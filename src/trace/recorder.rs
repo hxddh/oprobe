@@ -246,6 +246,20 @@ impl Agg {
         if !r.reused && r.protocol != Protocol::InProcess {
             rec(&mut a.stages.connect, t.connect_us());
         }
+        // A connection counts as dialed in the window through the request that used it first,
+        // so "new connections" and "warm %" always describe the same requests (a dial finished
+        // just before the window opened would otherwise be missing from one of them).
+        if !r.reused && r.protocol != Protocol::InProcess && (r.status != 0 || t.connect_us() > 0) {
+            self.conn.dialed += 1;
+            rec(&mut self.dns, t.dns_us);
+            rec(&mut self.tcp, t.tcp_us);
+            if t.proxy_us > 0 {
+                rec(&mut self.proxy, t.proxy_us);
+            }
+            if t.tls_us > 0 {
+                rec(&mut self.tls, t.tls_us);
+            }
+        }
         rec(&mut a.stages.send, t.send_us);
         rec(&mut a.stages.ttfb, t.ttfb_us);
         rec(&mut a.stages.body, t.body_us);
@@ -461,18 +475,8 @@ impl Recorder {
         {
             a.conn.remote_addrs.push(d.remote);
         }
-        if !measuring {
-            return;
-        }
-        a.conn.dialed += 1;
-        rec(&mut a.dns, d.dns_us);
-        rec(&mut a.tcp, d.tcp_us);
-        if d.proxy_us > 0 {
-            rec(&mut a.proxy, d.proxy_us);
-        }
-        if d.tls_us > 0 {
-            rec(&mut a.tls, d.tls_us);
-        }
+        // Dial counts and phase timings come from the cold request that used the connection
+        // (`record_request`); dials only contribute metadata and failures.
     }
 
     /// Request issued outside any operation scope (rare: background OpenDAL work).
