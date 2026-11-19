@@ -383,8 +383,8 @@ const CRC32C_TABLES: [[u32; 256]; 8] = {
 pub fn crc32c_append(crc: u32, data: &[u8]) -> u32 {
     let t = &CRC32C_TABLES;
     let mut c = !crc;
-    let mut chunks = data.chunks_exact(8);
-    for b in &mut chunks {
+    let (chunks, rest) = data.as_chunks::<8>();
+    for b in chunks {
         let lo = c ^ u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
         c = t[7][(lo & 0xff) as usize]
             ^ t[6][(lo >> 8 & 0xff) as usize]
@@ -395,7 +395,7 @@ pub fn crc32c_append(crc: u32, data: &[u8]) -> u32 {
             ^ t[1][b[6] as usize]
             ^ t[0][b[7] as usize];
     }
-    for &b in chunks.remainder() {
+    for &b in rest {
         c = (c >> 8) ^ t[0][((c ^ b as u32) & 0xff) as usize];
     }
     !c
