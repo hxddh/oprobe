@@ -1,13 +1,11 @@
-//! In-memory W-TinyLFU read cache layer (`moka`), caching exact byte ranges and whole objects.
+//! In-memory byte-bounded LRU read cache layer, caching exact byte ranges and whole objects.
 //! Lookups are timed and attributed to the current operation scope; writes/deletes invalidate.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ops::RangeBounds;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use await_tree::InstrumentAwait;
-use moka::future::Cache;
 use opendal_core::raw::oio::{self, ReadStream as _};
 use opendal_core::raw::*;
 use opendal_core::*;
@@ -27,6 +25,74 @@ fn note_lookup(us: u64, hit_bytes: Option<u64>) {
     }
 }
 
+/// Byte-bounded LRU map. Entries weigh their length (min 64 bytes); inserting evicts the
+/// least recently used entries until the total fits.
+struct ByteLru {
+    inner: Mutex<LruInner>,
+}
+
+struct LruInner {
+    cap: u64,
+    used: u64,
+    tick: u64,
+    map: HashMap<CacheEntryKey, (Buffer, u64, u64)>,
+    order: BTreeMap<u64, CacheEntryKey>,
+}
+
+impl ByteLru {
+    fn new(cap: u64) -> Self {
+        Self {
+            inner: Mutex::new(LruInner {
+                cap,
+                used: 0,
+                tick: 0,
+                map: HashMap::new(),
+                order: BTreeMap::new(),
+            }),
+        }
+    }
+
+    fn get(&self, k: &CacheEntryKey) -> Option<Buffer> {
+        let mut g = self.inner.lock().ok()?;
+        let g = &mut *g;
+        g.tick += 1;
+        let tick = g.tick;
+        let (v, t, _) = g.map.get_mut(k)?;
+        let old = std::mem::replace(t, tick);
+        let v = v.clone();
+        if let Some(key) = g.order.remove(&old) {
+            g.order.insert(tick, key);
+        }
+        Some(v)
+    }
+
+    fn insert(&self, k: CacheEntryKey, v: Buffer) {
+        let w = (v.len() as u64).max(64);
+        let Ok(mut g) = self.inner.lock() else { return };
+        let g = &mut *g;
+        if w > g.cap {
+            return;
+        }
+        if let Some((_, t, ow)) = g.map.remove(&k) {
+            g.order.remove(&t);
+            g.used -= ow;
+        }
+        while g.used + w > g.cap {
+            let Some((_, old)) = g.order.pop_first() else {
+                break;
+            };
+            if let Some((_, _, ow)) = g.map.remove(&old) {
+                g.used -= ow;
+            }
+        }
+        g.tick += 1;
+        let tick = g.tick;
+        g.order.insert(tick, k.clone());
+        g.map.insert(k, (v, tick, w));
+        g.used += w;
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct CacheEntryKey {
     path: String,
@@ -36,7 +102,7 @@ struct CacheEntryKey {
 }
 
 struct SharedCacheState {
-    cache: Cache<CacheEntryKey, Buffer>,
+    cache: ByteLru,
     path_epochs: Mutex<HashMap<String, u64>>,
 }
 
@@ -57,7 +123,7 @@ impl SharedCacheState {
     }
 }
 
-/// White-box OpenDAL `Layer` backed by `moka` W-TinyLFU concurrent byte-bounded cache.
+/// White-box OpenDAL `Layer` backed by a byte-bounded LRU cache.
 #[derive(Clone)]
 pub struct WhiteboxCacheLayer {
     state: Arc<SharedCacheState>,
@@ -71,10 +137,7 @@ impl std::fmt::Debug for WhiteboxCacheLayer {
 
 impl WhiteboxCacheLayer {
     pub fn new(capacity_bytes: u64) -> Self {
-        let cache = Cache::builder()
-            .max_capacity(capacity_bytes.max(1024 * 1024))
-            .weigher(|_k: &CacheEntryKey, v: &Buffer| v.len().clamp(64, u32::MAX as usize) as u32)
-            .build();
+        let cache = ByteLru::new(capacity_bytes.max(1024 * 1024));
         Self {
             state: Arc::new(SharedCacheState {
                 cache,
@@ -232,13 +295,7 @@ impl CachedReader {
             offset: range.offset(),
             size: range.size(),
         };
-        if let Some(buf) = self
-            .state
-            .cache
-            .get(&exact_key)
-            .instrument_await("cache::lookup")
-            .await
-        {
+        if let Some(buf) = self.state.cache.get(&exact_key) {
             note_lookup(
                 t_lookup.elapsed().as_micros() as u64,
                 Some(buf.len() as u64),
@@ -254,7 +311,7 @@ impl CachedReader {
                 offset: 0,
                 size: None,
             };
-            if let Some(full_buf) = self.state.cache.get(&full_key).await {
+            if let Some(full_buf) = self.state.cache.get(&full_key) {
                 let bounds = range.to_range_as_usize();
                 let start = match bounds.start_bound() {
                     std::ops::Bound::Included(&s) => s,
@@ -298,7 +355,7 @@ impl oio::Read for CachedReader {
                 offset: range.offset(),
                 size: range.size(),
             };
-            self.state.cache.insert(key, fetched.clone()).await;
+            self.state.cache.insert(key, fetched.clone());
         }
 
         Ok((rp, Box::new(fetched) as Box<dyn oio::ReadStreamDyn>))
@@ -323,7 +380,7 @@ impl oio::Read for CachedReader {
                 offset: range.offset(),
                 size: range.size(),
             };
-            self.state.cache.insert(key, fetched.clone()).await;
+            self.state.cache.insert(key, fetched.clone());
         }
 
         Ok((rp, fetched))
@@ -369,5 +426,36 @@ impl<D: oio::Delete> oio::Delete for InvalidatingDeleter<D> {
 
     async fn close(&mut self) -> Result<()> {
         self.inner.close().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(p: &str) -> CacheEntryKey {
+        CacheEntryKey {
+            path: p.into(),
+            epoch: 0,
+            offset: 0,
+            size: None,
+        }
+    }
+
+    #[test]
+    fn lru_evicts_least_recently_used_by_bytes() {
+        let c = ByteLru::new(300);
+        c.insert(key("a"), Buffer::from(vec![0u8; 100]));
+        c.insert(key("b"), Buffer::from(vec![0u8; 100]));
+        c.insert(key("c"), Buffer::from(vec![0u8; 100]));
+        assert!(c.get(&key("a")).is_some()); // a is now most recent
+        c.insert(key("d"), Buffer::from(vec![0u8; 100]));
+        assert!(c.get(&key("b")).is_none());
+        assert!(c.get(&key("a")).is_some() && c.get(&key("c")).is_some());
+        assert!(c.get(&key("d")).is_some());
+        c.insert(key("huge"), Buffer::from(vec![0u8; 1000]));
+        assert!(c.get(&key("huge")).is_none());
+        c.insert(key("a"), Buffer::from(vec![0u8; 200]));
+        assert_eq!(c.inner.lock().unwrap().used, 300);
     }
 }

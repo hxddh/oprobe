@@ -17,6 +17,7 @@ prints a fix for each failure. Errors from every command come with the same hint
 | leftover `oprobe-run-*` prefixes | a run was killed (second Ctrl-C, OOM, power loss) | `oprobe cleanup <target> --dry-run`, then without `--dry-run` |
 | results show "client processing-bound" on a remote store | client CPU, CRC verification or tiny objects | check `client cpu` in the report; `--no-verify`; larger objects or batching |
 | `oprobe top` fails in CI | needs an interactive terminal | use `oprobe run` |
+| `oprobe-app was not found` | `oprobe top` is the app's terminal UI | install `oprobe-app` (release page or `cargo install oprobe-app`) |
 
 ## Reading the report
 

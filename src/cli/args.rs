@@ -13,7 +13,7 @@ Examples:
   oprobe run s3://my-bucket/data --existing tables/events/ -c 64
   oprobe tune s3://my-bucket/bench --emit-profile tuned.toml --emit-rust tuned.rs
   oprobe diff base.json candidate.json --junit gate.xml
-  oprobe top s3://my-bucket/bench                       # live terminal workbench
+  oprobe top s3://my-bucket/bench                       # live terminal workbench (oprobe-app)
   oprobe doctor s3://my-bucket/bench                    # connectivity & permission checks
   oprobe probe https://s3.us-east-1.amazonaws.com       # DNS/TCP/TLS/TTFB microscope
   oprobe lab --tls --latency 20ms --throttle-above 32   # local S3 with faults
@@ -383,12 +383,26 @@ pub struct DiffArgs {
 
 #[derive(Args, Debug)]
 pub struct TopArgs {
-    #[command(flatten)]
-    pub target: TargetArgs,
-    #[command(flatten)]
-    pub workload: WorkloadArgs,
-    #[command(flatten)]
-    pub knobs: KnobArgs,
+    /// Storage URL, e.g. s3://bucket/prefix, memory://
+    pub target: Option<String>,
+    /// Custom endpoint (MinIO, R2, oprobe lab)
+    #[arg(long)]
+    pub endpoint: Option<String>,
+    /// Workload preset: parquet | checkpoint | small-files | metadata | mixed
+    #[arg(long)]
+    pub preset: Option<String>,
+    /// Measurement window, e.g. 30s
+    #[arg(short, long)]
+    pub duration: Option<String>,
+    /// Concurrent operations
+    #[arg(short, long)]
+    pub concurrency: Option<usize>,
+    /// Skip TLS certificate verification
+    #[arg(long)]
+    pub insecure: bool,
+    /// Public bucket, no credentials
+    #[arg(long)]
+    pub anonymous: bool,
 }
 
 #[derive(Args, Debug)]

@@ -65,7 +65,6 @@ fn main() -> std::process::ExitCode {
             }
         };
     }
-    env_logger::init();
     let _ = platform::run_app(
         platform::AppSource::Rust(platform::Root::of::<oprobe_app::App>()),
         platform::AppOptions {

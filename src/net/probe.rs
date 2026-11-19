@@ -308,8 +308,21 @@ pub fn httpdate_parse(s: &str) -> Option<std::time::SystemTime> {
         "Dec" => "12",
         _ => return None,
     };
-    let day = format!("{:0>2}", parts[1]);
-    humantime::parse_rfc3339(&format!("{}-{month}-{day}T{}Z", parts[3], parts[4])).ok()
+    let hms: Vec<u32> = parts[4]
+        .split(':')
+        .map(|x| x.parse().ok())
+        .collect::<Option<_>>()?;
+    if hms.len() != 3 {
+        return None;
+    }
+    crate::util::utc_time(
+        parts[3].parse().ok()?,
+        month.parse().ok()?,
+        parts[1].parse().ok()?,
+        hms[0],
+        hms[1],
+        hms[2],
+    )
 }
 
 #[cfg(test)]
@@ -317,9 +330,6 @@ mod tests {
     #[test]
     fn parses_http_dates() {
         let t = super::httpdate_parse("Sun, 06 Nov 1994 08:49:37 GMT").unwrap();
-        assert_eq!(
-            humantime::format_rfc3339_seconds(t).to_string(),
-            "1994-11-06T08:49:37Z"
-        );
+        assert_eq!(crate::util::fmt_rfc3339(t), "1994-11-06T08:49:37Z");
     }
 }

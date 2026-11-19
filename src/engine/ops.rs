@@ -46,7 +46,7 @@ pub fn verb(kind: &OpKind) -> &'static str {
 
 fn crc_of(buf: &Buffer) -> u32 {
     buf.clone()
-        .fold(0u32, |acc, chunk| crc32c::crc32c_append(acc, &chunk))
+        .fold(0u32, |acc, chunk| crate::util::crc32c_append(acc, &chunk))
 }
 
 fn aligned_offset(rng: &mut impl Rng, max: u64) -> u64 {
@@ -147,7 +147,7 @@ pub async fn execute(
             let path = format!("{}w-{slot:05}.bin", ctx.scratch_prefix);
             let data = ctx.pool.slice(rng, size.as_usize());
             let len = data.len() as u64;
-            let crc = (ctx.verify && slot.is_multiple_of(16)).then(|| crc32c::crc32c(&data));
+            let crc = (ctx.verify && slot.is_multiple_of(16)).then(|| crate::util::crc32c(&data));
             ctx.op.write(&path, data).await?;
             if let Some(crc) = crc {
                 push_written(ctx, path, crc);
@@ -161,7 +161,7 @@ pub async fn execute(
             let path = format!("{}mp-{slot:05}.bin", ctx.scratch_prefix);
             let data = ctx.pool.slice(rng, size.as_usize());
             let len = data.len() as u64;
-            let crc = (ctx.verify && slot.is_multiple_of(8)).then(|| crc32c::crc32c(&data));
+            let crc = (ctx.verify && slot.is_multiple_of(8)).then(|| crate::util::crc32c(&data));
             let mut w = ctx
                 .op
                 .writer_with(&path)

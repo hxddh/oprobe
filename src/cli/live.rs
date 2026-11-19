@@ -27,9 +27,12 @@ impl LiveLine {
     }
 
     fn width() -> usize {
-        crossterm::terminal::size()
-            .map(|(w, _)| w as usize)
-            .unwrap_or(100)
+        // Shells export COLUMNS; without it stay within a classic 80-column terminal so the
+        // single status line never wraps.
+        std::env::var("COLUMNS")
+            .ok()
+            .and_then(|c| c.trim().parse::<usize>().ok())
+            .unwrap_or(80)
             .max(40)
     }
 

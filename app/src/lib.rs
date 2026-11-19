@@ -54,7 +54,7 @@ pub fn App() -> impl IntoElement {
     // `nsh run` (which also reads `nsh.json`'s "theme").
     match nsh_base::tokens_of(Some(include_str!("../theme.json"))) {
         Ok(tokens) => set_tokens(tokens),
-        Err(e) => log::warn!("theme.json: {e}"),
+        Err(e) => eprintln!("oprobe-app: theme.json: {e}"),
     }
     provide_context(store::Store::new());
     view()

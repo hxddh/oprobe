@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use opendal::Operator;
+use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
-use rand_xoshiro::Xoshiro256PlusPlus;
 use tokio::sync::Semaphore;
 
 use super::cleanup::{delete_prefix, new_run_prefix, CleanupSummary};
@@ -188,8 +188,7 @@ impl Session {
             let rec = recorder.clone();
             let progress = progress.clone();
             tokio::spawn(async move {
-                let mut sys = sysinfo::System::new();
-                let pid = sysinfo::Pid::from_u32(std::process::id());
+                let mut cpu = super::procstat::CpuMeter::new();
                 let mut tick = tokio::time::interval(Duration::from_millis(20));
                 let mut n = 0u64;
                 while !stop.load(Ordering::Acquire) {
@@ -197,9 +196,8 @@ impl Session {
                     n += 1;
                     rec.sample_trees(rec.current_p90_us().max(2_000));
                     if n.is_multiple_of(50) {
-                        sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
-                        if let Some(p) = sys.process(pid) {
-                            rec.update_client(p.cpu_usage() as f64, p.memory() as f64 / 1048576.0);
+                        if let Some((pct, rss)) = cpu.sample() {
+                            rec.update_client(pct, rss);
                         }
                     }
                     if n.is_multiple_of(12) {
@@ -283,7 +281,7 @@ impl Session {
         };
         let total_w = cum.last().map(|c| c.0).unwrap_or(1);
         let cum = Arc::new(cum);
-        let pick_kind = move |rng: &mut Xoshiro256PlusPlus, cum: &Vec<(u32, OpKind)>| -> OpKind {
+        let pick_kind = move |rng: &mut SmallRng, cum: &Vec<(u32, OpKind)>| -> OpKind {
             let x = rng.gen_range(0..total_w);
             cum.iter()
                 .find(|(c, _)| x < *c)
@@ -314,9 +312,8 @@ impl Session {
                     let rec = recorder.clone();
                     let tree = tree.cloned();
                     handles.push(tokio::spawn(async move {
-                        let mut rng = Xoshiro256PlusPlus::seed_from_u64(
-                            seed ^ (w as u64).wrapping_mul(0x9E37_79B9),
-                        );
+                        let mut rng =
+                            SmallRng::seed_from_u64(seed ^ (w as u64).wrapping_mul(0x9E37_79B9));
                         let mut seq = 0u64;
                         while !stop() {
                             started.fetch_add(1, Ordering::Relaxed);
@@ -346,7 +343,7 @@ impl Session {
                 let interval = Duration::from_secs_f64(1.0 / rate.max(0.001));
                 let t0 = Instant::now();
                 let mut next = t0;
-                let mut rng = Xoshiro256PlusPlus::seed_from_u64(seed);
+                let mut rng = SmallRng::seed_from_u64(seed);
                 let mut missed = 0u64;
                 let mut issued = 0u64;
                 let mut max_lag = Duration::ZERO;
@@ -361,7 +358,7 @@ impl Session {
                             started.fetch_add(1, Ordering::Relaxed);
                             issued += 1;
                             let kind = pick_kind(&mut rng, &cum);
-                            let mut op_rng = Xoshiro256PlusPlus::seed_from_u64(rng.gen());
+                            let mut op_rng = SmallRng::seed_from_u64(rng.gen());
                             let slot = seq % (knobs.concurrency as u64 * 4).max(4);
                             seq += 1;
                             let ctx = ctx.clone();
@@ -409,7 +406,9 @@ impl Session {
         let (mut ok, mut bad) = (0, 0);
         for (path, crc) in items {
             if let Ok(buf) = self.admin.read(&path).await {
-                let got = buf.clone().fold(0u32, |a, c| crc32c::crc32c_append(a, &c));
+                let got = buf
+                    .clone()
+                    .fold(0u32, |a, c| crate::util::crc32c_append(a, &c));
                 if got == crc {
                     ok += 1;
                 } else {
@@ -455,7 +454,7 @@ impl Session {
 async fn run_one(
     ctx: &Arc<OpCtx>,
     kind: &OpKind,
-    rng: &mut Xoshiro256PlusPlus,
+    rng: &mut SmallRng,
     slot: u64,
     intended: Instant,
     measured: bool,

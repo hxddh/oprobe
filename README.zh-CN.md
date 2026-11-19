@@ -17,9 +17,9 @@ Windows 使用 Win32/Direct2D、Linux 使用 GTK 4，同一套 UI 也能在任�
 
 ![oprobe-app：最慢操作瀑布图](docs/images/app-slowest-op.png)
 
-> 关于 TUI：NSH 的终端后端可以渲染整套应用（`oprobe-app --tui`）。CLI 内置的 `oprobe top` 仍保留纯 ratatui 实现，
-> 因为 NSH 终端后端目前会引入 C 代码（语法高亮的正则引擎）并要求 Rust 1.97，放进主包会破坏纯 Rust 的
-> `cargo install oprobe`。详见 [docs/app.md](docs/app.md)。
+架构只有两层：**OpenDAL + oprobe 自研纯 Rust 传输层**负责一切测量，**NSH** 负责一切界面（窗口与终端）。
+`oprobe top` 即在终端中启动 `oprobe-app --tui`。主包 `oprobe` 不含任何 UI 框架，`cargo install oprobe` 保持纯 Rust；
+NSH 终端后端目前会编译一个小型 C 正则库（语法高亮），且要求 Rust 1.97，因此 UI 独立为 `oprobe-app` 包。详见 [docs/app.md](docs/app.md)。
 
 ## 它回答的问题
 
@@ -65,7 +65,7 @@ AWS_ACCESS_KEY_ID=lab AWS_SECRET_ACCESS_KEY=lab \
 oprobe doctor s3://my-bucket/oprobe            # 连通性、TLS、时钟偏差、读写删权限逐项检查
 oprobe run    s3://my-bucket/oprobe --preset parquet -d 30s --json baseline.json
 oprobe run    s3://my-bucket --existing warehouse/events/   # 只读压测你已有的真实对象
-oprobe top    s3://my-bucket/oprobe            # 实时终端工作台
+oprobe top    s3://my-bucket/oprobe            # 实时终端工作台（需安装 oprobe-app）
 
 # 4. 调优并落地
 oprobe tune s3://my-bucket/oprobe --preset parquet --p99-ms 250 \
@@ -84,7 +84,7 @@ oprobe diff baseline.json candidate.json --junit oprobe.xml --markdown oprobe.md
 | 命令 | 作用 |
 |---|---|
 | `oprobe run` | 运行负载并输出白盒报告；`--json` / `--markdown` 导出；`--fail-on` 用于 CI |
-| `oprobe top` | 交互式终端工作台：实时吞吐/延迟、耗时分解、请求分段、连接、最慢操作与诊断；单键调整参数，`t` 一键调优 |
+| `oprobe top` | 在终端中打开应用工作台（`oprobe-app --tui`）：实时曲线、耗时分解、按 API 统计、最慢操作瀑布图、调优与探测 |
 | `oprobe tune` | 感知限流的闭环调优，`--objective throughput\|latency\|cost` |
 | `oprobe diff` | 回归门禁（回归时退出码 3），输出 JSON / Markdown / JUnit |
 | `oprobe doctor` | 配置、凭据、DNS/代理/TCP/TLS、HTTP、时钟偏差、list/write/read/stat/delete 逐项诊断 |

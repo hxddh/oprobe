@@ -8,7 +8,7 @@ one Rust UI rendered with each platform's own toolkit, and the same UI on a term
 | macOS 14+ | AppKit, Core Animation, CoreText | `oprobe-app-<ver>-macos-universal.dmg` (Apple Silicon + Intel `oprobe.app`) |
 | Windows 10 1809+ | Win32, Direct2D, DirectWrite | `oprobe-app-<ver>-x64.msi` (Start menu shortcut), or the portable `.zip` |
 | Linux (GTK 4.14+) | GTK 4, Pango | `oprobe-app-<ver>-x86_64-unknown-linux-gnu.tar.gz` (`install.sh`, `.desktop` entry, icon) |
-| Any terminal | NSH terminal backend (ratatui) | `oprobe-app --tui` — same UI, keyboard and mouse |
+| Any terminal | NSH terminal backend | `oprobe-app --tui` or `oprobe top` — same UI, keyboard and mouse |
 
 ![Workbench](images/app-workbench.png)
 
@@ -25,8 +25,7 @@ one Rust UI rendered with each platform's own toolkit, and the same UI on a term
 
 ![Slowest operation](images/app-slowest-op.png)
 
-All measurement logic is the `oprobe` library — the app, the CLI and the built-in `oprobe top` produce identical
-numbers. Test data is cleaned up when a run ends or is stopped.
+All measurement logic is the `oprobe` library — the app and the CLI produce identical numbers. Test data is cleaned up when a run ends or is stopped.
 
 ## Launching
 
@@ -40,30 +39,33 @@ oprobe-app --tui                               # the same UI in this terminal
 Credentials come from the usual environment (`AWS_*`, `~/.aws`, `GOOGLE_APPLICATION_CREDENTIALS`, …), proxies from
 `HTTPS_PROXY` / `NO_PROXY`, exactly as for the CLI.
 
-## Terminal UIs: `oprobe top` vs `oprobe-app --tui`
+## One UI toolkit: NSH
 
-| | `oprobe top` | `oprobe-app --tui` |
-|---|---|---|
-| Ships with | the `oprobe` CLI (`cargo install oprobe`) | the desktop app |
-| Built with | ratatui directly | NSH's terminal backend (ratatui underneath) |
-| UI | compact single-screen dashboard, single-key controls | the full app: forms, tabs, tuner, probe, mouse |
-| Dependencies | pure Rust | NSH (includes some C, e.g. its syntax highlighter's regex engine), Rust ≥ 1.97 |
+The window and the terminal UI are the same NSH app; `oprobe top` simply starts `oprobe-app --tui` (found next to the
+`oprobe` binary or on `PATH`) with the target and options you pass:
 
-`oprobe top` stays in the CLI because NSH's terminal backend currently pulls C code and needs Rust 1.97; putting it in
-the `oprobe` crate would break the pure-Rust `cargo install oprobe`. If NSH makes those features optional, `oprobe top`
-can render the NSH app directly (`nsh-platform-tui` embeds into a ratatui frame).
+```bash
+oprobe top s3://my-bucket/oprobe --preset parquet -c 32     # == oprobe-app --tui s3://... --preset parquet -c 32
+```
+
+The architecture is deliberately two-layered: **OpenDAL + oprobe's own pure-Rust transport** (the `oprobe` crate:
+measurement, tuner, reports, CLI) and **NSH** (the `oprobe-app` crate: every UI). Nothing else is a framework.
+NSH is built with only what the app uses (`plot`); its JS engine, WebGPU shaders, network loader, updater, math,
+crypto and media features are off. `oprobe-app` needs Rust ≥ 1.97 and, on Linux, GTK 4; NSH's terminal backend
+currently always compiles its syntax highlighter (a small C regex library), which is why the UI lives in its own crate
+and `cargo install oprobe` stays pure Rust.
 
 ## Building from source
 
 ```bash
+cargo install oprobe-app     # from crates.io (Rust ≥ 1.97; Linux: GTK 4 dev package)
 cd app
-cargo run                    # desktop window (Linux needs GTK 4.14+, GStreamer dev packages)
+cargo run                    # desktop window
 cargo run -- --tui           # terminal
 cargo test                   # headless UI flows on the real NSH engine
 ```
 
-Linux build dependencies (Debian/Ubuntu 24.04):
-`sudo apt install clang libclang-dev libgtk-4-dev libwebkitgtk-6.0-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev`.
+Linux build dependency (Debian/Ubuntu 24.04): `sudo apt install libgtk-4-dev`.
 
 With the [NSH CLI](https://nsh.dev/docs/installation) you can also use `nsh run`, `nsh run --target tui` and
 `nsh package` from `app/` (`nsh.json` describes the app).

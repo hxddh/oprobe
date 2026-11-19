@@ -516,7 +516,7 @@ async fn handle_s3_request(
                 .await
                 .map(|c| c.to_bytes())
                 .unwrap_or_default();
-            let crc = crc32c::crc32c(&part_bytes);
+            let crc = crate::util::crc32c(&part_bytes);
             let etag = format!("\"{crc:08x}\"");
 
             if let Ok(mut ups) = store.uploads.write() {
@@ -551,7 +551,7 @@ async fn handle_s3_request(
                     merged.extend_from_slice(&p_bytes);
                 }
                 let frozen = merged.freeze();
-                let crc = crc32c::crc32c(&frozen);
+                let crc = crate::util::crc32c(&frozen);
                 let etag = format!("\"{crc:08x}-{num_parts}\"");
 
                 if let Ok(mut objs) = store.objects.write() {
@@ -626,7 +626,7 @@ async fn handle_s3_request(
                 .await
                 .map(|c| c.to_bytes())
                 .unwrap_or_default();
-            let crc = crc32c::crc32c(&body_bytes);
+            let crc = crate::util::crc32c(&body_bytes);
             let etag = format!("\"{crc:08x}\"");
             if let Ok(mut objs) = store.objects.write() {
                 objs.insert(

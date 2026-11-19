@@ -4,6 +4,7 @@ pub mod cleanup;
 pub mod dataset;
 pub mod operator;
 pub mod ops;
+pub mod procstat;
 pub mod runner;
 
 pub use cleanup::CleanupSummary;

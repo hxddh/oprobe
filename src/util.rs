@@ -260,33 +260,145 @@ pub fn redact_options(
         .collect()
 }
 
+/// Days since 1970-01-01 for a proleptic Gregorian date (Howard Hinnant's algorithm).
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (m as i64 + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (
+        if m <= 2 {
+            yoe + era * 400 + 1
+        } else {
+            yoe + era * 400
+        },
+        m,
+        d,
+    )
+}
+
+/// `SystemTime` from UTC calendar fields; `None` if out of range.
+pub fn utc_time(y: i64, mo: u32, d: u32, h: u32, mi: u32, s: u32) -> Option<std::time::SystemTime> {
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || s > 60 {
+        return None;
+    }
+    let secs = days_from_civil(y, mo, d) * 86_400 + (h * 3600 + mi * 60 + s) as i64;
+    let secs = u64::try_from(secs).ok()?;
+    Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+}
+
+/// RFC 3339 UTC timestamp with seconds precision: `2026-11-19T09:30:00Z`.
+pub fn fmt_rfc3339(t: std::time::SystemTime) -> String {
+    let secs = t
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let (y, m, d) = civil_from_days(secs.div_euclid(86_400));
+    let r = secs.rem_euclid(86_400);
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+        r / 3600,
+        r % 3600 / 60,
+        r % 60
+    )
+}
+
 /// UTC timestamp formatted as RFC 3339 (seconds precision).
 pub fn now_rfc3339() -> String {
-    humantime::format_rfc3339_seconds(std::time::SystemTime::now()).to_string()
+    fmt_rfc3339(std::time::SystemTime::now())
 }
 
 /// Compact UTC timestamp for object prefixes: `20261119T093000Z`.
 pub fn compact_utc_now() -> String {
-    let s = humantime::format_rfc3339_seconds(std::time::SystemTime::now()).to_string();
     // 2026-11-19T09:30:00Z -> 20261119T093000Z
-    s.replace(['-', ':'], "")
+    now_rfc3339().replace(['-', ':'], "")
 }
 
 /// Parse a compact UTC timestamp produced by [`compact_utc_now`].
 pub fn parse_compact_utc(s: &str) -> Option<std::time::SystemTime> {
-    if s.len() != 16 {
+    if s.len() != 16 || !s.is_ascii() || &s[8..9] != "T" || &s[15..] != "Z" {
         return None;
     }
-    let iso = format!(
-        "{}-{}-{}T{}:{}:{}Z",
-        &s[0..4],
-        &s[4..6],
-        &s[6..8],
-        &s[9..11],
-        &s[11..13],
-        &s[13..15]
-    );
-    humantime::parse_rfc3339(&iso).ok()
+    let n = |r: std::ops::Range<usize>| s[r].parse::<u32>().ok();
+    utc_time(
+        n(0..4)? as i64,
+        n(4..6)?,
+        n(6..8)?,
+        n(9..11)?,
+        n(11..13)?,
+        n(13..15)?,
+    )
+}
+
+/// CRC-32C (Castagnoli), slicing-by-8. Used to verify payload integrity end to end.
+pub fn crc32c(data: &[u8]) -> u32 {
+    crc32c_append(0, data)
+}
+
+const CRC32C_TABLES: [[u32; 256]; 8] = {
+    let mut t = [[0u32; 256]; 8];
+    let mut i = 0;
+    while i < 256 {
+        let mut c = i as u32;
+        let mut k = 0;
+        while k < 8 {
+            c = if c & 1 != 0 {
+                (c >> 1) ^ 0x82F6_3B78
+            } else {
+                c >> 1
+            };
+            k += 1;
+        }
+        t[0][i] = c;
+        i += 1;
+    }
+    let mut i = 0;
+    while i < 256 {
+        let mut s = 1;
+        while s < 8 {
+            let prev = t[s - 1][i];
+            t[s][i] = (prev >> 8) ^ t[0][(prev & 0xff) as usize];
+            s += 1;
+        }
+        i += 1;
+    }
+    t
+};
+
+/// Continue a CRC-32C over more data (`crc` is a previous result, `0` to start).
+pub fn crc32c_append(crc: u32, data: &[u8]) -> u32 {
+    let t = &CRC32C_TABLES;
+    let mut c = !crc;
+    let mut chunks = data.chunks_exact(8);
+    for b in &mut chunks {
+        let lo = c ^ u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+        c = t[7][(lo & 0xff) as usize]
+            ^ t[6][(lo >> 8 & 0xff) as usize]
+            ^ t[5][(lo >> 16 & 0xff) as usize]
+            ^ t[4][(lo >> 24) as usize]
+            ^ t[3][b[4] as usize]
+            ^ t[2][b[5] as usize]
+            ^ t[1][b[6] as usize]
+            ^ t[0][b[7] as usize];
+    }
+    for &b in chunks.remainder() {
+        c = (c >> 8) ^ t[0][((c ^ b as u32) & 0xff) as usize];
+    }
+    !c
 }
 
 pub fn pct(num: f64, den: f64) -> f64 {
@@ -328,6 +440,38 @@ mod tests {
         assert_eq!(parse_duration("2").unwrap(), Duration::from_secs(2));
         assert!(parse_duration("abc").is_err());
         assert_eq!(HumanDuration::secs(120).to_string(), "2m");
+    }
+
+    #[test]
+    fn crc32c_matches_reference_vectors() {
+        assert_eq!(crc32c(b""), 0);
+        assert_eq!(crc32c(b"123456789"), 0xE306_9283);
+        assert_eq!(crc32c(&[0u8; 32]), 0x8A91_36AA);
+        let data: Vec<u8> = (0..1000u32).map(|i| (i * 7) as u8).collect();
+        assert_eq!(
+            crc32c_append(crc32c(&data[..333]), &data[333..]),
+            crc32c(&data)
+        );
+    }
+
+    #[test]
+    fn rfc3339_formatting_and_calendar_math() {
+        use std::time::{Duration, UNIX_EPOCH};
+        assert_eq!(fmt_rfc3339(UNIX_EPOCH), "1970-01-01T00:00:00Z");
+        assert_eq!(
+            fmt_rfc3339(UNIX_EPOCH + Duration::from_secs(784_111_777)),
+            "1994-11-06T08:49:37Z"
+        );
+        assert_eq!(
+            fmt_rfc3339(UNIX_EPOCH + Duration::from_secs(951_782_400)),
+            "2000-02-29T00:00:00Z"
+        );
+        assert_eq!(
+            utc_time(2000, 2, 29, 0, 0, 0),
+            Some(UNIX_EPOCH + Duration::from_secs(951_782_400))
+        );
+        assert_eq!(utc_time(2026, 13, 1, 0, 0, 0), None);
+        assert!(parse_compact_utc("2026111xT093000Z").is_none());
     }
 
     #[test]

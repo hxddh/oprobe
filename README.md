@@ -43,7 +43,10 @@ SLOWEST OPERATION
 `oprobe-app` puts the same engine behind a native UI built with [Native Shell (NSH)](https://github.com/longbridge/nsh):
 AppKit on macOS, Win32/Direct2D on Windows, GTK 4 on Linux, and the same UI in any terminal (`oprobe-app --tui`).
 Run, tune and probe from forms; watch live charts; inspect the slowest operation as a request waterfall.
-[More →](docs/app.md)
+`oprobe top` opens it in the terminal. [More →](docs/app.md)
+
+The architecture has two layers and no other frameworks: **OpenDAL + oprobe's pure-Rust transport** for everything that
+measures, and **NSH** for everything you look at.
 
 ![oprobe-app: slowest operation waterfall](docs/images/app-slowest-op.png)
 
@@ -96,7 +99,7 @@ AWS_ACCESS_KEY_ID=lab AWS_SECRET_ACCESS_KEY=lab \
 oprobe doctor s3://my-bucket/oprobe            # connectivity, TLS, clock skew, permissions
 oprobe run    s3://my-bucket/oprobe --preset parquet -d 30s --json baseline.json
 oprobe run    s3://my-bucket --existing warehouse/events/   # read-only, your real objects
-oprobe top    s3://my-bucket/oprobe            # live terminal workbench
+oprobe top    s3://my-bucket/oprobe            # live terminal workbench (needs oprobe-app)
 
 # 4. Tune and ship
 oprobe tune s3://my-bucket/oprobe --preset parquet --p99-ms 250 \
@@ -116,7 +119,7 @@ of killed runs.
 | Command | Purpose |
 |---|---|
 | `oprobe run [TARGET]` | Run a workload; print the white-box report; save `--json` / `--markdown`. `--fail-on warning\|critical` for CI. |
-| `oprobe top [TARGET]` | Interactive workbench: live throughput/latency, time breakdown, request stages, connections, slowest ops, findings; change knobs with single keys, auto-tune with `t`. |
+| `oprobe top [TARGET]` | The app's interactive workbench in the terminal (`oprobe-app --tui`): live charts, time breakdown, per-API tables, slowest-op waterfall, tuner, probe. |
 | `oprobe tune [TARGET]` | Throttle-aware closed-loop tuning with `--objective throughput\|latency\|cost`. |
 | `oprobe diff BASE CAND` | Regression gate (exit code 3 on regression) with JSON / Markdown / JUnit output. |
 | `oprobe doctor [TARGET]` | Step-by-step checks: config, credentials, DNS/proxy/TCP/TLS, HTTP, clock skew, list/write/read/stat/delete. |

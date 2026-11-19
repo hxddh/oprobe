@@ -206,7 +206,7 @@ pub async fn run(a: DoctorArgs) -> Result<ExitCode> {
                 Ok(buf) => {
                     let got = buf
                         .clone()
-                        .fold(0u32, |a, ch| crc32c::crc32c_append(a, &ch));
+                        .fold(0u32, |a, ch| crate::util::crc32c_append(a, &ch));
                     if got == crc {
                         c.ok(
                             "read + crc32c",

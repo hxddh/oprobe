@@ -46,7 +46,7 @@ fn scheme_of(cmd: &Command) -> String {
     let t = match cmd {
         Command::Run(a) => a.target.target.clone(),
         Command::Tune(a) => a.target.target.clone(),
-        Command::Top(a) => a.target.target.clone(),
+        Command::Top(a) => a.target.clone(),
         Command::Doctor(a) => a.target.target.clone(),
         Command::Cleanup(a) => a.target.target.clone(),
         _ => None,
@@ -69,16 +69,60 @@ pub fn print_error(err: &anyhow::Error, scheme: &str) {
     }
 }
 
+/// `oprobe top` is the NSH app's terminal UI (`oprobe-app --tui`): one UI toolkit for the
+/// window and the terminal, while this crate stays pure Rust.
+fn cmd_top(a: TopArgs) -> Result<ExitCode> {
+    let exe = if cfg!(windows) {
+        "oprobe-app.exe"
+    } else {
+        "oprobe-app"
+    };
+    // Prefer the app installed next to this binary (release archives, packages), then PATH.
+    let app = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join(exe)))
+        .filter(|p| p.is_file())
+        .unwrap_or_else(|| exe.into());
+    let mut cmd = std::process::Command::new(&app);
+    cmd.arg("--tui");
+    cmd.args(a.target.iter());
+    for (flag, v) in [
+        ("--endpoint", a.endpoint),
+        ("--preset", a.preset),
+        ("--duration", a.duration),
+        ("--concurrency", a.concurrency.map(|c| c.to_string())),
+    ] {
+        if let Some(v) = v {
+            cmd.arg(flag).arg(v);
+        }
+    }
+    if a.insecure {
+        cmd.arg("--insecure");
+    }
+    if a.anonymous {
+        cmd.arg("--anonymous");
+    }
+    match cmd.status() {
+        Ok(st) => Ok(if st.success() {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => anyhow::bail!(
+            "`oprobe top` runs the oprobe app's terminal UI, and `oprobe-app` was not found \
+             next to oprobe or on PATH. Install it with `cargo install oprobe-app` or from the \
+             release page (oprobe-app-<version>-<platform>), or use `oprobe run` for a report."
+        ),
+        Err(e) => Err(anyhow::Error::new(e).context(format!("cannot start {}", app.display()))),
+    }
+}
+
 async fn dispatch(cmd: Command) -> Result<ExitCode> {
     match cmd {
         Command::Run(a) => cmd_run(a).await,
         Command::Tune(a) => cmd_tune(a).await,
         Command::Diff(a) => cmd_diff(a),
-        Command::Top(a) => {
-            let profile = build_profile(&a.target, &a.workload, &a.knobs, &CostArgs::default())?;
-            crate::tui::run(profile).await?;
-            Ok(ExitCode::SUCCESS)
-        }
+        Command::Top(a) => cmd_top(a),
         Command::Doctor(a) => doctor::run(a).await,
         Command::Probe(a) => cmd_probe(a).await,
         Command::Lab(a) => cmd_lab(a).await,

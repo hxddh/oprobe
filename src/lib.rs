@@ -14,6 +14,5 @@ pub mod layers;
 pub mod net;
 pub mod report;
 pub mod trace;
-pub mod tui;
 pub mod tune;
 pub mod util;

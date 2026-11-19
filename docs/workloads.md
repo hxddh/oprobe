@@ -91,7 +91,7 @@ range_gap = "64KiB"         # reader .gap(n): merge ranges closer than this
 max_inflight_requests = 0   # cap on concurrent HTTP requests (0 = unlimited)
 http_version = "auto"       # auto | h1 | h2
 keep_alive = true
-cache = false               # in-memory W-TinyLFU read cache
+cache = false               # in-memory byte-bounded LRU read cache
 cache_size = "256MiB"
 retries = 3                 # RetryLayer attempts (jittered exponential backoff)
 tail_cut = false            # TailCutLayer: cancel & retry stragglers above adaptive p95

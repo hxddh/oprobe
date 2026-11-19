@@ -7,15 +7,15 @@ use anyhow::{bail, Context, Result};
 use bytes::{Bytes, BytesMut};
 use futures::{StreamExt, TryStreamExt};
 use opendal::{EntryMode, Operator};
+use rand::rngs::SmallRng;
 use rand::{Rng, RngCore, SeedableRng};
-use rand_xoshiro::Xoshiro256PlusPlus;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{Access, DatasetSpec};
 
 /// Incompressible, de-duplication-proof payload with a CRC32C digest.
 pub fn generate_payload(seed: u64, size: usize) -> (Bytes, u32) {
-    let mut rng = Xoshiro256PlusPlus::seed_from_u64(seed ^ 0x9E37_79B9_7F4A_7C15);
+    let mut rng = SmallRng::seed_from_u64(seed ^ 0x9E37_79B9_7F4A_7C15);
     let mut buf = BytesMut::zeroed(size);
     rng.fill_bytes(&mut buf);
     if size >= 16 {
@@ -23,7 +23,7 @@ pub fn generate_payload(seed: u64, size: usize) -> (Bytes, u32) {
         buf[size - 8..].copy_from_slice(&(!seed).to_le_bytes());
     }
     let b = buf.freeze();
-    let crc = crc32c::crc32c(&b);
+    let crc = crate::util::crc32c(&b);
     (b, crc)
 }
 
@@ -85,7 +85,7 @@ fn fingerprint(spec: &DatasetSpec, seed: u64) -> String {
         spec.object_size.0,
         spec.partitions.max(1)
     );
-    format!("{:08x}", crc32c::crc32c(s.as_bytes()))
+    format!("{:08x}", crate::util::crc32c(s.as_bytes()))
 }
 
 impl Dataset {
@@ -312,12 +312,12 @@ mod tests {
         let (b, cb) = generate_payload(2, 4096);
         assert_ne!(a, b);
         assert_ne!(ca, cb);
-        assert_eq!(crc32c::crc32c(&a), ca);
+        assert_eq!(crate::util::crc32c(&a), ca);
     }
 
     #[test]
     fn zipf_and_hotset_skew() {
-        let mut rng = Xoshiro256PlusPlus::seed_from_u64(7);
+        let mut rng = SmallRng::seed_from_u64(7);
         let z = Picker::new(100, Access::Zipf(1.2));
         let hits0 = (0..10_000).filter(|_| z.pick(&mut rng) == 0).count();
         assert!(hits0 > 1500, "zipf head too cold: {hits0}");

@@ -52,7 +52,6 @@ opendal-core = { version = "0.59", default-features = false, features = [
 ] }
 
 await-tree = "0.3"
-moka = { version = "0.12", features = ["future"] }
 
 hyper = { version = "1", features = ["client", "server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["server", "server-auto", "http1", "http2", "tokio"] }
@@ -81,12 +80,7 @@ tokio = { version = "1.52", features = [
   "signal",
 ] }
 hdrhistogram = "7.5"
-crc32c = "0.6"
-rand = "0.8"
-rand_xoshiro = "0.6"
-sysinfo = { version = "0.32", default-features = false, features = ["system"] }
-ratatui = "0.30"
-crossterm = "0.29"
+rand = { version = "0.8", features = ["small_rng"] }
 clap = { version = "4.5", features = ["derive", "env", "wrap_help"] }
 clap_complete = "4.5"
 clap_mangen = "0.2"
@@ -94,7 +88,6 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["float_roundtrip"] }
 toml = "0.8"
 anyhow = "1.0"
-humantime = "2"
 
 [dev-dependencies]
 tempfile = "3"
