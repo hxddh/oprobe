@@ -1,0 +1,30 @@
+[target]
+name = "Backblaze B2 S3-Compatible"
+scheme = "s3"
+
+[target.options]
+bucket = "replace-with-b2-bucket"
+region = "us-west-004"
+endpoint = "https://s3.us-west-004.backblazeb2.com"
+root = "/oprobe-bench"
+
+[workload]
+kind = "mixed_read_write"
+rounds = 32
+object_size_mib = 4
+verify_crc32c = true
+enable_foyer_cache = true
+foyer_memory_mib = 128
+internet_egress_ratio = 0.25
+
+[sla]
+max_p99_ms = 260.0
+min_throughput_mib_s = 80.0
+max_read_amplification = 2.0
+
+[pricing]
+provider_name = "Backblaze B2"
+storage_usd_per_gb_month = 0.006
+class_a_put_list_usd_per_million = 0.0
+class_b_get_head_usd_per_million = 0.40
+egress_usd_per_gb = 0.01

@@ -1,0 +1,17 @@
+[target]
+name = "In-Memory Zero-Setup Sandbox"
+scheme = "memory"
+
+[workload]
+kind = "parquet_point_lookup"
+rounds = 32
+object_size_mib = 4
+verify_crc32c = true
+enable_foyer_cache = true
+foyer_memory_mib = 64
+internet_egress_ratio = 0.15
+
+[sla]
+max_p99_ms = 50.0
+min_throughput_mib_s = 50.0
+max_read_amplification = 2.2

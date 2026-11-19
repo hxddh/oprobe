@@ -1,0 +1,30 @@
+[target]
+name = "AWS S3 Standard Production"
+scheme = "s3"
+
+[target.options]
+bucket = "replace-with-your-s3-bucket"
+region = "ap-northeast-1"
+endpoint = "https://s3.ap-northeast-1.amazonaws.com"
+root = "/oprobe-bench"
+
+[workload]
+kind = "parquet_point_lookup"
+rounds = 48
+object_size_mib = 8
+verify_crc32c = true
+enable_foyer_cache = true
+foyer_memory_mib = 256
+internet_egress_ratio = 0.10
+
+[sla]
+max_p99_ms = 180.0
+min_throughput_mib_s = 120.0
+max_read_amplification = 2.0
+
+[pricing]
+provider_name = "AWS S3 Standard"
+storage_usd_per_gb_month = 0.023
+class_a_put_list_usd_per_million = 5.00
+class_b_get_head_usd_per_million = 0.40
+egress_usd_per_gb = 0.09

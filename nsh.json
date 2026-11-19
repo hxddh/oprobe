@@ -1,0 +1,9 @@
+{
+  "name": "oprobe",
+  "id": "io.github.hxddh.oprobe",
+  "version": "0.1.0",
+  "appearance": "dark",
+  "theme": "theme.json",
+  "rust": "native",
+  "root": "App"
+}

@@ -1,0 +1,36 @@
+[workspace]
+
+[package]
+name = "nsh-app-oprobe"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Native Shell (NSH) dual-surface GUI/TUI frontend for oprobe (targets GPUI, macOS AppKit, Windows Direct2D, Linux GTK4, and Terminal Cell Grid)"
+repository = "https://github.com/hxddh/oprobe"
+
+[lib]
+name = "nsh_app_oprobe"
+path = "src/lib.rs"
+
+[[bin]]
+name = "oprobe-desktop"
+path = "src/main.rs"
+
+[dependencies]
+oprobe = { path = ".." }
+nsh-core = { git = "https://github.com/longbridge/nsh.git" }
+nsh-base = { git = "https://github.com/longbridge/nsh.git" }
+env_logger = "0.11"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nsh-platform-linux = { git = "https://github.com/longbridge/nsh.git" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+nsh-platform-macos = { git = "https://github.com/longbridge/nsh.git" }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+nsh-platform-windows = { git = "https://github.com/longbridge/nsh.git" }
+
+[dev-dependencies]
+nsh-engine = { git = "https://github.com/longbridge/nsh.git", default-features = false }
+nsh-testing = { git = "https://github.com/longbridge/nsh.git", default-features = false }
