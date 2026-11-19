@@ -347,8 +347,23 @@ impl Session {
                 let mut max_lag = Duration::ZERO;
                 let mut seq = 0u64;
                 let mut handles = Vec::new();
-                while !should_stop() {
-                    tokio::time::sleep_until(next.into()).await;
+                'arrivals: while !should_stop() {
+                    // Never sleep past the window or through a cancellation: wake at the next
+                    // arrival, the deadline, or every 100 ms to check for Ctrl-C / Stop.
+                    if next >= deadline {
+                        break;
+                    }
+                    loop {
+                        let now = Instant::now();
+                        if now >= next {
+                            break;
+                        }
+                        let wake = next.min(deadline).min(now + Duration::from_millis(100));
+                        tokio::time::sleep_until(wake.into()).await;
+                        if should_stop() {
+                            break 'arrivals;
+                        }
+                    }
                     let lag = next.elapsed();
                     max_lag = max_lag.max(lag);
                     match cap.clone().try_acquire_owned() {

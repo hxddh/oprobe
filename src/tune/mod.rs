@@ -10,7 +10,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::analysis::cost::cost_report;
-use crate::config::{Access, Knobs, OpKind};
+use crate::config::{Access, Knobs, OpKind, TransportMode};
 use crate::engine::{RunOptions, Session};
 use crate::net::HttpVersion;
 use crate::report::TuneSummary;
@@ -98,6 +98,8 @@ struct Tuner<'a> {
     use_bytes: bool,
     on_event: Arc<dyn Fn(TuneEvent) + Send + Sync>,
     max_retry_after_ms: u64,
+    /// Concurrency limit once a throttling ceiling is known (80 % of it): no winner may exceed it.
+    concurrency_cap: Option<usize>,
 }
 
 impl Tuner<'_> {
@@ -201,15 +203,24 @@ impl Tuner<'_> {
         self.trials.len() < self.opts.max_trials && !self.session.cancel.is_cancelled()
     }
 
+    /// Trials that may win: not a confirmation run, and within the throttling headroom cap.
+    fn eligible(&self, i: usize) -> bool {
+        let t = &self.trials[i];
+        t.stage != "confirm"
+            && self
+                .concurrency_cap
+                .is_none_or(|cap| t.knobs.concurrency <= cap)
+    }
+
     /// Index of the best trial for the objective (feasible ones first).
     fn best(&self) -> Option<usize> {
         let pool: Vec<usize> = {
             let f: Vec<usize> = (0..self.trials.len())
-                .filter(|&i| self.trials[i].feasible && self.trials[i].stage != "confirm")
+                .filter(|&i| self.trials[i].feasible && self.eligible(i))
                 .collect();
             if f.is_empty() {
                 (0..self.trials.len())
-                    .filter(|&i| self.trials[i].stage != "confirm")
+                    .filter(|&i| self.eligible(i))
                     .collect()
             } else {
                 f
@@ -304,6 +315,7 @@ pub async fn tune(
         use_bytes: false,
         on_event,
         max_retry_after_ms: 0,
+        concurrency_cap: None,
     };
     let base_knobs = p.knobs.clone();
     let baseline = t.trial("baseline", &base_knobs, None).await?;
@@ -396,6 +408,7 @@ pub async fn tune(
     let mut current = t.best().unwrap_or(baseline);
     if let Some(ce) = ceiling {
         let safe = ((ce as f64) * 0.8).floor().max(1.0) as usize;
+        t.concurrency_cap = Some(safe);
         if t.trials[current].knobs.concurrency > safe {
             let k = Knobs {
                 concurrency: safe,
@@ -524,11 +537,15 @@ pub async fn tune(
         }
     }
     if p.target.endpoint().is_some_and(|e| e.starts_with("https")) && t.budget_left() {
+        // Compare the two protocols the measured client can actually speak: OpenDAL's reqwest
+        // client is HTTP/1.1 unless h2 is requested (`Auto` == `H1` there); the microscope pool
+        // negotiates h2 by ALPN under `Auto`.
         let mut k = t.trials[current].knobs.clone();
-        k.http_version = if k.http_version == HttpVersion::H1 {
-            HttpVersion::Auto
-        } else {
-            HttpVersion::H1
+        k.http_version = match (k.transport, k.http_version) {
+            (TransportMode::Opendal, HttpVersion::H2) => HttpVersion::Auto,
+            (TransportMode::Opendal, _) => HttpVersion::H2,
+            (TransportMode::Microscope, HttpVersion::H1) => HttpVersion::Auto,
+            (TransportMode::Microscope, _) => HttpVersion::H1,
         };
         let id = t.trial("http_version", &k, None).await?;
         if t.better(id, current) {

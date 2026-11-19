@@ -296,6 +296,27 @@ pub struct DialRecord {
     pub cipher: String,
 }
 
+/// Marks one HTTP request in flight for its whole life: dropping it (normal completion, error,
+/// or the request future being cancelled by a timeout / tail-cut) releases the slot exactly once.
+pub struct InflightGuard(Option<Arc<Recorder>>);
+
+impl InflightGuard {
+    pub fn start(rec: Option<Arc<Recorder>>) -> Self {
+        if let Some(r) = &rec {
+            r.request_started();
+        }
+        Self(rec)
+    }
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        if let Some(r) = &self.0 {
+            r.request_finished();
+        }
+    }
+}
+
 /// Central sink shared by the transport, OpenDAL layers and workload workers.
 pub struct Recorder {
     phase: AtomicU8,

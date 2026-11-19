@@ -453,6 +453,12 @@ async fn tuner_finds_throttling_ceiling() {
     let ceiling = out.summary.throttle_ceiling.expect("ceiling detected");
     assert!((4..=16).contains(&ceiling), "ceiling {ceiling}");
     assert!(out.winner.concurrency < ceiling);
+    // The headroom cap (80 % of the ceiling) holds for the exported winner too.
+    assert!(
+        out.winner.concurrency <= (ceiling as f64 * 0.8).floor().max(1.0) as usize,
+        "winner {} exceeds 80% of ceiling {ceiling}",
+        out.winner.concurrency
+    );
     assert!(
         out.winner_snapshot.resilience.throttled_responses == 0,
         "winner must be clean"
@@ -703,4 +709,55 @@ async fn early_close_throttling_is_retried() {
 #[tokio::test(flavor = "multi_thread")]
 async fn early_close_throttling_is_retried_microscope() {
     early_close_throttling_is_retried_with(TransportMode::Microscope).await;
+}
+
+/// Requests abandoned by the operation timeout must release their in-flight slot: a leak would
+/// make the in-flight count (and its peak) grow with every timeout.
+async fn timeouts_do_not_leak_inflight_requests_with(mode: TransportMode) {
+    let lab = lab(LabConfig {
+        straggler_every_n: 2,
+        straggler_delay: Duration::from_millis(800),
+        ..Default::default()
+    })
+    .await;
+    let mut p = lab.profile("bkt");
+    p.knobs.transport = mode;
+    small(&mut p, Preset::SmallFiles);
+    p.knobs.concurrency = 2;
+    p.knobs.io_concurrency = 1;
+    p.knobs.retries = 0;
+    p.knobs.timeout = oprobe::util::HumanDuration(Duration::from_millis(60));
+    let (s, _, _) = run_once(p, 1500).await;
+    assert!(s.summary.failed_ops > 3, "expected timeouts, got {:?}", s.verbs);
+    assert!(
+        s.connections.peak_inflight_requests <= 4,
+        "in-flight requests leaked: peak {}",
+        s.connections.peak_inflight_requests
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn timeouts_do_not_leak_inflight_requests() {
+    timeouts_do_not_leak_inflight_requests_with(TransportMode::Opendal).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn timeouts_do_not_leak_inflight_requests_microscope() {
+    timeouts_do_not_leak_inflight_requests_with(TransportMode::Microscope).await;
+}
+
+/// An open-loop arrival interval longer than the window must not run past it.
+#[tokio::test(flavor = "multi_thread")]
+async fn open_loop_never_runs_past_the_window() {
+    let mut p = Profile::from_target(TargetSpec::from_url("memory://").unwrap());
+    small(&mut p, Preset::SmallFiles);
+    let s = Session::open(p, Cancel::new(), quiet()).await.unwrap();
+    let mut o = opts(1000);
+    o.warmup = Duration::ZERO;
+    o.rate = Some(0.2); // one arrival every 5 s
+    let t = std::time::Instant::now();
+    let snap = s.run(&s.profile.knobs.clone(), &o, None).await.unwrap();
+    s.close().await;
+    assert!(t.elapsed() < Duration::from_secs(3), "took {:?}", t.elapsed());
+    assert!(snap.summary.ops <= 1, "issued {} ops", snap.summary.ops);
 }

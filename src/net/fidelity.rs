@@ -38,7 +38,7 @@ use super::tls::{InsecureCertVerifier, crypto_provider};
 use super::{HttpVersion, TransportConfig};
 use crate::trace::model::{Protocol, RequestRecord, RequestTiming, classify_http};
 use crate::trace::recorder::DialRecord;
-use crate::trace::{OpScope, Recorder};
+use crate::trace::{InflightGuard, OpScope, Recorder};
 
 // ---------------------------------------------------------------------------------------------
 // Dial timing (task-local while reqwest's connector future runs)
@@ -489,13 +489,11 @@ struct Finisher {
     scope: Option<Arc<OpScope>>,
     recorder: Option<Arc<Recorder>>,
     _permit: Option<OwnedSemaphorePermit>,
+    _inflight: InflightGuard,
 }
 
 impl Finisher {
     fn emit(record: RequestRecord, scope: &Option<Arc<OpScope>>, rec: &Option<Arc<Recorder>>) {
-        if let Some(r) = rec {
-            r.request_finished();
-        }
         match scope {
             Some(s) => s.push_request(record),
             None => {
@@ -633,9 +631,7 @@ impl HttpTransport for FidelityTransport {
         let method = parts.method.clone();
         let api = classify_http(&method, url.path(), url.query());
         let bytes_up = body.len() as u64;
-        if let Some(r) = &recorder {
-            r.request_started();
-        }
+        let inflight = InflightGuard::start(recorder.clone());
         let mut record = RequestRecord {
             api,
             method: method.to_string(),
@@ -791,6 +787,7 @@ impl HttpTransport for FidelityTransport {
             scope,
             recorder,
             _permit: permit,
+            _inflight: inflight,
         };
         let stream = TimedResponseBody {
             inner: Box::pin(resp.bytes_stream()),

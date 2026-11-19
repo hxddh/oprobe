@@ -25,7 +25,9 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use super::dial::{ConnClock, DialTiming, Dialer};
 use super::proxy::ProxyConfig;
 use super::tls::{TlsClientOptions, build_tls_connector};
-use crate::trace::{OpScope, Protocol, Recorder, RequestRecord, RequestTiming, classify_http};
+use crate::trace::{
+    InflightGuard, OpScope, Protocol, Recorder, RequestRecord, RequestTiming, classify_http,
+};
 
 /// HTTP protocol preference.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -405,6 +407,7 @@ struct Pending {
     scope: Option<Arc<OpScope>>,
     recorder: Option<Arc<Recorder>>,
     _permit: Option<OwnedSemaphorePermit>,
+    _inflight: InflightGuard,
     h1_return: Option<H1Return>,
 }
 
@@ -426,9 +429,6 @@ impl Pending {
         }
         if complete && let Some((inner, key, id, sender, clock)) = self.h1_return.take() {
             inner.return_h1(key, id, sender, clock);
-        }
-        if let Some(r) = &self.recorder {
-            r.request_finished();
         }
         match &self.scope {
             Some(s) => s.push_request(self.record),
@@ -565,9 +565,7 @@ impl HttpTransport for TracingTransport {
         let api = classify_http(&method, uri.path(), uri.query());
         let bytes_up = body_buf.len() as u64;
 
-        if let Some(r) = &recorder {
-            r.request_started();
-        }
+        let inflight = InflightGuard::start(recorder.clone());
         let start_offset_us = scope
             .as_ref()
             .map(|s| t_start.saturating_duration_since(s.started).as_micros() as u64)
@@ -593,9 +591,6 @@ impl HttpTransport for TracingTransport {
             record.error = Some(msg);
             record.timing.total_us = t_start.elapsed().as_micros() as u64;
             record.timing.queue_us = record.timing.total_us;
-            if let Some(r) = &recorder {
-                r.request_finished();
-            }
             match &scope {
                 Some(s) => s.push_request(record),
                 None => {
@@ -718,9 +713,6 @@ impl HttpTransport for TracingTransport {
                     .set_source(e);
                 record.error = Some(msg.clone());
                 record.timing.total_us = t_start.elapsed().as_micros() as u64;
-                if let Some(r) = &recorder {
-                    r.request_finished();
-                }
                 match &scope {
                     Some(s) => s.push_request(record),
                     None => {
@@ -782,6 +774,7 @@ impl HttpTransport for TracingTransport {
             scope,
             recorder,
             _permit: permit,
+            _inflight: inflight,
             h1_return: h1_sender.map(|s| (inner.clone(), key, id, s, clock)),
         };
         let mut out = Response::builder()
