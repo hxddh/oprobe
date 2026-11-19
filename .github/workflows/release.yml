@@ -63,10 +63,10 @@ jobs:
       - name: End-to-end CLI smoke test (run + tune + diff)
         if: matrix.run_tests
         run: |
-          cargo run --release --bin oprobe -- run --profile profiles/memory-quickstart.toml --rounds 8 --json baseline.json --markdown report.md --csv metrics.csv --quiet
-          cargo run --release --bin oprobe -- tune --profile profiles/memory-quickstart.toml --trial-rounds 4 --emit-profile tuned.toml --emit-rust operator.rs --emit-python operator.py --json candidate.json --quiet
-          cargo run --release --bin oprobe -- run --profile tuned.toml --rounds 8 --quiet
-          cargo run --release --bin oprobe -- diff baseline.json baseline.json
+          cargo run --release --target ${{ matrix.target }} --bin oprobe -- run --profile profiles/memory-quickstart.toml --rounds 8 --json baseline.json --markdown report.md --csv metrics.csv --quiet
+          cargo run --release --target ${{ matrix.target }} --bin oprobe -- tune --profile profiles/memory-quickstart.toml --trial-rounds 4 --emit-profile tuned.toml --emit-rust operator.rs --emit-python operator.py --json candidate.json --quiet
+          cargo run --release --target ${{ matrix.target }} --bin oprobe -- run --profile tuned.toml --rounds 8 --quiet
+          cargo run --release --target ${{ matrix.target }} --bin oprobe -- diff baseline.json baseline.json
 
       - name: Package release archive (Unix)
         if: startsWith(github.ref, 'refs/tags/v') && runner.os != 'Windows'

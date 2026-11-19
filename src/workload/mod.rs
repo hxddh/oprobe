@@ -558,11 +558,26 @@ pub async fn build_probed_operator(
     )?;
     let ctx = OperationContext::new().with_http_transport(HttpTransporter::new(transport));
 
+    let aux_transport = HyperWhiteboxTransport::try_new(
+        HyperTransportOptions {
+            pool_max_idle_per_host: 16,
+            keep_alive: true,
+            connect_timeout: Duration::from_secs(10),
+            tls: tls_opts.clone(),
+        },
+        None,
+    )?;
+    let aux_ctx = OperationContext::new().with_http_transport(HttpTransporter::new(aux_transport));
+
     let base_op = Operator::via_iter(&profile.target.scheme, clean_opts.clone())?;
     let cleanup_op = base_op
         .clone()
-        .with_context(ctx.clone())
-        .layer(TimeoutLayer::new().with_io_timeout(Duration::from_secs(15)))
+        .with_context(aux_ctx)
+        .layer(
+            TimeoutLayer::new()
+                .with_timeout(Duration::from_secs(60))
+                .with_io_timeout(Duration::from_secs(30)),
+        )
         .layer(RetryLayer::default().with_jitter().with_max_times(3));
 
     let retry_notify = TelemetryRegistry::make_retry_notify(telemetry.clone());
@@ -576,7 +591,11 @@ pub async fn build_probed_operator(
             telemetry.clone(),
             &profile.target.scheme,
         ))
-        .layer(TimeoutLayer::new().with_io_timeout(Duration::from_secs(15)));
+        .layer(
+            TimeoutLayer::new()
+                .with_timeout(Duration::from_secs(60))
+                .with_io_timeout(Duration::from_secs(30)),
+        );
 
     if knob.enable_tail_cut {
         op = op.layer(
@@ -736,6 +755,7 @@ async fn execute_single_op(
     seq: u64,
     fixture: &PreparedFixture,
     op: &Operator,
+    aux_op: &Operator,
     telemetry: &Arc<TelemetryRegistry>,
     tracker: &RemoteObjectTracker,
 ) -> Result<()> {
@@ -904,31 +924,28 @@ async fn execute_single_op(
                 }
             }
 
-            // Sampled end-to-end readback CRC32C check (first 2 shards + every 8th shard) without polluting measure phase
+            // Sampled end-to-end readback CRC32C check via unprobed `aux_op` so concurrent
+            // measurement workers never race on `telemetry.phase` or pollute measured counters.
             if *verify && (seq < 2 || seq.is_multiple_of(8)) {
-                let prev_phase = telemetry.phase();
-                telemetry.set_phase(MeasurementPhase::Verify);
                 let t_crc = Instant::now();
-                if let Ok(rb) = op.read(&path).await {
-                    if crc32c::crc32c(&rb.to_bytes()) == digest {
-                        telemetry.crc_verified_ok.fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        telemetry.crc_corrupted.fetch_add(1, Ordering::Relaxed);
+                if let Ok(rb) = aux_op.read(&path).await {
+                    if telemetry.is_measuring() {
+                        if crc32c::crc32c(&rb.to_bytes()) == digest {
+                            telemetry.crc_verified_ok.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            telemetry.crc_corrupted.fetch_add(1, Ordering::Relaxed);
+                        }
+                        telemetry
+                            .sum_verify_crc_us
+                            .fetch_add(t_crc.elapsed().as_micros() as u64, Ordering::Relaxed);
                     }
                 }
-                telemetry
-                    .sum_verify_crc_us
-                    .fetch_add(t_crc.elapsed().as_micros() as u64, Ordering::Relaxed);
-                telemetry.set_phase(prev_phase);
             }
 
-            // Eagerly delete completed transient shard to bound peak storage footprint during long streaming runs
-            let prev_phase = telemetry.phase();
-            telemetry.set_phase(MeasurementPhase::Cleanup);
-            if op.delete(&path).await.is_ok() {
+            // Eagerly delete completed transient shard via unprobed `aux_op` to bound peak storage footprint
+            if aux_op.delete(&path).await.is_ok() {
                 tracker.record_deleted(&path);
             }
-            telemetry.set_phase(prev_phase);
         }
         PreparedFixture::Metadata { partition_prefixes } => {
             let prefix = &partition_prefixes[(seq as usize) % partition_prefixes.len()];
@@ -1039,28 +1056,24 @@ async fn execute_single_op(
                 }
 
                 if *verify && seq == 0 {
-                    let prev_phase = telemetry.phase();
-                    telemetry.set_phase(MeasurementPhase::Verify);
                     let t_crc = Instant::now();
-                    if let Ok(rb) = op.read(&w_path).await {
-                        if crc32c::crc32c(&rb.to_bytes()) == crc {
-                            telemetry.crc_verified_ok.fetch_add(1, Ordering::Relaxed);
-                        } else {
-                            telemetry.crc_corrupted.fetch_add(1, Ordering::Relaxed);
+                    if let Ok(rb) = aux_op.read(&w_path).await {
+                        if telemetry.is_measuring() {
+                            if crc32c::crc32c(&rb.to_bytes()) == crc {
+                                telemetry.crc_verified_ok.fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                telemetry.crc_corrupted.fetch_add(1, Ordering::Relaxed);
+                            }
+                            telemetry
+                                .sum_verify_crc_us
+                                .fetch_add(t_crc.elapsed().as_micros() as u64, Ordering::Relaxed);
                         }
                     }
-                    telemetry
-                        .sum_verify_crc_us
-                        .fetch_add(t_crc.elapsed().as_micros() as u64, Ordering::Relaxed);
-                    telemetry.set_phase(prev_phase);
                 }
 
-                let prev_phase = telemetry.phase();
-                telemetry.set_phase(MeasurementPhase::Cleanup);
-                if op.delete(&w_path).await.is_ok() {
+                if aux_op.delete(&w_path).await.is_ok() {
                     tracker.record_deleted(&w_path);
                 }
-                telemetry.set_phase(prev_phase);
             } else {
                 // 80% Range Read path
                 let (base_path, _) = &base_files[(seq as usize) % base_files.len()];
@@ -1116,6 +1129,7 @@ async fn run_worker_pool_window(
     window_duration: Option<Duration>,
     fixture: &PreparedFixture,
     op: &Operator,
+    aux_op: &Operator,
     telemetry: &Arc<TelemetryRegistry>,
     tracker: &RemoteObjectTracker,
     cancel_flag: &Arc<AtomicBool>,
@@ -1128,6 +1142,7 @@ async fn run_worker_pool_window(
         let seq_c = seq_counter.clone();
         let fix_c = fixture.clone();
         let op_c = op.clone();
+        let aux_c = aux_op.clone();
         let tel_c = telemetry.clone();
         let trk_c = tracker.clone();
         let cancel_c = cancel_flag.clone();
@@ -1156,8 +1171,10 @@ async fn run_worker_pool_window(
                     PreparedFixture::Mixed { .. } => "mixed_rw",
                 });
                 let (root, _guard) = tel_c.register_active_task(seq + 1, task_label);
-                root.instrument(execute_single_op(seq, &fix_c, &op_c, &tel_c, &trk_c))
-                    .await?;
+                root.instrument(execute_single_op(
+                    seq, &fix_c, &op_c, &aux_c, &tel_c, &trk_c,
+                ))
+                .await?;
             }
             Ok::<(), anyhow::Error>(())
         }));
@@ -1272,6 +1289,7 @@ pub async fn execute_workload_with_options(
                     Some(warm_dur),
                     &fixture,
                     &op,
+                    &cleanup_op,
                     &telemetry,
                     &tracker,
                     &cancel_flag,
@@ -1289,6 +1307,7 @@ pub async fn execute_workload_with_options(
             duration_window,
             &fixture,
             &op,
+            &cleanup_op,
             &telemetry,
             &tracker,
             &cancel_flag,

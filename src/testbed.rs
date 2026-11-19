@@ -103,6 +103,7 @@ struct MultipartUploadState {
 struct S3Store {
     objects: RwLock<BTreeMap<String, StoredObject>>,
     uploads: RwLock<HashMap<String, MultipartUploadState>>,
+    completed_uploads: RwLock<HashMap<String, String>>,
     req_seq: AtomicU64,
     upload_seq: AtomicU64,
     active_inflight: AtomicUsize,
@@ -521,11 +522,27 @@ async fn handle_s3_request(
                     xml_escape(&st.key),
                     xml_escape(&etag)
                 );
+                if let Ok(mut done) = store.completed_uploads.write() {
+                    done.insert(upload_id.clone(), comp_xml.clone());
+                }
                 return Ok(Response::builder()
                     .status(StatusCode::OK)
                     .header("content-type", "application/xml")
                     .header("x-amz-request-id", &req_id)
                     .body(full_body(comp_xml))
+                    .unwrap());
+            }
+            if let Some(prev_xml) = store
+                .completed_uploads
+                .read()
+                .ok()
+                .and_then(|done| done.get(upload_id).cloned())
+            {
+                return Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/xml")
+                    .header("x-amz-request-id", &req_id)
+                    .body(full_body(prev_xml))
                     .unwrap());
             }
             return Ok(Response::builder()
@@ -786,6 +803,7 @@ impl S3ChaosServer {
         let store = Arc::new(S3Store {
             objects: RwLock::new(BTreeMap::new()),
             uploads: RwLock::new(HashMap::new()),
+            completed_uploads: RwLock::new(HashMap::new()),
             req_seq: AtomicU64::new(0),
             upload_seq: AtomicU64::new(0),
             active_inflight: AtomicUsize::new(0),
