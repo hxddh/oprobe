@@ -296,7 +296,7 @@ impl Dialer {
         let t = Instant::now();
         let tcp = timeout(
             step,
-            TcpStream::connect(&addrs[..])
+            happy_eyeballs(&addrs)
                 .instrument_await(await_tree::span!("tcp {conn_host}:{conn_port}")),
         )
         .await
@@ -438,4 +438,76 @@ pub(crate) async fn read_response_head<S: AsyncRead + Unpin>(s: &mut S) -> io::R
 pub(crate) async fn write_all<S: AsyncWrite + Unpin>(s: &mut S, data: &[u8]) -> io::Result<()> {
     s.write_all(data).await?;
     s.flush().await
+}
+
+/// Interleave address families (RFC 8305 §4): v6, v4, v6, v4, ...
+fn interleave(addrs: &[SocketAddr]) -> Vec<SocketAddr> {
+    let (v6, v4): (Vec<SocketAddr>, Vec<SocketAddr>) = addrs.iter().partition(|a| a.is_ipv6());
+    let first_v6 = addrs.first().is_some_and(|a| a.is_ipv6());
+    let (a, b) = if first_v6 { (v6, v4) } else { (v4, v6) };
+    let mut out = Vec::with_capacity(addrs.len());
+    for i in 0..a.len().max(b.len()) {
+        out.extend(a.get(i).copied());
+        out.extend(b.get(i).copied());
+    }
+    out
+}
+
+/// Happy Eyeballs connect: start the next address 250 ms after the previous one (or as soon
+/// as it fails), first successful connection wins. Avoids multi-second stalls on hosts where
+/// one address family is unreachable (e.g. `localhost` → `::1` with an IPv4-only listener).
+async fn happy_eyeballs(addrs: &[SocketAddr]) -> io::Result<TcpStream> {
+    use futures::stream::{FuturesUnordered, StreamExt};
+    const STAGGER: Duration = Duration::from_millis(250);
+    let order = interleave(addrs);
+    let mut pending = FuturesUnordered::new();
+    let mut next = 0;
+    let mut last_err = None;
+    loop {
+        if next < order.len() {
+            pending.push(TcpStream::connect(order[next]));
+            next += 1;
+        }
+        if pending.is_empty() {
+            return Err(last_err.unwrap_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "no addresses to connect to")
+            }));
+        }
+        let more = next < order.len();
+        tokio::select! {
+            res = pending.next() => match res {
+                Some(Ok(s)) => return Ok(s),
+                Some(Err(e)) => last_err = Some(e),
+                None => {}
+            },
+            _ = tokio::time::sleep(STAGGER), if more => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interleaves_families() {
+        let a: Vec<SocketAddr> = ["[::1]:1", "[::2]:1", "127.0.0.1:1", "127.0.0.2:1"]
+            .iter()
+            .map(|s| s.parse().unwrap())
+            .collect();
+        let o = interleave(&a);
+        assert!(o[0].is_ipv6() && o[1].is_ipv4() && o[2].is_ipv6() && o[3].is_ipv4());
+    }
+
+    #[tokio::test]
+    async fn falls_back_quickly_from_dead_address() {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let good = l.local_addr().unwrap();
+        // 10.255.255.1 is unroutable: connect would hang; the good address must win fast.
+        let dead: SocketAddr = "10.255.255.1:9".parse().unwrap();
+        let t = Instant::now();
+        let s = happy_eyeballs(&[dead, good]).await.unwrap();
+        assert_eq!(s.peer_addr().unwrap(), good);
+        assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+    }
 }
