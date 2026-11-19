@@ -1,23 +1,28 @@
-//! `/` Minibuffer 命令栏解析器（由内置 Ratatui 终端工作台与 `native/` NSH 双端工作台共同复用）：
-//! 支持动态切换后端 Scheme、注入桶/Endpoint 参数、修改并发与分块旋钮、发起网络微秒探测与落盘报告。
+//! `/` & `:` Minibuffer command parser for the interactive `oprobe tui` workbench.
+
+use std::time::Duration;
 
 use crate::autotune::TuneKnob;
 use crate::cost::CloudPricingProfile;
-use crate::workload::{ProfileConfig, WorkloadKind};
+use crate::workload::{parse_duration_str, ProfileConfig, WorkloadKind};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum MinibufferCommand {
     Workload(WorkloadKind),
     Scheme(String),
+    Url(String),
     SetOption { key: String, value: String },
     Concurrency(usize),
     ChunkKiB(usize),
     GapKiB(usize),
+    DurationWindow(Option<Duration>),
+    Rounds(usize),
     Foyer(bool),
     TailCut(bool),
     KeepAlive(bool),
     PricingPreset(String),
     ProbeOnce,
+    StreamRun(Duration),
     AutoTune,
     NetProbe(String),
     ExportReport(String),
@@ -33,11 +38,11 @@ fn parse_bool_flag(raw: &str) -> Result<bool, String> {
     }
 }
 
-/// 解析用户在 `/` 或 `:` 命令栏输入的指令字符串
+/// Parse a minibuffer command string (leading `/` or `:` is optional).
 pub fn parse_minibuffer_command(input: &str) -> Result<MinibufferCommand, String> {
     let trimmed = input.trim().trim_start_matches(['/', ':']).trim();
     if trimmed.is_empty() {
-        return Err("empty command (type `help` for available commands)".to_owned());
+        return Err("empty command (type `help` or press `?` for syntax)".to_owned());
     }
 
     let mut parts = trimmed.splitn(2, char::is_whitespace);
@@ -48,23 +53,28 @@ pub fn parse_minibuffer_command(input: &str) -> Result<MinibufferCommand, String
         "q" | "quit" | "exit" => Ok(MinibufferCommand::Quit),
         "h" | "help" | "?" => Ok(MinibufferCommand::Help),
         "probe" | "run" => Ok(MinibufferCommand::ProbeOnce),
+        "stream" => {
+            let dur = if rest.is_empty() {
+                Duration::from_secs(10)
+            } else {
+                parse_duration_str(rest).map_err(|e| e.to_string())?
+            };
+            Ok(MinibufferCommand::StreamRun(dur))
+        }
         "tune" | "autotune" => Ok(MinibufferCommand::AutoTune),
-        "w" | "workload" => match rest.to_ascii_lowercase().as_str() {
-            "1" | "parquet" => Ok(MinibufferCommand::Workload(WorkloadKind::ParquetPointLookup)),
-            "2" | "ckpt" | "multipart" => {
-                Ok(MinibufferCommand::Workload(WorkloadKind::CheckpointMultipart))
+        "w" | "workload" => WorkloadKind::from_slug(rest)
+            .map(MinibufferCommand::Workload)
+            .map_err(|e| e.to_string()),
+        "url" | "target" => {
+            if rest.is_empty() {
+                Err("usage: url <s3://bucket/prefix | fs:///tmp/bench | memory://>".to_owned())
+            } else {
+                Ok(MinibufferCommand::Url(rest.to_owned()))
             }
-            "3" | "meta" | "list" => {
-                Ok(MinibufferCommand::Workload(WorkloadKind::MetadataPrefixStorm))
-            }
-            "4" | "mixed" | "rw" => Ok(MinibufferCommand::Workload(WorkloadKind::MixedReadWrite)),
-            other => Err(format!(
-                "unknown workload `{other}` (use parquet | ckpt | meta | mixed)"
-            )),
-        },
+        }
         "scheme" | "backend" => {
             if rest.is_empty() {
-                Err("usage: scheme <memory|fs|s3|gcs|b2|oss|azblob|cos|webdav>".to_owned())
+                Err("usage: scheme <memory|fs|s3|gcs|b2|oss|azblob|cos|webdav|http>".to_owned())
             } else {
                 Ok(MinibufferCommand::Scheme(rest.to_ascii_lowercase()))
             }
@@ -100,12 +110,26 @@ pub fn parse_minibuffer_command(input: &str) -> Result<MinibufferCommand, String
                 .map_err(|_| format!("invalid gap KiB `{rest}`"))?;
             Ok(MinibufferCommand::GapKiB(kib.clamp(0, 16_384)))
         }
+        "duration" | "dur" => {
+            if rest.eq_ignore_ascii_case("off") || rest.eq_ignore_ascii_case("none") {
+                Ok(MinibufferCommand::DurationWindow(None))
+            } else {
+                let d = parse_duration_str(rest).map_err(|e| e.to_string())?;
+                Ok(MinibufferCommand::DurationWindow(Some(d)))
+            }
+        }
+        "rounds" => {
+            let r = rest
+                .parse::<usize>()
+                .map_err(|_| format!("invalid rounds `{rest}`"))?;
+            Ok(MinibufferCommand::Rounds(r.clamp(1, 100_000)))
+        }
         "foyer" | "cache" => Ok(MinibufferCommand::Foyer(parse_bool_flag(rest)?)),
         "tailcut" | "hedge" => Ok(MinibufferCommand::TailCut(parse_bool_flag(rest)?)),
         "keepalive" | "pool" => Ok(MinibufferCommand::KeepAlive(parse_bool_flag(rest)?)),
         "pricing" | "cloud" => {
             if rest.is_empty() {
-                Err("usage: pricing <s3|r2|b2>".to_owned())
+                Err("usage: pricing <s3|r2|gcs|oss|b2>".to_owned())
             } else {
                 Ok(MinibufferCommand::PricingPreset(rest.to_ascii_lowercase()))
             }
@@ -125,11 +149,11 @@ pub fn parse_minibuffer_command(input: &str) -> Result<MinibufferCommand, String
             };
             Ok(MinibufferCommand::ExportReport(prefix.to_owned()))
         }
-        other => Err(format!("unknown command `{other}` (type `:help` for syntax)")),
+        other => Err(format!("unknown command `{other}` (type `:help` or press `?`)")),
     }
 }
 
-/// 将不涉及异步任务的纯状态修改应用到 `ProfileConfig` 与 `TuneKnob`
+/// Apply synchronous configuration mutations to [`ProfileConfig`] and [`TuneKnob`].
 pub fn apply_state_mutation(
     cmd: &MinibufferCommand,
     profile: &mut ProfileConfig,
@@ -138,8 +162,16 @@ pub fn apply_state_mutation(
     match cmd {
         MinibufferCommand::Workload(kind) => {
             profile.workload.kind = *kind;
-            Some(format!("切换负载模型 -> {}", kind.title()))
+            Some(format!("Switched workload -> {}", kind.title()))
         }
+        MinibufferCommand::Url(u) => match ProfileConfig::from_storage_url(u, None, None, false, None) {
+            Ok(next) => {
+                profile.target = next.target;
+                profile.pricing = next.pricing;
+                Some(format!("Configured target from URL -> {u}"))
+            }
+            Err(e) => Some(format!("Invalid URL `{u}`: {e}")),
+        },
         MinibufferCommand::Scheme(s) => {
             profile.target.scheme = s.clone();
             profile.target.name = format!("{s} target");
@@ -149,46 +181,72 @@ pub fn apply_state_mutation(
                     .options
                     .insert("root".to_owned(), "/tmp/oprobe_fs_bench".to_owned());
             }
-            Some(format!("切换存储后端 -> scheme={s}"))
+            Some(format!("Switched storage backend -> scheme={s}"))
         }
         MinibufferCommand::SetOption { key, value } => {
             profile.target.options.insert(key.clone(), value.clone());
-            Some(format!("已写入后端参数 {key}={value}"))
+            Some(format!("Updated target option {key}={value}"))
         }
         MinibufferCommand::Concurrency(n) => {
             knob.concurrent = *n;
-            Some(format!("已更新并发上限 concurrent={n}"))
+            Some(format!("Updated concurrency limit -> concurrent={n}"))
         }
         MinibufferCommand::ChunkKiB(kib) => {
             knob.chunk_bytes = kib * 1024;
-            Some(format!("已更新分块尺寸 chunk={kib} KiB"))
+            Some(format!("Updated I/O chunk size -> chunk={kib} KiB"))
         }
         MinibufferCommand::GapKiB(kib) => {
             knob.range_gap_bytes = kib * 1024;
-            Some(format!("已更新稀疏合并窗口 gap={kib} KiB"))
+            Some(format!("Updated range coalesce gap -> gap={kib} KiB"))
+        }
+        MinibufferCommand::DurationWindow(dur) => {
+            profile.workload.duration_secs = dur.map(|d| d.as_secs_f64());
+            match dur {
+                Some(d) => Some(format!("Set streaming window -> {:.1}s", d.as_secs_f64())),
+                None => Some("Cleared duration window (using deterministic rounds)".to_owned()),
+            }
+        }
+        MinibufferCommand::Rounds(r) => {
+            profile.workload.rounds = *r;
+            profile.workload.duration_secs = None;
+            Some(format!("Set deterministic rounds -> {r}"))
         }
         MinibufferCommand::Foyer(on) => {
             knob.enable_foyer = *on;
-            Some(format!("FoyerLayer 本地混合缓存 -> {}", if *on { "ON" } else { "OFF" }))
+            Some(format!(
+                "Local W-TinyLFU Cache -> {}",
+                if *on { "ON" } else { "OFF" }
+            ))
         }
         MinibufferCommand::TailCut(on) => {
             knob.enable_tail_cut = *on;
-            Some(format!("TailCutLayer 长尾对冲 -> {}", if *on { "ON" } else { "OFF" }))
+            Some(format!(
+                "TailCutLayer Straggler Hedging -> {}",
+                if *on { "ON" } else { "OFF" }
+            ))
         }
         MinibufferCommand::KeepAlive(on) => {
             knob.keep_alive = *on;
-            Some(format!("HTTP 连接池复用 -> {}", if *on { "ON" } else { "OFF" }))
+            Some(format!(
+                "HTTP Connection Pool Reuse -> {}",
+                if *on { "ON" } else { "OFF" }
+            ))
         }
         MinibufferCommand::PricingPreset(p) => {
             profile.pricing = match p.as_str() {
                 "r2" | "cloudflare" => CloudPricingProfile::cloudflare_r2(),
+                "gcs" | "google" => CloudPricingProfile::google_gcs_standard(),
+                "oss" | "alibaba" | "aliyun" => CloudPricingProfile::alibaba_oss_standard(),
                 "b2" | "backblaze" => CloudPricingProfile::backblaze_b2(),
                 _ => CloudPricingProfile::aws_s3_standard(),
             };
-            Some(format!("切换成本模型 -> {}", profile.pricing.provider_name))
+            Some(format!(
+                "Switched FinOps baseline -> {}",
+                profile.pricing.provider_name
+            ))
         }
         MinibufferCommand::Help => Some(
-            "指令: workload parquet|ckpt|meta|mixed | scheme s3|fs|memory | set k=v | conc N | chunk KiB | gap KiB | net <url> | export <name> | tune | quit"
+            "Commands: url <uri> | scheme <s3|fs|memory> | set k=v | conc N | chunk KiB | gap KiB | stream 10s | tune | net <url> | export <name> | quit"
                 .to_owned(),
         ),
         _ => None,

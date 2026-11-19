@@ -1,3 +1,4 @@
+# Cloudflare R2 Zero-Egress AI Distributed Checkpoint Multipart Profile
 [target]
 name = "Cloudflare R2 Object Storage"
 scheme = "s3"
@@ -13,9 +14,18 @@ kind = "checkpoint_multipart"
 rounds = 16
 object_size_mib = 16
 verify_crc32c = true
-enable_foyer_cache = false
-foyer_memory_mib = 128
+enable_local_cache = false
+cache_memory_mib = 128
 internet_egress_ratio = 0.50
+auto_cleanup = true
+
+[knobs]
+concurrent = 16
+chunk_bytes = 8388608
+range_gap_bytes = 524288
+enable_cache = false
+enable_tail_cut = true
+keep_alive = true
 
 [sla]
 max_p99_ms = 350.0
@@ -28,3 +38,5 @@ storage_usd_per_gb_month = 0.015
 class_a_put_list_usd_per_million = 4.50
 class_b_get_head_usd_per_million = 0.36
 egress_usd_per_gb = 0.0
+baseline_stored_tb = 20.0
+monthly_logical_access_tb = 100.0

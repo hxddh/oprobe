@@ -1,0 +1,33 @@
+# Alibaba Cloud OSS AI Training Safetensors Checkpoint Multipart Profile
+[target]
+name = "Alibaba Cloud OSS Standard"
+scheme = "oss"
+
+[target.options]
+bucket = "replace-with-oss-bucket"
+endpoint = "https://oss-cn-hangzhou.aliyuncs.com"
+root = "/oprobe-bench"
+
+[workload]
+kind = "checkpoint_multipart"
+rounds = 16
+object_size_mib = 16
+verify_crc32c = true
+enable_local_cache = false
+cache_memory_mib = 128
+internet_egress_ratio = 0.05
+auto_cleanup = true
+
+[sla]
+max_p99_ms = 250.0
+min_throughput_mib_s = 160.0
+max_read_amplification = 1.5
+
+[pricing]
+provider_name = "Alibaba Cloud OSS"
+storage_usd_per_gb_month = 0.020
+class_a_put_list_usd_per_million = 1.40
+class_b_get_head_usd_per_million = 1.40
+egress_usd_per_gb = 0.07
+baseline_stored_tb = 25.0
+monthly_logical_access_tb = 100.0

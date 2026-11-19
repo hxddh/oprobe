@@ -1,19 +1,30 @@
-//! `oprobe` — Apache OpenDAL 存储栈白盒调优与故障显微镜核心库
+//! `oprobe` v1.0.0 — Production White-Box Cloud Storage Stack Microscope, TCP/TLS/HTTP
+//! Profiler, Multi-Cloud FinOps Analyzer, and Closed-Loop SLA Auto-Tuner powered by Apache OpenDAL.
 //!
-//! 核心能力域：
-//! - [`net_probe`]：微秒级 DNS 解析、TCP 三次握手、TLS 1.3 握手与 ALPN 协议协商底层探针；
-//! - [`telemetry`]：OpenDAL `Service` 语义层 + `HttpTransport` 传输层双切面六段式耗时瀑布、分动词独立 HDR 分位谱与 `AwaitTree` 慢协程栈；
-//! - [`workload`]：Xoshiro256++ 防重删数据载荷、CRC32C 端到端一致性校验及四大标准负载（Parquet 稀疏点查、AI 分片写入、元数据风暴、混合读写）；
-//! - [`cost`]：AWS S3 Standard、Cloudflare R2、Backblaze B2 请求放大与读放大月度 TCO 精算模型；
-//! - [`autotune`]：带 `503 SlowDown` 熔断保护的两阶段坐标下降参数寻优器，一键导出 Rust / Python / TOML 生产配置；
-//! - [`report`]：JSON 快照持久化、Markdown 诊断报告、CSV 矩阵导出与 `oprobe diff` CI 性能回归门禁；
-//! - [`tui`]：开箱即用的终端交互式工作台（内置 `/` Minibuffer 命令解析器，无需额外外部运行时）。
+//! ## Core Architecture
+//! - [`transport`]: Pure-Rust `HyperWhiteboxTransport` + `ProbedHttpConnector` measuring true per-socket
+//!   DNS lookup, TCP SYN/ACK RTT, TLS 1.2/1.3 + ALPN handshake, connection pool reuse vs cold dials,
+//!   post-write gateway TTFB, body streaming, and kernel-level wire RX/TX bytes without heuristics;
+//! - [`layers`]: OpenDAL middleware instrumentation (`ProbedSemaphore`, pure-Rust `WhiteboxCacheLayer`
+//!   backed by `moka` W-TinyLFU, and `WhiteboxObserveLayer` capturing `CompleteMultipartUpload` merge time);
+//! - [`telemetry`]: 7-stage latency waterfall, isolated per-verb HDR histograms, live 10ms `await-tree`
+//!   slow-request async call-stack capture, root-cause diagnosis, and human-friendly error hints;
+//! - [`workload`]: Anti-deduplication Xoshiro256++ payloads, CRC32C verification, deterministic &
+//!   time-window streaming load generation, and guaranteed remote test object auto-cleanup;
+//! - [`cost`]: 5-cloud FinOps TCO engine (AWS S3, Cloudflare R2, Google GCS, Alibaba OSS, Backblaze B2);
+//! - [`autotune`]: Closed-loop `429/503`-resilient SLA auto-tuner with binary cliff refinement & codegen;
+//! - [`report`]: JSON/Markdown/CSV/Terminal exporters and `oprobe diff` CI regression gate;
+//! - [`testbed`]: Built-in S3-compatible HTTP/1.1 + HTTP/2 + TLS 1.3 object storage & chaos server.
 
 pub mod autotune;
 pub mod cli;
 pub mod cost;
+pub mod layers;
 pub mod net_probe;
 pub mod report;
 pub mod telemetry;
+pub mod testbed;
+pub mod tls;
+pub mod transport;
 pub mod tui;
 pub mod workload;

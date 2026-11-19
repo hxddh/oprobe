@@ -1,15 +1,22 @@
 [package]
 name = "oprobe"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 rust-version = "1.91"
 license = "Apache-2.0"
-description = "White-box storage stack profiler, socket/TLS micro-probe, FinOps analyzer, and SLA auto-tuner powered by Apache OpenDAL"
+description = "Production white-box cloud storage stack profiler, TCP/TLS/HTTP microscope, FinOps analyzer, and SLA auto-tuner powered by Apache OpenDAL"
 repository = "https://github.com/hxddh/oprobe"
-homepage = "https://github.com/hxddh/oprobe"
 readme = "README.md"
-keywords = ["opendal", "s3", "benchmark", "profiler", "tui"]
+keywords = ["opendal", "s3", "benchmark", "profiler", "finops"]
 categories = ["command-line-utilities", "development-tools::profiling", "filesystem"]
+include = [
+  "src/**/*",
+  "profiles/**/*",
+  "Cargo.toml",
+  "README.md",
+  "CHANGELOG.md",
+  "LICENSE",
+]
 
 [lib]
 name = "oprobe"
@@ -20,7 +27,8 @@ name = "oprobe"
 path = "src/main.rs"
 
 [dependencies]
-opendal = { version = "0.59", features = [
+opendal = { version = "0.59", default-features = false, features = [
+  "executors-tokio",
   "services-memory",
   "services-fs",
   "services-s3",
@@ -30,26 +38,56 @@ opendal = { version = "0.59", features = [
   "services-azblob",
   "services-cos",
   "services-webdav",
+  "services-http",
   "layers-retry",
   "layers-timeout",
   "layers-tail-cut",
   "layers-concurrent-limit",
-  "layers-foyer",
   "layers-await-tree",
 ] }
-opendal-core = "0.59"
+opendal-core = { version = "0.59", default-features = false, features = [
+  "executors-tokio",
+  "services-memory",
+] }
 
 await-tree = "0.3"
-foyer = "0.22"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "http2"] }
-tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
-rustls-pki-types = "1"
-webpki-roots = "0.26"
+moka = { version = "0.12", features = ["future", "sync"] }
+
+hyper = { version = "1", features = ["client", "server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = [
+  "client",
+  "client-legacy",
+  "server",
+  "server-auto",
+  "http1",
+  "http2",
+  "tokio",
+] }
 http = "1"
+http-body = "1"
+http-body-util = "0.1"
+tower-service = "0.3"
+
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["tls12"] }
+oxitls-rustcrypto-provider = "0.3"
+rustls-pki-types = { version = "1", features = ["std"] }
+webpki-roots = "0.26"
+rustls-native-certs = "0.8"
+
 url = "2.5"
 bytes = "1.10"
 futures = "0.3"
-tokio = { version = "1.52", features = ["rt-multi-thread", "net", "sync", "time", "macros", "fs", "io-util", "signal"] }
+tokio = { version = "1.52", features = [
+  "rt-multi-thread",
+  "net",
+  "sync",
+  "time",
+  "macros",
+  "fs",
+  "io-util",
+  "signal",
+] }
 hdrhistogram = "7.5"
 crc32c = "0.6"
 rand = "0.8"
@@ -57,7 +95,7 @@ rand_xoshiro = "0.6"
 sysinfo = "0.32"
 ratatui = "0.29"
 crossterm = "0.28"
-clap = { version = "4.5", features = ["derive"] }
+clap = { version = "4.5", features = ["derive", "env"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "0.8"

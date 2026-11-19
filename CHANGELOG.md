@@ -1,13 +1,27 @@
 # Changelog
 
-## v0.1.0 — First Complete Release
+## v1.0.0 — Production White-Box Cloud Storage Microscope & Closed-Loop Auto-Tuner
 
-`oprobe`（**O**penDAL **Probe**）是基于 [Apache OpenDAL](https://opendal.apache.org/)（`0.59`）构建的存储栈白盒调优、底层握手探针、多云成本精算与 SLA 自动寻优工具，同时提供零依赖开箱即用的 Ratatui 终端工作台（`oprobe tui`）、完整 CI 命令行套件（`run` / `tune` / `diff` / `net-probe`）以及 [Native Shell (NSH)](https://github.com/longbridge/nsh) 双端桌面扩展壳层（`native/`）。
+`v1.0.0` 将 `oprobe` 全面重构并升级为 **100% 纯 Rust、零启发式估算**的生产级云存储栈白盒剖析与闭环调优套件。
 
-### Core Capabilities
+### Highlights & Breaking Upgrades
 
-- **微秒级底层 Socket + TLS 1.3 握手探针（`oprobe net-probe`）**：独立测量 DNS 解析、TCP SYN/ACK RTT、TLS 握手耗时、协商 ALPN 协议（`h2` / `http/1.1`）与密码套件，校准传输层冷热连接拆分基准。
-- **双切面六段式耗时归因（`Service` + `HttpTransport::fetch`）**：精确拆分信号量排队、[`FoyerLayer`](https://docs.rs/opendal-layer-foyer) 本地混合缓存、连接复用/TLS、远端网关 TTFB、Body 分块流与 Multipart 合并/CRC32C 六个阶段，并挂载 [`AwaitTreeLayer`](https://opendal.apache.org/docs/rust/opendal_layer_await_tree/struct.AwaitTreeLayer.html) 导出在途慢协程调用树。
-- **四类防重删生产负载与端到端校验**：内置 Xoshiro256++ 首尾防重删块戳记与 CRC32C 校验，覆盖 Parquet 稀疏列点查（精确计算 Gap 空洞读放大与 RPC 裂变）、AI Safetensors 分片写入、海量前缀元数据风暴及 80/20 混合读写。
-- **多云 FinOps 成本精算与两阶段防 `503` 自动寻优（`oprobe tune`）**：内置 AWS S3 Standard、Cloudflare R2、Backblaze B2 计费模型，自动量化读写放大造成的月度账单损耗，并一键导出 Rust / Python / TOML 生产配置。
-- **快照持久化与 CI 回归门禁（`oprobe diff`）**：支持导出 `.json` / `.md` / `.csv` 完整报告，对比基线与候选快照的分动词 P99、吞吐与读放大，超阈值时返回退出码 `2` 阻断退化变更。
+- **100% 纯 Rust 架构与零 C/CMake 依赖跨平台构建**
+  - 移除所有外部 C/C++ 编译依赖（彻底剔除 `aws-lc-sys`、`zstd-sys`、`lz4-sys`、`ring` 及原型壳层），全面采用 `hyper` 1.x + `tokio-rustls` + `oxitls-rustcrypto-provider` + `moka` 纯 Rust 技术栈，原生支持 `cargo install oprobe` 与 Linux (`x86_64`/`aarch64`)、macOS (`aarch64`/`x86_64`)、Windows 全平台分发。
+- **七段式真实底层白盒可观测性（彻底清除估算逻辑）**
+  - 自研 `ProbedHttpConnector` 与 `HyperWhiteboxTransport`：基于物理 Socket `dispatch_seq` 与内核级读写时间戳，精确拆解 **DNS 解析、TCP SYN/ACK 握手、TLS 1.2/1.3 + ALPN 协商、连接池热复用 vs 冷建连、网关首包 TTFB、Body 分块流与 L4 真实收发字节**。
+  - 自研 OpenDAL 中间件埋点栈：`ProbedSemaphore`（真实 `ConcurrentLimitLayer` 排队耗时）、`WhiteboxCacheLayer`（纯 Rust `moka` W-TinyLFU 全对象与稀疏 Range 块缓存真实命中/微秒耗时）及 `WhiteboxObserveLayer`（真实 `CompleteMultipartUpload` 分片合并耗时与 `RetryEvent.retry_after` 精确退避统计）。
+  - 慢请求异步调用栈实时捕获：后台 `10ms` `AwaitTree` 采样器持续追踪在途协程并保留 Top-5 最慢请求的完整跨层调用栈。
+- **闭环流式压测、全路径自动清理与五朵云 FinOps 诊断**
+  - 新增 `--duration` / `--warmup` 持续时间窗口流式压测模式与 `--url` 零配置文件直连模式。
+  - 新增隔离前缀 `oprobe-run-*` 全路径远端数据自动清理与校验（覆盖正常结束、报错中止及 `Ctrl-C` 信号），并提供 `oprobe cleanup` 独立清扫子命令。
+  - 升级多云成本引擎：覆盖 **AWS S3 Standard、Cloudflare R2、Google GCS、Alibaba Cloud OSS、Backblaze B2**，精确量化 Class A/B 请求放大损耗、读放大流出浪费与本地缓存月度节省金额。
+  - 升级防 `429/503` 闭环自动寻优器（`oprobe tune`）：支持软/硬限流熔断退避、悬崖下方二分并发探底，产出可 `oprobe run --profile` 直接回环复用的 `[knobs]` TOML 配置与 Rust / Python 生产代码。
+- **产品化交互体验与内置 S3 混沌验证台**
+  - `oprobe tui` 支持 `100ms` 实时流式动态刷新、流式寻优矩阵、命令历史与 `?` 快捷键浮层。
+  - 新增结构化运行时异常诊断提示（自动识别 TLS 证书、401/403 签名/权限、404 桶缺失、429/503 限流与 DNS 故障并给出修复步骤）。
+  - 内置 `oprobe serve-s3` 兼容对象存储与弱网/`503 SlowDown` 故障注入实验台。
+
+## v0.1.0 — Initial Prototype Release
+
+- 基于 Apache OpenDAL `0.59` 的初版 CLI（`run` / `tune` / `diff` / `net-probe`）与终端 TUI 原型。

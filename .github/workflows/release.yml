@@ -14,7 +14,7 @@ permissions:
 
 jobs:
   build-and-test:
-    name: Test & Build (${{ matrix.target }})
+    name: Verify & Build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -22,10 +22,19 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+            run_tests: true
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            run_tests: true
           - os: macos-latest
             target: aarch64-apple-darwin
+            run_tests: true
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            run_tests: false
           - os: windows-latest
             target: x86_64-pc-windows-msvc
+            run_tests: true
 
     steps:
       - name: Checkout repository
@@ -35,19 +44,29 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+          components: clippy, rustfmt
 
       - name: Cache Cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: Run full integration & unit test suite
+      - name: Lint with Clippy (-D warnings)
+        if: matrix.run_tests
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Run full unit & white-box integration test suite
+        if: matrix.run_tests
         run: cargo test --all-targets
 
       - name: Build release binary
         run: cargo build --release --bin oprobe --target ${{ matrix.target }}
 
-      - name: Smoke-test CLI headless run & report export
+      - name: End-to-end CLI smoke test (run + tune + diff)
+        if: matrix.run_tests
         run: |
-          cargo run --release --bin oprobe -- run --profile profiles/memory-quickstart.toml --rounds 4 --json smoke.json --markdown smoke.md
+          cargo run --release --bin oprobe -- run --profile profiles/memory-quickstart.toml --rounds 8 --json baseline.json --markdown report.md --csv metrics.csv --quiet
+          cargo run --release --bin oprobe -- tune --profile profiles/memory-quickstart.toml --trial-rounds 4 --emit-profile tuned.toml --emit-rust operator.rs --emit-python operator.py --json candidate.json --quiet
+          cargo run --release --bin oprobe -- run --profile tuned.toml --rounds 8 --quiet
+          cargo run --release --bin oprobe -- diff baseline.json baseline.json
 
       - name: Package release archive (Unix)
         if: startsWith(github.ref, 'refs/tags/v') && runner.os != 'Windows'
@@ -55,7 +74,7 @@ jobs:
           STAGE="oprobe-${{ github.ref_name }}-${{ matrix.target }}"
           mkdir -p "${STAGE}"
           cp "target/${{ matrix.target }}/release/oprobe" "${STAGE}/"
-          cp README.md CHANGELOG.md LICENSE nsh.json theme.json "${STAGE}/"
+          cp README.md CHANGELOG.md LICENSE "${STAGE}/"
           cp -r profiles "${STAGE}/"
           tar -czf "${STAGE}.tar.gz" "${STAGE}"
           shasum -a 256 "${STAGE}.tar.gz" > "${STAGE}.tar.gz.sha256"
@@ -67,7 +86,7 @@ jobs:
           $Stage = "oprobe-${{ github.ref_name }}-${{ matrix.target }}"
           New-Item -ItemType Directory -Force -Path $Stage | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/oprobe.exe" "$Stage/"
-          Copy-Item README.md, CHANGELOG.md, LICENSE, nsh.json, theme.json "$Stage/"
+          Copy-Item README.md, CHANGELOG.md, LICENSE "$Stage/"
           Copy-Item -Recurse profiles "$Stage/"
           Compress-Archive -Path "$Stage" -DestinationPath "$Stage.zip"
           Get-FileHash "$Stage.zip" -Algorithm SHA256 | ForEach-Object { "$($_.Hash.ToLower())  $Stage.zip" } | Set-Content "$Stage.zip.sha256"

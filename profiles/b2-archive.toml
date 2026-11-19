@@ -1,3 +1,4 @@
+# Backblaze B2 S3-Compatible 80/20 Mixed Read/Write Profile
 [target]
 name = "Backblaze B2 S3-Compatible"
 scheme = "s3"
@@ -10,12 +11,15 @@ root = "/oprobe-bench"
 
 [workload]
 kind = "mixed_read_write"
+duration_secs = 8.0
+warmup_secs = 1.0
 rounds = 32
 object_size_mib = 4
 verify_crc32c = true
-enable_foyer_cache = true
-foyer_memory_mib = 128
+enable_local_cache = true
+cache_memory_mib = 128
 internet_egress_ratio = 0.25
+auto_cleanup = true
 
 [sla]
 max_p99_ms = 260.0
@@ -28,3 +32,5 @@ storage_usd_per_gb_month = 0.006
 class_a_put_list_usd_per_million = 0.0
 class_b_get_head_usd_per_million = 0.40
 egress_usd_per_gb = 0.01
+baseline_stored_tb = 50.0
+monthly_logical_access_tb = 50.0
