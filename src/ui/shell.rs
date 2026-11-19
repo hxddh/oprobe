@@ -3,9 +3,9 @@
 use nsh_base::{button, theme};
 use nsh_core::prelude::*;
 
-use crate::pages::{probe::probe_page, tune::tune_page, workbench::workbench};
-use crate::store::{Page, store};
-use crate::ui::{muted, stage_color};
+use crate::ui::pages::{probe::probe_page, tune::tune_page, workbench::workbench};
+use crate::ui::store::{Page, store};
+use crate::ui::widgets::{muted, stage_color};
 
 fn nav_item(page: Page, label: &'static str, hint: &'static str) -> impl IntoElement {
     let s = store();

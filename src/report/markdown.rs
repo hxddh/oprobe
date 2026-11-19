@@ -29,7 +29,10 @@ pub fn render(r: &Report) -> String {
         r.generated_at
     );
     let sm = &s.summary;
-    let _ = writeln!(md, "| ops/s | MiB/s | p50 | p99 | p99.9 | failed ops | throttled |\n|---:|---:|---:|---:|---:|---:|---:|");
+    let _ = writeln!(
+        md,
+        "| ops/s | MiB/s | p50 | p99 | p99.9 | failed ops | throttled |\n|---:|---:|---:|---:|---:|---:|---:|"
+    );
     let _ = writeln!(
         md,
         "| {:.1} | {:.1} | {} | {} | {} | {} | {} |\n",
@@ -59,7 +62,10 @@ pub fn render(r: &Report) -> String {
         let _ = writeln!(md, "| {n} | {:.1}% |", v * 100.0);
     }
 
-    let _ = writeln!(md, "\n### Operations\n\n| operation | count | ops/s | MiB/s | p50 | p90 | p99 | max | req/op | errors |\n|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
+    let _ = writeln!(
+        md,
+        "\n### Operations\n\n| operation | count | ops/s | MiB/s | p50 | p90 | p99 | max | req/op | errors |\n|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
+    );
     for v in &s.verbs {
         let _ = writeln!(
             md,
@@ -78,7 +84,10 @@ pub fn render(r: &Report) -> String {
     }
 
     if !s.apis.is_empty() {
-        let _ = writeln!(md, "\n### Backend requests (mean per request)\n\n| request | count | warm | queue | connect | send | ttfb | transfer | stall | p99 |\n|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
+        let _ = writeln!(
+            md,
+            "\n### Backend requests (mean per request)\n\n| request | count | warm | queue | connect | send | ttfb | transfer | stall | p99 |\n|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
+        );
         for a in &s.apis {
             let st = &a.stages;
             let _ = writeln!(
@@ -106,7 +115,11 @@ pub fn render(r: &Report) -> String {
     let _ = writeln!(
         md,
         "\n### Bytes & cost\n\n- read amplification **{:.2}×**, over-read {:.2}×, **{:.2} requests/op**; downloaded {}, uploaded {}",
-        b.read_amplification, b.overread_ratio, b.request_amplification, fmt_bytes(b.backend_down), fmt_bytes(b.backend_up)
+        b.read_amplification,
+        b.overread_ratio,
+        b.request_amplification,
+        fmt_bytes(b.backend_down),
+        fmt_bytes(b.backend_up)
     );
     let c = &r.cost.selected;
     let _ = writeln!(

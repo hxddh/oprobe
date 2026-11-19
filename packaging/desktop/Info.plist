@@ -7,7 +7,7 @@
   <key>CFBundleIdentifier</key><string>io.github.hxddh.oprobe</string>
   <key>CFBundleVersion</key><string>@VERSION@</string>
   <key>CFBundleShortVersionString</key><string>@VERSION@</string>
-  <key>CFBundleExecutable</key><string>oprobe-app</string>
+  <key>CFBundleExecutable</key><string>oprobe</string>
   <key>CFBundleIconFile</key><string>oprobe</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>

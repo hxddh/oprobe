@@ -1,3 +1,4 @@
+#![cfg(feature = "tui")]
 //! UI flows on the real NSH engine (headless), driving the real oprobe engine underneath.
 
 use std::time::Duration;
@@ -8,7 +9,7 @@ use nsh_testing::Headless;
 fn start() -> Headless {
     let mut app = Headless::start(EngineConfig {
         viewport: Size::new(Points(1280.0), Points(900.0)),
-        ..EngineConfig::new(Root::of::<oprobe_app::App>())
+        ..EngineConfig::new(Root::of::<oprobe::ui::App>())
     })
     .unwrap();
     app.wait_for("Workbench").unwrap();

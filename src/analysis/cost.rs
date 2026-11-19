@@ -231,11 +231,7 @@ fn price(key: &str, p: &Pricing, u: &PerOpUsage, spec: &CostSpec) -> ProviderCos
     let egress_per_m = u.download_bytes * 1e6 / 1e9 * spec.egress_fraction * p.egress_per_gb;
     let avg_req_price = {
         let n = u.write_requests + u.list_requests + u.read_requests + u.delete_requests;
-        if n > 0.0 {
-            req_per_m / n
-        } else {
-            0.0
-        }
+        if n > 0.0 { req_per_m / n } else { 0.0 }
     };
     let stored_gb = spec.stored_gib * 1.073_741_824;
     ProviderCost {

@@ -15,4 +15,13 @@ pub mod net;
 pub mod report;
 pub mod trace;
 pub mod tune;
+#[cfg(feature = "tui")]
+pub mod ui;
+
+/// The UI set the NSH hosts load (`nsh_core` requires this at the crate root).
+#[cfg(feature = "tui")]
+#[nsh_core::prelude::native_module("oprobe/native")]
+fn native(registry: &mut nsh_core::prelude::Registry) {
+    registry.register::<ui::App>();
+}
 pub mod util;

@@ -4,18 +4,18 @@
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use await_tree::InstrumentAwait;
 use rustls_pki_types::ServerName;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
-use tokio::net::{lookup_host, TcpStream};
+use tokio::net::{TcpStream, lookup_host};
 use tokio::time::timeout;
-use tokio_rustls::client::TlsStream;
 use tokio_rustls::TlsConnector;
+use tokio_rustls::client::TlsStream;
 
 use super::proxy::ProxyConfig;
 use crate::trace::{DialRecord, Recorder};
@@ -80,14 +80,14 @@ impl AsyncWrite for CountingStream {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let poll = Pin::new(&mut self.inner).poll_write(cx, buf);
-        if let Poll::Ready(Ok(n)) = &poll {
-            if *n > 0 {
-                let us = self.clock.epoch.elapsed().as_micros() as u64;
-                self.clock.last_write_us.store(us, Ordering::Release);
-                self.clock.tx.fetch_add(*n as u64, Ordering::Relaxed);
-                if let Some(r) = &self.recorder {
-                    r.add_wire(0, *n as u64);
-                }
+        if let Poll::Ready(Ok(n)) = &poll
+            && *n > 0
+        {
+            let us = self.clock.epoch.elapsed().as_micros() as u64;
+            self.clock.last_write_us.store(us, Ordering::Release);
+            self.clock.tx.fetch_add(*n as u64, Ordering::Relaxed);
+            if let Some(r) = &self.recorder {
+                r.add_wire(0, *n as u64);
             }
         }
         poll
@@ -109,7 +109,7 @@ pub enum ConnStream {
 }
 
 macro_rules! delegate {
-    ($self:ident, $s:ident => $e:expr) => {
+    ($self:ident, $s:ident => $e:expr_2021) => {
         match $self.get_mut() {
             ConnStream::Plain($s) => {
                 let $s = Pin::new($s);
@@ -333,10 +333,10 @@ impl Dialer {
         .map_err(|e| err("tcp connect", e))?;
         let tcp_us = t.elapsed().as_micros() as u64;
         let remote = tcp.peer_addr().unwrap_or(addrs[0]);
-        if preferred != Some(remote) {
-            if let Ok(mut m) = self.last_good.lock() {
-                m.insert(key, remote);
-            }
+        if preferred != Some(remote)
+            && let Ok(mut m) = self.last_good.lock()
+        {
+            m.insert(key, remote);
         }
         let _ = tcp.set_nodelay(true);
 

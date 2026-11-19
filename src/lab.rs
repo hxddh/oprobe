@@ -519,10 +519,10 @@ async fn handle_s3_request(
             let crc = crate::util::crc32c(&part_bytes);
             let etag = format!("\"{crc:08x}\"");
 
-            if let Ok(mut ups) = store.uploads.write() {
-                if let Some(st) = ups.get_mut(upload_id) {
-                    st.parts.insert(part_num, part_bytes);
-                }
+            if let Ok(mut ups) = store.uploads.write()
+                && let Some(st) = ups.get_mut(upload_id)
+            {
+                st.parts.insert(part_num, part_bytes);
             }
             return Ok(Response::builder()
                 .status(StatusCode::OK)
@@ -680,22 +680,21 @@ async fn handle_s3_request(
             match found {
                 Some(obj) => {
                     let total_len = obj.data.len();
-                    if let Some(ref r_str) = range_hdr {
-                        if let Some((start, end)) = parse_http_range_header(r_str, total_len) {
-                            let slice = obj.data.slice(start..=end);
-                            let slice_len = slice.len();
-                            let body =
-                                build_shaped_body(slice, faults.stream_bandwidth_kib_s).await;
-                            return Ok(Response::builder()
-                                .status(StatusCode::PARTIAL_CONTENT)
-                                .header("content-length", slice_len)
-                                .header("content-range", format!("bytes {start}-{end}/{total_len}"))
-                                .header("accept-ranges", "bytes")
-                                .header("etag", obj.etag)
-                                .header("x-amz-request-id", &req_id)
-                                .body(body)
-                                .unwrap());
-                        }
+                    if let Some(ref r_str) = range_hdr
+                        && let Some((start, end)) = parse_http_range_header(r_str, total_len)
+                    {
+                        let slice = obj.data.slice(start..=end);
+                        let slice_len = slice.len();
+                        let body = build_shaped_body(slice, faults.stream_bandwidth_kib_s).await;
+                        return Ok(Response::builder()
+                            .status(StatusCode::PARTIAL_CONTENT)
+                            .header("content-length", slice_len)
+                            .header("content-range", format!("bytes {start}-{end}/{total_len}"))
+                            .header("accept-ranges", "bytes")
+                            .header("etag", obj.etag)
+                            .header("x-amz-request-id", &req_id)
+                            .body(body)
+                            .unwrap());
                     }
                     let body = build_shaped_body(obj.data, faults.stream_bandwidth_kib_s).await;
                     Ok(Response::builder()

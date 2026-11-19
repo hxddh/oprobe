@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use bytes::{Bytes, BytesMut};
 use futures::{StreamExt, TryStreamExt};
 use opendal::{EntryMode, Operator};
@@ -118,22 +118,21 @@ impl Dataset {
             (format!("{run_prefix}data/"), false)
         };
         let manifest_path = format!("{base}_manifest.json");
-        if persisted {
-            if let Ok(buf) = admin.read(&manifest_path).await {
-                if let Ok(m) = serde_json::from_slice::<Manifest>(&buf.to_vec()) {
-                    progress(format!(
-                        "reusing persisted dataset {base} ({} objects)",
-                        m.objects.len()
-                    ));
-                    return Ok(Self {
-                        prefix: base,
-                        objects: m.objects,
-                        partitions: m.partitions,
-                        preexisting: true,
-                        read_only: false,
-                    });
-                }
-            }
+        if persisted
+            && let Ok(buf) = admin.read(&manifest_path).await
+            && let Ok(m) = serde_json::from_slice::<Manifest>(&buf.to_vec())
+        {
+            progress(format!(
+                "reusing persisted dataset {base} ({} objects)",
+                m.objects.len()
+            ));
+            return Ok(Self {
+                prefix: base,
+                objects: m.objects,
+                partitions: m.partitions,
+                preexisting: true,
+                read_only: false,
+            });
         }
 
         let size = spec.object_size.as_usize().max(1);
@@ -284,7 +283,7 @@ impl Picker {
         match self.access {
             Access::Uniform => rng.gen_range(0..self.n),
             Access::Zipf(_) => {
-                let u: f64 = rng.gen();
+                let u: f64 = rng.r#gen();
                 self.zipf_cdf.partition_point(|&c| c < u).min(self.n - 1)
             }
             Access::Hotset {

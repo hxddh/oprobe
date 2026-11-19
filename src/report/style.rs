@@ -22,8 +22,8 @@ pub fn enabled() -> bool {
 fn ansi_ok() -> bool {
     // Enable virtual-terminal processing (ANSI colors) on Windows 10+ consoles.
     use windows_sys::Win32::System::Console::{
-        GetConsoleMode, GetStdHandle, SetConsoleMode, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
-        STD_OUTPUT_HANDLE,
+        ENABLE_VIRTUAL_TERMINAL_PROCESSING, GetConsoleMode, GetStdHandle, STD_OUTPUT_HANDLE,
+        SetConsoleMode,
     };
     // SAFETY: console-mode calls on this process's stdout handle with a valid out-pointer.
     unsafe {

@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use nsh_core::file_dialog::SaveDialog;
 use nsh_core::prelude::*;
 
-use crate::store::Store;
+use crate::ui::store::Store;
 
 fn save(store: Store, suggested: String, contents: Vec<(String, String)>) {
     spawn(async move {
@@ -56,8 +56,8 @@ pub fn save_report(store: Store) {
         return;
     };
     let json = serde_json(&r);
-    let md = oprobe::report::markdown::render(&r);
-    let name = format!("oprobe-{}.json", oprobe::util::compact_utc_now());
+    let md = crate::report::markdown::render(&r);
+    let name = format!("oprobe-{}.json", crate::util::compact_utc_now());
     save(store, name, vec![("json".into(), json), ("md".into(), md)]);
 }
 
@@ -79,6 +79,6 @@ pub fn save_tuned_rust(store: Store) {
     save(store, "storage.rs".into(), vec![(String::new(), t.rust)]);
 }
 
-fn serde_json(r: &oprobe::report::Report) -> String {
-    oprobe::report::to_json(r)
+fn serde_json(r: &crate::report::Report) -> String {
+    crate::report::to_json(r)
 }

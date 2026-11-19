@@ -5,7 +5,7 @@ pub mod recorder;
 pub mod scope;
 pub mod snapshot;
 
-pub use model::{classify_http, Api, BillingClass, Protocol, RequestRecord, RequestTiming};
+pub use model::{Api, BillingClass, Protocol, RequestRecord, RequestTiming, classify_http};
 pub use recorder::{DialRecord, OpCompletion, Recorder};
 pub use scope::{OpScope, ScopePropagatingExecutor};
 pub use snapshot::*;

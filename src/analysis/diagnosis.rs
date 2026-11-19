@@ -418,28 +418,29 @@ pub fn diagnose(s: &Snapshot, knobs: &Knobs, sla: &Sla, network: bool) -> Diagno
                 "See the slowest-operation timelines for the responsible stage. Server stragglers can be cut with `tail_cut = true`; retries/backoff point to throttling or errors.",
             ));
         }
-        if let Some(limit) = sla.p99_ms {
-            if v.count > 0 && v.latency.p99 > limit {
-                f.push(finding(
+        if let Some(limit) = sla.p99_ms
+            && v.count > 0
+            && v.latency.p99 > limit
+        {
+            f.push(finding(
                     Severity::Warning,
                     "sla-p99",
                     format!("`{}` p99 {} exceeds the {} SLA", v.verb, fmt_ms(v.latency.p99), fmt_ms(limit)),
                     format!("{} ops, p50 {}", v.count, fmt_ms(v.latency.p50)),
                     "Reduce concurrency if queueing/throttling, or tune chunk/range settings (`oprobe tune`).",
                 ));
-            }
         }
     }
-    if let Some(ol) = &s.open_loop {
-        if ol.missed > 0 {
-            f.push(finding(
+    if let Some(ol) = &s.open_loop
+        && ol.missed > 0
+    {
+        f.push(finding(
                 Severity::Warning,
                 "rate-not-sustained",
                 format!("Target rate {:.0} ops/s not sustained", ol.target_rate),
                 format!("achieved {:.0} ops/s; {} arrivals dropped because {} ops were already in flight", ol.achieved_rate, ol.missed, knobs.concurrency),
                 "Raise `concurrency` (in-flight cap) or lower the target rate; latency percentiles include queueing from the intended start time.",
             ));
-        }
     }
     if cpu_busy > 0.8 * cores && bottleneck != Bottleneck::Client {
         f.push(finding(

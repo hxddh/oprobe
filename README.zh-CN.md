@@ -9,17 +9,16 @@ DNS / TCP / 代理 CONNECT / TLS、请求发送、首字节等待（TTFB）、�
 
 [English](README.md) · [桌面应用](docs/app.md) · [指标与方法](docs/metrics.md) · [负载与 Profile](docs/workloads.md) · [调优](docs/tuning.md) · [CI 门禁](docs/ci.md) · [成本模型](docs/cost.md) · [故障排查](docs/troubleshooting.md) · [安装](docs/install.md)
 
-## 桌面与终端应用
+## 工作台：窗口与终端
 
-`oprobe-app` 用 [Native Shell (NSH)](https://github.com/longbridge/nsh) 为同一套引擎提供原生界面：macOS 使用 AppKit、
-Windows 使用 Win32/Direct2D、Linux 使用 GTK 4，同一套 UI 也能在任意终端中运行（`oprobe-app --tui`）。
-可通过表单运行、调优和探测，查看实时曲线，并以请求瀑布图审视最慢的操作。[详情 →](docs/app.md)
+直接运行 `oprobe`（不带参数）即打开工作台：有图形环境时是原生窗口（macOS 使用 AppKit、Windows 使用 Win32/Direct2D、
+Linux 使用 GTK 4），否则在当前终端中打开同一套界面（`oprobe top`，SSH 下同样可用）。可通过表单运行、调优和探测，查看实时
+曲线，并以请求瀑布图审视最慢的操作。[详情 →](docs/app.md)
 
-![oprobe-app：最慢操作瀑布图](docs/images/app-slowest-op.png)
+架构只有两层：**OpenDAL 及其自带 HTTP 客户端（逐请求观测）**负责一切测量，**[Native Shell (NSH)](https://github.com/longbridge/nsh)**
+负责一切界面。
 
-架构只有两层：**OpenDAL 及其自带 HTTP 客户端（逐请求观测）**负责一切测量，**NSH** 负责一切界面（窗口与终端）。
-`oprobe top` 即在终端中启动 `oprobe-app --tui`。主包 `oprobe` 不含任何 UI 框架；
-NSH 要求 Rust 1.97，因此 UI 目前独立为 `oprobe-app` 包。详见 [docs/app.md](docs/app.md)。
+![oprobe 工作台：最慢操作瀑布图](docs/images/app-slowest-op.png)
 
 ## 它回答的问题
 
@@ -37,15 +36,15 @@ NSH 要求 Rust 1.97，因此 UI 目前独立为 `oprobe-app` 包。详见 [docs
 
 | 平台 | 方式 |
 |---|---|
-| 任意平台（Rust ≥ 1.91） | `cargo install oprobe --locked` |
+| 任意平台（Rust ≥ 1.97） | `cargo install oprobe --locked`（Linux 如需窗口加 `--features gui`） |
 | macOS / Linux 脚本 | `curl -fsSL https://github.com/hxddh/oprobe/releases/latest/download/install.sh \| sh` |
-| macOS 安装包 | `oprobe-<版本>-macos-universal.pkg`（Apple Silicon + Intel 通用） |
+| macOS | `oprobe-<版本>-macos-universal.pkg`（命令行）或 `.dmg`（`oprobe.app`），Apple Silicon + Intel 通用 |
 | Debian / Ubuntu | `sudo apt install ./oprobe_<版本>-1_amd64.deb`（或 `_arm64`） |
 | Fedora / RHEL / SUSE | `sudo dnf install ./oprobe-<版本>-1.x86_64.rpm`（或 `.aarch64`） |
-| Windows 安装器 | `oprobe-<版本>-x64.msi` / `-arm64.msi`，自动加入 `PATH` |
+| Windows 安装器 | `oprobe-<版本>-x64.msi` / `-arm64.msi`，自动加入 `PATH` 并创建开始菜单项 |
 | Windows Scoop | `scoop install https://github.com/hxddh/oprobe/releases/latest/download/oprobe.json` |
 | Homebrew | 每个 Release 附带 `oprobe.rb`，见 [docs/install.md](docs/install.md) |
-| **桌面应用** | macOS `oprobe-app-<版本>-macos-universal.dmg` · Windows `oprobe-app-<版本>-x64.msi` · Linux `oprobe-app-<版本>-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux 桌面版 | `oprobe-desktop-<版本>-x86_64-unknown-linux-gnu.tar.gz`（带窗口，需 GTK 4.14+） |
 
 运行时无需 OpenSSL 或其他系统库；Linux musl 版本为完全静态链接。从源码安装需要 C 编译器（用于 aws-lc，与 reqwest 默认一致）。压缩包内含 man 手册、
 bash/zsh/fish/PowerShell/elvish 补全脚本与示例 Profile，所有产物的校验和见 `SHA256SUMS`。
@@ -65,7 +64,7 @@ AWS_ACCESS_KEY_ID=lab AWS_SECRET_ACCESS_KEY=lab \
 oprobe doctor s3://my-bucket/oprobe            # 连通性、TLS、时钟偏差、读写删权限逐项检查
 oprobe run    s3://my-bucket/oprobe --preset parquet -d 30s --json baseline.json
 oprobe run    s3://my-bucket --existing warehouse/events/   # 只读压测你已有的真实对象
-oprobe top    s3://my-bucket/oprobe            # 实时终端工作台（需安装 oprobe-app）
+oprobe top    s3://my-bucket/oprobe            # 在当前终端中打开实时工作台
 
 # 4. 调优并落地
 oprobe tune s3://my-bucket/oprobe --preset parquet --p99-ms 250 \
@@ -84,7 +83,7 @@ oprobe diff baseline.json candidate.json --junit oprobe.xml --markdown oprobe.md
 | 命令 | 作用 |
 |---|---|
 | `oprobe run` | 运行负载并输出白盒报告；`--json` / `--markdown` 导出；`--fail-on` 用于 CI |
-| `oprobe top` | 在终端中打开应用工作台（`oprobe-app --tui`）：实时曲线、耗时分解、按 API 统计、最慢操作瀑布图、调优与探测 |
+| `oprobe top` / `oprobe gui` | 在终端 / 窗口中打开交互式工作台：实时曲线、耗时分解、按 API 统计、最慢操作瀑布图、调优与探测；直接运行 `oprobe` 也会打开它 |
 | `oprobe tune` | 感知限流的闭环调优，`--objective throughput\|latency\|cost` |
 | `oprobe diff` | 回归门禁（回归时退出码 3），输出 JSON / Markdown / JUnit |
 | `oprobe doctor` | 配置、凭据、DNS/代理/TCP/TLS、HTTP、时钟偏差、list/write/read/stat/delete 逐项诊断 |

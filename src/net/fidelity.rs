@@ -34,9 +34,9 @@ use rustls::{ClientConfig, NamedGroup};
 use rustls_pki_types::ServerName;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use super::tls::{crypto_provider, InsecureCertVerifier};
+use super::tls::{InsecureCertVerifier, crypto_provider};
 use super::{HttpVersion, TransportConfig};
-use crate::trace::model::{classify_http, Protocol, RequestRecord, RequestTiming};
+use crate::trace::model::{Protocol, RequestRecord, RequestTiming, classify_http};
 use crate::trace::recorder::DialRecord;
 use crate::trace::{OpScope, Recorder};
 
@@ -535,10 +535,10 @@ impl<S: Stream<Item = reqwest::Result<Bytes>>> Stream for TimedResponseBody<S> {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
-        if let Some(f) = this.fin.as_mut() {
-            if let Some(t) = f.last_yield.take() {
-                f.stall += t.elapsed();
-            }
+        if let Some(f) = this.fin.as_mut()
+            && let Some(t) = f.last_yield.take()
+        {
+            f.stall += t.elapsed();
         }
         loop {
             match this.inner.as_mut().poll_next(cx) {
@@ -767,16 +767,16 @@ impl HttpTransport for FidelityTransport {
         let mut hr = Response::builder()
             .status(resp.status())
             .extension(uri.clone());
-        if let Ok(target) = resp.url().as_str().parse::<http::Uri>() {
-            if target != uri {
-                let redirect = parts
-                    .extensions
-                    .get::<HttpRedirect>()
-                    .filter(|redirect| redirect.uri().original_uri() == resp.url().as_str())
-                    .cloned()
-                    .unwrap_or_else(|| HttpRedirect::new(target));
-                hr = hr.extension(redirect);
-            }
+        if let Ok(target) = resp.url().as_str().parse::<http::Uri>()
+            && target != uri
+        {
+            let redirect = parts
+                .extensions
+                .get::<HttpRedirect>()
+                .filter(|redirect| redirect.uri().original_uri() == resp.url().as_str())
+                .cloned()
+                .unwrap_or_else(|| HttpRedirect::new(target));
+            hr = hr.extension(redirect);
         }
         hr = hr.version(resp.version());
         std::mem::swap(hr.headers_mut().expect("fresh builder"), resp.headers_mut());

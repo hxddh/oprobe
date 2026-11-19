@@ -108,10 +108,10 @@ pub async fn sweep(
             .and_then(|r| r.get(..16))
             .and_then(crate::util::parse_compact_utc)
             .and_then(|t| now.duration_since(t).ok());
-        if let Some(a) = age {
-            if a < older_than {
-                continue;
-            }
+        if let Some(a) = age
+            && a < older_than
+        {
+            continue;
         }
         let objects = list_files(op, &prefix)
             .await

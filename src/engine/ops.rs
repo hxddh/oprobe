@@ -92,10 +92,11 @@ pub async fn execute(
                 .concurrent(io)
                 .await?;
             let buf = reader.read(range).await?;
-            if full && ctx.verify {
-                if let Some(expected) = obj.crc {
-                    ctx.recorder.record_integrity(crc_of(&buf) == expected);
-                }
+            if full
+                && ctx.verify
+                && let Some(expected) = obj.crc
+            {
+                ctx.recorder.record_integrity(crc_of(&buf) == expected);
             }
             Ok(OpOutcome {
                 logical_read: buf.len() as u64,

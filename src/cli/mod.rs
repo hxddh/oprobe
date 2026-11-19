@@ -9,7 +9,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::CommandFactory;
 
 pub use args::Cli;
@@ -18,10 +18,10 @@ use args::*;
 use crate::analysis::hints::hint_for;
 use crate::config::{Access, DatasetSpec, Preset, Profile, TargetSpec};
 use crate::engine::{Cancel, Progress, ProgressFn, RunOptions, Session};
-use crate::report::diff::{diff, Thresholds};
+use crate::report::diff::{Thresholds, diff};
 use crate::report::style::{self, bold, dim, green, red, yellow};
-use crate::report::{markdown, terminal, write_file, Report};
-use crate::util::{parse_duration, ByteSize, HumanDuration};
+use crate::report::{Report, markdown, terminal, write_file};
+use crate::util::{ByteSize, HumanDuration, parse_duration};
 
 /// Exit code when `--fail-on` matched or the diff gate failed.
 pub const EXIT_GATE: u8 = 3;
@@ -32,8 +32,12 @@ pub async fn main(cli: Cli) -> ExitCode {
         ColorChoice::Never => style::set(false),
         ColorChoice::Auto => {}
     }
-    let scheme_hint = scheme_of(&cli.command);
-    match dispatch(cli.command).await {
+    let Some(command) = cli.command else {
+        let _ = Cli::command().print_help();
+        return ExitCode::SUCCESS;
+    };
+    let scheme_hint = scheme_of(&command);
+    match dispatch(command).await {
         Ok(code) => code,
         Err(err) => {
             print_error(&err, &scheme_hint);
@@ -46,7 +50,7 @@ fn scheme_of(cmd: &Command) -> String {
     let t = match cmd {
         Command::Run(a) => a.target.target.clone(),
         Command::Tune(a) => a.target.target.clone(),
-        Command::Top(a) => a.target.clone(),
+        Command::Top(a) | Command::Gui(a) => a.target.clone(),
         Command::Doctor(a) => a.target.target.clone(),
         Command::Cleanup(a) => a.target.target.clone(),
         _ => None,
@@ -69,51 +73,112 @@ pub fn print_error(err: &anyhow::Error, scheme: &str) {
     }
 }
 
-/// `oprobe top` is the NSH app's terminal UI (`oprobe-app --tui`): one UI toolkit for the
-/// window and the terminal.
-fn cmd_top(a: TopArgs) -> Result<ExitCode> {
-    let exe = if cfg!(windows) {
-        "oprobe-app.exe"
-    } else {
-        "oprobe-app"
-    };
-    // Prefer the app installed next to this binary (release archives, packages), then PATH.
-    let app = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.join(exe)))
-        .filter(|p| p.is_file())
-        .unwrap_or_else(|| exe.into());
-    let mut cmd = std::process::Command::new(&app);
-    cmd.arg("--tui");
-    cmd.args(a.target.iter());
-    for (flag, v) in [
-        ("--endpoint", a.endpoint),
-        ("--preset", a.preset),
-        ("--duration", a.duration),
-        ("--concurrency", a.concurrency.map(|c| c.to_string())),
-    ] {
-        if let Some(v) = v {
-            cmd.arg(flag).arg(v);
+/// Interactive commands run on the main thread, before (and without) the CLI's async runtime:
+/// native toolkits require the main thread, and the UI runs the engine on a runtime of its own.
+/// Returns `None` for every other command.
+pub fn ui_entry(cli: &Cli) -> Option<ExitCode> {
+    #[cfg(feature = "tui")]
+    {
+        let (args, window) = match &cli.command {
+            Some(Command::Top(a)) => (Some(a), false),
+            Some(Command::Gui(a)) => (Some(a), true),
+            None => (None, gui_available()),
+            Some(_) => return None,
+        };
+        if cli.command.is_none() && !window && !std::io::stdout().is_terminal() {
+            let _ = Cli::command().print_help();
+            return Some(ExitCode::SUCCESS);
+        }
+        if let Some(a) = args {
+            crate::ui::set_launch(crate::ui::Launch {
+                target: a.target.clone(),
+                endpoint: a.endpoint.clone(),
+                preset: a.preset.clone(),
+                duration: a.duration.clone(),
+                concurrency: a.concurrency.map(|c| c.to_string()),
+                insecure: a.insecure,
+                anonymous: a.anonymous,
+            });
+        }
+        if window {
+            return Some(run_window());
+        }
+        Some(match crate::ui::run_tui() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                print_error(&anyhow::Error::new(e).context("terminal UI failed"), "s3");
+                ExitCode::FAILURE
+            }
+        })
+    }
+    #[cfg(not(feature = "tui"))]
+    {
+        match &cli.command {
+            Some(Command::Top(_)) | Some(Command::Gui(_)) => {
+                eprintln!(
+                    "{} this oprobe was built without its interactive UI; reinstall with \
+                     `cargo install oprobe` (default features) or use `oprobe run`.",
+                    red(&bold("error:"))
+                );
+                Some(ExitCode::FAILURE)
+            }
+            None => {
+                let _ = Cli::command().print_help();
+                Some(ExitCode::SUCCESS)
+            }
+            Some(_) => None,
         }
     }
-    if a.insecure {
-        cmd.arg("--insecure");
+}
+
+/// Whether a native window can be shown: built with `gui`, and a display is present.
+#[cfg(feature = "tui")]
+fn gui_available() -> bool {
+    if !cfg!(feature = "gui") {
+        return false;
     }
-    if a.anonymous {
-        cmd.arg("--anonymous");
+    if cfg!(target_os = "linux") {
+        return std::env::var_os("WAYLAND_DISPLAY").is_some()
+            || std::env::var_os("DISPLAY").is_some();
     }
-    match cmd.status() {
-        Ok(st) => Ok(if st.success() {
-            ExitCode::SUCCESS
-        } else {
-            ExitCode::FAILURE
-        }),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => anyhow::bail!(
-            "`oprobe top` runs the oprobe app's terminal UI, and `oprobe-app` was not found \
-             next to oprobe or on PATH. Install it with `cargo install oprobe-app` or from the \
-             release page (oprobe-app-<version>-<platform>), or use `oprobe run` for a report."
-        ),
-        Err(e) => Err(anyhow::Error::new(e).context(format!("cannot start {}", app.display()))),
+    // macOS / Windows: a remote shell has no session to draw on.
+    std::env::var_os("SSH_CONNECTION").is_none()
+}
+
+#[cfg(feature = "tui")]
+fn run_window() -> ExitCode {
+    #[cfg(feature = "gui")]
+    {
+        detach_console();
+        crate::ui::run_gui();
+        ExitCode::SUCCESS
+    }
+    #[cfg(not(feature = "gui"))]
+    {
+        eprintln!(
+            "{} this oprobe was built without native windows; use `oprobe top` for the same \
+             workbench in this terminal, or install a desktop build (release page, or \
+             `cargo install oprobe --features gui`).",
+            red(&bold("error:"))
+        );
+        ExitCode::FAILURE
+    }
+}
+
+/// When started from Explorer, Windows gives a console program its own console window; hide it
+/// for the GUI. A console shared with a shell (more than one attached process) is left alone.
+#[cfg(feature = "gui")]
+fn detach_console() {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Console::{FreeConsole, GetConsoleProcessList};
+        let mut ids = [0u32; 2];
+        // SAFETY: the buffer is valid for two process ids.
+        unsafe {
+            if GetConsoleProcessList(ids.as_mut_ptr(), ids.len() as u32) == 1 {
+                FreeConsole();
+            }
+        }
     }
 }
 
@@ -122,7 +187,9 @@ async fn dispatch(cmd: Command) -> Result<ExitCode> {
         Command::Run(a) => cmd_run(a).await,
         Command::Tune(a) => cmd_tune(a).await,
         Command::Diff(a) => cmd_diff(a),
-        Command::Top(a) => cmd_top(a),
+        Command::Top(_) | Command::Gui(_) => {
+            unreachable!("interactive commands are handled by ui_entry")
+        }
         Command::Doctor(a) => doctor::run(a).await,
         Command::Probe(a) => cmd_probe(a).await,
         Command::Lab(a) => cmd_lab(a).await,
@@ -173,14 +240,14 @@ pub fn build_profile(
              or `oprobe lab` to start a local S3 server."
         ),
     };
-    if t.profile.is_some() {
-        if let Some(url) = &t.target {
-            let mut nt = TargetSpec::from_url(url)?;
-            nt.insecure = p.target.insecure;
-            nt.ca_cert = p.target.ca_cert.clone();
-            nt.proxy = p.target.proxy.clone();
-            p.target = nt;
-        }
+    if t.profile.is_some()
+        && let Some(url) = &t.target
+    {
+        let mut nt = TargetSpec::from_url(url)?;
+        nt.insecure = p.target.insecure;
+        nt.ca_cert = p.target.ca_cert.clone();
+        nt.proxy = p.target.proxy.clone();
+        p.target = nt;
     }
     let tg = &mut p.target;
     if let Some(e) = &t.endpoint {
@@ -378,10 +445,10 @@ fn gate_exit(r: &Report, o: &OutputArgs) -> ExitCode {
 fn progress_for(quiet: bool, total: Duration) -> (Option<ProgressFn>, Option<Arc<live::LiveLine>>) {
     if quiet || !std::io::stderr().is_terminal() {
         let msg: ProgressFn = Arc::new(move |p| {
-            if let Progress::Message(m) = p {
-                if !quiet {
-                    eprintln!("{m}");
-                }
+            if let Progress::Message(m) = p
+                && !quiet
+            {
+                eprintln!("{m}");
             }
         });
         return (Some(msg), None);
@@ -464,7 +531,7 @@ async fn cmd_run(a: RunArgs) -> Result<ExitCode> {
 // ---------------------------------------------------------------------------------------
 
 async fn cmd_tune(a: TuneArgs) -> Result<ExitCode> {
-    use crate::tune::{codegen, tune, Objective, TuneEvent, TuneOptions};
+    use crate::tune::{Objective, TuneEvent, TuneOptions, codegen, tune};
     let mut profile = build_profile(&a.target, &a.workload, &a.knobs, &a.cost)?;
     if let Some(p) = a.p99_ms {
         profile.sla.p99_ms = Some(p);
@@ -473,10 +540,10 @@ async fn cmd_tune(a: TuneArgs) -> Result<ExitCode> {
     install_ctrl_c(cancel.clone());
     let quiet = a.output.quiet;
     let msg: ProgressFn = Arc::new(move |p| {
-        if let Progress::Message(m) = p {
-            if !quiet {
-                eprintln!("{} {m}", dim("·"));
-            }
+        if let Progress::Message(m) = p
+            && !quiet
+        {
+            eprintln!("{} {m}", dim("·"));
         }
     });
     let session = Session::open(profile, cancel.clone(), msg).await?;
@@ -512,7 +579,9 @@ async fn cmd_tune(a: TuneArgs) -> Result<ExitCode> {
         );
         eprintln!(
             "{}",
-            dim("   #  stage            conc  io  chunk   gap     cache  http     ops/s    MiB/s     p99       result")
+            dim(
+                "   #  stage            conc  io  chunk   gap     cache  http     ops/s    MiB/s     p99       result"
+            )
         );
     }
     let on_event: Arc<dyn Fn(TuneEvent) + Send + Sync> = Arc::new(move |ev| {
@@ -667,7 +736,7 @@ fn cmd_diff(a: DiffArgs) -> Result<ExitCode> {
 }
 
 async fn cmd_probe(a: ProbeArgs) -> Result<ExitCode> {
-    use crate::net::probe::{probe_endpoint, ProbeOptions};
+    use crate::net::probe::{ProbeOptions, probe_endpoint};
     let endpoint = if a.endpoint.starts_with("http://") || a.endpoint.starts_with("https://") {
         a.endpoint.clone()
     } else {
@@ -716,7 +785,7 @@ async fn cmd_probe(a: ProbeArgs) -> Result<ExitCode> {
 }
 
 async fn cmd_lab(a: LabArgs) -> Result<ExitCode> {
-    use crate::lab::{LabConfig, LabServer, LAB_CA_PEM};
+    use crate::lab::{LAB_CA_PEM, LabConfig, LabServer};
     if let Some(p) = &a.write_ca {
         write_file(p, LAB_CA_PEM)?;
     }

@@ -1,14 +1,24 @@
-# Desktop & terminal app
+# Workbench: window and terminal
 
-`oprobe-app` is oprobe's graphical front end, built with [Native Shell (NSH)](https://github.com/longbridge/nsh):
-one Rust UI rendered with each platform's own toolkit, and the same UI on a terminal grid.
+`oprobe` has one interactive workbench, built with [Native Shell (NSH)](https://github.com/longbridge/nsh). It is the
+same app in a native window and in any terminal:
 
-| Platform | Drawn with | Package |
+```bash
+oprobe                                         # opens the workbench (window if there is a display, else terminal)
+oprobe gui s3://my-bucket/oprobe --preset parquet -d 30s    # window
+oprobe top s3://my-bucket/oprobe --preset parquet -d 30s    # this terminal (also over SSH)
+oprobe top s3://bench/demo --endpoint https://localhost:9000 --insecure
+```
+
+| Where | Drawn with | Comes with |
 |---|---|---|
-| macOS 14+ | AppKit, Core Animation, CoreText | `oprobe-app-<ver>-macos-universal.dmg` (Apple Silicon + Intel `oprobe.app`) |
-| Windows 10 1809+ | Win32, Direct2D, DirectWrite | `oprobe-app-<ver>-x64.msi` (Start menu shortcut), or the portable `.zip` |
-| Linux (GTK 4.14+) | GTK 4, Pango | `oprobe-app-<ver>-x86_64-unknown-linux-gnu.tar.gz` (`install.sh`, `.desktop` entry, icon) |
-| Any terminal | NSH terminal backend | `oprobe-app --tui` or `oprobe top` — same UI, keyboard and mouse |
+| macOS 14+ | AppKit, Core Animation, CoreText | every macOS build: `.pkg`, `.dmg` (`oprobe.app`), archives, Homebrew |
+| Windows 10 1809+ | Win32, Direct2D, DirectWrite | every Windows build: `.msi` (Start menu shortcut), `.zip`, Scoop |
+| Linux (GTK 4.14+) | GTK 4, Pango | `oprobe-desktop-<ver>-x86_64-unknown-linux-gnu.tar.gz`, or `cargo install oprobe --features gui` |
+| Any terminal | NSH terminal backend | every build, including the static Linux binaries, `.deb`, `.rpm` and `cargo install oprobe` |
+
+Linux packages for servers (`.deb`, `.rpm`, static musl archives) are built without the window so they need no GTK;
+`oprobe top` is always there.
 
 ![Workbench](images/app-workbench.png)
 
@@ -18,53 +28,33 @@ one Rust UI rendered with each platform's own toolkit, and the same UI on a term
   *Run*. While it runs: verdict, KPIs, live operations/s and p99 charts and where the time goes. When it finishes:
   per-operation and per-API tables, connections, findings, the projected cost per provider, and the **slowest
   operation as a waterfall** — one track per backend request, colored by stage, with the async call stack captured
-  while it was stuck. *Save report…* writes the same JSON (`oprobe diff`-compatible) and Markdown as the CLI.
+  while it was stuck. *Save report…* writes the same JSON (`oprobe diff`-compatible) and Markdown as `oprobe run`.
 - **Tune** — runs the throttle-aware tuner against the target, shows every trial as it completes, and offers the
   winner: *Apply to workbench*, *Save profile…* (`oprobe run --profile`), *Save Rust code…*.
 - **Probe** — DNS / TCP / proxy CONNECT / TLS and cold vs warm TTFB of an endpoint, with clock skew.
 
 ![Slowest operation](images/app-slowest-op.png)
 
-All measurement logic is the `oprobe` library — the app and the CLI produce identical numbers. Test data is cleaned up when a run ends or is stopped.
+The workbench drives the same engine as the CLI, so the numbers are identical. Test data is cleaned up when a run
+ends or is stopped. Credentials come from the usual environment (`AWS_*`, `~/.aws`,
+`GOOGLE_APPLICATION_CREDENTIALS`, …), proxies from `HTTPS_PROXY` / `NO_PROXY`, exactly as for the CLI.
 
-## Launching
+## Unsigned desktop builds
 
-```bash
-oprobe-app                                     # opens the workbench
-oprobe-app s3://my-bucket/oprobe --preset parquet -d 30s
-oprobe-app s3://bench/demo --endpoint https://localhost:9000 --insecure
-oprobe-app --tui                               # the same UI in this terminal
-```
-
-Credentials come from the usual environment (`AWS_*`, `~/.aws`, `GOOGLE_APPLICATION_CREDENTIALS`, …), proxies from
-`HTTPS_PROXY` / `NO_PROXY`, exactly as for the CLI.
-
-## One UI toolkit: NSH
-
-The window and the terminal UI are the same NSH app; `oprobe top` simply starts `oprobe-app --tui` (found next to the
-`oprobe` binary or on `PATH`) with the target and options you pass:
-
-```bash
-oprobe top s3://my-bucket/oprobe --preset parquet -c 32     # == oprobe-app --tui s3://... --preset parquet -c 32
-```
-
-The architecture is deliberately two-layered: **OpenDAL and its own HTTP client, observed request by request** (the `oprobe` crate:
-measurement, tuner, reports, CLI) and **NSH** (the `oprobe-app` crate: every UI). Nothing else is a framework.
-NSH is built with only what the app uses (`plot`); its JS engine, WebGPU shaders, network loader, updater, math,
-crypto and media features are off. `oprobe-app` needs Rust ≥ 1.97 and, on Linux, GTK 4; NSH's terminal backend
-currently always compiles its syntax highlighter (a small C regex library).
+The macOS `.dmg`/`.pkg` and the Windows `.msi` are not signed with a developer certificate yet. macOS: right-click
+`oprobe.app` → *Open* the first time (or `xattr -dr com.apple.quarantine /Applications/oprobe.app`). Windows: in
+the SmartScreen prompt choose *More info* → *Run anyway*. Installing through Homebrew, Scoop or `cargo install` avoids
+both prompts.
 
 ## Building from source
 
 ```bash
-cargo install oprobe-app     # from crates.io (Rust ≥ 1.97; Linux: GTK 4 dev package)
-cd app
-cargo run                    # desktop window
-cargo run -- --tui           # terminal
-cargo test                   # headless UI flows on the real NSH engine
+cargo install oprobe                    # CLI + terminal workbench (Rust ≥ 1.97, a C compiler)
+cargo install oprobe --features gui     # + native window (Linux: sudo apt install libgtk-4-dev)
+
+cargo run --features gui -- gui         # from a checkout
+cargo test                              # includes headless UI flows on the real NSH engine
 ```
 
-Linux build dependency (Debian/Ubuntu 24.04): `sudo apt install libgtk-4-dev`.
-
-With the [NSH CLI](https://nsh.dev/docs/installation) you can also use `nsh run`, `nsh run --target tui` and
-`nsh package` from `app/` (`nsh.json` describes the app).
+NSH is built with only what the workbench uses (`plot`); its JS engine, WebGPU shaders, network loader, updater,
+math, crypto and media features are off.

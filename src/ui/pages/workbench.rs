@@ -1,15 +1,15 @@
 //! The workbench: configure a target and workload, run it, and see where the time goes.
 
+use crate::analysis::diagnosis::{Severity, time_shares};
+use crate::trace::{Protocol, Snapshot};
+use crate::util::{fmt_bytes, fmt_ms, fmt_usd};
 use nsh_base::plot::{area, grid, line, plot};
 use nsh_base::theme;
 use nsh_core::element::{RowAccessor, Rows};
 use nsh_core::prelude::*;
-use oprobe::analysis::diagnosis::{Severity, time_shares};
-use oprobe::trace::{Protocol, Snapshot};
-use oprobe::util::{fmt_bytes, fmt_ms, fmt_usd};
 
-use crate::store::{Status, store};
-use crate::ui::*;
+use crate::ui::store::{Status, store};
+use crate::ui::widgets::*;
 
 pub const PRESETS: [(&str, &str); 5] = [
     ("parquet", "Parquet scan"),
@@ -214,7 +214,7 @@ fn kpis() -> impl IntoElement {
 fn chart(
     label: &'static str,
     key: &'static str,
-    pick: fn(&crate::store::Sample) -> f64,
+    pick: fn(&crate::ui::store::Sample) -> f64,
     stroke: impl Fn() -> AdaptiveColor + Copy + 'static,
 ) -> View {
     let s = store();
@@ -702,7 +702,7 @@ fn export_bar() -> impl IntoElement {
         move || {
             row()
                 .child(btn("Save report…", Kind::Secondary, move || {
-                    crate::files::save_report(s)
+                    crate::ui::files::save_report(s)
                 }))
                 .child(muted(move || s.notice.get().unwrap_or_default()))
         },

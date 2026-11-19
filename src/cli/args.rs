@@ -13,7 +13,8 @@ Examples:
   oprobe run s3://my-bucket/data --existing tables/events/ -c 64
   oprobe tune s3://my-bucket/bench --emit-profile tuned.toml --emit-rust tuned.rs
   oprobe diff base.json candidate.json --junit gate.xml
-  oprobe top s3://my-bucket/bench                       # live terminal workbench (oprobe-app)
+  oprobe top s3://my-bucket/bench                       # live workbench in this terminal
+  oprobe gui s3://my-bucket/bench                       # the same workbench in a window
   oprobe doctor s3://my-bucket/bench                    # connectivity & permission checks
   oprobe probe https://s3.us-east-1.amazonaws.com       # DNS/TCP/TLS/TTFB microscope
   oprobe lab --tls --latency 20ms --throttle-above 32   # local S3 with faults
@@ -37,8 +38,10 @@ pub struct Cli {
     #[arg(long, value_enum, default_value_t = ColorChoice::Auto, global = true)]
     pub color: ColorChoice,
 
+    /// Without a command, oprobe opens its workbench: a window when a display is available
+    /// (builds with the `gui` feature), otherwise in this terminal.
     #[command(subcommand)]
-    pub command: Command,
+    pub command: Option<Command>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -56,9 +59,12 @@ pub enum Command {
     Tune(TuneArgs),
     /// Compare two JSON reports and fail on regressions (CI gate)
     Diff(DiffArgs),
-    /// Live terminal workbench: run, watch and adjust a workload interactively
+    /// Interactive workbench in this terminal: run, tune and probe with live charts
     #[command(visible_alias = "tui")]
     Top(TopArgs),
+    /// The same workbench in a native window (macOS, Windows, Linux with GTK 4)
+    #[command(visible_alias = "app")]
+    Gui(TopArgs),
     /// Check endpoint reachability, TLS, clock skew, credentials and permissions
     Doctor(DoctorArgs),
     /// Measure DNS / TCP / proxy / TLS handshakes and cold vs warm TTFB of an endpoint

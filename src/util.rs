@@ -4,7 +4,7 @@ use std::fmt;
 use std::str::FromStr;
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// A byte quantity that (de)serializes as a human string (`"4MiB"`, `"512KiB"`, `"1GB"`) or a number.
@@ -355,19 +355,11 @@ pub fn crc32c_append(crc: u32, data: &[u8]) -> u32 {
 }
 
 pub fn pct(num: f64, den: f64) -> f64 {
-    if den > 0.0 {
-        num / den * 100.0
-    } else {
-        0.0
-    }
+    if den > 0.0 { num / den * 100.0 } else { 0.0 }
 }
 
 pub fn ratio(num: f64, den: f64) -> f64 {
-    if den > 0.0 {
-        num / den
-    } else {
-        0.0
-    }
+    if den > 0.0 { num / den } else { 0.0 }
 }
 
 #[cfg(test)]

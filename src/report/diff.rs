@@ -4,8 +4,8 @@ use std::fmt::Write as _;
 
 use serde::{Deserialize, Serialize};
 
-use super::style::*;
 use super::Report;
+use super::style::*;
 use crate::util::fmt_ms;
 
 /// Regression limits. Percentages are relative changes in the "bad" direction.
@@ -78,11 +78,7 @@ pub struct DiffReport {
 
 fn rel(b: f64, c: f64) -> f64 {
     if b.abs() < 1e-12 {
-        if c.abs() < 1e-12 {
-            0.0
-        } else {
-            100.0
-        }
+        if c.abs() < 1e-12 { 0.0 } else { 100.0 }
     } else {
         (c - b) / b * 100.0
     }
@@ -372,7 +368,10 @@ impl DiffReport {
         for w in &self.warnings {
             let _ = writeln!(md, "> ⚠️ {w}\n");
         }
-        let _ = writeln!(md, "| check | baseline | candidate | change | limit | result |\n|---|---:|---:|---:|---|---|");
+        let _ = writeln!(
+            md,
+            "| check | baseline | candidate | change | limit | result |\n|---|---:|---:|---:|---|---|"
+        );
         for c in &self.checks {
             let st = match c.status {
                 Status::Pass => "✅ pass",

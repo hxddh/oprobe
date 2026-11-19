@@ -1,12 +1,12 @@
 //! The tuner: throttle-aware search for the best client settings.
 
+use crate::util::fmt_ms;
 use nsh_base::theme;
 use nsh_core::prelude::*;
-use oprobe::util::fmt_ms;
 
 use super::workbench::{failure_banner, run_form};
-use crate::store::store;
-use crate::ui::*;
+use crate::ui::store::store;
+use crate::ui::widgets::*;
 
 const COLS: [(&str, f32); 10] = [
     ("stage", 120.0),
@@ -92,10 +92,10 @@ fn result() -> impl IntoElement {
                         s.apply_tuned()
                     }))
                     .child(btn("Save profile…", Kind::Secondary, move || {
-                        crate::files::save_tuned_profile(s)
+                        crate::ui::files::save_tuned_profile(s)
                     }))
                     .child(btn("Save Rust code…", Kind::Secondary, move || {
-                        crate::files::save_tuned_rust(s)
+                        crate::ui::files::save_tuned_rust(s)
                     }))
                     .child(muted(move || s.notice.get().unwrap_or_default())),
             )

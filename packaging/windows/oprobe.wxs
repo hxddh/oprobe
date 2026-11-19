@@ -1,6 +1,8 @@
-<!-- WiX Toolset v4 source for the oprobe MSI (per-machine, adds oprobe to PATH).
+<!-- WiX Toolset v4 source for the oprobe MSI (per-machine): adds oprobe to PATH and a Start menu
+     shortcut that opens the workbench window (`oprobe gui`).
      Built by .github/workflows/release.yml:
-       wix build packaging/windows/oprobe.wxs -arch x64 -d Version=2.0.0 -d BinDir=... -o oprobe-2.0.0-x64.msi -->
+       wix build packaging/windows/oprobe.wxs -arch x64 -d Version=2.0.0 -d BinDir=... \
+         -d IconFile=packaging/desktop/oprobe.ico -o oprobe-2.0.0-x64.msi -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
   <Package Name="oprobe"
            Manufacturer="oprobe contributors"
@@ -11,16 +13,23 @@
     <MajorUpgrade DowngradeErrorMessage="A newer version of oprobe is already installed." />
     <MediaTemplate EmbedCab="yes" />
     <SummaryInformation Description="oprobe — white-box cloud storage microscope" />
+    <Icon Id="AppIcon" SourceFile="$(var.IconFile)" />
+    <Property Id="ARPPRODUCTICON" Value="AppIcon" />
 
     <StandardDirectory Id="ProgramFiles64Folder">
       <Directory Id="INSTALLFOLDER" Name="oprobe">
         <Directory Id="ProfilesFolder" Name="profiles" />
       </Directory>
     </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder" />
 
     <ComponentGroup Id="Main" Directory="INSTALLFOLDER">
       <Component Id="Binary" Guid="3C2B8F5E-1D4A-4F6B-9A2C-7E8D1F0A3B42">
-        <File Id="oprobe.exe" Source="$(var.BinDir)\oprobe.exe" KeyPath="yes" />
+        <File Id="oprobe.exe" Source="$(var.BinDir)\oprobe.exe" KeyPath="yes">
+          <Shortcut Id="StartMenuShortcut" Directory="ProgramMenuFolder" Name="oprobe"
+                    Description="See which layer makes object-storage I/O slow or expensive"
+                    Arguments="gui" WorkingDirectory="INSTALLFOLDER" Icon="AppIcon" Advertise="yes" />
+        </File>
         <Environment Id="PathEntry" Name="PATH" Value="[INSTALLFOLDER]" Permanent="no"
                      Part="last" Action="set" System="yes" />
       </Component>

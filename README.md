@@ -38,17 +38,17 @@ SLOWEST OPERATION
 ```
 *(real output, trimmed: AWS S3 through a corporate egress proxy)*
 
-## Desktop & terminal app
+## Workbench: window and terminal
 
-`oprobe-app` puts the same engine behind a native UI built with [Native Shell (NSH)](https://github.com/longbridge/nsh):
-AppKit on macOS, Win32/Direct2D on Windows, GTK 4 on Linux, and the same UI in any terminal (`oprobe-app --tui`).
-Run, tune and probe from forms; watch live charts; inspect the slowest operation as a request waterfall.
-`oprobe top` opens it in the terminal. [More →](docs/app.md)
+Run `oprobe` with no arguments and its workbench opens — a native window (AppKit on macOS, Win32/Direct2D on
+Windows, GTK 4 on Linux) when there is a display, the same UI in your terminal otherwise (`oprobe top`, also over
+SSH). Run, tune and probe from forms; watch live charts; inspect the slowest operation as a request waterfall.
+[More →](docs/app.md)
 
-The architecture has two layers and no other frameworks: **OpenDAL and its own HTTP client, observed request by request** for everything that
-measures, and **NSH** for everything you look at.
+Two layers, no other frameworks: **OpenDAL and its own HTTP client, observed request by request** for everything
+that measures, and **[Native Shell (NSH)](https://github.com/longbridge/nsh)** for everything you look at.
 
-![oprobe-app: slowest operation waterfall](docs/images/app-slowest-op.png)
+![oprobe workbench: slowest operation waterfall](docs/images/app-slowest-op.png)
 
 ## Why oprobe
 
@@ -69,16 +69,16 @@ next questions directly from measurements — never from estimates:
 
 | Platform | Command |
 |---|---|
-| Any (Rust ≥ 1.91) | `cargo install oprobe --locked` |
+| Any (Rust ≥ 1.97) | `cargo install oprobe --locked` (add `--features gui` for the window on Linux) |
 | macOS / Linux (Homebrew) | each release ships `oprobe.rb` for a tap — see [docs/install.md](docs/install.md) |
 | macOS / Linux (script) | `curl -fsSL https://github.com/hxddh/oprobe/releases/latest/download/install.sh \| sh` |
-| macOS installer | `oprobe-<version>-macos-universal.pkg` (Apple Silicon + Intel) |
+| macOS | `oprobe-<version>-macos-universal.pkg` (command line) or `.dmg` (`oprobe.app`) — Apple Silicon + Intel |
 | Debian / Ubuntu | `sudo apt install ./oprobe_<version>-1_amd64.deb` (or `_arm64`) |
 | Fedora / RHEL / SUSE | `sudo dnf install ./oprobe-<version>-1.x86_64.rpm` (or `.aarch64`) |
-| Windows (installer) | `oprobe-<version>-x64.msi` / `-arm64.msi` — adds `oprobe` to `PATH` |
+| Windows (installer) | `oprobe-<version>-x64.msi` / `-arm64.msi` — adds `oprobe` to `PATH` and a Start menu entry |
 | Windows (Scoop) | `scoop install https://github.com/hxddh/oprobe/releases/latest/download/oprobe.json` |
 | Windows (PowerShell) | `irm https://github.com/hxddh/oprobe/releases/latest/download/install.ps1 \| iex` |
-| **Desktop app** | macOS `oprobe-app-<version>-macos-universal.dmg` · Windows `oprobe-app-<version>-x64.msi` · Linux `oprobe-app-<version>-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux desktop | `oprobe-desktop-<version>-x86_64-unknown-linux-gnu.tar.gz` (window; GTK 4.14+) |
 
 Release archives (`oprobe-<version>-<target>.tar.gz` / `.zip`) include man pages, shell completions
 (bash, zsh, fish, PowerShell, elvish) and example profiles. Every asset is listed in `SHA256SUMS`.
@@ -99,7 +99,7 @@ AWS_ACCESS_KEY_ID=lab AWS_SECRET_ACCESS_KEY=lab \
 oprobe doctor s3://my-bucket/oprobe            # connectivity, TLS, clock skew, permissions
 oprobe run    s3://my-bucket/oprobe --preset parquet -d 30s --json baseline.json
 oprobe run    s3://my-bucket --existing warehouse/events/   # read-only, your real objects
-oprobe top    s3://my-bucket/oprobe            # live terminal workbench (needs oprobe-app)
+oprobe top    s3://my-bucket/oprobe            # live workbench in this terminal
 
 # 4. Tune and ship
 oprobe tune s3://my-bucket/oprobe --preset parquet --p99-ms 250 \
@@ -119,7 +119,7 @@ of killed runs.
 | Command | Purpose |
 |---|---|
 | `oprobe run [TARGET]` | Run a workload; print the white-box report; save `--json` / `--markdown`. `--fail-on warning\|critical` for CI. |
-| `oprobe top [TARGET]` | The app's interactive workbench in the terminal (`oprobe-app --tui`): live charts, time breakdown, per-API tables, slowest-op waterfall, tuner, probe. |
+| `oprobe top [TARGET]` / `oprobe gui [TARGET]` | The interactive workbench in this terminal / in a window: live charts, time breakdown, per-API tables, slowest-op waterfall, tuner, probe. `oprobe` alone opens it. |
 | `oprobe tune [TARGET]` | Throttle-aware closed-loop tuning with `--objective throughput\|latency\|cost`. |
 | `oprobe diff BASE CAND` | Regression gate (exit code 3 on regression) with JSON / Markdown / JUnit output. |
 | `oprobe doctor [TARGET]` | Step-by-step checks: config, credentials, DNS/proxy/TCP/TLS, HTTP, clock skew, list/write/read/stat/delete. |

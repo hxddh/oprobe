@@ -8,8 +8,8 @@ use oprobe::analysis::diagnosis::Bottleneck;
 use oprobe::config::*;
 use oprobe::engine::{Cancel, RunOptions, Session};
 use oprobe::lab::{LabConfig, LabServer};
-use oprobe::report::diff::{diff, Thresholds};
 use oprobe::report::Report;
+use oprobe::report::diff::{Thresholds, diff};
 use oprobe::trace::{Api, Snapshot};
 use oprobe::util::ByteSize;
 
@@ -424,7 +424,7 @@ async fn proxy_connect_is_used_and_timed_with(mode: TransportMode) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn tuner_finds_throttling_ceiling() {
-    use oprobe::tune::{tune, Objective, TuneOptions};
+    use oprobe::tune::{Objective, TuneOptions, tune};
     let lab = lab(LabConfig {
         base_ttfb_delay: Duration::from_millis(5),
         max_inflight_before_503: Some(6),
@@ -565,9 +565,11 @@ fn cli_binary_end_to_end() {
         .output()
         .unwrap();
     assert!(d.status.success(), "{}", String::from_utf8_lossy(&d.stdout));
-    assert!(std::fs::read_to_string(&junit)
-        .unwrap()
-        .contains("testsuite"));
+    assert!(
+        std::fs::read_to_string(&junit)
+            .unwrap()
+            .contains("testsuite")
+    );
 
     let init = Command::new(bin)
         .args(["init", "--preset", "checkpoint"])
@@ -611,9 +613,12 @@ fn cli_binary_end_to_end() {
 
 #[test]
 fn shipped_profiles_are_valid() {
-    std::env::set_var("R2_ACCOUNT_ID", "x");
-    std::env::set_var("MINIO_ROOT_USER", "x");
-    std::env::set_var("MINIO_ROOT_PASSWORD", "x");
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("R2_ACCOUNT_ID", "x") };
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("MINIO_ROOT_USER", "x") };
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("MINIO_ROOT_PASSWORD", "x") };
     let mut n = 0;
     for e in std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/profiles")).unwrap() {
         let p = e.unwrap().path();

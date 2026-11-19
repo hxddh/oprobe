@@ -13,10 +13,10 @@ use serde::{Deserialize, Serialize};
 
 use super::dial::Dialer;
 use super::proxy::ProxyConfig;
-use super::tls::{build_tls_connector, TlsClientOptions};
+use super::tls::{TlsClientOptions, build_tls_connector};
 use super::transport::HttpVersion;
-use crate::trace::recorder::quantiles;
 use crate::trace::Quantiles;
+use crate::trace::recorder::quantiles;
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ProbeSample {
@@ -113,7 +113,7 @@ where
         Ok(b.body(Empty::new())?)
     };
     macro_rules! timed {
-        ($fut:expr) => {{
+        ($fut:expr_2021) => {{
             let t = Instant::now();
             let resp = tokio::time::timeout(step, $fut)
                 .await

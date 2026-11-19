@@ -1,7 +1,7 @@
 //! Thread-safe aggregation of trace records into histograms, timelines and slow-op samples.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 

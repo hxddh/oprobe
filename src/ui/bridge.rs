@@ -4,12 +4,12 @@
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use oprobe::config::Profile;
-use oprobe::engine::{Cancel, Progress, ProgressFn, RunOptions, Session};
-use oprobe::net::probe::{ProbeOptions, ProbeReport, probe_endpoint};
-use oprobe::report::{Report, TuneSummary};
-use oprobe::trace::Snapshot;
-use oprobe::tune::{Objective, Trial, TuneEvent, TuneOptions, codegen, tune};
+use crate::config::Profile;
+use crate::engine::{Cancel, Progress, ProgressFn, RunOptions, Session};
+use crate::net::probe::{ProbeOptions, ProbeReport, probe_endpoint};
+use crate::report::{Report, TuneSummary};
+use crate::trace::Snapshot;
+use crate::tune::{Objective, Trial, TuneEvent, TuneOptions, codegen, tune};
 
 fn runtime() -> &'static tokio::runtime::Runtime {
     static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
@@ -64,7 +64,7 @@ pub struct Job {
 
 fn failed(err: &anyhow::Error, scheme: &str) -> Outcome {
     let chain = format!("{err:#}");
-    let hint = oprobe::analysis::hints::hint_for(&chain, scheme).map(|h| (h.title, h.steps));
+    let hint = crate::analysis::hints::hint_for(&chain, scheme).map(|h| (h.title, h.steps));
     Outcome::Failed { error: chain, hint }
 }
 

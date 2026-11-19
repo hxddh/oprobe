@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::net::HttpVersion;
@@ -662,7 +662,10 @@ impl TargetSpec {
             "fs" | "file" => {
                 let p = match (&host, path) {
                     (Some(h), p) if !h.is_empty() => format!("{h}{p}"),
-                    (_, "") => std::env::temp_dir().join("oprobe").to_string_lossy().into_owned(),
+                    (_, "") => std::env::temp_dir()
+                        .join("oprobe")
+                        .to_string_lossy()
+                        .into_owned(),
                     (_, p) => p.to_owned(),
                 };
                 options.insert("root".into(), p);
@@ -695,7 +698,10 @@ impl TargetSpec {
                 }
             }
             "azblob" | "az" | "azure" => {
-                options.insert("container".into(), host.context("azblob:// URL needs a container")?);
+                options.insert(
+                    "container".into(),
+                    host.context("azblob:// URL needs a container")?,
+                );
                 if let Some(r) = root {
                     options.insert("root".into(), r);
                 }
@@ -952,7 +958,8 @@ mod tests {
 
     #[test]
     fn env_expansion_and_secret_placeholders() {
-        std::env::set_var("OPROBE_TEST_SECRET", "s3cr3t");
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("OPROBE_TEST_SECRET", "s3cr3t") };
         assert_eq!(
             expand_env("a-${OPROBE_TEST_SECRET}-b").unwrap(),
             "a-s3cr3t-b"

@@ -1,12 +1,12 @@
 //! The endpoint probe: DNS, TCP, proxy, TLS and cold vs warm time to first byte.
 
+use crate::util::fmt_ms;
 use nsh_base::theme;
 use nsh_core::prelude::*;
-use oprobe::util::fmt_ms;
 
 use super::workbench::failure_banner;
-use crate::store::store;
-use crate::ui::*;
+use crate::ui::store::store;
+use crate::ui::widgets::*;
 
 fn results() -> impl IntoElement {
     let s = store();

@@ -4,6 +4,9 @@ use clap::Parser;
 
 fn main() -> ExitCode {
     let cli = oprobe::cli::Cli::parse();
+    if let Some(code) = oprobe::cli::ui_entry(&cli) {
+        return code;
+    }
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

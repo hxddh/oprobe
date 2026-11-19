@@ -2,8 +2,8 @@
 
 use std::fmt::Write as _;
 
-use super::style::*;
 use super::Report;
+use super::style::*;
 use crate::analysis::diagnosis::Severity;
 use crate::trace::{Protocol, RequestRecord, SlowOp, Snapshot};
 use crate::util::{fmt_bytes, fmt_ms, fmt_usd};
@@ -171,16 +171,14 @@ pub fn slow_op_block(op: &SlowOp, show_tree: bool) -> String {
             dim(&format!("… {} more requests", op.requests.len() - 12))
         );
     }
-    if show_tree {
-        if let Some(t) = &op.await_tree {
-            let _ = writeln!(
-                out,
-                "    {}",
-                dim("async call stack captured while in flight:")
-            );
-            for l in t.lines().take(16) {
-                let _ = writeln!(out, "      {}", dim(l));
-            }
+    if show_tree && let Some(t) = &op.await_tree {
+        let _ = writeln!(
+            out,
+            "    {}",
+            dim("async call stack captured while in flight:")
+        );
+        for l in t.lines().take(16) {
+            let _ = writeln!(out, "      {}", dim(l));
         }
     }
     out
@@ -243,11 +241,7 @@ pub fn apis_table(s: &Snapshot) -> String {
                         c.to_string()
                     };
                     let t = format!("{label}×{n}");
-                    if *c == 0 || *c >= 400 {
-                        red(&t)
-                    } else {
-                        t
-                    }
+                    if *c == 0 || *c >= 400 { red(&t) } else { t }
                 })
                 .collect();
             vec![
@@ -384,7 +378,13 @@ pub fn render(r: &Report) -> String {
         );
         out.push_str(&apis_table(s));
         if s.connections.http2_requests > 0 {
-            let _ = writeln!(out, "  {}", dim("h2: `send` ends when the body is handed to the stream; flow-controlled transmission shows up in ttfb"));
+            let _ = writeln!(
+                out,
+                "  {}",
+                dim(
+                    "h2: `send` ends when the body is handed to the stream; flow-controlled transmission shows up in ttfb"
+                )
+            );
         }
     }
 
@@ -416,7 +416,11 @@ pub fn render(r: &Report) -> String {
             c.dialed,
             c.reuse_pct,
             c.peak_inflight_requests,
-            if c.dial_failures > 0 { red(&format!(" · {} failed dials", c.dial_failures)) } else { String::new() }
+            if c.dial_failures > 0 {
+                red(&format!(" · {} failed dials", c.dial_failures))
+            } else {
+                String::new()
+            }
         );
         if c.dns.count > 0 {
             let _ = writeln!(

@@ -14,14 +14,14 @@ use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use opendal::Operator;
-use opendal_core::raw::{Layer, Servicer};
 use opendal_core::HttpTransporter;
 use opendal_core::OperationContext;
+use opendal_core::raw::{Layer, Servicer};
 use opendal_http_transport_reqwest::ReqwestTransport;
 use oprobe::config::{Knobs, TransportMode};
 use oprobe::engine::operator::{base_operator, measured_operator};
 use oprobe::engine::procstat::usage;
-use oprobe::lab::{LabConfig, LabServer, LAB_CA_PEM};
+use oprobe::lab::{LAB_CA_PEM, LabConfig, LabServer};
 use oprobe::trace::{OpCompletion, OpScope, Phase, Recorder};
 
 /// Exactly what the `opendal` facade installs by default, with the lab CA trusted.

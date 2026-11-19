@@ -8,7 +8,7 @@ use anyhow::Result;
 
 use super::args::{CostArgs, DoctorArgs, KnobArgs, WorkloadArgs};
 use crate::analysis::hints::hint_for;
-use crate::net::probe::{probe_endpoint, ProbeOptions, ProbeReport};
+use crate::net::probe::{ProbeOptions, ProbeReport, probe_endpoint};
 use crate::report::style::{bold, dim, green, red, yellow};
 use crate::util::fmt_ms;
 

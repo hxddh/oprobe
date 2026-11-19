@@ -35,16 +35,17 @@ oprobe 2.0 is a rewrite. Everything reported is measured per request; nothing is
 - **CI gate.** `oprobe diff` checks throughput, per-operation p50/p99 (with noise floors and
   minimum samples), errors, new throttling, integrity, request/read amplification and cost; outputs
   terminal, Markdown, JSON and JUnit; exits 3 on regression.
-- **New commands.** `top` (the app's workbench in the terminal), `doctor` (step-by-step checks with fixes),
+- **New commands.** `top` / `gui` (the workbench in a terminal / window), `doctor` (step-by-step checks with fixes),
   `probe` (handshake microscope with clock-skew check), `lab` (S3-compatible fault-injection
   server), `cleanup` (sweeper with dry-run), `init`, `report`, `completions`, man pages.
 - **Egress proxy support.** `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` / `NO_PROXY` with HTTP CONNECT
   tunnelling (incl. basic auth) and timed proxy handshakes; `--proxy` / `--proxy none`.
-- **Desktop & terminal app (`oprobe-app`).** A Native Shell (NSH) app over the same engine: native windows on
-  macOS (AppKit), Windows (Win32/Direct2D) and Linux (GTK 4), and the same UI in a terminal (`--tui`). Workbench
-  with live charts, time breakdown, per-API tables, cost and a request waterfall of the slowest operation; tuner
-  with apply/save; endpoint probe. Shipped as `.dmg`, `.msi` / `.zip` and a Linux tarball with a `.desktop` entry,
-  and on crates.io (`cargo install oprobe-app`). `oprobe top` opens it in the terminal.
+- **Workbench in a window and in the terminal.** `oprobe` with no arguments opens an interactive workbench built
+  with Native Shell (NSH): a native window on macOS (AppKit), Windows (Win32/Direct2D) and Linux (GTK 4), or the same
+  UI in any terminal (`oprobe top`, also over SSH). Live charts, time breakdown, per-API tables, cost, the slowest
+  operation as a request waterfall, the tuner with apply/save, and the endpoint probe. One binary: macOS and Windows
+  builds include the window (`.dmg`, `.msi` with a Start menu entry); Linux server packages stay headless and a
+  `oprobe-desktop` tarball carries the window.
 - **Two-layer architecture.** OpenDAL and its own HTTP client for measurement; NSH for every UI.
 - **Native distribution.** Release archives named `oprobe-<version>-<target>`, static Linux musl
   builds, `.deb`, `.rpm`, macOS universal binary and `.pkg`, Windows `.msi` (x64 and ARM64),

@@ -24,8 +24,8 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use super::dial::{ConnClock, DialTiming, Dialer};
 use super::proxy::ProxyConfig;
-use super::tls::{build_tls_connector, TlsClientOptions};
-use crate::trace::{classify_http, OpScope, Protocol, Recorder, RequestRecord, RequestTiming};
+use super::tls::{TlsClientOptions, build_tls_connector};
+use crate::trace::{OpScope, Protocol, Recorder, RequestRecord, RequestTiming, classify_http};
 
 /// HTTP protocol preference.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -216,7 +216,7 @@ impl Inner {
                         id: c.id,
                         sender: c.sender,
                         clock: c.clock,
-                    })
+                    });
                 }
                 _ => continue,
             }
@@ -424,10 +424,8 @@ impl Pending {
         if error.is_some() && self.record.error.is_none() {
             self.record.error = error;
         }
-        if complete {
-            if let Some((inner, key, id, sender, clock)) = self.h1_return.take() {
-                inner.return_h1(key, id, sender, clock);
-            }
+        if complete && let Some((inner, key, id, sender, clock)) = self.h1_return.take() {
+            inner.return_h1(key, id, sender, clock);
         }
         if let Some(r) = &self.recorder {
             r.request_finished();
@@ -454,10 +452,10 @@ impl Stream for TracedResponseBody {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
-        if let Some(p) = this.pending.as_mut() {
-            if let Some(t) = p.last_yield.take() {
-                p.stall += t.elapsed();
-            }
+        if let Some(p) = this.pending.as_mut()
+            && let Some(t) = p.last_yield.take()
+        {
+            p.stall += t.elapsed();
         }
         loop {
             match Pin::new(&mut this.incoming).poll_frame(cx) {
@@ -553,7 +551,7 @@ impl HttpTransport for TracingTransport {
                 return Err(Error::new(
                     ErrorKind::ConfigInvalid,
                     format!("unsupported URI scheme {other:?} in {uri}"),
-                ))
+                ));
             }
         };
         let host = uri
@@ -660,12 +658,11 @@ impl HttpTransport for TracingTransport {
                 // HTTP/1 wants origin-form plus Host header.
                 let pq = uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
                 builder = builder.uri(pq).version(http::Version::HTTP_11);
-                if !parts.headers.contains_key(http::header::HOST) {
-                    if let Some(a) = uri.authority() {
-                        if let Ok(v) = HeaderValue::from_str(a.as_str()) {
-                            parts.headers.insert(http::header::HOST, v);
-                        }
-                    }
+                if !parts.headers.contains_key(http::header::HOST)
+                    && let Some(a) = uri.authority()
+                    && let Ok(v) = HeaderValue::from_str(a.as_str())
+                {
+                    parts.headers.insert(http::header::HOST, v);
                 }
                 if !inner.cfg.keep_alive {
                     parts

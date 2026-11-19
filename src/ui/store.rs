@@ -3,16 +3,16 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::analysis::diagnosis::{Diagnosis, diagnose};
+use crate::cli::args::{CostArgs, KnobArgs, TargetArgs, WorkloadArgs};
+use crate::config::{Knobs, Profile};
+use crate::net::probe::ProbeReport;
+use crate::report::{Report, TuneSummary};
+use crate::trace::Snapshot;
+use crate::tune::{Objective, Trial};
 use nsh_core::prelude::*;
-use oprobe::analysis::diagnosis::{Diagnosis, diagnose};
-use oprobe::cli::args::{CostArgs, KnobArgs, TargetArgs, WorkloadArgs};
-use oprobe::config::{Knobs, Profile};
-use oprobe::net::probe::ProbeReport;
-use oprobe::report::{Report, TuneSummary};
-use oprobe::trace::Snapshot;
-use oprobe::tune::{Objective, Trial};
 
-use crate::bridge::{Job, Outcome};
+use crate::ui::bridge::{Job, Outcome};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Page {
@@ -157,7 +157,7 @@ impl Store {
             job: stored(None),
             last: stored(None),
         };
-        let l = crate::launch();
+        let l = crate::ui::launch();
         batch(|| {
             if let Some(v) = l.target {
                 s.form.target.set(v);
@@ -222,7 +222,7 @@ impl Store {
             no_keep_alive: !f.keep_alive.get_untracked(),
             ..Default::default()
         };
-        oprobe::cli::build_profile(&target, &workload, &knobs, &CostArgs::default())
+        crate::cli::build_profile(&target, &workload, &knobs, &CostArgs::default())
             .map_err(|e| format!("{e:#}"))
     }
 
@@ -237,7 +237,7 @@ impl Store {
     }
 
     fn reject(&self, error: String) {
-        let hint = oprobe::analysis::hints::hint_for(&error, "s3").map(|h| (h.title, h.steps));
+        let hint = crate::analysis::hints::hint_for(&error, "s3").map(|h| (h.title, h.steps));
         batch(|| {
             self.failure.set(Some(Failure { error, hint }));
             self.status.set(Status::Failed);
@@ -336,8 +336,7 @@ impl Store {
         let up = job.take();
         batch(|| {
             if let Some(s) = up.snapshot {
-                if s.phase == oprobe::trace::Phase::Measure || s.phase == oprobe::trace::Phase::Done
-                {
+                if s.phase == crate::trace::Phase::Measure || s.phase == crate::trace::Phase::Done {
                     let (t, n) = (s.elapsed_s, s.summary.ops);
                     let prev = self.last.replace(Some((t, n)));
                     if let Some((t0, n0)) = prev

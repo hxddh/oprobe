@@ -119,10 +119,9 @@ impl Tuner<'_> {
             .trials
             .iter()
             .position(|t| &t.knobs == knobs && t.stage != "confirm")
+            && stage != "confirm"
         {
-            if stage != "confirm" {
-                return Ok(i);
-            }
+            return Ok(i);
         }
         let id = self.trials.len();
         (self.on_event)(TuneEvent::Started {
@@ -171,10 +170,10 @@ impl Tuner<'_> {
         {
             why.push(format!("{} throttled responses", t.throttled_responses));
         }
-        if let Some(limit) = p.sla.p99_ms {
-            if worst_p99 > limit {
-                why.push(format!("p99 {worst_p99:.1}ms > {limit}ms"));
-            }
+        if let Some(limit) = p.sla.p99_ms
+            && worst_p99 > limit
+        {
+            why.push(format!("p99 {worst_p99:.1}ms > {limit}ms"));
         }
         t.feasible = why.is_empty();
         t.note = why.join(", ");

@@ -8,11 +8,11 @@ pub mod terminal;
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::analysis::cost::{cost_report, CostReport};
-use crate::analysis::diagnosis::{diagnose, Diagnosis};
+use crate::analysis::cost::{CostReport, cost_report};
+use crate::analysis::diagnosis::{Diagnosis, diagnose};
 use crate::config::{Knobs, Profile, Sla, WorkloadSpec};
 use crate::engine::CleanupSummary;
 use crate::trace::Snapshot;
@@ -139,7 +139,10 @@ impl Report {
             .with_context(|| format!("`{}` is not valid JSON", path.display()))?;
         match v.get("schema").and_then(|s| s.as_str()) {
             Some(SCHEMA) => {}
-            Some(other) => bail!("`{}` uses report schema `{other}`; this oprobe reads `{SCHEMA}`", path.display()),
+            Some(other) => bail!(
+                "`{}` uses report schema `{other}`; this oprobe reads `{SCHEMA}`",
+                path.display()
+            ),
             None if v.get("schema_version").is_some() => bail!(
                 "`{}` is an oprobe v1 report; re-run the baseline with oprobe v2 (`oprobe run --json`)",
                 path.display()
@@ -157,11 +160,11 @@ pub fn to_json(r: &Report) -> String {
 }
 
 pub fn write_file(path: &Path, content: &str) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("cannot create directory `{}`", parent.display()))?;
-        }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("cannot create directory `{}`", parent.display()))?;
     }
     std::fs::write(path, content).with_context(|| format!("cannot write `{}`", path.display()))
 }

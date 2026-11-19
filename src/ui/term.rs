@@ -1,4 +1,4 @@
-//! `oprobe-app --tui`: the same NSH UI drawn on the terminal grid (`nsh-platform-tui`).
+//! `oprobe top`: the same NSH UI drawn on the terminal grid (`nsh-platform-tui`).
 //! Event conversion follows NSH's own terminal host (`nsh-tui-host`, Apache-2.0).
 
 use std::io;
@@ -136,7 +136,7 @@ pub fn run() -> io::Result<()> {
     let mut view = AppView::new(options);
     let mut term = Terminal::new(CrosstermBackend::new(io::BufWriter::new(io::stdout())))?;
     term.draw(|f| view.render(f, f.area()))?;
-    view.load(Root::of::<crate::App>())
+    view.load(Root::of::<crate::ui::App>())
         .map_err(|e| io::Error::other(e.to_string()))?;
     let res = run_app(&mut term, &mut view, |timeout: Duration| {
         if event::poll(timeout)? {

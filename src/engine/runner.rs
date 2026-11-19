@@ -11,10 +11,10 @@ use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use tokio::sync::Semaphore;
 
-use super::cleanup::{delete_prefix, new_run_prefix, CleanupSummary};
+use super::cleanup::{CleanupSummary, delete_prefix, new_run_prefix};
 use super::dataset::{Dataset, PayloadPool, Picker};
 use super::operator::{admin_operator, base_operator, measured_operator};
-use super::ops::{error_class, execute, verb, OpCtx};
+use super::ops::{OpCtx, error_class, execute, verb};
 use crate::config::{Knobs, OpKind, OpSpec, Profile};
 use crate::trace::{OpCompletion, OpScope, OpenLoopStats, Phase, Recorder, Snapshot};
 
@@ -117,12 +117,10 @@ impl Session {
             .iter()
             .map(|m| &m.op)
             .find(|o| matches!(o, OpKind::Read { size: Some(_) }))
+            && let Some(min) = dataset.objects.iter().map(|o| o.size).min()
+            && sz.0 > min
         {
-            if let Some(min) = dataset.objects.iter().map(|o| o.size).min() {
-                if sz.0 > min {
-                    warnings.push(format!("range size {sz} exceeds the smallest object ({min} B); those reads become whole-object reads"));
-                }
-            }
+            warnings.push(format!("range size {sz} exceeds the smallest object ({min} B); those reads become whole-object reads"));
         }
         let max_write = mix
             .iter()
@@ -195,15 +193,15 @@ impl Session {
                     tick.tick().await;
                     n += 1;
                     rec.sample_trees(rec.current_p90_us().max(2_000));
-                    if n.is_multiple_of(50) {
-                        if let Some((pct, rss)) = cpu.sample() {
-                            rec.update_client(pct, rss);
-                        }
+                    if n.is_multiple_of(50)
+                        && let Some((pct, rss)) = cpu.sample()
+                    {
+                        rec.update_client(pct, rss);
                     }
-                    if n.is_multiple_of(12) {
-                        if let Some(cb) = &progress {
-                            cb(Progress::Snapshot(Box::new(rec.snapshot())));
-                        }
+                    if n.is_multiple_of(12)
+                        && let Some(cb) = &progress
+                    {
+                        cb(Progress::Snapshot(Box::new(rec.snapshot())));
                     }
                 }
             })
@@ -358,7 +356,7 @@ impl Session {
                             started.fetch_add(1, Ordering::Relaxed);
                             issued += 1;
                             let kind = pick_kind(&mut rng, &cum);
-                            let mut op_rng = SmallRng::seed_from_u64(rng.gen());
+                            let mut op_rng = SmallRng::seed_from_u64(rng.r#gen());
                             let slot = seq % (knobs.concurrency as u64 * 4).max(4);
                             seq += 1;
                             let ctx = ctx.clone();

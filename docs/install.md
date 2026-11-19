@@ -13,14 +13,16 @@ with their SHA-256 in `SHA256SUMS`.
 | `oprobe-<ver>-universal-apple-darwin.tar.gz` | macOS (Apple Silicon + Intel) |
 | `oprobe-<ver>-macos-universal.pkg` | macOS installer (`/usr/local/bin`, man page, zsh completion) |
 | `oprobe-<ver>-aarch64-apple-darwin.tar.gz` / `x86_64-apple-darwin` | macOS single-arch |
-| `oprobe-<ver>-x64.msi` / `-arm64.msi` | Windows installer (adds to `PATH`, removable in *Apps*) |
+| `oprobe-<ver>-x64.msi` / `-arm64.msi` | Windows installer (adds to `PATH`, Start menu entry, removable in *Apps*) |
 | `oprobe-<ver>-x86_64-pc-windows-msvc.zip` / `aarch64-…` | Windows portable |
-| `oprobe-app-<ver>-macos-universal.dmg` | desktop app for macOS (`oprobe.app`, Apple Silicon + Intel) |
-| `oprobe-app-<ver>-x64.msi` / `oprobe-app-<ver>-x86_64-pc-windows-msvc.zip` | desktop app for Windows (Start menu shortcut) |
-| `oprobe-app-<ver>-x86_64-unknown-linux-gnu.tar.gz` | desktop app for Linux (GTK 4.14+; `install.sh`, `.desktop`, icon) |
+| `oprobe-<ver>-macos-universal.dmg` | macOS app bundle (`oprobe.app`, same binary as the `.pkg`) |
+| `oprobe-desktop-<ver>-x86_64-unknown-linux-gnu.tar.gz` | Linux build with the window (GTK 4.14+; `install.sh`, `.desktop`, icon) |
 | `oprobe.rb` | Homebrew formula |
 | `oprobe.json` | Scoop manifest |
 | `install.sh` / `install.ps1` | one-line installers (verify checksums) |
+
+Every build has the CLI and the terminal workbench (`oprobe top`); macOS and Windows builds also open a native
+window (`oprobe gui`). The Linux `.deb`, `.rpm` and static archives are headless (no GTK needed).
 
 Archives contain `oprobe` (`oprobe.exe`), `README.md`, `LICENSE`, `CHANGELOG.md`, `man/` pages,
 `completions/` for bash, zsh, fish, PowerShell and elvish, `profiles/` and `docs/`.
@@ -28,7 +30,8 @@ Archives contain `oprobe` (`oprobe.exe`), `README.md`, `LICENSE`, `CHANGELOG.md`
 ## From source
 
 ```bash
-cargo install oprobe --locked     # Rust ≥ 1.91 and a C compiler (for aws-lc, the TLS crypto); no OpenSSL
+cargo install oprobe --locked                  # Rust ≥ 1.97 and a C compiler; no OpenSSL
+cargo install oprobe --locked --features gui   # + native window (Linux: libgtk-4-dev)
 ```
 
 ## Homebrew
@@ -62,3 +65,9 @@ sha256sum --ignore-missing -c SHA256SUMS                 # Linux
 shasum -a 256 --ignore-missing -c SHA256SUMS             # macOS
 Get-FileHash oprobe-2.0.0-x64.msi -Algorithm SHA256       # Windows
 ```
+
+## Unsigned macOS and Windows packages
+
+The `.pkg`, `.dmg` and `.msi` are not yet signed with a developer certificate. macOS: right-click → *Open* the first
+time, or `xattr -dr com.apple.quarantine /Applications/oprobe.app`. Windows: SmartScreen → *More info* → *Run
+anyway*. Homebrew, Scoop, the install scripts and `cargo install` are not affected.

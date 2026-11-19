@@ -5,8 +5,8 @@ use std::sync::{Arc, Once};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use opendal::layers::{RetryLayer, TailCutLayer, TimeoutLayer};
 use opendal::Operator;
+use opendal::layers::{RetryLayer, TailCutLayer, TimeoutLayer};
 
 use crate::config::{Knobs, TargetSpec, TransportMode};
 use crate::layers::{InProcessObserveLayer, TraceContextLayer, WhiteboxCacheLayer};
