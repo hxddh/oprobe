@@ -51,6 +51,17 @@ oprobe 2.0 is a rewrite. Everything reported is measured per request; nothing is
   builds, `.deb`, `.rpm`, macOS universal binary and `.pkg`, Windows `.msi` (x64 and ARM64),
   Homebrew formula, Scoop manifest, checksum-verifying install scripts, `SHA256SUMS`.
 
+### Known limitations
+
+- The macOS `.pkg`/`.dmg` and Windows `.msi` are not yet signed with a developer certificate: macOS asks to confirm
+  on first open, Windows SmartScreen asks to *Run anyway* (see `docs/install.md`). Homebrew, Scoop, the install
+  scripts and `cargo install` are unaffected.
+- With OpenDAL's own client (the default), time spent waiting inside reqwest's pool for an idle connection is part
+  of TTFB, proxy CONNECT is reported together with TCP to the proxy, and wire bytes and the TLS cipher are not
+  available; `--microscope` measures all of these with oprobe's own pool.
+- Observer effect: on tens of thousands of tiny requests per second over loopback, tracing costs up to ~10–18 %
+  throughput; on real storage latencies it is negligible (`examples/overhead.rs`, `docs/metrics.md`).
+
 ### Breaking changes
 
 - Report schema is now `oprobe.report/v2`; v1 reports are rejected by `oprobe diff` with a clear

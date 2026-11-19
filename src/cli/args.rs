@@ -481,6 +481,10 @@ pub struct LabArgs {
     /// Cap response bandwidth per request (KiB/s)
     #[arg(long)]
     pub bandwidth_kib: Option<u64>,
+    /// Answer throttled requests without reading the upload and close the connection (as real
+    /// gateways do), so clients see resets mid-upload
+    #[arg(long)]
+    pub throttle_early_close: bool,
     /// Delay for CompleteMultipartUpload
     #[arg(long, default_value = "0ms")]
     pub complete_delay: String,

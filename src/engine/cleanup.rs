@@ -57,7 +57,16 @@ pub async fn delete_prefix(op: &Operator, prefix: &str) -> CleanupSummary {
                 break;
             }
             let n = files.len() as u64;
-            op.delete_iter(files).await?;
+            if op.delete_iter(files.clone()).await.is_err() {
+                // Batch delete is optional on many S3-compatible stores, proxies and emulators:
+                // fall back to one DELETE per object rather than leave test data behind.
+                use futures::{StreamExt, TryStreamExt};
+                futures::stream::iter(files)
+                    .map(|f| async move { op.delete(&f).await })
+                    .buffer_unordered(16)
+                    .try_collect::<Vec<_>>()
+                    .await?;
+            }
             s.deleted += n;
         }
         let _ = op.delete_with(prefix).recursive(true).await;

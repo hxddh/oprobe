@@ -800,6 +800,7 @@ async fn cmd_lab(a: LabArgs) -> Result<ExitCode> {
         throttle_every_n_requests: a.throttle_every,
         throttle_status_code: a.throttle_status,
         stream_bandwidth_kib_s: a.bandwidth_kib,
+        throttle_early_close: a.throttle_early_close,
     };
     let lab = LabServer::spawn(&a.bind, cfg).await?;
     println!(

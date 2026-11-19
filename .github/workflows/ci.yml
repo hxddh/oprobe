@@ -46,6 +46,51 @@ jobs:
           cargo run --release --locked -- diff base.json cand.json --max-p99-increase 400 --max-p50-increase 400 --max-throughput-drop 80 --markdown gate.md
           cat gate.md >> "$GITHUB_STEP_SUMMARY"
 
+  backends:
+    name: real backends (MinIO, fake-gcs-server, Azurite)
+    runs-on: ubuntu-latest
+    env:
+      OPROBE_IT_S3_ENDPOINT: http://127.0.0.1:9000
+      OPROBE_IT_GCS_ENDPOINT: http://127.0.0.1:4443
+      OPROBE_IT_AZBLOB_ENDPOINT: http://127.0.0.1:10000/oprobeit
+      OPROBE_IT_AZBLOB_ACCOUNT: oprobeit
+    steps:
+      - uses: actions/checkout@v4
+      - name: Start MinIO, fake-gcs-server and Azurite
+        run: |
+          # Azurite account with a key generated for this run only.
+          key="$(openssl rand -base64 64 | tr -d '\n')"
+          echo "::add-mask::$key"
+          echo "OPROBE_IT_AZBLOB_KEY=$key" >> "$GITHUB_ENV"
+          docker run -d --name minio -p 9000:9000 -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio server /data
+          docker run -d --name gcs -p 4443:4443 fsouza/fake-gcs-server -scheme http -public-host 127.0.0.1:4443
+          docker run -d --name azurite -p 10000:10000 -e "AZURITE_ACCOUNTS=oprobeit:$key" \
+            mcr.microsoft.com/azure-storage/azurite \
+            azurite-blob --blobHost 0.0.0.0 --skipApiVersionCheck --loose
+          for i in $(seq 1 60); do
+            curl -sf http://127.0.0.1:9000/minio/health/live >/dev/null \
+              && curl -sf http://127.0.0.1:4443/storage/v1/b >/dev/null \
+              && curl -s -o /dev/null http://127.0.0.1:10000/ && break
+            sleep 1
+          done
+      - name: Create bucket / bucket / container
+        env:
+          AWS_ACCESS_KEY_ID: minioadmin
+          AWS_SECRET_ACCESS_KEY: minioadmin
+          AWS_DEFAULT_REGION: us-east-1
+        run: |
+          aws --endpoint-url http://127.0.0.1:9000 s3 mb s3://bench
+          curl -sf -X POST -H 'Content-Type: application/json' -d '{"name":"bench"}' http://127.0.0.1:4443/storage/v1/b
+          az storage container create -n bench --connection-string \
+            "DefaultEndpointsProtocol=http;AccountName=oprobeit;AccountKey=$OPROBE_IT_AZBLOB_KEY;BlobEndpoint=$OPROBE_IT_AZBLOB_ENDPOINT;"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked --test backends -- --nocapture
+      - name: Container logs on failure
+        if: failure()
+        run: for c in minio gcs azurite; do echo "== $c"; docker logs --tail 80 $c; done
+
   msrv:
     name: MSRV (1.97)
     runs-on: ubuntu-latest

@@ -14,29 +14,29 @@ without tripping 429/503 throttling, and turns it all into a CI regression gate.
 ```text
 $ oprobe run s3://noaa-ghcn-pds --anonymous --existing csv.gz/ --preset mixed -d 8s -c 8
 
-[REVIEW] Server latency (TTFB)-bound: 81% of operation time is spent in server latency (TTFB) (p50 70.4ms / p99 281ms).
+[REVIEW] Server latency (TTFB)-bound: 84% of operation time is spent in server latency (TTFB) (p50 64.6ms / p99 218ms).
 
-  throughput 89.8 ops/s · 92.2 MiB/s   latency p50 70.4ms · p99 281ms · p99.9 1.93s   errors 0 · 0 throttled
+  throughput 98.4 ops/s · 77.8 MiB/s   latency p50 64.6ms · p99 218ms · p99.9 1.51s   errors 0 · 0 throttled
 
 WHERE THE TIME GOES  (share of operation wall time)
-  connect   ▍                              1.0%  DNS + TCP + proxy + TLS on fresh connections
-  server    ████████████████████████████  81.0%  time to first byte (server processing + RTT)
-  download  ██████▏                       17.6%  receiving response bodies
+  connect   ▊                              2.1%  DNS + TCP + proxy + TLS on fresh connections
+  server    ████████████████████████████  83.5%  time to first byte (server processing + RTT)
+  download  ████▊                         14.2%  receiving response bodies
 
 BACKEND REQUESTS  (mean per request; p99 of total)
-  request     count  warm   queue  connect    send    ttfb  transfer   stall    p99   status
-  GetObject     717   99%  0.01ms    213ms  0.15ms  86.2ms    19.9ms  0.00ms  414ms  206×717
-  HeadObject     91  100%  0.01ms        -  1.03ms  44.9ms    0.00ms  0.00ms  77.2ms  200×91
+  request     count  warm   queue  connect    send    ttfb  transfer   stall     p99   status
+  GetObject     747   99%  0.01ms    338ms  0.00ms  81.7ms    15.0ms  0.00ms   342ms  206×747
+  HeadObject    116  100%  0.01ms        -  0.00ms  43.0ms    0.02ms  0.00ms  62.2ms  200×116
 
 SLOWEST OPERATION
-  read.full 1.92s at 4.0s  queue 0.01ms · backend 1.92s · client 0.78ms
-    #2  +0.05ms  GetObject  206 h1 conn#12 cold  connect 72.1ms (dns 0.00ms tcp 0.10ms proxy 9.37ms tls 62.6ms) · ttfb 94.2ms · transfer 248ms  req-id PY6T4PG8JQ00QR2G
-    #3  +0.08ms  GetObject  206 h1 conn#13 cold  connect 367ms (dns 0.00ms tcp 0.08ms proxy 287ms tls 80.9ms) · ttfb 68.3ms · transfer 261ms  req-id DRM21XWEN03GHVD7
+  read.full 1.51s at 3.3s  queue 0.00ms · backend 1.51s · client 1.04ms
+    #3  +0.16ms  GetObject  206 h1 conn#31 cold  connect 335ms (proxy 274ms tls 60.6ms) · ttfb 164ms · transfer 242ms  req-id WKPW2FKWB2K5RH9X
+    #4  +0.18ms  GetObject  206 h1 conn#30 cold  connect 352ms (proxy 273ms tls 78.4ms) · ttfb 163ms · transfer 283ms  req-id WKPP3FEWN4DYN946
     async call stack captured while in flight:
-      read.full [156.000ms]
-        [sub-task 0] opendal::background_task → opendal::read → http::checkout → proxy CONNECT s3.us-east-1.amazonaws.com:443
+      read.full [128.000ms]
+        [sub-task 5] opendal::background_task → GetObject
 ```
-*(real output, trimmed: AWS S3 through a corporate egress proxy)*
+*(real output, trimmed: AWS S3 from a cloud VM through an egress proxy, OpenDAL's default HTTP client)*
 
 ## Workbench: window and terminal
 

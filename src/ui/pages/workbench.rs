@@ -390,19 +390,7 @@ fn connections(snap: &Snapshot) -> View {
     };
     view()
         .gap_1p5()
-        .child(line(
-            "Protocol",
-            format!(
-                "{} · {} · {}",
-                if c.alpn.is_empty() { "–" } else { &c.alpn },
-                if c.tls_version.is_empty() {
-                    "plain"
-                } else {
-                    &c.tls_version
-                },
-                c.cipher
-            ),
-        ))
+        .child(line("Protocol", crate::report::connection_protocol(c)))
         .child(line(
             "Proxy",
             c.proxy.clone().unwrap_or_else(|| "none".into()),
@@ -414,20 +402,7 @@ fn connections(snap: &Snapshot) -> View {
                 c.dialed, c.reuse_pct, c.peak_inflight_requests
             ),
         ))
-        .child(line(
-            "Dial p50 / p99",
-            format!(
-                "dns {}/{} · tcp {}/{} · proxy {}/{} · tls {}/{}",
-                fmt_ms(c.dns.p50),
-                fmt_ms(c.dns.p99),
-                fmt_ms(c.tcp.p50),
-                fmt_ms(c.tcp.p99),
-                fmt_ms(c.proxy_connect.p50),
-                fmt_ms(c.proxy_connect.p99),
-                fmt_ms(c.tls.p50),
-                fmt_ms(c.tls.p99)
-            ),
-        ))
+        .child(line("Dial p50 / p99", crate::report::dial_phases(c)))
         .child(line(
             "Remote",
             if c.remote_addrs.is_empty() {

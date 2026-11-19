@@ -95,17 +95,20 @@ pub fn request_line(i: usize, r: &RequestRecord) -> String {
         parts.push(format!("queue {}", ms(t.queue_us)));
     }
     if !r.reused && r.protocol != Protocol::InProcess {
+        let phases: Vec<String> = [
+            ("dns", t.dns_us),
+            ("tcp", t.tcp_us),
+            ("proxy", t.proxy_us),
+            ("tls", t.tls_us),
+        ]
+        .iter()
+        .filter(|(_, us)| *us > 0)
+        .map(|(n, us)| format!("{n} {}", ms(*us)))
+        .collect();
         parts.push(format!(
-            "connect {} (dns {} tcp {}{} tls {})",
+            "connect {} ({})",
             ms(t.connect_us()),
-            ms(t.dns_us),
-            ms(t.tcp_us),
-            if t.proxy_us > 0 {
-                format!(" proxy {}", ms(t.proxy_us))
-            } else {
-                String::new()
-            },
-            ms(t.tls_us)
+            phases.join(" ")
         ));
     }
     if r.protocol != Protocol::InProcess {
@@ -393,18 +396,8 @@ pub fn render(r: &Report) -> String {
         section(&mut out, "CONNECTIONS");
         let _ = writeln!(
             out,
-            "  {} · {} · {}{}",
-            if c.alpn.is_empty() {
-                "http/1.1".into()
-            } else {
-                c.alpn.clone()
-            },
-            if c.tls_version.is_empty() {
-                "plain".into()
-            } else {
-                c.tls_version.clone()
-            },
-            dim(&c.cipher),
+            "  {}{}",
+            super::connection_protocol(c),
             c.proxy
                 .as_ref()
                 .map(|p| format!(" · via {p}"))
@@ -422,26 +415,9 @@ pub fn render(r: &Report) -> String {
                 String::new()
             }
         );
-        if c.dns.count > 0 {
-            let _ = writeln!(
-                out,
-                "  dial p50/p99   dns {}/{} · tcp {}/{}{} · tls {}/{}",
-                fmt_ms(c.dns.p50),
-                fmt_ms(c.dns.p99),
-                fmt_ms(c.tcp.p50),
-                fmt_ms(c.tcp.p99),
-                if c.proxy_connect.count > 0 {
-                    format!(
-                        " · proxy {}/{}",
-                        fmt_ms(c.proxy_connect.p50),
-                        fmt_ms(c.proxy_connect.p99)
-                    )
-                } else {
-                    String::new()
-                },
-                fmt_ms(c.tls.p50),
-                fmt_ms(c.tls.p99),
-            );
+        let phases = super::dial_phases(c);
+        if !phases.is_empty() {
+            let _ = writeln!(out, "  dial p50/p99   {phases}");
         }
         if !c.remote_addrs.is_empty() {
             let _ = writeln!(
@@ -465,12 +441,20 @@ pub fn render(r: &Report) -> String {
     );
     let _ = writeln!(
         out,
-        "  read amplification {:.2}× · over-read {:.2}× · {:.2} requests/op · wire rx {} tx {}",
+        "  read amplification {:.2}× · over-read {:.2}× · {:.2} requests/op{}",
         b.read_amplification,
         b.overread_ratio,
         b.request_amplification,
-        fmt_bytes(b.wire_rx),
-        fmt_bytes(b.wire_tx)
+        // Socket-level bytes are only visible to the microscope transport.
+        if b.wire_rx + b.wire_tx > 0 {
+            format!(
+                " · wire rx {} tx {}",
+                fmt_bytes(b.wire_rx),
+                fmt_bytes(b.wire_tx)
+            )
+        } else {
+            String::new()
+        }
     );
     if s.cache.enabled {
         let _ = writeln!(

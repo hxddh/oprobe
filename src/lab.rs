@@ -76,6 +76,10 @@ pub struct LabConfig {
     pub throttle_every_n_requests: Option<usize>,
     pub throttle_status_code: u16,
     pub stream_bandwidth_kib_s: Option<u64>,
+    /// Answer throttled requests immediately and close the connection without reading the
+    /// request body, as real gateways do. Clients then often see a reset or abort while still
+    /// uploading instead of the 503 (always on Windows), and must retry the upload.
+    pub throttle_early_close: bool,
 }
 
 impl LabConfig {
@@ -289,9 +293,11 @@ async fn handle_s3_request(
 
         if over_conc || periodic_throttle {
             store.emitted_throttles.fetch_add(1, Ordering::Relaxed);
-            // Read the request body first: closing a socket with unread data makes the client
-            // see a reset/abort (instead of the 503) on some platforms, e.g. Windows.
-            let _ = req.into_body().collect().await;
+            // By default read the request body first so every client sees the 503 itself;
+            // `throttle_early_close` reproduces gateways that answer and hang up mid-upload.
+            if !faults.throttle_early_close {
+                let _ = req.into_body().collect().await;
+            }
             let status_u16 = if faults.throttle_status_code == 429 {
                 429
             } else {
@@ -308,7 +314,11 @@ async fn handle_s3_request(
                  <Message>Please reduce your request rate.</Message>\
                  <RequestId>{req_id}</RequestId></Error>"
             );
-            return Ok(Response::builder()
+            let mut resp = Response::builder();
+            if faults.throttle_early_close {
+                resp = resp.header("connection", "close");
+            }
+            return Ok(resp
                 .status(StatusCode::from_u16(status_u16).unwrap_or(StatusCode::SERVICE_UNAVAILABLE))
                 .header("content-type", "application/xml")
                 .header("retry-after", "1")

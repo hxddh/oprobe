@@ -155,6 +155,40 @@ impl Report {
 }
 
 /// Pretty JSON of a report (what `--json` writes).
+/// `http/1.1 · TLSv1.3 · TLS13_AES_128_GCM_SHA256`, skipping parts the transport did not report.
+pub fn connection_protocol(c: &crate::trace::ConnStats) -> String {
+    let mut parts = vec![if c.alpn.is_empty() {
+        "http/1.1".to_owned()
+    } else {
+        c.alpn.clone()
+    }];
+    parts.push(if c.tls_version.is_empty() {
+        "plain".to_owned()
+    } else {
+        c.tls_version.clone()
+    });
+    if !c.cipher.is_empty() {
+        parts.push(c.cipher.clone());
+    }
+    parts.join(" · ")
+}
+
+/// `dns 1.2ms/3.4ms · tcp … · proxy … · tls …` (p50/p99), only for phases that took time.
+pub fn dial_phases(c: &crate::trace::ConnStats) -> String {
+    use crate::util::fmt_ms;
+    [
+        ("dns", &c.dns),
+        ("tcp", &c.tcp),
+        ("proxy", &c.proxy_connect),
+        ("tls", &c.tls),
+    ]
+    .iter()
+    .filter(|(_, q)| q.count > 0 && q.p99 > 0.0)
+    .map(|(n, q)| format!("{n} {}/{}", fmt_ms(q.p50), fmt_ms(q.p99)))
+    .collect::<Vec<_>>()
+    .join(" · ")
+}
+
 pub fn to_json(r: &Report) -> String {
     serde_json::to_string_pretty(r).unwrap_or_default()
 }

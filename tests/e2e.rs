@@ -674,3 +674,33 @@ async fn proxy_connect_is_used_and_timed() {
 async fn proxy_connect_is_used_and_timed_microscope() {
     proxy_connect_is_used_and_timed_with(TransportMode::Microscope).await;
 }
+
+/// Gateways answer 503 and hang up while the client is still uploading; the client sees a reset
+/// or abort (always on Windows) and must retry rather than fail the operation or the seeding.
+async fn early_close_throttling_is_retried_with(mode: TransportMode) {
+    let lab = lab(LabConfig {
+        throttle_every_n_requests: Some(5),
+        throttle_early_close: true,
+        ..Default::default()
+    })
+    .await;
+    let mut p = lab.profile("bkt");
+    p.knobs.transport = mode;
+    small(&mut p, Preset::SmallFiles);
+    p.knobs.retries = 6;
+    let (s, c, _) = run_once(p, 600).await;
+    assert!(c.verified, "{c:?}");
+    assert!(s.summary.ops > 0);
+    assert_eq!(s.summary.failed_ops, 0, "{:?}", s.verbs);
+    assert!(s.resilience.retries > 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn early_close_throttling_is_retried() {
+    early_close_throttling_is_retried_with(TransportMode::Opendal).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn early_close_throttling_is_retried_microscope() {
+    early_close_throttling_is_retried_with(TransportMode::Microscope).await;
+}
