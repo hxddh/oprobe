@@ -17,7 +17,6 @@ use oprobe::engine::{Cancel, RunOptions, Session};
 use oprobe::trace::Api;
 use oprobe::util::ByteSize;
 
-
 fn target(scheme: &str, opts: &[(&str, &str)]) -> TargetSpec {
     let mut options: BTreeMap<String, String> = opts
         .iter()
