@@ -617,7 +617,11 @@ fn shipped_profiles_are_valid() {
         let p = e.unwrap().path();
         if p.extension().is_some_and(|x| x == "toml") {
             let prof = Profile::load(&p).unwrap_or_else(|e| panic!("{}: {e:#}", p.display()));
-            prof.target.normalized().unwrap().resolved_options().unwrap();
+            prof.target
+                .normalized()
+                .unwrap()
+                .resolved_options()
+                .unwrap();
             n += 1;
         }
     }

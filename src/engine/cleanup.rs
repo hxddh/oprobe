@@ -60,7 +60,7 @@ pub async fn delete_prefix(op: &Operator, prefix: &str) -> CleanupSummary {
             op.delete_iter(files).await?;
             s.deleted += n;
         }
-        let _ = op.delete(prefix).await;
+        let _ = op.delete_with(prefix).recursive(true).await;
         let left = list_files(op, prefix).await?;
         s.remaining = left.len() as u64;
         s.verified = left.is_empty();

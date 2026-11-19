@@ -17,7 +17,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, BorderType, Borders, Cell, Clear, Gauge, Paragraph, Row, Sparkline, Table, Tabs, Wrap,
+    Block, BorderType, Borders, Cell, Clear, Paragraph, Row, Sparkline, Table, Tabs, Wrap,
 };
 use ratatui::{Frame, Terminal};
 use tokio::sync::mpsc;
@@ -70,6 +70,9 @@ struct App {
     continuous: bool,
     tx: mpsc::UnboundedSender<Msg>,
     quit: bool,
+    /// Instantaneous (ops/s, p99 ms) samples computed between live snapshots.
+    history: std::collections::VecDeque<(f64, f64)>,
+    last_sample: Option<(f64, u64)>,
 }
 
 impl App {
@@ -111,6 +114,8 @@ impl App {
         };
         self.cancel.reset();
         self.job = Job::Running;
+        self.history.clear();
+        self.last_sample = None;
         let tx = self.tx.clone();
         let knobs = self.knobs.clone();
         let mut opts = RunOptions::from_profile(&session.profile);
@@ -414,6 +419,8 @@ pub async fn run(profile: Profile) -> Result<()> {
         continuous: false,
         tx: tx.clone(),
         quit: false,
+        history: std::collections::VecDeque::new(),
+        last_sample: None,
     };
     app.log("welcome to oprobe top — press ? for keys");
     app.open_session();
@@ -429,7 +436,22 @@ pub async fn run(profile: Profile) -> Result<()> {
                     match m {
                         Msg::Key(k) => app.on_key(k),
                         Msg::Resize => {}
-                        Msg::Snapshot(s) => app.snap = Some(*s),
+                        Msg::Snapshot(s) => {
+                            if s.phase == Phase::Measure {
+                                let (t, n) = (s.elapsed_s, s.summary.ops);
+                                if let Some((t0, n0)) = app.last_sample {
+                                    if t > t0 && n >= n0 {
+                                        let p99 = s.timeline.last().map(|p| p.p99_ms).unwrap_or(s.summary.latency.p99);
+                                        app.history.push_back(((n - n0) as f64 / (t - t0), p99));
+                                        if app.history.len() > 600 {
+                                            app.history.pop_front();
+                                        }
+                                    }
+                                }
+                                app.last_sample = Some((t, n));
+                            }
+                            app.snap = Some(*s);
+                        }
                         Msg::Log(l) => app.log(l),
                         Msg::SessionReady(Ok(s)) => {
                             for w in &s.warnings {
@@ -540,7 +562,11 @@ fn draw(f: &mut Frame, app: &App) {
     draw_breakdown(f, mid[1], app);
     draw_tabs(f, rows[2], app);
     draw_log(f, rows[3], app);
-    let keys = " space start/stop · t tune · +/- concurrency · i/I io · k/K chunk · g/G gap · c cache · h http · p preset · l loop · e export · ? help · q quit";
+    let keys = if area.width >= 120 {
+        " space run/stop · t tune · +/- conc · i/I io · k/K chunk · g/G gap · c cache · h http · p preset · e export · ? help · q quit"
+    } else {
+        " space run/stop · t tune · +/- conc · e export · ? help · q quit"
+    };
     f.render_widget(
         Paragraph::new(keys).style(Style::default().fg(Color::DarkGray)),
         rows[4],
@@ -630,9 +656,23 @@ fn draw_sparks(f: &mut Frame, area: Rect, app: &App) {
         ])
         .split(inner);
     let w = inner.width as usize;
-    let tl: Vec<_> = s.timeline.iter().rev().take(w).rev().collect();
-    let ops: Vec<u64> = tl.iter().map(|p| p.ops_per_s as u64).collect();
-    let p99: Vec<u64> = tl.iter().map(|p| (p.p99_ms * 100.0) as u64).collect();
+    let (ops, p99): (Vec<u64>, Vec<u64>) = if app.history.len() >= 2 {
+        app.history
+            .iter()
+            .rev()
+            .take(w)
+            .rev()
+            .map(|(o, p)| (*o as u64, (*p * 100.0) as u64))
+            .unzip()
+    } else {
+        s.timeline
+            .iter()
+            .rev()
+            .take(w)
+            .rev()
+            .map(|p| (p.ops_per_s as u64, (p.p99_ms * 100.0) as u64))
+            .unzip()
+    };
     let sm = &s.summary;
     f.render_widget(
         Paragraph::new(Line::from(vec![
@@ -709,26 +749,22 @@ fn draw_breakdown(f: &mut Frame, area: Rect, app: &App) {
         ("download", sh.download, Color::Cyan),
         ("client", sh.client + sh.cache, Color::Gray),
     ];
-    let lay = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints(
-            rows.iter()
-                .map(|_| Constraint::Length(1))
-                .collect::<Vec<_>>(),
-        )
-        .split(inner);
-    for (i, (name, v, c)) in rows.iter().enumerate() {
-        if i >= lay.len() {
-            break;
-        }
-        f.render_widget(
-            Gauge::default()
-                .gauge_style(Style::default().fg(*c).bg(Color::Black))
-                .ratio(v.clamp(0.0, 1.0))
-                .label(format!("{name:<9}{:>5.1}%", v * 100.0)),
-            lay[i],
-        );
-    }
+    let bar_w = (inner.width as usize).saturating_sub(18).max(4);
+    let max = rows.iter().map(|r| r.1).fold(0.0, f64::max).max(1e-9);
+    let lines: Vec<Line> = rows
+        .iter()
+        .map(|(name, v, c)| {
+            Line::from(vec![
+                Span::styled(format!("{name:<9}"), Style::default().fg(Color::Gray)),
+                Span::styled(
+                    crate::report::style::bar(v / max, bar_w),
+                    Style::default().fg(*c),
+                ),
+                Span::styled(format!("{:>6.1}%", v * 100.0), Style::default().bold()),
+            ])
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 fn draw_tabs(f: &mut Frame, area: Rect, app: &App) {

@@ -173,7 +173,7 @@ impl Dataset {
                     })
                 }
             })
-            .buffered(8)
+            .buffered(4)
             .try_collect()
             .await?;
         progress(format!(

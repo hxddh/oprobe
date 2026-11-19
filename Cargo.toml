@@ -2,7 +2,7 @@
 name = "oprobe"
 version = "2.0.0"
 edition = "2021"
-rust-version = "1.88"
+rust-version = "1.91"
 license = "Apache-2.0"
 description = "White-box cloud storage microscope built on Apache OpenDAL: see which layer makes object-storage I/O slow or expensive, auto-tune it, and gate regressions in CI"
 repository = "https://github.com/hxddh/oprobe"

@@ -153,7 +153,10 @@ pub async fn run(a: DoctorArgs) -> Result<ExitCode> {
                     None => {}
                 }
             }
-            Err(e) => c.fail("network", &format!("{e:#}")),
+            Err(e) => {
+                c.fail("network", &format!("{e:#}"));
+                return Ok(finish(c));
+            }
         }
     }
 

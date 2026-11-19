@@ -159,7 +159,8 @@ pub fn admin_operator(base: &Operator, target: &TargetSpec) -> Result<Operator> 
         .layer(
             RetryLayer::default()
                 .with_jitter()
-                .with_max_times(5)
+                .with_min_delay(Duration::from_millis(100))
+                .with_max_times(10)
                 .with_max_delay(Duration::from_secs(10)),
         ))
 }
