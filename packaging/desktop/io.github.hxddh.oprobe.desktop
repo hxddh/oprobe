@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=oprobe
+GenericName=Storage Microscope
+Comment=See which layer makes object-storage I/O slow or expensive
+Exec=oprobe gui
+Icon=io.github.hxddh.oprobe
+Terminal=false
+Categories=Development;Network;Monitor;
+Keywords=s3;storage;benchmark;opendal;latency;
+StartupWMClass=io.github.hxddh.oprobe

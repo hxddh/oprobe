@@ -1,14 +1,16 @@
 [package]
 name = "oprobe"
-version = "1.0.0"
-edition = "2021"
-rust-version = "1.91"
+version = "2.0.0"
+edition = "2024"
+rust-version = "1.97"
 license = "Apache-2.0"
-description = "Production white-box cloud storage stack profiler, TCP/TLS/HTTP microscope, FinOps analyzer, and SLA auto-tuner powered by Apache OpenDAL"
+description = "White-box cloud storage microscope built on Apache OpenDAL: see which layer makes object-storage I/O slow or expensive, auto-tune it, and gate regressions in CI"
 repository = "https://github.com/hxddh/oprobe"
+homepage = "https://github.com/hxddh/oprobe"
+documentation = "https://github.com/hxddh/oprobe/tree/main/docs"
 readme = "README.md"
-keywords = ["opendal", "s3", "benchmark", "profiler", "finops"]
-categories = ["command-line-utilities", "development-tools::profiling", "filesystem"]
+keywords = ["opendal", "s3", "benchmark", "profiler", "object-storage"]
+categories = ["command-line-utilities", "development-tools::profiling"]
 include = [
   "src/**/*",
   "profiles/**/*",
@@ -42,7 +44,6 @@ opendal = { version = "0.59", default-features = false, features = [
   "layers-retry",
   "layers-timeout",
   "layers-tail-cut",
-  "layers-concurrent-limit",
   "layers-await-tree",
 ] }
 opendal-core = { version = "0.59", default-features = false, features = [
@@ -51,26 +52,15 @@ opendal-core = { version = "0.59", default-features = false, features = [
 ] }
 
 await-tree = "0.3"
-moka = { version = "0.12", features = ["future", "sync"] }
 
 hyper = { version = "1", features = ["client", "server", "http1", "http2"] }
-hyper-util = { version = "0.1", features = [
-  "client",
-  "client-legacy",
-  "server",
-  "server-auto",
-  "http1",
-  "http2",
-  "tokio",
-] }
+hyper-util = { version = "0.1", features = ["client-legacy", "server", "server-auto", "http1", "http2", "tokio"] }
 http = "1"
 http-body = "1"
 http-body-util = "0.1"
-tower-service = "0.3"
 
-rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
-tokio-rustls = { version = "0.26", default-features = false, features = ["tls12"] }
-oxitls-rustcrypto-provider = "0.3"
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "aws_lc_rs", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["tls12", "aws_lc_rs"] }
 rustls-pki-types = { version = "1", features = ["std"] }
 webpki-roots = "0.26"
 rustls-native-certs = "0.8"
@@ -89,23 +79,104 @@ tokio = { version = "1.52", features = [
   "signal",
 ] }
 hdrhistogram = "7.5"
-crc32c = "0.6"
-rand = "0.8"
-rand_xoshiro = "0.6"
-sysinfo = "0.32"
-ratatui = "0.29"
-crossterm = "0.28"
-clap = { version = "4.5", features = ["derive", "env"] }
+rand = { version = "0.8", features = ["small_rng"] }
+clap = { version = "4.5", features = ["derive", "env", "wrap_help"] }
+clap_complete = "4.5"
+clap_mangen = "0.2"
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde_json = { version = "1.0", features = ["float_roundtrip"] }
 toml = "0.8"
 anyhow = "1.0"
+# The same client OpenDAL uses by default (opendal-http-transport-reqwest: rustls + stream);
+# `http2` is compiled in but only negotiated when `knobs.http = "h2"`.
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2", "stream"] }
+rustls-platform-verifier = "0.6"
+tower-layer = "0.3"
+tower-service = "0.3"
+crc32c = "0.6"
+libc = "0.2"
+
+# Interactive UI (Native Shell): the terminal workbench (`tui`, default) and native windows (`gui`).
+nsh-core = { version = "0.6", optional = true }
+nsh-base = { version = "0.6", default-features = false, features = ["plot"], optional = true }
+nsh-platform-tui = { version = "0.6", default-features = false, features = ["run-app"], optional = true }
+ratatui-core = { version = "0.1", optional = true }
+ratatui-crossterm = { version = "0.1", optional = true }
+crossterm = { version = "0.29", optional = true }
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "aws_lc_rs"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nsh-platform-linux = { version = "0.6", default-features = false, features = ["plot"], optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+nsh-platform-macos = { version = "0.6", default-features = false, features = ["plot"], optional = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+nsh-platform-windows = { version = "0.6", default-features = false, features = ["plot"], optional = true }
+
+[features]
+default = ["tui"]
+# `oprobe top`: the app in any terminal (no GUI toolkit needed).
+tui = [
+  "dep:nsh-core",
+  "dep:nsh-base",
+  "dep:nsh-platform-tui",
+  "dep:ratatui-core",
+  "dep:ratatui-crossterm",
+  "dep:crossterm",
+]
+# `oprobe gui`: native windows (AppKit / Win32 / GTK 4; Linux builds need libgtk-4-dev).
+gui = ["tui", "dep:nsh-platform-linux", "dep:nsh-platform-macos", "dep:nsh-platform-windows"]
 
 [dev-dependencies]
+nsh-engine = { version = "0.6", default-features = false }
+nsh-testing = { version = "0.6", default-features = false }
+opendal-http-transport-reqwest = "0.59"
 tempfile = "3"
 
-# Optimize third-party crypto/TLS/HTTP dependencies in dev & test profiles so pure-Rust
-# TLS 1.3 (AES-GCM/GHASH/SHA-2/P-256) and CRC32C run at native speed across CI runners.
+[profile.release]
+lto = "thin"
+codegen-units = 4
+strip = "symbols"
+
+# Pure-Rust crypto (TLS, CRC32C) is far too slow unoptimized; keep dependencies fast in dev/test.
 [profile.dev.package."*"]
 opt-level = 2
 
+[target."cfg(windows)".dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_ProcessStatus", "Win32_System_Console"] }
+
+# ---------------------------------------------------------------------------------------
+# Native packages (built by .github/workflows/release.yml; extras generated by `oprobe man`
+# and `oprobe completions` into dist/extras before packaging).
+# ---------------------------------------------------------------------------------------
+[package.metadata.deb]
+maintainer = "oprobe maintainers <noreply@github.com>"
+section = "utils"
+priority = "optional"
+extended-description = """\
+oprobe drives realistic object-storage workloads through Apache OpenDAL and traces every \
+backend request (queue, DNS/TCP/TLS, send, time-to-first-byte, transfer). It explains the \
+bottleneck, projects the cloud bill, tunes client settings and gates regressions in CI."""
+assets = [
+  ["target/release/oprobe", "usr/bin/", "755"],
+  ["README.md", "usr/share/doc/oprobe/README.md", "644"],
+  ["CHANGELOG.md", "usr/share/doc/oprobe/CHANGELOG.md", "644"],
+  ["dist/extras/man/*.1", "usr/share/man/man1/", "644"],
+  ["dist/extras/completions/oprobe.bash", "usr/share/bash-completion/completions/oprobe", "644"],
+  ["dist/extras/completions/_oprobe", "usr/share/zsh/vendor-completions/_oprobe", "644"],
+  ["dist/extras/completions/oprobe.fish", "usr/share/fish/vendor_completions.d/oprobe.fish", "644"],
+  ["profiles/*.toml", "usr/share/oprobe/profiles/", "644"],
+]
+
+[package.metadata.generate-rpm]
+summary = "White-box cloud storage microscope built on Apache OpenDAL"
+license = "Apache-2.0"
+assets = [
+  { source = "target/release/oprobe", dest = "/usr/bin/oprobe", mode = "755" },
+  { source = "README.md", dest = "/usr/share/doc/oprobe/README.md", mode = "644", doc = true },
+  { source = "dist/extras/man/oprobe.1", dest = "/usr/share/man/man1/oprobe.1", mode = "644", doc = true },
+  { source = "dist/extras/completions/oprobe.bash", dest = "/usr/share/bash-completion/completions/oprobe", mode = "644" },
+  { source = "dist/extras/completions/_oprobe", dest = "/usr/share/zsh/site-functions/_oprobe", mode = "644" },
+  { source = "dist/extras/completions/oprobe.fish", dest = "/usr/share/fish/vendor_completions.d/oprobe.fish", mode = "644" },
+]

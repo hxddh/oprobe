@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleName</key><string>oprobe</string>
+  <key>CFBundleDisplayName</key><string>oprobe</string>
+  <key>CFBundleIdentifier</key><string>io.github.hxddh.oprobe</string>
+  <key>CFBundleVersion</key><string>@VERSION@</string>
+  <key>CFBundleShortVersionString</key><string>@VERSION@</string>
+  <key>CFBundleExecutable</key><string>oprobe</string>
+  <key>CFBundleIconFile</key><string>oprobe</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>
+  <key>LSMinimumSystemVersion</key><string>14.0</string>
+  <key>NSHighResolutionCapable</key><true/>
+  <key>NSSupportsAutomaticGraphicsSwitching</key><true/>
+</dict>
+</plist>

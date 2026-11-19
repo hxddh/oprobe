@@ -1,27 +1,91 @@
 # Changelog
 
-## v1.0.0 — Production White-Box Cloud Storage Microscope & Closed-Loop Auto-Tuner
+All notable changes to this project are documented here. The format follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
+[Semantic Versioning](https://semver.org/).
 
-`v1.0.0` 将 `oprobe` 全面重构并升级为 **100% 纯 Rust、零启发式估算**的生产级云存储栈白盒剖析与闭环调优套件。
+## v2.0.0 — 2026-11-19
 
-### Highlights & Breaking Upgrades
+oprobe 2.0 is a rewrite. Everything reported is measured per request; nothing is estimated.
 
-- **100% 纯 Rust 架构与零 C/CMake 依赖跨平台构建**
-  - 移除所有外部 C/C++ 编译依赖（彻底剔除 `aws-lc-sys`、`zstd-sys`、`lz4-sys`、`ring` 及原型壳层），全面采用 `hyper` 1.x + `tokio-rustls` + `oxitls-rustcrypto-provider` + `moka` 纯 Rust 技术栈，原生支持 `cargo install oprobe` 与 Linux (`x86_64`/`aarch64`)、macOS (`aarch64`/`x86_64`)、Windows 全平台分发。
-- **七段式真实底层白盒可观测性（彻底清除估算逻辑）**
-  - 自研 `ProbedHttpConnector` 与 `HyperWhiteboxTransport`：基于物理 Socket `dispatch_seq` 与内核级读写时间戳，精确拆解 **DNS 解析、TCP SYN/ACK 握手、TLS 1.2/1.3 + ALPN 协商、连接池热复用 vs 冷建连、网关首包 TTFB、Body 分块流与 L4 真实收发字节**。
-  - 自研 OpenDAL 中间件埋点栈：`ProbedSemaphore`（真实 `ConcurrentLimitLayer` 排队耗时）、`WhiteboxCacheLayer`（纯 Rust `moka` W-TinyLFU 全对象与稀疏 Range 块缓存真实命中/微秒耗时）及 `WhiteboxObserveLayer`（真实 `CompleteMultipartUpload` 分片合并耗时与 `RetryEvent.retry_after` 精确退避统计）。
-  - 慢请求异步调用栈实时捕获：后台 `10ms` `AwaitTree` 采样器持续追踪在途协程并保留 Top-5 最慢请求的完整跨层调用栈。
-- **闭环流式压测、全路径自动清理与五朵云 FinOps 诊断**
-  - 新增 `--duration` / `--warmup` 持续时间窗口流式压测模式与 `--url` 零配置文件直连模式。
-  - 新增隔离前缀 `oprobe-run-*` 全路径远端数据自动清理与校验（覆盖正常结束、报错中止及 `Ctrl-C` 信号），并提供 `oprobe cleanup` 独立清扫子命令。
-  - 升级多云成本引擎：覆盖 **AWS S3 Standard、Cloudflare R2、Google GCS、Alibaba Cloud OSS、Backblaze B2**，精确量化 Class A/B 请求放大损耗、读放大流出浪费与本地缓存月度节省金额。
-  - 升级防 `429/503` 闭环自动寻优器（`oprobe tune`）：支持软/硬限流熔断退避、悬崖下方二分并发探底，产出可 `oprobe run --profile` 直接回环复用的 `[knobs]` TOML 配置与 Rust / Python 生产代码。
-- **产品化交互体验与内置 S3 混沌验证台**
-  - `oprobe tui` 支持 `100ms` 实时流式动态刷新、流式寻优矩阵、命令历史与 `?` 快捷键浮层。
-  - 新增结构化运行时异常诊断提示（自动识别 TLS 证书、401/403 签名/权限、404 桶缺失、429/503 限流与 DNS 故障并给出修复步骤）。
-  - 内置 `oprobe serve-s3` 兼容对象存储与弱网/`503 SlowDown` 故障注入实验台。
+### Highlights
 
-## v0.1.0 — Initial Prototype Release
+- **Request-level white-box tracing of the client you deploy.** Requests go through OpenDAL's own
+  HTTP client (reqwest + rustls/aws-lc-rs, configured as OpenDAL builds it), observed through
+  reqwest's extension points: every backend request records DNS, TCP, proxy and TLS (when it
+  dialed), request send, TTFB, transfer and consumer stall, plus status, connection, cold/warm, bytes
+  and the provider's request ID. `--microscope` switches to oprobe's own instrumented connection pool
+  for pool queueing, per-dial proxy timing and HTTP/2 stream detail. The observer effect is measured
+  (`examples/overhead.rs`) and documented.
+- **Exact attribution through OpenDAL.** A scope follows each logical operation through OpenDAL's
+  layers and into its background tasks (concurrent readers/writers), and each operation's wall time
+  is split exactly into queue / cache / backend / client by sweeping its request intervals.
+- **Slow-operation forensics.** The slowest operations keep their full request timelines and
+  async call stacks (await-tree, including OpenDAL sub-tasks) captured while in flight.
+- **Realistic workloads.** Presets `parquet`, `checkpoint`, `small-files`, `metadata`, `mixed`;
+  custom weighted mixes; zipf/hot-set key popularity; closed-loop concurrency or open-loop arrival
+  rate without coordinated omission; warmup and time windows; `--existing <prefix>` read-only
+  benchmarks of your own data; persisted datasets.
+- **Throttle-aware tuner.** Concurrency ladder with 429/503 ceiling detection, binary refinement,
+  Retry-After-aware cooldown and an 80 % safety margin, then coordinate descent over the knobs that
+  matter for the workload, and a confirmation run. Emits a profile and Rust/Python OpenDAL code.
+- **Measured cost model.** Requests are classified by real API (S3, GCS, Azure, B2 conventions)
+  into billing classes; usage per operation is projected to your monthly volume for six providers,
+  with waste from failed/throttled requests and over-reads and savings from caching.
+- **CI gate.** `oprobe diff` checks throughput, per-operation p50/p99 (with noise floors and
+  minimum samples), errors, new throttling, integrity, request/read amplification and cost; outputs
+  terminal, Markdown, JSON and JUnit; exits 3 on regression.
+- **New commands.** `top` / `gui` (the workbench in a terminal / window), `doctor` (step-by-step checks with fixes),
+  `probe` (handshake microscope with clock-skew check), `lab` (S3-compatible fault-injection
+  server), `cleanup` (sweeper with dry-run), `init`, `report`, `completions`, man pages.
+- **Egress proxy support.** `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` / `NO_PROXY` with HTTP CONNECT
+  tunnelling (incl. basic auth) and timed proxy handshakes; `--proxy` / `--proxy none`.
+- **Workbench in a window and in the terminal.** `oprobe` with no arguments opens an interactive workbench built
+  with Native Shell (NSH): a native window on macOS (AppKit), Windows (Win32/Direct2D) and Linux (GTK 4), or the same
+  UI in any terminal (`oprobe top`, also over SSH). Live charts, time breakdown, per-API tables, cost, the slowest
+  operation as a request waterfall, the tuner with apply/save, and the endpoint probe. One binary: macOS and Windows
+  builds include the window (`.dmg`, `.msi` with a Start menu entry); Linux server packages stay headless and a
+  `oprobe-desktop` tarball carries the window.
+- **Two-layer architecture.** OpenDAL and its own HTTP client for measurement; NSH for every UI.
+- **Native distribution.** Release archives named `oprobe-<version>-<target>`, static Linux musl
+  builds, `.deb`, `.rpm`, macOS universal binary and `.pkg`, Windows `.msi` (x64 and ARM64),
+  Homebrew formula, Scoop manifest, checksum-verifying install scripts, `SHA256SUMS`.
 
-- 基于 Apache OpenDAL `0.59` 的初版 CLI（`run` / `tune` / `diff` / `net-probe`）与终端 TUI 原型。
+### Known limitations
+
+- The macOS `.pkg`/`.dmg` and Windows `.msi` are not yet signed with a developer certificate: macOS asks to confirm
+  on first open, Windows SmartScreen asks to *Run anyway* (see `docs/install.md`). Homebrew, Scoop, the install
+  scripts and `cargo install` are unaffected.
+- With OpenDAL's own client (the default), time spent waiting inside reqwest's pool for an idle connection is part
+  of TTFB, proxy CONNECT is reported together with TCP to the proxy, and wire bytes and the TLS cipher are not
+  available; `--microscope` measures all of these with oprobe's own pool.
+- Observer effect: on tens of thousands of tiny requests per second over loopback, tracing costs up to ~10–18 %
+  throughput; on real storage latencies it is negligible (`examples/overhead.rs`, `docs/metrics.md`).
+
+### Breaking changes
+
+- Report schema is now `oprobe.report/v2`; v1 reports are rejected by `oprobe diff` with a clear
+  message. Re-create baselines with v2.
+- Profile format changed (`[target] url`, `[workload] preset/duration/warmup/mix/dataset`,
+  `[knobs]`, `[sla]`, `[cost]`). See `docs/workloads.md` and `oprobe init`.
+- `serve-s3` is now `lab` (alias kept), `net-probe` is now `probe`, `tui` is now `top` (alias kept).
+- Exit code for gate failures is 3 (was 2).
+
+### Fixed (from v1)
+
+- Secrets passed via environment variables were copied into profiles and JSON reports; option
+  values with secret-like keys are now always redacted and emitted profiles use `${ENV}`.
+- Stage timings were global sums divided by request counts; HTTP/2 TTFB used a connection-wide
+  write timestamp; the "multipart merge" stage timed the entire upload for single PUTs; tracing was
+  lost inside OpenDAL's concurrent sub-tasks. All replaced by per-request measurement.
+- The auto-tuner fabricated synthetic "throttled" trials on errors; trials are now always real.
+- Cost projections relied on invented scaling factors; now based on measured per-op usage.
+- Release artifact names embedded the `v` tag prefix and lacked native packages.
+
+## v1.0.0
+
+- Pure-Rust CLI (`run`, `tune`, `diff`, `net-probe`, `tui`, `serve-s3`) on Apache OpenDAL 0.59.
+
+## v0.1.0
+
+- Initial prototype.

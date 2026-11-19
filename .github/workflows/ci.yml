@@ -1,0 +1,171 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked --all-targets
+      - name: CLI smoke (run → diff gate)
+        shell: bash
+        run: |
+          cargo run --release --locked -- run memory:// --preset mixed -d 2s --warmup 500ms -q --json base.json
+          cargo run --release --locked -- run memory:// --preset mixed -d 2s --warmup 500ms -q --json cand.json
+          cargo run --release --locked -- diff base.json cand.json --max-p99-increase 400 --max-p50-increase 400 --max-throughput-drop 80 --markdown gate.md
+          cat gate.md >> "$GITHUB_STEP_SUMMARY"
+
+  backends:
+    name: real backends (MinIO, fake-gcs-server, Azurite)
+    runs-on: ubuntu-latest
+    env:
+      OPROBE_IT_S3_ENDPOINT: http://127.0.0.1:9000
+      OPROBE_IT_GCS_ENDPOINT: http://127.0.0.1:4443
+      OPROBE_IT_AZBLOB_ENDPOINT: http://127.0.0.1:10000/oprobeit
+      OPROBE_IT_AZBLOB_ACCOUNT: oprobeit
+    steps:
+      - uses: actions/checkout@v4
+      # MinIO no longer publishes container images; build a pinned revision from source.
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+      - uses: actions/cache@v4
+        with:
+          path: ~/go/bin/minio
+          key: minio-v0.0.0-20260212201848-7aac2a2c5b7c
+      - name: Build MinIO
+        run: |
+          [ -x ~/go/bin/minio ] || go install github.com/minio/minio@v0.0.0-20260212201848-7aac2a2c5b7c
+      - name: Start MinIO, fake-gcs-server and Azurite
+        run: |
+          # Azurite account with a key generated for this run only.
+          key="$(openssl rand -base64 64 | tr -d '\n')"
+          echo "::add-mask::$key"
+          echo "OPROBE_IT_AZBLOB_KEY=$key" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/minio"
+          MINIO_ROOT_USER=minioadmin MINIO_ROOT_PASSWORD=minioadmin \
+            nohup ~/go/bin/minio server "$RUNNER_TEMP/minio" --address 127.0.0.1:9000 > "$RUNNER_TEMP/minio.log" 2>&1 &
+          docker run -d --name gcs -p 4443:4443 fsouza/fake-gcs-server -scheme http -public-host 127.0.0.1:4443
+          docker run -d --name azurite -p 10000:10000 -e "AZURITE_ACCOUNTS=oprobeit:$key" \
+            mcr.microsoft.com/azure-storage/azurite \
+            azurite-blob --blobHost 0.0.0.0 --skipApiVersionCheck --loose
+          for i in $(seq 1 60); do
+            curl -sf http://127.0.0.1:9000/minio/health/live >/dev/null \
+              && curl -sf http://127.0.0.1:4443/storage/v1/b >/dev/null \
+              && curl -s -o /dev/null http://127.0.0.1:10000/ && break
+            sleep 1
+          done
+      - name: Create bucket / bucket / container
+        env:
+          AWS_ACCESS_KEY_ID: minioadmin
+          AWS_SECRET_ACCESS_KEY: minioadmin
+          AWS_DEFAULT_REGION: us-east-1
+        run: |
+          aws --endpoint-url http://127.0.0.1:9000 s3 mb s3://bench
+          curl -sf -X POST -H 'Content-Type: application/json' -d '{"name":"bench"}' http://127.0.0.1:4443/storage/v1/b
+          az storage container create -n bench --connection-string \
+            "DefaultEndpointsProtocol=http;AccountName=oprobeit;AccountKey=$OPROBE_IT_AZBLOB_KEY;BlobEndpoint=$OPROBE_IT_AZBLOB_ENDPOINT;"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked --test backends -- --nocapture
+      - name: Container logs on failure
+        if: failure()
+        run: |
+          echo "== minio"; tail -n 80 "$RUNNER_TEMP/minio.log" || true
+          for c in gcs azurite; do echo "== $c"; docker logs --tail 80 $c || true; done
+
+  msrv:
+    name: MSRV (1.97)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --locked --all-targets
+
+  release-targets:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl, musl: true }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, musl: true }
+          - { os: macos-latest, target: x86_64-apple-darwin, features: gui }
+          - { os: windows-latest, target: aarch64-pc-windows-msvc, features: gui }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Install musl tools
+        if: matrix.musl
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build --release --locked --target ${{ matrix.target }} ${{ matrix.features && format('--features {0}', matrix.features) || '' }}
+
+  package:
+    name: cargo package (cargo install readiness)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo package --locked
+      - run: cargo install --locked --path . --root "$RUNNER_TEMP/inst" && "$RUNNER_TEMP/inst/bin/oprobe" --version
+
+  gui:
+    name: gui build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: GTK 4 (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libgtk-4-dev
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: gui
+      - run: cargo clippy --locked --all-targets --features gui -- -D warnings
+      - run: cargo build --locked --release --features gui

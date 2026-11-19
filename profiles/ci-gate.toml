@@ -1,0 +1,16 @@
+# Deterministic CI benchmark: fixed op count, fixed seed, open-loop rate.
+#   oprobe run --profile profiles/ci-gate.toml --json candidate.json
+#   oprobe diff baseline.json candidate.json --junit oprobe-gate.xml
+[target]
+url = "memory://"
+
+[workload]
+preset = "small-files"
+duration = "60s"
+warmup = "1s"
+max_ops = 20000
+rate = 2000.0
+seed = 7
+
+[knobs]
+concurrency = 32
