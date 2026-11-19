@@ -207,9 +207,27 @@ pub struct Dialer {
     pub proxy: Option<ProxyConfig>,
     pub connect_timeout: Duration,
     pub recorder: Option<Arc<Recorder>>,
+    /// Address that last connected successfully per `host:port`; tried first on the next dial
+    /// (like browsers do) so a dead address family costs the Happy Eyeballs stagger only once.
+    pub last_good: Arc<std::sync::Mutex<std::collections::HashMap<String, SocketAddr>>>,
 }
 
 impl Dialer {
+    pub fn new(
+        tls: TlsConnector,
+        proxy: Option<ProxyConfig>,
+        connect_timeout: Duration,
+        recorder: Option<Arc<Recorder>>,
+    ) -> Self {
+        Self {
+            tls,
+            proxy,
+            connect_timeout,
+            recorder,
+            last_good: Default::default(),
+        }
+    }
+
     /// Dial `host:port`, optionally performing a TLS handshake. Every phase is timed.
     pub async fn dial(&self, https: bool, host: &str, port: u16) -> Result<Dialed, DialError> {
         let res = self.dial_inner(https, host, port).await;
@@ -293,10 +311,16 @@ impl Dialer {
         }
 
         // 2. TCP
+        let key = format!("{conn_host}:{conn_port}");
+        let preferred = self
+            .last_good
+            .lock()
+            .ok()
+            .and_then(|m| m.get(&key).copied());
         let t = Instant::now();
         let tcp = timeout(
             step,
-            happy_eyeballs(&addrs)
+            happy_eyeballs(&addrs, preferred)
                 .instrument_await(await_tree::span!("tcp {conn_host}:{conn_port}")),
         )
         .await
@@ -309,6 +333,11 @@ impl Dialer {
         .map_err(|e| err("tcp connect", e))?;
         let tcp_us = t.elapsed().as_micros() as u64;
         let remote = tcp.peer_addr().unwrap_or(addrs[0]);
+        if preferred != Some(remote) {
+            if let Ok(mut m) = self.last_good.lock() {
+                m.insert(key, remote);
+            }
+        }
         let _ = tcp.set_nodelay(true);
 
         let clock = ConnClock::new();
@@ -441,6 +470,15 @@ pub(crate) async fn write_all<S: AsyncWrite + Unpin>(s: &mut S, data: &[u8]) -> 
 }
 
 /// Interleave address families (RFC 8305 §4): v6, v4, v6, v4, ...
+/// Move the address that worked last time to the front (if it is still in the DNS answer).
+fn prefer(mut order: Vec<SocketAddr>, preferred: Option<SocketAddr>) -> Vec<SocketAddr> {
+    if let Some(i) = preferred.and_then(|p| order.iter().position(|a| *a == p)) {
+        let a = order.remove(i);
+        order.insert(0, a);
+    }
+    order
+}
+
 fn interleave(addrs: &[SocketAddr]) -> Vec<SocketAddr> {
     let (v6, v4): (Vec<SocketAddr>, Vec<SocketAddr>) = addrs.iter().partition(|a| a.is_ipv6());
     let first_v6 = addrs.first().is_some_and(|a| a.is_ipv6());
@@ -456,10 +494,13 @@ fn interleave(addrs: &[SocketAddr]) -> Vec<SocketAddr> {
 /// Happy Eyeballs connect: start the next address 250 ms after the previous one (or as soon
 /// as it fails), first successful connection wins. Avoids multi-second stalls on hosts where
 /// one address family is unreachable (e.g. `localhost` → `::1` with an IPv4-only listener).
-async fn happy_eyeballs(addrs: &[SocketAddr]) -> io::Result<TcpStream> {
+async fn happy_eyeballs(
+    addrs: &[SocketAddr],
+    preferred: Option<SocketAddr>,
+) -> io::Result<TcpStream> {
     use futures::stream::{FuturesUnordered, StreamExt};
     const STAGGER: Duration = Duration::from_millis(250);
-    let order = interleave(addrs);
+    let order = prefer(interleave(addrs), preferred);
     let mut pending = FuturesUnordered::new();
     let mut next = 0;
     let mut last_err = None;
@@ -497,6 +538,10 @@ mod tests {
             .collect();
         let o = interleave(&a);
         assert!(o[0].is_ipv6() && o[1].is_ipv4() && o[2].is_ipv6() && o[3].is_ipv4());
+        let p = prefer(o.clone(), Some(a[3]));
+        assert_eq!(p[0], a[3]);
+        assert_eq!(p.len(), 4);
+        assert_eq!(prefer(o.clone(), Some("10.0.0.1:1".parse().unwrap())), o);
     }
 
     #[tokio::test]
@@ -506,7 +551,7 @@ mod tests {
         // 10.255.255.1 is unroutable: connect would hang; the good address must win fast.
         let dead: SocketAddr = "10.255.255.1:9".parse().unwrap();
         let t = Instant::now();
-        let s = happy_eyeballs(&[dead, good]).await.unwrap();
+        let s = happy_eyeballs(&[dead, good], None).await.unwrap();
         assert_eq!(s.peer_addr().unwrap(), good);
         assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
     }

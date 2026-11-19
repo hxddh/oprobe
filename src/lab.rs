@@ -289,6 +289,9 @@ async fn handle_s3_request(
 
         if over_conc || periodic_throttle {
             store.emitted_throttles.fetch_add(1, Ordering::Relaxed);
+            // Read the request body first: closing a socket with unread data makes the client
+            // see a reset/abort (instead of the 503) on some platforms, e.g. Windows.
+            let _ = req.into_body().collect().await;
             let status_u16 = if faults.throttle_status_code == 429 {
                 429
             } else {

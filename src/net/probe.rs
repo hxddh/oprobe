@@ -183,12 +183,12 @@ pub async fn probe_endpoint(endpoint: &str, opts: &ProbeOptions) -> Result<Probe
         Some(Some(raw)) => Some(ProxyConfig::parse(raw, "")?),
     }
     .filter(|p| !p.bypass(&host));
-    let dialer = Dialer {
-        tls: build_tls_connector(&tls)?,
-        proxy: proxy.clone(),
-        connect_timeout: opts.timeout,
-        recorder: None,
-    };
+    let dialer = Dialer::new(
+        build_tls_connector(&tls)?,
+        proxy.clone(),
+        opts.timeout,
+        None,
+    );
 
     let mk = || hdrhistogram::Histogram::<u64>::new_with_bounds(1, 3_600_000_000, 3).expect("hist");
     let (mut h_dns, mut h_tcp, mut h_proxy, mut h_tls, mut h_cold, mut h_warm) =

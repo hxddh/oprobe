@@ -145,12 +145,12 @@ impl TracingTransport {
             }
         };
         let mk = |https: bool| -> anyhow::Result<Dialer> {
-            Ok(Dialer {
-                tls: connector.clone(),
-                proxy: proxy_for(https)?,
-                connect_timeout: cfg.connect_timeout,
-                recorder: recorder.clone(),
-            })
+            Ok(Dialer::new(
+                connector.clone(),
+                proxy_for(https)?,
+                cfg.connect_timeout,
+                recorder.clone(),
+            ))
         };
         let https_dialer = mk(true)?;
         let http_dialer = mk(false)?;
@@ -707,8 +707,10 @@ impl HttpTransport for TracingTransport {
         let resp = match resp {
             Ok(r) => r,
             Err(e) => {
-                let temporary =
-                    e.is_canceled() || e.is_incomplete_message() || e.is_closed() || e.is_timeout();
+                // Anything but a malformed request/response is a transport failure (reset, abort,
+                // early close while the body was still being sent — common after a 503 on
+                // Windows) and safe for the retry layer to try again.
+                let temporary = !(e.is_user() || e.is_parse());
                 let msg = format!("send request: {e}");
                 record.timing.send_us =
                     t_headers.saturating_duration_since(t_ready).as_micros() as u64;
