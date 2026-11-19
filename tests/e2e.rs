@@ -728,7 +728,11 @@ async fn timeouts_do_not_leak_inflight_requests_with(mode: TransportMode) {
     p.knobs.retries = 0;
     p.knobs.timeout = oprobe::util::HumanDuration(Duration::from_millis(60));
     let (s, _, _) = run_once(p, 1500).await;
-    assert!(s.summary.failed_ops > 3, "expected timeouts, got {:?}", s.verbs);
+    assert!(
+        s.summary.failed_ops > 3,
+        "expected timeouts, got {:?}",
+        s.verbs
+    );
     assert!(
         s.connections.peak_inflight_requests <= 4,
         "in-flight requests leaked: peak {}",
@@ -758,6 +762,10 @@ async fn open_loop_never_runs_past_the_window() {
     let t = std::time::Instant::now();
     let snap = s.run(&s.profile.knobs.clone(), &o, None).await.unwrap();
     s.close().await;
-    assert!(t.elapsed() < Duration::from_secs(3), "took {:?}", t.elapsed());
+    assert!(
+        t.elapsed() < Duration::from_secs(3),
+        "took {:?}",
+        t.elapsed()
+    );
     assert!(snap.summary.ops <= 1, "issued {} ops", snap.summary.ops);
 }
