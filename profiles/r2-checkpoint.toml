@@ -1,0 +1,35 @@
+# ML checkpoint shards on Cloudflare R2 (S3 API): 128 MiB multipart writes + restores.
+#   export R2_ACCOUNT_ID=... AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=...
+[target]
+url = "s3://replace-me-bucket/checkpoints"
+[target.options]
+endpoint = "https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+region = "auto"
+
+[workload]
+preset = "checkpoint"
+duration = "60s"
+warmup = "5s"
+
+[workload.dataset]
+objects = 2
+object_size = "128MiB"
+
+[[workload.mix]]
+op = "multipart_write"
+size = "128MiB"
+weight = 4
+
+[[workload.mix]]
+op = "read"
+weight = 1
+
+[knobs]
+concurrency = 4
+io_concurrency = 8
+chunk_size = "16MiB"
+
+[cost]
+provider = "cloudflare-r2"
+monthly_ops = 200000
+stored_gib = 51200

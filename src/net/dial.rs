@@ -1,0 +1,441 @@
+//! Connection establishment with exact per-phase timing: DNS → TCP → (proxy CONNECT) → TLS,
+//! plus an instrumented socket that counts raw wire bytes and timestamps writes.
+
+use std::io;
+use std::net::SocketAddr;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
+
+use await_tree::InstrumentAwait;
+use rustls_pki_types::ServerName;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::net::{lookup_host, TcpStream};
+use tokio::time::timeout;
+use tokio_rustls::client::TlsStream;
+use tokio_rustls::TlsConnector;
+
+use super::proxy::ProxyConfig;
+use crate::trace::{DialRecord, Recorder};
+
+/// Per-connection clock shared between the socket wrapper and the request path.
+#[derive(Debug)]
+pub struct ConnClock {
+    epoch: Instant,
+    last_write_us: AtomicU64,
+    pub rx: AtomicU64,
+    pub tx: AtomicU64,
+}
+
+impl ConnClock {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            epoch: Instant::now(),
+            last_write_us: AtomicU64::new(0),
+            rx: AtomicU64::new(0),
+            tx: AtomicU64::new(0),
+        })
+    }
+
+    /// Instant at which the most recent socket write completed.
+    pub fn last_write(&self) -> Instant {
+        self.epoch + Duration::from_micros(self.last_write_us.load(Ordering::Acquire))
+    }
+}
+
+/// TCP socket wrapper counting raw wire bytes (TLS records + HTTP framing) and write times.
+pub struct CountingStream {
+    inner: TcpStream,
+    clock: Arc<ConnClock>,
+    recorder: Option<Arc<Recorder>>,
+}
+
+impl AsyncRead for CountingStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let before = buf.filled().len();
+        let poll = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if let Poll::Ready(Ok(())) = &poll {
+            let n = (buf.filled().len() - before) as u64;
+            if n > 0 {
+                self.clock.rx.fetch_add(n, Ordering::Relaxed);
+                if let Some(r) = &self.recorder {
+                    r.add_wire(n, 0);
+                }
+            }
+        }
+        poll
+    }
+}
+
+impl AsyncWrite for CountingStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let poll = Pin::new(&mut self.inner).poll_write(cx, buf);
+        if let Poll::Ready(Ok(n)) = &poll {
+            if *n > 0 {
+                let us = self.clock.epoch.elapsed().as_micros() as u64;
+                self.clock.last_write_us.store(us, Ordering::Release);
+                self.clock.tx.fetch_add(*n as u64, Ordering::Relaxed);
+                if let Some(r) = &self.recorder {
+                    r.add_wire(0, *n as u64);
+                }
+            }
+        }
+        poll
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// Plain or TLS stream over the counting socket.
+pub enum ConnStream {
+    Plain(CountingStream),
+    Tls(Box<TlsStream<CountingStream>>),
+}
+
+macro_rules! delegate {
+    ($self:ident, $s:ident => $e:expr) => {
+        match $self.get_mut() {
+            ConnStream::Plain($s) => {
+                let $s = Pin::new($s);
+                $e
+            }
+            ConnStream::Tls($s) => {
+                let $s = Pin::new($s.as_mut());
+                $e
+            }
+        }
+    };
+}
+
+impl AsyncRead for ConnStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        delegate!(self, s => s.poll_read(cx, buf))
+    }
+}
+
+impl AsyncWrite for ConnStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        delegate!(self, s => s.poll_write(cx, buf))
+    }
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        delegate!(self, s => s.poll_flush(cx))
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        delegate!(self, s => s.poll_shutdown(cx))
+    }
+}
+
+/// Exact handshake timings of one dial in microseconds.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct DialTiming {
+    pub dns_us: u64,
+    pub tcp_us: u64,
+    pub proxy_us: u64,
+    pub tls_us: u64,
+}
+
+impl DialTiming {
+    pub fn total_us(&self) -> u64 {
+        self.dns_us + self.tcp_us + self.proxy_us + self.tls_us
+    }
+}
+
+pub struct Dialed {
+    pub stream: ConnStream,
+    pub clock: Arc<ConnClock>,
+    pub timing: DialTiming,
+    /// Negotiated ALPN (`h2`, `http/1.1`) or `None` for plain HTTP.
+    pub alpn: Option<String>,
+    pub tls_version: String,
+    pub cipher: String,
+    /// Address actually connected to (proxy address when tunnelling).
+    pub remote: SocketAddr,
+    pub resolved: Vec<SocketAddr>,
+}
+
+/// Classified dial failure (used for actionable diagnostics).
+#[derive(Debug)]
+pub struct DialError {
+    pub stage: &'static str,
+    pub target: String,
+    pub source: io::Error,
+}
+
+impl std::fmt::Display for DialError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} failed for {}: {}",
+            self.stage, self.target, self.source
+        )
+    }
+}
+
+impl std::error::Error for DialError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+#[derive(Clone)]
+pub struct Dialer {
+    pub tls: TlsConnector,
+    pub proxy: Option<ProxyConfig>,
+    pub connect_timeout: Duration,
+    pub recorder: Option<Arc<Recorder>>,
+}
+
+impl Dialer {
+    /// Dial `host:port`, optionally performing a TLS handshake. Every phase is timed.
+    pub async fn dial(&self, https: bool, host: &str, port: u16) -> Result<Dialed, DialError> {
+        let res = self.dial_inner(https, host, port).await;
+        if let Some(r) = &self.recorder {
+            match &res {
+                Ok(d) => r.record_dial(DialRecord {
+                    ok: true,
+                    proxy: self
+                        .proxy
+                        .as_ref()
+                        .filter(|p| !p.bypass(host))
+                        .map(|p| p.display()),
+                    dns_us: d.timing.dns_us,
+                    tcp_us: d.timing.tcp_us,
+                    proxy_us: d.timing.proxy_us,
+                    tls_us: d.timing.tls_us,
+                    remote: d.remote.to_string(),
+                    alpn: d.alpn.clone().unwrap_or_else(|| "http/1.1".into()),
+                    tls_version: d.tls_version.clone(),
+                    cipher: d.cipher.clone(),
+                }),
+                Err(_) => r.record_dial(DialRecord {
+                    ok: false,
+                    proxy: None,
+                    dns_us: 0,
+                    tcp_us: 0,
+                    proxy_us: 0,
+                    tls_us: 0,
+                    remote: String::new(),
+                    alpn: String::new(),
+                    tls_version: String::new(),
+                    cipher: String::new(),
+                }),
+            }
+        }
+        res
+    }
+
+    async fn dial_inner(&self, https: bool, host: &str, port: u16) -> Result<Dialed, DialError> {
+        let target = format!("{host}:{port}");
+        let err = |stage: &'static str, e: io::Error| DialError {
+            stage,
+            target: target.clone(),
+            source: e,
+        };
+        let proxy = self.proxy.as_ref().filter(|p| !p.bypass(host));
+        let (conn_host, conn_port) = match proxy {
+            Some(p) => (p.host.as_str(), p.port),
+            None => (host, port),
+        };
+        let step = self.connect_timeout;
+
+        // 1. DNS
+        let t = Instant::now();
+        let addrs: Vec<SocketAddr> = match conn_host.parse::<std::net::IpAddr>() {
+            Ok(ip) => vec![SocketAddr::new(ip, conn_port)],
+            Err(_) => timeout(
+                step,
+                lookup_host((conn_host, conn_port))
+                    .instrument_await(await_tree::span!("dns {conn_host}")),
+            )
+            .await
+            .map_err(|_| {
+                err(
+                    "dns",
+                    io::Error::new(io::ErrorKind::TimedOut, "DNS lookup timed out"),
+                )
+            })?
+            .map_err(|e| err("dns", e))?
+            .collect(),
+        };
+        let dns_us = t.elapsed().as_micros() as u64;
+        if addrs.is_empty() {
+            return Err(err(
+                "dns",
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("no addresses for {conn_host}"),
+                ),
+            ));
+        }
+
+        // 2. TCP
+        let t = Instant::now();
+        let tcp = timeout(
+            step,
+            TcpStream::connect(&addrs[..])
+                .instrument_await(await_tree::span!("tcp {conn_host}:{conn_port}")),
+        )
+        .await
+        .map_err(|_| {
+            err(
+                "tcp connect",
+                io::Error::new(io::ErrorKind::TimedOut, "TCP connect timed out"),
+            )
+        })?
+        .map_err(|e| err("tcp connect", e))?;
+        let tcp_us = t.elapsed().as_micros() as u64;
+        let remote = tcp.peer_addr().unwrap_or(addrs[0]);
+        let _ = tcp.set_nodelay(true);
+
+        let clock = ConnClock::new();
+        let mut sock = CountingStream {
+            inner: tcp,
+            clock: clock.clone(),
+            recorder: self.recorder.clone(),
+        };
+
+        // 3. Proxy CONNECT tunnel
+        let mut proxy_us = 0;
+        if let Some(p) = proxy {
+            let t = Instant::now();
+            timeout(step, p.connect_tunnel(&mut sock, host, port))
+                .instrument_await(await_tree::span!("proxy CONNECT {host}:{port}"))
+                .await
+                .map_err(|_| {
+                    err(
+                        "proxy CONNECT",
+                        io::Error::new(io::ErrorKind::TimedOut, "proxy CONNECT timed out"),
+                    )
+                })?
+                .map_err(|e| err("proxy CONNECT", e))?;
+            proxy_us = t.elapsed().as_micros() as u64;
+        }
+
+        // 4. TLS
+        if !https {
+            return Ok(Dialed {
+                stream: ConnStream::Plain(sock),
+                clock,
+                timing: DialTiming {
+                    dns_us,
+                    tcp_us,
+                    proxy_us,
+                    tls_us: 0,
+                },
+                alpn: None,
+                tls_version: "none".into(),
+                cipher: "none".into(),
+                remote,
+                resolved: addrs,
+            });
+        }
+        let sni = ServerName::try_from(host.trim_matches(['[', ']']).to_owned()).map_err(|_| {
+            err(
+                "tls",
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("invalid TLS server name `{host}`"),
+                ),
+            )
+        })?;
+        let t = Instant::now();
+        let tls = timeout(
+            step,
+            self.tls
+                .connect(sni, sock)
+                .instrument_await(await_tree::span!("tls {host}")),
+        )
+        .await
+        .map_err(|_| {
+            err(
+                "tls handshake",
+                io::Error::new(io::ErrorKind::TimedOut, "TLS handshake timed out"),
+            )
+        })?
+        .map_err(|e| err("tls handshake", e))?;
+        let tls_us = t.elapsed().as_micros() as u64;
+        let (_, info) = tls.get_ref();
+        let alpn = info
+            .alpn_protocol()
+            .map(|p| String::from_utf8_lossy(p).into_owned());
+        let tls_version = info
+            .protocol_version()
+            .map(|v| {
+                format!("{v:?}")
+                    .replace("TLSv1_", "TLS1.")
+                    .replace("TLSv", "TLS")
+            })
+            .unwrap_or_default();
+        let cipher = info
+            .negotiated_cipher_suite()
+            .map(|c| format!("{:?}", c.suite()))
+            .unwrap_or_default();
+        Ok(Dialed {
+            stream: ConnStream::Tls(Box::new(tls)),
+            clock,
+            timing: DialTiming {
+                dns_us,
+                tcp_us,
+                proxy_us,
+                tls_us,
+            },
+            alpn,
+            tls_version,
+            cipher,
+            remote,
+            resolved: addrs,
+        })
+    }
+}
+
+/// Read an HTTP/1 response head (up to `\r\n\r\n`) from a raw stream.
+pub(crate) async fn read_response_head<S: AsyncRead + Unpin>(s: &mut S) -> io::Result<String> {
+    let mut buf = Vec::with_capacity(512);
+    let mut byte = [0u8; 1];
+    while !buf.ends_with(b"\r\n\r\n") {
+        let n = s.read(&mut byte).await?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "proxy closed the connection",
+            ));
+        }
+        buf.push(byte[0]);
+        if buf.len() > 16 * 1024 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "proxy response head too large",
+            ));
+        }
+    }
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+pub(crate) async fn write_all<S: AsyncWrite + Unpin>(s: &mut S, data: &[u8]) -> io::Result<()> {
+    s.write_all(data).await?;
+    s.flush().await
+}

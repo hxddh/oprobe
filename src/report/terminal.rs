@@ -1,355 +1,605 @@
-//! Crisp, ANSI-aware terminal report renderer for CLI output (`oprobe run`, `tune`, `diff`, `net-probe`, errors).
+//! Human-oriented terminal rendering of reports.
 
-use std::io::IsTerminal;
+use std::fmt::Write as _;
 
-use crate::net_probe::EndpointHandshakeSummary;
-use crate::telemetry::{ActionableErrorHint, Severity};
+use super::style::*;
+use super::Report;
+use crate::analysis::diagnosis::Severity;
+use crate::trace::{Protocol, RequestRecord, SlowOp, Snapshot};
+use crate::util::{fmt_bytes, fmt_ms, fmt_usd};
 
-use super::diff::DiffSummary;
-use super::BenchmarkReport;
-
-fn colors_enabled() -> bool {
-    std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal()
+fn section(out: &mut String, title: &str) {
+    let _ = writeln!(out, "\n{}", bold(&cyan(title)));
 }
 
-fn style(text: &str, ansi_code: &str, enabled: bool) -> String {
-    if enabled {
-        format!("\x1b[{ansi_code}m{text}\x1b[0m")
-    } else {
-        text.to_owned()
+pub fn severity_icon(s: Severity) -> String {
+    match s {
+        Severity::Critical => red("✖"),
+        Severity::Warning => yellow("▲"),
+        Severity::Info => blue("●"),
     }
 }
 
-fn bar_meter(pct: f64, width: usize) -> String {
-    let filled = ((pct / 100.0) * width as f64).round().clamp(0.0, width as f64) as usize;
-    let empty = width.saturating_sub(filled);
-    format!("{}{}", "█".repeat(filled), "░".repeat(empty))
-}
-
-/// Render a white-box [`BenchmarkReport`] as an ergonomic, scannable CLI terminal summary.
-pub fn render_report_terminal(rep: &BenchmarkReport) -> String {
-    let c = colors_enabled();
-    let mut out = String::with_capacity(4096);
-
-    let sev_ansi = match rep.frame.diagnosis.severity {
-        Severity::Healthy => "1;32",
-        Severity::Advisory => "1;36",
-        Severity::Warning => "1;33",
-        Severity::Critical => "1;31",
-    };
-
-    out.push_str(&format!(
-        "{} {} ({}) · {}\n",
-        style("● oprobe v1.0.0", "1;36", c),
-        style(&rep.profile.target.name, "1", c),
-        rep.profile.target.scheme,
-        rep.profile.workload.kind.title()
-    ));
-    out.push_str(&format!(
-        "  [{}] {}\n  ↳ {}\n",
-        style(rep.frame.diagnosis.severity.badge(), sev_ansi, c),
-        style(&rep.frame.diagnosis.headline, "1", c),
-        rep.frame.diagnosis.recommendation
-    ));
-    out.push_str(&format!(
-        "  Knobs: conc={} | chunk={} KiB | gap={} KiB | cache={} | tail_cut={} | keep_alive={}\n\n",
-        rep.active_knob.concurrent,
-        rep.active_knob.chunk_bytes / 1024,
-        rep.active_knob.range_gap_bytes / 1024,
-        if rep.active_knob.enable_foyer { "on" } else { "off" },
-        if rep.active_knob.enable_tail_cut { "on" } else { "off" },
-        if rep.active_knob.keep_alive { "on" } else { "off" },
-    ));
-
-    // 1. 7-Stage Waterfall
-    out.push_str(&format!(
-        "{} (mean {:.3} ms)\n",
-        style("1. Seven-Stage White-Box Latency Waterfall", "1;36", c),
-        rep.frame.waterfall.total_ms()
-    ));
-    for (stage, ms, pct) in rep.frame.waterfall.breakdown_pct() {
-        out.push_str(&format!(
-            "  {:<28} {:>8.3} ms ({:>5.1}%)  {}\n",
-            stage,
-            ms,
-            pct,
-            bar_meter(pct, 24)
-        ));
-    }
-    if rep.frame.transport.total_http_requests > 0 {
-        let wf = &rep.frame.waterfall;
-        out.push_str(&format!(
-            "  └─ Stage 3 Wire Split: DNS {:.3} ms | TCP {:.3} ms | TLS {:.3} ms | Pool/Write {:.3} ms\n",
-            wf.dns_lookup_us as f64 / 1000.0,
-            wf.tcp_connect_us as f64 / 1000.0,
-            wf.tls_handshake_us as f64 / 1000.0,
-            wf.pool_checkout_us as f64 / 1000.0,
-        ));
-    }
-    out.push('\n');
-
-    // 2. Per-Verb Quantiles
-    out.push_str(&format!(
-        "{}\n",
-        style("2. Per-Verb Isolated HDR Latency Quantiles", "1;36", c)
-    ));
-    out.push_str(&format!(
-        "  {:<24} {:>7} {:>9} {:>9} {:>9} {:>9} {:>9} {:>10} {:>8}\n",
-        "VERB", "COUNT", "OPS/s", "P50(ms)", "P95(ms)", "P99(ms)", "MAX(ms)", "MiB/s", "429/503"
-    ));
-    out.push_str(&format!("  {}\n", "─".repeat(102)));
-    for v in &rep.frame.verbs {
-        out.push_str(&format!(
-            "  {:<24} {:>7} {:>9.1} {:>9.2} {:>9.2} {:>9.2} {:>9.2} {:>10.2} {:>7.1}%\n",
-            v.verb,
-            v.count,
-            v.ops_per_sec,
-            v.p50_ms,
-            v.p95_ms,
-            v.p99_ms,
-            v.max_ms,
-            v.throughput_mib_s,
-            v.throttle_429_503_pct
-        ));
-    }
-    out.push('\n');
-
-    // 3. Transport, Amplification & Cleanup
-    let tp = &rep.frame.transport;
-    out.push_str(&format!(
-        "{}\n",
-        style("3. Transport Efficiency, Amplification & Cleanup", "1;36", c)
-    ));
-    out.push_str(&format!(
-        "  Throughput : {:.2} MiB/s logical ({:.2} MiB/s wire | {:.2} MiB/s/core across {} cores | RSS {} MiB)\n",
-        tp.aggregate_mib_s, tp.wire_mib_s, tp.mib_per_cpu_core, tp.cpu_cores, tp.process_rss_mib
-    ));
-    out.push_str(&format!(
-        "  Connections: {:.1}% socket reuse ({} warm / {} cold) | ALPN={} TLS={} | Peak Inflight={}\n",
-        tp.socket_reuse_pct,
-        tp.reused_connections,
-        tp.cold_connections_dialed,
-        tp.negotiated_alpn,
-        tp.tls_version,
-        tp.peak_inflight
-    ));
-    out.push_str(&format!(
-        "  Amplify    : Read Amp {:.2}x (Net Wire/Logical {:.2}x, Gap Waste {} KiB) | RPC Amp {:.2}x ({} A / {} B) | Cache Hit {:.1}%\n",
-        tp.read_amplification,
-        tp.net_wire_read_ratio,
-        tp.coalesced_gap_waste_bytes / 1024,
-        tp.rpc_amplification,
-        tp.class_a_rpcs,
-        tp.class_b_rpcs,
-        tp.cache_hit_ratio_pct
-    ));
-    out.push_str(&format!(
-        "  Resilience : 429/503 Throttles={} | Retries={} ({:.1} ms backoff) | TailCut Cancels={} | CRC32C={} ok / {} bad\n",
-        tp.http_429_count + tp.http_503_slowdown_count,
-        tp.retry_attempts,
-        tp.retry_backoff_ms,
-        tp.tail_cut_cancels,
-        tp.crc32c_verified_ok,
-        tp.crc32c_corrupted
-    ));
-    if rep.frame.cleanup.auto_cleanup_enabled {
-        out.push_str(&format!(
-            "  Cleanup    : {} ({}/{} objects removed under `{}` in {:.1} ms)\n",
-            if rep.frame.cleanup.verified_clean {
-                "VERIFIED CLEAN (0 leaked objects)"
+/// Render the time-share bars (used by run reports and the TUI-less live view).
+pub fn time_share_lines(r: &Report) -> String {
+    let sh = &r.diagnosis.shares;
+    let mut out = String::new();
+    let rows = [
+        (
+            "queue",
+            sh.queue,
+            "waiting for in-flight permits / connections",
+        ),
+        (
+            "connect",
+            sh.connect,
+            "DNS + TCP + proxy + TLS on fresh connections",
+        ),
+        ("upload", sh.upload, "sending request bodies"),
+        (
+            if r.target.endpoint.is_some() {
+                "server"
             } else {
-                "INCOMPLETE"
+                "backend"
             },
-            rep.frame.cleanup.objects_deleted,
-            rep.frame.cleanup.objects_created,
-            rep.frame.cleanup.run_prefix,
-            rep.frame.cleanup.cleanup_ms
-        ));
-    }
-    out.push('\n');
-
-    // 4. Multi-Cloud FinOps
-    out.push_str(&format!(
-        "{} ({:.0} TB stored / {:.0} TB monthly access)\n",
-        style("4. Multi-Cloud Monthly FinOps Projection", "1;36", c),
-        rep.profile.pricing.baseline_stored_tb,
-        rep.profile.pricing.monthly_logical_access_tb
-    ));
-    out.push_str(&format!(
-        "  {:<22} {:>11} {:>12} {:>11} {:>13} {:>13} {:>13}\n",
-        "PROVIDER", "STORAGE", "API(A+B)", "EGRESS", "TOTAL/MO", "AMP WASTE", "CACHE SAVED"
-    ));
-    out.push_str(&format!("  {}\n", "─".repeat(101)));
-    for f in &rep.multi_cloud_finops {
-        out.push_str(&format!(
-            "  {:<22} {:>10.2}$ {:>11.2}$ {:>10.2}$ {:>12.2}$ {:>12.2}$ {:>12.2}$\n",
-            f.provider_name,
-            f.monthly_storage_usd,
-            f.monthly_api_requests_usd,
-            f.monthly_egress_usd,
-            f.total_monthly_usd,
-            f.waste_from_amplification_usd,
-            f.saved_by_cache_usd
-        ));
-    }
-
-    // 5. Top Slow Request Call Stack
-    if let Some(slowest) = rep.frame.slowest_traces.first() {
-        out.push_str(&format!(
-            "\n{} (slowest observed: {:.2} ms on `{}`)\n",
-            style("5. Slow-Request AwaitTree Call Stack", "1;36", c),
-            slowest.observed_ms,
-            slowest.root_span
-        ));
-        for line in slowest.tree_dump.lines().take(8) {
-            out.push_str(&format!("  {line}\n"));
+            sh.server,
+            "time to first byte (server processing + RTT)",
+        ),
+        ("download", sh.download, "receiving response bodies"),
+        ("cache", sh.cache, "local cache lookups"),
+        ("client", sh.client, "OpenDAL / signing / CRC / consumer"),
+    ];
+    let max = rows.iter().map(|r| r.1).fold(0.0, f64::max).max(1e-9);
+    for (name, v, desc) in rows {
+        if v < 0.0005 && name != "server" {
+            continue;
         }
+        let b = bar(v / max, 28);
+        let colored = if (v - max).abs() < 1e-12 {
+            magenta(&b)
+        } else {
+            dim(&b)
+        };
+        let _ = writeln!(
+            out,
+            "  {:<9} {colored} {:>5.1}%  {}",
+            name,
+            v * 100.0,
+            dim(desc)
+        );
     }
-
-    if !rep.trials.is_empty() {
-        out.push_str(&format!(
-            "\n{} ({} trials, 429/503 circuit breaker: {})\n",
-            style("6. Auto-Tune Sweep Summary", "1;36", c),
-            rep.trials.len(),
-            if rep.circuit_breaker_triggered {
-                "TRIGGERED -> BACKED OFF SAFELY"
-            } else {
-                "NOT TRIGGERED"
-            }
-        ));
-        for t in &rep.trials {
-            let marker = if t.knob == rep.active_knob && !t.throttled_503 {
-                "★"
-            } else if t.throttled_503 {
-                "✗"
-            } else {
-                " "
-            };
-            out.push_str(&format!(
-                "  {marker} #{:<2} [{:<18}] conc={:<3} chunk={:>5}KiB gap={:>4}KiB cache={:<3} -> {:>7.1} MiB/s | P99 {:>7.2}ms | ReadAmp {:.2}x | 429/503={}\n",
-                t.trial_id,
-                t.phase,
-                t.knob.concurrent,
-                t.knob.chunk_bytes / 1024,
-                t.knob.range_gap_bytes / 1024,
-                if t.knob.enable_foyer { "on" } else { "off" },
-                t.aggregate_mib_s,
-                t.worst_p99_ms,
-                t.read_amplification,
-                t.throttle_events
-            ));
-        }
-    }
-
     out
 }
 
-/// Render `oprobe diff` verdict cleanly for terminal / CI logs.
-pub fn render_diff_terminal(diff: &DiffSummary) -> String {
-    let c = colors_enabled();
-    let badge = if diff.passed_gate {
-        style("PASS (CI Gate Green)", "1;32", c)
+pub fn request_line(i: usize, r: &RequestRecord) -> String {
+    let t = &r.timing;
+    let ms = |us: u64| fmt_ms(us as f64 / 1000.0);
+    let status = if r.status == 0 {
+        red("ERR")
+    } else if r.status >= 400 {
+        red(&r.status.to_string())
     } else {
-        style("FAIL (Regression Gate Breached — Exit Code 2)", "1;31", c)
+        green(&r.status.to_string())
     };
-    let mut out = format!("● oprobe diff — {badge}\n");
-    out.push_str(&format!(
-        "  Throughput : {:.2} -> {:.2} MiB/s ({:.2}x)\n",
-        diff.baseline_mib_s, diff.candidate_mib_s, diff.throughput_ratio
-    ));
-    out.push_str(&format!(
-        "  Amplify    : Read Amp {:.2}x -> {:.2}x | RPC Amp {:.2}x -> {:.2}x | Monthly Bill ${:.2} -> ${:.2} ({:+.1}%)\n\n",
-        diff.baseline_read_amp,
-        diff.candidate_read_amp,
-        diff.baseline_rpc_amp,
-        diff.candidate_rpc_amp,
-        diff.baseline_monthly_usd,
-        diff.candidate_monthly_usd,
-        diff.monthly_usd_delta_pct
-    ));
-    out.push_str(&format!(
-        "  {:<24} {:>12} {:>12} {:>12} {:>10}\n",
-        "OPERATION VERB", "BASE P99(ms)", "CAND P99(ms)", "DELTA(%)", "STATUS"
-    ));
-    out.push_str(&format!("  {}\n", "─".repeat(74)));
-    for v in &diff.verb_diffs {
-        out.push_str(&format!(
-            "  {:<24} {:>12.2} {:>12.2} {:>+11.1}% {:>10}\n",
-            v.verb,
-            v.baseline_p99_ms,
-            v.candidate_p99_ms,
-            v.p99_delta_pct,
-            if v.regressed { "REGRESSED" } else { "OK" }
+    let conn = match r.protocol {
+        Protocol::InProcess => "in-process".to_owned(),
+        p => format!(
+            "{} conn#{} {}",
+            if p == Protocol::Http2 { "h2" } else { "h1" },
+            r.conn_id,
+            if r.reused { "warm" } else { "cold" }
+        ),
+    };
+    let mut parts = Vec::new();
+    if t.queue_us > 0 {
+        parts.push(format!("queue {}", ms(t.queue_us)));
+    }
+    if !r.reused && r.protocol != Protocol::InProcess {
+        parts.push(format!(
+            "connect {} (dns {} tcp {}{} tls {})",
+            ms(t.connect_us()),
+            ms(t.dns_us),
+            ms(t.tcp_us),
+            if t.proxy_us > 0 {
+                format!(" proxy {}", ms(t.proxy_us))
+            } else {
+                String::new()
+            },
+            ms(t.tls_us)
         ));
     }
-    if !diff.reasons.is_empty() {
-        out.push_str("\n  Breach Reasons:\n");
-        for r in &diff.reasons {
-            out.push_str(&format!("    - {r}\n"));
+    if r.protocol != Protocol::InProcess {
+        parts.push(format!("send {}", ms(t.send_us)));
+        parts.push(format!("ttfb {}", ms(t.ttfb_us)));
+        parts.push(format!("transfer {}", ms(t.body_us)));
+        if t.stall_us > 0 {
+            parts.push(format!("stall {}", ms(t.stall_us)));
+        }
+    } else {
+        parts.push(format!("service {}", ms(t.ttfb_us)));
+    }
+    let mut s = format!(
+        "    #{:<2} +{:<8} {:<24} {} {}  {}  {}",
+        i + 1,
+        fmt_ms(r.start_offset_us as f64 / 1000.0),
+        r.api.label(),
+        status,
+        dim(&conn),
+        parts.join(" · "),
+        dim(&format!("= {}", ms(t.total_us)))
+    );
+    if let Some(e) = &r.error {
+        let _ = write!(s, "  {}", red(e));
+    }
+    if let Some(id) = &r.request_id {
+        let _ = write!(s, "  {}", dim(&format!("req-id {id}")));
+    }
+    s
+}
+
+pub fn slow_op_block(op: &SlowOp, show_tree: bool) -> String {
+    let mut out = String::new();
+    let b = &op.breakdown;
+    let _ = writeln!(
+        out,
+        "  {} {} at {:.1}s  {}",
+        bold(&op.verb),
+        bold(&fmt_ms(op.latency_ms)),
+        op.at_s,
+        dim(&format!(
+            "queue {} · backend {} · client {}{}",
+            fmt_ms(b.queue_ms),
+            fmt_ms(b.backend_ms),
+            fmt_ms(b.client_ms + b.cache_ms),
+            if op.retries > 0 {
+                format!(" · {} retries", op.retries)
+            } else {
+                String::new()
+            }
+        ))
+    );
+    if let Some(e) = &op.error {
+        let _ = writeln!(out, "    {}", red(&format!("failed: {e}")));
+    }
+    for (i, r) in op.requests.iter().take(12).enumerate() {
+        let _ = writeln!(out, "{}", request_line(i, r));
+    }
+    if op.requests.len() > 12 {
+        let _ = writeln!(
+            out,
+            "    {}",
+            dim(&format!("… {} more requests", op.requests.len() - 12))
+        );
+    }
+    if show_tree {
+        if let Some(t) = &op.await_tree {
+            let _ = writeln!(
+                out,
+                "    {}",
+                dim("async call stack captured while in flight:")
+            );
+            for l in t.lines().take(16) {
+                let _ = writeln!(out, "      {}", dim(l));
+            }
         }
     }
     out
 }
 
-/// Render `oprobe net-probe` cold-vs-warm socket & TLS handshake summary in terminal.
-pub fn render_handshake_terminal(hs: &EndpointHandshakeSummary) -> String {
-    let c = colors_enabled();
-    let mut out = format!(
-        "{} {} ({}:{})\n",
-        style("● oprobe net-probe", "1;36", c),
-        style(&hs.endpoint, "1", c),
-        hs.host,
-        hs.port
-    );
-    out.push_str(&format!(
-        "  Protocol : ALPN `{}` | TLS `{}` | Cipher `{}` | Resolved IPs: {:?}\n",
-        hs.negotiated_alpn, hs.tls_version, hs.cipher_suite, hs.resolved_ips
-    ));
-    out.push_str(&format!(
-        "  Cold Dial: DNS {:.2}/{:.2} ms (P50/P99) | TCP RTT {:.2}/{:.2} ms | TLS {:.2}/{:.2} ms | Cold HEAD TTFB {:.2}/{:.2} ms\n",
-        hs.dns_p50_ms,
-        hs.dns_p99_ms,
-        hs.tcp_rtt_p50_ms,
-        hs.tcp_rtt_p99_ms,
-        hs.tls_p50_ms,
-        hs.tls_p99_ms,
-        hs.head_ttfb_p50_ms,
-        hs.head_ttfb_p99_ms
-    ));
-    out.push_str(&format!(
-        "  Reuse Win: Cold Total {:.2} ms vs Warm Reused HEAD TTFB {:.2} ms -> {:.1}x faster with Keep-Alive!\n\n",
-        hs.cold_total_ms, hs.warm_ttfb_p50_ms, hs.cold_vs_warm_ratio
-    ));
-    for s in &hs.samples {
-        out.push_str(&format!(
-            "  #{} [{} -> HTTP {}] dns={:.2}ms tcp={:.2}ms tls={:.2}ms cold_ttfb={:.2}ms warm_ttfb={:.2}ms ({})\n",
-            s.sample_index,
-            s.remote_addr,
-            s.http_status,
-            s.dns_lookup_us as f64 / 1000.0,
-            s.tcp_connect_us as f64 / 1000.0,
-            s.tls_handshake_us as f64 / 1000.0,
-            s.http_head_ttfb_us as f64 / 1000.0,
-            s.warm_reused_ttfb_us as f64 / 1000.0,
-            s.alpn_protocol
-        ));
-    }
-    out
+pub fn verbs_table(s: &Snapshot) -> String {
+    let rows: Vec<Vec<String>> = s
+        .verbs
+        .iter()
+        .map(|v| {
+            vec![
+                v.verb.clone(),
+                v.count.to_string(),
+                format!("{:.1}", v.ops_per_s),
+                format!("{:.1}", v.mib_per_s),
+                fmt_ms(v.latency.p50),
+                fmt_ms(v.latency.p90),
+                fmt_ms(v.latency.p99),
+                fmt_ms(v.latency.max),
+                format!("{:.2}", v.requests_per_op),
+                if v.errors > 0 {
+                    red(&v.errors.to_string())
+                } else {
+                    "0".into()
+                },
+            ]
+        })
+        .collect();
+    table(
+        &[
+            "operation",
+            "count",
+            "ops/s",
+            "MiB/s",
+            "p50",
+            "p90",
+            "p99",
+            "max",
+            "req/op",
+            "errors",
+        ],
+        &rows,
+        2,
+    )
 }
 
-/// Format a structured runtime failure with actionable diagnostic hints on stderr.
-pub fn render_error_terminal(err: &anyhow::Error, hint: &ActionableErrorHint) -> String {
-    let c = std::env::var_os("NO_COLOR").is_none() && std::io::stderr().is_terminal();
-    let mut out = format!(
-        "\n{} {}\n",
-        style("✗ oprobe diagnostic error:", "1;31", c),
-        style(&hint.category, "1", c)
+pub fn apis_table(s: &Snapshot) -> String {
+    let rows: Vec<Vec<String>> = s
+        .apis
+        .iter()
+        .map(|a| {
+            let st = &a.stages;
+            let status: Vec<String> = a
+                .status
+                .iter()
+                .map(|(c, n)| {
+                    let label = if *c == 0 {
+                        "err".to_owned()
+                    } else {
+                        c.to_string()
+                    };
+                    let t = format!("{label}×{n}");
+                    if *c == 0 || *c >= 400 {
+                        red(&t)
+                    } else {
+                        t
+                    }
+                })
+                .collect();
+            vec![
+                a.api.label().to_owned(),
+                a.count.to_string(),
+                format!("{:.0}%", a.reused_pct),
+                fmt_ms(st.queue.mean),
+                if st.connect.count > 0 {
+                    fmt_ms(st.connect.mean)
+                } else {
+                    "-".into()
+                },
+                fmt_ms(st.send.mean),
+                fmt_ms(st.ttfb.mean),
+                fmt_ms(st.body.mean),
+                fmt_ms(st.stall.mean),
+                fmt_ms(st.total.p99),
+                status.join(" "),
+            ]
+        })
+        .collect();
+    table(
+        &[
+            "request", "count", "warm", "queue", "connect", "send", "ttfb", "transfer", "stall",
+            "p99", "status",
+        ],
+        &rows,
+        2,
+    )
+}
+
+pub fn render(r: &Report) -> String {
+    let s = &r.result;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "{} {} {} {}",
+        bold("oprobe"),
+        dim(&r.oprobe_version),
+        bold(&r.target.display),
+        dim(&format!(
+            "· {} · {:.1}s measured · {}",
+            r.workload.preset.slug(),
+            s.elapsed_s,
+            if let Some(rate) = r.workload.rate {
+                format!("open-loop {rate} ops/s")
+            } else {
+                format!("{} workers", r.knobs.concurrency)
+            }
+        ))
     );
-    out.push_str(&format!("  Cause   : {err:#}\n"));
-    out.push_str(&format!("  Insight : {}\n", hint.likely_cause));
-    out.push_str("  How to fix:\n");
-    for (idx, step) in hint.remediation_steps.iter().enumerate() {
-        out.push_str(&format!("    {}. {}\n", idx + 1, step));
+    if let Some(ep) = &r.target.endpoint {
+        let _ = writeln!(
+            out,
+            "{}",
+            dim(&format!(
+                "endpoint {ep}{}",
+                r.target
+                    .proxy
+                    .as_ref()
+                    .map(|p| format!(" via proxy {p}"))
+                    .unwrap_or_default()
+            ))
+        );
+    }
+    for w in &r.warnings {
+        let _ = writeln!(out, "{} {}", yellow("warning:"), w);
+    }
+
+    let worst = r.diagnosis.worst();
+    let verdict = match worst {
+        Severity::Critical => badge("ATTENTION", "41"),
+        Severity::Warning => badge("REVIEW", "43;30"),
+        Severity::Info => badge("HEALTHY", "42;30"),
+    };
+    let _ = writeln!(out, "\n{verdict} {}", bold(&r.diagnosis.headline));
+
+    let sm = &s.summary;
+    let _ = writeln!(
+        out,
+        "\n  {} {:.1} ops/s · {:.1} MiB/s {}   {} p50 {} · p99 {} · p99.9 {}   {} {} · {}",
+        dim("throughput"),
+        sm.ops_per_s,
+        sm.mib_per_s,
+        dim(&format!(
+            "(read {:.1} / write {:.1})",
+            sm.read_mib_per_s, sm.write_mib_per_s
+        )),
+        dim("latency"),
+        fmt_ms(sm.latency.p50),
+        fmt_ms(sm.latency.p99),
+        fmt_ms(sm.latency.p999),
+        dim("errors"),
+        if sm.failed_ops > 0 {
+            red(&sm.failed_ops.to_string())
+        } else {
+            "0".into()
+        },
+        if s.resilience.throttled_responses > 0 {
+            red(&format!("{} throttled", s.resilience.throttled_responses))
+        } else {
+            "0 throttled".into()
+        },
+    );
+    if let Some(ol) = &s.open_loop {
+        let _ = writeln!(
+            out,
+            "  {} target {:.0} ops/s · achieved {:.0} · missed {} · max schedule lag {}",
+            dim("open loop"),
+            ol.target_rate,
+            ol.achieved_rate,
+            ol.missed,
+            fmt_ms(ol.max_schedule_lag_ms)
+        );
+    }
+
+    section(
+        &mut out,
+        "WHERE THE TIME GOES  (share of operation wall time)",
+    );
+    out.push_str(&time_share_lines(r));
+
+    section(&mut out, "OPERATIONS");
+    out.push_str(&verbs_table(s));
+
+    if !s.apis.is_empty() {
+        section(
+            &mut out,
+            "BACKEND REQUESTS  (mean per request; p99 of total)",
+        );
+        out.push_str(&apis_table(s));
+        if s.connections.http2_requests > 0 {
+            let _ = writeln!(out, "  {}", dim("h2: `send` ends when the body is handed to the stream; flow-controlled transmission shows up in ttfb"));
+        }
+    }
+
+    let c = &s.connections;
+    if c.requests > 0 && (c.http1_requests + c.http2_requests) > 0 {
+        section(&mut out, "CONNECTIONS");
+        let _ = writeln!(
+            out,
+            "  {} · {} · {}{}",
+            if c.alpn.is_empty() {
+                "http/1.1".into()
+            } else {
+                c.alpn.clone()
+            },
+            if c.tls_version.is_empty() {
+                "plain".into()
+            } else {
+                c.tls_version.clone()
+            },
+            dim(&c.cipher),
+            c.proxy
+                .as_ref()
+                .map(|p| format!(" · via {p}"))
+                .unwrap_or_default()
+        );
+        let _ = writeln!(
+            out,
+            "  {} new in window · {:.1}% of requests on warm connections · peak {} in-flight requests{}",
+            c.dialed,
+            c.reuse_pct,
+            c.peak_inflight_requests,
+            if c.dial_failures > 0 { red(&format!(" · {} failed dials", c.dial_failures)) } else { String::new() }
+        );
+        if c.dns.count > 0 {
+            let _ = writeln!(
+                out,
+                "  dial p50/p99   dns {}/{} · tcp {}/{}{} · tls {}/{}",
+                fmt_ms(c.dns.p50),
+                fmt_ms(c.dns.p99),
+                fmt_ms(c.tcp.p50),
+                fmt_ms(c.tcp.p99),
+                if c.proxy_connect.count > 0 {
+                    format!(
+                        " · proxy {}/{}",
+                        fmt_ms(c.proxy_connect.p50),
+                        fmt_ms(c.proxy_connect.p99)
+                    )
+                } else {
+                    String::new()
+                },
+                fmt_ms(c.tls.p50),
+                fmt_ms(c.tls.p99),
+            );
+        }
+        if !c.remote_addrs.is_empty() {
+            let _ = writeln!(
+                out,
+                "  {}",
+                dim(&format!("remote {}", c.remote_addrs.join(", ")))
+            );
+        }
+    }
+
+    section(&mut out, "BYTES & AMPLIFICATION");
+    let b = &s.bytes;
+    let _ = writeln!(
+        out,
+        "  logical read {} · write {} · backend down {} · up {} · cache hits {}",
+        fmt_bytes(b.logical_read),
+        fmt_bytes(b.logical_write),
+        fmt_bytes(b.backend_down),
+        fmt_bytes(b.backend_up),
+        fmt_bytes(b.cache_hit_bytes)
+    );
+    let _ = writeln!(
+        out,
+        "  read amplification {:.2}× · over-read {:.2}× · {:.2} requests/op · wire rx {} tx {}",
+        b.read_amplification,
+        b.overread_ratio,
+        b.request_amplification,
+        fmt_bytes(b.wire_rx),
+        fmt_bytes(b.wire_tx)
+    );
+    if s.cache.enabled {
+        let _ = writeln!(
+            out,
+            "  cache {:.1}% hit ({} of {} lookups, mean lookup {})",
+            s.cache.hit_ratio * 100.0,
+            s.cache.hits,
+            s.cache.lookups,
+            fmt_ms(s.cache.lookup_ms_mean)
+        );
+    }
+    if s.integrity.verified + s.integrity.corrupted > 0 {
+        let _ = writeln!(
+            out,
+            "  integrity {} {} verified{}",
+            if s.integrity.corrupted == 0 {
+                green("✓")
+            } else {
+                red("✖")
+            },
+            s.integrity.verified,
+            if s.integrity.corrupted > 0 {
+                red(&format!(", {} CORRUPTED", s.integrity.corrupted))
+            } else {
+                String::new()
+            }
+        );
+    }
+
+    if r.target.endpoint.is_some() && s.summary.ops > 0 {
+        let cst = &r.cost;
+        section(
+            &mut out,
+            &format!(
+                "COST  ({} at {:.0}M ops/month, egress {:.0}%)",
+                cst.selected.provider,
+                cst.monthly_ops / 1e6,
+                cst.egress_fraction * 100.0
+            ),
+        );
+        let sel = &cst.selected;
+        let _ = writeln!(
+            out,
+            "  {} per 1M ops · requests {} · egress {} · storage {} → {} /month",
+            bold(&fmt_usd(sel.per_million_ops_usd)),
+            fmt_usd(sel.requests_usd),
+            fmt_usd(sel.egress_usd),
+            fmt_usd(sel.storage_usd),
+            bold(&fmt_usd(sel.total_usd))
+        );
+        let u = &cst.per_op;
+        let _ = writeln!(
+            out,
+            "  {}",
+            dim(&format!(
+                "per op: {:.2} write · {:.2} list · {:.2} read requests · {} down · {} up",
+                u.write_requests,
+                u.list_requests,
+                u.read_requests,
+                fmt_bytes(u.download_bytes as u64),
+                fmt_bytes(u.upload_bytes as u64)
+            ))
+        );
+        if sel.failed_requests_usd > 0.005
+            || sel.overread_usd > 0.005
+            || sel.cache_savings_usd > 0.005
+        {
+            let _ = writeln!(
+                out,
+                "  waste: failed/throttled requests {} · over-read egress {} · cache saved {}",
+                fmt_usd(sel.failed_requests_usd),
+                fmt_usd(sel.overread_usd),
+                fmt_usd(sel.cache_savings_usd)
+            );
+        }
+        let mut cmp: Vec<_> = cst.comparison.iter().collect();
+        cmp.sort_by(|a, b| a.total_usd.total_cmp(&b.total_usd));
+        let line: Vec<String> = cmp
+            .iter()
+            .map(|c| format!("{} {}", c.key, fmt_usd(c.total_usd)))
+            .collect();
+        let _ = writeln!(
+            out,
+            "  {}",
+            dim(&format!("same workload elsewhere: {}", line.join(" · ")))
+        );
+    }
+
+    if !r.diagnosis.findings.is_empty() {
+        section(&mut out, "FINDINGS");
+        for f in &r.diagnosis.findings {
+            let _ = writeln!(out, "  {} {}", severity_icon(f.severity), bold(&f.title));
+            let _ = writeln!(out, "    {}", dim(&f.evidence));
+            let _ = writeln!(out, "    → {}", f.action);
+        }
+    }
+
+    if let Some(op) = s.slow_ops.first() {
+        section(&mut out, "SLOWEST OPERATION");
+        out.push_str(&slow_op_block(op, true));
+    }
+
+    section(&mut out, "CLEANUP");
+    let cl = &r.cleanup;
+    if !cl.enabled {
+        let _ = writeln!(
+            out,
+            "  {} test data kept under {} (remove later with `oprobe cleanup`)",
+            yellow("●"),
+            cl.prefix
+        );
+    } else if cl.verified && cl.deleted == 0 && cl.kept_dataset.is_some() && cl.duration_ms == 0.0 {
+        let _ = writeln!(out, "  {} read-only run: nothing was written", green("✓"));
+    } else if cl.verified {
+        let _ = writeln!(
+            out,
+            "  {} removed {} objects under {} {}",
+            green("✓"),
+            cl.deleted,
+            cl.prefix,
+            dim(&format!("({:.0} ms, verified empty)", cl.duration_ms))
+        );
+    } else {
+        let _ = writeln!(
+            out,
+            "  {} {} objects remain under {}{} — run `oprobe cleanup`",
+            red("✖"),
+            cl.remaining,
+            cl.prefix,
+            cl.error
+                .as_ref()
+                .map(|e| format!(" ({e})"))
+                .unwrap_or_default()
+        );
+    }
+    if let Some(ds) = &cl.kept_dataset {
+        let _ = writeln!(out, "  {}", dim(&format!("dataset left in place: {ds}")));
     }
     out
 }

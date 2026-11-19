@@ -1,5 +1,5 @@
-//! Pure-Rust W-TinyLFU local hybrid/memory cache OpenDAL layer (`moka::future::Cache`),
-//! supporting both full-object and sparse byte-range caching with exact microsecond lookup telemetry.
+//! In-memory W-TinyLFU read cache layer (`moka`), caching exact byte ranges and whole objects.
+//! Lookups are timed and attributed to the current operation scope; writes/deletes invalidate.
 
 use std::collections::HashMap;
 use std::ops::RangeBounds;
@@ -12,7 +12,20 @@ use opendal_core::raw::oio::{self, ReadStream as _};
 use opendal_core::raw::*;
 use opendal_core::*;
 
-use crate::telemetry::TelemetryRegistry;
+use crate::trace::OpScope;
+
+fn note_lookup(us: u64, hit_bytes: Option<u64>) {
+    if let Some(s) = OpScope::current() {
+        s.with(|d| {
+            d.cache_lookups += 1;
+            d.cache_lookup_us += us;
+            if let Some(b) = hit_bytes {
+                d.cache_hits += 1;
+                d.cache_hit_bytes += b;
+            }
+        });
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct CacheEntryKey {
@@ -25,7 +38,6 @@ struct CacheEntryKey {
 struct SharedCacheState {
     cache: Cache<CacheEntryKey, Buffer>,
     path_epochs: Mutex<HashMap<String, u64>>,
-    telemetry: Arc<TelemetryRegistry>,
 }
 
 impl SharedCacheState {
@@ -58,7 +70,7 @@ impl std::fmt::Debug for WhiteboxCacheLayer {
 }
 
 impl WhiteboxCacheLayer {
-    pub fn new(capacity_bytes: u64, telemetry: Arc<TelemetryRegistry>) -> Self {
+    pub fn new(capacity_bytes: u64) -> Self {
         let cache = Cache::builder()
             .max_capacity(capacity_bytes.max(1024 * 1024))
             .weigher(|_k: &CacheEntryKey, v: &Buffer| v.len().clamp(64, u32::MAX as usize) as u32)
@@ -67,7 +79,6 @@ impl WhiteboxCacheLayer {
             state: Arc::new(SharedCacheState {
                 cache,
                 path_epochs: Mutex::new(HashMap::new()),
-                telemetry,
             }),
         }
     }
@@ -225,13 +236,13 @@ impl CachedReader {
             .state
             .cache
             .get(&exact_key)
-            .instrument_await("layer::local_cache_lookup")
+            .instrument_await("cache::lookup")
             .await
         {
-            let us = t_lookup.elapsed().as_micros() as u64;
-            self.state
-                .telemetry
-                .record_cache_lookup(us, true, buf.len() as u64);
+            note_lookup(
+                t_lookup.elapsed().as_micros() as u64,
+                Some(buf.len() as u64),
+            );
             return Some(buf);
         }
 
@@ -252,17 +263,16 @@ impl CachedReader {
                 };
                 if start <= full_buf.len() {
                     let sliced = full_buf.slice(range.to_range_as_usize());
-                    let us = t_lookup.elapsed().as_micros() as u64;
-                    self.state
-                        .telemetry
-                        .record_cache_lookup(us, true, sliced.len() as u64);
+                    note_lookup(
+                        t_lookup.elapsed().as_micros() as u64,
+                        Some(sliced.len() as u64),
+                    );
                     return Some(sliced);
                 }
             }
         }
 
-        let us = t_lookup.elapsed().as_micros() as u64;
-        self.state.telemetry.record_cache_lookup(us, false, 0);
+        note_lookup(t_lookup.elapsed().as_micros() as u64, None);
         None
     }
 }
@@ -282,7 +292,6 @@ impl oio::Read for CachedReader {
         let fetched = stream.read_all().await?;
 
         if fetched.len() <= 32 * 1024 * 1024 {
-            let t_ins = Instant::now();
             let key = CacheEntryKey {
                 path: self.path.clone(),
                 epoch,
@@ -290,12 +299,6 @@ impl oio::Read for CachedReader {
                 size: range.size(),
             };
             self.state.cache.insert(key, fetched.clone()).await;
-            if self.state.telemetry.is_measuring() {
-                self.state
-                    .telemetry
-                    .cache_lookup_us
-                    .fetch_add(t_ins.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
-            }
         }
 
         Ok((rp, Box::new(fetched) as Box<dyn oio::ReadStreamDyn>))
@@ -314,7 +317,6 @@ impl oio::Read for CachedReader {
         let (rp, fetched) = reader.read(range).await?;
 
         if fetched.len() <= 32 * 1024 * 1024 {
-            let t_ins = Instant::now();
             let key = CacheEntryKey {
                 path: self.path.clone(),
                 epoch,
@@ -322,12 +324,6 @@ impl oio::Read for CachedReader {
                 size: range.size(),
             };
             self.state.cache.insert(key, fetched.clone()).await;
-            if self.state.telemetry.is_measuring() {
-                self.state
-                    .telemetry
-                    .cache_lookup_us
-                    .fetch_add(t_ins.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
-            }
         }
 
         Ok((rp, fetched))

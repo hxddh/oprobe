@@ -1,1144 +1,1001 @@
-//! Real-time streaming interactive terminal workbench (`oprobe tui`, powered by `ratatui` + `crossterm`):
-//! Streams live 100ms white-box telemetry frames during benchmark windows and live trial results
-//! during closed-loop auto-tuning, with cooperative cancellation that preserves remote auto-cleanup.
+//! `oprobe top`: interactive terminal workbench. Runs workloads against the target, shows
+//! live throughput/latency, the time breakdown, request stages, connections, slow-op
+//! timelines and findings, and lets you change knobs or launch the tuner on the fly.
 
-pub mod command;
-
-use std::io;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::io::Stdout;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use crossterm::execute;
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
+use crossterm::ExecutableCommand;
 use ratatui::backend::CrosstermBackend;
-use ratatui::prelude::{
-    Alignment, Color, Constraint, Direction, Layout, Line, Modifier, Rect, Span, Style,
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style, Stylize};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{
+    Block, BorderType, Borders, Cell, Clear, Gauge, Paragraph, Row, Sparkline, Table, Tabs, Wrap,
 };
-use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Sparkline, Table, Tabs, Wrap};
-use ratatui::Terminal;
+use ratatui::{Frame, Terminal};
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
 
-use crate::autotune::{
-    generate_python_snippet, generate_rust_snippet, generate_toml_snippet, AutoTuneEngine,
-    AutoTuneOutcome, CandidateTrial, TuneKnob, TuneSearchSpace,
-};
-use crate::cost::compare_multi_cloud_finops_scaled;
-use crate::net_probe::{probe_endpoint_handshakes, EndpointHandshakeSummary};
-use crate::report::BenchmarkReport;
-use crate::telemetry::{Severity, TelemetryFrame};
-use crate::workload::{
-    execute_workload_with_options, ProfileConfig, WorkloadKind, WorkloadRunOptions,
-};
-use command::{apply_state_mutation, parse_minibuffer_command, MinibufferCommand};
+use crate::analysis::diagnosis::{diagnose, Severity};
+use crate::config::{Knobs, Preset, Profile};
+use crate::engine::{Cancel, Progress, ProgressFn, RunOptions, Session};
+use crate::net::HttpVersion;
+use crate::report::Report;
+use crate::trace::{Phase, Protocol, Snapshot};
+use crate::util::{fmt_bytes, fmt_ms, ByteSize};
 
-enum WorkerEvent {
-    LiveFrame(TelemetryFrame),
-    LiveTrial(CandidateTrial, TelemetryFrame),
-    ProbeDone(Result<TelemetryFrame, String>),
-    TuneDone(Result<AutoTuneOutcome, String>),
-    NetProbeDone(Result<EndpointHandshakeSummary, String>),
+enum Msg {
+    Key(KeyEvent),
+    Resize,
+    Snapshot(Box<Snapshot>),
+    Log(String),
+    SessionReady(Result<Arc<Session>>),
+    RunDone(Result<Box<Snapshot>>),
+    TuneDone(Result<(Knobs, f64)>),
 }
 
-struct WorkbenchState {
-    profile: ProfileConfig,
-    knob: TuneKnob,
-    frame: TelemetryFrame,
-    trials: Vec<CandidateTrial>,
-    rust_code: String,
-    python_code: String,
-    toml_profile: String,
-    inspector_tab: usize,
-    status_line: String,
-    running: bool,
-    show_help_modal: bool,
-    minibuffer_active: bool,
-    minibuffer_input: String,
-    cmd_history: Vec<String>,
-    history_cursor: Option<usize>,
-    cancel_flag: Option<Arc<AtomicBool>>,
-    active_job: Option<JoinHandle<()>>,
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Job {
+    Idle,
+    Preparing,
+    Running,
+    Tuning,
 }
 
-impl WorkbenchState {
-    fn new(profile: ProfileConfig) -> Self {
-        let knob = profile.effective_knob();
-        let rust_code = generate_rust_snippet(&profile.target.scheme, &knob);
-        let python_code = generate_python_snippet(&profile.target.scheme, &knob);
-        let toml_profile = generate_toml_snippet(&profile, &knob);
-        Self {
-            profile,
-            knob,
-            frame: TelemetryFrame::default(),
-            trials: Vec::new(),
-            rust_code,
-            python_code,
-            toml_profile,
-            inspector_tab: 0,
-            status_line:
-                "READY · Space Run/Stop | S 10s Stream | O Auto-Tune | 1-4 Workload | Tab Views | E Export | / Cmd | ? Help | Q Quit"
-                    .to_owned(),
-            running: false,
-            show_help_modal: false,
-            minibuffer_active: false,
-            minibuffer_input: String::new(),
-            cmd_history: Vec::new(),
-            history_cursor: None,
-            cancel_flag: None,
-            active_job: None,
+const TABS: [&str; 5] = [
+    "Operations",
+    "Requests",
+    "Connections",
+    "Slowest",
+    "Diagnosis",
+];
+
+struct App {
+    profile: Profile,
+    knobs: Knobs,
+    session: Option<Arc<Session>>,
+    cancel: Cancel,
+    job: Job,
+    snap: Option<Snapshot>,
+    last_final: Option<Snapshot>,
+    log: Vec<String>,
+    tab: usize,
+    help: bool,
+    continuous: bool,
+    tx: mpsc::UnboundedSender<Msg>,
+    quit: bool,
+}
+
+impl App {
+    fn log(&mut self, m: impl Into<String>) {
+        let ts = humantime::format_rfc3339_seconds(std::time::SystemTime::now()).to_string();
+        self.log.push(format!("{} {}", &ts[11..19], m.into()));
+        if self.log.len() > 200 {
+            self.log.remove(0);
         }
     }
 
-    async fn cancel_job_gracefully(&mut self) {
-        if let Some(flag) = self.cancel_flag.take() {
-            flag.store(true, Ordering::Relaxed);
-        }
-        if let Some(mut handle) = self.active_job.take() {
-            // Give cooperative cancellation up to 1.5s to complete remote auto-cleanup cleanly
-            if tokio::time::timeout(Duration::from_millis(1500), &mut handle)
-                .await
-                .is_err()
-            {
-                handle.abort();
-            }
-            self.running = false;
-            self.status_line =
-                "STOPPED · Active run cancelled cleanly (remote test objects cleaned up)".to_owned();
-        }
+    fn open_session(&mut self) {
+        self.job = Job::Preparing;
+        self.snap = None;
+        let tx = self.tx.clone();
+        let mut profile = self.profile.clone();
+        profile.knobs = self.knobs.clone();
+        let cancel = self.cancel.clone();
+        self.log(format!(
+            "preparing {} ({})",
+            profile.target.display(),
+            profile.workload.preset.slug()
+        ));
+        tokio::spawn(async move {
+            let t2 = tx.clone();
+            let progress: ProgressFn = Arc::new(move |p| {
+                if let Progress::Message(m) = p {
+                    let _ = t2.send(Msg::Log(m));
+                }
+            });
+            let s = Session::open(profile, cancel, progress).await.map(Arc::new);
+            let _ = tx.send(Msg::SessionReady(s));
+        });
     }
 
-    fn refresh_codegen(&mut self) {
-        self.rust_code = generate_rust_snippet(&self.profile.target.scheme, &self.knob);
-        self.python_code = generate_python_snippet(&self.profile.target.scheme, &self.knob);
-        self.toml_profile = generate_toml_snippet(&self.profile, &self.knob);
-    }
-
-    async fn spawn_probe(
-        &mut self,
-        duration_override: Option<Duration>,
-        tx: mpsc::UnboundedSender<WorkerEvent>,
-    ) {
-        self.cancel_job_gracefully().await;
-        self.running = true;
-        let cancel = Arc::new(AtomicBool::new(false));
-        self.cancel_flag = Some(cancel.clone());
-
-        let mode_desc = match duration_override {
-            Some(d) => format!("stream={:.1}s", d.as_secs_f64()),
-            None => match self.profile.workload.duration_secs {
-                Some(s) if s > 0.0 => format!("stream={s:.1}s"),
-                _ => format!("rounds={}", self.profile.workload.rounds),
-            },
+    fn start_run(&mut self) {
+        let Some(session) = self.session.clone() else {
+            return;
         };
-        self.status_line = format!(
-            "PROFILING · [{}] ({}, scheme={}, conc={}, chunk={}KiB)...",
-            self.profile.workload.kind.title(),
-            mode_desc,
-            self.profile.target.scheme,
-            self.knob.concurrent,
-            self.knob.chunk_bytes / 1024
-        );
-
-        let prof = self.profile.clone();
-        let knob = self.knob;
-        let (live_tx, mut live_rx) = mpsc::unbounded_channel::<TelemetryFrame>();
-        let tx_live = tx.clone();
-        tokio::spawn(async move {
-            while let Some(frame) = live_rx.recv().await {
-                let _ = tx_live.send(WorkerEvent::LiveFrame(frame));
+        self.cancel.reset();
+        self.job = Job::Running;
+        let tx = self.tx.clone();
+        let knobs = self.knobs.clone();
+        let mut opts = RunOptions::from_profile(&session.profile);
+        if self.continuous {
+            opts.duration = Duration::from_secs(24 * 3600);
+        }
+        self.log(format!(
+            "run started: {} for {}",
+            knobs.summary(),
+            if self.continuous {
+                "until stopped".to_owned()
+            } else {
+                format!("{:.0}s", opts.duration.as_secs_f64())
             }
+        ));
+        tokio::spawn(async move {
+            let t2 = tx.clone();
+            let progress: ProgressFn = Arc::new(move |p| {
+                let _ = t2.send(match p {
+                    Progress::Snapshot(s) => Msg::Snapshot(s),
+                    Progress::Message(m) => Msg::Log(m),
+                });
+            });
+            let r = session.run(&knobs, &opts, Some(progress)).await;
+            let _ = tx.send(Msg::RunDone(r.map(Box::new)));
         });
+    }
 
-        self.active_job = Some(tokio::spawn(async move {
-            let res = execute_workload_with_options(
-                &prof,
-                &knob,
-                WorkloadRunOptions {
-                    rounds_override: None,
-                    duration_override,
-                    warmup_override: None,
-                    cancel_flag: Some(cancel),
-                    live_frame_tx: Some(live_tx),
+    fn start_tune(&mut self) {
+        let Some(session) = self.session.clone() else {
+            return;
+        };
+        self.cancel.reset();
+        self.job = Job::Tuning;
+        let tx = self.tx.clone();
+        self.log("tuning: 3s trials, throttle-aware concurrency ladder, then knob refinement");
+        tokio::spawn(async move {
+            use crate::tune::{tune, Objective, TuneEvent, TuneOptions};
+            let opts = TuneOptions {
+                objective: Objective::Throughput,
+                trial: RunOptions {
+                    duration: Duration::from_secs(3),
+                    warmup: Duration::from_millis(500),
+                    max_ops: None,
+                    rate: session.profile.workload.rate,
+                    trace_slow_ops: false,
                 },
-            )
-            .await
-            .map_err(|e| format!("{e:#}"));
-            let _ = tx.send(WorkerEvent::ProbeDone(res));
-        }));
-    }
-
-    async fn spawn_autotune(&mut self, tx: mpsc::UnboundedSender<WorkerEvent>) {
-        self.cancel_job_gracefully().await;
-        self.running = true;
-        self.trials.clear();
-        self.inspector_tab = 1;
-
-        let cancel = Arc::new(AtomicBool::new(false));
-        self.cancel_flag = Some(cancel.clone());
-        self.status_line = format!(
-            "AUTO-TUNING · Running 429/503-resilient sweep on [{}]...",
-            self.profile.workload.kind.title()
-        );
-
-        let prof = self.profile.clone();
-        let (prog_tx, mut prog_rx) = mpsc::unbounded_channel::<(CandidateTrial, TelemetryFrame)>();
-        let tx_prog = tx.clone();
-        tokio::spawn(async move {
-            while let Some((trial, frame)) = prog_rx.recv().await {
-                let _ = tx_prog.send(WorkerEvent::LiveTrial(trial, frame));
-            }
+                max_concurrency: 256,
+                max_trials: 16,
+                cooldown: Duration::from_secs(3),
+            };
+            let t2 = tx.clone();
+            let ev: Arc<dyn Fn(TuneEvent) + Send + Sync> = Arc::new(move |e| {
+                let m = match e {
+                    TuneEvent::Started { id, stage, knobs } => {
+                        format!("trial {id} [{stage}] {}", knobs.summary())
+                    }
+                    TuneEvent::Finished(t) => format!(
+                        "  → {:.1} ops/s {:.1} MiB/s p99 {} {}",
+                        t.ops_per_s,
+                        t.mib_per_s,
+                        fmt_ms(t.p99_ms),
+                        if t.throttled() {
+                            format!("THROTTLED ×{}", t.throttled_responses)
+                        } else if t.feasible {
+                            "ok".into()
+                        } else {
+                            t.note.clone()
+                        }
+                    ),
+                    TuneEvent::Message(m) => m,
+                };
+                let _ = t2.send(Msg::Log(m));
+            });
+            let r = tune(&session, &opts, ev)
+                .await
+                .map(|o| (o.winner, o.summary.improvement));
+            let _ = tx.send(Msg::TuneDone(r));
         });
-
-        self.active_job = Some(tokio::spawn(async move {
-            let engine = AutoTuneEngine::new(prof.sla.clone(), TuneSearchSpace::default());
-            let res = engine
-                .run_adaptive_sweep_with_progress(&prof, Some(prog_tx), Some(cancel))
-                .await
-                .map_err(|e| format!("{e:#}"));
-            let _ = tx.send(WorkerEvent::TuneDone(res));
-        }));
     }
 
-    async fn spawn_net_probe(&mut self, url: String, tx: mpsc::UnboundedSender<WorkerEvent>) {
-        self.cancel_job_gracefully().await;
-        self.running = true;
-        self.status_line = format!(
-            "NET-PROBE · Sampling cold & warm DNS/TCP/TLS/ALPN handshakes on {url}..."
-        );
-        self.active_job = Some(tokio::spawn(async move {
-            let res = probe_endpoint_handshakes(&url, 4, Duration::from_secs(5))
-                .await
-                .map_err(|e| format!("{e:#}"));
-            let _ = tx.send(WorkerEvent::NetProbeDone(res));
-        }));
+    fn stop(&mut self) {
+        if matches!(self.job, Job::Running | Job::Tuning) {
+            self.cancel.cancel();
+            self.log("stopping…");
+        }
     }
 
-    fn export_all(&mut self, prefix: &str) {
-        let mut rep = BenchmarkReport::from_single_run(
-            self.profile.clone(),
-            self.knob,
-            self.frame.clone(),
-        );
-        rep.trials = self.trials.clone();
-        rep.generated_rust_code = self.rust_code.clone();
-        rep.generated_python_code = self.python_code.clone();
-        rep.generated_toml_profile = self.toml_profile.clone();
+    fn adjust(&mut self, f: impl FnOnce(&mut Knobs) -> String) {
+        let msg = f(&mut self.knobs);
+        let suffix = if self.job == Job::Running {
+            " (applies to the next run)"
+        } else {
+            ""
+        };
+        self.log(format!("{msg}{suffix}"));
+    }
 
-        let json_p = format!("{prefix}.json");
-        let md_p = format!("{prefix}.md");
-        let csv_p = format!("{prefix}.csv");
-        let toml_p = format!("{prefix}.profile.toml");
-        match (
-            rep.save_json(&json_p),
-            rep.save_markdown(&md_p),
-            rep.save_csv(&csv_p),
-            std::fs::write(&toml_p, &self.toml_profile).map_err(anyhow::Error::from),
-        ) {
-            (Ok(()), Ok(()), Ok(()), Ok(())) => {
-                self.status_line =
-                    format!("EXPORTED · Saved {json_p}, {md_p}, {csv_p}, {toml_p}");
+    fn export(&mut self) {
+        let Some(s) = self.last_final.clone().or_else(|| self.snap.clone()) else {
+            self.log("nothing to export yet");
+            return;
+        };
+        let p = self
+            .session
+            .as_ref()
+            .map(|s| s.profile.clone())
+            .unwrap_or_else(|| self.profile.clone());
+        let r = Report::build(&p, &self.knobs, s, Default::default(), vec![]);
+        let stamp = crate::util::compact_utc_now();
+        let json = std::path::PathBuf::from(format!("oprobe-{stamp}.json"));
+        let md = std::path::PathBuf::from(format!("oprobe-{stamp}.md"));
+        match r
+            .save_json(&json)
+            .and_then(|_| crate::report::write_file(&md, &crate::report::markdown::render(&r)))
+        {
+            Ok(_) => self.log(format!("exported {} and {}", json.display(), md.display())),
+            Err(e) => self.log(format!("export failed: {e:#}")),
+        }
+    }
+
+    fn on_key(&mut self, k: KeyEvent) {
+        if k.kind != KeyEventKind::Press {
+            return;
+        }
+        if self.help {
+            self.help = false;
+            return;
+        }
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        match k.code {
+            KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
+            KeyCode::Char('c') if ctrl => self.quit = true,
+            KeyCode::Char('?') => self.help = true,
+            KeyCode::Char(' ') | KeyCode::Enter => match self.job {
+                Job::Idle => self.start_run(),
+                Job::Running | Job::Tuning => self.stop(),
+                Job::Preparing => {}
+            },
+            KeyCode::Char('l') => {
+                self.continuous = !self.continuous;
+                let m = if self.continuous {
+                    "continuous mode: runs until stopped"
+                } else {
+                    "timed mode: runs for the profile duration"
+                };
+                self.log(m);
             }
-            (Err(e), _, _, _) | (_, Err(e), _, _) | (_, _, Err(e), _) | (_, _, _, Err(e)) => {
-                self.status_line = format!("EXPORT ERROR · {e}");
+            KeyCode::Char('t') if self.job == Job::Idle => self.start_tune(),
+            KeyCode::Char('e') => self.export(),
+            KeyCode::Tab | KeyCode::Right => self.tab = (self.tab + 1) % TABS.len(),
+            KeyCode::BackTab | KeyCode::Left => self.tab = (self.tab + TABS.len() - 1) % TABS.len(),
+            KeyCode::Char(c @ '1'..='5') => self.tab = (c as usize) - ('1' as usize),
+            KeyCode::Char('+') | KeyCode::Char('=') => self.adjust(|k| {
+                k.concurrency = (k.concurrency * 2).min(1024);
+                format!("concurrency → {}", k.concurrency)
+            }),
+            KeyCode::Char('-') => self.adjust(|k| {
+                k.concurrency = (k.concurrency / 2).max(1);
+                format!("concurrency → {}", k.concurrency)
+            }),
+            KeyCode::Char('i') => self.adjust(|k| {
+                k.io_concurrency = (k.io_concurrency * 2).min(64);
+                format!("io_concurrency → {}", k.io_concurrency)
+            }),
+            KeyCode::Char('I') => self.adjust(|k| {
+                k.io_concurrency = (k.io_concurrency / 2).max(1);
+                format!("io_concurrency → {}", k.io_concurrency)
+            }),
+            KeyCode::Char('k') => self.adjust(|k| {
+                k.chunk_size = ByteSize((k.chunk_size.0 * 2).min(256 << 20));
+                format!("chunk_size → {}", k.chunk_size)
+            }),
+            KeyCode::Char('K') => self.adjust(|k| {
+                k.chunk_size = ByteSize((k.chunk_size.0 / 2).max(256 << 10));
+                format!("chunk_size → {}", k.chunk_size)
+            }),
+            KeyCode::Char('g') => self.adjust(|k| {
+                k.range_gap = ByteSize(if k.range_gap.0 == 0 {
+                    16 << 10
+                } else {
+                    (k.range_gap.0 * 4).min(16 << 20)
+                });
+                format!("range_gap → {}", k.range_gap)
+            }),
+            KeyCode::Char('G') => self.adjust(|k| {
+                k.range_gap = ByteSize(if k.range_gap.0 <= 16 << 10 {
+                    0
+                } else {
+                    k.range_gap.0 / 4
+                });
+                format!("range_gap → {}", k.range_gap)
+            }),
+            KeyCode::Char('c') => self.adjust(|k| {
+                k.cache = !k.cache;
+                format!(
+                    "cache → {}",
+                    if k.cache {
+                        k.cache_size.to_string()
+                    } else {
+                        "off".into()
+                    }
+                )
+            }),
+            KeyCode::Char('h') => self.adjust(|k| {
+                k.http_version = match k.http_version {
+                    HttpVersion::Auto => HttpVersion::H1,
+                    HttpVersion::H1 => HttpVersion::H2,
+                    HttpVersion::H2 => HttpVersion::Auto,
+                };
+                format!("http_version → {:?}", k.http_version)
+            }),
+            KeyCode::Char('a') => self.adjust(|k| {
+                k.keep_alive = !k.keep_alive;
+                format!("keep_alive → {}", k.keep_alive)
+            }),
+            KeyCode::Char('x') => self.adjust(|k| {
+                k.tail_cut = !k.tail_cut;
+                format!("tail_cut → {}", k.tail_cut)
+            }),
+            KeyCode::Char('p') if self.job == Job::Idle => {
+                let idx = Preset::ALL
+                    .iter()
+                    .position(|p| *p == self.profile.workload.preset)
+                    .unwrap_or(0);
+                self.profile.workload.preset = Preset::ALL[(idx + 1) % Preset::ALL.len()];
+                self.profile.workload.mix.clear();
+                self.profile.workload.dataset = None;
+                if let Some(s) = self.session.take() {
+                    tokio::spawn(async move {
+                        s.close().await;
+                    });
+                }
+                self.open_session();
             }
+            _ => {}
         }
     }
 }
 
-/// Launch the interactive Ratatui terminal workbench and trigger an initial baseline run.
-pub async fn run_tui_workbench(initial_profile: ProfileConfig) -> Result<()> {
+fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-
-    let loop_res = event_loop(&mut terminal, initial_profile).await;
-
-    let _ = disable_raw_mode();
-    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
-    let _ = terminal.show_cursor();
-    loop_res
+    let mut out = std::io::stdout();
+    out.execute(EnterAlternateScreen)?;
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = disable_raw_mode();
+        let _ = std::io::stdout().execute(LeaveAlternateScreen);
+        prev(info);
+    }));
+    Ok(Terminal::new(CrosstermBackend::new(out))?)
 }
 
-async fn event_loop(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    initial_profile: ProfileConfig,
-) -> Result<()> {
-    let (tx, mut rx) = mpsc::unbounded_channel::<WorkerEvent>();
-    let mut state = WorkbenchState::new(initial_profile);
-    state.spawn_probe(None, tx.clone()).await;
+fn restore_terminal() {
+    let _ = disable_raw_mode();
+    let _ = std::io::stdout().execute(LeaveAlternateScreen);
+}
 
-    loop {
-        while let Ok(ev) = rx.try_recv() {
-            match ev {
-                WorkerEvent::LiveFrame(frame) => {
-                    state.status_line = format!(
-                        "STREAMING · {:.1}s | Ops={} | {:.1} MiB/s | Inflight={}",
-                        frame.transport.elapsed_secs,
-                        frame.transport.logical_ops,
-                        frame.transport.aggregate_mib_s,
-                        frame.transport.active_inflight
-                    );
-                    state.frame = frame;
-                }
-                WorkerEvent::LiveTrial(trial, frame) => {
-                    state.status_line = format!(
-                        "AUTO-TUNING · Trial #{} [{}] conc={} chunk={}KiB -> {:.1} MiB/s | P99 {:.2}ms | 429/503={}",
-                        trial.trial_id,
-                        trial.phase,
-                        trial.knob.concurrent,
-                        trial.knob.chunk_bytes / 1024,
-                        trial.aggregate_mib_s,
-                        trial.worst_p99_ms,
-                        trial.throttle_events
-                    );
-                    if !trial.throttled_503 && !frame.verbs.is_empty() {
-                        state.frame = frame;
-                    }
-                    state.trials.push(trial);
-                }
-                WorkerEvent::ProbeDone(Ok(frame)) => {
-                    state.running = false;
-                    state.active_job = None;
-                    state.cancel_flag = None;
-                    state.status_line = format!(
-                        "[{}] {} · {:.1} MiB/s | Cleanup: {}",
-                        frame.diagnosis.severity.badge(),
-                        frame.diagnosis.headline,
-                        frame.transport.aggregate_mib_s,
-                        if frame.cleanup.verified_clean {
-                            "CLEAN"
-                        } else {
-                            "KEPT"
-                        }
-                    );
-                    state.frame = frame;
-                }
-                WorkerEvent::ProbeDone(Err(e)) => {
-                    state.running = false;
-                    state.active_job = None;
-                    state.cancel_flag = None;
-                    state.status_line = format!("PROBE FAILED · {e}");
-                }
-                WorkerEvent::TuneDone(Ok(outcome)) => {
-                    state.running = false;
-                    state.active_job = None;
-                    state.cancel_flag = None;
-                    state.knob = outcome.winner.knob;
-                    state.frame = outcome.best_frame;
-                    state.trials = outcome.trials;
-                    state.rust_code = outcome.generated_rust_code;
-                    state.python_code = outcome.generated_python_code;
-                    state.toml_profile = outcome.generated_toml_profile;
-                    state.inspector_tab = 1;
-                    state.status_line = format!(
-                        "TUNE COMPLETE · Winner conc={} chunk={}KiB gap={}KiB | P99 {:.2}ms | {:.1} MiB/s",
-                        state.knob.concurrent,
-                        state.knob.chunk_bytes / 1024,
-                        state.knob.range_gap_bytes / 1024,
-                        outcome.winner.worst_p99_ms,
-                        outcome.winner.aggregate_mib_s
-                    );
-                }
-                WorkerEvent::TuneDone(Err(e)) => {
-                    state.running = false;
-                    state.active_job = None;
-                    state.cancel_flag = None;
-                    state.status_line = format!("AUTO-TUNE FAILED · {e}");
-                }
-                WorkerEvent::NetProbeDone(Ok(hs)) => {
-                    state.running = false;
-                    state.active_job = None;
-                    state.cancel_flag = None;
-                    state.status_line = format!(
-                        "NET-PROBE OK · {} ({}) DNS {:.2}ms | TCP {:.2}ms | TLS {:.2}ms | Cold/Warm {:.1}x ({})",
-                        hs.host,
-                        hs.tls_version,
-                        hs.dns_p50_ms,
-                        hs.tcp_rtt_p50_ms,
-                        hs.tls_p50_ms,
-                        hs.cold_vs_warm_ratio,
-                        hs.negotiated_alpn
-                    );
-                    state.frame.handshake = hs;
-                    state.inspector_tab = 3;
-                }
-                WorkerEvent::NetProbeDone(Err(e)) => {
-                    state.running = false;
-                    state.active_job = None;
-                    state.cancel_flag = None;
-                    state.status_line = format!("NET-PROBE FAILED · {e}");
-                }
+pub async fn run(profile: Profile) -> Result<()> {
+    use std::io::IsTerminal;
+    anyhow::ensure!(
+        std::io::stdout().is_terminal(),
+        "`oprobe top` needs an interactive terminal; use `oprobe run` for scripts and CI"
+    );
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let stop_input = Arc::new(Mutex::new(false));
+    {
+        let tx = tx.clone();
+        let stop = stop_input.clone();
+        std::thread::spawn(move || loop {
+            if *stop.lock().unwrap_or_else(|e| e.into_inner()) {
+                break;
             }
-        }
-
-        terminal.draw(|f| draw_workbench(f, &state))?;
-
-        if event::poll(Duration::from_millis(50))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind != KeyEventKind::Press {
-                    continue;
-                }
-                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-                    state.cancel_job_gracefully().await;
-                    break;
-                }
-
-                if state.show_help_modal {
-                    if matches!(
-                        key.code,
-                        KeyCode::Esc | KeyCode::Char('?') | KeyCode::Enter | KeyCode::Char('q')
-                    ) {
-                        state.show_help_modal = false;
-                    }
-                    continue;
-                }
-
-                if state.minibuffer_active {
-                    match key.code {
-                        KeyCode::Esc => {
-                            state.minibuffer_active = false;
-                            state.minibuffer_input.clear();
-                            state.history_cursor = None;
-                        }
-                        KeyCode::Backspace => {
-                            state.minibuffer_input.pop();
-                        }
-                        KeyCode::Up => {
-                            if !state.cmd_history.is_empty() {
-                                let next_idx = match state.history_cursor {
-                                    Some(idx) => idx.saturating_sub(1),
-                                    None => state.cmd_history.len() - 1,
-                                };
-                                state.history_cursor = Some(next_idx);
-                                state.minibuffer_input = state.cmd_history[next_idx].clone();
-                            }
-                        }
-                        KeyCode::Down => {
-                            if let Some(idx) = state.history_cursor {
-                                if idx + 1 < state.cmd_history.len() {
-                                    state.history_cursor = Some(idx + 1);
-                                    state.minibuffer_input = state.cmd_history[idx + 1].clone();
-                                } else {
-                                    state.history_cursor = None;
-                                    state.minibuffer_input.clear();
-                                }
-                            }
-                        }
-                        KeyCode::Enter => {
-                            let cmd_raw = state.minibuffer_input.clone();
-                            state.minibuffer_active = false;
-                            state.minibuffer_input.clear();
-                            state.history_cursor = None;
-                            if !cmd_raw.trim().is_empty() {
-                                state.cmd_history.push(cmd_raw.clone());
-                            }
-                            match parse_minibuffer_command(&cmd_raw) {
-                                Ok(MinibufferCommand::Quit) => {
-                                    state.cancel_job_gracefully().await;
-                                    break;
-                                }
-                                Ok(MinibufferCommand::ProbeOnce) => {
-                                    state.spawn_probe(None, tx.clone()).await;
-                                }
-                                Ok(MinibufferCommand::StreamRun(dur)) => {
-                                    state.spawn_probe(Some(dur), tx.clone()).await;
-                                }
-                                Ok(MinibufferCommand::AutoTune) => {
-                                    state.spawn_autotune(tx.clone()).await;
-                                }
-                                Ok(MinibufferCommand::NetProbe(url)) => {
-                                    state.spawn_net_probe(url, tx.clone()).await;
-                                }
-                                Ok(MinibufferCommand::ExportReport(prefix)) => {
-                                    state.export_all(&prefix);
-                                }
-                                Ok(other) => {
-                                    if let Some(msg) = apply_state_mutation(
-                                        &other,
-                                        &mut state.profile,
-                                        &mut state.knob,
-                                    ) {
-                                        state.refresh_codegen();
-                                        state.status_line = msg;
-                                        if !matches!(other, MinibufferCommand::Help) {
-                                            state.spawn_probe(None, tx.clone()).await;
-                                        }
-                                    }
-                                }
-                                Err(err_msg) => {
-                                    state.status_line = format!("COMMAND ERROR · {err_msg}");
-                                }
-                            }
-                        }
-                        KeyCode::Char(c) => {
-                            state.minibuffer_input.push(c);
-                        }
-                        _ => {}
-                    }
-                    continue;
-                }
-
-                match key.code {
-                    KeyCode::Char('q') | KeyCode::Char('Q') => {
-                        state.cancel_job_gracefully().await;
-                        break;
-                    }
-                    KeyCode::Char('?') => {
-                        state.show_help_modal = true;
-                    }
-                    KeyCode::Esc => {
-                        state.cancel_job_gracefully().await;
-                    }
-                    KeyCode::Char('/') | KeyCode::Char(':') => {
-                        state.minibuffer_active = true;
-                        state.minibuffer_input.clear();
-                    }
-                    KeyCode::Char(' ') => {
-                        if state.running {
-                            state.cancel_job_gracefully().await;
-                        } else {
-                            state.spawn_probe(None, tx.clone()).await;
+            if event::poll(Duration::from_millis(100)).unwrap_or(false) {
+                match event::read() {
+                    Ok(Event::Key(k)) => {
+                        if tx.send(Msg::Key(k)).is_err() {
+                            break;
                         }
                     }
-                    KeyCode::Char('s') | KeyCode::Char('S') => {
-                        state
-                            .spawn_probe(Some(Duration::from_secs(10)), tx.clone())
-                            .await;
-                    }
-                    KeyCode::Char('o') | KeyCode::Char('O') => {
-                        state.spawn_autotune(tx.clone()).await;
-                    }
-                    KeyCode::Char('e') | KeyCode::Char('E') => {
-                        state.export_all("oprobe_report");
-                    }
-                    KeyCode::Tab => {
-                        state.inspector_tab = (state.inspector_tab + 1) % 5;
-                    }
-                    KeyCode::BackTab => {
-                        state.inspector_tab = (state.inspector_tab + 4) % 5;
-                    }
-                    KeyCode::Char('1') => {
-                        state.profile.workload.kind = WorkloadKind::ParquetPointLookup;
-                        state.spawn_probe(None, tx.clone()).await;
-                    }
-                    KeyCode::Char('2') => {
-                        state.profile.workload.kind = WorkloadKind::CheckpointMultipart;
-                        state.spawn_probe(None, tx.clone()).await;
-                    }
-                    KeyCode::Char('3') => {
-                        state.profile.workload.kind = WorkloadKind::MetadataPrefixStorm;
-                        state.spawn_probe(None, tx.clone()).await;
-                    }
-                    KeyCode::Char('4') => {
-                        state.profile.workload.kind = WorkloadKind::MixedReadWrite;
-                        state.spawn_probe(None, tx.clone()).await;
-                    }
-                    KeyCode::Char('f') | KeyCode::Char('F') => {
-                        state.knob.enable_foyer = !state.knob.enable_foyer;
-                        state.refresh_codegen();
-                        state.spawn_probe(None, tx.clone()).await;
-                    }
-                    KeyCode::Char('t') | KeyCode::Char('T') => {
-                        state.knob.enable_tail_cut = !state.knob.enable_tail_cut;
-                        state.refresh_codegen();
-                        state.spawn_probe(None, tx.clone()).await;
-                    }
-                    KeyCode::Char('k') | KeyCode::Char('K') => {
-                        state.knob.keep_alive = !state.knob.keep_alive;
-                        state.refresh_codegen();
-                        state.spawn_probe(None, tx.clone()).await;
-                    }
-                    KeyCode::Char('[') => {
-                        state.knob.concurrent = state.knob.concurrent.saturating_sub(4).max(2);
-                        state.refresh_codegen();
-                        state.spawn_probe(None, tx.clone()).await;
-                    }
-                    KeyCode::Char(']') => {
-                        state.knob.concurrent = (state.knob.concurrent + 8).min(128);
-                        state.refresh_codegen();
-                        state.spawn_probe(None, tx.clone()).await;
-                    }
-                    KeyCode::Char('-') => {
-                        state.knob.chunk_bytes = (state.knob.chunk_bytes / 2).max(64 * 1024);
-                        state.refresh_codegen();
-                        state.spawn_probe(None, tx.clone()).await;
-                    }
-                    KeyCode::Char('=') | KeyCode::Char('+') => {
-                        state.knob.chunk_bytes = (state.knob.chunk_bytes * 2).min(32 * 1024 * 1024);
-                        state.refresh_codegen();
-                        state.spawn_probe(None, tx.clone()).await;
+                    Ok(Event::Resize(..)) => {
+                        let _ = tx.send(Msg::Resize);
                     }
                     _ => {}
                 }
             }
-        }
+        });
     }
+    let mut term = setup_terminal()?;
+    let mut app = App {
+        knobs: profile.knobs.clone(),
+        profile,
+        session: None,
+        cancel: Cancel::new(),
+        job: Job::Idle,
+        snap: None,
+        last_final: None,
+        log: Vec::new(),
+        tab: 0,
+        help: false,
+        continuous: false,
+        tx: tx.clone(),
+        quit: false,
+    };
+    app.log("welcome to oprobe top — press ? for keys");
+    app.open_session();
 
-    Ok(())
-}
-
-fn severity_color(sev: Severity) -> Color {
-    match sev {
-        Severity::Healthy => Color::Green,
-        Severity::Advisory => Color::Cyan,
-        Severity::Warning => Color::Yellow,
-        Severity::Critical => Color::Red,
-    }
-}
-
-fn draw_workbench(f: &mut ratatui::Frame<'_>, state: &WorkbenchState) {
-    let root_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Length(4),
-            Constraint::Length(5),
-            Constraint::Length(8),
-            Constraint::Min(9),
-            Constraint::Length(3),
-        ])
-        .split(f.area());
-
-    // 1. Header Bar
-    let wk = state.profile.workload.kind;
-    let header_line = Line::from(vec![
-        Span::styled(
-            " oprobe v1.0.0 ",
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(format!(
-            " {} ({}) | ",
-            state.profile.target.name, state.profile.target.scheme
-        )),
-        Span::styled(
-            format!(
-                "[1]Parquet{} ",
-                if wk == WorkloadKind::ParquetPointLookup {
-                    "*"
-                } else {
-                    ""
+    let result: Result<()> = async {
+        let mut tick = tokio::time::interval(Duration::from_millis(250));
+        loop {
+            term.draw(|f| draw(f, &app))?;
+            tokio::select! {
+                _ = tick.tick() => {}
+                m = rx.recv() => {
+                    let Some(m) = m else { break };
+                    match m {
+                        Msg::Key(k) => app.on_key(k),
+                        Msg::Resize => {}
+                        Msg::Snapshot(s) => app.snap = Some(*s),
+                        Msg::Log(l) => app.log(l),
+                        Msg::SessionReady(Ok(s)) => {
+                            for w in &s.warnings {
+                                app.log(format!("warning: {w}"));
+                            }
+                            app.session = Some(s);
+                            app.job = Job::Idle;
+                            app.log("ready — press space to start a run, t to auto-tune");
+                        }
+                        Msg::SessionReady(Err(e)) => {
+                            app.job = Job::Idle;
+                            app.log(format!("error: {e:#}"));
+                            if let Some(h) = crate::analysis::hints::hint_for(&format!("{e:#}"), &app.profile.target.scheme) {
+                                app.log(format!("hint: {}", h.title));
+                                for s in h.steps { app.log(format!("  • {s}")); }
+                            }
+                        }
+                        Msg::RunDone(r) => {
+                            app.job = Job::Idle;
+                            match r {
+                                Ok(s) => {
+                                    let s = *s;
+                                    app.log(format!("run finished: {:.1} ops/s · {:.1} MiB/s · p99 {}", s.summary.ops_per_s, s.summary.mib_per_s, fmt_ms(s.summary.latency.p99)));
+                                    app.snap = Some(s.clone());
+                                    app.last_final = Some(s);
+                                }
+                                Err(e) => app.log(format!("run failed: {e:#}")),
+                            }
+                        }
+                        Msg::TuneDone(r) => {
+                            app.job = Job::Idle;
+                            match r {
+                                Ok((k, imp)) => {
+                                    app.log(format!("tuned: {} ({:+.0}% vs baseline) — applied", k.summary(), imp * 100.0));
+                                    app.knobs = k;
+                                }
+                                Err(e) => app.log(format!("tune failed: {e:#}")),
+                            }
+                        }
+                    }
                 }
-            ),
-            Style::default().fg(if wk == WorkloadKind::ParquetPointLookup {
-                Color::Yellow
-            } else {
-                Color::Gray
-            }),
-        ),
-        Span::styled(
-            format!(
-                "[2]Ckpt{} ",
-                if wk == WorkloadKind::CheckpointMultipart {
-                    "*"
-                } else {
-                    ""
-                }
-            ),
-            Style::default().fg(if wk == WorkloadKind::CheckpointMultipart {
-                Color::Yellow
-            } else {
-                Color::Gray
-            }),
-        ),
-        Span::styled(
-            format!(
-                "[3]Meta{} ",
-                if wk == WorkloadKind::MetadataPrefixStorm {
-                    "*"
-                } else {
-                    ""
-                }
-            ),
-            Style::default().fg(if wk == WorkloadKind::MetadataPrefixStorm {
-                Color::Yellow
-            } else {
-                Color::Gray
-            }),
-        ),
-        Span::styled(
-            format!(
-                "[4]Mixed{} ",
-                if wk == WorkloadKind::MixedReadWrite {
-                    "*"
-                } else {
-                    ""
-                }
-            ),
-            Style::default().fg(if wk == WorkloadKind::MixedReadWrite {
-                Color::Yellow
-            } else {
-                Color::Gray
-            }),
-        ),
-        Span::raw(format!(
-            "| [F]Cache:{} [T]TailCut:{} [K]Pool:{} [ [/] ]Conc:{} [-/+]Chunk:{}KiB Gap:{}KiB",
-            if state.knob.enable_foyer { "ON" } else { "OFF" },
-            if state.knob.enable_tail_cut { "ON" } else { "OFF" },
-            if state.knob.keep_alive { "ON" } else { "OFF" },
-            state.knob.concurrent,
-            state.knob.chunk_bytes / 1024,
-            state.knob.range_gap_bytes / 1024,
-        )),
-    ]);
-    let header_block = Paragraph::new(header_line).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(" Apache OpenDAL White-Box Cloud Storage Stack Microscope & Auto-Tuner "),
-    );
-    f.render_widget(header_block, root_chunks[0]);
-
-    // 2. Three KPI Cards
-    let kpi_cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(40),
-            Constraint::Percentage(32),
-            Constraint::Percentage(28),
-        ])
-        .split(root_chunks[1]);
-
-    let diag = &state.frame.diagnosis;
-    let diag_card = Paragraph::new(vec![
-        Line::from(Span::styled(
-            if diag.headline.is_empty() {
-                "Sampling initial white-box telemetry..."
-            } else {
-                &diag.headline
-            },
-            Style::default()
-                .fg(severity_color(diag.severity))
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(Span::styled(
-            &diag.recommendation,
-            Style::default().fg(Color::Gray),
-        )),
-    ])
-    .block(Block::default().borders(Borders::ALL).title(format!(
-        " Root-Cause Diagnosis [{}] ",
-        diag.severity.badge()
-    )));
-    f.render_widget(diag_card, kpi_cols[0]);
-
-    let tp = &state.frame.transport;
-    let amp_card = Paragraph::new(vec![
-        Line::from(format!(
-            "Socket Reuse {:.1}% | ReadAmp {:.2}x | RpcAmp {:.2}x",
-            tp.socket_reuse_pct, tp.read_amplification, tp.rpc_amplification
-        )),
-        Line::from(format!(
-            "Cache Hit {:.1}% | Retries {} | 429/503 Throttles {}",
-            tp.cache_hit_ratio_pct,
-            tp.retry_attempts,
-            tp.http_429_count + tp.http_503_slowdown_count
-        )),
-    ])
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(" Connection Pool, Cache & Amplification "),
-    );
-    f.render_widget(amp_card, kpi_cols[1]);
-
-    let host_card = Paragraph::new(vec![
-        Line::from(Span::styled(
-            format!(
-                "{:.1} MiB/s ({:.1}/core · {}c · Inflight {})",
-                tp.aggregate_mib_s, tp.mib_per_cpu_core, tp.cpu_cores, tp.active_inflight
-            ),
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-        )),
-        Line::from(format!(
-            "RSS {} MiB | CRC32C {} ok / {} bad",
-            tp.process_rss_mib, tp.crc32c_verified_ok, tp.crc32c_corrupted
-        )),
-    ])
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(" Throughput & Host Self-Check "),
-    );
-    f.render_widget(host_card, kpi_cols[2]);
-
-    // 3. Seven-Stage Waterfall + Live Sparkline
-    let mid_cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
-        .split(root_chunks[2]);
-
-    draw_waterfall_panel(f, mid_cols[0], state);
-    draw_sparkline_panel(f, mid_cols[1], state);
-
-    // 4. Per-Verb Isolated HDR Table
-    let header_cells = [
-        "OPERATION VERB",
-        "COUNT",
-        "OPS/s",
-        "P50(ms)",
-        "P95(ms)",
-        "P99(ms)",
-        "P99.9(ms)",
-        "MiB/s",
-        "429/503",
-    ]
-    .into_iter()
-    .map(|h| Cell::from(h).style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
-    let rows = state.frame.verbs.iter().map(|v| {
-        Row::new(vec![
-            Cell::from(v.verb.clone()),
-            Cell::from(format!("{}", v.count)),
-            Cell::from(format!("{:.1}", v.ops_per_sec)),
-            Cell::from(format!("{:.2}", v.p50_ms)),
-            Cell::from(format!("{:.2}", v.p95_ms)),
-            Cell::from(format!("{:.2}", v.p99_ms)),
-            Cell::from(format!("{:.2}", v.p999_ms)),
-            Cell::from(format!("{:.1}", v.throughput_mib_s)),
-            Cell::from(format!("{:.1}%", v.throttle_429_503_pct)),
-        ])
-    });
-    let verb_table = Table::new(
-        rows,
-        [
-            Constraint::Length(24),
-            Constraint::Length(7),
-            Constraint::Length(9),
-            Constraint::Length(9),
-            Constraint::Length(9),
-            Constraint::Length(9),
-            Constraint::Length(10),
-            Constraint::Length(10),
-            Constraint::Length(8),
-        ],
-    )
-    .header(Row::new(header_cells))
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(" Per-Verb Isolated HDR Latency Quantiles "),
-    );
-    f.render_widget(verb_table, root_chunks[3]);
-
-    // 5. Five-Tab Inspector Panel
-    draw_inspector_tabs(f, root_chunks[4], state);
-
-    // 6. Status / `/` Command Bar
-    if state.minibuffer_active {
-        let cmd_bar = Paragraph::new(Line::from(vec![
-            Span::styled(
-                " COMMAND ",
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" :"),
-            Span::styled(
-                format!("{}_", state.minibuffer_input),
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                "   (Enter Run | Up/Down History | Esc Cancel | Try `url s3://bucket/p`, `stream 10s`, `conc 32`, `export snap`)",
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]))
-        .block(Block::default().borders(Borders::ALL));
-        f.render_widget(cmd_bar, root_chunks[5]);
-    } else {
-        let status_bar = Paragraph::new(Line::from(vec![
-            Span::styled(
-                if state.running { " STREAMING " } else { " IDLE " },
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(if state.running {
-                        Color::Yellow
-                    } else {
-                        Color::Green
-                    })
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(format!(" {}", state.status_line)),
-        ]))
-        .block(Block::default().borders(Borders::ALL));
-        f.render_widget(status_bar, root_chunks[5]);
-    }
-
-    if state.show_help_modal {
-        draw_help_modal(f);
-    }
-}
-
-fn draw_waterfall_panel(f: &mut ratatui::Frame<'_>, area: Rect, state: &WorkbenchState) {
-    let stages = state.frame.waterfall.breakdown_pct();
-    let colors = [
-        Color::Yellow,
-        Color::Green,
-        Color::Magenta,
-        Color::Red,
-        Color::Cyan,
-        Color::LightBlue,
-        Color::Blue,
-    ];
-    let bar_width = area.width.saturating_sub(4) as usize;
-    let mut bar_spans = Vec::new();
-    for (idx, (_, _, pct)) in stages.iter().enumerate() {
-        let cells =
-            (((pct / 100.0) * bar_width as f64).round() as usize).max(if *pct > 1.2 { 1 } else { 0 });
-        if cells > 0 {
-            bar_spans.push(Span::styled(
-                "█".repeat(cells),
-                Style::default().fg(colors[idx]),
-            ));
-        }
-    }
-    if bar_spans.is_empty() {
-        bar_spans.push(Span::styled(
-            "░".repeat(bar_width.min(56)),
-            Style::default().fg(Color::DarkGray),
-        ));
-    }
-
-    let legend_1 = Line::from(vec![
-        Span::styled("■1.Queue ", Style::default().fg(Color::Yellow)),
-        Span::raw(format!("{:.2}ms({:.0}%) ", stages[0].1, stages[0].2)),
-        Span::styled("■2.Cache ", Style::default().fg(Color::Green)),
-        Span::raw(format!("{:.2}ms({:.0}%) ", stages[1].1, stages[1].2)),
-        Span::styled("■3.DNS/TCP/TLS ", Style::default().fg(Color::Magenta)),
-        Span::raw(format!("{:.2}ms({:.0}%) ", stages[2].1, stages[2].2)),
-        Span::styled("■4.TTFB ", Style::default().fg(Color::Red)),
-        Span::raw(format!("{:.2}ms({:.0}%)", stages[3].1, stages[3].2)),
-    ]);
-    let legend_2 = Line::from(vec![
-        Span::styled("■5.Stream ", Style::default().fg(Color::Cyan)),
-        Span::raw(format!("{:.2}ms({:.0}%)  ", stages[4].1, stages[4].2)),
-        Span::styled("■6.MPU-Merge ", Style::default().fg(Color::LightBlue)),
-        Span::raw(format!("{:.2}ms({:.0}%)  ", stages[5].1, stages[5].2)),
-        Span::styled("■7.CRC32C ", Style::default().fg(Color::Blue)),
-        Span::raw(format!("{:.2}ms({:.0}%)", stages[6].1, stages[6].2)),
-    ]);
-
-    let p = Paragraph::new(vec![Line::from(bar_spans), legend_1, legend_2]).block(
-        Block::default().borders(Borders::ALL).title(format!(
-            " Seven-Stage White-Box Latency Waterfall (Mean {:.2} ms) ",
-            state.frame.waterfall.total_ms()
-        )),
-    );
-    f.render_widget(p, area);
-}
-
-fn draw_sparkline_panel(f: &mut ratatui::Frame<'_>, area: Rect, state: &WorkbenchState) {
-    let vals: Vec<u64> = state
-        .frame
-        .timeseries
-        .iter()
-        .map(|pt| (pt.throughput_mib_s * 10.0).round().max(0.0) as u64)
-        .collect();
-    let spark = Sparkline::default()
-        .block(Block::default().borders(Borders::ALL).title(format!(
-            " Live Throughput ({:.1} MiB/s) ",
-            state.frame.transport.aggregate_mib_s
-        )))
-        .data(&vals)
-        .style(Style::default().fg(Color::Cyan));
-    f.render_widget(spark, area);
-}
-
-fn draw_inspector_tabs(f: &mut ratatui::Frame<'_>, area: Rect, state: &WorkbenchState) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(2), Constraint::Min(5)])
-        .split(area);
-
-    let tab_titles = [
-        " [1] AwaitTree Slow Stacks ",
-        " [2] Auto-Tune & Rust Code ",
-        " [3] 5-Cloud FinOps & Cache ",
-        " [4] Socket/TLS & Req-IDs ",
-        " [5] Cleanup & TOML Config ",
-    ];
-    let tabs = Tabs::new(tab_titles.into_iter().map(Line::from).collect::<Vec<_>>())
-        .select(state.inspector_tab)
-        .highlight_style(
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        );
-    f.render_widget(tabs, chunks[0]);
-
-    let content_text = match state.inspector_tab {
-        0 => state.frame.await_tree_dump.clone(),
-        1 => {
-            let mut buf = String::new();
-            if !state.trials.is_empty() {
-                buf.push_str("Auto-Tune Candidate Matrix (Top 6 by Score):\n");
-                let mut sorted = state.trials.clone();
-                sorted.sort_by(|a, b| {
-                    b.score
-                        .partial_cmp(&a.score)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-                for t in sorted.iter().take(6) {
-                    buf.push_str(&format!(
-                        "  #{} [{}] conc={} chunk={}KiB gap={}KiB cache={} -> {:.1} MiB/s | P99 {:.2}ms | ReadAmp {:.2}x | 429/503={} | Score {:.1}\n",
-                        t.trial_id,
-                        t.phase,
-                        t.knob.concurrent,
-                        t.knob.chunk_bytes / 1024,
-                        t.knob.range_gap_bytes / 1024,
-                        if t.knob.enable_foyer { "on" } else { "off" },
-                        t.aggregate_mib_s,
-                        t.worst_p99_ms,
-                        t.read_amplification,
-                        t.throttle_events,
-                        t.score
-                    ));
-                }
-                buf.push('\n');
             }
-            buf.push_str(&state.rust_code);
-            buf
+            if app.quit {
+                break;
+            }
+        }
+        Ok(())
+    }
+    .await;
+
+    app.cancel.cancel();
+    if let Some(s) = app.session.take() {
+        term.draw(|f| {
+            let a = centered(f.area(), 50, 5);
+            f.render_widget(Clear, a);
+            f.render_widget(
+                Paragraph::new("cleaning up test data…")
+                    .block(Block::bordered().border_type(BorderType::Rounded)),
+                a,
+            );
+        })?;
+        // Let running jobs observe the cancellation before deleting their data.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        s.close().await;
+    }
+    *stop_input.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    restore_terminal();
+    result
+}
+
+fn centered(r: Rect, w: u16, h: u16) -> Rect {
+    let w = w.min(r.width);
+    let h = h.min(r.height);
+    Rect::new(r.x + (r.width - w) / 2, r.y + (r.height - h) / 2, w, h)
+}
+
+fn block(title: &str) -> Block<'_> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .title(Span::styled(
+            format!(" {title} "),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ))
+}
+
+fn draw(f: &mut Frame, app: &App) {
+    let area = f.area();
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Length(10),
+            Constraint::Min(8),
+            Constraint::Length(7),
+            Constraint::Length(1),
+        ])
+        .split(area);
+    draw_header(f, rows[0], app);
+    let mid = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+        .split(rows[1]);
+    draw_sparks(f, mid[0], app);
+    draw_breakdown(f, mid[1], app);
+    draw_tabs(f, rows[2], app);
+    draw_log(f, rows[3], app);
+    let keys = " space start/stop · t tune · +/- concurrency · i/I io · k/K chunk · g/G gap · c cache · h http · p preset · l loop · e export · ? help · q quit";
+    f.render_widget(
+        Paragraph::new(keys).style(Style::default().fg(Color::DarkGray)),
+        rows[4],
+    );
+    if app.help {
+        draw_help(f, area);
+    }
+}
+
+fn draw_header(f: &mut Frame, area: Rect, app: &App) {
+    let (state, color) = match app.job {
+        Job::Idle => ("idle", Color::Gray),
+        Job::Preparing => ("preparing", Color::Yellow),
+        Job::Running => ("running", Color::Green),
+        Job::Tuning => ("tuning", Color::Magenta),
+    };
+    let phase = app
+        .snap
+        .as_ref()
+        .filter(|_| app.job == Job::Running)
+        .map(|s| format!(" · {} {:.1}s", s.phase.label(), s.elapsed_s))
+        .unwrap_or_default();
+    let p = &app.profile;
+    let title = Line::from(vec![
+        Span::styled(
+            " oprobe ",
+            Style::default().fg(Color::Black).bg(Color::Cyan).bold(),
+        ),
+        Span::raw(" "),
+        Span::styled(p.target.display(), Style::default().bold()),
+        Span::raw(format!("  {} · ", p.workload.preset.slug())),
+        Span::styled(
+            format!("● {state}{phase}"),
+            Style::default().fg(color).bold(),
+        ),
+        Span::raw(if app.continuous { "  ∞" } else { "" }),
+    ]);
+    let knobs = Line::from(Span::styled(
+        format!(" {}", app.knobs.summary()),
+        Style::default().fg(Color::Gray),
+    ));
+    let mut lines = vec![title, knobs];
+    if app.job == Job::Running && !app.continuous {
+        if let Some(s) = &app.snap {
+            if s.phase == Phase::Measure {
+                let total = p.workload.duration.get().as_secs_f64().max(1e-3);
+                let pct = (s.elapsed_s / total * 100.0).clamp(0.0, 100.0);
+                lines[1] = Line::from(vec![
+                    Span::styled(
+                        format!(" {}", app.knobs.summary()),
+                        Style::default().fg(Color::Gray),
+                    ),
+                    Span::styled(format!("   {pct:>3.0}%"), Style::default().fg(Color::Green)),
+                ]);
+            }
+        }
+    }
+    f.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::BOTTOM)
+                .border_style(Style::default().fg(Color::DarkGray)),
+        ),
+        area,
+    );
+}
+
+fn draw_sparks(f: &mut Frame, area: Rect, app: &App) {
+    let b = block("Live");
+    let inner = b.inner(area);
+    f.render_widget(b, area);
+    let Some(s) = &app.snap else {
+        f.render_widget(
+            Paragraph::new("No data yet. Press space to run.")
+                .style(Style::default().fg(Color::DarkGray)),
+            inner,
+        );
+        return;
+    };
+    let parts = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(3),
+            Constraint::Length(1),
+            Constraint::Length(3),
+        ])
+        .split(inner);
+    let w = inner.width as usize;
+    let tl: Vec<_> = s.timeline.iter().rev().take(w).rev().collect();
+    let ops: Vec<u64> = tl.iter().map(|p| p.ops_per_s as u64).collect();
+    let p99: Vec<u64> = tl.iter().map(|p| (p.p99_ms * 100.0) as u64).collect();
+    let sm = &s.summary;
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                format!("{:.1} ops/s", sm.ops_per_s),
+                Style::default().fg(Color::Green).bold(),
+            ),
+            Span::raw(format!(
+                "  {:.1} MiB/s  in-flight {}",
+                sm.mib_per_s, sm.inflight_ops
+            )),
+            if sm.failed_ops > 0 {
+                Span::styled(
+                    format!("  errors {}", sm.failed_ops),
+                    Style::default().fg(Color::Red),
+                )
+            } else {
+                Span::raw("")
+            },
+            if s.resilience.throttled_responses > 0 {
+                Span::styled(
+                    format!("  429/503 {}", s.resilience.throttled_responses),
+                    Style::default().fg(Color::Yellow),
+                )
+            } else {
+                Span::raw("")
+            },
+        ])),
+        parts[0],
+    );
+    f.render_widget(
+        Sparkline::default()
+            .data(&ops)
+            .style(Style::default().fg(Color::Green)),
+        parts[1],
+    );
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                format!(
+                    "p50 {}  p99 {}",
+                    fmt_ms(sm.latency.p50),
+                    fmt_ms(sm.latency.p99)
+                ),
+                Style::default().fg(Color::Magenta).bold(),
+            ),
+            Span::raw(format!(
+                "  p99.9 {}  max {}",
+                fmt_ms(sm.latency.p999),
+                fmt_ms(sm.latency.max)
+            )),
+        ])),
+        parts[2],
+    );
+    f.render_widget(
+        Sparkline::default()
+            .data(&p99)
+            .style(Style::default().fg(Color::Magenta)),
+        parts[3],
+    );
+}
+
+fn draw_breakdown(f: &mut Frame, area: Rect, app: &App) {
+    let b = block("Where the time goes");
+    let inner = b.inner(area);
+    f.render_widget(b, area);
+    let Some(s) = &app.snap else { return };
+    let sh = crate::analysis::diagnosis::time_shares(s);
+    let rows = [
+        ("queue", sh.queue, Color::Yellow),
+        ("connect", sh.connect, Color::Red),
+        ("upload", sh.upload, Color::Blue),
+        ("server", sh.server, Color::Magenta),
+        ("download", sh.download, Color::Cyan),
+        ("client", sh.client + sh.cache, Color::Gray),
+    ];
+    let lay = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(
+            rows.iter()
+                .map(|_| Constraint::Length(1))
+                .collect::<Vec<_>>(),
+        )
+        .split(inner);
+    for (i, (name, v, c)) in rows.iter().enumerate() {
+        if i >= lay.len() {
+            break;
+        }
+        f.render_widget(
+            Gauge::default()
+                .gauge_style(Style::default().fg(*c).bg(Color::Black))
+                .ratio(v.clamp(0.0, 1.0))
+                .label(format!("{name:<9}{:>5.1}%", v * 100.0)),
+            lay[i],
+        );
+    }
+}
+
+fn draw_tabs(f: &mut Frame, area: Rect, app: &App) {
+    let b = block("Details");
+    let inner = b.inner(area);
+    f.render_widget(b, area);
+    let parts = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(1)])
+        .split(inner);
+    f.render_widget(
+        Tabs::new(
+            TABS.iter()
+                .enumerate()
+                .map(|(i, t)| format!("{} {t}", i + 1))
+                .collect::<Vec<_>>(),
+        )
+        .select(app.tab)
+        .highlight_style(Style::default().fg(Color::Cyan).bold().underlined())
+        .style(Style::default().fg(Color::Gray)),
+        parts[0],
+    );
+    let area = parts[1];
+    let Some(s) = &app.snap else { return };
+    let head = |cols: &[&str]| {
+        Row::new(cols.iter().map(|c| Cell::from(c.to_string())))
+            .style(Style::default().fg(Color::DarkGray))
+    };
+    match app.tab {
+        0 => {
+            let rows: Vec<Row> = s
+                .verbs
+                .iter()
+                .map(|v| {
+                    Row::new(vec![
+                        v.verb.clone(),
+                        v.count.to_string(),
+                        format!("{:.1}", v.ops_per_s),
+                        format!("{:.1}", v.mib_per_s),
+                        fmt_ms(v.latency.p50),
+                        fmt_ms(v.latency.p99),
+                        fmt_ms(v.latency.max),
+                        format!("{:.2}", v.requests_per_op),
+                        format!(
+                            "{}/{}/{}",
+                            fmt_ms(v.breakdown.queue_ms),
+                            fmt_ms(v.breakdown.backend_ms),
+                            fmt_ms(v.breakdown.client_ms + v.breakdown.cache_ms)
+                        ),
+                        v.errors.to_string(),
+                    ])
+                })
+                .collect();
+            let widths = [14, 8, 9, 8, 8, 8, 8, 7, 24, 6].map(Constraint::Length);
+            f.render_widget(
+                Table::new(rows, widths).header(head(&[
+                    "operation",
+                    "count",
+                    "ops/s",
+                    "MiB/s",
+                    "p50",
+                    "p99",
+                    "max",
+                    "req/op",
+                    "queue/backend/client",
+                    "err",
+                ])),
+                area,
+            );
+        }
+        1 => {
+            let rows: Vec<Row> = s
+                .apis
+                .iter()
+                .map(|a| {
+                    let st = &a.stages;
+                    Row::new(vec![
+                        a.api.label().to_owned(),
+                        a.count.to_string(),
+                        format!("{:.0}%", a.reused_pct),
+                        fmt_ms(st.queue.mean),
+                        if st.connect.count > 0 {
+                            fmt_ms(st.connect.mean)
+                        } else {
+                            "-".into()
+                        },
+                        fmt_ms(st.send.mean),
+                        fmt_ms(st.ttfb.mean),
+                        fmt_ms(st.body.mean),
+                        fmt_ms(st.stall.mean),
+                        fmt_ms(st.total.p99),
+                        a.status
+                            .iter()
+                            .map(|(c, n)| format!("{c}×{n}"))
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                    ])
+                })
+                .collect();
+            let widths = [24, 8, 6, 8, 8, 8, 8, 9, 8, 8, 20].map(Constraint::Length);
+            f.render_widget(
+                Table::new(rows, widths).header(head(&[
+                    "request", "count", "warm", "queue", "connect", "send", "ttfb", "transfer",
+                    "stall", "p99", "status",
+                ])),
+                area,
+            );
         }
         2 => {
-            let finops = compare_multi_cloud_finops_scaled(
-                &state.frame.transport,
-                state.profile.workload.kind.write_ratio(),
-                state.profile.workload.internet_egress_ratio,
-                state.profile.pricing.baseline_stored_tb,
-                state.profile.pricing.monthly_logical_access_tb,
-            );
-            let mut lines = vec![format!(
-                "{:<22} {:>12} {:>12} {:>12} {:>14} {:>14} {:>14}",
-                "CLOUD PROVIDER",
-                "STORAGE/mo",
-                "API(A+B)/mo",
-                "EGRESS/mo",
-                "TOTAL USD/mo",
-                "AMP WASTE/mo",
-                "CACHE SAVED"
-            )];
-            for c in finops {
-                lines.push(format!(
-                    "{:<22} {:>11.2}$ {:>11.2}$ {:>11.2}$ {:>13.2}$ {:>13.2}$ {:>13.2}$",
-                    c.provider_name,
-                    c.monthly_storage_usd,
-                    c.monthly_api_requests_usd,
-                    c.monthly_egress_usd,
-                    c.total_monthly_usd,
-                    c.waste_from_amplification_usd,
-                    c.saved_by_cache_usd
-                ));
-            }
-            lines.push(String::new());
-            lines.push(format!(
-                "Scale: {:.0} TB stored + {:.0} TB/mo logical access (egress ratio {:.0}%). Use `:pricing s3|r2|gcs|oss|b2` to change baseline.",
-                state.profile.pricing.baseline_stored_tb,
-                state.profile.pricing.monthly_logical_access_tb,
-                state.profile.workload.internet_egress_ratio * 100.0
-            ));
-            lines.join("\n")
+            let c = &s.connections;
+            let b = &s.bytes;
+            let lines = vec![
+                Line::from(format!(
+                    "protocol {} · {} · {}{}",
+                    if c.alpn.is_empty() { "-" } else { &c.alpn },
+                    if c.tls_version.is_empty() { "plain" } else { &c.tls_version },
+                    c.cipher,
+                    c.proxy.as_ref().map(|p| format!(" · via {p}")).unwrap_or_default()
+                )),
+                Line::from(format!("{} new connections · {:.1}% requests warm · peak {} in-flight requests · {} dial failures", c.dialed, c.reuse_pct, c.peak_inflight_requests, c.dial_failures)),
+                Line::from(format!("dial p50/p99: dns {}/{} · tcp {}/{} · proxy {}/{} · tls {}/{}", fmt_ms(c.dns.p50), fmt_ms(c.dns.p99), fmt_ms(c.tcp.p50), fmt_ms(c.tcp.p99), fmt_ms(c.proxy_connect.p50), fmt_ms(c.proxy_connect.p99), fmt_ms(c.tls.p50), fmt_ms(c.tls.p99))),
+                Line::from(format!("remote {}", c.remote_addrs.join(", "))),
+                Line::from(""),
+                Line::from(format!("bytes: logical read {} write {} · backend down {} up {} · wire rx {} tx {}", fmt_bytes(b.logical_read), fmt_bytes(b.logical_write), fmt_bytes(b.backend_down), fmt_bytes(b.backend_up), fmt_bytes(b.wire_rx), fmt_bytes(b.wire_tx))),
+                Line::from(format!("read amplification {:.2}× · over-read {:.2}× · {:.2} requests/op · cache hit {:.1}%", b.read_amplification, b.overread_ratio, b.request_amplification, s.cache.hit_ratio * 100.0)),
+                Line::from(format!("client cpu {:.0}% of one core ({} cores) · rss {:.0} MiB", s.client.cpu_pct, s.client.cpu_cores, s.client.rss_mib)),
+            ];
+            f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
         }
         3 => {
-            let hs = &state.frame.handshake;
-            let mut s = format!(
-                "Endpoint: {} (Host: {}:{}, TLS: {}, ALPN: {}, Cipher: {})\n\
-                 DNS P50/P99: {:.2}/{:.2} ms | TCP RTT P50/P99: {:.2}/{:.2} ms | TLS P50/P99: {:.2}/{:.2} ms\n\
-                 Cold HEAD Total: {:.2} ms vs Warm Reused HEAD TTFB: {:.2} ms ({:.1}x Keep-Alive speedup)\n\
-                 Resolved IPs: {:?}   (Run `:net https://s3.amazonaws.com` to probe any live endpoint)\n\n\
-                 Recent Storage Gateway Request-IDs:\n",
-                hs.endpoint,
-                hs.host,
-                hs.port,
-                hs.tls_version,
-                hs.negotiated_alpn,
-                hs.cipher_suite,
-                hs.dns_p50_ms,
-                hs.dns_p99_ms,
-                hs.tcp_rtt_p50_ms,
-                hs.tcp_rtt_p99_ms,
-                hs.tls_p50_ms,
-                hs.tls_p99_ms,
-                hs.cold_total_ms,
-                hs.warm_ttfb_p50_ms,
-                hs.cold_vs_warm_ratio,
-                hs.resolved_ips,
-            );
-            if state.frame.transport.recent_request_ids.is_empty() {
-                s.push_str("  (In-process storage backend or no remote gateway request-id headers yet)");
-            } else {
-                for req_id in &state.frame.transport.recent_request_ids {
-                    s.push_str(&format!("  - {req_id}\n"));
+            let mut lines = Vec::new();
+            for op in s.slow_ops.iter().take(3) {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("{} {}", op.verb, fmt_ms(op.latency_ms)),
+                        Style::default().bold(),
+                    ),
+                    Span::styled(
+                        format!(
+                            "  at {:.1}s · queue {} backend {} client {}",
+                            op.at_s,
+                            fmt_ms(op.breakdown.queue_ms),
+                            fmt_ms(op.breakdown.backend_ms),
+                            fmt_ms(op.breakdown.client_ms)
+                        ),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]));
+                for r in op.requests.iter().take(6) {
+                    let t = &r.timing;
+                    let ms = |us: u64| fmt_ms(us as f64 / 1000.0);
+                    let conn = if r.protocol == Protocol::InProcess {
+                        "local".into()
+                    } else if r.reused {
+                        format!("warm #{}", r.conn_id)
+                    } else {
+                        format!("cold #{} connect {}", r.conn_id, ms(t.connect_us()))
+                    };
+                    lines.push(Line::from(format!(
+                        "  +{:<7} {:<22} {:>3} {conn:<18} queue {} send {} ttfb {} transfer {} = {}",
+                        fmt_ms(r.start_offset_us as f64 / 1000.0),
+                        r.api.label(),
+                        r.status,
+                        ms(t.queue_us),
+                        ms(t.send_us),
+                        ms(t.ttfb_us),
+                        ms(t.body_us),
+                        ms(t.total_us)
+                    )));
                 }
             }
-            s
+            if lines.is_empty() {
+                lines.push(Line::from("no operations yet"));
+            }
+            f.render_widget(Paragraph::new(lines), area);
         }
         _ => {
-            let cl = &state.frame.cleanup;
-            format!(
-                "Remote Test Data Auto-Cleanup Status:\n  \
-                 Enabled: {} | Prefix: `{}` | Created: {} | Deleted: {} | Remaining: {} | Clean: {} ({:.1} ms)\n\n\
-                 Reusable Round-Trip TOML Profile:\n{}",
-                cl.auto_cleanup_enabled,
-                cl.run_prefix,
-                cl.objects_created,
-                cl.objects_deleted,
-                cl.remaining_objects,
-                cl.verified_clean,
-                cl.cleanup_ms,
-                state.toml_profile
-            )
+            let d = diagnose(
+                s,
+                &app.knobs,
+                &app.profile.sla,
+                app.profile.target.is_network(),
+            );
+            let mut lines = vec![Line::from(Span::styled(
+                d.headline.clone(),
+                Style::default().bold(),
+            ))];
+            for fi in &d.findings {
+                let (icon, c) = match fi.severity {
+                    Severity::Critical => ("✖", Color::Red),
+                    Severity::Warning => ("▲", Color::Yellow),
+                    Severity::Info => ("●", Color::Blue),
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{icon} "), Style::default().fg(c)),
+                    Span::styled(fi.title.clone(), Style::default().bold()),
+                ]));
+                lines.push(Line::from(Span::styled(
+                    format!("   {}", fi.evidence),
+                    Style::default().fg(Color::DarkGray),
+                )));
+                lines.push(Line::from(format!("   → {}", fi.action)));
+            }
+            f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
         }
-    };
-
-    let body = Paragraph::new(content_text)
-        .wrap(Wrap { trim: false })
-        .alignment(Alignment::Left)
-        .block(Block::default().borders(Borders::ALL));
-    f.render_widget(body, chunks[1]);
+    }
 }
 
-fn draw_help_modal(f: &mut ratatui::Frame<'_>) {
-    let area = f.area();
-    let popup_w = area.width.min(86);
-    let popup_h = area.height.min(20);
-    let popup_rect = Rect {
-        x: area.x + (area.width.saturating_sub(popup_w)) / 2,
-        y: area.y + (area.height.saturating_sub(popup_h)) / 2,
-        width: popup_w,
-        height: popup_h,
-    };
+fn draw_log(f: &mut Frame, area: Rect, app: &App) {
+    let b = block("Log");
+    let inner = b.inner(area);
+    f.render_widget(b, area);
+    let n = inner.height as usize;
+    let lines: Vec<Line> = app
+        .log
+        .iter()
+        .rev()
+        .take(n)
+        .rev()
+        .map(|l| {
+            let style = if l.contains("error") || l.contains("failed") || l.contains("THROTTLED") {
+                Style::default().fg(Color::Red)
+            } else if l.contains("warning") || l.contains("hint") {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            Line::from(Span::styled(l.clone(), style))
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines), inner);
+}
 
-    f.render_widget(Clear, popup_rect);
-    let help_text = "\
-Keyboard Shortcuts:
-  Space        Run single benchmark burst / Gracefully stop active run
-  S            Run 10-second continuous streaming window
-  O            Run closed-loop 429/503-resilient SLA Auto-Tuner
-  1 / 2 / 3 / 4 Switch workload (Parquet / Checkpoint / Metadata / Mixed)
-  [ / ]        Decrease / Increase concurrency limit
-  - / +        Halve / Double I/O chunk size
-  F / T / K    Toggle Local Cache / TailCutLayer / HTTP Keep-Alive
-  Tab / S-Tab  Cycle through 5 white-box inspector tabs
-  E            Export .json, .md, .csv, and .profile.toml snapshots
-  / or :       Open command bar (`url s3://...`, `set k=v`, `net <url>`)
-  Q / Ctrl-C   Cleanly stop active run, clean remote data, and quit
-
-Press Esc or `?` to close.";
-
-    let modal = Paragraph::new(help_text).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan))
-            .title(" oprobe v1.0.0 Interactive Workbench Help "),
+fn draw_help(f: &mut Frame, area: Rect) {
+    let a = centered(area, 64, 22);
+    f.render_widget(Clear, a);
+    let rows = [
+        ("space / enter", "start or stop a run"),
+        ("l", "toggle continuous mode (run until stopped)"),
+        ("t", "auto-tune (throttle-aware) and apply the winner"),
+        ("+ / -", "double / halve concurrency"),
+        ("i / I", "double / halve per-op io concurrency"),
+        ("k / K", "double / halve chunk size"),
+        ("g / G", "increase / decrease range gap"),
+        ("c", "toggle read cache"),
+        ("h", "cycle HTTP version auto → h1 → h2"),
+        ("a", "toggle keep-alive"),
+        ("x", "toggle tail-cut (straggler retry)"),
+        ("p", "next workload preset (re-prepares data)"),
+        ("tab / 1-5", "switch detail panel"),
+        ("e", "export JSON + Markdown report"),
+        ("q / esc", "quit (test data is cleaned up)"),
+    ];
+    let lines: Vec<Line> = rows
+        .iter()
+        .map(|(k, d)| {
+            Line::from(vec![
+                Span::styled(
+                    format!("  {k:<16}"),
+                    Style::default().fg(Color::Cyan).bold(),
+                ),
+                Span::raw(*d),
+            ])
+        })
+        .collect();
+    f.render_widget(
+        Paragraph::new(lines).block(block("Keys — press any key to close")),
+        a,
     );
-    f.render_widget(modal, popup_rect);
 }

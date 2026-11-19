@@ -1,0 +1,43 @@
+<!-- WiX Toolset v4 source for the oprobe MSI (per-machine, adds oprobe to PATH).
+     Built by .github/workflows/release.yml:
+       wix build packaging/windows/oprobe.wxs -arch x64 -d Version=2.0.0 -d BinDir=... -o oprobe-2.0.0-x64.msi -->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="oprobe"
+           Manufacturer="oprobe contributors"
+           Version="$(var.Version)"
+           UpgradeCode="6F1B4C2A-9E57-4C31-8D0B-2A7E0C9B5D11"
+           Scope="perMachine"
+           Compressed="yes">
+    <MajorUpgrade DowngradeErrorMessage="A newer version of oprobe is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+    <SummaryInformation Description="oprobe — white-box cloud storage microscope" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="oprobe">
+        <Directory Id="ProfilesFolder" Name="profiles" />
+      </Directory>
+    </StandardDirectory>
+
+    <ComponentGroup Id="Main" Directory="INSTALLFOLDER">
+      <Component Id="Binary" Guid="3C2B8F5E-1D4A-4F6B-9A2C-7E8D1F0A3B42">
+        <File Id="oprobe.exe" Source="$(var.BinDir)\oprobe.exe" KeyPath="yes" />
+        <Environment Id="PathEntry" Name="PATH" Value="[INSTALLFOLDER]" Permanent="no"
+                     Part="last" Action="set" System="yes" />
+      </Component>
+      <Component Id="Docs" Guid="8A4D2E61-5B3C-4E7F-A1D9-0C6B2F8E4A73">
+        <File Source="$(var.BinDir)\README.md" KeyPath="yes" />
+        <File Source="$(var.BinDir)\LICENSE.txt" />
+        <File Source="$(var.BinDir)\CHANGELOG.md" />
+        <File Source="$(var.BinDir)\_oprobe.ps1" />
+      </Component>
+    </ComponentGroup>
+    <ComponentGroup Id="Profiles" Directory="ProfilesFolder">
+      <Files Include="$(var.BinDir)\profiles\*.toml" />
+    </ComponentGroup>
+
+    <Feature Id="Complete" Title="oprobe" Level="1">
+      <ComponentGroupRef Id="Main" />
+      <ComponentGroupRef Id="Profiles" />
+    </Feature>
+  </Package>
+</Wix>

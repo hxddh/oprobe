@@ -1,0 +1,38 @@
+# Lakehouse scan on AWS S3: stat + footer + 8 column chunks per query, skewed toward hot files.
+#   export AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=...
+#   oprobe run --profile profiles/s3-lakehouse-parquet.toml --json baseline.json
+[target]
+url = "s3://replace-me-bucket/oprobe"
+[target.options]
+region = "us-east-1"
+
+[workload]
+preset = "parquet"
+duration = "30s"
+warmup = "5s"
+access = "zipf:1.1"
+
+[workload.dataset]
+objects = 16
+object_size = "64MiB"
+persist = true              # upload once, reuse in later runs (oprobe cleanup --datasets removes it)
+
+[[workload.mix]]
+op = "parquet_scan"
+columns = 8
+column_size = "1MiB"
+footer_size = "64KiB"
+
+[knobs]
+concurrency = 32
+io_concurrency = 8
+chunk_size = "8MiB"
+range_gap = "256KiB"
+
+[sla]
+p99_ms = 250.0
+
+[cost]
+provider = "aws-s3"
+monthly_ops = 50000000
+stored_gib = 10240

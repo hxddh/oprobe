@@ -1,6 +1,5 @@
 /target
-/native/target
-/.nsh
-*.json.bak
-oprobe_report.*
-oprobe_nsh_report.*
+/dist
+*.json.tmp
+oprobe-*.json
+oprobe-*.md

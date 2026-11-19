@@ -1,0 +1,348 @@
+//! Small shared helpers: human-friendly byte sizes and durations, formatting, redaction.
+
+use std::fmt;
+use std::str::FromStr;
+use std::time::Duration;
+
+use anyhow::{bail, Context, Result};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+/// A byte quantity that (de)serializes as a human string (`"4MiB"`, `"512KiB"`, `"1GB"`) or a number.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ByteSize(pub u64);
+
+impl ByteSize {
+    pub const fn b(n: u64) -> Self {
+        Self(n)
+    }
+    pub const fn kib(n: u64) -> Self {
+        Self(n * 1024)
+    }
+    pub const fn mib(n: u64) -> Self {
+        Self(n * 1024 * 1024)
+    }
+    pub fn as_u64(self) -> u64 {
+        self.0
+    }
+    pub fn as_usize(self) -> usize {
+        self.0 as usize
+    }
+}
+
+impl FromStr for ByteSize {
+    type Err = anyhow::Error;
+    fn from_str(raw: &str) -> Result<Self> {
+        let s = raw.trim();
+        if s.is_empty() {
+            bail!("empty size");
+        }
+        let split = s
+            .find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '_'))
+            .unwrap_or(s.len());
+        let (num, unit) = s.split_at(split);
+        let num: f64 = num.replace('_', "").parse().with_context(|| {
+            format!("invalid size `{raw}` (examples: 4MiB, 512KiB, 1GB, 65536)")
+        })?;
+        let mult: f64 = match unit.trim().to_ascii_lowercase().as_str() {
+            "" | "b" => 1.0,
+            "k" | "kb" => 1e3,
+            "ki" | "kib" => 1024.0,
+            "m" | "mb" => 1e6,
+            "mi" | "mib" => 1024.0 * 1024.0,
+            "g" | "gb" => 1e9,
+            "gi" | "gib" => 1024.0 * 1024.0 * 1024.0,
+            "t" | "tb" => 1e12,
+            "ti" | "tib" => 1024.0_f64.powi(4),
+            other => bail!("unknown size unit `{other}` in `{raw}`"),
+        };
+        if num < 0.0 {
+            bail!("size must be non-negative");
+        }
+        Ok(Self((num * mult).round() as u64))
+    }
+}
+
+impl fmt::Display for ByteSize {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let v = self.0;
+        const UNITS: [(&str, u64); 4] = [
+            ("TiB", 1 << 40),
+            ("GiB", 1 << 30),
+            ("MiB", 1 << 20),
+            ("KiB", 1 << 10),
+        ];
+        for (name, unit) in UNITS {
+            if v >= unit && v.is_multiple_of(unit) {
+                return write!(f, "{}{name}", v / unit);
+            }
+        }
+        write!(f, "{v}B")
+    }
+}
+
+impl Serialize for ByteSize {
+    fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        s.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for ByteSize {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            N(u64),
+            S(String),
+        }
+        match Raw::deserialize(d)? {
+            Raw::N(n) => Ok(ByteSize(n)),
+            Raw::S(s) => s.parse().map_err(serde::de::Error::custom),
+        }
+    }
+}
+
+/// A duration that (de)serializes as a human string (`"10s"`, `"500ms"`, `"2m"`) or seconds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct HumanDuration(pub Duration);
+
+impl HumanDuration {
+    pub fn secs(s: u64) -> Self {
+        Self(Duration::from_secs(s))
+    }
+    pub fn get(self) -> Duration {
+        self.0
+    }
+}
+
+impl FromStr for HumanDuration {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self> {
+        parse_duration(s).map(Self)
+    }
+}
+
+impl fmt::Display for HumanDuration {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let ms = self.0.as_millis();
+        if ms == 0 {
+            write!(f, "0s")
+        } else if ms.is_multiple_of(60_000) {
+            write!(f, "{}m", ms / 60_000)
+        } else if ms.is_multiple_of(1000) {
+            write!(f, "{}s", ms / 1000)
+        } else {
+            write!(f, "{ms}ms")
+        }
+    }
+}
+
+impl Serialize for HumanDuration {
+    fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        s.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for HumanDuration {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            N(f64),
+            S(String),
+        }
+        match Raw::deserialize(d)? {
+            Raw::N(n) if n >= 0.0 => Ok(Self(Duration::from_secs_f64(n))),
+            Raw::N(_) => Err(serde::de::Error::custom("duration must be >= 0")),
+            Raw::S(s) => s.parse().map_err(serde::de::Error::custom),
+        }
+    }
+}
+
+/// Parse `"10s"`, `"500ms"`, `"1.5m"`, `"1h"`, `"250us"` or plain seconds (`"5"`).
+pub fn parse_duration(raw: &str) -> Result<Duration> {
+    let s = raw.trim().to_ascii_lowercase();
+    if s.is_empty() {
+        bail!("duration cannot be empty");
+    }
+    let (num, mult) = if let Some(v) = s.strip_suffix("ms") {
+        (v, 1e-3)
+    } else if let Some(v) = s.strip_suffix("us").or_else(|| s.strip_suffix("µs")) {
+        (v, 1e-6)
+    } else if let Some(v) = s.strip_suffix('h') {
+        (v, 3600.0)
+    } else if let Some(v) = s.strip_suffix('m') {
+        (v, 60.0)
+    } else if let Some(v) = s.strip_suffix('s') {
+        (v, 1.0)
+    } else {
+        (s.as_str(), 1.0)
+    };
+    let val: f64 = num
+        .trim()
+        .parse()
+        .with_context(|| format!("invalid duration `{raw}` (examples: 10s, 500ms, 2m)"))?;
+    if val.is_nan() || val < 0.0 || !val.is_finite() {
+        bail!("duration must be a non-negative number");
+    }
+    Ok(Duration::from_secs_f64(val * mult))
+}
+
+/// Format bytes in binary units with one decimal (`"12.5 MiB"`).
+pub fn fmt_bytes(v: u64) -> String {
+    let f = v as f64;
+    if f >= 1024.0 * 1024.0 * 1024.0 {
+        format!("{:.2} GiB", f / (1024.0 * 1024.0 * 1024.0))
+    } else if f >= 1024.0 * 1024.0 {
+        format!("{:.1} MiB", f / (1024.0 * 1024.0))
+    } else if f >= 1024.0 {
+        format!("{:.1} KiB", f / 1024.0)
+    } else {
+        format!("{v} B")
+    }
+}
+
+/// Format a millisecond latency with adaptive precision.
+pub fn fmt_ms(ms: f64) -> String {
+    if !ms.is_finite() {
+        "-".to_owned()
+    } else if ms >= 1000.0 {
+        format!("{:.2}s", ms / 1000.0)
+    } else if ms >= 100.0 {
+        format!("{ms:.0}ms")
+    } else if ms >= 10.0 {
+        format!("{ms:.1}ms")
+    } else {
+        format!("{ms:.2}ms")
+    }
+}
+
+/// Format USD amounts.
+pub fn fmt_usd(v: f64) -> String {
+    if v.abs() >= 1000.0 {
+        format!("${v:.0}")
+    } else if v.abs() >= 1.0 {
+        format!("${v:.2}")
+    } else {
+        format!("${v:.4}")
+    }
+}
+
+/// Keys whose values must never be printed or persisted.
+pub fn is_secret_key(key: &str) -> bool {
+    let k = key.to_ascii_lowercase();
+    [
+        "secret",
+        "password",
+        "token",
+        "credential",
+        "access_key",
+        "account_key",
+        "sas",
+        "private_key",
+        "application_key",
+    ]
+    .iter()
+    .any(|needle| k.contains(needle))
+}
+
+/// Replace secret values with `"<redacted>"`.
+pub fn redact_options(
+    opts: &std::collections::BTreeMap<String, String>,
+) -> std::collections::BTreeMap<String, String> {
+    opts.iter()
+        .map(|(k, v)| {
+            if is_secret_key(k) {
+                (k.clone(), "<redacted>".to_owned())
+            } else {
+                (k.clone(), v.clone())
+            }
+        })
+        .collect()
+}
+
+/// UTC timestamp formatted as RFC 3339 (seconds precision).
+pub fn now_rfc3339() -> String {
+    humantime::format_rfc3339_seconds(std::time::SystemTime::now()).to_string()
+}
+
+/// Compact UTC timestamp for object prefixes: `20261119T093000Z`.
+pub fn compact_utc_now() -> String {
+    let s = humantime::format_rfc3339_seconds(std::time::SystemTime::now()).to_string();
+    // 2026-11-19T09:30:00Z -> 20261119T093000Z
+    s.replace(['-', ':'], "")
+}
+
+/// Parse a compact UTC timestamp produced by [`compact_utc_now`].
+pub fn parse_compact_utc(s: &str) -> Option<std::time::SystemTime> {
+    if s.len() != 16 {
+        return None;
+    }
+    let iso = format!(
+        "{}-{}-{}T{}:{}:{}Z",
+        &s[0..4],
+        &s[4..6],
+        &s[6..8],
+        &s[9..11],
+        &s[11..13],
+        &s[13..15]
+    );
+    humantime::parse_rfc3339(&iso).ok()
+}
+
+pub fn pct(num: f64, den: f64) -> f64 {
+    if den > 0.0 {
+        num / den * 100.0
+    } else {
+        0.0
+    }
+}
+
+pub fn ratio(num: f64, den: f64) -> f64 {
+    if den > 0.0 {
+        num / den
+    } else {
+        0.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn byte_sizes_parse_and_print() {
+        assert_eq!("4MiB".parse::<ByteSize>().unwrap(), ByteSize::mib(4));
+        assert_eq!("512 KiB".parse::<ByteSize>().unwrap(), ByteSize::kib(512));
+        assert_eq!("1GB".parse::<ByteSize>().unwrap().0, 1_000_000_000);
+        assert_eq!("65536".parse::<ByteSize>().unwrap().0, 65536);
+        assert_eq!(ByteSize::mib(8).to_string(), "8MiB");
+        assert_eq!(ByteSize(1000).to_string(), "1000B");
+        assert!("4XB".parse::<ByteSize>().is_err());
+    }
+
+    #[test]
+    fn durations_parse() {
+        assert_eq!(parse_duration("10s").unwrap(), Duration::from_secs(10));
+        assert_eq!(parse_duration("500ms").unwrap(), Duration::from_millis(500));
+        assert_eq!(parse_duration("1.5m").unwrap(), Duration::from_secs(90));
+        assert_eq!(parse_duration("2").unwrap(), Duration::from_secs(2));
+        assert!(parse_duration("abc").is_err());
+        assert_eq!(HumanDuration::secs(120).to_string(), "2m");
+    }
+
+    #[test]
+    fn compact_timestamps_roundtrip() {
+        let s = compact_utc_now();
+        assert!(parse_compact_utc(&s).is_some(), "{s}");
+    }
+
+    #[test]
+    fn secrets_are_redacted() {
+        let mut m = std::collections::BTreeMap::new();
+        m.insert("secret_access_key".to_owned(), "x".to_owned());
+        m.insert("bucket".to_owned(), "b".to_owned());
+        let r = redact_options(&m);
+        assert_eq!(r["secret_access_key"], "<redacted>");
+        assert_eq!(r["bucket"], "b");
+    }
+}
