@@ -785,9 +785,9 @@ async fn cmd_probe(a: ProbeArgs) -> Result<ExitCode> {
 }
 
 async fn cmd_lab(a: LabArgs) -> Result<ExitCode> {
-    use crate::lab::{LAB_CA_PEM, LabConfig, LabServer};
+    use crate::lab::{LabConfig, LabServer, lab_ca_pem};
     if let Some(p) = &a.write_ca {
-        write_file(p, LAB_CA_PEM)?;
+        write_file(p, lab_ca_pem())?;
     }
     let cfg = LabConfig {
         enable_tls: a.tls,

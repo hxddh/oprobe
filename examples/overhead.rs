@@ -21,7 +21,7 @@ use opendal_http_transport_reqwest::ReqwestTransport;
 use oprobe::config::{Knobs, TransportMode};
 use oprobe::engine::operator::{base_operator, measured_operator};
 use oprobe::engine::procstat::usage;
-use oprobe::lab::{LAB_CA_PEM, LabConfig, LabServer};
+use oprobe::lab::{LabConfig, LabServer, lab_ca_pem};
 use oprobe::trace::{OpCompletion, OpScope, Phase, Recorder};
 
 /// Exactly what the `opendal` facade installs by default, with the lab CA trusted.
@@ -151,7 +151,7 @@ async fn main() -> anyhow::Result<()> {
     let profile = lab.profile("bench");
     let base = base_operator(&profile.target)?;
     let client = reqwest::Client::builder()
-        .add_root_certificate(reqwest::Certificate::from_pem(LAB_CA_PEM.as_bytes())?)
+        .add_root_certificate(reqwest::Certificate::from_pem(lab_ca_pem().as_bytes())?)
         .build()?;
     let plain_transport = HttpTransporter::new(ReqwestTransport::new(client));
     // The baseline carries the same client configuration oprobe applies for the default knobs

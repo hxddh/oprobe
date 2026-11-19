@@ -56,14 +56,27 @@ jobs:
       OPROBE_IT_AZBLOB_ACCOUNT: oprobeit
     steps:
       - uses: actions/checkout@v4
+      # MinIO no longer publishes container images; build a pinned revision from source.
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+      - uses: actions/cache@v4
+        with:
+          path: ~/go/bin/minio
+          key: minio-v0.0.0-20260212201848-7aac2a2c5b7c
+      - name: Build MinIO
+        run: |
+          [ -x ~/go/bin/minio ] || go install github.com/minio/minio@v0.0.0-20260212201848-7aac2a2c5b7c
       - name: Start MinIO, fake-gcs-server and Azurite
         run: |
           # Azurite account with a key generated for this run only.
           key="$(openssl rand -base64 64 | tr -d '\n')"
           echo "::add-mask::$key"
           echo "OPROBE_IT_AZBLOB_KEY=$key" >> "$GITHUB_ENV"
-          docker run -d --name minio -p 9000:9000 -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
-            minio/minio server /data
+          mkdir -p "$RUNNER_TEMP/minio"
+          MINIO_ROOT_USER=minioadmin MINIO_ROOT_PASSWORD=minioadmin \
+            nohup ~/go/bin/minio server "$RUNNER_TEMP/minio" --address 127.0.0.1:9000 > "$RUNNER_TEMP/minio.log" 2>&1 &
           docker run -d --name gcs -p 4443:4443 fsouza/fake-gcs-server -scheme http -public-host 127.0.0.1:4443
           docker run -d --name azurite -p 10000:10000 -e "AZURITE_ACCOUNTS=oprobeit:$key" \
             mcr.microsoft.com/azure-storage/azurite \
@@ -89,7 +102,9 @@ jobs:
       - run: cargo test --locked --test backends -- --nocapture
       - name: Container logs on failure
         if: failure()
-        run: for c in minio gcs azurite; do echo "== $c"; docker logs --tail 80 $c; done
+        run: |
+          echo "== minio"; tail -n 80 "$RUNNER_TEMP/minio.log" || true
+          for c in gcs azurite; do echo "== $c"; docker logs --tail 80 $c || true; done
 
   msrv:
     name: MSRV (1.97)

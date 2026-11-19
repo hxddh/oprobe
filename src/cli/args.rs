@@ -51,6 +51,8 @@ pub enum ColorChoice {
     Never,
 }
 
+// Parsed once per process; boxing the larger argument structs would only add noise.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand, Debug)]
 pub enum Command {
     /// Run a workload and report where time and money go

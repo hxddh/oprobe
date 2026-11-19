@@ -103,6 +103,7 @@ nsh-platform-tui = { version = "0.6", default-features = false, features = ["run
 ratatui-core = { version = "0.1", optional = true }
 ratatui-crossterm = { version = "0.1", optional = true }
 crossterm = { version = "0.29", optional = true }
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "aws_lc_rs"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 nsh-platform-linux = { version = "0.6", default-features = false, features = ["plot"], optional = true }

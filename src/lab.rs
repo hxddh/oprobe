@@ -27,41 +27,65 @@ use tokio::sync::oneshot;
 use crate::config::{Profile, TargetSpec};
 use crate::net::tls::build_tls_acceptor;
 
-/// Root CA (ECDSA P-256, valid 2026–2046) that signs the lab's `localhost` certificate.
-pub const LAB_CA_PEM: &str = "\
------BEGIN CERTIFICATE-----
-MIIBhTCCASygAwIBAgIUa9W+2hG6ppa6pjBvtenbnhcEHMgwCgYIKoZIzj0EAwIw
-ITEfMB0GA1UEAwwWb3Byb2JlLXRlc3RiZWQtcm9vdC1jYTAeFw0yNjExMTkwOTEy
-MDlaFw00NjExMTQwOTEyMDlaMCExHzAdBgNVBAMMFm9wcm9iZS10ZXN0YmVkLXJv
-b3QtY2EwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAQuAYbKF3tfOz1qFokIPVb/
-fa7HhDz+LJL2XCUIcKbdFAlNbT+wjbdaQtrrnkGGJ8x+NUn9sqasepW7hAAmn2CY
-o0IwQDAPBgNVHRMBAf8EBTADAQH/MA4GA1UdDwEB/wQEAwIBBjAdBgNVHQ4EFgQU
-BJnBwfx6Mh+dzBVBk0QD7YlvPmAwCgYIKoZIzj0EAwIDRwAwRAIgKFBVQkv9CbaQ
-g+h0wZ1oZTOvgY9ehjpDE8YFFHpyBFQCIEwV9BcopOiVmG3LDJ6fFf9z/EVCkpw5
-rRocfRJPshFC
------END CERTIFICATE-----";
+struct LabTls {
+    ca_pem: String,
+    cert_pem: String,
+    key_pem: String,
+}
 
-/// Lab server certificate (`SAN=DNS:localhost,IP:127.0.0.1`) signed by [`LAB_CA_PEM`].
-pub const LAB_SERVER_CERT_PEM: &str = "\
------BEGIN CERTIFICATE-----
-MIIByjCCAXCgAwIBAgIUPN+3iZibqp0LH3ZkdgE0Apa8tRUwCgYIKoZIzj0EAwIw
-ITEfMB0GA1UEAwwWb3Byb2JlLXRlc3RiZWQtcm9vdC1jYTAeFw0yNjExMTkwOTEy
-MDlaFw00NjExMTQwOTEyMDlaMBQxEjAQBgNVBAMMCWxvY2FsaG9zdDBZMBMGByqG
-SM49AgEGCCqGSM49AwEHA0IABNwTFYJv7wJbEK36aX0L4mgPK/vemQLiDVK0M+EZ
-WAWmawR8TCFGdSpU+RZlccjAN0szEzsz0uMNVx1zy7Apmu+jgZIwgY8wDAYDVR0T
-AQH/BAIwADAOBgNVHQ8BAf8EBAMCB4AwEwYDVR0lBAwwCgYIKwYBBQUHAwEwGgYD
-VR0RBBMwEYIJbG9jYWxob3N0hwR/AAABMB0GA1UdDgQWBBQYBX8ySBr7sjxhmvYH
-2/RH69uByjAfBgNVHSMEGDAWgBQEmcHB/HoyH53MFUGTRAPtiW8+YDAKBggqhkjO
-PQQDAgNIADBFAiEA2ezDulVa+RtjGSQEZCkutz/f5yExHQX61LxN82kK7KcCIADy
-QurYeaTbo4+Uaparj0ZJ6zGLQL/yFzPmyfW8e1J6
------END CERTIFICATE-----";
+/// A CA and a `localhost` server certificate generated once per process: valid from yesterday for
+/// 30 days, ECDSA P-256, SANs `localhost` / `127.0.0.1` / `::1`, server-auth EKU — what strict
+/// verifiers (macOS Security.framework, the platform verifier reqwest uses) accept.
+fn lab_tls() -> &'static LabTls {
+    static TLS: std::sync::OnceLock<LabTls> = std::sync::OnceLock::new();
+    TLS.get_or_init(|| generate_lab_tls().expect("generate lab certificates"))
+}
 
-pub const LAB_SERVER_KEY_PEM: &str = "\
------BEGIN PRIVATE KEY-----
-MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQguAIvbvO5nkk9fTiw
-35UNv9IgygTjxfIde+RrTbzseIehRANCAATcExWCb+8CWxCt+ml9C+JoDyv73pkC
-4g1StDPhGVgFpmsEfEwhRnUqVPkWZXHIwDdLMxM7M9LjDVcdc8uwKZrv
------END PRIVATE KEY-----";
+fn generate_lab_tls() -> std::result::Result<LabTls, rcgen::Error> {
+    use rcgen::{
+        BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair,
+        KeyUsagePurpose, date_time_ymd,
+    };
+    let today = crate::util::utc_today();
+    let (y0, m0, d0) = crate::util::civil_from_days(today - 1);
+    let (y1, m1, d1) = crate::util::civil_from_days(today + 30);
+    let validity = |p: &mut CertificateParams| {
+        p.not_before = date_time_ymd(y0 as i32, m0 as u8, d0 as u8);
+        p.not_after = date_time_ymd(y1 as i32, m1 as u8, d1 as u8);
+    };
+
+    let ca_key = KeyPair::generate()?;
+    let mut ca = CertificateParams::new(Vec::<String>::new())?;
+    ca.distinguished_name
+        .push(DnType::CommonName, "oprobe lab CA (generated)");
+    ca.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+    ca.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    validity(&mut ca);
+    let ca_cert = ca.self_signed(&ca_key)?;
+
+    let key = KeyPair::generate()?;
+    let mut leaf = CertificateParams::new(vec![
+        "localhost".to_owned(),
+        "127.0.0.1".to_owned(),
+        "::1".to_owned(),
+    ])?;
+    leaf.distinguished_name
+        .push(DnType::CommonName, "localhost");
+    leaf.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    leaf.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    validity(&mut leaf);
+    let cert = leaf.signed_by(&key, &ca_cert, &ca_key)?;
+    Ok(LabTls {
+        ca_pem: ca_cert.pem(),
+        cert_pem: cert.pem(),
+        key_pem: key.serialize_pem(),
+    })
+}
+
+/// PEM of the CA that signs the lab's TLS certificate in this process (trust it as `ca_cert`).
+pub fn lab_ca_pem() -> &'static str {
+    &lab_tls().ca_pem
+}
 
 /// Fault profile for the lab server.
 #[derive(Clone, Debug, Default)]
@@ -794,7 +818,7 @@ impl LabHandle {
         opts.insert("disable_config_load".to_owned(), "true".to_owned());
         opts.insert("root".to_owned(), "/bench".to_owned());
         if self.endpoint_url.starts_with("https://") {
-            opts.insert("ca_cert_pem".to_owned(), LAB_CA_PEM.to_owned());
+            opts.insert("ca_cert_pem".to_owned(), lab_ca_pem().to_owned());
         }
         Profile::from_target(TargetSpec {
             url: None,
@@ -831,9 +855,10 @@ impl LabServer {
         let local_addr = listener.local_addr()?;
 
         let tls_acceptor = if faults.enable_tls {
+            let tls = lab_tls();
             Some(build_tls_acceptor(
-                LAB_SERVER_CERT_PEM,
-                LAB_SERVER_KEY_PEM,
+                &tls.cert_pem,
+                &tls.key_pem,
                 faults.enable_http2,
             )?)
         } else {
@@ -841,12 +866,22 @@ impl LabServer {
         };
 
         let scheme = if faults.enable_tls { "https" } else { "http" };
-        let host_for_url = if local_addr.ip().is_loopback() {
-            "localhost".to_owned()
+        // Advertise the address actually bound. `localhost` would make clients try the other
+        // address family first (`::1` vs `127.0.0.1`), which costs a Happy Eyeballs fallback on
+        // every new connection — reqwest waits 300 ms, and Windows takes ~2 s to refuse `::1`.
+        let advertised = if local_addr.ip().is_unspecified() {
+            std::net::SocketAddr::new(
+                if local_addr.is_ipv6() {
+                    std::net::Ipv6Addr::LOCALHOST.into()
+                } else {
+                    std::net::Ipv4Addr::LOCALHOST.into()
+                },
+                local_addr.port(),
+            )
         } else {
-            local_addr.ip().to_string()
+            local_addr
         };
-        let endpoint_url = format!("{scheme}://{host_for_url}:{}", local_addr.port());
+        let endpoint_url = format!("{scheme}://{advertised}");
 
         let store = Arc::new(S3Store {
             objects: RwLock::new(BTreeMap::new()),
