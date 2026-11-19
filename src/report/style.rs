@@ -21,19 +21,15 @@ pub fn enabled() -> bool {
 #[cfg(windows)]
 fn ansi_ok() -> bool {
     // Enable virtual-terminal processing (ANSI colors) on Windows 10+ consoles.
-    const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
-    const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x0004;
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn GetStdHandle(which: u32) -> isize;
-        fn GetConsoleMode(h: isize, mode: *mut u32) -> i32;
-        fn SetConsoleMode(h: isize, mode: u32) -> i32;
-    }
+    use windows_sys::Win32::System::Console::{
+        GetConsoleMode, GetStdHandle, SetConsoleMode, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+        STD_OUTPUT_HANDLE,
+    };
     // SAFETY: console-mode calls on this process's stdout handle with a valid out-pointer.
     unsafe {
         let h = GetStdHandle(STD_OUTPUT_HANDLE);
         let mut mode = 0u32;
-        if h == 0 || h == -1 || GetConsoleMode(h, &mut mode) == 0 {
+        if h.is_null() || h as isize == -1 || GetConsoleMode(h, &mut mode) == 0 {
             return false;
         }
         mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING != 0

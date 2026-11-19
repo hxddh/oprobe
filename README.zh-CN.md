@@ -17,9 +17,9 @@ Windows 使用 Win32/Direct2D、Linux 使用 GTK 4，同一套 UI 也能在任�
 
 ![oprobe-app：最慢操作瀑布图](docs/images/app-slowest-op.png)
 
-架构只有两层：**OpenDAL + oprobe 自研纯 Rust 传输层**负责一切测量，**NSH** 负责一切界面（窗口与终端）。
-`oprobe top` 即在终端中启动 `oprobe-app --tui`。主包 `oprobe` 不含任何 UI 框架，`cargo install oprobe` 保持纯 Rust；
-NSH 终端后端目前会编译一个小型 C 正则库（语法高亮），且要求 Rust 1.97，因此 UI 独立为 `oprobe-app` 包。详见 [docs/app.md](docs/app.md)。
+架构只有两层：**OpenDAL 及其自带 HTTP 客户端（逐请求观测）**负责一切测量，**NSH** 负责一切界面（窗口与终端）。
+`oprobe top` 即在终端中启动 `oprobe-app --tui`。主包 `oprobe` 不含任何 UI 框架；
+NSH 要求 Rust 1.97，因此 UI 目前独立为 `oprobe-app` 包。详见 [docs/app.md](docs/app.md)。
 
 ## 它回答的问题
 
@@ -47,7 +47,7 @@ NSH 终端后端目前会编译一个小型 C 正则库（语法高亮），且�
 | Homebrew | 每个 Release 附带 `oprobe.rb`，见 [docs/install.md](docs/install.md) |
 | **桌面应用** | macOS `oprobe-app-<版本>-macos-universal.dmg` · Windows `oprobe-app-<版本>-x64.msi` · Linux `oprobe-app-<版本>-x86_64-unknown-linux-gnu.tar.gz` |
 
-纯 Rust 实现，无 OpenSSL、无 C 工具链依赖；Linux musl 版本为完全静态链接。压缩包内含 man 手册、
+运行时无需 OpenSSL 或其他系统库；Linux musl 版本为完全静态链接。从源码安装需要 C 编译器（用于 aws-lc，与 reqwest 默认一致）。压缩包内含 man 手册、
 bash/zsh/fish/PowerShell/elvish 补全脚本与示例 Profile，所有产物的校验和见 `SHA256SUMS`。
 
 ## 快速开始

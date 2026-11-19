@@ -289,13 +289,17 @@ pub fn render(r: &Report) -> String {
         dim(&r.oprobe_version),
         bold(&r.target.display),
         dim(&format!(
-            "· {} · {:.1}s measured · {}",
+            "· {} · {:.1}s measured · {} · client {}",
             r.workload.preset.slug(),
             s.elapsed_s,
             if let Some(rate) = r.workload.rate {
                 format!("open-loop {rate} ops/s")
             } else {
                 format!("{} workers", r.knobs.concurrency)
+            },
+            match r.knobs.transport {
+                crate::config::TransportMode::Opendal => "OpenDAL reqwest",
+                crate::config::TransportMode::Microscope => "oprobe microscope",
             }
         ))
     );

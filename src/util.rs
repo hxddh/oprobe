@@ -344,61 +344,14 @@ pub fn parse_compact_utc(s: &str) -> Option<std::time::SystemTime> {
     )
 }
 
-/// CRC-32C (Castagnoli), slicing-by-8. Used to verify payload integrity end to end.
+/// CRC-32C (Castagnoli), hardware-accelerated where available (SSE 4.2 / ARMv8 CRC).
 pub fn crc32c(data: &[u8]) -> u32 {
-    crc32c_append(0, data)
+    ::crc32c::crc32c(data)
 }
-
-const CRC32C_TABLES: [[u32; 256]; 8] = {
-    let mut t = [[0u32; 256]; 8];
-    let mut i = 0;
-    while i < 256 {
-        let mut c = i as u32;
-        let mut k = 0;
-        while k < 8 {
-            c = if c & 1 != 0 {
-                (c >> 1) ^ 0x82F6_3B78
-            } else {
-                c >> 1
-            };
-            k += 1;
-        }
-        t[0][i] = c;
-        i += 1;
-    }
-    let mut i = 0;
-    while i < 256 {
-        let mut s = 1;
-        while s < 8 {
-            let prev = t[s - 1][i];
-            t[s][i] = (prev >> 8) ^ t[0][(prev & 0xff) as usize];
-            s += 1;
-        }
-        i += 1;
-    }
-    t
-};
 
 /// Continue a CRC-32C over more data (`crc` is a previous result, `0` to start).
 pub fn crc32c_append(crc: u32, data: &[u8]) -> u32 {
-    let t = &CRC32C_TABLES;
-    let mut c = !crc;
-    let (chunks, rest) = data.as_chunks::<8>();
-    for b in chunks {
-        let lo = c ^ u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
-        c = t[7][(lo & 0xff) as usize]
-            ^ t[6][(lo >> 8 & 0xff) as usize]
-            ^ t[5][(lo >> 16 & 0xff) as usize]
-            ^ t[4][(lo >> 24) as usize]
-            ^ t[3][b[4] as usize]
-            ^ t[2][b[5] as usize]
-            ^ t[1][b[6] as usize]
-            ^ t[0][b[7] as usize];
-    }
-    for &b in rest {
-        c = (c >> 8) ^ t[0][((c ^ b as u32) & 0xff) as usize];
-    }
-    !c
+    ::crc32c::crc32c_append(crc, data)
 }
 
 pub fn pct(num: f64, den: f64) -> f64 {

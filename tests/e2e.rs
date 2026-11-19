@@ -121,14 +121,14 @@ fn walk(p: &std::path::Path) -> Vec<std::path::PathBuf> {
     out
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn http1_requests_are_attributed_stage_by_stage() {
+async fn http1_requests_are_attributed_stage_by_stage_with(mode: TransportMode) {
     let lab = lab(LabConfig {
         base_ttfb_delay: Duration::from_millis(15),
         ..Default::default()
     })
     .await;
     let mut p = lab.profile("bkt");
+    p.knobs.transport = mode;
     small(&mut p, Preset::Mixed);
     let (s, c, _) = run_once(p, 800).await;
     assert!(c.verified);
@@ -167,8 +167,7 @@ async fn http1_requests_are_attributed_stage_by_stage() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn https_h2_multipart_upload_is_traced_per_api() {
+async fn https_h2_multipart_upload_is_traced_per_api_with(mode: TransportMode) {
     let lab = lab(LabConfig {
         enable_tls: true,
         enable_http2: true,
@@ -177,6 +176,7 @@ async fn https_h2_multipart_upload_is_traced_per_api() {
     })
     .await;
     let mut p = lab.profile("bkt");
+    p.knobs.transport = mode;
     p.workload.dataset = Some(DatasetSpec {
         objects: 1,
         object_size: ByteSize::kib(64),
@@ -190,6 +190,8 @@ async fn https_h2_multipart_upload_is_traced_per_api() {
     }];
     p.knobs.chunk_size = ByteSize::mib(5);
     p.knobs.concurrency = 2;
+    // OpenDAL's client speaks HTTP/1.1 unless the app enables reqwest's http2 feature.
+    p.knobs.http_version = oprobe::net::HttpVersion::H2;
     let (s, c, _) = run_once(p, 1200).await;
     assert!(c.verified);
     assert_eq!(s.connections.alpn, "h2");
@@ -217,10 +219,10 @@ async fn https_h2_multipart_upload_is_traced_per_api() {
     assert_eq!(s.integrity.corrupted, 0);
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn keep_alive_off_dials_for_every_request() {
+async fn keep_alive_off_dials_for_every_request_with(mode: TransportMode) {
     let lab = lab(LabConfig::default()).await;
     let mut p = lab.profile("bkt");
+    p.knobs.transport = mode;
     small(&mut p, Preset::SmallFiles);
     p.knobs.keep_alive = false;
     let (s, _, _) = run_once(p, 500).await;
@@ -399,8 +401,7 @@ async fn connect_proxy() -> (String, Arc<std::sync::atomic::AtomicU64>) {
     (format!("http://{addr}"), tunnels)
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn proxy_connect_is_used_and_timed() {
+async fn proxy_connect_is_used_and_timed_with(mode: TransportMode) {
     let lab = lab(LabConfig {
         enable_tls: true,
         enable_http2: true,
@@ -409,6 +410,7 @@ async fn proxy_connect_is_used_and_timed() {
     .await;
     let (proxy, tunnels) = connect_proxy().await;
     let mut p = lab.profile("bkt");
+    p.knobs.transport = mode;
     p.target.proxy = Some(proxy.clone());
     small(&mut p, Preset::SmallFiles);
     p.knobs.keep_alive = false;
@@ -626,4 +628,44 @@ fn shipped_profiles_are_valid() {
         }
     }
     assert!(n >= 6);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn http1_requests_are_attributed_stage_by_stage() {
+    http1_requests_are_attributed_stage_by_stage_with(TransportMode::Opendal).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn http1_requests_are_attributed_stage_by_stage_microscope() {
+    http1_requests_are_attributed_stage_by_stage_with(TransportMode::Microscope).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn https_h2_multipart_upload_is_traced_per_api() {
+    https_h2_multipart_upload_is_traced_per_api_with(TransportMode::Opendal).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn https_h2_multipart_upload_is_traced_per_api_microscope() {
+    https_h2_multipart_upload_is_traced_per_api_with(TransportMode::Microscope).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn keep_alive_off_dials_for_every_request() {
+    keep_alive_off_dials_for_every_request_with(TransportMode::Opendal).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn keep_alive_off_dials_for_every_request_microscope() {
+    keep_alive_off_dials_for_every_request_with(TransportMode::Microscope).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn proxy_connect_is_used_and_timed() {
+    proxy_connect_is_used_and_timed_with(TransportMode::Opendal).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn proxy_connect_is_used_and_timed_microscope() {
+    proxy_connect_is_used_and_timed_with(TransportMode::Microscope).await;
 }

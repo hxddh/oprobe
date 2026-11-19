@@ -28,7 +28,7 @@ Archives contain `oprobe` (`oprobe.exe`), `README.md`, `LICENSE`, `CHANGELOG.md`
 ## From source
 
 ```bash
-cargo install oprobe --locked     # Rust ≥ 1.91; pure Rust, no C compiler or OpenSSL needed
+cargo install oprobe --locked     # Rust ≥ 1.91 and a C compiler (for aws-lc, the TLS crypto); no OpenSSL
 ```
 
 ## Homebrew

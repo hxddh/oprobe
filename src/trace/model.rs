@@ -155,12 +155,17 @@ impl RequestRecord {
 /// Classify an HTTP request into a storage API from method, path and query.
 pub fn classify_http(method: &http::Method, path: &str, query: Option<&str>) -> Api {
     use http::Method;
+    // Runs once per backend request: no allocation unless the path has upper-case letters.
     let q = query.unwrap_or_default();
     let has = |k: &str| {
         q.split('&')
-            .any(|p| p == k || p.starts_with(&format!("{k}=")))
+            .any(|p| p.split_once('=').map_or(p, |(name, _)| name) == k)
     };
-    let path_l = path.to_ascii_lowercase();
+    let path_l: std::borrow::Cow<'_, str> = if path.bytes().any(|b| b.is_ascii_uppercase()) {
+        std::borrow::Cow::Owned(path.to_ascii_lowercase())
+    } else {
+        std::borrow::Cow::Borrowed(path)
+    };
 
     // Backblaze B2 native API.
     if path_l.contains("/b2api/") {

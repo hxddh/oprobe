@@ -33,7 +33,9 @@ pub fn rust_snippet(scheme: &str, k: &Knobs) -> String {
         HttpVersion::H1 => {
             "\n// Tuned for HTTP/1.1: configure your HTTP client with `http1_only()`."
         }
-        HttpVersion::H2 => "\n// Tuned for HTTP/2: make sure your HTTP client negotiates h2.",
+        HttpVersion::H2 => {
+            "\n// Tuned for HTTP/2: OpenDAL's reqwest client speaks HTTP/1.1 unless your crate enables\n// reqwest's `http2` feature (reqwest = { version = \"0.13\", features = [\"http2\"] })."
+        }
         HttpVersion::Auto => "",
     };
     format!(

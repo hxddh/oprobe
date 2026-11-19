@@ -13,14 +13,58 @@ it is captured, and the known limits.
    ├─ cache layer          → cache lookups/hits, lookup time
    ├─ retry / timeout / tail-cut layers → retry count, backoff (RetryLayer notify)
    ├─ service (s3, gcs, azblob, …)
-   └─ HTTP transport  ◀── oprobe's own: connection pool + dialer + instrumented sockets
+   └─ HTTP transport
+         default:      OpenDAL's own reqwest client, observed through its extension points
+         --microscope: oprobe's instrumented connection pool
          queue → [dns → tcp → proxy CONNECT → tls] → send → ttfb → transfer (+ consumer stall)
 ```
 
-* **Transport.** oprobe replaces OpenDAL's HTTP client with its own transport built on hyper's
-  low-level HTTP/1.1 and HTTP/2 connections, rustls and its own connection pool. Because oprobe owns
-  the pool, it knows *exactly* whether a request reused a connection or dialed a new one, and the
-  dial phases belong to the request that waited for them.
+### Two transports: production fidelity vs. microscope
+
+Tuning results are only useful if they were measured on the client you deploy. By default oprobe
+therefore sends every request through **OpenDAL's own HTTP client** — reqwest 0.13 with rustls and
+aws-lc-rs, configured exactly as `opendal-http-transport-reqwest` builds it (HTTP/1.1, environment
+proxies, platform certificate verifier) — and observes it only through reqwest's public extension
+points:
+
+| Signal | How it is captured (default mode) |
+|---|---|
+| DNS | a timed resolver on the same `getaddrinfo` path as reqwest's default resolver |
+| TCP / proxy / TLS | a connector layer times each dial; a delegating TLS session store timestamps the ClientHello, which splits TCP (or TCP + proxy CONNECT) from the TLS handshake; the TLS version comes from the key-schedule labels (no secrets are read) |
+| Cold vs warm | the connection's local address (`HttpInfo`): the first request seen on a connection is the cold one and carries that connection's dial |
+| Send / TTFB / transfer / stall | the request body reports when its last byte was handed over; response headers and body chunks are timed as they arrive and as your code consumes them |
+
+`--microscope` (or `transport = "microscope"`) switches to oprobe's own pool built on hyper's
+low-level HTTP/1.1 and HTTP/2 connections. It sees more — time spent waiting for a pooled
+connection or an HTTP/2 stream as **queue**, proxy CONNECT separately from TCP, the TLS cipher, the
+exact connection a dial was made for — but it is a different client:
+
+| Default (OpenDAL's client) | `--microscope` (oprobe's pool) |
+|---|---|
+| Results transfer to production as-is | Results describe oprobe's pool, not your client |
+| Waiting for a pooled connection / HTTP/2 stream is part of TTFB | Shown as queue time |
+| Proxy CONNECT reported together with TCP to the proxy | Proxy CONNECT timed on its own |
+| HTTP/1.1 unless `http = "h2"` (OpenDAL builds reqwest without `http2`) | ALPN negotiates h2 for https by default |
+
+### Observer effect
+
+`cargo run --release --example overhead` runs the same workload against a local TLS lab through
+plain OpenDAL (its default client plus the same timeout/retry layers oprobe applies), oprobe's
+default mode and `--microscope`. On a 4-core Linux VM with the lab server in the same process
+(medians of 3 × 3 s, repeated twice):
+
+| Workload | plain OpenDAL | oprobe default | `--microscope` |
+|---|---|---|---|
+| 16 KiB GETs, 32 concurrent | ~24–25 k ops/s | 9–18 % fewer ops/s | 8–14 % *more* ops/s |
+| 4 MiB GETs, 16 concurrent | ~5.7–6.5 GiB/s | within noise (±8 %) | within noise |
+
+Small requests at tens of thousands per second over loopback are the worst case: oprobe's
+bookkeeping is ~0.5 µs per operation, and the rest is contention on shared aggregation state when
+every request takes microseconds. Against real storage (milliseconds per request) the effect is
+negligible. The microscope row is also the reason it is not the default: its pool is 20–29 %
+faster than OpenDAL's client on this benchmark, so it would make your storage look faster than
+your application will see it.
+
 * **Scope propagation.** A logical operation (e.g. one Parquet query) runs inside an `OpScope`.
   OpenDAL's concurrent readers/writers spawn background tasks; oprobe wraps OpenDAL's executor so
   those tasks inherit the scope. Every request is therefore attributed to the operation that caused
@@ -91,8 +135,9 @@ connect / upload / server / download in proportion to the measured request-stage
 The eight slowest operations of the window are kept with their complete request lists. While
 operations run, oprobe samples [await-tree](https://github.com/risingwavelabs/await-tree) call
 stacks every 20 ms for those slower than the current p90 (≥ 2 ms), including OpenDAL background
-sub-tasks — so you can see e.g. `opendal::read → http::checkout → proxy CONNECT` for a stuck
-operation. Request IDs (`x-amz-request-id`, `x-ms-request-id`, …) are kept for support tickets.
+sub-tasks — so you can see e.g. `read.full → [sub-task 0] → GetObject → http::dial` for a stuck
+operation. OpenDAL's own `AwaitTreeLayer` is deliberately not used: it wraps every call and every
+read chunk and cost about 14 % throughput on small requests. Request IDs (`x-amz-request-id`, `x-ms-request-id`, …) are kept for support tickets.
 
 ## Client resources
 

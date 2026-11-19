@@ -5,12 +5,12 @@ use std::sync::{Arc, Once};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use opendal::layers::{AwaitTreeLayer, RetryLayer, TailCutLayer, TimeoutLayer};
+use opendal::layers::{RetryLayer, TailCutLayer, TimeoutLayer};
 use opendal::Operator;
 
-use crate::config::{Knobs, TargetSpec};
+use crate::config::{Knobs, TargetSpec, TransportMode};
 use crate::layers::{InProcessObserveLayer, TraceContextLayer, WhiteboxCacheLayer};
-use crate::net::{HttpVersion, TlsClientOptions, TracingTransport, TransportConfig};
+use crate::net::{FidelityTransport, TlsClientOptions, TracingTransport, TransportConfig};
 use crate::trace::{OpScope, Recorder};
 
 static REGISTRY: Once = Once::new();
@@ -56,22 +56,43 @@ pub fn proxy_setting(target: &TargetSpec) -> Option<Option<String>> {
     }
 }
 
+pub fn transport_config(target: &TargetSpec, knobs: &Knobs) -> Result<TransportConfig> {
+    Ok(TransportConfig {
+        http: knobs.http_version,
+        keep_alive: knobs.keep_alive,
+        max_inflight: (knobs.max_inflight_requests > 0).then_some(knobs.max_inflight_requests),
+        tls: tls_options(target)?,
+        proxy: proxy_setting(target),
+        ..Default::default()
+    })
+}
+
+/// oprobe's instrumented connection pool (`--microscope`).
 pub fn transport(
     target: &TargetSpec,
     knobs: &Knobs,
     recorder: Option<Arc<Recorder>>,
 ) -> Result<TracingTransport> {
-    TracingTransport::new(
-        TransportConfig {
-            http: knobs.http_version,
-            keep_alive: knobs.keep_alive,
-            max_inflight: (knobs.max_inflight_requests > 0).then_some(knobs.max_inflight_requests),
-            tls: tls_options(target)?,
-            proxy: proxy_setting(target),
-            ..Default::default()
-        },
-        recorder,
-    )
+    TracingTransport::new(transport_config(target, knobs)?, recorder)
+}
+
+/// The tracing layer for the configured transport mode.
+pub fn trace_layer(
+    target: &TargetSpec,
+    knobs: &Knobs,
+    recorder: Option<Arc<Recorder>>,
+) -> Result<TraceContextLayer> {
+    Ok(match knobs.transport {
+        TransportMode::Microscope => TraceContextLayer::new(transport(target, knobs, recorder)?),
+        TransportMode::Opendal => {
+            let https = target.endpoint().is_none_or(|e| e.starts_with("https"));
+            TraceContextLayer::new(FidelityTransport::new(
+                transport_config(target, knobs)?,
+                https,
+                recorder,
+            )?)
+        }
+    })
 }
 
 /// Instrumented operator: every request is traced into `recorder`.
@@ -86,11 +107,7 @@ pub fn measured_operator(
     if !target.is_network() {
         op = op.layer(InProcessObserveLayer::new(recorder.clone()));
     }
-    op = op.layer(TraceContextLayer::new(transport(
-        target,
-        knobs,
-        Some(recorder.clone()),
-    )?));
+    op = op.layer(trace_layer(target, knobs, Some(recorder.clone()))?);
     op = op.layer(
         TimeoutLayer::new()
             .with_timeout(knobs.timeout.get())
@@ -132,9 +149,11 @@ pub fn measured_operator(
                 }),
         );
     }
-    if tree_registry.is_some() {
-        op = op.layer(AwaitTreeLayer::new());
-    }
+    // Async call stacks: operations are registered as await-tree roots by the runner, OpenDAL
+    // sub-tasks by `ScopePropagatingExecutor`, and the transports add zero-allocation spans per
+    // request. OpenDAL's `AwaitTreeLayer` is not used: it wraps every call and read chunk and
+    // cost ~14% throughput on small requests (examples/overhead.rs).
+    let _ = tree_registry;
     if knobs.cache {
         op = op.layer(WhiteboxCacheLayer::new(knobs.cache_size.as_u64()));
     }
@@ -144,13 +163,10 @@ pub fn measured_operator(
 
 /// Untraced operator for dataset seeding, verification and cleanup.
 pub fn admin_operator(base: &Operator, target: &TargetSpec) -> Result<Operator> {
-    let knobs = Knobs {
-        http_version: HttpVersion::Auto,
-        ..Knobs::default()
-    };
+    let knobs = Knobs::default();
     Ok(base
         .clone()
-        .layer(TraceContextLayer::new(transport(target, &knobs, None)?))
+        .layer(trace_layer(target, &knobs, None)?)
         .layer(
             TimeoutLayer::new()
                 .with_timeout(Duration::from_secs(300))

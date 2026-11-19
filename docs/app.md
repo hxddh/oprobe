@@ -48,12 +48,11 @@ The window and the terminal UI are the same NSH app; `oprobe top` simply starts 
 oprobe top s3://my-bucket/oprobe --preset parquet -c 32     # == oprobe-app --tui s3://... --preset parquet -c 32
 ```
 
-The architecture is deliberately two-layered: **OpenDAL + oprobe's own pure-Rust transport** (the `oprobe` crate:
+The architecture is deliberately two-layered: **OpenDAL and its own HTTP client, observed request by request** (the `oprobe` crate:
 measurement, tuner, reports, CLI) and **NSH** (the `oprobe-app` crate: every UI). Nothing else is a framework.
 NSH is built with only what the app uses (`plot`); its JS engine, WebGPU shaders, network loader, updater, math,
 crypto and media features are off. `oprobe-app` needs Rust ≥ 1.97 and, on Linux, GTK 4; NSH's terminal backend
-currently always compiles its syntax highlighter (a small C regex library), which is why the UI lives in its own crate
-and `cargo install oprobe` stays pure Rust.
+currently always compiles its syntax highlighter (a small C regex library).
 
 ## Building from source
 

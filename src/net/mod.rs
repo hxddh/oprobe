@@ -2,11 +2,13 @@
 //! the stand-alone handshake probe.
 
 pub mod dial;
+pub mod fidelity;
 pub mod probe;
 pub mod proxy;
 pub mod tls;
 pub mod transport;
 
+pub use fidelity::FidelityTransport;
 pub use proxy::ProxyConfig;
 pub use tls::TlsClientOptions;
 pub use transport::{HttpVersion, TracingTransport, TransportConfig};

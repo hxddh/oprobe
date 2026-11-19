@@ -1,4 +1,5 @@
-//! Pure-Rust TLS 1.2/1.3 client & server configuration (rustls + RustCrypto provider, no C deps).
+//! TLS 1.2/1.3 client & server configuration: rustls with the aws-lc-rs provider — the same
+//! crypto OpenDAL's default reqwest client uses, so TLS CPU cost matches production.
 
 use std::sync::{Arc, OnceLock};
 
@@ -13,10 +14,10 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 static CRYPTO_PROVIDER: OnceLock<Arc<CryptoProvider>> = OnceLock::new();
 static SYSTEM_ROOT_CERTS: OnceLock<Vec<CertificateDer<'static>>> = OnceLock::new();
 
-/// Return the shared pure-Rust `rustls::crypto::CryptoProvider`.
-pub fn pure_rust_crypto_provider() -> Arc<CryptoProvider> {
+/// Return the shared `rustls::crypto::CryptoProvider` (aws-lc-rs).
+pub fn crypto_provider() -> Arc<CryptoProvider> {
     CRYPTO_PROVIDER
-        .get_or_init(|| Arc::new(oxitls_rustcrypto_provider::provider()))
+        .get_or_init(|| Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
         .clone()
 }
 
@@ -66,8 +67,8 @@ pub fn build_root_store(extra_ca_pem: Option<&str>) -> Result<RootCertStore> {
 }
 
 #[derive(Debug)]
-struct InsecureCertVerifier {
-    provider: Arc<CryptoProvider>,
+pub(crate) struct InsecureCertVerifier {
+    pub(crate) provider: Arc<CryptoProvider>,
 }
 
 impl ServerCertVerifier for InsecureCertVerifier {
@@ -119,7 +120,7 @@ impl ServerCertVerifier for InsecureCertVerifier {
 
 /// Build a `tokio_rustls::TlsConnector` from [`TlsClientOptions`].
 pub fn build_tls_connector(opts: &TlsClientOptions) -> Result<TlsConnector> {
-    let provider = pure_rust_crypto_provider();
+    let provider = crypto_provider();
     let builder = ClientConfig::builder_with_provider(provider.clone())
         .with_safe_default_protocol_versions()
         .context("failed to configure TLS 1.2/1.3 protocol versions")?;
@@ -140,7 +141,7 @@ pub fn build_tls_connector(opts: &TlsClientOptions) -> Result<TlsConnector> {
 
 /// Build a `tokio_rustls::TlsAcceptor` from PEM-encoded certificate chain and PKCS#8 private key.
 pub fn build_tls_acceptor(cert_pem: &str, key_pem: &str, enable_h2: bool) -> Result<TlsAcceptor> {
-    let provider = pure_rust_crypto_provider();
+    let provider = crypto_provider();
     let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
         .collect::<std::result::Result<Vec<_>, _>>()
         .context("failed to parse server certificate PEM")?;

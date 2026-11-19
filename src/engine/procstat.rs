@@ -1,5 +1,5 @@
-//! Client process CPU time and memory from the OS, without extra crates: `getrusage` on Unix,
-//! `GetProcessTimes` / `K32GetProcessMemoryInfo` on Windows.
+//! Client process CPU time and memory: `getrusage` on Unix, `GetProcessTimes` /
+//! `GetProcessMemoryInfo` on Windows.
 
 use std::time::{Duration, Instant};
 
@@ -13,83 +13,62 @@ pub struct Usage {
 
 #[cfg(unix)]
 pub fn usage() -> Option<Usage> {
-    // `struct rusage` starts with two `struct timeval` (16 bytes each on 64-bit Unix) followed by
-    // `long` counters, `ru_maxrss` first. 18 words cover the whole struct on Linux and macOS.
-    #[repr(C)]
-    struct RUsage([i64; 18]);
-    unsafe extern "C" {
-        fn getrusage(who: i32, usage: *mut RUsage) -> i32;
-    }
-    if std::mem::size_of::<usize>() != 8 {
-        return None;
-    }
-    let mut r = RUsage([0; 18]);
-    // SAFETY: RUSAGE_SELF (0) fills a `struct rusage`, which fits in the buffer.
-    if unsafe { getrusage(0, &mut r) } != 0 {
-        return None;
-    }
-    let tv = |sec: i64, usec: i64| {
-        // `tv_usec` is 32-bit on macOS; mask the padding.
-        Duration::from_secs(sec.max(0) as u64) + Duration::from_micros((usec & 0xFFFF_FFFF) as u64)
+    // SAFETY: getrusage(RUSAGE_SELF) fills the zero-initialised struct it is given.
+    let r = unsafe {
+        let mut r: libc::rusage = std::mem::zeroed();
+        if libc::getrusage(libc::RUSAGE_SELF, &mut r) != 0 {
+            return None;
+        }
+        r
     };
-    let cpu = tv(r.0[0], r.0[1]) + tv(r.0[2], r.0[3]);
-    let maxrss = r.0[4].max(0) as u64;
+    let tv = |t: libc::timeval| {
+        Duration::from_secs(t.tv_sec.max(0) as u64) + Duration::from_micros(t.tv_usec.max(0) as u64)
+    };
+    let maxrss = r.ru_maxrss.max(0) as u64;
+    // ru_maxrss is bytes on Apple platforms, KiB elsewhere.
     let rss_bytes = if cfg!(target_vendor = "apple") {
         maxrss
     } else {
         maxrss * 1024
     };
-    Some(Usage { cpu, rss_bytes })
+    Some(Usage {
+        cpu: tv(r.ru_utime) + tv(r.ru_stime),
+        rss_bytes,
+    })
 }
 
 #[cfg(windows)]
 pub fn usage() -> Option<Usage> {
-    #[repr(C)]
-    #[derive(Default, Clone, Copy)]
-    struct FileTime(u32, u32);
-    #[repr(C)]
-    #[derive(Default)]
-    struct MemCounters {
-        cb: u32,
-        page_fault_count: u32,
-        peak_working_set: usize,
-        working_set: usize,
-        quota_peak_paged: usize,
-        quota_paged: usize,
-        quota_peak_nonpaged: usize,
-        quota_nonpaged: usize,
-        pagefile: usize,
-        peak_pagefile: usize,
-    }
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn GetCurrentProcess() -> isize;
-        fn GetProcessTimes(
-            h: isize,
-            creation: *mut FileTime,
-            exit: *mut FileTime,
-            kernel: *mut FileTime,
-            user: *mut FileTime,
-        ) -> i32;
-        fn K32GetProcessMemoryInfo(h: isize, c: *mut MemCounters, cb: u32) -> i32;
-    }
-    let (mut c, mut e, mut k, mut u) = Default::default();
-    let mut m = MemCounters {
-        cb: std::mem::size_of::<MemCounters>() as u32,
-        ..Default::default()
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::ProcessStatus::{
+        GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
     };
-    // SAFETY: plain Win32 calls on the current-process pseudo handle with valid out-pointers.
-    unsafe {
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+    let zero = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let (mut c, mut e, mut k, mut u) = (zero, zero, zero, zero);
+    // SAFETY: Win32 calls on the current-process pseudo handle with valid out-pointers.
+    let mem = unsafe {
         let h = GetCurrentProcess();
         if GetProcessTimes(h, &mut c, &mut e, &mut k, &mut u) == 0 {
             return None;
         }
-        K32GetProcessMemoryInfo(h, &mut m, m.cb);
-    }
-    let ft = |t: FileTime| Duration::from_nanos((((t.1 as u64) << 32) | t.0 as u64) * 100);
+        let mut m: PROCESS_MEMORY_COUNTERS = std::mem::zeroed();
+        m.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+        if GetProcessMemoryInfo(h, &mut m, m.cb) != 0 {
+            m.WorkingSetSize as u64
+        } else {
+            0
+        }
+    };
+    let ft = |t: FILETIME| {
+        Duration::from_nanos((((t.dwHighDateTime as u64) << 32) | t.dwLowDateTime as u64) * 100)
+    };
     Some(Usage {
         cpu: ft(k) + ft(u),
-        rss_bytes: m.working_set as u64,
+        rss_bytes: mem,
     })
 }
 

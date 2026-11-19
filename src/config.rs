@@ -443,6 +443,25 @@ impl WorkloadSpec {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TransportMode {
+    /// OpenDAL's default HTTP client (reqwest), observed through its extension points.
+    #[default]
+    Opendal,
+    /// oprobe's own instrumented connection pool.
+    Microscope,
+}
+
+impl TransportMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Opendal => "opendal",
+            Self::Microscope => "microscope",
+        }
+    }
+}
+
 /// Client-side configuration under test / being tuned.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -464,6 +483,11 @@ pub struct Knobs {
     pub max_inflight_requests: usize,
     #[serde(default)]
     pub http_version: HttpVersion,
+    /// How requests are made and observed: `opendal` = OpenDAL's own reqwest client (what
+    /// production runs; the default), `microscope` = oprobe's instrumented connection pool
+    /// (exact queue / per-dial phases / HTTP/2 streams, but a different client).
+    #[serde(default)]
+    pub transport: TransportMode,
     #[serde(default = "default_true")]
     pub keep_alive: bool,
     /// In-memory read cache.
@@ -513,6 +537,7 @@ impl Default for Knobs {
             range_gap: default_gap(),
             max_inflight_requests: 0,
             http_version: HttpVersion::Auto,
+            transport: TransportMode::Opendal,
             keep_alive: true,
             cache: false,
             cache_size: default_cache_size(),
@@ -526,7 +551,7 @@ impl Default for Knobs {
 impl Knobs {
     pub fn summary(&self) -> String {
         format!(
-            "concurrency={} io={} chunk={} gap={} inflight={} http={:?} keep-alive={} cache={} retries={}{}",
+            "concurrency={} io={} chunk={} gap={} inflight={} http={:?} keep-alive={} cache={} retries={}{}{}",
             self.concurrency,
             self.io_concurrency,
             self.chunk_size,
@@ -537,6 +562,7 @@ impl Knobs {
             if self.cache { self.cache_size.to_string() } else { "off".into() },
             self.retries,
             if self.tail_cut { " tail-cut" } else { "" },
+            if self.transport == TransportMode::Microscope { " (microscope)" } else { "" },
         )
         .to_ascii_lowercase()
     }

@@ -10,10 +10,13 @@ oprobe 2.0 is a rewrite. Everything reported is measured per request; nothing is
 
 ### Highlights
 
-- **Request-level white-box tracing.** A new pure-Rust HTTP transport (hyper + rustls) with its own
-  connection pool replaces OpenDAL's client. Every backend request records queue wait, DNS, TCP,
-  proxy CONNECT and TLS (only when it dialed), request send, TTFB, transfer and consumer stall, plus
-  status, connection id, cold/warm, bytes and the provider's request ID.
+- **Request-level white-box tracing of the client you deploy.** Requests go through OpenDAL's own
+  HTTP client (reqwest + rustls/aws-lc-rs, configured as OpenDAL builds it), observed through
+  reqwest's extension points: every backend request records DNS, TCP, proxy and TLS (when it
+  dialed), request send, TTFB, transfer and consumer stall, plus status, connection, cold/warm, bytes
+  and the provider's request ID. `--microscope` switches to oprobe's own instrumented connection pool
+  for pool queueing, per-dial proxy timing and HTTP/2 stream detail. The observer effect is measured
+  (`examples/overhead.rs`) and documented.
 - **Exact attribution through OpenDAL.** A scope follows each logical operation through OpenDAL's
   layers and into its background tasks (concurrent readers/writers), and each operation's wall time
   is split exactly into queue / cache / backend / client by sweeping its request intervals.
@@ -42,9 +45,7 @@ oprobe 2.0 is a rewrite. Everything reported is measured per request; nothing is
   with live charts, time breakdown, per-API tables, cost and a request waterfall of the slowest operation; tuner
   with apply/save; endpoint probe. Shipped as `.dmg`, `.msi` / `.zip` and a Linux tarball with a `.desktop` entry,
   and on crates.io (`cargo install oprobe-app`). `oprobe top` opens it in the terminal.
-- **Two-layer architecture.** OpenDAL plus oprobe's own pure-Rust transport for measurement; NSH for every UI.
-  The `oprobe` crate carries no UI framework and no helper crates that a few lines of std can replace (own LRU
-  cache, CRC-32C, UTC time, process CPU sampling).
+- **Two-layer architecture.** OpenDAL and its own HTTP client for measurement; NSH for every UI.
 - **Native distribution.** Release archives named `oprobe-<version>-<target>`, static Linux musl
   builds, `.deb`, `.rpm`, macOS universal binary and `.pkg`, Windows `.msi` (x64 and ARM64),
   Homebrew formula, Scoop manifest, checksum-verifying install scripts, `SHA256SUMS`.

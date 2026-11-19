@@ -45,7 +45,7 @@ AppKit on macOS, Win32/Direct2D on Windows, GTK 4 on Linux, and the same UI in a
 Run, tune and probe from forms; watch live charts; inspect the slowest operation as a request waterfall.
 `oprobe top` opens it in the terminal. [More →](docs/app.md)
 
-The architecture has two layers and no other frameworks: **OpenDAL + oprobe's pure-Rust transport** for everything that
+The architecture has two layers and no other frameworks: **OpenDAL and its own HTTP client, observed request by request** for everything that
 measures, and **NSH** for everything you look at.
 
 ![oprobe-app: slowest operation waterfall](docs/images/app-slowest-op.png)
@@ -82,7 +82,7 @@ next questions directly from measurements — never from estimates:
 
 Release archives (`oprobe-<version>-<target>.tar.gz` / `.zip`) include man pages, shell completions
 (bash, zsh, fish, PowerShell, elvish) and example profiles. Every asset is listed in `SHA256SUMS`.
-oprobe is pure Rust — no OpenSSL, no C toolchain — and the Linux musl builds are fully static.
+oprobe needs no OpenSSL or system libraries at run time, and the Linux musl builds are fully static.
 
 ## Quick start
 
@@ -149,13 +149,15 @@ Use `--existing <prefix>` to benchmark objects you already have, read-only. See
 
 ## How it works
 
-oprobe installs its own HTTP transport (hyper + rustls, pure Rust) into OpenDAL and wraps it with
-a scope that follows each logical operation through OpenDAL's layers **and** its background tasks
-(concurrent readers/writers). Each request records sequential, non-overlapping stages; each
-operation's wall time is attributed by sweeping its request intervals. Connections are pooled by
-oprobe itself, so "cold" vs "warm" is exact, as are dial phases and in-flight caps. Nothing is
-estimated or simulated. Details and caveats (e.g. HTTP/2 multiplexing) are in
-[docs/metrics.md](docs/metrics.md).
+By default every request goes through **OpenDAL's own HTTP client** (reqwest + rustls/aws-lc-rs,
+configured as OpenDAL builds it), so what you measure and tune is what your application runs.
+oprobe observes it through reqwest's public extension points (a timed resolver, a connector layer,
+a TLS session-store hook, the connection's identity) and follows each logical operation through
+OpenDAL's layers **and** its background tasks. Each request records sequential, non-overlapping
+stages; each operation's wall time is attributed by sweeping its request intervals.
+`--microscope` swaps in oprobe's own instrumented connection pool when you need pool queueing,
+per-dial proxy timing or HTTP/2 stream detail. Nothing is estimated or simulated; methodology,
+the observer effect and caveats are in [docs/metrics.md](docs/metrics.md).
 
 ## License
 

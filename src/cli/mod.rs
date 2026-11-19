@@ -70,7 +70,7 @@ pub fn print_error(err: &anyhow::Error, scheme: &str) {
 }
 
 /// `oprobe top` is the NSH app's terminal UI (`oprobe-app --tui`): one UI toolkit for the
-/// window and the terminal, while this crate stays pure Rust.
+/// window and the terminal.
 fn cmd_top(a: TopArgs) -> Result<ExitCode> {
     let exe = if cfg!(windows) {
         "oprobe-app.exe"
@@ -282,6 +282,9 @@ pub fn build_profile(
     }
     if k.no_keep_alive {
         kn.keep_alive = false;
+    }
+    if k.microscope {
+        kn.transport = crate::config::TransportMode::Microscope;
     }
     if let Some(sz) = &k.cache {
         kn.cache = true;

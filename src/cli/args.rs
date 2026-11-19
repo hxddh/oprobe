@@ -185,6 +185,11 @@ pub struct KnobArgs {
     /// Open a new connection for every request
     #[arg(long)]
     pub no_keep_alive: bool,
+    /// Use oprobe's instrumented connection pool instead of OpenDAL's own HTTP client:
+    /// exact pool queueing, per-dial DNS/TCP/proxy/TLS and HTTP/2 streams, at the cost of
+    /// measuring a different client than production runs
+    #[arg(long)]
+    pub microscope: bool,
     /// Enable the in-memory read cache with this size (e.g. 512MiB)
     #[arg(long, value_name = "SIZE")]
     pub cache: Option<String>,
