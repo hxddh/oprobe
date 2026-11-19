@@ -1,0 +1,27 @@
+<!-- WiX v4: the oprobe desktop app, per-machine, with a Start menu shortcut. -->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="oprobe (desktop app)" Manufacturer="oprobe contributors" Version="$(var.Version)"
+           UpgradeCode="0B5E7D2C-4A91-4C6E-8F3B-5D2A1E9C7B64" Scope="perMachine" Compressed="yes">
+    <MajorUpgrade DowngradeErrorMessage="A newer version of oprobe is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+    <Icon Id="AppIcon" SourceFile="$(var.BinDir)\oprobe.ico" />
+    <Property Id="ARPPRODUCTICON" Value="AppIcon" />
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="oprobe App" />
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder" />
+    <ComponentGroup Id="Main" Directory="INSTALLFOLDER">
+      <Component Id="AppExe" Guid="9D7C1E2A-6B4F-4A1D-8E3C-2F5B7A9D1C03">
+        <File Id="oprobeapp.exe" Source="$(var.BinDir)\oprobe-app.exe" KeyPath="yes">
+          <Shortcut Id="StartMenuShortcut" Directory="ProgramMenuFolder" Name="oprobe"
+                    Description="See which layer makes object-storage I/O slow or expensive"
+                    WorkingDirectory="INSTALLFOLDER" Icon="AppIcon" Advertise="yes" />
+        </File>
+        <File Source="$(var.BinDir)\LICENSE.txt" />
+      </Component>
+    </ComponentGroup>
+    <Feature Id="Complete" Title="oprobe desktop app" Level="1">
+      <ComponentGroupRef Id="Main" />
+    </Feature>
+  </Package>
+</Wix>

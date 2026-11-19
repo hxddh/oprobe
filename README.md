@@ -9,7 +9,7 @@ request, waiting for the first byte, transferring the body, and waiting for your
 it. It then tells you where the time and the money go, finds the best client configuration
 without tripping 429/503 throttling, and turns it all into a CI regression gate.
 
-[中文文档](README.zh-CN.md) · [Metrics & methodology](docs/metrics.md) · [Workloads & profiles](docs/workloads.md) · [Tuning](docs/tuning.md) · [CI gate](docs/ci.md) · [Cost model](docs/cost.md) · [Troubleshooting](docs/troubleshooting.md)
+[中文文档](README.zh-CN.md) · [Desktop app](docs/app.md) · [Metrics & methodology](docs/metrics.md) · [Workloads & profiles](docs/workloads.md) · [Tuning](docs/tuning.md) · [CI gate](docs/ci.md) · [Cost model](docs/cost.md) · [Troubleshooting](docs/troubleshooting.md)
 
 ```text
 $ oprobe run s3://noaa-ghcn-pds --anonymous --existing csv.gz/ --preset mixed -d 8s -c 8
@@ -37,6 +37,15 @@ SLOWEST OPERATION
         [sub-task 0] opendal::background_task → opendal::read → http::checkout → proxy CONNECT s3.us-east-1.amazonaws.com:443
 ```
 *(real output, trimmed: AWS S3 through a corporate egress proxy)*
+
+## Desktop & terminal app
+
+`oprobe-app` puts the same engine behind a native UI built with [Native Shell (NSH)](https://github.com/longbridge/nsh):
+AppKit on macOS, Win32/Direct2D on Windows, GTK 4 on Linux, and the same UI in any terminal (`oprobe-app --tui`).
+Run, tune and probe from forms; watch live charts; inspect the slowest operation as a request waterfall.
+[More →](docs/app.md)
+
+![oprobe-app: slowest operation waterfall](docs/images/app-slowest-op.png)
 
 ## Why oprobe
 
@@ -66,6 +75,7 @@ next questions directly from measurements — never from estimates:
 | Windows (installer) | `oprobe-<version>-x64.msi` / `-arm64.msi` — adds `oprobe` to `PATH` |
 | Windows (Scoop) | `scoop install https://github.com/hxddh/oprobe/releases/latest/download/oprobe.json` |
 | Windows (PowerShell) | `irm https://github.com/hxddh/oprobe/releases/latest/download/install.ps1 \| iex` |
+| **Desktop app** | macOS `oprobe-app-<version>-macos-universal.dmg` · Windows `oprobe-app-<version>-x64.msi` · Linux `oprobe-app-<version>-x86_64-unknown-linux-gnu.tar.gz` |
 
 Release archives (`oprobe-<version>-<target>.tar.gz` / `.zip`) include man pages, shell completions
 (bash, zsh, fish, PowerShell, elvish) and example profiles. Every asset is listed in `SHA256SUMS`.

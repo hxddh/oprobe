@@ -7,7 +7,19 @@ MinIO 及本地存储施加真实业务负载，并在传输层追踪**每一个
 DNS / TCP / 代理 CONNECT / TLS、请求发送、首字节等待（TTFB）、响应体传输，以及数据等待应用消费的时间。
 随后告诉你时间和钱花在哪里，在不触发 429/503 限流的前提下找出最优客户端配置，并把这一切变成 CI 回归门禁。
 
-[English](README.md) · [指标与方法](docs/metrics.md) · [负载与 Profile](docs/workloads.md) · [调优](docs/tuning.md) · [CI 门禁](docs/ci.md) · [成本模型](docs/cost.md) · [故障排查](docs/troubleshooting.md) · [安装](docs/install.md)
+[English](README.md) · [桌面应用](docs/app.md) · [指标与方法](docs/metrics.md) · [负载与 Profile](docs/workloads.md) · [调优](docs/tuning.md) · [CI 门禁](docs/ci.md) · [成本模型](docs/cost.md) · [故障排查](docs/troubleshooting.md) · [安装](docs/install.md)
+
+## 桌面与终端应用
+
+`oprobe-app` 用 [Native Shell (NSH)](https://github.com/longbridge/nsh) 为同一套引擎提供原生界面：macOS 使用 AppKit、
+Windows 使用 Win32/Direct2D、Linux 使用 GTK 4，同一套 UI 也能在任意终端中运行（`oprobe-app --tui`）。
+可通过表单运行、调优和探测，查看实时曲线，并以请求瀑布图审视最慢的操作。[详情 →](docs/app.md)
+
+![oprobe-app：最慢操作瀑布图](docs/images/app-slowest-op.png)
+
+> 关于 TUI：NSH 的终端后端可以渲染整套应用（`oprobe-app --tui`）。CLI 内置的 `oprobe top` 仍保留纯 ratatui 实现，
+> 因为 NSH 终端后端目前会引入 C 代码（语法高亮的正则引擎）并要求 Rust 1.97，放进主包会破坏纯 Rust 的
+> `cargo install oprobe`。详见 [docs/app.md](docs/app.md)。
 
 ## 它回答的问题
 
@@ -33,6 +45,7 @@ DNS / TCP / 代理 CONNECT / TLS、请求发送、首字节等待（TTFB）、�
 | Windows 安装器 | `oprobe-<版本>-x64.msi` / `-arm64.msi`，自动加入 `PATH` |
 | Windows Scoop | `scoop install https://github.com/hxddh/oprobe/releases/latest/download/oprobe.json` |
 | Homebrew | 每个 Release 附带 `oprobe.rb`，见 [docs/install.md](docs/install.md) |
+| **桌面应用** | macOS `oprobe-app-<版本>-macos-universal.dmg` · Windows `oprobe-app-<版本>-x64.msi` · Linux `oprobe-app-<版本>-x86_64-unknown-linux-gnu.tar.gz` |
 
 纯 Rust 实现，无 OpenSSL、无 C 工具链依赖；Linux musl 版本为完全静态链接。压缩包内含 man 手册、
 bash/zsh/fish/PowerShell/elvish 补全脚本与示例 Profile，所有产物的校验和见 `SHA256SUMS`。

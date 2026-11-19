@@ -37,6 +37,10 @@ oprobe 2.0 is a rewrite. Everything reported is measured per request; nothing is
   server), `cleanup` (sweeper with dry-run), `init`, `report`, `completions`, man pages.
 - **Egress proxy support.** `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` / `NO_PROXY` with HTTP CONNECT
   tunnelling (incl. basic auth) and timed proxy handshakes; `--proxy` / `--proxy none`.
+- **Desktop & terminal app (`oprobe-app`).** A Native Shell (NSH) app over the same engine: native windows on
+  macOS (AppKit), Windows (Win32/Direct2D) and Linux (GTK 4), and the same UI in a terminal (`--tui`). Workbench
+  with live charts, time breakdown, per-API tables, cost and a request waterfall of the slowest operation; tuner
+  with apply/save; endpoint probe. Shipped as `.dmg`, `.msi` / `.zip` and a Linux tarball with a `.desktop` entry.
 - **Native distribution.** Release archives named `oprobe-<version>-<target>`, static Linux musl
   builds, `.deb`, `.rpm`, macOS universal binary and `.pkg`, Windows `.msi` (x64 and ARM64),
   Homebrew formula, Scoop manifest, checksum-verifying install scripts, `SHA256SUMS`.

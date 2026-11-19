@@ -1,0 +1,56 @@
+[package]
+name = "oprobe-app"
+version = "2.0.0"
+edition = "2024"
+rust-version = "1.97"
+license = "Apache-2.0"
+description = "oprobe desktop and terminal app (Native Shell): native windows on macOS, Windows and Linux, and a terminal UI"
+repository = "https://github.com/hxddh/oprobe"
+publish = false
+
+# A workspace of its own: NSH and its platform toolkits stay out of the `oprobe` crate,
+# which keeps `cargo install oprobe` pure Rust.
+[workspace]
+
+[lib]
+name = "oprobe_app"
+path = "src/lib.rs"
+
+[[bin]]
+name = "oprobe-app"
+path = "src/main.rs"
+
+[dependencies]
+oprobe = { path = ".." }
+nsh-core = "0.6"
+nsh-base = { version = "0.6", default-features = false, features = ["plot"] }
+tokio = { version = "1.52", features = ["rt-multi-thread", "sync", "time"] }
+log = "0.4"
+env_logger = "0.11"
+anyhow = "1"
+
+# The terminal UI (`oprobe-app --tui`), on every desktop OS.
+nsh-platform-tui = { version = "0.6", default-features = false, features = ["run-app"] }
+ratatui-core = "0.1"
+ratatui-crossterm = "0.1"
+crossterm = "0.29"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nsh-platform-linux = "0.6"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+nsh-platform-macos = "0.6"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+nsh-platform-windows = "0.6"
+
+[dev-dependencies]
+nsh-engine = { version = "0.6", default-features = false }
+nsh-testing = { version = "0.6", default-features = false }
+
+[profile.release]
+lto = "thin"
+strip = "symbols"
+
+[profile.dev.package."*"]
+opt-level = 2

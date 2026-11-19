@@ -64,3 +64,34 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo package --locked
       - run: cargo install --locked --path . --root "$RUNNER_TEMP/inst" && "$RUNNER_TEMP/inst/bin/oprobe" --version
+
+  app:
+    name: desktop app (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-latest, windows-latest]
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: GTK 4 and GStreamer (Linux)
+        if: runner.os == 'Linux'
+        working-directory: .
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libclang-dev libgtk-4-dev libwebkitgtk-6.0-dev \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Headless UI flows (real NSH engine + real oprobe engine)
+        run: cargo test --locked
+      - run: cargo build --locked --release

@@ -1,0 +1,10 @@
+{
+  "name": "oprobe",
+  "id": "io.github.hxddh.oprobe",
+  "version": "2.0.0",
+  "appearance": "system",
+  "theme": "theme.json",
+  "rust": ".",
+  "root": "App",
+  "tui": { "pointsPerCell": "8x16" }
+}

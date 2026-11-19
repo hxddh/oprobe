@@ -151,6 +151,11 @@ impl Report {
     }
 }
 
+/// Pretty JSON of a report (what `--json` writes).
+pub fn to_json(r: &Report) -> String {
+    serde_json::to_string_pretty(r).unwrap_or_default()
+}
+
 pub fn write_file(path: &Path, content: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {

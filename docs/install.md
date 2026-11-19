@@ -15,6 +15,9 @@ with their SHA-256 in `SHA256SUMS`.
 | `oprobe-<ver>-aarch64-apple-darwin.tar.gz` / `x86_64-apple-darwin` | macOS single-arch |
 | `oprobe-<ver>-x64.msi` / `-arm64.msi` | Windows installer (adds to `PATH`, removable in *Apps*) |
 | `oprobe-<ver>-x86_64-pc-windows-msvc.zip` / `aarch64-…` | Windows portable |
+| `oprobe-app-<ver>-macos-universal.dmg` | desktop app for macOS (`oprobe.app`, Apple Silicon + Intel) |
+| `oprobe-app-<ver>-x64.msi` / `oprobe-app-<ver>-x86_64-pc-windows-msvc.zip` | desktop app for Windows (Start menu shortcut) |
+| `oprobe-app-<ver>-x86_64-unknown-linux-gnu.tar.gz` | desktop app for Linux (GTK 4.14+; `install.sh`, `.desktop`, icon) |
 | `oprobe.rb` | Homebrew formula |
 | `oprobe.json` | Scoop manifest |
 | `install.sh` / `install.ps1` | one-line installers (verify checksums) |

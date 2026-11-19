@@ -1,5 +1,6 @@
 /target
 /dist
+/app/target
 *.json.tmp
 oprobe-*.json
 oprobe-*.md
