@@ -93,11 +93,11 @@ async fn suffix_footer_reads_skip_the_head() {
     assert!(suffix.ops.iter().all(|o| o.verb == "parquet.scan.suffix"));
     // The plain scan gets the advice, the suffix scan does not need it.
     assert!(
-        plain.findings.iter().any(|c| c == "suffix-reads"),
+        plain.findings.iter().any(|c| c == "suffix_read"),
         "{:?}",
         plain.findings
     );
-    assert!(!suffix.findings.iter().any(|c| c == "suffix-reads"));
+    assert!(!suffix.findings.iter().any(|c| c == "suffix_read"));
     // One request fewer per file.
     let per_op = |o: &Out| o.reqs.len() as f64 / o.ops.len() as f64;
     assert!(

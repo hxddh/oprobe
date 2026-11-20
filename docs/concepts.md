@@ -79,7 +79,7 @@ comparison, a different host or oprobe version is a warning. Exit code 3 means a
 
 A finding is one diagnosis item with:
 
-- a stable **code** (`throttling`, `tail-latency`, `connection-churn`, `server-latency`, …) — `oprobe explain CODE`
+- a stable **code** (`throttling`, `tail_stragglers`, `cold_connections`, `server_latency`, …) — `oprobe explain CODE`
   documents it;
 - a **severity**: info, warning or critical;
 - a one-sentence **cause**;

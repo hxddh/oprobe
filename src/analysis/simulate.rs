@@ -57,8 +57,10 @@ fn reqs_by_op(reqs: &[ReqRow]) -> HashMap<u64, Vec<&ReqRow>> {
     m
 }
 
-/// A tail-cut threshold for `api`: 1.5× the request p95, rounded up to 10 ms, at least the
-/// p90 × 2 (so ordinary variance is never cut).
+/// A tail-cut threshold for `api`, derived from the body of its latency distribution: 3× the
+/// request p75 and 4× the median, rounded up to 10 ms. Stragglers can be several percent of
+/// the requests, so tail quantiles (p90, p95) may themselves be stragglers and would put the
+/// threshold above every request; the p75 and the median are not.
 pub fn tail_cut_threshold_us(reqs: &[ReqRow], api: &str) -> Option<u64> {
     let mut t: Vec<u64> = reqs
         .iter()
@@ -68,9 +70,9 @@ pub fn tail_cut_threshold_us(reqs: &[ReqRow], api: &str) -> Option<u64> {
     if t.len() < 50 {
         return None;
     }
-    let p95 = quantile_us_ms(&mut t, 0.95) * 1000.0;
-    let p90 = quantile_us_ms(&mut t, 0.90) * 1000.0;
-    let raw = (p95 * 1.5).max(p90 * 2.0).max(1000.0);
+    let p50 = quantile_us_ms(&mut t, 0.50) * 1000.0;
+    let p75 = quantile_us_ms(&mut t, 0.75) * 1000.0;
+    let raw = (p75 * 3.0).max(p50 * 4.0).max(1000.0);
     Some(((raw / 10_000.0).ceil() * 10_000.0) as u64)
 }
 
