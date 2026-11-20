@@ -100,11 +100,13 @@ fn mix_entry(m: &crate::config::OpSpec) -> MixEntry {
             columns,
             column_size,
             footer_size,
+            suffix,
         } => {
             e.op = "parquet_scan".into();
             e.columns_count = Some(*columns);
             e.column_bytes = Some(column_size.0);
             e.footer_bytes = Some(footer_size.0);
+            e.suffix = suffix.then_some(true);
         }
         OpKind::Write { size } => {
             e.op = "write".into();
@@ -118,6 +120,25 @@ fn mix_entry(m: &crate::config::OpSpec) -> MixEntry {
         OpKind::List { recursive } => {
             e.op = "list".into();
             e.recursive = Some(*recursive);
+        }
+        OpKind::ListPaged { limit } => {
+            e.op = "list_paged".into();
+            e.limit_count = Some(*limit);
+        }
+        OpKind::Delete { batch } => {
+            e.op = "delete".into();
+            e.batch_count = Some(*batch);
+        }
+        OpKind::Copy => e.op = "copy".into(),
+        OpKind::PresignedRead => e.op = "presigned_read".into(),
+        OpKind::ConditionalWrite { size } => {
+            e.op = "conditional_write".into();
+            e.size_bytes = Some(size.0);
+        }
+        OpKind::MetadataWrite { size, entries } => {
+            e.op = "metadata_write".into();
+            e.size_bytes = Some(size.0);
+            e.metadata_entries_count = Some(*entries);
         }
     }
     e

@@ -615,6 +615,20 @@ pub fn build_profile(
     if k.tail_cut {
         kn.tail_cut = true;
     }
+    if let Some(a) = &k.addressing {
+        kn.provider.addressing = match a.trim().to_ascii_lowercase().as_str() {
+            "auto" => crate::config::Addressing::Auto,
+            "virtual" | "virtual-host" | "vhost" => crate::config::Addressing::Virtual,
+            "path" => crate::config::Addressing::Path,
+            other => anyhow::bail!("invalid --addressing `{other}` (auto, virtual or path)"),
+        };
+    }
+    if k.checksum.is_some() {
+        kn.provider.checksum = k.checksum.clone();
+    }
+    if k.sse.is_some() {
+        kn.provider.sse = k.sse.clone();
+    }
 
     let cs = &mut p.cost;
     if let Some(v) = &c.provider {

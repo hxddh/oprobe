@@ -25,13 +25,107 @@ pub fn base_operator(target: &TargetSpec) -> Result<Operator> {
     ensure_registry();
     let mut opts = target.resolved_options()?;
     opts.remove("ca_cert_pem");
-    Operator::via_iter(&target.scheme, opts).with_context(|| {
-        format!(
-            "cannot configure the `{}` backend for {}",
+    Operator::via_iter(&target.scheme, opts).map_err(|e| {
+        let hint = if e.kind() == opendal::ErrorKind::ConfigInvalid {
+            format!(
+                " (set missing options with `-o KEY=VALUE`, `?KEY=VALUE` in the URL or under [target.options]; required for `{}`: {})",
+                target.scheme,
+                crate::config::required_options(&target.scheme).join(", ")
+            )
+        } else {
+            String::new()
+        };
+        anyhow::Error::new(e).context(format!(
+            "cannot configure the `{}` backend for {}{hint}",
             target.scheme,
             target.display()
-        )
+        ))
     })
+}
+
+/// Where the region of an S3 target comes from.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RegionSource {
+    /// `region` option (URL, flag, target).
+    Configured,
+    /// `AWS_REGION` / `AWS_DEFAULT_REGION`.
+    Environment,
+    /// Asked the service (`x-amz-bucket-region` of a HeadBucket, or the endpoint's name).
+    Detected,
+    /// Nothing known: OpenDAL's default (`us-east-1`).
+    Default,
+}
+
+/// The region of an S3 target and where it comes from; detects it (HeadBucket, ≤ 3 s) when
+/// none is configured. `None` for other services.
+pub async fn s3_region(target: &TargetSpec) -> Option<(String, RegionSource)> {
+    if target.scheme != "s3" {
+        return None;
+    }
+    if let Some(r) = target.options.get("region") {
+        return Some((r.clone(), RegionSource::Configured));
+    }
+    for k in ["AWS_REGION", "AWS_DEFAULT_REGION"] {
+        if let Ok(r) = std::env::var(k)
+            && !r.is_empty()
+        {
+            return Some((r, RegionSource::Environment));
+        }
+    }
+    match detect_s3_region(target).await {
+        Some(r) => Some((r, RegionSource::Detected)),
+        None => Some(("us-east-1".into(), RegionSource::Default)),
+    }
+}
+
+async fn detect_s3_region(target: &TargetSpec) -> Option<String> {
+    let bucket = target.options.get("bucket")?.clone();
+    let endpoint = target
+        .options
+        .get("endpoint")
+        .and_then(|e| crate::config::expand_env(e).ok());
+    let budget = Duration::from_secs(3);
+    match endpoint.filter(|e| !e.contains("amazonaws.com")) {
+        // Other S3-compatible services: OpenDAL's detection (endpoint name, then HeadBucket).
+        Some(ep) => {
+            tokio::time::timeout(budget, opendal::services::S3::detect_region(&ep, &bucket))
+                .await
+                .ok()
+                .flatten()
+        }
+        // AWS answers HeadBucket on the global endpoint with the bucket's region in a header,
+        // whatever the status (301 / 403 included): a PermanentRedirect avoided up front.
+        None => {
+            let mut b = reqwest::Client::builder().timeout(budget);
+            if proxy_setting(target) == Some(None) {
+                b = b.no_proxy();
+            }
+            let resp = b
+                .build()
+                .ok()?
+                .head(format!("https://{bucket}.s3.amazonaws.com/"))
+                .send()
+                .await
+                .ok()?;
+            resp.headers()
+                .get("x-amz-bucket-region")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned)
+        }
+    }
+}
+
+/// Prepare a target before its operator is built: apply the provider knobs (addressing style,
+/// checksum, SSE) and detect the region of an S3 bucket that has none configured.
+pub async fn prepare_target(target: &mut TargetSpec, knobs: &Knobs) -> Result<()> {
+    for (k, v) in knobs.provider.options(&target.scheme)? {
+        target.options.insert(k.to_owned(), v);
+    }
+    if let Some((region, RegionSource::Detected)) = s3_region(target).await {
+        target.options.insert("region".into(), region);
+    }
+    Ok(())
 }
 
 pub fn tls_options(target: &TargetSpec) -> Result<TlsClientOptions> {

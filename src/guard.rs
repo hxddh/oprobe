@@ -289,8 +289,9 @@ pub fn plan(profile: &Profile, run_prefix: &str, read_only: bool, budgets: &Budg
                 columns,
                 column_size,
                 footer_size,
+                suffix,
             } => (
-                2.0 + *columns as f64,
+                if *suffix { 1.0 } else { 2.0 } + *columns as f64,
                 footer_size.0 as f64 + *columns as f64 * column_size.0 as f64,
                 false,
             ),
@@ -305,6 +306,20 @@ pub fn plan(profile: &Profile, run_prefix: &str, read_only: bool, budgets: &Budg
             }
             OpKind::Stat => (1.0, 0.0, false),
             OpKind::List { .. } => (1.0, 4096.0, false),
+            OpKind::ListPaged { limit } => {
+                let per_part = (ds.objects / ds.partitions.max(1)).max(1) as f64;
+                (
+                    (per_part / (*limit).max(1) as f64).ceil().max(1.0),
+                    4096.0,
+                    false,
+                )
+            }
+            // One batch request (or one request per key where the service has no batches).
+            OpKind::Delete { .. } => (1.0, 0.0, true),
+            OpKind::Copy => (1.0, 0.0, true),
+            OpKind::PresignedRead => (1.0, obj as f64, false),
+            OpKind::ConditionalWrite { size } => (1.0, size.0 as f64, true),
+            OpKind::MetadataWrite { size, .. } => (1.0, size.0 as f64, true),
         }
     };
     let (mut req_per_op, mut bytes_per_op, mut write_share) = (0.0, 0.0, 0.0);

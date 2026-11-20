@@ -435,6 +435,15 @@ pub struct KnobArgs {
     /// Cancel and retry straggler requests (TailCutLayer)
     #[arg(long)]
     pub tail_cut: bool,
+    /// S3 bucket addressing: auto (as configured), virtual (bucket.host) or path (host/bucket)
+    #[arg(long, value_name = "STYLE")]
+    pub addressing: Option<String>,
+    /// Checksum computed by the client and verified by the server on writes (S3: crc32c)
+    #[arg(long, value_name = "ALGO")]
+    pub checksum: Option<String>,
+    /// Server-side encryption of written objects (S3: AES256, aws:kms)
+    #[arg(long, value_name = "MODE")]
+    pub sse: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -731,6 +740,16 @@ pub struct ProbeArgs {
 pub struct LabArgs {
     #[arg(long, default_value = "127.0.0.1:9000")]
     pub bind: String,
+    /// Start from a fault preset: clean, demo, throttle, stragglers, lossy, flaky (the flags
+    /// below override it)
+    #[arg(long)]
+    pub scenario: Option<String>,
+    /// Answer every Nth request with 500 InternalError
+    #[arg(long)]
+    pub error_every: Option<usize>,
+    /// Drop the connection on every Nth request
+    #[arg(long)]
+    pub reset_every: Option<usize>,
     /// Serve HTTPS (certificate for localhost / 127.0.0.1)
     #[arg(long)]
     pub tls: bool,
