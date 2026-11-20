@@ -291,7 +291,7 @@ pub fn stage_table(reqs: &[&ReqRow]) -> Vec<StageRow> {
         .into_iter()
         .map(|(api, v)| stage_row(api.to_owned(), &v))
         .collect();
-    rows.sort_by(|a, b| b.requests_count.cmp(&a.requests_count));
+    rows.sort_by_key(|r| std::cmp::Reverse(r.requests_count));
     if rows.len() > 1 {
         rows.push(stage_row("all".into(), reqs));
     }

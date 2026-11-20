@@ -149,18 +149,15 @@ pub fn cmd_compare(a: CompareArgs, ctx: &Ctx) -> Result<u8> {
     }
     .unwrap_or_else(|| "last".into());
     let cand = load_side(ctx, &cand_ref)?;
-    // A run never compares against itself.
-    let base: Vec<Run> = base
-        .into_iter()
+    // A candidate run that is also in the baseline set (e.g. it already joined a named
+    // baseline) is left out of the baseline side — unless that would empty it (comparing a
+    // run with itself is allowed and passes).
+    let others: Vec<Run> = base
+        .iter()
         .filter(|b| !cand.iter().any(|c| c.id() == b.id()))
+        .cloned()
         .collect();
-    if base.is_empty() {
-        return Err(OprobeError::new(
-            ErrorCode::UsageInvalidArgument,
-            "the baseline and the candidate are the same runs",
-        )
-        .into());
-    }
+    let base = if others.is_empty() { base } else { others };
     let c = compare(&base, &cand, &base_label, &cand_ref, &thresholds(&a));
     write_compare_files(&c, &a)?;
     if !c.passed && ctx.out.format == crate::output::OutputFormat::Text {

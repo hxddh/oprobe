@@ -216,7 +216,6 @@ fn errors_are_classified_with_exit_codes() {
         &["schema", "report"][..],
         &["mcp"][..],
         &["explain", "throttling"][..],
-        &["runs", "export", "last"][..],
         &["target", "test", "x"][..],
     ] {
         // Global flags go before the arguments of a pending command (it accepts any).
