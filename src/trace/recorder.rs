@@ -624,16 +624,19 @@ impl Recorder {
     /// Record a completed logical operation (only if it started inside the window).
     pub fn complete_op(&self, measured: bool, c: OpCompletion) {
         self.inflight_ops.fetch_sub(1, Ordering::Relaxed);
-        self.live_ops
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&c.op_id);
+        let forget_live = || {
+            self.live_ops
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&c.op_id);
+        };
         let tree = self
             .trees
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&c.op_id);
         if !measured || !self.is_measuring() {
+            forget_live();
             return;
         }
         let window_start = self.window_start();
@@ -648,6 +651,10 @@ impl Recorder {
         let req_count = c.data.requests.len() as u64 + c.data.dropped_requests;
 
         let mut a = self.agg();
+        // Leave the live set only under the aggregate lock: until then this operation keeps
+        // its second open, so a concurrent completion cannot close that second before this
+        // sample is in it.
+        forget_live();
         for r in &c.data.requests {
             a.record_request(r);
         }
