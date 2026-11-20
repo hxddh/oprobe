@@ -84,6 +84,39 @@ async fn exercise(t: TargetSpec, mode: TransportMode, expect_put: Api) {
     assert!(cleanup.verified, "cleanup not verified: {cleanup:?}");
 }
 
+/// The compatibility suite (`oprobe compat`): what the emulator implements passes; checks it
+/// cannot run are skipped; the report is printed for the CI log. Test objects are removed.
+async fn compat(t: TargetSpec) {
+    let t = t.normalized().unwrap();
+    let base = oprobe::engine::operator::base_operator(&t).unwrap();
+    let op = oprobe::engine::operator::preflight_operator(&base, &t).unwrap();
+    let prefix = "oprobe-compat-it/";
+    let mut r = oprobe::compat::run_suite(&op, &t.display(), &t.scheme, prefix).await;
+    r.push(oprobe::compat::checksum_check(&t, prefix).await);
+    let admin = oprobe::engine::operator::admin_operator(&base, &t).unwrap();
+    let cleaned = oprobe::engine::cleanup::delete_prefix(&admin, prefix).await;
+    for c in &r.checks {
+        eprintln!("{:?} {} {}: {}", c.status, c.category, c.id, c.detail);
+    }
+    eprintln!("{}: score {:.0}%", t.scheme, r.score_pct);
+    assert!(cleaned.verified, "{cleaned:?}");
+    // The basics hold everywhere.
+    for id in [
+        "read_after_write",
+        "read_after_overwrite",
+        "range_reads",
+        "delete_idempotent",
+    ] {
+        let c = r.checks.iter().find(|c| c.id == id).unwrap();
+        assert_eq!(
+            c.status,
+            oprobe::compat::CompatStatus::Pass,
+            "{id}: {}",
+            c.detail
+        );
+    }
+}
+
 fn env(name: &str) -> Option<String> {
     let v = std::env::var(name).ok().filter(|v| !v.is_empty());
     if v.is_none() {
@@ -109,6 +142,9 @@ async fn minio_s3() {
                 ("disable_config_load", "true"),
             ],
         );
+        if mode == TransportMode::Opendal {
+            compat(t.clone()).await;
+        }
         exercise(t, mode, Api::PutObject).await;
     }
 }
@@ -129,6 +165,9 @@ async fn fake_gcs() {
                 ("disable_config_load", "true"),
             ],
         );
+        if mode == TransportMode::Opendal {
+            compat(t.clone()).await;
+        }
         exercise(t, mode, Api::PutObject).await;
     }
 }
@@ -152,6 +191,9 @@ async fn azurite_blob() {
                 ("account_key", &key),
             ],
         );
+        if mode == TransportMode::Opendal {
+            compat(t.clone()).await;
+        }
         exercise(t, mode, Api::PutObject).await;
     }
 }

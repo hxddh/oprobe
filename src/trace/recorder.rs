@@ -1184,6 +1184,9 @@ mod tests {
             retry_after_ms: None,
             error: None,
             remote: None,
+            service_op: None,
+            tls: None,
+            tcp: None,
         }
     }
 

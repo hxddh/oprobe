@@ -56,6 +56,7 @@ pub async fn cmd_probe(a: ProbeArgs, ctx: &Ctx) -> Result<u8> {
             Some("none") => Some(None),
             Some(p) => Some(Some(p.to_owned())),
         },
+        certs: true,
         method: if a.get {
             http::Method::GET
         } else {
@@ -95,19 +96,32 @@ pub async fn cmd_lab(a: LabArgs, ctx: &Ctx) -> Result<u8> {
     if let Some(p) = &a.write_ca {
         write_file(p, lab_ca_pem())?;
     }
-    let cfg = LabConfig {
-        enable_tls: a.tls,
-        enable_http2: !a.h1_only,
-        base_ttfb_delay: parse_duration(&a.latency)?,
-        multipart_merge_delay: parse_duration(&a.complete_delay)?,
-        straggler_every_n: a.straggler_every,
-        straggler_delay: parse_duration(&a.straggler)?,
-        max_inflight_before_503: a.throttle_above,
-        throttle_every_n_requests: a.throttle_every,
-        throttle_status_code: a.throttle_status,
-        stream_bandwidth_kib_s: a.bandwidth_kib,
-        throttle_early_close: a.throttle_early_close,
+    let mut cfg = match &a.scenario {
+        Some(s) => crate::lab::Scenario::parse(s)?.config(),
+        None => LabConfig::default(),
     };
+    // Flags override the scenario where they were given (differ from their defaults).
+    cfg.enable_tls = a.tls;
+    cfg.enable_http2 = !a.h1_only;
+    cfg.throttle_status_code = a.throttle_status;
+    cfg.throttle_early_close |= a.throttle_early_close;
+    let latency = parse_duration(&a.latency)?;
+    if !latency.is_zero() {
+        cfg.base_ttfb_delay = latency;
+    }
+    let complete = parse_duration(&a.complete_delay)?;
+    if !complete.is_zero() {
+        cfg.multipart_merge_delay = complete;
+    }
+    if a.straggler_every > 0 {
+        cfg.straggler_every_n = a.straggler_every;
+        cfg.straggler_delay = parse_duration(&a.straggler)?;
+    }
+    cfg.max_inflight_before_503 = a.throttle_above.or(cfg.max_inflight_before_503);
+    cfg.throttle_every_n_requests = a.throttle_every.or(cfg.throttle_every_n_requests);
+    cfg.stream_bandwidth_kib_s = a.bandwidth_kib.or(cfg.stream_bandwidth_kib_s);
+    cfg.error_every_n = a.error_every.or(cfg.error_every_n);
+    cfg.reset_every_n = a.reset_every.or(cfg.reset_every_n);
     let lab = LabServer::spawn(&a.bind, cfg).await?;
     let tls_flag = if a.tls {
         match &a.write_ca {

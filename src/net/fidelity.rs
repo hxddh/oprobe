@@ -10,9 +10,14 @@
 //! - the response's `HttpInfo` (local address = connection identity), which marks the first
 //!   request on every connection as cold and attributes that connection's dial to it.
 //!
+//! - the same rustls crypto provider and certificate verifier with delegating wrappers that
+//!   report the negotiated cipher suite, key-exchange group, HelloRetryRequests and whether the
+//!   handshake was resumed (`net::tlsinfo`),
+//! - the kernel's TCP statistics of the connection at request end (`net::tcpinfo`: the socket
+//!   is found by its addresses and only queried, never owned).
+//!
 //! What this mode cannot see (use `--microscope`): time waiting inside reqwest's pool for an
-//! idle connection or HTTP/2 stream is part of TTFB, and the TLS cipher suite is not exposed (the
-//! TLS version is, from the key-schedule labels).
+//! idle connection or HTTP/2 stream is part of TTFB.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -28,15 +33,18 @@ use bytes::Bytes;
 use futures::Stream;
 use http::{Method, Request, Response};
 use hyper_util::client::legacy::connect::{Connection, HttpInfo};
-use opendal_core::raw::{parse_content_encoding, parse_content_length};
+use opendal_core::raw::{ServiceOperation, parse_content_encoding, parse_content_length};
 use opendal_core::{Buffer, Error, ErrorKind, HttpBody, HttpRedirect, HttpTransport, Result};
 use rustls::client::{ClientSessionMemoryCache, ClientSessionStore, Resumption};
 use rustls::{ClientConfig, NamedGroup};
 use rustls_pki_types::ServerName;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+use super::tcpinfo::{self, TcpProbe};
 use super::tls::{InsecureCertVerifier, crypto_provider};
+use super::tlsinfo::{HandshakeMarks, ObservedVerifier, TlsEvent, observed_provider};
 use super::{HttpVersion, TransportConfig};
+use crate::model::{TcpRow, TlsRow};
 use crate::trace::model::{Protocol, RequestRecord, RequestTiming, classify_http};
 use crate::trace::recorder::DialRecord;
 use crate::trace::{InflightGuard, OpScope, Recorder};
@@ -50,6 +58,7 @@ struct DialMarks {
     dns_end: Option<Instant>,
     client_hello: Option<Instant>,
     tls_version: Option<&'static str>,
+    hs: HandshakeMarks,
 }
 
 tokio::task_local! {
@@ -64,14 +73,38 @@ fn mark(f: impl FnOnce(&mut DialMarks)) {
     });
 }
 
+/// Reports of the observing TLS provider / verifier (outside a dial they are ignored).
+fn tls_hook(e: TlsEvent) {
+    mark(|m| m.hs.apply(e));
+}
+
 /// A finished dial waiting for the first request that uses its connection.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct Dialed {
     dns_us: u64,
     tcp_us: u64,
     proxy_us: u64,
     tls_us: u64,
     end: Instant,
+    tls: Option<TlsRow>,
+}
+
+/// Where the kernel statistics of a connection come from.
+#[derive(Clone, Debug, Default)]
+enum Sock {
+    /// Not looked up yet (looked up once, at the end of the connection's first request).
+    #[default]
+    Unknown,
+    /// Not found or not supported: never looked up again.
+    Missing,
+    Found(Arc<TcpProbe>),
+}
+
+#[derive(Default)]
+struct ConnEntry {
+    id: u64,
+    dial: Option<Dialed>,
+    sock: Sock,
 }
 
 /// Bound on remembered connections (see [`Conns::by_addr`]).
@@ -83,7 +116,7 @@ struct Conns {
     /// Connection identity (local, remote address) -> (id, dial awaiting its first request).
     /// The local address alone is not unique: the kernel reuses a local port for connections
     /// to different peers, and object stores answer from many addresses.
-    by_addr: HashMap<(SocketAddr, SocketAddr), (u64, Option<Dialed>)>,
+    by_addr: HashMap<(SocketAddr, SocketAddr), ConnEntry>,
 }
 
 struct Shared {
@@ -93,6 +126,33 @@ struct Shared {
     /// them went through the proxy (reqwest applies NO_PROXY itself).
     proxy: Option<String>,
     proxy_addrs: Vec<SocketAddr>,
+    /// Query `TCP_INFO` at request end.
+    tcp_info: bool,
+}
+
+impl Shared {
+    /// Kernel TCP statistics of connection `addr` now (see `net::tcpinfo` for why this is safe).
+    /// `known` is what the connection table said when the response arrived.
+    fn tcp_info(&self, addr: (SocketAddr, SocketAddr), known: Sock) -> Option<TcpRow> {
+        if !self.tcp_info {
+            return None;
+        }
+        let id = match known {
+            Sock::Found(p) => p,
+            Sock::Missing => return None,
+            Sock::Unknown => {
+                // Scan the descriptor table without holding the lock.
+                let found = tcpinfo::find(addr.0, addr.1).map(|id| Arc::new(TcpProbe::new(id)));
+                if let Ok(mut c) = self.conns.lock()
+                    && let Some(e) = c.by_addr.get_mut(&addr)
+                {
+                    e.sock = found.clone().map_or(Sock::Missing, Sock::Found);
+                }
+                found?
+            }
+        };
+        id.sample()
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -121,6 +181,8 @@ struct HelloClock(Arc<ClientSessionMemoryCache>);
 
 impl ClientSessionStore for HelloClock {
     fn set_kx_hint(&self, server_name: ServerName<'static>, group: NamedGroup) {
+        // Called at the end of a TLS 1.3 handshake with the group it used.
+        mark(|m| m.hs.final_group = Some(group));
         self.0.set_kx_hint(server_name, group)
     }
     fn kx_hint(&self, server_name: &ServerName<'_>) -> Option<NamedGroup> {
@@ -181,15 +243,20 @@ impl rustls::KeyLog for VersionProbe {
 }
 
 /// The rustls config reqwest 0.13 builds by default (aws-lc-rs, TLS 1.2 + 1.3, platform
-/// verifier, extra roots merged), plus the ClientHello clock.
+/// verifier, extra roots merged), plus the ClientHello clock and the observing wrappers of
+/// `net::tlsinfo` (same suites, groups and verifier; they only report what was negotiated).
 fn rustls_config(cfg: &TransportConfig, alpn: Vec<Vec<u8>>) -> anyhow::Result<ClientConfig> {
-    let provider = crypto_provider();
+    let base = crypto_provider();
+    let provider = observed_provider(&base, tls_hook);
     let builder = ClientConfig::builder_with_provider(provider.clone())
         .with_protocol_versions(rustls::ALL_VERSIONS)?;
     let mut tls = if cfg.tls.insecure_skip_verify {
         builder
             .dangerous()
-            .with_custom_certificate_verifier(Arc::new(InsecureCertVerifier { provider }))
+            .with_custom_certificate_verifier(Arc::new(ObservedVerifier {
+                inner: InsecureCertVerifier { provider },
+                hook: tls_hook,
+            }))
             .with_no_client_auth()
     } else {
         let extra: Vec<rustls_pki_types::CertificateDer<'static>> = match &cfg.tls.extra_ca_pem {
@@ -214,7 +281,10 @@ fn rustls_config(cfg: &TransportConfig, alpn: Vec<Vec<u8>>) -> anyhow::Result<Cl
         };
         builder
             .dangerous()
-            .with_custom_certificate_verifier(Arc::new(verifier))
+            .with_custom_certificate_verifier(Arc::new(ObservedVerifier {
+                inner: verifier,
+                hook: tls_hook,
+            }))
             .with_no_client_auth()
     };
     tls.alpn_protocols = alpn;
@@ -272,6 +342,7 @@ where
             let res = fut.await;
             let end = Instant::now();
             let m = marks.lock().map(|g| *g).unwrap_or_default();
+            let tls = m.tls_version.map(|v| m.hs.row(&v.replace("TLSv", "TLS")));
             let us = |a: Instant, b: Instant| b.saturating_duration_since(a).as_micros() as u64;
             let dns_us = match (m.dns_start, m.dns_end) {
                 (Some(a), Some(b)) => us(a, b),
@@ -318,7 +389,10 @@ where
                                 String::new()
                             },
                             tls_version: m.tls_version.unwrap_or_default().to_owned(),
-                            cipher: String::new(),
+                            cipher: tls
+                                .as_ref()
+                                .and_then(|t| t.cipher.clone())
+                                .unwrap_or_default(),
                         });
                     }
                     if let (Some(i), Ok(mut c)) = (info, shared.conns.lock()) {
@@ -327,20 +401,22 @@ where
                         if c.by_addr.len() >= MAX_TRACKED_CONNS {
                             // Long runs with connection churn: forget connections whose dial was
                             // already claimed (their later requests get a fresh id, still warm).
-                            c.by_addr.retain(|_, (_, d)| d.is_some());
+                            c.by_addr.retain(|_, e| e.dial.is_some());
                         }
                         c.by_addr.insert(
                             (i.local_addr(), i.remote_addr()),
-                            (
+                            ConnEntry {
                                 id,
-                                Some(Dialed {
+                                dial: Some(Dialed {
                                     dns_us,
                                     tcp_us,
                                     proxy_us,
                                     tls_us,
                                     end,
+                                    tls,
                                 }),
-                            ),
+                                sock: Sock::Unknown,
+                            },
                         );
                     }
                 }
@@ -383,6 +459,7 @@ impl FidelityTransport {
         https: bool,
         recorder: Option<Arc<Recorder>>,
     ) -> anyhow::Result<Self> {
+        let tcp_info = cfg.tcp_info && recorder.is_some();
         let proxy = match &cfg.proxy {
             Some(Some(p)) => Some(super::ProxyConfig::parse(p, "")?),
             Some(None) => None,
@@ -401,6 +478,7 @@ impl FidelityTransport {
             conns: Mutex::new(Conns::default()),
             proxy: proxy.map(|p| p.display()),
             proxy_addrs,
+            tcp_info,
         });
         // OpenDAL builds reqwest without the `http2` feature, so its default is HTTP/1.1.
         let alpn: Vec<Vec<u8>> = match cfg.http {
@@ -536,6 +614,7 @@ impl http_body::Body for TimedBody {
 pub(super) struct CancelGuard {
     armed: bool,
     api: crate::trace::Api,
+    service_op: Option<&'static str>,
     method: String,
     bytes_up: u64,
     start_offset_us: u64,
@@ -548,6 +627,7 @@ impl CancelGuard {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         api: crate::trace::Api,
+        service_op: Option<&'static str>,
         method: String,
         bytes_up: u64,
         start_offset_us: u64,
@@ -558,6 +638,7 @@ impl CancelGuard {
         Self {
             armed: true,
             api,
+            service_op,
             method,
             bytes_up,
             start_offset_us,
@@ -596,6 +677,9 @@ impl Drop for CancelGuard {
             retry_after_ms: None,
             error: Some("cancelled before a response (timeout or abandoned)".into()),
             remote: None,
+            service_op: self.service_op,
+            tls: None,
+            tcp: None,
         };
         Finisher::emit(record, &self.scope, &self.recorder);
     }
@@ -603,6 +687,11 @@ impl Drop for CancelGuard {
 
 struct Finisher {
     record: RequestRecord,
+    /// The connection (local, remote), for its TCP statistics at request end.
+    conn: Option<(SocketAddr, SocketAddr)>,
+    /// The connection's socket as known when the response arrived (no second table lookup).
+    sock: Sock,
+    shared: Arc<Shared>,
     t_start: Instant,
     t_headers: Instant,
     stall: Duration,
@@ -638,6 +727,11 @@ impl Finisher {
         t.total_us = now.saturating_duration_since(self.t_start).as_micros() as u64;
         if error.is_some() && self.record.error.is_none() {
             self.record.error = error;
+        }
+        // After the clock stopped: the query is not part of the request's time.
+        if let Some(addr) = self.conn {
+            let sock = std::mem::take(&mut self.sock);
+            self.record.tcp = self.shared.tcp_info(addr, sock).map(Box::new);
         }
         Self::emit(self.record, &self.scope, &self.recorder);
     }
@@ -754,7 +848,13 @@ impl HttpTransport for FidelityTransport {
         // ---------------------------------------------------------------------------------
 
         let method = parts.method.clone();
-        let api = classify_http(&method, url.path(), url.query());
+        // The exact API the service named (OpenDAL `ServiceOperation`); the URL heuristic only
+        // when the service attached none.
+        let service_op = parts.extensions.get::<ServiceOperation>().map(|o| o.0);
+        let api = match service_op.map(crate::trace::Api::from_service_operation) {
+            Some(a) if a != crate::trace::Api::Other => a,
+            _ => classify_http(&method, url.path(), url.query()),
+        };
         let bytes_up = body.len() as u64;
         let inflight = InflightGuard::start(recorder.clone());
         let start_offset_us = scope
@@ -763,6 +863,7 @@ impl HttpTransport for FidelityTransport {
             .unwrap_or(0);
         let mut cancel_guard = CancelGuard::new(
             api,
+            service_op,
             method.to_string(),
             bytes_up,
             start_offset_us,
@@ -785,6 +886,9 @@ impl HttpTransport for FidelityTransport {
             retry_after_ms: None,
             error: None,
             remote: None,
+            service_op,
+            tls: None,
+            tcp: None,
         };
 
         let permit = match &self.limiter {
@@ -816,7 +920,10 @@ impl HttpTransport for FidelityTransport {
         }
 
         // Static span name: no allocation per request.
-        let sent = rb.send().instrument_await(api.label()).await;
+        let sent = rb
+            .send()
+            .instrument_await(service_op.unwrap_or_else(|| api.label()))
+            .await;
         let t_headers = Instant::now();
         cancel_guard.disarm();
         let mut resp = match sent {
@@ -847,15 +954,20 @@ impl HttpTransport for FidelityTransport {
             .get::<HttpInfo>()
             .map(|i| (i.local_addr(), i.remote_addr()));
         let mut dial = None;
+        let mut sock = Sock::Missing;
         record.remote = addr.map(|(_, remote)| remote);
         if let (Some(addr), Ok(mut c)) = (addr, self.shared.conns.lock()) {
             let c = &mut *c;
             let entry = c.by_addr.entry(addr).or_insert_with(|| {
                 c.seq += 1;
-                (c.seq, None)
+                ConnEntry {
+                    id: c.seq,
+                    ..Default::default()
+                }
             });
-            record.conn_id = entry.0;
-            dial = entry.1.take();
+            record.conn_id = entry.id;
+            dial = entry.dial.take();
+            sock = entry.sock.clone();
         }
         record.protocol = if resp.version() == http::Version::HTTP_2 {
             Protocol::Http2
@@ -873,6 +985,7 @@ impl HttpTransport for FidelityTransport {
                 record.timing.tcp_us = d.tcp_us;
                 record.timing.proxy_us = d.proxy_us;
                 record.timing.tls_us = d.tls_us;
+                record.tls = d.tls.map(Box::new);
                 if d.end <= t_headers {
                     wire_from = d.end;
                 }
@@ -938,6 +1051,9 @@ impl HttpTransport for FidelityTransport {
 
         let fin = Finisher {
             record,
+            conn: addr,
+            sock,
+            shared: self.shared.clone(),
             t_start,
             t_headers,
             stall: Duration::ZERO,
@@ -970,6 +1086,7 @@ mod tests {
             conns: Mutex::new(Conns::default()),
             proxy: None,
             proxy_addrs: Vec::new(),
+            tcp_info: false,
         })
     }
 

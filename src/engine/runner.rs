@@ -199,6 +199,7 @@ impl Session {
     ) -> Result<Self> {
         profile.target = profile.target.normalized()?;
         profile.validate()?;
+        super::operator::prepare_target(&mut profile.target, &profile.knobs).await?;
         let base = base_operator(&profile.target)?;
         let admin = admin_operator(&base, &profile.target)?;
         let run_prefix = opts.run_prefix.clone().unwrap_or_else(new_run_prefix);
@@ -207,7 +208,11 @@ impl Session {
         }
         let spec = profile.workload.effective_dataset();
         let mut mix = profile.workload.effective_mix();
-        let mut warnings = Vec::new();
+        let mut warnings = super::workloads::adapt_mix(
+            &mut mix,
+            &base.info().capability(),
+            &profile.target.scheme,
+        );
         if spec.existing_prefix.is_some() && mix.iter().any(|m| m.op.is_write()) {
             mix.retain(|m| !m.op.is_write());
             warnings.push("existing_prefix datasets are read-only: write operations were removed from the mix".into());
@@ -224,7 +229,7 @@ impl Session {
         if profile.target.is_network() {
             super::operator::check_reachable(&base, &profile.target).await?;
         }
-        let needs_objects = mix.iter().any(|m| !m.op.is_write() && m.weight > 0);
+        let needs_objects = mix.iter().any(|m| m.op.needs_dataset() && m.weight > 0);
         if opts.preflight {
             let writes = spec.existing_prefix.is_none()
                 && (needs_objects || mix.iter().any(|m| m.weight > 0 && m.op.is_write()));
@@ -329,6 +334,7 @@ impl Session {
             recorder: recorder.clone(),
             scratch_prefix: format!("{}writes/t{trial:03}-", self.run_prefix),
             written: self.written.clone(),
+            state: super::workloads::WorkloadState::new(self.capability, &self.mix),
         });
 
         // Background sampler: slow-op call stacks, client CPU/RSS, live snapshots.

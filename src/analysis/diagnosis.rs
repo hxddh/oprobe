@@ -498,6 +498,31 @@ pub fn diagnose(s: &Snapshot, knobs: &Knobs, sla: &Sla, network: bool) -> Diagno
             "Measurements may understate what the storage can do; use a bigger client or lower verification overhead.",
         ));
     }
+    // Parquet-style scans that HEAD every file before reading its footer (stream B2).
+    if let Some(v) = s
+        .verbs
+        .iter()
+        .find(|v| v.verb == "parquet.scan" && v.count > 0)
+    {
+        let heads = s
+            .apis
+            .iter()
+            .find(|a| a.api == crate::trace::Api::HeadObject)
+            .map_or(0, |a| a.count);
+        if heads > 0 && heads * 2 >= v.count {
+            f.push(finding(
+                Severity::Info,
+                "suffix-reads",
+                "Use suffix reads: saves one HEAD per file".into(),
+                format!(
+                    "{heads} HEAD requests for {} file scans ({:.0}% of all requests): each scan asks for the size before reading the footer",
+                    v.count,
+                    heads as f64 / requests * 100.0
+                ),
+                "Read the footer with a suffix range (`Range: bytes=-N`, OpenDAL `read_with(path).range(BytesRange::suffix(n))`): the response carries the footer and the file size. Verify: `oprobe run TARGET --preset parquet-suffix`.",
+            ));
+        }
+    }
     let _ = ops;
     f.sort_by_key(|x| std::cmp::Reverse(x.severity));
     Diagnosis {

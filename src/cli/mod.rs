@@ -7,7 +7,7 @@ pub(crate) mod analyze;
 pub mod args;
 pub(crate) mod compare;
 pub(crate) mod demo;
-pub(crate) mod doctor;
+pub mod doctor;
 pub(crate) mod export;
 mod live;
 pub(crate) mod matrix;
@@ -329,7 +329,6 @@ fn detach_console() {
 }
 
 async fn dispatch(cmd: Command, ctx: &Ctx) -> Result<u8> {
-    let pending = |name: &str| -> Result<u8> { Err(OprobeError::not_implemented(name).into()) };
     match cmd {
         Command::Run(a) => run::cmd_run(a, ctx).await,
         Command::Tune(a) => run::cmd_tune(a, ctx).await,
@@ -386,7 +385,7 @@ async fn dispatch(cmd: Command, ctx: &Ctx) -> Result<u8> {
         Command::Explain(a) => agent::cmd_explain(a, ctx),
         Command::Watch(a) => watch::cmd_watch(a, ctx).await,
         Command::Matrix(a) => matrix::cmd_matrix(a, ctx).await,
-        Command::Compat(_) => pending("compat"),
+        Command::Compat(a) => crate::compat::command::run(a, ctx).await,
         Command::Baseline(c) => compare::cmd_baseline(c, ctx),
         Command::Mcp(a) => agent::cmd_mcp(a, ctx).await,
         Command::Schema(a) => agent::cmd_schema(a, ctx),
@@ -644,6 +643,20 @@ pub fn build_profile(
     }
     if k.tail_cut {
         kn.tail_cut = true;
+    }
+    if let Some(a) = &k.addressing {
+        kn.provider.addressing = match a.trim().to_ascii_lowercase().as_str() {
+            "auto" => crate::config::Addressing::Auto,
+            "virtual" | "virtual-host" | "vhost" => crate::config::Addressing::Virtual,
+            "path" => crate::config::Addressing::Path,
+            other => anyhow::bail!("invalid --addressing `{other}` (auto, virtual or path)"),
+        };
+    }
+    if k.checksum.is_some() {
+        kn.provider.checksum = k.checksum.clone();
+    }
+    if k.sse.is_some() {
+        kn.provider.sse = k.sse.clone();
     }
 
     let cs = &mut p.cost;

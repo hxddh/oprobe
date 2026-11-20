@@ -1,5 +1,198 @@
 {
   "$defs": {
+    "Access": {
+      "description": "Access tested with real requests.",
+      "enum": [
+        "allowed",
+        "denied",
+        "failed",
+        "skipped"
+      ],
+      "type": "string"
+    },
+    "CapabilityMatrix": {
+      "description": "The provider capability matrix (doctor, capabilities): what the OpenDAL service supports\nand the limits it applies.",
+      "properties": {
+        "copy": {
+          "type": "boolean"
+        },
+        "delete": {
+          "type": "boolean"
+        },
+        "delete_max_count": {
+          "description": "Keys per batch delete request (1: no batch deletes).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "list": {
+          "type": "boolean"
+        },
+        "list_with_limit": {
+          "type": "boolean"
+        },
+        "list_with_recursive": {
+          "type": "boolean"
+        },
+        "list_with_versions": {
+          "type": "boolean"
+        },
+        "presign_read": {
+          "type": "boolean"
+        },
+        "presign_write": {
+          "type": "boolean"
+        },
+        "read": {
+          "type": "boolean"
+        },
+        "read_with_if_match": {
+          "type": "boolean"
+        },
+        "read_with_suffix": {
+          "description": "`Range: bytes=-N` (footer reads without HEAD).",
+          "type": "boolean"
+        },
+        "read_with_version": {
+          "type": "boolean"
+        },
+        "rename": {
+          "type": "boolean"
+        },
+        "stat": {
+          "type": "boolean"
+        },
+        "write": {
+          "type": "boolean"
+        },
+        "write_can_append": {
+          "type": "boolean"
+        },
+        "write_can_empty": {
+          "type": "boolean"
+        },
+        "write_can_multi": {
+          "type": "boolean"
+        },
+        "write_multi_max_size_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "write_multi_min_size_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "write_total_max_size_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "write_with_content_type": {
+          "type": "boolean"
+        },
+        "write_with_if_match": {
+          "type": "boolean"
+        },
+        "write_with_if_not_exists": {
+          "type": "boolean"
+        },
+        "write_with_user_metadata": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "read",
+        "write",
+        "stat",
+        "list",
+        "delete",
+        "copy",
+        "rename",
+        "presign_read",
+        "presign_write",
+        "read_with_suffix",
+        "read_with_if_match",
+        "read_with_version",
+        "write_can_multi",
+        "write_can_append",
+        "write_can_empty",
+        "write_with_if_not_exists",
+        "write_with_if_match",
+        "write_with_user_metadata",
+        "write_with_content_type",
+        "list_with_limit",
+        "list_with_recursive",
+        "list_with_versions",
+        "delete_max_count"
+      ],
+      "type": "object"
+    },
+    "CertChain": {
+      "description": "The chain as presented (leaf first).",
+      "properties": {
+        "certs": {
+          "items": {
+            "$ref": "#/$defs/CertInfo"
+          },
+          "type": "array"
+        },
+        "total_bytes": {
+          "description": "Total DER size the server sends in every full handshake.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "certs",
+        "total_bytes"
+      ],
+      "type": "object"
+    },
+    "CertInfo": {
+      "description": "One certificate the server presented.",
+      "properties": {
+        "der_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "expires_in_days": {
+          "description": "Days until `notAfter` (negative: expired).",
+          "format": "int64",
+          "type": "integer"
+        },
+        "issuer": {
+          "type": "string"
+        },
+        "not_after": {
+          "description": "`notAfter`, RFC 3339 (UTC).",
+          "type": "string"
+        },
+        "subject": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "subject",
+        "issuer",
+        "not_after",
+        "expires_in_days",
+        "der_bytes"
+      ],
+      "type": "object"
+    },
     "CheckStatus": {
       "description": "Outcome of one check.",
       "enum": [
@@ -9,6 +202,54 @@
         "skipped"
       ],
       "type": "string"
+    },
+    "CredentialInfo": {
+      "description": "Where the credentials come from (as far as it can be told without using them).",
+      "properties": {
+        "detail": {
+          "type": "string"
+        },
+        "source": {
+          "description": "`options`, `environment`, `profile`, `web_identity`, `container`, `adc`,\n`service_principal`, `workload_identity`, `az_cli`, `instance_metadata`, `anonymous`,\n`lab`, `none_needed`, `provider_chain`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "source",
+        "detail"
+      ],
+      "type": "object"
+    },
+    "DnsInfo": {
+      "properties": {
+        "a": {
+          "description": "IPv4 answers.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "aaaa": {
+          "description": "IPv6 answers.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "host": {
+          "type": "string"
+        },
+        "lookup": {
+          "$ref": "#/$defs/Quantiles"
+        }
+      },
+      "required": [
+        "host",
+        "a",
+        "aaaa",
+        "lookup"
+      ],
+      "type": "object"
     },
     "DoctorCheck": {
       "properties": {
@@ -34,29 +275,258 @@
         "detail"
       ],
       "type": "object"
+    },
+    "Permissions": {
+      "properties": {
+        "delete": {
+          "$ref": "#/$defs/Access"
+        },
+        "list": {
+          "$ref": "#/$defs/Access"
+        },
+        "read": {
+          "$ref": "#/$defs/Access"
+        },
+        "stat": {
+          "$ref": "#/$defs/Access"
+        },
+        "write": {
+          "$ref": "#/$defs/Access"
+        }
+      },
+      "required": [
+        "list",
+        "read",
+        "write",
+        "stat",
+        "delete"
+      ],
+      "type": "object"
+    },
+    "Quantiles": {
+      "description": "Latency distribution in milliseconds.",
+      "properties": {
+        "count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_ms": {
+          "format": "double",
+          "type": "number"
+        },
+        "mean_ms": {
+          "format": "double",
+          "type": "number"
+        },
+        "p50_ms": {
+          "format": "double",
+          "type": "number"
+        },
+        "p90_ms": {
+          "format": "double",
+          "type": "number"
+        },
+        "p999_ms": {
+          "format": "double",
+          "type": "number"
+        },
+        "p99_ms": {
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "count",
+        "mean_ms",
+        "p50_ms",
+        "p90_ms",
+        "p99_ms",
+        "p999_ms",
+        "max_ms"
+      ],
+      "type": "object"
+    },
+    "RegionInfo": {
+      "properties": {
+        "detected": {
+          "description": "The region the service reports for the bucket, when it differs from the configured one.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "region": {
+          "type": "string"
+        },
+        "source": {
+          "$ref": "#/$defs/RegionSource"
+        }
+      },
+      "required": [
+        "region",
+        "source"
+      ],
+      "type": "object"
+    },
+    "RegionSource": {
+      "description": "Where the region of an S3 target comes from.",
+      "oneOf": [
+        {
+          "const": "configured",
+          "description": "`region` option (URL, flag, target).",
+          "type": "string"
+        },
+        {
+          "const": "environment",
+          "description": "`AWS_REGION` / `AWS_DEFAULT_REGION`.",
+          "type": "string"
+        },
+        {
+          "const": "detected",
+          "description": "Asked the service (`x-amz-bucket-region` of a HeadBucket, or the endpoint's name).",
+          "type": "string"
+        },
+        {
+          "const": "default",
+          "description": "Nothing known: OpenDAL's default (`us-east-1`).",
+          "type": "string"
+        }
+      ]
+    },
+    "TlsDoctor": {
+      "properties": {
+        "alpn": {
+          "type": "string"
+        },
+        "chain": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CertChain"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "cipher": {
+          "type": "string"
+        },
+        "group": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "handshake": {
+          "$ref": "#/$defs/Quantiles"
+        },
+        "resumption": {
+          "description": "Handshakes after the first resumed the session.",
+          "type": "boolean"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "version",
+        "alpn",
+        "cipher",
+        "resumption",
+        "handshake"
+      ],
+      "type": "object"
     }
   },
   "$id": "https://github.com/hxddh/oprobe/schemas/3/doctor.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "Result of `oprobe doctor`",
   "properties": {
+    "addressing": {
+      "description": "S3 bucket addressing: `virtual_host` or `path`.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "capabilities": {
+      "$ref": "#/$defs/CapabilityMatrix",
+      "description": "What the OpenDAL service supports (drives workloads, the tuner and `compat`)."
+    },
     "checks": {
       "items": {
         "$ref": "#/$defs/DoctorCheck"
       },
       "type": "array"
     },
+    "clock_skew_s": {
+      "format": "double",
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "credentials": {
+      "$ref": "#/$defs/CredentialInfo"
+    },
+    "dns": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/DnsInfo"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "endpoint": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "failed_count": {
       "format": "uint64",
       "minimum": 0,
       "type": "integer"
     },
+    "next_command": {
+      "description": "A command to run next.",
+      "type": "string"
+    },
+    "permissions": {
+      "$ref": "#/$defs/Permissions"
+    },
     "ready": {
       "description": "No check failed: the target can be benchmarked.",
       "type": "boolean"
     },
+    "region": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/RegionInfo"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "scheme": {
+      "type": "string"
+    },
     "target": {
       "type": "string"
+    },
+    "tls": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/TlsDoctor"
+        },
+        {
+          "type": "null"
+        }
+      ]
     },
     "warned_count": {
       "format": "uint64",
@@ -66,10 +536,15 @@
   },
   "required": [
     "target",
+    "scheme",
     "checks",
+    "credentials",
+    "permissions",
+    "capabilities",
     "failed_count",
     "warned_count",
-    "ready"
+    "ready",
+    "next_command"
   ],
   "title": "oprobe doctor",
   "type": "object",

@@ -80,6 +80,13 @@ pub fn accepted_keys(scheme: &str) -> Option<BTreeSet<&'static str>> {
         "http" => fields_of::<HttpConfig>(),
         "fs" => fields_of::<FsConfig>(),
         "memory" => fields_of::<MemoryConfig>(),
+        "azdls" => fields_of::<AzdlsConfig>(),
+        "azfile" => fields_of::<AzfileConfig>(),
+        "obs" => fields_of::<ObsConfig>(),
+        "swift" => fields_of::<SwiftConfig>(),
+        "tos" => fields_of::<TosConfig>(),
+        "webhdfs" => fields_of::<WebhdfsConfig>(),
+        "upyun" => fields_of::<UpyunConfig>(),
         _ => return None,
     };
     Some(fields.into_iter().collect())

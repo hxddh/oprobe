@@ -239,6 +239,18 @@ pub struct MixEntry {
     pub footer_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recursive: Option<bool>,
+    /// `parquet_scan`: footer read with a suffix range, no HEAD.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suffix: Option<bool>,
+    /// `delete`: keys per batch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch_count: Option<u32>,
+    /// `list_paged`: keys per page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit_count: Option<u32>,
+    /// `metadata_write`: user-metadata pairs per object.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata_entries_count: Option<u32>,
 }
 
 /// Client knob values in machine units.
@@ -258,6 +270,12 @@ pub struct KnobValues {
     pub retries_count: u64,
     pub tail_cut: bool,
     pub timeout_ms: u64,
+    /// Addressing style, checksum and SSE (S3).
+    #[serde(
+        default,
+        skip_serializing_if = "crate::config::ProviderKnobs::is_default"
+    )]
+    pub provider: crate::config::ProviderKnobs,
 }
 
 impl From<&Knobs> for KnobValues {
@@ -276,6 +294,7 @@ impl From<&Knobs> for KnobValues {
             retries_count: k.retries as u64,
             tail_cut: k.tail_cut,
             timeout_ms: k.timeout.get().as_millis() as u64,
+            provider: k.provider.clone(),
         }
     }
 }
@@ -297,6 +316,7 @@ impl KnobValues {
             retries: self.retries_count as usize,
             tail_cut: self.tail_cut,
             timeout: crate::util::HumanDuration(std::time::Duration::from_millis(self.timeout_ms)),
+            provider: self.provider.clone(),
         }
     }
 }
@@ -493,6 +513,9 @@ pub struct TlsInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cipher: Option<String>,
     pub handshake: Quantiles,
+    /// Full / resumed / HelloRetryRequest handshakes, versions, ciphers and groups.
+    #[serde(default)]
+    pub handshakes: crate::net::stats::TlsHandshakeStats,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -501,6 +524,9 @@ pub struct TcpInfo {
     pub connect: Quantiles,
     pub proxy_connect: Quantiles,
     pub dialed_count: u64,
+    /// Kernel TCP statistics at request end (Linux `TCP_INFO`, macOS `TCP_CONNECTION_INFO`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kernel: Option<crate::net::stats::TcpKernelStats>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]

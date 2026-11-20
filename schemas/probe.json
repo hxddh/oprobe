@@ -1,5 +1,60 @@
 {
   "$defs": {
+    "CertChain": {
+      "description": "The chain as presented (leaf first).",
+      "properties": {
+        "certs": {
+          "items": {
+            "$ref": "#/$defs/CertInfo"
+          },
+          "type": "array"
+        },
+        "total_bytes": {
+          "description": "Total DER size the server sends in every full handshake.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "certs",
+        "total_bytes"
+      ],
+      "type": "object"
+    },
+    "CertInfo": {
+      "description": "One certificate the server presented.",
+      "properties": {
+        "der_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "expires_in_days": {
+          "description": "Days until `notAfter` (negative: expired).",
+          "format": "int64",
+          "type": "integer"
+        },
+        "issuer": {
+          "type": "string"
+        },
+        "not_after": {
+          "description": "`notAfter`, RFC 3339 (UTC).",
+          "type": "string"
+        },
+        "subject": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "subject",
+        "issuer",
+        "not_after",
+        "expires_in_days",
+        "der_bytes"
+      ],
+      "type": "object"
+    },
     "ProbeSample": {
       "properties": {
         "cold_ttfb_ms": {
@@ -99,6 +154,40 @@
         "max_ms"
       ],
       "type": "object"
+    },
+    "TlsRow": {
+      "description": "TLS details of the connection a request used (when the transport reports them).",
+      "properties": {
+        "cipher": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "group": {
+          "description": "Negotiated key-exchange group, e.g. `X25519MLKEM768`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "hrr": {
+          "description": "The handshake needed a HelloRetryRequest.",
+          "type": "boolean"
+        },
+        "resumed": {
+          "type": "boolean"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "resumed",
+        "version",
+        "hrr"
+      ],
+      "type": "object"
     }
   },
   "$id": "https://github.com/hxddh/oprobe/schemas/3/probe.json",
@@ -107,6 +196,17 @@
   "properties": {
     "alpn": {
       "type": "string"
+    },
+    "cert_chain": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/CertChain"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The certificate chain the server presented (`ProbeOptions::certs`)."
     },
     "cipher": {
       "type": "string"
@@ -132,6 +232,13 @@
     },
     "endpoint": {
       "type": "string"
+    },
+    "handshakes": {
+      "description": "Every handshake (the first is full; later ones resume when the server allows it).",
+      "items": {
+        "$ref": "#/$defs/TlsRow"
+      },
+      "type": "array"
     },
     "host": {
       "type": "string"

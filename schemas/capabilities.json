@@ -1,5 +1,25 @@
 {
   "$defs": {
+    "Addressing": {
+      "description": "S3 bucket addressing.",
+      "oneOf": [
+        {
+          "const": "auto",
+          "description": "As the target configures it (OpenDAL's default: path style unless\n`enable_virtual_host_style`).",
+          "type": "string"
+        },
+        {
+          "const": "virtual",
+          "description": "`https://bucket.s3.region.amazonaws.com/key`.",
+          "type": "string"
+        },
+        {
+          "const": "path",
+          "description": "`https://s3.region.amazonaws.com/bucket/key`.",
+          "type": "string"
+        }
+      ]
+    },
     "DatasetInfo": {
       "properties": {
         "existing_prefix": {
@@ -248,6 +268,10 @@
           "minimum": 0,
           "type": "integer"
         },
+        "provider": {
+          "$ref": "#/$defs/ProviderKnobs",
+          "description": "Addressing style, checksum and SSE (S3)."
+        },
         "range_gap_bytes": {
           "format": "uint64",
           "minimum": 0,
@@ -353,6 +377,15 @@
     "MixEntry": {
       "description": "One weighted operation of the mix.",
       "properties": {
+        "batch_count": {
+          "description": "`delete`: keys per batch.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "column_bytes": {
           "format": "uint64",
           "minimum": 0,
@@ -377,6 +410,24 @@
             "null"
           ]
         },
+        "limit_count": {
+          "description": "`list_paged`: keys per page.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "metadata_entries_count": {
+          "description": "`metadata_write`: user-metadata pairs per object.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "op": {
           "description": "`read`, `parquet_scan`, `write`, `multipart_write`, `stat`, `list`.",
           "type": "string"
@@ -393,6 +444,13 @@
           "minimum": 0,
           "type": [
             "integer",
+            "null"
+          ]
+        },
+        "suffix": {
+          "description": "`parquet_scan`: footer read with a suffix range, no HEAD.",
+          "type": [
+            "boolean",
             "null"
           ]
         },
@@ -496,6 +554,34 @@
         "delete_per_million_usd",
         "egress_per_gb_usd",
         "note"
+      ],
+      "type": "object"
+    },
+    "ProviderKnobs": {
+      "additionalProperties": false,
+      "description": "Provider request options measured for their overhead (S3 service options).",
+      "properties": {
+        "addressing": {
+          "$ref": "#/$defs/Addressing",
+          "default": "auto"
+        },
+        "checksum": {
+          "description": "Checksum the client computes and the server verifies on writes (`crc32c`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sse": {
+          "description": "Server-side encryption: `AES256` or `aws:kms`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "addressing"
       ],
       "type": "object"
     },

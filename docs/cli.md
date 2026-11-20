@@ -100,6 +100,9 @@ oprobe run [OPTIONS] [TARGET]
 | `--cache <SIZE>` | Enable the in-memory read cache with this size (e.g. 512MiB) |
 | `--retries <RETRIES>` | Retry attempts for temporary errors |
 | `--tail-cut` | Cancel and retry straggler requests (TailCutLayer) |
+| `--addressing <STYLE>` | S3 bucket addressing: auto (as configured), virtual (bucket.host) or path (host/bucket) |
+| `--checksum <ALGO>` | Checksum computed by the client and verified by the server on writes (S3: crc32c) |
+| `--sse <MODE>` | Server-side encryption of written objects (S3: AES256, aws:kms) |
 
 *Cost*
 
@@ -205,6 +208,9 @@ oprobe tune [OPTIONS] [TARGET]
 | `--cache <SIZE>` | Enable the in-memory read cache with this size (e.g. 512MiB) |
 | `--retries <RETRIES>` | Retry attempts for temporary errors |
 | `--tail-cut` | Cancel and retry straggler requests (TailCutLayer) |
+| `--addressing <STYLE>` | S3 bucket addressing: auto (as configured), virtual (bucket.host) or path (host/bucket) |
+| `--checksum <ALGO>` | Checksum computed by the client and verified by the server on writes (S3: crc32c) |
+| `--sse <MODE>` | Server-side encryption of written objects (S3: AES256, aws:kms) |
 
 *Cost*
 
@@ -575,6 +581,9 @@ oprobe watch [OPTIONS] [TARGET]
 | `--cache <SIZE>` | Enable the in-memory read cache with this size (e.g. 512MiB) |
 | `--retries <RETRIES>` | Retry attempts for temporary errors |
 | `--tail-cut` | Cancel and retry straggler requests (TailCutLayer) |
+| `--addressing <STYLE>` | S3 bucket addressing: auto (as configured), virtual (bucket.host) or path (host/bucket) |
+| `--checksum <ALGO>` | Checksum computed by the client and verified by the server on writes (S3: crc32c) |
+| `--sse <MODE>` | Server-side encryption of written objects (S3: AES256, aws:kms) |
 
 *Cost*
 
@@ -662,6 +671,9 @@ oprobe matrix [OPTIONS] [TARGET]
 | `--cache <SIZE>` | Enable the in-memory read cache with this size (e.g. 512MiB) |
 | `--retries <RETRIES>` | Retry attempts for temporary errors |
 | `--tail-cut` | Cancel and retry straggler requests (TailCutLayer) |
+| `--addressing <STYLE>` | S3 bucket addressing: auto (as configured), virtual (bucket.host) or path (host/bucket) |
+| `--checksum <ALGO>` | Checksum computed by the client and verified by the server on writes (S3: crc32c) |
+| `--sse <MODE>` | Server-side encryption of written objects (S3: AES256, aws:kms) |
 
 *Cost*
 
@@ -707,8 +719,24 @@ oprobe matrix [OPTIONS] [TARGET]
 Correctness & compatibility suite for a target
 
 ```text
-oprobe compat [OPTIONS]
+oprobe compat [OPTIONS] [TARGET]
 ```
+
+*Target*
+
+| argument | description |
+|---|---|
+| `<TARGET>` | Target name (see `oprobe target list`) or storage URL: s3://bucket/prefix, gcs://bucket, azblob://container, oss://, cos://, b2://, fs:///path, memory:// |
+| `-p, --profile <FILE>` | Load a profile (TOML); flags override its values |
+| `--endpoint <ENDPOINT>` | Custom endpoint (MinIO, R2, Ceph, private clouds) |
+| `--region <REGION>` | Region of the bucket (e.g. us-east-1); most S3-compatible services accept any value |
+| `--option <KEY=VALUE>` | Extra backend option, repeatable (e.g. --option enable_virtual_host_style=true) |
+| `--anonymous` | Access a public bucket without credentials (s3, gcs, azblob, oss: unsigned requests) |
+| `--ca-cert <PEM>` | Trust an extra PEM CA bundle |
+| `--insecure` | Skip TLS certificate verification (development only) |
+| `--proxy <PROXY>` | Egress proxy URL, or `none` to ignore HTTPS_PROXY/HTTP_PROXY |
+| `--read-only` | Refuse to run (compat writes test objects); for symmetry with other commands |
+| `--min-score <PCT>` | Exit 3 when the score (percent of the checks that ran) is below this |
 
 ## `oprobe baseline`
 
@@ -779,6 +807,9 @@ oprobe lab [OPTIONS]
 | argument | description |
 |---|---|
 | `--bind <BIND>` | · default `127.0.0.1:9000` |
+| `--scenario <SCENARIO>` | Start from a fault preset: clean, demo, throttle, stragglers, lossy, flaky (the flags below override it) |
+| `--error-every <ERROR_EVERY>` | Answer every Nth request with 500 InternalError |
+| `--reset-every <RESET_EVERY>` | Drop the connection on every Nth request |
 | `--tls` | Serve HTTPS (certificate for localhost / 127.0.0.1) |
 | `--h1-only` | Disable HTTP/2 |
 | `--latency <LATENCY>` | Added time-to-first-byte for every request (e.g. 20ms) · default `0ms` |

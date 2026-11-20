@@ -113,6 +113,63 @@ impl Api {
         }
     }
 
+    /// The API class of an OpenDAL `ServiceOperation` name (the exact backend API a service
+    /// attached to its request), across providers: S3 `ListObjectsV2`, Azure `ListBlobs` and
+    /// B2 `ListFileNames` are all [`Api::ListObjects`]. Unknown names are [`Api::Other`].
+    pub fn from_service_operation(name: &str) -> Api {
+        match name {
+            "GetObject" | "Get" | "GetBlob" | "DownloadFileByName" | "PresignedGetObject" => {
+                Api::GetObject
+            }
+            "HeadObject" | "Head" | "GetBlobProperties" | "GetFileInfo" | "StatObject" => {
+                Api::HeadObject
+            }
+            "PutObject"
+            | "Put"
+            | "PutBlob"
+            | "InsertObject"
+            | "UploadFile"
+            | "AppendObject"
+            | "AppendBlock"
+            | "Mkcol"
+            | "Proppatch"
+            | "ConditionalPutObject" => Api::PutObject,
+            "CreateMultipartUpload"
+            | "InitiateMultipartUpload"
+            | "InitiateResumableUpload"
+            | "StartLargeFile" => Api::CreateMultipart,
+            "UploadPart"
+            | "PutBlock"
+            | "UploadResumableChunk"
+            | "UploadPartCopy"
+            | "PutBlockFromUrl" => Api::UploadPart,
+            "CompleteMultipartUpload" | "PutBlockList" | "ComposeObject" | "FinishLargeFile" => {
+                Api::CompleteMultipart
+            }
+            "AbortMultipartUpload" | "CancelResumableUpload" | "CancelLargeFile" => {
+                Api::AbortMultipart
+            }
+            "ListObjects" | "ListObjectsV2" | "ListObjectVersions" | "ListBlobs"
+            | "ListFileNames" | "ListFileVersions" => Api::ListObjects,
+            "DeleteObject" | "Delete" | "DeleteBlob" | "HideFile" | "DeleteFileVersion" => {
+                Api::DeleteObject
+            }
+            "DeleteObjects"
+            | "BatchDeleteObjects"
+            | "BatchDeleteBlobs"
+            | "DeleteMultipleObjects" => Api::DeleteObjects,
+            "CopyObject" | "Copy" | "CopyBlob" | "CopyFile" | "RewriteObject" | "Move" => {
+                Api::CopyObject
+            }
+            "AuthorizeAccount"
+            | "GetUploadUrl"
+            | "GetUploadPartUrl"
+            | "GetDownloadAuthorization"
+            | "Test" => Api::Control,
+            _ => Api::Other,
+        }
+    }
+
     pub fn billing_class(&self) -> BillingClass {
         match self {
             Api::PutObject
@@ -196,6 +253,16 @@ pub struct RequestRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(with = "Option<String>")]
     pub remote: Option<std::net::SocketAddr>,
+    /// The exact backend API (OpenDAL `ServiceOperation`) when the service attached one; the
+    /// request row's `api`. `api` above is its class (aggregation, billing).
+    #[serde(skip)]
+    pub service_op: Option<&'static str>,
+    /// TLS handshake of the connection, on the request that dialed it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<Box<crate::model::TlsRow>>,
+    /// Kernel TCP statistics of the connection at request end.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tcp: Option<Box<crate::model::TcpRow>>,
 }
 
 impl RequestRecord {
@@ -407,5 +474,28 @@ mod tests {
             classify_http(&Method::POST, "/b2api/v2/b2_list_file_names", None),
             Api::ListObjects
         );
+    }
+
+    #[test]
+    fn service_operations_map_to_api_classes() {
+        for (name, api) in [
+            ("ListObjectsV2", Api::ListObjects),
+            ("ListBlobs", Api::ListObjects),
+            ("PutBlockList", Api::CompleteMultipart),
+            ("InsertObject", Api::PutObject),
+            ("GetBlobProperties", Api::HeadObject),
+            ("BatchDeleteBlobs", Api::DeleteObjects),
+            ("AuthorizeAccount", Api::Control),
+            ("PresignedGetObject", Api::GetObject),
+            ("Whatever", Api::Other),
+        ] {
+            assert_eq!(Api::from_service_operation(name), api, "{name}");
+        }
+        // Canonical names map onto themselves.
+        for a in Api::ALL {
+            if !matches!(a, Api::Control | Api::Other) {
+                assert_eq!(Api::from_service_operation(a.label()), a);
+            }
+        }
     }
 }

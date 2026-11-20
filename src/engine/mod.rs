@@ -7,6 +7,7 @@ pub mod ops;
 pub mod procstat;
 pub mod runner;
 pub mod stack;
+pub mod workloads;
 
 pub use cleanup::CleanupSummary;
 pub use runner::{Cancel, Progress, ProgressFn, RunOptions, Session, SessionOptions};

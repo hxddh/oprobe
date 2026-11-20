@@ -5,7 +5,10 @@ pub mod dial;
 pub mod fidelity;
 pub mod probe;
 pub mod proxy;
+pub mod stats;
+pub mod tcpinfo;
 pub mod tls;
+pub mod tlsinfo;
 pub mod transport;
 
 pub use fidelity::FidelityTransport;

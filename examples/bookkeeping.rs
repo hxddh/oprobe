@@ -41,6 +41,9 @@ fn main() {
                         retry_after_ms: None,
                         error: None,
                         remote: None,
+                        service_op: None,
+                        tls: None,
+                        tcp: None,
                     };
                     rec.request_finished();
                     OpScope::current().unwrap().push_request(r);

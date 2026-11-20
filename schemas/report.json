@@ -1,5 +1,25 @@
 {
   "$defs": {
+    "Addressing": {
+      "description": "S3 bucket addressing.",
+      "oneOf": [
+        {
+          "const": "auto",
+          "description": "As the target configures it (OpenDAL's default: path style unless\n`enable_virtual_host_style`).",
+          "type": "string"
+        },
+        {
+          "const": "virtual",
+          "description": "`https://bucket.s3.region.amazonaws.com/key`.",
+          "type": "string"
+        },
+        {
+          "const": "path",
+          "description": "`https://s3.region.amazonaws.com/bucket/key`.",
+          "type": "string"
+        }
+      ]
+    },
     "Api": {
       "description": "Storage API name, e.g. GetObject (OpenDAL ServiceOperation)",
       "type": "string"
@@ -619,6 +639,10 @@
           "minimum": 0,
           "type": "integer"
         },
+        "provider": {
+          "$ref": "#/$defs/ProviderKnobs",
+          "description": "Addressing style, checksum and SSE (S3)."
+        },
         "range_gap_bytes": {
           "format": "uint64",
           "minimum": 0,
@@ -924,6 +948,10 @@
           "minimum": 0,
           "type": "integer"
         },
+        "provider": {
+          "$ref": "#/$defs/ProviderKnobs",
+          "description": "Addressing style, checksum and SSE (S3)."
+        },
         "range_gap_bytes": {
           "format": "uint64",
           "minimum": 0,
@@ -982,6 +1010,15 @@
     "MixEntry": {
       "description": "One weighted operation of the mix.",
       "properties": {
+        "batch_count": {
+          "description": "`delete`: keys per batch.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "column_bytes": {
           "format": "uint64",
           "minimum": 0,
@@ -1006,6 +1043,24 @@
             "null"
           ]
         },
+        "limit_count": {
+          "description": "`list_paged`: keys per page.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "metadata_entries_count": {
+          "description": "`metadata_write`: user-metadata pairs per object.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "op": {
           "description": "`read`, `parquet_scan`, `write`, `multipart_write`, `stat`, `list`.",
           "type": "string"
@@ -1022,6 +1077,13 @@
           "minimum": 0,
           "type": [
             "integer",
+            "null"
+          ]
+        },
+        "suffix": {
+          "description": "`parquet_scan`: footer read with a suffix range, no HEAD.",
+          "type": [
+            "boolean",
             "null"
           ]
         },
@@ -1245,6 +1307,34 @@
         "failed_requests_usd",
         "overread_usd",
         "cache_savings_usd"
+      ],
+      "type": "object"
+    },
+    "ProviderKnobs": {
+      "additionalProperties": false,
+      "description": "Provider request options measured for their overhead (S3 service options).",
+      "properties": {
+        "addressing": {
+          "$ref": "#/$defs/Addressing",
+          "default": "auto"
+        },
+        "checksum": {
+          "description": "Checksum the client computes and the server verifies on writes (`crc32c`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sse": {
+          "description": "Server-side encryption: `AES256` or `aws:kms`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "addressing"
       ],
       "type": "object"
     },
@@ -1799,6 +1889,17 @@
         "dns": {
           "$ref": "#/$defs/Quantiles"
         },
+        "kernel": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TcpKernelStats"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Kernel TCP statistics at request end (Linux `TCP_INFO`, macOS `TCP_CONNECTION_INFO`)."
+        },
         "proxy_connect": {
           "$ref": "#/$defs/Quantiles"
         }
@@ -1808,6 +1909,82 @@
         "connect",
         "proxy_connect",
         "dialed_count"
+      ],
+      "type": "object"
+    },
+    "TcpKernelStats": {
+      "description": "Kernel TCP statistics (`TCP_INFO`) over the requests of the window.",
+      "properties": {
+        "connections_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "cwnd_p50_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "delivery_rate_p50_bits_per_s": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "retrans_count": {
+          "description": "Segments retransmitted, summed over connections (their last sample).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "retransmitting_connections_count": {
+          "description": "Connections that retransmitted at least once.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "rtt_p50_us": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "rtt_p99_us": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "rttvar_p50_us": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "rwnd_limited_ratio": {
+          "description": "Share of the busy (sending) time limited by the receive window / send buffer.",
+          "format": "double",
+          "type": "number"
+        },
+        "samples_count": {
+          "description": "Requests that carried kernel statistics.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "sndbuf_limited_ratio": {
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "samples_count",
+        "connections_count",
+        "rtt_p50_us",
+        "rtt_p99_us",
+        "rttvar_p50_us",
+        "retrans_count",
+        "retransmitting_connections_count",
+        "cwnd_p50_count",
+        "delivery_rate_p50_bits_per_s",
+        "rwnd_limited_ratio",
+        "sndbuf_limited_ratio"
       ],
       "type": "object"
     },
@@ -1872,6 +2049,72 @@
       ],
       "type": "object"
     },
+    "TlsHandshakeStats": {
+      "description": "TLS handshakes of the window (one per dialed connection).",
+      "properties": {
+        "ciphers_count": {
+          "additionalProperties": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "object"
+        },
+        "full_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "groups_count": {
+          "additionalProperties": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "object"
+        },
+        "handshakes_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "hrr_count": {
+          "description": "Handshakes that needed a HelloRetryRequest (an extra round trip: the client's first key\nshare was not one the server accepts).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "resumed_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "resumption_ratio": {
+          "description": "resumed / handshakes.",
+          "format": "double",
+          "type": "number"
+        },
+        "versions_count": {
+          "additionalProperties": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "object"
+        }
+      },
+      "required": [
+        "handshakes_count",
+        "full_count",
+        "resumed_count",
+        "hrr_count",
+        "resumption_ratio",
+        "versions_count",
+        "ciphers_count",
+        "groups_count"
+      ],
+      "type": "object"
+    },
     "TlsInfo": {
       "properties": {
         "alpn": {
@@ -1886,12 +2129,27 @@
         "handshake": {
           "$ref": "#/$defs/Quantiles"
         },
+        "handshakes": {
+          "$ref": "#/$defs/TlsHandshakeStats",
+          "default": {
+            "ciphers_count": {},
+            "full_count": 0,
+            "groups_count": {},
+            "handshakes_count": 0,
+            "hrr_count": 0,
+            "resumed_count": 0,
+            "resumption_ratio": 0.0,
+            "versions_count": {}
+          },
+          "description": "Full / resumed / HelloRetryRequest handshakes, versions, ciphers and groups."
+        },
         "version": {
           "type": "string"
         }
       },
       "required": [
-        "handshake"
+        "handshake",
+        "handshakes"
       ],
       "type": "object"
     },

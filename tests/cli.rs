@@ -210,6 +210,10 @@ fn errors_are_classified_with_exit_codes() {
     let o = env.run(&["run", "no-such-target", "-o", "json"]);
     assert_eq!(o.status.code(), Some(2));
     assert_eq!(error_code(&o), "usage.unknown_target");
+    // `target test` is the doctor of a configured target.
+    let o = env.run(&["target", "test", "x", "-o", "json"]);
+    assert_eq!(o.status.code(), Some(2));
+    assert_eq!(error_code(&o), "usage.unknown_target");
     // ndjson: version line, then the error event.
     let o = env.run(&["runs", "show", "nope", "-o", "ndjson"]);
     assert_eq!(o.status.code(), Some(2));

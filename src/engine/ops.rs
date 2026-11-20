@@ -9,6 +9,7 @@ use opendal::{Buffer, Operator};
 use rand::Rng;
 
 use super::dataset::{Dataset, PayloadPool, Picker};
+use super::workloads::WorkloadState;
 use crate::config::{Knobs, OpKind};
 use crate::trace::Recorder;
 
@@ -24,6 +25,8 @@ pub struct OpCtx {
     pub scratch_prefix: String,
     /// Sampled written objects to verify after the run: (path, crc).
     pub written: Arc<std::sync::Mutex<Vec<(String, u32)>>>,
+    /// Service capability and the state of delete / conditional-write operations.
+    pub state: WorkloadState,
 }
 
 /// Outcome of one logical operation.
@@ -36,11 +39,18 @@ pub fn verb(kind: &OpKind) -> &'static str {
     match kind {
         OpKind::Read { size: None } => "read.full",
         OpKind::Read { size: Some(_) } => "read.range",
-        OpKind::ParquetScan { .. } => "parquet.scan",
+        OpKind::ParquetScan { suffix: false, .. } => "parquet.scan",
+        OpKind::ParquetScan { suffix: true, .. } => "parquet.scan.suffix",
         OpKind::Write { .. } => "write",
         OpKind::MultipartWrite { .. } => "write.multipart",
         OpKind::Stat => "stat",
         OpKind::List { .. } => "list",
+        OpKind::ListPaged { .. } => "list.paged",
+        OpKind::Delete { .. } => "delete.batch",
+        OpKind::Copy => "copy",
+        OpKind::PresignedRead => "read.presigned",
+        OpKind::ConditionalWrite { .. } => "write.conditional",
+        OpKind::MetadataWrite { .. } => "write.metadata",
     }
 }
 
@@ -110,11 +120,22 @@ pub async fn execute(
             columns,
             column_size,
             footer_size,
+            suffix,
         } => {
             let obj = pick(rng)?;
             key.clone_from(&obj.path);
-            let meta = ctx.op.stat(&obj.path).await?;
-            let size = meta.content_length();
+            let (size, f) = if *suffix {
+                // One GET `Range: bytes=-N` and no HEAD: a reader learns the file size from the
+                // response's Content-Range (here: from the dataset).
+                let f = ctx
+                    .op
+                    .read_with(&obj.path)
+                    .range(opendal::BytesRange::suffix(footer_size.0))
+                    .await?;
+                (obj.size, Some(f))
+            } else {
+                (ctx.op.stat(&obj.path).await?.content_length(), None)
+            };
             let footer = footer_size.0.min(size);
             let reader = ctx
                 .op
@@ -123,7 +144,10 @@ pub async fn execute(
                 .gap(k.range_gap.as_usize())
                 .concurrent(io)
                 .await?;
-            let f = reader.read(size - footer..size).await?;
+            let f = match f {
+                Some(f) => f,
+                None => reader.read(size - footer..size).await?,
+            };
             let mut logical = f.len() as u64;
             let body = size - footer;
             let col = column_size.0.min(body.max(1));
@@ -149,13 +173,24 @@ pub async fn execute(
             })
         }
         OpKind::Write { size } => {
-            let path = format!("{}w-{slot:05}.bin", ctx.scratch_prefix);
+            let path = if ctx.state.unique_writes {
+                // Deletes consume what writes create: every write makes a new key.
+                format!(
+                    "{}w-{slot:05}-{}.bin",
+                    ctx.scratch_prefix,
+                    ctx.state.next_seq()
+                )
+            } else {
+                format!("{}w-{slot:05}.bin", ctx.scratch_prefix)
+            };
             key.clone_from(&path);
             let data = ctx.pool.slice(rng, size.as_usize());
             let len = data.len() as u64;
             let crc = (ctx.verify && slot.is_multiple_of(16)).then(|| crate::util::crc32c(&data));
             ctx.op.write(&path, data).await?;
-            if let Some(crc) = crc {
+            if ctx.state.unique_writes {
+                ctx.state.push_deletable(path.clone());
+            } else if let Some(crc) = crc {
                 push_written(ctx, path, crc);
             }
             Ok(OpOutcome {
@@ -214,6 +249,180 @@ pub async fn execute(
                 logical_write: 0,
             })
         }
+        OpKind::ListPaged { .. }
+        | OpKind::Delete { .. }
+        | OpKind::Copy
+        | OpKind::PresignedRead
+        | OpKind::ConditionalWrite { .. }
+        | OpKind::MetadataWrite { .. } => execute_more(ctx, kind, rng, slot, key).await,
+    }
+}
+
+/// The newer operations (capability-dependent; `workloads::adapt_mix` removed or replaced
+/// those the service cannot run).
+async fn execute_more(
+    ctx: &OpCtx,
+    kind: &OpKind,
+    rng: &mut (impl Rng + Send),
+    slot: u64,
+    key: &mut String,
+) -> Result<OpOutcome> {
+    let ds = &ctx.dataset;
+    let pick = |rng: &mut (dyn rand::RngCore + Send)| -> Result<&super::dataset::DataObject> {
+        if ds.objects.is_empty() {
+            anyhow::bail!("dataset has no objects to read");
+        }
+        Ok(&ds.objects[ctx.picker.pick(rng)])
+    };
+    let none = OpOutcome {
+        logical_read: 0,
+        logical_write: 0,
+    };
+    match kind {
+        OpKind::ListPaged { limit } => {
+            let parts = &ds.partitions;
+            let prefix = if parts.is_empty() {
+                ds.prefix.clone()
+            } else {
+                parts[rng.gen_range(0..parts.len())].clone()
+            };
+            key.clone_from(&prefix);
+            let mut lister = ctx
+                .op
+                .lister_with(&prefix)
+                .limit((*limit).max(1) as usize)
+                .await?;
+            while lister.try_next().await?.is_some() {}
+            Ok(none)
+        }
+        OpKind::Delete { batch } => {
+            let n = (*batch).max(1) as usize;
+            let mut keys = ctx.state.take_deletable(n);
+            if keys.is_empty() {
+                // Nothing written yet: delete keys that do not exist (same request, billed
+                // the same; deleting a missing key succeeds).
+                keys = (0..n)
+                    .map(|i| format!("{}d-{slot:05}-{i}.bin", ctx.scratch_prefix))
+                    .collect();
+            }
+            key.clone_from(&keys[0]);
+            ctx.op.delete_iter(keys).await?;
+            Ok(none)
+        }
+        OpKind::Copy => {
+            let obj = pick(rng)?;
+            let to = format!("{}c-{slot:05}.bin", ctx.scratch_prefix);
+            key.clone_from(&to);
+            ctx.op.copy(&obj.path, &to).await?;
+            Ok(OpOutcome {
+                logical_read: 0,
+                logical_write: obj.size,
+            })
+        }
+        OpKind::PresignedRead => {
+            let obj = pick(rng)?;
+            key.clone_from(&obj.path);
+            let signed = ctx
+                .op
+                .presign_read(&obj.path, std::time::Duration::from_secs(900))
+                .await?;
+            let mut req = http::Request::builder()
+                .method(signed.method().clone())
+                .uri(signed.uri().clone())
+                // The request row names it: the URL alone looks like any GetObject.
+                .extension(opendal::raw::ServiceOperation("PresignedGetObject"))
+                .body(Buffer::new())?;
+            *req.headers_mut() = signed.header().clone();
+            // Through the operator's own (traced) HTTP transport: no signing on this path.
+            let resp = ctx.op.context().http_transport().fetch(req).await?;
+            let status = resp.status();
+            let mut body = resp.into_body();
+            let buf = body.to_buffer().await?;
+            if !status.is_success() {
+                return Err(opendal::Error::new(
+                    if status.as_u16() == 404 {
+                        opendal::ErrorKind::NotFound
+                    } else if status.as_u16() == 403 {
+                        opendal::ErrorKind::PermissionDenied
+                    } else if matches!(status.as_u16(), 429 | 503) {
+                        opendal::ErrorKind::RateLimited
+                    } else {
+                        opendal::ErrorKind::Unexpected
+                    },
+                    format!("presigned GET answered {status}"),
+                )
+                .into());
+            }
+            if ctx.verify
+                && let Some(expected) = obj.crc
+            {
+                ctx.recorder.record_integrity(crc_of(&buf) == expected);
+            }
+            Ok(OpOutcome {
+                logical_read: buf.len() as u64,
+                logical_write: 0,
+            })
+        }
+        OpKind::ConditionalWrite { size } => {
+            let cap = &ctx.state.capability;
+            let data = ctx.pool.slice(rng, size.as_usize());
+            let len = data.len() as u64;
+            let slot_path = format!("{}cw-{slot:05}.bin", ctx.scratch_prefix);
+            let meta = match ctx.state.etag(slot).filter(|e| !e.is_empty()) {
+                // Optimistic update of the object this slot wrote last.
+                Some(etag) if cap.write_with_if_match => {
+                    key.clone_from(&slot_path);
+                    ctx.op.write_with(&slot_path, data).if_match(&etag).await?
+                }
+                _ => {
+                    // Conditional create. On the slot's key when an overwrite can follow
+                    // (If-Match); a fresh key when the service only creates conditionally or
+                    // the slot's object has no known etag.
+                    let fresh = !cap.write_with_if_match || ctx.state.etag(slot).is_some();
+                    let path = if fresh {
+                        format!(
+                            "{}cw-{slot:05}-{}.bin",
+                            ctx.scratch_prefix,
+                            ctx.state.next_seq()
+                        )
+                    } else {
+                        slot_path.clone()
+                    };
+                    key.clone_from(&path);
+                    if cap.write_with_if_not_exists {
+                        ctx.op.write_with(&path, data).if_not_exists(true).await?
+                    } else {
+                        ctx.op.write_with(&path, data).if_none_match("*").await?
+                    }
+                }
+            };
+            if *key == slot_path || ctx.state.etag(slot).is_none() {
+                ctx.state.set_etag(slot, meta.etag());
+            }
+            Ok(OpOutcome {
+                logical_read: 0,
+                logical_write: len,
+            })
+        }
+        OpKind::MetadataWrite { size, entries } => {
+            let path = format!("{}m-{slot:05}.bin", ctx.scratch_prefix);
+            key.clone_from(&path);
+            let data = ctx.pool.slice(rng, size.as_usize());
+            let len = data.len() as u64;
+            let meta: Vec<(String, String)> = (0..*entries)
+                .map(|i| (format!("oprobe-{i}"), format!("value-{slot}-{i}")))
+                .collect();
+            ctx.op
+                .write_with(&path, data)
+                .content_type("application/octet-stream")
+                .user_metadata(meta)
+                .await?;
+            Ok(OpOutcome {
+                logical_read: 0,
+                logical_write: len,
+            })
+        }
+        _ => unreachable!("handled by execute"),
     }
 }
 
