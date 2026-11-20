@@ -194,6 +194,15 @@ The storage service answered with 429 or 503 SlowDown: the request rate is above
 - **Verify:** report.resilience.throttled_responses and the retry share in report.stages.shares.retry_pct; re-run with half the concurrency and compare (`oprobe compare`); `oprobe tune TARGET` finds the throttling ceiling
 - **Knobs:** --concurrency; --max-inflight; --retries; --max-throttle-rate
 
+<a id="finding-suffix-reads"></a>
+### `suffix-reads` — Use suffix reads: saves one HEAD per file
+
+File-scan operations issue a HEAD to learn the object size before reading the footer; a suffix range read returns the footer and the size in one request. *(cost, usually info)*
+
+- **Causes:** readers that stat a file before reading its tail (Parquet/ORC footers); a reader without suffix-range support enabled
+- **Verify:** report.apis: HeadObject count close to the number of file scans; `oprobe run TARGET --preset parquet-suffix` and `oprobe compare` against the parquet preset
+- **Knobs:** --preset parquet-suffix
+
 <a id="finding-client-queue"></a>
 ### `client-queue` — Operations wait for in-flight request permits
 

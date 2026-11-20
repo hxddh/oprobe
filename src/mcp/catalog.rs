@@ -114,6 +114,22 @@ const ENTRIES: &[Entry] = &[
         ],
     },
     Entry {
+        code: "suffix-reads",
+        title: "Use suffix reads: saves one HEAD per file",
+        severity: Severity::Info,
+        category: "cost",
+        meaning: "File-scan operations issue a HEAD to learn the object size before reading the footer; a suffix range read returns the footer and the size in one request.",
+        causes: &[
+            "readers that stat a file before reading its tail (Parquet/ORC footers)",
+            "a reader without suffix-range support enabled",
+        ],
+        verify: &[
+            "report.apis: HeadObject count close to the number of file scans",
+            "`oprobe run TARGET --preset parquet-suffix` and `oprobe compare` against the parquet preset",
+        ],
+        knobs: &["--preset parquet-suffix"],
+    },
+    Entry {
         code: "client-queue",
         title: "Operations wait for in-flight request permits",
         severity: Severity::Warning,

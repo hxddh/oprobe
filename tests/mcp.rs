@@ -360,8 +360,8 @@ fn agent_workflow_over_stdio() {
     let slow: Value = serde_json::from_str(&slow).unwrap();
     assert!(!slow["ops"].as_array().unwrap().is_empty());
     let (doc, mime) = m.read(&format!("oprobe://runs/{id1}/html"));
-    assert_eq!(mime, "text/markdown");
-    assert!(!doc.is_empty());
+    assert_eq!(mime, "text/html");
+    assert!(doc.starts_with("<!doctype html>"));
     let (schema, _) = m.read("oprobe://schema/report");
     let schema: Value = serde_json::from_str(&schema).unwrap();
     assert_eq!(
