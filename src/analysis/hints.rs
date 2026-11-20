@@ -207,7 +207,7 @@ pub fn hint_for(error_chain: &str, scheme: &str) -> Option<Hint> {
             ],
         ));
     }
-    if has("connection refused") {
+    if has("connection refused") || has("actively refused") || has("os error 10061") {
         return Some(h(
             "Connection refused",
             &[
@@ -237,6 +237,13 @@ pub fn hint_for(error_chain: &str, scheme: &str) -> Option<Hint> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_connection_refused_is_recognised() {
+        let msg = "cannot reach http://127.0.0.1:9 (s3://b): No connection could be made because \
+                   the target machine actively refused it. (os error 10061)";
+        assert!(hint_for(msg, "s3").unwrap().title.contains("refused"));
+    }
 
     #[test]
     fn maps_common_failures() {

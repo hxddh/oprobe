@@ -180,8 +180,13 @@ pub async fn check_reachable(base: &Operator, target: &TargetSpec) -> Result<()>
         src = s.source();
     }
     let l = chain.to_ascii_lowercase();
+    // Wording differs by OS: "Connection refused (os error 111)" on Linux, "(os error 61)" on
+    // macOS, "No connection could be made because the target machine actively refused it.
+    // (os error 10061)" on Windows.
     let unreachable = [
         "connection refused",
+        "actively refused",
+        "os error 10061",
         "connect: ",
         "dns error",
         "failed to lookup address",
