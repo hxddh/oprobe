@@ -129,7 +129,10 @@ mod tests {
         // Process-wide CPU: this thread spins (≥ ~30 % of one core), and other tests running in
         // the same process may add to it — but never beyond every core busy.
         let cores = std::thread::available_parallelism().map_or(1, |n| n.get()) as f64;
-        assert!(pct > 30.0 && pct <= 100.0 * cores * 1.05, "cpu {pct} on {cores} cores");
+        assert!(
+            pct > 30.0 && pct <= 100.0 * cores * 1.05,
+            "cpu {pct} on {cores} cores"
+        );
         assert!(rss > 1.0);
         assert!(usage().unwrap().cpu > before.cpu);
     }
