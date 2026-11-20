@@ -3,7 +3,7 @@ use std::process::ExitCode;
 use clap::Parser;
 
 fn main() -> ExitCode {
-    let cli = oprobe::cli::Cli::parse();
+    let cli = oprobe::cli::Cli::parse_from(oprobe::cli::launch_args(std::env::args_os()));
     if let Some(code) = oprobe::cli::ui_entry(&cli) {
         return code;
     }

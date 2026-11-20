@@ -169,15 +169,13 @@ jobs:
           key: gui
       - run: cargo clippy --locked --all-targets --features gui -- -D warnings
       - run: cargo build --locked --release --features gui
-      # Like the MSI below, the macOS disk image is otherwise only built at release time.
-      - name: Disk image (macOS)
+      # Like the MSI below, the macOS app and disk image are otherwise only built at release
+      # time; the script also opens the app through LaunchServices and fails if it does not stay up.
+      - name: App bundle + disk image (macOS)
         if: runner.os == 'macOS'
         run: |
-          app="dmg/oprobe.app/Contents"
-          mkdir -p "$app/MacOS" "$app/Resources" out
-          cp target/release/oprobe "$app/MacOS/oprobe"
-          sed "s/@VERSION@/2.0.0/g" packaging/desktop/Info.plist > "$app/Info.plist"
-          codesign --force --deep --sign - dmg/oprobe.app
+          mkdir -p dmg out
+          scripts/macos-app.sh target/release/oprobe 0.0.0-ci dmg
           ln -s /Applications dmg/Applications
           size_mb=$(( $(du -sm dmg | cut -f1) * 2 + 32 ))
           hdiutil create -volname "oprobe ci" -srcfolder dmg -fs HFS+ -size "${size_mb}m" \

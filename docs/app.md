@@ -41,10 +41,10 @@ ends or is stopped. Credentials come from the usual environment (`AWS_*`, `~/.aw
 
 ## Unsigned desktop builds
 
-The macOS `.dmg`/`.pkg` and the Windows `.msi` are not signed with a developer certificate yet. macOS: right-click
-`oprobe.app` → *Open* the first time (or `xattr -dr com.apple.quarantine /Applications/oprobe.app`). Windows: in
-the SmartScreen prompt choose *More info* → *Run anyway*. Installing through Homebrew, Scoop or `cargo install` avoids
-both prompts.
+The macOS `.dmg`/`.pkg` and the Windows `.msi` are not signed with a developer certificate yet. macOS 15+: open the
+app once, then *System Settings → Privacy & Security → Open Anyway*; macOS 14: right-click `oprobe.app` → *Open*; or
+`xattr -dr com.apple.quarantine /Applications/oprobe.app`. Windows: in the SmartScreen prompt choose *More info* →
+*Run anyway*. Installing through Homebrew, Scoop or `cargo install` avoids both prompts.
 
 ## Building from source
 

@@ -73,6 +73,20 @@ pub fn print_error(err: &anyhow::Error, scheme: &str) {
     }
 }
 
+/// The command line, minus what a desktop launcher adds: macOS LaunchServices passes
+/// `-psn_<serial>` to apps opened from Finder on some versions. A bare `oprobe` (what
+/// `oprobe.app` runs) must reach [`ui_entry`] and open the workbench, never a usage error.
+pub fn launch_args<I>(args: I) -> Vec<std::ffi::OsString>
+where
+    I: IntoIterator<Item = std::ffi::OsString>,
+{
+    args.into_iter()
+        .enumerate()
+        .filter(|(i, a)| *i == 0 || !a.to_string_lossy().starts_with("-psn_"))
+        .map(|(_, a)| a)
+        .collect()
+}
+
 /// Interactive commands run on the main thread, before (and without) the CLI's async runtime:
 /// native toolkits require the main thread, and the UI runs the engine on a runtime of its own.
 /// Returns `None` for every other command.

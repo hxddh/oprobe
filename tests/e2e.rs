@@ -769,3 +769,27 @@ async fn open_loop_never_runs_past_the_window() {
     );
     assert!(snap.summary.ops <= 1, "issued {} ops", snap.summary.ops);
 }
+
+/// A bare `oprobe` is what `oprobe.app` runs when opened from Finder (with `-psn_…` on some
+/// macOS versions): it must reach the workbench entry, never fail with a usage error (exit 2)
+/// before any window code runs. Here stdout is a pipe and the test build has no window, so
+/// the entry falls back to printing help and succeeding.
+#[test]
+fn bare_invocation_is_not_a_usage_error() {
+    let bin = env!("CARGO_BIN_EXE_oprobe");
+    for args in [&[][..], &["-psn_0_1234567"][..]] {
+        let out = Command::new(bin)
+            .args(args)
+            .env_remove("DISPLAY")
+            .env_remove("WAYLAND_DISPLAY")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{args:?}: {:?}\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(String::from_utf8_lossy(&out.stdout).contains("Usage: oprobe"));
+    }
+}

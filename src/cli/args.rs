@@ -30,7 +30,6 @@ Docs: https://github.com/hxddh/oprobe/tree/main/docs";
 queue wait, DNS/TCP/TLS handshakes, request send, time-to-first-byte, transfer and consumer stall. \
 It explains the bottleneck, projects the cloud bill, tunes the client configuration and gates regressions in CI.",
     after_help = EXAMPLES,
-    arg_required_else_help = true,
     propagate_version = true
 )]
 pub struct Cli {

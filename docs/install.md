@@ -68,6 +68,14 @@ Get-FileHash oprobe-2.0.0-x64.msi -Algorithm SHA256       # Windows
 
 ## Unsigned macOS and Windows packages
 
-The `.pkg`, `.dmg` and `.msi` are not yet signed with a developer certificate. macOS: right-click → *Open* the first
-time, or `xattr -dr com.apple.quarantine /Applications/oprobe.app`. Windows: SmartScreen → *More info* → *Run
-anyway*. Homebrew, Scoop, the install scripts and `cargo install` are not affected.
+The `.pkg`, `.dmg` and `.msi` are not yet signed with a developer certificate or notarized, so the first open asks
+for confirmation:
+
+- **macOS 15 (Sequoia) and later**: open `oprobe.app` (or the `.pkg`) once and dismiss the warning, then
+  *System Settings → Privacy & Security* → *Open Anyway* next to the oprobe message, and confirm. (Right-click →
+  *Open* no longer bypasses the check on macOS 15.)
+- **macOS 14**: right-click `oprobe.app` → *Open* → *Open*.
+- Either version, from a terminal: `xattr -dr com.apple.quarantine /Applications/oprobe.app`.
+- **Windows**: SmartScreen → *More info* → *Run anyway*.
+
+Homebrew, Scoop, the install scripts and `cargo install` are not affected.
