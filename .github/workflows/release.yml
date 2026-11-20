@@ -194,6 +194,8 @@ jobs:
           wix build packaging/windows/oprobe.wxs -arch ${{ matrix.msi }} `
             -d Version=$env:VERSION -d BinDir="stage/$name" -d IconFile=packaging/desktop/oprobe.ico `
             -o "out/oprobe-$env:VERSION-${{ matrix.msi }}.msi"
+          # WiX also writes a debug database next to the MSI; it is not a release asset.
+          Remove-Item out/*.wixpdb -ErrorAction SilentlyContinue
 
       - name: Debian & RPM packages
         if: matrix.deb

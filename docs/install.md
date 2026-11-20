@@ -32,6 +32,8 @@ Archives contain `oprobe` (`oprobe.exe`), `README.md`, `LICENSE`, `CHANGELOG.md`
 ```bash
 cargo install oprobe --locked                  # Rust ≥ 1.97 and a C compiler; no OpenSSL
 cargo install oprobe --locked --features gui   # + native window (Linux: libgtk-4-dev)
+# or straight from a release tag:
+cargo install --locked --git https://github.com/hxddh/oprobe --tag v2.0.1 oprobe
 ```
 
 ## Homebrew
@@ -53,7 +55,7 @@ cp completions/_oprobe ~/.zfunc/
 # fish
 cp completions/oprobe.fish ~/.config/fish/completions/
 # PowerShell
-. ./_oprobe.ps1   # add to $PROFILE
+. ./_oprobe.ps1   # add to $PROFILE (Windows archives: next to oprobe.exe)
 ```
 
 `deb`, `rpm`, `pkg` and Homebrew install completions and man pages automatically.
