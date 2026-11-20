@@ -71,6 +71,8 @@ jobs:
             --no-progress --max-retries 3 --accept 200,206,429
             --exclude-path docs/design
             --exclude 'releases/(latest/)?download'
+            --exclude-loopback
+            --remap 'https://github.com/hxddh/oprobe/blob/main/(.*) file://${{ github.workspace }}/$1'
             README.md README.zh-CN.md CHANGELOG.md llms.txt docs/*.md
           fail: true
       - name: Action metadata
