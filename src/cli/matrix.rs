@@ -10,8 +10,9 @@ use serde::Serialize;
 
 use super::Ctx;
 use super::args::*;
-use super::measure::measure;
+use super::measure::{Opts, measure};
 use crate::engine::Cancel;
+use crate::engine::measure::Mode;
 use crate::errors::{ErrorCode, OprobeError, exit};
 use crate::output::CommandOutput;
 use crate::report::style::{bold, dim, green};
@@ -218,6 +219,94 @@ impl CommandOutput for MatrixOutput {
     }
 }
 
+/// One cell of `matrix --dry-run`.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct MatrixPlanCell {
+    pub target: String,
+    /// Knob values of this cell (`--vary`).
+    pub settings: BTreeMap<String, String>,
+    pub plan: crate::guard::Plan,
+}
+
+/// Result of `matrix --dry-run`: every cell's plan and the totals. Budgets apply to the whole
+/// matrix.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct MatrixPlanOutput {
+    pub cells: Vec<MatrixPlanCell>,
+    pub estimated_requests_count: u64,
+    pub estimated_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub estimated_cost_usd: Option<f64>,
+    pub eta_s: f64,
+}
+
+impl MatrixPlanOutput {
+    fn new(cells: Vec<MatrixPlanCell>) -> Self {
+        let costs: Vec<f64> = cells
+            .iter()
+            .filter_map(|c| c.plan.estimated_cost_usd)
+            .collect();
+        Self {
+            estimated_requests_count: cells.iter().map(|c| c.plan.estimated_requests_count).sum(),
+            estimated_bytes: cells.iter().map(|c| c.plan.estimated_bytes).sum(),
+            estimated_cost_usd: (!costs.is_empty()).then(|| costs.iter().sum()),
+            eta_s: cells.iter().map(|c| c.plan.eta_s).sum(),
+            cells,
+        }
+    }
+}
+
+impl CommandOutput for MatrixPlanOutput {
+    fn text(&self) -> String {
+        let rows: Vec<Vec<String>> = self
+            .cells
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                vec![
+                    (i + 1).to_string(),
+                    crate::util::display_url(&c.target),
+                    c.settings
+                        .iter()
+                        .map(|(k, v)| format!("{k}={v}"))
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    c.plan.estimated_requests_count.to_string(),
+                    crate::util::fmt_bytes(c.plan.estimated_bytes),
+                    c.plan
+                        .estimated_cost_usd
+                        .map(crate::util::fmt_usd)
+                        .unwrap_or_else(|| "n/a".into()),
+                    format!("{:.0}s", c.plan.eta_s),
+                ]
+            })
+            .collect();
+        let mut o = format!(
+            "{} {} cells would run\n",
+            bold("matrix plan"),
+            self.cells.len()
+        );
+        o += &crate::report::style::table(
+            &[
+                "#", "target", "settings", "requests", "bytes", "cost", "ETA",
+            ],
+            &rows,
+            2,
+        );
+        o += &format!(
+            "  total ~{} requests · ~{} · cost {} · ETA {:.0}s\n",
+            self.estimated_requests_count,
+            crate::util::fmt_bytes(self.estimated_bytes),
+            self.estimated_cost_usd
+                .map(crate::util::fmt_usd)
+                .unwrap_or_else(|| "not applicable".into()),
+            self.eta_s
+        );
+        o += &dim("dry run: nothing was sent to the target; budgets cover the whole matrix\n");
+        o
+    }
+}
+
 fn score(c: &MatrixCell, by: &str) -> f64 {
     if c.error.is_some() {
         return f64::NEG_INFINITY;
@@ -308,21 +397,27 @@ pub async fn cmd_matrix(a: MatrixArgs, ctx: &Ctx) -> Result<u8> {
             plans.push((profile, name, combo.clone()));
         }
     }
-    if a.safety.dry_run {
-        let mut out = Vec::new();
-        for (p, _, combo) in &plans {
-            let r = super::run::rails(p, &a.safety)?;
-            let plan = crate::guard::plan(p, &r.run_prefix, r.read_only, &r.budgets);
-            out.push(serde_json::json!({ "settings": combo, "plan": plan }));
-        }
-        return ctx.out.finish(&crate::output::TextOutput {
-            text: format!(
-                "{} cells would run:\n{}\n",
-                out.len(),
-                serde_json::to_string_pretty(&out)?
-            ),
-        });
+    let mut rails = Vec::new();
+    for (p, _, _) in &plans {
+        rails.push(super::run::rails(ctx, p, &a.safety)?);
     }
+    if a.safety.dry_run {
+        let cells = plans
+            .iter()
+            .zip(&rails)
+            .map(|((p, _, combo), r)| MatrixPlanCell {
+                target: p.target.display(),
+                settings: combo.iter().cloned().collect(),
+                plan: r.plan(p),
+            })
+            .collect();
+        return ctx.out.finish(&MatrixPlanOutput::new(cells));
+    }
+    // One guard for the whole matrix: the budgets cap all cells together.
+    let guard = plans
+        .first()
+        .zip(rails.first())
+        .and_then(|((p, _, _), r)| super::run::guard_for(ctx, p, &r.budgets));
     let cancel = Cancel::new();
     super::install_ctrl_c(cancel.clone());
     let mut cells = Vec::new();
@@ -334,7 +429,7 @@ pub async fn cmd_matrix(a: MatrixArgs, ctx: &Ctx) -> Result<u8> {
         label: Some(label.clone()),
         ..Default::default()
     };
-    for (i, (mut profile, name, combo)) in plans.into_iter().enumerate() {
+    for (i, ((mut profile, name, combo), rails)) in plans.into_iter().zip(rails).enumerate() {
         if cancel.is_cancelled() {
             break;
         }
@@ -367,11 +462,19 @@ pub async fn cmd_matrix(a: MatrixArgs, ctx: &Ctx) -> Result<u8> {
             verdict: String::new(),
             error: None,
         };
-        match measure(ctx, profile, name, &a.safety, &output, &cancel).await {
+        let opts = Opts {
+            target_name: name,
+            rails,
+            guard: guard.clone(),
+            output: &output,
+            cancel: &cancel,
+            mode: Mode::Run,
+        };
+        match measure(ctx, profile, opts).await {
             Ok(m) => {
                 let r = &m.run.report;
                 cell.run_id = r.run.id.clone();
-                cell.path = m.path;
+                cell.path = m.path.map(|p| p.display().to_string());
                 cell.ops_per_s = r.summary.ops_per_s;
                 cell.mib_per_s = r.summary.mib_per_s;
                 cell.p50_ms = r.summary.latency.p50;

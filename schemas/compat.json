@@ -1,0 +1,112 @@
+{
+  "$defs": {
+    "CompatCheck": {
+      "description": "One compatibility check.",
+      "properties": {
+        "category": {
+          "description": "`consistency`, `conditional`, `multipart`, `range`, `integrity`, `metadata`, `delete`,\n`list`, `copy`, `versioning`, `http`.",
+          "type": "string"
+        },
+        "detail": {
+          "description": "What happened (the observed behavior, or why the check was skipped).",
+          "type": "string"
+        },
+        "duration_ms": {
+          "format": "double",
+          "type": "number"
+        },
+        "id": {
+          "description": "Stable identifier, e.g. `conditional_create`.",
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/CompatStatus"
+        }
+      },
+      "required": [
+        "id",
+        "category",
+        "status",
+        "detail",
+        "duration_ms"
+      ],
+      "type": "object"
+    },
+    "CompatStatus": {
+      "description": "Outcome of one check.",
+      "enum": [
+        "pass",
+        "fail",
+        "skipped"
+      ],
+      "type": "string"
+    }
+  },
+  "$id": "https://github.com/hxddh/oprobe/schemas/3/compat.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Result of `oprobe compat`",
+  "properties": {
+    "checks": {
+      "items": {
+        "$ref": "#/$defs/CompatCheck"
+      },
+      "type": "array"
+    },
+    "cleaned_up": {
+      "description": "The prefix was deleted and verified empty.",
+      "type": "boolean"
+    },
+    "failed_count": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "min_score_pct": {
+      "description": "`--min-score` (percent), when given.",
+      "format": "double",
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "passed_count": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "prefix": {
+      "description": "Object prefix the suite wrote under (deleted afterwards).",
+      "type": "string"
+    },
+    "scheme": {
+      "type": "string"
+    },
+    "score_pct": {
+      "description": "passed / (passed + failed), percent.",
+      "format": "double",
+      "type": "number"
+    },
+    "skipped_count": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "target": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "target",
+    "scheme",
+    "prefix",
+    "checks",
+    "passed_count",
+    "failed_count",
+    "skipped_count",
+    "score_pct",
+    "cleaned_up"
+  ],
+  "title": "oprobe compat",
+  "type": "object",
+  "x-rust-type": "CompatOutput"
+}

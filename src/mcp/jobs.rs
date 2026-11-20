@@ -4,18 +4,18 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
-use std::time::{Instant, SystemTime};
+use std::time::Instant;
 
 use schemars::JsonSchema;
 use serde::Serialize;
 use tokio::sync::{Semaphore, watch};
 
 use crate::config::Profile;
-use crate::engine::{Cancel, RunOptions, Session, SessionOptions};
-use crate::errors::{ErrorBody, ErrorCode, exit};
+use crate::engine::Cancel;
+use crate::errors::{ErrorBody, ErrorCode};
 use crate::events::{Event, EventBus, EventKind, LogLevel};
-use crate::guard::{Budgets, Guard, Plan};
-use crate::model::{RunId, TuneReport};
+use crate::guard::{Budgets, Plan};
+use crate::model::RunId;
 use crate::store::RunStore;
 use crate::trace::Phase;
 
@@ -338,6 +338,7 @@ struct Outcome {
 }
 
 async fn execute(job: &Arc<Job>, spec: JobSpec) -> anyhow::Result<Outcome> {
+    use crate::engine::measure::{self, Mode, Rails, Request, Stage};
     let JobSpec {
         kind: _,
         run_id,
@@ -345,7 +346,7 @@ async fn execute(job: &Arc<Job>, spec: JobSpec) -> anyhow::Result<Outcome> {
         profile,
         target_name,
         budgets,
-        plan: _,
+        plan,
         trace_max_requests,
         store,
         label,
@@ -355,108 +356,59 @@ async fn execute(job: &Arc<Job>, spec: JobSpec) -> anyhow::Result<Outcome> {
     if label.is_some() {
         profile.name = label;
     }
-    let guard = (!budgets.is_empty())
-        .then(|| Guard::with_pricing(budgets, crate::guard::usd_per_request(&profile)));
     let total_s = match &tune {
         Some(t) => (t.trial.duration + t.trial.warmup).as_secs_f64() * t.max_trials as f64,
         None => profile.workload.duration.get().as_secs_f64(),
     };
     let progress = job.bus.progress_fn(Some(total_s));
-    let started_at = SystemTime::now();
-    let session = Session::open_with(
-        profile,
-        job.cancel.clone(),
-        progress.clone(),
-        SessionOptions {
-            run_prefix: Some(run_prefix),
-            guard,
-            trace_max_requests,
-            preflight: true,
-        },
-    )
-    .await?;
-    for w in &session.warnings {
-        job.bus.log(LogLevel::Warn, w.clone());
-    }
-    let mut run = match tune {
-        None => {
-            let knobs = session.profile.knobs.clone();
-            let res = session
-                .run(
-                    &knobs,
-                    &RunOptions::from_profile(&session.profile),
-                    Some(progress.clone()),
-                )
-                .await;
-            let (ok, bad) = if res.is_ok() && session.profile.workload.verify {
-                session.verify_writes(None).await
-            } else {
-                (0, 0)
-            };
-            job.bus.log(LogLevel::Info, "cleaning up");
-            let cleanup = session.close().await;
-            let mut snap = res?;
-            snap.integrity.verified += ok;
-            snap.integrity.corrupted += bad;
-            if session.guard().is_some_and(|g| g.tripped()) {
-                snap.interrupted = true;
-            }
-            crate::model::build_run(crate::model::ReportInput {
-                run_id: &run_id,
-                target_name,
-                profile: &session.profile,
-                knobs: &knobs,
-                snapshot: snap,
-                trace: session.take_trace().unwrap_or_default(),
-                cleanup,
-                warnings: session.warnings.clone(),
-                started_at,
-                ended_at: SystemTime::now(),
-            })
-        }
+    let rails = Rails {
+        run_id: run_id.clone(),
+        run_prefix,
+        read_only: plan.read_only,
+        budgets,
+    };
+    let guard = rails.guard(&profile);
+    let mode = match tune {
+        None => Mode::Run,
         Some(opts) => {
             let bus = job.bus.clone();
-            let on_event: Arc<dyn Fn(crate::tune::TuneEvent) + Send + Sync> =
-                Arc::new(move |ev| match ev {
+            Mode::Tune {
+                opts,
+                on_event: Arc::new(move |ev| match ev {
                     crate::tune::TuneEvent::Finished(t) => {
                         bus.emit(EventKind::Trial { trial: (&t).into() })
                     }
                     crate::tune::TuneEvent::Message(m) => bus.log(LogLevel::Info, m),
                     crate::tune::TuneEvent::Started { .. } => {}
-                });
-            let outcome = crate::tune::tune(&session, &opts, on_event).await;
-            let cleanup = session.close().await;
-            let outcome = outcome?;
-            let mut snap = outcome.winner_snapshot.clone();
-            if session.guard().is_some_and(|g| g.tripped()) {
-                snap.interrupted = true;
+                }),
             }
-            let mut run = crate::model::build_run(crate::model::ReportInput {
-                run_id: &run_id,
-                target_name,
-                profile: &session.profile,
-                knobs: &outcome.winner,
-                snapshot: snap,
-                trace: Default::default(),
-                cleanup,
-                warnings: session.warnings.clone(),
-                started_at,
-                ended_at: SystemTime::now(),
-            });
-            run.report.tune = Some(TuneReport::from(&outcome.summary));
-            run
         }
     };
-    let breach = session.guard().and_then(|g| g.breach());
-    if breach.is_some() {
-        run.report.verdict.exit_code = exit::BUDGET;
+    let bus = job.bus.clone();
+    let mut req = Request::new(profile, rails, job.cancel.clone(), progress);
+    req.target_name = target_name;
+    req.guard = guard;
+    req.trace_max_requests = trace_max_requests;
+    req.store = Some(store);
+    req.mode = mode;
+    req.on_stage = Some(Arc::new(move |s| {
+        if s == Stage::CleaningUp {
+            bus.log(LogLevel::Info, "cleaning up");
+        }
+    }));
+    let m = measure::measure(req).await?;
+    for w in &m.warnings {
+        job.bus.log(LogLevel::Warn, w.clone());
     }
-    let path = store.save(&run)?.display().to_string();
+    let path = m.path.map(|p| p.display().to_string()).unwrap_or_default();
     job.bus.emit(EventKind::Result {
         run_id: Some(run_id.to_string()),
         path: Some(path.clone()),
         report: None,
         data: None,
     });
-    Ok(Outcome { path, breach })
+    Ok(Outcome {
+        path,
+        breach: m.breach,
+    })
 }

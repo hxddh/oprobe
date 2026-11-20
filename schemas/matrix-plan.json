@@ -1,0 +1,204 @@
+{
+  "$defs": {
+    "Budgets": {
+      "description": "Limits for one command.",
+      "properties": {
+        "max_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_cost_usd": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "max_duration_s": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "max_requests_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "MatrixPlanCell": {
+      "description": "One cell of `matrix --dry-run`.",
+      "properties": {
+        "plan": {
+          "$ref": "#/$defs/Plan"
+        },
+        "settings": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Knob values of this cell (`--vary`).",
+          "type": "object"
+        },
+        "target": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "target",
+        "settings",
+        "plan"
+      ],
+      "type": "object"
+    },
+    "Plan": {
+      "description": "What a run would do (`--dry-run`).",
+      "properties": {
+        "assumptions": {
+          "description": "How the estimates were made.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "budgets": {
+          "$ref": "#/$defs/Budgets"
+        },
+        "concurrency_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "duration_s": {
+          "format": "double",
+          "type": "number"
+        },
+        "estimated_bytes": {
+          "description": "Estimated bytes transferred (up + down).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "estimated_cost_usd": {
+          "description": "Request cost at list prices, where a price table applies.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "estimated_ops_count": {
+          "description": "Estimated logical operations (warmup + window).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "estimated_requests_count": {
+          "description": "Estimated backend requests (dataset upload + workload + cleanup).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "eta_s": {
+          "description": "Estimated wall time, dataset upload and cleanup included.",
+          "format": "double",
+          "type": "number"
+        },
+        "objects_deleted_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "objects_written_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "preset": {
+          "type": "string"
+        },
+        "read_only": {
+          "type": "boolean"
+        },
+        "run_prefix": {
+          "type": "string"
+        },
+        "target": {
+          "type": "string"
+        },
+        "warmup_s": {
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "target",
+        "preset",
+        "run_prefix",
+        "read_only",
+        "concurrency_count",
+        "warmup_s",
+        "duration_s",
+        "estimated_ops_count",
+        "estimated_requests_count",
+        "estimated_bytes",
+        "objects_written_count",
+        "objects_deleted_count",
+        "eta_s",
+        "budgets",
+        "assumptions"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://github.com/hxddh/oprobe/schemas/3/matrix-plan.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Result of `oprobe matrix --dry-run`",
+  "properties": {
+    "cells": {
+      "items": {
+        "$ref": "#/$defs/MatrixPlanCell"
+      },
+      "type": "array"
+    },
+    "estimated_bytes": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "estimated_cost_usd": {
+      "format": "double",
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "estimated_requests_count": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "eta_s": {
+      "format": "double",
+      "type": "number"
+    }
+  },
+  "required": [
+    "cells",
+    "estimated_requests_count",
+    "estimated_bytes",
+    "eta_s"
+  ],
+  "title": "oprobe matrix-plan",
+  "type": "object",
+  "x-rust-type": "MatrixPlanOutput"
+}

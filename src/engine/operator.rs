@@ -285,10 +285,25 @@ pub async fn check_reachable(base: &Operator, target: &TargetSpec) -> Result<()>
 /// Untraced operator for dataset seeding, verification and cleanup.
 /// Untraced operator that fails fast (few retries, short timeouts): the preflight check.
 pub fn preflight_operator(base: &Operator, target: &TargetSpec) -> Result<Operator> {
+    preflight_operator_with(base, target, None)
+}
+
+/// [`preflight_operator`] whose requests are recorded into `recorder` (budgets: a recorder
+/// with a guard accounts every request).
+pub fn preflight_operator_with(
+    base: &Operator,
+    target: &TargetSpec,
+    recorder: Option<Arc<crate::trace::Recorder>>,
+) -> Result<Operator> {
     let knobs = Knobs::default();
-    Ok(base
-        .clone()
-        .layer(trace_layer(target, &knobs, None)?)
+    let mut op = base.clone();
+    if let Some(r) = &recorder
+        && !target.is_network()
+    {
+        op = op.layer(InProcessObserveLayer::new(r.clone()));
+    }
+    Ok(op
+        .layer(trace_layer(target, &knobs, recorder)?)
         .layer(
             TimeoutLayer::new()
                 .with_timeout(Duration::from_secs(30))

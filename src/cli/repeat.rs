@@ -9,9 +9,10 @@ use serde::Serialize;
 use super::Ctx;
 use super::args::*;
 use super::compare::{RunSetStats, baseline_runs};
-use super::measure::measure;
+use super::measure::{Opts, measure};
 use crate::analysis::compare::{Comparison, compare};
 use crate::engine::Cancel;
+use crate::engine::measure::Mode;
 use crate::errors::exit;
 use crate::events::EventKind;
 use crate::output::CommandOutput;
@@ -123,17 +124,20 @@ pub async fn cmd_run_repeat(a: RunArgs, ctx: &Ctx) -> Result<u8> {
     let (mut profile, target_name) =
         super::resolve_profile(ctx, &a.target, &a.workload, &a.knobs, &a.cost)?;
     super::apply_sla(&mut profile, &a.sla)?;
+    let first = super::run::rails(ctx, &profile, &a.safety)?;
     if a.safety.dry_run {
-        let r = super::run::rails(&profile, &a.safety)?;
-        let mut plan = crate::guard::plan(&profile, &r.run_prefix, r.read_only, &r.budgets);
+        let mut plan = first.plan(&profile);
         if a.repeat > 1 {
             plan.assumptions.push(format!(
-                "this plan is for one of {} repeated runs",
+                "this plan is for one of {} repeated runs; budgets cover all of them together",
                 a.repeat
             ));
         }
         return ctx.out.finish(&super::run::PlanOutput { plan });
     }
+    // One guard for the whole command: the budgets cap all repeated runs together.
+    let guard = super::run::guard_for(ctx, &profile, &first.budgets);
+    let mut next_rails = Some(first);
     // A repeat group needs a shared label (`compare all:LABEL`); a single run keeps the user's.
     let mut group = a.output.label.clone().unwrap_or_else(|| {
         if a.repeat > 1 {
@@ -161,17 +165,25 @@ pub async fn cmd_run_repeat(a: RunArgs, ctx: &Ctx) -> Result<u8> {
                 profile.target.display()
             )));
         }
+        let rails = match next_rails.take() {
+            Some(r) => r,
+            None => super::run::rails(ctx, &profile, &a.safety)?,
+        };
         let m = measure(
             ctx,
             profile.clone(),
-            target_name.clone(),
-            &a.safety,
-            &a.output,
-            &cancel,
+            Opts {
+                target_name: target_name.clone(),
+                rails,
+                guard: guard.clone(),
+                output: &a.output,
+                cancel: &cancel,
+                mode: Mode::Run,
+            },
         )
         .await?;
         if let Some(p) = m.path {
-            paths.push(p);
+            paths.push(p.display().to_string());
         }
         runs.push(m.run);
     }

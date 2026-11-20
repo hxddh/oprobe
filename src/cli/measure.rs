@@ -1,108 +1,103 @@
-//! One complete measurement (session → run → verify → cleanup → Report v3 → store), shared by
-//! `run --repeat`, `run --baseline` and `matrix`. The same steps as `oprobe run`, with the
-//! safety rails of `run.rs`.
+//! The CLI side of the measurement pipeline ([`crate::engine::measure`]): progress for this
+//! output mode, `--fail-on`, `--no-save` and the report files, budget-breach and Ctrl-C
+//! messages. Used by `run`, `demo`, `run --repeat` / `--baseline`, `matrix` and `tune`.
 
-use std::time::SystemTime;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use anyhow::Result;
 
 use super::Ctx;
-use super::args::{OutputArgs, SafetyArgs};
-use super::run::{apply_fail_on, budget_error, guard_for, progress_for, rails, save_run};
+use super::args::OutputArgs;
+use super::run::{fail_on_gate, progress_for, save_outputs};
 use crate::config::Profile;
-use crate::engine::{Cancel, RunOptions, Session, SessionOptions};
+use crate::engine::Cancel;
+use crate::engine::measure::{self as pipeline, Measured, Mode, Rails, Request, Stage};
 use crate::errors::exit;
-use crate::model::Run;
+use crate::guard::Guard;
+use crate::report::style::dim;
 
-/// A finished measurement.
-pub(super) struct Measured {
-    pub run: Run,
-    /// The saved run file (absent with `--no-save`).
-    pub path: Option<String>,
+/// What one CLI measurement needs besides the profile.
+pub(super) struct Opts<'a> {
+    pub target_name: Option<String>,
+    pub rails: Rails,
+    /// The command's guard: shared by every measurement of the command (one aggregate budget).
+    pub guard: Option<Arc<Guard>>,
+    pub output: &'a OutputArgs,
+    pub cancel: &'a Cancel,
+    pub mode: Mode,
 }
 
-/// Measure `profile` once and save the run. A budget breach saves the partial run and returns
-/// its error (exit 4).
-pub(super) async fn measure(
-    ctx: &Ctx,
-    profile: Profile,
-    target_name: Option<String>,
-    safety: &SafetyArgs,
-    output: &OutputArgs,
-    cancel: &Cancel,
-) -> Result<Measured> {
-    let rails = rails(&profile, safety)?;
-    let guard = guard_for(ctx, &profile, &rails.budgets);
-    let total_s = profile.workload.duration.get().as_secs_f64();
-    let (progress, line) = progress_for(ctx, total_s);
-    let started_at = SystemTime::now();
-    let session = Session::open_with(
-        profile,
-        cancel.clone(),
-        progress.clone(),
-        SessionOptions {
-            run_prefix: Some(rails.run_prefix.clone()),
-            guard,
-            trace_max_requests: super::trace_max_requests(ctx),
-            preflight: true,
-        },
-    )
-    .await;
-    let session = match session {
-        Ok(s) => s,
-        Err(e) => {
-            if let Some(l) = &line {
-                l.finish();
-            }
-            return Err(e);
+/// Measure `profile` once through the pipeline and save the run (unless `--no-save`). A budget
+/// breach saves the partial run and returns its error (exit 4).
+pub(super) async fn measure(ctx: &Ctx, profile: Profile, o: Opts<'_>) -> Result<Measured> {
+    let total_s = match &o.mode {
+        Mode::Run => profile.workload.duration.get().as_secs_f64(),
+        Mode::Tune { opts, .. } => {
+            (opts.trial.duration + opts.trial.warmup).as_secs_f64() * opts.max_trials as f64
         }
     };
-    for w in &session.warnings {
-        ctx.out.warn(w.clone());
-    }
-    let knobs = session.profile.knobs.clone();
-    let res = session
-        .run(
-            &knobs,
-            &RunOptions::from_profile(&session.profile),
-            Some(progress.clone()),
-        )
-        .await;
+    let (progress, line) = match &o.mode {
+        Mode::Run => progress_for(ctx, total_s),
+        Mode::Tune { .. } => (super::run::tune_progress(ctx), None),
+    };
+    let announce_cleanup = matches!(o.mode, Mode::Run);
+    let l2 = line.clone();
+    let out = ctx.out.clone();
+    let on_stage: pipeline::StageFn = Arc::new(move |s| match s {
+        Stage::Measured => {
+            if let Some(l) = &l2 {
+                l.finish();
+            }
+        }
+        Stage::CleaningUp if announce_cleanup => out.info(dim("cleaning up…")),
+        Stage::CleaningUp => {}
+    });
+    let gate = Arc::new(AtomicU8::new(0));
+    let g2 = gate.clone();
+    let fail_on = o.output.fail_on;
+    let mut req = Request::new(profile, o.rails, o.cancel.clone(), progress);
+    req.target_name = o.target_name;
+    req.guard = o.guard;
+    req.trace_max_requests = super::trace_max_requests(ctx);
+    req.store = (!o.output.no_save).then(|| ctx.store());
+    req.mode = o.mode;
+    req.on_stage = Some(on_stage);
+    req.finalize = Some(Box::new(move |run| {
+        if let Some(level) = fail_on
+            && fail_on_gate(&mut run.report, level)
+        {
+            g2.store(1, Ordering::Relaxed);
+        }
+    }));
+    let res = pipeline::measure(req).await;
     if let Some(l) = &line {
         l.finish();
     }
-    let (ok, bad) = if res.is_ok() && session.profile.workload.verify {
-        session.verify_writes(None).await
-    } else {
-        (0, 0)
-    };
-    let cleanup = session.close().await;
-    let mut snap = res?;
-    snap.integrity.verified += ok;
-    snap.integrity.corrupted += bad;
-    let budget_hit = session.guard().is_some_and(|g| g.tripped());
-    if budget_hit {
-        snap.interrupted = true;
+    let m = res?;
+    for w in &m.warnings {
+        ctx.out.warn(w.clone());
     }
-    let mut run = crate::model::build_run(crate::model::ReportInput {
-        run_id: &rails.run_id,
-        target_name,
-        profile: &session.profile,
-        knobs: &knobs,
-        snapshot: snap,
-        trace: session.take_trace().unwrap_or_default(),
-        cleanup,
-        warnings: session.warnings.clone(),
-        started_at,
-        ended_at: SystemTime::now(),
-    });
-    if budget_hit {
-        run.report.verdict.exit_code = exit::BUDGET;
+    if gate.load(Ordering::Relaxed) == 1 {
+        ctx.out.warn(format!(
+            "`--fail-on`: the diagnosis has {} findings (exit {})",
+            m.run.report.worst_severity().label(),
+            exit::GATE
+        ));
     }
-    apply_fail_on(&mut run.report, output, ctx);
-    let path = save_run(ctx, &run, output)?;
-    if let Some(e) = budget_error(&session, &rails.run_id, ctx, path.is_some()) {
-        return Err(e);
+    save_outputs(&m.run.report, o.output)?;
+    if let Some(b) = &m.breach {
+        if m.path.is_some() {
+            ctx.out.warn(format!(
+                "the partial run was saved: oprobe runs show {}",
+                m.run.id()
+            ));
+        }
+        return Err(b.to_error());
     }
-    Ok(Measured { run, path })
+    if m.cancelled {
+        ctx.out
+            .warn("interrupted — partial results: they cover only the time before Ctrl-C");
+    }
+    Ok(m)
 }

@@ -488,6 +488,11 @@ pub fn resolve_profile(
     Ok((build_profile(&t, &w, &k, c)?, name))
 }
 
+/// Budgets of the safety flags, unset ones from `[defaults.budgets]`.
+pub fn safety_budgets(ctx: &Ctx, s: &SafetyArgs) -> Result<crate::guard::Budgets> {
+    run::budgets(ctx, s)
+}
+
 /// Trace rows kept per run: `$OPROBE_MAX_REQUESTS` > `[defaults] max_requests` > built-in.
 pub fn trace_max_requests(ctx: &Ctx) -> usize {
     std::env::var("OPROBE_MAX_REQUESTS")

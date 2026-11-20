@@ -35,6 +35,73 @@ pub struct Defaults {
     /// Trace rows kept per run (`trace.max_requests`, default 1 000 000).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_requests: Option<usize>,
+    /// Budgets of every measuring command (`run`, `tune`, `matrix`, `watch`, `compat`, the
+    /// app) unless a flag sets them (`[defaults.budgets]`).
+    #[serde(default, skip_serializing_if = "BudgetDefaults::is_empty")]
+    pub budgets: BudgetDefaults,
+}
+
+/// `[defaults.budgets]`: the `--max-*` safety flags' defaults.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BudgetDefaults {
+    /// Estimated request cost (USD).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_cost_usd: Option<f64>,
+    /// Backend requests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_requests: Option<u64>,
+    /// Bytes transferred, e.g. `10GiB`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<String>,
+    /// Wall time, e.g. `5m`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_duration: Option<String>,
+}
+
+impl BudgetDefaults {
+    pub fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
+
+    /// Fill the budgets `b` leaves unset from these defaults.
+    pub fn apply(&self, b: &mut crate::guard::Budgets) -> Result<()> {
+        let bad = |k: &str, e: anyhow::Error| -> anyhow::Error {
+            OprobeError::new(
+                ErrorCode::ConfigInvalid,
+                format!("invalid [defaults.budgets] {k}: {e:#}"),
+            )
+            .into()
+        };
+        if b.max_cost_usd.is_none() {
+            if let Some(c) = self.max_cost_usd
+                && !(c.is_finite() && c >= 0.0)
+            {
+                return Err(bad("max_cost_usd", anyhow::anyhow!("must be >= 0")));
+            }
+            b.max_cost_usd = self.max_cost_usd;
+        }
+        if b.max_requests_count.is_none() {
+            b.max_requests_count = self.max_requests;
+        }
+        if b.max_bytes.is_none() {
+            b.max_bytes = self
+                .max_bytes
+                .as_deref()
+                .map(|v| v.parse::<crate::util::ByteSize>().map(|x| x.0))
+                .transpose()
+                .map_err(|e| bad("max_bytes", e))?;
+        }
+        if b.max_duration_s.is_none() {
+            b.max_duration_s = self
+                .max_duration
+                .as_deref()
+                .map(|v| crate::util::parse_duration(v).map(|d| d.as_secs_f64()))
+                .transpose()
+                .map_err(|e| bad("max_duration", e))?;
+        }
+        Ok(())
+    }
 }
 
 /// A named storage endpoint.
@@ -188,6 +255,21 @@ impl ConfigFile {
             d.max_requests.map(|c| c.to_string()),
             &crate::trace::DEFAULT_MAX_REQUESTS.to_string(),
         );
+        let b = &d.budgets;
+        put(
+            "budgets.max_cost_usd",
+            None,
+            b.max_cost_usd.map(|c| c.to_string()),
+            "",
+        );
+        put(
+            "budgets.max_requests",
+            None,
+            b.max_requests.map(|c| c.to_string()),
+            "",
+        );
+        put("budgets.max_bytes", None, b.max_bytes.clone(), "");
+        put("budgets.max_duration", None, b.max_duration.clone(), "");
         out
     }
 }
@@ -226,6 +308,32 @@ mod tests {
         )
         .unwrap();
         assert!(ConfigFile::load(&p).is_err());
+    }
+
+    #[test]
+    fn budget_defaults_fill_unset_flags() {
+        let d: ConfigFile = toml::from_str(
+            "[defaults.budgets]\nmax_requests = 100\nmax_bytes = \"1MiB\"\nmax_duration = \"2m\"\n",
+        )
+        .unwrap();
+        let mut b = crate::guard::Budgets {
+            max_requests_count: Some(5),
+            ..Default::default()
+        };
+        d.defaults.budgets.apply(&mut b).unwrap();
+        assert_eq!(b.max_requests_count, Some(5), "flags win");
+        assert_eq!(b.max_bytes, Some(1 << 20));
+        assert_eq!(b.max_duration_s, Some(120.0));
+        assert!(b.max_cost_usd.is_none());
+        let bad = BudgetDefaults {
+            max_bytes: Some("lots".into()),
+            ..Default::default()
+        };
+        let e = bad.apply(&mut Default::default()).unwrap_err();
+        assert_eq!(
+            crate::errors::classify(&e, "s3").code,
+            ErrorCode::ConfigInvalid
+        );
     }
 
     #[test]

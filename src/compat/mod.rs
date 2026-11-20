@@ -1,7 +1,7 @@
 //! `oprobe compat`: a correctness & compatibility suite for a storage target.
 //!
 //! Every check runs through OpenDAL (what applications use) against objects under one run
-//! prefix (`oprobe-compat-<id>/`), which is deleted (and verified empty) at the end. Checks
+//! prefix (`oprobe-run-<id>/`, swept by `oprobe cleanup`), which is deleted (and verified empty) at the end. Checks
 //! the service's capability rules out are skipped, not failed; the score is the share of the
 //! checks that ran and passed.
 

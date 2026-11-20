@@ -278,6 +278,89 @@ fn budgets_stop_the_run_with_exit_4() {
 }
 
 #[test]
+fn budgets_cover_the_whole_command() {
+    let env = Env::new();
+    // Each run alone fits the 1 s budget; three of them do not.
+    let mut args: Vec<String> = ["run", "memory://", "-d", "600ms", "--repeat", "3"]
+        .iter()
+        .chain(SMALL)
+        .map(|s| s.to_string())
+        .collect();
+    args.extend(["--max-duration", "1s", "-o", "json"].map(String::from));
+    let o = env.cmd().args(&args).output().unwrap();
+    assert_eq!(o.status.code(), Some(4), "{}", stderr(&o));
+    assert_eq!(error_code(&o), "safety.budget_exceeded");
+    assert!(env.runs().len() < 3, "the budget stopped the group");
+}
+
+#[test]
+fn every_measuring_command_honours_dry_run() {
+    let env = Env::new();
+    // watch: the plan of its windows, nothing measured.
+    let o = env.run(&[
+        "watch",
+        "memory://",
+        "--count",
+        "3",
+        "--dry-run",
+        "-o",
+        "json",
+    ]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let v = json(&o);
+    assert!(v["plan"]["estimated_requests_count"].is_u64(), "{v:#}");
+    // matrix: a typed document, one plan per cell.
+    let o = env.run(&[
+        "matrix",
+        "memory://",
+        "--vary",
+        "concurrency=2,4",
+        "--dry-run",
+        "-o",
+        "json",
+    ]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let v = json(&o);
+    assert_eq!(v["cells"].as_array().unwrap().len(), 2, "{v:#}");
+    assert!(v["cells"][1]["plan"]["concurrency_count"] == 4, "{v:#}");
+    assert!(v["estimated_requests_count"].is_u64());
+    // compat: the plan under the standard run prefix.
+    let o = env.run(&["compat", "memory://", "--dry-run", "-o", "json"]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert!(
+        json(&o)["run_prefix"]
+            .as_str()
+            .unwrap()
+            .starts_with("oprobe-run-")
+    );
+    // tune --budget: the trials are capped to fit, or refused when two do not fit.
+    let o = env.run(&[
+        "tune",
+        "memory://",
+        "--budget",
+        "1h",
+        "--max-trials",
+        "5",
+        "--dry-run",
+        "-o",
+        "json",
+    ]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let o = env.run(&[
+        "tune",
+        "memory://",
+        "--budget",
+        "5s",
+        "--dry-run",
+        "-o",
+        "json",
+    ]);
+    assert_eq!(o.status.code(), Some(2));
+    assert_eq!(error_code(&o), "usage.invalid_argument");
+    assert!(env.runs().is_empty(), "dry runs save nothing");
+}
+
+#[test]
 fn dry_run_prints_the_plan_and_touches_nothing() {
     let env = Env::new();
     let root = env.dir.path().join("bucket");

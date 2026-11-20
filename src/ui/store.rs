@@ -735,7 +735,13 @@ impl Store {
             return;
         }
         let title = req.profile.target.display();
-        let job = Job::tune(req.profile, req.target_name, opts, Some(self.run_store()));
+        let job = Job::tune(
+            req.profile,
+            req.target_name,
+            opts,
+            req.budgets,
+            Some(self.run_store()),
+        );
         self.tuned.set(None);
         self.begin(job, JobKind::Tune, title, 0.0);
         self.mode.set(Mode::Tune);

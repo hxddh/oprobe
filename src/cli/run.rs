@@ -2,20 +2,20 @@
 
 use std::io::IsTerminal;
 use std::sync::Arc;
-use std::time::SystemTime;
 
 use anyhow::{Context, Result};
 use schemars::JsonSchema;
 use serde::Serialize;
 
 use super::args::*;
-use super::{Ctx, apply_sla, install_ctrl_c, live, resolve_profile, trace_max_requests};
+use super::{Ctx, apply_sla, install_ctrl_c, live, resolve_profile};
 use crate::config::Profile;
-use crate::engine::{Cancel, Progress, ProgressFn, RunOptions, Session, SessionOptions};
+use crate::engine::measure::{Mode, Rails};
+use crate::engine::{Cancel, Progress, ProgressFn};
 use crate::errors::{ErrorCode, OprobeError, exit};
 use crate::events::EventKind;
 use crate::guard::{Budgets, Guard, Plan};
-use crate::model::{Report, Run, RunId, TuneReport};
+use crate::model::{Report, Run, TuneReport};
 use crate::output::{CommandOutput, OutputFormat};
 use crate::report::style::{self, bold, dim, green, red, yellow};
 use crate::report::{brief, markdown, write_file};
@@ -108,8 +108,8 @@ impl CommandOutput for PlanOutput {
     }
 }
 
-/// Parse the safety flags into budgets.
-pub(super) fn budgets(s: &SafetyArgs) -> Result<Budgets> {
+/// Parse the safety flags into budgets; unset ones come from `[defaults.budgets]`.
+pub(super) fn budgets(ctx: &Ctx, s: &SafetyArgs) -> Result<Budgets> {
     let bad = |flag: &str, e: anyhow::Error| -> anyhow::Error {
         OprobeError::new(
             ErrorCode::UsageInvalidArgument,
@@ -126,7 +126,7 @@ pub(super) fn budgets(s: &SafetyArgs) -> Result<Budgets> {
             )
         );
     }
-    Ok(Budgets {
+    let mut b = Budgets {
         max_cost_usd: s.max_cost_usd,
         max_requests_count: s.max_requests,
         max_bytes: s
@@ -141,51 +141,31 @@ pub(super) fn budgets(s: &SafetyArgs) -> Result<Budgets> {
             .map(|v| parse_duration(v).map(|d| d.as_secs_f64()))
             .transpose()
             .map_err(|e| bad("--max-duration", e))?,
-    })
-}
-
-/// Everything the safety rails decide before a session opens.
-pub(super) struct Rails {
-    pub(super) run_id: RunId,
-    pub(super) run_prefix: String,
-    pub(super) budgets: Budgets,
-    pub(super) read_only: bool,
-}
-
-pub(super) fn rails(profile: &Profile, s: &SafetyArgs) -> Result<Rails> {
-    let run_id = RunId::new();
-    let run_prefix = match &s.idempotency_key {
-        Some(k) => crate::model::ids::idempotent_run_prefix(k),
-        None => run_id.run_prefix(),
     };
-    let existing = profile
-        .workload
-        .effective_dataset()
-        .existing_prefix
-        .is_some();
-    let read_only = s.read_only || existing;
-    if read_only {
-        crate::guard::check_read_only(profile)?;
-    }
-    Ok(Rails {
-        run_id,
-        run_prefix,
-        budgets: budgets(s)?,
-        read_only,
-    })
+    ctx.config()?.defaults.budgets.apply(&mut b)?;
+    Ok(b)
 }
 
+/// The safety rails of one measurement (a new run id each call).
+pub(super) fn rails(ctx: &Ctx, profile: &Profile, s: &SafetyArgs) -> Result<Rails> {
+    Rails::new(
+        profile,
+        s.read_only,
+        s.idempotency_key.as_deref(),
+        budgets(ctx, s)?,
+    )
+}
+
+/// The command's live guard (one per command: every measurement of `run --repeat` or `matrix`
+/// shares it, so its budgets cover the whole command).
 pub(super) fn guard_for(ctx: &Ctx, profile: &Profile, b: &Budgets) -> Option<Arc<Guard>> {
-    if b.is_empty() {
-        return None;
-    }
-    let price = crate::guard::usd_per_request(profile);
-    if b.max_cost_usd.is_some() && price.is_none() {
+    let g = crate::engine::measure::guard_for(b, profile)?;
+    if b.max_cost_usd.is_some() && crate::guard::usd_per_request(profile).is_none() {
         ctx.out.warn(
             "--max-cost-usd is not enforced: no price table applies to this target (set --provider)",
         );
     }
-    Some(Guard::with_pricing(b.clone(), price))
+    Some(g)
 }
 
 /// Progress for this output mode: a live line on a terminal, events in ndjson mode,
@@ -212,7 +192,23 @@ pub(super) fn progress_for(ctx: &Ctx, total_s: f64) -> (ProgressFn, Option<Arc<l
     (Arc::new(move |p| l2.update(p)), Some(line))
 }
 
-fn save_outputs(r: &Report, o: &OutputArgs) -> Result<()> {
+/// Progress of the tuner: messages on stderr, or events in ndjson mode.
+pub(super) fn tune_progress(ctx: &Ctx) -> ProgressFn {
+    if ctx.out.format == OutputFormat::Ndjson {
+        return ctx.out.bus().progress_fn(None);
+    }
+    let quiet = ctx.out.quiet;
+    Arc::new(move |p| {
+        if let Progress::Message(m) = p
+            && !quiet
+        {
+            eprintln!("{} {m}", dim("·"));
+        }
+    })
+}
+
+/// `--json` / `--markdown` report files.
+pub(super) fn save_outputs(r: &Report, o: &OutputArgs) -> Result<()> {
     if let Some(p) = &o.json {
         write_file(p, &serde_json::to_string_pretty(r)?)?;
     }
@@ -222,52 +218,19 @@ fn save_outputs(r: &Report, o: &OutputArgs) -> Result<()> {
     Ok(())
 }
 
-/// `--fail-on`: exit 3 when the diagnosis has findings of this severity or worse.
-pub(super) fn apply_fail_on(r: &mut Report, o: &OutputArgs, ctx: &Ctx) {
+/// `--fail-on`: exit 3 when the diagnosis has findings of this severity or worse. Returns
+/// whether the gate changed the exit code.
+pub(super) fn fail_on_gate(r: &mut Report, level: FailOn) -> bool {
     use crate::analysis::diagnosis::Severity;
-    let Some(level) = o.fail_on else { return };
     let min = match level {
         FailOn::Warning => Severity::Warning,
         FailOn::Critical => Severity::Critical,
     };
     if r.worst_severity() >= min && r.verdict.exit_code == exit::OK {
-        ctx.out.warn(format!(
-            "`--fail-on {}`: the diagnosis has {} findings (exit {})",
-            min.label(),
-            r.worst_severity().label(),
-            exit::GATE
-        ));
         r.verdict.exit_code = exit::GATE;
+        return true;
     }
-}
-
-/// Save the run (unless `--no-save`); returns the run file path.
-pub(super) fn save_run(ctx: &Ctx, run: &Run, o: &OutputArgs) -> Result<Option<String>> {
-    save_outputs(&run.report, o)?;
-    if o.no_save {
-        return Ok(None);
-    }
-    let path = ctx
-        .store()
-        .save(run)
-        .context("cannot save the run (set OPROBE_DATA_DIR or pass --no-save)")?;
-    Ok(Some(path.display().to_string()))
-}
-
-/// Shared tail of `run` / `tune`: budget breach handling.
-pub(super) fn budget_error(
-    session: &Session,
-    run_id: &RunId,
-    ctx: &Ctx,
-    saved: bool,
-) -> Option<anyhow::Error> {
-    let breach = session.guard()?.breach()?;
-    if saved {
-        ctx.out.warn(format!(
-            "the partial run was saved: oprobe runs show {run_id}"
-        ));
-    }
-    Some(breach.to_error())
+    false
 }
 
 pub async fn cmd_run(mut a: RunArgs, ctx: &Ctx) -> Result<u8> {
@@ -316,16 +279,14 @@ pub(super) async fn measure(
     safety: &SafetyArgs,
     output: &OutputArgs,
 ) -> Result<Measured> {
-    let rails = rails(&profile, safety)?;
+    let rails = rails(ctx, &profile, safety)?;
     if safety.dry_run {
-        let plan = crate::guard::plan(&profile, &rails.run_prefix, rails.read_only, &rails.budgets);
+        let plan = rails.plan(&profile);
         return Ok(Measured::Plan(Box::new(PlanOutput { plan })));
     }
     let guard = guard_for(ctx, &profile, &rails.budgets);
     let cancel = Cancel::new();
     install_ctrl_c(cancel.clone());
-    let total_s = profile.workload.duration.get().as_secs_f64();
-    let (progress, line) = progress_for(ctx, total_s);
     if ctx.out.format == OutputFormat::Text {
         ctx.out.info(format!(
             "{} {} {}",
@@ -339,83 +300,23 @@ pub(super) async fn measure(
             ))
         ));
     }
-    let started_at = SystemTime::now();
-    let session = Session::open_with(
+    let m = super::measure::measure(
+        ctx,
         profile,
-        cancel.clone(),
-        progress.clone(),
-        SessionOptions {
-            run_prefix: Some(rails.run_prefix.clone()),
+        super::measure::Opts {
+            target_name,
+            rails,
             guard,
-            trace_max_requests: trace_max_requests(ctx),
-            preflight: true,
+            output,
+            cancel: &cancel,
+            mode: Mode::Run,
         },
     )
-    .await;
-    let session = match session {
-        Ok(s) => s,
-        Err(e) => {
-            if let Some(l) = &line {
-                l.finish();
-            }
-            return Err(e);
-        }
-    };
-    for w in &session.warnings {
-        ctx.out.warn(w.clone());
-    }
-    let knobs = session.profile.knobs.clone();
-    let res = session
-        .run(
-            &knobs,
-            &RunOptions::from_profile(&session.profile),
-            Some(progress.clone()),
-        )
-        .await;
-    if let Some(l) = &line {
-        l.finish();
-    }
-    let (ok, bad) = if res.is_ok() && session.profile.workload.verify {
-        session.verify_writes(None).await
-    } else {
-        (0, 0)
-    };
-    ctx.out.info(dim("cleaning up…"));
-    let cleanup = session.close().await;
-    let mut snap = res?;
-    snap.integrity.verified += ok;
-    snap.integrity.corrupted += bad;
-    let budget_hit = session.guard().is_some_and(|g| g.tripped());
-    if budget_hit {
-        snap.interrupted = true;
-    }
-    let mut run = crate::model::build_run(crate::model::ReportInput {
-        run_id: &rails.run_id,
-        target_name,
-        profile: &session.profile,
-        knobs: &knobs,
-        snapshot: snap,
-        trace: session.take_trace().unwrap_or_default(),
-        cleanup,
-        warnings: session.warnings.clone(),
-        started_at,
-        ended_at: SystemTime::now(),
-    });
-    if budget_hit {
-        run.report.verdict.exit_code = exit::BUDGET;
-    }
-    apply_fail_on(&mut run.report, output, ctx);
-    let path = save_run(ctx, &run, output)?;
-    if let Some(e) = budget_error(&session, &rails.run_id, ctx, path.is_some()) {
-        return Err(e);
-    }
-    if run.report.run.interrupted || cancel.is_cancelled() {
-        ctx.out
-            .warn("run interrupted — partial results: they cover only the time before Ctrl-C");
-    }
+    .await?;
+    let run = m.run;
     Ok(Measured::Run(Box::new(RunOutput {
-        run_id: rails.run_id.to_string(),
-        path,
+        run_id: run.id().to_owned(),
+        path: m.path.map(|p| p.display().to_string()),
         report: run.report.clone(),
         full: Some(Box::new(run)),
     })))
@@ -481,21 +382,49 @@ impl CommandOutput for TuneOutput {
     }
 }
 
+/// Time one tuner trial takes (warmup, window and cooldown).
+fn trial_wall(opts: &crate::tune::TuneOptions) -> std::time::Duration {
+    opts.trial.duration + opts.trial.warmup + opts.cooldown
+}
+
+/// `tune --budget`: cap the trials so the estimated wall time fits `budget`.
+pub(super) fn fit_trials(
+    opts: &mut crate::tune::TuneOptions,
+    budget: std::time::Duration,
+) -> Result<()> {
+    let per = trial_wall(opts).as_secs_f64().max(1e-3);
+    let fit = (budget.as_secs_f64() / per).floor() as usize;
+    if fit < tune_defaults::MIN_TRIALS {
+        return Err(OprobeError::new(
+            ErrorCode::UsageInvalidArgument,
+            format!(
+                "--budget {:.0}s fits {fit} trial(s) of {per:.0}s; the tuner needs at least {}",
+                budget.as_secs_f64(),
+                tune_defaults::MIN_TRIALS
+            ),
+        )
+        .with_hint("raise --budget, or shorten --trial-duration / --trial-warmup / --cooldown")
+        .into());
+    }
+    opts.max_trials = opts.max_trials.min(fit);
+    Ok(())
+}
+
 pub async fn cmd_tune(a: TuneArgs, ctx: &Ctx) -> Result<u8> {
-    use crate::tune::{Objective, TuneEvent, codegen, tune};
+    use crate::tune::{Objective, TuneEvent, codegen};
     let (mut profile, target_name) =
         resolve_profile(ctx, &a.target, &a.workload, &a.knobs, &a.cost)?;
     apply_sla(&mut profile, &a.sla)?;
     if a.output.label.is_some() {
         profile.name = a.output.label.clone();
     }
-    let rails = rails(&profile, &a.safety)?;
+    let rails = rails(ctx, &profile, &a.safety)?;
     let objective = match a.objective {
         ObjectiveArg::Throughput => Objective::Throughput,
         ObjectiveArg::Latency => Objective::Latency,
         ObjectiveArg::Cost => Objective::Cost,
     };
-    let opts = super::tune_options(
+    let mut opts = super::tune_options(
         objective,
         &super::TuneSettings {
             trial_duration: &a.trial_duration,
@@ -505,14 +434,31 @@ pub async fn cmd_tune(a: TuneArgs, ctx: &Ctx) -> Result<u8> {
             cooldown: &a.cooldown,
         },
         profile.workload.rate,
-    )?;
+    )
+    .map_err(|e| OprobeError::new(ErrorCode::UsageInvalidArgument, format!("{e:#}")))?;
+    let budget = a
+        .budget
+        .as_deref()
+        .map(parse_duration)
+        .transpose()
+        .map_err(|e| {
+            OprobeError::new(
+                ErrorCode::UsageInvalidArgument,
+                format!("invalid --budget: {e:#}"),
+            )
+        })?;
+    if let Some(b) = budget {
+        fit_trials(&mut opts, b)?;
+    }
+    let eta = trial_wall(&opts).as_secs_f64() * opts.max_trials as f64;
     if a.safety.dry_run {
         // The plan of one trial times the trial budget.
         let mut p = profile.clone();
         p.workload.duration =
             crate::util::HumanDuration(opts.trial.duration * opts.max_trials as u32);
         p.workload.warmup = crate::util::HumanDuration(opts.trial.warmup * opts.max_trials as u32);
-        let plan = crate::guard::plan(&p, &rails.run_prefix, rails.read_only, &rails.budgets);
+        let mut plan = rails.plan(&p);
+        plan.eta_s = plan.eta_s.max(eta);
         return ctx.out.finish(&PlanOutput { plan });
     }
     let guard = guard_for(ctx, &profile, &rails.budgets);
@@ -520,35 +466,15 @@ pub async fn cmd_tune(a: TuneArgs, ctx: &Ctx) -> Result<u8> {
     install_ctrl_c(cancel.clone());
     let quiet = ctx.out.quiet;
     let ndjson = ctx.out.format == OutputFormat::Ndjson;
-    let msg: ProgressFn = if ndjson {
-        ctx.out.bus().progress_fn(None)
-    } else {
-        Arc::new(move |p| {
-            if let Progress::Message(m) = p
-                && !quiet
-            {
-                eprintln!("{} {m}", dim("·"));
-            }
-        })
-    };
-    let eta = (opts.trial.duration + opts.trial.warmup).as_secs_f64() * opts.max_trials as f64;
     ctx.out.info(dim(&format!(
-        "tuning: up to {} trials of {} · ETA ≤ {:.0}s plus dataset upload",
-        opts.max_trials, a.trial_duration, eta
+        "tuning: up to {} trials of {}{} · ETA ≤ {:.0}s plus dataset upload",
+        opts.max_trials,
+        a.trial_duration,
+        budget
+            .map(|b| format!(" (budget {:.0}s)", b.as_secs_f64()))
+            .unwrap_or_default(),
+        eta
     )));
-    let started_at = SystemTime::now();
-    let session = Session::open_with(
-        profile,
-        cancel.clone(),
-        msg,
-        SessionOptions {
-            run_prefix: Some(rails.run_prefix.clone()),
-            guard,
-            trace_max_requests: trace_max_requests(ctx),
-            preflight: true,
-        },
-    )
-    .await?;
     // The trial table is report content: stdout in text mode (even with `-q`); otherwise it is
     // progress (stderr, or `trial` events in ndjson mode).
     let table_on_stdout = ctx.out.format == OutputFormat::Text;
@@ -562,10 +488,10 @@ pub async fn cmd_tune(a: TuneArgs, ctx: &Ctx) -> Result<u8> {
     table_line(format!(
         "{} {} {}",
         bold("oprobe tune"),
-        session.profile.target.display(),
+        profile.target.display(),
         dim(&format!(
             "· {} · objective {} · ≤{} trials of {}",
-            session.profile.workload.preset.slug(),
+            profile.workload.preset.slug(),
             opts.objective.label(),
             opts.max_trials,
             a.trial_duration
@@ -613,82 +539,57 @@ pub async fn cmd_tune(a: TuneArgs, ctx: &Ctx) -> Result<u8> {
             ));
         }
     });
-    let outcome = tune(&session, &opts, on_event).await;
-    let cleanup = session.close().await;
-    let outcome = outcome?;
-    let mut snap = outcome.winner_snapshot.clone();
-    let budget_hit = session.guard().is_some_and(|g| g.tripped());
-    if budget_hit {
-        snap.interrupted = true;
-    }
-    let mut run = crate::model::build_run(crate::model::ReportInput {
-        run_id: &rails.run_id,
-        target_name,
-        profile: &session.profile,
-        knobs: &outcome.winner,
-        snapshot: snap,
-        // The winner's window is a trial: its rows were not kept (slow ops still are).
-        trace: Default::default(),
-        cleanup,
-        warnings: session.warnings.clone(),
-        started_at,
-        ended_at: SystemTime::now(),
-    });
-    let tune_report = TuneReport::from(&outcome.summary);
-    run.report.tune = Some(tune_report.clone());
-    if budget_hit {
-        run.report.verdict.exit_code = exit::BUDGET;
-    }
-    apply_fail_on(&mut run.report, &a.output, ctx);
-
+    let m = super::measure::measure(
+        ctx,
+        profile,
+        super::measure::Opts {
+            target_name,
+            rails,
+            guard,
+            output: &a.output,
+            cancel: &cancel,
+            mode: Mode::Tune { opts, on_event },
+        },
+    )
+    .await?;
+    let tuned = m.tuned.as_ref().context("the tuner returned no result")?;
     let header = format!(
         "objective {} · {:+.0}% vs baseline · {}",
-        outcome.summary.objective,
-        outcome.summary.improvement * 100.0,
+        tuned.summary.objective,
+        tuned.summary.improvement * 100.0,
         crate::util::now_rfc3339()
     );
     let mut wrote = Vec::new();
     if let Some(p) = &a.emit_profile {
         write_file(
             p,
-            &codegen::profile_toml(&session.profile, &outcome.winner, &header)?,
+            &codegen::profile_toml(&tuned.profile, &tuned.winner, &header)?,
         )?;
         wrote.push(("profile".to_owned(), p.display().to_string()));
     }
     if let Some(p) = &a.emit_rust {
         write_file(
             p,
-            &codegen::rust_snippet(
-                &session.profile.target,
-                &outcome.winner,
-                &session.capability,
-            ),
+            &codegen::rust_snippet(&tuned.profile.target, &tuned.winner, &tuned.capability),
         )?;
         wrote.push(("rust".to_owned(), p.display().to_string()));
     }
     if let Some(p) = &a.emit_python {
         write_file(
             p,
-            &codegen::python_snippet(
-                &session.profile.target,
-                &outcome.winner,
-                &session.capability,
-            ),
+            &codegen::python_snippet(&tuned.profile.target, &tuned.winner, &tuned.capability),
         )?;
         wrote.push(("python".to_owned(), p.display().to_string()));
     }
-    let path = save_run(ctx, &run, &a.output)?;
-    if let Some(e) = budget_error(&session, &rails.run_id, ctx, path.is_some()) {
-        return Err(e);
-    }
-    if cancel.is_cancelled() {
-        ctx.out.warn("tuning interrupted — partial results");
-    }
+    let report = m.run.report;
     ctx.out.finish(&TuneOutput {
-        run_id: rails.run_id.to_string(),
-        path,
-        tune: tune_report,
+        run_id: report.run.id.clone(),
+        path: m.path.map(|p| p.display().to_string()),
+        tune: report
+            .tune
+            .clone()
+            .context("the tuner returned no report")?,
         wrote,
-        report: run.report,
+        report,
     })
 }

@@ -74,7 +74,7 @@ fn compat_command_reports_a_score_and_cleans_up() {
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["score_pct"], 100.0, "{v:#}");
     assert_eq!(v["cleaned_up"], true);
-    assert!(v["prefix"].as_str().unwrap().starts_with("oprobe-compat-"));
+    assert!(v["prefix"].as_str().unwrap().starts_with("oprobe-run-"));
     assert!(v["checks"].as_array().unwrap().len() >= 20);
 
     // In-process backends skip what they cannot do; the gate fails below the minimum.

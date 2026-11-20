@@ -1,9 +1,51 @@
 {
   "$defs": {
+    "BudgetDefaults": {
+      "additionalProperties": false,
+      "description": "`[defaults.budgets]`: the `--max-*` safety flags' defaults.",
+      "properties": {
+        "max_bytes": {
+          "description": "Bytes transferred, e.g. `10GiB`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "max_cost_usd": {
+          "description": "Estimated request cost (USD).",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "max_duration": {
+          "description": "Wall time, e.g. `5m`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "max_requests": {
+          "description": "Backend requests.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "Defaults": {
       "additionalProperties": false,
       "description": "Settings applied to every command unless overridden.",
       "properties": {
+        "budgets": {
+          "$ref": "#/$defs/BudgetDefaults",
+          "description": "Budgets of every measuring command (`run`, `tune`, `matrix`, `watch`, `compat`, the\napp) unless a flag sets them (`[defaults.budgets]`)."
+        },
         "color": {
           "description": "`auto`, `always`, `never`.",
           "type": [
