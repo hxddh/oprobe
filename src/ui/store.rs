@@ -500,20 +500,21 @@ impl Store {
             }
             if let Some(o) = up.outcome {
                 match o {
-                    Outcome::Report(r) => {
-                        self.snapshot.set(Some(r.result.clone()));
-                        self.report.set(Some(*r));
+                    Outcome::Report { report, snapshot } => {
+                        self.snapshot.set(Some(*snapshot));
+                        self.report.set(Some(*report));
                         self.status.set(Status::Done);
                     }
                     Outcome::Tuned {
                         report,
+                        knobs,
                         summary,
                         profile_toml,
                         rust,
                     } => {
                         // The workbench keeps its own run; the winner lives in `tuned`.
                         self.tuned.set(Some(Tuned {
-                            knobs: report.knobs.clone(),
+                            knobs: *knobs,
                             report: *report,
                             summary: *summary,
                             profile_toml,
@@ -553,9 +554,6 @@ impl Store {
 
     /// Diagnosis of what is shown (live runs are diagnosed continuously).
     pub fn diagnosis(&self) -> Option<Diagnosis> {
-        if let Some(r) = self.report.get() {
-            return Some(r.diagnosis);
-        }
         let s = self.snapshot.get()?;
         let p = self.profile.get();
         let (sla, net) = p

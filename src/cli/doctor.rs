@@ -1,56 +1,158 @@
 //! `oprobe doctor`: step-by-step connectivity, TLS, clock, credential and permission checks.
 
 use std::fmt::Write as _;
-use std::process::ExitCode;
 use std::time::Instant;
 
 use anyhow::Result;
+use schemars::JsonSchema;
+use serde::Serialize;
 
+use super::Ctx;
 use super::args::{CostArgs, DoctorArgs, KnobArgs, WorkloadArgs};
 use crate::analysis::hints::hint_for;
 use crate::net::probe::{ProbeOptions, ProbeReport, probe_endpoint};
+use crate::output::CommandOutput;
 use crate::report::style::{bold, dim, green, red, yellow};
 use crate::util::fmt_ms;
 
-struct Checks {
-    failed: usize,
-    warned: usize,
-    scheme: String,
+/// Outcome of one check.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckStatus {
+    Ok,
+    Warn,
+    Fail,
+    Skipped,
 }
 
-impl Checks {
-    fn ok(&self, name: &str, detail: &str) {
-        println!("  {} {:<22} {}", green("✓"), name, dim(detail));
-    }
-    fn warn(&mut self, name: &str, detail: &str) {
-        self.warned += 1;
-        println!("  {} {:<22} {}", yellow("▲"), name, detail);
-    }
-    fn fail(&mut self, name: &str, err: &str) {
-        self.failed += 1;
-        println!("  {} {:<22} {}", red("✖"), name, red(err));
-        if let Some(h) = hint_for(err, &self.scheme) {
-            println!("    {} {}", yellow("hint:"), h.title);
-            for s in h.steps {
-                println!("      • {s}");
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct DoctorCheck {
+    pub name: String,
+    pub status: CheckStatus,
+    pub detail: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
+}
+
+/// Result of `oprobe doctor`.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct DoctorOutput {
+    pub target: String,
+    pub checks: Vec<DoctorCheck>,
+    pub failed_count: u64,
+    pub warned_count: u64,
+    /// No check failed: the target can be benchmarked.
+    pub ready: bool,
+}
+
+impl CommandOutput for DoctorOutput {
+    fn text(&self) -> String {
+        let mut o = format!("{} {}\n", bold("oprobe doctor"), self.target);
+        for c in &self.checks {
+            let _ = match c.status {
+                CheckStatus::Ok => {
+                    writeln!(o, "  {} {:<22} {}", green("✓"), c.name, dim(&c.detail))
+                }
+                CheckStatus::Warn => writeln!(o, "  {} {:<22} {}", yellow("▲"), c.name, c.detail),
+                CheckStatus::Fail => {
+                    writeln!(o, "  {} {:<22} {}", red("✖"), c.name, red(&c.detail))
+                }
+                CheckStatus::Skipped => writeln!(o, "  {} {}", dim("·"), dim(&c.detail)),
+            };
+            if let Some(h) = &c.hint {
+                let _ = writeln!(o, "    {} {h}", yellow("hint:"));
             }
+        }
+        o.push('\n');
+        if self.ready {
+            let _ = writeln!(
+                o,
+                "{} ready to benchmark{}",
+                green("●"),
+                if self.warned_count > 0 {
+                    format!(" ({} warnings)", self.warned_count)
+                } else {
+                    String::new()
+                }
+            );
+        } else {
+            let _ = writeln!(o, "{} {} check(s) failed", red("●"), self.failed_count);
+        }
+        o
+    }
+    fn exit_code(&self) -> u8 {
+        if self.ready {
+            0
+        } else {
+            crate::errors::exit::RUNTIME
         }
     }
 }
 
-pub async fn run(a: DoctorArgs) -> Result<ExitCode> {
-    let profile = super::build_profile(
+struct Checks {
+    list: Vec<DoctorCheck>,
+    scheme: String,
+}
+
+impl Checks {
+    fn push(&mut self, name: &str, status: CheckStatus, detail: &str, hint: Option<String>) {
+        self.list.push(DoctorCheck {
+            name: name.to_owned(),
+            status,
+            detail: detail.to_owned(),
+            hint,
+        });
+    }
+    fn ok(&mut self, name: &str, detail: &str) {
+        self.push(name, CheckStatus::Ok, detail, None);
+    }
+    fn warn(&mut self, name: &str, detail: &str) {
+        self.push(name, CheckStatus::Warn, detail, None);
+    }
+    fn fail(&mut self, name: &str, err: &str) {
+        let hint = hint_for(err, &self.scheme).map(|h| {
+            if h.steps.is_empty() {
+                h.title
+            } else {
+                format!("{}: {}", h.title, h.steps.join("; "))
+            }
+        });
+        self.push(name, CheckStatus::Fail, err, hint);
+    }
+}
+
+pub async fn run(a: DoctorArgs, ctx: &Ctx) -> Result<u8> {
+    let (profile, _) = super::resolve_profile(
+        ctx,
         &a.target,
         &WorkloadArgs::default(),
         &KnobArgs::default(),
         &CostArgs::default(),
     )?;
     let target = profile.target.normalized()?;
-    println!("{} {}", bold("oprobe doctor"), target.display());
     let mut c = Checks {
-        failed: 0,
-        warned: 0,
+        list: Vec::new(),
         scheme: target.scheme.clone(),
+    };
+    let display = target.display();
+    let finish = |c: Checks| -> Result<u8> {
+        let failed = c
+            .list
+            .iter()
+            .filter(|x| x.status == CheckStatus::Fail)
+            .count() as u64;
+        let warned = c
+            .list
+            .iter()
+            .filter(|x| x.status == CheckStatus::Warn)
+            .count() as u64;
+        ctx.out.finish(&DoctorOutput {
+            target: display.clone(),
+            checks: c.list,
+            failed_count: failed,
+            warned_count: warned,
+            ready: failed == 0,
+        })
     };
 
     // 1. Configuration
@@ -158,7 +260,7 @@ pub async fn run(a: DoctorArgs) -> Result<ExitCode> {
             }
             Err(e) => {
                 c.fail("network", &format!("{e:#}"));
-                return Ok(finish(c));
+                return finish(c);
             }
         }
     }
@@ -168,7 +270,7 @@ pub async fn run(a: DoctorArgs) -> Result<ExitCode> {
         Ok(b) => b,
         Err(e) => {
             c.fail("backend", &format!("{e:#}"));
-            return Ok(finish(c));
+            return finish(c);
         }
     };
     let admin = crate::engine::operator::admin_operator(&base, &target)?;
@@ -185,12 +287,13 @@ pub async fn run(a: DoctorArgs) -> Result<ExitCode> {
         Err(e) => c.fail("list", &e.to_string()),
     }
     if a.read_only {
-        println!(
-            "  {} {}",
-            dim("·"),
-            dim("skipping write/read/delete checks (--read-only)")
+        c.push(
+            "write",
+            CheckStatus::Skipped,
+            "skipping write/read/delete checks (--read-only)",
+            None,
         );
-        return Ok(finish(c));
+        return finish(c);
     }
     let key = format!(
         "oprobe-run-{}-doctor/probe.bin",
@@ -236,26 +339,7 @@ pub async fn run(a: DoctorArgs) -> Result<ExitCode> {
         }
         Err(e) => c.fail("write", &e.to_string()),
     }
-    Ok(finish(c))
-}
-
-fn finish(c: Checks) -> ExitCode {
-    println!();
-    if c.failed == 0 {
-        println!(
-            "{} ready to benchmark{}",
-            green("●"),
-            if c.warned > 0 {
-                format!(" ({} warnings)", c.warned)
-            } else {
-                String::new()
-            }
-        );
-        ExitCode::SUCCESS
-    } else {
-        println!("{} {} check(s) failed", red("●"), c.failed);
-        ExitCode::FAILURE
-    }
+    finish(c)
 }
 
 pub fn render_probe(r: &ProbeReport) -> String {

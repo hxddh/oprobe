@@ -26,9 +26,15 @@ fn runtime() -> &'static tokio::runtime::Runtime {
 /// The finished result of a job.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Outcome {
-    Report(Box<Report>),
+    Report {
+        report: Box<Report>,
+        /// The final aggregate the report was built from (the live views keep showing it).
+        snapshot: Box<Snapshot>,
+    },
     Tuned {
         report: Box<Report>,
+        /// The winning configuration.
+        knobs: Box<crate::config::Knobs>,
         summary: Box<TuneSummary>,
         profile_toml: String,
         rust: String,
@@ -232,7 +238,8 @@ impl Job {
         Self::spawn(move |state, cancel| async move {
             let scheme = profile.target.scheme.clone();
             let progress = Self::progress(&state);
-            let res: anyhow::Result<Report> = async {
+            let res: anyhow::Result<(Report, Snapshot)> = async {
+                let started_at = std::time::SystemTime::now();
                 let session = Session::open(profile, cancel, progress.clone()).await?;
                 for w in &session.warnings {
                     progress(Progress::Message(format!("warning: {w}")));
@@ -255,17 +262,26 @@ impl Job {
                 let mut snap = run?;
                 snap.integrity.verified += ok;
                 snap.integrity.corrupted += bad;
-                Ok(Report::build(
-                    &session.profile,
-                    &knobs,
-                    snap,
+                let report = crate::model::build_report(crate::model::ReportInput {
+                    run_id: &crate::model::RunId::new(),
+                    target_name: None,
+                    profile: &session.profile,
+                    knobs: &knobs,
+                    snapshot: snap.clone(),
+                    trace: session.take_trace().unwrap_or_default(),
                     cleanup,
-                    session.warnings.clone(),
-                ))
+                    warnings: session.warnings.clone(),
+                    started_at,
+                    ended_at: std::time::SystemTime::now(),
+                });
+                Ok((report, snap))
             }
             .await;
             match res {
-                Ok(r) => Outcome::Report(Box::new(r)),
+                Ok((r, snap)) => Outcome::Report {
+                    report: Box::new(r),
+                    snapshot: Box::new(snap),
+                },
                 Err(e) => failed(&e, &scheme),
             }
         })
@@ -293,14 +309,20 @@ impl Job {
                 progress(Progress::Message("cleaning up test data…".into()));
                 let cleanup = session.close().await;
                 let out = out?;
-                let mut report = Report::build(
-                    &session.profile,
-                    &out.winner,
-                    out.winner_snapshot.clone(),
+                let now = std::time::SystemTime::now();
+                let mut report = crate::model::build_report(crate::model::ReportInput {
+                    run_id: &crate::model::RunId::new(),
+                    target_name: None,
+                    profile: &session.profile,
+                    knobs: &out.winner,
+                    snapshot: out.winner_snapshot.clone(),
+                    trace: Default::default(),
                     cleanup,
-                    session.warnings.clone(),
-                );
-                report.tune = Some(out.summary.clone());
+                    warnings: session.warnings.clone(),
+                    started_at: now,
+                    ended_at: now,
+                });
+                report.tune = Some((&out.summary).into());
                 let header = format!(
                     "objective {} · {:+.0}% vs baseline",
                     out.summary.objective,
@@ -314,6 +336,7 @@ impl Job {
                         &session.capability,
                     ),
                     summary: Box::new(out.summary),
+                    knobs: Box::new(out.winner.clone()),
                     report: Box::new(report),
                 })
             }

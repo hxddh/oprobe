@@ -182,7 +182,9 @@ fn verdict() -> impl IntoElement {
                     .flex_1(),
             )
             .child(muted(move || {
-                let partial = s.report.with(|r| r.as_ref().is_some_and(|r| r.interrupted));
+                let partial = s
+                    .report
+                    .with(|r| r.as_ref().is_some_and(|r| r.run.interrupted));
                 if partial {
                     format!(
                         "{} · stopped early: partial results",

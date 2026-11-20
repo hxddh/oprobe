@@ -1,13 +1,18 @@
-//! Command handlers.
+//! The 3.0 command tree (design §9). Every command returns a typed result
+//! ([`crate::output::CommandOutput`]) rendered by [`crate::output::Output`]; failures are
+//! classified ([`crate::errors::classify`]) at this boundary and mapped to exit codes.
 
 pub mod args;
 mod doctor;
 mod live;
+mod misc;
+mod run;
+mod runs;
+mod settings;
 
 use std::io::IsTerminal;
 use std::process::ExitCode;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::OnceLock;
 
 use anyhow::{Context, Result, bail};
 use clap::CommandFactory;
@@ -15,17 +20,55 @@ use clap::CommandFactory;
 pub use args::Cli;
 use args::*;
 
-use crate::analysis::hints::hint_for;
 use crate::config::{Access, DatasetSpec, Preset, Profile, TargetSpec};
-use crate::engine::{Cancel, Progress, ProgressFn, RunOptions, Session};
-use crate::report::diff::{Thresholds, diff};
-use crate::report::style::{self, bold, dim, green, red, yellow};
-use crate::report::{Report, markdown, terminal, write_file};
+use crate::engine::RunOptions;
+use crate::errors::{ErrorCode, OprobeError, exit};
+use crate::output::{Output, OutputFormat};
+use crate::report::style::{self, bold, red, yellow};
+use crate::store::{ConfigFile, Paths};
 use crate::util::{ByteSize, HumanDuration, parse_duration};
 
-/// Exit code when the SLA is breached, `--fail-on` matched or the diff gate failed.
-pub const EXIT_GATE: u8 = 3;
+pub use run::{RunOutput, TuneOutput};
 
+/// Exit code when the SLA is breached, `--fail-on` matched or the compare gate failed.
+pub const EXIT_GATE: u8 = exit::GATE;
+/// Exit code of a command stopped by Ctrl-C (SIGINT), as shells report it.
+pub const EXIT_INTERRUPTED: u8 = exit::INTERRUPTED;
+
+/// What every command gets: output, paths and the (lazily loaded) config file.
+pub struct Ctx {
+    pub out: Output,
+    pub paths: Paths,
+    /// Global settings given as flags (for `config show` sources).
+    pub flags: std::collections::BTreeMap<String, String>,
+    config: OnceLock<std::result::Result<ConfigFile, String>>,
+}
+
+impl Ctx {
+    pub fn new(out: Output, paths: Paths) -> Self {
+        Self {
+            out,
+            paths,
+            flags: Default::default(),
+            config: OnceLock::new(),
+        }
+    }
+
+    /// The config file (empty when missing; an invalid file is a `config.invalid` error).
+    pub fn config(&self) -> Result<&ConfigFile> {
+        self.config
+            .get_or_init(|| ConfigFile::load(&self.paths.config_file).map_err(|e| format!("{e:#}")))
+            .as_ref()
+            .map_err(|m| OprobeError::new(ErrorCode::ConfigInvalid, m.clone()).into())
+    }
+
+    /// The run store.
+    pub fn store(&self) -> crate::store::RunStore {
+        self.paths.run_store()
+    }
+}
+
+/// Run the parsed command line and return the process exit code.
 pub async fn main(cli: Cli) -> ExitCode {
     match cli.color {
         ColorChoice::Always => style::set(true),
@@ -36,17 +79,42 @@ pub async fn main(cli: Cli) -> ExitCode {
         let _ = Cli::command().print_help();
         return ExitCode::SUCCESS;
     };
+    let paths = Paths::resolve(cli.config.as_deref());
+    let format = cli.output.unwrap_or_else(|| {
+        ConfigFile::load(&paths.config_file)
+            .ok()
+            .and_then(|c| c.defaults.output)
+            .and_then(|o| OutputFormat::parse(&o))
+            .unwrap_or_default()
+    });
+    let non_interactive = cli.non_interactive || !crate::output::interactive_terminal();
+    let mut ctx = Ctx::new(Output::new(format, cli.quiet, non_interactive), paths);
+    if let Some(o) = cli.output
+        && std::env::var_os("OPROBE_OUTPUT").is_none()
+    {
+        ctx.flags
+            .insert("output".into(), format!("{o:?}").to_ascii_lowercase());
+    }
+    if cli.color != ColorChoice::Auto {
+        ctx.flags.insert(
+            "color".into(),
+            format!("{:?}", cli.color).to_ascii_lowercase(),
+        );
+    }
     let scheme_hint = scheme_of(&command);
-    match dispatch(command).await {
+    let code = match dispatch(command, &ctx).await {
         Ok(code) => code,
         Err(err) => {
-            print_error(&err, &scheme_hint);
-            if INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst) {
-                return interrupted_exit("command");
+            let mut body = crate::errors::classify(&err, &scheme_hint);
+            if INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst)
+                && body.code.exit_code() == exit::RUNTIME
+            {
+                body.code = ErrorCode::RunInterrupted;
             }
-            ExitCode::FAILURE
+            ctx.out.error(&body)
         }
-    }
+    };
+    ExitCode::from(code)
 }
 
 /// Set by the first Ctrl-C of `run` / `tune`.
@@ -65,17 +133,12 @@ fn scheme_of(cmd: &Command) -> String {
         .unwrap_or_else(|| "s3".into())
 }
 
+/// Print an error chain with a hint on stderr (interactive surfaces before the CLI runtime).
 pub fn print_error(err: &anyhow::Error, scheme: &str) {
-    let chain = format!("{err:#}");
-    eprintln!("{} {}", red(&bold("error:")), err);
-    for cause in err.chain().skip(1) {
-        eprintln!("  {} {cause}", dim("caused by:"));
-    }
-    if let Some(h) = hint_for(&chain, scheme) {
-        eprintln!("\n{} {}", yellow(&bold("hint:")), bold(&h.title));
-        for s in h.steps {
-            eprintln!("  • {s}");
-        }
+    let body = crate::errors::classify(err, scheme);
+    eprintln!("{} {}", red(&bold("error:")), body.message);
+    if let Some(h) = &body.hint {
+        eprintln!("{} {h}", yellow(&bold("hint:")));
     }
 }
 
@@ -249,27 +312,40 @@ fn detach_console() {
     }
 }
 
-async fn dispatch(cmd: Command) -> Result<ExitCode> {
+async fn dispatch(cmd: Command, ctx: &Ctx) -> Result<u8> {
+    let pending = |name: &str| -> Result<u8> { Err(OprobeError::not_implemented(name).into()) };
     match cmd {
-        Command::Run(a) => cmd_run(a).await,
-        Command::Tune(a) => cmd_tune(a).await,
-        Command::Diff(a) => cmd_diff(a),
-        Command::Top(_) | Command::Gui(_) => {
-            unreachable!("interactive commands are handled by ui_entry")
-        }
-        Command::Doctor(a) => doctor::run(a).await,
-        Command::Probe(a) => cmd_probe(a).await,
-        Command::Lab(a) => cmd_lab(a).await,
-        Command::Cleanup(a) => cmd_cleanup(a).await,
+        Command::Run(a) => run::cmd_run(a, ctx).await,
+        Command::Tune(a) => run::cmd_tune(a, ctx).await,
+        Command::Compare(a) => runs::cmd_compare(a, ctx),
+        Command::Runs(c) => match c {
+            RunsCommand::List(a) => runs::cmd_list(a, ctx),
+            RunsCommand::Show(a) => runs::cmd_show(a, ctx),
+            RunsCommand::Rm(a) => runs::cmd_rm(a, ctx),
+            RunsCommand::Gc(a) => runs::cmd_gc(a, ctx),
+            RunsCommand::Open(_) => pending("runs open"),
+            RunsCommand::Export(_) => pending("runs export"),
+        },
+        Command::Target(c) => match c {
+            TargetCommand::Add(a) => settings::target_add(a, ctx),
+            TargetCommand::List => settings::target_list(ctx),
+            TargetCommand::Show(a) => settings::target_show(a, ctx),
+            TargetCommand::Rm(a) => settings::target_rm(a, ctx),
+            TargetCommand::Test(_) => pending("target test"),
+        },
+        Command::Config(c) => match c {
+            ConfigCommand::Show => settings::config_show(ctx),
+            ConfigCommand::Path => settings::config_path(ctx),
+            ConfigCommand::Edit(_) => pending("config edit"),
+        },
+        Command::Doctor(a) => doctor::run(a, ctx).await,
+        Command::Probe(a) => misc::cmd_probe(a, ctx).await,
+        Command::Lab(a) => misc::cmd_lab(a, ctx).await,
+        Command::Cleanup(a) => misc::cmd_cleanup(a, ctx).await,
         Command::Init(a) => cmd_init(a),
-        Command::Report(a) => {
-            let r = Report::load_json(&a.file)?;
-            emit(&r, a.format)?;
-            Ok(ExitCode::SUCCESS)
-        }
         Command::Completions { shell } => {
             clap_complete::generate(shell, &mut Cli::command(), "oprobe", &mut std::io::stdout());
-            Ok(ExitCode::SUCCESS)
+            Ok(exit::OK)
         }
         Command::Man { out_dir } => {
             let cmd = Cli::command();
@@ -280,14 +356,117 @@ async fn dispatch(cmd: Command) -> Result<ExitCode> {
                 }
                 None => clap_mangen::Man::new(cmd).render(&mut std::io::stdout())?,
             }
-            Ok(ExitCode::SUCCESS)
+            Ok(exit::OK)
         }
+        Command::Top(_) | Command::Gui(_) => {
+            unreachable!("interactive commands are handled by ui_entry")
+        }
+        Command::Demo(_) => pending("demo"),
+        Command::Analyze(_) => pending("analyze"),
+        Command::Explain(_) => pending("explain"),
+        Command::Watch(_) => pending("watch"),
+        Command::Matrix(_) => pending("matrix"),
+        Command::Compat(_) => pending("compat"),
+        Command::Baseline(_) => pending("baseline"),
+        Command::Mcp(_) => pending("mcp"),
+        Command::Schema(_) => pending("schema"),
+        Command::Capabilities(_) => pending("capabilities"),
+        Command::SelfUpdate(_) => pending("self-update"),
     }
 }
 
 // ---------------------------------------------------------------------------------------
 // Profile assembly
 // ---------------------------------------------------------------------------------------
+
+/// Resolve a target *name* (from the config file) into URL arguments; URLs pass through.
+/// Flags given on the command line override the target's values. Returns the target name.
+pub fn resolve_target(t: &TargetArgs, cfg: &ConfigFile) -> Result<(TargetArgs, Option<String>)> {
+    let mut t = t.clone();
+    if t.profile.is_some() {
+        return Ok((t, None));
+    }
+    let given = t.target.clone().or_else(|| cfg.defaults.target.clone());
+    let Some(given) = given else {
+        return Ok((t, None));
+    };
+    if given.contains("://") {
+        t.target = Some(given);
+        return Ok((t, None));
+    }
+    let Some(entry) = cfg.target(&given) else {
+        let known: Vec<&str> = cfg.targets.keys().map(String::as_str).collect();
+        return Err(OprobeError::new(
+            ErrorCode::UsageUnknownTarget,
+            format!("unknown target `{given}`"),
+        )
+        .with_hint(if known.is_empty() {
+            "pass a storage URL (s3://bucket/prefix, memory://) or add a target with `oprobe target add NAME URL`".to_owned()
+        } else {
+            format!("configured targets: {}", known.join(", "))
+        })
+        .into());
+    };
+    entry.validate()?;
+    t.target = Some(entry.url.clone());
+    if t.endpoint.is_none() {
+        t.endpoint = entry.endpoint.clone();
+    }
+    if t.region.is_none() {
+        t.region = entry.region.clone();
+    }
+    let mut opts: Vec<String> = entry
+        .options
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect();
+    opts.append(&mut t.options);
+    t.options = opts;
+    if entry.credentials.as_deref() == Some("anonymous") {
+        t.anonymous = true;
+    }
+    Ok((t, Some(given)))
+}
+
+/// Apply `[defaults]` for workload/knob values not given on the command line.
+fn apply_defaults(w: &mut WorkloadArgs, k: &mut KnobArgs, cfg: &ConfigFile) {
+    let d = &cfg.defaults;
+    if w.preset.is_none() {
+        w.preset = d.preset.clone();
+    }
+    if w.duration.is_none() {
+        w.duration = d.duration.clone();
+    }
+    if k.concurrency.is_none() {
+        k.concurrency = d.concurrency;
+    }
+}
+
+/// [`build_profile`] with configured targets and `[defaults]` applied.
+pub fn resolve_profile(
+    ctx: &Ctx,
+    t: &TargetArgs,
+    w: &WorkloadArgs,
+    k: &KnobArgs,
+    c: &CostArgs,
+) -> Result<(Profile, Option<String>)> {
+    let cfg = ctx.config()?;
+    let (t, name) = resolve_target(t, cfg)?;
+    let (mut w, mut k) = (w.clone(), k.clone());
+    if t.profile.is_none() {
+        apply_defaults(&mut w, &mut k, cfg);
+    }
+    Ok((build_profile(&t, &w, &k, c)?, name))
+}
+
+/// Trace rows kept per run: `$OPROBE_MAX_REQUESTS` > `[defaults] max_requests` > built-in.
+pub fn trace_max_requests(ctx: &Ctx) -> usize {
+    std::env::var("OPROBE_MAX_REQUESTS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .or_else(|| ctx.config().ok().and_then(|c| c.defaults.max_requests))
+        .unwrap_or(crate::trace::DEFAULT_MAX_REQUESTS)
+}
 
 fn parse_size(flag: &str, v: &str) -> Result<ByteSize> {
     v.parse().with_context(|| format!("invalid {flag}"))
@@ -302,10 +481,14 @@ pub fn build_profile(
     let mut p = match (&t.profile, &t.target) {
         (Some(path), _) => Profile::load(path)?,
         (None, Some(url)) => Profile::from_target(TargetSpec::from_url(url)?),
-        (None, None) => bail!(
-            "no target given\n\n  Try `oprobe run memory://` for a local demo, `oprobe run s3://bucket/prefix`, \
-             or `oprobe lab` to start a local S3 server."
-        ),
+        (None, None) => {
+            return Err(OprobeError::new(ErrorCode::UsageUnknownTarget, "no target given")
+                .with_hint(
+                    "try `oprobe run memory://` for a local demo, `oprobe run s3://bucket/prefix`, \
+                     a configured target name, or `oprobe lab` to start a local S3 server",
+                )
+                .into());
+        }
     };
     if t.profile.is_some()
         && let Some(url) = &t.target
@@ -454,12 +637,8 @@ pub fn build_profile(
     Ok(p)
 }
 
-// ---------------------------------------------------------------------------------------
-// run
-// ---------------------------------------------------------------------------------------
-
 /// Install a Ctrl-C handler: first press cancels gracefully (cleanup still runs), second exits.
-fn install_ctrl_c(cancel: Cancel) {
+fn install_ctrl_c(cancel: crate::engine::Cancel) {
     tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
             INTERRUPTED.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -477,25 +656,6 @@ fn install_ctrl_c(cancel: Cancel) {
             }
         }
     });
-}
-
-fn emit(r: &Report, format: Format) -> Result<()> {
-    match format {
-        Format::Text => print!("{}", terminal::render(r)),
-        Format::Json => println!("{}", serde_json::to_string_pretty(r)?),
-        Format::Markdown => println!("{}", markdown::render(r)),
-    }
-    Ok(())
-}
-
-fn save_outputs(r: &Report, o: &OutputArgs) -> Result<()> {
-    if let Some(p) = &o.json {
-        r.save_json(p)?;
-    }
-    if let Some(p) = &o.markdown {
-        write_file(p, &markdown::render(r))?;
-    }
-    Ok(())
 }
 
 /// A share given as `1%`, `0.5 %` or a fraction (`0.01`).
@@ -529,152 +689,6 @@ pub fn apply_sla(p: &mut Profile, a: &SlaArgs) -> Result<()> {
     }
     p.sla.validate()
 }
-
-/// Exit code 3 when the enforced SLA is breached or `--fail-on` matched a finding.
-fn gate_exit(r: &Report, o: &OutputArgs) -> ExitCode {
-    use crate::analysis::diagnosis::Severity;
-    let v = &r.sla_verdict;
-    let mut failed = false;
-    if !v.passed {
-        if v.enforced {
-            failed = true;
-            eprintln!(
-                "{} SLA breached (exit {EXIT_GATE}): {}",
-                red(&bold("✖")),
-                v.breaches.join("; ")
-            );
-        } else if !o.quiet {
-            eprintln!(
-                "{} SLA breached but not enforced (`--sla none`): {}",
-                yellow("▲"),
-                v.breaches.join("; ")
-            );
-        }
-    }
-    if let Some(level) = o.fail_on {
-        let min = match level {
-            FailOn::Warning => Severity::Warning,
-            FailOn::Critical => Severity::Critical,
-        };
-        if r.diagnosis.worst() >= min {
-            eprintln!(
-                "{} `--fail-on {}`: the diagnosis has {} findings (exit {EXIT_GATE})",
-                red(&bold("✖")),
-                if min == Severity::Warning {
-                    "warning"
-                } else {
-                    "critical"
-                },
-                r.diagnosis.worst().label()
-            );
-            failed = true;
-        }
-    }
-    if failed {
-        ExitCode::from(EXIT_GATE)
-    } else {
-        ExitCode::SUCCESS
-    }
-}
-
-fn progress_for(quiet: bool, total: Duration) -> (Option<ProgressFn>, Option<Arc<live::LiveLine>>) {
-    if quiet || !std::io::stderr().is_terminal() {
-        let msg: ProgressFn = Arc::new(move |p| {
-            if let Progress::Message(m) = p
-                && !quiet
-            {
-                eprintln!("{m}");
-            }
-        });
-        return (Some(msg), None);
-    }
-    let line = Arc::new(live::LiveLine::new(total));
-    let l2 = line.clone();
-    (Some(Arc::new(move |p| l2.update(p))), Some(line))
-}
-
-async fn cmd_run(a: RunArgs) -> Result<ExitCode> {
-    let mut profile = build_profile(&a.target, &a.workload, &a.knobs, &a.cost)?;
-    apply_sla(&mut profile, &a.sla)?;
-    if a.output.label.is_some() {
-        profile.name = a.output.label.clone();
-    }
-    let cancel = Cancel::new();
-    install_ctrl_c(cancel.clone());
-    let (progress, line) = progress_for(a.output.quiet, profile.workload.duration.get());
-    let progress = progress.expect("progress callback");
-    if !a.output.quiet {
-        eprintln!(
-            "{} {} {}",
-            bold("oprobe"),
-            profile.target.display(),
-            dim(&format!(
-                "· {} · {}",
-                profile.workload.preset.slug(),
-                profile.knobs.summary()
-            ))
-        );
-    }
-    let session = Session::open(profile, cancel.clone(), progress.clone()).await?;
-    if a.output.format != Format::Text {
-        for w in &session.warnings {
-            eprintln!("{} {w}", yellow("warning:"));
-        }
-    }
-    let knobs = session.profile.knobs.clone();
-    let res = session
-        .run(
-            &knobs,
-            &RunOptions::from_profile(&session.profile),
-            Some(progress.clone()),
-        )
-        .await;
-    if let Some(l) = &line {
-        l.finish();
-    }
-    let (ok, bad) = if res.is_ok() && session.profile.workload.verify {
-        session.verify_writes(None).await
-    } else {
-        (0, 0)
-    };
-    if !a.output.quiet {
-        eprintln!("{}", dim("cleaning up…"));
-    }
-    let cleanup = session.close().await;
-    let mut snap = res?;
-    snap.integrity.verified += ok;
-    snap.integrity.corrupted += bad;
-    let report = Report::build(
-        &session.profile,
-        &knobs,
-        snap,
-        cleanup,
-        session.warnings.clone(),
-    );
-    save_outputs(&report, &a.output)?;
-    emit(&report, a.output.format)?;
-    if report.interrupted || cancel.is_cancelled() {
-        return Ok(interrupted_exit("run"));
-    }
-    Ok(gate_exit(&report, &a.output))
-}
-
-/// Exit code of a command stopped by Ctrl-C (SIGINT), as shells report it.
-pub const EXIT_INTERRUPTED: u8 = 130;
-
-/// A run stopped by Ctrl-C: say so (its numbers cover only part of the window) and exit 130,
-/// so scripts and CI never mistake a partial result for a complete one.
-fn interrupted_exit(what: &str) -> ExitCode {
-    eprintln!(
-        "{} {what} interrupted — partial results: they cover only the time before Ctrl-C",
-        yellow(&bold("■"))
-    );
-    ExitCode::from(EXIT_INTERRUPTED)
-}
-
-// ---------------------------------------------------------------------------------------
-// tune
-// ---------------------------------------------------------------------------------------
 
 /// The tuner's search settings, as text the user typed (flags or the app's Tune page).
 #[derive(Clone, Copy, Debug)]
@@ -731,385 +745,26 @@ pub fn tune_options(
     })
 }
 
-async fn cmd_tune(a: TuneArgs) -> Result<ExitCode> {
-    use crate::tune::{Objective, TuneEvent, codegen, tune};
-    let mut profile = build_profile(&a.target, &a.workload, &a.knobs, &a.cost)?;
-    apply_sla(&mut profile, &a.sla)?;
-    let cancel = Cancel::new();
-    install_ctrl_c(cancel.clone());
-    let quiet = a.output.quiet;
-    let msg: ProgressFn = Arc::new(move |p| {
-        if let Progress::Message(m) = p
-            && !quiet
-        {
-            eprintln!("{} {m}", dim("·"));
-        }
-    });
-    let objective = match a.objective {
-        ObjectiveArg::Throughput => Objective::Throughput,
-        ObjectiveArg::Latency => Objective::Latency,
-        ObjectiveArg::Cost => Objective::Cost,
-    };
-    let opts = tune_options(
-        objective,
-        &TuneSettings {
-            trial_duration: &a.trial_duration,
-            trial_warmup: &a.trial_warmup,
-            max_trials: a.max_trials,
-            max_concurrency: a.max_concurrency,
-            cooldown: &a.cooldown,
-        },
-        profile.workload.rate,
-    )?;
-    let session = Session::open(profile, cancel.clone(), msg).await?;
-    // The trial table is report content: stdout with the text report (even with `-q`); with
-    // `--format json|markdown` stdout holds only that document, so the table is progress on
-    // stderr. Progress messages always go to stderr.
-    let table_on_stdout = a.output.format == Format::Text;
-    let table_line = move |line: String| {
-        if table_on_stdout {
-            println!("{line}");
-        } else if !quiet {
-            eprintln!("{line}");
-        }
-    };
-    {
-        table_line(format!(
-            "{} {} {}",
-            bold("oprobe tune"),
-            session.profile.target.display(),
-            dim(&format!(
-                "· {} · objective {} · ≤{} trials of {}",
-                session.profile.workload.preset.slug(),
-                opts.objective.label(),
-                opts.max_trials,
-                a.trial_duration
-            ))
-        ));
-        table_line(dim(
-            "   #  stage            conc  io  chunk   gap     cache  http     ops/s    MiB/s     p99       result",
-        ));
-    }
-    let on_event: Arc<dyn Fn(TuneEvent) + Send + Sync> = Arc::new(move |ev| match ev {
-        TuneEvent::Started { .. } => {}
-        TuneEvent::Message(m) => {
-            if !quiet {
-                eprintln!("   {}", dim(&m));
-            }
-        }
-        TuneEvent::Finished(t) => {
-            let k = &t.knobs;
-            let verdict = if t.throttled() {
-                red(&format!("throttled ({})", t.throttled_responses))
-            } else if t.feasible {
-                green("ok")
-            } else {
-                yellow(&t.note)
-            };
-            table_line(format!(
-                "  {:>2}  {:<15} {:>5} {:>3}  {:<7} {:<7} {:<6} {:<6} {:>8.1} {:>8.1} {:>9}  {verdict}",
-                t.id,
-                t.stage,
-                k.concurrency,
-                k.io_concurrency,
-                k.chunk_size.to_string(),
-                k.range_gap.to_string(),
-                if k.cache { "on" } else { "off" },
-                format!("{:?}", k.http_version).to_ascii_lowercase(),
-                t.ops_per_s,
-                t.mib_per_s,
-                crate::util::fmt_ms(t.p99_ms),
-            ));
-        }
-    });
-    let outcome = tune(&session, &opts, on_event).await;
-    let cleanup = session.close().await;
-    let outcome = outcome?;
-    let mut report = Report::build(
-        &session.profile,
-        &outcome.winner,
-        outcome.winner_snapshot.clone(),
-        cleanup,
-        session.warnings.clone(),
-    );
-    report.tune = Some(outcome.summary.clone());
-
-    let header = format!(
-        "objective {} · {:+.0}% vs baseline · {}",
-        outcome.summary.objective,
-        outcome.summary.improvement * 100.0,
-        crate::util::now_rfc3339()
-    );
-    if let Some(p) = &a.emit_profile {
-        write_file(
-            p,
-            &codegen::profile_toml(&session.profile, &outcome.winner, &header)?,
-        )?;
-    }
-    if let Some(p) = &a.emit_rust {
-        write_file(
-            p,
-            &codegen::rust_snippet(
-                &session.profile.target,
-                &outcome.winner,
-                &session.capability,
-            ),
-        )?;
-    }
-    if let Some(p) = &a.emit_python {
-        write_file(
-            p,
-            &codegen::python_snippet(
-                &session.profile.target,
-                &outcome.winner,
-                &session.capability,
-            ),
-        )?;
-    }
-    save_outputs(&report, &a.output)?;
-    match a.output.format {
-        Format::Text => {
-            let s = &outcome.summary;
-            println!();
-            println!(
-                "{} {}",
-                style::badge("TUNED", "42;30"),
-                bold(&format!(
-                    "{} → {:+.0}% {} vs baseline",
-                    outcome.winner.summary(),
-                    s.improvement * 100.0,
-                    outcome.summary.objective
-                ))
-            );
-            for n in &s.notes {
-                println!("  {} {n}", dim("·"));
-            }
-            for (flag, path) in [
-                ("profile", &a.emit_profile),
-                ("rust", &a.emit_rust),
-                ("python", &a.emit_python),
-            ] {
-                if let Some(p) = path {
-                    println!("  {} wrote {flag}: {}", green("✓"), p.display());
-                }
-            }
-            println!(
-                "\n{}",
-                dim("Confirmation run of the winning configuration:")
-            );
-            print!("{}", terminal::render(&report));
-        }
-        f => emit(&report, f)?,
-    }
-    if cancel.is_cancelled() {
-        return Ok(interrupted_exit("tuning"));
-    }
-    Ok(gate_exit(&report, &a.output))
-}
-
-// ---------------------------------------------------------------------------------------
-// diff / probe / lab / cleanup / init
-// ---------------------------------------------------------------------------------------
-
-fn cmd_diff(a: DiffArgs) -> Result<ExitCode> {
-    let base = Report::load_json(&a.baseline)?;
-    let cand = Report::load_json(&a.candidate)?;
-    let t = Thresholds {
-        p99_pct: a.max_p99_increase,
-        p50_pct: a.max_p50_increase,
-        min_latency_delta_ms: a.min_latency_delta_ms,
-        throughput_drop_pct: a.max_throughput_drop,
-        error_rate_pp: a.max_error_increase,
-        request_amp_pct: a.max_request_amp_increase,
-        read_amp_pct: a.max_read_amp_increase,
-        cost_pct: a.max_cost_increase,
-        fail_on_new_throttling: !a.allow_throttling,
-        min_samples: a.min_samples,
-        allow_workload_change: a.allow_workload_change,
-        allow_target_change: a.allow_target_change,
-    };
-    let d = diff(&base, &cand, &t);
-    if let Some(p) = &a.markdown {
-        write_file(p, &d.render_markdown())?;
-    }
-    if let Some(p) = &a.junit {
-        write_file(p, &d.render_junit())?;
-    }
-    if let Some(p) = &a.json {
-        write_file(p, &serde_json::to_string_pretty(&d)?)?;
-    }
-    match a.format {
-        Format::Text => print!("{}", d.render_terminal()),
-        Format::Json => println!("{}", serde_json::to_string_pretty(&d)?),
-        Format::Markdown => println!("{}", d.render_markdown()),
-    }
-    Ok(if d.passed {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::from(EXIT_GATE)
-    })
-}
-
-async fn cmd_probe(a: ProbeArgs) -> Result<ExitCode> {
-    use crate::net::probe::{ProbeOptions, probe_endpoint};
-    let endpoint = if a.endpoint.starts_with("http://") || a.endpoint.starts_with("https://") {
-        a.endpoint.clone()
-    } else {
-        TargetSpec::from_url(&a.endpoint)?
-            .normalized()?
-            .endpoint()
-            .with_context(|| {
-                format!(
-                    "cannot derive an http(s) endpoint from `{}`; pass one explicitly",
-                    a.endpoint
-                )
-            })?
-    };
-    let mut tls = crate::net::TlsClientOptions::default();
-    if let Some(p) = &a.ca_cert {
-        tls.extra_ca_pem = Some(
-            std::fs::read_to_string(p).with_context(|| format!("cannot read `{}`", p.display()))?,
-        );
-    }
-    tls.insecure_skip_verify = a.insecure;
-    let opts = ProbeOptions {
-        samples: a.samples,
-        timeout: parse_duration(&a.timeout)?,
-        http: a.http.into(),
-        tls,
-        proxy: match a.proxy.as_deref() {
-            None => None,
-            Some("none") => Some(None),
-            Some(p) => Some(Some(p.to_owned())),
-        },
-        method: if a.get {
-            http::Method::GET
-        } else {
-            http::Method::HEAD
-        },
-    };
-    let r = probe_endpoint(&endpoint, &opts).await?;
-    if let Some(p) = &a.json {
-        write_file(p, &serde_json::to_string_pretty(&r)?)?;
-    }
-    match a.format {
-        Format::Json => println!("{}", serde_json::to_string_pretty(&r)?),
-        _ => print!("{}", doctor::render_probe(&r)),
-    }
-    Ok(ExitCode::SUCCESS)
-}
-
-async fn cmd_lab(a: LabArgs) -> Result<ExitCode> {
-    use crate::lab::{LabConfig, LabServer, lab_ca_pem};
-    if let Some(p) = &a.write_ca {
-        write_file(p, lab_ca_pem())?;
-    }
-    let cfg = LabConfig {
-        enable_tls: a.tls,
-        enable_http2: !a.h1_only,
-        base_ttfb_delay: parse_duration(&a.latency)?,
-        multipart_merge_delay: parse_duration(&a.complete_delay)?,
-        straggler_every_n: a.straggler_every,
-        straggler_delay: parse_duration(&a.straggler)?,
-        max_inflight_before_503: a.throttle_above,
-        throttle_every_n_requests: a.throttle_every,
-        throttle_status_code: a.throttle_status,
-        stream_bandwidth_kib_s: a.bandwidth_kib,
-        throttle_early_close: a.throttle_early_close,
-    };
-    let lab = LabServer::spawn(&a.bind, cfg).await?;
-    println!(
-        "{} S3 lab listening on {}",
-        green("●"),
-        bold(&lab.endpoint_url)
-    );
-    let tls_flag = if a.tls {
-        match &a.write_ca {
-            Some(p) => format!(" --ca-cert {}", p.display()),
-            None => " --insecure".into(),
-        }
-    } else {
-        String::new()
-    };
-    println!(
-        "  try: AWS_ACCESS_KEY_ID=lab AWS_SECRET_ACCESS_KEY=lab oprobe run s3://bench/demo --endpoint {} --proxy none{tls_flag}",
-        lab.endpoint_url
-    );
-    println!(
-        "  {}",
-        dim("any bucket name works; data lives in memory; Ctrl-C to stop")
-    );
-    tokio::signal::ctrl_c().await?;
-    println!(
-        "{} served {} requests",
-        dim("lab stopped:"),
-        lab.requests_served()
-    );
-    Ok(ExitCode::SUCCESS)
-}
-
-async fn cmd_cleanup(a: CleanupArgs) -> Result<ExitCode> {
-    let p = build_profile(
-        &a.target,
-        &WorkloadArgs::default(),
-        &KnobArgs::default(),
-        &CostArgs::default(),
-    )?;
-    let target = p.target.normalized()?;
-    let base = crate::engine::operator::base_operator(&target)?;
-    let admin = crate::engine::operator::admin_operator(&base, &target)?;
-    let older = parse_duration(&a.older_than)?;
-    let found = crate::engine::cleanup::sweep(&admin, older, a.datasets, a.dry_run).await?;
-    if found.is_empty() {
-        println!(
-            "{} nothing to clean under {} (older than {})",
-            green("✓"),
-            target.display(),
-            a.older_than
-        );
-        return Ok(ExitCode::SUCCESS);
-    }
-    for e in &found {
-        let age = e
-            .age_s
-            .map(|s| format!("{}h{:02}m old", s / 3600, (s % 3600) / 60))
-            .unwrap_or_else(|| "dataset".into());
-        let status = if a.dry_run {
-            yellow("would delete")
-        } else if e.deleted {
-            green("deleted")
-        } else {
-            red("partially deleted")
-        };
-        println!(
-            "  {status} {} {}",
-            e.prefix,
-            dim(&format!("({} objects, {age})", e.objects))
-        );
-    }
-    Ok(ExitCode::SUCCESS)
-}
-
-fn cmd_init(a: InitArgs) -> Result<ExitCode> {
+fn cmd_init(a: InitArgs) -> Result<u8> {
     let preset = Preset::parse(&a.preset)?;
     let text = crate::config::template(
         preset,
         a.target.as_deref().unwrap_or("s3://my-bucket/oprobe"),
     );
-    match &a.output {
+    match &a.file {
         Some(p) => {
             if p.exists() {
                 bail!("`{}` already exists", p.display());
             }
-            write_file(p, &text)?;
+            crate::report::write_file(p, &text)?;
             eprintln!(
                 "{} wrote {} — edit it, then `oprobe run --profile {}`",
-                green("✓"),
+                crate::report::style::green("✓"),
                 p.display(),
                 p.display()
             );
         }
         None => print!("{text}"),
     }
-    Ok(ExitCode::SUCCESS)
+    Ok(exit::OK)
 }

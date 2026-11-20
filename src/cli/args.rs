@@ -5,14 +5,18 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::net::HttpVersion;
+pub use crate::output::OutputFormat;
 
 const EXAMPLES: &str = "\
 Examples:
   oprobe run memory://                                  # zero-setup demo
-  oprobe run s3://my-bucket/bench --preset parquet -d 30s --json base.json
+  oprobe run s3://my-bucket/bench --preset parquet -d 30s --label base
   oprobe run s3://my-bucket/data --existing tables/events/ -c 64
+  oprobe run s3://my-bucket/bench --dry-run             # plan: requests, bytes, cost, ETA
+  oprobe runs list                                      # saved runs; `runs show last`
+  oprobe compare base last --junit gate.xml             # regression gate between two runs
   oprobe tune s3://my-bucket/bench --emit-profile tuned.toml --emit-rust tuned.rs
-  oprobe diff base.json candidate.json --junit gate.xml
+  oprobe run memory:// -o ndjson                        # events + result for agents/CI
   oprobe top s3://my-bucket/bench                       # live workbench in this terminal
   oprobe gui s3://my-bucket/bench                       # the same workbench in a window
   oprobe doctor s3://my-bucket/bench                    # connectivity & permission checks
@@ -61,9 +65,31 @@ It explains the bottleneck, projects the cloud bill, tunes the client configurat
     propagate_version = true
 )]
 pub struct Cli {
+    /// Output format of the result on stdout (logs and progress go to stderr)
+    #[arg(
+        short = 'o',
+        long = "output",
+        value_enum,
+        global = true,
+        env = "OPROBE_OUTPUT"
+    )]
+    pub output: Option<OutputFormat>,
+
     /// When to use colors.
     #[arg(long, value_enum, default_value_t = ColorChoice::Auto, global = true)]
     pub color: ColorChoice,
+
+    /// No progress or informational messages on stderr
+    #[arg(short, long, global = true)]
+    pub quiet: bool,
+
+    /// Never prompt or redraw (implied when stdin/stdout is not a terminal)
+    #[arg(long, global = true)]
+    pub non_interactive: bool,
+
+    /// Config file (default: $OPROBE_CONFIG or <config dir>/oprobe/config.toml)
+    #[arg(long, global = true, value_name = "PATH")]
+    pub config: Option<PathBuf>,
 
     /// Without a command, oprobe opens its workbench: a window when a display is available
     /// (builds with the `gui` feature), otherwise in this terminal.
@@ -78,54 +104,228 @@ pub enum ColorChoice {
     Never,
 }
 
+/// Arguments of a command that a later 3.0 stream implements (accepted and ignored for now).
+#[derive(Args, Debug, Clone, Default)]
+pub struct PendingArgs {
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
+    pub args: Vec<String>,
+}
+
 // Parsed once per process; boxing the larger argument structs would only add noise.
 #[allow(clippy::large_enum_variant)]
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    /// Run a workload and report where time and money go
+    /// Measure a target: where time and money go (saves the run)
     Run(RunArgs),
+    /// Start a lab target with throttling and stragglers, run it and narrate the result
+    Demo(PendingArgs),
     /// Find the best client configuration for a workload (throttle-aware)
     Tune(TuneArgs),
-    /// Compare two JSON reports and fail on regressions (CI gate)
-    Diff(DiffArgs),
+    /// Regression gate: compare two runs (RUNREFs or files) and fail on regressions
+    Compare(CompareArgs),
+    /// Saved runs: list, show, open, export, rm, gc
+    #[command(subcommand)]
+    Runs(RunsCommand),
+    /// Re-slice a run by API, connection, remote, stage or second
+    Analyze(PendingArgs),
+    /// Narrate a run's causes and advice, or document a finding code
+    Explain(PendingArgs),
+    /// Named targets: add, list, show, rm, test
+    #[command(subcommand)]
+    Target(TargetCommand),
+    /// Check endpoint reachability, TLS, clock skew, credentials and permissions
+    Doctor(DoctorArgs),
+    /// Measure DNS / TCP / proxy / TLS handshakes and cold vs warm TTFB of an endpoint
+    Probe(ProbeArgs),
+    /// Continuous low-rate probing with SLOs and a Prometheus endpoint
+    Watch(PendingArgs),
+    /// Run the same workload across targets / knob values and rank them
+    Matrix(PendingArgs),
+    /// Correctness & compatibility suite for a target
+    Compat(PendingArgs),
+    /// Named baselines: set, list, rm, show
+    #[command(subcommand)]
+    Baseline(BaselineCommand),
+    /// Start a local S3-compatible server with programmable faults
+    #[command(visible_alias = "serve-s3")]
+    Lab(LabArgs),
+    /// MCP server for agents (stdio, or --http ADDR)
+    Mcp(PendingArgs),
+    /// Print the JSON Schema of a machine output (report, events, …)
+    Schema(PendingArgs),
+    /// Describe what this oprobe can do (machine-readable)
+    Capabilities(PendingArgs),
+    /// Configuration: show (with sources), path, edit
+    #[command(subcommand)]
+    Config(ConfigCommand),
+    /// Remove test data left behind by interrupted runs
+    Cleanup(CleanupArgs),
+    /// Check, download, verify and install the latest release
+    SelfUpdate(PendingArgs),
     /// Interactive workbench in this terminal: run, tune and probe with live charts
     #[command(visible_alias = "tui")]
     Top(TopArgs),
     /// The same workbench in a native window (macOS, Windows, Linux with GTK 4)
     #[command(visible_alias = "app")]
     Gui(TopArgs),
-    /// Check endpoint reachability, TLS, clock skew, credentials and permissions
-    Doctor(DoctorArgs),
-    /// Measure DNS / TCP / proxy / TLS handshakes and cold vs warm TTFB of an endpoint
-    Probe(ProbeArgs),
-    /// Start a local S3-compatible server with programmable faults
-    #[command(visible_alias = "serve-s3")]
-    Lab(LabArgs),
-    /// Remove test data left behind by interrupted runs
-    Cleanup(CleanupArgs),
-    /// Print a commented profile template
-    Init(InitArgs),
-    /// Re-render a saved JSON report
-    Report(ReportArgs),
     /// Generate shell completions
     Completions {
         #[arg(value_enum)]
         shell: clap_complete::Shell,
     },
     /// Generate the man page
-    #[command(hide = true)]
     Man {
         /// Output directory (one page per command)
         #[arg(long)]
         out_dir: Option<PathBuf>,
     },
+    /// Print a commented profile template
+    #[command(hide = true)]
+    Init(InitArgs),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum RunsCommand {
+    /// List saved runs, newest first
+    List(RunsListArgs),
+    /// Show a run's full report
+    Show(RunRefArg),
+    /// Open a run in the app
+    Open(PendingArgs),
+    /// Export a run (html, md, json, ndjson, csv, har, otlp)
+    Export(PendingArgs),
+    /// Delete saved runs
+    Rm(RunsRmArgs),
+    /// Delete old runs (keeps the newest and every baseline run)
+    Gc(RunsGcArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct RunsListArgs {
+    /// Show at most N runs
+    #[arg(short = 'n', long, default_value_t = 20)]
+    pub limit: usize,
+}
+
+#[derive(Args, Debug)]
+pub struct RunRefArg {
+    /// Run id, id prefix, `last`, `last~N`, label, or path to a .oprobe / report .json file
+    #[arg(value_name = "RUNREF")]
+    pub run: String,
+}
+
+#[derive(Args, Debug)]
+pub struct RunsRmArgs {
+    /// Runs to delete (RUNREFs)
+    #[arg(value_name = "RUNREF", required = true)]
+    pub runs: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct RunsGcArgs {
+    /// Keep the newest N runs
+    #[arg(long, default_value_t = 50)]
+    pub keep: usize,
+    /// Only delete runs older than this (e.g. 30d is not supported; use hours: 720h)
+    #[arg(long, value_name = "DURATION")]
+    pub older_than: Option<String>,
+    /// Show what would be deleted
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum TargetCommand {
+    /// Add (or replace) a named target
+    Add(TargetAddArgs),
+    /// List configured targets
+    List,
+    /// Show one target
+    Show(TargetNameArg),
+    /// Remove a target
+    Rm(TargetNameArg),
+    /// Check a target (doctor)
+    Test(PendingArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct TargetAddArgs {
+    /// Name, e.g. prod
+    pub name: String,
+    /// Storage URL, e.g. s3://bucket/prefix
+    pub url: String,
+    #[arg(long)]
+    pub region: Option<String>,
+    #[arg(long)]
+    pub endpoint: Option<String>,
+    /// env | profile:NAME | anonymous
+    #[arg(long)]
+    pub credentials: Option<String>,
+    /// OpenDAL option, repeatable (KEY=VALUE)
+    #[arg(long = "option", value_name = "KEY=VALUE")]
+    pub options: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct TargetNameArg {
+    pub name: String,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum BaselineCommand {
+    /// Create or update a named baseline
+    Set(PendingArgs),
+    /// List baselines
+    List(PendingArgs),
+    /// Delete a baseline
+    Rm(PendingArgs),
+    /// Show a baseline's runs
+    Show(PendingArgs),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ConfigCommand {
+    /// Effective settings and where each comes from
+    Show,
+    /// Paths of the config file and data directory
+    Path,
+    /// Open the config file in $EDITOR
+    Edit(PendingArgs),
+}
+
+/// Safety rails of commands that touch storage (design §10).
+#[derive(Args, Debug, Clone, Default)]
+#[command(next_help_heading = "Safety")]
+pub struct SafetyArgs {
+    /// Print the plan (requests, bytes, objects written/deleted, cost, ETA) and exit
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Refuse every write and delete (exit 5); implied by --existing
+    #[arg(long)]
+    pub read_only: bool,
+    /// Stop when the estimated request cost exceeds this (USD; exit 4)
+    #[arg(long, value_name = "USD")]
+    pub max_cost_usd: Option<f64>,
+    /// Stop after this many backend requests (exit 4)
+    #[arg(long, value_name = "N")]
+    pub max_requests: Option<u64>,
+    /// Stop after transferring this many bytes, e.g. 10GiB (exit 4)
+    #[arg(long, value_name = "SIZE")]
+    pub max_bytes: Option<String>,
+    /// Stop after this much wall time, e.g. 5m (exit 4)
+    #[arg(long, value_name = "DURATION")]
+    pub max_duration: Option<String>,
+    /// Name the run prefix after KEY: a retried command reuses and cleans it up
+    #[arg(long, value_name = "KEY")]
+    pub idempotency_key: Option<String>,
 }
 
 /// Where to benchmark.
 #[derive(Args, Debug, Clone, Default)]
 #[command(next_help_heading = "Target")]
 pub struct TargetArgs {
-    /// Storage URL: s3://bucket/prefix, gcs://bucket, azblob://container, oss://, cos://, b2://, fs:///path, memory://
+    /// Target name (see `oprobe target list`) or storage URL: s3://bucket/prefix, gcs://bucket,
+    /// azblob://container, oss://, cos://, b2://, fs:///path, memory://
     #[arg(value_name = "TARGET")]
     pub target: Option<String>,
     /// Load a profile (TOML); flags override its values
@@ -137,8 +337,8 @@ pub struct TargetArgs {
     /// Region of the bucket (e.g. us-east-1); most S3-compatible services accept any value
     #[arg(long)]
     pub region: Option<String>,
-    /// Extra backend option, repeatable (e.g. -o enable_virtual_host_style=true)
-    #[arg(short = 'o', long = "option", value_name = "KEY=VALUE")]
+    /// Extra backend option, repeatable (e.g. --option enable_virtual_host_style=true)
+    #[arg(long = "option", value_name = "KEY=VALUE")]
     pub options: Vec<String>,
     /// Access a public bucket without credentials (s3, gcs, azblob, oss: unsigned requests)
     #[arg(long)]
@@ -272,13 +472,6 @@ pub struct CostArgs {
     pub stored_gib: Option<f64>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-pub enum Format {
-    Text,
-    Json,
-    Markdown,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, ValueEnum)]
 pub enum FailOn {
     Warning,
@@ -313,21 +506,18 @@ pub struct SlaArgs {
     pub p99_ms: Option<f64>,
 }
 
-#[derive(Args, Debug, Clone)]
+#[derive(Args, Debug, Clone, Default)]
 #[command(next_help_heading = "Output")]
 pub struct OutputArgs {
-    /// Save the full report as JSON (input for `oprobe diff`)
+    /// Also save the report as JSON (input for `oprobe compare`)
     #[arg(long, value_name = "FILE")]
     pub json: Option<PathBuf>,
-    /// Save a Markdown report
+    /// Also save a Markdown report
     #[arg(long, value_name = "FILE")]
     pub markdown: Option<PathBuf>,
-    /// Format printed to stdout
-    #[arg(long, value_enum, default_value_t = Format::Text)]
-    pub format: Format,
-    /// No live progress on stderr
-    #[arg(short, long)]
-    pub quiet: bool,
+    /// Do not save the run in the run store
+    #[arg(long)]
+    pub no_save: bool,
     /// Also exit with code 3 if the diagnosis has findings of this severity or worse
     /// (SLA breaches always do, unless `--sla none`)
     #[arg(long, value_enum)]
@@ -351,6 +541,14 @@ pub struct RunArgs {
     pub sla: SlaArgs,
     #[command(flatten)]
     pub output: OutputArgs,
+    #[command(flatten)]
+    pub safety: SafetyArgs,
+    /// Repeat the run N times and report the spread
+    #[arg(long, value_name = "N", default_value_t = 1, value_parser = at_least::<1>)]
+    pub repeat: usize,
+    /// Compare against (and add to) a named baseline
+    #[arg(long, value_name = "NAME")]
+    pub baseline: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -374,6 +572,8 @@ pub struct TuneArgs {
     pub sla: SlaArgs,
     #[command(flatten)]
     pub output: OutputArgs,
+    #[command(flatten)]
+    pub safety: SafetyArgs,
     /// What to optimize
     #[arg(long, value_enum, default_value_t = ObjectiveArg::Throughput, help_heading = "Tuning")]
     pub objective: ObjectiveArg,
@@ -404,11 +604,16 @@ pub struct TuneArgs {
 }
 
 #[derive(Args, Debug)]
-pub struct DiffArgs {
-    /// Baseline report (JSON)
-    pub baseline: PathBuf,
-    /// Candidate report (JSON)
-    pub candidate: PathBuf,
+pub struct CompareArgs {
+    /// Baseline: RUNREF (id, prefix, last~N, label) or a .oprobe / report .json file
+    #[arg(value_name = "A")]
+    pub baseline: Option<String>,
+    /// Candidate: RUNREF or file (default: `last`)
+    #[arg(value_name = "B")]
+    pub candidate: Option<String>,
+    /// Compare against a named baseline instead of A
+    #[arg(long = "baseline", value_name = "NAME")]
+    pub baseline_name: Option<String>,
     /// Max p99 increase per operation (%)
     #[arg(long, default_value_t = 20.0)]
     pub max_p99_increase: f64,
@@ -451,11 +656,9 @@ pub struct DiffArgs {
     /// Write JUnit XML
     #[arg(long, value_name = "FILE")]
     pub junit: Option<PathBuf>,
-    /// Write the diff as JSON
+    /// Write the comparison as JSON
     #[arg(long, value_name = "FILE")]
     pub json: Option<PathBuf>,
-    #[arg(long, value_enum, default_value_t = Format::Text)]
-    pub format: Format,
 }
 
 #[derive(Args, Debug)]
@@ -491,7 +694,7 @@ pub struct TopArgs {
     pub anonymous: bool,
 }
 
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Default)]
 pub struct DoctorArgs {
     #[command(flatten)]
     pub target: TargetArgs,
@@ -519,10 +722,9 @@ pub struct ProbeArgs {
     pub insecure: bool,
     #[arg(long)]
     pub proxy: Option<String>,
+    /// Also save the result as JSON
     #[arg(long, value_name = "FILE")]
     pub json: Option<PathBuf>,
-    #[arg(long, value_enum, default_value_t = Format::Text)]
-    pub format: Format,
 }
 
 #[derive(Args, Debug)]
@@ -581,6 +783,9 @@ pub struct CleanupArgs {
     /// Show what would be deleted
     #[arg(long)]
     pub dry_run: bool,
+    /// Refuse to delete anything (implies --dry-run)
+    #[arg(long)]
+    pub read_only: bool,
 }
 
 #[derive(Args, Debug)]
@@ -592,13 +797,6 @@ pub struct InitArgs {
     #[arg(long)]
     pub target: Option<String>,
     /// Write to a file instead of stdout
-    #[arg(short, long)]
-    pub output: Option<PathBuf>,
-}
-
-#[derive(Args, Debug)]
-pub struct ReportArgs {
-    pub file: PathBuf,
-    #[arg(long, value_enum, default_value_t = Format::Text)]
-    pub format: Format,
+    #[arg(long = "out", value_name = "FILE")]
+    pub file: Option<PathBuf>,
 }
