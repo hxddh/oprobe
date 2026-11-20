@@ -50,6 +50,7 @@ pub enum EventKind {
     },
     /// One second of the measurement window.
     Interval {
+        /// Start of the second, seconds from the window start.
         t_s: f64,
         ops_per_s: f64,
         mib_per_s: f64,

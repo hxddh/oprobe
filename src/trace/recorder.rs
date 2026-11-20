@@ -1041,7 +1041,7 @@ impl Recorder {
                 };
                 let (p50, p99) = b.quantiles();
                 TimelinePoint {
-                    t_s: i as f64 + 1.0,
+                    t_s: i as f64,
                     ops_per_s: b.ops as f64 / width,
                     mib_per_s: mib(b.bytes) / width,
                     p50_ms: p50 as f64 / 1000.0,

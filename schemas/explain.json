@@ -322,7 +322,7 @@
       "description": "Documentation of one finding code.",
       "properties": {
         "category": {
-          "description": "Area: `correctness`, `availability`, `bottleneck`, `network`, `efficiency`, `sla`,\n`client`.",
+          "description": "Area: `correctness`, `availability`, `bottleneck`, `network`, `efficiency`, `cost`,\n`sla`, `client`.",
           "type": "string"
         },
         "causes": {

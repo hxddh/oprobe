@@ -186,7 +186,9 @@ pub struct GroupRow {
     pub p90_ms: f64,
     pub p99_ms: f64,
     pub max_ms: f64,
+    #[serde(rename = "down_bytes", alias = "bytes_down")]
     pub bytes_down: u64,
+    #[serde(rename = "up_bytes", alias = "bytes_up")]
     pub bytes_up: u64,
     /// Share of the filtered requests' total time spent in this group (0–100).
     pub time_pct: f64,

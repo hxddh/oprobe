@@ -115,18 +115,13 @@
     "GroupRow": {
       "description": "One group of a `--by` table.",
       "properties": {
-        "bytes_down": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "bytes_up": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
         "cold_count": {
           "description": "Requests that opened a new connection.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "down_bytes": {
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -173,6 +168,11 @@
           "description": "Share of the filtered requests' total time spent in this group (0–100).",
           "format": "double",
           "type": "number"
+        },
+        "up_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
         }
       },
       "required": [
@@ -186,8 +186,8 @@
         "p90_ms",
         "p99_ms",
         "max_ms",
-        "bytes_down",
-        "bytes_up",
+        "down_bytes",
+        "up_bytes",
         "time_pct"
       ],
       "type": "object"

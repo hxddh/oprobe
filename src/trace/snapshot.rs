@@ -10,6 +10,8 @@ use super::model::{Api, RequestRecord};
 /// Latency distribution in milliseconds.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Quantiles {
+    /// Samples in the distribution.
+    #[serde(rename = "samples_count", alias = "count")]
     pub count: u64,
     #[serde(rename = "mean_ms")]
     pub mean: f64,
@@ -73,6 +75,7 @@ pub struct OpBreakdown {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct VerbStats {
     pub verb: String,
+    #[serde(rename = "ops_count", alias = "count")]
     pub count: u64,
     #[serde(rename = "errors_count")]
     pub errors: u64,
@@ -106,6 +109,7 @@ pub struct StageStats {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ApiStats {
     pub api: Api,
+    #[serde(rename = "requests_count", alias = "count")]
     pub count: u64,
     #[serde(rename = "errors_count")]
     pub errors: u64,
@@ -114,7 +118,9 @@ pub struct ApiStats {
     #[serde(rename = "status_count")]
     pub status: BTreeMap<u16, u64>,
     pub reused_pct: f64,
+    #[serde(rename = "up_bytes", alias = "bytes_up")]
     pub bytes_up: u64,
+    #[serde(rename = "down_bytes", alias = "bytes_down")]
     pub bytes_down: u64,
     pub stages: StageStats,
 }
@@ -228,6 +234,8 @@ pub struct IntegrityStats {
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct TimelinePoint {
+    /// Start of this one-second interval, seconds from the measurement window start (the same
+    /// convention as `heatmap.t_buckets_s` and `oprobe analyze --by second`).
     pub t_s: f64,
     pub ops_per_s: f64,
     pub mib_per_s: f64,

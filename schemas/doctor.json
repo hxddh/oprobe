@@ -306,11 +306,6 @@
     "Quantiles": {
       "description": "Latency distribution in milliseconds.",
       "properties": {
-        "count": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
         "max_ms": {
           "format": "double",
           "type": "number"
@@ -334,10 +329,16 @@
         "p99_ms": {
           "format": "double",
           "type": "number"
+        },
+        "samples_count": {
+          "description": "Samples in the distribution.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
         }
       },
       "required": [
-        "count",
+        "samples_count",
         "mean_ms",
         "p50_ms",
         "p90_ms",

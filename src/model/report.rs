@@ -24,6 +24,41 @@ use crate::trace::{
 /// Schema id of [`Report`].
 pub const REPORT_SCHEMA: &str = "oprobe.report/3";
 
+/// Unit suffixes a numeric report field name ends with (design §6). Each names its unit:
+/// `_us` / `_ms` / `_s` time; `_bytes`, `_mib`, `_gib` sizes (`_mib`/`_gib` only where the
+/// value is naturally fractional: `client.rss_mib`, `cost.stored_gib`); `_bps` bits per second;
+/// `_per_s` rates (`ops_per_s`, `mib_per_s`, `requests_per_s`); `_pct` percent (0–100);
+/// `_ratio` dimensionless fractions and multipliers; `_usd` money; `_count` counts (also a
+/// count per something, e.g. `requests_per_op_count`, and maps of counts like
+/// `status_count`).
+pub const UNIT_SUFFIXES: &[&str] = &[
+    "_us", "_ms", "_s", "_bytes", "_mib", "_gib", "_bps", "_per_s", "_pct", "_ratio", "_usd",
+    "_count",
+];
+
+/// Numeric report fields that are not quantities and so carry no unit: identifiers
+/// (`id`, `*_id`, `*_ids`, `slowest` op ids, tune trial ids), codes (`exit_code`), the
+/// workload `seed`, relative mix `weight`s and the heatmap's `counts` matrix (named by §6).
+pub const UNITLESS_FIELDS: &[&str] = &[
+    "id",
+    "op_ids",
+    "slowest",
+    "baseline_trial",
+    "winner_trial",
+    "exit_code",
+    "seed",
+    "weight",
+    "counts",
+];
+
+/// Whether a numeric report field name follows the unit rule.
+pub fn has_unit(name: &str) -> bool {
+    UNIT_SUFFIXES.iter().any(|s| name.ends_with(s))
+        || UNITLESS_FIELDS.contains(&name)
+        || name.ends_with("_id")
+        || name.ends_with("_ids")
+}
+
 /// The full report of one run.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Report {
@@ -535,6 +570,7 @@ pub struct RemoteStats {
     pub remote: String,
     pub requests_count: u64,
     pub errors_count: u64,
+    #[serde(rename = "down_bytes", alias = "bytes_down")]
     pub bytes_down: u64,
     pub p50_ms: f64,
     pub p99_ms: f64,
