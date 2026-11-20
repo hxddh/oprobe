@@ -90,7 +90,15 @@ cargo install --locked --git https://github.com/hxddh/oprobe --tag v3.0.0 oprobe
 oprobe was installed by a package manager (Homebrew, apt/dnf, the `.pkg` or `.app`, Scoop, winget, the MSI,
 cargo), it refuses and prints that manager's update command instead.
 
+`SHA256SUMS` comes from the same GitHub release as the archive, so the check proves the download is
+intact, not who built it: oprobe releases are not code-signed (no signing certificates), and the
+checksums are as trustworthy as the GitHub release itself. `OPROBE_UPDATE_API` replaces the GitHub API
+base URL (default `https://api.github.com`); it exists for internal mirrors and tests — point it only at a
+server you trust, since it decides which binary is installed.
+
 ## Verifying downloads
+
+The checksums detect corrupted or truncated downloads; they are not a signature (see above).
 
 ```bash
 sha256sum --ignore-missing -c SHA256SUMS                    # Linux
