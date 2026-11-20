@@ -551,10 +551,13 @@ async fn build_shaped_body(payload: Bytes, bandwidth_kib_s: Option<u64>) -> BoxB
     StreamBody::new(stream).boxed()
 }
 
-async fn handle_s3_request(
+/// One request; a straggler is delayed after its request was read and handled, right before
+/// the response goes out: the delay is time to first byte, never upload time.
+async fn serve_s3_request(
     req: Request<Incoming>,
     store: Arc<S3Store>,
 ) -> std::result::Result<Response<BoxBody>, std::io::Error> {
+    // In flight until the response leaves (a sleeping straggler counts).
     let cur_inflight = store.active_inflight.fetch_add(1, Ordering::AcqRel) + 1;
     store
         .peak_inflight
@@ -562,7 +565,20 @@ async fn handle_s3_request(
     let _inflight_guard = ServerInflightGuard {
         store: store.clone(),
     };
+    let mut straggle = Duration::ZERO;
+    let resp = handle_s3_request(req, store, cur_inflight, &mut straggle).await;
+    if !straggle.is_zero() {
+        tokio::time::sleep(straggle).await;
+    }
+    resp
+}
 
+async fn handle_s3_request(
+    req: Request<Incoming>,
+    store: Arc<S3Store>,
+    cur_inflight: usize,
+    straggle: &mut Duration,
+) -> std::result::Result<Response<BoxBody>, std::io::Error> {
     let seq = store.req_seq.fetch_add(1, Ordering::Relaxed) + 1;
     let req_id = format!("oprobe-s3-req-{seq:06}");
     let faults = store.faults.read().expect("faults lock").clone();
@@ -654,7 +670,7 @@ async fn handle_s3_request(
         && seq.is_multiple_of(faults.straggler_every_n as u64)
         && !faults.straggler_delay.is_zero()
     {
-        tokio::time::sleep(faults.straggler_delay).await;
+        *straggle = faults.straggler_delay;
     }
 
     let trimmed_path = uri.path().trim_start_matches('/');
@@ -1412,7 +1428,7 @@ impl LabServer {
                         let tls_acc = tls_acceptor.clone();
 
                         tokio::spawn(async move {
-                            let svc = service_fn(move |req| handle_s3_request(req, st.clone()));
+                            let svc = service_fn(move |req| serve_s3_request(req, st.clone()));
                             let mut builder = AutoServerBuilder::new(TokioExecutor::new());
                             builder.http2().adaptive_window(true);
                             if !allow_h2 {
