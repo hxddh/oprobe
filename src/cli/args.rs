@@ -245,7 +245,7 @@ pub enum TargetCommand {
     /// Remove a target
     Rm(TargetNameArg),
     /// Check a target (doctor)
-    Test(PendingArgs),
+    Test(DoctorArgs),
 }
 
 #[derive(Args, Debug)]

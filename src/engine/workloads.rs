@@ -101,6 +101,124 @@ pub fn list_pages(cap: &Capability, objects: u64, limit: u32) -> u64 {
     }
 }
 
+/// The provider capability matrix (doctor, capabilities): what the OpenDAL service supports
+/// and the limits it applies.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, schemars::JsonSchema)]
+pub struct CapabilityMatrix {
+    pub read: bool,
+    pub write: bool,
+    pub stat: bool,
+    pub list: bool,
+    pub delete: bool,
+    pub copy: bool,
+    pub rename: bool,
+    pub presign_read: bool,
+    pub presign_write: bool,
+    /// `Range: bytes=-N` (footer reads without HEAD).
+    pub read_with_suffix: bool,
+    pub read_with_if_match: bool,
+    pub read_with_version: bool,
+    pub write_can_multi: bool,
+    pub write_can_append: bool,
+    pub write_can_empty: bool,
+    pub write_with_if_not_exists: bool,
+    pub write_with_if_match: bool,
+    pub write_with_user_metadata: bool,
+    pub write_with_content_type: bool,
+    pub list_with_limit: bool,
+    pub list_with_recursive: bool,
+    pub list_with_versions: bool,
+    /// Keys per batch delete request (1: no batch deletes).
+    pub delete_max_count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub write_multi_min_size_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub write_multi_max_size_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub write_total_max_size_bytes: Option<u64>,
+}
+
+impl From<&Capability> for CapabilityMatrix {
+    fn from(c: &Capability) -> Self {
+        let b = |v: Option<usize>| v.map(|v| v as u64);
+        Self {
+            read: c.read,
+            write: c.write,
+            stat: c.stat,
+            list: c.list,
+            delete: c.delete,
+            copy: c.copy,
+            rename: c.rename,
+            presign_read: c.presign_read,
+            presign_write: c.presign_write,
+            read_with_suffix: c.read_with_suffix,
+            read_with_if_match: c.read_with_if_match,
+            read_with_version: c.read_with_version,
+            write_can_multi: c.write_can_multi,
+            write_can_append: c.write_can_append,
+            write_can_empty: c.write_can_empty,
+            write_with_if_not_exists: c.write_with_if_not_exists,
+            write_with_if_match: c.write_with_if_match,
+            write_with_user_metadata: c.write_with_user_metadata,
+            write_with_content_type: c.write_with_content_type,
+            list_with_limit: c.list_with_limit,
+            list_with_recursive: c.list_with_recursive,
+            list_with_versions: c.list_with_versions,
+            delete_max_count: c.delete_max_size.unwrap_or(1) as u64,
+            write_multi_min_size_bytes: b(c.write_multi_min_size),
+            write_multi_max_size_bytes: b(c.write_multi_max_size),
+            write_total_max_size_bytes: b(c.write_total_max_size),
+        }
+    }
+}
+
+impl CapabilityMatrix {
+    /// Short labels of what is and is not supported, for text output.
+    pub fn summary(&self) -> (Vec<String>, Vec<String>) {
+        let mut yes = Vec::new();
+        let mut no = Vec::new();
+        let mut f = |on: bool, label: String| {
+            if on {
+                yes.push(label)
+            } else {
+                no.push(label.split('(').next().unwrap_or_default().to_owned())
+            }
+        };
+        let size = |v: Option<u64>| v.map(|v| crate::util::ByteSize(v).to_string());
+        f(self.read, "read".into());
+        f(self.write, "write".into());
+        f(self.list, "list".into());
+        f(
+            self.delete,
+            if self.delete_max_count > 1 {
+                format!("delete(batch {})", self.delete_max_count)
+            } else {
+                "delete".into()
+            },
+        );
+        f(self.copy, "copy".into());
+        f(self.presign_read, "presign".into());
+        f(self.read_with_suffix, "suffix-read".into());
+        f(self.write_with_if_not_exists, "create-if-absent".into());
+        f(self.write_with_if_match, "if-match-write".into());
+        f(self.write_with_user_metadata, "user-metadata".into());
+        f(
+            self.write_can_multi,
+            match (
+                size(self.write_multi_min_size_bytes),
+                size(self.write_multi_max_size_bytes),
+            ) {
+                (Some(a), Some(b)) => format!("multipart({a}–{b})"),
+                _ => "multipart".into(),
+            },
+        );
+        f(self.write_can_append, "append".into());
+        f(self.list_with_limit, "paged-list".into());
+        f(self.list_with_versions, "versions".into());
+        (yes, no)
+    }
+}
+
 /// Mutable state of one measurement window's newer operations.
 pub struct WorkloadState {
     pub capability: Capability,

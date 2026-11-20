@@ -56,6 +56,7 @@ pub async fn cmd_probe(a: ProbeArgs, ctx: &Ctx) -> Result<u8> {
             Some("none") => Some(None),
             Some(p) => Some(Some(p.to_owned())),
         },
+        certs: true,
         method: if a.get {
             http::Method::GET
         } else {

@@ -131,3 +131,47 @@ async fn opendal_transport_reports_api_names_tls_and_tcp() {
 async fn microscope_transport_reports_api_names_tls_and_tcp() {
     depth_in(TransportMode::Microscope).await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn doctor_reports_tls_chain_permissions_and_capabilities() {
+    use oprobe::cli::doctor::{Access, doctor};
+    let lab = LabServer::spawn("127.0.0.1:0", LabConfig::clean_https_h2())
+        .await
+        .unwrap();
+    let t = lab.profile("bkt").target.normalized().unwrap();
+    let d = doctor(t.clone(), false, "mylab").await;
+    assert!(d.ready, "{:#?}", d.checks);
+    let tls = d.tls.as_ref().expect("tls details");
+    assert_eq!(tls.version, "TLS1.3");
+    assert!(tls.resumption, "the lab resumes sessions");
+    assert!(tls.group.is_some());
+    let chain = tls.chain.as_ref().expect("certificate chain");
+    assert_eq!(chain.certs[0].subject, "localhost");
+    assert_eq!(chain.certs[0].issuer, "oprobe lab CA (generated)");
+    assert!(chain.min_expiry_days().unwrap() > 20);
+    assert_eq!(d.credentials.source, "options");
+    assert_eq!(d.addressing.as_deref(), Some("path"));
+    assert_eq!(d.dns.as_ref().unwrap().a, vec!["127.0.0.1".to_owned()]);
+    assert!(d.clock_skew_s.is_some());
+    let p = &d.permissions;
+    for a in [p.list, p.read, p.write, p.stat, p.delete] {
+        assert_eq!(a, Access::Allowed);
+    }
+    assert!(d.capabilities.copy && d.capabilities.read_with_suffix);
+    assert_eq!(d.capabilities.delete_max_count, 1000);
+    assert!(
+        d.next_command.starts_with("oprobe run mylab"),
+        "{}",
+        d.next_command
+    );
+    let v = serde_json::to_value(&d).unwrap();
+    assert!(v["capabilities"]["write_with_if_match"].as_bool().unwrap());
+
+    let ro = doctor(t, true, "mylab").await;
+    assert_eq!(ro.permissions.write, Access::Skipped);
+    assert!(
+        ro.next_command.contains("--existing"),
+        "{}",
+        ro.next_command
+    );
+}

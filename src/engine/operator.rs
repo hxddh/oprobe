@@ -79,7 +79,8 @@ pub async fn s3_region(target: &TargetSpec) -> Option<(String, RegionSource)> {
     }
 }
 
-async fn detect_s3_region(target: &TargetSpec) -> Option<String> {
+/// The region the service reports for an S3 bucket (`None`: not determinable).
+pub async fn detect_s3_region(target: &TargetSpec) -> Option<String> {
     let bucket = target.options.get("bucket")?.clone();
     let endpoint = target
         .options

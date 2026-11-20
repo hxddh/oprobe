@@ -3,7 +3,7 @@
 //! classified ([`crate::errors::classify`]) at this boundary and mapped to exit codes.
 
 pub mod args;
-mod doctor;
+pub mod doctor;
 mod live;
 mod misc;
 mod run;
@@ -331,7 +331,7 @@ async fn dispatch(cmd: Command, ctx: &Ctx) -> Result<u8> {
             TargetCommand::List => settings::target_list(ctx),
             TargetCommand::Show(a) => settings::target_show(a, ctx),
             TargetCommand::Rm(a) => settings::target_rm(a, ctx),
-            TargetCommand::Test(_) => pending("target test"),
+            TargetCommand::Test(a) => doctor::run(a, ctx).await,
         },
         Command::Config(c) => match c {
             ConfigCommand::Show => settings::config_show(ctx),
