@@ -199,7 +199,9 @@ pub fn extract_binary(archive_name: &str, bytes: &[u8]) -> Result<Vec<u8>> {
         let mut z = zip::ZipArchive::new(std::io::Cursor::new(bytes))?;
         for i in 0..z.len() {
             let mut f = z.by_index(i)?;
-            if f.is_file() && f.name().rsplit('/').next() == Some(exe) {
+            // Archive member names use `/`; tolerate `\` from Windows-built archives.
+            let matches = f.is_file() && f.name()?.rsplit(['/', '\\']).next() == Some(exe);
+            if matches {
                 let mut out = Vec::new();
                 f.read_to_end(&mut out)?;
                 return Ok(out);
