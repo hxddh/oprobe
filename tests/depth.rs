@@ -107,12 +107,14 @@ async fn depth_in(mode: TransportMode) {
     p.knobs.transport = mode;
     let reqs = rows(p, 300).await;
     if oprobe::net::tcpinfo::SUPPORTED {
-        let with_tcp = reqs.iter().filter(|r| r.tcp.is_some()).count();
-        assert!(
-            with_tcp * 10 >= reqs.len() * 9,
-            "{mode:?}: {with_tcp}/{}",
-            reqs.len()
-        );
+        // Every connection is sampled: its first request always, then at most every 10 ms.
+        let conns: std::collections::BTreeSet<u64> = reqs.iter().map(|r| r.conn_id).collect();
+        let sampled: std::collections::BTreeSet<u64> = reqs
+            .iter()
+            .filter(|r| r.tcp.is_some())
+            .map(|r| r.conn_id)
+            .collect();
+        assert_eq!(sampled, conns, "{mode:?}");
         let t = reqs.iter().find_map(|r| r.tcp.as_deref()).unwrap();
         assert!(t.cwnd > 0 && t.rtt_us > 0, "{t:?}");
         let k = oprobe::net::stats::tcp_kernel(&reqs).unwrap();

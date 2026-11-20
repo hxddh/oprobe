@@ -204,7 +204,9 @@ fn common(c: &rustls::CipherSuiteCommon) -> rustls::CipherSuiteCommon {
 /// `base` with every cipher suite and key-exchange group wrapped to report to `hook`. Built
 /// once per hook (the wrappers are `'static`, like rustls' own suites).
 pub fn observed_provider(base: &CryptoProvider, hook: TlsHook) -> Arc<CryptoProvider> {
-    static CACHE: OnceLock<std::sync::Mutex<Vec<(usize, Arc<CryptoProvider>)>>> = OnceLock::new();
+    /// Providers built so far, by hook.
+    type Built = std::sync::Mutex<Vec<(usize, Arc<CryptoProvider>)>>;
+    static CACHE: OnceLock<Built> = OnceLock::new();
     let cache = CACHE.get_or_init(Default::default);
     let mut c = cache.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((_, p)) = c.iter().find(|(h, _)| *h == hook as usize) {

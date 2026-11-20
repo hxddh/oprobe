@@ -18,10 +18,16 @@
 //!
 //! No descriptor is ever duplicated, so no connection is kept open by oprobe.
 //!
-//! Cost: three syscalls per request (≈1–3 µs), plus, in OpenDAL mode, one scan of the
-//! process's descriptor table the first time a connection finishes a request.
+//! Cost: three syscalls per sample (≈1–3 µs). A connection is sampled at most every
+//! [`TcpProbe::MAX_AGE`]: a request ending sooner after the previous sample carries none (on
+//! real storage, with milliseconds per request, practically every request is sampled; the
+//! first request of every connection always is). In OpenDAL mode the descriptor table is
+//! scanned once per connection, at the end of its first request.
 
 use std::net::SocketAddr;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use crate::model::TcpRow;
 
@@ -37,6 +43,45 @@ impl SockId {
     /// TCP statistics of this connection now, if it is still alive and the platform has them.
     pub fn query(&self) -> Option<TcpRow> {
         imp::query(self)
+    }
+}
+
+/// Rate-limited sampling of one connection's statistics.
+#[derive(Debug)]
+pub struct TcpProbe {
+    pub id: SockId,
+    /// When the last sample was taken, µs since [`epoch`] (0: never).
+    last_us: AtomicU64,
+}
+
+fn epoch() -> Instant {
+    static E: OnceLock<Instant> = OnceLock::new();
+    *E.get_or_init(Instant::now)
+}
+
+impl TcpProbe {
+    /// A connection is sampled at most this often; requests ending sooner carry no sample.
+    pub const MAX_AGE: Duration = Duration::from_millis(10);
+
+    pub fn new(id: SockId) -> Self {
+        Self {
+            id,
+            last_us: AtomicU64::new(0),
+        }
+    }
+
+    /// The connection's statistics now, unless it was sampled less than [`Self::MAX_AGE`] ago
+    /// (lock-free; concurrent requests on one HTTP/2 connection take turns).
+    pub fn sample(&self) -> Option<TcpRow> {
+        let now = (epoch().elapsed().as_micros() as u64).max(1);
+        let last = self.last_us.load(Ordering::Relaxed);
+        if last != 0 && now.saturating_sub(last) < Self::MAX_AGE.as_micros() as u64 {
+            return None;
+        }
+        self.last_us
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .ok()?;
+        self.id.query()
     }
 }
 
@@ -136,10 +181,16 @@ mod imp {
             .ok()?
             .filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
             .collect();
-        // Newest descriptors first: the connection was just opened.
+        // High descriptors first: the low ones are mostly the process's own files and
+        // listeners opened at start-up (the order only affects how soon the scan stops).
         fds.sort_unstable_by(|a, b| b.cmp(a));
+        // One syscall per descriptor (the local address is nearly unique); the peer is only
+        // asked of a match.
         fds.into_iter()
-            .find(|&fd| identity(fd).is_some_and(|(l, r)| same(l, local) && same(r, remote)))
+            .find(|&fd| {
+                name_of(fd, libc::getsockname).is_some_and(|l| same(l, local))
+                    && name_of(fd, libc::getpeername).is_some_and(|r| same(r, remote))
+            })
             .map(|fd| SockId {
                 fd: fd as i64,
                 local,

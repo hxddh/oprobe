@@ -40,7 +40,7 @@ use rustls::{ClientConfig, NamedGroup};
 use rustls_pki_types::ServerName;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use super::tcpinfo::{self, SockId};
+use super::tcpinfo::{self, TcpProbe};
 use super::tls::{InsecureCertVerifier, crypto_provider};
 use super::tlsinfo::{HandshakeMarks, ObservedVerifier, TlsEvent, observed_provider};
 use super::{HttpVersion, TransportConfig};
@@ -90,14 +90,14 @@ struct Dialed {
 }
 
 /// Where the kernel statistics of a connection come from.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 enum Sock {
     /// Not looked up yet (looked up once, at the end of the connection's first request).
     #[default]
     Unknown,
     /// Not found or not supported: never looked up again.
     Missing,
-    Found(SockId),
+    Found(Arc<TcpProbe>),
 }
 
 #[derive(Default)]
@@ -132,33 +132,26 @@ struct Shared {
 
 impl Shared {
     /// Kernel TCP statistics of connection `addr` now (see `net::tcpinfo` for why this is safe).
-    fn tcp_info(&self, addr: (SocketAddr, SocketAddr)) -> Option<TcpRow> {
+    /// `known` is what the connection table said when the response arrived.
+    fn tcp_info(&self, addr: (SocketAddr, SocketAddr), known: Sock) -> Option<TcpRow> {
         if !self.tcp_info {
             return None;
         }
-        let known = self
-            .conns
-            .lock()
-            .ok()?
-            .by_addr
-            .get(&addr)
-            .map(|e| e.sock)
-            .unwrap_or_default();
         let id = match known {
-            Sock::Found(id) => id,
+            Sock::Found(p) => p,
             Sock::Missing => return None,
             Sock::Unknown => {
                 // Scan the descriptor table without holding the lock.
-                let found = tcpinfo::find(addr.0, addr.1);
+                let found = tcpinfo::find(addr.0, addr.1).map(|id| Arc::new(TcpProbe::new(id)));
                 if let Ok(mut c) = self.conns.lock()
                     && let Some(e) = c.by_addr.get_mut(&addr)
                 {
-                    e.sock = found.map_or(Sock::Missing, Sock::Found);
+                    e.sock = found.clone().map_or(Sock::Missing, Sock::Found);
                 }
                 found?
             }
         };
-        id.query()
+        id.sample()
     }
 }
 
@@ -696,6 +689,8 @@ struct Finisher {
     record: RequestRecord,
     /// The connection (local, remote), for its TCP statistics at request end.
     conn: Option<(SocketAddr, SocketAddr)>,
+    /// The connection's socket as known when the response arrived (no second table lookup).
+    sock: Sock,
     shared: Arc<Shared>,
     t_start: Instant,
     t_headers: Instant,
@@ -735,7 +730,8 @@ impl Finisher {
         }
         // After the clock stopped: the query is not part of the request's time.
         if let Some(addr) = self.conn {
-            self.record.tcp = self.shared.tcp_info(addr).map(Box::new);
+            let sock = std::mem::take(&mut self.sock);
+            self.record.tcp = self.shared.tcp_info(addr, sock).map(Box::new);
         }
         Self::emit(self.record, &self.scope, &self.recorder);
     }
@@ -958,6 +954,7 @@ impl HttpTransport for FidelityTransport {
             .get::<HttpInfo>()
             .map(|i| (i.local_addr(), i.remote_addr()));
         let mut dial = None;
+        let mut sock = Sock::Missing;
         record.remote = addr.map(|(_, remote)| remote);
         if let (Some(addr), Ok(mut c)) = (addr, self.shared.conns.lock()) {
             let c = &mut *c;
@@ -970,6 +967,7 @@ impl HttpTransport for FidelityTransport {
             });
             record.conn_id = entry.id;
             dial = entry.dial.take();
+            sock = entry.sock.clone();
         }
         record.protocol = if resp.version() == http::Version::HTTP_2 {
             Protocol::Http2
@@ -1054,6 +1052,7 @@ impl HttpTransport for FidelityTransport {
         let fin = Finisher {
             record,
             conn: addr,
+            sock,
             shared: self.shared.clone(),
             t_start,
             t_headers,

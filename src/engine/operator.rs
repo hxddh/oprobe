@@ -159,6 +159,8 @@ pub fn transport_config(target: &TargetSpec, knobs: &Knobs) -> Result<TransportC
         max_inflight: ClientStack::from_knobs(knobs).http_concurrent_limit,
         tls: tls_options(target)?,
         proxy: proxy_setting(target),
+        // `OPROBE_TCP_INFO=0` turns the per-request kernel statistics off.
+        tcp_info: std::env::var("OPROBE_TCP_INFO").map_or(true, |v| v != "0"),
         ..Default::default()
     })
 }

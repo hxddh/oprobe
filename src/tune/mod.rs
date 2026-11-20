@@ -576,7 +576,16 @@ pub async fn tune(
         .max()
         .unwrap_or(0)
         >= 8 << 20;
-    let multipart = has(&|o| matches!(o, OpKind::MultipartWrite { .. }));
+    // A service without multipart uploads writes every object in one request: the chunk size
+    // does not shape writes there (capability-aware candidates, stream B2).
+    let multipart =
+        has(&|o| matches!(o, OpKind::MultipartWrite { .. })) && session.capability.write_can_multi;
+    if has(&|o| matches!(o, OpKind::MultipartWrite { .. })) && !multipart {
+        notes.push(format!(
+            "`{}` has no multipart uploads: write chunk sizes are not tuned (each object is one request)",
+            session.profile.target.scheme
+        ));
+    }
     let vectored = has(&|o| matches!(o, OpKind::ParquetScan { .. }));
     let full_reads = has(&|o| matches!(o, OpKind::Read { size: None }));
     let reads = has(&|o| !o.is_write());

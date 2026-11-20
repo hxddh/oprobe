@@ -334,7 +334,7 @@ impl Session {
             recorder: recorder.clone(),
             scratch_prefix: format!("{}writes/t{trial:03}-", self.run_prefix),
             written: self.written.clone(),
-            state: super::workloads::WorkloadState::new(self.capability.clone(), &self.mix),
+            state: super::workloads::WorkloadState::new(self.capability, &self.mix),
         });
 
         // Background sampler: slow-op call stacks, client CPU/RSS, live snapshots.

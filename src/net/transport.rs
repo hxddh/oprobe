@@ -454,8 +454,8 @@ impl Pending {
         }
         // After the clock stopped: the query is not part of the request's time. The pooled
         // connection is still referenced here, so the socket is alive (`net::tcpinfo`).
-        if let Some(sock) = self.clock.as_ref().and_then(|c| c.sock) {
-            self.record.tcp = sock.query().map(Box::new);
+        if let Some(sock) = self.clock.as_ref().and_then(|c| c.sock.as_ref()) {
+            self.record.tcp = sock.sample().map(Box::new);
         }
         if complete && let Some((inner, key, id, sender, clock)) = self.h1_return.take() {
             inner.return_h1(key, id, sender, clock);

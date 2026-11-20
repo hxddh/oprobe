@@ -294,3 +294,45 @@ async fn checksums_are_sent_and_verified_by_the_lab() {
     assert!(o.failed().is_empty(), "{:?}", o.failed());
     assert!(o.apis().contains_key("PutObject"));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lab_scenarios_inject_their_faults() {
+    async fn snap(url: &str, concurrency: usize) -> oprobe::trace::Snapshot {
+        let mut p = Profile::from_target(TargetSpec::from_url(url).unwrap());
+        p.workload.preset = Preset::SmallFiles;
+        p.workload.dataset = Some(DatasetSpec {
+            objects: 8,
+            object_size: ByteSize::kib(16),
+            ..Default::default()
+        });
+        p.knobs.concurrency = concurrency;
+        let s = Session::open(p, Cancel::new(), quiet()).await.unwrap();
+        let knobs = s.profile.knobs.clone();
+        let opts = RunOptions {
+            duration: Duration::from_millis(600),
+            warmup: Duration::ZERO,
+            max_ops: None,
+            rate: None,
+            trace_slow_ops: false,
+        };
+        let out = s.run(&knobs, &opts, None).await.unwrap();
+        s.close().await;
+        out
+    }
+    // flaky: 500s and resets, absorbed by retries.
+    let s = snap("lab://flaky/t", 4).await;
+    assert!(s.resilience.server_errors > 0, "{:?}", s.resilience);
+    assert!(s.resilience.network_errors > 0, "{:?}", s.resilience);
+    assert!(s.resilience.retries > 0);
+    // demo: throttling above 24 concurrent requests, ~2.5% stragglers of 250 ms.
+    let s = snap("lab://demo/t", 48).await;
+    assert!(s.resilience.throttled_responses > 0, "{:?}", s.resilience);
+    assert!(s.summary.latency.max >= 250.0, "{:?}", s.summary.latency);
+    // clean: nothing.
+    let s = snap("lab://clean/t", 8).await;
+    assert_eq!(
+        s.resilience.throttled_responses + s.resilience.server_errors,
+        0
+    );
+    assert_eq!(s.summary.failed_ops, 0);
+}

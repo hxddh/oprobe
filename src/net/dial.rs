@@ -18,7 +18,7 @@ use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
 
 use super::proxy::ProxyConfig;
-use super::tcpinfo::{self, SockId};
+use super::tcpinfo::{self, TcpProbe};
 use super::tlsinfo::{CertChain, group_name, suite_name, version_name};
 use crate::model::TlsRow;
 use crate::trace::{DialRecord, Recorder};
@@ -31,11 +31,11 @@ pub struct ConnClock {
     pub rx: AtomicU64,
     pub tx: AtomicU64,
     /// The socket, for its kernel TCP statistics (`net::tcpinfo`).
-    pub sock: Option<SockId>,
+    pub sock: Option<TcpProbe>,
 }
 
 impl ConnClock {
-    fn new(sock: Option<SockId>) -> Arc<Self> {
+    fn new(sock: Option<TcpProbe>) -> Arc<Self> {
         Arc::new(Self {
             epoch: Instant::now(),
             last_write_us: AtomicU64::new(0),
@@ -353,7 +353,7 @@ impl Dialer {
         }
         let _ = tcp.set_nodelay(true);
 
-        let clock = ConnClock::new(tcpinfo::sock_id_of(&tcp));
+        let clock = ConnClock::new(tcpinfo::sock_id_of(&tcp).map(TcpProbe::new));
         let mut sock = CountingStream {
             inner: tcp,
             clock: clock.clone(),
