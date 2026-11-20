@@ -4,6 +4,39 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## Unreleased (v3)
+
+### Trust fixes (breaking)
+
+Places where oprobe could lead to a wrong conclusion. Reports use schema `oprobe.report/v3`;
+v2 reports are rejected by `oprobe diff`.
+
+- **Retry backoff** is its own `retry` share of operation time (terminal, Markdown, app, JSON
+  `breakdown.retry_ms` / `shares.retry`) instead of being counted as client time; throttling
+  headlines state how much time went to waiting for retries.
+- **SLA gate**: `oprobe run` / `tune` exit 3 when the run breaches its SLA — by default more
+  than 1% failed operations or any corrupted data (`sla_verdict` in the report). `--sla none`
+  disables it; `--max-error-rate`, `--max-throttle-rate`, `--p99-ms` override it. `--fail-on`
+  still adds a gate on diagnosis findings.
+- **Write chunks**: the tuner no longer recommends chunk sizes OpenDAL raises to the service's
+  minimum part size (5 MiB on S3); reports carry `effective_knobs` (requested vs effective).
+- **Generated code** reproduces exactly the measured layers and parameters (one `ClientStack`
+  feeds both the measured operator and `--emit-rust` / `--emit-python`).
+- **`r2://` / `minio://`** require `account_id` / an endpoint instead of silently using AWS.
+- **Cost** is projected only for recognised cloud endpoints or an explicit price table;
+  otherwise `cost.applicable = false` and the section is hidden.
+- **Tuner** narrative states the throttling ceiling once, explains the safety margin with
+  numbers, no longer writes `scheme = ""`, and prints its report (trial table included) on stdout.
+- **`oprobe diff`** lists every configuration change; a different workload or target fails the
+  gate (`--allow-workload-change`, `--allow-target-change`), knob changes are an A/B note.
+- **Default transport** keeps OpenDAL's reqwest defaults (no connect timeout, unlimited idle
+  connections per host).
+- **Unknown `[target.options]` keys** are rejected with a "did you mean" suggestion.
+- **`--anonymous`** sets each service's own unsigned-access options; unsupported services error.
+- **Error classes** cover every OpenDAL error kind; timeouts and connect failures are detected
+  from typed errors, not message text.
+- Docs: the TLS cipher suite is only reported with `--microscope`.
+
 ## v2.0.1 — 2026-11-20
 
 Fixes from a full review of 2.0.0. Some numbers change: see *Measurement changes*.
