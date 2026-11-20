@@ -1,0 +1,75 @@
+name: macOS launch diagnosis (temporary)
+on:
+  push:
+    branches: [claude/oprobe-v2-release-l67be8]
+    paths: [.github/workflows/macos-diag.yml]
+permissions:
+  contents: read
+jobs:
+  diag:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Download released dmg and tarball
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sw_vers; uname -m
+          gh release download v2.0.0 -R "$GITHUB_REPOSITORY" -p '*macos-universal.dmg' -p '*universal-apple-darwin.tar.gz'
+          ls -la
+      - name: Inspect bundle
+        run: |
+          set -x
+          hdiutil attach -nobrowse -mountpoint /tmp/m oprobe-*.dmg
+          ls -la /tmp/m /tmp/m/oprobe.app/Contents /tmp/m/oprobe.app/Contents/MacOS
+          cp -R /tmp/m/oprobe.app /tmp/oprobe.app
+          b=/tmp/oprobe.app/Contents/MacOS/oprobe
+          file $b; lipo -info $b
+          otool -l -arch arm64 $b | grep -A4 LC_BUILD_VERSION || true
+          otool -L -arch arm64 $b
+          codesign -dvvv /tmp/oprobe.app || true
+          codesign --verify --deep --strict -vvvv /tmp/oprobe.app || true
+          spctl -a -vvv -t exec /tmp/oprobe.app || true
+          plutil -p /tmp/oprobe.app/Contents/Info.plist
+      - name: Run the bundle binary directly
+        run: |
+          b=/tmp/oprobe.app/Contents/MacOS/oprobe
+          $b --version
+          ( $b > run.out 2> run.err & echo $! > pid )
+          sleep 10
+          if kill -0 $(cat pid) 2>/dev/null; then echo "ALIVE after 10s"; screencapture -x direct.png || true; kill $(cat pid); else echo "EXITED"; wait $(cat pid) 2>/dev/null; echo "exit=$?"; fi
+          echo '--- stdout'; cat run.out; echo '--- stderr'; cat run.err
+      - name: Launch with LaunchServices (open)
+        run: |
+          open /tmp/oprobe.app || echo "open failed: $?"
+          sleep 10
+          pgrep -fl oprobe && echo "ALIVE via open" || echo "NOT RUNNING via open"
+          screencapture -x open.png || true
+          pkill -f oprobe.app || true
+          log show --last 2m --style compact --predicate 'process == "oprobe" OR eventMessage CONTAINS[c] "oprobe"' | tail -n 200 || true
+          ls -la ~/Library/Logs/DiagnosticReports/ || true
+          for f in ~/Library/Logs/DiagnosticReports/oprobe*; do [ -f "$f" ] && head -c 12000 "$f"; done || true
+      - name: Quarantined copy (as downloaded by a browser)
+        run: |
+          cp -R /tmp/oprobe.app /tmp/q.app
+          xattr -w com.apple.quarantine "0081;$(printf %x $(date +%s));Safari;" /tmp/q.app
+          spctl -a -vvv -t exec /tmp/q.app || true
+          syspolicy_check distribution /tmp/q.app 2>&1 || true
+      - name: Plain terminal binary (tarball)
+        run: |
+          tar xzf oprobe-*-universal-apple-darwin.tar.gz
+          d=$(ls -d oprobe-*-universal-apple-darwin)
+          ls -la $d
+          $d/oprobe --version
+          ( $d/oprobe gui > g.out 2> g.err & echo $! > gpid )
+          sleep 10
+          if kill -0 $(cat gpid) 2>/dev/null; then echo "gui ALIVE"; screencapture -x tar-gui.png || true; kill $(cat gpid); else echo "gui EXITED"; fi
+          cat g.out g.err
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: diag-${{ matrix.os }}
+          path: "*.png"
