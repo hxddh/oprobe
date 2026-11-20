@@ -1,0 +1,77 @@
+{
+  "$defs": {
+    "CheckStatus": {
+      "description": "Outcome of one check.",
+      "enum": [
+        "ok",
+        "warn",
+        "fail",
+        "skipped"
+      ],
+      "type": "string"
+    },
+    "DoctorCheck": {
+      "properties": {
+        "detail": {
+          "type": "string"
+        },
+        "hint": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/CheckStatus"
+        }
+      },
+      "required": [
+        "name",
+        "status",
+        "detail"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://github.com/hxddh/oprobe/schemas/3/doctor.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Result of `oprobe doctor`",
+  "properties": {
+    "checks": {
+      "items": {
+        "$ref": "#/$defs/DoctorCheck"
+      },
+      "type": "array"
+    },
+    "failed_count": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "ready": {
+      "description": "No check failed: the target can be benchmarked.",
+      "type": "boolean"
+    },
+    "target": {
+      "type": "string"
+    },
+    "warned_count": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "target",
+    "checks",
+    "failed_count",
+    "warned_count",
+    "ready"
+  ],
+  "title": "oprobe doctor",
+  "type": "object",
+  "x-rust-type": "DoctorOutput"
+}

@@ -1,0 +1,25 @@
+{
+  "$id": "https://github.com/hxddh/oprobe/schemas/3/lab.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "What `oprobe lab` serves",
+  "properties": {
+    "endpoint": {
+      "type": "string"
+    },
+    "tls": {
+      "type": "boolean"
+    },
+    "try_command": {
+      "description": "A command that benchmarks the lab.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "endpoint",
+    "tls",
+    "try_command"
+  ],
+  "title": "oprobe lab",
+  "type": "object",
+  "x-rust-type": "LabOutput"
+}

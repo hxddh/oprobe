@@ -1,0 +1,63 @@
+{
+  "$defs": {
+    "Setting": {
+      "description": "One effective setting.",
+      "properties": {
+        "key": {
+          "type": "string"
+        },
+        "source": {
+          "$ref": "#/$defs/Source"
+        },
+        "value": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "key",
+        "value",
+        "source"
+      ],
+      "type": "object"
+    },
+    "Source": {
+      "description": "Where an effective value comes from.",
+      "enum": [
+        "flag",
+        "env",
+        "target",
+        "defaults",
+        "builtin"
+      ],
+      "type": "string"
+    }
+  },
+  "$id": "https://github.com/hxddh/oprobe/schemas/3/config-show.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Result of `oprobe config show`",
+  "properties": {
+    "config_file": {
+      "type": "string"
+    },
+    "settings": {
+      "items": {
+        "$ref": "#/$defs/Setting"
+      },
+      "type": "array"
+    },
+    "targets": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "config_file",
+    "settings",
+    "targets"
+  ],
+  "title": "oprobe config-show",
+  "type": "object",
+  "x-rust-type": "ConfigShow"
+}

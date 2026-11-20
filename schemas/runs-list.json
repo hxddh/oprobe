@@ -1,0 +1,138 @@
+{
+  "$defs": {
+    "RunSummary": {
+      "description": "Sidecar summary of a run (`runs/<id>.json`).",
+      "properties": {
+        "cost_per_month_usd": {
+          "description": "Projected monthly cost, where cost applies.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "error_ratio": {
+          "format": "double",
+          "type": "number"
+        },
+        "headline": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "interrupted": {
+          "type": "boolean"
+        },
+        "label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ops_per_s": {
+          "format": "double",
+          "type": "number"
+        },
+        "p50_ms": {
+          "format": "double",
+          "type": "number"
+        },
+        "p99_ms": {
+          "format": "double",
+          "type": "number"
+        },
+        "path": {
+          "description": "The run file (filled in when listing; not stored).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "started_at": {
+          "type": "string"
+        },
+        "target_display": {
+          "type": "string"
+        },
+        "target_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "verdict_level": {
+          "$ref": "#/$defs/VerdictLevel"
+        },
+        "window_s": {
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "id",
+        "target_display",
+        "started_at",
+        "window_s",
+        "interrupted",
+        "verdict_level",
+        "headline",
+        "ops_per_s",
+        "p50_ms",
+        "p99_ms",
+        "error_ratio"
+      ],
+      "type": "object"
+    },
+    "VerdictLevel": {
+      "description": "Overall judgement.",
+      "oneOf": [
+        {
+          "enum": [
+            "ok"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "review",
+          "description": "Worth a look (informational findings, warnings, partial run).",
+          "type": "string"
+        },
+        {
+          "const": "attention",
+          "description": "Warning findings.",
+          "type": "string"
+        },
+        {
+          "const": "critical",
+          "description": "Critical findings or a breached SLA.",
+          "type": "string"
+        }
+      ]
+    }
+  },
+  "$id": "https://github.com/hxddh/oprobe/schemas/3/runs-list.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Result of `oprobe runs list`",
+  "properties": {
+    "runs": {
+      "items": {
+        "$ref": "#/$defs/RunSummary"
+      },
+      "type": "array"
+    },
+    "total_count": {
+      "description": "Runs stored in total (the list may be limited).",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "runs",
+    "total_count"
+  ],
+  "title": "oprobe runs-list",
+  "type": "object",
+  "x-rust-type": "RunsList"
+}

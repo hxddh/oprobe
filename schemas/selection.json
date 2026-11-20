@@ -1,0 +1,42 @@
+{
+  "$id": "https://github.com/hxddh/oprobe/schemas/3/selection.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Which requests to attribute (MCP analyze_run)",
+  "properties": {
+    "api": {
+      "description": "Restrict to one storage API (e.g. `GetObject`); applies to both sides.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "from_us": {
+      "description": "Window start, µs from the measurement window start (inclusive).",
+      "format": "int64",
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "min_total_us": {
+      "description": "Requests at least this slow (total), µs.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "to_us": {
+      "description": "Window end, µs (exclusive).",
+      "format": "int64",
+      "type": [
+        "integer",
+        "null"
+      ]
+    }
+  },
+  "title": "oprobe selection",
+  "type": "object",
+  "x-rust-type": "Selection"
+}
