@@ -107,7 +107,7 @@ impl Col {
         match self {
             Col::T => 84.0,
             Col::Api => 150.0,
-            Col::Status => 64.0,
+            Col::Status => 72.0,
             Col::Remote => 150.0,
             Col::Error => 180.0,
             Col::RequestId => 200.0,
@@ -241,7 +241,7 @@ pub fn parse_latency_us(s: &str) -> Option<u64> {
         (s, 1e3)
     };
     let v: f64 = num.trim().parse().ok()?;
-    (v >= 0.0).then(|| (v * mul) as u64)
+    (v >= 0.0).then_some((v * mul) as u64)
 }
 
 impl Filter {

@@ -216,16 +216,17 @@ pub fn tool_dyn(
     hint: &'static str,
     on_press: impl Fn() + 'static,
 ) -> nsh_base::ButtonElement {
+    let term = in_terminal();
     let inner = view()
         .flex_row()
         .gap(px(5.0))
         .items_center()
-        .child(
-            text(move || glyph())
+        .child((!term).then(|| {
+            text(glyph)
                 .text_size(px(13.0))
-                .text_color(move || theme().muted_foreground),
-        )
-        .child(text(move || label()).text_size(px(12.0)).number_of_lines(1));
+                .text_color(move || theme().muted_foreground)
+        }))
+        .child(text(label).text_size(px(12.0)).number_of_lines(1));
     let inner = if hint.is_empty() || in_terminal() {
         inner
     } else {

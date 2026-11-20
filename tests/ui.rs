@@ -84,7 +84,7 @@ impl Ctx {
             ..EngineConfig::new(Root::of::<oprobe::ui::App>())
         };
         let mut app = Headless::start(config).unwrap();
-        app.wait_for("role:button[Commands]").unwrap();
+        app.wait_for("id:run-stop").unwrap();
         app
     }
 }

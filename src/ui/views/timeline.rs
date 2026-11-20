@@ -159,7 +159,7 @@ fn axis(s: Store) -> impl IntoElement {
                 .line_to(x.round() + 0.5, 20.0)
                 .stroke()
                 .fill_color(paint("axis"))
-                .fill_text(&fmt_s(t), x, 1.0);
+                .fill_text(&fmt_s(t), x.clamp(16.0, (w - 22.0).max(16.0)), 1.0);
         }
         p.begin_path().move_to(0.0, 19.5).line_to(w, 19.5).stroke()
     })
@@ -261,8 +261,8 @@ pub fn timeline() -> impl IntoElement {
                 .gap_2()
                 .px_3()
                 .py_2()
-                .child(btn("−", || Kind::Plain, move || zoom(s, 1.5, 0.5)).accessibility_label("Zoom out"))
-                .child(btn("+", || Kind::Plain, move || zoom(s, 1.0 / 1.5, 0.5)).accessibility_label("Zoom in"))
+                .child(btn("−", || Kind::Plain, move || zoom(s, 1.5, 0.0)).accessibility_label("Zoom out"))
+                .child(btn("+", || Kind::Plain, move || zoom(s, 1.0 / 1.5, 0.0)).accessibility_label("Zoom in"))
                 .child(
                     slider()
                         .value(move || Some(nsh_base::SliderValue::Single(zoom_level() as f64)))
@@ -288,7 +288,7 @@ pub fn timeline() -> impl IntoElement {
                         })
                         .w(px(140.0))
                         .h(px(20.0))
-                        .track_style(|st| st.h(px(4.0)).rounded_full().bg(move || theme().input))
+                        .track_style(|st| st.flex_1().h(px(4.0)).rounded_full().bg(move || theme().input))
                         .range_style(|st| st.h_full().rounded_full().bg(move || theme().primary))
                         .thumb_style(|st| {
                             st.size(px(14.0))
@@ -325,6 +325,17 @@ pub fn timeline() -> impl IntoElement {
                     return empty("No operations", "This run kept no operation rows.").into_element();
                 }
                 let width = signal(0.0_f32);
+                let list = element_ref();
+                // An operation inspected elsewhere (Reveal in Timeline): bring its row into view.
+                effect(move || {
+                    let Inspect::Op(i) = s.inspect.get() else { return };
+                    let pos = untracked(|| {
+                        s.current.with(|c| c.as_ref().and_then(|c| c.op_order.iter().position(|o| *o == i)))
+                    });
+                    if let Some(pos) = pos {
+                        list.scroll_to_index(pos as u32, percentage(0.3), px(0.0), true);
+                    }
+                });
                 view()
                     .flex_1()
                     .on_pinch(move |e: &PinchEvent| zoom(s, 1.0 / (1.0 + e.delta.0 as f64), 0.5))
@@ -396,6 +407,7 @@ pub fn timeline() -> impl IntoElement {
                                 )
                         })
                         .estimated_item_size(px(ROW_H))
+                        .element_ref(&list)
                         .flex_1(),
                     )
                     .into_element()

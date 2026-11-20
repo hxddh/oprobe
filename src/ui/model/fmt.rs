@@ -122,6 +122,9 @@ pub fn delta_pct(p: f64) -> String {
     if !p.is_finite() {
         return "—".into();
     }
+    if p.abs() < 0.01 {
+        return "±0 %".into();
+    }
     let s = sig3(p.abs());
     if p > 0.0 {
         format!("+{s} %")

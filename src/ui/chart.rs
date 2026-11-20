@@ -98,7 +98,7 @@ impl Frame {
             }
         } else {
             Self {
-                left: 46.0,
+                left: 52.0,
                 right: 10.0,
                 top: 6.0,
                 bottom: 18.0,
@@ -123,6 +123,7 @@ const DASH: &[Points] = &[Points(4.0), Points(3.0)];
 
 pub const FONT: &str = "11px system-ui";
 
+#[allow(clippy::too_many_arguments)]
 /// Axes, grid and tick labels for `x` / `y` over a `w`×`h` canvas.
 pub fn axes(
     p: Painter,
@@ -139,7 +140,16 @@ pub fn axes(
     let axis = paint("axis");
     let mut p = p.font(FONT).line_width(1.0);
     // Horizontal grid and y labels.
-    let y_ticks = y.ticks(if h < 120.0 { 3 } else { 4 });
+    let mut y_ticks = y.ticks(if h < 120.0 { 3 } else { 4 });
+    // Never closer than a label's height: a log axis keeps its decades first.
+    let room = ((y0 - y1) / 14.0).max(2.0) as usize;
+    if y_ticks.len() > room && y.log {
+        y_ticks.retain(|t| (t.log10() - t.log10().round()).abs() < 1e-6);
+    }
+    if y_ticks.len() > room {
+        let k = y_ticks.len().div_ceil(room);
+        y_ticks = y_ticks.into_iter().step_by(k).collect();
+    }
     p = p
         .text_align(CanvasTextAlign::Right)
         .text_baseline(CanvasTextBaseline::Middle);
@@ -168,7 +178,7 @@ pub fn axes(
             .line_to(px.round() + 0.5, y0 + 3.0)
             .stroke()
             .fill_color(axis)
-            .fill_text(&x_fmt(t), px, y0 + 4.0);
+            .fill_text(&x_fmt(t), px.min(w - 18.0), y0 + 4.0);
     }
     // The axes themselves.
     p.stroke_color(axis)
@@ -316,7 +326,7 @@ pub fn chart(
                                     .items_center()
                                     .gap_1()
                                     .child(swatch(token(tok)))
-                                    .child(small(if dashed {
+                                    .child(small(if dashed && tok == "series-b" {
                                         format!("{label} (B)")
                                     } else {
                                         label.to_owned()
@@ -367,5 +377,5 @@ pub fn fmt_rate(v: f64) -> String {
 
 /// MiB/s axis label.
 pub fn fmt_mib(v: f64) -> String {
-    format!("{} MiB/s", crate::ui::model::fmt::compact(v))
+    crate::ui::model::fmt::compact(v)
 }

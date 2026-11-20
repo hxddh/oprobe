@@ -65,9 +65,13 @@ impl Scale {
         if self.log {
             log_ticks(self.min, self.max)
         } else {
-            let (lo, hi, step) = nice_range(self.min, self.max, target);
-            let n = ((hi - lo) / step).round() as usize;
-            (0..=n).map(|i| lo + step * i as f64).collect()
+            // Ticks inside the axis only: an axis that ends at 8 s has no "10 s" label.
+            let step = nice_step((self.max - self.min) / target.max(1) as f64);
+            let first = (self.min / step - 1e-9).ceil();
+            let last = (self.max / step + 1e-9).floor();
+            (first as i64..=last as i64)
+                .map(|i| i as f64 * step)
+                .collect()
         }
     }
 }
@@ -135,6 +139,13 @@ mod tests {
         assert_eq!(s.max, 100.0);
         assert_eq!(s.ticks(5), vec![0.0, 20.0, 40.0, 60.0, 80.0, 100.0]);
         assert_eq!(nice_step(0.3), 0.5);
+        let t = Scale {
+            min: 0.0,
+            max: 8.0,
+            log: false,
+        }
+        .ticks(2);
+        assert_eq!(t, vec![0.0, 5.0]);
         assert_eq!(nice_step(7.0), 10.0);
     }
 

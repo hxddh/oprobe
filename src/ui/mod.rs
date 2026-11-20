@@ -9,6 +9,8 @@
 
 pub mod bridge;
 mod chart;
+// A menu, reveal or URL request answers once done; nothing waits for it.
+#[allow(clippy::let_underscore_future)]
 mod files;
 mod heatmap;
 mod kit;
@@ -16,6 +18,7 @@ pub mod launcher;
 pub mod model;
 pub mod store;
 mod term;
+#[allow(clippy::let_underscore_future)]
 mod views;
 
 /// Initial values from the command line (`oprobe top s3://bucket/x --endpoint …`).

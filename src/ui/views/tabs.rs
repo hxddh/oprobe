@@ -136,20 +136,21 @@ pub fn connections() -> impl IntoElement {
                 .child(
                     view()
                         .flex_row()
-                        .gap_6()
-                        .child(prop_row(
+                        .flex_wrap()
+                        .gap_4()
+                        .child(kv(
                             "Dialed",
                             format!(
                                 "{} connections · {} failed",
                                 stats.dialed, stats.dial_failures
                             ),
                         ))
-                        .child(prop_row("Reuse", fmt::pct(stats.reuse_pct)))
-                        .child(prop_row(
+                        .child(kv("Reuse", fmt::pct(stats.reuse_pct)))
+                        .child(kv(
                             "Protocol",
                             format!("h1 {} · h2 {}", stats.http1_requests, stats.http2_requests),
                         ))
-                        .child(prop_row(
+                        .child(kv(
                             "TLS",
                             if stats.tls_version.is_empty() {
                                 "—".to_owned()
@@ -351,4 +352,14 @@ pub fn cost() -> impl IntoElement {
                 .into_element()
         })
     }))
+}
+
+/// A name and its value on one line (summary rows).
+fn kv(name: &'static str, value: impl Into<SharedString>) -> View {
+    view()
+        .flex_row()
+        .gap_1()
+        .items_center()
+        .child(small(name))
+        .child(num(value.into()).text_size(px(12.0)))
 }

@@ -366,6 +366,7 @@ fn narrow() -> bool {
 fn toolbar_view(s: Store) -> impl IntoElement {
     let busy = move || s.busy();
     let inset = move || nsh_core::element::desktop::title_bar().left.0;
+    let term = kit::in_terminal();
     view().window_drag(true).child(
         toolbar()
             .accessibility_label("Toolbar")
@@ -409,46 +410,54 @@ fn toolbar_view(s: Store) -> impl IntoElement {
                         move || s.compare_default(),
                     )),
             )
-            .child(
-                toolbar_separator()
-                    .w(px(1.0))
-                    .h(px(18.0))
-                    .mx_1()
-                    .bg(move || theme().border),
-            )
-            .child(
-                toolbar_group()
-                    .accessibility_label("Tools")
+            // In a terminal the menu bar (F10) carries the tools: the row keeps Run/Stop.
+            .child((!term).then(|| {
+                view()
                     .flex_row()
+                    .items_center()
                     .gap_1()
                     .child(
-                        tool("⚙", "Tune", "Find better client settings", move || {
-                            s.mode.set(Mode::Tune)
-                        })
-                        .selected(move || s.mode.get() == Mode::Tune),
+                        toolbar_separator()
+                            .w(px(1.0))
+                            .h(px(18.0))
+                            .mx_1()
+                            .bg(move || theme().border),
                     )
                     .child(
-                        tool(
-                            "⌁",
-                            "Probe",
-                            "Handshakes and TTFB of an endpoint",
-                            move || s.mode.set(Mode::Probe),
-                        )
-                        .selected(move || s.mode.get() == Mode::Probe),
+                        toolbar_group()
+                            .accessibility_label("Tools")
+                            .flex_row()
+                            .gap_1()
+                            .child(
+                                tool("⚙", "Tune", "Find better client settings", move || {
+                                    s.mode.set(Mode::Tune)
+                                })
+                                .selected(move || s.mode.get() == Mode::Tune),
+                            )
+                            .child(
+                                tool(
+                                    "⌁",
+                                    "Probe",
+                                    "Handshakes and TTFB of an endpoint",
+                                    move || s.mode.set(Mode::Probe),
+                                )
+                                .selected(move || s.mode.get() == Mode::Probe),
+                            )
+                            .child(tool("⇪", "Export", "Export the run (⌘S)", move || {
+                                let _ = popup_menu(vec![
+                                    MenuItem::new("Run File (.oprobe)…").on_select(move || {
+                                        crate::ui::files::export_run(s, "oprobe")
+                                    }),
+                                    MenuItem::new("Report (JSON)…")
+                                        .on_select(move || crate::ui::files::export_run(s, "json")),
+                                    MenuItem::new("Report (Markdown)…")
+                                        .on_select(move || crate::ui::files::export_run(s, "md")),
+                                    MenuItem::new("Requests (CSV)…")
+                                        .on_select(move || requests::export_csv(s)),
+                                ]);
+                            })),
                     )
-                    .child(tool("⇪", "Export", "Export the run (⌘S)", move || {
-                        let _ = popup_menu(vec![
-                            MenuItem::new("Run File (.oprobe)…")
-                                .on_select(move || crate::ui::files::export_run(s, "oprobe")),
-                            MenuItem::new("Report (JSON)…")
-                                .on_select(move || crate::ui::files::export_run(s, "json")),
-                            MenuItem::new("Report (Markdown)…")
-                                .on_select(move || crate::ui::files::export_run(s, "md")),
-                            MenuItem::new("Requests (CSV)…")
-                                .on_select(move || requests::export_csv(s)),
-                        ]);
-                    })),
-            )
+            }))
             .child(
                 view().flex_1().min_w(px(0.0)).items_center().child(
                     body(move || status_line(s))
@@ -457,27 +466,33 @@ fn toolbar_view(s: Store) -> impl IntoElement {
                         .text_color(move || theme().muted_foreground),
                 ),
             )
-            .child(tool(
-                "⌘",
-                "Commands",
-                "Command palette (⌘K)",
-                move || s.open(Overlay::Palette),
-            ))
-            .child(
-                tool("◧", "Sidebar", "Show or hide the sidebar", move || {
-                    s.toggle_sidebar()
-                })
-                .selected(move || s.prefs.with(|p| p.sidebar_visible)),
-            )
-            .child(
-                tool(
-                    "◨",
-                    "Inspector",
-                    "Show or hide the inspector",
-                    move || s.toggle_inspector(),
-                )
-                .selected(move || s.prefs.with(|p| p.inspector_visible)),
-            ),
+            .child((!term).then(|| {
+                view()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .child(tool(
+                        "⌘",
+                        "Commands",
+                        "Command palette (⌘K)",
+                        move || s.open(Overlay::Palette),
+                    ))
+                    .child(
+                        tool("◧", "Sidebar", "Show or hide the sidebar", move || {
+                            s.toggle_sidebar()
+                        })
+                        .selected(move || s.prefs.with(|p| p.sidebar_visible)),
+                    )
+                    .child(
+                        tool(
+                            "◨",
+                            "Inspector",
+                            "Show or hide the inspector",
+                            move || s.toggle_inspector(),
+                        )
+                        .selected(move || s.prefs.with(|p| p.inspector_visible)),
+                    )
+            })),
     )
 }
 
@@ -805,6 +820,7 @@ fn tab_bar(s: Store) -> impl IntoElement {
             .focus_visible(|st| st.outline(px(2.0)).outline_color(move || theme().ring))
             .child(
                 text(t.label())
+                    .number_of_lines(1)
                     .text_size(px(12.0))
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(move || {
@@ -859,6 +875,9 @@ fn run_header(s: Store) -> impl IntoElement {
                 })
             });
             let live = s.sel.get() == Sel::Live;
+            if narrow() {
+                return view().into_element();
+            }
             untracked(|| {
                 small(if live {
                     "live".to_owned()
@@ -1061,6 +1080,9 @@ fn palette(s: Store) -> impl IntoElement {
                                 .search_bar_style(|st| {
                                     st.px_3()
                                         .h(px(40.0))
+                                        .justify_center()
+                                        .flex_row()
+                                        .items_center()
                                         .border_b_1()
                                         .border_color(move || theme().border)
                                 })

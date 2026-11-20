@@ -188,6 +188,12 @@ pub struct Store {
     pub started: Stored<std::time::Instant>,
 }
 
+impl Default for Store {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub fn store() -> Store {
     use_context::<Store>().expect("the root provides the store")
 }

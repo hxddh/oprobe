@@ -92,7 +92,7 @@ pub fn reveal_in_timeline(s: Store, i: u32) {
         let r = c.run.reqs.get(i as usize)?;
         let op = c.op_index.get(&r.op_id).copied();
         let t = r.t_us as f64 / 1e6;
-        let span = (r.total_us as f64 / 1e6 * 6.0).max(0.05);
+        let span = (r.total_us as f64 / 1e6 * 2.0).max(0.02);
         Some((op, (t - span, t + span)))
     });
     if let Some((op, win)) = hit {

@@ -438,14 +438,11 @@ fn finished(s: Store) -> View {
             view()
                 .flex_row()
                 .gap_4()
-                .child(
-                    view()
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .child(chart("BANDWIDTH", 90.0, move || {
-                            series.with(|s| s.as_ref().and_then(bandwidth_plot))
-                        })),
-                )
+                .child(view().flex_1().min_w(px(0.0)).child(chart(
+                    "BANDWIDTH · MiB/s",
+                    90.0,
+                    move || series.with(|s| s.as_ref().and_then(bandwidth_plot)),
+                )))
                 .child(view().flex_1().min_w(px(0.0)).child(chart(
                     "ERRORS & THROTTLING",
                     90.0,

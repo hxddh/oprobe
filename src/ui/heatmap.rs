@@ -137,7 +137,7 @@ pub fn heatmap(
                 .gap_3()
                 .h(px(16.0))
                 .items_center()
-                .child(caption("Request latency over time"))
+                .child(caption("REQUEST LATENCY OVER TIME"))
                 .child(small(
                     "drag to select · the inspector shows what sets them apart",
                 )),
