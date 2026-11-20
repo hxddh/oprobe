@@ -36,14 +36,26 @@ jobs:
           plutil -p /tmp/oprobe.app/Contents/Info.plist
       - name: Run the bundle binary directly
         run: |
+          set +e
           b=/tmp/oprobe.app/Contents/MacOS/oprobe
           $b --version
-          ( $b > run.out 2> run.err & echo $! > pid )
+          $b > run.out 2> run.err &
+          pid=$!
           sleep 10
-          if kill -0 $(cat pid) 2>/dev/null; then echo "ALIVE after 10s"; screencapture -x direct.png || true; kill $(cat pid); else echo "EXITED"; wait $(cat pid) 2>/dev/null; echo "exit=$?"; fi
+          if kill -0 $pid 2>/dev/null; then echo "ALIVE after 10s"; screencapture -x direct.png; kill $pid; else wait $pid; echo "EXITED code=$?"; fi
           echo '--- stdout'; cat run.out; echo '--- stderr'; cat run.err
+          echo '--- gui subcommand'
+          $b gui > g2.out 2> g2.err &
+          pid=$!
+          sleep 10
+          if kill -0 $pid 2>/dev/null; then echo "gui ALIVE"; screencapture -x direct-gui.png; kill $pid; else wait $pid; echo "gui EXITED code=$?"; fi
+          cat g2.out g2.err
+          env | grep -E '^(SSH|TERM|DISPLAY)' || true
+          ls -la ~/Library/Logs/DiagnosticReports/ 2>/dev/null | tail
       - name: Launch with LaunchServices (open)
+        if: always()
         run: |
+          set +e
           open /tmp/oprobe.app || echo "open failed: $?"
           sleep 10
           pgrep -fl oprobe && echo "ALIVE via open" || echo "NOT RUNNING via open"
@@ -53,13 +65,17 @@ jobs:
           ls -la ~/Library/Logs/DiagnosticReports/ || true
           for f in ~/Library/Logs/DiagnosticReports/oprobe*; do [ -f "$f" ] && head -c 12000 "$f"; done || true
       - name: Quarantined copy (as downloaded by a browser)
+        if: always()
         run: |
+          set +e
           cp -R /tmp/oprobe.app /tmp/q.app
           xattr -w com.apple.quarantine "0081;$(printf %x $(date +%s));Safari;" /tmp/q.app
           spctl -a -vvv -t exec /tmp/q.app || true
           syspolicy_check distribution /tmp/q.app 2>&1 || true
       - name: Plain terminal binary (tarball)
+        if: always()
         run: |
+          set +e
           tar xzf oprobe-*-universal-apple-darwin.tar.gz
           d=$(ls -d oprobe-*-universal-apple-darwin)
           ls -la $d
