@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
-## 3.0.0 — unreleased
+## v3.0.0 — 2026-11-20
 
 oprobe 3 turns a benchmark into a product: **see every request your object-storage client makes, know where
 the time and money go and what to change — usable by people, CI and agents alike.** Every run is saved as one

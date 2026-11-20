@@ -97,17 +97,10 @@ impl CommandOutput for DemoOutput {
     }
 }
 
-/// The lab's fault profile for the demo.
+/// The lab's fault profile for the demo: exactly the `lab://demo` scenario, so the commands the
+/// demo suggests (`oprobe run lab://demo …`) measure the same server.
 pub fn demo_lab() -> LabConfig {
-    LabConfig {
-        enable_http2: true,
-        base_ttfb_delay: std::time::Duration::from_millis(3),
-        straggler_every_n: DEMO_STRAGGLER_EVERY,
-        straggler_delay: std::time::Duration::from_millis(DEMO_STRAGGLER_MS),
-        max_inflight_before_503: Some(DEMO_THROTTLE_ABOVE),
-        throttle_status_code: 503,
-        ..Default::default()
-    }
+    crate::lab::Scenario::Demo.config()
 }
 
 /// Plain-language narration of a demo run.
@@ -223,8 +216,6 @@ pub async fn cmd_demo(a: DemoArgs, ctx: &Ctx) -> Result<u8> {
             format!("--duration: {e:#}"),
         )
     })?;
-    // TODO(B2 lab::Scenario): once `lab://demo` resolves through `lab::Scenario`, run that
-    // target (`super::resolve_profile` on "lab://demo") instead of configuring the lab here.
     ctx.out.info(format!(
         "{} starting a local S3 lab with throttling above {DEMO_THROTTLE_ABOVE} requests in flight \
          and 1-in-{DEMO_STRAGGLER_EVERY} stragglers…",
@@ -291,5 +282,19 @@ mod tests {
         assert!(text.contains("oprobe runs show 20261120-143005-a1b2"));
         assert!(next[0].starts_with("oprobe target add"));
         assert_eq!(steps.len(), 5);
+    }
+}
+
+#[cfg(test)]
+mod scenario_tests {
+    #[test]
+    fn narration_matches_the_lab_demo_scenario() {
+        let c = super::demo_lab();
+        assert_eq!(c.max_inflight_before_503, Some(super::DEMO_THROTTLE_ABOVE));
+        assert_eq!(c.straggler_every_n, super::DEMO_STRAGGLER_EVERY);
+        assert_eq!(
+            c.straggler_delay.as_millis() as u64,
+            super::DEMO_STRAGGLER_MS
+        );
     }
 }

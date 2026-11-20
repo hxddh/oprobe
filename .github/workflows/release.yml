@@ -363,6 +363,16 @@ jobs:
           body_path: notes.md
           files: out/*
           fail_on_unmatched_files: true
+      # `uses: hxddh/oprobe@v3` (the GitHub Action) follows the newest 3.x release.
+      - name: Move the floating major tag
+        if: ${{ !contains(env.VERSION, '-') }}
+        run: |
+          major="v${VERSION%%.*}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch --force origin "refs/tags/${TAG}:refs/tags/${TAG}"
+          git tag -f "$major" "${TAG}^{commit}"
+          git push -f origin "refs/tags/$major"
 
   crates-io:
     name: Publish to crates.io
