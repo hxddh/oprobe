@@ -1,4 +1,5 @@
-//! Run identifiers: `YYYYMMDD-HHMMSS-xxxx` (UTC start time + 16 random bits).
+//! Run identifiers: `YYYYMMDD-HHMMSS-xxxx`: the UTC start second, then 16 bits holding the
+//! millisecond (× 64) plus 6 random bits, so ids sort in creation order even within a second.
 
 use std::fmt;
 use std::time::SystemTime;
@@ -17,7 +18,12 @@ pub struct RunId(String);
 impl RunId {
     /// A fresh id for a run starting now.
     pub fn new() -> Self {
-        Self::at(SystemTime::now(), rand::random())
+        let now = SystemTime::now();
+        let ms = now
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.subsec_millis() as u16)
+            .unwrap_or(0);
+        Self::at(now, ms * 64 + rand::random::<u16>() % 64)
     }
 
     /// The id of a run started at `t` with random tag `tag`.
@@ -156,5 +162,27 @@ mod tests {
         assert_ne!(a, idempotent_run_prefix("CI build #43"));
         assert!(a.starts_with("oprobe-run-key-ci-build--42-"), "{a}");
         assert!(a.ends_with('/'));
+    }
+}
+
+#[cfg(test)]
+mod order_tests {
+    use super::RunId;
+
+    #[test]
+    fn ids_created_in_sequence_sort_in_sequence() {
+        let mut prev = RunId::new();
+        for _ in 0..50 {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            let next = RunId::new();
+            assert!(
+                next.as_str() > prev.as_str(),
+                "{} then {}",
+                prev.as_str(),
+                next.as_str()
+            );
+            assert!(RunId::parse(next.as_str()).is_some());
+            prev = next;
+        }
     }
 }
