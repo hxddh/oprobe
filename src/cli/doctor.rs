@@ -68,7 +68,10 @@ pub async fn run(a: DoctorArgs) -> Result<ExitCode> {
         }
         Err(e) => c.fail("configuration", &format!("{e:#}")),
     }
-    if target.scheme == "s3" && !target.options.contains_key("allow_anonymous") {
+    let unsigned = ["skip_signature", "allow_anonymous"]
+        .iter()
+        .any(|k| target.options.get(*k).is_some_and(|v| v == "true"));
+    if target.scheme == "s3" && !unsigned {
         let has_keys = target.options.contains_key("access_key_id")
             || std::env::var("AWS_ACCESS_KEY_ID").is_ok()
             || std::env::var("AWS_PROFILE").is_ok()

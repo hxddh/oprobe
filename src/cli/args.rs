@@ -140,7 +140,7 @@ pub struct TargetArgs {
     /// Extra backend option, repeatable (e.g. -o enable_virtual_host_style=true)
     #[arg(short = 'o', long = "option", value_name = "KEY=VALUE")]
     pub options: Vec<String>,
-    /// Access a public bucket without credentials
+    /// Access a public bucket without credentials (s3, gcs, azblob, oss: unsigned requests)
     #[arg(long)]
     pub anonymous: bool,
     /// Trust an extra PEM CA bundle

@@ -336,10 +336,10 @@ pub fn build_profile(
             .insert(key.trim().to_owned(), val.trim().to_owned());
     }
     if t.anonymous {
-        tg.options.insert("allow_anonymous".into(), "true".into());
-        tg.options
-            .insert("disable_config_load".into(), "true".into());
-        tg.options.insert("skip_signature".into(), "true".into());
+        let scheme = tg.service_scheme()?;
+        for (k, v) in crate::config::anonymous_options(&scheme)? {
+            tg.options.insert((*k).into(), (*v).into());
+        }
     }
     if let Some(ca) = &t.ca_cert {
         tg.ca_cert = Some(ca.clone());

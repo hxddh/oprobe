@@ -794,6 +794,18 @@ impl TargetSpec {
         Ok(t)
     }
 
+    /// The OpenDAL scheme, derived from `url` when not set explicitly.
+    pub fn service_scheme(&self) -> Result<String> {
+        if !self.scheme.is_empty() {
+            return Ok(self.scheme.clone());
+        }
+        let url = self
+            .url
+            .as_deref()
+            .context("target needs either `url` or `scheme`")?;
+        Ok(Self::from_url(url)?.scheme)
+    }
+
     /// The scheme as the user wrote it in `url` (`r2`, `minio`, `s3a`, ...).
     pub fn url_scheme(&self) -> Option<String> {
         self.url
@@ -916,6 +928,26 @@ impl TargetSpec {
     pub fn is_network(&self) -> bool {
         !matches!(self.scheme.as_str(), "memory" | "fs")
     }
+}
+
+/// Backend options for unsigned, credential-free access to a public bucket (`--anonymous`), per
+/// OpenDAL service. `skip_signature` is what OpenDAL 0.59 calls it (`allow_anonymous` is its
+/// deprecated alias); credential discovery is disabled too so no config files or metadata
+/// servers are consulted.
+pub fn anonymous_options(scheme: &str) -> Result<&'static [(&'static str, &'static str)]> {
+    Ok(match scheme {
+        "s3" => &[("skip_signature", "true"), ("disable_config_load", "true")],
+        "gcs" => &[
+            ("skip_signature", "true"),
+            ("disable_vm_metadata", "true"),
+            ("disable_config_load", "true"),
+        ],
+        // No credentials at all: unsigned requests.
+        "azblob" | "oss" => &[("skip_signature", "true")],
+        other => bail!(
+            "--anonymous is not supported for `{other}` (OpenDAL's {other} service has no unsigned mode); configure credentials instead"
+        ),
+    })
 }
 
 /// Options `from_url` derives from URL credentials: always kept (as `${ENV}` references) when
@@ -1077,6 +1109,31 @@ mod tests {
         assert_eq!(t.options["root"], "/tmp/x");
         assert_eq!(TargetSpec::from_url("memory://").unwrap().scheme, "memory");
         assert!(TargetSpec::from_url("ftp://x").is_err());
+    }
+
+    #[test]
+    fn anonymous_access_maps_per_service() {
+        for scheme in ["s3", "gcs", "azblob", "oss"] {
+            let opts = anonymous_options(scheme).unwrap();
+            assert!(opts.contains(&("skip_signature", "true")), "{scheme}");
+            // Every key is one the service accepts (none silently ignored).
+            let keys: Vec<String> = opts.iter().map(|(k, _)| (*k).to_owned()).collect();
+            crate::service_options::validate_keys(scheme, &keys).unwrap();
+        }
+        assert!(anonymous_options("gcs").unwrap().contains(&("disable_vm_metadata", "true")));
+        let e = anonymous_options("b2").unwrap_err().to_string();
+        assert!(e.contains("not supported for `b2`"), "{e}");
+        assert!(anonymous_options("fs").is_err());
+        let t = TargetSpec::from_url("gs://b").unwrap();
+        assert_eq!(
+            TargetSpec {
+                scheme: String::new(),
+                ..t
+            }
+            .service_scheme()
+            .unwrap(),
+            "gcs"
+        );
     }
 
     #[test]
