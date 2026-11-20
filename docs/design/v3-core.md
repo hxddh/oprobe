@@ -104,3 +104,12 @@ breach cancels the run, the command saves the partial run and returns
 - The tuner's report carries no trace rows (only its slowest operations).
 - JSON Schema: `schemars::schema_for!(oprobe::model::Report)` (and `Run`, `events::Event`,
   `errors::ErrorBody`, every `CommandOutput`) — stream B1 publishes them via `oprobe schema`.
+
+## Outlier attribution (shared by B1, B3, B4)
+
+`analysis::outliers::{Selection, Attribution, Factor, attribute, dominant_stage}` is the stable
+interface: `attribute(&run.reqs, &Selection::slowest(&run.reqs, 1.0))` ranks the attribute
+values (api, status, protocol, connection cold/warm, remote IP, attempt, error, dominant stage)
+over-represented among the selected requests. Stream B3 owns and refines the ranking; B1 (MCP
+`analyze_run`/`explain_run`) and B4 (GUI brush on the timeline/heatmap) call it and must not
+change its signatures.

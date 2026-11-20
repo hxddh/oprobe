@@ -3,3 +3,4 @@
 pub mod cost;
 pub mod diagnosis;
 pub mod hints;
+pub mod outliers;
