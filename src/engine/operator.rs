@@ -186,6 +186,27 @@ pub async fn check_reachable(base: &Operator, target: &TargetSpec) -> Result<()>
 }
 
 /// Untraced operator for dataset seeding, verification and cleanup.
+/// Untraced operator that fails fast (few retries, short timeouts): the preflight check.
+pub fn preflight_operator(base: &Operator, target: &TargetSpec) -> Result<Operator> {
+    let knobs = Knobs::default();
+    Ok(base
+        .clone()
+        .layer(trace_layer(target, &knobs, None)?)
+        .layer(
+            TimeoutLayer::new()
+                .with_timeout(Duration::from_secs(30))
+                .with_io_timeout(Duration::from_secs(15)),
+        )
+        // A few quick retries of temporary errors (throttling); persistent ones fail at once.
+        .layer(
+            RetryLayer::default()
+                .with_jitter()
+                .with_min_delay(Duration::from_millis(200))
+                .with_max_times(4)
+                .with_max_delay(Duration::from_secs(2)),
+        ))
+}
+
 pub fn admin_operator(base: &Operator, target: &TargetSpec) -> Result<Operator> {
     let knobs = Knobs::default();
     Ok(base

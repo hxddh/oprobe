@@ -6,7 +6,19 @@ use crate::config::{Knobs, Sla};
 use crate::trace::Snapshot;
 use crate::util::{fmt_bytes, fmt_ms};
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Serialize,
+    Deserialize,
+    schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum Severity {
     #[default]
@@ -26,7 +38,9 @@ impl Severity {
 }
 
 /// The layer that dominates operation latency.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum Bottleneck {
     #[default]
@@ -68,7 +82,7 @@ impl Bottleneck {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Finding {
     pub severity: Severity,
     pub code: String,
@@ -78,7 +92,7 @@ pub struct Finding {
 }
 
 /// Share of total operation time spent in each layer (fractions sum to ~1).
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TimeShares {
     pub queue: f64,
     pub cache: f64,
@@ -92,7 +106,7 @@ pub struct TimeShares {
     pub client: f64,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Diagnosis {
     pub bottleneck: Bottleneck,
     pub headline: String,
@@ -503,7 +517,7 @@ fn capitalize(s: &str) -> String {
 }
 
 /// Outcome of checking a run against its [`Sla`].
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SlaVerdict {
     /// Whether a breach fails the command (exit code 3).
     pub enforced: bool,

@@ -96,6 +96,10 @@ tower-layer = "0.3"
 tower-service = "0.3"
 crc32c = "0.6"
 libc = "0.2"
+# 3.0 core: JSON Schema of every machine output, run files (zstd NDJSON), config/data dirs.
+schemars = "1"
+zstd = "0.13"
+dirs = "6"
 
 # Interactive UI (Native Shell): the terminal workbench (`tui`, default) and native windows (`gui`).
 nsh-core = { version = "0.6", optional = true }

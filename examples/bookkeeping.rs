@@ -40,6 +40,7 @@ fn main() {
                         request_id: Some("oprobe-s3-req-000123".into()),
                         retry_after_ms: None,
                         error: None,
+                        remote: None,
                     };
                     rec.request_finished();
                     OpScope::current().unwrap().push_request(r);
@@ -55,6 +56,7 @@ fn main() {
                     logical_read: 16384,
                     logical_write: 0,
                     error: None,
+                    key: String::new(),
                     data: scope.take(),
                 },
             );

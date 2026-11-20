@@ -595,6 +595,7 @@ impl Drop for CancelGuard {
             request_id: None,
             retry_after_ms: None,
             error: Some("cancelled before a response (timeout or abandoned)".into()),
+            remote: None,
         };
         Finisher::emit(record, &self.scope, &self.recorder);
     }
@@ -783,6 +784,7 @@ impl HttpTransport for FidelityTransport {
             request_id: None,
             retry_after_ms: None,
             error: None,
+            remote: None,
         };
 
         let permit = match &self.limiter {
@@ -845,6 +847,7 @@ impl HttpTransport for FidelityTransport {
             .get::<HttpInfo>()
             .map(|i| (i.local_addr(), i.remote_addr()));
         let mut dial = None;
+        record.remote = addr.map(|(_, remote)| remote);
         if let (Some(addr), Ok(mut c)) = (addr, self.shared.conns.lock()) {
             let c = &mut *c;
             let entry = c.by_addr.entry(addr).or_insert_with(|| {

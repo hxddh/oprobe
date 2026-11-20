@@ -9,11 +9,17 @@ pub mod analysis;
 pub mod cli;
 pub mod config;
 pub mod engine;
+pub mod errors;
+pub mod events;
+pub mod guard;
 pub mod lab;
 pub mod layers;
+pub mod model;
 pub mod net;
+pub mod output;
 pub mod report;
 pub mod service_options;
+pub mod store;
 pub mod trace;
 pub mod tune;
 #[cfg(feature = "tui")]

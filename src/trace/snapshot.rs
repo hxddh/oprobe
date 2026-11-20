@@ -2,23 +2,30 @@
 
 use std::collections::BTreeMap;
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::model::{Api, RequestRecord};
 
 /// Latency distribution in milliseconds.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Quantiles {
     pub count: u64,
+    #[serde(rename = "mean_ms")]
     pub mean: f64,
+    #[serde(rename = "p50_ms")]
     pub p50: f64,
+    #[serde(rename = "p90_ms")]
     pub p90: f64,
+    #[serde(rename = "p99_ms")]
     pub p99: f64,
+    #[serde(rename = "p999_ms")]
     pub p999: f64,
+    #[serde(rename = "max_ms")]
     pub max: f64,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Phase {
     #[default]
@@ -47,7 +54,7 @@ impl Phase {
 
 /// Where the wall-clock time of a logical operation went (mean ms per op).
 /// `queue + cache + backend + retry + client == latency mean` (exact for each op; see docs/metrics.md).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct OpBreakdown {
     /// Waiting for in-flight request permits / connections, with nothing on the wire.
     pub queue_ms: f64,
@@ -63,23 +70,28 @@ pub struct OpBreakdown {
     pub client_ms: f64,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct VerbStats {
     pub verb: String,
     pub count: u64,
+    #[serde(rename = "errors_count")]
     pub errors: u64,
+    #[serde(rename = "throttled_count")]
     pub throttled: u64,
     pub ops_per_s: f64,
     pub mib_per_s: f64,
     pub latency: Quantiles,
     pub breakdown: OpBreakdown,
+    #[serde(rename = "mean_requests_count")]
     pub requests_per_op: f64,
+    #[serde(rename = "mean_bytes")]
     pub bytes_per_op: f64,
+    #[serde(rename = "retries_count")]
     pub retries: u64,
 }
 
 /// Request stage distribution for one API (ms).
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct StageStats {
     pub queue: Quantiles,
     /// DNS+TCP+proxy+TLS; only requests that dialed are counted.
@@ -91,12 +103,15 @@ pub struct StageStats {
     pub total: Quantiles,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ApiStats {
     pub api: Api,
     pub count: u64,
+    #[serde(rename = "errors_count")]
     pub errors: u64,
+    #[serde(rename = "throttled_count")]
     pub throttled: u64,
+    #[serde(rename = "status_count")]
     pub status: BTreeMap<u16, u64>,
     pub reused_pct: f64,
     pub bytes_up: u64,
@@ -104,14 +119,20 @@ pub struct ApiStats {
     pub stages: StageStats,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ConnStats {
+    #[serde(rename = "dialed_count")]
     pub dialed: u64,
+    #[serde(rename = "dial_failures_count")]
     pub dial_failures: u64,
+    #[serde(rename = "requests_count")]
     pub requests: u64,
+    #[serde(rename = "reused_requests_count")]
     pub reused_requests: u64,
     pub reuse_pct: f64,
+    #[serde(rename = "http1_requests_count")]
     pub http1_requests: u64,
+    #[serde(rename = "http2_requests_count")]
     pub http2_requests: u64,
     pub alpn: String,
     pub tls_version: String,
@@ -123,81 +144,113 @@ pub struct ConnStats {
     pub tcp: Quantiles,
     pub proxy_connect: Quantiles,
     pub tls: Quantiles,
+    #[serde(rename = "peak_inflight_requests_count")]
     pub peak_inflight_requests: u64,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ResilienceStats {
+    #[serde(rename = "retries_count")]
     pub retries: u64,
     pub retry_backoff_ms: f64,
+    #[serde(rename = "throttled_responses_count")]
     pub throttled_responses: u64,
+    #[serde(rename = "status_429_count")]
     pub status_429: u64,
+    #[serde(rename = "status_503_count")]
     pub status_503: u64,
     pub max_retry_after_ms: u64,
+    #[serde(rename = "server_errors_count")]
     pub server_errors: u64,
+    #[serde(rename = "client_errors_count")]
     pub client_errors: u64,
+    #[serde(rename = "network_errors_count")]
     pub network_errors: u64,
+    #[serde(rename = "failed_ops_count")]
     pub failed_ops: u64,
+    #[serde(rename = "error_classes_count")]
     pub error_classes: BTreeMap<String, u64>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ByteStats {
     /// Bytes the application asked to read.
+    #[serde(rename = "logical_read_bytes")]
     pub logical_read: u64,
     /// Bytes the application wrote.
+    #[serde(rename = "logical_write_bytes")]
     pub logical_write: u64,
     /// Logical read bytes answered by the local cache.
     pub cache_hit_bytes: u64,
     /// Response body bytes downloaded from the backend.
+    #[serde(rename = "backend_down_bytes")]
     pub backend_down: u64,
     /// Request body bytes uploaded to the backend.
+    #[serde(rename = "backend_up_bytes")]
     pub backend_up: u64,
     /// Raw socket bytes incl. TLS records and HTTP headers.
+    #[serde(rename = "wire_rx_bytes")]
     pub wire_rx: u64,
+    #[serde(rename = "wire_tx_bytes")]
     pub wire_tx: u64,
     /// backend_down / logical_read (cache hits lower it, over-fetching raises it).
+    #[serde(rename = "read_amplification_ratio")]
     pub read_amplification: f64,
     /// backend_down / (logical_read - cache_hit_bytes): over-fetch from range coalescing & chunking.
     pub overread_ratio: f64,
     /// backend_up / logical_write (retried uploads raise it).
+    #[serde(rename = "write_amplification_ratio")]
     pub write_amplification: f64,
     /// Backend requests per logical operation.
+    #[serde(rename = "request_amplification_ratio")]
     pub request_amplification: f64,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct CacheStats {
     pub enabled: bool,
+    #[serde(rename = "lookups_count")]
     pub lookups: u64,
+    #[serde(rename = "hits_count")]
     pub hits: u64,
     pub hit_ratio: f64,
+    #[serde(rename = "mean_lookup_ms")]
     pub lookup_ms_mean: f64,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct IntegrityStats {
+    #[serde(rename = "verified_count")]
     pub verified: u64,
+    #[serde(rename = "corrupted_count")]
     pub corrupted: u64,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct TimelinePoint {
     pub t_s: f64,
     pub ops_per_s: f64,
     pub mib_per_s: f64,
     pub p50_ms: f64,
     pub p99_ms: f64,
+    #[serde(rename = "errors_count")]
     pub errors: u64,
+    #[serde(rename = "throttled_count")]
     pub throttled: u64,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct SlowOp {
+    /// Id of the operation (its row in the run file).
+    #[serde(default)]
+    pub op_id: u64,
+    #[serde(default)]
+    pub key: String,
     pub verb: String,
     pub latency_ms: f64,
     pub at_s: f64,
     pub breakdown: OpBreakdown,
+    #[serde(rename = "retries_count")]
     pub retries: u64,
     pub requests: Vec<RequestRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -206,42 +259,51 @@ pub struct SlowOp {
     pub error: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ClientStats {
+    #[serde(rename = "cpu_cores_count")]
     pub cpu_cores: usize,
     /// Process CPU usage in percent of ONE core (e.g. 350% = 3.5 cores busy).
     pub cpu_pct: f64,
+    #[serde(rename = "peak_cpu_pct")]
     pub cpu_pct_peak: f64,
     pub rss_mib: f64,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct OpenLoopStats {
+    #[serde(rename = "target_per_s")]
     pub target_rate: f64,
+    #[serde(rename = "achieved_per_s")]
     pub achieved_rate: f64,
     /// Arrivals that never started: still queued behind `concurrency` busy slots when the
     /// window ended, or dropped after falling more than `knobs.timeout` behind schedule.
     /// Arrivals that waited for a slot and then ran are not missed: their queueing delay is
     /// part of their latency (measured from the intended start).
+    #[serde(rename = "missed_count")]
     pub missed: u64,
     pub max_schedule_lag_ms: f64,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Summary {
+    #[serde(rename = "ops_count")]
     pub ops: u64,
     pub ops_per_s: f64,
+    #[serde(rename = "failed_ops_count")]
     pub failed_ops: u64,
+    #[serde(rename = "error_ratio")]
     pub error_rate: f64,
     pub mib_per_s: f64,
     pub read_mib_per_s: f64,
     pub write_mib_per_s: f64,
     pub latency: Quantiles,
+    #[serde(rename = "inflight_ops_count")]
     pub inflight_ops: u64,
 }
 
 /// Complete aggregated view of one measurement window.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Snapshot {
     pub phase: Phase,
     pub elapsed_s: f64,
@@ -267,16 +329,20 @@ pub struct Snapshot {
 }
 
 /// Knob values as OpenDAL applies them, which can differ from what was requested.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct EffectiveKnobs {
     /// `knobs.chunk_size` as requested (bytes).
+    #[serde(rename = "requested_chunk_bytes")]
     pub requested_chunk_size: u64,
     /// Chunk (multipart part size) OpenDAL writes with: the requested chunk clamped to the
     /// service's `write_multi_min_size ..= write_multi_max_size` (reads use it unchanged).
+    #[serde(rename = "write_chunk_bytes")]
     pub write_chunk_size: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "service_min_part_bytes")]
     pub service_min_part_size: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "service_max_part_bytes")]
     pub service_max_part_size: Option<u64>,
 }
 

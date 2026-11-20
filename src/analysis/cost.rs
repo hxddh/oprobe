@@ -167,24 +167,30 @@ pub fn detect_provider(scheme: &str, endpoint: Option<&str>) -> Option<&'static 
 }
 
 /// Measured usage per logical operation.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PerOpUsage {
+    #[serde(rename = "write_requests_count")]
     pub write_requests: f64,
+    #[serde(rename = "list_requests_count")]
     pub list_requests: f64,
+    #[serde(rename = "read_requests_count")]
     pub read_requests: f64,
+    #[serde(rename = "delete_requests_count")]
     pub delete_requests: f64,
     /// Requests that failed or were throttled (billed on most providers, add no value).
+    #[serde(rename = "failed_requests_count")]
     pub failed_requests: f64,
     pub download_bytes: f64,
     pub upload_bytes: f64,
     /// Downloaded bytes the application never asked for (range coalescing / chunk over-fetch).
     pub overread_bytes: f64,
     /// GETs avoided thanks to cache hits.
+    #[serde(rename = "cache_saved_reads_count")]
     pub cache_saved_reads: f64,
     pub cache_saved_bytes: f64,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ProviderCost {
     pub key: String,
     pub provider: String,
@@ -202,7 +208,7 @@ pub struct ProviderCost {
     pub cache_savings_usd: f64,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct CostReport {
     /// A price table applies: the target is a recognised cloud endpoint, or the profile chose a
     /// provider / custom pricing. Otherwise `selected` and `comparison` are empty.
@@ -210,9 +216,15 @@ pub struct CostReport {
     /// Why no cost is projected (when not applicable).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub not_applicable_reason: Option<String>,
+    /// Pricing key of `selected` (e.g. `aws-s3`, `custom`), when applicable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
     pub pricing_as_of: String,
+    #[serde(rename = "monthly_ops_count")]
     pub monthly_ops: f64,
+    #[serde(rename = "stored_gib")]
     pub stored_gb: f64,
+    #[serde(rename = "egress_ratio")]
     pub egress_fraction: f64,
     pub per_op: PerOpUsage,
     /// The provider matching the target (or the profile's choice / custom pricing).
@@ -325,6 +337,7 @@ pub fn cost_report(
                     })
                 ),
             }),
+            provider: None,
             pricing_as_of: PRICING_AS_OF.to_owned(),
             monthly_ops: spec.monthly_ops,
             stored_gb: spec.stored_gib,
@@ -341,6 +354,7 @@ pub fn cost_report(
     CostReport {
         applicable: true,
         not_applicable_reason: None,
+        provider: Some(selected.key.clone()),
         pricing_as_of: PRICING_AS_OF.to_owned(),
         monthly_ops: spec.monthly_ops,
         stored_gb: spec.stored_gib,

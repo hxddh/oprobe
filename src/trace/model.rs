@@ -1,14 +1,15 @@
 //! Raw trace records produced by instrumentation (one per backend request).
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// Storage API classification of a single backend request. Derived from the real HTTP
 /// request line (S3 / GCS / Azure / OSS / COS / B2 conventions) or the OpenDAL call for
 /// in-process backends.
-#[derive(
-    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
-)]
-#[serde(rename_all = "snake_case")]
+///
+/// Serialized as the API's name (`GetObject`, `UploadPart`, …): the same string a request row
+/// carries in `api`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Api {
     #[default]
     GetObject,
@@ -28,7 +29,7 @@ pub enum Api {
 }
 
 /// Billing bucket used by the cost model.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum BillingClass {
     /// PUT / POST / COPY (S3 "tier 1", GCS "class A").
@@ -43,7 +44,57 @@ pub enum BillingClass {
     Free,
 }
 
+impl Serialize for Api {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.label())
+    }
+}
+
+impl<'de> Deserialize<'de> for Api {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = std::borrow::Cow::<'de, str>::deserialize(d)?;
+        Ok(Api::from_label(&s))
+    }
+}
+
+impl JsonSchema for Api {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "Api".into()
+    }
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "type": "string",
+            "description": "Storage API name, e.g. GetObject (OpenDAL ServiceOperation)"
+        })
+    }
+}
+
 impl Api {
+    pub const ALL: [Api; 13] = [
+        Api::GetObject,
+        Api::HeadObject,
+        Api::PutObject,
+        Api::CreateMultipart,
+        Api::UploadPart,
+        Api::CompleteMultipart,
+        Api::AbortMultipart,
+        Api::ListObjects,
+        Api::DeleteObject,
+        Api::DeleteObjects,
+        Api::CopyObject,
+        Api::Control,
+        Api::Other,
+    ];
+
+    /// Inverse of [`Api::label`]; unknown names are [`Api::Other`].
+    pub fn from_label(s: &str) -> Api {
+        Api::ALL
+            .iter()
+            .copied()
+            .find(|a| a.label() == s)
+            .unwrap_or(Api::Other)
+    }
+
     pub fn label(&self) -> &'static str {
         match self {
             Api::GetObject => "GetObject",
@@ -78,7 +129,7 @@ impl Api {
 }
 
 /// Transport protocol a request travelled over.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Protocol {
     #[default]
@@ -90,7 +141,7 @@ pub enum Protocol {
 
 /// Sequential, non-overlapping phases of one backend request in microseconds.
 /// `total_us == queue + dns + tcp + proxy + tls + send + ttfb + body + stall` (±rounding).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct RequestTiming {
     /// Waiting for an in-flight request permit or a usable pooled connection.
     pub queue_us: u64,
@@ -120,7 +171,7 @@ impl RequestTiming {
 }
 
 /// One backend request (HTTP request or in-process backend call).
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct RequestRecord {
     pub api: Api,
     pub method: String,
@@ -141,6 +192,10 @@ pub struct RequestRecord {
     pub retry_after_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Remote address of the connection (the proxy's when tunnelling), when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<String>")]
+    pub remote: Option<std::net::SocketAddr>,
 }
 
 impl RequestRecord {

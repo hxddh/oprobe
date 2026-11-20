@@ -2,11 +2,12 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use hdrhistogram::Histogram;
 
+use super::log::{TraceLog, TraceRows, attempts, op_row, req_row};
 use super::model::{Api, Protocol, RequestRecord};
 use super::scope::OpScopeData;
 use super::snapshot::*;
@@ -316,6 +317,8 @@ pub struct OpCompletion {
     pub logical_read: u64,
     pub logical_write: u64,
     pub error: Option<String>,
+    /// Object key (or listed prefix) the operation worked on.
+    pub key: String,
     pub data: OpScopeData,
 }
 
@@ -355,6 +358,9 @@ impl Drop for InflightGuard {
     }
 }
 
+/// Trace log shards (each keeps `max_requests / TRACE_SHARDS` rows).
+const TRACE_SHARDS: usize = 16;
+
 /// `Recorder::frozen_elapsed_us` while the measurement window is open.
 const WINDOW_OPEN: u64 = u64::MAX;
 
@@ -379,6 +385,11 @@ pub struct Recorder {
     live_ops: Mutex<HashMap<u64, Instant>>,
     trees: Mutex<HashMap<u64, String>>,
     client: Mutex<ClientStats>,
+    /// Per-request / per-operation rows of the measurement window, sharded by operation id so
+    /// concurrent completions rarely contend.
+    trace: Vec<Mutex<TraceLog>>,
+    /// Safety rails fed with every completed operation (all phases).
+    guard: OnceLock<Arc<crate::guard::Guard>>,
 }
 
 impl Recorder {
@@ -405,7 +416,45 @@ impl Recorder {
                     .unwrap_or(1),
                 ..Default::default()
             }),
+            trace: (0..TRACE_SHARDS)
+                .map(|_| {
+                    Mutex::new(TraceLog::new(
+                        super::log::DEFAULT_MAX_REQUESTS.div_ceil(TRACE_SHARDS),
+                    ))
+                })
+                .collect(),
+            guard: OnceLock::new(),
         })
+    }
+
+    fn trace(&self, op_id: u64) -> std::sync::MutexGuard<'_, TraceLog> {
+        self.trace[(op_id as usize) % TRACE_SHARDS]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Cap of kept trace rows (`trace.max_requests`).
+    pub fn set_trace_limit(&self, max_requests: usize) {
+        for t in &self.trace {
+            t.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .set_max_requests(max_requests.div_ceil(TRACE_SHARDS));
+        }
+    }
+
+    /// Feed every completed operation's requests and bytes to `guard` (budgets).
+    pub fn set_guard(&self, guard: Arc<crate::guard::Guard>) {
+        let _ = self.guard.set(guard);
+    }
+
+    /// Take the trace rows recorded in the measurement window.
+    pub fn take_trace(&self) -> TraceRows {
+        let parts: Vec<TraceRows> = self
+            .trace
+            .iter()
+            .map(|t| t.lock().unwrap_or_else(|e| e.into_inner()).take())
+            .collect();
+        TraceRows::merge(parts)
     }
 
     fn agg(&self) -> std::sync::MutexGuard<'_, Agg> {
@@ -458,6 +507,9 @@ impl Recorder {
                 ..conn
             };
             drop(a);
+            for t in &self.trace {
+                t.lock().unwrap_or_else(|e| e.into_inner()).reset();
+            }
             self.wire_rx.store(0, Ordering::Relaxed);
             self.wire_tx.store(0, Ordering::Relaxed);
             self.peak_inflight_requests.store(
@@ -592,8 +644,16 @@ impl Recorder {
 
     /// Request issued outside any operation scope (rare: background OpenDAL work).
     pub fn record_unscoped_request(&self, r: &RequestRecord) {
+        if let Some(g) = self.guard.get() {
+            g.add(1, r.bytes_up + r.bytes_down);
+        }
         if self.is_measuring() {
             self.agg().record_request(r);
+            // Unscoped: its offset is not relative to an operation; it ended just now.
+            let now_us = self.window_start().elapsed().as_micros() as i64;
+            let mut row = req_row(r.clone(), 0, 0, 1);
+            row.t_us = now_us - r.timing.total_us as i64;
+            self.trace(0).push_req(row);
         }
     }
 
@@ -626,6 +686,18 @@ impl Recorder {
     /// Record a completed logical operation (only if it started inside the window).
     pub fn complete_op(&self, measured: bool, c: OpCompletion) {
         self.inflight_ops.fetch_sub(1, Ordering::Relaxed);
+        if let Some(g) = self.guard.get() {
+            let bytes: u64 = c
+                .data
+                .requests
+                .iter()
+                .map(|r| r.bytes_up + r.bytes_down)
+                .sum();
+            g.add(
+                c.data.requests.len() as u64 + c.data.dropped_requests,
+                bytes,
+            );
+        }
         let forget_live = || {
             self.live_ops
                 .lock()
@@ -739,6 +811,8 @@ impl Recorder {
         if qualifies {
             let ms = |v: u64| v as f64 / 1000.0;
             a.slow.push(SlowOp {
+                op_id: c.op_id,
+                key: c.key.clone(),
                 verb: c.verb.to_owned(),
                 latency_ms: lat_ms,
                 at_s,
@@ -750,12 +824,36 @@ impl Recorder {
                     client_ms: ms(bd[4]),
                 },
                 retries: c.data.retries,
-                requests: c.data.requests,
+                requests: c.data.requests.clone(),
                 await_tree: tree,
-                error: c.error,
+                error: c.error.clone(),
             });
             a.slow.sort_by(|x, y| y.latency_ms.total_cmp(&x.latency_ms));
             a.slow.truncate(SLOW_OPS_KEPT);
+        }
+        drop(a);
+
+        // Trace rows (moved out of the scope data: no per-request allocation).
+        let op_t_us = signed_offset_us(window_start, c.started);
+        let att = attempts(&c.data.requests);
+        let att = |i: usize| att.as_ref().map_or(1, |a| a[i]);
+        let row = op_row(
+            c.op_id,
+            c.verb,
+            c.key,
+            op_t_us,
+            c.latency_us,
+            bytes,
+            c.error,
+            throttled,
+            c.data.retries,
+            bd,
+            req_count,
+        );
+        let mut t = self.trace(c.op_id);
+        t.push_op(row);
+        for (i, r) in c.data.requests.into_iter().enumerate() {
+            t.push_req(req_row(r, c.op_id, op_t_us, att(i)));
         }
     }
 
@@ -991,6 +1089,14 @@ impl Recorder {
     }
 }
 
+/// `at - origin` in µs, negative when `at` is earlier.
+fn signed_offset_us(origin: Instant, at: Instant) -> i64 {
+    match at.checked_duration_since(origin) {
+        Some(d) => d.as_micros() as i64,
+        None => -(origin.duration_since(at).as_micros() as i64),
+    }
+}
+
 /// Exact split of one op's wall time into `[queue, cache, backend, retry, client]`
 /// microseconds using a sweep over its request intervals and retry backoff sleeps: an instant
 /// counts as *backend* if any request is on the network, else *queue* if any request is
@@ -1077,6 +1183,7 @@ mod tests {
             request_id: None,
             retry_after_ms: None,
             error: None,
+            remote: None,
         }
     }
 
@@ -1117,6 +1224,7 @@ mod tests {
                 logical_read: 0,
                 logical_write: 0,
                 error: None,
+                key: String::new(),
                 data: OpScopeData::default(),
             },
         );

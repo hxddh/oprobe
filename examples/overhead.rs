@@ -110,6 +110,7 @@ async fn round(
                                     logical_read: n as u64,
                                     logical_write: 0,
                                     error: None,
+                                    key: path.to_string(),
                                     data: scope.take(),
                                 },
                             );

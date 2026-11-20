@@ -58,11 +58,13 @@ fn aligned_offset(rng: &mut impl Rng, max: u64) -> u64 {
 }
 
 /// Execute `kind`. `slot` selects the scratch key for writes (bounded footprint via overwrite).
+/// `key` receives the object key (or listed prefix) as soon as it is chosen, also on failure.
 pub async fn execute(
     ctx: &OpCtx,
     kind: &OpKind,
     rng: &mut (impl Rng + Send),
     slot: u64,
+    key: &mut String,
 ) -> Result<OpOutcome> {
     let k = &ctx.knobs;
     let chunk = k.chunk_size.as_usize();
@@ -77,6 +79,7 @@ pub async fn execute(
     match kind {
         OpKind::Read { size } => {
             let obj = pick(rng)?;
+            key.clone_from(&obj.path);
             let full = size.map(|s| s.0 >= obj.size).unwrap_or(true);
             let range: Range<u64> = if full {
                 0..obj.size
@@ -109,6 +112,7 @@ pub async fn execute(
             footer_size,
         } => {
             let obj = pick(rng)?;
+            key.clone_from(&obj.path);
             let meta = ctx.op.stat(&obj.path).await?;
             let size = meta.content_length();
             let footer = footer_size.0.min(size);
@@ -146,6 +150,7 @@ pub async fn execute(
         }
         OpKind::Write { size } => {
             let path = format!("{}w-{slot:05}.bin", ctx.scratch_prefix);
+            key.clone_from(&path);
             let data = ctx.pool.slice(rng, size.as_usize());
             let len = data.len() as u64;
             let crc = (ctx.verify && slot.is_multiple_of(16)).then(|| crate::util::crc32c(&data));
@@ -160,6 +165,7 @@ pub async fn execute(
         }
         OpKind::MultipartWrite { size } => {
             let path = format!("{}mp-{slot:05}.bin", ctx.scratch_prefix);
+            key.clone_from(&path);
             let data = ctx.pool.slice(rng, size.as_usize());
             let len = data.len() as u64;
             let crc = (ctx.verify && slot.is_multiple_of(8)).then(|| crate::util::crc32c(&data));
@@ -186,6 +192,7 @@ pub async fn execute(
         }
         OpKind::Stat => {
             let obj = pick(rng)?;
+            key.clone_from(&obj.path);
             ctx.op.stat(&obj.path).await?;
             Ok(OpOutcome {
                 logical_read: 0,
@@ -199,6 +206,7 @@ pub async fn execute(
             } else {
                 parts[rng.gen_range(0..parts.len())].clone()
             };
+            key.clone_from(&prefix);
             let mut lister = ctx.op.lister_with(&prefix).recursive(*recursive).await?;
             while lister.try_next().await?.is_some() {}
             Ok(OpOutcome {
@@ -272,10 +280,15 @@ pub fn is_connect_failure(e: &opendal::Error) -> bool {
 /// layers, and [`opendal::Error::is_temporary`]. Substrings of the formatted error are never
 /// matched: object names (`obj-00429.bin`), dates and ports contain digits and words too.
 pub fn error_class(e: &anyhow::Error, last_status: Option<u16>) -> String {
+    match e.downcast_ref::<opendal::Error>() {
+        Some(oe) => error_class_of(oe, last_status),
+        None => "other".into(),
+    }
+}
+
+/// [`error_class`] of an OpenDAL error.
+pub fn error_class_of(oe: &opendal::Error, last_status: Option<u16>) -> String {
     use opendal::ErrorKind as K;
-    let Some(oe) = e.downcast_ref::<opendal::Error>() else {
-        return "other".into();
-    };
     let class = match oe.kind() {
         K::RateLimited => "rate_limited",
         K::PermissionDenied => "permission_denied",

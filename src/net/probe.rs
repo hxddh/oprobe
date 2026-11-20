@@ -18,7 +18,7 @@ use super::transport::HttpVersion;
 use crate::trace::Quantiles;
 use crate::trace::recorder::quantiles;
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ProbeSample {
     pub remote: String,
     pub status: u16,
@@ -34,7 +34,7 @@ pub struct ProbeSample {
     pub server_date: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ProbeReport {
     pub endpoint: String,
     pub host: String,

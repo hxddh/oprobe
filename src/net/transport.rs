@@ -30,7 +30,9 @@ use crate::trace::{
 };
 
 /// HTTP protocol preference.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum HttpVersion {
     /// Negotiate via ALPN (h2 preferred for https), HTTP/1.1 for plain http.
@@ -597,6 +599,7 @@ impl HttpTransport for TracingTransport {
             request_id: None,
             retry_after_ms: None,
             error: None,
+            remote: None,
         };
 
         // A request dropped before its response (timeout layer, tail-cut) still gets a record.

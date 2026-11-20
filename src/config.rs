@@ -444,7 +444,9 @@ impl WorkloadSpec {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum TransportMode {
     /// OpenDAL's default HTTP client (reqwest), observed through its extension points.
