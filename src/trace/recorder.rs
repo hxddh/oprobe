@@ -984,6 +984,7 @@ impl Recorder {
                 .clone(),
             open_loop: a.open_loop.clone(),
             interrupted: false,
+            effective_knobs: EffectiveKnobs::default(),
             timeline,
             slow_ops: a.slow.clone(),
         }

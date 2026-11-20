@@ -27,6 +27,10 @@ oprobe tune s3://bucket/oprobe --preset parquet --p99-ms 250 \
    `existing_prefix` when they fit), and HTTP/1.1 vs HTTP/2 for HTTPS. A cache win that relies on
    the whole generated test dataset fitting in the cache is flagged as dataset-size-dependent.
    A change is accepted only if it improves the objective by more than 3 % (noise guard).
+   For multipart writes, chunk candidates are clamped to the service's part-size limits first
+   (OpenDAL raises a write chunk to `write_multi_min_size`, 5 MiB on S3/GCS), so the tuner never
+   recommends a chunk OpenDAL would not use. Every report records the chunk that was actually
+   written with under `effective_knobs` (requested vs effective) and warns when they differ.
 6. **Confirmation** — the winner runs again for twice the trial duration; the report you get is
    from that run.
 

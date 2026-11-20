@@ -259,8 +259,32 @@ pub struct Snapshot {
     /// The run was stopped early (Ctrl-C / Stop): the window is shorter than configured.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub interrupted: bool,
+    /// What OpenDAL actually did with the knobs (after the service's limits were applied).
+    #[serde(default)]
+    pub effective_knobs: EffectiveKnobs,
     pub timeline: Vec<TimelinePoint>,
     pub slow_ops: Vec<SlowOp>,
+}
+
+/// Knob values as OpenDAL applies them, which can differ from what was requested.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct EffectiveKnobs {
+    /// `knobs.chunk_size` as requested (bytes).
+    pub requested_chunk_size: u64,
+    /// Chunk (multipart part size) OpenDAL writes with: the requested chunk clamped to the
+    /// service's `write_multi_min_size ..= write_multi_max_size` (reads use it unchanged).
+    pub write_chunk_size: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_min_part_size: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_max_part_size: Option<u64>,
+}
+
+impl EffectiveKnobs {
+    /// OpenDAL changed the requested write chunk.
+    pub fn write_chunk_clamped(&self) -> bool {
+        self.requested_chunk_size != 0 && self.write_chunk_size != self.requested_chunk_size
+    }
 }
 
 impl Snapshot {

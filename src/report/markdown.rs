@@ -34,6 +34,9 @@ pub fn render(r: &Report) -> String {
             "> ⚠️ **Interrupted** — the run was stopped early; results cover a shorter window than configured.\n"
         );
     }
+    for w in &r.warnings {
+        let _ = writeln!(md, "> ⚠️ {w}\n");
+    }
     let sm = &s.summary;
     let _ = writeln!(
         md,

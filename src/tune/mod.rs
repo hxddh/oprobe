@@ -333,6 +333,22 @@ impl Tuner<'_> {
     }
 }
 
+/// Chunk candidates as OpenDAL would write them on a service with `cap`: each clamped to the
+/// part-size limits, duplicates removed (order kept). Returns `(requested, effective)`.
+fn write_chunk_candidates(
+    cap: &opendal::Capability,
+    chunks: &[ByteSize],
+) -> (Vec<ByteSize>, Vec<ByteSize>) {
+    let mut out: Vec<ByteSize> = Vec::new();
+    for c in chunks {
+        let e = ByteSize(crate::engine::stack::effective_write_chunk(cap, c.as_usize()) as u64);
+        if !out.contains(&e) {
+            out.push(e);
+        }
+    }
+    (chunks.to_vec(), out)
+}
+
 /// How long to pause after a trial: nothing unless it was throttled; then the configured
 /// cooldown or the service's `Retry-After` from *this* trial (capped at [`MAX_RETRY_AFTER`]),
 /// whichever is longer. `Retry-After` is honored even with `--cooldown 0`.
@@ -482,13 +498,36 @@ pub async fn tune(
     let vectored = has(&|o| matches!(o, OpKind::ParquetScan { .. }));
     let full_reads = has(&|o| matches!(o, OpKind::Read { size: None }));
     let reads = has(&|o| !o.is_write());
-    let chunks = [
+    let mut chunks = vec![
         ByteSize::mib(1),
         ByteSize::mib(4),
         ByteSize::mib(8),
         ByteSize::mib(16),
         ByteSize::mib(32),
     ];
+    if multipart {
+        // OpenDAL silently raises (lowers) write chunks to the service's minimum (maximum)
+        // multipart part size: only try chunk sizes it actually uses.
+        let (requested, effective) = write_chunk_candidates(&session.capability, &chunks);
+        if effective != requested {
+            notes.push(format!(
+                "chunk sizes tried: {} — {} would be raised to the service's minimum part size {} by OpenDAL",
+                effective.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(", "),
+                requested
+                    .iter()
+                    .filter(|c| !effective.contains(c))
+                    .map(|c| c.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                session
+                    .capability
+                    .write_multi_min_size
+                    .map(|m| ByteSize(m as u64).to_string())
+                    .unwrap_or_default()
+            ));
+        }
+        chunks = effective;
+    }
     let ios = [1usize, 2, 4, 8, 16];
     let gaps = [
         ByteSize::b(0),
@@ -685,6 +724,24 @@ pub async fn tune(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn write_chunk_candidates_respect_the_minimum_part_size() {
+        let mut cap = opendal::Capability::default();
+        let list = [
+            ByteSize::mib(1),
+            ByteSize::mib(4),
+            ByteSize::mib(8),
+            ByteSize::mib(16),
+        ];
+        assert_eq!(write_chunk_candidates(&cap, &list).1, list.to_vec());
+        cap.write_multi_min_size = Some(5 << 20);
+        cap.write_multi_max_size = Some(10 << 20);
+        assert_eq!(
+            write_chunk_candidates(&cap, &list).1,
+            vec![ByteSize::mib(5), ByteSize::mib(8), ByteSize::mib(10)]
+        );
+    }
 
     #[test]
     fn cooldown_honors_capped_retry_after_per_trial() {

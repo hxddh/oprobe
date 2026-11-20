@@ -1162,3 +1162,36 @@ fn failed_operations_breach_the_default_sla() {
     let bad = run_cli_against(&lab.endpoint_url, &["--max-error-rate", "150%"]);
     assert_eq!(bad.status.code(), Some(1));
 }
+
+/// OpenDAL raises S3 write chunks to the 5 MiB minimum part size: the report says which chunk
+/// was actually used instead of presenting the requested one as measured.
+#[tokio::test(flavor = "multi_thread")]
+async fn effective_write_chunk_is_reported() {
+    let lab = lab(LabConfig::default()).await;
+    let mut p = lab.profile("bkt");
+    small(&mut p, Preset::Checkpoint);
+    p.workload.mix = vec![OpSpec {
+        weight: 1,
+        op: OpKind::MultipartWrite {
+            size: ByteSize::mib(6),
+        },
+    }];
+    p.knobs.chunk_size = ByteSize::mib(1);
+    p.knobs.concurrency = 2;
+    let (s, c, prof) = run_once(p, 400).await;
+    let e = &s.effective_knobs;
+    assert_eq!(e.requested_chunk_size, ByteSize::mib(1).0);
+    assert_eq!(e.write_chunk_size, ByteSize::mib(5).0);
+    assert_eq!(e.service_min_part_size, Some(ByteSize::mib(5).0));
+    // 6 MiB in 5 MiB parts: two UploadPart requests per object, not six.
+    let parts = api(&s, Api::UploadPart).count as f64;
+    let writes = s.verbs.iter().map(|v| v.count).sum::<u64>() as f64;
+    assert!(parts / writes <= 2.5, "{parts} parts for {writes} writes");
+    let r = Report::build(&prof, &prof.knobs, s, c, vec![]);
+    assert_eq!(r.effective_knobs.write_chunk_size, ByteSize::mib(5).0);
+    assert!(
+        r.warnings.iter().any(|w| w.contains("5MiB parts")),
+        "{:?}",
+        r.warnings
+    );
+}

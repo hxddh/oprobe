@@ -150,6 +150,8 @@ pub struct Session {
     pool: Arc<PayloadPool>,
     written: Arc<Mutex<Vec<(String, u32)>>>,
     pub cancel: Cancel,
+    /// The service's full capability (limits OpenDAL applies, e.g. the minimum part size).
+    pub capability: opendal::Capability,
     trial: AtomicU64,
 }
 
@@ -209,6 +211,7 @@ impl Session {
             })
             .max()
             .unwrap_or(0);
+        let capability = base.info().capability();
         Ok(Self {
             profile,
             base,
@@ -220,6 +223,7 @@ impl Session {
             pool: Arc::new(PayloadPool::new(max_write)),
             written: Arc::new(Mutex::new(Vec::new())),
             cancel,
+            capability,
             trial: AtomicU64::new(0),
         })
     }
@@ -325,6 +329,7 @@ impl Session {
         let mut snap = recorder.snapshot();
         snap.phase = Phase::Done;
         snap.interrupted = self.cancel.is_cancelled();
+        snap.effective_knobs = super::stack::effective_knobs(&self.capability, knobs);
         if let Some(cb) = &progress {
             cb(Progress::Snapshot(Box::new(snap.clone())));
         }

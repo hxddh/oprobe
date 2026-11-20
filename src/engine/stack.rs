@@ -11,6 +11,31 @@ use opendal::layers::{RetryLayer, TailCutLayer, TimeoutLayer};
 use serde::{Deserialize, Serialize};
 
 use crate::config::Knobs;
+use crate::trace::EffectiveKnobs;
+
+/// The chunk OpenDAL writes with when asked for `requested` bytes: it raises it to the
+/// service's minimum multipart part size and lowers it to the maximum
+/// (`opendal_core` `WriteContext::calculate_chunk_size`).
+pub fn effective_write_chunk(cap: &opendal::Capability, requested: usize) -> usize {
+    let mut size = requested;
+    if let Some(max) = cap.write_multi_max_size {
+        size = size.min(max);
+    }
+    if let Some(min) = cap.write_multi_min_size {
+        size = size.max(min);
+    }
+    size
+}
+
+/// The effective knobs for `k` on a service with capability `cap`.
+pub fn effective_knobs(cap: &opendal::Capability, k: &Knobs) -> EffectiveKnobs {
+    EffectiveKnobs {
+        requested_chunk_size: k.chunk_size.0,
+        write_chunk_size: effective_write_chunk(cap, k.chunk_size.as_usize()) as u64,
+        service_min_part_size: cap.write_multi_min_size.map(|v| v as u64),
+        service_max_part_size: cap.write_multi_max_size.map(|v| v as u64),
+    }
+}
 
 /// Longest per-I/O timeout (`TimeoutLayer::with_io_timeout`).
 pub const MAX_IO_TIMEOUT: Duration = Duration::from_secs(30);

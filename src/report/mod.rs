@@ -78,6 +78,8 @@ pub struct Report {
     pub target: TargetInfo,
     pub workload: WorkloadSpec,
     pub knobs: Knobs,
+    /// What OpenDAL actually used (e.g. the write chunk after the service's part-size limits).
+    pub effective_knobs: crate::trace::EffectiveKnobs,
     pub sla: Sla,
     /// The result checked against `sla` (`oprobe run` exits 3 when enforced and breached).
     pub sla_verdict: SlaVerdict,
@@ -114,6 +116,20 @@ impl Report {
         let mut options = crate::util::redact_options(&t.options);
         options.remove("ca_cert_pem");
         let interrupted = snapshot.interrupted;
+        let effective_knobs = snapshot.effective_knobs.clone();
+        let mut warnings = warnings;
+        let chunked_writes = workload
+            .mix
+            .iter()
+            .any(|m| m.weight > 0 && matches!(m.op, crate::config::OpKind::MultipartWrite { .. }));
+        if chunked_writes && effective_knobs.write_chunk_clamped() {
+            warnings.push(format!(
+                "chunk_size {} is outside {}'s multipart part-size limits: OpenDAL wrote {} parts (the requested size was not measured)",
+                crate::util::ByteSize(effective_knobs.requested_chunk_size),
+                t.scheme,
+                crate::util::ByteSize(effective_knobs.write_chunk_size)
+            ));
+        }
         Self {
             schema: SCHEMA.to_owned(),
             oprobe_version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -133,6 +149,7 @@ impl Report {
             },
             workload,
             knobs: knobs.clone(),
+            effective_knobs,
             sla: profile.sla.clone(),
             sla_verdict,
             result: snapshot,
