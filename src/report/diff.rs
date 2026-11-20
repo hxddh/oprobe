@@ -27,6 +27,12 @@ pub struct Thresholds {
     pub fail_on_new_throttling: bool,
     /// Skip latency checks for operations with fewer samples.
     pub min_samples: u64,
+    /// Compare runs of different workloads without failing (otherwise a gate failure).
+    #[serde(default)]
+    pub allow_workload_change: bool,
+    /// Compare runs against different targets without failing (otherwise a gate failure).
+    #[serde(default)]
+    pub allow_target_change: bool,
 }
 
 impl Default for Thresholds {
@@ -42,6 +48,8 @@ impl Default for Thresholds {
             cost_pct: 10.0,
             fail_on_new_throttling: true,
             min_samples: 30,
+            allow_workload_change: false,
+            allow_target_change: false,
         }
     }
 }
@@ -68,14 +76,154 @@ pub struct Check {
     pub note: String,
 }
 
+/// What part of the setup a [`ConfigChange`] is in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangeKind {
+    /// What was run (preset, mix, dataset, access pattern, rate…): results are not comparable.
+    Workload,
+    /// Where it ran (scheme, bucket/prefix, endpoint, backend options).
+    Target,
+    /// Client configuration: the legitimate subject of an A/B comparison.
+    Knobs,
+    /// The machine, network path or oprobe version that measured.
+    Host,
+}
+
+impl ChangeKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            ChangeKind::Workload => "workload",
+            ChangeKind::Target => "target",
+            ChangeKind::Knobs => "knobs",
+            ChangeKind::Host => "host",
+        }
+    }
+}
+
+/// One setting that differs between baseline and candidate.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ConfigChange {
+    pub kind: ChangeKind,
+    /// Dotted path, e.g. `knobs.concurrency`, `workload.mix`.
+    pub field: String,
+    pub baseline: String,
+    pub candidate: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DiffReport {
     pub passed: bool,
     pub baseline: String,
     pub candidate: String,
     pub thresholds: Thresholds,
+    /// Every workload / target / knob / host setting that differs between the two runs.
+    pub config_changes: Vec<ConfigChange>,
     pub checks: Vec<Check>,
     pub warnings: Vec<String>,
+}
+
+/// Flatten a JSON value into `prefix.a.b = value` leaves (arrays are compared whole).
+fn flatten(prefix: &str, v: &serde_json::Value, out: &mut std::collections::BTreeMap<String, String>) {
+    match v {
+        serde_json::Value::Object(m) => {
+            for (k, x) in m {
+                flatten(&format!("{prefix}.{k}"), x, out);
+            }
+        }
+        serde_json::Value::String(s) => {
+            out.insert(prefix.to_owned(), s.clone());
+        }
+        other => {
+            out.insert(prefix.to_owned(), other.to_string());
+        }
+    }
+}
+
+fn changes_of<T: Serialize>(
+    kind: ChangeKind,
+    prefix: &str,
+    b: &T,
+    c: &T,
+    ignore: &[&str],
+    out: &mut Vec<ConfigChange>,
+) {
+    let (mut bm, mut cm) = (Default::default(), Default::default());
+    flatten(prefix, &serde_json::to_value(b).unwrap_or_default(), &mut bm);
+    flatten(prefix, &serde_json::to_value(c).unwrap_or_default(), &mut cm);
+    let keys: std::collections::BTreeSet<&String> = bm.keys().chain(cm.keys()).collect();
+    for k in keys {
+        if ignore.iter().any(|i| k == &format!("{prefix}.{i}")) {
+            continue;
+        }
+        let (bv, cv) = (bm.get(k), cm.get(k));
+        if bv != cv {
+            let show = |v: Option<&String>| v.cloned().unwrap_or_else(|| "(unset)".into());
+            out.push(ConfigChange {
+                kind,
+                field: k.clone(),
+                baseline: show(bv),
+                candidate: show(cv),
+            });
+        }
+    }
+}
+
+/// Settings that differ between two reports. The measurement window (duration, warmup,
+/// max_ops), the cleanup policy and the dataset's persistence do not change what is measured.
+pub fn config_changes(base: &Report, cand: &Report) -> Vec<ConfigChange> {
+    let mut out = Vec::new();
+    changes_of(
+        ChangeKind::Workload,
+        "workload",
+        &base.workload,
+        &cand.workload,
+        &["duration", "warmup", "max_ops", "cleanup", "dataset.persist"],
+        &mut out,
+    );
+    let target = |r: &Report| {
+        serde_json::json!({
+            "scheme": r.target.scheme,
+            "display": crate::util::display_url(&r.target.display),
+            "endpoint": r.target.endpoint,
+            "options": r.target.options,
+        })
+    };
+    changes_of(
+        ChangeKind::Target,
+        "target",
+        &target(base),
+        &target(cand),
+        &[],
+        &mut out,
+    );
+    changes_of(
+        ChangeKind::Knobs,
+        "knobs",
+        &base.knobs,
+        &cand.knobs,
+        &[],
+        &mut out,
+    );
+    changes_of(
+        ChangeKind::Knobs,
+        "effective_knobs",
+        &base.effective_knobs,
+        &cand.effective_knobs,
+        &["requested_chunk_size"],
+        &mut out,
+    );
+    let host = |r: &Report| {
+        serde_json::json!({
+            "os": r.host.os,
+            "arch": r.host.arch,
+            "cpus": r.host.cpus,
+            "proxy": r.target.proxy,
+            "oprobe_version": r.oprobe_version,
+        })
+    };
+    changes_of(ChangeKind::Host, "host", &host(base), &host(cand), &[], &mut out);
+    out
 }
 
 /// Relative throttle-rate increase (percent) that fails the gate when the baseline was throttled.
@@ -189,18 +337,76 @@ pub fn diff(base: &Report, cand: &Report, t: &Thresholds) -> DiffReport {
             "measurement windows differ a lot ({bd:.1}s vs {cd:.1}s): short windows are noisier and may miss slow effects"
         ));
     }
-    if base.target.display != cand.target.display {
+    let changes = config_changes(base, cand);
+    let fields = |k: ChangeKind| {
+        changes
+            .iter()
+            .filter(|c| c.kind == k)
+            .map(|c| format!("{} {} → {}", c.field, c.baseline, c.candidate))
+            .collect::<Vec<_>>()
+    };
+    let mut b = Builder { checks: Vec::new() };
+    for (kind, allowed, flag) in [
+        (
+            ChangeKind::Workload,
+            t.allow_workload_change,
+            "--allow-workload-change",
+        ),
+        (
+            ChangeKind::Target,
+            t.allow_target_change,
+            "--allow-target-change",
+        ),
+    ] {
+        let diffs = fields(kind);
+        b.checks.push(Check {
+            name: format!("same {}", kind.label()),
+            baseline: 0.0,
+            candidate: diffs.len() as f64,
+            change_pct: 0.0,
+            limit: if allowed {
+                format!("informational ({flag})")
+            } else {
+                "identical".into()
+            },
+            status: if diffs.is_empty() || allowed {
+                Status::Pass
+            } else {
+                Status::Fail
+            },
+            note: diffs.join("; "),
+        });
+        if !diffs.is_empty() {
+            warnings.push(if allowed {
+                format!(
+                    "the {} differs ({}): results may not be comparable",
+                    kind.label(),
+                    diffs.join("; ")
+                )
+            } else {
+                format!(
+                    "the {} differs ({}): the runs are not comparable, so the gate fails; pass {flag} to compare anyway",
+                    kind.label(),
+                    diffs.join("; ")
+                )
+            });
+        }
+    }
+    let knob_diffs = fields(ChangeKind::Knobs);
+    if !knob_diffs.is_empty() {
         warnings.push(format!(
-            "targets differ: `{}` vs `{}`",
-            crate::util::display_url(&base.target.display),
-            crate::util::display_url(&cand.target.display)
+            "client knobs differ ({}): an A/B comparison of the configuration — changes below are caused by it",
+            knob_diffs.join("; ")
         ));
     }
-    if base.workload.preset != cand.workload.preset || base.workload.mix != cand.workload.mix {
-        warnings.push("workloads differ; comparisons may not be meaningful".into());
+    let host_diffs = fields(ChangeKind::Host);
+    if !host_diffs.is_empty() {
+        warnings.push(format!(
+            "measured from a different host or oprobe ({}): differences may come from the client machine, not the storage",
+            host_diffs.join("; ")
+        ));
     }
     let (bs, cs) = (&base.result, &cand.result);
-    let mut b = Builder { checks: Vec::new() };
     let floor = format!(" & > {}ms", t.min_latency_delta_ms);
 
     b.lower_worse(
@@ -374,6 +580,7 @@ pub fn diff(base: &Report, cand: &Report, t: &Thresholds) -> DiffReport {
             cand.generated_at
         ),
         thresholds: t.clone(),
+        config_changes: changes,
         checks: b.checks,
         warnings,
     }
@@ -408,6 +615,21 @@ impl DiffReport {
             dim("candidate"),
             self.candidate
         );
+        if !self.config_changes.is_empty() {
+            let _ = writeln!(out, "\n{}", bold(&cyan("CONFIGURATION CHANGES")));
+            let rows: Vec<Vec<String>> = self
+                .config_changes
+                .iter()
+                .map(|c| {
+                    let kind = match c.kind {
+                        ChangeKind::Workload | ChangeKind::Target => red(c.kind.label()),
+                        _ => yellow(c.kind.label()),
+                    };
+                    vec![kind, c.field.clone(), c.baseline.clone(), c.candidate.clone()]
+                })
+                .collect();
+            out.push_str(&table(&["kind", "setting", "baseline", "candidate"], &rows, 2));
+        }
         for w in &self.warnings {
             let _ = writeln!(out, "  {} {w}", yellow("warning:"));
         }
@@ -456,6 +678,23 @@ impl DiffReport {
             self.baseline,
             self.candidate
         );
+        if !self.config_changes.is_empty() {
+            let _ = writeln!(
+                md,
+                "**Configuration changes**\n\n| kind | setting | baseline | candidate |\n|---|---|---|---|"
+            );
+            for c in &self.config_changes {
+                let _ = writeln!(
+                    md,
+                    "| {} | `{}` | {} | {} |",
+                    c.kind.label(),
+                    c.field,
+                    c.baseline,
+                    c.candidate
+                );
+            }
+            md.push('\n');
+        }
         for w in &self.warnings {
             let _ = writeln!(md, "> ⚠️ {w}\n");
         }
@@ -515,6 +754,14 @@ impl DiffReport {
                 esc(&c.name)
             );
             match c.status {
+                Status::Fail if c.name.starts_with("same ") => {
+                    let _ = write!(
+                        x,
+                        "<failure message=\"{}\">{}</failure>",
+                        esc(&format!("{}: differs", c.name)),
+                        esc(&c.note)
+                    );
+                }
                 Status::Fail => {
                     let _ = write!(
                         x,
@@ -576,6 +823,61 @@ mod tests {
             .find(|c| c.name == name)
             .unwrap_or_else(|| panic!("no check {name}: {:?}", d.checks))
             .status
+    }
+
+    #[test]
+    fn configuration_changes_are_reported_and_gate_workload_and_target() {
+        let b = report(&["stat"], 0, 1000);
+        // Knobs differ: legitimate A/B, passes with a prominent warning.
+        let mut c = b.clone();
+        c.knobs.concurrency = 64;
+        let d = diff(&b, &c, &Thresholds::default());
+        assert!(d.passed, "{}", d.render_terminal());
+        assert_eq!(
+            d.config_changes,
+            vec![ConfigChange {
+                kind: ChangeKind::Knobs,
+                field: "knobs.concurrency".into(),
+                baseline: "16".into(),
+                candidate: "64".into(),
+            }]
+        );
+        assert!(d.warnings.iter().any(|w| w.contains("knobs.concurrency 16 → 64")));
+        assert!(d.render_terminal().contains("CONFIGURATION CHANGES"));
+        assert!(d.render_markdown().contains("`knobs.concurrency`"));
+
+        // Workload differs: fails unless allowed.
+        let mut c = b.clone();
+        c.workload.access = crate::config::Access::Zipf(1.1);
+        c.workload.duration = crate::util::HumanDuration::secs(99);
+        let d = diff(&b, &c, &Thresholds::default());
+        assert!(!d.passed);
+        assert_eq!(status(&d, "same workload"), Status::Fail);
+        assert_eq!(d.config_changes.len(), 1, "duration is not a workload change");
+        assert!(d.render_junit().contains("same workload: differs"));
+        let allow = Thresholds {
+            allow_workload_change: true,
+            ..Thresholds::default()
+        };
+        assert!(diff(&b, &c, &allow).passed);
+
+        // Target differs: fails unless allowed.
+        let mut c = b.clone();
+        c.target.display = "s3://other".into();
+        let d = diff(&b, &c, &Thresholds::default());
+        assert_eq!(status(&d, "same target"), Status::Fail);
+        let allow = Thresholds {
+            allow_target_change: true,
+            ..Thresholds::default()
+        };
+        assert!(diff(&b, &c, &allow).passed);
+
+        // Host differs: warning only.
+        let mut c = b.clone();
+        c.host.cpus += 1;
+        let d = diff(&b, &c, &Thresholds::default());
+        assert!(d.passed);
+        assert!(d.warnings.iter().any(|w| w.contains("host.cpus")), "{:?}", d.warnings);
     }
 
     #[test]

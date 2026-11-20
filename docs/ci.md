@@ -14,6 +14,8 @@ Exit codes: `0` pass · `3` regression · `1` error (bad input, unreachable targ
 
 | Check | Default limit | Flag |
 |---|---|---|
+| same workload (preset, mix, dataset, access, rate, verify, seed) | must be identical | `--allow-workload-change` |
+| same target (scheme, bucket/prefix, endpoint, options) | must be identical | `--allow-target-change` |
 | throughput (ops/s, MiB/s) | −10 % | `--max-throughput-drop` |
 | p50 per operation | +20 % and > 1 ms | `--max-p50-increase`, `--min-latency-delta-ms` |
 | p99 per operation | +20 % and > 1 ms | `--max-p99-increase` |
@@ -22,10 +24,17 @@ Exit codes: `0` pass · `3` regression · `1` error (bad input, unreachable targ
 | CRC32C corruption | must be 0 | always |
 | requests per op | +10 % | `--max-request-amp-increase` |
 | read amplification | +10 % | `--max-read-amp-increase` |
-| cost per 1M ops | +10 % | `--max-cost-increase` |
+| cost per 1M ops (when a price table applies to both) | +10 % | `--max-cost-increase` |
 
 Operations with fewer than `--min-samples` (30) samples in either report are skipped for latency
-checks. A warning is printed if the two reports target different storage or workloads.
+checks.
+
+Every setting that differs between the two reports is listed first under **CONFIGURATION
+CHANGES** (also `config_changes` in `--json`, and in the Markdown summary): a different workload
+or target fails the gate (the numbers are not comparable), different client knobs (e.g.
+`knobs.concurrency 16 → 64`) are reported as an A/B comparison, and a different host, proxy or
+oprobe version is a warning. The measurement window (`duration`, `warmup`, `max_ops`) is not a
+workload change.
 
 ## Determinism tips
 

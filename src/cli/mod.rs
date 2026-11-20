@@ -920,6 +920,8 @@ fn cmd_diff(a: DiffArgs) -> Result<ExitCode> {
         cost_pct: a.max_cost_increase,
         fail_on_new_throttling: !a.allow_throttling,
         min_samples: a.min_samples,
+        allow_workload_change: a.allow_workload_change,
+        allow_target_change: a.allow_target_change,
     };
     let d = diff(&base, &cand, &t);
     if let Some(p) = &a.markdown {

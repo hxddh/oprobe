@@ -439,6 +439,12 @@ pub struct DiffArgs {
     /// Do not fail when the candidate starts getting throttled
     #[arg(long)]
     pub allow_throttling: bool,
+    /// Do not fail when the workload differs (preset, mix, dataset, access, rate)
+    #[arg(long)]
+    pub allow_workload_change: bool,
+    /// Do not fail when the target differs (scheme, bucket/prefix, endpoint, options)
+    #[arg(long)]
+    pub allow_target_change: bool,
     /// Write a Markdown summary (PR comment / job summary)
     #[arg(long, value_name = "FILE")]
     pub markdown: Option<PathBuf>,
