@@ -65,7 +65,7 @@ fn result() -> impl IntoElement {
         let Some(t) = s.tuned.get() else {
             return view().into_element();
         };
-        let k = s.knobs.get_untracked();
+        let k = &t.knobs;
         let sm = &t.summary;
         let mut c = card("Recommended configuration").child(
             row()
@@ -134,8 +134,8 @@ pub fn tune_page() -> impl IntoElement {
                         row()
                             .items_end()
                             .child(picker("Objective", &[("throughput", "Max throughput"), ("latency", "Min p99 latency"), ("cost", "Min cost per op")], s.objective).w(px(200.0)))
-                            .child(field("Trial length (s)", "4", s.trial_secs).w(px(130.0)))
-                            .child(field("Max trials", "16", s.max_trials).w(px(110.0))),
+                            .child(field("Trial length", "e.g. 5s", s.trial_secs).w(px(130.0)))
+                            .child(field("Max trials", "e.g. 24", s.max_trials).w(px(110.0))),
                     ),
             )
             .child(failure_banner())

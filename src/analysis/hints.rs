@@ -15,6 +15,52 @@ fn h(title: &str, steps: &[&str]) -> Hint {
     }
 }
 
+/// Whether `e` (lower-cased) mentions HTTP status `code` as a status, not as part of an object
+/// name, date, port or request id: `status: 403`, `status code 403`, `(403`, `403 forbidden`,
+/// `http 403`, or the code as a standalone word (` 403 `, `403,`).
+fn has_status(e: &str, code: u16) -> bool {
+    let c = code.to_string();
+    let bytes = e.as_bytes();
+    let mut from = 0;
+    while let Some(off) = e[from..].find(&c) {
+        let i = from + off;
+        let j = i + c.len();
+        from = j;
+        let before = if i == 0 { None } else { Some(bytes[i - 1]) };
+        let after = bytes.get(j).copied();
+        // Part of a longer number or identifier (obj-00403.bin, :4030, 2026-04-03).
+        let glued = |b: Option<u8>| {
+            b.is_some_and(|b| {
+                b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b':' | b'/')
+            })
+        };
+        let prefix = &e[..i];
+        let labelled = [
+            "status: ",
+            "status:",
+            "status code ",
+            "status code: ",
+            "status=",
+            "http ",
+            "code: ",
+        ]
+        .iter()
+        .any(|l| prefix.ends_with(l));
+        if labelled && !glued(after) {
+            return true;
+        }
+        let open = matches!(before, None | Some(b' ' | b'(' | b'[' | b'"' | b'\''));
+        let close = matches!(
+            after,
+            None | Some(b' ' | b')' | b']' | b',' | b';' | b'"' | b'\'')
+        );
+        if open && close && !glued(before) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Map an error chain to a human hint. `scheme` is the storage scheme (s3, gcs, ...).
 pub fn hint_for(error_chain: &str, scheme: &str) -> Option<Hint> {
     let e = error_chain.to_ascii_lowercase();
@@ -65,14 +111,35 @@ pub fn hint_for(error_chain: &str, scheme: &str) -> Option<Hint> {
             ],
         ));
     }
+    if has("failed to load signing credential")
+        || has("no valid credential")
+        || has("no credential")
+        || has("credential not found")
+        || has("credentials not found")
+        || has("could not load credentials")
+        || has("missing credentials")
+        || has("unable to load credentials")
+    {
+        return Some(h(
+            "No credentials found for the storage service",
+            &[
+                creds,
+                "Using a named profile? Export AWS_PROFILE (or set `credential_path` / `config_path` for other services).",
+                "Public bucket? Pass `--anonymous` to send unsigned requests.",
+                "Run `oprobe doctor` to see which credential sources were found.",
+            ],
+        ));
+    }
     if has("signaturedoesnotmatch")
         || has("invalidaccesskeyid")
         || has("invalid access key")
         || has("accessdenied")
         || has("permission denied")
         || has("permissiondenied")
-        || has("403")
-        || has("401")
+        || has_status(&e, 403)
+        || has_status(&e, 401)
+        || has("forbidden")
+        || has("unauthorized")
     {
         return Some(h(
             "Request rejected by the storage service (auth / permission)",
@@ -84,15 +151,15 @@ pub fn hint_for(error_chain: &str, scheme: &str) -> Option<Hint> {
             ],
         ));
     }
-    if has("nosuchbucket") || (has("404") && has("bucket")) {
+    if has("nosuchbucket") || (has_status(&e, 404) && has("bucket")) {
         return Some(h(
             "Bucket does not exist",
             &["Check the bucket name and region/endpoint in the target URL."],
         ));
     }
     if has("slowdown")
-        || has("429")
-        || has("503")
+        || has_status(&e, 429)
+        || has_status(&e, 503)
         || has("too many requests")
         || has("ratelimited")
         || has("rate_limited")
@@ -201,5 +268,61 @@ mod tests {
                 .contains("clock")
         );
         assert!(hint_for("all good", "s3").is_none());
+    }
+
+    #[test]
+    fn status_codes_match_as_tokens_only() {
+        // Object names, ports and dates containing the digits are not statuses.
+        for e in [
+            "Unexpected at read => path: oprobe-run-x/data/obj-00429.bin",
+            "connect to minio:4030 failed",
+            "object obj-00403.bin written at 2026-04-03",
+            "request id 1503a9f2",
+        ] {
+            let t = hint_for(e, "s3").map(|h| h.title);
+            assert!(
+                t.as_deref()
+                    .is_none_or(|t| !t.contains("auth") && !t.contains("throttling")),
+                "{e}: {t:?}"
+            );
+        }
+        for e in [
+            "Unexpected => status: 403, body: <Error>",
+            "PermissionDenied (persistent) at stat, context: { status: 403 }",
+            "http 401 Unauthorized",
+            "request failed (403 Forbidden)",
+        ] {
+            assert!(hint_for(e, "s3").unwrap().title.contains("auth"), "{e}");
+        }
+        assert!(
+            hint_for("status: 503 Service Unavailable", "s3")
+                .unwrap()
+                .title
+                .contains("throttling")
+        );
+        assert!(
+            hint_for("got 429 too many", "s3")
+                .unwrap()
+                .title
+                .contains("throttling")
+        );
+    }
+
+    #[test]
+    fn missing_credentials_get_their_own_hint() {
+        let h = hint_for(
+            "PermissionDenied at write => failed to load signing credential",
+            "s3",
+        )
+        .unwrap();
+        assert!(h.title.contains("No credentials"), "{}", h.title);
+        assert!(h.steps.iter().any(|s| s.contains("--anonymous")));
+        assert!(h.steps.iter().any(|s| s.contains("AWS_PROFILE")));
+        assert!(
+            hint_for("no valid credential found", "gcs")
+                .unwrap()
+                .title
+                .contains("No credentials")
+        );
     }
 }

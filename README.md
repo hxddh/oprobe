@@ -111,8 +111,9 @@ oprobe diff baseline.json candidate.json --junit oprobe.xml --markdown oprobe.md
 ```
 
 All test data is written under a unique `oprobe-run-<timestamp>-<id>/` prefix and deleted (and
-verified deleted) when the run ends — also on errors and Ctrl-C. `oprobe cleanup` sweeps leftovers
-of killed runs.
+verified deleted) when the run ends — also on errors and Ctrl-C, and when you quit the workbench
+mid-run. An interrupted `oprobe run` / `oprobe tune` prints its partial results and exits with code
+130. `oprobe cleanup` sweeps leftovers of killed runs.
 
 ## Commands
 

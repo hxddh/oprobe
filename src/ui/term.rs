@@ -2,16 +2,19 @@
 //! Event conversion follows NSH's own terminal host (`nsh-tui-host`, Apache-2.0).
 
 use std::io;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
 use crossterm::{ExecutableCommand, terminal};
 use nsh_core::element::Root;
 use nsh_platform_tui::{
-    AppOptions, AppView, Input, Modifiers, MouseButton, MouseInput, MouseKind, RunEvent, run_app,
+    AppOptions, AppView, ColorDepth, Input, Modifiers, MouseButton, MouseInput, MouseKind,
+    RunEvent, run_app,
 };
 use ratatui_core::terminal::Terminal;
 use ratatui_crossterm::CrosstermBackend;
+
+use crate::ui::bridge;
 
 fn modifiers(keys: KeyModifiers) -> Modifiers {
     Modifiers {
@@ -122,30 +125,89 @@ impl Drop for Guard {
     }
 }
 
+fn is_ctrl_c(ev: &Event) -> bool {
+    matches!(ev, Event::Key(k)
+        if k.kind == KeyEventKind::Press
+            && k.code == KeyCode::Char('c')
+            && k.modifiers == KeyModifiers::CONTROL)
+}
+
 /// Run the app full-screen in the current terminal until the user quits (Ctrl+C).
+///
+/// Ctrl+C while a job runs does not abandon it: the job is stopped, the UI shows that it is
+/// cleaning up its test data, and the app exits once it has (30 s at most). A second Ctrl+C
+/// exits at once.
 pub fn run() -> io::Result<()> {
     let mut options = AppOptions::default();
-    options.ui_sets = vec![nsh_base::registry(), crate::registry()];
+    options.ui_sets = crate::ui::ui_sets();
+    if crate::ui::launch().monochrome {
+        options.capabilities.colors = ColorDepth::Monochrome;
+    }
     let guard = Guard::enter()?;
-    let prev = std::panic::take_hook();
+    // Restore the terminal when the UI thread panics (it is going down). A panic on another
+    // thread (an engine task: the job reports it as a failure) must not leave the UI drawing
+    // over a cooked terminal, nor print over the UI: it goes to the log file instead.
+    let ui_thread = std::thread::current().id();
+    let prev: std::sync::Arc<dyn Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync> =
+        std::panic::take_hook().into();
+    let hook_prev = prev.clone();
     std::panic::set_hook(Box::new(move |info| {
-        let _ = terminal::disable_raw_mode();
-        let _ = io::stdout().execute(terminal::LeaveAlternateScreen);
-        prev(info);
+        if std::thread::current().id() == ui_thread {
+            let _ = terminal::disable_raw_mode();
+            let _ = io::stdout().execute(terminal::LeaveAlternateScreen);
+            hook_prev(info);
+        } else {
+            let name = std::thread::current().name().unwrap_or("?").to_owned();
+            crate::ui::log_fatal(&format!("panic on thread {name}: {info}"));
+        }
     }));
     let mut view = AppView::new(options);
     let mut term = Terminal::new(CrosstermBackend::new(io::BufWriter::new(io::stdout())))?;
     term.draw(|f| view.render(f, f.area()))?;
     view.load(Root::of::<crate::ui::App>())
         .map_err(|e| io::Error::other(e.to_string()))?;
+    let mut stopping: Option<Instant> = None;
+    let mut aborted = false;
     let res = run_app(&mut term, &mut view, |timeout: Duration| {
-        if event::poll(timeout)? {
-            Ok(convert(event::read()?))
-        } else {
-            Ok(RunEvent::Idle)
+        if let Some(since) = stopping {
+            if !bridge::busy() {
+                return Ok(RunEvent::Exit);
+            }
+            if since.elapsed() >= bridge::SHUTDOWN_TIMEOUT {
+                bridge::abandon();
+                aborted = true;
+                return Ok(RunEvent::Exit);
+            }
         }
+        if !event::poll(timeout)? {
+            return Ok(RunEvent::Idle);
+        }
+        let ev = event::read()?;
+        if is_ctrl_c(&ev) {
+            if stopping.is_some() {
+                // Second Ctrl+C: leave now.
+                bridge::abandon();
+                aborted = true;
+                return Ok(RunEvent::Exit);
+            }
+            if bridge::busy() {
+                bridge::begin_shutdown();
+                stopping = Some(Instant::now());
+                return Ok(RunEvent::Redraw);
+            }
+        }
+        Ok(convert(ev))
     });
     drop(term);
     drop(guard);
+    std::panic::set_hook(Box::new(move |info| prev(info)));
+    if aborted && bridge::busy() {
+        eprintln!(
+            "oprobe: quit before the running job finished cleaning up; leftover test data \
+             (oprobe-run-*) can be removed with `oprobe cleanup`"
+        );
+    } else {
+        crate::ui::finish_jobs();
+    }
     res
 }

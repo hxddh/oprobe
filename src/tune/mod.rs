@@ -45,15 +45,20 @@ pub struct TuneOptions {
     pub trial: RunOptions,
     pub max_concurrency: usize,
     pub max_trials: usize,
-    /// Pause after a throttled trial so the service's rate limiter recovers.
+    /// Pause after a throttled trial so the service's rate limiter recovers. The service's
+    /// `Retry-After` (capped at [`MAX_RETRY_AFTER`]) is honored even when this is zero.
     pub cooldown: Duration,
 }
+
+/// Longest `Retry-After` the tuner waits for between trials.
+pub const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Trial {
     pub id: usize,
     pub stage: String,
     pub knobs: Knobs,
+    /// Successful operations per second (failed operations never count toward the objective).
     pub ops_per_s: f64,
     pub mib_per_s: f64,
     pub p50_ms: f64,
@@ -97,7 +102,6 @@ struct Tuner<'a> {
     snapshots: Vec<Snapshot>,
     use_bytes: bool,
     on_event: Arc<dyn Fn(TuneEvent) + Send + Sync>,
-    max_retry_after_ms: u64,
     /// Concurrency limit once a throttling ceiling is known (80 % of it): no winner may exceed it.
     concurrency_cap: Option<usize>,
 }
@@ -149,7 +153,8 @@ impl Tuner<'_> {
             id,
             stage: stage.into(),
             knobs: knobs.clone(),
-            ops_per_s: snap.summary.ops_per_s,
+            ops_per_s: snap.summary.ops.saturating_sub(snap.summary.failed_ops) as f64
+                / snap.elapsed_s.max(1e-3),
             mib_per_s: snap.summary.mib_per_s,
             p50_ms: snap.summary.latency.p50,
             p99_ms: worst_p99,
@@ -179,22 +184,23 @@ impl Tuner<'_> {
         }
         t.feasible = why.is_empty();
         t.note = why.join(", ");
-        self.max_retry_after_ms = self
-            .max_retry_after_ms
-            .max(snap.resilience.max_retry_after_ms);
         (self.on_event)(TuneEvent::Finished(t.clone()));
+        let wait = cooldown_after(
+            t.throttled(),
+            self.opts.cooldown,
+            snap.resilience.max_retry_after_ms,
+        );
         self.trials.push(t);
         self.snapshots.push(snap);
-        if self.trials[id].throttled() && !self.opts.cooldown.is_zero() {
-            let wait = self
-                .opts
-                .cooldown
-                .max(Duration::from_millis(self.max_retry_after_ms));
+        if !wait.is_zero() && !self.session.cancel.is_cancelled() {
             (self.on_event)(TuneEvent::Message(format!(
                 "throttled: cooling down {:.1}s before the next trial",
                 wait.as_secs_f64()
             )));
-            tokio::time::sleep(wait).await;
+            tokio::select! {
+                _ = tokio::time::sleep(wait) => {}
+                _ = self.session.cancel.cancelled() => {}
+            }
         }
         Ok(id)
     }
@@ -212,20 +218,47 @@ impl Tuner<'_> {
                 .is_none_or(|cap| t.knobs.concurrency <= cap)
     }
 
-    /// Index of the best trial for the objective (feasible ones first).
+    fn any_feasible(&self) -> bool {
+        self.trials
+            .iter()
+            .any(|t| t.feasible && t.stage != "confirm")
+    }
+
+    /// Candidate pool, in order of preference: feasible trials within the headroom cap; any
+    /// feasible trial; and only when no trial met the SLA, the least-bad ones (not throttled
+    /// if possible, then the lowest error rate).
+    fn pool(&self) -> Vec<usize> {
+        let all = || (0..self.trials.len()).filter(|&i| self.trials[i].stage != "confirm");
+        let capped: Vec<usize> = all()
+            .filter(|&i| self.trials[i].feasible && self.eligible(i))
+            .collect();
+        if !capped.is_empty() {
+            return capped;
+        }
+        let feasible: Vec<usize> = all().filter(|&i| self.trials[i].feasible).collect();
+        if !feasible.is_empty() {
+            return feasible;
+        }
+        let mut rest: Vec<usize> = all().filter(|&i| self.eligible(i)).collect();
+        if rest.is_empty() {
+            rest = all().collect();
+        }
+        if rest.iter().any(|&i| !self.trials[i].throttled()) {
+            rest.retain(|&i| !self.trials[i].throttled());
+        }
+        let min_err = rest
+            .iter()
+            .map(|&i| self.trials[i].error_rate)
+            .fold(f64::INFINITY, f64::min);
+        // Within 0.1 percentage points of the lowest error rate counts as equally clean.
+        rest.retain(|&i| self.trials[i].error_rate <= min_err + 0.001);
+        rest
+    }
+
+    /// Index of the best trial for the objective. Never an SLA-violating trial while any trial
+    /// met the SLA.
     fn best(&self) -> Option<usize> {
-        let pool: Vec<usize> = {
-            let f: Vec<usize> = (0..self.trials.len())
-                .filter(|&i| self.trials[i].feasible && self.eligible(i))
-                .collect();
-            if f.is_empty() {
-                (0..self.trials.len())
-                    .filter(|&i| self.eligible(i))
-                    .collect()
-            } else {
-                f
-            }
-        };
+        let pool = self.pool();
         let top = pool
             .iter()
             .map(|&i| self.metric(&self.trials[i]))
@@ -300,6 +333,16 @@ impl Tuner<'_> {
     }
 }
 
+/// How long to pause after a trial: nothing unless it was throttled; then the configured
+/// cooldown or the service's `Retry-After` from *this* trial (capped at [`MAX_RETRY_AFTER`]),
+/// whichever is longer. `Retry-After` is honored even with `--cooldown 0`.
+fn cooldown_after(throttled: bool, cooldown: Duration, retry_after_ms: u64) -> Duration {
+    if !throttled {
+        return Duration::ZERO;
+    }
+    cooldown.max(Duration::from_millis(retry_after_ms).min(MAX_RETRY_AFTER))
+}
+
 /// Run the tuning loop on an open session.
 pub async fn tune(
     session: &Session,
@@ -314,7 +357,6 @@ pub async fn tune(
         snapshots: Vec::new(),
         use_bytes: false,
         on_event,
-        max_retry_after_ms: 0,
         concurrency_cap: None,
     };
     let base_knobs = p.knobs.clone();
@@ -410,14 +452,18 @@ pub async fn tune(
         let safe = ((ce as f64) * 0.8).floor().max(1.0) as usize;
         t.concurrency_cap = Some(safe);
         if t.trials[current].knobs.concurrency > safe {
-            let k = Knobs {
-                concurrency: safe,
-                ..t.trials[current].knobs.clone()
-            };
-            current = t.trial("safety-margin", &k, None).await?;
-            notes.push(format!(
-                "concurrency capped at {safe} (80% of the {ce} throttling ceiling) for headroom"
-            ));
+            if t.budget_left() {
+                let k = Knobs {
+                    concurrency: safe,
+                    ..t.trials[current].knobs.clone()
+                };
+                current = t.trial("safety-margin", &k, None).await?;
+                notes.push(format!(
+                    "concurrency capped at {safe} (80% of the {ce} throttling ceiling) for headroom"
+                ));
+            } else if let Some(b) = t.best() {
+                current = b;
+            }
         }
     }
 
@@ -471,7 +517,7 @@ pub async fn tune(
         if !ios.contains(&k.io_concurrency) {
             k.io_concurrency = 4;
         }
-        if k != t.trials[current].knobs {
+        if k != t.trials[current].knobs && t.budget_left() {
             let id = t.trial("normalize", &k, None).await?;
             if !t.better(current, id) {
                 current = id;
@@ -499,7 +545,7 @@ pub async fn tune(
     if vectored {
         let mut k = t.trials[current].knobs.clone();
         snap_dims(&mut k, &gaps, |k| k.range_gap, |k, v| k.range_gap = v);
-        if k != t.trials[current].knobs {
+        if k != t.trials[current].knobs && t.budget_left() {
             let id = t.trial("normalize", &k, None).await?;
             if !t.better(current, id) {
                 current = id;
@@ -526,15 +572,32 @@ pub async fn tune(
                 .await?;
         }
     }
+    // The read cache. A generated dataset is a small stand-in for the real data: under uniform
+    // access it fitting into the cache says nothing about production, so the cache is only
+    // tried for skewed access (locality) or for the user's real objects (`existing_prefix`),
+    // and a win that relies on the whole test dataset fitting is flagged.
     let skewed = !matches!(p.workload.access, Access::Uniform);
+    let real_data = session.dataset.read_only;
     let working_set: u64 = session.dataset.objects.iter().map(|o| o.size).sum();
-    if reads && t.budget_left() && (skewed || working_set <= t.trials[current].knobs.cache_size.0) {
+    let fits = working_set <= t.trials[current].knobs.cache_size.0;
+    if reads && t.budget_left() && (skewed || (real_data && fits)) {
         let mut k = t.trials[current].knobs.clone();
         k.cache = !k.cache;
         let id = t.trial("cache", &k, None).await?;
         if t.better(id, current) {
             current = id;
+            if t.trials[id].knobs.cache && fits && !real_data {
+                notes.push(format!(
+                    "the read cache won, but the whole {} test dataset fits in the {} cache: the hit ratio depends on your real working set (dataset-size-dependent; verify with `existing_prefix` or a production-sized dataset)",
+                    crate::util::fmt_bytes(working_set),
+                    t.trials[id].knobs.cache_size
+                ));
+            }
         }
+    } else if reads && !skewed && fits && !real_data && !t.trials[current].knobs.cache {
+        notes.push(
+            "read cache not tried: under uniform access its benefit depends on the real working set, not the generated test dataset".into(),
+        );
     }
     if p.target.endpoint().is_some_and(|e| e.starts_with("https")) && t.budget_left() {
         // Compare the two protocols the measured client can actually speak: OpenDAL's reqwest
@@ -554,10 +617,23 @@ pub async fn tune(
     }
 
     // 3. Confirm the winner with a longer window.
-    let winner_idx = t
+    let mut winner_idx = t
         .best()
         .map(|b| if t.better(b, current) { b } else { current })
         .unwrap_or(current);
+    let no_feasible = !t.any_feasible();
+    if !no_feasible && !t.trials[winner_idx].feasible {
+        // Never recommend an SLA-violating configuration while one met the SLA.
+        winner_idx = t.best().unwrap_or(winner_idx);
+    }
+    if no_feasible {
+        let msg = format!(
+            "no trial met the SLA; recommending the least-bad configuration (trial #{}: {})",
+            winner_idx, t.trials[winner_idx].note
+        );
+        (t.on_event)(TuneEvent::Message(msg.clone()));
+        notes.insert(0, msg);
+    }
     let winner = t.trials[winner_idx].knobs.clone();
     let confirm_opts = RunOptions {
         duration: opts.trial.duration * 2,
@@ -586,7 +662,10 @@ pub async fn tune(
     } else {
         0.0
     };
-    let winner_snapshot = t.snapshots[confirm].clone();
+    let mut winner_snapshot = t.snapshots[confirm].clone();
+    if session.cancel.is_cancelled() {
+        winner_snapshot.interrupted = true;
+    }
     Ok(TuneOutcome {
         summary: TuneSummary {
             objective: opts.objective.label().into(),
@@ -595,9 +674,28 @@ pub async fn tune(
             winner_trial: confirm,
             improvement,
             throttle_ceiling: ceiling,
+            no_feasible_trial: no_feasible,
             notes,
         },
         winner,
         winner_snapshot,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cooldown_honors_capped_retry_after_per_trial() {
+        let s = Duration::from_secs;
+        assert_eq!(cooldown_after(false, s(5), 30_000), Duration::ZERO);
+        assert_eq!(cooldown_after(true, Duration::ZERO, 2_000), s(2));
+        assert_eq!(cooldown_after(true, s(3), 1_000), s(3));
+        assert_eq!(
+            cooldown_after(true, Duration::ZERO, 3_600_000),
+            MAX_RETRY_AFTER
+        );
+        assert_eq!(cooldown_after(true, Duration::ZERO, 0), Duration::ZERO);
+    }
 }

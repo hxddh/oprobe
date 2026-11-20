@@ -61,6 +61,9 @@ pub struct TuneSummary {
     pub improvement: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub throttle_ceiling: Option<usize>,
+    /// No trial met the SLA: the winner is the least-bad configuration, not a recommendation.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_feasible_trial: bool,
     pub notes: Vec<String>,
 }
 
@@ -84,6 +87,10 @@ pub struct Report {
     pub warnings: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tune: Option<TuneSummary>,
+    /// The run was stopped early (Ctrl-C / Stop): results cover a shorter window than
+    /// configured. `oprobe diff` warns about such reports.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub interrupted: bool,
 }
 
 impl Report {
@@ -103,6 +110,7 @@ impl Report {
         workload.mix = workload.effective_mix();
         let mut options = crate::util::redact_options(&t.options);
         options.remove("ca_cert_pem");
+        let interrupted = snapshot.interrupted;
         Self {
             schema: SCHEMA.to_owned(),
             oprobe_version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -114,7 +122,11 @@ impl Report {
                 scheme: t.scheme.clone(),
                 endpoint: if t.is_network() { endpoint } else { None },
                 options,
-                proxy: snapshot.connections.proxy.clone(),
+                proxy: snapshot
+                    .connections
+                    .proxy
+                    .as_deref()
+                    .map(crate::util::strip_url_credentials),
             },
             workload,
             knobs: knobs.clone(),
@@ -125,6 +137,7 @@ impl Report {
             cleanup,
             warnings,
             tune: None,
+            interrupted,
         }
     }
 

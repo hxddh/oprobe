@@ -709,7 +709,17 @@ impl TargetSpec {
             }
             "webdav" | "webdavs" => {
                 let s = if scheme == "webdavs" { "https" } else { "http" };
-                options.insert("endpoint".into(), format!("{s}://{}", u.authority()));
+                let h = host.context("webdav:// URL needs a host")?;
+                let port = u.port().map(|p| format!(":{p}")).unwrap_or_default();
+                options.insert("endpoint".into(), format!("{s}://{h}{port}"));
+                // Credentials in the URL become backend options (redacted in every output)
+                // instead of leaking through `endpoint`.
+                if !u.username().is_empty() {
+                    options.insert("username".into(), u.username().to_owned());
+                }
+                if let Some(pw) = u.password() {
+                    options.insert("password".into(), pw.to_owned());
+                }
                 if let Some(r) = root {
                     options.insert("root".into(), r);
                 }
@@ -745,28 +755,36 @@ impl TargetSpec {
         } else {
             self.clone()
         };
-        if t.scheme == "s3"
-            && !t.options.contains_key("region")
-            && std::env::var("AWS_REGION").is_err()
-        {
-            let region = std::env::var("AWS_DEFAULT_REGION").unwrap_or_else(|_| "us-east-1".into());
-            t.options.insert("region".into(), region);
+        // Keep the user's URL but never its credentials (they moved into options above).
+        if let Some(u) = &t.url {
+            t.url = Some(crate::util::strip_url_credentials(u));
         }
         Ok(t)
     }
 
     /// Options with `${ENV}` references expanded, ready for `Operator::via_iter`.
+    /// S3 gets a default region (`AWS_DEFAULT_REGION`, else `us-east-1`) unless one is
+    /// configured; the default is applied here so it is never persisted as a user setting.
     pub fn resolved_options(&self) -> Result<BTreeMap<String, String>> {
-        self.options
+        let mut opts: BTreeMap<String, String> = self
+            .options
             .iter()
             .map(|(k, v)| Ok((k.clone(), expand_env(v)?)))
-            .collect()
+            .collect::<Result<_>>()?;
+        if self.scheme == "s3"
+            && !opts.contains_key("region")
+            && std::env::var("AWS_REGION").is_err()
+        {
+            let region = std::env::var("AWS_DEFAULT_REGION").unwrap_or_else(|_| "us-east-1".into());
+            opts.insert("region".into(), region);
+        }
+        Ok(opts)
     }
 
     /// Human-readable identity of the target (no secrets).
     pub fn display(&self) -> String {
         if let Some(u) = &self.url {
-            return u.clone();
+            return crate::util::display_url(u);
         }
         let o = &self.options;
         let base = o
@@ -781,12 +799,14 @@ impl TargetSpec {
     /// Endpoint URL the backend will talk to, when it can be determined.
     pub fn endpoint(&self) -> Option<String> {
         if let Some(e) = self.options.get("endpoint") {
-            return expand_env(e).ok();
+            return expand_env(e)
+                .ok()
+                .map(|e| crate::util::strip_url_credentials(&e));
         }
         match self.scheme.as_str() {
             "s3" => {
                 if let Ok(e) = std::env::var("AWS_ENDPOINT_URL") {
-                    return Some(e);
+                    return Some(crate::util::strip_url_credentials(&e));
                 }
                 let region = self
                     .options
@@ -809,6 +829,34 @@ impl TargetSpec {
     pub fn is_network(&self) -> bool {
         !matches!(self.scheme.as_str(), "memory" | "fs")
     }
+}
+
+/// Options `from_url` derives from URL credentials: always kept (as `${ENV}` references) when
+/// writing a profile, since the URL written back no longer carries them.
+fn is_url_secret(k: &str) -> bool {
+    matches!(k, "username" | "password")
+}
+
+/// A value made only of `${NAME}` references (e.g. `${AWS_SECRET_ACCESS_KEY}`).
+fn is_env_reference(v: &str) -> bool {
+    let mut rest = v.trim();
+    if rest.is_empty() {
+        return false;
+    }
+    while !rest.is_empty() {
+        let Some(after) = rest.strip_prefix("${") else {
+            return false;
+        };
+        let Some(end) = after.find('}') else {
+            return false;
+        };
+        let name = &after[..end];
+        if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+            return false;
+        }
+        rest = &after[end + 1..];
+    }
+    true
 }
 
 /// Expand `${NAME}` references from the environment.
@@ -880,20 +928,44 @@ impl Profile {
         Ok(())
     }
 
-    /// Serialize to TOML (secrets are never stored: use `${ENV}` references).
+    /// Serialize to TOML. Secrets are never stored: secret options become `${ENV}` references
+    /// (existing references are kept as written), credentials embedded in URLs are dropped, and
+    /// options that merely restate the target URL are left out so the file stays as the user
+    /// wrote it.
     pub fn to_toml(&self) -> Result<String> {
         let mut p = self.clone();
-        p.target.options = crate::util::redact_options(&p.target.options)
+        let t = &mut p.target;
+        if let Some(url) = t.url.clone() {
+            // Options derived from the URL (bucket, root, scheme...) are re-derived on load.
+            if let Ok(base) = TargetSpec::from_url(&url) {
+                t.options.retain(|k, v| {
+                    base.options
+                        .get(k)
+                        .is_none_or(|b| b != v || is_url_secret(k))
+                });
+                if t.scheme == base.scheme {
+                    t.scheme.clear();
+                }
+            }
+            t.url = Some(crate::util::strip_url_credentials(&url));
+        }
+        t.options = std::mem::take(&mut t.options)
             .into_iter()
             .map(|(k, v)| {
-                if v == "<redacted>" {
-                    let env = k.to_ascii_uppercase();
-                    (k, format!("${{{env}}}"))
+                if crate::util::is_secret_key(&k) {
+                    if is_env_reference(&v) {
+                        (k, v)
+                    } else {
+                        let env = k.to_ascii_uppercase().replace('-', "_");
+                        (k, format!("${{{env}}}"))
+                    }
                 } else {
+                    let v = crate::util::strip_url_credentials(&v);
                     (k, v)
                 }
             })
             .collect();
+        t.proxy = t.proxy.as_deref().map(crate::util::strip_url_credentials);
         Ok(toml::to_string_pretty(&p)?)
     }
 
@@ -970,6 +1042,67 @@ mod tests {
         assert!(!toml.contains("plain"));
         assert!(toml.contains("${SECRET_ACCESS_KEY}"));
     }
+
+    #[test]
+    fn to_toml_keeps_env_references_and_drops_derived_values() {
+        let mut t = TargetSpec::from_url("s3://bkt/pre").unwrap();
+        t.options
+            .insert("secret_access_key".into(), "${MY_SK}".into());
+        t.options.insert(
+            "server_side_encryption_customer_key".into(),
+            "c3VwZXJzZWNyZXQ=".into(),
+        );
+        t.options
+            .insert("endpoint".into(), "http://ak:sk@minio:9000".into());
+        let p = Profile::from_target(t.normalized().unwrap());
+        let toml = p.to_toml().unwrap();
+        assert!(toml.contains("secret_access_key = \"${MY_SK}\""), "{toml}");
+        assert!(
+            toml.contains("${SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY}"),
+            "{toml}"
+        );
+        assert!(!toml.contains("c3VwZXJzZWNyZXQ"), "{toml}");
+        assert!(!toml.contains("ak:sk"), "{toml}");
+        assert!(
+            !toml.contains("region"),
+            "defaulted region is not persisted: {toml}"
+        );
+        assert!(
+            !toml.contains("bucket"),
+            "URL-derived options are not repeated: {toml}"
+        );
+        let back: Profile = toml::from_str(&toml).unwrap();
+        back.validate().unwrap();
+        let n = back.target.normalized().unwrap();
+        assert_eq!(n.scheme, "s3");
+        assert_eq!(n.options["bucket"], "bkt");
+        assert_eq!(n.options["endpoint"], "http://minio:9000");
+    }
+
+    #[test]
+    fn url_credentials_never_reach_endpoint_or_display() {
+        let t = TargetSpec::from_url("webdav://alice:hunter2@dav.example:8443/files")
+            .unwrap()
+            .normalized()
+            .unwrap();
+        assert_eq!(t.options["endpoint"], "http://dav.example:8443");
+        assert_eq!(t.options["password"], "hunter2");
+        assert!(!t.display().contains("hunter2"), "{}", t.display());
+        assert!(!t.endpoint().unwrap().contains("alice"));
+        let toml = Profile::from_target(t).to_toml().unwrap();
+        assert!(!toml.contains("hunter2"), "{toml}");
+        assert!(toml.contains("${PASSWORD}"), "{toml}");
+        let mut s3 = TargetSpec::from_url("s3://b").unwrap();
+        s3.options
+            .insert("endpoint".into(), "https://k:s@minio.local".into());
+        assert_eq!(s3.endpoint().unwrap(), "https://minio.local");
+        // Default region is applied when building the operator, not stored in the profile.
+        let n = s3.normalized().unwrap();
+        assert!(!n.options.contains_key("region"));
+        if std::env::var("AWS_REGION").is_err() {
+            assert!(n.resolved_options().unwrap().contains_key("region"));
+        }
+    }
 }
 
 /// Fully commented profile template for `oprobe init`.
@@ -986,7 +1119,7 @@ pub fn template(preset: Preset, target: &str) -> String {
     format!(
         r#"# oprobe profile — {desc}
 # Run:  oprobe run --profile this.toml        Tune: oprobe tune --profile this.toml
-# Docs: https://github.com/hxddh/oprobe/blob/main/docs/profiles.md
+# Docs: https://github.com/hxddh/oprobe/blob/main/docs/workloads.md
 
 [target]
 url = "{target}"

@@ -5,7 +5,7 @@ use nsh_base::theme;
 use nsh_core::prelude::*;
 
 use super::workbench::failure_banner;
-use crate::ui::store::store;
+use crate::ui::store::{Status, store};
 use crate::ui::widgets::*;
 
 fn results() -> impl IntoElement {
@@ -107,9 +107,9 @@ pub fn probe_page() -> impl IntoElement {
                 card("Endpoint").child(
                     row()
                         .items_end()
-                        .child(field("URL", "https://s3.us-east-1.amazonaws.com", s.probe_endpoint).flex_1())
+                        .child(field("URL", "e.g. https://s3.us-east-1.amazonaws.com", s.probe_endpoint).flex_1())
                         .child(
-                            when(move || s.status.get().busy(), || btn_with("Probing…", Kind::Secondary, true, || {}))
+                            when(move || s.job_kind() == Some(Status::Probing), || btn_with("Probing…", Kind::Secondary, true, || {}))
                                 .otherwise(move || btn("Run probe", Kind::Primary, move || s.probe())),
                         ),
                 ),

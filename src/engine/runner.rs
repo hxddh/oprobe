@@ -5,11 +5,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use opendal::Operator;
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use tokio::sync::Semaphore;
+use tokio::task::{JoinError, JoinSet};
 
 use super::cleanup::{CleanupSummary, delete_prefix, new_run_prefix};
 use super::dataset::{Dataset, PayloadPool, Picker};
@@ -34,6 +35,75 @@ impl Cancel {
     }
     pub fn reset(&self) {
         self.0.store(false, Ordering::Release);
+    }
+    /// Resolves once [`Cancel::cancel`] has been called (polled every 50 ms).
+    pub async fn cancelled(&self) {
+        while !self.is_cancelled() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+}
+
+/// Turn a worker task failure into an error instead of losing it (a panicking worker would
+/// otherwise silently shrink the load and skew the results).
+fn worker_result(r: std::result::Result<(), JoinError>) -> Result<()> {
+    match r {
+        Ok(()) => Ok(()),
+        Err(e) if e.is_panic() => {
+            let p = e.into_panic();
+            let msg = p
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_owned())
+                .or_else(|| p.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic".into());
+            anyhow::bail!("a benchmark worker panicked: {msg}")
+        }
+        Err(e) => Err(anyhow::anyhow!("a benchmark worker failed: {e}")),
+    }
+}
+
+async fn join_workers(mut set: JoinSet<()>) -> Result<()> {
+    let mut first_err = None;
+    while let Some(r) = set.join_next().await {
+        if let Err(e) = worker_result(r)
+            && first_err.is_none()
+        {
+            first_err = Some(e);
+        }
+    }
+    first_err.map_or(Ok(()), Err)
+}
+
+/// Write slots of in-flight open-loop operations: a slot (scratch key) is held by exactly one
+/// operation at a time, so concurrent writes never race on the same key (which would make the
+/// sampled integrity check compare against the wrong payload).
+struct SlotPool(Mutex<std::collections::VecDeque<u64>>);
+
+impl SlotPool {
+    fn new(n: u64) -> Arc<Self> {
+        Arc::new(Self(Mutex::new((0..n.max(1)).collect())))
+    }
+    fn take(self: &Arc<Self>) -> SlotLease {
+        let slot = self
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pop_front()
+            .expect("slot pool holds more slots than permits");
+        SlotLease(self.clone(), slot)
+    }
+}
+
+/// Returns its slot to the pool when dropped (also on panic / cancellation).
+struct SlotLease(Arc<SlotPool>, u64);
+
+impl Drop for SlotLease {
+    fn drop(&mut self) {
+        self.0
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push_back(self.1);
     }
 }
 
@@ -97,10 +167,18 @@ impl Session {
         if spec.existing_prefix.is_some() && mix.iter().any(|m| m.op.is_write()) {
             mix.retain(|m| !m.op.is_write());
             warnings.push("existing_prefix datasets are read-only: write operations were removed from the mix".into());
-            anyhow::ensure!(
-                !mix.is_empty(),
-                "the workload mix only contains writes, but the dataset is read-only"
-            );
+        }
+        anyhow::ensure!(
+            mix.iter().any(|m| m.weight > 0),
+            "{}",
+            if spec.existing_prefix.is_some() {
+                "the dataset is read-only (existing prefix), but every read operation in the mix has weight 0: give a read/stat/list operation a weight > 0"
+            } else {
+                "the workload mix needs at least one operation with weight > 0"
+            }
+        );
+        if profile.target.is_network() {
+            super::operator::check_reachable(&base, &profile.target).await?;
         }
         let needs_objects = mix.iter().any(|m| !m.op.is_write() && m.weight > 0);
         let p2 = progress.clone();
@@ -110,6 +188,7 @@ impl Session {
             profile.workload.seed,
             &run_prefix,
             needs_objects,
+            &cancel,
             &move |m| p2(Progress::Message(m)),
         )
         .await?;
@@ -221,7 +300,7 @@ impl Session {
                     &recorder,
                     tree.as_ref(),
                 )
-                .await;
+                .await?;
             }
             recorder.set_phase(Phase::Measure);
             self.drive(
@@ -235,7 +314,7 @@ impl Session {
                 &recorder,
                 tree.as_ref(),
             )
-            .await;
+            .await?;
             recorder.set_phase(Phase::Verify);
             Ok::<_, anyhow::Error>(())
         }
@@ -245,12 +324,16 @@ impl Session {
         result?;
         let mut snap = recorder.snapshot();
         snap.phase = Phase::Done;
+        snap.interrupted = self.cancel.is_cancelled();
         if let Some(cb) = &progress {
             cb(Progress::Snapshot(Box::new(snap.clone())));
         }
         Ok(snap)
     }
 
+    /// Run one window. When `measured`, the recorder's window is closed at the deadline (or
+    /// when the run stops early) so rates cover exactly the window, while operations that
+    /// started inside it drain and are still recorded.
     #[allow(clippy::too_many_arguments)]
     async fn drive(
         &self,
@@ -263,7 +346,7 @@ impl Session {
         trial: u64,
         recorder: &Arc<Recorder>,
         tree: Option<&await_tree::Registry>,
-    ) {
+    ) -> Result<()> {
         let deadline = Instant::now() + window;
         let started = Arc::new(AtomicU64::new(0));
         let cum: Vec<(u32, OpKind)> = {
@@ -277,6 +360,10 @@ impl Session {
                 })
                 .collect()
         };
+        anyhow::ensure!(
+            !cum.is_empty(),
+            "the workload mix has no operation with weight > 0"
+        );
         let total_w = cum.last().map(|c| c.0).unwrap_or(1);
         let cum = Arc::new(cum);
         let pick_kind = move |rng: &mut SmallRng, cum: &Vec<(u32, OpKind)>| -> OpKind {
@@ -297,24 +384,37 @@ impl Session {
                         .unwrap_or(false)
             }
         };
+        let close_window = {
+            let rec = recorder.clone();
+            move || {
+                if measured {
+                    rec.close_window(Instant::now().min(deadline));
+                }
+            }
+        };
         let seed = self.profile.workload.seed ^ (trial << 32) ^ if measured { 0x5eed } else { 0 };
 
         match opts.rate {
             None => {
-                let mut handles = Vec::new();
+                let mut set = JoinSet::new();
                 for w in 0..knobs.concurrency.max(1) {
                     let ctx = ctx.clone();
                     let cum = cum.clone();
                     let stop = should_stop.clone();
+                    let close = close_window.clone();
                     let started = started.clone();
                     let rec = recorder.clone();
                     let tree = tree.cloned();
-                    handles.push(tokio::spawn(async move {
+                    set.spawn(async move {
                         let mut rng =
                             SmallRng::seed_from_u64(seed ^ (w as u64).wrapping_mul(0x9E37_79B9));
                         let mut seq = 0u64;
                         while !stop() {
-                            started.fetch_add(1, Ordering::Relaxed);
+                            // Claim a ticket first so `max_ops` is exact under concurrency.
+                            let n = started.fetch_add(1, Ordering::Relaxed);
+                            if max_ops.is_some_and(|m| n >= m) {
+                                break;
+                            }
                             let kind = pick_kind(&mut rng, &cum);
                             let slot = (w as u64) * 4 + seq % 4;
                             seq += 1;
@@ -330,29 +430,37 @@ impl Session {
                             )
                             .await;
                         }
-                    }));
+                        // The first worker to stop ends the window; the rest drain.
+                        close();
+                    });
                 }
-                for h in handles {
-                    let _ = h.await;
-                }
+                join_workers(set).await?;
+                close_window();
             }
             Some(rate) => {
-                let cap = Arc::new(Semaphore::new(knobs.concurrency.max(1)));
+                let conc = knobs.concurrency.max(1);
+                let cap = Arc::new(Semaphore::new(conc));
+                let slots = SlotPool::new(conc as u64 * 4);
                 let interval = Duration::from_secs_f64(1.0 / rate.max(0.001));
+                // Bounded backlog: an arrival more than `timeout` behind schedule could only
+                // time out; such arrivals are dropped (counted as missed) instead of queued.
+                let max_queue_delay = knobs.timeout.get().max(Duration::from_secs(1));
                 let t0 = Instant::now();
                 let mut next = t0;
                 let mut rng = SmallRng::seed_from_u64(seed);
                 let mut missed = 0u64;
                 let mut issued = 0u64;
                 let mut max_lag = Duration::ZERO;
-                let mut seq = 0u64;
-                let mut handles = Vec::new();
-                'arrivals: while !should_stop() {
-                    // Never sleep past the window or through a cancellation: wake at the next
-                    // arrival, the deadline, or every 100 ms to check for Ctrl-C / Stop.
-                    if next >= deadline {
+                let mut set = JoinSet::new();
+                'arrivals: loop {
+                    if next >= deadline
+                        || self.cancel.is_cancelled()
+                        || max_ops.is_some_and(|m| issued >= m)
+                    {
                         break;
                     }
+                    // Never sleep past the window or through a cancellation: wake at the next
+                    // arrival, the deadline, or every 100 ms to check for Ctrl-C / Stop.
                     loop {
                         let now = Instant::now();
                         if now >= next {
@@ -364,53 +472,86 @@ impl Session {
                             break 'arrivals;
                         }
                     }
-                    let lag = next.elapsed();
-                    max_lag = max_lag.max(lag);
-                    match cap.clone().try_acquire_owned() {
-                        Ok(permit) => {
-                            started.fetch_add(1, Ordering::Relaxed);
-                            issued += 1;
-                            let kind = pick_kind(&mut rng, &cum);
-                            let mut op_rng = SmallRng::seed_from_u64(rng.r#gen());
-                            let slot = seq % (knobs.concurrency as u64 * 4).max(4);
-                            seq += 1;
-                            let ctx = ctx.clone();
-                            let rec = recorder.clone();
-                            let tree = tree.cloned();
-                            let intended = next;
-                            handles.push(tokio::spawn(async move {
-                                run_one(
-                                    &ctx,
-                                    &kind,
-                                    &mut op_rng,
-                                    slot,
-                                    intended,
-                                    measured,
-                                    &rec,
-                                    tree.as_ref(),
-                                )
-                                .await;
-                                drop(permit);
-                            }));
+                    // Wait for a free slot (wrk2-style): the arrival stays queued and its latency
+                    // keeps counting from the intended start, so saturation shows in latency.
+                    let permit = loop {
+                        let now = Instant::now();
+                        if now >= deadline || self.cancel.is_cancelled() {
+                            break 'arrivals;
                         }
-                        Err(_) => missed += 1,
+                        let wake = deadline.min(now + Duration::from_millis(100));
+                        tokio::select! {
+                            p = cap.clone().acquire_owned() => {
+                                break p.context("open-loop slot semaphore closed")?;
+                            }
+                            _ = tokio::time::sleep_until(wake.into()) => {}
+                        }
+                    };
+                    while let Some(r) = set.try_join_next() {
+                        worker_result(r)?;
                     }
+                    let behind = Instant::now().saturating_duration_since(next);
+                    if behind > max_queue_delay {
+                        let skip = ((behind - max_queue_delay).as_secs_f64()
+                            / interval.as_secs_f64())
+                        .ceil()
+                        .max(1.0);
+                        missed += skip as u64;
+                        next += interval.mul_f64(skip);
+                        if next >= deadline {
+                            break;
+                        }
+                    }
+                    max_lag = max_lag.max(next.elapsed());
+                    started.fetch_add(1, Ordering::Relaxed);
+                    issued += 1;
+                    let kind = pick_kind(&mut rng, &cum);
+                    let mut op_rng = SmallRng::seed_from_u64(rng.r#gen());
+                    let lease = slots.take();
+                    let ctx = ctx.clone();
+                    let rec = recorder.clone();
+                    let tree = tree.cloned();
+                    let intended = next;
+                    set.spawn(async move {
+                        run_one(
+                            &ctx,
+                            &kind,
+                            &mut op_rng,
+                            lease.1,
+                            intended,
+                            measured,
+                            &rec,
+                            tree.as_ref(),
+                        )
+                        .await;
+                        drop(lease);
+                        drop(permit);
+                    });
                     next += interval;
-                    handles.retain(|h| !h.is_finished());
                 }
-                for h in handles {
-                    let _ = h.await;
+                let window_end = Instant::now().min(deadline);
+                close_window();
+                // Arrivals that were due inside the window but never got a slot.
+                if next < window_end && !max_ops.is_some_and(|m| issued >= m) {
+                    missed +=
+                        ((window_end - next).as_secs_f64() / interval.as_secs_f64()).ceil() as u64;
                 }
+                join_workers(set).await?;
                 if measured {
                     recorder.set_open_loop(OpenLoopStats {
                         target_rate: rate,
-                        achieved_rate: issued as f64 / t0.elapsed().as_secs_f64().max(1e-3),
+                        achieved_rate: issued as f64
+                            / window_end
+                                .saturating_duration_since(t0)
+                                .as_secs_f64()
+                                .max(1e-3),
                         missed,
                         max_schedule_lag_ms: max_lag.as_secs_f64() * 1000.0,
                     });
                 }
             }
         }
+        Ok(())
     }
 
     /// Re-read sampled written objects and compare CRC32C (via the untraced admin operator).
@@ -474,7 +615,7 @@ async fn run_one(
     rec: &Arc<Recorder>,
     tree: Option<&await_tree::Registry>,
 ) {
-    let scope = OpScope::new_at(measured && rec.is_measuring(), intended, Some(rec.clone()));
+    let scope = OpScope::new_at(measured && rec.window_open(), intended, Some(rec.clone()));
     let measured = scope.measured;
     let name = verb(kind);
     rec.op_started_at(scope.id, intended);
@@ -489,7 +630,10 @@ async fn run_one(
     let latency_us = intended.elapsed().as_micros() as u64;
     let (lr, lw, error) = match res {
         Ok(o) => (o.logical_read, o.logical_write, None),
-        Err(e) => (0, 0, Some(error_class(&e))),
+        Err(e) => {
+            let status = scope.with(|d| d.requests.last().map(|r| r.status));
+            (0, 0, Some(error_class(&e, status)))
+        }
     };
     rec.complete_op(
         measured,

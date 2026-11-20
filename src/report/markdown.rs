@@ -28,6 +28,12 @@ pub fn render(r: &Report) -> String {
         r.oprobe_version,
         r.generated_at
     );
+    if r.interrupted {
+        let _ = writeln!(
+            md,
+            "> ⚠️ **Interrupted** — the run was stopped early; results cover a shorter window than configured.\n"
+        );
+    }
     let sm = &s.summary;
     let _ = writeln!(
         md,

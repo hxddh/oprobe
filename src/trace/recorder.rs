@@ -353,11 +353,16 @@ impl Drop for InflightGuard {
     }
 }
 
+/// `Recorder::frozen_elapsed_us` while the measurement window is open.
+const WINDOW_OPEN: u64 = u64::MAX;
+
 /// Central sink shared by the transport, OpenDAL layers and workload workers.
 pub struct Recorder {
     phase: AtomicU8,
     measuring: AtomicBool,
-    frozen_elapsed_ms: AtomicU64,
+    /// Window length in microseconds once the window closed (no new operation is measured,
+    /// while operations that started inside it may still be completing); `WINDOW_OPEN` before.
+    frozen_elapsed_us: AtomicU64,
     window_start: Mutex<Instant>,
     agg: Mutex<Agg>,
     inflight_ops: AtomicU64,
@@ -379,7 +384,7 @@ impl Recorder {
         Arc::new(Self {
             phase: AtomicU8::new(0),
             measuring: AtomicBool::new(false),
-            frozen_elapsed_ms: AtomicU64::new(0),
+            frozen_elapsed_us: AtomicU64::new(WINDOW_OPEN),
             window_start: Mutex::new(Instant::now()),
             agg: Mutex::new(Agg::new()),
             inflight_ops: AtomicU64::new(0),
@@ -410,7 +415,8 @@ impl Recorder {
     }
 
     pub fn set_proxy(&self, proxy: Option<String>) {
-        *self.proxy.lock().unwrap_or_else(|e| e.into_inner()) = proxy;
+        *self.proxy.lock().unwrap_or_else(|e| e.into_inner()) =
+            proxy.map(|p| crate::util::strip_url_credentials(&p));
     }
 
     pub fn set_tree_registry(&self, reg: await_tree::Registry) {
@@ -457,33 +463,58 @@ impl Recorder {
                 Ordering::Relaxed,
             );
             *self.window_start.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
-            self.frozen_elapsed_ms.store(0, Ordering::Relaxed);
+            self.frozen_elapsed_us.store(WINDOW_OPEN, Ordering::Release);
             self.measuring.store(true, Ordering::Release);
         } else if self.measuring.load(Ordering::Acquire) {
-            // Freeze the window length at the moment measurement ends.
+            // Freeze the window length at the moment measurement ends (unless the runner already
+            // closed it at its deadline).
+            self.close_window(Instant::now());
             self.measuring.store(false, Ordering::Release);
-            let elapsed = self.elapsed_s();
-            self.frozen_elapsed_ms
-                .store((elapsed * 1000.0) as u64, Ordering::Relaxed);
         }
         self.phase.store(code, Ordering::Release);
     }
 
+    /// End the measurement window at `at` (normally the deadline): rates are computed over
+    /// `window_start..at`, operations starting afterwards are not measured, but operations that
+    /// started inside the window keep being recorded until the phase changes (drain).
+    /// Idempotent: the first call wins.
+    pub fn close_window(&self, at: Instant) {
+        if !self.measuring.load(Ordering::Acquire) {
+            return;
+        }
+        let len = at.saturating_duration_since(self.window_start());
+        let us = (len.as_micros() as u64).min(WINDOW_OPEN - 1);
+        let _ = self.frozen_elapsed_us.compare_exchange(
+            WINDOW_OPEN,
+            us,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    /// Whether the measurement phase is active (including the drain after the window closed):
+    /// completions of operations that started in the window are still recorded.
     #[inline]
     pub fn is_measuring(&self) -> bool {
         self.measuring.load(Ordering::Acquire)
+    }
+
+    /// Whether an operation starting now belongs to the measurement window.
+    #[inline]
+    pub fn window_open(&self) -> bool {
+        self.is_measuring() && self.frozen_elapsed_us.load(Ordering::Acquire) == WINDOW_OPEN
     }
 
     pub fn window_start(&self) -> Instant {
         *self.window_start.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Length of the measurement window: time since it started, or its final length once
+    /// closed (draining operations do not stretch it).
     pub fn elapsed_s(&self) -> f64 {
-        if !self.is_measuring() {
-            let frozen = self.frozen_elapsed_ms.load(Ordering::Relaxed);
-            if frozen > 0 {
-                return frozen as f64 / 1000.0;
-            }
+        let frozen = self.frozen_elapsed_us.load(Ordering::Acquire);
+        if frozen != WINDOW_OPEN {
+            return frozen as f64 / 1e6;
         }
         self.window_start().elapsed().as_secs_f64()
     }
@@ -520,8 +551,9 @@ impl Recorder {
             }
             return;
         }
-        if d.proxy.is_some() {
-            *self.proxy.lock().unwrap_or_else(|e| e.into_inner()) = d.proxy;
+        if let Some(p) = d.proxy {
+            *self.proxy.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some(crate::util::strip_url_credentials(&p));
         }
         a.conn.alpn = d.alpn;
         a.conn.tls_version = d.tls_version;
@@ -939,6 +971,7 @@ impl Recorder {
                 .unwrap_or_else(|e| e.into_inner())
                 .clone(),
             open_loop: a.open_loop.clone(),
+            interrupted: false,
             timeline,
             slow_ops: a.slow.clone(),
         }
@@ -1033,6 +1066,40 @@ mod tests {
         let b = breakdown_us(&d, 2000);
         assert_eq!(b, [0, 50, 1400, 550]);
         assert_eq!(b.iter().sum::<u64>(), 2000);
+    }
+
+    #[test]
+    fn closed_window_freezes_rates_but_records_draining_ops() {
+        let r = Recorder::new();
+        r.set_phase(Phase::Measure);
+        let start = r.window_start();
+        assert!(r.window_open());
+        r.close_window(start + std::time::Duration::from_millis(500));
+        assert!(!r.window_open());
+        assert!(r.is_measuring());
+        // A second close (e.g. another worker) does not move the end.
+        r.close_window(start + std::time::Duration::from_secs(5));
+        assert!((r.elapsed_s() - 0.5).abs() < 1e-6, "{}", r.elapsed_s());
+        // An op that started inside the window completes during the drain.
+        r.op_started_at(7, start);
+        r.complete_op(
+            true,
+            OpCompletion {
+                verb: "stat",
+                op_id: 7,
+                started: start,
+                latency_us: 900_000,
+                logical_read: 0,
+                logical_write: 0,
+                error: None,
+                data: OpScopeData::default(),
+            },
+        );
+        r.set_phase(Phase::Verify);
+        let s = r.snapshot();
+        assert_eq!(s.summary.ops, 1);
+        assert!((s.elapsed_s - 0.5).abs() < 1e-6);
+        assert!((s.summary.ops_per_s - 2.0).abs() < 1e-6);
     }
 
     #[test]

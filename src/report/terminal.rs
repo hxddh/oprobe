@@ -300,6 +300,14 @@ pub fn render(r: &Report) -> String {
             }
         ))
     );
+    if r.interrupted {
+        let _ = writeln!(
+            out,
+            "{} {}",
+            badge("INTERRUPTED", "43;30"),
+            yellow("run stopped early: results cover a shorter window than configured")
+        );
+    }
     if let Some(ep) = &r.target.endpoint {
         let _ = writeln!(
             out,

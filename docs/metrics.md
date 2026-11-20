@@ -115,10 +115,22 @@ connect / upload / server / download in proportion to the measured request-stage
 
 * Per-operation latencies go into HDR histograms (3 significant digits, µs resolution).
 * Closed loop (`concurrency` workers): latency = actual start → completion.
-* Open loop (`rate`): latency = **intended** start → completion, so queueing caused by a slow
-  service is included (no coordinated omission). Arrivals that cannot start because `concurrency`
-  operations are already in flight are counted as `missed`.
+* Open loop (`rate`): arrivals are scheduled at fixed intervals and latency = **intended** start →
+  completion (wrk2-style, no coordinated omission). An arrival that finds all `concurrency` slots
+  busy waits in a queue and runs when a slot frees up; its queueing delay is part of its latency, so
+  saturation shows up in the percentiles. Arrivals still queued when the window ends, and arrivals
+  that fall more than `knobs.timeout` behind schedule (bounded backlog), never start and are
+  counted as `missed`. `achieved_rate` = started arrivals ÷ window length.
 * Warmup operations, and operations that started before the measurement window, are excluded.
+
+## Throughput window
+
+Rates (ops/s, MiB/s, `achieved_rate`) are computed over the measurement window only: it ends at the
+deadline (or when `max_ops` is reached / the run is stopped). Operations that started inside the
+window and are still in flight at its end are drained and their latencies and bytes recorded, but
+the drain time does not stretch the window, so throughput is not understated. Failed operations
+count in ops/s but never in the tuner's objective. A run stopped early with Ctrl-C is marked
+`interrupted` in the report.
 
 ## Bytes and amplification
 

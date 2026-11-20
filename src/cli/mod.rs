@@ -41,10 +41,16 @@ pub async fn main(cli: Cli) -> ExitCode {
         Ok(code) => code,
         Err(err) => {
             print_error(&err, &scheme_hint);
+            if INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst) {
+                return interrupted_exit("command");
+            }
             ExitCode::FAILURE
         }
     }
 }
+
+/// Set by the first Ctrl-C of `run` / `tune`.
+static INTERRUPTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn scheme_of(cmd: &Command) -> String {
     let t = match cmd {
@@ -87,6 +93,9 @@ where
         .collect()
 }
 
+/// Exit code when the environment cannot run the requested interface (no terminal, no display).
+pub const EXIT_USAGE: u8 = 2;
+
 /// Interactive commands run on the main thread, before (and without) the CLI's async runtime:
 /// native toolkits require the main thread, and the UI runs the engine on a runtime of its own.
 /// Returns `None` for every other command.
@@ -96,26 +105,49 @@ pub fn ui_entry(cli: &Cli) -> Option<ExitCode> {
         let (args, window) = match &cli.command {
             Some(Command::Top(a)) => (Some(a), false),
             Some(Command::Gui(a)) => (Some(a), true),
-            None => (None, gui_available()),
+            None => (None, gui_available().is_ok()),
             Some(_) => return None,
         };
-        if cli.command.is_none() && !window && !std::io::stdout().is_terminal() {
+        let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+        if cli.command.is_none() && !window && !interactive {
             let _ = Cli::command().print_help();
             return Some(ExitCode::SUCCESS);
         }
+        let monochrome = match cli.color {
+            ColorChoice::Always => false,
+            ColorChoice::Never => true,
+            ColorChoice::Auto => std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty()),
+        };
+        let mut launch = crate::ui::Launch {
+            monochrome,
+            ..Default::default()
+        };
         if let Some(a) = args {
-            crate::ui::set_launch(crate::ui::Launch {
+            launch = crate::ui::Launch {
                 target: a.target.clone(),
                 endpoint: a.endpoint.clone(),
+                region: a.region.clone(),
                 preset: a.preset.clone(),
                 duration: a.duration.clone(),
                 concurrency: a.concurrency.map(|c| c.to_string()),
+                ca_cert: a.ca_cert.clone(),
                 insecure: a.insecure,
+                proxy: a.proxy.clone(),
                 anonymous: a.anonymous,
-            });
+                monochrome,
+            };
         }
+        crate::ui::set_launch(launch);
         if window {
             return Some(run_window());
+        }
+        if !interactive {
+            eprintln!(
+                "{} `oprobe top` needs an interactive terminal; use `oprobe run` for scripts \
+                 (or `oprobe gui` for a window).",
+                red(&bold("error:"))
+            );
+            return Some(ExitCode::from(EXIT_USAGE));
         }
         Some(match crate::ui::run_tui() {
             Ok(()) => ExitCode::SUCCESS,
@@ -146,26 +178,47 @@ pub fn ui_entry(cli: &Cli) -> Option<ExitCode> {
 }
 
 /// Whether a native window can be shown: built with `gui`, and a display is present.
+/// The error says why not.
 #[cfg(feature = "tui")]
-fn gui_available() -> bool {
+fn gui_available() -> std::result::Result<(), &'static str> {
     if !cfg!(feature = "gui") {
-        return false;
+        return Err("this oprobe was built without native windows");
     }
+    let ssh = std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some();
     if cfg!(target_os = "linux") {
-        return std::env::var_os("WAYLAND_DISPLAY").is_some()
-            || std::env::var_os("DISPLAY").is_some();
+        let display = std::env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty())
+            || std::env::var_os("DISPLAY").is_some_and(|v| !v.is_empty());
+        return if display {
+            Ok(())
+        } else if ssh {
+            Err("no display in this SSH session (DISPLAY / WAYLAND_DISPLAY are not set)")
+        } else {
+            Err("no display (DISPLAY / WAYLAND_DISPLAY are not set)")
+        };
     }
     // macOS / Windows: a remote shell has no session to draw on.
-    std::env::var_os("SSH_CONNECTION").is_none()
+    if ssh {
+        Err("no desktop session to draw on in an SSH session")
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(feature = "tui")]
 fn run_window() -> ExitCode {
     #[cfg(feature = "gui")]
     {
+        if let Err(why) = gui_available() {
+            let msg = format!(
+                "cannot open a window: {why}. Use `oprobe top` for the same workbench in this \
+                 terminal."
+            );
+            eprintln!("{} {msg}", red(&bold("error:")));
+            crate::ui::log_fatal(&msg);
+            return ExitCode::from(EXIT_USAGE);
+        }
         detach_console();
-        crate::ui::run_gui();
-        ExitCode::SUCCESS
+        crate::ui::run_gui()
     }
     #[cfg(not(feature = "gui"))]
     {
@@ -344,10 +397,12 @@ pub fn build_profile(
 
     let kn = &mut p.knobs;
     if let Some(v) = k.concurrency {
-        kn.concurrency = v.max(1);
+        anyhow::ensure!(v >= 1, "concurrency must be at least 1");
+        kn.concurrency = v;
     }
     if let Some(v) = k.io_concurrency {
-        kn.io_concurrency = v.max(1);
+        anyhow::ensure!(v >= 1, "I/O concurrency must be at least 1");
+        kn.io_concurrency = v;
     }
     if let Some(v) = &k.chunk_size {
         kn.chunk_size = parse_size("--chunk-size", v)?;
@@ -407,6 +462,7 @@ pub fn build_profile(
 fn install_ctrl_c(cancel: Cancel) {
     tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
+            INTERRUPTED.store(true, std::sync::atomic::Ordering::SeqCst);
             cancel.cancel();
             eprintln!(
                 "\n{} stopping… cleaning up test data (press Ctrl-C again to abort immediately)",
@@ -531,21 +587,86 @@ async fn cmd_run(a: RunArgs) -> Result<ExitCode> {
     );
     save_outputs(&report, &a.output)?;
     emit(&report, a.output.format)?;
-    if cancel.is_cancelled() {
-        eprintln!(
-            "{}",
-            yellow("run interrupted: results cover the partial window")
-        );
+    if report.interrupted || cancel.is_cancelled() {
+        return Ok(interrupted_exit("run"));
     }
     Ok(gate_exit(&report, &a.output))
+}
+
+/// Exit code of a command stopped by Ctrl-C (SIGINT), as shells report it.
+pub const EXIT_INTERRUPTED: u8 = 130;
+
+/// A run stopped by Ctrl-C: say so (its numbers cover only part of the window) and exit 130,
+/// so scripts and CI never mistake a partial result for a complete one.
+fn interrupted_exit(what: &str) -> ExitCode {
+    eprintln!(
+        "{} {what} interrupted — partial results: they cover only the time before Ctrl-C",
+        yellow(&bold("■"))
+    );
+    ExitCode::from(EXIT_INTERRUPTED)
 }
 
 // ---------------------------------------------------------------------------------------
 // tune
 // ---------------------------------------------------------------------------------------
 
+/// The tuner's search settings, as text the user typed (flags or the app's Tune page).
+#[derive(Clone, Copy, Debug)]
+pub struct TuneSettings<'a> {
+    pub trial_duration: &'a str,
+    pub trial_warmup: &'a str,
+    pub max_trials: usize,
+    pub max_concurrency: usize,
+    pub cooldown: &'a str,
+}
+
+impl Default for TuneSettings<'static> {
+    /// `oprobe tune`'s defaults.
+    fn default() -> Self {
+        Self {
+            trial_duration: tune_defaults::TRIAL_DURATION,
+            trial_warmup: tune_defaults::TRIAL_WARMUP,
+            max_trials: tune_defaults::MAX_TRIALS,
+            max_concurrency: tune_defaults::MAX_CONCURRENCY,
+            cooldown: tune_defaults::COOLDOWN,
+        }
+    }
+}
+
+/// Validate tuner settings and build the options `oprobe tune` and the app both run.
+pub fn tune_options(
+    objective: crate::tune::Objective,
+    s: &TuneSettings<'_>,
+    rate: Option<f64>,
+) -> Result<crate::tune::TuneOptions> {
+    let duration = parse_duration(s.trial_duration).context("invalid trial duration")?;
+    anyhow::ensure!(
+        !duration.is_zero(),
+        "the trial duration must be greater than zero"
+    );
+    anyhow::ensure!(
+        s.max_trials >= tune_defaults::MIN_TRIALS,
+        "max trials must be at least {}",
+        tune_defaults::MIN_TRIALS
+    );
+    anyhow::ensure!(s.max_concurrency >= 1, "max concurrency must be at least 1");
+    Ok(crate::tune::TuneOptions {
+        objective,
+        trial: RunOptions {
+            duration,
+            warmup: parse_duration(s.trial_warmup).context("invalid trial warmup")?,
+            max_ops: None,
+            rate,
+            trace_slow_ops: false,
+        },
+        max_concurrency: s.max_concurrency,
+        max_trials: s.max_trials,
+        cooldown: parse_duration(s.cooldown).context("invalid cooldown")?,
+    })
+}
+
 async fn cmd_tune(a: TuneArgs) -> Result<ExitCode> {
-    use crate::tune::{Objective, TuneEvent, TuneOptions, codegen, tune};
+    use crate::tune::{Objective, TuneEvent, codegen, tune};
     let mut profile = build_profile(&a.target, &a.workload, &a.knobs, &a.cost)?;
     if let Some(p) = a.p99_ms {
         profile.sla.p99_ms = Some(p);
@@ -560,24 +681,23 @@ async fn cmd_tune(a: TuneArgs) -> Result<ExitCode> {
             eprintln!("{} {m}", dim("·"));
         }
     });
-    let session = Session::open(profile, cancel.clone(), msg).await?;
-    let opts = TuneOptions {
-        objective: match a.objective {
-            ObjectiveArg::Throughput => Objective::Throughput,
-            ObjectiveArg::Latency => Objective::Latency,
-            ObjectiveArg::Cost => Objective::Cost,
-        },
-        trial: RunOptions {
-            duration: parse_duration(&a.trial_duration)?,
-            warmup: parse_duration(&a.trial_warmup)?,
-            max_ops: None,
-            rate: session.profile.workload.rate,
-            trace_slow_ops: false,
-        },
-        max_concurrency: a.max_concurrency,
-        max_trials: a.max_trials.max(2),
-        cooldown: parse_duration(&a.cooldown)?,
+    let objective = match a.objective {
+        ObjectiveArg::Throughput => Objective::Throughput,
+        ObjectiveArg::Latency => Objective::Latency,
+        ObjectiveArg::Cost => Objective::Cost,
     };
+    let opts = tune_options(
+        objective,
+        &TuneSettings {
+            trial_duration: &a.trial_duration,
+            trial_warmup: &a.trial_warmup,
+            max_trials: a.max_trials,
+            max_concurrency: a.max_concurrency,
+            cooldown: &a.cooldown,
+        },
+        profile.workload.rate,
+    )?;
+    let session = Session::open(profile, cancel.clone(), msg).await?;
     if !quiet {
         eprintln!(
             "{} {} {}",
@@ -704,6 +824,9 @@ async fn cmd_tune(a: TuneArgs) -> Result<ExitCode> {
             print!("{}", terminal::render(&report));
         }
         f => emit(&report, f)?,
+    }
+    if cancel.is_cancelled() {
+        return Ok(interrupted_exit("tuning"));
     }
     Ok(gate_exit(&report, &a.output))
 }

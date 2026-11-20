@@ -219,8 +219,23 @@ fn push_written(ctx: &OpCtx, path: String, crc: u32) {
 }
 
 /// Short, stable error class for aggregation (`rate_limited`, `not_found`, `timeout`, ...).
-pub fn error_class(e: &anyhow::Error) -> String {
+///
+/// Classification uses OpenDAL's [`opendal::ErrorKind`] and `last_status`, the HTTP status of
+/// the operation's last backend request (when one got a response), never substrings of the
+/// formatted error: object names (`obj-00429.bin`), dates and ports contain digits too.
+pub fn error_class(e: &anyhow::Error, last_status: Option<u16>) -> String {
     if let Some(oe) = e.downcast_ref::<opendal::Error>() {
+        match oe.kind() {
+            opendal::ErrorKind::RateLimited => return "rate_limited".into(),
+            opendal::ErrorKind::PermissionDenied => return "permission_denied".into(),
+            opendal::ErrorKind::NotFound => return "not_found".into(),
+            _ => {}
+        }
+        match last_status {
+            Some(429 | 503) => return "rate_limited".into(),
+            Some(401 | 403) => return "permission_denied".into(),
+            _ => {}
+        }
         let msg = oe.to_string().to_ascii_lowercase();
         if msg.contains("timeout") || msg.contains("timed out") {
             return "timeout".into();
@@ -229,16 +244,14 @@ pub fn error_class(e: &anyhow::Error) -> String {
             return "connect".into();
         }
         return match oe.kind() {
-            opendal::ErrorKind::NotFound => "not_found",
-            opendal::ErrorKind::PermissionDenied => "permission_denied",
-            opendal::ErrorKind::RateLimited => "rate_limited",
             opendal::ErrorKind::ConfigInvalid => "config_invalid",
             opendal::ErrorKind::Unsupported => "unsupported",
             opendal::ErrorKind::ConditionNotMatch => "condition_not_match",
             _ => {
-                if msg.contains("503") || msg.contains("slowdown") || msg.contains("429") {
-                    "rate_limited"
-                } else if msg.contains("send request") || msg.contains("response body") {
+                if msg.contains("send http request")
+                    || msg.contains("send request")
+                    || msg.contains("response body")
+                {
                     "network"
                 } else {
                     "unexpected"
@@ -248,4 +261,40 @@ pub fn error_class(e: &anyhow::Error) -> String {
         .into();
     }
     "other".into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn err(kind: opendal::ErrorKind, msg: &str) -> anyhow::Error {
+        opendal::Error::new(kind, msg).into()
+    }
+
+    #[test]
+    fn error_class_ignores_digits_in_paths() {
+        use opendal::ErrorKind::*;
+        // An object name that looks like a status code is not throttling or auth.
+        let e = err(
+            Unexpected,
+            "read failed: path oprobe-run-x/data/obj-00429.bin port 4030",
+        );
+        assert_eq!(error_class(&e, Some(500)), "unexpected");
+        let e = err(Unexpected, "obj-00503.bin 2026-04-03T401");
+        assert_eq!(error_class(&e, None), "unexpected");
+        assert_eq!(error_class(&err(RateLimited, "x"), None), "rate_limited");
+        assert_eq!(
+            error_class(&err(Unexpected, "x"), Some(503)),
+            "rate_limited"
+        );
+        assert_eq!(
+            error_class(&err(Unexpected, "x"), Some(403)),
+            "permission_denied"
+        );
+        assert_eq!(
+            error_class(&err(PermissionDenied, "x"), None),
+            "permission_denied"
+        );
+        assert_eq!(error_class(&err(NotFound, "x"), Some(404)), "not_found");
+    }
 }

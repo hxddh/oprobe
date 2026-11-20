@@ -194,7 +194,10 @@ pub fn per_op_usage(s: &Snapshot) -> PerOpUsage {
     let ops = s.summary.ops.max(1) as f64;
     let mut u = PerOpUsage::default();
     for a in &s.apis {
-        let n = a.count as f64 / ops;
+        // Requests that never reached the service (status 0: connect failure, client timeout
+        // before a response) are not billed.
+        let unsent = a.status.get(&0).copied().unwrap_or(0);
+        let n = a.count.saturating_sub(unsent) as f64 / ops;
         match a.api.billing_class() {
             BillingClass::Write => u.write_requests += n,
             BillingClass::List => u.list_requests += n,
@@ -205,7 +208,7 @@ pub fn per_op_usage(s: &Snapshot) -> PerOpUsage {
         let failed: u64 = a
             .status
             .iter()
-            .filter(|(code, _)| **code == 0 || (**code >= 400 && **code != 404))
+            .filter(|(code, _)| **code >= 400 && **code != 404)
             .map(|(_, c)| *c)
             .sum();
         if a.api.billing_class() != BillingClass::Free {
@@ -222,18 +225,21 @@ pub fn per_op_usage(s: &Snapshot) -> PerOpUsage {
     u
 }
 
+/// Providers' "GB" for egress and storage is a binary gigabyte (2^30 bytes).
+const BILLING_GB: f64 = 1024.0 * 1024.0 * 1024.0;
+
 fn price(key: &str, p: &Pricing, u: &PerOpUsage, spec: &CostSpec) -> ProviderCost {
     let m = spec.monthly_ops.max(0.0) / 1e6; // millions of ops
     let req_per_m = u.write_requests * p.write_per_million
         + u.list_requests * p.list_per_million
         + u.read_requests * p.read_per_million
         + u.delete_requests * p.delete_per_million;
-    let egress_per_m = u.download_bytes * 1e6 / 1e9 * spec.egress_fraction * p.egress_per_gb;
+    let egress_per_m = u.download_bytes * 1e6 / BILLING_GB * spec.egress_fraction * p.egress_per_gb;
     let avg_req_price = {
         let n = u.write_requests + u.list_requests + u.read_requests + u.delete_requests;
         if n > 0.0 { req_per_m / n } else { 0.0 }
     };
-    let stored_gb = spec.stored_gib * 1.073_741_824;
+    let stored_gb = spec.stored_gib;
     ProviderCost {
         key: key.to_owned(),
         provider: p.provider.clone(),
@@ -243,9 +249,12 @@ fn price(key: &str, p: &Pricing, u: &PerOpUsage, spec: &CostSpec) -> ProviderCos
         total_usd: (req_per_m + egress_per_m) * m + stored_gb * p.storage_gb_month,
         per_million_ops_usd: req_per_m + egress_per_m,
         failed_requests_usd: u.failed_requests * avg_req_price * m,
-        overread_usd: u.overread_bytes * 1e6 / 1e9 * spec.egress_fraction * p.egress_per_gb * m,
+        overread_usd: u.overread_bytes * 1e6 / BILLING_GB
+            * spec.egress_fraction
+            * p.egress_per_gb
+            * m,
         cache_savings_usd: (u.cache_saved_reads * p.read_per_million
-            + u.cache_saved_bytes * 1e6 / 1e9 * spec.egress_fraction * p.egress_per_gb)
+            + u.cache_saved_bytes * 1e6 / BILLING_GB * spec.egress_fraction * p.egress_per_gb)
             * m,
     }
 }
@@ -274,7 +283,7 @@ pub fn cost_report(
     CostReport {
         pricing_as_of: PRICING_AS_OF.to_owned(),
         monthly_ops: spec.monthly_ops,
-        stored_gb: spec.stored_gib * 1.073_741_824,
+        stored_gb: spec.stored_gib,
         egress_fraction: spec.egress_fraction,
         per_op: u,
         selected,
@@ -318,14 +327,16 @@ mod tests {
             ..Default::default()
         };
         let r = cost_report(&s, &spec, "s3", None);
-        // per million ops: 2M GET * 0.40 + 1M PUT * 5.00 = 5.80 ; egress 1 TB * 0.09 = 90
+        // per million ops: 2M GET * 0.40 + 1M PUT * 5.00 = 5.80 ;
+        // egress 1e12 B = 931.32 GiB (billed "GB") * 0.09 = 83.82
         assert!(
             (r.selected.requests_usd - 5.80).abs() < 1e-9,
             "{}",
             r.selected.requests_usd
         );
-        assert!((r.selected.egress_usd - 90.0).abs() < 1e-6);
-        assert!((r.selected.overread_usd - 45.0).abs() < 1e-6);
+        let gib = 1e12 / (1u64 << 30) as f64;
+        assert!((r.selected.egress_usd - gib * 0.09).abs() < 1e-6);
+        assert!((r.selected.overread_usd - gib * 0.09 / 2.0).abs() < 1e-6);
         assert_eq!(r.comparison.len(), presets().len());
         let r2 = r
             .comparison
@@ -333,6 +344,36 @@ mod tests {
             .find(|c| c.key == "cloudflare-r2")
             .unwrap();
         assert_eq!(r2.egress_usd, 0.0);
+    }
+
+    #[test]
+    fn requests_that_never_left_the_client_are_not_billed() {
+        let mut s = Snapshot {
+            summary: Summary {
+                ops: 100,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        s.apis = vec![ApiStats {
+            api: Api::GetObject,
+            count: 100,
+            status: [(0u16, 40u64), (200, 50), (503, 10)].into_iter().collect(),
+            ..Default::default()
+        }];
+        let u = per_op_usage(&s);
+        assert!((u.read_requests - 0.6).abs() < 1e-9, "{}", u.read_requests);
+        assert!(
+            (u.failed_requests - 0.1).abs() < 1e-9,
+            "{}",
+            u.failed_requests
+        );
+        let spec = CostSpec {
+            stored_gib: 10.0,
+            ..Default::default()
+        };
+        let r = cost_report(&s, &spec, "s3", None);
+        assert_eq!(r.stored_gb, 10.0);
     }
 
     #[test]

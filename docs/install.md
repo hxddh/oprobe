@@ -65,7 +65,7 @@ cp completions/oprobe.fish ~/.config/fish/completions/
 ```bash
 sha256sum --ignore-missing -c SHA256SUMS                 # Linux
 shasum -a 256 --ignore-missing -c SHA256SUMS             # macOS
-Get-FileHash oprobe-2.0.0-x64.msi -Algorithm SHA256       # Windows
+Get-FileHash oprobe-2.0.1-x64.msi -Algorithm SHA256       # Windows
 ```
 
 ## Unsigned macOS and Windows packages

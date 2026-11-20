@@ -21,6 +21,34 @@ Examples:
 
 Docs: https://github.com/hxddh/oprobe/tree/main/docs";
 
+/// Defaults of `oprobe tune`, shared with the app's Tune page so both run the same search.
+pub mod tune_defaults {
+    /// Measurement window per trial.
+    pub const TRIAL_DURATION: &str = "5s";
+    /// Warmup per trial.
+    pub const TRIAL_WARMUP: &str = "1s";
+    /// Maximum number of trials.
+    pub const MAX_TRIALS: usize = 24;
+    /// Fewest trials a search can run (a baseline and one candidate).
+    pub const MIN_TRIALS: usize = 2;
+    /// Highest concurrency to try.
+    pub const MAX_CONCURRENCY: usize = 256;
+    /// Pause after a throttled trial.
+    pub const COOLDOWN: &str = "5s";
+}
+
+/// A whole number that must be at least `MIN` (rejected with a clear error, never clamped).
+fn at_least<const MIN: usize>(v: &str) -> Result<usize, String> {
+    let n: usize = v
+        .trim()
+        .parse()
+        .map_err(|_| format!("`{v}` is not a whole number"))?;
+    if n < MIN {
+        return Err(format!("must be at least {MIN}"));
+    }
+    Ok(n)
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "oprobe",
@@ -106,6 +134,7 @@ pub struct TargetArgs {
     /// Custom endpoint (MinIO, R2, Ceph, private clouds)
     #[arg(long)]
     pub endpoint: Option<String>,
+    /// Region of the bucket (e.g. us-east-1); most S3-compatible services accept any value
     #[arg(long)]
     pub region: Option<String>,
     /// Extra backend option, repeatable (e.g. -o enable_virtual_host_style=true)
@@ -172,10 +201,10 @@ pub struct WorkloadArgs {
 #[command(next_help_heading = "Client knobs")]
 pub struct KnobArgs {
     /// Concurrent operations (workers)
-    #[arg(short = 'c', long)]
+    #[arg(short = 'c', long, value_parser = at_least::<1>)]
     pub concurrency: Option<usize>,
     /// Per-operation reader/writer parallelism
-    #[arg(long)]
+    #[arg(long, value_parser = at_least::<1>)]
     pub io_concurrency: Option<usize>,
     /// Reader/writer chunk and multipart part size (e.g. 8MiB)
     #[arg(long)]
@@ -316,19 +345,19 @@ pub struct TuneArgs {
     #[arg(long, value_enum, default_value_t = ObjectiveArg::Throughput, help_heading = "Tuning")]
     pub objective: ObjectiveArg,
     /// Measurement window per trial
-    #[arg(long, default_value = "5s", help_heading = "Tuning")]
+    #[arg(long, default_value = tune_defaults::TRIAL_DURATION, help_heading = "Tuning")]
     pub trial_duration: String,
     /// Warmup per trial
-    #[arg(long, default_value = "1s", help_heading = "Tuning")]
+    #[arg(long, default_value = tune_defaults::TRIAL_WARMUP, help_heading = "Tuning")]
     pub trial_warmup: String,
     /// Maximum number of trials
-    #[arg(long, default_value_t = 24, help_heading = "Tuning")]
+    #[arg(long, default_value_t = tune_defaults::MAX_TRIALS, value_parser = at_least::<{ tune_defaults::MIN_TRIALS }>, help_heading = "Tuning")]
     pub max_trials: usize,
     /// Highest concurrency to try
-    #[arg(long, default_value_t = 256, help_heading = "Tuning")]
+    #[arg(long, default_value_t = tune_defaults::MAX_CONCURRENCY, value_parser = at_least::<1>, help_heading = "Tuning")]
     pub max_concurrency: usize,
     /// Pause after a throttled trial
-    #[arg(long, default_value = "5s", help_heading = "Tuning")]
+    #[arg(long, default_value = tune_defaults::COOLDOWN, help_heading = "Tuning")]
     pub cooldown: String,
     /// p99 latency SLA in ms (trials above it are rejected)
     #[arg(long, help_heading = "Tuning")]
@@ -407,11 +436,20 @@ pub struct TopArgs {
     #[arg(short, long)]
     pub duration: Option<String>,
     /// Concurrent operations
-    #[arg(short, long)]
+    #[arg(short, long, value_parser = at_least::<1>)]
     pub concurrency: Option<usize>,
+    /// Region of the bucket (e.g. us-east-1)
+    #[arg(long)]
+    pub region: Option<String>,
+    /// Trust an extra PEM CA bundle
+    #[arg(long, value_name = "PEM")]
+    pub ca_cert: Option<PathBuf>,
     /// Skip TLS certificate verification
     #[arg(long)]
     pub insecure: bool,
+    /// Egress proxy URL, or `none` to ignore HTTPS_PROXY/HTTP_PROXY
+    #[arg(long)]
+    pub proxy: Option<String>,
     /// Public bucket, no credentials
     #[arg(long)]
     pub anonymous: bool,
