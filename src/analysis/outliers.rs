@@ -205,10 +205,12 @@ fn attributes(r: &ReqRow, bins: &TimeBins) -> [(&'static str, String); 12] {
 /// The lift of each value is smoothed (add-one on both sides, so a value seen twice in a tiny
 /// selection never gets an infinite lift); a value needs at least two selected requests and
 /// 5 % of the selection, and its over-representation must be significant (two-proportion
-/// z ≥ 1.65). Values are scored by `selected_ratio × ln(lift)` — distinctive *and* common —
+/// z ≥ 1.65; 3 for the many-valued `remote`, `conn` and `time`; a time selection never
+/// ranks `time`). Values are scored by `selected_ratio × ln(lift)` — distinctive *and* common —
 /// damped while the evidence is weak (z < 4).
 pub fn attribute(reqs: &[ReqRow], sel: &Selection) -> Attribution {
     let bins = TimeBins::new(reqs);
+    let by_time = sel.from_us.is_some() || sel.to_us.is_some();
     let mut selected: HashMap<(&'static str, String), u64> = HashMap::new();
     let mut rest: HashMap<(&'static str, String), u64> = HashMap::new();
     let (mut n_sel, mut n_rest) = (0u64, 0u64);
@@ -220,7 +222,8 @@ pub fn attribute(reqs: &[ReqRow], sel: &Selection) -> Attribution {
         };
         *n += 1;
         for (k, v) in attributes(r, &bins) {
-            if !v.is_empty() {
+            // A time selection trivially "explains" itself by time.
+            if !v.is_empty() && !(k == "time" && by_time) {
                 *map.entry((k, v)).or_default() += 1;
             }
         }
@@ -244,7 +247,13 @@ pub fn attribute(reqs: &[ReqRow], sel: &Selection) -> Attribution {
                 rc as f64,
                 n_rest as f64,
             );
-            if lift <= 1.0 || z < MIN_Z {
+            // Many-valued attributes get a stricter bar (many chances for a coincidence).
+            let min_z = if matches!(attr, "conn" | "time" | "remote") {
+                3.0
+            } else {
+                MIN_Z
+            };
+            if lift <= 1.0 || z < min_z {
                 return None;
             }
             let score = s * lift.ln() * (z / 4.0).min(1.0);

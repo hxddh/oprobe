@@ -546,6 +546,51 @@ mod tests {
     }
 
     #[test]
+    fn per_api_spend_and_waste() {
+        for (name, class) in [
+            ("GetObject", BillingClass::Read),
+            ("HeadObject", BillingClass::Read),
+            ("PutObject", BillingClass::Write),
+            ("CompleteMultipartUpload", BillingClass::Write),
+            ("ListObjectsV2", BillingClass::List),
+            ("DeleteObjects", BillingClass::Delete),
+            ("Control", BillingClass::Free),
+        ] {
+            assert_eq!(billing_class_of(name), class, "{name}");
+        }
+        let mut s = Snapshot {
+            summary: Summary {
+                ops: 100,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        s.apis = vec![
+            ApiStats {
+                api: Api::PutObject,
+                count: 100,
+                status: [(200u16, 100u64)].into_iter().collect(),
+                ..Default::default()
+            },
+            ApiStats {
+                api: Api::GetObject,
+                count: 100,
+                status: [(200u16, 50u64), (503, 50)].into_iter().collect(),
+                ..Default::default()
+            },
+        ];
+        let spec = CostSpec {
+            monthly_ops: 1e6,
+            ..Default::default()
+        };
+        let r = cost_report(&s, &spec, "s3", Some("https://s3.us-east-1.amazonaws.com"));
+        assert_eq!(r.by_api[0].api, "PutObject");
+        assert!((r.by_api[0].monthly_usd - 5.0).abs() < 1e-9);
+        assert!(r.by_api[0].share_pct > 90.0);
+        assert!(r.waste_usd > 0.0);
+    }
+
+    #[test]
     fn detects_providers() {
         assert_eq!(
             detect_provider("s3", Some("https://acc.r2.cloudflarestorage.com")),

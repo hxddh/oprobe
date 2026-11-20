@@ -1,4 +1,4 @@
-//! `oprobe runs list|show|rm|gc` and `oprobe compare` (the 2.x `diff` gate on RUNREFs).
+//! `oprobe runs list|show|rm|gc` (`compare` lives in `compare.rs`).
 
 use anyhow::Result;
 use schemars::JsonSchema;
@@ -9,9 +9,9 @@ use super::args::*;
 use crate::errors::{ErrorCode, OprobeError};
 use crate::model::Run;
 use crate::output::CommandOutput;
-use crate::report::diff::{DiffReport, Thresholds, diff};
-use crate::report::style::{bold, dim, red, yellow};
-use crate::report::{markdown, terminal, write_file};
+use crate::report::diff::DiffReport;
+use crate::report::style::{bold, dim, yellow};
+use crate::report::{markdown, terminal};
 use crate::store::RunSummary;
 use crate::util::fmt_ms;
 
@@ -208,55 +208,4 @@ impl CommandOutput for DiffReport {
             crate::errors::exit::GATE
         }
     }
-}
-
-/// Load a RUNREF or file for `compare`.
-fn load(ctx: &Ctx, r: &str) -> Result<Run> {
-    let path = ctx.store().resolve(r)?;
-    crate::store::runs::load_path(&path)
-}
-
-pub fn cmd_compare(a: CompareArgs, ctx: &Ctx) -> Result<u8> {
-    if a.baseline_name.is_some() {
-        return Err(OprobeError::not_implemented("compare --baseline").into());
-    }
-    let Some(base_ref) = a.baseline.as_deref() else {
-        return Err(OprobeError::new(
-            ErrorCode::UsageInvalidArgument,
-            "compare needs a baseline run: `oprobe compare A [B]`",
-        )
-        .with_hint("e.g. `oprobe compare last~1 last` or `oprobe compare base.json cand.json`")
-        .into());
-    };
-    let cand_ref = a.candidate.as_deref().unwrap_or("last");
-    let base = load(ctx, base_ref)?;
-    let cand = load(ctx, cand_ref)?;
-    let t = Thresholds {
-        p99_pct: a.max_p99_increase,
-        p50_pct: a.max_p50_increase,
-        min_latency_delta_ms: a.min_latency_delta_ms,
-        throughput_drop_pct: a.max_throughput_drop,
-        error_rate_pp: a.max_error_increase,
-        request_amp_pct: a.max_request_amp_increase,
-        read_amp_pct: a.max_read_amp_increase,
-        cost_pct: a.max_cost_increase,
-        fail_on_new_throttling: !a.allow_throttling,
-        min_samples: a.min_samples,
-        allow_workload_change: a.allow_workload_change,
-        allow_target_change: a.allow_target_change,
-    };
-    let d = diff(&base.report, &cand.report, &t);
-    if let Some(p) = &a.markdown {
-        write_file(p, &d.render_markdown())?;
-    }
-    if let Some(p) = &a.junit {
-        write_file(p, &d.render_junit())?;
-    }
-    if let Some(p) = &a.json {
-        write_file(p, &serde_json::to_string_pretty(&d)?)?;
-    }
-    if !d.passed && ctx.out.format == crate::output::OutputFormat::Text {
-        ctx.out.info(red(&bold("regression gate failed (exit 3)")));
-    }
-    ctx.out.finish(&d)
 }

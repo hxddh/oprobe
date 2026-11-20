@@ -127,7 +127,7 @@ pub enum Command {
     #[command(subcommand)]
     Runs(RunsCommand),
     /// Re-slice a run by API, connection, remote, stage or second
-    Analyze(PendingArgs),
+    Analyze(AnalyzeArgs),
     /// Narrate a run's causes and advice, or document a finding code
     Explain(PendingArgs),
     /// Named targets: add, list, show, rm, test
@@ -138,9 +138,9 @@ pub enum Command {
     /// Measure DNS / TCP / proxy / TLS handshakes and cold vs warm TTFB of an endpoint
     Probe(ProbeArgs),
     /// Continuous low-rate probing with SLOs and a Prometheus endpoint
-    Watch(PendingArgs),
+    Watch(WatchArgs),
     /// Run the same workload across targets / knob values and rank them
-    Matrix(PendingArgs),
+    Matrix(MatrixArgs),
     /// Correctness & compatibility suite for a target
     Compat(PendingArgs),
     /// Named baselines: set, list, rm, show
@@ -193,7 +193,7 @@ pub enum RunsCommand {
     /// Open a run in the app
     Open(PendingArgs),
     /// Export a run (html, md, json, ndjson, csv, har, otlp)
-    Export(PendingArgs),
+    Export(ExportArgs),
     /// Delete saved runs
     Rm(RunsRmArgs),
     /// Delete old runs (keeps the newest and every baseline run)
@@ -274,13 +274,13 @@ pub struct TargetNameArg {
 #[derive(Subcommand, Debug)]
 pub enum BaselineCommand {
     /// Create or update a named baseline
-    Set(PendingArgs),
+    Set(BaselineSetArgs),
     /// List baselines
-    List(PendingArgs),
+    List,
     /// Delete a baseline
-    Rm(PendingArgs),
-    /// Show a baseline's runs
-    Show(PendingArgs),
+    Rm(BaselineNameArg),
+    /// Show a baseline's runs and their spread
+    Show(BaselineNameArg),
 }
 
 #[derive(Subcommand, Debug)]
@@ -799,4 +799,149 @@ pub struct InitArgs {
     /// Write to a file instead of stdout
     #[arg(long = "out", value_name = "FILE")]
     pub file: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub struct BaselineSetArgs {
+    /// Baseline name (letters, digits, - _ .)
+    pub name: String,
+    /// Runs: RUNREFs, comma lists, or `all:LABEL`
+    #[arg(value_name = "RUNREF")]
+    pub runs: Vec<String>,
+    /// Use the newest N stored runs
+    #[arg(long, value_name = "N")]
+    pub last: Option<usize>,
+    /// Keep at most this many runs (rolling window; default 10, or the number given)
+    #[arg(long, value_name = "N")]
+    pub window: Option<usize>,
+    /// Add to the baseline's runs instead of replacing them
+    #[arg(long)]
+    pub append: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct BaselineNameArg {
+    pub name: String,
+}
+
+#[derive(Args, Debug)]
+pub struct AnalyzeArgs {
+    /// Run id, id prefix, `last`, `last~N`, label, or path to a .oprobe file
+    #[arg(value_name = "RUNREF", default_value = "last")]
+    pub run: String,
+    /// Group requests by: api, conn, remote, stage, second, status
+    #[arg(long, value_name = "KEY")]
+    pub by: Option<String>,
+    /// Only requests started in this window, seconds from the window start (e.g. 5..10)
+    #[arg(long, value_name = "A..B")]
+    pub window: Option<String>,
+    /// Only requests matching all conditions, e.g. api=GetObject,status=503 (repeatable)
+    #[arg(long = "where", value_name = "K=V,…")]
+    pub r#where: Vec<String>,
+    /// Attribute the slowest PCT percent of the (filtered) requests (default 1)
+    #[arg(long, value_name = "PCT")]
+    pub slowest: Option<f64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum ExportFormat {
+    Json,
+    Ndjson,
+    Csv,
+    Har,
+    Otlp,
+    Md,
+    Html,
+}
+
+#[derive(Args, Debug)]
+pub struct ExportArgs {
+    /// Run id, id prefix, `last`, `last~N`, label, or path to a .oprobe file
+    #[arg(value_name = "RUNREF")]
+    pub run: String,
+    /// Export format
+    #[arg(long, short = 'f', value_enum)]
+    pub format: ExportFormat,
+    /// Write to this file (default: stdout)
+    #[arg(long, value_name = "PATH")]
+    pub out: Option<PathBuf>,
+    /// OTLP/HTTP collector to push to (e.g. http://localhost:4318); with --format otlp
+    #[arg(long, value_name = "URL")]
+    pub endpoint: Option<String>,
+    /// CSV rows: requests or ops
+    #[arg(long, default_value = "requests")]
+    pub table: String,
+    /// OTLP signal: traces, metrics or all
+    #[arg(long, default_value = "all")]
+    pub signal: String,
+}
+
+#[derive(Args, Debug)]
+pub struct WatchArgs {
+    #[command(flatten)]
+    pub target: TargetArgs,
+    #[command(flatten)]
+    pub workload: WorkloadArgs,
+    #[command(flatten)]
+    pub knobs: KnobArgs,
+    #[command(flatten)]
+    pub cost: CostArgs,
+    #[command(flatten)]
+    pub safety: SafetyArgs,
+    /// Time between probe windows (each window lasts --duration, default 5s)
+    #[arg(long, default_value = "10s", help_heading = "Watch")]
+    pub interval: String,
+    /// Rolling window the SLOs are evaluated over
+    #[arg(long, default_value = "5m", help_heading = "Watch")]
+    pub window: String,
+    /// Service level objective, repeatable: p99<200ms, p50<50ms, errors<1%, throttle<1%,
+    /// availability>99.9%
+    #[arg(long, value_name = "SLO", help_heading = "Watch")]
+    pub slo: Vec<String>,
+    /// Serve Prometheus metrics on ADDR (/metrics), e.g. 127.0.0.1:9464
+    #[arg(long, value_name = "ADDR", help_heading = "Watch")]
+    pub listen: Option<String>,
+    /// Push OTLP metrics after every window (collector base URL, e.g. http://localhost:4318)
+    #[arg(long, value_name = "URL", help_heading = "Watch")]
+    pub otlp_endpoint: Option<String>,
+    /// Stop after N probe windows (default: until Ctrl-C)
+    #[arg(long, value_name = "N", help_heading = "Watch")]
+    pub count: Option<u64>,
+}
+
+impl WatchArgs {
+    /// Probe rate when `--rate` is not given (ops/s): low enough to watch production.
+    pub fn default_rate(&self) -> f64 {
+        2.0
+    }
+}
+
+#[derive(Args, Debug)]
+pub struct MatrixArgs {
+    #[command(flatten)]
+    pub target: TargetArgs,
+    #[command(flatten)]
+    pub workload: WorkloadArgs,
+    #[command(flatten)]
+    pub knobs: KnobArgs,
+    #[command(flatten)]
+    pub cost: CostArgs,
+    #[command(flatten)]
+    pub sla: SlaArgs,
+    #[command(flatten)]
+    pub safety: SafetyArgs,
+    /// Targets to compare (names or URLs, comma-separated or repeated)
+    #[arg(long, value_name = "A,B", help_heading = "Matrix")]
+    pub targets: Vec<String>,
+    /// A knob and its values, repeatable: concurrency=8,16,32 · http=h1,h2 ·
+    /// addressing=virtual,path · io_concurrency · chunk_size · range_gap · max_inflight ·
+    /// keep_alive=on,off · cache=off,256MiB · retries · tail_cut=on,off · preset
+    #[arg(long, value_name = "KNOB=V1,V2", help_heading = "Matrix")]
+    pub vary: Vec<String>,
+    /// Rank cells by throughput, mib, p50, p99 or cost
+    #[arg(long, default_value = "throughput", help_heading = "Matrix")]
+    pub rank_by: String,
+    /// Label of the stored runs (default matrix-<id>)
+    #[arg(long, help_heading = "Matrix")]
+    pub label: Option<String>,
 }

@@ -140,6 +140,18 @@ impl Ctx<'_> {
         if let Some(rate) = r.workload.rate_per_s {
             cmd += &format!(" --rate {rate}");
         }
+        let ds = &r.workload.dataset;
+        match &ds.existing_prefix {
+            Some(p) => cmd += &format!(" --existing {p}"),
+            None if ds.objects_count > 0 => {
+                cmd += &format!(
+                    " --objects {} --object-size {}",
+                    ds.objects_count,
+                    crate::util::ByteSize(ds.object_size_bytes)
+                )
+            }
+            None => {}
+        }
         if let Some(e) = r.target.endpoint.as_deref() {
             cmd += &format!(" --endpoint {e}");
         }
@@ -1168,7 +1180,10 @@ pub fn derive(run: &Run, legacy: &[diagnosis::Finding]) -> Vec<Finding> {
         push(Some(f), &mut out);
     }
     push(http1(&c), &mut out);
-    push(small_objects(&c), &mut out);
+    // Server-latency-bound runs already carry the same parallelism estimate.
+    if !out.iter().any(|f| f.code == "server_latency") {
+        push(small_objects(&c), &mut out);
+    }
     push(suffix_read(&c), &mut out);
     push(cache_opportunity(&c), &mut out);
     push(cost_hotspot(&c), &mut out);
