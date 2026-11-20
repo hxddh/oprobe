@@ -45,6 +45,8 @@ pub enum Bottleneck {
     Download,
     /// Rate limiting (429/503).
     Throttling,
+    /// Sleeping between retry attempts (errors that are not throttling).
+    RetryBackoff,
     /// In-process backend (memory/fs) service time.
     LocalBackend,
 }
@@ -60,6 +62,7 @@ impl Bottleneck {
             Bottleneck::ServerLatency => "server latency (TTFB)",
             Bottleneck::Download => "download transfer",
             Bottleneck::Throttling => "throttling (429/503)",
+            Bottleneck::RetryBackoff => "retry backoff",
             Bottleneck::LocalBackend => "local backend",
         }
     }
@@ -83,6 +86,9 @@ pub struct TimeShares {
     pub upload: f64,
     pub server: f64,
     pub download: f64,
+    /// Retry layer sleeping between attempts.
+    #[serde(default)]
+    pub retry: f64,
     pub client: f64,
 }
 
@@ -123,15 +129,16 @@ fn finding(
 /// Compute where operation time went. Backend time is split into request stages in
 /// proportion to the measured per-request stage totals.
 pub fn time_shares(s: &Snapshot) -> TimeShares {
-    let (mut q, mut c, mut b, mut cl) = (0.0, 0.0, 0.0, 0.0);
+    let (mut q, mut c, mut b, mut rt, mut cl) = (0.0, 0.0, 0.0, 0.0, 0.0);
     for v in &s.verbs {
         let n = v.count as f64;
         q += v.breakdown.queue_ms * n;
         c += v.breakdown.cache_ms * n;
         b += v.breakdown.backend_ms * n;
+        rt += v.breakdown.retry_ms * n;
         cl += v.breakdown.client_ms * n;
     }
-    let total = q + c + b + cl;
+    let total = q + c + b + rt + cl;
     if total <= 0.0 {
         return TimeShares::default();
     }
@@ -153,6 +160,7 @@ pub fn time_shares(s: &Snapshot) -> TimeShares {
         upload: f(up),
         server: if net > 0.0 { f(srv) } else { b / total },
         download: f(down),
+        retry: rt / total,
         client: cl / total,
     }
 }
@@ -197,10 +205,11 @@ pub fn diagnose(s: &Snapshot, knobs: &Knobs, sla: &Sla, network: bool) -> Diagno
             "throttling",
             format!("{thr} throttled responses (429/503)"),
             format!(
-                "{:.2}% of requests throttled; {} retries, {} total backoff, max Retry-After {} ms",
+                "{:.2}% of requests throttled; {} retries, {} total backoff ({:.0}% of operation time spent waiting to retry), max Retry-After {} ms",
                 thr as f64 / requests * 100.0,
                 s.resilience.retries,
                 fmt_ms(s.resilience.retry_backoff_ms),
+                shares.retry * 100.0,
                 s.resilience.max_retry_after_ms
             ),
             "The service is rate-limiting this request rate. Lower `concurrency` / `max_inflight_requests` (or run `oprobe tune` to find the safe ceiling), spread keys across more prefixes, and keep retries with jitter enabled.",
@@ -221,6 +230,7 @@ pub fn diagnose(s: &Snapshot, knobs: &Knobs, sla: &Sla, network: bool) -> Diagno
             shares.server,
         ),
         (Bottleneck::Download, shares.download),
+        (Bottleneck::RetryBackoff, shares.retry),
         (Bottleneck::Client, shares.client + shares.cache),
     ];
     let (mut bottleneck, top_share) = candidates
@@ -240,6 +250,11 @@ pub fn diagnose(s: &Snapshot, knobs: &Knobs, sla: &Sla, network: bool) -> Diagno
     let cpu_busy = s.client.cpu_pct / 100.0;
     let headline = match bottleneck {
         Bottleneck::None => "No operations completed in the measurement window.".to_owned(),
+        Bottleneck::Throttling if shares.retry >= 0.005 => format!(
+            "Throttling-bound: the service rejected {:.1}% of requests with 429/503; {:.0}% of operation time is retry backoff.",
+            thr as f64 / requests * 100.0,
+            shares.retry * 100.0
+        ),
         Bottleneck::Throttling => format!(
             "Throttling-bound: the service rejected {:.1}% of requests with 429/503.",
             thr as f64 / requests * 100.0
@@ -351,6 +366,18 @@ pub fn diagnose(s: &Snapshot, knobs: &Knobs, sla: &Sla, network: bool) -> Diagno
                 "Use more parallel streams (`io_concurrency`, `concurrency`) with larger `chunk_size`; check NIC, proxy and cross-region links.",
             ));
         }
+        Bottleneck::RetryBackoff => f.push(finding(
+            Severity::Warning,
+            "retry-backoff",
+            "Operations spend their time waiting to retry".into(),
+            format!(
+                "{:.0}% of op time in retry backoff; {} retries, {} total backoff",
+                shares.retry * 100.0,
+                s.resilience.retries,
+                fmt_ms(s.resilience.retry_backoff_ms)
+            ),
+            "Requests fail with temporary errors and are retried after a backoff: see `resilience.error_classes` and the slow-op request timelines for the failing requests.",
+        )),
         Bottleneck::LocalBackend => f.push(finding(
             Severity::Info,
             "local-backend",

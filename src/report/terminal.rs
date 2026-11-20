@@ -46,6 +46,7 @@ pub fn time_share_lines(r: &Report) -> String {
             "time to first byte (server processing + RTT)",
         ),
         ("download", sh.download, "receiving response bodies"),
+        ("retry", sh.retry, "backoff sleeps between retry attempts"),
         ("cache", sh.cache, "local cache lookups"),
         ("client", sh.client, "OpenDAL / signing / CRC / consumer"),
     ];
@@ -150,9 +151,10 @@ pub fn slow_op_block(op: &SlowOp, show_tree: bool) -> String {
         bold(&fmt_ms(op.latency_ms)),
         op.at_s,
         dim(&format!(
-            "queue {} · backend {} · client {}{}",
+            "queue {} · backend {} · retry {} · client {}{}",
             fmt_ms(b.queue_ms),
             fmt_ms(b.backend_ms),
+            fmt_ms(b.retry_ms),
             fmt_ms(b.client_ms + b.cache_ms),
             if op.retries > 0 {
                 format!(" · {} retries", op.retries)

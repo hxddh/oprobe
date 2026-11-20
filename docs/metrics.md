@@ -100,14 +100,19 @@ need to separate upload bandwidth from server latency.
 
 ## Operation breakdown ("where the time goes")
 
-Each operation's wall time is split exactly into four parts by sweeping its request intervals:
+Each operation's wall time is split exactly into five parts by sweeping its request intervals and
+the retry layer's backoff sleeps:
 
 * **backend** — at least one request is on the network (connect, send, ttfb or transfer);
 * **queue** — no request is on the network, but at least one is waiting for a permit/connection;
+* **retry** — nothing is on the network or queued, and OpenDAL's `RetryLayer` is sleeping before
+  the next attempt (exponential backoff with jitter, 50 ms – 5 s). Throttled or failing runs spend
+  most of their time here; this is never counted as client time;
 * **cache** — local cache lookups (carved out of the remainder);
 * **client** — everything else: OpenDAL processing, request signing, buffering, CRC, your code.
 
-Parallel requests are merged (an instant counts once), so `queue + cache + backend + client` equals
+Parallel requests are merged (an instant counts once), so `queue + cache + backend + retry + client`
+equals
 the measured latency of every single operation. The report then splits *backend* into
 connect / upload / server / download in proportion to the measured request-stage totals.
 

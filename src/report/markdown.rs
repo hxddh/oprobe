@@ -62,6 +62,7 @@ pub fn render(r: &Report) -> String {
         ("upload", sh.upload),
         ("server (TTFB)", sh.server),
         ("download", sh.download),
+        ("retry backoff", sh.retry),
         ("cache", sh.cache),
         ("client", sh.client),
     ] {

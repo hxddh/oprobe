@@ -103,6 +103,7 @@ struct VerbAgg {
     queue_us: u64,
     cache_us: u64,
     backend_us: u64,
+    retry_us: u64,
     client_us: u64,
 }
 
@@ -119,6 +120,7 @@ impl VerbAgg {
             queue_us: 0,
             cache_us: 0,
             backend_us: 0,
+            retry_us: 0,
             client_us: 0,
         }
     }
@@ -691,7 +693,8 @@ impl Recorder {
             v.queue_us += bd[0];
             v.cache_us += bd[1];
             v.backend_us += bd[2];
-            v.client_us += bd[3];
+            v.retry_us += bd[3];
+            v.client_us += bd[4];
         }
         let idx = at_s.max(0.0) as usize;
         if a.buckets.len() <= idx {
@@ -743,7 +746,8 @@ impl Recorder {
                     queue_ms: ms(bd[0]),
                     cache_ms: ms(bd[1]),
                     backend_ms: ms(bd[2]),
-                    client_ms: ms(bd[3]),
+                    retry_ms: ms(bd[3]),
+                    client_ms: ms(bd[4]),
                 },
                 retries: c.data.retries,
                 requests: c.data.requests,
@@ -843,6 +847,7 @@ impl Recorder {
                         queue_ms: v.queue_us as f64 / n / 1000.0,
                         cache_ms: v.cache_us as f64 / n / 1000.0,
                         backend_ms: v.backend_us as f64 / n / 1000.0,
+                        retry_ms: v.retry_us as f64 / n / 1000.0,
                         client_ms: v.client_us as f64 / n / 1000.0,
                     },
                     requests_per_op: v.requests as f64 / n,
@@ -985,13 +990,15 @@ impl Recorder {
     }
 }
 
-/// Exact split of one op's wall time into `[queue, cache, backend, client]` microseconds using a
-/// sweep over its request intervals: an instant counts as *backend* if any request is on the
-/// network, else *queue* if any request is waiting for a permit/connection, else *client*.
-/// Cache lookup time is carved out of the client share.
-pub fn breakdown_us(d: &OpScopeData, total_us: u64) -> [u64; 4] {
-    // events: (time, kind_delta) kind 0 = queue, 1 = network
-    let mut ev: Vec<(u64, i32, i32)> = Vec::with_capacity(d.requests.len() * 4);
+/// Exact split of one op's wall time into `[queue, cache, backend, retry, client]`
+/// microseconds using a sweep over its request intervals and retry backoff sleeps: an instant
+/// counts as *backend* if any request is on the network, else *queue* if any request is
+/// waiting for a permit/connection, else *retry* if the retry layer is sleeping before the
+/// next attempt, else *client*. Cache lookup time is carved out of the client share.
+pub fn breakdown_us(d: &OpScopeData, total_us: u64) -> [u64; 5] {
+    // events: (time, queue delta, network delta, retry delta)
+    let mut ev: Vec<(u64, i32, i32, i32)> =
+        Vec::with_capacity(d.requests.len() * 4 + d.retry_waits.len() * 2);
     for r in &d.requests {
         let s = r.start_offset_us;
         let q_end = s + r.timing.queue_us;
@@ -999,34 +1006,44 @@ pub fn breakdown_us(d: &OpScopeData, total_us: u64) -> [u64; 4] {
             .saturating_sub(r.timing.stall_us)
             .max(q_end);
         if r.timing.queue_us > 0 {
-            ev.push((s, 1, 0));
-            ev.push((q_end, -1, 0));
+            ev.push((s, 1, 0, 0));
+            ev.push((q_end, -1, 0, 0));
         }
         if n_end > q_end {
-            ev.push((q_end, 0, 1));
-            ev.push((n_end, 0, -1));
+            ev.push((q_end, 0, 1, 0));
+            ev.push((n_end, 0, -1, 0));
         }
     }
-    ev.sort_by_key(|e| (e.0, e.1.min(e.2)));
-    let (mut q, mut n) = (0i32, 0i32);
-    let (mut queue, mut net) = (0u64, 0u64);
+    for &(s, e) in &d.retry_waits {
+        if e > s {
+            ev.push((s, 0, 0, 1));
+            ev.push((e, 0, 0, -1));
+        }
+    }
+    // Ends before starts at the same instant.
+    ev.sort_by_key(|e| (e.0, e.1.min(e.2).min(e.3)));
+    let (mut q, mut n, mut w) = (0i32, 0i32, 0i32);
+    let (mut queue, mut net, mut retry) = (0u64, 0u64, 0u64);
     let mut last = 0u64;
-    for (t, dq, dn) in ev {
+    for (t, dq, dn, dw) in ev {
         let t = t.min(total_us);
         if t > last {
             if n > 0 {
                 net += t - last;
             } else if q > 0 {
                 queue += t - last;
+            } else if w > 0 {
+                retry += t - last;
             }
             last = t;
         }
         q += dq;
         n += dn;
+        w += dw;
     }
-    let rest = total_us.saturating_sub(queue + net);
+    let rest = total_us.saturating_sub(queue + net + retry);
     let cache = d.cache_lookup_us.min(rest);
-    [queue, cache, net, rest - cache]
+    [queue, cache, net, retry, rest - cache]
 }
 
 impl std::fmt::Debug for Recorder {
@@ -1071,7 +1088,7 @@ mod tests {
         };
         // network covers [100,1500) = 1400us; queue [500,700) overlaps network -> 0
         let b = breakdown_us(&d, 2000);
-        assert_eq!(b, [0, 50, 1400, 550]);
+        assert_eq!(b, [0, 50, 1400, 0, 550]);
         assert_eq!(b.iter().sum::<u64>(), 2000);
     }
 
@@ -1115,6 +1132,44 @@ mod tests {
             requests: vec![req(0, 300, 1000)],
             ..Default::default()
         };
-        assert_eq!(breakdown_us(&d, 1000), [300, 0, 700, 0]);
+        assert_eq!(breakdown_us(&d, 1000), [300, 0, 700, 0, 0]);
+    }
+
+    #[test]
+    fn breakdown_attributes_retry_backoff_to_retry_not_client() {
+        // Attempt 1 [0, 1000) is throttled, the retry layer sleeps [1100, 5100), attempt 2
+        // runs [5150, 6150); 50us of client time before the retry and 50us after the sleep.
+        let mut ok = req(5150, 0, 1000);
+        ok.status = 200;
+        let mut throttled = req(0, 0, 1000);
+        throttled.status = 503;
+        let d = OpScopeData {
+            requests: vec![throttled, ok],
+            retries: 1,
+            retry_backoff_us: 4000,
+            retry_waits: vec![(1100, 5100)],
+            ..Default::default()
+        };
+        let b = breakdown_us(&d, 6200);
+        assert_eq!(b, [0, 0, 2000, 4000, 200]);
+        // A backoff overlapping another request's network time is backend time.
+        let d = OpScopeData {
+            requests: vec![req(0, 0, 3000)],
+            retry_waits: vec![(1000, 4000)],
+            ..Default::default()
+        };
+        assert_eq!(breakdown_us(&d, 4000), [0, 0, 3000, 1000, 0]);
+    }
+
+    #[test]
+    fn scope_records_retry_waits() {
+        let s = crate::trace::OpScope::new(true);
+        s.record_retry(std::time::Duration::from_millis(5), true);
+        let d = s.take();
+        assert_eq!(d.retries, 1);
+        assert_eq!(d.retry_backoff_us, 5000);
+        assert_eq!(d.retry_waits.len(), 1);
+        assert_eq!(d.retry_waits[0].1 - d.retry_waits[0].0, 5000);
+        assert!(d.throttled);
     }
 }

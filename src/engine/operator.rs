@@ -6,8 +6,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use opendal::Operator;
-use opendal::layers::{RetryLayer, TailCutLayer, TimeoutLayer};
+use opendal::layers::{RetryLayer, TimeoutLayer};
 
+use super::stack::ClientStack;
 use crate::config::{Knobs, TargetSpec, TransportMode};
 use crate::layers::{InProcessObserveLayer, TraceContextLayer, WhiteboxCacheLayer};
 use crate::net::{FidelityTransport, TlsClientOptions, TracingTransport, TransportConfig};
@@ -60,7 +61,7 @@ pub fn transport_config(target: &TargetSpec, knobs: &Knobs) -> Result<TransportC
     Ok(TransportConfig {
         http: knobs.http_version,
         keep_alive: knobs.keep_alive,
-        max_inflight: (knobs.max_inflight_requests > 0).then_some(knobs.max_inflight_requests),
+        max_inflight: ClientStack::from_knobs(knobs).http_concurrent_limit,
         tls: tls_options(target)?,
         proxy: proxy_setting(target),
         ..Default::default()
@@ -108,46 +109,23 @@ pub fn measured_operator(
         op = op.layer(InProcessObserveLayer::new(recorder.clone()));
     }
     op = op.layer(trace_layer(target, knobs, Some(recorder.clone()))?);
-    op = op.layer(
-        TimeoutLayer::new()
-            .with_timeout(knobs.timeout.get())
-            .with_io_timeout(knobs.timeout.get().min(Duration::from_secs(30))),
-    );
-    if knobs.tail_cut {
-        op = op.layer(
-            TailCutLayer::builder()
-                .percentile(95)
-                .safety_factor(1.5)
-                .min_samples(32)
-                .min_deadline(Duration::from_millis(50))
-                .max_deadline(knobs.timeout.get())
-                .window(Duration::from_secs(60))
-                .build(),
-        );
+    let stack = ClientStack::from_knobs(knobs);
+    op = op.layer(stack.timeout_layer());
+    if let Some(l) = stack.tail_cut_layer() {
+        op = op.layer(l);
     }
-    if knobs.retries > 0 {
-        op = op.layer(
-            RetryLayer::default()
-                .with_jitter()
-                .with_min_delay(Duration::from_millis(50))
-                .with_max_delay(Duration::from_secs(5))
-                .with_max_times(knobs.retries)
-                .with_notify(|ev: opendal::layers::RetryEvent<'_>| {
-                    if let Some(s) = OpScope::current() {
-                        // 429/503 responses mark the scope throttled when they are recorded
-                        // (`OpScope::push_request`); OpenDAL's kind covers the rest. The error
-                        // text is never matched: object names and ports contain digits.
-                        let throttled = ev.err.kind() == opendal::ErrorKind::RateLimited;
-                        s.with(|d| {
-                            d.retries += 1;
-                            d.retry_backoff_us += ev.retry_after.as_micros() as u64;
-                            if throttled {
-                                d.throttled = true;
-                            }
-                        });
-                    }
-                }),
-        );
+    if let Some(l) = stack.retry_layer() {
+        op = op.layer(l.with_notify(|ev: opendal::layers::RetryEvent<'_>| {
+            if let Some(s) = OpScope::current() {
+                // 429/503 responses mark the scope throttled when they are recorded
+                // (`OpScope::push_request`); OpenDAL's kind covers the rest. The error text is
+                // never matched: object names and ports contain digits.
+                s.record_retry(
+                    ev.retry_after,
+                    ev.err.kind() == opendal::ErrorKind::RateLimited,
+                );
+            }
+        }));
     }
     // Async call stacks: operations are registered as await-tree roots by the runner, OpenDAL
     // sub-tasks by `ScopePropagatingExecutor`, and the transports add zero-allocation spans per

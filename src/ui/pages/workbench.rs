@@ -313,6 +313,7 @@ fn breakdown() -> impl IntoElement {
                 ("upload", sh.upload, "sending request bodies"),
                 ("server", sh.server, "time to first byte"),
                 ("download", sh.download, "receiving bodies"),
+                ("retry", sh.retry, "backoff between retry attempts"),
                 ("client", sh.client + sh.cache, "OpenDAL, CRC, consumer"),
             ];
             let max = rows.iter().map(|r| r.1).fold(0.0, f64::max).max(1e-9);
@@ -503,10 +504,11 @@ fn slowest(snap: &Snapshot) -> View {
                 row()
                     .child(heading(format!("{} · {}", op.verb, fmt_ms(op.latency_ms))))
                     .child(muted(format!(
-                        "at {:.1}s · queue {} · backend {} · client {}",
+                        "at {:.1}s · queue {} · backend {} · retry {} · client {}",
                         op.at_s,
                         fmt_ms(op.breakdown.queue_ms),
                         fmt_ms(op.breakdown.backend_ms),
+                        fmt_ms(op.breakdown.retry_ms),
                         fmt_ms(op.breakdown.client_ms + op.breakdown.cache_ms)
                     ))),
             )

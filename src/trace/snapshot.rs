@@ -46,7 +46,7 @@ impl Phase {
 }
 
 /// Where the wall-clock time of a logical operation went (mean ms per op).
-/// `queue + cache + backend + client == latency mean` (exact for each op; see docs/metrics.md).
+/// `queue + cache + backend + retry + client == latency mean` (exact for each op; see docs/metrics.md).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct OpBreakdown {
     /// Waiting for in-flight request permits / connections, with nothing on the wire.
@@ -55,6 +55,10 @@ pub struct OpBreakdown {
     pub cache_ms: f64,
     /// At least one backend request on the network (connect, send, TTFB, transfer).
     pub backend_ms: f64,
+    /// Retry backoff: the retry layer sleeping between a failed attempt and the next one
+    /// (with no request of the operation on the network or queued meanwhile).
+    #[serde(default)]
+    pub retry_ms: f64,
     /// Everything else: OpenDAL processing, signing, buffering, CRC, response consumption.
     pub client_ms: f64,
 }

@@ -254,6 +254,25 @@ async fn throttling_is_detected_and_diagnosed() {
     let r = Report::build(&prof, &prof.knobs, s, c, vec![]);
     assert_eq!(r.diagnosis.bottleneck, Bottleneck::Throttling);
     assert!(r.diagnosis.findings.iter().any(|f| f.code == "throttling"));
+    // Backoff between attempts is retry time, never "client" time (every retried op sleeps
+    // ≥ 50 ms; the lab answers in well under a millisecond).
+    let sh = &r.diagnosis.shares;
+    assert!(
+        sh.retry > 0.2 && sh.retry > sh.client,
+        "retry backoff must be its own share: {sh:?}"
+    );
+    let retry_ms: f64 = r
+        .result
+        .verbs
+        .iter()
+        .map(|v| v.breakdown.retry_ms * v.count as f64)
+        .sum();
+    assert!(retry_ms > 0.0 && retry_ms <= r.result.resilience.retry_backoff_ms + 1.0);
+    assert!(
+        r.diagnosis.headline.contains("retry backoff"),
+        "{}",
+        r.diagnosis.headline
+    );
     assert!(r.cost.per_op.failed_requests > 0.0);
 }
 
