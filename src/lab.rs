@@ -716,6 +716,39 @@ async fn handle_s3_request(
                 .unwrap());
         }
 
+        if method == Method::GET && qmap.contains_key("versions") {
+            // An unversioned bucket: every object has one version, `null`.
+            let prefix = qmap.get("prefix").cloned().unwrap_or_default();
+            let full = format!("{bucket}/{prefix}");
+            let mut items = String::new();
+            if let Ok(objs) = store.objects.read() {
+                for (k, o) in objs.range(full.clone()..) {
+                    if !k.starts_with(&full) {
+                        break;
+                    }
+                    items.push_str(&format!(
+                        "<Version><Key>{}</Key><VersionId>null</VersionId><IsLatest>true</IsLatest><LastModified>2026-11-19T00:00:00.000Z</LastModified><ETag>{}</ETag><Size>{}</Size><StorageClass>STANDARD</StorageClass></Version>",
+                        xml_escape(&k[bucket.len() + 1..]),
+                        xml_escape(&o.etag),
+                        o.data.len()
+                    ));
+                }
+            }
+            let xml = format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+                 <ListVersionsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+                 <Name>{}</Name><Prefix>{}</Prefix><IsTruncated>false</IsTruncated>{items}</ListVersionsResult>",
+                xml_escape(&bucket),
+                xml_escape(&prefix)
+            );
+            return Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "application/xml")
+                .header("x-amz-request-id", &req_id)
+                .body(full_body(xml))
+                .unwrap());
+        }
+
         if method == Method::GET {
             let prefix = qmap.get("prefix").cloned().unwrap_or_default();
             let delimiter = qmap.get("delimiter").cloned().filter(|d| !d.is_empty());

@@ -142,7 +142,7 @@ pub enum Command {
     /// Run the same workload across targets / knob values and rank them
     Matrix(PendingArgs),
     /// Correctness & compatibility suite for a target
-    Compat(PendingArgs),
+    Compat(CompatArgs),
     /// Named baselines: set, list, rm, show
     #[command(subcommand)]
     Baseline(BaselineCommand),
@@ -701,6 +701,18 @@ pub struct TopArgs {
     /// Public bucket, no credentials
     #[arg(long)]
     pub anonymous: bool,
+}
+
+#[derive(Args, Debug, Default)]
+pub struct CompatArgs {
+    #[command(flatten)]
+    pub target: TargetArgs,
+    /// Refuse to run (compat writes test objects); for symmetry with other commands
+    #[arg(long)]
+    pub read_only: bool,
+    /// Exit 3 when the score (percent of the checks that ran) is below this
+    #[arg(long, value_name = "PCT")]
+    pub min_score: Option<f64>,
 }
 
 #[derive(Args, Debug, Default)]

@@ -366,7 +366,7 @@ async fn dispatch(cmd: Command, ctx: &Ctx) -> Result<u8> {
         Command::Explain(_) => pending("explain"),
         Command::Watch(_) => pending("watch"),
         Command::Matrix(_) => pending("matrix"),
-        Command::Compat(_) => pending("compat"),
+        Command::Compat(a) => crate::compat::command::run(a, ctx).await,
         Command::Baseline(_) => pending("baseline"),
         Command::Mcp(_) => pending("mcp"),
         Command::Schema(_) => pending("schema"),
