@@ -187,10 +187,10 @@ impl Output {
                 Some(h) => out.write_all(h.as_bytes())?,
                 None => {
                     return Err(OprobeError::new(
-                        ErrorCode::Internal,
-                        "`--output html` is not implemented yet for this command",
+                        ErrorCode::UsageInvalidArgument,
+                        "this command has no HTML output",
                     )
-                    .with_hint("use -o md or -o json")
+                    .with_hint("use -o text, -o md, -o json or -o ndjson")
                     .into());
                 }
             },
@@ -204,7 +204,14 @@ impl Output {
         match self.format {
             OutputFormat::Json => {
                 let v = serde_json::json!({"type": "error", "error": e});
-                println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+                let mut out = std::io::stdout().lock();
+                // A closed stdout (`| head`) is not worth a second error.
+                let _ = writeln!(
+                    out,
+                    "{}",
+                    serde_json::to_string_pretty(&v).unwrap_or_default()
+                );
+                let _ = out.flush();
             }
             OutputFormat::Ndjson => self.bus.emit(EventKind::Error { error: e.clone() }),
             _ => {
@@ -217,6 +224,38 @@ impl Output {
         }
         e.exit_code()
     }
+}
+
+/// Exit code of a command whose reader closed stdout (`oprobe runs list | head`): 128 + SIGPIPE,
+/// as shells report a CLI stopped by a broken pipe.
+pub const EXIT_BROKEN_PIPE: u8 = 141;
+
+/// Whether `e` is a write to a closed pipe.
+pub fn is_broken_pipe(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        c.downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::BrokenPipe)
+            || c.downcast_ref::<serde_json::Error>()
+                .and_then(|j| j.io_error_kind())
+                .is_some_and(|k| k == std::io::ErrorKind::BrokenPipe)
+    })
+}
+
+/// Exit quietly (no panic message) when a `print!` hits a closed stdout.
+pub fn quiet_broken_pipes() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let msg = info
+            .payload()
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| info.payload().downcast_ref::<&str>().copied())
+            .unwrap_or_default();
+        if msg.starts_with("failed printing to stdout") && msg.contains("Broken pipe") {
+            std::process::exit(EXIT_BROKEN_PIPE.into());
+        }
+        default(info);
+    }));
 }
 
 /// Whether stdin and stdout are both terminals.
@@ -245,7 +284,15 @@ mod tests {
     }
 
     #[test]
-    fn html_is_wired_but_not_yet_implemented() {
+    fn broken_pipes_are_recognized() {
+        let e: anyhow::Error = std::io::Error::from(std::io::ErrorKind::BrokenPipe).into();
+        assert!(is_broken_pipe(&e.context("writing the result")));
+        let e: anyhow::Error = std::io::Error::from(std::io::ErrorKind::NotFound).into();
+        assert!(!is_broken_pipe(&e));
+    }
+
+    #[test]
+    fn html_without_a_renderer_is_a_usage_error() {
         let o = Output {
             format: OutputFormat::Html,
             quiet: true,
@@ -253,6 +300,9 @@ mod tests {
             bus: EventBus::new(),
         };
         let e = o.finish(&TextOutput { text: "x".into() }).unwrap_err();
-        assert_eq!(crate::errors::classify(&e, "s3").code, ErrorCode::Internal);
+        let body = crate::errors::classify(&e, "s3");
+        assert_eq!(body.code, ErrorCode::UsageInvalidArgument);
+        assert_eq!(body.exit_code(), 2);
+        assert!(body.hint.unwrap().contains("-o md"));
     }
 }
