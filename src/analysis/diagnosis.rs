@@ -501,3 +501,120 @@ fn capitalize(s: &str) -> String {
         None => String::new(),
     }
 }
+
+/// Outcome of checking a run against its [`Sla`].
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SlaVerdict {
+    /// Whether a breach fails the command (exit code 3).
+    pub enforced: bool,
+    pub passed: bool,
+    /// One line per breached objective (empty when passed).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub breaches: Vec<String>,
+}
+
+/// Check the measured result against the SLA: error rate, data integrity (always), per-verb
+/// p99 and throttle rate (when set).
+pub fn check_sla(s: &Snapshot, sla: &Sla) -> SlaVerdict {
+    let mut breaches = Vec::new();
+    if s.integrity.corrupted > 0 {
+        breaches.push(format!(
+            "{} corrupted objects (CRC32C mismatch); corrupted data is never acceptable",
+            s.integrity.corrupted
+        ));
+    }
+    if s.summary.ops > 0 && s.summary.error_rate > sla.max_error_rate {
+        breaches.push(format!(
+            "{:.2}% of operations failed ({} of {}), limit {}%",
+            s.summary.error_rate * 100.0,
+            s.summary.failed_ops,
+            s.summary.ops,
+            sla.max_error_rate * 100.0
+        ));
+    }
+    if s.summary.ops == 0 {
+        breaches.push("no operation completed in the measurement window".into());
+    }
+    if let Some(limit) = sla.max_throttle_rate {
+        let throttled: u64 = s.verbs.iter().map(|v| v.throttled).sum();
+        let rate = throttled as f64 / s.summary.ops.max(1) as f64;
+        if rate > limit {
+            breaches.push(format!(
+                "{:.2}% of operations were throttled (429/503), limit {}%",
+                rate * 100.0,
+                limit * 100.0
+            ));
+        }
+    }
+    if let Some(limit) = sla.p99_ms {
+        for v in s.verbs.iter().filter(|v| v.count > 0 && v.latency.p99 > limit) {
+            breaches.push(format!(
+                "`{}` p99 {} exceeds the {} limit",
+                v.verb,
+                fmt_ms(v.latency.p99),
+                fmt_ms(limit)
+            ));
+        }
+    }
+    SlaVerdict {
+        enforced: sla.enforce,
+        passed: breaches.is_empty(),
+        breaches,
+    }
+}
+
+#[cfg(test)]
+mod sla_tests {
+    use super::*;
+    use crate::trace::{Quantiles, Summary, VerbStats};
+
+    fn snap(ops: u64, failed: u64) -> Snapshot {
+        Snapshot {
+            summary: Summary {
+                ops,
+                failed_ops: failed,
+                error_rate: failed as f64 / ops.max(1) as f64,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn default_sla_fails_on_errors_above_one_percent_and_any_corruption() {
+        let sla = Sla::default();
+        assert!(sla.enforce);
+        assert!(check_sla(&snap(1000, 10), &sla).passed, "1% is within the SLA");
+        let v = check_sla(&snap(1000, 11), &sla);
+        assert!(!v.passed && v.enforced);
+        assert!(v.breaches[0].contains("failed"), "{v:?}");
+        let mut s = snap(1000, 0);
+        s.integrity.corrupted = 1;
+        assert!(!check_sla(&s, &sla).passed);
+        // Throttling absorbed by retries is not a breach unless a limit is set.
+        let mut s = snap(100, 0);
+        s.verbs = vec![VerbStats {
+            verb: "read.full".into(),
+            count: 100,
+            throttled: 50,
+            latency: Quantiles {
+                p99: 900.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        }];
+        assert!(check_sla(&s, &sla).passed);
+        let strict = Sla {
+            max_throttle_rate: Some(0.1),
+            p99_ms: Some(500.0),
+            ..Sla::default()
+        };
+        assert_eq!(check_sla(&s, &strict).breaches.len(), 2);
+        let off = Sla {
+            enforce: false,
+            ..Sla::default()
+        };
+        let v = check_sla(&snap(10, 10), &off);
+        assert!(!v.passed && !v.enforced);
+    }
+}

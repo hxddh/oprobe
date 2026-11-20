@@ -83,7 +83,7 @@ oprobe diff baseline.json candidate.json --junit oprobe.xml --markdown oprobe.md
 
 | 命令 | 作用 |
 |---|---|
-| `oprobe run` | 运行负载并输出白盒报告；`--json` / `--markdown` 导出；`--fail-on` 用于 CI |
+| `oprobe run` | 运行负载并输出白盒报告；`--json` / `--markdown` 导出；违反 SLA（默认：失败操作 > 1% 或任何数据损坏）时退出码为 3，`--sla none` 关闭 |
 | `oprobe top` / `oprobe gui` | 在终端 / 窗口中打开交互式工作台：实时曲线、耗时分解、按 API 统计、最慢操作瀑布图、调优与探测；直接运行 `oprobe` 也会打开它 |
 | `oprobe tune` | 感知限流的闭环调优，`--objective throughput\|latency\|cost` |
 | `oprobe diff` | 回归门禁（回归时退出码 3），输出 JSON / Markdown / JUnit |

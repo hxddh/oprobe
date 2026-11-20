@@ -568,35 +568,64 @@ impl Knobs {
     }
 }
 
-/// Service level objectives used by `tune` and the diagnosis engine.
+/// Service level objectives. `oprobe run` / `oprobe tune` exit with code 3 when the measured
+/// result breaches them (unless `enforce = false` / `--sla none`); the tuner rejects trials that
+/// breach them and the diagnosis grades findings against them.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Sla {
+    /// Turn a breach into exit code 3. Corrupted data (CRC mismatch) is always a breach.
+    #[serde(default = "default_true")]
+    pub enforce: bool,
     /// Max acceptable p99 per operation verb (ms); unset = no latency constraint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub p99_ms: Option<f64>,
-    /// Max fraction of failed operations.
+    /// Max fraction of failed operations (default 0.01 = 1%).
     #[serde(default = "default_error_rate")]
     pub max_error_rate: f64,
-    /// Max fraction of operations that hit a 429/503 throttle.
-    #[serde(default = "default_throttle_rate")]
-    pub max_throttle_rate: f64,
+    /// Max fraction of operations that hit a 429/503 throttle. Unset: throttling that retries
+    /// absorb does not breach the SLA of a run (it is still a finding), and the tuner treats
+    /// any throttling as infeasible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_throttle_rate: Option<f64>,
 }
 
 fn default_error_rate() -> f64 {
-    0.001
-}
-fn default_throttle_rate() -> f64 {
-    0.0
+    0.01
 }
 
 impl Default for Sla {
     fn default() -> Self {
         Self {
+            enforce: true,
             p99_ms: None,
             max_error_rate: default_error_rate(),
-            max_throttle_rate: default_throttle_rate(),
+            max_throttle_rate: None,
         }
+    }
+}
+
+impl Sla {
+    /// Throttle-rate limit the tuner applies (any throttling when unset).
+    pub fn tune_throttle_limit(&self) -> f64 {
+        self.max_throttle_rate.unwrap_or(0.0)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            (0.0..=1.0).contains(&self.max_error_rate),
+            "sla.max_error_rate must be within 0..1 (e.g. 0.01 = 1%)"
+        );
+        if let Some(t) = self.max_throttle_rate {
+            anyhow::ensure!(
+                (0.0..=1.0).contains(&t),
+                "sla.max_throttle_rate must be within 0..1"
+            );
+        }
+        if let Some(p) = self.p99_ms {
+            anyhow::ensure!(p > 0.0, "sla.p99_ms must be > 0");
+        }
+        Ok(())
     }
 }
 
@@ -925,6 +954,7 @@ impl Profile {
             (0.0..=1.0).contains(&self.cost.egress_fraction),
             "cost.egress_fraction must be within 0..1"
         );
+        self.sla.validate()?;
         Ok(())
     }
 
@@ -1162,10 +1192,11 @@ retries = 3
 tail_cut = false            # cancel & retry stragglers above adaptive p95
 timeout = "60s"
 
-[sla]
-# p99_ms = 200.0            # tune rejects configurations above this
-max_error_rate = 0.001
-max_throttle_rate = 0.0
+[sla]                       # `oprobe run` / `tune` exit 3 when breached (`--sla none` disables)
+enforce = true              # corrupted data always breaches the SLA
+max_error_rate = 0.01       # fraction of failed operations
+# p99_ms = 200.0            # per-operation p99 limit; tune rejects configurations above it
+# max_throttle_rate = 0.0   # fraction of throttled operations (unset: tune rejects any throttling)
 
 [cost]
 # provider = "aws-s3"       # aws-s3 | gcs | azure-blob | cloudflare-r2 | backblaze-b2 | aliyun-oss

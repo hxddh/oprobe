@@ -1,4 +1,4 @@
-//! `oprobe.report/v2`: the persisted result of a run (JSON), plus renderers and the diff gate.
+//! `oprobe.report/v3`: the persisted result of a run (JSON), plus renderers and the diff gate.
 
 pub mod diff;
 pub mod markdown;
@@ -12,12 +12,12 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::analysis::cost::{CostReport, cost_report};
-use crate::analysis::diagnosis::{Diagnosis, diagnose};
+use crate::analysis::diagnosis::{Diagnosis, SlaVerdict, check_sla, diagnose};
 use crate::config::{Knobs, Profile, Sla, WorkloadSpec};
 use crate::engine::CleanupSummary;
 use crate::trace::Snapshot;
 
-pub const SCHEMA: &str = "oprobe.report/v2";
+pub const SCHEMA: &str = "oprobe.report/v3";
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct HostInfo {
@@ -79,6 +79,8 @@ pub struct Report {
     pub workload: WorkloadSpec,
     pub knobs: Knobs,
     pub sla: Sla,
+    /// The result checked against `sla` (`oprobe run` exits 3 when enforced and breached).
+    pub sla_verdict: SlaVerdict,
     pub result: Snapshot,
     pub diagnosis: Diagnosis,
     pub cost: CostReport,
@@ -104,6 +106,7 @@ impl Report {
         let t = &profile.target;
         let endpoint = t.endpoint();
         let diagnosis = diagnose(&snapshot, knobs, &profile.sla, t.is_network());
+        let sla_verdict = check_sla(&snapshot, &profile.sla);
         let cost = cost_report(&snapshot, &profile.cost, &t.scheme, endpoint.as_deref());
         let mut workload = profile.workload.clone();
         workload.dataset = Some(workload.effective_dataset());
@@ -131,6 +134,7 @@ impl Report {
             workload,
             knobs: knobs.clone(),
             sla: profile.sla.clone(),
+            sla_verdict,
             result: snapshot,
             diagnosis,
             cost,
@@ -153,11 +157,11 @@ impl Report {
         match v.get("schema").and_then(|s| s.as_str()) {
             Some(SCHEMA) => {}
             Some(other) => bail!(
-                "`{}` uses report schema `{other}`; this oprobe reads `{SCHEMA}`",
+                "`{}` uses report schema `{other}`; this oprobe reads `{SCHEMA}`: re-run it with this oprobe (`oprobe run --json`)",
                 path.display()
             ),
             None if v.get("schema_version").is_some() => bail!(
-                "`{}` is an oprobe v1 report; re-run the baseline with oprobe v2 (`oprobe run --json`)",
+                "`{}` is an oprobe v1 report; re-run the baseline with this oprobe (`oprobe run --json`)",
                 path.display()
             ),
             None => bail!("`{}` is not an oprobe report", path.display()),

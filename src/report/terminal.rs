@@ -72,6 +72,33 @@ pub fn time_share_lines(r: &Report) -> String {
     out
 }
 
+/// `✓ met (failed ops ≤ 1%, no corrupted data)` or `✖ BREACHED: …`.
+pub fn sla_line(r: &Report) -> String {
+    let sla = &r.sla;
+    let mut terms = vec![
+        format!("failed ops ≤ {}%", sla.max_error_rate * 100.0),
+        "no corrupted data".to_owned(),
+    ];
+    if let Some(t) = sla.max_throttle_rate {
+        terms.push(format!("throttled ops ≤ {}%", t * 100.0));
+    }
+    if let Some(p) = sla.p99_ms {
+        terms.push(format!("p99 ≤ {}", fmt_ms(p)));
+    }
+    let v = &r.sla_verdict;
+    let enforced = if v.enforced { "" } else { " · not enforced (--sla none)" };
+    if v.passed {
+        format!("{} met ({}){}", green("✓"), terms.join(", "), dim(enforced))
+    } else {
+        format!(
+            "{} {}{}",
+            red(&bold("✖ BREACHED:")),
+            red(&v.breaches.join("; ")),
+            dim(enforced)
+        )
+    }
+}
+
 pub fn request_line(i: usize, r: &RequestRecord) -> String {
     let t = &r.timing;
     let ms = |us: u64| fmt_ms(us as f64 / 1000.0);
@@ -363,6 +390,7 @@ pub fn render(r: &Report) -> String {
             "0 throttled".into()
         },
     );
+    let _ = writeln!(out, "  {} {}", dim("sla       "), sla_line(r));
     if let Some(ol) = &s.open_loop {
         let _ = writeln!(
             out,

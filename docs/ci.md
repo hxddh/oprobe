@@ -51,5 +51,8 @@ checks. A warning is printed if the two reports target different storage or work
   run: cat gate.md >> "$GITHUB_STEP_SUMMARY"
 ```
 
-`--fail-on warning|critical` on `oprobe run` additionally fails the job when the diagnosis finds
-problems (e.g. throttling, integrity errors) even without a baseline.
+`oprobe run` itself fails the job (exit code 3) when the run breaches its SLA, even without a
+baseline. The default SLA is: at most 1% failed operations and no corrupted data. Tighten or relax
+it in the profile's `[sla]` or with `--max-error-rate 0.1%`, `--max-throttle-rate 0%`,
+`--p99-ms 250`; `--sla none` reports the verdict without failing. `--fail-on warning|critical`
+additionally fails the job when the diagnosis has findings of that severity (e.g. throttling).

@@ -41,5 +41,5 @@ support.
 |---|---|
 | 0 | success |
 | 1 | error (invalid input, unreachable target, failed checks in `doctor`) |
-| 3 | gate failed: `oprobe diff` regression or `--fail-on` matched |
-| 130 | aborted with a second Ctrl-C |
+| 3 | gate failed: the run breached its SLA (default: > 1% failed operations or any corrupted data; `--sla none` disables), `--fail-on` matched, or `oprobe diff` found a regression |
+| 130 | interrupted with Ctrl-C (partial results) |

@@ -285,6 +285,34 @@ pub enum FailOn {
     Critical,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum SlaMode {
+    /// Exit with code 3 when the SLA is breached (the default)
+    Enforce,
+    /// Report the SLA verdict but never fail on it
+    None,
+}
+
+/// Service level objectives (`[sla]` in a profile). By default `oprobe run` / `tune` exit with
+/// code 3 when more than 1% of operations fail or any data is corrupted.
+#[derive(Args, Debug, Clone, Default)]
+#[command(next_help_heading = "SLA (exit code 3 when breached)")]
+pub struct SlaArgs {
+    /// `none` reports the SLA verdict without failing the command
+    #[arg(long, value_enum, value_name = "MODE")]
+    pub sla: Option<SlaMode>,
+    /// Max share of failed operations, e.g. 1% or 0.01 (default 1%)
+    #[arg(long, value_name = "RATE")]
+    pub max_error_rate: Option<String>,
+    /// Max share of throttled (429/503) operations, e.g. 0% (default: not checked by `run`;
+    /// `tune` rejects any throttling)
+    #[arg(long, value_name = "RATE")]
+    pub max_throttle_rate: Option<String>,
+    /// Max p99 latency per operation in ms (tune rejects trials above it)
+    #[arg(long, value_name = "MS")]
+    pub p99_ms: Option<f64>,
+}
+
 #[derive(Args, Debug, Clone)]
 #[command(next_help_heading = "Output")]
 pub struct OutputArgs {
@@ -300,7 +328,8 @@ pub struct OutputArgs {
     /// No live progress on stderr
     #[arg(short, long)]
     pub quiet: bool,
-    /// Exit with code 3 if the diagnosis has findings of this severity or worse
+    /// Also exit with code 3 if the diagnosis has findings of this severity or worse
+    /// (SLA breaches always do, unless `--sla none`)
     #[arg(long, value_enum)]
     pub fail_on: Option<FailOn>,
     /// Label stored in the report (e.g. a git SHA)
@@ -318,6 +347,8 @@ pub struct RunArgs {
     pub knobs: KnobArgs,
     #[command(flatten)]
     pub cost: CostArgs,
+    #[command(flatten)]
+    pub sla: SlaArgs,
     #[command(flatten)]
     pub output: OutputArgs,
 }
@@ -340,6 +371,8 @@ pub struct TuneArgs {
     #[command(flatten)]
     pub cost: CostArgs,
     #[command(flatten)]
+    pub sla: SlaArgs,
+    #[command(flatten)]
     pub output: OutputArgs,
     /// What to optimize
     #[arg(long, value_enum, default_value_t = ObjectiveArg::Throughput, help_heading = "Tuning")]
@@ -359,9 +392,6 @@ pub struct TuneArgs {
     /// Pause after a throttled trial
     #[arg(long, default_value = tune_defaults::COOLDOWN, help_heading = "Tuning")]
     pub cooldown: String,
-    /// p99 latency SLA in ms (trials above it are rejected)
-    #[arg(long, help_heading = "Tuning")]
-    pub p99_ms: Option<f64>,
     /// Write the tuned profile (TOML)
     #[arg(long, value_name = "FILE", help_heading = "Tuning")]
     pub emit_profile: Option<PathBuf>,

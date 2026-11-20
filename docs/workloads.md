@@ -101,11 +101,19 @@ timeout = "60s"
 ## SLA and cost
 
 ```toml
-[sla]
-p99_ms = 250.0              # tune rejects configurations whose worst-operation p99 exceeds this
-max_error_rate = 0.001
-max_throttle_rate = 0.0     # any 429/503 makes a configuration infeasible
+[sla]                       # `oprobe run` / `tune` exit 3 when the result breaches it
+enforce = true              # false (or `--sla none`): report the verdict, never fail on it
+max_error_rate = 0.01       # default: at most 1% failed operations
+p99_ms = 250.0              # worst per-operation p99 (unset: no latency objective)
+max_throttle_rate = 0.0     # throttled-operation share (unset: `run` ignores throttling that
+                            # retries absorb; `tune` treats any 429/503 as infeasible)
+```
 
+Corrupted data (a CRC32C mismatch on read-back) always breaches the SLA. Every SLA field can also
+be set from the command line: `--max-error-rate 1%`, `--max-throttle-rate 0%`, `--p99-ms 250`,
+`--sla none`.
+
+```toml
 [cost]
 provider = "aws-s3"         # pricing preset; default: detected from the endpoint
 monthly_ops = 100000000     # projection volume

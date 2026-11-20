@@ -633,7 +633,7 @@ fn cli_binary_end_to_end() {
         .output()
         .unwrap();
     let rep: serde_json::Value = serde_json::from_slice(&fail_on.stdout).unwrap();
-    assert_eq!(rep["schema"], "oprobe.report/v2");
+    assert_eq!(rep["schema"], "oprobe.report/v3");
 }
 
 #[test]
@@ -1106,4 +1106,59 @@ fn interrupted_run_exits_130() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(130), "{err}");
     assert!(err.contains("partial results"), "{err}");
+}
+
+// ---------------------------------------------------------------------------------------
+// Trust fixes (v3): results must never lead to a wrong conclusion.
+// ---------------------------------------------------------------------------------------
+
+/// A lab served from a background runtime, for tests that drive the CLI binary.
+fn background_lab(cfg: LabConfig) -> (tokio::runtime::Runtime, oprobe::lab::LabHandle) {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let h = rt.block_on(lab(cfg));
+    (rt, h)
+}
+
+/// `oprobe run` against a lab with S3 credentials `x`/`x` and no proxy.
+fn run_cli_against(endpoint: &str, extra: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_oprobe"))
+        .args(["run", "s3://bkt/x", "--endpoint", endpoint, "--proxy", "none"])
+        .args(["-o", "access_key_id=x", "-o", "secret_access_key=x"])
+        .args(["--region", "us-east-1", "--preset", "small-files"])
+        .args(["--objects", "4", "--object-size", "16KiB", "-c", "2"])
+        .args(["-d", "400ms", "--warmup", "0s", "-q", "--color", "never"])
+        .args(extra)
+        .output()
+        .unwrap()
+}
+
+/// Failed operations breach the default SLA (≤ 1% failed, no corruption): exit 3, unless the
+/// SLA is disabled or relaxed.
+#[test]
+fn failed_operations_breach_the_default_sla() {
+    let (_rt, lab) = background_lab(LabConfig {
+        throttle_every_n_requests: Some(3),
+        ..Default::default()
+    });
+    let out = run_cli_against(&lab.endpoint_url, &["--retries", "0"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(3), "{err}\n{text}");
+    assert!(err.contains("SLA breached"), "{err}");
+    assert!(text.contains("BREACHED"), "{text}");
+    for relaxed in [&["--sla", "none"][..], &["--max-error-rate", "100%"][..]] {
+        let args: Vec<&str> = ["--retries", "0"].iter().chain(relaxed).copied().collect();
+        let out = run_cli_against(&lab.endpoint_url, &args);
+        assert!(
+            out.status.success(),
+            "{relaxed:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let bad = run_cli_against(&lab.endpoint_url, &["--max-error-rate", "150%"]);
+    assert_eq!(bad.status.code(), Some(1));
 }

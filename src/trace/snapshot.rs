@@ -1,4 +1,4 @@
-//! Aggregated, serializable measurement results (part of the `oprobe.report/v2` schema).
+//! Aggregated, serializable measurement results (part of the `oprobe.report/v3` schema).
 
 use std::collections::BTreeMap;
 

@@ -23,7 +23,7 @@ use crate::report::style::{self, bold, dim, green, red, yellow};
 use crate::report::{Report, markdown, terminal, write_file};
 use crate::util::{ByteSize, HumanDuration, parse_duration};
 
-/// Exit code when `--fail-on` matched or the diff gate failed.
+/// Exit code when the SLA is breached, `--fail-on` matched or the diff gate failed.
 pub const EXIT_GATE: u8 = 3;
 
 pub async fn main(cli: Cli) -> ExitCode {
@@ -498,18 +498,76 @@ fn save_outputs(r: &Report, o: &OutputArgs) -> Result<()> {
     Ok(())
 }
 
+/// A share given as `1%`, `0.5 %` or a fraction (`0.01`).
+fn parse_rate(flag: &str, v: &str) -> Result<f64> {
+    let t = v.trim();
+    let r = match t.strip_suffix('%') {
+        Some(p) => p.trim().parse::<f64>().map(|x| x / 100.0),
+        None => t.parse::<f64>(),
+    }
+    .map_err(|_| anyhow::anyhow!("invalid {flag} `{v}` (examples: 1%, 0.01)"))?;
+    anyhow::ensure!((0.0..=1.0).contains(&r), "{flag} must be between 0% and 100%");
+    Ok(r)
+}
+
+/// Apply `--sla`, `--max-error-rate`, `--max-throttle-rate` and `--p99-ms` to the profile.
+pub fn apply_sla(p: &mut Profile, a: &SlaArgs) -> Result<()> {
+    if let Some(m) = a.sla {
+        p.sla.enforce = m == SlaMode::Enforce;
+    }
+    if let Some(v) = &a.max_error_rate {
+        p.sla.max_error_rate = parse_rate("--max-error-rate", v)?;
+    }
+    if let Some(v) = &a.max_throttle_rate {
+        p.sla.max_throttle_rate = Some(parse_rate("--max-throttle-rate", v)?);
+    }
+    if let Some(ms) = a.p99_ms {
+        p.sla.p99_ms = Some(ms);
+    }
+    p.sla.validate()
+}
+
+/// Exit code 3 when the enforced SLA is breached or `--fail-on` matched a finding.
 fn gate_exit(r: &Report, o: &OutputArgs) -> ExitCode {
     use crate::analysis::diagnosis::Severity;
+    let v = &r.sla_verdict;
+    let mut failed = false;
+    if !v.passed {
+        if v.enforced {
+            failed = true;
+            eprintln!(
+                "{} SLA breached (exit {EXIT_GATE}): {}",
+                red(&bold("✖")),
+                v.breaches.join("; ")
+            );
+        } else if !o.quiet {
+            eprintln!(
+                "{} SLA breached but not enforced (`--sla none`): {}",
+                yellow("▲"),
+                v.breaches.join("; ")
+            );
+        }
+    }
     if let Some(level) = o.fail_on {
         let min = match level {
             FailOn::Warning => Severity::Warning,
             FailOn::Critical => Severity::Critical,
         };
         if r.diagnosis.worst() >= min {
-            return ExitCode::from(EXIT_GATE);
+            eprintln!(
+                "{} `--fail-on {}`: the diagnosis has {} findings (exit {EXIT_GATE})",
+                red(&bold("✖")),
+                if min == Severity::Warning { "warning" } else { "critical" },
+                r.diagnosis.worst().label()
+            );
+            failed = true;
         }
     }
-    ExitCode::SUCCESS
+    if failed {
+        ExitCode::from(EXIT_GATE)
+    } else {
+        ExitCode::SUCCESS
+    }
 }
 
 fn progress_for(quiet: bool, total: Duration) -> (Option<ProgressFn>, Option<Arc<live::LiveLine>>) {
@@ -530,6 +588,7 @@ fn progress_for(quiet: bool, total: Duration) -> (Option<ProgressFn>, Option<Arc
 
 async fn cmd_run(a: RunArgs) -> Result<ExitCode> {
     let mut profile = build_profile(&a.target, &a.workload, &a.knobs, &a.cost)?;
+    apply_sla(&mut profile, &a.sla)?;
     if a.output.label.is_some() {
         profile.name = a.output.label.clone();
     }
@@ -668,9 +727,7 @@ pub fn tune_options(
 async fn cmd_tune(a: TuneArgs) -> Result<ExitCode> {
     use crate::tune::{Objective, TuneEvent, codegen, tune};
     let mut profile = build_profile(&a.target, &a.workload, &a.knobs, &a.cost)?;
-    if let Some(p) = a.p99_ms {
-        profile.sla.p99_ms = Some(p);
-    }
+    apply_sla(&mut profile, &a.sla)?;
     let cancel = Cancel::new();
     install_ctrl_c(cancel.clone());
     let quiet = a.output.quiet;

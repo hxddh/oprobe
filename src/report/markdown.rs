@@ -51,6 +51,18 @@ pub fn render(r: &Report) -> String {
         s.resilience.throttled_responses
     );
 
+    let v = &r.sla_verdict;
+    let _ = writeln!(
+        md,
+        "**SLA:** {}{}\n",
+        if v.passed {
+            "✅ met".to_owned()
+        } else {
+            format!("❌ breached — {}", v.breaches.join("; "))
+        },
+        if v.enforced { "" } else { " (not enforced)" }
+    );
+
     let sh = &r.diagnosis.shares;
     let _ = writeln!(
         md,

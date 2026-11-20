@@ -119,7 +119,7 @@ mid-run. An interrupted `oprobe run` / `oprobe tune` prints its partial results 
 
 | Command | Purpose |
 |---|---|
-| `oprobe run [TARGET]` | Run a workload; print the white-box report; save `--json` / `--markdown`. `--fail-on warning\|critical` for CI. |
+| `oprobe run [TARGET]` | Run a workload; print the white-box report; save `--json` / `--markdown`. Exits 3 when the SLA is breached (default: > 1% failed ops or any corrupted data; `--sla none` to disable). |
 | `oprobe top [TARGET]` / `oprobe gui [TARGET]` | The interactive workbench in this terminal / in a window: live charts, time breakdown, per-API tables, slowest-op waterfall, tuner, probe. `oprobe` alone opens it. |
 | `oprobe tune [TARGET]` | Throttle-aware closed-loop tuning with `--objective throughput\|latency\|cost`. |
 | `oprobe diff BASE CAND` | Regression gate (exit code 3 on regression) with JSON / Markdown / JUnit output. |
