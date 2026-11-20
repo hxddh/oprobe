@@ -151,7 +151,7 @@ fn redacted(name: &str, t: &TargetEntry) -> TargetShow {
     }
 }
 
-pub fn target_add(a: TargetAddArgs, ctx: &Ctx) -> Result<u8> {
+pub async fn target_add(a: TargetAddArgs, ctx: &Ctx) -> Result<u8> {
     ConfigFile::check_target_name(&a.name)?;
     let spec = crate::config::TargetSpec::from_url(&a.url).map_err(|e| {
         OprobeError::new(
@@ -170,6 +170,8 @@ pub fn target_add(a: TargetAddArgs, ctx: &Ctx) -> Result<u8> {
         })?;
         options.insert(k.trim().to_owned(), v.trim().to_owned());
     }
+    let name = a.name.clone();
+    let no_test = a.no_test;
     let entry = TargetEntry {
         url: a.url,
         region: a.region,
@@ -181,15 +183,172 @@ pub fn target_add(a: TargetAddArgs, ctx: &Ctx) -> Result<u8> {
     let mut cfg = ctx.config()?.clone();
     cfg.targets.insert(a.name.clone(), entry.clone());
     cfg.save(&ctx.paths.config_file)?;
-    if ctx.out.format == crate::output::OutputFormat::Text {
+    let text = ctx.out.format == crate::output::OutputFormat::Text;
+    if text {
         ctx.out.info(format!(
             "{} saved target {} in {}",
             green("✓"),
-            bold(&a.name),
+            bold(&name),
             ctx.paths.config_file.display()
         ));
     }
-    ctx.out.finish(&redacted(&a.name, &entry))
+    let code = ctx.out.finish(&redacted(&name, &entry))?;
+    if no_test {
+        return Ok(code);
+    }
+    if !text {
+        ctx.out
+            .info(format!("check it with `oprobe target test {name}`"));
+        return Ok(code);
+    }
+    // A quick read-only doctor: reachability, TLS, clock, credentials and listing.
+    ctx.out.info(dim(
+        "quick check (read-only; `oprobe target test` also writes a probe object):",
+    ));
+    // A fresh context: the config was loaded (and cached) before the target was added.
+    let fresh = Ctx::new(ctx.out.clone(), ctx.paths.clone());
+    let checked = super::doctor::run(
+        DoctorArgs {
+            target: TargetArgs {
+                target: Some(name.clone()),
+                ..Default::default()
+            },
+            read_only: true,
+        },
+        &fresh,
+    )
+    .await;
+    match checked {
+        Ok(0) => Ok(code),
+        Ok(c) => {
+            ctx.out.warn(format!(
+                "the target is saved, but the check failed: fix it, then `oprobe target test {name}`"
+            ));
+            Ok(c)
+        }
+        Err(e) => {
+            ctx.out.warn(format!(
+                "the target is saved, but the check failed: fix it, then `oprobe target test {name}`"
+            ));
+            Err(e)
+        }
+    }
+}
+
+/// `oprobe target test NAME`: the doctor on a configured target (or a URL).
+pub async fn target_test(a: TargetTestArgs, ctx: &Ctx) -> Result<u8> {
+    super::doctor::run(
+        DoctorArgs {
+            target: TargetArgs {
+                target: Some(a.name),
+                ..Default::default()
+            },
+            read_only: a.read_only,
+        },
+        ctx,
+    )
+    .await
+}
+
+/// A commented starting point for a new config file.
+pub const CONFIG_TEMPLATE: &str = r#"# oprobe configuration (docs: https://github.com/hxddh/oprobe/blob/main/docs/concepts.md)
+# Precedence: command-line flags > OPROBE_* environment > target > [defaults] > built-in.
+# `oprobe config show` prints every effective value and where it comes from.
+
+[defaults]
+# output = "text"          # text | json | ndjson | md | html
+# target = "prod"          # used when `oprobe run` is given no target
+# preset = "parquet"       # parquet | checkpoint | small-files | metadata | mixed
+# duration = "10s"
+# concurrency = 16
+# max_requests = 1000000   # trace rows kept per run (sampled beyond)
+
+# [targets.prod]
+# url = "s3://my-bucket/oprobe"
+# region = "eu-west-1"
+# credentials = "profile:prod"   # env | profile:NAME | anonymous (default: provider chain)
+# options = { enable_virtual_host_style = "true" }
+"#;
+
+/// Result of `oprobe config edit`.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct ConfigEdited {
+    pub config_file: String,
+    pub created: bool,
+    pub targets: Vec<String>,
+}
+
+impl CommandOutput for ConfigEdited {
+    fn text(&self) -> String {
+        format!(
+            "{} {} is valid{}\n",
+            green("✓"),
+            self.config_file,
+            if self.targets.is_empty() {
+                String::new()
+            } else {
+                format!(" · targets: {}", self.targets.join(", "))
+            }
+        )
+    }
+}
+
+/// The editor command: `$VISUAL`, `$EDITOR`, else the platform's default.
+pub fn editor_command(env: &dyn Fn(&str) -> Option<String>) -> Vec<String> {
+    let raw = env("VISUAL")
+        .or_else(|| env("EDITOR"))
+        .filter(|e| !e.trim().is_empty())
+        .unwrap_or_else(|| {
+            if cfg!(windows) {
+                "notepad".into()
+            } else {
+                "vi".into()
+            }
+        });
+    raw.split_whitespace().map(str::to_owned).collect()
+}
+
+pub fn config_edit(ctx: &Ctx) -> Result<u8> {
+    let path = &ctx.paths.config_file;
+    if ctx.out.non_interactive {
+        return Err(OprobeError::new(
+            ErrorCode::UsageInvalidArgument,
+            "`oprobe config edit` needs an interactive terminal",
+        )
+        .with_hint(format!("edit {} directly", path.display()))
+        .into());
+    }
+    let created = !path.exists();
+    if created {
+        crate::store::atomic_write(path, CONFIG_TEMPLATE.as_bytes())?;
+    }
+    let env = |k: &str| std::env::var(k).ok();
+    let cmd = editor_command(&env);
+    let status = std::process::Command::new(&cmd[0])
+        .args(&cmd[1..])
+        .arg(path)
+        .status()
+        .map_err(|e| {
+            OprobeError::new(
+                ErrorCode::UsageInvalidArgument,
+                format!("cannot start the editor `{}`: {e}", cmd.join(" ")),
+            )
+            .with_hint("set $EDITOR (e.g. `export EDITOR=nano`)")
+        })?;
+    if !status.success() {
+        ctx.out.warn(format!(
+            "the editor exited with {status}; checking the file anyway"
+        ));
+    }
+    let cfg = ConfigFile::load(path).map_err(|e| {
+        OprobeError::new(ErrorCode::ConfigInvalid, format!("{e:#}"))
+            .with_hint("fix it with `oprobe config edit` (the file was kept as you saved it)")
+    })?;
+    ctx.out.finish(&ConfigEdited {
+        config_file: path.display().to_string(),
+        created,
+        targets: cfg.targets.keys().cloned().collect(),
+    })
 }
 
 pub fn target_list(ctx: &Ctx) -> Result<u8> {
@@ -222,4 +381,28 @@ pub fn target_rm(a: TargetNameArg, ctx: &Ctx) -> Result<u8> {
         .ok_or_else(|| unknown_target(&a.name))?;
     cfg.save(&ctx.paths.config_file)?;
     ctx.out.finish(&redacted(&a.name, &t))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn template_is_a_valid_config() {
+        let c: ConfigFile = toml::from_str(CONFIG_TEMPLATE).unwrap();
+        assert_eq!(c, ConfigFile::default());
+    }
+
+    #[test]
+    fn editor_prefers_visual_then_editor() {
+        let env = |k: &str| match k {
+            "VISUAL" => Some("code -w".to_owned()),
+            "EDITOR" => Some("nano".to_owned()),
+            _ => None,
+        };
+        assert_eq!(editor_command(&env), vec!["code", "-w"]);
+        let env = |k: &str| (k == "EDITOR").then(|| "nano".to_owned());
+        assert_eq!(editor_command(&env), vec!["nano"]);
+        assert!(!editor_command(&|_| None).is_empty());
+    }
 }

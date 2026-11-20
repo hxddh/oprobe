@@ -3676,6 +3676,7 @@ dependencies = [
  "crc32c",
  "crossterm",
  "dirs",
+ "flate2",
  "futures",
  "hdrhistogram",
  "http",
@@ -3708,6 +3709,8 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
+ "tar",
  "tempfile",
  "tokio",
  "tokio-rustls",
@@ -3717,6 +3720,7 @@ dependencies = [
  "url",
  "webpki-roots 0.26.11",
  "windows-sys 0.61.2",
+ "zip",
  "zstd",
 ]
 
@@ -5505,6 +5509,7 @@ checksum = "3f6221d9a6003c78398e3b239969f352578258df48c8eb051caadae0015bc840"
 dependencies = [
  "filetime",
  "libc",
+ "xattr",
 ]
 
 [[package]]

@@ -9,7 +9,9 @@ pub use crate::output::OutputFormat;
 
 const EXAMPLES: &str = "\
 Examples:
-  oprobe run memory://                                  # zero-setup demo
+  oprobe demo                                           # 30-second guided demo
+  oprobe target add prod s3://my-bucket/bench --region eu-west-1
+  oprobe run prod                                       # measure a saved target
   oprobe run s3://my-bucket/bench --preset parquet -d 30s --label base
   oprobe run s3://my-bucket/data --existing tables/events/ -c 64
   oprobe run s3://my-bucket/bench --dry-run             # plan: requests, bytes, cost, ETA
@@ -118,7 +120,7 @@ pub enum Command {
     /// Measure a target: where time and money go (saves the run)
     Run(RunArgs),
     /// Start a lab target with throttling and stragglers, run it and narrate the result
-    Demo(PendingArgs),
+    Demo(DemoArgs),
     /// Find the best client configuration for a workload (throttle-aware)
     Tune(TuneArgs),
     /// Regression gate: compare two runs (RUNREFs or files) and fail on regressions
@@ -161,7 +163,7 @@ pub enum Command {
     /// Remove test data left behind by interrupted runs
     Cleanup(CleanupArgs),
     /// Check, download, verify and install the latest release
-    SelfUpdate(PendingArgs),
+    SelfUpdate(SelfUpdateArgs),
     /// Interactive workbench in this terminal: run, tune and probe with live charts
     #[command(visible_alias = "tui")]
     Top(TopArgs),
@@ -188,10 +190,10 @@ pub enum Command {
 pub enum RunsCommand {
     /// List saved runs, newest first
     List(RunsListArgs),
-    /// Show a run's full report
-    Show(RunRefArg),
-    /// Open a run in the app
-    Open(PendingArgs),
+    /// Show a run's full report (-o md|html|json for documents)
+    Show(RunsShowArgs),
+    /// Open a run in the app (native window)
+    Open(RunRefArg),
     /// Export a run (html, md, json, ndjson, csv, har, otlp)
     Export(PendingArgs),
     /// Delete saved runs
@@ -205,6 +207,46 @@ pub struct RunsListArgs {
     /// Show at most N runs
     #[arg(short = 'n', long, default_value_t = 20)]
     pub limit: usize,
+}
+
+#[derive(Args, Debug)]
+pub struct RunsShowArgs {
+    /// Run id, id prefix, `last`, `last~N`, label, or path to a .oprobe / report .json file
+    #[arg(value_name = "RUNREF", default_value = "last")]
+    pub run: String,
+    /// Every column, per-stage and per-verb breakdowns, the timeline and the 5 slowest operations
+    #[arg(long)]
+    pub detail: bool,
+}
+
+/// `oprobe demo`: no flags needed.
+#[derive(Args, Debug, Clone)]
+pub struct DemoArgs {
+    /// Measurement window of the demo run
+    #[arg(short, long, default_value = "8s", hide = true)]
+    pub duration: String,
+}
+
+impl Default for DemoArgs {
+    fn default() -> Self {
+        Self {
+            duration: "8s".into(),
+        }
+    }
+}
+
+/// `oprobe self-update`.
+#[derive(Args, Debug, Clone, Default)]
+pub struct SelfUpdateArgs {
+    /// Only check whether a newer release exists (exit 0 either way)
+    #[arg(long)]
+    pub check: bool,
+    /// Install this release tag instead of the latest (e.g. v3.0.1)
+    #[arg(long, value_name = "TAG")]
+    pub to: Option<String>,
+    /// Reinstall even when already on that version
+    #[arg(long)]
+    pub force: bool,
 }
 
 #[derive(Args, Debug)]
@@ -226,7 +268,7 @@ pub struct RunsGcArgs {
     /// Keep the newest N runs
     #[arg(long, default_value_t = 50)]
     pub keep: usize,
-    /// Only delete runs older than this (e.g. 30d is not supported; use hours: 720h)
+    /// Only delete runs older than this, e.g. 30d, 12h, 2w
     #[arg(long, value_name = "DURATION")]
     pub older_than: Option<String>,
     /// Show what would be deleted
@@ -244,8 +286,8 @@ pub enum TargetCommand {
     Show(TargetNameArg),
     /// Remove a target
     Rm(TargetNameArg),
-    /// Check a target (doctor)
-    Test(PendingArgs),
+    /// Check a target (doctor: reachability, TLS, clock, credentials, permissions)
+    Test(TargetTestArgs),
 }
 
 #[derive(Args, Debug)]
@@ -264,6 +306,18 @@ pub struct TargetAddArgs {
     /// OpenDAL option, repeatable (KEY=VALUE)
     #[arg(long = "option", value_name = "KEY=VALUE")]
     pub options: Vec<String>,
+    /// Save without the quick read-only check
+    #[arg(long)]
+    pub no_test: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct TargetTestArgs {
+    /// Target name (or a storage URL)
+    pub name: String,
+    /// Only check reachability and listing; never write
+    #[arg(long)]
+    pub read_only: bool,
 }
 
 #[derive(Args, Debug)]
@@ -289,8 +343,8 @@ pub enum ConfigCommand {
     Show,
     /// Paths of the config file and data directory
     Path,
-    /// Open the config file in $EDITOR
-    Edit(PendingArgs),
+    /// Open the config file in $VISUAL / $EDITOR (validated when the editor exits)
+    Edit,
 }
 
 /// Safety rails of commands that touch storage (design §10).
@@ -692,6 +746,9 @@ pub struct TopArgs {
     /// Public bucket, no credentials
     #[arg(long)]
     pub anonymous: bool,
+    /// Open a saved run (.oprobe file) instead of starting with a new run
+    #[arg(long, value_name = "FILE")]
+    pub open: Option<PathBuf>,
 }
 
 #[derive(Args, Debug, Default)]
