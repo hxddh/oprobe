@@ -1,0 +1,99 @@
+{
+  "$defs": {
+    "InstallMethod": {
+      "description": "How this binary was installed.",
+      "oneOf": [
+        {
+          "enum": [
+            "homebrew",
+            "scoop",
+            "winget",
+            "cargo"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "standalone",
+          "description": "A binary we may replace (install.sh / install.ps1, an extracted archive).",
+          "type": "string"
+        },
+        {
+          "const": "system_package",
+          "description": "Debian/RPM package (`/usr/bin`).",
+          "type": "string"
+        },
+        {
+          "const": "macos_pkg",
+          "description": "The macOS installer package (`/usr/local/bin` with a pkgutil receipt).",
+          "type": "string"
+        },
+        {
+          "const": "macos_app",
+          "description": "Inside `oprobe.app` (the disk image).",
+          "type": "string"
+        },
+        {
+          "const": "msi",
+          "description": "The Windows installer (Program Files).",
+          "type": "string"
+        }
+      ]
+    }
+  },
+  "$id": "https://github.com/hxddh/oprobe/schemas/3/self-update.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Result of `oprobe self-update`",
+  "properties": {
+    "asset": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "current_version": {
+      "type": "string"
+    },
+    "executable": {
+      "type": "string"
+    },
+    "install_method": {
+      "$ref": "#/$defs/InstallMethod"
+    },
+    "installed": {
+      "description": "The new version was installed.",
+      "type": "boolean"
+    },
+    "latest_version": {
+      "type": "string"
+    },
+    "release_url": {
+      "type": "string"
+    },
+    "sha256": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "update_available": {
+      "type": "boolean"
+    },
+    "update_command": {
+      "description": "How to update this install.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "current_version",
+    "latest_version",
+    "update_available",
+    "installed",
+    "install_method",
+    "update_command",
+    "executable",
+    "release_url"
+  ],
+  "title": "oprobe self-update",
+  "type": "object",
+  "x-rust-type": "UpdateOutput"
+}

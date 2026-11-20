@@ -210,21 +210,6 @@ fn errors_are_classified_with_exit_codes() {
     let o = env.run(&["run", "no-such-target", "-o", "json"]);
     assert_eq!(o.status.code(), Some(2));
     assert_eq!(error_code(&o), "usage.unknown_target");
-    // later streams: internal, exit 1
-    for cmd in [&["runs", "export", "last"][..]] {
-        // Global flags go before the arguments of a pending command (it accepts any).
-        let mut args = vec!["-o", "json"];
-        args.extend(cmd);
-        let o = env.run(&args);
-        assert_eq!(o.status.code(), Some(1), "{cmd:?}");
-        assert_eq!(error_code(&o), "internal", "{cmd:?}");
-        assert!(
-            json(&o)["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("not implemented yet")
-        );
-    }
     // ndjson: version line, then the error event.
     let o = env.run(&["runs", "show", "nope", "-o", "ndjson"]);
     assert_eq!(o.status.code(), Some(2));

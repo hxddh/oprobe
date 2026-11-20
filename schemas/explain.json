@@ -280,11 +280,11 @@
       "description": "One attribute value and how much more common it is among the selected requests.",
       "properties": {
         "attribute": {
-          "description": "Attribute name: `api`, `status`, `protocol`, `connection`, `remote`, `attempt`,\n`error`, `stage` (the dominant stage of the request).",
+          "description": "Attribute name: `api`, `status`, `protocol`, `connection`, `remote`, `attempt`,\n`error`, `stage` (the dominant stage of the request), `size` (bytes moved, binned),\n`rtt` (TCP RTT, binned), `time` (tenth of the run), `conn` (connection id).",
           "type": "string"
         },
         "lift": {
-          "description": "`selected_ratio / rest_ratio` (capped; large when the value is absent from the rest).",
+          "description": "`selected_ratio / rest_ratio`, smoothed (add-one) and capped.",
           "format": "double",
           "type": "number"
         },

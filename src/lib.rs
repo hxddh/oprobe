@@ -11,6 +11,7 @@ pub mod config;
 pub mod engine;
 pub mod errors;
 pub mod events;
+pub mod export;
 pub mod guard;
 pub mod lab;
 pub mod layers;

@@ -1,0 +1,180 @@
+{
+  "$defs": {
+    "Rolling": {
+      "description": "Metrics of the rolling window.",
+      "properties": {
+        "availability_ratio": {
+          "format": "double",
+          "type": "number"
+        },
+        "error_ratio": {
+          "format": "double",
+          "type": "number"
+        },
+        "ops_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "p50_ms": {
+          "format": "double",
+          "type": "number"
+        },
+        "p90_ms": {
+          "format": "double",
+          "type": "number"
+        },
+        "p99_ms": {
+          "format": "double",
+          "type": "number"
+        },
+        "throttle_ratio": {
+          "format": "double",
+          "type": "number"
+        },
+        "windows_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "windows_count",
+        "ops_count",
+        "p50_ms",
+        "p90_ms",
+        "p99_ms",
+        "error_ratio",
+        "throttle_ratio",
+        "availability_ratio"
+      ],
+      "type": "object"
+    },
+    "Slo": {
+      "description": "A service level objective over the rolling window.",
+      "properties": {
+        "below": {
+          "description": "The value must stay below (`true`) or above (`false`) the limit.",
+          "type": "boolean"
+        },
+        "limit": {
+          "format": "double",
+          "type": "number"
+        },
+        "metric": {
+          "description": "`p50_ms`, `p90_ms`, `p99_ms`, `error_ratio`, `throttle_ratio`, `availability_ratio`.",
+          "type": "string"
+        },
+        "spec": {
+          "description": "As given, e.g. `p99<200ms`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "spec",
+        "metric",
+        "below",
+        "limit"
+      ],
+      "type": "object"
+    },
+    "SloState": {
+      "properties": {
+        "breached_windows_count": {
+          "description": "Probe windows that ended with the SLO breached.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "ok": {
+          "type": "boolean"
+        },
+        "slo": {
+          "$ref": "#/$defs/Slo"
+        },
+        "value": {
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "slo",
+        "ok",
+        "value",
+        "breached_windows_count"
+      ],
+      "type": "object"
+    },
+    "Transition": {
+      "description": "An SLO changing state.",
+      "properties": {
+        "at": {
+          "description": "RFC 3339.",
+          "type": "string"
+        },
+        "slo": {
+          "type": "string"
+        },
+        "state": {
+          "description": "`breached` or `recovered`.",
+          "type": "string"
+        },
+        "value": {
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "at",
+        "slo",
+        "state",
+        "value"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://github.com/hxddh/oprobe/schemas/3/watch.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Result of `oprobe watch`",
+  "properties": {
+    "listen": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "rolling": {
+      "$ref": "#/$defs/Rolling"
+    },
+    "slos": {
+      "items": {
+        "$ref": "#/$defs/SloState"
+      },
+      "type": "array"
+    },
+    "target": {
+      "type": "string"
+    },
+    "transitions": {
+      "items": {
+        "$ref": "#/$defs/Transition"
+      },
+      "type": "array"
+    },
+    "windows_count": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "target",
+    "windows_count",
+    "rolling",
+    "slos",
+    "transitions"
+  ],
+  "title": "oprobe watch",
+  "type": "object",
+  "x-rust-type": "WatchOutput"
+}

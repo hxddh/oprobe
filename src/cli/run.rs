@@ -109,7 +109,7 @@ impl CommandOutput for PlanOutput {
 }
 
 /// Parse the safety flags into budgets.
-fn budgets(s: &SafetyArgs) -> Result<Budgets> {
+pub(super) fn budgets(s: &SafetyArgs) -> Result<Budgets> {
     let bad = |flag: &str, e: anyhow::Error| -> anyhow::Error {
         OprobeError::new(
             ErrorCode::UsageInvalidArgument,
@@ -145,14 +145,14 @@ fn budgets(s: &SafetyArgs) -> Result<Budgets> {
 }
 
 /// Everything the safety rails decide before a session opens.
-struct Rails {
-    run_id: RunId,
-    run_prefix: String,
-    budgets: Budgets,
-    read_only: bool,
+pub(super) struct Rails {
+    pub(super) run_id: RunId,
+    pub(super) run_prefix: String,
+    pub(super) budgets: Budgets,
+    pub(super) read_only: bool,
 }
 
-fn rails(profile: &Profile, s: &SafetyArgs) -> Result<Rails> {
+pub(super) fn rails(profile: &Profile, s: &SafetyArgs) -> Result<Rails> {
     let run_id = RunId::new();
     let run_prefix = match &s.idempotency_key {
         Some(k) => crate::model::ids::idempotent_run_prefix(k),
@@ -175,7 +175,7 @@ fn rails(profile: &Profile, s: &SafetyArgs) -> Result<Rails> {
     })
 }
 
-fn guard_for(ctx: &Ctx, profile: &Profile, b: &Budgets) -> Option<Arc<Guard>> {
+pub(super) fn guard_for(ctx: &Ctx, profile: &Profile, b: &Budgets) -> Option<Arc<Guard>> {
     if b.is_empty() {
         return None;
     }
@@ -190,7 +190,7 @@ fn guard_for(ctx: &Ctx, profile: &Profile, b: &Budgets) -> Option<Arc<Guard>> {
 
 /// Progress for this output mode: a live line on a terminal, events in ndjson mode,
 /// messages on stderr otherwise.
-fn progress_for(ctx: &Ctx, total_s: f64) -> (ProgressFn, Option<Arc<live::LiveLine>>) {
+pub(super) fn progress_for(ctx: &Ctx, total_s: f64) -> (ProgressFn, Option<Arc<live::LiveLine>>) {
     if ctx.out.format == OutputFormat::Ndjson {
         return (ctx.out.bus().progress_fn(Some(total_s)), None);
     }
@@ -223,7 +223,7 @@ fn save_outputs(r: &Report, o: &OutputArgs) -> Result<()> {
 }
 
 /// `--fail-on`: exit 3 when the diagnosis has findings of this severity or worse.
-fn apply_fail_on(r: &mut Report, o: &OutputArgs, ctx: &Ctx) {
+pub(super) fn apply_fail_on(r: &mut Report, o: &OutputArgs, ctx: &Ctx) {
     use crate::analysis::diagnosis::Severity;
     let Some(level) = o.fail_on else { return };
     let min = match level {
@@ -242,7 +242,7 @@ fn apply_fail_on(r: &mut Report, o: &OutputArgs, ctx: &Ctx) {
 }
 
 /// Save the run (unless `--no-save`); returns the run file path.
-fn save_run(ctx: &Ctx, run: &Run, o: &OutputArgs) -> Result<Option<String>> {
+pub(super) fn save_run(ctx: &Ctx, run: &Run, o: &OutputArgs) -> Result<Option<String>> {
     save_outputs(&run.report, o)?;
     if o.no_save {
         return Ok(None);
@@ -255,7 +255,7 @@ fn save_run(ctx: &Ctx, run: &Run, o: &OutputArgs) -> Result<Option<String>> {
 }
 
 /// Shared tail of `run` / `tune`: budget breach handling.
-fn budget_error(
+pub(super) fn budget_error(
     session: &Session,
     run_id: &RunId,
     ctx: &Ctx,
@@ -271,12 +271,6 @@ fn budget_error(
 }
 
 pub async fn cmd_run(mut a: RunArgs, ctx: &Ctx) -> Result<u8> {
-    if a.repeat > 1 {
-        return Err(OprobeError::not_implemented("run --repeat").into());
-    }
-    if a.baseline.is_some() {
-        return Err(OprobeError::not_implemented("run --baseline").into());
-    }
     // `oprobe run` without a target in an interactive terminal: guided first run.
     if a.target.target.is_none()
         && a.target.profile.is_none()
@@ -290,6 +284,9 @@ pub async fn cmd_run(mut a: RunArgs, ctx: &Ctx) -> Result<u8> {
             super::onboard::Choice::Target(name) => a.target.target = Some(name),
             super::onboard::Choice::Saved => return Ok(exit::OK),
         }
+    }
+    if a.repeat > 1 || a.baseline.is_some() {
+        return super::repeat::cmd_run_repeat(a, ctx).await;
     }
     let (mut profile, target_name) =
         resolve_profile(ctx, &a.target, &a.workload, &a.knobs, &a.cost)?;

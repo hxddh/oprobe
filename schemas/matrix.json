@@ -1,0 +1,110 @@
+{
+  "$defs": {
+    "MatrixCell": {
+      "description": "One cell of the matrix.",
+      "properties": {
+        "cost_per_month_usd": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "error": {
+          "description": "The cell failed to run (error message); its numbers are zero.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "error_ratio": {
+          "format": "double",
+          "type": "number"
+        },
+        "mib_per_s": {
+          "format": "double",
+          "type": "number"
+        },
+        "ops_per_s": {
+          "format": "double",
+          "type": "number"
+        },
+        "p50_ms": {
+          "format": "double",
+          "type": "number"
+        },
+        "p99_ms": {
+          "format": "double",
+          "type": "number"
+        },
+        "path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "rank": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "run_id": {
+          "type": "string"
+        },
+        "settings": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Knob values of this cell (`--vary`).",
+          "type": "object"
+        },
+        "target": {
+          "type": "string"
+        },
+        "throttled_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "verdict": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "rank",
+        "target",
+        "settings",
+        "run_id",
+        "ops_per_s",
+        "mib_per_s",
+        "p50_ms",
+        "p99_ms",
+        "error_ratio",
+        "throttled_count",
+        "verdict"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://github.com/hxddh/oprobe/schemas/3/matrix.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Result of `oprobe matrix`",
+  "properties": {
+    "cells": {
+      "items": {
+        "$ref": "#/$defs/MatrixCell"
+      },
+      "type": "array"
+    },
+    "rank_by": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "rank_by",
+    "cells"
+  ],
+  "title": "oprobe matrix",
+  "type": "object",
+  "x-rust-type": "MatrixOutput"
+}

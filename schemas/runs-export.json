@@ -1,0 +1,50 @@
+{
+  "$id": "https://github.com/hxddh/oprobe/schemas/3/runs-export.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Result of `oprobe runs export`",
+  "properties": {
+    "bytes": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "endpoint": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "format": {
+      "type": "string"
+    },
+    "ops_count": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "path": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "requests_count": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "run_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "run_id",
+    "format",
+    "bytes",
+    "ops_count",
+    "requests_count"
+  ],
+  "title": "oprobe runs-export",
+  "type": "object",
+  "x-rust-type": "ExportOutput"
+}

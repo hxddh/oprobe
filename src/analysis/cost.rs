@@ -27,7 +27,9 @@ pub struct Pricing {
 
 /// Public list prices (standard/hot tier, cheapest common region). Verify against your
 /// contract; override with `[cost.pricing]` in the profile.
-pub const PRICING_AS_OF: &str = "2025-06";
+/// Cloudflare R2 and Backblaze B2 were checked against the providers' public pricing pages on
+/// 2026-11-20 (as was the AWS GET price); the other tables are list prices as of 2025-06.
+pub const PRICING_AS_OF: &str = "2026-11";
 
 pub fn presets() -> Vec<(&'static str, Pricing)> {
     let p = |provider: &str, storage, write, list, read, egress, note: &str| Pricing {
@@ -93,12 +95,12 @@ pub fn presets() -> Vec<(&'static str, Pricing)> {
             "backblaze-b2",
             p(
                 "Backblaze B2",
-                0.006,
+                0.00695,
                 0.0,
-                4.00,
-                0.40,
+                0.0,
+                0.0,
                 0.01,
-                "egress free up to 3x stored data",
+                "$6.95/TB-month, API calls free (checked 2026-11); egress free up to 3x stored data",
             ),
         ),
         (
@@ -230,6 +232,95 @@ pub struct CostReport {
     /// The provider matching the target (or the profile's choice / custom pricing).
     pub selected: ProviderCost,
     pub comparison: Vec<ProviderCost>,
+    /// Monthly request spend per storage API under the selected prices (largest first).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub by_api: Vec<ApiCost>,
+    /// Monthly spend that buys nothing: failed/throttled requests and over-read egress.
+    #[serde(default)]
+    pub waste_usd: f64,
+}
+
+/// Request spend of one storage API.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ApiCost {
+    pub api: String,
+    pub billing_class: BillingClass,
+    /// Billed requests of this API per logical operation.
+    pub requests_per_op: f64,
+    /// Monthly spend at the projected operation volume.
+    pub monthly_usd: f64,
+    /// Share of the monthly request spend (0–100).
+    pub share_pct: f64,
+}
+
+/// Billing class of a storage API by name: OpenDAL `ServiceOperation` names and the
+/// providers' own (S3, GCS JSON, Azure Blob, B2 native); unknown names bill as reads.
+pub fn billing_class_of(api: &str) -> BillingClass {
+    let a = api.to_ascii_lowercase();
+    let has = |xs: &[&str]| xs.iter().any(|x| a.contains(x));
+    if has(&["control", "authorize", "token", "session"]) {
+        BillingClass::Free
+    } else if has(&["delete", "abort", "remove"]) {
+        BillingClass::Delete
+    } else if has(&["list", "objects.list"]) {
+        BillingClass::List
+    } else if has(&[
+        "put",
+        "upload",
+        "copy",
+        "multipart",
+        "create",
+        "complete",
+        "insert",
+        "compose",
+        "append",
+        "write",
+        "post",
+    ]) {
+        BillingClass::Write
+    } else {
+        BillingClass::Read
+    }
+}
+
+/// Request spend per API for usage measured over `ops` operations under `p`.
+fn api_costs(s: &Snapshot, p: &Pricing, spec: &CostSpec) -> Vec<ApiCost> {
+    let ops = s.summary.ops.max(1) as f64;
+    let m = spec.monthly_ops.max(0.0) / 1e6;
+    let mut v: Vec<ApiCost> = s
+        .apis
+        .iter()
+        .map(|a| {
+            let unsent = a.status.get(&0).copied().unwrap_or(0);
+            let n = a.count.saturating_sub(unsent) as f64 / ops;
+            let class = billing_class_of(a.api.label());
+            let unit = match class {
+                BillingClass::Write => p.write_per_million,
+                BillingClass::List => p.list_per_million,
+                BillingClass::Read => p.read_per_million,
+                BillingClass::Delete => p.delete_per_million,
+                BillingClass::Free => 0.0,
+            };
+            ApiCost {
+                api: a.api.label().to_owned(),
+                billing_class: class,
+                requests_per_op: n,
+                monthly_usd: n * unit * m,
+                share_pct: 0.0,
+            }
+        })
+        .filter(|c| c.requests_per_op > 0.0)
+        .collect();
+    let total: f64 = v.iter().map(|c| c.monthly_usd).sum();
+    for c in &mut v {
+        c.share_pct = if total > 0.0 {
+            c.monthly_usd * 100.0 / total
+        } else {
+            0.0
+        };
+    }
+    v.sort_by(|a, b| b.monthly_usd.total_cmp(&a.monthly_usd));
+    v
 }
 
 pub fn per_op_usage(s: &Snapshot) -> PerOpUsage {
@@ -313,16 +404,16 @@ pub fn cost_report(
         .provider
         .clone()
         .or_else(|| detect_provider(scheme, endpoint).map(str::to_owned));
-    let selected = match (&spec.pricing, selected_key.as_deref().and_then(preset)) {
-        (Some(custom), _) => Some(price("custom", custom, &u, spec)),
-        (None, Some(p)) => Some(price(
-            selected_key.as_deref().unwrap_or_default(),
-            &p,
-            &u,
-            spec,
-        )),
+    let table = match (&spec.pricing, selected_key.as_deref().and_then(preset)) {
+        (Some(custom), _) => Some(("custom".to_owned(), custom.clone())),
+        (None, Some(p)) => Some((selected_key.clone().unwrap_or_default(), p)),
         (None, None) => None,
     };
+    let selected = table.as_ref().map(|(k, p)| price(k, p, &u, spec));
+    let by_api = table
+        .as_ref()
+        .map(|(_, p)| api_costs(s, p, spec))
+        .unwrap_or_default();
     let Some(selected) = selected else {
         return CostReport {
             applicable: false,
@@ -345,6 +436,8 @@ pub fn cost_report(
             per_op: u,
             selected: ProviderCost::default(),
             comparison: Vec::new(),
+            by_api: Vec::new(),
+            waste_usd: 0.0,
         };
     };
     let comparison: Vec<ProviderCost> = presets()
@@ -360,8 +453,10 @@ pub fn cost_report(
         stored_gb: spec.stored_gib,
         egress_fraction: spec.egress_fraction,
         per_op: u,
+        waste_usd: selected.failed_requests_usd + selected.overread_usd,
         selected,
         comparison,
+        by_api,
     }
 }
 
@@ -448,6 +543,51 @@ mod tests {
         };
         let r = cost_report(&s, &spec, "s3", Some("https://s3.us-east-1.amazonaws.com"));
         assert_eq!(r.stored_gb, 10.0);
+    }
+
+    #[test]
+    fn per_api_spend_and_waste() {
+        for (name, class) in [
+            ("GetObject", BillingClass::Read),
+            ("HeadObject", BillingClass::Read),
+            ("PutObject", BillingClass::Write),
+            ("CompleteMultipartUpload", BillingClass::Write),
+            ("ListObjectsV2", BillingClass::List),
+            ("DeleteObjects", BillingClass::Delete),
+            ("Control", BillingClass::Free),
+        ] {
+            assert_eq!(billing_class_of(name), class, "{name}");
+        }
+        let mut s = Snapshot {
+            summary: Summary {
+                ops: 100,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        s.apis = vec![
+            ApiStats {
+                api: Api::PutObject,
+                count: 100,
+                status: [(200u16, 100u64)].into_iter().collect(),
+                ..Default::default()
+            },
+            ApiStats {
+                api: Api::GetObject,
+                count: 100,
+                status: [(200u16, 50u64), (503, 50)].into_iter().collect(),
+                ..Default::default()
+            },
+        ];
+        let spec = CostSpec {
+            monthly_ops: 1e6,
+            ..Default::default()
+        };
+        let r = cost_report(&s, &spec, "s3", Some("https://s3.us-east-1.amazonaws.com"));
+        assert_eq!(r.by_api[0].api, "PutObject");
+        assert!((r.by_api[0].monthly_usd - 5.0).abs() < 1e-9);
+        assert!(r.by_api[0].share_pct > 90.0);
+        assert!(r.waste_usd > 0.0);
     }
 
     #[test]

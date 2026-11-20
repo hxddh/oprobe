@@ -3,17 +3,24 @@
 //! classified ([`crate::errors::classify`]) at this boundary and mapped to exit codes.
 
 mod agent;
+pub(crate) mod analyze;
 pub mod args;
-mod demo;
+pub(crate) mod compare;
+pub(crate) mod demo;
 pub(crate) mod doctor;
+pub(crate) mod export;
 mod live;
+pub(crate) mod matrix;
+mod measure;
 pub(crate) mod misc;
 mod onboard;
 pub mod reference;
+pub(crate) mod repeat;
 pub(crate) mod run;
 pub(crate) mod runs;
-mod self_update;
+pub(crate) mod self_update;
 pub(crate) mod settings;
+pub(crate) mod watch;
 
 use std::io::IsTerminal;
 use std::process::ExitCode;
@@ -131,6 +138,8 @@ fn scheme_of(cmd: &Command) -> String {
         Command::Tune(a) => a.target.target.clone(),
         Command::Top(a) | Command::Gui(a) => a.target.clone(),
         Command::Doctor(a) => a.target.target.clone(),
+        Command::Watch(a) => a.target.target.clone(),
+        Command::Matrix(a) => a.target.target.clone(),
         Command::Cleanup(a) => a.target.target.clone(),
         _ => None,
     };
@@ -323,14 +332,14 @@ async fn dispatch(cmd: Command, ctx: &Ctx) -> Result<u8> {
     match cmd {
         Command::Run(a) => run::cmd_run(a, ctx).await,
         Command::Tune(a) => run::cmd_tune(a, ctx).await,
-        Command::Compare(a) => runs::cmd_compare(a, ctx),
+        Command::Compare(a) => compare::cmd_compare(a, ctx),
         Command::Runs(c) => match c {
             RunsCommand::List(a) => runs::cmd_list(a, ctx),
             RunsCommand::Show(a) => runs::cmd_show(a, ctx),
             RunsCommand::Rm(a) => runs::cmd_rm(a, ctx),
             RunsCommand::Gc(a) => runs::cmd_gc(a, ctx),
             RunsCommand::Open(a) => runs::cmd_open(a, ctx),
-            RunsCommand::Export(_) => pending("runs export"),
+            RunsCommand::Export(a) => export::cmd_export(a, ctx).await,
         },
         Command::Target(c) => match c {
             TargetCommand::Add(a) => settings::target_add(a, ctx).await,
@@ -372,12 +381,12 @@ async fn dispatch(cmd: Command, ctx: &Ctx) -> Result<u8> {
             unreachable!("interactive commands are handled by ui_entry")
         }
         Command::Demo(a) => demo::cmd_demo(a, ctx).await,
-        Command::Analyze(_) => pending("analyze"),
+        Command::Analyze(a) => analyze::cmd_analyze(a, ctx),
         Command::Explain(a) => agent::cmd_explain(a, ctx),
-        Command::Watch(_) => pending("watch"),
-        Command::Matrix(_) => pending("matrix"),
+        Command::Watch(a) => watch::cmd_watch(a, ctx).await,
+        Command::Matrix(a) => matrix::cmd_matrix(a, ctx).await,
         Command::Compat(_) => pending("compat"),
-        Command::Baseline(_) => pending("baseline"),
+        Command::Baseline(c) => compare::cmd_baseline(c, ctx),
         Command::Mcp(a) => agent::cmd_mcp(a, ctx).await,
         Command::Schema(a) => agent::cmd_schema(a, ctx),
         Command::Capabilities(a) => agent::cmd_capabilities(a, ctx),

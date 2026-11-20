@@ -134,8 +134,62 @@ pub fn entries() -> Vec<Entry> {
         entry!(
             "compare",
             Output,
-            crate::report::diff::DiffReport,
+            crate::analysis::compare::Comparison,
             "Result of `oprobe compare`"
+        ),
+        entry!(
+            "analyze",
+            Output,
+            cli::analyze::AnalyzeOutput,
+            "Result of `oprobe analyze`"
+        ),
+        entry!(
+            "watch",
+            Output,
+            cli::watch::WatchOutput,
+            "Result of `oprobe watch`"
+        ),
+        entry!(
+            "matrix",
+            Output,
+            cli::matrix::MatrixOutput,
+            "Result of `oprobe matrix`"
+        ),
+        entry!(
+            "runs-export",
+            Output,
+            cli::export::ExportOutput,
+            "Result of `oprobe runs export`"
+        ),
+        entry!(
+            "run-repeat",
+            Output,
+            cli::repeat::RepeatOutput,
+            "Result of `oprobe run --repeat N` / `--baseline NAME`"
+        ),
+        entry!(
+            "baseline-show",
+            Output,
+            cli::compare::BaselineShow,
+            "Result of `oprobe baseline show`"
+        ),
+        entry!(
+            "baseline-list",
+            Output,
+            cli::compare::BaselineList,
+            "Result of `oprobe baseline list`"
+        ),
+        entry!(
+            "demo",
+            Output,
+            cli::demo::DemoOutput,
+            "Result of `oprobe demo`"
+        ),
+        entry!(
+            "self-update",
+            Output,
+            cli::self_update::UpdateOutput,
+            "Result of `oprobe self-update`"
         ),
         entry!(
             "doctor",

@@ -4,6 +4,40 @@
       "description": "Storage API name, e.g. GetObject (OpenDAL ServiceOperation)",
       "type": "string"
     },
+    "ApiCost": {
+      "description": "Request spend of one storage API.",
+      "properties": {
+        "api": {
+          "type": "string"
+        },
+        "billing_class": {
+          "$ref": "#/$defs/BillingClass"
+        },
+        "monthly_usd": {
+          "description": "Monthly spend at the projected operation volume.",
+          "format": "double",
+          "type": "number"
+        },
+        "requests_per_op": {
+          "description": "Billed requests of this API per logical operation.",
+          "format": "double",
+          "type": "number"
+        },
+        "share_pct": {
+          "description": "Share of the monthly request spend (0–100).",
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "api",
+        "billing_class",
+        "requests_per_op",
+        "monthly_usd",
+        "share_pct"
+      ],
+      "type": "object"
+    },
     "ApiStats": {
       "properties": {
         "api": {
@@ -65,6 +99,36 @@
         "stages"
       ],
       "type": "object"
+    },
+    "BillingClass": {
+      "description": "Billing bucket used by the cost model.",
+      "oneOf": [
+        {
+          "const": "write",
+          "description": "PUT / POST / COPY (S3 \"tier 1\", GCS \"class A\").",
+          "type": "string"
+        },
+        {
+          "const": "list",
+          "description": "LIST requests (class A on S3/GCS, class C on B2).",
+          "type": "string"
+        },
+        {
+          "const": "read",
+          "description": "GET / HEAD (S3 \"tier 2\", GCS \"class B\").",
+          "type": "string"
+        },
+        {
+          "const": "delete",
+          "description": "DELETE / abort, free on most providers.",
+          "type": "string"
+        },
+        {
+          "const": "free",
+          "description": "Not billed (control plane, in-process backends).",
+          "type": "string"
+        }
+      ]
     },
     "Bottleneck": {
       "description": "The layer that dominates operation latency.",
@@ -413,6 +477,13 @@
           "description": "A price table applies: the target is a recognised cloud endpoint, or the profile chose a\nprovider / custom pricing. Otherwise `selected` and `comparison` are empty.",
           "type": "boolean"
         },
+        "by_api": {
+          "description": "Monthly request spend per storage API under the selected prices (largest first).",
+          "items": {
+            "$ref": "#/$defs/ApiCost"
+          },
+          "type": "array"
+        },
         "comparison": {
           "items": {
             "$ref": "#/$defs/ProviderCost"
@@ -454,6 +525,12 @@
         "stored_gib": {
           "format": "double",
           "type": "number"
+        },
+        "waste_usd": {
+          "default": 0.0,
+          "description": "Monthly spend that buys nothing: failed/throttled requests and over-read egress.",
+          "format": "double",
+          "type": "number"
         }
       },
       "required": [
@@ -464,7 +541,8 @@
         "egress_ratio",
         "per_op",
         "selected",
-        "comparison"
+        "comparison",
+        "waste_usd"
       ],
       "type": "object"
     },
