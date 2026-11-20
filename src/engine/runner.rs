@@ -474,10 +474,10 @@ async fn run_one(
     rec: &Arc<Recorder>,
     tree: Option<&await_tree::Registry>,
 ) {
-    let scope = OpScope::new(measured && rec.is_measuring());
+    let scope = OpScope::new_at(measured && rec.is_measuring(), intended, Some(rec.clone()));
     let measured = scope.measured;
     let name = verb(kind);
-    rec.op_started(scope.id);
+    rec.op_started_at(scope.id, intended);
     let fut = scope.run(execute(ctx, kind, rng, slot));
     let res = match tree {
         Some(reg) => {

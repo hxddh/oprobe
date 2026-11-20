@@ -2,7 +2,6 @@
 //! Lookups are timed and attributed to the current operation scope; writes/deletes invalidate.
 
 use std::collections::{BTreeMap, HashMap};
-use std::ops::RangeBounds;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -99,6 +98,38 @@ struct CacheEntryKey {
     epoch: u64,
     offset: u64,
     size: Option<u64>,
+    /// A suffix range (`bytes=-N`, the last N bytes) reports offset 0 and size N, like the
+    /// first N bytes: the kind must be part of the key or a footer read is served the head.
+    suffix: bool,
+}
+
+impl CacheEntryKey {
+    fn of(path: &str, epoch: u64, range: BytesRange) -> Self {
+        Self {
+            path: path.to_owned(),
+            epoch,
+            offset: range.offset(),
+            size: range.size(),
+            suffix: range.is_suffix(),
+        }
+    }
+}
+
+/// The bytes of `range` within a whole cached object, if the object covers its start.
+fn slice_of_full(full: &Buffer, range: BytesRange) -> Option<Buffer> {
+    let len = full.len();
+    let (start, end) = if range.is_suffix() {
+        let n = range.size().unwrap_or(0) as usize;
+        (len.saturating_sub(n), len)
+    } else {
+        let start = usize::try_from(range.offset()).ok()?;
+        let end = match range.size() {
+            Some(n) => start.saturating_add(n as usize).min(len),
+            None => len,
+        };
+        (start, end)
+    };
+    (start <= len).then(|| full.slice(start..end.max(start)))
 }
 
 struct SharedCacheState {
@@ -289,12 +320,7 @@ impl CachedReader {
         let epoch = self.state.current_epoch(&self.path);
 
         // 1. Check exact range key
-        let exact_key = CacheEntryKey {
-            path: self.path.clone(),
-            epoch,
-            offset: range.offset(),
-            size: range.size(),
-        };
+        let exact_key = CacheEntryKey::of(&self.path, epoch, range);
         if let Some(buf) = self.state.cache.get(&exact_key) {
             note_lookup(
                 t_lookup.elapsed().as_micros() as u64,
@@ -305,27 +331,18 @@ impl CachedReader {
 
         // 2. If reading a sub-range, check whether the full object `(0, None)` is already cached
         if range.offset() > 0 || range.size().is_some() {
-            let full_key = CacheEntryKey {
-                path: self.path.clone(),
-                epoch,
-                offset: 0,
-                size: None,
-            };
-            if let Some(full_buf) = self.state.cache.get(&full_key) {
-                let bounds = range.to_range_as_usize();
-                let start = match bounds.start_bound() {
-                    std::ops::Bound::Included(&s) => s,
-                    std::ops::Bound::Excluded(&s) => s + 1,
-                    std::ops::Bound::Unbounded => 0,
-                };
-                if start <= full_buf.len() {
-                    let sliced = full_buf.slice(range.to_range_as_usize());
-                    note_lookup(
-                        t_lookup.elapsed().as_micros() as u64,
-                        Some(sliced.len() as u64),
-                    );
-                    return Some(sliced);
-                }
+            let full_key = CacheEntryKey::of(&self.path, epoch, BytesRange::new(0, None));
+            if let Some(sliced) = self
+                .state
+                .cache
+                .get(&full_key)
+                .and_then(|full| slice_of_full(&full, range))
+            {
+                note_lookup(
+                    t_lookup.elapsed().as_micros() as u64,
+                    Some(sliced.len() as u64),
+                );
+                return Some(sliced);
             }
         }
 
@@ -349,12 +366,7 @@ impl oio::Read for CachedReader {
         let fetched = stream.read_all().await?;
 
         if fetched.len() <= 32 * 1024 * 1024 {
-            let key = CacheEntryKey {
-                path: self.path.clone(),
-                epoch,
-                offset: range.offset(),
-                size: range.size(),
-            };
+            let key = CacheEntryKey::of(&self.path, epoch, range);
             self.state.cache.insert(key, fetched.clone());
         }
 
@@ -374,12 +386,7 @@ impl oio::Read for CachedReader {
         let (rp, fetched) = reader.read(range).await?;
 
         if fetched.len() <= 32 * 1024 * 1024 {
-            let key = CacheEntryKey {
-                path: self.path.clone(),
-                epoch,
-                offset: range.offset(),
-                size: range.size(),
-            };
+            let key = CacheEntryKey::of(&self.path, epoch, range);
             self.state.cache.insert(key, fetched.clone());
         }
 
@@ -439,7 +446,26 @@ mod tests {
             epoch: 0,
             offset: 0,
             size: None,
+            suffix: false,
         }
+    }
+
+    #[test]
+    fn suffix_and_out_of_bounds_ranges() {
+        let full = Buffer::from((0u8..100).collect::<Vec<_>>());
+        let tail = slice_of_full(&full, BytesRange::suffix(10)).unwrap();
+        assert_eq!(tail.to_vec(), (90u8..100).collect::<Vec<_>>());
+        let past = slice_of_full(&full, BytesRange::new(95, Some(20))).unwrap();
+        assert_eq!(past.len(), 5);
+        assert!(slice_of_full(&full, BytesRange::new(101, Some(1))).is_none());
+        assert_eq!(
+            slice_of_full(&full, BytesRange::suffix(500)).unwrap().len(),
+            100
+        );
+        assert_ne!(
+            CacheEntryKey::of("p", 0, BytesRange::suffix(10)),
+            CacheEntryKey::of("p", 0, BytesRange::new(0, Some(10)))
+        );
     }
 
     #[test]

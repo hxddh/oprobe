@@ -31,18 +31,20 @@ points:
 |---|---|
 | DNS | a timed resolver on the same `getaddrinfo` path as reqwest's default resolver |
 | TCP / proxy / TLS | a connector layer times each dial; a delegating TLS session store timestamps the ClientHello, which splits TCP (or TCP + proxy CONNECT) from the TLS handshake; the TLS version comes from the key-schedule labels (no secrets are read) |
-| Cold vs warm | the connection's local address (`HttpInfo`): the first request seen on a connection is the cold one and carries that connection's dial |
-| Send / TTFB / transfer / stall | the request body reports when its last byte was handed over; response headers and body chunks are timed as they arrive and as your code consumes them |
+| Cold vs warm | the connection's local and remote address (`HttpInfo`): the first request seen on a connection is the cold one and carries that connection's dial — if the dial finished while it waited. A dial that lost hyper's race against an idle connection (and went to the pool) counts as a new connection, but the request that later takes it is warm |
+| Send / TTFB / transfer / stall | the request body is handed over in 64 KiB frames and reports when the last one was taken (hyper takes a frame only when it can write, so this is within one frame plus the socket send buffer of the last byte leaving); response headers and body chunks are timed as they arrive and as your code consumes them |
+| Cancelled requests | a request dropped before its response (OpenDAL's timeout layer, a tail-cut) is recorded with its elapsed time and a `cancelled` error; a response body dropped before its declared length is recorded with an error |
 
 `--microscope` (or `transport = "microscope"`) switches to oprobe's own pool built on hyper's
 low-level HTTP/1.1 and HTTP/2 connections. It sees more — time spent waiting for a pooled
-connection or an HTTP/2 stream as **queue**, proxy CONNECT separately from TCP, the TLS cipher, the
-exact connection a dial was made for — but it is a different client:
+HTTP/1.1 connection as **queue**, proxy CONNECT separately from TCP, the TLS cipher, raw wire bytes,
+the exact connection a dial was made for — but it is a different client:
 
 | Default (OpenDAL's client) | `--microscope` (oprobe's pool) |
 |---|---|
 | Results transfer to production as-is | Results describe oprobe's pool, not your client |
-| Waiting for a pooled connection / HTTP/2 stream is part of TTFB | Shown as queue time |
+| Waiting for a pooled connection is part of TTFB | Shown as queue time (HTTP/1.1); waiting for an HTTP/2 stream slot is part of TTFB in both |
+| Wire rx / tx not available (reported as 0) | Raw socket bytes incl. TLS and framing |
 | Proxy CONNECT reported together with TCP to the proxy | Proxy CONNECT timed on its own |
 | HTTP/1.1 unless `http = "h2"` (OpenDAL builds reqwest without `http2`) | ALPN negotiates h2 for https by default |
 
@@ -84,7 +86,7 @@ For every backend request (columns of the *BACKEND REQUESTS* table):
 | `tcp` | `connect()` | SYN/ACK completed |
 | `proxy` | `CONNECT host:port` written | `200` received from the egress proxy |
 | `tls` | ClientHello | handshake complete (ALPN negotiated) |
-| `send` | connection ready | last request byte written to the socket (HTTP/1.1) / handed to the stream (HTTP/2) |
+| `send` | connection ready | last request byte written to the socket (microscope, HTTP/1.1) / last 64 KiB frame handed to the connection (default client) / handed to the stream (HTTP/2) |
 | `ttfb` | request sent | response headers received — server think time + one network round trip |
 | `transfer` | headers received | body EOF, **minus** consumer stall |
 | `stall` | — | time the body sat idle because the consumer had not polled it (application back-pressure) |
@@ -124,7 +126,7 @@ connect / upload / server / download in proportion to the measured request-stage
 |---|---|
 | logical read / write | bytes the workload asked to read / wrote |
 | backend down / up | HTTP response / request body bytes |
-| wire rx / tx | raw socket bytes incl. TLS records, HTTP framing, proxy handshake |
+| wire rx / tx | raw socket bytes incl. TLS records, HTTP framing, proxy handshake (`--microscope` only; 0 with the default client) |
 | read amplification | backend down ÷ logical read (cache hits lower it, over-fetch raises it) |
 | over-read | backend down ÷ (logical read − cache hit bytes): bytes fetched but never requested |
 | write amplification | backend up ÷ logical write (retried uploads raise it) |

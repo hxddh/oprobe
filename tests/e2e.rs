@@ -782,6 +782,8 @@ fn bare_invocation_is_not_a_usage_error() {
             .args(args)
             .env_remove("DISPLAY")
             .env_remove("WAYLAND_DISPLAY")
+            // macOS / Windows builds with `gui`: no window from a "remote" shell.
+            .env("SSH_CONNECTION", "test")
             .output()
             .unwrap();
         assert!(

@@ -129,7 +129,43 @@ struct Bucket {
     bytes: u64,
     errors: u64,
     throttled: u64,
-    latency: Histogram<u64>,
+    /// Latencies of the second while it is open; dropped (and its quantiles kept) once a later
+    /// second starts, so a long run holds a few numbers per second, not a histogram each, and a
+    /// snapshot does not recompute quantiles over every second of the run.
+    latency: Option<Histogram<u64>>,
+    p50_us: u64,
+    p99_us: u64,
+}
+
+impl Bucket {
+    fn new() -> Self {
+        Self {
+            ops: 0,
+            bytes: 0,
+            errors: 0,
+            throttled: 0,
+            latency: Some(small_hist()),
+            p50_us: 0,
+            p99_us: 0,
+        }
+    }
+
+    fn close(&mut self) {
+        if let Some(h) = self.latency.take()
+            && !h.is_empty()
+        {
+            self.p50_us = h.value_at_quantile(0.5);
+            self.p99_us = h.value_at_quantile(0.99);
+        }
+    }
+
+    fn quantiles(&self) -> (u64, u64) {
+        match &self.latency {
+            Some(h) if !h.is_empty() => (h.value_at_quantile(0.5), h.value_at_quantile(0.99)),
+            Some(_) => (0, 0),
+            None => (self.p50_us, self.p99_us),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -500,6 +536,26 @@ impl Recorder {
         // (`record_request`); dials only contribute metadata and failures.
     }
 
+    /// A connection whose handshake finished before any request waited on it: hyper's pool
+    /// races a new dial against an idle connection and keeps the loser. It is a new connection
+    /// (counted, with its handshake phases), but the request that later takes it saw it warm,
+    /// so the phases are not charged to that request.
+    pub fn record_unclaimed_dial(&self, dns_us: u64, tcp_us: u64, proxy_us: u64, tls_us: u64) {
+        if !self.is_measuring() {
+            return;
+        }
+        let mut a = self.agg();
+        a.conn.dialed += 1;
+        rec(&mut a.dns, dns_us);
+        rec(&mut a.tcp, tcp_us);
+        if proxy_us > 0 {
+            rec(&mut a.proxy, proxy_us);
+        }
+        if tls_us > 0 {
+            rec(&mut a.tls, tls_us);
+        }
+    }
+
     /// Request issued outside any operation scope (rare: background OpenDAL work).
     pub fn record_unscoped_request(&self, r: &RequestRecord) {
         if self.is_measuring() {
@@ -521,11 +577,16 @@ impl Recorder {
     }
 
     pub fn op_started(&self, op_id: u64) {
+        self.op_started_at(op_id, Instant::now());
+    }
+
+    /// An operation started at `at` (its intended start in open-loop runs).
+    pub fn op_started_at(&self, op_id: u64, at: Instant) {
         self.inflight_ops.fetch_add(1, Ordering::Relaxed);
         self.live_ops
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(op_id, Instant::now());
+            .insert(op_id, at);
     }
 
     /// Record a completed logical operation (only if it started inside the window).
@@ -594,14 +655,27 @@ impl Recorder {
             v.client_us += bd[3];
         }
         let idx = at_s.max(0.0) as usize;
-        while a.buckets.len() <= idx {
-            a.buckets.push(Bucket {
-                ops: 0,
-                bytes: 0,
-                errors: 0,
-                throttled: 0,
-                latency: small_hist(),
-            });
+        if a.buckets.len() <= idx {
+            // A second is complete once every operation that started in it has finished: close
+            // the seconds before the oldest operation still running (its start, or this one's).
+            // (`live_ops` is never held while taking `agg`, so this nesting cannot deadlock.)
+            let oldest_live = self
+                .live_ops
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .values()
+                .min()
+                .copied();
+            let first_open = oldest_live
+                .map(|t| t.saturating_duration_since(window_start).as_secs_f64() as usize)
+                .unwrap_or(idx)
+                .min(idx);
+            for b in a.buckets.iter_mut().take(first_open) {
+                b.close();
+            }
+            while a.buckets.len() <= idx {
+                a.buckets.push(Bucket::new());
+            }
         }
         let b = &mut a.buckets[idx];
         b.ops += 1;
@@ -612,7 +686,9 @@ impl Recorder {
         if throttled {
             b.throttled += 1;
         }
-        rec(&mut b.latency, c.latency_us);
+        if let Some(h) = b.latency.as_mut() {
+            rec(h, c.latency_us);
+        }
 
         // Keep the slowest operations with their full request timelines.
         let lat_ms = c.latency_us as f64 / 1000.0;
@@ -821,20 +897,13 @@ impl Recorder {
                 } else {
                     1.0
                 };
+                let (p50, p99) = b.quantiles();
                 TimelinePoint {
                     t_s: i as f64 + 1.0,
                     ops_per_s: b.ops as f64 / width,
                     mib_per_s: mib(b.bytes) / width,
-                    p50_ms: if b.latency.is_empty() {
-                        0.0
-                    } else {
-                        b.latency.value_at_quantile(0.5) as f64 / 1000.0
-                    },
-                    p99_ms: if b.latency.is_empty() {
-                        0.0
-                    } else {
-                        b.latency.value_at_quantile(0.99) as f64 / 1000.0
-                    },
+                    p50_ms: p50 as f64 / 1000.0,
+                    p99_ms: p99 as f64 / 1000.0,
                     errors: b.errors,
                     throttled: b.throttled,
                 }
@@ -918,6 +987,12 @@ pub fn breakdown_us(d: &OpScopeData, total_us: u64) -> [u64; 4] {
     let rest = total_us.saturating_sub(queue + net);
     let cache = d.cache_lookup_us.min(rest);
     [queue, cache, net, rest - cache]
+}
+
+impl std::fmt::Debug for Recorder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Recorder").finish_non_exhaustive()
+    }
 }
 
 #[cfg(test)]

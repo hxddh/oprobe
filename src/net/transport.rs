@@ -445,6 +445,8 @@ struct TracedResponseBody {
     incoming: Incoming,
     pending: Option<Pending>,
     uri: String,
+    /// Declared body length, to tell a body read to its end from one dropped part-way.
+    expected: Option<u64>,
 }
 
 impl Stream for TracedResponseBody {
@@ -499,7 +501,12 @@ impl Drop for TracedResponseBody {
         if let Some(p) = self.pending.take() {
             // Body dropped before EOF: connection cannot be reused safely.
             let complete = self.incoming.is_end_stream();
-            p.finish(complete, None);
+            let got = p.record.bytes_down;
+            let short = self.expected.filter(|&n| got < n);
+            p.finish(
+                complete,
+                short.map(|n| format!("response body dropped after {got} of {n} bytes")),
+            );
         }
     }
 }
@@ -586,6 +593,17 @@ impl HttpTransport for TracingTransport {
             error: None,
         };
 
+        // A request dropped before its response (timeout layer, tail-cut) still gets a record.
+        let mut cancel_guard = super::fidelity::CancelGuard::new(
+            api,
+            method.to_string(),
+            bytes_up,
+            start_offset_us,
+            t_start,
+            scope.clone(),
+            recorder.clone(),
+        );
+
         // Early failures still produce a request record so errors are attributed.
         let fail = |mut record: RequestRecord, msg: String, err: Error| -> Error {
             record.error = Some(msg);
@@ -621,7 +639,10 @@ impl HttpTransport for TracingTransport {
             .await
         {
             Ok(v) => v,
-            Err(e) => return Err(fail(record, e.to_string(), e)),
+            Err(e) => {
+                cancel_guard.disarm();
+                return Err(fail(record, e.to_string(), e));
+            }
         };
         let t_ready = Instant::now();
         let dial_us = dial.map(|d| d.total_us()).unwrap_or(0);
@@ -696,6 +717,7 @@ impl HttpTransport for TracingTransport {
             }
         };
         let t_headers = Instant::now();
+        cancel_guard.disarm();
         let resp = match resp {
             Ok(r) => r,
             Err(e) => {
@@ -749,8 +771,8 @@ impl HttpTransport for TracingTransport {
         record.request_id = REQUEST_ID_HEADERS.iter().find_map(|h| header_str(&resp, h));
         if record.is_throttle() {
             record.retry_after_ms = header_str(&resp, "retry-after")
-                .and_then(|v| v.trim().parse::<f64>().ok())
-                .map(|s| (s * 1000.0) as u64);
+                .as_deref()
+                .and_then(super::parse_retry_after);
         }
 
         let content_length = if method == Method::HEAD
@@ -770,7 +792,8 @@ impl HttpTransport for TracingTransport {
             t_start,
             t_headers,
             stall: Duration::ZERO,
-            last_yield: None,
+            // Until the consumer first polls the body, the bytes wait on it, not the network.
+            last_yield: Some(t_headers),
             scope,
             recorder,
             _permit: permit,
@@ -794,6 +817,7 @@ impl HttpTransport for TracingTransport {
             incoming,
             pending,
             uri: original_uri.to_string(),
+            expected: content_length,
         };
         Ok(out
             .body(HttpBody::new(stream, content_length))
