@@ -367,15 +367,28 @@ jobs:
           files: out/*
           fail_on_unmatched_files: true
       # `uses: hxddh/oprobe@v3` (the GitHub Action) follows the newest 3.x release.
+      # GitHub refuses to let the workflow token move a tag across commits that change
+      # `.github/workflows/`, which a major release usually does: set the RELEASE_TAG_TOKEN
+      # secret (a token with `contents` and `workflows` write) to move it here. Without it, a
+      # rejected move is a warning, not a failed release: the warning says how to move it by hand.
       - name: Move the floating major tag
         if: ${{ !contains(env.VERSION, '-') }}
+        env:
+          TAG_TOKEN: ${{ secrets.RELEASE_TAG_TOKEN }}
+          REPO: ${{ github.repository }}
         run: |
           major="v${VERSION%%.*}"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if [ -n "$TAG_TOKEN" ]; then
+            git config --unset-all http.https://github.com/.extraheader || true
+            git remote set-url origin "https://x-access-token:${TAG_TOKEN}@github.com/${REPO}.git"
+          fi
           git fetch --force origin "refs/tags/${TAG}:refs/tags/${TAG}"
           git tag -f "$major" "${TAG}^{commit}"
-          git push -f origin "refs/tags/$major"
+          if ! git push -f origin "refs/tags/$major"; then
+            echo "::warning::could not move $major to $TAG (set the RELEASE_TAG_TOKEN secret, or run: git fetch --tags && git tag -f $major $TAG^{commit} && git push -f origin refs/tags/$major)"
+          fi
 
   crates-io:
     name: Publish to crates.io

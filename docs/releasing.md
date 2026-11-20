@@ -13,7 +13,10 @@ Checklist:
 1. Set the version in `Cargo.toml` and run `cargo build` (updates `Cargo.lock`).
 2. Date the `## <version>` section at the top of `CHANGELOG.md`: it becomes the release notes.
 3. Bump the default `version` input of `action.yml` to the new version, so `uses: hxddh/oprobe@v<major>` installs
-   it; after the release, move the `v<major>` tag to the release commit.
+   it. The workflow moves the `v<major>` tag to the release commit after publishing; GitHub lets it do so only
+   with the `RELEASE_TAG_TOKEN` secret (a token with `contents` and `workflows` write) whenever the release
+   changes `.github/workflows/`. Without it the run warns and the tag is moved by hand:
+   `git fetch --tags && git tag -f v<major> v<version>^{commit} && git push -f origin refs/tags/v<major>`.
 4. Regenerate the CLI reference if commands changed: `OPROBE_BLESS=1 cargo test --test docs`.
 5. Merge. The workflow tests, builds every platform, generates the package manifests, attests every asset and
    publishes; crates.io follows when the `CARGO_REGISTRY_TOKEN` secret is set.
