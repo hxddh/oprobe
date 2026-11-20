@@ -834,6 +834,7 @@ fn tab_bar(s: Store) -> impl IntoElement {
     };
     tabs()
         .flex_row()
+        .flex_shrink_0()
         .self_start()
         .gap(px(2.0))
         .p(px(2.0))
@@ -859,35 +860,40 @@ fn run_header(s: Store) -> impl IntoElement {
         .border_b_1()
         .border_color(move || theme().border)
         .child(tab_bar(s))
-        .child(view().flex_1())
-        .child(dynamic(move || {
-            let info = s.current.with(|c| {
-                c.as_ref().map(|c| {
-                    let r = &c.run.report;
-                    format!(
-                        "{} · {} · {} · {}{}",
-                        r.target.name.clone().unwrap_or(r.target.display.clone()),
-                        r.workload.preset,
-                        fmt::dur_us(r.run.window_s * 1e6),
-                        c.id(),
-                        if r.run.sampled { " · sampled" } else { "" }
-                    )
-                })
-            });
-            let live = s.sel.get() == Sel::Live;
-            if narrow() {
-                return view().into_element();
-            }
-            untracked(|| {
-                small(if live {
-                    "live".to_owned()
-                } else {
-                    info.unwrap_or_default()
-                })
-                .number_of_lines(1)
-                .into_element()
-            })
-        }))
+        .child(
+            view()
+                .flex_1()
+                .min_w(px(0.0))
+                .items_end()
+                .child(dynamic(move || {
+                    let info = s.current.with(|c| {
+                        c.as_ref().map(|c| {
+                            let r = &c.run.report;
+                            format!(
+                                "{} · {} · {} · {}{}",
+                                r.target.name.clone().unwrap_or(r.target.display.clone()),
+                                r.workload.preset,
+                                fmt::dur_us(r.run.window_s * 1e6),
+                                c.id(),
+                                if r.run.sampled { " · sampled" } else { "" }
+                            )
+                        })
+                    });
+                    let live = s.sel.get() == Sel::Live;
+                    if narrow() {
+                        return view().into_element();
+                    }
+                    untracked(|| {
+                        small(if live {
+                            "live".to_owned()
+                        } else {
+                            info.unwrap_or_default()
+                        })
+                        .number_of_lines(1)
+                        .into_element()
+                    })
+                })),
+        )
 }
 
 fn run_inspector(s: Store) -> impl IntoElement {
