@@ -1,4 +1,4 @@
-//! `oprobe diff`: compare a candidate report against a baseline and gate regressions.
+//! `oprobe compare`: compare a candidate run against a baseline and gate regressions.
 
 use std::fmt::Write as _;
 
@@ -9,7 +9,7 @@ use super::style::*;
 use crate::util::fmt_ms;
 
 /// Regression limits. Percentages are relative changes in the "bad" direction.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Thresholds {
     pub p99_pct: f64,
     pub p50_pct: f64,
@@ -54,7 +54,7 @@ impl Default for Thresholds {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Status {
     Pass,
@@ -63,7 +63,7 @@ pub enum Status {
     Skipped,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Check {
     pub name: String,
     pub baseline: f64,
@@ -77,7 +77,9 @@ pub struct Check {
 }
 
 /// What part of the setup a [`ConfigChange`] is in.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum ChangeKind {
     /// What was run (preset, mix, dataset, access pattern, rate…): results are not comparable.
@@ -102,7 +104,7 @@ impl ChangeKind {
 }
 
 /// One setting that differs between baseline and candidate.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ConfigChange {
     pub kind: ChangeKind,
     /// Dotted path, e.g. `knobs.concurrency`, `workload.mix`.
@@ -111,7 +113,7 @@ pub struct ConfigChange {
     pub candidate: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct DiffReport {
     pub passed: bool,
     pub baseline: String,
@@ -191,9 +193,9 @@ pub fn config_changes(base: &Report, cand: &Report) -> Vec<ConfigChange> {
         &base.workload,
         &cand.workload,
         &[
-            "duration",
-            "warmup",
-            "max_ops",
+            "duration_s",
+            "warmup_s",
+            "max_ops_count",
             "cleanup",
             "dataset.persist",
         ],
@@ -217,27 +219,35 @@ pub fn config_changes(base: &Report, cand: &Report) -> Vec<ConfigChange> {
     );
     changes_of(
         ChangeKind::Knobs,
-        "knobs",
-        &base.knobs,
-        &cand.knobs,
+        "knobs.requested",
+        &base.knobs.requested,
+        &cand.knobs.requested,
         &[],
         &mut out,
     );
+    let effective = |r: &Report| {
+        let e = &r.knobs.effective;
+        serde_json::json!({
+            "write_chunk_bytes": e.write_chunk_bytes,
+            "service_min_part_bytes": e.service_min_part_bytes,
+            "service_max_part_bytes": e.service_max_part_bytes,
+        })
+    };
     changes_of(
         ChangeKind::Knobs,
-        "effective_knobs",
-        &base.effective_knobs,
-        &cand.effective_knobs,
-        &["requested_chunk_size"],
+        "knobs.effective",
+        &effective(base),
+        &effective(cand),
+        &[],
         &mut out,
     );
     let host = |r: &Report| {
         serde_json::json!({
-            "os": r.host.os,
-            "arch": r.host.arch,
-            "cpus": r.host.cpus,
+            "os": r.run.host.os,
+            "arch": r.run.host.arch,
+            "cpus_count": r.run.host.cpus_count,
             "proxy": r.target.proxy,
-            "oprobe_version": r.oprobe_version,
+            "oprobe_version": r.run.oprobe_version,
         })
     };
     changes_of(
@@ -321,7 +331,7 @@ impl Builder {
     }
 }
 
-fn throttle_rate(s: &crate::trace::Snapshot) -> f64 {
+fn throttle_rate(s: &Report) -> f64 {
     crate::util::ratio(
         s.resilience.throttled_responses as f64,
         s.connections.requests as f64,
@@ -329,9 +339,9 @@ fn throttle_rate(s: &crate::trace::Snapshot) -> f64 {
 }
 
 /// Share of open-loop arrivals that never started (percent).
-fn missed_pct(s: &crate::trace::Snapshot) -> Option<f64> {
+fn missed_pct(s: &Report) -> Option<f64> {
     let ol = s.open_loop.as_ref()?;
-    let issued = ol.achieved_rate * s.elapsed_s;
+    let issued = ol.achieved_rate * s.run.window_s;
     Some(crate::util::pct(
         ol.missed as f64,
         issued + ol.missed as f64,
@@ -341,13 +351,13 @@ fn missed_pct(s: &crate::trace::Snapshot) -> Option<f64> {
 pub fn diff(base: &Report, cand: &Report, t: &Thresholds) -> DiffReport {
     let mut warnings = Vec::new();
     for (side, r) in [("baseline", base), ("candidate", cand)] {
-        if r.interrupted {
+        if r.run.interrupted {
             warnings.push(format!(
                 "the {side} run was interrupted (stopped early): its results cover a shorter window and may not be comparable; re-run it to completion"
             ));
         }
     }
-    match (base.workload.rate, cand.workload.rate) {
+    match (base.workload.rate_per_s, cand.workload.rate_per_s) {
         (None, Some(_)) | (Some(_), None) => warnings.push(
             "comparing a closed-loop run with an open-loop (fixed-rate) run: throughput and latency mean different things in each mode".into(),
         ),
@@ -356,7 +366,7 @@ pub fn diff(base: &Report, cand: &Report, t: &Thresholds) -> DiffReport {
         )),
         _ => {}
     }
-    let (bd, cd) = (base.result.elapsed_s, cand.result.elapsed_s);
+    let (bd, cd) = (base.run.window_s, cand.run.window_s);
     if bd > 0.0 && cd > 0.0 && (bd / cd > 2.0 || cd / bd > 2.0) {
         warnings.push(format!(
             "measurement windows differ a lot ({bd:.1}s vs {cd:.1}s): short windows are noisier and may miss slow effects"
@@ -431,7 +441,7 @@ pub fn diff(base: &Report, cand: &Report, t: &Thresholds) -> DiffReport {
             host_diffs.join("; ")
         ));
     }
-    let (bs, cs) = (&base.result, &cand.result);
+    let (bs, cs) = (base, cand);
     let floor = format!(" & > {}ms", t.min_latency_delta_ms);
 
     b.lower_worse(
@@ -449,7 +459,7 @@ pub fn diff(base: &Report, cand: &Report, t: &Thresholds) -> DiffReport {
         );
     }
     for bv in &bs.verbs {
-        let Some(cv) = cs.verb(&bv.verb) else {
+        let Some(cv) = cs.verbs.iter().find(|v| v.verb == bv.verb) else {
             b.checks.push(Check {
                 name: format!("{} present", bv.verb),
                 baseline: bv.count as f64,
@@ -595,14 +605,16 @@ pub fn diff(base: &Report, cand: &Report, t: &Thresholds) -> DiffReport {
     DiffReport {
         passed,
         baseline: format!(
-            "{} ({})",
+            "{} ({} {})",
             crate::util::display_url(&base.target.display),
-            base.generated_at
+            base.run.id,
+            base.run.started_at
         ),
         candidate: format!(
-            "{} ({})",
+            "{} ({} {})",
             crate::util::display_url(&cand.target.display),
-            cand.generated_at
+            cand.run.id,
+            cand.run.started_at
         ),
         thresholds: t.clone(),
         config_changes: changes,
@@ -848,7 +860,19 @@ mod tests {
                 ..Default::default()
             })
             .collect();
-        Report::build(&p, &p.knobs, s, Default::default(), vec![])
+        let id = crate::model::RunId::new();
+        crate::model::build_report(crate::model::ReportInput {
+            run_id: &id,
+            target_name: None,
+            profile: &p,
+            knobs: &p.knobs,
+            snapshot: s,
+            trace: Default::default(),
+            cleanup: Default::default(),
+            warnings: vec![],
+            started_at: std::time::SystemTime::now(),
+            ended_at: std::time::SystemTime::now(),
+        })
     }
 
     fn status(d: &DiffReport, name: &str) -> Status {
@@ -864,14 +888,14 @@ mod tests {
         let b = report(&["stat"], 0, 1000);
         // Knobs differ: legitimate A/B, passes with a prominent warning.
         let mut c = b.clone();
-        c.knobs.concurrency = 64;
+        c.knobs.requested.concurrency_count = 64;
         let d = diff(&b, &c, &Thresholds::default());
         assert!(d.passed, "{}", d.render_terminal());
         assert_eq!(
             d.config_changes,
             vec![ConfigChange {
                 kind: ChangeKind::Knobs,
-                field: "knobs.concurrency".into(),
+                field: "knobs.requested.concurrency_count".into(),
                 baseline: "16".into(),
                 candidate: "64".into(),
             }]
@@ -879,15 +903,18 @@ mod tests {
         assert!(
             d.warnings
                 .iter()
-                .any(|w| w.contains("knobs.concurrency 16 → 64"))
+                .any(|w| w.contains("knobs.requested.concurrency_count 16 → 64"))
         );
         assert!(d.render_terminal().contains("CONFIGURATION CHANGES"));
-        assert!(d.render_markdown().contains("`knobs.concurrency`"));
+        assert!(
+            d.render_markdown()
+                .contains("`knobs.requested.concurrency_count`")
+        );
 
         // Workload differs: fails unless allowed.
         let mut c = b.clone();
-        c.workload.access = crate::config::Access::Zipf(1.1);
-        c.workload.duration = crate::util::HumanDuration::secs(99);
+        c.workload.access = "zipf:1.1".into();
+        c.workload.duration_s = 99.0;
         let d = diff(&b, &c, &Thresholds::default());
         assert!(!d.passed);
         assert_eq!(status(&d, "same workload"), Status::Fail);
@@ -916,11 +943,11 @@ mod tests {
 
         // Host differs: warning only.
         let mut c = b.clone();
-        c.host.cpus += 1;
+        c.run.host.cpus_count += 1;
         let d = diff(&b, &c, &Thresholds::default());
         assert!(d.passed);
         assert!(
-            d.warnings.iter().any(|w| w.contains("host.cpus")),
+            d.warnings.iter().any(|w| w.contains("host.cpus_count")),
             "{:?}",
             d.warnings
         );
@@ -968,8 +995,8 @@ mod tests {
     fn mode_and_duration_mismatches_warn_and_missed_growth_fails() {
         let b = report(&["stat"], 0, 1000);
         let mut c = report(&["stat"], 0, 1000);
-        c.workload.rate = Some(100.0);
-        c.result.elapsed_s = 60.0;
+        c.workload.rate_per_s = Some(100.0);
+        c.run.window_s = 60.0;
         let d = diff(&b, &c, &Thresholds::default());
         assert!(
             d.warnings.iter().any(|w| w.contains("closed-loop")),
@@ -990,8 +1017,8 @@ mod tests {
             missed,
             max_schedule_lag_ms: 0.0,
         };
-        b.result.open_loop = Some(ol(0));
-        c.result.open_loop = Some(ol(100));
+        b.open_loop = Some(ol(0));
+        c.open_loop = Some(ol(100));
         let d = diff(&b, &c, &Thresholds::default());
         assert_eq!(status(&d, "open-loop missed %"), Status::Fail);
     }

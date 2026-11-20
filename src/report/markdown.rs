@@ -4,6 +4,7 @@ use std::fmt::Write as _;
 
 use super::Report;
 use crate::analysis::diagnosis::Severity;
+use crate::model::{OpRow, ReqRow, Run};
 use crate::util::{fmt_bytes, fmt_ms, fmt_usd};
 
 fn icon(s: Severity) -> &'static str {
@@ -14,21 +15,37 @@ fn icon(s: Severity) -> &'static str {
     }
 }
 
+/// The report as Markdown.
 pub fn render(r: &Report) -> String {
-    let s = &r.result;
+    render_with(r, None)
+}
+
+/// A run as Markdown, with the slowest operation's request timeline.
+pub fn render_run(run: &Run) -> String {
+    let slow = run
+        .report
+        .slowest
+        .first()
+        .and_then(|id| run.op(*id))
+        .map(|op| (op, run.requests_of(op.op_id)));
+    render_with(&run.report, slow)
+}
+
+fn render_with(r: &Report, slow: Option<(&OpRow, Vec<&ReqRow>)>) -> String {
+    let s = r;
     let mut md = String::new();
     let _ = writeln!(md, "## oprobe report — `{}`\n", r.target.display);
     let _ = writeln!(
         md,
         "**{}** · preset `{}` · {:.1}s measured · {} · oprobe {} · {}\n",
-        r.diagnosis.headline,
-        r.workload.preset.slug(),
-        s.elapsed_s,
-        r.knobs.summary(),
-        r.oprobe_version,
-        r.generated_at
+        r.verdict.headline,
+        r.workload.preset,
+        r.run.window_s,
+        r.knobs.requested.to_knobs().summary(),
+        r.run.oprobe_version,
+        r.run.started_at
     );
-    if r.interrupted {
+    if r.run.interrupted {
         let _ = writeln!(
             md,
             "> ⚠️ **Interrupted** — the run was stopped early; results cover a shorter window than configured.\n"
@@ -54,7 +71,7 @@ pub fn render(r: &Report) -> String {
         s.resilience.throttled_responses
     );
 
-    let v = &r.sla_verdict;
+    let v = &r.verdict.sla;
     let _ = writeln!(
         md,
         "**SLA:** {}{}\n",
@@ -66,22 +83,22 @@ pub fn render(r: &Report) -> String {
         if v.enforced { "" } else { " (not enforced)" }
     );
 
-    let sh = &r.diagnosis.shares;
+    let sh = &r.stages.shares;
     let _ = writeln!(
         md,
         "### Where the time goes\n\n| layer | share |\n|---|---:|"
     );
     for (n, v) in [
-        ("queue", sh.queue),
-        ("connect", sh.connect),
-        ("upload", sh.upload),
-        ("server (TTFB)", sh.server),
-        ("download", sh.download),
-        ("retry backoff", sh.retry),
-        ("cache", sh.cache),
-        ("client", sh.client),
+        ("queue", sh.queue_pct),
+        ("connect", sh.connect_pct),
+        ("upload", sh.upload_pct),
+        ("server (TTFB)", sh.server_pct),
+        ("download", sh.download_pct),
+        ("retry backoff", sh.retry_pct),
+        ("cache", sh.cache_pct),
+        ("client", sh.client_pct),
     ] {
-        let _ = writeln!(md, "| {n} | {:.1}% |", v * 100.0);
+        let _ = writeln!(md, "| {n} | {v:.1}% |");
     }
 
     let _ = writeln!(
@@ -163,35 +180,35 @@ pub fn render(r: &Report) -> String {
         );
     }
 
-    if !r.diagnosis.findings.is_empty() {
+    if !r.findings.is_empty() {
         let _ = writeln!(md, "\n### Findings\n");
-        for f in &r.diagnosis.findings {
+        for f in &r.findings {
             let _ = writeln!(
                 md,
                 "- {} **{}** — {}  \n  → {}",
                 icon(f.severity),
-                f.title,
-                f.evidence,
-                f.action
+                f.cause,
+                f.evidence.text,
+                f.advice
             );
         }
     }
 
-    if let Some(op) = s.slow_ops.first() {
+    if let Some((op, reqs)) = slow {
         let _ = writeln!(
             md,
             "\n<details><summary>Slowest operation: <code>{}</code> {}</summary>\n\n```text",
             op.verb,
-            fmt_ms(op.latency_ms)
+            fmt_ms(op.latency_us as f64 / 1000.0)
         );
-        for (i, req) in op.requests.iter().take(20).enumerate() {
-            let t = &req.timing;
+        for (i, req) in reqs.iter().take(20).enumerate() {
+            let t = req;
             let _ = writeln!(
                 md,
                 "#{:<2} +{:>8} {:<24} {:>3} {} queue={} connect={} send={} ttfb={} transfer={} total={}",
                 i + 1,
-                fmt_ms(req.start_offset_us as f64 / 1000.0),
-                req.api.label(),
+                fmt_ms((req.t_us - op.t_us).max(0) as f64 / 1000.0),
+                req.api,
                 req.status,
                 if req.reused { "warm" } else { "cold" },
                 fmt_ms(t.queue_us as f64 / 1000.0),

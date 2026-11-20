@@ -5,8 +5,19 @@ use std::fmt::Write as _;
 use super::Report;
 use super::style::*;
 use crate::analysis::diagnosis::Severity;
-use crate::trace::{Protocol, RequestRecord, SlowOp, Snapshot};
+use crate::model::{OpRow, ReqRow, Run, VerdictLevel, WireProtocol};
+use crate::trace::{ApiStats, VerbStats};
 use crate::util::{fmt_bytes, fmt_ms, fmt_usd};
+
+/// `HEALTHY` / `REVIEW` / `ATTENTION` / `CRITICAL` badge of a verdict level.
+pub fn verdict_badge(level: VerdictLevel) -> String {
+    match level {
+        VerdictLevel::Ok => badge("HEALTHY", "42;30"),
+        VerdictLevel::Review => badge("REVIEW", "46;30"),
+        VerdictLevel::Attention => badge("ATTENTION", "43;30"),
+        VerdictLevel::Critical => badge("CRITICAL", "41"),
+    }
+}
 
 fn section(out: &mut String, title: &str) {
     let _ = writeln!(out, "\n{}", bold(&cyan(title)));
@@ -22,33 +33,45 @@ pub fn severity_icon(s: Severity) -> String {
 
 /// Render the time-share bars (used by run reports and the TUI-less live view).
 pub fn time_share_lines(r: &Report) -> String {
-    let sh = &r.diagnosis.shares;
+    let sh = &r.stages.shares;
     let mut out = String::new();
     let rows = [
         (
             "queue",
-            sh.queue,
+            sh.queue_pct / 100.0,
             "waiting for in-flight permits / connections",
         ),
         (
             "connect",
-            sh.connect,
+            sh.connect_pct / 100.0,
             "DNS + TCP + proxy + TLS on fresh connections",
         ),
-        ("upload", sh.upload, "sending request bodies"),
+        ("upload", sh.upload_pct / 100.0, "sending request bodies"),
         (
             if r.target.endpoint.is_some() {
                 "server"
             } else {
                 "backend"
             },
-            sh.server,
+            sh.server_pct / 100.0,
             "time to first byte (server processing + RTT)",
         ),
-        ("download", sh.download, "receiving response bodies"),
-        ("retry", sh.retry, "backoff sleeps between retry attempts"),
-        ("cache", sh.cache, "local cache lookups"),
-        ("client", sh.client, "OpenDAL / signing / CRC / consumer"),
+        (
+            "download",
+            sh.download_pct / 100.0,
+            "receiving response bodies",
+        ),
+        (
+            "retry",
+            sh.retry_pct / 100.0,
+            "backoff sleeps between retry attempts",
+        ),
+        ("cache", sh.cache_pct / 100.0, "local cache lookups"),
+        (
+            "client",
+            sh.client_pct / 100.0,
+            "OpenDAL / signing / CRC / consumer",
+        ),
     ];
     let max = rows.iter().map(|r| r.1).fold(0.0, f64::max).max(1e-9);
     for (name, v, desc) in rows {
@@ -76,16 +99,16 @@ pub fn time_share_lines(r: &Report) -> String {
 pub fn sla_line(r: &Report) -> String {
     let sla = &r.sla;
     let mut terms = vec![
-        format!("failed ops ≤ {}%", sla.max_error_rate * 100.0),
+        format!("failed ops ≤ {}%", sla.max_error_ratio * 100.0),
         "no corrupted data".to_owned(),
     ];
-    if let Some(t) = sla.max_throttle_rate {
+    if let Some(t) = sla.max_throttle_ratio {
         terms.push(format!("throttled ops ≤ {}%", t * 100.0));
     }
     if let Some(p) = sla.p99_ms {
         terms.push(format!("p99 ≤ {}", fmt_ms(p)));
     }
-    let v = &r.sla_verdict;
+    let v = &r.verdict.sla;
     let enforced = if v.enforced {
         ""
     } else {
@@ -103,8 +126,9 @@ pub fn sla_line(r: &Report) -> String {
     }
 }
 
-pub fn request_line(i: usize, r: &RequestRecord) -> String {
-    let t = &r.timing;
+/// One request of an operation that started at `op_t_us`.
+pub fn request_line(i: usize, r: &ReqRow, op_t_us: i64) -> String {
+    let t = r;
     let ms = |us: u64| fmt_ms(us as f64 / 1000.0);
     let status = if r.status == 0 {
         red("ERR")
@@ -114,10 +138,10 @@ pub fn request_line(i: usize, r: &RequestRecord) -> String {
         green(&r.status.to_string())
     };
     let conn = match r.protocol {
-        Protocol::InProcess => "in-process".to_owned(),
+        WireProtocol::Inproc => "in-process".to_owned(),
         p => format!(
             "{} conn#{} {}",
-            if p == Protocol::Http2 { "h2" } else { "h1" },
+            if p == WireProtocol::H2 { "h2" } else { "h1" },
             r.conn_id,
             if r.reused { "warm" } else { "cold" }
         ),
@@ -126,7 +150,7 @@ pub fn request_line(i: usize, r: &RequestRecord) -> String {
     if t.queue_us > 0 {
         parts.push(format!("queue {}", ms(t.queue_us)));
     }
-    if !r.reused && r.protocol != Protocol::InProcess {
+    if !r.reused && r.protocol != WireProtocol::Inproc {
         let phases: Vec<String> = [
             ("dns", t.dns_us),
             ("tcp", t.tcp_us),
@@ -143,7 +167,7 @@ pub fn request_line(i: usize, r: &RequestRecord) -> String {
             phases.join(" ")
         ));
     }
-    if r.protocol != Protocol::InProcess {
+    if r.protocol != WireProtocol::Inproc {
         parts.push(format!("send {}", ms(t.send_us)));
         parts.push(format!("ttfb {}", ms(t.ttfb_us)));
         parts.push(format!("transfer {}", ms(t.body_us)));
@@ -156,8 +180,8 @@ pub fn request_line(i: usize, r: &RequestRecord) -> String {
     let mut s = format!(
         "    #{:<2} +{:<8} {:<24} {} {}  {}  {}",
         i + 1,
-        fmt_ms(r.start_offset_us as f64 / 1000.0),
-        r.api.label(),
+        fmt_ms((r.t_us - op_t_us).max(0) as f64 / 1000.0),
+        r.api,
         status,
         dim(&conn),
         parts.join(" · "),
@@ -172,23 +196,25 @@ pub fn request_line(i: usize, r: &RequestRecord) -> String {
     s
 }
 
-pub fn slow_op_block(op: &SlowOp, show_tree: bool) -> String {
+/// An operation with its request timeline.
+pub fn slow_op_block(op: &OpRow, requests: &[&ReqRow], show_tree: bool) -> String {
     let mut out = String::new();
     let b = &op.breakdown;
+    let ms = |us: u64| fmt_ms(us as f64 / 1000.0);
     let _ = writeln!(
         out,
         "  {} {} at {:.1}s  {}",
         bold(&op.verb),
-        bold(&fmt_ms(op.latency_ms)),
-        op.at_s,
+        bold(&ms(op.latency_us)),
+        op.t_us as f64 / 1e6,
         dim(&format!(
             "queue {} · backend {} · retry {} · client {}{}",
-            fmt_ms(b.queue_ms),
-            fmt_ms(b.backend_ms),
-            fmt_ms(b.retry_ms),
-            fmt_ms(b.client_ms + b.cache_ms),
-            if op.retries > 0 {
-                format!(" · {} retries", op.retries)
+            ms(b.queue_us),
+            ms(b.backend_us),
+            ms(b.retry_us),
+            ms(b.client_us + b.cache_us),
+            if op.attempts > 1 {
+                format!(" · {} retries", op.attempts - 1)
             } else {
                 String::new()
             }
@@ -197,14 +223,14 @@ pub fn slow_op_block(op: &SlowOp, show_tree: bool) -> String {
     if let Some(e) = &op.error {
         let _ = writeln!(out, "    {}", red(&format!("failed: {e}")));
     }
-    for (i, r) in op.requests.iter().take(12).enumerate() {
-        let _ = writeln!(out, "{}", request_line(i, r));
+    for (i, r) in requests.iter().take(12).enumerate() {
+        let _ = writeln!(out, "{}", request_line(i, r, op.t_us));
     }
-    if op.requests.len() > 12 {
+    if requests.len() > 12 {
         let _ = writeln!(
             out,
             "    {}",
-            dim(&format!("… {} more requests", op.requests.len() - 12))
+            dim(&format!("… {} more requests", requests.len() - 12))
         );
     }
     if show_tree && let Some(t) = &op.await_tree {
@@ -220,9 +246,8 @@ pub fn slow_op_block(op: &SlowOp, show_tree: bool) -> String {
     out
 }
 
-pub fn verbs_table(s: &Snapshot) -> String {
-    let rows: Vec<Vec<String>> = s
-        .verbs
+pub fn verbs_table(verbs: &[VerbStats]) -> String {
+    let rows: Vec<Vec<String>> = verbs
         .iter()
         .map(|v| {
             vec![
@@ -261,9 +286,8 @@ pub fn verbs_table(s: &Snapshot) -> String {
     )
 }
 
-pub fn apis_table(s: &Snapshot) -> String {
-    let rows: Vec<Vec<String>> = s
-        .apis
+pub fn apis_table(apis: &[ApiStats]) -> String {
+    let rows: Vec<Vec<String>> = apis
         .iter()
         .map(|a| {
             let st = &a.stages;
@@ -309,31 +333,47 @@ pub fn apis_table(s: &Snapshot) -> String {
     )
 }
 
+/// The full report.
 pub fn render(r: &Report) -> String {
-    let s = &r.result;
+    render_with(r, None)
+}
+
+/// The full report of a run, with the slowest operation's request timeline.
+pub fn render_run(run: &Run) -> String {
+    let slow = run
+        .report
+        .slowest
+        .first()
+        .and_then(|id| run.op(*id))
+        .map(|op| (op, run.requests_of(op.op_id)));
+    render_with(&run.report, slow)
+}
+
+fn render_with(r: &Report, slow: Option<(&OpRow, Vec<&ReqRow>)>) -> String {
+    let s = r;
     let mut out = String::new();
     let _ = writeln!(
         out,
         "{} {} {} {}",
         bold("oprobe"),
-        dim(&r.oprobe_version),
+        dim(&r.run.oprobe_version),
         bold(&r.target.display),
         dim(&format!(
             "· {} · {:.1}s measured · {} · client {}",
-            r.workload.preset.slug(),
-            s.elapsed_s,
-            if let Some(rate) = r.workload.rate {
+            r.workload.preset,
+            r.run.window_s,
+            if let Some(rate) = r.workload.rate_per_s {
                 format!("open-loop {rate} ops/s")
             } else {
-                format!("{} workers", r.knobs.concurrency)
+                format!("{} workers", r.knobs.requested.concurrency_count)
             },
-            match r.knobs.transport {
+            match r.knobs.requested.transport {
                 crate::config::TransportMode::Opendal => "OpenDAL reqwest",
                 crate::config::TransportMode::Microscope => "oprobe microscope",
             }
         ))
     );
-    if r.interrupted {
+    if r.run.interrupted {
         let _ = writeln!(
             out,
             "{} {}",
@@ -359,13 +399,12 @@ pub fn render(r: &Report) -> String {
         let _ = writeln!(out, "{} {}", yellow("warning:"), w);
     }
 
-    let worst = r.diagnosis.worst();
-    let verdict = match worst {
-        Severity::Critical => badge("ATTENTION", "41"),
-        Severity::Warning => badge("REVIEW", "43;30"),
-        Severity::Info => badge("HEALTHY", "42;30"),
-    };
-    let _ = writeln!(out, "\n{verdict} {}", bold(&r.diagnosis.headline));
+    let _ = writeln!(
+        out,
+        "\n{} {}",
+        verdict_badge(r.verdict.level),
+        bold(&r.verdict.headline)
+    );
 
     let sm = &s.summary;
     let _ = writeln!(
@@ -414,14 +453,14 @@ pub fn render(r: &Report) -> String {
     out.push_str(&time_share_lines(r));
 
     section(&mut out, "OPERATIONS");
-    out.push_str(&verbs_table(s));
+    out.push_str(&verbs_table(&s.verbs));
 
     if !s.apis.is_empty() {
         section(
             &mut out,
             "BACKEND REQUESTS  (mean per request; p99 of total)",
         );
-        out.push_str(&apis_table(s));
+        out.push_str(&apis_table(&s.apis));
         if s.connections.http2_requests > 0 {
             let _ = writeln!(
                 out,
@@ -585,18 +624,18 @@ pub fn render(r: &Report) -> String {
         );
     }
 
-    if !r.diagnosis.findings.is_empty() {
+    if !r.findings.is_empty() {
         section(&mut out, "FINDINGS");
-        for f in &r.diagnosis.findings {
-            let _ = writeln!(out, "  {} {}", severity_icon(f.severity), bold(&f.title));
-            let _ = writeln!(out, "    {}", dim(&f.evidence));
-            let _ = writeln!(out, "    → {}", f.action);
+        for f in &r.findings {
+            let _ = writeln!(out, "  {} {}", severity_icon(f.severity), bold(&f.cause));
+            let _ = writeln!(out, "    {}", dim(&f.evidence.text));
+            let _ = writeln!(out, "    → {}", f.advice);
         }
     }
 
-    if let Some(op) = s.slow_ops.first() {
+    if let Some((op, reqs)) = slow {
         section(&mut out, "SLOWEST OPERATION");
-        out.push_str(&slow_op_block(op, true));
+        out.push_str(&slow_op_block(op, &reqs, true));
     }
 
     section(&mut out, "CLEANUP");
