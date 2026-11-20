@@ -1252,3 +1252,17 @@ async fn effective_write_chunk_is_reported() {
         r.warnings
     );
 }
+
+/// Option keys OpenDAL would silently ignore are rejected with a suggestion, before anything
+/// connects.
+#[test]
+fn unknown_target_options_are_rejected() {
+    let out = Command::new(env!("CARGO_BIN_EXE_oprobe"))
+        .args(["run", "s3://bkt", "-o", "regin=eu-west-1", "--color", "never"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(err.contains("unknown option `regin`"), "{err}");
+    assert!(err.contains("did you mean `region`?"), "{err}");
+}

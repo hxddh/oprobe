@@ -20,6 +20,10 @@ region = "eu-west-1"
 # access_key_id = "${AWS_ACCESS_KEY_ID}"   # ${ENV} references are expanded at runtime
 ```
 
+Option keys are checked against the OpenDAL service's configuration (its field names and
+aliases): a key the service would silently ignore — a typo such as `regin`, or another service's
+option — is an error with a "did you mean" suggestion.
+
 Secrets are never written to reports: option keys containing `secret`, `key`, `token`,
 `password`, `credential` or `sas` are redacted, and `--emit-profile` writes `${ENV}` placeholders.
 Without explicit keys, the backend's usual credential chain is used (e.g. `AWS_*` variables,

@@ -790,6 +790,7 @@ impl TargetSpec {
             t.url = Some(crate::util::strip_url_credentials(u));
         }
         t.apply_provider_url()?;
+        crate::service_options::validate_keys(&t.scheme, t.options.keys())?;
         Ok(t)
     }
 

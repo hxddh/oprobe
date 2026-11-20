@@ -13,6 +13,7 @@ pub mod lab;
 pub mod layers;
 pub mod net;
 pub mod report;
+pub mod service_options;
 pub mod trace;
 pub mod tune;
 #[cfg(feature = "tui")]
