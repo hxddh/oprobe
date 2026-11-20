@@ -4,3 +4,6 @@
 *.json.tmp
 oprobe-*.json
 oprobe-*.md
+
+# Local agent worktrees
+/.claude/worktrees/
