@@ -47,6 +47,7 @@ the exact connection a dial was made for — but it is a different client:
 | Results transfer to production as-is | Results describe oprobe's pool, not your client |
 | Waiting for a pooled connection is part of TTFB | Shown as queue time (HTTP/1.1); waiting for an HTTP/2 stream slot is part of TTFB in both |
 | Wire rx / tx not available (reported as 0) | Raw socket bytes incl. TLS and framing |
+| TLS version only; the cipher suite is not exposed (reported empty) | TLS version and cipher suite |
 | Proxy CONNECT reported together with TCP to the proxy | Proxy CONNECT timed on its own |
 | HTTP/1.1 unless `http = "h2"` (OpenDAL builds reqwest without `http2`) | ALPN negotiates h2 for https by default |
 | reqwest's pool: no connect timeout, unlimited idle connections per host | 10 s timeout per dial phase, at most 256 idle connections per host |

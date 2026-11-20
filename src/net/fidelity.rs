@@ -11,7 +11,8 @@
 //!   request on every connection as cold and attributes that connection's dial to it.
 //!
 //! What this mode cannot see (use `--microscope`): time waiting inside reqwest's pool for an
-//! idle connection or HTTP/2 stream is part of TTFB, and the TLS version/cipher are not exposed.
+//! idle connection or HTTP/2 stream is part of TTFB, and the TLS cipher suite is not exposed (the
+//! TLS version is, from the key-schedule labels).
 
 use std::collections::HashMap;
 use std::future::Future;

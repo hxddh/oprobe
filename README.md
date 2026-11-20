@@ -59,7 +59,7 @@ next questions directly from measurements — never from estimates:
 |---|---|
 | Is it the network, the server, or my client? | Every operation's wall time is split into **queue / connect / upload / server TTFB / download / client** using the real request timeline ([how](docs/metrics.md)). |
 | Why is p99 so much worse than p50? | The slowest operations are kept with **every backend request's stage timings, connection (cold/warm), status, request ID** and an **async call stack** captured while they were stuck. |
-| Are connections reused? Is TLS or the proxy slow? | Per-dial DNS / TCP / proxy CONNECT / TLS histograms, ALPN, TLS version, cipher, reuse ratio, peak in-flight requests. |
+| Are connections reused? Is TLS or the proxy slow? | Per-dial DNS / TCP / proxy CONNECT / TLS histograms, ALPN, TLS version, reuse ratio, peak in-flight requests; the TLS cipher suite with `--microscope` (OpenDAL's client does not expose it). |
 | Am I paying for bytes I don't use? | Logical vs backend vs wire bytes: **read amplification, over-read from range coalescing, requests per operation**. |
 | What will this cost per month? | Measured request mix × provider list prices (S3, GCS, Azure, R2, B2, OSS), waste from failed/throttled requests and over-reads, savings from caching. |
 | What settings should I ship? | `oprobe tune` runs real trials, **detects the 429/503 ceiling**, backs off, refines chunk/gap/parallelism/cache/HTTP version and emits a profile plus Rust/Python OpenDAL code. |
