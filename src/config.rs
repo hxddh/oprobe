@@ -1120,7 +1120,11 @@ mod tests {
             let keys: Vec<String> = opts.iter().map(|(k, _)| (*k).to_owned()).collect();
             crate::service_options::validate_keys(scheme, &keys).unwrap();
         }
-        assert!(anonymous_options("gcs").unwrap().contains(&("disable_vm_metadata", "true")));
+        assert!(
+            anonymous_options("gcs")
+                .unwrap()
+                .contains(&("disable_vm_metadata", "true"))
+        );
         let e = anonymous_options("b2").unwrap_err().to_string();
         assert!(e.contains("not supported for `b2`"), "{e}");
         assert!(anonymous_options("fs").is_err());
@@ -1250,7 +1254,10 @@ mod tests {
             !toml.contains("bucket"),
             "URL-derived options are not repeated: {toml}"
         );
-        assert!(!toml.contains("scheme"), "derived scheme is not written: {toml}");
+        assert!(
+            !toml.contains("scheme"),
+            "derived scheme is not written: {toml}"
+        );
         let back: Profile = toml::from_str(&toml).unwrap();
         back.validate().unwrap();
         let n = back.target.normalized().unwrap();

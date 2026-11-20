@@ -173,8 +173,7 @@ impl Tuner<'_> {
             why.push(format!("errors {:.2}%", t.error_rate * 100.0));
         }
         let throttle_limit = p.sla.tune_throttle_limit();
-        if t.throttle_rate > throttle_limit || (throttle_limit == 0.0 && t.throttled())
-        {
+        if t.throttle_rate > throttle_limit || (throttle_limit == 0.0 && t.throttled()) {
             why.push(format!("{} throttled responses", t.throttled_responses));
         }
         if let Some(limit) = p.sla.p99_ms

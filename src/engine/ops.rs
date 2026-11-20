@@ -389,7 +389,10 @@ mod tests {
                 .set_source(std::io::Error::new(k, "boom"))
                 .into()
         };
-        assert_eq!(error_class(&io(std::io::ErrorKind::TimedOut), None), "timeout");
+        assert_eq!(
+            error_class(&io(std::io::ErrorKind::TimedOut), None),
+            "timeout"
+        );
         assert_eq!(
             error_class(&io(std::io::ErrorKind::ConnectionRefused), None),
             "connect"
@@ -403,7 +406,10 @@ mod tests {
             .into();
         assert_eq!(error_class(&dial, None), "connect");
         // Server errors, then transient vs persistent.
-        assert_eq!(error_class(&err(Unexpected, "x"), Some(500)), "server_error");
+        assert_eq!(
+            error_class(&err(Unexpected, "x"), Some(500)),
+            "server_error"
+        );
         let temp: anyhow::Error = opendal::Error::new(Unexpected, "x").set_temporary().into();
         assert_eq!(error_class(&temp, None), "network");
         assert_eq!(error_class(&err(Unexpected, "x"), None), "unexpected");

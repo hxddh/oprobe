@@ -547,7 +547,11 @@ pub fn check_sla(s: &Snapshot, sla: &Sla) -> SlaVerdict {
         }
     }
     if let Some(limit) = sla.p99_ms {
-        for v in s.verbs.iter().filter(|v| v.count > 0 && v.latency.p99 > limit) {
+        for v in s
+            .verbs
+            .iter()
+            .filter(|v| v.count > 0 && v.latency.p99 > limit)
+        {
             breaches.push(format!(
                 "`{}` p99 {} exceeds the {} limit",
                 v.verb,
@@ -584,7 +588,10 @@ mod sla_tests {
     fn default_sla_fails_on_errors_above_one_percent_and_any_corruption() {
         let sla = Sla::default();
         assert!(sla.enforce);
-        assert!(check_sla(&snap(1000, 10), &sla).passed, "1% is within the SLA");
+        assert!(
+            check_sla(&snap(1000, 10), &sla).passed,
+            "1% is within the SLA"
+        );
         let v = check_sla(&snap(1000, 11), &sla);
         assert!(!v.passed && v.enforced);
         assert!(v.breaches[0].contains("failed"), "{v:?}");

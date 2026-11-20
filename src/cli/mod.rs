@@ -506,7 +506,10 @@ fn parse_rate(flag: &str, v: &str) -> Result<f64> {
         None => t.parse::<f64>(),
     }
     .map_err(|_| anyhow::anyhow!("invalid {flag} `{v}` (examples: 1%, 0.01)"))?;
-    anyhow::ensure!((0.0..=1.0).contains(&r), "{flag} must be between 0% and 100%");
+    anyhow::ensure!(
+        (0.0..=1.0).contains(&r),
+        "{flag} must be between 0% and 100%"
+    );
     Ok(r)
 }
 
@@ -557,7 +560,11 @@ fn gate_exit(r: &Report, o: &OutputArgs) -> ExitCode {
             eprintln!(
                 "{} `--fail-on {}`: the diagnosis has {} findings (exit {EXIT_GATE})",
                 red(&bold("✖")),
-                if min == Severity::Warning { "warning" } else { "critical" },
+                if min == Severity::Warning {
+                    "warning"
+                } else {
+                    "critical"
+                },
                 r.diagnosis.worst().label()
             );
             failed = true;
@@ -783,38 +790,36 @@ async fn cmd_tune(a: TuneArgs) -> Result<ExitCode> {
             "   #  stage            conc  io  chunk   gap     cache  http     ops/s    MiB/s     p99       result",
         ));
     }
-    let on_event: Arc<dyn Fn(TuneEvent) + Send + Sync> = Arc::new(move |ev| {
-        match ev {
-            TuneEvent::Started { .. } => {}
-            TuneEvent::Message(m) => {
-                if !quiet {
-                    eprintln!("   {}", dim(&m));
-                }
+    let on_event: Arc<dyn Fn(TuneEvent) + Send + Sync> = Arc::new(move |ev| match ev {
+        TuneEvent::Started { .. } => {}
+        TuneEvent::Message(m) => {
+            if !quiet {
+                eprintln!("   {}", dim(&m));
             }
-            TuneEvent::Finished(t) => {
-                let k = &t.knobs;
-                let verdict = if t.throttled() {
-                    red(&format!("throttled ({})", t.throttled_responses))
-                } else if t.feasible {
-                    green("ok")
-                } else {
-                    yellow(&t.note)
-                };
-                table_line(format!(
-                    "  {:>2}  {:<15} {:>5} {:>3}  {:<7} {:<7} {:<6} {:<6} {:>8.1} {:>8.1} {:>9}  {verdict}",
-                    t.id,
-                    t.stage,
-                    k.concurrency,
-                    k.io_concurrency,
-                    k.chunk_size.to_string(),
-                    k.range_gap.to_string(),
-                    if k.cache { "on" } else { "off" },
-                    format!("{:?}", k.http_version).to_ascii_lowercase(),
-                    t.ops_per_s,
-                    t.mib_per_s,
-                    crate::util::fmt_ms(t.p99_ms),
-                ));
-            }
+        }
+        TuneEvent::Finished(t) => {
+            let k = &t.knobs;
+            let verdict = if t.throttled() {
+                red(&format!("throttled ({})", t.throttled_responses))
+            } else if t.feasible {
+                green("ok")
+            } else {
+                yellow(&t.note)
+            };
+            table_line(format!(
+                "  {:>2}  {:<15} {:>5} {:>3}  {:<7} {:<7} {:<6} {:<6} {:>8.1} {:>8.1} {:>9}  {verdict}",
+                t.id,
+                t.stage,
+                k.concurrency,
+                k.io_concurrency,
+                k.chunk_size.to_string(),
+                k.range_gap.to_string(),
+                if k.cache { "on" } else { "off" },
+                format!("{:?}", k.http_version).to_ascii_lowercase(),
+                t.ops_per_s,
+                t.mib_per_s,
+                crate::util::fmt_ms(t.p99_ms),
+            ));
         }
     });
     let outcome = tune(&session, &opts, on_event).await;

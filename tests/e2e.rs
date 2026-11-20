@@ -536,7 +536,10 @@ fn tune_report_goes_to_stdout_and_emits_a_clean_profile() {
     assert!(stdout.contains("stage"), "trial table on stdout: {stdout}");
     assert!(stdout.contains("baseline"), "{stdout}");
     assert!(stdout.contains("TUNED"), "{stdout}");
-    assert!(!stderr.contains("baseline"), "no report content on stderr: {stderr}");
+    assert!(
+        !stderr.contains("baseline"),
+        "no report content on stderr: {stderr}"
+    );
     let toml = std::fs::read_to_string(&prof).unwrap();
     assert!(!toml.contains("scheme"), "{toml}");
     Profile::load(&prof).unwrap();
@@ -1183,7 +1186,14 @@ fn background_lab(cfg: LabConfig) -> (tokio::runtime::Runtime, oprobe::lab::LabH
 /// `oprobe run` against a lab with S3 credentials `x`/`x` and no proxy.
 fn run_cli_against(endpoint: &str, extra: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_oprobe"))
-        .args(["run", "s3://bkt/x", "--endpoint", endpoint, "--proxy", "none"])
+        .args([
+            "run",
+            "s3://bkt/x",
+            "--endpoint",
+            endpoint,
+            "--proxy",
+            "none",
+        ])
         .args(["-o", "access_key_id=x", "-o", "secret_access_key=x"])
         .args(["--region", "us-east-1", "--preset", "small-files"])
         .args(["--objects", "4", "--object-size", "16KiB", "-c", "2"])
@@ -1258,7 +1268,14 @@ async fn effective_write_chunk_is_reported() {
 #[test]
 fn unknown_target_options_are_rejected() {
     let out = Command::new(env!("CARGO_BIN_EXE_oprobe"))
-        .args(["run", "s3://bkt", "-o", "regin=eu-west-1", "--color", "never"])
+        .args([
+            "run",
+            "s3://bkt",
+            "-o",
+            "regin=eu-west-1",
+            "--color",
+            "never",
+        ])
         .output()
         .unwrap();
     let err = String::from_utf8_lossy(&out.stderr);

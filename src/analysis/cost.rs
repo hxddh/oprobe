@@ -303,7 +303,12 @@ pub fn cost_report(
         .or_else(|| detect_provider(scheme, endpoint).map(str::to_owned));
     let selected = match (&spec.pricing, selected_key.as_deref().and_then(preset)) {
         (Some(custom), _) => Some(price("custom", custom, &u, spec)),
-        (None, Some(p)) => Some(price(selected_key.as_deref().unwrap_or_default(), &p, &u, spec)),
+        (None, Some(p)) => Some(price(
+            selected_key.as_deref().unwrap_or_default(),
+            &p,
+            &u,
+            spec,
+        )),
         (None, None) => None,
     };
     let Some(selected) = selected else {

@@ -9,5 +9,5 @@ pub mod runner;
 pub mod stack;
 
 pub use cleanup::CleanupSummary;
-pub use stack::ClientStack;
 pub use runner::{Cancel, Progress, ProgressFn, RunOptions, Session};
+pub use stack::ClientStack;

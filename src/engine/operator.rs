@@ -163,16 +163,16 @@ pub async fn check_reachable(base: &Operator, target: &TargetSpec) -> Result<()>
     // (os error 10061)" on Windows.
     let unreachable = super::ops::is_connect_failure(&e)
         || [
-        "connection refused",
-        "actively refused",
-        "os error 10061",
-        "connect: ",
-        "dns error",
-        "failed to lookup address",
-        "name or service not known",
-        "no addresses to connect to",
-        "nodename nor servname",
-    ]
+            "connection refused",
+            "actively refused",
+            "os error 10061",
+            "connect: ",
+            "dns error",
+            "failed to lookup address",
+            "name or service not known",
+            "no addresses to connect to",
+            "nodename nor servname",
+        ]
         .iter()
         .any(|n| l.contains(n));
     if unreachable {

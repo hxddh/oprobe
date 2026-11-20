@@ -167,7 +167,11 @@ mod tests {
         ] {
             assert!(s3.contains(k), "s3 lacks `{k}`: {s3:?}");
         }
-        assert!(accepted_keys("gcs").unwrap().contains("disable_vm_metadata"));
+        assert!(
+            accepted_keys("gcs")
+                .unwrap()
+                .contains("disable_vm_metadata")
+        );
         assert!(accepted_keys("azblob").unwrap().contains("account_name"));
         assert!(accepted_keys("fs").unwrap().contains("root"));
         assert!(accepted_keys("ftp").is_none());
@@ -185,8 +189,13 @@ mod tests {
         let e = validate_keys("s3", &keys(&["virtual_host_style"]))
             .unwrap_err()
             .to_string();
-        assert!(e.contains("did you mean `enable_virtual_host_style`?"), "{e}");
-        let e = validate_keys("gcs", &keys(&["xyzzy"])).unwrap_err().to_string();
+        assert!(
+            e.contains("did you mean `enable_virtual_host_style`?"),
+            "{e}"
+        );
+        let e = validate_keys("gcs", &keys(&["xyzzy"]))
+            .unwrap_err()
+            .to_string();
         assert!(!e.contains("did you mean"), "{e}");
         // An S3 option on GCS is not silently ignored either.
         assert!(validate_keys("gcs", &keys(&["enable_virtual_host_style"])).is_err());

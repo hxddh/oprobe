@@ -86,7 +86,11 @@ pub fn sla_line(r: &Report) -> String {
         terms.push(format!("p99 ≤ {}", fmt_ms(p)));
     }
     let v = &r.sla_verdict;
-    let enforced = if v.enforced { "" } else { " · not enforced (--sla none)" };
+    let enforced = if v.enforced {
+        ""
+    } else {
+        " · not enforced (--sla none)"
+    };
     if v.passed {
         format!("{} met ({}){}", green("✓"), terms.join(", "), dim(enforced))
     } else {

@@ -124,7 +124,11 @@ pub struct DiffReport {
 }
 
 /// Flatten a JSON value into `prefix.a.b = value` leaves (arrays are compared whole).
-fn flatten(prefix: &str, v: &serde_json::Value, out: &mut std::collections::BTreeMap<String, String>) {
+fn flatten(
+    prefix: &str,
+    v: &serde_json::Value,
+    out: &mut std::collections::BTreeMap<String, String>,
+) {
     match v {
         serde_json::Value::Object(m) => {
             for (k, x) in m {
@@ -149,8 +153,16 @@ fn changes_of<T: Serialize>(
     out: &mut Vec<ConfigChange>,
 ) {
     let (mut bm, mut cm) = (Default::default(), Default::default());
-    flatten(prefix, &serde_json::to_value(b).unwrap_or_default(), &mut bm);
-    flatten(prefix, &serde_json::to_value(c).unwrap_or_default(), &mut cm);
+    flatten(
+        prefix,
+        &serde_json::to_value(b).unwrap_or_default(),
+        &mut bm,
+    );
+    flatten(
+        prefix,
+        &serde_json::to_value(c).unwrap_or_default(),
+        &mut cm,
+    );
     let keys: std::collections::BTreeSet<&String> = bm.keys().chain(cm.keys()).collect();
     for k in keys {
         if ignore.iter().any(|i| k == &format!("{prefix}.{i}")) {
@@ -178,7 +190,13 @@ pub fn config_changes(base: &Report, cand: &Report) -> Vec<ConfigChange> {
         "workload",
         &base.workload,
         &cand.workload,
-        &["duration", "warmup", "max_ops", "cleanup", "dataset.persist"],
+        &[
+            "duration",
+            "warmup",
+            "max_ops",
+            "cleanup",
+            "dataset.persist",
+        ],
         &mut out,
     );
     let target = |r: &Report| {
@@ -222,7 +240,14 @@ pub fn config_changes(base: &Report, cand: &Report) -> Vec<ConfigChange> {
             "oprobe_version": r.oprobe_version,
         })
     };
-    changes_of(ChangeKind::Host, "host", &host(base), &host(cand), &[], &mut out);
+    changes_of(
+        ChangeKind::Host,
+        "host",
+        &host(base),
+        &host(cand),
+        &[],
+        &mut out,
+    );
     out
 }
 
@@ -625,10 +650,19 @@ impl DiffReport {
                         ChangeKind::Workload | ChangeKind::Target => red(c.kind.label()),
                         _ => yellow(c.kind.label()),
                     };
-                    vec![kind, c.field.clone(), c.baseline.clone(), c.candidate.clone()]
+                    vec![
+                        kind,
+                        c.field.clone(),
+                        c.baseline.clone(),
+                        c.candidate.clone(),
+                    ]
                 })
                 .collect();
-            out.push_str(&table(&["kind", "setting", "baseline", "candidate"], &rows, 2));
+            out.push_str(&table(
+                &["kind", "setting", "baseline", "candidate"],
+                &rows,
+                2,
+            ));
         }
         for w in &self.warnings {
             let _ = writeln!(out, "  {} {w}", yellow("warning:"));
@@ -842,7 +876,11 @@ mod tests {
                 candidate: "64".into(),
             }]
         );
-        assert!(d.warnings.iter().any(|w| w.contains("knobs.concurrency 16 → 64")));
+        assert!(
+            d.warnings
+                .iter()
+                .any(|w| w.contains("knobs.concurrency 16 → 64"))
+        );
         assert!(d.render_terminal().contains("CONFIGURATION CHANGES"));
         assert!(d.render_markdown().contains("`knobs.concurrency`"));
 
@@ -853,7 +891,11 @@ mod tests {
         let d = diff(&b, &c, &Thresholds::default());
         assert!(!d.passed);
         assert_eq!(status(&d, "same workload"), Status::Fail);
-        assert_eq!(d.config_changes.len(), 1, "duration is not a workload change");
+        assert_eq!(
+            d.config_changes.len(),
+            1,
+            "duration is not a workload change"
+        );
         assert!(d.render_junit().contains("same workload: differs"));
         let allow = Thresholds {
             allow_workload_change: true,
@@ -877,7 +919,11 @@ mod tests {
         c.host.cpus += 1;
         let d = diff(&b, &c, &Thresholds::default());
         assert!(d.passed);
-        assert!(d.warnings.iter().any(|w| w.contains("host.cpus")), "{:?}", d.warnings);
+        assert!(
+            d.warnings.iter().any(|w| w.contains("host.cpus")),
+            "{:?}",
+            d.warnings
+        );
     }
 
     #[test]

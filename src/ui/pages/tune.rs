@@ -81,8 +81,8 @@ fn result() -> impl IntoElement {
                     "Throttling ceiling: concurrency {ce} (recommendations stay at or below {}).",
                     crate::tune::safe_concurrency(ce)
                 ))
-                    .text_sm()
-                    .text_color(token("warn")),
+                .text_sm()
+                .text_color(token("warn")),
             );
         }
         for n in &sm.notes {

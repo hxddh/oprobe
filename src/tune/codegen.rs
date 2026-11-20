@@ -92,7 +92,11 @@ pub fn rust_snippet(target: &TargetSpec, k: &Knobs, cap: &opendal::Capability) -
             ms(r.min_delay),
             ms(r.max_delay),
             r.max_times,
-            if r.jitter { "\n                .with_jitter()" } else { "" }
+            if r.jitter {
+                "\n                .with_jitter()"
+            } else {
+                ""
+            }
         );
     }
     if let Some(n) = stack.http_concurrent_limit {
@@ -243,7 +247,9 @@ pub fn python_snippet(target: &TargetSpec, k: &Knobs, cap: &opendal::Capability)
         ));
     }
     if let Some(n) = stack.http_concurrent_limit {
-        missing.push(format!("an HTTP concurrency limit of {n} in-flight requests"));
+        missing.push(format!(
+            "an HTTP concurrency limit of {n} in-flight requests"
+        ));
     }
     if custom_http_client(k) {
         missing.push(format!(
@@ -345,8 +351,10 @@ mod tests {
     #[test]
     fn rust_snippet_reproduces_the_measured_stack_exactly() {
         let target = TargetSpec::from_url("s3://b/p").unwrap();
-        let mut cap = opendal::Capability::default();
-        cap.write_multi_min_size = Some(5 << 20);
+        let cap = opendal::Capability {
+            write_multi_min_size: Some(5 << 20),
+            ..Default::default()
+        };
         for k in [knobs(true, 3, 64), knobs(false, 0, 0), knobs(false, 7, 0)] {
             let stack = ClientStack::from_knobs(&k);
             let code = rust_snippet(&target, &k, &cap);
@@ -391,14 +399,22 @@ mod tests {
 
             match stack.http_concurrent_limit {
                 Some(n) => assert_eq!(
-                    arg(&code, ".with_http_concurrent_limit(").parse::<usize>().unwrap(),
+                    arg(&code, ".with_http_concurrent_limit(")
+                        .parse::<usize>()
+                        .unwrap(),
                     n
                 ),
                 None => assert!(!code.contains("ConcurrentLimitLayer"), "{code}"),
             }
             // The writer uses the chunk OpenDAL actually wrote with (5 MiB minimum part size).
-            assert!(code.contains(&format!("WRITE_CHUNK: usize = {};", 5 << 20)), "{code}");
-            assert!(code.contains(&format!("READ_CHUNK: usize = {};", 1 << 20)), "{code}");
+            assert!(
+                code.contains(&format!("WRITE_CHUNK: usize = {};", 5 << 20)),
+                "{code}"
+            );
+            assert!(
+                code.contains(&format!("READ_CHUNK: usize = {};", 1 << 20)),
+                "{code}"
+            );
             // Nothing unmeasured: OpenDAL's default HTTP client unless the knobs changed it.
             assert!(!code.contains("reqwest::Client::builder"), "{code}");
         }
@@ -406,7 +422,10 @@ mod tests {
         k.keep_alive = false;
         let code = rust_snippet(&target, &k, &cap);
         assert!(code.contains(".pool_max_idle_per_host(0)"), "{code}");
-        assert!(code.contains("with_http_transport(http_transport()?)"), "{code}");
+        assert!(
+            code.contains("with_http_transport(http_transport()?)"),
+            "{code}"
+        );
     }
 
     #[test]
@@ -415,7 +434,10 @@ mod tests {
         let k = knobs(true, 4, 32);
         let code = python_snippet(&target, &k, &opendal::Capability::default());
         let r = ClientStack::from_knobs(&k).retry.unwrap();
-        assert!(code.contains(&format!("max_times={},", r.max_times)), "{code}");
+        assert!(
+            code.contains(&format!("max_times={},", r.max_times)),
+            "{code}"
+        );
         assert!(code.contains("min_delay=0.05,"), "{code}");
         assert!(code.contains("max_delay=5.0,"), "{code}");
         assert!(code.contains("jitter=True"), "{code}");
