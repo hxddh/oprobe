@@ -949,12 +949,63 @@ impl Default for CostSpec {
 }
 
 impl TargetSpec {
+    /// `fs://PATH` / `file://PATH`: the path is taken verbatim (not parsed as a URL), so Windows
+    /// paths keep their drive and separators: `fs://C:\\bench`, `fs:///C:/bench`, `fs:///tmp/x`,
+    /// `fs://relative/dir`. Empty → a directory under the temp dir. Query parameters become
+    /// options like for other schemes.
+    fn from_fs_url(raw: &str) -> Option<Self> {
+        let lower = raw.to_ascii_lowercase();
+        let rest = ["fs://", "file://"]
+            .iter()
+            .find_map(|p| lower.starts_with(p).then(|| &raw[p.len()..]))?;
+        let (path, query) = match rest.split_once('?') {
+            Some((p, q)) => (p, Some(q)),
+            None => (rest, None),
+        };
+        let mut options = BTreeMap::new();
+        if let Some(q) = query {
+            for (k, v) in url::form_urlencoded::parse(q.as_bytes()) {
+                options.insert(k.into_owned(), v.into_owned());
+            }
+        }
+        // `/C:/x` (a file URL's form of a Windows path) → `C:/x`.
+        let b = path.as_bytes();
+        let path = if b.len() >= 3 && b[0] == b'/' && b[1].is_ascii_alphabetic() && b[2] == b':' {
+            &path[1..]
+        } else {
+            path
+        };
+        let trimmed = path.trim_end_matches(['/', '\\']);
+        let root = if trimmed.is_empty() {
+            // `fs://` or `fs:///`: never the filesystem root.
+            std::env::temp_dir()
+                .join("oprobe")
+                .to_string_lossy()
+                .into_owned()
+        } else if trimmed.ends_with(':') {
+            // `C:/`: keep the drive's root separator.
+            path.to_owned()
+        } else {
+            trimmed.to_owned()
+        };
+        options.insert("root".into(), root);
+        Some(Self {
+            url: Some(raw.to_owned()),
+            scheme: "fs".into(),
+            options,
+            ..Default::default()
+        })
+    }
+
     /// Build a target from a storage URL such as `s3://bucket/prefix`, `gcs://bucket`,
     /// `azblob://container/prefix`, `fs:///tmp/bench`, `memory://`, `lab://demo` (an in-process
     /// lab server, see [`crate::lab::Scenario`]) or any other OpenDAL scheme compiled in
     /// (`azdls://`, `obs://`, `swift://`, `tos://`, ... via the service's `Config::from_uri`).
     /// Query parameters become service options: `s3://b/p?region=eu-west-1`.
     pub fn from_url(raw: &str) -> Result<Self> {
+        if let Some(t) = Self::from_fs_url(raw) {
+            return Ok(t);
+        }
         let u = url::Url::parse(raw).with_context(|| {
             format!("invalid storage URL `{raw}` (examples: s3://bucket/prefix, fs:///tmp/bench, memory://, lab://demo)")
         })?;
@@ -1788,5 +1839,31 @@ mod template_tests {
                 toml::from_str(&t).unwrap_or_else(|e| panic!("{p:?}: {e}\n{t}"));
             prof.validate().unwrap();
         }
+    }
+}
+
+#[cfg(test)]
+mod fs_url_tests {
+    use super::TargetSpec;
+
+    fn root(u: &str) -> String {
+        let t = TargetSpec::from_url(u).unwrap();
+        assert_eq!(t.scheme, "fs", "{u}");
+        t.options["root"].clone()
+    }
+
+    #[test]
+    fn fs_urls_keep_windows_and_unix_paths() {
+        assert_eq!(root("fs:///tmp/x"), "/tmp/x");
+        assert_eq!(root("fs:///tmp/x/"), "/tmp/x");
+        assert_eq!(root(r"fs://C:\Users\me\bench\"), r"C:\Users\me\bench");
+        assert_eq!(root("fs:///C:/Users/me/bench"), "C:/Users/me/bench");
+        assert_eq!(root("file:///D:/data"), "D:/data");
+        assert_eq!(root("fs://C:/"), "C:/");
+        assert_eq!(root("fs://relative/dir"), "relative/dir");
+        assert!(root("fs://").ends_with("oprobe"));
+        assert!(root("fs:///").ends_with("oprobe"));
+        let t = TargetSpec::from_url("fs:///tmp/x?atomic_write_dir=/tmp/w").unwrap();
+        assert_eq!(t.options["atomic_write_dir"], "/tmp/w");
     }
 }
