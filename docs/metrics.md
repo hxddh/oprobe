@@ -23,9 +23,11 @@ it is captured, and the known limits.
 
 Tuning results are only useful if they were measured on the client you deploy. By default oprobe
 therefore sends every request through **OpenDAL's own HTTP client** — reqwest 0.13 with rustls and
-aws-lc-rs, configured exactly as `opendal-http-transport-reqwest` builds it (HTTP/1.1, environment
-proxies, platform certificate verifier) — and observes it only through reqwest's public extension
-points:
+aws-lc-rs, configured exactly as `opendal-http-transport-reqwest` builds it (`reqwest::Client::new()`:
+HTTP/1.1, environment proxies, platform certificate verifier, no connect timeout, unlimited idle
+connections per host, 90 s idle timeout) — and observes it only through reqwest's public extension
+points. The only settings oprobe changes are the ones a knob asks for (`keep_alive = false`,
+`http = "h2"`, `--proxy`):
 
 | Signal | How it is captured (default mode) |
 |---|---|
@@ -47,6 +49,7 @@ the exact connection a dial was made for — but it is a different client:
 | Wire rx / tx not available (reported as 0) | Raw socket bytes incl. TLS and framing |
 | Proxy CONNECT reported together with TCP to the proxy | Proxy CONNECT timed on its own |
 | HTTP/1.1 unless `http = "h2"` (OpenDAL builds reqwest without `http2`) | ALPN negotiates h2 for https by default |
+| reqwest's pool: no connect timeout, unlimited idle connections per host | 10 s timeout per dial phase, at most 256 idle connections per host |
 
 ### Observer effect
 

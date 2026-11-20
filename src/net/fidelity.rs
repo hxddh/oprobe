@@ -406,33 +406,50 @@ impl FidelityTransport {
             HttpVersion::Auto | HttpVersion::H1 => vec![b"http/1.1".to_vec()],
             HttpVersion::H2 => vec![b"h2".to_vec(), b"http/1.1".to_vec()],
         };
-        let mut b = reqwest::Client::builder()
-            .tls_backend_preconfigured(rustls_config(&cfg, alpn)?)
-            .dns_resolver(Arc::new(TimedResolver))
-            .connector_layer(DialLayer(shared.clone()))
-            .connect_timeout(cfg.connect_timeout)
-            .pool_idle_timeout(cfg.idle_timeout)
-            .pool_max_idle_per_host(if cfg.keep_alive {
-                cfg.max_idle_per_host
-            } else {
-                0
-            });
-        b = match cfg.http {
-            HttpVersion::Auto | HttpVersion::H1 => b.http1_only(),
-            HttpVersion::H2 if !https => b.http2_prior_knowledge(),
-            HttpVersion::H2 => b,
-        };
-        b = match &cfg.proxy {
-            None => b,
-            Some(None) => b.no_proxy(),
-            Some(Some(p)) => b.proxy(reqwest::Proxy::all(p.as_str())?),
-        };
+        let b = client_builder(&cfg, https, alpn, shared.clone())?;
         Ok(Self {
             client: b.build()?,
             shared,
             limiter: cfg.max_inflight.map(|n| Arc::new(Semaphore::new(n.max(1)))),
         })
     }
+}
+
+/// OpenDAL's default client is `reqwest::Client::new()` (opendal-http-transport-reqwest): no
+/// connect timeout, unlimited idle connections per host, 90 s idle timeout, 15 s TCP
+/// keep-alive. Fidelity mode keeps every one of those defaults. It only adds what observing
+/// requires or what a knob asks for:
+///
+/// - timed DNS (the same `getaddrinfo` as reqwest's default resolver), a connector layer that
+///   timestamps dials, and a rustls config built like reqwest's rustls backend (aws-lc-rs
+///   provider, platform verifier) with a session store that timestamps the ClientHello;
+/// - `http1_only()` for `http_version = auto | h1`: OpenDAL builds reqwest without `http2`, so its
+///   client speaks HTTP/1.1 (oprobe's reqwest has `http2` compiled in for the `h2` knob);
+/// - `keep_alive = false` → `pool_max_idle_per_host(0)`; `--proxy` → an explicit proxy setting.
+fn client_builder(
+    cfg: &TransportConfig,
+    https: bool,
+    alpn: Vec<Vec<u8>>,
+    shared: Arc<Shared>,
+) -> anyhow::Result<reqwest::ClientBuilder> {
+    let mut b = reqwest::Client::builder()
+        .tls_backend_preconfigured(rustls_config(cfg, alpn)?)
+        .dns_resolver(Arc::new(TimedResolver))
+        .connector_layer(DialLayer(shared));
+    if !cfg.keep_alive {
+        b = b.pool_max_idle_per_host(0);
+    }
+    b = match cfg.http {
+        HttpVersion::Auto | HttpVersion::H1 => b.http1_only(),
+        HttpVersion::H2 if !https => b.http2_prior_knowledge(),
+        HttpVersion::H2 => b,
+    };
+    b = match &cfg.proxy {
+        None => b,
+        Some(None) => b.no_proxy(),
+        Some(Some(p)) => b.proxy(reqwest::Proxy::all(p.as_str())?),
+    };
+    Ok(b)
 }
 
 impl FidelityTransport {
@@ -936,5 +953,38 @@ impl HttpTransport for FidelityTransport {
         Ok(hr
             .body(HttpBody::new(stream, content_length))
             .expect("response must build"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn shared() -> Arc<Shared> {
+        Arc::new(Shared {
+            recorder: None,
+            conns: Mutex::new(Conns::default()),
+            proxy: None,
+            proxy_addrs: Vec::new(),
+        })
+    }
+
+    /// Fidelity mode measures OpenDAL's default client (`reqwest::Client::new()`): none of the
+    /// microscope pool's limits (10 s connect timeout, 256 idle connections per host) leak in.
+    #[test]
+    fn fidelity_client_keeps_opendal_reqwest_defaults() {
+        let cfg = TransportConfig {
+            proxy: Some(None),
+            ..TransportConfig::default()
+        };
+        let alpn = vec![b"http/1.1".to_vec()];
+        let ours = format!("{:?}", client_builder(&cfg, true, alpn, shared()).unwrap());
+        let opendal = format!("{:?}", reqwest::Client::builder().http1_only().no_proxy());
+        assert!(!ours.contains("connect_timeout"), "{ours}");
+        assert!(!ours.contains("timeout"), "{ours}");
+        assert!(ours.contains("http1_only"), "{ours}");
+        // Everything reqwest reports about its configuration matches OpenDAL's HTTP/1.1 client.
+        let strip_tls = |s: &str| s.split(", tls").next().unwrap_or(s).to_owned();
+        assert_eq!(strip_tls(&ours), strip_tls(&opendal));
     }
 }

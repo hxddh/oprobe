@@ -46,8 +46,12 @@ pub enum HttpVersion {
 pub struct TransportConfig {
     pub http: HttpVersion,
     pub keep_alive: bool,
+    /// Microscope pool only: the fidelity transport keeps reqwest's (= OpenDAL's) defaults —
+    /// unlimited idle connections per host, 90 s idle timeout, no connect timeout.
     pub max_idle_per_host: usize,
+    /// Microscope pool only (see `max_idle_per_host`).
     pub idle_timeout: Duration,
+    /// Microscope pool only: bounds each dial phase (see `max_idle_per_host`).
     pub connect_timeout: Duration,
     /// Cap on concurrent in-flight HTTP requests (None = unlimited).
     pub max_inflight: Option<usize>,
