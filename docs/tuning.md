@@ -50,9 +50,17 @@ then the lowest error rate). The objective throughput counts successful operatio
 ## Outputs
 
 * `--emit-profile` — your profile with the winning `[knobs]`; run it with `oprobe run --profile`.
-* `--emit-rust` — an OpenDAL 0.59 `Operator` builder with `RetryLayer`, `TimeoutLayer`,
-  `ConcurrentLimitLayer` (+ HTTP limit) and reader/writer helpers using the tuned chunk/gap/concurrency.
-* `--emit-python` — the same for the `opendal` Python package.
+* `--emit-rust` — an OpenDAL 0.59 `Operator` builder that reproduces exactly the measured client:
+  `TimeoutLayer` (operation + I/O timeout), `TailCutLayer` (when enabled) and `RetryLayer`
+  (jittered exponential backoff, 50 ms – 5 s) with the parameters oprobe applied, an HTTP
+  concurrency limit only when `max_inflight_requests` was set, a custom reqwest client only when
+  the knobs changed OpenDAL's default one (keep-alive off, HTTP/2), and reader/writer helpers with
+  the tuned chunk/gap/concurrency (the writer chunk is the part size OpenDAL actually used). Both
+  the measured operator and the generated code are derived from one `ClientStack` value, and a
+  test rebuilds the layers from the generated source and compares them parameter for parameter.
+* `--emit-python` — the same for the `opendal` Python package where the binding allows
+  (`RetryLayer` with identical parameters); measured layers the binding cannot express (timeouts,
+  tail cut, HTTP limit) are listed in the header instead of being approximated.
 * `--json` — the full report of the confirmation run plus every trial (`tune.trials`).
 
 ## Budget

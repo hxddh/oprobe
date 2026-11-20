@@ -835,13 +835,21 @@ async fn cmd_tune(a: TuneArgs) -> Result<ExitCode> {
     if let Some(p) = &a.emit_rust {
         write_file(
             p,
-            &codegen::rust_snippet(&session.profile.target.scheme, &outcome.winner),
+            &codegen::rust_snippet(
+                &session.profile.target,
+                &outcome.winner,
+                &session.capability,
+            ),
         )?;
     }
     if let Some(p) = &a.emit_python {
         write_file(
             p,
-            &codegen::python_snippet(&session.profile.target.scheme, &outcome.winner),
+            &codegen::python_snippet(
+                &session.profile.target,
+                &outcome.winner,
+                &session.capability,
+            ),
         )?;
     }
     save_outputs(&report, &a.output)?;

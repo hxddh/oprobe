@@ -308,7 +308,11 @@ impl Job {
                 );
                 Ok(Outcome::Tuned {
                     profile_toml: codegen::profile_toml(&session.profile, &out.winner, &header)?,
-                    rust: codegen::rust_snippet(&session.profile.target.scheme, &out.winner),
+                    rust: codegen::rust_snippet(
+                        &session.profile.target,
+                        &out.winner,
+                        &session.capability,
+                    ),
                     summary: Box::new(out.summary),
                     report: Box::new(report),
                 })
