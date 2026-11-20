@@ -29,6 +29,11 @@ URL forms: `s3://bucket/prefix`, `gcs://bucket/prefix`, `azblob://container/pref
 `account_name`), `oss://bucket`, `cos://bucket`, `b2://bucket`, `webdav[s]://host/path`,
 `fs:///absolute/path`, `memory://`.
 
+`r2://bucket/prefix` and `minio://bucket/prefix` are S3 with a provider endpoint and never fall
+back to AWS: R2 needs `account_id` (`-o account_id=<ID>`, giving
+`https://<ID>.r2.cloudflarestorage.com` with region `auto`) or `--endpoint`; MinIO needs
+`--endpoint` (path-style addressing is used). Without them oprobe stops with an error.
+
 ## Workload
 
 ```toml

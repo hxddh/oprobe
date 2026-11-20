@@ -788,7 +788,63 @@ impl TargetSpec {
         if let Some(u) = &t.url {
             t.url = Some(crate::util::strip_url_credentials(u));
         }
+        t.apply_provider_url()?;
         Ok(t)
+    }
+
+    /// The scheme as the user wrote it in `url` (`r2`, `minio`, `s3a`, ...).
+    pub fn url_scheme(&self) -> Option<String> {
+        self.url
+            .as_deref()
+            .and_then(|u| u.split_once("://"))
+            .map(|(s, _)| s.to_ascii_lowercase())
+    }
+
+    /// `r2://` and `minio://` are S3 with a provider-specific endpoint: never let them fall back
+    /// to AWS. R2 takes `account_id` (→ `https://<account>.r2.cloudflarestorage.com`, region
+    /// `auto`) or an explicit endpoint; MinIO needs its endpoint.
+    fn apply_provider_url(&mut self) -> Result<()> {
+        let Some(kind) = self.url_scheme() else {
+            return Ok(());
+        };
+        let has_endpoint = self
+            .options
+            .get("endpoint")
+            .is_some_and(|e| !e.trim().is_empty());
+        match kind.as_str() {
+            "r2" => {
+                let account = self.options.remove("account_id");
+                if !has_endpoint {
+                    let Some(account) = account.filter(|a| !a.trim().is_empty()) else {
+                        bail!(
+                            "r2:// needs your Cloudflare account: add `-o account_id=<ACCOUNT_ID>` (or \
+                             `account_id = \"${{R2_ACCOUNT_ID}}\"` under [target.options]), or pass \
+                             `--endpoint https://<ACCOUNT_ID>.r2.cloudflarestorage.com`"
+                        );
+                    };
+                    self.options.insert(
+                        "endpoint".into(),
+                        format!("https://{}.r2.cloudflarestorage.com", account.trim()),
+                    );
+                }
+                self.options
+                    .entry("region".into())
+                    .or_insert_with(|| "auto".into());
+            }
+            "minio" => {
+                if !has_endpoint {
+                    bail!(
+                        "minio:// needs the server's endpoint: pass `--endpoint http://<host>:9000` \
+                         (or `endpoint = ...` under [target.options])"
+                    );
+                }
+                self.options
+                    .entry("enable_virtual_host_style".into())
+                    .or_insert_with(|| "false".into());
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     /// Options with `${ENV}` references expanded, ready for `Operator::via_iter`.
@@ -931,6 +987,7 @@ impl Profile {
     }
 
     pub fn validate(&self) -> Result<()> {
+        self.target.normalized()?;
         let k = &self.knobs;
         anyhow::ensure!(k.concurrency >= 1, "knobs.concurrency must be >= 1");
         anyhow::ensure!(k.io_concurrency >= 1, "knobs.io_concurrency must be >= 1");
@@ -1018,6 +1075,35 @@ mod tests {
         assert_eq!(t.options["root"], "/tmp/x");
         assert_eq!(TargetSpec::from_url("memory://").unwrap().scheme, "memory");
         assert!(TargetSpec::from_url("ftp://x").is_err());
+    }
+
+    #[test]
+    fn r2_and_minio_never_fall_back_to_aws() {
+        let e = TargetSpec::from_url("r2://bkt").unwrap().normalized();
+        assert!(e.unwrap_err().to_string().contains("account_id"));
+        let e = TargetSpec::from_url("minio://bkt").unwrap().normalized();
+        assert!(e.unwrap_err().to_string().contains("--endpoint"));
+
+        let mut r2 = TargetSpec::from_url("r2://bkt/p").unwrap();
+        r2.options.insert("account_id".into(), "abc123".into());
+        let n = r2.normalized().unwrap();
+        assert_eq!(
+            n.endpoint().unwrap(),
+            "https://abc123.r2.cloudflarestorage.com"
+        );
+        assert_eq!(n.options["region"], "auto");
+        assert!(!n.options.contains_key("account_id"));
+        // A profile written from it reloads to the same target.
+        let toml = Profile::from_target(n.clone()).to_toml().unwrap();
+        let back: Profile = toml::from_str(&toml).unwrap();
+        assert_eq!(back.target.normalized().unwrap().endpoint(), n.endpoint());
+
+        let mut m = TargetSpec::from_url("minio://bkt").unwrap();
+        m.options
+            .insert("endpoint".into(), "http://127.0.0.1:9000".into());
+        let n = m.normalized().unwrap();
+        assert_eq!(n.endpoint().unwrap(), "http://127.0.0.1:9000");
+        assert_eq!(n.options["enable_virtual_host_style"], "false");
     }
 
     #[test]
