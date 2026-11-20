@@ -415,6 +415,11 @@ impl Session {
                             if max_ops.is_some_and(|m| n >= m) {
                                 break;
                             }
+                            // Window membership is decided here, when the operation is issued:
+                            // a ticket under `max_ops` belongs to the window by definition (the
+                            // first worker to run out of tickets closes it while others are
+                            // still starting theirs).
+                            let in_window = measured && (max_ops.is_some() || rec.window_open());
                             let kind = pick_kind(&mut rng, &cum);
                             let slot = (w as u64) * 4 + seq % 4;
                             seq += 1;
@@ -424,7 +429,7 @@ impl Session {
                                 &mut rng,
                                 slot,
                                 Instant::now(),
-                                measured,
+                                in_window,
                                 &rec,
                                 tree.as_ref(),
                             )
@@ -512,6 +517,8 @@ impl Session {
                     let rec = recorder.clone();
                     let tree = tree.cloned();
                     let intended = next;
+                    // Decided at dispatch: the task may start after the window closed.
+                    let in_window = measured && rec.window_open();
                     set.spawn(async move {
                         run_one(
                             &ctx,
@@ -519,7 +526,7 @@ impl Session {
                             &mut op_rng,
                             lease.1,
                             intended,
-                            measured,
+                            in_window,
                             &rec,
                             tree.as_ref(),
                         )
@@ -615,7 +622,9 @@ async fn run_one(
     rec: &Arc<Recorder>,
     tree: Option<&await_tree::Registry>,
 ) {
-    let scope = OpScope::new_at(measured && rec.window_open(), intended, Some(rec.clone()));
+    // `measured`: the caller decided, when it issued the operation, that it belongs to the
+    // measurement window.
+    let scope = OpScope::new_at(measured && rec.is_measuring(), intended, Some(rec.clone()));
     let measured = scope.measured;
     let name = verb(kind);
     rec.op_started_at(scope.id, intended);
