@@ -13,6 +13,34 @@ use oprobe::report::diff::{Thresholds, diff};
 use oprobe::trace::{Api, Snapshot};
 use oprobe::util::ByteSize;
 
+/// The oprobe binary with its config and run store in a per-process temporary directory
+/// (tests never touch the user's files).
+fn oprobe_cmd() -> Command {
+    static HOME: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    let home = HOME.get_or_init(|| tempfile::tempdir().unwrap());
+    let mut c = Command::new(env!("CARGO_BIN_EXE_oprobe"));
+    c.env("OPROBE_DATA_DIR", home.path().join("data"))
+        .env("OPROBE_CONFIG", home.path().join("config.toml"))
+        .env_remove("OPROBE_OUTPUT");
+    c
+}
+
+/// Build the Report v3 of a measured window (no trace rows).
+fn build(prof: &Profile, s: Snapshot, c: oprobe::engine::CleanupSummary) -> Report {
+    oprobe::model::build_report(oprobe::model::ReportInput {
+        run_id: &oprobe::model::RunId::new(),
+        target_name: None,
+        profile: prof,
+        knobs: &prof.knobs,
+        snapshot: s,
+        trace: Default::default(),
+        cleanup: c,
+        warnings: vec![],
+        started_at: std::time::SystemTime::now(),
+        ended_at: std::time::SystemTime::now(),
+    })
+}
+
 fn quiet() -> oprobe::engine::ProgressFn {
     Arc::new(|_| {})
 }
@@ -251,27 +279,27 @@ async fn throttling_is_detected_and_diagnosed() {
     assert!(s.resilience.status_503 > 0);
     assert!(s.resilience.retries > 0);
     assert!(s.resilience.max_retry_after_ms >= 1000);
-    let r = Report::build(&prof, &prof.knobs, s, c, vec![]);
-    assert_eq!(r.diagnosis.bottleneck, Bottleneck::Throttling);
-    assert!(r.diagnosis.findings.iter().any(|f| f.code == "throttling"));
+    let r = build(&prof, s, c);
+    assert_eq!(r.verdict.bottleneck, Bottleneck::Throttling);
+    assert_eq!(r.stages.bottleneck, Bottleneck::Throttling);
+    assert!(r.findings.iter().any(|f| f.code == "throttling"));
     // Backoff between attempts is retry time, never "client" time (every retried op sleeps
     // ≥ 50 ms; the lab answers in well under a millisecond).
-    let sh = &r.diagnosis.shares;
+    let sh = &r.stages.shares;
     assert!(
-        sh.retry > 0.2 && sh.retry > sh.client,
+        sh.retry_pct > 20.0 && sh.retry_pct > sh.client_pct,
         "retry backoff must be its own share: {sh:?}"
     );
     let retry_ms: f64 = r
-        .result
         .verbs
         .iter()
         .map(|v| v.breakdown.retry_ms * v.count as f64)
         .sum();
-    assert!(retry_ms > 0.0 && retry_ms <= r.result.resilience.retry_backoff_ms + 1.0);
+    assert!(retry_ms > 0.0 && retry_ms <= r.resilience.retry_backoff_ms + 1.0);
     assert!(
-        r.diagnosis.headline.contains("retry backoff"),
+        r.verdict.headline.contains("retry backoff"),
         "{}",
-        r.diagnosis.headline
+        r.verdict.headline
     );
     assert!(r.cost.per_op.failed_requests > 0.0);
     // A localhost lab has no cloud bill: no AWS (or any) price is projected.
@@ -520,7 +548,7 @@ async fn tuner_finds_throttling_ceiling() {
 fn tune_report_goes_to_stdout_and_emits_a_clean_profile() {
     let dir = tempfile::tempdir().unwrap();
     let prof = dir.path().join("tuned.toml");
-    let out = Command::new(env!("CARGO_BIN_EXE_oprobe"))
+    let out = oprobe_cmd()
         .args(["tune", "memory://", "--preset", "small-files"])
         .args(["--objects", "4", "--object-size", "16KiB"])
         .args(["--trial-duration", "150ms", "--trial-warmup", "0s"])
@@ -550,21 +578,21 @@ async fn report_roundtrip_and_diff_gate() {
     let mut p = Profile::from_target(TargetSpec::from_url("memory://").unwrap());
     small(&mut p, Preset::SmallFiles);
     let (s, c, prof) = run_once(p, 400).await;
-    let r = Report::build(&prof, &prof.knobs, s, c, vec![]);
+    let r = build(&prof, s, c);
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("r.json");
-    r.save_json(&path).unwrap();
-    let back = Report::load_json(&path).unwrap();
+    oprobe::report::write_file(&path, &oprobe::report::to_json(&r)).unwrap();
+    let back = oprobe::report::load_json(&path).unwrap();
     assert_eq!(back, r);
     let same = diff(&r, &back, &Thresholds::default());
     assert!(same.passed, "{}", same.render_terminal());
 
     let mut worse = r.clone();
-    worse.result.summary.ops_per_s *= 0.5;
-    for v in &mut worse.result.verbs {
+    worse.summary.ops_per_s *= 0.5;
+    for v in &mut worse.verbs {
         v.latency.p99 = v.latency.p99 * 3.0 + 10.0;
     }
-    worse.result.integrity.corrupted = 1;
+    worse.integrity.corrupted = 1;
     let d = diff(&r, &worse, &Thresholds::default());
     assert!(!d.passed);
     let fails: Vec<_> = d
@@ -606,10 +634,9 @@ async fn kept_data_is_swept_by_cleanup() {
 
 #[test]
 fn cli_binary_end_to_end() {
-    let bin = env!("CARGO_BIN_EXE_oprobe");
     let dir = tempfile::tempdir().unwrap();
     let base = dir.path().join("base.json");
-    let out = Command::new(bin)
+    let out = oprobe_cmd()
         .args([
             "run",
             "memory://",
@@ -637,12 +664,26 @@ fn cli_binary_end_to_end() {
         String::from_utf8_lossy(&out.stderr)
     );
     let text = String::from_utf8_lossy(&out.stdout);
-    assert!(text.contains("WHERE THE TIME GOES"), "{text}");
-    assert!(text.contains("CLEANUP"));
+    assert!(text.contains("full report: oprobe runs show"), "{text}");
+    assert!(text.lines().count() <= 20, "{text}");
+
+    // The saved run renders in full.
+    let show = oprobe_cmd()
+        .args(["runs", "show", "last", "--color", "never"])
+        .output()
+        .unwrap();
+    let full = String::from_utf8_lossy(&show.stdout);
+    assert!(
+        show.status.success(),
+        "{}",
+        String::from_utf8_lossy(&show.stderr)
+    );
+    assert!(full.contains("WHERE THE TIME GOES"), "{full}");
+    assert!(full.contains("CLEANUP"));
 
     let junit = dir.path().join("gate.xml");
-    let d = Command::new(bin)
-        .args(["diff", "--color", "never"])
+    let d = oprobe_cmd()
+        .args(["compare", "--color", "never"])
         .arg(&base)
         .arg(&base)
         .arg("--junit")
@@ -656,23 +697,20 @@ fn cli_binary_end_to_end() {
             .contains("testsuite")
     );
 
-    let init = Command::new(bin)
+    let init = oprobe_cmd()
         .args(["init", "--preset", "checkpoint"])
         .output()
         .unwrap();
     let prof: Profile = toml::from_str(&String::from_utf8_lossy(&init.stdout)).unwrap();
     assert_eq!(prof.workload.preset, Preset::Checkpoint);
 
-    let bad = Command::new(bin).args(["run", "ftp://x"]).output().unwrap();
+    let bad = oprobe_cmd().args(["run", "ftp://x"]).output().unwrap();
     assert!(!bad.status.success());
     assert!(String::from_utf8_lossy(&bad.stderr).contains("hint:"));
 
-    let comp = Command::new(bin)
-        .args(["completions", "bash"])
-        .output()
-        .unwrap();
+    let comp = oprobe_cmd().args(["completions", "bash"]).output().unwrap();
     assert!(String::from_utf8_lossy(&comp.stdout).contains("oprobe"));
-    let fail_on = Command::new(bin)
+    let fail_on = oprobe_cmd()
         .args([
             "run",
             "memory://",
@@ -687,13 +725,17 @@ fn cli_binary_end_to_end() {
             "64KiB",
             "--fail-on",
             "warning",
-            "--format",
+            "-o",
             "json",
         ])
         .output()
         .unwrap();
     let rep: serde_json::Value = serde_json::from_slice(&fail_on.stdout).unwrap();
-    assert_eq!(rep["schema"], "oprobe.report/v3");
+    assert_eq!(rep["report"]["schema"], "oprobe.report/3");
+    assert_eq!(
+        rep["report"]["verdict"]["exit_code"].as_u64(),
+        fail_on.status.code().map(|c| c as u64)
+    );
 }
 
 #[test]
@@ -855,9 +897,8 @@ async fn open_loop_never_runs_past_the_window() {
 /// the entry falls back to printing help and succeeding.
 #[test]
 fn bare_invocation_is_not_a_usage_error() {
-    let bin = env!("CARGO_BIN_EXE_oprobe");
     for args in [&[][..], &["-psn_0_1234567"][..]] {
-        let out = Command::new(bin)
+        let out = oprobe_cmd()
             .args(args)
             .env_remove("DISPLAY")
             .env_remove("WAYLAND_DISPLAY")
@@ -1073,23 +1114,22 @@ async fn cancelled_run_is_marked_interrupted() {
     assert!(snap.interrupted);
     assert!(snap.elapsed_s < 5.0, "{}", snap.elapsed_s);
     let prof = s.profile.clone();
-    let r = Report::build(&prof, &prof.knobs, snap, c, vec![]);
-    assert!(r.interrupted);
+    let r = build(&prof, snap, c);
+    assert!(r.run.interrupted);
+    assert_eq!(r.verdict.exit_code, 130);
     let json = oprobe::report::to_json(&r);
     assert!(json.contains("\"interrupted\": true"));
     assert!(oprobe::report::terminal::render(&r).contains("INTERRUPTED"));
     assert!(oprobe::report::markdown::render(&r).contains("Interrupted"));
     let mut done = r.clone();
-    done.interrupted = false;
-    done.result.interrupted = false;
+    done.run.interrupted = false;
     let d = diff(&done, &r, &Thresholds::default());
     assert!(
         d.warnings.iter().any(|w| w.contains("interrupted")),
         "{:?}",
         d.warnings
     );
-    // A complete report does not carry the field at all.
-    assert!(!oprobe::report::to_json(&done).contains("interrupted"));
+    assert!(oprobe::report::to_json(&done).contains("\"interrupted\": false"));
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1099,7 +1139,7 @@ async fn cancelled_run_is_marked_interrupted() {
 /// `oprobe top` without a terminal explains itself and exits 2 (not a cryptic os error).
 #[test]
 fn top_without_a_terminal_is_a_clear_usage_error() {
-    let out = Command::new(env!("CARGO_BIN_EXE_oprobe"))
+    let out = oprobe_cmd()
         .args(["top", "memory://"])
         .stdin(std::process::Stdio::null())
         .output()
@@ -1117,7 +1157,7 @@ fn top_without_a_terminal_is_a_clear_usage_error() {
 /// `oprobe gui` without a display (or a window build) fails clearly and points to `top`.
 #[test]
 fn gui_without_a_display_fails_clearly() {
-    let out = Command::new(env!("CARGO_BIN_EXE_oprobe"))
+    let out = oprobe_cmd()
         .args(["gui", "memory://"])
         .env_remove("DISPLAY")
         .env_remove("WAYLAND_DISPLAY")
@@ -1133,13 +1173,12 @@ fn gui_without_a_display_fails_clearly() {
 /// Zero workers or too few tuner trials are rejected, never silently clamped.
 #[test]
 fn zero_concurrency_and_too_few_trials_are_rejected() {
-    let bin = env!("CARGO_BIN_EXE_oprobe");
     for args in [
         &["run", "memory://", "-c", "0"][..],
         &["run", "memory://", "--io-concurrency", "0"][..],
         &["tune", "memory://", "--max-trials", "1"][..],
     ] {
-        let out = Command::new(bin).args(args).output().unwrap();
+        let out = oprobe_cmd().args(args).output().unwrap();
         let err = String::from_utf8_lossy(&out.stderr);
         assert_eq!(out.status.code(), Some(2), "{args:?}: {err}");
         assert!(err.contains("must be at least"), "{args:?}: {err}");
@@ -1151,7 +1190,7 @@ fn zero_concurrency_and_too_few_trials_are_rejected() {
 #[cfg(unix)]
 #[test]
 fn interrupted_run_exits_130() {
-    let child = Command::new(env!("CARGO_BIN_EXE_oprobe"))
+    let child = oprobe_cmd()
         .args(["run", "memory://", "-d", "60s", "--warmup", "0s", "--quiet"])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -1185,7 +1224,7 @@ fn background_lab(cfg: LabConfig) -> (tokio::runtime::Runtime, oprobe::lab::LabH
 
 /// `oprobe run` against a lab with S3 credentials `x`/`x` and no proxy.
 fn run_cli_against(endpoint: &str, extra: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_oprobe"))
+    oprobe_cmd()
         .args([
             "run",
             "s3://bkt/x",
@@ -1194,7 +1233,12 @@ fn run_cli_against(endpoint: &str, extra: &[&str]) -> std::process::Output {
             "--proxy",
             "none",
         ])
-        .args(["-o", "access_key_id=x", "-o", "secret_access_key=x"])
+        .args([
+            "--option",
+            "access_key_id=x",
+            "--option",
+            "secret_access_key=x",
+        ])
         .args(["--region", "us-east-1", "--preset", "small-files"])
         .args(["--objects", "4", "--object-size", "16KiB", "-c", "2"])
         .args(["-d", "400ms", "--warmup", "0s", "-q", "--color", "never"])
@@ -1215,8 +1259,7 @@ fn failed_operations_breach_the_default_sla() {
     let err = String::from_utf8_lossy(&out.stderr);
     let text = String::from_utf8_lossy(&out.stdout);
     assert_eq!(out.status.code(), Some(3), "{err}\n{text}");
-    assert!(err.contains("SLA breached"), "{err}");
-    assert!(text.contains("BREACHED"), "{text}");
+    assert!(text.contains("SLA BREACHED"), "{err}\n{text}");
     for relaxed in [&["--sla", "none"][..], &["--max-error-rate", "100%"][..]] {
         let args: Vec<&str> = ["--retries", "0"].iter().chain(relaxed).copied().collect();
         let out = run_cli_against(&lab.endpoint_url, &args);
@@ -1227,7 +1270,7 @@ fn failed_operations_breach_the_default_sla() {
         );
     }
     let bad = run_cli_against(&lab.endpoint_url, &["--max-error-rate", "150%"]);
-    assert_eq!(bad.status.code(), Some(1));
+    assert_eq!(bad.status.code(), Some(2), "a usage error");
 }
 
 /// OpenDAL raises S3 write chunks to the 5 MiB minimum part size: the report says which chunk
@@ -1254,8 +1297,9 @@ async fn effective_write_chunk_is_reported() {
     let parts = api(&s, Api::UploadPart).count as f64;
     let writes = s.verbs.iter().map(|v| v.count).sum::<u64>() as f64;
     assert!(parts / writes <= 2.5, "{parts} parts for {writes} writes");
-    let r = Report::build(&prof, &prof.knobs, s, c, vec![]);
-    assert_eq!(r.effective_knobs.write_chunk_size, ByteSize::mib(5).0);
+    let r = build(&prof, s, c);
+    assert_eq!(r.knobs.effective.write_chunk_bytes, ByteSize::mib(5).0);
+    assert_eq!(r.knobs.requested.chunk_bytes, ByteSize::mib(1).0);
     assert!(
         r.warnings.iter().any(|w| w.contains("5MiB parts")),
         "{:?}",
@@ -1267,11 +1311,11 @@ async fn effective_write_chunk_is_reported() {
 /// connects.
 #[test]
 fn unknown_target_options_are_rejected() {
-    let out = Command::new(env!("CARGO_BIN_EXE_oprobe"))
+    let out = oprobe_cmd()
         .args([
             "run",
             "s3://bkt",
-            "-o",
+            "--option",
             "regin=eu-west-1",
             "--color",
             "never",
@@ -1279,7 +1323,8 @@ fn unknown_target_options_are_rejected() {
         .output()
         .unwrap();
     let err = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert_eq!(out.status.code(), Some(2), "{err}");
     assert!(err.contains("unknown option `regin`"), "{err}");
+    assert!(err.contains("config.unknown_option"), "{err}");
     assert!(err.contains("did you mean `region`?"), "{err}");
 }
