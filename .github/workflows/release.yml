@@ -189,7 +189,7 @@ jobs:
         if: matrix.msi
         shell: pwsh
         run: |
-          dotnet tool install --global wix --version 4.0.6
+          dotnet tool install --global wix --version 5.0.2   # <Files> needs WiX 5
           $name = "oprobe-$env:VERSION-${{ matrix.target }}"
           wix build packaging/windows/oprobe.wxs -arch ${{ matrix.msi }} `
             -d Version=$env:VERSION -d BinDir="stage/$name" -d IconFile=packaging/desktop/oprobe.ico `

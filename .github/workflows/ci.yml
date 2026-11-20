@@ -169,3 +169,20 @@ jobs:
           key: gui
       - run: cargo clippy --locked --all-targets --features gui -- -D warnings
       - run: cargo build --locked --release --features gui
+      # The MSI is otherwise only built at release time: build it here from a staged copy of
+      # the archive layout, exactly as release.yml does.
+      - name: MSI (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $stage = "stage/oprobe"
+          New-Item -ItemType Directory -Force -Path $stage, out | Out-Null
+          Copy-Item target/release/oprobe.exe, README.md, CHANGELOG.md $stage
+          Copy-Item LICENSE "$stage/LICENSE.txt"
+          ./target/release/oprobe.exe completions powershell > "$stage/_oprobe.ps1"
+          Copy-Item -Recurse profiles $stage
+          dotnet tool install --global wix --version 5.0.2
+          wix build packaging/windows/oprobe.wxs -arch x64 `
+            -d Version=2.0.0 -d BinDir=$stage -d IconFile=packaging/desktop/oprobe.ico `
+            -o out/oprobe-ci-x64.msi
+          Get-Item out/oprobe-ci-x64.msi
