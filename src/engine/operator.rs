@@ -161,7 +161,8 @@ pub async fn check_reachable(base: &Operator, target: &TargetSpec) -> Result<()>
     // Wording differs by OS: "Connection refused (os error 111)" on Linux, "(os error 61)" on
     // macOS, "No connection could be made because the target machine actively refused it.
     // (os error 10061)" on Windows.
-    let unreachable = [
+    let unreachable = super::ops::is_connect_failure(&e)
+        || [
         "connection refused",
         "actively refused",
         "os error 10061",
@@ -172,8 +173,8 @@ pub async fn check_reachable(base: &Operator, target: &TargetSpec) -> Result<()>
         "no addresses to connect to",
         "nodename nor servname",
     ]
-    .iter()
-    .any(|n| l.contains(n));
+        .iter()
+        .any(|n| l.contains(n));
     if unreachable {
         anyhow::bail!(
             "cannot reach {} ({}): {chain}",

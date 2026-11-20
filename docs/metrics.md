@@ -161,6 +161,18 @@ sub-tasks — so you can see e.g. `read.full → [sub-task 0] → GetObject → 
 operation. OpenDAL's own `AwaitTreeLayer` is deliberately not used: it wraps every call and every
 read chunk and cost about 14 % throughput on small requests. Request IDs (`x-amz-request-id`, `x-ms-request-id`, …) are kept for support tickets.
 
+## Error classes
+
+Failed operations are counted per class in `resilience.error_classes`. Every OpenDAL error kind
+has its own class (`rate_limited`, `permission_denied`, `not_found`, `config_invalid`,
+`unsupported`, `is_a_directory`, `not_a_directory`, `already_exists`, `is_same_file`,
+`condition_not_match`, `range_not_satisfied`, `conflict`). OpenDAL's catch-all `Unexpected` is
+refined structurally, never by matching the error text (object names and ports contain digits):
+the last response status (429/503 → `rate_limited`, 401/403 → `permission_denied`, 5xx →
+`server_error`), OpenDAL's timeout and tail-cut layers (`timeout`, `tail_cut`), the typed error
+chain (reqwest / hyper / I/O timeouts → `timeout`; refused or failed dials → `connect`), then
+OpenDAL's `is_temporary()` (`network`) or `unexpected`.
+
 ## Client resources
 
 Process CPU (percent of one core) and RSS are sampled every second. When the load generator uses

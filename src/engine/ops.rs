@@ -218,49 +218,97 @@ fn push_written(ctx: &OpCtx, path: String, crc: u32) {
     }
 }
 
-/// Short, stable error class for aggregation (`rate_limited`, `not_found`, `timeout`, ...).
-///
-/// Classification uses OpenDAL's [`opendal::ErrorKind`] and `last_status`, the HTTP status of
-/// the operation's last backend request (when one got a response), never substrings of the
-/// formatted error: object names (`obj-00429.bin`), dates and ports contain digits too.
-pub fn error_class(e: &anyhow::Error, last_status: Option<u16>) -> String {
-    if let Some(oe) = e.downcast_ref::<opendal::Error>() {
-        match oe.kind() {
-            opendal::ErrorKind::RateLimited => return "rate_limited".into(),
-            opendal::ErrorKind::PermissionDenied => return "permission_denied".into(),
-            opendal::ErrorKind::NotFound => return "not_found".into(),
-            _ => {}
-        }
-        match last_status {
-            Some(429 | 503) => return "rate_limited".into(),
-            Some(401 | 403) => return "permission_denied".into(),
-            _ => {}
-        }
-        let msg = oe.to_string().to_ascii_lowercase();
-        if msg.contains("timeout") || msg.contains("timed out") {
-            return "timeout".into();
-        }
-        if msg.contains("connect:") {
-            return "connect".into();
-        }
-        return match oe.kind() {
-            opendal::ErrorKind::ConfigInvalid => "config_invalid",
-            opendal::ErrorKind::Unsupported => "unsupported",
-            opendal::ErrorKind::ConditionNotMatch => "condition_not_match",
-            _ => {
-                if msg.contains("send http request")
-                    || msg.contains("send request")
-                    || msg.contains("response body")
-                {
-                    "network"
-                } else {
-                    "unexpected"
-                }
+/// What a failure's source chain says about where it happened.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Cause {
+    Timeout,
+    Connect,
+}
+
+/// Inspect the typed errors under an OpenDAL error: reqwest's (default transport), oprobe's
+/// dial errors (`--microscope`), hyper's and I/O errors. No message text is matched.
+fn source_cause(e: &opendal::Error) -> Option<Cause> {
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(e);
+    while let Some(err) = cur {
+        if let Some(r) = err.downcast_ref::<reqwest::Error>() {
+            if r.is_timeout() {
+                return Some(Cause::Timeout);
+            }
+            if r.is_connect() {
+                return Some(Cause::Connect);
             }
         }
-        .into();
+        if err.downcast_ref::<crate::net::dial::DialError>().is_some() {
+            return Some(Cause::Connect);
+        }
+        if let Some(h) = err.downcast_ref::<hyper::Error>()
+            && h.is_timeout()
+        {
+            return Some(Cause::Timeout);
+        }
+        if let Some(io) = err.downcast_ref::<std::io::Error>() {
+            match io.kind() {
+                std::io::ErrorKind::TimedOut => return Some(Cause::Timeout),
+                std::io::ErrorKind::ConnectionRefused => return Some(Cause::Connect),
+                _ => {}
+            }
+        }
+        cur = err.source();
     }
-    "other".into()
+    None
+}
+
+/// The request never got a connection (refused, unreachable, DNS, dial timeout).
+pub fn is_connect_failure(e: &opendal::Error) -> bool {
+    source_cause(e) == Some(Cause::Connect)
+}
+
+/// Short, stable error class for aggregation (`rate_limited`, `not_found`, `timeout`, ...).
+///
+/// Every OpenDAL 0.59 [`opendal::ErrorKind`] maps to its own class. `Unexpected` errors are
+/// refined from `last_status` (the HTTP status of the operation's last backend request, when
+/// one got a response), the typed source chain (timeouts and connection failures from reqwest,
+/// hyper, oprobe's dialer and I/O), the exact messages of OpenDAL's own timeout and tail-cut
+/// layers, and [`opendal::Error::is_temporary`]. Substrings of the formatted error are never
+/// matched: object names (`obj-00429.bin`), dates and ports contain digits and words too.
+pub fn error_class(e: &anyhow::Error, last_status: Option<u16>) -> String {
+    use opendal::ErrorKind as K;
+    let Some(oe) = e.downcast_ref::<opendal::Error>() else {
+        return "other".into();
+    };
+    let class = match oe.kind() {
+        K::RateLimited => "rate_limited",
+        K::PermissionDenied => "permission_denied",
+        K::NotFound => "not_found",
+        K::ConfigInvalid => "config_invalid",
+        K::Unsupported => "unsupported",
+        K::IsADirectory => "is_a_directory",
+        K::NotADirectory => "not_a_directory",
+        K::AlreadyExists => "already_exists",
+        K::IsSameFile => "is_same_file",
+        K::ConditionNotMatch => "condition_not_match",
+        K::RangeNotSatisfied => "range_not_satisfied",
+        K::Conflict => "conflict",
+        K::Unexpected => {
+            return match (last_status, source_cause(oe), oe.message()) {
+                (Some(429 | 503), ..) => "rate_limited",
+                (Some(401 | 403), ..) => "permission_denied",
+                // OpenDAL's TimeoutLayer / TailCutLayer errors (exact messages, set by OpenDAL).
+                (_, _, "operation timeout reached" | "io operation timeout reached") => "timeout",
+                (_, _, "cancelled by tail cut" | "io cancelled by tail cut") => "tail_cut",
+                (_, Some(Cause::Timeout), _) => "timeout",
+                (_, Some(Cause::Connect), _) => "connect",
+                (Some(s), ..) if s >= 500 => "server_error",
+                // A transient transport failure (reset, broken body, ...): OpenDAL retries these.
+                _ if oe.is_temporary() => "network",
+                _ => "unexpected",
+            }
+            .into();
+        }
+        // `ErrorKind` is non-exhaustive: a kind added by a later OpenDAL keeps its own name.
+        other => return other.into_static().to_ascii_lowercase().replace(' ', "_"),
+    };
+    class.into()
 }
 
 #[cfg(test)]
@@ -279,7 +327,8 @@ mod tests {
             Unexpected,
             "read failed: path oprobe-run-x/data/obj-00429.bin port 4030",
         );
-        assert_eq!(error_class(&e, Some(500)), "unexpected");
+        // The status the request got decides, never the digits in the text.
+        assert_eq!(error_class(&e, Some(500)), "server_error");
         let e = err(Unexpected, "obj-00503.bin 2026-04-03T401");
         assert_eq!(error_class(&e, None), "unexpected");
         assert_eq!(error_class(&err(RateLimited, "x"), None), "rate_limited");
@@ -296,5 +345,68 @@ mod tests {
             "permission_denied"
         );
         assert_eq!(error_class(&err(NotFound, "x"), Some(404)), "not_found");
+    }
+
+    #[test]
+    fn every_error_kind_has_its_own_class() {
+        use opendal::ErrorKind::*;
+        for (kind, class) in [
+            (Unsupported, "unsupported"),
+            (ConfigInvalid, "config_invalid"),
+            (NotFound, "not_found"),
+            (PermissionDenied, "permission_denied"),
+            (IsADirectory, "is_a_directory"),
+            (NotADirectory, "not_a_directory"),
+            (AlreadyExists, "already_exists"),
+            (RateLimited, "rate_limited"),
+            (IsSameFile, "is_same_file"),
+            (ConditionNotMatch, "condition_not_match"),
+            (RangeNotSatisfied, "range_not_satisfied"),
+            (Conflict, "conflict"),
+        ] {
+            assert_eq!(error_class(&err(kind, "x"), None), class, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn unexpected_errors_are_refined_structurally() {
+        use opendal::ErrorKind::Unexpected;
+        // OpenDAL's own layers.
+        assert_eq!(
+            error_class(&err(Unexpected, "operation timeout reached"), None),
+            "timeout"
+        );
+        assert_eq!(
+            error_class(&err(Unexpected, "io cancelled by tail cut"), None),
+            "tail_cut"
+        );
+        // A path that merely mentions a timeout is not one.
+        let e = err(Unexpected, "read obj-timed out-timeout.bin");
+        assert_eq!(error_class(&e, None), "unexpected");
+        // Typed sources.
+        let io = |k: std::io::ErrorKind| -> anyhow::Error {
+            opendal::Error::new(Unexpected, "send request")
+                .set_source(std::io::Error::new(k, "boom"))
+                .into()
+        };
+        assert_eq!(error_class(&io(std::io::ErrorKind::TimedOut), None), "timeout");
+        assert_eq!(
+            error_class(&io(std::io::ErrorKind::ConnectionRefused), None),
+            "connect"
+        );
+        let dial: anyhow::Error = opendal::Error::new(Unexpected, "connect")
+            .set_source(crate::net::dial::DialError {
+                stage: "tcp",
+                target: "h:1".into(),
+                source: std::io::Error::other("unreachable"),
+            })
+            .into();
+        assert_eq!(error_class(&dial, None), "connect");
+        // Server errors, then transient vs persistent.
+        assert_eq!(error_class(&err(Unexpected, "x"), Some(500)), "server_error");
+        let temp: anyhow::Error = opendal::Error::new(Unexpected, "x").set_temporary().into();
+        assert_eq!(error_class(&temp, None), "network");
+        assert_eq!(error_class(&err(Unexpected, "x"), None), "unexpected");
+        assert_eq!(error_class(&anyhow::anyhow!("plain"), None), "other");
     }
 }

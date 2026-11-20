@@ -239,10 +239,12 @@ impl Inner {
             .dial(key.https, &key.host, key.port)
             .await
             .map_err(|e| {
-                Error::new(ErrorKind::Unexpected, format!("connect: {e}"))
+                // The typed source lets error classification see a connect failure.
+                Error::new(ErrorKind::Unexpected, "connect")
                     .with_operation("oprobe::dial")
                     .with_context("target", format!("{}:{}", key.host, key.port))
                     .set_temporary()
+                    .set_source(e)
             })?;
         let id = self.conn_seq.fetch_add(1, Ordering::Relaxed);
         let use_h2 = match d.alpn.as_deref() {
