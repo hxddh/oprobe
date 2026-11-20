@@ -6,6 +6,31 @@ All notable changes to this project are documented here. The format follows
 
 ## Unreleased (v3)
 
+### Shared core (breaking)
+
+- **Run store**: every `oprobe run` / `tune` is saved as `runs/<id>.oprobe` (zstd NDJSON,
+  `oprobe.run/3`: report + one row per operation and per request) with a `.json` sidecar under
+  `$OPROBE_DATA_DIR`. `oprobe runs list|show|rm|gc`; runs are referenced by id, id prefix,
+  `last`, `last~N`, label or path.
+- **Report v3** (`oprobe.report/3`): `run`, `verdict {level, headline, exit_code}`,
+  `knobs {requested, effective}`, `stages`, `network`, `heatmap`, `findings`, `slowest` (op ids);
+  every numeric field carries its unit. 2.x reports are not read.
+- **Global `-o/--output text|json|ndjson|md`** (html wired, not yet rendered); stdout carries
+  only the result; `-o ndjson` streams `oprobe.events/1`. `--format` is gone; `--option` lost
+  its `-o` short flag.
+- **Classified errors**: stable codes (`net.timeout`, `safety.read_only`, …) and exit codes
+  (2 usage/config, 3 gate, 4 budget, 5 safety refusal, 130 interrupted); JSON errors in machine
+  modes.
+- **Safety rails**: `--dry-run` plan, `--read-only` (implied by `--existing`), budgets
+  (`--max-requests`, `--max-bytes`, `--max-duration`, `--max-cost-usd`), `--idempotency-key`,
+  and a preflight (list + tiny write/delete) before any data is uploaded.
+- **Config file** with named targets (`oprobe target add|list|show|rm`, `oprobe config
+  show|path`); `oprobe run prod` uses target `prod`.
+- **Command tree**: `diff` is now `compare A B` (RUNREFs or files); `report` is gone (`runs show
+  FILE`), `init` is hidden; `demo`, `analyze`, `explain`, `watch`, `matrix`, `compat`,
+  `baseline`, `mcp`, `schema`, `capabilities`, `self-update`, `runs open|export`, `target test`
+  and `config edit` exist and report "not implemented yet".
+
 ### Trust fixes (breaking)
 
 Places where oprobe could lead to a wrong conclusion. Reports use schema `oprobe.report/v3`;
