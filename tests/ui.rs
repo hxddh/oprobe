@@ -43,7 +43,8 @@ fn runs_a_memory_workload_end_to_end() {
     app.wait_for_within("text:/^#1 /", Duration::from_secs(2))
         .unwrap();
     app.press("Cost").unwrap();
-    app.wait_for("text:/per 1M ops/").unwrap();
+    // memory:// has no cloud bill: no price table is applied.
+    app.wait_for("text:/^Cost not applicable/").unwrap();
     assert!(app.shows("Save report…"));
 }
 
