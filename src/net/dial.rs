@@ -18,6 +18,9 @@ use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
 
 use super::proxy::ProxyConfig;
+use super::tcpinfo::{self, SockId};
+use super::tlsinfo::{CertChain, group_name, suite_name, version_name};
+use crate::model::TlsRow;
 use crate::trace::{DialRecord, Recorder};
 
 /// Per-connection clock shared between the socket wrapper and the request path.
@@ -27,15 +30,18 @@ pub struct ConnClock {
     last_write_us: AtomicU64,
     pub rx: AtomicU64,
     pub tx: AtomicU64,
+    /// The socket, for its kernel TCP statistics (`net::tcpinfo`).
+    pub sock: Option<SockId>,
 }
 
 impl ConnClock {
-    fn new() -> Arc<Self> {
+    fn new(sock: Option<SockId>) -> Arc<Self> {
         Arc::new(Self {
             epoch: Instant::now(),
             last_write_us: AtomicU64::new(0),
             rx: AtomicU64::new(0),
             tx: AtomicU64::new(0),
+            sock,
         })
     }
 
@@ -172,6 +178,10 @@ pub struct Dialed {
     pub alpn: Option<String>,
     pub tls_version: String,
     pub cipher: String,
+    /// The handshake (full / resumed / HelloRetryRequest, group, cipher) for request rows.
+    pub tls: Option<TlsRow>,
+    /// The server's certificate chain (only when the dialer captures it, see `Dialer::certs`).
+    pub certs: Option<CertChain>,
     /// Address actually connected to (proxy address when tunnelling).
     pub remote: SocketAddr,
     pub resolved: Vec<SocketAddr>,
@@ -210,6 +220,8 @@ pub struct Dialer {
     /// Address that last connected successfully per `host:port`; tried first on the next dial
     /// (like browsers do) so a dead address family costs the Happy Eyeballs stagger only once.
     pub last_good: Arc<std::sync::Mutex<std::collections::HashMap<String, SocketAddr>>>,
+    /// Parse the server's certificate chain on every TLS dial (doctor / probe).
+    pub certs: bool,
 }
 
 impl Dialer {
@@ -225,6 +237,7 @@ impl Dialer {
             connect_timeout,
             recorder,
             last_good: Default::default(),
+            certs: false,
         }
     }
 
@@ -340,7 +353,7 @@ impl Dialer {
         }
         let _ = tcp.set_nodelay(true);
 
-        let clock = ConnClock::new();
+        let clock = ConnClock::new(tcpinfo::sock_id_of(&tcp));
         let mut sock = CountingStream {
             inner: tcp,
             clock: clock.clone(),
@@ -378,6 +391,8 @@ impl Dialer {
                 alpn: None,
                 tls_version: "none".into(),
                 cipher: "none".into(),
+                tls: None,
+                certs: None,
                 remote,
                 resolved: addrs,
             });
@@ -413,16 +428,26 @@ impl Dialer {
             .map(|p| String::from_utf8_lossy(p).into_owned());
         let tls_version = info
             .protocol_version()
-            .map(|v| {
-                format!("{v:?}")
-                    .replace("TLSv1_", "TLS1.")
-                    .replace("TLSv", "TLS")
-            })
+            .map(version_name)
             .unwrap_or_default();
         let cipher = info
             .negotiated_cipher_suite()
-            .map(|c| format!("{:?}", c.suite()))
+            .map(|c| suite_name(c.suite()))
             .unwrap_or_default();
+        let row = TlsRow {
+            resumed: info.handshake_kind() == Some(rustls::HandshakeKind::Resumed),
+            version: tls_version.clone(),
+            cipher: (!cipher.is_empty()).then(|| cipher.clone()),
+            hrr: info.handshake_kind() == Some(rustls::HandshakeKind::FullWithHelloRetryRequest),
+            group: info
+                .negotiated_key_exchange_group()
+                .map(|g| group_name(g.name())),
+        };
+        let certs = if self.certs {
+            info.peer_certificates().map(CertChain::from_der)
+        } else {
+            None
+        };
         Ok(Dialed {
             stream: ConnStream::Tls(Box::new(tls)),
             clock,
@@ -435,6 +460,8 @@ impl Dialer {
             alpn,
             tls_version,
             cipher,
+            tls: Some(row),
+            certs,
             remote,
             resolved: addrs,
         })

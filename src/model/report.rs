@@ -493,6 +493,9 @@ pub struct TlsInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cipher: Option<String>,
     pub handshake: Quantiles,
+    /// Full / resumed / HelloRetryRequest handshakes, versions, ciphers and groups.
+    #[serde(default)]
+    pub handshakes: crate::net::stats::TlsHandshakeStats,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -501,6 +504,9 @@ pub struct TcpInfo {
     pub connect: Quantiles,
     pub proxy_connect: Quantiles,
     pub dialed_count: u64,
+    /// Kernel TCP statistics at request end (Linux `TCP_INFO`, macOS `TCP_CONNECTION_INFO`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kernel: Option<crate::net::stats::TcpKernelStats>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]

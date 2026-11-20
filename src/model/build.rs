@@ -269,12 +269,14 @@ pub fn build_run(i: ReportInput<'_>) -> Run {
             alpn: c.alpn.clone(),
             cipher: (!c.cipher.is_empty()).then(|| c.cipher.clone()),
             handshake: c.tls,
+            handshakes: crate::net::stats::tls_handshakes(&trace.reqs),
         },
         tcp: TcpInfo {
             dns: c.dns,
             connect: c.tcp,
             proxy_connect: c.proxy_connect,
             dialed_count: c.dialed,
+            kernel: crate::net::stats::tcp_kernel(&trace.reqs),
         },
         remotes: remotes(&trace.reqs),
     };

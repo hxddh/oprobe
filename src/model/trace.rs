@@ -52,16 +52,33 @@ pub struct TlsRow {
     pub cipher: Option<String>,
     /// The handshake needed a HelloRetryRequest.
     pub hrr: bool,
+    /// Negotiated key-exchange group, e.g. `X25519MLKEM768`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
 }
 
-/// Kernel TCP statistics of the connection at request end (Linux `TCP_INFO`).
+/// Kernel TCP statistics of the connection at request end (Linux `TCP_INFO`, macOS
+/// `TCP_CONNECTION_INFO`). Counters are totals over the connection's life so far.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct TcpRow {
+    /// Smoothed round-trip time.
     pub rtt_us: u64,
     pub rttvar_us: u64,
+    /// Retransmitted segments (whole connection).
     pub retrans: u64,
+    /// Congestion window, segments.
     pub cwnd: u64,
+    /// Most recent delivery rate estimate, bits per second (Linux).
     pub delivery_rate_bps: u64,
+    /// Time busy sending data (Linux ≥ 4.10).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub busy_us: u64,
+    /// Time sending was limited by the receiver's window (Linux ≥ 4.10).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub rwnd_limited_us: u64,
+    /// Time sending was limited by the send buffer (Linux ≥ 4.10).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub sndbuf_limited_us: u64,
 }
 
 /// One backend request (an HTTP exchange, or an in-process backend call).

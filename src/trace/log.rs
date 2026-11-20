@@ -196,7 +196,7 @@ pub fn req_row(r: RequestRecord, op_id: u64, op_t_us: i64, attempt: u32) -> ReqR
         t_us: op_t_us + r.start_offset_us as i64,
         op_id,
         attempt,
-        api: Cow::Borrowed(r.api.label()),
+        api: Cow::Borrowed(r.service_op.unwrap_or_else(|| r.api.label())),
         method: method_name(r.method),
         status: r.status,
         protocol: r.protocol.into(),
@@ -219,8 +219,8 @@ pub fn req_row(r: RequestRecord, op_id: u64, op_t_us: i64, attempt: u32) -> ReqR
         retry_after_ms: r.retry_after_ms,
         error_code,
         error: r.error,
-        tls: None,
-        tcp: None,
+        tls: r.tls,
+        tcp: r.tcp,
     }
 }
 
@@ -354,6 +354,9 @@ mod tests {
             retry_after_ms: None,
             error: None,
             remote: None,
+            service_op: None,
+            tls: None,
+            tcp: None,
         }
     }
 
