@@ -368,6 +368,11 @@ pub async fn run_suite(op: &Operator, target: &str, scheme: &str, prefix: &str) 
             Err(e) if e.kind() == ErrorKind::RangeNotSatisfied => {
                 pass("a range past the end fails with 416")
             }
+            // Some OpenDAL services (gcs, azblob) report the server's 416 as `Unexpected`: the
+            // server behaved correctly, so the check passes (the message names the status).
+            Err(e) if format!("{e:#}").contains("416") => pass(
+                "a range past the end fails with 416 (reported by OpenDAL as an unexpected error)",
+            ),
             Ok(b) if b.is_empty() => pass("a range past the end returns no bytes"),
             Ok(b) => bail!("a range past the end returned {} bytes", b.len()),
             Err(e) => bail!("a range past the end: {e} (expected 416 Range Not Satisfiable)"),
@@ -426,8 +431,10 @@ pub async fn run_suite(op: &Operator, target: &str, scheme: &str, prefix: &str) 
             return skip("the service does not store user metadata");
         }
         let meta = [
-            ("oprobe-a".to_owned(), "1".to_owned()),
-            ("oprobe-b".to_owned(), "two words".to_owned()),
+            // Names valid everywhere: Azure requires C#-identifier names (no `-`), S3/GCS
+            // lower-case them.
+            ("oprobea".to_owned(), "1".to_owned()),
+            ("oprobeb".to_owned(), "two words".to_owned()),
         ];
         op.write_with(&k, payload(16, 10))
             .user_metadata(meta.clone())

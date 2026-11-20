@@ -27,9 +27,7 @@ use super::dial::{ConnClock, DialTiming, Dialer};
 use super::proxy::ProxyConfig;
 use super::tls::{TlsClientOptions, build_tls_connector};
 use crate::model::TlsRow;
-use crate::trace::{
-    InflightGuard, OpScope, Protocol, Recorder, RequestRecord, RequestTiming, classify_http,
-};
+use crate::trace::{InflightGuard, OpScope, Protocol, Recorder, RequestRecord, RequestTiming};
 
 /// HTTP protocol preference.
 #[derive(
@@ -600,11 +598,12 @@ impl HttpTransport for TracingTransport {
         let key = PoolKey { https, host, port };
         let method = parts.method.clone();
         // The exact API the service named (OpenDAL `ServiceOperation`), else the URL heuristic.
-        let service_op = parts.extensions.get::<ServiceOperation>().map(|o| o.0);
-        let api = match service_op.map(crate::trace::Api::from_service_operation) {
-            Some(a) if a != crate::trace::Api::Other => a,
-            _ => classify_http(&method, uri.path(), uri.query()),
-        };
+        let (api, service_op) = crate::trace::Api::resolve(
+            parts.extensions.get::<ServiceOperation>().map(|o| o.0),
+            &method,
+            uri.path(),
+            uri.query(),
+        );
         let bytes_up = body_buf.len() as u64;
 
         let inflight = InflightGuard::start(recorder.clone());

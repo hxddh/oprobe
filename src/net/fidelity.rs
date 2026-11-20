@@ -45,7 +45,7 @@ use super::tls::{InsecureCertVerifier, crypto_provider};
 use super::tlsinfo::{HandshakeMarks, ObservedVerifier, TlsEvent, observed_provider};
 use super::{HttpVersion, TransportConfig};
 use crate::model::{TcpRow, TlsRow};
-use crate::trace::model::{Protocol, RequestRecord, RequestTiming, classify_http};
+use crate::trace::model::{Protocol, RequestRecord, RequestTiming};
 use crate::trace::recorder::DialRecord;
 use crate::trace::{InflightGuard, OpScope, Recorder};
 
@@ -850,11 +850,12 @@ impl HttpTransport for FidelityTransport {
         let method = parts.method.clone();
         // The exact API the service named (OpenDAL `ServiceOperation`); the URL heuristic only
         // when the service attached none.
-        let service_op = parts.extensions.get::<ServiceOperation>().map(|o| o.0);
-        let api = match service_op.map(crate::trace::Api::from_service_operation) {
-            Some(a) if a != crate::trace::Api::Other => a,
-            _ => classify_http(&method, url.path(), url.query()),
-        };
+        let (api, service_op) = crate::trace::Api::resolve(
+            parts.extensions.get::<ServiceOperation>().map(|o| o.0),
+            &method,
+            url.path(),
+            url.query(),
+        );
         let bytes_up = body.len() as u64;
         let inflight = InflightGuard::start(recorder.clone());
         let start_offset_us = scope

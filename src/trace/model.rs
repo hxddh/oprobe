@@ -116,6 +116,27 @@ impl Api {
     /// The API class of an OpenDAL `ServiceOperation` name (the exact backend API a service
     /// attached to its request), across providers: S3 `ListObjectsV2`, Azure `ListBlobs` and
     /// B2 `ListFileNames` are all [`Api::ListObjects`]. Unknown names are [`Api::Other`].
+    /// The API of one HTTP request: the name the service attached (OpenDAL `ServiceOperation`)
+    /// when it is known, else the URL heuristic. Services label a metadata read with the same
+    /// name as a download (GCS: `GetObject` for `GET …/o/key` without `alt=media`, and for HEAD),
+    /// so a `GetObject` the request itself shows to be metadata is reported as `HeadObject`.
+    /// Returns the class and the exact name to record.
+    pub fn resolve(
+        service_op: Option<&'static str>,
+        method: &http::Method,
+        path: &str,
+        query: Option<&str>,
+    ) -> (Api, Option<&'static str>) {
+        let heuristic = || classify_http(method, path, query);
+        match service_op.map(|n| (n, Api::from_service_operation(n))) {
+            Some((_, Api::GetObject)) if heuristic() == Api::HeadObject => {
+                (Api::HeadObject, Some("HeadObject"))
+            }
+            Some((name, a)) if a != Api::Other => (a, Some(name)),
+            _ => (heuristic(), service_op),
+        }
+    }
+
     pub fn from_service_operation(name: &str) -> Api {
         match name {
             "GetObject" | "Get" | "GetBlob" | "DownloadFileByName" | "PresignedGetObject" => {
@@ -497,5 +518,41 @@ mod tests {
                 assert_eq!(Api::from_service_operation(a.label()), a);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod resolve_tests {
+    use super::{Api, classify_http};
+    use http::Method;
+
+    #[test]
+    fn gcs_metadata_reads_labelled_get_object_are_head_object() {
+        let meta = Api::resolve(
+            Some("GetObject"),
+            &Method::GET,
+            "/storage/v1/b/bench/o/data%2Fobj-1.bin",
+            None,
+        );
+        assert_eq!(
+            meta,
+            (Api::HeadObject, Some("HeadObject")),
+            "{:?}",
+            classify_http(&Method::GET, "/storage/v1/b/bench/o/x", None)
+        );
+        let media = Api::resolve(
+            Some("GetObject"),
+            &Method::GET,
+            "/storage/v1/b/bench/o/data%2Fobj-1.bin",
+            Some("alt=media"),
+        );
+        assert_eq!(media, (Api::GetObject, Some("GetObject")));
+        let head = Api::resolve(Some("GetObject"), &Method::HEAD, "/bench/key", None);
+        assert_eq!(head.0, Api::HeadObject);
+        assert_eq!(
+            Api::resolve(Some("PutBlob"), &Method::PUT, "/c/k", None),
+            (Api::PutObject, Some("PutBlob"))
+        );
+        assert_eq!(Api::resolve(None, &Method::GET, "/b/k", None).1, None);
     }
 }
