@@ -270,7 +270,12 @@ jobs:
           iconutil -c icns $iconset -o "$app/Resources/oprobe.icns"
           codesign --force --deep --sign - dmg/oprobe.app
           ln -s /Applications dmg/Applications
-          hdiutil create -volname "oprobe $VERSION" -srcfolder dmg -ov -format UDZO "out/oprobe-${VERSION}-macos-universal.dmg"
+          # hdiutil's own size estimate for -srcfolder can come out too small ("No space left on
+          # device" while copying the universal binary): size the image explicitly with headroom.
+          size_mb=$(( $(du -sm dmg | cut -f1) * 2 + 32 ))
+          hdiutil create -volname "oprobe $VERSION" -srcfolder dmg -fs HFS+ -size "${size_mb}m" \
+            -ov -format UDZO "out/oprobe-${VERSION}-macos-universal.dmg"
+          hdiutil verify "out/oprobe-${VERSION}-macos-universal.dmg"
       - uses: actions/upload-artifact@v4
         with:
           name: dist-universal-apple-darwin
