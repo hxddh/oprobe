@@ -74,7 +74,7 @@ fn exit_code(code: impl Into<std::process::ExitCode>) -> std::process::ExitCode 
 
 /// The file types the app opens (`.oprobe` run files): file associations where the platform
 /// registers them from the app (Linux desktop entry; the bundles on macOS and Windows).
-#[cfg(feature = "gui")]
+#[cfg(all(feature = "gui", not(target_os = "macos")))]
 fn file_types() -> Vec<nsh_core::file_type::FileType> {
     let json = serde_json::json!([{
         "name": "oprobe run",
@@ -98,14 +98,20 @@ pub fn run_gui() -> std::process::ExitCode {
     use nsh_platform_windows as platform;
     // The same UI sets as the terminal host (`term::run`).
     platform::set_ui_sets(ui_sets());
+    #[cfg_attr(target_os = "macos", allow(unused_mut))]
     let mut options = platform::AppOptions {
         title: "oprobe".to_owned(),
         app_id: "io.github.hxddh.oprobe".to_owned(),
         size: (1360, 880),
         ..Default::default()
     };
-    options.file_types = file_types();
-    options.single_instance = true;
+    // macOS takes file types and single-instance behaviour from the app bundle (Info.plist);
+    // the Windows and Linux hosts take them here.
+    #[cfg(not(target_os = "macos"))]
+    {
+        options.file_types = file_types();
+        options.single_instance = true;
+    }
     // `run_app` returns `ExitCode` on macOS / Windows and `glib::ExitCode` on Linux.
     let code = exit_code(platform::run_app(
         platform::AppSource::Rust(platform::Root::of::<App>()),
