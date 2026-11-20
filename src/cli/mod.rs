@@ -198,6 +198,7 @@ pub fn ui_entry(cli: &Cli) -> Option<ExitCode> {
                 proxy: a.proxy.clone(),
                 anonymous: a.anonymous,
                 monochrome,
+                ..Default::default()
             };
         }
         crate::ui::set_launch(launch);
