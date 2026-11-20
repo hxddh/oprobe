@@ -118,6 +118,40 @@ impl CommandOutput for McpHttpOutput {
     }
 }
 
+/// Whether every address `addr` resolves to is a loopback address.
+async fn loopback_only(addr: &str) -> Result<bool> {
+    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host(addr)
+        .await
+        .map_err(|e| {
+            OprobeError::new(
+                ErrorCode::UsageInvalidArgument,
+                format!("invalid --http address `{addr}`: {e}"),
+            )
+            .with_hint("e.g. --http 127.0.0.1:8765")
+        })?
+        .collect();
+    Ok(!addrs.is_empty() && addrs.iter().all(|a| a.ip().is_loopback()))
+}
+
+/// `--http` serves without authentication: loopback only unless `--http-allow-remote`.
+async fn check_http_bind(addr: &str, allow_remote: bool, ctx: &Ctx) -> Result<()> {
+    if loopback_only(addr).await? {
+        return Ok(());
+    }
+    if !allow_remote {
+        return Err(OprobeError::new(
+            ErrorCode::SafetyRefused,
+            format!("refusing to serve MCP on non-loopback address `{addr}`: the server has no authentication"),
+        )
+        .with_hint("bind 127.0.0.1:PORT (tunnel it if needed), or pass --http-allow-remote to accept the risk")
+        .into());
+    }
+    ctx.out.warn(format!(
+        "serving MCP on non-loopback address {addr} without authentication: anyone who can reach it can run tools with the configured credentials"
+    ));
+    Ok(())
+}
+
 pub async fn cmd_mcp(a: McpArgs, ctx: &Ctx) -> Result<u8> {
     let cfg = McpConfig {
         allow_write: a.allow_write,
@@ -140,6 +174,7 @@ pub async fn cmd_mcp(a: McpArgs, ctx: &Ctx) -> Result<u8> {
             crate::mcp::serve_stdio(cfg).await?;
         }
         Some(addr) => {
+            check_http_bind(addr, a.http_allow_remote, ctx).await?;
             let out = &ctx.out;
             let allow_write = a.allow_write;
             let mut printed = Ok(exit::OK);
@@ -154,4 +189,31 @@ pub async fn cmd_mcp(a: McpArgs, ctx: &Ctx) -> Result<u8> {
         }
     }
     Ok(exit::OK)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn http_binding_is_loopback_unless_allowed() {
+        assert!(loopback_only("127.0.0.1:0").await.unwrap());
+        assert!(loopback_only("[::1]:0").await.unwrap());
+        assert!(!loopback_only("0.0.0.0:0").await.unwrap());
+        assert!(loopback_only("not an address").await.is_err());
+        let ctx = Ctx::new(
+            crate::output::Output::silent(),
+            crate::store::Paths {
+                config_file: "c.toml".into(),
+                data_dir: "d".into(),
+            },
+        );
+        let e = check_http_bind("0.0.0.0:0", false, &ctx).await.unwrap_err();
+        assert_eq!(
+            crate::errors::classify(&e, "s3").code,
+            ErrorCode::SafetyRefused
+        );
+        check_http_bind("0.0.0.0:0", true, &ctx).await.unwrap();
+        check_http_bind("127.0.0.1:0", false, &ctx).await.unwrap();
+    }
 }

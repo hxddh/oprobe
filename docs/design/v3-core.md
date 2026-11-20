@@ -35,7 +35,7 @@ pub async fn cmd_mine(a: MyArgs, ctx: &Ctx) -> anyhow::Result<u8> {
 
 Wire it in `cli::dispatch` (replace the `pending("…")` arm) and its arguments in
 `cli/args.rs` (replace the `PendingArgs` placeholder). stdout carries only the result; use
-`ctx.out.info/warn` for anything else. `-o html` errors with `internal` until a command
+`ctx.out.info/warn` for anything else. `-o html` is a `usage.invalid_argument` error unless a command
 implements `html()`.
 
 ## Raise a classified error

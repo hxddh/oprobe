@@ -27,7 +27,7 @@ use crate::events::EventKind;
 use crate::guard::{Budgets, Plan};
 use crate::model::{Report, RunId};
 use crate::output::Output;
-use crate::report::diff::{DiffReport, Thresholds};
+use crate::report::diff::Thresholds;
 use crate::store::RunSummary;
 use crate::util::{ByteSize, fmt_ms, parse_duration};
 
@@ -561,7 +561,7 @@ pub const SPECS: &[ToolSpec] = &[
         read_only: true,
         open_world: false,
         input: input::<CompareIn>,
-        output: output::<DiffReport>,
+        output: output::<crate::analysis::compare::Comparison>,
     },
     ToolSpec {
         name: "start_tune",
@@ -845,6 +845,96 @@ fn target_url(p: &Profile, given: &str) -> String {
     p.target.url.clone().unwrap_or_else(|| given.to_owned())
 }
 
+/// Options that never change where requests go or which bucket/root they touch.
+const HARMLESS_OPTIONS: [&str; 2] = ["region", "enable_virtual_host_style"];
+
+/// What makes two targets the same place: every option except [`HARMLESS_OPTIONS`], the
+/// scheme, TLS trust and the proxy. Returns the names that differ (never their values).
+fn identity_diff(a: &crate::config::TargetSpec, b: &crate::config::TargetSpec) -> Vec<String> {
+    let mut d = Vec::new();
+    if a.scheme != b.scheme {
+        d.push("scheme".to_owned());
+    }
+    let keys: std::collections::BTreeSet<&String> =
+        a.options.keys().chain(b.options.keys()).collect();
+    for k in keys {
+        if !HARMLESS_OPTIONS.contains(&k.as_str()) && a.options.get(k) != b.options.get(k) {
+            d.push(k.clone());
+        }
+    }
+    if a.insecure != b.insecure {
+        d.push("insecure".into());
+    }
+    if a.ca_cert != b.ca_cert {
+        d.push("ca_cert".into());
+    }
+    if a.proxy != b.proxy {
+        d.push("proxy".into());
+    }
+    d
+}
+
+/// `--allow-target` for a tool call: the target as configured (or typed, without a query
+/// string) must be allowed, and the call's overrides (`endpoint`, `options`, `proxy`,
+/// `insecure`, query parameters) must not move it to another host, bucket or root.
+/// `region` and `anonymous` are accepted (they never retarget the allowed credentials).
+fn check_target(st: &State, t: &TargetIn, effective: &Profile) -> anyhow::Result<()> {
+    if st.cfg.allow_targets.is_empty() {
+        return Ok(());
+    }
+    let given = t.target.trim();
+    let bare_given = given.split(['?', '#']).next().unwrap_or(given).to_owned();
+    let bare = TargetIn {
+        target: bare_given.clone(),
+        region: t.region.clone(),
+        anonymous: t.anonymous,
+        ..Default::default()
+    };
+    let ctx = st.ctx();
+    let (ta, _) = crate::cli::resolve_target(&target_args(&bare), ctx.config()?)?;
+    let reference = crate::cli::build_profile(
+        &ta,
+        &WorkloadArgs::default(),
+        &KnobArgs::default(),
+        &CostArgs::default(),
+    )?;
+    check_allowed(
+        &st.cfg,
+        &bare_given,
+        Some(&target_url(&reference, &bare_given)),
+    )?;
+    let diff = identity_diff(&reference.target, &effective.target);
+    if diff.is_empty() {
+        return Ok(());
+    }
+    Err(OprobeError::new(
+        ErrorCode::SafetyRefused,
+        format!(
+            "target `{bare_given}` is allowed on this MCP server, but this call changes where it points ({}): refused",
+            diff.join(", ")
+        ),
+    )
+    .with_hint(
+        "call the tool with the allowed target alone (only `region` and `anonymous` may be set), \
+         or restart the server with an --allow-target entry for the other location",
+    )
+    .into())
+}
+
+/// `--allow-target` for `probe_endpoint`: the endpoint must be allowed, and no proxy or TLS
+/// override may be given.
+fn check_probe(cfg: &McpConfig, a: &ProbeIn) -> anyhow::Result<()> {
+    check_allowed(cfg, &a.endpoint, Some(&a.endpoint))?;
+    if !cfg.allow_targets.is_empty() && (a.insecure || a.proxy.is_some()) {
+        return Err(OprobeError::new(
+            ErrorCode::SafetyRefused,
+            "this MCP server restricts targets (--allow-target): `proxy` and `insecure` overrides are refused",
+        )
+        .into());
+    }
+    Ok(())
+}
+
 /// The write rail of this server: refuses runs that write unless `--allow-write`
 /// (`memory://` writes only into this process and is always allowed).
 fn write_refusal(cfg: &McpConfig, p: &Profile, read_only: bool) -> Option<anyhow::Error> {
@@ -975,11 +1065,7 @@ fn prepare(st: &State, a: &PlanIn) -> anyhow::Result<Prepared> {
     let writes = crate::guard::check_read_only(&profile).is_err();
     let plan = crate::guard::plan(&profile, &run_prefix, read_only, &budgets);
     let mut refusals = Vec::new();
-    if let Err(e) = check_allowed(
-        &st.cfg,
-        &a.target.target,
-        Some(&target_url(&profile, &a.target.target)),
-    ) {
+    if let Err(e) = check_target(st, &a.target, &profile) {
         refusals.push(e);
     }
     if let Some(e) = write_refusal(&st.cfg, &profile, read_only) {
@@ -1045,11 +1131,7 @@ async fn child_json(st: &State, args: Vec<String>, timeout: Duration) -> anyhow:
 
 async fn doctor(st: &Arc<State>, a: DoctorIn) -> anyhow::Result<Reply> {
     let (p, _) = profile_of(st, &a.target, &WorkloadIn::default())?;
-    check_allowed(
-        &st.cfg,
-        &a.target.target,
-        Some(&target_url(&p, &a.target.target)),
-    )?;
+    check_target(st, &a.target, &p)?;
     let read_only = !st.cfg.allow_write || a.read_only.unwrap_or(false);
     let mut args = vec!["doctor".to_owned()];
     args.extend(target_cli(&a.target));
@@ -1082,7 +1164,7 @@ async fn doctor(st: &Arc<State>, a: DoctorIn) -> anyhow::Result<Reply> {
 }
 
 async fn probe(st: &Arc<State>, a: ProbeIn) -> anyhow::Result<Reply> {
-    check_allowed(&st.cfg, &a.endpoint, Some(&a.endpoint))?;
+    check_probe(&st.cfg, &a)?;
     let mut args = vec![
         "probe".to_owned(),
         a.endpoint.clone(),
@@ -1573,7 +1655,15 @@ fn compare_runs(st: &Arc<State>, a: CompareIn) -> anyhow::Result<Reply> {
             t.allow_target_change = v;
         }
     }
-    let d = crate::report::diff::diff(&base.report, &cand.report, &t);
+    // The CLI's `compare`: the gate with significance applied (same verdict as
+    // `oprobe compare` and the app).
+    let d = crate::analysis::compare::compare(
+        std::slice::from_ref(&base),
+        std::slice::from_ref(&cand),
+        base.id(),
+        cand.id(),
+        &t,
+    );
     let text = format!(
         "{} → {}: {}",
         base.id(),
@@ -1625,11 +1715,7 @@ fn estimate_cost(st: &Arc<State>, a: PlanIn) -> anyhow::Result<Reply> {
 
 async fn cleanup(st: &Arc<State>, a: CleanupIn) -> anyhow::Result<Reply> {
     let (p, _) = profile_of(st, &a.target, &WorkloadIn::default())?;
-    check_allowed(
-        &st.cfg,
-        &a.target.target,
-        Some(&target_url(&p, &a.target.target)),
-    )?;
+    check_target(st, &a.target, &p)?;
     let dry_run = !(a.confirm && st.cfg.allow_write);
     let mut args = vec!["cleanup".to_owned()];
     args.extend(target_cli(&a.target));
@@ -1751,6 +1837,79 @@ mod tests {
             Some("s3://bench-evil/x")
         ));
         assert!(!allowed(&cfg, "memory://", Some("memory://")));
+    }
+
+    fn allow_state(dir: &std::path::Path, allow: &[&str]) -> State {
+        std::fs::write(
+            dir.join("config.toml"),
+            "[targets.prod]\nurl = \"s3://bench/data\"\nregion = \"eu-west-1\"\n",
+        )
+        .unwrap();
+        State::new(McpConfig {
+            allow_write: false,
+            budgets: Budgets::default(),
+            allow_targets: allow.iter().map(|s| s.to_string()).collect(),
+            paths: crate::store::Paths {
+                config_file: dir.join("config.toml"),
+                data_dir: dir.join("data"),
+            },
+            max_concurrent_runs: 1,
+        })
+    }
+
+    fn check(st: &State, t: TargetIn) -> Result<(), ErrorCode> {
+        let (p, _) = profile_of(st, &t, &WorkloadIn::default()).unwrap();
+        check_target(st, &t, &p).map_err(|e| crate::errors::classify(&e, "s3").code)
+    }
+
+    #[test]
+    fn allowlisted_targets_cannot_be_retargeted_by_overrides() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = allow_state(dir.path(), &["prod", "s3://bench/"]);
+        let t = |target: &str| TargetIn {
+            target: target.into(),
+            ..Default::default()
+        };
+        assert_eq!(check(&st, t("prod")), Ok(()));
+        assert_eq!(check(&st, t("s3://bench/x")), Ok(()));
+        // Region and anonymous never move the target.
+        let mut r = t("prod");
+        r.region = Some("us-east-1".into());
+        r.anonymous = true;
+        assert_eq!(check(&st, r), Ok(()));
+        let refused = Err(ErrorCode::SafetyRefused);
+        let mut e = t("prod");
+        e.endpoint = Some("https://evil.example.com".into());
+        assert_eq!(check(&st, e), refused);
+        let mut o = t("s3://bench/x");
+        o.options.insert("bucket".into(), "other".into());
+        assert_eq!(check(&st, o), refused);
+        let mut o = t("prod");
+        o.options.insert("root".into(), "/elsewhere".into());
+        assert_eq!(check(&st, o), refused);
+        assert_eq!(
+            check(&st, t("s3://bench/x?endpoint=https://evil.example.com")),
+            refused
+        );
+        let mut px = t("prod");
+        px.proxy = Some("http://evil.example.com:3128".into());
+        assert_eq!(check(&st, px), refused);
+        let mut i = t("prod");
+        i.insecure = true;
+        assert_eq!(check(&st, i), refused);
+        assert_eq!(check(&st, t("s3://other/x")), refused);
+        // Without an allowlist every override is the caller's business.
+        let open = allow_state(dir.path(), &[]);
+        let mut e = t("prod");
+        e.endpoint = Some("https://elsewhere.example.com".into());
+        assert_eq!(check(&open, e), Ok(()));
+        // probe_endpoint: no proxy/insecure overrides under an allowlist.
+        let probe = ProbeIn {
+            endpoint: "s3://bench/x".into(),
+            proxy: Some("http://p:1".into()),
+            ..Default::default()
+        };
+        assert!(check_probe(&st.cfg, &probe).is_err());
     }
 
     #[test]

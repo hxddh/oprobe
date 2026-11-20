@@ -735,7 +735,13 @@ impl Store {
             return;
         }
         let title = req.profile.target.display();
-        let job = Job::tune(req.profile, req.target_name, opts, Some(self.run_store()));
+        let job = Job::tune(
+            req.profile,
+            req.target_name,
+            opts,
+            req.budgets,
+            Some(self.run_store()),
+        );
         self.tuned.set(None);
         self.begin(job, JobKind::Tune, title, 0.0);
         self.mode.set(Mode::Tune);
@@ -1018,15 +1024,13 @@ impl Store {
         self.comparison.set(None);
         spawn(async move {
             let res = off_thread(move || {
-                let load = |id: &str| -> anyhow::Result<RunView> {
+                let load = |id: &str| -> anyhow::Result<(crate::model::Run, std::path::PathBuf)> {
                     let path = store.resolve(id)?;
-                    Ok(RunView::new(
-                        crate::store::read_run_file(&path)?,
-                        Some(path),
-                    ))
+                    Ok((crate::store::read_run_file(&path)?, path))
                 };
-                let (va, vb) = (load(&a)?, load(&b)?);
-                let c = compare(&va.run.report, &vb.run.report);
+                let ((ra, pa), (rb, pb)) = (load(&a)?, load(&b)?);
+                let c = compare(&ra, &rb);
+                let (va, vb) = (RunView::new(ra, Some(pa)), RunView::new(rb, Some(pb)));
                 anyhow::Ok((va, vb, c))
             })
             .await;

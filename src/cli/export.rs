@@ -23,6 +23,9 @@ pub struct ExportOutput {
     pub path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+    /// Files written (OTLP `--signal all`: one document per signal).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<String>,
     pub bytes: u64,
     pub ops_count: u64,
     pub requests_count: u64,
@@ -30,6 +33,15 @@ pub struct ExportOutput {
 
 impl CommandOutput for ExportOutput {
     fn text(&self) -> String {
+        if !self.files.is_empty() {
+            return format!(
+                "exported run {} as {} to {} ({} bytes)\n",
+                self.run_id,
+                self.format,
+                self.files.join(", "),
+                self.bytes
+            );
+        }
         match (&self.path, &self.endpoint) {
             (Some(p), _) => format!(
                 "exported run {} as {} to {p} ({} bytes)\n",
@@ -44,7 +56,16 @@ impl CommandOutput for ExportOutput {
     }
 }
 
-/// Render `run` in `format` (OTLP: traces, metrics or both as one JSON array).
+/// One OTLP/JSON document (`ExportTraceServiceRequest` / `ExportMetricsServiceRequest`).
+fn otlp(run: &Run, signal: &str) -> serde_json::Value {
+    if signal == "metrics" {
+        export::otlp::metrics(run)
+    } else {
+        export::otlp::traces(run)
+    }
+}
+
+/// Render `run` in `format` (OTLP: the one selected signal).
 fn render(run: &Run, a: &ExportArgs) -> Result<String> {
     Ok(match a.format {
         ExportFormat::Json => serde_json::to_string_pretty(run)? + "\n",
@@ -62,12 +83,15 @@ fn render(run: &Run, a: &ExportArgs) -> Result<String> {
         },
         ExportFormat::Har => serde_json::to_string_pretty(&export::har::har(run))? + "\n",
         ExportFormat::Otlp => {
-            let v = match a.signal.as_str() {
-                "traces" => export::otlp::traces(run),
-                "metrics" => export::otlp::metrics(run),
-                _ => serde_json::json!([export::otlp::traces(run), export::otlp::metrics(run)]),
+            let [signal] = a.signal.signals() else {
+                return Err(OprobeError::new(
+                    ErrorCode::UsageInvalidArgument,
+                    "--signal all writes one OTLP document per signal: pass --out DIR (or --endpoint URL)",
+                )
+                .with_hint("or pick one: --signal traces | --signal metrics")
+                .into());
             };
-            serde_json::to_string(&v)? + "\n"
+            serde_json::to_string(&otlp(run, signal))? + "\n"
         }
         ExportFormat::Md => crate::report::markdown::render(run),
         ExportFormat::Html => crate::report::html::render(run),
@@ -81,6 +105,7 @@ pub async fn cmd_export(a: ExportArgs, ctx: &Ctx) -> Result<u8> {
         format: format!("{:?}", a.format).to_ascii_lowercase(),
         path: None,
         endpoint: None,
+        files: Vec::new(),
         bytes: 0,
         ops_count: run.ops.len() as u64,
         requests_count: run.reqs.len() as u64,
@@ -94,15 +119,8 @@ pub async fn cmd_export(a: ExportArgs, ctx: &Ctx) -> Result<u8> {
             .into());
         }
         let mut bytes = 0;
-        for signal in ["traces", "metrics"] {
-            if a.signal != "all" && a.signal != signal {
-                continue;
-            }
-            let body = if signal == "traces" {
-                export::otlp::traces(&run)
-            } else {
-                export::otlp::metrics(&run)
-            };
+        for signal in a.signal.signals() {
+            let body = otlp(&run, signal);
             bytes += serde_json::to_vec(&body)?.len() as u64;
             export::otlp::push(ep, signal, &body)
                 .await
@@ -110,6 +128,33 @@ pub async fn cmd_export(a: ExportArgs, ctx: &Ctx) -> Result<u8> {
         }
         return ctx.out.finish(&ExportOutput {
             endpoint: Some(ep.clone()),
+            bytes,
+            ..base()
+        });
+    }
+    if matches!(a.format, ExportFormat::Otlp)
+        && a.signal == super::args::OtlpSignal::All
+        && let Some(dir) = &a.out
+    {
+        // One valid OTLP document per signal, in the directory `--out` names.
+        std::fs::create_dir_all(dir).map_err(|e| {
+            OprobeError::new(
+                ErrorCode::UsageInvalidArgument,
+                format!("cannot create --out directory `{}`: {e}", dir.display()),
+            )
+        })?;
+        let mut files = Vec::new();
+        let mut bytes = 0;
+        for signal in a.signal.signals() {
+            let text = serde_json::to_string(&otlp(&run, signal))? + "\n";
+            let p = dir.join(format!("{}.{signal}.otlp.json", run.id()));
+            crate::report::write_file(&p, &text)?;
+            bytes += text.len() as u64;
+            files.push(p.display().to_string());
+        }
+        return ctx.out.finish(&ExportOutput {
+            path: Some(dir.display().to_string()),
+            files,
             bytes,
             ..base()
         });

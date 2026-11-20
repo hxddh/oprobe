@@ -82,7 +82,8 @@ serves Streamable HTTP at `http://127.0.0.1:8765/mcp`.
 | (default) | read-only: runs that would upload a dataset or write are refused with `safety.read_only` (`memory://` and `existing` runs are allowed); `doctor` skips its write probe; `cleanup` is a dry run |
 | `--allow-write` | enable runs that write test data, `start_tune`, `cleanup` with `confirm` |
 | `--max-cost-usd`, `--max-requests`, `--max-bytes`, `--max-duration` | budgets applied to every run the server starts (a call can only lower them) |
-| `--allow-target NAME\|URL-PREFIX` | only these targets (repeatable; prefixes match at `/` boundaries) |
+| `--allow-target NAME\|URL-PREFIX` | only these targets (repeatable; prefixes match at `/` boundaries). A call may set `region` and `anonymous`, but `endpoint`, `options`, `proxy`, `insecure` or URL query parameters that change the scheme, host, bucket, root, TLS trust or proxy of the allowed target are refused with `safety.refused` |
+| `--http-allow-remote` | allow `--http` on a non-loopback address (refused otherwise: the HTTP transport has no authentication) |
 | `--max-concurrent-runs N` | runs executing at once (others queue; default 1) |
 
 ### Tools
@@ -155,7 +156,9 @@ VS Code (`.vscode/mcp.json`):
 
 Streamable HTTP (any client): start `oprobe mcp --http 127.0.0.1:8765` and point the client at
 `http://127.0.0.1:8765/mcp`. Only loopback `Host` headers are accepted unless you bind another
-address.
+address. The HTTP transport has no authentication, so `--http` refuses non-loopback addresses
+(`0.0.0.0:8765`, a LAN IP) unless you also pass `--http-allow-remote`, which prints a warning;
+prefer a loopback bind behind an authenticating tunnel or proxy.
 
 Credentials come from the server's environment (the usual provider chains, `AWS_PROFILE`, …) or
 from configured targets (`oprobe target add`); never pass secrets as tool arguments.

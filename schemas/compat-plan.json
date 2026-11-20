@@ -1,0 +1,84 @@
+{
+  "$defs": {
+    "Budgets": {
+      "description": "Limits for one command.",
+      "properties": {
+        "max_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_cost_usd": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "max_duration_s": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "max_requests_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    }
+  },
+  "$id": "https://github.com/hxddh/oprobe/schemas/3/compat-plan.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Result of `oprobe compat --dry-run`",
+  "properties": {
+    "budgets": {
+      "$ref": "#/$defs/Budgets"
+    },
+    "estimated_bytes": {
+      "description": "Upper bound of the bytes uploaded (multipart checks write 3 parts of the minimum size).",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "estimated_cost_usd": {
+      "format": "double",
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "estimated_requests_count": {
+      "description": "Upper bound of the requests the suite sends.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "run_prefix": {
+      "description": "Prefix the suite writes under (`oprobe-run-<id>/`; `oprobe cleanup` sweeps it).",
+      "type": "string"
+    },
+    "target": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "target",
+    "run_prefix",
+    "estimated_requests_count",
+    "estimated_bytes",
+    "budgets"
+  ],
+  "title": "oprobe compat-plan",
+  "type": "object",
+  "x-rust-type": "CompatPlan"
+}

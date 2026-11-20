@@ -177,15 +177,6 @@ impl OprobeError {
         self.hint = Some(hint.into());
         self
     }
-
-    /// The `internal` / "not implemented yet" error of commands a later stream implements.
-    pub fn not_implemented(command: &str) -> Self {
-        Self::new(
-            ErrorCode::Internal,
-            format!("`oprobe {command}` is not implemented yet"),
-        )
-        .with_hint("this command lands later in the 3.0 cycle")
-    }
 }
 
 impl fmt::Display for OprobeError {
@@ -240,7 +231,11 @@ pub fn classify(err: &anyhow::Error, scheme: &str) -> ErrorBody {
     for cause in err.chain() {
         if let Some(e) = cause.downcast_ref::<OprobeError>() {
             let mut body = ErrorBody::new(e.code, chain_message(err));
-            body.hint = e.hint.clone().or_else(hint_text);
+            body.hint = e
+                .hint
+                .as_deref()
+                .map(crate::util::strip_url_credentials)
+                .or_else(hint_text);
             return body;
         }
     }
@@ -250,9 +245,10 @@ pub fn classify(err: &anyhow::Error, scheme: &str) -> ErrorBody {
     body
 }
 
-/// The whole chain on one line (`outer: inner: root`).
+/// The whole chain on one line (`outer: inner: root`), with URL credentials (`user:pass@`)
+/// removed: OpenDAL contexts quote endpoints as configured.
 fn chain_message(err: &anyhow::Error) -> String {
-    format!("{err:#}")
+    crate::util::strip_url_credentials(&format!("{err:#}"))
 }
 
 fn typed_code(err: &anyhow::Error) -> Option<ErrorCode> {
@@ -345,6 +341,45 @@ fn message_code(chain: &str) -> ErrorCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn credentials_in_urls_never_reach_error_messages() {
+        let e = anyhow::anyhow!("connect to http://admin:s3cret@minio.local:9000/bucket failed")
+            .context("cannot open the target");
+        let b = classify(&e, "s3");
+        assert!(!b.message.contains("s3cret"), "{}", b.message);
+        assert!(
+            b.message.contains("http://minio.local:9000/bucket"),
+            "{}",
+            b.message
+        );
+        let e: anyhow::Error = OprobeError::new(ErrorCode::NetUnreachable, "x")
+            .with_hint("check https://u:p@proxy.example.com")
+            .into();
+        assert!(!classify(&e, "s3").hint.unwrap().contains("u:p@"));
+    }
+
+    #[test]
+    fn every_code_has_its_docs_anchor() {
+        let doc = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/troubleshooting.md"),
+        )
+        .unwrap();
+        for c in ErrorCode::ALL {
+            let url = c.docs();
+            let (page, anchor) = url.rsplit_once('#').unwrap();
+            assert!(page.ends_with("docs/troubleshooting.md"), "{url}");
+            assert!(
+                doc.contains(&format!("<a id=\"{anchor}\"></a>")),
+                "docs/troubleshooting.md has no anchor `{anchor}` for {c}"
+            );
+            assert!(
+                doc.contains(&format!("### `{c}` (exit {}", c.exit_code())),
+                "docs/troubleshooting.md: no section for {c} with exit {}",
+                c.exit_code()
+            );
+        }
+    }
 
     #[test]
     fn codes_round_trip_and_map_to_exit_codes() {

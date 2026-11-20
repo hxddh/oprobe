@@ -104,3 +104,17 @@ The **verdict** sums a run up: `ok`, `review` (worth a look), `attention` (warni
 
 With `-o json` or `-o ndjson`, errors are printed on stdout as `{"type":"error","error":{"code":…}}`
 with a stable dotted code such as `auth.denied` or `net.timeout`.
+
+## Safety rails
+
+Every command that sends requests (`run`, `demo`, `tune`, `matrix`, `watch`, `compat`, the app and
+MCP runs) goes through the same rails:
+
+- `--dry-run` prints the plan (requests, bytes, objects written/deleted, cost, ETA) and exits;
+- `--read-only` refuses writes and deletes (exit 5); `--existing PREFIX` implies it;
+- writes stay under `oprobe-run-<id>/` (or the prefix `--idempotency-key` names), which
+  `oprobe cleanup` sweeps;
+- budgets (`--max-cost-usd`, `--max-requests`, `--max-bytes`, `--max-duration`, defaults under
+  `[defaults.budgets]` in the config file) stop the command with exit 4. A budget covers the whole
+  command: all runs of `run --repeat N`, all cells of `matrix`, all windows of `watch`, all trials
+  of `tune`. `tune --budget 10m` additionally caps the number of trials so the tuner's estimate fits.

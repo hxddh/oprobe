@@ -136,7 +136,13 @@ impl RunForm {
         }
         let profile = crate::cli::build_profile(&t, &w, &k, &CostArgs::default())
             .map_err(|e| format!("{e:#}"))?;
+        let mut budgets = crate::guard::Budgets::default();
+        cfg.defaults
+            .budgets
+            .apply(&mut budgets)
+            .map_err(|e| format!("{e:#}"))?;
         Ok(RunRequest {
+            budgets,
             profile,
             target_name,
             display,

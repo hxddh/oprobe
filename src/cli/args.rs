@@ -658,6 +658,10 @@ pub struct TuneArgs {
     /// Pause after a throttled trial
     #[arg(long, default_value = tune_defaults::COOLDOWN, help_heading = "Tuning")]
     pub cooldown: String,
+    /// Total wall-time budget of the tuner, e.g. 5m: caps the trials so the estimate fits
+    /// (add --max-duration for a hard stop)
+    #[arg(long, value_name = "DURATION", help_heading = "Tuning")]
+    pub budget: Option<String>,
     /// Write the tuned profile (TOML)
     #[arg(long, value_name = "FILE", help_heading = "Tuning")]
     pub emit_profile: Option<PathBuf>,
@@ -767,9 +771,9 @@ pub struct TopArgs {
 pub struct CompatArgs {
     #[command(flatten)]
     pub target: TargetArgs,
-    /// Refuse to run (compat writes test objects); for symmetry with other commands
-    #[arg(long)]
-    pub read_only: bool,
+    /// `--read-only` refuses (compat writes test objects); budgets stop the suite (exit 4)
+    #[command(flatten)]
+    pub safety: SafetyArgs,
     /// Exit 3 when the score (percent of the checks that ran) is below this
     #[arg(long, value_name = "PCT")]
     pub min_score: Option<f64>,
@@ -921,6 +925,10 @@ pub struct McpArgs {
     /// Serve MCP over Streamable HTTP on this address (e.g. 127.0.0.1:8765) instead of stdio
     #[arg(long, value_name = "ADDR")]
     pub http: Option<String>,
+    /// Allow --http on a non-loopback address (anyone who can reach it can use the tools and
+    /// the configured credentials; there is no authentication)
+    #[arg(long, requires = "http")]
+    pub http_allow_remote: bool,
     /// Enable tools that write test data (runs that upload a dataset, tune, cleanup)
     #[arg(long)]
     pub allow_write: bool,
@@ -1014,9 +1022,30 @@ pub struct ExportArgs {
     /// CSV rows: requests or ops
     #[arg(long, default_value = "requests")]
     pub table: String,
-    /// OTLP signal: traces, metrics or all
-    #[arg(long, default_value = "all")]
-    pub signal: String,
+    /// OTLP signal: one OTLP/JSON document per signal; `all` needs --out DIR (two files) or
+    /// --endpoint (posts /v1/traces and /v1/metrics)
+    #[arg(long, value_enum, default_value_t = OtlpSignal::Traces)]
+    pub signal: OtlpSignal,
+}
+
+/// `runs export --format otlp --signal`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub enum OtlpSignal {
+    #[default]
+    Traces,
+    Metrics,
+    All,
+}
+
+impl OtlpSignal {
+    /// The OTLP signals this selects (`traces`, `metrics`).
+    pub fn signals(self) -> &'static [&'static str] {
+        match self {
+            Self::Traces => &["traces"],
+            Self::Metrics => &["metrics"],
+            Self::All => &["traces", "metrics"],
+        }
+    }
 }
 
 #[derive(Args, Debug)]

@@ -282,7 +282,14 @@ impl Dataset {
             }
         }
         if objects.is_empty() {
-            bail!("no non-empty objects found under `{prefix}` (workload.dataset.existing_prefix)");
+            return Err(crate::errors::OprobeError::new(
+                crate::errors::ErrorCode::StorageNotFound,
+                format!("no non-empty objects found under `{prefix}` (--existing / workload.dataset.existing_prefix)"),
+            )
+            .with_hint(
+                "check the prefix is relative to the target's root and holds objects (e.g. list it with your storage CLI), or drop --existing to let oprobe upload a dataset",
+            )
+            .into());
         }
         let mut partitions: Vec<String> = parts.into_iter().take(64).collect();
         if partitions.is_empty() {

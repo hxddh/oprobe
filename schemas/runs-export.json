@@ -14,6 +14,13 @@
         "null"
       ]
     },
+    "files": {
+      "description": "Files written (OTLP `--signal all`: one document per signal).",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
     "format": {
       "type": "string"
     },

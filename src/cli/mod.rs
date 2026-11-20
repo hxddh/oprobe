@@ -116,6 +116,7 @@ pub async fn main(cli: Cli) -> ExitCode {
     let scheme_hint = scheme_of(&command);
     let code = match dispatch(command, &ctx).await {
         Ok(code) => code,
+        Err(err) if crate::output::is_broken_pipe(&err) => crate::output::EXIT_BROKEN_PIPE,
         Err(err) => {
             let mut body = crate::errors::classify(&err, &scheme_hint);
             if INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst)
@@ -168,6 +169,77 @@ where
         .filter(|(i, a)| *i == 0 || !a.to_string_lossy().starts_with("-psn_"))
         .map(|(_, a)| a)
         .collect()
+}
+
+/// Parse the command line. Help and `--version` behave as clap's (exit 0); an argument error
+/// is a `usage.invalid_argument` error (exit 2): JSON on stdout when `-o json|ndjson` (or
+/// `OPROBE_OUTPUT`) asks for machine output, clap's text on stderr otherwise.
+pub fn parse_cli(args: Vec<std::ffi::OsString>) -> std::result::Result<Cli, ExitCode> {
+    use clap::Parser;
+    use clap::error::ErrorKind;
+    let e = match Cli::try_parse_from(&args) {
+        Ok(cli) => return Ok(cli),
+        Err(e) => e,
+    };
+    let machine = machine_output(&args);
+    if matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) || machine.is_none() {
+        let _ = e.print();
+        return Err(ExitCode::from(e.exit_code().clamp(0, 255) as u8));
+    }
+    let rendered = e.render().to_string();
+    let message = rendered
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("invalid arguments")
+        .trim_start_matches("error:")
+        .trim()
+        .to_owned();
+    let usage = rendered
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("Usage:"))
+        .map(|u| u.trim().to_owned());
+    let hint = match usage {
+        Some(u) => format!("usage: {u} (see `--help`)"),
+        None => "see `oprobe --help`".to_owned(),
+    };
+    let err: anyhow::Error = OprobeError::new(ErrorCode::UsageInvalidArgument, message)
+        .with_hint(hint)
+        .into();
+    let body = crate::errors::classify(&err, "s3");
+    let out = Output::new(machine.unwrap_or_default(), true, true);
+    Err(ExitCode::from(out.error(&body)))
+}
+
+/// `-o json|ndjson` on the raw command line, else `OPROBE_OUTPUT`, when it is a machine format.
+fn machine_output(args: &[std::ffi::OsString]) -> Option<OutputFormat> {
+    let args: Vec<String> = args
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    let mut given = None;
+    let mut i = 1;
+    while i < args.len() {
+        let a = &args[i];
+        if a == "--" {
+            break;
+        }
+        if a == "-o" || a == "--output" {
+            given = args.get(i + 1).cloned();
+            i += 1;
+        } else if let Some(v) = a.strip_prefix("--output=") {
+            given = Some(v.to_owned());
+        } else if let Some(v) = a.strip_prefix("-o").filter(|v| !v.is_empty()) {
+            given = Some(v.trim_start_matches('=').to_owned());
+        }
+        i += 1;
+    }
+    let f = match given {
+        Some(v) => OutputFormat::parse(&v),
+        None => std::env::var("OPROBE_OUTPUT")
+            .ok()
+            .and_then(|v| OutputFormat::parse(&v)),
+    }?;
+    f.is_machine().then_some(f)
 }
 
 /// Exit code when the environment cannot run the requested interface (no terminal, no display).
@@ -486,6 +558,11 @@ pub fn resolve_profile(
         apply_defaults(&mut w, &mut k, cfg);
     }
     Ok((build_profile(&t, &w, &k, c)?, name))
+}
+
+/// Budgets of the safety flags, unset ones from `[defaults.budgets]`.
+pub fn safety_budgets(ctx: &Ctx, s: &SafetyArgs) -> Result<crate::guard::Budgets> {
+    run::budgets(ctx, s)
 }
 
 /// Trace rows kept per run: `$OPROBE_MAX_REQUESTS` > `[defaults] max_requests` > built-in.

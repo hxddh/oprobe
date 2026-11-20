@@ -2,6 +2,7 @@
 
 pub mod cleanup;
 pub mod dataset;
+pub mod measure;
 pub mod operator;
 pub mod ops;
 pub mod procstat;

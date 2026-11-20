@@ -425,15 +425,22 @@ pub fn metrics(run: &Run) -> Value {
     })
 }
 
+/// The OTLP/HTTP URL of `signal` at `endpoint` (a base URL, or one already ending in
+/// `/v1/traces` or `/v1/metrics`, which is replaced).
+pub fn signal_url(endpoint: &str, signal: &str) -> String {
+    let mut base = endpoint.trim_end_matches('/');
+    for s in ["/v1/traces", "/v1/metrics"] {
+        if let Some(b) = base.strip_suffix(s) {
+            base = b;
+        }
+    }
+    format!("{base}/v1/{signal}")
+}
+
 /// POST an OTLP/JSON body to `endpoint` (a collector base URL such as
 /// `http://localhost:4318`; `/v1/traces` or `/v1/metrics` is appended unless present).
 pub async fn push(endpoint: &str, signal: &str, body: &Value) -> anyhow::Result<()> {
-    let base = endpoint.trim_end_matches('/');
-    let url = if base.ends_with(&format!("/v1/{signal}")) {
-        base.to_owned()
-    } else {
-        format!("{base}/v1/{signal}")
-    };
+    let url = signal_url(endpoint, signal);
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()?;
@@ -458,6 +465,19 @@ pub async fn push(endpoint: &str, signal: &str, body: &Value) -> anyhow::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn each_signal_posts_to_its_own_path() {
+        for ep in [
+            "http://c:4318",
+            "http://c:4318/",
+            "http://c:4318/v1/traces",
+            "http://c:4318/v1/metrics",
+        ] {
+            assert_eq!(signal_url(ep, "traces"), "http://c:4318/v1/traces");
+            assert_eq!(signal_url(ep, "metrics"), "http://c:4318/v1/metrics");
+        }
+    }
     use crate::analysis::simulate::tests::straggler_run;
 
     #[test]

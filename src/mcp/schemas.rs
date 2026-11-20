@@ -156,6 +156,24 @@ pub fn entries() -> Vec<Entry> {
             "Result of `oprobe matrix`"
         ),
         entry!(
+            "matrix-plan",
+            Output,
+            cli::matrix::MatrixPlanOutput,
+            "Result of `oprobe matrix --dry-run`"
+        ),
+        entry!(
+            "compat",
+            Output,
+            crate::compat::command::CompatOutput,
+            "Result of `oprobe compat`"
+        ),
+        entry!(
+            "compat-plan",
+            Output,
+            crate::compat::command::CompatPlan,
+            "Result of `oprobe compat --dry-run`"
+        ),
+        entry!(
             "runs-export",
             Output,
             cli::export::ExportOutput,

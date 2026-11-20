@@ -16,7 +16,7 @@ use serde::Serialize;
 use super::Ctx;
 use super::args::WatchArgs;
 use crate::analysis::stats::quantile_us_ms;
-use crate::engine::{Cancel, RunOptions, Session, SessionOptions};
+use crate::engine::{Cancel, RunOptions};
 use crate::errors::{ErrorCode, OprobeError, exit};
 use crate::events::{EventKind, LogLevel};
 use crate::export::prometheus::Registry;
@@ -289,7 +289,23 @@ pub async fn cmd_watch(a: WatchArgs, ctx: &Ctx) -> Result<u8> {
     if a.target.target.is_none() && target_name.is_none() && profile.target.url.is_none() {
         return Err(bad("watch needs a target".into()));
     }
-    let rails = super::run::rails(&profile, &a.safety)?;
+    let rails = super::run::rails(ctx, &profile, &a.safety)?;
+    if a.safety.dry_run {
+        // The plan of every window (one window when it runs until Ctrl-C).
+        let mut p = profile.clone();
+        let windows = a.count.unwrap_or(1).max(1);
+        p.workload.duration = crate::util::HumanDuration(window * windows as u32);
+        p.workload.warmup = crate::util::HumanDuration(Duration::ZERO);
+        let mut plan = rails.plan(&p);
+        plan.assumptions.push(match a.count {
+            Some(n) => format!("{n} windows of {window:?} every {}", a.interval),
+            None => format!(
+                "one window of {window:?}; watch repeats it every {} until Ctrl-C (budgets cap the total)",
+                a.interval
+            ),
+        });
+        return ctx.out.finish(&super::run::PlanOutput { plan });
+    }
     let guard = super::run::guard_for(ctx, &profile, &rails.budgets);
     let cancel = Cancel::new();
     super::install_ctrl_c(cancel.clone());
@@ -313,16 +329,13 @@ pub async fn cmd_watch(a: WatchArgs, ctx: &Ctx) -> Result<u8> {
         a.window
     ));
     let quiet: crate::engine::ProgressFn = Arc::new(|_| {});
-    let session = Session::open_with(
+    let session = crate::engine::measure::open(
         profile,
+        &rails,
+        guard,
+        super::trace_max_requests(ctx),
         cancel.clone(),
         quiet,
-        SessionOptions {
-            run_prefix: Some(rails.run_prefix.clone()),
-            guard,
-            trace_max_requests: super::trace_max_requests(ctx),
-            preflight: true,
-        },
     )
     .await?;
     let knobs = session.profile.knobs.clone();

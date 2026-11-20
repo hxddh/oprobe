@@ -1,9 +1,11 @@
 use std::process::ExitCode;
 
-use clap::Parser;
-
 fn main() -> ExitCode {
-    let cli = oprobe::cli::Cli::parse_from(oprobe::cli::launch_args(std::env::args_os()));
+    oprobe::output::quiet_broken_pipes();
+    let cli = match oprobe::cli::parse_cli(oprobe::cli::launch_args(std::env::args_os())) {
+        Ok(cli) => cli,
+        Err(code) => return code,
+    };
     if let Some(code) = oprobe::cli::ui_entry(&cli) {
         return code;
     }

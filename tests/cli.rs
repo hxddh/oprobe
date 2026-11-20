@@ -174,9 +174,76 @@ fn markdown_and_html_outputs() {
     assert!(o.status.success(), "{}", stderr(&o));
     assert!(stdout(&o).contains("## oprobe report"), "{}", stdout(&o));
     assert!(env.runs().is_empty(), "--no-save");
+    // A command without an HTML renderer: a usage error naming the formats it has.
     let o = env.run(&["runs", "list", "-o", "html"]);
-    assert_eq!(o.status.code(), Some(1));
-    assert!(stderr(&o).contains("not implemented yet"), "{}", stderr(&o));
+    assert_eq!(o.status.code(), Some(2));
+    assert!(stderr(&o).contains("no HTML output"), "{}", stderr(&o));
+    assert!(stderr(&o).contains("-o md"), "{}", stderr(&o));
+    assert!(!stderr(&o).contains("not implemented"), "{}", stderr(&o));
+}
+
+#[test]
+fn runs_open_without_a_window_points_to_the_terminal_workbench() {
+    let env = Env::new();
+    assert!(run_small(&env, &["-q"]).status.success());
+    // Not a terminal here: no fallback to start, the hint names it.
+    let o = env
+        .cmd()
+        .env_remove("DISPLAY")
+        .env_remove("WAYLAND_DISPLAY")
+        .args(["runs", "open", "last", "-o", "json"])
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(2), "{}", stdout(&o));
+    assert!(
+        json(&o)["error"]["hint"]
+            .as_str()
+            .unwrap()
+            .contains("oprobe top --open")
+    );
+}
+
+#[test]
+fn an_empty_existing_prefix_is_not_found() {
+    let env = Env::new();
+    let dir = env.dir.path().join("bucket");
+    std::fs::create_dir_all(dir.join("empty")).unwrap();
+    let url = format!("fs://{}", dir.display());
+    let o = env.run(&[
+        "run",
+        &url,
+        "--existing",
+        "empty/",
+        "-d",
+        "200ms",
+        "--no-save",
+        "-o",
+        "json",
+    ]);
+    assert_eq!(o.status.code(), Some(1), "{}", stdout(&o));
+    assert_eq!(error_code(&o), "storage.not_found");
+    assert!(json(&o)["error"]["hint"].is_string());
+}
+
+#[test]
+fn a_closed_stdout_ends_quietly() {
+    use std::io::Read;
+    let env = Env::new();
+    // Larger than a pipe buffer: the writer hits the closed pipe.
+    let mut child = env
+        .cmd()
+        .args(["schema", "report"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut first = [0u8; 16];
+    child.stdout.take().unwrap().read_exact(&mut first).unwrap();
+    let o = child.wait_with_output().unwrap();
+    let code = o.status.code();
+    assert!(matches!(code, Some(0) | Some(141)), "{code:?}");
+    assert!(!stderr(&o).contains("panicked"), "{}", stderr(&o));
+    assert!(!stderr(&o).contains("error"), "{}", stderr(&o));
 }
 
 #[test]
@@ -231,6 +298,44 @@ fn errors_are_classified_with_exit_codes() {
 }
 
 #[test]
+fn argument_errors_follow_the_output_mode() {
+    let env = Env::new();
+    // json: the error document on stdout, exit 2.
+    let o = env.run(&["run", "x", "--bogus", "-o", "json"]);
+    assert_eq!(o.status.code(), Some(2));
+    assert_eq!(error_code(&o), "usage.invalid_argument");
+    assert!(
+        json(&o)["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("--bogus")
+    );
+    // ndjson (also through OPROBE_OUTPUT): version line, then the error event.
+    let o = env
+        .cmd()
+        .env("OPROBE_OUTPUT", "ndjson")
+        .args(["run", "--bogus"])
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(2));
+    let lines: Vec<serde_json::Value> = stdout(&o)
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(lines[0]["type"], "version");
+    assert_eq!(lines[1]["error"]["code"], "usage.invalid_argument");
+    // text: clap's message on stderr; help and version still exit 0.
+    let o = env.run(&["run", "x", "--bogus"]);
+    assert_eq!(o.status.code(), Some(2));
+    assert!(stdout(&o).is_empty() && stderr(&o).contains("--bogus"));
+    for args in [&["--help", "-o", "json"][..], &["--version"][..]] {
+        let o = env.run(args);
+        assert_eq!(o.status.code(), Some(0), "{args:?}");
+        assert!(!stdout(&o).is_empty());
+    }
+}
+
+#[test]
 fn read_only_refuses_runs_that_write() {
     let env = Env::new();
     let o = env
@@ -275,6 +380,89 @@ fn budgets_stop_the_run_with_exit_4() {
     assert_eq!(o.status.code(), Some(4), "{}", stderr(&o));
     assert!(error_code(&o).contains("budget"));
     assert!(t.elapsed().as_secs() < 20);
+}
+
+#[test]
+fn budgets_cover_the_whole_command() {
+    let env = Env::new();
+    // Each run alone fits the 1 s budget; three of them do not.
+    let mut args: Vec<String> = ["run", "memory://", "-d", "600ms", "--repeat", "3"]
+        .iter()
+        .chain(SMALL)
+        .map(|s| s.to_string())
+        .collect();
+    args.extend(["--max-duration", "1s", "-o", "json"].map(String::from));
+    let o = env.cmd().args(&args).output().unwrap();
+    assert_eq!(o.status.code(), Some(4), "{}", stderr(&o));
+    assert_eq!(error_code(&o), "safety.budget_exceeded");
+    assert!(env.runs().len() < 3, "the budget stopped the group");
+}
+
+#[test]
+fn every_measuring_command_honours_dry_run() {
+    let env = Env::new();
+    // watch: the plan of its windows, nothing measured.
+    let o = env.run(&[
+        "watch",
+        "memory://",
+        "--count",
+        "3",
+        "--dry-run",
+        "-o",
+        "json",
+    ]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let v = json(&o);
+    assert!(v["plan"]["estimated_requests_count"].is_u64(), "{v:#}");
+    // matrix: a typed document, one plan per cell.
+    let o = env.run(&[
+        "matrix",
+        "memory://",
+        "--vary",
+        "concurrency=2,4",
+        "--dry-run",
+        "-o",
+        "json",
+    ]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let v = json(&o);
+    assert_eq!(v["cells"].as_array().unwrap().len(), 2, "{v:#}");
+    assert!(v["cells"][1]["plan"]["concurrency_count"] == 4, "{v:#}");
+    assert!(v["estimated_requests_count"].is_u64());
+    // compat: the plan under the standard run prefix.
+    let o = env.run(&["compat", "memory://", "--dry-run", "-o", "json"]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert!(
+        json(&o)["run_prefix"]
+            .as_str()
+            .unwrap()
+            .starts_with("oprobe-run-")
+    );
+    // tune --budget: the trials are capped to fit, or refused when two do not fit.
+    let o = env.run(&[
+        "tune",
+        "memory://",
+        "--budget",
+        "1h",
+        "--max-trials",
+        "5",
+        "--dry-run",
+        "-o",
+        "json",
+    ]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let o = env.run(&[
+        "tune",
+        "memory://",
+        "--budget",
+        "5s",
+        "--dry-run",
+        "-o",
+        "json",
+    ]);
+    assert_eq!(o.status.code(), Some(2));
+    assert_eq!(error_code(&o), "usage.invalid_argument");
+    assert!(env.runs().is_empty(), "dry runs save nothing");
 }
 
 #[test]

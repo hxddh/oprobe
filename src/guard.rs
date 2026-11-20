@@ -6,7 +6,7 @@
 //! first breach cancels the run, and the command fails with `safety.budget_exceeded` (exit 4).
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use schemars::JsonSchema;
@@ -88,7 +88,8 @@ pub struct Guard {
     bytes: AtomicU64,
     breach: Mutex<Option<BudgetBreach>>,
     tripped: std::sync::atomic::AtomicBool,
-    cancel: OnceLock<Cancel>,
+    /// The measurement currently enforced (re-armed by each session sharing this guard).
+    cancel: Mutex<Option<Cancel>>,
 }
 
 impl Guard {
@@ -101,7 +102,7 @@ impl Guard {
             bytes: AtomicU64::new(0),
             breach: Mutex::new(None),
             tripped: std::sync::atomic::AtomicBool::new(false),
-            cancel: OnceLock::new(),
+            cancel: Mutex::new(None),
         })
     }
 
@@ -116,9 +117,14 @@ impl Guard {
         &self.budgets
     }
 
-    /// Cancel `cancel` when a budget is exceeded.
+    /// Cancel `cancel` when a budget is exceeded. A guard shared by several measurements
+    /// (one aggregate budget for `run --repeat`, `matrix`) is re-armed by each of them; a
+    /// guard that has already tripped cancels at once.
     pub fn arm(&self, cancel: Cancel) {
-        let _ = self.cancel.set(cancel);
+        if self.tripped() {
+            cancel.cancel();
+        }
+        *self.cancel.lock().unwrap_or_else(|e| e.into_inner()) = Some(cancel);
     }
 
     /// Account requests and bytes (hot path: two atomic adds and a few compares).
@@ -165,7 +171,12 @@ impl Guard {
             limit,
             observed,
         });
-        if let Some(c) = self.cancel.get() {
+        if let Some(c) = self
+            .cancel
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
             c.cancel();
         }
     }
@@ -485,6 +496,29 @@ mod tests {
         assert_eq!(
             crate::errors::classify(&e, "s3").code,
             ErrorCode::SafetyBudgetExceeded
+        );
+    }
+
+    #[test]
+    fn a_shared_guard_aggregates_and_rearms() {
+        let g = Guard::new(Budgets {
+            max_requests_count: Some(10),
+            ..Default::default()
+        });
+        let first = Cancel::new();
+        g.arm(first.clone());
+        g.add(6, 0);
+        let second = Cancel::new();
+        g.arm(second.clone());
+        g.add(6, 0);
+        assert!(g.tripped(), "12 requests over two measurements exceed 10");
+        assert!(second.is_cancelled());
+        assert!(!first.is_cancelled());
+        let third = Cancel::new();
+        g.arm(third.clone());
+        assert!(
+            third.is_cancelled(),
+            "a spent budget stops the next measurement"
         );
     }
 
