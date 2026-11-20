@@ -18,6 +18,7 @@ use http_body::{Body, Frame, SizeHint};
 use hyper::body::Incoming;
 use hyper::client::conn::{http1, http2};
 use hyper_util::rt::{TokioExecutor, TokioIo};
+use opendal_core::raw::ServiceOperation;
 use opendal_core::{Buffer, Error, ErrorKind, HttpBody, HttpRedirect, HttpTransport, Result};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -25,12 +26,13 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use super::dial::{ConnClock, DialTiming, Dialer};
 use super::proxy::ProxyConfig;
 use super::tls::{TlsClientOptions, build_tls_connector};
-use crate::trace::{
-    InflightGuard, OpScope, Protocol, Recorder, RequestRecord, RequestTiming, classify_http,
-};
+use crate::model::TlsRow;
+use crate::trace::{InflightGuard, OpScope, Protocol, Recorder, RequestRecord, RequestTiming};
 
 /// HTTP protocol preference.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum HttpVersion {
     /// Negotiate via ALPN (h2 preferred for https), HTTP/1.1 for plain http.
@@ -46,14 +48,21 @@ pub enum HttpVersion {
 pub struct TransportConfig {
     pub http: HttpVersion,
     pub keep_alive: bool,
+    /// Microscope pool only: the fidelity transport keeps reqwest's (= OpenDAL's) defaults —
+    /// unlimited idle connections per host, 90 s idle timeout, no connect timeout.
     pub max_idle_per_host: usize,
+    /// Microscope pool only (see `max_idle_per_host`).
     pub idle_timeout: Duration,
+    /// Microscope pool only: bounds each dial phase (see `max_idle_per_host`).
     pub connect_timeout: Duration,
     /// Cap on concurrent in-flight HTTP requests (None = unlimited).
     pub max_inflight: Option<usize>,
     pub tls: TlsClientOptions,
     /// Explicit proxy; `None` = resolve from environment; `Some(None)` = disabled.
     pub proxy: Option<Option<String>>,
+    /// Read the kernel's TCP statistics of the connection at the end of every request
+    /// (`net::tcpinfo`; Linux and macOS).
+    pub tcp_info: bool,
 }
 
 impl Default for TransportConfig {
@@ -67,6 +76,7 @@ impl Default for TransportConfig {
             max_inflight: None,
             tls: TlsClientOptions::default(),
             proxy: None,
+            tcp_info: true,
         }
     }
 }
@@ -225,7 +235,7 @@ impl Inner {
         }
     }
 
-    async fn dial_new(&self, key: &PoolKey) -> std::result::Result<(Checked, DialTiming), Error> {
+    async fn dial_new(&self, key: &PoolKey) -> std::result::Result<(Checked, Dial), Error> {
         let dialer = if key.https {
             &self.https_dialer
         } else {
@@ -235,10 +245,12 @@ impl Inner {
             .dial(key.https, &key.host, key.port)
             .await
             .map_err(|e| {
-                Error::new(ErrorKind::Unexpected, format!("connect: {e}"))
+                // The typed source lets error classification see a connect failure.
+                Error::new(ErrorKind::Unexpected, "connect")
                     .with_operation("oprobe::dial")
                     .with_context("target", format!("{}:{}", key.host, key.port))
                     .set_temporary()
+                    .set_source(e)
             })?;
         let id = self.conn_seq.fetch_add(1, Ordering::Relaxed);
         let use_h2 = match d.alpn.as_deref() {
@@ -288,13 +300,16 @@ impl Inner {
                 clock: d.clock,
             }
         };
-        Ok((checked, d.timing))
+        Ok((
+            checked,
+            Dial {
+                timing: d.timing,
+                tls: d.tls,
+            },
+        ))
     }
 
-    async fn checkout(
-        &self,
-        key: &PoolKey,
-    ) -> std::result::Result<(Checked, Option<DialTiming>), Error> {
+    async fn checkout(&self, key: &PoolKey) -> std::result::Result<(Checked, Option<Dial>), Error> {
         if let Some(c) = self.checkout_pooled(key).await {
             return Ok((c, None));
         }
@@ -345,6 +360,12 @@ impl Inner {
             });
         }
     }
+}
+
+/// A fresh dial: its phases and TLS handshake belong to the request that waited for it.
+struct Dial {
+    timing: DialTiming,
+    tls: Option<TlsRow>,
 }
 
 /// Request body that records when its last byte was handed to the connection.
@@ -409,6 +430,8 @@ struct Pending {
     _permit: Option<OwnedSemaphorePermit>,
     _inflight: InflightGuard,
     h1_return: Option<H1Return>,
+    /// The connection, for its TCP statistics at request end.
+    clock: Option<Arc<ConnClock>>,
 }
 
 impl Pending {
@@ -426,6 +449,11 @@ impl Pending {
         t.total_us = now.saturating_duration_since(self.t_start).as_micros() as u64;
         if error.is_some() && self.record.error.is_none() {
             self.record.error = error;
+        }
+        // After the clock stopped: the query is not part of the request's time. The pooled
+        // connection is still referenced here, so the socket is alive (`net::tcpinfo`).
+        if let Some(sock) = self.clock.as_ref().and_then(|c| c.sock.as_ref()) {
+            self.record.tcp = sock.sample().map(Box::new);
         }
         if complete && let Some((inner, key, id, sender, clock)) = self.h1_return.take() {
             inner.return_h1(key, id, sender, clock);
@@ -569,7 +597,13 @@ impl HttpTransport for TracingTransport {
         let port = uri.port_u16().unwrap_or(if https { 443 } else { 80 });
         let key = PoolKey { https, host, port };
         let method = parts.method.clone();
-        let api = classify_http(&method, uri.path(), uri.query());
+        // The exact API the service named (OpenDAL `ServiceOperation`), else the URL heuristic.
+        let (api, service_op) = crate::trace::Api::resolve(
+            parts.extensions.get::<ServiceOperation>().map(|o| o.0),
+            &method,
+            uri.path(),
+            uri.query(),
+        );
         let bytes_up = body_buf.len() as u64;
 
         let inflight = InflightGuard::start(recorder.clone());
@@ -591,11 +625,16 @@ impl HttpTransport for TracingTransport {
             request_id: None,
             retry_after_ms: None,
             error: None,
+            remote: None,
+            service_op,
+            tls: None,
+            tcp: None,
         };
 
         // A request dropped before its response (timeout layer, tail-cut) still gets a record.
         let mut cancel_guard = super::fidelity::CancelGuard::new(
             api,
+            service_op,
             method.to_string(),
             bytes_up,
             start_offset_us,
@@ -645,14 +684,15 @@ impl HttpTransport for TracingTransport {
             }
         };
         let t_ready = Instant::now();
-        let dial_us = dial.map(|d| d.total_us()).unwrap_or(0);
-        if let Some(d) = dial {
-            record.timing.dns_us = d.dns_us;
-            record.timing.tcp_us = d.tcp_us;
-            record.timing.proxy_us = d.proxy_us;
-            record.timing.tls_us = d.tls_us;
-        }
+        let dial_us = dial.as_ref().map(|d| d.timing.total_us()).unwrap_or(0);
         record.reused = dial.is_none();
+        if let Some(d) = dial {
+            record.timing.dns_us = d.timing.dns_us;
+            record.timing.tcp_us = d.timing.tcp_us;
+            record.timing.proxy_us = d.timing.proxy_us;
+            record.timing.tls_us = d.timing.tls_us;
+            record.tls = d.tls.map(Box::new);
+        }
         record.timing.queue_us =
             (t_ready.saturating_duration_since(t_start).as_micros() as u64).saturating_sub(dial_us);
 
@@ -700,7 +740,12 @@ impl HttpTransport for TracingTransport {
 
         // 4. Send and await response headers.
         let t_dispatch = Instant::now();
-        let span = format!("http::{} {} {}", api.label(), method, uri.path());
+        let span = format!(
+            "http::{} {} {}",
+            service_op.unwrap_or_else(|| api.label()),
+            method,
+            uri.path()
+        );
         let (resp, h1_sender) = match checked {
             Checked::H1 { mut sender, .. } => {
                 let r = sender.send_request(hreq).instrument_await(span).await;
@@ -798,6 +843,7 @@ impl HttpTransport for TracingTransport {
             recorder,
             _permit: permit,
             _inflight: inflight,
+            clock: inner.cfg.tcp_info.then(|| clock.clone()),
             h1_return: h1_sender.map(|s| (inner.clone(), key, id, s, clock)),
         };
         let mut out = Response::builder()

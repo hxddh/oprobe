@@ -1,0 +1,466 @@
+{
+  "$defs": {
+    "AttributionOutput": {
+      "description": "What was selected for outlier attribution.",
+      "properties": {
+        "factors": {
+          "description": "Most distinctive first.",
+          "items": {
+            "$ref": "#/$defs/Factor"
+          },
+          "type": "array"
+        },
+        "rest_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "selected_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "selection": {
+          "description": "`slowest 1%`, `window 5..10s`, …",
+          "type": "string"
+        }
+      },
+      "required": [
+        "selection",
+        "selected_count",
+        "rest_count",
+        "factors"
+      ],
+      "type": "object"
+    },
+    "Factor": {
+      "description": "One attribute value and how much more common it is among the selected requests.",
+      "properties": {
+        "attribute": {
+          "description": "Attribute name: `api`, `status`, `protocol`, `connection`, `remote`, `attempt`,\n`error`, `stage` (the dominant stage of the request), `size` (bytes moved, binned),\n`rtt` (TCP RTT, binned), `time` (tenth of the run), `conn` (connection id).",
+          "type": "string"
+        },
+        "lift": {
+          "description": "`selected_ratio / rest_ratio`, smoothed (add-one) and capped.",
+          "format": "double",
+          "type": "number"
+        },
+        "rest_ratio": {
+          "description": "Share of the other requests with this value (0–1).",
+          "format": "double",
+          "type": "number"
+        },
+        "selected_count": {
+          "description": "Selected requests with this value.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "selected_ratio": {
+          "description": "Share of selected requests with this value (0–1).",
+          "format": "double",
+          "type": "number"
+        },
+        "value": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "attribute",
+        "value",
+        "selected_ratio",
+        "rest_ratio",
+        "lift",
+        "selected_count"
+      ],
+      "type": "object"
+    },
+    "Filter": {
+      "description": "Request filters: `--window A..B` and `--where k=v,…`.",
+      "properties": {
+        "conditions": {
+          "description": "`attribute = value` conditions (all must hold): `api`, `status`, `protocol`, `remote`,\n`conn`, `stage`, `connection` (`cold`/`warm`), `attempt` (`first`/`retry`), `method`,\n`op` (operation id).",
+          "items": {
+            "maxItems": 2,
+            "minItems": 2,
+            "prefixItems": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "string"
+              }
+            ],
+            "type": "array"
+          },
+          "type": "array"
+        },
+        "from_s": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "to_s": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "GroupRow": {
+      "description": "One group of a `--by` table.",
+      "properties": {
+        "cold_count": {
+          "description": "Requests that opened a new connection.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "down_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "errors_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "key": {
+          "type": "string"
+        },
+        "max_ms": {
+          "format": "double",
+          "type": "number"
+        },
+        "mean_ms": {
+          "format": "double",
+          "type": "number"
+        },
+        "p50_ms": {
+          "format": "double",
+          "type": "number"
+        },
+        "p90_ms": {
+          "format": "double",
+          "type": "number"
+        },
+        "p99_ms": {
+          "format": "double",
+          "type": "number"
+        },
+        "requests_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "throttled_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "time_pct": {
+          "description": "Share of the filtered requests' total time spent in this group (0–100).",
+          "format": "double",
+          "type": "number"
+        },
+        "up_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "key",
+        "requests_count",
+        "errors_count",
+        "throttled_count",
+        "cold_count",
+        "mean_ms",
+        "p50_ms",
+        "p90_ms",
+        "p99_ms",
+        "max_ms",
+        "down_bytes",
+        "up_bytes",
+        "time_pct"
+      ],
+      "type": "object"
+    },
+    "SecondStats": {
+      "description": "One second of the measurement window (from the operation rows).",
+      "properties": {
+        "errors_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "mib_per_s": {
+          "format": "double",
+          "type": "number"
+        },
+        "ops_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "p50_ms": {
+          "format": "double",
+          "type": "number"
+        },
+        "p99_ms": {
+          "format": "double",
+          "type": "number"
+        },
+        "t_s": {
+          "format": "double",
+          "type": "number"
+        },
+        "throttled_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "t_s",
+        "ops_count",
+        "mib_per_s",
+        "p50_ms",
+        "p99_ms",
+        "errors_count",
+        "throttled_count"
+      ],
+      "type": "object"
+    },
+    "Segment": {
+      "description": "A stretch of the run with stable throughput.",
+      "properties": {
+        "errors_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "from_s": {
+          "format": "double",
+          "type": "number"
+        },
+        "mib_per_s": {
+          "format": "double",
+          "type": "number"
+        },
+        "ops_per_s": {
+          "format": "double",
+          "type": "number"
+        },
+        "p50_ms": {
+          "format": "double",
+          "type": "number"
+        },
+        "p99_ms": {
+          "format": "double",
+          "type": "number"
+        },
+        "throttled_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "to_s": {
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "from_s",
+        "to_s",
+        "ops_per_s",
+        "mib_per_s",
+        "p50_ms",
+        "p99_ms",
+        "errors_count",
+        "throttled_count"
+      ],
+      "type": "object"
+    },
+    "Segments": {
+      "properties": {
+        "per_second": {
+          "items": {
+            "$ref": "#/$defs/SecondStats"
+          },
+          "type": "array"
+        },
+        "segments": {
+          "description": "Stable-throughput segments in time order.",
+          "items": {
+            "$ref": "#/$defs/Segment"
+          },
+          "type": "array"
+        },
+        "start": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Segment"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The first seconds of the window (start-up)."
+        },
+        "steady": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Segment"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The longest segment: what the run measures once settled."
+        }
+      },
+      "required": [
+        "per_second",
+        "segments"
+      ],
+      "type": "object"
+    },
+    "StageQ": {
+      "description": "p50 / p99 of one request stage (ms).",
+      "properties": {
+        "p50_ms": {
+          "format": "double",
+          "type": "number"
+        },
+        "p99_ms": {
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "p50_ms",
+        "p99_ms"
+      ],
+      "type": "object"
+    },
+    "StageRow": {
+      "description": "Per-stage latency of one API's requests.",
+      "properties": {
+        "api": {
+          "description": "API name, or `all`.",
+          "type": "string"
+        },
+        "body": {
+          "$ref": "#/$defs/StageQ"
+        },
+        "connect": {
+          "$ref": "#/$defs/StageQ",
+          "description": "Requests that dialed only."
+        },
+        "queue": {
+          "$ref": "#/$defs/StageQ"
+        },
+        "requests_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "send": {
+          "$ref": "#/$defs/StageQ"
+        },
+        "stall": {
+          "$ref": "#/$defs/StageQ"
+        },
+        "total": {
+          "$ref": "#/$defs/StageQ"
+        },
+        "ttfb": {
+          "$ref": "#/$defs/StageQ"
+        }
+      },
+      "required": [
+        "api",
+        "requests_count",
+        "queue",
+        "connect",
+        "send",
+        "ttfb",
+        "body",
+        "stall",
+        "total"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://github.com/hxddh/oprobe/schemas/3/analyze.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Result of `oprobe analyze`",
+  "properties": {
+    "attribution": {
+      "$ref": "#/$defs/AttributionOutput"
+    },
+    "by": {
+      "type": "string"
+    },
+    "filter": {
+      "$ref": "#/$defs/Filter"
+    },
+    "groups": {
+      "items": {
+        "$ref": "#/$defs/GroupRow"
+      },
+      "type": "array"
+    },
+    "requests_count": {
+      "description": "Request rows after `--where` / `--window`.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "run_id": {
+      "type": "string"
+    },
+    "sampled": {
+      "description": "The run's rows are sampled: counts are of the kept rows.",
+      "type": "boolean"
+    },
+    "segments": {
+      "$ref": "#/$defs/Segments"
+    },
+    "stages": {
+      "description": "Per-stage p50/p99 per API.",
+      "items": {
+        "$ref": "#/$defs/StageRow"
+      },
+      "type": "array"
+    },
+    "total_requests_count": {
+      "description": "Request rows in the run file.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "run_id",
+    "filter",
+    "requests_count",
+    "total_requests_count",
+    "by",
+    "groups",
+    "stages",
+    "attribution",
+    "segments",
+    "sampled"
+  ],
+  "title": "oprobe analyze",
+  "type": "object",
+  "x-rust-type": "AnalyzeOutput"
+}

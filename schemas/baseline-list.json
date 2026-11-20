@@ -1,0 +1,50 @@
+{
+  "$defs": {
+    "BaselineEntry": {
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "newest_run": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "runs_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "window": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "name",
+        "window",
+        "runs_count"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://github.com/hxddh/oprobe/schemas/3/baseline-list.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Result of `oprobe baseline list`",
+  "properties": {
+    "baselines": {
+      "items": {
+        "$ref": "#/$defs/BaselineEntry"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "baselines"
+  ],
+  "title": "oprobe baseline-list",
+  "type": "object",
+  "x-rust-type": "BaselineList"
+}

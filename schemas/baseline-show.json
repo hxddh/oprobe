@@ -1,0 +1,206 @@
+{
+  "$defs": {
+    "Interval": {
+      "description": "An estimate with a confidence interval.",
+      "properties": {
+        "estimate": {
+          "format": "double",
+          "type": "number"
+        },
+        "high": {
+          "format": "double",
+          "type": "number"
+        },
+        "low": {
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "estimate",
+        "low",
+        "high"
+      ],
+      "type": "object"
+    },
+    "RunSetStats": {
+      "description": "Spread of a set of runs: medians across runs with 95 % bootstrap intervals.",
+      "properties": {
+        "error_ratio": {
+          "$ref": "#/$defs/Interval"
+        },
+        "ops_per_s": {
+          "$ref": "#/$defs/Interval"
+        },
+        "p50_ms": {
+          "$ref": "#/$defs/Interval"
+        },
+        "p99_ms": {
+          "$ref": "#/$defs/Interval"
+        },
+        "runs_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "runs_count",
+        "p50_ms",
+        "p99_ms",
+        "ops_per_s",
+        "error_ratio"
+      ],
+      "type": "object"
+    },
+    "RunSummary": {
+      "description": "Sidecar summary of a run (`runs/<id>.json`).",
+      "properties": {
+        "cost_per_month_usd": {
+          "description": "Projected monthly cost, where cost applies.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "error_ratio": {
+          "format": "double",
+          "type": "number"
+        },
+        "headline": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "interrupted": {
+          "type": "boolean"
+        },
+        "label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ops_per_s": {
+          "format": "double",
+          "type": "number"
+        },
+        "p50_ms": {
+          "format": "double",
+          "type": "number"
+        },
+        "p99_ms": {
+          "format": "double",
+          "type": "number"
+        },
+        "path": {
+          "description": "The run file (filled in when listing; not stored).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "started_at": {
+          "type": "string"
+        },
+        "target_display": {
+          "type": "string"
+        },
+        "target_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "verdict_level": {
+          "$ref": "#/$defs/VerdictLevel"
+        },
+        "window_s": {
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "id",
+        "target_display",
+        "started_at",
+        "window_s",
+        "interrupted",
+        "verdict_level",
+        "headline",
+        "ops_per_s",
+        "p50_ms",
+        "p99_ms",
+        "error_ratio"
+      ],
+      "type": "object"
+    },
+    "VerdictLevel": {
+      "description": "Overall judgement.",
+      "oneOf": [
+        {
+          "enum": [
+            "ok"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "review",
+          "description": "Worth a look (informational findings, warnings, partial run).",
+          "type": "string"
+        },
+        {
+          "const": "attention",
+          "description": "Warning findings.",
+          "type": "string"
+        },
+        {
+          "const": "critical",
+          "description": "Critical findings or a breached SLA.",
+          "type": "string"
+        }
+      ]
+    }
+  },
+  "$id": "https://github.com/hxddh/oprobe/schemas/3/baseline-show.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Result of `oprobe baseline show`",
+  "properties": {
+    "missing": {
+      "description": "Run ids the baseline lists that are no longer stored.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "name": {
+      "type": "string"
+    },
+    "runs": {
+      "items": {
+        "$ref": "#/$defs/RunSummary"
+      },
+      "type": "array"
+    },
+    "stats": {
+      "$ref": "#/$defs/RunSetStats"
+    },
+    "window": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "name",
+    "window",
+    "runs",
+    "missing",
+    "stats"
+  ],
+  "title": "oprobe baseline-show",
+  "type": "object",
+  "x-rust-type": "BaselineShow"
+}

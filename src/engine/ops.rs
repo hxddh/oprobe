@@ -9,6 +9,7 @@ use opendal::{Buffer, Operator};
 use rand::Rng;
 
 use super::dataset::{Dataset, PayloadPool, Picker};
+use super::workloads::WorkloadState;
 use crate::config::{Knobs, OpKind};
 use crate::trace::Recorder;
 
@@ -24,6 +25,8 @@ pub struct OpCtx {
     pub scratch_prefix: String,
     /// Sampled written objects to verify after the run: (path, crc).
     pub written: Arc<std::sync::Mutex<Vec<(String, u32)>>>,
+    /// Service capability and the state of delete / conditional-write operations.
+    pub state: WorkloadState,
 }
 
 /// Outcome of one logical operation.
@@ -36,11 +39,18 @@ pub fn verb(kind: &OpKind) -> &'static str {
     match kind {
         OpKind::Read { size: None } => "read.full",
         OpKind::Read { size: Some(_) } => "read.range",
-        OpKind::ParquetScan { .. } => "parquet.scan",
+        OpKind::ParquetScan { suffix: false, .. } => "parquet.scan",
+        OpKind::ParquetScan { suffix: true, .. } => "parquet.scan.suffix",
         OpKind::Write { .. } => "write",
         OpKind::MultipartWrite { .. } => "write.multipart",
         OpKind::Stat => "stat",
         OpKind::List { .. } => "list",
+        OpKind::ListPaged { .. } => "list.paged",
+        OpKind::Delete { .. } => "delete.batch",
+        OpKind::Copy => "copy",
+        OpKind::PresignedRead => "read.presigned",
+        OpKind::ConditionalWrite { .. } => "write.conditional",
+        OpKind::MetadataWrite { .. } => "write.metadata",
     }
 }
 
@@ -58,11 +68,13 @@ fn aligned_offset(rng: &mut impl Rng, max: u64) -> u64 {
 }
 
 /// Execute `kind`. `slot` selects the scratch key for writes (bounded footprint via overwrite).
+/// `key` receives the object key (or listed prefix) as soon as it is chosen, also on failure.
 pub async fn execute(
     ctx: &OpCtx,
     kind: &OpKind,
     rng: &mut (impl Rng + Send),
     slot: u64,
+    key: &mut String,
 ) -> Result<OpOutcome> {
     let k = &ctx.knobs;
     let chunk = k.chunk_size.as_usize();
@@ -77,6 +89,7 @@ pub async fn execute(
     match kind {
         OpKind::Read { size } => {
             let obj = pick(rng)?;
+            key.clone_from(&obj.path);
             let full = size.map(|s| s.0 >= obj.size).unwrap_or(true);
             let range: Range<u64> = if full {
                 0..obj.size
@@ -107,10 +120,22 @@ pub async fn execute(
             columns,
             column_size,
             footer_size,
+            suffix,
         } => {
             let obj = pick(rng)?;
-            let meta = ctx.op.stat(&obj.path).await?;
-            let size = meta.content_length();
+            key.clone_from(&obj.path);
+            let (size, f) = if *suffix {
+                // One GET `Range: bytes=-N` and no HEAD: a reader learns the file size from the
+                // response's Content-Range (here: from the dataset).
+                let f = ctx
+                    .op
+                    .read_with(&obj.path)
+                    .range(opendal::BytesRange::suffix(footer_size.0))
+                    .await?;
+                (obj.size, Some(f))
+            } else {
+                (ctx.op.stat(&obj.path).await?.content_length(), None)
+            };
             let footer = footer_size.0.min(size);
             let reader = ctx
                 .op
@@ -119,7 +144,10 @@ pub async fn execute(
                 .gap(k.range_gap.as_usize())
                 .concurrent(io)
                 .await?;
-            let f = reader.read(size - footer..size).await?;
+            let f = match f {
+                Some(f) => f,
+                None => reader.read(size - footer..size).await?,
+            };
             let mut logical = f.len() as u64;
             let body = size - footer;
             let col = column_size.0.min(body.max(1));
@@ -145,12 +173,24 @@ pub async fn execute(
             })
         }
         OpKind::Write { size } => {
-            let path = format!("{}w-{slot:05}.bin", ctx.scratch_prefix);
+            let path = if ctx.state.unique_writes {
+                // Deletes consume what writes create: every write makes a new key.
+                format!(
+                    "{}w-{slot:05}-{}.bin",
+                    ctx.scratch_prefix,
+                    ctx.state.next_seq()
+                )
+            } else {
+                format!("{}w-{slot:05}.bin", ctx.scratch_prefix)
+            };
+            key.clone_from(&path);
             let data = ctx.pool.slice(rng, size.as_usize());
             let len = data.len() as u64;
             let crc = (ctx.verify && slot.is_multiple_of(16)).then(|| crate::util::crc32c(&data));
             ctx.op.write(&path, data).await?;
-            if let Some(crc) = crc {
+            if ctx.state.unique_writes {
+                ctx.state.push_deletable(path.clone());
+            } else if let Some(crc) = crc {
                 push_written(ctx, path, crc);
             }
             Ok(OpOutcome {
@@ -160,6 +200,7 @@ pub async fn execute(
         }
         OpKind::MultipartWrite { size } => {
             let path = format!("{}mp-{slot:05}.bin", ctx.scratch_prefix);
+            key.clone_from(&path);
             let data = ctx.pool.slice(rng, size.as_usize());
             let len = data.len() as u64;
             let crc = (ctx.verify && slot.is_multiple_of(8)).then(|| crate::util::crc32c(&data));
@@ -186,6 +227,7 @@ pub async fn execute(
         }
         OpKind::Stat => {
             let obj = pick(rng)?;
+            key.clone_from(&obj.path);
             ctx.op.stat(&obj.path).await?;
             Ok(OpOutcome {
                 logical_read: 0,
@@ -199,6 +241,7 @@ pub async fn execute(
             } else {
                 parts[rng.gen_range(0..parts.len())].clone()
             };
+            key.clone_from(&prefix);
             let mut lister = ctx.op.lister_with(&prefix).recursive(*recursive).await?;
             while lister.try_next().await?.is_some() {}
             Ok(OpOutcome {
@@ -206,6 +249,180 @@ pub async fn execute(
                 logical_write: 0,
             })
         }
+        OpKind::ListPaged { .. }
+        | OpKind::Delete { .. }
+        | OpKind::Copy
+        | OpKind::PresignedRead
+        | OpKind::ConditionalWrite { .. }
+        | OpKind::MetadataWrite { .. } => execute_more(ctx, kind, rng, slot, key).await,
+    }
+}
+
+/// The newer operations (capability-dependent; `workloads::adapt_mix` removed or replaced
+/// those the service cannot run).
+async fn execute_more(
+    ctx: &OpCtx,
+    kind: &OpKind,
+    rng: &mut (impl Rng + Send),
+    slot: u64,
+    key: &mut String,
+) -> Result<OpOutcome> {
+    let ds = &ctx.dataset;
+    let pick = |rng: &mut (dyn rand::RngCore + Send)| -> Result<&super::dataset::DataObject> {
+        if ds.objects.is_empty() {
+            anyhow::bail!("dataset has no objects to read");
+        }
+        Ok(&ds.objects[ctx.picker.pick(rng)])
+    };
+    let none = OpOutcome {
+        logical_read: 0,
+        logical_write: 0,
+    };
+    match kind {
+        OpKind::ListPaged { limit } => {
+            let parts = &ds.partitions;
+            let prefix = if parts.is_empty() {
+                ds.prefix.clone()
+            } else {
+                parts[rng.gen_range(0..parts.len())].clone()
+            };
+            key.clone_from(&prefix);
+            let mut lister = ctx
+                .op
+                .lister_with(&prefix)
+                .limit((*limit).max(1) as usize)
+                .await?;
+            while lister.try_next().await?.is_some() {}
+            Ok(none)
+        }
+        OpKind::Delete { batch } => {
+            let n = (*batch).max(1) as usize;
+            let mut keys = ctx.state.take_deletable(n);
+            if keys.is_empty() {
+                // Nothing written yet: delete keys that do not exist (same request, billed
+                // the same; deleting a missing key succeeds).
+                keys = (0..n)
+                    .map(|i| format!("{}d-{slot:05}-{i}.bin", ctx.scratch_prefix))
+                    .collect();
+            }
+            key.clone_from(&keys[0]);
+            ctx.op.delete_iter(keys).await?;
+            Ok(none)
+        }
+        OpKind::Copy => {
+            let obj = pick(rng)?;
+            let to = format!("{}c-{slot:05}.bin", ctx.scratch_prefix);
+            key.clone_from(&to);
+            ctx.op.copy(&obj.path, &to).await?;
+            Ok(OpOutcome {
+                logical_read: 0,
+                logical_write: obj.size,
+            })
+        }
+        OpKind::PresignedRead => {
+            let obj = pick(rng)?;
+            key.clone_from(&obj.path);
+            let signed = ctx
+                .op
+                .presign_read(&obj.path, std::time::Duration::from_secs(900))
+                .await?;
+            let mut req = http::Request::builder()
+                .method(signed.method().clone())
+                .uri(signed.uri().clone())
+                // The request row names it: the URL alone looks like any GetObject.
+                .extension(opendal::raw::ServiceOperation("PresignedGetObject"))
+                .body(Buffer::new())?;
+            *req.headers_mut() = signed.header().clone();
+            // Through the operator's own (traced) HTTP transport: no signing on this path.
+            let resp = ctx.op.context().http_transport().fetch(req).await?;
+            let status = resp.status();
+            let mut body = resp.into_body();
+            let buf = body.to_buffer().await?;
+            if !status.is_success() {
+                return Err(opendal::Error::new(
+                    if status.as_u16() == 404 {
+                        opendal::ErrorKind::NotFound
+                    } else if status.as_u16() == 403 {
+                        opendal::ErrorKind::PermissionDenied
+                    } else if matches!(status.as_u16(), 429 | 503) {
+                        opendal::ErrorKind::RateLimited
+                    } else {
+                        opendal::ErrorKind::Unexpected
+                    },
+                    format!("presigned GET answered {status}"),
+                )
+                .into());
+            }
+            if ctx.verify
+                && let Some(expected) = obj.crc
+            {
+                ctx.recorder.record_integrity(crc_of(&buf) == expected);
+            }
+            Ok(OpOutcome {
+                logical_read: buf.len() as u64,
+                logical_write: 0,
+            })
+        }
+        OpKind::ConditionalWrite { size } => {
+            let cap = &ctx.state.capability;
+            let data = ctx.pool.slice(rng, size.as_usize());
+            let len = data.len() as u64;
+            let slot_path = format!("{}cw-{slot:05}.bin", ctx.scratch_prefix);
+            let meta = match ctx.state.etag(slot).filter(|e| !e.is_empty()) {
+                // Optimistic update of the object this slot wrote last.
+                Some(etag) if cap.write_with_if_match => {
+                    key.clone_from(&slot_path);
+                    ctx.op.write_with(&slot_path, data).if_match(&etag).await?
+                }
+                _ => {
+                    // Conditional create. On the slot's key when an overwrite can follow
+                    // (If-Match); a fresh key when the service only creates conditionally or
+                    // the slot's object has no known etag.
+                    let fresh = !cap.write_with_if_match || ctx.state.etag(slot).is_some();
+                    let path = if fresh {
+                        format!(
+                            "{}cw-{slot:05}-{}.bin",
+                            ctx.scratch_prefix,
+                            ctx.state.next_seq()
+                        )
+                    } else {
+                        slot_path.clone()
+                    };
+                    key.clone_from(&path);
+                    if cap.write_with_if_not_exists {
+                        ctx.op.write_with(&path, data).if_not_exists(true).await?
+                    } else {
+                        ctx.op.write_with(&path, data).if_none_match("*").await?
+                    }
+                }
+            };
+            if *key == slot_path || ctx.state.etag(slot).is_none() {
+                ctx.state.set_etag(slot, meta.etag());
+            }
+            Ok(OpOutcome {
+                logical_read: 0,
+                logical_write: len,
+            })
+        }
+        OpKind::MetadataWrite { size, entries } => {
+            let path = format!("{}m-{slot:05}.bin", ctx.scratch_prefix);
+            key.clone_from(&path);
+            let data = ctx.pool.slice(rng, size.as_usize());
+            let len = data.len() as u64;
+            let meta: Vec<(String, String)> = (0..*entries)
+                .map(|i| (format!("oprobe-{i}"), format!("value-{slot}-{i}")))
+                .collect();
+            ctx.op
+                .write_with(&path, data)
+                .content_type("application/octet-stream")
+                .user_metadata(meta)
+                .await?;
+            Ok(OpOutcome {
+                logical_read: 0,
+                logical_write: len,
+            })
+        }
+        _ => unreachable!("handled by execute"),
     }
 }
 
@@ -218,49 +435,102 @@ fn push_written(ctx: &OpCtx, path: String, crc: u32) {
     }
 }
 
-/// Short, stable error class for aggregation (`rate_limited`, `not_found`, `timeout`, ...).
-///
-/// Classification uses OpenDAL's [`opendal::ErrorKind`] and `last_status`, the HTTP status of
-/// the operation's last backend request (when one got a response), never substrings of the
-/// formatted error: object names (`obj-00429.bin`), dates and ports contain digits too.
-pub fn error_class(e: &anyhow::Error, last_status: Option<u16>) -> String {
-    if let Some(oe) = e.downcast_ref::<opendal::Error>() {
-        match oe.kind() {
-            opendal::ErrorKind::RateLimited => return "rate_limited".into(),
-            opendal::ErrorKind::PermissionDenied => return "permission_denied".into(),
-            opendal::ErrorKind::NotFound => return "not_found".into(),
-            _ => {}
-        }
-        match last_status {
-            Some(429 | 503) => return "rate_limited".into(),
-            Some(401 | 403) => return "permission_denied".into(),
-            _ => {}
-        }
-        let msg = oe.to_string().to_ascii_lowercase();
-        if msg.contains("timeout") || msg.contains("timed out") {
-            return "timeout".into();
-        }
-        if msg.contains("connect:") {
-            return "connect".into();
-        }
-        return match oe.kind() {
-            opendal::ErrorKind::ConfigInvalid => "config_invalid",
-            opendal::ErrorKind::Unsupported => "unsupported",
-            opendal::ErrorKind::ConditionNotMatch => "condition_not_match",
-            _ => {
-                if msg.contains("send http request")
-                    || msg.contains("send request")
-                    || msg.contains("response body")
-                {
-                    "network"
-                } else {
-                    "unexpected"
-                }
+/// What a failure's source chain says about where it happened.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Cause {
+    Timeout,
+    Connect,
+}
+
+/// Inspect the typed errors under an OpenDAL error: reqwest's (default transport), oprobe's
+/// dial errors (`--microscope`), hyper's and I/O errors. No message text is matched.
+fn source_cause(e: &opendal::Error) -> Option<Cause> {
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(e);
+    while let Some(err) = cur {
+        if let Some(r) = err.downcast_ref::<reqwest::Error>() {
+            if r.is_timeout() {
+                return Some(Cause::Timeout);
+            }
+            if r.is_connect() {
+                return Some(Cause::Connect);
             }
         }
-        .into();
+        if err.downcast_ref::<crate::net::dial::DialError>().is_some() {
+            return Some(Cause::Connect);
+        }
+        if let Some(h) = err.downcast_ref::<hyper::Error>()
+            && h.is_timeout()
+        {
+            return Some(Cause::Timeout);
+        }
+        if let Some(io) = err.downcast_ref::<std::io::Error>() {
+            match io.kind() {
+                std::io::ErrorKind::TimedOut => return Some(Cause::Timeout),
+                std::io::ErrorKind::ConnectionRefused => return Some(Cause::Connect),
+                _ => {}
+            }
+        }
+        cur = err.source();
     }
-    "other".into()
+    None
+}
+
+/// The request never got a connection (refused, unreachable, DNS, dial timeout).
+pub fn is_connect_failure(e: &opendal::Error) -> bool {
+    source_cause(e) == Some(Cause::Connect)
+}
+
+/// Short, stable error class for aggregation (`rate_limited`, `not_found`, `timeout`, ...).
+///
+/// Every OpenDAL 0.59 [`opendal::ErrorKind`] maps to its own class. `Unexpected` errors are
+/// refined from `last_status` (the HTTP status of the operation's last backend request, when
+/// one got a response), the typed source chain (timeouts and connection failures from reqwest,
+/// hyper, oprobe's dialer and I/O), the exact messages of OpenDAL's own timeout and tail-cut
+/// layers, and [`opendal::Error::is_temporary`]. Substrings of the formatted error are never
+/// matched: object names (`obj-00429.bin`), dates and ports contain digits and words too.
+pub fn error_class(e: &anyhow::Error, last_status: Option<u16>) -> String {
+    match e.downcast_ref::<opendal::Error>() {
+        Some(oe) => error_class_of(oe, last_status),
+        None => "other".into(),
+    }
+}
+
+/// [`error_class`] of an OpenDAL error.
+pub fn error_class_of(oe: &opendal::Error, last_status: Option<u16>) -> String {
+    use opendal::ErrorKind as K;
+    let class = match oe.kind() {
+        K::RateLimited => "rate_limited",
+        K::PermissionDenied => "permission_denied",
+        K::NotFound => "not_found",
+        K::ConfigInvalid => "config_invalid",
+        K::Unsupported => "unsupported",
+        K::IsADirectory => "is_a_directory",
+        K::NotADirectory => "not_a_directory",
+        K::AlreadyExists => "already_exists",
+        K::IsSameFile => "is_same_file",
+        K::ConditionNotMatch => "condition_not_match",
+        K::RangeNotSatisfied => "range_not_satisfied",
+        K::Conflict => "conflict",
+        K::Unexpected => {
+            return match (last_status, source_cause(oe), oe.message()) {
+                (Some(429 | 503), ..) => "rate_limited",
+                (Some(401 | 403), ..) => "permission_denied",
+                // OpenDAL's TimeoutLayer / TailCutLayer errors (exact messages, set by OpenDAL).
+                (_, _, "operation timeout reached" | "io operation timeout reached") => "timeout",
+                (_, _, "cancelled by tail cut" | "io cancelled by tail cut") => "tail_cut",
+                (_, Some(Cause::Timeout), _) => "timeout",
+                (_, Some(Cause::Connect), _) => "connect",
+                (Some(s), ..) if s >= 500 => "server_error",
+                // A transient transport failure (reset, broken body, ...): OpenDAL retries these.
+                _ if oe.is_temporary() => "network",
+                _ => "unexpected",
+            }
+            .into();
+        }
+        // `ErrorKind` is non-exhaustive: a kind added by a later OpenDAL keeps its own name.
+        other => return other.into_static().to_ascii_lowercase().replace(' ', "_"),
+    };
+    class.into()
 }
 
 #[cfg(test)]
@@ -279,7 +549,8 @@ mod tests {
             Unexpected,
             "read failed: path oprobe-run-x/data/obj-00429.bin port 4030",
         );
-        assert_eq!(error_class(&e, Some(500)), "unexpected");
+        // The status the request got decides, never the digits in the text.
+        assert_eq!(error_class(&e, Some(500)), "server_error");
         let e = err(Unexpected, "obj-00503.bin 2026-04-03T401");
         assert_eq!(error_class(&e, None), "unexpected");
         assert_eq!(error_class(&err(RateLimited, "x"), None), "rate_limited");
@@ -296,5 +567,74 @@ mod tests {
             "permission_denied"
         );
         assert_eq!(error_class(&err(NotFound, "x"), Some(404)), "not_found");
+    }
+
+    #[test]
+    fn every_error_kind_has_its_own_class() {
+        use opendal::ErrorKind::*;
+        for (kind, class) in [
+            (Unsupported, "unsupported"),
+            (ConfigInvalid, "config_invalid"),
+            (NotFound, "not_found"),
+            (PermissionDenied, "permission_denied"),
+            (IsADirectory, "is_a_directory"),
+            (NotADirectory, "not_a_directory"),
+            (AlreadyExists, "already_exists"),
+            (RateLimited, "rate_limited"),
+            (IsSameFile, "is_same_file"),
+            (ConditionNotMatch, "condition_not_match"),
+            (RangeNotSatisfied, "range_not_satisfied"),
+            (Conflict, "conflict"),
+        ] {
+            assert_eq!(error_class(&err(kind, "x"), None), class, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn unexpected_errors_are_refined_structurally() {
+        use opendal::ErrorKind::Unexpected;
+        // OpenDAL's own layers.
+        assert_eq!(
+            error_class(&err(Unexpected, "operation timeout reached"), None),
+            "timeout"
+        );
+        assert_eq!(
+            error_class(&err(Unexpected, "io cancelled by tail cut"), None),
+            "tail_cut"
+        );
+        // A path that merely mentions a timeout is not one.
+        let e = err(Unexpected, "read obj-timed out-timeout.bin");
+        assert_eq!(error_class(&e, None), "unexpected");
+        // Typed sources.
+        let io = |k: std::io::ErrorKind| -> anyhow::Error {
+            opendal::Error::new(Unexpected, "send request")
+                .set_source(std::io::Error::new(k, "boom"))
+                .into()
+        };
+        assert_eq!(
+            error_class(&io(std::io::ErrorKind::TimedOut), None),
+            "timeout"
+        );
+        assert_eq!(
+            error_class(&io(std::io::ErrorKind::ConnectionRefused), None),
+            "connect"
+        );
+        let dial: anyhow::Error = opendal::Error::new(Unexpected, "connect")
+            .set_source(crate::net::dial::DialError {
+                stage: "tcp",
+                target: "h:1".into(),
+                source: std::io::Error::other("unreachable"),
+            })
+            .into();
+        assert_eq!(error_class(&dial, None), "connect");
+        // Server errors, then transient vs persistent.
+        assert_eq!(
+            error_class(&err(Unexpected, "x"), Some(500)),
+            "server_error"
+        );
+        let temp: anyhow::Error = opendal::Error::new(Unexpected, "x").set_temporary().into();
+        assert_eq!(error_class(&temp, None), "network");
+        assert_eq!(error_class(&err(Unexpected, "x"), None), "unexpected");
+        assert_eq!(error_class(&anyhow::anyhow!("plain"), None), "other");
     }
 }

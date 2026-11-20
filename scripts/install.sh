@@ -1,7 +1,7 @@
 #!/bin/sh
 # oprobe installer for Linux and macOS.
 #   curl -fsSL https://github.com/hxddh/oprobe/releases/latest/download/install.sh | sh
-# Options (env): OPROBE_VERSION=2.0.1  OPROBE_INSTALL_DIR=~/.local/bin
+# Options (env): OPROBE_VERSION=3.0.0  OPROBE_INSTALL_DIR=~/.local/bin
 set -eu
 
 repo="hxddh/oprobe"

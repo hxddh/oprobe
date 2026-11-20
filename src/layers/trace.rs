@@ -78,6 +78,10 @@ fn push(
         request_id: None,
         retry_after_ms: None,
         error: err.map(|e| e.to_string()),
+        remote: None,
+        service_op: None,
+        tls: None,
+        tcp: None,
     };
     match scope {
         Some(s) => s.push_request(rec),

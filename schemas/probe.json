@@ -1,0 +1,316 @@
+{
+  "$defs": {
+    "CertChain": {
+      "description": "The chain as presented (leaf first).",
+      "properties": {
+        "certs": {
+          "items": {
+            "$ref": "#/$defs/CertInfo"
+          },
+          "type": "array"
+        },
+        "total_bytes": {
+          "description": "Total DER size the server sends in every full handshake.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "certs",
+        "total_bytes"
+      ],
+      "type": "object"
+    },
+    "CertInfo": {
+      "description": "One certificate the server presented.",
+      "properties": {
+        "der_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "expires_in_days": {
+          "description": "Days until `notAfter` (negative: expired).",
+          "format": "int64",
+          "type": "integer"
+        },
+        "issuer": {
+          "type": "string"
+        },
+        "not_after": {
+          "description": "`notAfter`, RFC 3339 (UTC).",
+          "type": "string"
+        },
+        "subject": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "subject",
+        "issuer",
+        "not_after",
+        "expires_in_days",
+        "der_bytes"
+      ],
+      "type": "object"
+    },
+    "ProbeSample": {
+      "properties": {
+        "cold_ttfb_ms": {
+          "description": "First request on a fresh connection: request sent -> response headers.",
+          "format": "double",
+          "type": "number"
+        },
+        "dns_ms": {
+          "format": "double",
+          "type": "number"
+        },
+        "proxy_ms": {
+          "format": "double",
+          "type": "number"
+        },
+        "remote": {
+          "type": "string"
+        },
+        "server_date": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "tcp_ms": {
+          "format": "double",
+          "type": "number"
+        },
+        "tls_ms": {
+          "format": "double",
+          "type": "number"
+        },
+        "warm_ttfb_ms": {
+          "description": "Second request reusing the same connection.",
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "remote",
+        "status",
+        "dns_ms",
+        "tcp_ms",
+        "proxy_ms",
+        "tls_ms",
+        "cold_ttfb_ms",
+        "warm_ttfb_ms"
+      ],
+      "type": "object"
+    },
+    "Quantiles": {
+      "description": "Latency distribution in milliseconds.",
+      "properties": {
+        "max_ms": {
+          "format": "double",
+          "type": "number"
+        },
+        "mean_ms": {
+          "format": "double",
+          "type": "number"
+        },
+        "p50_ms": {
+          "format": "double",
+          "type": "number"
+        },
+        "p90_ms": {
+          "format": "double",
+          "type": "number"
+        },
+        "p999_ms": {
+          "format": "double",
+          "type": "number"
+        },
+        "p99_ms": {
+          "format": "double",
+          "type": "number"
+        },
+        "samples_count": {
+          "description": "Samples in the distribution.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "samples_count",
+        "mean_ms",
+        "p50_ms",
+        "p90_ms",
+        "p99_ms",
+        "p999_ms",
+        "max_ms"
+      ],
+      "type": "object"
+    },
+    "TlsRow": {
+      "description": "TLS details of the connection a request used (when the transport reports them).",
+      "properties": {
+        "cipher": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "group": {
+          "description": "Negotiated key-exchange group, e.g. `X25519MLKEM768`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "hrr": {
+          "description": "The handshake needed a HelloRetryRequest.",
+          "type": "boolean"
+        },
+        "resumed": {
+          "type": "boolean"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "resumed",
+        "version",
+        "hrr"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://github.com/hxddh/oprobe/schemas/3/probe.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Result of `oprobe probe`",
+  "properties": {
+    "alpn": {
+      "type": "string"
+    },
+    "cert_chain": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/CertChain"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The certificate chain the server presented (`ProbeOptions::certs`)."
+    },
+    "cipher": {
+      "type": "string"
+    },
+    "clock_skew_s": {
+      "description": "Local clock minus server `Date` header, seconds (signature schemes reject > 900 s).",
+      "format": "double",
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "cold_request_ms": {
+      "description": "Median cost of a cold request (connect + cold TTFB) vs a warm request.",
+      "format": "double",
+      "type": "number"
+    },
+    "cold_ttfb": {
+      "$ref": "#/$defs/Quantiles"
+    },
+    "dns": {
+      "$ref": "#/$defs/Quantiles"
+    },
+    "endpoint": {
+      "type": "string"
+    },
+    "handshakes": {
+      "description": "Every handshake (the first is full; later ones resume when the server allows it).",
+      "items": {
+        "$ref": "#/$defs/TlsRow"
+      },
+      "type": "array"
+    },
+    "host": {
+      "type": "string"
+    },
+    "port": {
+      "format": "uint16",
+      "maximum": 65535,
+      "minimum": 0,
+      "type": "integer"
+    },
+    "proxy": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "proxy_connect": {
+      "$ref": "#/$defs/Quantiles"
+    },
+    "resolved": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "samples": {
+      "items": {
+        "$ref": "#/$defs/ProbeSample"
+      },
+      "type": "array"
+    },
+    "tcp": {
+      "$ref": "#/$defs/Quantiles"
+    },
+    "tls": {
+      "type": "boolean"
+    },
+    "tls_handshake": {
+      "$ref": "#/$defs/Quantiles"
+    },
+    "tls_version": {
+      "type": "string"
+    },
+    "warm_request_ms": {
+      "format": "double",
+      "type": "number"
+    },
+    "warm_ttfb": {
+      "$ref": "#/$defs/Quantiles"
+    }
+  },
+  "required": [
+    "endpoint",
+    "host",
+    "port",
+    "tls",
+    "resolved",
+    "alpn",
+    "tls_version",
+    "cipher",
+    "dns",
+    "tcp",
+    "proxy_connect",
+    "tls_handshake",
+    "cold_ttfb",
+    "warm_ttfb",
+    "cold_request_ms",
+    "warm_request_ms",
+    "samples"
+  ],
+  "title": "oprobe probe",
+  "type": "object",
+  "x-rust-type": "ProbeReport"
+}

@@ -20,13 +20,20 @@ oprobe tune s3://bucket/oprobe --preset parquet --p99-ms 250 \
    `Retry-After`, capped at 60 s; `Retry-After` is honored even with `--cooldown 0`) so the next
    trial is not measured against a depleted rate limiter. Ctrl-C interrupts the pause.
 4. **Safety margin** — the recommended concurrency is capped at 80 % of the ceiling to leave
-   headroom for production variance.
+   headroom for production variance (a trial at the cap is run when the best clean trial lies
+   above it). The notes state the ceiling once — the throttled level the bisection ended on and
+   the highest clean level — and explain the margin with numbers, e.g. "concurrency 12 was clean
+   and measured +21 % but sits only 8 % below the ceiling, so it was not recommended".
 5. **Workload-specific knobs** — coordinate descent over only the knobs that matter for the mix:
    `chunk_size` and `io_concurrency` for multipart writes and large reads, `range_gap` for vectored
    (Parquet) reads, the read cache for skewed access (or uniform access over your real objects with
    `existing_prefix` when they fit), and HTTP/1.1 vs HTTP/2 for HTTPS. A cache win that relies on
    the whole generated test dataset fitting in the cache is flagged as dataset-size-dependent.
    A change is accepted only if it improves the objective by more than 3 % (noise guard).
+   For multipart writes, chunk candidates are clamped to the service's part-size limits first
+   (OpenDAL raises a write chunk to `write_multi_min_size`, 5 MiB on S3/GCS), so the tuner never
+   recommends a chunk OpenDAL would not use. Every report records the chunk that was actually
+   written with under `effective_knobs` (requested vs effective) and warns when they differ.
 6. **Confirmation** — the winner runs again for twice the trial duration; the report you get is
    from that run.
 
@@ -46,10 +53,23 @@ then the lowest error rate). The objective throughput counts successful operatio
 ## Outputs
 
 * `--emit-profile` — your profile with the winning `[knobs]`; run it with `oprobe run --profile`.
-* `--emit-rust` — an OpenDAL 0.59 `Operator` builder with `RetryLayer`, `TimeoutLayer`,
-  `ConcurrentLimitLayer` (+ HTTP limit) and reader/writer helpers using the tuned chunk/gap/concurrency.
-* `--emit-python` — the same for the `opendal` Python package.
+* `--emit-rust` — an OpenDAL 0.59 `Operator` builder that reproduces exactly the measured client:
+  `TimeoutLayer` (operation + I/O timeout), `TailCutLayer` (when enabled) and `RetryLayer`
+  (jittered exponential backoff, 50 ms – 5 s) with the parameters oprobe applied, an HTTP
+  concurrency limit only when `max_inflight_requests` was set, a custom reqwest client only when
+  the knobs changed OpenDAL's default one (keep-alive off, HTTP/2), and reader/writer helpers with
+  the tuned chunk/gap/concurrency (the writer chunk is the part size OpenDAL actually used). Both
+  the measured operator and the generated code are derived from one `ClientStack` value, and a
+  test rebuilds the layers from the generated source and compares them parameter for parameter.
+* `--emit-python` — the same for the `opendal` Python package where the binding allows
+  (`RetryLayer` with identical parameters); measured layers the binding cannot express (timeouts,
+  tail cut, HTTP limit) are listed in the header instead of being approximated.
 * `--json` — the full report of the confirmation run plus every trial (`tune.trials`).
+
+With the default text format, everything that is part of the result — the trial table, the
+recommendation and the confirmation report — goes to stdout; stderr only carries progress
+(dataset upload, cool-down pauses). With `-o json|md`, stdout holds only that
+document and the trial table is shown on stderr as progress.
 
 ## Budget
 

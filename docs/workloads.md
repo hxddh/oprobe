@@ -1,4 +1,24 @@
-# Workloads & profiles
+# Workloads & presets
+
+## Presets
+
+`--preset NAME` picks a realistic workload; the dataset is generated under the run prefix and removed at the
+end (or use your own objects read-only with `--existing PREFIX`).
+
+| Preset | Models | Dataset | Operation mix |
+|---|---|---|---|
+| `parquet` (default) | lakehouse scans (Spark, DuckDB, DataFusion) | 8 × 16 MiB | stat + 64 KiB footer read + 4 vectored 512 KiB column-chunk ranges |
+| `checkpoint` | AI/ML checkpoints | 2 × 32 MiB | 80 % 32 MiB multipart writes, 20 % full restores |
+| `small-files` | many small objects (logs, thumbnails, KV blobs) | 256 × 64 KiB | 60 % whole-object GET, 30 % 64 KiB PUT, 10 % HEAD |
+| `metadata` | catalog and listing storms | 512 × 4 KiB in 16 partitions | 40 % LIST, 60 % HEAD |
+| `mixed` | general purpose | 32 × 4 MiB | 60 % 1 MiB range reads, 10 % full reads, 20 % 1 MiB writes, 10 % stat |
+
+Shape any preset from the command line: `--objects`, `--object-size`, `--access uniform|zipf:1.1|hotset:0.2/0.8`,
+`-d/--duration`, `--warmup`, `--max-ops`, `--rate` (open loop), `-c/--concurrency`, `--io-concurrency`,
+`--chunk-size`, `--range-gap`, `--http h1|h2`, `--cache SIZE`, `--retries`, `--tail-cut`. `--dry-run` prints
+what a combination will cost before it runs.
+
+## Profiles
 
 A profile is a TOML file describing **what** to benchmark (target), **how** (workload) and **with
 which client settings** (knobs), plus the SLA used by `tune` and the volume used to project costs.
@@ -20,6 +40,10 @@ region = "eu-west-1"
 # access_key_id = "${AWS_ACCESS_KEY_ID}"   # ${ENV} references are expanded at runtime
 ```
 
+Option keys are checked against the OpenDAL service's configuration (its field names and
+aliases): a key the service would silently ignore — a typo such as `regin`, or another service's
+option — is an error with a "did you mean" suggestion.
+
 Secrets are never written to reports: option keys containing `secret`, `key`, `token`,
 `password`, `credential` or `sas` are redacted, and `--emit-profile` writes `${ENV}` placeholders.
 Without explicit keys, the backend's usual credential chain is used (e.g. `AWS_*` variables,
@@ -28,6 +52,11 @@ Without explicit keys, the backend's usual credential chain is used (e.g. `AWS_*
 URL forms: `s3://bucket/prefix`, `gcs://bucket/prefix`, `azblob://container/prefix` (set
 `account_name`), `oss://bucket`, `cos://bucket`, `b2://bucket`, `webdav[s]://host/path`,
 `fs:///absolute/path`, `memory://`.
+
+`r2://bucket/prefix` and `minio://bucket/prefix` are S3 with a provider endpoint and never fall
+back to AWS: R2 needs `account_id` (`-o account_id=<ID>`, giving
+`https://<ID>.r2.cloudflarestorage.com` with region `auto`) or `--endpoint`; MinIO needs
+`--endpoint` (path-style addressing is used). Without them oprobe stops with an error.
 
 ## Workload
 
@@ -101,11 +130,19 @@ timeout = "60s"
 ## SLA and cost
 
 ```toml
-[sla]
-p99_ms = 250.0              # tune rejects configurations whose worst-operation p99 exceeds this
-max_error_rate = 0.001
-max_throttle_rate = 0.0     # any 429/503 makes a configuration infeasible
+[sla]                       # `oprobe run` / `tune` exit 3 when the result breaches it
+enforce = true              # false (or `--sla none`): report the verdict, never fail on it
+max_error_rate = 0.01       # default: at most 1% failed operations
+p99_ms = 250.0              # worst per-operation p99 (unset: no latency objective)
+max_throttle_rate = 0.0     # throttled-operation share (unset: `run` ignores throttling that
+                            # retries absorb; `tune` treats any 429/503 as infeasible)
+```
 
+Corrupted data (a CRC32C mismatch on read-back) always breaches the SLA. Every SLA field can also
+be set from the command line: `--max-error-rate 1%`, `--max-throttle-rate 0%`, `--p99-ms 250`,
+`--sla none`.
+
+```toml
 [cost]
 provider = "aws-s3"         # pricing preset; default: detected from the endpoint
 monthly_ops = 100000000     # projection volume

@@ -21,6 +21,9 @@ static NEXT_OP_ID: AtomicU64 = AtomicU64::new(1);
 /// Maximum backend requests retained per logical operation (counts are always exact).
 pub const MAX_REQUESTS_PER_OP: usize = 512;
 
+/// Maximum retry backoff intervals retained per logical operation.
+pub const MAX_RETRY_WAITS_PER_OP: usize = 256;
+
 #[derive(Default, Debug)]
 pub struct OpScopeData {
     pub requests: Vec<RequestRecord>,
@@ -31,6 +34,9 @@ pub struct OpScopeData {
     pub cache_lookup_us: u64,
     pub retries: u64,
     pub retry_backoff_us: u64,
+    /// Backoff sleeps between retry attempts, as `[start, end)` offsets (µs) from the
+    /// operation's start (at most [`MAX_RETRY_WAITS_PER_OP`]; `retry_backoff_us` is exact).
+    pub retry_waits: Vec<(u64, u64)>,
     pub throttled: bool,
     /// Set by [`OpScope::take`]: the operation is complete and its data handed over.
     pub closed: bool,
@@ -112,6 +118,26 @@ impl OpScope {
         if let (Some(rec), Some(r), true) = (late, &self.late, self.measured) {
             r.record_unscoped_request(&rec);
         }
+    }
+
+    /// The retry layer is about to sleep `backoff` before the next attempt: account the
+    /// attempt and the wait interval (attributed to *retry* in the time breakdown).
+    pub fn record_retry(&self, backoff: std::time::Duration, throttled: bool) {
+        let start = self.started.elapsed().as_micros() as u64;
+        let us = backoff.as_micros() as u64;
+        self.with(|d| {
+            if d.closed {
+                return;
+            }
+            d.retries += 1;
+            d.retry_backoff_us += us;
+            if d.retry_waits.len() < MAX_RETRY_WAITS_PER_OP {
+                d.retry_waits.push((start, start + us));
+            }
+            if throttled {
+                d.throttled = true;
+            }
+        });
     }
 
     /// Hand over everything recorded and close the scope (later requests go to `late`).

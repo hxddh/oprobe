@@ -1,0 +1,739 @@
+{
+  "$defs": {
+    "Addressing": {
+      "description": "S3 bucket addressing.",
+      "oneOf": [
+        {
+          "const": "auto",
+          "description": "As the target configures it (OpenDAL's default: path style unless\n`enable_virtual_host_style`).",
+          "type": "string"
+        },
+        {
+          "const": "virtual",
+          "description": "`https://bucket.s3.region.amazonaws.com/key`.",
+          "type": "string"
+        },
+        {
+          "const": "path",
+          "description": "`https://s3.region.amazonaws.com/bucket/key`.",
+          "type": "string"
+        }
+      ]
+    },
+    "DatasetInfo": {
+      "properties": {
+        "existing_prefix": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "object_size_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "objects_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "partitions_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "persist": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "objects_count",
+        "object_size_bytes",
+        "partitions_count",
+        "persist"
+      ],
+      "type": "object"
+    },
+    "Defaults": {
+      "properties": {
+        "duration_s": {
+          "format": "double",
+          "type": "number"
+        },
+        "knobs": {
+          "$ref": "#/$defs/KnobValues"
+        },
+        "preset": {
+          "type": "string"
+        },
+        "trace_max_requests_count": {
+          "description": "Trace rows kept per run before reservoir sampling.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "tune_max_concurrency_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "tune_max_trials_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "tune_trial_duration": {
+          "type": "string"
+        },
+        "warmup_s": {
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "preset",
+        "duration_s",
+        "warmup_s",
+        "knobs",
+        "trace_max_requests_count",
+        "tune_trial_duration",
+        "tune_max_trials_count",
+        "tune_max_concurrency_count"
+      ],
+      "type": "object"
+    },
+    "ErrorCode": {
+      "description": "Stable error code. Serialized as its dotted string (e.g. `net.timeout`).",
+      "enum": [
+        "usage.invalid_argument",
+        "usage.unknown_target",
+        "usage.unknown_run",
+        "config.invalid",
+        "config.unknown_option",
+        "auth.no_credentials",
+        "auth.denied",
+        "net.unreachable",
+        "net.dns",
+        "net.tls",
+        "net.timeout",
+        "storage.not_found",
+        "storage.throttled",
+        "storage.unsupported",
+        "safety.budget_exceeded",
+        "safety.read_only",
+        "safety.refused",
+        "run.sla_failed",
+        "run.regression",
+        "run.interrupted",
+        "internal"
+      ],
+      "type": "string"
+    },
+    "ErrorCodeInfo": {
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/ErrorCode"
+        },
+        "docs": {
+          "type": "string"
+        },
+        "exit_code": {
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "retryable": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "code",
+        "exit_code",
+        "retryable",
+        "docs"
+      ],
+      "type": "object"
+    },
+    "ExitCodeInfo": {
+      "properties": {
+        "code": {
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "meaning": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "meaning"
+      ],
+      "type": "object"
+    },
+    "Features": {
+      "properties": {
+        "gui": {
+          "description": "`oprobe gui` (native windows).",
+          "type": "boolean"
+        },
+        "tui": {
+          "description": "`oprobe top` (terminal workbench).",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "tui",
+        "gui"
+      ],
+      "type": "object"
+    },
+    "FindingCodeInfo": {
+      "properties": {
+        "category": {
+          "type": "string"
+        },
+        "code": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "title",
+        "category"
+      ],
+      "type": "object"
+    },
+    "HttpVersion": {
+      "description": "HTTP protocol preference.",
+      "oneOf": [
+        {
+          "const": "auto",
+          "description": "Negotiate via ALPN (h2 preferred for https), HTTP/1.1 for plain http.",
+          "type": "string"
+        },
+        {
+          "const": "h1",
+          "description": "Force HTTP/1.1.",
+          "type": "string"
+        },
+        {
+          "const": "h2",
+          "description": "Require HTTP/2 (ALPN for https, prior knowledge for plain http).",
+          "type": "string"
+        }
+      ]
+    },
+    "KnobValues": {
+      "description": "Client knob values in machine units.",
+      "properties": {
+        "cache": {
+          "type": "boolean"
+        },
+        "cache_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "chunk_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "concurrency_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "http_version": {
+          "$ref": "#/$defs/HttpVersion"
+        },
+        "io_concurrency_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "keep_alive": {
+          "type": "boolean"
+        },
+        "max_inflight_requests_count": {
+          "description": "0 = unlimited.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "provider": {
+          "$ref": "#/$defs/ProviderKnobs",
+          "description": "Addressing style, checksum and SSE (S3)."
+        },
+        "range_gap_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "retries_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "tail_cut": {
+          "type": "boolean"
+        },
+        "timeout_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "transport": {
+          "$ref": "#/$defs/TransportMode"
+        }
+      },
+      "required": [
+        "concurrency_count",
+        "io_concurrency_count",
+        "chunk_bytes",
+        "range_gap_bytes",
+        "max_inflight_requests_count",
+        "http_version",
+        "transport",
+        "keep_alive",
+        "cache",
+        "cache_bytes",
+        "retries_count",
+        "tail_cut",
+        "timeout_ms"
+      ],
+      "type": "object"
+    },
+    "McpInfo": {
+      "properties": {
+        "prompts": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "protocol_versions": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "resources": {
+          "description": "URI templates.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "tools": {
+          "items": {
+            "$ref": "#/$defs/McpToolInfo"
+          },
+          "type": "array"
+        },
+        "transports": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "transports",
+        "protocol_versions",
+        "tools",
+        "resources",
+        "prompts"
+      ],
+      "type": "object"
+    },
+    "McpToolInfo": {
+      "properties": {
+        "description": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "writes": {
+          "description": "Writes test data (needs `oprobe mcp --allow-write`).",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "name",
+        "description",
+        "writes"
+      ],
+      "type": "object"
+    },
+    "MixEntry": {
+      "description": "One weighted operation of the mix.",
+      "properties": {
+        "batch_count": {
+          "description": "`delete`: keys per batch.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "column_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "columns_count": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "footer_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "limit_count": {
+          "description": "`list_paged`: keys per page.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "metadata_entries_count": {
+          "description": "`metadata_write`: user-metadata pairs per object.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "op": {
+          "description": "`read`, `parquet_scan`, `write`, `multipart_write`, `stat`, `list`.",
+          "type": "string"
+        },
+        "recursive": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "size_bytes": {
+          "description": "Read range / write size (absent: whole object).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "suffix": {
+          "description": "`parquet_scan`: footer read with a suffix range, no HEAD.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "weight": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "weight",
+        "op"
+      ],
+      "type": "object"
+    },
+    "NamedInfo": {
+      "properties": {
+        "description": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "description"
+      ],
+      "type": "object"
+    },
+    "PresetInfo": {
+      "properties": {
+        "dataset": {
+          "$ref": "#/$defs/DatasetInfo"
+        },
+        "description": {
+          "type": "string"
+        },
+        "mix": {
+          "items": {
+            "$ref": "#/$defs/MixEntry"
+          },
+          "type": "array"
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "description",
+        "mix",
+        "dataset"
+      ],
+      "type": "object"
+    },
+    "ProviderInfo": {
+      "properties": {
+        "delete_per_million_usd": {
+          "format": "double",
+          "type": "number"
+        },
+        "egress_per_gb_usd": {
+          "format": "double",
+          "type": "number"
+        },
+        "key": {
+          "description": "`--provider` value.",
+          "type": "string"
+        },
+        "list_per_million_usd": {
+          "format": "double",
+          "type": "number"
+        },
+        "name": {
+          "type": "string"
+        },
+        "note": {
+          "type": "string"
+        },
+        "read_per_million_usd": {
+          "format": "double",
+          "type": "number"
+        },
+        "storage_gb_month_usd": {
+          "format": "double",
+          "type": "number"
+        },
+        "write_per_million_usd": {
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "key",
+        "name",
+        "storage_gb_month_usd",
+        "write_per_million_usd",
+        "read_per_million_usd",
+        "list_per_million_usd",
+        "delete_per_million_usd",
+        "egress_per_gb_usd",
+        "note"
+      ],
+      "type": "object"
+    },
+    "ProviderKnobs": {
+      "additionalProperties": false,
+      "description": "Provider request options measured for their overhead (S3 service options).",
+      "properties": {
+        "addressing": {
+          "$ref": "#/$defs/Addressing",
+          "default": "auto"
+        },
+        "checksum": {
+          "description": "Checksum the client computes and the server verifies on writes (`crc32c`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sse": {
+          "description": "Server-side encryption: `AES256` or `aws:kms`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "addressing"
+      ],
+      "type": "object"
+    },
+    "Service": {
+      "properties": {
+        "aliases": {
+          "description": "Other URL schemes accepted for it.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "example": {
+          "type": "string"
+        },
+        "network": {
+          "description": "Network service (false: in-process backend).",
+          "type": "boolean"
+        },
+        "scheme": {
+          "description": "Canonical scheme (`s3`, `gcs`, …).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "scheme",
+        "aliases",
+        "example",
+        "network"
+      ],
+      "type": "object"
+    },
+    "TransportMode": {
+      "oneOf": [
+        {
+          "const": "opendal",
+          "description": "OpenDAL's default HTTP client (reqwest), observed through its extension points.",
+          "type": "string"
+        },
+        {
+          "const": "microscope",
+          "description": "oprobe's own instrumented connection pool.",
+          "type": "string"
+        }
+      ]
+    }
+  },
+  "$id": "https://github.com/hxddh/oprobe/schemas/3/capabilities.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Result of `oprobe capabilities`",
+  "properties": {
+    "defaults": {
+      "$ref": "#/$defs/Defaults"
+    },
+    "error_codes": {
+      "items": {
+        "$ref": "#/$defs/ErrorCodeInfo"
+      },
+      "type": "array"
+    },
+    "exit_codes": {
+      "items": {
+        "$ref": "#/$defs/ExitCodeInfo"
+      },
+      "type": "array"
+    },
+    "features": {
+      "$ref": "#/$defs/Features"
+    },
+    "finding_codes": {
+      "items": {
+        "$ref": "#/$defs/FindingCodeInfo"
+      },
+      "type": "array"
+    },
+    "http_versions": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "mcp": {
+      "$ref": "#/$defs/McpInfo"
+    },
+    "oprobe_version": {
+      "type": "string"
+    },
+    "output_formats": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "presets": {
+      "items": {
+        "$ref": "#/$defs/PresetInfo"
+      },
+      "type": "array"
+    },
+    "pricing_as_of": {
+      "description": "When the list prices were taken (YYYY-MM).",
+      "type": "string"
+    },
+    "providers": {
+      "description": "Pricing presets (`--provider`).",
+      "items": {
+        "$ref": "#/$defs/ProviderInfo"
+      },
+      "type": "array"
+    },
+    "schema": {
+      "description": "Always [`CAPABILITIES_SCHEMA`].",
+      "type": "string"
+    },
+    "schemas": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "services": {
+      "items": {
+        "$ref": "#/$defs/Service"
+      },
+      "type": "array"
+    },
+    "transports": {
+      "items": {
+        "$ref": "#/$defs/NamedInfo"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "schema",
+    "oprobe_version",
+    "services",
+    "presets",
+    "providers",
+    "pricing_as_of",
+    "transports",
+    "http_versions",
+    "output_formats",
+    "exit_codes",
+    "error_codes",
+    "finding_codes",
+    "schemas",
+    "mcp",
+    "defaults",
+    "features"
+  ],
+  "title": "oprobe capabilities",
+  "type": "object",
+  "x-rust-type": "Capabilities"
+}

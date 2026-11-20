@@ -1,6 +1,16 @@
 //! Generate ready-to-use configuration from tuned knobs.
+//!
+//! The emitted code reproduces exactly the client oprobe measured: the OpenDAL layers and their
+//! parameters come from [`ClientStack`] (the value `measured_operator` builds its layers from),
+//! the HTTP client settings from the knobs, and the writer chunk is the one OpenDAL actually used.
+//! Nothing that was not measured is added.
 
-use crate::config::{Knobs, Profile};
+use std::fmt::Write as _;
+use std::time::Duration;
+
+use crate::config::{Knobs, Profile, TargetSpec, TransportMode};
+use crate::engine::ClientStack;
+use crate::engine::stack::effective_write_chunk;
 use crate::net::HttpVersion;
 
 /// Profile TOML with the tuned `[knobs]`, loadable with `oprobe run --profile`.
@@ -14,107 +24,426 @@ pub fn profile_toml(profile: &Profile, knobs: &Knobs, header: &str) -> anyhow::R
     ))
 }
 
-/// Rust snippet for Apache OpenDAL 0.59 applying the tuned settings.
-pub fn rust_snippet(scheme: &str, k: &Knobs) -> String {
-    let http_limit = if k.max_inflight_requests > 0 {
-        format!(
-            "\n        .with_http_concurrent_limit({})",
-            k.max_inflight_requests
+fn ms(d: Duration) -> u128 {
+    d.as_millis()
+}
+
+/// Whether the measured HTTP client differs from OpenDAL's default `reqwest::Client::new()`
+/// (HTTP/1.1 — OpenDAL builds reqwest without `http2` — with keep-alive).
+fn custom_http_client(k: &Knobs) -> bool {
+    !k.keep_alive || k.http_version == HttpVersion::H2
+}
+
+/// Header lines shared by the Rust and Python snippets (`prefix` = comment marker).
+fn caveats(prefix: &str, k: &Knobs) -> String {
+    let mut s = String::new();
+    if k.transport == TransportMode::Microscope {
+        let _ = writeln!(
+            s,
+            "{prefix} WARNING: measured with oprobe's own connection pool (`--microscope`), not OpenDAL's\n\
+             {prefix} HTTP client. Re-run `oprobe tune` without `--microscope` to measure the client this code uses."
+        );
+    }
+    if k.cache {
+        let _ = writeln!(
+            s,
+            "{prefix} NOTE: the tuned run used oprobe's in-memory read cache ({}); OpenDAL has no equivalent\n\
+             {prefix} layer, so add your own cache in front of the operator to reproduce the result.",
+            k.cache_size
+        );
+    }
+    s
+}
+
+/// Rust snippet for Apache OpenDAL 0.59 reproducing the measured client stack.
+pub fn rust_snippet(target: &TargetSpec, k: &Knobs, cap: &opendal::Capability) -> String {
+    let stack = ClientStack::from_knobs(k);
+    let write_chunk = effective_write_chunk(cap, k.chunk_size.as_usize());
+    let https = target.endpoint().is_none_or(|e| e.starts_with("https"));
+
+    let mut features = vec!["layers-timeout"];
+    let mut imports = vec!["TimeoutLayer"];
+    let mut layers = format!(
+        "        .layer(\n            TimeoutLayer::new()\n                .with_timeout(Duration::from_millis({}))\n                .with_io_timeout(Duration::from_millis({})),\n        )",
+        ms(stack.timeout),
+        ms(stack.io_timeout)
+    );
+    if let Some(t) = &stack.tail_cut {
+        features.push("layers-tail-cut");
+        imports.push("TailCutLayer");
+        let _ = write!(
+            layers,
+            "\n        .layer(\n            TailCutLayer::builder()\n                .percentile({})\n                .safety_factor({:?})\n                .min_samples({})\n                .min_deadline(Duration::from_millis({}))\n                .max_deadline(Duration::from_millis({}))\n                .window(Duration::from_millis({}))\n                .build(),\n        )",
+            t.percentile,
+            t.safety_factor,
+            t.min_samples,
+            ms(t.min_deadline),
+            ms(t.max_deadline),
+            ms(t.window)
+        );
+    }
+    if let Some(r) = &stack.retry {
+        features.push("layers-retry");
+        imports.push("RetryLayer");
+        let _ = write!(
+            layers,
+            "\n        .layer(\n            RetryLayer::default()\n                .with_factor({:?})\n                .with_min_delay(Duration::from_millis({}))\n                .with_max_delay(Duration::from_millis({}))\n                .with_max_times({}){},\n        )",
+            r.factor,
+            ms(r.min_delay),
+            ms(r.max_delay),
+            r.max_times,
+            if r.jitter {
+                "\n                .with_jitter()"
+            } else {
+                ""
+            }
+        );
+    }
+    if let Some(n) = stack.http_concurrent_limit {
+        features.push("layers-concurrent-limit");
+        imports.push("ConcurrentLimitLayer");
+        let _ = write!(
+            layers,
+            "\n        // At most {n} HTTP requests in flight (held until the response body is consumed), as\n        // measured. The operation permits equal the measured operation concurrency, so they\n        // never bind for a workload of OPERATION_CONCURRENCY concurrent operations.\n        .layer(ConcurrentLimitLayer::new(OPERATION_CONCURRENCY).with_http_concurrent_limit({n}))"
+        );
+    }
+    let (client_fn, client_use, client_deps) = if custom_http_client(k) {
+        let mut b = String::from("reqwest::Client::builder()");
+        if !k.keep_alive {
+            b.push_str("\n        .pool_max_idle_per_host(0)");
+        }
+        let proto = match k.http_version {
+            HttpVersion::H2 if !https => {
+                b.push_str("\n        .http2_prior_knowledge()");
+                "HTTP/2 with prior knowledge (plain http)"
+            }
+            HttpVersion::H2 => "HTTP/2 negotiated by ALPN",
+            _ => "HTTP/1.1",
+        };
+        (
+            format!(
+                "\n/// The measured HTTP client: {proto}{}; otherwise reqwest's defaults, like OpenDAL's.\nfn http_transport() -> opendal::Result<HttpTransporter> {{\n    let client = {b}\n        .build()\n        .map_err(|e| opendal::Error::new(opendal::ErrorKind::ConfigInvalid, \"build http client\").set_source(e))?;\n    Ok(HttpTransporter::new(ReqwestTransport::new(client)))\n}}\n",
+                if k.keep_alive {
+                    ""
+                } else {
+                    ", a new connection for every request"
+                }
+            ),
+            "\n        .with_context(OperationContext::new().with_http_transport(http_transport()?))",
+            format!(
+                "\n//   reqwest = {{ version = \"0.13\", default-features = false, features = [\"rustls\"{}] }}\n//   opendal-http-transport-reqwest = \"0.59\"",
+                if k.http_version == HttpVersion::H2 {
+                    ", \"http2\""
+                } else {
+                    ""
+                }
+            ),
         )
     } else {
-        String::new()
+        (String::new(), "", String::new())
     };
-    let tail = if k.tail_cut {
-        "\n        .layer(TailCutLayer::builder().percentile(95).safety_factor(1.5).build())"
+    let ctx_imports = if custom_http_client(k) {
+        "\nuse opendal::{HttpTransporter, OperationContext};\nuse opendal_http_transport_reqwest::ReqwestTransport;"
     } else {
         ""
     };
-    let http_note = match k.http_version {
-        HttpVersion::H1 => {
-            "\n// Tuned for HTTP/1.1: configure your HTTP client with `http1_only()`."
-        }
-        HttpVersion::H2 => {
-            "\n// Tuned for HTTP/2: OpenDAL's reqwest client speaks HTTP/1.1 unless your crate enables\n// reqwest's `http2` feature (reqwest = { version = \"0.13\", features = [\"http2\"] })."
-        }
-        HttpVersion::Auto => "",
+    let http_note = if custom_http_client(k) {
+        ""
+    } else {
+        "\n// HTTP: OpenDAL's default client (HTTP/1.1 with keep-alive), as measured. If your build enables\n// reqwest's `http2` feature, that client negotiates HTTP/2 instead, which was not measured."
     };
     format!(
-        r#"// Generated by oprobe {ver}: {summary}{http_note}
+        r#"// Generated by oprobe {ver}: {summary}
+{caveats}// Reproduces the measured client: the same OpenDAL layers with the same parameters.
+// Cargo.toml:
+//   opendal = {{ version = "0.59", features = [{features}] }}{client_deps}{http_note}
 use std::collections::HashMap;
 use std::time::Duration;
 
-use opendal::layers::{{ConcurrentLimitLayer, RetryLayer, TimeoutLayer{tail_import}}};
-use opendal::{{Operator, Reader, Writer}};
+use opendal::layers::{{{imports}}};
+use opendal::{{Operator, Reader, Writer}};{ctx_imports}
 
-/// Concurrent logical operations the application should run (worker pool size).
+/// Concurrent logical operations the measured workload ran (size your worker pool to this).
 pub const OPERATION_CONCURRENCY: usize = {conc};
-
+/// Per-operation reader/writer parallelism (`.concurrent(n)`).
+pub const IO_CONCURRENCY: usize = {io};
+/// Reader chunk (`.chunk(n)`).
+pub const READ_CHUNK: usize = {read_chunk};
+/// Writer chunk = multipart part size OpenDAL used{write_chunk_note}.
+pub const WRITE_CHUNK: usize = {write_chunk};
+/// Vectored-read range coalescing (`.gap(n)`).
+pub const RANGE_GAP: usize = {gap};
+{client_fn}
 pub fn build_operator(config: HashMap<String, String>) -> opendal::Result<Operator> {{
     opendal::init_default_registry();
-    let op = Operator::via_iter("{scheme}", config)?
-        .layer(TimeoutLayer::new().with_timeout(Duration::from_secs({timeout})))
-        .layer(RetryLayer::default().with_jitter().with_max_times({retries})){tail}
-        .layer(ConcurrentLimitLayer::new(OPERATION_CONCURRENCY){http_limit});
+    let op = Operator::via_iter("{scheme}", config)?{client_use}
+{layers};
     Ok(op)
 }}
 
-/// Reader with tuned chunking, range coalescing and per-read parallelism.
+/// Reader with the tuned chunking, range coalescing and per-read parallelism.
 pub async fn reader(op: &Operator, path: &str) -> opendal::Result<Reader> {{
     op.reader_with(path)
-        .chunk({chunk})
-        .gap({gap})
-        .concurrent({io})
+        .chunk(READ_CHUNK)
+        .gap(RANGE_GAP)
+        .concurrent(IO_CONCURRENCY)
         .await
 }}
 
-/// Writer with tuned part size and upload parallelism.
+/// Writer with the tuned part size and upload parallelism.
 pub async fn writer(op: &Operator, path: &str) -> opendal::Result<Writer> {{
-    op.writer_with(path).chunk({chunk}).concurrent({io}).await
+    op.writer_with(path)
+        .chunk(WRITE_CHUNK)
+        .concurrent(IO_CONCURRENCY)
+        .await
 }}
 "#,
         ver = env!("CARGO_PKG_VERSION"),
         summary = k.summary(),
-        tail_import = if k.tail_cut { ", TailCutLayer" } else { "" },
+        caveats = caveats("//", k),
+        features = features
+            .iter()
+            .map(|f| format!("\"{f}\""))
+            .collect::<Vec<_>>()
+            .join(", "),
+        imports = imports.join(", "),
+        scheme = target.scheme,
         conc = k.concurrency,
-        timeout = k.timeout.get().as_secs().max(1),
-        retries = k.retries,
-        chunk = k.chunk_size.0,
-        gap = k.range_gap.0,
         io = k.io_concurrency,
+        read_chunk = k.chunk_size.0,
+        write_chunk = write_chunk,
+        write_chunk_note = if write_chunk as u64 != k.chunk_size.0 {
+            format!(
+                " (requested {}; the service's part-size limits apply)",
+                k.chunk_size
+            )
+        } else {
+            String::new()
+        },
+        gap = k.range_gap.0,
     )
 }
 
-/// Python snippet for the `opendal` package.
-pub fn python_snippet(scheme: &str, k: &Knobs) -> String {
+/// Python snippet for the `opendal` package. The Python binding exposes `RetryLayer` with the
+/// same parameters; the measured layers it cannot express are called out, never approximated.
+pub fn python_snippet(target: &TargetSpec, k: &Knobs, cap: &opendal::Capability) -> String {
+    let stack = ClientStack::from_knobs(k);
+    let write_chunk = effective_write_chunk(cap, k.chunk_size.as_usize());
+    let secs = |d: Duration| format!("{:?}", d.as_secs_f64());
+    let mut missing = vec![format!(
+        "TimeoutLayer(timeout={}s, io_timeout={}s)",
+        secs(stack.timeout),
+        secs(stack.io_timeout)
+    )];
+    if let Some(t) = &stack.tail_cut {
+        missing.push(format!(
+            "TailCutLayer(percentile={}, safety_factor={}, min_samples={}, min_deadline={}s, max_deadline={}s, window={}s)",
+            t.percentile,
+            t.safety_factor,
+            t.min_samples,
+            secs(t.min_deadline),
+            secs(t.max_deadline),
+            secs(t.window)
+        ));
+    }
+    if let Some(n) = stack.http_concurrent_limit {
+        missing.push(format!(
+            "an HTTP concurrency limit of {n} in-flight requests"
+        ));
+    }
+    if custom_http_client(k) {
+        missing.push(format!(
+            "the measured HTTP client ({}{})",
+            if k.http_version == HttpVersion::H2 {
+                "HTTP/2"
+            } else {
+                "HTTP/1.1"
+            },
+            if k.keep_alive { "" } else { ", no keep-alive" }
+        ));
+    }
+    let retry = match &stack.retry {
+        Some(r) => format!(
+            "    op = op.layer(\n        RetryLayer(\n            max_times={},\n            factor={:?},\n            jitter={},\n            min_delay={},\n            max_delay={},\n        )\n    )\n",
+            r.max_times,
+            r.factor,
+            if r.jitter { "True" } else { "False" },
+            secs(r.min_delay),
+            secs(r.max_delay)
+        ),
+        None => String::new(),
+    };
     format!(
         r#"# Generated by oprobe {ver}: {summary}
+{caveats}# The measured client also used {missing}, which the
+# Python binding does not expose: apply equivalents in your application or results will differ.
 import opendal
-from opendal.layers import RetryLayer, ConcurrentLimitLayer
-
+{retry_import}
 OPERATION_CONCURRENCY = {conc}
-CHUNK_SIZE = {chunk}
-RANGE_GAP = {gap}
 IO_CONCURRENCY = {io}
+READ_CHUNK = {read_chunk}
+WRITE_CHUNK = {write_chunk}  # multipart part size OpenDAL used
+RANGE_GAP = {gap}
 
 
 def build_operator(**config) -> opendal.AsyncOperator:
     op = opendal.AsyncOperator("{scheme}", **config)
-    op = op.layer(RetryLayer(max_times={retries}, jitter=True))
-    op = op.layer(ConcurrentLimitLayer(OPERATION_CONCURRENCY))
-    return op
+{retry}    return op
 
 
 async def read_range(op: opendal.AsyncOperator, path: str, offset: int, size: int) -> bytes:
-    async with await op.open(path, "rb", chunk=CHUNK_SIZE, gap=RANGE_GAP, concurrent=IO_CONCURRENCY) as f:
+    async with await op.open(path, "rb", chunk=READ_CHUNK, gap=RANGE_GAP, concurrent=IO_CONCURRENCY) as f:
         await f.seek(offset)
         return await f.read(size)
 "#,
         ver = env!("CARGO_PKG_VERSION"),
         summary = k.summary(),
+        caveats = caveats("#", k),
+        missing = missing.join(", "),
+        retry_import = if stack.retry.is_some() {
+            "from opendal.layers import RetryLayer\n"
+        } else {
+            ""
+        },
+        scheme = target.scheme,
         conc = k.concurrency,
-        chunk = k.chunk_size.0,
-        gap = k.range_gap.0,
         io = k.io_concurrency,
-        retries = k.retries,
+        read_chunk = k.chunk_size.0,
+        write_chunk = write_chunk,
+        gap = k.range_gap.0,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::util::{ByteSize, HumanDuration};
+    use opendal::layers::{RetryLayer, TailCutLayer, TimeoutLayer};
+
+    /// The numeric argument of the first `call` after `from` in `code`
+    /// (`Duration::from_millis(N)` arguments yield N).
+    fn arg(code: &str, call: &str) -> String {
+        let i = code
+            .find(call)
+            .unwrap_or_else(|| panic!("`{call}` not in:\n{code}"));
+        let rest = &code[i + call.len()..];
+        let rest = rest.strip_prefix("Duration::from_millis(").unwrap_or(rest);
+        rest[..rest.find(')').unwrap()].trim().to_owned()
+    }
+
+    fn millis(code: &str, call: &str) -> Duration {
+        Duration::from_millis(arg(code, call).parse().unwrap())
+    }
+
+    fn knobs(tail_cut: bool, retries: usize, inflight: usize) -> Knobs {
+        Knobs {
+            tail_cut,
+            retries,
+            max_inflight_requests: inflight,
+            timeout: HumanDuration::secs(45),
+            chunk_size: ByteSize::mib(1),
+            ..Knobs::default()
+        }
+    }
+
+    /// The emitted layers, rebuilt from the generated source, are identical (parameter for
+    /// parameter, per the layers' own `Debug`) to the ones `measured_operator` applies.
+    #[test]
+    fn rust_snippet_reproduces_the_measured_stack_exactly() {
+        let target = TargetSpec::from_url("s3://b/p").unwrap();
+        let cap = opendal::Capability {
+            write_multi_min_size: Some(5 << 20),
+            ..Default::default()
+        };
+        for k in [knobs(true, 3, 64), knobs(false, 0, 0), knobs(false, 7, 0)] {
+            let stack = ClientStack::from_knobs(&k);
+            let code = rust_snippet(&target, &k, &cap);
+
+            let timeout = TimeoutLayer::new()
+                .with_timeout(millis(&code, ".with_timeout("))
+                .with_io_timeout(millis(&code, ".with_io_timeout("));
+            assert_eq!(
+                format!("{timeout:?}"),
+                format!("{:?}", stack.timeout_layer())
+            );
+
+            match stack.retry_layer() {
+                Some(measured) => {
+                    let mut l = RetryLayer::default()
+                        .with_factor(arg(&code, ".with_factor(").parse().unwrap())
+                        .with_min_delay(millis(&code, ".with_min_delay("))
+                        .with_max_delay(millis(&code, ".with_max_delay("))
+                        .with_max_times(arg(&code, ".with_max_times(").parse().unwrap());
+                    if code.contains(".with_jitter()") {
+                        l = l.with_jitter();
+                    }
+                    assert_eq!(format!("{l:?}"), format!("{measured:?}"));
+                }
+                None => assert!(!code.contains("RetryLayer"), "{code}"),
+            }
+
+            match stack.tail_cut_layer() {
+                Some(measured) => {
+                    let l = TailCutLayer::builder()
+                        .percentile(arg(&code, ".percentile(").parse().unwrap())
+                        .safety_factor(arg(&code, ".safety_factor(").parse().unwrap())
+                        .min_samples(arg(&code, ".min_samples(").parse().unwrap())
+                        .min_deadline(millis(&code, ".min_deadline("))
+                        .max_deadline(millis(&code, ".max_deadline("))
+                        .window(millis(&code, ".window("))
+                        .build();
+                    assert_eq!(format!("{l:?}"), format!("{measured:?}"));
+                }
+                None => assert!(!code.contains("TailCutLayer"), "{code}"),
+            }
+
+            match stack.http_concurrent_limit {
+                Some(n) => assert_eq!(
+                    arg(&code, ".with_http_concurrent_limit(")
+                        .parse::<usize>()
+                        .unwrap(),
+                    n
+                ),
+                None => assert!(!code.contains("ConcurrentLimitLayer"), "{code}"),
+            }
+            // The writer uses the chunk OpenDAL actually wrote with (5 MiB minimum part size).
+            assert!(
+                code.contains(&format!("WRITE_CHUNK: usize = {};", 5 << 20)),
+                "{code}"
+            );
+            assert!(
+                code.contains(&format!("READ_CHUNK: usize = {};", 1 << 20)),
+                "{code}"
+            );
+            // Nothing unmeasured: OpenDAL's default HTTP client unless the knobs changed it.
+            assert!(!code.contains("reqwest::Client::builder"), "{code}");
+        }
+        let mut k = knobs(false, 3, 0);
+        k.keep_alive = false;
+        let code = rust_snippet(&target, &k, &cap);
+        assert!(code.contains(".pool_max_idle_per_host(0)"), "{code}");
+        assert!(
+            code.contains("with_http_transport(http_transport()?)"),
+            "{code}"
+        );
+    }
+
+    #[test]
+    fn python_snippet_matches_retry_and_names_what_it_cannot_express() {
+        let target = TargetSpec::from_url("s3://b/p").unwrap();
+        let k = knobs(true, 4, 32);
+        let code = python_snippet(&target, &k, &opendal::Capability::default());
+        let r = ClientStack::from_knobs(&k).retry.unwrap();
+        assert!(
+            code.contains(&format!("max_times={},", r.max_times)),
+            "{code}"
+        );
+        assert!(code.contains("min_delay=0.05,"), "{code}");
+        assert!(code.contains("max_delay=5.0,"), "{code}");
+        assert!(code.contains("jitter=True"), "{code}");
+        assert!(code.contains("TimeoutLayer(timeout=45.0s"), "{code}");
+        assert!(code.contains("TailCutLayer(percentile=95"), "{code}");
+        assert!(code.contains("32 in-flight requests"), "{code}");
+        assert!(!code.contains("ConcurrentLimitLayer("), "{code}");
+    }
 }

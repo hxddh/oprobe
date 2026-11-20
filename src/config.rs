@@ -33,7 +33,8 @@ pub struct Profile {
 pub struct TargetSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
-    #[serde(default)]
+    /// OpenDAL scheme; derived from `url` when empty (and then not written back).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub scheme: String,
     /// OpenDAL service options. Values may reference environment variables as `${NAME}`.
     #[serde(default)]
@@ -63,15 +64,36 @@ pub enum Preset {
     Metadata,
     /// General purpose 70/20/10 read/write/stat mix.
     Mixed,
+    /// Lakehouse scan reading the footer with a suffix range (no HEAD per file).
+    ParquetSuffix,
+    /// Churn: small writes removed again by batched deletes (OpenDAL `Deleter`).
+    Delete,
+    /// Server-side copies of dataset objects.
+    Copy,
+    /// LIST with a page size (`limit`): every page is a billed request.
+    ListPaged,
+    /// GETs through presigned URLs.
+    Presign,
+    /// Optimistic concurrency: conditional create (`If-None-Match: *`) and overwrite (`If-Match`).
+    Conditional,
+    /// HEAD storm plus small writes carrying user metadata.
+    MetadataHeavy,
 }
 
 impl Preset {
-    pub const ALL: [Preset; 5] = [
+    pub const ALL: [Preset; 12] = [
         Preset::Parquet,
         Preset::Checkpoint,
         Preset::SmallFiles,
         Preset::Metadata,
         Preset::Mixed,
+        Preset::ParquetSuffix,
+        Preset::Delete,
+        Preset::Copy,
+        Preset::ListPaged,
+        Preset::Presign,
+        Preset::Conditional,
+        Preset::MetadataHeavy,
     ];
 
     pub fn slug(&self) -> &'static str {
@@ -81,6 +103,13 @@ impl Preset {
             Preset::SmallFiles => "small-files",
             Preset::Metadata => "metadata",
             Preset::Mixed => "mixed",
+            Preset::ParquetSuffix => "parquet-suffix",
+            Preset::Delete => "delete",
+            Preset::Copy => "copy",
+            Preset::ListPaged => "list-paged",
+            Preset::Presign => "presign",
+            Preset::Conditional => "conditional",
+            Preset::MetadataHeavy => "metadata-heavy",
         }
     }
 
@@ -91,6 +120,15 @@ impl Preset {
             Preset::SmallFiles => "small objects: whole-object GET/PUT",
             Preset::Metadata => "metadata storm: LIST + HEAD over partitions",
             Preset::Mixed => "general purpose: 70% reads / 20% writes / 10% stat",
+            Preset::ParquetSuffix => {
+                "lakehouse scan without HEAD: suffix footer read + vectored column chunks"
+            }
+            Preset::Delete => "churn: 4 KiB writes removed by batched deletes (20 keys/batch)",
+            Preset::Copy => "server-side copies of 1 MiB objects",
+            Preset::ListPaged => "paged LIST: 32 keys per page over 128-object partitions",
+            Preset::Presign => "GETs through presigned URLs",
+            Preset::Conditional => "optimistic concurrency: If-None-Match / If-Match writes",
+            Preset::MetadataHeavy => "60% HEAD / 40% small writes with user metadata",
         }
     }
 
@@ -101,8 +139,16 @@ impl Preset {
             "small-files" | "small" => Ok(Preset::SmallFiles),
             "metadata" | "meta" => Ok(Preset::Metadata),
             "mixed" => Ok(Preset::Mixed),
+            "parquet-suffix" | "suffix" => Ok(Preset::ParquetSuffix),
+            "delete" | "deleter" | "churn" => Ok(Preset::Delete),
+            "copy" => Ok(Preset::Copy),
+            "list-paged" | "paged-list" => Ok(Preset::ListPaged),
+            "presign" | "presigned" => Ok(Preset::Presign),
+            "conditional" | "conditional-writes" => Ok(Preset::Conditional),
+            "metadata-heavy" => Ok(Preset::MetadataHeavy),
             other => bail!(
-                "unknown preset `{other}` (choose: parquet, checkpoint, small-files, metadata, mixed)"
+                "unknown preset `{other}` (choose: {})",
+                Preset::ALL.map(|p| p.slug()).join(", ")
             ),
         }
     }
@@ -123,8 +169,92 @@ impl Preset {
                         columns: 4,
                         column_size: ByteSize::kib(512),
                         footer_size: ByteSize::kib(64),
+                        suffix: false,
                     },
                 }],
+            ),
+            Preset::ParquetSuffix => (
+                ds(8, ByteSize::mib(16)),
+                vec![OpSpec {
+                    weight: 100,
+                    op: OpKind::ParquetScan {
+                        columns: 4,
+                        column_size: ByteSize::kib(512),
+                        footer_size: ByteSize::kib(64),
+                        suffix: true,
+                    },
+                }],
+            ),
+            Preset::Delete => (
+                ds(1, ByteSize::kib(4)),
+                vec![
+                    OpSpec {
+                        weight: 95,
+                        op: OpKind::Write {
+                            size: ByteSize::kib(4),
+                        },
+                    },
+                    OpSpec {
+                        weight: 5,
+                        op: OpKind::Delete { batch: 20 },
+                    },
+                ],
+            ),
+            Preset::Copy => (
+                ds(16, ByteSize::mib(1)),
+                vec![OpSpec {
+                    weight: 100,
+                    op: OpKind::Copy,
+                }],
+            ),
+            Preset::ListPaged => (
+                DatasetSpec {
+                    objects: 512,
+                    object_size: ByteSize::kib(1),
+                    partitions: 4,
+                    ..DatasetSpec::default()
+                },
+                vec![OpSpec {
+                    weight: 100,
+                    op: OpKind::ListPaged { limit: 32 },
+                }],
+            ),
+            Preset::Presign => (
+                ds(32, ByteSize::kib(256)),
+                vec![OpSpec {
+                    weight: 100,
+                    op: OpKind::PresignedRead,
+                }],
+            ),
+            Preset::Conditional => (
+                ds(1, ByteSize::kib(16)),
+                vec![OpSpec {
+                    weight: 100,
+                    op: OpKind::ConditionalWrite {
+                        size: ByteSize::kib(16),
+                    },
+                }],
+            ),
+            Preset::MetadataHeavy => (
+                DatasetSpec {
+                    objects: 256,
+                    object_size: ByteSize::kib(4),
+                    partitions: 8,
+                    ..DatasetSpec::default()
+                },
+                vec![
+                    OpSpec {
+                        weight: 60,
+                        op: OpKind::Stat,
+                    },
+                    OpSpec {
+                        weight: 40,
+                        op: OpKind::MetadataWrite {
+                            size: ByteSize::kib(4),
+                            entries: 8,
+                        },
+                    },
+                ],
             ),
             Preset::Checkpoint => (
                 ds(2, ByteSize::mib(32)),
@@ -229,10 +359,14 @@ pub enum OpKind {
         size: Option<ByteSize>,
     },
     /// `stat` + footer read + `columns` random column chunks fetched as one vectored read.
+    /// With `suffix`, the footer is read with a suffix range (`bytes=-N`) and no `stat`: one
+    /// request fewer per file.
     ParquetScan {
         columns: u32,
         column_size: ByteSize,
         footer_size: ByteSize,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        suffix: bool,
     },
     /// Single PUT of `size` bytes.
     Write { size: ByteSize },
@@ -245,11 +379,62 @@ pub enum OpKind {
         #[serde(default)]
         recursive: bool,
     },
+    /// LIST one dataset partition `limit` keys per page (each page is a billed request).
+    ListPaged { limit: u32 },
+    /// Delete up to `batch` objects the workload wrote, in one batch (OpenDAL `Deleter`:
+    /// `DeleteObjects` where the service batches).
+    Delete {
+        #[serde(default = "default_delete_batch")]
+        batch: u32,
+    },
+    /// Server-side copy of a dataset object to a scratch key.
+    Copy,
+    /// GET a dataset object through a presigned URL.
+    PresignedRead,
+    /// Optimistic-concurrency write of `size` bytes: create with `If-None-Match: *`, then
+    /// overwrite with `If-Match: <etag of the previous write>`.
+    ConditionalWrite { size: ByteSize },
+    /// Small write carrying `entries` user-metadata pairs and a content type.
+    MetadataWrite {
+        size: ByteSize,
+        #[serde(default = "default_meta_entries")]
+        entries: u32,
+    },
+}
+
+fn default_delete_batch() -> u32 {
+    100
+}
+fn default_meta_entries() -> u32 {
+    4
 }
 
 impl OpKind {
+    /// The operation writes or deletes (refused on read-only datasets).
     pub fn is_write(&self) -> bool {
-        matches!(self, OpKind::Write { .. } | OpKind::MultipartWrite { .. })
+        matches!(
+            self,
+            OpKind::Write { .. }
+                | OpKind::MultipartWrite { .. }
+                | OpKind::Delete { .. }
+                | OpKind::Copy
+                | OpKind::ConditionalWrite { .. }
+                | OpKind::MetadataWrite { .. }
+        )
+    }
+
+    /// The operation works on dataset objects (the dataset must be prepared).
+    pub fn needs_dataset(&self) -> bool {
+        matches!(
+            self,
+            OpKind::Read { .. }
+                | OpKind::ParquetScan { .. }
+                | OpKind::Stat
+                | OpKind::List { .. }
+                | OpKind::ListPaged { .. }
+                | OpKind::Copy
+                | OpKind::PresignedRead
+        )
     }
 }
 
@@ -443,7 +628,9 @@ impl WorkloadSpec {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum TransportMode {
     /// OpenDAL's default HTTP client (reqwest), observed through its extension points.
@@ -504,6 +691,80 @@ pub struct Knobs {
     /// Per-operation timeout.
     #[serde(default = "default_timeout")]
     pub timeout: HumanDuration,
+    /// Provider request options (addressing style, checksums, SSE), applied when the session
+    /// opens.
+    #[serde(default, skip_serializing_if = "ProviderKnobs::is_default")]
+    pub provider: ProviderKnobs,
+}
+
+/// S3 bucket addressing.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum Addressing {
+    /// As the target configures it (OpenDAL's default: path style unless
+    /// `enable_virtual_host_style`).
+    #[default]
+    Auto,
+    /// `https://bucket.s3.region.amazonaws.com/key`.
+    Virtual,
+    /// `https://s3.region.amazonaws.com/bucket/key`.
+    Path,
+}
+
+/// Provider request options measured for their overhead (S3 service options).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderKnobs {
+    #[serde(default)]
+    pub addressing: Addressing,
+    /// Checksum the client computes and the server verifies on writes (`crc32c`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checksum: Option<String>,
+    /// Server-side encryption: `AES256` or `aws:kms`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sse: Option<String>,
+}
+
+impl ProviderKnobs {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// The target options these knobs set (S3 only; an error elsewhere).
+    pub fn options(&self, scheme: &str) -> Result<Vec<(&'static str, String)>> {
+        if self.is_default() {
+            return Ok(Vec::new());
+        }
+        anyhow::ensure!(
+            scheme == "s3",
+            "addressing / checksum / sse knobs apply to S3-compatible targets only (this target is `{scheme}`)"
+        );
+        let mut o = Vec::new();
+        match self.addressing {
+            Addressing::Auto => {}
+            Addressing::Virtual => o.push(("enable_virtual_host_style", "true".to_owned())),
+            Addressing::Path => o.push(("enable_virtual_host_style", "false".to_owned())),
+        }
+        if let Some(c) = &self.checksum {
+            let c = c.trim().to_ascii_lowercase();
+            anyhow::ensure!(
+                c == "crc32c",
+                "unsupported checksum `{c}` (OpenDAL's S3 service supports crc32c)"
+            );
+            o.push(("checksum_algorithm", c));
+        }
+        if let Some(s) = &self.sse {
+            let s = s.trim();
+            anyhow::ensure!(
+                matches!(s, "AES256" | "aws:kms" | "aws:kms:dsse"),
+                "unsupported sse `{s}` (AES256, aws:kms or aws:kms:dsse)"
+            );
+            o.push(("server_side_encryption", s.to_owned()));
+        }
+        Ok(o)
+    }
 }
 
 fn default_concurrency() -> usize {
@@ -544,6 +805,7 @@ impl Default for Knobs {
             retries: default_retries(),
             tail_cut: false,
             timeout: default_timeout(),
+            provider: ProviderKnobs::default(),
         }
     }
 }
@@ -565,38 +827,83 @@ impl Knobs {
             if self.transport == TransportMode::Microscope { " (microscope)" } else { "" },
         )
         .to_ascii_lowercase()
+            + &self.provider_summary()
+    }
+
+    fn provider_summary(&self) -> String {
+        let p = &self.provider;
+        let mut s = String::new();
+        if p.addressing != Addressing::Auto {
+            s += &format!(" addressing={:?}", p.addressing).to_ascii_lowercase();
+        }
+        if let Some(c) = &p.checksum {
+            s += &format!(" checksum={c}");
+        }
+        if let Some(e) = &p.sse {
+            s += &format!(" sse={e}");
+        }
+        s
     }
 }
 
-/// Service level objectives used by `tune` and the diagnosis engine.
+/// Service level objectives. `oprobe run` / `oprobe tune` exit with code 3 when the measured
+/// result breaches them (unless `enforce = false` / `--sla none`); the tuner rejects trials that
+/// breach them and the diagnosis grades findings against them.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Sla {
+    /// Turn a breach into exit code 3. Corrupted data (CRC mismatch) is always a breach.
+    #[serde(default = "default_true")]
+    pub enforce: bool,
     /// Max acceptable p99 per operation verb (ms); unset = no latency constraint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub p99_ms: Option<f64>,
-    /// Max fraction of failed operations.
+    /// Max fraction of failed operations (default 0.01 = 1%).
     #[serde(default = "default_error_rate")]
     pub max_error_rate: f64,
-    /// Max fraction of operations that hit a 429/503 throttle.
-    #[serde(default = "default_throttle_rate")]
-    pub max_throttle_rate: f64,
+    /// Max fraction of operations that hit a 429/503 throttle. Unset: throttling that retries
+    /// absorb does not breach the SLA of a run (it is still a finding), and the tuner treats
+    /// any throttling as infeasible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_throttle_rate: Option<f64>,
 }
 
 fn default_error_rate() -> f64 {
-    0.001
-}
-fn default_throttle_rate() -> f64 {
-    0.0
+    0.01
 }
 
 impl Default for Sla {
     fn default() -> Self {
         Self {
+            enforce: true,
             p99_ms: None,
             max_error_rate: default_error_rate(),
-            max_throttle_rate: default_throttle_rate(),
+            max_throttle_rate: None,
         }
+    }
+}
+
+impl Sla {
+    /// Throttle-rate limit the tuner applies (any throttling when unset).
+    pub fn tune_throttle_limit(&self) -> f64 {
+        self.max_throttle_rate.unwrap_or(0.0)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            (0.0..=1.0).contains(&self.max_error_rate),
+            "sla.max_error_rate must be within 0..1 (e.g. 0.01 = 1%)"
+        );
+        if let Some(t) = self.max_throttle_rate {
+            anyhow::ensure!(
+                (0.0..=1.0).contains(&t),
+                "sla.max_throttle_rate must be within 0..1"
+            );
+        }
+        if let Some(p) = self.p99_ms {
+            anyhow::ensure!(p > 0.0, "sla.p99_ms must be > 0");
+        }
+        Ok(())
     }
 }
 
@@ -642,14 +949,75 @@ impl Default for CostSpec {
 }
 
 impl TargetSpec {
+    /// `fs://PATH` / `file://PATH`: the path is taken verbatim (not parsed as a URL), so Windows
+    /// paths keep their drive and separators: `fs://C:\\bench`, `fs:///C:/bench`, `fs:///tmp/x`,
+    /// `fs://relative/dir`. Empty → a directory under the temp dir. Query parameters become
+    /// options like for other schemes.
+    fn from_fs_url(raw: &str) -> Option<Self> {
+        let lower = raw.to_ascii_lowercase();
+        let rest = ["fs://", "file://"]
+            .iter()
+            .find_map(|p| lower.starts_with(p).then(|| &raw[p.len()..]))?;
+        let (path, query) = match rest.split_once('?') {
+            Some((p, q)) => (p, Some(q)),
+            None => (rest, None),
+        };
+        let mut options = BTreeMap::new();
+        if let Some(q) = query {
+            for (k, v) in url::form_urlencoded::parse(q.as_bytes()) {
+                options.insert(k.into_owned(), v.into_owned());
+            }
+        }
+        // `/C:/x` (a file URL's form of a Windows path) → `C:/x`.
+        let b = path.as_bytes();
+        let path = if b.len() >= 3 && b[0] == b'/' && b[1].is_ascii_alphabetic() && b[2] == b':' {
+            &path[1..]
+        } else {
+            path
+        };
+        let trimmed = path.trim_end_matches(['/', '\\']);
+        let root = if trimmed.is_empty() {
+            // `fs://` or `fs:///`: never the filesystem root.
+            std::env::temp_dir()
+                .join("oprobe")
+                .to_string_lossy()
+                .into_owned()
+        } else if trimmed.ends_with(':') {
+            // `C:/`: keep the drive's root separator.
+            path.to_owned()
+        } else {
+            trimmed.to_owned()
+        };
+        options.insert("root".into(), root);
+        Some(Self {
+            url: Some(raw.to_owned()),
+            scheme: "fs".into(),
+            options,
+            ..Default::default()
+        })
+    }
+
     /// Build a target from a storage URL such as `s3://bucket/prefix`, `gcs://bucket`,
-    /// `azblob://container/prefix`, `fs:///tmp/bench`, `memory://`.
+    /// `azblob://container/prefix`, `fs:///tmp/bench`, `memory://`, `lab://demo` (an in-process
+    /// lab server, see [`crate::lab::Scenario`]) or any other OpenDAL scheme compiled in
+    /// (`azdls://`, `obs://`, `swift://`, `tos://`, ... via the service's `Config::from_uri`).
+    /// Query parameters become service options: `s3://b/p?region=eu-west-1`.
     pub fn from_url(raw: &str) -> Result<Self> {
+        if let Some(t) = Self::from_fs_url(raw) {
+            return Ok(t);
+        }
         let u = url::Url::parse(raw).with_context(|| {
-            format!("invalid storage URL `{raw}` (examples: s3://bucket/prefix, fs:///tmp/bench, memory://)")
+            format!("invalid storage URL `{raw}` (examples: s3://bucket/prefix, fs:///tmp/bench, memory://, lab://demo)")
         })?;
         let scheme = u.scheme().to_ascii_lowercase();
         let mut options = BTreeMap::new();
+        for (k, v) in u.query_pairs() {
+            options.insert(k.into_owned(), v.into_owned());
+        }
+        let raw_no_query = match raw.split_once('?') {
+            Some((base, _)) => base,
+            None => raw,
+        };
         let path = u.path().trim_end_matches('/');
         let root = if path.is_empty() {
             None
@@ -725,9 +1093,37 @@ impl TargetSpec {
                 }
                 "webdav"
             }
-            other => bail!(
-                "unsupported storage scheme `{other}` (supported: s3, gcs, azblob, oss, cos, b2, webdav, fs, memory)"
-            ),
+            "lab" => {
+                let scenario = crate::lab::Scenario::parse(host.as_deref().unwrap_or_default())?;
+                let lab = crate::lab::shared(scenario)?;
+                options.insert("bucket".into(), crate::lab::LAB_BUCKET.into());
+                options.insert("region".into(), "us-east-1".into());
+                options.insert("endpoint".into(), lab.endpoint_url.clone());
+                options.insert("access_key_id".into(), "oprobe-lab".into());
+                options.insert("secret_access_key".into(), "oprobe-lab-secret".into());
+                options.insert("disable_config_load".into(), "true".into());
+                options.insert("root".into(), root.unwrap_or_else(|| "/".into()));
+                return Ok(Self {
+                    url: Some(raw.to_owned()),
+                    scheme: "s3".into(),
+                    options,
+                    // Local server: never through an egress proxy.
+                    proxy: Some("none".into()),
+                    ..Default::default()
+                });
+            }
+            other => match uri_options(other, raw_no_query)? {
+                Some(o) => {
+                    for (k, v) in o {
+                        options.entry(k).or_insert(v);
+                    }
+                    other
+                }
+                None => bail!(
+                    "unsupported storage scheme `{other}` (supported: {}, lab, memory)",
+                    supported_schemes().join(", ")
+                ),
+            },
         };
         Ok(Self {
             url: Some(raw.to_owned()),
@@ -750,7 +1146,8 @@ impl TargetSpec {
             }
             base.insecure = self.insecure;
             base.ca_cert = self.ca_cert.clone();
-            base.proxy = self.proxy.clone();
+            // `lab://` targets bring their own (`none`).
+            base.proxy = self.proxy.clone().or(base.proxy);
             base
         } else {
             self.clone()
@@ -759,7 +1156,94 @@ impl TargetSpec {
         if let Some(u) = &t.url {
             t.url = Some(crate::util::strip_url_credentials(u));
         }
+        t.apply_provider_url()?;
+        crate::service_options::validate_keys(&t.scheme, t.options.keys())?;
+        let missing: Vec<&str> = required_options(&t.scheme)
+            .iter()
+            .copied()
+            .filter(|k| t.options.get(*k).is_none_or(|v| v.trim().is_empty()))
+            .collect();
+        if !missing.is_empty() {
+            bail!(
+                "the `{}` service needs {}: add `-o {}=...` (or `?{}=...` in the URL, or under [target.options])",
+                t.scheme,
+                missing
+                    .iter()
+                    .map(|k| format!("`{k}`"))
+                    .collect::<Vec<_>>()
+                    .join(" and "),
+                missing[0],
+                missing[0]
+            );
+        }
         Ok(t)
+    }
+
+    /// The OpenDAL scheme, derived from `url` when not set explicitly.
+    pub fn service_scheme(&self) -> Result<String> {
+        if !self.scheme.is_empty() {
+            return Ok(self.scheme.clone());
+        }
+        let url = self
+            .url
+            .as_deref()
+            .context("target needs either `url` or `scheme`")?;
+        Ok(Self::from_url(url)?.scheme)
+    }
+
+    /// The scheme as the user wrote it in `url` (`r2`, `minio`, `s3a`, ...).
+    pub fn url_scheme(&self) -> Option<String> {
+        self.url
+            .as_deref()
+            .and_then(|u| u.split_once("://"))
+            .map(|(s, _)| s.to_ascii_lowercase())
+    }
+
+    /// `r2://` and `minio://` are S3 with a provider-specific endpoint: never let them fall back
+    /// to AWS. R2 takes `account_id` (→ `https://<account>.r2.cloudflarestorage.com`, region
+    /// `auto`) or an explicit endpoint; MinIO needs its endpoint.
+    fn apply_provider_url(&mut self) -> Result<()> {
+        let Some(kind) = self.url_scheme() else {
+            return Ok(());
+        };
+        let has_endpoint = self
+            .options
+            .get("endpoint")
+            .is_some_and(|e| !e.trim().is_empty());
+        match kind.as_str() {
+            "r2" => {
+                let account = self.options.remove("account_id");
+                if !has_endpoint {
+                    let Some(account) = account.filter(|a| !a.trim().is_empty()) else {
+                        bail!(
+                            "r2:// needs your Cloudflare account: add `-o account_id=<ACCOUNT_ID>` (or \
+                             `account_id = \"${{R2_ACCOUNT_ID}}\"` under [target.options]), or pass \
+                             `--endpoint https://<ACCOUNT_ID>.r2.cloudflarestorage.com`"
+                        );
+                    };
+                    self.options.insert(
+                        "endpoint".into(),
+                        format!("https://{}.r2.cloudflarestorage.com", account.trim()),
+                    );
+                }
+                self.options
+                    .entry("region".into())
+                    .or_insert_with(|| "auto".into());
+            }
+            "minio" => {
+                if !has_endpoint {
+                    bail!(
+                        "minio:// needs the server's endpoint: pass `--endpoint http://<host>:9000` \
+                         (or `endpoint = ...` under [target.options])"
+                    );
+                }
+                self.options
+                    .entry("enable_virtual_host_style".into())
+                    .or_insert_with(|| "false".into());
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     /// Options with `${ENV}` references expanded, ready for `Operator::via_iter`.
@@ -829,6 +1313,101 @@ impl TargetSpec {
     pub fn is_network(&self) -> bool {
         !matches!(self.scheme.as_str(), "memory" | "fs")
     }
+}
+
+/// URL schemes oprobe resolves (aliases included), for messages.
+pub fn supported_schemes() -> Vec<&'static str> {
+    vec![
+        "s3", "r2", "minio", "gcs", "azblob", "azdls", "azfile", "oss", "cos", "obs", "tos", "b2",
+        "swift", "webdav", "webhdfs", "upyun", "http", "fs",
+    ]
+}
+
+/// Service options of `raw` from the OpenDAL service's own `Config::from_uri` (bucket /
+/// container / account / endpoint / root, per service), or `None` for a scheme not compiled in.
+fn uri_options(scheme: &str, raw: &str) -> Result<Option<BTreeMap<String, String>>> {
+    use opendal::services::*;
+    fn opts<C: opendal::Configurator>(raw: &str) -> Result<BTreeMap<String, String>> {
+        let uri = opendal::OperatorUri::new(raw, Vec::<(String, String)>::new())
+            .with_context(|| format!("invalid storage URL `{raw}`"))?;
+        let cfg = C::from_uri(&uri).with_context(|| format!("cannot read `{raw}`"))?;
+        let v = serde_json::to_value(&cfg)?;
+        let mut out = BTreeMap::new();
+        if let serde_json::Value::Object(m) = v {
+            for (k, v) in m {
+                // Only what the URL set: defaults (null, false, empty) stay unset.
+                let s = match v {
+                    serde_json::Value::String(s) if !s.is_empty() => s,
+                    serde_json::Value::Bool(true) => "true".into(),
+                    serde_json::Value::Number(n) => n.to_string(),
+                    _ => continue,
+                };
+                out.insert(k, s);
+            }
+        }
+        Ok(out)
+    }
+    Ok(Some(match scheme {
+        "azdls" => opts::<AzdlsConfig>(raw)?,
+        "azfile" => opts::<AzfileConfig>(raw)?,
+        "obs" => opts::<ObsConfig>(raw)?,
+        "swift" => opts::<SwiftConfig>(raw)?,
+        "tos" => opts::<TosConfig>(raw)?,
+        "webhdfs" => opts::<WebhdfsConfig>(raw)?,
+        "upyun" => opts::<UpyunConfig>(raw)?,
+        "http" | "https" => {
+            let mut o = BTreeMap::new();
+            let u = url::Url::parse(raw)?;
+            o.insert(
+                "endpoint".into(),
+                format!(
+                    "{}://{}",
+                    u.scheme(),
+                    u.host_str().context("http:// URL needs a host")?
+                ) + &u.port().map(|p| format!(":{p}")).unwrap_or_default(),
+            );
+            let path = u.path().trim_end_matches('/');
+            if !path.is_empty() {
+                o.insert("root".into(), path.to_owned());
+            }
+            return Ok(Some(o));
+        }
+        _ => return Ok(None),
+    }))
+}
+
+/// Options each service cannot work without (checked before building, for a clear message).
+pub fn required_options(scheme: &str) -> &'static [&'static str] {
+    match scheme {
+        "s3" | "gcs" | "oss" | "cos" | "b2" | "obs" | "tos" => &["bucket"],
+        "azblob" => &["container"],
+        "azdls" => &["filesystem", "endpoint"],
+        "azfile" => &["share_name", "endpoint"],
+        "swift" => &["endpoint", "container"],
+        "webdav" | "webhdfs" | "http" => &["endpoint"],
+        "upyun" => &["bucket", "operator", "password"],
+        _ => &[],
+    }
+}
+
+/// Backend options for unsigned, credential-free access to a public bucket (`--anonymous`), per
+/// OpenDAL service. `skip_signature` is what OpenDAL 0.59 calls it (`allow_anonymous` is its
+/// deprecated alias); credential discovery is disabled too so no config files or metadata
+/// servers are consulted.
+pub fn anonymous_options(scheme: &str) -> Result<&'static [(&'static str, &'static str)]> {
+    Ok(match scheme {
+        "s3" => &[("skip_signature", "true"), ("disable_config_load", "true")],
+        "gcs" => &[
+            ("skip_signature", "true"),
+            ("disable_vm_metadata", "true"),
+            ("disable_config_load", "true"),
+        ],
+        // No credentials at all: unsigned requests.
+        "azblob" | "oss" => &[("skip_signature", "true")],
+        other => bail!(
+            "--anonymous is not supported for `{other}` (OpenDAL's {other} service has no unsigned mode); configure credentials instead"
+        ),
+    })
 }
 
 /// Options `from_url` derives from URL credentials: always kept (as `${ENV}` references) when
@@ -902,6 +1481,7 @@ impl Profile {
     }
 
     pub fn validate(&self) -> Result<()> {
+        self.target.normalized()?;
         let k = &self.knobs;
         anyhow::ensure!(k.concurrency >= 1, "knobs.concurrency must be >= 1");
         anyhow::ensure!(k.io_concurrency >= 1, "knobs.io_concurrency must be >= 1");
@@ -914,7 +1494,7 @@ impl Profile {
         anyhow::ensure!(
             ds.existing_prefix.is_some()
                 || ds.objects >= 1
-                || w.effective_mix().iter().all(|m| m.op.is_write()),
+                || w.effective_mix().iter().all(|m| !m.op.needs_dataset()),
             "workload.dataset.objects must be >= 1 for read workloads"
         );
         anyhow::ensure!(
@@ -925,6 +1505,7 @@ impl Profile {
             (0.0..=1.0).contains(&self.cost.egress_fraction),
             "cost.egress_fraction must be within 0..1"
         );
+        self.sla.validate()?;
         Ok(())
     }
 
@@ -988,6 +1569,68 @@ mod tests {
         assert_eq!(t.options["root"], "/tmp/x");
         assert_eq!(TargetSpec::from_url("memory://").unwrap().scheme, "memory");
         assert!(TargetSpec::from_url("ftp://x").is_err());
+    }
+
+    #[test]
+    fn anonymous_access_maps_per_service() {
+        for scheme in ["s3", "gcs", "azblob", "oss"] {
+            let opts = anonymous_options(scheme).unwrap();
+            assert!(opts.contains(&("skip_signature", "true")), "{scheme}");
+            // Every key is one the service accepts (none silently ignored).
+            let keys: Vec<String> = opts.iter().map(|(k, _)| (*k).to_owned()).collect();
+            crate::service_options::validate_keys(scheme, &keys).unwrap();
+        }
+        assert!(
+            anonymous_options("gcs")
+                .unwrap()
+                .contains(&("disable_vm_metadata", "true"))
+        );
+        let e = anonymous_options("b2").unwrap_err().to_string();
+        assert!(e.contains("not supported for `b2`"), "{e}");
+        assert!(anonymous_options("fs").is_err());
+        let t = TargetSpec::from_url("gs://b").unwrap();
+        assert_eq!(
+            TargetSpec {
+                scheme: String::new(),
+                ..t
+            }
+            .service_scheme()
+            .unwrap(),
+            "gcs"
+        );
+    }
+
+    #[test]
+    fn r2_and_minio_never_fall_back_to_aws() {
+        let e = TargetSpec::from_url("r2://bkt").unwrap().normalized();
+        assert!(e.unwrap_err().to_string().contains("account_id"));
+        let e = TargetSpec::from_url("minio://bkt").unwrap().normalized();
+        assert!(e.unwrap_err().to_string().contains("--endpoint"));
+
+        let mut r2 = TargetSpec::from_url("r2://bkt/p").unwrap();
+        r2.options.insert("account_id".into(), "abc123".into());
+        let n = r2.normalized().unwrap();
+        assert_eq!(
+            n.endpoint().unwrap(),
+            "https://abc123.r2.cloudflarestorage.com"
+        );
+        assert_eq!(n.options["region"], "auto");
+        assert!(!n.options.contains_key("account_id"));
+        assert_eq!(
+            crate::analysis::cost::detect_provider("s3", n.endpoint().as_deref()),
+            Some("cloudflare-r2")
+        );
+        // A profile written from it reloads to the same target.
+        let toml = Profile::from_target(n.clone()).to_toml().unwrap();
+        let back: Profile = toml::from_str(&toml).unwrap();
+        assert_eq!(back.target.normalized().unwrap().endpoint(), n.endpoint());
+
+        let mut m = TargetSpec::from_url("minio://bkt").unwrap();
+        m.options
+            .insert("endpoint".into(), "http://127.0.0.1:9000".into());
+        let n = m.normalized().unwrap();
+        assert_eq!(n.endpoint().unwrap(), "http://127.0.0.1:9000");
+        assert_eq!(n.options["enable_virtual_host_style"], "false");
     }
 
     #[test]
@@ -1070,6 +1713,10 @@ mod tests {
         assert!(
             !toml.contains("bucket"),
             "URL-derived options are not repeated: {toml}"
+        );
+        assert!(
+            !toml.contains("scheme"),
+            "derived scheme is not written: {toml}"
         );
         let back: Profile = toml::from_str(&toml).unwrap();
         back.validate().unwrap();
@@ -1162,10 +1809,11 @@ retries = 3
 tail_cut = false            # cancel & retry stragglers above adaptive p95
 timeout = "60s"
 
-[sla]
-# p99_ms = 200.0            # tune rejects configurations above this
-max_error_rate = 0.001
-max_throttle_rate = 0.0
+[sla]                       # `oprobe run` / `tune` exit 3 when breached (`--sla none` disables)
+enforce = true              # corrupted data always breaches the SLA
+max_error_rate = 0.01       # fraction of failed operations
+# p99_ms = 200.0            # per-operation p99 limit; tune rejects configurations above it
+# max_throttle_rate = 0.0   # fraction of throttled operations (unset: tune rejects any throttling)
 
 [cost]
 # provider = "aws-s3"       # aws-s3 | gcs | azure-blob | cloudflare-r2 | backblaze-b2 | aliyun-oss
@@ -1191,5 +1839,31 @@ mod template_tests {
                 toml::from_str(&t).unwrap_or_else(|e| panic!("{p:?}: {e}\n{t}"));
             prof.validate().unwrap();
         }
+    }
+}
+
+#[cfg(test)]
+mod fs_url_tests {
+    use super::TargetSpec;
+
+    fn root(u: &str) -> String {
+        let t = TargetSpec::from_url(u).unwrap();
+        assert_eq!(t.scheme, "fs", "{u}");
+        t.options["root"].clone()
+    }
+
+    #[test]
+    fn fs_urls_keep_windows_and_unix_paths() {
+        assert_eq!(root("fs:///tmp/x"), "/tmp/x");
+        assert_eq!(root("fs:///tmp/x/"), "/tmp/x");
+        assert_eq!(root(r"fs://C:\Users\me\bench\"), r"C:\Users\me\bench");
+        assert_eq!(root("fs:///C:/Users/me/bench"), "C:/Users/me/bench");
+        assert_eq!(root("file:///D:/data"), "D:/data");
+        assert_eq!(root("fs://C:/"), "C:/");
+        assert_eq!(root("fs://relative/dir"), "relative/dir");
+        assert!(root("fs://").ends_with("oprobe"));
+        assert!(root("fs:///").ends_with("oprobe"));
+        let t = TargetSpec::from_url("fs:///tmp/x?atomic_write_dir=/tmp/w").unwrap();
+        assert_eq!(t.options["atomic_write_dir"], "/tmp/w");
     }
 }

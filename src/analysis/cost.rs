@@ -27,7 +27,9 @@ pub struct Pricing {
 
 /// Public list prices (standard/hot tier, cheapest common region). Verify against your
 /// contract; override with `[cost.pricing]` in the profile.
-pub const PRICING_AS_OF: &str = "2025-06";
+/// Cloudflare R2 and Backblaze B2 were checked against the providers' public pricing pages on
+/// 2026-11-20 (as was the AWS GET price); the other tables are list prices as of 2025-06.
+pub const PRICING_AS_OF: &str = "2026-11";
 
 pub fn presets() -> Vec<(&'static str, Pricing)> {
     let p = |provider: &str, storage, write, list, read, egress, note: &str| Pricing {
@@ -93,12 +95,12 @@ pub fn presets() -> Vec<(&'static str, Pricing)> {
             "backblaze-b2",
             p(
                 "Backblaze B2",
-                0.006,
+                0.00695,
                 0.0,
-                4.00,
-                0.40,
+                0.0,
+                0.0,
                 0.01,
-                "egress free up to 3x stored data",
+                "$6.95/TB-month, API calls free (checked 2026-11); egress free up to 3x stored data",
             ),
         ),
         (
@@ -124,43 +126,73 @@ pub fn preset(name: &str) -> Option<Pricing> {
         .map(|(_, p)| p)
 }
 
-/// Guess the provider preset from scheme and endpoint.
-pub fn detect_provider(scheme: &str, endpoint: Option<&str>) -> &'static str {
-    let ep = endpoint.unwrap_or_default().to_ascii_lowercase();
-    if ep.contains("r2.cloudflarestorage.com") {
-        "cloudflare-r2"
-    } else if ep.contains("aliyuncs.com") || scheme == "oss" {
-        "aliyun-oss"
-    } else if ep.contains("backblazeb2.com") || scheme == "b2" {
-        "backblaze-b2"
-    } else if ep.contains("googleapis.com") || scheme == "gcs" {
-        "gcs"
-    } else if ep.contains("windows.net") || scheme == "azblob" {
-        "azure-blob"
+/// The provider price table for a recognised cloud storage endpoint; `None` for everything
+/// else (in-process backends, localhost, private addresses, self-hosted or unknown endpoints),
+/// whose bill oprobe cannot know.
+pub fn detect_provider(scheme: &str, endpoint: Option<&str>) -> Option<&'static str> {
+    if matches!(scheme, "memory" | "fs") {
+        return None;
+    }
+    let host = match endpoint {
+        Some(ep) => url::Url::parse(ep)
+            .ok()?
+            .host_str()?
+            .trim_end_matches('.')
+            .to_ascii_lowercase(),
+        // Services whose endpoint is implied by the scheme.
+        None => {
+            return match scheme {
+                "gcs" => Some("gcs"),
+                "azblob" => Some("azure-blob"),
+                "oss" => Some("aliyun-oss"),
+                "b2" => Some("backblaze-b2"),
+                _ => None,
+            };
+        }
+    };
+    let under = |domain: &str| host == domain || host.ends_with(&format!(".{domain}"));
+    if under("r2.cloudflarestorage.com") {
+        Some("cloudflare-r2")
+    } else if under("aliyuncs.com") {
+        Some("aliyun-oss")
+    } else if under("backblazeb2.com") {
+        Some("backblaze-b2")
+    } else if under("googleapis.com") {
+        Some("gcs")
+    } else if under("blob.core.windows.net") {
+        Some("azure-blob")
+    } else if under("amazonaws.com") {
+        Some("aws-s3")
     } else {
-        "aws-s3"
+        None
     }
 }
 
 /// Measured usage per logical operation.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PerOpUsage {
+    #[serde(rename = "write_requests_count")]
     pub write_requests: f64,
+    #[serde(rename = "list_requests_count")]
     pub list_requests: f64,
+    #[serde(rename = "read_requests_count")]
     pub read_requests: f64,
+    #[serde(rename = "delete_requests_count")]
     pub delete_requests: f64,
     /// Requests that failed or were throttled (billed on most providers, add no value).
+    #[serde(rename = "failed_requests_count")]
     pub failed_requests: f64,
     pub download_bytes: f64,
     pub upload_bytes: f64,
     /// Downloaded bytes the application never asked for (range coalescing / chunk over-fetch).
     pub overread_bytes: f64,
     /// GETs avoided thanks to cache hits.
+    #[serde(rename = "cache_saved_reads_count")]
     pub cache_saved_reads: f64,
     pub cache_saved_bytes: f64,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ProviderCost {
     pub key: String,
     pub provider: String,
@@ -178,16 +210,118 @@ pub struct ProviderCost {
     pub cache_savings_usd: f64,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct CostReport {
+    /// A price table applies: the target is a recognised cloud endpoint, or the profile chose a
+    /// provider / custom pricing. Otherwise `selected` and `comparison` are empty.
+    pub applicable: bool,
+    /// Why no cost is projected (when not applicable).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_applicable_reason: Option<String>,
+    /// Pricing key of `selected` (e.g. `aws-s3`, `custom`), when applicable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
     pub pricing_as_of: String,
+    #[serde(rename = "monthly_ops_count")]
     pub monthly_ops: f64,
+    #[serde(rename = "stored_gib")]
     pub stored_gb: f64,
+    #[serde(rename = "egress_ratio")]
     pub egress_fraction: f64,
     pub per_op: PerOpUsage,
     /// The provider matching the target (or the profile's choice / custom pricing).
     pub selected: ProviderCost,
     pub comparison: Vec<ProviderCost>,
+    /// Monthly request spend per storage API under the selected prices (largest first).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub by_api: Vec<ApiCost>,
+    /// Monthly spend that buys nothing: failed/throttled requests and over-read egress.
+    #[serde(default)]
+    pub waste_usd: f64,
+}
+
+/// Request spend of one storage API.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ApiCost {
+    pub api: String,
+    pub billing_class: BillingClass,
+    /// Billed requests of this API per logical operation.
+    #[serde(rename = "requests_per_op_count", alias = "requests_per_op")]
+    pub requests_per_op: f64,
+    /// Monthly spend at the projected operation volume.
+    pub monthly_usd: f64,
+    /// Share of the monthly request spend (0–100).
+    pub share_pct: f64,
+}
+
+/// Billing class of a storage API by name: OpenDAL `ServiceOperation` names and the
+/// providers' own (S3, GCS JSON, Azure Blob, B2 native); unknown names bill as reads.
+pub fn billing_class_of(api: &str) -> BillingClass {
+    let a = api.to_ascii_lowercase();
+    let has = |xs: &[&str]| xs.iter().any(|x| a.contains(x));
+    if has(&["control", "authorize", "token", "session"]) {
+        BillingClass::Free
+    } else if has(&["delete", "abort", "remove"]) {
+        BillingClass::Delete
+    } else if has(&["list", "objects.list"]) {
+        BillingClass::List
+    } else if has(&[
+        "put",
+        "upload",
+        "copy",
+        "multipart",
+        "create",
+        "complete",
+        "insert",
+        "compose",
+        "append",
+        "write",
+        "post",
+    ]) {
+        BillingClass::Write
+    } else {
+        BillingClass::Read
+    }
+}
+
+/// Request spend per API for usage measured over `ops` operations under `p`.
+fn api_costs(s: &Snapshot, p: &Pricing, spec: &CostSpec) -> Vec<ApiCost> {
+    let ops = s.summary.ops.max(1) as f64;
+    let m = spec.monthly_ops.max(0.0) / 1e6;
+    let mut v: Vec<ApiCost> = s
+        .apis
+        .iter()
+        .map(|a| {
+            let unsent = a.status.get(&0).copied().unwrap_or(0);
+            let n = a.count.saturating_sub(unsent) as f64 / ops;
+            let class = billing_class_of(a.api.label());
+            let unit = match class {
+                BillingClass::Write => p.write_per_million,
+                BillingClass::List => p.list_per_million,
+                BillingClass::Read => p.read_per_million,
+                BillingClass::Delete => p.delete_per_million,
+                BillingClass::Free => 0.0,
+            };
+            ApiCost {
+                api: a.api.label().to_owned(),
+                billing_class: class,
+                requests_per_op: n,
+                monthly_usd: n * unit * m,
+                share_pct: 0.0,
+            }
+        })
+        .filter(|c| c.requests_per_op > 0.0)
+        .collect();
+    let total: f64 = v.iter().map(|c| c.monthly_usd).sum();
+    for c in &mut v {
+        c.share_pct = if total > 0.0 {
+            c.monthly_usd * 100.0 / total
+        } else {
+            0.0
+        };
+    }
+    v.sort_by(|a, b| b.monthly_usd.total_cmp(&a.monthly_usd));
+    v
 }
 
 pub fn per_op_usage(s: &Snapshot) -> PerOpUsage {
@@ -270,24 +404,60 @@ pub fn cost_report(
     let selected_key = spec
         .provider
         .clone()
-        .unwrap_or_else(|| detect_provider(scheme, endpoint).to_owned());
+        .or_else(|| detect_provider(scheme, endpoint).map(str::to_owned));
+    let table = match (&spec.pricing, selected_key.as_deref().and_then(preset)) {
+        (Some(custom), _) => Some(("custom".to_owned(), custom.clone())),
+        (None, Some(p)) => Some((selected_key.clone().unwrap_or_default(), p)),
+        (None, None) => None,
+    };
+    let selected = table.as_ref().map(|(k, p)| price(k, p, &u, spec));
+    let by_api = table
+        .as_ref()
+        .map(|(_, p)| api_costs(s, p, spec))
+        .unwrap_or_default();
+    let Some(selected) = selected else {
+        return CostReport {
+            applicable: false,
+            not_applicable_reason: Some(match &selected_key {
+                Some(k) => format!("unknown pricing provider `{k}`"),
+                None => format!(
+                    "{} is not a recognised cloud storage endpoint, so its bill is unknown; set `cost.provider` (or `--provider`) or `[cost.pricing]` to project one",
+                    endpoint.unwrap_or(match scheme {
+                        "memory" => "the in-memory backend",
+                        "fs" => "the local filesystem",
+                        _ => "the target",
+                    })
+                ),
+            }),
+            provider: None,
+            pricing_as_of: PRICING_AS_OF.to_owned(),
+            monthly_ops: spec.monthly_ops,
+            stored_gb: spec.stored_gib,
+            egress_fraction: spec.egress_fraction,
+            per_op: u,
+            selected: ProviderCost::default(),
+            comparison: Vec::new(),
+            by_api: Vec::new(),
+            waste_usd: 0.0,
+        };
+    };
     let comparison: Vec<ProviderCost> = presets()
         .iter()
         .map(|(k, p)| price(k, p, &u, spec))
         .collect();
-    let selected = match (&spec.pricing, preset(&selected_key)) {
-        (Some(custom), _) => price("custom", custom, &u, spec),
-        (None, Some(p)) => price(&selected_key, &p, &u, spec),
-        (None, None) => price("aws-s3", &preset("aws-s3").expect("preset"), &u, spec),
-    };
     CostReport {
+        applicable: true,
+        not_applicable_reason: None,
+        provider: Some(selected.key.clone()),
         pricing_as_of: PRICING_AS_OF.to_owned(),
         monthly_ops: spec.monthly_ops,
         stored_gb: spec.stored_gib,
         egress_fraction: spec.egress_fraction,
         per_op: u,
+        waste_usd: selected.failed_requests_usd + selected.overread_usd,
         selected,
         comparison,
+        by_api,
     }
 }
 
@@ -326,7 +496,7 @@ mod tests {
             stored_gib: 0.0,
             ..Default::default()
         };
-        let r = cost_report(&s, &spec, "s3", None);
+        let r = cost_report(&s, &spec, "s3", Some("https://s3.us-east-1.amazonaws.com"));
         // per million ops: 2M GET * 0.40 + 1M PUT * 5.00 = 5.80 ;
         // egress 1e12 B = 931.32 GiB (billed "GB") * 0.09 = 83.82
         assert!(
@@ -372,20 +542,117 @@ mod tests {
             stored_gib: 10.0,
             ..Default::default()
         };
-        let r = cost_report(&s, &spec, "s3", None);
+        let r = cost_report(&s, &spec, "s3", Some("https://s3.us-east-1.amazonaws.com"));
         assert_eq!(r.stored_gb, 10.0);
+    }
+
+    #[test]
+    fn per_api_spend_and_waste() {
+        for (name, class) in [
+            ("GetObject", BillingClass::Read),
+            ("HeadObject", BillingClass::Read),
+            ("PutObject", BillingClass::Write),
+            ("CompleteMultipartUpload", BillingClass::Write),
+            ("ListObjectsV2", BillingClass::List),
+            ("DeleteObjects", BillingClass::Delete),
+            ("Control", BillingClass::Free),
+        ] {
+            assert_eq!(billing_class_of(name), class, "{name}");
+        }
+        let mut s = Snapshot {
+            summary: Summary {
+                ops: 100,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        s.apis = vec![
+            ApiStats {
+                api: Api::PutObject,
+                count: 100,
+                status: [(200u16, 100u64)].into_iter().collect(),
+                ..Default::default()
+            },
+            ApiStats {
+                api: Api::GetObject,
+                count: 100,
+                status: [(200u16, 50u64), (503, 50)].into_iter().collect(),
+                ..Default::default()
+            },
+        ];
+        let spec = CostSpec {
+            monthly_ops: 1e6,
+            ..Default::default()
+        };
+        let r = cost_report(&s, &spec, "s3", Some("https://s3.us-east-1.amazonaws.com"));
+        assert_eq!(r.by_api[0].api, "PutObject");
+        assert!((r.by_api[0].monthly_usd - 5.0).abs() < 1e-9);
+        assert!(r.by_api[0].share_pct > 90.0);
+        assert!(r.waste_usd > 0.0);
     }
 
     #[test]
     fn detects_providers() {
         assert_eq!(
             detect_provider("s3", Some("https://acc.r2.cloudflarestorage.com")),
-            "cloudflare-r2"
+            Some("cloudflare-r2")
         );
-        assert_eq!(detect_provider("gcs", None), "gcs");
+        assert_eq!(detect_provider("gcs", None), Some("gcs"));
         assert_eq!(
             detect_provider("s3", Some("https://oss-cn-hangzhou.aliyuncs.com")),
-            "aliyun-oss"
+            Some("aliyun-oss")
         );
+        assert_eq!(
+            detect_provider("s3", Some("https://s3.eu-west-1.amazonaws.com")),
+            Some("aws-s3")
+        );
+        for local in [
+            "http://127.0.0.1:9000",
+            "http://localhost:9000",
+            "http://10.0.0.5:9000",
+            "https://minio.internal",
+            "http://[::1]:9000",
+            // A cloud domain in the path or as a prefix is not that cloud.
+            "http://192.168.1.2/amazonaws.com",
+            "https://amazonaws.com.evil.example",
+        ] {
+            assert_eq!(detect_provider("s3", Some(local)), None, "{local}");
+        }
+        assert_eq!(detect_provider("memory", None), None);
+        assert_eq!(detect_provider("fs", None), None);
+        assert_eq!(detect_provider("cos", None), None);
+    }
+
+    #[test]
+    fn no_cost_is_projected_for_local_or_unknown_endpoints() {
+        let s = Snapshot {
+            summary: Summary {
+                ops: 10,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let spec = CostSpec::default();
+        for (scheme, ep) in [
+            ("memory", None),
+            ("fs", None),
+            ("s3", Some("http://127.0.0.1:9000")),
+        ] {
+            let r = cost_report(&s, &spec, scheme, ep);
+            assert!(!r.applicable, "{scheme} {ep:?}");
+            assert!(r.not_applicable_reason.is_some());
+            assert!(r.comparison.is_empty());
+            assert_eq!(r.selected.total_usd, 0.0);
+        }
+        // An explicit choice of price table applies anywhere.
+        let chosen = CostSpec {
+            provider: Some("aws-s3".into()),
+            ..Default::default()
+        };
+        let r = cost_report(&s, &chosen, "s3", Some("http://127.0.0.1:9000"));
+        assert!(r.applicable);
+        assert_eq!(r.selected.key, "aws-s3");
+        let r = cost_report(&s, &spec, "s3", Some("https://s3.us-east-1.amazonaws.com"));
+        assert!(r.applicable && r.selected.key == "aws-s3");
     }
 }

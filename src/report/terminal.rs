@@ -5,8 +5,19 @@ use std::fmt::Write as _;
 use super::Report;
 use super::style::*;
 use crate::analysis::diagnosis::Severity;
-use crate::trace::{Protocol, RequestRecord, SlowOp, Snapshot};
+use crate::model::{OpRow, ReqRow, Run, VerdictLevel, WireProtocol};
+use crate::trace::{ApiStats, VerbStats};
 use crate::util::{fmt_bytes, fmt_ms, fmt_usd};
+
+/// `HEALTHY` / `REVIEW` / `ATTENTION` / `CRITICAL` badge of a verdict level.
+pub fn verdict_badge(level: VerdictLevel) -> String {
+    match level {
+        VerdictLevel::Ok => badge("HEALTHY", "42;30"),
+        VerdictLevel::Review => badge("REVIEW", "46;30"),
+        VerdictLevel::Attention => badge("ATTENTION", "43;30"),
+        VerdictLevel::Critical => badge("CRITICAL", "41"),
+    }
+}
 
 fn section(out: &mut String, title: &str) {
     let _ = writeln!(out, "\n{}", bold(&cyan(title)));
@@ -22,39 +33,52 @@ pub fn severity_icon(s: Severity) -> String {
 
 /// Render the time-share bars (used by run reports and the TUI-less live view).
 pub fn time_share_lines(r: &Report) -> String {
-    let sh = &r.diagnosis.shares;
+    let sh = &r.stages.shares;
     let mut out = String::new();
     let rows = [
         (
             "queue",
-            sh.queue,
-            "waiting for in-flight permits / connections",
+            sh.queue_pct / 100.0,
+            "waiting for permits or connections",
         ),
         (
             "connect",
-            sh.connect,
-            "DNS + TCP + proxy + TLS on fresh connections",
+            sh.connect_pct / 100.0,
+            "DNS + TCP + proxy + TLS (new conns)",
         ),
-        ("upload", sh.upload, "sending request bodies"),
+        ("upload", sh.upload_pct / 100.0, "sending request bodies"),
         (
             if r.target.endpoint.is_some() {
                 "server"
             } else {
                 "backend"
             },
-            sh.server,
-            "time to first byte (server processing + RTT)",
+            sh.server_pct / 100.0,
+            "time to first byte (server + RTT)",
         ),
-        ("download", sh.download, "receiving response bodies"),
-        ("cache", sh.cache, "local cache lookups"),
-        ("client", sh.client, "OpenDAL / signing / CRC / consumer"),
+        (
+            "download",
+            sh.download_pct / 100.0,
+            "receiving response bodies",
+        ),
+        (
+            "retry",
+            sh.retry_pct / 100.0,
+            "backoff between retry attempts",
+        ),
+        ("cache", sh.cache_pct / 100.0, "local cache lookups"),
+        (
+            "client",
+            sh.client_pct / 100.0,
+            "OpenDAL / signing / CRC / consumer",
+        ),
     ];
     let max = rows.iter().map(|r| r.1).fold(0.0, f64::max).max(1e-9);
     for (name, v, desc) in rows {
         if v < 0.0005 && name != "server" {
             continue;
         }
-        let b = bar(v / max, 28);
+        let b = bar(v / max, 20);
         let colored = if (v - max).abs() < 1e-12 {
             magenta(&b)
         } else {
@@ -71,8 +95,40 @@ pub fn time_share_lines(r: &Report) -> String {
     out
 }
 
-pub fn request_line(i: usize, r: &RequestRecord) -> String {
-    let t = &r.timing;
+/// `✓ met (failed ops ≤ 1%, no corrupted data)` or `✖ BREACHED: …`.
+pub fn sla_line(r: &Report) -> String {
+    let sla = &r.sla;
+    let mut terms = vec![
+        format!("failed ops ≤ {}%", sla.max_error_ratio * 100.0),
+        "no corrupted data".to_owned(),
+    ];
+    if let Some(t) = sla.max_throttle_ratio {
+        terms.push(format!("throttled ops ≤ {}%", t * 100.0));
+    }
+    if let Some(p) = sla.p99_ms {
+        terms.push(format!("p99 ≤ {}", fmt_ms(p)));
+    }
+    let v = &r.verdict.sla;
+    let enforced = if v.enforced {
+        ""
+    } else {
+        " · not enforced (--sla none)"
+    };
+    if v.passed {
+        format!("{} met ({}){}", green("✓"), terms.join(", "), dim(enforced))
+    } else {
+        format!(
+            "{} {}{}",
+            red(&bold("✖ BREACHED:")),
+            red(&v.breaches.join("; ")),
+            dim(enforced)
+        )
+    }
+}
+
+/// One request of an operation that started at `op_t_us`.
+pub fn request_line(i: usize, r: &ReqRow, op_t_us: i64) -> String {
+    let t = r;
     let ms = |us: u64| fmt_ms(us as f64 / 1000.0);
     let status = if r.status == 0 {
         red("ERR")
@@ -82,10 +138,10 @@ pub fn request_line(i: usize, r: &RequestRecord) -> String {
         green(&r.status.to_string())
     };
     let conn = match r.protocol {
-        Protocol::InProcess => "in-process".to_owned(),
+        WireProtocol::Inproc => "in-process".to_owned(),
         p => format!(
             "{} conn#{} {}",
-            if p == Protocol::Http2 { "h2" } else { "h1" },
+            if p == WireProtocol::H2 { "h2" } else { "h1" },
             r.conn_id,
             if r.reused { "warm" } else { "cold" }
         ),
@@ -94,7 +150,7 @@ pub fn request_line(i: usize, r: &RequestRecord) -> String {
     if t.queue_us > 0 {
         parts.push(format!("queue {}", ms(t.queue_us)));
     }
-    if !r.reused && r.protocol != Protocol::InProcess {
+    if !r.reused && r.protocol != WireProtocol::Inproc {
         let phases: Vec<String> = [
             ("dns", t.dns_us),
             ("tcp", t.tcp_us),
@@ -111,7 +167,7 @@ pub fn request_line(i: usize, r: &RequestRecord) -> String {
             phases.join(" ")
         ));
     }
-    if r.protocol != Protocol::InProcess {
+    if r.protocol != WireProtocol::Inproc {
         parts.push(format!("send {}", ms(t.send_us)));
         parts.push(format!("ttfb {}", ms(t.ttfb_us)));
         parts.push(format!("transfer {}", ms(t.body_us)));
@@ -124,8 +180,8 @@ pub fn request_line(i: usize, r: &RequestRecord) -> String {
     let mut s = format!(
         "    #{:<2} +{:<8} {:<24} {} {}  {}  {}",
         i + 1,
-        fmt_ms(r.start_offset_us as f64 / 1000.0),
-        r.api.label(),
+        fmt_ms((r.t_us - op_t_us).max(0) as f64 / 1000.0),
+        r.api,
         status,
         dim(&conn),
         parts.join(" · "),
@@ -140,22 +196,25 @@ pub fn request_line(i: usize, r: &RequestRecord) -> String {
     s
 }
 
-pub fn slow_op_block(op: &SlowOp, show_tree: bool) -> String {
+/// An operation with its request timeline.
+pub fn slow_op_block(op: &OpRow, requests: &[&ReqRow], show_tree: bool) -> String {
     let mut out = String::new();
     let b = &op.breakdown;
+    let ms = |us: u64| fmt_ms(us as f64 / 1000.0);
     let _ = writeln!(
         out,
         "  {} {} at {:.1}s  {}",
         bold(&op.verb),
-        bold(&fmt_ms(op.latency_ms)),
-        op.at_s,
+        bold(&ms(op.latency_us)),
+        op.t_us as f64 / 1e6,
         dim(&format!(
-            "queue {} · backend {} · client {}{}",
-            fmt_ms(b.queue_ms),
-            fmt_ms(b.backend_ms),
-            fmt_ms(b.client_ms + b.cache_ms),
-            if op.retries > 0 {
-                format!(" · {} retries", op.retries)
+            "queue {} · backend {} · retry {} · client {}{}",
+            ms(b.queue_us),
+            ms(b.backend_us),
+            ms(b.retry_us),
+            ms(b.client_us + b.cache_us),
+            if op.attempts > 1 {
+                format!(" · {} retries", op.attempts - 1)
             } else {
                 String::new()
             }
@@ -164,14 +223,14 @@ pub fn slow_op_block(op: &SlowOp, show_tree: bool) -> String {
     if let Some(e) = &op.error {
         let _ = writeln!(out, "    {}", red(&format!("failed: {e}")));
     }
-    for (i, r) in op.requests.iter().take(12).enumerate() {
-        let _ = writeln!(out, "{}", request_line(i, r));
+    for (i, r) in requests.iter().take(12).enumerate() {
+        let _ = writeln!(out, "{}", request_line(i, r, op.t_us));
     }
-    if op.requests.len() > 12 {
+    if requests.len() > 12 {
         let _ = writeln!(
             out,
             "    {}",
-            dim(&format!("… {} more requests", op.requests.len() - 12))
+            dim(&format!("… {} more requests", requests.len() - 12))
         );
     }
     if show_tree && let Some(t) = &op.await_tree {
@@ -187,127 +246,260 @@ pub fn slow_op_block(op: &SlowOp, show_tree: bool) -> String {
     out
 }
 
-pub fn verbs_table(s: &Snapshot) -> String {
-    let rows: Vec<Vec<String>> = s
-        .verbs
-        .iter()
-        .map(|v| {
-            vec![
-                v.verb.clone(),
-                v.count.to_string(),
-                format!("{:.1}", v.ops_per_s),
-                format!("{:.1}", v.mib_per_s),
-                fmt_ms(v.latency.p50),
-                fmt_ms(v.latency.p90),
-                fmt_ms(v.latency.p99),
-                fmt_ms(v.latency.max),
-                format!("{:.2}", v.requests_per_op),
-                if v.errors > 0 {
-                    red(&v.errors.to_string())
-                } else {
-                    "0".into()
-                },
-            ]
-        })
-        .collect();
-    table(
-        &[
-            "operation",
-            "count",
-            "ops/s",
-            "MiB/s",
-            "p50",
-            "p90",
-            "p99",
-            "max",
-            "req/op",
-            "errors",
-        ],
-        &rows,
-        2,
-    )
+/// Width the default full report fits in.
+pub const WIDTH: usize = 80;
+
+/// Cut a line to `max` visible columns (ANSI escapes are kept; an ellipsis marks the cut).
+pub fn fit(line: &str, max: usize) -> String {
+    if visible_width(line) <= max {
+        return line.to_owned();
+    }
+    let mut out = String::new();
+    let mut w = 0;
+    let mut in_esc = false;
+    for c in line.chars() {
+        if in_esc {
+            out.push(c);
+            if c == 'm' {
+                in_esc = false;
+            }
+        } else if c == '\x1b' {
+            in_esc = true;
+            out.push(c);
+        } else if w + 1 < max {
+            out.push(c);
+            w += 1;
+        } else {
+            break;
+        }
+    }
+    out.push('…');
+    if enabled() {
+        out.push_str("\x1b[0m");
+    }
+    out
 }
 
-pub fn apis_table(s: &Snapshot) -> String {
-    let rows: Vec<Vec<String>> = s
-        .apis
+/// Operations: compact columns by default, every column with `detail`.
+pub fn verbs_table(verbs: &[VerbStats], detail: bool) -> String {
+    let rows: Vec<Vec<String>> = verbs
+        .iter()
+        .map(|v| {
+            let errors = if v.errors > 0 {
+                red(&v.errors.to_string())
+            } else {
+                "0".into()
+            };
+            if detail {
+                vec![
+                    v.verb.clone(),
+                    v.count.to_string(),
+                    format!("{:.1}", v.ops_per_s),
+                    format!("{:.1}", v.mib_per_s),
+                    fmt_ms(v.latency.p50),
+                    fmt_ms(v.latency.p90),
+                    fmt_ms(v.latency.p99),
+                    fmt_ms(v.latency.p999),
+                    fmt_ms(v.latency.max),
+                    format!("{:.2}", v.requests_per_op),
+                    v.retries.to_string(),
+                    errors,
+                ]
+            } else {
+                vec![
+                    v.verb.clone(),
+                    v.count.to_string(),
+                    format!("{:.1}", v.ops_per_s),
+                    fmt_ms(v.latency.p50),
+                    fmt_ms(v.latency.p99),
+                    fmt_ms(v.latency.max),
+                    format!("{:.2}", v.requests_per_op),
+                    errors,
+                ]
+            }
+        })
+        .collect();
+    if detail {
+        table(
+            &[
+                "operation",
+                "count",
+                "ops/s",
+                "MiB/s",
+                "p50",
+                "p90",
+                "p99",
+                "p99.9",
+                "max",
+                "req/op",
+                "retries",
+                "errors",
+            ],
+            &rows,
+            2,
+        )
+    } else {
+        table(
+            &[
+                "operation",
+                "count",
+                "ops/s",
+                "p50",
+                "p99",
+                "max",
+                "req/op",
+                "errors",
+            ],
+            &rows,
+            2,
+        )
+    }
+}
+
+fn status_summary(a: &ApiStats) -> String {
+    a.status
+        .iter()
+        .map(|(c, n)| {
+            let label = if *c == 0 {
+                "err".to_owned()
+            } else {
+                c.to_string()
+            };
+            let t = format!("{label}×{n}");
+            if *c == 0 || *c >= 400 { red(&t) } else { t }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Backend requests: compact columns by default (mean ttfb, p99, statuses), every stage with
+/// `detail`.
+pub fn apis_table(apis: &[ApiStats], detail: bool) -> String {
+    let rows: Vec<Vec<String>> = apis
         .iter()
         .map(|a| {
             let st = &a.stages;
-            let status: Vec<String> = a
-                .status
-                .iter()
-                .map(|(c, n)| {
-                    let label = if *c == 0 {
-                        "err".to_owned()
+            if detail {
+                vec![
+                    a.api.label().to_owned(),
+                    a.count.to_string(),
+                    format!("{:.0}%", a.reused_pct),
+                    fmt_ms(st.queue.mean),
+                    if st.connect.count > 0 {
+                        fmt_ms(st.connect.mean)
                     } else {
-                        c.to_string()
-                    };
-                    let t = format!("{label}×{n}");
-                    if *c == 0 || *c >= 400 { red(&t) } else { t }
-                })
-                .collect();
-            vec![
-                a.api.label().to_owned(),
-                a.count.to_string(),
-                format!("{:.0}%", a.reused_pct),
-                fmt_ms(st.queue.mean),
-                if st.connect.count > 0 {
-                    fmt_ms(st.connect.mean)
-                } else {
-                    "-".into()
-                },
-                fmt_ms(st.send.mean),
-                fmt_ms(st.ttfb.mean),
-                fmt_ms(st.body.mean),
-                fmt_ms(st.stall.mean),
-                fmt_ms(st.total.p99),
-                status.join(" "),
-            ]
+                        "-".into()
+                    },
+                    fmt_ms(st.send.mean),
+                    fmt_ms(st.ttfb.mean),
+                    fmt_ms(st.body.mean),
+                    fmt_ms(st.stall.mean),
+                    fmt_ms(st.total.p99),
+                    status_summary(a),
+                ]
+            } else {
+                vec![
+                    a.api.label().to_owned(),
+                    a.count.to_string(),
+                    format!("{:.0}%", a.reused_pct),
+                    fmt_ms(st.ttfb.mean),
+                    fmt_ms(st.body.mean),
+                    fmt_ms(st.total.p99),
+                    status_summary(a),
+                ]
+            }
         })
         .collect();
-    table(
-        &[
-            "request", "count", "warm", "queue", "connect", "send", "ttfb", "transfer", "stall",
-            "p99", "status",
-        ],
-        &rows,
-        2,
-    )
+    if detail {
+        table(
+            &[
+                "request", "count", "warm", "queue", "connect", "send", "ttfb", "transfer",
+                "stall", "p99", "status",
+            ],
+            &rows,
+            2,
+        )
+    } else {
+        table(
+            &[
+                "request", "count", "warm", "ttfb", "transfer", "p99", "status",
+            ],
+            &rows,
+            2,
+        )
+    }
 }
 
+/// The full report of a report without trace rows.
 pub fn render(r: &Report) -> String {
-    let s = &r.result;
+    render_with(r, None, false)
+}
+
+/// The full report of a run (`oprobe runs show`), fitting 80 columns.
+pub fn render_run(run: &Run) -> String {
+    render_with(&run.report, Some(run), false)
+}
+
+/// The full report; `detail` adds every column, per-stage and per-verb breakdowns, remote
+/// addresses, the per-second timeline, effective knobs and the five slowest operations.
+pub fn render_run_with(run: &Run, detail: bool) -> String {
+    render_with(&run.report, Some(run), detail)
+}
+
+fn kv(out: &mut String, k: &str, v: &str) {
+    let _ = writeln!(out, "  {} {v}", dim(&format!("{k:<11}")));
+}
+
+fn render_with(r: &Report, run: Option<&Run>, detail: bool) -> String {
     let mut out = String::new();
+    let sm = &r.summary;
+
+    // Identity.
     let _ = writeln!(
         out,
-        "{} {} {} {}",
+        "{} {} {}",
         bold("oprobe"),
-        dim(&r.oprobe_version),
-        bold(&r.target.display),
+        dim(&r.run.oprobe_version),
         dim(&format!(
-            "· {} · {:.1}s measured · {} · client {}",
-            r.workload.preset.slug(),
-            s.elapsed_s,
-            if let Some(rate) = r.workload.rate {
-                format!("open-loop {rate} ops/s")
-            } else {
-                format!("{} workers", r.knobs.concurrency)
-            },
-            match r.knobs.transport {
-                crate::config::TransportMode::Opendal => "OpenDAL reqwest",
-                crate::config::TransportMode::Microscope => "oprobe microscope",
-            }
+            "· run {}{}",
+            r.run.id,
+            r.run
+                .label
+                .as_ref()
+                .map(|l| format!(" · {l}"))
+                .unwrap_or_default()
         ))
     );
-    if r.interrupted {
-        let _ = writeln!(
-            out,
-            "{} {}",
-            badge("INTERRUPTED", "43;30"),
-            yellow("run stopped early: results cover a shorter window than configured")
-        );
-    }
+    let _ = writeln!(
+        out,
+        "{} {}",
+        bold(&r.target.display),
+        dim(&r
+            .target
+            .name
+            .as_ref()
+            .map(|n| format!("(target {n})"))
+            .unwrap_or_default())
+    );
+    let _ = writeln!(
+        out,
+        "{}",
+        dim(&format!(
+            "{} · {:.1}s measured · {} · client {} · {}",
+            r.workload.preset,
+            r.run.window_s,
+            if let Some(rate) = r.workload.rate_per_s {
+                format!("open loop {rate} ops/s")
+            } else {
+                format!("{} workers", r.knobs.requested.concurrency_count)
+            },
+            match r.knobs.requested.transport {
+                crate::config::TransportMode::Opendal => "OpenDAL reqwest",
+                crate::config::TransportMode::Microscope => "microscope",
+            },
+            r.run.started_at
+        ))
+    );
     if let Some(ep) = &r.target.endpoint {
         let _ = writeln!(
             out,
@@ -322,55 +514,118 @@ pub fn render(r: &Report) -> String {
             ))
         );
     }
+    if r.run.interrupted {
+        let _ = writeln!(
+            out,
+            "{} {}",
+            badge("INTERRUPTED", "43;30"),
+            yellow("stopped early: a shorter window than configured")
+        );
+    }
     for w in &r.warnings {
         let _ = writeln!(out, "{} {}", yellow("warning:"), w);
     }
-
-    let worst = r.diagnosis.worst();
-    let verdict = match worst {
-        Severity::Critical => badge("ATTENTION", "41"),
-        Severity::Warning => badge("REVIEW", "43;30"),
-        Severity::Info => badge("HEALTHY", "42;30"),
-    };
-    let _ = writeln!(out, "\n{verdict} {}", bold(&r.diagnosis.headline));
-
-    let sm = &s.summary;
     let _ = writeln!(
         out,
-        "\n  {} {:.1} ops/s · {:.1} MiB/s {}   {} p50 {} · p99 {} · p99.9 {}   {} {} · {}",
-        dim("throughput"),
-        sm.ops_per_s,
-        sm.mib_per_s,
-        dim(&format!(
-            "(read {:.1} / write {:.1})",
-            sm.read_mib_per_s, sm.write_mib_per_s
-        )),
-        dim("latency"),
-        fmt_ms(sm.latency.p50),
-        fmt_ms(sm.latency.p99),
-        fmt_ms(sm.latency.p999),
-        dim("errors"),
-        if sm.failed_ops > 0 {
-            red(&sm.failed_ops.to_string())
-        } else {
-            "0".into()
-        },
-        if s.resilience.throttled_responses > 0 {
-            red(&format!("{} throttled", s.resilience.throttled_responses))
-        } else {
-            "0 throttled".into()
-        },
+        "\n{} {}",
+        verdict_badge(r.verdict.level),
+        bold(&r.verdict.headline)
     );
-    if let Some(ol) = &s.open_loop {
-        let _ = writeln!(
-            out,
-            "  {} target {:.0} ops/s · achieved {:.0} · missed {} · max schedule lag {}",
-            dim("open loop"),
-            ol.target_rate,
-            ol.achieved_rate,
-            ol.missed,
-            fmt_ms(ol.max_schedule_lag_ms)
+
+    section(&mut out, "KEY NUMBERS");
+    kv(
+        &mut out,
+        "throughput",
+        &format!(
+            "{:.1} ops/s · {:.1} MiB/s {}",
+            sm.ops_per_s,
+            sm.mib_per_s,
+            dim(&format!(
+                "(read {:.1} / write {:.1})",
+                sm.read_mib_per_s, sm.write_mib_per_s
+            ))
+        ),
+    );
+    kv(
+        &mut out,
+        "latency",
+        &format!(
+            "p50 {} · p99 {} · p99.9 {} · max {}",
+            fmt_ms(sm.latency.p50),
+            fmt_ms(sm.latency.p99),
+            fmt_ms(sm.latency.p999),
+            fmt_ms(sm.latency.max)
+        ),
+    );
+    kv(
+        &mut out,
+        "errors",
+        &format!(
+            "{} failed ops ({:.2}%) · {}",
+            if sm.failed_ops > 0 {
+                red(&sm.failed_ops.to_string())
+            } else {
+                "0".into()
+            },
+            sm.error_rate * 100.0,
+            if r.resilience.throttled_responses > 0 {
+                red(&format!("{} throttled", r.resilience.throttled_responses))
+            } else {
+                "0 throttled".into()
+            }
+        ),
+    );
+    kv(&mut out, "sla", &sla_line(r));
+    if r.cost.applicable && sm.ops > 0 {
+        kv(
+            &mut out,
+            "cost",
+            &format!(
+                "{} per 1M ops · {} /month ({})",
+                fmt_usd(r.cost.selected.per_million_ops_usd),
+                fmt_usd(r.cost.selected.total_usd),
+                r.cost.selected.provider
+            ),
         );
+    }
+    if let Some(ol) = &r.open_loop {
+        kv(
+            &mut out,
+            "open loop",
+            &format!(
+                "target {:.0} ops/s · achieved {:.0} · missed {} · lag {}",
+                ol.target_rate,
+                ol.achieved_rate,
+                ol.missed,
+                fmt_ms(ol.max_schedule_lag_ms)
+            ),
+        );
+    }
+
+    if !r.findings.is_empty() {
+        section(&mut out, "FINDINGS");
+        let mut fs: Vec<_> = r.findings.iter().collect();
+        fs.sort_by_key(|f| std::cmp::Reverse(f.severity));
+        for f in fs {
+            let _ = writeln!(
+                out,
+                "  {} {} {}",
+                severity_icon(f.severity),
+                bold(&f.cause),
+                dim(&format!("[{}]", f.code))
+            );
+            for l in wrap_text(&f.evidence.text, WIDTH - 4) {
+                let _ = writeln!(out, "    {}", dim(&l));
+            }
+            for (i, l) in wrap_text(&f.advice, WIDTH - 6).iter().enumerate() {
+                let _ = writeln!(out, "    {} {l}", if i == 0 { "→" } else { " " });
+            }
+            if let Some(v) = &f.verification
+                && let Some(c) = &v.command
+            {
+                let _ = writeln!(out, "    {} {}", dim("try:"), c);
+            }
+        }
     }
 
     section(
@@ -378,28 +633,75 @@ pub fn render(r: &Report) -> String {
         "WHERE THE TIME GOES  (share of operation wall time)",
     );
     out.push_str(&time_share_lines(r));
+    if detail {
+        let p = &r.stages.request_p99;
+        let _ = writeln!(
+            out,
+            "  {}",
+            dim(&format!(
+                "request p99: queue {} · connect {} · send {} · ttfb {} · body {} · stall {} · total {}",
+                fmt_ms(p.queue_ms),
+                fmt_ms(p.connect_ms),
+                fmt_ms(p.send_ms),
+                fmt_ms(p.ttfb_ms),
+                fmt_ms(p.body_ms),
+                fmt_ms(p.stall_ms),
+                fmt_ms(p.total_ms)
+            ))
+        );
+        if !r.stages.per_verb.is_empty() {
+            let rows: Vec<Vec<String>> = r
+                .stages
+                .per_verb
+                .iter()
+                .map(|v| {
+                    let b = &v.breakdown;
+                    vec![
+                        v.verb.clone(),
+                        fmt_ms(b.queue_ms),
+                        fmt_ms(b.cache_ms),
+                        fmt_ms(b.backend_ms),
+                        fmt_ms(b.retry_ms),
+                        fmt_ms(b.client_ms),
+                    ]
+                })
+                .collect();
+            out.push_str(&table(
+                &[
+                    "mean per op",
+                    "queue",
+                    "cache",
+                    "backend",
+                    "retry",
+                    "client",
+                ],
+                &rows,
+                2,
+            ));
+        }
+    }
 
     section(&mut out, "OPERATIONS");
-    out.push_str(&verbs_table(s));
+    out.push_str(&verbs_table(&r.verbs, detail));
 
-    if !s.apis.is_empty() {
+    if !r.apis.is_empty() {
         section(
             &mut out,
-            "BACKEND REQUESTS  (mean per request; p99 of total)",
+            "BACKEND REQUESTS  (mean per request; p99 of the total)",
         );
-        out.push_str(&apis_table(s));
-        if s.connections.http2_requests > 0 {
+        out.push_str(&apis_table(&r.apis, detail));
+        if detail && r.connections.http2_requests > 0 {
             let _ = writeln!(
                 out,
                 "  {}",
                 dim(
-                    "h2: `send` ends when the body is handed to the stream; flow-controlled transmission shows up in ttfb"
+                    "h2: `send` ends when the body is handed to the stream; flow control shows up in ttfb"
                 )
             );
         }
     }
 
-    let c = &s.connections;
+    let c = &r.connections;
     if c.requests > 0 && (c.http1_requests + c.http2_requests) > 0 {
         section(&mut out, "CONNECTIONS");
         let _ = writeln!(
@@ -413,7 +715,7 @@ pub fn render(r: &Report) -> String {
         );
         let _ = writeln!(
             out,
-            "  {} new in window · {:.1}% of requests on warm connections · peak {} in-flight requests{}",
+            "  {} new · {:.1}% of requests warm · peak {} in flight{}",
             c.dialed,
             c.reuse_pct,
             c.peak_inflight_requests,
@@ -425,9 +727,30 @@ pub fn render(r: &Report) -> String {
         );
         let phases = super::dial_phases(c);
         if !phases.is_empty() {
-            let _ = writeln!(out, "  dial p50/p99   {phases}");
+            let _ = writeln!(out, "  dial p50/p99 {phases}");
         }
-        if !c.remote_addrs.is_empty() {
+        if detail && !r.network.remotes.is_empty() {
+            let rows: Vec<Vec<String>> = r
+                .network
+                .remotes
+                .iter()
+                .map(|x| {
+                    vec![
+                        x.remote.clone(),
+                        x.requests_count.to_string(),
+                        x.errors_count.to_string(),
+                        fmt_bytes(x.bytes_down),
+                        fmt_ms(x.p50_ms),
+                        fmt_ms(x.p99_ms),
+                    ]
+                })
+                .collect();
+            out.push_str(&table(
+                &["remote", "requests", "errors", "down", "p50", "p99"],
+                &rows,
+                2,
+            ));
+        } else if !c.remote_addrs.is_empty() {
             let _ = writeln!(
                 out,
                 "  {}",
@@ -437,67 +760,63 @@ pub fn render(r: &Report) -> String {
     }
 
     section(&mut out, "BYTES & AMPLIFICATION");
-    let b = &s.bytes;
+    let b = &r.bytes;
     let _ = writeln!(
         out,
-        "  logical read {} · write {} · backend down {} · up {} · cache hits {}",
+        "  read {} · write {} · backend down {} · up {}",
         fmt_bytes(b.logical_read),
         fmt_bytes(b.logical_write),
         fmt_bytes(b.backend_down),
         fmt_bytes(b.backend_up),
-        fmt_bytes(b.cache_hit_bytes)
     );
     let _ = writeln!(
         out,
-        "  read amplification {:.2}× · over-read {:.2}× · {:.2} requests/op{}",
-        b.read_amplification,
-        b.overread_ratio,
-        b.request_amplification,
-        // Socket-level bytes are only visible to the microscope transport.
-        if b.wire_rx + b.wire_tx > 0 {
-            format!(
-                " · wire rx {} tx {}",
-                fmt_bytes(b.wire_rx),
-                fmt_bytes(b.wire_tx)
-            )
-        } else {
-            String::new()
-        }
+        "  read amplification {:.2}× · over-read {:.2}× · {:.2} requests/op",
+        b.read_amplification, b.overread_ratio, b.request_amplification,
     );
-    if s.cache.enabled {
+    if b.wire_rx + b.wire_tx > 0 {
         let _ = writeln!(
             out,
-            "  cache {:.1}% hit ({} of {} lookups, mean lookup {})",
-            s.cache.hit_ratio * 100.0,
-            s.cache.hits,
-            s.cache.lookups,
-            fmt_ms(s.cache.lookup_ms_mean)
+            "  wire rx {} · tx {} {}",
+            fmt_bytes(b.wire_rx),
+            fmt_bytes(b.wire_tx),
+            dim("(--microscope)")
         );
     }
-    if s.integrity.verified + s.integrity.corrupted > 0 {
+    if r.cache.enabled {
+        let _ = writeln!(
+            out,
+            "  cache {:.1}% hit ({} of {} lookups, mean {})",
+            r.cache.hit_ratio * 100.0,
+            r.cache.hits,
+            r.cache.lookups,
+            fmt_ms(r.cache.lookup_ms_mean)
+        );
+    }
+    if r.integrity.verified + r.integrity.corrupted > 0 {
         let _ = writeln!(
             out,
             "  integrity {} {} verified{}",
-            if s.integrity.corrupted == 0 {
+            if r.integrity.corrupted == 0 {
                 green("✓")
             } else {
                 red("✖")
             },
-            s.integrity.verified,
-            if s.integrity.corrupted > 0 {
-                red(&format!(", {} CORRUPTED", s.integrity.corrupted))
+            r.integrity.verified,
+            if r.integrity.corrupted > 0 {
+                red(&format!(", {} CORRUPTED", r.integrity.corrupted))
             } else {
                 String::new()
             }
         );
     }
 
-    if r.target.endpoint.is_some() && s.summary.ops > 0 {
+    if r.cost.applicable && sm.ops > 0 {
         let cst = &r.cost;
         section(
             &mut out,
             &format!(
-                "COST  ({} at {:.0}M ops/month, egress {:.0}%)",
+                "COST  ({} · {:.0}M ops/month · egress {:.0}%)",
                 cst.selected.provider,
                 cst.monthly_ops / 1e6,
                 cst.egress_fraction * 100.0
@@ -506,25 +825,16 @@ pub fn render(r: &Report) -> String {
         let sel = &cst.selected;
         let _ = writeln!(
             out,
-            "  {} per 1M ops · requests {} · egress {} · storage {} → {} /month",
+            "  {} per 1M ops → {} /month",
             bold(&fmt_usd(sel.per_million_ops_usd)),
+            bold(&fmt_usd(sel.total_usd))
+        );
+        let _ = writeln!(
+            out,
+            "  requests {} · egress {} · storage {}",
             fmt_usd(sel.requests_usd),
             fmt_usd(sel.egress_usd),
             fmt_usd(sel.storage_usd),
-            bold(&fmt_usd(sel.total_usd))
-        );
-        let u = &cst.per_op;
-        let _ = writeln!(
-            out,
-            "  {}",
-            dim(&format!(
-                "per op: {:.2} write · {:.2} list · {:.2} read requests · {} down · {} up",
-                u.write_requests,
-                u.list_requests,
-                u.read_requests,
-                fmt_bytes(u.download_bytes as u64),
-                fmt_bytes(u.upload_bytes as u64)
-            ))
         );
         if sel.failed_requests_usd > 0.005
             || sel.overread_usd > 0.005
@@ -532,37 +842,138 @@ pub fn render(r: &Report) -> String {
         {
             let _ = writeln!(
                 out,
-                "  waste: failed/throttled requests {} · over-read egress {} · cache saved {}",
+                "  waste: failed {} · over-read {} · cache saved {}",
                 fmt_usd(sel.failed_requests_usd),
                 fmt_usd(sel.overread_usd),
                 fmt_usd(sel.cache_savings_usd)
             );
         }
+        if detail {
+            let u = &cst.per_op;
+            let _ = writeln!(
+                out,
+                "  {}",
+                dim(&format!(
+                    "per op: {:.2} write · {:.2} list · {:.2} read requests · {} down · {} up",
+                    u.write_requests,
+                    u.list_requests,
+                    u.read_requests,
+                    fmt_bytes(u.download_bytes as u64),
+                    fmt_bytes(u.upload_bytes as u64)
+                ))
+            );
+        }
         let mut cmp: Vec<_> = cst.comparison.iter().collect();
         cmp.sort_by(|a, b| a.total_usd.total_cmp(&b.total_usd));
-        let line: Vec<String> = cmp
-            .iter()
-            .map(|c| format!("{} {}", c.key, fmt_usd(c.total_usd)))
-            .collect();
-        let _ = writeln!(
-            out,
-            "  {}",
-            dim(&format!("same workload elsewhere: {}", line.join(" · ")))
-        );
-    }
-
-    if !r.diagnosis.findings.is_empty() {
-        section(&mut out, "FINDINGS");
-        for f in &r.diagnosis.findings {
-            let _ = writeln!(out, "  {} {}", severity_icon(f.severity), bold(&f.title));
-            let _ = writeln!(out, "    {}", dim(&f.evidence));
-            let _ = writeln!(out, "    → {}", f.action);
+        if !cmp.is_empty() {
+            let line: Vec<String> = cmp
+                .iter()
+                .map(|c| format!("{} {}", c.key, fmt_usd(c.total_usd)))
+                .collect();
+            if detail {
+                let _ = writeln!(
+                    out,
+                    "  {}",
+                    dim(&format!("elsewhere: {}", line.join(" · ")))
+                );
+            } else {
+                for chunk in line.chunks(3) {
+                    let _ = writeln!(out, "  {}", dim(&chunk.join(" · ")));
+                }
+            }
         }
     }
 
-    if let Some(op) = s.slow_ops.first() {
-        section(&mut out, "SLOWEST OPERATION");
-        out.push_str(&slow_op_block(op, true));
+    if detail && !r.timeline.is_empty() {
+        section(&mut out, "TIMELINE  (per second)");
+        let rows: Vec<Vec<String>> = r
+            .timeline
+            .iter()
+            .map(|p| {
+                vec![
+                    format!("{:.0}s", p.t_s),
+                    format!("{:.1}", p.ops_per_s),
+                    format!("{:.1}", p.mib_per_s),
+                    fmt_ms(p.p50_ms),
+                    fmt_ms(p.p99_ms),
+                    p.errors.to_string(),
+                    p.throttled.to_string(),
+                ]
+            })
+            .collect();
+        out.push_str(&table(
+            &["t", "ops/s", "MiB/s", "p50", "p99", "errors", "throttled"],
+            &rows,
+            2,
+        ));
+    }
+
+    if let Some(run) = run {
+        let n = if detail { 5 } else { 1 };
+        let slow: Vec<&OpRow> = r
+            .slowest
+            .iter()
+            .filter_map(|id| run.op(*id))
+            .take(n)
+            .collect();
+        if !slow.is_empty() {
+            section(
+                &mut out,
+                if n > 1 {
+                    "SLOWEST OPERATIONS"
+                } else {
+                    "SLOWEST OPERATION"
+                },
+            );
+            for op in slow {
+                let reqs = run.requests_of(op.op_id);
+                out.push_str(&slow_op_block(op, &reqs, detail));
+            }
+        }
+    }
+
+    if detail {
+        section(&mut out, "CONFIGURATION");
+        let k = &r.knobs.requested;
+        let _ = writeln!(out, "  knobs      {}", k.to_knobs().summary());
+        let e = &r.knobs.effective;
+        if e.write_chunk_clamped() {
+            let _ = writeln!(
+                out,
+                "  effective  write chunk {} (requested {})",
+                fmt_bytes(e.write_chunk_bytes),
+                fmt_bytes(k.chunk_bytes)
+            );
+        }
+        let w = &r.workload;
+        let _ = writeln!(
+            out,
+            "  workload   {} · {} objects × {} · access {} · seed {}",
+            w.preset,
+            w.dataset.objects_count,
+            fmt_bytes(w.dataset.object_size_bytes),
+            w.access,
+            w.seed
+        );
+        for (k, v) in &r.target.options {
+            let _ = writeln!(out, "  option     {k}={v}");
+        }
+        let h = &r.run.host;
+        let _ = writeln!(
+            out,
+            "  host       {}/{} · {} CPUs · {}",
+            h.os, h.arch, h.cpus_count, h.hostname_hash
+        );
+        let t = &r.run.trace;
+        let _ = writeln!(
+            out,
+            "  trace      {} of {} requests, {} of {} ops kept{}",
+            t.requests_kept_count,
+            t.requests_seen_count,
+            t.ops_kept_count,
+            t.ops_seen_count,
+            if r.run.sampled { " (sampled)" } else { "" }
+        );
     }
 
     section(&mut out, "CLEANUP");
@@ -570,7 +981,7 @@ pub fn render(r: &Report) -> String {
     if !cl.enabled {
         let _ = writeln!(
             out,
-            "  {} test data kept under {} (remove later with `oprobe cleanup`)",
+            "  {} test data kept under {} (remove with `oprobe cleanup`)",
             yellow("●"),
             cl.prefix
         );
@@ -583,7 +994,7 @@ pub fn render(r: &Report) -> String {
             green("✓"),
             cl.deleted,
             cl.prefix,
-            dim(&format!("({:.0} ms, verified empty)", cl.duration_ms))
+            dim(&format!("({:.0} ms, verified)", cl.duration_ms))
         );
     } else {
         let _ = writeln!(
@@ -601,5 +1012,87 @@ pub fn render(r: &Report) -> String {
     if let Some(ds) = &cl.kept_dataset {
         let _ = writeln!(out, "  {}", dim(&format!("dataset left in place: {ds}")));
     }
-    out
+
+    if !r.run.id.is_empty() {
+        let _ = writeln!(
+            out,
+            "\n{}",
+            dim(&format!(
+                "more: oprobe runs show {} --detail · -o html > report.html",
+                r.run.id
+            ))
+        );
+    }
+    if detail {
+        out
+    } else {
+        out.lines()
+            .map(|l| fit(l, WIDTH))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n"
+    }
+}
+
+/// Word-wrap plain text to `width` columns.
+pub fn wrap_text(s: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut cur = String::new();
+    for word in s.split_whitespace() {
+        let wl = word.chars().count();
+        let cl = cur.chars().count();
+        if cl > 0 && cl + 1 + wl > width {
+            lines.push(std::mem::take(&mut cur));
+        }
+        if !cur.is_empty() {
+            cur.push(' ');
+        }
+        cur.push_str(word);
+    }
+    if !cur.is_empty() {
+        lines.push(cur);
+    }
+    lines
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn full_report_fits_80_columns_and_detail_adds_sections() {
+        set(false);
+        let mut run = super::super::fixture::run();
+        run.report.findings[0].advice = "word ".repeat(60);
+        run.report.target.display = format!("s3://{}", "b".repeat(120));
+        let text = render_run(&run);
+        for l in text.lines() {
+            assert!(visible_width(l) <= WIDTH, "{} > 80: {l}", visible_width(l));
+        }
+        for s in [
+            "KEY NUMBERS",
+            "FINDINGS",
+            "WHERE THE TIME GOES",
+            "OPERATIONS",
+            "SLOWEST OPERATION",
+            "CLEANUP",
+            "try: oprobe run prod -c 16",
+            "--detail",
+        ] {
+            assert!(text.contains(s), "{s}\n{text}");
+        }
+        let detail = render_run_with(&run, true);
+        for s in ["TIMELINE", "CONFIGURATION", "SLOWEST OPERATIONS", "p99.9"] {
+            assert!(detail.contains(s), "{s}");
+        }
+    }
+
+    #[test]
+    fn fit_keeps_escapes_and_cuts_visible_text() {
+        let s = format!("\x1b[31m{}\x1b[0m tail", "x".repeat(100));
+        let f = fit(&s, 10);
+        assert_eq!(visible_width(&f), 10);
+        assert!(f.starts_with("\x1b[31m"));
+        assert_eq!(wrap_text("a bb ccc dddd", 6), vec!["a bb", "ccc", "dddd"]);
+    }
 }

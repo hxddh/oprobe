@@ -23,9 +23,11 @@ it is captured, and the known limits.
 
 Tuning results are only useful if they were measured on the client you deploy. By default oprobe
 therefore sends every request through **OpenDAL's own HTTP client** — reqwest 0.13 with rustls and
-aws-lc-rs, configured exactly as `opendal-http-transport-reqwest` builds it (HTTP/1.1, environment
-proxies, platform certificate verifier) — and observes it only through reqwest's public extension
-points:
+aws-lc-rs, configured exactly as `opendal-http-transport-reqwest` builds it (`reqwest::Client::new()`:
+HTTP/1.1, environment proxies, platform certificate verifier, no connect timeout, unlimited idle
+connections per host, 90 s idle timeout) — and observes it only through reqwest's public extension
+points. The only settings oprobe changes are the ones a knob asks for (`keep_alive = false`,
+`http = "h2"`, `--proxy`):
 
 | Signal | How it is captured (default mode) |
 |---|---|
@@ -45,8 +47,10 @@ the exact connection a dial was made for — but it is a different client:
 | Results transfer to production as-is | Results describe oprobe's pool, not your client |
 | Waiting for a pooled connection is part of TTFB | Shown as queue time (HTTP/1.1); waiting for an HTTP/2 stream slot is part of TTFB in both |
 | Wire rx / tx not available (reported as 0) | Raw socket bytes incl. TLS and framing |
+| TLS version only; the cipher suite is not exposed (reported empty) | TLS version and cipher suite |
 | Proxy CONNECT reported together with TCP to the proxy | Proxy CONNECT timed on its own |
 | HTTP/1.1 unless `http = "h2"` (OpenDAL builds reqwest without `http2`) | ALPN negotiates h2 for https by default |
+| reqwest's pool: no connect timeout, unlimited idle connections per host | 10 s timeout per dial phase, at most 256 idle connections per host |
 
 ### Observer effect
 
@@ -100,14 +104,19 @@ need to separate upload bandwidth from server latency.
 
 ## Operation breakdown ("where the time goes")
 
-Each operation's wall time is split exactly into four parts by sweeping its request intervals:
+Each operation's wall time is split exactly into five parts by sweeping its request intervals and
+the retry layer's backoff sleeps:
 
 * **backend** — at least one request is on the network (connect, send, ttfb or transfer);
 * **queue** — no request is on the network, but at least one is waiting for a permit/connection;
+* **retry** — nothing is on the network or queued, and OpenDAL's `RetryLayer` is sleeping before
+  the next attempt (exponential backoff with jitter, 50 ms – 5 s). Throttled or failing runs spend
+  most of their time here; this is never counted as client time;
 * **cache** — local cache lookups (carved out of the remainder);
 * **client** — everything else: OpenDAL processing, request signing, buffering, CRC, your code.
 
-Parallel requests are merged (an instant counts once), so `queue + cache + backend + client` equals
+Parallel requests are merged (an instant counts once), so `queue + cache + backend + retry + client`
+equals
 the measured latency of every single operation. The report then splits *backend* into
 connect / upload / server / download in proportion to the measured request-stage totals.
 
@@ -153,6 +162,18 @@ sub-tasks — so you can see e.g. `read.full → [sub-task 0] → GetObject → 
 operation. OpenDAL's own `AwaitTreeLayer` is deliberately not used: it wraps every call and every
 read chunk and cost about 14 % throughput on small requests. Request IDs (`x-amz-request-id`, `x-ms-request-id`, …) are kept for support tickets.
 
+## Error classes
+
+Failed operations are counted per class in `resilience.error_classes`. Every OpenDAL error kind
+has its own class (`rate_limited`, `permission_denied`, `not_found`, `config_invalid`,
+`unsupported`, `is_a_directory`, `not_a_directory`, `already_exists`, `is_same_file`,
+`condition_not_match`, `range_not_satisfied`, `conflict`). OpenDAL's catch-all `Unexpected` is
+refined structurally, never by matching the error text (object names and ports contain digits):
+the last response status (429/503 → `rate_limited`, 401/403 → `permission_denied`, 5xx →
+`server_error`), OpenDAL's timeout and tail-cut layers (`timeout`, `tail_cut`), the typed error
+chain (reqwest / hyper / I/O timeouts → `timeout`; refused or failed dials → `connect`), then
+OpenDAL's `is_temporary()` (`network`) or `unexpected`.
+
 ## Client resources
 
 Process CPU (percent of one core) and RSS are sampled every second. When the load generator uses
@@ -163,4 +184,28 @@ storage can deliver.
 
 Generated dataset objects are deterministic and their CRC32C is known; whole-object reads are
 verified during the run. A sample of written objects is read back after the run with an untraced
-client. Any mismatch is a critical finding and fails `oprobe diff`.
+client. Any mismatch is a critical finding and fails `oprobe compare`.
+
+## Trace rows
+
+Besides the aggregates, every run file keeps one row per measured operation (`OpRow`: verb, key, start,
+latency, bytes, attempts, the five-part breakdown, error) and one per backend request (`ReqRow`: start,
+operation, attempt, storage API, method, status, protocol, connection id and reuse, remote address, every stage
+in µs, bytes up/down, request id, Retry-After, error). Up to `max_requests` request rows are kept (default
+1 000 000; `OPROBE_MAX_REQUESTS` or `[defaults] max_requests`), reservoir-sampled beyond that: the report says
+`sampled: true` with the kept and seen counts, and every aggregate stays exact. The heatmap and the per-remote
+table are computed from the rows. `oprobe runs export` writes them as CSV, HAR, NDJSON or OTLP; the HTML report
+embeds up to 5 000 of them.
+
+## Only with `--microscope`
+
+These values need oprobe's instrumented pool; with OpenDAL's own client (the default) they are 0, empty or
+folded into another stage:
+
+| Field | With the default client |
+|---|---|
+| `bytes.wire_rx_bytes`, `bytes.wire_tx_bytes` | 0 |
+| `connections.cipher`, `network.tls.cipher` | empty |
+| queue time waiting for a pooled HTTP/1.1 connection | part of TTFB |
+| proxy CONNECT timed separately from TCP | reported together with TCP |
+| HTTP/2 negotiated by ALPN | HTTP/1.1 unless `--http h2` |

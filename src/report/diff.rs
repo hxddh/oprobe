@@ -1,4 +1,4 @@
-//! `oprobe diff`: compare a candidate report against a baseline and gate regressions.
+//! `oprobe compare`: compare a candidate run against a baseline and gate regressions.
 
 use std::fmt::Write as _;
 
@@ -9,7 +9,7 @@ use super::style::*;
 use crate::util::fmt_ms;
 
 /// Regression limits. Percentages are relative changes in the "bad" direction.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Thresholds {
     pub p99_pct: f64,
     pub p50_pct: f64,
@@ -27,6 +27,12 @@ pub struct Thresholds {
     pub fail_on_new_throttling: bool,
     /// Skip latency checks for operations with fewer samples.
     pub min_samples: u64,
+    /// Compare runs of different workloads without failing (otherwise a gate failure).
+    #[serde(default)]
+    pub allow_workload_change: bool,
+    /// Compare runs against different targets without failing (otherwise a gate failure).
+    #[serde(default)]
+    pub allow_target_change: bool,
 }
 
 impl Default for Thresholds {
@@ -42,11 +48,13 @@ impl Default for Thresholds {
             cost_pct: 10.0,
             fail_on_new_throttling: true,
             min_samples: 30,
+            allow_workload_change: false,
+            allow_target_change: false,
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Status {
     Pass,
@@ -55,7 +63,7 @@ pub enum Status {
     Skipped,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Check {
     pub name: String,
     pub baseline: f64,
@@ -68,14 +76,207 @@ pub struct Check {
     pub note: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+/// What part of the setup a [`ConfigChange`] is in.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangeKind {
+    /// What was run (preset, mix, dataset, access pattern, rate…): results are not comparable.
+    Workload,
+    /// Where it ran (scheme, bucket/prefix, endpoint, backend options).
+    Target,
+    /// Client configuration: the legitimate subject of an A/B comparison.
+    Knobs,
+    /// The machine, network path or oprobe version that measured.
+    Host,
+}
+
+impl ChangeKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            ChangeKind::Workload => "workload",
+            ChangeKind::Target => "target",
+            ChangeKind::Knobs => "knobs",
+            ChangeKind::Host => "host",
+        }
+    }
+}
+
+/// One setting that differs between baseline and candidate.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ConfigChange {
+    pub kind: ChangeKind,
+    /// Dotted path, e.g. `knobs.concurrency`, `workload.mix`.
+    pub field: String,
+    pub baseline: String,
+    pub candidate: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct DiffReport {
     pub passed: bool,
     pub baseline: String,
     pub candidate: String,
     pub thresholds: Thresholds,
+    /// Every workload / target / knob / host setting that differs between the two runs.
+    pub config_changes: Vec<ConfigChange>,
     pub checks: Vec<Check>,
     pub warnings: Vec<String>,
+}
+
+/// Flatten a JSON value into `prefix.a.b = value` leaves (arrays are compared whole).
+fn flatten(
+    prefix: &str,
+    v: &serde_json::Value,
+    out: &mut std::collections::BTreeMap<String, String>,
+) {
+    match v {
+        serde_json::Value::Object(m) => {
+            for (k, x) in m {
+                flatten(&format!("{prefix}.{k}"), x, out);
+            }
+        }
+        serde_json::Value::String(s) => {
+            out.insert(prefix.to_owned(), s.clone());
+        }
+        other => {
+            out.insert(prefix.to_owned(), other.to_string());
+        }
+    }
+}
+
+fn changes_of<T: Serialize>(
+    kind: ChangeKind,
+    prefix: &str,
+    b: &T,
+    c: &T,
+    ignore: &[&str],
+    out: &mut Vec<ConfigChange>,
+) {
+    let (mut bm, mut cm) = (Default::default(), Default::default());
+    flatten(
+        prefix,
+        &serde_json::to_value(b).unwrap_or_default(),
+        &mut bm,
+    );
+    flatten(
+        prefix,
+        &serde_json::to_value(c).unwrap_or_default(),
+        &mut cm,
+    );
+    let keys: std::collections::BTreeSet<&String> = bm.keys().chain(cm.keys()).collect();
+    for k in keys {
+        if ignore.iter().any(|i| k == &format!("{prefix}.{i}")) {
+            continue;
+        }
+        let (bv, cv) = (bm.get(k), cm.get(k));
+        if bv != cv {
+            let show = |v: Option<&String>| v.cloned().unwrap_or_else(|| "(unset)".into());
+            out.push(ConfigChange {
+                kind,
+                field: k.clone(),
+                baseline: show(bv),
+                candidate: show(cv),
+            });
+        }
+    }
+}
+
+/// Whether the run measured an in-process `lab://` server (by URL, or as `oprobe demo` names it).
+fn is_lab(r: &Report) -> bool {
+    r.target.display.starts_with("lab://")
+        || r.target
+            .name
+            .as_deref()
+            .is_some_and(|n| n.starts_with("lab://"))
+}
+
+/// Settings that differ between two reports. The measurement window (duration, warmup,
+/// max_ops), the cleanup policy and the dataset's persistence do not change what is measured.
+pub fn config_changes(base: &Report, cand: &Report) -> Vec<ConfigChange> {
+    let mut out = Vec::new();
+    changes_of(
+        ChangeKind::Workload,
+        "workload",
+        &base.workload,
+        &cand.workload,
+        &[
+            "duration_s",
+            "warmup_s",
+            "max_ops_count",
+            "cleanup",
+            "dataset.persist",
+        ],
+        &mut out,
+    );
+    let target = |r: &Report| {
+        // A `lab://` target is identified by its scenario: its endpoint is the ephemeral port
+        // of an in-process server and differs on every run.
+        let (endpoint, options) = if is_lab(r) {
+            let mut o = r.target.options.clone();
+            o.remove("endpoint");
+            (None, o)
+        } else {
+            (r.target.endpoint.clone(), r.target.options.clone())
+        };
+        serde_json::json!({
+            "scheme": r.target.scheme,
+            "display": crate::util::display_url(&r.target.display),
+            "endpoint": endpoint,
+            "options": options,
+        })
+    };
+    changes_of(
+        ChangeKind::Target,
+        "target",
+        &target(base),
+        &target(cand),
+        &[],
+        &mut out,
+    );
+    changes_of(
+        ChangeKind::Knobs,
+        "knobs.requested",
+        &base.knobs.requested,
+        &cand.knobs.requested,
+        &[],
+        &mut out,
+    );
+    let effective = |r: &Report| {
+        let e = &r.knobs.effective;
+        serde_json::json!({
+            "write_chunk_bytes": e.write_chunk_bytes,
+            "service_min_part_bytes": e.service_min_part_bytes,
+            "service_max_part_bytes": e.service_max_part_bytes,
+        })
+    };
+    changes_of(
+        ChangeKind::Knobs,
+        "knobs.effective",
+        &effective(base),
+        &effective(cand),
+        &[],
+        &mut out,
+    );
+    let host = |r: &Report| {
+        serde_json::json!({
+            "os": r.run.host.os,
+            "arch": r.run.host.arch,
+            "cpus_count": r.run.host.cpus_count,
+            "proxy": r.target.proxy,
+            "oprobe_version": r.run.oprobe_version,
+        })
+    };
+    changes_of(
+        ChangeKind::Host,
+        "host",
+        &host(base),
+        &host(cand),
+        &[],
+        &mut out,
+    );
+    out
 }
 
 /// Relative throttle-rate increase (percent) that fails the gate when the baseline was throttled.
@@ -148,7 +349,7 @@ impl Builder {
     }
 }
 
-fn throttle_rate(s: &crate::trace::Snapshot) -> f64 {
+fn throttle_rate(s: &Report) -> f64 {
     crate::util::ratio(
         s.resilience.throttled_responses as f64,
         s.connections.requests as f64,
@@ -156,9 +357,9 @@ fn throttle_rate(s: &crate::trace::Snapshot) -> f64 {
 }
 
 /// Share of open-loop arrivals that never started (percent).
-fn missed_pct(s: &crate::trace::Snapshot) -> Option<f64> {
+fn missed_pct(s: &Report) -> Option<f64> {
     let ol = s.open_loop.as_ref()?;
-    let issued = ol.achieved_rate * s.elapsed_s;
+    let issued = ol.achieved_rate * s.run.window_s;
     Some(crate::util::pct(
         ol.missed as f64,
         issued + ol.missed as f64,
@@ -168,13 +369,13 @@ fn missed_pct(s: &crate::trace::Snapshot) -> Option<f64> {
 pub fn diff(base: &Report, cand: &Report, t: &Thresholds) -> DiffReport {
     let mut warnings = Vec::new();
     for (side, r) in [("baseline", base), ("candidate", cand)] {
-        if r.interrupted {
+        if r.run.interrupted {
             warnings.push(format!(
                 "the {side} run was interrupted (stopped early): its results cover a shorter window and may not be comparable; re-run it to completion"
             ));
         }
     }
-    match (base.workload.rate, cand.workload.rate) {
+    match (base.workload.rate_per_s, cand.workload.rate_per_s) {
         (None, Some(_)) | (Some(_), None) => warnings.push(
             "comparing a closed-loop run with an open-loop (fixed-rate) run: throughput and latency mean different things in each mode".into(),
         ),
@@ -183,24 +384,82 @@ pub fn diff(base: &Report, cand: &Report, t: &Thresholds) -> DiffReport {
         )),
         _ => {}
     }
-    let (bd, cd) = (base.result.elapsed_s, cand.result.elapsed_s);
+    let (bd, cd) = (base.run.window_s, cand.run.window_s);
     if bd > 0.0 && cd > 0.0 && (bd / cd > 2.0 || cd / bd > 2.0) {
         warnings.push(format!(
             "measurement windows differ a lot ({bd:.1}s vs {cd:.1}s): short windows are noisier and may miss slow effects"
         ));
     }
-    if base.target.display != cand.target.display {
+    let changes = config_changes(base, cand);
+    let fields = |k: ChangeKind| {
+        changes
+            .iter()
+            .filter(|c| c.kind == k)
+            .map(|c| format!("{} {} → {}", c.field, c.baseline, c.candidate))
+            .collect::<Vec<_>>()
+    };
+    let mut b = Builder { checks: Vec::new() };
+    for (kind, allowed, flag) in [
+        (
+            ChangeKind::Workload,
+            t.allow_workload_change,
+            "--allow-workload-change",
+        ),
+        (
+            ChangeKind::Target,
+            t.allow_target_change,
+            "--allow-target-change",
+        ),
+    ] {
+        let diffs = fields(kind);
+        b.checks.push(Check {
+            name: format!("same {}", kind.label()),
+            baseline: 0.0,
+            candidate: diffs.len() as f64,
+            change_pct: 0.0,
+            limit: if allowed {
+                format!("informational ({flag})")
+            } else {
+                "identical".into()
+            },
+            status: if diffs.is_empty() || allowed {
+                Status::Pass
+            } else {
+                Status::Fail
+            },
+            note: diffs.join("; "),
+        });
+        if !diffs.is_empty() {
+            warnings.push(if allowed {
+                format!(
+                    "the {} differs ({}): results may not be comparable",
+                    kind.label(),
+                    diffs.join("; ")
+                )
+            } else {
+                format!(
+                    "the {} differs ({}): the runs are not comparable, so the gate fails; pass {flag} to compare anyway",
+                    kind.label(),
+                    diffs.join("; ")
+                )
+            });
+        }
+    }
+    let knob_diffs = fields(ChangeKind::Knobs);
+    if !knob_diffs.is_empty() {
         warnings.push(format!(
-            "targets differ: `{}` vs `{}`",
-            crate::util::display_url(&base.target.display),
-            crate::util::display_url(&cand.target.display)
+            "client knobs differ ({}): an A/B comparison of the configuration — changes below are caused by it",
+            knob_diffs.join("; ")
         ));
     }
-    if base.workload.preset != cand.workload.preset || base.workload.mix != cand.workload.mix {
-        warnings.push("workloads differ; comparisons may not be meaningful".into());
+    let host_diffs = fields(ChangeKind::Host);
+    if !host_diffs.is_empty() {
+        warnings.push(format!(
+            "measured from a different host or oprobe ({}): differences may come from the client machine, not the storage",
+            host_diffs.join("; ")
+        ));
     }
-    let (bs, cs) = (&base.result, &cand.result);
-    let mut b = Builder { checks: Vec::new() };
+    let (bs, cs) = (base, cand);
     let floor = format!(" & > {}ms", t.min_latency_delta_ms);
 
     b.lower_worse(
@@ -218,7 +477,7 @@ pub fn diff(base: &Report, cand: &Report, t: &Thresholds) -> DiffReport {
         );
     }
     for bv in &bs.verbs {
-        let Some(cv) = cs.verb(&bv.verb) else {
+        let Some(cv) = cs.verbs.iter().find(|v| v.verb == bv.verb) else {
             b.checks.push(Check {
                 name: format!("{} present", bv.verb),
                 baseline: bv.count as f64,
@@ -350,28 +609,33 @@ pub fn diff(base: &Report, cand: &Report, t: &Thresholds) -> DiffReport {
             "",
         );
     }
-    b.higher_worse(
-        "cost per 1M ops USD".into(),
-        base.cost.selected.per_million_ops_usd,
-        cand.cost.selected.per_million_ops_usd,
-        t.cost_pct,
-        0.0001,
-        "",
-    );
+    if base.cost.applicable && cand.cost.applicable {
+        b.higher_worse(
+            "cost per 1M ops USD".into(),
+            base.cost.selected.per_million_ops_usd,
+            cand.cost.selected.per_million_ops_usd,
+            t.cost_pct,
+            0.0001,
+            "",
+        );
+    }
     let passed = !b.checks.iter().any(|c| c.status == Status::Fail);
     DiffReport {
         passed,
         baseline: format!(
-            "{} ({})",
+            "{} ({} {})",
             crate::util::display_url(&base.target.display),
-            base.generated_at
+            base.run.id,
+            base.run.started_at
         ),
         candidate: format!(
-            "{} ({})",
+            "{} ({} {})",
             crate::util::display_url(&cand.target.display),
-            cand.generated_at
+            cand.run.id,
+            cand.run.started_at
         ),
         thresholds: t.clone(),
+        config_changes: changes,
         checks: b.checks,
         warnings,
     }
@@ -400,12 +664,36 @@ impl DiffReport {
             } else {
                 badge("REGRESSION", "41")
             },
-            bold("oprobe diff"),
+            bold("oprobe compare"),
             dim("baseline "),
             self.baseline,
             dim("candidate"),
             self.candidate
         );
+        if !self.config_changes.is_empty() {
+            let _ = writeln!(out, "\n{}", bold(&cyan("CONFIGURATION CHANGES")));
+            let rows: Vec<Vec<String>> = self
+                .config_changes
+                .iter()
+                .map(|c| {
+                    let kind = match c.kind {
+                        ChangeKind::Workload | ChangeKind::Target => red(c.kind.label()),
+                        _ => yellow(c.kind.label()),
+                    };
+                    vec![
+                        kind,
+                        c.field.clone(),
+                        c.baseline.clone(),
+                        c.candidate.clone(),
+                    ]
+                })
+                .collect();
+            out.push_str(&table(
+                &["kind", "setting", "baseline", "candidate"],
+                &rows,
+                2,
+            ));
+        }
         for w in &self.warnings {
             let _ = writeln!(out, "  {} {w}", yellow("warning:"));
         }
@@ -454,6 +742,23 @@ impl DiffReport {
             self.baseline,
             self.candidate
         );
+        if !self.config_changes.is_empty() {
+            let _ = writeln!(
+                md,
+                "**Configuration changes**\n\n| kind | setting | baseline | candidate |\n|---|---|---|---|"
+            );
+            for c in &self.config_changes {
+                let _ = writeln!(
+                    md,
+                    "| {} | `{}` | {} | {} |",
+                    c.kind.label(),
+                    c.field,
+                    c.baseline,
+                    c.candidate
+                );
+            }
+            md.push('\n');
+        }
         for w in &self.warnings {
             let _ = writeln!(md, "> ⚠️ {w}\n");
         }
@@ -503,7 +808,7 @@ impl DiffReport {
         let mut x = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
         let _ = writeln!(
             x,
-            "<testsuite name=\"oprobe diff\" tests=\"{}\" failures=\"{failures}\" skipped=\"{skipped}\">",
+            "<testsuite name=\"oprobe compare\" tests=\"{}\" failures=\"{failures}\" skipped=\"{skipped}\">",
             self.checks.len()
         );
         for c in &self.checks {
@@ -513,6 +818,14 @@ impl DiffReport {
                 esc(&c.name)
             );
             match c.status {
+                Status::Fail if c.name.starts_with("same ") => {
+                    let _ = write!(
+                        x,
+                        "<failure message=\"{}\">{}</failure>",
+                        esc(&format!("{}: differs", c.name)),
+                        esc(&c.note)
+                    );
+                }
                 Status::Fail => {
                     let _ = write!(
                         x,
@@ -565,7 +878,19 @@ mod tests {
                 ..Default::default()
             })
             .collect();
-        Report::build(&p, &p.knobs, s, Default::default(), vec![])
+        let id = crate::model::RunId::new();
+        crate::model::build_report(crate::model::ReportInput {
+            run_id: &id,
+            target_name: None,
+            profile: &p,
+            knobs: &p.knobs,
+            snapshot: s,
+            trace: Default::default(),
+            cleanup: Default::default(),
+            warnings: vec![],
+            started_at: std::time::SystemTime::now(),
+            ended_at: std::time::SystemTime::now(),
+        })
     }
 
     fn status(d: &DiffReport, name: &str) -> Status {
@@ -574,6 +899,119 @@ mod tests {
             .find(|c| c.name == name)
             .unwrap_or_else(|| panic!("no check {name}: {:?}", d.checks))
             .status
+    }
+
+    #[test]
+    fn configuration_changes_are_reported_and_gate_workload_and_target() {
+        let b = report(&["stat"], 0, 1000);
+        // Knobs differ: legitimate A/B, passes with a prominent warning.
+        let mut c = b.clone();
+        c.knobs.requested.concurrency_count = 64;
+        let d = diff(&b, &c, &Thresholds::default());
+        assert!(d.passed, "{}", d.render_terminal());
+        assert_eq!(
+            d.config_changes,
+            vec![ConfigChange {
+                kind: ChangeKind::Knobs,
+                field: "knobs.requested.concurrency_count".into(),
+                baseline: "16".into(),
+                candidate: "64".into(),
+            }]
+        );
+        assert!(
+            d.warnings
+                .iter()
+                .any(|w| w.contains("knobs.requested.concurrency_count 16 → 64"))
+        );
+        assert!(d.render_terminal().contains("CONFIGURATION CHANGES"));
+        assert!(
+            d.render_markdown()
+                .contains("`knobs.requested.concurrency_count`")
+        );
+
+        // Workload differs: fails unless allowed.
+        let mut c = b.clone();
+        c.workload.access = "zipf:1.1".into();
+        c.workload.duration_s = 99.0;
+        let d = diff(&b, &c, &Thresholds::default());
+        assert!(!d.passed);
+        assert_eq!(status(&d, "same workload"), Status::Fail);
+        assert_eq!(
+            d.config_changes.len(),
+            1,
+            "duration is not a workload change"
+        );
+        assert!(d.render_junit().contains("same workload: differs"));
+        let allow = Thresholds {
+            allow_workload_change: true,
+            ..Thresholds::default()
+        };
+        assert!(diff(&b, &c, &allow).passed);
+
+        // Target differs: fails unless allowed.
+        let mut c = b.clone();
+        c.target.display = "s3://other".into();
+        let d = diff(&b, &c, &Thresholds::default());
+        assert_eq!(status(&d, "same target"), Status::Fail);
+        let allow = Thresholds {
+            allow_target_change: true,
+            ..Thresholds::default()
+        };
+        assert!(diff(&b, &c, &allow).passed);
+
+        // Host differs: warning only.
+        let mut c = b.clone();
+        c.run.host.cpus_count += 1;
+        let d = diff(&b, &c, &Thresholds::default());
+        assert!(d.passed);
+        assert!(
+            d.warnings.iter().any(|w| w.contains("host.cpus_count")),
+            "{:?}",
+            d.warnings
+        );
+    }
+
+    #[test]
+    fn lab_targets_compare_by_scenario_not_ephemeral_port() {
+        let mut b = report(&["stat"], 0, 1000);
+        b.target.scheme = "s3".into();
+        b.target.display = "lab://demo".into();
+        b.target.endpoint = Some("http://127.0.0.1:43373".into());
+        b.target
+            .options
+            .insert("endpoint".into(), "http://127.0.0.1:43373".into());
+        let mut c = b.clone();
+        c.target.endpoint = Some("http://127.0.0.1:39831".into());
+        c.target
+            .options
+            .insert("endpoint".into(), "http://127.0.0.1:39831".into());
+        let d = diff(&b, &c, &Thresholds::default());
+        assert!(d.config_changes.is_empty(), "{:?}", d.config_changes);
+        assert_eq!(status(&d, "same target"), Status::Pass);
+        // `oprobe demo` names its lab target.
+        let (mut b2, mut c2) = (b.clone(), c.clone());
+        for r in [&mut b2, &mut c2] {
+            r.target.display = "s3://demo".into();
+            r.target.name = Some("lab://demo".into());
+        }
+        assert!(
+            diff(&b2, &c2, &Thresholds::default())
+                .config_changes
+                .is_empty()
+        );
+        // A different scenario is still a different target.
+        c.target.display = "lab://throttle".into();
+        let d = diff(&b, &c, &Thresholds::default());
+        assert_eq!(status(&d, "same target"), Status::Fail);
+        // So is a different endpoint of a real target.
+        let (mut b3, mut c3) = (b.clone(), b.clone());
+        b3.target.display = "s3://bkt".into();
+        c3.target.display = "s3://bkt".into();
+        c3.target.endpoint = Some("http://127.0.0.1:1".into());
+        assert_eq!(
+            status(&diff(&b3, &c3, &Thresholds::default()), "same target"),
+            Status::Fail
+        );
     }
 
     #[test]
@@ -618,8 +1056,8 @@ mod tests {
     fn mode_and_duration_mismatches_warn_and_missed_growth_fails() {
         let b = report(&["stat"], 0, 1000);
         let mut c = report(&["stat"], 0, 1000);
-        c.workload.rate = Some(100.0);
-        c.result.elapsed_s = 60.0;
+        c.workload.rate_per_s = Some(100.0);
+        c.run.window_s = 60.0;
         let d = diff(&b, &c, &Thresholds::default());
         assert!(
             d.warnings.iter().any(|w| w.contains("closed-loop")),
@@ -640,8 +1078,8 @@ mod tests {
             missed,
             max_schedule_lag_ms: 0.0,
         };
-        b.result.open_loop = Some(ol(0));
-        c.result.open_loop = Some(ol(100));
+        b.open_loop = Some(ol(0));
+        c.open_loop = Some(ol(100));
         let d = diff(&b, &c, &Thresholds::default());
         assert_eq!(status(&d, "open-loop missed %"), Status::Fail);
     }

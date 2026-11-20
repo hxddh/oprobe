@@ -1,0 +1,28 @@
+{
+  "$id": "https://github.com/hxddh/oprobe/schemas/3/config-path.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Result of `oprobe config path`",
+  "properties": {
+    "config_exists": {
+      "type": "boolean"
+    },
+    "config_file": {
+      "type": "string"
+    },
+    "data_dir": {
+      "type": "string"
+    },
+    "runs_dir": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "config_file",
+    "config_exists",
+    "data_dir",
+    "runs_dir"
+  ],
+  "title": "oprobe config-path",
+  "type": "object",
+  "x-rust-type": "ConfigPaths"
+}

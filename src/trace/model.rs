@@ -1,14 +1,15 @@
 //! Raw trace records produced by instrumentation (one per backend request).
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// Storage API classification of a single backend request. Derived from the real HTTP
 /// request line (S3 / GCS / Azure / OSS / COS / B2 conventions) or the OpenDAL call for
 /// in-process backends.
-#[derive(
-    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
-)]
-#[serde(rename_all = "snake_case")]
+///
+/// Serialized as the API's name (`GetObject`, `UploadPart`, …): the same string a request row
+/// carries in `api`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Api {
     #[default]
     GetObject,
@@ -28,7 +29,7 @@ pub enum Api {
 }
 
 /// Billing bucket used by the cost model.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum BillingClass {
     /// PUT / POST / COPY (S3 "tier 1", GCS "class A").
@@ -43,7 +44,57 @@ pub enum BillingClass {
     Free,
 }
 
+impl Serialize for Api {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.label())
+    }
+}
+
+impl<'de> Deserialize<'de> for Api {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = std::borrow::Cow::<'de, str>::deserialize(d)?;
+        Ok(Api::from_label(&s))
+    }
+}
+
+impl JsonSchema for Api {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "Api".into()
+    }
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "type": "string",
+            "description": "Storage API name, e.g. GetObject (OpenDAL ServiceOperation)"
+        })
+    }
+}
+
 impl Api {
+    pub const ALL: [Api; 13] = [
+        Api::GetObject,
+        Api::HeadObject,
+        Api::PutObject,
+        Api::CreateMultipart,
+        Api::UploadPart,
+        Api::CompleteMultipart,
+        Api::AbortMultipart,
+        Api::ListObjects,
+        Api::DeleteObject,
+        Api::DeleteObjects,
+        Api::CopyObject,
+        Api::Control,
+        Api::Other,
+    ];
+
+    /// Inverse of [`Api::label`]; unknown names are [`Api::Other`].
+    pub fn from_label(s: &str) -> Api {
+        Api::ALL
+            .iter()
+            .copied()
+            .find(|a| a.label() == s)
+            .unwrap_or(Api::Other)
+    }
+
     pub fn label(&self) -> &'static str {
         match self {
             Api::GetObject => "GetObject",
@@ -59,6 +110,84 @@ impl Api {
             Api::CopyObject => "CopyObject",
             Api::Control => "Control",
             Api::Other => "Other",
+        }
+    }
+
+    /// The API class of an OpenDAL `ServiceOperation` name (the exact backend API a service
+    /// attached to its request), across providers: S3 `ListObjectsV2`, Azure `ListBlobs` and
+    /// B2 `ListFileNames` are all [`Api::ListObjects`]. Unknown names are [`Api::Other`].
+    /// The API of one HTTP request: the name the service attached (OpenDAL `ServiceOperation`)
+    /// when it is known, else the URL heuristic. Services label a metadata read with the same
+    /// name as a download (GCS: `GetObject` for `GET …/o/key` without `alt=media`, and for HEAD),
+    /// so a `GetObject` the request itself shows to be metadata is reported as `HeadObject`.
+    /// Returns the class and the exact name to record.
+    pub fn resolve(
+        service_op: Option<&'static str>,
+        method: &http::Method,
+        path: &str,
+        query: Option<&str>,
+    ) -> (Api, Option<&'static str>) {
+        let heuristic = || classify_http(method, path, query);
+        match service_op.map(|n| (n, Api::from_service_operation(n))) {
+            Some((_, Api::GetObject)) if heuristic() == Api::HeadObject => {
+                (Api::HeadObject, Some("HeadObject"))
+            }
+            Some((name, a)) if a != Api::Other => (a, Some(name)),
+            _ => (heuristic(), service_op),
+        }
+    }
+
+    pub fn from_service_operation(name: &str) -> Api {
+        match name {
+            "GetObject" | "Get" | "GetBlob" | "DownloadFileByName" | "PresignedGetObject" => {
+                Api::GetObject
+            }
+            "HeadObject" | "Head" | "GetBlobProperties" | "GetFileInfo" | "StatObject" => {
+                Api::HeadObject
+            }
+            "PutObject"
+            | "Put"
+            | "PutBlob"
+            | "InsertObject"
+            | "UploadFile"
+            | "AppendObject"
+            | "AppendBlock"
+            | "Mkcol"
+            | "Proppatch"
+            | "ConditionalPutObject" => Api::PutObject,
+            "CreateMultipartUpload"
+            | "InitiateMultipartUpload"
+            | "InitiateResumableUpload"
+            | "StartLargeFile" => Api::CreateMultipart,
+            "UploadPart"
+            | "PutBlock"
+            | "UploadResumableChunk"
+            | "UploadPartCopy"
+            | "PutBlockFromUrl" => Api::UploadPart,
+            "CompleteMultipartUpload" | "PutBlockList" | "ComposeObject" | "FinishLargeFile" => {
+                Api::CompleteMultipart
+            }
+            "AbortMultipartUpload" | "CancelResumableUpload" | "CancelLargeFile" => {
+                Api::AbortMultipart
+            }
+            "ListObjects" | "ListObjectsV2" | "ListObjectVersions" | "ListBlobs"
+            | "ListFileNames" | "ListFileVersions" => Api::ListObjects,
+            "DeleteObject" | "Delete" | "DeleteBlob" | "HideFile" | "DeleteFileVersion" => {
+                Api::DeleteObject
+            }
+            "DeleteObjects"
+            | "BatchDeleteObjects"
+            | "BatchDeleteBlobs"
+            | "DeleteMultipleObjects" => Api::DeleteObjects,
+            "CopyObject" | "Copy" | "CopyBlob" | "CopyFile" | "RewriteObject" | "Move" => {
+                Api::CopyObject
+            }
+            "AuthorizeAccount"
+            | "GetUploadUrl"
+            | "GetUploadPartUrl"
+            | "GetDownloadAuthorization"
+            | "Test" => Api::Control,
+            _ => Api::Other,
         }
     }
 
@@ -78,7 +207,7 @@ impl Api {
 }
 
 /// Transport protocol a request travelled over.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Protocol {
     #[default]
@@ -90,7 +219,7 @@ pub enum Protocol {
 
 /// Sequential, non-overlapping phases of one backend request in microseconds.
 /// `total_us == queue + dns + tcp + proxy + tls + send + ttfb + body + stall` (±rounding).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct RequestTiming {
     /// Waiting for an in-flight request permit or a usable pooled connection.
     pub queue_us: u64,
@@ -120,7 +249,7 @@ impl RequestTiming {
 }
 
 /// One backend request (HTTP request or in-process backend call).
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct RequestRecord {
     pub api: Api,
     pub method: String,
@@ -141,6 +270,20 @@ pub struct RequestRecord {
     pub retry_after_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Remote address of the connection (the proxy's when tunnelling), when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<String>")]
+    pub remote: Option<std::net::SocketAddr>,
+    /// The exact backend API (OpenDAL `ServiceOperation`) when the service attached one; the
+    /// request row's `api`. `api` above is its class (aggregation, billing).
+    #[serde(skip)]
+    pub service_op: Option<&'static str>,
+    /// TLS handshake of the connection, on the request that dialed it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<Box<crate::model::TlsRow>>,
+    /// Kernel TCP statistics of the connection at request end.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tcp: Option<Box<crate::model::TcpRow>>,
 }
 
 impl RequestRecord {
@@ -352,5 +495,64 @@ mod tests {
             classify_http(&Method::POST, "/b2api/v2/b2_list_file_names", None),
             Api::ListObjects
         );
+    }
+
+    #[test]
+    fn service_operations_map_to_api_classes() {
+        for (name, api) in [
+            ("ListObjectsV2", Api::ListObjects),
+            ("ListBlobs", Api::ListObjects),
+            ("PutBlockList", Api::CompleteMultipart),
+            ("InsertObject", Api::PutObject),
+            ("GetBlobProperties", Api::HeadObject),
+            ("BatchDeleteBlobs", Api::DeleteObjects),
+            ("AuthorizeAccount", Api::Control),
+            ("PresignedGetObject", Api::GetObject),
+            ("Whatever", Api::Other),
+        ] {
+            assert_eq!(Api::from_service_operation(name), api, "{name}");
+        }
+        // Canonical names map onto themselves.
+        for a in Api::ALL {
+            if !matches!(a, Api::Control | Api::Other) {
+                assert_eq!(Api::from_service_operation(a.label()), a);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod resolve_tests {
+    use super::{Api, classify_http};
+    use http::Method;
+
+    #[test]
+    fn gcs_metadata_reads_labelled_get_object_are_head_object() {
+        let meta = Api::resolve(
+            Some("GetObject"),
+            &Method::GET,
+            "/storage/v1/b/bench/o/data%2Fobj-1.bin",
+            None,
+        );
+        assert_eq!(
+            meta,
+            (Api::HeadObject, Some("HeadObject")),
+            "{:?}",
+            classify_http(&Method::GET, "/storage/v1/b/bench/o/x", None)
+        );
+        let media = Api::resolve(
+            Some("GetObject"),
+            &Method::GET,
+            "/storage/v1/b/bench/o/data%2Fobj-1.bin",
+            Some("alt=media"),
+        );
+        assert_eq!(media, (Api::GetObject, Some("GetObject")));
+        let head = Api::resolve(Some("GetObject"), &Method::HEAD, "/bench/key", None);
+        assert_eq!(head.0, Api::HeadObject);
+        assert_eq!(
+            Api::resolve(Some("PutBlob"), &Method::PUT, "/c/k", None),
+            (Api::PutObject, Some("PutBlob"))
+        );
+        assert_eq!(Api::resolve(None, &Method::GET, "/b/k", None).1, None);
     }
 }

@@ -6,7 +6,19 @@ use crate::config::{Knobs, Sla};
 use crate::trace::Snapshot;
 use crate::util::{fmt_bytes, fmt_ms};
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Serialize,
+    Deserialize,
+    schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum Severity {
     #[default]
@@ -26,7 +38,9 @@ impl Severity {
 }
 
 /// The layer that dominates operation latency.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum Bottleneck {
     #[default]
@@ -45,6 +59,8 @@ pub enum Bottleneck {
     Download,
     /// Rate limiting (429/503).
     Throttling,
+    /// Sleeping between retry attempts (errors that are not throttling).
+    RetryBackoff,
     /// In-process backend (memory/fs) service time.
     LocalBackend,
 }
@@ -60,12 +76,13 @@ impl Bottleneck {
             Bottleneck::ServerLatency => "server latency (TTFB)",
             Bottleneck::Download => "download transfer",
             Bottleneck::Throttling => "throttling (429/503)",
+            Bottleneck::RetryBackoff => "retry backoff",
             Bottleneck::LocalBackend => "local backend",
         }
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Finding {
     pub severity: Severity,
     pub code: String,
@@ -75,7 +92,7 @@ pub struct Finding {
 }
 
 /// Share of total operation time spent in each layer (fractions sum to ~1).
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TimeShares {
     pub queue: f64,
     pub cache: f64,
@@ -83,10 +100,13 @@ pub struct TimeShares {
     pub upload: f64,
     pub server: f64,
     pub download: f64,
+    /// Retry layer sleeping between attempts.
+    #[serde(default)]
+    pub retry: f64,
     pub client: f64,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Diagnosis {
     pub bottleneck: Bottleneck,
     pub headline: String,
@@ -123,15 +143,16 @@ fn finding(
 /// Compute where operation time went. Backend time is split into request stages in
 /// proportion to the measured per-request stage totals.
 pub fn time_shares(s: &Snapshot) -> TimeShares {
-    let (mut q, mut c, mut b, mut cl) = (0.0, 0.0, 0.0, 0.0);
+    let (mut q, mut c, mut b, mut rt, mut cl) = (0.0, 0.0, 0.0, 0.0, 0.0);
     for v in &s.verbs {
         let n = v.count as f64;
         q += v.breakdown.queue_ms * n;
         c += v.breakdown.cache_ms * n;
         b += v.breakdown.backend_ms * n;
+        rt += v.breakdown.retry_ms * n;
         cl += v.breakdown.client_ms * n;
     }
-    let total = q + c + b + cl;
+    let total = q + c + b + rt + cl;
     if total <= 0.0 {
         return TimeShares::default();
     }
@@ -153,6 +174,7 @@ pub fn time_shares(s: &Snapshot) -> TimeShares {
         upload: f(up),
         server: if net > 0.0 { f(srv) } else { b / total },
         download: f(down),
+        retry: rt / total,
         client: cl / total,
     }
 }
@@ -197,10 +219,11 @@ pub fn diagnose(s: &Snapshot, knobs: &Knobs, sla: &Sla, network: bool) -> Diagno
             "throttling",
             format!("{thr} throttled responses (429/503)"),
             format!(
-                "{:.2}% of requests throttled; {} retries, {} total backoff, max Retry-After {} ms",
+                "{:.2}% of requests throttled; {} retries, {} total backoff ({:.0}% of operation time spent waiting to retry), max Retry-After {} ms",
                 thr as f64 / requests * 100.0,
                 s.resilience.retries,
                 fmt_ms(s.resilience.retry_backoff_ms),
+                shares.retry * 100.0,
                 s.resilience.max_retry_after_ms
             ),
             "The service is rate-limiting this request rate. Lower `concurrency` / `max_inflight_requests` (or run `oprobe tune` to find the safe ceiling), spread keys across more prefixes, and keep retries with jitter enabled.",
@@ -221,6 +244,7 @@ pub fn diagnose(s: &Snapshot, knobs: &Knobs, sla: &Sla, network: bool) -> Diagno
             shares.server,
         ),
         (Bottleneck::Download, shares.download),
+        (Bottleneck::RetryBackoff, shares.retry),
         (Bottleneck::Client, shares.client + shares.cache),
     ];
     let (mut bottleneck, top_share) = candidates
@@ -240,6 +264,11 @@ pub fn diagnose(s: &Snapshot, knobs: &Knobs, sla: &Sla, network: bool) -> Diagno
     let cpu_busy = s.client.cpu_pct / 100.0;
     let headline = match bottleneck {
         Bottleneck::None => "No operations completed in the measurement window.".to_owned(),
+        Bottleneck::Throttling if shares.retry >= 0.005 => format!(
+            "Throttling-bound: the service rejected {:.1}% of requests with 429/503; {:.0}% of operation time is retry backoff.",
+            thr as f64 / requests * 100.0,
+            shares.retry * 100.0
+        ),
         Bottleneck::Throttling => format!(
             "Throttling-bound: the service rejected {:.1}% of requests with 429/503.",
             thr as f64 / requests * 100.0
@@ -257,7 +286,7 @@ pub fn diagnose(s: &Snapshot, knobs: &Knobs, sla: &Sla, network: bool) -> Diagno
     match bottleneck {
         Bottleneck::ClientQueue => f.push(finding(
             Severity::Warning,
-            "client-queue",
+            "client_queue",
             "Operations wait for in-flight request permits".into(),
             format!(
                 "{:.0}% of op time queued; mean request queue wait {} (cap {} in-flight requests, peak {})",
@@ -272,7 +301,7 @@ pub fn diagnose(s: &Snapshot, knobs: &Knobs, sla: &Sla, network: bool) -> Diagno
             if cpu_busy > 0.8 * cores {
                 f.push(finding(
                     Severity::Warning,
-                    "client-cpu",
+                    "client_cpu",
                     "Client CPU is saturated".into(),
                     format!("process uses {:.1} of {cores} cores", cpu_busy),
                     "The load generator itself is the bottleneck: use fewer/larger operations, disable CRC verification (`workload.verify = false`), or run on a larger machine.",
@@ -280,7 +309,7 @@ pub fn diagnose(s: &Snapshot, knobs: &Knobs, sla: &Sla, network: bool) -> Diagno
             } else if stage.stall > stage.body && stage.stall > 0.5 {
                 f.push(finding(
                     Severity::Warning,
-                    "consumer-stall",
+                    "consumer_stall",
                     "Response bodies wait for the consumer".into(),
                     format!("mean consumer stall {} vs network transfer {}", fmt_ms(stage.stall), fmt_ms(stage.body)),
                     "Data arrives faster than it is consumed; the application side (decode/copy) is the limit, not storage.",
@@ -288,7 +317,7 @@ pub fn diagnose(s: &Snapshot, knobs: &Knobs, sla: &Sla, network: bool) -> Diagno
             } else {
                 f.push(finding(
                     Severity::Info,
-                    "client-overhead",
+                    "client_overhead",
                     "Time is spent outside network requests".into(),
                     format!("{:.0}% of op time in client processing (signing, buffering, OpenDAL, CRC)", (shares.client + shares.cache) * 100.0),
                     "Typical for in-memory/local backends or tiny objects. For remote stores, batch small operations.",
@@ -297,7 +326,7 @@ pub fn diagnose(s: &Snapshot, knobs: &Knobs, sla: &Sla, network: bool) -> Diagno
         }
         Bottleneck::Connect => f.push(finding(
             Severity::Warning,
-            "connect",
+            "cold_connections",
             "Connection setup dominates".into(),
             format!(
                 "{} new connections, reuse {:.0}%; DNS p50 {} · TCP p50 {} · TLS p50 {}",
@@ -317,7 +346,7 @@ pub fn diagnose(s: &Snapshot, knobs: &Knobs, sla: &Sla, network: bool) -> Diagno
             let rtt = s.connections.tcp.p50;
             f.push(finding(
                 Severity::Info,
-                "server-latency",
+                "server_latency",
                 "Latency-bound on server time-to-first-byte".into(),
                 format!(
                     "mean TTFB {} per request{}, {:.2} requests per op",
@@ -342,7 +371,7 @@ pub fn diagnose(s: &Snapshot, knobs: &Knobs, sla: &Sla, network: bool) -> Diagno
             let per_stream = if api_bw.1 > 0.0 { api_bw.0 / (api_bw.1 / 1000.0) / 1048576.0 } else { 0.0 };
             f.push(finding(
                 Severity::Info,
-                if bottleneck == Bottleneck::Download { "download-bound" } else { "upload-bound" },
+                if bottleneck == Bottleneck::Download { "download_bound" } else { "upload_bound" },
                 format!("Bandwidth-bound on {}", if bottleneck == Bottleneck::Download { "downloads" } else { "uploads" }),
                 format!(
                     "≈{per_stream:.1} MiB/s per request stream, aggregate {:.1} MiB/s",
@@ -351,9 +380,21 @@ pub fn diagnose(s: &Snapshot, knobs: &Knobs, sla: &Sla, network: bool) -> Diagno
                 "Use more parallel streams (`io_concurrency`, `concurrency`) with larger `chunk_size`; check NIC, proxy and cross-region links.",
             ));
         }
+        Bottleneck::RetryBackoff => f.push(finding(
+            Severity::Warning,
+            "retries",
+            "Operations spend their time waiting to retry".into(),
+            format!(
+                "{:.0}% of op time in retry backoff; {} retries, {} total backoff",
+                shares.retry * 100.0,
+                s.resilience.retries,
+                fmt_ms(s.resilience.retry_backoff_ms)
+            ),
+            "Requests fail with temporary errors and are retried after a backoff: see `resilience.error_classes` and the slow-op request timelines for the failing requests.",
+        )),
         Bottleneck::LocalBackend => f.push(finding(
             Severity::Info,
-            "local-backend",
+            "local_backend",
             "Local backend service time dominates".into(),
             format!("in-process backend calls take {:.0}% of op time", shares.server * 100.0),
             "Results reflect local disk/memory, not network storage.",
@@ -369,7 +410,7 @@ pub fn diagnose(s: &Snapshot, knobs: &Knobs, sla: &Sla, network: bool) -> Diagno
     {
         f.push(finding(
             Severity::Warning,
-            "connection-churn",
+            "cold_connections",
             format!("Only {:.0}% of requests reused a connection", s.connections.reuse_pct),
             format!("{} dials for {} requests", s.connections.dialed, s.connections.requests),
             "Enable keep-alive and make sure response bodies are fully drained so connections return to the pool.",
@@ -378,7 +419,7 @@ pub fn diagnose(s: &Snapshot, knobs: &Knobs, sla: &Sla, network: bool) -> Diagno
     if s.connections.tls.p50 > 100.0 {
         f.push(finding(
             Severity::Info,
-            "slow-tls",
+            "cold_connections",
             "Slow TLS handshakes".into(),
             format!(
                 "TLS p50 {} p99 {}",
@@ -402,7 +443,7 @@ pub fn diagnose(s: &Snapshot, knobs: &Knobs, sla: &Sla, network: bool) -> Diagno
     if s.cache.enabled && s.cache.lookups > 100 && s.cache.hit_ratio < 0.05 {
         f.push(finding(
             Severity::Info,
-            "cache-ineffective",
+            "cache_ineffective",
             format!("Read cache hit ratio is {:.1}%", s.cache.hit_ratio * 100.0),
             format!("{} lookups, {} hits", s.cache.lookups, s.cache.hits),
             "The access pattern has little reuse; disable the cache to save memory or enlarge it if the working set is close to `cache_size`.",
@@ -412,7 +453,7 @@ pub fn diagnose(s: &Snapshot, knobs: &Knobs, sla: &Sla, network: bool) -> Diagno
         if v.count >= 50 && v.latency.p50 > 0.5 && v.latency.p99 > 5.0 * v.latency.p50 {
             f.push(finding(
                 Severity::Warning,
-                "tail-latency",
+                "tail_latency",
                 format!("`{}` p99 is {:.1}× its median", v.verb, v.latency.p99 / v.latency.p50),
                 format!("p50 {} · p99 {} · max {}", fmt_ms(v.latency.p50), fmt_ms(v.latency.p99), fmt_ms(v.latency.max)),
                 "See the slowest-operation timelines for the responsible stage. Server stragglers can be cut with `tail_cut = true`; retries/backoff point to throttling or errors.",
@@ -424,7 +465,7 @@ pub fn diagnose(s: &Snapshot, knobs: &Knobs, sla: &Sla, network: bool) -> Diagno
         {
             f.push(finding(
                     Severity::Warning,
-                    "sla-p99",
+                    "sla_p99",
                     format!("`{}` p99 {} exceeds the {} SLA", v.verb, fmt_ms(v.latency.p99), fmt_ms(limit)),
                     format!("{} ops, p50 {}", v.count, fmt_ms(v.latency.p50)),
                     "Reduce concurrency if queueing/throttling, or tune chunk/range settings (`oprobe tune`).",
@@ -436,7 +477,7 @@ pub fn diagnose(s: &Snapshot, knobs: &Knobs, sla: &Sla, network: bool) -> Diagno
     {
         f.push(finding(
                 Severity::Warning,
-                "rate-not-sustained",
+                "rate_not_sustained",
                 format!("Target rate {:.0} ops/s not sustained", ol.target_rate),
                 format!(
                     "achieved {:.0} ops/s; arrivals queued behind {} busy slots (max schedule lag {}); {} never started before the window ended",
@@ -451,11 +492,36 @@ pub fn diagnose(s: &Snapshot, knobs: &Knobs, sla: &Sla, network: bool) -> Diagno
     if cpu_busy > 0.8 * cores && bottleneck != Bottleneck::Client {
         f.push(finding(
             Severity::Warning,
-            "client-cpu",
+            "client_cpu",
             "Load generator CPU is near saturation".into(),
             format!("process uses {:.1} of {cores} cores", cpu_busy),
             "Measurements may understate what the storage can do; use a bigger client or lower verification overhead.",
         ));
+    }
+    // Parquet-style scans that HEAD every file before reading its footer (stream B2).
+    if let Some(v) = s
+        .verbs
+        .iter()
+        .find(|v| v.verb == "parquet.scan" && v.count > 0)
+    {
+        let heads = s
+            .apis
+            .iter()
+            .find(|a| a.api == crate::trace::Api::HeadObject)
+            .map_or(0, |a| a.count);
+        if heads > 0 && heads * 2 >= v.count {
+            f.push(finding(
+                Severity::Info,
+                "suffix_read",
+                "Use suffix reads: saves one HEAD per file".into(),
+                format!(
+                    "{heads} HEAD requests for {} file scans ({:.0}% of all requests): each scan asks for the size before reading the footer",
+                    v.count,
+                    heads as f64 / requests * 100.0
+                ),
+                "Read the footer with a suffix range (`Range: bytes=-N`, OpenDAL `read_with(path).range(BytesRange::suffix(n))`): the response carries the footer and the file size. Verify: `oprobe run TARGET --preset parquet-suffix`.",
+            ));
+        }
     }
     let _ = ops;
     f.sort_by_key(|x| std::cmp::Reverse(x.severity));
@@ -472,5 +538,129 @@ fn capitalize(s: &str) -> String {
     match c.next() {
         Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
         None => String::new(),
+    }
+}
+
+/// Outcome of checking a run against its [`Sla`].
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SlaVerdict {
+    /// Whether a breach fails the command (exit code 3).
+    pub enforced: bool,
+    pub passed: bool,
+    /// One line per breached objective (empty when passed).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub breaches: Vec<String>,
+}
+
+/// Check the measured result against the SLA: error rate, data integrity (always), per-verb
+/// p99 and throttle rate (when set).
+pub fn check_sla(s: &Snapshot, sla: &Sla) -> SlaVerdict {
+    let mut breaches = Vec::new();
+    if s.integrity.corrupted > 0 {
+        breaches.push(format!(
+            "{} corrupted objects (CRC32C mismatch); corrupted data is never acceptable",
+            s.integrity.corrupted
+        ));
+    }
+    if s.summary.ops > 0 && s.summary.error_rate > sla.max_error_rate {
+        breaches.push(format!(
+            "{:.2}% of operations failed ({} of {}), limit {}%",
+            s.summary.error_rate * 100.0,
+            s.summary.failed_ops,
+            s.summary.ops,
+            sla.max_error_rate * 100.0
+        ));
+    }
+    if s.summary.ops == 0 {
+        breaches.push("no operation completed in the measurement window".into());
+    }
+    if let Some(limit) = sla.max_throttle_rate {
+        let throttled: u64 = s.verbs.iter().map(|v| v.throttled).sum();
+        let rate = throttled as f64 / s.summary.ops.max(1) as f64;
+        if rate > limit {
+            breaches.push(format!(
+                "{:.2}% of operations were throttled (429/503), limit {}%",
+                rate * 100.0,
+                limit * 100.0
+            ));
+        }
+    }
+    if let Some(limit) = sla.p99_ms {
+        for v in s
+            .verbs
+            .iter()
+            .filter(|v| v.count > 0 && v.latency.p99 > limit)
+        {
+            breaches.push(format!(
+                "`{}` p99 {} exceeds the {} limit",
+                v.verb,
+                fmt_ms(v.latency.p99),
+                fmt_ms(limit)
+            ));
+        }
+    }
+    SlaVerdict {
+        enforced: sla.enforce,
+        passed: breaches.is_empty(),
+        breaches,
+    }
+}
+
+#[cfg(test)]
+mod sla_tests {
+    use super::*;
+    use crate::trace::{Quantiles, Summary, VerbStats};
+
+    fn snap(ops: u64, failed: u64) -> Snapshot {
+        Snapshot {
+            summary: Summary {
+                ops,
+                failed_ops: failed,
+                error_rate: failed as f64 / ops.max(1) as f64,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn default_sla_fails_on_errors_above_one_percent_and_any_corruption() {
+        let sla = Sla::default();
+        assert!(sla.enforce);
+        assert!(
+            check_sla(&snap(1000, 10), &sla).passed,
+            "1% is within the SLA"
+        );
+        let v = check_sla(&snap(1000, 11), &sla);
+        assert!(!v.passed && v.enforced);
+        assert!(v.breaches[0].contains("failed"), "{v:?}");
+        let mut s = snap(1000, 0);
+        s.integrity.corrupted = 1;
+        assert!(!check_sla(&s, &sla).passed);
+        // Throttling absorbed by retries is not a breach unless a limit is set.
+        let mut s = snap(100, 0);
+        s.verbs = vec![VerbStats {
+            verb: "read.full".into(),
+            count: 100,
+            throttled: 50,
+            latency: Quantiles {
+                p99: 900.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        }];
+        assert!(check_sla(&s, &sla).passed);
+        let strict = Sla {
+            max_throttle_rate: Some(0.1),
+            p99_ms: Some(500.0),
+            ..Sla::default()
+        };
+        assert_eq!(check_sla(&s, &strict).breaches.len(), 2);
+        let off = Sla {
+            enforce: false,
+            ..Sla::default()
+        };
+        let v = check_sla(&snap(10, 10), &off);
+        assert!(!v.passed && !v.enforced);
     }
 }

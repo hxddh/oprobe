@@ -172,9 +172,8 @@ impl Tuner<'_> {
         if t.error_rate > p.sla.max_error_rate {
             why.push(format!("errors {:.2}%", t.error_rate * 100.0));
         }
-        if t.throttle_rate > p.sla.max_throttle_rate
-            || (p.sla.max_throttle_rate == 0.0 && t.throttled())
-        {
+        let throttle_limit = p.sla.tune_throttle_limit();
+        if t.throttle_rate > throttle_limit || (throttle_limit == 0.0 && t.throttled()) {
             why.push(format!("{} throttled responses", t.throttled_responses));
         }
         if let Some(limit) = p.sla.p99_ms
@@ -333,6 +332,96 @@ impl Tuner<'_> {
     }
 }
 
+/// Highest concurrency the tuner recommends below a throttling ceiling (80 % of it).
+pub fn safe_concurrency(ceiling: usize) -> usize {
+    ((ceiling as f64) * 0.8).floor().max(1.0) as usize
+}
+
+/// "throttling ceiling: concurrency 48 was throttled (… 429/503 responses, trial #9); 40 is the
+/// highest clean concurrency measured (first seen at 64 on the doubling ladder, narrowed by
+/// bisection)".
+fn ceiling_note(trials: &[Trial], base: &Knobs, ce: usize, first: Option<usize>) -> String {
+    let at = |c: usize| {
+        let k = Knobs {
+            concurrency: c,
+            ..base.clone()
+        };
+        trials
+            .iter()
+            .rev()
+            .find(|t| t.stage != "confirm" && t.knobs == k)
+    };
+    let mut s = format!("throttling ceiling: concurrency {ce}");
+    if let Some(t) = at(ce) {
+        s += &format!(
+            " was throttled ({} responses 429/503, trial #{})",
+            t.throttled_responses, t.id
+        );
+    }
+    let clean = trials
+        .iter()
+        .filter(|t| t.stage != "confirm" && !t.throttled() && t.knobs.concurrency < ce)
+        .map(|t| t.knobs.concurrency)
+        .max();
+    if let Some(c) = clean {
+        s += &format!("; {c} is the highest clean concurrency measured");
+    }
+    if let Some(f) = first.filter(|&f| f != ce) {
+        s += &format!(" (first seen at {f} on the doubling ladder, narrowed down by bisection)");
+    }
+    s
+}
+
+/// Explain the safety margin with the numbers that decided it.
+fn safety_note(t: &Tuner<'_>, winner: usize, ce: usize) -> String {
+    let safe = safe_concurrency(ce);
+    let w = &t.trials[winner];
+    let mut s = format!(
+        "safety margin: concurrency is capped at {safe} = 80% of the throttling ceiling {ce}, leaving {} slots of headroom for production variance",
+        ce - safe
+    );
+    // The best clean trial the cap excluded, if it measured better than the winner.
+    let excluded = (0..t.trials.len())
+        .filter(|&i| {
+            let x = &t.trials[i];
+            x.stage != "confirm" && x.feasible && x.knobs.concurrency > safe
+        })
+        .max_by(|&a, &b| t.metric(&t.trials[a]).total_cmp(&t.metric(&t.trials[b])));
+    if let Some(i) = excluded {
+        let x = &t.trials[i];
+        let (mx, mw) = (t.metric(x), t.metric(w));
+        if mw > 0.0 && mx > mw {
+            s += &format!(
+                "; concurrency {} (trial #{}) was clean and measured {:+.0}% {} vs concurrency {} (trial #{}), but sits only {:.0}% below the ceiling, so it was not recommended",
+                x.knobs.concurrency,
+                x.id,
+                (mx / mw - 1.0) * 100.0,
+                if t.use_bytes { "MiB/s" } else { "ops/s" },
+                w.knobs.concurrency,
+                w.id,
+                (1.0 - x.knobs.concurrency as f64 / ce as f64) * 100.0
+            );
+        }
+    }
+    s
+}
+
+/// Chunk candidates as OpenDAL would write them on a service with `cap`: each clamped to the
+/// part-size limits, duplicates removed (order kept). Returns `(requested, effective)`.
+fn write_chunk_candidates(
+    cap: &opendal::Capability,
+    chunks: &[ByteSize],
+) -> (Vec<ByteSize>, Vec<ByteSize>) {
+    let mut out: Vec<ByteSize> = Vec::new();
+    for c in chunks {
+        let e = ByteSize(crate::engine::stack::effective_write_chunk(cap, c.as_usize()) as u64);
+        if !out.contains(&e) {
+            out.push(e);
+        }
+    }
+    (chunks.to_vec(), out)
+}
+
 /// How long to pause after a trial: nothing unless it was throttled; then the configured
 /// cooldown or the service's `Retry-After` from *this* trial (capped at [`MAX_RETRY_AFTER`]),
 /// whichever is longer. `Retry-After` is honored even with `--cooldown 0`.
@@ -350,6 +439,17 @@ pub async fn tune(
     on_event: Arc<dyn Fn(TuneEvent) + Send + Sync>,
 ) -> Result<TuneOutcome> {
     let p = &session.profile;
+    if opts.objective == Objective::Cost {
+        let probe = cost_report(
+            &Snapshot::default(),
+            &p.cost,
+            &p.target.scheme,
+            p.target.endpoint().as_deref(),
+        );
+        if let Some(why) = probe.not_applicable_reason {
+            anyhow::bail!("the cost objective needs a price table: {why}");
+        }
+    }
     let mut t = Tuner {
         session,
         opts,
@@ -395,10 +495,6 @@ pub async fn tune(
         let tr = t.trials[id].clone();
         if tr.throttled() {
             ceiling = Some(c);
-            notes.push(format!(
-                "throttling starts at concurrency {c} ({} responses 429/503)",
-                tr.throttled_responses
-            ));
             break;
         }
         last_clean = Some(c);
@@ -421,6 +517,7 @@ pub async fn tune(
             }
         }
     }
+    let first_throttled = ceiling;
     // Binary refinement just below the throttling ceiling.
     if let (Some(hi0), Some(lo0)) = (ceiling, last_clean) {
         let (mut lo, mut hi) = (lo0, hi0);
@@ -447,9 +544,13 @@ pub async fn tune(
         }
         ceiling = Some(hi);
     }
+    // One statement about the ceiling, consistent with `throttle_ceiling` in the summary.
+    if let Some(ce) = ceiling {
+        notes.push(ceiling_note(&t.trials, &base_knobs, ce, first_throttled));
+    }
     let mut current = t.best().unwrap_or(baseline);
     if let Some(ce) = ceiling {
-        let safe = ((ce as f64) * 0.8).floor().max(1.0) as usize;
+        let safe = safe_concurrency(ce);
         t.concurrency_cap = Some(safe);
         if t.trials[current].knobs.concurrency > safe {
             if t.budget_left() {
@@ -458,9 +559,6 @@ pub async fn tune(
                     ..t.trials[current].knobs.clone()
                 };
                 current = t.trial("safety-margin", &k, None).await?;
-                notes.push(format!(
-                    "concurrency capped at {safe} (80% of the {ce} throttling ceiling) for headroom"
-                ));
             } else if let Some(b) = t.best() {
                 current = b;
             }
@@ -478,17 +576,49 @@ pub async fn tune(
         .max()
         .unwrap_or(0)
         >= 8 << 20;
-    let multipart = has(&|o| matches!(o, OpKind::MultipartWrite { .. }));
+    // A service without multipart uploads writes every object in one request: the chunk size
+    // does not shape writes there (capability-aware candidates, stream B2).
+    let multipart =
+        has(&|o| matches!(o, OpKind::MultipartWrite { .. })) && session.capability.write_can_multi;
+    if has(&|o| matches!(o, OpKind::MultipartWrite { .. })) && !multipart {
+        notes.push(format!(
+            "`{}` has no multipart uploads: write chunk sizes are not tuned (each object is one request)",
+            session.profile.target.scheme
+        ));
+    }
     let vectored = has(&|o| matches!(o, OpKind::ParquetScan { .. }));
     let full_reads = has(&|o| matches!(o, OpKind::Read { size: None }));
     let reads = has(&|o| !o.is_write());
-    let chunks = [
+    let mut chunks = vec![
         ByteSize::mib(1),
         ByteSize::mib(4),
         ByteSize::mib(8),
         ByteSize::mib(16),
         ByteSize::mib(32),
     ];
+    if multipart {
+        // OpenDAL silently raises (lowers) write chunks to the service's minimum (maximum)
+        // multipart part size: only try chunk sizes it actually uses.
+        let (requested, effective) = write_chunk_candidates(&session.capability, &chunks);
+        if effective != requested {
+            notes.push(format!(
+                "chunk sizes tried: {} — {} would be raised to the service's minimum part size {} by OpenDAL",
+                effective.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(", "),
+                requested
+                    .iter()
+                    .filter(|c| !effective.contains(c))
+                    .map(|c| c.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                session
+                    .capability
+                    .write_multi_min_size
+                    .map(|m| ByteSize(m as u64).to_string())
+                    .unwrap_or_default()
+            ));
+        }
+        chunks = effective;
+    }
     let ios = [1usize, 2, 4, 8, 16];
     let gaps = [
         ByteSize::b(0),
@@ -634,6 +764,9 @@ pub async fn tune(
         (t.on_event)(TuneEvent::Message(msg.clone()));
         notes.insert(0, msg);
     }
+    if let Some(ce) = ceiling {
+        notes.push(safety_note(&t, winner_idx, ce));
+    }
     let winner = t.trials[winner_idx].knobs.clone();
     let confirm_opts = RunOptions {
         duration: opts.trial.duration * 2,
@@ -685,6 +818,24 @@ pub async fn tune(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn write_chunk_candidates_respect_the_minimum_part_size() {
+        let mut cap = opendal::Capability::default();
+        let list = [
+            ByteSize::mib(1),
+            ByteSize::mib(4),
+            ByteSize::mib(8),
+            ByteSize::mib(16),
+        ];
+        assert_eq!(write_chunk_candidates(&cap, &list).1, list.to_vec());
+        cap.write_multi_min_size = Some(5 << 20);
+        cap.write_multi_max_size = Some(10 << 20);
+        assert_eq!(
+            write_chunk_candidates(&cap, &list).1,
+            vec![ByteSize::mib(5), ByteSize::mib(8), ByteSize::mib(10)]
+        );
+    }
 
     #[test]
     fn cooldown_honors_capped_retry_after_per_trial() {

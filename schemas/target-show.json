@@ -1,0 +1,47 @@
+{
+  "$id": "https://github.com/hxddh/oprobe/schemas/3/target-show.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Result of `oprobe target show`",
+  "properties": {
+    "credentials": {
+      "description": "`env`, `profile:NAME` or `anonymous` (default: the provider's credential chain).",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "endpoint": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "name": {
+      "type": "string"
+    },
+    "options": {
+      "additionalProperties": {
+        "type": "string"
+      },
+      "description": "OpenDAL options, validated against the service when the target is used.",
+      "type": "object"
+    },
+    "region": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "url": {
+      "description": "Storage URL, e.g. `s3://bucket/prefix`.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "name",
+    "url"
+  ],
+  "title": "oprobe target-show",
+  "type": "object",
+  "x-rust-type": "TargetShow"
+}

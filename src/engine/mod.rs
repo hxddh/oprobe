@@ -2,10 +2,14 @@
 
 pub mod cleanup;
 pub mod dataset;
+pub mod measure;
 pub mod operator;
 pub mod ops;
 pub mod procstat;
 pub mod runner;
+pub mod stack;
+pub mod workloads;
 
 pub use cleanup::CleanupSummary;
-pub use runner::{Cancel, Progress, ProgressFn, RunOptions, Session};
+pub use runner::{Cancel, Progress, ProgressFn, RunOptions, Session, SessionOptions};
+pub use stack::ClientStack;

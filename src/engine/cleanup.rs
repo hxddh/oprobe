@@ -11,11 +11,13 @@ use serde::{Deserialize, Serialize};
 pub const RUN_PREFIX: &str = "oprobe-run-";
 pub const DATASET_PREFIX: &str = "oprobe-dataset/";
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct CleanupSummary {
     pub enabled: bool,
     pub prefix: String,
+    #[serde(rename = "deleted_count")]
     pub deleted: u64,
+    #[serde(rename = "remaining_count")]
     pub remaining: u64,
     pub duration_ms: f64,
     /// Re-listed after deletion and found nothing left.
@@ -26,9 +28,19 @@ pub struct CleanupSummary {
     pub error: Option<String>,
 }
 
+/// `oprobe-run-<run id>/` for a fresh run id.
 pub fn new_run_prefix() -> String {
-    let tag: u16 = rand::random();
-    format!("{RUN_PREFIX}{}-{tag:04x}/", crate::util::compact_utc_now())
+    crate::model::RunId::new().run_prefix()
+}
+
+/// Start time encoded in a run prefix (`oprobe-run-<run id>/` or the 2.x
+/// `oprobe-run-<compact utc>-<tag>/`).
+fn prefix_started_at(prefix: &str) -> Option<SystemTime> {
+    let rest = prefix.strip_prefix(RUN_PREFIX)?;
+    rest.get(..20)
+        .and_then(crate::model::RunId::parse)
+        .and_then(|id| id.started_at())
+        .or_else(|| rest.get(..16).and_then(crate::util::parse_compact_utc))
 }
 
 async fn list_files(op: &Operator, prefix: &str) -> Result<Vec<String>> {
@@ -83,10 +95,11 @@ pub async fn delete_prefix(op: &Operator, prefix: &str) -> CleanupSummary {
     s
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SweepEntry {
     pub prefix: String,
     pub age_s: Option<u64>,
+    #[serde(rename = "objects_count")]
     pub objects: u64,
     pub deleted: bool,
 }
@@ -112,11 +125,7 @@ pub async fn sweep(
     let now = SystemTime::now();
     let mut out = Vec::new();
     for prefix in candidates {
-        let age = prefix
-            .strip_prefix(RUN_PREFIX)
-            .and_then(|r| r.get(..16))
-            .and_then(crate::util::parse_compact_utc)
-            .and_then(|t| now.duration_since(t).ok());
+        let age = prefix_started_at(&prefix).and_then(|t| now.duration_since(t).ok());
         if let Some(a) = age
             && a < older_than
         {

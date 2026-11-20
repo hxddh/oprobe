@@ -1,16 +1,23 @@
 //! Bridge between the UI and the `oprobe` engine. Benchmarks run on a Tokio runtime of their
-//! own (the engine spawns Tokio tasks and owns sockets); the UI polls a shared, `Send` state.
+//! own (the engine spawns Tokio tasks and owns sockets); the UI polls a shared, `Send` state
+//! and only ever reads snapshots of it.
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use anyhow::Context as _;
+
 use crate::config::Profile;
-use crate::engine::{Cancel, Progress, ProgressFn, RunOptions, Session};
+use crate::engine::measure::{Measured, Mode, Rails, Request, Stage};
+use crate::engine::{Cancel, Progress, ProgressFn};
+use crate::guard::Budgets;
+use crate::model::Run;
 use crate::net::probe::{ProbeOptions, ProbeReport, probe_endpoint};
-use crate::report::{Report, TuneSummary};
+use crate::store::RunStore;
 use crate::trace::Snapshot;
-use crate::tune::{Trial, TuneEvent, TuneOptions, codegen, tune};
+use crate::tune::{Trial, TuneEvent, TuneOptions, codegen};
 
 fn runtime() -> &'static tokio::runtime::Runtime {
     static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
@@ -23,21 +30,54 @@ fn runtime() -> &'static tokio::runtime::Runtime {
     })
 }
 
+/// Run blocking work (loading a run file, deriving its views) on the engine's threads.
+pub async fn off_thread<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+    let (tx, rx) = futures::channel::oneshot::channel();
+    runtime().spawn_blocking(move || {
+        let _ = tx.send(f());
+    });
+    rx.await.ok()
+}
+
 /// The finished result of a job.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub enum Outcome {
-    Report(Box<Report>),
-    Tuned {
-        report: Box<Report>,
-        summary: Box<TuneSummary>,
-        profile_toml: String,
-        rust: String,
+    /// A measurement (or the tuner's confirmation run), saved to the run store when it has one.
+    Run {
+        run: Box<Run>,
+        path: Option<PathBuf>,
+        /// The tuner's extras (its winner as a profile and as Rust code).
+        tuned: Option<Box<TunedExtras>>,
     },
     Probe(Box<ProbeReport>),
     Failed {
         error: String,
         hint: Option<(String, Vec<String>)>,
     },
+}
+
+/// What the tuner adds to its confirmation run.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TunedExtras {
+    pub knobs: crate::config::Knobs,
+    pub profile_toml: String,
+    pub rust: String,
+}
+
+/// What a run job measures and where its result goes.
+#[derive(Clone)]
+pub struct RunRequest {
+    pub profile: Profile,
+    pub target_name: Option<String>,
+    /// Shown instead of the profile's target (`lab://demo`).
+    pub display: Option<String>,
+    pub label: Option<String>,
+    /// Start an in-process lab with these faults and point the profile at it.
+    pub lab: Option<crate::lab::LabConfig>,
+    pub store: Option<RunStore>,
+    pub trace_max_requests: usize,
+    /// Budgets of the run (`[defaults.budgets]`, as for the CLI).
+    pub budgets: Budgets,
 }
 
 #[derive(Default)]
@@ -179,6 +219,51 @@ fn join_error(e: tokio::task::JoinError) -> String {
     )
 }
 
+/// One app measurement through [`crate::engine::measure`]: the rails and budgets of the CLI
+/// (`[defaults.budgets]` from the config file). A budget breach keeps the saved partial run
+/// and fails the job with the breach.
+#[allow(clippy::too_many_arguments)]
+async fn measure_in_app(
+    profile: Profile,
+    target_name: Option<String>,
+    budgets: &Budgets,
+    trace_max_requests: usize,
+    store: Option<RunStore>,
+    cancel: Cancel,
+    progress: ProgressFn,
+    mode: Mode,
+    finalize: crate::engine::measure::FinalizeFn,
+) -> anyhow::Result<Measured> {
+    let rails = Rails::new(&profile, false, None, budgets.clone())?;
+    let guard = rails.guard(&profile);
+    let p2 = progress.clone();
+    let p3 = progress.clone();
+    let mut req = Request::new(profile, rails, cancel, progress);
+    req.target_name = target_name;
+    req.guard = guard;
+    req.trace_max_requests = trace_max_requests;
+    req.store = store;
+    req.mode = mode;
+    req.finalize = Some(finalize);
+    req.on_stage = Some(Arc::new(move |s| {
+        if s == Stage::CleaningUp {
+            p2(Progress::Message("cleaning up test data…".into()));
+        }
+    }));
+    let m = crate::engine::measure::measure(req).await?;
+    for w in &m.warnings {
+        p3(Progress::Message(format!("warning: {w}")));
+    }
+    if let Some(b) = &m.breach {
+        let mut e = b.to_error();
+        if let Some(p) = &m.path {
+            e = e.context(format!("the partial run was saved: {}", p.display()));
+        }
+        return Err(e);
+    }
+    Ok(m)
+}
+
 impl Job {
     fn spawn<F, Fut>(f: F) -> Arc<Self>
     where
@@ -227,57 +312,72 @@ impl Job {
         })
     }
 
-    /// Run one workload window and build its report.
-    pub fn run(profile: Profile) -> Arc<Self> {
+    /// Run one workload window, build the run (report + trace rows) and save it — through the
+    /// same pipeline as `oprobe run` (rails, budgets, preflight, cleanup).
+    pub fn run(req: RunRequest) -> Arc<Self> {
         Self::spawn(move |state, cancel| async move {
-            let scheme = profile.target.scheme.clone();
+            let scheme = req.profile.target.scheme.clone();
             let progress = Self::progress(&state);
-            let res: anyhow::Result<Report> = async {
-                let session = Session::open(profile, cancel, progress.clone()).await?;
-                for w in &session.warnings {
-                    progress(Progress::Message(format!("warning: {w}")));
-                }
-                let knobs = session.profile.knobs.clone();
-                let run = session
-                    .run(
-                        &knobs,
-                        &RunOptions::from_profile(&session.profile),
-                        Some(progress.clone()),
-                    )
-                    .await;
-                let (ok, bad) = if run.is_ok() && session.profile.workload.verify {
-                    session.verify_writes(None).await
-                } else {
-                    (0, 0)
+            let res: anyhow::Result<Outcome> = async {
+                let mut profile = req.profile.clone();
+                // The lab lives as long as this task: until the session is closed.
+                let _lab = match req.lab.clone() {
+                    Some(faults) => {
+                        progress(Progress::Message("starting the lab server…".into()));
+                        let handle = crate::lab::LabServer::spawn("127.0.0.1:0", faults).await?;
+                        let mut p = handle.profile("demo");
+                        p.workload = profile.workload.clone();
+                        p.knobs = profile.knobs.clone();
+                        p.sla = profile.sla.clone();
+                        p.name = profile.name.clone();
+                        profile = p;
+                        Some(handle)
+                    }
+                    None => None,
                 };
-                progress(Progress::Message("cleaning up test data…".into()));
-                let cleanup = session.close().await;
-                let mut snap = run?;
-                snap.integrity.verified += ok;
-                snap.integrity.corrupted += bad;
-                Ok(Report::build(
-                    &session.profile,
-                    &knobs,
-                    snap,
-                    cleanup,
-                    session.warnings.clone(),
-                ))
+                if let Some(l) = &req.label {
+                    profile.name = Some(l.clone());
+                }
+                let display = req.display.clone();
+                let m = measure_in_app(
+                    profile,
+                    req.target_name.clone(),
+                    &req.budgets,
+                    req.trace_max_requests,
+                    req.store.clone(),
+                    cancel,
+                    progress,
+                    Mode::Run,
+                    Box::new(move |run| {
+                        if let Some(d) = display {
+                            run.report.target.display = d;
+                        }
+                    }),
+                )
+                .await?;
+                Ok(Outcome::Run {
+                    run: Box::new(m.run),
+                    path: m.path,
+                    tuned: None,
+                })
             }
             .await;
-            match res {
-                Ok(r) => Outcome::Report(Box::new(r)),
-                Err(e) => failed(&e, &scheme),
-            }
+            res.unwrap_or_else(|e| failed(&e, &scheme))
         })
     }
 
-    /// Run the closed-loop tuner.
-    pub fn tune(profile: Profile, opts: TuneOptions) -> Arc<Self> {
+    /// Run the closed-loop tuner; its confirmation run is saved like any run.
+    pub fn tune(
+        profile: Profile,
+        target_name: Option<String>,
+        opts: TuneOptions,
+        budgets: Budgets,
+        store: Option<RunStore>,
+    ) -> Arc<Self> {
         Self::spawn(move |state, cancel| async move {
             let scheme = profile.target.scheme.clone();
             let progress = Self::progress(&state);
             let res: anyhow::Result<Outcome> = async {
-                let session = Session::open(profile, cancel, progress.clone()).await?;
                 let st = state.clone();
                 let on_event: Arc<dyn Fn(TuneEvent) + Send + Sync> = Arc::new(move |ev| {
                     let mut s = st.lock().unwrap_or_else(|e| e.into_inner());
@@ -289,28 +389,40 @@ impl Job {
                         TuneEvent::Message(m) => s.log.push(m),
                     }
                 });
-                let out = tune(&session, &opts, on_event).await;
-                progress(Progress::Message("cleaning up test data…".into()));
-                let cleanup = session.close().await;
-                let out = out?;
-                let mut report = Report::build(
-                    &session.profile,
-                    &out.winner,
-                    out.winner_snapshot.clone(),
-                    cleanup,
-                    session.warnings.clone(),
-                );
-                report.tune = Some(out.summary.clone());
+                let m = measure_in_app(
+                    profile,
+                    target_name,
+                    &budgets,
+                    crate::trace::DEFAULT_MAX_REQUESTS,
+                    store,
+                    cancel,
+                    progress,
+                    Mode::Tune { opts, on_event },
+                    Box::new(|run| run.report.run.label = Some("tuned".into())),
+                )
+                .await?;
+                let tuned = m.tuned.context("the tuner returned no result")?;
                 let header = format!(
                     "objective {} · {:+.0}% vs baseline",
-                    out.summary.objective,
-                    out.summary.improvement * 100.0
+                    tuned.summary.objective,
+                    tuned.summary.improvement * 100.0
                 );
-                Ok(Outcome::Tuned {
-                    profile_toml: codegen::profile_toml(&session.profile, &out.winner, &header)?,
-                    rust: codegen::rust_snippet(&session.profile.target.scheme, &out.winner),
-                    summary: Box::new(out.summary),
-                    report: Box::new(report),
+                Ok(Outcome::Run {
+                    tuned: Some(Box::new(TunedExtras {
+                        profile_toml: codegen::profile_toml(
+                            &tuned.profile,
+                            &tuned.winner,
+                            &header,
+                        )?,
+                        rust: codegen::rust_snippet(
+                            &tuned.profile.target,
+                            &tuned.winner,
+                            &tuned.capability,
+                        ),
+                        knobs: tuned.winner.clone(),
+                    })),
+                    run: Box::new(m.run),
+                    path: m.path,
                 })
             }
             .await;

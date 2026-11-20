@@ -4,6 +4,128 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## v3.0.0 — 2026-11-20
+
+oprobe 3 turns a benchmark into a product: **see every request your object-storage client makes, know where
+the time and money go and what to change — usable by people, CI and agents alike.** Every run is saved as one
+`.oprobe` file; every command has typed output (`-o text|json|ndjson|md|html`), stable error codes and exit
+codes. Nothing reads 2.x reports or flags.
+
+### Highlights
+
+- **`oprobe demo`**: zero flags. A local lab with throttling above a concurrency limit and 1-in-40 stragglers,
+  measured and narrated step by step, ending with how to measure your own bucket.
+- **Guided first run**: `oprobe run` with no target in a terminal offers the demo, the AWS profiles, Google
+  application default credentials and Azure storage variables found on the machine, or a URL, and saves the
+  choice as a named target.
+- **Answers first**: the default output of `oprobe run` is at most 20 lines in 80 columns — verdict, top
+  findings (cause · evidence · advice · next command), key numbers, and `oprobe runs show <id>` for the rest.
+- **Findings with evidence**: every diagnosis item has a stable code, severity, one-sentence cause, evidence
+  (numbers, operation ids, time windows), advice and, where possible, a command that verifies it;
+  `oprobe explain` narrates a run or documents a finding code.
+- **Single-file HTML report** (`-o html` on `run`, `runs show`, `compare`): SVG charts with real axes (log
+  latency), a latency heatmap, stage shares, findings with evidence, waterfalls of the slowest operations,
+  a filterable and sortable table of every request, network, cost and environment; light/dark, offline,
+  printable.
+- **Run history**: `oprobe runs list|show|open|export|rm|gc`; RUNREFs (`last`, `last~1`, an id prefix, a
+  label or a file); `runs show --detail`; `runs open` opens the run in the app.
+- **Named targets and configuration**: `oprobe target add|list|show|rm|test` (`add` runs a quick read-only
+  check; `test` is the full doctor), `credentials = "env" | "profile:NAME" | "anonymous"`,
+  `oprobe config show` (every value with its source), `config path`, `config edit`.
+- **Regression gate on runs**: `oprobe compare A B` and named baselines (`oprobe baseline`, `run --baseline`),
+  configuration differences listed first, Markdown and JUnit.
+- **GitHub Action** (`uses: hxddh/oprobe@v3`): installs a pinned, checksum-verified release, runs, compares
+  against a file or a named baseline kept in the Actions cache, uploads the run and the HTML report, keeps one
+  sticky PR comment up to date, and fails on regression.
+- **Agents**: `oprobe mcp` (MCP server; read-only unless `--allow-write`, budgets, progress notifications),
+  `oprobe schema` (JSON Schemas of every output), `oprobe capabilities`, the `oprobe.events/1` NDJSON stream,
+  `AGENTS.md`, `llms.txt` / `llms-full.txt`.
+- **Deeper observability**: storage API attribution from OpenDAL's `ServiceOperation`, retry backoff as its own
+  share, per-remote-address and per-connection splits, TCP_INFO and TLS handshake kind/resumption, outlier
+  attribution (`oprobe analyze`), capability-aware workloads (batched delete, copy, paged list, presigned GET,
+  footer reads, conditional writes), `oprobe compat` (correctness and compatibility score), `oprobe watch`
+  (continuous probing, SLOs, Prometheus, OTLP), `oprobe matrix` (rank targets or knob values), exports to
+  CSV, HAR, NDJSON and OTLP.
+- **Safety rails**: `--dry-run` plans (requests, bytes, objects, USD, ETA), budgets (`--max-cost-usd`,
+  `--max-requests`, `--max-bytes`, `--max-duration`, exit 4), `--read-only` (exit 5), writes confined to
+  `<prefix>/oprobe-run-<id>/`, `--idempotency-key`, preflight before any write.
+- **The app**: three panes (targets · runs · baselines / run inspector / selected request), virtualized request
+  table, timeline waterfall with zoom and brush, compare, command palette; `oprobe gui --open FILE`.
+- **`oprobe self-update`**: checks GitHub Releases, verifies the download against `SHA256SUMS`, checks that
+  the new binary runs and replaces it atomically; refuses package-managed installs with their update command.
+
+### Distribution
+
+- New release assets: Homebrew cask for the `.dmg` (`oprobe.cask.rb`) next to the formula, winget manifests
+  (`winget-manifests.zip`), `latest.json` (every asset's URL, size and SHA-256); `SHA256SUMS` covers every
+  asset including the manifests.
+- **SLSA build provenance** for every asset (`gh attestation verify FILE --repo hxddh/oprobe`).
+- Packages remain unsigned (no certificates); [docs/install.md](docs/install.md#first-open-of-unsigned-packages)
+  explains the first open on macOS 15+ (Privacy & Security → Open Anyway) and Windows SmartScreen.
+- Release notes come from this file; CI checks the docs (links, the generated CLI reference in `docs/cli.md`).
+
+### Documentation
+
+Rewritten around the product: getting started, concepts (targets, runs, baselines, findings), the generated
+CLI reference, workloads and presets, metrics (with `--microscope`-only values marked), reading the report,
+CI, install, troubleshooting, privacy (no telemetry), releasing; README in English and Chinese.
+
+### Shared core (breaking)
+
+- **Run store**: every `oprobe run` / `tune` is saved as `runs/<id>.oprobe` (zstd NDJSON,
+  `oprobe.run/3`: report + one row per operation and per request) with a `.json` sidecar under
+  `$OPROBE_DATA_DIR`. `oprobe runs list|show|rm|gc`; runs are referenced by id, id prefix,
+  `last`, `last~N`, label or path.
+- **Report v3** (`oprobe.report/3`): `run`, `verdict {level, headline, exit_code}`,
+  `knobs {requested, effective}`, `stages`, `network`, `heatmap`, `findings`, `slowest` (op ids);
+  every numeric field carries its unit. 2.x reports are not read.
+- **Global `-o/--output text|json|ndjson|md|html`**; stdout carries
+  only the result; `-o ndjson` streams `oprobe.events/1`. `--format` is gone; `--option` lost
+  its `-o` short flag.
+- **Classified errors**: stable codes (`net.timeout`, `safety.read_only`, …) and exit codes
+  (2 usage/config, 3 gate, 4 budget, 5 safety refusal, 130 interrupted); JSON errors in machine
+  modes.
+- **Safety rails**: `--dry-run` plan, `--read-only` (implied by `--existing`), budgets
+  (`--max-requests`, `--max-bytes`, `--max-duration`, `--max-cost-usd`), `--idempotency-key`,
+  and a preflight (list + tiny write/delete) before any data is uploaded.
+- **Config file** with named targets (`oprobe target add|list|show|rm`, `oprobe config
+  show|path`); `oprobe run prod` uses target `prod`.
+- **Command tree**: `diff` is now `compare A B` (RUNREFs or files); `report` is gone (`runs show
+  FILE`), `init` is hidden; `demo`, `analyze`, `explain`, `watch`, `matrix`, `compat`,
+  `baseline`, `mcp`, `schema`, `capabilities`, `self-update`, `runs open|export`, `target test`
+  and `config edit` are new (see Highlights).
+
+### Trust fixes (breaking)
+
+Places where oprobe could lead to a wrong conclusion. Reports use schema `oprobe.report/3`;
+v2 reports are rejected by `oprobe compare`.
+
+- **Retry backoff** is its own `retry` share of operation time (terminal, Markdown, app, JSON
+  `stages.shares.retry_pct`, `verbs[].breakdown.retry_ms`) instead of being counted as client time; throttling
+  headlines state how much time went to waiting for retries.
+- **SLA gate**: `oprobe run` / `tune` exit 3 when the run breaches its SLA — by default more
+  than 1% failed operations or any corrupted data (`verdict.sla` in the report). `--sla none`
+  disables it; `--max-error-rate`, `--max-throttle-rate`, `--p99-ms` override it. `--fail-on`
+  still adds a gate on diagnosis findings.
+- **Write chunks**: the tuner no longer recommends chunk sizes OpenDAL raises to the service's
+  minimum part size (5 MiB on S3); reports carry `knobs.requested` and `knobs.effective`.
+- **Generated code** reproduces exactly the measured layers and parameters (one `ClientStack`
+  feeds both the measured operator and `--emit-rust` / `--emit-python`).
+- **`r2://` / `minio://`** require `account_id` / an endpoint instead of silently using AWS.
+- **Cost** is projected only for recognised cloud endpoints or an explicit price table;
+  otherwise `cost.applicable = false` and the section is hidden.
+- **Tuner** narrative states the throttling ceiling once, explains the safety margin with
+  numbers, no longer writes `scheme = ""`, and prints its report (trial table included) on stdout.
+- **`oprobe compare`** (formerly `diff`) lists every configuration change; a different workload or target fails the
+  gate (`--allow-workload-change`, `--allow-target-change`), knob changes are an A/B note.
+- **Default transport** keeps OpenDAL's reqwest defaults (no connect timeout, unlimited idle
+  connections per host).
+- **Unknown `[target.options]` keys** are rejected with a "did you mean" suggestion.
+- **`--anonymous`** sets each service's own unsigned-access options; unsupported services error.
+- **Error classes** cover every OpenDAL error kind; timeouts and connect failures are detected
+  from typed errors, not message text.
+- Docs: the TLS cipher suite is only reported with `--microscope`.
+
 ## v2.0.1 — 2026-11-20
 
 Fixes from a full review of 2.0.0. Some numbers change: see *Measurement changes*.

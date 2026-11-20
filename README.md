@@ -1,165 +1,127 @@
 # oprobe
 
-**See which layer makes your object-storage I/O slow or expensive — then fix it.**
+**See every request your object-storage client makes. Know where the time and the money go, and what to change.**
 
-`oprobe` drives realistic workloads through [Apache OpenDAL](https://opendal.apache.org/) against
-S3, GCS, Azure Blob, R2, OSS, COS, B2, MinIO or local storage and traces **every backend request**
-at the transport level: time spent queued, DNS/TCP/proxy/TLS on fresh connections, sending the
-request, waiting for the first byte, transferring the body, and waiting for your code to consume
-it. It then tells you where the time and the money go, finds the best client configuration
-without tripping 429/503 throttling, and turns it all into a CI regression gate.
+oprobe drives realistic workloads through [Apache OpenDAL](https://opendal.apache.org/) against S3, GCS,
+Azure Blob, R2, OSS, COS, B2, MinIO or local storage and traces **every backend request**: time queued,
+DNS/TCP/proxy/TLS on new connections, sending, waiting for the first byte, transferring, and waiting for your
+code. It names the cause of what it finds, backs it with evidence, says what to change and how to verify it.
+Every run is saved as one `.oprobe` file you can reopen, compare, export or hand to an agent.
 
-[中文文档](README.zh-CN.md) · [Desktop app](docs/app.md) · [Metrics & methodology](docs/metrics.md) · [Workloads & profiles](docs/workloads.md) · [Tuning](docs/tuning.md) · [CI gate](docs/ci.md) · [Cost model](docs/cost.md) · [Troubleshooting](docs/troubleshooting.md)
+It is built for people (a terminal, a native app, a single-file HTML report), for CI (a GitHub Action, exit
+codes, Markdown/JUnit) and for agents (JSON everywhere, an event stream, an MCP server).
+
+[中文](README.zh-CN.md) · [Getting started](docs/getting-started.md) · [Concepts](docs/concepts.md) ·
+[CLI reference](docs/cli.md) · [Reading the report](docs/reading-the-report.md) · [Metrics](docs/metrics.md) ·
+[Workloads](docs/workloads.md) · [CI](docs/ci.md) · [Install](docs/install.md) · [Troubleshooting](docs/troubleshooting.md)
+
+## Start in 60 seconds
+
+```bash
+# 1. install (macOS / Linux; Windows and packages: docs/install.md)
+curl -fsSL https://github.com/hxddh/oprobe/releases/latest/download/install.sh | sh
+
+# 2. see what oprobe finds, with no account and no flags
+oprobe demo
+
+# 3. your bucket
+oprobe target add prod s3://my-bucket/oprobe --region eu-west-1
+oprobe run prod
+```
+
+`oprobe demo` starts a local S3 lab that throttles above 24 requests in flight and turns 1 in 40 requests into
+stragglers, measures it with 32 workers for 8 seconds and explains, step by step, what it found. `oprobe run`
+without a target asks what to measure: the demo, the AWS profiles, Google credentials or Azure variables it
+finds on your machine, or a URL — and saves your choice as a named target.
 
 ```text
-$ oprobe run s3://noaa-ghcn-pds --anonymous --existing csv.gz/ --preset mixed -d 8s -c 8
-
-[REVIEW] Server latency (TTFB)-bound: 84% of operation time is spent in server latency (TTFB) (p50 64.6ms / p99 218ms).
-
-  throughput 98.4 ops/s · 77.8 MiB/s   latency p50 64.6ms · p99 218ms · p99.9 1.51s   errors 0 · 0 throttled
-
-WHERE THE TIME GOES  (share of operation wall time)
-  connect   ▊                              2.1%  DNS + TCP + proxy + TLS on fresh connections
-  server    ████████████████████████████  83.5%  time to first byte (server processing + RTT)
-  download  ████▊                         14.2%  receiving response bodies
-
-BACKEND REQUESTS  (mean per request; p99 of total)
-  request     count  warm   queue  connect    send    ttfb  transfer   stall     p99   status
-  GetObject     747   99%  0.01ms    338ms  0.00ms  81.7ms    15.0ms  0.00ms   342ms  206×747
-  HeadObject    116  100%  0.01ms        -  0.00ms  43.0ms    0.02ms  0.00ms  62.2ms  200×116
-
-SLOWEST OPERATION
-  read.full 1.51s at 3.3s  queue 0.00ms · backend 1.51s · client 1.04ms
-    #3  +0.16ms  GetObject  206 h1 conn#31 cold  connect 335ms (proxy 274ms tls 60.6ms) · ttfb 164ms · transfer 242ms  req-id WKPW2FKWB2K5RH9X
-    #4  +0.18ms  GetObject  206 h1 conn#30 cold  connect 352ms (proxy 273ms tls 78.4ms) · ttfb 163ms · transfer 283ms  req-id WKPP3FEWN4DYN946
-    async call stack captured while in flight:
-      read.full [128.000ms]
-        [sub-task 5] opendal::background_task → GetObject
+$ oprobe run prod
+[CRITICAL] Throttling-bound: the service rejected 3.6% of requests with 429/503;
+  ✖ 626 throttled responses (429/503)
+    3.57% of requests throttled; 609 retries, 63.02s total backoff (25% of operat…
+    → The service is rate-limiting this request rate. Lower `concurrency` / `max…
+  ▲ `read.full` p99 is 50.9× its median
+    p50 5.04ms · p99 257ms · max 663ms
+    → See the slowest-operation timelines for the responsible stage. Server stra…
+  2114.0 ops/s · 119.2 MiB/s · p50 5.04ms · p99 257ms · errors 0.10%
+  626 throttled · SLA met
+full report: oprobe runs show 20261120-084637-d873
 ```
-*(real output, trimmed: AWS S3 from a cloud VM through an egress proxy, OpenDAL's default HTTP client)*
 
-## Workbench: window and terminal
+The default output is at most 20 lines that fit 80 columns: the verdict, the top findings (cause · evidence ·
+advice · next command), the key numbers, and where the full report is.
 
-Run `oprobe` with no arguments and its workbench opens — a native window (AppKit on macOS, Win32/Direct2D on
-Windows, GTK 4 on Linux) when there is a display, the same UI in your terminal otherwise (`oprobe top`, also over
-SSH). Run, tune and probe from forms; watch live charts; inspect the slowest operation as a request waterfall.
-[More →](docs/app.md)
+## Look closer
 
-Two layers, no other frameworks: **OpenDAL and its own HTTP client, observed request by request** for everything
-that measures, and **[Native Shell (NSH)](https://github.com/longbridge/nsh)** for everything you look at.
-
-![oprobe workbench: slowest operation waterfall](docs/images/app-slowest-op.png)
-
-## Why oprobe
-
-Black-box benchmarks report "120 MiB/s, p99 280 ms" and leave you guessing. oprobe answers the
-next questions directly from measurements — never from estimates:
-
-| Question | How oprobe answers it |
+| | |
 |---|---|
-| Is it the network, the server, or my client? | Every operation's wall time is split into **queue / connect / upload / server TTFB / download / client** using the real request timeline ([how](docs/metrics.md)). |
-| Why is p99 so much worse than p50? | The slowest operations are kept with **every backend request's stage timings, connection (cold/warm), status, request ID** and an **async call stack** captured while they were stuck. |
-| Are connections reused? Is TLS or the proxy slow? | Per-dial DNS / TCP / proxy CONNECT / TLS histograms, ALPN, TLS version, cipher, reuse ratio, peak in-flight requests. |
-| Am I paying for bytes I don't use? | Logical vs backend vs wire bytes: **read amplification, over-read from range coalescing, requests per operation**. |
-| What will this cost per month? | Measured request mix × provider list prices (S3, GCS, Azure, R2, B2, OSS), waste from failed/throttled requests and over-reads, savings from caching. |
-| What settings should I ship? | `oprobe tune` runs real trials, **detects the 429/503 ceiling**, backs off, refines chunk/gap/parallelism/cache/HTTP version and emits a profile plus Rust/Python OpenDAL code. |
-| Did my change make storage I/O worse? | `oprobe diff` compares JSON reports with noise floors and exits non-zero; Markdown for PR comments, JUnit for CI dashboards. |
+| `oprobe runs show last` | The full report in the terminal (80 columns; `--detail` for everything). |
+| `oprobe runs show last -o html > report.html` | One self-contained HTML file: charts with real axes, a latency heatmap, the slowest operations as request waterfalls, every request in a filterable table. Works offline, light and dark, prints cleanly. |
+| `oprobe runs open last` | The run in the native app. |
+| `oprobe compare base last` | A regression gate between two runs (exit 3 on regression). |
+| `oprobe tune prod` | The best client configuration that does not trip throttling, as a profile and Rust/Python code. |
+| `oprobe runs list` | Every saved run: when, verdict, ops/s, p99, cost. |
+
+![The HTML report of the demo run](docs/images/report-html.png)
+
+## The app
+
+Run `oprobe` with no arguments: a native window (AppKit on macOS, Win32/Direct2D on Windows, GTK 4 on Linux)
+when there is a display, the same workbench in your terminal otherwise (`oprobe top`, also over SSH). Targets,
+run history and baselines on the left; the run inspector with Overview, Requests, Timeline, Connections,
+Findings and Cost; the selected request or operation on the right. [More →](docs/app.md)
+
+![oprobe workbench](docs/images/app-workbench.png)
+
+## What it answers
+
+| Question | How |
+|---|---|
+| Network, server or my client? | Each operation's wall time split into queue / connect / upload / server / download / retry / client from the real request timeline. |
+| Why is p99 so much worse than p50? | The slowest operations keep every request with its stages, connection (cold/warm), status and request ID, plus an async call stack captured while they were stuck. |
+| Is it throttling? | 429/503 counts, Retry-After, retry backoff as its own share of time, and the concurrency where it starts (`oprobe tune`). |
+| Are connections reused? Is TLS slow? | Per-dial DNS/TCP/proxy/TLS times, reuse ratio, peak in-flight requests, per remote address. |
+| Am I paying for bytes I do not use? | Read amplification, over-read from range coalescing, requests per operation. |
+| What will it cost? | The measured request mix × provider price tables, waste from failed requests and over-reads. |
+| Did my change make storage I/O worse? | `oprobe compare` or the GitHub Action: noise floors, configuration differences, Markdown + JUnit. |
+
+## In CI
+
+```yaml
+- uses: hxddh/oprobe@v3
+  with:
+    target: s3://ci-bucket/oprobe
+    preset: small-files
+    baseline: main
+```
+
+The action installs a pinned oprobe, runs, compares against the baseline, uploads the `.oprobe` file and the
+HTML report, keeps one sticky PR comment up to date and fails on regression. [CI guide →](docs/ci.md)
+
+## For agents
+
+Every command prints one JSON document with `-o json` and an event stream with `-o ndjson`; errors carry stable
+codes and exit codes; `oprobe schema` prints the JSON Schemas; `oprobe mcp` is an MCP server (read-only unless
+`--allow-write`). See [docs/agents.md](docs/agents.md) and [llms.txt](llms.txt).
 
 ## Install
 
-| Platform | Command |
+| Platform | |
 |---|---|
-| Any (Rust ≥ 1.97) | `cargo install oprobe --locked` (add `--features gui` for the window on Linux) |
-| macOS / Linux (Homebrew) | each release ships `oprobe.rb` for a tap — see [docs/install.md](docs/install.md) |
-| macOS / Linux (script) | `curl -fsSL https://github.com/hxddh/oprobe/releases/latest/download/install.sh \| sh` |
-| macOS | `oprobe-<version>-macos-universal.pkg` (command line) or `.dmg` (`oprobe.app`) — Apple Silicon + Intel |
-| Debian / Ubuntu | `sudo apt install ./oprobe_<version>-1_amd64.deb` (or `_arm64`) |
-| Fedora / RHEL / SUSE | `sudo dnf install ./oprobe-<version>-1.x86_64.rpm` (or `.aarch64`) |
-| Windows (installer) | `oprobe-<version>-x64.msi` / `-arm64.msi` — adds `oprobe` to `PATH` and a Start menu entry |
-| Windows (Scoop) | `scoop install https://github.com/hxddh/oprobe/releases/latest/download/oprobe.json` |
-| Windows (PowerShell) | `irm https://github.com/hxddh/oprobe/releases/latest/download/install.ps1 \| iex` |
-| Linux desktop | `oprobe-desktop-<version>-x86_64-unknown-linux-gnu.tar.gz` (window; GTK 4.14+) |
+| macOS / Linux | `curl -fsSL https://github.com/hxddh/oprobe/releases/latest/download/install.sh \| sh` |
+| Windows | `winget install hxddh.oprobe`, the `.msi`, or `irm https://github.com/hxddh/oprobe/releases/latest/download/install.ps1 \| iex` |
+| Homebrew | `oprobe.rb` (CLI) and `oprobe.cask.rb` (the app) in every release — [docs/install.md](docs/install.md#homebrew) |
+| Debian / Ubuntu, Fedora / RHEL | `.deb` / `.rpm` from the release page |
+| Rust | `cargo install oprobe --locked` (`--features gui` for the window on Linux) |
 
-Release archives (`oprobe-<version>-<target>.tar.gz` / `.zip`) include man pages, shell completions
-(bash, zsh, fish, PowerShell, elvish) and example profiles. Every asset is listed in `SHA256SUMS`.
-oprobe needs no OpenSSL or system libraries at run time, and the Linux musl builds are fully static.
+The macOS and Windows packages are **not code-signed** (no certificates): the first open needs one
+confirmation — [how](docs/install.md#first-open-of-unsigned-packages). Every asset has a SHA-256 in
+`SHA256SUMS` and a signed SLSA build provenance attestation (`gh attestation verify`). Update with
+`oprobe self-update` (or your package manager).
 
-## Quick start
-
-```bash
-# 1. Zero setup: in-memory backend
-oprobe run memory://
-
-# 2. Reproduce storage problems locally: an S3-compatible lab with latency and throttling
-oprobe lab --latency 20ms --straggler-every 50 --throttle-above 16 &
-AWS_ACCESS_KEY_ID=lab AWS_SECRET_ACCESS_KEY=lab \
-  oprobe run s3://bench/demo --endpoint http://127.0.0.1:9000 --proxy none -c 32
-
-# 3. Your bucket (credentials from the usual AWS/GCP/Azure environment)
-oprobe doctor s3://my-bucket/oprobe            # connectivity, TLS, clock skew, permissions
-oprobe run    s3://my-bucket/oprobe --preset parquet -d 30s --json baseline.json
-oprobe run    s3://my-bucket --existing warehouse/events/   # read-only, your real objects
-oprobe top    s3://my-bucket/oprobe            # live workbench in this terminal
-
-# 4. Tune and ship
-oprobe tune s3://my-bucket/oprobe --preset parquet --p99-ms 250 \
-  --emit-profile tuned.toml --emit-rust src/storage.rs --emit-python storage.py
-
-# 5. Gate regressions in CI
-oprobe run --profile tuned.toml --json candidate.json
-oprobe diff baseline.json candidate.json --junit oprobe.xml --markdown oprobe.md
-```
-
-All test data is written under a unique `oprobe-run-<timestamp>-<id>/` prefix and deleted (and
-verified deleted) when the run ends — also on errors and Ctrl-C, and when you quit the workbench
-mid-run. An interrupted `oprobe run` / `oprobe tune` prints its partial results and exits with code
-130. `oprobe cleanup` sweeps leftovers of killed runs.
-
-## Commands
-
-| Command | Purpose |
-|---|---|
-| `oprobe run [TARGET]` | Run a workload; print the white-box report; save `--json` / `--markdown`. `--fail-on warning\|critical` for CI. |
-| `oprobe top [TARGET]` / `oprobe gui [TARGET]` | The interactive workbench in this terminal / in a window: live charts, time breakdown, per-API tables, slowest-op waterfall, tuner, probe. `oprobe` alone opens it. |
-| `oprobe tune [TARGET]` | Throttle-aware closed-loop tuning with `--objective throughput\|latency\|cost`. |
-| `oprobe diff BASE CAND` | Regression gate (exit code 3 on regression) with JSON / Markdown / JUnit output. |
-| `oprobe doctor [TARGET]` | Step-by-step checks: config, credentials, DNS/proxy/TCP/TLS, HTTP, clock skew, list/write/read/stat/delete. |
-| `oprobe probe URL` | Handshake microscope: DNS, TCP, proxy CONNECT, TLS, cold vs warm TTFB, clock skew. |
-| `oprobe lab` | Local S3-compatible server (HTTP/1.1, HTTP/2, TLS 1.3) with latency, stragglers, bandwidth caps, slow multipart completion and 429/503 throttling. |
-| `oprobe cleanup [TARGET]` | Remove leftovers from interrupted runs (`--dry-run`, `--older-than`, `--datasets`). |
-| `oprobe init` | Print a fully commented profile for a preset. |
-| `oprobe report FILE` | Re-render a saved JSON report as text or Markdown. |
-| `oprobe completions SHELL` | Shell completions. |
-
-## Workloads
-
-Five presets model real access patterns; each can be customised with an operation mix, dataset
-shape, key popularity (`uniform`, `zipf:1.1`, `hotset:0.2/0.8`), closed-loop concurrency or
-open-loop arrival rate (latency measured from the intended start — no coordinated omission).
-
-| Preset | Models |
-|---|---|
-| `parquet` | Lakehouse scans: `stat` + footer read + vectored column-chunk range reads with gap coalescing |
-| `checkpoint` | ML checkpoints: large multipart uploads plus full restores |
-| `small-files` | Many small objects: whole-object GET/PUT and HEAD |
-| `metadata` | Partition discovery: LIST + HEAD storms |
-| `mixed` | General purpose: 70 % reads (range + full), 20 % writes, 10 % stat |
-
-Use `--existing <prefix>` to benchmark objects you already have, read-only. See
-[docs/workloads.md](docs/workloads.md) for the profile format.
-
-## How it works
-
-By default every request goes through **OpenDAL's own HTTP client** (reqwest + rustls/aws-lc-rs,
-configured as OpenDAL builds it), so what you measure and tune is what your application runs.
-oprobe observes it through reqwest's public extension points (a timed resolver, a connector layer,
-a TLS session-store hook, the connection's identity) and follows each logical operation through
-OpenDAL's layers **and** its background tasks. Each request records sequential, non-overlapping
-stages; each operation's wall time is attributed by sweeping its request intervals.
-`--microscope` swaps in oprobe's own instrumented connection pool when you need pool queueing,
-per-dial proxy timing or HTTP/2 stream detail. Nothing is estimated or simulated; methodology,
-the observer effect and caveats are in [docs/metrics.md](docs/metrics.md).
+oprobe sends no telemetry. It talks only to the storage you point it at, and to GitHub when you run
+`oprobe self-update`. [Privacy →](docs/privacy.md)
 
 ## License
 
-Apache-2.0. oprobe is not affiliated with the Apache Software Foundation; it builds on Apache OpenDAL.
+Apache-2.0

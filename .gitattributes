@@ -1,0 +1,7 @@
+# Generated files are compared byte-for-byte by tests (`OPROBE_BLESS=1`): keep LF on every OS.
+docs/** text eol=lf
+schemas/** text eol=lf
+llms.txt text eol=lf
+llms-full.txt text eol=lf
+README*.md text eol=lf
+CHANGELOG.md text eol=lf

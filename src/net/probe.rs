@@ -14,11 +14,13 @@ use serde::{Deserialize, Serialize};
 use super::dial::Dialer;
 use super::proxy::ProxyConfig;
 use super::tls::{TlsClientOptions, build_tls_connector};
+use super::tlsinfo::CertChain;
 use super::transport::HttpVersion;
+use crate::model::TlsRow;
 use crate::trace::Quantiles;
 use crate::trace::recorder::quantiles;
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ProbeSample {
     pub remote: String,
     pub status: u16,
@@ -34,7 +36,7 @@ pub struct ProbeSample {
     pub server_date: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ProbeReport {
     pub endpoint: String,
     pub host: String,
@@ -59,6 +61,12 @@ pub struct ProbeReport {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clock_skew_s: Option<f64>,
     pub samples: Vec<ProbeSample>,
+    /// Every handshake (the first is full; later ones resume when the server allows it).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub handshakes: Vec<TlsRow>,
+    /// The certificate chain the server presented (`ProbeOptions::certs`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cert_chain: Option<CertChain>,
 }
 
 pub struct ProbeOptions {
@@ -69,6 +77,8 @@ pub struct ProbeOptions {
     /// `None` = from environment, `Some(None)` = disabled.
     pub proxy: Option<Option<String>>,
     pub method: Method,
+    /// Parse the server's certificate chain.
+    pub certs: bool,
 }
 
 impl Default for ProbeOptions {
@@ -80,6 +90,7 @@ impl Default for ProbeOptions {
             tls: TlsClientOptions::default(),
             proxy: None,
             method: Method::HEAD,
+            certs: true,
         }
     }
 }
@@ -183,12 +194,13 @@ pub async fn probe_endpoint(endpoint: &str, opts: &ProbeOptions) -> Result<Probe
         Some(Some(raw)) => Some(ProxyConfig::parse(raw, "")?),
     }
     .filter(|p| !p.bypass(&host));
-    let dialer = Dialer::new(
+    let mut dialer = Dialer::new(
         build_tls_connector(&tls)?,
         proxy.clone(),
         opts.timeout,
         None,
     );
+    dialer.certs = opts.certs;
 
     let mk = || hdrhistogram::Histogram::<u64>::new_with_bounds(1, 3_600_000_000, 3).expect("hist");
     let (mut h_dns, mut h_tcp, mut h_proxy, mut h_tls, mut h_cold, mut h_warm) =
@@ -220,6 +232,12 @@ pub async fn probe_endpoint(endpoint: &str, opts: &ProbeOptions) -> Result<Probe
         report.alpn = d.alpn.clone().unwrap_or_else(|| "http/1.1 (plain)".into());
         report.tls_version = d.tls_version.clone();
         report.cipher = d.cipher.clone();
+        if let Some(t) = &d.tls {
+            report.handshakes.push(t.clone());
+        }
+        if report.cert_chain.is_none() {
+            report.cert_chain = d.certs.clone();
+        }
         let t = d.timing;
         let remote = d.remote.to_string();
         let t_req = Instant::now();

@@ -19,6 +19,22 @@ oprobe prices **what it measured**, scaled to the volume you declare. No traffic
    Internet egress applies only to the `egress_fraction` of downloaded bytes (default 0: compute
    in the same region).
 
+## When cost is projected
+
+A price table is applied only when it is known to be the right one:
+
+* the endpoint is a recognised cloud storage endpoint (`*.amazonaws.com`,
+  `storage.googleapis.com`, `*.blob.core.windows.net`, `*.r2.cloudflarestorage.com`,
+  `*.backblazeb2.com`, `*.aliyuncs.com`, or the scheme's implied endpoint for `gcs`, `azblob`,
+  `oss`, `b2`), or
+* the profile chose one explicitly (`[cost].provider` / `--provider`, or `[cost.pricing]`).
+
+Everything else — `memory://`, `fs://`, localhost, private addresses, MinIO, Ceph or any unknown
+endpoint — gets no projection: the report's `cost.applicable` is `false` with a
+`not_applicable_reason`, the terminal report omits the COST section, `oprobe compare` skips the cost
+check, and `oprobe tune --objective cost` refuses to run. The measured per-operation usage
+(`cost.per_op`) is still reported.
+
 ## Price presets (list prices, as of 2025-06)
 
 | Key | Storage $/GB-mo | Write $/M | List $/M | Read $/M | Egress $/GB |

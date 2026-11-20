@@ -6,8 +6,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use opendal::Operator;
-use opendal::layers::{RetryLayer, TailCutLayer, TimeoutLayer};
+use opendal::layers::{RetryLayer, TimeoutLayer};
 
+use super::stack::ClientStack;
 use crate::config::{Knobs, TargetSpec, TransportMode};
 use crate::layers::{InProcessObserveLayer, TraceContextLayer, WhiteboxCacheLayer};
 use crate::net::{FidelityTransport, TlsClientOptions, TracingTransport, TransportConfig};
@@ -24,13 +25,108 @@ pub fn base_operator(target: &TargetSpec) -> Result<Operator> {
     ensure_registry();
     let mut opts = target.resolved_options()?;
     opts.remove("ca_cert_pem");
-    Operator::via_iter(&target.scheme, opts).with_context(|| {
-        format!(
-            "cannot configure the `{}` backend for {}",
+    Operator::via_iter(&target.scheme, opts).map_err(|e| {
+        let hint = if e.kind() == opendal::ErrorKind::ConfigInvalid {
+            format!(
+                " (set missing options with `-o KEY=VALUE`, `?KEY=VALUE` in the URL or under [target.options]; required for `{}`: {})",
+                target.scheme,
+                crate::config::required_options(&target.scheme).join(", ")
+            )
+        } else {
+            String::new()
+        };
+        anyhow::Error::new(e).context(format!(
+            "cannot configure the `{}` backend for {}{hint}",
             target.scheme,
             target.display()
-        )
+        ))
     })
+}
+
+/// Where the region of an S3 target comes from.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RegionSource {
+    /// `region` option (URL, flag, target).
+    Configured,
+    /// `AWS_REGION` / `AWS_DEFAULT_REGION`.
+    Environment,
+    /// Asked the service (`x-amz-bucket-region` of a HeadBucket, or the endpoint's name).
+    Detected,
+    /// Nothing known: OpenDAL's default (`us-east-1`).
+    Default,
+}
+
+/// The region of an S3 target and where it comes from; detects it (HeadBucket, ≤ 3 s) when
+/// none is configured. `None` for other services.
+pub async fn s3_region(target: &TargetSpec) -> Option<(String, RegionSource)> {
+    if target.scheme != "s3" {
+        return None;
+    }
+    if let Some(r) = target.options.get("region") {
+        return Some((r.clone(), RegionSource::Configured));
+    }
+    for k in ["AWS_REGION", "AWS_DEFAULT_REGION"] {
+        if let Ok(r) = std::env::var(k)
+            && !r.is_empty()
+        {
+            return Some((r, RegionSource::Environment));
+        }
+    }
+    match detect_s3_region(target).await {
+        Some(r) => Some((r, RegionSource::Detected)),
+        None => Some(("us-east-1".into(), RegionSource::Default)),
+    }
+}
+
+/// The region the service reports for an S3 bucket (`None`: not determinable).
+pub async fn detect_s3_region(target: &TargetSpec) -> Option<String> {
+    let bucket = target.options.get("bucket")?.clone();
+    let endpoint = target
+        .options
+        .get("endpoint")
+        .and_then(|e| crate::config::expand_env(e).ok());
+    let budget = Duration::from_secs(3);
+    match endpoint.filter(|e| !e.contains("amazonaws.com")) {
+        // Other S3-compatible services: OpenDAL's detection (endpoint name, then HeadBucket).
+        Some(ep) => {
+            tokio::time::timeout(budget, opendal::services::S3::detect_region(&ep, &bucket))
+                .await
+                .ok()
+                .flatten()
+        }
+        // AWS answers HeadBucket on the global endpoint with the bucket's region in a header,
+        // whatever the status (301 / 403 included): a PermanentRedirect avoided up front.
+        None => {
+            let mut b = reqwest::Client::builder().timeout(budget);
+            if proxy_setting(target) == Some(None) {
+                b = b.no_proxy();
+            }
+            let resp = b
+                .build()
+                .ok()?
+                .head(format!("https://{bucket}.s3.amazonaws.com/"))
+                .send()
+                .await
+                .ok()?;
+            resp.headers()
+                .get("x-amz-bucket-region")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned)
+        }
+    }
+}
+
+/// Prepare a target before its operator is built: apply the provider knobs (addressing style,
+/// checksum, SSE) and detect the region of an S3 bucket that has none configured.
+pub async fn prepare_target(target: &mut TargetSpec, knobs: &Knobs) -> Result<()> {
+    for (k, v) in knobs.provider.options(&target.scheme)? {
+        target.options.insert(k.to_owned(), v);
+    }
+    if let Some((region, RegionSource::Detected)) = s3_region(target).await {
+        target.options.insert("region".into(), region);
+    }
+    Ok(())
 }
 
 pub fn tls_options(target: &TargetSpec) -> Result<TlsClientOptions> {
@@ -60,9 +156,11 @@ pub fn transport_config(target: &TargetSpec, knobs: &Knobs) -> Result<TransportC
     Ok(TransportConfig {
         http: knobs.http_version,
         keep_alive: knobs.keep_alive,
-        max_inflight: (knobs.max_inflight_requests > 0).then_some(knobs.max_inflight_requests),
+        max_inflight: ClientStack::from_knobs(knobs).http_concurrent_limit,
         tls: tls_options(target)?,
         proxy: proxy_setting(target),
+        // `OPROBE_TCP_INFO=0` turns the per-request kernel statistics off.
+        tcp_info: std::env::var("OPROBE_TCP_INFO").map_or(true, |v| v != "0"),
         ..Default::default()
     })
 }
@@ -108,46 +206,23 @@ pub fn measured_operator(
         op = op.layer(InProcessObserveLayer::new(recorder.clone()));
     }
     op = op.layer(trace_layer(target, knobs, Some(recorder.clone()))?);
-    op = op.layer(
-        TimeoutLayer::new()
-            .with_timeout(knobs.timeout.get())
-            .with_io_timeout(knobs.timeout.get().min(Duration::from_secs(30))),
-    );
-    if knobs.tail_cut {
-        op = op.layer(
-            TailCutLayer::builder()
-                .percentile(95)
-                .safety_factor(1.5)
-                .min_samples(32)
-                .min_deadline(Duration::from_millis(50))
-                .max_deadline(knobs.timeout.get())
-                .window(Duration::from_secs(60))
-                .build(),
-        );
+    let stack = ClientStack::from_knobs(knobs);
+    op = op.layer(stack.timeout_layer());
+    if let Some(l) = stack.tail_cut_layer() {
+        op = op.layer(l);
     }
-    if knobs.retries > 0 {
-        op = op.layer(
-            RetryLayer::default()
-                .with_jitter()
-                .with_min_delay(Duration::from_millis(50))
-                .with_max_delay(Duration::from_secs(5))
-                .with_max_times(knobs.retries)
-                .with_notify(|ev: opendal::layers::RetryEvent<'_>| {
-                    if let Some(s) = OpScope::current() {
-                        // 429/503 responses mark the scope throttled when they are recorded
-                        // (`OpScope::push_request`); OpenDAL's kind covers the rest. The error
-                        // text is never matched: object names and ports contain digits.
-                        let throttled = ev.err.kind() == opendal::ErrorKind::RateLimited;
-                        s.with(|d| {
-                            d.retries += 1;
-                            d.retry_backoff_us += ev.retry_after.as_micros() as u64;
-                            if throttled {
-                                d.throttled = true;
-                            }
-                        });
-                    }
-                }),
-        );
+    if let Some(l) = stack.retry_layer() {
+        op = op.layer(l.with_notify(|ev: opendal::layers::RetryEvent<'_>| {
+            if let Some(s) = OpScope::current() {
+                // 429/503 responses mark the scope throttled when they are recorded
+                // (`OpScope::push_request`); OpenDAL's kind covers the rest. The error text is
+                // never matched: object names and ports contain digits.
+                s.record_retry(
+                    ev.retry_after,
+                    ev.err.kind() == opendal::ErrorKind::RateLimited,
+                );
+            }
+        }));
     }
     // Async call stacks: operations are registered as await-tree roots by the runner, OpenDAL
     // sub-tasks by `ScopePropagatingExecutor`, and the transports add zero-allocation spans per
@@ -183,19 +258,20 @@ pub async fn check_reachable(base: &Operator, target: &TargetSpec) -> Result<()>
     // Wording differs by OS: "Connection refused (os error 111)" on Linux, "(os error 61)" on
     // macOS, "No connection could be made because the target machine actively refused it.
     // (os error 10061)" on Windows.
-    let unreachable = [
-        "connection refused",
-        "actively refused",
-        "os error 10061",
-        "connect: ",
-        "dns error",
-        "failed to lookup address",
-        "name or service not known",
-        "no addresses to connect to",
-        "nodename nor servname",
-    ]
-    .iter()
-    .any(|n| l.contains(n));
+    let unreachable = super::ops::is_connect_failure(&e)
+        || [
+            "connection refused",
+            "actively refused",
+            "os error 10061",
+            "connect: ",
+            "dns error",
+            "failed to lookup address",
+            "name or service not known",
+            "no addresses to connect to",
+            "nodename nor servname",
+        ]
+        .iter()
+        .any(|n| l.contains(n));
     if unreachable {
         anyhow::bail!(
             "cannot reach {} ({}): {chain}",
@@ -207,6 +283,42 @@ pub async fn check_reachable(base: &Operator, target: &TargetSpec) -> Result<()>
 }
 
 /// Untraced operator for dataset seeding, verification and cleanup.
+/// Untraced operator that fails fast (few retries, short timeouts): the preflight check.
+pub fn preflight_operator(base: &Operator, target: &TargetSpec) -> Result<Operator> {
+    preflight_operator_with(base, target, None)
+}
+
+/// [`preflight_operator`] whose requests are recorded into `recorder` (budgets: a recorder
+/// with a guard accounts every request).
+pub fn preflight_operator_with(
+    base: &Operator,
+    target: &TargetSpec,
+    recorder: Option<Arc<crate::trace::Recorder>>,
+) -> Result<Operator> {
+    let knobs = Knobs::default();
+    let mut op = base.clone();
+    if let Some(r) = &recorder
+        && !target.is_network()
+    {
+        op = op.layer(InProcessObserveLayer::new(r.clone()));
+    }
+    Ok(op
+        .layer(trace_layer(target, &knobs, recorder)?)
+        .layer(
+            TimeoutLayer::new()
+                .with_timeout(Duration::from_secs(30))
+                .with_io_timeout(Duration::from_secs(15)),
+        )
+        // A few quick retries of temporary errors (throttling); persistent ones fail at once.
+        .layer(
+            RetryLayer::default()
+                .with_jitter()
+                .with_min_delay(Duration::from_millis(200))
+                .with_max_times(4)
+                .with_max_delay(Duration::from_secs(2)),
+        ))
+}
+
 pub fn admin_operator(base: &Operator, target: &TargetSpec) -> Result<Operator> {
     let knobs = Knobs::default();
     Ok(base

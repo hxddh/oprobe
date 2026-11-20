@@ -1,17 +1,26 @@
 #!/usr/bin/env bash
-# Generate a Homebrew formula and a Scoop manifest for a release.
+# Generate the package-manager manifests of a release from its assets and SHA256SUMS:
+#   oprobe.rb             Homebrew formula (CLI; macOS universal + Linux musl archives)
+#   oprobe.cask.rb        Homebrew cask (oprobe.app from the .dmg)
+#   oprobe.json           Scoop manifest (Windows zip)
+#   winget-manifests.zip  winget manifests for the MSI (submit to microsoft/winget-pkgs; docs/releasing.md)
+#   latest.json           machine-readable index: version + every asset's URL, size and SHA-256
 # usage: scripts/release-manifests.sh <version> <dist-dir> <owner/repo>
+# Missing assets are skipped with a warning (e.g. a partial rebuild), never guessed.
 set -euo pipefail
-version="$1"; dist="$2"; repo="$3"
+version="$1"; dist="$(cd "$2" && pwd)"; repo="$3"
 url="https://github.com/$repo/releases/download/v$version"
-sha() { grep " $1\$" "$dist/SHA256SUMS" | cut -d' ' -f1; }
+desc="See every request your object-storage client makes: where time and money go, and what to change"
+sha() { grep " \*\?$1\$" "$dist/SHA256SUMS" | cut -d' ' -f1; }
+have() { [ -f "$dist/$1" ] || { echo "warning: $1 missing; skipping what needs it" >&2; return 1; }; }
 
 mac="oprobe-$version-universal-apple-darwin.tar.gz"
 lx64="oprobe-$version-x86_64-unknown-linux-musl.tar.gz"
 larm="oprobe-$version-aarch64-unknown-linux-musl.tar.gz"
+if have "$mac" && have "$lx64" && have "$larm"; then
 cat > "$dist/oprobe.rb" <<RB
 class Oprobe < Formula
-  desc "White-box cloud storage microscope built on Apache OpenDAL"
+  desc "$desc"
   homepage "https://github.com/$repo"
   version "$version"
   license "Apache-2.0"
@@ -41,19 +50,50 @@ class Oprobe < Formula
     pkgshare.install "profiles"
   end
 
+  def caveats
+    "Update with \`brew upgrade oprobe\` (oprobe self-update refuses Homebrew installs)."
+  end
+
   test do
     assert_match version.to_s, shell_output("#{bin}/oprobe --version")
-    system bin/"oprobe", "run", "memory://", "-d", "1s", "--warmup", "0s", "-q", "--format", "json"
+    system bin/"oprobe", "run", "memory://", "-d", "1s", "--warmup", "0s", "-q", "-o", "json"
   end
 end
 RB
+fi
+
+dmg="oprobe-$version-macos-universal.dmg"
+if have "$dmg"; then
+cat > "$dist/oprobe.cask.rb" <<RB
+cask "oprobe" do
+  version "$version"
+  sha256 "$(sha "$dmg")"
+
+  url "$url/$dmg"
+  name "oprobe"
+  desc "$desc"
+  homepage "https://github.com/$repo"
+
+  depends_on macos: ">= :big_sur"
+
+  app "oprobe.app"
+
+  caveats <<~EOS
+    oprobe.app is not signed or notarized (the project has no Apple certificate).
+    On first open, macOS 15+ blocks it: open System Settings > Privacy & Security and
+    click "Open Anyway". Or run: xattr -dr com.apple.quarantine /Applications/oprobe.app
+  EOS
+end
+RB
+fi
 
 wx64="oprobe-$version-x86_64-pc-windows-msvc.zip"
 warm="oprobe-$version-aarch64-pc-windows-msvc.zip"
+if have "$wx64" && have "$warm"; then
 cat > "$dist/oprobe.json" <<JSON
 {
   "version": "$version",
-  "description": "White-box cloud storage microscope built on Apache OpenDAL",
+  "description": "$desc",
   "homepage": "https://github.com/$repo",
   "license": "Apache-2.0",
   "architecture": {
@@ -78,4 +118,103 @@ cat > "$dist/oprobe.json" <<JSON
   }
 }
 JSON
-echo "wrote $dist/oprobe.rb and $dist/oprobe.json"
+fi
+
+# winget: one version manifest, one installer manifest (both MSIs), one default locale.
+mx64="oprobe-$version-x64.msi"
+marm="oprobe-$version-arm64.msi"
+if have "$mx64" && have "$marm"; then
+  id="hxddh.oprobe"
+  w="$(mktemp -d)"
+  d="$w/manifests/h/hxddh/oprobe/$version"
+  mkdir -p "$d"
+  upgrade_code="{6F1B4C2A-9E57-4C31-8D0B-2A7E0C9B5D11}"   # packaging/windows/oprobe.wxs
+  up() { echo "$1" | tr '[:lower:]' '[:upper:]'; }
+  cat > "$d/$id.yaml" <<YAML
+# yaml-language-server: \$schema=https://aka.ms/winget-manifest.version.1.6.0.schema.json
+PackageIdentifier: $id
+PackageVersion: $version
+DefaultLocale: en-US
+ManifestType: version
+ManifestVersion: 1.6.0
+YAML
+  cat > "$d/$id.installer.yaml" <<YAML
+# yaml-language-server: \$schema=https://aka.ms/winget-manifest.installer.1.6.0.schema.json
+PackageIdentifier: $id
+PackageVersion: $version
+InstallerType: wix
+Scope: machine
+UpgradeBehavior: install
+Commands:
+- oprobe
+AppsAndFeaturesEntries:
+- UpgradeCode: '$upgrade_code'
+Installers:
+- Architecture: x64
+  InstallerUrl: $url/$mx64
+  InstallerSha256: $(up "$(sha "$mx64")")
+- Architecture: arm64
+  InstallerUrl: $url/$marm
+  InstallerSha256: $(up "$(sha "$marm")")
+ManifestType: installer
+ManifestVersion: 1.6.0
+YAML
+  cat > "$d/$id.locale.en-US.yaml" <<YAML
+# yaml-language-server: \$schema=https://aka.ms/winget-manifest.defaultLocale.1.6.0.schema.json
+PackageIdentifier: $id
+PackageVersion: $version
+PackageLocale: en-US
+Publisher: oprobe contributors
+PublisherUrl: https://github.com/$repo
+PublisherSupportUrl: https://github.com/$repo/issues
+PackageName: oprobe
+PackageUrl: https://github.com/$repo
+License: Apache-2.0
+LicenseUrl: https://github.com/$repo/blob/main/LICENSE
+ShortDescription: $desc
+Description: oprobe drives realistic workloads through Apache OpenDAL against S3, GCS, Azure Blob and other object stores, traces every backend request, explains the bottleneck and the bill, tunes the client and gates regressions in CI.
+Moniker: oprobe
+Tags:
+- s3
+- object-storage
+- benchmark
+- opendal
+- observability
+ReleaseNotesUrl: https://github.com/$repo/releases/tag/v$version
+ManifestType: defaultLocale
+ManifestVersion: 1.6.0
+YAML
+  (cd "$w" && zip -qr "$dist/winget-manifests.zip" manifests)
+  rm -rf "$w"
+fi
+
+# latest.json: every asset listed in SHA256SUMS with its URL and size.
+python3 - "$version" "$dist" "$url" "$repo" <<'PY'
+import json, os, sys
+version, dist, url, repo = sys.argv[1:5]
+assets = []
+for line in open(os.path.join(dist, "SHA256SUMS")):
+    parts = line.split()
+    if len(parts) != 2:
+        continue
+    digest, name = parts[0], parts[1].lstrip("*")
+    path = os.path.join(dist, name)
+    assets.append({
+        "name": name,
+        "url": f"{url}/{name}",
+        "size_bytes": os.path.getsize(path) if os.path.exists(path) else None,
+        "sha256": digest,
+    })
+doc = {
+    "schema": "oprobe.release/1",
+    "version": version,
+    "tag": f"v{version}",
+    "release_url": f"https://github.com/{repo}/releases/tag/v{version}",
+    "assets": assets,
+}
+with open(os.path.join(dist, "latest.json"), "w") as f:
+    json.dump(doc, f, indent=2)
+    f.write("\n")
+PY
+echo "wrote manifests to $dist:"
+ls "$dist" | grep -E '^(oprobe\.rb|oprobe\.cask\.rb|oprobe\.json|winget-manifests\.zip|latest\.json)$' || true

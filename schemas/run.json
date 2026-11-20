@@ -1,0 +1,2744 @@
+{
+  "$defs": {
+    "Addressing": {
+      "description": "S3 bucket addressing.",
+      "oneOf": [
+        {
+          "const": "auto",
+          "description": "As the target configures it (OpenDAL's default: path style unless\n`enable_virtual_host_style`).",
+          "type": "string"
+        },
+        {
+          "const": "virtual",
+          "description": "`https://bucket.s3.region.amazonaws.com/key`.",
+          "type": "string"
+        },
+        {
+          "const": "path",
+          "description": "`https://s3.region.amazonaws.com/bucket/key`.",
+          "type": "string"
+        }
+      ]
+    },
+    "Api": {
+      "description": "Storage API name, e.g. GetObject (OpenDAL ServiceOperation)",
+      "type": "string"
+    },
+    "ApiCost": {
+      "description": "Request spend of one storage API.",
+      "properties": {
+        "api": {
+          "type": "string"
+        },
+        "billing_class": {
+          "$ref": "#/$defs/BillingClass"
+        },
+        "monthly_usd": {
+          "description": "Monthly spend at the projected operation volume.",
+          "format": "double",
+          "type": "number"
+        },
+        "requests_per_op_count": {
+          "description": "Billed requests of this API per logical operation.",
+          "format": "double",
+          "type": "number"
+        },
+        "share_pct": {
+          "description": "Share of the monthly request spend (0–100).",
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "api",
+        "billing_class",
+        "requests_per_op_count",
+        "monthly_usd",
+        "share_pct"
+      ],
+      "type": "object"
+    },
+    "ApiStats": {
+      "properties": {
+        "api": {
+          "$ref": "#/$defs/Api"
+        },
+        "down_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "errors_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "requests_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "reused_pct": {
+          "format": "double",
+          "type": "number"
+        },
+        "stages": {
+          "$ref": "#/$defs/StageStats"
+        },
+        "status_count": {
+          "additionalProperties": false,
+          "patternProperties": {
+            "^\\d+$": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "type": "object"
+        },
+        "throttled_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "up_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "api",
+        "requests_count",
+        "errors_count",
+        "throttled_count",
+        "status_count",
+        "reused_pct",
+        "up_bytes",
+        "down_bytes",
+        "stages"
+      ],
+      "type": "object"
+    },
+    "BillingClass": {
+      "description": "Billing bucket used by the cost model.",
+      "oneOf": [
+        {
+          "const": "write",
+          "description": "PUT / POST / COPY (S3 \"tier 1\", GCS \"class A\").",
+          "type": "string"
+        },
+        {
+          "const": "list",
+          "description": "LIST requests (class A on S3/GCS, class C on B2).",
+          "type": "string"
+        },
+        {
+          "const": "read",
+          "description": "GET / HEAD (S3 \"tier 2\", GCS \"class B\").",
+          "type": "string"
+        },
+        {
+          "const": "delete",
+          "description": "DELETE / abort, free on most providers.",
+          "type": "string"
+        },
+        {
+          "const": "free",
+          "description": "Not billed (control plane, in-process backends).",
+          "type": "string"
+        }
+      ]
+    },
+    "Bottleneck": {
+      "description": "The layer that dominates operation latency.",
+      "oneOf": [
+        {
+          "enum": [
+            "none"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "client_queue",
+          "description": "Waiting for in-flight request permits / pooled connections.",
+          "type": "string"
+        },
+        {
+          "const": "client",
+          "description": "Client-side processing (CPU, OpenDAL, response consumption).",
+          "type": "string"
+        },
+        {
+          "const": "connect",
+          "description": "DNS / TCP / TLS / proxy handshakes.",
+          "type": "string"
+        },
+        {
+          "const": "upload",
+          "description": "Uploading request bodies.",
+          "type": "string"
+        },
+        {
+          "const": "server_latency",
+          "description": "Server time to first byte.",
+          "type": "string"
+        },
+        {
+          "const": "download",
+          "description": "Downloading response bodies.",
+          "type": "string"
+        },
+        {
+          "const": "throttling",
+          "description": "Rate limiting (429/503).",
+          "type": "string"
+        },
+        {
+          "const": "retry_backoff",
+          "description": "Sleeping between retry attempts (errors that are not throttling).",
+          "type": "string"
+        },
+        {
+          "const": "local_backend",
+          "description": "In-process backend (memory/fs) service time.",
+          "type": "string"
+        }
+      ]
+    },
+    "ByteStats": {
+      "properties": {
+        "backend_down_bytes": {
+          "description": "Response body bytes downloaded from the backend.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "backend_up_bytes": {
+          "description": "Request body bytes uploaded to the backend.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "cache_hit_bytes": {
+          "description": "Logical read bytes answered by the local cache.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "logical_read_bytes": {
+          "description": "Bytes the application asked to read.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "logical_write_bytes": {
+          "description": "Bytes the application wrote.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "overread_ratio": {
+          "description": "backend_down / (logical_read - cache_hit_bytes): over-fetch from range coalescing & chunking.",
+          "format": "double",
+          "type": "number"
+        },
+        "read_amplification_ratio": {
+          "description": "backend_down / logical_read (cache hits lower it, over-fetching raises it).",
+          "format": "double",
+          "type": "number"
+        },
+        "request_amplification_ratio": {
+          "description": "Backend requests per logical operation.",
+          "format": "double",
+          "type": "number"
+        },
+        "wire_rx_bytes": {
+          "description": "Raw socket bytes incl. TLS records and HTTP headers.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "wire_tx_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "write_amplification_ratio": {
+          "description": "backend_up / logical_write (retried uploads raise it).",
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "logical_read_bytes",
+        "logical_write_bytes",
+        "cache_hit_bytes",
+        "backend_down_bytes",
+        "backend_up_bytes",
+        "wire_rx_bytes",
+        "wire_tx_bytes",
+        "read_amplification_ratio",
+        "overread_ratio",
+        "write_amplification_ratio",
+        "request_amplification_ratio"
+      ],
+      "type": "object"
+    },
+    "CacheStats": {
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "hit_ratio": {
+          "format": "double",
+          "type": "number"
+        },
+        "hits_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "lookups_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "mean_lookup_ms": {
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "enabled",
+        "lookups_count",
+        "hits_count",
+        "hit_ratio",
+        "mean_lookup_ms"
+      ],
+      "type": "object"
+    },
+    "CleanupSummary": {
+      "properties": {
+        "deleted_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "duration_ms": {
+          "format": "double",
+          "type": "number"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kept_dataset": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "prefix": {
+          "type": "string"
+        },
+        "remaining_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "verified": {
+          "description": "Re-listed after deletion and found nothing left.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "enabled",
+        "prefix",
+        "deleted_count",
+        "remaining_count",
+        "duration_ms",
+        "verified"
+      ],
+      "type": "object"
+    },
+    "ClientStats": {
+      "properties": {
+        "cpu_cores_count": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "cpu_pct": {
+          "description": "Process CPU usage in percent of ONE core (e.g. 350% = 3.5 cores busy).",
+          "format": "double",
+          "type": "number"
+        },
+        "peak_cpu_pct": {
+          "format": "double",
+          "type": "number"
+        },
+        "rss_mib": {
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "cpu_cores_count",
+        "cpu_pct",
+        "peak_cpu_pct",
+        "rss_mib"
+      ],
+      "type": "object"
+    },
+    "ConnStats": {
+      "properties": {
+        "alpn": {
+          "type": "string"
+        },
+        "cipher": {
+          "type": "string"
+        },
+        "dial_failures_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "dialed_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "dns": {
+          "$ref": "#/$defs/Quantiles"
+        },
+        "http1_requests_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "http2_requests_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "peak_inflight_requests_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "proxy": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "proxy_connect": {
+          "$ref": "#/$defs/Quantiles"
+        },
+        "remote_addrs": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "requests_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "reuse_pct": {
+          "format": "double",
+          "type": "number"
+        },
+        "reused_requests_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "tcp": {
+          "$ref": "#/$defs/Quantiles"
+        },
+        "tls": {
+          "$ref": "#/$defs/Quantiles"
+        },
+        "tls_version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "dialed_count",
+        "dial_failures_count",
+        "requests_count",
+        "reused_requests_count",
+        "reuse_pct",
+        "http1_requests_count",
+        "http2_requests_count",
+        "alpn",
+        "tls_version",
+        "cipher",
+        "remote_addrs",
+        "dns",
+        "tcp",
+        "proxy_connect",
+        "tls",
+        "peak_inflight_requests_count"
+      ],
+      "type": "object"
+    },
+    "CostReport": {
+      "properties": {
+        "applicable": {
+          "description": "A price table applies: the target is a recognised cloud endpoint, or the profile chose a\nprovider / custom pricing. Otherwise `selected` and `comparison` are empty.",
+          "type": "boolean"
+        },
+        "by_api": {
+          "description": "Monthly request spend per storage API under the selected prices (largest first).",
+          "items": {
+            "$ref": "#/$defs/ApiCost"
+          },
+          "type": "array"
+        },
+        "comparison": {
+          "items": {
+            "$ref": "#/$defs/ProviderCost"
+          },
+          "type": "array"
+        },
+        "egress_ratio": {
+          "format": "double",
+          "type": "number"
+        },
+        "monthly_ops_count": {
+          "format": "double",
+          "type": "number"
+        },
+        "not_applicable_reason": {
+          "description": "Why no cost is projected (when not applicable).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "per_op": {
+          "$ref": "#/$defs/PerOpUsage"
+        },
+        "pricing_as_of": {
+          "type": "string"
+        },
+        "provider": {
+          "description": "Pricing key of `selected` (e.g. `aws-s3`, `custom`), when applicable.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "selected": {
+          "$ref": "#/$defs/ProviderCost",
+          "description": "The provider matching the target (or the profile's choice / custom pricing)."
+        },
+        "stored_gib": {
+          "format": "double",
+          "type": "number"
+        },
+        "waste_usd": {
+          "default": 0.0,
+          "description": "Monthly spend that buys nothing: failed/throttled requests and over-read egress.",
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "applicable",
+        "pricing_as_of",
+        "monthly_ops_count",
+        "stored_gib",
+        "egress_ratio",
+        "per_op",
+        "selected",
+        "comparison",
+        "waste_usd"
+      ],
+      "type": "object"
+    },
+    "DatasetInfo": {
+      "properties": {
+        "existing_prefix": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "object_size_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "objects_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "partitions_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "persist": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "objects_count",
+        "object_size_bytes",
+        "partitions_count",
+        "persist"
+      ],
+      "type": "object"
+    },
+    "EffectiveKnobValues": {
+      "description": "The effective configuration: the requested values with the service's limits applied.",
+      "properties": {
+        "cache": {
+          "type": "boolean"
+        },
+        "cache_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "chunk_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "concurrency_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "http_version": {
+          "$ref": "#/$defs/HttpVersion"
+        },
+        "io_concurrency_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "keep_alive": {
+          "type": "boolean"
+        },
+        "max_inflight_requests_count": {
+          "description": "0 = unlimited.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "provider": {
+          "$ref": "#/$defs/ProviderKnobs",
+          "description": "Addressing style, checksum and SSE (S3)."
+        },
+        "range_gap_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "retries_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "service_max_part_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "service_min_part_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "tail_cut": {
+          "type": "boolean"
+        },
+        "timeout_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "transport": {
+          "$ref": "#/$defs/TransportMode"
+        },
+        "write_chunk_bytes": {
+          "description": "Multipart part size OpenDAL writes with (the chunk clamped to the service's limits).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "concurrency_count",
+        "io_concurrency_count",
+        "chunk_bytes",
+        "range_gap_bytes",
+        "max_inflight_requests_count",
+        "http_version",
+        "transport",
+        "keep_alive",
+        "cache",
+        "cache_bytes",
+        "retries_count",
+        "tail_cut",
+        "timeout_ms",
+        "write_chunk_bytes"
+      ],
+      "type": "object"
+    },
+    "EnvInfo": {
+      "description": "Cloud context of the target, when known.",
+      "properties": {
+        "provider": {
+          "description": "Pricing/provider key, e.g. `aws-s3`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "region": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "Evidence": {
+      "description": "The numbers and trace references behind a finding.",
+      "properties": {
+        "op_ids": {
+          "description": "Operations that show the problem.",
+          "items": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        "text": {
+          "description": "The evidence in words, with numbers.",
+          "type": "string"
+        },
+        "values": {
+          "additionalProperties": {
+            "format": "double",
+            "type": "number"
+          },
+          "description": "Named measurements (unit-suffixed keys).",
+          "type": "object"
+        },
+        "windows": {
+          "description": "Time windows (seconds from the window start) where it shows.",
+          "items": {
+            "$ref": "#/$defs/TimeWindow"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "text"
+      ],
+      "type": "object"
+    },
+    "Finding": {
+      "description": "A diagnosis item (design §1).",
+      "properties": {
+        "advice": {
+          "description": "What to change.",
+          "type": "string"
+        },
+        "cause": {
+          "description": "One sentence: what is wrong.",
+          "type": "string"
+        },
+        "code": {
+          "description": "Stable code, e.g. `throttling`, `cold_connections`.",
+          "type": "string"
+        },
+        "evidence": {
+          "$ref": "#/$defs/Evidence"
+        },
+        "severity": {
+          "$ref": "#/$defs/Severity"
+        },
+        "verification": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Verification"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "code",
+        "severity",
+        "cause",
+        "evidence",
+        "advice"
+      ],
+      "type": "object"
+    },
+    "Heatmap": {
+      "description": "Operation latency over time: `counts[t][l]` operations started in time bucket `t` whose\nlatency falls in latency bucket `l` (from the trace rows; sampled when the run is).",
+      "properties": {
+        "bucket_width_s": {
+          "format": "double",
+          "type": "number"
+        },
+        "counts": {
+          "items": {
+            "items": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "type": "array"
+        },
+        "latency_buckets_ms": {
+          "description": "Lower bound of each latency bucket (log scale; the last bucket is open-ended).",
+          "items": {
+            "format": "double",
+            "type": "number"
+          },
+          "type": "array"
+        },
+        "t_buckets_s": {
+          "description": "Start of each time bucket, seconds from the window start.",
+          "items": {
+            "format": "double",
+            "type": "number"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "t_buckets_s",
+        "bucket_width_s",
+        "latency_buckets_ms",
+        "counts"
+      ],
+      "type": "object"
+    },
+    "HostInfo": {
+      "properties": {
+        "arch": {
+          "type": "string"
+        },
+        "cpus_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "hostname_hash": {
+          "description": "FNV-1a hash of the host name (identifies the machine without naming it).",
+          "type": "string"
+        },
+        "os": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "os",
+        "arch",
+        "cpus_count",
+        "hostname_hash"
+      ],
+      "type": "object"
+    },
+    "HttpVersion": {
+      "description": "HTTP protocol preference.",
+      "oneOf": [
+        {
+          "const": "auto",
+          "description": "Negotiate via ALPN (h2 preferred for https), HTTP/1.1 for plain http.",
+          "type": "string"
+        },
+        {
+          "const": "h1",
+          "description": "Force HTTP/1.1.",
+          "type": "string"
+        },
+        {
+          "const": "h2",
+          "description": "Require HTTP/2 (ALPN for https, prior knowledge for plain http).",
+          "type": "string"
+        }
+      ]
+    },
+    "IntegrityStats": {
+      "properties": {
+        "corrupted_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "verified_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "verified_count",
+        "corrupted_count"
+      ],
+      "type": "object"
+    },
+    "KnobValues": {
+      "description": "Client knob values in machine units.",
+      "properties": {
+        "cache": {
+          "type": "boolean"
+        },
+        "cache_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "chunk_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "concurrency_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "http_version": {
+          "$ref": "#/$defs/HttpVersion"
+        },
+        "io_concurrency_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "keep_alive": {
+          "type": "boolean"
+        },
+        "max_inflight_requests_count": {
+          "description": "0 = unlimited.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "provider": {
+          "$ref": "#/$defs/ProviderKnobs",
+          "description": "Addressing style, checksum and SSE (S3)."
+        },
+        "range_gap_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "retries_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "tail_cut": {
+          "type": "boolean"
+        },
+        "timeout_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "transport": {
+          "$ref": "#/$defs/TransportMode"
+        }
+      },
+      "required": [
+        "concurrency_count",
+        "io_concurrency_count",
+        "chunk_bytes",
+        "range_gap_bytes",
+        "max_inflight_requests_count",
+        "http_version",
+        "transport",
+        "keep_alive",
+        "cache",
+        "cache_bytes",
+        "retries_count",
+        "tail_cut",
+        "timeout_ms"
+      ],
+      "type": "object"
+    },
+    "KnobsInfo": {
+      "description": "Knobs as requested and as OpenDAL applied them.",
+      "properties": {
+        "effective": {
+          "$ref": "#/$defs/EffectiveKnobValues"
+        },
+        "requested": {
+          "$ref": "#/$defs/KnobValues"
+        }
+      },
+      "required": [
+        "requested",
+        "effective"
+      ],
+      "type": "object"
+    },
+    "MixEntry": {
+      "description": "One weighted operation of the mix.",
+      "properties": {
+        "batch_count": {
+          "description": "`delete`: keys per batch.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "column_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "columns_count": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "footer_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "limit_count": {
+          "description": "`list_paged`: keys per page.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "metadata_entries_count": {
+          "description": "`metadata_write`: user-metadata pairs per object.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "op": {
+          "description": "`read`, `parquet_scan`, `write`, `multipart_write`, `stat`, `list`.",
+          "type": "string"
+        },
+        "recursive": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "size_bytes": {
+          "description": "Read range / write size (absent: whole object).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "suffix": {
+          "description": "`parquet_scan`: footer read with a suffix range, no HEAD.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "weight": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "weight",
+        "op"
+      ],
+      "type": "object"
+    },
+    "Network": {
+      "description": "Network view: TLS, TCP and the remote addresses requests went to.",
+      "properties": {
+        "remotes": {
+          "items": {
+            "$ref": "#/$defs/RemoteStats"
+          },
+          "type": "array"
+        },
+        "tcp": {
+          "$ref": "#/$defs/TcpInfo"
+        },
+        "tls": {
+          "$ref": "#/$defs/TlsInfo"
+        }
+      },
+      "required": [
+        "tls",
+        "tcp",
+        "remotes"
+      ],
+      "type": "object"
+    },
+    "OpBreakdown": {
+      "description": "Where the wall-clock time of a logical operation went (mean ms per op).\n`queue + cache + backend + retry + client == latency mean` (exact for each op; see docs/metrics.md).",
+      "properties": {
+        "backend_ms": {
+          "description": "At least one backend request on the network (connect, send, TTFB, transfer).",
+          "format": "double",
+          "type": "number"
+        },
+        "cache_ms": {
+          "description": "Local cache lookups.",
+          "format": "double",
+          "type": "number"
+        },
+        "client_ms": {
+          "description": "Everything else: OpenDAL processing, signing, buffering, CRC, response consumption.",
+          "format": "double",
+          "type": "number"
+        },
+        "queue_ms": {
+          "description": "Waiting for in-flight request permits / connections, with nothing on the wire.",
+          "format": "double",
+          "type": "number"
+        },
+        "retry_ms": {
+          "default": 0.0,
+          "description": "Retry backoff: the retry layer sleeping between a failed attempt and the next one\n(with no request of the operation on the network or queued meanwhile).",
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "queue_ms",
+        "cache_ms",
+        "backend_ms",
+        "retry_ms",
+        "client_ms"
+      ],
+      "type": "object"
+    },
+    "OpenLoopStats": {
+      "properties": {
+        "achieved_per_s": {
+          "format": "double",
+          "type": "number"
+        },
+        "max_schedule_lag_ms": {
+          "format": "double",
+          "type": "number"
+        },
+        "missed_count": {
+          "description": "Arrivals that never started: still queued behind `concurrency` busy slots when the\nwindow ended, or dropped after falling more than `knobs.timeout` behind schedule.\nArrivals that waited for a slot and then ran are not missed: their queueing delay is\npart of their latency (measured from the intended start).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "target_per_s": {
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "target_per_s",
+        "achieved_per_s",
+        "missed_count",
+        "max_schedule_lag_ms"
+      ],
+      "type": "object"
+    },
+    "PerOpUsage": {
+      "description": "Measured usage per logical operation.",
+      "properties": {
+        "cache_saved_bytes": {
+          "format": "double",
+          "type": "number"
+        },
+        "cache_saved_reads_count": {
+          "description": "GETs avoided thanks to cache hits.",
+          "format": "double",
+          "type": "number"
+        },
+        "delete_requests_count": {
+          "format": "double",
+          "type": "number"
+        },
+        "download_bytes": {
+          "format": "double",
+          "type": "number"
+        },
+        "failed_requests_count": {
+          "description": "Requests that failed or were throttled (billed on most providers, add no value).",
+          "format": "double",
+          "type": "number"
+        },
+        "list_requests_count": {
+          "format": "double",
+          "type": "number"
+        },
+        "overread_bytes": {
+          "description": "Downloaded bytes the application never asked for (range coalescing / chunk over-fetch).",
+          "format": "double",
+          "type": "number"
+        },
+        "read_requests_count": {
+          "format": "double",
+          "type": "number"
+        },
+        "upload_bytes": {
+          "format": "double",
+          "type": "number"
+        },
+        "write_requests_count": {
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "write_requests_count",
+        "list_requests_count",
+        "read_requests_count",
+        "delete_requests_count",
+        "failed_requests_count",
+        "download_bytes",
+        "upload_bytes",
+        "overread_bytes",
+        "cache_saved_reads_count",
+        "cache_saved_bytes"
+      ],
+      "type": "object"
+    },
+    "ProviderCost": {
+      "properties": {
+        "cache_savings_usd": {
+          "description": "Monthly spend avoided by the local cache.",
+          "format": "double",
+          "type": "number"
+        },
+        "egress_usd": {
+          "format": "double",
+          "type": "number"
+        },
+        "failed_requests_usd": {
+          "description": "Monthly spend on failed/throttled requests.",
+          "format": "double",
+          "type": "number"
+        },
+        "key": {
+          "type": "string"
+        },
+        "overread_usd": {
+          "description": "Monthly egress spend on over-read bytes.",
+          "format": "double",
+          "type": "number"
+        },
+        "per_million_ops_usd": {
+          "description": "Requests + egress per million logical operations.",
+          "format": "double",
+          "type": "number"
+        },
+        "provider": {
+          "type": "string"
+        },
+        "requests_usd": {
+          "format": "double",
+          "type": "number"
+        },
+        "storage_usd": {
+          "format": "double",
+          "type": "number"
+        },
+        "total_usd": {
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "key",
+        "provider",
+        "requests_usd",
+        "egress_usd",
+        "storage_usd",
+        "total_usd",
+        "per_million_ops_usd",
+        "failed_requests_usd",
+        "overread_usd",
+        "cache_savings_usd"
+      ],
+      "type": "object"
+    },
+    "ProviderKnobs": {
+      "additionalProperties": false,
+      "description": "Provider request options measured for their overhead (S3 service options).",
+      "properties": {
+        "addressing": {
+          "$ref": "#/$defs/Addressing",
+          "default": "auto"
+        },
+        "checksum": {
+          "description": "Checksum the client computes and the server verifies on writes (`crc32c`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sse": {
+          "description": "Server-side encryption: `AES256` or `aws:kms`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "addressing"
+      ],
+      "type": "object"
+    },
+    "Quantiles": {
+      "description": "Latency distribution in milliseconds.",
+      "properties": {
+        "max_ms": {
+          "format": "double",
+          "type": "number"
+        },
+        "mean_ms": {
+          "format": "double",
+          "type": "number"
+        },
+        "p50_ms": {
+          "format": "double",
+          "type": "number"
+        },
+        "p90_ms": {
+          "format": "double",
+          "type": "number"
+        },
+        "p999_ms": {
+          "format": "double",
+          "type": "number"
+        },
+        "p99_ms": {
+          "format": "double",
+          "type": "number"
+        },
+        "samples_count": {
+          "description": "Samples in the distribution.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "samples_count",
+        "mean_ms",
+        "p50_ms",
+        "p90_ms",
+        "p99_ms",
+        "p999_ms",
+        "max_ms"
+      ],
+      "type": "object"
+    },
+    "RemoteStats": {
+      "properties": {
+        "down_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "errors_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "p50_ms": {
+          "format": "double",
+          "type": "number"
+        },
+        "p99_ms": {
+          "format": "double",
+          "type": "number"
+        },
+        "remote": {
+          "description": "`ip:port`.",
+          "type": "string"
+        },
+        "requests_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "remote",
+        "requests_count",
+        "errors_count",
+        "down_bytes",
+        "p50_ms",
+        "p99_ms"
+      ],
+      "type": "object"
+    },
+    "Report": {
+      "description": "The full report of one run.",
+      "properties": {
+        "apis": {
+          "items": {
+            "$ref": "#/$defs/ApiStats"
+          },
+          "type": "array"
+        },
+        "bytes": {
+          "$ref": "#/$defs/ByteStats"
+        },
+        "cache": {
+          "$ref": "#/$defs/CacheStats"
+        },
+        "cleanup": {
+          "$ref": "#/$defs/CleanupSummary"
+        },
+        "client": {
+          "$ref": "#/$defs/ClientStats"
+        },
+        "connections": {
+          "$ref": "#/$defs/ConnStats"
+        },
+        "cost": {
+          "$ref": "#/$defs/CostReport"
+        },
+        "findings": {
+          "items": {
+            "$ref": "#/$defs/Finding"
+          },
+          "type": "array"
+        },
+        "heatmap": {
+          "$ref": "#/$defs/Heatmap"
+        },
+        "integrity": {
+          "$ref": "#/$defs/IntegrityStats"
+        },
+        "knobs": {
+          "$ref": "#/$defs/KnobsInfo"
+        },
+        "network": {
+          "$ref": "#/$defs/Network"
+        },
+        "open_loop": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/OpenLoopStats"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "resilience": {
+          "$ref": "#/$defs/ResilienceStats"
+        },
+        "run": {
+          "$ref": "#/$defs/RunInfo"
+        },
+        "schema": {
+          "description": "Always [`REPORT_SCHEMA`].",
+          "type": "string"
+        },
+        "sla": {
+          "$ref": "#/$defs/SlaInfo"
+        },
+        "slowest": {
+          "description": "Op ids of the slowest operations (slowest first); their rows are in the run file.",
+          "items": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        "stages": {
+          "$ref": "#/$defs/Stages"
+        },
+        "summary": {
+          "$ref": "#/$defs/Summary"
+        },
+        "target": {
+          "$ref": "#/$defs/TargetInfo"
+        },
+        "timeline": {
+          "items": {
+            "$ref": "#/$defs/TimelinePoint"
+          },
+          "type": "array"
+        },
+        "tune": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TuneReport"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "verbs": {
+          "items": {
+            "$ref": "#/$defs/VerbStats"
+          },
+          "type": "array"
+        },
+        "verdict": {
+          "$ref": "#/$defs/Verdict"
+        },
+        "warnings": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "workload": {
+          "$ref": "#/$defs/WorkloadInfo"
+        }
+      },
+      "required": [
+        "schema",
+        "run",
+        "target",
+        "workload",
+        "knobs",
+        "sla",
+        "verdict",
+        "summary",
+        "stages",
+        "apis",
+        "verbs",
+        "connections",
+        "network",
+        "resilience",
+        "bytes",
+        "cache",
+        "integrity",
+        "client",
+        "timeline",
+        "heatmap",
+        "findings",
+        "cost",
+        "slowest",
+        "cleanup",
+        "warnings"
+      ],
+      "type": "object"
+    },
+    "RequestStagesP99": {
+      "properties": {
+        "body_ms": {
+          "format": "double",
+          "type": "number"
+        },
+        "connect_ms": {
+          "description": "Requests that dialed only.",
+          "format": "double",
+          "type": "number"
+        },
+        "queue_ms": {
+          "format": "double",
+          "type": "number"
+        },
+        "send_ms": {
+          "format": "double",
+          "type": "number"
+        },
+        "stall_ms": {
+          "format": "double",
+          "type": "number"
+        },
+        "total_ms": {
+          "format": "double",
+          "type": "number"
+        },
+        "ttfb_ms": {
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "queue_ms",
+        "connect_ms",
+        "send_ms",
+        "ttfb_ms",
+        "body_ms",
+        "stall_ms",
+        "total_ms"
+      ],
+      "type": "object"
+    },
+    "ResilienceStats": {
+      "properties": {
+        "client_errors_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "error_classes_count": {
+          "additionalProperties": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "object"
+        },
+        "failed_ops_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_retry_after_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "network_errors_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "retries_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "retry_backoff_ms": {
+          "format": "double",
+          "type": "number"
+        },
+        "server_errors_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "status_429_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "status_503_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "throttled_responses_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "retries_count",
+        "retry_backoff_ms",
+        "throttled_responses_count",
+        "status_429_count",
+        "status_503_count",
+        "max_retry_after_ms",
+        "server_errors_count",
+        "client_errors_count",
+        "network_errors_count",
+        "failed_ops_count",
+        "error_classes_count"
+      ],
+      "type": "object"
+    },
+    "RunInfo": {
+      "description": "Identity and context of the run.",
+      "properties": {
+        "ended_at": {
+          "description": "RFC 3339.",
+          "type": "string"
+        },
+        "env": {
+          "$ref": "#/$defs/EnvInfo"
+        },
+        "host": {
+          "$ref": "#/$defs/HostInfo"
+        },
+        "id": {
+          "description": "Run id (`YYYYMMDD-HHMMSS-xxxx`).",
+          "type": "string"
+        },
+        "interrupted": {
+          "description": "Stopped early (Ctrl-C, Stop, budget): the window is shorter than configured.",
+          "type": "boolean"
+        },
+        "label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "oprobe_version": {
+          "type": "string"
+        },
+        "sampled": {
+          "description": "Trace rows were sampled (more requests than `trace.max_requests`); aggregates are exact.",
+          "type": "boolean"
+        },
+        "started_at": {
+          "description": "RFC 3339.",
+          "type": "string"
+        },
+        "trace": {
+          "$ref": "#/$defs/TraceInfo"
+        },
+        "window_s": {
+          "description": "Length of the measurement window.",
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "id",
+        "started_at",
+        "ended_at",
+        "window_s",
+        "interrupted",
+        "sampled",
+        "trace",
+        "oprobe_version",
+        "host",
+        "env"
+      ],
+      "type": "object"
+    },
+    "Severity": {
+      "enum": [
+        "info",
+        "warning",
+        "critical"
+      ],
+      "type": "string"
+    },
+    "SlaInfo": {
+      "description": "Service level objectives the run was checked against.",
+      "properties": {
+        "enforced": {
+          "description": "A breach fails the command (exit 3).",
+          "type": "boolean"
+        },
+        "max_error_ratio": {
+          "format": "double",
+          "type": "number"
+        },
+        "max_throttle_ratio": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "p99_ms": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "enforced",
+        "max_error_ratio"
+      ],
+      "type": "object"
+    },
+    "SlaVerdict": {
+      "description": "Outcome of checking a run against its [`Sla`].",
+      "properties": {
+        "breaches": {
+          "description": "One line per breached objective (empty when passed).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "enforced": {
+          "description": "Whether a breach fails the command (exit code 3).",
+          "type": "boolean"
+        },
+        "passed": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "enforced",
+        "passed"
+      ],
+      "type": "object"
+    },
+    "StageShares": {
+      "properties": {
+        "cache_pct": {
+          "format": "double",
+          "type": "number"
+        },
+        "client_pct": {
+          "format": "double",
+          "type": "number"
+        },
+        "connect_pct": {
+          "format": "double",
+          "type": "number"
+        },
+        "download_pct": {
+          "format": "double",
+          "type": "number"
+        },
+        "queue_pct": {
+          "format": "double",
+          "type": "number"
+        },
+        "retry_pct": {
+          "format": "double",
+          "type": "number"
+        },
+        "server_pct": {
+          "format": "double",
+          "type": "number"
+        },
+        "upload_pct": {
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "queue_pct",
+        "cache_pct",
+        "connect_pct",
+        "upload_pct",
+        "server_pct",
+        "download_pct",
+        "retry_pct",
+        "client_pct"
+      ],
+      "type": "object"
+    },
+    "StageStats": {
+      "description": "Request stage distribution for one API (ms).",
+      "properties": {
+        "body": {
+          "$ref": "#/$defs/Quantiles"
+        },
+        "connect": {
+          "$ref": "#/$defs/Quantiles",
+          "description": "DNS+TCP+proxy+TLS; only requests that dialed are counted."
+        },
+        "queue": {
+          "$ref": "#/$defs/Quantiles"
+        },
+        "send": {
+          "$ref": "#/$defs/Quantiles"
+        },
+        "stall": {
+          "$ref": "#/$defs/Quantiles"
+        },
+        "total": {
+          "$ref": "#/$defs/Quantiles"
+        },
+        "ttfb": {
+          "$ref": "#/$defs/Quantiles"
+        }
+      },
+      "required": [
+        "queue",
+        "connect",
+        "send",
+        "ttfb",
+        "body",
+        "stall",
+        "total"
+      ],
+      "type": "object"
+    },
+    "Stages": {
+      "description": "Where operation time went.",
+      "properties": {
+        "bottleneck": {
+          "$ref": "#/$defs/Bottleneck"
+        },
+        "per_verb": {
+          "description": "Mean breakdown per verb.",
+          "items": {
+            "$ref": "#/$defs/VerbBreakdown"
+          },
+          "type": "array"
+        },
+        "request_p99": {
+          "$ref": "#/$defs/RequestStagesP99",
+          "description": "p99 of each request stage across every request (from the trace rows)."
+        },
+        "shares": {
+          "$ref": "#/$defs/StageShares",
+          "description": "Share of total operation time per layer (sums to ~100)."
+        }
+      },
+      "required": [
+        "bottleneck",
+        "shares",
+        "per_verb",
+        "request_p99"
+      ],
+      "type": "object"
+    },
+    "Summary": {
+      "properties": {
+        "error_ratio": {
+          "format": "double",
+          "type": "number"
+        },
+        "failed_ops_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "inflight_ops_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "latency": {
+          "$ref": "#/$defs/Quantiles"
+        },
+        "mib_per_s": {
+          "format": "double",
+          "type": "number"
+        },
+        "ops_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "ops_per_s": {
+          "format": "double",
+          "type": "number"
+        },
+        "read_mib_per_s": {
+          "format": "double",
+          "type": "number"
+        },
+        "write_mib_per_s": {
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "ops_count",
+        "ops_per_s",
+        "failed_ops_count",
+        "error_ratio",
+        "mib_per_s",
+        "read_mib_per_s",
+        "write_mib_per_s",
+        "latency",
+        "inflight_ops_count"
+      ],
+      "type": "object"
+    },
+    "TargetInfo": {
+      "description": "The target, with secrets redacted.",
+      "properties": {
+        "display": {
+          "type": "string"
+        },
+        "endpoint": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "description": "Configured target name, when the run used one.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "options": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Backend options with secrets redacted.",
+          "type": "object"
+        },
+        "proxy": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "scheme": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "display",
+        "scheme",
+        "options"
+      ],
+      "type": "object"
+    },
+    "TcpInfo": {
+      "properties": {
+        "connect": {
+          "$ref": "#/$defs/Quantiles"
+        },
+        "dialed_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "dns": {
+          "$ref": "#/$defs/Quantiles"
+        },
+        "kernel": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TcpKernelStats"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Kernel TCP statistics at request end (Linux `TCP_INFO`, macOS `TCP_CONNECTION_INFO`)."
+        },
+        "proxy_connect": {
+          "$ref": "#/$defs/Quantiles"
+        }
+      },
+      "required": [
+        "dns",
+        "connect",
+        "proxy_connect",
+        "dialed_count"
+      ],
+      "type": "object"
+    },
+    "TcpKernelStats": {
+      "description": "Kernel TCP statistics (`TCP_INFO`) over the requests of the window.",
+      "properties": {
+        "connections_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "cwnd_p50_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "delivery_rate_p50_bits_per_s": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "retrans_count": {
+          "description": "Segments retransmitted, summed over connections (their last sample).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "retransmitting_connections_count": {
+          "description": "Connections that retransmitted at least once.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "rtt_p50_us": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "rtt_p99_us": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "rttvar_p50_us": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "rwnd_limited_ratio": {
+          "description": "Share of the busy (sending) time limited by the receive window / send buffer.",
+          "format": "double",
+          "type": "number"
+        },
+        "samples_count": {
+          "description": "Requests that carried kernel statistics.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "sndbuf_limited_ratio": {
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "samples_count",
+        "connections_count",
+        "rtt_p50_us",
+        "rtt_p99_us",
+        "rttvar_p50_us",
+        "retrans_count",
+        "retransmitting_connections_count",
+        "cwnd_p50_count",
+        "delivery_rate_p50_bits_per_s",
+        "rwnd_limited_ratio",
+        "sndbuf_limited_ratio"
+      ],
+      "type": "object"
+    },
+    "TimeWindow": {
+      "properties": {
+        "from_s": {
+          "format": "double",
+          "type": "number"
+        },
+        "to_s": {
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "from_s",
+        "to_s"
+      ],
+      "type": "object"
+    },
+    "TimelinePoint": {
+      "properties": {
+        "errors_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "mib_per_s": {
+          "format": "double",
+          "type": "number"
+        },
+        "ops_per_s": {
+          "format": "double",
+          "type": "number"
+        },
+        "p50_ms": {
+          "format": "double",
+          "type": "number"
+        },
+        "p99_ms": {
+          "format": "double",
+          "type": "number"
+        },
+        "t_s": {
+          "description": "Start of this one-second interval, seconds from the measurement window start (the same\nconvention as `heatmap.t_buckets_s` and `oprobe analyze --by second`).",
+          "format": "double",
+          "type": "number"
+        },
+        "throttled_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "t_s",
+        "ops_per_s",
+        "mib_per_s",
+        "p50_ms",
+        "p99_ms",
+        "errors_count",
+        "throttled_count"
+      ],
+      "type": "object"
+    },
+    "TlsHandshakeStats": {
+      "description": "TLS handshakes of the window (one per dialed connection).",
+      "properties": {
+        "ciphers_count": {
+          "additionalProperties": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "object"
+        },
+        "full_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "groups_count": {
+          "additionalProperties": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "object"
+        },
+        "handshakes_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "hrr_count": {
+          "description": "Handshakes that needed a HelloRetryRequest (an extra round trip: the client's first key\nshare was not one the server accepts).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "resumed_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "resumption_ratio": {
+          "description": "resumed / handshakes.",
+          "format": "double",
+          "type": "number"
+        },
+        "versions_count": {
+          "additionalProperties": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "object"
+        }
+      },
+      "required": [
+        "handshakes_count",
+        "full_count",
+        "resumed_count",
+        "hrr_count",
+        "resumption_ratio",
+        "versions_count",
+        "ciphers_count",
+        "groups_count"
+      ],
+      "type": "object"
+    },
+    "TlsInfo": {
+      "properties": {
+        "alpn": {
+          "type": "string"
+        },
+        "cipher": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "handshake": {
+          "$ref": "#/$defs/Quantiles"
+        },
+        "handshakes": {
+          "$ref": "#/$defs/TlsHandshakeStats",
+          "default": {
+            "ciphers_count": {},
+            "full_count": 0,
+            "groups_count": {},
+            "handshakes_count": 0,
+            "hrr_count": 0,
+            "resumed_count": 0,
+            "resumption_ratio": 0.0,
+            "versions_count": {}
+          },
+          "description": "Full / resumed / HelloRetryRequest handshakes, versions, ciphers and groups."
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "handshake",
+        "handshakes"
+      ],
+      "type": "object"
+    },
+    "TraceInfo": {
+      "description": "What the run file's trace rows cover.",
+      "properties": {
+        "max_requests_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "ops_kept_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "ops_seen_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "requests_kept_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "requests_seen_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "sample_ratio": {
+          "description": "Kept / seen request rows (1 when nothing was sampled away).",
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "max_requests_count",
+        "ops_seen_count",
+        "ops_kept_count",
+        "requests_seen_count",
+        "requests_kept_count",
+        "sample_ratio"
+      ],
+      "type": "object"
+    },
+    "TransportMode": {
+      "oneOf": [
+        {
+          "const": "opendal",
+          "description": "OpenDAL's default HTTP client (reqwest), observed through its extension points.",
+          "type": "string"
+        },
+        {
+          "const": "microscope",
+          "description": "oprobe's own instrumented connection pool.",
+          "type": "string"
+        }
+      ]
+    },
+    "TrialRow": {
+      "description": "One tuner trial.",
+      "properties": {
+        "cost_per_million_ops_usd": {
+          "format": "double",
+          "type": "number"
+        },
+        "error_ratio": {
+          "format": "double",
+          "type": "number"
+        },
+        "feasible": {
+          "type": "boolean"
+        },
+        "id": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "knobs": {
+          "$ref": "#/$defs/KnobValues"
+        },
+        "mib_per_s": {
+          "format": "double",
+          "type": "number"
+        },
+        "note": {
+          "type": "string"
+        },
+        "ops_per_s": {
+          "description": "Successful operations per second.",
+          "format": "double",
+          "type": "number"
+        },
+        "p50_ms": {
+          "format": "double",
+          "type": "number"
+        },
+        "p99_ms": {
+          "format": "double",
+          "type": "number"
+        },
+        "stage": {
+          "type": "string"
+        },
+        "throttle_ratio": {
+          "format": "double",
+          "type": "number"
+        },
+        "throttled_responses_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id",
+        "stage",
+        "knobs",
+        "ops_per_s",
+        "mib_per_s",
+        "p50_ms",
+        "p99_ms",
+        "error_ratio",
+        "throttle_ratio",
+        "throttled_responses_count",
+        "cost_per_million_ops_usd",
+        "feasible",
+        "note"
+      ],
+      "type": "object"
+    },
+    "TuneReport": {
+      "description": "The tuner's search, embedded in the winner's report.",
+      "properties": {
+        "baseline_trial": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "improvement_pct": {
+          "description": "Objective change of the winner vs the baseline trial.",
+          "format": "double",
+          "type": "number"
+        },
+        "no_feasible_trial": {
+          "description": "No trial met the SLA: the winner is the least-bad configuration.",
+          "type": "boolean"
+        },
+        "notes": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "objective": {
+          "type": "string"
+        },
+        "throttle_ceiling_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "trials": {
+          "items": {
+            "$ref": "#/$defs/TrialRow"
+          },
+          "type": "array"
+        },
+        "winner_trial": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "objective",
+        "trials",
+        "baseline_trial",
+        "winner_trial",
+        "improvement_pct",
+        "no_feasible_trial",
+        "notes"
+      ],
+      "type": "object"
+    },
+    "VerbBreakdown": {
+      "properties": {
+        "breakdown": {
+          "$ref": "#/$defs/OpBreakdown"
+        },
+        "verb": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "verb",
+        "breakdown"
+      ],
+      "type": "object"
+    },
+    "VerbStats": {
+      "properties": {
+        "breakdown": {
+          "$ref": "#/$defs/OpBreakdown"
+        },
+        "errors_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "latency": {
+          "$ref": "#/$defs/Quantiles"
+        },
+        "mean_bytes": {
+          "format": "double",
+          "type": "number"
+        },
+        "mean_requests_count": {
+          "format": "double",
+          "type": "number"
+        },
+        "mib_per_s": {
+          "format": "double",
+          "type": "number"
+        },
+        "ops_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "ops_per_s": {
+          "format": "double",
+          "type": "number"
+        },
+        "retries_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "throttled_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "verb": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "verb",
+        "ops_count",
+        "errors_count",
+        "throttled_count",
+        "ops_per_s",
+        "mib_per_s",
+        "latency",
+        "breakdown",
+        "mean_requests_count",
+        "mean_bytes",
+        "retries_count"
+      ],
+      "type": "object"
+    },
+    "Verdict": {
+      "properties": {
+        "bottleneck": {
+          "$ref": "#/$defs/Bottleneck"
+        },
+        "exit_code": {
+          "description": "What `oprobe run` exits with for this result (0, 3 SLA breach, 130 interrupted; 4/5 when\na safety rail stopped it).",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "headline": {
+          "description": "One sentence: where the time went.",
+          "type": "string"
+        },
+        "level": {
+          "$ref": "#/$defs/VerdictLevel"
+        },
+        "sla": {
+          "$ref": "#/$defs/SlaVerdict"
+        }
+      },
+      "required": [
+        "level",
+        "headline",
+        "exit_code",
+        "bottleneck",
+        "sla"
+      ],
+      "type": "object"
+    },
+    "VerdictLevel": {
+      "description": "Overall judgement.",
+      "oneOf": [
+        {
+          "enum": [
+            "ok"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "review",
+          "description": "Worth a look (informational findings, warnings, partial run).",
+          "type": "string"
+        },
+        {
+          "const": "attention",
+          "description": "Warning findings.",
+          "type": "string"
+        },
+        {
+          "const": "critical",
+          "description": "Critical findings or a breached SLA.",
+          "type": "string"
+        }
+      ]
+    },
+    "Verification": {
+      "description": "A concrete way to test a finding's advice.",
+      "properties": {
+        "command": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "description": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "description"
+      ],
+      "type": "object"
+    },
+    "WorkloadInfo": {
+      "description": "The workload, resolved (preset defaults applied).",
+      "properties": {
+        "access": {
+          "description": "Key popularity: `uniform`, `zipf:1.1`, `hotset:0.2/0.8`.",
+          "type": "string"
+        },
+        "cleanup": {
+          "type": "boolean"
+        },
+        "dataset": {
+          "$ref": "#/$defs/DatasetInfo"
+        },
+        "duration_s": {
+          "format": "double",
+          "type": "number"
+        },
+        "max_ops_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "mix": {
+          "items": {
+            "$ref": "#/$defs/MixEntry"
+          },
+          "type": "array"
+        },
+        "preset": {
+          "type": "string"
+        },
+        "rate_per_s": {
+          "description": "Open-loop arrival rate.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "seed": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "verify": {
+          "type": "boolean"
+        },
+        "warmup_s": {
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "preset",
+        "duration_s",
+        "warmup_s",
+        "access",
+        "dataset",
+        "mix",
+        "verify",
+        "cleanup",
+        "seed"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://github.com/hxddh/oprobe/schemas/3/run.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Result of `oprobe run`",
+  "properties": {
+    "path": {
+      "description": "The saved run file (absent with `--no-save`).",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "report": {
+      "$ref": "#/$defs/Report"
+    },
+    "run_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "run_id",
+    "report"
+  ],
+  "title": "oprobe run",
+  "type": "object",
+  "x-rust-type": "RunOutput"
+}

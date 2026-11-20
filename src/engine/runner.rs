@@ -17,10 +17,11 @@ use super::dataset::{Dataset, PayloadPool, Picker};
 use super::operator::{admin_operator, base_operator, measured_operator};
 use super::ops::{OpCtx, error_class, execute, verb};
 use crate::config::{Knobs, OpKind, OpSpec, Profile};
-use crate::trace::{OpCompletion, OpScope, OpenLoopStats, Phase, Recorder, Snapshot};
+use crate::guard::Guard;
+use crate::trace::{OpCompletion, OpScope, OpenLoopStats, Phase, Recorder, Snapshot, TraceRows};
 
 /// Cooperative cancellation shared with Ctrl-C handlers and the TUI.
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Cancel(Arc<AtomicBool>);
 
 impl Cancel {
@@ -139,6 +140,30 @@ pub enum Progress {
 
 pub type ProgressFn = Arc<dyn Fn(Progress) + Send + Sync>;
 
+/// How a [`Session`] is opened (safety rails and trace settings).
+#[derive(Clone, Debug)]
+pub struct SessionOptions {
+    /// Object prefix the run writes under (default: `oprobe-run-<new run id>/`).
+    pub run_prefix: Option<String>,
+    /// Budgets enforced live (requests, bytes, cost, duration).
+    pub guard: Option<Arc<Guard>>,
+    /// Trace rows kept per measurement window (`trace.max_requests`).
+    pub trace_max_requests: usize,
+    /// List (and, when the run writes, write + delete a tiny object) before anything else.
+    pub preflight: bool,
+}
+
+impl Default for SessionOptions {
+    fn default() -> Self {
+        Self {
+            run_prefix: None,
+            guard: None,
+            trace_max_requests: crate::trace::DEFAULT_MAX_REQUESTS,
+            preflight: true,
+        }
+    }
+}
+
 pub struct Session {
     pub profile: Profile,
     pub base: Operator,
@@ -150,20 +175,44 @@ pub struct Session {
     pool: Arc<PayloadPool>,
     written: Arc<Mutex<Vec<(String, u32)>>>,
     pub cancel: Cancel,
+    /// The service's full capability (limits OpenDAL applies, e.g. the minimum part size).
+    pub capability: opendal::Capability,
     trial: AtomicU64,
+    guard: Option<Arc<Guard>>,
+    trace_max_requests: usize,
+    last_trace: Mutex<Option<TraceRows>>,
 }
 
 impl Session {
     /// Connect to the target and prepare the dataset.
-    pub async fn open(mut profile: Profile, cancel: Cancel, progress: ProgressFn) -> Result<Self> {
+    pub async fn open(profile: Profile, cancel: Cancel, progress: ProgressFn) -> Result<Self> {
+        Self::open_with(profile, cancel, progress, SessionOptions::default()).await
+    }
+
+    /// [`Session::open`] with safety rails: preflight before any write, budgets armed on
+    /// `cancel`, a chosen run prefix.
+    pub async fn open_with(
+        mut profile: Profile,
+        cancel: Cancel,
+        progress: ProgressFn,
+        opts: SessionOptions,
+    ) -> Result<Self> {
         profile.target = profile.target.normalized()?;
         profile.validate()?;
+        super::operator::prepare_target(&mut profile.target, &profile.knobs).await?;
         let base = base_operator(&profile.target)?;
         let admin = admin_operator(&base, &profile.target)?;
-        let run_prefix = new_run_prefix();
+        let run_prefix = opts.run_prefix.clone().unwrap_or_else(new_run_prefix);
+        if let Some(g) = &opts.guard {
+            g.arm(cancel.clone());
+        }
         let spec = profile.workload.effective_dataset();
         let mut mix = profile.workload.effective_mix();
-        let mut warnings = Vec::new();
+        let mut warnings = super::workloads::adapt_mix(
+            &mut mix,
+            &base.info().capability(),
+            &profile.target.scheme,
+        );
         if spec.existing_prefix.is_some() && mix.iter().any(|m| m.op.is_write()) {
             mix.retain(|m| !m.op.is_write());
             warnings.push("existing_prefix datasets are read-only: write operations were removed from the mix".into());
@@ -180,7 +229,14 @@ impl Session {
         if profile.target.is_network() {
             super::operator::check_reachable(&base, &profile.target).await?;
         }
-        let needs_objects = mix.iter().any(|m| !m.op.is_write() && m.weight > 0);
+        let needs_objects = mix.iter().any(|m| m.op.needs_dataset() && m.weight > 0);
+        if opts.preflight {
+            let writes = spec.existing_prefix.is_none()
+                && (needs_objects || mix.iter().any(|m| m.weight > 0 && m.op.is_write()));
+            // Fail fast: few retries, short timeouts (the admin operator retries for minutes).
+            let quick = super::operator::preflight_operator(&base, &profile.target)?;
+            crate::guard::preflight(&quick, &run_prefix, writes).await?;
+        }
         let p2 = progress.clone();
         let dataset = Dataset::prepare(
             &admin,
@@ -209,6 +265,7 @@ impl Session {
             })
             .max()
             .unwrap_or(0);
+        let capability = base.info().capability();
         Ok(Self {
             profile,
             base,
@@ -220,8 +277,25 @@ impl Session {
             pool: Arc::new(PayloadPool::new(max_write)),
             written: Arc::new(Mutex::new(Vec::new())),
             cancel,
+            capability,
             trial: AtomicU64::new(0),
+            guard: opts.guard,
+            trace_max_requests: opts.trace_max_requests,
+            last_trace: Mutex::new(None),
         })
+    }
+
+    /// Trace rows of the last [`Session::run`] (taken: a second call returns `None`).
+    pub fn take_trace(&self) -> Option<TraceRows> {
+        self.last_trace
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+    }
+
+    /// The budget guard, when the session has one.
+    pub fn guard(&self) -> Option<&Arc<Guard>> {
+        self.guard.as_ref()
     }
 
     /// Run warmup + one measurement window with `knobs` and return the final snapshot.
@@ -233,6 +307,10 @@ impl Session {
     ) -> Result<Snapshot> {
         let trial = self.trial.fetch_add(1, Ordering::Relaxed);
         let recorder = Recorder::new();
+        recorder.set_trace_limit(self.trace_max_requests);
+        if let Some(g) = &self.guard {
+            recorder.set_guard(g.clone());
+        }
         let tree = opts
             .trace_slow_ops
             .then(|| await_tree::Registry::new(await_tree::Config::default()));
@@ -256,6 +334,7 @@ impl Session {
             recorder: recorder.clone(),
             scratch_prefix: format!("{}writes/t{trial:03}-", self.run_prefix),
             written: self.written.clone(),
+            state: super::workloads::WorkloadState::new(self.capability, &self.mix),
         });
 
         // Background sampler: slow-op call stacks, client CPU/RSS, live snapshots.
@@ -264,6 +343,7 @@ impl Session {
             let stop = stop.clone();
             let rec = recorder.clone();
             let progress = progress.clone();
+            let guard = self.guard.clone();
             tokio::spawn(async move {
                 let mut cpu = super::procstat::CpuMeter::new();
                 let mut tick = tokio::time::interval(Duration::from_millis(20));
@@ -271,6 +351,9 @@ impl Session {
                 while !stop.load(Ordering::Acquire) {
                     tick.tick().await;
                     n += 1;
+                    if let Some(g) = &guard {
+                        g.tick();
+                    }
                     rec.sample_trees(rec.current_p90_us().max(2_000));
                     if n.is_multiple_of(50)
                         && let Some((pct, rss)) = cpu.sample()
@@ -325,6 +408,8 @@ impl Session {
         let mut snap = recorder.snapshot();
         snap.phase = Phase::Done;
         snap.interrupted = self.cancel.is_cancelled();
+        snap.effective_knobs = super::stack::effective_knobs(&self.capability, knobs);
+        *self.last_trace.lock().unwrap_or_else(|e| e.into_inner()) = Some(recorder.take_trace());
         if let Some(cb) = &progress {
             cb(Progress::Snapshot(Box::new(snap.clone())));
         }
@@ -628,7 +713,8 @@ async fn run_one(
     let measured = scope.measured;
     let name = verb(kind);
     rec.op_started_at(scope.id, intended);
-    let fut = scope.run(execute(ctx, kind, rng, slot));
+    let mut key = String::new();
+    let fut = scope.run(execute(ctx, kind, rng, slot, &mut key));
     let res = match tree {
         Some(reg) => {
             scope.set_tree_registry(reg.clone());
@@ -654,6 +740,7 @@ async fn run_one(
             logical_read: lr,
             logical_write: lw,
             error,
+            key,
             data: scope.take(),
         },
     );
