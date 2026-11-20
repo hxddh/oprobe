@@ -180,6 +180,9 @@ pub enum Command {
         /// Output directory (one page per command)
         #[arg(long)]
         out_dir: Option<PathBuf>,
+        /// Print the CLI reference as Markdown instead (docs/cli.md)
+        #[arg(long, conflicts_with = "out_dir")]
+        markdown: bool,
     },
     /// Print a commented profile template
     #[command(hide = true)]

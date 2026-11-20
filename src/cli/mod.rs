@@ -8,6 +8,7 @@ mod doctor;
 mod live;
 mod misc;
 mod onboard;
+pub mod reference;
 mod run;
 mod runs;
 mod self_update;
@@ -351,7 +352,11 @@ async fn dispatch(cmd: Command, ctx: &Ctx) -> Result<u8> {
             clap_complete::generate(shell, &mut Cli::command(), "oprobe", &mut std::io::stdout());
             Ok(exit::OK)
         }
-        Command::Man { out_dir } => {
+        Command::Man { markdown: true, .. } => {
+            print!("{}", reference::markdown());
+            Ok(exit::OK)
+        }
+        Command::Man { out_dir, .. } => {
             let cmd = Cli::command();
             match out_dir {
                 Some(dir) => {
