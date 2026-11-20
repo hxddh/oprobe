@@ -239,22 +239,7 @@ pub fn build_run(i: ReportInput<'_>) -> Run {
             crate::util::ByteSize(effective.write_chunk_bytes)
         ));
     }
-    let findings: Vec<Finding> = diagnosis.findings.iter().map(Finding::from).collect();
-    let worst = findings
-        .iter()
-        .map(|f| f.severity)
-        .max()
-        .unwrap_or_default();
     let breached = !sla_verdict.passed;
-    let level = if (breached && sla_verdict.enforced) || worst == Severity::Critical {
-        VerdictLevel::Critical
-    } else if worst == Severity::Warning || breached {
-        VerdictLevel::Attention
-    } else if interrupted || !warnings.is_empty() {
-        VerdictLevel::Review
-    } else {
-        VerdictLevel::Ok
-    };
     let exit_code = if interrupted {
         exit::INTERRUPTED
     } else if breached && sla_verdict.enforced {
@@ -327,7 +312,7 @@ pub fn build_run(i: ReportInput<'_>) -> Run {
         },
         sla: (&profile.sla).into(),
         verdict: Verdict {
-            level,
+            level: VerdictLevel::Ok,
             headline: diagnosis.headline.clone(),
             exit_code,
             bottleneck: diagnosis.bottleneck,
@@ -347,18 +332,32 @@ pub fn build_run(i: ReportInput<'_>) -> Run {
         open_loop: snapshot.open_loop.clone(),
         timeline: snapshot.timeline.clone(),
         heatmap,
-        findings,
+        findings: Vec::new(),
         cost,
         slowest: snapshot.slow_ops.iter().map(|s| s.op_id).collect(),
         cleanup,
         warnings,
         tune: None,
     };
-    Run {
+    let mut run = Run {
         report,
         ops: trace.ops,
         reqs: trace.reqs,
-    }
+    };
+    // Findings read the finished report and the trace rows (stream B3: analysis::findings).
+    run.report.findings = crate::analysis::findings::derive(&run, &diagnosis.findings);
+    let worst = run.report.worst_severity();
+    let r = &mut run.report;
+    r.verdict.level = if (breached && r.verdict.sla.enforced) || worst == Severity::Critical {
+        VerdictLevel::Critical
+    } else if worst == Severity::Warning || breached {
+        VerdictLevel::Attention
+    } else if interrupted || !r.warnings.is_empty() {
+        VerdictLevel::Review
+    } else {
+        VerdictLevel::Ok
+    };
+    run
 }
 
 /// Build only the report (the trace rows are dropped).
