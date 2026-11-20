@@ -220,7 +220,10 @@ jobs:
           [ -f "$bin.exe" ] && bin="$bin.exe"
           "$bin" --version
           "$bin" run memory:// -d 1s --warmup 200ms -q -o json --no-save > /dev/null
-          "$bin" run memory:// -d 1s --warmup 200ms -q -o html --no-save | grep -q '<svg class="viz"'
+          # Write to a file first: `grep -q` stops reading at the first match, which would end
+          # the writer with SIGPIPE (exit 141) under `pipefail`.
+          "$bin" run memory:// -d 1s --warmup 200ms -q -o html --no-save > smoke.html
+          grep -q '<svg class="viz"' smoke.html
 
       - uses: actions/upload-artifact@v4
         with:
