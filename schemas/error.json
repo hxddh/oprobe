@@ -1,0 +1,88 @@
+{
+  "$defs": {
+    "ErrorBody": {
+      "description": "Machine form of an error (`{\"type\":\"error\",\"error\":{…}}` in json/ndjson output).",
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/ErrorCode"
+        },
+        "docs": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "hint": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "message": {
+          "type": "string"
+        },
+        "retryable": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "code",
+        "message",
+        "retryable"
+      ],
+      "type": "object"
+    },
+    "ErrorCode": {
+      "description": "Stable error code. Serialized as its dotted string (e.g. `net.timeout`).",
+      "enum": [
+        "usage.invalid_argument",
+        "usage.unknown_target",
+        "usage.unknown_run",
+        "config.invalid",
+        "config.unknown_option",
+        "auth.no_credentials",
+        "auth.denied",
+        "net.unreachable",
+        "net.dns",
+        "net.tls",
+        "net.timeout",
+        "storage.not_found",
+        "storage.throttled",
+        "storage.unsupported",
+        "safety.budget_exceeded",
+        "safety.read_only",
+        "safety.refused",
+        "run.sla_failed",
+        "run.regression",
+        "run.interrupted",
+        "internal"
+      ],
+      "type": "string"
+    },
+    "ErrorTag": {
+      "description": "Always `error`.",
+      "enum": [
+        "error"
+      ],
+      "type": "string"
+    }
+  },
+  "$id": "https://github.com/hxddh/oprobe/schemas/3/error.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "The error document of json/ndjson modes",
+  "properties": {
+    "error": {
+      "$ref": "#/$defs/ErrorBody"
+    },
+    "type": {
+      "$ref": "#/$defs/ErrorTag"
+    }
+  },
+  "required": [
+    "type",
+    "error"
+  ],
+  "title": "oprobe error",
+  "type": "object",
+  "x-rust-type": "ErrorEnvelope"
+}

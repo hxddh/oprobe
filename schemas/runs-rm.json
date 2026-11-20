@@ -1,0 +1,23 @@
+{
+  "$id": "https://github.com/hxddh/oprobe/schemas/3/runs-rm.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Result of `oprobe runs rm` / `runs gc`",
+  "properties": {
+    "dry_run": {
+      "type": "boolean"
+    },
+    "removed": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "removed",
+    "dry_run"
+  ],
+  "title": "oprobe runs-rm",
+  "type": "object",
+  "x-rust-type": "RemovedRuns"
+}

@@ -1,0 +1,60 @@
+{
+  "$defs": {
+    "Direction": {
+      "description": "Whether a schema describes something oprobe writes (outputs) or reads (inputs).",
+      "oneOf": [
+        {
+          "const": "output",
+          "description": "oprobe writes it (command results, reports, events, run files).",
+          "type": "string"
+        },
+        {
+          "const": "input",
+          "description": "oprobe reads it (the config file, MCP tool inputs).",
+          "type": "string"
+        }
+      ]
+    },
+    "SchemaInfo": {
+      "description": "One entry of `oprobe schema` without a name.",
+      "properties": {
+        "$id": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        },
+        "direction": {
+          "$ref": "#/$defs/Direction"
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "$id",
+        "direction",
+        "description"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://github.com/hxddh/oprobe/schemas/3/schema-list.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Result of `oprobe schema` without a name",
+  "properties": {
+    "schemas": {
+      "items": {
+        "$ref": "#/$defs/SchemaInfo"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "schemas"
+  ],
+  "title": "oprobe schema-list",
+  "type": "object",
+  "x-rust-type": "SchemaList"
+}

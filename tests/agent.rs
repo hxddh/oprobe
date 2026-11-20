@@ -1,0 +1,325 @@
+//! Agent contract: a JSON-only workflow through the CLI (no text parsing) whose every output
+//! validates against the published JSON Schemas, and the checked-in `schemas/` (plus the
+//! finding-code section of docs/agents.md) staying in sync with the code.
+//!
+//! Regenerate the checked-in files with `OPROBE_BLESS=1 cargo test --test agent`.
+
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+
+use serde_json::Value;
+
+fn root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+fn bless() -> bool {
+    std::env::var_os("OPROBE_BLESS").is_some_and(|v| !v.is_empty() && v != "0")
+}
+
+/// Compare (or, when blessing, write) a generated file.
+fn check_file(path: &Path, want: &str, stale: &mut Vec<String>) {
+    let have = std::fs::read_to_string(path).unwrap_or_default();
+    if have.replace("\r\n", "\n") == want {
+        return;
+    }
+    if bless() {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, want).unwrap();
+    } else {
+        stale.push(path.display().to_string());
+    }
+}
+
+#[test]
+fn checked_in_schemas_match_the_code() {
+    let dir = root().join("schemas");
+    let mut stale = Vec::new();
+    let names = oprobe::mcp::schemas::names();
+    for name in &names {
+        let v = oprobe::mcp::schemas::schema(name).unwrap();
+        let text = serde_json::to_string_pretty(&v).unwrap() + "\n";
+        check_file(&dir.join(format!("{name}.json")), &text, &mut stale);
+    }
+    // No schema files for names that no longer exist.
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        for e in rd {
+            let p = e.unwrap().path();
+            let stem = p.file_stem().unwrap().to_string_lossy().into_owned();
+            if p.extension().is_some_and(|x| x == "json") && !names.contains(&stem.as_str()) {
+                if bless() {
+                    std::fs::remove_file(&p).unwrap();
+                } else {
+                    stale.push(format!("{} (no such schema)", p.display()));
+                }
+            }
+        }
+    }
+    assert!(
+        stale.is_empty(),
+        "schemas/ is out of date: {stale:?}\nregenerate with `OPROBE_BLESS=1 cargo test --test agent`"
+    );
+}
+
+#[test]
+fn docs_list_every_finding_code() {
+    let path = root().join("docs/agents.md");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let begin = text
+        .find("<!-- BEGIN finding-codes")
+        .expect("docs/agents.md has a BEGIN finding-codes marker");
+    let begin_end = begin + text[begin..].find("-->").unwrap() + 3;
+    let end = text.find("<!-- END finding-codes -->").expect("END marker");
+    let mut block = String::from("\n\n");
+    for d in oprobe::mcp::catalog::all() {
+        block += &format!(
+            "<a id=\"finding-{}\"></a>\n### `{}` — {}\n\n{} *({}, usually {})*\n\n",
+            d.code,
+            d.code,
+            d.title,
+            d.meaning,
+            d.category,
+            d.typical_severity.label()
+        );
+        for (h, items) in [
+            ("Causes", d.causes),
+            ("Verify", d.verify),
+            ("Knobs", d.knobs),
+        ] {
+            if !items.is_empty() {
+                block += &format!("- **{h}:** {}\n", items.join("; "));
+            }
+        }
+        block.push('\n');
+    }
+    let want = format!("{}{}{}", &text[..begin_end], block, &text[end..]);
+    let mut stale = Vec::new();
+    check_file(&path, &want, &mut stale);
+    assert!(
+        stale.is_empty(),
+        "docs/agents.md finding codes are out of date; regenerate with `OPROBE_BLESS=1 cargo test --test agent`"
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// JSON workflow
+// ---------------------------------------------------------------------------------------
+
+struct Env {
+    dir: tempfile::TempDir,
+}
+
+impl Env {
+    fn new() -> Self {
+        Self {
+            dir: tempfile::tempdir().unwrap(),
+        }
+    }
+
+    fn run(&self, args: &[&str]) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_oprobe"))
+            .env("OPROBE_DATA_DIR", self.dir.path().join("data"))
+            .env("OPROBE_CONFIG", self.dir.path().join("config.toml"))
+            .env_remove("OPROBE_OUTPUT")
+            .args(["--color", "never"])
+            .args(args)
+            .output()
+            .unwrap()
+    }
+
+    /// Run with `-o json`, check the exit code, parse stdout and validate it against `schema`.
+    fn json(&self, args: &[&str], schema: &str, exit: i32) -> Value {
+        let mut a = args.to_vec();
+        a.extend(["-o", "json"]);
+        let o = self.run(&a);
+        assert_eq!(
+            o.status.code(),
+            Some(exit),
+            "{args:?}: stderr {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+        let v: Value = serde_json::from_slice(&o.stdout).unwrap_or_else(|e| {
+            panic!(
+                "{args:?}: stdout is not one JSON document ({e}): {}",
+                String::from_utf8_lossy(&o.stdout)
+            )
+        });
+        validate(schema, &v);
+        v
+    }
+}
+
+fn validate(schema: &str, v: &Value) {
+    let s = oprobe::mcp::schemas::schema(schema).unwrap_or_else(|| panic!("no schema {schema}"));
+    let validator = jsonschema::validator_for(&s)
+        .unwrap_or_else(|e| panic!("schema {schema} does not compile: {e}"));
+    let errors: Vec<String> = validator
+        .iter_errors(v)
+        .take(10)
+        .map(|e| format!("{} at {}", e, e.instance_path()))
+        .collect();
+    assert!(
+        errors.is_empty(),
+        "output does not match schema `{schema}`:\n{}\n{}",
+        errors.join("\n"),
+        serde_json::to_string(v)
+            .unwrap()
+            .chars()
+            .take(2000)
+            .collect::<String>()
+    );
+}
+
+const SMALL: &[&str] = &[
+    "run",
+    "memory://",
+    "-d",
+    "400ms",
+    "--warmup",
+    "0s",
+    "--preset",
+    "small-files",
+    "--objects",
+    "8",
+    "--object-size",
+    "16KiB",
+    "-c",
+    "4",
+];
+
+#[test]
+fn json_only_agent_workflow_validates_against_the_schemas() {
+    let env = Env::new();
+
+    // 1. Self-description.
+    let caps = env.json(&["capabilities"], "capabilities", 0);
+    assert_eq!(caps["schema"], "oprobe.capabilities/1");
+    let tools: Vec<&str> = caps["mcp"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(tools[0], "doctor");
+    assert!(tools.contains(&"start_run") && tools.contains(&"compare_runs"));
+    assert!(caps["error_codes"].as_array().unwrap().iter().any(|e| {
+        e["code"] == "safety.budget_exceeded" && e["exit_code"] == 4 && e["retryable"] == false
+    }));
+    let list = env.json(&["schema"], "schema-list", 0);
+    assert!(list["schemas"].as_array().unwrap().len() >= 20);
+    let report_schema = env.run(&["schema", "report", "-o", "json"]);
+    let rs: Value = serde_json::from_slice(&report_schema.stdout).unwrap();
+    assert_eq!(
+        rs["$id"],
+        "https://github.com/hxddh/oprobe/schemas/3/report.json"
+    );
+
+    // 2. Preflight and plan.
+    let doc = env.json(&["doctor", "memory://"], "doctor", 0);
+    assert_eq!(doc["ready"], true);
+    let mut plan_args = SMALL.to_vec();
+    plan_args.push("--dry-run");
+    let plan = env.json(&plan_args, "plan", 0);
+    assert!(plan["plan"]["estimated_requests_count"].as_u64().unwrap() > 0);
+
+    // 3. Two runs.
+    let mut a = SMALL.to_vec();
+    a.extend(["--label", "base"]);
+    let r1 = env.json(&a, "run", 0);
+    let id1 = r1["run_id"].as_str().unwrap().to_owned();
+    let r2 = env.json(SMALL, "run", 0);
+    let id2 = r2["run_id"].as_str().unwrap().to_owned();
+    assert_ne!(id1, id2);
+
+    // 4. History, explanation, comparison.
+    let runs = env.json(&["runs", "list"], "runs-list", 0);
+    assert_eq!(runs["total_count"], 2);
+    assert_eq!(runs["runs"][0]["id"], id2.as_str());
+    env.json(&["runs", "show", "base"], "runs-show", 0);
+    let ex = env.json(&["explain", "last"], "explain", 0);
+    assert_eq!(ex["kind"], "run");
+    assert_eq!(ex["run_id"], id2.as_str());
+    assert!(!ex["narrative"].as_array().unwrap().is_empty());
+    assert!(
+        ex["slowest"]["attribution"]["selected_count"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert!(
+        ex["next_commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c.as_str().unwrap().contains(&id2))
+    );
+    let code = env.json(&["explain", "throttling"], "explain", 0);
+    assert_eq!(code["kind"], "finding_code");
+    assert_eq!(code["code"], "throttling");
+    let all = env.json(&["explain", "--list"], "explain", 0);
+    assert!(all["codes"].as_array().unwrap().len() >= 15);
+    let cmp = env.json(
+        &[
+            "compare",
+            "base",
+            "last",
+            "--max-p99-increase",
+            "10000",
+            "--max-p50-increase",
+            "10000",
+            "--max-throughput-drop",
+            "100",
+            "--max-cost-increase",
+            "10000",
+        ],
+        "compare",
+        0,
+    );
+    assert!(cmp["passed"].is_boolean());
+
+    // 5. Classified errors are JSON too.
+    let err = env.json(&["explain", "no-such-run-or-code"], "error", 2);
+    assert_eq!(err["type"], "error");
+    assert_eq!(err["error"]["code"], "usage.unknown_run");
+    let err = env.json(&["schema", "nope"], "error", 2);
+    assert_eq!(err["error"]["code"], "usage.invalid_argument");
+    let mut ro = SMALL.to_vec();
+    ro.push("--read-only");
+    let err = env.json(&ro, "error", 5);
+    assert_eq!(err["error"]["code"], "safety.read_only");
+}
+
+#[test]
+fn ndjson_events_validate_line_by_line() {
+    let env = Env::new();
+    let mut a = SMALL.to_vec();
+    a.extend(["-o", "ndjson"]);
+    let o = env.run(&a);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let text = String::from_utf8(o.stdout).unwrap();
+    let lines: Vec<Value> = text
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(lines[0]["type"], "version");
+    assert_eq!(lines.last().unwrap()["type"], "result");
+    for l in &lines {
+        validate("events", l);
+    }
+    // The run file's lines validate as run-file lines.
+    let run_id = lines.last().unwrap()["run_id"].as_str().unwrap();
+    let path = env.dir.path().join(format!("data/runs/{run_id}.oprobe"));
+    let raw = zstd::stream::decode_all(std::fs::File::open(path).unwrap()).unwrap();
+    let mut kinds = std::collections::BTreeSet::new();
+    for (i, l) in String::from_utf8(raw).unwrap().lines().enumerate() {
+        let v: Value = serde_json::from_str(l).unwrap();
+        kinds.insert(v["kind"].as_str().unwrap().to_owned());
+        // Validate the header, the report and a sample of rows (keeps the test fast).
+        if i < 50 {
+            validate("run-file", &v);
+        }
+    }
+    for k in ["header", "report", "op", "req"] {
+        assert!(kinds.contains(k), "run file has no `{k}` line");
+    }
+}

@@ -1,0 +1,631 @@
+{
+  "$defs": {
+    "Attribution": {
+      "properties": {
+        "factors": {
+          "description": "Most distinctive first.",
+          "items": {
+            "$ref": "#/$defs/Factor"
+          },
+          "type": "array"
+        },
+        "rest_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "selected_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "selected_count",
+        "rest_count",
+        "factors"
+      ],
+      "type": "object"
+    },
+    "Bottleneck": {
+      "description": "The layer that dominates operation latency.",
+      "oneOf": [
+        {
+          "enum": [
+            "none"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "client_queue",
+          "description": "Waiting for in-flight request permits / pooled connections.",
+          "type": "string"
+        },
+        {
+          "const": "client",
+          "description": "Client-side processing (CPU, OpenDAL, response consumption).",
+          "type": "string"
+        },
+        {
+          "const": "connect",
+          "description": "DNS / TCP / TLS / proxy handshakes.",
+          "type": "string"
+        },
+        {
+          "const": "upload",
+          "description": "Uploading request bodies.",
+          "type": "string"
+        },
+        {
+          "const": "server_latency",
+          "description": "Server time to first byte.",
+          "type": "string"
+        },
+        {
+          "const": "download",
+          "description": "Downloading response bodies.",
+          "type": "string"
+        },
+        {
+          "const": "throttling",
+          "description": "Rate limiting (429/503).",
+          "type": "string"
+        },
+        {
+          "const": "retry_backoff",
+          "description": "Sleeping between retry attempts (errors that are not throttling).",
+          "type": "string"
+        },
+        {
+          "const": "local_backend",
+          "description": "In-process backend (memory/fs) service time.",
+          "type": "string"
+        }
+      ]
+    },
+    "ErrorCode": {
+      "description": "Stable error code. Serialized as its dotted string (e.g. `net.timeout`).",
+      "enum": [
+        "usage.invalid_argument",
+        "usage.unknown_target",
+        "usage.unknown_run",
+        "config.invalid",
+        "config.unknown_option",
+        "auth.no_credentials",
+        "auth.denied",
+        "net.unreachable",
+        "net.dns",
+        "net.tls",
+        "net.timeout",
+        "storage.not_found",
+        "storage.throttled",
+        "storage.unsupported",
+        "safety.budget_exceeded",
+        "safety.read_only",
+        "safety.refused",
+        "run.sla_failed",
+        "run.regression",
+        "run.interrupted",
+        "internal"
+      ],
+      "type": "string"
+    },
+    "Evidence": {
+      "description": "The numbers and trace references behind a finding.",
+      "properties": {
+        "op_ids": {
+          "description": "Operations that show the problem.",
+          "items": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        "text": {
+          "description": "The evidence in words, with numbers.",
+          "type": "string"
+        },
+        "values": {
+          "additionalProperties": {
+            "format": "double",
+            "type": "number"
+          },
+          "description": "Named measurements (unit-suffixed keys).",
+          "type": "object"
+        },
+        "windows": {
+          "description": "Time windows (seconds from the window start) where it shows.",
+          "items": {
+            "$ref": "#/$defs/TimeWindow"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "text"
+      ],
+      "type": "object"
+    },
+    "ExplainRun": {
+      "description": "Narrated explanation of a stored run.",
+      "properties": {
+        "bottleneck": {
+          "$ref": "#/$defs/Bottleneck"
+        },
+        "exit_code": {
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "findings": {
+          "description": "All findings, most severe first.",
+          "items": {
+            "$ref": "#/$defs/ExplainedFinding"
+          },
+          "type": "array"
+        },
+        "headline": {
+          "type": "string"
+        },
+        "interrupted": {
+          "type": "boolean"
+        },
+        "label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "level": {
+          "$ref": "#/$defs/VerdictLevel"
+        },
+        "narrative": {
+          "description": "The explanation in sentences.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "next_commands": {
+          "description": "Commands worth running next.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "run_id": {
+          "type": "string"
+        },
+        "slowest": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SlowestAnalysis"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Absent when the run file holds no request rows (e.g. tune runs)."
+        },
+        "target": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "run_id",
+        "target",
+        "level",
+        "headline",
+        "exit_code",
+        "bottleneck",
+        "interrupted",
+        "findings",
+        "narrative",
+        "next_commands"
+      ],
+      "type": "object"
+    },
+    "ExplainedFinding": {
+      "description": "A finding of the run with its documentation.",
+      "properties": {
+        "advice": {
+          "type": "string"
+        },
+        "cause": {
+          "type": "string"
+        },
+        "code": {
+          "type": "string"
+        },
+        "doc": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FindingDoc"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Catalog entry of the code (absent for codes this oprobe does not document)."
+        },
+        "evidence": {
+          "$ref": "#/$defs/Evidence"
+        },
+        "severity": {
+          "$ref": "#/$defs/Severity"
+        },
+        "verification": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Verification"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "code",
+        "severity",
+        "cause",
+        "evidence",
+        "advice"
+      ],
+      "type": "object"
+    },
+    "Factor": {
+      "description": "One attribute value and how much more common it is among the selected requests.",
+      "properties": {
+        "attribute": {
+          "description": "Attribute name: `api`, `status`, `protocol`, `connection`, `remote`, `attempt`,\n`error`, `stage` (the dominant stage of the request).",
+          "type": "string"
+        },
+        "lift": {
+          "description": "`selected_ratio / rest_ratio` (capped; large when the value is absent from the rest).",
+          "format": "double",
+          "type": "number"
+        },
+        "rest_ratio": {
+          "description": "Share of the other requests with this value (0–1).",
+          "format": "double",
+          "type": "number"
+        },
+        "selected_count": {
+          "description": "Selected requests with this value.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "selected_ratio": {
+          "description": "Share of selected requests with this value (0–1).",
+          "format": "double",
+          "type": "number"
+        },
+        "value": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "attribute",
+        "value",
+        "selected_ratio",
+        "rest_ratio",
+        "lift",
+        "selected_count"
+      ],
+      "type": "object"
+    },
+    "FindingDoc": {
+      "description": "Documentation of one finding code.",
+      "properties": {
+        "category": {
+          "description": "Area: `correctness`, `availability`, `bottleneck`, `network`, `efficiency`, `sla`,\n`client`.",
+          "type": "string"
+        },
+        "causes": {
+          "description": "Typical causes, most common first.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "code": {
+          "description": "Stable code as it appears in `report.findings[].code`.",
+          "type": "string"
+        },
+        "docs": {
+          "description": "Documentation link.",
+          "type": "string"
+        },
+        "knobs": {
+          "description": "Related knobs, flags and profile settings.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "meaning": {
+          "description": "What the finding means.",
+          "type": "string"
+        },
+        "title": {
+          "description": "Short title.",
+          "type": "string"
+        },
+        "typical_severity": {
+          "$ref": "#/$defs/Severity",
+          "description": "Severity the diagnosis usually assigns (`critical` codes can also be `warning`)."
+        },
+        "verify": {
+          "description": "How to confirm it (report fields, commands).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "code",
+        "title",
+        "typical_severity",
+        "category",
+        "meaning",
+        "causes",
+        "verify",
+        "knobs",
+        "docs"
+      ],
+      "type": "object"
+    },
+    "Selection": {
+      "description": "Which requests are \"selected\" (everything else is the comparison set).",
+      "properties": {
+        "api": {
+          "description": "Restrict to one storage API (e.g. `GetObject`); applies to both sides.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "from_us": {
+          "description": "Window start, µs from the measurement window start (inclusive).",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "min_total_us": {
+          "description": "Requests at least this slow (total), µs.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "to_us": {
+          "description": "Window end, µs (exclusive).",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "Severity": {
+      "enum": [
+        "info",
+        "warning",
+        "critical"
+      ],
+      "type": "string"
+    },
+    "SlowOp": {
+      "description": "One of the slowest operations.",
+      "properties": {
+        "attempts_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "dominant_stage": {
+          "description": "Stage that dominated its slowest request (`queue`, `connect`, `send`, `ttfb`,\n`transfer`, `stall`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "error_code": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ErrorCode"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "key": {
+          "type": "string"
+        },
+        "latency_ms": {
+          "format": "double",
+          "type": "number"
+        },
+        "op_id": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "requests_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "verb": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "op_id",
+        "verb",
+        "key",
+        "latency_ms",
+        "attempts_count",
+        "requests_count"
+      ],
+      "type": "object"
+    },
+    "SlowestAnalysis": {
+      "description": "Outlier attribution of the slowest requests.",
+      "properties": {
+        "attribution": {
+          "$ref": "#/$defs/Attribution"
+        },
+        "ops": {
+          "items": {
+            "$ref": "#/$defs/SlowOp"
+          },
+          "type": "array"
+        },
+        "selection": {
+          "$ref": "#/$defs/Selection"
+        },
+        "slowest_pct": {
+          "description": "Percent of requests selected (by total time).",
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "slowest_pct",
+        "selection",
+        "attribution",
+        "ops"
+      ],
+      "type": "object"
+    },
+    "TimeWindow": {
+      "properties": {
+        "from_s": {
+          "format": "double",
+          "type": "number"
+        },
+        "to_s": {
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "from_s",
+        "to_s"
+      ],
+      "type": "object"
+    },
+    "VerdictLevel": {
+      "description": "Overall judgement.",
+      "oneOf": [
+        {
+          "enum": [
+            "ok"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "review",
+          "description": "Worth a look (informational findings, warnings, partial run).",
+          "type": "string"
+        },
+        {
+          "const": "attention",
+          "description": "Warning findings.",
+          "type": "string"
+        },
+        {
+          "const": "critical",
+          "description": "Critical findings or a breached SLA.",
+          "type": "string"
+        }
+      ]
+    },
+    "Verification": {
+      "description": "A concrete way to test a finding's advice.",
+      "properties": {
+        "command": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "description": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "description"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://github.com/hxddh/oprobe/schemas/3/explain.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Result of `oprobe explain` (a run or a finding code)",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/FindingDoc",
+      "description": "Documentation of one finding code.",
+      "properties": {
+        "kind": {
+          "const": "finding_code",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "Every finding code (`--list`).",
+      "properties": {
+        "codes": {
+          "items": {
+            "$ref": "#/$defs/FindingDoc"
+          },
+          "type": "array"
+        },
+        "kind": {
+          "const": "finding_codes",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "codes"
+      ],
+      "type": "object"
+    },
+    {
+      "$ref": "#/$defs/ExplainRun",
+      "description": "A narrated run.",
+      "properties": {
+        "kind": {
+          "const": "run",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "type": "object"
+    }
+  ],
+  "title": "oprobe explain",
+  "x-rust-type": "ExplainOutput"
+}

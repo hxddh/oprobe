@@ -1,0 +1,64 @@
+{
+  "$defs": {
+    "TargetShow": {
+      "description": "One configured target.",
+      "properties": {
+        "credentials": {
+          "description": "`env`, `profile:NAME` or `anonymous` (default: the provider's credential chain).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "endpoint": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "options": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "OpenDAL options, validated against the service when the target is used.",
+          "type": "object"
+        },
+        "region": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "url": {
+          "description": "Storage URL, e.g. `s3://bucket/prefix`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "url"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://github.com/hxddh/oprobe/schemas/3/target-list.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Result of `oprobe target list`",
+  "properties": {
+    "targets": {
+      "items": {
+        "$ref": "#/$defs/TargetShow"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "targets"
+  ],
+  "title": "oprobe target-list",
+  "type": "object",
+  "x-rust-type": "TargetList"
+}

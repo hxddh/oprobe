@@ -1,0 +1,63 @@
+{
+  "$defs": {
+    "SweepEntry": {
+      "properties": {
+        "age_s": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "deleted": {
+          "type": "boolean"
+        },
+        "objects_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "prefix": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "prefix",
+        "age_s",
+        "objects_count",
+        "deleted"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://github.com/hxddh/oprobe/schemas/3/cleanup.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Result of `oprobe cleanup`",
+  "properties": {
+    "dry_run": {
+      "type": "boolean"
+    },
+    "entries": {
+      "items": {
+        "$ref": "#/$defs/SweepEntry"
+      },
+      "type": "array"
+    },
+    "older_than": {
+      "type": "string"
+    },
+    "target": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "target",
+    "dry_run",
+    "older_than",
+    "entries"
+  ],
+  "title": "oprobe cleanup",
+  "type": "object",
+  "x-rust-type": "CleanupOutput"
+}

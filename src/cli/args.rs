@@ -129,7 +129,7 @@ pub enum Command {
     /// Re-slice a run by API, connection, remote, stage or second
     Analyze(PendingArgs),
     /// Narrate a run's causes and advice, or document a finding code
-    Explain(PendingArgs),
+    Explain(ExplainArgs),
     /// Named targets: add, list, show, rm, test
     #[command(subcommand)]
     Target(TargetCommand),
@@ -150,11 +150,11 @@ pub enum Command {
     #[command(visible_alias = "serve-s3")]
     Lab(LabArgs),
     /// MCP server for agents (stdio, or --http ADDR)
-    Mcp(PendingArgs),
+    Mcp(McpArgs),
     /// Print the JSON Schema of a machine output (report, events, …)
-    Schema(PendingArgs),
+    Schema(SchemaArgs),
     /// Describe what this oprobe can do (machine-readable)
-    Capabilities(PendingArgs),
+    Capabilities(CapabilitiesArgs),
     /// Configuration: show (with sources), path, edit
     #[command(subcommand)]
     Config(ConfigCommand),
@@ -799,4 +799,56 @@ pub struct InitArgs {
     /// Write to a file instead of stdout
     #[arg(long = "out", value_name = "FILE")]
     pub file: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub struct ExplainArgs {
+    /// A RUNREF (id, prefix, `last`, `last~N`, label, .oprobe path) or a finding code
+    /// (e.g. `throttling`); `oprobe explain --list` lists the codes
+    #[arg(value_name = "RUNREF|FINDING_CODE", required_unless_present = "list")]
+    pub subject: Option<String>,
+    /// List every finding code
+    #[arg(long, conflicts_with = "subject")]
+    pub list: bool,
+    /// Findings to narrate for a run
+    #[arg(long, default_value_t = 3)]
+    pub top: usize,
+}
+
+#[derive(Args, Debug)]
+pub struct SchemaArgs {
+    /// Schema name (`report`, `events`, `run`, …); omit to list the names
+    #[arg(value_name = "NAME")]
+    pub name: Option<String>,
+}
+
+#[derive(Args, Debug, Default)]
+pub struct CapabilitiesArgs {}
+
+#[derive(Args, Debug, Default, Clone)]
+pub struct McpArgs {
+    /// Serve MCP over Streamable HTTP on this address (e.g. 127.0.0.1:8765) instead of stdio
+    #[arg(long, value_name = "ADDR")]
+    pub http: Option<String>,
+    /// Enable tools that write test data (runs that upload a dataset, tune, cleanup)
+    #[arg(long)]
+    pub allow_write: bool,
+    /// Only these targets: a configured target name or a URL prefix (repeatable)
+    #[arg(long = "allow-target", value_name = "NAME|URL-PREFIX")]
+    pub allow_targets: Vec<String>,
+    /// Budget applied to every run the server starts: estimated request cost (USD)
+    #[arg(long, value_name = "USD")]
+    pub max_cost_usd: Option<f64>,
+    /// Budget applied to every run: backend requests
+    #[arg(long, value_name = "N")]
+    pub max_requests: Option<u64>,
+    /// Budget applied to every run: bytes transferred (e.g. 1GiB)
+    #[arg(long, value_name = "SIZE")]
+    pub max_bytes: Option<String>,
+    /// Budget applied to every run: wall time (e.g. 2m)
+    #[arg(long, value_name = "DURATION")]
+    pub max_duration: Option<String>,
+    /// Runs executing at the same time (others wait)
+    #[arg(long, default_value_t = 1, value_parser = at_least::<1>)]
+    pub max_concurrent_runs: usize,
 }
