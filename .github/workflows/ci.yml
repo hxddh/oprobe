@@ -38,13 +38,49 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked --all-targets
-      - name: CLI smoke (run → diff gate)
+      - name: CLI smoke (demo, run → compare gate, HTML report)
         shell: bash
+        env:
+          OPROBE_DATA_DIR: ${{ runner.temp }}/oprobe-data
         run: |
-          cargo run --release --locked -- run memory:// --preset mixed -d 2s --warmup 500ms -q --json base.json
-          cargo run --release --locked -- run memory:// --preset mixed -d 2s --warmup 500ms -q --json cand.json
-          cargo run --release --locked -- diff base.json cand.json --max-p99-increase 400 --max-p50-increase 400 --max-throughput-drop 80 --markdown gate.md
+          cargo build --release --locked
+          o=target/release/oprobe
+          $o demo --duration 2s
+          $o run memory:// --preset mixed -d 2s --warmup 500ms -q --label base
+          $o run memory:// --preset mixed -d 2s --warmup 500ms -q --label cand
+          $o compare base cand --max-p99-increase 400 --max-p50-increase 400 --max-throughput-drop 80 --markdown gate.md
+          $o runs show cand -o html > report.html
+          grep -q '<svg class="viz"' report.html
+          $o runs list
           cat gate.md >> "$GITHUB_STEP_SUMMARY"
+
+  docs:
+    name: docs (links, CLI reference drift)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # docs/cli.md is generated from the command definitions; regenerate it with
+      # `OPROBE_BLESS=1 cargo test --test docs`. The same test checks relative links.
+      - run: cargo test --locked --test docs
+      - name: Links (external included)
+        uses: lycheeverse/lychee-action@v2
+        with:
+          args: >-
+            --no-progress --max-retries 3 --accept 200,206,429
+            --exclude-path docs/design
+            --exclude 'releases/(latest/)?download'
+            README.md README.zh-CN.md CHANGELOG.md llms.txt docs/*.md
+          fail: true
+      - name: Action metadata
+        run: |
+          python3 -c "import yaml,sys; d=yaml.safe_load(open('action.yml')); assert d['runs']['using']=='composite'; print('action.yml ok:', len(d['runs']['steps']), 'steps')"
+      - name: Install scripts
+        run: |
+          sh -n scripts/install.sh
+          bash -n scripts/release-manifests.sh
+          shellcheck scripts/install.sh scripts/release-manifests.sh scripts/macos-app.sh || true
 
   backends:
     name: real backends (MinIO, fake-gcs-server, Azurite)
@@ -195,6 +231,6 @@ jobs:
           Copy-Item -Recurse profiles $stage
           dotnet tool install --global wix --version 5.0.2
           wix build packaging/windows/oprobe.wxs -arch x64 `
-            -d Version=2.0.0 -d BinDir=$stage -d IconFile=packaging/desktop/oprobe.ico `
+            -d Version=3.0.0 -d BinDir=$stage -d IconFile=packaging/desktop/oprobe.ico `
             -o out/oprobe-ci-x64.msi
           Get-Item out/oprobe-ci-x64.msi

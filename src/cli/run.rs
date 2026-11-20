@@ -29,6 +29,10 @@ pub struct RunOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
     pub report: Report,
+    /// The run with its trace rows (not serialized; the HTML and Markdown renderers use it).
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub full: Option<Box<Run>>,
 }
 
 impl CommandOutput for RunOutput {
@@ -36,7 +40,16 @@ impl CommandOutput for RunOutput {
         brief::render(&self.report, &self.run_id)
     }
     fn markdown(&self) -> String {
-        markdown::render(&self.report)
+        match &self.full {
+            Some(run) => markdown::render(run),
+            None => markdown::render_report(&self.report),
+        }
+    }
+    fn html(&self) -> Option<String> {
+        Some(match &self.full {
+            Some(run) => crate::report::html::render(run),
+            None => crate::report::html::render_report(&self.report),
+        })
     }
     fn exit_code(&self) -> u8 {
         self.report.verdict.exit_code
@@ -204,7 +217,7 @@ fn save_outputs(r: &Report, o: &OutputArgs) -> Result<()> {
         write_file(p, &serde_json::to_string_pretty(r)?)?;
     }
     if let Some(p) = &o.markdown {
-        write_file(p, &markdown::render(r))?;
+        write_file(p, &markdown::render_report(r))?;
     }
     Ok(())
 }
@@ -257,12 +270,26 @@ fn budget_error(
     Some(breach.to_error())
 }
 
-pub async fn cmd_run(a: RunArgs, ctx: &Ctx) -> Result<u8> {
+pub async fn cmd_run(mut a: RunArgs, ctx: &Ctx) -> Result<u8> {
     if a.repeat > 1 {
         return Err(OprobeError::not_implemented("run --repeat").into());
     }
     if a.baseline.is_some() {
         return Err(OprobeError::not_implemented("run --baseline").into());
+    }
+    // `oprobe run` without a target in an interactive terminal: guided first run.
+    if a.target.target.is_none()
+        && a.target.profile.is_none()
+        && ctx.config()?.defaults.target.is_none()
+        && super::onboard::should_offer(ctx)
+    {
+        match super::onboard::choose(ctx)? {
+            super::onboard::Choice::Demo => {
+                return super::demo::cmd_demo(DemoArgs::default(), ctx).await;
+            }
+            super::onboard::Choice::Target(name) => a.target.target = Some(name),
+            super::onboard::Choice::Saved => return Ok(exit::OK),
+        }
     }
     let (mut profile, target_name) =
         resolve_profile(ctx, &a.target, &a.workload, &a.knobs, &a.cost)?;
@@ -270,10 +297,32 @@ pub async fn cmd_run(a: RunArgs, ctx: &Ctx) -> Result<u8> {
     if a.output.label.is_some() {
         profile.name = a.output.label.clone();
     }
-    let rails = rails(&profile, &a.safety)?;
-    if a.safety.dry_run {
+    match measure(ctx, profile, target_name, &a.safety, &a.output).await? {
+        Measured::Plan(plan) => ctx.out.finish(plan.as_ref()),
+        Measured::Run(out) => ctx.out.finish(out.as_ref()),
+    }
+}
+
+/// What [`measure`] produced.
+pub(super) enum Measured {
+    /// `--dry-run`: the plan; nothing was sent.
+    Plan(Box<PlanOutput>),
+    Run(Box<RunOutput>),
+}
+
+/// Measure a resolved profile under the safety rails, build the report and save the run
+/// (shared by `oprobe run` and `oprobe demo`).
+pub(super) async fn measure(
+    ctx: &Ctx,
+    profile: Profile,
+    target_name: Option<String>,
+    safety: &SafetyArgs,
+    output: &OutputArgs,
+) -> Result<Measured> {
+    let rails = rails(&profile, safety)?;
+    if safety.dry_run {
         let plan = crate::guard::plan(&profile, &rails.run_prefix, rails.read_only, &rails.budgets);
-        return ctx.out.finish(&PlanOutput { plan });
+        return Ok(Measured::Plan(Box::new(PlanOutput { plan })));
     }
     let guard = guard_for(ctx, &profile, &rails.budgets);
     let cancel = Cancel::new();
@@ -358,8 +407,8 @@ pub async fn cmd_run(a: RunArgs, ctx: &Ctx) -> Result<u8> {
     if budget_hit {
         run.report.verdict.exit_code = exit::BUDGET;
     }
-    apply_fail_on(&mut run.report, &a.output, ctx);
-    let path = save_run(ctx, &run, &a.output)?;
+    apply_fail_on(&mut run.report, output, ctx);
+    let path = save_run(ctx, &run, output)?;
     if let Some(e) = budget_error(&session, &rails.run_id, ctx, path.is_some()) {
         return Err(e);
     }
@@ -367,11 +416,12 @@ pub async fn cmd_run(a: RunArgs, ctx: &Ctx) -> Result<u8> {
         ctx.out
             .warn("run interrupted — partial results: they cover only the time before Ctrl-C");
     }
-    ctx.out.finish(&RunOutput {
+    Ok(Measured::Run(Box::new(RunOutput {
         run_id: rails.run_id.to_string(),
         path,
-        report: run.report,
-    })
+        report: run.report.clone(),
+        full: Some(Box::new(run)),
+    })))
 }
 
 /// Result of `oprobe tune`.
@@ -419,7 +469,7 @@ impl CommandOutput for TuneOutput {
         o
     }
     fn markdown(&self) -> String {
-        markdown::render(&self.report)
+        markdown::render_report(&self.report)
     }
     fn exit_code(&self) -> u8 {
         self.report.verdict.exit_code

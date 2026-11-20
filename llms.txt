@@ -1,0 +1,27 @@
+# oprobe
+
+> oprobe benchmarks and traces object storage (S3, GCS, Azure Blob, R2, OSS, COS, B2, MinIO, local) request by request through Apache OpenDAL. It explains where time and money go (findings with cause, evidence, advice and a verification command), tunes the client, gates regressions in CI, and saves every run as a `.oprobe` file. It has a CLI, a terminal UI, a native app, a GitHub Action and an MCP server.
+
+Agents should use machine output: every command prints exactly one JSON document with `-o json`, or an `oprobe.events/1` NDJSON stream ending with a `result` event with `-o ndjson`. Errors are `{"type":"error","error":{"code","message","hint","retryable"}}` with stable dotted codes. Exit codes: 0 ok, 1 runtime failure, 2 usage/config, 3 SLA failed or regression, 4 budget exceeded, 5 safety refusal, 130 interrupted. Prefer `--dry-run` before measuring a real bucket, budgets (`--max-cost-usd`, `--max-requests`, `--max-duration`) while measuring, and `--read-only` / `--existing PREFIX` when writes are not allowed. `oprobe run` never prompts when stdin/stdout is not a terminal or with `--non-interactive`.
+
+Key commands: `oprobe demo` (no setup), `oprobe run TARGET`, `oprobe runs list|show|export`, `oprobe compare A B`, `oprobe explain RUNREF|CODE`, `oprobe analyze RUNREF`, `oprobe tune TARGET`, `oprobe doctor TARGET`, `oprobe target add NAME URL`, `oprobe schema [NAME]`, `oprobe capabilities`, `oprobe mcp`. A TARGET is a configured name, a URL (`s3://bucket/prefix`, `gcs://`, `azblob://`, `memory://`, …) or `lab://SCENARIO`. A RUNREF is a run id, unique id prefix, `last`, `last~N`, a label or a `.oprobe` path.
+
+## Docs
+
+- [Getting started](https://github.com/hxddh/oprobe/blob/main/docs/getting-started.md): install, the demo, your bucket, reading and acting on the result
+- [Concepts](https://github.com/hxddh/oprobe/blob/main/docs/concepts.md): targets, runs and RUNREFs, baselines, findings, exit codes
+- [CLI reference](https://github.com/hxddh/oprobe/blob/main/docs/cli.md): every command and flag, generated from the code
+- [Reading the report](https://github.com/hxddh/oprobe/blob/main/docs/reading-the-report.md): brief, full text, HTML and Markdown reports section by section
+- [Metrics](https://github.com/hxddh/oprobe/blob/main/docs/metrics.md): what every number means, how it is measured, trace rows, `--microscope`-only values
+- [Workloads and presets](https://github.com/hxddh/oprobe/blob/main/docs/workloads.md): presets, profiles, knobs
+- [CI](https://github.com/hxddh/oprobe/blob/main/docs/ci.md): the GitHub Action, baselines, the compare gate, exit codes
+- [Agents](https://github.com/hxddh/oprobe/blob/main/docs/agents.md): MCP tools and resources, schemas, events
+
+## Optional
+
+- [Install](https://github.com/hxddh/oprobe/blob/main/docs/install.md): packages, unsigned first open, verification, self-update
+- [Troubleshooting](https://github.com/hxddh/oprobe/blob/main/docs/troubleshooting.md): error codes and fixes
+- [Tuning](https://github.com/hxddh/oprobe/blob/main/docs/tuning.md): throttle-aware search and generated client code
+- [Cost model](https://github.com/hxddh/oprobe/blob/main/docs/cost.md): price tables and when cost applies
+- [Privacy](https://github.com/hxddh/oprobe/blob/main/docs/privacy.md): no telemetry; what is stored
+- [Full text of the docs](https://github.com/hxddh/oprobe/blob/main/llms-full.txt): the pages above in one file

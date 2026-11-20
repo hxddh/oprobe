@@ -1,0 +1,252 @@
+name: oprobe storage gate
+description: >-
+  Measure object storage with oprobe, compare against a baseline, upload the run and its HTML report,
+  keep a sticky pull-request comment up to date and fail on regression.
+author: oprobe maintainers
+branding:
+  icon: activity
+  color: blue
+
+inputs:
+  version:
+    description: oprobe release to install (pinned; `latest` follows new releases).
+    default: "3.0.0"
+  target:
+    description: Target URL (s3://bucket/prefix, gcs://…, azblob://…, memory://, lab://demo) or a configured name.
+    required: true
+  preset:
+    description: Workload preset (parquet, checkpoint, small-files, metadata, mixed).
+    default: ""
+  duration:
+    description: Measurement window, e.g. 30s.
+    default: "20s"
+  args:
+    description: Extra `oprobe run` arguments, e.g. "-c 32 --region eu-west-1 --max-cost-usd 0.25".
+    default: ""
+  baseline:
+    description: >-
+      Baseline to compare against: a path to a .oprobe (or report .json) file in the workspace, or a name.
+      A name keeps the baseline run in the Actions cache (restored on every run, replaced by runs of
+      `update-baseline`). Empty: no comparison.
+    default: ""
+  update-baseline:
+    description: Replace a named baseline with this run ("auto" = on pushes to the default branch).
+    default: auto
+  compare-args:
+    description: Extra `oprobe compare` arguments, e.g. "--max-p99-increase 30".
+    default: ""
+  fail-on-regression:
+    description: Fail the step when the comparison finds a regression (exit 3) or the run breaches its SLA.
+    default: "true"
+  comment:
+    description: Post or update one sticky pull-request comment with the result.
+    default: "true"
+  artifact-name:
+    description: Name of the uploaded artifact (the .oprobe run, HTML and Markdown reports).
+    default: oprobe-report
+  github-token:
+    description: Token for the pull-request comment.
+    default: ${{ github.token }}
+
+outputs:
+  run-id:
+    description: Id of the run.
+    value: ${{ steps.run.outputs.run-id }}
+  run-file:
+    description: Path of the .oprobe run file.
+    value: ${{ steps.run.outputs.run-file }}
+  html-report:
+    description: Path of the HTML report.
+    value: ${{ steps.run.outputs.html }}
+  run-exit-code:
+    description: Exit code of `oprobe run` (0 ok, 3 SLA breached, 4 budget, …).
+    value: ${{ steps.run.outputs.exit-code }}
+  regression:
+    description: "`true` when the comparison failed."
+    value: ${{ steps.compare.outputs.regression }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install oprobe
+      shell: bash
+      env:
+        VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        case "$RUNNER_OS-$RUNNER_ARCH" in
+          Linux-X64)     triple=x86_64-unknown-linux-musl;  ext=tar.gz ;;
+          Linux-ARM64)   triple=aarch64-unknown-linux-musl; ext=tar.gz ;;
+          macOS-*)       triple=universal-apple-darwin;     ext=tar.gz ;;
+          Windows-X64)   triple=x86_64-pc-windows-msvc;     ext=zip ;;
+          Windows-ARM64) triple=aarch64-pc-windows-msvc;    ext=zip ;;
+          *) echo "::error::unsupported runner $RUNNER_OS-$RUNNER_ARCH"; exit 1 ;;
+        esac
+        if [ "$VERSION" = latest ]; then
+          base="https://github.com/hxddh/oprobe/releases/latest/download"
+          VERSION=$(curl -fsSL -o /dev/null -w '%{url_effective}' https://github.com/hxddh/oprobe/releases/latest | sed 's#.*/v##')
+        else
+          VERSION="${VERSION#v}"
+          base="https://github.com/hxddh/oprobe/releases/download/v$VERSION"
+        fi
+        asset="oprobe-$VERSION-$triple.$ext"
+        dir="$RUNNER_TEMP/oprobe-bin"
+        mkdir -p "$dir" && cd "$dir"
+        curl -fsSL --retry 3 -o "$asset" "$base/$asset"
+        curl -fsSL --retry 3 -o SHA256SUMS "$base/SHA256SUMS"
+        want=$(awk -v a="$asset" '$2 == a || $2 == "*"a {print $1}' SHA256SUMS)
+        if command -v sha256sum >/dev/null; then got=$(sha256sum "$asset" | cut -d' ' -f1); else got=$(shasum -a 256 "$asset" | cut -d' ' -f1); fi
+        if [ -z "$want" ] || [ "$want" != "$got" ]; then echo "::error::checksum mismatch for $asset"; exit 1; fi
+        if [ "$ext" = zip ]; then unzip -q "$asset"; else tar -xzf "$asset"; fi
+        echo "$dir/oprobe-$VERSION-$triple" >> "$GITHUB_PATH"
+        "$dir/oprobe-$VERSION-$triple/oprobe" --version
+
+    - name: Restore the named baseline
+      id: base
+      if: inputs.baseline != '' && !endsWith(inputs.baseline, '.oprobe') && !endsWith(inputs.baseline, '.json')
+      uses: actions/cache/restore@v4
+      with:
+        path: ${{ runner.temp }}/oprobe-baseline
+        key: oprobe-baseline-${{ inputs.baseline }}-${{ github.run_id }}
+        restore-keys: oprobe-baseline-${{ inputs.baseline }}-
+
+    - name: Run
+      id: run
+      shell: bash
+      env:
+        TARGET: ${{ inputs.target }}
+        PRESET: ${{ inputs.preset }}
+        DURATION: ${{ inputs.duration }}
+        ARGS: ${{ inputs.args }}
+      run: |
+        set -uo pipefail
+        export OPROBE_DATA_DIR="$RUNNER_TEMP/oprobe-data"
+        out="$RUNNER_TEMP/oprobe-out"
+        mkdir -p "$out"
+        preset=()
+        [ -n "$PRESET" ] && preset=(--preset "$PRESET")
+        # shellcheck disable=SC2086
+        oprobe run "$TARGET" "${preset[@]}" -d "$DURATION" --label "${GITHUB_SHA::12}" \
+          --color never --non-interactive $ARGS
+        code=$?
+        file=$(ls -t "$OPROBE_DATA_DIR"/runs/*.oprobe 2>/dev/null | head -1 || true)
+        echo "exit-code=$code" >> "$GITHUB_OUTPUT"
+        if [ -z "$file" ]; then echo "::error::oprobe run failed before saving a run (exit $code)"; exit "$code"; fi
+        id=$(basename "$file" .oprobe)
+        cp "$file" "$out/"
+        oprobe runs show "$id" -o html > "$out/oprobe-report.html"
+        oprobe runs show "$id" -o md > "$out/oprobe-report.md"
+        {
+          echo "run-id=$id"
+          echo "run-file=$out/$id.oprobe"
+          echo "html=$out/oprobe-report.html"
+          echo "out=$out"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Compare
+      id: compare
+      shell: bash
+      env:
+        BASELINE: ${{ inputs.baseline }}
+        CACHED: ${{ runner.temp }}/oprobe-baseline/baseline.oprobe
+        CANDIDATE: ${{ steps.run.outputs.run-file }}
+        OUT: ${{ steps.run.outputs.out }}
+        ARGS: ${{ inputs.compare-args }}
+      run: |
+        set -uo pipefail
+        base=""
+        case "$BASELINE" in
+          "") ;;
+          *.oprobe|*.json) base="$BASELINE" ;;
+          *) [ -f "$CACHED" ] && base="$CACHED" ;;
+        esac
+        if [ -z "$BASELINE" ]; then
+          echo "regression=false" >> "$GITHUB_OUTPUT"; exit 0
+        fi
+        if [ -z "$base" ] || [ ! -f "$base" ]; then
+          echo "::notice::no baseline \`$BASELINE\` yet; this run can become it"
+          echo "regression=false" >> "$GITHUB_OUTPUT"; echo "compared=false" >> "$GITHUB_OUTPUT"; exit 0
+        fi
+        # shellcheck disable=SC2086
+        oprobe compare "$base" "$CANDIDATE" --color never --markdown "$OUT/oprobe-gate.md" \
+          --junit "$OUT/oprobe-gate.xml" $ARGS
+        code=$?
+        echo "compared=true" >> "$GITHUB_OUTPUT"
+        if [ "$code" = 3 ]; then echo "regression=true" >> "$GITHUB_OUTPUT"; else echo "regression=false" >> "$GITHUB_OUTPUT"; fi
+        if [ "$code" != 0 ] && [ "$code" != 3 ]; then exit "$code"; fi
+
+    - name: Update the named baseline
+      if: >-
+        inputs.baseline != '' && !endsWith(inputs.baseline, '.oprobe') && !endsWith(inputs.baseline, '.json') &&
+        steps.compare.outputs.regression != 'true' && steps.run.outputs.exit-code == '0' &&
+        (inputs.update-baseline == 'true' ||
+         (inputs.update-baseline == 'auto' && github.event_name == 'push' &&
+          github.ref == format('refs/heads/{0}', github.event.repository.default_branch)))
+      shell: bash
+      env:
+        CANDIDATE: ${{ steps.run.outputs.run-file }}
+      run: |
+        mkdir -p "$RUNNER_TEMP/oprobe-baseline"
+        cp "$CANDIDATE" "$RUNNER_TEMP/oprobe-baseline/baseline.oprobe"
+
+    - name: Save the named baseline
+      if: >-
+        inputs.baseline != '' && !endsWith(inputs.baseline, '.oprobe') && !endsWith(inputs.baseline, '.json') &&
+        hashFiles(format('{0}/oprobe-baseline/baseline.oprobe', runner.temp)) != ''
+      uses: actions/cache/save@v4
+      with:
+        path: ${{ runner.temp }}/oprobe-baseline
+        key: oprobe-baseline-${{ inputs.baseline }}-${{ github.run_id }}
+
+    - name: Summary
+      shell: bash
+      env:
+        OUT: ${{ steps.run.outputs.out }}
+      run: |
+        {
+          [ -f "$OUT/oprobe-gate.md" ] && cat "$OUT/oprobe-gate.md" && echo
+          cat "$OUT/oprobe-report.md"
+        } > "$OUT/oprobe-comment.md"
+        cat "$OUT/oprobe-comment.md" >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Upload the run and reports
+      id: upload
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ inputs.artifact-name }}
+        path: ${{ steps.run.outputs.out }}
+        if-no-files-found: warn
+
+    - name: Sticky pull-request comment
+      if: inputs.comment == 'true' && github.event.pull_request
+      uses: actions/github-script@v7
+      env:
+        BODY_FILE: ${{ steps.run.outputs.out }}/oprobe-comment.md
+        ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}
+        MARKER: <!-- oprobe-gate:${{ inputs.artifact-name }} -->
+      with:
+        github-token: ${{ inputs.github-token }}
+        script: |
+          const fs = require('fs');
+          let body = fs.readFileSync(process.env.BODY_FILE, 'utf8');
+          if (body.length > 60000) body = body.slice(0, 60000) + '\n\n… (truncated; see the job summary)';
+          body = `${process.env.MARKER}\n${body}\n\n[Run file and HTML report](${process.env.ARTIFACT_URL})`;
+          const { owner, repo } = context.repo;
+          const issue_number = context.payload.pull_request.number;
+          const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number });
+          const mine = comments.find(c => c.body && c.body.startsWith(process.env.MARKER));
+          if (mine) {
+            await github.rest.issues.updateComment({ owner, repo, comment_id: mine.id, body });
+          } else {
+            await github.rest.issues.createComment({ owner, repo, issue_number, body });
+          }
+
+    - name: Gate
+      if: inputs.fail-on-regression == 'true'
+      shell: bash
+      env:
+        REGRESSION: ${{ steps.compare.outputs.regression }}
+        RUN_CODE: ${{ steps.run.outputs.exit-code }}
+      run: |
+        if [ "$REGRESSION" = true ]; then echo "::error::oprobe: regression against the baseline"; exit 3; fi
+        if [ "$RUN_CODE" != 0 ]; then echo "::error::oprobe run exited with $RUN_CODE (3 = SLA breached, 4 = budget)"; exit "$RUN_CODE"; fi

@@ -308,7 +308,7 @@ async fn throttling_is_detected_and_diagnosed() {
     assert!(oprobe::report::to_json(&r).contains("\"applicable\": false"));
     let text = oprobe::report::terminal::render(&r);
     assert!(!text.contains("COST"), "{text}");
-    assert!(oprobe::report::markdown::render(&r).contains("cost: not applicable"));
+    assert!(oprobe::report::markdown::render_report(&r).contains("cost: not applicable"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1120,7 +1120,7 @@ async fn cancelled_run_is_marked_interrupted() {
     let json = oprobe::report::to_json(&r);
     assert!(json.contains("\"interrupted\": true"));
     assert!(oprobe::report::terminal::render(&r).contains("INTERRUPTED"));
-    assert!(oprobe::report::markdown::render(&r).contains("Interrupted"));
+    assert!(oprobe::report::markdown::render_report(&r).contains("Interrupted"));
     let mut done = r.clone();
     done.run.interrupted = false;
     let d = diff(&done, &r, &Thresholds::default());

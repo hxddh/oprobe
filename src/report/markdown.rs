@@ -15,13 +15,14 @@ fn icon(s: Severity) -> &'static str {
     }
 }
 
-/// The report as Markdown.
-pub fn render(r: &Report) -> String {
+/// A report without trace rows as Markdown.
+pub fn render_report(r: &Report) -> String {
     render_with(r, None)
 }
 
-/// A run as Markdown, with the slowest operation's request timeline.
-pub fn render_run(run: &Run) -> String {
+/// A run as Markdown (PR comments, job summaries, wikis), with the slowest operation's
+/// request timeline when the run has trace rows.
+pub fn render(run: &Run) -> String {
     let slow = run
         .report
         .slowest

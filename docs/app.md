@@ -28,7 +28,7 @@ Linux packages for servers (`.deb`, `.rpm`, static musl archives) are built with
   *Run*. While it runs: verdict, KPIs, live operations/s and p99 charts and where the time goes. When it finishes:
   per-operation and per-API tables, connections, findings, the projected cost per provider, and the **slowest
   operation as a waterfall** — one track per backend request, colored by stage, with the async call stack captured
-  while it was stuck. *Save report…* writes the same JSON (`oprobe diff`-compatible) and Markdown as `oprobe run`.
+  while it was stuck. *Save report…* writes the same JSON (`oprobe compare`-compatible) and Markdown as `oprobe run`.
 - **Tune** — runs the throttle-aware tuner against the target, shows every trial as it completes, and offers the
   winner: *Apply to workbench*, *Save profile…* (`oprobe run --profile`), *Save Rust code…*.
 - **Probe** — DNS / TCP / proxy CONNECT / TLS and cold vs warm TTFB of an endpoint, with clock skew.
@@ -53,6 +53,12 @@ stderr is invisible when launched from Finder or Explorer: `~/Library/Logs/oprob
 `%LOCALAPPDATA%\oprobe\oprobe.log` (Windows), `$XDG_STATE_HOME/oprobe/oprobe.log` or
 `~/.local/state/oprobe/oprobe.log` (Linux). Saving from the terminal writes to the working directory and never
 replaces an existing file (`report-1.json`, …).
+
+## Opening saved runs
+
+Every run, from the CLI or the app, is saved as a `.oprobe` file. Open one in the app with
+`oprobe runs open RUNREF` (it starts `oprobe gui --open FILE`), or start the terminal workbench on it with
+`oprobe top --open FILE`.
 
 ## Unsigned desktop builds
 

@@ -4,11 +4,15 @@
 
 mod agent;
 pub mod args;
+mod demo;
 pub(crate) mod doctor;
 mod live;
 pub(crate) mod misc;
+mod onboard;
+pub mod reference;
 pub(crate) mod run;
 pub(crate) mod runs;
+mod self_update;
 pub(crate) mod settings;
 
 use std::io::IsTerminal;
@@ -199,6 +203,7 @@ pub fn ui_entry(cli: &Cli) -> Option<ExitCode> {
                 proxy: a.proxy.clone(),
                 anonymous: a.anonymous,
                 monochrome,
+                open: a.open.clone(),
             };
         }
         crate::ui::set_launch(launch);
@@ -324,20 +329,20 @@ async fn dispatch(cmd: Command, ctx: &Ctx) -> Result<u8> {
             RunsCommand::Show(a) => runs::cmd_show(a, ctx),
             RunsCommand::Rm(a) => runs::cmd_rm(a, ctx),
             RunsCommand::Gc(a) => runs::cmd_gc(a, ctx),
-            RunsCommand::Open(_) => pending("runs open"),
+            RunsCommand::Open(a) => runs::cmd_open(a, ctx),
             RunsCommand::Export(_) => pending("runs export"),
         },
         Command::Target(c) => match c {
-            TargetCommand::Add(a) => settings::target_add(a, ctx),
+            TargetCommand::Add(a) => settings::target_add(a, ctx).await,
             TargetCommand::List => settings::target_list(ctx),
             TargetCommand::Show(a) => settings::target_show(a, ctx),
             TargetCommand::Rm(a) => settings::target_rm(a, ctx),
-            TargetCommand::Test(_) => pending("target test"),
+            TargetCommand::Test(a) => settings::target_test(a, ctx).await,
         },
         Command::Config(c) => match c {
             ConfigCommand::Show => settings::config_show(ctx),
             ConfigCommand::Path => settings::config_path(ctx),
-            ConfigCommand::Edit(_) => pending("config edit"),
+            ConfigCommand::Edit => settings::config_edit(ctx),
         },
         Command::Doctor(a) => doctor::run(a, ctx).await,
         Command::Probe(a) => misc::cmd_probe(a, ctx).await,
@@ -348,7 +353,11 @@ async fn dispatch(cmd: Command, ctx: &Ctx) -> Result<u8> {
             clap_complete::generate(shell, &mut Cli::command(), "oprobe", &mut std::io::stdout());
             Ok(exit::OK)
         }
-        Command::Man { out_dir } => {
+        Command::Man { markdown: true, .. } => {
+            print!("{}", reference::markdown());
+            Ok(exit::OK)
+        }
+        Command::Man { out_dir, .. } => {
             let cmd = Cli::command();
             match out_dir {
                 Some(dir) => {
@@ -362,7 +371,7 @@ async fn dispatch(cmd: Command, ctx: &Ctx) -> Result<u8> {
         Command::Top(_) | Command::Gui(_) => {
             unreachable!("interactive commands are handled by ui_entry")
         }
-        Command::Demo(_) => pending("demo"),
+        Command::Demo(a) => demo::cmd_demo(a, ctx).await,
         Command::Analyze(_) => pending("analyze"),
         Command::Explain(a) => agent::cmd_explain(a, ctx),
         Command::Watch(_) => pending("watch"),
@@ -372,7 +381,7 @@ async fn dispatch(cmd: Command, ctx: &Ctx) -> Result<u8> {
         Command::Mcp(a) => agent::cmd_mcp(a, ctx).await,
         Command::Schema(a) => agent::cmd_schema(a, ctx),
         Command::Capabilities(a) => agent::cmd_capabilities(a, ctx),
-        Command::SelfUpdate(_) => pending("self-update"),
+        Command::SelfUpdate(a) => self_update::cmd_self_update(a, ctx).await,
     }
 }
 
@@ -425,6 +434,16 @@ pub fn resolve_target(t: &TargetArgs, cfg: &ConfigFile) -> Result<(TargetArgs, O
     t.options = opts;
     if entry.credentials.as_deref() == Some("anonymous") {
         t.anonymous = true;
+    }
+    // `credentials = "profile:NAME"`: the AWS shared-config profile (S3-compatible targets).
+    if let Some(p) = entry
+        .credentials
+        .as_deref()
+        .and_then(|c| c.strip_prefix("profile:"))
+        && !t.options.iter().any(|o| o.starts_with("profile="))
+        && TargetSpec::from_url(&entry.url).is_ok_and(|s| s.scheme == "s3")
+    {
+        t.options.insert(0, format!("profile={p}"));
     }
     Ok((t, Some(given)))
 }

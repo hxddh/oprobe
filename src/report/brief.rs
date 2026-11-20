@@ -1,6 +1,9 @@
 //! The concise text result of `oprobe run` (design §9 "Text output default"): at most 20
 //! lines that fit 80 columns — verdict, top findings (cause · evidence · advice · next
 //! command), key numbers, and where the full report is.
+//!
+//! Layout: 1 verdict line, up to 3 findings × (cause, evidence, advice, next command), a line
+//! for more findings, 2–4 lines of numbers and SLA breaches, the pointer to the full report.
 
 use super::Report;
 use super::style::*;
@@ -42,6 +45,9 @@ pub fn render(r: &Report, run_id: &str) -> String {
             lines.push(format!("    {}", dim(&cut(&f.evidence.text, WIDTH - 4))));
         }
         lines.push(format!("    → {}", cut(&f.advice, WIDTH - 6)));
+        if let Some(c) = f.verification.as_ref().and_then(|v| v.command.as_ref()) {
+            lines.push(format!("    {} {}", dim("next:"), cut(c, WIDTH - 10)));
+        }
     }
     if r.findings.len() > 3 {
         lines.push(dim(&format!(
@@ -130,6 +136,10 @@ mod tests {
             r.findings.push(Finding {
                 cause: "c".repeat(120),
                 advice: "a".repeat(120),
+                verification: Some(crate::model::Verification {
+                    description: "d".into(),
+                    command: Some("oprobe run x ".repeat(20)),
+                }),
                 ..Default::default()
             });
         }

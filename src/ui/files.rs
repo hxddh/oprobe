@@ -106,7 +106,7 @@ pub fn save_report(store: Store) {
         return;
     };
     let json = serde_json(&r);
-    let md = crate::report::markdown::render(&r);
+    let md = crate::report::markdown::render_report(&r);
     let name = format!("oprobe-{}.json", crate::util::compact_utc_now());
     save(store, name, vec![("json".into(), json), ("md".into(), md)]);
 }

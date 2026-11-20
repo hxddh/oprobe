@@ -260,10 +260,9 @@ pub fn read(st: &State, uri: &str) -> anyhow::Result<Contents> {
                         })
                         .collect(),
                 }),
-                // TODO(html): serve the HTML report once the renderer exists.
                 "html" => Ok(Contents {
-                    text: crate::report::markdown::render_run(&run),
-                    mime_type: "text/markdown",
+                    text: crate::report::html::render(&run),
+                    mime_type: "text/html",
                 }),
                 _ => Err(not_found(uri)),
             }

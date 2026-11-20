@@ -26,6 +26,8 @@ pub struct Launch {
     pub anonymous: bool,
     /// Draw the terminal UI without colors (`--color never`, `NO_COLOR`).
     pub monochrome: bool,
+    /// A saved run to open (`oprobe gui --open FILE`, `oprobe runs open RUNREF`).
+    pub open: Option<std::path::PathBuf>,
 }
 
 static LAUNCH: std::sync::OnceLock<Launch> = std::sync::OnceLock::new();

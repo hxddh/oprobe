@@ -211,11 +211,7 @@ fn errors_are_classified_with_exit_codes() {
     assert_eq!(o.status.code(), Some(2));
     assert_eq!(error_code(&o), "usage.unknown_target");
     // later streams: internal, exit 1
-    for cmd in [
-        &["demo"][..],
-        &["runs", "export", "last"][..],
-        &["target", "test", "x"][..],
-    ] {
+    for cmd in [&["runs", "export", "last"][..]] {
         // Global flags go before the arguments of a pending command (it accepts any).
         let mut args = vec!["-o", "json"];
         args.extend(cmd);
@@ -431,4 +427,123 @@ fn every_contract_command_is_in_help() {
             "`{c}` missing from --help:\n{help}"
         );
     }
+}
+
+#[test]
+fn html_report_of_run_and_runs_show() {
+    let env = Env::new();
+    let o = run_small(&env, &["-o", "html"]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let html = stdout(&o);
+    assert!(html.starts_with("<!doctype html>"), "{html}");
+    assert!(html.contains("id=\"oprobe-rows\""));
+    assert!(!html.contains("src=\"http"));
+    let o = env.run(&["runs", "show", "last", "-o", "html"]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert!(stdout(&o).contains("id=\"requests\""));
+    let o = env.run(&["runs", "show", "-o", "md"]);
+    assert!(stdout(&o).contains("## oprobe report"), "{}", stdout(&o));
+    let o = env.run(&["compare", "last", "last", "-o", "html"]);
+    assert!(stdout(&o).contains("Regression gate"), "{}", stderr(&o));
+}
+
+#[test]
+fn runs_show_fits_80_columns_and_detail_adds_sections() {
+    let env = Env::new();
+    assert!(run_small(&env, &[]).status.success());
+    let text = stdout(&env.run(&["runs", "show"]));
+    assert!(text.contains("KEY NUMBERS"), "{text}");
+    assert!(text.lines().all(|l| l.chars().count() <= 80), "{text}");
+    let detail = stdout(&env.run(&["runs", "show", "last", "--detail"]));
+    assert!(detail.contains("CONFIGURATION"), "{detail}");
+    let list = stdout(&env.run(&["runs", "list"]));
+    assert!(
+        list.contains("verdict") && list.contains("just now"),
+        "{list}"
+    );
+    let o = env.run(&[
+        "runs",
+        "gc",
+        "--keep",
+        "0",
+        "--older-than",
+        "30d",
+        "-o",
+        "json",
+    ]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert!(json(&o)["removed"].as_array().unwrap().is_empty());
+    let o = env.run(&["runs", "gc", "--older-than", "soon"]);
+    assert_eq!(o.status.code(), Some(2));
+}
+
+#[test]
+fn demo_narrates_and_saves_a_run() {
+    let env = Env::new();
+    let o = env.run(&["demo", "--duration", "1s"]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let text = stdout(&o);
+    assert!(text.contains("What oprobe found"), "{text}");
+    assert!(text.contains("oprobe target add"), "{text}");
+    assert_eq!(env.runs().len(), 1);
+    let o = env.run(&["demo", "--duration", "1s", "-o", "json"]);
+    let v = json(&o);
+    assert_eq!(v["report"]["schema"], "oprobe.report/3");
+    assert!(v["steps"].as_array().unwrap().len() >= 4);
+}
+
+#[test]
+fn target_test_runs_the_doctor() {
+    let env = Env::new();
+    let o = env.run(&["target", "add", "local", "memory://"]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert!(stdout(&o).contains("ready to benchmark"), "{}", stdout(&o));
+    let o = env.run(&["target", "test", "local", "-o", "json"]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert_eq!(json(&o)["ready"], true);
+    let o = env.run(&["target", "test", "nope", "-o", "json"]);
+    assert_eq!(error_code(&o), "usage.unknown_target");
+    // `config edit` refuses without a terminal.
+    let o = env.run(&["config", "edit", "-o", "json"]);
+    assert_eq!(error_code(&o), "usage.invalid_argument");
+}
+
+/// A one-shot HTTP server answering every request with `body`.
+fn serve(body: String) -> String {
+    use std::io::{Read, Write};
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = l.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for s in l.incoming().take(4) {
+            let Ok(mut s) = s else { continue };
+            let mut buf = [0u8; 4096];
+            let _ = s.read(&mut buf);
+            let _ = write!(
+                s,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+        }
+    });
+    format!("http://{addr}")
+}
+
+#[test]
+fn self_update_check_reports_a_newer_release() {
+    let env = Env::new();
+    let api = serve(
+        r#"{"tag_name":"v99.0.0","html_url":"https://example.invalid/r","assets":[]}"#.into(),
+    );
+    let o = env
+        .cmd()
+        .env("OPROBE_UPDATE_API", &api)
+        .args(["self-update", "--check", "-o", "json"])
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", stderr(&o));
+    let v = json(&o);
+    assert_eq!(v["latest_version"], "99.0.0");
+    assert_eq!(v["update_available"], true);
+    assert_eq!(v["installed"], false);
 }
