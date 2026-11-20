@@ -2,13 +2,14 @@
 //! ([`crate::output::CommandOutput`]) rendered by [`crate::output::Output`]; failures are
 //! classified ([`crate::errors::classify`]) at this boundary and mapped to exit codes.
 
+mod agent;
 pub mod args;
-mod doctor;
+pub(crate) mod doctor;
 mod live;
-mod misc;
-mod run;
-mod runs;
-mod settings;
+pub(crate) mod misc;
+pub(crate) mod run;
+pub(crate) mod runs;
+pub(crate) mod settings;
 
 use std::io::IsTerminal;
 use std::process::ExitCode;
@@ -363,14 +364,14 @@ async fn dispatch(cmd: Command, ctx: &Ctx) -> Result<u8> {
         }
         Command::Demo(_) => pending("demo"),
         Command::Analyze(_) => pending("analyze"),
-        Command::Explain(_) => pending("explain"),
+        Command::Explain(a) => agent::cmd_explain(a, ctx),
         Command::Watch(_) => pending("watch"),
         Command::Matrix(_) => pending("matrix"),
         Command::Compat(_) => pending("compat"),
         Command::Baseline(_) => pending("baseline"),
-        Command::Mcp(_) => pending("mcp"),
-        Command::Schema(_) => pending("schema"),
-        Command::Capabilities(_) => pending("capabilities"),
+        Command::Mcp(a) => agent::cmd_mcp(a, ctx).await,
+        Command::Schema(a) => agent::cmd_schema(a, ctx),
+        Command::Capabilities(a) => agent::cmd_capabilities(a, ctx),
         Command::SelfUpdate(_) => pending("self-update"),
     }
 }

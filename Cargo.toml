@@ -78,6 +78,7 @@ tokio = { version = "1.52", features = [
   "fs",
   "io-util",
   "signal",
+  "process",
 ] }
 hdrhistogram = "7.5"
 rand = { version = "0.8", features = ["small_rng"] }
@@ -100,6 +101,9 @@ libc = "0.2"
 schemars = "1"
 zstd = "0.13"
 dirs = "6"
+# `oprobe mcp`: the official MCP SDK (stdio + Streamable HTTP server transports).
+rmcp = { version = "3.11", default-features = false, features = ["server", "transport-io", "transport-streamable-http-server"] }
+tokio-util = "0.7"
 
 # Interactive UI (Native Shell): the terminal workbench (`tui`, default) and native windows (`gui`).
 nsh-core = { version = "0.6", optional = true }
@@ -138,6 +142,7 @@ nsh-engine = { version = "0.6", default-features = false }
 nsh-testing = { version = "0.6", default-features = false }
 opendal-http-transport-reqwest = "0.59"
 tempfile = "3"
+jsonschema = { version = "0.61", default-features = false }
 
 [profile.release]
 lto = "thin"

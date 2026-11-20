@@ -14,6 +14,7 @@ pub mod events;
 pub mod guard;
 pub mod lab;
 pub mod layers;
+pub mod mcp;
 pub mod model;
 pub mod net;
 pub mod output;
