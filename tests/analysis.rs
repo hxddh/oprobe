@@ -142,19 +142,41 @@ fn stragglers_are_found_explained_and_attributed() {
         tail["cause"].as_str().unwrap().contains("tail-cut at"),
         "{tail}"
     );
-    let predicted = tail["evidence"]["values"]["predicted_value"]
-        .as_f64()
-        .unwrap();
-    let current = tail["evidence"]["values"]["predicted_current"]
-        .as_f64()
-        .unwrap();
+    let vals = &tail["evidence"]["values"];
+    let predicted = vals["predicted_p99_ms"].as_f64().unwrap();
+    let current = vals["current_p99_ms"].as_f64().unwrap();
+    // The injected stragglers wait 300 ms on top of a few ms: whatever the runner's speed,
+    // some requests are above the threshold, the threshold is below the straggler delay and
+    // a tail-cut takes most of the p99 away.
+    assert!(vals["straggler_pct"].as_f64().unwrap() > 0.0, "{tail}");
+    assert!(
+        vals["straggler_ttfb_ms"].as_f64().unwrap() >= 250.0,
+        "{tail}"
+    );
+    assert!(
+        vals["tail_cut_threshold_ms"].as_f64().unwrap() < 300.0,
+        "{tail}"
+    );
+    assert!(current >= 250.0, "{tail}");
     assert!(predicted < current / 3.0, "{tail}");
     assert!(!tail["evidence"]["op_ids"].as_array().unwrap().is_empty());
     let cmd = tail["verification"]["command"].as_str().unwrap();
     assert!(
-        cmd.contains("--tail-cut") && cmd.contains("--endpoint"),
+        cmd.contains("--tail-cut")
+            && cmd.contains(&format!("--endpoint {}", lab.endpoint_url))
+            && cmd.contains("--concurrency 8"),
         "{cmd}"
     );
+    // The verification command is valid: it plans the same run with tail-cut on.
+    let words: Vec<&str> = cmd.split_whitespace().collect();
+    assert_eq!(words[0], "oprobe");
+    let plan = env
+        .cmd()
+        .args(&words[1..])
+        .args(["--dry-run", "-o", "json"])
+        .output()
+        .unwrap();
+    assert!(plan.status.success(), "{cmd}: {}", err(&plan));
     // At most one tail finding.
     assert_eq!(
         findings

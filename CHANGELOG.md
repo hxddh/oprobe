@@ -101,14 +101,14 @@ Places where oprobe could lead to a wrong conclusion. Reports use schema `oprobe
 v2 reports are rejected by `oprobe compare`.
 
 - **Retry backoff** is its own `retry` share of operation time (terminal, Markdown, app, JSON
-  `breakdown.retry_ms` / `shares.retry`) instead of being counted as client time; throttling
+  `stages.shares.retry_pct`, `verbs[].breakdown.retry_ms`) instead of being counted as client time; throttling
   headlines state how much time went to waiting for retries.
 - **SLA gate**: `oprobe run` / `tune` exit 3 when the run breaches its SLA — by default more
-  than 1% failed operations or any corrupted data (`sla_verdict` in the report). `--sla none`
+  than 1% failed operations or any corrupted data (`verdict.sla` in the report). `--sla none`
   disables it; `--max-error-rate`, `--max-throttle-rate`, `--p99-ms` override it. `--fail-on`
   still adds a gate on diagnosis findings.
 - **Write chunks**: the tuner no longer recommends chunk sizes OpenDAL raises to the service's
-  minimum part size (5 MiB on S3); reports carry `effective_knobs` (requested vs effective).
+  minimum part size (5 MiB on S3); reports carry `knobs.requested` and `knobs.effective`.
 - **Generated code** reproduces exactly the measured layers and parameters (one `ClientStack`
   feeds both the measured operator and `--emit-rust` / `--emit-python`).
 - **`r2://` / `minio://`** require `account_id` / an endpoint instead of silently using AWS.
@@ -116,7 +116,7 @@ v2 reports are rejected by `oprobe compare`.
   otherwise `cost.applicable = false` and the section is hidden.
 - **Tuner** narrative states the throttling ceiling once, explains the safety margin with
   numbers, no longer writes `scheme = ""`, and prints its report (trial table included) on stdout.
-- **`oprobe diff`** lists every configuration change; a different workload or target fails the
+- **`oprobe compare`** (formerly `diff`) lists every configuration change; a different workload or target fails the
   gate (`--allow-workload-change`, `--allow-target-change`), knob changes are an A/B note.
 - **Default transport** keeps OpenDAL's reqwest defaults (no connect timeout, unlimited idle
   connections per host).

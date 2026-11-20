@@ -286,7 +286,7 @@ pub fn diagnose(s: &Snapshot, knobs: &Knobs, sla: &Sla, network: bool) -> Diagno
     match bottleneck {
         Bottleneck::ClientQueue => f.push(finding(
             Severity::Warning,
-            "client-queue",
+            "client_queue",
             "Operations wait for in-flight request permits".into(),
             format!(
                 "{:.0}% of op time queued; mean request queue wait {} (cap {} in-flight requests, peak {})",
@@ -301,7 +301,7 @@ pub fn diagnose(s: &Snapshot, knobs: &Knobs, sla: &Sla, network: bool) -> Diagno
             if cpu_busy > 0.8 * cores {
                 f.push(finding(
                     Severity::Warning,
-                    "client-cpu",
+                    "client_cpu",
                     "Client CPU is saturated".into(),
                     format!("process uses {:.1} of {cores} cores", cpu_busy),
                     "The load generator itself is the bottleneck: use fewer/larger operations, disable CRC verification (`workload.verify = false`), or run on a larger machine.",
@@ -309,7 +309,7 @@ pub fn diagnose(s: &Snapshot, knobs: &Knobs, sla: &Sla, network: bool) -> Diagno
             } else if stage.stall > stage.body && stage.stall > 0.5 {
                 f.push(finding(
                     Severity::Warning,
-                    "consumer-stall",
+                    "consumer_stall",
                     "Response bodies wait for the consumer".into(),
                     format!("mean consumer stall {} vs network transfer {}", fmt_ms(stage.stall), fmt_ms(stage.body)),
                     "Data arrives faster than it is consumed; the application side (decode/copy) is the limit, not storage.",
@@ -317,7 +317,7 @@ pub fn diagnose(s: &Snapshot, knobs: &Knobs, sla: &Sla, network: bool) -> Diagno
             } else {
                 f.push(finding(
                     Severity::Info,
-                    "client-overhead",
+                    "client_overhead",
                     "Time is spent outside network requests".into(),
                     format!("{:.0}% of op time in client processing (signing, buffering, OpenDAL, CRC)", (shares.client + shares.cache) * 100.0),
                     "Typical for in-memory/local backends or tiny objects. For remote stores, batch small operations.",
@@ -326,7 +326,7 @@ pub fn diagnose(s: &Snapshot, knobs: &Knobs, sla: &Sla, network: bool) -> Diagno
         }
         Bottleneck::Connect => f.push(finding(
             Severity::Warning,
-            "connect",
+            "cold_connections",
             "Connection setup dominates".into(),
             format!(
                 "{} new connections, reuse {:.0}%; DNS p50 {} · TCP p50 {} · TLS p50 {}",
@@ -346,7 +346,7 @@ pub fn diagnose(s: &Snapshot, knobs: &Knobs, sla: &Sla, network: bool) -> Diagno
             let rtt = s.connections.tcp.p50;
             f.push(finding(
                 Severity::Info,
-                "server-latency",
+                "server_latency",
                 "Latency-bound on server time-to-first-byte".into(),
                 format!(
                     "mean TTFB {} per request{}, {:.2} requests per op",
@@ -371,7 +371,7 @@ pub fn diagnose(s: &Snapshot, knobs: &Knobs, sla: &Sla, network: bool) -> Diagno
             let per_stream = if api_bw.1 > 0.0 { api_bw.0 / (api_bw.1 / 1000.0) / 1048576.0 } else { 0.0 };
             f.push(finding(
                 Severity::Info,
-                if bottleneck == Bottleneck::Download { "download-bound" } else { "upload-bound" },
+                if bottleneck == Bottleneck::Download { "download_bound" } else { "upload_bound" },
                 format!("Bandwidth-bound on {}", if bottleneck == Bottleneck::Download { "downloads" } else { "uploads" }),
                 format!(
                     "≈{per_stream:.1} MiB/s per request stream, aggregate {:.1} MiB/s",
@@ -382,7 +382,7 @@ pub fn diagnose(s: &Snapshot, knobs: &Knobs, sla: &Sla, network: bool) -> Diagno
         }
         Bottleneck::RetryBackoff => f.push(finding(
             Severity::Warning,
-            "retry-backoff",
+            "retries",
             "Operations spend their time waiting to retry".into(),
             format!(
                 "{:.0}% of op time in retry backoff; {} retries, {} total backoff",
@@ -394,7 +394,7 @@ pub fn diagnose(s: &Snapshot, knobs: &Knobs, sla: &Sla, network: bool) -> Diagno
         )),
         Bottleneck::LocalBackend => f.push(finding(
             Severity::Info,
-            "local-backend",
+            "local_backend",
             "Local backend service time dominates".into(),
             format!("in-process backend calls take {:.0}% of op time", shares.server * 100.0),
             "Results reflect local disk/memory, not network storage.",
@@ -410,7 +410,7 @@ pub fn diagnose(s: &Snapshot, knobs: &Knobs, sla: &Sla, network: bool) -> Diagno
     {
         f.push(finding(
             Severity::Warning,
-            "connection-churn",
+            "cold_connections",
             format!("Only {:.0}% of requests reused a connection", s.connections.reuse_pct),
             format!("{} dials for {} requests", s.connections.dialed, s.connections.requests),
             "Enable keep-alive and make sure response bodies are fully drained so connections return to the pool.",
@@ -419,7 +419,7 @@ pub fn diagnose(s: &Snapshot, knobs: &Knobs, sla: &Sla, network: bool) -> Diagno
     if s.connections.tls.p50 > 100.0 {
         f.push(finding(
             Severity::Info,
-            "slow-tls",
+            "cold_connections",
             "Slow TLS handshakes".into(),
             format!(
                 "TLS p50 {} p99 {}",
@@ -443,7 +443,7 @@ pub fn diagnose(s: &Snapshot, knobs: &Knobs, sla: &Sla, network: bool) -> Diagno
     if s.cache.enabled && s.cache.lookups > 100 && s.cache.hit_ratio < 0.05 {
         f.push(finding(
             Severity::Info,
-            "cache-ineffective",
+            "cache_ineffective",
             format!("Read cache hit ratio is {:.1}%", s.cache.hit_ratio * 100.0),
             format!("{} lookups, {} hits", s.cache.lookups, s.cache.hits),
             "The access pattern has little reuse; disable the cache to save memory or enlarge it if the working set is close to `cache_size`.",
@@ -453,7 +453,7 @@ pub fn diagnose(s: &Snapshot, knobs: &Knobs, sla: &Sla, network: bool) -> Diagno
         if v.count >= 50 && v.latency.p50 > 0.5 && v.latency.p99 > 5.0 * v.latency.p50 {
             f.push(finding(
                 Severity::Warning,
-                "tail-latency",
+                "tail_latency",
                 format!("`{}` p99 is {:.1}× its median", v.verb, v.latency.p99 / v.latency.p50),
                 format!("p50 {} · p99 {} · max {}", fmt_ms(v.latency.p50), fmt_ms(v.latency.p99), fmt_ms(v.latency.max)),
                 "See the slowest-operation timelines for the responsible stage. Server stragglers can be cut with `tail_cut = true`; retries/backoff point to throttling or errors.",
@@ -465,7 +465,7 @@ pub fn diagnose(s: &Snapshot, knobs: &Knobs, sla: &Sla, network: bool) -> Diagno
         {
             f.push(finding(
                     Severity::Warning,
-                    "sla-p99",
+                    "sla_p99",
                     format!("`{}` p99 {} exceeds the {} SLA", v.verb, fmt_ms(v.latency.p99), fmt_ms(limit)),
                     format!("{} ops, p50 {}", v.count, fmt_ms(v.latency.p50)),
                     "Reduce concurrency if queueing/throttling, or tune chunk/range settings (`oprobe tune`).",
@@ -477,7 +477,7 @@ pub fn diagnose(s: &Snapshot, knobs: &Knobs, sla: &Sla, network: bool) -> Diagno
     {
         f.push(finding(
                 Severity::Warning,
-                "rate-not-sustained",
+                "rate_not_sustained",
                 format!("Target rate {:.0} ops/s not sustained", ol.target_rate),
                 format!(
                     "achieved {:.0} ops/s; arrivals queued behind {} busy slots (max schedule lag {}); {} never started before the window ended",
@@ -492,7 +492,7 @@ pub fn diagnose(s: &Snapshot, knobs: &Knobs, sla: &Sla, network: bool) -> Diagno
     if cpu_busy > 0.8 * cores && bottleneck != Bottleneck::Client {
         f.push(finding(
             Severity::Warning,
-            "client-cpu",
+            "client_cpu",
             "Load generator CPU is near saturation".into(),
             format!("process uses {:.1} of {cores} cores", cpu_busy),
             "Measurements may understate what the storage can do; use a bigger client or lower verification overhead.",
@@ -512,7 +512,7 @@ pub fn diagnose(s: &Snapshot, knobs: &Knobs, sla: &Sla, network: bool) -> Diagno
         if heads > 0 && heads * 2 >= v.count {
             f.push(finding(
                 Severity::Info,
-                "suffix-reads",
+                "suffix_read",
                 "Use suffix reads: saves one HEAD per file".into(),
                 format!(
                     "{heads} HEAD requests for {} file scans ({:.0}% of all requests): each scan asks for the size before reading the footer",

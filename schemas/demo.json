@@ -38,7 +38,7 @@
           "format": "double",
           "type": "number"
         },
-        "requests_per_op": {
+        "requests_per_op_count": {
           "description": "Billed requests of this API per logical operation.",
           "format": "double",
           "type": "number"
@@ -52,7 +52,7 @@
       "required": [
         "api",
         "billing_class",
-        "requests_per_op",
+        "requests_per_op_count",
         "monthly_usd",
         "share_pct"
       ],
@@ -63,22 +63,17 @@
         "api": {
           "$ref": "#/$defs/Api"
         },
-        "bytes_down": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "bytes_up": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "count": {
+        "down_bytes": {
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "errors_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "requests_count": {
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -105,17 +100,22 @@
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
+        },
+        "up_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
         }
       },
       "required": [
         "api",
-        "count",
+        "requests_count",
         "errors_count",
         "throttled_count",
         "status_count",
         "reused_pct",
-        "bytes_up",
-        "bytes_down",
+        "up_bytes",
+        "down_bytes",
         "stages"
       ],
       "type": "object"
@@ -1360,11 +1360,6 @@
     "Quantiles": {
       "description": "Latency distribution in milliseconds.",
       "properties": {
-        "count": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
         "max_ms": {
           "format": "double",
           "type": "number"
@@ -1388,10 +1383,16 @@
         "p99_ms": {
           "format": "double",
           "type": "number"
+        },
+        "samples_count": {
+          "description": "Samples in the distribution.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
         }
       },
       "required": [
-        "count",
+        "samples_count",
         "mean_ms",
         "p50_ms",
         "p90_ms",
@@ -1403,7 +1404,7 @@
     },
     "RemoteStats": {
       "properties": {
-        "bytes_down": {
+        "down_bytes": {
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -1435,7 +1436,7 @@
         "remote",
         "requests_count",
         "errors_count",
-        "bytes_down",
+        "down_bytes",
         "p50_ms",
         "p99_ms"
       ],
@@ -2199,6 +2200,7 @@
           "type": "number"
         },
         "t_s": {
+          "description": "Start of this one-second interval, seconds from the measurement window start (the same\nconvention as `heatmap.t_buckets_s` and `oprobe analyze --by second`).",
           "format": "double",
           "type": "number"
         },
@@ -2530,11 +2532,6 @@
         "breakdown": {
           "$ref": "#/$defs/OpBreakdown"
         },
-        "count": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
         "errors_count": {
           "format": "uint64",
           "minimum": 0,
@@ -2554,6 +2551,11 @@
         "mib_per_s": {
           "format": "double",
           "type": "number"
+        },
+        "ops_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
         },
         "ops_per_s": {
           "format": "double",
@@ -2575,7 +2577,7 @@
       },
       "required": [
         "verb",
-        "count",
+        "ops_count",
         "errors_count",
         "throttled_count",
         "ops_per_s",

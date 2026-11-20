@@ -18,102 +18,39 @@ use super::stats::{median, quantile_us_ms};
 use crate::model::{Evidence, Finding, Report, ReqRow, Run, TimeWindow, Verification};
 use crate::util::{fmt_bytes, fmt_ms, fmt_usd};
 
-/// Every code this engine emits, with a one-line description (for `oprobe explain CODE`).
-pub const CODES: &[(&str, &str)] = &[
-    (
-        "integrity",
-        "data read back differs from what was written (CRC32C mismatch)",
-    ),
-    ("errors", "operations failed"),
-    (
-        "throttling",
-        "the service answered 429/503 (rate limiting); includes the request-rate ceiling",
-    ),
-    (
-        "retries",
-        "a large share of operation time is retry backoff after non-throttling errors",
-    ),
-    (
-        "tail_stragglers",
-        "a few requests wait far longer for the server's first byte than the rest",
-    ),
-    (
-        "tail_latency",
-        "p99 is many times the median; the dominant stage of the slow requests is named",
-    ),
-    (
-        "client_queue",
-        "operations wait for in-flight request permits (max_inflight_requests)",
-    ),
-    (
-        "cold_connections",
-        "connection setup (DNS, TCP, TLS) costs a large share of request time",
-    ),
-    (
-        "http1_connections",
-        "HTTP/1.1 needs one connection per in-flight request; HTTP/2 multiplexes",
-    ),
-    (
-        "remote_skew",
-        "one remote address (front-end) is much slower than the others",
-    ),
-    (
-        "tcp_retransmits",
-        "TCP retransmissions on the connections (packet loss)",
-    ),
-    (
-        "high_rtt",
-        "the network round trip to the endpoint is long (far region, proxy)",
-    ),
-    (
-        "consumer_stall",
-        "response bodies wait for the consumer: the application side is the limit",
-    ),
-    (
-        "overread",
-        "bytes were downloaded that the application never asked for",
-    ),
-    (
-        "small_objects",
-        "small requests: throughput is bound by request round trips, not bandwidth",
-    ),
-    (
-        "suffix_read",
-        "operations HEAD an object before reading its footer; a suffix range read needs no HEAD",
-    ),
-    (
-        "cache_opportunity",
-        "the same objects are read repeatedly; a read cache would save requests",
-    ),
-    (
-        "cost_hotspot",
-        "one API or wasted requests/egress dominate the projected bill",
-    ),
-    (
-        "slow_start",
-        "the first seconds of the run are much slower than the steady state",
-    ),
-    (
-        "server_latency",
-        "latency-bound on server time-to-first-byte",
-    ),
-    ("download_bound", "bandwidth-bound on downloads"),
-    ("upload_bound", "bandwidth-bound on uploads"),
-    ("client_cpu", "the load generator's CPU is saturated"),
-    ("client_overhead", "time is spent outside network requests"),
-    ("local_backend", "in-process backend service time dominates"),
-    ("cache_ineffective", "the read cache rarely hits"),
-    ("sla_p99", "an operation's p99 exceeds the SLA"),
-    (
-        "rate_not_sustained",
-        "the open-loop arrival rate was not sustained",
-    ),
+/// Every finding code this engine can emit (canonical, `snake_case`). The 2.x diagnosis it
+/// carries uses the same codes. `crate::mcp::catalog` documents exactly this set (a test
+/// checks), and `oprobe capabilities` lists it.
+pub const CODES: &[&str] = &[
+    "integrity",
+    "errors",
+    "throttling",
+    "retries",
+    "tail_stragglers",
+    "tail_latency",
+    "client_queue",
+    "cold_connections",
+    "http1_connections",
+    "remote_skew",
+    "tcp_retransmits",
+    "high_rtt",
+    "consumer_stall",
+    "overread",
+    "small_objects",
+    "suffix_read",
+    "cache_opportunity",
+    "cost_hotspot",
+    "slow_start",
+    "server_latency",
+    "download_bound",
+    "upload_bound",
+    "client_cpu",
+    "client_overhead",
+    "local_backend",
+    "cache_ineffective",
+    "sla_p99",
+    "rate_not_sustained",
 ];
-
-/// Description of a finding code (`None` when unknown).
-pub fn describe(code: &str) -> Option<&'static str> {
-    CODES.iter().find(|(c, _)| *c == code).map(|(_, d)| *d)
-}
 
 struct Ctx<'a> {
     run: &'a Run,
@@ -122,44 +59,173 @@ struct Ctx<'a> {
     throttled: bool,
 }
 
-impl Ctx<'_> {
-    /// `oprobe run TARGET …` reproducing this run's workload, plus `extra` flags.
-    fn rerun(&self, extra: &str) -> String {
-        let r = self.r;
-        let target = r
-            .target
-            .name
-            .clone()
-            .unwrap_or_else(|| r.target.display.clone());
-        let mut cmd = format!(
-            "oprobe run {target} --preset {} -d {}s -c {}",
-            r.workload.preset,
-            r.workload.duration_s.round().max(1.0),
-            r.knobs.requested.concurrency_count
-        );
-        if let Some(rate) = r.workload.rate_per_s {
-            cmd += &format!(" --rate {rate}");
+/// How a command names the run's target: the configured target name, the `lab://` scenario,
+/// or the storage URL — plus `--endpoint` / `--region` only when the user gave them with a URL
+/// (a `lab://` target's endpoint is an ephemeral in-process port; a named target carries its
+/// own).
+pub fn target_args(t: &crate::model::TargetInfo) -> Vec<String> {
+    if let Some(n) = &t.name {
+        return vec![n.clone()];
+    }
+    let mut out = vec![t.display.clone()];
+    if t.display.starts_with("lab://") {
+        return out;
+    }
+    for (opt, flag) in [("endpoint", "--endpoint"), ("region", "--region")] {
+        if let Some(v) = t.options.get(opt).filter(|v| !v.contains("<redacted>")) {
+            out.push(flag.into());
+            out.push(v.clone());
         }
-        let ds = &r.workload.dataset;
-        match &ds.existing_prefix {
-            Some(p) => cmd += &format!(" --existing {p}"),
-            None if ds.objects_count > 0 => {
-                cmd += &format!(
-                    " --objects {} --object-size {}",
-                    ds.objects_count,
-                    crate::util::ByteSize(ds.object_size_bytes)
-                )
+    }
+    out
+}
+
+/// An `oprobe` command line: a subcommand, its positional arguments and flags (a flag set
+/// twice keeps the last value, so a verification can override one knob of the run).
+#[derive(Clone, Debug)]
+pub struct Command {
+    head: Vec<String>,
+    flags: Vec<(String, Option<String>)>,
+}
+
+impl Command {
+    /// `oprobe SUBCOMMAND TARGET…` for the run's target.
+    pub fn for_target(subcommand: &str, t: &crate::model::TargetInfo) -> Self {
+        Self {
+            head: std::iter::once(subcommand.to_owned())
+                .chain(target_args(t))
+                .collect(),
+            flags: Vec::new(),
+        }
+    }
+
+    /// Set (or replace) `flag`; `None` = a switch without a value.
+    pub fn set(&mut self, flag: &str, value: Option<String>) -> &mut Self {
+        match self.flags.iter_mut().find(|(f, _)| f == flag) {
+            Some(slot) => slot.1 = value,
+            None => self.flags.push((flag.to_owned(), value)),
+        }
+        self
+    }
+
+    /// Remove `flag`.
+    pub fn unset(&mut self, flag: &str) -> &mut Self {
+        self.flags.retain(|(f, _)| f != flag);
+        self
+    }
+
+    /// Apply `extra` (`--flag value --switch …`), replacing flags already present.
+    pub fn apply(&mut self, extra: &str) -> &mut Self {
+        let toks: Vec<&str> = extra.split_whitespace().collect();
+        let mut i = 0;
+        while i < toks.len() {
+            let value = toks.get(i + 1).filter(|v| !v.starts_with('-'));
+            self.set(toks[i], value.map(|v| (*v).to_owned()));
+            i += 1 + usize::from(value.is_some());
+        }
+        self
+    }
+
+    /// The arguments after `oprobe`.
+    pub fn args(&self) -> Vec<String> {
+        let mut v = self.head.clone();
+        for (f, val) in &self.flags {
+            v.push(f.clone());
+            v.extend(val.clone());
+        }
+        v
+    }
+}
+
+impl std::fmt::Display for Command {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "oprobe")?;
+        for a in self.args() {
+            let plain = !a.is_empty()
+                && a.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "-_./:=@%+,~".contains(c));
+            if plain {
+                write!(f, " {a}")?;
+            } else {
+                write!(f, " '{}'", a.replace('\'', r"'\''"))?;
             }
-            None => {}
         }
-        if let Some(e) = r.target.endpoint.as_deref() {
-            cmd += &format!(" --endpoint {e}");
+        Ok(())
+    }
+}
+
+/// `oprobe run TARGET …` reproducing the run's workload and the client knobs that shape it
+/// (concurrency, I/O concurrency, chunk size, HTTP version, tail-cut, …), so a verification
+/// measures the same configuration except the proposed change.
+pub fn rerun_command(r: &Report) -> Command {
+    let mut c = Command::for_target("run", &r.target);
+    let k = &r.knobs.requested;
+    let def = crate::config::Knobs::default();
+    let size = |b: u64| Some(crate::util::ByteSize(b).to_string());
+    c.set("--preset", Some(r.workload.preset.clone()));
+    c.set(
+        "--duration",
+        Some(format!("{}s", r.workload.duration_s.round().max(1.0))),
+    );
+    if let Some(rate) = r.workload.rate_per_s {
+        c.set("--rate", Some(rate.to_string()));
+    }
+    let ds = &r.workload.dataset;
+    match &ds.existing_prefix {
+        Some(p) => {
+            c.set("--existing", Some(p.clone()));
         }
-        if !extra.is_empty() {
-            cmd += " ";
-            cmd += extra;
+        None if ds.objects_count > 0 => {
+            c.set("--objects", Some(ds.objects_count.to_string()));
+            c.set("--object-size", size(ds.object_size_bytes));
         }
-        cmd
+        None => {}
+    }
+    if !r.workload.access.is_empty() && r.workload.access != "uniform" {
+        c.set("--access", Some(r.workload.access.clone()));
+    }
+    c.set("--concurrency", Some(k.concurrency_count.to_string()));
+    c.set("--io-concurrency", Some(k.io_concurrency_count.to_string()));
+    c.set("--chunk-size", size(k.chunk_bytes));
+    let http = match k.http_version {
+        crate::net::HttpVersion::Auto => "auto",
+        crate::net::HttpVersion::H1 => "h1",
+        crate::net::HttpVersion::H2 => "h2",
+    };
+    c.set("--http", Some(http.into()));
+    if k.tail_cut {
+        c.set("--tail-cut", None);
+    }
+    if k.range_gap_bytes != def.range_gap.0 {
+        c.set("--range-gap", size(k.range_gap_bytes));
+    }
+    if k.max_inflight_requests_count != def.max_inflight_requests as u64 {
+        c.set(
+            "--max-inflight",
+            Some(k.max_inflight_requests_count.to_string()),
+        );
+    }
+    if !k.keep_alive {
+        c.set("--no-keep-alive", None);
+    }
+    if k.cache {
+        c.set("--cache", size(k.cache_bytes));
+    }
+    if k.retries_count != def.retries as u64 {
+        c.set("--retries", Some(k.retries_count.to_string()));
+    }
+    if k.transport == crate::config::TransportMode::Microscope {
+        c.set("--microscope", None);
+    }
+    c
+}
+
+impl Ctx<'_> {
+    /// `oprobe run TARGET …` reproducing this run, with `extra` flags replacing its own.
+    fn rerun(&self, extra: &str) -> String {
+        let mut cmd = rerun_command(self.r);
+        cmd.apply(extra);
+        cmd.to_string()
     }
 
     fn verify(&self, description: impl Into<String>, extra: &str) -> Option<Verification> {
@@ -170,7 +236,14 @@ impl Ctx<'_> {
     }
 }
 
+/// Evidence values; every key carries its unit like a report field (design §6).
 fn values(kv: &[(&str, f64)]) -> BTreeMap<String, f64> {
+    for (k, _) in kv {
+        debug_assert!(
+            crate::model::has_unit(k),
+            "evidence value `{k}` has no unit suffix"
+        );
+    }
     kv.iter()
         .filter(|(_, v)| v.is_finite())
         .map(|(k, v)| ((*k).to_owned(), *v))
@@ -234,12 +307,22 @@ fn pred_text(p: &Prediction) -> String {
     )
 }
 
+/// Evidence values of a prediction, named after the predicted metric and its unit:
+/// `current_p99_ms` / `predicted_p99_ms` (or `…_p50_ms`, `…_ops_per_s`) and the change in
+/// requests per 1 000 operations (`predicted_extra_requests_per_1k_ops_count`, negative =
+/// saved).
 fn pred_values(p: &Prediction) -> [(&'static str, f64); 3] {
+    let (cur, pred) = match p.metric.split(' ').next().unwrap_or("") {
+        "p99_ms" => ("current_p99_ms", "predicted_p99_ms"),
+        "p50_ms" => ("current_p50_ms", "predicted_p50_ms"),
+        "ops_per_s" => ("current_ops_per_s", "predicted_ops_per_s"),
+        _ => ("current_ms", "predicted_ms"),
+    };
     [
-        ("predicted_current", p.current),
-        ("predicted_value", p.predicted),
+        (cur, p.current),
+        (pred, p.predicted),
         (
-            "predicted_requests_per_1k_ops_delta",
+            "predicted_extra_requests_per_1k_ops_count",
             p.requests_per_1k_ops_delta,
         ),
     ]
@@ -338,7 +421,7 @@ fn throttling(c: &Ctx) -> Option<Finding> {
         ("retry_pct", r.stages.shares.retry_pct),
     ];
     let mut advice = "The service is rate-limiting this request rate: lower `concurrency` / `max_inflight_requests` below the ceiling, spread keys across more prefixes, keep retries with jitter.".to_owned();
-    let mut verification = c.verify("find the highest throttle-free concurrency", "");
+    let verification;
     if let Some((rps, inflight)) = ceiling {
         let safe_c = ((inflight / amp).floor() as u64).max(1);
         text += &format!(
@@ -350,25 +433,20 @@ fn throttling(c: &Ctx) -> Option<Finding> {
             "The service accepts ≈{rps:.0} requests/s here: run at concurrency ≤ {safe_c} (or cap `max_inflight_requests` near {:.0}), spread keys across more prefixes, keep retries with jitter.",
             inflight.max(1.0)
         );
-        if let Some(v) = verification.as_mut() {
-            v.description = format!(
+        verification = c.verify(
+            format!(
                 "re-run at concurrency {safe_c}: throttling should disappear at a similar throughput"
-            );
-            v.command = Some(c.rerun("").replace(
-                &format!(" -c {}", r.knobs.requested.concurrency_count),
-                &format!(" -c {safe_c}"),
-            ));
-        }
+            ),
+            &format!("--concurrency {safe_c}"),
+        );
     } else {
         verification = Some(Verification {
             description: "let the tuner find the throttle ceiling".into(),
-            command: Some(format!(
-                "oprobe tune {} --objective throughput",
-                r.target
-                    .name
-                    .clone()
-                    .unwrap_or_else(|| r.target.display.clone())
-            )),
+            command: Some(
+                Command::for_target("tune", &r.target)
+                    .set("--objective", Some("throughput".into()))
+                    .to_string(),
+            ),
         });
     }
     let ids = c.run.ops.iter().filter(|o| o.throttled).map(|o| o.op_id);
@@ -417,6 +495,47 @@ fn retries(c: &Ctx) -> Option<Finding> {
         advice: "Requests fail with temporary errors and are retried after a backoff: inspect them with `oprobe analyze RUN --where attempt=retry --by status`.".into(),
         verification: None,
     })
+}
+
+/// A tail-cut must take at least this share off the affected operations' p99 to be advice.
+const TAIL_CUT_MIN_GAIN: f64 = 1.0 / 3.0;
+
+/// The API whose stragglers a tail-cut would cut best: its threshold, the replayed prediction
+/// and the successful requests above the threshold. `None` when no API has requests above its
+/// threshold that mostly wait for the first byte, or the replay predicts no substantial gain.
+fn straggler_candidate(run: &Run) -> Option<(String, u64, Prediction, Vec<&ReqRow>)> {
+    let mut apis: Vec<&str> = run.reqs.iter().map(|q| q.api.as_ref()).collect();
+    apis.sort_unstable();
+    apis.dedup();
+    let mut best: Option<(String, u64, Prediction, Vec<&ReqRow>)> = None;
+    for api in apis {
+        let Some(cut) = simulate::tail_cut_threshold_us(&run.reqs, api) else {
+            continue;
+        };
+        let over: Vec<&ReqRow> = run
+            .reqs
+            .iter()
+            .filter(|q| q.api == api && !q.is_error() && q.total_us > cut)
+            .collect();
+        let ttfb_bound = over.iter().filter(|q| dominant_stage(q) == "ttfb").count();
+        if over.len() < 3 || ttfb_bound * 2 < over.len() {
+            continue;
+        }
+        let Some(pred) = simulate::tail_cut(run, api, cut) else {
+            continue;
+        };
+        let gain = pred.current - pred.predicted;
+        if pred.current <= 0.0 || gain < TAIL_CUT_MIN_GAIN * pred.current {
+            continue;
+        }
+        if best
+            .as_ref()
+            .is_none_or(|b| gain > b.2.current - b.2.predicted)
+        {
+            best = Some((api.to_owned(), cut, pred, over));
+        }
+    }
+    best
 }
 
 /// The one tail finding: p99 ≫ median, explained by the dominant stage of the slow requests.
@@ -488,53 +607,45 @@ fn tail(c: &Ctx, have: &[Finding]) -> Option<Finding> {
             factors.join(", ")
         );
     }
-    if *stage == "ttfb" {
-        // Stragglers: which API, how many, how slow, and what a tail-cut would do.
-        let mut apis: HashMap<&str, usize> = HashMap::new();
-        for q in &slow {
-            *apis.entry(&q.api).or_default() += 1;
-        }
-        let api = apis.iter().max_by_key(|(_, n)| **n).map(|(a, _)| *a)?;
-        let threshold = simulate::tail_cut_threshold_us(&run.reqs, api);
-        let all_api: Vec<&ReqRow> = run.reqs.iter().filter(|q| q.api == api).collect();
-        let cut = threshold.unwrap_or(min);
-        let stragglers: Vec<&&ReqRow> = all_api.iter().filter(|q| q.total_us > cut).collect();
-        let share = stragglers.len() as f64 * 100.0 / all_api.len().max(1) as f64;
-        let mut ttfb: Vec<u64> = stragglers.iter().map(|q| q.ttfb_us).collect();
+    // Stragglers: requests of one API far slower than that API's own typical request, waiting
+    // for the server's first byte, where a tail-cut would take a large part off the p99. The
+    // API is the one where the replay saves the most, not the one most common among the
+    // slowest requests (slow writes on a slow machine can outnumber a few GET stragglers).
+    if let Some((api, cut, pred, over)) = straggler_candidate(run) {
+        let all_api = run
+            .reqs
+            .iter()
+            .filter(|q| q.api == api && !q.is_error())
+            .count();
+        let share = over.len() as f64 * 100.0 / all_api.max(1) as f64;
+        let mut ttfb: Vec<u64> = over.iter().map(|q| q.ttfb_us).collect();
         let wait = quantile_us_ms(&mut ttfb, 0.5);
-        let pred = threshold.and_then(|t| simulate::tail_cut(run, api, t));
-        let mut cause = format!(
-            "{share:.1}% of {api} requests wait ~{} for the server's first byte (stragglers)",
-            fmt_ms(wait)
+        let cause = format!(
+            "{share:.1}% of {api} requests wait ~{} for the server's first byte (stragglers); tail-cut at {} ms would cut p99 from {} to ~{}.",
+            fmt_ms(wait),
+            cut / 1000,
+            fmt_ms(pred.current),
+            fmt_ms(pred.predicted)
         );
         vals.push(("straggler_pct", share));
         vals.push(("straggler_ttfb_ms", wait));
-        let mut verification = None;
-        if let Some(p) = &pred {
-            cause += &format!(
-                "; tail-cut at {} ms would cut p99 from {} to ~{}.",
-                cut / 1000,
-                fmt_ms(p.current),
-                fmt_ms(p.predicted)
-            );
-            vals.extend(pred_values(p));
-            vals.push(("tail_cut_threshold_ms", ms(cut)));
-            ev_text += &format!(
-                "; {} — about {:.0} extra requests per 1 000 operations",
-                p.note, p.requests_per_1k_ops_delta
-            );
-            if !c.r.knobs.requested.tail_cut {
-                verification = c.verify(
-                    format!(
-                        "enable tail-cut and compare p99 (predicted ~{})",
-                        fmt_ms(p.predicted)
-                    ),
-                    "--tail-cut",
-                );
-            }
+        vals.extend(pred_values(&pred));
+        vals.push(("tail_cut_threshold_ms", ms(cut)));
+        ev_text += &format!(
+            "; {} — about {:.0} extra requests per 1 000 operations",
+            pred.note, pred.requests_per_1k_ops_delta
+        );
+        let verification = if c.r.knobs.requested.tail_cut {
+            None
         } else {
-            cause.push('.');
-        }
+            c.verify(
+                format!(
+                    "enable tail-cut and compare p99 (predicted ~{})",
+                    fmt_ms(pred.predicted)
+                ),
+                "--tail-cut",
+            )
+        };
         return Some(Finding {
             code: "tail_stragglers".into(),
             severity: Severity::Warning,
@@ -542,7 +653,7 @@ fn tail(c: &Ctx, have: &[Finding]) -> Option<Finding> {
             evidence: Evidence {
                 text: ev_text,
                 values: values(&vals),
-                op_ids: slow_ids,
+                op_ids: slowest_ops(run, over.iter().map(|q| q.op_id).filter(|id| *id != 0)),
                 windows: Vec::new(),
             },
             advice: if c.r.knobs.requested.tail_cut {
@@ -701,7 +812,10 @@ fn cold_connections(c: &Ctx) -> Option<Finding> {
         verification: if keep_alive {
             c.verify("multiplex on fewer connections", "--http h2")
         } else {
-            c.verify("re-run with keep-alive (drop --no-keep-alive)", "")
+            Some(Verification {
+                description: "re-run with keep-alive (drop --no-keep-alive)".into(),
+                command: Some(rerun_command(c.r).unset("--no-keep-alive").to_string()),
+            })
         },
     })
 }
@@ -810,35 +924,72 @@ fn remote_skew(c: &Ctx) -> Option<Finding> {
     })
 }
 
+/// Segments each request saw retransmitted *while it ran*: the growth of its connection's
+/// cumulative retransmit counter since the previous sample on that connection (requests are
+/// ordered by end time). The first sample of a fresh connection counts in full (its handshake
+/// belongs to the request); the first sample of a reused connection has no baseline and counts
+/// zero. Requests to loopback addresses are skipped: local servers are not a network path.
+fn retransmit_deltas(reqs: &[ReqRow]) -> Vec<(&ReqRow, u64)> {
+    let mut rows: Vec<&ReqRow> = reqs
+        .iter()
+        .filter(|q| q.tcp.is_some() && !q.remote.is_some_and(|a| a.ip().is_loopback()))
+        .collect();
+    rows.sort_by_key(|q| (q.conn_id, q.t_us + q.total_us as i64));
+    let mut last: HashMap<u64, u64> = HashMap::new();
+    rows.into_iter()
+        .map(|q| {
+            let now = q.tcp.as_ref().map_or(0, |t| t.retrans);
+            let delta = match last.insert(q.conn_id, now) {
+                Some(prev) => now.saturating_sub(prev),
+                None if !q.reused => now,
+                None => 0,
+            };
+            (q, delta)
+        })
+        .collect()
+}
+
+/// Minimum share of requests (percent) that must see retransmissions while running.
+const RETRANSMIT_MIN_PCT: f64 = 1.0;
+/// Minimum number of such requests: a handful of lost packets is not a finding.
+const RETRANSMIT_MIN_REQUESTS: usize = 5;
+
 fn tcp(c: &Ctx) -> Vec<Finding> {
+    let deltas = retransmit_deltas(&c.run.reqs);
+    let mut out = Vec::new();
+    if deltas.len() >= 20 {
+        let hit: Vec<&(&ReqRow, u64)> = deltas.iter().filter(|(_, d)| *d > 0).collect();
+        let share = hit.len() as f64 * 100.0 / deltas.len() as f64;
+        let segments: u64 = hit.iter().map(|(_, d)| d).sum();
+        if share >= RETRANSMIT_MIN_PCT && hit.len() >= RETRANSMIT_MIN_REQUESTS {
+            let hit_ids: std::collections::HashSet<(u64, i64)> =
+                hit.iter().map(|(q, _)| (q.conn_id, q.t_us)).collect();
+            out.push(Finding {
+                code: "tcp_retransmits".into(),
+                severity: if share >= 5.0 { Severity::Warning } else { Severity::Info },
+                cause: format!("{share:.1}% of requests lost packets while they ran (TCP retransmissions)."),
+                evidence: Evidence {
+                    text: format!(
+                        "{} of {} requests with TCP statistics saw {segments} segments retransmitted during the request",
+                        hit.len(),
+                        deltas.len()
+                    ),
+                    values: values(&[
+                        ("retransmit_requests_pct", share),
+                        ("retransmit_requests_count", hit.len() as f64),
+                        ("retransmitted_segments_count", segments as f64),
+                    ]),
+                    op_ids: slowest_ops(c.run, hit.iter().map(|(q, _)| q.op_id).filter(|i| *i != 0)),
+                    windows: windows_where(&c.run.reqs, |q| hit_ids.contains(&(q.conn_id, q.t_us))),
+                },
+                advice: "Packet loss on the path (congested NIC, proxy, VPN or cross-region link) stretches transfers and the tail; compare from another host or region.".into(),
+                verification: None,
+            });
+        }
+    }
     let with: Vec<&ReqRow> = c.run.reqs.iter().filter(|q| q.tcp.is_some()).collect();
     if with.len() < 20 {
-        return Vec::new();
-    }
-    let mut out = Vec::new();
-    let retrans: Vec<&&ReqRow> = with
-        .iter()
-        .filter(|q| q.tcp.as_ref().is_some_and(|t| t.retrans > 0))
-        .collect();
-    let share = retrans.len() as f64 * 100.0 / with.len() as f64;
-    if share >= 1.0 {
-        out.push(Finding {
-            code: "tcp_retransmits".into(),
-            severity: if share >= 5.0 { Severity::Warning } else { Severity::Info },
-            cause: format!("{share:.1}% of requests ran on connections that retransmitted packets."),
-            evidence: Evidence {
-                text: format!(
-                    "{} of {} requests with TCP statistics saw retransmissions",
-                    retrans.len(),
-                    with.len()
-                ),
-                values: values(&[("retransmit_requests_pct", share)]),
-                op_ids: slowest_ops(c.run, retrans.iter().map(|q| q.op_id).filter(|i| *i != 0)),
-                windows: windows_where(&c.run.reqs, |q| q.tcp.as_ref().is_some_and(|t| t.retrans > 0)),
-            },
-            advice: "Packet loss on the path (congested NIC, proxy, VPN or cross-region link) stretches transfers and the tail; compare from another host or region.".into(),
-            verification: None,
-        });
+        return out;
     }
     let mut rtt: Vec<u64> = with
         .iter()
@@ -901,10 +1052,7 @@ fn small_objects(c: &Ctx) -> Option<Finding> {
         advice: "Raise parallelism (`concurrency`) until throttling or the latency SLA stops you, batch or pack small objects, and coalesce neighbouring ranges (`range_gap`).".into(),
         verification: pred
             .is_some()
-            .then(|| c.verify(format!("double the concurrency to {}", cc * 2), "").map(|mut v| {
-                v.command = v.command.map(|cmd| cmd.replace(&format!(" -c {cc}"), &format!(" -c {}", cc * 2)));
-                v
-            }))
+            .then(|| c.verify(format!("double the concurrency to {}", cc * 2), &format!("--concurrency {}", cc * 2)))
             .flatten(),
     })
 }
@@ -1059,9 +1207,8 @@ fn slow_start(c: &Ctx) -> Option<Finding> {
 
 /// Convert a 2.x-style diagnosis item (aggregate-only checks this engine keeps as they are).
 fn carry(c: &Ctx, f: &diagnosis::Finding) -> Finding {
-    let code = f.code.replace('-', "_");
+    let code = f.code.clone();
     let mut out = Finding::from(f);
-    out.code = code.clone();
     if !out.cause.ends_with('.') {
         out.cause.push('.');
     }
@@ -1071,14 +1218,10 @@ fn carry(c: &Ctx, f: &diagnosis::Finding) -> Finding {
             if let Some(p) = simulate::concurrency(c.run, cc * 2, None) {
                 out.evidence.text += &format!("; {}", pred_text(&p));
                 out.evidence.values = values(&pred_values(&p));
-                out.verification = c
-                    .verify(format!("double the concurrency to {}", cc * 2), "")
-                    .map(|mut v| {
-                        v.command = v.command.map(|cmd| {
-                            cmd.replace(&format!(" -c {cc}"), &format!(" -c {}", cc * 2))
-                        });
-                        v
-                    });
+                out.verification = c.verify(
+                    format!("double the concurrency to {}", cc * 2),
+                    &format!("--concurrency {}", cc * 2),
+                );
             }
         }
         "overread" => {
@@ -1107,16 +1250,17 @@ fn carry(c: &Ctx, f: &diagnosis::Finding) -> Finding {
     out
 }
 
-/// Codes the 2.x diagnosis emits that this engine replaces with row-based findings.
+/// Codes the 2.x diagnosis emits that this engine replaces with row-based findings (the
+/// diagnosis' connection-setup, connection-churn and slow-TLS checks all emit
+/// `cold_connections`, its retry-backoff check `retries`).
 const REPLACED: &[&str] = &[
     "errors",
     "throttling",
-    "client-queue",
-    "connect",
-    "connection-churn",
-    "slow-tls",
-    "retry-backoff",
-    "tail-latency",
+    "retries",
+    "client_queue",
+    "cold_connections",
+    "tail_latency",
+    "suffix_read",
 ];
 
 /// All findings of a run: row-based checks plus the aggregate checks of `legacy` (the
@@ -1250,7 +1394,7 @@ pub(crate) mod tests {
         run.report.knobs.requested.keep_alive = true;
         let legacy = vec![diagnosis::Finding {
             severity: Severity::Warning,
-            code: "tail-latency".into(),
+            code: "tail_latency".into(),
             title: "p99 is 80x".into(),
             evidence: String::new(),
             action: String::new(),
@@ -1265,7 +1409,7 @@ pub(crate) mod tests {
             "{}",
             t.cause
         );
-        assert!(t.evidence.values["predicted_value"] < 100.0, "{t:#?}");
+        assert!(t.evidence.values["predicted_p99_ms"] < 100.0, "{t:#?}");
         assert!(!t.evidence.op_ids.is_empty());
         let v = t.verification.as_ref().unwrap();
         assert!(
@@ -1276,9 +1420,10 @@ pub(crate) mod tests {
             v.command
                 .as_deref()
                 .unwrap()
-                .starts_with("oprobe run s3://bkt/x")
+                .starts_with("oprobe run s3://bkt/x"),
+            "{v:?}"
         );
-        assert!(describe("tail_stragglers").is_some());
+        assert!(CODES.contains(&"tail_stragglers"));
     }
 
     #[test]
@@ -1333,5 +1478,179 @@ pub(crate) mod tests {
         assert!(cold.cause.contains("TLS"), "{}", cold.cause);
         let skew = f.iter().find(|x| x.code == "remote_skew").expect("skew");
         assert!(skew.cause.contains("10.0.0.9"));
+    }
+
+    /// Parse `cmd` (as printed) with the CLI parser; the `run` arguments.
+    fn parse_run(cmd: &str) -> crate::cli::args::RunArgs {
+        use clap::Parser;
+        let words: Vec<&str> = cmd.split_whitespace().collect();
+        assert_eq!(words[0], "oprobe");
+        let cli =
+            crate::cli::args::Cli::try_parse_from(&words).unwrap_or_else(|e| panic!("{cmd}: {e}"));
+        match cli.command {
+            Some(crate::cli::args::Command::Run(a)) => a,
+            other => panic!("not a run: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verification_commands_reproduce_the_run_except_the_change() {
+        let mut run = straggler_run();
+        let r = &mut run.report;
+        r.target
+            .options
+            .insert("endpoint".into(), "https://minio.local:9000".into());
+        r.target.options.insert("region".into(), "eu-west-1".into());
+        r.target.options.insert("bucket".into(), "bkt".into());
+        r.target.endpoint = Some("https://minio.local:9000".into());
+        r.workload.preset = "small-files".into();
+        r.workload.duration_s = 12.0;
+        r.workload.dataset.objects_count = 64;
+        r.workload.dataset.object_size_bytes = 64 << 10;
+        let k = &mut r.knobs.requested;
+        *k = crate::model::KnobValues::from(&crate::config::Knobs::default());
+        k.concurrency_count = 24;
+        k.io_concurrency_count = 3;
+        k.chunk_bytes = 4 << 20;
+        k.http_version = crate::net::HttpVersion::H1;
+        k.max_inflight_requests_count = 16;
+        k.keep_alive = false;
+        let mut cmd = rerun_command(&run.report);
+        cmd.apply("--tail-cut --concurrency 48");
+        let text = cmd.to_string();
+        let a = parse_run(&text);
+        assert_eq!(a.target.target.as_deref(), Some("s3://bkt/x"), "{text}");
+        assert_eq!(
+            a.target.endpoint.as_deref(),
+            Some("https://minio.local:9000")
+        );
+        assert_eq!(a.target.region.as_deref(), Some("eu-west-1"));
+        let p = crate::cli::build_profile(&a.target, &a.workload, &a.knobs, &a.cost).unwrap();
+        assert_eq!(p.workload.preset.slug(), "small-files");
+        assert_eq!(p.workload.duration.get().as_secs(), 12);
+        let ds = p.workload.dataset.as_ref().unwrap();
+        assert_eq!((ds.objects, ds.object_size.0), (64, 64 << 10));
+        // Same knobs except the two that the verification changes.
+        let mut want = run.report.knobs.requested.clone();
+        want.tail_cut = true;
+        want.concurrency_count = 48;
+        assert_eq!(crate::model::KnobValues::from(&p.knobs), want, "{text}");
+
+        // Dropping a switch, and a flag the run did not set.
+        let text = rerun_command(&run.report)
+            .unset("--no-keep-alive")
+            .to_string();
+        assert!(!parse_run(&text).knobs.no_keep_alive, "{text}");
+
+        // A named target is re-run by name; a lab target by its scenario, never by the
+        // ephemeral endpoint of its in-process server.
+        run.report.target.name = Some("prod".into());
+        let a = parse_run(&rerun_command(&run.report).to_string());
+        assert_eq!(a.target.target.as_deref(), Some("prod"));
+        assert!(a.target.endpoint.is_none() && a.target.region.is_none());
+        run.report.target.name = None;
+        run.report.target.display = "lab://throttle".into();
+        run.report
+            .target
+            .options
+            .insert("endpoint".into(), "http://127.0.0.1:43373".into());
+        let text = rerun_command(&run.report).to_string();
+        let a = parse_run(&text);
+        assert_eq!(a.target.target.as_deref(), Some("lab://throttle"));
+        assert!(!text.contains("127.0.0.1"), "{text}");
+        // Every verification a run produces parses.
+        for f in derive(&run, &[]) {
+            if let Some(c) = f.verification.and_then(|v| v.command) {
+                let a = parse_run(&c);
+                assert_eq!(a.target.target.as_deref(), Some("lab://throttle"), "{c}");
+            }
+        }
+    }
+
+    #[test]
+    fn tcp_retransmits_count_losses_during_requests_not_connection_history() {
+        let tcp = |retrans: u64| {
+            Some(Box::new(crate::model::TcpRow {
+                rtt_us: 1_000,
+                retrans,
+                ..Default::default()
+            }))
+        };
+        // One early retransmit on a long-lived connection taints nothing after it.
+        let mut run = straggler_run();
+        for (i, q) in run.reqs.iter_mut().enumerate() {
+            q.conn_id = (i % 4) as u64;
+            q.reused = i >= 4;
+            q.tcp = tcp(u64::from(q.conn_id == 0));
+        }
+        let codes =
+            |run: &Run| -> Vec<String> { derive(run, &[]).into_iter().map(|f| f.code).collect() };
+        assert!(!codes(&run).contains(&"tcp_retransmits".to_owned()));
+        // Losses that keep growing while requests run are a finding.
+        for (i, q) in run.reqs.iter_mut().enumerate() {
+            q.tcp = tcp(i as u64 / 20);
+        }
+        let f = derive(&run, &[]);
+        let t = f
+            .iter()
+            .find(|x| x.code == "tcp_retransmits")
+            .expect("finding");
+        assert!(
+            t.evidence.values["retransmit_requests_count"] >= 40.0,
+            "{t:#?}"
+        );
+        // Loopback remotes (a local lab) are never a network path.
+        for q in &mut run.reqs {
+            q.remote = Some("127.0.0.1:9000".parse().unwrap());
+        }
+        assert!(!codes(&run).contains(&"tcp_retransmits".to_owned()));
+    }
+
+    #[test]
+    fn stragglers_are_found_on_their_own_api_even_when_slower_writes_dominate_the_tail() {
+        use crate::analysis::outliers::test_req;
+        use crate::analysis::simulate::tests::op;
+        let mut run = straggler_run();
+        run.ops.clear();
+        run.reqs.clear();
+        for i in 0..2000u64 {
+            let t = i as i64 * 2_000;
+            let (api, lat) = if i % 2 == 0 {
+                // GETs: 5 ms, 1 in 25 waits 300 ms more for the first byte.
+                (
+                    "GetObject",
+                    if (i / 2) % 25 == 7 {
+                        305_000
+                    } else {
+                        5_000 + i % 7 * 100
+                    },
+                )
+            } else {
+                // Writes: spread from 5 ms to 400 ms, the slowest requests of the run.
+                ("PutObject", 5_000 + (i * 7919 % 1000) * 400)
+            };
+            run.ops.push(op(i + 1, t, lat));
+            let mut q = test_req(t, lat);
+            q.op_id = i + 1;
+            q.api = std::borrow::Cow::Borrowed(api);
+            run.reqs.push(q);
+        }
+        let f = derive(&run, &[]);
+        let t = f
+            .iter()
+            .find(|x| x.code == "tail_stragglers")
+            .expect("stragglers");
+        assert!(t.cause.starts_with("4.0% of GetObject"), "{}", t.cause);
+        let v = &t.evidence.values;
+        assert!(v["tail_cut_threshold_ms"] < 300.0, "{v:?}");
+        assert!(v["predicted_p99_ms"] < v["current_p99_ms"] / 3.0, "{v:?}");
+
+        // No stragglers anywhere: the rule says nothing rather than something empty.
+        for q in run.reqs.iter_mut().filter(|q| q.api == "GetObject") {
+            q.total_us = 5_000;
+            q.ttfb_us = 4_990;
+        }
+        let f = derive(&run, &[]);
+        assert!(f.iter().all(|x| x.code != "tail_stragglers"), "{f:#?}");
     }
 }

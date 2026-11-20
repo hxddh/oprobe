@@ -752,8 +752,8 @@ fn timeline_section(r: &Report) -> String {
         .map(|w| w[1] - w[0])
         .find(|d| *d > 0.0)
         .unwrap_or(1.0);
-    // Timeline points are stamped at the end of their second.
-    let starts: Vec<f64> = xs.iter().map(|x| (x - dt).max(0.0)).collect();
+    // Timeline points are stamped at the start of their interval (like heatmap columns).
+    let starts = xs;
     o += "<p class=\"sub\">One sample per second; hover a column for its values.</p>";
     o += &time_chart(
         "Throughput (operations per second)",

@@ -246,6 +246,7 @@ pub struct ApiCost {
     pub api: String,
     pub billing_class: BillingClass,
     /// Billed requests of this API per logical operation.
+    #[serde(rename = "requests_per_op_count", alias = "requests_per_op")]
     pub requests_per_op: f64,
     /// Monthly spend at the projected operation volume.
     pub monthly_usd: f64,

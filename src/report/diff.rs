@@ -183,6 +183,15 @@ fn changes_of<T: Serialize>(
     }
 }
 
+/// Whether the run measured an in-process `lab://` server (by URL, or as `oprobe demo` names it).
+fn is_lab(r: &Report) -> bool {
+    r.target.display.starts_with("lab://")
+        || r.target
+            .name
+            .as_deref()
+            .is_some_and(|n| n.starts_with("lab://"))
+}
+
 /// Settings that differ between two reports. The measurement window (duration, warmup,
 /// max_ops), the cleanup policy and the dataset's persistence do not change what is measured.
 pub fn config_changes(base: &Report, cand: &Report) -> Vec<ConfigChange> {
@@ -202,11 +211,20 @@ pub fn config_changes(base: &Report, cand: &Report) -> Vec<ConfigChange> {
         &mut out,
     );
     let target = |r: &Report| {
+        // A `lab://` target is identified by its scenario: its endpoint is the ephemeral port
+        // of an in-process server and differs on every run.
+        let (endpoint, options) = if is_lab(r) {
+            let mut o = r.target.options.clone();
+            o.remove("endpoint");
+            (None, o)
+        } else {
+            (r.target.endpoint.clone(), r.target.options.clone())
+        };
         serde_json::json!({
             "scheme": r.target.scheme,
             "display": crate::util::display_url(&r.target.display),
-            "endpoint": r.target.endpoint,
-            "options": r.target.options,
+            "endpoint": endpoint,
+            "options": options,
         })
     };
     changes_of(
@@ -646,7 +664,7 @@ impl DiffReport {
             } else {
                 badge("REGRESSION", "41")
             },
-            bold("oprobe diff"),
+            bold("oprobe compare"),
             dim("baseline "),
             self.baseline,
             dim("candidate"),
@@ -790,7 +808,7 @@ impl DiffReport {
         let mut x = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
         let _ = writeln!(
             x,
-            "<testsuite name=\"oprobe diff\" tests=\"{}\" failures=\"{failures}\" skipped=\"{skipped}\">",
+            "<testsuite name=\"oprobe compare\" tests=\"{}\" failures=\"{failures}\" skipped=\"{skipped}\">",
             self.checks.len()
         );
         for c in &self.checks {
@@ -950,6 +968,49 @@ mod tests {
             d.warnings.iter().any(|w| w.contains("host.cpus_count")),
             "{:?}",
             d.warnings
+        );
+    }
+
+    #[test]
+    fn lab_targets_compare_by_scenario_not_ephemeral_port() {
+        let mut b = report(&["stat"], 0, 1000);
+        b.target.scheme = "s3".into();
+        b.target.display = "lab://demo".into();
+        b.target.endpoint = Some("http://127.0.0.1:43373".into());
+        b.target
+            .options
+            .insert("endpoint".into(), "http://127.0.0.1:43373".into());
+        let mut c = b.clone();
+        c.target.endpoint = Some("http://127.0.0.1:39831".into());
+        c.target
+            .options
+            .insert("endpoint".into(), "http://127.0.0.1:39831".into());
+        let d = diff(&b, &c, &Thresholds::default());
+        assert!(d.config_changes.is_empty(), "{:?}", d.config_changes);
+        assert_eq!(status(&d, "same target"), Status::Pass);
+        // `oprobe demo` names its lab target.
+        let (mut b2, mut c2) = (b.clone(), c.clone());
+        for r in [&mut b2, &mut c2] {
+            r.target.display = "s3://demo".into();
+            r.target.name = Some("lab://demo".into());
+        }
+        assert!(
+            diff(&b2, &c2, &Thresholds::default())
+                .config_changes
+                .is_empty()
+        );
+        // A different scenario is still a different target.
+        c.target.display = "lab://throttle".into();
+        let d = diff(&b, &c, &Thresholds::default());
+        assert_eq!(status(&d, "same target"), Status::Fail);
+        // So is a different endpoint of a real target.
+        let (mut b3, mut c3) = (b.clone(), b.clone());
+        b3.target.display = "s3://bkt".into();
+        c3.target.display = "s3://bkt".into();
+        c3.target.endpoint = Some("http://127.0.0.1:1".into());
+        assert_eq!(
+            status(&diff(&b3, &c3, &Thresholds::default()), "same target"),
+            Status::Fail
         );
     }
 

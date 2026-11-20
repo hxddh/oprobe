@@ -61,6 +61,84 @@ fn checked_in_schemas_match_the_code() {
     );
 }
 
+/// Design §6: every numeric property of the report carries its unit in its name.
+#[test]
+fn report_schema_numeric_fields_carry_units() {
+    let schema = serde_json::to_value(schemars::schema_for!(oprobe::model::Report)).unwrap();
+    let defs = schema["$defs"].as_object().cloned().unwrap_or_default();
+    fn resolve<'a>(s: &'a Value, defs: &'a serde_json::Map<String, Value>) -> &'a Value {
+        match s.get("$ref").and_then(Value::as_str) {
+            Some(r) => resolve(&defs[r.rsplit('/').next().unwrap()], defs),
+            None => s,
+        }
+    }
+    fn numeric(s: &Value, defs: &serde_json::Map<String, Value>) -> bool {
+        let s = resolve(s, defs);
+        let types: Vec<&str> = match &s["type"] {
+            Value::String(t) => vec![t.as_str()],
+            Value::Array(a) => a.iter().filter_map(Value::as_str).collect(),
+            _ => vec![],
+        };
+        types.iter().any(|t| *t == "number" || *t == "integer")
+            || ["anyOf", "oneOf", "allOf"].iter().any(|k| {
+                s[*k]
+                    .as_array()
+                    .is_some_and(|a| a.iter().any(|x| numeric(x, defs)))
+            })
+            || (types.contains(&"array") && numeric(&s["items"], defs))
+    }
+    fn walk(
+        s: &Value,
+        path: &str,
+        defs: &serde_json::Map<String, Value>,
+        seen: &mut Vec<String>,
+        bad: &mut Vec<String>,
+    ) {
+        if let Some(r) = s.get("$ref").and_then(Value::as_str) {
+            let name = r.rsplit('/').next().unwrap().to_owned();
+            if seen.contains(&name) {
+                return;
+            }
+            seen.push(name.clone());
+            walk(&defs[&name], path, defs, seen, bad);
+            seen.pop();
+            return;
+        }
+        for k in ["anyOf", "oneOf", "allOf"] {
+            for x in s[k].as_array().into_iter().flatten() {
+                walk(x, path, defs, seen, bad);
+            }
+        }
+        if s["items"].is_object() {
+            walk(&s["items"], &format!("{path}[]"), defs, seen, bad);
+        }
+        if s["additionalProperties"].is_object() {
+            walk(
+                &s["additionalProperties"],
+                &format!("{path}.*"),
+                defs,
+                seen,
+                bad,
+            );
+        }
+        for (name, p) in s["properties"].as_object().into_iter().flatten() {
+            if numeric(p, defs) && !oprobe::model::has_unit(name) {
+                bad.push(format!("{path}.{name}"));
+            }
+            walk(p, &format!("{path}.{name}"), defs, seen, bad);
+        }
+    }
+    let mut bad = Vec::new();
+    walk(&schema, "", &defs, &mut Vec::new(), &mut bad);
+    bad.sort();
+    bad.dedup();
+    assert!(
+        bad.is_empty(),
+        "numeric report fields without a unit suffix ({:?}): {bad:#?}",
+        oprobe::model::UNIT_SUFFIXES
+    );
+}
+
 #[test]
 fn docs_list_every_finding_code() {
     let path = root().join("docs/agents.md");
@@ -258,6 +336,26 @@ fn json_only_agent_workflow_validates_against_the_schemas() {
     assert_eq!(code["code"], "throttling");
     let all = env.json(&["explain", "--list"], "explain", 0);
     assert!(all["codes"].as_array().unwrap().len() >= 15);
+    // Codes are snake_case as reports emit them; `-` spellings are accepted too.
+    for spelling in ["tail_stragglers", "tail-stragglers"] {
+        let c = env.json(&["explain", spelling], "explain", 0);
+        assert_eq!(c["code"], "tail_stragglers");
+    }
+    // capabilities.finding_codes is exactly the set the findings engine can emit.
+    let mut advertised: Vec<&str> = caps["finding_codes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["code"].as_str().unwrap())
+        .collect();
+    advertised.sort_unstable();
+    let mut emitted = oprobe::analysis::findings::CODES.to_vec();
+    emitted.sort_unstable();
+    assert_eq!(advertised, emitted);
+    for f in r2["report"]["findings"].as_array().into_iter().flatten() {
+        let c = f["code"].as_str().unwrap();
+        assert!(emitted.contains(&c), "report emits undocumented code {c}");
+    }
     let cmp = env.json(
         &[
             "compare",

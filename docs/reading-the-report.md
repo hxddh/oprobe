@@ -25,7 +25,8 @@ full report: oprobe runs show 20261120-084637-d873
 
 The badge is the verdict level: **HEALTHY** (ok), **REVIEW** (worth a look: informational findings, warnings,
 a partial run), **ATTENTION** (warning findings), **CRITICAL** (critical findings or a breached SLA). At most
-three findings are shown, most severe first; `oprobe explain RUNREF` narrates all of them.
+three findings are shown, most severe first; `oprobe explain RUNREF` narrates the top three with their
+evidence and documentation (`--top N` for more; the report lists every finding).
 
 ## The full text report
 
@@ -77,6 +78,10 @@ One file, no network: it can be attached to a ticket, opened offline, printed or
   second, one stepped sample per second; hover a column for every value.
 - **Latency heatmap** — operations by start time and latency bucket (log), darker = more operations.
   Horizontal bands above the bulk are stragglers; vertical stripes are stalls.
+
+Time axes count seconds from the start of the measurement window, and every bucket is stamped with its
+**start**: `timeline[].t_s = 3` is the interval 3–4 s, like `heatmap.t_buckets_s`, `oprobe analyze --by
+second` and the `interval` events.
 - **Operations** — the full verb and API tables, bytes and amplification.
 - **Slowest operations** — up to five waterfalls: each request of the operation on a shared millisecond
   axis, coloured by stage (queue, connect, send, time to first byte, body; grey for retry waits and other

@@ -7,6 +7,7 @@ use serde::Serialize;
 
 use super::catalog::{self, FindingDoc};
 use crate::analysis::diagnosis::{Bottleneck, Severity};
+use crate::analysis::findings::Command;
 use crate::analysis::outliers::{self, Attribution, Selection};
 use crate::model::{Evidence, Run, VerdictLevel, Verification};
 use crate::output::CommandOutput;
@@ -240,12 +241,16 @@ pub fn explain_run(run: &Run, top: usize) -> ExplainRun {
         if let Some(c) = f.verification.as_ref().and_then(|v| v.command.clone()) {
             next.push(c);
         }
-        let cmd = match f.code.replace('_', "-").as_str() {
-            "throttling" | "sla-p99" | "server-latency" | "tail-latency" => {
-                Some(format!("oprobe tune {target} --dry-run"))
+        let cmd = match f.code.as_str() {
+            "throttling" | "sla_p99" | "server_latency" | "tail_latency" | "tail_stragglers" => {
+                Some(
+                    Command::for_target("tune", &r.target)
+                        .set("--dry-run", None)
+                        .to_string(),
+                )
             }
-            "errors" | "connect" | "slow-tls" | "connection-churn" => {
-                Some(format!("oprobe doctor {target}"))
+            "errors" | "cold_connections" | "high_rtt" | "tcp_retransmits" => {
+                Some(Command::for_target("doctor", &r.target).to_string())
             }
             _ => None,
         };
