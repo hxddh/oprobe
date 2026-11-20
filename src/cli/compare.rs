@@ -24,6 +24,9 @@ impl CommandOutput for Comparison {
     fn markdown(&self) -> String {
         self.render_markdown()
     }
+    fn html(&self) -> Option<String> {
+        Some(crate::report::html::render_compare(&self.gate))
+    }
     fn exit_code(&self) -> u8 {
         if self.passed {
             0

@@ -213,6 +213,7 @@ pub fn ui_entry(cli: &Cli) -> Option<ExitCode> {
                 anonymous: a.anonymous,
                 monochrome,
                 open: a.open.clone(),
+                ..Default::default()
             };
         }
         crate::ui::set_launch(launch);
