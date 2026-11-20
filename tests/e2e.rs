@@ -490,6 +490,56 @@ async fn tuner_finds_throttling_ceiling() {
         "winner must be clean"
     );
     assert!(!out.summary.trials[out.summary.baseline_trial].feasible);
+    // One consistent story: the only ceiling the notes state is the summary's ceiling, and the
+    // safety margin is explained with numbers.
+    let notes = out.summary.notes.join("\n");
+    let ceiling_notes: Vec<_> = out
+        .summary
+        .notes
+        .iter()
+        .filter(|n| n.contains("throttling ceiling: concurrency"))
+        .collect();
+    assert_eq!(ceiling_notes.len(), 1, "{notes}");
+    assert!(
+        ceiling_notes[0].starts_with(&format!("throttling ceiling: concurrency {ceiling} ")),
+        "{notes}"
+    );
+    assert!(!notes.contains("throttling starts at"), "{notes}");
+    let safe = (ceiling as f64 * 0.8).floor().max(1.0) as usize;
+    assert!(
+        notes.contains(&format!(
+            "capped at {safe} = 80% of the throttling ceiling {ceiling}"
+        )),
+        "{notes}"
+    );
+}
+
+/// `oprobe tune` prints its whole report (trial table included) on stdout, only progress on
+/// stderr, and the emitted profile has no empty `scheme`.
+#[test]
+fn tune_report_goes_to_stdout_and_emits_a_clean_profile() {
+    let dir = tempfile::tempdir().unwrap();
+    let prof = dir.path().join("tuned.toml");
+    let out = Command::new(env!("CARGO_BIN_EXE_oprobe"))
+        .args(["tune", "memory://", "--preset", "small-files"])
+        .args(["--objects", "4", "--object-size", "16KiB"])
+        .args(["--trial-duration", "150ms", "--trial-warmup", "0s"])
+        .args(["--max-trials", "3", "--color", "never", "--emit-profile"])
+        .arg(&prof)
+        .output()
+        .unwrap();
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(out.status.success(), "{stderr}");
+    assert!(stdout.contains("stage"), "trial table on stdout: {stdout}");
+    assert!(stdout.contains("baseline"), "{stdout}");
+    assert!(stdout.contains("TUNED"), "{stdout}");
+    assert!(!stderr.contains("baseline"), "no report content on stderr: {stderr}");
+    let toml = std::fs::read_to_string(&prof).unwrap();
+    assert!(!toml.contains("scheme"), "{toml}");
+    Profile::load(&prof).unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]

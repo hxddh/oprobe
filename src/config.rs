@@ -33,7 +33,8 @@ pub struct Profile {
 pub struct TargetSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
-    #[serde(default)]
+    /// OpenDAL scheme; derived from `url` when empty (and then not written back).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub scheme: String,
     /// OpenDAL service options. Values may reference environment variables as `${NAME}`.
     #[serde(default)]
@@ -1191,6 +1192,7 @@ mod tests {
             !toml.contains("bucket"),
             "URL-derived options are not repeated: {toml}"
         );
+        assert!(!toml.contains("scheme"), "derived scheme is not written: {toml}");
         let back: Profile = toml::from_str(&toml).unwrap();
         back.validate().unwrap();
         let n = back.target.normalized().unwrap();

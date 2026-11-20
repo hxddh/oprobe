@@ -755,8 +755,19 @@ async fn cmd_tune(a: TuneArgs) -> Result<ExitCode> {
         profile.workload.rate,
     )?;
     let session = Session::open(profile, cancel.clone(), msg).await?;
-    if !quiet {
-        eprintln!(
+    // The trial table is report content: stdout with the text report (even with `-q`); with
+    // `--format json|markdown` stdout holds only that document, so the table is progress on
+    // stderr. Progress messages always go to stderr.
+    let table_on_stdout = a.output.format == Format::Text;
+    let table_line = move |line: String| {
+        if table_on_stdout {
+            println!("{line}");
+        } else if !quiet {
+            eprintln!("{line}");
+        }
+    };
+    {
+        table_line(format!(
             "{} {} {}",
             bold("oprobe tune"),
             session.profile.target.display(),
@@ -767,21 +778,19 @@ async fn cmd_tune(a: TuneArgs) -> Result<ExitCode> {
                 opts.max_trials,
                 a.trial_duration
             ))
-        );
-        eprintln!(
-            "{}",
-            dim(
-                "   #  stage            conc  io  chunk   gap     cache  http     ops/s    MiB/s     p99       result"
-            )
-        );
+        ));
+        table_line(dim(
+            "   #  stage            conc  io  chunk   gap     cache  http     ops/s    MiB/s     p99       result",
+        ));
     }
     let on_event: Arc<dyn Fn(TuneEvent) + Send + Sync> = Arc::new(move |ev| {
-        if quiet {
-            return;
-        }
         match ev {
             TuneEvent::Started { .. } => {}
-            TuneEvent::Message(m) => eprintln!("   {}", dim(&m)),
+            TuneEvent::Message(m) => {
+                if !quiet {
+                    eprintln!("   {}", dim(&m));
+                }
+            }
             TuneEvent::Finished(t) => {
                 let k = &t.knobs;
                 let verdict = if t.throttled() {
@@ -791,7 +800,7 @@ async fn cmd_tune(a: TuneArgs) -> Result<ExitCode> {
                 } else {
                     yellow(&t.note)
                 };
-                eprintln!(
+                table_line(format!(
                     "  {:>2}  {:<15} {:>5} {:>3}  {:<7} {:<7} {:<6} {:<6} {:>8.1} {:>8.1} {:>9}  {verdict}",
                     t.id,
                     t.stage,
@@ -804,7 +813,7 @@ async fn cmd_tune(a: TuneArgs) -> Result<ExitCode> {
                     t.ops_per_s,
                     t.mib_per_s,
                     crate::util::fmt_ms(t.p99_ms),
-                );
+                ));
             }
         }
     });
@@ -867,9 +876,6 @@ async fn cmd_tune(a: TuneArgs) -> Result<ExitCode> {
                     outcome.summary.objective
                 ))
             );
-            if let Some(c) = s.throttle_ceiling {
-                println!("  {} throttling observed at concurrency {c}", yellow("▲"));
-            }
             for n in &s.notes {
                 println!("  {} {n}", dim("·"));
             }

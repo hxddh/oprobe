@@ -333,6 +333,80 @@ impl Tuner<'_> {
     }
 }
 
+/// Highest concurrency the tuner recommends below a throttling ceiling (80 % of it).
+pub fn safe_concurrency(ceiling: usize) -> usize {
+    ((ceiling as f64) * 0.8).floor().max(1.0) as usize
+}
+
+/// "throttling ceiling: concurrency 48 was throttled (… 429/503 responses, trial #9); 40 is the
+/// highest clean concurrency measured (first seen at 64 on the doubling ladder, narrowed by
+/// bisection)".
+fn ceiling_note(trials: &[Trial], base: &Knobs, ce: usize, first: Option<usize>) -> String {
+    let at = |c: usize| {
+        let k = Knobs {
+            concurrency: c,
+            ..base.clone()
+        };
+        trials
+            .iter()
+            .rev()
+            .find(|t| t.stage != "confirm" && t.knobs == k)
+    };
+    let mut s = format!("throttling ceiling: concurrency {ce}");
+    if let Some(t) = at(ce) {
+        s += &format!(
+            " was throttled ({} responses 429/503, trial #{})",
+            t.throttled_responses, t.id
+        );
+    }
+    let clean = trials
+        .iter()
+        .filter(|t| t.stage != "confirm" && !t.throttled() && t.knobs.concurrency < ce)
+        .map(|t| t.knobs.concurrency)
+        .max();
+    if let Some(c) = clean {
+        s += &format!("; {c} is the highest clean concurrency measured");
+    }
+    if let Some(f) = first.filter(|&f| f != ce) {
+        s += &format!(" (first seen at {f} on the doubling ladder, narrowed down by bisection)");
+    }
+    s
+}
+
+/// Explain the safety margin with the numbers that decided it.
+fn safety_note(t: &Tuner<'_>, winner: usize, ce: usize) -> String {
+    let safe = safe_concurrency(ce);
+    let w = &t.trials[winner];
+    let mut s = format!(
+        "safety margin: concurrency is capped at {safe} = 80% of the throttling ceiling {ce}, leaving {} slots of headroom for production variance",
+        ce - safe
+    );
+    // The best clean trial the cap excluded, if it measured better than the winner.
+    let excluded = (0..t.trials.len())
+        .filter(|&i| {
+            let x = &t.trials[i];
+            x.stage != "confirm" && x.feasible && x.knobs.concurrency > safe
+        })
+        .max_by(|&a, &b| t.metric(&t.trials[a]).total_cmp(&t.metric(&t.trials[b])));
+    if let Some(i) = excluded {
+        let x = &t.trials[i];
+        let (mx, mw) = (t.metric(x), t.metric(w));
+        if mw > 0.0 && mx > mw {
+            s += &format!(
+                "; concurrency {} (trial #{}) was clean and measured {:+.0}% {} vs concurrency {} (trial #{}), but sits only {:.0}% below the ceiling, so it was not recommended",
+                x.knobs.concurrency,
+                x.id,
+                (mx / mw - 1.0) * 100.0,
+                if t.use_bytes { "MiB/s" } else { "ops/s" },
+                w.knobs.concurrency,
+                w.id,
+                (1.0 - x.knobs.concurrency as f64 / ce as f64) * 100.0
+            );
+        }
+    }
+    s
+}
+
 /// Chunk candidates as OpenDAL would write them on a service with `cap`: each clamped to the
 /// part-size limits, duplicates removed (order kept). Returns `(requested, effective)`.
 fn write_chunk_candidates(
@@ -422,10 +496,6 @@ pub async fn tune(
         let tr = t.trials[id].clone();
         if tr.throttled() {
             ceiling = Some(c);
-            notes.push(format!(
-                "throttling starts at concurrency {c} ({} responses 429/503)",
-                tr.throttled_responses
-            ));
             break;
         }
         last_clean = Some(c);
@@ -448,6 +518,7 @@ pub async fn tune(
             }
         }
     }
+    let first_throttled = ceiling;
     // Binary refinement just below the throttling ceiling.
     if let (Some(hi0), Some(lo0)) = (ceiling, last_clean) {
         let (mut lo, mut hi) = (lo0, hi0);
@@ -474,9 +545,13 @@ pub async fn tune(
         }
         ceiling = Some(hi);
     }
+    // One statement about the ceiling, consistent with `throttle_ceiling` in the summary.
+    if let Some(ce) = ceiling {
+        notes.push(ceiling_note(&t.trials, &base_knobs, ce, first_throttled));
+    }
     let mut current = t.best().unwrap_or(baseline);
     if let Some(ce) = ceiling {
-        let safe = ((ce as f64) * 0.8).floor().max(1.0) as usize;
+        let safe = safe_concurrency(ce);
         t.concurrency_cap = Some(safe);
         if t.trials[current].knobs.concurrency > safe {
             if t.budget_left() {
@@ -485,9 +560,6 @@ pub async fn tune(
                     ..t.trials[current].knobs.clone()
                 };
                 current = t.trial("safety-margin", &k, None).await?;
-                notes.push(format!(
-                    "concurrency capped at {safe} (80% of the {ce} throttling ceiling) for headroom"
-                ));
             } else if let Some(b) = t.best() {
                 current = b;
             }
@@ -683,6 +755,9 @@ pub async fn tune(
         );
         (t.on_event)(TuneEvent::Message(msg.clone()));
         notes.insert(0, msg);
+    }
+    if let Some(ce) = ceiling {
+        notes.push(safety_note(&t, winner_idx, ce));
     }
     let winner = t.trials[winner_idx].knobs.clone();
     let confirm_opts = RunOptions {

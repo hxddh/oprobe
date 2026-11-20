@@ -20,7 +20,10 @@ oprobe tune s3://bucket/oprobe --preset parquet --p99-ms 250 \
    `Retry-After`, capped at 60 s; `Retry-After` is honored even with `--cooldown 0`) so the next
    trial is not measured against a depleted rate limiter. Ctrl-C interrupts the pause.
 4. **Safety margin** — the recommended concurrency is capped at 80 % of the ceiling to leave
-   headroom for production variance.
+   headroom for production variance (a trial at the cap is run when the best clean trial lies
+   above it). The notes state the ceiling once — the throttled level the bisection ended on and
+   the highest clean level — and explain the margin with numbers, e.g. "concurrency 12 was clean
+   and measured +21 % but sits only 8 % below the ceiling, so it was not recommended".
 5. **Workload-specific knobs** — coordinate descent over only the knobs that matter for the mix:
    `chunk_size` and `io_concurrency` for multipart writes and large reads, `range_gap` for vectored
    (Parquet) reads, the read cache for skewed access (or uniform access over your real objects with
@@ -62,6 +65,11 @@ then the lowest error rate). The objective throughput counts successful operatio
   (`RetryLayer` with identical parameters); measured layers the binding cannot express (timeouts,
   tail cut, HTTP limit) are listed in the header instead of being approximated.
 * `--json` — the full report of the confirmation run plus every trial (`tune.trials`).
+
+With the default text format, everything that is part of the result — the trial table, the
+recommendation and the confirmation report — goes to stdout; stderr only carries progress
+(dataset upload, cool-down pauses). With `--format json|markdown`, stdout holds only that
+document and the trial table is shown on stderr as progress.
 
 ## Budget
 

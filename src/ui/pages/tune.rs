@@ -77,7 +77,10 @@ fn result() -> impl IntoElement {
         );
         if let Some(ce) = sm.throttle_ceiling {
             c = c.child(
-                text(format!("Throttling starts at concurrency {ce}."))
+                text(format!(
+                    "Throttling ceiling: concurrency {ce} (recommendations stay at or below {}).",
+                    crate::tune::safe_concurrency(ce)
+                ))
                     .text_sm()
                     .text_color(token("warn")),
             );
