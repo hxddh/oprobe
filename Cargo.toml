@@ -145,8 +145,13 @@ codegen-units = 4
 strip = "symbols"
 
 # Pure-Rust crypto (TLS, CRC32C) is far too slow unoptimized; keep dependencies fast in dev/test.
+# Line tables keep backtraces useful at a fraction of full debug info's disk and link time.
+[profile.dev]
+debug = "line-tables-only"
+
 [profile.dev.package."*"]
 opt-level = 2
+debug = false
 
 [target."cfg(windows)".dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_ProcessStatus", "Win32_System_Console"] }
