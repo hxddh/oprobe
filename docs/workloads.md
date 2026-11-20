@@ -1,4 +1,24 @@
-# Workloads & profiles
+# Workloads & presets
+
+## Presets
+
+`--preset NAME` picks a realistic workload; the dataset is generated under the run prefix and removed at the
+end (or use your own objects read-only with `--existing PREFIX`).
+
+| Preset | Models | Dataset | Operation mix |
+|---|---|---|---|
+| `parquet` (default) | lakehouse scans (Spark, DuckDB, DataFusion) | 8 × 16 MiB | stat + 64 KiB footer read + 4 vectored 512 KiB column-chunk ranges |
+| `checkpoint` | AI/ML checkpoints | 2 × 32 MiB | 80 % 32 MiB multipart writes, 20 % full restores |
+| `small-files` | many small objects (logs, thumbnails, KV blobs) | 256 × 64 KiB | 60 % whole-object GET, 30 % 64 KiB PUT, 10 % HEAD |
+| `metadata` | catalog and listing storms | 512 × 4 KiB in 16 partitions | 40 % LIST, 60 % HEAD |
+| `mixed` | general purpose | 32 × 4 MiB | 60 % 1 MiB range reads, 10 % full reads, 20 % 1 MiB writes, 10 % stat |
+
+Shape any preset from the command line: `--objects`, `--object-size`, `--access uniform|zipf:1.1|hotset:0.2/0.8`,
+`-d/--duration`, `--warmup`, `--max-ops`, `--rate` (open loop), `-c/--concurrency`, `--io-concurrency`,
+`--chunk-size`, `--range-gap`, `--http h1|h2`, `--cache SIZE`, `--retries`, `--tail-cut`. `--dry-run` prints
+what a combination will cost before it runs.
+
+## Profiles
 
 A profile is a TOML file describing **what** to benchmark (target), **how** (workload) and **with
 which client settings** (knobs), plus the SLA used by `tune` and the volume used to project costs.

@@ -31,7 +31,7 @@ A price table is applied only when it is known to be the right one:
 
 Everything else — `memory://`, `fs://`, localhost, private addresses, MinIO, Ceph or any unknown
 endpoint — gets no projection: the report's `cost.applicable` is `false` with a
-`not_applicable_reason`, the terminal report omits the COST section, `oprobe diff` skips the cost
+`not_applicable_reason`, the terminal report omits the COST section, `oprobe compare` skips the cost
 check, and `oprobe tune --objective cost` refuses to run. The measured per-operation usage
 (`cost.per_op`) is still reported.
 

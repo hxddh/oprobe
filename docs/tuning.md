@@ -68,7 +68,7 @@ then the lowest error rate). The objective throughput counts successful operatio
 
 With the default text format, everything that is part of the result — the trial table, the
 recommendation and the confirmation report — goes to stdout; stderr only carries progress
-(dataset upload, cool-down pauses). With `--format json|markdown`, stdout holds only that
+(dataset upload, cool-down pauses). With `-o json|md`, stdout holds only that
 document and the trial table is shown on stderr as progress.
 
 ## Budget

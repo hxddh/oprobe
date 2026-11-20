@@ -184,4 +184,28 @@ storage can deliver.
 
 Generated dataset objects are deterministic and their CRC32C is known; whole-object reads are
 verified during the run. A sample of written objects is read back after the run with an untraced
-client. Any mismatch is a critical finding and fails `oprobe diff`.
+client. Any mismatch is a critical finding and fails `oprobe compare`.
+
+## Trace rows
+
+Besides the aggregates, every run file keeps one row per measured operation (`OpRow`: verb, key, start,
+latency, bytes, attempts, the five-part breakdown, error) and one per backend request (`ReqRow`: start,
+operation, attempt, storage API, method, status, protocol, connection id and reuse, remote address, every stage
+in µs, bytes up/down, request id, Retry-After, error). Up to `max_requests` request rows are kept (default
+1 000 000; `OPROBE_MAX_REQUESTS` or `[defaults] max_requests`), reservoir-sampled beyond that: the report says
+`sampled: true` with the kept and seen counts, and every aggregate stays exact. The heatmap and the per-remote
+table are computed from the rows. `oprobe runs export` writes them as CSV, HAR, NDJSON or OTLP; the HTML report
+embeds up to 5 000 of them.
+
+## Only with `--microscope`
+
+These values need oprobe's instrumented pool; with OpenDAL's own client (the default) they are 0, empty or
+folded into another stage:
+
+| Field | With the default client |
+|---|---|
+| `bytes.wire_rx_bytes`, `bytes.wire_tx_bytes` | 0 |
+| `connections.cipher`, `network.tls.cipher` | empty |
+| queue time waiting for a pooled HTTP/1.1 connection | part of TTFB |
+| proxy CONNECT timed separately from TCP | reported together with TCP |
+| HTTP/2 negotiated by ALPN | HTTP/1.1 unless `--http h2` |
