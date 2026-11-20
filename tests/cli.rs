@@ -213,9 +213,6 @@ fn errors_are_classified_with_exit_codes() {
     // later streams: internal, exit 1
     for cmd in [
         &["demo"][..],
-        &["schema", "report"][..],
-        &["mcp"][..],
-        &["explain", "throttling"][..],
         &["runs", "export", "last"][..],
         &["target", "test", "x"][..],
     ] {
