@@ -325,6 +325,10 @@ fn agent_workflow_over_stdio() {
         }),
     );
     assert!(cmp["passed"].is_boolean());
+    // The CLI's comparison (significance included), not the raw report diff.
+    assert_eq!(cmp["passed"], cmp["gate"]["passed"], "{cmp:#}");
+    assert!(cmp["stats"].is_array(), "{cmp:#}");
+    assert_eq!(cmp["candidate"]["representative"], id2.as_str());
     let list = m.tool("list_runs", json!({"limit": 5}));
     assert_eq!(list["total_count"], 2);
     assert_eq!(list["started"].as_array().unwrap().len(), 2);

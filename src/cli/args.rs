@@ -925,6 +925,10 @@ pub struct McpArgs {
     /// Serve MCP over Streamable HTTP on this address (e.g. 127.0.0.1:8765) instead of stdio
     #[arg(long, value_name = "ADDR")]
     pub http: Option<String>,
+    /// Allow --http on a non-loopback address (anyone who can reach it can use the tools and
+    /// the configured credentials; there is no authentication)
+    #[arg(long, requires = "http")]
+    pub http_allow_remote: bool,
     /// Enable tools that write test data (runs that upload a dataset, tune, cleanup)
     #[arg(long)]
     pub allow_write: bool,
