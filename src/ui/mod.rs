@@ -44,6 +44,11 @@ pub fn run_tui() -> std::io::Result<()> {
     term::run()
 }
 
+#[cfg(feature = "gui")]
+fn exit_code(code: impl Into<std::process::ExitCode>) -> std::process::ExitCode {
+    code.into()
+}
+
 /// Run the app in a native window (`oprobe gui`). Blocks the calling (main) thread and returns
 /// the platform's exit code.
 #[cfg(feature = "gui")]
@@ -57,7 +62,8 @@ pub fn run_gui() -> std::process::ExitCode {
     // The same UI sets as the terminal host (`term::run`): all of `nsh/base` (plots included)
     // and oprobe's own components.
     platform::set_ui_sets(ui_sets());
-    let code: std::process::ExitCode = platform::run_app(
+    // `run_app` returns `ExitCode` on macOS / Windows and `glib::ExitCode` on Linux.
+    let code = exit_code(platform::run_app(
         platform::AppSource::Rust(platform::Root::of::<App>()),
         platform::AppOptions {
             title: "oprobe".to_owned(),
@@ -66,8 +72,7 @@ pub fn run_gui() -> std::process::ExitCode {
             size: (1280, 860),
             ..Default::default()
         },
-    )
-    .into();
+    ));
     // The window is gone; a job still running (its window closed mid-run) is stopped and its
     // test data removed before the process ends. (The quit listeners in `App` do the same
     // where the platform ends the process itself.)
