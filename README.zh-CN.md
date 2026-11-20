@@ -75,8 +75,9 @@ oprobe run --profile tuned.toml --json candidate.json
 oprobe diff baseline.json candidate.json --junit oprobe.xml --markdown oprobe.md
 ```
 
-所有测试数据写入唯一的 `oprobe-run-<时间戳>-<id>/` 前缀，运行结束（包括报错与 Ctrl-C）后自动删除并
-重新列举校验为空；被强制终止的运行可用 `oprobe cleanup` 清扫。
+所有测试数据写入唯一的 `oprobe-run-<时间戳>-<id>/` 前缀，运行结束（包括报错、Ctrl-C 以及运行中退出工作台）后
+自动删除并重新列举校验为空；被 Ctrl-C 中断的 `oprobe run` / `oprobe tune` 会输出部分结果并以退出码 130 结束；
+被强制终止的运行可用 `oprobe cleanup` 清扫。
 
 ## 命令一览
 

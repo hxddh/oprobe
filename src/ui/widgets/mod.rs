@@ -128,19 +128,33 @@ pub fn btn_with(
     disabled: bool,
     on_press: impl Fn() + 'static,
 ) -> impl IntoElement {
-    let (bg, fg) = match kind {
-        Kind::Primary => (
-            (move || theme().primary) as fn() -> AdaptiveColor,
-            (move || theme().primary_foreground) as fn() -> AdaptiveColor,
-        ),
-        Kind::Secondary => (
-            (move || theme().secondary) as fn() -> AdaptiveColor,
-            (move || theme().secondary_foreground) as fn() -> AdaptiveColor,
-        ),
-        Kind::Danger => (
-            (move || theme().destructive) as fn() -> AdaptiveColor,
-            (move || theme().primary_foreground) as fn() -> AdaptiveColor,
-        ),
+    styled_button(label, move || kind, disabled, on_press)
+}
+
+/// The app's button with a kind that follows state (Run ⇄ Stop keeps one element, and so
+/// keyboard focus).
+pub fn btn_reactive(
+    label: impl IntoReactive<SharedString>,
+    kind: impl Fn() -> Kind + Copy + 'static,
+    on_press: impl Fn() + 'static,
+) -> impl IntoElement {
+    styled_button(label, kind, false, on_press)
+}
+
+fn styled_button(
+    label: impl IntoReactive<SharedString>,
+    kind: impl Fn() -> Kind + Copy + 'static,
+    disabled: bool,
+    on_press: impl Fn() + 'static,
+) -> impl IntoElement {
+    let bg = move || match kind() {
+        Kind::Primary => theme().primary,
+        Kind::Secondary => theme().secondary,
+        Kind::Danger => theme().destructive,
+    };
+    let fg = move || match kind() {
+        Kind::Primary | Kind::Danger => theme().primary_foreground,
+        Kind::Secondary => theme().secondary_foreground,
     };
     button()
         .on_press(on_press)
@@ -165,11 +179,14 @@ pub fn btn_with(
         )
 }
 
-/// A labelled text field bound to a signal.
+/// A labelled text field bound to a signal. Screen readers announce `label` (the visible label
+/// is a separate text). Placeholders are examples ("e.g. …"), never values: in a terminal they
+/// would otherwise read as filled in.
 pub fn field(label: &'static str, placeholder: &'static str, value: Signal<String>) -> View {
     view().gap_1().min_w(px(0.0)).child(muted(label)).child(
         input()
             .test_id(label)
+            .label(label)
             .value(move || value.get())
             .on_change(move |t: &str| value.set(t.to_owned()))
             .placeholder(placeholder)

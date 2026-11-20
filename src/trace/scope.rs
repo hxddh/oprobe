@@ -9,6 +9,7 @@ use std::time::Instant;
 use opendal_core::raw::BoxedStaticFuture;
 use opendal_core::{Execute, Executor};
 
+use super::Recorder;
 use super::model::RequestRecord;
 
 tokio::task_local! {
@@ -31,6 +32,8 @@ pub struct OpScopeData {
     pub retries: u64,
     pub retry_backoff_us: u64,
     pub throttled: bool,
+    /// Set by [`OpScope::take`]: the operation is complete and its data handed over.
+    pub closed: bool,
 }
 
 /// Collects everything that happened underneath one logical operation.
@@ -44,6 +47,9 @@ pub struct OpScope {
     /// Await-tree registry for capturing call stacks of sub-tasks spawned by OpenDAL.
     tree: Mutex<Option<await_tree::Registry>>,
     subtasks: AtomicU64,
+    /// Where requests that finish after the operation completed go (OpenDAL background tasks
+    /// still running, response bodies dropped late), so they are counted, not lost.
+    late: Option<Arc<Recorder>>,
 }
 
 /// Await-tree key of a sub-task spawned on behalf of operation `.0`.
@@ -52,13 +58,21 @@ pub struct SubTaskKey(pub u64, pub u64);
 
 impl OpScope {
     pub fn new(measured: bool) -> Arc<Self> {
+        Self::new_at(measured, Instant::now(), None)
+    }
+
+    /// A scope whose operation started at `started` (in open-loop runs, the intended start, so
+    /// request offsets and the operation's latency share one origin). Requests recorded after
+    /// the operation completed go to `late`.
+    pub fn new_at(measured: bool, started: Instant, late: Option<Arc<Recorder>>) -> Arc<Self> {
         Arc::new(Self {
             id: NEXT_OP_ID.fetch_add(1, Ordering::Relaxed),
-            started: Instant::now(),
+            started,
             measured,
             data: Mutex::new(OpScopeData::default()),
             tree: Mutex::new(None),
             subtasks: AtomicU64::new(0),
+            late,
         })
     }
 
@@ -81,7 +95,10 @@ impl OpScope {
     }
 
     pub fn push_request(&self, rec: RequestRecord) {
-        self.with(|d| {
+        let late = self.with(|d| {
+            if d.closed {
+                return Some(rec);
+            }
             if rec.is_throttle() {
                 d.throttled = true;
             }
@@ -90,11 +107,20 @@ impl OpScope {
             } else {
                 d.dropped_requests += 1;
             }
+            None
         });
+        if let (Some(rec), Some(r), true) = (late, &self.late, self.measured) {
+            r.record_unscoped_request(&rec);
+        }
     }
 
+    /// Hand over everything recorded and close the scope (later requests go to `late`).
     pub fn take(&self) -> OpScopeData {
-        self.with(std::mem::take)
+        self.with(|d| {
+            let out = std::mem::take(d);
+            d.closed = true;
+            out
+        })
     }
 }
 

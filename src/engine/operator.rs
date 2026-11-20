@@ -134,10 +134,10 @@ pub fn measured_operator(
                 .with_max_times(knobs.retries)
                 .with_notify(|ev: opendal::layers::RetryEvent<'_>| {
                     if let Some(s) = OpScope::current() {
-                        let throttled = ev.err.kind() == opendal::ErrorKind::RateLimited || {
-                            let m = ev.err.to_string();
-                            m.contains("429") || m.contains("503") || m.contains("SlowDown")
-                        };
+                        // 429/503 responses mark the scope throttled when they are recorded
+                        // (`OpScope::push_request`); OpenDAL's kind covers the rest. The error
+                        // text is never matched: object names and ports contain digits.
+                        let throttled = ev.err.kind() == opendal::ErrorKind::RateLimited;
                         s.with(|d| {
                             d.retries += 1;
                             d.retry_backoff_us += ev.retry_after.as_micros() as u64;
@@ -159,6 +159,51 @@ pub fn measured_operator(
     }
     recorder.set_cache_enabled(knobs.cache);
     Ok(op)
+}
+
+/// Fail fast when the endpoint cannot be reached at all (connection refused, unknown host):
+/// the admin operator would otherwise retry every dataset upload for minutes. One `stat` on a
+/// key that does not exist, without retries; any HTTP answer (404, 403, ...) passes.
+pub async fn check_reachable(base: &Operator, target: &TargetSpec) -> Result<()> {
+    let probe = base
+        .clone()
+        .layer(trace_layer(target, &Knobs::default(), None)?)
+        .layer(TimeoutLayer::new().with_timeout(Duration::from_secs(20)));
+    let Err(e) = probe.stat(".oprobe-reachability-check").await else {
+        return Ok(());
+    };
+    let mut chain = e.to_string();
+    let mut src = std::error::Error::source(&e);
+    while let Some(s) = src {
+        chain.push_str(": ");
+        chain.push_str(&s.to_string());
+        src = s.source();
+    }
+    let l = chain.to_ascii_lowercase();
+    // Wording differs by OS: "Connection refused (os error 111)" on Linux, "(os error 61)" on
+    // macOS, "No connection could be made because the target machine actively refused it.
+    // (os error 10061)" on Windows.
+    let unreachable = [
+        "connection refused",
+        "actively refused",
+        "os error 10061",
+        "connect: ",
+        "dns error",
+        "failed to lookup address",
+        "name or service not known",
+        "no addresses to connect to",
+        "nodename nor servname",
+    ]
+    .iter()
+    .any(|n| l.contains(n));
+    if unreachable {
+        anyhow::bail!(
+            "cannot reach {} ({}): {chain}",
+            target.endpoint().unwrap_or_else(|| target.display()),
+            target.display()
+        );
+    }
+    Ok(())
 }
 
 /// Untraced operator for dataset seeding, verification and cleanup.

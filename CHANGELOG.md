@@ -4,6 +4,63 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## v2.0.1 — 2026-11-20
+
+Fixes from a full review of 2.0.0. Some numbers change: see *Measurement changes*.
+
+### Fixed
+
+- **macOS: `oprobe.app` could not be opened.** Opened from Finder, the app runs `oprobe` without arguments, which
+  was rejected as a usage error before the window opened. A bare `oprobe` now opens the workbench; CI and the release
+  build open the app through LaunchServices and fail unless it stays up. The install docs describe the macOS 15
+  Gatekeeper flow for unsigned apps (*Privacy & Security → Open Anyway*).
+- **Secrets**: customer-supplied encryption keys (`server_side_encryption_customer_key`, `encryption_key`, …) and
+  credentials embedded in URLs (`webdav://user:pass@host`) were written to reports, diff summaries and generated
+  profiles. They are now redacted/stripped; `webdav://user:pass@…` maps to `username`/`password` options.
+- **Generated profiles** (`tune --emit-profile`) rewrote `${AWS_ACCESS_KEY_ID}` as `${ACCESS_KEY_ID}` and failed to
+  load; existing `${VAR}` references are kept, and defaulted or URL-derived options are no longer written.
+- **Test data left behind** when the dataset upload failed or was stopped, or when the workbench was quit mid-run:
+  uploads observe Stop/Ctrl-C and clean up; quitting the workbench stops the run and cleans up first (up to 30 s).
+  An unreachable endpoint (connection refused, DNS) fails in seconds instead of retrying for a minute.
+- **False throttling**: "429"/"503" (and "401"/"403" for hints) were matched anywhere in error text, including object
+  names such as `obj-00429.bin`; classification now uses the error kind and the HTTP status. New hint for missing
+  credentials.
+- **Diff gate**: an operation missing from the candidate now fails; throttling is gated on its rate, not only when the
+  baseline had none; new open-loop *missed %* check; warnings for closed- vs open-loop, different durations and
+  interrupted runs.
+- **Tuner**: never recommends a trial that failed the SLA when one passed (and says so when none did); throughput
+  counts successful operations only; `Retry-After` is honoured per trial (capped at 60 s, also with `--cooldown 0`)
+  and cooldowns can be stopped; `--max-trials` is respected; the cache trial no longer wins just because the test
+  dataset fits in the cache.
+- **Open-loop writes** could hit the same key concurrently and report false corruption.
+- **Workbench**: *Apply to workbench* could apply the last run's settings instead of the tuner's winner; an engine
+  panic left the UI stuck in *Running*; keyboard focus was lost when Run turned into Stop; window start-up errors
+  were silently ignored (they are now reported and logged); defaults now match the CLI (preset `parquet`, tuner
+  5 s trials, 24 trials); inputs have accessibility labels; terminal saves never overwrite files.
+- **CLI**: an interrupted `run`/`tune` exits 130 and its report is marked `"interrupted": true`; `oprobe top`
+  without a terminal and `oprobe gui` without a display exit 2 with a hint; `-c 0` and `--max-trials 1` are
+  rejected; `top`/`gui` accept `--proxy`, `--ca-cert`, `--region` and honour `--color`/`NO_COLOR`.
+- A cache-layer bug served the head of an object for a suffix (footer) read and could panic on out-of-bounds ranges.
+- Release assets no longer include the WiX debug database.
+
+### Measurement changes
+
+- **Throughput** (ops/s, MiB/s, achieved rate) no longer includes the time spent draining in-flight operations
+  after the window closed; values are higher than 2.0.0 reported, and correct.
+- **Open loop** queues arrivals that find all workers busy and measures them from their intended start, so
+  saturation shows in p50/p99 (2.0.0 dropped them); `missed` counts arrivals that never started.
+- **Uploads** with the default client: `send` now ends near the last byte written (it ended before the first), so
+  upload time moves from `ttfb` to `send`.
+- Requests cut off by a timeout or tail-cut are recorded (with a `cancelled` error) instead of disappearing;
+  bodies dropped short of their length are marked.
+- Cold/warm: connections are identified by local *and* remote address; a dial that finished before the request was
+  ready (hyper's pool race) is counted but not charged to that request; failed sends are not counted as warm.
+- Time before your code first reads a response body is *stall*, not *transfer*.
+- `Retry-After` in HTTP-date form is understood. Probe clock skew lost a +0.5 s bias.
+- Cost: storage and egress are billed per GiB (2.0.0 overstated them by ~7 %); requests that never left the client
+  are not billed. GCS batch requests are classified as deletes.
+- Long runs use bounded memory (per-second statistics no longer keep a histogram each).
+
 ## v2.0.0 — 2026-11-19
 
 oprobe 2.0 is a rewrite. Everything reported is measured per request; nothing is estimated.

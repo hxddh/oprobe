@@ -30,20 +30,16 @@ pub fn run_form(primary_label: &'static str, on_primary: impl Fn() + Copy + 'sta
                 .child(
                     field(
                         "Storage URL",
-                        "s3://bucket/prefix · memory:// · fs:///tmp/x",
+                        "e.g. s3://bucket/prefix · memory:// · fs:///tmp/x",
                         f.target,
                     )
                     .flex_1(),
                 )
                 .child(picker("Preset", &PRESETS, f.preset).w(px(170.0)))
-                .child(field("Duration", "10s", f.duration).w(px(90.0)))
-                .child(
-                    when(
-                        move || s.status.get().busy(),
-                        move || btn("Stop", Kind::Danger, move || s.stop()),
-                    )
-                    .otherwise(move || btn(primary_label, Kind::Primary, on_primary)),
-                ),
+                .child(field("Duration", "e.g. 10s", f.duration).w(px(90.0)))
+                // One button whose label and action follow the state (Run ⇄ Stop), so keyboard
+                // focus stays on it when a run starts or ends.
+                .child(run_stop_button(primary_label, on_primary)),
         )
         .child(
             row()
@@ -52,34 +48,68 @@ pub fn run_form(primary_label: &'static str, on_primary: impl Fn() + Copy + 'sta
                 .child(
                     field(
                         "Endpoint (optional)",
-                        "https://minio.local:9000",
+                        "e.g. https://minio.local:9000",
                         f.endpoint,
                     )
                     .flex_1()
                     .min_w(px(200.0)),
                 )
-                .child(field("Region", "us-east-1", f.region).w(px(120.0)))
+                .child(field("Region", "e.g. us-east-1", f.region).w(px(140.0)))
                 .child(
                     field(
                         "Existing prefix (read-only)",
-                        "warehouse/events/",
+                        "e.g. warehouse/events/",
                         f.existing,
                     )
                     .w(px(220.0)),
+                )
+                .child(
+                    field("Proxy (optional)", "e.g. http://proxy:3128 · none", f.proxy)
+                        .w(px(220.0)),
                 ),
         )
         .child(
             row()
                 .items_end()
                 .flex_wrap()
-                .child(field("Concurrency", "16", f.concurrency).w(px(110.0)))
-                .child(field("I/O per op", "4", f.io_concurrency).w(px(100.0)))
-                .child(field("Chunk", "8MiB", f.chunk).w(px(100.0)))
+                .child(field("Concurrency", "e.g. 16", f.concurrency).w(px(110.0)))
+                .child(field("I/O per op", "e.g. 4", f.io_concurrency).w(px(100.0)))
+                .child(field("Chunk", "e.g. 8MiB", f.chunk).w(px(100.0)))
                 .child(toggle("Keep-alive", f.keep_alive))
                 .child(toggle("Cache", f.cache))
                 .child(toggle("Anonymous", f.anonymous))
                 .child(toggle("Skip TLS verify", f.insecure)),
         )
+}
+
+/// The primary action of a form, which turns into Stop (then "Stopping…") while a job runs.
+pub fn run_stop_button(
+    primary_label: &'static str,
+    on_primary: impl Fn() + Copy + 'static,
+) -> impl IntoElement {
+    let s = store();
+    let label = move || -> SharedString {
+        match s.status.get() {
+            Status::Stopping => "Stopping…".into(),
+            st if st.busy() => "Stop".into(),
+            _ => primary_label.into(),
+        }
+    };
+    btn_reactive(
+        label,
+        move || {
+            if s.status.get().busy() {
+                Kind::Danger
+            } else {
+                Kind::Primary
+            }
+        },
+        move || match s.status.get_untracked() {
+            Status::Stopping => {}
+            st if st.busy() => s.stop(),
+            _ => on_primary(),
+        },
+    )
 }
 
 /// Error banner with the actionable hint.
@@ -123,6 +153,7 @@ fn verdict() -> impl IntoElement {
                     Status::Running => {
                         "Preparing the dataset and warming up connections…".to_owned()
                     }
+                    Status::Stopping => "Stopping and cleaning up test data…".to_owned(),
                     _ => "Choose a target and press Run. Try memory:// for a zero-setup demo."
                         .to_owned(),
                 }))
@@ -150,7 +181,17 @@ fn verdict() -> impl IntoElement {
                     .font_weight(FontWeight::MEDIUM)
                     .flex_1(),
             )
-            .child(muted(move || s.status.get().label()))
+            .child(muted(move || {
+                let partial = s.report.with(|r| r.as_ref().is_some_and(|r| r.interrupted));
+                if partial {
+                    format!(
+                        "{} · stopped early: partial results",
+                        s.status.get().label()
+                    )
+                } else {
+                    s.status.get().label().to_owned()
+                }
+            }))
             .into_element()
     })
 }
@@ -672,16 +713,20 @@ fn log_panel() -> impl IntoElement {
 
 fn export_bar() -> impl IntoElement {
     let s = store();
-    when(
-        move || s.report.with(|r| r.is_some()),
-        move || {
-            row()
-                .child(btn("Save report…", Kind::Secondary, move || {
-                    crate::ui::files::save_report(s)
-                }))
-                .child(muted(move || s.notice.get().unwrap_or_default()))
-        },
-    )
+    row()
+        .child(
+            when(
+                move || s.report.with(|r| r.is_some()),
+                move || {
+                    btn("Save report…", Kind::Secondary, move || {
+                        crate::ui::files::save_report(s)
+                    })
+                },
+            )
+            .otherwise(view),
+        )
+        // Notices (saved files, applied tuning, stopping) show with or without a report.
+        .child(muted(move || s.notice.get().unwrap_or_default()))
 }
 
 pub fn workbench() -> impl IntoElement {

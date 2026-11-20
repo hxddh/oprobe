@@ -88,14 +88,38 @@ fn fingerprint(spec: &DatasetSpec, seed: u64) -> String {
     format!("{:08x}", crate::util::crc32c(s.as_bytes()))
 }
 
+/// Best-effort removal of a failed/cancelled upload (bounded: the service may be unreachable,
+/// which is often why the upload failed in the first place).
+async fn remove_partial(admin: &Operator, paths: Vec<String>, manifest: &str, persisted: bool) {
+    let mut paths = paths;
+    if persisted {
+        paths.push(manifest.to_owned());
+    }
+    if paths.is_empty() {
+        return;
+    }
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        if admin.delete_iter(paths.clone()).await.is_err() {
+            for p in paths {
+                let _ = admin.delete(&p).await;
+            }
+        }
+    })
+    .await;
+}
+
 impl Dataset {
     /// Prepare the dataset: discover existing objects, reuse a persisted dataset, or upload one.
+    ///
+    /// Observes `cancel`; when the upload fails or is cancelled, every object it started
+    /// uploading is deleted again before the error is returned (no test data left behind).
     pub async fn prepare(
         admin: &Operator,
         spec: &DatasetSpec,
         seed: u64,
         run_prefix: &str,
         needs_objects: bool,
+        cancel: &crate::engine::Cancel,
         progress: &(dyn Fn(String) + Send + Sync),
     ) -> Result<Self> {
         if let Some(prefix) = &spec.existing_prefix {
@@ -145,10 +169,15 @@ impl Dataset {
             "uploading dataset: {n} × {} to {base}",
             crate::util::fmt_bytes(size as u64)
         ));
-        let objects: Vec<DataObject> = futures::stream::iter(0..n)
+        let uploaded = std::sync::Mutex::new(Vec::<String>::new());
+        let upload = futures::stream::iter(0..n)
             .map(|i| {
                 let path = format!("{}obj-{i:05}.bin", parts[i % partitions]);
                 let admin = admin.clone();
+                uploaded
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(path.clone());
                 async move {
                     let (data, crc) = tokio::task::spawn_blocking(move || {
                         generate_payload(seed.wrapping_add(i as u64 * 7919), size)
@@ -173,19 +202,43 @@ impl Dataset {
                 }
             })
             .buffered(4)
-            .try_collect()
-            .await?;
+            .try_collect::<Vec<DataObject>>();
+        let res = async {
+            let objects = tokio::select! {
+                r = upload => r?,
+                _ = cancel.cancelled() => bail!("cancelled while uploading the dataset"),
+            };
+            if persisted {
+                let m = Manifest {
+                    objects: objects.clone(),
+                    partitions: parts.clone(),
+                };
+                let w = admin.write(&manifest_path, serde_json::to_vec(&m)?);
+                tokio::select! {
+                    r = w => { r?; }
+                    _ = cancel.cancelled() => bail!("cancelled while uploading the dataset"),
+                }
+            }
+            Ok(objects)
+        }
+        .await;
+        let objects = match res {
+            Ok(o) => o,
+            Err(e) => {
+                let paths =
+                    std::mem::take(&mut *uploaded.lock().unwrap_or_else(|e| e.into_inner()));
+                progress(format!(
+                    "dataset upload failed; removing {} partially uploaded objects",
+                    paths.len()
+                ));
+                remove_partial(admin, paths, &manifest_path, persisted).await;
+                return Err(e);
+            }
+        };
         progress(format!(
             "dataset ready in {:.1}s",
             t0.elapsed().as_secs_f64()
         ));
-        if persisted {
-            let m = Manifest {
-                objects: objects.clone(),
-                partitions: parts.clone(),
-            };
-            admin.write(&manifest_path, serde_json::to_vec(&m)?).await?;
-        }
         Ok(Self {
             prefix: base,
             objects,

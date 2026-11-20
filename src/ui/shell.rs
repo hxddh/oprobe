@@ -70,6 +70,13 @@ fn sidebar() -> impl IntoElement {
         .child(nav_item(Page::Probe, "Probe", "handshakes & TTFB"))
         .child(view().flex_1())
         .child(muted(move || format!("● {}", s.status.get().label())).px_3())
+        .child(dynamic(|| {
+            if nsh_base::terminal::is_terminal() {
+                muted("Ctrl+C quit · Tab moves").px_3().into_element()
+            } else {
+                view().into_element()
+            }
+        }))
 }
 
 pub fn shell() -> impl IntoElement {

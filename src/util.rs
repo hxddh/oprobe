@@ -228,11 +228,19 @@ pub fn fmt_usd(v: f64) -> String {
 }
 
 /// Keys whose values must never be printed or persisted.
+///
+/// Covers OpenDAL's credential options across services (`secret_access_key`, `account_key`,
+/// `sas_token`, `session_token`, `password`, `credential`, `private_key`, ...), customer-supplied
+/// encryption keys (`server_side_encryption_customer_key`, `encryption_key`, ...) and generally
+/// any `*_key`. `access_key_id` stays redacted as before; non-secret encryption settings such as
+/// `server_side_encryption = "aws:kms"` remain visible.
 pub fn is_secret_key(key: &str) -> bool {
     let k = key.to_ascii_lowercase();
-    [
+    let k = k.as_str();
+    const NEEDLES: [&str; 13] = [
         "secret",
         "password",
+        "passwd",
         "token",
         "credential",
         "access_key",
@@ -240,12 +248,52 @@ pub fn is_secret_key(key: &str) -> bool {
         "sas",
         "private_key",
         "application_key",
-    ]
-    .iter()
-    .any(|needle| k.contains(needle))
+        "api_key",
+        "apikey",
+        "signature",
+    ];
+    NEEDLES.iter().any(|n| k.contains(n))
+        || k == "key"
+        || k.ends_with("_key")
+        || k.ends_with("-key")
+        || (k.contains("encryption") && k.contains("key"))
+        || k.contains("authorization")
 }
 
-/// Replace secret values with `"<redacted>"`.
+/// Remove `user:password@` from every URL embedded in `s` (`http://u:p@host:9000/x` →
+/// `http://host:9000/x`). Other text is returned unchanged, byte for byte.
+pub fn strip_url_credentials(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find("://") {
+        let (head, tail) = rest.split_at(i + 3);
+        out.push_str(head);
+        let auth_end = tail
+            .find(['/', '?', '#', ' ', '\'', '"'])
+            .unwrap_or(tail.len());
+        let authority = &tail[..auth_end];
+        match authority.rfind('@') {
+            Some(at) => out.push_str(&authority[at + 1..]),
+            None => out.push_str(authority),
+        }
+        rest = &tail[auth_end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// A storage URL safe to print: credentials and the query string (SAS tokens, signatures)
+/// removed.
+pub fn display_url(raw: &str) -> String {
+    let stripped = strip_url_credentials(raw);
+    match stripped.find('?') {
+        Some(q) => stripped[..q].to_owned(),
+        None => stripped,
+    }
+}
+
+/// Replace secret values with `"<redacted>"` and strip credentials embedded in URL values
+/// (e.g. an `endpoint` of `http://user:pass@host`).
 pub fn redact_options(
     opts: &std::collections::BTreeMap<String, String>,
 ) -> std::collections::BTreeMap<String, String> {
@@ -254,7 +302,7 @@ pub fn redact_options(
             if is_secret_key(k) {
                 (k.clone(), "<redacted>".to_owned())
             } else {
-                (k.clone(), v.clone())
+                (k.clone(), strip_url_credentials(v))
             }
         })
         .collect()
@@ -443,5 +491,74 @@ mod tests {
         let r = redact_options(&m);
         assert_eq!(r["secret_access_key"], "<redacted>");
         assert_eq!(r["bucket"], "b");
+    }
+
+    #[test]
+    fn secret_keys_cover_opendal_credentials_and_encryption_keys() {
+        for k in [
+            "secret_access_key",
+            "access_key_id",
+            "session_token",
+            "security_token",
+            "account_key",
+            "sas_token",
+            "password",
+            "credential",
+            "credential_path",
+            "private_key",
+            "application_key",
+            "server_side_encryption_customer_key",
+            "server_side_encryption_customer_key_md5",
+            "server_side_encryption_aws_kms_key_id",
+            "encryption_key",
+            "master_key",
+            "SSE_KEY",
+            "key",
+            "api_key",
+        ] {
+            assert!(is_secret_key(k), "{k} must be secret");
+        }
+        for k in [
+            "bucket",
+            "region",
+            "endpoint",
+            "root",
+            "server_side_encryption",
+            "server_side_encryption_customer_algorithm",
+            "account_name",
+            "container",
+            "allow_anonymous",
+            "enable_virtual_host_style",
+        ] {
+            assert!(!is_secret_key(k), "{k} is not secret");
+        }
+    }
+
+    #[test]
+    fn url_credentials_are_stripped() {
+        assert_eq!(
+            strip_url_credentials("http://user:pa:ss@minio:9000/x?y=1"),
+            "http://minio:9000/x?y=1"
+        );
+        assert_eq!(
+            strip_url_credentials("https://host.example"),
+            "https://host.example"
+        );
+        assert_eq!(
+            strip_url_credentials("http://127.0.0.1:8080"),
+            "http://127.0.0.1:8080"
+        );
+        assert_eq!(strip_url_credentials("no url here"), "no url here");
+        assert_eq!(
+            strip_url_credentials("a http://u@h b https://u:p@k/"),
+            "a http://h b https://k/"
+        );
+        assert_eq!(
+            display_url("webdav://u:p@host/dir?sig=abc"),
+            "webdav://host/dir"
+        );
+        let mut m = std::collections::BTreeMap::new();
+        m.insert("endpoint".to_owned(), "http://ak:sk@minio:9000".to_owned());
+        assert_eq!(redact_options(&m)["endpoint"], "http://minio:9000");
     }
 }

@@ -35,16 +35,31 @@ Linux packages for servers (`.deb`, `.rpm`, static musl archives) are built with
 
 ![Slowest operation](images/app-slowest-op.png)
 
-The workbench drives the same engine as the CLI, so the numbers are identical. Test data is cleaned up when a run
-ends or is stopped. Credentials come from the usual environment (`AWS_*`, `~/.aws`,
-`GOOGLE_APPLICATION_CREDENTIALS`, …), proxies from `HTTPS_PROXY` / `NO_PROXY`, exactly as for the CLI.
+The workbench drives the same engine as the CLI with the same defaults (preset `parquet`, 10 s window, 2 s warmup;
+the tuner's 5 s trials, 1 s trial warmup, at most 24 trials, 5 s cooldown), so the numbers are identical. Test data is
+cleaned up when a run ends or is stopped. Credentials come from the usual environment (`AWS_*`, `~/.aws`,
+`GOOGLE_APPLICATION_CREDENTIALS`, …), proxies from `HTTPS_PROXY` / `NO_PROXY` (or the *Proxy* field / `--proxy`),
+exactly as for the CLI. `top` and `gui` also take `--region`, `--ca-cert`, `--insecure` and `--proxy`.
+
+**Quitting mid-run** (Ctrl+C in the terminal, closing the window) stops the job and waits — up to 30 s — until its test
+data is removed; the workbench shows *Stopping and cleaning up test data…* meanwhile. A second Ctrl+C quits at once
+(`oprobe cleanup` removes what is left). *Apply to workbench* applies the tuner's winning configuration; the
+workbench's own results are left untouched by tuning.
+
+`oprobe top` needs an interactive terminal (use `oprobe run` in scripts); it honors `--color never` and `NO_COLOR`.
+`oprobe gui` without a display (no `DISPLAY` / `WAYLAND_DISPLAY` on Linux, or an SSH session) says so and exits with
+code 2 — use `oprobe top` there. When the window cannot start, the reason is also written to a log file, since
+stderr is invisible when launched from Finder or Explorer: `~/Library/Logs/oprobe.log` (macOS),
+`%LOCALAPPDATA%\oprobe\oprobe.log` (Windows), `$XDG_STATE_HOME/oprobe/oprobe.log` or
+`~/.local/state/oprobe/oprobe.log` (Linux). Saving from the terminal writes to the working directory and never
+replaces an existing file (`report-1.json`, …).
 
 ## Unsigned desktop builds
 
-The macOS `.dmg`/`.pkg` and the Windows `.msi` are not signed with a developer certificate yet. macOS: right-click
-`oprobe.app` → *Open* the first time (or `xattr -dr com.apple.quarantine /Applications/oprobe.app`). Windows: in
-the SmartScreen prompt choose *More info* → *Run anyway*. Installing through Homebrew, Scoop or `cargo install` avoids
-both prompts.
+The macOS `.dmg`/`.pkg` and the Windows `.msi` are not signed with a developer certificate yet. macOS 15+: open the
+app once, then *System Settings → Privacy & Security → Open Anyway*; macOS 14: right-click `oprobe.app` → *Open*; or
+`xattr -dr com.apple.quarantine /Applications/oprobe.app`. Windows: in the SmartScreen prompt choose *More info* →
+*Run anyway*. Installing through Homebrew, Scoop or `cargo install` avoids both prompts.
 
 ## Building from source
 

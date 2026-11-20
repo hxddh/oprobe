@@ -21,7 +21,9 @@ pub struct Thresholds {
     pub request_amp_pct: f64,
     pub read_amp_pct: f64,
     pub cost_pct: f64,
-    /// Fail when the candidate is throttled and the baseline was not.
+    /// Gate throttling: fail when the candidate is throttled and the baseline was not, or when
+    /// its throttle rate (throttled responses per request) grew by more than
+    /// [`THROTTLE_RATE_PCT`] and [`THROTTLE_RATE_FLOOR`].
     pub fail_on_new_throttling: bool,
     /// Skip latency checks for operations with fewer samples.
     pub min_samples: u64,
@@ -75,6 +77,13 @@ pub struct DiffReport {
     pub checks: Vec<Check>,
     pub warnings: Vec<String>,
 }
+
+/// Relative throttle-rate increase (percent) that fails the gate when the baseline was throttled.
+pub const THROTTLE_RATE_PCT: f64 = 25.0;
+/// Throttle-rate changes below this (fraction of requests, 0.1 pp) are noise.
+pub const THROTTLE_RATE_FLOOR: f64 = 0.001;
+/// Max increase of the open-loop missed-arrival share, in percentage points.
+pub const MISSED_PP: f64 = 1.0;
 
 fn rel(b: f64, c: f64) -> f64 {
     if b.abs() < 1e-12 {
@@ -139,12 +148,52 @@ impl Builder {
     }
 }
 
+fn throttle_rate(s: &crate::trace::Snapshot) -> f64 {
+    crate::util::ratio(
+        s.resilience.throttled_responses as f64,
+        s.connections.requests as f64,
+    )
+}
+
+/// Share of open-loop arrivals that never started (percent).
+fn missed_pct(s: &crate::trace::Snapshot) -> Option<f64> {
+    let ol = s.open_loop.as_ref()?;
+    let issued = ol.achieved_rate * s.elapsed_s;
+    Some(crate::util::pct(
+        ol.missed as f64,
+        issued + ol.missed as f64,
+    ))
+}
+
 pub fn diff(base: &Report, cand: &Report, t: &Thresholds) -> DiffReport {
     let mut warnings = Vec::new();
+    for (side, r) in [("baseline", base), ("candidate", cand)] {
+        if r.interrupted {
+            warnings.push(format!(
+                "the {side} run was interrupted (stopped early): its results cover a shorter window and may not be comparable; re-run it to completion"
+            ));
+        }
+    }
+    match (base.workload.rate, cand.workload.rate) {
+        (None, Some(_)) | (Some(_), None) => warnings.push(
+            "comparing a closed-loop run with an open-loop (fixed-rate) run: throughput and latency mean different things in each mode".into(),
+        ),
+        (Some(a), Some(b)) if (a - b).abs() > 0.01 * a.max(b) => warnings.push(format!(
+            "open-loop target rates differ ({a} vs {b} ops/s)"
+        )),
+        _ => {}
+    }
+    let (bd, cd) = (base.result.elapsed_s, cand.result.elapsed_s);
+    if bd > 0.0 && cd > 0.0 && (bd / cd > 2.0 || cd / bd > 2.0) {
+        warnings.push(format!(
+            "measurement windows differ a lot ({bd:.1}s vs {cd:.1}s): short windows are noisier and may miss slow effects"
+        ));
+    }
     if base.target.display != cand.target.display {
         warnings.push(format!(
             "targets differ: `{}` vs `{}`",
-            base.target.display, cand.target.display
+            crate::util::display_url(&base.target.display),
+            crate::util::display_url(&cand.target.display)
         ));
     }
     if base.workload.preset != cand.workload.preset || base.workload.mix != cand.workload.mix {
@@ -170,7 +219,15 @@ pub fn diff(base: &Report, cand: &Report, t: &Thresholds) -> DiffReport {
     }
     for bv in &bs.verbs {
         let Some(cv) = cs.verb(&bv.verb) else {
-            warnings.push(format!("operation `{}` missing from candidate", bv.verb));
+            b.checks.push(Check {
+                name: format!("{} present", bv.verb),
+                baseline: bv.count as f64,
+                candidate: 0.0,
+                change_pct: -100.0,
+                limit: "operation must run".into(),
+                status: Status::Fail,
+                note: format!("operation `{}` is missing from the candidate", bv.verb),
+            });
             continue;
         };
         if bv.count < t.min_samples || cv.count < t.min_samples {
@@ -221,23 +278,47 @@ pub fn diff(base: &Report, cand: &Report, t: &Thresholds) -> DiffReport {
         bs.resilience.throttled_responses,
         cs.resilience.throttled_responses,
     );
+    let (btr, ctr) = (throttle_rate(bs) * 100.0, throttle_rate(cs) * 100.0);
+    let new_throttling = bt == 0 && ct > 0;
+    let more_throttling =
+        bt > 0 && (ctr - btr) / 100.0 > THROTTLE_RATE_FLOOR && rel(btr, ctr) > THROTTLE_RATE_PCT;
     b.checks.push(Check {
-        name: "throttled responses".into(),
-        baseline: bt as f64,
-        candidate: ct as f64,
-        change_pct: rel(bt as f64, ct as f64),
+        name: "throttled requests %".into(),
+        baseline: btr,
+        candidate: ctr,
+        change_pct: rel(btr, ctr),
         limit: if t.fail_on_new_throttling {
-            "no new throttling".into()
+            format!("no new throttling, ≤ +{THROTTLE_RATE_PCT}%")
         } else {
             "informational".into()
         },
-        status: if t.fail_on_new_throttling && bt == 0 && ct > 0 {
+        status: if t.fail_on_new_throttling && (new_throttling || more_throttling) {
             Status::Fail
+        } else if bt > 0
+            && (btr - ctr) / 100.0 > THROTTLE_RATE_FLOOR
+            && -rel(btr, ctr) > THROTTLE_RATE_PCT
+        {
+            Status::Improved
         } else {
             Status::Pass
         },
-        note: String::new(),
+        note: format!("{bt} → {ct} throttled responses"),
     });
+    if let (Some(bm), Some(cm)) = (missed_pct(bs), missed_pct(cs)) {
+        b.checks.push(Check {
+            name: "open-loop missed %".into(),
+            baseline: bm,
+            candidate: cm,
+            change_pct: cm - bm,
+            limit: format!("≤ +{MISSED_PP}pp"),
+            status: if cm - bm > MISSED_PP {
+                Status::Fail
+            } else {
+                Status::Pass
+            },
+            note: String::new(),
+        });
+    }
     b.checks.push(Check {
         name: "integrity (corrupted)".into(),
         baseline: bs.integrity.corrupted as f64,
@@ -280,8 +361,16 @@ pub fn diff(base: &Report, cand: &Report, t: &Thresholds) -> DiffReport {
     let passed = !b.checks.iter().any(|c| c.status == Status::Fail);
     DiffReport {
         passed,
-        baseline: format!("{} ({})", base.target.display, base.generated_at),
-        candidate: format!("{} ({})", cand.target.display, cand.generated_at),
+        baseline: format!(
+            "{} ({})",
+            crate::util::display_url(&base.target.display),
+            base.generated_at
+        ),
+        candidate: format!(
+            "{} ({})",
+            crate::util::display_url(&cand.target.display),
+            cand.generated_at
+        ),
         thresholds: t.clone(),
         checks: b.checks,
         warnings,
@@ -444,5 +533,116 @@ impl DiffReport {
         }
         x.push_str("</testsuite>\n");
         x
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Profile, TargetSpec};
+    use crate::trace::{OpenLoopStats, Quantiles, Snapshot, VerbStats};
+
+    fn report(verbs: &[&str], throttled: u64, requests: u64) -> Report {
+        let p = Profile::from_target(TargetSpec::from_url("memory://").unwrap());
+        let mut s = Snapshot {
+            elapsed_s: 10.0,
+            ..Default::default()
+        };
+        s.summary.ops = 1000;
+        s.summary.ops_per_s = 100.0;
+        s.connections.requests = requests;
+        s.resilience.throttled_responses = throttled;
+        s.verbs = verbs
+            .iter()
+            .map(|v| VerbStats {
+                verb: (*v).to_owned(),
+                count: 500,
+                latency: Quantiles {
+                    p50: 10.0,
+                    p99: 20.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .collect();
+        Report::build(&p, &p.knobs, s, Default::default(), vec![])
+    }
+
+    fn status(d: &DiffReport, name: &str) -> Status {
+        d.checks
+            .iter()
+            .find(|c| c.name == name)
+            .unwrap_or_else(|| panic!("no check {name}: {:?}", d.checks))
+            .status
+    }
+
+    #[test]
+    fn missing_operation_fails_the_gate() {
+        let b = report(&["read.full", "write"], 0, 1000);
+        let c = report(&["read.full"], 0, 1000);
+        let d = diff(&b, &c, &Thresholds::default());
+        assert!(!d.passed);
+        assert_eq!(status(&d, "write present"), Status::Fail);
+    }
+
+    #[test]
+    fn throttling_gates_on_rate_growth_with_noise_floor() {
+        let t = Thresholds::default();
+        // baseline already throttled: 2% -> 4% fails
+        let d = diff(
+            &report(&["stat"], 20, 1000),
+            &report(&["stat"], 40, 1000),
+            &t,
+        );
+        assert_eq!(status(&d, "throttled requests %"), Status::Fail);
+        // 2% -> 2.05% is noise
+        let d = diff(
+            &report(&["stat"], 200, 10_000),
+            &report(&["stat"], 205, 10_000),
+            &t,
+        );
+        assert_eq!(status(&d, "throttled requests %"), Status::Pass);
+        // tiny absolute change below the floor even if relatively large
+        let d = diff(
+            &report(&["stat"], 1, 100_000),
+            &report(&["stat"], 5, 100_000),
+            &t,
+        );
+        assert_eq!(status(&d, "throttled requests %"), Status::Pass);
+        // new throttling still fails
+        let d = diff(&report(&["stat"], 0, 1000), &report(&["stat"], 1, 1000), &t);
+        assert_eq!(status(&d, "throttled requests %"), Status::Fail);
+    }
+
+    #[test]
+    fn mode_and_duration_mismatches_warn_and_missed_growth_fails() {
+        let b = report(&["stat"], 0, 1000);
+        let mut c = report(&["stat"], 0, 1000);
+        c.workload.rate = Some(100.0);
+        c.result.elapsed_s = 60.0;
+        let d = diff(&b, &c, &Thresholds::default());
+        assert!(
+            d.warnings.iter().any(|w| w.contains("closed-loop")),
+            "{:?}",
+            d.warnings
+        );
+        assert!(
+            d.warnings.iter().any(|w| w.contains("windows differ")),
+            "{:?}",
+            d.warnings
+        );
+
+        let mut b = report(&["stat"], 0, 1000);
+        let mut c = b.clone();
+        let ol = |missed| OpenLoopStats {
+            target_rate: 100.0,
+            achieved_rate: 100.0,
+            missed,
+            max_schedule_lag_ms: 0.0,
+        };
+        b.result.open_loop = Some(ol(0));
+        c.result.open_loop = Some(ol(100));
+        let d = diff(&b, &c, &Thresholds::default());
+        assert_eq!(status(&d, "open-loop missed %"), Status::Fail);
     }
 }

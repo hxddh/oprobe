@@ -32,6 +32,8 @@ Archives contain `oprobe` (`oprobe.exe`), `README.md`, `LICENSE`, `CHANGELOG.md`
 ```bash
 cargo install oprobe --locked                  # Rust ≥ 1.97 and a C compiler; no OpenSSL
 cargo install oprobe --locked --features gui   # + native window (Linux: libgtk-4-dev)
+# or straight from a release tag:
+cargo install --locked --git https://github.com/hxddh/oprobe --tag v2.0.1 oprobe
 ```
 
 ## Homebrew
@@ -53,7 +55,7 @@ cp completions/_oprobe ~/.zfunc/
 # fish
 cp completions/oprobe.fish ~/.config/fish/completions/
 # PowerShell
-. ./_oprobe.ps1   # add to $PROFILE
+. ./_oprobe.ps1   # add to $PROFILE (Windows archives: next to oprobe.exe)
 ```
 
 `deb`, `rpm`, `pkg` and Homebrew install completions and man pages automatically.
@@ -63,11 +65,19 @@ cp completions/oprobe.fish ~/.config/fish/completions/
 ```bash
 sha256sum --ignore-missing -c SHA256SUMS                 # Linux
 shasum -a 256 --ignore-missing -c SHA256SUMS             # macOS
-Get-FileHash oprobe-2.0.0-x64.msi -Algorithm SHA256       # Windows
+Get-FileHash oprobe-2.0.1-x64.msi -Algorithm SHA256       # Windows
 ```
 
 ## Unsigned macOS and Windows packages
 
-The `.pkg`, `.dmg` and `.msi` are not yet signed with a developer certificate. macOS: right-click → *Open* the first
-time, or `xattr -dr com.apple.quarantine /Applications/oprobe.app`. Windows: SmartScreen → *More info* → *Run
-anyway*. Homebrew, Scoop, the install scripts and `cargo install` are not affected.
+The `.pkg`, `.dmg` and `.msi` are not yet signed with a developer certificate or notarized, so the first open asks
+for confirmation:
+
+- **macOS 15 (Sequoia) and later**: open `oprobe.app` (or the `.pkg`) once and dismiss the warning, then
+  *System Settings → Privacy & Security* → *Open Anyway* next to the oprobe message, and confirm. (Right-click →
+  *Open* no longer bypasses the check on macOS 15.)
+- **macOS 14**: right-click `oprobe.app` → *Open* → *Open*.
+- Either version, from a terminal: `xattr -dr com.apple.quarantine /Applications/oprobe.app`.
+- **Windows**: SmartScreen → *More info* → *Run anyway*.
+
+Homebrew, Scoop, the install scripts and `cargo install` are not affected.

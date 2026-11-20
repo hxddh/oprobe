@@ -215,7 +215,10 @@ pub struct ClientStats {
 pub struct OpenLoopStats {
     pub target_rate: f64,
     pub achieved_rate: f64,
-    /// Ops that could not start because `concurrency` ops were already in flight.
+    /// Arrivals that never started: still queued behind `concurrency` busy slots when the
+    /// window ended, or dropped after falling more than `knobs.timeout` behind schedule.
+    /// Arrivals that waited for a slot and then ran are not missed: their queueing delay is
+    /// part of their latency (measured from the intended start).
     pub missed: u64,
     pub max_schedule_lag_ms: f64,
 }
@@ -249,6 +252,9 @@ pub struct Snapshot {
     pub client: ClientStats,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub open_loop: Option<OpenLoopStats>,
+    /// The run was stopped early (Ctrl-C / Stop): the window is shorter than configured.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub interrupted: bool,
     pub timeline: Vec<TimelinePoint>,
     pub slow_ops: Vec<SlowOp>,
 }

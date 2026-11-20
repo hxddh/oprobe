@@ -197,7 +197,11 @@ pub fn classify_http(method: &http::Method, path: &str, query: Option<&str>) -> 
         };
     }
 
-    // Google Cloud Storage JSON API.
+    // Google Cloud Storage JSON API. Batch requests (OpenDAL batches deletes) go to
+    // `/batch/storage/v1`, outside the `/storage/v1/` tree.
+    if *method == Method::POST && path_l.trim_end_matches('/') == "/batch/storage/v1" {
+        return Api::DeleteObjects;
+    }
     if path_l.starts_with("/storage/v1/") || path_l.starts_with("/upload/storage/v1/") {
         if path_l.starts_with("/upload/") {
             return if has("upload_id") {
@@ -219,7 +223,6 @@ pub fn classify_http(method: &http::Method, path: &str, query: Option<&str>) -> 
             Method::GET if path_l.ends_with("/o") => Api::ListObjects,
             Method::GET if q.contains("alt=media") => Api::GetObject,
             Method::GET => Api::HeadObject,
-            Method::POST if path_l.ends_with("/batch/storage/v1") => Api::DeleteObjects,
             Method::POST | Method::PUT => Api::PutObject,
             _ => Api::Other,
         };
@@ -332,6 +335,10 @@ mod tests {
         assert_eq!(
             classify_http(&Method::GET, "/storage/v1/b/bk/o", Some("prefix=x")),
             Api::ListObjects
+        );
+        assert_eq!(
+            classify_http(&Method::POST, "/batch/storage/v1", None),
+            Api::DeleteObjects
         );
         assert_eq!(
             classify_http(&Method::PUT, "/c/blob", Some("comp=block&blockid=AAA")),

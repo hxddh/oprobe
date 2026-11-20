@@ -232,7 +232,10 @@ pub async fn probe_endpoint(endpoint: &str, opts: &ProbeOptions) -> Result<Probe
             opts.timeout,
         )
         .await?;
-        let local_now = std::time::SystemTime::now() - t_req.elapsed() / 2;
+        // `Date` comes from the first (cold) response: compare it with the local clock halfway
+        // through that request, not through both.
+        let local_now = std::time::SystemTime::now() - t_req.elapsed()
+            + std::time::Duration::from_secs_f64((cold / 2000.0).max(0.0));
         let ms = |us: u64| us as f64 / 1000.0;
         let rec = |h: &mut hdrhistogram::Histogram<u64>, v: f64| {
             if v.is_finite() {
@@ -249,7 +252,13 @@ pub async fn probe_endpoint(endpoint: &str, opts: &ProbeOptions) -> Result<Probe
         }
         rec(&mut h_cold, cold);
         rec(&mut h_warm, warm);
-        if let Some(server) = date.as_deref().and_then(httpdate_parse) {
+        // `Date` has one-second resolution and is truncated: on average the server's clock
+        // was half a second past it.
+        if let Some(server) = date
+            .as_deref()
+            .and_then(httpdate_parse)
+            .map(|d| d + std::time::Duration::from_millis(500))
+        {
             let skew = match local_now.duration_since(server) {
                 Ok(d) => d.as_secs_f64(),
                 Err(e) => -e.duration().as_secs_f64(),

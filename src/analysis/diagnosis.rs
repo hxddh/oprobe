@@ -438,8 +438,14 @@ pub fn diagnose(s: &Snapshot, knobs: &Knobs, sla: &Sla, network: bool) -> Diagno
                 Severity::Warning,
                 "rate-not-sustained",
                 format!("Target rate {:.0} ops/s not sustained", ol.target_rate),
-                format!("achieved {:.0} ops/s; {} arrivals dropped because {} ops were already in flight", ol.achieved_rate, ol.missed, knobs.concurrency),
-                "Raise `concurrency` (in-flight cap) or lower the target rate; latency percentiles include queueing from the intended start time.",
+                format!(
+                    "achieved {:.0} ops/s; arrivals queued behind {} busy slots (max schedule lag {}); {} never started before the window ended",
+                    ol.achieved_rate,
+                    knobs.concurrency,
+                    fmt_ms(ol.max_schedule_lag_ms),
+                    ol.missed
+                ),
+                "Raise `concurrency` (in-flight cap) or lower the target rate. Queued arrivals still ran: their wait is included in the latency percentiles (measured from the intended start time).",
             ));
     }
     if cpu_busy > 0.8 * cores && bottleneck != Bottleneck::Client {

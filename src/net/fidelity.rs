@@ -73,11 +73,16 @@ struct Dialed {
     end: Instant,
 }
 
+/// Bound on remembered connections (see [`Conns::by_addr`]).
+const MAX_TRACKED_CONNS: usize = 8192;
+
 #[derive(Default)]
 struct Conns {
     seq: u64,
-    /// Connection identity (local address) -> (id, dial awaiting its first request).
-    by_local: HashMap<SocketAddr, (u64, Option<Dialed>)>,
+    /// Connection identity (local, remote address) -> (id, dial awaiting its first request).
+    /// The local address alone is not unique: the kernel reuses a local port for connections
+    /// to different peers, and object stores answer from many addresses.
+    by_addr: HashMap<(SocketAddr, SocketAddr), (u64, Option<Dialed>)>,
 }
 
 struct Shared {
@@ -318,8 +323,13 @@ where
                     if let (Some(i), Ok(mut c)) = (info, shared.conns.lock()) {
                         c.seq += 1;
                         let id = c.seq;
-                        c.by_local.insert(
-                            i.local_addr(),
+                        if c.by_addr.len() >= MAX_TRACKED_CONNS {
+                            // Long runs with connection churn: forget connections whose dial was
+                            // already claimed (their later requests get a fresh id, still warm).
+                            c.by_addr.retain(|_, (_, d)| d.is_some());
+                        }
+                        c.by_addr.insert(
+                            (i.local_addr(), i.remote_addr()),
                             (
                                 id,
                                 Some(Dialed {
@@ -448,11 +458,25 @@ fn is_temporary_error(err: &reqwest::Error) -> bool {
     err.is_request() || err.is_body() || err.is_decode()
 }
 
+/// Upload frame size: hyper polls the next frame only when it can write, so with bounded
+/// frames the last one is handed over once the rest is on its way (within one frame plus the
+/// socket send buffer). OpenDAL hands a contiguous body over as a single chunk, which would
+/// otherwise mark "last byte sent" before any byte was written.
+const SEND_FRAME: usize = 64 * 1024;
+
 /// Request body that notes when its last byte was handed to the connection.
 struct TimedBody {
     buf: Buffer,
+    /// The rest of the chunk being framed.
+    pending: Bytes,
     start: Instant,
     end_us: Arc<AtomicU64>,
+}
+
+impl TimedBody {
+    fn remaining(&self) -> usize {
+        self.pending.len() + self.buf.len()
+    }
 }
 
 impl http_body::Body for TimedBody {
@@ -463,20 +487,98 @@ impl http_body::Body for TimedBody {
         mut self: Pin<&mut Self>,
         _: &mut Context<'_>,
     ) -> Poll<Option<std::result::Result<http_body::Frame<Bytes>, Self::Error>>> {
-        let next = self.buf.next();
-        if self.buf.is_empty() {
-            let us = (self.start.elapsed().as_micros() as u64).max(1);
-            self.end_us.store(us, Ordering::Release);
+        let this = &mut *self;
+        while this.pending.is_empty() {
+            match this.buf.next() {
+                Some(b) => this.pending = b,
+                None => return Poll::Ready(None),
+            }
         }
-        Poll::Ready(next.map(|b| Ok(http_body::Frame::data(b))))
+        let n = this.pending.len().min(SEND_FRAME);
+        let frame = this.pending.split_to(n);
+        if this.remaining() == 0 {
+            let us = (this.start.elapsed().as_micros() as u64).max(1);
+            this.end_us.store(us, Ordering::Release);
+        }
+        Poll::Ready(Some(Ok(http_body::Frame::data(frame))))
     }
 
     fn is_end_stream(&self) -> bool {
-        self.buf.is_empty()
+        self.remaining() == 0
     }
 
     fn size_hint(&self) -> http_body::SizeHint {
-        http_body::SizeHint::with_exact(self.buf.len() as u64)
+        http_body::SizeHint::with_exact(self.remaining() as u64)
+    }
+}
+
+/// Emits a record for a request whose future was dropped before it produced a response
+/// (OpenDAL's timeout layer, a tail-cut, a cancelled operation): otherwise the slowest
+/// requests would vanish from every statistic.
+pub(super) struct CancelGuard {
+    armed: bool,
+    api: crate::trace::Api,
+    method: String,
+    bytes_up: u64,
+    start_offset_us: u64,
+    t_start: Instant,
+    scope: Option<Arc<OpScope>>,
+    recorder: Option<Arc<Recorder>>,
+}
+
+impl CancelGuard {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn new(
+        api: crate::trace::Api,
+        method: String,
+        bytes_up: u64,
+        start_offset_us: u64,
+        t_start: Instant,
+        scope: Option<Arc<OpScope>>,
+        recorder: Option<Arc<Recorder>>,
+    ) -> Self {
+        Self {
+            armed: true,
+            api,
+            method,
+            bytes_up,
+            start_offset_us,
+            t_start,
+            scope,
+            recorder,
+        }
+    }
+
+    /// The request reached a point where it records itself.
+    pub(super) fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CancelGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let record = RequestRecord {
+            api: self.api,
+            method: std::mem::take(&mut self.method),
+            status: 0,
+            protocol: Protocol::Http1,
+            reused: false,
+            conn_id: 0,
+            start_offset_us: self.start_offset_us,
+            timing: RequestTiming {
+                total_us: self.t_start.elapsed().as_micros() as u64,
+                ..Default::default()
+            },
+            bytes_up: self.bytes_up,
+            bytes_down: 0,
+            request_id: None,
+            retry_after_ms: None,
+            error: Some("cancelled before a response (timeout or abandoned)".into()),
+        };
+        Finisher::emit(record, &self.scope, &self.recorder);
     }
 }
 
@@ -526,6 +628,8 @@ struct TimedResponseBody<S> {
     inner: Pin<Box<S>>,
     fin: Option<Finisher>,
     uri: String,
+    /// Declared body length, to tell a body read to its end from one dropped part-way.
+    expected: Option<u64>,
 }
 
 impl<S: Stream<Item = reqwest::Result<Bytes>>> Stream for TimedResponseBody<S> {
@@ -580,7 +684,9 @@ impl<S: Stream<Item = reqwest::Result<Bytes>>> Stream for TimedResponseBody<S> {
 impl<S> Drop for TimedResponseBody<S> {
     fn drop(&mut self) {
         if let Some(f) = self.fin.take() {
-            f.finish(None);
+            let got = f.record.bytes_down;
+            let short = self.expected.filter(|&n| got < n);
+            f.finish(short.map(|n| format!("response body dropped after {got} of {n} bytes")));
         }
     }
 }
@@ -632,6 +738,19 @@ impl HttpTransport for FidelityTransport {
         let api = classify_http(&method, url.path(), url.query());
         let bytes_up = body.len() as u64;
         let inflight = InflightGuard::start(recorder.clone());
+        let start_offset_us = scope
+            .as_ref()
+            .map(|s| t_start.saturating_duration_since(s.started).as_micros() as u64)
+            .unwrap_or(0);
+        let mut cancel_guard = CancelGuard::new(
+            api,
+            method.to_string(),
+            bytes_up,
+            start_offset_us,
+            t_start,
+            scope.clone(),
+            recorder.clone(),
+        );
         let mut record = RequestRecord {
             api,
             method: method.to_string(),
@@ -639,10 +758,7 @@ impl HttpTransport for FidelityTransport {
             protocol: Protocol::Http1,
             reused: true,
             conn_id: 0,
-            start_offset_us: scope
-                .as_ref()
-                .map(|s| t_start.saturating_duration_since(s.started).as_micros() as u64)
-                .unwrap_or(0),
+            start_offset_us,
             timing: RequestTiming::default(),
             bytes_up,
             bytes_down: 0,
@@ -673,6 +789,7 @@ impl HttpTransport for FidelityTransport {
         if !body.is_empty() {
             rb = rb.body(reqwest::Body::wrap(TimedBody {
                 buf: body,
+                pending: Bytes::new(),
                 start: t_start,
                 end_us: end_us.clone(),
             }));
@@ -681,11 +798,15 @@ impl HttpTransport for FidelityTransport {
         // Static span name: no allocation per request.
         let sent = rb.send().instrument_await(api.label()).await;
         let t_headers = Instant::now();
+        cancel_guard.disarm();
         let mut resp = match sent {
             Ok(r) => r,
             Err(err) => {
                 let msg = format!("send http request: {err}");
                 record.error = Some(msg);
+                // Whether a pooled connection was involved is unknown; a failed connect is
+                // by far the common case, and counting it as warm would inflate reuse.
+                record.reused = false;
                 record.timing.ttfb_us =
                     t_headers.saturating_duration_since(t_ready).as_micros() as u64;
                 record.timing.total_us =
@@ -701,11 +822,14 @@ impl HttpTransport for FidelityTransport {
 
         // Connection identity: the first request seen on a local address is the cold one and
         // carries that connection's dial.
-        let local = resp.extensions().get::<HttpInfo>().map(|i| i.local_addr());
+        let addr = resp
+            .extensions()
+            .get::<HttpInfo>()
+            .map(|i| (i.local_addr(), i.remote_addr()));
         let mut dial = None;
-        if let (Some(local), Ok(mut c)) = (local, self.shared.conns.lock()) {
+        if let (Some(addr), Ok(mut c)) = (addr, self.shared.conns.lock()) {
             let c = &mut *c;
-            let entry = c.by_local.entry(local).or_insert_with(|| {
+            let entry = c.by_addr.entry(addr).or_insert_with(|| {
                 c.seq += 1;
                 (c.seq, None)
             });
@@ -719,15 +843,28 @@ impl HttpTransport for FidelityTransport {
         };
         // Time on the wire starts when the connection was ready.
         let mut wire_from = t_ready;
-        if let Some(d) = dial {
-            record.reused = false;
-            record.timing.dns_us = d.dns_us;
-            record.timing.tcp_us = d.tcp_us;
-            record.timing.proxy_us = d.proxy_us;
-            record.timing.tls_us = d.tls_us;
-            if d.end > t_ready && d.end <= t_headers {
-                wire_from = d.end;
+        match dial {
+            // The connection was dialed while this request waited: its phases are this
+            // request's.
+            Some(d) if d.end >= t_ready => {
+                record.reused = false;
+                record.timing.dns_us = d.dns_us;
+                record.timing.tcp_us = d.tcp_us;
+                record.timing.proxy_us = d.proxy_us;
+                record.timing.tls_us = d.tls_us;
+                if d.end <= t_headers {
+                    wire_from = d.end;
+                }
             }
+            // Finished before this request was even ready: a dial that lost hyper's race
+            // against an idle connection and went to the pool. Count the connection, but this
+            // request found it ready (warm) and did not wait for it.
+            Some(d) => {
+                if let Some(r) = &recorder {
+                    r.record_unclaimed_dial(d.dns_us, d.tcp_us, d.proxy_us, d.tls_us);
+                }
+            }
+            None => {}
         }
         let sent_at = {
             let end = end_us.load(Ordering::Acquire);
@@ -750,8 +887,8 @@ impl HttpTransport for FidelityTransport {
         record.request_id = REQUEST_ID_HEADERS.iter().find_map(|h| header(h));
         if record.is_throttle() {
             record.retry_after_ms = header("retry-after")
-                .and_then(|v| v.trim().parse::<f64>().ok())
-                .map(|s| (s * 1000.0) as u64);
+                .as_deref()
+                .and_then(super::parse_retry_after);
         }
 
         // --- identical to opendal-http-transport-reqwest ---------------------------------
@@ -783,7 +920,8 @@ impl HttpTransport for FidelityTransport {
             t_start,
             t_headers,
             stall: Duration::ZERO,
-            last_yield: None,
+            // Until the consumer first polls the body, the bytes wait on it, not the network.
+            last_yield: Some(t_headers),
             scope,
             recorder,
             _permit: permit,
@@ -793,6 +931,7 @@ impl HttpTransport for FidelityTransport {
             inner: Box::pin(resp.bytes_stream()),
             fin: Some(fin),
             uri: uri.to_string(),
+            expected: content_length,
         };
         Ok(hr
             .body(HttpBody::new(stream, content_length))
