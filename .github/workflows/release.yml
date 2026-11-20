@@ -9,7 +9,12 @@ name: Release
 #   oprobe-desktop-<ver>-x86_64-unknown-linux-gnu.tar.gz  (Linux build with windows; needs GTK 4)
 # One binary everywhere: macOS and Windows builds include native windows (`--features gui`);
 # Linux packages stay headless (CLI + terminal workbench) so servers need no GTK.
-#   SHA256SUMS, oprobe.rb (Homebrew formula), oprobe.json (Scoop manifest), install.sh, install.ps1
+#   SHA256SUMS, oprobe.rb (Homebrew formula), oprobe.cask.rb (Homebrew cask for the .dmg),
+#   oprobe.json (Scoop manifest), winget-manifests.zip (submit to microsoft/winget-pkgs),
+#   latest.json (index of every asset with URL, size and SHA-256), install.sh, install.ps1
+# Every asset gets a SLSA build provenance attestation (`gh attestation verify FILE --repo …`).
+# Nothing is code-signed (no Apple/Microsoft certificates): docs/install.md explains the first open.
+# Release notes are the CHANGELOG section of the version.
 
 # How a release starts:
 #   * merging to main a commit whose Cargo.toml version has no `v<version>` tag yet: the `plan`
@@ -214,7 +219,8 @@ jobs:
           bin="target/${{ matrix.target }}/release/oprobe"
           [ -f "$bin.exe" ] && bin="$bin.exe"
           "$bin" --version
-          "$bin" run memory:// -d 1s --warmup 200ms -q --format json > /dev/null
+          "$bin" run memory:// -d 1s --warmup 200ms -q -o json --no-save > /dev/null
+          "$bin" run memory:// -d 1s --warmup 200ms -q -o html --no-save | grep -q '<svg class="viz"'
 
       - uses: actions/upload-artifact@v4
         with:
@@ -313,6 +319,10 @@ jobs:
     name: Publish GitHub release
     needs: [plan, meta, build, macos-universal, linux-desktop]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write       # build provenance attestations
+      attestations: write
     env:
       VERSION: ${{ needs.meta.outputs.version }}
       TAG: ${{ needs.plan.outputs.tag }}
@@ -322,16 +332,30 @@ jobs:
           ref: ${{ env.TAG }}
       - uses: actions/download-artifact@v4
         with: { pattern: "dist-*", merge-multiple: true, path: out }
-      - name: Checksums, Homebrew formula, Scoop manifest, installers
+      - name: Checksums, Homebrew formula + cask, Scoop, winget, latest.json, installers
         run: |
           cp scripts/install.sh scripts/install.ps1 out/
           (cd out && sha256sum * | sort -k2 > SHA256SUMS)
           scripts/release-manifests.sh "$VERSION" out "${{ github.repository }}"
+          # The checksums cover the generated manifests too.
+          (cd out && rm SHA256SUMS && sha256sum * | sort -k2 > SHA256SUMS)
           cat out/SHA256SUMS
+      - name: Build provenance (SLSA) for every asset
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: out/*
       - name: Release notes from CHANGELOG
         run: |
-          awk -v v="$VERSION" '$0 ~ "^## v?"v {f=1; next} f && /^## / {exit} f' CHANGELOG.md > notes.md
+          awk -v v="$VERSION" '$0 ~ "^## \\[?v?"v {f=1; next} f && /^## / {exit} f' CHANGELOG.md > notes.md
           [ -s notes.md ] || echo "oprobe $VERSION" > notes.md
+          {
+            echo
+            echo "---"
+            echo "**Install:** \`curl -fsSL https://github.com/${{ github.repository }}/releases/download/v$VERSION/install.sh | sh\` ·"
+            echo "Windows: \`winget install hxddh.oprobe\` or the \`.msi\` · update: \`oprobe self-update\`."
+            echo "The macOS and Windows packages are not code-signed; first open: [docs/install.md](https://github.com/${{ github.repository }}/blob/v$VERSION/docs/install.md#first-open-of-unsigned-packages)."
+            echo "Verify: \`sha256sum -c SHA256SUMS --ignore-missing\` and \`gh attestation verify <file> --repo ${{ github.repository }}\`."
+          } >> notes.md
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.TAG }}
