@@ -1022,9 +1022,30 @@ pub struct ExportArgs {
     /// CSV rows: requests or ops
     #[arg(long, default_value = "requests")]
     pub table: String,
-    /// OTLP signal: traces, metrics or all
-    #[arg(long, default_value = "all")]
-    pub signal: String,
+    /// OTLP signal: one OTLP/JSON document per signal; `all` needs --out DIR (two files) or
+    /// --endpoint (posts /v1/traces and /v1/metrics)
+    #[arg(long, value_enum, default_value_t = OtlpSignal::Traces)]
+    pub signal: OtlpSignal,
+}
+
+/// `runs export --format otlp --signal`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub enum OtlpSignal {
+    #[default]
+    Traces,
+    Metrics,
+    All,
+}
+
+impl OtlpSignal {
+    /// The OTLP signals this selects (`traces`, `metrics`).
+    pub fn signals(self) -> &'static [&'static str] {
+        match self {
+            Self::Traces => &["traces"],
+            Self::Metrics => &["metrics"],
+            Self::All => &["traces", "metrics"],
+        }
+    }
 }
 
 #[derive(Args, Debug)]

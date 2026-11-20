@@ -240,14 +240,47 @@ fn exports_cover_every_format() {
                 assert!(!v["log"]["entries"].as_array().unwrap().is_empty());
             }
             "otlp" => {
+                // One valid OTLP/JSON document (traces by default), not an array of signals.
                 let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-                assert!(v[0]["resourceSpans"][0]["scopeSpans"][0]["spans"].is_array());
-                assert!(v[1]["resourceMetrics"].is_array());
+                assert!(v["resourceSpans"][0]["scopeSpans"][0]["spans"].is_array());
             }
             "csv" => assert!(body.starts_with("t_us,op_id,")),
             "ndjson" => assert!(body.lines().next().unwrap().contains("\"kind\":\"report\"")),
             _ => {}
         }
+    }
+    // OTLP: metrics alone, or both signals as two documents in a directory.
+    let o = env.run(&[
+        "runs", "export", "last", "-f", "otlp", "--signal", "metrics",
+    ]);
+    assert!(o.status.success(), "{}", err(&o));
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert!(v["resourceMetrics"].is_array());
+    let o = env.run(&[
+        "runs", "export", "last", "-f", "otlp", "--signal", "all", "-o", "json",
+    ]);
+    assert_eq!(o.status.code(), Some(2), "all needs --out DIR");
+    let dir = env.path("otlp");
+    let o = env.run(&[
+        "runs",
+        "export",
+        "last",
+        "-f",
+        "otlp",
+        "--signal",
+        "all",
+        "--out",
+        dir.to_str().unwrap(),
+        "-o",
+        "json",
+    ]);
+    assert!(o.status.success(), "{}", err(&o));
+    let files = json(&o)["files"].as_array().unwrap().clone();
+    assert_eq!(files.len(), 2);
+    for (f, key) in files.iter().zip(["resourceSpans", "resourceMetrics"]) {
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(f.as_str().unwrap()).unwrap()).unwrap();
+        assert!(v[key].is_array(), "{f}");
     }
     // stdout export
     let o = env.run(&["runs", "export", "last", "-f", "csv", "--table", "ops"]);

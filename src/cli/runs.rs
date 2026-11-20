@@ -231,6 +231,24 @@ pub fn cmd_open(a: RunRefArg, ctx: &Ctx) -> Result<u8> {
     #[cfg(not(feature = "tui"))]
     let window: std::result::Result<(), &str> = Err("this oprobe was built without native windows");
     if let Err(why) = window {
+        // No window here (no `gui` feature, no display): the terminal workbench shows the same
+        // run when this is an interactive terminal.
+        if cfg!(feature = "tui")
+            && ctx.out.format == crate::output::OutputFormat::Text
+            && crate::output::interactive_terminal()
+        {
+            ctx.out.info(format!(
+                "cannot open a window ({why}); opening the run in the terminal workbench: oprobe top --open {}",
+                path.display()
+            ));
+            let status = std::process::Command::new(std::env::current_exe()?)
+                .arg("top")
+                .arg("--open")
+                .arg(&path)
+                .status()
+                .map_err(|e| anyhow::anyhow!("cannot start the terminal workbench: {e}"))?;
+            return Ok(status.code().map_or(1, |c| c.clamp(0, 255) as u8));
+        }
         return Err(OprobeError::new(
             ErrorCode::UsageInvalidArgument,
             format!("cannot open a window: {why}"),

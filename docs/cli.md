@@ -262,6 +262,7 @@ oprobe tune [OPTIONS] [TARGET]
 | `--max-trials <MAX_TRIALS>` | Maximum number of trials · default `24` |
 | `--max-concurrency <MAX_CONCURRENCY>` | Highest concurrency to try · default `256` |
 | `--cooldown <COOLDOWN>` | Pause after a throttled trial · default `5s` |
+| `--budget <DURATION>` | Total wall-time budget of the tuner, e.g. 5m: caps the trials so the estimate fits (add --max-duration for a hard stop) |
 | `--emit-profile <FILE>` | Write the tuned profile (TOML) |
 | `--emit-rust <FILE>` | Write a Rust/OpenDAL snippet with the tuned settings |
 | `--emit-python <FILE>` | Write a Python/OpenDAL snippet with the tuned settings |
@@ -355,7 +356,7 @@ oprobe runs export [OPTIONS] --format <FORMAT> <RUNREF>
 | `--out <PATH>` | Write to this file (default: stdout) |
 | `--endpoint <URL>` | OTLP/HTTP collector to push to (e.g. http://localhost:4318); with --format otlp |
 | `--table <TABLE>` | CSV rows: requests or ops · default `requests` |
-| `--signal <SIGNAL>` | OTLP signal: traces, metrics or all · default `all` |
+| `--signal <SIGNAL>` | OTLP signal: one OTLP/JSON document per signal; `all` needs --out DIR (two files) or --endpoint (posts /v1/traces and /v1/metrics) · one of `traces`, `metrics`, `all` · default `traces` |
 
 ## `oprobe runs rm`
 
@@ -735,7 +736,18 @@ oprobe compat [OPTIONS] [TARGET]
 | `--ca-cert <PEM>` | Trust an extra PEM CA bundle |
 | `--insecure` | Skip TLS certificate verification (development only) |
 | `--proxy <PROXY>` | Egress proxy URL, or `none` to ignore HTTPS_PROXY/HTTP_PROXY |
-| `--read-only` | Refuse to run (compat writes test objects); for symmetry with other commands |
+
+*Safety*
+
+| argument | description |
+|---|---|
+| `--dry-run` | Print the plan (requests, bytes, objects written/deleted, cost, ETA) and exit |
+| `--read-only` | Refuse every write and delete (exit 5); implied by --existing |
+| `--max-cost-usd <USD>` | Stop when the estimated request cost exceeds this (USD; exit 4) |
+| `--max-requests <N>` | Stop after this many backend requests (exit 4) |
+| `--max-bytes <SIZE>` | Stop after transferring this many bytes, e.g. 10GiB (exit 4) |
+| `--max-duration <DURATION>` | Stop after this much wall time, e.g. 5m (exit 4) |
+| `--idempotency-key <KEY>` | Name the run prefix after KEY: a retried command reuses and cleans it up |
 | `--min-score <PCT>` | Exit 3 when the score (percent of the checks that ran) is below this |
 
 ## `oprobe baseline`
@@ -834,6 +846,7 @@ oprobe mcp [OPTIONS]
 | argument | description |
 |---|---|
 | `--http <ADDR>` | Serve MCP over Streamable HTTP on this address (e.g. 127.0.0.1:8765) instead of stdio |
+| `--http-allow-remote` | Allow --http on a non-loopback address (anyone who can reach it can use the tools and the configured credentials; there is no authentication) |
 | `--allow-write` | Enable tools that write test data (runs that upload a dataset, tune, cleanup) |
 | `--allow-target <NAME\|URL-PREFIX>` | Only these targets: a configured target name or a URL prefix (repeatable) |
 | `--max-cost-usd <USD>` | Budget applied to every run the server starts: estimated request cost (USD) |
