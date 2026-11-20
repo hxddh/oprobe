@@ -366,6 +366,17 @@ pub async fn tune(
     on_event: Arc<dyn Fn(TuneEvent) + Send + Sync>,
 ) -> Result<TuneOutcome> {
     let p = &session.profile;
+    if opts.objective == Objective::Cost {
+        let probe = cost_report(
+            &Snapshot::default(),
+            &p.cost,
+            &p.target.scheme,
+            p.target.endpoint().as_deref(),
+        );
+        if let Some(why) = probe.not_applicable_reason {
+            anyhow::bail!("the cost objective needs a price table: {why}");
+        }
+    }
     let mut t = Tuner {
         session,
         opts,

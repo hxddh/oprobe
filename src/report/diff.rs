@@ -350,14 +350,16 @@ pub fn diff(base: &Report, cand: &Report, t: &Thresholds) -> DiffReport {
             "",
         );
     }
-    b.higher_worse(
-        "cost per 1M ops USD".into(),
-        base.cost.selected.per_million_ops_usd,
-        cand.cost.selected.per_million_ops_usd,
-        t.cost_pct,
-        0.0001,
-        "",
-    );
+    if base.cost.applicable && cand.cost.applicable {
+        b.higher_worse(
+            "cost per 1M ops USD".into(),
+            base.cost.selected.per_million_ops_usd,
+            cand.cost.selected.per_million_ops_usd,
+            t.cost_pct,
+            0.0001,
+            "",
+        );
+    }
     let passed = !b.checks.iter().any(|c| c.status == Status::Fail);
     DiffReport {
         passed,

@@ -628,6 +628,12 @@ fn cost() -> View {
         return view().child(muted("Cost is projected when the run finishes."));
     };
     let c = &r.cost;
+    if !c.applicable {
+        return view().child(muted(format!(
+            "Cost not applicable: {}",
+            c.not_applicable_reason.as_deref().unwrap_or_default()
+        )));
+    }
     let sel = &c.selected;
     let mut cmp = c.comparison.clone();
     cmp.sort_by(|a, b| a.total_usd.total_cmp(&b.total_usd));

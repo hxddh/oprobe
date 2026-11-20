@@ -144,16 +144,24 @@ pub fn render(r: &Report) -> String {
         fmt_bytes(b.backend_up)
     );
     let c = &r.cost.selected;
-    let _ = writeln!(
-        md,
-        "- {}: **{} per 1M ops** ({} requests + {} egress per month at {:.0}M ops; storage {})",
-        c.provider,
-        fmt_usd(c.per_million_ops_usd),
-        fmt_usd(c.requests_usd),
-        fmt_usd(c.egress_usd),
-        r.cost.monthly_ops / 1e6,
-        fmt_usd(c.storage_usd)
-    );
+    if r.cost.applicable {
+        let _ = writeln!(
+            md,
+            "- {}: **{} per 1M ops** ({} requests + {} egress per month at {:.0}M ops; storage {})",
+            c.provider,
+            fmt_usd(c.per_million_ops_usd),
+            fmt_usd(c.requests_usd),
+            fmt_usd(c.egress_usd),
+            r.cost.monthly_ops / 1e6,
+            fmt_usd(c.storage_usd)
+        );
+    } else {
+        let _ = writeln!(
+            md,
+            "- cost: not applicable — {}",
+            r.cost.not_applicable_reason.as_deref().unwrap_or_default()
+        );
+    }
 
     if !r.diagnosis.findings.is_empty() {
         let _ = writeln!(md, "\n### Findings\n");

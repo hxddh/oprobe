@@ -124,21 +124,45 @@ pub fn preset(name: &str) -> Option<Pricing> {
         .map(|(_, p)| p)
 }
 
-/// Guess the provider preset from scheme and endpoint.
-pub fn detect_provider(scheme: &str, endpoint: Option<&str>) -> &'static str {
-    let ep = endpoint.unwrap_or_default().to_ascii_lowercase();
-    if ep.contains("r2.cloudflarestorage.com") {
-        "cloudflare-r2"
-    } else if ep.contains("aliyuncs.com") || scheme == "oss" {
-        "aliyun-oss"
-    } else if ep.contains("backblazeb2.com") || scheme == "b2" {
-        "backblaze-b2"
-    } else if ep.contains("googleapis.com") || scheme == "gcs" {
-        "gcs"
-    } else if ep.contains("windows.net") || scheme == "azblob" {
-        "azure-blob"
+/// The provider price table for a recognised cloud storage endpoint; `None` for everything
+/// else (in-process backends, localhost, private addresses, self-hosted or unknown endpoints),
+/// whose bill oprobe cannot know.
+pub fn detect_provider(scheme: &str, endpoint: Option<&str>) -> Option<&'static str> {
+    if matches!(scheme, "memory" | "fs") {
+        return None;
+    }
+    let host = match endpoint {
+        Some(ep) => url::Url::parse(ep)
+            .ok()?
+            .host_str()?
+            .trim_end_matches('.')
+            .to_ascii_lowercase(),
+        // Services whose endpoint is implied by the scheme.
+        None => {
+            return match scheme {
+                "gcs" => Some("gcs"),
+                "azblob" => Some("azure-blob"),
+                "oss" => Some("aliyun-oss"),
+                "b2" => Some("backblaze-b2"),
+                _ => None,
+            };
+        }
+    };
+    let under = |domain: &str| host == domain || host.ends_with(&format!(".{domain}"));
+    if under("r2.cloudflarestorage.com") {
+        Some("cloudflare-r2")
+    } else if under("aliyuncs.com") {
+        Some("aliyun-oss")
+    } else if under("backblazeb2.com") {
+        Some("backblaze-b2")
+    } else if under("googleapis.com") {
+        Some("gcs")
+    } else if under("blob.core.windows.net") {
+        Some("azure-blob")
+    } else if under("amazonaws.com") {
+        Some("aws-s3")
     } else {
-        "aws-s3"
+        None
     }
 }
 
@@ -180,6 +204,12 @@ pub struct ProviderCost {
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct CostReport {
+    /// A price table applies: the target is a recognised cloud endpoint, or the profile chose a
+    /// provider / custom pricing. Otherwise `selected` and `comparison` are empty.
+    pub applicable: bool,
+    /// Why no cost is projected (when not applicable).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_applicable_reason: Option<String>,
     pub pricing_as_of: String,
     pub monthly_ops: f64,
     pub stored_gb: f64,
@@ -270,17 +300,42 @@ pub fn cost_report(
     let selected_key = spec
         .provider
         .clone()
-        .unwrap_or_else(|| detect_provider(scheme, endpoint).to_owned());
+        .or_else(|| detect_provider(scheme, endpoint).map(str::to_owned));
+    let selected = match (&spec.pricing, selected_key.as_deref().and_then(preset)) {
+        (Some(custom), _) => Some(price("custom", custom, &u, spec)),
+        (None, Some(p)) => Some(price(selected_key.as_deref().unwrap_or_default(), &p, &u, spec)),
+        (None, None) => None,
+    };
+    let Some(selected) = selected else {
+        return CostReport {
+            applicable: false,
+            not_applicable_reason: Some(match &selected_key {
+                Some(k) => format!("unknown pricing provider `{k}`"),
+                None => format!(
+                    "{} is not a recognised cloud storage endpoint, so its bill is unknown; set `cost.provider` (or `--provider`) or `[cost.pricing]` to project one",
+                    endpoint.unwrap_or(match scheme {
+                        "memory" => "the in-memory backend",
+                        "fs" => "the local filesystem",
+                        _ => "the target",
+                    })
+                ),
+            }),
+            pricing_as_of: PRICING_AS_OF.to_owned(),
+            monthly_ops: spec.monthly_ops,
+            stored_gb: spec.stored_gib,
+            egress_fraction: spec.egress_fraction,
+            per_op: u,
+            selected: ProviderCost::default(),
+            comparison: Vec::new(),
+        };
+    };
     let comparison: Vec<ProviderCost> = presets()
         .iter()
         .map(|(k, p)| price(k, p, &u, spec))
         .collect();
-    let selected = match (&spec.pricing, preset(&selected_key)) {
-        (Some(custom), _) => price("custom", custom, &u, spec),
-        (None, Some(p)) => price(&selected_key, &p, &u, spec),
-        (None, None) => price("aws-s3", &preset("aws-s3").expect("preset"), &u, spec),
-    };
     CostReport {
+        applicable: true,
+        not_applicable_reason: None,
         pricing_as_of: PRICING_AS_OF.to_owned(),
         monthly_ops: spec.monthly_ops,
         stored_gb: spec.stored_gib,
@@ -326,7 +381,7 @@ mod tests {
             stored_gib: 0.0,
             ..Default::default()
         };
-        let r = cost_report(&s, &spec, "s3", None);
+        let r = cost_report(&s, &spec, "s3", Some("https://s3.us-east-1.amazonaws.com"));
         // per million ops: 2M GET * 0.40 + 1M PUT * 5.00 = 5.80 ;
         // egress 1e12 B = 931.32 GiB (billed "GB") * 0.09 = 83.82
         assert!(
@@ -372,7 +427,7 @@ mod tests {
             stored_gib: 10.0,
             ..Default::default()
         };
-        let r = cost_report(&s, &spec, "s3", None);
+        let r = cost_report(&s, &spec, "s3", Some("https://s3.us-east-1.amazonaws.com"));
         assert_eq!(r.stored_gb, 10.0);
     }
 
@@ -380,12 +435,64 @@ mod tests {
     fn detects_providers() {
         assert_eq!(
             detect_provider("s3", Some("https://acc.r2.cloudflarestorage.com")),
-            "cloudflare-r2"
+            Some("cloudflare-r2")
         );
-        assert_eq!(detect_provider("gcs", None), "gcs");
+        assert_eq!(detect_provider("gcs", None), Some("gcs"));
         assert_eq!(
             detect_provider("s3", Some("https://oss-cn-hangzhou.aliyuncs.com")),
-            "aliyun-oss"
+            Some("aliyun-oss")
         );
+        assert_eq!(
+            detect_provider("s3", Some("https://s3.eu-west-1.amazonaws.com")),
+            Some("aws-s3")
+        );
+        for local in [
+            "http://127.0.0.1:9000",
+            "http://localhost:9000",
+            "http://10.0.0.5:9000",
+            "https://minio.internal",
+            "http://[::1]:9000",
+            // A cloud domain in the path or as a prefix is not that cloud.
+            "http://192.168.1.2/amazonaws.com",
+            "https://amazonaws.com.evil.example",
+        ] {
+            assert_eq!(detect_provider("s3", Some(local)), None, "{local}");
+        }
+        assert_eq!(detect_provider("memory", None), None);
+        assert_eq!(detect_provider("fs", None), None);
+        assert_eq!(detect_provider("cos", None), None);
+    }
+
+    #[test]
+    fn no_cost_is_projected_for_local_or_unknown_endpoints() {
+        let s = Snapshot {
+            summary: Summary {
+                ops: 10,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let spec = CostSpec::default();
+        for (scheme, ep) in [
+            ("memory", None),
+            ("fs", None),
+            ("s3", Some("http://127.0.0.1:9000")),
+        ] {
+            let r = cost_report(&s, &spec, scheme, ep);
+            assert!(!r.applicable, "{scheme} {ep:?}");
+            assert!(r.not_applicable_reason.is_some());
+            assert!(r.comparison.is_empty());
+            assert_eq!(r.selected.total_usd, 0.0);
+        }
+        // An explicit choice of price table applies anywhere.
+        let chosen = CostSpec {
+            provider: Some("aws-s3".into()),
+            ..Default::default()
+        };
+        let r = cost_report(&s, &chosen, "s3", Some("http://127.0.0.1:9000"));
+        assert!(r.applicable);
+        assert_eq!(r.selected.key, "aws-s3");
+        let r = cost_report(&s, &spec, "s3", Some("https://s3.us-east-1.amazonaws.com"));
+        assert!(r.applicable && r.selected.key == "aws-s3");
     }
 }

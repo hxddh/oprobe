@@ -1093,6 +1093,10 @@ mod tests {
         );
         assert_eq!(n.options["region"], "auto");
         assert!(!n.options.contains_key("account_id"));
+        assert_eq!(
+            crate::analysis::cost::detect_provider("s3", n.endpoint().as_deref()),
+            Some("cloudflare-r2")
+        );
         // A profile written from it reloads to the same target.
         let toml = Profile::from_target(n.clone()).to_toml().unwrap();
         let back: Profile = toml::from_str(&toml).unwrap();

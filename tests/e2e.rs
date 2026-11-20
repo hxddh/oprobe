@@ -274,6 +274,13 @@ async fn throttling_is_detected_and_diagnosed() {
         r.diagnosis.headline
     );
     assert!(r.cost.per_op.failed_requests > 0.0);
+    // A localhost lab has no cloud bill: no AWS (or any) price is projected.
+    assert!(!r.cost.applicable, "{:?}", r.cost);
+    assert!(r.cost.comparison.is_empty());
+    assert!(oprobe::report::to_json(&r).contains("\"applicable\": false"));
+    let text = oprobe::report::terminal::render(&r);
+    assert!(!text.contains("COST"), "{text}");
+    assert!(oprobe::report::markdown::render(&r).contains("cost: not applicable"));
 }
 
 #[tokio::test(flavor = "multi_thread")]

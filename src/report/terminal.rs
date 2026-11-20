@@ -522,7 +522,7 @@ pub fn render(r: &Report) -> String {
         );
     }
 
-    if r.target.endpoint.is_some() && s.summary.ops > 0 {
+    if r.cost.applicable && s.summary.ops > 0 {
         let cst = &r.cost;
         section(
             &mut out,
