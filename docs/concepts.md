@@ -12,6 +12,10 @@ takes a target accepts:
 - a **URL**: `s3://bucket/prefix`, `gcs://bucket`, `azblob://container`, `oss://`, `cos://`, `b2://`,
   `webdav://`, `fs:///path`, `memory://` (with `--endpoint`, `--region`, `--option KEY=VALUE` as needed);
 - `lab://SCENARIO`: an S3-compatible server with programmable faults inside oprobe (no credentials).
+  Scenarios: `clean`, `demo` (8 ms, 503 above 24 requests in flight, 2.5 % stragglers), `throttle`
+  (503 above 8 in flight), `stragglers`, `lossy`, `flaky` and `parquet` (the demo's 24-in-flight limit
+  without stragglers, for `--preset parquet`: a HEAD, a footer read, then 4 parallel column reads per
+  operation, so 6 workers fit under the limit and 8 throttle).
 
 ```toml
 # <config dir>/oprobe/config.toml   (oprobe config path · oprobe config edit)

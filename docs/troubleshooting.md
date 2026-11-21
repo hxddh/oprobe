@@ -18,6 +18,7 @@ the writes). Every error of every command carries a stable code (`-o json`: `err
 |---|---|---|
 | `usage.unknown_target` | the name is not in the config file | `oprobe target list`; pass a URL; `oprobe target add NAME URL` |
 | `usage.unknown_run` | no run matches the RUNREF | `oprobe runs list`; use more characters of the id |
+| `usage.unknown_baseline` | no baseline has that name | `oprobe baseline list`; `oprobe baseline set NAME RUNREF…` |
 | `config.invalid`, `config.unknown_option` | a typo in the config file or an option the service ignores | `oprobe config edit` (validated on save); the error names the closest valid option |
 | `auth.no_credentials`, `auth.denied`, `AccessDenied`, `SignatureDoesNotMatch` | missing or wrong credentials, IAM | `--credentials profile:NAME`, export `AWS_*` / `GOOGLE_APPLICATION_CREDENTIALS` / `AZURE_STORAGE_*`; oprobe needs list/read/write/delete on the prefix — or measure read-only with `--existing PREFIX`, or `--anonymous` for public buckets |
 | `net.tls`, `invalid peer certificate: UnknownIssuer` | private CA or a TLS-inspecting proxy | `--ca-cert corp.pem` (or `SSL_CERT_FILE`); `--insecure` for development endpoints only |
@@ -71,6 +72,12 @@ URL (`s3://bucket/prefix`, `memory://`); `oprobe target add NAME URL`.
 
 No stored run matches the RUNREF. `oprobe runs list`; use more characters of the id, `last`,
 `last~N`, a label or a path to a `.oprobe` file.
+
+<a id="usage-unknown_baseline"></a>
+### `usage.unknown_baseline` (exit 2)
+
+No baseline has that name. `oprobe baseline list`; create one with `oprobe baseline set NAME
+RUNREF…` or `oprobe run … --baseline NAME`.
 
 <a id="config-invalid"></a>
 ### `config.invalid` (exit 2)

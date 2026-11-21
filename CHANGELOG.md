@@ -4,6 +4,44 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## v4.0.0 — unreleased
+
+oprobe 4: *one model, one spec, one loop* ([docs/design/v4.md](docs/design/v4.md)). Nothing reads 3.x run files
+or reports.
+
+### Foundation (breaking)
+
+- **Run spec**: every report carries `spec` (`oprobe.report/4`; run files are `oprobe.run/4`) — the resolved
+  profile with secrets redacted, the target as given, the seed, `--existing` and the label. `oprobe run --from
+  RUNREF [--set key=value]… [flags]` replays a stored run (credentials are resolved again from the target);
+  `--set` changes any knob, workload, SLA or cost setting (`oprobe run … --set seed=7` works without
+  `--from` too). `config::defaults()` is the single source of built-in defaults.
+- **Findings' verifications** are `{ description, overrides, command, rerun, replay, expect }`: `command` is
+  `oprobe verify RUN CODE`, `rerun` is `oprobe run --from RUN --set …`, `replay` is a self-contained
+  `oprobe run TARGET …` that keeps every setting of the run (warmup, seed, mix, dataset, endpoint, region, HTTP
+  version, tail-cut, rate, `--existing`, `--max-ops`) and changes only the advice. The 3.x `command: Option`
+  is gone.
+- **Capacity model**: `report.capacity` estimates the in-flight ceiling from the request rows (the levels at
+  which throttling starts, bracketed `lo`/`hi`), the per-operation request shape (a parquet scan peaks at 4
+  requests in flight, not its 6.3 requests per op), `safe_concurrency(headroom)` and `predict(concurrency)`.
+  Ceilings are remembered per target and workload in `<data>/capacity.toml`.
+- **Target identity**: `--allow-target` on the MCP server compares normalised identities (scheme and bucket
+  case, default ports, `.`/`..`/`//`, trailing `/`, query) on whole path segments; `..` above a root and
+  `existing` prefixes that leave the allowed target are refused (fixes the `fs://…/allowed/../other` bypass).
+- **Typed input**: one parser per input kind (`src/input.rs`) behind clap, the profile and config loaders and
+  MCP, with "did you mean" hints. Bad input is never `internal` any more, and the CLI and MCP give the same
+  code; the message-matching classifier is gone. Provider aliases (`aws`, `gcp`, `google`, `azure`, `r2`, `b2`,
+  `oss`, `aliyun`) are accepted. Missing credentials are `auth.no_credentials`. New code
+  `usage.unknown_baseline`. `--object-size 0`, `--endpoint ftp://…`, a missing `--config` file, negative
+  durations and amounts and `target add` of an existing name (now needs `--replace`) are refused; `top -o json`
+  and `gui` without the feature exit 2 with a JSON error.
+- **Envelope**: every JSON command result carries `next` (`{ title, cli, mcp: { tool, arguments } }`) and
+  `warnings` (including the command's stderr warnings). Doctor's `next_command`, explain's `next_commands`,
+  the demo's `next_commands` and MCP `get_run`'s prose `next` moved onto it. Schemas are under
+  `…/schemas/4/`; new schemas: `run-spec`, `overrides`, `capacity`, `capacity-history`, `verification`,
+  `recommendation`, `next-step`, `target-id`, `defaults`.
+- **Lab**: new `lab://parquet` scenario (503 above 24 in flight, no stragglers) for the parquet preset.
+
 ## v3.0.0 — 2026-11-20
 
 oprobe 3 turns a benchmark into a product: **see every request your object-storage client makes, know where

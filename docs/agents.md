@@ -20,7 +20,7 @@ repository should read [`AGENTS.md`](../AGENTS.md).
 | Self-description | `oprobe capabilities -o json` | `oprobe schema capabilities` |
 
 Schemas are JSON Schema 2020-12 with `$id`
-`https://github.com/hxddh/oprobe/schemas/3/<name>.json`; the checked-in copies live in
+`https://github.com/hxddh/oprobe/schemas/4/<name>.json`; the checked-in copies live in
 [`schemas/`](../schemas). `oprobe schema` lists every name.
 
 Rules that hold everywhere:
@@ -34,6 +34,17 @@ Rules that hold everywhere:
   no human-formatted numbers in machine fields. A test walks the report schema to enforce this.
 - Time buckets (`timeline[].t_s`, `heatmap.t_buckets_s`, `interval` events) are stamped with the start
   of the bucket, in seconds from the measurement window start.
+- `_mean` marks fractional means of counts (`capacity.observed.inflight_mean`); values whose unit
+  is a sibling `unit` field (`predicted`, `lo`, `hi`, `baseline`, `candidate`) are unitless.
+- Every JSON command result is an envelope: its own fields plus `next` (suggested steps, each
+  `{ title, cli, mcp: { tool, arguments } }`) and `warnings` (including what the command printed as
+  warnings on stderr).
+- Every report carries `spec`, the run's replayable definition: `oprobe run --from RUNREF` repeats a
+  run exactly (credentials are resolved again), `--set key=value` changes one setting. A finding's
+  `verification` names its `overrides` and gives `command` (`oprobe verify RUN CODE`), `rerun`
+  (`oprobe run --from RUN --set …`) and `replay` (a self-contained `oprobe run TARGET …`).
+- Bad input is never `internal`: it is `usage.*` or `config.*` (exit 2) with a hint, and the CLI and
+  the MCP server give the same code for the same input.
 - Finding codes are `snake_case`; `oprobe explain` also accepts `-` spellings.
 - Consumers must ignore unknown fields and unknown event types.
 

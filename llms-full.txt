@@ -243,6 +243,10 @@ takes a target accepts:
 - a **URL**: `s3://bucket/prefix`, `gcs://bucket`, `azblob://container`, `oss://`, `cos://`, `b2://`,
   `webdav://`, `fs:///path`, `memory://` (with `--endpoint`, `--region`, `--option KEY=VALUE` as needed);
 - `lab://SCENARIO`: an S3-compatible server with programmable faults inside oprobe (no credentials).
+  Scenarios: `clean`, `demo` (8 ms, 503 above 24 requests in flight, 2.5 % stragglers), `throttle`
+  (503 above 8 in flight), `stragglers`, `lossy`, `flaky` and `parquet` (the demo's 24-in-flight limit
+  without stragglers, for `--preset parquet`: a HEAD, a footer read, then 4 parallel column reads per
+  operation, so 6 workers fit under the limit and 8 throttle).
 
 ```toml
 # <config dir>/oprobe/config.toml   (oprobe config path · oprobe config edit)
@@ -999,7 +1003,7 @@ repository should read [`AGENTS.md`](../AGENTS.md).
 | Self-description | `oprobe capabilities -o json` | `oprobe schema capabilities` |
 
 Schemas are JSON Schema 2020-12 with `$id`
-`https://github.com/hxddh/oprobe/schemas/3/<name>.json`; the checked-in copies live in
+`https://github.com/hxddh/oprobe/schemas/4/<name>.json`; the checked-in copies live in
 [`schemas/`](../schemas). `oprobe schema` lists every name.
 
 Rules that hold everywhere:
@@ -1013,6 +1017,17 @@ Rules that hold everywhere:
   no human-formatted numbers in machine fields. A test walks the report schema to enforce this.
 - Time buckets (`timeline[].t_s`, `heatmap.t_buckets_s`, `interval` events) are stamped with the start
   of the bucket, in seconds from the measurement window start.
+- `_mean` marks fractional means of counts (`capacity.observed.inflight_mean`); values whose unit
+  is a sibling `unit` field (`predicted`, `lo`, `hi`, `baseline`, `candidate`) are unitless.
+- Every JSON command result is an envelope: its own fields plus `next` (suggested steps, each
+  `{ title, cli, mcp: { tool, arguments } }`) and `warnings` (including what the command printed as
+  warnings on stderr).
+- Every report carries `spec`, the run's replayable definition: `oprobe run --from RUNREF` repeats a
+  run exactly (credentials are resolved again), `--set key=value` changes one setting. A finding's
+  `verification` names its `overrides` and gives `command` (`oprobe verify RUN CODE`), `rerun`
+  (`oprobe run --from RUN --set …`) and `replay` (a self-contained `oprobe run TARGET …`).
+- Bad input is never `internal`: it is `usage.*` or `config.*` (exit 2) with a hint, and the CLI and
+  the MCP server give the same code for the same input.
 - Finding codes are `snake_case`; `oprobe explain` also accepts `-` spellings.
 - Consumers must ignore unknown fields and unknown event types.
 
@@ -1738,6 +1753,7 @@ the writes). Every error of every command carries a stable code (`-o json`: `err
 |---|---|---|
 | `usage.unknown_target` | the name is not in the config file | `oprobe target list`; pass a URL; `oprobe target add NAME URL` |
 | `usage.unknown_run` | no run matches the RUNREF | `oprobe runs list`; use more characters of the id |
+| `usage.unknown_baseline` | no baseline has that name | `oprobe baseline list`; `oprobe baseline set NAME RUNREF…` |
 | `config.invalid`, `config.unknown_option` | a typo in the config file or an option the service ignores | `oprobe config edit` (validated on save); the error names the closest valid option |
 | `auth.no_credentials`, `auth.denied`, `AccessDenied`, `SignatureDoesNotMatch` | missing or wrong credentials, IAM | `--credentials profile:NAME`, export `AWS_*` / `GOOGLE_APPLICATION_CREDENTIALS` / `AZURE_STORAGE_*`; oprobe needs list/read/write/delete on the prefix — or measure read-only with `--existing PREFIX`, or `--anonymous` for public buckets |
 | `net.tls`, `invalid peer certificate: UnknownIssuer` | private CA or a TLS-inspecting proxy | `--ca-cert corp.pem` (or `SSL_CERT_FILE`); `--insecure` for development endpoints only |
@@ -1791,6 +1807,12 @@ URL (`s3://bucket/prefix`, `memory://`); `oprobe target add NAME URL`.
 
 No stored run matches the RUNREF. `oprobe runs list`; use more characters of the id, `last`,
 `last~N`, a label or a path to a `.oprobe` file.
+
+<a id="usage-unknown_baseline"></a>
+### `usage.unknown_baseline` (exit 2)
+
+No baseline has that name. `oprobe baseline list`; create one with `oprobe baseline set NAME
+RUNREF…` or `oprobe run … --baseline NAME`.
 
 <a id="config-invalid"></a>
 ### `config.invalid` (exit 2)
@@ -2059,7 +2081,7 @@ oprobe run [OPTIONS] [TARGET]
 
 | argument | description |
 |---|---|
-| `--provider <PROVIDER>` | Pricing preset: aws-s3, gcs, azure-blob, cloudflare-r2, backblaze-b2, aliyun-oss |
+| `--provider <PROVIDER>` | Pricing preset: aws-s3, gcs, azure-blob, cloudflare-r2, backblaze-b2, aliyun-oss (aliases: aws, gcp, google, azure, r2, b2, oss, aliyun) |
 | `--monthly-ops <MONTHLY_OPS>` | Logical operations per month to project costs for |
 | `--egress-fraction <EGRESS_FRACTION>` | Fraction of downloads leaving the cloud (0..1) |
 | `--stored-gib <STORED_GIB>` | Stored data in GiB |
@@ -2096,6 +2118,13 @@ oprobe run [OPTIONS] [TARGET]
 | `--idempotency-key <KEY>` | Name the run prefix after KEY: a retried command reuses and cleans it up |
 | `--repeat <N>` | Repeat the run N times and report the spread · default `1` |
 | `--baseline <NAME>` | Compare against (and add to) a named baseline |
+
+*Replay*
+
+| argument | description |
+|---|---|
+| `--from <RUNREF>` | Replay a stored run (RUNREF): its spec, with credentials resolved again from the target; other flags and --set override it |
+| `--set <KEY=VALUE>` | Override one setting, repeatable (e.g. --set concurrency=8 --set warmup=1s); keys: the profile's knob, workload, SLA and cost names, `endpoint`, `region`, `label` |
 
 ## `oprobe demo`
 
@@ -2167,7 +2196,7 @@ oprobe tune [OPTIONS] [TARGET]
 
 | argument | description |
 |---|---|
-| `--provider <PROVIDER>` | Pricing preset: aws-s3, gcs, azure-blob, cloudflare-r2, backblaze-b2, aliyun-oss |
+| `--provider <PROVIDER>` | Pricing preset: aws-s3, gcs, azure-blob, cloudflare-r2, backblaze-b2, aliyun-oss (aliases: aws, gcp, google, azure, r2, b2, oss, aliyun) |
 | `--monthly-ops <MONTHLY_OPS>` | Logical operations per month to project costs for |
 | `--egress-fraction <EGRESS_FRACTION>` | Fraction of downloads leaving the cloud (0..1) |
 | `--stored-gib <STORED_GIB>` | Stored data in GiB |
@@ -2375,7 +2404,7 @@ oprobe target [OPTIONS] <COMMAND>
 
 ## `oprobe target add`
 
-Add (or replace) a named target
+Add a named target (`--replace` overwrites one of the same name)
 
 ```text
 oprobe target add [OPTIONS] <NAME> <URL>
@@ -2390,6 +2419,7 @@ oprobe target add [OPTIONS] <NAME> <URL>
 | `--credentials <CREDENTIALS>` | env \| profile:NAME \| anonymous |
 | `--option <KEY=VALUE>` | OpenDAL option, repeatable (KEY=VALUE) |
 | `--no-test` | Save without the quick read-only check |
+| `--replace` | Replace a target of the same name (otherwise an existing name is refused) |
 
 ## `oprobe target list`
 
@@ -2541,7 +2571,7 @@ oprobe watch [OPTIONS] [TARGET]
 
 | argument | description |
 |---|---|
-| `--provider <PROVIDER>` | Pricing preset: aws-s3, gcs, azure-blob, cloudflare-r2, backblaze-b2, aliyun-oss |
+| `--provider <PROVIDER>` | Pricing preset: aws-s3, gcs, azure-blob, cloudflare-r2, backblaze-b2, aliyun-oss (aliases: aws, gcp, google, azure, r2, b2, oss, aliyun) |
 | `--monthly-ops <MONTHLY_OPS>` | Logical operations per month to project costs for |
 | `--egress-fraction <EGRESS_FRACTION>` | Fraction of downloads leaving the cloud (0..1) |
 | `--stored-gib <STORED_GIB>` | Stored data in GiB |
@@ -2631,7 +2661,7 @@ oprobe matrix [OPTIONS] [TARGET]
 
 | argument | description |
 |---|---|
-| `--provider <PROVIDER>` | Pricing preset: aws-s3, gcs, azure-blob, cloudflare-r2, backblaze-b2, aliyun-oss |
+| `--provider <PROVIDER>` | Pricing preset: aws-s3, gcs, azure-blob, cloudflare-r2, backblaze-b2, aliyun-oss (aliases: aws, gcp, google, azure, r2, b2, oss, aliyun) |
 | `--monthly-ops <MONTHLY_OPS>` | Logical operations per month to project costs for |
 | `--egress-fraction <EGRESS_FRACTION>` | Fraction of downloads leaving the cloud (0..1) |
 | `--stored-gib <STORED_GIB>` | Stored data in GiB |
@@ -2770,7 +2800,7 @@ oprobe lab [OPTIONS]
 | argument | description |
 |---|---|
 | `--bind <BIND>` | · default `127.0.0.1:9000` |
-| `--scenario <SCENARIO>` | Start from a fault preset: clean, demo, throttle, stragglers, lossy, flaky (the flags below override it) |
+| `--scenario <SCENARIO>` | Start from a fault preset: clean, demo, throttle, stragglers, lossy, flaky, parquet (the flags below override it) |
 | `--error-every <ERROR_EVERY>` | Answer every Nth request with 500 InternalError |
 | `--reset-every <RESET_EVERY>` | Drop the connection on every Nth request |
 | `--tls` | Serve HTTPS (certificate for localhost / 127.0.0.1) |
