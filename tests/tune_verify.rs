@@ -451,4 +451,9 @@ fn fix_without_saving_verifies_from_the_in_memory_diagnosis() {
     );
     assert!(v["verify"].is_object(), "{v}");
     assert_eq!(saved_runs(&env), 0, "--no-save stores nothing");
+    // The next step cannot replay an unsaved run by id: it is a self-contained command.
+    for n in v["next"].as_array().unwrap() {
+        let cli = n["cli"].as_str().unwrap();
+        assert!(!cli.contains("--from"), "{cli}");
+    }
 }

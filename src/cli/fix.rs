@@ -36,6 +36,11 @@ pub struct FixOutput {
     pub verify: Option<VerifyResult>,
     /// Files written (`--write-profile`): kind → path.
     pub wrote: Vec<(String, String)>,
+    /// A self-contained replay of the recommendation, when the diagnosis was not saved
+    /// (`--no-save`): `run --from` cannot name it.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub unsaved_replay: Option<String>,
 }
 
 impl CommandOutput for FixOutput {
@@ -102,13 +107,13 @@ impl CommandOutput for FixOutput {
         if self.recommendation.overrides.is_empty() {
             return Vec::new();
         }
-        vec![NextStep::new(
-            "run with the recommended settings",
+        let cli = self.unsaved_replay.clone().unwrap_or_else(|| {
             crate::model::RunSpec::rerun_from(
                 &self.diagnosis_run_id,
                 &self.recommendation.overrides,
-            ),
-        )]
+            )
+        });
+        vec![NextStep::new("run with the recommended settings", cli)]
     }
 }
 
@@ -279,6 +284,7 @@ pub async fn cmd_fix(a: FixArgs, ctx: &Ctx) -> Result<u8> {
         write_file(p, &rec.profile_toml)?;
         wrote.push(("profile".to_owned(), p.display().to_string()));
     }
+    let rec_overrides = rec.overrides.clone();
     ctx.out.finish(&FixOutput {
         diagnosis_run_id: diag.id().to_owned(),
         finding_codes: diag
@@ -292,6 +298,10 @@ pub async fn cmd_fix(a: FixArgs, ctx: &Ctx) -> Result<u8> {
         recommendation: rec,
         verify,
         wrote,
+        unsaved_replay: a
+            .output
+            .no_save
+            .then(|| diag.report.spec.with(&rec_overrides).command()),
     })
 }
 
