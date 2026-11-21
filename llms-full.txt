@@ -1997,6 +1997,8 @@ Every command accepts the global options below. Exit codes: `0` ok · `1` runtim
 | [`oprobe demo`](#oprobe-demo) | Start a lab target with throttling and stragglers, run it and narrate the result |
 | [`oprobe tune`](#oprobe-tune) | Find the best client configuration for a workload (throttle-aware) |
 | [`oprobe compare`](#oprobe-compare) | Regression gate: compare two runs (RUNREFs or files) and fail on regressions |
+| [`oprobe verify`](#oprobe-verify) | Test a finding's advice: replay the run with and without the change (A B A B…) and answer confirmed, refuted or inconclusive |
+| [`oprobe fix`](#oprobe-fix) | Diagnose a target, tune it and verify the recommendation; prints a profile patch |
 | [`oprobe runs`](#oprobe-runs) | Saved runs: list, show, open, export, rm, gc |
 | [`oprobe analyze`](#oprobe-analyze) | Re-slice a run by API, connection, remote, stage or second |
 | [`oprobe explain`](#oprobe-explain) | Narrate a run's causes and advice, or document a finding code |
@@ -2236,12 +2238,15 @@ oprobe tune [OPTIONS] [TARGET]
 
 | argument | description |
 |---|---|
-| `--objective <OBJECTIVE>` | What to optimize · one of `throughput`, `latency`, `cost` · default `throughput` |
+| `--objective <OBJECTIVE>` | What to optimize · one of `goodput`, `p99`, `cost`, `balanced` · default `goodput` |
 | `--trial-duration <TRIAL_DURATION>` | Measurement window per trial · default `5s` |
 | `--trial-warmup <TRIAL_WARMUP>` | Warmup per trial · default `1s` |
 | `--max-trials <MAX_TRIALS>` | Maximum number of trials · default `24` |
 | `--max-concurrency <MAX_CONCURRENCY>` | Highest concurrency to try · default `256` |
 | `--cooldown <COOLDOWN>` | Pause after a throttled trial · default `5s` |
+| `--max-throttle-ratio <RATIO>` | Share of throttled requests a configuration may cause and still be feasible (default 0.001, or the profile's `sla.max_throttle_rate`) |
+| `--boundary-repeats <BOUNDARY_REPEATS>` | Runs of each bisection trial near the throttle boundary · default `2` |
+| `--headroom-ratio <RATIO>` | In-flight headroom kept below the throttling ceiling (default 0.15) |
 | `--budget <DURATION>` | Total wall-time budget of the tuner, e.g. 5m: caps the trials so the estimate fits (add --max-duration for a hard stop) |
 | `--emit-profile <FILE>` | Write the tuned profile (TOML) |
 | `--emit-rust <FILE>` | Write a Rust/OpenDAL snippet with the tuned settings |
@@ -2272,9 +2277,158 @@ oprobe compare [OPTIONS] [A] [B]
 | `--allow-throttling` | Do not fail when the candidate starts getting throttled |
 | `--allow-workload-change` | Do not fail when the workload differs (preset, mix, dataset, access, rate) |
 | `--allow-target-change` | Do not fail when the target differs (scheme, bucket/prefix, endpoint, options) |
+| `--strict` | Runs of different targets or workloads are an error (exit 2) instead of a warning |
 | `--markdown <FILE>` | Write a Markdown summary (PR comment / job summary) |
 | `--junit <FILE>` | Write JUnit XML |
 | `--json <FILE>` | Write the comparison as JSON |
+
+## `oprobe verify`
+
+Test a finding's advice: replay the run with and without the change (A B A B…) and answer confirmed, refuted or inconclusive
+
+```text
+oprobe verify [OPTIONS] <RUNREF> [CODE]
+```
+
+| argument | description |
+|---|---|
+| `<RUNREF>` | The run whose findings to test (RUNREF: id, prefix, last, last~N, label) |
+| `<CODE>` | The finding code to verify (default: every finding with a verification) |
+| `--all` | Verify every finding that has a verification |
+| `--repeat <N>` | Baseline / candidate pairs to run (interleaved A B A B…) · default `3` |
+| `--no-calibrate` | Do not store the outcomes or calibrate the capacity history and noise floor |
+
+*Safety*
+
+| argument | description |
+|---|---|
+| `--dry-run` | Print the plan (requests, bytes, objects written/deleted, cost, ETA) and exit |
+| `--read-only` | Refuse every write and delete (exit 5); implied by --existing |
+| `--max-cost-usd <USD>` | Stop when the estimated request cost exceeds this (USD; exit 4) |
+| `--max-requests <N>` | Stop after this many backend requests (exit 4) |
+| `--max-bytes <SIZE>` | Stop after transferring this many bytes, e.g. 10GiB (exit 4) |
+| `--max-duration <DURATION>` | Stop after this much wall time, e.g. 5m (exit 4) |
+| `--idempotency-key <KEY>` | Name the run prefix after KEY: a retried command reuses and cleans it up |
+| `--no-save` | Do not save the replayed runs in the run store |
+
+## `oprobe fix`
+
+Diagnose a target, tune it and verify the recommendation; prints a profile patch
+
+```text
+oprobe fix [OPTIONS] [TARGET]
+```
+
+*Target*
+
+| argument | description |
+|---|---|
+| `<TARGET>` | Target name (see `oprobe target list`) or storage URL: s3://bucket/prefix, gcs://bucket, azblob://container, oss://, cos://, b2://, fs:///path, memory:// |
+| `-p, --profile <FILE>` | Load a profile (TOML); flags override its values |
+| `--endpoint <ENDPOINT>` | Custom endpoint (MinIO, R2, Ceph, private clouds) |
+| `--region <REGION>` | Region of the bucket (e.g. us-east-1); most S3-compatible services accept any value |
+| `--option <KEY=VALUE>` | Extra backend option, repeatable (e.g. --option enable_virtual_host_style=true) |
+| `--anonymous` | Access a public bucket without credentials (s3, gcs, azblob, oss: unsigned requests) |
+| `--ca-cert <PEM>` | Trust an extra PEM CA bundle |
+| `--insecure` | Skip TLS certificate verification (development only) |
+| `--proxy <PROXY>` | Egress proxy URL, or `none` to ignore HTTPS_PROXY/HTTP_PROXY |
+
+*Workload*
+
+| argument | description |
+|---|---|
+| `--preset <PRESET>` | Workload preset: parquet, checkpoint, small-files, metadata, mixed |
+| `-d, --duration <DURATION>` | Measurement window (e.g. 30s, 2m) |
+| `--warmup <WARMUP>` | Warmup before measuring (connections, caches) |
+| `--max-ops <MAX_OPS>` | Stop after N measured operations |
+| `--rate <RATE>` | Open-loop arrival rate (ops/s); latency is measured from the intended start time |
+| `--existing <PREFIX>` | Benchmark existing objects under this prefix (read-only) |
+| `--objects <OBJECTS>` | Number of dataset objects to generate |
+| `--object-size <OBJECT_SIZE>` | Size of each generated object (e.g. 16MiB) |
+| `--access <ACCESS>` | Key popularity: uniform, zipf:1.1, hotset:0.2/0.8 |
+| `--persist-dataset` | Keep the generated dataset for later runs (oprobe-dataset/<fingerprint>/) |
+| `--no-verify` | Skip CRC32C verification |
+| `--keep-data` | Do not delete test data when the run ends |
+
+*Client knobs*
+
+| argument | description |
+|---|---|
+| `-c, --concurrency <CONCURRENCY>` | Concurrent operations (workers) |
+| `--io-concurrency <IO_CONCURRENCY>` | Per-operation reader/writer parallelism |
+| `--chunk-size <CHUNK_SIZE>` | Reader/writer chunk and multipart part size (e.g. 8MiB) |
+| `--range-gap <RANGE_GAP>` | Merge vectored ranges closer than this (e.g. 64KiB) |
+| `--max-inflight <MAX_INFLIGHT>` | Cap in-flight HTTP requests (0 = unlimited) |
+| `--http <HTTP>` | HTTP version · one of `auto`, `h1`, `h2` |
+| `--no-keep-alive` | Open a new connection for every request |
+| `--microscope` | Use oprobe's instrumented connection pool instead of OpenDAL's own HTTP client: exact pool queueing, per-dial DNS/TCP/proxy/TLS and HTTP/2 streams, at the cost of measuring a different client than production runs |
+| `--cache <SIZE>` | Enable the in-memory read cache with this size (e.g. 512MiB) |
+| `--retries <RETRIES>` | Retry attempts for temporary errors |
+| `--tail-cut` | Cancel and retry straggler requests (TailCutLayer) |
+| `--addressing <STYLE>` | S3 bucket addressing: auto (as configured), virtual (bucket.host) or path (host/bucket) |
+| `--checksum <ALGO>` | Checksum computed by the client and verified by the server on writes (S3: crc32c) |
+| `--sse <MODE>` | Server-side encryption of written objects (S3: AES256, aws:kms) |
+
+*Cost*
+
+| argument | description |
+|---|---|
+| `--provider <PROVIDER>` | Pricing preset: aws-s3, gcs, azure-blob, cloudflare-r2, backblaze-b2, aliyun-oss (aliases: aws, gcp, google, azure, r2, b2, oss, aliyun) |
+| `--monthly-ops <MONTHLY_OPS>` | Logical operations per month to project costs for |
+| `--egress-fraction <EGRESS_FRACTION>` | Fraction of downloads leaving the cloud (0..1) |
+| `--stored-gib <STORED_GIB>` | Stored data in GiB |
+
+*SLA (exit code 3 when breached)*
+
+| argument | description |
+|---|---|
+| `--sla <MODE>` | `none` reports the SLA verdict without failing the command · one of `enforce`, `none` |
+| `--max-error-rate <RATE>` | Max share of failed operations, e.g. 1% or 0.01 (default 1%) |
+| `--max-throttle-rate <RATE>` | Max share of throttled (429/503) operations, e.g. 0% (default: not checked by `run`; `tune` rejects any throttling) |
+| `--p99-ms <MS>` | Max p99 latency per operation in ms (tune rejects trials above it) |
+
+*Output*
+
+| argument | description |
+|---|---|
+| `--json <FILE>` | Also save the report as JSON (input for `oprobe compare`) |
+| `--markdown <FILE>` | Also save a Markdown report |
+| `--no-save` | Do not save the run in the run store |
+| `--fail-on <FAIL_ON>` | Also exit with code 3 if the diagnosis has findings of this severity or worse (SLA breaches always do, unless `--sla none`) · one of `warning`, `critical` |
+| `--label <LABEL>` | Label stored in the report (e.g. a git SHA) |
+
+*Safety*
+
+| argument | description |
+|---|---|
+| `--dry-run` | Print the plan (requests, bytes, objects written/deleted, cost, ETA) and exit |
+| `--read-only` | Refuse every write and delete (exit 5); implied by --existing |
+| `--max-cost-usd <USD>` | Stop when the estimated request cost exceeds this (USD; exit 4) |
+| `--max-requests <N>` | Stop after this many backend requests (exit 4) |
+| `--max-bytes <SIZE>` | Stop after transferring this many bytes, e.g. 10GiB (exit 4) |
+| `--max-duration <DURATION>` | Stop after this much wall time, e.g. 5m (exit 4) |
+| `--idempotency-key <KEY>` | Name the run prefix after KEY: a retried command reuses and cleans it up |
+
+*Tuning*
+
+| argument | description |
+|---|---|
+| `--objective <OBJECTIVE>` | What to optimize · one of `goodput`, `p99`, `cost`, `balanced` · default `goodput` |
+| `--trial-duration <TRIAL_DURATION>` | Measurement window per trial · default `5s` |
+| `--trial-warmup <TRIAL_WARMUP>` | Warmup per trial · default `1s` |
+| `--max-trials <MAX_TRIALS>` | Maximum number of trials · default `24` |
+| `--max-concurrency <MAX_CONCURRENCY>` | Highest concurrency to try · default `256` |
+| `--cooldown <COOLDOWN>` | Pause after a throttled trial · default `5s` |
+| `--max-throttle-ratio <RATIO>` | Share of throttled requests a configuration may cause and still be feasible (default 0.001, or the profile's `sla.max_throttle_rate`) |
+| `--boundary-repeats <BOUNDARY_REPEATS>` | Runs of each bisection trial near the throttle boundary · default `2` |
+| `--headroom-ratio <RATIO>` | In-flight headroom kept below the throttling ceiling (default 0.15) |
+
+*Verification*
+
+| argument | description |
+|---|---|
+| `--repeat <N>` | Baseline / candidate pairs of the verification · default `2` |
+| `--write-profile <FILE>` | Write the recommended profile (TOML) to this file |
 
 ## `oprobe runs`
 
@@ -2786,6 +2940,79 @@ oprobe baseline show [OPTIONS] <NAME>
 | argument | description |
 |---|---|
 | `<NAME>` |  |
+
+## `oprobe baseline calibrate`
+
+Learn the target's noise floor from repeated identical runs (<data>/noise.toml)
+
+```text
+oprobe baseline calibrate [OPTIONS] [TARGET]
+```
+
+*Target*
+
+| argument | description |
+|---|---|
+| `<TARGET>` | Target name (see `oprobe target list`) or storage URL: s3://bucket/prefix, gcs://bucket, azblob://container, oss://, cos://, b2://, fs:///path, memory:// |
+| `-p, --profile <FILE>` | Load a profile (TOML); flags override its values |
+| `--endpoint <ENDPOINT>` | Custom endpoint (MinIO, R2, Ceph, private clouds) |
+| `--region <REGION>` | Region of the bucket (e.g. us-east-1); most S3-compatible services accept any value |
+| `--option <KEY=VALUE>` | Extra backend option, repeatable (e.g. --option enable_virtual_host_style=true) |
+| `--anonymous` | Access a public bucket without credentials (s3, gcs, azblob, oss: unsigned requests) |
+| `--ca-cert <PEM>` | Trust an extra PEM CA bundle |
+| `--insecure` | Skip TLS certificate verification (development only) |
+| `--proxy <PROXY>` | Egress proxy URL, or `none` to ignore HTTPS_PROXY/HTTP_PROXY |
+
+*Workload*
+
+| argument | description |
+|---|---|
+| `--preset <PRESET>` | Workload preset: parquet, checkpoint, small-files, metadata, mixed |
+| `-d, --duration <DURATION>` | Measurement window (e.g. 30s, 2m) |
+| `--warmup <WARMUP>` | Warmup before measuring (connections, caches) |
+| `--max-ops <MAX_OPS>` | Stop after N measured operations |
+| `--rate <RATE>` | Open-loop arrival rate (ops/s); latency is measured from the intended start time |
+| `--existing <PREFIX>` | Benchmark existing objects under this prefix (read-only) |
+| `--objects <OBJECTS>` | Number of dataset objects to generate |
+| `--object-size <OBJECT_SIZE>` | Size of each generated object (e.g. 16MiB) |
+| `--access <ACCESS>` | Key popularity: uniform, zipf:1.1, hotset:0.2/0.8 |
+| `--persist-dataset` | Keep the generated dataset for later runs (oprobe-dataset/<fingerprint>/) |
+| `--no-verify` | Skip CRC32C verification |
+| `--keep-data` | Do not delete test data when the run ends |
+
+*Client knobs*
+
+| argument | description |
+|---|---|
+| `-c, --concurrency <CONCURRENCY>` | Concurrent operations (workers) |
+| `--io-concurrency <IO_CONCURRENCY>` | Per-operation reader/writer parallelism |
+| `--chunk-size <CHUNK_SIZE>` | Reader/writer chunk and multipart part size (e.g. 8MiB) |
+| `--range-gap <RANGE_GAP>` | Merge vectored ranges closer than this (e.g. 64KiB) |
+| `--max-inflight <MAX_INFLIGHT>` | Cap in-flight HTTP requests (0 = unlimited) |
+| `--http <HTTP>` | HTTP version · one of `auto`, `h1`, `h2` |
+| `--no-keep-alive` | Open a new connection for every request |
+| `--microscope` | Use oprobe's instrumented connection pool instead of OpenDAL's own HTTP client: exact pool queueing, per-dial DNS/TCP/proxy/TLS and HTTP/2 streams, at the cost of measuring a different client than production runs |
+| `--cache <SIZE>` | Enable the in-memory read cache with this size (e.g. 512MiB) |
+| `--retries <RETRIES>` | Retry attempts for temporary errors |
+| `--tail-cut` | Cancel and retry straggler requests (TailCutLayer) |
+| `--addressing <STYLE>` | S3 bucket addressing: auto (as configured), virtual (bucket.host) or path (host/bucket) |
+| `--checksum <ALGO>` | Checksum computed by the client and verified by the server on writes (S3: crc32c) |
+| `--sse <MODE>` | Server-side encryption of written objects (S3: AES256, aws:kms) |
+
+*Safety*
+
+| argument | description |
+|---|---|
+| `--dry-run` | Print the plan (requests, bytes, objects written/deleted, cost, ETA) and exit |
+| `--read-only` | Refuse every write and delete (exit 5); implied by --existing |
+| `--max-cost-usd <USD>` | Stop when the estimated request cost exceeds this (USD; exit 4) |
+| `--max-requests <N>` | Stop after this many backend requests (exit 4) |
+| `--max-bytes <SIZE>` | Stop after transferring this many bytes, e.g. 10GiB (exit 4) |
+| `--max-duration <DURATION>` | Stop after this much wall time, e.g. 5m (exit 4) |
+| `--idempotency-key <KEY>` | Name the run prefix after KEY: a retried command reuses and cleans it up |
+| `--repeat <N>` | Identical runs to measure (N − 1 A/A pairs) · default `4` |
+| `--from <RUNREF>` | Calibrate the workload of a stored run instead (RUNREF; its spec is replayed) |
+| `--no-save` | Do not save the calibration runs in the run store |
 
 ## `oprobe lab`
 

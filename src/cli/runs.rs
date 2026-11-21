@@ -390,11 +390,7 @@ impl CommandOutput for DiffReport {
         Some(crate::report::html::render_compare(self))
     }
     fn exit_code(&self) -> u8 {
-        if self.passed {
-            0
-        } else {
-            crate::errors::exit::GATE
-        }
+        DiffReport::exit_code(self)
     }
 }
 #[cfg(test)]

@@ -1,4 +1,15 @@
-//! `oprobe compare`: compare a candidate run against a baseline and gate regressions.
+//! The regression gate of `oprobe compare` (design v4 §7): identity, then machine-grade checks.
+//!
+//! - **Identity first:** a gate verdict needs the same target ([`crate::store::TargetId`]) and
+//!   the same workload ([`crate::model::RunSpec::workload_hash`]). Otherwise the result is
+//!   `comparable: false` with the differing settings, and no regression verdict.
+//! - **Checks** are `{ id, unit, baseline, candidate, delta_ratio, limit_ratio, verdict }`:
+//!   stable ids (`throughput`, `latency_p99.read.range`, `throttled_request_ratio`, …), values in
+//!   `unit`, relative limits as ratios.
+//! - **Count metrics have absolute floors:** going from 0 to 1 throttled response (or one
+//!   failed operation) is not a regression.
+//!
+//! [`crate::analysis::compare`] adds the statistics (significance and noise floors) on top.
 
 use std::fmt::Write as _;
 
@@ -8,52 +19,73 @@ use super::Report;
 use super::style::*;
 use crate::util::fmt_ms;
 
-/// Regression limits. Percentages are relative changes in the "bad" direction.
+/// Regression limits. Relative limits are ratios of the baseline in the "bad" direction
+/// (0.2 = 20 % worse).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Thresholds {
-    pub p99_pct: f64,
-    pub p50_pct: f64,
-    /// Latency changes smaller than this (ms) are never regressions (noise floor).
+    pub p99_increase_ratio: f64,
+    pub p50_increase_ratio: f64,
+    /// Latency changes smaller than this (ms) are never regressions.
     pub min_latency_delta_ms: f64,
-    pub throughput_drop_pct: f64,
-    /// Max increase of the failed-operation rate in percentage points.
-    pub error_rate_pp: f64,
-    pub request_amp_pct: f64,
-    pub read_amp_pct: f64,
-    pub cost_pct: f64,
-    /// Gate throttling: fail when the candidate is throttled and the baseline was not, or when
-    /// its throttle rate (throttled responses per request) grew by more than
-    /// [`THROTTLE_RATE_PCT`] and [`THROTTLE_RATE_FLOOR`].
+    pub throughput_drop_ratio: f64,
+    /// Max increase of the failed-operation ratio (absolute, 0.005 = 0.5 percentage points).
+    pub error_increase_ratio: f64,
+    /// Fewer additional failed operations than this are never a regression (count floor).
+    pub min_failed_ops_count: u64,
+    pub request_amp_increase_ratio: f64,
+    pub read_amp_increase_ratio: f64,
+    pub cost_increase_ratio: f64,
+    /// Gate throttling: fail when the candidate's throttled-request ratio grows past
+    /// [`Thresholds::throttle_increase_ratio`] (relative), [`THROTTLE_RATIO_FLOOR`] (absolute)
+    /// and [`Thresholds::min_throttled_count`] (count floor).
     pub fail_on_new_throttling: bool,
+    /// Relative growth of the throttled-request ratio that fails the gate.
+    pub throttle_increase_ratio: f64,
+    /// Fewer throttled responses than this in the candidate are never a regression
+    /// (0 → 1 throttled response is noise).
+    pub min_throttled_count: u64,
     /// Skip latency checks for operations with fewer samples.
-    pub min_samples: u64,
-    /// Compare runs of different workloads without failing (otherwise a gate failure).
+    pub min_samples_count: u64,
+    /// Compare runs of different workloads anyway (otherwise `comparable: false`).
     #[serde(default)]
     pub allow_workload_change: bool,
-    /// Compare runs against different targets without failing (otherwise a gate failure).
+    /// Compare runs against different targets anyway (otherwise `comparable: false`).
     #[serde(default)]
     pub allow_target_change: bool,
+    /// Runs that are not comparable are an error (exit 2) instead of a warning (exit 0).
+    #[serde(default)]
+    pub strict: bool,
 }
 
 impl Default for Thresholds {
     fn default() -> Self {
         Self {
-            p99_pct: 20.0,
-            p50_pct: 20.0,
+            p99_increase_ratio: 0.20,
+            p50_increase_ratio: 0.20,
             min_latency_delta_ms: 1.0,
-            throughput_drop_pct: 10.0,
-            error_rate_pp: 0.5,
-            request_amp_pct: 10.0,
-            read_amp_pct: 10.0,
-            cost_pct: 10.0,
+            throughput_drop_ratio: 0.10,
+            error_increase_ratio: 0.005,
+            min_failed_ops_count: 5,
+            request_amp_increase_ratio: 0.10,
+            read_amp_increase_ratio: 0.10,
+            cost_increase_ratio: 0.10,
             fail_on_new_throttling: true,
-            min_samples: 30,
+            throttle_increase_ratio: 0.25,
+            min_throttled_count: 10,
+            min_samples_count: 30,
             allow_workload_change: false,
             allow_target_change: false,
+            strict: false,
         }
     }
 }
 
+/// Throttled-ratio changes below this (fraction of requests, 0.1 pp) are noise.
+pub const THROTTLE_RATIO_FLOOR: f64 = 0.001;
+/// Max increase of the open-loop missed-arrival share (absolute ratio, 1 pp).
+pub const MISSED_RATIO: f64 = 0.01;
+
+/// The verdict of one check.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Status {
@@ -63,17 +95,111 @@ pub enum Status {
     Skipped,
 }
 
+impl Status {
+    pub fn label(self) -> &'static str {
+        match self {
+            Status::Pass => "pass",
+            Status::Improved => "improved",
+            Status::Fail => "fail",
+            Status::Skipped => "skipped",
+        }
+    }
+}
+
+/// One gate check, machine-grade (design v4 §7).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Check {
-    pub name: String,
+    /// Stable id: `throughput`, `throughput_bytes`, `latency_p50.VERB`, `latency_p99.VERB`,
+    /// `present.VERB`, `error_ratio`, `throttled_request_ratio`, `open_loop_missed_ratio`,
+    /// `corrupted_objects`, `requests_per_op`, `read_amplification`, `cost_per_million_ops`.
+    pub id: String,
+    /// Unit of `baseline`, `candidate` and `abs_limit` (`ops_per_s`, `mib_per_s`, `ms`,
+    /// `ratio`, `count`, `requests_per_op`, `usd`).
+    pub unit: String,
     pub baseline: f64,
     pub candidate: f64,
-    /// Relative change in percent (positive = higher).
-    pub change_pct: f64,
-    pub limit: String,
-    pub status: Status,
+    /// `(candidate − baseline) / baseline`; absent when the baseline is 0 and the candidate
+    /// is not.
+    pub delta_ratio: Option<f64>,
+    /// Relative change in the bad direction that fails the check (absent: no relative limit).
+    pub limit_ratio: Option<f64>,
+    /// Absolute limit or floor in `unit` (e.g. the minimum latency change in ms, the
+    /// failed-ratio increase).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub abs_limit: Option<f64>,
+    pub verdict: Status,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub note: String,
+}
+
+impl Check {
+    /// A human label of the check id (`p99 read.range`, `throughput`).
+    pub fn label(&self) -> String {
+        let (kind, verb) = self.id.split_once('.').unwrap_or((&self.id, ""));
+        match kind {
+            "latency_p50" => format!("{verb} p50"),
+            "latency_p99" => format!("{verb} p99"),
+            "present" => format!("{verb} present"),
+            "throughput_bytes" => "throughput MiB/s".into(),
+            "throughput" => "throughput ops/s".into(),
+            "error_ratio" => "failed ops".into(),
+            "throttled_request_ratio" => "throttled requests".into(),
+            "open_loop_missed_ratio" => "open-loop missed".into(),
+            "corrupted_objects" => "integrity (corrupted)".into(),
+            "requests_per_op" => "requests per op".into(),
+            "read_amplification" => "read amplification".into(),
+            "cost_per_million_ops" => "cost per 1M ops".into(),
+            _ => self.id.clone(),
+        }
+    }
+
+    /// One value of this check, formatted for its unit.
+    pub fn fmt_value(&self, v: f64) -> String {
+        match self.unit.as_str() {
+            "ms" => fmt_ms(v),
+            "usd" => format!("${v:.4}"),
+            "ratio" => format!("{:.2}%", v * 100.0),
+            "count" => format!("{v:.0}"),
+            _ if v.fract() == 0.0 && v.abs() < 1e12 => format!("{v:.0}"),
+            _ => format!("{v:.2}"),
+        }
+    }
+
+    /// The change, formatted (`+12.3%`, `+0.40pp` for ratios, `new` when the baseline is 0).
+    pub fn fmt_delta(&self) -> String {
+        if self.unit == "ratio" {
+            return format!("{:+.2}pp", (self.candidate - self.baseline) * 100.0);
+        }
+        match self.delta_ratio {
+            Some(d) => format!("{:+.1}%", d * 100.0),
+            None => "new".into(),
+        }
+    }
+
+    /// The limit, formatted (`≤ +20%`, `≥ −10%`, `≤ +0.50pp`).
+    pub fn fmt_limit(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(l) = self.limit_ratio {
+            parts.push(if self.id.starts_with("throughput") {
+                format!("≥ −{:.0}%", l * 100.0)
+            } else {
+                format!("≤ +{:.0}%", l * 100.0)
+            });
+        }
+        if let Some(a) = self.abs_limit {
+            parts.push(match self.unit.as_str() {
+                "ms" => format!("> {}", fmt_ms(a)),
+                "ratio" => format!("≤ +{:.2}pp", a * 100.0),
+                "count" => format!("≥ {a:.0}"),
+                _ => format!("> {a}"),
+            });
+        }
+        if parts.is_empty() {
+            "informational".into()
+        } else {
+            parts.join(" & ")
+        }
+    }
 }
 
 /// What part of the setup a [`ConfigChange`] is in.
@@ -113,16 +239,88 @@ pub struct ConfigChange {
     pub candidate: String,
 }
 
+/// Whether two runs may be gated against each other (design v4 §7).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct Identity {
+    /// Same target identity and workload hash (or the difference was allowed).
+    pub comparable: bool,
+    pub same_target: bool,
+    pub same_workload: bool,
+    pub baseline_target: String,
+    pub candidate_target: String,
+    pub baseline_workload_hash: String,
+    pub candidate_workload_hash: String,
+    /// Why the runs are not comparable (empty when they are).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasons: Vec<String>,
+}
+
+/// The gate's answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GateVerdict {
+    /// Comparable and no check failed.
+    Passed,
+    /// Comparable and at least one check failed (exit 3).
+    Regression,
+    /// Different target or workload: no regression verdict (exit 0 with a warning, exit 2
+    /// with `--strict`).
+    NotComparable,
+}
+
+impl GateVerdict {
+    pub fn label(self) -> &'static str {
+        match self {
+            GateVerdict::Passed => "passed",
+            GateVerdict::Regression => "regression",
+            GateVerdict::NotComparable => "not comparable",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct DiffReport {
+    pub verdict: GateVerdict,
+    /// The verdict is `passed`.
     pub passed: bool,
+    pub comparable: bool,
     pub baseline: String,
     pub candidate: String,
     pub thresholds: Thresholds,
+    pub identity: Identity,
     /// Every workload / target / knob / host setting that differs between the two runs.
     pub config_changes: Vec<ConfigChange>,
     pub checks: Vec<Check>,
     pub warnings: Vec<String>,
+}
+
+impl DiffReport {
+    /// Recompute `verdict` and `passed` from the identity and the checks.
+    pub fn settle(&mut self) {
+        self.verdict = if !self.comparable {
+            GateVerdict::NotComparable
+        } else if self.checks.iter().any(|c| c.verdict == Status::Fail) {
+            GateVerdict::Regression
+        } else {
+            GateVerdict::Passed
+        };
+        self.passed = self.verdict == GateVerdict::Passed;
+    }
+
+    /// The exit code of this verdict (3 on a regression; 2 for non-comparable runs under
+    /// `--strict`).
+    pub fn exit_code(&self) -> u8 {
+        match self.verdict {
+            GateVerdict::Passed => crate::errors::exit::OK,
+            GateVerdict::Regression => crate::errors::exit::GATE,
+            GateVerdict::NotComparable if self.thresholds.strict => crate::errors::exit::USAGE,
+            GateVerdict::NotComparable => crate::errors::exit::OK,
+        }
+    }
+
+    pub fn check(&self, id: &str) -> Option<&Check> {
+        self.checks.iter().find(|c| c.id == id)
+    }
 }
 
 /// Flatten a JSON value into `prefix.a.b = value` leaves (arrays are compared whole).
@@ -279,18 +477,76 @@ pub fn config_changes(base: &Report, cand: &Report) -> Vec<ConfigChange> {
     out
 }
 
-/// Relative throttle-rate increase (percent) that fails the gate when the baseline was throttled.
-pub const THROTTLE_RATE_PCT: f64 = 25.0;
-/// Throttle-rate changes below this (fraction of requests, 0.1 pp) are noise.
-pub const THROTTLE_RATE_FLOOR: f64 = 0.001;
-/// Max increase of the open-loop missed-arrival share, in percentage points.
-pub const MISSED_PP: f64 = 1.0;
+/// The target identity of a report: its spec's [`crate::store::TargetId`], or the displayed
+/// target when the spec's target does not resolve.
+pub fn target_identity(r: &Report) -> String {
+    match r.spec.target_id() {
+        Some(id) => id.to_string(),
+        None => crate::util::display_url(&r.target.display),
+    }
+}
 
-fn rel(b: f64, c: f64) -> f64 {
+/// Same target identity and workload hash (design v4 §7), with the allowed differences.
+pub fn identity(
+    base: &Report,
+    cand: &Report,
+    changes: &[ConfigChange],
+    t: &Thresholds,
+) -> Identity {
+    let (bt, ct) = (target_identity(base), target_identity(cand));
+    let (bw, cw) = (base.spec.workload_hash(), cand.spec.workload_hash());
+    let same_target = bt == ct;
+    let same_workload = bw == cw;
+    let mut reasons = Vec::new();
+    let fields = |k: ChangeKind| {
+        changes
+            .iter()
+            .filter(|c| c.kind == k)
+            .map(|c| c.field.clone())
+            .collect::<Vec<_>>()
+    };
+    if !same_target && !t.allow_target_change {
+        reasons.push(format!("different targets: {bt} vs {ct}"));
+    }
+    if !same_workload && !t.allow_workload_change {
+        let keys = fields(ChangeKind::Workload);
+        let (bwk, cwk) = (&base.spec.profile.workload, &cand.spec.profile.workload);
+        let mut window = Vec::new();
+        if bwk.duration != cwk.duration {
+            window.push(format!("duration {} vs {}", bwk.duration, cwk.duration));
+        }
+        if bwk.warmup != cwk.warmup {
+            window.push(format!("warmup {} vs {}", bwk.warmup, cwk.warmup));
+        }
+        if bwk.max_ops != cwk.max_ops {
+            window.push("max_ops".to_owned());
+        }
+        let mut what: Vec<String> = keys;
+        what.extend(window);
+        reasons.push(if what.is_empty() {
+            format!("different workloads ({bw} vs {cw})")
+        } else {
+            format!("different workloads: {}", what.join(", "))
+        });
+    }
+    Identity {
+        comparable: reasons.is_empty(),
+        same_target,
+        same_workload,
+        baseline_target: bt,
+        candidate_target: ct,
+        baseline_workload_hash: bw,
+        candidate_workload_hash: cw,
+        reasons,
+    }
+}
+
+/// `(c − b) / b`, `None` when only the baseline is 0.
+fn rel(b: f64, c: f64) -> Option<f64> {
     if b.abs() < 1e-12 {
-        if c.abs() < 1e-12 { 0.0 } else { 100.0 }
+        if c.abs() < 1e-12 { Some(0.0) } else { None }
     } else {
-        (c - b) / b * 100.0
+        Some((c - b) / b)
     }
 }
 
@@ -299,68 +555,91 @@ struct Builder {
 }
 
 impl Builder {
-    /// Higher-is-worse metric with relative limit and absolute noise floor.
+    fn push(&mut self, c: Check) {
+        self.checks.push(c);
+    }
+
+    /// Higher-is-worse metric with a relative limit and an absolute noise floor.
+    #[allow(clippy::too_many_arguments)]
     fn higher_worse(
         &mut self,
-        name: String,
+        id: String,
+        unit: &str,
         b: f64,
         c: f64,
-        limit_pct: f64,
+        limit: f64,
         min_abs: f64,
-        unit: &str,
+        show_floor: bool,
     ) {
-        let ch = rel(b, c);
-        let status = if c - b > min_abs && ch > limit_pct {
+        let d = rel(b, c);
+        let up = d.unwrap_or(f64::INFINITY);
+        let verdict = if c - b > min_abs && up > limit {
             Status::Fail
-        } else if b - c > min_abs && -ch > limit_pct {
+        } else if b - c > min_abs && -up > limit {
             Status::Improved
         } else {
             Status::Pass
         };
-        self.checks.push(Check {
-            name,
+        self.push(Check {
+            id,
+            unit: unit.into(),
             baseline: b,
             candidate: c,
-            change_pct: ch,
-            limit: format!("≤ +{limit_pct}%{unit}"),
-            status,
+            delta_ratio: d,
+            limit_ratio: Some(limit),
+            abs_limit: show_floor.then_some(min_abs),
+            verdict,
             note: String::new(),
         });
     }
 
-    fn lower_worse(&mut self, name: String, b: f64, c: f64, limit_pct: f64) {
-        let ch = rel(b, c);
-        let status = if -ch > limit_pct {
+    fn lower_worse(&mut self, id: String, unit: &str, b: f64, c: f64, limit: f64) {
+        let d = rel(b, c);
+        let ch = d.unwrap_or(f64::INFINITY);
+        let verdict = if -ch > limit {
             Status::Fail
-        } else if ch > limit_pct {
+        } else if ch > limit {
             Status::Improved
         } else {
             Status::Pass
         };
-        self.checks.push(Check {
-            name,
+        self.push(Check {
+            id,
+            unit: unit.into(),
             baseline: b,
             candidate: c,
-            change_pct: ch,
-            limit: format!("≥ -{limit_pct}%"),
-            status,
+            delta_ratio: d,
+            limit_ratio: Some(limit),
+            abs_limit: None,
+            verdict,
             note: String::new(),
         });
     }
 }
 
-fn throttle_rate(s: &Report) -> f64 {
+/// Throttled responses / requests.
+pub fn throttled_request_ratio(r: &Report) -> f64 {
     crate::util::ratio(
-        s.resilience.throttled_responses as f64,
-        s.connections.requests as f64,
+        r.resilience.throttled_responses as f64,
+        r.connections.requests as f64,
     )
 }
 
-/// Share of open-loop arrivals that never started (percent).
-fn missed_pct(s: &Report) -> Option<f64> {
+/// Successful operations per second (failed operations never count).
+pub fn good_ops_per_s(r: &Report) -> f64 {
+    let s = &r.summary;
+    if r.run.window_s > 0.0 {
+        s.ops.saturating_sub(s.failed_ops) as f64 / r.run.window_s
+    } else {
+        s.ops_per_s
+    }
+}
+
+/// Share of open-loop arrivals that never started.
+fn missed_ratio(s: &Report) -> Option<f64> {
     let ol = s.open_loop.as_ref()?;
     let issued = ol.achieved_rate * s.run.window_s;
-    Some(crate::util::pct(
+    Some(crate::util::ratio(
         ol.missed as f64,
         issued + ol.missed as f64,
     ))
@@ -384,65 +663,48 @@ pub fn diff(base: &Report, cand: &Report, t: &Thresholds) -> DiffReport {
         )),
         _ => {}
     }
-    let (bd, cd) = (base.run.window_s, cand.run.window_s);
-    if bd > 0.0 && cd > 0.0 && (bd / cd > 2.0 || cd / bd > 2.0) {
+    let changes = config_changes(base, cand);
+    let ident = identity(base, cand, &changes, t);
+    for r in &ident.reasons {
         warnings.push(format!(
-            "measurement windows differ a lot ({bd:.1}s vs {cd:.1}s): short windows are noisier and may miss slow effects"
+            "not comparable — {r}: no regression verdict (replay the baseline with `oprobe run --from {}` for a comparable candidate{})",
+            base.run.id,
+            if t.strict { "" } else { "; --strict makes this exit 2" }
         ));
     }
-    let changes = config_changes(base, cand);
     let fields = |k: ChangeKind| {
         changes
             .iter()
             .filter(|c| c.kind == k)
-            .map(|c| format!("{} {} → {}", c.field, c.baseline, c.candidate))
+            .map(|c| {
+                format!(
+                    "{} {} → {}",
+                    c.field,
+                    summarize(&c.baseline, 32),
+                    summarize(&c.candidate, 32)
+                )
+            })
             .collect::<Vec<_>>()
     };
-    let mut b = Builder { checks: Vec::new() };
-    for (kind, allowed, flag) in [
+    for (kind, allowed, same) in [
         (
             ChangeKind::Workload,
             t.allow_workload_change,
-            "--allow-workload-change",
+            ident.same_workload,
         ),
-        (
-            ChangeKind::Target,
-            t.allow_target_change,
-            "--allow-target-change",
-        ),
+        (ChangeKind::Target, t.allow_target_change, ident.same_target),
     ] {
         let diffs = fields(kind);
-        b.checks.push(Check {
-            name: format!("same {}", kind.label()),
-            baseline: 0.0,
-            candidate: diffs.len() as f64,
-            change_pct: 0.0,
-            limit: if allowed {
-                format!("informational ({flag})")
-            } else {
-                "identical".into()
-            },
-            status: if diffs.is_empty() || allowed {
-                Status::Pass
-            } else {
-                Status::Fail
-            },
-            note: diffs.join("; "),
-        });
-        if !diffs.is_empty() {
-            warnings.push(if allowed {
-                format!(
-                    "the {} differs ({}): results may not be comparable",
-                    kind.label(),
-                    diffs.join("; ")
-                )
-            } else {
-                format!(
-                    "the {} differs ({}): the runs are not comparable, so the gate fails; pass {flag} to compare anyway",
-                    kind.label(),
-                    diffs.join("; ")
-                )
-            });
+        if allowed && (!same || !diffs.is_empty()) {
+            warnings.push(format!(
+                "the {} differs{}: compared anyway (allowed), results may not be comparable",
+                kind.label(),
+                if diffs.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", diffs.join("; "))
+                }
+            ));
         }
     }
     let knob_diffs = fields(ChangeKind::Knobs);
@@ -460,117 +722,148 @@ pub fn diff(base: &Report, cand: &Report, t: &Thresholds) -> DiffReport {
         ));
     }
     let (bs, cs) = (base, cand);
-    let floor = format!(" & > {}ms", t.min_latency_delta_ms);
-
+    let mut b = Builder { checks: Vec::new() };
     b.lower_worse(
-        "throughput ops/s".into(),
-        bs.summary.ops_per_s,
-        cs.summary.ops_per_s,
-        t.throughput_drop_pct,
+        "throughput".into(),
+        "ops_per_s",
+        good_ops_per_s(bs),
+        good_ops_per_s(cs),
+        t.throughput_drop_ratio,
     );
     if bs.summary.mib_per_s > 0.01 {
         b.lower_worse(
-            "throughput MiB/s".into(),
+            "throughput_bytes".into(),
+            "mib_per_s",
             bs.summary.mib_per_s,
             cs.summary.mib_per_s,
-            t.throughput_drop_pct,
+            t.throughput_drop_ratio,
         );
     }
     for bv in &bs.verbs {
         let Some(cv) = cs.verbs.iter().find(|v| v.verb == bv.verb) else {
-            b.checks.push(Check {
-                name: format!("{} present", bv.verb),
+            b.push(Check {
+                id: format!("present.{}", bv.verb),
+                unit: "count".into(),
                 baseline: bv.count as f64,
                 candidate: 0.0,
-                change_pct: -100.0,
-                limit: "operation must run".into(),
-                status: Status::Fail,
+                delta_ratio: Some(-1.0),
+                limit_ratio: None,
+                abs_limit: None,
+                verdict: Status::Fail,
                 note: format!("operation `{}` is missing from the candidate", bv.verb),
             });
             continue;
         };
-        if bv.count < t.min_samples || cv.count < t.min_samples {
-            b.checks.push(Check {
-                name: format!("{} p99", bv.verb),
+        if bv.count < t.min_samples_count || cv.count < t.min_samples_count {
+            b.push(Check {
+                id: format!("latency_p99.{}", bv.verb),
+                unit: "ms".into(),
                 baseline: bv.latency.p99,
                 candidate: cv.latency.p99,
-                change_pct: rel(bv.latency.p99, cv.latency.p99),
-                limit: format!("needs ≥ {} samples", t.min_samples),
-                status: Status::Skipped,
-                note: format!("{} / {} samples", bv.count, cv.count),
+                delta_ratio: rel(bv.latency.p99, cv.latency.p99),
+                limit_ratio: Some(t.p99_increase_ratio),
+                abs_limit: None,
+                verdict: Status::Skipped,
+                note: format!(
+                    "{} / {} samples (needs ≥ {})",
+                    bv.count, cv.count, t.min_samples_count
+                ),
             });
             continue;
         }
         b.higher_worse(
-            format!("{} p50 ms", bv.verb),
+            format!("latency_p50.{}", bv.verb),
+            "ms",
             bv.latency.p50,
             cv.latency.p50,
-            t.p50_pct,
+            t.p50_increase_ratio,
             t.min_latency_delta_ms,
-            &floor,
+            true,
         );
         b.higher_worse(
-            format!("{} p99 ms", bv.verb),
+            format!("latency_p99.{}", bv.verb),
+            "ms",
             bv.latency.p99,
             cv.latency.p99,
-            t.p99_pct,
+            t.p99_increase_ratio,
             t.min_latency_delta_ms,
-            &floor,
+            true,
         );
     }
-    // error rate (percentage points)
-    let (be, ce) = (bs.summary.error_rate * 100.0, cs.summary.error_rate * 100.0);
-    b.checks.push(Check {
-        name: "failed ops %".into(),
+    // Failed operations: an absolute ratio limit and a count floor.
+    let (be, ce) = (bs.summary.error_rate, cs.summary.error_rate);
+    let (bf, cf) = (bs.summary.failed_ops, cs.summary.failed_ops);
+    let more_failed = cf.saturating_sub(bf);
+    b.push(Check {
+        id: "error_ratio".into(),
+        unit: "ratio".into(),
         baseline: be,
         candidate: ce,
-        change_pct: ce - be,
-        limit: format!("≤ +{}pp", t.error_rate_pp),
-        status: if ce - be > t.error_rate_pp {
+        delta_ratio: rel(be, ce),
+        limit_ratio: None,
+        abs_limit: Some(t.error_increase_ratio),
+        verdict: if ce - be > t.error_increase_ratio && more_failed >= t.min_failed_ops_count {
             Status::Fail
         } else {
             Status::Pass
         },
-        note: String::new(),
+        note: if ce - be > t.error_increase_ratio && more_failed < t.min_failed_ops_count {
+            format!(
+                "{bf} → {cf} failed operations: below the floor of {} more",
+                t.min_failed_ops_count
+            )
+        } else {
+            format!("{bf} → {cf} failed operations")
+        },
     });
+    // Throttling: relative growth, an absolute ratio floor and a count floor.
     let (bt, ct) = (
         bs.resilience.throttled_responses,
         cs.resilience.throttled_responses,
     );
-    let (btr, ctr) = (throttle_rate(bs) * 100.0, throttle_rate(cs) * 100.0);
-    let new_throttling = bt == 0 && ct > 0;
-    let more_throttling =
-        bt > 0 && (ctr - btr) / 100.0 > THROTTLE_RATE_FLOOR && rel(btr, ctr) > THROTTLE_RATE_PCT;
-    b.checks.push(Check {
-        name: "throttled requests %".into(),
+    let (btr, ctr) = (throttled_request_ratio(bs), throttled_request_ratio(cs));
+    let grew = ctr - btr > THROTTLE_RATIO_FLOOR
+        && rel(btr, ctr).is_none_or(|d| d > t.throttle_increase_ratio);
+    let enough = ct >= t.min_throttled_count;
+    let shrank = bt >= t.min_throttled_count
+        && btr - ctr > THROTTLE_RATIO_FLOOR
+        && rel(btr, ctr).is_some_and(|d| -d > t.throttle_increase_ratio);
+    b.push(Check {
+        id: "throttled_request_ratio".into(),
+        unit: "ratio".into(),
         baseline: btr,
         candidate: ctr,
-        change_pct: rel(btr, ctr),
-        limit: if t.fail_on_new_throttling {
-            format!("no new throttling, ≤ +{THROTTLE_RATE_PCT}%")
-        } else {
-            "informational".into()
-        },
-        status: if t.fail_on_new_throttling && (new_throttling || more_throttling) {
+        delta_ratio: rel(btr, ctr),
+        limit_ratio: t
+            .fail_on_new_throttling
+            .then_some(t.throttle_increase_ratio),
+        abs_limit: t.fail_on_new_throttling.then_some(THROTTLE_RATIO_FLOOR),
+        verdict: if t.fail_on_new_throttling && grew && enough {
             Status::Fail
-        } else if bt > 0
-            && (btr - ctr) / 100.0 > THROTTLE_RATE_FLOOR
-            && -rel(btr, ctr) > THROTTLE_RATE_PCT
-        {
+        } else if shrank {
             Status::Improved
         } else {
             Status::Pass
         },
-        note: format!("{bt} → {ct} throttled responses"),
+        note: if grew && !enough {
+            format!(
+                "{bt} → {ct} throttled responses: below the floor of {} responses",
+                t.min_throttled_count
+            )
+        } else {
+            format!("{bt} → {ct} throttled responses")
+        },
     });
-    if let (Some(bm), Some(cm)) = (missed_pct(bs), missed_pct(cs)) {
-        b.checks.push(Check {
-            name: "open-loop missed %".into(),
+    if let (Some(bm), Some(cm)) = (missed_ratio(bs), missed_ratio(cs)) {
+        b.push(Check {
+            id: "open_loop_missed_ratio".into(),
+            unit: "ratio".into(),
             baseline: bm,
             candidate: cm,
-            change_pct: cm - bm,
-            limit: format!("≤ +{MISSED_PP}pp"),
-            status: if cm - bm > MISSED_PP {
+            delta_ratio: rel(bm, cm),
+            limit_ratio: None,
+            abs_limit: Some(MISSED_RATIO),
+            verdict: if cm - bm > MISSED_RATIO {
                 Status::Fail
             } else {
                 Status::Pass
@@ -578,50 +871,56 @@ pub fn diff(base: &Report, cand: &Report, t: &Thresholds) -> DiffReport {
             note: String::new(),
         });
     }
-    b.checks.push(Check {
-        name: "integrity (corrupted)".into(),
+    b.push(Check {
+        id: "corrupted_objects".into(),
+        unit: "count".into(),
         baseline: bs.integrity.corrupted as f64,
         candidate: cs.integrity.corrupted as f64,
-        change_pct: 0.0,
-        limit: "= 0".into(),
-        status: if cs.integrity.corrupted > 0 {
+        delta_ratio: rel(bs.integrity.corrupted as f64, cs.integrity.corrupted as f64),
+        limit_ratio: None,
+        abs_limit: None,
+        verdict: if cs.integrity.corrupted > 0 {
             Status::Fail
         } else {
             Status::Pass
         },
-        note: String::new(),
+        note: "any corrupted object fails".into(),
     });
     b.higher_worse(
-        "requests per op".into(),
+        "requests_per_op".into(),
+        "requests_per_op",
         bs.bytes.request_amplification,
         cs.bytes.request_amplification,
-        t.request_amp_pct,
+        t.request_amp_increase_ratio,
         0.01,
-        "",
+        false,
     );
     if bs.bytes.logical_read > 0 {
         b.higher_worse(
-            "read amplification".into(),
+            "read_amplification".into(),
+            "times",
             bs.bytes.read_amplification,
             cs.bytes.read_amplification,
-            t.read_amp_pct,
+            t.read_amp_increase_ratio,
             0.01,
-            "",
+            false,
         );
     }
     if base.cost.applicable && cand.cost.applicable {
         b.higher_worse(
-            "cost per 1M ops USD".into(),
+            "cost_per_million_ops".into(),
+            "usd",
             base.cost.selected.per_million_ops_usd,
             cand.cost.selected.per_million_ops_usd,
-            t.cost_pct,
+            t.cost_increase_ratio,
             0.0001,
-            "",
+            false,
         );
     }
-    let passed = !b.checks.iter().any(|c| c.status == Status::Fail);
-    DiffReport {
-        passed,
+    let mut d = DiffReport {
+        verdict: GateVerdict::Passed,
+        passed: true,
+        comparable: ident.comparable,
         baseline: format!(
             "{} ({} {})",
             crate::util::display_url(&base.target.display),
@@ -635,35 +934,83 @@ pub fn diff(base: &Report, cand: &Report, t: &Thresholds) -> DiffReport {
             cand.run.started_at
         ),
         thresholds: t.clone(),
+        identity: ident,
         config_changes: changes,
         checks: b.checks,
         warnings,
-    }
+    };
+    d.settle();
+    d
 }
 
-fn fmt_val(name: &str, v: f64) -> String {
-    if name.ends_with(" ms") {
-        fmt_ms(v)
-    } else if name.contains("USD") {
-        format!("${v:.4}")
-    } else if v.fract() == 0.0 && v.abs() < 1e12 {
-        format!("{v:.0}")
-    } else {
-        format!("{v:.2}")
+/// A setting value shortened for a table cell: JSON arrays and objects become a summary
+/// (`[2 ops: read.range×80, stat×20]`, `{3 keys}`), long strings are cut with `…` (CMP-1).
+pub fn summarize(v: &str, max: usize) -> String {
+    let t = v.trim();
+    if t.chars().count() <= max {
+        return t.to_owned();
     }
+    if let Ok(j) = serde_json::from_str::<serde_json::Value>(t) {
+        match &j {
+            serde_json::Value::Array(a) => {
+                let names: Vec<String> = a
+                    .iter()
+                    .map(|x| match x {
+                        serde_json::Value::Object(m) => {
+                            let kind = m
+                                .get("op")
+                                .and_then(|o| o.get("kind").or(Some(o)))
+                                .and_then(|k| k.as_str().map(str::to_owned))
+                                .or_else(|| {
+                                    m.get("op")
+                                        .and_then(|o| o.as_object())
+                                        .and_then(|o| o.keys().next().cloned())
+                                })
+                                .unwrap_or_else(|| "item".into());
+                            match m.get("weight").and_then(|w| w.as_u64()) {
+                                Some(w) => format!("{kind}×{w}"),
+                                None => kind,
+                            }
+                        }
+                        other => other.to_string(),
+                    })
+                    .collect();
+                let s = format!("[{} items: {}]", a.len(), names.join(", "));
+                return cut(&s, max);
+            }
+            serde_json::Value::Object(m) => {
+                return format!("{{{} keys}}", m.len());
+            }
+            _ => {}
+        }
+    }
+    cut(t, max)
 }
+
+fn cut(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_owned();
+    }
+    let mut o: String = s.chars().take(max.saturating_sub(1)).collect();
+    o.push('…');
+    o
+}
+
+/// Width of the setting-value columns of the text compare.
+const VALUE_WIDTH: usize = 36;
 
 impl DiffReport {
     pub fn render_terminal(&self) -> String {
         let mut out = String::new();
+        let badge_txt = match self.verdict {
+            GateVerdict::Passed => badge("PASS", "42;30"),
+            GateVerdict::Regression => badge("REGRESSION", "41"),
+            GateVerdict::NotComparable => badge("NOT COMPARABLE", "43;30"),
+        };
         let _ = writeln!(
             out,
             "{} {}\n  {} {}\n  {} {}",
-            if self.passed {
-                badge("PASS", "42;30")
-            } else {
-                badge("REGRESSION", "41")
-            },
+            badge_txt,
             bold("oprobe compare"),
             dim("baseline "),
             self.baseline,
@@ -683,8 +1030,8 @@ impl DiffReport {
                     vec![
                         kind,
                         c.field.clone(),
-                        c.baseline.clone(),
-                        c.candidate.clone(),
+                        summarize(&c.baseline, VALUE_WIDTH),
+                        summarize(&c.candidate, VALUE_WIDTH),
                     ]
                 })
                 .collect();
@@ -695,24 +1042,25 @@ impl DiffReport {
             ));
         }
         for w in &self.warnings {
-            let _ = writeln!(out, "  {} {w}", yellow("warning:"));
+            let _ = writeln!(out, "  {} {}", yellow("warning:"), wrap(w, 100, 11));
         }
         let rows: Vec<Vec<String>> = self
             .checks
             .iter()
             .map(|c| {
-                let st = match c.status {
+                let st = match c.verdict {
                     Status::Pass => green("pass"),
                     Status::Improved => cyan("improved"),
-                    Status::Fail => red("FAIL"),
+                    Status::Fail if self.comparable => red("FAIL"),
+                    Status::Fail => yellow("fail (n/a)"),
                     Status::Skipped => dim("skipped"),
                 };
                 vec![
-                    c.name.clone(),
-                    fmt_val(&c.name, c.baseline),
-                    fmt_val(&c.name, c.candidate),
-                    format!("{:+.1}%", c.change_pct),
-                    c.limit.clone(),
+                    c.label(),
+                    c.fmt_value(c.baseline),
+                    c.fmt_value(c.candidate),
+                    c.fmt_delta(),
+                    c.fmt_limit(),
                     st,
                 ]
             })
@@ -737,8 +1085,13 @@ impl DiffReport {
         let mut md = String::new();
         let _ = writeln!(
             md,
-            "## {} oprobe storage gate\n\nBaseline: {}  \nCandidate: {}\n",
-            if self.passed { "✅" } else { "❌" },
+            "## {} oprobe storage gate — {}\n\nBaseline: {}  \nCandidate: {}\n",
+            match self.verdict {
+                GateVerdict::Passed => "✅",
+                GateVerdict::Regression => "❌",
+                GateVerdict::NotComparable => "⚠️",
+            },
+            self.verdict.label(),
             self.baseline,
             self.candidate
         );
@@ -753,8 +1106,8 @@ impl DiffReport {
                     "| {} | `{}` | {} | {} |",
                     c.kind.label(),
                     c.field,
-                    c.baseline,
-                    c.candidate
+                    summarize(&c.baseline, 60).replace('|', "\\|"),
+                    summarize(&c.candidate, 60).replace('|', "\\|")
                 );
             }
             md.push('\n');
@@ -767,7 +1120,7 @@ impl DiffReport {
             "| check | baseline | candidate | change | limit | result |\n|---|---:|---:|---:|---|---|"
         );
         for c in &self.checks {
-            let st = match c.status {
+            let st = match c.verdict {
                 Status::Pass => "✅ pass",
                 Status::Improved => "🚀 improved",
                 Status::Fail => "❌ **FAIL**",
@@ -775,12 +1128,12 @@ impl DiffReport {
             };
             let _ = writeln!(
                 md,
-                "| {} | {} | {} | {:+.1}% | {} | {} |",
-                c.name,
-                fmt_val(&c.name, c.baseline),
-                fmt_val(&c.name, c.candidate),
-                c.change_pct,
-                c.limit,
+                "| {} | {} | {} | {} | {} | {} |",
+                c.label(),
+                c.fmt_value(c.baseline),
+                c.fmt_value(c.candidate),
+                c.fmt_delta(),
+                c.fmt_limit(),
                 st
             );
         }
@@ -795,58 +1148,77 @@ impl DiffReport {
                 .replace('>', "&gt;")
                 .replace('"', "&quot;")
         };
-        let failures = self
-            .checks
-            .iter()
-            .filter(|c| c.status == Status::Fail)
-            .count();
+        let failing = |c: &Check| self.comparable && c.verdict == Status::Fail;
+        let failures = self.checks.iter().filter(|c| failing(c)).count();
         let skipped = self
             .checks
             .iter()
-            .filter(|c| c.status == Status::Skipped)
+            .filter(|c| c.verdict == Status::Skipped)
             .count();
         let mut x = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
         let _ = writeln!(
             x,
             "<testsuite name=\"oprobe compare\" tests=\"{}\" failures=\"{failures}\" skipped=\"{skipped}\">",
-            self.checks.len()
+            self.checks.len() + 1
         );
+        let _ = write!(
+            x,
+            "  <testcase classname=\"oprobe.gate\" name=\"comparable\">"
+        );
+        if !self.comparable {
+            let _ = write!(
+                x,
+                "<skipped message=\"{}\"/>",
+                esc(&self.identity.reasons.join("; "))
+            );
+        }
+        let _ = writeln!(x, "</testcase>");
         for c in &self.checks {
             let _ = write!(
                 x,
                 "  <testcase classname=\"oprobe.gate\" name=\"{}\">",
-                esc(&c.name)
+                esc(&c.id)
             );
-            match c.status {
-                Status::Fail if c.name.starts_with("same ") => {
-                    let _ = write!(
-                        x,
-                        "<failure message=\"{}\">{}</failure>",
-                        esc(&format!("{}: differs", c.name)),
-                        esc(&c.note)
-                    );
-                }
-                Status::Fail => {
-                    let _ = write!(
-                        x,
-                        "<failure message=\"{}\">baseline={} candidate={} change={:+.2}% limit={}</failure>",
-                        esc(&format!("{} regressed {:+.1}%", c.name, c.change_pct)),
-                        c.baseline,
-                        c.candidate,
-                        c.change_pct,
-                        esc(&c.limit)
-                    );
-                }
-                Status::Skipped => {
-                    let _ = write!(x, "<skipped message=\"{}\"/>", esc(&c.note));
-                }
-                _ => {}
+            if failing(c) {
+                let _ = write!(
+                    x,
+                    "<failure message=\"{}\">baseline={} candidate={} unit={} delta_ratio={} limit={}</failure>",
+                    esc(&format!("{} regressed {}", c.label(), c.fmt_delta())),
+                    c.baseline,
+                    c.candidate,
+                    esc(&c.unit),
+                    c.delta_ratio
+                        .map_or("null".to_owned(), |d| format!("{d:.4}")),
+                    esc(&c.fmt_limit())
+                );
+            } else if c.verdict == Status::Skipped {
+                let _ = write!(x, "<skipped message=\"{}\"/>", esc(&c.note));
             }
             let _ = writeln!(x, "</testcase>");
         }
         x.push_str("</testsuite>\n");
         x
     }
+}
+
+/// Wrap `s` at `width` columns, continuation lines indented by `indent` spaces.
+pub fn wrap(s: &str, width: usize, indent: usize) -> String {
+    let mut out = String::new();
+    let mut line = 0usize;
+    for word in s.split_whitespace() {
+        let w = word.chars().count();
+        if line > 0 && line + 1 + w > width {
+            out.push('\n');
+            out.push_str(&" ".repeat(indent));
+            line = 0;
+        } else if line > 0 {
+            out.push(' ');
+            line += 1;
+        }
+        out.push_str(word);
+        line += w;
+    }
+    out
 }
 
 #[cfg(test)]
@@ -890,26 +1262,53 @@ mod tests {
             warnings: vec![],
             started_at: std::time::SystemTime::now(),
             ended_at: std::time::SystemTime::now(),
-            spec: None,
+            spec: Some(crate::model::RunSpec::new(&p, "memory://")),
         })
     }
 
-    fn status(d: &DiffReport, name: &str) -> Status {
-        d.checks
-            .iter()
-            .find(|c| c.name == name)
-            .unwrap_or_else(|| panic!("no check {name}: {:?}", d.checks))
-            .status
+    fn verdict(d: &DiffReport, id: &str) -> Status {
+        d.check(id)
+            .unwrap_or_else(|| panic!("no check {id}: {:?}", d.checks))
+            .verdict
     }
 
     #[test]
-    fn configuration_changes_are_reported_and_gate_workload_and_target() {
+    fn checks_are_machine_grade() {
         let b = report(&["stat"], 0, 1000);
-        // Knobs differ: legitimate A/B, passes with a prominent warning.
+        let mut c = b.clone();
+        c.summary.ops = 500;
+        let d = diff(&b, &c, &Thresholds::default());
+        let t = d.check("throughput").unwrap();
+        assert_eq!(t.unit, "ops_per_s");
+        assert!((t.delta_ratio.unwrap() + 0.5).abs() < 1e-9, "{t:?}");
+        assert_eq!(t.limit_ratio, Some(0.10));
+        assert_eq!(t.verdict, Status::Fail);
+        assert_eq!(d.verdict, GateVerdict::Regression);
+        assert_eq!(d.exit_code(), crate::errors::exit::GATE);
+        let v = serde_json::to_value(t).unwrap();
+        for k in [
+            "id",
+            "unit",
+            "baseline",
+            "candidate",
+            "delta_ratio",
+            "limit_ratio",
+            "verdict",
+        ] {
+            assert!(v.get(k).is_some(), "{k} missing: {v}");
+        }
+        assert!(v.get("name").is_none());
+        assert!(d.check("latency_p99.stat").is_some());
+    }
+
+    #[test]
+    fn knob_changes_are_an_ab_comparison() {
+        let b = report(&["stat"], 0, 1000);
         let mut c = b.clone();
         c.knobs.requested.concurrency_count = 64;
         let d = diff(&b, &c, &Thresholds::default());
         assert!(d.passed, "{}", d.render_terminal());
+        assert!(d.comparable);
         assert_eq!(
             d.config_changes,
             vec![ConfigChange {
@@ -925,51 +1324,49 @@ mod tests {
                 .any(|w| w.contains("knobs.requested.concurrency_count 16 → 64"))
         );
         assert!(d.render_terminal().contains("CONFIGURATION CHANGES"));
-        assert!(
-            d.render_markdown()
-                .contains("`knobs.requested.concurrency_count`")
-        );
-
-        // Workload differs: fails unless allowed.
-        let mut c = b.clone();
-        c.workload.access = "zipf:1.1".into();
-        c.workload.duration_s = 99.0;
-        let d = diff(&b, &c, &Thresholds::default());
-        assert!(!d.passed);
-        assert_eq!(status(&d, "same workload"), Status::Fail);
-        assert_eq!(
-            d.config_changes.len(),
-            1,
-            "duration is not a workload change"
-        );
-        assert!(d.render_junit().contains("same workload: differs"));
-        let allow = Thresholds {
-            allow_workload_change: true,
-            ..Thresholds::default()
-        };
-        assert!(diff(&b, &c, &allow).passed);
-
-        // Target differs: fails unless allowed.
-        let mut c = b.clone();
-        c.target.display = "s3://other".into();
-        let d = diff(&b, &c, &Thresholds::default());
-        assert_eq!(status(&d, "same target"), Status::Fail);
-        let allow = Thresholds {
-            allow_target_change: true,
-            ..Thresholds::default()
-        };
-        assert!(diff(&b, &c, &allow).passed);
-
         // Host differs: warning only.
         let mut c = b.clone();
         c.run.host.cpus_count += 1;
         let d = diff(&b, &c, &Thresholds::default());
         assert!(d.passed);
-        assert!(
-            d.warnings.iter().any(|w| w.contains("host.cpus_count")),
-            "{:?}",
-            d.warnings
+        assert!(d.warnings.iter().any(|w| w.contains("host.cpus_count")));
+    }
+
+    #[test]
+    fn different_workload_or_target_is_not_comparable() {
+        let b = report(&["stat"], 0, 1000);
+        let mut c = report(&["stat"], 0, 1000);
+        c.spec.profile.workload.access = crate::config::Access::Zipf(1.1);
+        c.summary.ops = 10; // would be a regression if it were comparable
+        let d = diff(&b, &c, &Thresholds::default());
+        assert!(!d.comparable);
+        assert_eq!(d.verdict, GateVerdict::NotComparable);
+        assert!(!d.passed);
+        assert_eq!(d.exit_code(), crate::errors::exit::OK);
+        assert!(!d.identity.same_workload && d.identity.same_target);
+        assert!(!d.identity.reasons.is_empty());
+        assert!(d.warnings.iter().any(|w| w.contains("not comparable")));
+        assert!(!d.render_junit().contains("<failure"));
+        let strict = Thresholds {
+            strict: true,
+            ..Thresholds::default()
+        };
+        assert_eq!(
+            diff(&b, &c, &strict).exit_code(),
+            crate::errors::exit::USAGE
         );
+        let allow = Thresholds {
+            allow_workload_change: true,
+            ..Thresholds::default()
+        };
+        let d = diff(&b, &c, &allow);
+        assert!(d.comparable && d.verdict == GateVerdict::Regression);
+
+        let mut c = report(&["stat"], 0, 1000);
+        c.spec.profile.target = TargetSpec::from_url("s3://other/x").unwrap();
+        let d = diff(&b, &c, &Thresholds::default());
+        assert!(!d.identity.same_target);
+        assert_eq!(d.verdict, GateVerdict::NotComparable);
     }
 
     #[test]
@@ -988,31 +1385,7 @@ mod tests {
             .insert("endpoint".into(), "http://127.0.0.1:39831".into());
         let d = diff(&b, &c, &Thresholds::default());
         assert!(d.config_changes.is_empty(), "{:?}", d.config_changes);
-        assert_eq!(status(&d, "same target"), Status::Pass);
-        // `oprobe demo` names its lab target.
-        let (mut b2, mut c2) = (b.clone(), c.clone());
-        for r in [&mut b2, &mut c2] {
-            r.target.display = "s3://demo".into();
-            r.target.name = Some("lab://demo".into());
-        }
-        assert!(
-            diff(&b2, &c2, &Thresholds::default())
-                .config_changes
-                .is_empty()
-        );
-        // A different scenario is still a different target.
-        c.target.display = "lab://throttle".into();
-        let d = diff(&b, &c, &Thresholds::default());
-        assert_eq!(status(&d, "same target"), Status::Fail);
-        // So is a different endpoint of a real target.
-        let (mut b3, mut c3) = (b.clone(), b.clone());
-        b3.target.display = "s3://bkt".into();
-        c3.target.display = "s3://bkt".into();
-        c3.target.endpoint = Some("http://127.0.0.1:1".into());
-        assert_eq!(
-            status(&diff(&b3, &c3, &Thresholds::default()), "same target"),
-            Status::Fail
-        );
+        assert!(d.comparable);
     }
 
     #[test]
@@ -1021,11 +1394,11 @@ mod tests {
         let c = report(&["read.full"], 0, 1000);
         let d = diff(&b, &c, &Thresholds::default());
         assert!(!d.passed);
-        assert_eq!(status(&d, "write present"), Status::Fail);
+        assert_eq!(verdict(&d, "present.write"), Status::Fail);
     }
 
     #[test]
-    fn throttling_gates_on_rate_growth_with_noise_floor() {
+    fn throttling_gates_on_rate_growth_with_floors() {
         let t = Thresholds::default();
         // baseline already throttled: 2% -> 4% fails
         let d = diff(
@@ -1033,43 +1406,62 @@ mod tests {
             &report(&["stat"], 40, 1000),
             &t,
         );
-        assert_eq!(status(&d, "throttled requests %"), Status::Fail);
+        assert_eq!(verdict(&d, "throttled_request_ratio"), Status::Fail);
         // 2% -> 2.05% is noise
         let d = diff(
             &report(&["stat"], 200, 10_000),
             &report(&["stat"], 205, 10_000),
             &t,
         );
-        assert_eq!(status(&d, "throttled requests %"), Status::Pass);
-        // tiny absolute change below the floor even if relatively large
+        assert_eq!(verdict(&d, "throttled_request_ratio"), Status::Pass);
+        // tiny absolute change below the ratio floor
         let d = diff(
             &report(&["stat"], 1, 100_000),
             &report(&["stat"], 5, 100_000),
             &t,
         );
-        assert_eq!(status(&d, "throttled requests %"), Status::Pass);
-        // new throttling still fails
+        assert_eq!(verdict(&d, "throttled_request_ratio"), Status::Pass);
+        // 0 -> 1 throttled response is not a regression (count floor) …
         let d = diff(&report(&["stat"], 0, 1000), &report(&["stat"], 1, 1000), &t);
-        assert_eq!(status(&d, "throttled requests %"), Status::Fail);
+        assert_eq!(verdict(&d, "throttled_request_ratio"), Status::Pass);
+        assert!(d.passed, "{}", d.render_terminal());
+        let d = diff(&report(&["stat"], 0, 1000), &report(&["stat"], 3, 1000), &t);
+        assert_eq!(verdict(&d, "throttled_request_ratio"), Status::Pass);
+        assert!(
+            d.check("throttled_request_ratio")
+                .unwrap()
+                .note
+                .contains("floor")
+        );
+        // … but real new throttling is.
+        let d = diff(
+            &report(&["stat"], 0, 1000),
+            &report(&["stat"], 50, 1000),
+            &t,
+        );
+        assert_eq!(verdict(&d, "throttled_request_ratio"), Status::Fail);
     }
 
     #[test]
-    fn mode_and_duration_mismatches_warn_and_missed_growth_fails() {
+    fn one_more_failed_op_is_below_the_count_floor() {
+        let b = report(&["stat"], 0, 1000);
+        let mut c = b.clone();
+        c.summary.failed_ops = 1;
+        c.summary.error_rate = 0.01;
+        let d = diff(&b, &c, &Thresholds::default());
+        assert_eq!(verdict(&d, "error_ratio"), Status::Pass);
+        c.summary.failed_ops = 10;
+        let d = diff(&b, &c, &Thresholds::default());
+        assert_eq!(verdict(&d, "error_ratio"), Status::Fail);
+    }
+
+    #[test]
+    fn mode_mismatch_warns_and_missed_growth_fails() {
         let b = report(&["stat"], 0, 1000);
         let mut c = report(&["stat"], 0, 1000);
         c.workload.rate_per_s = Some(100.0);
-        c.run.window_s = 60.0;
         let d = diff(&b, &c, &Thresholds::default());
-        assert!(
-            d.warnings.iter().any(|w| w.contains("closed-loop")),
-            "{:?}",
-            d.warnings
-        );
-        assert!(
-            d.warnings.iter().any(|w| w.contains("windows differ")),
-            "{:?}",
-            d.warnings
-        );
+        assert!(d.warnings.iter().any(|w| w.contains("closed-loop")));
 
         let mut b = report(&["stat"], 0, 1000);
         let mut c = b.clone();
@@ -1082,6 +1474,29 @@ mod tests {
         b.open_loop = Some(ol(0));
         c.open_loop = Some(ol(100));
         let d = diff(&b, &c, &Thresholds::default());
-        assert_eq!(status(&d, "open-loop missed %"), Status::Fail);
+        assert_eq!(verdict(&d, "open_loop_missed_ratio"), Status::Fail);
+    }
+
+    #[test]
+    fn long_json_values_are_summarized() {
+        let mix = r#"[{"weight":80,"op":{"kind":"read","size":"1MiB"}},{"weight":20,"op":{"kind":"stat"}}]"#;
+        let s = summarize(mix, 36);
+        assert!(s.chars().count() <= 36, "{s}");
+        assert!(s.starts_with("[2 items: read×80"), "{s}");
+        assert_eq!(summarize("short", 36), "short");
+        assert!(summarize(&"x".repeat(100), 10).ends_with('…'));
+        let mut b = report(&["stat"], 0, 1000);
+        let mut c = b.clone();
+        b.workload.preset = mix.into();
+        c.workload.preset = "small-files".into();
+        let d = diff(&b, &c, &Thresholds::default());
+        let width = d
+            .render_terminal()
+            .lines()
+            .map(crate::report::style::visible_width)
+            .max()
+            .unwrap();
+        assert!(width < 160, "table is {width} columns wide");
+        assert!(wrap(&"word ".repeat(60), 40, 2).lines().count() > 3);
     }
 }

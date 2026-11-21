@@ -6,12 +6,14 @@ use serde::Serialize;
 
 use super::Ctx;
 use super::args::*;
-use crate::analysis::compare::{Comparison, compare};
+use crate::analysis::compare::{Comparison, compare_with_noise};
 use crate::analysis::stats::{self, Interval};
 use crate::errors::{ErrorCode, OprobeError};
 use crate::model::Run;
 use crate::output::CommandOutput;
+use crate::report::diff::GateVerdict;
 use crate::report::diff::Thresholds;
+use crate::report::style::yellow;
 use crate::report::style::{bold, dim, red};
 use crate::report::write_file;
 use crate::store::{Baseline, Baselines, RunSummary};
@@ -32,29 +34,49 @@ impl CommandOutput for Comparison {
         Some(crate::report::html::render_compare(&self.gate))
     }
     fn exit_code(&self) -> u8 {
-        if self.passed {
-            0
-        } else {
-            crate::errors::exit::GATE
+        Comparison::exit_code(self)
+    }
+    fn warnings(&self) -> Vec<String> {
+        self.gate.warnings.clone()
+    }
+    fn next(&self) -> Vec<crate::output::NextStep> {
+        if self.comparable {
+            return Vec::new();
         }
+        let base = &self.baseline.representative;
+        vec![crate::output::NextStep::new(
+            "replay the baseline for a comparable candidate",
+            format!("oprobe run --from {base}"),
+        )]
     }
 }
 
 pub(super) fn thresholds(a: &CompareArgs) -> Thresholds {
     Thresholds {
-        p99_pct: a.max_p99_increase,
-        p50_pct: a.max_p50_increase,
+        p99_increase_ratio: a.max_p99_increase / 100.0,
+        p50_increase_ratio: a.max_p50_increase / 100.0,
         min_latency_delta_ms: a.min_latency_delta_ms,
-        throughput_drop_pct: a.max_throughput_drop,
-        error_rate_pp: a.max_error_increase,
-        request_amp_pct: a.max_request_amp_increase,
-        read_amp_pct: a.max_read_amp_increase,
-        cost_pct: a.max_cost_increase,
+        throughput_drop_ratio: a.max_throughput_drop / 100.0,
+        error_increase_ratio: a.max_error_increase / 100.0,
+        request_amp_increase_ratio: a.max_request_amp_increase / 100.0,
+        read_amp_increase_ratio: a.max_read_amp_increase / 100.0,
+        cost_increase_ratio: a.max_cost_increase / 100.0,
         fail_on_new_throttling: !a.allow_throttling,
-        min_samples: a.min_samples,
+        min_samples_count: a.min_samples,
         allow_workload_change: a.allow_workload_change,
         allow_target_change: a.allow_target_change,
+        strict: a.strict,
+        ..Thresholds::default()
     }
+}
+
+/// The noise floors learned for the target and workload of `r` (none when unknown).
+pub(super) fn noise_for(ctx: &Ctx, r: &Run) -> Option<crate::store::baselines::NoiseEntry> {
+    let file = crate::store::baselines::noise_file(&ctx.paths);
+    crate::store::baselines::NoiseFloors::load(&file)
+        .ok()?
+        .of(&r.report)
+        .cloned()
 }
 
 /// Load one side: a RUNREF, a comma-separated list of RUNREFs, or `all:LABEL` (every stored run
@@ -165,10 +187,27 @@ pub fn cmd_compare(a: CompareArgs, ctx: &Ctx) -> Result<u8> {
         .cloned()
         .collect();
     let base = if others.is_empty() { base } else { others };
-    let c = compare(&base, &cand, &base_label, &cand_ref, &thresholds(&a));
+    let noise = noise_for(ctx, &base[0]);
+    let c = compare_with_noise(
+        &base,
+        &cand,
+        &base_label,
+        &cand_ref,
+        &thresholds(&a),
+        noise.as_ref(),
+    );
     write_compare_files(&c, &a)?;
-    if !c.passed && ctx.out.format == crate::output::OutputFormat::Text {
-        ctx.out.info(red(&bold("regression gate failed (exit 3)")));
+    if ctx.out.format == crate::output::OutputFormat::Text {
+        match c.verdict {
+            GateVerdict::Regression => {
+                ctx.out.info(red(&bold("regression gate failed (exit 3)")));
+            }
+            GateVerdict::NotComparable => ctx.out.info(yellow(&bold(&format!(
+                "not comparable: no regression verdict{}",
+                if a.strict { " (--strict: exit 2)" } else { "" }
+            )))),
+            GateVerdict::Passed => {}
+        }
     }
     ctx.out.finish(&c)
 }
@@ -362,6 +401,130 @@ fn valid_name(name: &str) -> Result<()> {
     }
 }
 
+/// Result of `baseline calibrate`.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct CalibrateOutput {
+    /// Target identity the floor is stored under.
+    pub target: String,
+    pub workload_hash: String,
+    /// The identical runs measured.
+    pub run_ids: Vec<String>,
+    /// A/A pairs added.
+    pub pairs_count: u64,
+    /// A/A pairs known for this target and workload (all calibrations and verifications).
+    pub total_pairs_count: u64,
+    /// The noise floor per metric (`p50_ms`, `p99_ms`, `ops_per_s`, `mib_per_s`): relative
+    /// changes below it are not significant.
+    pub noise_floor_ratio: std::collections::BTreeMap<String, f64>,
+    /// Where it is stored.
+    pub path: String,
+}
+
+impl CommandOutput for CalibrateOutput {
+    fn text(&self) -> String {
+        let mut o = format!(
+            "{} {} {}\n",
+            bold("noise floor"),
+            self.target,
+            dim(&format!(
+                "· workload {} · {} new A/A pair(s), {} in total",
+                self.workload_hash, self.pairs_count, self.total_pairs_count
+            ))
+        );
+        for (m, v) in &self.noise_floor_ratio {
+            o += &format!("  {m:<10} ±{:.1}%\n", v * 100.0);
+        }
+        o += &dim(&format!("stored in {}\n", self.path));
+        o
+    }
+}
+
+/// `oprobe baseline calibrate TARGET [--repeat N]`: identical runs, consecutive pairs feed the
+/// noise floor (`<data>/noise.toml`) that compare and verify use.
+pub async fn cmd_calibrate(a: CalibrateArgs, ctx: &Ctx) -> Result<u8> {
+    use crate::store::baselines::{NOISE_METRICS, NoiseFloors, noise_file, noise_ratio};
+    let mut runs: Vec<Run> = Vec::new();
+    if let Some(from) = &a.from {
+        let base = ctx.store().load(from)?;
+        for i in 0..a.repeat {
+            ctx.out.info(dim(&format!(
+                "calibrate: run {}/{} (replay of {})",
+                i + 1,
+                a.repeat,
+                base.id()
+            )));
+            let args = super::verify::replay_args(
+                base.id(),
+                &crate::model::Overrides::new(),
+                &format!("calibrate-{}", base.id()),
+                &a.safety,
+                a.no_save,
+            );
+            runs.push(super::verify::replay(ctx, &args).await?);
+        }
+    } else {
+        let (profile, target_name) =
+            super::resolve_profile(ctx, &a.target, &a.workload, &a.knobs, &CostArgs::default())?;
+        let output = OutputArgs {
+            no_save: a.no_save,
+            label: Some(format!("calibrate-{}", crate::model::RunId::new())),
+            ..OutputArgs::default()
+        };
+        if a.safety.dry_run {
+            let rails = super::run::rails(ctx, &profile, &a.safety)?;
+            let mut plan = rails.plan(&profile);
+            plan.eta_s *= a.repeat as f64;
+            plan.assumptions.push(format!(
+                "{} identical runs (this plan is one of them)",
+                a.repeat
+            ));
+            return ctx.out.finish(&super::run::PlanOutput { plan });
+        }
+        for i in 0..a.repeat {
+            ctx.out
+                .info(dim(&format!("calibrate: run {}/{}", i + 1, a.repeat)));
+            match super::run::measure(
+                ctx,
+                profile.clone(),
+                target_name.clone(),
+                &a.safety,
+                &output,
+            )
+            .await?
+            {
+                super::run::Measured::Run(o) => runs.push(
+                    o.full
+                        .map(|r| *r)
+                        .ok_or_else(|| anyhow::anyhow!("the calibration run kept no rows"))?,
+                ),
+                super::run::Measured::Plan(_) => unreachable!("not a dry run"),
+            }
+        }
+    }
+    let file = noise_file(&ctx.paths);
+    let mut floors = NoiseFloors::load(&file)?;
+    let mut pairs = 0u64;
+    for w in runs.windows(2) {
+        floors.add_pair(&w[0].report, &w[1].report);
+        pairs += 1;
+    }
+    floors.save(&file)?;
+    let first = &runs[0].report;
+    let entry = floors.of(first).cloned();
+    ctx.out.finish(&CalibrateOutput {
+        target: crate::report::diff::target_identity(first),
+        workload_hash: first.spec.workload_hash(),
+        run_ids: runs.iter().map(|r| r.id().to_owned()).collect(),
+        pairs_count: pairs,
+        total_pairs_count: entry.as_ref().map_or(0, |e| e.pairs_count),
+        noise_floor_ratio: NOISE_METRICS
+            .iter()
+            .map(|m| ((*m).to_owned(), noise_ratio(entry.as_ref(), m)))
+            .collect(),
+        path: file.display().to_string(),
+    })
+}
+
 pub fn cmd_baseline(c: BaselineCommand, ctx: &Ctx) -> Result<u8> {
     let file = ctx.paths.baselines_file();
     match c {
@@ -441,5 +604,6 @@ pub fn cmd_baseline(c: BaselineCommand, ctx: &Ctx) -> Result<u8> {
             };
             ctx.out.finish(&show(ctx, &a.name, bl)?)
         }
+        BaselineCommand::Calibrate(_) => unreachable!("dispatched to cmd_calibrate"),
     }
 }

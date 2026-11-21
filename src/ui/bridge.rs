@@ -403,9 +403,8 @@ impl Job {
                 .await?;
                 let tuned = m.tuned.context("the tuner returned no result")?;
                 let header = format!(
-                    "objective {} · {:+.0}% vs baseline",
-                    tuned.summary.objective,
-                    tuned.summary.improvement * 100.0
+                    "objective {} · {}",
+                    tuned.summary.objective, tuned.summary.headline
                 );
                 Ok(Outcome::Run {
                     tuned: Some(Box::new(TunedExtras {

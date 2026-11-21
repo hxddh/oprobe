@@ -329,6 +329,14 @@
     "Capacity": {
       "description": "How much load the target takes (design v4 §3); `report.capacity`.",
       "properties": {
+        "calibration_bias_ratio": {
+          "description": "Measured / predicted throughput of earlier verifications of this target and workload\n([`calibrate`]); [`Capacity::predict`] scales its throughput by it.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
         "confidence": {
           "$ref": "#/$defs/Confidence"
         },
@@ -802,6 +810,54 @@
         "object_size",
         "partitions",
         "persist"
+      ],
+      "type": "object"
+    },
+    "Delta": {
+      "description": "One objective metric, recommended vs a reference trial.",
+      "properties": {
+        "baseline": {
+          "description": "The reference trial's value.",
+          "format": "double",
+          "type": "number"
+        },
+        "baseline_feasible": {
+          "description": "The reference met the SLA and the throttle budget; deltas against an infeasible\nreference are not improvements.",
+          "type": "boolean"
+        },
+        "baseline_trial": {
+          "description": "Trial id of the reference.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "candidate": {
+          "description": "The recommended configuration's value.",
+          "format": "double",
+          "type": "number"
+        },
+        "delta_ratio": {
+          "description": "`(candidate − baseline) / baseline` (0 when the baseline is 0).",
+          "format": "double",
+          "type": "number"
+        },
+        "metric": {
+          "description": "`ops_per_s` / `mib_per_s` (goodput), `p99_ms` (latency) or\n`cost_per_million_ops_usd`.",
+          "type": "string"
+        },
+        "unit": {
+          "description": "Unit of `baseline` and `candidate`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "metric",
+        "unit",
+        "baseline",
+        "candidate",
+        "delta_ratio",
+        "baseline_feasible",
+        "baseline_trial"
       ],
       "type": "object"
     },
@@ -2523,6 +2579,64 @@
       ],
       "type": "object"
     },
+    "Recommendation": {
+      "description": "What `oprobe tune` / `oprobe fix` / MCP `recommend_config` recommend.",
+      "properties": {
+        "confirmed": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VerifyOutcome"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What `oprobe verify` concluded about the recommendation (set by `oprobe fix`)."
+        },
+        "knobs": {
+          "$ref": "#/$defs/KnobValues",
+          "description": "The recommended knob values."
+        },
+        "no_feasible_trial": {
+          "description": "No trial met the SLA: this is the least-bad configuration, not a recommendation.",
+          "type": "boolean"
+        },
+        "objective": {
+          "type": "string"
+        },
+        "overrides": {
+          "$ref": "#/$defs/Overrides",
+          "description": "The change from the baseline's knobs (`--set` vocabulary): apply with\n`oprobe run --from RUN …` or `RunSpec::with`."
+        },
+        "profile_toml": {
+          "description": "A profile with the recommended knobs (environment defaults such as `proxy` and\nredacted secrets omitted).",
+          "type": "string"
+        },
+        "rust_snippet": {
+          "description": "Rust/OpenDAL code configuring the same client.",
+          "type": "string"
+        },
+        "vs_baseline": {
+          "$ref": "#/$defs/Delta",
+          "description": "Against the baseline trial (`baseline_feasible: false` when it violated the SLA or\nthe throttle budget)."
+        },
+        "vs_best": {
+          "$ref": "#/$defs/Delta",
+          "description": "Against the best feasible trial: the cost of the safety margin."
+        }
+      },
+      "required": [
+        "objective",
+        "knobs",
+        "overrides",
+        "profile_toml",
+        "rust_snippet",
+        "vs_baseline",
+        "vs_best",
+        "no_feasible_trial"
+      ],
+      "type": "object"
+    },
     "RemoteStats": {
       "properties": {
         "down_bytes": {
@@ -4004,10 +4118,33 @@
           "format": "double",
           "type": "number"
         },
+        "peak_inflight_count": {
+          "description": "Requests in flight at the trial's peak.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "peak_inflight_per_op_count": {
+          "description": "Requests one operation keeps in flight at its peak (p95 over operations).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "requests_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "stage": {
           "type": "string"
         },
-        "throttle_ratio": {
+        "throttled_op_ratio": {
+          "description": "Operations with ≥ 1 throttled response / operations.",
+          "format": "double",
+          "type": "number"
+        },
+        "throttled_request_ratio": {
+          "description": "Throttled responses / requests (the throttle budget applies to this).",
           "format": "double",
           "type": "number"
         },
@@ -4026,8 +4163,12 @@
         "p50_ms",
         "p99_ms",
         "error_ratio",
-        "throttle_ratio",
+        "throttled_request_ratio",
+        "throttled_op_ratio",
         "throttled_responses_count",
+        "requests_count",
+        "peak_inflight_count",
+        "peak_inflight_per_op_count",
         "cost_per_million_ops_usd",
         "feasible",
         "note"
@@ -4035,17 +4176,65 @@
       "type": "object"
     },
     "TuneReport": {
-      "description": "The tuner's search, embedded in the winner's report.",
+      "description": "The tuner's search, embedded in the winner's report (design v4 §6).",
       "properties": {
+        "baseline_feasible": {
+          "description": "The baseline met the SLA and the throttle budget. When it did not, deltas are taken\nagainst the best feasible trial.",
+          "type": "boolean"
+        },
         "baseline_trial": {
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
-        "improvement_pct": {
-          "description": "Objective change of the winner vs the baseline trial.",
+        "best_feasible_trial_id": {
+          "description": "The best trial within the SLA and the throttle budget, ignoring the safety margin.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "capacity": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Capacity"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The capacity model over every trial (`source: tune`)."
+        },
+        "headline": {
+          "description": "One line: what is recommended and why.",
+          "type": "string"
+        },
+        "improvement_ratio": {
+          "description": "Objective improvement of the recommendation vs the baseline (positive = better);\nabsent when the baseline was infeasible or above the safety margin. Never negative.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "margin_cost_ratio": {
+          "description": "How much better the best feasible trial measured than the recommendation: what the\nsafety margin costs.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "max_throttle_ratio": {
+          "description": "The throttle budget (share of throttled requests a feasible trial may cause).",
           "format": "double",
           "type": "number"
+        },
+        "metric_unit": {
+          "description": "What goodput was measured in: `ops_per_s` or `mib_per_s`.",
+          "type": "string"
         },
         "no_feasible_trial": {
           "description": "No trial met the SLA: the winner is the least-bad configuration.",
@@ -4058,9 +4247,47 @@
           "type": "array"
         },
         "objective": {
+          "description": "`goodput`, `p99`, `cost` or `balanced`.",
           "type": "string"
         },
+        "pareto_trial_ids": {
+          "default": [],
+          "description": "Trials not dominated on (goodput, p99, cost, throttling).",
+          "items": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        "recommendation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Recommendation"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The recommended configuration: knobs, profile, code, deltas."
+        },
+        "recommended_trial_id": {
+          "description": "The trial whose knobs are recommended.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "safe_concurrency_count": {
+          "description": "The capacity model's concurrency within the safety margin.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "throttle_ceiling_count": {
+          "description": "Lowest concurrency that exceeded the throttle budget.",
           "format": "uint64",
           "minimum": 0,
           "type": [
@@ -4075,6 +4302,7 @@
           "type": "array"
         },
         "winner_trial": {
+          "description": "The recommendation's confirmation run.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -4082,10 +4310,15 @@
       },
       "required": [
         "objective",
+        "metric_unit",
         "trials",
         "baseline_trial",
+        "recommended_trial_id",
         "winner_trial",
-        "improvement_pct",
+        "baseline_feasible",
+        "headline",
+        "max_throttle_ratio",
+        "pareto_trial_ids",
         "no_feasible_trial",
         "notes"
       ],
@@ -4266,6 +4499,26 @@
         "replay"
       ],
       "type": "object"
+    },
+    "VerifyOutcome": {
+      "description": "What `verify` concluded about one hypothesis.",
+      "oneOf": [
+        {
+          "const": "confirmed",
+          "description": "The change moved the metrics as expected.",
+          "type": "string"
+        },
+        {
+          "const": "refuted",
+          "description": "The change did not help (or made things worse).",
+          "type": "string"
+        },
+        {
+          "const": "inconclusive",
+          "description": "Noise or too few samples to tell.",
+          "type": "string"
+        }
+      ]
     },
     "WireProtocol": {
       "description": "Wire protocol of one request.",

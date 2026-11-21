@@ -1806,11 +1806,12 @@ fn environment_section(r: &Report) -> String {
 
 /// The regression gate (`oprobe compare -o html`) as a self-contained page.
 pub fn render_compare(d: &DiffReport) -> String {
+    use super::diff::GateVerdict;
     let mut b = String::new();
-    let (cls, icon, label) = if d.passed {
-        ("st-ok", "✓", "PASSED")
-    } else {
-        ("st-critical", "✖", "FAILED")
+    let (cls, icon, label) = match d.verdict {
+        GateVerdict::Passed => ("st-ok", "✓", "PASSED"),
+        GateVerdict::Regression => ("st-critical", "✖", "FAILED"),
+        GateVerdict::NotComparable => ("st-attention", "▲", "NOT COMPARABLE"),
     };
     let _ = write!(
         b,
@@ -1820,14 +1821,22 @@ pub fn render_compare(d: &DiffReport) -> String {
         esc(&d.baseline),
         esc(&d.candidate)
     );
-    let fails = d.checks.iter().filter(|c| c.status == Status::Fail).count();
+    let fails = d
+        .checks
+        .iter()
+        .filter(|c| c.verdict == Status::Fail)
+        .count();
     let _ = write!(
         b,
         "<section id=\"verdict\"><div class=\"verdict\"><span class=\"pill {cls}\">{icon} {label}</span><p class=\"headline\">{}</p></div>",
-        if d.passed {
-            "No check exceeded its limit.".to_owned()
-        } else {
-            format!("{fails} check(s) exceeded their limit (exit code 3).")
+        match d.verdict {
+            GateVerdict::Passed => "No check exceeded its limit.".to_owned(),
+            GateVerdict::Regression =>
+                format!("{fails} check(s) exceeded their limit (exit code 3)."),
+            GateVerdict::NotComparable => esc(&format!(
+                "No regression verdict: {}.",
+                d.identity.reasons.join("; ")
+            )),
         }
     );
     for w in &d.warnings {
@@ -1846,15 +1855,15 @@ pub fn render_compare(d: &DiffReport) -> String {
                 "<tr><td>{}</td><td class=\"l\"><code>{}</code></td><td class=\"l\">{}</td><td class=\"l\">{}</td></tr>",
                 c.kind.label(),
                 esc(&c.field),
-                esc(&c.baseline),
-                esc(&c.candidate)
+                esc(&super::diff::summarize(&c.baseline, 80)),
+                esc(&super::diff::summarize(&c.candidate, 80))
             );
         }
         b += "</tbody></table></div></section>";
     }
     b += "<section><h2>Checks</h2><div class=\"tablewrap\"><table><thead><tr><th>check</th><th>baseline</th><th>candidate</th><th>change</th><th class=\"l\">limit</th><th class=\"l\">result</th></tr></thead><tbody>";
     for c in &d.checks {
-        let (cls, txt) = match c.status {
+        let (cls, txt) = match c.verdict {
             Status::Pass => ("st-ok", "✓ pass"),
             Status::Improved => ("st-review", "▲ improved"),
             Status::Fail => ("st-critical", "✖ fail"),
@@ -1862,12 +1871,12 @@ pub fn render_compare(d: &DiffReport) -> String {
         };
         let _ = write!(
             b,
-            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{:+.1}%</td><td class=\"l\">{}</td><td class=\"l\"><span class=\"pill {cls}\">{txt}</span>{}</td></tr>",
-            esc(&c.name),
-            fmt_num(c.baseline),
-            fmt_num(c.candidate),
-            c.change_pct,
-            esc(&c.limit),
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td class=\"l\">{}</td><td class=\"l\"><span class=\"pill {cls}\">{txt}</span>{}</td></tr>",
+            esc(&c.label()),
+            esc(&c.fmt_value(c.baseline)),
+            esc(&c.fmt_value(c.candidate)),
+            esc(&c.fmt_delta()),
+            esc(&c.fmt_limit()),
             if c.note.is_empty() {
                 String::new()
             } else {
@@ -1973,23 +1982,29 @@ mod tests {
 
     #[test]
     fn compare_page_shows_the_gate() {
-        let d = DiffReport {
+        let mut d = DiffReport {
+            verdict: super::super::diff::GateVerdict::Passed,
             passed: false,
+            comparable: true,
             baseline: "a".into(),
             candidate: "<b>".into(),
             thresholds: Default::default(),
+            identity: Default::default(),
             config_changes: vec![],
             checks: vec![super::super::diff::Check {
-                name: "p99 read".into(),
+                id: "latency_p99.read".into(),
+                unit: "ms".into(),
                 baseline: 10.0,
                 candidate: 20.0,
-                change_pct: 100.0,
-                limit: "+20%".into(),
-                status: Status::Fail,
+                delta_ratio: Some(1.0),
+                limit_ratio: Some(0.2),
+                abs_limit: None,
+                verdict: Status::Fail,
                 note: String::new(),
             }],
             warnings: vec![],
         };
+        d.settle();
         let h = render_compare(&d);
         assert!(h.contains("FAILED") && h.contains("&lt;b&gt;") && h.contains("+100.0%"));
     }

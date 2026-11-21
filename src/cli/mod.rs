@@ -9,6 +9,7 @@ pub(crate) mod compare;
 pub(crate) mod demo;
 pub mod doctor;
 pub(crate) mod export;
+pub(crate) mod fix;
 mod live;
 pub(crate) mod matrix;
 mod measure;
@@ -20,6 +21,8 @@ pub(crate) mod run;
 pub(crate) mod runs;
 pub(crate) mod self_update;
 pub(crate) mod settings;
+pub(crate) mod tune;
+pub(crate) mod verify;
 pub(crate) mod watch;
 
 use std::io::IsTerminal;
@@ -40,7 +43,8 @@ use crate::report::style::{self, bold, red, yellow};
 use crate::store::{ConfigFile, Paths};
 use crate::util::{ByteSize, HumanDuration, parse_duration};
 
-pub use run::{RunOutput, TuneOutput};
+pub use run::RunOutput;
+pub use tune::TuneOutput;
 
 /// Exit code when the SLA is breached, `--fail-on` matched or the compare gate failed.
 pub const EXIT_GATE: u8 = exit::GATE;
@@ -447,7 +451,9 @@ fn detach_console() {
 async fn dispatch(cmd: Command, ctx: &Ctx) -> Result<u8> {
     match cmd {
         Command::Run(a) => run::cmd_run(a, ctx).await,
-        Command::Tune(a) => run::cmd_tune(a, ctx).await,
+        Command::Tune(a) => tune::cmd_tune(a, ctx).await,
+        Command::Verify(a) => verify::cmd_verify(a, ctx).await,
+        Command::Fix(a) => fix::cmd_fix(a, ctx).await,
         Command::Compare(a) => compare::cmd_compare(a, ctx),
         Command::Runs(c) => match c {
             RunsCommand::List(a) => runs::cmd_list(a, ctx),
@@ -502,6 +508,7 @@ async fn dispatch(cmd: Command, ctx: &Ctx) -> Result<u8> {
         Command::Watch(a) => watch::cmd_watch(a, ctx).await,
         Command::Matrix(a) => matrix::cmd_matrix(a, ctx).await,
         Command::Compat(a) => crate::compat::command::run(a, ctx).await,
+        Command::Baseline(BaselineCommand::Calibrate(a)) => compare::cmd_calibrate(a, ctx).await,
         Command::Baseline(c) => compare::cmd_baseline(c, ctx),
         Command::Mcp(a) => agent::cmd_mcp(a, ctx).await,
         Command::Schema(a) => agent::cmd_schema(a, ctx),
@@ -940,6 +947,11 @@ pub struct TuneSettings<'a> {
     pub max_trials: usize,
     pub max_concurrency: usize,
     pub cooldown: &'a str,
+    /// Throttle budget (unset: `config::defaults().tune.max_throttle_ratio`).
+    pub max_throttle_ratio: Option<f64>,
+    pub boundary_repeats: usize,
+    /// In-flight headroom below the ceiling (unset: `config::defaults().headroom_ratio`).
+    pub headroom_ratio: Option<f64>,
 }
 
 impl Default for TuneSettings<'static> {
@@ -951,6 +963,9 @@ impl Default for TuneSettings<'static> {
             max_trials: tune_defaults::MAX_TRIALS,
             max_concurrency: tune_defaults::MAX_CONCURRENCY,
             cooldown: tune_defaults::COOLDOWN,
+            max_throttle_ratio: None,
+            boundary_repeats: tune_defaults::BOUNDARY_REPEATS,
+            headroom_ratio: None,
         }
     }
 }
@@ -972,19 +987,34 @@ pub fn tune_options(
         tune_defaults::MIN_TRIALS
     );
     anyhow::ensure!(s.max_concurrency >= 1, "max concurrency must be at least 1");
-    Ok(crate::tune::TuneOptions {
+    let d = crate::config::defaults();
+    let max_throttle_ratio = s.max_throttle_ratio.unwrap_or(d.tune.max_throttle_ratio);
+    anyhow::ensure!(
+        (0.0..=1.0).contains(&max_throttle_ratio),
+        "the throttle budget must be within 0..1"
+    );
+    let headroom_ratio = s.headroom_ratio.unwrap_or(d.headroom_ratio);
+    anyhow::ensure!(
+        (0.0..0.95).contains(&headroom_ratio),
+        "the headroom must be within 0..0.95"
+    );
+    let mut o = crate::tune::TuneOptions::new(
         objective,
-        trial: RunOptions {
+        RunOptions {
             duration,
             warmup: parse_duration(s.trial_warmup).context("invalid trial warmup")?,
             max_ops: None,
             rate,
             trace_slow_ops: false,
         },
-        max_concurrency: s.max_concurrency,
-        max_trials: s.max_trials,
-        cooldown: parse_duration(s.cooldown).context("invalid cooldown")?,
-    })
+    );
+    o.max_concurrency = s.max_concurrency;
+    o.max_trials = s.max_trials;
+    o.cooldown = parse_duration(s.cooldown).context("invalid cooldown")?;
+    o.max_throttle_ratio = max_throttle_ratio;
+    o.boundary_repeats = s.boundary_repeats.max(1);
+    o.headroom_ratio = headroom_ratio;
+    Ok(o)
 }
 
 fn cmd_init(a: InitArgs) -> Result<u8> {

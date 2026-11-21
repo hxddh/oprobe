@@ -20,14 +20,44 @@ pub use crate::model::{REPORT_SCHEMA as SCHEMA, Report, Run};
 /// [`crate::model::TuneReport`]).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct TuneSummary {
+    /// `goodput`, `p99`, `cost` or `balanced`.
     pub objective: String,
+    /// What goodput was measured in: `ops_per_s` or `mib_per_s`.
+    pub metric_unit: String,
     pub trials: Vec<crate::tune::Trial>,
     pub baseline_trial: usize,
+    /// The trial whose knobs are recommended.
+    pub recommended_trial: usize,
+    /// The recommendation's confirmation run (a longer window).
     pub winner_trial: usize,
-    /// Throughput change of the winner vs baseline (fraction, e.g. 0.42 = +42%).
-    pub improvement: f64,
+    /// The best trial within the SLA and the throttle budget, ignoring the safety margin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub best_feasible_trial: Option<usize>,
+    /// The baseline met the SLA and the throttle budget.
+    pub baseline_feasible: bool,
+    /// Objective improvement of the recommendation vs the baseline (ratio, positive =
+    /// better); absent when the baseline was infeasible or above the margin (never negative).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub improvement: Option<f64>,
+    /// One line: what is recommended and why (never a negative improvement).
+    pub headline: String,
+    /// How much better the best feasible trial measured than the recommendation (the cost of
+    /// the safety margin).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub margin_cost_ratio: Option<f64>,
+    /// Lowest concurrency that exceeded the throttle budget.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub throttle_ceiling: Option<usize>,
+    /// The capacity model's concurrency within the margin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub safe_concurrency: Option<usize>,
+    /// The pooled capacity estimate over every trial.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity: Option<crate::analysis::capacity::Capacity>,
+    pub max_throttle_ratio: f64,
+    /// Trials not dominated on (goodput, p99, cost, throttling).
+    #[serde(default)]
+    pub pareto: Vec<usize>,
     /// No trial met the SLA: the winner is the least-bad configuration, not a recommendation.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub no_feasible_trial: bool,

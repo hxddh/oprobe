@@ -66,7 +66,7 @@ pub fn tune_page() -> impl IntoElement {
                                 .child(mono(t.knobs.summary()).flex_1().number_of_lines(1))
                                 .child(num(fmt::compact(t.ops_per_s)).w(px(70.0)))
                                 .child(num(fmt::dur_ms(t.p99_ms)).w(px(70.0)))
-                                .child(num(fmt::ratio(t.throttle_rate)).w(px(70.0)).text_color(move || if ok { theme().foreground } else { Tone::Warn.color() }))
+                                .child(num(fmt::ratio(t.throttled_request_ratio)).w(px(70.0)).text_color(move || if ok { theme().foreground } else { Tone::Warn.color() }))
                         }))
                         .into_element()
                 })

@@ -179,6 +179,10 @@ pub struct Capacity {
     /// Why the confidence is what it is.
     pub confidence_reason: String,
     pub source: CapacitySource,
+    /// Measured / predicted throughput of earlier verifications of this target and workload
+    /// ([`calibrate`]); [`Capacity::predict`] scales its throughput by it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calibration_bias_ratio: Option<f64>,
 }
 
 /// What [`Capacity::predict`] expects at a concurrency.
@@ -503,7 +507,11 @@ impl Capacity {
             Some(ce) => c.min((ce.hi.max(1.0) / per_op_mean).max(1.0)),
             None => c,
         };
-        let ops = per_worker.map_or(0.0, |r| r * workers);
+        let bias = self
+            .calibration_bias_ratio
+            .filter(|b| b.is_finite() && *b > 0.0)
+            .unwrap_or(1.0);
+        let ops = per_worker.map_or(0.0, |r| r * workers) * bias;
         let rel = if o.ops_inflight_mean > 0.0 {
             (0.1 + 0.2 * (c / o.ops_inflight_mean).ln().abs()).min(0.6)
         } else {
@@ -555,6 +563,142 @@ pub struct HistoryEntry {
     pub run_id: Option<String>,
     /// RFC 3339.
     pub updated_at: String,
+    /// What verifications of this target and workload taught ([`calibrate`]).
+    #[serde(default, skip_serializing_if = "Calibration::is_empty")]
+    pub calibration: Calibration,
+}
+
+/// One verified prediction (`oprobe verify`), as remembered.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Observation {
+    /// The finding (or `recommendation`) whose change was verified.
+    pub code: String,
+    pub outcome: crate::analysis::verification::VerifyOutcome,
+    /// Workers of the verified configuration.
+    pub concurrency_count: u64,
+    /// What [`Capacity::predict`] expected (successful ops/s).
+    pub predicted_ops_per_s: f64,
+    /// What the candidate runs measured (successful ops/s, mean).
+    pub measured_ops_per_s: f64,
+    /// Peak requests in flight of the candidate runs (max).
+    pub peak_inflight_count: u64,
+    /// Throttled responses / requests of the candidate runs.
+    pub throttled_request_ratio: f64,
+    /// The throttle budget the outcome was judged against.
+    pub max_throttle_ratio: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    /// RFC 3339.
+    #[serde(default)]
+    pub at: String,
+}
+
+/// Verification outcomes stored next to the capacity history, and the prediction bias they
+/// imply.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Calibration {
+    /// Measured / predicted throughput (exponential moving average; 1 = unbiased).
+    #[serde(default)]
+    pub ops_bias_ratio: f64,
+    /// Observations folded into the bias.
+    #[serde(default)]
+    pub observations_count: u64,
+    /// The newest observations (at most [`CALIBRATION_KEEP`]).
+    #[serde(default)]
+    pub observations: Vec<Observation>,
+}
+
+impl Calibration {
+    pub fn is_empty(&self) -> bool {
+        self.observations_count == 0 && self.observations.is_empty()
+    }
+}
+
+/// Observations kept per target and workload.
+pub const CALIBRATION_KEEP: usize = 20;
+
+/// Fold a verification into the estimate `cap` (in place):
+/// - the throughput bias (measured / predicted) moves toward this observation (weight 0.3);
+/// - a clean run (throttled ratio within the budget) at a peak above the ceiling's clean
+///   level raises it; a throttled run below the ceiling's throttled level lowers it.
+pub fn calibrate_capacity(cap: &mut Capacity, cal: &mut Calibration, obs: &Observation) {
+    if obs.predicted_ops_per_s > 0.0 && obs.measured_ops_per_s > 0.0 {
+        let r = (obs.measured_ops_per_s / obs.predicted_ops_per_s).clamp(0.2, 5.0);
+        cal.ops_bias_ratio = if cal.observations_count == 0 || cal.ops_bias_ratio <= 0.0 {
+            r
+        } else {
+            0.7 * cal.ops_bias_ratio + 0.3 * r
+        };
+        cal.observations_count += 1;
+    }
+    let peak = obs.peak_inflight_count as f64;
+    if peak > 0.0 {
+        let clean = obs.throttled_request_ratio <= obs.max_throttle_ratio;
+        match cap.inflight_ceiling.as_mut() {
+            Some(ce) if clean && peak > ce.lo => {
+                ce.lo = peak;
+                ce.requests = peak;
+                ce.hi = ce.hi.max(peak + 1.0);
+            }
+            Some(ce) if !clean && peak < ce.hi => {
+                ce.hi = peak.max(1.0);
+                ce.lo = ce.lo.min((peak - 1.0).max(0.0));
+                ce.requests = ce.lo;
+            }
+            None if !clean && peak > 1.0 => {
+                cap.inflight_ceiling = Some(Ceiling {
+                    requests: peak - 1.0,
+                    lo: peak - 1.0,
+                    hi: peak,
+                });
+                cap.confidence = Confidence::Low;
+                cap.confidence_reason =
+                    format!("throttled at {peak:.0} requests in flight in a verification run");
+            }
+            _ => {}
+        }
+    }
+    cal.observations.push(obs.clone());
+    if cal.observations.len() > CALIBRATION_KEEP {
+        let n = cal.observations.len() - CALIBRATION_KEEP;
+        cal.observations.drain(..n);
+    }
+    if cal.observations_count > 0 {
+        cap.calibration_bias_ratio = Some(cal.ops_bias_ratio);
+    }
+}
+
+/// Store a verification outcome in the history file at `path` and calibrate the remembered
+/// capacity of `target` / `workload_hash` (starting from `base` when nothing is remembered).
+/// Returns the calibrated capacity.
+pub fn calibrate(
+    path: &Path,
+    target: &TargetId,
+    workload_hash: &str,
+    base: &Capacity,
+    obs: &Observation,
+) -> anyhow::Result<Capacity> {
+    let mut h = History::load(path)?;
+    let entry = h
+        .targets
+        .entry(target.to_string())
+        .or_default()
+        .entry(workload_hash.to_owned())
+        .or_insert_with(|| {
+            let mut c = base.clone();
+            c.observed.levels.clear();
+            HistoryEntry {
+                capacity: c,
+                run_id: obs.run_id.clone(),
+                updated_at: String::new(),
+                calibration: Calibration::default(),
+            }
+        });
+    calibrate_capacity(&mut entry.capacity, &mut entry.calibration, obs);
+    entry.updated_at = crate::util::now_rfc3339();
+    let out = entry.capacity.clone();
+    h.save(path)?;
+    Ok(out)
 }
 
 /// `<data>/capacity.toml`: estimates keyed by target identity, then workload hash.
@@ -593,6 +737,9 @@ impl History {
         let e = self.targets.get(&target.to_string())?.get(workload_hash)?;
         let mut c = e.capacity.clone();
         c.source = CapacitySource::History;
+        if e.calibration.observations_count > 0 {
+            c.calibration_bias_ratio = Some(e.calibration.ops_bias_ratio);
+        }
         Some(c)
     }
 
@@ -606,12 +753,22 @@ impl History {
     ) {
         let mut c = cap.clone();
         c.observed.levels.clear();
-        self.targets.entry(target.to_string()).or_default().insert(
+        let m = self.targets.entry(target.to_string()).or_default();
+        // Verification outcomes outlive a new estimate; the bias keeps applying.
+        let calibration = m
+            .remove(workload_hash)
+            .map(|e| e.calibration)
+            .unwrap_or_default();
+        if calibration.observations_count > 0 {
+            c.calibration_bias_ratio = Some(calibration.ops_bias_ratio);
+        }
+        m.insert(
             workload_hash.to_owned(),
             HistoryEntry {
                 capacity: c,
                 run_id: run_id.map(str::to_owned),
                 updated_at: crate::util::now_rfc3339(),
+                calibration,
             },
         );
     }
@@ -850,6 +1007,61 @@ mod tests {
         assert!(v["per_op"]["peak_inflight_per_op_count"].is_u64(), "{v}");
         let back: Capacity = serde_json::from_value(v).unwrap();
         assert_eq!(back.inflight_ceiling, c.inflight_ceiling);
+    }
+
+    #[test]
+    fn calibrate_adjusts_the_ceiling_and_the_bias() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("capacity.toml");
+        let (reqs, ops) = synthetic(30, 24, &[1], 5, 30);
+        let c = estimate(&reqs, &ops, Window::all());
+        let lo = c.inflight_ceiling.unwrap().lo;
+        let t = TargetId::parse("s3://bench/data").unwrap();
+        let p = c.predict(10);
+        let obs = Observation {
+            code: "throttling".into(),
+            outcome: crate::analysis::verification::VerifyOutcome::Confirmed,
+            concurrency_count: 10,
+            predicted_ops_per_s: p.ops_per_s,
+            measured_ops_per_s: p.ops_per_s * 0.5,
+            peak_inflight_count: lo as u64 + 3,
+            throttled_request_ratio: 0.0,
+            max_throttle_ratio: 0.001,
+            ..Default::default()
+        };
+        let after = calibrate(&path, &t, "sha256:aa", &c, &obs).unwrap();
+        // A clean run above the clean level raises it.
+        assert_eq!(after.inflight_ceiling.unwrap().lo, lo + 3.0);
+        assert!((after.calibration_bias_ratio.unwrap() - 0.5).abs() < 1e-9);
+        let back = load(&path, &t, "sha256:aa").unwrap();
+        assert!(
+            (back.predict(10).ops_per_s - p.ops_per_s * 0.5).abs() < 1e-6 * p.ops_per_s.max(1.0)
+        );
+        // A throttled run below the throttled level lowers it.
+        let obs2 = Observation {
+            peak_inflight_count: 20,
+            throttled_request_ratio: 0.05,
+            measured_ops_per_s: p.ops_per_s,
+            ..obs
+        };
+        let after = calibrate(&path, &t, "sha256:aa", &c, &obs2).unwrap();
+        let ce = after.inflight_ceiling.unwrap();
+        assert_eq!(ce.hi, 20.0);
+        assert!(ce.lo <= 19.0);
+        let h = History::load(&path).unwrap();
+        let e = &h.targets[&t.to_string()]["sha256:aa"];
+        assert_eq!(e.calibration.observations.len(), 2);
+        assert!((e.calibration.ops_bias_ratio - (0.7 * 0.5 + 0.3)).abs() < 1e-9);
+        // A new estimate keeps the outcomes.
+        save(&path, &t, "sha256:aa", &c, Some("run-2")).unwrap();
+        let h = History::load(&path).unwrap();
+        assert_eq!(
+            h.targets[&t.to_string()]["sha256:aa"]
+                .calibration
+                .observations
+                .len(),
+            2
+        );
     }
 
     #[test]

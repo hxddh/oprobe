@@ -155,6 +155,27 @@ pub fn entries() -> Vec<Entry> {
             "Result of `oprobe compare`"
         ),
         entry!(
+            cmd "verify",
+            cli::verify::VerifyResult,
+            "Result of `oprobe verify`: confirmed, refuted or inconclusive per finding"
+        ),
+        entry!(
+            cmd "fix",
+            cli::fix::FixOutput,
+            "Result of `oprobe fix`: diagnose, tune, verify; a recommendation and a profile patch"
+        ),
+        entry!(
+            cmd "baseline-calibrate",
+            cli::compare::CalibrateOutput,
+            "Result of `oprobe baseline calibrate`: the target's noise floor"
+        ),
+        entry!(
+            "noise-floors",
+            Output,
+            crate::store::baselines::NoiseFloors,
+            "Noise floors learned per target and workload (<data>/noise.toml)"
+        ),
+        entry!(
             cmd "analyze",
             cli::analyze::AnalyzeOutput,
             "Result of `oprobe analyze`"

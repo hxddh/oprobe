@@ -1505,18 +1505,13 @@ async fn start_tune(st: &Arc<State>, a: StartTuneIn, cx: CallCx) -> anyhow::Resu
     if let Some(e) = p.refusals.into_iter().next() {
         return Err(e);
     }
-    let objective = match a.objective.as_deref().unwrap_or("throughput") {
-        "throughput" => crate::tune::Objective::Throughput,
-        "latency" => crate::tune::Objective::Latency,
-        "cost" => crate::tune::Objective::Cost,
-        o => {
-            return Err(OprobeError::new(
-                ErrorCode::UsageInvalidArgument,
-                format!("invalid objective `{o}` (throughput, latency, cost)"),
-            )
-            .into());
-        }
-    };
+    let o = a.objective.as_deref().unwrap_or("goodput");
+    let objective = crate::tune::Objective::parse(o).ok_or_else(|| {
+        OprobeError::new(
+            ErrorCode::UsageInvalidArgument,
+            format!("invalid objective `{o}` (goodput, p99, cost, balanced)"),
+        )
+    })?;
     let opts = crate::cli::tune_options(
         objective,
         &crate::cli::TuneSettings {
@@ -1525,6 +1520,8 @@ async fn start_tune(st: &Arc<State>, a: StartTuneIn, cx: CallCx) -> anyhow::Resu
             max_trials: a.max_trials.unwrap_or(d::MAX_TRIALS),
             max_concurrency: a.max_concurrency.unwrap_or(d::MAX_CONCURRENCY),
             cooldown: d::COOLDOWN,
+            max_throttle_ratio: p.profile.sla.max_throttle_rate,
+            ..Default::default()
         },
         p.profile.workload.rate,
     )?;
@@ -1715,14 +1712,15 @@ fn compare_runs(st: &Arc<State>, a: CompareIn) -> anyhow::Result<Reply> {
                 *dst = v;
             }
         };
-        set(&mut t.p99_pct, x.max_p99_increase_pct);
-        set(&mut t.p50_pct, x.max_p50_increase_pct);
+        let pct = |v: Option<f64>| v.map(|p| p / 100.0);
+        set(&mut t.p99_increase_ratio, pct(x.max_p99_increase_pct));
+        set(&mut t.p50_increase_ratio, pct(x.max_p50_increase_pct));
         set(&mut t.min_latency_delta_ms, x.min_latency_delta_ms);
-        set(&mut t.throughput_drop_pct, x.max_throughput_drop_pct);
-        set(&mut t.error_rate_pp, x.max_error_increase_pp);
-        set(&mut t.cost_pct, x.max_cost_increase_pct);
+        set(&mut t.throughput_drop_ratio, pct(x.max_throughput_drop_pct));
+        set(&mut t.error_increase_ratio, pct(x.max_error_increase_pp));
+        set(&mut t.cost_increase_ratio, pct(x.max_cost_increase_pct));
         if let Some(v) = x.min_samples {
-            t.min_samples = v;
+            t.min_samples_count = v;
         }
         if let Some(v) = x.allow_throttling {
             t.fail_on_new_throttling = !v;
@@ -1747,10 +1745,13 @@ fn compare_runs(st: &Arc<State>, a: CompareIn) -> anyhow::Result<Reply> {
         "{} → {}: {}",
         base.id(),
         cand.id(),
-        if d.passed {
-            "passed (no regression)"
-        } else {
-            "REGRESSION (gate failed)"
+        match d.verdict {
+            crate::report::diff::GateVerdict::Passed => "passed (no regression)".to_owned(),
+            crate::report::diff::GateVerdict::Regression => "REGRESSION (gate failed)".to_owned(),
+            crate::report::diff::GateVerdict::NotComparable => format!(
+                "not comparable, no verdict: {}",
+                d.gate.identity.reasons.join("; ")
+            ),
         }
     );
     reply(&d, text)

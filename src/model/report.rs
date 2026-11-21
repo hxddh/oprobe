@@ -57,6 +57,10 @@ pub const UNITLESS_FIELDS: &[&str] = &[
     "hi",
     "baseline",
     "candidate",
+    "abs_limit",
+    "estimate",
+    "low",
+    "high",
 ];
 
 /// Whether a numeric report field name follows the unit rule.
@@ -693,20 +697,55 @@ impl From<&crate::analysis::diagnosis::Finding> for Finding {
     }
 }
 
-/// The tuner's search, embedded in the winner's report.
+/// The tuner's search, embedded in the winner's report (design v4 §6).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct TuneReport {
+    /// `goodput`, `p99`, `cost` or `balanced`.
     pub objective: String,
+    /// What goodput was measured in: `ops_per_s` or `mib_per_s`.
+    pub metric_unit: String,
     pub trials: Vec<TrialRow>,
     pub baseline_trial: u64,
+    /// The trial whose knobs are recommended.
+    pub recommended_trial_id: u64,
+    /// The recommendation's confirmation run.
     pub winner_trial: u64,
-    /// Objective change of the winner vs the baseline trial.
-    pub improvement_pct: f64,
+    /// The best trial within the SLA and the throttle budget, ignoring the safety margin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub best_feasible_trial_id: Option<u64>,
+    /// The baseline met the SLA and the throttle budget. When it did not, deltas are taken
+    /// against the best feasible trial.
+    pub baseline_feasible: bool,
+    /// Objective improvement of the recommendation vs the baseline (positive = better);
+    /// absent when the baseline was infeasible or above the safety margin. Never negative.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub improvement_ratio: Option<f64>,
+    /// One line: what is recommended and why.
+    pub headline: String,
+    /// How much better the best feasible trial measured than the recommendation: what the
+    /// safety margin costs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub margin_cost_ratio: Option<f64>,
+    /// Lowest concurrency that exceeded the throttle budget.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub throttle_ceiling_count: Option<u64>,
+    /// The capacity model's concurrency within the safety margin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub safe_concurrency_count: Option<u64>,
+    /// The throttle budget (share of throttled requests a feasible trial may cause).
+    pub max_throttle_ratio: f64,
+    /// The capacity model over every trial (`source: tune`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity: Option<crate::analysis::capacity::Capacity>,
+    /// Trials not dominated on (goodput, p99, cost, throttling).
+    #[serde(default)]
+    pub pareto_trial_ids: Vec<u64>,
     /// No trial met the SLA: the winner is the least-bad configuration.
     pub no_feasible_trial: bool,
     pub notes: Vec<String>,
+    /// The recommended configuration: knobs, profile, code, deltas.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recommendation: Option<crate::tune::recommend::Recommendation>,
 }
 
 /// One tuner trial.
@@ -721,8 +760,16 @@ pub struct TrialRow {
     pub p50_ms: f64,
     pub p99_ms: f64,
     pub error_ratio: f64,
-    pub throttle_ratio: f64,
+    /// Throttled responses / requests (the throttle budget applies to this).
+    pub throttled_request_ratio: f64,
+    /// Operations with ≥ 1 throttled response / operations.
+    pub throttled_op_ratio: f64,
     pub throttled_responses_count: u64,
+    pub requests_count: u64,
+    /// Requests in flight at the trial's peak.
+    pub peak_inflight_count: u64,
+    /// Requests one operation keeps in flight at its peak (p95 over operations).
+    pub peak_inflight_per_op_count: u64,
     pub cost_per_million_ops_usd: f64,
     pub feasible: bool,
     pub note: String,
@@ -739,8 +786,12 @@ impl From<&crate::tune::Trial> for TrialRow {
             p50_ms: t.p50_ms,
             p99_ms: t.p99_ms,
             error_ratio: t.error_rate,
-            throttle_ratio: t.throttle_rate,
+            throttled_request_ratio: t.throttled_request_ratio,
+            throttled_op_ratio: t.throttled_op_ratio,
             throttled_responses_count: t.throttled_responses,
+            requests_count: t.requests,
+            peak_inflight_count: t.peak_inflight,
+            peak_inflight_per_op_count: t.peak_inflight_per_op.round().max(0.0) as u64,
             cost_per_million_ops_usd: t.cost_per_million_ops,
             feasible: t.feasible,
             note: t.note.clone(),
@@ -752,13 +803,24 @@ impl From<&crate::report::TuneSummary> for TuneReport {
     fn from(s: &crate::report::TuneSummary) -> Self {
         Self {
             objective: s.objective.clone(),
+            metric_unit: s.metric_unit.clone(),
             trials: s.trials.iter().map(TrialRow::from).collect(),
             baseline_trial: s.baseline_trial as u64,
+            recommended_trial_id: s.recommended_trial as u64,
             winner_trial: s.winner_trial as u64,
-            improvement_pct: s.improvement * 100.0,
+            best_feasible_trial_id: s.best_feasible_trial.map(|t| t as u64),
+            baseline_feasible: s.baseline_feasible,
+            improvement_ratio: s.improvement.filter(|i| *i >= 0.0),
+            headline: s.headline.clone(),
+            margin_cost_ratio: s.margin_cost_ratio,
             throttle_ceiling_count: s.throttle_ceiling.map(|c| c as u64),
+            safe_concurrency_count: s.safe_concurrency.map(|c| c as u64),
+            max_throttle_ratio: s.max_throttle_ratio,
+            capacity: s.capacity.clone(),
+            pareto_trial_ids: s.pareto.iter().map(|t| *t as u64).collect(),
             no_feasible_trial: s.no_feasible_trial,
             notes: s.notes.clone(),
+            recommendation: None,
         }
     }
 }
