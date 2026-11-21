@@ -276,6 +276,6 @@ jobs:
           Copy-Item -Recurse profiles $stage
           dotnet tool install --global wix --version 5.0.2
           wix build packaging/windows/oprobe.wxs -arch x64 `
-            -d Version=3.0.0 -d BinDir=$stage -d IconFile=packaging/desktop/oprobe.ico `
+            -d Version=4.0.0 -d BinDir=$stage -d IconFile=packaging/desktop/oprobe.ico `
             -o out/oprobe-ci-x64.msi
           Get-Item out/oprobe-ci-x64.msi

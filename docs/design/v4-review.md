@@ -1,7 +1,7 @@
 # 4.0 review evidence (input to docs/design/v4.md §13)
 
 Findings of the 3.0.0 deep review, with file:line evidence as of commit 1c833b1. The IDs match
-the v4.md checklist. This is a working document for the 4.0 streams and is deleted once 4.0 ships.
+the v4.md checklist. It was the working document of the 4.0 streams and is kept as the record of what 4.0 fixed.
 
 ## Analysis / tune / compare (streams A, T)
 
