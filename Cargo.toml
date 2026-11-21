@@ -12,6 +12,7 @@ readme = "README.md"
 keywords = ["opendal", "s3", "benchmark", "profiler", "object-storage"]
 categories = ["command-line-utilities", "development-tools::profiling"]
 include = [
+  "build.rs",
   "src/**/*",
   "profiles/**/*",
   "Cargo.toml",
