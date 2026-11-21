@@ -325,6 +325,8 @@ Test a finding's advice: replay the run with and without the change (A B A B…)
 oprobe verify [OPTIONS] <RUNREF> [CODE]
 ```
 
+Output formats (`-o`): text, json, ndjson, md
+
 | argument | description |
 |---|---|
 | `<RUNREF>` | The run whose findings to test (RUNREF: id, prefix, last, last~N, label) |
@@ -353,6 +355,8 @@ Diagnose a target, tune it and verify the recommendation; prints a profile patch
 ```text
 oprobe fix [OPTIONS] [TARGET]
 ```
+
+Output formats (`-o`): text, json, ndjson, md
 
 *Target*
 
@@ -457,6 +461,7 @@ oprobe fix [OPTIONS] [TARGET]
 | `--max-throttle-ratio <RATIO>` | Share of throttled requests a configuration may cause and still be feasible (default 0.001, or the profile's `sla.max_throttle_rate`) |
 | `--boundary-repeats <BOUNDARY_REPEATS>` | Runs of each bisection trial near the throttle boundary · default `2` |
 | `--headroom-ratio <RATIO>` | In-flight headroom kept below the throttling ceiling (default 0.15) |
+| `--budget <DURATION>` | Total wall-time budget of the tuning step, e.g. 5m (caps the trials so the estimate fits) |
 
 *Verification*
 
@@ -1066,6 +1071,8 @@ Learn the target's noise floor from repeated identical runs (<data>/noise.toml)
 ```text
 oprobe baseline calibrate [OPTIONS] [TARGET]
 ```
+
+Output formats (`-o`): text, json, ndjson
 
 *Target*
 

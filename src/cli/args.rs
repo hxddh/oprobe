@@ -411,6 +411,9 @@ pub struct FixArgs {
     /// Write the recommended profile (TOML) to this file
     #[arg(long, value_name = "FILE", help_heading = "Verification")]
     pub write_profile: Option<PathBuf>,
+    /// Total wall-time budget of the tuning step, e.g. 5m (caps the trials so the estimate fits)
+    #[arg(long, value_name = "DURATION", value_parser = parse::positive_duration, help_heading = "Tuning")]
+    pub budget: Option<String>,
 }
 
 /// `oprobe baseline calibrate TARGET`.

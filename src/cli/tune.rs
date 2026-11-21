@@ -240,8 +240,11 @@ pub(super) fn options_for(
     .map_err(|e| OprobeError::new(ErrorCode::UsageInvalidArgument, format!("{e:#}")))?;
     let spec = crate::engine::measure::spec_of(profile, target_name);
     if let Some(id) = spec.target_id() {
-        opts.prior =
-            crate::analysis::capacity::load(&ctx.paths.capacity_file(), &id, &spec.workload_hash());
+        opts.prior = crate::analysis::capacity::load(
+            &ctx.paths.capacity_file(),
+            &id,
+            &crate::analysis::capacity::history_key(&spec),
+        );
     }
     Ok(opts)
 }

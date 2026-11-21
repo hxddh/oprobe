@@ -148,7 +148,11 @@ pub async fn cmd_fix(a: FixArgs, ctx: &Ctx) -> Result<u8> {
         .with_hint("plan the pieces: `oprobe run TARGET --dry-run`, `oprobe tune TARGET --dry-run`")
         .into());
     }
-    let opts = super::tune::options_for(ctx, &profile, target_name.as_deref(), &a.search)?;
+    let mut opts = super::tune::options_for(ctx, &profile, target_name.as_deref(), &a.search)?;
+    if let Some(b) = a.budget.as_deref() {
+        let b = crate::input::positive_duration(b).map_err(anyhow::Error::from)?;
+        super::tune::fit_trials(&mut opts, b)?;
+    }
     let budget = opts.max_throttle_ratio;
     // 1. Diagnose.
     ctx.out.info(bold("fix 1/3 · diagnose"));

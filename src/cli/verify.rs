@@ -693,7 +693,7 @@ pub(super) async fn verify_hypotheses(
         if cfg.calibrate
             && let Some(target) = run.report.spec.target_id()
         {
-            let wh = run.report.spec.workload_hash();
+            let wh = capacity::history_key(&run.report.spec);
             let base = capacity::load(&history, &target, &wh)
                 .unwrap_or_else(|| run.report.capacity.clone());
             let c = h
