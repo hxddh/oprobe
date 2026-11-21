@@ -19,6 +19,9 @@ use super::Report;
 use super::style::*;
 use crate::util::fmt_ms;
 
+/// Samples a percentile needs beyond it to be gated (a p99 needs ≥ 1000 samples).
+pub const MIN_TAIL_SAMPLES: u64 = 10;
+
 /// Regression limits. Relative limits are ratios of the baseline in the "bad" direction
 /// (0.2 = 20 % worse).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -754,41 +757,66 @@ pub fn diff(base: &Report, cand: &Report, t: &Thresholds) -> DiffReport {
             });
             continue;
         };
+        let skipped = |id: String, b0: f64, c0: f64, limit: f64, needs: u64, what: &str| Check {
+            id,
+            unit: "ms".into(),
+            baseline: b0,
+            candidate: c0,
+            delta_ratio: rel(b0, c0),
+            limit_ratio: Some(limit),
+            abs_limit: None,
+            verdict: Status::Skipped,
+            note: format!(
+                "{} / {} samples (a stable {what} needs ≥ {needs})",
+                bv.count, cv.count
+            ),
+        };
         if bv.count < t.min_samples_count || cv.count < t.min_samples_count {
-            b.push(Check {
-                id: format!("latency_p99.{}", bv.verb),
-                unit: "ms".into(),
-                baseline: bv.latency.p99,
-                candidate: cv.latency.p99,
-                delta_ratio: rel(bv.latency.p99, cv.latency.p99),
-                limit_ratio: Some(t.p99_increase_ratio),
-                abs_limit: None,
-                verdict: Status::Skipped,
-                note: format!(
-                    "{} / {} samples (needs ≥ {})",
-                    bv.count, cv.count, t.min_samples_count
-                ),
-            });
-            continue;
+            b.push(skipped(
+                format!("latency_p50.{}", bv.verb),
+                bv.latency.p50,
+                cv.latency.p50,
+                t.p50_increase_ratio,
+                t.min_samples_count,
+                "p50",
+            ));
+        } else {
+            b.higher_worse(
+                format!("latency_p50.{}", bv.verb),
+                "ms",
+                bv.latency.p50,
+                cv.latency.p50,
+                t.p50_increase_ratio,
+                t.min_latency_delta_ms,
+                true,
+            );
         }
-        b.higher_worse(
-            format!("latency_p50.{}", bv.verb),
-            "ms",
-            bv.latency.p50,
-            cv.latency.p50,
-            t.p50_increase_ratio,
-            t.min_latency_delta_ms,
-            true,
-        );
-        b.higher_worse(
-            format!("latency_p99.{}", bv.verb),
-            "ms",
-            bv.latency.p99,
-            cv.latency.p99,
-            t.p99_increase_ratio,
-            t.min_latency_delta_ms,
-            true,
-        );
+        // A p99 is only as stable as the samples above it: with fewer than
+        // `MIN_TAIL_SAMPLES` beyond the 99th percentile it is essentially the maximum, and one
+        // straggler more or less flips it (17 ms → 262 ms between two identical runs).
+        let p99_needs = t
+            .min_samples_count
+            .max((MIN_TAIL_SAMPLES as f64 / (1.0 - 0.99)).round() as u64);
+        if bv.count < p99_needs || cv.count < p99_needs {
+            b.push(skipped(
+                format!("latency_p99.{}", bv.verb),
+                bv.latency.p99,
+                cv.latency.p99,
+                t.p99_increase_ratio,
+                p99_needs,
+                "p99",
+            ));
+        } else {
+            b.higher_worse(
+                format!("latency_p99.{}", bv.verb),
+                "ms",
+                bv.latency.p99,
+                cv.latency.p99,
+                t.p99_increase_ratio,
+                t.min_latency_delta_ms,
+                true,
+            );
+        }
     }
     // Failed operations: an absolute ratio limit and a count floor.
     let (be, ce) = (bs.summary.error_rate, cs.summary.error_rate);
@@ -1270,6 +1298,26 @@ mod tests {
         d.check(id)
             .unwrap_or_else(|| panic!("no check {id}: {:?}", d.checks))
             .verdict
+    }
+
+    #[test]
+    fn a_p99_of_few_samples_is_not_gated() {
+        // Two identical lab runs: 66 stats each, one straggler more lands in the candidate.
+        let mut b = report(&["stat"], 0, 1000);
+        let mut c = b.clone();
+        b.verbs[0].count = 66;
+        c.verbs[0].count = 66;
+        b.verbs[0].latency.p99 = 17.2;
+        c.verbs[0].latency.p99 = 262.4;
+        let d = diff(&b, &c, &Thresholds::default());
+        assert_eq!(verdict(&d, "latency_p99.stat"), Status::Skipped);
+        assert_eq!(verdict(&d, "latency_p50.stat"), Status::Pass);
+        assert_ne!(d.verdict, GateVerdict::Regression, "{:?}", d.checks);
+        // With enough samples the same jump is a regression.
+        b.verbs[0].count = 5000;
+        c.verbs[0].count = 5000;
+        let d = diff(&b, &c, &Thresholds::default());
+        assert_eq!(verdict(&d, "latency_p99.stat"), Status::Fail);
     }
 
     #[test]
