@@ -552,8 +552,19 @@ pub struct SlaVerdict {
     pub breaches: Vec<String>,
 }
 
+/// Throttled responses (429/503) per request of a snapshot.
+pub fn throttled_request_ratio(s: &Snapshot) -> f64 {
+    if s.summary.throttled_request_ratio > 0.0 {
+        return s.summary.throttled_request_ratio;
+    }
+    crate::util::ratio(
+        s.resilience.throttled_responses as f64,
+        s.connections.requests as f64,
+    )
+}
+
 /// Check the measured result against the SLA: error rate, data integrity (always), per-verb
-/// p99 and throttle rate (when set).
+/// p99 and throttled requests (when set).
 pub fn check_sla(s: &Snapshot, sla: &Sla) -> SlaVerdict {
     let mut breaches = Vec::new();
     if s.integrity.corrupted > 0 {
@@ -575,11 +586,11 @@ pub fn check_sla(s: &Snapshot, sla: &Sla) -> SlaVerdict {
         breaches.push("no operation completed in the measurement window".into());
     }
     if let Some(limit) = sla.max_throttle_rate {
-        let throttled: u64 = s.verbs.iter().map(|v| v.throttled).sum();
-        let rate = throttled as f64 / s.summary.ops.max(1) as f64;
+        // Throttled responses per request (design v4 §4: the one throttle rate of the SLA).
+        let rate = throttled_request_ratio(s);
         if rate > limit {
             breaches.push(format!(
-                "{:.2}% of operations were throttled (429/503), limit {}%",
+                "{:.2}% of requests were throttled (429/503), limit {}%",
                 rate * 100.0,
                 limit * 100.0
             ));
@@ -649,13 +660,23 @@ mod sla_tests {
             },
             ..Default::default()
         }];
+        s.resilience.throttled_responses = 50;
+        s.connections.requests = 400;
         assert!(check_sla(&s, &sla).passed);
         let strict = Sla {
             max_throttle_rate: Some(0.1),
             p99_ms: Some(500.0),
             ..Sla::default()
         };
-        assert_eq!(check_sla(&s, &strict).breaches.len(), 2);
+        let v = check_sla(&s, &strict);
+        assert_eq!(v.breaches.len(), 2);
+        // The limit is on requests (50 of 400 = 12.5%), not on operations (50%).
+        assert!(v.breaches[0].contains("12.50% of requests"), "{v:?}");
+        let loose = Sla {
+            max_throttle_rate: Some(0.2),
+            ..Sla::default()
+        };
+        assert!(check_sla(&s, &loose).passed, "12.5% of requests < 20%");
         let off = Sla {
             enforce: false,
             ..Sla::default()

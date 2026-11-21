@@ -168,26 +168,52 @@ pub fn detect_provider(scheme: &str, endpoint: Option<&str>) -> Option<&'static 
     }
 }
 
+/// Serialize a count held as `f64` as a whole number.
+fn ser_whole<S: serde::Serializer>(v: &f64, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_u64(if v.is_finite() && *v > 0.0 {
+        v.round() as u64
+    } else {
+        0
+    })
+}
+
+/// `(assumed 1 TiB stored — set --stored-gib)` when the storage size is the default, else
+/// empty: the label every renderer puts next to a bill that includes storage (design v4 §4).
+pub fn storage_label(c: &CostReport) -> String {
+    if c.storage_assumed {
+        format!(
+            "(assumed {} stored — set --stored-gib)",
+            if c.stored_gb == 1024.0 {
+                "1 TiB".to_owned()
+            } else {
+                format!("{:.0} GiB", c.stored_gb)
+            }
+        )
+    } else {
+        String::new()
+    }
+}
+
 /// Measured usage per logical operation.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PerOpUsage {
-    #[serde(rename = "write_requests_count")]
+    #[serde(rename = "write_requests_mean")]
     pub write_requests: f64,
-    #[serde(rename = "list_requests_count")]
+    #[serde(rename = "list_requests_mean")]
     pub list_requests: f64,
-    #[serde(rename = "read_requests_count")]
+    #[serde(rename = "read_requests_mean")]
     pub read_requests: f64,
-    #[serde(rename = "delete_requests_count")]
+    #[serde(rename = "delete_requests_mean")]
     pub delete_requests: f64,
     /// Requests that failed or were throttled (billed on most providers, add no value).
-    #[serde(rename = "failed_requests_count")]
+    #[serde(rename = "failed_requests_mean")]
     pub failed_requests: f64,
     pub download_bytes: f64,
     pub upload_bytes: f64,
     /// Downloaded bytes the application never asked for (range coalescing / chunk over-fetch).
     pub overread_bytes: f64,
     /// GETs avoided thanks to cache hits.
-    #[serde(rename = "cache_saved_reads_count")]
+    #[serde(rename = "cache_saved_reads_mean")]
     pub cache_saved_reads: f64,
     pub cache_saved_bytes: f64,
 }
@@ -222,10 +248,16 @@ pub struct CostReport {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
     pub pricing_as_of: String,
-    #[serde(rename = "monthly_ops_count")]
+    /// Projected operations per month (a whole number).
+    #[serde(rename = "monthly_ops_count", serialize_with = "ser_whole")]
+    #[schemars(with = "u64")]
     pub monthly_ops: f64,
     #[serde(rename = "stored_gib")]
     pub stored_gb: f64,
+    /// `stored_gib` is the default assumption (1 TiB), not a size the user gave
+    /// (`--stored-gib`); renderers label it so.
+    #[serde(default)]
+    pub storage_assumed: bool,
     #[serde(rename = "egress_ratio")]
     pub egress_fraction: f64,
     pub per_op: PerOpUsage,
@@ -246,7 +278,7 @@ pub struct ApiCost {
     pub api: String,
     pub billing_class: BillingClass,
     /// Billed requests of this API per logical operation.
-    #[serde(rename = "requests_per_op_count", alias = "requests_per_op")]
+    #[serde(rename = "requests_per_op_mean")]
     pub requests_per_op: f64,
     /// Monthly spend at the projected operation volume.
     pub monthly_usd: f64,
@@ -401,6 +433,9 @@ pub fn cost_report(
     endpoint: Option<&str>,
 ) -> CostReport {
     let u = per_op_usage(s);
+    // The stored size is the default unless the profile or `--stored-gib` changed it (the
+    // same rule `RunSpec` uses to decide what a replay must repeat).
+    let storage_assumed = spec.stored_gib == CostSpec::default().stored_gib;
     let selected_key = spec
         .provider
         .clone()
@@ -433,6 +468,7 @@ pub fn cost_report(
             pricing_as_of: PRICING_AS_OF.to_owned(),
             monthly_ops: spec.monthly_ops,
             stored_gb: spec.stored_gib,
+            storage_assumed,
             egress_fraction: spec.egress_fraction,
             per_op: u,
             selected: ProviderCost::default(),
@@ -452,6 +488,7 @@ pub fn cost_report(
         pricing_as_of: PRICING_AS_OF.to_owned(),
         monthly_ops: spec.monthly_ops,
         stored_gb: spec.stored_gib,
+        storage_assumed,
         egress_fraction: spec.egress_fraction,
         per_op: u,
         waste_usd: selected.failed_requests_usd + selected.overread_usd,

@@ -75,6 +75,8 @@ fn small(p: &mut Profile, preset: Preset) {
     ds.object_size = ByteSize::kib(512);
     p.workload.dataset = Some(ds);
     p.knobs.concurrency = 4;
+    // The warmup `opts` runs with: a report judges its window against the profile's warmup.
+    p.workload.warmup = oprobe::util::HumanDuration(Duration::from_millis(200));
 }
 
 async fn run_once(p: Profile, ms: u64) -> (Snapshot, oprobe::engine::CleanupSummary, Profile) {
@@ -1120,8 +1122,13 @@ async fn cancelled_run_is_marked_interrupted() {
     assert_eq!(r.verdict.exit_code, 130);
     let json = oprobe::report::to_json(&r);
     assert!(json.contains("\"interrupted\": true"));
-    assert!(oprobe::report::terminal::render(&r).contains("INTERRUPTED"));
-    assert!(oprobe::report::markdown::render_report(&r).contains("Interrupted"));
+    assert!(oprobe::report::terminal::render(&r).contains("PARTIAL · interrupted"));
+    assert!(oprobe::report::markdown::render_report(&r).contains("partial run: interrupted"));
+    assert_eq!(
+        r.run.partial.as_ref().map(|p| p.reason),
+        Some(oprobe::model::PartialReason::Interrupted)
+    );
+    assert!(r.baseline_refusal().is_some());
     let mut done = r.clone();
     done.run.interrupted = false;
     let d = diff(&done, &r, &Thresholds::default());

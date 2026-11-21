@@ -1052,11 +1052,18 @@ impl Recorder {
             })
             .collect();
 
+        let throttled_ops: u64 = verbs.iter().map(|v| v.throttled).sum();
         let summary = Summary {
             ops: a.ops,
-            ops_per_s: a.ops as f64 / elapsed,
+            ops_per_s: a.ops.saturating_sub(a.failed_ops) as f64 / elapsed,
+            attempted_ops_per_s: a.ops as f64 / elapsed,
             failed_ops: a.failed_ops,
             error_rate: crate::util::ratio(a.failed_ops as f64, a.ops as f64),
+            throttled_request_ratio: crate::util::ratio(
+                a.res.throttled_responses as f64,
+                a.requests as f64,
+            ),
+            throttled_op_ratio: crate::util::ratio(throttled_ops as f64, a.ops as f64),
             mib_per_s: mib(a.logical_read + a.logical_write) / elapsed,
             read_mib_per_s: mib(a.logical_read) / elapsed,
             write_mib_per_s: mib(a.logical_write) / elapsed,
