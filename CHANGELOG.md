@@ -42,6 +42,111 @@ or reports.
   `recommendation`, `next-step`, `target-id`, `defaults`.
 - **Lab**: new `lab://parquet` scenario (503 above 24 in flight, no stragglers) for the parquet preset.
 
+### Analysis: one capacity model behind every recommendation
+
+- Every finding that mentions concurrency (`throttling`, `server_latency`, `small_objects`, `client_queue`)
+  and `simulate::concurrency` ask the capacity model. Following a suggestion never pushes past the measured
+  ceiling, and runs under the ceiling reuse the remembered one. The 3.x ping-pong is gone: on a parquet lab
+  the findings used to say 16 → 3 → 6 → 12, and on small files "try 44" after a clean run at 22. Each
+  verification's `expect` holds the predicted goodput with its interval and the throttle budget.
+- **Throttling is defined once**: `summary.throttled_request_ratio` (throttled responses / requests, used by
+  the SLA) and `summary.throttled_op_ratio`. `throttle_ratio` is gone, and `sla.max_throttle_ratio` is now
+  `max_throttled_request_ratio`.
+- **Throughput counts successful operations** (`summary.ops_per_s`; `attempted_ops_per_s` counts all).
+- **Invalid runs** (no ops, errors above the SLA, a window shorter than the warmup) and **interrupted runs**
+  keep only correctness findings plus `run_invalid` / `run_partial`. `report.run.partial` records why, the
+  warning is in `report.warnings`, and partial or invalid runs are refused as baselines.
+- **Tail-cut**:
+  - The simulator uses the layer's own rule (p95 × 1.5, at least 50 ms, 32 samples). A run with tail-cut on
+    is never told to try it.
+  - OpenDAL 0.59's tail-cut layer is blind for its first 10 s. Runs show how long it was blind, and the
+    suggestion lengthens short runs.
+- **Error advice per class**: credential advice only for authentication failures. Retry-exhausted 429/503
+  failures fold into throttling.
+- **Tail attribution** ignores the kernel RTT when it tracks server delay (loopback, correlated with TTFB).
+  The straggler API is chosen stably.
+- **Units**: integer `_count` fields everywhere; fractions renamed `_mean`. One percentile estimator.
+- **Readable evidence**: the HTML, Markdown and text evidence uses human labels, units and percentages.
+  Every bill that includes storage says "(assumed 1 TiB stored — set --stored-gib)".
+
+### Tune, verify, fix, compare
+
+- **`oprobe verify RUN [CODE|--all] [--repeat N]`** replays the run interleaved (A B A B…) with each
+  finding's change. It compares the sides and answers `confirmed`, `refuted` or `inconclusive` per
+  expectation, with numbers. Outcomes calibrate the capacity history (`capacity::calibrate`).
+- **`oprobe fix TARGET`** runs diagnose → tune → verify. It returns a `Recommendation` (knobs, profile
+  TOML, Rust snippet, deltas, `confirmed`) and a profile patch (`--write-profile`).
+- **Tune**:
+  - **Objective and budget**: optimises **goodput** by default (`p99`, `cost` and `balanced` also exist)
+    within a throttle budget (`--max-throttle-ratio`, default 0.1 % of requests). Throttling within the
+    budget no longer stops the ceiling search.
+  - **Search**: bisection repeats trials at the boundary (`--boundary-repeats`). The margin
+    (`--headroom-ratio`, default 15 %) is counted in requests in flight and re-checked after io and range
+    steps.
+  - **Reporting**: an infeasible baseline is reported as such, and deltas are taken against the best
+    feasible trial. There is no more "−61 % vs baseline" headline. The cost of the margin and the Pareto
+    front are shown.
+  - **Recommendation**: in the tune JSON and in MCP `start_tune`. The emitted profile has no environment
+    defaults such as `proxy`.
+- **Compare**:
+  - **Identity**: a verdict needs the same target identity and workload; otherwise `comparable: false`
+    with the reasons (exit 2 under `--strict`).
+  - **Statistics**: one run per side uses a block bootstrap over time windows, labelled low confidence.
+    Several runs use a Welch interval over per-run values.
+  - **Noise floor**: `<data>/noise.toml`, filled by `oprobe baseline calibrate` and verify's A/A pairs.
+  - **Count floors**: 0 → 1 throttled response no longer fails the gate.
+  - **Gate checks**: `{ id, unit, baseline, candidate, delta_ratio, limit_ratio, verdict }`.
+  - **Text output**: compare sizes its columns to their content and summarises long values.
+
+### CLI and agents
+
+- **Next steps everywhere**: every command result has `next` steps with both a CLI command and an MCP call.
+  MCP `start_run` and `plan_run` take `from` and `set`.
+- **New MCP tools**: `discover_targets`, `sample_objects` (read-only), `verify_finding`, `recommend_config`.
+  New CLI commands: `oprobe target discover` (credential sources by name only) and `oprobe target sample`.
+  `oprobe` with no command and no terminal prints the discovery.
+- **Formats per command**: `-o` outside a command's formats is refused before it runs, and `capabilities`
+  lists them. `completions` and `man` are text only.
+- **Schema rules**: the unit and enum rules are checked on every schema.
+- **MCP server**: `lab://` targets are allowed on a read-only server. Unknown tool arguments are refused with
+  a hint. `get_run` turns `done` atomically with its last event, and progress never overshoots.
+- **Safer defaults**:
+  - `doctor` is read-only (`--write-probe` opts in) and names what it sees, with an object sample.
+  - `cleanup` is a dry run unless `--yes`.
+  - Doctor failures show a summarised cause (raw output with `-v`).
+- **Better errors**:
+  - Backend-config errors name `--option KEY=VALUE` and `[targets.NAME.options]`.
+  - New codes `net.rate_limited` and `net.http` for non-storage APIs.
+  - A warmup at least as long as the duration warns.
+
+### App (GUI and terminal)
+
+- **Add Target**: discovery of credential sources, a read-only connection test, and save to the config.
+- **Re-run and Verify** are built from the run's spec, so nothing is dropped. Verify opens Compare with a
+  confirmed/refuted/inconclusive banner.
+- **One set of defaults** with the CLI (tune, demo, cost).
+- **Run list**:
+  - The list is live: it watches the runs directory and refreshes on focus.
+  - Partial runs get a badge; a budget stop is not a failure.
+  - "Stopped during warmup" replaces 0 ops/s.
+  - Search, "show more" and a truthful run count.
+- **Compare**: defaults to the same target and workload. Selectors never wrap, and a non-comparable pair says
+  why.
+- **Commands**: one context-aware command list drives the menu bar and the ⌘K palette (Verify, Open Run,
+  Switch Target, Add Target, Fix, Export…).
+- **Keyboard**: letter shortcuts never fire in text fields, sheets focus their first field, Enter submits,
+  Esc cancels, and the terminal shows a focus band.
+- **Accessibility**: every button has an accessible label, and charts carry a text summary and a data table.
+- **Overview**: a THROTTLED tile, and the cost tile labels assumed storage.
+- **Layout**: works at 120×30 and in narrow windows (tiles wrap, Cost becomes one column, numbers never
+  wrap).
+- **Live views**:
+  - live series append instead of rebuilding;
+  - chart paths are cached;
+  - the crosshair has its own layer;
+  - live phases (preparing, warmup, measuring, cleanup) are shown;
+  - the tune result offers Run, Verify, Save profile and Rust snippet.
+
 ### Onboarding and distribution
 
 - **The demo is the lab**: `oprobe demo` runs exactly `oprobe run lab://demo`. Every lab scenario has a

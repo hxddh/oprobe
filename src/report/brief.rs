@@ -69,7 +69,12 @@ pub fn render(r: &Report, run_id: &str) -> String {
         extra.push(format!("{} throttled", r.resilience.throttled_responses));
     }
     if r.cost.applicable {
-        extra.push(format!("{} /month", fmt_usd(r.cost.selected.total_usd)));
+        let label = crate::analysis::cost::storage_label(&r.cost);
+        extra.push(if label.is_empty() {
+            format!("{} /month", fmt_usd(r.cost.selected.total_usd))
+        } else {
+            format!("{} /month {label}", fmt_usd(r.cost.selected.total_usd))
+        });
     }
     let v = &r.verdict.sla;
     extra.push(if v.passed {
