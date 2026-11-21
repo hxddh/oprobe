@@ -42,7 +42,7 @@
           "format": "double",
           "type": "number"
         },
-        "requests_per_op_count": {
+        "requests_per_op_mean": {
           "description": "Billed requests of this API per logical operation.",
           "format": "double",
           "type": "number"
@@ -56,7 +56,7 @@
       "required": [
         "api",
         "billing_class",
-        "requests_per_op_count",
+        "requests_per_op_mean",
         "monthly_usd",
         "share_pct"
       ],
@@ -629,8 +629,10 @@
           "type": "number"
         },
         "monthly_ops_count": {
-          "format": "double",
-          "type": "number"
+          "description": "Projected operations per month (a whole number).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
         },
         "not_applicable_reason": {
           "description": "Why no cost is projected (when not applicable).",
@@ -656,6 +658,11 @@
           "$ref": "#/$defs/ProviderCost",
           "description": "The provider matching the target (or the profile's choice / custom pricing)."
         },
+        "storage_assumed": {
+          "default": false,
+          "description": "`stored_gib` is the default assumption (1 TiB), not a size the user gave\n(`--stored-gib`); renderers label it so.",
+          "type": "boolean"
+        },
         "stored_gib": {
           "format": "double",
           "type": "number"
@@ -672,6 +679,7 @@
         "pricing_as_of",
         "monthly_ops_count",
         "stored_gib",
+        "storage_assumed",
         "egress_ratio",
         "per_op",
         "selected",
@@ -2148,6 +2156,44 @@
       },
       "type": "object"
     },
+    "PartialInfo": {
+      "description": "A run that stopped early (`report.run.partial`).",
+      "properties": {
+        "measured_s": {
+          "description": "Seconds of the measurement window that ran.",
+          "format": "double",
+          "type": "number"
+        },
+        "reason": {
+          "$ref": "#/$defs/PartialReason"
+        }
+      },
+      "required": [
+        "reason",
+        "measured_s"
+      ],
+      "type": "object"
+    },
+    "PartialReason": {
+      "description": "Why a run stopped before its configured end.",
+      "oneOf": [
+        {
+          "const": "interrupted",
+          "description": "Ctrl-C, Stop or a cancelled job.",
+          "type": "string"
+        },
+        {
+          "const": "budget",
+          "description": "A safety budget (`--max-requests`, `--max-bytes`, `--max-duration`, `--max-cost-usd`).",
+          "type": "string"
+        },
+        {
+          "const": "error",
+          "description": "A fatal error ended the measurement.",
+          "type": "string"
+        }
+      ]
+    },
     "PerOpUsage": {
       "description": "Measured usage per logical operation.",
       "properties": {
@@ -2155,12 +2201,12 @@
           "format": "double",
           "type": "number"
         },
-        "cache_saved_reads_count": {
+        "cache_saved_reads_mean": {
           "description": "GETs avoided thanks to cache hits.",
           "format": "double",
           "type": "number"
         },
-        "delete_requests_count": {
+        "delete_requests_mean": {
           "format": "double",
           "type": "number"
         },
@@ -2168,12 +2214,12 @@
           "format": "double",
           "type": "number"
         },
-        "failed_requests_count": {
+        "failed_requests_mean": {
           "description": "Requests that failed or were throttled (billed on most providers, add no value).",
           "format": "double",
           "type": "number"
         },
-        "list_requests_count": {
+        "list_requests_mean": {
           "format": "double",
           "type": "number"
         },
@@ -2182,7 +2228,7 @@
           "format": "double",
           "type": "number"
         },
-        "read_requests_count": {
+        "read_requests_mean": {
           "format": "double",
           "type": "number"
         },
@@ -2190,21 +2236,21 @@
           "format": "double",
           "type": "number"
         },
-        "write_requests_count": {
+        "write_requests_mean": {
           "format": "double",
           "type": "number"
         }
       },
       "required": [
-        "write_requests_count",
-        "list_requests_count",
-        "read_requests_count",
-        "delete_requests_count",
-        "failed_requests_count",
+        "write_requests_mean",
+        "list_requests_mean",
+        "read_requests_mean",
+        "delete_requests_mean",
+        "failed_requests_mean",
         "download_bytes",
         "upload_bytes",
         "overread_bytes",
-        "cache_saved_reads_count",
+        "cache_saved_reads_mean",
         "cache_saved_bytes"
       ],
       "type": "object"
@@ -3104,6 +3150,17 @@
         "oprobe_version": {
           "type": "string"
         },
+        "partial": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PartialInfo"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Why and when the run stopped early (absent for a complete run). A partial run is never\naccepted as a baseline."
+        },
         "sampled": {
           "description": "Trace rows were sampled (more requests than `trace.max_requests`); aggregates are exact.",
           "type": "boolean"
@@ -3230,7 +3287,8 @@
           "format": "double",
           "type": "number"
         },
-        "max_throttle_ratio": {
+        "max_throttled_request_ratio": {
+          "description": "Throttled responses / requests the run may have (`sla.max_throttle_rate`).",
           "format": "double",
           "type": [
             "number",
@@ -3391,6 +3449,12 @@
     },
     "Summary": {
       "properties": {
+        "attempted_ops_per_s": {
+          "default": 0.0,
+          "description": "Operations per second, failed ones included.",
+          "format": "double",
+          "type": "number"
+        },
         "error_ratio": {
           "format": "double",
           "type": "number"
@@ -3418,10 +3482,23 @@
           "type": "integer"
         },
         "ops_per_s": {
+          "description": "Successful operations per second (goodput; failed operations are not throughput).",
           "format": "double",
           "type": "number"
         },
         "read_mib_per_s": {
+          "format": "double",
+          "type": "number"
+        },
+        "throttled_op_ratio": {
+          "default": 0.0,
+          "description": "Operations with at least one throttled response / operations.",
+          "format": "double",
+          "type": "number"
+        },
+        "throttled_request_ratio": {
+          "default": 0.0,
+          "description": "Throttled responses (429/503) / requests: what the SLA's throttle limit checks.",
           "format": "double",
           "type": "number"
         },
@@ -3433,8 +3510,11 @@
       "required": [
         "ops_count",
         "ops_per_s",
+        "attempted_ops_per_s",
         "failed_ops_count",
         "error_ratio",
+        "throttled_request_ratio",
+        "throttled_op_ratio",
         "mib_per_s",
         "read_mib_per_s",
         "write_mib_per_s",
@@ -4007,7 +4087,8 @@
         "stage": {
           "type": "string"
         },
-        "throttle_ratio": {
+        "throttled_op_ratio": {
+          "description": "Operations with at least one throttled response / operations.",
           "format": "double",
           "type": "number"
         },
@@ -4026,7 +4107,7 @@
         "p50_ms",
         "p99_ms",
         "error_ratio",
-        "throttle_ratio",
+        "throttled_op_ratio",
         "throttled_responses_count",
         "cost_per_million_ops_usd",
         "feasible",
@@ -4123,10 +4204,6 @@
           "format": "double",
           "type": "number"
         },
-        "mean_requests_count": {
-          "format": "double",
-          "type": "number"
-        },
         "mib_per_s": {
           "format": "double",
           "type": "number"
@@ -4137,6 +4214,10 @@
           "type": "integer"
         },
         "ops_per_s": {
+          "format": "double",
+          "type": "number"
+        },
+        "requests_per_op_mean": {
           "format": "double",
           "type": "number"
         },
@@ -4163,7 +4244,7 @@
         "mib_per_s",
         "latency",
         "breakdown",
-        "mean_requests_count",
+        "requests_per_op_mean",
         "mean_bytes",
         "retries_count"
       ],

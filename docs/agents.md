@@ -208,7 +208,7 @@ Some logical operations failed after retries; critical when the failure rate exc
 <a id="finding-throttling"></a>
 ### `throttling` — The service rate-limited requests (429/503)
 
-The storage service answered with 429 or 503 SlowDown: the request rate is above what the bucket, prefix or account allows right now. The evidence names the request rate the service accepted while throttling (the ceiling) and a concurrency to try. *(availability, usually critical)*
+The storage service answered with 429 or 503 SlowDown: the request rate is above what the bucket, prefix or account allows right now. The evidence names the in-flight level where throttling starts (the capacity model's ceiling, report.capacity) and the safe concurrency below it; when throttling does not follow concurrency, the request rate the service accepted and a rate to pace at. *(availability, usually critical)*
 
 - **Causes:** too many concurrent requests against one prefix (S3 partitions scale per prefix); a request-rate quota on the account or bucket; a burst right after the bucket was created (not yet scaled out)
 - **Verify:** report.resilience.throttled_responses and the retry share in report.stages.shares.retry_pct; the finding's verification command re-runs at the suggested concurrency; `oprobe tune TARGET` finds the throttling ceiling
@@ -437,5 +437,23 @@ With an open-loop `--rate`, arrivals queued behind busy workers; their wait is p
 - **Causes:** too few workers (`--concurrency`) for the rate; a rate above what the target can serve
 - **Verify:** report.open_loop (target vs achieved rate, missed arrivals)
 - **Knobs:** --rate; --concurrency
+
+<a id="finding-run_invalid"></a>
+### `run_invalid` — The run cannot be judged on performance
+
+No operation completed, more operations failed than the SLA allows, or the measurement window was shorter than the warmup: latency and throughput would describe failures or noise, so performance findings (latency, scaling, small objects, HTTP, cache, tail, cost) are suppressed. *(validity, usually warning)*
+
+- **Causes:** failing requests (credentials, missing objects, an unsupported HTTP version); a measurement window shorter than the warmup
+- **Verify:** report.summary.error_ratio against report.sla.max_error_ratio; report.run.window_s against report.workload.warmup_s
+- **Knobs:** --duration; --warmup; --http
+
+<a id="finding-run_partial"></a>
+### `run_partial` — The run stopped early
+
+The run was interrupted (Ctrl-C, Stop), stopped by a safety budget or by an error before its configured end (report.run.partial). Interrupted runs and windows under a second have their performance findings suppressed; a partial run is never accepted as a baseline. *(validity, usually warning)*
+
+- **Causes:** Ctrl-C or a cancelled job; a budget (--max-requests, --max-bytes, --max-duration, --max-cost-usd)
+- **Verify:** report.run.partial (reason, measured_s) and report.warnings; re-run with `oprobe run --from RUNREF`
+- **Knobs:** --duration; --max-requests; --max-cost-usd
 
 <!-- END finding-codes -->
