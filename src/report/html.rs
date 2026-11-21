@@ -201,7 +201,14 @@ fn verdict_section(r: &Report) -> String {
     o += &tile(
         "Throughput",
         &format!("{:.1} ops/s", sm.ops_per_s),
-        &format!("{} operations", sm.ops),
+        &if sm.failed_ops > 0 {
+            format!(
+                "successful · {:.1} attempted/s · {} operations",
+                sm.attempted_ops_per_s, sm.ops
+            )
+        } else {
+            format!("{} operations", sm.ops)
+        },
     );
     o += &tile(
         "Data rate",
@@ -223,18 +230,29 @@ fn verdict_section(r: &Report) -> String {
         &format!("{:.2}% of operations", sm.error_rate * 100.0),
     );
     o += &tile(
-        "Throttled responses",
-        &r.resilience.throttled_responses.to_string(),
-        &format!("{} retries", r.resilience.retries),
+        "Throttled requests",
+        &format!("{:.2}%", sm.throttled_request_ratio * 100.0),
+        &format!(
+            "{} responses · {:.2}% of operations · {} retries",
+            r.resilience.throttled_responses,
+            sm.throttled_op_ratio * 100.0,
+            r.resilience.retries
+        ),
     );
     if r.cost.applicable {
+        let label = crate::analysis::cost::storage_label(&r.cost);
         o += &tile(
             "Projected cost",
             &format!("{} /month", fmt_usd(r.cost.selected.total_usd)),
             &format!(
-                "{} per 1M ops · {}",
+                "{} per 1M ops · {}{}",
                 fmt_usd(r.cost.selected.per_million_ops_usd),
-                r.cost.selected.provider
+                r.cost.selected.provider,
+                if label.is_empty() {
+                    label
+                } else {
+                    format!(" {label}")
+                }
             ),
         );
     } else {
@@ -260,9 +278,17 @@ fn verdict_section(r: &Report) -> String {
         },
         r.verdict.exit_code
     );
-    if r.run.interrupted {
-        o += "<p><span class=\"pill st-attention\">▲ partial</span> The run was stopped early: \
-              results cover a shorter window than configured.</p>";
+    if r.is_partial() {
+        let reason = r
+            .run
+            .partial
+            .as_ref()
+            .map_or("interrupted", |p| p.reason.as_str());
+        let _ = write!(
+            o,
+            "<p><span class=\"pill st-attention\">▲ partial · {reason}</span> The run was stopped early: \
+             results cover a shorter window than configured.</p>"
+        );
     }
     if r.run.sampled {
         let _ = write!(
@@ -309,8 +335,15 @@ fn findings_section(r: &Report, run: &Run) -> String {
         }
         if !f.evidence.values.is_empty() {
             o += "<dl class=\"kv\">";
-            for (k, v) in &f.evidence.values {
-                let _ = write!(o, "<dt>{}</dt><dd>{}</dd>", esc(k), fmt_num(*v));
+            for ((label, value), key) in f.evidence.labelled().iter().zip(f.evidence.values.keys())
+            {
+                let _ = write!(
+                    o,
+                    "<dt title=\"{}\">{}</dt><dd>{}</dd>",
+                    esc(key),
+                    esc(label),
+                    esc(value)
+                );
             }
             o += "</dl>";
         }
@@ -1525,11 +1558,15 @@ fn cost_section(r: &Report) -> String {
     let _ = write!(
         o,
         "<p class=\"sub\">{} at {} operations per month, {:.0}% of downloads leaving the cloud, \
-         {:.0} GiB stored · prices as of {}.</p><div class=\"tiles\">",
+         {:.0} GiB stored{} · prices as of {}.</p><div class=\"tiles\">",
         esc(&s.provider),
         trim_num(c.monthly_ops),
         c.egress_fraction * 100.0,
         c.stored_gb,
+        match crate::analysis::cost::storage_label(c) {
+            l if l.is_empty() => l,
+            l => format!(" <strong>{}</strong>", esc(&l)),
+        },
         esc(&c.pricing_as_of)
     );
     o += &tile(
@@ -1539,7 +1576,15 @@ fn cost_section(r: &Report) -> String {
     );
     o += &tile("Requests", &fmt_usd(s.requests_usd), "per month");
     o += &tile("Egress", &fmt_usd(s.egress_usd), "per month");
-    o += &tile("Storage", &fmt_usd(s.storage_usd), "per month");
+    o += &tile(
+        "Storage",
+        &fmt_usd(s.storage_usd),
+        &if c.storage_assumed {
+            format!("per month · assumed {:.0} GiB", c.stored_gb)
+        } else {
+            format!("per month · {:.0} GiB", c.stored_gb)
+        },
+    );
     o += &tile("Total", &fmt_usd(s.total_usd), "per month");
     o += "</div>";
     if s.failed_requests_usd + s.overread_usd + s.cache_savings_usd > 0.0 {
