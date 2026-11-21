@@ -195,7 +195,7 @@ mod tests {
         let v = judge("throttling", std::slice::from_ref(&up), &base, &cand, &gate);
         assert_eq!(v.outcome, VerifyOutcome::Confirmed);
         assert!(v.lines[0].contains("summary.ops_per_s"), "{:?}", v.lines);
-        let v = judge("throttling", &[up.clone()], &cand, &base, &gate);
+        let v = judge("throttling", std::slice::from_ref(&up), &cand, &base, &gate);
         assert_eq!(v.outcome, VerifyOutcome::Refuted);
         let v = judge("throttling", &[up], &base, &base, &gate);
         assert_eq!(v.outcome, VerifyOutcome::Inconclusive);

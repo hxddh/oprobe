@@ -513,7 +513,7 @@ pub fn kpi(
     value: impl Fn() -> SharedString + 'static,
     tone: impl Fn() -> Tone + Copy + 'static,
 ) -> View {
-    kpi_detail(label, value, || SharedString::default(), tone)
+    kpi_detail(label, value, SharedString::default, tone)
 }
 
 /// The row of key numbers: one row when it fits, two (or more) when it does not.

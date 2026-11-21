@@ -534,7 +534,7 @@ fn run_row(s: Store, r: RunSummary) -> impl IntoElement {
         "Run {} · {} · {}{}",
         r.id,
         label,
-        &numbers,
+        numbers,
         partial
             .as_ref()
             .map(|p| format!(" · {p}"))

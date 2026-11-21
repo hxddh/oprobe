@@ -403,6 +403,13 @@
           "format": "double",
           "type": "number"
         },
+        "partial": {
+          "description": "Why the run is partial: `budget` (a safety budget stopped it) or `interrupted`\n(stopped early); absent for a complete run.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "path": {
           "description": "The run file (filled in when listing; not stored).",
           "type": [
@@ -414,6 +421,10 @@
           "type": "string"
         },
         "target_display": {
+          "type": "string"
+        },
+        "target_id": {
+          "description": "The target identity of the run's spec (`store::TargetId`, empty when it does not\nresolve). Required, so sidecars written without it are rebuilt from the run file.",
           "type": "string"
         },
         "target_name": {
@@ -428,6 +439,10 @@
         "window_s": {
           "format": "double",
           "type": "number"
+        },
+        "workload_hash": {
+          "description": "`report.spec.workload_hash()`: runs with the same target and workload hash compare.",
+          "type": "string"
         }
       },
       "required": [
@@ -441,7 +456,9 @@
         "ops_per_s",
         "p50_ms",
         "p99_ms",
-        "error_ratio"
+        "error_ratio",
+        "target_id",
+        "workload_hash"
       ],
       "type": "object"
     },

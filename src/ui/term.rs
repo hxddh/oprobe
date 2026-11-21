@@ -59,7 +59,11 @@ fn key_name(code: &KeyCode) -> String {
 pub fn convert(ev: Event) -> RunEvent {
     match ev {
         Event::Resize(..) => RunEvent::Redraw,
-        Event::FocusGained => RunEvent::Input(Input::Focus(true)),
+        Event::FocusGained => {
+            // Coming back to the terminal: runs may have been saved meanwhile.
+            crate::ui::store::request_refresh();
+            RunEvent::Input(Input::Focus(true))
+        }
         Event::FocusLost => RunEvent::Input(Input::Focus(false)),
         Event::Paste(t) => RunEvent::Input(Input::Paste(t)),
         Event::Mouse(m) => {

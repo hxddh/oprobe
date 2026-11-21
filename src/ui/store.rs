@@ -1285,7 +1285,8 @@ impl Store {
         let stamp = self
             .runs_changed
             .with(|g| g.load(std::sync::atomic::Ordering::Relaxed));
-        if self.runs_seen.with(|s| *s != stamp) {
+        let focus_in = REFRESH_REQUESTED.swap(false, std::sync::atomic::Ordering::Relaxed);
+        if self.runs_seen.with(|s| *s != stamp) || focus_in {
             self.runs_seen.replace(stamp);
             self.refresh();
         }
@@ -1681,6 +1682,14 @@ pub fn test_connection(name: &str, cfg: &ConfigFile) -> Result<String, String> {
             })
         }
     }
+}
+
+/// Set when the terminal regains the focus (`term.rs`): the next poll reloads the runs.
+static REFRESH_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Ask the store to reload the run history at its next poll (the terminal's focus-in).
+pub fn request_refresh() {
+    REFRESH_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
 fn kit_in_terminal() -> bool {

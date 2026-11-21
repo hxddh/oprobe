@@ -234,10 +234,12 @@ impl RunForm {
             duration: opt(&self.duration).or_else(|| d.duration.clone()),
             ..Default::default()
         };
-        let mut k = KnobArgs::default();
-        k.concurrency = num(&self.concurrency, "Concurrency")?.or(d.concurrency);
-        k.io_concurrency = num(&self.io_concurrency, "I/O concurrency")?;
-        k.chunk_size = opt(&self.chunk);
+        let k = KnobArgs {
+            concurrency: num(&self.concurrency, "Concurrency")?.or(d.concurrency),
+            io_concurrency: num(&self.io_concurrency, "I/O concurrency")?,
+            chunk_size: opt(&self.chunk),
+            ..Default::default()
+        };
         let stored_gib = match opt(&self.stored_gib) {
             None => None,
             Some(v) => Some(
