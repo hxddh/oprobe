@@ -535,12 +535,18 @@ pub fn cmd_baseline(c: BaselineCommand, ctx: &Ctx) -> Result<u8> {
             let store = ctx.store();
             let mut ids: Vec<String> = Vec::new();
             if let Some(n) = a.last {
-                let mut all = store.list()?;
+                // The newest N complete runs: partial ones cannot be baselines.
+                let mut all: Vec<_> = store
+                    .list()?
+                    .into_iter()
+                    .filter(|s| !s.interrupted)
+                    .collect();
                 all.truncate(n);
                 ids.extend(all.into_iter().rev().map(|s| s.id));
             }
             for r in &a.runs {
                 for run in load_side(ctx, r)? {
+                    crate::store::baselines::check_baseline_run(&run.report)?;
                     ids.push(run.id().to_owned());
                 }
             }

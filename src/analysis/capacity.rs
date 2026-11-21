@@ -480,6 +480,44 @@ fn rate_ceiling(reqs: &[&ReqRow]) -> Option<f64> {
 }
 
 impl Capacity {
+    /// This run's estimate, completed by a remembered one (`<data>/capacity.toml`, the same
+    /// target and workload): a run that stayed under the ceiling sees no throttling and so no
+    /// ceiling of its own, yet the ceiling still holds. The remembered ceiling is used
+    /// (`source: history`) unless this run has its own, or served requests cleanly above the
+    /// remembered limit (the service changed: the memory is stale). This run's per-op shape
+    /// and observations are kept.
+    pub fn with_history(mut self, history: Option<Capacity>) -> Capacity {
+        let Some(h) = history else { return self };
+        let Some(hc) = h.inflight_ceiling else {
+            return self;
+        };
+        if self.inflight_ceiling.is_some()
+            || self
+                .observed
+                .max_clean_inflight_count
+                .is_some_and(|m| m as f64 >= hc.hi)
+        {
+            return self;
+        }
+        self.inflight_ceiling = Some(hc);
+        if self.rate_ceiling_requests_per_s.is_none() {
+            self.rate_ceiling_requests_per_s = h.rate_ceiling_requests_per_s;
+        }
+        self.confidence = h.confidence;
+        self.confidence_reason = format!(
+            "remembered from an earlier run of this target and workload ({}); this run peaked at {} requests in flight without crossing it",
+            h.confidence_reason, self.observed.peak_inflight_count
+        );
+        self.source = CapacitySource::History;
+        self
+    }
+
+    /// The most workers any advice may suggest: [`Capacity::safe_concurrency`] with the
+    /// default headroom. `None` when no ceiling is known.
+    pub fn max_advisable_concurrency(&self) -> Option<u32> {
+        self.safe_concurrency(DEFAULT_HEADROOM_RATIO)
+    }
+
     /// Workers that keep peak in-flight under the ceiling with `headroom_ratio` spare:
     /// `floor(ceiling.lo × (1 − headroom) / peak_inflight_per_op)`, at least 1. `None` when no
     /// ceiling is known.
@@ -774,6 +812,20 @@ impl History {
     }
 }
 
+/// The workload key a target's capacity is remembered under: the spec's workload hash with
+/// the run's length left out (duration, warmup, `max_ops`). How long a run lasts does not
+/// change how much load the target takes, so a verification that only lengthens the run (or
+/// a replay with a shorter warmup) still finds the remembered ceiling.
+pub fn history_key(spec: &crate::model::RunSpec) -> String {
+    let mut s = spec.clone();
+    let d = crate::config::WorkloadSpec::default();
+    let w = &mut s.profile.workload;
+    w.duration = d.duration;
+    w.warmup = d.warmup;
+    w.max_ops = None;
+    s.workload_hash()
+}
+
 /// The remembered capacity of `target` / `workload_hash` in the history file at `path`.
 pub fn load(path: &Path, target: &TargetId, workload_hash: &str) -> Option<Capacity> {
     History::load(path).ok()?.get(target, workload_hash)
@@ -1062,6 +1114,47 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    #[test]
+    fn a_run_under_the_ceiling_keeps_the_remembered_one() {
+        let (reqs, ops) = synthetic(30, 24, &[1], 5, 60);
+        let throttled = estimate(&reqs, &ops, Window::all());
+        let (reqs, ops) = synthetic(20, 24, &[1], 5, 60);
+        let clean = estimate(&reqs, &ops, Window::all());
+        assert!(clean.inflight_ceiling.is_none());
+        let merged = clean.clone().with_history(Some(throttled.clone()));
+        assert_eq!(merged.inflight_ceiling, throttled.inflight_ceiling);
+        assert_eq!(merged.source, CapacitySource::History);
+        assert_eq!(merged.per_op, clean.per_op);
+        assert_eq!(
+            merged.safe_concurrency(0.15),
+            throttled.safe_concurrency(0.15)
+        );
+        assert!(merged.confidence_reason.contains("remembered"));
+        // Its own ceiling wins; no memory changes nothing.
+        let own = throttled.clone().with_history(Some(clean.clone()));
+        assert_eq!(own.source, CapacitySource::ThisRun);
+        assert_eq!(clean.clone().with_history(None), clean);
+        // Clean arrivals above the remembered limit: the memory is stale.
+        let (reqs, ops) = synthetic(40, 1000, &[1], 5, 30);
+        let bigger = estimate(&reqs, &ops, Window::all());
+        let stale = bigger.clone().with_history(Some(throttled));
+        assert!(stale.inflight_ceiling.is_none(), "{stale:#?}");
+        assert_eq!(stale.max_advisable_concurrency(), None);
+    }
+
+    #[test]
+    fn history_key_ignores_the_run_length() {
+        use crate::model::{Overrides, RunSpec};
+        let s = RunSpec::default();
+        let longer = s.with(&Overrides::new().with_set("duration", "60s"));
+        let warm = s.with(&Overrides::new().with_set("warmup", "0s"));
+        assert_ne!(s.workload_hash(), longer.workload_hash());
+        assert_eq!(history_key(&s), history_key(&longer));
+        assert_eq!(history_key(&s), history_key(&warm));
+        let other = s.with(&Overrides::new().with_set("objects", "7"));
+        assert_ne!(history_key(&s), history_key(&other));
     }
 
     #[test]

@@ -96,7 +96,7 @@ const ENTRIES: &[Entry] = &[
         title: "The service rate-limited requests (429/503)",
         severity: Severity::Critical,
         category: "availability",
-        meaning: "The storage service answered with 429 or 503 SlowDown: the request rate is above what the bucket, prefix or account allows right now. The evidence names the request rate the service accepted while throttling (the ceiling) and a concurrency to try.",
+        meaning: "The storage service answered with 429 or 503 SlowDown: the request rate is above what the bucket, prefix or account allows right now. The evidence names the in-flight level where throttling starts (the capacity model's ceiling, report.capacity) and the safe concurrency below it; when throttling does not follow concurrency, the request rate the service accepted and a rate to pace at.",
         causes: &[
             "too many concurrent requests against one prefix (S3 partitions scale per prefix)",
             "a request-rate quota on the account or bucket",
@@ -515,6 +515,38 @@ const ENTRIES: &[Entry] = &[
         ],
         verify: &["report.open_loop (target vs achieved rate, missed arrivals)"],
         knobs: &["--rate", "--concurrency"],
+    },
+    Entry {
+        code: "run_invalid",
+        title: "The run cannot be judged on performance",
+        severity: Severity::Warning,
+        category: "validity",
+        meaning: "No operation completed, more operations failed than the SLA allows, or the measurement window was shorter than the warmup: latency and throughput would describe failures or noise, so performance findings (latency, scaling, small objects, HTTP, cache, tail, cost) are suppressed.",
+        causes: &[
+            "failing requests (credentials, missing objects, an unsupported HTTP version)",
+            "a measurement window shorter than the warmup",
+        ],
+        verify: &[
+            "report.summary.error_ratio against report.sla.max_error_ratio",
+            "report.run.window_s against report.workload.warmup_s",
+        ],
+        knobs: &["--duration", "--warmup", "--http"],
+    },
+    Entry {
+        code: "run_partial",
+        title: "The run stopped early",
+        severity: Severity::Warning,
+        category: "validity",
+        meaning: "The run was interrupted (Ctrl-C, Stop), stopped by a safety budget or by an error before its configured end (report.run.partial). Interrupted runs and windows under a second have their performance findings suppressed; a partial run is never accepted as a baseline.",
+        causes: &[
+            "Ctrl-C or a cancelled job",
+            "a budget (--max-requests, --max-bytes, --max-duration, --max-cost-usd)",
+        ],
+        verify: &[
+            "report.run.partial (reason, measured_s) and report.warnings",
+            "re-run with `oprobe run --from RUNREF`",
+        ],
+        knobs: &["--duration", "--max-requests", "--max-cost-usd"],
     },
 ];
 

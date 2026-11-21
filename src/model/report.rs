@@ -30,7 +30,7 @@ pub const REPORT_SCHEMA: &str = "oprobe.report/4";
 /// value is naturally fractional: `client.rss_mib`, `cost.stored_gib`); `_bps` bits per second;
 /// `_per_s` rates (`ops_per_s`, `mib_per_s`, `requests_per_s`); `_pct` percent (0–100);
 /// `_ratio` dimensionless fractions and multipliers; `_usd` money; `_count` counts (also a
-/// count per something, e.g. `requests_per_op_count`, and maps of counts like
+/// count per something, e.g. `peak_inflight_per_op_count`, and maps of counts like
 /// `status_count`); `_mean` fractional means of counts (`inflight_mean`, v4 §4).
 pub const UNIT_SUFFIXES: &[&str] = &[
     "_us", "_ms", "_s", "_bytes", "_mib", "_gib", "_bps", "_per_s", "_pct", "_pp", "_ratio",
@@ -132,6 +132,34 @@ impl Report {
             .unwrap_or_default()
     }
 
+    /// The run stopped early (`run.partial`, or the legacy `run.interrupted` flag).
+    pub fn is_partial(&self) -> bool {
+        self.run.partial.is_some() || self.run.interrupted
+    }
+
+    /// Why this run cannot be a baseline (`None`: it can): a partial run, or one whose
+    /// findings say it is invalid, would make every later comparison wrong (design v4 §4).
+    pub fn baseline_refusal(&self) -> Option<String> {
+        if let Some(p) = &self.run.partial {
+            return Some(format!(
+                "run {} is partial ({} after {:.1} s of measurement)",
+                self.run.id,
+                p.reason.describe(),
+                p.measured_s
+            ));
+        }
+        if self.run.interrupted {
+            return Some(format!(
+                "run {} is partial (interrupted after {:.1} s of measurement)",
+                self.run.id, self.run.window_s
+            ));
+        }
+        self.findings
+            .iter()
+            .find(|f| f.code == "run_invalid")
+            .map(|f| format!("run {} is invalid: {}", self.run.id, f.cause))
+    }
+
     /// Parse a report from JSON: a bare report, a `{"report": …}` command result, or a
     /// `{"kind":"report", …}` run-file line. Other schemas are rejected with a clear error.
     pub fn from_json_value(mut v: serde_json::Value) -> anyhow::Result<Self> {
@@ -176,12 +204,56 @@ pub struct RunInfo {
     pub window_s: f64,
     /// Stopped early (Ctrl-C, Stop, budget): the window is shorter than configured.
     pub interrupted: bool,
+    /// Why and when the run stopped early (absent for a complete run). A partial run is never
+    /// accepted as a baseline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partial: Option<PartialInfo>,
     /// Trace rows were sampled (more requests than `trace.max_requests`); aggregates are exact.
     pub sampled: bool,
     pub trace: TraceInfo,
     pub oprobe_version: String,
     pub host: HostInfo,
     pub env: EnvInfo,
+}
+
+/// Why a run stopped before its configured end.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PartialReason {
+    /// Ctrl-C, Stop or a cancelled job.
+    #[default]
+    Interrupted,
+    /// A safety budget (`--max-requests`, `--max-bytes`, `--max-duration`, `--max-cost-usd`).
+    Budget,
+    /// A fatal error ended the measurement.
+    Error,
+}
+
+impl PartialReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Interrupted => "interrupted",
+            Self::Budget => "budget",
+            Self::Error => "error",
+        }
+    }
+
+    /// `interrupted` / `stopped by a budget` / `stopped by an error`.
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::Interrupted => "interrupted",
+            Self::Budget => "stopped by a budget",
+            Self::Error => "stopped by an error",
+        }
+    }
+}
+
+/// A run that stopped early (`report.run.partial`).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct PartialInfo {
+    pub reason: PartialReason,
+    /// Seconds of the measurement window that ran.
+    pub measured_s: f64,
 }
 
 /// What the run file's trace rows cover.
@@ -435,7 +507,12 @@ pub struct SlaInfo {
     /// A breach fails the command (exit 3).
     pub enforced: bool,
     pub max_error_ratio: f64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Throttled responses / requests the run may have (`sla.max_throttle_rate`).
+    #[serde(
+        default,
+        rename = "max_throttled_request_ratio",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub max_throttle_ratio: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub p99_ms: Option<f64>,
@@ -681,6 +758,128 @@ pub struct Evidence {
     pub windows: Vec<TimeWindow>,
 }
 
+impl Evidence {
+    /// The named values for people (P2-8): a label without the unit suffix and the value in
+    /// its unit — ratios as percentages, times as ms/s, sizes in bytes units, counts as whole
+    /// numbers.
+    pub fn labelled(&self) -> Vec<(String, String)> {
+        self.values
+            .iter()
+            .map(|(k, v)| evidence_label(k, *v))
+            .collect()
+    }
+}
+
+/// `throttled_request_ratio` = 0.047 → (`Throttled requests`, `4.7%`).
+pub fn evidence_label(key: &str, v: f64) -> (String, String) {
+    use crate::util::{fmt_bytes, fmt_ms, fmt_usd};
+    let known: Option<&str> = match key {
+        "throttled_request_ratio" => Some("Throttled requests"),
+        "throttled_op_ratio" => Some("Throttled operations"),
+        "error_ratio" => Some("Failed operations"),
+        "p99_to_p50_ratio" => Some("p99 / p50"),
+        "overread_ratio" => Some("Over-read"),
+        "ttfb_pct" => Some("Time waiting for the first byte"),
+        "retry_pct" => Some("Time in retry backoff"),
+        "queue_pct" => Some("Time queued"),
+        "connect_pct" => Some("Time connecting"),
+        "reuse_pct" => Some("Connection reuse"),
+        "straggler_pct" => Some("Stragglers"),
+        "straggler_ttfb_ms" => Some("Straggler wait (p50)"),
+        "ceiling_lo_inflight_count" => Some("Clean up to (in flight)"),
+        "ceiling_hi_inflight_count" => Some("Throttled from (in flight)"),
+        "peak_inflight_per_op_count" => Some("In flight per operation (peak)"),
+        "safe_concurrency_count" => Some("Safe concurrency"),
+        "extra_requests_per_1k_ops_mean" => Some("Extra requests per 1 000 ops"),
+        "mean_request_bytes" => Some("Mean request size"),
+        "tail_cut_deadline_ms" => Some("Tail-cut deadline"),
+        "tail_cut_blind_s" => Some("Tail-cut blind for"),
+        "accepted_requests_per_s" => Some("Accepted while throttled"),
+        "monthly_usd" => Some("Projected monthly bill"),
+        _ => None,
+    };
+    let label = known.map(str::to_owned).unwrap_or_else(|| {
+        let bare = UNIT_SUFFIXES
+            .iter()
+            .filter(|s| key.ends_with(*s))
+            .max_by_key(|s| s.len())
+            .map_or(key, |s| &key[..key.len() - s.len()]);
+        let words = bare.replace('_', " ");
+        let mut c = words.chars();
+        match c.next() {
+            Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+            None => key.to_owned(),
+        }
+    });
+    let multiplier = key.contains("_to_") || key == "overread_ratio";
+    let value = if key.ends_with("_ratio") && multiplier {
+        format!("{v:.2}×")
+    } else if key.ends_with("_ratio") {
+        pct(v * 100.0)
+    } else if key.ends_with("_pct") {
+        pct(v)
+    } else if key.ends_with("_ms") {
+        fmt_ms(v)
+    } else if key.ends_with("_us") {
+        fmt_ms(v / 1000.0)
+    } else if key.ends_with("_s") && !key.ends_with("_per_s") {
+        format!("{v:.1} s")
+    } else if key.ends_with("_bytes") {
+        fmt_bytes(v.max(0.0) as u64)
+    } else if key.ends_with("_usd") {
+        fmt_usd(v)
+    } else if key.ends_with("_per_s") {
+        let unit = if key.contains("requests") {
+            "requests/s"
+        } else if key.contains("mib") {
+            "MiB/s"
+        } else {
+            "ops/s"
+        };
+        format!(
+            "{} {unit}",
+            group_thousands(v, if v.abs() < 10.0 { 1 } else { 0 })
+        )
+    } else if key.ends_with("_count") {
+        group_thousands(v, 0)
+    } else {
+        group_thousands(v, 2)
+    };
+    (label, value)
+}
+
+/// A percentage with as many decimals as it needs: `4.7%`, `0.12%`, `100%`.
+fn pct(p: f64) -> String {
+    if p == 0.0 || p.abs() >= 10.0 {
+        format!("{p:.0}%")
+    } else if p.abs() >= 0.1 {
+        format!("{p:.1}%")
+    } else {
+        format!("{p:.2}%")
+    }
+}
+
+/// `12345.6` → `12 346` (thin groups of three, `decimals` after the point).
+fn group_thousands(v: f64, decimals: usize) -> String {
+    let s = format!("{:.*}", decimals, v.abs());
+    let (int, frac) = s.split_once('.').map_or((s.as_str(), ""), |(a, b)| (a, b));
+    let mut out = String::new();
+    for (i, ch) in int.chars().enumerate() {
+        if i > 0 && (int.len() - i) % 3 == 0 {
+            out.push('\u{202f}');
+        }
+        out.push(ch);
+    }
+    if !frac.is_empty() {
+        out.push('.');
+        out.push_str(frac);
+    }
+    if v < 0.0 && v.abs() >= 0.5 * 10f64.powi(-(decimals as i32)) {
+        out.insert(0, '−');
+    }
+    out
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct TimeWindow {
     pub from_s: f64,
@@ -831,5 +1030,79 @@ impl From<&crate::report::TuneSummary> for TuneReport {
             notes: s.notes.clone(),
             recommendation: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every `*_count` field of every registered schema is an integer (design v4 §4).
+    #[test]
+    fn counts_are_integers_in_every_schema() {
+        fn walk(v: &serde_json::Value, path: &str, bad: &mut Vec<String>) {
+            match v {
+                serde_json::Value::Object(m) => {
+                    if let Some(serde_json::Value::Object(props)) = m.get("properties") {
+                        for (k, p) in props {
+                            let number = p.get("type").is_some_and(|t| {
+                                t == "number"
+                                    || t.as_array()
+                                        .is_some_and(|a| a.iter().any(|x| x == "number"))
+                            });
+                            let map_of_numbers = p
+                                .get("additionalProperties")
+                                .and_then(|a| a.get("type"))
+                                .is_some_and(|t| t == "number");
+                            if k.ends_with("_count") && (number || map_of_numbers) {
+                                bad.push(format!("{path}.{k}"));
+                            }
+                        }
+                    }
+                    for (k, x) in m {
+                        walk(x, &format!("{path}/{k}"), bad);
+                    }
+                }
+                serde_json::Value::Array(a) => a.iter().for_each(|x| walk(x, path, bad)),
+                _ => {}
+            }
+        }
+        let mut bad = Vec::new();
+        for e in crate::mcp::schemas::entries() {
+            if let Some(s) = crate::mcp::schemas::schema(e.name) {
+                walk(&s, e.name, &mut bad);
+            }
+        }
+        assert!(bad.is_empty(), "fractional `_count` fields: {bad:#?}");
+    }
+
+    #[test]
+    fn evidence_values_read_as_labels_units_and_percentages() {
+        let e = Evidence {
+            values: [
+                ("throttled_request_ratio", 0.0468),
+                ("p99_ms", 262.918),
+                ("retry_pct", 12.0),
+                ("safe_concurrency_count", 20.0),
+                ("mean_request_bytes", 65536.0),
+                ("p99_to_p50_ratio", 30.0),
+                ("ceiling_requests_per_s", 2410.4),
+                ("extra_requests_per_1k_ops_mean", -1031.0),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), v))
+            .collect(),
+            ..Default::default()
+        };
+        let l: BTreeMap<String, String> = e.labelled().into_iter().collect();
+        assert_eq!(l["Throttled requests"], "4.7%");
+        assert_eq!(l["Time in retry backoff"], "12%");
+        assert_eq!(l["Safe concurrency"], "20");
+        assert_eq!(l["p99 / p50"], "30.00×");
+        assert_eq!(l["Ceiling requests"], "2\u{202f}410 requests/s");
+        assert_eq!(l["Extra requests per 1 000 ops"], "−1\u{202f}031.00");
+        assert!(l["Mean request size"].contains("KiB"), "{l:?}");
+        assert!(l["P99"].ends_with("ms"), "{l:?}");
+        assert!(!l.keys().any(|k| k.contains('_')), "{l:?}");
     }
 }

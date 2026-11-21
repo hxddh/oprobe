@@ -3,7 +3,7 @@
 //! Each [`Finding`] has a stable `code` (documented by `oprobe explain CODE`), a severity, a
 //! one-sentence cause, evidence (numbers plus references: operation ids, time windows), advice
 //! and — where a knob change can test the advice — a verification with the exact
-//! `oprobe run …` command. Predictions ("tail-cut at 150 ms would cut p99 from 918 ms to
+//! `oprobe run …` command. Predictions ("tail-cut (deadline 50 ms) would cut p99 from 918 ms to
 //! ~140 ms") come from [`super::simulate`], which replays the recorded rows; they are stated
 //! as estimates.
 //!
@@ -11,10 +11,12 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+use super::capacity::Capacity;
 use super::diagnosis::{self, Severity};
 use super::outliers::{Selection, attribute, dominant_stage};
-use super::simulate::{self, Prediction};
+use super::simulate::{self, Prediction, TailCutReplay, TailCutSetup};
 use super::stats::{median, quantile_us_ms};
+use super::verification::{Direction, Expectation};
 use crate::model::{Evidence, Finding, Report, ReqRow, Run, TimeWindow, Verification};
 use crate::util::{fmt_bytes, fmt_ms, fmt_usd};
 
@@ -50,6 +52,24 @@ pub const CODES: &[&str] = &[
     "cache_ineffective",
     "sla_p99",
     "rate_not_sustained",
+    "run_invalid",
+    "run_partial",
+];
+
+/// Throttled-request share a recommendation may leave (the tune budget's default).
+pub const THROTTLE_BUDGET_RATIO: f64 = 0.001;
+
+/// Codes that still hold on a broken run: facts about correctness, failures and the
+/// service's limits. Every other finding is about performance and is suppressed when the run
+/// is invalid or too short to judge (design v4 §4).
+const VALID_ON_BROKEN_RUNS: &[&str] = &[
+    "integrity",
+    "errors",
+    "throttling",
+    "retries",
+    "client_cpu",
+    "run_invalid",
+    "run_partial",
 ];
 
 struct Ctx<'a> {
@@ -57,6 +77,10 @@ struct Ctx<'a> {
     r: &'a Report,
     network: bool,
     throttled: bool,
+    /// The capacity model of the run (its own ceiling, or a remembered one).
+    cap: &'a Capacity,
+    /// The most workers any advice may suggest ([`Capacity::max_advisable_concurrency`]).
+    safe: Option<u32>,
 }
 
 /// How a command names the run's target: the configured target name, the `lab://` scenario,
@@ -175,14 +199,106 @@ impl Ctx<'_> {
             description,
         ))
     }
+
+    fn concurrency(&self) -> u64 {
+        self.r.knobs.requested.concurrency_count.max(1)
+    }
+
+    /// More workers, as far as the capacity model allows: twice the current concurrency,
+    /// capped at the safe concurrency when a ceiling is known. `Err(safe)` when the run is
+    /// already at (or above) the safe concurrency: more workers would throttle.
+    fn scale_up(&self) -> Result<u64, u32> {
+        let cc = self.concurrency();
+        match self.safe {
+            Some(safe) if u64::from(safe) <= cc => Err(safe),
+            Some(safe) => Ok((cc * 2).min(u64::from(safe))),
+            None => Ok(cc * 2),
+        }
+    }
+
+    /// What a run at `to` workers should show: goodput from the capacity model (with its
+    /// interval) and throttling within the budget.
+    fn concurrency_expectations(&self, to: u64) -> Vec<Expectation> {
+        let p = self.cap.predict(to.clamp(1, u64::from(u32::MAX)) as u32);
+        let mut out = Vec::new();
+        if p.ops_per_s > 0.0 && self.r.workload.rate_per_s.is_none() {
+            out.push(Expectation {
+                metric: "summary.ops_per_s".into(),
+                direction: if to > self.concurrency() {
+                    Direction::Increase
+                } else {
+                    Direction::AtLeast
+                },
+                predicted: p.ops_per_s,
+                lo: p.ops_lo_per_s,
+                hi: p.ops_hi_per_s,
+                unit: "ops_per_s".into(),
+            });
+        }
+        out.push(Expectation {
+            metric: "summary.throttled_request_ratio".into(),
+            direction: Direction::AtMost,
+            // Under the ceiling nothing should be throttled; above it, the model's chance.
+            predicted: if p.within_ceiling {
+                0.0
+            } else {
+                p.throttle_probability_ratio
+            },
+            lo: 0.0,
+            hi: THROTTLE_BUDGET_RATIO,
+            unit: "ratio".into(),
+        });
+        out
+    }
+
+    /// The verification of running at `to` workers.
+    fn verify_concurrency(&self, description: String, to: u64) -> Option<Verification> {
+        let mut v = self.verify(description, &[("concurrency", to.to_string())])?;
+        v.expect = self.concurrency_expectations(to);
+        Some(v)
+    }
+
+    /// "… (the in-flight ceiling is N requests: at most M workers)" when one is known.
+    fn ceiling_note(&self) -> String {
+        match (self.cap.inflight_ceiling, self.safe) {
+            (Some(c), Some(s)) => format!(
+                "the service throttles above ~{:.0} requests in flight ({} per operation at the peak): at most {s} workers{}",
+                c.lo,
+                self.cap.per_op.peak_inflight_per_op,
+                if self.cap.source == super::capacity::CapacitySource::History {
+                    " (remembered from an earlier run)"
+                } else {
+                    ""
+                }
+            ),
+            _ => String::new(),
+        }
+    }
+}
+
+/// An expectation that a latency metric falls to the replayed value.
+fn latency_expectation(metric: &str, p: &Prediction) -> Expectation {
+    Expectation {
+        metric: metric.into(),
+        direction: Direction::Decrease,
+        predicted: p.predicted,
+        lo: p.predicted_lo,
+        hi: p.predicted_hi,
+        unit: "ms".into(),
+    }
 }
 
 /// Evidence values; every key carries its unit like a report field (design §6).
 fn values(kv: &[(&str, f64)]) -> BTreeMap<String, f64> {
-    for (k, _) in kv {
+    for (k, v) in kv {
         debug_assert!(
             crate::model::has_unit(k),
             "evidence value `{k}` has no unit suffix"
+        );
+        // A count is a whole number (design v4 §4); fractions are `_mean` / `_ratio`.
+        debug_assert!(
+            !k.ends_with("_count") || v.fract() == 0.0,
+            "evidence count `{k}` = {v} is not a whole number"
         );
     }
     kv.iter()
@@ -250,8 +366,7 @@ fn pred_text(p: &Prediction) -> String {
 
 /// Evidence values of a prediction, named after the predicted metric and its unit:
 /// `current_p99_ms` / `predicted_p99_ms` (or `…_p50_ms`, `…_ops_per_s`) and the change in
-/// requests per 1 000 operations (`predicted_extra_requests_per_1k_ops_count`, negative =
-/// saved).
+/// requests per 1 000 operations (`extra_requests_per_1k_ops_mean`, negative = saved).
 fn pred_values(p: &Prediction) -> [(&'static str, f64); 3] {
     let (cur, pred) = match p.metric.split(' ').next().unwrap_or("") {
         "p99_ms" => ("current_p99_ms", "predicted_p99_ms"),
@@ -263,7 +378,7 @@ fn pred_values(p: &Prediction) -> [(&'static str, f64); 3] {
         (cur, p.current),
         (pred, p.predicted),
         (
-            "predicted_extra_requests_per_1k_ops_count",
+            "extra_requests_per_1k_ops_mean",
             p.requests_per_1k_ops_delta,
         ),
     ]
@@ -271,19 +386,54 @@ fn pred_values(p: &Prediction) -> [(&'static str, f64); 3] {
 
 // ---------------------------------------------------------------------------------------
 
+/// Failures of one error class (`resilience.error_classes`) and what to do about them.
+fn class_advice(class: &str, http: crate::net::HttpVersion) -> String {
+    match class {
+        "permission_denied" | "config_invalid" => "credentials or permissions were refused: run `oprobe doctor` to check the credentials, the bucket policy and the endpoint".into(),
+        "not_found" => "objects were missing: check the `--existing` prefix and that nothing deleted the dataset during the run".into(),
+        "timeout" => "requests timed out: raise `--timeout`, or find the slow server with `oprobe analyze RUN --slowest 2 --by remote`".into(),
+        "tail_cut" => "tail-cut cancelled requests until the retries ran out: raise `--retries` or turn tail-cut off".into(),
+        "connect" | "network" => "connections failed or were reset: check the endpoint, proxy and network path (`oprobe doctor`, `oprobe probe ENDPOINT`)".into(),
+        "server_error" => "the service answered 5xx: check its health (`oprobe analyze RUN --by status`); retries absorb short bursts".into(),
+        "condition_not_match" | "already_exists" | "conflict" => "conditional writes lost a race with another writer: expected under contention on the same keys".into(),
+        "range_not_satisfied" => "reads asked for ranges past the end of the objects: check the object size and the range settings".into(),
+        "unsupported" => "the service does not support an operation of the mix: change the mix or the preset".into(),
+        _ if http == crate::net::HttpVersion::H2 => "unclassified failures with HTTP/2 forced: the service may not speak HTTP/2 (re-run with `--http h1` or `--http auto`)".into(),
+        other => format!("`{other}` failures: inspect the failing requests with `oprobe analyze RUN --by status`"),
+    }
+}
+
+/// Failed operations by error class, most common first, without `rate_limited` (failures
+/// that ran out of retries on 429/503 belong to the throttling finding).
+fn failure_classes(r: &Report) -> Vec<(&str, u64)> {
+    let mut v: Vec<(&str, u64)> = r
+        .resilience
+        .error_classes
+        .iter()
+        .filter(|(k, n)| k.as_str() != "rate_limited" && **n > 0)
+        .map(|(k, n)| (k.as_str(), *n))
+        .collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    v
+}
+
 fn errors(c: &Ctx) -> Option<Finding> {
     let r = c.r;
     let s = &r.summary;
     if s.failed_ops == 0 {
         return None;
     }
-    let top = r
+    let rate_limited = r
         .resilience
         .error_classes
-        .iter()
-        .max_by_key(|(_, n)| **n)
-        .map(|(k, n)| format!("; most common: {k} ×{n}"))
-        .unwrap_or_default();
+        .get("rate_limited")
+        .copied()
+        .unwrap_or(0);
+    let classes = failure_classes(r);
+    // Every failure was a throttled request out of retries: the throttling finding says so.
+    if rate_limited > 0 && classes.is_empty() && c.throttled {
+        return None;
+    }
     let failed: Vec<u64> = c
         .run
         .ops
@@ -291,6 +441,52 @@ fn errors(c: &Ctx) -> Option<Finding> {
         .filter(|o| !o.ok)
         .map(|o| o.op_id)
         .collect();
+    let by_class: Vec<String> = classes.iter().map(|(k, n)| format!("{k} ×{n}")).collect();
+    let mut text = format!("{} of {} operations failed", s.failed_ops, s.ops);
+    if !by_class.is_empty() {
+        text += &format!(": {}", by_class.join(", "));
+    }
+    if rate_limited > 0 {
+        text +=
+            &format!(" (and {rate_limited} throttled operations out of retries: see throttling)");
+    }
+    let http = r.knobs.requested.http_version;
+    let advice: Vec<String> = if classes.is_empty() {
+        vec![class_advice("other", http)]
+    } else {
+        classes
+            .iter()
+            .take(3)
+            .map(|(k, _)| class_advice(k, http))
+            .collect()
+    };
+    let mut advice = advice.join("; ");
+    if let Some(first) = advice.get(..1) {
+        advice = first.to_uppercase() + &advice[1..];
+    }
+    advice.push('.');
+    // Forced HTTP/2 with unclassified failures: test HTTP/1.1.
+    let verification = (http == crate::net::HttpVersion::H2
+        && classes
+            .first()
+            .is_some_and(|(k, _)| matches!(*k, "unexpected" | "other" | "network")))
+    .then(|| {
+        c.verify(
+            "re-run over HTTP/1.1: the failures should disappear",
+            &[("http_version", "h1".into())],
+        )
+        .map(|v| {
+            v.expecting(Expectation {
+                metric: "summary.error_ratio".into(),
+                direction: Direction::AtMost,
+                predicted: 0.0,
+                lo: 0.0,
+                hi: r.sla.max_error_ratio,
+                unit: "ratio".into(),
+            })
+        })
+    })
+    .flatten();
     Some(Finding {
         code: "errors".into(),
         severity: if s.error_rate > r.sla.max_error_ratio {
@@ -300,44 +496,19 @@ fn errors(c: &Ctx) -> Option<Finding> {
         },
         cause: format!("{:.2}% of operations failed.", s.error_rate * 100.0),
         evidence: Evidence {
-            text: format!("{} of {} operations failed{top}", s.failed_ops, s.ops),
+            text,
             values: values(&[
                 ("failed_ops_count", s.failed_ops as f64),
                 ("error_ratio", s.error_rate),
             ]),
             op_ids: slowest_ops(c.run, failed),
-            windows: windows_where(&c.run.reqs, |q| q.is_error() && !q.is_throttle() && q.status != 404),
+            windows: windows_where(&c.run.reqs, |q| {
+                q.is_error() && !q.is_throttle() && q.status != 404
+            }),
         },
-        advice: "Inspect the failing requests (`oprobe analyze RUN --where status=…`) and run `oprobe doctor` for credential, permission and endpoint checks.".into(),
-        verification: None,
+        advice,
+        verification,
     })
-}
-
-/// Requests per second the service accepted while it was throttling (median over throttled
-/// seconds), and the in-flight requests that rate corresponds to.
-fn throttle_ceiling(reqs: &[ReqRow]) -> Option<(f64, f64)> {
-    let mut per: BTreeMap<i64, (u64, u64, u64)> = BTreeMap::new();
-    for q in reqs {
-        let e = per.entry(q.t_us.div_euclid(1_000_000)).or_default();
-        if q.is_throttle() {
-            e.0 += 1;
-        } else {
-            e.1 += 1;
-            e.2 += q.total_us;
-        }
-    }
-    let rates: Vec<f64> = per
-        .values()
-        .filter(|e| e.0 > 0)
-        .map(|e| e.1 as f64)
-        .collect();
-    if rates.is_empty() {
-        return None;
-    }
-    let ok: Vec<&ReqRow> = reqs.iter().filter(|q| !q.is_throttle()).collect();
-    let mean_s = ok.iter().map(|q| q.total_us).sum::<u64>() as f64 / ok.len().max(1) as f64 / 1e6;
-    let rps = median(&rates);
-    Some((rps, rps * mean_s))
 }
 
 fn throttling(c: &Ctx) -> Option<Finding> {
@@ -346,46 +517,119 @@ fn throttling(c: &Ctx) -> Option<Finding> {
     if thr == 0 {
         return None;
     }
-    let requests = r.connections.requests.max(1) as f64;
-    let ceiling = throttle_ceiling(&c.run.reqs);
-    let amp = r.bytes.request_amplification.max(1.0);
+    let (req_ratio, op_ratio) = (
+        r.summary.throttled_request_ratio,
+        r.summary.throttled_op_ratio,
+    );
+    let cc = c.concurrency();
+    let out_of_retries = r
+        .resilience
+        .error_classes
+        .get("rate_limited")
+        .copied()
+        .unwrap_or(0);
     let mut text = format!(
-        "{thr} throttled responses ({:.2}% of requests); {} retries, {:.0}% of operation time in retry backoff; max Retry-After {} ms",
-        thr as f64 * 100.0 / requests,
+        "{thr} throttled responses ({:.2}% of requests, {:.2}% of operations); {} retries, {:.0}% of operation time in retry backoff; max Retry-After {} ms",
+        req_ratio * 100.0,
+        op_ratio * 100.0,
         r.resilience.retries,
         r.stages.shares.retry_pct,
         r.resilience.max_retry_after_ms
     );
+    if out_of_retries > 0 {
+        text += &format!("; {out_of_retries} operations failed when their retries ran out");
+    }
     let mut vals = vec![
         ("throttled_responses_count", thr as f64),
-        ("throttle_ratio", thr as f64 / requests),
+        ("throttled_request_ratio", req_ratio),
+        ("throttled_op_ratio", op_ratio),
         ("retry_pct", r.stages.shares.retry_pct),
     ];
-    let mut advice = "The service is rate-limiting this request rate: lower `concurrency` / `max_inflight_requests` below the ceiling, spread keys across more prefixes, keep retries with jitter.".to_owned();
+    if out_of_retries > 0 {
+        vals.push(("rate_limited_failures_count", out_of_retries as f64));
+    }
+    let advice;
     let verification;
-    if let Some((rps, inflight)) = ceiling {
-        let safe_c = ((inflight / amp).floor() as u64).max(1);
-        text += &format!(
-            "; while throttled the service accepted ≈{rps:.0} requests/s (≈{inflight:.0} in flight)"
-        );
-        vals.push(("ceiling_requests_per_s", rps));
-        vals.push(("ceiling_inflight_count", inflight));
-        advice = format!(
-            "The service accepts ≈{rps:.0} requests/s here: run at concurrency ≤ {safe_c} (or cap `max_inflight_requests` near {:.0}), spread keys across more prefixes, keep retries with jitter.",
-            inflight.max(1.0)
-        );
-        verification = c.verify(
-            format!(
-                "re-run at concurrency {safe_c}: throttling should disappear at a similar throughput"
-            ),
-            &[("concurrency", safe_c.to_string())],
-        );
-    } else {
-        let half = (r.knobs.requested.concurrency_count / 2).max(1);
-        verification = c.verify(
-            format!("re-run at half the concurrency ({half}); `oprobe tune` finds the ceiling"),
-            &[("concurrency", half.to_string())],
-        );
+    let cap = c.cap;
+    match (cap.inflight_ceiling, c.safe) {
+        (Some(ce), Some(safe)) => {
+            // Always fewer workers than now: the run throttled at its own concurrency.
+            let to = u64::from(safe).min(cc.saturating_sub(1)).max(1);
+            let peak = cap.per_op.peak_inflight_per_op;
+            text += &format!(
+                "; throttling starts between {:.0} and {:.0} requests in flight, and one operation keeps up to {peak:.0} in flight",
+                ce.lo, ce.hi
+            );
+            vals.push(("ceiling_lo_inflight_count", ce.lo));
+            vals.push(("ceiling_hi_inflight_count", ce.hi));
+            vals.push(("peak_inflight_per_op_count", peak));
+            vals.push(("safe_concurrency_count", to as f64));
+            let p = cap.predict(to as u32);
+            advice = format!(
+                "The service throttles above ~{:.0} requests in flight: run at concurrency ≤ {to} ({peak:.0} requests in flight per operation at the peak, {:.0}% headroom; predicted {:.0} ops/s), or cap `max_inflight_requests` at {:.0}; keep retries with jitter.",
+                ce.lo,
+                super::capacity::DEFAULT_HEADROOM_RATIO * 100.0,
+                p.ops_per_s,
+                (ce.lo * (1.0 - super::capacity::DEFAULT_HEADROOM_RATIO))
+                    .floor()
+                    .max(1.0)
+            );
+            verification = c.verify_concurrency(
+                format!(
+                    "re-run at concurrency {to}: throttling should stay within {:.1}% of requests at ~{:.0} ops/s",
+                    THROTTLE_BUDGET_RATIO * 100.0,
+                    p.ops_per_s
+                ),
+                to,
+            );
+        }
+        _ => {
+            let per_op = cap
+                .per_op
+                .requests_per_op
+                .max(r.bytes.request_amplification);
+            match cap.rate_ceiling_requests_per_s {
+                Some(rps) if per_op > 0.0 && rps > 0.0 => {
+                    let rate = ((rps / per_op) * (1.0 - super::capacity::DEFAULT_HEADROOM_RATIO))
+                        .floor()
+                        .max(1.0);
+                    text += &format!(
+                        "; throttling does not follow the requests in flight: while throttled the service accepted ≈{rps:.0} requests/s"
+                    );
+                    vals.push(("accepted_requests_per_s", rps));
+                    advice = format!(
+                        "The service limits the request rate (≈{rps:.0} requests/s), not concurrency: pace the client at ≤ {rate:.0} operations/s (`--rate {rate:.0}`; {per_op:.1} requests per operation), spread keys across more prefixes, keep retries with jitter."
+                    );
+                    verification = c
+                        .verify(
+                            format!("re-run paced at {rate:.0} operations/s: throttling should disappear"),
+                            &[("rate", format!("{rate:.0}"))],
+                        )
+                        .map(|v| {
+                            v.expecting(Expectation {
+                                metric: "summary.throttled_request_ratio".into(),
+                                direction: Direction::AtMost,
+                                predicted: 0.0,
+                                lo: 0.0,
+                                hi: THROTTLE_BUDGET_RATIO,
+                                unit: "ratio".into(),
+                            })
+                        });
+                }
+                _ => {
+                    let half = (cc / 2).max(1);
+                    advice = "The service is rate-limiting this load: lower `concurrency` / `max_inflight_requests` (`oprobe tune` finds the ceiling), spread keys across more prefixes, keep retries with jitter.".into();
+                    verification = (half < cc)
+                        .then(|| {
+                            c.verify_concurrency(
+                                format!("re-run at half the concurrency ({half}); `oprobe tune` finds the ceiling"),
+                                half,
+                            )
+                        })
+                        .flatten();
+                }
+            }
+        }
     }
     let ids = c.run.ops.iter().filter(|o| o.throttled).map(|o| o.op_id);
     Some(Finding {
@@ -393,7 +637,7 @@ fn throttling(c: &Ctx) -> Option<Finding> {
         severity: Severity::Critical,
         cause: format!(
             "The service throttled {:.1}% of requests (429/503).",
-            thr as f64 * 100.0 / requests
+            req_ratio * 100.0
         ),
         evidence: Evidence {
             text,
@@ -413,10 +657,21 @@ fn retries(c: &Ctx) -> Option<Finding> {
         return None;
     }
     let ids = c.run.ops.iter().filter(|o| o.attempts > 1).map(|o| o.op_id);
+    // With tail-cut on, the layer's cancellations are retried like failures: the backoff is
+    // the price of the cut, not a service problem.
+    let tail_cut = r.knobs.requested.tail_cut;
     Some(Finding {
         code: "retries".into(),
-        severity: Severity::Warning,
-        cause: format!("{share:.0}% of operation time is retry backoff after failed requests."),
+        severity: if tail_cut {
+            Severity::Info
+        } else {
+            Severity::Warning
+        },
+        cause: if tail_cut {
+            format!("{share:.0}% of operation time is retry backoff, mostly tail-cut re-issues.")
+        } else {
+            format!("{share:.0}% of operation time is retry backoff after failed requests.")
+        },
         evidence: Evidence {
             text: format!(
                 "{} retries, {} total backoff",
@@ -430,7 +685,11 @@ fn retries(c: &Ctx) -> Option<Finding> {
             op_ids: slowest_ops(c.run, ids),
             windows: windows_where(&c.run.reqs, |q| q.attempt > 1),
         },
-        advice: "Requests fail with temporary errors and are retried after a backoff: inspect them with `oprobe analyze RUN --where attempt=retry --by status`.".into(),
+        advice: if tail_cut {
+            "Each request tail-cut cancels is re-issued after the retry backoff (50–100 ms): compare p99 with and without tail-cut (`oprobe compare`) to see whether the cut pays for its wait.".into()
+        } else {
+            "Requests fail with temporary errors and are retried after a backoff: inspect them with `oprobe analyze RUN --where attempt=retry --by status`.".into()
+        },
         verification: None,
     })
 }
@@ -438,42 +697,74 @@ fn retries(c: &Ctx) -> Option<Finding> {
 /// A tail-cut must take at least this share off the affected operations' p99 to be advice.
 const TAIL_CUT_MIN_GAIN: f64 = 1.0 / 3.0;
 
-/// The API whose stragglers a tail-cut would cut best: its threshold, the replayed prediction
-/// and the successful requests above the threshold. `None` when no API has requests above its
-/// threshold that mostly wait for the first byte, or the replay predicts no substantial gain.
-fn straggler_candidate(run: &Run) -> Option<(String, u64, Prediction, Vec<&ReqRow>)> {
+/// APIs whose replayed gain is within this share of the best one count as equally good; among
+/// them the one with the most stragglers wins (then the name), so the named API does not flip
+/// between runs of the same workload on noise.
+const STRAGGLER_TIE_RATIO: f64 = 0.75;
+
+/// Stragglers of one API that the measured client's tail-cut layer would cut.
+struct Stragglers<'a> {
+    api: String,
+    /// The replay on a long-lived client (the layer always active).
+    steady: TailCutReplay,
+    deadline_us: u64,
+    /// Successful requests slower than the layer's deadline.
+    over: Vec<&'a ReqRow>,
+}
+
+/// The API whose stragglers `TailCutLayer` (the measured client's own rule, via
+/// [`simulate::tail_cut`]) would cut best. `None` when no API has requests above its
+/// deadline that mostly wait for the first byte, or the replay predicts no substantial gain:
+/// e.g. when stragglers are more than 5 % of the requests, the layer's p95 deadline sits above
+/// them and it cuts nothing.
+fn straggler_candidate<'a>(run: &'a Run, setup: &TailCutSetup) -> Option<Stragglers<'a>> {
     let mut apis: Vec<&str> = run.reqs.iter().map(|q| q.api.as_ref()).collect();
     apis.sort_unstable();
     apis.dedup();
-    let mut best: Option<(String, u64, Prediction, Vec<&ReqRow>)> = None;
+    let steady = setup.steady();
+    let mut found: Vec<(f64, Stragglers)> = Vec::new();
     for api in apis {
-        let Some(cut) = simulate::tail_cut_threshold_us(&run.reqs, api) else {
+        let Some(replay) = simulate::tail_cut(run, api, &steady) else {
+            continue;
+        };
+        let Some(deadline_us) = replay.deadline_us else {
             continue;
         };
         let over: Vec<&ReqRow> = run
             .reqs
             .iter()
-            .filter(|q| q.api == api && !q.is_error() && q.total_us > cut)
+            .filter(|q| q.api == api && !q.is_error() && q.total_us > deadline_us)
             .collect();
         let ttfb_bound = over.iter().filter(|q| dominant_stage(q) == "ttfb").count();
         if over.len() < 3 || ttfb_bound * 2 < over.len() {
             continue;
         }
-        let Some(pred) = simulate::tail_cut(run, api, cut) else {
-            continue;
-        };
-        let gain = pred.current - pred.predicted;
-        if pred.current <= 0.0 || gain < TAIL_CUT_MIN_GAIN * pred.current {
+        let p = &replay.prediction;
+        let gain = p.current - p.predicted;
+        if p.current <= 0.0 || gain < TAIL_CUT_MIN_GAIN * p.current {
             continue;
         }
-        if best
-            .as_ref()
-            .is_none_or(|b| gain > b.2.current - b.2.predicted)
-        {
-            best = Some((api.to_owned(), cut, pred, over));
-        }
+        found.push((
+            gain,
+            Stragglers {
+                api: api.to_owned(),
+                steady: replay,
+                deadline_us,
+                over,
+            },
+        ));
     }
-    best
+    let best = found.iter().map(|f| f.0).fold(0.0, f64::max);
+    found
+        .into_iter()
+        .filter(|f| f.0 >= STRAGGLER_TIE_RATIO * best)
+        .max_by(|a, b| {
+            a.1.over
+                .len()
+                .cmp(&b.1.over.len())
+                .then_with(|| b.1.api.cmp(&a.1.api))
+        })
+        .map(|f| f.1)
 }
 
 /// The one tail finding: p99 ≫ median, explained by the dominant stage of the slow requests.
@@ -498,7 +789,10 @@ fn tail(c: &Ctx, have: &[Finding]) -> Option<Finding> {
     for q in &slow {
         *by_stage.entry(dominant_stage(q)).or_default() += 1;
     }
-    let (stage, _) = by_stage.iter().max_by_key(|(_, n)| **n)?;
+    // Most common stage; ties broken by name, so the cause is stable.
+    let (stage, _) = by_stage
+        .iter()
+        .max_by(|a, b| a.1.cmp(b.1).then_with(|| b.0.cmp(a.0)))?;
     // A cause that already has its own finding explains the tail there.
     let owner = match *stage {
         "queue" => Some("client_queue"),
@@ -546,42 +840,121 @@ fn tail(c: &Ctx, have: &[Finding]) -> Option<Finding> {
         );
     }
     // Stragglers: requests of one API far slower than that API's own typical request, waiting
-    // for the server's first byte, where a tail-cut would take a large part off the p99. The
-    // API is the one where the replay saves the most, not the one most common among the
-    // slowest requests (slow writes on a slow machine can outnumber a few GET stragglers).
-    if let Some((api, cut, pred, over)) = straggler_candidate(run) {
+    // for the server's first byte, that the measured client's tail-cut layer would cut. The
+    // API is the one where the replay saves the most (near-ties go to the one with the most
+    // stragglers), not the one most common among the slowest requests.
+    let tail_cut_on = c.r.knobs.requested.tail_cut;
+    let setup = TailCutSetup::of(c.r);
+    if let Some(st) = setup.as_ref().and_then(|s| straggler_candidate(run, s)) {
+        let setup = setup.expect("candidate implies a setup");
+        let api = &st.api;
+        let pred = &st.steady.prediction;
         let all_api = run
             .reqs
             .iter()
-            .filter(|q| q.api == api && !q.is_error())
+            .filter(|q| q.api == *api && !q.is_error())
             .count();
-        let share = over.len() as f64 * 100.0 / all_api.max(1) as f64;
-        let mut ttfb: Vec<u64> = over.iter().map(|q| q.ttfb_us).collect();
+        let share = st.over.len() as f64 * 100.0 / all_api.max(1) as f64;
+        let mut ttfb: Vec<u64> = st.over.iter().map(|q| q.ttfb_us).collect();
         let wait = quantile_us_ms(&mut ttfb, 0.5);
-        let cause = format!(
-            "{share:.1}% of {api} requests wait ~{} for the server's first byte (stragglers); tail-cut at {} ms would cut p99 from {} to ~{}.",
-            fmt_ms(wait),
-            cut / 1000,
-            fmt_ms(pred.current),
-            fmt_ms(pred.predicted)
-        );
+        let deadline = fmt_ms(ms(st.deadline_us));
+        let window = c.r.run.window_s;
+        let blind_s = setup.blind_s(window);
+        let blind = blind_s > 0.25 * window;
         vals.push(("straggler_pct", share));
         vals.push(("straggler_ttfb_ms", wait));
-        vals.extend(pred_values(&pred));
-        vals.push(("tail_cut_threshold_ms", ms(cut)));
+        vals.extend(pred_values(pred));
+        vals.push(("tail_cut_deadline_ms", ms(st.deadline_us)));
+        if blind {
+            vals.push(("tail_cut_blind_s", blind_s));
+        }
         ev_text += &format!(
             "; {} — about {:.0} extra requests per 1 000 operations",
             pred.note, pred.requests_per_1k_ops_delta
         );
-        let verification = if c.r.knobs.requested.tail_cut {
-            None
-        } else {
-            c.verify(
+        // The layer is blind for its first 10 s: a run that short needs a longer window to
+        // show the effect, so the verification lengthens it.
+        let longer = format!(
+            "{:.0}s",
+            (window.max(10.0) + blind_s).ceil()
+                + crate::engine::stack::TAIL_CUT_BLIND_START.as_secs_f64()
+        );
+        let expectation = (pred.replayed_ops_count * 10 >= c.r.summary.ops * 9)
+            .then(|| latency_expectation("summary.latency.p99_ms", pred));
+        let (cause, advice, verification) = if tail_cut_on {
+            let live = simulate::tail_cut(run, api, &setup);
+            let cut = live.as_ref().map_or(0, |l| l.cut_count);
+            ev_text += &format!(
+                "; with tail-cut on, {} of {} stragglers started while the layer was still blind",
+                live.as_ref().map_or(0, |l| l.blind_count),
+                st.over.len()
+            );
+            let cause = if blind {
                 format!(
-                    "enable tail-cut and compare p99 (predicted ~{})",
-                    fmt_ms(pred.predicted)
-                ),
-                &[("tail_cut", "on".into())],
+                    "Tail-cut is on, yet {share:.1}% of {api} requests still wait ~{} for the first byte: the layer cuts nothing during its first 10 s, which covered {blind_s:.1} s of this {window:.1} s window.",
+                    fmt_ms(wait)
+                )
+            } else {
+                format!(
+                    "Tail-cut is on, yet {share:.1}% of {api} requests still wait ~{} for the first byte (deadline {deadline}; ~{cut} would be cut).",
+                    fmt_ms(wait)
+                )
+            };
+            let advice = if blind {
+                format!(
+                    "OpenDAL's TailCutLayer counts no latencies during its first 10 s, so a short run is never cut (a long-lived client is unaffected): measure with a longer run (`--duration {longer}`) to see its effect."
+                )
+            } else {
+                "Tail-cut is already on: check the slow requests' remotes (`oprobe analyze RUN --slowest 2 --by remote`) and the service's health.".into()
+            };
+            let verification = blind
+                .then(|| {
+                    c.verify(
+                        format!(
+                            "measure long enough for the layer to engage: p99 should fall to ~{}",
+                            fmt_ms(pred.predicted)
+                        ),
+                        &[("duration", longer.clone())],
+                    )
+                })
+                .flatten()
+                .map(|mut v| {
+                    v.expect.extend(expectation.clone());
+                    v
+                });
+            (cause, advice, verification)
+        } else {
+            let cause = format!(
+                "{share:.1}% of {api} requests wait ~{} for the server's first byte (stragglers); tail-cut (deadline {deadline}) would cut p99 from {} to ~{}.",
+                fmt_ms(wait),
+                fmt_ms(pred.current),
+                fmt_ms(pred.predicted)
+            );
+            let mut sets = vec![("tail_cut", "on".to_owned())];
+            if blind {
+                sets.push(("duration", longer.clone()));
+            }
+            let verification = c
+                .verify(
+                    format!(
+                        "enable tail-cut and compare p99 (predicted ~{}){}",
+                        fmt_ms(pred.predicted),
+                        if blind {
+                            "; the run is lengthened because the layer is blind for its first 10 s"
+                        } else {
+                            ""
+                        }
+                    ),
+                    &sets,
+                )
+                .map(|mut v| {
+                    v.expect.extend(expectation.clone());
+                    v
+                });
+            (
+                cause,
+                "Cut server stragglers with `tail_cut = true` (OpenDAL TailCutLayer re-issues requests slower than p95 × 1.5, at least 50 ms; it starts cutting 10 s after the client is built); the extra requests cost a little.".into(),
+                verification,
             )
         };
         return Some(Finding {
@@ -591,14 +964,10 @@ fn tail(c: &Ctx, have: &[Finding]) -> Option<Finding> {
             evidence: Evidence {
                 text: ev_text,
                 values: values(&vals),
-                op_ids: slowest_ops(run, over.iter().map(|q| q.op_id).filter(|id| *id != 0)),
+                op_ids: slowest_ops(run, st.over.iter().map(|q| q.op_id).filter(|id| *id != 0)),
                 windows: Vec::new(),
             },
-            advice: if c.r.knobs.requested.tail_cut {
-                "Tail-cut is already on: check the slow requests' remotes (`oprobe analyze RUN --slowest 2 --by remote`) and the service's health.".into()
-            } else {
-                "Cut server stragglers with `tail_cut = true` (OpenDAL TailCutLayer re-issues requests slower than the threshold); the extra requests cost a little.".into()
-            },
+            advice,
             verification,
         });
     }
@@ -615,9 +984,15 @@ fn tail(c: &Ctx, have: &[Finding]) -> Option<Finding> {
             op_ids: slow_ids,
             windows: Vec::new(),
         },
-        advice: format!(
-            "Look at the slowest operations (`oprobe analyze RUN --slowest 2 --by stage`); the {stage} stage is where the tail comes from."
-        ),
+        advice: if tail_cut_on && *stage == "ttfb" {
+            format!(
+                "Tail-cut is on but cuts little here: its deadline (p95 × 1.5) sits above the slow requests when they are more than ~5% of them. Look at the slowest operations (`oprobe analyze RUN --slowest 2 --by stage`); the {stage} stage is where the tail comes from."
+            )
+        } else {
+            format!(
+                "Look at the slowest operations (`oprobe analyze RUN --slowest 2 --by stage`); the {stage} stage is where the tail comes from."
+            )
+        },
         verification: None,
     })
 }
@@ -654,6 +1029,24 @@ fn client_queue(c: &Ctx) -> Option<Finding> {
         .iter()
         .filter(|o| o.breakdown.queue_us * 2 > o.latency_us)
         .map(|o| o.op_id);
+    // The cap to test: none (0) unless the uncapped peak would cross the in-flight ceiling,
+    // then the most the ceiling allows (and nothing when that is no more than now).
+    let uncap: Option<u64> = (cap > 0)
+        .then(|| match c.cap.inflight_ceiling {
+            Some(ce) => {
+                let allowed =
+                    (ce.lo * (1.0 - super::capacity::DEFAULT_HEADROOM_RATIO)).floor() as u64;
+                let uncapped =
+                    c.concurrency() as f64 * c.r.knobs.requested.io_concurrency_count.max(1) as f64;
+                if uncapped <= allowed as f64 {
+                    Some(0)
+                } else {
+                    (allowed > cap).then_some(allowed)
+                }
+            }
+            None => Some(0),
+        })
+        .flatten();
     Some(Finding {
         code: "client_queue".into(),
         severity: Severity::Warning,
@@ -664,10 +1057,25 @@ fn client_queue(c: &Ctx) -> Option<Finding> {
             op_ids: slowest_ops(c.run, ids),
             windows: Vec::new(),
         },
-        advice: "Raise `max_inflight_requests` (0 = unlimited) or lower `concurrency × io_concurrency` so requests stop queueing behind each other.".into(),
-        verification: (cap > 0)
-            .then(|| c.verify("remove the in-flight cap and compare p99", &[("max_inflight_requests", "0".into())]))
-            .flatten(),
+        advice: match uncap {
+            Some(0) | None => "Raise `max_inflight_requests` (0 = unlimited) or lower `concurrency × io_concurrency` so requests stop queueing behind each other.".into(),
+            Some(n) => format!("Raise `max_inflight_requests` to {n} (not unlimited: {}), or lower `concurrency × io_concurrency` so requests stop queueing behind each other.", c.ceiling_note()),
+        },
+        verification: uncap
+            .and_then(|n| {
+                let what = if n == 0 {
+                    "remove the in-flight cap and compare p99".to_owned()
+                } else {
+                    format!("raise the in-flight cap to {n} and compare p99")
+                };
+                c.verify(what, &[("max_inflight_requests", n.to_string())])
+                    .map(|mut v| {
+                        if let Some(p) = &pred {
+                            v.expect.push(latency_expectation("summary.latency.p99_ms", p));
+                        }
+                        v
+                    })
+            }),
     })
 }
 
@@ -933,7 +1341,23 @@ fn tcp(c: &Ctx) -> Vec<Finding> {
         .iter()
         .filter_map(|q| q.tcp.as_ref().map(|t| t.rtt_us))
         .collect();
-    let rtt_p50 = quantile_us_ms(&mut rtt, 0.5);
+    let mut rtt_p50 = quantile_us_ms(&mut rtt, 0.5);
+    // A kernel RTT inflated by the server's delay is no network round trip: use the TCP
+    // handshake's (a clean sample) instead, or say nothing.
+    if super::outliers::rtt_tracks_server(&c.run.reqs) {
+        let mut hs: Vec<u64> = c
+            .run
+            .reqs
+            .iter()
+            .filter(|q| !q.reused && q.tcp_us > 0)
+            .map(|q| q.tcp_us)
+            .collect();
+        rtt_p50 = if hs.len() >= 5 {
+            quantile_us_ms(&mut hs, 0.5)
+        } else {
+            0.0
+        };
+    }
     if rtt_p50 >= 50.0 {
         out.push(Finding {
             code: "high_rtt".into(),
@@ -951,6 +1375,60 @@ fn tcp(c: &Ctx) -> Vec<Finding> {
     out
 }
 
+/// The parallelism part of a latency-bound finding (`server_latency`, `small_objects`), from
+/// the capacity model: how many workers to try (never past the safe concurrency), what that
+/// should give, and the verification; or, at the ceiling, that more workers would throttle.
+struct ScaleAdvice {
+    text: String,
+    vals: Vec<(&'static str, f64)>,
+    advice: String,
+    verification: Option<Verification>,
+}
+
+fn scale_advice(c: &Ctx) -> ScaleAdvice {
+    match c.scale_up() {
+        Ok(to) => {
+            let pred = simulate::concurrency(c.run, to, c.cap);
+            let mut out = ScaleAdvice {
+                text: String::new(),
+                vals: Vec::new(),
+                advice: match c.safe {
+                    Some(_) => format!(
+                        "Raise `concurrency` to {to}, the most the in-flight ceiling allows ({})",
+                        c.ceiling_note()
+                    ),
+                    None => format!(
+                        "Raise `concurrency` (try {to}) until throttling or the latency SLA stops you (`oprobe tune` finds the ceiling)"
+                    ),
+                },
+                verification: None,
+            };
+            if let Some(p) = &pred {
+                out.text = pred_text(p);
+                out.vals.extend(pred_values(p));
+                out.verification = c.verify_concurrency(
+                    format!(
+                        "raise the concurrency to {to}: ~{:.0} ops/s predicted",
+                        p.predicted
+                    ),
+                    to,
+                );
+            }
+            out
+        }
+        Err(safe) => ScaleAdvice {
+            text: format!(
+                "the run already uses {} workers: {}",
+                c.concurrency(),
+                c.ceiling_note()
+            ),
+            vals: vec![("safe_concurrency_count", f64::from(safe))],
+            advice: "Do not add workers: the service throttles beyond the current parallelism. Cut round trips instead".into(),
+            verification: None,
+        },
+    }
+}
+
 fn small_objects(c: &Ctx) -> Option<Finding> {
     let reqs = &c.run.reqs;
     if !c.network || c.throttled || reqs.len() < 100 {
@@ -964,34 +1442,34 @@ fn small_objects(c: &Ctx) -> Option<Finding> {
     if mean_bytes >= 128 * 1024 || share < 60.0 {
         return None;
     }
-    let cc = c.r.knobs.requested.concurrency_count;
-    let pred = simulate::concurrency(c.run, cc * 2, None);
+    let scale = scale_advice(c);
     let mut text = format!(
         "mean {} per request; {share:.0}% of request time waiting for the server's answer",
         fmt_bytes(mean_bytes)
     );
+    if !scale.text.is_empty() {
+        text += &format!("; {}", scale.text);
+    }
     let mut vals = vec![
         ("mean_request_bytes", mean_bytes as f64),
         ("ttfb_pct", share),
     ];
-    if let Some(p) = &pred {
-        text += &format!("; {}", pred_text(p));
-        vals.extend(pred_values(p));
-    }
+    vals.extend(scale.vals);
     Some(Finding {
         code: "small_objects".into(),
         severity: Severity::Info,
-        cause: "Requests are small: throughput is bound by request round trips, not bandwidth.".into(),
+        cause: "Requests are small: throughput is bound by request round trips, not bandwidth."
+            .into(),
         evidence: Evidence {
             text,
             values: values(&vals),
             ..Default::default()
         },
-        advice: "Raise parallelism (`concurrency`) until throttling or the latency SLA stops you, batch or pack small objects, and coalesce neighbouring ranges (`range_gap`).".into(),
-        verification: pred
-            .is_some()
-            .then(|| c.verify(format!("double the concurrency to {}", cc * 2), &[("concurrency", (cc * 2).to_string())]))
-            .flatten(),
+        advice: format!(
+            "{}; batch or pack small objects, and coalesce neighbouring ranges (`range_gap`).",
+            scale.advice
+        ),
+        verification: scale.verification,
     })
 }
 
@@ -1151,16 +1629,33 @@ fn carry(c: &Ctx, f: &diagnosis::Finding) -> Finding {
         out.cause.push('.');
     }
     match code.as_str() {
-        "server_latency" if !c.throttled => {
-            let cc = c.r.knobs.requested.concurrency_count;
-            if let Some(p) = simulate::concurrency(c.run, cc * 2, None) {
-                out.evidence.text += &format!("; {}", pred_text(&p));
-                out.evidence.values = values(&pred_values(&p));
-                out.verification = c.verify(
-                    format!("double the concurrency to {}", cc * 2),
-                    &[("concurrency", (cc * 2).to_string())],
-                );
+        "server_latency" if c.throttled && c.safe.is_none() => {
+            out.advice = "Latency-bound, but the service throttles this load: do not add workers; coalesce small ranges (`range_gap`) and run close to the bucket's region.".into();
+        }
+        "server_latency" => {
+            let scale = scale_advice(c);
+            if !scale.text.is_empty() {
+                out.evidence.text += &format!("; {}", scale.text);
             }
+            out.evidence.values = values(&scale.vals);
+            out.advice = format!(
+                "{}; coalesce small ranges (`range_gap`), and run close to the bucket's region.",
+                scale.advice
+            );
+            out.verification = scale.verification;
+        }
+        "download_bound" | "upload_bound" if c.safe.is_some() => {
+            out.advice = format!(
+                "{} Stay within the in-flight ceiling: {}.",
+                out.advice,
+                c.ceiling_note()
+            );
+        }
+        "rate_not_sustained" if c.scale_up().is_err() => {
+            out.advice = format!(
+                "Lower the target rate: more in-flight slots would cross the service's ceiling ({}). Queued arrivals still ran: their wait is included in the latency percentiles.",
+                c.ceiling_note()
+            );
         }
         "overread" => {
             out.evidence.values = values(&[("overread_ratio", c.r.bytes.overread_ratio)]);
@@ -1210,6 +1705,8 @@ pub fn derive(run: &Run, legacy: &[diagnosis::Finding]) -> Vec<Finding> {
         r,
         network: r.target.scheme != "memory" && r.target.scheme != "fs",
         throttled: r.resilience.throttled_responses > 0,
+        cap: &r.capacity,
+        safe: r.capacity.max_advisable_concurrency(),
     };
     let mut out: Vec<Finding> = Vec::new();
     let push = |f: Option<Finding>, out: &mut Vec<Finding>| {
@@ -1285,7 +1782,135 @@ pub fn derive(run: &Run, legacy: &[diagnosis::Finding]) -> Vec<Finding> {
             ]);
         }
     }
-    out
+    let (kept, _) = validity(r, out);
+    kept
+}
+
+/// Why a run cannot be judged on performance (design v4 §4): it is invalid (no operation
+/// completed, or more failed than the SLA allows), or it is partial (interrupted, stopped by a
+/// budget or an error) and too short to judge, or its window is shorter than its warmup.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Validity {
+    pub invalid: Option<String>,
+    pub partial: Option<String>,
+    /// Performance findings are suppressed.
+    pub suppress: bool,
+}
+
+/// The run's [`Validity`].
+pub fn run_validity(r: &Report) -> Validity {
+    let s = &r.summary;
+    let window = r.run.window_s;
+    let invalid = if s.ops == 0 {
+        Some("no operation completed in the measurement window".to_owned())
+    } else if s.error_rate > r.sla.max_error_ratio {
+        Some(format!(
+            "{:.1}% of operations failed (the SLA allows {}%), so latency and throughput describe failures",
+            s.error_rate * 100.0,
+            r.sla.max_error_ratio * 100.0
+        ))
+    } else if r.workload.warmup_s > 0.0 && window < r.workload.warmup_s {
+        Some(format!(
+            "the measurement window ({window:.1} s) is shorter than the warmup ({:.1} s)",
+            r.workload.warmup_s
+        ))
+    } else {
+        None
+    };
+    let partial = r.run.partial.as_ref().map(|p| {
+        format!(
+            "the run was {} after {:.1} s of measurement",
+            p.reason.describe(),
+            p.measured_s
+        )
+    });
+    // A budget stop with a usable window still describes the workload; an interrupted or
+    // failed run, or any window under a second (or under the warmup), does not.
+    let too_short = window < r.workload.warmup_s.max(1.0);
+    let suppress = invalid.is_some()
+        || r.run
+            .partial
+            .as_ref()
+            .is_some_and(|p| p.reason != crate::model::PartialReason::Budget || too_short);
+    Validity {
+        invalid,
+        partial,
+        suppress,
+    }
+}
+
+/// Apply the run's [`Validity`] to `findings`: performance findings are dropped when the run
+/// cannot be judged, and `run_invalid` / `run_partial` say why. Idempotent. Returns the kept
+/// findings (most severe first) and the validity.
+pub fn validity(r: &Report, findings: Vec<Finding>) -> (Vec<Finding>, Validity) {
+    let v = run_validity(r);
+    let mut out: Vec<Finding> = findings
+        .into_iter()
+        .filter(|f| !matches!(f.code.as_str(), "run_invalid" | "run_partial"))
+        .filter(|f| !v.suppress || VALID_ON_BROKEN_RUNS.contains(&f.code.as_str()))
+        .collect();
+    let suppressed = if v.suppress {
+        " Performance findings (latency, scaling, tail, cache, cost) are suppressed."
+    } else {
+        ""
+    };
+    if let Some(why) = &v.invalid {
+        out.push(Finding {
+            code: "run_invalid".into(),
+            severity: Severity::Warning,
+            cause: format!("The run cannot be judged on performance: {why}."),
+            evidence: Evidence {
+                text: format!(
+                    "{} operations, {} failed ({:.2}%), {:.1} s measured after a {:.1} s warmup",
+                    r.summary.ops,
+                    r.summary.failed_ops,
+                    r.summary.error_rate * 100.0,
+                    r.run.window_s,
+                    r.workload.warmup_s
+                ),
+                values: values(&[
+                    ("error_ratio", r.summary.error_rate),
+                    ("window_s", r.run.window_s),
+                ]),
+                ..Default::default()
+            },
+            advice: format!(
+                "Fix the failures (see the errors finding) or lengthen the run, then measure again.{suppressed}"
+            ),
+            verification: None,
+        });
+    }
+    if let (Some(why), Some(p)) = (&v.partial, &r.run.partial) {
+        out.push(Finding {
+            code: "run_partial".into(),
+            severity: if v.suppress {
+                Severity::Warning
+            } else {
+                Severity::Info
+            },
+            cause: format!("Partial run: {why}."),
+            evidence: Evidence {
+                text: format!(
+                    "{:.1} s of {:.1} s measured; {} operations",
+                    p.measured_s,
+                    r.workload.duration_s,
+                    r.summary.ops
+                ),
+                values: values(&[
+                    ("measured_s", p.measured_s),
+                    ("configured_s", r.workload.duration_s),
+                ]),
+                ..Default::default()
+            },
+            advice: format!(
+                "Re-run the full workload (`oprobe run --from {}`); a partial run is not accepted as a baseline.{suppressed}",
+                r.run.id
+            ),
+            verification: None,
+        });
+    }
+    out.sort_by_key(|f| std::cmp::Reverse(f.severity));
+    (out, v)
 }
 
 #[cfg(test)]
@@ -1354,11 +1979,11 @@ pub(crate) mod tests {
         let t = tails[0];
         assert_eq!(t.code, "tail_stragglers");
         assert!(
-            t.cause.contains("GetObject") && t.cause.contains("tail-cut at"),
+            t.cause.contains("GetObject") && t.cause.contains("tail-cut (deadline"),
             "{}",
             t.cause
         );
-        assert!(t.evidence.values["predicted_p99_ms"] < 100.0, "{t:#?}");
+        assert!(t.evidence.values["predicted_p99_ms"] < 200.0, "{t:#?}");
         assert!(!t.evidence.op_ids.is_empty());
         let v = t.verification.as_ref().unwrap();
         assert!(v.replay.contains("--tail-cut"), "{v:?}");
@@ -1372,6 +1997,7 @@ pub(crate) mod tests {
         let mut run = straggler_run();
         run.report.resilience.throttled_responses = 100;
         run.report.connections.requests = 1000;
+        run.report.summary.throttled_request_ratio = 0.1;
         run.report.knobs.requested.concurrency_count = 32;
         run.report.bytes.request_amplification = 1.0;
         for (i, q) in run.reqs.iter_mut().enumerate() {
@@ -1379,20 +2005,248 @@ pub(crate) mod tests {
                 q.status = 503;
             }
         }
+        // The capacity model knows the ceiling: 24 requests in flight, 1 per operation.
+        run.report.capacity = capacity_24();
         let f = derive(&run, &[]);
         let t = f.iter().find(|x| x.code == "throttling").unwrap();
         assert_eq!(f[0].code, "throttling");
-        assert!(
-            t.evidence.values.contains_key("ceiling_requests_per_s"),
-            "{t:#?}"
-        );
+        assert_eq!(t.evidence.values["ceiling_lo_inflight_count"], 24.0);
+        assert_eq!(t.evidence.values["safe_concurrency_count"], 20.0);
+        assert_eq!(t.evidence.values["throttled_request_ratio"], 0.1);
+        assert!(!t.evidence.values.contains_key("throttle_ratio"));
         assert!(!t.evidence.windows.is_empty());
+        assert!(t.advice.contains("concurrency ≤ 20"), "{}", t.advice);
         let v = t.verification.as_ref().unwrap();
-        assert_ne!(v.overrides.knobs["concurrency"], "32", "{v:?}");
+        assert_eq!(v.overrides.knobs["concurrency"], "20", "{v:?}");
+        let thr = v
+            .expect
+            .iter()
+            .find(|e| e.metric == "summary.throttled_request_ratio")
+            .expect("throttle expectation");
+        assert_eq!(thr.direction, Direction::AtMost);
+        assert!(thr.hi <= THROTTLE_BUDGET_RATIO);
+        let ops = v
+            .expect
+            .iter()
+            .find(|e| e.metric == "summary.ops_per_s")
+            .expect("goodput expectation");
+        assert!(ops.lo < ops.predicted && ops.predicted < ops.hi, "{ops:?}");
         // Throttling explains the run: no separate tail item about retries.
         assert!(f.iter().all(|x| x.code != "retries"));
+
+        // Throttling that does not follow concurrency: pace the request rate instead.
+        run.report.capacity.inflight_ceiling = None;
+        run.report.capacity.rate_ceiling_requests_per_s = Some(1000.0);
+        let f = derive(&run, &[]);
+        let t = f.iter().find(|x| x.code == "throttling").unwrap();
+        let v = t.verification.as_ref().unwrap();
+        assert_eq!(v.overrides.workload["rate"], "850", "{v:?}");
+        // Nothing known: halve.
+        run.report.capacity = Default::default();
+        let f = derive(&run, &[]);
+        let t = f.iter().find(|x| x.code == "throttling").unwrap();
+        let v = t.verification.as_ref().unwrap();
+        assert_eq!(v.overrides.knobs["concurrency"], "16", "{v:?}");
     }
 
+    /// A capacity estimate with a ceiling of 24 requests in flight, one per operation, from a
+    /// run of 20 workers at 2 000 ops/s.
+    pub(crate) fn capacity_24() -> Capacity {
+        let mut c = Capacity {
+            inflight_ceiling: Some(super::super::capacity::Ceiling {
+                requests: 24.0,
+                lo: 24.0,
+                hi: 26.0,
+            }),
+            ..Default::default()
+        };
+        c.per_op.peak_inflight_per_op = 1.0;
+        c.per_op.mean_inflight_per_op = 1.0;
+        c.per_op.requests_per_op = 1.0;
+        c.observed.ops_per_s = 2000.0;
+        c.observed.ops_inflight_mean = 20.0;
+        c.observed.peak_inflight_count = 20;
+        c.confidence = super::super::capacity::Confidence::High;
+        c
+    }
+
+    #[test]
+    fn latency_findings_never_suggest_more_workers_than_the_ceiling_allows() {
+        let mut run = straggler_run();
+        run.report.target.scheme = "s3".into();
+        run.report.summary.ops_per_s = 2000.0;
+        for q in &mut run.reqs {
+            q.total_us = 9_000;
+            q.ttfb_us = 8_990;
+        }
+        let legacy = vec![diagnosis::Finding {
+            severity: Severity::Info,
+            code: "server_latency".into(),
+            title: "Latency-bound on server time-to-first-byte".into(),
+            evidence: "mean TTFB 9 ms".into(),
+            action: "raise concurrency".into(),
+        }];
+        // No ceiling known: double (a hypothesis verify will test).
+        run.report.knobs.requested.concurrency_count = 12;
+        run.report.capacity = capacity_24();
+        run.report.capacity.inflight_ceiling = None;
+        let f = derive(&run, &legacy);
+        let s = f.iter().find(|x| x.code == "server_latency").unwrap();
+        assert_eq!(
+            s.verification.as_ref().unwrap().overrides.knobs["concurrency"],
+            "24"
+        );
+        // A ceiling of 24 in flight: at most 20 workers.
+        run.report.capacity = capacity_24();
+        let f = derive(&run, &legacy);
+        let s = f.iter().find(|x| x.code == "server_latency").unwrap();
+        let v = s.verification.as_ref().unwrap();
+        assert_eq!(v.overrides.knobs["concurrency"], "20", "{s:#?}");
+        assert!(s.advice.contains("at most 20 workers"), "{}", s.advice);
+        assert!(v.expect.iter().any(|e| e.metric == "summary.ops_per_s"));
+        // Already at the safe concurrency: no more workers, and no verification.
+        run.report.knobs.requested.concurrency_count = 20;
+        let f = derive(&run, &legacy);
+        let s = f.iter().find(|x| x.code == "server_latency").unwrap();
+        assert!(s.verification.is_none(), "{s:#?}");
+        assert!(s.advice.starts_with("Do not add workers"), "{}", s.advice);
+        for f in &f {
+            if let Some(v) = &f.verification
+                && let Some(c) = v.overrides.knobs.get("concurrency")
+            {
+                assert!(c.parse::<u64>().unwrap() <= 20, "{f:#?}");
+            }
+        }
+    }
+
+    #[test]
+    fn broken_runs_get_no_performance_findings() {
+        let mut run = straggler_run();
+        run.report.run.id = "20261121-101010-abcd".into();
+        run.report.run.window_s = 5.0;
+        run.report.workload.duration_s = 10.0;
+        let legacy = vec![diagnosis::Finding {
+            severity: Severity::Warning,
+            code: "tail_latency".into(),
+            title: "p99 is 80x".into(),
+            evidence: String::new(),
+            action: String::new(),
+        }];
+        assert!(
+            derive(&run, &legacy)
+                .iter()
+                .any(|f| f.code.starts_with("tail"))
+        );
+        // Interrupted: only the run_partial finding explains why nothing else is said.
+        run.report.run.partial = Some(crate::model::PartialInfo {
+            reason: crate::model::PartialReason::Interrupted,
+            measured_s: 0.5,
+        });
+        let f = derive(&run, &legacy);
+        let codes: Vec<&str> = f.iter().map(|x| x.code.as_str()).collect();
+        assert_eq!(codes, ["run_partial"], "{f:#?}");
+        assert!(f[0].advice.contains("--from 20261121-101010-abcd"));
+        // A budget stop with a usable window keeps its findings (and says it is partial).
+        run.report.run.partial = Some(crate::model::PartialInfo {
+            reason: crate::model::PartialReason::Budget,
+            measured_s: 5.0,
+        });
+        let f = derive(&run, &legacy);
+        assert!(f.iter().any(|x| x.code.starts_with("tail")), "{f:#?}");
+        assert!(
+            f.iter()
+                .any(|x| x.code == "run_partial" && x.severity == Severity::Info)
+        );
+        // Every op failed: errors stay, performance goes, run_invalid says why.
+        run.report.run.partial = None;
+        run.report.summary.failed_ops = 1000;
+        run.report.summary.error_rate = 1.0;
+        run.report.sla.max_error_ratio = 0.01;
+        run.report
+            .resilience
+            .error_classes
+            .insert("unexpected".into(), 1000);
+        run.report.knobs.requested.http_version = crate::net::HttpVersion::H2;
+        for o in &mut run.ops {
+            o.ok = false;
+        }
+        let f = derive(&run, &legacy);
+        let codes: Vec<&str> = f.iter().map(|x| x.code.as_str()).collect();
+        assert!(
+            codes.contains(&"errors") && codes.contains(&"run_invalid"),
+            "{codes:?}"
+        );
+        assert!(!codes.iter().any(|c| c.starts_with("tail")), "{codes:?}");
+        // AN-6: forced HTTP/2 with unclassified failures → test HTTP/1.1.
+        let e = f.iter().find(|x| x.code == "errors").unwrap();
+        assert!(e.advice.contains("HTTP/2"), "{}", e.advice);
+        assert_eq!(
+            e.verification.as_ref().unwrap().overrides.knobs["http_version"],
+            "h1"
+        );
+        // Idempotent: validity applied twice changes nothing.
+        let (again, v) = validity(&run.report, f.clone());
+        assert_eq!(again, f);
+        assert!(v.suppress && v.invalid.is_some());
+    }
+
+    #[test]
+    fn error_advice_follows_the_error_class() {
+        let mut run = straggler_run();
+        run.report.summary.failed_ops = 23;
+        run.report.summary.ops = 1000;
+        run.report.summary.error_rate = 0.023;
+        run.report.sla.max_error_ratio = 0.5;
+        run.report.resilience.throttled_responses = 200;
+        run.report.connections.requests = 1000;
+        // AN-9: failures that ran out of retries on 429/503 are throttling, not credentials.
+        run.report
+            .resilience
+            .error_classes
+            .insert("rate_limited".into(), 23);
+        let f = derive(&run, &[]);
+        assert!(f.iter().all(|x| x.code != "errors"), "{f:#?}");
+        let t = f.iter().find(|x| x.code == "throttling").unwrap();
+        assert!(t.evidence.text.contains("23 operations failed"), "{t:#?}");
+        assert!(f.iter().all(|x| !x.advice.contains("doctor")), "{f:#?}");
+        // Credentials advice only for auth classes.
+        run.report
+            .resilience
+            .error_classes
+            .insert("permission_denied".into(), 5);
+        let f = derive(&run, &[]);
+        let e = f.iter().find(|x| x.code == "errors").unwrap();
+        assert!(e.advice.contains("oprobe doctor"), "{}", e.advice);
+        assert!(e.evidence.text.contains("permission_denied ×5"), "{e:#?}");
+        run.report.resilience.error_classes.clear();
+        run.report
+            .resilience
+            .error_classes
+            .insert("timeout".into(), 23);
+        let f = derive(&run, &[]);
+        let e = f.iter().find(|x| x.code == "errors").unwrap();
+        assert!(
+            !e.advice.contains("doctor") && e.advice.contains("--timeout"),
+            "{}",
+            e.advice
+        );
+    }
+
+    #[test]
+    fn evidence_counts_are_whole_numbers() {
+        let mut run = straggler_run();
+        run.report.capacity = capacity_24();
+        run.report.resilience.throttled_responses = 100;
+        run.report.connections.requests = 1000;
+        run.report.knobs.requested.concurrency_count = 32;
+        for f in derive(&run, &[]) {
+            for (k, v) in &f.evidence.values {
+                if k.ends_with("_count") {
+                    assert_eq!(v.fract(), 0.0, "{}: {k} = {v}", f.code);
+                }
+            }
+        }
+    }
     #[test]
     fn cold_connections_and_remote_skew_from_rows() {
         let mut run = straggler_run();
@@ -1568,8 +2422,8 @@ pub(crate) mod tests {
             .expect("stragglers");
         assert!(t.cause.starts_with("4.0% of GetObject"), "{}", t.cause);
         let v = &t.evidence.values;
-        assert!(v["tail_cut_threshold_ms"] < 300.0, "{v:?}");
-        assert!(v["predicted_p99_ms"] < v["current_p99_ms"] / 3.0, "{v:?}");
+        assert!(v["tail_cut_deadline_ms"] < 300.0, "{v:?}");
+        assert!(v["predicted_p99_ms"] < v["current_p99_ms"] / 2.0, "{v:?}");
 
         // No stragglers anywhere: the rule says nothing rather than something empty.
         for q in run.reqs.iter_mut().filter(|q| q.api == "GetObject") {

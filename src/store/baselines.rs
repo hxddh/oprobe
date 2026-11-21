@@ -46,6 +46,23 @@ impl Baseline {
     }
 }
 
+/// Refuse a run that cannot be a baseline (design v4 §4): a partial run (interrupted, stopped
+/// by a budget or an error) or an invalid one would make every later comparison wrong.
+pub fn check_baseline_run(report: &crate::model::Report) -> Result<()> {
+    match report.baseline_refusal() {
+        None => Ok(()),
+        Some(why) => Err(OprobeError::new(
+            ErrorCode::UsageInvalidArgument,
+            format!("{why}: it cannot be a baseline"),
+        )
+        .with_hint(format!(
+            "re-run the full workload (`oprobe run --from {}`) and use that run",
+            report.run.id
+        ))
+        .into()),
+    }
+}
+
 /// `baselines.toml`.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -82,6 +99,14 @@ impl Baselines {
     /// Add `id` to baseline `name` (created with the default window when missing).
     pub fn add_run(&mut self, name: &str, id: &str) {
         self.baselines.entry(name.to_owned()).or_default().push(id);
+    }
+
+    /// Add the run of `report` to baseline `name`, unless it cannot be a baseline
+    /// ([`check_baseline_run`]).
+    pub fn add_report(&mut self, name: &str, report: &crate::model::Report) -> Result<()> {
+        check_baseline_run(report)?;
+        self.add_run(name, &report.run.id);
+        Ok(())
     }
 
     pub fn remove(&mut self, name: &str) -> Option<Baseline> {
@@ -293,5 +318,29 @@ mod tests {
                 .contains("[baselines.main]")
         );
         assert_eq!(back.referenced().len(), 2);
+    }
+
+    #[test]
+    fn partial_and_invalid_runs_are_refused() {
+        let mut r: crate::model::Report =
+            serde_json::from_value(crate::analysis::findings::tests::empty_report_json()).unwrap();
+        r.run.id = "20261121-101010-abcd".into();
+        let mut b = Baselines::default();
+        b.add_report("main", &r).unwrap();
+        assert_eq!(b.get("main").unwrap().runs, ["20261121-101010-abcd"]);
+        r.run.partial = Some(crate::model::PartialInfo {
+            reason: crate::model::PartialReason::Budget,
+            measured_s: 0.5,
+        });
+        let e = b.add_report("other", &r).unwrap_err();
+        assert!(e.to_string().contains("partial"), "{e}");
+        assert!(b.get("other").is_none());
+        r.run.partial = None;
+        r.findings.push(crate::model::Finding {
+            code: "run_invalid".into(),
+            cause: "The run cannot be judged on performance.".into(),
+            ..Default::default()
+        });
+        assert!(check_baseline_run(&r).is_err());
     }
 }

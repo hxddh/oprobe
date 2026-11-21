@@ -277,19 +277,31 @@ pub async fn measure(req: Request) -> Result<Measured> {
             if session.guard().is_some_and(|g| g.tripped()) {
                 snap.interrupted = true;
             }
-            let run = crate::model::build_run(crate::model::ReportInput {
-                run_id: &rails.run_id,
-                target_name,
-                profile: &session.profile,
-                knobs: &knobs,
-                snapshot: snap,
-                trace: session.take_trace().unwrap_or_default(),
-                cleanup,
-                warnings: session.warnings.clone(),
-                started_at,
-                ended_at: SystemTime::now(),
-                spec: Some(spec),
+            // The ceiling remembered for this target and workload (design v4 §3).
+            let history = store.as_ref().and_then(|s| {
+                let dir = s.dir().parent()?;
+                crate::analysis::capacity::load(
+                    &dir.join("capacity.toml"),
+                    &spec.target_id()?,
+                    &crate::analysis::capacity::history_key(&spec),
+                )
             });
+            let run = crate::model::build::build_run_with(
+                crate::model::ReportInput {
+                    run_id: &rails.run_id,
+                    target_name,
+                    profile: &session.profile,
+                    knobs: &knobs,
+                    snapshot: snap,
+                    trace: session.take_trace().unwrap_or_default(),
+                    cleanup,
+                    warnings: session.warnings.clone(),
+                    started_at,
+                    ended_at: SystemTime::now(),
+                    spec: Some(spec),
+                },
+                history,
+            );
             (run, None)
         }
         Mode::Tune { opts, on_event } => {
@@ -346,9 +358,9 @@ pub async fn measure(req: Request) -> Result<Measured> {
     let breach = session.guard().and_then(|g| g.breach());
     if breach.is_some() {
         run.report.verdict.exit_code = exit::BUDGET;
-    }
-    if cancel.is_cancelled() {
-        run.report.run.interrupted = true;
+        crate::model::build::mark_partial(&mut run, crate::model::PartialReason::Budget);
+    } else if cancel.is_cancelled() && run.report.run.partial.is_none() {
+        crate::model::build::mark_partial(&mut run, crate::model::PartialReason::Interrupted);
     }
     if let Some(f) = finalize {
         f(&mut run);
@@ -368,7 +380,7 @@ pub async fn measure(req: Request) -> Result<Measured> {
         let _ = crate::analysis::capacity::save(
             &dir.join("capacity.toml"),
             &id,
-            &run.report.spec.workload_hash(),
+            &crate::analysis::capacity::history_key(&run.report.spec),
             &run.report.capacity,
             Some(run.id()),
         );

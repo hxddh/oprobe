@@ -85,7 +85,7 @@ pub struct VerbStats {
     pub mib_per_s: f64,
     pub latency: Quantiles,
     pub breakdown: OpBreakdown,
-    #[serde(rename = "mean_requests_count")]
+    #[serde(rename = "requests_per_op_mean")]
     pub requests_per_op: f64,
     #[serde(rename = "mean_bytes")]
     pub bytes_per_op: f64,
@@ -297,11 +297,21 @@ pub struct OpenLoopStats {
 pub struct Summary {
     #[serde(rename = "ops_count")]
     pub ops: u64,
+    /// Successful operations per second (goodput; failed operations are not throughput).
     pub ops_per_s: f64,
+    /// Operations per second, failed ones included.
+    #[serde(default)]
+    pub attempted_ops_per_s: f64,
     #[serde(rename = "failed_ops_count")]
     pub failed_ops: u64,
     #[serde(rename = "error_ratio")]
     pub error_rate: f64,
+    /// Throttled responses (429/503) / requests: what the SLA's throttle limit checks.
+    #[serde(default)]
+    pub throttled_request_ratio: f64,
+    /// Operations with at least one throttled response / operations.
+    #[serde(default)]
+    pub throttled_op_ratio: f64,
     pub mib_per_s: f64,
     pub read_mib_per_s: f64,
     pub write_mib_per_s: f64,

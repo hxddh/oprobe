@@ -139,7 +139,10 @@ fn stragglers_are_found_explained_and_attributed() {
         .find(|f| f["code"] == "tail_stragglers")
         .unwrap_or_else(|| panic!("no straggler finding: {findings:#?}"));
     assert!(
-        tail["cause"].as_str().unwrap().contains("tail-cut at"),
+        tail["cause"]
+            .as_str()
+            .unwrap()
+            .contains("tail-cut (deadline"),
         "{tail}"
     );
     let vals = &tail["evidence"]["values"];
@@ -154,11 +157,11 @@ fn stragglers_are_found_explained_and_attributed() {
         "{tail}"
     );
     assert!(
-        vals["tail_cut_threshold_ms"].as_f64().unwrap() < 300.0,
+        vals["tail_cut_deadline_ms"].as_f64().unwrap() < 300.0,
         "{tail}"
     );
     assert!(current >= 250.0, "{tail}");
-    assert!(predicted < current / 3.0, "{tail}");
+    assert!(predicted < current / 2.0, "{tail}");
     assert!(!tail["evidence"]["op_ids"].as_array().unwrap().is_empty());
     let ver = &tail["verification"];
     let run_id = v["run_id"].as_str().unwrap();
