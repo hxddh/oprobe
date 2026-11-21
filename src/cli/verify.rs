@@ -183,8 +183,7 @@ pub(super) struct Hypothesis {
 /// How to replay and what to learn.
 pub(super) struct VerifyCfg<'a> {
     pub repeat: usize,
-    pub safety: &'a SafetyArgs,
-    pub no_save: bool,
+    pub replayer: &'a Replayer<'a>,
     pub calibrate: bool,
     /// The throttle budget the default throttling expectation uses.
     pub max_throttle_ratio: f64,
@@ -248,13 +247,72 @@ pub(super) fn parse_run(args: &[String]) -> Result<RunArgs> {
     }
 }
 
-/// Replay `run_id` with `o` applied and return the measured run.
-pub(super) async fn replay(ctx: &Ctx, args: &[String]) -> Result<Run> {
-    let ra = parse_run(args)?;
-    let (profile, name) = super::run_profile(ctx, &ra)?;
-    match super::run::measure(ctx, profile, name, &ra.safety, &ra.output).await? {
-        super::run::Measured::Run(o) => o.full.map(|r| *r).context("the replay kept no run"),
-        super::run::Measured::Plan(_) => unreachable!("replays are never dry runs"),
+/// Replays of one run (`run --from RUN --set …`, in process): the run's resolved profile and
+/// one guard for the whole command, so `--max-requests`, `--max-bytes`, `--max-cost-usd` and
+/// `--max-duration` cap every replay together (as with `run --repeat`).
+pub(super) struct Replayer<'a> {
+    /// The profile the run measured, its target resolved (credentials included).
+    pub base: crate::config::Profile,
+    pub target_name: Option<String>,
+    pub safety: &'a SafetyArgs,
+    pub no_save: bool,
+    /// The command's guard (none without budgets).
+    pub guard: Option<std::sync::Arc<crate::guard::Guard>>,
+}
+
+impl<'a> Replayer<'a> {
+    /// Replays of a stored run: its spec, the target resolved again (as `run --from RUN`).
+    pub fn of_run(ctx: &Ctx, run: &Run, safety: &'a SafetyArgs, no_save: bool) -> Result<Self> {
+        let (base, target_name) =
+            super::spec_profile(ctx, run.report.spec.clone(), &RunArgs::default())?;
+        Self::new(ctx, base, target_name, safety, no_save)
+    }
+
+    /// Replays of `base` (a profile in memory, e.g. the diagnosis of `fix --no-save`) under a
+    /// new command guard.
+    pub fn new(
+        ctx: &Ctx,
+        base: crate::config::Profile,
+        target_name: Option<String>,
+        safety: &'a SafetyArgs,
+        no_save: bool,
+    ) -> Result<Self> {
+        let guard = super::run::guard_for(ctx, &base, &super::run::budgets(ctx, safety)?);
+        Ok(Self {
+            base,
+            target_name,
+            safety,
+            no_save,
+            guard,
+        })
+    }
+
+    /// Replay with `o` applied, labelled `label`, and return the measured run.
+    pub async fn replay(&self, ctx: &Ctx, o: &Overrides, label: &str) -> Result<Run> {
+        let mut p = self.base.clone();
+        let mut name = Some(label.to_owned());
+        o.apply(&mut p, &mut name)?;
+        p.name = name;
+        p.validate()?;
+        let output = OutputArgs {
+            no_save: self.no_save,
+            ..OutputArgs::default()
+        };
+        let mut safety = self.safety.clone();
+        safety.dry_run = false;
+        match super::run::measure_guarded(
+            ctx,
+            p,
+            self.target_name.clone(),
+            &safety,
+            &output,
+            self.guard.clone(),
+        )
+        .await?
+        {
+            super::run::Measured::Run(o) => o.full.map(|r| *r).context("the replay kept no run"),
+            super::run::Measured::Plan(_) => unreachable!("replays are never dry runs"),
+        }
     }
 }
 
@@ -549,17 +607,9 @@ pub(super) async fn verify_hypotheses(
             cfg.repeat
         )));
         a_runs.push(
-            replay(
-                ctx,
-                &replay_args(
-                    &id,
-                    &Overrides::new(),
-                    &format!("verify-{id}-baseline"),
-                    cfg.safety,
-                    cfg.no_save,
-                ),
-            )
-            .await?,
+            cfg.replayer
+                .replay(ctx, &Overrides::new(), &format!("verify-{id}-baseline"))
+                .await?,
         );
         for (h, out) in hyps.iter().zip(b_runs.iter_mut()) {
             n += 1;
@@ -569,17 +619,9 @@ pub(super) async fn verify_hypotheses(
                 h.overrides.summary()
             )));
             out.push(
-                replay(
-                    ctx,
-                    &replay_args(
-                        &id,
-                        &h.overrides,
-                        &format!("verify-{id}-{}", h.code),
-                        cfg.safety,
-                        cfg.no_save,
-                    ),
-                )
-                .await?,
+                cfg.replayer
+                    .replay(ctx, &h.overrides, &format!("verify-{id}-{}", h.code))
+                    .await?,
             );
         }
     }
@@ -809,14 +851,14 @@ pub async fn cmd_verify(a: VerifyArgs, ctx: &Ctx) -> Result<u8> {
             .collect::<Vec<_>>()
             .join(", ")
     ));
+    let replayer = Replayer::of_run(ctx, &run, &a.safety, a.no_save)?;
     let res = verify_hypotheses(
         ctx,
         &run,
         hyps,
         VerifyCfg {
             repeat: a.repeat,
-            safety: &a.safety,
-            no_save: a.no_save,
+            replayer: &replayer,
             calibrate: !a.no_calibrate,
             max_throttle_ratio: budget,
         },

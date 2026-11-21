@@ -307,6 +307,25 @@ pub(super) async fn measure(
     safety: &SafetyArgs,
     output: &OutputArgs,
 ) -> Result<Measured> {
+    let guard = if safety.dry_run {
+        None
+    } else {
+        guard_for(ctx, &profile, &budgets(ctx, safety)?)
+    };
+    measure_guarded(ctx, profile, target_name, safety, output, guard).await
+}
+
+/// [`measure`] under the command's guard: every measurement of a command that measures
+/// several times (`verify`, `fix`, `baseline calibrate`) passes the same guard, so the budgets
+/// cover the whole command; once it has tripped, the next measurement refuses at once.
+pub(super) async fn measure_guarded(
+    ctx: &Ctx,
+    profile: Profile,
+    target_name: Option<String>,
+    safety: &SafetyArgs,
+    output: &OutputArgs,
+    guard: Option<Arc<Guard>>,
+) -> Result<Measured> {
     let rails = rails(ctx, &profile, safety)?;
     if safety.dry_run {
         let plan = rails.plan(&profile);
@@ -315,7 +334,6 @@ pub(super) async fn measure(
     for w in crate::guard::workload_warnings(&profile) {
         ctx.out.warn(w);
     }
-    let guard = guard_for(ctx, &profile, &rails.budgets);
     let cancel = Cancel::new();
     install_ctrl_c(cancel.clone());
     if ctx.out.format == OutputFormat::Text {

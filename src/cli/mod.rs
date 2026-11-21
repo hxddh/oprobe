@@ -1015,9 +1015,18 @@ pub fn run_profile(ctx: &Ctx, a: &RunArgs) -> Result<(Profile, Option<String>)> 
 
 /// `run --from RUNREF`: the stored spec, the target re-resolved, the flags on top.
 fn replay_profile(ctx: &Ctx, r: &str, a: &RunArgs) -> Result<(Profile, Option<String>)> {
-    use crate::model::spec::REDACTED;
     let run = ctx.store().load(r)?;
-    let spec = run.report.spec;
+    spec_profile(ctx, run.report.spec, a)
+}
+
+/// The profile replaying `spec` (a stored run's, or one in memory): the target re-resolved
+/// (credentials from the environment, profile or configured target), `a`'s flags on top.
+fn spec_profile(
+    ctx: &Ctx,
+    spec: crate::model::RunSpec,
+    a: &RunArgs,
+) -> Result<(Profile, Option<String>)> {
+    use crate::model::spec::REDACTED;
     let mut ta = a.target.clone();
     let same = ta.target.is_none() || ta.target.as_deref() == Some(spec.target_ref.as_str());
     if ta.target.is_none() {

@@ -448,6 +448,18 @@ pub async fn cmd_calibrate(a: CalibrateArgs, ctx: &Ctx) -> Result<u8> {
     let mut runs: Vec<Run> = Vec::new();
     if let Some(from) = &a.from {
         let base = ctx.store().load(from)?;
+        let replayer = super::verify::Replayer::of_run(ctx, &base, &a.safety, a.no_save)?;
+        if a.safety.dry_run {
+            let rails = super::run::rails(ctx, &replayer.base, &a.safety)?;
+            let mut plan = rails.plan(&replayer.base);
+            plan.eta_s *= a.repeat as f64;
+            plan.assumptions.push(format!(
+                "{} replays of {} (this plan is one of them)",
+                a.repeat,
+                base.id()
+            ));
+            return ctx.out.finish(&super::run::PlanOutput { plan });
+        }
         for i in 0..a.repeat {
             ctx.out.info(dim(&format!(
                 "calibrate: run {}/{} (replay of {})",
@@ -455,14 +467,15 @@ pub async fn cmd_calibrate(a: CalibrateArgs, ctx: &Ctx) -> Result<u8> {
                 a.repeat,
                 base.id()
             )));
-            let args = super::verify::replay_args(
-                base.id(),
-                &crate::model::Overrides::new(),
-                &format!("calibrate-{}", base.id()),
-                &a.safety,
-                a.no_save,
+            runs.push(
+                replayer
+                    .replay(
+                        ctx,
+                        &crate::model::Overrides::new(),
+                        &format!("calibrate-{}", base.id()),
+                    )
+                    .await?,
             );
-            runs.push(super::verify::replay(ctx, &args).await?);
         }
     } else {
         let (profile, target_name) =
@@ -482,15 +495,18 @@ pub async fn cmd_calibrate(a: CalibrateArgs, ctx: &Ctx) -> Result<u8> {
             ));
             return ctx.out.finish(&super::run::PlanOutput { plan });
         }
+        // One guard for the whole command: the budgets cap all calibration runs together.
+        let guard = super::run::guard_for(ctx, &profile, &super::run::budgets(ctx, &a.safety)?);
         for i in 0..a.repeat {
             ctx.out
                 .info(dim(&format!("calibrate: run {}/{}", i + 1, a.repeat)));
-            match super::run::measure(
+            match super::run::measure_guarded(
                 ctx,
                 profile.clone(),
                 target_name.clone(),
                 &a.safety,
                 &output,
+                guard.clone(),
             )
             .await?
             {

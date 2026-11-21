@@ -9,7 +9,7 @@ use serde::Serialize;
 
 use super::Ctx;
 use super::args::*;
-use super::verify::{Hypothesis, VerifyCfg, VerifyResult, verify_hypotheses};
+use super::verify::{Hypothesis, Replayer, VerifyCfg, VerifyResult, verify_hypotheses};
 use crate::analysis::verification::{Direction, Expectation, VerifyOutcome};
 use crate::config::Knobs;
 use crate::errors::{ErrorCode, OprobeError};
@@ -134,9 +134,27 @@ pub fn knobs_patch(from: &Knobs, to: &Knobs) -> String {
 }
 
 pub async fn cmd_fix(a: FixArgs, ctx: &Ctx) -> Result<u8> {
-    let (mut profile, target_name) =
-        super::resolve_profile(ctx, &a.target, &a.workload, &a.knobs, &a.cost)?;
-    super::apply_sla(&mut profile, &a.sla)?;
+    let (mut profile, target_name) = if a.from.is_some() || !a.set.is_empty() {
+        // `--from RUN --set …`: the workload exactly as `run --from` replays it (MCP
+        // `recommend_config` passes a stored run this way, `--existing` prefix included).
+        super::run_profile(
+            ctx,
+            &RunArgs {
+                target: a.target.clone(),
+                workload: a.workload.clone(),
+                knobs: a.knobs.clone(),
+                cost: a.cost.clone(),
+                sla: a.sla.clone(),
+                from: a.from.clone(),
+                set: a.set.clone(),
+                ..RunArgs::default()
+            },
+        )?
+    } else {
+        let (mut p, name) = super::resolve_profile(ctx, &a.target, &a.workload, &a.knobs, &a.cost)?;
+        super::apply_sla(&mut p, &a.sla)?;
+        (p, name)
+    };
     if a.output.label.is_some() {
         profile.name = a.output.label.clone();
     }
@@ -154,14 +172,17 @@ pub async fn cmd_fix(a: FixArgs, ctx: &Ctx) -> Result<u8> {
         super::tune::fit_trials(&mut opts, b)?;
     }
     let budget = opts.max_throttle_ratio;
+    // One guard for the whole command: diagnosis, tuning and verification share the budgets.
+    let guard = super::run::guard_for(ctx, &profile, &super::run::budgets(ctx, &a.safety)?);
     // 1. Diagnose.
     ctx.out.info(bold("fix 1/3 · diagnose"));
-    let diag = match super::run::measure(
+    let diag = match super::run::measure_guarded(
         ctx,
         profile.clone(),
         target_name.clone(),
         &a.safety,
         &a.output,
+        guard.clone(),
     )
     .await?
     {
@@ -177,6 +198,7 @@ pub async fn cmd_fix(a: FixArgs, ctx: &Ctx) -> Result<u8> {
         opts,
         &a.safety,
         &a.output,
+        guard.clone(),
     )
     .await?;
     let mut rec = tuned
@@ -223,6 +245,15 @@ pub async fn cmd_fix(a: FixArgs, ctx: &Ctx) -> Result<u8> {
                 unit: if mib { "mib_per_s" } else { "ops_per_s" }.into(),
             },
         ];
+        // Replays of the diagnosis as it ran (in memory: `--no-save` stores nothing to
+        // replay from), under the same guard.
+        let replayer = Replayer {
+            base: profile.clone(),
+            target_name: target_name.clone(),
+            safety: &a.safety,
+            no_save: a.output.no_save,
+            guard: guard.clone(),
+        };
         let v = verify_hypotheses(
             ctx,
             &diag,
@@ -234,8 +265,7 @@ pub async fn cmd_fix(a: FixArgs, ctx: &Ctx) -> Result<u8> {
             }],
             VerifyCfg {
                 repeat: a.repeat,
-                safety: &a.safety,
-                no_save: a.output.no_save,
+                replayer: &replayer,
                 calibrate: true,
                 max_throttle_ratio: budget,
             },
