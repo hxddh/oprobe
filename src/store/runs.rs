@@ -37,6 +37,15 @@ pub struct RunSummary {
     /// The run file (filled in when listing; not stored).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    /// Why the run is partial: `budget` (a safety budget stopped it) or `interrupted`
+    /// (stopped early); absent for a complete run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partial: Option<String>,
+    /// The target identity of the run's spec (`store::TargetId`, empty when it does not
+    /// resolve). Required, so sidecars written without it are rebuilt from the run file.
+    pub target_id: String,
+    /// `report.spec.workload_hash()`: runs with the same target and workload hash compare.
+    pub workload_hash: String,
 }
 
 impl From<&Report> for RunSummary {
@@ -57,6 +66,19 @@ impl From<&Report> for RunSummary {
             error_ratio: r.summary.error_rate,
             cost_per_month_usd: r.cost.applicable.then_some(r.cost.selected.total_usd),
             path: None,
+            partial: if r.verdict.exit_code == crate::errors::exit::BUDGET {
+                Some("budget".into())
+            } else if r.run.interrupted {
+                Some("interrupted".into())
+            } else {
+                None
+            },
+            target_id: r
+                .spec
+                .target_id()
+                .map(|t| t.to_string())
+                .unwrap_or_default(),
+            workload_hash: r.spec.workload_hash(),
         }
     }
 }

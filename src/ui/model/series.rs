@@ -141,6 +141,44 @@ impl Series {
         }
     }
 
+    /// Follow a live timeline: append the seconds that are new and refresh the last one
+    /// (finished seconds never change), instead of rebuilding the series. Falls back to
+    /// [`Self::from_timeline`] once long runs merge buckets.
+    pub fn update_timeline(&mut self, tl: &[TimelinePoint], elapsed_s: f64) {
+        if tl.len() > MAX_BUCKETS || (self.bucket_s != 1.0 && !self.points.is_empty()) {
+            *self = Self::from_timeline(tl, elapsed_s);
+            return;
+        }
+        let point = |p: &TimelinePoint| Point {
+            t_s: p.t_s,
+            ops_per_s: p.ops_per_s,
+            mib_per_s: p.mib_per_s,
+            p50_ms: p.p50_ms,
+            p99_ms: p.p99_ms,
+            errors_per_s: p.errors as f64,
+            throttled_per_s: p.throttled as f64,
+        };
+        // Keep the points that are still the timeline's (all but the last, which may have
+        // been partial); a timeline that does not start where ours did is rebuilt.
+        let keep = self.points.len().saturating_sub(1).min(tl.len());
+        let same_start = self
+            .points
+            .first()
+            .zip(tl.first())
+            .is_none_or(|(a, b)| a.t_s == b.t_s);
+        if !same_start {
+            *self = Self::from_timeline(tl, elapsed_s);
+            return;
+        }
+        self.points.truncate(keep);
+        self.points.extend(tl[keep..].iter().map(point));
+        if self.points.len() > 1 && self.points.last().is_some_and(|p| elapsed_s - p.t_s < 0.25) {
+            self.points.pop();
+        }
+        self.bucket_s = 1.0;
+        self.window_s = elapsed_s.max(1.0);
+    }
+
     /// The largest value of `f` over the points.
     pub fn max(&self, f: impl Fn(&Point) -> f64) -> f64 {
         self.points.iter().map(f).fold(0.0, f64::max)
@@ -231,5 +269,32 @@ mod tests {
             .collect();
         assert_eq!(Series::from_timeline(&tl, 3.1).points.len(), 3);
         assert_eq!(Series::from_timeline(&tl, 3.6).points.len(), 4);
+    }
+
+    #[test]
+    fn a_live_series_appends_what_is_new() {
+        let tl = |n: usize, last: f64| -> Vec<TimelinePoint> {
+            (0..n)
+                .map(|i| TimelinePoint {
+                    t_s: i as f64,
+                    ops_per_s: if i + 1 == n { last } else { 10.0 },
+                    ..Default::default()
+                })
+                .collect()
+        };
+        let mut s = Series::default();
+        for n in 1..40 {
+            let t = tl(n, 5.0 + n as f64);
+            let elapsed = n as f64 - 0.4;
+            s.update_timeline(&t, elapsed);
+            assert_eq!(s, Series::from_timeline(&t, elapsed), "after {n} seconds");
+        }
+        // A new run (a timeline that starts elsewhere) is rebuilt.
+        let mut other = tl(3, 1.0);
+        for p in &mut other {
+            p.t_s += 100.0;
+        }
+        s.update_timeline(&other, 102.6);
+        assert_eq!(s, Series::from_timeline(&other, 102.6));
     }
 }

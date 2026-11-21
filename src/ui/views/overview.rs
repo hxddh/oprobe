@@ -8,13 +8,15 @@ use crate::model::{Finding, Report};
 use crate::ui::chart::{Line, Plot, Unit, chart};
 use crate::ui::heatmap::heatmap;
 use crate::ui::kit::{
-    Kind, Tone, badge, body, btn, caption, empty, kpi, small, stage_color, strong, swatch, title,
+    Kind, Tone, badge, body, btn, caption, empty, kpi, kpi_detail, kpi_row, small, stage_color,
+    strong, swatch, title,
 };
 use crate::ui::model::Tab;
 use crate::ui::model::fmt;
+use crate::ui::model::metrics;
 use crate::ui::model::scale::Scale;
 use crate::ui::model::series::Series;
-use crate::ui::store::{Phase, Sel, Store, store};
+use crate::ui::store::{Phase, Sel, Stage, Store, store};
 
 /// The throughput chart's plot.
 pub fn throughput_plot(s: &Series, b: Option<&Series>) -> Option<Plot> {
@@ -214,6 +216,22 @@ pub fn stage_bar(parts: Vec<(&'static str, f64)>) -> View {
         )
 }
 
+/// Why a run is partial (`partial · budget`), from its report.
+pub fn partial_of(r: &Report) -> Option<&'static str> {
+    if r.verdict.exit_code == crate::errors::exit::BUDGET {
+        Some("partial · budget")
+    } else if r.run.interrupted {
+        Some("partial · interrupted")
+    } else {
+        None
+    }
+}
+
+/// The run stopped before its measurement window began.
+pub fn stopped_in_warmup(r: &Report) -> bool {
+    partial_of(r).is_some() && (r.run.window_s < 0.05 || r.summary.ops == 0)
+}
+
 fn verdict_word(r: &Report) -> &'static str {
     match r.verdict.level {
         crate::model::VerdictLevel::Ok => "Healthy",
@@ -305,19 +323,35 @@ fn finished(s: Store) -> View {
                     .flex_1()
                     .min_w(px(0.0))
                     .selectable(true),
-                ),
+                )
+                .child(dynamic(move || {
+                    let p = r.with(|r| r.as_ref().and_then(partial_of));
+                    untracked(|| match p {
+                        // A budget stop is not a failure: a partial run, kept and shown.
+                        Some(p) => badge(p, || Tone::Warn).into_element(),
+                        None => view().into_element(),
+                    })
+                })),
         )
-        // Key numbers: one row, never wrapping.
+        // Key numbers: one row when it fits, two when it does not; numbers never wrap.
         .child(
-            view()
-                .flex_row()
-                .rounded(px(6.0))
-                .border_1()
-                .border_color(move || theme().border)
-                .overflow_hidden()
-                .child(kpi(
+            kpi_row()
+                .child(kpi_detail(
                     "OPS/S",
-                    num(|r| fmt::compact(r.summary.ops_per_s).into()),
+                    num(|r| {
+                        if stopped_in_warmup(r) {
+                            "—".into()
+                        } else {
+                            fmt::compact(r.summary.ops_per_s).into()
+                        }
+                    }),
+                    num(|r| {
+                        if stopped_in_warmup(r) {
+                            "stopped during warmup".into()
+                        } else {
+                            SharedString::default()
+                        }
+                    }),
                     || Tone::Neutral,
                 ))
                 .child(kpi(
@@ -346,18 +380,45 @@ fn finished(s: Store) -> View {
                         }
                     },
                 ))
+                // Throttling next to errors: a "throttling" verdict always has its number.
+                .child(kpi_detail(
+                    "THROTTLED",
+                    num(|r| fmt::ratio(metrics::throttled_request_ratio(r)).into()),
+                    num(|r| format!("retry {}", fmt::ratio(metrics::retry_share(r))).into()),
+                    move || {
+                        if r.with(|r| {
+                            r.as_ref()
+                                .is_some_and(|r| metrics::throttled_request_ratio(r) > 0.0)
+                        }) {
+                            Tone::Warn
+                        } else {
+                            Tone::Neutral
+                        }
+                    },
+                ))
                 .child(kpi(
                     "REQ/OP",
                     num(|r| fmt::sig3(r.bytes.request_amplification).into()),
                     || Tone::Neutral,
                 ))
-                .child(kpi(
+                .child(kpi_detail(
                     "COST/MO",
                     num(|r| {
                         if r.cost.applicable {
                             fmt::usd(r.cost.selected.total_usd).into()
                         } else {
                             "n/a".into()
+                        }
+                    }),
+                    num(|r| {
+                        if r.cost.applicable && metrics::storage_assumed(r) {
+                            format!(
+                                "assumed {} stored",
+                                fmt::bytes(r.cost.stored_gb * 1_073_741_824.0)
+                            )
+                            .into()
+                        } else {
+                            SharedString::default()
                         }
                     }),
                     || Tone::Neutral,
@@ -454,18 +515,68 @@ fn finished(s: Store) -> View {
         ))
 }
 
+/// What the live view's title says for a job at `stage`.
+pub fn stage_title(stage: Stage, phase: Phase, title: &str) -> String {
+    match (phase, stage) {
+        (Phase::Stopping, _) => "Stopping — cleaning up test data…".to_owned(),
+        (Phase::Failed, _) => "The run failed".to_owned(),
+        (Phase::Done, _) => format!("Finished {title}"),
+        (_, Stage::Starting) => format!("Starting {title}…"),
+        (_, Stage::Preparing) => format!("Preparing the dataset on {title}"),
+        (_, Stage::Warmup) => format!("Warming up {title}"),
+        (_, Stage::Measuring) => format!("Measuring {title}"),
+        (_, Stage::Verifying) => format!("Verifying what {title} returned"),
+        (_, Stage::Cleanup) => "Cleaning up test data…".to_owned(),
+    }
+}
+
+/// Progress in words: the measured window only counts while measuring (nothing is shown as
+/// 0 ops/s before it starts).
+pub fn stage_progress(stage: Stage, elapsed_s: f64, total_s: f64) -> String {
+    match stage {
+        Stage::Starting => "resolving the target and checking it (read-only)".into(),
+        Stage::Preparing => "uploading the test dataset · not measured yet".into(),
+        Stage::Warmup => "warming connections up · not measured yet".into(),
+        Stage::Measuring if total_s > 0.0 => format!(
+            "{} of {} measured",
+            fmt::clock_s(elapsed_s.min(total_s)),
+            fmt::clock_s(total_s)
+        ),
+        Stage::Measuring => format!("{} measured", fmt::clock_s(elapsed_s)),
+        Stage::Verifying => "the window has ended · checking what was read".into(),
+        Stage::Cleanup => "the window has ended · removing test data".into(),
+    }
+}
+
 fn live(s: Store) -> View {
     let l = s.live;
+    let stage = computed(move || l.with(|l| l.as_ref().map(|l| l.stage).unwrap_or_default()));
+    let measuring = move || {
+        matches!(
+            stage.get(),
+            Stage::Measuring | Stage::Verifying | Stage::Cleanup
+        )
+    };
+    // The numbers mean something only once the window has started.
     let snap = computed(move || {
+        let on = measuring();
         l.with(|l| {
             l.as_ref()
-                .and_then(|l| l.snapshot.as_ref().map(|s| s.summary.clone()))
+                .and_then(|l| l.snapshot.as_ref())
+                .filter(|_| on)
+                .map(|s| {
+                    (
+                        s.summary.clone(),
+                        s.resilience.clone(),
+                        s.connections.clone(),
+                    )
+                })
         })
     });
     let series = computed(move || l.with(|l| l.as_ref().map(|l| l.series.clone())));
     let log = s.log_latency;
     let num = move |f: fn(&crate::trace::Summary) -> SharedString| {
-        move || snap.with(|s| s.as_ref().map(f).unwrap_or_else(|| "—".into()))
+        move || snap.with(|s| s.as_ref().map(|s| f(&s.0)).unwrap_or_else(|| "—".into()))
     };
     view()
         .gap_4()
@@ -478,11 +589,18 @@ fn live(s: Store) -> View {
                 .gap_2()
                 .child(badge(
                     move || {
-                        l.with(|l| match l.as_ref().map(|l| l.phase) {
-                            Some(Phase::Running) => "Running",
-                            Some(Phase::Stopping) => "Stopping",
-                            Some(Phase::Done) => "Finished",
-                            Some(Phase::Failed) => "Failed",
+                        l.with(|l| match l.as_ref().map(|l| (l.phase, l.stage)) {
+                            Some((Phase::Running, st)) => match st {
+                                Stage::Starting => "Starting",
+                                Stage::Preparing => "Preparing",
+                                Stage::Warmup => "Warmup",
+                                Stage::Measuring => "Measuring",
+                                Stage::Verifying => "Verifying",
+                                Stage::Cleanup => "Cleanup",
+                            },
+                            Some((Phase::Stopping, _)) => "Stopping",
+                            Some((Phase::Done, _)) => "Finished",
+                            Some((Phase::Failed, _)) => "Failed",
                             None => "",
                         })
                     },
@@ -490,21 +608,78 @@ fn live(s: Store) -> View {
                         l.with(|l| match l.as_ref().map(|l| l.phase) {
                             Some(Phase::Failed) => Tone::Crit,
                             Some(Phase::Done) => Tone::Ok,
+                            Some(Phase::Stopping) => Tone::Warn,
                             _ => Tone::Info,
                         })
                     },
                 ))
-                .child(title(move || {
-                    l.with(|l| {
-                        l.as_ref()
-                            .map(|l| match l.phase {
-                                Phase::Stopping => "Stopping — cleaning up test data…".to_owned(),
-                                Phase::Failed => "The run failed".to_owned(),
-                                _ => format!("Measuring {}", l.title),
-                            })
-                            .unwrap_or_default()
+                .child(
+                    title(move || {
+                        l.with(|l| {
+                            l.as_ref()
+                                .map(|l| stage_title(l.stage, l.phase, &l.title))
+                                .unwrap_or_default()
+                        })
                     })
-                })),
+                    .number_of_lines(1)
+                    .flex_1()
+                    .min_w(px(0.0)),
+                ),
+        )
+        // The phases, in order, and where the run is.
+        .child(
+            view()
+                .flex_row()
+                .flex_wrap()
+                .items_center()
+                .gap_3()
+                .label("Run phases")
+                .children(Stage::STEPS.into_iter().map(move |st| {
+                    let state = move || {
+                        let now = stage.get();
+                        if now == st || (st == Stage::Measuring && now == Stage::Verifying) {
+                            2
+                        } else if st.before(now) {
+                            1
+                        } else {
+                            0
+                        }
+                    };
+                    small(move || {
+                        let mark = match state() {
+                            2 => "●",
+                            1 => "✓",
+                            _ => "○",
+                        };
+                        format!("{mark} {}", st.label())
+                    })
+                    .number_of_lines(1)
+                    .text_color(move || match state() {
+                        2 => Tone::Info.color(),
+                        1 => theme().foreground,
+                        _ => theme().muted_foreground,
+                    })
+                }))
+                .child(
+                    small(move || {
+                        l.with(|l| {
+                            l.as_ref()
+                                .filter(|l| l.phase == Phase::Running)
+                                .map(|l| {
+                                    stage_progress(
+                                        l.stage,
+                                        l.snapshot.as_ref().map(|s| s.elapsed_s).unwrap_or(0.0),
+                                        l.total_s,
+                                    )
+                                })
+                                .unwrap_or_default()
+                        })
+                    })
+                    .number_of_lines(1)
+                    .tabular_nums()
+                    .flex_1()
+                    .min_w(px(0.0)),
+                ),
         )
         .child(dynamic(move || {
             let failure = l.with(|l| l.as_ref().and_then(|l| l.failure.clone()));
@@ -527,12 +702,7 @@ fn live(s: Store) -> View {
             })
         }))
         .child(
-            view()
-                .flex_row()
-                .rounded(px(6.0))
-                .border_1()
-                .border_color(move || theme().border)
-                .overflow_hidden()
+            kpi_row()
                 .child(kpi(
                     "OPS/S",
                     num(|s| fmt::compact(s.ops_per_s).into()),
@@ -556,6 +726,29 @@ fn live(s: Store) -> View {
                 .child(kpi(
                     "ERRORS",
                     num(|s| fmt::ratio(s.error_rate).into()),
+                    || Tone::Neutral,
+                ))
+                .child(kpi_detail(
+                    "THROTTLED",
+                    move || {
+                        snap.with(|s| {
+                            s.as_ref()
+                                .map(|(_, r, c)| {
+                                    fmt::ratio(metrics::throttled_request_ratio_of(r, c)).into()
+                                })
+                                .unwrap_or_else(|| "—".into())
+                        })
+                    },
+                    move || {
+                        snap.with(|s| {
+                            s.as_ref()
+                                .map(|(_, r, c)| {
+                                    format!("retry {}", fmt::ratio(metrics::retry_share_of(r, c)))
+                                        .into()
+                                })
+                                .unwrap_or_default()
+                        })
+                    },
                     || Tone::Neutral,
                 ))
                 .child(kpi(

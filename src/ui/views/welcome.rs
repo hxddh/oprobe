@@ -6,7 +6,8 @@ use nsh_core::prelude::*;
 
 use crate::ui::kit::{Kind, body, btn, caption, panel, row_button, small, strong, title};
 use crate::ui::model::cloud::detect;
-use crate::ui::store::{Overlay, store};
+use crate::ui::model::target::TargetDraft;
+use crate::ui::store::store;
 
 fn path_card(heading: &'static str, detail: &'static str) -> View {
     panel()
@@ -45,7 +46,7 @@ pub fn welcome() -> impl IntoElement {
                     .child(
                         path_card("Connect my bucket", "S3, GCS, Azure Blob and every OpenDAL service. oprobe writes only under its own run prefix and removes it afterwards.")
                             .child(view().flex_1())
-                            .child(btn("Connect…", || Kind::Plain, move || s.open(Overlay::NewRun)).self_start()),
+                            .child(btn("Add Target…", || Kind::Plain, move || s.open_add_target(None)).self_start()),
                     )
                     .child(
                         path_card("Open a run file", "A .oprobe file from `oprobe run` on a server or in CI, or one a colleague sent. You can also drop it on this window.")
@@ -57,27 +58,21 @@ pub fn welcome() -> impl IntoElement {
                 view()
                     .gap_1()
                     .child(caption("CREDENTIALS FOUND ON THIS MACHINE"))
+                    // A credentials source has no bucket: it opens Add Target with the
+                    // source chosen, and the sheet asks for the bucket.
                     .children(found.into_iter().map(move |d| {
                         let label = d.label.clone();
-                        let scheme = d.scheme;
-                        let region = d.region.clone();
-                        row_button(label.clone(), || false, move || {
-                            batch(|| {
-                                s.form.target.set(scheme.to_owned());
-                                if let Some(r) = &region {
-                                    s.form.region.set(r.clone());
-                                }
-                                s.form.advanced.set(region.is_some());
-                            });
-                            s.open(Overlay::NewRun);
+                        let draft = TargetDraft::from_detected(&d);
+                        row_button(format!("{label}: add a target with it"), || false, move || {
+                            s.open_add_target(Some(draft.clone()))
                         })
                         .flex_row()
                         .gap_2()
-                        .child(body(label))
-                        .child(small(match (&d.region, &d.credentials) {
-                            (Some(r), _) => format!("{} · {r}", d.scheme),
-                            _ => d.scheme.to_owned(),
-                        }))
+                        .child(body(label).number_of_lines(1))
+                        .child(small(match &d.region {
+                            Some(r) => format!("{} · {r} · add a bucket…", d.provider),
+                            None => format!("{} · add a bucket…", d.provider),
+                        }).number_of_lines(1))
                     }))
             }))
             .child(small("Shortcuts: ⌘N new run · ⌘O open · ⌘K commands (Ctrl on Windows and Linux).")),

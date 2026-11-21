@@ -48,6 +48,9 @@ pub enum Outcome {
         path: Option<PathBuf>,
         /// The tuner's extras (its winner as a profile and as Rust code).
         tuned: Option<Box<TunedExtras>>,
+        /// A safety budget stopped the measurement: the partial run was kept and saved (a
+        /// budget stop is not a failure). The budget that stopped it.
+        partial: Option<String>,
     },
     Probe(Box<ProbeReport>),
     Failed {
@@ -69,11 +72,6 @@ pub struct TunedExtras {
 pub struct RunRequest {
     pub profile: Profile,
     pub target_name: Option<String>,
-    /// Shown instead of the profile's target (`lab://demo`).
-    pub display: Option<String>,
-    pub label: Option<String>,
-    /// Start an in-process lab with these faults and point the profile at it.
-    pub lab: Option<crate::lab::LabConfig>,
     pub store: Option<RunStore>,
     pub trace_max_requests: usize,
     /// Budgets of the run (`[defaults.budgets]`, as for the CLI).
@@ -86,6 +84,7 @@ struct State {
     log: Vec<String>,
     trials: Vec<Trial>,
     outcome: Option<Outcome>,
+    cleaning: bool,
 }
 
 /// What changed since the last [`Job::take`].
@@ -95,6 +94,8 @@ pub struct Update {
     pub log: Vec<String>,
     pub trials: Option<Vec<Trial>>,
     pub outcome: Option<Outcome>,
+    /// The job is removing its test data (the measurement has ended).
+    pub cleaning: bool,
 }
 
 /// Set once the job's task has ended (after its cleanup), however it ended.
@@ -220,8 +221,8 @@ fn join_error(e: tokio::task::JoinError) -> String {
 }
 
 /// One app measurement through [`crate::engine::measure`]: the rails and budgets of the CLI
-/// (`[defaults.budgets]` from the config file). A budget breach keeps the saved partial run
-/// and fails the job with the breach.
+/// (`[defaults.budgets]` from the config file). A budget breach keeps the saved partial run:
+/// it comes back with [`Measured::breach`] set, not as an error.
 #[allow(clippy::too_many_arguments)]
 async fn measure_in_app(
     profile: Profile,
@@ -233,6 +234,7 @@ async fn measure_in_app(
     progress: ProgressFn,
     mode: Mode,
     finalize: crate::engine::measure::FinalizeFn,
+    state: Arc<Mutex<State>>,
 ) -> anyhow::Result<Measured> {
     let rails = Rails::new(&profile, false, None, budgets.clone())?;
     let guard = rails.guard(&profile);
@@ -247,6 +249,7 @@ async fn measure_in_app(
     req.finalize = Some(finalize);
     req.on_stage = Some(Arc::new(move |s| {
         if s == Stage::CleaningUp {
+            state.lock().unwrap_or_else(|e| e.into_inner()).cleaning = true;
             p2(Progress::Message("cleaning up test data…".into()));
         }
     }));
@@ -255,13 +258,17 @@ async fn measure_in_app(
         p3(Progress::Message(format!("warning: {w}")));
     }
     if let Some(b) = &m.breach {
-        let mut e = b.to_error();
-        if let Some(p) = &m.path {
-            e = e.context(format!("the partial run was saved: {}", p.display()));
-        }
-        return Err(e);
+        p3(Progress::Message(format!(
+            "stopped by a budget (the partial run was kept): {:#}",
+            b.to_error()
+        )));
     }
     Ok(m)
+}
+
+/// The budget that stopped a measurement, in words.
+fn breach_text(m: &Measured) -> Option<String> {
+    m.breach.as_ref().map(|b| format!("{:#}", b.to_error()))
 }
 
 impl Job {
@@ -319,28 +326,8 @@ impl Job {
             let scheme = req.profile.target.scheme.clone();
             let progress = Self::progress(&state);
             let res: anyhow::Result<Outcome> = async {
-                let mut profile = req.profile.clone();
-                // The lab lives as long as this task: until the session is closed.
-                let _lab = match req.lab.clone() {
-                    Some(faults) => {
-                        progress(Progress::Message("starting the lab server…".into()));
-                        let handle = crate::lab::LabServer::spawn("127.0.0.1:0", faults).await?;
-                        let mut p = handle.profile("demo");
-                        p.workload = profile.workload.clone();
-                        p.knobs = profile.knobs.clone();
-                        p.sla = profile.sla.clone();
-                        p.name = profile.name.clone();
-                        profile = p;
-                        Some(handle)
-                    }
-                    None => None,
-                };
-                if let Some(l) = &req.label {
-                    profile.name = Some(l.clone());
-                }
-                let display = req.display.clone();
                 let m = measure_in_app(
-                    profile,
+                    req.profile.clone(),
                     req.target_name.clone(),
                     &req.budgets,
                     req.trace_max_requests,
@@ -348,17 +335,16 @@ impl Job {
                     cancel,
                     progress,
                     Mode::Run,
-                    Box::new(move |run| {
-                        if let Some(d) = display {
-                            run.report.target.display = d;
-                        }
-                    }),
+                    Box::new(|_| {}),
+                    state.clone(),
                 )
                 .await?;
+                let partial = breach_text(&m);
                 Ok(Outcome::Run {
                     run: Box::new(m.run),
                     path: m.path,
                     tuned: None,
+                    partial,
                 })
             }
             .await;
@@ -399,8 +385,10 @@ impl Job {
                     progress,
                     Mode::Tune { opts, on_event },
                     Box::new(|run| run.report.run.label = Some("tuned".into())),
+                    state.clone(),
                 )
                 .await?;
+                let partial = breach_text(&m);
                 let tuned = m.tuned.context("the tuner returned no result")?;
                 let header = format!(
                     "objective {} · {}",
@@ -422,6 +410,7 @@ impl Job {
                     })),
                     run: Box::new(m.run),
                     path: m.path,
+                    partial,
                 })
             }
             .await;
@@ -451,6 +440,7 @@ impl Job {
             log: std::mem::take(&mut s.log),
             trials: (!s.trials.is_empty()).then(|| s.trials.clone()),
             outcome: s.outcome.take(),
+            cleaning: s.cleaning,
         }
     }
 

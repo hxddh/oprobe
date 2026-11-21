@@ -189,8 +189,45 @@ pub fn axes(
         .stroke()
 }
 
-/// The whole plot, with a crosshair at canvas x `hover`.
-pub fn paint_plot(plot: &Plot, w: f32, h: f32, hover: Option<f32>) -> Painter {
+/// A line projected onto the canvas: its color token, dash, and its path in canvas points.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Path {
+    pub token: &'static str,
+    pub dashed: bool,
+    pub pts: Vec<(f32, f32)>,
+}
+
+/// The lines of `plot` projected onto a `w`×`h` canvas (steps expanded). Computed once per
+/// plot and size, not on every paint or mouse move.
+pub fn project(plot: &Plot, w: f32, h: f32) -> Vec<Path> {
+    let f = Frame::standard();
+    let (x0, x1, y0, y1) = (f.x0(), f.x1(w), f.y0(h), f.y1());
+    let sx = |v: f64| x0 + (plot.x.norm(v) as f32) * (x1 - x0);
+    let sy = |v: f64| y0 - (plot.y.norm(v) as f32) * (y0 - y1);
+    plot.lines
+        .iter()
+        .filter(|l| !l.pts.is_empty())
+        .map(|l| {
+            let mut pts = Vec::with_capacity(l.pts.len() * if l.step { 2 } else { 1 });
+            for (i, (x, y)) in l.pts.iter().enumerate() {
+                let py = sy(*y);
+                pts.push((sx(*x), py));
+                if l.step {
+                    let next = l.pts.get(i + 1).map(|n| n.0).unwrap_or(x + plot.step_w);
+                    pts.push((sx(next), py));
+                }
+            }
+            Path {
+                token: l.token,
+                dashed: l.dashed,
+                pts,
+            }
+        })
+        .collect()
+}
+
+/// The plot's axes and its (already projected) lines.
+pub fn paint_plot(plot: &Plot, paths: &[Path], w: f32, h: f32) -> Painter {
     let f = Frame::standard();
     let (x0, x1, y0, y1) = (f.x0(), f.x1(w), f.y0(h), f.y1());
     let mut p = axes(
@@ -203,8 +240,6 @@ pub fn paint_plot(plot: &Plot, w: f32, h: f32, hover: Option<f32>) -> Painter {
         plot.x_fmt.f(),
         plot.y_fmt.f(),
     );
-    let sx = |v: f64| x0 + (plot.x.norm(v) as f32) * (x1 - x0);
-    let sy = |v: f64| y0 - (plot.y.norm(v) as f32) * (y0 - y1);
     p = p
         .save()
         .begin_path()
@@ -213,55 +248,124 @@ pub fn paint_plot(plot: &Plot, w: f32, h: f32, hover: Option<f32>) -> Painter {
             size(px(x1 - x0), px(y0 - y1)),
         ))
         .clip();
-    for l in &plot.lines {
-        if l.pts.is_empty() {
-            continue;
-        }
+    for l in paths {
         p = p
             .stroke_color(paint(l.token))
             .line_width(1.5)
             .line_dash(if l.dashed { DASH } else { &[] })
             .begin_path();
-        let mut first = true;
         for (i, (x, y)) in l.pts.iter().enumerate() {
-            let (px_, py) = (sx(*x), sy(*y));
-            if first {
-                p = p.move_to(px_, py);
-                first = false;
+            p = if i == 0 {
+                p.move_to(*x, *y)
             } else {
-                p = p.line_to(px_, py);
-            }
-            if l.step {
-                let next = l.pts.get(i + 1).map(|n| n.0).unwrap_or(x + plot.step_w);
-                p = p.line_to(sx(next), py);
-            }
+                p.line_to(*x, *y)
+            };
         }
         p = p.stroke();
     }
-    p = p.line_dash(&[]).restore();
-    if let Some(hx) = hover.filter(|hx| *hx >= x0 && *hx <= x1) {
-        let xv = plot.x.value(((hx - x0) / (x1 - x0)) as f64);
-        p = p
-            .stroke_color(paint("axis"))
-            .line_width(1.0)
-            .begin_path()
-            .move_to(hx.round() + 0.5, y1)
-            .line_to(hx.round() + 0.5, y0)
-            .stroke();
-        for (_, tok, v) in plot.values_at(xv) {
-            if let Some(v) = v {
-                p = p
-                    .fill_color(paint(tok))
-                    .begin_path()
-                    .arc(hx, sy(v), 3.0, 0.0, std::f32::consts::TAU)
-                    .fill();
-            }
+    p.line_dash(&[]).restore()
+}
+
+/// The crosshair at canvas x `hx` with a dot on each line (its own layer over the plot, so a
+/// mouse move repaints only this).
+pub fn paint_crosshair(plot: &Plot, w: f32, h: f32, hx: f32) -> Painter {
+    let f = Frame::standard();
+    let (x0, x1, y0, y1) = (f.x0(), f.x1(w), f.y0(h), f.y1());
+    if hx < x0 || hx > x1 {
+        return Painter::new();
+    }
+    let sy = |v: f64| y0 - (plot.y.norm(v) as f32) * (y0 - y1);
+    let xv = plot.x.value(((hx - x0) / (x1 - x0)) as f64);
+    let mut p = Painter::new()
+        .stroke_color(paint("axis"))
+        .line_width(1.0)
+        .begin_path()
+        .move_to(hx.round() + 0.5, y1)
+        .line_to(hx.round() + 0.5, y0)
+        .stroke();
+    for (_, tok, v) in plot.values_at(xv) {
+        if let Some(v) = v {
+            p = p
+                .fill_color(paint(tok))
+                .begin_path()
+                .arc(hx, sy(v), 3.0, 0.0, std::f32::consts::TAU)
+                .fill();
         }
     }
     p
 }
 
-/// A chart: its title, legend and hover readout above the canvas.
+/// What a chart says to assistive technology: per line, its range and mean over the axis.
+pub fn summary(heading: &str, p: &Plot) -> String {
+    let yf = p.y_fmt.f();
+    let xf = p.x_fmt.f();
+    let mut s = format!("{heading}, {} to {}", xf(p.x.min), xf(p.x.max));
+    for l in &p.lines {
+        if l.pts.is_empty() {
+            continue;
+        }
+        let (mut lo, mut hi, mut sum) = (f64::INFINITY, f64::NEG_INFINITY, 0.0);
+        for (_, y) in &l.pts {
+            lo = lo.min(*y);
+            hi = hi.max(*y);
+            sum += y;
+        }
+        let mean = sum / l.pts.len() as f64;
+        let name = if l.dashed && l.token == "series-b" {
+            format!("{} (B)", l.label)
+        } else {
+            l.label.to_owned()
+        };
+        s += &format!(
+            "; {name}: min {}, mean {}, max {}",
+            yf(lo),
+            yf(mean),
+            yf(hi)
+        );
+    }
+    s
+}
+
+/// The plot as a table: one row per x, one column per line (the chart's data, readable).
+pub fn table(p: &Plot) -> (Vec<String>, Vec<Vec<String>>) {
+    let mut head = vec!["at".to_owned()];
+    head.extend(p.lines.iter().map(|l| {
+        if l.dashed && l.token == "series-b" {
+            format!("{} (B)", l.label)
+        } else {
+            l.label.to_owned()
+        }
+    }));
+    let mut xs: Vec<f64> = p
+        .lines
+        .iter()
+        .flat_map(|l| l.pts.iter().map(|q| q.0))
+        .collect();
+    xs.sort_by(f64::total_cmp);
+    xs.dedup();
+    let yf = p.y_fmt.f();
+    let rows = xs
+        .into_iter()
+        .map(|x| {
+            let mut r = vec![(p.x_fmt.f())(x)];
+            for l in &p.lines {
+                r.push(
+                    l.pts
+                        .iter()
+                        .find(|q| q.0 == x)
+                        .map(|q| yf(q.1))
+                        .unwrap_or_else(|| "—".into()),
+                );
+            }
+            r
+        })
+        .collect();
+    (head, rows)
+}
+
+/// A chart: its title, legend and hover readout above the canvas. The plot and the crosshair
+/// are two layers; the canvas carries a text summary, and "Data" shows the numbers as a
+/// table (accessibility, design v4 §11).
 pub fn chart(
     heading: &'static str,
     height: f32,
@@ -270,12 +374,21 @@ pub fn chart(
     let plot = computed(data);
     let size = signal((0.0_f32, 0.0_f32));
     let hover = signal(None::<f32>);
+    let show_table = signal(false);
+    // Projected once per plot and size (not per paint or mouse move).
+    let paths = computed(move || {
+        let (w, h) = size.get();
+        plot.with(|p| match p {
+            Some(p) if w > 0.0 => project(p, w, h),
+            _ => Vec::new(),
+        })
+    });
     let readout = move || -> SharedString {
         let Some(hx) = hover.get() else {
             return "".into();
         };
-        let (w, _) = size.get();
-        plot.with(|p| {
+        let (w, _) = size.get_untracked();
+        plot.with_untracked(|p| {
             let Some(p) = p else {
                 return SharedString::default();
             };
@@ -304,6 +417,12 @@ pub fn chart(
                 .unwrap_or_default()
         })
     };
+    let described = move || -> SharedString {
+        plot.with(|p| match p {
+            Some(p) => summary(heading, p).into(),
+            None => format!("{heading}: no data yet").into(),
+        })
+    };
     view()
         .gap_1()
         .min_w(px(0.0))
@@ -313,7 +432,8 @@ pub fn chart(
                 .items_center()
                 .gap_3()
                 .h(px(16.0))
-                .child(caption(heading))
+                .min_w(px(0.0))
+                .child(caption(heading).number_of_lines(1).flex_shrink_0())
                 .child(dynamic(move || {
                     let items = legend();
                     untracked(|| {
@@ -335,29 +455,116 @@ pub fn chart(
                             .into_element()
                     })
                 }))
-                .child(view().flex_1())
-                .child(small(readout).tabular_nums().number_of_lines(1)),
+                .child(
+                    small(readout)
+                        .tabular_nums()
+                        .number_of_lines(1)
+                        .flex_1()
+                        .min_w(px(0.0)),
+                )
+                .child(
+                    nsh_base::button()
+                        .on_press(move || show_table.set(!show_table.get_untracked()))
+                        .accessibility_label(format!("{heading}: show the data as a table"))
+                        .px(px(4.0))
+                        .rounded(px(4.0))
+                        .flex_shrink_0()
+                        .hover(|st| st.bg(move || theme().secondary))
+                        .focus_visible(kit::ring)
+                        .child(small(
+                            move || {
+                                if show_table.get() { "Chart" } else { "Data" }
+                            },
+                        )),
+                ),
         )
-        .child(
-            canvas(move || {
-                let (w, h) = size.get();
-                let hx = hover.get();
-                // Repaint when the appearance changes (token colors).
-                let _ = theme();
-                plot.with(|p| match p {
-                    Some(p) if w > 0.0 => paint_plot(p, w, h, hx),
-                    _ => Painter::new(),
-                })
+        .child(dynamic(move || {
+            if show_table.get() {
+                let t = plot.with(|p| p.as_ref().map(table));
+                return untracked(|| data_table(heading, height, t).into_element());
+            }
+            untracked(|| {
+                view()
+                    .h(px(height))
+                    .min_w(px(0.0))
+                    .child(
+                        canvas(move || {
+                            let (w, h) = size.get();
+                            // Repaint when the appearance changes (token colors).
+                            let _ = theme();
+                            paths.with(|ps| {
+                                plot.with(|p| match p {
+                                    Some(p) if w > 0.0 => paint_plot(p, ps, w, h),
+                                    _ => Painter::new(),
+                                })
+                            })
+                        })
+                        .absolute()
+                        .top(px(0.0))
+                        .left(px(0.0))
+                        .right(px(0.0))
+                        .bottom(px(0.0))
+                        .label(described)
+                        .on_layout(move |frame: &Bounds<Points>| {
+                            size.set((frame.size.width.0, frame.size.height.0))
+                        }),
+                    )
+                    .child(
+                        // The crosshair layer: only this repaints as the mouse moves.
+                        canvas(move || {
+                            let (w, h) = size.get();
+                            let Some(hx) = hover.get() else {
+                                return Painter::new();
+                            };
+                            plot.with(|p| match p {
+                                Some(p) if w > 0.0 => paint_crosshair(p, w, h, hx),
+                                _ => Painter::new(),
+                            })
+                        })
+                        .absolute()
+                        .top(px(0.0))
+                        .left(px(0.0))
+                        .right(px(0.0))
+                        .bottom(px(0.0))
+                        .on_mouse_move(move |e: &MouseEvent| hover.set(Some(e.position.x.0)))
+                        .on_mouse_leave(move |_: &MouseEvent| hover.set(None)),
+                    )
+                    .into_element()
             })
-            .h(px(height))
-            .min_w(px(0.0))
-            .label(heading)
-            .on_layout(move |frame: &Bounds<Points>| {
-                size.set((frame.size.width.0, frame.size.height.0))
-            })
-            .on_mouse_move(move |e: &MouseEvent| hover.set(Some(e.position.x.0)))
-            .on_mouse_leave(move |_: &MouseEvent| hover.set(None)),
-        )
+        }))
+}
+
+/// A chart's numbers as a scrollable table of the same height.
+fn data_table(
+    heading: &'static str,
+    height: f32,
+    t: Option<(Vec<String>, Vec<Vec<String>>)>,
+) -> View {
+    let Some((head, rows)) = t else {
+        return view().h(px(height)).child(small("No data yet"));
+    };
+    let cell = |s: String| {
+        small(s)
+            .tabular_nums()
+            .number_of_lines(1)
+            .w(px(90.0))
+            .flex_shrink_0()
+    };
+    view().h(px(height)).min_w(px(0.0)).child(
+        scroll().flex_1().label(format!("{heading} data")).child(
+            view()
+                .child(
+                    view()
+                        .flex_row()
+                        .gap_2()
+                        .children(head.into_iter().map(|h| caption(h).w(px(90.0)))),
+                )
+                .children(
+                    rows.into_iter()
+                        .map(move |r| view().flex_row().gap_2().children(r.into_iter().map(cell))),
+                ),
+        ),
+    )
 }
 
 /// Time axis label (seconds).
