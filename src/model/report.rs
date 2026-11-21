@@ -976,7 +976,7 @@ pub struct TrialRow {
     pub requests_count: u64,
     /// Requests in flight at the trial's peak.
     pub peak_inflight_count: u64,
-    /// Requests one operation keeps in flight at its peak (p95 over operations).
+    /// The most requests one operation had in flight at once (maximum over operations).
     pub peak_inflight_per_op_count: u64,
     pub cost_per_million_ops_usd: f64,
     pub feasible: bool,

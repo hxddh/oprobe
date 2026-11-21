@@ -135,7 +135,7 @@ pub struct Trial {
     pub cost_per_million_ops: f64,
     /// Requests in flight at the trial's peak.
     pub peak_inflight: u64,
-    /// Requests one operation keeps in flight at its peak (p95 over operations).
+    /// The most requests one operation had in flight at once (maximum over operations).
     pub peak_inflight_per_op: f64,
     pub feasible: bool,
     pub note: String,

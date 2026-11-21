@@ -90,7 +90,9 @@ pub struct OpShape {
     /// Backend requests per operation (mean, retries included).
     #[serde(rename = "requests_per_op_mean")]
     pub requests_per_op: f64,
-    /// Requests one operation keeps in flight at its peak (p95 over operations).
+    /// The most requests one operation had in flight at once (the maximum over operations:
+    /// on a busy client the parallel reads of an op often fail to overlap, and a p95 then
+    /// under-counts the burst the server sees).
     #[serde(rename = "peak_inflight_per_op_count", serialize_with = "ser_whole")]
     #[schemars(with = "u64")]
     pub peak_inflight_per_op: f64,
@@ -284,7 +286,7 @@ fn op_shape(reqs: &[&ReqRow], ops: &[&OpRow]) -> OpShape {
     };
     OpShape {
         requests_per_op,
-        peak_inflight_per_op: quantile(&mut peaks, 0.95).max(1.0),
+        peak_inflight_per_op: peaks.iter().copied().fold(1.0, f64::max),
         mean_inflight_per_op: inflight_total / n,
         sequential_fraction: (single_total / span_total).clamp(0.0, 1.0),
         ops_count: by_op.len() as u64,

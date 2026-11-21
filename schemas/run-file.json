@@ -1877,7 +1877,7 @@
           "type": "integer"
         },
         "peak_inflight_per_op_count": {
-          "description": "Requests one operation keeps in flight at its peak (p95 over operations).",
+          "description": "The most requests one operation had in flight at once (the maximum over operations:\non a busy client the parallel reads of an op often fail to overlap, and a p95 then\nunder-counts the burst the server sees).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -4207,7 +4207,7 @@
           "type": "integer"
         },
         "peak_inflight_per_op_count": {
-          "description": "Requests one operation keeps in flight at its peak (p95 over operations).",
+          "description": "The most requests one operation had in flight at once (maximum over operations).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
