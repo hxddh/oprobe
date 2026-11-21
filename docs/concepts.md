@@ -37,7 +37,9 @@ Every setting has a precedence: flags > `OPROBE_*` environment > target > `[defa
 |---|---|
 | `oprobe target add NAME URL [--region --endpoint --credentials --option K=V]` | Save (or replace) a target; a quick read-only check follows (`--no-test` skips it). |
 | `oprobe target list` / `show NAME` / `rm NAME` | Manage. Secrets in options are never printed. |
-| `oprobe target test NAME [--read-only]` | The doctor: DNS, TCP, TLS, HTTP, clock skew, credentials, list/write/read/stat/delete. |
+| `oprobe target test NAME [--write-probe]` | The doctor: DNS, TCP, TLS, HTTP, clock skew, credentials, list and an object sample (read-only); `--write-probe` adds write/read/stat/delete. |
+| `oprobe target discover` | Credential sources on this machine (AWS profiles and environment, GCP ADC, Azure environment), by name only. |
+| `oprobe target sample TARGET` | What a target holds: prefixes, object counts, size distribution, the prefix to use with `--existing`. |
 
 ## Runs
 

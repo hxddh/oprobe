@@ -28,5 +28,6 @@ Delete runs with `oprobe runs rm` / `oprobe runs gc`, or remove the data directo
 ## Test data in your bucket
 
 `oprobe run` writes under `<prefix>/oprobe-run-<id>/` and deletes it at the end, verifying the prefix is empty.
-`--read-only` and `--existing` never write; `--dry-run` sends nothing. Leftovers from killed runs are listed
-and removed with `oprobe cleanup TARGET --dry-run` / `oprobe cleanup TARGET`.
+`--read-only` and `--existing` never write; `--dry-run` sends nothing; `oprobe doctor` writes only with
+`--write-probe`. Leftovers from killed runs are listed with `oprobe cleanup TARGET` (a dry run) and
+removed with `oprobe cleanup TARGET --yes`.

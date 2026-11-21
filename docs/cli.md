@@ -27,7 +27,7 @@ Every command accepts the global options below. Exit codes: `0` ok · `1` runtim
 | [`oprobe runs`](#oprobe-runs) | Saved runs: list, show, open, export, rm, gc |
 | [`oprobe analyze`](#oprobe-analyze) | Re-slice a run by API, connection, remote, stage or second |
 | [`oprobe explain`](#oprobe-explain) | Narrate a run's causes and advice, or document a finding code |
-| [`oprobe target`](#oprobe-target) | Named targets: add, list, show, rm, test |
+| [`oprobe target`](#oprobe-target) | Named targets: add, list, show, rm, test, discover (credential sources), sample |
 | [`oprobe doctor`](#oprobe-doctor) | Check endpoint reachability, TLS, clock skew, credentials and permissions |
 | [`oprobe probe`](#oprobe-probe) | Measure DNS / TCP / proxy / TLS handshakes and cold vs warm TTFB of an endpoint |
 | [`oprobe watch`](#oprobe-watch) | Continuous low-rate probing with SLOs and a Prometheus endpoint |
@@ -53,6 +53,8 @@ Measure a target: where time and money go (saves the run)
 ```text
 oprobe run [OPTIONS] [TARGET]
 ```
+
+Output formats (`-o`): text, json, ndjson, md, html
 
 *Target*
 
@@ -161,6 +163,8 @@ Start a lab target with throttling and stragglers, run it and narrate the result
 oprobe demo [OPTIONS]
 ```
 
+Output formats (`-o`): text, json, ndjson, md, html
+
 ## `oprobe tune`
 
 Find the best client configuration for a workload (throttle-aware)
@@ -168,6 +172,8 @@ Find the best client configuration for a workload (throttle-aware)
 ```text
 oprobe tune [OPTIONS] [TARGET]
 ```
+
+Output formats (`-o`): text, json, ndjson, md
 
 *Target*
 
@@ -282,6 +288,8 @@ Regression gate: compare two runs (RUNREFs or files) and fail on regressions
 oprobe compare [OPTIONS] [A] [B]
 ```
 
+Output formats (`-o`): text, json, ndjson, md, html
+
 | argument | description |
 |---|---|
 | `<A>` | Baseline: RUNREF (id, prefix, last~N, label) or a .oprobe / report .json file |
@@ -319,6 +327,8 @@ List saved runs, newest first
 oprobe runs list [OPTIONS]
 ```
 
+Output formats (`-o`): text, json, ndjson, md
+
 | argument | description |
 |---|---|
 | `-n, --limit <LIMIT>` | Show at most N runs · default `20` |
@@ -330,6 +340,8 @@ Show a run's full report (-o md|html|json for documents)
 ```text
 oprobe runs show [OPTIONS] [RUNREF]
 ```
+
+Output formats (`-o`): text, json, ndjson, md, html
 
 | argument | description |
 |---|---|
@@ -344,6 +356,8 @@ Open a run in the app (native window)
 oprobe runs open [OPTIONS] <RUNREF>
 ```
 
+Output formats (`-o`): text, json, ndjson
+
 | argument | description |
 |---|---|
 | `<RUNREF>` | Run id, id prefix, `last`, `last~N`, label, or path to a .oprobe / report .json file |
@@ -355,6 +369,8 @@ Export a run (html, md, json, ndjson, csv, har, otlp)
 ```text
 oprobe runs export [OPTIONS] --format <FORMAT> <RUNREF>
 ```
+
+Output formats (`-o`): text, json, ndjson
 
 | argument | description |
 |---|---|
@@ -373,6 +389,8 @@ Delete saved runs
 oprobe runs rm [OPTIONS] <RUNREF>...
 ```
 
+Output formats (`-o`): text, json, ndjson
+
 | argument | description |
 |---|---|
 | `<RUNREF>` | Runs to delete (RUNREFs) |
@@ -384,6 +402,8 @@ Delete old runs (keeps the newest and every baseline run)
 ```text
 oprobe runs gc [OPTIONS]
 ```
+
+Output formats (`-o`): text, json, ndjson
 
 | argument | description |
 |---|---|
@@ -398,6 +418,8 @@ Re-slice a run by API, connection, remote, stage or second
 ```text
 oprobe analyze [OPTIONS] [RUNREF]
 ```
+
+Output formats (`-o`): text, json, ndjson
 
 | argument | description |
 |---|---|
@@ -415,6 +437,8 @@ Narrate a run's causes and advice, or document a finding code
 oprobe explain [OPTIONS] [RUNREF|FINDING_CODE]
 ```
 
+Output formats (`-o`): text, json, ndjson, md
+
 | argument | description |
 |---|---|
 | `<RUNREF\|FINDING_CODE>` | A RUNREF (id, prefix, `last`, `last~N`, label, .oprobe path) or a finding code (e.g. `throttling`); `oprobe explain --list` lists the codes |
@@ -423,7 +447,7 @@ oprobe explain [OPTIONS] [RUNREF|FINDING_CODE]
 
 ## `oprobe target`
 
-Named targets: add, list, show, rm, test
+Named targets: add, list, show, rm, test, discover (credential sources), sample
 
 ```text
 oprobe target [OPTIONS] <COMMAND>
@@ -436,6 +460,8 @@ Add a named target (`--replace` overwrites one of the same name)
 ```text
 oprobe target add [OPTIONS] <NAME> <URL>
 ```
+
+Output formats (`-o`): text, json, ndjson
 
 | argument | description |
 |---|---|
@@ -456,6 +482,8 @@ List configured targets
 oprobe target list [OPTIONS]
 ```
 
+Output formats (`-o`): text, json, ndjson
+
 ## `oprobe target show`
 
 Show one target
@@ -463,6 +491,8 @@ Show one target
 ```text
 oprobe target show [OPTIONS] <NAME>
 ```
+
+Output formats (`-o`): text, json, ndjson
 
 | argument | description |
 |---|---|
@@ -476,6 +506,8 @@ Remove a target
 oprobe target rm [OPTIONS] <NAME>
 ```
 
+Output formats (`-o`): text, json, ndjson
+
 | argument | description |
 |---|---|
 | `<NAME>` |  |
@@ -488,18 +520,33 @@ Check a target (doctor: reachability, TLS, clock, credentials, permissions)
 oprobe target test [OPTIONS] <NAME>
 ```
 
+Output formats (`-o`): text, json, ndjson
+
 | argument | description |
 |---|---|
 | `<NAME>` | Target name (or a storage URL) |
-| `--read-only` | Only check reachability and listing; never write |
+| `--read-only` | Only check reachability and listing; never write (the default) |
+| `--write-probe` | Also write, read back and delete a probe object |
 
-## `oprobe doctor`
+## `oprobe target discover`
 
-Check endpoint reachability, TLS, clock skew, credentials and permissions
+Credential sources on this machine (AWS profiles and environment, GCP ADC, Azure environment), by name only, with the targets they can reach
 
 ```text
-oprobe doctor [OPTIONS] [TARGET]
+oprobe target discover [OPTIONS]
 ```
+
+Output formats (`-o`): text, json, ndjson, md
+
+## `oprobe target sample`
+
+What a target holds (read-only): prefixes, object counts, size distribution, examples
+
+```text
+oprobe target sample [OPTIONS] [TARGET]
+```
+
+Output formats (`-o`): text, json, ndjson, md
 
 *Target*
 
@@ -514,7 +561,35 @@ oprobe doctor [OPTIONS] [TARGET]
 | `--ca-cert <PEM>` | Trust an extra PEM CA bundle |
 | `--insecure` | Skip TLS certificate verification (development only) |
 | `--proxy <PROXY>` | Egress proxy URL, or `none` to ignore HTTPS_PROXY/HTTP_PROXY |
-| `--read-only` | Only check reachability and listing; never write |
+| `--prefix <PREFIX>` | List under this prefix (relative to the target root) |
+| `--limit <N>` | List at most N objects · default `1000` |
+
+## `oprobe doctor`
+
+Check endpoint reachability, TLS, clock skew, credentials and permissions
+
+```text
+oprobe doctor [OPTIONS] [TARGET]
+```
+
+Output formats (`-o`): text, json, ndjson
+
+*Target*
+
+| argument | description |
+|---|---|
+| `<TARGET>` | Target name (see `oprobe target list`) or storage URL: s3://bucket/prefix, gcs://bucket, azblob://container, oss://, cos://, b2://, fs:///path, memory:// |
+| `-p, --profile <FILE>` | Load a profile (TOML); flags override its values |
+| `--endpoint <ENDPOINT>` | Custom endpoint (MinIO, R2, Ceph, private clouds) |
+| `--region <REGION>` | Region of the bucket (e.g. us-east-1); most S3-compatible services accept any value |
+| `--option <KEY=VALUE>` | Extra backend option, repeatable (e.g. --option enable_virtual_host_style=true) |
+| `--anonymous` | Access a public bucket without credentials (s3, gcs, azblob, oss: unsigned requests) |
+| `--ca-cert <PEM>` | Trust an extra PEM CA bundle |
+| `--insecure` | Skip TLS certificate verification (development only) |
+| `--proxy <PROXY>` | Egress proxy URL, or `none` to ignore HTTPS_PROXY/HTTP_PROXY |
+| `--read-only` | Only check reachability and listing; never write (the default; kept for scripts) |
+| `--write-probe` | Also write, read back, stat and delete a 256 KiB probe object under `oprobe-run-<time>-doctor/` (the default is read-only) |
+| `-v, --verbose` | Show the raw backend error of failed checks |
 
 ## `oprobe probe`
 
@@ -523,6 +598,8 @@ Measure DNS / TCP / proxy / TLS handshakes and cold vs warm TTFB of an endpoint
 ```text
 oprobe probe [OPTIONS] <ENDPOINT>
 ```
+
+Output formats (`-o`): text, json, ndjson
 
 | argument | description |
 |---|---|
@@ -543,6 +620,8 @@ Continuous low-rate probing with SLOs and a Prometheus endpoint
 ```text
 oprobe watch [OPTIONS] [TARGET]
 ```
+
+Output formats (`-o`): text, json, ndjson
 
 *Target*
 
@@ -633,6 +712,8 @@ Run the same workload across targets / knob values and rank them
 ```text
 oprobe matrix [OPTIONS] [TARGET]
 ```
+
+Output formats (`-o`): text, json, ndjson, md
 
 *Target*
 
@@ -731,6 +812,8 @@ Correctness & compatibility suite for a target
 oprobe compat [OPTIONS] [TARGET]
 ```
 
+Output formats (`-o`): text, json, ndjson
+
 *Target*
 
 | argument | description |
@@ -774,6 +857,8 @@ Create or update a named baseline
 oprobe baseline set [OPTIONS] <NAME> [RUNREF]...
 ```
 
+Output formats (`-o`): text, json, ndjson
+
 | argument | description |
 |---|---|
 | `<NAME>` | Baseline name (letters, digits, - _ .) |
@@ -790,6 +875,8 @@ List baselines
 oprobe baseline list [OPTIONS]
 ```
 
+Output formats (`-o`): text, json, ndjson
+
 ## `oprobe baseline rm`
 
 Delete a baseline
@@ -797,6 +884,8 @@ Delete a baseline
 ```text
 oprobe baseline rm [OPTIONS] <NAME>
 ```
+
+Output formats (`-o`): text, json, ndjson
 
 | argument | description |
 |---|---|
@@ -809,6 +898,8 @@ Show a baseline's runs and their spread
 ```text
 oprobe baseline show [OPTIONS] <NAME>
 ```
+
+Output formats (`-o`): text, json, ndjson
 
 | argument | description |
 |---|---|
@@ -823,6 +914,8 @@ Aliases: serve-s3
 ```text
 oprobe lab [OPTIONS]
 ```
+
+Output formats (`-o`): text, json, ndjson
 
 | argument | description |
 |---|---|
@@ -851,6 +944,8 @@ MCP server for agents (stdio, or --http ADDR)
 oprobe mcp [OPTIONS]
 ```
 
+Output formats (`-o`): text, json, ndjson
+
 | argument | description |
 |---|---|
 | `--http <ADDR>` | Serve MCP over Streamable HTTP on this address (e.g. 127.0.0.1:8765) instead of stdio |
@@ -871,6 +966,8 @@ Print the JSON Schema of a machine output (report, events, …)
 oprobe schema [OPTIONS] [NAME]
 ```
 
+Output formats (`-o`): text, json, ndjson
+
 | argument | description |
 |---|---|
 | `<NAME>` | Schema name (`report`, `events`, `run`, …); omit to list the names |
@@ -882,6 +979,8 @@ Describe what this oprobe can do (machine-readable)
 ```text
 oprobe capabilities [OPTIONS]
 ```
+
+Output formats (`-o`): text, json, ndjson
 
 ## `oprobe config`
 
@@ -899,6 +998,8 @@ Effective settings and where each comes from
 oprobe config show [OPTIONS]
 ```
 
+Output formats (`-o`): text, json, ndjson
+
 ## `oprobe config path`
 
 Paths of the config file and data directory
@@ -906,6 +1007,8 @@ Paths of the config file and data directory
 ```text
 oprobe config path [OPTIONS]
 ```
+
+Output formats (`-o`): text, json, ndjson
 
 ## `oprobe config edit`
 
@@ -915,6 +1018,8 @@ Open the config file in $VISUAL / $EDITOR (validated when the editor exits)
 oprobe config edit [OPTIONS]
 ```
 
+Output formats (`-o`): text, json, ndjson
+
 ## `oprobe cleanup`
 
 Remove test data left behind by interrupted runs
@@ -922,6 +1027,8 @@ Remove test data left behind by interrupted runs
 ```text
 oprobe cleanup [OPTIONS] [TARGET]
 ```
+
+Output formats (`-o`): text, json, ndjson
 
 *Target*
 
@@ -938,8 +1045,9 @@ oprobe cleanup [OPTIONS] [TARGET]
 | `--proxy <PROXY>` | Egress proxy URL, or `none` to ignore HTTPS_PROXY/HTTP_PROXY |
 | `--older-than <OLDER_THAN>` | Only remove run prefixes older than this · default `1h` |
 | `--datasets` | Also remove persisted datasets (oprobe-dataset/) |
-| `--dry-run` | Show what would be deleted |
+| `--dry-run` | Show what would be deleted (the default without --yes) |
 | `--read-only` | Refuse to delete anything (implies --dry-run) |
+| `-y, --yes` | Delete what was found (without it, cleanup only lists it) |
 
 ## `oprobe self-update`
 
@@ -948,6 +1056,8 @@ Check, download, verify and install the latest release
 ```text
 oprobe self-update [OPTIONS]
 ```
+
+Output formats (`-o`): text, json, ndjson
 
 | argument | description |
 |---|---|
@@ -964,6 +1074,8 @@ Aliases: tui
 ```text
 oprobe top [OPTIONS] [TARGET]
 ```
+
+Output formats (`-o`): text
 
 | argument | description |
 |---|---|
@@ -989,6 +1101,8 @@ Aliases: app
 oprobe gui [OPTIONS] [TARGET]
 ```
 
+Output formats (`-o`): text
+
 | argument | description |
 |---|---|
 | `<TARGET>` | Storage URL, e.g. s3://bucket/prefix, memory:// |
@@ -1011,6 +1125,8 @@ Generate shell completions
 oprobe completions [OPTIONS] <SHELL>
 ```
 
+Output formats (`-o`): text
+
 | argument | description |
 |---|---|
 | `<SHELL>` | · one of `bash`, `elvish`, `fish`, `powershell`, `zsh` |
@@ -1022,6 +1138,8 @@ Generate the man page
 ```text
 oprobe man [OPTIONS]
 ```
+
+Output formats (`-o`): text
 
 | argument | description |
 |---|---|

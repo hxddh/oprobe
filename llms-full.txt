@@ -268,7 +268,9 @@ Every setting has a precedence: flags > `OPROBE_*` environment > target > `[defa
 |---|---|
 | `oprobe target add NAME URL [--region --endpoint --credentials --option K=V]` | Save (or replace) a target; a quick read-only check follows (`--no-test` skips it). |
 | `oprobe target list` / `show NAME` / `rm NAME` | Manage. Secrets in options are never printed. |
-| `oprobe target test NAME [--read-only]` | The doctor: DNS, TCP, TLS, HTTP, clock skew, credentials, list/write/read/stat/delete. |
+| `oprobe target test NAME [--write-probe]` | The doctor: DNS, TCP, TLS, HTTP, clock skew, credentials, list and an object sample (read-only); `--write-probe` adds write/read/stat/delete. |
+| `oprobe target discover` | Credential sources on this machine (AWS profiles and environment, GCP ADC, Azure environment), by name only. |
+| `oprobe target sample TARGET` | What a target holds: prefixes, object counts, size distribution, the prefix to use with `--existing`. |
 
 ## Runs
 
@@ -997,7 +999,7 @@ repository should read [`AGENTS.md`](../AGENTS.md).
 | Command results | `-o json` (one document on stdout) | `oprobe schema <command>` |
 | Live events | `-o ndjson` (one event per line, ends with `result` or `error`) | `oprobe schema events` |
 | Errors | `{"type":"error","error":{code,message,hint?,retryable,docs?}}` on stdout in json/ndjson modes | `oprobe schema error` |
-| Report v3 | `report` of `run`, `runs show`, MCP `get_run` | `oprobe schema report` |
+| Report v4 | `report` of `run`, `runs show`, MCP `get_run` | `oprobe schema report` |
 | Run files | `runs/<id>.oprobe` (zstd NDJSON: header, report, op rows, req rows) | `oprobe schema run-file` |
 | Config | `config.toml` (`[defaults]`, `[targets.NAME]`) | `oprobe schema config` |
 | Self-description | `oprobe capabilities -o json` | `oprobe schema capabilities` |
@@ -1010,18 +1012,24 @@ Rules that hold everywhere:
 
 - stdout carries only the result; logs and progress go to stderr (or become `log` events).
 - Numeric field names carry their unit (`_us`, `_ms`, `_s`, `_bytes`, `_mib`, `_gib`, `_bps`,
-  `_per_s`, `_pct`, `_ratio`, `_usd`, `_count`; `_mib`/`_gib` only where the value is naturally
-  fractional, e.g. `client.rss_mib`, `cost.stored_gib`); identifiers (`*_id`, `op_ids`, `slowest`),
+  `_per_s`, `_pct`, `_pp`, `_ratio`, `_usd`, `_count`, `_days`; `_mib`/`_gib` only where the value is naturally
+  fractional, e.g. `client.rss_mib`, `cost.stored_gib`); identifiers (`*_id`, `op_ids`, `slowest`, `port`, `rank`),
   `exit_code`, `seed`, mix `weight` and `heatmap.counts` are unitless. Finding evidence values follow
-  the same rule (`current_p99_ms`, `predicted_p99_ms`, …). Enums are lowercase `snake_case`; there are
-  no human-formatted numbers in machine fields. A test walks the report schema to enforce this.
+  the same rule (`current_p99_ms`, `predicted_p99_ms`, …); `_pp` marks percentage points. Enums are
+  lowercase `snake_case` (error codes `family.snake_case`); there are no human-formatted numbers in
+  machine fields. A test walks every registered schema to enforce this.
 - Time buckets (`timeline[].t_s`, `heatmap.t_buckets_s`, `interval` events) are stamped with the start
   of the bucket, in seconds from the measurement window start.
 - `_mean` marks fractional means of counts (`capacity.observed.inflight_mean`); values whose unit
   is a sibling `unit` field (`predicted`, `lo`, `hi`, `baseline`, `candidate`) are unitless.
 - Every JSON command result is an envelope: its own fields plus `next` (suggested steps, each
-  `{ title, cli, mcp: { tool, arguments } }`) and `warnings` (including what the command printed as
-  warnings on stderr).
+  `{ title, cli, mcp: { tool, arguments } }`, built from real run ids and targets — never
+  placeholders) and `warnings` (including what the command printed as warnings on stderr). MCP
+  tool results carry the same `next`.
+- Each command offers the output formats its result renders: `-o` outside them is refused with
+  `usage.invalid_argument` before anything runs (`completions` and `man` are text only).
+  `oprobe capabilities -o json` lists them per command (`commands[].formats`). `md` is real
+  Markdown (tables, headings) wherever it is offered.
 - Every report carries `spec`, the run's replayable definition: `oprobe run --from RUNREF` repeats a
   run exactly (credentials are resolved again), `--set key=value` changes one setting. A finding's
   `verification` names its `overrides` and gives `command` (`oprobe verify RUN CODE`), `rerun`
@@ -1051,26 +1059,44 @@ help (`retryable`).
 Commands and tools that take a run accept a RUNREF: the run id (`20261120-143005-a1b2`), a unique
 id prefix, `last`, `last~N`, a label, or a path to a `.oprobe` file.
 
-## Safe workflow
+## Safe workflow: find why a bucket is slow and fix the config
+
+Each step's JSON result names the next ones in `next` (CLI command and MCP call).
 
 1. **Know the tool**: `oprobe capabilities -o json` (services, presets, providers, error and
-   finding codes, MCP tools, defaults).
-2. **Preflight**: `oprobe doctor TARGET -o json` — `ready` must be true. Add `--read-only` to
-   skip the write/read/delete probe.
-3. **Plan**: `oprobe run TARGET … --dry-run -o json` — requests, bytes, objects written and
-   deleted, cost and ETA. Nothing is sent to the target.
-4. **Run with budgets**: `oprobe run TARGET … --max-requests N --max-duration 2m
+   finding codes, MCP tools, formats per command, defaults).
+2. **Find credentials and targets**: `oprobe target discover -o json` — AWS profiles and
+   environment, GCP application default credentials, Azure storage environment, **by name only**
+   (never a key), the configured targets, and the `oprobe target add` command for each source.
+   `oprobe` without a command, off a terminal, prints the same.
+3. **Preflight**: `oprobe doctor TARGET -o json` — `ready` must be true. Doctor is read-only by
+   default and includes a `sample` of what the target holds; `--write-probe` also writes, reads
+   back and deletes a 256 KiB object. Failed checks show a summarized cause (`-v` adds the raw
+   backend error).
+4. **See the data**: `oprobe target sample TARGET -o json` — first-level prefixes with object
+   counts and bytes, the size distribution, example keys and `suggested_existing`, the prefix to
+   measure without writing anything.
+5. **Plan**: `oprobe run TARGET --existing PREFIX … --dry-run -o json` — requests, bytes, objects
+   written and deleted, cost and ETA, and `plan.warnings` (e.g. a warmup at least as long as the
+   window). Nothing is sent to the target.
+6. **Run with budgets**: `oprobe run TARGET --existing PREFIX … --max-requests N --max-duration 2m
    --max-cost-usd 0.10 -o ndjson`. A breached budget stops the run (exit 4, `safety.budget_exceeded`)
    and still saves the partial run. `--read-only` refuses anything that writes (exit 5);
    `--existing PREFIX` benchmarks existing objects and never writes.
-5. **Explain**: `oprobe explain last -o json` — verdict, findings with evidence and documentation,
-   outlier attribution of the slowest 1 % of requests, suggested next commands.
-6. **Change one knob, run again, compare**: `oprobe compare last~1 last -o json` (exit 3 on a
-   regression).
+7. **Explain**: `oprobe explain last -o json` — verdict, findings with evidence and documentation,
+   outlier attribution of the slowest 1 % of requests, and `next`: `oprobe verify RUN CODE` for
+   each finding's advice, `oprobe run --from RUN --set …` for the change alone, `oprobe fix TARGET`.
+8. **Fix**: `oprobe verify RUN CODE` replays the run with and without the change and answers
+   `confirmed`, `refuted` or `inconclusive`; `oprobe fix TARGET` diagnoses, tunes and verifies in
+   one command and returns a `Recommendation` (knobs, overrides, profile TOML, Rust snippet,
+   deltas).
+9. **Measure the change, compare**: `oprobe run --from RUN --set concurrency=16 -o json`, then
+   `oprobe compare RUN last -o json` (exit 3 on a regression).
 
 Writes are always confined to `<prefix>/oprobe-run-<id>/` and removed when the run ends;
-`oprobe cleanup TARGET --dry-run` finds leftovers of killed runs. `memory://` needs no
-credentials and never leaves the process — use it to learn the outputs.
+`oprobe cleanup TARGET` lists leftovers of killed runs (a dry run) and `--yes` deletes them.
+`memory://` and `lab://demo` need no credentials and never leave the process — use them to learn
+the outputs.
 
 ## MCP server
 
@@ -1079,8 +1105,8 @@ serves Streamable HTTP at `http://127.0.0.1:8765/mcp`.
 
 | Flag | Effect |
 |---|---|
-| (default) | read-only: runs that would upload a dataset or write are refused with `safety.read_only` (`memory://` and `existing` runs are allowed); `doctor` skips its write probe; `cleanup` is a dry run |
-| `--allow-write` | enable runs that write test data, `start_tune`, `cleanup` with `confirm` |
+| (default) | read-only: runs that would upload a dataset or write are refused with `safety.read_only` (`memory://`, `lab://` and `existing` runs are allowed: the first two write only into the server's own process); `doctor` never writes a probe; `cleanup` is a dry run |
+| `--allow-write` | enable runs that write test data, `start_tune`, `verify_finding` and `recommend_config` on real targets, `doctor` with `write_probe`, `cleanup` with `confirm` |
 | `--max-cost-usd`, `--max-requests`, `--max-bytes`, `--max-duration` | budgets applied to every run the server starts (a call can only lower them) |
 | `--allow-target NAME\|URL-PREFIX` | only these targets (repeatable; prefixes match at `/` boundaries). A call may set `region` and `anonymous`, but `endpoint`, `options`, `proxy`, `insecure` or URL query parameters that change the scheme, host, bucket, root, TLS trust or proxy of the allowed target are refused with `safety.refused` |
 | `--http-allow-remote` | allow `--http` on a non-loopback address (refused otherwise: the HTTP transport has no authentication) |
@@ -1090,24 +1116,47 @@ serves Streamable HTTP at `http://127.0.0.1:8765/mcp`.
 
 `tools/list` order is fixed. Every tool has an `inputSchema` and an `outputSchema`, returns
 `structuredContent` plus a one-paragraph text summary, and reports failures as tool errors
-(`isError: true`) whose second text block is the JSON error document.
+(`isError: true`) whose second text block is the JSON error document. Unknown arguments are
+refused (`usage.invalid_argument`, with a "did you mean" hint). Tools give the same error codes
+as the CLI for the same input.
 
-| Tool | Purpose |
-|---|---|
-| `doctor` | preflight a target |
-| `probe_endpoint` | DNS/TCP/TLS handshakes and cold/warm TTFB of an endpoint |
-| `plan_run` | dry-run plan, effective budgets, `allowed` + `refusals` |
-| `start_run` | start a run in the background; returns the run id at once (`wait: true` blocks); progress notifications when the call has a `progressToken` |
-| `get_run` | status, progress and (when done) summary and report; also any stored RUNREF |
-| `cancel_run` | stop a run (cleanup runs, the partial run is saved) |
-| `list_runs` | stored runs and runs this server started |
-| `explain_run` | narrated explanation (same as `oprobe explain RUNREF`) |
-| `analyze_run` | outlier attribution for a `Selection` (time window, latency floor, API) or the slowest N % |
-| `compare_runs` | regression gate between two runs |
-| `start_tune` | throttle-aware tuning in the background |
-| `estimate_cost` | request cost at list prices vs the cost budget |
-| `cleanup` | leftover test data (dry run unless `confirm` on a write-enabled server) |
-| `list_targets` | configured targets, what is allowed, server budgets |
+| Tool | Purpose | CLI |
+|---|---|---|
+| `discover_targets` | credential sources on this machine (names only) and configured targets | `oprobe target discover` |
+| `doctor` | preflight a target, read-only, with a sample of its objects (`write_probe` on a write-enabled server) | `oprobe doctor` |
+| `sample_objects` | prefixes, counts, size distribution, example keys, `suggested_existing` (read-only) | `oprobe target sample` |
+| `probe_endpoint` | DNS/TCP/TLS handshakes and cold/warm TTFB of an endpoint | `oprobe probe` |
+| `plan_run` | dry-run plan, effective budgets, `allowed` + `refusals` | `oprobe run --dry-run` |
+| `start_run` | start a run in the background; returns the run id at once (`wait: true` blocks); progress notifications when the call has a `progressToken`; `from` + `set` replay a stored run with changes | `oprobe run [--from RUN --set k=v]` |
+| `get_run` | status, progress and (when done) summary, report and, for tunes, the `recommendation`; also any stored RUNREF. `status` turns final together with the last event; progress never passes its total | `oprobe runs show` |
+| `cancel_run` | stop a run (cleanup runs, the partial run is saved) | Ctrl-C |
+| `list_runs` | stored runs and runs this server started | `oprobe runs list` |
+| `explain_run` | narrated explanation; `next` holds MCP calls (`verify_finding`, `start_run {from, set}`, `recommend_config`) | `oprobe explain` |
+| `analyze_run` | outlier attribution for a `Selection` (time window, latency floor, API) or the slowest N % | `oprobe analyze` |
+| `compare_runs` | regression gate between two runs | `oprobe compare` |
+| `start_tune` | throttle-aware tuning in the background; the finished job has a `recommendation` | `oprobe tune` |
+| `verify_finding` | replay a run with and without a finding's change: confirmed, refuted or inconclusive | `oprobe verify RUN CODE` |
+| `recommend_config` | diagnose → tune → verify: a `Recommendation` and a profile patch | `oprobe fix TARGET` |
+| `estimate_cost` | request cost at list prices vs the cost budget | `oprobe run --dry-run` |
+| `cleanup` | leftover test data (dry run unless `confirm` on a write-enabled server) | `oprobe cleanup [--yes]` |
+| `list_targets` | configured targets, what is allowed, server budgets | `oprobe target list` |
+
+The read-only workflow over MCP, against the in-process lab (no credentials needed):
+
+```text
+discover_targets {}
+doctor {"target": "lab://demo"}                       → ready, sample, next
+sample_objects {"target": "lab://demo"}               → prefixes, sizes, suggested_existing
+plan_run {"target": "lab://demo", "duration": "5s"}   → allowed: true (lab:// is in-process)
+start_run {"target": "lab://demo", "duration": "5s"}  → run_id; poll get_run {"run": run_id}
+explain_run {"run": run_id}                           → findings; next: verify_finding, start_run {from, set}
+verify_finding {"run": run_id, "code": "throttling"}  → confirmed | refuted | inconclusive
+recommend_config {"target": "lab://demo"}             → recommendation (knobs, overrides, profile_toml)
+start_run {"from": run_id, "set": ["concurrency=16"]} → then compare_runs {"baseline": run_id, "candidate": "last"}
+```
+
+On a real bucket, a read-only server measures existing objects: `start_run {"target": "prod",
+"existing": "tables/events/"}` with the prefix `sample_objects` suggested.
 
 Resources: `oprobe://runs/{id}/report`, `oprobe://runs/{id}/events` (NDJSON), `oprobe://runs/{id}/slowest`,
 `oprobe://runs/{id}/html` (the single-file HTML report), `oprobe://schema/{name}`,
@@ -1185,7 +1234,7 @@ CRC32C verification of objects oprobe wrote and read back failed: the storage pa
 Some logical operations failed after retries; critical when the failure rate exceeds the SLA's max error rate. *(availability, usually warning)*
 
 - **Causes:** missing permissions (403) or wrong credentials; objects or buckets that do not exist (404); timeouts or connection resets on an overloaded path; throttling that outlasts the retry budget
-- **Verify:** report.resilience.error_classes and report.summary.error_ratio; `oprobe doctor TARGET` for credentials, permissions and the endpoint; `oprobe analyze RUNREF --where error` / MCP analyze_run to see which requests failed
+- **Verify:** report.resilience.error_classes and report.summary.error_ratio; `oprobe doctor TARGET` for credentials, permissions and the endpoint; `oprobe analyze RUNREF --by status` (then `--where status=CODE`) / MCP analyze_run to see which requests failed
 - **Knobs:** --retries; --max-error-rate; --concurrency
 
 <a id="finding-throttling"></a>
@@ -1743,9 +1792,10 @@ oprobe doctor s3://bucket/prefix   # any URL
 ```
 
 It checks configuration, credentials, the network path (DNS, proxy, TCP, TLS, HTTP), clock skew and
-list/write/read/stat/delete permissions one by one, and prints a fix for each failure (`--read-only` skips
-the writes). Every error of every command carries a stable code (`-o json`: `error.code`) and usually a
-`hint:` line.
+list permission and a sample of the objects, and prints a summarized cause and a fix for each failure
+(`-v` adds the raw backend error). It never writes unless you pass `--write-probe`, which also tests
+write/read/stat/delete. Every error of every command carries a stable code (`-o json`: `error.code`)
+and usually a `hint:` line.
 
 ## Errors
 
@@ -1771,7 +1821,7 @@ the writes). Every error of every command carries a stable code (`-o json`: `err
 
 | Situation | What to do |
 |---|---|
-| leftover `oprobe-run-*` prefixes | a run was killed (second Ctrl-C, OOM, power loss): `oprobe cleanup TARGET --dry-run`, then without `--dry-run` |
+| leftover `oprobe-run-*` prefixes | a run was killed (second Ctrl-C, OOM, power loss): `oprobe cleanup TARGET` lists them, `oprobe cleanup TARGET --yes` deletes them |
 | "client processing-bound" on a remote store | client CPU, CRC verification or tiny objects: check `client cpu` in `runs show --detail`; `--no-verify`; larger objects |
 | `oprobe run` asks questions in a script | it never does: prompts appear only on an interactive terminal with text output; pass a target, or `--non-interactive` |
 | `oprobe top` fails in CI | it needs an interactive terminal; use `oprobe run` |
@@ -1865,6 +1915,21 @@ certificate): a private CA or a TLS-inspecting proxy. `--ca-cert corp.pem` (or `
 
 A request or connection timed out. Check the network path with `oprobe doctor`; lower the
 concurrency if the client or the link is saturated.
+
+<a id="net-rate_limited"></a>
+### `net.rate_limited` (exit 1, retryable)
+
+An HTTP API other than the storage target (GitHub releases for `oprobe self-update`, an OTLP
+collector) refused the request because its rate limit is exhausted (429, or 403 with no quota
+left). Wait and retry; for GitHub, set `GITHUB_TOKEN` to raise the limit. Your storage
+credentials are not involved.
+
+<a id="net-http"></a>
+### `net.http` (exit 1)
+
+An HTTP API other than the storage target answered with an error (for example GitHub 403 or 404
+for a release, or an OTLP collector rejecting a push). The message names the URL and the status.
+Check the URL, the release tag or the collector; your storage credentials are not involved.
 
 <a id="storage-not_found"></a>
 ### `storage.not_found` (exit 1)
@@ -1965,8 +2030,9 @@ Delete runs with `oprobe runs rm` / `oprobe runs gc`, or remove the data directo
 ## Test data in your bucket
 
 `oprobe run` writes under `<prefix>/oprobe-run-<id>/` and deletes it at the end, verifying the prefix is empty.
-`--read-only` and `--existing` never write; `--dry-run` sends nothing. Leftovers from killed runs are listed
-and removed with `oprobe cleanup TARGET --dry-run` / `oprobe cleanup TARGET`.
+`--read-only` and `--existing` never write; `--dry-run` sends nothing; `oprobe doctor` writes only with
+`--write-probe`. Leftovers from killed runs are listed with `oprobe cleanup TARGET` (a dry run) and
+removed with `oprobe cleanup TARGET --yes`.
 
 
 <!-- source: docs/cli.md -->
@@ -2000,7 +2066,7 @@ Every command accepts the global options below. Exit codes: `0` ok · `1` runtim
 | [`oprobe runs`](#oprobe-runs) | Saved runs: list, show, open, export, rm, gc |
 | [`oprobe analyze`](#oprobe-analyze) | Re-slice a run by API, connection, remote, stage or second |
 | [`oprobe explain`](#oprobe-explain) | Narrate a run's causes and advice, or document a finding code |
-| [`oprobe target`](#oprobe-target) | Named targets: add, list, show, rm, test |
+| [`oprobe target`](#oprobe-target) | Named targets: add, list, show, rm, test, discover (credential sources), sample |
 | [`oprobe doctor`](#oprobe-doctor) | Check endpoint reachability, TLS, clock skew, credentials and permissions |
 | [`oprobe probe`](#oprobe-probe) | Measure DNS / TCP / proxy / TLS handshakes and cold vs warm TTFB of an endpoint |
 | [`oprobe watch`](#oprobe-watch) | Continuous low-rate probing with SLOs and a Prometheus endpoint |
@@ -2026,6 +2092,8 @@ Measure a target: where time and money go (saves the run)
 ```text
 oprobe run [OPTIONS] [TARGET]
 ```
+
+Output formats (`-o`): text, json, ndjson, md, html
 
 *Target*
 
@@ -2134,6 +2202,8 @@ Start a lab target with throttling and stragglers, run it and narrate the result
 oprobe demo [OPTIONS]
 ```
 
+Output formats (`-o`): text, json, ndjson, md, html
+
 ## `oprobe tune`
 
 Find the best client configuration for a workload (throttle-aware)
@@ -2141,6 +2211,8 @@ Find the best client configuration for a workload (throttle-aware)
 ```text
 oprobe tune [OPTIONS] [TARGET]
 ```
+
+Output formats (`-o`): text, json, ndjson, md
 
 *Target*
 
@@ -2255,6 +2327,8 @@ Regression gate: compare two runs (RUNREFs or files) and fail on regressions
 oprobe compare [OPTIONS] [A] [B]
 ```
 
+Output formats (`-o`): text, json, ndjson, md, html
+
 | argument | description |
 |---|---|
 | `<A>` | Baseline: RUNREF (id, prefix, last~N, label) or a .oprobe / report .json file |
@@ -2292,6 +2366,8 @@ List saved runs, newest first
 oprobe runs list [OPTIONS]
 ```
 
+Output formats (`-o`): text, json, ndjson, md
+
 | argument | description |
 |---|---|
 | `-n, --limit <LIMIT>` | Show at most N runs · default `20` |
@@ -2303,6 +2379,8 @@ Show a run's full report (-o md|html|json for documents)
 ```text
 oprobe runs show [OPTIONS] [RUNREF]
 ```
+
+Output formats (`-o`): text, json, ndjson, md, html
 
 | argument | description |
 |---|---|
@@ -2317,6 +2395,8 @@ Open a run in the app (native window)
 oprobe runs open [OPTIONS] <RUNREF>
 ```
 
+Output formats (`-o`): text, json, ndjson
+
 | argument | description |
 |---|---|
 | `<RUNREF>` | Run id, id prefix, `last`, `last~N`, label, or path to a .oprobe / report .json file |
@@ -2328,6 +2408,8 @@ Export a run (html, md, json, ndjson, csv, har, otlp)
 ```text
 oprobe runs export [OPTIONS] --format <FORMAT> <RUNREF>
 ```
+
+Output formats (`-o`): text, json, ndjson
 
 | argument | description |
 |---|---|
@@ -2346,6 +2428,8 @@ Delete saved runs
 oprobe runs rm [OPTIONS] <RUNREF>...
 ```
 
+Output formats (`-o`): text, json, ndjson
+
 | argument | description |
 |---|---|
 | `<RUNREF>` | Runs to delete (RUNREFs) |
@@ -2357,6 +2441,8 @@ Delete old runs (keeps the newest and every baseline run)
 ```text
 oprobe runs gc [OPTIONS]
 ```
+
+Output formats (`-o`): text, json, ndjson
 
 | argument | description |
 |---|---|
@@ -2371,6 +2457,8 @@ Re-slice a run by API, connection, remote, stage or second
 ```text
 oprobe analyze [OPTIONS] [RUNREF]
 ```
+
+Output formats (`-o`): text, json, ndjson
 
 | argument | description |
 |---|---|
@@ -2388,6 +2476,8 @@ Narrate a run's causes and advice, or document a finding code
 oprobe explain [OPTIONS] [RUNREF|FINDING_CODE]
 ```
 
+Output formats (`-o`): text, json, ndjson, md
+
 | argument | description |
 |---|---|
 | `<RUNREF\|FINDING_CODE>` | A RUNREF (id, prefix, `last`, `last~N`, label, .oprobe path) or a finding code (e.g. `throttling`); `oprobe explain --list` lists the codes |
@@ -2396,7 +2486,7 @@ oprobe explain [OPTIONS] [RUNREF|FINDING_CODE]
 
 ## `oprobe target`
 
-Named targets: add, list, show, rm, test
+Named targets: add, list, show, rm, test, discover (credential sources), sample
 
 ```text
 oprobe target [OPTIONS] <COMMAND>
@@ -2409,6 +2499,8 @@ Add a named target (`--replace` overwrites one of the same name)
 ```text
 oprobe target add [OPTIONS] <NAME> <URL>
 ```
+
+Output formats (`-o`): text, json, ndjson
 
 | argument | description |
 |---|---|
@@ -2429,6 +2521,8 @@ List configured targets
 oprobe target list [OPTIONS]
 ```
 
+Output formats (`-o`): text, json, ndjson
+
 ## `oprobe target show`
 
 Show one target
@@ -2436,6 +2530,8 @@ Show one target
 ```text
 oprobe target show [OPTIONS] <NAME>
 ```
+
+Output formats (`-o`): text, json, ndjson
 
 | argument | description |
 |---|---|
@@ -2449,6 +2545,8 @@ Remove a target
 oprobe target rm [OPTIONS] <NAME>
 ```
 
+Output formats (`-o`): text, json, ndjson
+
 | argument | description |
 |---|---|
 | `<NAME>` |  |
@@ -2461,18 +2559,33 @@ Check a target (doctor: reachability, TLS, clock, credentials, permissions)
 oprobe target test [OPTIONS] <NAME>
 ```
 
+Output formats (`-o`): text, json, ndjson
+
 | argument | description |
 |---|---|
 | `<NAME>` | Target name (or a storage URL) |
-| `--read-only` | Only check reachability and listing; never write |
+| `--read-only` | Only check reachability and listing; never write (the default) |
+| `--write-probe` | Also write, read back and delete a probe object |
 
-## `oprobe doctor`
+## `oprobe target discover`
 
-Check endpoint reachability, TLS, clock skew, credentials and permissions
+Credential sources on this machine (AWS profiles and environment, GCP ADC, Azure environment), by name only, with the targets they can reach
 
 ```text
-oprobe doctor [OPTIONS] [TARGET]
+oprobe target discover [OPTIONS]
 ```
+
+Output formats (`-o`): text, json, ndjson, md
+
+## `oprobe target sample`
+
+What a target holds (read-only): prefixes, object counts, size distribution, examples
+
+```text
+oprobe target sample [OPTIONS] [TARGET]
+```
+
+Output formats (`-o`): text, json, ndjson, md
 
 *Target*
 
@@ -2487,7 +2600,35 @@ oprobe doctor [OPTIONS] [TARGET]
 | `--ca-cert <PEM>` | Trust an extra PEM CA bundle |
 | `--insecure` | Skip TLS certificate verification (development only) |
 | `--proxy <PROXY>` | Egress proxy URL, or `none` to ignore HTTPS_PROXY/HTTP_PROXY |
-| `--read-only` | Only check reachability and listing; never write |
+| `--prefix <PREFIX>` | List under this prefix (relative to the target root) |
+| `--limit <N>` | List at most N objects · default `1000` |
+
+## `oprobe doctor`
+
+Check endpoint reachability, TLS, clock skew, credentials and permissions
+
+```text
+oprobe doctor [OPTIONS] [TARGET]
+```
+
+Output formats (`-o`): text, json, ndjson
+
+*Target*
+
+| argument | description |
+|---|---|
+| `<TARGET>` | Target name (see `oprobe target list`) or storage URL: s3://bucket/prefix, gcs://bucket, azblob://container, oss://, cos://, b2://, fs:///path, memory:// |
+| `-p, --profile <FILE>` | Load a profile (TOML); flags override its values |
+| `--endpoint <ENDPOINT>` | Custom endpoint (MinIO, R2, Ceph, private clouds) |
+| `--region <REGION>` | Region of the bucket (e.g. us-east-1); most S3-compatible services accept any value |
+| `--option <KEY=VALUE>` | Extra backend option, repeatable (e.g. --option enable_virtual_host_style=true) |
+| `--anonymous` | Access a public bucket without credentials (s3, gcs, azblob, oss: unsigned requests) |
+| `--ca-cert <PEM>` | Trust an extra PEM CA bundle |
+| `--insecure` | Skip TLS certificate verification (development only) |
+| `--proxy <PROXY>` | Egress proxy URL, or `none` to ignore HTTPS_PROXY/HTTP_PROXY |
+| `--read-only` | Only check reachability and listing; never write (the default; kept for scripts) |
+| `--write-probe` | Also write, read back, stat and delete a 256 KiB probe object under `oprobe-run-<time>-doctor/` (the default is read-only) |
+| `-v, --verbose` | Show the raw backend error of failed checks |
 
 ## `oprobe probe`
 
@@ -2496,6 +2637,8 @@ Measure DNS / TCP / proxy / TLS handshakes and cold vs warm TTFB of an endpoint
 ```text
 oprobe probe [OPTIONS] <ENDPOINT>
 ```
+
+Output formats (`-o`): text, json, ndjson
 
 | argument | description |
 |---|---|
@@ -2516,6 +2659,8 @@ Continuous low-rate probing with SLOs and a Prometheus endpoint
 ```text
 oprobe watch [OPTIONS] [TARGET]
 ```
+
+Output formats (`-o`): text, json, ndjson
 
 *Target*
 
@@ -2606,6 +2751,8 @@ Run the same workload across targets / knob values and rank them
 ```text
 oprobe matrix [OPTIONS] [TARGET]
 ```
+
+Output formats (`-o`): text, json, ndjson, md
 
 *Target*
 
@@ -2704,6 +2851,8 @@ Correctness & compatibility suite for a target
 oprobe compat [OPTIONS] [TARGET]
 ```
 
+Output formats (`-o`): text, json, ndjson
+
 *Target*
 
 | argument | description |
@@ -2747,6 +2896,8 @@ Create or update a named baseline
 oprobe baseline set [OPTIONS] <NAME> [RUNREF]...
 ```
 
+Output formats (`-o`): text, json, ndjson
+
 | argument | description |
 |---|---|
 | `<NAME>` | Baseline name (letters, digits, - _ .) |
@@ -2763,6 +2914,8 @@ List baselines
 oprobe baseline list [OPTIONS]
 ```
 
+Output formats (`-o`): text, json, ndjson
+
 ## `oprobe baseline rm`
 
 Delete a baseline
@@ -2770,6 +2923,8 @@ Delete a baseline
 ```text
 oprobe baseline rm [OPTIONS] <NAME>
 ```
+
+Output formats (`-o`): text, json, ndjson
 
 | argument | description |
 |---|---|
@@ -2782,6 +2937,8 @@ Show a baseline's runs and their spread
 ```text
 oprobe baseline show [OPTIONS] <NAME>
 ```
+
+Output formats (`-o`): text, json, ndjson
 
 | argument | description |
 |---|---|
@@ -2796,6 +2953,8 @@ Aliases: serve-s3
 ```text
 oprobe lab [OPTIONS]
 ```
+
+Output formats (`-o`): text, json, ndjson
 
 | argument | description |
 |---|---|
@@ -2824,6 +2983,8 @@ MCP server for agents (stdio, or --http ADDR)
 oprobe mcp [OPTIONS]
 ```
 
+Output formats (`-o`): text, json, ndjson
+
 | argument | description |
 |---|---|
 | `--http <ADDR>` | Serve MCP over Streamable HTTP on this address (e.g. 127.0.0.1:8765) instead of stdio |
@@ -2844,6 +3005,8 @@ Print the JSON Schema of a machine output (report, events, …)
 oprobe schema [OPTIONS] [NAME]
 ```
 
+Output formats (`-o`): text, json, ndjson
+
 | argument | description |
 |---|---|
 | `<NAME>` | Schema name (`report`, `events`, `run`, …); omit to list the names |
@@ -2855,6 +3018,8 @@ Describe what this oprobe can do (machine-readable)
 ```text
 oprobe capabilities [OPTIONS]
 ```
+
+Output formats (`-o`): text, json, ndjson
 
 ## `oprobe config`
 
@@ -2872,6 +3037,8 @@ Effective settings and where each comes from
 oprobe config show [OPTIONS]
 ```
 
+Output formats (`-o`): text, json, ndjson
+
 ## `oprobe config path`
 
 Paths of the config file and data directory
@@ -2879,6 +3046,8 @@ Paths of the config file and data directory
 ```text
 oprobe config path [OPTIONS]
 ```
+
+Output formats (`-o`): text, json, ndjson
 
 ## `oprobe config edit`
 
@@ -2888,6 +3057,8 @@ Open the config file in $VISUAL / $EDITOR (validated when the editor exits)
 oprobe config edit [OPTIONS]
 ```
 
+Output formats (`-o`): text, json, ndjson
+
 ## `oprobe cleanup`
 
 Remove test data left behind by interrupted runs
@@ -2895,6 +3066,8 @@ Remove test data left behind by interrupted runs
 ```text
 oprobe cleanup [OPTIONS] [TARGET]
 ```
+
+Output formats (`-o`): text, json, ndjson
 
 *Target*
 
@@ -2911,8 +3084,9 @@ oprobe cleanup [OPTIONS] [TARGET]
 | `--proxy <PROXY>` | Egress proxy URL, or `none` to ignore HTTPS_PROXY/HTTP_PROXY |
 | `--older-than <OLDER_THAN>` | Only remove run prefixes older than this · default `1h` |
 | `--datasets` | Also remove persisted datasets (oprobe-dataset/) |
-| `--dry-run` | Show what would be deleted |
+| `--dry-run` | Show what would be deleted (the default without --yes) |
 | `--read-only` | Refuse to delete anything (implies --dry-run) |
+| `-y, --yes` | Delete what was found (without it, cleanup only lists it) |
 
 ## `oprobe self-update`
 
@@ -2921,6 +3095,8 @@ Check, download, verify and install the latest release
 ```text
 oprobe self-update [OPTIONS]
 ```
+
+Output formats (`-o`): text, json, ndjson
 
 | argument | description |
 |---|---|
@@ -2937,6 +3113,8 @@ Aliases: tui
 ```text
 oprobe top [OPTIONS] [TARGET]
 ```
+
+Output formats (`-o`): text
 
 | argument | description |
 |---|---|
@@ -2962,6 +3140,8 @@ Aliases: app
 oprobe gui [OPTIONS] [TARGET]
 ```
 
+Output formats (`-o`): text
+
 | argument | description |
 |---|---|
 | `<TARGET>` | Storage URL, e.g. s3://bucket/prefix, memory:// |
@@ -2984,6 +3164,8 @@ Generate shell completions
 oprobe completions [OPTIONS] <SHELL>
 ```
 
+Output formats (`-o`): text
+
 | argument | description |
 |---|---|
 | `<SHELL>` | · one of `bash`, `elvish`, `fish`, `powershell`, `zsh` |
@@ -2995,6 +3177,8 @@ Generate the man page
 ```text
 oprobe man [OPTIONS]
 ```
+
+Output formats (`-o`): text
 
 | argument | description |
 |---|---|
