@@ -80,7 +80,7 @@ install_case() {
   case_name="$1"; want="$2"; shift 2
   home="$work/home-$case_name"
   mkdir -p "$home"
-  env HOME="$home" SHELL=/bin/bash OPROBE_RELEASE_BASE="$base" OPROBE_API="http://127.0.0.1:$port/api" \
+  env -u XDG_CONFIG_HOME HOME="$home" SHELL=/bin/bash OPROBE_RELEASE_BASE="$base" OPROBE_API="http://127.0.0.1:$port/api" \
     "$@" sh "$installer" </dev/null > "$work/out-$case_name" 2>&1 ||
     { cat "$work/out-$case_name"; fail "$case_name: install.sh failed"; }
   got=$("$home/.local/bin/oprobe")
