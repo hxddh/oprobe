@@ -900,6 +900,11 @@ fn target_args(t: &TargetIn) -> TargetArgs {
 }
 
 /// The CLI arguments selecting `t` (for child commands).
+/// [`target_cli`] without the positional target: the override flags alone.
+fn target_flags_cli(t: &TargetIn) -> Vec<String> {
+    target_cli(t).into_iter().skip(1).collect()
+}
+
 fn target_cli(t: &TargetIn) -> Vec<String> {
     let mut v = vec![t.target.clone()];
     if let Some(e) = &t.endpoint {
@@ -2285,6 +2290,10 @@ fn plan_cli(st: &State, a: &PlanIn, p: &Prepared) -> Vec<String> {
         args.extend(target_cli(&a.target));
     } else if a.from.is_none() {
         args.extend(target_cli(&effective_target(a, &p.profile)));
+    } else {
+        // `from` names the target; its overrides (region, anonymous, endpoint, options…)
+        // still apply, as they did to the profile `prepare` checked.
+        args.extend(target_flags_cli(&a.target));
     }
     args.extend(workload_cli(&a.workload));
     if let Some(f) = &a.from {
@@ -2381,6 +2390,20 @@ fn list_targets(st: &Arc<State>) -> anyhow::Result<Reply> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn target_overrides_survive_a_from_replay() {
+        let t = TargetIn {
+            region: Some("eu-west-1".into()),
+            anonymous: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            target_flags_cli(&t),
+            ["--region", "eu-west-1", "--anonymous"]
+        );
+        assert!(target_flags_cli(&TargetIn::default()).is_empty());
+    }
 
     #[test]
     fn specs_are_unique_and_schemas_are_objects() {

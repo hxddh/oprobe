@@ -4,6 +4,14 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## v4.0.2 — 2026-11-21
+
+### Fixed
+
+- MCP `recommend_config` with `from` and no `target` forwards the call's target overrides
+  (`region`, `anonymous`, `endpoint`, `options`, …) to the `fix` it runs, as they were applied to
+  the profile the server checked; they were dropped, so the measurement used the stored settings.
+
 ## v4.0.1 — 2026-11-21
 
 A patch release for four review findings in 4.0.0; no breaking changes.
