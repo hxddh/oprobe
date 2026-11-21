@@ -45,6 +45,21 @@ pub struct AnalyzeOutput {
 }
 
 impl CommandOutput for AnalyzeOutput {
+    fn next(&self) -> Vec<crate::output::NextStep> {
+        vec![
+            crate::cli::next::explain(&self.run_id),
+            crate::output::NextStep::new(
+                "requests by status (failures)",
+                format!(
+                    "oprobe analyze {} --by status",
+                    crate::model::spec::shell_quote(&self.run_id)
+                ),
+            )
+            .with_mcp("analyze_run", serde_json::json!({ "run": self.run_id })),
+            crate::cli::next::show(&self.run_id),
+        ]
+    }
+
     fn text(&self) -> String {
         let mut o = format!(
             "{} run {} · {} of {} requests{}\n",

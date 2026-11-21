@@ -148,6 +148,14 @@ pub struct MatrixOutput {
 }
 
 impl CommandOutput for MatrixOutput {
+    fn next(&self) -> Vec<crate::output::NextStep> {
+        vec![crate::cli::next::list_runs()]
+    }
+
+    fn formats() -> &'static [crate::output::OutputFormat] {
+        crate::output::WITH_MD
+    }
+
     fn text(&self) -> String {
         let keys: Vec<String> = self
             .cells
@@ -257,6 +265,10 @@ impl MatrixPlanOutput {
 }
 
 impl CommandOutput for MatrixPlanOutput {
+    fn next(&self) -> Vec<crate::output::NextStep> {
+        vec![crate::cli::next::list_runs()]
+    }
+
     fn text(&self) -> String {
         let rows: Vec<Vec<String>> = self
             .cells

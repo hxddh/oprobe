@@ -4,14 +4,100 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::net::HttpVersion;
 use crate::util::{ByteSize, HumanDuration};
 
+/// A typed `usage.invalid_argument` error (values given as flags, tool arguments or in a
+/// profile; [`Profile::load`] re-codes them `config.invalid`).
+fn invalid(msg: impl Into<String>) -> anyhow::Error {
+    crate::input::invalid(msg).into()
+}
+
+fn usage(msg: impl Into<String>) -> anyhow::Error {
+    invalid(msg)
+}
+
+/// Defaults of `oprobe tune`, shared with the app's Tune page and MCP so every surface runs
+/// the same search (clap needs them as `&'static str`; [`defaults`] parses them).
+pub mod tune_defaults {
+    /// Measurement window per trial.
+    pub const TRIAL_DURATION: &str = "5s";
+    /// Warmup per trial.
+    pub const TRIAL_WARMUP: &str = "1s";
+    /// Maximum number of trials.
+    pub const MAX_TRIALS: usize = 24;
+    /// Fewest trials a search can run (a baseline and one candidate).
+    pub const MIN_TRIALS: usize = 2;
+    /// Highest concurrency to try.
+    pub const MAX_CONCURRENCY: usize = 256;
+    /// Pause after a throttled trial.
+    pub const COOLDOWN: &str = "5s";
+    /// Share of throttled requests a configuration may cause and still be feasible (v4 §6).
+    pub const MAX_THROTTLE_RATIO: f64 = 0.001;
+    /// Repeats of each trial near the throttle boundary (v4 §6).
+    pub const BOUNDARY_REPEATS: usize = 2;
+}
+
+/// The tuner's built-in search settings, parsed.
+#[derive(Clone, Debug, PartialEq, Serialize, schemars::JsonSchema)]
+pub struct TuneDefaults {
+    pub trial_duration: HumanDuration,
+    pub trial_warmup: HumanDuration,
+    pub max_trials: usize,
+    pub min_trials: usize,
+    pub max_concurrency: usize,
+    pub cooldown: HumanDuration,
+    pub max_throttle_ratio: f64,
+    pub boundary_repeats: usize,
+}
+
+/// Every built-in default in one place (design v4 §1): the CLI, the App, MCP and tune read
+/// these instead of hard-coding their own. A profile's defaults are `Profile::from_target`'s
+/// (the same values); `[defaults]` in the config file and flags override them.
+#[derive(Clone, Debug, PartialEq, Serialize, schemars::JsonSchema)]
+pub struct BuiltinDefaults {
+    pub workload: WorkloadSpec,
+    pub knobs: Knobs,
+    pub sla: Sla,
+    pub cost: CostSpec,
+    pub tune: TuneDefaults,
+    /// Spare in-flight capacity kept below a measured ceiling (`analysis::capacity`).
+    pub headroom_ratio: f64,
+    /// The demo target (`oprobe demo`, the App's Demo button).
+    pub demo_target: String,
+    /// The demo's measurement window.
+    pub demo_duration: HumanDuration,
+}
+
+/// The built-in defaults (see [`BuiltinDefaults`]).
+pub fn defaults() -> BuiltinDefaults {
+    let d = |s: &str| HumanDuration(crate::util::parse_duration(s).unwrap_or_default());
+    BuiltinDefaults {
+        workload: WorkloadSpec::default(),
+        knobs: Knobs::default(),
+        sla: Sla::default(),
+        cost: CostSpec::default(),
+        tune: TuneDefaults {
+            trial_duration: d(tune_defaults::TRIAL_DURATION),
+            trial_warmup: d(tune_defaults::TRIAL_WARMUP),
+            max_trials: tune_defaults::MAX_TRIALS,
+            min_trials: tune_defaults::MIN_TRIALS,
+            max_concurrency: tune_defaults::MAX_CONCURRENCY,
+            cooldown: d(tune_defaults::COOLDOWN),
+            max_throttle_ratio: tune_defaults::MAX_THROTTLE_RATIO,
+            boundary_repeats: tune_defaults::BOUNDARY_REPEATS,
+        },
+        headroom_ratio: crate::analysis::capacity::DEFAULT_HEADROOM_RATIO,
+        demo_target: "lab://demo".into(),
+        demo_duration: HumanDuration::secs(8),
+    }
+}
+
 /// Complete, round-trippable benchmark profile.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Profile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -28,7 +114,7 @@ pub struct Profile {
 }
 
 /// Storage target. Either `url = "s3://bucket/prefix"` or explicit `scheme` + `options`.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TargetSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -50,7 +136,9 @@ pub struct TargetSpec {
     pub proxy: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "kebab-case")]
 pub enum Preset {
     /// Lakehouse scan: stat + footer read + vectored column-chunk range reads.
@@ -132,25 +220,9 @@ impl Preset {
         }
     }
 
+    /// Typed: see [`crate::input::preset`].
     pub fn parse(s: &str) -> Result<Self> {
-        match s.trim().to_ascii_lowercase().replace('_', "-").as_str() {
-            "parquet" | "lakehouse" => Ok(Preset::Parquet),
-            "checkpoint" | "ckpt" => Ok(Preset::Checkpoint),
-            "small-files" | "small" => Ok(Preset::SmallFiles),
-            "metadata" | "meta" => Ok(Preset::Metadata),
-            "mixed" => Ok(Preset::Mixed),
-            "parquet-suffix" | "suffix" => Ok(Preset::ParquetSuffix),
-            "delete" | "deleter" | "churn" => Ok(Preset::Delete),
-            "copy" => Ok(Preset::Copy),
-            "list-paged" | "paged-list" => Ok(Preset::ListPaged),
-            "presign" | "presigned" => Ok(Preset::Presign),
-            "conditional" | "conditional-writes" => Ok(Preset::Conditional),
-            "metadata-heavy" => Ok(Preset::MetadataHeavy),
-            other => bail!(
-                "unknown preset `{other}` (choose: {})",
-                Preset::ALL.map(|p| p.slug()).join(", ")
-            ),
-        }
+        Ok(crate::input::preset(s)?)
     }
 
     /// Default dataset shape and operation mix for the preset.
@@ -338,7 +410,7 @@ impl Preset {
 }
 
 /// One weighted operation in the workload mix.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct OpSpec {
     #[serde(default = "default_weight")]
     pub weight: u32,
@@ -350,7 +422,7 @@ fn default_weight() -> u32 {
     1
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum OpKind {
     /// Read a random range of `size` bytes, or the whole object when `size` is omitted.
@@ -451,31 +523,9 @@ pub enum Access {
 
 impl std::str::FromStr for Access {
     type Err = anyhow::Error;
+    /// Typed: see [`crate::input::access`].
     fn from_str(s: &str) -> Result<Self> {
-        let s = s.trim().to_ascii_lowercase();
-        if s == "uniform" {
-            return Ok(Access::Uniform);
-        }
-        if let Some(v) = s.strip_prefix("zipf") {
-            let v = v.trim_start_matches([':', '=']);
-            let exp = if v.is_empty() { 1.1 } else { v.parse()? };
-            anyhow::ensure!(exp > 0.0, "zipf exponent must be > 0");
-            return Ok(Access::Zipf(exp));
-        }
-        if let Some(v) = s.strip_prefix("hotset") {
-            let v = v.trim_start_matches([':', '=']);
-            let (f, p) = v.split_once('/').unwrap_or(("0.2", "0.8"));
-            let (fraction, probability): (f64, f64) = (f.parse()?, p.parse()?);
-            anyhow::ensure!(
-                (0.0..=1.0).contains(&fraction) && (0.0..=1.0).contains(&probability),
-                "hotset fractions must be within 0..1"
-            );
-            return Ok(Access::Hotset {
-                fraction,
-                probability,
-            });
-        }
-        bail!("unknown access pattern `{s}` (uniform | zipf:1.1 | hotset:0.2/0.8)")
+        Ok(crate::input::access(s)?)
     }
 }
 
@@ -489,6 +539,18 @@ impl std::fmt::Display for Access {
                 probability,
             } => write!(f, "hotset:{fraction}/{probability}"),
         }
+    }
+}
+
+impl schemars::JsonSchema for Access {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "Access".into()
+    }
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "type": "string",
+            "description": "Key popularity: `uniform`, `zipf:S` (e.g. `zipf:1.1`) or `hotset:F/P` (e.g. `hotset:0.2/0.8`)."
+        })
     }
 }
 
@@ -507,7 +569,7 @@ impl<'de> Deserialize<'de> for Access {
 }
 
 /// Objects the workload reads from.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DatasetSpec {
     #[serde(default = "default_objects")]
@@ -548,7 +610,7 @@ impl Default for DatasetSpec {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WorkloadSpec {
     #[serde(default)]
@@ -650,7 +712,7 @@ impl TransportMode {
 }
 
 /// Client-side configuration under test / being tuned.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Knobs {
     /// Concurrent logical operations (closed-loop workers, or open-loop in-flight cap).
@@ -737,10 +799,11 @@ impl ProviderKnobs {
         if self.is_default() {
             return Ok(Vec::new());
         }
-        anyhow::ensure!(
-            scheme == "s3",
-            "addressing / checksum / sse knobs apply to S3-compatible targets only (this target is `{scheme}`)"
-        );
+        if scheme != "s3" {
+            return Err(usage(format!(
+                "addressing / checksum / sse knobs apply to S3-compatible targets only (this target is `{scheme}`)"
+            )));
+        }
         let mut o = Vec::new();
         match self.addressing {
             Addressing::Auto => {}
@@ -749,18 +812,23 @@ impl ProviderKnobs {
         }
         if let Some(c) = &self.checksum {
             let c = c.trim().to_ascii_lowercase();
-            anyhow::ensure!(
-                c == "crc32c",
-                "unsupported checksum `{c}` (OpenDAL's S3 service supports crc32c)"
-            );
+            if c != "crc32c" {
+                return Err(crate::input::invalid(format!("unsupported checksum `{c}`"))
+                    .with_hint("OpenDAL's S3 service supports crc32c")
+                    .into());
+            }
             o.push(("checksum_algorithm", c));
         }
         if let Some(s) = &self.sse {
             let s = s.trim();
-            anyhow::ensure!(
-                matches!(s, "AES256" | "aws:kms" | "aws:kms:dsse"),
-                "unsupported sse `{s}` (AES256, aws:kms or aws:kms:dsse)"
-            );
+            if !matches!(s, "AES256" | "aws:kms" | "aws:kms:dsse") {
+                return Err(crate::input::invalid(format!("unsupported sse `{s}`"))
+                    .with_hint(crate::input::choices_hint(
+                        s,
+                        &["AES256", "aws:kms", "aws:kms:dsse"],
+                    ))
+                    .into());
+            }
             o.push(("server_side_encryption", s.to_owned()));
         }
         Ok(o)
@@ -849,7 +917,7 @@ impl Knobs {
 /// Service level objectives. `oprobe run` / `oprobe tune` exit with code 3 when the measured
 /// result breaches them (unless `enforce = false` / `--sla none`); the tuner rejects trials that
 /// breach them and the diagnosis grades findings against them.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Sla {
     /// Turn a breach into exit code 3. Corrupted data (CRC mismatch) is always a breach.
@@ -890,25 +958,27 @@ impl Sla {
     }
 
     pub fn validate(&self) -> Result<()> {
-        anyhow::ensure!(
-            (0.0..=1.0).contains(&self.max_error_rate),
-            "sla.max_error_rate must be within 0..1 (e.g. 0.01 = 1%)"
-        );
-        if let Some(t) = self.max_throttle_rate {
-            anyhow::ensure!(
-                (0.0..=1.0).contains(&t),
-                "sla.max_throttle_rate must be within 0..1"
-            );
+        if !(0.0..=1.0).contains(&self.max_error_rate) {
+            return Err(invalid(
+                "sla.max_error_rate must be within 0..1 (e.g. 0.01 = 1%)",
+            ));
         }
-        if let Some(p) = self.p99_ms {
-            anyhow::ensure!(p > 0.0, "sla.p99_ms must be > 0");
+        if let Some(t) = self.max_throttle_rate
+            && !(0.0..=1.0).contains(&t)
+        {
+            return Err(invalid("sla.max_throttle_rate must be within 0..1"));
+        }
+        if let Some(p) = self.p99_ms
+            && !(p.is_finite() && p > 0.0)
+        {
+            return Err(invalid("sla.p99_ms must be > 0"));
         }
         Ok(())
     }
 }
 
 /// Business volume used to project measured per-operation costs to a monthly bill.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CostSpec {
     /// Pricing preset: aws-s3, gcs, azure-blob, cloudflare-r2, backblaze-b2, aliyun-oss.
@@ -1006,8 +1076,10 @@ impl TargetSpec {
         if let Some(t) = Self::from_fs_url(raw) {
             return Ok(t);
         }
-        let u = url::Url::parse(raw).with_context(|| {
-            format!("invalid storage URL `{raw}` (examples: s3://bucket/prefix, fs:///tmp/bench, memory://, lab://demo)")
+        crate::input::storage_url(raw)?;
+        let u = url::Url::parse(raw).map_err(|e| {
+            crate::input::invalid(format!("invalid storage URL `{raw}`: {e}"))
+                .with_hint(crate::input::URL_EXAMPLES)
         })?;
         let scheme = u.scheme().to_ascii_lowercase();
         let mut options = BTreeMap::new();
@@ -1024,7 +1096,10 @@ impl TargetSpec {
         } else {
             Some(path.to_owned())
         };
-        let host = u.host_str().map(str::to_owned);
+        let host = u.host_str().map(str::to_owned).filter(|h| !h.is_empty());
+        let need = |h: Option<String>, what: &str| -> Result<String> {
+            h.ok_or_else(|| crate::input::missing_bucket(&scheme, what).into())
+        };
         let scheme = match scheme.as_str() {
             "memory" | "mem" => "memory",
             "fs" | "file" => {
@@ -1040,7 +1115,7 @@ impl TargetSpec {
                 "fs"
             }
             "s3" | "s3a" | "r2" | "minio" => {
-                let bucket = host.context("s3:// URL needs a bucket: s3://my-bucket/prefix")?;
+                let bucket = need(host, "bucket")?;
                 options.insert("bucket".into(), bucket);
                 if let Some(r) = root {
                     options.insert("root".into(), r);
@@ -1048,14 +1123,14 @@ impl TargetSpec {
                 "s3"
             }
             "gs" | "gcs" => {
-                options.insert("bucket".into(), host.context("gcs:// URL needs a bucket")?);
+                options.insert("bucket".into(), need(host, "bucket")?);
                 if let Some(r) = root {
                     options.insert("root".into(), r);
                 }
                 "gcs"
             }
             "oss" | "cos" | "b2" => {
-                options.insert("bucket".into(), host.context("URL needs a bucket")?);
+                options.insert("bucket".into(), need(host, "bucket")?);
                 if let Some(r) = root {
                     options.insert("root".into(), r);
                 }
@@ -1066,10 +1141,7 @@ impl TargetSpec {
                 }
             }
             "azblob" | "az" | "azure" => {
-                options.insert(
-                    "container".into(),
-                    host.context("azblob:// URL needs a container")?,
-                );
+                options.insert("container".into(), need(host, "container")?);
                 if let Some(r) = root {
                     options.insert("root".into(), r);
                 }
@@ -1077,7 +1149,7 @@ impl TargetSpec {
             }
             "webdav" | "webdavs" => {
                 let s = if scheme == "webdavs" { "https" } else { "http" };
-                let h = host.context("webdav:// URL needs a host")?;
+                let h = need(host, "host")?;
                 let port = u.port().map(|p| format!(":{p}")).unwrap_or_default();
                 options.insert("endpoint".into(), format!("{s}://{h}{port}"));
                 // Credentials in the URL become backend options (redacted in every output)
@@ -1094,7 +1166,7 @@ impl TargetSpec {
                 "webdav"
             }
             "lab" => {
-                let scenario = crate::lab::Scenario::parse(host.as_deref().unwrap_or_default())?;
+                let scenario = crate::input::lab_scenario(host.as_deref().unwrap_or_default())?;
                 let lab = crate::lab::shared(scenario)?;
                 options.insert("bucket".into(), crate::lab::LAB_BUCKET.into());
                 options.insert("region".into(), "us-east-1".into());
@@ -1119,10 +1191,18 @@ impl TargetSpec {
                     }
                     other
                 }
-                None => bail!(
-                    "unsupported storage scheme `{other}` (supported: {}, lab, memory)",
-                    supported_schemes().join(", ")
-                ),
+                None => {
+                    return Err(crate::input::scheme(other)
+                        .err()
+                        .unwrap_or_else(|| {
+                            crate::input::invalid(format!("unsupported storage scheme `{other}`"))
+                                .with_hint(format!(
+                                    "supported: {}, lab, memory",
+                                    supported_schemes().join(", ")
+                                ))
+                        })
+                        .into());
+                }
             },
         };
         Ok(Self {
@@ -1139,7 +1219,7 @@ impl TargetSpec {
             let url = self
                 .url
                 .as_deref()
-                .context("target needs either `url` or `scheme`")?;
+                .ok_or_else(|| invalid("target needs either `url` or `scheme`"))?;
             let mut base = Self::from_url(url)?;
             for (k, v) in &self.options {
                 base.options.insert(k.clone(), v.clone());
@@ -1164,17 +1244,20 @@ impl TargetSpec {
             .filter(|k| t.options.get(*k).is_none_or(|v| v.trim().is_empty()))
             .collect();
         if !missing.is_empty() {
-            bail!(
-                "the `{}` service needs {}: add `-o {}=...` (or `?{}=...` in the URL, or under [target.options])",
+            return Err(crate::input::invalid(format!(
+                "the `{}` service needs {}",
                 t.scheme,
                 missing
                     .iter()
                     .map(|k| format!("`{k}`"))
                     .collect::<Vec<_>>()
                     .join(" and "),
-                missing[0],
-                missing[0]
-            );
+            ))
+            .with_hint(format!(
+                "add `--option {}=VALUE` (or `?{}=VALUE` in the URL, or under [targets.NAME.options] in the config file)",
+                missing[0], missing[0]
+            ))
+            .into());
         }
         Ok(t)
     }
@@ -1187,7 +1270,7 @@ impl TargetSpec {
         let url = self
             .url
             .as_deref()
-            .context("target needs either `url` or `scheme`")?;
+            .ok_or_else(|| invalid("target needs either `url` or `scheme`"))?;
         Ok(Self::from_url(url)?.scheme)
     }
 
@@ -1215,11 +1298,15 @@ impl TargetSpec {
                 let account = self.options.remove("account_id");
                 if !has_endpoint {
                     let Some(account) = account.filter(|a| !a.trim().is_empty()) else {
-                        bail!(
-                            "r2:// needs your Cloudflare account: add `-o account_id=<ACCOUNT_ID>` (or \
-                             `account_id = \"${{R2_ACCOUNT_ID}}\"` under [target.options]), or pass \
-                             `--endpoint https://<ACCOUNT_ID>.r2.cloudflarestorage.com`"
-                        );
+                        return Err(crate::input::invalid(
+                            "r2:// needs your Cloudflare account_id or an endpoint",
+                        )
+                        .with_hint(
+                            "add `--option account_id=<ACCOUNT_ID>` (or `account_id = \"${R2_ACCOUNT_ID}\"` \
+                             under [targets.NAME.options]), or pass \
+                             `--endpoint https://<ACCOUNT_ID>.r2.cloudflarestorage.com`",
+                        )
+                        .into());
                     };
                     self.options.insert(
                         "endpoint".into(),
@@ -1232,9 +1319,13 @@ impl TargetSpec {
             }
             "minio" => {
                 if !has_endpoint {
-                    bail!(
-                        "minio:// needs the server's endpoint: pass `--endpoint http://<host>:9000` \
-                         (or `endpoint = ...` under [target.options])"
+                    return Err(
+                        crate::input::invalid("minio:// needs the server's endpoint")
+                            .with_hint(
+                                "pass `--endpoint http://<host>:9000` (or `endpoint = ...` under \
+                             [targets.NAME.options])",
+                            )
+                            .into(),
                     );
                 }
                 self.options
@@ -1328,9 +1419,14 @@ pub fn supported_schemes() -> Vec<&'static str> {
 fn uri_options(scheme: &str, raw: &str) -> Result<Option<BTreeMap<String, String>>> {
     use opendal::services::*;
     fn opts<C: opendal::Configurator>(raw: &str) -> Result<BTreeMap<String, String>> {
-        let uri = opendal::OperatorUri::new(raw, Vec::<(String, String)>::new())
-            .with_context(|| format!("invalid storage URL `{raw}`"))?;
-        let cfg = C::from_uri(&uri).with_context(|| format!("cannot read `{raw}`"))?;
+        let uri = opendal::OperatorUri::new(raw, Vec::<(String, String)>::new()).map_err(|e| {
+            crate::input::invalid(format!("invalid storage URL `{raw}`: {e}"))
+                .with_hint(crate::input::URL_EXAMPLES)
+        })?;
+        let cfg = C::from_uri(&uri).map_err(|e| {
+            crate::input::invalid(format!("cannot read storage URL `{raw}`: {e}"))
+                .with_hint(crate::input::URL_EXAMPLES)
+        })?;
         let v = serde_json::to_value(&cfg)?;
         let mut out = BTreeMap::new();
         if let serde_json::Value::Object(m) = v {
@@ -1357,13 +1453,17 @@ fn uri_options(scheme: &str, raw: &str) -> Result<Option<BTreeMap<String, String
         "upyun" => opts::<UpyunConfig>(raw)?,
         "http" | "https" => {
             let mut o = BTreeMap::new();
-            let u = url::Url::parse(raw)?;
+            let u = url::Url::parse(raw)
+                .map_err(|e| crate::input::invalid(format!("invalid URL `{raw}`: {e}")))?;
             o.insert(
                 "endpoint".into(),
                 format!(
                     "{}://{}",
                     u.scheme(),
-                    u.host_str().context("http:// URL needs a host")?
+                    u.host_str().filter(|h| !h.is_empty()).ok_or_else(|| {
+                        crate::input::invalid(format!("`{raw}` needs a host"))
+                            .with_hint("e.g. https://files.example.com/data")
+                    })?
                 ) + &u.port().map(|p| format!(":{p}")).unwrap_or_default(),
             );
             let path = u.path().trim_end_matches('/');
@@ -1404,9 +1504,13 @@ pub fn anonymous_options(scheme: &str) -> Result<&'static [(&'static str, &'stat
         ],
         // No credentials at all: unsigned requests.
         "azblob" | "oss" => &[("skip_signature", "true")],
-        other => bail!(
-            "--anonymous is not supported for `{other}` (OpenDAL's {other} service has no unsigned mode); configure credentials instead"
-        ),
+        other => {
+            return Err(crate::input::invalid(format!(
+                "--anonymous is not supported for `{other}` (OpenDAL's {other} service has no unsigned mode)"
+            ))
+            .with_hint("configure credentials instead (`oprobe doctor TARGET` shows which it finds)")
+            .into());
+        }
     })
 }
 
@@ -1447,10 +1551,14 @@ pub fn expand_env(v: &str) -> Result<String> {
         let after = &rest[start + 2..];
         let end = after
             .find('}')
-            .with_context(|| format!("unterminated `${{` in `{v}`"))?;
+            .ok_or_else(|| invalid(format!("unterminated `${{` in `{v}`")))?;
         let name = &after[..end];
-        let val = std::env::var(name).with_context(|| {
-            format!("environment variable `{name}` referenced by the profile is not set")
+        let val = std::env::var(name).map_err(|_| {
+            crate::errors::OprobeError::new(
+                crate::errors::ErrorCode::ConfigInvalid,
+                format!("environment variable `{name}` referenced by the profile is not set"),
+            )
+            .with_hint(format!("export {name}=… or edit the reference"))
         })?;
         out.push_str(&val);
         rest = &after[end + 1..];
@@ -1460,51 +1568,111 @@ pub fn expand_env(v: &str) -> Result<String> {
 }
 
 impl Profile {
+    /// A `lab://NAME` target starts from its scenario's default workload
+    /// ([`crate::lab::Scenario::defaults`]).
     pub fn from_target(target: TargetSpec) -> Self {
-        Self {
+        let scenario = target.url.as_deref().and_then(crate::lab::Scenario::of_url);
+        let mut p = Self {
             name: None,
             target,
             workload: WorkloadSpec::default(),
             knobs: Knobs::default(),
             sla: Sla::default(),
             cost: CostSpec::default(),
+        };
+        if let Some(sc) = scenario {
+            sc.apply_defaults(&mut p);
         }
+        p
     }
 
+    /// Load and validate a profile file: a missing file is `usage.invalid_argument`, a file that
+    /// does not parse or validate is `config.invalid`.
     pub fn load(path: &Path) -> Result<Self> {
-        let raw = std::fs::read_to_string(path)
-            .with_context(|| format!("cannot read profile `{}`", path.display()))?;
-        let p: Profile = toml::from_str(&raw)
-            .with_context(|| format!("invalid profile `{}`", path.display()))?;
-        p.validate()?;
+        use crate::errors::{ErrorCode, OprobeError};
+        let raw = std::fs::read_to_string(path).map_err(|e| {
+            OprobeError::new(
+                ErrorCode::UsageInvalidArgument,
+                format!("cannot read profile `{}`: {e}", path.display()),
+            )
+            .with_hint(
+                "pass the path of a profile TOML file (`oprobe init > profile.toml` writes one)",
+            )
+        })?;
+        let p: Profile = toml::from_str(&raw).map_err(|e| {
+            OprobeError::new(
+                ErrorCode::ConfigInvalid,
+                format!("invalid profile `{}`: {e}", path.display()),
+            )
+        })?;
+        p.validate().map_err(|e| {
+            let body = crate::errors::classify(&e, "s3");
+            let mut o = OprobeError::new(
+                ErrorCode::ConfigInvalid,
+                format!("invalid profile `{}`: {}", path.display(), body.message),
+            );
+            o.hint = body.hint;
+            o
+        })?;
         Ok(p)
     }
 
+    /// Check every value; errors are typed (`usage.invalid_argument`, or `config.unknown_option`
+    /// for backend options the service would ignore).
     pub fn validate(&self) -> Result<()> {
         self.target.normalized()?;
         let k = &self.knobs;
-        anyhow::ensure!(k.concurrency >= 1, "knobs.concurrency must be >= 1");
-        anyhow::ensure!(k.io_concurrency >= 1, "knobs.io_concurrency must be >= 1");
-        anyhow::ensure!(k.chunk_size.0 >= 4096, "knobs.chunk_size must be >= 4KiB");
+        if k.concurrency < 1 {
+            return Err(invalid("knobs.concurrency must be >= 1"));
+        }
+        if k.io_concurrency < 1 {
+            return Err(invalid("knobs.io_concurrency must be >= 1"));
+        }
+        if k.chunk_size.0 < 4096 {
+            return Err(invalid("knobs.chunk_size must be >= 4KiB"));
+        }
         let w = &self.workload;
-        if let Some(r) = w.rate {
-            anyhow::ensure!(r > 0.0, "workload.rate must be > 0");
+        if let Some(r) = w.rate
+            && !(r.is_finite() && r > 0.0)
+        {
+            return Err(invalid("workload.rate must be > 0"));
         }
         let ds = w.effective_dataset();
-        anyhow::ensure!(
-            ds.existing_prefix.is_some()
-                || ds.objects >= 1
-                || w.effective_mix().iter().all(|m| !m.op.needs_dataset()),
-            "workload.dataset.objects must be >= 1 for read workloads"
-        );
-        anyhow::ensure!(
-            w.effective_mix().iter().any(|m| m.weight > 0),
-            "workload.mix needs at least one op with weight > 0"
-        );
-        anyhow::ensure!(
-            (0.0..=1.0).contains(&self.cost.egress_fraction),
-            "cost.egress_fraction must be within 0..1"
-        );
+        let mix = w.effective_mix();
+        let reads = mix.iter().any(|m| m.weight > 0 && m.op.needs_dataset());
+        if ds.existing_prefix.is_none() && ds.objects < 1 && reads {
+            return Err(invalid(
+                "workload.dataset.objects must be >= 1 for read workloads",
+            ));
+        }
+        if ds.existing_prefix.is_none() && ds.object_size.0 == 0 && reads {
+            return Err(invalid(
+                "workload.dataset.object_size must be > 0 for read workloads",
+            ));
+        }
+        if !mix.iter().any(|m| m.weight > 0) {
+            return Err(invalid(
+                "workload.mix needs at least one op with weight > 0",
+            ));
+        }
+        let c = &self.cost;
+        if !(0.0..=1.0).contains(&c.egress_fraction) {
+            return Err(invalid("cost.egress_fraction must be within 0..1"));
+        }
+        if !(c.monthly_ops.is_finite() && c.monthly_ops >= 0.0) {
+            return Err(invalid("cost.monthly_ops must be >= 0"));
+        }
+        if !(c.stored_gib.is_finite() && c.stored_gib >= 0.0) {
+            return Err(invalid("cost.stored_gib must be >= 0"));
+        }
+        if let Some(p) = &c.provider {
+            crate::input::provider(p)?;
+        }
+        if let Some(e) = self.target.options.get("endpoint")
+            && !e.contains("${")
+        {
+            crate::input::endpoint(e)?;
+        }
         self.sla.validate()?;
         Ok(())
     }
@@ -1602,10 +1770,15 @@ mod tests {
 
     #[test]
     fn r2_and_minio_never_fall_back_to_aws() {
+        let full = |e: anyhow::Error| {
+            let b = crate::errors::classify(&e, "s3");
+            assert_eq!(b.code, crate::errors::ErrorCode::UsageInvalidArgument);
+            format!("{} {}", b.message, b.hint.unwrap_or_default())
+        };
         let e = TargetSpec::from_url("r2://bkt").unwrap().normalized();
-        assert!(e.unwrap_err().to_string().contains("account_id"));
+        assert!(full(e.unwrap_err()).contains("account_id"));
         let e = TargetSpec::from_url("minio://bkt").unwrap().normalized();
-        assert!(e.unwrap_err().to_string().contains("--endpoint"));
+        assert!(full(e.unwrap_err()).contains("--endpoint"));
 
         let mut r2 = TargetSpec::from_url("r2://bkt/p").unwrap();
         r2.options.insert("account_id".into(), "abc123".into());

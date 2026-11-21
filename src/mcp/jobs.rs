@@ -73,6 +73,9 @@ struct Inner {
     events: VecDeque<Event>,
     user_cancelled: bool,
     ended_s: Option<f64>,
+    /// The final status, set by [`Job::finish`] and published with the final event.
+    ending: Option<JobStatus>,
+    recommendation: Option<Box<crate::tune::recommend::Recommendation>>,
 }
 
 /// One background run or tune.
@@ -95,6 +98,8 @@ pub struct JobView {
     pub error: Option<ErrorBody>,
     pub path: Option<String>,
     pub wall_s: f64,
+    /// The tuner's recommendation (finished tune jobs).
+    pub recommendation: Option<Box<crate::tune::recommend::Recommendation>>,
 }
 
 impl Job {
@@ -115,6 +120,8 @@ impl Job {
                 events: VecDeque::new(),
                 user_cancelled: false,
                 ended_s: None,
+                ending: None,
+                recommendation: None,
             }),
             status,
         });
@@ -135,6 +142,11 @@ impl Job {
     fn record(&self, e: &Event) {
         let mut i = self.lock();
         match &e.kind {
+            // `done` is the job's, not the engine's: the run still cleans up and saves after
+            // its window closes, and `get_run` must not read `done` while it is `running`.
+            EventKind::Phase { phase } if *phase == Phase::Done && i.ending.is_none() => {
+                i.progress.phase = Some(Phase::Cleanup)
+            }
             EventKind::Phase { phase } => i.progress.phase = Some(*phase),
             EventKind::Progress {
                 elapsed_s,
@@ -142,7 +154,11 @@ impl Job {
                 ops,
                 requests,
             } => {
-                i.progress.elapsed_s = *elapsed_s;
+                // Never past the planned window.
+                i.progress.elapsed_s = match total_s {
+                    Some(t) if *t > 0.0 => elapsed_s.min(*t),
+                    _ => *elapsed_s,
+                };
                 i.progress.total_s = *total_s;
                 i.progress.ops_count = *ops;
                 i.progress.requests_count = *requests;
@@ -154,6 +170,16 @@ impl Job {
             i.events.pop_front();
         }
         i.events.push_back(e.clone());
+        // The final event and the final status are published under the same lock: a reader
+        // sees both or neither (AG-6).
+        let last = matches!(e.kind, EventKind::Result { .. } | EventKind::Error { .. });
+        if last && let Some(status) = i.ending {
+            if i.progress.phase.is_some() {
+                i.progress.phase = Some(Phase::Done);
+            }
+            i.ended_s = Some(self.started.elapsed().as_secs_f64());
+            self.status.send_replace(status);
+        }
     }
 
     pub fn status(&self) -> JobStatus {
@@ -182,6 +208,7 @@ impl Job {
             wall_s: i
                 .ended_s
                 .unwrap_or_else(|| self.started.elapsed().as_secs_f64()),
+            recommendation: i.recommendation.clone(),
         }
     }
 
@@ -196,19 +223,38 @@ impl Job {
         self.cancel.cancel();
     }
 
-    fn finish(&self, status: JobStatus, error: Option<ErrorBody>, path: Option<String>) {
+    /// End the job: the `done` phase, then its last event (`result`, or `error` when `error`
+    /// is set); recording that event flips the status (see [`Job::record`]).
+    fn finish(
+        &self,
+        status: JobStatus,
+        error: Option<ErrorBody>,
+        path: Option<String>,
+        run_id: Option<String>,
+    ) {
         {
             let mut i = self.lock();
-            i.error = error;
+            i.error = error.clone();
             if path.is_some() {
-                i.path = path;
+                i.path = path.clone();
             }
-            i.ended_s = Some(self.started.elapsed().as_secs_f64());
-            if i.progress.phase.is_some() {
-                i.progress.phase = Some(Phase::Done);
-            }
+            i.ending = Some(status);
         }
-        self.status.send_replace(status);
+        self.bus.emit(EventKind::Phase { phase: Phase::Done });
+        match error {
+            Some(error) => self.bus.emit(EventKind::Error { error }),
+            None => self.bus.emit(EventKind::Result {
+                run_id,
+                path,
+                report: None,
+                data: None,
+            }),
+        }
+        if !self.status().is_final() {
+            let mut i = self.lock();
+            i.ended_s = Some(self.started.elapsed().as_secs_f64());
+            self.status.send_replace(status);
+        }
     }
 }
 
@@ -288,11 +334,12 @@ impl Jobs {
                 _ = j.cancel.cancelled() => None,
             };
             let Some(_permit) = permit else {
-                j.finish(JobStatus::Cancelled, None, None);
+                j.finish(JobStatus::Cancelled, None, None, None);
                 return;
             };
             j.status.send_replace(JobStatus::Running);
             let scheme = spec.profile.target.scheme.clone();
+            let run_id = spec.run_id.to_string();
             let res = execute(&j, spec).await;
             let cancelled = j.lock().user_cancelled;
             match res {
@@ -305,10 +352,8 @@ impl Jobs {
                         None if cancelled => (JobStatus::Cancelled, None),
                         None => (JobStatus::Succeeded, None),
                     };
-                    if let Some(e) = &error {
-                        j.bus.emit(EventKind::Error { error: e.clone() });
-                    }
-                    j.finish(status, error, Some(o.path));
+                    j.lock().recommendation = o.recommendation;
+                    j.finish(status, error, Some(o.path), Some(run_id));
                 }
                 Err(e) => {
                     let mut body = crate::errors::classify(&e, &scheme);
@@ -316,15 +361,12 @@ impl Jobs {
                         body.code = ErrorCode::RunInterrupted;
                         body.retryable = true;
                     }
-                    j.bus.emit(EventKind::Error {
-                        error: body.clone(),
-                    });
                     let status = if cancelled {
                         JobStatus::Cancelled
                     } else {
                         JobStatus::Failed
                     };
-                    j.finish(status, Some(body), None);
+                    j.finish(status, Some(body), None, Some(run_id));
                 }
             }
         });
@@ -335,6 +377,7 @@ impl Jobs {
 struct Outcome {
     path: String,
     breach: Option<crate::guard::BudgetBreach>,
+    recommendation: Option<Box<crate::tune::recommend::Recommendation>>,
 }
 
 async fn execute(job: &Arc<Job>, spec: JobSpec) -> anyhow::Result<Outcome> {
@@ -360,7 +403,16 @@ async fn execute(job: &Arc<Job>, spec: JobSpec) -> anyhow::Result<Outcome> {
         Some(t) => (t.trial.duration + t.trial.warmup).as_secs_f64() * t.max_trials as f64,
         None => profile.workload.duration.get().as_secs_f64(),
     };
-    let progress = job.bus.progress_fn(Some(total_s));
+    // The engine reports `done` when the window closes; cleanup and saving follow. The job's
+    // stream says `cleaning up` then, and `done` only with its final event (`Job::finish`).
+    let inner = job.bus.progress_fn(Some(total_s));
+    let progress: crate::engine::ProgressFn = Arc::new(move |p| match p {
+        crate::engine::Progress::Snapshot(mut s) if s.phase == Phase::Done => {
+            s.phase = Phase::Cleanup;
+            inner(crate::engine::Progress::Snapshot(s))
+        }
+        other => inner(other),
+    });
     let rails = Rails {
         run_id: run_id.clone(),
         run_prefix,
@@ -401,14 +453,19 @@ async fn execute(job: &Arc<Job>, spec: JobSpec) -> anyhow::Result<Outcome> {
         job.bus.log(LogLevel::Warn, w.clone());
     }
     let path = m.path.map(|p| p.display().to_string()).unwrap_or_default();
-    job.bus.emit(EventKind::Result {
-        run_id: Some(run_id.to_string()),
-        path: Some(path.clone()),
-        report: None,
-        data: None,
-    });
+    // The tuner's answer as a recommendation (AG-1): the winner's knobs, profile, snippet and
+    // deltas, in `start_tune` / `get_run` structured output.
+    let recommendation = m
+        .run
+        .report
+        .tune
+        .as_ref()
+        .and_then(|t| t.recommendation.clone())
+        .map(Box::new);
+    let _ = run_id;
     Ok(Outcome {
         path,
         breach: m.breach,
+        recommendation,
     })
 }

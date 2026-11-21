@@ -83,12 +83,43 @@
         }
       ]
     },
+    "Direction": {
+      "description": "Which way a metric should move.",
+      "oneOf": [
+        {
+          "const": "increase",
+          "description": "Higher than the baseline.",
+          "type": "string"
+        },
+        {
+          "const": "decrease",
+          "description": "Lower than the baseline.",
+          "type": "string"
+        },
+        {
+          "const": "at_most",
+          "description": "At most the predicted value (e.g. a throttle budget).",
+          "type": "string"
+        },
+        {
+          "const": "at_least",
+          "description": "At least the predicted value.",
+          "type": "string"
+        },
+        {
+          "const": "unchanged",
+          "description": "Within the interval of the baseline (a change that must not cost anything).",
+          "type": "string"
+        }
+      ]
+    },
     "ErrorCode": {
       "description": "Stable error code. Serialized as its dotted string (e.g. `net.timeout`).",
       "enum": [
         "usage.invalid_argument",
         "usage.unknown_target",
         "usage.unknown_run",
+        "usage.unknown_baseline",
         "config.invalid",
         "config.unknown_option",
         "auth.no_credentials",
@@ -97,6 +128,8 @@
         "net.dns",
         "net.tls",
         "net.timeout",
+        "net.rate_limited",
+        "net.http",
         "storage.not_found",
         "storage.throttled",
         "storage.unsupported",
@@ -147,6 +180,46 @@
       ],
       "type": "object"
     },
+    "Expectation": {
+      "description": "What a change should do to one metric: a predicted value with an interval.",
+      "properties": {
+        "direction": {
+          "$ref": "#/$defs/Direction"
+        },
+        "hi": {
+          "description": "Upper end of the prediction interval, in `unit`.",
+          "format": "double",
+          "type": "number"
+        },
+        "lo": {
+          "description": "Lower end of the prediction interval, in `unit`.",
+          "format": "double",
+          "type": "number"
+        },
+        "metric": {
+          "description": "A report metric path, e.g. `summary.ops_per_s`, `throttled_request_ratio`, `p99_ms`.",
+          "type": "string"
+        },
+        "predicted": {
+          "description": "Predicted value, in `unit`.",
+          "format": "double",
+          "type": "number"
+        },
+        "unit": {
+          "description": "Unit of `predicted`, `lo` and `hi` (`ops_per_s`, `ms`, `ratio`, …).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "metric",
+        "direction",
+        "predicted",
+        "lo",
+        "hi",
+        "unit"
+      ],
+      "type": "object"
+    },
     "ExplainRun": {
       "description": "Narrated explanation of a stored run.",
       "properties": {
@@ -188,13 +261,6 @@
           },
           "type": "array"
         },
-        "next_commands": {
-          "description": "Commands worth running next.",
-          "items": {
-            "type": "string"
-          },
-          "type": "array"
-        },
         "run_id": {
           "type": "string"
         },
@@ -222,8 +288,7 @@
         "bottleneck",
         "interrupted",
         "findings",
-        "narrative",
-        "next_commands"
+        "narrative"
       ],
       "type": "object"
     },
@@ -283,7 +348,7 @@
           "description": "Attribute name: `api`, `status`, `protocol`, `connection`, `remote`, `attempt`,\n`error`, `stage` (the dominant stage of the request), `size` (bytes moved, binned),\n`rtt` (TCP RTT, binned), `time` (tenth of the run), `conn` (connection id).",
           "type": "string"
         },
-        "lift": {
+        "lift_ratio": {
           "description": "`selected_ratio / rest_ratio`, smoothed (add-one) and capped.",
           "format": "double",
           "type": "number"
@@ -313,7 +378,7 @@
         "value",
         "selected_ratio",
         "rest_ratio",
-        "lift",
+        "lift_ratio",
         "selected_count"
       ],
       "type": "object"
@@ -378,6 +443,94 @@
         "knobs",
         "docs"
       ],
+      "type": "object"
+    },
+    "McpCall": {
+      "description": "An MCP tool call: the tool and its arguments.",
+      "properties": {
+        "arguments": {
+          "additionalProperties": true,
+          "type": "object"
+        },
+        "tool": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "arguments"
+      ],
+      "type": "object"
+    },
+    "NextStep": {
+      "description": "A suggested next step: what it does, the CLI command, and the MCP call doing the same.",
+      "properties": {
+        "cli": {
+          "description": "The command line (`oprobe …`).",
+          "type": "string"
+        },
+        "mcp": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/McpCall"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The same step as an MCP tool call, when a tool does it."
+        },
+        "title": {
+          "description": "What the step does, in a few words.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "title",
+        "cli"
+      ],
+      "type": "object"
+    },
+    "Overrides": {
+      "description": "A change to a run: `--set key=value` pairs grouped by the part of the profile they change\n(canonical key names, see [`SET_KEYS`]). Built with [`Overrides::set`], which validates.",
+      "properties": {
+        "cost": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "knobs": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sla": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "target": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "workload": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        }
+      },
       "type": "object"
     },
     "Selection": {
@@ -555,25 +708,47 @@
       ]
     },
     "Verification": {
-      "description": "A concrete way to test a finding's advice.",
+      "description": "How to test a finding's advice (design v4 §5).",
       "properties": {
         "command": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "description": "`oprobe verify RUN CODE`: replays the run with and without the change and judges it.",
+          "type": "string"
         },
         "description": {
+          "description": "The hypothesis in words.",
+          "type": "string"
+        },
+        "expect": {
+          "description": "What the change should do (filled by the findings that can predict it).",
+          "items": {
+            "$ref": "#/$defs/Expectation"
+          },
+          "type": "array"
+        },
+        "overrides": {
+          "$ref": "#/$defs/Overrides",
+          "description": "The change to the run's spec."
+        },
+        "replay": {
+          "description": "The changed run as a self-contained `oprobe run TARGET …` command (no stored run\nneeded).",
+          "type": "string"
+        },
+        "rerun": {
+          "description": "`oprobe run --from RUN --set …`: the changed run alone.",
           "type": "string"
         }
       },
       "required": [
-        "description"
+        "description",
+        "overrides",
+        "command",
+        "rerun",
+        "replay"
       ],
       "type": "object"
     }
   },
-  "$id": "https://github.com/hxddh/oprobe/schemas/3/explain.json",
+  "$id": "https://github.com/hxddh/oprobe/schemas/4/explain.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "Result of `oprobe explain` (a run or a finding code)",
   "oneOf": [
@@ -626,6 +801,27 @@
       "type": "object"
     }
   ],
+  "properties": {
+    "next": {
+      "description": "Suggested next steps.",
+      "items": {
+        "$ref": "#/$defs/NextStep"
+      },
+      "type": "array"
+    },
+    "warnings": {
+      "description": "Warnings of the command (also printed on stderr in text mode).",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "next",
+    "warnings"
+  ],
   "title": "oprobe explain",
+  "type": "object",
   "x-rust-type": "ExplainOutput"
 }

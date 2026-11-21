@@ -103,6 +103,14 @@ pub struct Defaults {
     pub tune_max_concurrency_count: u64,
 }
 
+/// One command and the output formats it offers (`-o`).
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct CommandInfo {
+    /// The command path, e.g. `runs show`.
+    pub command: String,
+    pub formats: Vec<crate::output::OutputFormat>,
+}
+
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 pub struct Features {
     /// `oprobe top` (terminal workbench).
@@ -125,7 +133,10 @@ pub struct Capabilities {
     pub pricing_as_of: String,
     pub transports: Vec<NamedInfo>,
     pub http_versions: Vec<String>,
+    /// Every output format; `commands` says which command offers which.
     pub output_formats: Vec<String>,
+    /// Every command with its output formats (`-o` outside them is a usage error).
+    pub commands: Vec<CommandInfo>,
     pub exit_codes: Vec<ExitCodeInfo>,
     pub error_codes: Vec<ErrorCodeInfo>,
     pub finding_codes: Vec<FindingCodeInfo>,
@@ -260,6 +271,7 @@ impl Capabilities {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
+            commands: command_infos(),
             exit_codes,
             error_codes,
             finding_codes,
@@ -293,6 +305,36 @@ impl Capabilities {
     }
 }
 
+/// Every command of the CLI (from its definition) with its formats.
+fn command_infos() -> Vec<CommandInfo> {
+    use clap::CommandFactory;
+    let cmd = crate::cli::Cli::command();
+    let mut out = Vec::new();
+    for sub in cmd.get_subcommands() {
+        let name = sub.get_name();
+        if name == "help" {
+            continue;
+        }
+        let mut paths = Vec::new();
+        if sub.has_subcommands() {
+            for s in sub.get_subcommands() {
+                if s.get_name() != "help" {
+                    paths.push(format!("{name} {}", s.get_name()));
+                }
+            }
+        } else {
+            paths.push(name.to_owned());
+        }
+        for p in paths {
+            out.push(CommandInfo {
+                formats: crate::cli::formats::formats_of(&p).to_vec(),
+                command: p,
+            });
+        }
+    }
+    out
+}
+
 fn short_exit(code: u8) -> &'static str {
     match code {
         exit::OK => "ok",
@@ -306,6 +348,13 @@ fn short_exit(code: u8) -> &'static str {
 }
 
 impl CommandOutput for Capabilities {
+    fn next(&self) -> Vec<crate::output::NextStep> {
+        vec![
+            crate::cli::next::discover(),
+            crate::output::NextStep::new("the JSON Schemas of every output", "oprobe schema"),
+        ]
+    }
+
     fn text(&self) -> String {
         let mut o = format!("{} {}\n", bold("oprobe"), self.oprobe_version);
         let join = |v: Vec<String>| v.join(", ");

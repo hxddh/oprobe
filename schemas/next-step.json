@@ -1,0 +1,52 @@
+{
+  "$defs": {
+    "McpCall": {
+      "description": "An MCP tool call: the tool and its arguments.",
+      "properties": {
+        "arguments": {
+          "additionalProperties": true,
+          "type": "object"
+        },
+        "tool": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "arguments"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://github.com/hxddh/oprobe/schemas/4/next-step.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "One suggested next step of a command result (CLI command and MCP call)",
+  "properties": {
+    "cli": {
+      "description": "The command line (`oprobe …`).",
+      "type": "string"
+    },
+    "mcp": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/McpCall"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The same step as an MCP tool call, when a tool does it."
+    },
+    "title": {
+      "description": "What the step does, in a few words.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "title",
+    "cli"
+  ],
+  "title": "oprobe next-step",
+  "type": "object",
+  "x-rust-type": "NextStep"
+}

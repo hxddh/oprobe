@@ -11,6 +11,48 @@ use crate::ui::kit::{
 use crate::ui::model::fmt;
 use crate::ui::store::{JobKind, Phase, store};
 
+/// The trial table's columns: one list for the header and the rows, so every column has a
+/// header (UI-21).
+pub const TRIAL_COLUMNS: [(&str, f32); 7] = [
+    ("Trial", 44.0),
+    ("Stage", 110.0),
+    ("Settings", 0.0),
+    ("ops/s", 70.0),
+    ("p99", 70.0),
+    ("Throttled", 74.0),
+    ("Within SLA", 74.0),
+];
+
+/// One trial as the table's cells, in [`TRIAL_COLUMNS`] order.
+pub fn trial_cells(t: &crate::tune::Trial) -> [String; 7] {
+    [
+        format!("#{}", t.id),
+        t.stage.clone(),
+        t.knobs.summary(),
+        fmt::compact(t.ops_per_s),
+        fmt::dur_ms(t.p99_ms),
+        fmt::ratio(t.throttled_request_ratio),
+        if t.feasible { "yes" } else { "no" }.to_owned(),
+    ]
+}
+
+fn cell(i: usize, v: String, header: bool) -> Text {
+    let (_, w) = TRIAL_COLUMNS[i];
+    let t = if header {
+        small(v)
+    } else if i == 2 {
+        mono(v)
+    } else {
+        num(v)
+    }
+    .number_of_lines(1);
+    if w == 0.0 {
+        t.flex_1().min_w(px(0.0))
+    } else {
+        t.w(px(w)).flex_shrink_0()
+    }
+}
+
 pub fn tune_page() -> impl IntoElement {
     let s = store();
     let running = move || {
@@ -19,32 +61,38 @@ pub fn tune_page() -> impl IntoElement {
                 .is_some_and(|l| l.kind == JobKind::Tune && l.phase == Phase::Running)
         })
     };
+    let d = crate::config::defaults().tune;
     scroll().flex_1().child(
         view()
             .p_4()
             .gap_4()
             .max_w(px(900.0))
+            .min_w(px(0.0))
             .child(title("Tune"))
-            .child(small("Searches client settings (concurrency ladder, then I/O, chunk, HTTP) on the shown run's target, aware of throttling. The winner is confirmed with a run that lands in the history."))
+            .child(small("Searches client settings (concurrency ladder, then I/O, chunk, HTTP) on the shown run's workload, aware of throttling. The winner is confirmed with a run that lands in the history."))
             .child(
                 view()
                     .gap_2()
                     .max_w(px(520.0))
                     .child(form_row("Target", body(move || {
-                        s.current.with(|c| c.as_ref().map(|c| c.run.report.target.display.clone()))
+                        s.current.with(|c| c.as_ref().map(|c| c.run.report.spec.target_ref.clone()))
                             .unwrap_or_else(|| s.form.target.get())
-                    })))
+                    }).number_of_lines(1)))
                     .child(form_row("Objective", picker("Objective", vec![
                         ("throughput".into(), "Throughput (within the SLA)".into()),
                         ("latency".into(), "Latency (p99)".into()),
                         ("cost".into(), "Cost per operation".into()),
                     ], s.tune_objective)))
                     .child(form_row("Trial length", field("Trial length", "e.g. 5s", s.tune_trial)))
-                    .child(form_row("Max trials", field("Max trials", "e.g. 8", s.tune_max)))
+                    .child(form_row("Max trials", field("Max trials", "e.g. 24", s.tune_max)))
+                    .child(form_row("", small(format!(
+                        "Trial warmup {} · cooldown {} · up to {} workers (the CLI's defaults)",
+                        d.trial_warmup, d.cooldown, d.max_concurrency
+                    ))))
                     .child(form_row("", view().flex_row().gap_2()
                         .child(btn(move || if running() { "Stop" } else { "Start tuning" }, move || if running() { Kind::Danger } else { Kind::Primary }, move || {
                             if running() { s.stop() } else { s.start_tune() }
-                        }).accessibility_label(move || Some(SharedString::from(if running() { "Stop" } else { "Start tuning" })))))),
+                        })))),
             )
             .child(dynamic(move || {
                 let trials = s.live.with(|l| l.as_ref().filter(|l| l.kind == JobKind::Tune).map(|l| l.trials.clone())).unwrap_or_default();
@@ -54,25 +102,37 @@ pub fn tune_page() -> impl IntoElement {
                     }
                     view()
                         .gap_0p5()
+                        .min_w(px(0.0))
+                        .label("Trials")
                         .child(caption("TRIALS"))
-                        .child(view().flex_row().gap_3().child(small("#").w(px(28.0))).child(small("Stage").w(px(110.0))).child(small("Settings").flex_1()).child(small("ops/s").w(px(70.0))).child(small("p99").w(px(70.0))).child(small("throttled").w(px(70.0))))
+                        .child(
+                            view()
+                                .flex_row()
+                                .gap_3()
+                                .min_w(px(0.0))
+                                .children(TRIAL_COLUMNS.iter().enumerate().map(|(i, (h, _))| cell(i, (*h).to_owned(), true))),
+                        )
                         .children(trials.into_iter().map(|t| {
                             let ok = t.feasible;
                             view()
                                 .flex_row()
                                 .gap_3()
-                                .child(num(format!("#{}", t.id)).w(px(28.0)))
-                                .child(body(t.stage.clone()).w(px(110.0)))
-                                .child(mono(t.knobs.summary()).flex_1().number_of_lines(1))
-                                .child(num(fmt::compact(t.ops_per_s)).w(px(70.0)))
-                                .child(num(fmt::dur_ms(t.p99_ms)).w(px(70.0)))
-                                .child(num(fmt::ratio(t.throttle_rate)).w(px(70.0)).text_color(move || if ok { theme().foreground } else { Tone::Warn.color() }))
+                                .min_w(px(0.0))
+                                .children(trial_cells(&t).into_iter().enumerate().map(move |(i, v)| {
+                                    let c = cell(i, v, false);
+                                    if i == 5 || i == 6 {
+                                        c.text_color(move || if ok { theme().foreground } else { Tone::Warn.color() })
+                                    } else {
+                                        c
+                                    }
+                                }))
                         }))
                         .into_element()
                 })
             }))
             .child(dynamic(move || {
                 let t = s.tuned.get();
+                let busy = s.busy();
                 untracked(|| match t {
                     None => view().into_element(),
                     Some(t) => {
@@ -82,7 +142,11 @@ pub fn tune_page() -> impl IntoElement {
                             .gap_2()
                             .child(caption("RECOMMENDED CONFIGURATION"))
                             .child(mono(t.knobs.summary()).selectable(true))
-                            .child(view().flex_row().gap_2()
+                            .child(view().flex_row().flex_wrap().gap_2()
+                                .child(btn("Run with these settings", || Kind::Primary, move || s.run_tuned()).disabled(busy))
+                                .child(btn("Verify", || Kind::Plain, move || s.verify_tuned())
+                                    .accessibility_label("Verify the recommended settings against the tuned run")
+                                    .disabled(busy))
                                 .child(btn("Save profile…", || Kind::Plain, move || crate::ui::files::save(s, "tuned.toml".into(), toml.clone().into_bytes())))
                                 .child(btn("Save Rust snippet…", || Kind::Plain, move || crate::ui::files::save(s, "storage.rs".into(), rust.clone().into_bytes()))))
                             .into_element()

@@ -10,7 +10,7 @@ use crate::analysis::diagnosis::{Bottleneck, Severity};
 use crate::analysis::findings::Command;
 use crate::analysis::outliers::{self, Attribution, Selection};
 use crate::model::{Evidence, Run, VerdictLevel, Verification};
-use crate::output::CommandOutput;
+use crate::output::{CommandOutput, NextStep};
 use crate::report::style::{bold, dim, yellow};
 use crate::util::fmt_ms;
 
@@ -78,8 +78,11 @@ pub struct ExplainRun {
     pub slowest: Option<SlowestAnalysis>,
     /// The explanation in sentences.
     pub narrative: Vec<String>,
-    /// Commands worth running next.
-    pub next_commands: Vec<String>,
+    /// Steps worth taking next, each with its CLI command and MCP call (the JSON envelope's
+    /// `next`).
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub next: Vec<NextStep>,
     /// Findings shown in text output.
     #[serde(skip)]
     #[schemars(skip)]
@@ -236,33 +239,79 @@ pub fn explain_run(run: &Run, top: usize) -> ExplainRun {
         ),
     }
 
-    let mut next = vec![format!("oprobe runs show {id}")];
+    let target_ref = r.spec.target_ref.clone();
+    let mut next = vec![
+        NextStep::new("the full report", format!("oprobe runs show {id}")).with_mcp(
+            "get_run",
+            serde_json::json!({ "run": id, "include_report": true }),
+        ),
+    ];
     for f in findings.iter().take(top.max(1)) {
-        if let Some(c) = f.verification.as_ref().and_then(|v| v.command.clone()) {
-            next.push(c);
+        if let Some(v) = &f.verification {
+            // The hypothesis tested both ways (A B A B…), then the changed run alone.
+            next.push(
+                NextStep::new(format!("verify: {}", v.description), v.command.clone()).with_mcp(
+                    "verify_finding",
+                    serde_json::json!({ "run": id, "code": f.code }),
+                ),
+            );
+            if !v.overrides.is_empty() {
+                let sets: Vec<String> = v
+                    .overrides
+                    .entries()
+                    .into_iter()
+                    .map(|(k, val)| format!("{k}={val}"))
+                    .collect();
+                next.push(
+                    NextStep::new(format!("measure it: {}", sets.join(" ")), v.rerun.clone())
+                        .with_mcp("start_run", serde_json::json!({ "from": id, "set": sets })),
+                );
+            }
         }
-        let cmd = match f.code.as_str() {
-            "throttling" | "sla_p99" | "server_latency" | "tail_latency" | "tail_stragglers" => {
-                Some(
-                    Command::for_target("tune", &r.target)
-                        .set("--dry-run", None)
-                        .to_string(),
+        let step = match f.code.as_str() {
+            "throttling" | "sla_p99" | "server_latency" | "tail_latency" | "tail_stragglers"
+            | "small_objects" => Some(
+                NextStep::new(
+                    "find and verify a better configuration",
+                    format!(
+                        "oprobe fix {}",
+                        crate::model::spec::shell_quote(&target_ref)
+                    ),
                 )
-            }
-            "errors" | "cold_connections" | "high_rtt" | "tcp_retransmits" => {
-                Some(Command::for_target("doctor", &r.target).to_string())
-            }
+                .with_mcp(
+                    "recommend_config",
+                    serde_json::json!({ "target": target_ref }),
+                ),
+            ),
+            "errors" | "cold_connections" | "high_rtt" | "tcp_retransmits" => Some(
+                NextStep::new(
+                    "check the target",
+                    Command::for_target("doctor", &r.target).to_string(),
+                )
+                .with_mcp("doctor", serde_json::json!({ "target": target_ref })),
+            ),
             _ => None,
         };
-        if let Some(c) = cmd
-            && !next.contains(&c)
+        if let Some(s) = step
+            && !next.iter().any(|n| n.cli == s.cli)
         {
-            next.push(c);
+            next.push(s);
         }
     }
-    next.push(format!("oprobe analyze {id} --by api"));
-    next.push(format!("oprobe compare last~1 {id}"));
-    next.dedup();
+    next.push(
+        NextStep::new("requests by API", format!("oprobe analyze {id} --by api"))
+            .with_mcp("analyze_run", serde_json::json!({ "run": id })),
+    );
+    next.push(
+        NextStep::new(
+            "compare with the previous run",
+            format!("oprobe compare last~1 {id}"),
+        )
+        .with_mcp(
+            "compare_runs",
+            serde_json::json!({ "baseline": "last~1", "candidate": id }),
+        ),
+    );
 
     ExplainRun {
         run_id: id,
@@ -276,7 +325,7 @@ pub fn explain_run(run: &Run, top: usize) -> ExplainRun {
         findings,
         slowest: slow,
         narrative,
-        next_commands: next,
+        next,
         top,
     }
 }
@@ -328,7 +377,80 @@ fn doc_text(d: &FindingDoc) -> String {
     o
 }
 
+impl CommandOutput for ExplainRun {
+    fn text(&self) -> String {
+        ExplainOutput::Run(self.clone()).text()
+    }
+    fn next(&self) -> Vec<NextStep> {
+        self.next.clone()
+    }
+}
+
 impl CommandOutput for ExplainOutput {
+    fn next(&self) -> Vec<NextStep> {
+        match self {
+            Self::Run(e) => e.next.clone(),
+            Self::FindingCode(_) | Self::FindingCodes { .. } => vec![
+                NextStep::new("stored runs to explain", "oprobe runs list")
+                    .with_mcp("list_runs", serde_json::json!({})),
+                NextStep::new("explain the latest run", "oprobe explain last")
+                    .with_mcp("explain_run", serde_json::json!({ "run": "last" })),
+            ],
+        }
+    }
+    fn formats() -> &'static [crate::output::OutputFormat] {
+        crate::output::WITH_MD
+    }
+    fn markdown(&self) -> String {
+        let doc_md = |d: &FindingDoc| {
+            let mut o = format!(
+                "### `{}` — {}\n\n{} *({}, usually {})*\n\n",
+                d.code,
+                d.title,
+                d.meaning,
+                d.category,
+                d.typical_severity.label()
+            );
+            for (h, items) in [
+                ("Causes", d.causes),
+                ("Verify", d.verify),
+                ("Knobs", d.knobs),
+            ] {
+                if !items.is_empty() {
+                    o += &format!("- **{h}:** {}\n", items.join("; "));
+                }
+            }
+            o
+        };
+        match self {
+            Self::FindingCode(d) => doc_md(d),
+            Self::FindingCodes { codes } => {
+                let mut o = String::from("| Code | Category | Title |\n|---|---|---|\n");
+                for d in codes {
+                    o += &format!("| `{}` | {} | {} |\n", d.code, d.category, d.title);
+                }
+                o
+            }
+            Self::Run(e) => {
+                let mut o = format!(
+                    "## Run `{}` — {}\n\n**{}**\n\n",
+                    e.run_id,
+                    e.level.as_str(),
+                    e.headline
+                );
+                for s in e.narrative.iter().skip(1) {
+                    o += &format!("- {s}\n");
+                }
+                if !e.next.is_empty() {
+                    o += "\n### Next\n\n";
+                    for n in &e.next {
+                        o += &format!("- {}: `{}`\n", n.title, n.cli);
+                    }
+                }
+                o
+            }
+        }
+    }
     fn text(&self) -> String {
         match self {
             Self::FindingCode(d) => doc_text(d),
@@ -375,8 +497,8 @@ impl CommandOutput for ExplainOutput {
                     }
                 }
                 o += &format!("  {}\n", bold("next:"));
-                for c in e.next_commands.iter().take(4) {
-                    o += &format!("    {c}\n");
+                for c in e.next.iter().take(4) {
+                    o += &format!("    {}\n", c.cli);
                 }
                 o
             }

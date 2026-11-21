@@ -1,5 +1,9 @@
 {
   "$defs": {
+    "Access": {
+      "description": "Key popularity: `uniform`, `zipf:S` (e.g. `zipf:1.1`) or `hotset:F/P` (e.g. `hotset:0.2/0.8`).",
+      "type": "string"
+    },
     "Addressing": {
       "description": "S3 bucket addressing.",
       "oneOf": [
@@ -38,7 +42,7 @@
           "format": "double",
           "type": "number"
         },
-        "requests_per_op_count": {
+        "requests_per_op_mean": {
           "description": "Billed requests of this API per logical operation.",
           "format": "double",
           "type": "number"
@@ -52,7 +56,7 @@
       "required": [
         "api",
         "billing_class",
-        "requests_per_op_count",
+        "requests_per_op_mean",
         "monthly_usd",
         "share_pct"
       ],
@@ -206,6 +210,10 @@
         }
       ]
     },
+    "ByteSize": {
+      "description": "A byte size: `4MiB`, `512KiB`, `1GB` (a plain number of bytes is accepted on input).",
+      "type": "string"
+    },
     "ByteStats": {
       "properties": {
         "backend_down_bytes": {
@@ -318,6 +326,111 @@
       ],
       "type": "object"
     },
+    "Capacity": {
+      "description": "How much load the target takes (design v4 §3); `report.capacity`.",
+      "properties": {
+        "calibration_bias_ratio": {
+          "description": "Measured / predicted throughput of earlier verifications of this target and workload\n([`calibrate`]); [`Capacity::predict`] scales its throughput by it.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "confidence": {
+          "$ref": "#/$defs/Confidence"
+        },
+        "confidence_reason": {
+          "description": "Why the confidence is what it is.",
+          "type": "string"
+        },
+        "inflight_ceiling": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Ceiling"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "In-flight requests the server accepts before it throttles (none: no throttling seen,\nor throttling unrelated to concurrency)."
+        },
+        "observed": {
+          "$ref": "#/$defs/Observed"
+        },
+        "per_op": {
+          "$ref": "#/$defs/OpShape"
+        },
+        "rate_ceiling_requests_per_s": {
+          "description": "Requests per second the service accepted while it throttled.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "source": {
+          "$ref": "#/$defs/CapacitySource"
+        }
+      },
+      "required": [
+        "per_op",
+        "observed",
+        "confidence",
+        "confidence_reason",
+        "source"
+      ],
+      "type": "object"
+    },
+    "CapacitySource": {
+      "description": "Where a capacity estimate comes from.",
+      "oneOf": [
+        {
+          "const": "this_run",
+          "description": "Estimated from this run's rows.",
+          "type": "string"
+        },
+        {
+          "const": "tune",
+          "description": "From a tuner search.",
+          "type": "string"
+        },
+        {
+          "const": "history",
+          "description": "Loaded from `<data>/capacity.toml` (an earlier run of the same target and workload).",
+          "type": "string"
+        }
+      ]
+    },
+    "Ceiling": {
+      "description": "The in-flight level the service accepts before it throttles.",
+      "properties": {
+        "hi_inflight_count": {
+          "description": "Lowest in-flight level whose arrivals were throttled (the limit is in `[lo, hi)`).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "inflight_count": {
+          "description": "In-flight requests the service accepted cleanly (the estimate; equals `lo`).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "lo_inflight_count": {
+          "description": "Highest in-flight level whose arrivals were served without throttling.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "inflight_count",
+        "lo_inflight_count",
+        "hi_inflight_count"
+      ],
+      "type": "object"
+    },
     "CleanupSummary": {
       "properties": {
         "deleted_count": {
@@ -395,6 +508,15 @@
         "rss_mib"
       ],
       "type": "object"
+    },
+    "Confidence": {
+      "description": "How far to trust the estimate.",
+      "enum": [
+        "low",
+        "medium",
+        "high"
+      ],
+      "type": "string"
     },
     "ConnStats": {
       "properties": {
@@ -515,8 +637,10 @@
           "type": "number"
         },
         "monthly_ops_count": {
-          "format": "double",
-          "type": "number"
+          "description": "Projected operations per month (a whole number).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
         },
         "not_applicable_reason": {
           "description": "Why no cost is projected (when not applicable).",
@@ -542,6 +666,11 @@
           "$ref": "#/$defs/ProviderCost",
           "description": "The provider matching the target (or the profile's choice / custom pricing)."
         },
+        "storage_assumed": {
+          "default": false,
+          "description": "`stored_gib` is the default assumption (1 TiB), not a size the user gave\n(`--stored-gib`); renderers label it so.",
+          "type": "boolean"
+        },
         "stored_gib": {
           "format": "double",
           "type": "number"
@@ -558,11 +687,60 @@
         "pricing_as_of",
         "monthly_ops_count",
         "stored_gib",
+        "storage_assumed",
         "egress_ratio",
         "per_op",
         "selected",
         "comparison",
         "waste_usd"
+      ],
+      "type": "object"
+    },
+    "CostSpec": {
+      "additionalProperties": false,
+      "description": "Business volume used to project measured per-operation costs to a monthly bill.",
+      "properties": {
+        "egress_fraction": {
+          "default": 0.0,
+          "description": "Fraction of downloaded bytes that leave the cloud (internet egress).",
+          "format": "double",
+          "type": "number"
+        },
+        "monthly_ops": {
+          "default": 100000000.0,
+          "description": "Logical operations per month at this workload mix.",
+          "format": "double",
+          "type": "number"
+        },
+        "pricing": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Pricing"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Custom price overrides (USD)."
+        },
+        "provider": {
+          "description": "Pricing preset: aws-s3, gcs, azure-blob, cloudflare-r2, backblaze-b2, aliyun-oss.\nDefaults to the target's provider.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "stored_gib": {
+          "default": 1024.0,
+          "description": "Data kept at rest (GiB).",
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "monthly_ops",
+        "stored_gib",
+        "egress_fraction"
       ],
       "type": "object"
     },
@@ -600,6 +778,126 @@
         "persist"
       ],
       "type": "object"
+    },
+    "DatasetSpec": {
+      "additionalProperties": false,
+      "description": "Objects the workload reads from.",
+      "properties": {
+        "existing_prefix": {
+          "description": "Benchmark **existing** objects under this prefix (read-only; nothing is written).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "object_size": {
+          "$ref": "#/$defs/ByteSize",
+          "default": "4MiB"
+        },
+        "objects": {
+          "default": 16,
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "partitions": {
+          "default": 4,
+          "description": "Spread objects across this many `part=NN/` prefixes.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "persist": {
+          "default": false,
+          "description": "Keep the generated dataset between runs (`oprobe-dataset/<fingerprint>/`) to avoid\nre-uploading it every time. Remove with `oprobe cleanup --datasets`.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "objects",
+        "object_size",
+        "partitions",
+        "persist"
+      ],
+      "type": "object"
+    },
+    "Delta": {
+      "description": "One objective metric, recommended vs a reference trial.",
+      "properties": {
+        "baseline": {
+          "description": "The reference trial's value.",
+          "format": "double",
+          "type": "number"
+        },
+        "baseline_feasible": {
+          "description": "The reference met the SLA and the throttle budget; deltas against an infeasible\nreference are not improvements.",
+          "type": "boolean"
+        },
+        "baseline_trial": {
+          "description": "Trial id of the reference.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "candidate": {
+          "description": "The recommended configuration's value.",
+          "format": "double",
+          "type": "number"
+        },
+        "delta_ratio": {
+          "description": "`(candidate − baseline) / baseline` (0 when the baseline is 0).",
+          "format": "double",
+          "type": "number"
+        },
+        "metric": {
+          "description": "`ops_per_s` / `mib_per_s` (goodput), `p99_ms` (latency) or\n`cost_per_million_ops_usd`.",
+          "type": "string"
+        },
+        "unit": {
+          "description": "Unit of `baseline` and `candidate`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "metric",
+        "unit",
+        "baseline",
+        "candidate",
+        "delta_ratio",
+        "baseline_feasible",
+        "baseline_trial"
+      ],
+      "type": "object"
+    },
+    "Direction": {
+      "description": "Which way a metric should move.",
+      "oneOf": [
+        {
+          "const": "increase",
+          "description": "Higher than the baseline.",
+          "type": "string"
+        },
+        {
+          "const": "decrease",
+          "description": "Lower than the baseline.",
+          "type": "string"
+        },
+        {
+          "const": "at_most",
+          "description": "At most the predicted value (e.g. a throttle budget).",
+          "type": "string"
+        },
+        {
+          "const": "at_least",
+          "description": "At least the predicted value.",
+          "type": "string"
+        },
+        {
+          "const": "unchanged",
+          "description": "Within the interval of the baseline (a change that must not cost anything).",
+          "type": "string"
+        }
+      ]
     },
     "EffectiveKnobValues": {
       "description": "The effective configuration: the requested values with the service's limits applied.",
@@ -761,6 +1059,46 @@
       ],
       "type": "object"
     },
+    "Expectation": {
+      "description": "What a change should do to one metric: a predicted value with an interval.",
+      "properties": {
+        "direction": {
+          "$ref": "#/$defs/Direction"
+        },
+        "hi": {
+          "description": "Upper end of the prediction interval, in `unit`.",
+          "format": "double",
+          "type": "number"
+        },
+        "lo": {
+          "description": "Lower end of the prediction interval, in `unit`.",
+          "format": "double",
+          "type": "number"
+        },
+        "metric": {
+          "description": "A report metric path, e.g. `summary.ops_per_s`, `throttled_request_ratio`, `p99_ms`.",
+          "type": "string"
+        },
+        "predicted": {
+          "description": "Predicted value, in `unit`.",
+          "format": "double",
+          "type": "number"
+        },
+        "unit": {
+          "description": "Unit of `predicted`, `lo` and `hi` (`ops_per_s`, `ms`, `ratio`, …).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "metric",
+        "direction",
+        "predicted",
+        "lo",
+        "hi",
+        "unit"
+      ],
+      "type": "object"
+    },
     "Finding": {
       "description": "A diagnosis item (design §1).",
       "properties": {
@@ -891,6 +1229,37 @@
         }
       ]
     },
+    "HumanDuration": {
+      "description": "A duration: `10s`, `500ms`, `2m` (plain seconds are accepted on input).",
+      "type": "string"
+    },
+    "InflightLevel": {
+      "description": "Arrivals at one in-flight level.",
+      "properties": {
+        "inflight_count": {
+          "description": "Requests in flight when a request arrived (itself included).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "requests_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "throttled_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "inflight_count",
+        "requests_count",
+        "throttled_count"
+      ],
+      "type": "object"
+    },
     "IntegrityStats": {
       "properties": {
         "corrupted_count": {
@@ -988,6 +1357,102 @@
         "retries_count",
         "tail_cut",
         "timeout_ms"
+      ],
+      "type": "object"
+    },
+    "Knobs": {
+      "additionalProperties": false,
+      "description": "Client-side configuration under test / being tuned.",
+      "properties": {
+        "cache": {
+          "default": false,
+          "description": "In-memory read cache.",
+          "type": "boolean"
+        },
+        "cache_size": {
+          "$ref": "#/$defs/ByteSize",
+          "default": "256MiB"
+        },
+        "chunk_size": {
+          "$ref": "#/$defs/ByteSize",
+          "default": "8MiB",
+          "description": "Reader/writer chunk size (`.chunk(n)`), also the multipart part size."
+        },
+        "concurrency": {
+          "default": 16,
+          "description": "Concurrent logical operations (closed-loop workers, or open-loop in-flight cap).",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "http_version": {
+          "$ref": "#/$defs/HttpVersion",
+          "default": "auto"
+        },
+        "io_concurrency": {
+          "default": 4,
+          "description": "Per-operation reader/writer concurrency (`.concurrent(n)`).",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "keep_alive": {
+          "default": true,
+          "type": "boolean"
+        },
+        "max_inflight_requests": {
+          "default": 0,
+          "description": "Cap on in-flight HTTP requests across the client (0 = unlimited).",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "provider": {
+          "$ref": "#/$defs/ProviderKnobs",
+          "description": "Provider request options (addressing style, checksums, SSE), applied when the session\nopens."
+        },
+        "range_gap": {
+          "$ref": "#/$defs/ByteSize",
+          "default": "64KiB",
+          "description": "Merge vectored ranges closer than this (`.gap(n)`)."
+        },
+        "retries": {
+          "default": 3,
+          "description": "Retry attempts on temporary errors (OpenDAL `RetryLayer`).",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "tail_cut": {
+          "default": false,
+          "description": "Cancel & retry straggler requests above the adaptive p95 deadline (`TailCutLayer`).",
+          "type": "boolean"
+        },
+        "timeout": {
+          "$ref": "#/$defs/HumanDuration",
+          "default": "1m",
+          "description": "Per-operation timeout."
+        },
+        "transport": {
+          "$ref": "#/$defs/TransportMode",
+          "default": "opendal",
+          "description": "How requests are made and observed: `opendal` = OpenDAL's own reqwest client (what\nproduction runs; the default), `microscope` = oprobe's instrumented connection pool\n(exact queue / per-dial phases / HTTP/2 streams, but a different client)."
+        }
+      },
+      "required": [
+        "concurrency",
+        "io_concurrency",
+        "chunk_size",
+        "range_gap",
+        "max_inflight_requests",
+        "http_version",
+        "transport",
+        "keep_alive",
+        "cache",
+        "cache_size",
+        "retries",
+        "tail_cut",
+        "timeout"
       ],
       "type": "object"
     },
@@ -1122,6 +1587,81 @@
       ],
       "type": "object"
     },
+    "Observed": {
+      "description": "What the rows showed.",
+      "properties": {
+        "inflight_mean": {
+          "description": "Time-weighted mean of requests in flight.",
+          "format": "double",
+          "type": "number"
+        },
+        "levels": {
+          "description": "Arrivals per in-flight level (the evidence of the ceiling).",
+          "items": {
+            "$ref": "#/$defs/InflightLevel"
+          },
+          "type": "array"
+        },
+        "max_clean_inflight_count": {
+          "description": "Highest level a request arrived at and was served cleanly.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "min_throttled_inflight_count": {
+          "description": "Lowest level a request arrived at and was throttled.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "ops_inflight_mean": {
+          "description": "Operations in flight on average (≈ the workers of a closed-loop run).",
+          "format": "double",
+          "type": "number"
+        },
+        "ops_per_s": {
+          "description": "Successful operations per second.",
+          "format": "double",
+          "type": "number"
+        },
+        "peak_inflight_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "requests_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "throttled_requests_count": {
+          "description": "Requests answered 429 / 503.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "window_s": {
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "window_s",
+        "requests_count",
+        "throttled_requests_count",
+        "peak_inflight_count",
+        "inflight_mean",
+        "ops_inflight_mean",
+        "ops_per_s"
+      ],
+      "type": "object"
+    },
     "OpBreakdown": {
       "description": "Where the wall-clock time of a logical operation went (mean ms per op).\n`queue + cache + backend + retry + client == latency mean` (exact for each op; see docs/metrics.md).",
       "properties": {
@@ -1161,6 +1701,287 @@
       ],
       "type": "object"
     },
+    "OpShape": {
+      "description": "Request concurrency of one operation.",
+      "properties": {
+        "inflight_per_op_mean": {
+          "description": "Requests one operation keeps in flight on average over its lifetime.",
+          "format": "double",
+          "type": "number"
+        },
+        "ops_count": {
+          "description": "Operations the shape was measured over.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "peak_inflight_per_op_count": {
+          "description": "The most requests one operation had in flight at once (the maximum over operations:\non a busy client the parallel reads of an op often fail to overlap, and a p95 then\nunder-counts the burst the server sees).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "requests_per_op_mean": {
+          "description": "Backend requests per operation (mean, retries included).",
+          "format": "double",
+          "type": "number"
+        },
+        "sequential_ratio": {
+          "description": "Share of operation time with exactly one request in flight (1 = strictly sequential).",
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "requests_per_op_mean",
+        "peak_inflight_per_op_count",
+        "inflight_per_op_mean",
+        "sequential_ratio",
+        "ops_count"
+      ],
+      "type": "object"
+    },
+    "OpSpec": {
+      "description": "One weighted operation in the workload mix.",
+      "oneOf": [
+        {
+          "description": "Read a random range of `size` bytes, or the whole object when `size` is omitted.",
+          "properties": {
+            "op": {
+              "const": "read",
+              "type": "string"
+            },
+            "size": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ByteSize"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "op"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "`stat` + footer read + `columns` random column chunks fetched as one vectored read.\nWith `suffix`, the footer is read with a suffix range (`bytes=-N`) and no `stat`: one\nrequest fewer per file.",
+          "properties": {
+            "column_size": {
+              "$ref": "#/$defs/ByteSize"
+            },
+            "columns": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "footer_size": {
+              "$ref": "#/$defs/ByteSize"
+            },
+            "op": {
+              "const": "parquet_scan",
+              "type": "string"
+            },
+            "suffix": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "op",
+            "columns",
+            "column_size",
+            "footer_size"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Single PUT of `size` bytes.",
+          "properties": {
+            "op": {
+              "const": "write",
+              "type": "string"
+            },
+            "size": {
+              "$ref": "#/$defs/ByteSize"
+            }
+          },
+          "required": [
+            "op",
+            "size"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Streaming multipart write of `size` bytes (chunked by `knobs.chunk_size`).",
+          "properties": {
+            "op": {
+              "const": "multipart_write",
+              "type": "string"
+            },
+            "size": {
+              "$ref": "#/$defs/ByteSize"
+            }
+          },
+          "required": [
+            "op",
+            "size"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "HEAD a dataset object.",
+          "properties": {
+            "op": {
+              "const": "stat",
+              "type": "string"
+            }
+          },
+          "required": [
+            "op"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "LIST one dataset partition.",
+          "properties": {
+            "op": {
+              "const": "list",
+              "type": "string"
+            },
+            "recursive": {
+              "default": false,
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "op",
+            "recursive"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "LIST one dataset partition `limit` keys per page (each page is a billed request).",
+          "properties": {
+            "limit": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "op": {
+              "const": "list_paged",
+              "type": "string"
+            }
+          },
+          "required": [
+            "op",
+            "limit"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Delete up to `batch` objects the workload wrote, in one batch (OpenDAL `Deleter`:\n`DeleteObjects` where the service batches).",
+          "properties": {
+            "batch": {
+              "default": 100,
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "op": {
+              "const": "delete",
+              "type": "string"
+            }
+          },
+          "required": [
+            "op",
+            "batch"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Server-side copy of a dataset object to a scratch key.",
+          "properties": {
+            "op": {
+              "const": "copy",
+              "type": "string"
+            }
+          },
+          "required": [
+            "op"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "GET a dataset object through a presigned URL.",
+          "properties": {
+            "op": {
+              "const": "presigned_read",
+              "type": "string"
+            }
+          },
+          "required": [
+            "op"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Optimistic-concurrency write of `size` bytes: create with `If-None-Match: *`, then\noverwrite with `If-Match: <etag of the previous write>`.",
+          "properties": {
+            "op": {
+              "const": "conditional_write",
+              "type": "string"
+            },
+            "size": {
+              "$ref": "#/$defs/ByteSize"
+            }
+          },
+          "required": [
+            "op",
+            "size"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Small write carrying `entries` user-metadata pairs and a content type.",
+          "properties": {
+            "entries": {
+              "default": 4,
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "op": {
+              "const": "metadata_write",
+              "type": "string"
+            },
+            "size": {
+              "$ref": "#/$defs/ByteSize"
+            }
+          },
+          "required": [
+            "op",
+            "size",
+            "entries"
+          ],
+          "type": "object"
+        }
+      ],
+      "properties": {
+        "weight": {
+          "default": 1,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "weight"
+      ],
+      "type": "object"
+    },
     "OpenLoopStats": {
       "properties": {
         "achieved_per_s": {
@@ -1190,6 +2011,86 @@
       ],
       "type": "object"
     },
+    "Overrides": {
+      "description": "A change to a run: `--set key=value` pairs grouped by the part of the profile they change\n(canonical key names, see [`SET_KEYS`]). Built with [`Overrides::set`], which validates.",
+      "properties": {
+        "cost": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "knobs": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sla": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "target": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "workload": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        }
+      },
+      "type": "object"
+    },
+    "PartialInfo": {
+      "description": "A run that stopped early (`report.run.partial`).",
+      "properties": {
+        "measured_s": {
+          "description": "Seconds of the measurement window that ran.",
+          "format": "double",
+          "type": "number"
+        },
+        "reason": {
+          "$ref": "#/$defs/PartialReason"
+        }
+      },
+      "required": [
+        "reason",
+        "measured_s"
+      ],
+      "type": "object"
+    },
+    "PartialReason": {
+      "description": "Why a run stopped before its configured end.",
+      "oneOf": [
+        {
+          "const": "interrupted",
+          "description": "Ctrl-C, Stop or a cancelled job.",
+          "type": "string"
+        },
+        {
+          "const": "budget",
+          "description": "A safety budget (`--max-requests`, `--max-bytes`, `--max-duration`, `--max-cost-usd`).",
+          "type": "string"
+        },
+        {
+          "const": "error",
+          "description": "A fatal error ended the measurement.",
+          "type": "string"
+        }
+      ]
+    },
     "PerOpUsage": {
       "description": "Measured usage per logical operation.",
       "properties": {
@@ -1197,12 +2098,12 @@
           "format": "double",
           "type": "number"
         },
-        "cache_saved_reads_count": {
+        "cache_saved_reads_mean": {
           "description": "GETs avoided thanks to cache hits.",
           "format": "double",
           "type": "number"
         },
-        "delete_requests_count": {
+        "delete_requests_mean": {
           "format": "double",
           "type": "number"
         },
@@ -1210,12 +2111,12 @@
           "format": "double",
           "type": "number"
         },
-        "failed_requests_count": {
+        "failed_requests_mean": {
           "description": "Requests that failed or were throttled (billed on most providers, add no value).",
           "format": "double",
           "type": "number"
         },
-        "list_requests_count": {
+        "list_requests_mean": {
           "format": "double",
           "type": "number"
         },
@@ -1224,7 +2125,7 @@
           "format": "double",
           "type": "number"
         },
-        "read_requests_count": {
+        "read_requests_mean": {
           "format": "double",
           "type": "number"
         },
@@ -1232,22 +2133,204 @@
           "format": "double",
           "type": "number"
         },
-        "write_requests_count": {
+        "write_requests_mean": {
           "format": "double",
           "type": "number"
         }
       },
       "required": [
-        "write_requests_count",
-        "list_requests_count",
-        "read_requests_count",
-        "delete_requests_count",
-        "failed_requests_count",
+        "write_requests_mean",
+        "list_requests_mean",
+        "read_requests_mean",
+        "delete_requests_mean",
+        "failed_requests_mean",
         "download_bytes",
         "upload_bytes",
         "overread_bytes",
-        "cache_saved_reads_count",
+        "cache_saved_reads_mean",
         "cache_saved_bytes"
+      ],
+      "type": "object"
+    },
+    "Preset": {
+      "oneOf": [
+        {
+          "const": "parquet",
+          "description": "Lakehouse scan: stat + footer read + vectored column-chunk range reads.",
+          "type": "string"
+        },
+        {
+          "const": "checkpoint",
+          "description": "AI/ML checkpoint: large multipart writes plus occasional full restores.",
+          "type": "string"
+        },
+        {
+          "const": "small-files",
+          "description": "Many small objects: whole-object GETs and PUTs.",
+          "type": "string"
+        },
+        {
+          "const": "metadata",
+          "description": "Metadata-heavy: LIST and HEAD storms over a partitioned prefix.",
+          "type": "string"
+        },
+        {
+          "const": "mixed",
+          "description": "General purpose 70/20/10 read/write/stat mix.",
+          "type": "string"
+        },
+        {
+          "const": "parquet-suffix",
+          "description": "Lakehouse scan reading the footer with a suffix range (no HEAD per file).",
+          "type": "string"
+        },
+        {
+          "const": "delete",
+          "description": "Churn: small writes removed again by batched deletes (OpenDAL `Deleter`).",
+          "type": "string"
+        },
+        {
+          "const": "copy",
+          "description": "Server-side copies of dataset objects.",
+          "type": "string"
+        },
+        {
+          "const": "list-paged",
+          "description": "LIST with a page size (`limit`): every page is a billed request.",
+          "type": "string"
+        },
+        {
+          "const": "presign",
+          "description": "GETs through presigned URLs.",
+          "type": "string"
+        },
+        {
+          "const": "conditional",
+          "description": "Optimistic concurrency: conditional create (`If-None-Match: *`) and overwrite (`If-Match`).",
+          "type": "string"
+        },
+        {
+          "const": "metadata-heavy",
+          "description": "HEAD storm plus small writes carrying user metadata.",
+          "type": "string"
+        }
+      ]
+    },
+    "Pricing": {
+      "additionalProperties": false,
+      "description": "Provider list prices in USD (request prices per million, data per GB = 1e9 bytes).",
+      "properties": {
+        "delete_per_million": {
+          "default": 0.0,
+          "format": "double",
+          "type": "number"
+        },
+        "egress_per_gb": {
+          "description": "Internet egress per GB.",
+          "format": "double",
+          "type": "number"
+        },
+        "list_per_million": {
+          "format": "double",
+          "type": "number"
+        },
+        "note": {
+          "type": "string"
+        },
+        "provider": {
+          "type": "string"
+        },
+        "read_per_million": {
+          "description": "GET / HEAD.",
+          "format": "double",
+          "type": "number"
+        },
+        "storage_gb_month": {
+          "format": "double",
+          "type": "number"
+        },
+        "write_per_million": {
+          "description": "PUT / POST / COPY / multipart part & complete.",
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "provider",
+        "storage_gb_month",
+        "write_per_million",
+        "list_per_million",
+        "read_per_million",
+        "delete_per_million",
+        "egress_per_gb"
+      ],
+      "type": "object"
+    },
+    "Profile": {
+      "additionalProperties": false,
+      "description": "Complete, round-trippable benchmark profile.",
+      "properties": {
+        "cost": {
+          "$ref": "#/$defs/CostSpec",
+          "default": {
+            "egress_fraction": 0.0,
+            "monthly_ops": 100000000.0,
+            "stored_gib": 1024.0
+          }
+        },
+        "knobs": {
+          "$ref": "#/$defs/Knobs",
+          "default": {
+            "cache": false,
+            "cache_size": "256MiB",
+            "chunk_size": "8MiB",
+            "concurrency": 16,
+            "http_version": "auto",
+            "io_concurrency": 4,
+            "keep_alive": true,
+            "max_inflight_requests": 0,
+            "range_gap": "64KiB",
+            "retries": 3,
+            "tail_cut": false,
+            "timeout": "1m",
+            "transport": "opendal"
+          }
+        },
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sla": {
+          "$ref": "#/$defs/Sla",
+          "default": {
+            "enforce": true,
+            "max_error_rate": 0.01
+          }
+        },
+        "target": {
+          "$ref": "#/$defs/TargetSpec"
+        },
+        "workload": {
+          "$ref": "#/$defs/WorkloadSpec",
+          "default": {
+            "access": "uniform",
+            "cleanup": true,
+            "duration": "10s",
+            "preset": "parquet",
+            "seed": 42,
+            "verify": true,
+            "warmup": "2s"
+          }
+        }
+      },
+      "required": [
+        "target",
+        "workload",
+        "knobs",
+        "sla",
+        "cost"
       ],
       "type": "object"
     },
@@ -1380,6 +2463,64 @@
         "p99_ms",
         "p999_ms",
         "max_ms"
+      ],
+      "type": "object"
+    },
+    "Recommendation": {
+      "description": "What `oprobe tune` / `oprobe fix` / MCP `recommend_config` recommend.",
+      "properties": {
+        "confirmed": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VerifyOutcome"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What `oprobe verify` concluded about the recommendation (set by `oprobe fix`)."
+        },
+        "knobs": {
+          "$ref": "#/$defs/KnobValues",
+          "description": "The recommended knob values."
+        },
+        "no_feasible_trial": {
+          "description": "No trial met the SLA: this is the least-bad configuration, not a recommendation.",
+          "type": "boolean"
+        },
+        "objective": {
+          "type": "string"
+        },
+        "overrides": {
+          "$ref": "#/$defs/Overrides",
+          "description": "The change from the baseline's knobs (`--set` vocabulary): apply with\n`oprobe run --from RUN …` or `RunSpec::with`."
+        },
+        "profile_toml": {
+          "description": "A profile with the recommended knobs (environment defaults such as `proxy` and\nredacted secrets omitted).",
+          "type": "string"
+        },
+        "rust_snippet": {
+          "description": "Rust/OpenDAL code configuring the same client.",
+          "type": "string"
+        },
+        "vs_baseline": {
+          "$ref": "#/$defs/Delta",
+          "description": "Against the baseline trial (`baseline_feasible: false` when it violated the SLA or\nthe throttle budget)."
+        },
+        "vs_best": {
+          "$ref": "#/$defs/Delta",
+          "description": "Against the best feasible trial: the cost of the safety margin."
+        }
+      },
+      "required": [
+        "objective",
+        "knobs",
+        "overrides",
+        "profile_toml",
+        "rust_snippet",
+        "vs_baseline",
+        "vs_best",
+        "no_feasible_trial"
       ],
       "type": "object"
     },
@@ -1571,6 +2712,17 @@
         "oprobe_version": {
           "type": "string"
         },
+        "partial": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PartialInfo"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Why and when the run stopped early (absent for a complete run). A partial run is never\naccepted as a baseline."
+        },
         "sampled": {
           "description": "Trace rows were sampled (more requests than `trace.max_requests`); aggregates are exact.",
           "type": "boolean"
@@ -1602,6 +2754,44 @@
       ],
       "type": "object"
     },
+    "RunSpec": {
+      "description": "One replayable definition of a run.",
+      "properties": {
+        "existing": {
+          "description": "`--existing PREFIX`: benchmark existing objects (read-only).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "profile": {
+          "$ref": "#/$defs/Profile",
+          "description": "The fully resolved profile (preset defaults are kept implicit, as in a profile file).\nSecret options are `\"<redacted>\"` (environment references such as\n`${AWS_SECRET_ACCESS_KEY}` are kept: they are not secrets); options the target URL\nimplies are left out, so the profile's target holds only what was added on top."
+        },
+        "seed": {
+          "description": "The dataset / key-choice seed the run used.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "target_ref": {
+          "description": "The target as given: a configured target name, a storage URL or `lab://SCENARIO`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "profile",
+        "target_ref",
+        "seed"
+      ],
+      "type": "object"
+    },
     "Severity": {
       "enum": [
         "info",
@@ -1609,6 +2799,44 @@
         "critical"
       ],
       "type": "string"
+    },
+    "Sla": {
+      "additionalProperties": false,
+      "description": "Service level objectives. `oprobe run` / `oprobe tune` exit with code 3 when the measured\nresult breaches them (unless `enforce = false` / `--sla none`); the tuner rejects trials that\nbreach them and the diagnosis grades findings against them.",
+      "properties": {
+        "enforce": {
+          "default": true,
+          "description": "Turn a breach into exit code 3. Corrupted data (CRC mismatch) is always a breach.",
+          "type": "boolean"
+        },
+        "max_error_rate": {
+          "default": 0.01,
+          "description": "Max fraction of failed operations (default 0.01 = 1%).",
+          "format": "double",
+          "type": "number"
+        },
+        "max_throttle_rate": {
+          "description": "Max fraction of operations that hit a 429/503 throttle. Unset: throttling that retries\nabsorb does not breach the SLA of a run (it is still a finding), and the tuner treats\nany throttling as infeasible.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "p99_ms": {
+          "description": "Max acceptable p99 per operation verb (ms); unset = no latency constraint.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "enforce",
+        "max_error_rate"
+      ],
+      "type": "object"
     },
     "SlaInfo": {
       "description": "Service level objectives the run was checked against.",
@@ -1621,7 +2849,8 @@
           "format": "double",
           "type": "number"
         },
-        "max_throttle_ratio": {
+        "max_throttled_request_ratio": {
+          "description": "Throttled responses / requests the run may have (`sla.max_throttle_rate`).",
           "format": "double",
           "type": [
             "number",
@@ -1782,6 +3011,12 @@
     },
     "Summary": {
       "properties": {
+        "attempted_ops_per_s": {
+          "default": 0.0,
+          "description": "Operations per second, failed ones included.",
+          "format": "double",
+          "type": "number"
+        },
         "error_ratio": {
           "format": "double",
           "type": "number"
@@ -1809,10 +3044,23 @@
           "type": "integer"
         },
         "ops_per_s": {
+          "description": "Successful operations per second (goodput; failed operations are not throughput).",
           "format": "double",
           "type": "number"
         },
         "read_mib_per_s": {
+          "format": "double",
+          "type": "number"
+        },
+        "throttled_op_ratio": {
+          "default": 0.0,
+          "description": "Operations with at least one throttled response / operations.",
+          "format": "double",
+          "type": "number"
+        },
+        "throttled_request_ratio": {
+          "default": 0.0,
+          "description": "Throttled responses (429/503) / requests: what the SLA's throttle limit checks.",
           "format": "double",
           "type": "number"
         },
@@ -1824,8 +3072,11 @@
       "required": [
         "ops_count",
         "ops_per_s",
+        "attempted_ops_per_s",
         "failed_ops_count",
         "error_ratio",
+        "throttled_request_ratio",
+        "throttled_op_ratio",
         "mib_per_s",
         "read_mib_per_s",
         "write_mib_per_s",
@@ -1873,6 +3124,52 @@
       "required": [
         "display",
         "scheme",
+        "options"
+      ],
+      "type": "object"
+    },
+    "TargetSpec": {
+      "additionalProperties": false,
+      "description": "Storage target. Either `url = \"s3://bucket/prefix\"` or explicit `scheme` + `options`.",
+      "properties": {
+        "ca_cert": {
+          "description": "Extra PEM CA bundle to trust.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "insecure": {
+          "description": "Skip TLS certificate verification (self-signed dev endpoints only).",
+          "type": "boolean"
+        },
+        "options": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "description": "OpenDAL service options. Values may reference environment variables as `${NAME}`.",
+          "type": "object"
+        },
+        "proxy": {
+          "description": "Egress proxy URL; `\"none\"` disables proxies; unset = `HTTPS_PROXY`/`HTTP_PROXY` env.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "scheme": {
+          "description": "OpenDAL scheme; derived from `url` when empty (and then not written back).",
+          "type": "string"
+        },
+        "url": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
         "options"
       ],
       "type": "object"
@@ -2255,10 +3552,33 @@
           "format": "double",
           "type": "number"
         },
+        "peak_inflight_count": {
+          "description": "Requests in flight at the trial's peak.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "peak_inflight_per_op_count": {
+          "description": "The most requests one operation had in flight at once (maximum over operations).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "requests_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "stage": {
           "type": "string"
         },
-        "throttle_ratio": {
+        "throttled_op_ratio": {
+          "description": "Operations with ≥ 1 throttled response / operations.",
+          "format": "double",
+          "type": "number"
+        },
+        "throttled_request_ratio": {
+          "description": "Throttled responses / requests (the throttle budget applies to this).",
           "format": "double",
           "type": "number"
         },
@@ -2277,8 +3597,12 @@
         "p50_ms",
         "p99_ms",
         "error_ratio",
-        "throttle_ratio",
+        "throttled_request_ratio",
+        "throttled_op_ratio",
         "throttled_responses_count",
+        "requests_count",
+        "peak_inflight_count",
+        "peak_inflight_per_op_count",
         "cost_per_million_ops_usd",
         "feasible",
         "note"
@@ -2286,17 +3610,65 @@
       "type": "object"
     },
     "TuneReport": {
-      "description": "The tuner's search, embedded in the winner's report.",
+      "description": "The tuner's search, embedded in the winner's report (design v4 §6).",
       "properties": {
+        "baseline_feasible": {
+          "description": "The baseline met the SLA and the throttle budget. When it did not, deltas are taken\nagainst the best feasible trial.",
+          "type": "boolean"
+        },
         "baseline_trial": {
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
-        "improvement_pct": {
-          "description": "Objective change of the winner vs the baseline trial.",
+        "best_feasible_trial_id": {
+          "description": "The best trial within the SLA and the throttle budget, ignoring the safety margin.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "capacity": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Capacity"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The capacity model over every trial (`source: tune`)."
+        },
+        "headline": {
+          "description": "One line: what is recommended and why.",
+          "type": "string"
+        },
+        "improvement_ratio": {
+          "description": "Objective improvement of the recommendation vs the baseline (positive = better);\nabsent when the baseline was infeasible or above the safety margin. Never negative.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "margin_cost_ratio": {
+          "description": "How much better the best feasible trial measured than the recommendation: what the\nsafety margin costs.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "max_throttle_ratio": {
+          "description": "The throttle budget (share of throttled requests a feasible trial may cause).",
           "format": "double",
           "type": "number"
+        },
+        "metric_unit": {
+          "description": "What goodput was measured in: `ops_per_s` or `mib_per_s`.",
+          "type": "string"
         },
         "no_feasible_trial": {
           "description": "No trial met the SLA: the winner is the least-bad configuration.",
@@ -2309,9 +3681,47 @@
           "type": "array"
         },
         "objective": {
+          "description": "`goodput`, `p99`, `cost` or `balanced`.",
           "type": "string"
         },
+        "pareto_trial_ids": {
+          "default": [],
+          "description": "Trials not dominated on (goodput, p99, cost, throttling).",
+          "items": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        "recommendation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Recommendation"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The recommended configuration: knobs, profile, code, deltas."
+        },
+        "recommended_trial_id": {
+          "description": "The trial whose knobs are recommended.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "safe_concurrency_count": {
+          "description": "The capacity model's concurrency within the safety margin.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "throttle_ceiling_count": {
+          "description": "Lowest concurrency that exceeded the throttle budget.",
           "format": "uint64",
           "minimum": 0,
           "type": [
@@ -2326,6 +3736,7 @@
           "type": "array"
         },
         "winner_trial": {
+          "description": "The recommendation's confirmation run.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -2333,10 +3744,15 @@
       },
       "required": [
         "objective",
+        "metric_unit",
         "trials",
         "baseline_trial",
+        "recommended_trial_id",
         "winner_trial",
-        "improvement_pct",
+        "baseline_feasible",
+        "headline",
+        "max_throttle_ratio",
+        "pareto_trial_ids",
         "no_feasible_trial",
         "notes"
       ],
@@ -2374,10 +3790,6 @@
           "format": "double",
           "type": "number"
         },
-        "mean_requests_count": {
-          "format": "double",
-          "type": "number"
-        },
         "mib_per_s": {
           "format": "double",
           "type": "number"
@@ -2388,6 +3800,10 @@
           "type": "integer"
         },
         "ops_per_s": {
+          "format": "double",
+          "type": "number"
+        },
+        "requests_per_op_mean": {
           "format": "double",
           "type": "number"
         },
@@ -2414,7 +3830,7 @@
         "mib_per_s",
         "latency",
         "breakdown",
-        "mean_requests_count",
+        "requests_per_op_mean",
         "mean_bytes",
         "retries_count"
       ],
@@ -2479,22 +3895,64 @@
       ]
     },
     "Verification": {
-      "description": "A concrete way to test a finding's advice.",
+      "description": "How to test a finding's advice (design v4 §5).",
       "properties": {
         "command": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "description": "`oprobe verify RUN CODE`: replays the run with and without the change and judges it.",
+          "type": "string"
         },
         "description": {
+          "description": "The hypothesis in words.",
+          "type": "string"
+        },
+        "expect": {
+          "description": "What the change should do (filled by the findings that can predict it).",
+          "items": {
+            "$ref": "#/$defs/Expectation"
+          },
+          "type": "array"
+        },
+        "overrides": {
+          "$ref": "#/$defs/Overrides",
+          "description": "The change to the run's spec."
+        },
+        "replay": {
+          "description": "The changed run as a self-contained `oprobe run TARGET …` command (no stored run\nneeded).",
+          "type": "string"
+        },
+        "rerun": {
+          "description": "`oprobe run --from RUN --set …`: the changed run alone.",
           "type": "string"
         }
       },
       "required": [
-        "description"
+        "description",
+        "overrides",
+        "command",
+        "rerun",
+        "replay"
       ],
       "type": "object"
+    },
+    "VerifyOutcome": {
+      "description": "What `verify` concluded about one hypothesis.",
+      "oneOf": [
+        {
+          "const": "confirmed",
+          "description": "The change moved the metrics as expected.",
+          "type": "string"
+        },
+        {
+          "const": "refuted",
+          "description": "The change did not help (or made things worse).",
+          "type": "string"
+        },
+        {
+          "const": "inconclusive",
+          "description": "Noise or too few samples to tell.",
+          "type": "string"
+        }
+      ]
     },
     "WorkloadInfo": {
       "description": "The workload, resolved (preset defaults applied).",
@@ -2563,11 +4021,93 @@
         "seed"
       ],
       "type": "object"
+    },
+    "WorkloadSpec": {
+      "additionalProperties": false,
+      "properties": {
+        "access": {
+          "$ref": "#/$defs/Access",
+          "default": "uniform"
+        },
+        "cleanup": {
+          "default": true,
+          "description": "Delete everything written under the run prefix when the run ends.",
+          "type": "boolean"
+        },
+        "dataset": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DatasetSpec"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Dataset override (defaults come from the preset)."
+        },
+        "duration": {
+          "$ref": "#/$defs/HumanDuration",
+          "default": "10s"
+        },
+        "max_ops": {
+          "description": "Stop after this many measured operations (deterministic CI runs).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "mix": {
+          "description": "Operation mix override (defaults come from the preset).",
+          "items": {
+            "$ref": "#/$defs/OpSpec"
+          },
+          "type": "array"
+        },
+        "preset": {
+          "$ref": "#/$defs/Preset",
+          "default": "parquet"
+        },
+        "rate": {
+          "description": "Open-loop arrival rate in ops/s. Unset = closed loop (`knobs.concurrency` workers).",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "seed": {
+          "default": 42,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "verify": {
+          "default": true,
+          "description": "Verify CRC32C of whole-object reads and sampled writes.",
+          "type": "boolean"
+        },
+        "warmup": {
+          "$ref": "#/$defs/HumanDuration",
+          "default": "2s"
+        }
+      },
+      "required": [
+        "preset",
+        "duration",
+        "warmup",
+        "access",
+        "verify",
+        "cleanup",
+        "seed"
+      ],
+      "type": "object"
     }
   },
-  "$id": "https://github.com/hxddh/oprobe/schemas/3/report.json",
+  "$id": "https://github.com/hxddh/oprobe/schemas/4/report.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "description": "Report v3 (oprobe.report/3): the result of one run",
+  "description": "Report v4 (oprobe.report/4): the result of one run",
   "properties": {
     "apis": {
       "items": {
@@ -2580,6 +4120,31 @@
     },
     "cache": {
       "$ref": "#/$defs/CacheStats"
+    },
+    "capacity": {
+      "$ref": "#/$defs/Capacity",
+      "default": {
+        "confidence": "low",
+        "confidence_reason": "",
+        "observed": {
+          "inflight_mean": 0.0,
+          "ops_inflight_mean": 0.0,
+          "ops_per_s": 0.0,
+          "peak_inflight_count": 0,
+          "requests_count": 0,
+          "throttled_requests_count": 0,
+          "window_s": 0.0
+        },
+        "per_op": {
+          "inflight_per_op_mean": 0.0,
+          "ops_count": 0,
+          "peak_inflight_per_op_count": 0,
+          "requests_per_op_mean": 0.0,
+          "sequential_ratio": 0.0
+        },
+        "source": "this_run"
+      },
+      "description": "How much load the target takes: the in-flight ceiling and the per-op request shape."
     },
     "cleanup": {
       "$ref": "#/$defs/CleanupSummary"
@@ -2643,6 +4208,10 @@
       },
       "type": "array"
     },
+    "spec": {
+      "$ref": "#/$defs/RunSpec",
+      "description": "The replayable definition of the run (`oprobe run --from RUN`)."
+    },
     "stages": {
       "$ref": "#/$defs/Stages"
     },
@@ -2691,6 +4260,7 @@
   "required": [
     "schema",
     "run",
+    "spec",
     "target",
     "workload",
     "knobs",
@@ -2710,6 +4280,7 @@
     "timeline",
     "heatmap",
     "findings",
+    "capacity",
     "cost",
     "slowest",
     "cleanup",

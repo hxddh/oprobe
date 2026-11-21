@@ -26,12 +26,18 @@ pub struct ExportOutput {
     /// Files written (OTLP `--signal all`: one document per signal).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub files: Vec<String>,
+    /// Bytes written.
+    #[serde(rename = "written_bytes")]
     pub bytes: u64,
     pub ops_count: u64,
     pub requests_count: u64,
 }
 
 impl CommandOutput for ExportOutput {
+    fn next(&self) -> Vec<crate::output::NextStep> {
+        vec![crate::cli::next::show(&self.run_id)]
+    }
+
     fn text(&self) -> String {
         if !self.files.is_empty() {
             return format!(

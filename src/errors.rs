@@ -1,9 +1,11 @@
 //! Classified errors (design §8): a stable dotted [`ErrorCode`], an [`ErrorBody`] for machine
 //! output, and the exit-code mapping every command uses.
 //!
-//! Raise a classified error with [`OprobeError`] (or the [`fail!`](crate::fail) macro); any other
-//! `anyhow::Error` is classified at the CLI boundary by [`classify`] (OpenDAL error kinds, typed
-//! transport errors, then known messages), with a hint from `analysis::hints`.
+//! Raise a classified error with [`OprobeError`] (or the [`fail!`](crate::fail) macro) where the
+//! error happens; user input is parsed by [`crate::input`], whose errors are typed. Any other
+//! `anyhow::Error` is classified at the CLI boundary by [`classify`] from typed sources only
+//! (OpenDAL error kinds, dial/TLS/timeout errors, I/O kinds); there is no message matching, so
+//! an untyped error is `internal` — a bug to fix where it is raised.
 
 use std::fmt;
 
@@ -64,6 +66,7 @@ codes! {
     UsageInvalidArgument => "usage.invalid_argument", exit::USAGE, false;
     UsageUnknownTarget => "usage.unknown_target", exit::USAGE, false;
     UsageUnknownRun => "usage.unknown_run", exit::USAGE, false;
+    UsageUnknownBaseline => "usage.unknown_baseline", exit::USAGE, false;
     ConfigInvalid => "config.invalid", exit::USAGE, false;
     ConfigUnknownOption => "config.unknown_option", exit::USAGE, false;
     AuthNoCredentials => "auth.no_credentials", exit::RUNTIME, false;
@@ -72,6 +75,8 @@ codes! {
     NetDns => "net.dns", exit::RUNTIME, true;
     NetTls => "net.tls", exit::RUNTIME, false;
     NetTimeout => "net.timeout", exit::RUNTIME, true;
+    NetRateLimited => "net.rate_limited", exit::RUNTIME, true;
+    NetHttp => "net.http", exit::RUNTIME, false;
     StorageNotFound => "storage.not_found", exit::RUNTIME, false;
     StorageThrottled => "storage.throttled", exit::RUNTIME, true;
     StorageUnsupported => "storage.unsupported", exit::RUNTIME, false;
@@ -115,6 +120,19 @@ impl ErrorCode {
             400..=499 => Some(Self::Internal),
             500..=599 => Some(Self::Internal),
             _ => None,
+        }
+    }
+
+    /// The code of a non-storage HTTP API (GitHub releases, an OTLP collector) answering
+    /// `status`: rate limits (429, or 403 with an exhausted quota) are `net.rate_limited`,
+    /// anything else `net.http`. Never `storage.*` or `auth.*`: the storage target's
+    /// credentials are not involved (design v4 §8).
+    pub fn from_api_status(status: u16, rate_limited: bool) -> Self {
+        match status {
+            0 => Self::NetUnreachable,
+            429 => Self::NetRateLimited,
+            403 if rate_limited => Self::NetRateLimited,
+            _ => Self::NetHttp,
         }
     }
 
@@ -215,7 +233,7 @@ impl<T, E: Into<anyhow::Error>> Classify<T> for Result<T, E> {
 }
 
 /// Classify an error chain: an [`OprobeError`] anywhere in the chain wins, then typed sources
-/// (OpenDAL error kinds, dial/TLS/timeout errors), then known messages. `scheme` selects
+/// (OpenDAL error kinds, dial/TLS/timeout errors), else `internal`. `scheme` selects
 /// provider-specific hints.
 pub fn classify(err: &anyhow::Error, scheme: &str) -> ErrorBody {
     let chain = format!("{err:#}");
@@ -239,7 +257,7 @@ pub fn classify(err: &anyhow::Error, scheme: &str) -> ErrorBody {
             return body;
         }
     }
-    let code = typed_code(err).unwrap_or_else(|| message_code(&chain));
+    let code = typed_code(err).unwrap_or(ErrorCode::Internal);
     let mut body = ErrorBody::new(code, chain_message(err));
     body.hint = hint_text();
     body
@@ -251,30 +269,39 @@ fn chain_message(err: &anyhow::Error) -> String {
     crate::util::strip_url_credentials(&format!("{err:#}"))
 }
 
+/// The code of an OpenDAL error, from its kind (and, for `Unexpected`, the failure class
+/// `engine::ops::error_class_of` derives from its status and source). Credential failures
+/// (`failed to load signing credential`, `no valid credential found`: OpenDAL raises these as
+/// `ConfigInvalid` or `Unexpected` depending on the service) are `auth.no_credentials`.
+/// `None` when the error says nothing more specific than "unexpected".
+pub fn opendal_code(oe: &opendal::Error) -> Option<ErrorCode> {
+    use opendal::ErrorKind as K;
+    // The message, its context (`called: reqsign::Sign`) and its source.
+    let credential = oe.to_string().to_ascii_lowercase().contains("credential");
+    Some(match oe.kind() {
+        K::NotFound => ErrorCode::StorageNotFound,
+        K::PermissionDenied => ErrorCode::AuthDenied,
+        K::RateLimited => ErrorCode::StorageThrottled,
+        K::Unsupported => ErrorCode::StorageUnsupported,
+        K::ConfigInvalid if credential => ErrorCode::AuthNoCredentials,
+        K::ConfigInvalid => ErrorCode::ConfigInvalid,
+        K::Unexpected if credential => ErrorCode::AuthNoCredentials,
+        _ => match ErrorCode::from_class(&crate::engine::ops::error_class_of(oe, None)) {
+            ErrorCode::Internal => return None,
+            c => c,
+        },
+    })
+}
+
+/// Typed sources in the chain: OpenDAL kinds, dial stages, reqwest timeouts/connect errors, I/O
+/// kinds, TOML parse errors. An OpenDAL error that says only "unexpected" lets a more specific
+/// cause further down the chain decide.
 fn typed_code(err: &anyhow::Error) -> Option<ErrorCode> {
     for cause in err.chain() {
-        if let Some(oe) = cause.downcast_ref::<opendal::Error>() {
-            use opendal::ErrorKind as K;
-            return Some(match oe.kind() {
-                K::NotFound => ErrorCode::StorageNotFound,
-                K::PermissionDenied => ErrorCode::AuthDenied,
-                K::RateLimited => ErrorCode::StorageThrottled,
-                K::Unsupported => ErrorCode::StorageUnsupported,
-                K::ConfigInvalid => {
-                    if oe.to_string().contains("credential") {
-                        ErrorCode::AuthNoCredentials
-                    } else {
-                        ErrorCode::ConfigInvalid
-                    }
-                }
-                _ => {
-                    let class = crate::engine::ops::error_class_of(oe, None);
-                    match ErrorCode::from_class(&class) {
-                        ErrorCode::Internal => message_code(&format!("{err:#}")),
-                        c => c,
-                    }
-                }
-            });
+        if let Some(oe) = cause.downcast_ref::<opendal::Error>()
+            && let Some(c) = opendal_code(oe)
+        {
+            return Some(c);
         }
         if let Some(d) = cause.downcast_ref::<crate::net::dial::DialError>() {
             return Some(match d.stage {
@@ -294,7 +321,11 @@ fn typed_code(err: &anyhow::Error) -> Option<ErrorCode> {
         if let Some(io) = cause.downcast_ref::<std::io::Error>() {
             match io.kind() {
                 std::io::ErrorKind::TimedOut => return Some(ErrorCode::NetTimeout),
-                std::io::ErrorKind::ConnectionRefused => return Some(ErrorCode::NetUnreachable),
+                std::io::ErrorKind::ConnectionRefused
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::HostUnreachable
+                | std::io::ErrorKind::NetworkUnreachable => return Some(ErrorCode::NetUnreachable),
                 std::io::ErrorKind::PermissionDenied => return Some(ErrorCode::AuthDenied),
                 _ => {}
             }
@@ -302,40 +333,14 @@ fn typed_code(err: &anyhow::Error) -> Option<ErrorCode> {
         if cause.downcast_ref::<toml::de::Error>().is_some() {
             return Some(ErrorCode::ConfigInvalid);
         }
+        if cause
+            .downcast_ref::<tokio::time::error::Elapsed>()
+            .is_some()
+        {
+            return Some(ErrorCode::NetTimeout);
+        }
     }
     None
-}
-
-/// Last resort: messages oprobe itself produces for usage and configuration errors.
-fn message_code(chain: &str) -> ErrorCode {
-    let l = chain.to_ascii_lowercase();
-    let has = |s: &str| l.contains(s);
-    if has("unknown option") || has("not a valid option") || has("did you mean") {
-        ErrorCode::ConfigUnknownOption
-    } else if has("no target given") || has("invalid storage url") || has("unsupported scheme") {
-        ErrorCode::UsageUnknownTarget
-    } else if has("invalid --") || has("must be at least") || has("must be between") {
-        ErrorCode::UsageInvalidArgument
-    } else if has("profile") && (has("parse") || has("invalid")) || has("invalid sla") {
-        ErrorCode::ConfigInvalid
-    } else if has("dns error")
-        || has("failed to lookup address")
-        || has("name or service not known")
-    {
-        ErrorCode::NetDns
-    } else if has("certificate") || has("tls handshake") || has("invalid peer certificate") {
-        ErrorCode::NetTls
-    } else if has("timed out") || has("timeout") {
-        ErrorCode::NetTimeout
-    } else if has("connection refused") || has("unreachable") || has("connect error") {
-        ErrorCode::NetUnreachable
-    } else if has("credential") || has("no valid credential") {
-        ErrorCode::AuthNoCredentials
-    } else if has("access denied") || has("forbidden") || has("permission denied") {
-        ErrorCode::AuthDenied
-    } else {
-        ErrorCode::Internal
-    }
 }
 
 #[cfg(test)]
@@ -399,7 +404,7 @@ mod tests {
             };
             assert_eq!(c.exit_code(), want, "{c}");
         }
-        assert_eq!(ErrorCode::ALL.len(), 21);
+        assert_eq!(ErrorCode::ALL.len(), 24);
     }
 
     #[test]
@@ -425,10 +430,38 @@ mod tests {
         assert_eq!(classify(&e, "s3").code, ErrorCode::AuthDenied);
         let e = anyhow::Error::new(opendal::Error::new(opendal::ErrorKind::NotFound, "nope"));
         assert_eq!(classify(&e, "s3").code, ErrorCode::StorageNotFound);
-        let e = anyhow::anyhow!("no target given");
-        assert_eq!(classify(&e, "s3").code, ErrorCode::UsageUnknownTarget);
+        // Messages are never matched: only typed errors carry a code.
+        let e = anyhow::anyhow!("no target given: connection refused, credential");
+        assert_eq!(classify(&e, "s3").code, ErrorCode::Internal);
+        let e = anyhow::Error::new(opendal::Error::new(
+            opendal::ErrorKind::Unexpected,
+            "failed to load signing credential",
+        ))
+        .context("preflight");
+        assert_eq!(classify(&e, "gcs").code, ErrorCode::AuthNoCredentials);
+        let e = anyhow::Error::new(opendal::Error::new(
+            opendal::ErrorKind::ConfigInvalid,
+            "no valid credential found",
+        ));
+        assert_eq!(classify(&e, "s3").code, ErrorCode::AuthNoCredentials);
         let e = anyhow::anyhow!("something odd");
         assert_eq!(classify(&e, "s3").code, ErrorCode::Internal);
+    }
+
+    #[test]
+    fn api_statuses_are_network_codes() {
+        assert_eq!(
+            ErrorCode::from_api_status(403, true),
+            ErrorCode::NetRateLimited
+        );
+        assert_eq!(
+            ErrorCode::from_api_status(429, false),
+            ErrorCode::NetRateLimited
+        );
+        assert_eq!(ErrorCode::from_api_status(403, false), ErrorCode::NetHttp);
+        assert_eq!(ErrorCode::from_api_status(404, false), ErrorCode::NetHttp);
+        assert!(ErrorCode::NetRateLimited.retryable());
+        assert_eq!(ErrorCode::NetHttp.exit_code(), 1);
     }
 
     #[test]

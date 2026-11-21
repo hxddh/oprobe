@@ -4,8 +4,8 @@
 
 oprobe 通过 [Apache OpenDAL](https://opendal.apache.org/) 对 S3、GCS、Azure Blob、R2、OSS、COS、B2、MinIO 或本地存储
 施加真实负载，并追踪**每一个后端请求**：排队、新连接的 DNS/TCP/代理/TLS、发送、等待首字节、传输、等待你的代码消费。
-它给出发现的问题的原因、证据、建议以及验证方法。每次运行都保存为一个 `.oprobe` 文件，可以重新打开、对比、导出，
-或交给智能体分析。
+它给出发现的问题的原因、证据和建议，并且验证改动是否真的有效。每次运行都连同完整的运行规格（spec）保存为一个
+`.oprobe` 文件，可以重新打开、原样重放、对比、导出，或交给智能体分析。
 
 它为人（终端、原生应用、单文件 HTML 报告）、为 CI（GitHub Action、退出码、Markdown/JUnit）、也为智能体
 （处处可用 JSON、事件流、MCP 服务器）而设计。
@@ -30,9 +30,11 @@ oprobe target add prod s3://my-bucket/oprobe --region eu-west-1
 oprobe run prod
 ```
 
-`oprobe demo` 在进程内启动一个本地 S3 实验服务器：并发超过 24 个请求时返回限流，每 40 个请求有 1 个慢请求；
-用 32 个 worker 测量 8 秒，然后一步步解释它的发现。不带目标运行 `oprobe run` 时会询问要测什么：演示、本机发现的
-AWS profile、Google 凭据、Azure 环境变量，或者一个 URL，并把选择保存为命名目标。
+`oprobe demo` 就是 `oprobe run lab://demo`：进程内的本地 S3 实验服务器，并发超过 24 个请求时返回限流，每 40 个
+请求有 1 个慢请求；使用该场景的默认负载（小文件、32 个 worker、8 秒）测量，然后一步步解释它的发现，并给出可重放
+本次运行的命令（`oprobe run --from RUN`），后续运行都能与之直接对比。不带目标运行 `oprobe run` 时会询问要测什么：
+演示、本机发现的 AWS profile、Google 凭据、Azure 环境变量（`oprobe target discover`），或者一个 URL，并把选择保存为
+命名目标。
 
 默认输出最多 20 行、不超过 80 列：结论、最重要的发现（原因 · 证据 · 建议 · 下一条命令）、关键数字，以及完整报告的位置。
 
@@ -43,9 +45,22 @@ AWS profile、Google 凭据、Azure 环境变量，或者一个 URL，并把选�
 | `oprobe runs show last` | 终端里的完整报告（80 列；`--detail` 查看全部）。 |
 | `oprobe runs show last -o html > report.html` | 一个自包含的 HTML 文件：带真实坐标轴的图表、延迟热力图、最慢操作的请求瀑布图、可筛选的全部请求表。离线可用，支持亮/暗色，可打印。 |
 | `oprobe runs open last` | 在原生应用中打开这次运行。 |
-| `oprobe compare base last` | 两次运行之间的回归门禁（回归时退出码 3）。 |
-| `oprobe tune prod` | 不触发限流的最佳客户端配置，输出 profile 与 Rust/Python 代码。 |
+| `oprobe run --from last --set concurrency=16` | 按保存的运行规格重放一次运行（负载、数据集、预热、种子、endpoint、region 都相同），只改一项。 |
+| `oprobe verify last throttling` | 验证某个发现的建议：交替重放基线与改动（A B A B…），对照预测数值给出 *confirmed*、*refuted* 或 *inconclusive*。 |
+| `oprobe fix prod` | 一步完成 诊断 → 调优 → 验证：推荐配置以 profile 补丁和代码给出。 |
+| `oprobe compare base last` | 同一目标、同一负载的两次运行之间的回归门禁（回归时退出码 3）。 |
+| `oprobe tune prod` | 在限流预算内吞吐（goodput）最高的客户端配置，输出 profile 与 Rust/Python 代码。 |
 | `oprobe runs list` | 所有保存的运行：时间、结论、ops/s、p99、成本。 |
+
+## 一个模型、一份规格、一个闭环
+
+- **一个容量模型。** oprobe 从请求时间线重建在途请求数，找出服务开始限流的水位（带区间的上限，而不是用平均延迟 ×
+  速率估算）。所有涉及并发度的建议——发现、`tune`、`verify`、应用——都来自这一个模型，并在上限之下保留 15 % 余量，
+  同时考虑单个操作同时发出的请求数。
+- **一份规格。** 每份报告都带有本次运行解析后的完整规格。`oprobe run --from RUN` 重放它，`--set key=value` 修改一项；
+  所有建议的命令都是这样的重放，不会丢掉预热、种子、混合比例、数据集、endpoint、region、HTTP 版本或速率。
+- **一个闭环。** 建议是带预期结果的假设。`oprobe verify` 实际测量并判断它是否成立；`compare` 拒绝评判不同目标或
+  不同负载的运行。
 
 ![演示运行的 HTML 报告](docs/images/report-html.png)
 
@@ -62,7 +77,7 @@ AWS profile、Google 凭据、Azure 环境变量，或者一个 URL，并把选�
 |---|---|
 | 是网络、服务器还是我的客户端？ | 根据真实请求时间线，把每个操作的耗时拆分为 排队 / 连接 / 上传 / 服务器 / 下载 / 重试 / 客户端。 |
 | 为什么 p99 比 p50 差这么多？ | 最慢的操作保留每个请求的各阶段耗时、连接（冷/热）、状态码和请求 ID，以及卡住时采集的异步调用栈。 |
-| 是限流吗？ | 429/503 计数、Retry-After、重试退避作为独立份额，以及开始限流的并发度（`oprobe tune`）。 |
+| 是限流吗？ | 429/503 计数、Retry-After、重试退避作为独立份额，以及开始限流的在途上限和其下的安全并发度（容量模型）。 |
 | 连接复用了吗？TLS 慢吗？ | 每次建连的 DNS/TCP/代理/TLS 耗时、复用率、峰值在途请求数、按远端地址统计。 |
 | 我是否在为用不到的字节付费？ | 读放大、范围合并导致的多读、每个操作的请求数。 |
 | 要花多少钱？ | 实测请求构成 × 各云厂商价格表，以及失败请求和多读造成的浪费。 |
@@ -71,15 +86,15 @@ AWS profile、Google 凭据、Azure 环境变量，或者一个 URL，并把选�
 ## 在 CI 中
 
 ```yaml
-- uses: hxddh/oprobe@v3
+- uses: hxddh/oprobe@v4
   with:
     target: s3://ci-bucket/oprobe
     preset: small-files
     baseline: main
 ```
 
-该 Action 安装固定版本的 oprobe、运行、与基线对比、上传 `.oprobe` 文件和 HTML 报告、维护一条置顶的 PR 评论，
-并在回归时失败。[CI 指南 →](docs/ci.md)
+该 Action 安装最新的 oprobe 4.x（或你固定的 `version`）、运行、与基线对比、上传 `.oprobe` 文件和 HTML 报告、
+维护一条置顶的 PR 评论，并在回归时失败。[CI 指南 →](docs/ci.md)
 
 ## 面向智能体
 
@@ -92,8 +107,9 @@ AWS profile、Google 凭据、Azure 环境变量，或者一个 URL，并把选�
 | 平台 | |
 |---|---|
 | macOS / Linux | `curl -fsSL https://github.com/hxddh/oprobe/releases/latest/download/install.sh \| sh` |
-| Windows | `winget install hxddh.oprobe`、`.msi`，或 `irm https://github.com/hxddh/oprobe/releases/latest/download/install.ps1 \| iex` |
-| Homebrew | 每个版本附带 `oprobe.rb`（命令行）和 `oprobe.cask.rb`（应用）— [docs/install.md](docs/install.md#homebrew) |
+| Homebrew | `brew install hxddh/tap/oprobe`（应用：`brew install --cask hxddh/tap/oprobe-app`） |
+| Windows | `irm https://github.com/hxddh/oprobe/releases/latest/download/install.ps1 \| iex`、`.msi`，或 Scoop（`scoop bucket add hxddh https://github.com/hxddh/scoop-bucket`，`scoop install oprobe`） |
+| winget | 软件包被 winget-pkgs 接受之后才可用 `winget install hxddh.oprobe` — [状态](docs/install.md#windows) |
 | Debian / Ubuntu、Fedora / RHEL | 发布页上的 `.deb` / `.rpm` |
 | Rust | `cargo install oprobe --locked`（Linux 上加 `--features gui` 获得窗口） |
 

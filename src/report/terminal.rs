@@ -103,7 +103,7 @@ pub fn sla_line(r: &Report) -> String {
         "no corrupted data".to_owned(),
     ];
     if let Some(t) = sla.max_throttle_ratio {
-        terms.push(format!("throttled ops ≤ {}%", t * 100.0));
+        terms.push(format!("throttled requests ≤ {}%", t * 100.0));
     }
     if let Some(p) = sla.p99_ms {
         terms.push(format!("p99 ≤ {}", fmt_ms(p)));
@@ -514,11 +514,16 @@ fn render_with(r: &Report, run: Option<&Run>, detail: bool) -> String {
             ))
         );
     }
-    if r.run.interrupted {
+    if r.is_partial() {
+        let reason = r
+            .run
+            .partial
+            .as_ref()
+            .map_or("interrupted", |p| p.reason.as_str());
         let _ = writeln!(
             out,
             "{} {}",
-            badge("INTERRUPTED", "43;30"),
+            badge(&format!("PARTIAL · {reason}"), "43;30"),
             yellow("stopped early: a shorter window than configured")
         );
     }
@@ -540,10 +545,17 @@ fn render_with(r: &Report, run: Option<&Run>, detail: bool) -> String {
             "{:.1} ops/s · {:.1} MiB/s {}",
             sm.ops_per_s,
             sm.mib_per_s,
-            dim(&format!(
-                "(read {:.1} / write {:.1})",
-                sm.read_mib_per_s, sm.write_mib_per_s
-            ))
+            dim(&if sm.failed_ops > 0 {
+                format!(
+                    "(successful ops; {:.1} attempted/s · read {:.1} / write {:.1})",
+                    sm.attempted_ops_per_s, sm.read_mib_per_s, sm.write_mib_per_s
+                )
+            } else {
+                format!(
+                    "(read {:.1} / write {:.1})",
+                    sm.read_mib_per_s, sm.write_mib_per_s
+                )
+            })
         ),
     );
     kv(
@@ -569,7 +581,12 @@ fn render_with(r: &Report, run: Option<&Run>, detail: bool) -> String {
             },
             sm.error_rate * 100.0,
             if r.resilience.throttled_responses > 0 {
-                red(&format!("{} throttled", r.resilience.throttled_responses))
+                red(&format!(
+                    "{} throttled ({:.2}% of requests, {:.2}% of ops)",
+                    r.resilience.throttled_responses,
+                    sm.throttled_request_ratio * 100.0,
+                    sm.throttled_op_ratio * 100.0
+                ))
             } else {
                 "0 throttled".into()
             }
@@ -581,10 +598,14 @@ fn render_with(r: &Report, run: Option<&Run>, detail: bool) -> String {
             &mut out,
             "cost",
             &format!(
-                "{} per 1M ops · {} /month ({})",
+                "{} per 1M ops · {} /month ({}){}",
                 fmt_usd(r.cost.selected.per_million_ops_usd),
                 fmt_usd(r.cost.selected.total_usd),
-                r.cost.selected.provider
+                r.cost.selected.provider,
+                match crate::analysis::cost::storage_label(&r.cost) {
+                    l if l.is_empty() => l,
+                    l => format!(" {}", dim(&l)),
+                }
             ),
         );
     }
@@ -617,13 +638,22 @@ fn render_with(r: &Report, run: Option<&Run>, detail: bool) -> String {
             for l in wrap_text(&f.evidence.text, WIDTH - 4) {
                 let _ = writeln!(out, "    {}", dim(&l));
             }
+            if detail {
+                let kv: Vec<String> = f
+                    .evidence
+                    .labelled()
+                    .into_iter()
+                    .map(|(k, v)| format!("{k} {v}"))
+                    .collect();
+                for l in wrap_text(&kv.join(" · "), WIDTH - 4) {
+                    let _ = writeln!(out, "    {}", dim(&l));
+                }
+            }
             for (i, l) in wrap_text(&f.advice, WIDTH - 6).iter().enumerate() {
                 let _ = writeln!(out, "    {} {l}", if i == 0 { "→" } else { " " });
             }
-            if let Some(v) = &f.verification
-                && let Some(c) = &v.command
-            {
-                let _ = writeln!(out, "    {} {}", dim("try:"), c);
+            if let Some(v) = &f.verification {
+                let _ = writeln!(out, "    {} {}", dim("try:"), v.rerun);
             }
         }
     }
@@ -831,10 +861,15 @@ fn render_with(r: &Report, run: Option<&Run>, detail: bool) -> String {
         );
         let _ = writeln!(
             out,
-            "  requests {} · egress {} · storage {}",
+            "  requests {} · egress {} · storage {} for {:.0} GiB{}",
             fmt_usd(sel.requests_usd),
             fmt_usd(sel.egress_usd),
             fmt_usd(sel.storage_usd),
+            cst.stored_gb,
+            match crate::analysis::cost::storage_label(cst) {
+                l if l.is_empty() => l,
+                l => format!(" {}", dim(&l)),
+            }
         );
         if sel.failed_requests_usd > 0.005
             || sel.overread_usd > 0.005
@@ -1076,7 +1111,7 @@ mod tests {
             "OPERATIONS",
             "SLOWEST OPERATION",
             "CLEANUP",
-            "try: oprobe run prod -c 16",
+            "try: oprobe run --from 20261120-143005-a1b2 --set concurrency=16",
             "--detail",
         ] {
             assert!(text.contains(s), "{s}\n{text}");

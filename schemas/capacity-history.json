@@ -1,0 +1,428 @@
+{
+  "$defs": {
+    "Calibration": {
+      "description": "Verification outcomes stored next to the capacity history, and the prediction bias they\nimply.",
+      "properties": {
+        "observations": {
+          "default": [],
+          "description": "The newest observations (at most [`CALIBRATION_KEEP`]).",
+          "items": {
+            "$ref": "#/$defs/Observation"
+          },
+          "type": "array"
+        },
+        "observations_count": {
+          "default": 0,
+          "description": "Observations folded into the bias.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "ops_bias_ratio": {
+          "default": 0.0,
+          "description": "Measured / predicted throughput (exponential moving average; 1 = unbiased).",
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "ops_bias_ratio",
+        "observations_count",
+        "observations"
+      ],
+      "type": "object"
+    },
+    "Capacity": {
+      "description": "How much load the target takes (design v4 §3); `report.capacity`.",
+      "properties": {
+        "calibration_bias_ratio": {
+          "description": "Measured / predicted throughput of earlier verifications of this target and workload\n([`calibrate`]); [`Capacity::predict`] scales its throughput by it.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "confidence": {
+          "$ref": "#/$defs/Confidence"
+        },
+        "confidence_reason": {
+          "description": "Why the confidence is what it is.",
+          "type": "string"
+        },
+        "inflight_ceiling": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Ceiling"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "In-flight requests the server accepts before it throttles (none: no throttling seen,\nor throttling unrelated to concurrency)."
+        },
+        "observed": {
+          "$ref": "#/$defs/Observed"
+        },
+        "per_op": {
+          "$ref": "#/$defs/OpShape"
+        },
+        "rate_ceiling_requests_per_s": {
+          "description": "Requests per second the service accepted while it throttled.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "source": {
+          "$ref": "#/$defs/CapacitySource"
+        }
+      },
+      "required": [
+        "per_op",
+        "observed",
+        "confidence",
+        "confidence_reason",
+        "source"
+      ],
+      "type": "object"
+    },
+    "CapacitySource": {
+      "description": "Where a capacity estimate comes from.",
+      "oneOf": [
+        {
+          "const": "this_run",
+          "description": "Estimated from this run's rows.",
+          "type": "string"
+        },
+        {
+          "const": "tune",
+          "description": "From a tuner search.",
+          "type": "string"
+        },
+        {
+          "const": "history",
+          "description": "Loaded from `<data>/capacity.toml` (an earlier run of the same target and workload).",
+          "type": "string"
+        }
+      ]
+    },
+    "Ceiling": {
+      "description": "The in-flight level the service accepts before it throttles.",
+      "properties": {
+        "hi_inflight_count": {
+          "description": "Lowest in-flight level whose arrivals were throttled (the limit is in `[lo, hi)`).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "inflight_count": {
+          "description": "In-flight requests the service accepted cleanly (the estimate; equals `lo`).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "lo_inflight_count": {
+          "description": "Highest in-flight level whose arrivals were served without throttling.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "inflight_count",
+        "lo_inflight_count",
+        "hi_inflight_count"
+      ],
+      "type": "object"
+    },
+    "Confidence": {
+      "description": "How far to trust the estimate.",
+      "enum": [
+        "low",
+        "medium",
+        "high"
+      ],
+      "type": "string"
+    },
+    "HistoryEntry": {
+      "description": "One remembered estimate.",
+      "properties": {
+        "calibration": {
+          "$ref": "#/$defs/Calibration",
+          "description": "What verifications of this target and workload taught ([`calibrate`])."
+        },
+        "capacity": {
+          "$ref": "#/$defs/Capacity"
+        },
+        "run_id": {
+          "description": "The run it was estimated from.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "updated_at": {
+          "description": "RFC 3339.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "capacity",
+        "updated_at"
+      ],
+      "type": "object"
+    },
+    "InflightLevel": {
+      "description": "Arrivals at one in-flight level.",
+      "properties": {
+        "inflight_count": {
+          "description": "Requests in flight when a request arrived (itself included).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "requests_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "throttled_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "inflight_count",
+        "requests_count",
+        "throttled_count"
+      ],
+      "type": "object"
+    },
+    "Observation": {
+      "description": "One verified prediction (`oprobe verify`), as remembered.",
+      "properties": {
+        "at": {
+          "default": "",
+          "description": "RFC 3339.",
+          "type": "string"
+        },
+        "code": {
+          "description": "The finding (or `recommendation`) whose change was verified.",
+          "type": "string"
+        },
+        "concurrency_count": {
+          "description": "Workers of the verified configuration.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_throttle_ratio": {
+          "description": "The throttle budget the outcome was judged against.",
+          "format": "double",
+          "type": "number"
+        },
+        "measured_ops_per_s": {
+          "description": "What the candidate runs measured (successful ops/s, mean).",
+          "format": "double",
+          "type": "number"
+        },
+        "outcome": {
+          "$ref": "#/$defs/VerifyOutcome"
+        },
+        "peak_inflight_count": {
+          "description": "Peak requests in flight of the candidate runs (max).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "predicted_ops_per_s": {
+          "description": "What [`Capacity::predict`] expected (successful ops/s).",
+          "format": "double",
+          "type": "number"
+        },
+        "run_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "throttled_request_ratio": {
+          "description": "Throttled responses / requests of the candidate runs.",
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "code",
+        "outcome",
+        "concurrency_count",
+        "predicted_ops_per_s",
+        "measured_ops_per_s",
+        "peak_inflight_count",
+        "throttled_request_ratio",
+        "max_throttle_ratio",
+        "at"
+      ],
+      "type": "object"
+    },
+    "Observed": {
+      "description": "What the rows showed.",
+      "properties": {
+        "inflight_mean": {
+          "description": "Time-weighted mean of requests in flight.",
+          "format": "double",
+          "type": "number"
+        },
+        "levels": {
+          "description": "Arrivals per in-flight level (the evidence of the ceiling).",
+          "items": {
+            "$ref": "#/$defs/InflightLevel"
+          },
+          "type": "array"
+        },
+        "max_clean_inflight_count": {
+          "description": "Highest level a request arrived at and was served cleanly.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "min_throttled_inflight_count": {
+          "description": "Lowest level a request arrived at and was throttled.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "ops_inflight_mean": {
+          "description": "Operations in flight on average (≈ the workers of a closed-loop run).",
+          "format": "double",
+          "type": "number"
+        },
+        "ops_per_s": {
+          "description": "Successful operations per second.",
+          "format": "double",
+          "type": "number"
+        },
+        "peak_inflight_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "requests_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "throttled_requests_count": {
+          "description": "Requests answered 429 / 503.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "window_s": {
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "window_s",
+        "requests_count",
+        "throttled_requests_count",
+        "peak_inflight_count",
+        "inflight_mean",
+        "ops_inflight_mean",
+        "ops_per_s"
+      ],
+      "type": "object"
+    },
+    "OpShape": {
+      "description": "Request concurrency of one operation.",
+      "properties": {
+        "inflight_per_op_mean": {
+          "description": "Requests one operation keeps in flight on average over its lifetime.",
+          "format": "double",
+          "type": "number"
+        },
+        "ops_count": {
+          "description": "Operations the shape was measured over.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "peak_inflight_per_op_count": {
+          "description": "The most requests one operation had in flight at once (the maximum over operations:\non a busy client the parallel reads of an op often fail to overlap, and a p95 then\nunder-counts the burst the server sees).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "requests_per_op_mean": {
+          "description": "Backend requests per operation (mean, retries included).",
+          "format": "double",
+          "type": "number"
+        },
+        "sequential_ratio": {
+          "description": "Share of operation time with exactly one request in flight (1 = strictly sequential).",
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "requests_per_op_mean",
+        "peak_inflight_per_op_count",
+        "inflight_per_op_mean",
+        "sequential_ratio",
+        "ops_count"
+      ],
+      "type": "object"
+    },
+    "VerifyOutcome": {
+      "description": "What `verify` concluded about one hypothesis.",
+      "oneOf": [
+        {
+          "const": "confirmed",
+          "description": "The change moved the metrics as expected.",
+          "type": "string"
+        },
+        {
+          "const": "refuted",
+          "description": "The change did not help (or made things worse).",
+          "type": "string"
+        },
+        {
+          "const": "inconclusive",
+          "description": "Noise or too few samples to tell.",
+          "type": "string"
+        }
+      ]
+    }
+  },
+  "$id": "https://github.com/hxddh/oprobe/schemas/4/capacity-history.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Ceilings remembered per target and workload (<data>/capacity.toml)",
+  "properties": {
+    "targets": {
+      "additionalProperties": {
+        "additionalProperties": {
+          "$ref": "#/$defs/HistoryEntry"
+        },
+        "type": "object"
+      },
+      "default": {},
+      "type": "object"
+    }
+  },
+  "required": [
+    "targets"
+  ],
+  "title": "oprobe capacity-history",
+  "type": "object",
+  "x-rust-type": "History"
+}

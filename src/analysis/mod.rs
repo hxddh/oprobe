@@ -2,6 +2,7 @@
 //! what-if estimates, time segments, re-slicing, run comparison statistics, the cost model
 //! and error hints.
 
+pub mod capacity;
 pub mod compare;
 pub mod cost;
 pub mod diagnosis;
@@ -12,3 +13,4 @@ pub mod segments;
 pub mod simulate;
 pub mod slice;
 pub mod stats;
+pub mod verification;

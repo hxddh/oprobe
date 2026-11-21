@@ -254,6 +254,7 @@
     "DoctorCheck": {
       "properties": {
         "detail": {
+          "description": "What was found; for a failure, the summarized cause (service error code and message,\nHTTP status) rather than the raw backend error.",
           "type": "string"
         },
         "hint": {
@@ -265,6 +266,13 @@
         "name": {
           "type": "string"
         },
+        "raw": {
+          "description": "The raw backend error of a failed check (`--verbose` only).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "status": {
           "$ref": "#/$defs/CheckStatus"
         }
@@ -273,6 +281,121 @@
         "name",
         "status",
         "detail"
+      ],
+      "type": "object"
+    },
+    "McpCall": {
+      "description": "An MCP tool call: the tool and its arguments.",
+      "properties": {
+        "arguments": {
+          "additionalProperties": true,
+          "type": "object"
+        },
+        "tool": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "arguments"
+      ],
+      "type": "object"
+    },
+    "NextStep": {
+      "description": "A suggested next step: what it does, the CLI command, and the MCP call doing the same.",
+      "properties": {
+        "cli": {
+          "description": "The command line (`oprobe …`).",
+          "type": "string"
+        },
+        "mcp": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/McpCall"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The same step as an MCP tool call, when a tool does it."
+        },
+        "title": {
+          "description": "What the step does, in a few words.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "title",
+        "cli"
+      ],
+      "type": "object"
+    },
+    "ObjectSample": {
+      "description": "Result of `oprobe target sample` (MCP `sample_objects`).",
+      "properties": {
+        "examples": {
+          "description": "A few keys (relative to the target root).",
+          "items": {
+            "$ref": "#/$defs/SampleEntry"
+          },
+          "type": "array"
+        },
+        "limit_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "objects_count": {
+          "description": "Objects examined (at most `limit_count`).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "prefix": {
+          "description": "The listed prefix, relative to the target root (`\"\"`: the root).",
+          "type": "string"
+        },
+        "prefixes": {
+          "description": "First-level prefixes under `prefix`, most objects first.",
+          "items": {
+            "$ref": "#/$defs/PrefixStat"
+          },
+          "type": "array"
+        },
+        "sizes": {
+          "$ref": "#/$defs/SizeDistribution"
+        },
+        "suggested_existing": {
+          "description": "The prefix to measure with `--existing` (the one holding the most objects), if any.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "target": {
+          "description": "The target as given.",
+          "type": "string"
+        },
+        "total_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "truncated": {
+          "description": "The listing stopped at the limit: counts are a sample, not the whole target.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "target",
+        "prefix",
+        "objects_count",
+        "total_bytes",
+        "truncated",
+        "limit_count",
+        "prefixes",
+        "sizes",
+        "examples"
       ],
       "type": "object"
     },
@@ -300,6 +423,38 @@
         "write",
         "stat",
         "delete"
+      ],
+      "type": "object"
+    },
+    "PrefixStat": {
+      "description": "Objects and bytes under one first-level prefix.",
+      "properties": {
+        "median_bytes": {
+          "description": "Median object size under the prefix.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "objects_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "prefix": {
+          "description": "The prefix, relative to the target root, ending in `/` (`\"\"`: objects at the root).",
+          "type": "string"
+        },
+        "total_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "prefix",
+        "objects_count",
+        "total_bytes",
+        "median_bytes"
       ],
       "type": "object"
     },
@@ -395,6 +550,90 @@
         }
       ]
     },
+    "SampleEntry": {
+      "description": "An example object.",
+      "properties": {
+        "key": {
+          "type": "string"
+        },
+        "size_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "key",
+        "size_bytes"
+      ],
+      "type": "object"
+    },
+    "SizeBucket": {
+      "description": "One size class of the distribution.",
+      "properties": {
+        "max_bytes": {
+          "description": "Upper bound of the class (objects of at most this size; the last class is open).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "objects_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "max_bytes",
+        "objects_count"
+      ],
+      "type": "object"
+    },
+    "SizeDistribution": {
+      "description": "Object sizes of the sample.",
+      "properties": {
+        "buckets": {
+          "items": {
+            "$ref": "#/$defs/SizeBucket"
+          },
+          "type": "array"
+        },
+        "max_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "mean_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "min_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "p50_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "p90_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "min_bytes",
+        "p50_bytes",
+        "p90_bytes",
+        "max_bytes",
+        "mean_bytes",
+        "buckets"
+      ],
+      "type": "object"
+    },
     "TlsDoctor": {
       "properties": {
         "alpn": {
@@ -440,7 +679,7 @@
       "type": "object"
     }
   },
-  "$id": "https://github.com/hxddh/oprobe/schemas/3/doctor.json",
+  "$id": "https://github.com/hxddh/oprobe/schemas/4/doctor.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "Result of `oprobe doctor`",
   "properties": {
@@ -492,9 +731,12 @@
       "minimum": 0,
       "type": "integer"
     },
-    "next_command": {
-      "description": "A command to run next.",
-      "type": "string"
+    "next": {
+      "description": "Suggested next steps.",
+      "items": {
+        "$ref": "#/$defs/NextStep"
+      },
+      "type": "array"
     },
     "permissions": {
       "$ref": "#/$defs/Permissions"
@@ -512,6 +754,17 @@
           "type": "null"
         }
       ]
+    },
+    "sample": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ObjectSample"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "What the target holds (a read-only listing): prefixes, counts and sizes."
     },
     "scheme": {
       "type": "string"
@@ -533,6 +786,17 @@
       "format": "uint64",
       "minimum": 0,
       "type": "integer"
+    },
+    "warnings": {
+      "description": "Warnings of the command (also printed on stderr in text mode).",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "write_probe": {
+      "description": "Write checks ran (`--write-probe`); otherwise doctor only read.",
+      "type": "boolean"
     }
   },
   "required": [
@@ -541,11 +805,13 @@
     "checks",
     "credentials",
     "permissions",
+    "write_probe",
     "capabilities",
     "failed_count",
     "warned_count",
     "ready",
-    "next_command"
+    "next",
+    "warnings"
   ],
   "title": "oprobe doctor",
   "type": "object",

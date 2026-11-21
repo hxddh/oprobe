@@ -1,7 +1,23 @@
-//! Closed-loop tuner: measures real trials against the target, finds the throttling ceiling,
-//! refines workload-relevant knobs by coordinate descent and confirms the winner.
+//! Closed-loop tuner (design v4 §6): measures real trials against the target and finds the
+//! best configuration within a throttle budget, using the capacity model.
+//!
+//! - **Objective:** `goodput` by default — successful ops/s (or MiB/s for large objects)
+//!   while the share of throttled requests stays within `max_throttle_ratio` (default
+//!   0.001); also `p99`, `cost` and `balanced`. Throttling within the budget is acceptable:
+//!   the ceiling search does not stop at the first 503.
+//! - **Search:** a concurrency ladder, then bisection between the highest feasible and the
+//!   lowest infeasible concurrency, each boundary trial repeated (`boundary_repeats`). Every
+//!   trial's request rows feed one pooled [`Capacity`] estimate (in-flight ceiling); the
+//!   margin is [`Capacity::safe_concurrency`], counted in requests in flight, so it is
+//!   re-checked whenever `io_concurrency` or `range_gap` change the requests one operation
+//!   keeps in flight.
+//! - **Honest deltas:** an infeasible baseline is flagged (`baseline_feasible: false`); deltas
+//!   are then taken against the best feasible trial, and the headline never reports a
+//!   negative "improvement". The cost of the safety margin (best measured vs recommended)
+//!   and the Pareto front of the trials are reported.
 
 pub mod codegen;
+pub mod recommend;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -9,9 +25,11 @@ use std::time::Duration;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+use crate::analysis::capacity::{self, Capacity, Window};
 use crate::analysis::cost::cost_report;
 use crate::config::{Access, Knobs, OpKind, TransportMode};
 use crate::engine::{RunOptions, Session};
+use crate::model::{OpRow, ReqRow};
 use crate::net::HttpVersion;
 use crate::report::TuneSummary;
 use crate::trace::Snapshot;
@@ -20,21 +38,37 @@ use crate::util::ByteSize;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Objective {
-    /// Maximize throughput within the SLA.
+    /// Maximize goodput (successful ops/s or MiB/s) within the SLA and the throttle budget.
     #[default]
     Throughput,
-    /// Minimize worst p99 while keeping ≥ 80% of the best throughput.
+    /// Minimize worst p99 while keeping ≥ 80% of the best goodput.
     Latency,
-    /// Minimize cost per operation while keeping ≥ 80% of the best throughput.
+    /// Minimize cost per operation while keeping ≥ 80% of the best goodput.
     Cost,
+    /// Goodput and p99 together: the best goodput-to-latency trade among trials within 80 %
+    /// of the best goodput.
+    Balanced,
 }
 
 impl Objective {
     pub fn label(&self) -> &'static str {
         match self {
-            Objective::Throughput => "throughput",
-            Objective::Latency => "latency",
+            Objective::Throughput => "goodput",
+            Objective::Latency => "p99",
             Objective::Cost => "cost",
+            Objective::Balanced => "balanced",
+        }
+    }
+
+    /// Parse an objective label (`goodput`/`throughput`, `p99`/`latency`, `cost`,
+    /// `balanced`).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "goodput" | "throughput" => Some(Objective::Throughput),
+            "p99" | "latency" => Some(Objective::Latency),
+            "cost" => Some(Objective::Cost),
+            "balanced" => Some(Objective::Balanced),
+            _ => None,
         }
     }
 }
@@ -48,6 +82,33 @@ pub struct TuneOptions {
     /// Pause after a throttled trial so the service's rate limiter recovers. The service's
     /// `Retry-After` (capped at [`MAX_RETRY_AFTER`]) is honored even when this is zero.
     pub cooldown: Duration,
+    /// Share of throttled requests a feasible configuration may cause.
+    pub max_throttle_ratio: f64,
+    /// Runs of each bisection trial near the throttle boundary.
+    pub boundary_repeats: usize,
+    /// In-flight headroom kept below the ceiling ([`capacity::DEFAULT_HEADROOM_RATIO`]).
+    pub headroom_ratio: f64,
+    /// A remembered capacity of this target and workload (`<data>/capacity.toml`).
+    pub prior: Option<Capacity>,
+}
+
+impl TuneOptions {
+    /// Options with the built-in defaults ([`crate::config::defaults`]) for everything but
+    /// the objective and the trial.
+    pub fn new(objective: Objective, trial: RunOptions) -> Self {
+        let d = crate::config::defaults();
+        Self {
+            objective,
+            trial,
+            max_concurrency: d.tune.max_concurrency,
+            max_trials: d.tune.max_trials,
+            cooldown: d.tune.cooldown.get(),
+            max_throttle_ratio: d.tune.max_throttle_ratio,
+            boundary_repeats: d.tune.boundary_repeats,
+            headroom_ratio: d.headroom_ratio,
+            prior: None,
+        }
+    }
 }
 
 /// Longest `Retry-After` the tuner waits for between trials.
@@ -65,10 +126,17 @@ pub struct Trial {
     /// Worst per-operation p99.
     pub p99_ms: f64,
     pub error_rate: f64,
-    /// Fraction of operations that saw a 429/503.
-    pub throttle_rate: f64,
+    /// Throttled responses / requests (the throttle budget applies to this).
+    pub throttled_request_ratio: f64,
+    /// Operations with at least one throttled response / operations.
+    pub throttled_op_ratio: f64,
     pub throttled_responses: u64,
+    pub requests: u64,
     pub cost_per_million_ops: f64,
+    /// Requests in flight at the trial's peak.
+    pub peak_inflight: u64,
+    /// The most requests one operation had in flight at once (maximum over operations).
+    pub peak_inflight_per_op: f64,
     pub feasible: bool,
     pub note: String,
 }
@@ -95,6 +163,12 @@ pub struct TuneOutcome {
     pub winner_snapshot: Snapshot,
 }
 
+/// Time offset between pooled trials (µs): far larger than any trial, so in-flight levels of
+/// different trials never overlap in the pooled estimate.
+const POOL_OFFSET_US: i64 = 10_000_000_000;
+/// Most request rows kept per trial for the pooled estimate.
+const POOL_MAX_PER_TRIAL: usize = 200_000;
+
 struct Tuner<'a> {
     session: &'a Session,
     opts: &'a TuneOptions,
@@ -102,8 +176,11 @@ struct Tuner<'a> {
     snapshots: Vec<Snapshot>,
     use_bytes: bool,
     on_event: Arc<dyn Fn(TuneEvent) + Send + Sync>,
-    /// Concurrency limit once a throttling ceiling is known (80 % of it): no winner may exceed it.
-    concurrency_cap: Option<usize>,
+    /// Request and op rows of every trial, shifted apart in time.
+    pool_reqs: Vec<ReqRow>,
+    pool_ops: Vec<OpRow>,
+    /// The in-flight ceiling (requests), once known.
+    ceiling: Option<capacity::Ceiling>,
 }
 
 impl Tuner<'_> {
@@ -115,20 +192,24 @@ impl Tuner<'_> {
         }
     }
 
-    async fn trial(
+    async fn trial(&mut self, stage: &str, knobs: &Knobs) -> Result<usize> {
+        if let Some(i) = self
+            .trials
+            .iter()
+            .position(|t| &t.knobs == knobs && t.stage != "confirm")
+        {
+            return Ok(i);
+        }
+        self.measure(stage, knobs, None).await
+    }
+
+    /// Measure `knobs` (always a new trial).
+    async fn measure(
         &mut self,
         stage: &str,
         knobs: &Knobs,
         opts: Option<&RunOptions>,
     ) -> Result<usize> {
-        if let Some(i) = self
-            .trials
-            .iter()
-            .position(|t| &t.knobs == knobs && t.stage != "confirm")
-            && stage != "confirm"
-        {
-            return Ok(i);
-        }
         let id = self.trials.len();
         (self.on_event)(TuneEvent::Started {
             id,
@@ -139,6 +220,29 @@ impl Tuner<'_> {
             .session
             .run(knobs, opts.unwrap_or(&self.opts.trial), None)
             .await?;
+        let rows = self.session.take_trace().unwrap_or_default();
+        let cap = capacity::estimate(&rows.reqs, &rows.ops, Window::measured(snap.elapsed_s));
+        let offset = id as i64 * POOL_OFFSET_US;
+        for q in rows
+            .reqs
+            .iter()
+            .filter(|q| q.t_us >= 0)
+            .take(POOL_MAX_PER_TRIAL)
+        {
+            let mut q = q.clone();
+            q.t_us += offset;
+            self.pool_reqs.push(q);
+        }
+        for o in rows
+            .ops
+            .iter()
+            .filter(|o| o.t_us >= 0)
+            .take(POOL_MAX_PER_TRIAL)
+        {
+            let mut o = o.clone();
+            o.t_us += offset;
+            self.pool_ops.push(o);
+        }
         let p = &self.session.profile;
         let worst_p99 = snap.verbs.iter().map(|v| v.latency.p99).fold(0.0, f64::max);
         let throttled_ops: u64 = snap.verbs.iter().map(|v| v.throttled).sum();
@@ -149,6 +253,8 @@ impl Tuner<'_> {
             &p.target.scheme,
             p.target.endpoint().as_deref(),
         );
+        let requests = snap.connections.requests;
+        let throttled = snap.resilience.throttled_responses;
         let mut t = Trial {
             id,
             stage: stage.into(),
@@ -159,9 +265,13 @@ impl Tuner<'_> {
             p50_ms: snap.summary.latency.p50,
             p99_ms: worst_p99,
             error_rate: snap.summary.error_rate,
-            throttle_rate: throttled_ops as f64 / ops,
-            throttled_responses: snap.resilience.throttled_responses,
+            throttled_request_ratio: crate::util::ratio(throttled as f64, requests as f64),
+            throttled_op_ratio: throttled_ops as f64 / ops,
+            throttled_responses: throttled,
+            requests,
             cost_per_million_ops: cost.selected.per_million_ops_usd,
+            peak_inflight: cap.observed.peak_inflight_count,
+            peak_inflight_per_op: cap.per_op.peak_inflight_per_op.max(1.0),
             feasible: true,
             note: String::new(),
         };
@@ -172,9 +282,12 @@ impl Tuner<'_> {
         if t.error_rate > p.sla.max_error_rate {
             why.push(format!("errors {:.2}%", t.error_rate * 100.0));
         }
-        let throttle_limit = p.sla.tune_throttle_limit();
-        if t.throttle_rate > throttle_limit || (throttle_limit == 0.0 && t.throttled()) {
-            why.push(format!("{} throttled responses", t.throttled_responses));
+        if t.throttled_request_ratio > self.opts.max_throttle_ratio {
+            why.push(format!(
+                "throttled {:.2}% of requests > budget {:.2}%",
+                t.throttled_request_ratio * 100.0,
+                self.opts.max_throttle_ratio * 100.0
+            ));
         }
         if let Some(limit) = p.sla.p99_ms
             && worst_p99 > limit
@@ -208,13 +321,32 @@ impl Tuner<'_> {
         self.trials.len() < self.opts.max_trials && !self.session.cancel.is_cancelled()
     }
 
-    /// Trials that may win: not a confirmation run, and within the throttling headroom cap.
-    fn eligible(&self, i: usize) -> bool {
+    /// The pooled capacity estimate over every trial so far.
+    fn pooled(&self) -> Capacity {
+        let mut c = capacity::estimate(&self.pool_reqs, &self.pool_ops, Window::all());
+        c.source = capacity::CapacitySource::Tune;
+        c
+    }
+
+    /// Workers that keep a trial's peak in-flight under the ceiling with headroom, for its
+    /// request shape (`None` without a ceiling).
+    fn safe_for(&self, peak_per_op: f64) -> Option<usize> {
+        let ce = self.ceiling?;
+        let h = self.opts.headroom_ratio.clamp(0.0, 0.95);
+        Some(((ce.lo * (1.0 - h) / peak_per_op.max(1.0)).floor() as usize).max(1))
+    }
+
+    /// Within the safety margin: its peak in-flight (concurrency × its per-op peak) stays
+    /// under the ceiling with headroom.
+    fn within_margin(&self, i: usize) -> bool {
         let t = &self.trials[i];
-        t.stage != "confirm"
-            && self
-                .concurrency_cap
-                .is_none_or(|cap| t.knobs.concurrency <= cap)
+        self.safe_for(t.peak_inflight_per_op)
+            .is_none_or(|s| t.knobs.concurrency <= s)
+    }
+
+    /// Trials that may win: not a confirmation run, and within the safety margin.
+    fn eligible(&self, i: usize) -> bool {
+        self.trials[i].stage != "confirm" && self.within_margin(i)
     }
 
     fn any_feasible(&self) -> bool {
@@ -223,9 +355,9 @@ impl Tuner<'_> {
             .any(|t| t.feasible && t.stage != "confirm")
     }
 
-    /// Candidate pool, in order of preference: feasible trials within the headroom cap; any
-    /// feasible trial; and only when no trial met the SLA, the least-bad ones (not throttled
-    /// if possible, then the lowest error rate).
+    /// Candidate pool, in order of preference: feasible trials within the margin; any
+    /// feasible trial; and only when no trial met the SLA, the least-bad ones (least
+    /// throttled, then the lowest error rate).
     fn pool(&self) -> Vec<usize> {
         let all = || (0..self.trials.len()).filter(|&i| self.trials[i].stage != "confirm");
         let capped: Vec<usize> = all()
@@ -242,9 +374,11 @@ impl Tuner<'_> {
         if rest.is_empty() {
             rest = all().collect();
         }
-        if rest.iter().any(|&i| !self.trials[i].throttled()) {
-            rest.retain(|&i| !self.trials[i].throttled());
-        }
+        let min_thr = rest
+            .iter()
+            .map(|&i| self.trials[i].throttled_request_ratio)
+            .fold(f64::INFINITY, f64::min);
+        rest.retain(|&i| self.trials[i].throttled_request_ratio <= min_thr + 1e-3);
         let min_err = rest
             .iter()
             .map(|&i| self.trials[i].error_rate)
@@ -254,10 +388,8 @@ impl Tuner<'_> {
         rest
     }
 
-    /// Index of the best trial for the objective. Never an SLA-violating trial while any trial
-    /// met the SLA.
-    fn best(&self) -> Option<usize> {
-        let pool = self.pool();
+    /// The best of `pool` for the objective.
+    fn best_of(&self, pool: Vec<usize>) -> Option<usize> {
         let top = pool
             .iter()
             .map(|&i| self.metric(&self.trials[i]))
@@ -277,6 +409,38 @@ impl Tuner<'_> {
                     .cost_per_million_ops
                     .total_cmp(&self.trials[b].cost_per_million_ops)
             }),
+            Objective::Balanced => {
+                let pool: Vec<usize> = pool.into_iter().filter(near).collect();
+                let min_p99 = pool
+                    .iter()
+                    .map(|&i| self.trials[i].p99_ms)
+                    .fold(f64::INFINITY, f64::min)
+                    .max(1e-6);
+                let score = |i: usize| {
+                    let t = &self.trials[i];
+                    self.metric(t) / top.max(1e-9) - 0.5 * (t.p99_ms / min_p99 - 1.0)
+                };
+                pool.into_iter()
+                    .max_by(|&a, &b| score(a).total_cmp(&score(b)))
+            }
+        }
+    }
+
+    /// Index of the best trial for the objective. Never an SLA-violating trial while any trial
+    /// met the SLA.
+    fn best(&self) -> Option<usize> {
+        self.best_of(self.pool())
+    }
+
+    /// The best feasible trial regardless of the margin (what the margin is measured against).
+    fn best_feasible(&self) -> Option<usize> {
+        let pool: Vec<usize> = (0..self.trials.len())
+            .filter(|&i| self.trials[i].stage != "confirm" && self.trials[i].feasible)
+            .collect();
+        if pool.is_empty() {
+            None
+        } else {
+            self.best_of(pool)
         }
     }
 
@@ -285,6 +449,10 @@ impl Tuner<'_> {
         let (ta, tb) = (&self.trials[a], &self.trials[b]);
         if ta.feasible != tb.feasible {
             return ta.feasible;
+        }
+        let (ea, eb) = (self.within_margin(a), self.within_margin(b));
+        if ea != eb {
+            return ea;
         }
         match self.opts.objective {
             Objective::Throughput => self.metric(ta) > self.metric(tb) * 1.03,
@@ -295,10 +463,15 @@ impl Tuner<'_> {
                 ta.cost_per_million_ops < tb.cost_per_million_ops * 0.97
                     && self.metric(ta) >= 0.8 * self.metric(tb)
             }
+            Objective::Balanced => {
+                let s = |t: &Trial| self.metric(t) / t.p99_ms.max(1e-6);
+                s(ta) > s(tb) * 1.03 && self.metric(ta) >= 0.8 * self.metric(tb)
+            }
         }
     }
 
-    /// Coordinate descent over one knob dimension.
+    /// Coordinate descent over one knob dimension. Every accepted step that changes the
+    /// requests one operation keeps in flight re-checks the margin.
     async fn descend<T: Clone + PartialEq>(
         &mut self,
         stage: &str,
@@ -320,7 +493,8 @@ impl Tuner<'_> {
                 }
                 let mut k = self.trials[current].knobs.clone();
                 set(&mut k, values[p as usize].clone());
-                let id = self.trial(stage, &k, None).await?;
+                let id = self.trial(stage, &k).await?;
+                let id = self.recheck_margin(id).await?;
                 if self.better(id, current) {
                     current = id;
                 } else {
@@ -330,80 +504,49 @@ impl Tuner<'_> {
         }
         Ok(current)
     }
-}
 
-/// Highest concurrency the tuner recommends below a throttling ceiling (80 % of it).
-pub fn safe_concurrency(ceiling: usize) -> usize {
-    ((ceiling as f64) * 0.8).floor().max(1.0) as usize
-}
-
-/// "throttling ceiling: concurrency 48 was throttled (… 429/503 responses, trial #9); 40 is the
-/// highest clean concurrency measured (first seen at 64 on the doubling ladder, narrowed by
-/// bisection)".
-fn ceiling_note(trials: &[Trial], base: &Knobs, ce: usize, first: Option<usize>) -> String {
-    let at = |c: usize| {
-        let k = Knobs {
-            concurrency: c,
-            ..base.clone()
+    /// When trial `id` keeps more requests in flight per operation than the margin allows at
+    /// its concurrency, measure it again at the concurrency that fits ("margin-recheck").
+    async fn recheck_margin(&mut self, id: usize) -> Result<usize> {
+        let t = &self.trials[id];
+        let Some(safe) = self.safe_for(t.peak_inflight_per_op) else {
+            return Ok(id);
         };
-        trials
-            .iter()
-            .rev()
-            .find(|t| t.stage != "confirm" && t.knobs == k)
-    };
-    let mut s = format!("throttling ceiling: concurrency {ce}");
-    if let Some(t) = at(ce) {
-        s += &format!(
-            " was throttled ({} responses 429/503, trial #{})",
-            t.throttled_responses, t.id
+        if t.knobs.concurrency <= safe || !self.budget_left() {
+            return Ok(id);
+        }
+        let mut k = t.knobs.clone();
+        let msg = format!(
+            "margin re-check: {} peaks at {:.0} requests in flight per op, so concurrency {} exceeds the ceiling's margin; trying {safe}",
+            k.summary(),
+            t.peak_inflight_per_op,
+            k.concurrency
         );
+        (self.on_event)(TuneEvent::Message(msg));
+        k.concurrency = safe;
+        self.trial("margin-recheck", &k).await
     }
-    let clean = trials
-        .iter()
-        .filter(|t| t.stage != "confirm" && !t.throttled() && t.knobs.concurrency < ce)
-        .map(|t| t.knobs.concurrency)
-        .max();
-    if let Some(c) = clean {
-        s += &format!("; {c} is the highest clean concurrency measured");
-    }
-    if let Some(f) = first.filter(|&f| f != ce) {
-        s += &format!(" (first seen at {f} on the doubling ladder, narrowed down by bisection)");
-    }
-    s
 }
 
-/// Explain the safety margin with the numbers that decided it.
-fn safety_note(t: &Tuner<'_>, winner: usize, ce: usize) -> String {
-    let safe = safe_concurrency(ce);
-    let w = &t.trials[winner];
-    let mut s = format!(
-        "safety margin: concurrency is capped at {safe} = 80% of the throttling ceiling {ce}, leaving {} slots of headroom for production variance",
-        ce - safe
-    );
-    // The best clean trial the cap excluded, if it measured better than the winner.
-    let excluded = (0..t.trials.len())
-        .filter(|&i| {
-            let x = &t.trials[i];
-            x.stage != "confirm" && x.feasible && x.knobs.concurrency > safe
-        })
-        .max_by(|&a, &b| t.metric(&t.trials[a]).total_cmp(&t.metric(&t.trials[b])));
-    if let Some(i) = excluded {
-        let x = &t.trials[i];
-        let (mx, mw) = (t.metric(x), t.metric(w));
-        if mw > 0.0 && mx > mw {
-            s += &format!(
-                "; concurrency {} (trial #{}) was clean and measured {:+.0}% {} vs concurrency {} (trial #{}), but sits only {:.0}% below the ceiling, so it was not recommended",
-                x.knobs.concurrency,
-                x.id,
-                (mx / mw - 1.0) * 100.0,
-                if t.use_bytes { "MiB/s" } else { "ops/s" },
-                w.knobs.concurrency,
-                w.id,
-                (1.0 - x.knobs.concurrency as f64 / ce as f64) * 100.0
-            );
-        }
-    }
-    s
+/// The trials that are not dominated on (goodput, p99, cost, throttled ratio).
+pub fn pareto_front(trials: &[Trial], use_bytes: bool) -> Vec<usize> {
+    let m = |t: &Trial| if use_bytes { t.mib_per_s } else { t.ops_per_s };
+    let cand: Vec<&Trial> = trials.iter().filter(|t| t.stage != "confirm").collect();
+    let dominates = |a: &Trial, b: &Trial| {
+        let ge = m(a) >= m(b)
+            && a.p99_ms <= b.p99_ms
+            && a.cost_per_million_ops <= b.cost_per_million_ops
+            && a.throttled_request_ratio <= b.throttled_request_ratio;
+        let gt = m(a) > m(b)
+            || a.p99_ms < b.p99_ms
+            || a.cost_per_million_ops < b.cost_per_million_ops
+            || a.throttled_request_ratio < b.throttled_request_ratio;
+        ge && gt
+    };
+    cand.iter()
+        .filter(|b| !cand.iter().any(|a| dominates(a, b)))
+        .map(|t| t.id)
+        .collect()
 }
 
 /// Chunk candidates as OpenDAL would write them on a service with `cap`: each clamped to the
@@ -432,6 +575,26 @@ fn cooldown_after(throttled: bool, cooldown: Duration, retry_after_ms: u64) -> D
     cooldown.max(Duration::from_millis(retry_after_ms).min(MAX_RETRY_AFTER))
 }
 
+/// The objective's value of a trial, signed so that higher is better.
+fn score(o: Objective, use_bytes: bool, t: &Trial) -> f64 {
+    let m = if use_bytes { t.mib_per_s } else { t.ops_per_s };
+    match o {
+        Objective::Throughput | Objective::Balanced => m,
+        Objective::Latency => -t.p99_ms,
+        Objective::Cost => -t.cost_per_million_ops,
+    }
+}
+
+/// Relative improvement of `b` over `a` for the objective (positive = better).
+fn improvement(o: Objective, use_bytes: bool, a: &Trial, b: &Trial) -> f64 {
+    let (x, y) = (score(o, use_bytes, a), score(o, use_bytes, b));
+    if x.abs() < 1e-12 {
+        0.0
+    } else {
+        (y - x) / x.abs()
+    }
+}
+
 /// Run the tuning loop on an open session.
 pub async fn tune(
     session: &Session,
@@ -457,47 +620,58 @@ pub async fn tune(
         snapshots: Vec::new(),
         use_bytes: false,
         on_event,
-        concurrency_cap: None,
+        pool_reqs: Vec::new(),
+        pool_ops: Vec::new(),
+        ceiling: None,
     };
     let base_knobs = p.knobs.clone();
-    let baseline = t.trial("baseline", &base_knobs, None).await?;
+    let baseline = t.trial("baseline", &base_knobs).await?;
     let bs = &t.snapshots[baseline];
     t.use_bytes = bs.summary.ops > 0
         && (bs.bytes.logical_read + bs.bytes.logical_write) / bs.summary.ops.max(1) >= 64 * 1024;
+    let unit = if t.use_bytes { "MiB/s" } else { "ops/s" };
     let mut notes = vec![format!(
-        "objective: {} (measured as {})",
+        "objective: {} (measured as {unit}) within a throttle budget of {:.2}% of requests",
         opts.objective.label(),
-        if t.use_bytes { "MiB/s" } else { "ops/s" }
+        opts.max_throttle_ratio * 100.0
     )];
+    if let Some(prior) = &opts.prior
+        && let Some(ce) = prior.inflight_ceiling
+    {
+        notes.push(format!(
+            "history: this target and workload throttled above ≈{:.0} requests in flight before",
+            ce.lo
+        ));
+    }
 
-    // 1. Concurrency ladder with throttling-ceiling detection.
+    // 1. Concurrency ladder: up while feasible (throttling within the budget is fine).
     let max_c = opts.max_concurrency.max(1);
     let ladder: Vec<usize> = std::iter::successors(Some(1usize), |c| Some(c * 2))
         .take_while(|&c| c <= max_c)
         .collect();
-    let mut ceiling: Option<usize> = if t.trials[baseline].throttled() {
-        Some(base_knobs.concurrency)
-    } else {
-        None
-    };
-    let mut last_clean: Option<usize> = None;
+    let throttle_bound = |tr: &Trial| tr.throttled_request_ratio > opts.max_throttle_ratio;
+    let mut infeasible_at: Option<usize> = (!t.trials[baseline].feasible
+        && throttle_bound(&t.trials[baseline]))
+    .then_some(base_knobs.concurrency);
+    let mut last_feasible: Option<usize> = t.trials[baseline]
+        .feasible
+        .then_some(base_knobs.concurrency);
     let mut best_metric = 0.0f64;
     let mut flat = 0;
     for &c in ladder.iter().filter(|&&c| c >= 2) {
-        if !t.budget_left() || ceiling.is_some_and(|ce| c >= ce) {
+        if !t.budget_left() || infeasible_at.is_some_and(|ce| c >= ce) {
             break;
         }
         let k = Knobs {
             concurrency: c,
             ..base_knobs.clone()
         };
-        let id = t.trial("concurrency", &k, None).await?;
+        let id = t.trial("concurrency", &k).await?;
         let tr = t.trials[id].clone();
-        if tr.throttled() {
-            ceiling = Some(c);
+        if throttle_bound(&tr) {
+            infeasible_at = Some(c);
             break;
         }
-        last_clean = Some(c);
         if !tr.feasible {
             notes.push(format!(
                 "concurrency {c} violates the SLA ({}); not going higher",
@@ -505,6 +679,7 @@ pub async fn tune(
             ));
             break;
         }
+        last_feasible = Some(last_feasible.map_or(c, |l| l.max(c)));
         let m = t.metric(&tr);
         if m > best_metric * 1.05 {
             best_metric = m;
@@ -512,60 +687,143 @@ pub async fn tune(
         } else {
             flat += 1;
             if flat >= 2 {
-                notes.push(format!("throughput plateaued at concurrency ≈{}", c / 4));
+                notes.push(format!("goodput plateaued at concurrency ≈{}", c / 4));
                 break;
             }
         }
     }
-    let first_throttled = ceiling;
-    // Binary refinement just below the throttling ceiling.
-    if let (Some(hi0), Some(lo0)) = (ceiling, last_clean) {
+    let first_infeasible = infeasible_at;
+    // 2. Bisection between the highest feasible and the lowest throttle-infeasible
+    // concurrency; each boundary trial is repeated and judged on its mean throttled ratio.
+    if let (Some(hi0), Some(lo0)) = (
+        infeasible_at,
+        last_feasible.filter(|l| Some(*l) < infeasible_at),
+    ) {
         let (mut lo, mut hi) = (lo0, hi0);
-        for _ in 0..3 {
+        for _ in 0..4 {
             if hi - lo < 2 || !t.budget_left() {
                 break;
             }
             let mid = (lo + hi) / 2;
-            let id = t
-                .trial(
-                    "ceiling",
-                    &Knobs {
-                        concurrency: mid,
-                        ..base_knobs.clone()
-                    },
-                    None,
+            let k = Knobs {
+                concurrency: mid,
+                ..base_knobs.clone()
+            };
+            let mut ids = vec![t.trial("boundary", &k).await?];
+            for _ in 1..opts.boundary_repeats.max(1) {
+                if !t.budget_left() {
+                    break;
+                }
+                ids.push(t.measure("boundary", &k, None).await?);
+            }
+            let (thr, req): (u64, u64) = ids.iter().fold((0, 0), |(a, b), &i| {
+                (
+                    a + t.trials[i].throttled_responses,
+                    b + t.trials[i].requests,
                 )
-                .await?;
-            if t.trials[id].throttled() {
+            });
+            let mean_ratio = crate::util::ratio(thr as f64, req as f64);
+            let all_feasible = ids.iter().all(|&i| t.trials[i].feasible);
+            if mean_ratio > opts.max_throttle_ratio {
                 hi = mid;
             } else {
                 lo = mid;
             }
+            // A repeat that disagrees marks every run of this level infeasible.
+            if mean_ratio > opts.max_throttle_ratio || !all_feasible {
+                for &i in &ids {
+                    if t.trials[i].feasible && mean_ratio > opts.max_throttle_ratio {
+                        t.trials[i].feasible = false;
+                        t.trials[i].note = format!(
+                            "throttled {:.2}% of requests over {} repeats > budget",
+                            mean_ratio * 100.0,
+                            ids.len()
+                        );
+                    }
+                }
+            }
         }
-        ceiling = Some(hi);
+        infeasible_at = Some(hi);
+        last_feasible = Some(lo);
     }
-    // One statement about the ceiling, consistent with `throttle_ceiling` in the summary.
-    if let Some(ce) = ceiling {
-        notes.push(ceiling_note(&t.trials, &base_knobs, ce, first_throttled));
+    // 3. The capacity model over every trial: the in-flight ceiling and the margin.
+    let mut cap = t.pooled();
+    if cap.inflight_ceiling.is_none()
+        && let Some(prior) = &opts.prior
+        && prior.inflight_ceiling.is_some()
+        && infeasible_at.is_some()
+    {
+        cap.inflight_ceiling = prior.inflight_ceiling;
+        notes.push("the in-flight ceiling comes from the target's history".into());
+    }
+    t.ceiling = cap.inflight_ceiling;
+    let base_shape = t.trials[baseline].peak_inflight_per_op;
+    let mut safe = t.safe_for(base_shape);
+    if let (Some(ce), Some(s)) = (t.ceiling, safe) {
+        notes.push(format!(
+            "throttling ceiling: {:.0}–{:.0} requests in flight ({} confidence); at {:.0} requests in flight per op the margin of {:.0}% allows concurrency {s}",
+            ce.lo,
+            ce.hi,
+            match cap.confidence {
+                capacity::Confidence::Low => "low",
+                capacity::Confidence::Medium => "medium",
+                capacity::Confidence::High => "high",
+            },
+            base_shape,
+            opts.headroom_ratio * 100.0
+        ));
+        // The margin never exceeds what was measured feasible.
+        if let Some(hi) = infeasible_at
+            && s >= hi
+        {
+            safe = Some(hi.saturating_sub(1).max(1));
+        }
+    } else if let Some(hi) = infeasible_at {
+        // Throttling that does not follow in-flight requests (a rate limit): stay at the
+        // highest feasible concurrency measured.
+        let fallback = last_feasible.unwrap_or(1).min(hi.saturating_sub(1)).max(1);
+        notes.push(format!(
+            "throttled above the budget from concurrency {hi}, but not at a clear in-flight level ({}); staying at concurrency {fallback}",
+            cap.confidence_reason
+        ));
+        safe = Some(fallback);
+    }
+    if let Some(f) = first_infeasible.filter(|f| Some(*f) != infeasible_at)
+        && let Some(hi) = infeasible_at
+    {
+        notes.push(format!(
+            "over budget from concurrency {hi} (first seen at {f} on the doubling ladder, narrowed down by bisection with {} repeats per step)",
+            opts.boundary_repeats.max(1)
+        ));
     }
     let mut current = t.best().unwrap_or(baseline);
-    if let Some(ce) = ceiling {
-        let safe = safe_concurrency(ce);
-        t.concurrency_cap = Some(safe);
-        if t.trials[current].knobs.concurrency > safe {
-            if t.budget_left() {
-                let k = Knobs {
-                    concurrency: safe,
-                    ..t.trials[current].knobs.clone()
-                };
-                current = t.trial("safety-margin", &k, None).await?;
-            } else if let Some(b) = t.best() {
-                current = b;
+    if let Some(s) = safe {
+        let at_safe = Knobs {
+            concurrency: s,
+            ..base_knobs.clone()
+        };
+        let cur_c = t.trials[current].knobs.concurrency;
+        // For goodput the margin's concurrency is the natural answer: measure it unless a
+        // measured trial at it exists.
+        let measure_safe = cur_c != s
+            && (cur_c > s || matches!(opts.objective, Objective::Throughput | Objective::Balanced));
+        if measure_safe && t.budget_left() {
+            let id = t.trial("safety-margin", &at_safe).await?;
+            if t.trials[id].feasible
+                && (t.trials[current].knobs.concurrency > s
+                    || !t.within_margin(current)
+                    || !t.better(current, id))
+            {
+                current = id;
             }
+        } else if cur_c > s
+            && let Some(b) = t.best()
+        {
+            current = b;
         }
     }
 
-    // 2. Workload-relevant knobs.
+    // 4. Workload-relevant knobs.
     let mix = &session.mix;
     let has = |f: &dyn Fn(&OpKind) -> bool| mix.iter().any(|m| m.weight > 0 && f(&m.op));
     let big_objects = session
@@ -576,8 +834,6 @@ pub async fn tune(
         .max()
         .unwrap_or(0)
         >= 8 << 20;
-    // A service without multipart uploads writes every object in one request: the chunk size
-    // does not shape writes there (capability-aware candidates, stream B2).
     let multipart =
         has(&|o| matches!(o, OpKind::MultipartWrite { .. })) && session.capability.write_can_multi;
     if has(&|o| matches!(o, OpKind::MultipartWrite { .. })) && !multipart {
@@ -597,8 +853,6 @@ pub async fn tune(
         ByteSize::mib(32),
     ];
     if multipart {
-        // OpenDAL silently raises (lowers) write chunks to the service's minimum (maximum)
-        // multipart part size: only try chunk sizes it actually uses.
         let (requested, effective) = write_chunk_candidates(&session.capability, &chunks);
         if effective != requested {
             notes.push(format!(
@@ -627,7 +881,6 @@ pub async fn tune(
         ByteSize::kib(256),
         ByteSize::mib(1),
     ];
-
     let snap_dims = |k: &mut Knobs,
                      list: &[ByteSize],
                      f: fn(&Knobs) -> ByteSize,
@@ -648,7 +901,8 @@ pub async fn tune(
             k.io_concurrency = 4;
         }
         if k != t.trials[current].knobs && t.budget_left() {
-            let id = t.trial("normalize", &k, None).await?;
+            let id = t.trial("normalize", &k).await?;
+            let id = t.recheck_margin(id).await?;
             if !t.better(current, id) {
                 current = id;
             }
@@ -676,7 +930,8 @@ pub async fn tune(
         let mut k = t.trials[current].knobs.clone();
         snap_dims(&mut k, &gaps, |k| k.range_gap, |k, v| k.range_gap = v);
         if k != t.trials[current].knobs && t.budget_left() {
-            let id = t.trial("normalize", &k, None).await?;
+            let id = t.trial("normalize", &k).await?;
+            let id = t.recheck_margin(id).await?;
             if !t.better(current, id) {
                 current = id;
             }
@@ -702,10 +957,8 @@ pub async fn tune(
                 .await?;
         }
     }
-    // The read cache. A generated dataset is a small stand-in for the real data: under uniform
-    // access it fitting into the cache says nothing about production, so the cache is only
-    // tried for skewed access (locality) or for the user's real objects (`existing_prefix`),
-    // and a win that relies on the whole test dataset fitting is flagged.
+    // The read cache: only for skewed access or the user's real objects (a generated dataset
+    // fitting the cache says nothing about production).
     let skewed = !matches!(p.workload.access, Access::Uniform);
     let real_data = session.dataset.read_only;
     let working_set: u64 = session.dataset.objects.iter().map(|o| o.size).sum();
@@ -713,7 +966,7 @@ pub async fn tune(
     if reads && t.budget_left() && (skewed || (real_data && fits)) {
         let mut k = t.trials[current].knobs.clone();
         k.cache = !k.cache;
-        let id = t.trial("cache", &k, None).await?;
+        let id = t.trial("cache", &k).await?;
         if t.better(id, current) {
             current = id;
             if t.trials[id].knobs.cache && fits && !real_data {
@@ -730,9 +983,6 @@ pub async fn tune(
         );
     }
     if p.target.endpoint().is_some_and(|e| e.starts_with("https")) && t.budget_left() {
-        // Compare the two protocols the measured client can actually speak: OpenDAL's reqwest
-        // client is HTTP/1.1 unless h2 is requested (`Auto` == `H1` there); the microscope pool
-        // negotiates h2 by ALPN under `Auto`.
         let mut k = t.trials[current].knobs.clone();
         k.http_version = match (k.transport, k.http_version) {
             (TransportMode::Opendal, HttpVersion::H2) => HttpVersion::Auto,
@@ -740,32 +990,28 @@ pub async fn tune(
             (TransportMode::Microscope, HttpVersion::H1) => HttpVersion::Auto,
             (TransportMode::Microscope, _) => HttpVersion::H1,
         };
-        let id = t.trial("http_version", &k, None).await?;
+        let id = t.trial("http_version", &k).await?;
         if t.better(id, current) {
             current = id;
         }
     }
 
-    // 3. Confirm the winner with a longer window.
+    // 5. The winner: the best eligible trial; confirmed with a longer window.
     let mut winner_idx = t
         .best()
         .map(|b| if t.better(b, current) { b } else { current })
         .unwrap_or(current);
     let no_feasible = !t.any_feasible();
-    if !no_feasible && !t.trials[winner_idx].feasible {
-        // Never recommend an SLA-violating configuration while one met the SLA.
+    if !no_feasible && (!t.trials[winner_idx].feasible || !t.eligible(winner_idx)) {
         winner_idx = t.best().unwrap_or(winner_idx);
     }
     if no_feasible {
         let msg = format!(
-            "no trial met the SLA; recommending the least-bad configuration (trial #{}: {})",
+            "no trial met the SLA and the throttle budget; this is the least-bad configuration (trial #{}: {})",
             winner_idx, t.trials[winner_idx].note
         );
         (t.on_event)(TuneEvent::Message(msg.clone()));
         notes.insert(0, msg);
-    }
-    if let Some(ce) = ceiling {
-        notes.push(safety_note(&t, winner_idx, ce));
     }
     let winner = t.trials[winner_idx].knobs.clone();
     let confirm_opts = RunOptions {
@@ -773,40 +1019,127 @@ pub async fn tune(
         ..opts.trial.clone()
     };
     let confirm = if !session.cancel.is_cancelled() {
-        t.trial("confirm", &winner, Some(&confirm_opts)).await?
+        t.measure("confirm", &winner, Some(&confirm_opts)).await?
     } else {
         winner_idx
     };
-    if !t.trials[baseline].feasible {
-        notes.push(format!(
-            "baseline configuration violated the SLA ({}); the winner is compared against it",
-            t.trials[baseline].note
-        ));
-    }
     if !t.trials[confirm].feasible {
         notes.push(format!(
             "confirmation run was not clean ({}); treat the result with care",
             t.trials[confirm].note
         ));
     }
-    let base_m = t.metric(&t.trials[baseline]);
-    let improvement = if base_m > 0.0 {
-        t.metric(&t.trials[confirm]) / base_m - 1.0
-    } else {
-        0.0
+    // The final capacity estimate includes every trial.
+    let mut cap = t.pooled();
+    if cap.inflight_ceiling.is_none() {
+        cap.inflight_ceiling = t.ceiling;
+    }
+    let o = opts.objective;
+    let (wt, bt) = (&t.trials[winner_idx], &t.trials[baseline]);
+    let baseline_feasible = bt.feasible;
+    let best_feasible = t.best_feasible();
+    let change = {
+        let o = recommend::knob_overrides(&base_knobs, &wt.knobs);
+        if o.is_empty() {
+            "the baseline settings".to_owned()
+        } else {
+            o.summary()
+        }
     };
+    // Deltas: against the baseline when it is feasible and within the margin, else against
+    // the best feasible trial; never a negative headline.
+    let (improvement_ratio, headline) = if no_feasible {
+        (
+            None,
+            format!(
+                "no feasible configuration: least-bad is {} ({})",
+                change.clone(),
+                wt.note
+            ),
+        )
+    } else if !baseline_feasible {
+        (
+            None,
+            format!(
+                "baseline infeasible ({:.1}% of requests throttled{}); recommended {} at {:.1} {unit}",
+                bt.throttled_request_ratio * 100.0,
+                if bt.error_rate > p.sla.max_error_rate {
+                    format!(", {:.1}% errors", bt.error_rate * 100.0)
+                } else {
+                    String::new()
+                },
+                change.clone(),
+                t.metric(wt)
+            ),
+        )
+    } else {
+        let imp = improvement(o, t.use_bytes, bt, wt);
+        if imp >= 0.0 {
+            (
+                Some(imp),
+                format!(
+                    "{} → {:+.0}% {} vs baseline",
+                    change.clone(),
+                    imp * 100.0,
+                    o.label()
+                ),
+            )
+        } else {
+            (
+                None,
+                format!(
+                    "baseline exceeds the safety margin; recommended {} keeps {:.0}% headroom below the throttling ceiling (costs {:.0}% {})",
+                    change.clone(),
+                    opts.headroom_ratio * 100.0,
+                    -imp * 100.0,
+                    o.label()
+                ),
+            )
+        }
+    };
+    let margin_cost_ratio = best_feasible
+        .filter(|&b| b != winner_idx)
+        .map(|b| improvement(o, t.use_bytes, wt, &t.trials[b]))
+        .filter(|d| *d > 0.0);
+    if let (Some(b), Some(d)) = (best_feasible, margin_cost_ratio) {
+        let bf = &t.trials[b];
+        notes.push(format!(
+            "cost of the margin: trial #{} ({}) measured {:.1} {unit} within the throttle budget, {:.0}% more than the recommended {:.1} {unit}; it sits closer to the ceiling",
+            bf.id,
+            bf.knobs.summary(),
+            t.metric(bf),
+            d * 100.0,
+            t.metric(wt)
+        ));
+    }
+    let pareto = pareto_front(&t.trials, t.use_bytes);
     let mut winner_snapshot = t.snapshots[confirm].clone();
     if session.cancel.is_cancelled() {
         winner_snapshot.interrupted = true;
     }
     Ok(TuneOutcome {
         summary: TuneSummary {
-            objective: opts.objective.label().into(),
+            objective: o.label().into(),
+            metric_unit: if t.use_bytes {
+                "mib_per_s"
+            } else {
+                "ops_per_s"
+            }
+            .into(),
             trials: t.trials,
             baseline_trial: baseline,
+            recommended_trial: winner_idx,
             winner_trial: confirm,
-            improvement,
-            throttle_ceiling: ceiling,
+            best_feasible_trial: best_feasible,
+            baseline_feasible,
+            improvement: improvement_ratio,
+            headline,
+            margin_cost_ratio,
+            throttle_ceiling: infeasible_at,
+            safe_concurrency: safe,
+            capacity: Some(cap),
+            max_throttle_ratio: opts.max_throttle_ratio,
+            pareto,
             no_feasible_trial: no_feasible,
             notes,
         },
@@ -848,5 +1181,54 @@ mod tests {
             MAX_RETRY_AFTER
         );
         assert_eq!(cooldown_after(true, Duration::ZERO, 0), Duration::ZERO);
+    }
+
+    fn tr(id: usize, ops: f64, p99: f64, cost: f64, thr: f64) -> Trial {
+        Trial {
+            id,
+            stage: "concurrency".into(),
+            ops_per_s: ops,
+            p99_ms: p99,
+            cost_per_million_ops: cost,
+            throttled_request_ratio: thr,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn pareto_front_drops_dominated_trials() {
+        let trials = vec![
+            tr(0, 100.0, 10.0, 1.0, 0.0),
+            tr(1, 200.0, 12.0, 1.0, 0.0),
+            tr(2, 150.0, 15.0, 1.0, 0.0), // dominated by 1
+            tr(3, 300.0, 40.0, 1.0, 0.05),
+        ];
+        assert_eq!(pareto_front(&trials, false), vec![0, 1, 3]);
+    }
+
+    #[test]
+    fn objective_labels_and_improvement_signs() {
+        assert_eq!(Objective::parse("throughput"), Some(Objective::Throughput));
+        assert_eq!(Objective::parse("goodput").unwrap().label(), "goodput");
+        assert_eq!(Objective::parse("latency").unwrap().label(), "p99");
+        assert_eq!(Objective::parse("balanced"), Some(Objective::Balanced));
+        assert!(Objective::parse("nope").is_none());
+        let (a, b) = (tr(0, 100.0, 20.0, 1.0, 0.0), tr(1, 150.0, 10.0, 0.5, 0.0));
+        assert!((improvement(Objective::Throughput, false, &a, &b) - 0.5).abs() < 1e-9);
+        assert!((improvement(Objective::Latency, false, &a, &b) - 0.5).abs() < 1e-9);
+        assert!((improvement(Objective::Cost, false, &a, &b) - 0.5).abs() < 1e-9);
+        assert!(improvement(Objective::Throughput, false, &b, &a) < 0.0);
+        let o = TuneOptions::new(
+            Objective::Throughput,
+            RunOptions {
+                duration: Duration::from_secs(1),
+                warmup: Duration::ZERO,
+                max_ops: None,
+                rate: None,
+                trace_slow_ops: false,
+            },
+        );
+        assert_eq!(o.max_throttle_ratio, 0.001);
+        assert_eq!(o.boundary_repeats, 2);
     }
 }

@@ -20,7 +20,7 @@ use super::{Cancel, ProgressFn, RunOptions, Session, SessionOptions};
 use crate::config::{Knobs, Profile};
 use crate::errors::exit;
 use crate::guard::{BudgetBreach, Budgets, Guard, Plan};
-use crate::model::{Run, RunId, TuneReport};
+use crate::model::{Run, RunId, RunSpec, TuneReport};
 use crate::report::TuneSummary;
 use crate::store::RunStore;
 use crate::tune::{TuneEvent, TuneOptions};
@@ -86,6 +86,8 @@ pub fn guard_for(budgets: &Budgets, profile: &Profile) -> Option<Arc<Guard>> {
 }
 
 /// Measure a workload window, or run the tuner.
+// One per measurement; the tuner options are not worth a box.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone)]
 pub enum Mode {
     Run,
@@ -125,6 +127,9 @@ pub struct Request {
     pub mode: Mode,
     pub on_stage: Option<StageFn>,
     pub finalize: Option<FinalizeFn>,
+    /// The run's spec. `None`: `RunSpec::new(&profile, target)` with the target name, else the
+    /// profile's URL (the pipeline fills it before the session normalises the profile).
+    pub spec: Option<RunSpec>,
 }
 
 impl Request {
@@ -142,8 +147,18 @@ impl Request {
             mode: Mode::Run,
             on_stage: None,
             finalize: None,
+            spec: None,
         }
     }
+}
+
+/// The spec of measuring `profile` at `target_name` (or the profile's own URL).
+pub fn spec_of(profile: &Profile, target_name: Option<&str>) -> RunSpec {
+    let target_ref = target_name
+        .map(str::to_owned)
+        .or_else(|| profile.target.url.clone())
+        .unwrap_or_else(|| profile.target.display());
+    RunSpec::new(profile, target_ref)
 }
 
 /// What the tuner adds.
@@ -213,7 +228,9 @@ pub async fn measure(req: Request) -> Result<Measured> {
         mode,
         on_stage,
         finalize,
+        spec,
     } = req;
+    let mut spec = spec.unwrap_or_else(|| spec_of(&profile, target_name.as_deref()));
     let stage = |s: Stage| {
         if let Some(f) = &on_stage {
             f(s)
@@ -260,18 +277,31 @@ pub async fn measure(req: Request) -> Result<Measured> {
             if session.guard().is_some_and(|g| g.tripped()) {
                 snap.interrupted = true;
             }
-            let run = crate::model::build_run(crate::model::ReportInput {
-                run_id: &rails.run_id,
-                target_name,
-                profile: &session.profile,
-                knobs: &knobs,
-                snapshot: snap,
-                trace: session.take_trace().unwrap_or_default(),
-                cleanup,
-                warnings: session.warnings.clone(),
-                started_at,
-                ended_at: SystemTime::now(),
+            // The ceiling remembered for this target and workload (design v4 §3).
+            let history = store.as_ref().and_then(|s| {
+                let dir = s.dir().parent()?;
+                crate::analysis::capacity::load(
+                    &dir.join("capacity.toml"),
+                    &spec.target_id()?,
+                    &crate::analysis::capacity::history_key(&spec),
+                )
             });
+            let run = crate::model::build::build_run_with(
+                crate::model::ReportInput {
+                    run_id: &rails.run_id,
+                    target_name,
+                    profile: &session.profile,
+                    knobs: &knobs,
+                    snapshot: snap,
+                    trace: session.take_trace().unwrap_or_default(),
+                    cleanup,
+                    warnings: session.warnings.clone(),
+                    started_at,
+                    ended_at: SystemTime::now(),
+                    spec: Some(spec),
+                },
+                history,
+            );
             (run, None)
         }
         Mode::Tune { opts, on_event } => {
@@ -284,6 +314,16 @@ pub async fn measure(req: Request) -> Result<Measured> {
             if session.guard().is_some_and(|g| g.tripped()) {
                 snap.interrupted = true;
             }
+            let recommendation = crate::tune::recommend::Recommendation::from_tune(
+                &spec,
+                &session.profile,
+                &outcome.winner,
+                &outcome.summary,
+                &session.capability,
+            )
+            .ok();
+            // The tuner's run replays as its winner.
+            spec.profile.knobs = outcome.winner.clone();
             let mut run = crate::model::build_run(crate::model::ReportInput {
                 run_id: &rails.run_id,
                 target_name,
@@ -296,8 +336,16 @@ pub async fn measure(req: Request) -> Result<Measured> {
                 warnings: session.warnings.clone(),
                 started_at,
                 ended_at: SystemTime::now(),
+                spec: Some(spec),
             });
-            run.report.tune = Some(TuneReport::from(&outcome.summary));
+            // The winner's window kept no rows: the report's capacity is the tuner's pooled
+            // estimate (`source: tune`).
+            if let Some(c) = &outcome.summary.capacity {
+                run.report.capacity = c.clone();
+            }
+            let mut tr = TuneReport::from(&outcome.summary);
+            tr.recommendation = recommendation;
+            run.report.tune = Some(tr);
             let tuned = Tuned {
                 winner: outcome.winner,
                 summary: outcome.summary,
@@ -310,9 +358,9 @@ pub async fn measure(req: Request) -> Result<Measured> {
     let breach = session.guard().and_then(|g| g.breach());
     if breach.is_some() {
         run.report.verdict.exit_code = exit::BUDGET;
-    }
-    if cancel.is_cancelled() {
-        run.report.run.interrupted = true;
+        crate::model::build::mark_partial(&mut run, crate::model::PartialReason::Budget);
+    } else if cancel.is_cancelled() && run.report.run.partial.is_none() {
+        crate::model::build::mark_partial(&mut run, crate::model::PartialReason::Interrupted);
     }
     if let Some(f) = finalize {
         f(&mut run);
@@ -323,6 +371,20 @@ pub async fn measure(req: Request) -> Result<Measured> {
         })?),
         None => None,
     };
+    // Remember the ceiling for later runs of the same target and workload (best effort).
+    if let (Some(s), Some(_)) = (&store, run.report.capacity.inflight_ceiling)
+        && !run.report.run.interrupted
+        && let Some(id) = run.report.spec.target_id()
+        && let Some(dir) = s.dir().parent()
+    {
+        let _ = crate::analysis::capacity::save(
+            &dir.join("capacity.toml"),
+            &id,
+            &crate::analysis::capacity::history_key(&run.report.spec),
+            &run.report.capacity,
+            Some(run.id()),
+        );
+    }
     Ok(Measured {
         run,
         path,

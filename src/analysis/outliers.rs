@@ -68,6 +68,7 @@ pub struct Factor {
     /// Share of the other requests with this value (0–1).
     pub rest_ratio: f64,
     /// `selected_ratio / rest_ratio`, smoothed (add-one) and capped.
+    #[serde(rename = "lift_ratio", alias = "lift")]
     pub lift: f64,
     /// Selected requests with this value.
     pub selected_count: u64,
@@ -131,6 +132,97 @@ pub fn rtt_bin(rtt_us: u64) -> &'static str {
     }
 }
 
+/// The kernel's smoothed RTT of the requests' connections measures the server's response
+/// delay as well as the network (AN-11): a delayed answer delays the ACK the RTT is sampled
+/// from. It is no network signal when it tracks the server: on loopback (no network path),
+/// when it is far above the TCP handshake's round trip (a clean RTT sample), or when it rises
+/// and falls with the time to first byte (rank correlation ≥ 0.5).
+pub fn rtt_tracks_server(reqs: &[ReqRow]) -> bool {
+    let with: Vec<&ReqRow> = reqs
+        .iter()
+        .filter(|r| r.tcp.as_ref().is_some_and(|t| t.rtt_us > 0))
+        .collect();
+    if with.len() < 20 {
+        return false;
+    }
+    if with
+        .iter()
+        .all(|r| r.remote.is_some_and(|a| a.ip().is_loopback()))
+    {
+        return true;
+    }
+    let mut rtt: Vec<u64> = with
+        .iter()
+        .filter_map(|r| r.tcp.as_ref().map(|t| t.rtt_us))
+        .collect();
+    let mut hs: Vec<u64> = reqs
+        .iter()
+        .filter(|r| !r.reused && r.tcp_us > 0)
+        .map(|r| r.tcp_us)
+        .collect();
+    if hs.len() >= 5 {
+        let (k, h) = (
+            crate::analysis::stats::quantile_us_ms(&mut rtt, 0.5),
+            crate::analysis::stats::quantile_us_ms(&mut hs, 0.5),
+        );
+        if k > 3.0 * h + 1.0 {
+            return true;
+        }
+    }
+    let pairs: Vec<(f64, f64)> = with
+        .iter()
+        .map(|r| {
+            (
+                r.tcp.as_ref().map_or(0, |t| t.rtt_us) as f64,
+                r.ttfb_us as f64,
+            )
+        })
+        .collect();
+    rank_correlation(&pairs) >= 0.5
+}
+
+/// Spearman's rank correlation of `pairs` (0 when undefined).
+fn rank_correlation(pairs: &[(f64, f64)]) -> f64 {
+    fn ranks(v: &[f64]) -> Vec<f64> {
+        let mut idx: Vec<usize> = (0..v.len()).collect();
+        idx.sort_by(|a, b| v[*a].total_cmp(&v[*b]));
+        let mut r = vec![0.0; v.len()];
+        let mut i = 0;
+        while i < idx.len() {
+            let mut j = i;
+            while j + 1 < idx.len() && v[idx[j + 1]] == v[idx[i]] {
+                j += 1;
+            }
+            let avg = (i + j) as f64 / 2.0;
+            for k in &idx[i..=j] {
+                r[*k] = avg;
+            }
+            i = j + 1;
+        }
+        r
+    }
+    if pairs.len() < 3 {
+        return 0.0;
+    }
+    let a = ranks(&pairs.iter().map(|p| p.0).collect::<Vec<_>>());
+    let b = ranks(&pairs.iter().map(|p| p.1).collect::<Vec<_>>());
+    let (ma, mb) = (
+        crate::analysis::stats::mean(&a),
+        crate::analysis::stats::mean(&b),
+    );
+    let (mut num, mut da, mut db) = (0.0, 0.0, 0.0);
+    for (x, y) in a.iter().zip(&b) {
+        num += (x - ma) * (y - mb);
+        da += (x - ma).powi(2);
+        db += (y - mb).powi(2);
+    }
+    if da <= 0.0 || db <= 0.0 {
+        0.0
+    } else {
+        num / (da * db).sqrt()
+    }
+}
+
 /// Time bins over the run: ten equal slices of the observed request start times.
 struct TimeBins {
     from_us: i64,
@@ -155,7 +247,7 @@ impl TimeBins {
     }
 }
 
-fn attributes(r: &ReqRow, bins: &TimeBins) -> [(&'static str, String); 12] {
+fn attributes(r: &ReqRow, bins: &TimeBins, rtt: bool) -> [(&'static str, String); 12] {
     [
         ("api", r.api.to_string()),
         ("status", r.status.to_string()),
@@ -184,7 +276,7 @@ fn attributes(r: &ReqRow, bins: &TimeBins) -> [(&'static str, String); 12] {
             "rtt",
             r.tcp
                 .as_ref()
-                .filter(|t| t.rtt_us > 0)
+                .filter(|t| rtt && t.rtt_us > 0)
                 .map(|t| rtt_bin(t.rtt_us).to_owned())
                 .unwrap_or_default(),
         ),
@@ -210,6 +302,8 @@ fn attributes(r: &ReqRow, bins: &TimeBins) -> [(&'static str, String); 12] {
 /// damped while the evidence is weak (z < 4).
 pub fn attribute(reqs: &[ReqRow], sel: &Selection) -> Attribution {
     let bins = TimeBins::new(reqs);
+    // An RTT inflated by the server's own delay would "explain" every slow request.
+    let rtt = !rtt_tracks_server(reqs);
     let by_time = sel.from_us.is_some() || sel.to_us.is_some();
     let mut selected: HashMap<(&'static str, String), u64> = HashMap::new();
     let mut rest: HashMap<(&'static str, String), u64> = HashMap::new();
@@ -221,7 +315,7 @@ pub fn attribute(reqs: &[ReqRow], sel: &Selection) -> Attribution {
             (&mut rest, &mut n_rest)
         };
         *n += 1;
-        for (k, v) in attributes(r, &bins) {
+        for (k, v) in attributes(r, &bins, rtt) {
             // A time selection trivially "explains" itself by time.
             if !v.is_empty() && !(k == "time" && by_time) {
                 *map.entry((k, v)).or_default() += 1;
@@ -395,5 +489,35 @@ mod tests {
         let a = attribute(&reqs, &Selection::slowest(&reqs, 5.0));
         let t = a.factors.iter().find(|f| f.attribute == "time").unwrap();
         assert_eq!(t.value, "3.0-4.0s");
+    }
+
+    #[test]
+    fn an_rtt_that_tracks_server_delay_is_not_a_factor() {
+        // Loopback, and the kernel RTT rises with the server's delay (delayed ACKs).
+        let mut reqs = Vec::new();
+        for i in 0..1000 {
+            let slow = i % 25 == 0;
+            let mut r = test_req(i * 1000, if slow { 250_000 } else { 8_000 });
+            r.remote = Some("127.0.0.1:9000".parse().unwrap());
+            r.tcp = Some(Box::new(crate::model::TcpRow {
+                rtt_us: if slow { 30_000 } else { 200 },
+                ..Default::default()
+            }));
+            reqs.push(r);
+        }
+        assert!(rtt_tracks_server(&reqs));
+        let a = attribute(&reqs, &Selection::slowest(&reqs, 2.0));
+        assert!(a.factors.iter().all(|f| f.attribute != "rtt"), "{a:#?}");
+        // Off loopback the correlation with the first byte gives it away too.
+        for r in &mut reqs {
+            r.remote = Some("10.0.0.1:443".parse().unwrap());
+        }
+        assert!(rtt_tracks_server(&reqs));
+        // A genuinely slow path to one remote, independent of the server: kept.
+        for (i, r) in reqs.iter_mut().enumerate() {
+            r.tcp.as_mut().unwrap().rtt_us = if i % 2 == 0 { 40_000 } else { 400 };
+        }
+        assert!(!rtt_tracks_server(&reqs));
+        assert!(rank_correlation(&[(1.0, 1.0), (2.0, 2.0), (3.0, 3.0)]) > 0.99);
     }
 }

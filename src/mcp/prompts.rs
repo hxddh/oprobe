@@ -109,17 +109,17 @@ pub fn render(name: &str, a: &Map<String, Value>) -> anyhow::Result<(String, Str
                 (None, Some(prefix)) => format!(
                     "Read the existing objects under `{prefix}` (set `existing: \"{prefix}\"`, which is read-only)."
                 ),
-                (None, None) => "No existing prefix was given: use the `small-files` or `parquet` preset with a small generated dataset (this needs a server started with --allow-write unless the target is memory://).".to_owned(),
+                (None, None) => "No existing prefix was given: call `sample_objects` and use its `suggested_existing` prefix; if the target holds nothing, use the `small-files` or `parquet` preset with a small generated dataset (this needs a server started with --allow-write unless the target is memory:// or lab://).".to_owned(),
             };
             format!(
-                "Diagnose why reads from `{target}` are slow, using the oprobe MCP tools.\n\n\
+                "Diagnose why reads from `{target}` are slow, and fix the client configuration, using the oprobe MCP tools.\n\n\
                  {start}\n\n\
-                 1. Call `doctor` with target `{target}` and stop if it is not ready; report the failing check and its hint.\n\
+                 1. Call `doctor` with target `{target}` and stop if it is not ready; report the failing check and its hint (`discover_targets` lists the credential sources).\n\
                  2. Call `plan_run` with a 15s duration and a request budget (`max_requests: 20000`); check `allowed` and `budget_warnings`.\n\
                  3. Call `start_run` with the same arguments; poll `get_run` until the status is final.\n\
                  4. Call `explain_run` on the run and summarize the verdict and the top findings with their evidence numbers.\n\
                  5. Call `analyze_run` (default: slowest 1%) and say which attributes (cold connections, remote IP, retries, a stage) explain the tail.\n\
-                 6. Propose one knob change from the findings' advice, run again with it, and use `compare_runs` to confirm it helped.\n\
+                 6. Test the top finding's advice with `verify_finding` (or get a verified configuration with `recommend_config`), then measure it with `start_run` `from` the run and `set` the change, and `compare_runs` to confirm it helped.\n\
                  Never raise budgets on your own; ask first."
             )
         }
@@ -131,8 +131,8 @@ pub fn render(name: &str, a: &Map<String, Value>) -> anyhow::Result<(String, Str
                  1. `doctor` the target.\n\
                  2. `plan_run` a 10s baseline and `start_run` it; `explain_run` it.\n\
                  3. `start_tune` with objective `latency`, `max_trials: 12` and a `max_duration` budget; tell the user the plan's ETA first. It needs a server started with --allow-write unless the target is memory:// or `existing` is set.\n\
-                 4. Poll `get_run` until done; report the winning knobs from `report.tune` (trials, improvement_pct) and whether p99 meets {p99} ms.\n\
-                 5. Confirm with a normal run using the winning knobs and `compare_runs` against the baseline."
+                 4. Poll `get_run` until done; report the `recommendation` (knobs, overrides, deltas, profile_toml) and whether p99 meets {p99} ms.\n\
+                 5. Confirm with `start_run` `from` the baseline run and `set` the recommendation's overrides, then `compare_runs` against the baseline."
             )
         }
         _ => {

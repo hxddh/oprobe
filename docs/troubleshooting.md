@@ -8,9 +8,10 @@ oprobe doctor s3://bucket/prefix   # any URL
 ```
 
 It checks configuration, credentials, the network path (DNS, proxy, TCP, TLS, HTTP), clock skew and
-list/write/read/stat/delete permissions one by one, and prints a fix for each failure (`--read-only` skips
-the writes). Every error of every command carries a stable code (`-o json`: `error.code`) and usually a
-`hint:` line.
+list permission and a sample of the objects, and prints a summarized cause and a fix for each failure
+(`-v` adds the raw backend error). It never writes unless you pass `--write-probe`, which also tests
+write/read/stat/delete. Every error of every command carries a stable code (`-o json`: `error.code`)
+and usually a `hint:` line.
 
 ## Errors
 
@@ -18,6 +19,7 @@ the writes). Every error of every command carries a stable code (`-o json`: `err
 |---|---|---|
 | `usage.unknown_target` | the name is not in the config file | `oprobe target list`; pass a URL; `oprobe target add NAME URL` |
 | `usage.unknown_run` | no run matches the RUNREF | `oprobe runs list`; use more characters of the id |
+| `usage.unknown_baseline` | no baseline has that name | `oprobe baseline list`; `oprobe baseline set NAME RUNREF…` |
 | `config.invalid`, `config.unknown_option` | a typo in the config file or an option the service ignores | `oprobe config edit` (validated on save); the error names the closest valid option |
 | `auth.no_credentials`, `auth.denied`, `AccessDenied`, `SignatureDoesNotMatch` | missing or wrong credentials, IAM | `--credentials profile:NAME`, export `AWS_*` / `GOOGLE_APPLICATION_CREDENTIALS` / `AZURE_STORAGE_*`; oprobe needs list/read/write/delete on the prefix — or measure read-only with `--existing PREFIX`, or `--anonymous` for public buckets |
 | `net.tls`, `invalid peer certificate: UnknownIssuer` | private CA or a TLS-inspecting proxy | `--ca-cert corp.pem` (or `SSL_CERT_FILE`); `--insecure` for development endpoints only |
@@ -35,15 +37,15 @@ the writes). Every error of every command carries a stable code (`-o json`: `err
 
 | Situation | What to do |
 |---|---|
-| leftover `oprobe-run-*` prefixes | a run was killed (second Ctrl-C, OOM, power loss): `oprobe cleanup TARGET --dry-run`, then without `--dry-run` |
+| leftover `oprobe-run-*` prefixes | a run was killed (second Ctrl-C, OOM, power loss): `oprobe cleanup TARGET` lists them, `oprobe cleanup TARGET --yes` deletes them |
 | "client processing-bound" on a remote store | client CPU, CRC verification or tiny objects: check `client cpu` in `runs show --detail`; `--no-verify`; larger objects |
 | `oprobe run` asks questions in a script | it never does: prompts appear only on an interactive terminal with text output; pass a target, or `--non-interactive` |
 | `oprobe top` fails in CI | it needs an interactive terminal; use `oprobe run` |
 | `cannot open a window` / `built without native windows` | Linux server packages are headless: `oprobe top`, the `oprobe-desktop` tarball, or `cargo install oprobe --features gui` |
 | `runs open` says no display | over SSH: `oprobe runs show RUNREF`, or `oprobe top --open FILE` in the terminal |
 | `config edit` opens the wrong editor | set `VISUAL` or `EDITOR` (`export EDITOR="code -w"`) |
-| `self-update` refuses | oprobe was installed by a package manager; the message names its update command (`brew upgrade oprobe`, `winget upgrade oprobe`, …) |
-| `self-update` rate limited | GitHub's anonymous API limit: wait an hour or set `GITHUB_TOKEN` |
+| `self-update` refuses | oprobe was installed by a package manager; the message names its update command (`brew upgrade oprobe`, `winget upgrade hxddh.oprobe`, …) |
+| `self-update` rate limited (`net.unreachable`) | GitHub refused the request (403/429): `self-update` reads the release's `latest.json` first, so this means both it and the API were refused; wait or set `GITHUB_TOKEN` |
 | macOS: "cannot be opened because the developer cannot be verified" / Windows SmartScreen | the packages are unsigned: [first open](install.md#first-open-of-unsigned-packages) |
 
 ## Error codes
@@ -71,6 +73,12 @@ URL (`s3://bucket/prefix`, `memory://`); `oprobe target add NAME URL`.
 
 No stored run matches the RUNREF. `oprobe runs list`; use more characters of the id, `last`,
 `last~N`, a label or a path to a `.oprobe` file.
+
+<a id="usage-unknown_baseline"></a>
+### `usage.unknown_baseline` (exit 2)
+
+No baseline has that name. `oprobe baseline list`; create one with `oprobe baseline set NAME
+RUNREF…` or `oprobe run … --baseline NAME`.
 
 <a id="config-invalid"></a>
 ### `config.invalid` (exit 2)
@@ -123,6 +131,21 @@ certificate): a private CA or a TLS-inspecting proxy. `--ca-cert corp.pem` (or `
 
 A request or connection timed out. Check the network path with `oprobe doctor`; lower the
 concurrency if the client or the link is saturated.
+
+<a id="net-rate_limited"></a>
+### `net.rate_limited` (exit 1, retryable)
+
+An HTTP API other than the storage target (GitHub releases for `oprobe self-update`, an OTLP
+collector) refused the request because its rate limit is exhausted (429, or 403 with no quota
+left). Wait and retry; for GitHub, set `GITHUB_TOKEN` to raise the limit. Your storage
+credentials are not involved.
+
+<a id="net-http"></a>
+### `net.http` (exit 1)
+
+An HTTP API other than the storage target answered with an error (for example GitHub 403 or 404
+for a release, or an OTLP collector rejecting a push). The message names the URL and the status.
+Check the URL, the release tag or the collector; your storage credentials are not involved.
 
 <a id="storage-not_found"></a>
 ### `storage.not_found` (exit 1)

@@ -66,13 +66,17 @@ pub fn hint_for(error_chain: &str, scheme: &str) -> Option<Hint> {
     let e = error_chain.to_ascii_lowercase();
     let has = |n: &str| e.contains(n);
     let creds = match scheme {
-        "gcs" => "Set GOOGLE_APPLICATION_CREDENTIALS or `credential_path` in [target.options].",
-        "azblob" => "Set `account_name` and `account_key` (or a SAS token) in [target.options].",
+        "gcs" => {
+            "Set GOOGLE_APPLICATION_CREDENTIALS or `credential_path` in the target's options (`--option KEY=VALUE`, or `[targets.NAME.options]` in the config)."
+        }
+        "azblob" => {
+            "Set `account_name` and `account_key` (or a SAS token) in the target's options (`--option KEY=VALUE`, or `[targets.NAME.options]` in the config)."
+        }
         "oss" => {
-            "Set `access_key_id` / `access_key_secret` in [target.options] (use ${ENV} references)."
+            "Set `access_key_id` / `access_key_secret` in the target's options (`--option KEY=VALUE`, or `[targets.NAME.options]` in the config) (use ${ENV} references)."
         }
         _ => {
-            "Export AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY (or AWS_PROFILE), or reference them as ${ENV} in [target.options]."
+            "Export AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY (or AWS_PROFILE), or reference them as ${ENV} in the target's options (`--option KEY=VALUE`, or `[targets.NAME.options]` in the config)."
         }
     };
 
@@ -97,7 +101,7 @@ pub fn hint_for(error_chain: &str, scheme: &str) -> Option<Hint> {
         return Some(h(
             "Wrong or missing region",
             &[
-                "Set `region` in [target.options] or export AWS_REGION to the bucket's region.",
+                "Set `region` in the target's options (`--option KEY=VALUE`, or `[targets.NAME.options]` in the config) or export AWS_REGION to the bucket's region.",
                 "S3-compatible stores (MinIO, R2, Ceph) also need `endpoint`; R2 uses region `auto`.",
             ],
         ));

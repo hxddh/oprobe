@@ -11,7 +11,11 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use std::time::Duration;
+
+use super::capacity::Capacity;
 use super::stats::{Rng, quantile_us_ms};
+use crate::engine::stack::{ClientStack, TAIL_CUT_BLIND_START, TailCutHistogram, TailCutParams};
 use crate::model::{OpRow, ReqRow, Run};
 
 /// The predicted effect of one setting change.
@@ -26,6 +30,10 @@ pub struct Prediction {
     pub metric: String,
     pub current: f64,
     pub predicted: f64,
+    /// Lower end of the prediction interval (same unit as `predicted`).
+    pub predicted_lo: f64,
+    /// Upper end of the prediction interval.
+    pub predicted_hi: f64,
     /// Requests added (positive) or saved (negative) per 1 000 operations.
     pub requests_per_1k_ops_delta: f64,
     /// Operations / requests the estimate replayed.
@@ -34,6 +42,13 @@ pub struct Prediction {
 }
 
 impl Prediction {
+    /// A replay's interval: between "no effect" (`current`) and the replayed value.
+    fn bounded(mut self) -> Self {
+        self.predicted_lo = self.predicted.min(self.current);
+        self.predicted_hi = self.predicted.max(self.current);
+        self
+    }
+
     /// Relative change of the metric (`predicted / current - 1`).
     pub fn change_ratio(&self) -> f64 {
         if self.current > 0.0 {
@@ -57,42 +72,79 @@ fn reqs_by_op(reqs: &[ReqRow]) -> HashMap<u64, Vec<&ReqRow>> {
     m
 }
 
-/// A tail-cut threshold for `api`, derived from the body of its latency distribution: 3× the
-/// request p75 and 4× the median, rounded up to 10 ms. Stragglers can be several percent of
-/// the requests, so tail quantiles (p90, p95) may themselves be stragglers and would put the
-/// threshold above every request; the p75 and the median are not.
-pub fn tail_cut_threshold_us(reqs: &[ReqRow], api: &str) -> Option<u64> {
-    let mut t: Vec<u64> = reqs
-        .iter()
-        .filter(|r| r.api == api && !r.is_error())
-        .map(|r| r.total_us)
-        .collect();
-    if t.len() < 50 {
-        return None;
-    }
-    let p50 = quantile_us_ms(&mut t, 0.50) * 1000.0;
-    let p75 = quantile_us_ms(&mut t, 0.75) * 1000.0;
-    let raw = (p75 * 3.0).max(p50 * 4.0).max(1000.0);
-    Some(((raw / 10_000.0).ceil() * 10_000.0) as u64)
+/// How the measured client's `TailCutLayer` would behave on a run: the layer's parameters
+/// (`engine::stack`, the same values the client is built with), the retry backoff a cut
+/// request waits before it is re-issued, and when the layer starts cutting.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TailCutSetup {
+    pub params: TailCutParams,
+    /// Mean wait before the re-issue (the retry layer's first backoff), µs.
+    pub backoff_us: u64,
+    /// Requests that start before this time (µs from the window start) are never cut and
+    /// never counted: the layer is blind for its first 10 s ([`TAIL_CUT_BLIND_START`]).
+    pub blind_until_us: i64,
 }
 
-/// Tail-cut (OpenDAL `TailCutLayer`): a request of `api` slower than `threshold_us` is
-/// abandoned at the threshold and re-issued; the re-issue takes a time drawn from the
-/// requests of the same API that finished under the threshold. Each operation saves the
-/// largest saving of its cut requests (conservative when an operation's requests overlap).
-pub fn tail_cut(run: &Run, api: &str, threshold_us: u64) -> Option<Prediction> {
-    let fast: Vec<u64> = run
-        .reqs
+impl TailCutSetup {
+    /// The layer of a client with the run's knobs (tail-cut switched on), built when the
+    /// warmup began. `None` when retries are off: a cut request would fail instead of being
+    /// re-issued.
+    pub fn of(r: &crate::model::Report) -> Option<Self> {
+        let mut k = r.knobs.requested.to_knobs();
+        k.tail_cut = true;
+        let stack = ClientStack::from_knobs(&k);
+        let retry = stack.retry?;
+        Some(Self {
+            params: stack.tail_cut?,
+            backoff_us: retry.first_backoff_mean().as_micros() as u64,
+            blind_until_us: ((TAIL_CUT_BLIND_START.as_secs_f64() - r.workload.warmup_s) * 1e6)
+                as i64,
+        })
+    }
+
+    /// The same layer on a long-lived client (no blind start): the steady state.
+    pub fn steady(mut self) -> Self {
+        self.blind_until_us = i64::MIN;
+        self
+    }
+
+    /// Seconds of the window `[0, window_s)` the layer was blind for.
+    pub fn blind_s(&self, window_s: f64) -> f64 {
+        (self.blind_until_us as f64 / 1e6).clamp(0.0, window_s.max(0.0))
+    }
+}
+
+/// A trace replayed through `TailCutLayer`'s rule for one API.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TailCutReplay {
+    pub prediction: Prediction,
+    /// The deadline the layer holds at the end of the replay (its steady state), µs; `None`
+    /// when it never had enough samples.
+    pub deadline_us: Option<u64>,
+    /// Requests the layer cut and re-issued.
+    pub cut_count: u64,
+    /// Requests slower than the final deadline that started while the layer was blind.
+    pub blind_count: u64,
+}
+
+/// Replay `api`'s requests (in start order) through `TailCutLayer`: each successful request
+/// is recorded in the layer's histogram, and a request slower than the deadline in force when
+/// it starts ([`TailCutParams::deadline`], the layer's rule) is cut at the deadline and
+/// re-issued after the retry backoff; the re-issue takes a time drawn from the requests that
+/// finished within the deadline. Each operation saves the largest saving of its cut requests
+/// (conservative when an operation's requests overlap).
+pub fn tail_cut(run: &Run, api: &str, setup: &TailCutSetup) -> Option<TailCutReplay> {
+    let rows: Vec<&ReqRow> = run.reqs.iter().filter(|r| r.api == api).collect();
+    let mut ok: Vec<u64> = rows
         .iter()
-        .filter(|r| r.api == api && !r.is_error() && r.total_us <= threshold_us)
+        .filter(|r| !r.is_error())
         .map(|r| r.total_us)
         .collect();
-    if fast.len() < 20 {
+    if ok.len() < 50 {
         return None;
     }
+    ok.sort_unstable();
     let by_op = reqs_by_op(&run.reqs);
-    let mut rng = Rng::new(threshold_us);
-    let mut extra = 0u64;
     let affected: Vec<&OpRow> = run
         .ops
         .iter()
@@ -105,33 +157,76 @@ pub fn tail_cut(run: &Run, api: &str, threshold_us: u64) -> Option<Prediction> {
     if affected.len() < 20 {
         return None;
     }
+    // A fixed seed: the same trace always gives the same estimate.
+    let mut rng = Rng::new(0x7a11_c075);
+    let mut hist = TailCutHistogram::default();
+    let mut saving: HashMap<u64, u64> = HashMap::new();
+    let (mut cut, mut blind_over) = (0u64, Vec::new());
+    for q in &rows {
+        if q.t_us < setup.blind_until_us {
+            if !q.is_error() {
+                blind_over.push(q.total_us);
+            }
+            continue;
+        }
+        let deadline = setup.params.deadline(&hist).map(|d| d.as_micros() as u64);
+        match deadline {
+            Some(d) if !q.is_error() && q.total_us > d => {
+                let fast = ok.partition_point(|t| *t <= d);
+                if fast == 0 {
+                    hist.record(Duration::from_micros(q.total_us));
+                    continue;
+                }
+                let redo = ok[rng.index(fast)];
+                cut += 1;
+                hist.record(Duration::from_micros(redo));
+                let s = q.total_us.saturating_sub(d + setup.backoff_us + redo);
+                let e = saving.entry(q.op_id).or_default();
+                *e = (*e).max(s);
+            }
+            _ if !q.is_error() => hist.record(Duration::from_micros(q.total_us)),
+            _ => {}
+        }
+    }
+    let deadline_us = setup.params.deadline(&hist).map(|d| d.as_micros() as u64);
+    // Stragglers the blind layer let through, judged by the deadline it would have held
+    // (from every successful request when it never armed).
+    let reference = deadline_us.or_else(|| {
+        let mut all = TailCutHistogram::default();
+        for t in &ok {
+            all.record(Duration::from_micros(*t));
+        }
+        setup.params.deadline(&all).map(|d| d.as_micros() as u64)
+    });
+    let blind_count = reference.map_or(0, |d| blind_over.iter().filter(|t| **t > d).count()) as u64;
     let before = op_p99_ms(affected.iter().map(|o| o.latency_us));
     let after = op_p99_ms(affected.iter().map(|o| {
-        let saving = by_op[&o.op_id]
-            .iter()
-            .filter(|r| r.api == api && r.total_us > threshold_us)
-            .map(|r| {
-                extra += 1;
-                let redo = fast[rng.index(fast.len())];
-                r.total_us.saturating_sub(threshold_us + redo)
-            })
-            .max()
-            .unwrap_or(0);
-        o.latency_us.saturating_sub(saving)
+        o.latency_us
+            .saturating_sub(saving.get(&o.op_id).copied().unwrap_or(0))
     }));
-    Some(Prediction {
-        kind: "tail_cut".into(),
-        setting: format!("tail_cut at {} ms", threshold_us / 1000),
-        metric: format!("p99_ms of operations issuing {api}"),
-        current: before,
-        predicted: after,
-        requests_per_1k_ops_delta: extra as f64 * 1000.0 / affected.len() as f64,
-        replayed_ops_count: affected.len() as u64,
-        note: format!(
-            "estimate: replayed {} operations; each {api} slower than {} ms is re-issued and the retry takes a time drawn from the requests that finished in time",
-            affected.len(),
-            threshold_us / 1000
-        ),
+    let d_ms = deadline_us.map_or(0, |d| d / 1000);
+    Some(TailCutReplay {
+        prediction: Prediction {
+            kind: "tail_cut".into(),
+            setting: format!("tail_cut (deadline {d_ms} ms)"),
+            metric: format!("p99_ms of operations issuing {api}"),
+            current: before,
+            predicted: after,
+            predicted_lo: after,
+            predicted_hi: before.max(after),
+            requests_per_1k_ops_delta: cut as f64 * 1000.0 / affected.len() as f64,
+            replayed_ops_count: affected.len() as u64,
+            note: format!(
+                "estimate: replayed {} operations through TailCutLayer's rule (p{} of recent {api} latencies × {}, at least {} ms); a cut request is re-issued after the retry backoff and takes a time drawn from the requests that finished in time",
+                affected.len(),
+                setup.params.percentile,
+                setup.params.safety_factor,
+                setup.params.min_deadline.as_millis()
+            ),
+        },
+        deadline_us,
+        cut_count: cut,
+        blind_count,
     })
 }
 
@@ -153,10 +248,13 @@ pub fn uncapped_inflight(run: &Run) -> Option<Prediction> {
         metric: "p99_ms of all operations".into(),
         current: before,
         predicted: after,
+        predicted_lo: 0.0,
+        predicted_hi: 0.0,
         requests_per_1k_ops_delta: 0.0,
         replayed_ops_count: run.ops.len() as u64,
         note: "estimate: the queue wait is removed and nothing else changes (more parallel requests may slow the server or trigger throttling)".into(),
-    })
+    }
+    .bounded())
 }
 
 /// Operations that `HEAD` (stat) an object and then read it: a suffix range read
@@ -196,12 +294,15 @@ pub fn suffix_read(run: &Run) -> Option<Prediction> {
         metric: "p50_ms of all operations".into(),
         current: quantile_us_ms(&mut a, 0.5),
         predicted: quantile_us_ms(&mut b, 0.5),
+        predicted_lo: 0.0,
+        predicted_hi: 0.0,
         requests_per_1k_ops_delta: -(heads as f64) * 1000.0 / run.ops.len().max(1) as f64,
         replayed_ops_count: run.ops.len() as u64,
         note: format!(
             "estimate: {ops} operations issued a HEAD before reading; their HEAD time is removed"
         ),
-    })
+    }
+    .bounded())
 }
 
 /// Replay the read operations' keys through an LRU cache of `capacity_bytes` (object size =
@@ -256,6 +357,8 @@ pub fn cache(run: &Run, capacity_bytes: u64) -> Option<Prediction> {
         metric: "p50_ms of read operations".into(),
         current: quantile_us_ms(&mut before, 0.5),
         predicted: quantile_us_ms(&mut lat_after, 0.5),
+        predicted_lo: 0.0,
+        predicted_hi: 0.0,
         requests_per_1k_ops_delta: -(saved_reqs as f64) * 1000.0 / reads.len() as f64,
         replayed_ops_count: reads.len() as u64,
         note: format!(
@@ -263,32 +366,44 @@ pub fn cache(run: &Run, capacity_bytes: u64) -> Option<Prediction> {
             reads.len(),
             hits as f64 * 100.0 / reads.len() as f64
         ),
-    })
+    }
+    .bounded())
 }
 
-/// Closed-loop throughput at `concurrency` workers (Little's law on the measured latency),
-/// capped by the throttle ceiling when one was observed.
-pub fn concurrency(run: &Run, to: u64, ceiling_ops_per_s: Option<f64>) -> Option<Prediction> {
+/// Closed-loop throughput at `to` workers, from the capacity model ([`Capacity::predict`]):
+/// throughput scales from the measured rate per worker and saturates at the in-flight
+/// ceiling (when one is known). Open-loop runs and runs with too few operations predict
+/// nothing.
+pub fn concurrency(run: &Run, to: u64, cap: &Capacity) -> Option<Prediction> {
     let r = &run.report;
-    let from = r.knobs.requested.concurrency_count.max(1);
     if r.summary.ops < 20 || r.summary.ops_per_s <= 0.0 || r.workload.rate_per_s.is_some() {
         return None;
     }
-    let scaled = r.summary.ops_per_s * to as f64 / from as f64;
-    let predicted = ceiling_ops_per_s.map_or(scaled, |c| scaled.min(c));
+    let p = cap.predict(to.clamp(1, u64::from(u32::MAX)) as u32);
+    if p.ops_per_s <= 0.0 {
+        return None;
+    }
+    let note = match cap.inflight_ceiling {
+        Some(c) => format!(
+            "estimate (capacity model): {} requests in flight at the peak against a ceiling of {:.0}; throughput scales with workers until the ceiling",
+            p.peak_inflight_count, c.lo
+        ),
+        None => format!(
+            "estimate (capacity model): {} requests in flight at the peak; no ceiling was seen (holds while the server, network and client CPU keep up)",
+            p.peak_inflight_count
+        ),
+    };
     Some(Prediction {
         kind: "concurrency".into(),
         setting: format!("concurrency {to}"),
         metric: "ops_per_s".into(),
         current: r.summary.ops_per_s,
-        predicted,
+        predicted: p.ops_per_s,
+        predicted_lo: p.ops_lo_per_s,
+        predicted_hi: p.ops_hi_per_s,
         requests_per_1k_ops_delta: 0.0,
         replayed_ops_count: r.summary.ops,
-        note: if ceiling_ops_per_s.is_some() {
-            "estimate: throughput scales with workers at the measured latency until the observed throttle ceiling".into()
-        } else {
-            "estimate: throughput scales with workers at the measured latency (holds while the server, network and client CPU keep up)".into()
-        },
+        note,
     })
 }
 
@@ -336,19 +451,50 @@ pub(crate) mod tests {
             serde_json::from_value(crate::analysis::findings::tests::empty_report_json()).unwrap();
         report.summary.ops = 1000;
         report.summary.ops_per_s = 200.0;
+        report.knobs.requested = (&crate::config::Knobs::default()).into();
         report.knobs.requested.concurrency_count = 2;
         Run { report, ops, reqs }
     }
 
     #[test]
-    fn tail_cut_replay_cuts_the_p99() {
+    fn tail_cut_replay_follows_the_layer() {
         let run = straggler_run();
-        let t = tail_cut_threshold_us(&run.reqs, "GetObject").unwrap();
-        assert!((10_000..100_000).contains(&t), "{t}");
-        let p = tail_cut(&run, "GetObject", t).unwrap();
+        let setup = TailCutSetup::of(&run.report).unwrap();
+        // A long-lived client: 2.5 % stragglers, the deadline sits at the 50 ms floor.
+        let t = tail_cut(&run, "GetObject", &setup.steady()).unwrap();
+        assert_eq!(t.deadline_us, Some(50_000));
+        let p = &t.prediction;
         assert!(p.current > 800.0, "{p:?}");
-        assert!(p.predicted < 100.0, "{p:?}");
+        // Cut at 50 ms, re-issued after a 75 ms backoff: ~135 ms instead of 840 ms.
+        assert!(p.predicted < 200.0, "{p:?}");
+        assert!(p.predicted_lo <= p.predicted && p.predicted <= p.predicted_hi);
         assert!((20.0..30.0).contains(&p.requests_per_1k_ops_delta), "{p:?}");
+        assert_eq!(t.blind_count, 0);
+        // The first 10 s of a fresh client (this run is 5 s long, no warmup): nothing is cut.
+        let blind = tail_cut(&run, "GetObject", &setup).unwrap();
+        assert_eq!(blind.cut_count, 0);
+        assert!(blind.blind_count >= 20, "{blind:?}");
+        assert_eq!(blind.prediction.predicted, blind.prediction.current);
+        assert!((setup.blind_s(5.0) - 5.0).abs() < 1e-9);
+        // Without retries a cut request would fail: no estimate.
+        let mut r = run.report.clone();
+        r.knobs.requested.retries_count = 0;
+        assert!(TailCutSetup::of(&r).is_none());
+    }
+
+    #[test]
+    fn tail_cut_cannot_cut_stragglers_that_set_the_p95() {
+        let mut run = straggler_run();
+        for (i, q) in run.reqs.iter_mut().enumerate() {
+            if i % 10 == 3 {
+                q.total_us = 840_000;
+                q.ttfb_us = 839_990;
+            }
+        }
+        let setup = TailCutSetup::of(&run.report).unwrap().steady();
+        let t = tail_cut(&run, "GetObject", &setup).unwrap();
+        assert!(t.deadline_us.unwrap() > 840_000, "{t:?}");
+        assert!(t.cut_count < 10, "{t:?}");
     }
 
     #[test]
@@ -357,10 +503,22 @@ pub(crate) mod tests {
         // Ten keys of 1 KiB: everything after the first touch hits.
         let c = cache(&run, 1 << 20).unwrap();
         assert!(c.requests_per_1k_ops_delta < -900.0, "{c:?}");
-        let c2 = concurrency(&run, 8, None).unwrap();
-        assert_eq!(c2.predicted, 800.0);
-        let c3 = concurrency(&run, 8, Some(300.0)).unwrap();
-        assert_eq!(c3.predicted, 300.0);
+        let mut cap = crate::analysis::capacity::Capacity::default();
+        cap.per_op.peak_inflight_per_op = 1.0;
+        cap.per_op.mean_inflight_per_op = 1.0;
+        cap.observed.ops_per_s = 200.0;
+        cap.observed.ops_inflight_mean = 2.0;
+        let c2 = concurrency(&run, 8, &cap).unwrap();
+        assert!((c2.predicted - 800.0).abs() < 1e-6, "{c2:?}");
+        assert!(c2.predicted_lo < c2.predicted && c2.predicted_hi > c2.predicted);
+        // A ceiling of 6 requests in flight: 8 workers do no better than 6.
+        cap.inflight_ceiling = Some(crate::analysis::capacity::Ceiling {
+            requests: 5.0,
+            lo: 5.0,
+            hi: 6.0,
+        });
+        let c3 = concurrency(&run, 8, &cap).unwrap();
+        assert!((c3.predicted - 600.0).abs() < 1e-6, "{c3:?}");
         assert!(uncapped_inflight(&run).is_none());
     }
 }

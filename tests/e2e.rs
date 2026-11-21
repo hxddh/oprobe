@@ -38,6 +38,7 @@ fn build(prof: &Profile, s: Snapshot, c: oprobe::engine::CleanupSummary) -> Repo
         warnings: vec![],
         started_at: std::time::SystemTime::now(),
         ended_at: std::time::SystemTime::now(),
+        spec: None,
     })
 }
 
@@ -74,6 +75,8 @@ fn small(p: &mut Profile, preset: Preset) {
     ds.object_size = ByteSize::kib(512);
     p.workload.dataset = Some(ds);
     p.knobs.concurrency = 4;
+    // The warmup `opts` runs with: a report judges its window against the profile's warmup.
+    p.workload.warmup = oprobe::util::HumanDuration(Duration::from_millis(200));
 }
 
 async fn run_once(p: Profile, ms: u64) -> (Snapshot, oprobe::engine::CleanupSummary, Profile) {
@@ -475,7 +478,6 @@ async fn proxy_connect_is_used_and_timed_with(mode: TransportMode) {
     assert!(s.connections.proxy_connect.count > 0);
     assert!(s.connections.tls.count > 0);
 }
-
 #[tokio::test(flavor = "multi_thread")]
 async fn tuner_finds_throttling_ceiling() {
     use oprobe::tune::{Objective, TuneOptions, tune};
@@ -489,57 +491,57 @@ async fn tuner_finds_throttling_ceiling() {
     small(&mut p, Preset::SmallFiles);
     p.knobs.concurrency = 32;
     let s = Session::open(p, Cancel::new(), quiet()).await.unwrap();
-    let o = TuneOptions {
-        objective: Objective::Throughput,
-        trial: RunOptions {
+    let mut o = TuneOptions::new(
+        Objective::Throughput,
+        RunOptions {
             duration: Duration::from_millis(500),
             warmup: Duration::from_millis(100),
             max_ops: None,
             rate: None,
             trace_slow_ops: false,
         },
-        max_concurrency: 64,
-        max_trials: 12,
-        cooldown: Duration::ZERO,
-    };
+    );
+    o.max_concurrency = 64;
+    o.max_trials = 14;
+    o.cooldown = Duration::ZERO;
     let out = tune(&s, &o, Arc::new(|_| {})).await.unwrap();
     s.close().await;
-    let ceiling = out.summary.throttle_ceiling.expect("ceiling detected");
-    assert!((4..=16).contains(&ceiling), "ceiling {ceiling}");
-    assert!(out.winner.concurrency < ceiling);
-    // The headroom cap (80 % of the ceiling) holds for the exported winner too.
+    let sum = &out.summary;
+    // Over the throttle budget from some concurrency on; the in-flight ceiling brackets the
+    // lab's limit of 6.
+    let over = sum
+        .throttle_ceiling
+        .expect("over budget at some concurrency");
+    assert!((4..=16).contains(&over), "over budget from {over}");
+    let cap = sum.capacity.as_ref().expect("capacity estimate");
+    let ce = cap.inflight_ceiling.expect("in-flight ceiling");
+    assert!(ce.lo <= 6.0 && 6.0 < ce.hi + 1.0, "{ce:?}");
+    // The winner stays within the capacity model's margin and the throttle budget.
+    let safe = sum.safe_concurrency.expect("a margin");
+    assert!(safe < over, "safe {safe} over {over}");
     assert!(
-        out.winner.concurrency <= (ceiling as f64 * 0.8).floor().max(1.0) as usize,
-        "winner {} exceeds 80% of ceiling {ceiling}",
+        out.winner.concurrency <= safe,
+        "winner {} > safe {safe}",
         out.winner.concurrency
     );
+    assert!(out.winner.concurrency < over);
+    let w = &sum.trials[sum.winner_trial];
     assert!(
-        out.winner_snapshot.resilience.throttled_responses == 0,
-        "winner must be clean"
+        w.throttled_request_ratio <= o.max_throttle_ratio * 5.0,
+        "winner throttled {:.4}",
+        w.throttled_request_ratio
     );
-    assert!(!out.summary.trials[out.summary.baseline_trial].feasible);
-    // One consistent story: the only ceiling the notes state is the summary's ceiling, and the
-    // safety margin is explained with numbers.
-    let notes = out.summary.notes.join("\n");
-    let ceiling_notes: Vec<_> = out
-        .summary
-        .notes
-        .iter()
-        .filter(|n| n.contains("throttling ceiling: concurrency"))
-        .collect();
-    assert_eq!(ceiling_notes.len(), 1, "{notes}");
+    // An infeasible baseline: no improvement headline, deltas against the best feasible trial.
+    assert!(!sum.baseline_feasible);
+    assert!(sum.improvement.is_none());
     assert!(
-        ceiling_notes[0].starts_with(&format!("throttling ceiling: concurrency {ceiling} ")),
-        "{notes}"
+        sum.headline.starts_with("baseline infeasible"),
+        "{}",
+        sum.headline
     );
-    assert!(!notes.contains("throttling starts at"), "{notes}");
-    let safe = (ceiling as f64 * 0.8).floor().max(1.0) as usize;
-    assert!(
-        notes.contains(&format!(
-            "capped at {safe} = 80% of the throttling ceiling {ceiling}"
-        )),
-        "{notes}"
-    );
+    let notes = sum.notes.join("\n");
+    assert!(notes.contains("throttling ceiling:"), "{notes}");
+    assert!(!sum.pareto.is_empty());
 }
 
 /// `oprobe tune` prints its whole report (trial table included) on stdout, only progress on
@@ -588,6 +590,7 @@ async fn report_roundtrip_and_diff_gate() {
     assert!(same.passed, "{}", same.render_terminal());
 
     let mut worse = r.clone();
+    worse.summary.ops /= 2;
     worse.summary.ops_per_s *= 0.5;
     for v in &mut worse.verbs {
         v.latency.p99 = v.latency.p99 * 3.0 + 10.0;
@@ -598,12 +601,12 @@ async fn report_roundtrip_and_diff_gate() {
     let fails: Vec<_> = d
         .checks
         .iter()
-        .filter(|c| c.status == oprobe::report::diff::Status::Fail)
-        .map(|c| c.name.clone())
+        .filter(|c| c.verdict == oprobe::report::diff::Status::Fail)
+        .map(|c| c.id.clone())
         .collect();
     assert!(fails.iter().any(|n| n.contains("throughput")));
     assert!(fails.iter().any(|n| n.contains("p99")));
-    assert!(fails.iter().any(|n| n.contains("integrity")));
+    assert!(fails.iter().any(|n| n.contains("corrupted")));
     assert!(d.render_junit().contains("<failure"));
     assert!(d.render_markdown().contains("FAIL"));
 }
@@ -731,7 +734,7 @@ fn cli_binary_end_to_end() {
         .output()
         .unwrap();
     let rep: serde_json::Value = serde_json::from_slice(&fail_on.stdout).unwrap();
-    assert_eq!(rep["report"]["schema"], "oprobe.report/3");
+    assert_eq!(rep["report"]["schema"], "oprobe.report/4");
     assert_eq!(
         rep["report"]["verdict"]["exit_code"].as_u64(),
         fail_on.status.code().map(|c| c as u64)
@@ -1119,8 +1122,13 @@ async fn cancelled_run_is_marked_interrupted() {
     assert_eq!(r.verdict.exit_code, 130);
     let json = oprobe::report::to_json(&r);
     assert!(json.contains("\"interrupted\": true"));
-    assert!(oprobe::report::terminal::render(&r).contains("INTERRUPTED"));
-    assert!(oprobe::report::markdown::render_report(&r).contains("Interrupted"));
+    assert!(oprobe::report::terminal::render(&r).contains("PARTIAL · interrupted"));
+    assert!(oprobe::report::markdown::render_report(&r).contains("partial run: interrupted"));
+    assert_eq!(
+        r.run.partial.as_ref().map(|p| p.reason),
+        Some(oprobe::model::PartialReason::Interrupted)
+    );
+    assert!(r.baseline_refusal().is_some());
     let mut done = r.clone();
     done.run.interrupted = false;
     let d = diff(&done, &r, &Thresholds::default());

@@ -41,6 +41,46 @@ pub struct Defaults {
     pub budgets: BudgetDefaults,
 }
 
+impl Defaults {
+    /// Check every value with the parsers flags use (`crate::input`).
+    pub fn validate(&self) -> std::result::Result<(), OprobeError> {
+        if let Some(o) = &self.output
+            && crate::output::OutputFormat::parse(o).is_none()
+        {
+            return Err(
+                crate::input::invalid(format!("unknown output `{o}`")).with_hint(
+                    crate::input::choices_hint(o, &["text", "json", "ndjson", "md", "html"]),
+                ),
+            );
+        }
+        if let Some(c) = &self.color {
+            crate::input::choice("color", c, &[("auto", ()), ("always", ()), ("never", ())])?;
+        }
+        if let Some(p) = &self.preset {
+            crate::input::preset(p)?;
+        }
+        if let Some(d) = &self.duration {
+            crate::input::duration(d)?;
+        }
+        if self.concurrency == Some(0) {
+            return Err(crate::input::invalid("concurrency must be at least 1"));
+        }
+        let b = &self.budgets;
+        if let Some(v) = &b.max_bytes {
+            crate::input::size(v)?;
+        }
+        if let Some(v) = &b.max_duration {
+            crate::input::duration(v)?;
+        }
+        if let Some(c) = b.max_cost_usd
+            && !(c.is_finite() && c >= 0.0)
+        {
+            return Err(crate::input::invalid("budgets.max_cost_usd must be >= 0"));
+        }
+        Ok(())
+    }
+}
+
 /// `[defaults.budgets]`: the `--max-*` safety flags' defaults.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -181,6 +221,14 @@ impl ConfigFile {
                 ErrorCode::ConfigInvalid,
                 format!("invalid config file `{}`: {e}", path.display()),
             )
+        })?;
+        cfg.defaults.validate().map_err(|e| {
+            let mut o = OprobeError::new(
+                ErrorCode::ConfigInvalid,
+                format!("invalid [defaults] in `{}`: {}", path.display(), e.message),
+            );
+            o.hint = e.hint;
+            o
         })?;
         for (name, t) in &cfg.targets {
             t.validate()

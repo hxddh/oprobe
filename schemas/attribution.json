@@ -7,7 +7,7 @@
           "description": "Attribute name: `api`, `status`, `protocol`, `connection`, `remote`, `attempt`,\n`error`, `stage` (the dominant stage of the request), `size` (bytes moved, binned),\n`rtt` (TCP RTT, binned), `time` (tenth of the run), `conn` (connection id).",
           "type": "string"
         },
-        "lift": {
+        "lift_ratio": {
           "description": "`selected_ratio / rest_ratio`, smoothed (add-one) and capped.",
           "format": "double",
           "type": "number"
@@ -37,13 +37,13 @@
         "value",
         "selected_ratio",
         "rest_ratio",
-        "lift",
+        "lift_ratio",
         "selected_count"
       ],
       "type": "object"
     }
   },
-  "$id": "https://github.com/hxddh/oprobe/schemas/3/attribution.json",
+  "$id": "https://github.com/hxddh/oprobe/schemas/4/attribution.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "Outlier attribution (MCP analyze_run, explain)",
   "properties": {

@@ -28,8 +28,8 @@ use crate::guard::{Budgets, Plan};
 use crate::model::{Report, RunId};
 use crate::output::Output;
 use crate::report::diff::Thresholds;
-use crate::store::RunSummary;
-use crate::util::{ByteSize, fmt_ms, parse_duration};
+use crate::store::{RunSummary, TargetId};
+use crate::util::fmt_ms;
 
 // ---------------------------------------------------------------------------------------
 // Inputs
@@ -39,7 +39,9 @@ use crate::util::{ByteSize, fmt_ms, parse_duration};
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
 pub struct TargetIn {
     /// Configured target name (`list_targets`) or storage URL: `s3://bucket/prefix`,
-    /// `gcs://bucket`, `azblob://container`, `fs:///path`, `memory://`.
+    /// `gcs://bucket`, `azblob://container`, `fs:///path`, `memory://`, `lab://demo`.
+    /// Optional only with `from` (the stored run's target).
+    #[serde(default)]
     pub target: String,
     /// Custom endpoint (MinIO, R2, Ceph, an `oprobe lab` URL).
     #[serde(default)]
@@ -135,9 +137,48 @@ pub struct BudgetIn {
 pub struct DoctorIn {
     #[serde(flatten)]
     pub target: TargetIn,
-    /// Only check reachability and listing (forced on a read-only server).
+    /// Only check reachability and listing (the default; forced on a read-only server).
     #[serde(default)]
     pub read_only: Option<bool>,
+    /// Also write, read back and delete a probe object (needs a server with --allow-write).
+    #[serde(default)]
+    pub write_probe: Option<bool>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
+pub struct SampleIn {
+    #[serde(flatten)]
+    pub target: TargetIn,
+    /// List under this prefix (relative to the target root).
+    #[serde(default)]
+    pub prefix: Option<String>,
+    /// List at most this many objects (default 1000).
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
+pub struct VerifyIn {
+    /// RUNREF of the run whose finding to test: id, prefix, `last`, `last~N`, label.
+    pub run: String,
+    /// Finding code to verify (default: every finding with a verification).
+    #[serde(default)]
+    pub code: Option<String>,
+    /// Baseline/candidate pairs to run (A B A B…; default 3).
+    #[serde(default)]
+    pub repeat: Option<usize>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
+pub struct RecommendIn {
+    #[serde(flatten)]
+    pub plan: PlanIn,
+    /// `throughput` (default), `latency` or `cost`.
+    #[serde(default)]
+    pub objective: Option<String>,
+    /// Total wall-time budget of the search, e.g. `5m`.
+    #[serde(default)]
+    pub budget: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
@@ -170,6 +211,13 @@ pub struct PlanIn {
     /// Refuse anything that writes (implied by `existing`).
     #[serde(default)]
     pub read_only: bool,
+    /// Replay a stored run (RUNREF): its spec, with credentials resolved again from the
+    /// target; the other arguments and `set` override it (`oprobe run --from`).
+    #[serde(default)]
+    pub from: Option<String>,
+    /// Override settings, `key=value` each (`oprobe run --set`), e.g. `concurrency=8`.
+    #[serde(default)]
+    pub set: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
@@ -349,8 +397,12 @@ pub struct RunStatusOut {
     pub summary: Option<RunSummary>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub report: Option<Box<Report>>,
-    /// Suggested next tool calls.
-    pub next: Vec<String>,
+    /// The tuner's recommendation (finished tunes started by this server): knobs, profile,
+    /// Rust snippet, `--set` overrides and deltas.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recommendation: Option<Box<crate::tune::recommend::Recommendation>>,
+    /// Suggested next steps (each with its MCP call and CLI command).
+    pub next: Vec<crate::output::NextStep>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -464,14 +516,34 @@ fn output<T: JsonSchema>() -> Map<String, Value> {
 /// Every tool, in `tools/list` order.
 pub const SPECS: &[ToolSpec] = &[
     ToolSpec {
+        name: "discover_targets",
+        title: "Discover credentials and targets",
+        description: "Credential sources on this machine (AWS profiles and environment, GCP application default credentials, Azure storage environment) by name only, never secrets, plus the configured targets. Start here when you do not know the target.",
+        writes: false,
+        read_only: true,
+        open_world: false,
+        input: input::<EmptyIn>,
+        output: output::<crate::output::Envelope<crate::cli::discover::Discovery>>,
+    },
+    ToolSpec {
         name: "doctor",
         title: "Check a target",
-        description: "Preflight a storage target: configuration, DNS/TCP/TLS, clock skew, credentials and permissions (list; write/read/delete only on a server with --allow-write). Run this first.",
+        description: "Preflight a storage target: configuration, DNS/TCP/TLS, clock skew, credentials, permissions and a sample of the objects it holds. Read-only by default (write_probe=true also writes a probe object, on a server with --allow-write). Run this first.",
         writes: false,
         read_only: true,
         open_world: true,
         input: input::<DoctorIn>,
-        output: output::<crate::cli::doctor::DoctorOutput>,
+        output: output::<crate::output::Envelope<crate::cli::doctor::DoctorOutput>>,
+    },
+    ToolSpec {
+        name: "sample_objects",
+        title: "Sample a target's objects",
+        description: "Read-only listing of what a target holds: first-level prefixes with object counts and bytes, the size distribution and example keys, and the prefix to measure with `existing`.",
+        writes: false,
+        read_only: true,
+        open_world: true,
+        input: input::<SampleIn>,
+        output: output::<crate::output::Envelope<crate::cli::sample::ObjectSample>>,
     },
     ToolSpec {
         name: "probe_endpoint",
@@ -481,7 +553,7 @@ pub const SPECS: &[ToolSpec] = &[
         read_only: true,
         open_world: true,
         input: input::<ProbeIn>,
-        output: output::<crate::net::probe::ProbeReport>,
+        output: output::<crate::output::Envelope<crate::net::probe::ProbeReport>>,
     },
     ToolSpec {
         name: "plan_run",
@@ -496,7 +568,7 @@ pub const SPECS: &[ToolSpec] = &[
     ToolSpec {
         name: "start_run",
         title: "Start a run",
-        description: "Start a measurement in the background and return its run id at once (set wait=true to block for short runs). Budgets of the server and the call apply; progress notifications are sent when the call carries a progressToken. Poll get_run for the result.",
+        description: "Start a measurement in the background and return its run id at once (set wait=true to block for short runs). `from` replays a stored run and `set` overrides settings (`oprobe run --from RUN --set k=v`). Budgets of the server and the call apply; progress notifications are sent when the call carries a progressToken. Poll get_run for the result.",
         writes: true,
         read_only: false,
         open_world: true,
@@ -541,7 +613,7 @@ pub const SPECS: &[ToolSpec] = &[
         read_only: true,
         open_world: false,
         input: input::<ExplainIn>,
-        output: output::<ExplainRun>,
+        output: output::<crate::output::Envelope<ExplainRun>>,
     },
     ToolSpec {
         name: "analyze_run",
@@ -566,12 +638,32 @@ pub const SPECS: &[ToolSpec] = &[
     ToolSpec {
         name: "start_tune",
         title: "Start tuning",
-        description: "Start a throttle-aware search for the best client configuration in the background (needs --allow-write unless `existing` is set); returns a run id. The winner's report includes the trial table.",
+        description: "Start a throttle-aware search for the best client configuration in the background (needs --allow-write unless `existing` is set, or a memory:// / lab:// target); returns a run id. When finished, get_run returns the `recommendation` (knobs, profile TOML, Rust snippet, overrides, deltas) and the report with the trial table.",
         writes: true,
         read_only: false,
         open_world: true,
         input: input::<StartTuneIn>,
         output: output::<RunStatusOut>,
+    },
+    ToolSpec {
+        name: "verify_finding",
+        title: "Verify a finding",
+        description: "Test a finding's advice: replay the run with and without the change (A B A B…) and answer confirmed, refuted or inconclusive against its expectations (`oprobe verify RUN CODE`). Writes like the run did (allowed for memory://, lab:// and `existing` runs on a read-only server). Blocks until done.",
+        writes: true,
+        read_only: false,
+        open_world: true,
+        input: input::<VerifyIn>,
+        output: output::<Value>,
+    },
+    ToolSpec {
+        name: "recommend_config",
+        title: "Recommend a configuration",
+        description: "Diagnose, tune and verify in one call (`oprobe fix TARGET`): returns a Recommendation (knobs, profile TOML, Rust snippet, overrides, deltas, verification outcome) and an applicable profile patch. Writes test data like start_tune. Blocks until done.",
+        writes: true,
+        read_only: false,
+        open_world: true,
+        input: input::<RecommendIn>,
+        output: output::<Value>,
     },
     ToolSpec {
         name: "estimate_cost",
@@ -591,7 +683,7 @@ pub const SPECS: &[ToolSpec] = &[
         read_only: false,
         open_world: true,
         input: input::<CleanupIn>,
-        output: output::<crate::cli::misc::CleanupOutput>,
+        output: output::<crate::output::Envelope<crate::cli::misc::CleanupOutput>>,
     },
     ToolSpec {
         name: "list_targets",
@@ -657,6 +749,78 @@ impl State {
     }
 }
 
+/// Every property name a tool's input schema accepts (flattened structs included).
+fn schema_properties(schema: &Map<String, Value>) -> std::collections::BTreeSet<String> {
+    fn walk(
+        s: &Value,
+        defs: &Map<String, Value>,
+        out: &mut std::collections::BTreeSet<String>,
+        depth: usize,
+    ) {
+        if depth > 8 {
+            return;
+        }
+        if let Some(r) = s.get("$ref").and_then(Value::as_str) {
+            if let Some(d) = r.rsplit('/').next().and_then(|n| defs.get(n)) {
+                walk(d, defs, out, depth + 1);
+            }
+            return;
+        }
+        if let Some(p) = s.get("properties").and_then(Value::as_object) {
+            out.extend(p.keys().cloned());
+        }
+        for k in ["allOf", "anyOf", "oneOf"] {
+            for x in s.get(k).and_then(Value::as_array).into_iter().flatten() {
+                walk(x, defs, out, depth + 1);
+            }
+        }
+    }
+    let defs = schema
+        .get("$defs")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let mut out = std::collections::BTreeSet::new();
+    walk(&Value::Object(schema.clone()), &defs, &mut out, 0);
+    out
+}
+
+/// Extra arguments are refused (design v4 §9, AG-6): a misspelt `concurency` must not be
+/// silently ignored. (`deny_unknown_fields` cannot be combined with flattened inputs, so the
+/// check runs against the tool's input schema.)
+fn check_unknown(name: &str, a: &Map<String, Value>) -> anyhow::Result<()> {
+    let Some(spec) = spec(name) else {
+        return Ok(());
+    };
+    let known = schema_properties(&(spec.input)());
+    let unknown: Vec<&String> = a.keys().filter(|k| !known.contains(*k)).collect();
+    let Some(first) = unknown.first() else {
+        return Ok(());
+    };
+    let names: Vec<&str> = known.iter().map(String::as_str).collect();
+    let hint = match crate::input::suggest(first, names.iter().copied()) {
+        Some(m) => format!(
+            "did you mean `{m}`? arguments of {name}: {}",
+            names.join(", ")
+        ),
+        None => format!("arguments of {name}: {}", names.join(", ")),
+    };
+    Err(OprobeError::new(
+        ErrorCode::UsageInvalidArgument,
+        format!(
+            "unknown argument{} {} for tool `{name}`",
+            if unknown.len() > 1 { "s" } else { "" },
+            unknown
+                .iter()
+                .map(|k| format!("`{k}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    )
+    .with_hint(hint)
+    .into())
+}
+
 fn args<T: DeserializeOwned>(v: Map<String, Value>) -> anyhow::Result<T> {
     serde_json::from_value(Value::Object(v)).map_err(|e| {
         OprobeError::new(
@@ -675,7 +839,12 @@ pub async fn call(
     a: Map<String, Value>,
     cx: CallCx,
 ) -> Result<Reply, ErrorBody> {
+    check_unknown(name, &a).map_err(err)?;
     let r = match name {
+        "discover_targets" => discover_targets(st),
+        "sample_objects" => sample_objects(st, args(a).map_err(err)?).await,
+        "verify_finding" => verify_finding(st, args(a).map_err(err)?, cx).await,
+        "recommend_config" => recommend_config(st, args(a).map_err(err)?, cx).await,
         "doctor" => doctor(st, args(a).map_err(err)?).await,
         "probe_endpoint" => probe(st, args(a).map_err(err)?).await,
         "plan_run" => plan_run(st, args(a).map_err(err)?),
@@ -706,19 +875,12 @@ fn err(e: anyhow::Error) -> ErrorBody {
 // --- helpers --------------------------------------------------------------------------
 
 fn http_arg(v: Option<&str>) -> anyhow::Result<Option<HttpArg>> {
-    Ok(match v.map(|s| s.trim().to_ascii_lowercase()) {
+    Ok(match v {
         None => None,
-        Some(s) => Some(match s.as_str() {
-            "auto" => HttpArg::Auto,
-            "h1" | "http1" | "http/1.1" => HttpArg::H1,
-            "h2" | "http2" => HttpArg::H2,
-            _ => {
-                return Err(OprobeError::new(
-                    ErrorCode::UsageInvalidArgument,
-                    format!("invalid http `{s}` (auto, h1, h2)"),
-                )
-                .into());
-            }
+        Some(s) => Some(match crate::input::http_version(s)? {
+            crate::net::HttpVersion::Auto => HttpArg::Auto,
+            crate::net::HttpVersion::H1 => HttpArg::H1,
+            crate::net::HttpVersion::H2 => HttpArg::H2,
         }),
     })
 }
@@ -761,20 +923,8 @@ fn target_cli(t: &TargetIn) -> Vec<String> {
     v
 }
 
-fn profile_of(
-    st: &State,
-    t: &TargetIn,
-    w: &WorkloadIn,
-) -> anyhow::Result<(Profile, Option<String>)> {
-    if t.target.trim().is_empty() {
-        return Err(
-            OprobeError::new(ErrorCode::UsageUnknownTarget, "no target given")
-                .with_hint(
-                    "pass `target`: a configured name (list_targets) or a URL such as memory://",
-                )
-                .into(),
-        );
-    }
+/// The CLI's workload, knob and cost arguments of a tool's workload input.
+fn workload_args(w: &WorkloadIn) -> anyhow::Result<(WorkloadArgs, KnobArgs, CostArgs)> {
     let wa = WorkloadArgs {
         preset: w.preset.clone(),
         duration: w.duration.clone(),
@@ -801,48 +951,115 @@ fn profile_of(
         provider: w.provider.clone(),
         ..Default::default()
     };
+    Ok((wa, ka, ca))
+}
+
+fn profile_of(
+    st: &State,
+    t: &TargetIn,
+    w: &WorkloadIn,
+) -> anyhow::Result<(Profile, Option<String>)> {
+    if t.target.trim().is_empty() {
+        return Err(
+            OprobeError::new(ErrorCode::UsageUnknownTarget, "no target given")
+                .with_hint(
+                    "pass `target`: a configured name (list_targets, discover_targets), a URL such as lab://demo or memory://, or `from` to replay a stored run",
+                )
+                .into(),
+        );
+    }
+    let (wa, ka, ca) = workload_args(w)?;
     let ctx = st.ctx();
-    crate::cli::resolve_profile(&ctx, &target_args(t), &wa, &ka, &ca).map_err(|e| {
-        // Everything here comes from the call's arguments.
-        if crate::errors::classify(&e, "s3").code == ErrorCode::Internal {
-            OprobeError::new(ErrorCode::UsageInvalidArgument, format!("{e:#}")).into()
-        } else {
-            e
-        }
-    })
+    // The same parsers and codes as the CLI: no remapping here (design v4 §8).
+    crate::cli::resolve_profile(&ctx, &target_args(t), &wa, &ka, &ca)
 }
 
-/// Whether `url` starts with `prefix` at a path boundary.
-fn url_prefix(url: &str, prefix: &str) -> bool {
-    url == prefix
-        || (url.starts_with(prefix)
-            && (prefix.ends_with('/') || url[prefix.len()..].starts_with('/')))
+/// The identity of a configured target (its URL, endpoint and options).
+fn entry_id(e: &crate::store::TargetEntry) -> Option<TargetId> {
+    if let Some(id) = TargetId::parse(&e.url).ok().filter(|i| i.scheme == "lab") {
+        return Some(id);
+    }
+    let mut t = crate::config::TargetSpec::from_url(&e.url).ok()?;
+    if let Some(ep) = &e.endpoint {
+        t.options.insert("endpoint".into(), ep.clone());
+    }
+    for (k, v) in &e.options {
+        t.options.insert(k.clone(), v.clone());
+    }
+    TargetId::of(&t).ok()
 }
 
-/// `--allow-target`: `given` (as the caller typed it) or its URL must be allowed.
-fn check_allowed(cfg: &McpConfig, given: &str, url: Option<&str>) -> anyhow::Result<()> {
-    if allowed(cfg, given, url) {
+/// Whether one `--allow-target` entry allows `given` (as typed) at identity `id`: a URL entry
+/// (or a local path) contains `id` on whole path segments after both are normalised
+/// (`store::TargetId`); a name entry matches the name, or contains `id` as its target does.
+fn entry_allows(
+    entry: &str,
+    config: Option<&crate::store::ConfigFile>,
+    given: &str,
+    id: Option<&TargetId>,
+) -> bool {
+    let named = config.and_then(|c| c.target(entry));
+    if named.is_none() && (entry.contains("://") || entry.contains('/') || entry.contains('\\')) {
+        return match (TargetId::parse(entry), id) {
+            (Ok(a), Some(i)) => a.contains(i),
+            _ => false,
+        };
+    }
+    entry == given
+        || named
+            .and_then(entry_id)
+            .zip(id)
+            .is_some_and(|(a, i)| a.contains(i))
+}
+
+/// `--allow-target`: `given` (as the caller typed it) at identity `id` must be allowed.
+fn check_allowed(
+    cfg: &McpConfig,
+    config: Option<&crate::store::ConfigFile>,
+    given: &str,
+    id: Option<&TargetId>,
+) -> anyhow::Result<()> {
+    if allowed(cfg, config, given, id) {
         return Ok(());
     }
     Err(OprobeError::new(
         ErrorCode::SafetyRefused,
-        format!("target `{given}` is not allowed on this MCP server"),
+        format!(
+            "target `{given}` is not allowed on this MCP server{}",
+            id.map(|i| format!(" (it resolves to {i})"))
+                .unwrap_or_default()
+        ),
     )
     .with_hint(format!("allowed: {}", cfg.allow_targets.join(", ")))
     .into())
 }
 
-fn allowed(cfg: &McpConfig, given: &str, url: Option<&str>) -> bool {
+fn allowed(
+    cfg: &McpConfig,
+    config: Option<&crate::store::ConfigFile>,
+    given: &str,
+    id: Option<&TargetId>,
+) -> bool {
     cfg.allow_targets.is_empty()
-        || cfg.allow_targets.iter().any(|a| {
-            a == given
-                || (a.contains("://")
-                    && (url_prefix(given, a) || url.is_some_and(|u| url_prefix(u, a))))
-        })
+        || cfg
+            .allow_targets
+            .iter()
+            .any(|a| entry_allows(a, config, given, id))
 }
 
-fn target_url(p: &Profile, given: &str) -> String {
-    p.target.url.clone().unwrap_or_else(|| given.to_owned())
+/// A target identity, or the `safety.refused` error of a target that leaves its root.
+fn identity(t: &crate::config::TargetSpec, given: &str) -> anyhow::Result<TargetId> {
+    TargetId::of(t).map_err(|e| {
+        OprobeError::new(
+            ErrorCode::SafetyRefused,
+            format!(
+                "target `{given}` is refused on this MCP server: {}",
+                e.message
+            ),
+        )
+        .with_hint("pass the target without `..` segments")
+        .into()
+    })
 }
 
 /// Options that never change where requests go or which bucket/root they touch.
@@ -891,18 +1108,34 @@ fn check_target(st: &State, t: &TargetIn, effective: &Profile) -> anyhow::Result
         ..Default::default()
     };
     let ctx = st.ctx();
-    let (ta, _) = crate::cli::resolve_target(&target_args(&bare), ctx.config()?)?;
+    let config = ctx.config()?;
+    let (ta, _) = crate::cli::resolve_target(&target_args(&bare), config)?;
     let reference = crate::cli::build_profile(
         &ta,
         &WorkloadArgs::default(),
         &KnobArgs::default(),
         &CostArgs::default(),
     )?;
-    check_allowed(
-        &st.cfg,
-        &bare_given,
-        Some(&target_url(&reference, &bare_given)),
-    )?;
+    // Both sides normalised (`..`, `//`, `./`, case, default ports, trailing `/`): what the
+    // run would really touch must lie inside an allowed location (SEC-1, MCP-1).
+    let id = identity(&effective.target, &bare_given)?;
+    check_allowed(&st.cfg, Some(config), &bare_given, Some(&id))?;
+    if let Some(prefix) = effective.workload.effective_dataset().existing_prefix {
+        let leaves = prefix.split(['/', '\\']).any(|seg| seg == "..");
+        let inside = id
+            .join(&prefix)
+            .is_ok_and(|e| allowed(&st.cfg, Some(config), &bare_given, Some(&e)));
+        if leaves || !inside {
+            return Err(OprobeError::new(
+                ErrorCode::SafetyRefused,
+                format!(
+                    "`existing: {prefix}` leaves the allowed target `{bare_given}` on this MCP server"
+                ),
+            )
+            .with_hint("pass a prefix below the target root, without `..` segments")
+            .into());
+        }
+    }
     let diff = identity_diff(&reference.target, &effective.target);
     if diff.is_empty() {
         return Ok(());
@@ -924,7 +1157,9 @@ fn check_target(st: &State, t: &TargetIn, effective: &Profile) -> anyhow::Result
 /// `--allow-target` for `probe_endpoint`: the endpoint must be allowed, and no proxy or TLS
 /// override may be given.
 fn check_probe(cfg: &McpConfig, a: &ProbeIn) -> anyhow::Result<()> {
-    check_allowed(cfg, &a.endpoint, Some(&a.endpoint))?;
+    let id = TargetId::parse(&a.endpoint).ok();
+    let config = crate::store::ConfigFile::load(&cfg.paths.config_file).ok();
+    check_allowed(cfg, config.as_ref(), &a.endpoint, id.as_ref())?;
     if !cfg.allow_targets.is_empty() && (a.insecure || a.proxy.is_some()) {
         return Err(OprobeError::new(
             ErrorCode::SafetyRefused,
@@ -935,14 +1170,24 @@ fn check_probe(cfg: &McpConfig, a: &ProbeIn) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Targets that live in this process: `memory://` and the in-process `lab://` S3 server.
+/// Writing to them touches nothing outside the server, so a read-only server allows it
+/// (design v4 §9, AG-2).
+pub fn in_process(t: &crate::config::TargetSpec) -> bool {
+    t.scheme == "memory"
+        || t.url
+            .as_deref()
+            .is_some_and(|u| u.trim().to_ascii_lowercase().starts_with("lab://"))
+}
+
 /// The write rail of this server: refuses runs that write unless `--allow-write`
-/// (`memory://` writes only into this process and is always allowed).
+/// (`memory://` and `lab://` write only into this process and are always allowed).
 fn write_refusal(cfg: &McpConfig, p: &Profile, read_only: bool) -> Option<anyhow::Error> {
     let err = crate::guard::check_read_only(p).err()?;
     if read_only {
         return Some(err);
     }
-    if cfg.allow_write || p.target.scheme == "memory" {
+    if cfg.allow_write || in_process(&p.target) {
         return None;
     }
     Some(
@@ -954,7 +1199,7 @@ fn write_refusal(cfg: &McpConfig, p: &Profile, read_only: bool) -> Option<anyhow
             ),
         )
         .with_hint(
-            "benchmark existing objects with `existing: PREFIX`, or restart the server with `oprobe mcp --allow-write`",
+            "benchmark existing objects with `existing: PREFIX` (sample_objects lists them), use a lab://demo target, or restart the server with `oprobe mcp --allow-write`",
         )
         .into(),
     )
@@ -969,11 +1214,10 @@ fn min_opt<T: PartialOrd + Copy>(a: Option<T>, b: Option<T>) -> Option<T> {
 }
 
 fn bad(flag: &str, e: anyhow::Error) -> anyhow::Error {
-    OprobeError::new(
-        ErrorCode::UsageInvalidArgument,
-        format!("invalid {flag}: {e:#}"),
-    )
-    .into()
+    let b = crate::errors::classify(&e, "s3");
+    let mut o = OprobeError::new(b.code, format!("invalid {flag}: {}", b.message));
+    o.hint = b.hint;
+    o.into()
 }
 
 fn budgets_of(server: &Budgets, b: &BudgetIn) -> anyhow::Result<Budgets> {
@@ -986,15 +1230,15 @@ fn budgets_of(server: &Budgets, b: &BudgetIn) -> anyhow::Result<Budgets> {
     let bytes = b
         .max_bytes
         .as_deref()
-        .map(|v| v.parse::<ByteSize>().map(|x| x.0))
+        .map(|v| crate::input::size(v).map(|x| x.0))
         .transpose()
-        .map_err(|e| bad("max_bytes", e))?;
+        .map_err(|e| bad("max_bytes", e.into()))?;
     let dur = b
         .max_duration
         .as_deref()
-        .map(|v| parse_duration(v).map(|d| d.as_secs_f64()))
+        .map(|v| crate::input::duration(v).map(|d| d.as_secs_f64()))
         .transpose()
-        .map_err(|e| bad("max_duration", e))?;
+        .map_err(|e| bad("max_duration", e.into()))?;
     Ok(Budgets {
         max_cost_usd: min_opt(server.max_cost_usd, b.max_cost_usd),
         max_requests_count: min_opt(server.max_requests_count, b.max_requests),
@@ -1051,8 +1295,47 @@ struct Prepared {
     writes: bool,
 }
 
+/// The profile of a call: from its target and workload, or — with `from` — the stored run's
+/// spec with the call's arguments and `set` on top (the CLI's `run --from` / `--set`).
+fn call_profile(st: &State, a: &PlanIn) -> anyhow::Result<(Profile, Option<String>)> {
+    if a.from.is_none() && a.set.is_empty() {
+        return profile_of(st, &a.target, &a.workload);
+    }
+    let (wa, ka, ca) = workload_args(&a.workload)?;
+    let mut ta = target_args(&a.target);
+    if a.target.target.trim().is_empty() {
+        ta.target = None;
+    }
+    let ra = crate::cli::args::RunArgs {
+        target: ta,
+        workload: wa,
+        knobs: ka,
+        cost: ca,
+        from: a.from.clone(),
+        set: a.set.clone(),
+        ..Default::default()
+    };
+    if a.from.is_none() && ra.target.target.is_none() {
+        return profile_of(st, &a.target, &a.workload);
+    }
+    crate::cli::run_profile(&st.ctx(), &ra)
+}
+
+/// The target a call names (as typed), or the stored run's target with `from`.
+fn effective_target(a: &PlanIn, p: &Profile) -> TargetIn {
+    if !a.target.target.trim().is_empty() {
+        return a.target.clone();
+    }
+    TargetIn {
+        target: p.target.url.clone().unwrap_or_else(|| p.target.display()),
+        region: a.target.region.clone(),
+        anonymous: a.target.anonymous,
+        ..Default::default()
+    }
+}
+
 fn prepare(st: &State, a: &PlanIn) -> anyhow::Result<Prepared> {
-    let (profile, target_name) = profile_of(st, &a.target, &a.workload)?;
+    let (profile, target_name) = call_profile(st, a)?;
     let budgets = budgets_of(&st.cfg.budgets, &a.budgets)?;
     let run_id = RunId::new();
     let run_prefix = run_id.run_prefix();
@@ -1065,7 +1348,7 @@ fn prepare(st: &State, a: &PlanIn) -> anyhow::Result<Prepared> {
     let writes = crate::guard::check_read_only(&profile).is_err();
     let plan = crate::guard::plan(&profile, &run_prefix, read_only, &budgets);
     let mut refusals = Vec::new();
-    if let Err(e) = check_target(st, &a.target, &profile) {
+    if let Err(e) = check_target(st, &effective_target(a, &profile), &profile) {
         refusals.push(e);
     }
     if let Some(e) = write_refusal(&st.cfg, &profile, read_only) {
@@ -1132,11 +1415,21 @@ async fn child_json(st: &State, args: Vec<String>, timeout: Duration) -> anyhow:
 async fn doctor(st: &Arc<State>, a: DoctorIn) -> anyhow::Result<Reply> {
     let (p, _) = profile_of(st, &a.target, &WorkloadIn::default())?;
     check_target(st, &a.target, &p)?;
-    let read_only = !st.cfg.allow_write || a.read_only.unwrap_or(false);
+    // Read-only by default (design v4 §10); the probe object needs --allow-write.
+    let write_probe = a.write_probe.unwrap_or(false) && !a.read_only.unwrap_or(false);
+    if write_probe && !st.cfg.allow_write && !in_process(&p.target) {
+        return Err(OprobeError::new(
+            ErrorCode::SafetyReadOnly,
+            "this MCP server is read-only: doctor cannot write a probe object",
+        )
+        .with_hint("call doctor without write_probe, or restart the server with `oprobe mcp --allow-write`")
+        .into());
+    }
+    let read_only = !write_probe;
     let mut args = vec!["doctor".to_owned()];
     args.extend(target_cli(&a.target));
-    if read_only {
-        args.push("--read-only".into());
+    if write_probe {
+        args.push("--write-probe".into());
     }
     let v = child_json(st, args, Duration::from_secs(120)).await?;
     let failed = v["failed_count"].as_u64().unwrap_or(0);
@@ -1257,21 +1550,24 @@ fn status_of(st: &State, job: &Job, include_report: bool) -> RunStatusOut {
         _ => (None, None),
     };
     let _ = st;
-    let next = match v.status {
-        JobStatus::Queued | JobStatus::Running => vec![format!(
-            "get_run {{\"run\": \"{}\"}} (poll every few seconds)",
-            job.id
-        )],
-        _ if v.path.is_some() => vec![
-            format!("explain_run {{\"run\": \"{}\"}}", job.id),
-            format!("analyze_run {{\"run\": \"{}\"}}", job.id),
-            format!(
-                "compare_runs {{\"baseline\": \"<previous run>\", \"candidate\": \"{}\"}}",
-                job.id
-            ),
+    use crate::output::NextStep;
+    let id = job.id.as_str();
+    let mut next = match v.status {
+        JobStatus::Queued | JobStatus::Running => vec![
+            NextStep::new("poll every few seconds", format!("oprobe runs show {id}"))
+                .with_mcp("get_run", serde_json::json!({ "run": id })),
         ],
-        _ => vec!["doctor {\"target\": …} to check the target".into()],
+        _ if v.path.is_some() => finished_steps(id),
+        _ => vec![
+            NextStep::new("list stored runs", "oprobe runs list")
+                .with_mcp("list_runs", serde_json::json!({})),
+        ],
     };
+    if let Some(r) = &v.recommendation
+        && !r.overrides.is_empty()
+    {
+        next.insert(0, apply_step(id, &r.overrides));
+    }
     RunStatusOut {
         run_id: job.id.clone(),
         kind: job.kind,
@@ -1284,8 +1580,45 @@ fn status_of(st: &State, job: &Job, include_report: bool) -> RunStatusOut {
         path: v.path,
         summary,
         report,
+        recommendation: v.recommendation,
         next,
     }
+}
+
+/// Re-run `id` with `overrides` applied: `oprobe run --from ID --set …` / `start_run`.
+pub fn apply_step(id: &str, overrides: &crate::model::Overrides) -> crate::output::NextStep {
+    let sets: Vec<String> = overrides
+        .entries()
+        .into_iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect();
+    crate::output::NextStep::new(
+        format!("measure the recommended configuration ({})", sets.join(" ")),
+        crate::model::RunSpec::rerun_from(id, overrides),
+    )
+    .with_mcp("start_run", serde_json::json!({ "from": id, "set": sets }))
+}
+
+/// Next steps of a finished, stored run.
+fn finished_steps(id: &str) -> Vec<crate::output::NextStep> {
+    use crate::output::NextStep;
+    vec![
+        NextStep::new("explain the run", format!("oprobe explain {id}"))
+            .with_mcp("explain_run", serde_json::json!({ "run": id })),
+        NextStep::new(
+            "attribute the slowest requests",
+            format!("oprobe analyze {id}"),
+        )
+        .with_mcp("analyze_run", serde_json::json!({ "run": id })),
+        NextStep::new(
+            "compare with the previous run",
+            format!("oprobe compare last~1 {id}"),
+        )
+        .with_mcp(
+            "compare_runs",
+            serde_json::json!({ "baseline": "last~1", "candidate": id }),
+        ),
+    ]
 }
 
 fn status_text(s: &RunStatusOut) -> String {
@@ -1313,6 +1646,18 @@ fn status_text(s: &RunStatusOut) -> String {
     if let Some(e) = &s.error {
         t += &format!(" · error [{}] {}", e.code, e.message);
     }
+    if let Some(r) = &s.recommendation {
+        t += &format!(
+            " · recommended: {} ({:+.0}% {} vs baseline)",
+            if r.overrides.is_empty() {
+                "keep the current settings".to_owned()
+            } else {
+                r.overrides.summary()
+            },
+            r.vs_baseline.delta_ratio * 100.0,
+            r.vs_baseline.metric
+        );
+    }
     t
 }
 
@@ -1332,13 +1677,22 @@ fn forward_progress(job: Arc<Job>, sink: ProgressSink) {
         let _ = tx.send(e.clone());
     }));
     let mut status = job.watch();
-    let total = Some(job.plan.eta_s.max(0.001));
+    let eta = job.plan.eta_s.max(0.001);
+    let total = Some(eta);
     tokio::spawn(async move {
         let start = Instant::now();
         let mut last_sent = 0.0f64;
         let mut last_at: Option<Instant> = None;
         let mut send = |msg: String, force: bool| {
-            let p = start.elapsed().as_secs_f64().max(last_sent + 1e-3);
+            // Increasing, and never past the total (AG-6): a run slower than its ETA stays
+            // just below it until it ends.
+            let cap = eta * 0.999;
+            let p = start
+                .elapsed()
+                .as_secs_f64()
+                .max(last_sent + 1e-6)
+                .min(cap.max(last_sent + 1e-6))
+                .min(eta);
             let due = last_at.is_none_or(|t| t.elapsed() >= Duration::from_millis(250));
             if force || due {
                 sink(p, total, Some(msg));
@@ -1370,7 +1724,7 @@ fn forward_progress(job: Arc<Job>, sink: ProgressSink) {
                 },
                 s = status.wait_for(|s| s.is_final()) => {
                     let label = s.map(|s| format!("{:?}", *s).to_lowercase()).unwrap_or_else(|_| "ended".into());
-                    send(label, true);
+                    sink(eta, total, Some(label));
                     break;
                 }
             }
@@ -1426,18 +1780,13 @@ async fn start_tune(st: &Arc<State>, a: StartTuneIn, cx: CallCx) -> anyhow::Resu
     if let Some(e) = p.refusals.into_iter().next() {
         return Err(e);
     }
-    let objective = match a.objective.as_deref().unwrap_or("throughput") {
-        "throughput" => crate::tune::Objective::Throughput,
-        "latency" => crate::tune::Objective::Latency,
-        "cost" => crate::tune::Objective::Cost,
-        o => {
-            return Err(OprobeError::new(
-                ErrorCode::UsageInvalidArgument,
-                format!("invalid objective `{o}` (throughput, latency, cost)"),
-            )
-            .into());
-        }
-    };
+    let o = a.objective.as_deref().unwrap_or("goodput");
+    let objective = crate::tune::Objective::parse(o).ok_or_else(|| {
+        OprobeError::new(
+            ErrorCode::UsageInvalidArgument,
+            format!("invalid objective `{o}` (goodput, p99, cost, balanced)"),
+        )
+    })?;
     let opts = crate::cli::tune_options(
         objective,
         &crate::cli::TuneSettings {
@@ -1446,6 +1795,8 @@ async fn start_tune(st: &Arc<State>, a: StartTuneIn, cx: CallCx) -> anyhow::Resu
             max_trials: a.max_trials.unwrap_or(d::MAX_TRIALS),
             max_concurrency: a.max_concurrency.unwrap_or(d::MAX_CONCURRENCY),
             cooldown: d::COOLDOWN,
+            max_throttle_ratio: p.profile.sla.max_throttle_rate,
+            ..Default::default()
         },
         p.profile.workload.rate,
     )?;
@@ -1499,10 +1850,8 @@ fn get_run(st: &Arc<State>, a: GetRunIn) -> anyhow::Result<Reply> {
         path: Some(path.display().to_string()),
         summary: Some(RunSummary::from(&run.report)),
         report: include.then(|| Box::new(run.report)),
-        next: vec![
-            format!("explain_run {{\"run\": \"{id}\"}}"),
-            format!("analyze_run {{\"run\": \"{id}\"}}"),
-        ],
+        recommendation: None,
+        next: finished_steps(&id),
     };
     let text = status_text(&out);
     reply(&out, text)
@@ -1584,7 +1933,10 @@ fn explain_run(st: &Arc<State>, a: ExplainIn) -> anyhow::Result<Reply> {
     let run = load_run(st, &a.run)?;
     let e = explain::explain_run(&run, a.top.unwrap_or(3));
     let text = e.narrative.join("\n");
-    reply(&e, text)
+    Ok(Reply {
+        structured: crate::output::envelope_value(&e, Vec::new()),
+        text,
+    })
 }
 
 fn analyze_run(st: &Arc<State>, a: AnalyzeIn) -> anyhow::Result<Reply> {
@@ -1636,14 +1988,15 @@ fn compare_runs(st: &Arc<State>, a: CompareIn) -> anyhow::Result<Reply> {
                 *dst = v;
             }
         };
-        set(&mut t.p99_pct, x.max_p99_increase_pct);
-        set(&mut t.p50_pct, x.max_p50_increase_pct);
+        let pct = |v: Option<f64>| v.map(|p| p / 100.0);
+        set(&mut t.p99_increase_ratio, pct(x.max_p99_increase_pct));
+        set(&mut t.p50_increase_ratio, pct(x.max_p50_increase_pct));
         set(&mut t.min_latency_delta_ms, x.min_latency_delta_ms);
-        set(&mut t.throughput_drop_pct, x.max_throughput_drop_pct);
-        set(&mut t.error_rate_pp, x.max_error_increase_pp);
-        set(&mut t.cost_pct, x.max_cost_increase_pct);
+        set(&mut t.throughput_drop_ratio, pct(x.max_throughput_drop_pct));
+        set(&mut t.error_increase_ratio, pct(x.max_error_increase_pp));
+        set(&mut t.cost_increase_ratio, pct(x.max_cost_increase_pct));
         if let Some(v) = x.min_samples {
-            t.min_samples = v;
+            t.min_samples_count = v;
         }
         if let Some(v) = x.allow_throttling {
             t.fail_on_new_throttling = !v;
@@ -1668,10 +2021,13 @@ fn compare_runs(st: &Arc<State>, a: CompareIn) -> anyhow::Result<Reply> {
         "{} → {}: {}",
         base.id(),
         cand.id(),
-        if d.passed {
-            "passed (no regression)"
-        } else {
-            "REGRESSION (gate failed)"
+        match d.verdict {
+            crate::report::diff::GateVerdict::Passed => "passed (no regression)".to_owned(),
+            crate::report::diff::GateVerdict::Regression => "REGRESSION (gate failed)".to_owned(),
+            crate::report::diff::GateVerdict::NotComparable => format!(
+                "not comparable, no verdict: {}",
+                d.gate.identity.reasons.join("; ")
+            ),
         }
     );
     reply(&d, text)
@@ -1716,7 +2072,7 @@ fn estimate_cost(st: &Arc<State>, a: PlanIn) -> anyhow::Result<Reply> {
 async fn cleanup(st: &Arc<State>, a: CleanupIn) -> anyhow::Result<Reply> {
     let (p, _) = profile_of(st, &a.target, &WorkloadIn::default())?;
     check_target(st, &a.target, &p)?;
-    let dry_run = !(a.confirm && st.cfg.allow_write);
+    let dry_run = !(a.confirm && (st.cfg.allow_write || in_process(&p.target)));
     let mut args = vec!["cleanup".to_owned()];
     args.extend(target_cli(&a.target));
     args.extend([
@@ -1726,8 +2082,9 @@ async fn cleanup(st: &Arc<State>, a: CleanupIn) -> anyhow::Result<Reply> {
     if a.datasets {
         args.push("--datasets".into());
     }
-    if dry_run {
-        args.push("--dry-run".into());
+    // `oprobe cleanup` is a dry run unless --yes.
+    if !dry_run {
+        args.push("--yes".into());
     }
     let v = child_json(st, args, Duration::from_secs(600)).await?;
     let n = v["entries"].as_array().map(|e| e.len()).unwrap_or(0);
@@ -1749,6 +2106,186 @@ async fn cleanup(st: &Arc<State>, a: CleanupIn) -> anyhow::Result<Reply> {
     })
 }
 
+fn discover_targets(st: &Arc<State>) -> anyhow::Result<Reply> {
+    let d = crate::cli::discover::discover(&st.ctx())?;
+    let text = if d.sources.is_empty() {
+        format!(
+            "no credential sources found; {} configured target(s)",
+            d.targets.len()
+        )
+    } else {
+        format!(
+            "{} credential source(s): {}; {} configured target(s)",
+            d.sources.len(),
+            d.sources
+                .iter()
+                .map(|s| format!("{} ({:?})", s.name, s.cloud).to_lowercase())
+                .collect::<Vec<_>>()
+                .join(", "),
+            d.targets.len()
+        )
+    };
+    Ok(Reply {
+        structured: crate::output::envelope_value(&d, Vec::new()),
+        text,
+    })
+}
+
+async fn sample_objects(st: &Arc<State>, a: SampleIn) -> anyhow::Result<Reply> {
+    let (p, _) = profile_of(st, &a.target, &WorkloadIn::default())?;
+    check_target(st, &a.target, &p)?;
+    let target = p.target.normalized()?;
+    let s = crate::cli::sample::sample(
+        &target,
+        &a.target.target,
+        a.prefix.as_deref().unwrap_or(""),
+        a.limit
+            .unwrap_or(crate::cli::sample::DEFAULT_LIMIT)
+            .clamp(1, 100_000),
+    )
+    .await?;
+    let text = match &s.suggested_existing {
+        Some(px) => format!(
+            "{} object(s), {} under {}; most under {px} (measure it with existing: \"{px}\")",
+            s.objects_count,
+            crate::util::fmt_bytes(s.total_bytes),
+            s.target
+        ),
+        None => format!("no objects under {}", s.target),
+    };
+    Ok(Reply {
+        structured: crate::output::envelope_value(&s, Vec::new()),
+        text,
+    })
+}
+
+/// Budgets of this server as CLI flags (for child commands that run workloads).
+fn budget_flags(b: &Budgets) -> Vec<String> {
+    let mut v = Vec::new();
+    if let Some(c) = b.max_cost_usd {
+        v.extend(["--max-cost-usd".into(), c.to_string()]);
+    }
+    if let Some(n) = b.max_requests_count {
+        v.extend(["--max-requests".into(), n.to_string()]);
+    }
+    if let Some(n) = b.max_bytes {
+        v.extend(["--max-bytes".into(), n.to_string()]);
+    }
+    if let Some(s) = b.max_duration_s {
+        v.extend(["--max-duration".into(), format!("{s}s")]);
+    }
+    v
+}
+
+/// Run a CLI command that runs workloads (`verify`, `fix`) as a child; a cancelled call
+/// stops it.
+async fn child_job(st: &State, args: Vec<String>, cx: &CallCx) -> anyhow::Result<Value> {
+    tokio::select! {
+        r = child_json(st, args, Duration::from_secs(3600)) => r,
+        _ = cx.ct.cancelled() => Err(OprobeError::new(
+            ErrorCode::RunInterrupted,
+            "the call was cancelled",
+        )
+        .into()),
+    }
+}
+
+async fn verify_finding(st: &Arc<State>, a: VerifyIn, cx: CallCx) -> anyhow::Result<Reply> {
+    // The replay writes what the run wrote: the same rails as start_run (`from`).
+    let plan = PlanIn {
+        from: Some(a.run.clone()),
+        ..Default::default()
+    };
+    let p = prepare(st, &plan)?;
+    if let Some(e) = p.refusals.into_iter().next() {
+        return Err(e);
+    }
+    let run_id = load_run(st, &a.run)?.id().to_owned();
+    let mut args = vec!["verify".to_owned(), run_id.clone()];
+    match &a.code {
+        Some(c) => args.push(c.clone()),
+        None => args.push("--all".into()),
+    }
+    if let Some(n) = a.repeat {
+        args.extend(["--repeat".into(), n.clamp(1, 20).to_string()]);
+    }
+    args.extend(budget_flags(&p.budgets));
+    let v = child_job(st, args, &cx).await?;
+    let text = verify_text(&v, &run_id);
+    Ok(Reply {
+        structured: v,
+        text,
+    })
+}
+
+/// One line per verdict of a `verify` result (any shape: the fields it has).
+fn verify_text(v: &Value, run_id: &str) -> String {
+    let items: Vec<String> = v
+        .get("verdicts")
+        .or_else(|| v.get("results"))
+        .or_else(|| v.get("findings"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|x| {
+            format!(
+                "{}: {}",
+                x.get("code").and_then(Value::as_str).unwrap_or("?"),
+                x.get("outcome")
+                    .or_else(|| x.get("verdict"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("?")
+            )
+        })
+        .collect();
+    if items.is_empty() {
+        format!("verified run {run_id}")
+    } else {
+        format!("run {run_id}: {}", items.join(" · "))
+    }
+}
+
+async fn recommend_config(st: &Arc<State>, a: RecommendIn, cx: CallCx) -> anyhow::Result<Reply> {
+    let p = prepare(st, &a.plan)?;
+    if let Some(e) = p.refusals.into_iter().next() {
+        return Err(e);
+    }
+    let mut args = vec!["fix".to_owned()];
+    let t = effective_target(&a.plan, &p.profile);
+    args.extend(target_cli(&t));
+    let w = &a.plan.workload;
+    let mut flag = |f: &str, v: Option<String>| {
+        if let Some(v) = v {
+            args.extend([f.to_owned(), v]);
+        }
+    };
+    flag("--preset", w.preset.clone());
+    flag("--duration", w.duration.clone());
+    flag("--warmup", w.warmup.clone());
+    flag("--existing", w.existing.clone());
+    flag("--objects", w.objects.map(|n| n.to_string()));
+    flag("--object-size", w.object_size.clone());
+    flag("--access", w.access.clone());
+    flag("--rate", w.rate.map(|r| r.to_string()));
+    flag("--provider", w.provider.clone());
+    flag("--objective", a.objective.clone());
+    flag("--budget", a.budget.clone());
+    args.extend(budget_flags(&p.budgets));
+    let v = child_job(st, args, &cx).await?;
+    let rec = v.get("recommendation").unwrap_or(&v);
+    let text = format!(
+        "recommended for {}: {}",
+        t.target,
+        rec.get("overrides")
+            .map(|o| o.to_string())
+            .unwrap_or_else(|| "see the structured result".into())
+    );
+    Ok(Reply {
+        structured: v,
+        text,
+    })
+}
+
 fn list_targets(st: &Arc<State>) -> anyhow::Result<Reply> {
     let ctx = st.ctx();
     let cfg = ctx.config()?;
@@ -1764,7 +2301,7 @@ fn list_targets(st: &Arc<State>) -> anyhow::Result<Reply> {
             options: crate::util::redact_options(&t.options)
                 .into_iter()
                 .collect(),
-            allowed: allowed(&st.cfg, n, Some(&t.url)),
+            allowed: allowed(&st.cfg, Some(cfg), n, entry_id(t).as_ref()),
         })
         .collect();
     let out = TargetsOut {
@@ -1805,13 +2342,48 @@ mod tests {
             assert_eq!((s.input)()["type"], "object", "{}", s.name);
             assert_eq!((s.output)()["type"], "object", "{}", s.name);
         }
-        assert_eq!(SPECS.len(), 14);
+        assert_eq!(SPECS.len(), 18);
         let start = (spec("start_run").unwrap().input)();
         let props = start["properties"].as_object().unwrap();
-        for k in ["target", "duration", "max_requests", "wait"] {
+        for k in ["target", "duration", "max_requests", "wait", "from", "set"] {
             assert!(props.contains_key(k), "{k}: {start:?}");
         }
-        assert_eq!(start["required"], serde_json::json!(["target"]));
+        // `target` is optional with `from` (the stored run's target).
+        assert!(
+            !start
+                .get("required")
+                .and_then(Value::as_array)
+                .is_some_and(|r| r.contains(&serde_json::json!("target"))),
+            "{start:?}"
+        );
+    }
+
+    #[test]
+    fn unknown_arguments_are_refused_with_a_suggestion() {
+        let mut a = Map::new();
+        a.insert("target".into(), "memory://".into());
+        a.insert("concurency".into(), 4.into());
+        let e = check_unknown("start_run", &a).unwrap_err();
+        let b = crate::errors::classify(&e, "s3");
+        assert_eq!(b.code, ErrorCode::UsageInvalidArgument);
+        assert!(b.message.contains("`concurency`"), "{}", b.message);
+        assert!(b.hint.unwrap().contains("did you mean `concurrency`"));
+        // Every argument of every tool is known (flattened inputs included).
+        let mut ok = Map::new();
+        for k in [
+            "target",
+            "endpoint",
+            "preset",
+            "max_bytes",
+            "read_only",
+            "from",
+            "wait",
+        ] {
+            ok.insert(k.into(), Value::Null);
+        }
+        check_unknown("start_run", &ok).unwrap();
+        check_unknown("list_targets", &Map::new()).unwrap();
+        assert!(check_unknown("list_targets", &a).is_err());
     }
 
     #[test]
@@ -1826,17 +2398,23 @@ mod tests {
             },
             max_concurrent_runs: 1,
         };
-        assert!(allowed(&cfg, "anything", None));
+        let id = |u: &str| TargetId::parse(u).unwrap();
+        let ok = |cfg: &McpConfig, given: &str| allowed(cfg, None, given, Some(&id(given)));
+        assert!(allowed(&cfg, None, "anything", None));
         cfg.allow_targets = vec!["prod".into(), "s3://bench".into()];
-        assert!(allowed(&cfg, "prod", None));
-        assert!(allowed(&cfg, "s3://bench/x", Some("s3://bench/x")));
-        assert!(allowed(&cfg, "s3://bench", None));
-        assert!(!allowed(
-            &cfg,
-            "s3://bench-evil/x",
-            Some("s3://bench-evil/x")
-        ));
-        assert!(!allowed(&cfg, "memory://", Some("memory://")));
+        assert!(allowed(&cfg, None, "prod", None));
+        assert!(ok(&cfg, "s3://bench/x"));
+        assert!(ok(&cfg, "s3://bench"));
+        assert!(!ok(&cfg, "s3://bench-evil/x"));
+        assert!(!ok(&cfg, "memory://"));
+        // Normalised on both sides (MCP-1): case, trailing slash, default port, `//`, `./`.
+        assert!(ok(&cfg, "S3://BENCH/x/"));
+        assert!(ok(&cfg, "s3://bench//x/./y"));
+        assert!(!ok(&cfg, "s3://bench2/x"));
+        cfg.allow_targets = vec!["S3://Bench/Data/".into()];
+        assert!(ok(&cfg, "s3://bench/Data/x"));
+        assert!(!ok(&cfg, "s3://bench/data/x"), "paths are case-sensitive");
+        assert!(!ok(&cfg, "s3://bench/Database"));
     }
 
     fn allow_state(dir: &std::path::Path, allow: &[&str]) -> State {
@@ -1910,6 +2488,55 @@ mod tests {
             ..Default::default()
         };
         assert!(check_probe(&st.cfg, &probe).is_err());
+    }
+
+    /// SEC-1 / MCP-1: `..`, `//`, `./`, case, ports and `existing: ../` never escape an
+    /// allowed location.
+    #[test]
+    fn allowlist_bypasses_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().display().to_string().replace('\\', "/");
+        let allowed_url = format!("fs://{root}/allowed/");
+        let st = allow_state(dir.path(), &[allowed_url.as_str(), "s3://bench/oprobe"]);
+        let t = |target: &str| TargetIn {
+            target: target.into(),
+            ..Default::default()
+        };
+        let refused = Err(ErrorCode::SafetyRefused);
+        assert_eq!(check(&st, t(&format!("fs://{root}/allowed/run"))), Ok(()));
+        assert_eq!(check(&st, t(&format!("fs://{root}/allowed"))), Ok(()));
+        // The 3.0 bypass: a raw prefix test let this write into `other/`.
+        assert_eq!(
+            check(&st, t(&format!("fs://{root}/allowed/../other"))),
+            refused
+        );
+        assert_eq!(
+            check(&st, t(&format!("fs://{root}//allowed/./../other"))),
+            refused
+        );
+        assert_eq!(check(&st, t(&format!("fs://{root}/allowed-evil"))), refused);
+        assert_eq!(check(&st, t("s3://bench/oprobe/x")), Ok(()));
+        assert_eq!(check(&st, t("S3://BENCH/oprobe/x/")), Ok(()));
+        assert_eq!(check(&st, t("s3://bench//oprobe/./x")), Ok(()));
+        assert_eq!(check(&st, t("s3://bench/oprobe/../prod")), refused);
+        assert_eq!(check(&st, t("s3://bench/prod")), refused);
+        // `existing` with `..` is refused; a prefix inside the root is fine.
+        let with_existing = |target: &str, existing: &str| {
+            let tin = t(target);
+            let w = WorkloadIn {
+                existing: Some(existing.into()),
+                ..Default::default()
+            };
+            let (p, _) = profile_of(&st, &tin, &w).unwrap();
+            check_target(&st, &tin, &p).map_err(|e| crate::errors::classify(&e, "s3").code)
+        };
+        assert_eq!(with_existing("s3://bench/oprobe", "tables/events/"), Ok(()));
+        assert_eq!(with_existing("s3://bench/oprobe", "../../prod/"), refused);
+        assert_eq!(with_existing("s3://bench/oprobe", "x/../../prod"), refused);
+        assert_eq!(
+            with_existing(&format!("fs://{root}/allowed"), "../other"),
+            refused
+        );
     }
 
     #[test]

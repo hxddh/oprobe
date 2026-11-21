@@ -20,6 +20,26 @@
         }
       ]
     },
+    "CommandInfo": {
+      "description": "One command and the output formats it offers (`-o`).",
+      "properties": {
+        "command": {
+          "description": "The command path, e.g. `runs show`.",
+          "type": "string"
+        },
+        "formats": {
+          "items": {
+            "$ref": "#/$defs/OutputFormat"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "command",
+        "formats"
+      ],
+      "type": "object"
+    },
     "DatasetInfo": {
       "properties": {
         "existing_prefix": {
@@ -109,6 +129,7 @@
         "usage.invalid_argument",
         "usage.unknown_target",
         "usage.unknown_run",
+        "usage.unknown_baseline",
         "config.invalid",
         "config.unknown_option",
         "auth.no_credentials",
@@ -117,6 +138,8 @@
         "net.dns",
         "net.tls",
         "net.timeout",
+        "net.rate_limited",
+        "net.http",
         "storage.not_found",
         "storage.throttled",
         "storage.unsupported",
@@ -311,6 +334,23 @@
       ],
       "type": "object"
     },
+    "McpCall": {
+      "description": "An MCP tool call: the tool and its arguments.",
+      "properties": {
+        "arguments": {
+          "additionalProperties": true,
+          "type": "object"
+        },
+        "tool": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "arguments"
+      ],
+      "type": "object"
+    },
     "McpInfo": {
       "properties": {
         "prompts": {
@@ -481,6 +521,46 @@
       ],
       "type": "object"
     },
+    "NextStep": {
+      "description": "A suggested next step: what it does, the CLI command, and the MCP call doing the same.",
+      "properties": {
+        "cli": {
+          "description": "The command line (`oprobe …`).",
+          "type": "string"
+        },
+        "mcp": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/McpCall"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The same step as an MCP tool call, when a tool does it."
+        },
+        "title": {
+          "description": "What the step does, in a few words.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "title",
+        "cli"
+      ],
+      "type": "object"
+    },
+    "OutputFormat": {
+      "description": "`-o/--output`.",
+      "enum": [
+        "text",
+        "json",
+        "ndjson",
+        "md",
+        "html"
+      ],
+      "type": "string"
+    },
     "PresetInfo": {
       "properties": {
         "dataset": {
@@ -629,10 +709,17 @@
       ]
     }
   },
-  "$id": "https://github.com/hxddh/oprobe/schemas/3/capabilities.json",
+  "$id": "https://github.com/hxddh/oprobe/schemas/4/capabilities.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "Result of `oprobe capabilities`",
   "properties": {
+    "commands": {
+      "description": "Every command with its output formats (`-o` outside them is a usage error).",
+      "items": {
+        "$ref": "#/$defs/CommandInfo"
+      },
+      "type": "array"
+    },
     "defaults": {
       "$ref": "#/$defs/Defaults"
     },
@@ -666,10 +753,18 @@
     "mcp": {
       "$ref": "#/$defs/McpInfo"
     },
+    "next": {
+      "description": "Suggested next steps.",
+      "items": {
+        "$ref": "#/$defs/NextStep"
+      },
+      "type": "array"
+    },
     "oprobe_version": {
       "type": "string"
     },
     "output_formats": {
+      "description": "Every output format; `commands` says which command offers which.",
       "items": {
         "type": "string"
       },
@@ -713,6 +808,13 @@
         "$ref": "#/$defs/NamedInfo"
       },
       "type": "array"
+    },
+    "warnings": {
+      "description": "Warnings of the command (also printed on stderr in text mode).",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
     }
   },
   "required": [
@@ -725,13 +827,16 @@
     "transports",
     "http_versions",
     "output_formats",
+    "commands",
     "exit_codes",
     "error_codes",
     "finding_codes",
     "schemas",
     "mcp",
     "defaults",
-    "features"
+    "features",
+    "next",
+    "warnings"
   ],
   "title": "oprobe capabilities",
   "type": "object",

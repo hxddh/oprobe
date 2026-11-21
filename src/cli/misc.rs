@@ -16,6 +16,13 @@ use crate::report::write_file;
 use crate::util::parse_duration;
 
 impl CommandOutput for ProbeReport {
+    fn next(&self) -> Vec<crate::output::NextStep> {
+        vec![
+            crate::cli::next::discover(),
+            crate::cli::next::list_targets(),
+        ]
+    }
+
     fn text(&self) -> String {
         super::doctor::render_probe(self)
     }
@@ -80,6 +87,15 @@ pub struct LabOutput {
 }
 
 impl CommandOutput for LabOutput {
+    fn next(&self) -> Vec<crate::output::NextStep> {
+        vec![
+            crate::output::NextStep::new("measure the lab", self.try_command.clone()).with_mcp(
+                "start_run",
+                serde_json::json!({ "target": "lab://demo", "duration": "5s" }),
+            ),
+        ]
+    }
+
     fn text(&self) -> String {
         format!(
             "{} S3 lab listening on {}\n  try: {}\n  {}\n",
@@ -155,9 +171,38 @@ pub struct CleanupOutput {
     pub dry_run: bool,
     pub older_than: String,
     pub entries: Vec<SweepEntry>,
+    /// The target as given (for next steps).
+    #[serde(skip)]
+    pub target_arg: String,
 }
 
 impl CommandOutput for CleanupOutput {
+    fn next(&self) -> Vec<crate::output::NextStep> {
+        use crate::output::NextStep;
+        let t = crate::model::spec::shell_quote(&self.target_arg);
+        if self.dry_run && !self.entries.is_empty() {
+            vec![
+                NextStep::new(
+                    "delete the prefixes listed",
+                    format!("oprobe cleanup {t} --older-than {} --yes", self.older_than),
+                )
+                .with_mcp(
+                    "cleanup",
+                    serde_json::json!({
+                        "target": self.target_arg,
+                        "older_than": self.older_than,
+                        "confirm": true
+                    }),
+                ),
+            ]
+        } else {
+            vec![
+                NextStep::new("check the target", format!("oprobe doctor {t}"))
+                    .with_mcp("doctor", serde_json::json!({ "target": self.target_arg })),
+            ]
+        }
+    }
+
     fn text(&self) -> String {
         if self.entries.is_empty() {
             return format!(
@@ -186,6 +231,9 @@ impl CommandOutput for CleanupOutput {
                 dim(&format!("({} objects, {age})", e.objects))
             );
         }
+        if self.dry_run {
+            o += &dim("dry run: nothing was deleted; add --yes to delete\n");
+        }
         o
     }
 }
@@ -202,8 +250,9 @@ pub async fn cmd_cleanup(a: CleanupArgs, ctx: &Ctx) -> Result<u8> {
     let base = crate::engine::operator::base_operator(&target)?;
     let admin = crate::engine::operator::admin_operator(&base, &target)?;
     let older = parse_duration(&a.older_than)?;
-    let dry_run = a.dry_run || a.read_only;
-    if a.read_only && !a.dry_run && ctx.out.format == OutputFormat::Text {
+    // A dry run unless --yes (design v4 §10): cleanup deletes only when asked to.
+    let dry_run = !a.yes || a.dry_run || a.read_only;
+    if a.read_only && ctx.out.format == OutputFormat::Text {
         ctx.out
             .info(dim("--read-only: listing only, nothing is deleted"));
     }
@@ -213,5 +262,6 @@ pub async fn cmd_cleanup(a: CleanupArgs, ctx: &Ctx) -> Result<u8> {
         dry_run,
         older_than: a.older_than,
         entries,
+        target_arg: a.target.target.clone().unwrap_or_else(|| target.display()),
     })
 }

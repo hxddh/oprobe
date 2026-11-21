@@ -10,6 +10,7 @@ use opendal::layers::{RetryLayer, TimeoutLayer};
 
 use super::stack::ClientStack;
 use crate::config::{Knobs, TargetSpec, TransportMode};
+use crate::errors::{ErrorCode, OprobeError};
 use crate::layers::{InProcessObserveLayer, TraceContextLayer, WhiteboxCacheLayer};
 use crate::net::{FidelityTransport, TlsClientOptions, TracingTransport, TransportConfig};
 use crate::trace::{OpScope, Recorder};
@@ -25,22 +26,51 @@ pub fn base_operator(target: &TargetSpec) -> Result<Operator> {
     ensure_registry();
     let mut opts = target.resolved_options()?;
     opts.remove("ca_cert_pem");
-    Operator::via_iter(&target.scheme, opts).map_err(|e| {
-        let hint = if e.kind() == opendal::ErrorKind::ConfigInvalid {
+    Operator::via_iter(&target.scheme, opts.clone()).map_err(|e| {
+        let code = crate::errors::opendal_code(&e).unwrap_or(ErrorCode::ConfigInvalid);
+        let mut err = OprobeError::new(
+            code,
             format!(
-                " (set missing options with `-o KEY=VALUE`, `?KEY=VALUE` in the URL or under [target.options]; required for `{}`: {})",
+                "cannot configure the `{}` backend for {}: {e}",
                 target.scheme,
-                crate::config::required_options(&target.scheme).join(", ")
-            )
-        } else {
-            String::new()
-        };
-        anyhow::Error::new(e).context(format!(
-            "cannot configure the `{}` backend for {}{hint}",
-            target.scheme,
-            target.display()
-        ))
+                target.display()
+            ),
+        );
+        if e.kind() == opendal::ErrorKind::ConfigInvalid {
+            err = err.with_hint(backend_config_hint(&target.scheme, &opts));
+        }
+        anyhow::Error::new(err)
     })
+}
+
+/// What to set when OpenDAL refuses a backend configuration: the required options that are
+/// really missing (the bucket or container usually comes from the URL), then where options go.
+pub fn backend_config_hint(
+    scheme: &str,
+    opts: &std::collections::BTreeMap<String, String>,
+) -> String {
+    let has = |k: &str| opts.get(k).is_some_and(|v| !v.trim().is_empty());
+    let mut missing: Vec<String> = crate::config::required_options(scheme)
+        .iter()
+        .filter(|k| !has(k))
+        .map(|k| format!("`{k}`"))
+        .collect();
+    if scheme == "azblob"
+        && !has("endpoint")
+        && !has("account_name")
+        && !missing.iter().any(|m| m == "`endpoint`")
+    {
+        missing.push("`endpoint` (https://ACCOUNT.blob.core.windows.net) or `account_name`".into());
+    }
+    let what = if missing.is_empty() {
+        "check the backend options".to_owned()
+    } else {
+        format!("set {}", missing.join(" and "))
+    };
+    format!(
+        "{what}: pass `--option KEY=VALUE` (or `?KEY=VALUE` in the URL), or add it under \
+         [targets.NAME.options] in the config file (`oprobe config edit`)"
+    )
 }
 
 /// Where the region of an S3 target comes from.
@@ -273,11 +303,16 @@ pub async fn check_reachable(base: &Operator, target: &TargetSpec) -> Result<()>
         .iter()
         .any(|n| l.contains(n));
     if unreachable {
-        anyhow::bail!(
-            "cannot reach {} ({}): {chain}",
-            target.endpoint().unwrap_or_else(|| target.display()),
-            target.display()
-        );
+        return Err(OprobeError::new(
+            ErrorCode::NetUnreachable,
+            format!(
+                "cannot reach {} ({}): {chain}",
+                target.endpoint().unwrap_or_else(|| target.display()),
+                target.display()
+            ),
+        )
+        .with_hint("check the endpoint, the network path and the proxy (`oprobe doctor TARGET`)")
+        .into());
     }
     Ok(())
 }
@@ -336,4 +371,30 @@ pub fn admin_operator(base: &Operator, target: &TargetSpec) -> Result<Operator> 
                 .with_max_times(10)
                 .with_max_delay(Duration::from_secs(10)),
         ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backend_config_hints_name_flags_and_only_missing_options() {
+        let mut o = std::collections::BTreeMap::new();
+        o.insert("container".to_owned(), "c".to_owned());
+        let h = backend_config_hint("azblob", &o);
+        assert!(!h.contains("`container`"), "{h}");
+        assert!(h.contains("`endpoint`"), "{h}");
+        assert!(h.contains("--option KEY=VALUE"), "{h}");
+        assert!(h.contains("[targets.NAME.options]"), "{h}");
+        assert!(!h.contains("-o KEY"), "{h}");
+        let h = backend_config_hint("s3", &Default::default());
+        assert!(h.contains("set `bucket`"), "{h}");
+        let t = TargetSpec::from_url("azblob://c/p").unwrap();
+        let e = base_operator(&t).unwrap_err();
+        let b = crate::errors::classify(&e, "azblob");
+        assert_eq!(b.code, ErrorCode::ConfigInvalid, "{b:?}");
+        let hint = b.hint.unwrap_or_default();
+        assert!(!hint.contains("`container`"), "{hint}");
+        assert!(hint.contains("--option"), "{hint}");
+    }
 }

@@ -37,9 +37,14 @@ pub enum CheckStatus {
 pub struct DoctorCheck {
     pub name: String,
     pub status: CheckStatus,
+    /// What was found; for a failure, the summarized cause (service error code and message,
+    /// HTTP status) rather than the raw backend error.
     pub detail: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
+    /// The raw backend error of a failed check (`--verbose` only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw: Option<String>,
 }
 
 /// Where the credentials come from (as far as it can be told without using them).
@@ -137,17 +142,27 @@ pub struct DoctorOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub clock_skew_s: Option<f64>,
     pub permissions: Permissions,
+    /// What the target holds (a read-only listing): prefixes, counts and sizes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sample: Option<super::sample::ObjectSample>,
+    /// Write checks ran (`--write-probe`); otherwise doctor only read.
+    pub write_probe: bool,
     /// What the OpenDAL service supports (drives workloads, the tuner and `compat`).
     pub capabilities: CapabilityMatrix,
     pub failed_count: u64,
     pub warned_count: u64,
     /// No check failed: the target can be benchmarked.
     pub ready: bool,
-    /// A command to run next.
-    pub next_command: String,
+    /// What to run next (the JSON envelope's `next`).
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub next: Vec<crate::output::NextStep>,
 }
 
 impl CommandOutput for DoctorOutput {
+    fn next(&self) -> Vec<crate::output::NextStep> {
+        self.next.clone()
+    }
     fn text(&self) -> String {
         let mut o = format!("{} {}\n", bold("oprobe doctor"), self.target);
         for c in &self.checks {
@@ -166,6 +181,34 @@ impl CommandOutput for DoctorOutput {
             if let Some(h) = &c.hint {
                 let _ = writeln!(o, "    {} {h}", yellow("hint:"));
             }
+            if let Some(r) = &c.raw {
+                let _ = writeln!(o, "    {}", dim(&format!("raw: {r}")));
+            }
+        }
+        if let Some(s) = &self.sample
+            && s.objects_count > 0
+        {
+            let tops: Vec<String> = s
+                .prefixes
+                .iter()
+                .take(4)
+                .map(|p| {
+                    format!(
+                        "{} ({})",
+                        if p.prefix.is_empty() { "/" } else { &p.prefix },
+                        p.objects_count
+                    )
+                })
+                .collect();
+            let _ = writeln!(
+                o,
+                "  {} {:<14} {} object(s){} · {}",
+                dim("·"),
+                "sample",
+                s.objects_count,
+                if s.truncated { "+" } else { "" },
+                tops.join(", ")
+            );
         }
         let (yes, no) = self.capabilities.summary();
         let _ = writeln!(o, "  {} {:<14} {}", dim("·"), "capabilities", yes.join(" "));
@@ -191,7 +234,9 @@ impl CommandOutput for DoctorOutput {
         } else {
             let _ = writeln!(o, "{} {} check(s) failed", red("●"), self.failed_count);
         }
-        let _ = writeln!(o, "  next: {}", bold(&self.next_command));
+        if let Some(n) = self.next.first() {
+            let _ = writeln!(o, "  next: {}", bold(&n.cli));
+        }
         o
     }
     fn exit_code(&self) -> u8 {
@@ -206,6 +251,76 @@ impl CommandOutput for DoctorOutput {
 struct Checks {
     list: Vec<DoctorCheck>,
     scheme: String,
+    verbose: bool,
+}
+
+/// The value of `<Tag>…</Tag>` in a service's XML error body.
+fn xml_tag<'a>(s: &'a str, tag: &str) -> Option<&'a str> {
+    let open = format!("<{tag}>");
+    let i = s.find(&open)? + open.len();
+    let j = s[i..].find("</")? + i;
+    Some(s[i..j].trim()).filter(|v| !v.is_empty())
+}
+
+/// The HTTP status a backend error reports (`status: 403`).
+fn http_status(s: &str) -> Option<u16> {
+    let i = s.find("status: ")? + "status: ".len();
+    s.get(i..i + 3)?.parse().ok()
+}
+
+/// A one-line cause of a backend error (design v4 §10: no raw debug text by default): the
+/// service's error code and message when its body has them, else the message without
+/// OpenDAL's context dump, with the HTTP status.
+pub fn summarize_error(raw: &str) -> String {
+    let status = http_status(raw);
+    let st = status.map(|s| format!(" (HTTP {s})")).unwrap_or_default();
+    if let Some(c) = xml_tag(raw, "Code") {
+        return match xml_tag(raw, "Message").filter(|m| *m != c) {
+            Some(m) => format!("{c}: {m}{st}"),
+            None => format!("{c}{st}"),
+        };
+    }
+    // OpenDAL: `Kind (permanent) at op, context: { … } => message`.
+    let head = raw.split(", context:").next().unwrap_or(raw);
+    let head = head.split(" => ").next().unwrap_or(head).trim();
+    let tail = match raw.rsplit_once(" => ") {
+        Some((_, t)) if t.len() < 200 && !t.trim().is_empty() => format!(": {}", t.trim()),
+        _ => String::new(),
+    };
+    let mut s = format!("{head}{tail}");
+    if s.chars().count() > 200 {
+        s = s.chars().take(197).collect::<String>() + "…";
+    }
+    if status.is_some() && !s.contains("HTTP") {
+        s += &st;
+    }
+    s
+}
+
+/// The hint of an auth failure, aware of what is already exported: "export
+/// AWS_ACCESS_KEY_ID" is no advice when it is set (AG-8).
+fn auth_hint(raw: &str, scheme: &str) -> Option<String> {
+    let l = raw.to_ascii_lowercase();
+    let keys_exported = env_set("AWS_ACCESS_KEY_ID") && env_set("AWS_SECRET_ACCESS_KEY");
+    if scheme != "s3" || !keys_exported {
+        return None;
+    }
+    if l.contains("invalidaccesskeyid") {
+        return Some(
+            "AWS_ACCESS_KEY_ID is exported, but the service does not know that key: check that \
+             it belongs to this endpoint and account (AWS, MinIO and R2 keys differ), that it is \
+             active, and that no stale AWS_SESSION_TOKEN is exported with long-term keys"
+                .into(),
+        );
+    }
+    if l.contains("signaturedoesnotmatch") {
+        return Some(
+            "the exported AWS_SECRET_ACCESS_KEY does not match AWS_ACCESS_KEY_ID (or the clock \
+             or region is off): export the matching pair, then run `oprobe doctor` again"
+                .into(),
+        );
+    }
+    None
 }
 
 impl Checks {
@@ -215,6 +330,7 @@ impl Checks {
             status,
             detail: detail.to_owned(),
             hint,
+            raw: None,
         });
     }
     fn ok(&mut self, name: &str, detail: &str) {
@@ -224,14 +340,21 @@ impl Checks {
         self.push(name, CheckStatus::Warn, detail, None);
     }
     fn fail(&mut self, name: &str, err: &str) {
-        let hint = hint_for(err, &self.scheme).map(|h| {
-            if h.steps.is_empty() {
-                h.title
-            } else {
-                format!("{}: {}", h.title, h.steps.join("; "))
-            }
+        let hint = auth_hint(err, &self.scheme).or_else(|| {
+            hint_for(err, &self.scheme).map(|h| {
+                if h.steps.is_empty() {
+                    h.title
+                } else {
+                    format!("{}: {}", h.title, h.steps.join("; "))
+                }
+            })
         });
-        self.push(name, CheckStatus::Fail, err, hint);
+        let detail = summarize_error(err);
+        let raw = (self.verbose && detail != err).then(|| crate::util::strip_url_credentials(err));
+        self.push(name, CheckStatus::Fail, &detail, hint);
+        if let Some(c) = self.list.last_mut() {
+            c.raw = raw;
+        }
     }
 }
 
@@ -347,10 +470,17 @@ pub fn credential_source(t: &TargetSpec) -> CredentialInfo {
 
 /// Check `target` (the doctor behind `oprobe doctor`, `oprobe target test` and MCP).
 /// `target_arg` is how the user named it (for the suggested command).
-pub async fn doctor(mut target: TargetSpec, read_only: bool, target_arg: &str) -> DoctorOutput {
+/// `read_only` skips the write probe; `verbose` keeps the raw backend errors of failed checks.
+pub async fn doctor(
+    mut target: TargetSpec,
+    read_only: bool,
+    target_arg: &str,
+    verbose: bool,
+) -> DoctorOutput {
     let mut c = Checks {
         list: Vec::new(),
         scheme: target.scheme.clone(),
+        verbose,
     };
     let mut out = DoctorOutput {
         target: target.display(),
@@ -374,11 +504,13 @@ pub async fn doctor(mut target: TargetSpec, read_only: bool, target_arg: &str) -
         tls: None,
         clock_skew_s: None,
         permissions: Permissions::default(),
+        sample: None,
+        write_probe: !read_only,
         capabilities: CapabilityMatrix::default(),
         failed_count: 0,
         warned_count: 0,
         ready: false,
-        next_command: String::new(),
+        next: Vec::new(),
     };
     run_checks(&mut target, read_only, &mut c, &mut out).await;
     out.failed_count = c
@@ -393,19 +525,89 @@ pub async fn doctor(mut target: TargetSpec, read_only: bool, target_arg: &str) -
         .count() as u64;
     out.ready = out.failed_count == 0;
     out.checks = c.list;
-    let arg = if target_arg.contains(' ') {
-        format!("'{target_arg}'")
-    } else {
-        target_arg.to_owned()
-    };
-    out.next_command = if !out.ready {
-        format!("oprobe doctor {arg}   # again, after fixing the failed checks")
-    } else if read_only || out.permissions.write != Access::Allowed {
-        format!("oprobe run {arg} --existing <PREFIX>   # read-only: measure your own objects")
-    } else {
-        format!("oprobe run {arg} --preset mixed --duration 30s")
-    };
+    out.next = doctor_next(&out, target_arg);
     out
+}
+
+/// What to do after doctor: fix and re-check, measure the objects it saw (read-only), or run.
+fn doctor_next(out: &DoctorOutput, target_arg: &str) -> Vec<crate::output::NextStep> {
+    use crate::output::NextStep;
+    let arg = crate::model::spec::shell_quote(target_arg);
+    let target = serde_json::json!({ "target": target_arg });
+    if !out.ready {
+        return vec![
+            NextStep::new(
+                "check again after fixing the failed checks",
+                format!("oprobe doctor {arg}"),
+            )
+            .with_mcp("doctor", target),
+            NextStep::new(
+                "credential sources found on this machine",
+                "oprobe target discover",
+            )
+            .with_mcp("discover_targets", serde_json::json!({})),
+        ];
+    }
+    let mut next = Vec::new();
+    if let Some(p) = out
+        .sample
+        .as_ref()
+        .and_then(|s| s.suggested_existing.clone())
+    {
+        let q = crate::model::spec::shell_quote(&p);
+        next.push(
+            NextStep::new(
+                format!("measure the objects under {p} (read-only)"),
+                format!("oprobe run {arg} --existing {q} -d 10s"),
+            )
+            .with_mcp(
+                "start_run",
+                serde_json::json!({ "target": target_arg, "existing": p, "duration": "10s" }),
+            ),
+        );
+    }
+    if out.write_probe && out.permissions.write == Access::Allowed {
+        next.push(
+            NextStep::new(
+                "measure a mixed workload",
+                format!("oprobe run {arg} --preset mixed -d 30s"),
+            )
+            .with_mcp(
+                "start_run",
+                serde_json::json!({ "target": target_arg, "preset": "mixed", "duration": "30s" }),
+            ),
+        );
+    } else {
+        next.push(
+            NextStep::new(
+                "plan a run with a generated dataset (nothing touches the target)",
+                format!("oprobe run {arg} --dry-run"),
+            )
+            .with_mcp("plan_run", target.clone()),
+        );
+        if !out.write_probe {
+            next.push(
+                NextStep::new(
+                    "also test write, read and delete permissions",
+                    format!("oprobe doctor {arg} --write-probe"),
+                )
+                .with_mcp(
+                    "doctor",
+                    serde_json::json!({ "target": target_arg, "write_probe": true }),
+                ),
+            );
+        }
+    }
+    if out.sample.as_ref().is_none_or(|s| s.objects_count == 0) {
+        next.push(
+            NextStep::new(
+                "list what the target holds",
+                format!("oprobe target sample {arg}"),
+            )
+            .with_mcp("sample_objects", target),
+        );
+    }
+    next
 }
 
 async fn run_checks(
@@ -654,14 +856,31 @@ async fn run_checks(
     match admin.list_with("").limit(5).await {
         Ok(entries) => {
             out.permissions.list = Access::Allowed;
+            let names: Vec<&str> = entries
+                .iter()
+                .map(|e| e.path())
+                .filter(|p| !p.is_empty() && *p != "/")
+                .take(5)
+                .collect();
             c.ok(
                 "list",
                 &format!(
-                    "{} entries visible at root in {}",
-                    entries.len(),
-                    fmt_ms(t.elapsed().as_secs_f64() * 1000.0)
+                    "{} entries visible at root in {}{}",
+                    names.len(),
+                    fmt_ms(t.elapsed().as_secs_f64() * 1000.0),
+                    if names.is_empty() {
+                        String::new()
+                    } else {
+                        format!(": {}", names.join(", "))
+                    }
                 ),
-            )
+            );
+            // A read-only sample of what the target holds (AG-2): what to measure with
+            // `--existing` when writes are refused.
+            match super::sample::sample(target, &out.target, "", 200).await {
+                Ok(s) => out.sample = Some(s),
+                Err(e) => c.warn("sample", &summarize_error(&format!("{e:#}"))),
+            }
         }
         Err(e) => {
             out.permissions.list = access(&e);
@@ -672,7 +891,7 @@ async fn run_checks(
         c.push(
             "write",
             CheckStatus::Skipped,
-            "skipping write/read/delete checks (--read-only)",
+            "read-only: write/read/delete not tested (add --write-probe)",
             None,
         );
         return;
@@ -756,7 +975,9 @@ pub async fn run(a: DoctorArgs, ctx: &Ctx) -> Result<u8> {
     )?;
     let target = profile.target.normalized()?;
     let arg = a.target.target.clone().unwrap_or_else(|| target.display());
-    let out = doctor(target, a.read_only, &arg).await;
+    // Read-only unless --write-probe (design v4 §10).
+    let read_only = a.read_only || !a.write_probe;
+    let out = doctor(target, read_only, &arg, a.verbose).await;
     ctx.out.finish(&out)
 }
 
@@ -867,4 +1088,40 @@ pub fn render_probe(r: &crate::net::probe::ProbeReport) -> String {
         );
     }
     o
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failures_are_summarized_not_dumped() {
+        let raw = "PermissionDenied (permanent) at list, context: { uri: https://b.s3.amazonaws.com/?list-type=2, response: Parts { status: 403, version: HTTP/1.1, headers: {\"x-amz-request-id\": \"X\"} }, service: s3, path: / } => <?xml version=\"1.0\"?><Error><Code>InvalidAccessKeyId</Code><Message>The AWS Access Key Id you provided does not exist in our records.</Message></Error>";
+        let s = summarize_error(raw);
+        assert_eq!(
+            s,
+            "InvalidAccessKeyId: The AWS Access Key Id you provided does not exist in our records. (HTTP 403)"
+        );
+        let s = summarize_error(
+            "Unexpected (temporary) at stat, context: { service: s3, path: x } => send http request",
+        );
+        assert_eq!(s, "Unexpected (temporary) at stat: send http request");
+        assert!(summarize_error(&"x".repeat(500)).chars().count() <= 200);
+    }
+
+    #[test]
+    fn verbose_keeps_the_raw_error() {
+        let raw = "PermissionDenied (permanent) at list, context: { response: Parts { status: 403 } } => denied";
+        let mut c = Checks {
+            list: Vec::new(),
+            scheme: "s3".into(),
+            verbose: false,
+        };
+        c.fail("list", raw);
+        assert!(c.list[0].raw.is_none());
+        assert!(!c.list[0].detail.contains("Parts"));
+        c.verbose = true;
+        c.fail("list", raw);
+        assert_eq!(c.list[1].raw.as_deref(), Some(raw));
+    }
 }

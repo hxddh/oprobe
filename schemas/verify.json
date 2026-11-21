@@ -1,0 +1,904 @@
+{
+  "$defs": {
+    "ChangeKind": {
+      "description": "What part of the setup a [`ConfigChange`] is in.",
+      "oneOf": [
+        {
+          "const": "workload",
+          "description": "What was run (preset, mix, dataset, access pattern, rate…): results are not comparable.",
+          "type": "string"
+        },
+        {
+          "const": "target",
+          "description": "Where it ran (scheme, bucket/prefix, endpoint, backend options).",
+          "type": "string"
+        },
+        {
+          "const": "knobs",
+          "description": "Client configuration: the legitimate subject of an A/B comparison.",
+          "type": "string"
+        },
+        {
+          "const": "host",
+          "description": "The machine, network path or oprobe version that measured.",
+          "type": "string"
+        }
+      ]
+    },
+    "Check": {
+      "description": "One gate check, machine-grade (design v4 §7).",
+      "properties": {
+        "abs_limit": {
+          "description": "Absolute limit or floor in `unit` (e.g. the minimum latency change in ms, the\nfailed-ratio increase).",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "baseline": {
+          "format": "double",
+          "type": "number"
+        },
+        "candidate": {
+          "format": "double",
+          "type": "number"
+        },
+        "delta_ratio": {
+          "description": "`(candidate − baseline) / baseline`; absent when the baseline is 0 and the candidate\nis not.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "id": {
+          "description": "Stable id: `throughput`, `throughput_bytes`, `latency_p50.VERB`, `latency_p99.VERB`,\n`present.VERB`, `error_ratio`, `throttled_request_ratio`, `open_loop_missed_ratio`,\n`corrupted_objects`, `requests_per_op`, `read_amplification`, `cost_per_million_ops`.",
+          "type": "string"
+        },
+        "limit_ratio": {
+          "description": "Relative change in the bad direction that fails the check (absent: no relative limit).",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "note": {
+          "type": "string"
+        },
+        "unit": {
+          "description": "Unit of `baseline`, `candidate` and `abs_limit` (`ops_per_s`, `mib_per_s`, `ms`,\n`ratio`, `count`, `requests_per_op`, `usd`).",
+          "type": "string"
+        },
+        "verdict": {
+          "$ref": "#/$defs/Status"
+        }
+      },
+      "required": [
+        "id",
+        "unit",
+        "baseline",
+        "candidate",
+        "delta_ratio",
+        "limit_ratio",
+        "verdict"
+      ],
+      "type": "object"
+    },
+    "Comparison": {
+      "description": "Result of `oprobe compare`.",
+      "properties": {
+        "baseline": {
+          "$ref": "#/$defs/Side"
+        },
+        "candidate": {
+          "$ref": "#/$defs/Side"
+        },
+        "comparable": {
+          "description": "Same target identity and workload hash (design v4 §7).",
+          "type": "boolean"
+        },
+        "findings": {
+          "$ref": "#/$defs/FindingsDiff"
+        },
+        "gate": {
+          "$ref": "#/$defs/DiffReport",
+          "description": "The per-check gate (per-operation latency, errors, throttling, amplification, cost),\nwith significance applied to latency and throughput checks."
+        },
+        "p99_trend_ms": {
+          "description": "p99 (ms) of every baseline run then every candidate run, in time order.",
+          "items": {
+            "format": "double",
+            "type": "number"
+          },
+          "type": "array"
+        },
+        "passed": {
+          "description": "The verdict is `passed`.",
+          "type": "boolean"
+        },
+        "stats": {
+          "items": {
+            "$ref": "#/$defs/MetricStat"
+          },
+          "type": "array"
+        },
+        "verdict": {
+          "$ref": "#/$defs/GateVerdict",
+          "description": "`passed`, `regression` or `not_comparable` (no verdict)."
+        }
+      },
+      "required": [
+        "verdict",
+        "passed",
+        "comparable",
+        "baseline",
+        "candidate",
+        "stats",
+        "findings",
+        "p99_trend_ms",
+        "gate"
+      ],
+      "type": "object"
+    },
+    "Confidence": {
+      "description": "How far to trust the estimate.",
+      "enum": [
+        "low",
+        "medium",
+        "high"
+      ],
+      "type": "string"
+    },
+    "ConfigChange": {
+      "description": "One setting that differs between baseline and candidate.",
+      "properties": {
+        "baseline": {
+          "type": "string"
+        },
+        "candidate": {
+          "type": "string"
+        },
+        "field": {
+          "description": "Dotted path, e.g. `knobs.concurrency`, `workload.mix`.",
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/ChangeKind"
+        }
+      },
+      "required": [
+        "kind",
+        "field",
+        "baseline",
+        "candidate"
+      ],
+      "type": "object"
+    },
+    "DiffReport": {
+      "properties": {
+        "baseline": {
+          "type": "string"
+        },
+        "candidate": {
+          "type": "string"
+        },
+        "checks": {
+          "items": {
+            "$ref": "#/$defs/Check"
+          },
+          "type": "array"
+        },
+        "comparable": {
+          "type": "boolean"
+        },
+        "config_changes": {
+          "description": "Every workload / target / knob / host setting that differs between the two runs.",
+          "items": {
+            "$ref": "#/$defs/ConfigChange"
+          },
+          "type": "array"
+        },
+        "identity": {
+          "$ref": "#/$defs/Identity"
+        },
+        "passed": {
+          "description": "The verdict is `passed`.",
+          "type": "boolean"
+        },
+        "thresholds": {
+          "$ref": "#/$defs/Thresholds"
+        },
+        "verdict": {
+          "$ref": "#/$defs/GateVerdict"
+        },
+        "warnings": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "verdict",
+        "passed",
+        "comparable",
+        "baseline",
+        "candidate",
+        "thresholds",
+        "identity",
+        "config_changes",
+        "checks",
+        "warnings"
+      ],
+      "type": "object"
+    },
+    "Direction": {
+      "description": "Which way a metric should move.",
+      "oneOf": [
+        {
+          "const": "increase",
+          "description": "Higher than the baseline.",
+          "type": "string"
+        },
+        {
+          "const": "decrease",
+          "description": "Lower than the baseline.",
+          "type": "string"
+        },
+        {
+          "const": "at_most",
+          "description": "At most the predicted value (e.g. a throttle budget).",
+          "type": "string"
+        },
+        {
+          "const": "at_least",
+          "description": "At least the predicted value.",
+          "type": "string"
+        },
+        {
+          "const": "unchanged",
+          "description": "Within the interval of the baseline (a change that must not cost anything).",
+          "type": "string"
+        }
+      ]
+    },
+    "ExpectationCheck": {
+      "description": "One expectation, measured.",
+      "properties": {
+        "baseline": {
+          "$ref": "#/$defs/Interval",
+          "description": "The metric over the baseline runs (mean with a 95 % t-interval)."
+        },
+        "candidate": {
+          "$ref": "#/$defs/Interval",
+          "description": "The metric over the candidate runs."
+        },
+        "change": {
+          "$ref": "#/$defs/Interval",
+          "description": "Relative change of the candidate (ratio)."
+        },
+        "direction": {
+          "$ref": "#/$defs/Direction"
+        },
+        "hi": {
+          "format": "double",
+          "type": "number"
+        },
+        "lo": {
+          "format": "double",
+          "type": "number"
+        },
+        "metric": {
+          "type": "string"
+        },
+        "note": {
+          "description": "The judgement in words, with numbers.",
+          "type": "string"
+        },
+        "outcome": {
+          "$ref": "#/$defs/VerifyOutcome"
+        },
+        "predicted": {
+          "format": "double",
+          "type": "number"
+        },
+        "unit": {
+          "description": "Unit of `predicted`, `lo`, `hi` (`baseline_ratio`: a multiple of the baseline's value).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "metric",
+        "direction",
+        "unit",
+        "predicted",
+        "lo",
+        "hi",
+        "baseline",
+        "candidate",
+        "change",
+        "outcome",
+        "note"
+      ],
+      "type": "object"
+    },
+    "FindingRef": {
+      "description": "A finding code on one side only, or on both.",
+      "properties": {
+        "cause": {
+          "type": "string"
+        },
+        "code": {
+          "type": "string"
+        },
+        "severity": {
+          "$ref": "#/$defs/Severity"
+        }
+      },
+      "required": [
+        "code",
+        "severity",
+        "cause"
+      ],
+      "type": "object"
+    },
+    "FindingVerdict": {
+      "description": "What verify concluded about one finding.",
+      "properties": {
+        "candidate_run_ids": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "code": {
+          "type": "string"
+        },
+        "comparison": {
+          "$ref": "#/$defs/Comparison",
+          "description": "Baseline runs vs candidate runs (run-level statistics)."
+        },
+        "description": {
+          "description": "The hypothesis in words.",
+          "type": "string"
+        },
+        "expectations": {
+          "items": {
+            "$ref": "#/$defs/ExpectationCheck"
+          },
+          "type": "array"
+        },
+        "outcome": {
+          "$ref": "#/$defs/VerifyOutcome"
+        },
+        "overrides": {
+          "$ref": "#/$defs/Overrides",
+          "description": "The change that was tested."
+        },
+        "reason": {
+          "description": "Why, in one sentence with numbers.",
+          "type": "string"
+        },
+        "resolved": {
+          "description": "The finding no longer shows in most candidate runs.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "code",
+        "description",
+        "overrides",
+        "outcome",
+        "reason",
+        "expectations",
+        "resolved",
+        "candidate_run_ids",
+        "comparison"
+      ],
+      "type": "object"
+    },
+    "FindingsDiff": {
+      "properties": {
+        "new": {
+          "items": {
+            "$ref": "#/$defs/FindingRef"
+          },
+          "type": "array"
+        },
+        "persisting": {
+          "items": {
+            "$ref": "#/$defs/FindingRef"
+          },
+          "type": "array"
+        },
+        "resolved": {
+          "items": {
+            "$ref": "#/$defs/FindingRef"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "new",
+        "resolved",
+        "persisting"
+      ],
+      "type": "object"
+    },
+    "GateVerdict": {
+      "description": "The gate's answer.",
+      "oneOf": [
+        {
+          "const": "passed",
+          "description": "Comparable and no check failed.",
+          "type": "string"
+        },
+        {
+          "const": "regression",
+          "description": "Comparable and at least one check failed (exit 3).",
+          "type": "string"
+        },
+        {
+          "const": "not_comparable",
+          "description": "Different target or workload: no regression verdict (exit 0 with a warning, exit 2\nwith `--strict`).",
+          "type": "string"
+        }
+      ]
+    },
+    "Identity": {
+      "description": "Whether two runs may be gated against each other (design v4 §7).",
+      "properties": {
+        "baseline_target": {
+          "type": "string"
+        },
+        "baseline_workload_hash": {
+          "type": "string"
+        },
+        "candidate_target": {
+          "type": "string"
+        },
+        "candidate_workload_hash": {
+          "type": "string"
+        },
+        "comparable": {
+          "description": "Same target identity and workload hash (or the difference was allowed).",
+          "type": "boolean"
+        },
+        "reasons": {
+          "description": "Why the runs are not comparable (empty when they are).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "same_target": {
+          "type": "boolean"
+        },
+        "same_workload": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "comparable",
+        "same_target",
+        "same_workload",
+        "baseline_target",
+        "candidate_target",
+        "baseline_workload_hash",
+        "candidate_workload_hash"
+      ],
+      "type": "object"
+    },
+    "Interval": {
+      "description": "An estimate with a confidence interval.",
+      "properties": {
+        "estimate": {
+          "format": "double",
+          "type": "number"
+        },
+        "high": {
+          "format": "double",
+          "type": "number"
+        },
+        "low": {
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "estimate",
+        "low",
+        "high"
+      ],
+      "type": "object"
+    },
+    "McpCall": {
+      "description": "An MCP tool call: the tool and its arguments.",
+      "properties": {
+        "arguments": {
+          "additionalProperties": true,
+          "type": "object"
+        },
+        "tool": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "arguments"
+      ],
+      "type": "object"
+    },
+    "Method": {
+      "description": "How a [`MetricStat`] interval was computed.",
+      "oneOf": [
+        {
+          "const": "block_bootstrap",
+          "description": "One run per side: block bootstrap over per-second windows.",
+          "type": "string"
+        },
+        {
+          "const": "runs_t",
+          "description": "Several runs per side: a t-interval over the per-run values.",
+          "type": "string"
+        },
+        {
+          "const": "unavailable",
+          "description": "Too few samples: point estimates only, never significant.",
+          "type": "string"
+        }
+      ]
+    },
+    "MetricStat": {
+      "description": "A headline metric with confidence intervals.",
+      "properties": {
+        "baseline": {
+          "$ref": "#/$defs/Interval"
+        },
+        "candidate": {
+          "$ref": "#/$defs/Interval"
+        },
+        "change": {
+          "$ref": "#/$defs/Interval",
+          "description": "Relative change of the candidate (ratio; +0.1 = 10 % higher), with its 95 % interval."
+        },
+        "confidence": {
+          "$ref": "#/$defs/Confidence"
+        },
+        "method": {
+          "$ref": "#/$defs/Method"
+        },
+        "metric": {
+          "description": "`p50_ms`, `p99_ms`, `ops_per_s`.",
+          "type": "string"
+        },
+        "noise_floor_ratio": {
+          "description": "Changes smaller than this are noise for this target and workload.",
+          "format": "double",
+          "type": "number"
+        },
+        "significant": {
+          "description": "The 95 % interval excludes zero and the change exceeds the noise floor.",
+          "type": "boolean"
+        },
+        "unit": {
+          "description": "Unit of `baseline` and `candidate`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "metric",
+        "unit",
+        "baseline",
+        "candidate",
+        "change",
+        "noise_floor_ratio",
+        "significant",
+        "method",
+        "confidence"
+      ],
+      "type": "object"
+    },
+    "NextStep": {
+      "description": "A suggested next step: what it does, the CLI command, and the MCP call doing the same.",
+      "properties": {
+        "cli": {
+          "description": "The command line (`oprobe …`).",
+          "type": "string"
+        },
+        "mcp": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/McpCall"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The same step as an MCP tool call, when a tool does it."
+        },
+        "title": {
+          "description": "What the step does, in a few words.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "title",
+        "cli"
+      ],
+      "type": "object"
+    },
+    "Overrides": {
+      "description": "A change to a run: `--set key=value` pairs grouped by the part of the profile they change\n(canonical key names, see [`SET_KEYS`]). Built with [`Overrides::set`], which validates.",
+      "properties": {
+        "cost": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "knobs": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sla": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "target": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "workload": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        }
+      },
+      "type": "object"
+    },
+    "Severity": {
+      "enum": [
+        "info",
+        "warning",
+        "critical"
+      ],
+      "type": "string"
+    },
+    "Side": {
+      "description": "One side of a comparison.",
+      "properties": {
+        "label": {
+          "description": "What the user named (RUNREF, baseline name, `repeat group`).",
+          "type": "string"
+        },
+        "representative": {
+          "description": "The run whose report the per-check table compares (the median-p99 run).",
+          "type": "string"
+        },
+        "run_ids": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "label",
+        "run_ids",
+        "representative"
+      ],
+      "type": "object"
+    },
+    "Status": {
+      "description": "The verdict of one check.",
+      "enum": [
+        "pass",
+        "improved",
+        "fail",
+        "skipped"
+      ],
+      "type": "string"
+    },
+    "Thresholds": {
+      "description": "Regression limits. Relative limits are ratios of the baseline in the \"bad\" direction\n(0.2 = 20 % worse).",
+      "properties": {
+        "allow_target_change": {
+          "default": false,
+          "description": "Compare runs against different targets anyway (otherwise `comparable: false`).",
+          "type": "boolean"
+        },
+        "allow_workload_change": {
+          "default": false,
+          "description": "Compare runs of different workloads anyway (otherwise `comparable: false`).",
+          "type": "boolean"
+        },
+        "cost_increase_ratio": {
+          "format": "double",
+          "type": "number"
+        },
+        "error_increase_ratio": {
+          "description": "Max increase of the failed-operation ratio (absolute, 0.005 = 0.5 percentage points).",
+          "format": "double",
+          "type": "number"
+        },
+        "fail_on_new_throttling": {
+          "description": "Gate throttling: fail when the candidate's throttled-request ratio grows past\n[`Thresholds::throttle_increase_ratio`] (relative), [`THROTTLE_RATIO_FLOOR`] (absolute)\nand [`Thresholds::min_throttled_count`] (count floor).",
+          "type": "boolean"
+        },
+        "min_failed_ops_count": {
+          "description": "Fewer additional failed operations than this are never a regression (count floor).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "min_latency_delta_ms": {
+          "description": "Latency changes smaller than this (ms) are never regressions.",
+          "format": "double",
+          "type": "number"
+        },
+        "min_samples_count": {
+          "description": "Skip latency checks for operations with fewer samples.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "min_throttled_count": {
+          "description": "Fewer throttled responses than this in the candidate are never a regression\n(0 → 1 throttled response is noise).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "p50_increase_ratio": {
+          "format": "double",
+          "type": "number"
+        },
+        "p99_increase_ratio": {
+          "format": "double",
+          "type": "number"
+        },
+        "read_amp_increase_ratio": {
+          "format": "double",
+          "type": "number"
+        },
+        "request_amp_increase_ratio": {
+          "format": "double",
+          "type": "number"
+        },
+        "strict": {
+          "default": false,
+          "description": "Runs that are not comparable are an error (exit 2) instead of a warning (exit 0).",
+          "type": "boolean"
+        },
+        "throttle_increase_ratio": {
+          "description": "Relative growth of the throttled-request ratio that fails the gate.",
+          "format": "double",
+          "type": "number"
+        },
+        "throughput_drop_ratio": {
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "p99_increase_ratio",
+        "p50_increase_ratio",
+        "min_latency_delta_ms",
+        "throughput_drop_ratio",
+        "error_increase_ratio",
+        "min_failed_ops_count",
+        "request_amp_increase_ratio",
+        "read_amp_increase_ratio",
+        "cost_increase_ratio",
+        "fail_on_new_throttling",
+        "throttle_increase_ratio",
+        "min_throttled_count",
+        "min_samples_count",
+        "allow_workload_change",
+        "allow_target_change",
+        "strict"
+      ],
+      "type": "object"
+    },
+    "VerifyOutcome": {
+      "description": "What `verify` concluded about one hypothesis.",
+      "oneOf": [
+        {
+          "const": "confirmed",
+          "description": "The change moved the metrics as expected.",
+          "type": "string"
+        },
+        {
+          "const": "refuted",
+          "description": "The change did not help (or made things worse).",
+          "type": "string"
+        },
+        {
+          "const": "inconclusive",
+          "description": "Noise or too few samples to tell.",
+          "type": "string"
+        }
+      ]
+    }
+  },
+  "$id": "https://github.com/hxddh/oprobe/schemas/4/verify.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Result of `oprobe verify`: confirmed, refuted or inconclusive per finding",
+  "properties": {
+    "baseline_run_ids": {
+      "description": "The replays of the run without changes.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "calibrated": {
+      "description": "The outcomes were stored and calibrated the capacity history.",
+      "type": "boolean"
+    },
+    "findings": {
+      "items": {
+        "$ref": "#/$defs/FindingVerdict"
+      },
+      "type": "array"
+    },
+    "next": {
+      "description": "Suggested next steps.",
+      "items": {
+        "$ref": "#/$defs/NextStep"
+      },
+      "type": "array"
+    },
+    "noise_pairs_count": {
+      "description": "A/A pairs added to the noise floor of the target and workload.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "repeat_count": {
+      "description": "Baseline / candidate pairs per finding.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "run_id": {
+      "description": "The verified run.",
+      "type": "string"
+    },
+    "warnings": {
+      "description": "Warnings of the command (also printed on stderr in text mode).",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "run_id",
+    "repeat_count",
+    "baseline_run_ids",
+    "findings",
+    "noise_pairs_count",
+    "calibrated",
+    "next",
+    "warnings"
+  ],
+  "title": "oprobe verify",
+  "type": "object",
+  "x-rust-type": "VerifyResult"
+}

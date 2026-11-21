@@ -11,7 +11,7 @@ use serde_json::Value;
 use crate::errors::ErrorBody;
 
 /// Base of every schema `$id`.
-pub const ID_BASE: &str = "https://github.com/hxddh/oprobe/schemas/3/";
+pub const ID_BASE: &str = "https://github.com/hxddh/oprobe/schemas/4/";
 
 /// Whether a schema describes something oprobe writes (outputs) or reads (inputs).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -35,6 +35,16 @@ fn gen_for<T: JsonSchema>(s: SchemaSettings) -> Schema {
     s.into_generator().into_root_schema_for::<T>()
 }
 
+/// A command result: `T` in the common envelope (`next`, `warnings`; design v4 §8), titled
+/// after `T`.
+fn gen_cmd<T: JsonSchema>(s: SchemaSettings) -> Schema {
+    let mut schema = s
+        .into_generator()
+        .into_root_schema_for::<crate::output::Envelope<T>>();
+    schema.insert("title".into(), Value::String(T::schema_name().into_owned()));
+    schema
+}
+
 /// The `{"type":"error","error":{…}}` document printed on failures in json/ndjson modes.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct ErrorEnvelope {
@@ -52,7 +62,7 @@ pub enum ErrorTag {
 /// First line of a run file.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct RunFileHeader {
-    /// Always `oprobe.run/3`.
+    /// Always `oprobe.run/4`.
     pub format: String,
     pub run_id: String,
     pub oprobe_version: String,
@@ -60,7 +70,7 @@ pub struct RunFileHeader {
     pub created_at: String,
 }
 
-/// One line of a `.oprobe` run file (zstd-compressed NDJSON, `oprobe.run/3`): a `header`,
+/// One line of a `.oprobe` run file (zstd-compressed NDJSON, `oprobe.run/4`): a `header`,
 /// the `report`, then `op` and `req` rows. Readers skip unknown kinds.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -81,6 +91,15 @@ macro_rules! entry {
             build: gen_for::<$ty>,
         }
     };
+    // A command result: wrapped in the common envelope.
+    (cmd $name:literal, $ty:ty, $desc:literal) => {
+        Entry {
+            name: $name,
+            description: $desc,
+            direction: Direction::Output,
+            build: gen_cmd::<$ty>,
+        }
+    };
 }
 
 /// Every schema, in a stable order.
@@ -91,7 +110,7 @@ pub fn entries() -> Vec<Entry> {
             "report",
             Output,
             crate::model::Report,
-            "Report v3 (oprobe.report/3): the result of one run"
+            "Report v4 (oprobe.report/4): the result of one run"
         ),
         entry!(
             "events",
@@ -109,7 +128,7 @@ pub fn entries() -> Vec<Entry> {
             "run-file",
             Output,
             RunFileLine,
-            "One line of a .oprobe run file (oprobe.run/3)"
+            "One line of a .oprobe run file (oprobe.run/4)"
         ),
         entry!(
             "run-summary",
@@ -123,173 +142,176 @@ pub fn entries() -> Vec<Entry> {
             crate::store::ConfigFile,
             "The config file (config.toml): [defaults] and [targets.NAME]"
         ),
-        entry!("run", Output, cli::RunOutput, "Result of `oprobe run`"),
+        entry!(cmd "run", cli::RunOutput, "Result of `oprobe run`"),
         entry!(
-            "plan",
-            Output,
+            cmd "plan",
             cli::run::PlanOutput,
             "Result of `oprobe run --dry-run` / `tune --dry-run`"
         ),
-        entry!("tune", Output, cli::TuneOutput, "Result of `oprobe tune`"),
+        entry!(cmd "tune", cli::TuneOutput, "Result of `oprobe tune`"),
         entry!(
-            "compare",
-            Output,
+            cmd "compare",
             crate::analysis::compare::Comparison,
             "Result of `oprobe compare`"
         ),
         entry!(
-            "analyze",
+            cmd "verify",
+            cli::verify::VerifyResult,
+            "Result of `oprobe verify`: confirmed, refuted or inconclusive per finding"
+        ),
+        entry!(
+            cmd "fix",
+            cli::fix::FixOutput,
+            "Result of `oprobe fix`: diagnose, tune, verify; a recommendation and a profile patch"
+        ),
+        entry!(
+            cmd "baseline-calibrate",
+            cli::compare::CalibrateOutput,
+            "Result of `oprobe baseline calibrate`: the target's noise floor"
+        ),
+        entry!(
+            "noise-floors",
             Output,
+            crate::store::baselines::NoiseFloors,
+            "Noise floors learned per target and workload (<data>/noise.toml)"
+        ),
+        entry!(
+            cmd "analyze",
             cli::analyze::AnalyzeOutput,
             "Result of `oprobe analyze`"
         ),
         entry!(
-            "watch",
-            Output,
+            cmd "watch",
             cli::watch::WatchOutput,
             "Result of `oprobe watch`"
         ),
         entry!(
-            "matrix",
-            Output,
+            cmd "matrix",
             cli::matrix::MatrixOutput,
             "Result of `oprobe matrix`"
         ),
         entry!(
-            "matrix-plan",
-            Output,
+            cmd "matrix-plan",
             cli::matrix::MatrixPlanOutput,
             "Result of `oprobe matrix --dry-run`"
         ),
         entry!(
-            "compat",
-            Output,
+            cmd "compat",
             crate::compat::command::CompatOutput,
             "Result of `oprobe compat`"
         ),
         entry!(
-            "compat-plan",
-            Output,
+            cmd "compat-plan",
             crate::compat::command::CompatPlan,
             "Result of `oprobe compat --dry-run`"
         ),
         entry!(
-            "runs-export",
-            Output,
+            cmd "runs-export",
             cli::export::ExportOutput,
             "Result of `oprobe runs export`"
         ),
         entry!(
-            "run-repeat",
-            Output,
+            cmd "run-repeat",
             cli::repeat::RepeatOutput,
             "Result of `oprobe run --repeat N` / `--baseline NAME`"
         ),
         entry!(
-            "baseline-show",
-            Output,
+            cmd "baseline-show",
             cli::compare::BaselineShow,
             "Result of `oprobe baseline show`"
         ),
         entry!(
-            "baseline-list",
-            Output,
+            cmd "baseline-list",
             cli::compare::BaselineList,
             "Result of `oprobe baseline list`"
         ),
         entry!(
-            "demo",
-            Output,
+            cmd "demo",
             cli::demo::DemoOutput,
             "Result of `oprobe demo`"
         ),
         entry!(
-            "self-update",
-            Output,
+            cmd "self-update",
             cli::self_update::UpdateOutput,
             "Result of `oprobe self-update`"
         ),
         entry!(
-            "doctor",
-            Output,
+            cmd "doctor",
             cli::doctor::DoctorOutput,
             "Result of `oprobe doctor`"
         ),
         entry!(
-            "probe",
-            Output,
+            cmd "probe",
             crate::net::probe::ProbeReport,
             "Result of `oprobe probe`"
         ),
         entry!(
-            "cleanup",
-            Output,
+            cmd "cleanup",
             cli::misc::CleanupOutput,
             "Result of `oprobe cleanup`"
         ),
         entry!(
-            "lab",
-            Output,
+            cmd "lab",
             cli::misc::LabOutput,
             "What `oprobe lab` serves"
         ),
         entry!(
-            "runs-list",
-            Output,
+            cmd "runs-list",
             cli::runs::RunsList,
             "Result of `oprobe runs list`"
         ),
         entry!(
-            "runs-show",
-            Output,
+            cmd "runs-show",
             cli::runs::RunShow,
             "Result of `oprobe runs show`"
         ),
         entry!(
-            "runs-rm",
-            Output,
+            cmd "runs-rm",
             cli::runs::RemovedRuns,
             "Result of `oprobe runs rm` / `runs gc`"
         ),
         entry!(
-            "target-list",
-            Output,
+            cmd "target-list",
             cli::settings::TargetList,
             "Result of `oprobe target list`"
         ),
         entry!(
-            "target-show",
-            Output,
+            cmd "target-show",
             cli::settings::TargetShow,
             "Result of `oprobe target show`"
         ),
         entry!(
-            "config-show",
-            Output,
+            cmd "target-discover",
+            cli::discover::Discovery,
+            "Result of `oprobe target discover` (MCP discover_targets): credential sources by name"
+        ),
+        entry!(
+            cmd "target-sample",
+            cli::sample::ObjectSample,
+            "Result of `oprobe target sample` (MCP sample_objects): prefixes, counts and sizes"
+        ),
+        entry!(
+            cmd "config-show",
             cli::settings::ConfigShow,
             "Result of `oprobe config show`"
         ),
         entry!(
-            "config-path",
-            Output,
+            cmd "config-path",
             cli::settings::ConfigPaths,
             "Result of `oprobe config path`"
         ),
         entry!(
-            "capabilities",
-            Output,
+            cmd "capabilities",
             super::capabilities::Capabilities,
             "Result of `oprobe capabilities`"
         ),
         entry!(
-            "explain",
-            Output,
+            cmd "explain",
             super::explain::ExplainOutput,
             "Result of `oprobe explain` (a run or a finding code)"
         ),
         entry!(
-            "schema-list",
-            Output,
+            cmd "schema-list",
             SchemaList,
             "Result of `oprobe schema` without a name"
         ),
@@ -304,6 +326,60 @@ pub fn entries() -> Vec<Entry> {
             Input,
             crate::analysis::outliers::Selection,
             "Which requests to attribute (MCP analyze_run)"
+        ),
+        entry!(
+            "run-spec",
+            Output,
+            crate::model::RunSpec,
+            "The replayable definition of a run (report.spec; `oprobe run --from RUN`)"
+        ),
+        entry!(
+            "overrides",
+            Input,
+            crate::model::Overrides,
+            "A change to a run: `--set key=value` pairs by section (verifications, recommendations)"
+        ),
+        entry!(
+            "capacity",
+            Output,
+            crate::analysis::capacity::Capacity,
+            "The capacity model (report.capacity): in-flight ceiling and per-op request shape"
+        ),
+        entry!(
+            "capacity-history",
+            Output,
+            crate::analysis::capacity::History,
+            "Ceilings remembered per target and workload (<data>/capacity.toml)"
+        ),
+        entry!(
+            "verification",
+            Output,
+            crate::analysis::verification::Verification,
+            "How to test a finding's advice: overrides, commands and expectations"
+        ),
+        entry!(
+            "recommendation",
+            Output,
+            crate::tune::recommend::Recommendation,
+            "A tuned configuration with its deltas (tune, fix, MCP recommend_config)"
+        ),
+        entry!(
+            "next-step",
+            Output,
+            crate::output::NextStep,
+            "One suggested next step of a command result (CLI command and MCP call)"
+        ),
+        entry!(
+            "target-id",
+            Output,
+            crate::store::TargetId,
+            "The normalised identity of a storage target"
+        ),
+        entry!(
+            "defaults",
+            Output,
+            crate::config::BuiltinDefaults,
+            "Every built-in default (config::defaults)"
         ),
     ]
 }

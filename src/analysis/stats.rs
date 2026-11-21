@@ -34,6 +34,30 @@ pub fn quantile_us_ms(v: &mut [u64], q: f64) -> f64 {
     *x as f64 / 1000.0
 }
 
+/// The latency distribution of `us` (µs samples) with the one percentile estimator of
+/// reports, findings and compare (design v4 §4): nearest rank over the exact samples. `None`
+/// for no samples. Reorders `us`.
+pub fn exact_quantiles(us: &mut [u64]) -> Option<crate::trace::Quantiles> {
+    if us.is_empty() {
+        return None;
+    }
+    us.sort_unstable();
+    let n = us.len();
+    let at = |q: f64| {
+        let i = ((n as f64 * q).ceil() as usize).clamp(1, n) - 1;
+        us[i] as f64 / 1000.0
+    };
+    Some(crate::trace::Quantiles {
+        count: n as u64,
+        mean: us.iter().map(|v| *v as f64).sum::<f64>() / n as f64 / 1000.0,
+        p50: at(0.50),
+        p90: at(0.90),
+        p99: at(0.99),
+        p999: at(0.999),
+        max: us[n - 1] as f64 / 1000.0,
+    })
+}
+
 pub fn median(values: &[f64]) -> f64 {
     if values.is_empty() {
         return 0.0;
@@ -258,6 +282,20 @@ mod tests {
         assert!((stddev(&[2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0]) - 2.138).abs() < 0.01);
         let mut us = vec![1000, 2000, 3000];
         assert_eq!(quantile_us_ms(&mut us, 0.5), 2.0);
+    }
+
+    #[test]
+    fn exact_quantiles_agree_with_the_nearest_rank_estimator() {
+        let mut us: Vec<u64> = (1..=1000).rev().map(|i| i * 1000).collect();
+        let q = exact_quantiles(&mut us.clone()).unwrap();
+        assert_eq!(q.count, 1000);
+        assert_eq!(q.p50, quantile_us_ms(&mut us, 0.5));
+        assert_eq!(q.p99, quantile_us_ms(&mut us, 0.99));
+        assert_eq!(q.p99, 990.0);
+        assert_eq!(q.p999, 999.0);
+        assert_eq!(q.max, 1000.0);
+        assert!((q.mean - 500.5).abs() < 1e-9);
+        assert!(exact_quantiles(&mut []).is_none());
     }
 
     #[test]

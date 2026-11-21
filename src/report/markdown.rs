@@ -46,10 +46,10 @@ fn render_with(r: &Report, slow: Option<(&OpRow, Vec<&ReqRow>)>) -> String {
         r.run.oprobe_version,
         r.run.started_at
     );
-    if r.run.interrupted {
+    if r.is_partial() && !r.warnings.iter().any(|w| w.starts_with("partial run: ")) {
         let _ = writeln!(
             md,
-            "> ⚠️ **Interrupted** — the run was stopped early; results cover a shorter window than configured.\n"
+            "> ⚠️ **Partial** — the run was stopped early; results cover a shorter window than configured.\n"
         );
     }
     for w in &r.warnings {
@@ -58,18 +58,20 @@ fn render_with(r: &Report, slow: Option<(&OpRow, Vec<&ReqRow>)>) -> String {
     let sm = &s.summary;
     let _ = writeln!(
         md,
-        "| ops/s | MiB/s | p50 | p99 | p99.9 | failed ops | throttled |\n|---:|---:|---:|---:|---:|---:|---:|"
+        "| good ops/s | MiB/s | p50 | p99 | p99.9 | failed ops | throttled requests |\n|---:|---:|---:|---:|---:|---:|---:|"
     );
     let _ = writeln!(
         md,
-        "| {:.1} | {:.1} | {} | {} | {} | {} | {} |\n",
+        "| {:.1} | {:.1} | {} | {} | {} | {} ({:.2}%) | {} ({:.2}%) |\n",
         sm.ops_per_s,
         sm.mib_per_s,
         fmt_ms(sm.latency.p50),
         fmt_ms(sm.latency.p99),
         fmt_ms(sm.latency.p999),
         sm.failed_ops,
-        s.resilience.throttled_responses
+        sm.error_rate * 100.0,
+        s.resilience.throttled_responses,
+        sm.throttled_request_ratio * 100.0
     );
 
     let v = &r.verdict.sla;
@@ -165,13 +167,18 @@ fn render_with(r: &Report, slow: Option<(&OpRow, Vec<&ReqRow>)>) -> String {
     if r.cost.applicable {
         let _ = writeln!(
             md,
-            "- {}: **{} per 1M ops** ({} requests + {} egress per month at {:.0}M ops; storage {})",
+            "- {}: **{} per 1M ops** ({} requests + {} egress per month at {:.0}M ops; storage {} for {:.0} GiB{})",
             c.provider,
             fmt_usd(c.per_million_ops_usd),
             fmt_usd(c.requests_usd),
             fmt_usd(c.egress_usd),
             r.cost.monthly_ops / 1e6,
-            fmt_usd(c.storage_usd)
+            fmt_usd(c.storage_usd),
+            r.cost.stored_gb,
+            match crate::analysis::cost::storage_label(&r.cost) {
+                l if l.is_empty() => l,
+                l => format!(" {l}"),
+            }
         );
     } else {
         let _ = writeln!(
@@ -192,6 +199,15 @@ fn render_with(r: &Report, slow: Option<(&OpRow, Vec<&ReqRow>)>) -> String {
                 f.evidence.text,
                 f.advice
             );
+            let kv: Vec<String> = f
+                .evidence
+                .labelled()
+                .into_iter()
+                .map(|(k, v)| format!("{k} **{v}**"))
+                .collect();
+            if !kv.is_empty() {
+                let _ = writeln!(md, "  {}", kv.join(" · "));
+            }
         }
     }
 

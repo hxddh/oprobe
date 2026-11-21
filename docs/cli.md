@@ -24,10 +24,12 @@ Every command accepts the global options below. Exit codes: `0` ok · `1` runtim
 | [`oprobe demo`](#oprobe-demo) | Start a lab target with throttling and stragglers, run it and narrate the result |
 | [`oprobe tune`](#oprobe-tune) | Find the best client configuration for a workload (throttle-aware) |
 | [`oprobe compare`](#oprobe-compare) | Regression gate: compare two runs (RUNREFs or files) and fail on regressions |
+| [`oprobe verify`](#oprobe-verify) | Test a finding's advice: replay the run with and without the change (A B A B…) and answer confirmed, refuted or inconclusive |
+| [`oprobe fix`](#oprobe-fix) | Diagnose a target, tune it and verify the recommendation; prints a profile patch |
 | [`oprobe runs`](#oprobe-runs) | Saved runs: list, show, open, export, rm, gc |
 | [`oprobe analyze`](#oprobe-analyze) | Re-slice a run by API, connection, remote, stage or second |
 | [`oprobe explain`](#oprobe-explain) | Narrate a run's causes and advice, or document a finding code |
-| [`oprobe target`](#oprobe-target) | Named targets: add, list, show, rm, test |
+| [`oprobe target`](#oprobe-target) | Named targets: add, list, show, rm, test, discover (credential sources), sample |
 | [`oprobe doctor`](#oprobe-doctor) | Check endpoint reachability, TLS, clock skew, credentials and permissions |
 | [`oprobe probe`](#oprobe-probe) | Measure DNS / TCP / proxy / TLS handshakes and cold vs warm TTFB of an endpoint |
 | [`oprobe watch`](#oprobe-watch) | Continuous low-rate probing with SLOs and a Prometheus endpoint |
@@ -53,6 +55,8 @@ Measure a target: where time and money go (saves the run)
 ```text
 oprobe run [OPTIONS] [TARGET]
 ```
+
+Output formats (`-o`): text, json, ndjson, md, html
 
 *Target*
 
@@ -108,7 +112,7 @@ oprobe run [OPTIONS] [TARGET]
 
 | argument | description |
 |---|---|
-| `--provider <PROVIDER>` | Pricing preset: aws-s3, gcs, azure-blob, cloudflare-r2, backblaze-b2, aliyun-oss |
+| `--provider <PROVIDER>` | Pricing preset: aws-s3, gcs, azure-blob, cloudflare-r2, backblaze-b2, aliyun-oss (aliases: aws, gcp, google, azure, r2, b2, oss, aliyun) |
 | `--monthly-ops <MONTHLY_OPS>` | Logical operations per month to project costs for |
 | `--egress-fraction <EGRESS_FRACTION>` | Fraction of downloads leaving the cloud (0..1) |
 | `--stored-gib <STORED_GIB>` | Stored data in GiB |
@@ -146,6 +150,13 @@ oprobe run [OPTIONS] [TARGET]
 | `--repeat <N>` | Repeat the run N times and report the spread · default `1` |
 | `--baseline <NAME>` | Compare against (and add to) a named baseline |
 
+*Replay*
+
+| argument | description |
+|---|---|
+| `--from <RUNREF>` | Replay a stored run (RUNREF): its spec, with credentials resolved again from the target; other flags and --set override it |
+| `--set <KEY=VALUE>` | Override one setting, repeatable (e.g. --set concurrency=8 --set warmup=1s); keys: the profile's knob, workload, SLA and cost names, `endpoint`, `region`, `label` |
+
 ## `oprobe demo`
 
 Start a lab target with throttling and stragglers, run it and narrate the result
@@ -154,6 +165,8 @@ Start a lab target with throttling and stragglers, run it and narrate the result
 oprobe demo [OPTIONS]
 ```
 
+Output formats (`-o`): text, json, ndjson, md, html
+
 ## `oprobe tune`
 
 Find the best client configuration for a workload (throttle-aware)
@@ -161,6 +174,8 @@ Find the best client configuration for a workload (throttle-aware)
 ```text
 oprobe tune [OPTIONS] [TARGET]
 ```
+
+Output formats (`-o`): text, json, ndjson, md
 
 *Target*
 
@@ -216,7 +231,7 @@ oprobe tune [OPTIONS] [TARGET]
 
 | argument | description |
 |---|---|
-| `--provider <PROVIDER>` | Pricing preset: aws-s3, gcs, azure-blob, cloudflare-r2, backblaze-b2, aliyun-oss |
+| `--provider <PROVIDER>` | Pricing preset: aws-s3, gcs, azure-blob, cloudflare-r2, backblaze-b2, aliyun-oss (aliases: aws, gcp, google, azure, r2, b2, oss, aliyun) |
 | `--monthly-ops <MONTHLY_OPS>` | Logical operations per month to project costs for |
 | `--egress-fraction <EGRESS_FRACTION>` | Fraction of downloads leaving the cloud (0..1) |
 | `--stored-gib <STORED_GIB>` | Stored data in GiB |
@@ -256,12 +271,15 @@ oprobe tune [OPTIONS] [TARGET]
 
 | argument | description |
 |---|---|
-| `--objective <OBJECTIVE>` | What to optimize · one of `throughput`, `latency`, `cost` · default `throughput` |
+| `--objective <OBJECTIVE>` | What to optimize · one of `goodput`, `p99`, `cost`, `balanced` · default `goodput` |
 | `--trial-duration <TRIAL_DURATION>` | Measurement window per trial · default `5s` |
 | `--trial-warmup <TRIAL_WARMUP>` | Warmup per trial · default `1s` |
 | `--max-trials <MAX_TRIALS>` | Maximum number of trials · default `24` |
 | `--max-concurrency <MAX_CONCURRENCY>` | Highest concurrency to try · default `256` |
 | `--cooldown <COOLDOWN>` | Pause after a throttled trial · default `5s` |
+| `--max-throttle-ratio <RATIO>` | Share of throttled requests a configuration may cause and still be feasible (default 0.001, or the profile's `sla.max_throttle_rate`) |
+| `--boundary-repeats <BOUNDARY_REPEATS>` | Runs of each bisection trial near the throttle boundary · default `2` |
+| `--headroom-ratio <RATIO>` | In-flight headroom kept below the throttling ceiling (default 0.15) |
 | `--budget <DURATION>` | Total wall-time budget of the tuner, e.g. 5m: caps the trials so the estimate fits (add --max-duration for a hard stop) |
 | `--emit-profile <FILE>` | Write the tuned profile (TOML) |
 | `--emit-rust <FILE>` | Write a Rust/OpenDAL snippet with the tuned settings |
@@ -274,6 +292,8 @@ Regression gate: compare two runs (RUNREFs or files) and fail on regressions
 ```text
 oprobe compare [OPTIONS] [A] [B]
 ```
+
+Output formats (`-o`): text, json, ndjson, md, html
 
 | argument | description |
 |---|---|
@@ -292,249 +312,51 @@ oprobe compare [OPTIONS] [A] [B]
 | `--allow-throttling` | Do not fail when the candidate starts getting throttled |
 | `--allow-workload-change` | Do not fail when the workload differs (preset, mix, dataset, access, rate) |
 | `--allow-target-change` | Do not fail when the target differs (scheme, bucket/prefix, endpoint, options) |
+| `--strict` | Runs of different targets or workloads are an error (exit 2) instead of a warning |
 | `--markdown <FILE>` | Write a Markdown summary (PR comment / job summary) |
 | `--junit <FILE>` | Write JUnit XML |
 | `--json <FILE>` | Write the comparison as JSON |
 
-## `oprobe runs`
+## `oprobe verify`
 
-Saved runs: list, show, open, export, rm, gc
-
-```text
-oprobe runs [OPTIONS] <COMMAND>
-```
-
-## `oprobe runs list`
-
-List saved runs, newest first
+Test a finding's advice: replay the run with and without the change (A B A B…) and answer confirmed, refuted or inconclusive
 
 ```text
-oprobe runs list [OPTIONS]
+oprobe verify [OPTIONS] <RUNREF> [CODE]
 ```
+
+Output formats (`-o`): text, json, ndjson, md
 
 | argument | description |
 |---|---|
-| `-n, --limit <LIMIT>` | Show at most N runs · default `20` |
+| `<RUNREF>` | The run whose findings to test (RUNREF: id, prefix, last, last~N, label) |
+| `<CODE>` | The finding code to verify (default: every finding with a verification) |
+| `--all` | Verify every finding that has a verification |
+| `--repeat <N>` | Baseline / candidate pairs to run (interleaved A B A B…) · default `3` |
+| `--no-calibrate` | Do not store the outcomes or calibrate the capacity history and noise floor |
 
-## `oprobe runs show`
-
-Show a run's full report (-o md|html|json for documents)
-
-```text
-oprobe runs show [OPTIONS] [RUNREF]
-```
+*Safety*
 
 | argument | description |
 |---|---|
-| `<RUNREF>` | Run id, id prefix, `last`, `last~N`, label, or path to a .oprobe / report .json file · default `last` |
-| `--detail` | Every column, per-stage and per-verb breakdowns, the timeline and the 5 slowest operations |
+| `--dry-run` | Print the plan (requests, bytes, objects written/deleted, cost, ETA) and exit |
+| `--read-only` | Refuse every write and delete (exit 5); implied by --existing |
+| `--max-cost-usd <USD>` | Stop when the estimated request cost exceeds this (USD; exit 4) |
+| `--max-requests <N>` | Stop after this many backend requests (exit 4) |
+| `--max-bytes <SIZE>` | Stop after transferring this many bytes, e.g. 10GiB (exit 4) |
+| `--max-duration <DURATION>` | Stop after this much wall time, e.g. 5m (exit 4) |
+| `--idempotency-key <KEY>` | Name the run prefix after KEY: a retried command reuses and cleans it up |
+| `--no-save` | Do not save the replayed runs in the run store |
 
-## `oprobe runs open`
+## `oprobe fix`
 
-Open a run in the app (native window)
-
-```text
-oprobe runs open [OPTIONS] <RUNREF>
-```
-
-| argument | description |
-|---|---|
-| `<RUNREF>` | Run id, id prefix, `last`, `last~N`, label, or path to a .oprobe / report .json file |
-
-## `oprobe runs export`
-
-Export a run (html, md, json, ndjson, csv, har, otlp)
+Diagnose a target, tune it and verify the recommendation; prints a profile patch
 
 ```text
-oprobe runs export [OPTIONS] --format <FORMAT> <RUNREF>
+oprobe fix [OPTIONS] [TARGET]
 ```
 
-| argument | description |
-|---|---|
-| `<RUNREF>` | Run id, id prefix, `last`, `last~N`, label, or path to a .oprobe file |
-| `-f, --format <FORMAT>` | Export format · one of `json`, `ndjson`, `csv`, `har`, `otlp`, `md`, `html` |
-| `--out <PATH>` | Write to this file (default: stdout) |
-| `--endpoint <URL>` | OTLP/HTTP collector to push to (e.g. http://localhost:4318); with --format otlp |
-| `--table <TABLE>` | CSV rows: requests or ops · default `requests` |
-| `--signal <SIGNAL>` | OTLP signal: one OTLP/JSON document per signal; `all` needs --out DIR (two files) or --endpoint (posts /v1/traces and /v1/metrics) · one of `traces`, `metrics`, `all` · default `traces` |
-
-## `oprobe runs rm`
-
-Delete saved runs
-
-```text
-oprobe runs rm [OPTIONS] <RUNREF>...
-```
-
-| argument | description |
-|---|---|
-| `<RUNREF>` | Runs to delete (RUNREFs) |
-
-## `oprobe runs gc`
-
-Delete old runs (keeps the newest and every baseline run)
-
-```text
-oprobe runs gc [OPTIONS]
-```
-
-| argument | description |
-|---|---|
-| `--keep <KEEP>` | Keep the newest N runs · default `50` |
-| `--older-than <DURATION>` | Only delete runs older than this, e.g. 30d, 12h, 2w |
-| `--dry-run` | Show what would be deleted |
-
-## `oprobe analyze`
-
-Re-slice a run by API, connection, remote, stage or second
-
-```text
-oprobe analyze [OPTIONS] [RUNREF]
-```
-
-| argument | description |
-|---|---|
-| `<RUNREF>` | Run id, id prefix, `last`, `last~N`, label, or path to a .oprobe file · default `last` |
-| `--by <KEY>` | Group requests by: api, conn, remote, stage, second, status |
-| `--window <A..B>` | Only requests started in this window, seconds from the window start (e.g. 5..10) |
-| `--where <K=V,…>` | Only requests matching all conditions, e.g. api=GetObject,status=503 (repeatable) |
-| `--slowest <PCT>` | Attribute the slowest PCT percent of the (filtered) requests (default 1) |
-
-## `oprobe explain`
-
-Narrate a run's causes and advice, or document a finding code
-
-```text
-oprobe explain [OPTIONS] [RUNREF|FINDING_CODE]
-```
-
-| argument | description |
-|---|---|
-| `<RUNREF\|FINDING_CODE>` | A RUNREF (id, prefix, `last`, `last~N`, label, .oprobe path) or a finding code (e.g. `throttling`); `oprobe explain --list` lists the codes |
-| `--list` | List every finding code |
-| `--top <TOP>` | Findings to narrate for a run · default `3` |
-
-## `oprobe target`
-
-Named targets: add, list, show, rm, test
-
-```text
-oprobe target [OPTIONS] <COMMAND>
-```
-
-## `oprobe target add`
-
-Add (or replace) a named target
-
-```text
-oprobe target add [OPTIONS] <NAME> <URL>
-```
-
-| argument | description |
-|---|---|
-| `<NAME>` | Name, e.g. prod |
-| `<URL>` | Storage URL, e.g. s3://bucket/prefix |
-| `--region <REGION>` |  |
-| `--endpoint <ENDPOINT>` |  |
-| `--credentials <CREDENTIALS>` | env \| profile:NAME \| anonymous |
-| `--option <KEY=VALUE>` | OpenDAL option, repeatable (KEY=VALUE) |
-| `--no-test` | Save without the quick read-only check |
-
-## `oprobe target list`
-
-List configured targets
-
-```text
-oprobe target list [OPTIONS]
-```
-
-## `oprobe target show`
-
-Show one target
-
-```text
-oprobe target show [OPTIONS] <NAME>
-```
-
-| argument | description |
-|---|---|
-| `<NAME>` |  |
-
-## `oprobe target rm`
-
-Remove a target
-
-```text
-oprobe target rm [OPTIONS] <NAME>
-```
-
-| argument | description |
-|---|---|
-| `<NAME>` |  |
-
-## `oprobe target test`
-
-Check a target (doctor: reachability, TLS, clock, credentials, permissions)
-
-```text
-oprobe target test [OPTIONS] <NAME>
-```
-
-| argument | description |
-|---|---|
-| `<NAME>` | Target name (or a storage URL) |
-| `--read-only` | Only check reachability and listing; never write |
-
-## `oprobe doctor`
-
-Check endpoint reachability, TLS, clock skew, credentials and permissions
-
-```text
-oprobe doctor [OPTIONS] [TARGET]
-```
-
-*Target*
-
-| argument | description |
-|---|---|
-| `<TARGET>` | Target name (see `oprobe target list`) or storage URL: s3://bucket/prefix, gcs://bucket, azblob://container, oss://, cos://, b2://, fs:///path, memory:// |
-| `-p, --profile <FILE>` | Load a profile (TOML); flags override its values |
-| `--endpoint <ENDPOINT>` | Custom endpoint (MinIO, R2, Ceph, private clouds) |
-| `--region <REGION>` | Region of the bucket (e.g. us-east-1); most S3-compatible services accept any value |
-| `--option <KEY=VALUE>` | Extra backend option, repeatable (e.g. --option enable_virtual_host_style=true) |
-| `--anonymous` | Access a public bucket without credentials (s3, gcs, azblob, oss: unsigned requests) |
-| `--ca-cert <PEM>` | Trust an extra PEM CA bundle |
-| `--insecure` | Skip TLS certificate verification (development only) |
-| `--proxy <PROXY>` | Egress proxy URL, or `none` to ignore HTTPS_PROXY/HTTP_PROXY |
-| `--read-only` | Only check reachability and listing; never write |
-
-## `oprobe probe`
-
-Measure DNS / TCP / proxy / TLS handshakes and cold vs warm TTFB of an endpoint
-
-```text
-oprobe probe [OPTIONS] <ENDPOINT>
-```
-
-| argument | description |
-|---|---|
-| `<ENDPOINT>` | http(s) endpoint, or a storage URL whose endpoint should be probed |
-| `-n, --samples <SAMPLES>` | · default `5` |
-| `--http <HTTP>` | · one of `auto`, `h1`, `h2` · default `auto` |
-| `--get` | Use GET instead of HEAD for the cold/warm requests |
-| `--timeout <TIMEOUT>` | · default `10s` |
-| `--ca-cert <PEM>` |  |
-| `--insecure` |  |
-| `--proxy <PROXY>` |  |
-| `--json <FILE>` | Also save the result as JSON |
-
-## `oprobe watch`
-
-Continuous low-rate probing with SLOs and a Prometheus endpoint
-
-```text
-oprobe watch [OPTIONS] [TARGET]
-```
+Output formats (`-o`): text, json, ndjson, md
 
 *Target*
 
@@ -590,7 +412,431 @@ oprobe watch [OPTIONS] [TARGET]
 
 | argument | description |
 |---|---|
-| `--provider <PROVIDER>` | Pricing preset: aws-s3, gcs, azure-blob, cloudflare-r2, backblaze-b2, aliyun-oss |
+| `--provider <PROVIDER>` | Pricing preset: aws-s3, gcs, azure-blob, cloudflare-r2, backblaze-b2, aliyun-oss (aliases: aws, gcp, google, azure, r2, b2, oss, aliyun) |
+| `--monthly-ops <MONTHLY_OPS>` | Logical operations per month to project costs for |
+| `--egress-fraction <EGRESS_FRACTION>` | Fraction of downloads leaving the cloud (0..1) |
+| `--stored-gib <STORED_GIB>` | Stored data in GiB |
+
+*SLA (exit code 3 when breached)*
+
+| argument | description |
+|---|---|
+| `--sla <MODE>` | `none` reports the SLA verdict without failing the command · one of `enforce`, `none` |
+| `--max-error-rate <RATE>` | Max share of failed operations, e.g. 1% or 0.01 (default 1%) |
+| `--max-throttle-rate <RATE>` | Max share of throttled (429/503) operations, e.g. 0% (default: not checked by `run`; `tune` rejects any throttling) |
+| `--p99-ms <MS>` | Max p99 latency per operation in ms (tune rejects trials above it) |
+
+*Output*
+
+| argument | description |
+|---|---|
+| `--json <FILE>` | Also save the report as JSON (input for `oprobe compare`) |
+| `--markdown <FILE>` | Also save a Markdown report |
+| `--no-save` | Do not save the run in the run store |
+| `--fail-on <FAIL_ON>` | Also exit with code 3 if the diagnosis has findings of this severity or worse (SLA breaches always do, unless `--sla none`) · one of `warning`, `critical` |
+| `--label <LABEL>` | Label stored in the report (e.g. a git SHA) |
+
+*Safety*
+
+| argument | description |
+|---|---|
+| `--dry-run` | Print the plan (requests, bytes, objects written/deleted, cost, ETA) and exit |
+| `--read-only` | Refuse every write and delete (exit 5); implied by --existing |
+| `--max-cost-usd <USD>` | Stop when the estimated request cost exceeds this (USD; exit 4) |
+| `--max-requests <N>` | Stop after this many backend requests (exit 4) |
+| `--max-bytes <SIZE>` | Stop after transferring this many bytes, e.g. 10GiB (exit 4) |
+| `--max-duration <DURATION>` | Stop after this much wall time, e.g. 5m (exit 4) |
+| `--idempotency-key <KEY>` | Name the run prefix after KEY: a retried command reuses and cleans it up |
+
+*Tuning*
+
+| argument | description |
+|---|---|
+| `--objective <OBJECTIVE>` | What to optimize · one of `goodput`, `p99`, `cost`, `balanced` · default `goodput` |
+| `--trial-duration <TRIAL_DURATION>` | Measurement window per trial · default `5s` |
+| `--trial-warmup <TRIAL_WARMUP>` | Warmup per trial · default `1s` |
+| `--max-trials <MAX_TRIALS>` | Maximum number of trials · default `24` |
+| `--max-concurrency <MAX_CONCURRENCY>` | Highest concurrency to try · default `256` |
+| `--cooldown <COOLDOWN>` | Pause after a throttled trial · default `5s` |
+| `--max-throttle-ratio <RATIO>` | Share of throttled requests a configuration may cause and still be feasible (default 0.001, or the profile's `sla.max_throttle_rate`) |
+| `--boundary-repeats <BOUNDARY_REPEATS>` | Runs of each bisection trial near the throttle boundary · default `2` |
+| `--headroom-ratio <RATIO>` | In-flight headroom kept below the throttling ceiling (default 0.15) |
+| `--budget <DURATION>` | Total wall-time budget of the tuning step, e.g. 5m (caps the trials so the estimate fits) |
+
+*Verification*
+
+| argument | description |
+|---|---|
+| `--repeat <N>` | Baseline / candidate pairs of the verification · default `2` |
+| `--write-profile <FILE>` | Write the recommended profile (TOML) to this file |
+
+## `oprobe runs`
+
+Saved runs: list, show, open, export, rm, gc
+
+```text
+oprobe runs [OPTIONS] <COMMAND>
+```
+
+## `oprobe runs list`
+
+List saved runs, newest first
+
+```text
+oprobe runs list [OPTIONS]
+```
+
+Output formats (`-o`): text, json, ndjson, md
+
+| argument | description |
+|---|---|
+| `-n, --limit <LIMIT>` | Show at most N runs · default `20` |
+
+## `oprobe runs show`
+
+Show a run's full report (-o md|html|json for documents)
+
+```text
+oprobe runs show [OPTIONS] [RUNREF]
+```
+
+Output formats (`-o`): text, json, ndjson, md, html
+
+| argument | description |
+|---|---|
+| `<RUNREF>` | Run id, id prefix, `last`, `last~N`, label, or path to a .oprobe / report .json file · default `last` |
+| `--detail` | Every column, per-stage and per-verb breakdowns, the timeline and the 5 slowest operations |
+
+## `oprobe runs open`
+
+Open a run in the app (native window)
+
+```text
+oprobe runs open [OPTIONS] <RUNREF>
+```
+
+Output formats (`-o`): text, json, ndjson
+
+| argument | description |
+|---|---|
+| `<RUNREF>` | Run id, id prefix, `last`, `last~N`, label, or path to a .oprobe / report .json file |
+
+## `oprobe runs export`
+
+Export a run (html, md, json, ndjson, csv, har, otlp)
+
+```text
+oprobe runs export [OPTIONS] --format <FORMAT> <RUNREF>
+```
+
+Output formats (`-o`): text, json, ndjson
+
+| argument | description |
+|---|---|
+| `<RUNREF>` | Run id, id prefix, `last`, `last~N`, label, or path to a .oprobe file |
+| `-f, --format <FORMAT>` | Export format · one of `json`, `ndjson`, `csv`, `har`, `otlp`, `md`, `html` |
+| `--out <PATH>` | Write to this file (default: stdout) |
+| `--endpoint <URL>` | OTLP/HTTP collector to push to (e.g. http://localhost:4318); with --format otlp |
+| `--table <TABLE>` | CSV rows: requests or ops · default `requests` |
+| `--signal <SIGNAL>` | OTLP signal: one OTLP/JSON document per signal; `all` needs --out DIR (two files) or --endpoint (posts /v1/traces and /v1/metrics) · one of `traces`, `metrics`, `all` · default `traces` |
+
+## `oprobe runs rm`
+
+Delete saved runs
+
+```text
+oprobe runs rm [OPTIONS] <RUNREF>...
+```
+
+Output formats (`-o`): text, json, ndjson
+
+| argument | description |
+|---|---|
+| `<RUNREF>` | Runs to delete (RUNREFs) |
+
+## `oprobe runs gc`
+
+Delete old runs (keeps the newest and every baseline run)
+
+```text
+oprobe runs gc [OPTIONS]
+```
+
+Output formats (`-o`): text, json, ndjson
+
+| argument | description |
+|---|---|
+| `--keep <KEEP>` | Keep the newest N runs · default `50` |
+| `--older-than <DURATION>` | Only delete runs older than this, e.g. 30d, 12h, 2w |
+| `--dry-run` | Show what would be deleted |
+
+## `oprobe analyze`
+
+Re-slice a run by API, connection, remote, stage or second
+
+```text
+oprobe analyze [OPTIONS] [RUNREF]
+```
+
+Output formats (`-o`): text, json, ndjson
+
+| argument | description |
+|---|---|
+| `<RUNREF>` | Run id, id prefix, `last`, `last~N`, label, or path to a .oprobe file · default `last` |
+| `--by <KEY>` | Group requests by: api, conn, remote, stage, second, status |
+| `--window <A..B>` | Only requests started in this window, seconds from the window start (e.g. 5..10) |
+| `--where <K=V,…>` | Only requests matching all conditions, e.g. api=GetObject,status=503 (repeatable) |
+| `--slowest <PCT>` | Attribute the slowest PCT percent of the (filtered) requests (default 1) |
+
+## `oprobe explain`
+
+Narrate a run's causes and advice, or document a finding code
+
+```text
+oprobe explain [OPTIONS] [RUNREF|FINDING_CODE]
+```
+
+Output formats (`-o`): text, json, ndjson, md
+
+| argument | description |
+|---|---|
+| `<RUNREF\|FINDING_CODE>` | A RUNREF (id, prefix, `last`, `last~N`, label, .oprobe path) or a finding code (e.g. `throttling`); `oprobe explain --list` lists the codes |
+| `--list` | List every finding code |
+| `--top <TOP>` | Findings to narrate for a run · default `3` |
+
+## `oprobe target`
+
+Named targets: add, list, show, rm, test, discover (credential sources), sample
+
+```text
+oprobe target [OPTIONS] <COMMAND>
+```
+
+## `oprobe target add`
+
+Add a named target (`--replace` overwrites one of the same name)
+
+```text
+oprobe target add [OPTIONS] <NAME> <URL>
+```
+
+Output formats (`-o`): text, json, ndjson
+
+| argument | description |
+|---|---|
+| `<NAME>` | Name, e.g. prod |
+| `<URL>` | Storage URL, e.g. s3://bucket/prefix |
+| `--region <REGION>` |  |
+| `--endpoint <ENDPOINT>` |  |
+| `--credentials <CREDENTIALS>` | env \| profile:NAME \| anonymous |
+| `--option <KEY=VALUE>` | OpenDAL option, repeatable (KEY=VALUE) |
+| `--no-test` | Save without the quick read-only check |
+| `--replace` | Replace a target of the same name (otherwise an existing name is refused) |
+
+## `oprobe target list`
+
+List configured targets
+
+```text
+oprobe target list [OPTIONS]
+```
+
+Output formats (`-o`): text, json, ndjson
+
+## `oprobe target show`
+
+Show one target
+
+```text
+oprobe target show [OPTIONS] <NAME>
+```
+
+Output formats (`-o`): text, json, ndjson
+
+| argument | description |
+|---|---|
+| `<NAME>` |  |
+
+## `oprobe target rm`
+
+Remove a target
+
+```text
+oprobe target rm [OPTIONS] <NAME>
+```
+
+Output formats (`-o`): text, json, ndjson
+
+| argument | description |
+|---|---|
+| `<NAME>` |  |
+
+## `oprobe target test`
+
+Check a target (doctor: reachability, TLS, clock, credentials, permissions)
+
+```text
+oprobe target test [OPTIONS] <NAME>
+```
+
+Output formats (`-o`): text, json, ndjson
+
+| argument | description |
+|---|---|
+| `<NAME>` | Target name (or a storage URL) |
+| `--read-only` | Only check reachability and listing; never write (the default) |
+| `--write-probe` | Also write, read back and delete a probe object |
+
+## `oprobe target discover`
+
+Credential sources on this machine (AWS profiles and environment, GCP ADC, Azure environment), by name only, with the targets they can reach
+
+```text
+oprobe target discover [OPTIONS]
+```
+
+Output formats (`-o`): text, json, ndjson, md
+
+## `oprobe target sample`
+
+What a target holds (read-only): prefixes, object counts, size distribution, examples
+
+```text
+oprobe target sample [OPTIONS] [TARGET]
+```
+
+Output formats (`-o`): text, json, ndjson, md
+
+*Target*
+
+| argument | description |
+|---|---|
+| `<TARGET>` | Target name (see `oprobe target list`) or storage URL: s3://bucket/prefix, gcs://bucket, azblob://container, oss://, cos://, b2://, fs:///path, memory:// |
+| `-p, --profile <FILE>` | Load a profile (TOML); flags override its values |
+| `--endpoint <ENDPOINT>` | Custom endpoint (MinIO, R2, Ceph, private clouds) |
+| `--region <REGION>` | Region of the bucket (e.g. us-east-1); most S3-compatible services accept any value |
+| `--option <KEY=VALUE>` | Extra backend option, repeatable (e.g. --option enable_virtual_host_style=true) |
+| `--anonymous` | Access a public bucket without credentials (s3, gcs, azblob, oss: unsigned requests) |
+| `--ca-cert <PEM>` | Trust an extra PEM CA bundle |
+| `--insecure` | Skip TLS certificate verification (development only) |
+| `--proxy <PROXY>` | Egress proxy URL, or `none` to ignore HTTPS_PROXY/HTTP_PROXY |
+| `--prefix <PREFIX>` | List under this prefix (relative to the target root) |
+| `--limit <N>` | List at most N objects · default `1000` |
+
+## `oprobe doctor`
+
+Check endpoint reachability, TLS, clock skew, credentials and permissions
+
+```text
+oprobe doctor [OPTIONS] [TARGET]
+```
+
+Output formats (`-o`): text, json, ndjson
+
+*Target*
+
+| argument | description |
+|---|---|
+| `<TARGET>` | Target name (see `oprobe target list`) or storage URL: s3://bucket/prefix, gcs://bucket, azblob://container, oss://, cos://, b2://, fs:///path, memory:// |
+| `-p, --profile <FILE>` | Load a profile (TOML); flags override its values |
+| `--endpoint <ENDPOINT>` | Custom endpoint (MinIO, R2, Ceph, private clouds) |
+| `--region <REGION>` | Region of the bucket (e.g. us-east-1); most S3-compatible services accept any value |
+| `--option <KEY=VALUE>` | Extra backend option, repeatable (e.g. --option enable_virtual_host_style=true) |
+| `--anonymous` | Access a public bucket without credentials (s3, gcs, azblob, oss: unsigned requests) |
+| `--ca-cert <PEM>` | Trust an extra PEM CA bundle |
+| `--insecure` | Skip TLS certificate verification (development only) |
+| `--proxy <PROXY>` | Egress proxy URL, or `none` to ignore HTTPS_PROXY/HTTP_PROXY |
+| `--read-only` | Only check reachability and listing; never write (the default; kept for scripts) |
+| `--write-probe` | Also write, read back, stat and delete a 256 KiB probe object under `oprobe-run-<time>-doctor/` (the default is read-only) |
+| `-v, --verbose` | Show the raw backend error of failed checks |
+
+## `oprobe probe`
+
+Measure DNS / TCP / proxy / TLS handshakes and cold vs warm TTFB of an endpoint
+
+```text
+oprobe probe [OPTIONS] <ENDPOINT>
+```
+
+Output formats (`-o`): text, json, ndjson
+
+| argument | description |
+|---|---|
+| `<ENDPOINT>` | http(s) endpoint, or a storage URL whose endpoint should be probed |
+| `-n, --samples <SAMPLES>` | · default `5` |
+| `--http <HTTP>` | · one of `auto`, `h1`, `h2` · default `auto` |
+| `--get` | Use GET instead of HEAD for the cold/warm requests |
+| `--timeout <TIMEOUT>` | · default `10s` |
+| `--ca-cert <PEM>` |  |
+| `--insecure` |  |
+| `--proxy <PROXY>` |  |
+| `--json <FILE>` | Also save the result as JSON |
+
+## `oprobe watch`
+
+Continuous low-rate probing with SLOs and a Prometheus endpoint
+
+```text
+oprobe watch [OPTIONS] [TARGET]
+```
+
+Output formats (`-o`): text, json, ndjson
+
+*Target*
+
+| argument | description |
+|---|---|
+| `<TARGET>` | Target name (see `oprobe target list`) or storage URL: s3://bucket/prefix, gcs://bucket, azblob://container, oss://, cos://, b2://, fs:///path, memory:// |
+| `-p, --profile <FILE>` | Load a profile (TOML); flags override its values |
+| `--endpoint <ENDPOINT>` | Custom endpoint (MinIO, R2, Ceph, private clouds) |
+| `--region <REGION>` | Region of the bucket (e.g. us-east-1); most S3-compatible services accept any value |
+| `--option <KEY=VALUE>` | Extra backend option, repeatable (e.g. --option enable_virtual_host_style=true) |
+| `--anonymous` | Access a public bucket without credentials (s3, gcs, azblob, oss: unsigned requests) |
+| `--ca-cert <PEM>` | Trust an extra PEM CA bundle |
+| `--insecure` | Skip TLS certificate verification (development only) |
+| `--proxy <PROXY>` | Egress proxy URL, or `none` to ignore HTTPS_PROXY/HTTP_PROXY |
+
+*Workload*
+
+| argument | description |
+|---|---|
+| `--preset <PRESET>` | Workload preset: parquet, checkpoint, small-files, metadata, mixed |
+| `-d, --duration <DURATION>` | Measurement window (e.g. 30s, 2m) |
+| `--warmup <WARMUP>` | Warmup before measuring (connections, caches) |
+| `--max-ops <MAX_OPS>` | Stop after N measured operations |
+| `--rate <RATE>` | Open-loop arrival rate (ops/s); latency is measured from the intended start time |
+| `--existing <PREFIX>` | Benchmark existing objects under this prefix (read-only) |
+| `--objects <OBJECTS>` | Number of dataset objects to generate |
+| `--object-size <OBJECT_SIZE>` | Size of each generated object (e.g. 16MiB) |
+| `--access <ACCESS>` | Key popularity: uniform, zipf:1.1, hotset:0.2/0.8 |
+| `--persist-dataset` | Keep the generated dataset for later runs (oprobe-dataset/<fingerprint>/) |
+| `--no-verify` | Skip CRC32C verification |
+| `--keep-data` | Do not delete test data when the run ends |
+
+*Client knobs*
+
+| argument | description |
+|---|---|
+| `-c, --concurrency <CONCURRENCY>` | Concurrent operations (workers) |
+| `--io-concurrency <IO_CONCURRENCY>` | Per-operation reader/writer parallelism |
+| `--chunk-size <CHUNK_SIZE>` | Reader/writer chunk and multipart part size (e.g. 8MiB) |
+| `--range-gap <RANGE_GAP>` | Merge vectored ranges closer than this (e.g. 64KiB) |
+| `--max-inflight <MAX_INFLIGHT>` | Cap in-flight HTTP requests (0 = unlimited) |
+| `--http <HTTP>` | HTTP version · one of `auto`, `h1`, `h2` |
+| `--no-keep-alive` | Open a new connection for every request |
+| `--microscope` | Use oprobe's instrumented connection pool instead of OpenDAL's own HTTP client: exact pool queueing, per-dial DNS/TCP/proxy/TLS and HTTP/2 streams, at the cost of measuring a different client than production runs |
+| `--cache <SIZE>` | Enable the in-memory read cache with this size (e.g. 512MiB) |
+| `--retries <RETRIES>` | Retry attempts for temporary errors |
+| `--tail-cut` | Cancel and retry straggler requests (TailCutLayer) |
+| `--addressing <STYLE>` | S3 bucket addressing: auto (as configured), virtual (bucket.host) or path (host/bucket) |
+| `--checksum <ALGO>` | Checksum computed by the client and verified by the server on writes (S3: crc32c) |
+| `--sse <MODE>` | Server-side encryption of written objects (S3: AES256, aws:kms) |
+
+*Cost*
+
+| argument | description |
+|---|---|
+| `--provider <PROVIDER>` | Pricing preset: aws-s3, gcs, azure-blob, cloudflare-r2, backblaze-b2, aliyun-oss (aliases: aws, gcp, google, azure, r2, b2, oss, aliyun) |
 | `--monthly-ops <MONTHLY_OPS>` | Logical operations per month to project costs for |
 | `--egress-fraction <EGRESS_FRACTION>` | Fraction of downloads leaving the cloud (0..1) |
 | `--stored-gib <STORED_GIB>` | Stored data in GiB |
@@ -626,6 +872,8 @@ Run the same workload across targets / knob values and rank them
 oprobe matrix [OPTIONS] [TARGET]
 ```
 
+Output formats (`-o`): text, json, ndjson, md
+
 *Target*
 
 | argument | description |
@@ -680,7 +928,7 @@ oprobe matrix [OPTIONS] [TARGET]
 
 | argument | description |
 |---|---|
-| `--provider <PROVIDER>` | Pricing preset: aws-s3, gcs, azure-blob, cloudflare-r2, backblaze-b2, aliyun-oss |
+| `--provider <PROVIDER>` | Pricing preset: aws-s3, gcs, azure-blob, cloudflare-r2, backblaze-b2, aliyun-oss (aliases: aws, gcp, google, azure, r2, b2, oss, aliyun) |
 | `--monthly-ops <MONTHLY_OPS>` | Logical operations per month to project costs for |
 | `--egress-fraction <EGRESS_FRACTION>` | Fraction of downloads leaving the cloud (0..1) |
 | `--stored-gib <STORED_GIB>` | Stored data in GiB |
@@ -722,6 +970,8 @@ Correctness & compatibility suite for a target
 ```text
 oprobe compat [OPTIONS] [TARGET]
 ```
+
+Output formats (`-o`): text, json, ndjson
 
 *Target*
 
@@ -766,6 +1016,8 @@ Create or update a named baseline
 oprobe baseline set [OPTIONS] <NAME> [RUNREF]...
 ```
 
+Output formats (`-o`): text, json, ndjson
+
 | argument | description |
 |---|---|
 | `<NAME>` | Baseline name (letters, digits, - _ .) |
@@ -782,6 +1034,8 @@ List baselines
 oprobe baseline list [OPTIONS]
 ```
 
+Output formats (`-o`): text, json, ndjson
+
 ## `oprobe baseline rm`
 
 Delete a baseline
@@ -789,6 +1043,8 @@ Delete a baseline
 ```text
 oprobe baseline rm [OPTIONS] <NAME>
 ```
+
+Output formats (`-o`): text, json, ndjson
 
 | argument | description |
 |---|---|
@@ -802,9 +1058,86 @@ Show a baseline's runs and their spread
 oprobe baseline show [OPTIONS] <NAME>
 ```
 
+Output formats (`-o`): text, json, ndjson
+
 | argument | description |
 |---|---|
 | `<NAME>` |  |
+
+## `oprobe baseline calibrate`
+
+Learn the target's noise floor from repeated identical runs (<data>/noise.toml)
+
+```text
+oprobe baseline calibrate [OPTIONS] [TARGET]
+```
+
+Output formats (`-o`): text, json, ndjson
+
+*Target*
+
+| argument | description |
+|---|---|
+| `<TARGET>` | Target name (see `oprobe target list`) or storage URL: s3://bucket/prefix, gcs://bucket, azblob://container, oss://, cos://, b2://, fs:///path, memory:// |
+| `-p, --profile <FILE>` | Load a profile (TOML); flags override its values |
+| `--endpoint <ENDPOINT>` | Custom endpoint (MinIO, R2, Ceph, private clouds) |
+| `--region <REGION>` | Region of the bucket (e.g. us-east-1); most S3-compatible services accept any value |
+| `--option <KEY=VALUE>` | Extra backend option, repeatable (e.g. --option enable_virtual_host_style=true) |
+| `--anonymous` | Access a public bucket without credentials (s3, gcs, azblob, oss: unsigned requests) |
+| `--ca-cert <PEM>` | Trust an extra PEM CA bundle |
+| `--insecure` | Skip TLS certificate verification (development only) |
+| `--proxy <PROXY>` | Egress proxy URL, or `none` to ignore HTTPS_PROXY/HTTP_PROXY |
+
+*Workload*
+
+| argument | description |
+|---|---|
+| `--preset <PRESET>` | Workload preset: parquet, checkpoint, small-files, metadata, mixed |
+| `-d, --duration <DURATION>` | Measurement window (e.g. 30s, 2m) |
+| `--warmup <WARMUP>` | Warmup before measuring (connections, caches) |
+| `--max-ops <MAX_OPS>` | Stop after N measured operations |
+| `--rate <RATE>` | Open-loop arrival rate (ops/s); latency is measured from the intended start time |
+| `--existing <PREFIX>` | Benchmark existing objects under this prefix (read-only) |
+| `--objects <OBJECTS>` | Number of dataset objects to generate |
+| `--object-size <OBJECT_SIZE>` | Size of each generated object (e.g. 16MiB) |
+| `--access <ACCESS>` | Key popularity: uniform, zipf:1.1, hotset:0.2/0.8 |
+| `--persist-dataset` | Keep the generated dataset for later runs (oprobe-dataset/<fingerprint>/) |
+| `--no-verify` | Skip CRC32C verification |
+| `--keep-data` | Do not delete test data when the run ends |
+
+*Client knobs*
+
+| argument | description |
+|---|---|
+| `-c, --concurrency <CONCURRENCY>` | Concurrent operations (workers) |
+| `--io-concurrency <IO_CONCURRENCY>` | Per-operation reader/writer parallelism |
+| `--chunk-size <CHUNK_SIZE>` | Reader/writer chunk and multipart part size (e.g. 8MiB) |
+| `--range-gap <RANGE_GAP>` | Merge vectored ranges closer than this (e.g. 64KiB) |
+| `--max-inflight <MAX_INFLIGHT>` | Cap in-flight HTTP requests (0 = unlimited) |
+| `--http <HTTP>` | HTTP version · one of `auto`, `h1`, `h2` |
+| `--no-keep-alive` | Open a new connection for every request |
+| `--microscope` | Use oprobe's instrumented connection pool instead of OpenDAL's own HTTP client: exact pool queueing, per-dial DNS/TCP/proxy/TLS and HTTP/2 streams, at the cost of measuring a different client than production runs |
+| `--cache <SIZE>` | Enable the in-memory read cache with this size (e.g. 512MiB) |
+| `--retries <RETRIES>` | Retry attempts for temporary errors |
+| `--tail-cut` | Cancel and retry straggler requests (TailCutLayer) |
+| `--addressing <STYLE>` | S3 bucket addressing: auto (as configured), virtual (bucket.host) or path (host/bucket) |
+| `--checksum <ALGO>` | Checksum computed by the client and verified by the server on writes (S3: crc32c) |
+| `--sse <MODE>` | Server-side encryption of written objects (S3: AES256, aws:kms) |
+
+*Safety*
+
+| argument | description |
+|---|---|
+| `--dry-run` | Print the plan (requests, bytes, objects written/deleted, cost, ETA) and exit |
+| `--read-only` | Refuse every write and delete (exit 5); implied by --existing |
+| `--max-cost-usd <USD>` | Stop when the estimated request cost exceeds this (USD; exit 4) |
+| `--max-requests <N>` | Stop after this many backend requests (exit 4) |
+| `--max-bytes <SIZE>` | Stop after transferring this many bytes, e.g. 10GiB (exit 4) |
+| `--max-duration <DURATION>` | Stop after this much wall time, e.g. 5m (exit 4) |
+| `--idempotency-key <KEY>` | Name the run prefix after KEY: a retried command reuses and cleans it up |
+| `--repeat <N>` | Identical runs to measure (N − 1 A/A pairs) · default `4` |
+| `--from <RUNREF>` | Calibrate the workload of a stored run instead (RUNREF; its spec is replayed) |
+| `--no-save` | Do not save the calibration runs in the run store |
 
 ## `oprobe lab`
 
@@ -816,10 +1149,12 @@ Aliases: serve-s3
 oprobe lab [OPTIONS]
 ```
 
+Output formats (`-o`): text, json, ndjson
+
 | argument | description |
 |---|---|
 | `--bind <BIND>` | · default `127.0.0.1:9000` |
-| `--scenario <SCENARIO>` | Start from a fault preset: clean, demo, throttle, stragglers, lossy, flaky (the flags below override it) |
+| `--scenario <SCENARIO>` | Start from a fault preset: clean, demo, throttle, stragglers, lossy, flaky, parquet (the flags below override it) |
 | `--error-every <ERROR_EVERY>` | Answer every Nth request with 500 InternalError |
 | `--reset-every <RESET_EVERY>` | Drop the connection on every Nth request |
 | `--tls` | Serve HTTPS (certificate for localhost / 127.0.0.1) |
@@ -843,6 +1178,8 @@ MCP server for agents (stdio, or --http ADDR)
 oprobe mcp [OPTIONS]
 ```
 
+Output formats (`-o`): text, json, ndjson
+
 | argument | description |
 |---|---|
 | `--http <ADDR>` | Serve MCP over Streamable HTTP on this address (e.g. 127.0.0.1:8765) instead of stdio |
@@ -863,6 +1200,8 @@ Print the JSON Schema of a machine output (report, events, …)
 oprobe schema [OPTIONS] [NAME]
 ```
 
+Output formats (`-o`): text, json, ndjson
+
 | argument | description |
 |---|---|
 | `<NAME>` | Schema name (`report`, `events`, `run`, …); omit to list the names |
@@ -874,6 +1213,8 @@ Describe what this oprobe can do (machine-readable)
 ```text
 oprobe capabilities [OPTIONS]
 ```
+
+Output formats (`-o`): text, json, ndjson
 
 ## `oprobe config`
 
@@ -891,6 +1232,8 @@ Effective settings and where each comes from
 oprobe config show [OPTIONS]
 ```
 
+Output formats (`-o`): text, json, ndjson
+
 ## `oprobe config path`
 
 Paths of the config file and data directory
@@ -898,6 +1241,8 @@ Paths of the config file and data directory
 ```text
 oprobe config path [OPTIONS]
 ```
+
+Output formats (`-o`): text, json, ndjson
 
 ## `oprobe config edit`
 
@@ -907,6 +1252,8 @@ Open the config file in $VISUAL / $EDITOR (validated when the editor exits)
 oprobe config edit [OPTIONS]
 ```
 
+Output formats (`-o`): text, json, ndjson
+
 ## `oprobe cleanup`
 
 Remove test data left behind by interrupted runs
@@ -914,6 +1261,8 @@ Remove test data left behind by interrupted runs
 ```text
 oprobe cleanup [OPTIONS] [TARGET]
 ```
+
+Output formats (`-o`): text, json, ndjson
 
 *Target*
 
@@ -930,8 +1279,9 @@ oprobe cleanup [OPTIONS] [TARGET]
 | `--proxy <PROXY>` | Egress proxy URL, or `none` to ignore HTTPS_PROXY/HTTP_PROXY |
 | `--older-than <OLDER_THAN>` | Only remove run prefixes older than this · default `1h` |
 | `--datasets` | Also remove persisted datasets (oprobe-dataset/) |
-| `--dry-run` | Show what would be deleted |
+| `--dry-run` | Show what would be deleted (the default without --yes) |
 | `--read-only` | Refuse to delete anything (implies --dry-run) |
+| `-y, --yes` | Delete what was found (without it, cleanup only lists it) |
 
 ## `oprobe self-update`
 
@@ -940,6 +1290,8 @@ Check, download, verify and install the latest release
 ```text
 oprobe self-update [OPTIONS]
 ```
+
+Output formats (`-o`): text, json, ndjson
 
 | argument | description |
 |---|---|
@@ -956,6 +1308,8 @@ Aliases: tui
 ```text
 oprobe top [OPTIONS] [TARGET]
 ```
+
+Output formats (`-o`): text
 
 | argument | description |
 |---|---|
@@ -981,6 +1335,8 @@ Aliases: app
 oprobe gui [OPTIONS] [TARGET]
 ```
 
+Output formats (`-o`): text
+
 | argument | description |
 |---|---|
 | `<TARGET>` | Storage URL, e.g. s3://bucket/prefix, memory:// |
@@ -1003,6 +1359,8 @@ Generate shell completions
 oprobe completions [OPTIONS] <SHELL>
 ```
 
+Output formats (`-o`): text
+
 | argument | description |
 |---|---|
 | `<SHELL>` | · one of `bash`, `elvish`, `fish`, `powershell`, `zsh` |
@@ -1014,6 +1372,8 @@ Generate the man page
 ```text
 oprobe man [OPTIONS]
 ```
+
+Output formats (`-o`): text
 
 | argument | description |
 |---|---|

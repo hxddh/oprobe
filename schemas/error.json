@@ -38,6 +38,7 @@
         "usage.invalid_argument",
         "usage.unknown_target",
         "usage.unknown_run",
+        "usage.unknown_baseline",
         "config.invalid",
         "config.unknown_option",
         "auth.no_credentials",
@@ -46,6 +47,8 @@
         "net.dns",
         "net.tls",
         "net.timeout",
+        "net.rate_limited",
+        "net.http",
         "storage.not_found",
         "storage.throttled",
         "storage.unsupported",
@@ -67,7 +70,7 @@
       "type": "string"
     }
   },
-  "$id": "https://github.com/hxddh/oprobe/schemas/3/error.json",
+  "$id": "https://github.com/hxddh/oprobe/schemas/4/error.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "The error document of json/ndjson modes",
   "properties": {

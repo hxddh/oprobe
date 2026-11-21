@@ -4,6 +4,182 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## v4.0.0 — 2026-11-21
+
+oprobe 4: *one model, one spec, one loop* ([docs/design/v4.md](docs/design/v4.md)). Nothing reads 3.x run files
+or reports.
+
+### Foundation (breaking)
+
+- **Run spec**: every report carries `spec` (`oprobe.report/4`; run files are `oprobe.run/4`) — the resolved
+  profile with secrets redacted, the target as given, the seed, `--existing` and the label. `oprobe run --from
+  RUNREF [--set key=value]… [flags]` replays a stored run (credentials are resolved again from the target);
+  `--set` changes any knob, workload, SLA or cost setting (`oprobe run … --set seed=7` works without
+  `--from` too). `config::defaults()` is the single source of built-in defaults.
+- **Findings' verifications** are `{ description, overrides, command, rerun, replay, expect }`: `command` is
+  `oprobe verify RUN CODE`, `rerun` is `oprobe run --from RUN --set …`, `replay` is a self-contained
+  `oprobe run TARGET …` that keeps every setting of the run (warmup, seed, mix, dataset, endpoint, region, HTTP
+  version, tail-cut, rate, `--existing`, `--max-ops`) and changes only the advice. The 3.x `command: Option`
+  is gone.
+- **Capacity model**: `report.capacity` estimates the in-flight ceiling from the request rows (the levels at
+  which throttling starts, bracketed `lo`/`hi`), the per-operation request shape (a parquet scan peaks at 4
+  requests in flight, not its 6.3 requests per op), `safe_concurrency(headroom)` and `predict(concurrency)`.
+  Ceilings are remembered per target and workload in `<data>/capacity.toml`.
+- **Target identity**: `--allow-target` on the MCP server compares normalised identities (scheme and bucket
+  case, default ports, `.`/`..`/`//`, trailing `/`, query) on whole path segments; `..` above a root and
+  `existing` prefixes that leave the allowed target are refused (fixes the `fs://…/allowed/../other` bypass).
+- **Typed input**: one parser per input kind (`src/input.rs`) behind clap, the profile and config loaders and
+  MCP, with "did you mean" hints. Bad input is never `internal` any more, and the CLI and MCP give the same
+  code; the message-matching classifier is gone. Provider aliases (`aws`, `gcp`, `google`, `azure`, `r2`, `b2`,
+  `oss`, `aliyun`) are accepted. Missing credentials are `auth.no_credentials`. New code
+  `usage.unknown_baseline`. `--object-size 0`, `--endpoint ftp://…`, a missing `--config` file, negative
+  durations and amounts and `target add` of an existing name (now needs `--replace`) are refused; `top -o json`
+  and `gui` without the feature exit 2 with a JSON error.
+- **Envelope**: every JSON command result carries `next` (`{ title, cli, mcp: { tool, arguments } }`) and
+  `warnings` (including the command's stderr warnings). Doctor's `next_command`, explain's `next_commands`,
+  the demo's `next_commands` and MCP `get_run`'s prose `next` moved onto it. Schemas are under
+  `…/schemas/4/`; new schemas: `run-spec`, `overrides`, `capacity`, `capacity-history`, `verification`,
+  `recommendation`, `next-step`, `target-id`, `defaults`.
+- **Lab**: new `lab://parquet` scenario (503 above 24 in flight, no stragglers) for the parquet preset.
+
+### Analysis: one capacity model behind every recommendation
+
+- Every finding that mentions concurrency (`throttling`, `server_latency`, `small_objects`, `client_queue`)
+  and `simulate::concurrency` ask the capacity model. Following a suggestion never pushes past the measured
+  ceiling, and runs under the ceiling reuse the remembered one. The 3.x ping-pong is gone: on a parquet lab
+  the findings used to say 16 → 3 → 6 → 12, and on small files "try 44" after a clean run at 22. Each
+  verification's `expect` holds the predicted goodput with its interval and the throttle budget.
+- **Throttling is defined once**: `summary.throttled_request_ratio` (throttled responses / requests, used by
+  the SLA) and `summary.throttled_op_ratio`. `throttle_ratio` is gone, and `sla.max_throttle_ratio` is now
+  `max_throttled_request_ratio`.
+- **Throughput counts successful operations** (`summary.ops_per_s`; `attempted_ops_per_s` counts all).
+- **Invalid runs** (no ops, errors above the SLA, a window shorter than the warmup) and **interrupted runs**
+  keep only correctness findings plus `run_invalid` / `run_partial`. `report.run.partial` records why, the
+  warning is in `report.warnings`, and partial or invalid runs are refused as baselines.
+- **Tail-cut**:
+  - The simulator uses the layer's own rule (p95 × 1.5, at least 50 ms, 32 samples). A run with tail-cut on
+    is never told to try it.
+  - OpenDAL 0.59's tail-cut layer is blind for its first 10 s. Runs show how long it was blind, and the
+    suggestion lengthens short runs.
+- **Error advice per class**: credential advice only for authentication failures. Retry-exhausted 429/503
+  failures fold into throttling.
+- **Tail attribution** ignores the kernel RTT when it tracks server delay (loopback, correlated with TTFB).
+  The straggler API is chosen stably.
+- **Units**: integer `_count` fields everywhere; fractions renamed `_mean`. One percentile estimator.
+- **Readable evidence**: the HTML, Markdown and text evidence uses human labels, units and percentages.
+  Every bill that includes storage says "(assumed 1 TiB stored — set --stored-gib)".
+
+### Tune, verify, fix, compare
+
+- **`oprobe verify RUN [CODE|--all] [--repeat N]`** replays the run interleaved (A B A B…) with each
+  finding's change. It compares the sides and answers `confirmed`, `refuted` or `inconclusive` per
+  expectation, with numbers. Outcomes calibrate the capacity history (`capacity::calibrate`).
+- **`oprobe fix TARGET`** runs diagnose → tune → verify. It returns a `Recommendation` (knobs, profile
+  TOML, Rust snippet, deltas, `confirmed`) and a profile patch (`--write-profile`).
+- **Tune**:
+  - **Objective and budget**: optimises **goodput** by default (`p99`, `cost` and `balanced` also exist)
+    within a throttle budget (`--max-throttle-ratio`, default 0.1 % of requests). Throttling within the
+    budget no longer stops the ceiling search.
+  - **Search**: bisection repeats trials at the boundary (`--boundary-repeats`). The margin
+    (`--headroom-ratio`, default 15 %) is counted in requests in flight and re-checked after io and range
+    steps.
+  - **Reporting**: an infeasible baseline is reported as such, and deltas are taken against the best
+    feasible trial. There is no more "−61 % vs baseline" headline. The cost of the margin and the Pareto
+    front are shown.
+  - **Recommendation**: in the tune JSON and in MCP `start_tune`. The emitted profile has no environment
+    defaults such as `proxy`.
+- **Compare**:
+  - **Identity**: a verdict needs the same target identity and workload; otherwise `comparable: false`
+    with the reasons (exit 2 under `--strict`).
+  - **Statistics**: one run per side uses a block bootstrap over time windows, labelled low confidence.
+    Several runs use a Welch interval over per-run values.
+  - **Noise floor**: `<data>/noise.toml`, filled by `oprobe baseline calibrate` and verify's A/A pairs.
+  - **Count floors**: 0 → 1 throttled response no longer fails the gate.
+  - **Gate checks**: `{ id, unit, baseline, candidate, delta_ratio, limit_ratio, verdict }`.
+  - **Text output**: compare sizes its columns to their content and summarises long values.
+
+### CLI and agents
+
+- **Next steps everywhere**: every command result has `next` steps with both a CLI command and an MCP call.
+  MCP `start_run` and `plan_run` take `from` and `set`.
+- **New MCP tools**: `discover_targets`, `sample_objects` (read-only), `verify_finding`, `recommend_config`.
+  New CLI commands: `oprobe target discover` (credential sources by name only) and `oprobe target sample`.
+  `oprobe` with no command and no terminal prints the discovery.
+- **Formats per command**: `-o` outside a command's formats is refused before it runs, and `capabilities`
+  lists them. `completions` and `man` are text only.
+- **Schema rules**: the unit and enum rules are checked on every schema.
+- **MCP server**: `lab://` targets are allowed on a read-only server. Unknown tool arguments are refused with
+  a hint. `get_run` turns `done` atomically with its last event, and progress never overshoots.
+- **Safer defaults**:
+  - `doctor` is read-only (`--write-probe` opts in) and names what it sees, with an object sample.
+  - `cleanup` is a dry run unless `--yes`.
+  - Doctor failures show a summarised cause (raw output with `-v`).
+- **Better errors**:
+  - Backend-config errors name `--option KEY=VALUE` and `[targets.NAME.options]`.
+  - New codes `net.rate_limited` and `net.http` for non-storage APIs.
+  - A warmup at least as long as the duration warns.
+
+### App (GUI and terminal)
+
+- **Add Target**: discovery of credential sources, a read-only connection test, and save to the config.
+- **Re-run and Verify** are built from the run's spec, so nothing is dropped. Verify opens Compare with a
+  confirmed/refuted/inconclusive banner.
+- **One set of defaults** with the CLI (tune, demo, cost).
+- **Run list**:
+  - The list is live: it watches the runs directory and refreshes on focus.
+  - Partial runs get a badge; a budget stop is not a failure.
+  - "Stopped during warmup" replaces 0 ops/s.
+  - Search, "show more" and a truthful run count.
+- **Compare**: defaults to the same target and workload. Selectors never wrap, and a non-comparable pair says
+  why.
+- **Commands**: one context-aware command list drives the menu bar and the ⌘K palette (Verify, Open Run,
+  Switch Target, Add Target, Fix, Export…).
+- **Keyboard**: letter shortcuts never fire in text fields, sheets focus their first field, Enter submits,
+  Esc cancels, and the terminal shows a focus band.
+- **Accessibility**: every button has an accessible label, and charts carry a text summary and a data table.
+- **Overview**: a THROTTLED tile, and the cost tile labels assumed storage.
+- **Layout**: works at 120×30 and in narrow windows (tiles wrap, Cost becomes one column, numbers never
+  wrap).
+- **Live views**:
+  - live series append instead of rebuilding;
+  - chart paths are cached;
+  - the crosshair has its own layer;
+  - live phases (preparing, warmup, measuring, cleanup) are shown;
+  - the tune result offers Run, Verify, Save profile and Rust snippet.
+
+### Onboarding and distribution
+
+- **The demo is the lab**: `oprobe demo` runs exactly `oprobe run lab://demo`. Every lab scenario has a
+  default workload, applied when no flag says otherwise: `lab://demo` is small-files (64 objects of 64 KiB),
+  32 workers, 0.5 s warmup, 8 s; `lab://parquet` is the parquet preset with 8 workers. The demo used to
+  measure `s3://demo/bench`, so `compare` flagged a different target, dataset and mix against
+  `run lab://demo`; now both have the same target identity and `workload_hash`.
+- **Demo next steps are replays**: `oprobe run --from RUN`, `oprobe compare RUN last`, `oprobe verify RUN
+  CODE` and `oprobe run --from RUN s3://YOUR-BUCKET/…`, with MCP calls in the envelope's `next`.
+- **Installers**: `install.sh` and `install.ps1` resolve the latest version from the release's `latest.json`,
+  then the `releases/latest` redirect, then the API, so GitHub's anonymous API rate limit no longer breaks an
+  install. `OPROBE_VERSION` still pins a version; `OPROBE_RELEASE_BASE` points them at a mirror. `install.sh`
+  offers to add the install directory to the zsh, bash or fish rc file (asking on `/dev/tty` when piped;
+  `OPROBE_MODIFY_PATH=1|0` decides without asking). `install.ps1` updates the user `PATH` and the current
+  session's `$env:Path`, uses `-UseBasicParsing` and a silent progress bar, and detects ARM64 Windows from the
+  OS (it used to install the x64 build under emulation).
+- **`self-update`** reads `latest.json` before the API (`release_source: latest_json | api` in its output)
+  and verifies against the SHA-256 listed there. A GitHub 403 or 429 is `net.unreachable` (retryable), never
+  `storage.throttled`; an unknown `--to` tag is `usage.invalid_argument`.
+- **Package managers are published**: on each stable release, the workflow updates the Homebrew tap
+  `hxddh/homebrew-tap` (`brew install hxddh/tap/oprobe`, `brew install --cask hxddh/tap/oprobe-app`), the
+  Scoop bucket `hxddh/scoop-bucket` and opens a winget-pkgs pull request, each when its secret (`TAP_TOKEN`,
+  `SCOOP_TOKEN`, `WINGET_TOKEN`) exists and skipped with a warning otherwise. The formula and the cask have
+  distinct names (`oprobe`, `oprobe-app`; the cask asset is now `oprobe-app.rb`). The Scoop manifest's
+  `checkver` reads `latest.json` and its `autoupdate` takes hashes from `SHA256SUMS`. The docs say that
+  `winget install hxddh.oprobe` works only once the package is accepted.
+- **GitHub Action** (`uses: hxddh/oprobe@v4`): `version` defaults to `latest-major`, the newest release of
+  the action's major version (`latest` and exact versions still work). The pull-request comment step has
+  `continue-on-error` (fork PRs get a read-only token), a named baseline is saved to the cache only when it
+  is replaced, and `args` / `compare-args` are split with shell quoting but never evaluated.
+- **CI** runs both installers against a local fake release (`scripts/test-install.sh`,
+  `scripts/test-install.ps1`), shellchecks the scripts strictly and checks the generated manifests.
+
 ## v3.0.0 — 2026-11-20
 
 oprobe 3 turns a benchmark into a product: **see every request your object-storage client makes, know where

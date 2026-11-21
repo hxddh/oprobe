@@ -11,6 +11,8 @@ fn main() -> ExitCode {
     }
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
+        // The same deep stacks as the main thread (see build.rs): tasks render schemas and reports.
+        .thread_stack_size(8 * 1024 * 1024)
         .build()
     {
         Ok(rt) => rt,

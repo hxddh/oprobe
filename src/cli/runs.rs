@@ -25,6 +25,30 @@ pub struct RunsList {
 }
 
 impl CommandOutput for RunsList {
+    fn next(&self) -> Vec<crate::output::NextStep> {
+        match self.runs.first() {
+            Some(r) => vec![
+                crate::cli::next::explain(&r.id),
+                crate::cli::next::show(&r.id),
+            ],
+            None => vec![
+                crate::output::NextStep::new(
+                    "measure a local lab target",
+                    "oprobe run lab://demo -d 5s",
+                )
+                .with_mcp(
+                    "start_run",
+                    serde_json::json!({ "target": "lab://demo", "duration": "5s" }),
+                ),
+                crate::cli::next::discover(),
+            ],
+        }
+    }
+
+    fn formats() -> &'static [crate::output::OutputFormat] {
+        crate::output::WITH_MD
+    }
+
     fn text(&self) -> String {
         if self.runs.is_empty() {
             return format!(
@@ -173,6 +197,14 @@ pub struct RunReportOnly {
 }
 
 impl CommandOutput for RunShow {
+    fn next(&self) -> Vec<crate::output::NextStep> {
+        crate::cli::next::after_run(&self.run.report)
+    }
+
+    fn formats() -> &'static [crate::output::OutputFormat] {
+        crate::output::WITH_MD_HTML
+    }
+
     fn text(&self) -> String {
         match &self.full {
             Some(run) => terminal::render_run_with(run, self.detail),
@@ -218,6 +250,10 @@ pub struct OpenedRun {
 }
 
 impl CommandOutput for OpenedRun {
+    fn next(&self) -> Vec<crate::output::NextStep> {
+        vec![crate::cli::next::list_runs()]
+    }
+
     fn text(&self) -> String {
         format!("{} opening {} in the app\n", green("●"), self.path)
     }
@@ -308,6 +344,10 @@ pub struct RemovedRuns {
 }
 
 impl CommandOutput for RemovedRuns {
+    fn next(&self) -> Vec<crate::output::NextStep> {
+        vec![crate::cli::next::list_runs()]
+    }
+
     fn text(&self) -> String {
         if self.removed.is_empty() {
             return "nothing to remove\n".into();
@@ -368,6 +408,10 @@ pub fn cmd_gc(a: RunsGcArgs, ctx: &Ctx) -> Result<u8> {
 }
 
 impl CommandOutput for DiffReport {
+    fn formats() -> &'static [crate::output::OutputFormat] {
+        crate::output::WITH_MD_HTML
+    }
+
     fn text(&self) -> String {
         self.render_terminal()
     }
@@ -378,11 +422,7 @@ impl CommandOutput for DiffReport {
         Some(crate::report::html::render_compare(self))
     }
     fn exit_code(&self) -> u8 {
-        if self.passed {
-            0
-        } else {
-            crate::errors::exit::GATE
-        }
+        DiffReport::exit_code(self)
     }
 }
 #[cfg(test)]

@@ -34,7 +34,7 @@ use hyper_util::server::conn::auto::Builder as AutoServerBuilder;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
-use crate::config::{Profile, TargetSpec};
+use crate::config::{DatasetSpec, Preset, Profile, TargetSpec};
 use crate::net::tls::build_tls_acceptor;
 
 struct LabTls {
@@ -139,16 +139,20 @@ pub enum Scenario {
     Lossy,
     /// 4% `500 InternalError` and 2% connection resets.
     Flaky,
+    /// The demo's limit without stragglers, for the parquet preset (HEAD, footer, then 4
+    /// parallel column reads): 503 above 24 in flight, so 6 parquet workers fit and 8 throttle.
+    Parquet,
 }
 
 impl Scenario {
-    pub const ALL: [Scenario; 6] = [
+    pub const ALL: [Scenario; 7] = [
         Scenario::Clean,
         Scenario::Demo,
         Scenario::Throttle,
         Scenario::Stragglers,
         Scenario::Lossy,
         Scenario::Flaky,
+        Scenario::Parquet,
     ];
 
     pub fn name(self) -> &'static str {
@@ -159,6 +163,7 @@ impl Scenario {
             Scenario::Stragglers => "stragglers",
             Scenario::Lossy => "lossy",
             Scenario::Flaky => "flaky",
+            Scenario::Parquet => "parquet",
         }
     }
 
@@ -166,29 +171,23 @@ impl Scenario {
         match self {
             Scenario::Clean => "no faults: S3 semantics only",
             Scenario::Demo => {
-                "8 ms latency, 503 SlowDown above 24 concurrent requests, 2.5% stragglers (+250 ms)"
+                "8 ms latency, 503 SlowDown above 24 concurrent requests, 2.5% stragglers (+250 ms); \
+                 default workload: small-files, 64 × 64 KiB, 32 workers, 0.5 s warmup, 8 s"
             }
             Scenario::Throttle => "5 ms latency, 503 SlowDown above 8 concurrent requests",
             Scenario::Stragglers => "5 ms latency, 3% of requests wait 400 ms",
             Scenario::Lossy => "20 ms latency, responses capped at 4 MiB/s per stream",
             Scenario::Flaky => "5 ms latency, 4% 500 InternalError, 2% connection resets",
+            Scenario::Parquet => {
+                "8 ms latency, 503 SlowDown above 24 concurrent requests, no stragglers; \
+                 default workload: the parquet preset, 8 workers"
+            }
         }
     }
 
+    /// Typed: see [`crate::input::lab_scenario`].
     pub fn parse(s: &str) -> Result<Self> {
-        let s = s.trim().to_ascii_lowercase();
-        if s.is_empty() {
-            return Ok(Scenario::Clean);
-        }
-        Scenario::ALL
-            .into_iter()
-            .find(|x| x.name() == s)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "unknown lab scenario `{s}` (choose: {})",
-                    Scenario::ALL.map(|x| x.name()).join(", ")
-                )
-            })
+        Ok(crate::input::lab_scenario(s)?)
     }
 
     /// The server configuration of this scenario (plain HTTP/1.1 + h2c, S3 part-size rules).
@@ -203,9 +202,9 @@ impl Scenario {
             Scenario::Clean => base,
             Scenario::Demo => LabConfig {
                 base_ttfb_delay: ms(8),
-                max_inflight_before_503: Some(24),
-                straggler_every_n: 40,
-                straggler_delay: ms(250),
+                max_inflight_before_503: Some(DEMO_THROTTLE_ABOVE),
+                straggler_every_n: DEMO_STRAGGLER_EVERY,
+                straggler_delay: ms(DEMO_STRAGGLER_MS),
                 ..base
             },
             Scenario::Throttle => LabConfig {
@@ -230,7 +229,90 @@ impl Scenario {
                 reset_every_n: Some(50),
                 ..base
             },
+            Scenario::Parquet => LabConfig {
+                base_ttfb_delay: ms(8),
+                max_inflight_before_503: Some(24),
+                ..base
+            },
         }
+    }
+}
+
+/// Requests in flight above which `lab://demo` answers `503 SlowDown`.
+pub const DEMO_THROTTLE_ABOVE: usize = 24;
+/// Workers of the `lab://demo` default workload (more than the lab accepts at once).
+pub const DEMO_CONCURRENCY: usize = 32;
+/// Every Nth request of `lab://demo` is a straggler.
+pub const DEMO_STRAGGLER_EVERY: usize = 40;
+/// Extra delay of a `lab://demo` straggler.
+pub const DEMO_STRAGGLER_MS: u64 = 250;
+/// Workers of the `lab://parquet` default workload (4 requests in flight per op: 6 fit, 8 throttle).
+pub const PARQUET_CONCURRENCY: usize = 8;
+
+/// The workload a `lab://NAME` target runs when no flag says otherwise (design v4 §10): what
+/// `oprobe demo` runs is exactly `oprobe run lab://demo`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ScenarioDefaults {
+    pub preset: Option<Preset>,
+    pub dataset: Option<DatasetSpec>,
+    pub warmup: Option<Duration>,
+    pub duration: Option<Duration>,
+    pub concurrency: Option<usize>,
+}
+
+impl Scenario {
+    /// This scenario's default workload (empty: the profile defaults).
+    pub fn defaults(self) -> ScenarioDefaults {
+        match self {
+            Scenario::Demo => ScenarioDefaults {
+                preset: Some(Preset::SmallFiles),
+                dataset: Some(DatasetSpec {
+                    objects: 64,
+                    object_size: crate::util::ByteSize::kib(64),
+                    ..DatasetSpec::default()
+                }),
+                warmup: Some(Duration::from_millis(500)),
+                duration: Some(crate::config::defaults().demo_duration.get()),
+                concurrency: Some(DEMO_CONCURRENCY),
+            },
+            Scenario::Parquet => ScenarioDefaults {
+                preset: Some(Preset::Parquet),
+                concurrency: Some(PARQUET_CONCURRENCY),
+                ..Default::default()
+            },
+            _ => ScenarioDefaults::default(),
+        }
+    }
+
+    /// Set this scenario's default workload on `p` (flags applied afterwards win).
+    pub fn apply_defaults(self, p: &mut Profile) {
+        let d = self.defaults();
+        let w = &mut p.workload;
+        if let Some(pr) = d.preset {
+            w.preset = pr;
+            w.mix.clear();
+            w.dataset = None;
+        }
+        if let Some(ds) = d.dataset {
+            w.dataset = Some(ds);
+        }
+        if let Some(v) = d.warmup {
+            w.warmup = crate::util::HumanDuration(v);
+        }
+        if let Some(v) = d.duration {
+            w.duration = crate::util::HumanDuration(v);
+        }
+        if let Some(c) = d.concurrency {
+            p.knobs.concurrency = c;
+        }
+    }
+
+    /// The scenario a `lab://NAME[/root]` URL names (`None`: not a lab URL, or unknown).
+    pub fn of_url(url: &str) -> Option<Scenario> {
+        let lower = url.trim().to_ascii_lowercase();
+        let rest = lower.strip_prefix("lab://")?;
+        let name = rest.split(['/', '?', '#']).next().unwrap_or_default();
+        crate::input::lab_scenario(name).ok()
     }
 }
 

@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
+use crate::input::clap as parse;
 use crate::net::HttpVersion;
 pub use crate::output::OutputFormat;
 
@@ -27,21 +28,8 @@ Examples:
 
 Docs: https://github.com/hxddh/oprobe/tree/main/docs";
 
-/// Defaults of `oprobe tune`, shared with the app's Tune page so both run the same search.
-pub mod tune_defaults {
-    /// Measurement window per trial.
-    pub const TRIAL_DURATION: &str = "5s";
-    /// Warmup per trial.
-    pub const TRIAL_WARMUP: &str = "1s";
-    /// Maximum number of trials.
-    pub const MAX_TRIALS: usize = 24;
-    /// Fewest trials a search can run (a baseline and one candidate).
-    pub const MIN_TRIALS: usize = 2;
-    /// Highest concurrency to try.
-    pub const MAX_CONCURRENCY: usize = 256;
-    /// Pause after a throttled trial.
-    pub const COOLDOWN: &str = "5s";
-}
+/// Defaults of `oprobe tune` (defined with every other default in [`crate::config`]).
+pub use crate::config::tune_defaults;
 
 /// A whole number that must be at least `MIN` (rejected with a clear error, never clamped).
 fn at_least<const MIN: usize>(v: &str) -> Result<usize, String> {
@@ -125,6 +113,11 @@ pub enum Command {
     Tune(TuneArgs),
     /// Regression gate: compare two runs (RUNREFs or files) and fail on regressions
     Compare(CompareArgs),
+    /// Test a finding's advice: replay the run with and without the change (A B A B…) and
+    /// answer confirmed, refuted or inconclusive
+    Verify(VerifyArgs),
+    /// Diagnose a target, tune it and verify the recommendation; prints a profile patch
+    Fix(FixArgs),
     /// Saved runs: list, show, open, export, rm, gc
     #[command(subcommand)]
     Runs(RunsCommand),
@@ -132,7 +125,7 @@ pub enum Command {
     Analyze(AnalyzeArgs),
     /// Narrate a run's causes and advice, or document a finding code
     Explain(ExplainArgs),
-    /// Named targets: add, list, show, rm, test
+    /// Named targets: add, list, show, rm, test, discover (credential sources), sample
     #[command(subcommand)]
     Target(TargetCommand),
     /// Check endpoint reachability, TLS, clock skew, credentials and permissions
@@ -215,7 +208,7 @@ pub struct RunsListArgs {
 #[derive(Args, Debug)]
 pub struct RunsShowArgs {
     /// Run id, id prefix, `last`, `last~N`, label, or path to a .oprobe / report .json file
-    #[arg(value_name = "RUNREF", default_value = "last")]
+    #[arg(value_name = "RUNREF", default_value = "last", value_parser = parse::run_ref)]
     pub run: String,
     /// Every column, per-stage and per-verb breakdowns, the timeline and the 5 slowest operations
     #[arg(long)]
@@ -281,7 +274,7 @@ pub struct RunsGcArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum TargetCommand {
-    /// Add (or replace) a named target
+    /// Add a named target (`--replace` overwrites one of the same name)
     Add(TargetAddArgs),
     /// List configured targets
     List,
@@ -291,6 +284,23 @@ pub enum TargetCommand {
     Rm(TargetNameArg),
     /// Check a target (doctor: reachability, TLS, clock, credentials, permissions)
     Test(TargetTestArgs),
+    /// Credential sources on this machine (AWS profiles and environment, GCP ADC, Azure
+    /// environment), by name only, with the targets they can reach
+    Discover,
+    /// What a target holds (read-only): prefixes, object counts, size distribution, examples
+    Sample(TargetSampleArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct TargetSampleArgs {
+    #[command(flatten)]
+    pub target: TargetArgs,
+    /// List under this prefix (relative to the target root)
+    #[arg(long, value_name = "PREFIX")]
+    pub prefix: Option<String>,
+    /// List at most N objects
+    #[arg(long, value_name = "N", default_value_t = crate::cli::sample::DEFAULT_LIMIT, value_parser = at_least::<1>)]
+    pub limit: usize,
 }
 
 #[derive(Args, Debug)]
@@ -298,29 +308,36 @@ pub struct TargetAddArgs {
     /// Name, e.g. prod
     pub name: String,
     /// Storage URL, e.g. s3://bucket/prefix
+    #[arg(value_parser = parse::storage_url)]
     pub url: String,
     #[arg(long)]
     pub region: Option<String>,
-    #[arg(long)]
+    #[arg(long, value_parser = parse::endpoint)]
     pub endpoint: Option<String>,
     /// env | profile:NAME | anonymous
     #[arg(long)]
     pub credentials: Option<String>,
     /// OpenDAL option, repeatable (KEY=VALUE)
-    #[arg(long = "option", value_name = "KEY=VALUE")]
+    #[arg(long = "option", value_name = "KEY=VALUE", value_parser = parse::key_value)]
     pub options: Vec<String>,
     /// Save without the quick read-only check
     #[arg(long)]
     pub no_test: bool,
+    /// Replace a target of the same name (otherwise an existing name is refused)
+    #[arg(long)]
+    pub replace: bool,
 }
 
 #[derive(Args, Debug)]
 pub struct TargetTestArgs {
     /// Target name (or a storage URL)
     pub name: String,
-    /// Only check reachability and listing; never write
-    #[arg(long)]
+    /// Only check reachability and listing; never write (the default)
+    #[arg(long, conflicts_with = "write_probe")]
     pub read_only: bool,
+    /// Also write, read back and delete a probe object
+    #[arg(long)]
+    pub write_probe: bool,
 }
 
 #[derive(Args, Debug)]
@@ -328,6 +345,8 @@ pub struct TargetNameArg {
     pub name: String,
 }
 
+// Parsed once per process.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand, Debug)]
 pub enum BaselineCommand {
     /// Create or update a named baseline
@@ -338,6 +357,85 @@ pub enum BaselineCommand {
     Rm(BaselineNameArg),
     /// Show a baseline's runs and their spread
     Show(BaselineNameArg),
+    /// Learn the target's noise floor from repeated identical runs (<data>/noise.toml)
+    Calibrate(CalibrateArgs),
+}
+
+/// `oprobe verify RUNREF [CODE|--all] [--repeat N]`.
+#[derive(Args, Debug)]
+pub struct VerifyArgs {
+    /// The run whose findings to test (RUNREF: id, prefix, last, last~N, label)
+    #[arg(value_name = "RUNREF", value_parser = parse::run_ref)]
+    pub run: String,
+    /// The finding code to verify (default: every finding with a verification)
+    #[arg(value_name = "CODE", conflicts_with = "all")]
+    pub code: Option<String>,
+    /// Verify every finding that has a verification
+    #[arg(long)]
+    pub all: bool,
+    /// Baseline / candidate pairs to run (interleaved A B A B…)
+    #[arg(long, value_name = "N", default_value_t = 3, value_parser = at_least::<1>)]
+    pub repeat: usize,
+    /// Do not store the outcomes or calibrate the capacity history and noise floor
+    #[arg(long)]
+    pub no_calibrate: bool,
+    #[command(flatten)]
+    pub safety: SafetyArgs,
+    /// Do not save the replayed runs in the run store
+    #[arg(long)]
+    pub no_save: bool,
+}
+
+/// `oprobe fix TARGET`: diagnose → tune → verify.
+#[derive(Args, Debug)]
+pub struct FixArgs {
+    #[command(flatten)]
+    pub target: TargetArgs,
+    #[command(flatten)]
+    pub workload: WorkloadArgs,
+    #[command(flatten)]
+    pub knobs: KnobArgs,
+    #[command(flatten)]
+    pub cost: CostArgs,
+    #[command(flatten)]
+    pub sla: SlaArgs,
+    #[command(flatten)]
+    pub output: OutputArgs,
+    #[command(flatten)]
+    pub safety: SafetyArgs,
+    #[command(flatten)]
+    pub search: TuneSearchArgs,
+    /// Baseline / candidate pairs of the verification
+    #[arg(long, value_name = "N", default_value_t = 2, value_parser = at_least::<1>, help_heading = "Verification")]
+    pub repeat: usize,
+    /// Write the recommended profile (TOML) to this file
+    #[arg(long, value_name = "FILE", help_heading = "Verification")]
+    pub write_profile: Option<PathBuf>,
+    /// Total wall-time budget of the tuning step, e.g. 5m (caps the trials so the estimate fits)
+    #[arg(long, value_name = "DURATION", value_parser = parse::positive_duration, help_heading = "Tuning")]
+    pub budget: Option<String>,
+}
+
+/// `oprobe baseline calibrate TARGET`.
+#[derive(Args, Debug)]
+pub struct CalibrateArgs {
+    #[command(flatten)]
+    pub target: TargetArgs,
+    #[command(flatten)]
+    pub workload: WorkloadArgs,
+    #[command(flatten)]
+    pub knobs: KnobArgs,
+    #[command(flatten)]
+    pub safety: SafetyArgs,
+    /// Identical runs to measure (N − 1 A/A pairs)
+    #[arg(long, value_name = "N", default_value_t = 4, value_parser = at_least::<2>)]
+    pub repeat: usize,
+    /// Calibrate the workload of a stored run instead (RUNREF; its spec is replayed)
+    #[arg(long, value_name = "RUNREF", value_parser = parse::run_ref)]
+    pub from: Option<String>,
+    /// Do not save the calibration runs in the run store
+    #[arg(long)]
+    pub no_save: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -361,16 +459,16 @@ pub struct SafetyArgs {
     #[arg(long)]
     pub read_only: bool,
     /// Stop when the estimated request cost exceeds this (USD; exit 4)
-    #[arg(long, value_name = "USD")]
+    #[arg(long, value_name = "USD", value_parser = parse::non_negative, allow_hyphen_values = true)]
     pub max_cost_usd: Option<f64>,
     /// Stop after this many backend requests (exit 4)
     #[arg(long, value_name = "N")]
     pub max_requests: Option<u64>,
     /// Stop after transferring this many bytes, e.g. 10GiB (exit 4)
-    #[arg(long, value_name = "SIZE")]
+    #[arg(long, value_name = "SIZE", value_parser = parse::size, allow_hyphen_values = true)]
     pub max_bytes: Option<String>,
     /// Stop after this much wall time, e.g. 5m (exit 4)
-    #[arg(long, value_name = "DURATION")]
+    #[arg(long, value_name = "DURATION", value_parser = parse::duration, allow_hyphen_values = true)]
     pub max_duration: Option<String>,
     /// Name the run prefix after KEY: a retried command reuses and cleans it up
     #[arg(long, value_name = "KEY")]
@@ -389,13 +487,13 @@ pub struct TargetArgs {
     #[arg(short, long, value_name = "FILE")]
     pub profile: Option<PathBuf>,
     /// Custom endpoint (MinIO, R2, Ceph, private clouds)
-    #[arg(long)]
+    #[arg(long, value_parser = parse::endpoint)]
     pub endpoint: Option<String>,
     /// Region of the bucket (e.g. us-east-1); most S3-compatible services accept any value
     #[arg(long)]
     pub region: Option<String>,
     /// Extra backend option, repeatable (e.g. --option enable_virtual_host_style=true)
-    #[arg(long = "option", value_name = "KEY=VALUE")]
+    #[arg(long = "option", value_name = "KEY=VALUE", value_parser = parse::key_value)]
     pub options: Vec<String>,
     /// Access a public bucket without credentials (s3, gcs, azblob, oss: unsigned requests)
     #[arg(long)]
@@ -416,19 +514,19 @@ pub struct TargetArgs {
 #[command(next_help_heading = "Workload")]
 pub struct WorkloadArgs {
     /// Workload preset: parquet, checkpoint, small-files, metadata, mixed
-    #[arg(long)]
+    #[arg(long, value_parser = parse::preset)]
     pub preset: Option<String>,
     /// Measurement window (e.g. 30s, 2m)
-    #[arg(short, long)]
+    #[arg(short, long, value_parser = parse::duration, allow_hyphen_values = true)]
     pub duration: Option<String>,
     /// Warmup before measuring (connections, caches)
-    #[arg(long)]
+    #[arg(long, value_parser = parse::duration, allow_hyphen_values = true)]
     pub warmup: Option<String>,
     /// Stop after N measured operations
     #[arg(long)]
     pub max_ops: Option<u64>,
     /// Open-loop arrival rate (ops/s); latency is measured from the intended start time
-    #[arg(long)]
+    #[arg(long, value_parser = parse::positive, allow_hyphen_values = true)]
     pub rate: Option<f64>,
     /// Benchmark existing objects under this prefix (read-only)
     #[arg(long, value_name = "PREFIX")]
@@ -437,10 +535,10 @@ pub struct WorkloadArgs {
     #[arg(long)]
     pub objects: Option<usize>,
     /// Size of each generated object (e.g. 16MiB)
-    #[arg(long)]
+    #[arg(long, value_parser = parse::nonzero_size, allow_hyphen_values = true)]
     pub object_size: Option<String>,
     /// Key popularity: uniform, zipf:1.1, hotset:0.2/0.8
-    #[arg(long)]
+    #[arg(long, value_parser = parse::access)]
     pub access: Option<String>,
     /// Keep the generated dataset for later runs (oprobe-dataset/<fingerprint>/)
     #[arg(long)]
@@ -464,10 +562,10 @@ pub struct KnobArgs {
     #[arg(long, value_parser = at_least::<1>)]
     pub io_concurrency: Option<usize>,
     /// Reader/writer chunk and multipart part size (e.g. 8MiB)
-    #[arg(long)]
+    #[arg(long, value_parser = parse::size, allow_hyphen_values = true)]
     pub chunk_size: Option<String>,
     /// Merge vectored ranges closer than this (e.g. 64KiB)
-    #[arg(long)]
+    #[arg(long, value_parser = parse::size, allow_hyphen_values = true)]
     pub range_gap: Option<String>,
     /// Cap in-flight HTTP requests (0 = unlimited)
     #[arg(long)]
@@ -484,7 +582,7 @@ pub struct KnobArgs {
     #[arg(long)]
     pub microscope: bool,
     /// Enable the in-memory read cache with this size (e.g. 512MiB)
-    #[arg(long, value_name = "SIZE")]
+    #[arg(long, value_name = "SIZE", value_parser = parse::nonzero_size)]
     pub cache: Option<String>,
     /// Retry attempts for temporary errors
     #[arg(long)]
@@ -493,7 +591,7 @@ pub struct KnobArgs {
     #[arg(long)]
     pub tail_cut: bool,
     /// S3 bucket addressing: auto (as configured), virtual (bucket.host) or path (host/bucket)
-    #[arg(long, value_name = "STYLE")]
+    #[arg(long, value_name = "STYLE", value_parser = parse::addressing)]
     pub addressing: Option<String>,
     /// Checksum computed by the client and verified by the server on writes (S3: crc32c)
     #[arg(long, value_name = "ALGO")]
@@ -525,16 +623,17 @@ impl From<HttpArg> for HttpVersion {
 #[command(next_help_heading = "Cost")]
 pub struct CostArgs {
     /// Pricing preset: aws-s3, gcs, azure-blob, cloudflare-r2, backblaze-b2, aliyun-oss
-    #[arg(long)]
+    /// (aliases: aws, gcp, google, azure, r2, b2, oss, aliyun)
+    #[arg(long, value_parser = parse::provider)]
     pub provider: Option<String>,
     /// Logical operations per month to project costs for
-    #[arg(long)]
+    #[arg(long, value_parser = parse::non_negative, allow_hyphen_values = true)]
     pub monthly_ops: Option<f64>,
     /// Fraction of downloads leaving the cloud (0..1)
-    #[arg(long)]
+    #[arg(long, value_parser = parse::fraction, allow_hyphen_values = true)]
     pub egress_fraction: Option<f64>,
     /// Stored data in GiB
-    #[arg(long)]
+    #[arg(long, value_parser = parse::non_negative, allow_hyphen_values = true)]
     pub stored_gib: Option<f64>,
 }
 
@@ -561,14 +660,14 @@ pub struct SlaArgs {
     #[arg(long, value_enum, value_name = "MODE")]
     pub sla: Option<SlaMode>,
     /// Max share of failed operations, e.g. 1% or 0.01 (default 1%)
-    #[arg(long, value_name = "RATE")]
+    #[arg(long, value_name = "RATE", value_parser = parse::share, allow_hyphen_values = true)]
     pub max_error_rate: Option<String>,
     /// Max share of throttled (429/503) operations, e.g. 0% (default: not checked by `run`;
     /// `tune` rejects any throttling)
-    #[arg(long, value_name = "RATE")]
+    #[arg(long, value_name = "RATE", value_parser = parse::share, allow_hyphen_values = true)]
     pub max_throttle_rate: Option<String>,
     /// Max p99 latency per operation in ms (tune rejects trials above it)
-    #[arg(long, value_name = "MS")]
+    #[arg(long, value_name = "MS", value_parser = parse::positive, allow_hyphen_values = true)]
     pub p99_ms: Option<f64>,
 }
 
@@ -593,7 +692,7 @@ pub struct OutputArgs {
     pub label: Option<String>,
 }
 
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Default)]
 pub struct RunArgs {
     #[command(flatten)]
     pub target: TargetArgs,
@@ -615,13 +714,74 @@ pub struct RunArgs {
     /// Compare against (and add to) a named baseline
     #[arg(long, value_name = "NAME")]
     pub baseline: Option<String>,
+    /// Replay a stored run (RUNREF): its spec, with credentials resolved again from the
+    /// target; other flags and --set override it
+    #[arg(long, value_name = "RUNREF", value_parser = parse::run_ref, conflicts_with = "profile", help_heading = "Replay")]
+    pub from: Option<String>,
+    /// Override one setting, repeatable (e.g. --set concurrency=8 --set warmup=1s); keys:
+    /// the profile's knob, workload, SLA and cost names, `endpoint`, `region`, `label`
+    #[arg(long = "set", value_name = "KEY=VALUE", value_parser = parse::set, help_heading = "Replay")]
+    pub set: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub enum ObjectiveArg {
-    Throughput,
-    Latency,
+    /// Successful ops/s (or MiB/s) within the throttle budget (`throughput` is an alias)
+    #[value(alias = "throughput")]
+    Goodput,
+    /// Lowest worst-case p99 at ≥ 80 % of the best goodput (`latency` is an alias)
+    #[value(alias = "latency")]
+    P99,
+    /// Lowest cost per operation at ≥ 80 % of the best goodput
     Cost,
+    /// Best goodput-to-p99 trade at ≥ 80 % of the best goodput
+    Balanced,
+}
+
+impl ObjectiveArg {
+    pub fn objective(self) -> crate::tune::Objective {
+        use crate::tune::Objective;
+        match self {
+            ObjectiveArg::Goodput => Objective::Throughput,
+            ObjectiveArg::P99 => Objective::Latency,
+            ObjectiveArg::Cost => Objective::Cost,
+            ObjectiveArg::Balanced => Objective::Balanced,
+        }
+    }
+}
+
+/// The tuner's search flags (shared by `tune` and `fix`).
+#[derive(Args, Debug, Clone)]
+#[command(next_help_heading = "Tuning")]
+pub struct TuneSearchArgs {
+    /// What to optimize
+    #[arg(long, value_enum, default_value_t = ObjectiveArg::Goodput)]
+    pub objective: ObjectiveArg,
+    /// Measurement window per trial
+    #[arg(long, default_value = tune_defaults::TRIAL_DURATION, value_parser = parse::positive_duration)]
+    pub trial_duration: String,
+    /// Warmup per trial
+    #[arg(long, default_value = tune_defaults::TRIAL_WARMUP, value_parser = parse::duration)]
+    pub trial_warmup: String,
+    /// Maximum number of trials
+    #[arg(long, default_value_t = tune_defaults::MAX_TRIALS, value_parser = at_least::<{ tune_defaults::MIN_TRIALS }>)]
+    pub max_trials: usize,
+    /// Highest concurrency to try
+    #[arg(long, default_value_t = tune_defaults::MAX_CONCURRENCY, value_parser = at_least::<1>)]
+    pub max_concurrency: usize,
+    /// Pause after a throttled trial
+    #[arg(long, default_value = tune_defaults::COOLDOWN, value_parser = parse::duration)]
+    pub cooldown: String,
+    /// Share of throttled requests a configuration may cause and still be feasible
+    /// (default 0.001, or the profile's `sla.max_throttle_rate`)
+    #[arg(long, value_name = "RATIO", value_parser = parse::fraction)]
+    pub max_throttle_ratio: Option<f64>,
+    /// Runs of each bisection trial near the throttle boundary
+    #[arg(long, default_value_t = tune_defaults::BOUNDARY_REPEATS, value_parser = at_least::<1>)]
+    pub boundary_repeats: usize,
+    /// In-flight headroom kept below the throttling ceiling (default 0.15)
+    #[arg(long, value_name = "RATIO", value_parser = parse::fraction)]
+    pub headroom_ratio: Option<f64>,
 }
 
 #[derive(Args, Debug)]
@@ -640,27 +800,11 @@ pub struct TuneArgs {
     pub output: OutputArgs,
     #[command(flatten)]
     pub safety: SafetyArgs,
-    /// What to optimize
-    #[arg(long, value_enum, default_value_t = ObjectiveArg::Throughput, help_heading = "Tuning")]
-    pub objective: ObjectiveArg,
-    /// Measurement window per trial
-    #[arg(long, default_value = tune_defaults::TRIAL_DURATION, help_heading = "Tuning")]
-    pub trial_duration: String,
-    /// Warmup per trial
-    #[arg(long, default_value = tune_defaults::TRIAL_WARMUP, help_heading = "Tuning")]
-    pub trial_warmup: String,
-    /// Maximum number of trials
-    #[arg(long, default_value_t = tune_defaults::MAX_TRIALS, value_parser = at_least::<{ tune_defaults::MIN_TRIALS }>, help_heading = "Tuning")]
-    pub max_trials: usize,
-    /// Highest concurrency to try
-    #[arg(long, default_value_t = tune_defaults::MAX_CONCURRENCY, value_parser = at_least::<1>, help_heading = "Tuning")]
-    pub max_concurrency: usize,
-    /// Pause after a throttled trial
-    #[arg(long, default_value = tune_defaults::COOLDOWN, help_heading = "Tuning")]
-    pub cooldown: String,
+    #[command(flatten)]
+    pub search: TuneSearchArgs,
     /// Total wall-time budget of the tuner, e.g. 5m: caps the trials so the estimate fits
     /// (add --max-duration for a hard stop)
-    #[arg(long, value_name = "DURATION", help_heading = "Tuning")]
+    #[arg(long, value_name = "DURATION", value_parser = parse::positive_duration, help_heading = "Tuning")]
     pub budget: Option<String>,
     /// Write the tuned profile (TOML)
     #[arg(long, value_name = "FILE", help_heading = "Tuning")]
@@ -720,6 +864,9 @@ pub struct CompareArgs {
     /// Do not fail when the target differs (scheme, bucket/prefix, endpoint, options)
     #[arg(long)]
     pub allow_target_change: bool,
+    /// Runs of different targets or workloads are an error (exit 2) instead of a warning
+    #[arg(long)]
+    pub strict: bool,
     /// Write a Markdown summary (PR comment / job summary)
     #[arg(long, value_name = "FILE")]
     pub markdown: Option<PathBuf>,
@@ -736,13 +883,13 @@ pub struct TopArgs {
     /// Storage URL, e.g. s3://bucket/prefix, memory://
     pub target: Option<String>,
     /// Custom endpoint (MinIO, R2, oprobe lab)
-    #[arg(long)]
+    #[arg(long, value_parser = parse::endpoint)]
     pub endpoint: Option<String>,
     /// Workload preset: parquet | checkpoint | small-files | metadata | mixed
-    #[arg(long)]
+    #[arg(long, value_parser = parse::preset)]
     pub preset: Option<String>,
     /// Measurement window, e.g. 30s
-    #[arg(short, long)]
+    #[arg(short, long, value_parser = parse::duration, allow_hyphen_values = true)]
     pub duration: Option<String>,
     /// Concurrent operations
     #[arg(short, long, value_parser = at_least::<1>)]
@@ -783,9 +930,16 @@ pub struct CompatArgs {
 pub struct DoctorArgs {
     #[command(flatten)]
     pub target: TargetArgs,
-    /// Only check reachability and listing; never write
-    #[arg(long)]
+    /// Only check reachability and listing; never write (the default; kept for scripts)
+    #[arg(long, conflicts_with = "write_probe")]
     pub read_only: bool,
+    /// Also write, read back, stat and delete a 256 KiB probe object under
+    /// `oprobe-run-<time>-doctor/` (the default is read-only)
+    #[arg(long)]
+    pub write_probe: bool,
+    /// Show the raw backend error of failed checks
+    #[arg(short, long)]
+    pub verbose: bool,
 }
 
 #[derive(Args, Debug)]
@@ -799,7 +953,7 @@ pub struct ProbeArgs {
     /// Use GET instead of HEAD for the cold/warm requests
     #[arg(long)]
     pub get: bool,
-    #[arg(long, default_value = "10s")]
+    #[arg(long, default_value = "10s", value_parser = parse::positive_duration)]
     pub timeout: String,
     #[arg(long, value_name = "PEM")]
     pub ca_cert: Option<PathBuf>,
@@ -816,9 +970,9 @@ pub struct ProbeArgs {
 pub struct LabArgs {
     #[arg(long, default_value = "127.0.0.1:9000")]
     pub bind: String,
-    /// Start from a fault preset: clean, demo, throttle, stragglers, lossy, flaky (the flags
-    /// below override it)
-    #[arg(long)]
+    /// Start from a fault preset: clean, demo, throttle, stragglers, lossy, flaky, parquet (the
+    /// flags below override it)
+    #[arg(long, value_parser = parse::lab_scenario)]
     pub scenario: Option<String>,
     /// Answer every Nth request with 500 InternalError
     #[arg(long)]
@@ -833,13 +987,13 @@ pub struct LabArgs {
     #[arg(long)]
     pub h1_only: bool,
     /// Added time-to-first-byte for every request (e.g. 20ms)
-    #[arg(long, default_value = "0ms")]
+    #[arg(long, default_value = "0ms", value_parser = parse::duration, allow_hyphen_values = true)]
     pub latency: String,
     /// Make every Nth request a straggler
     #[arg(long, default_value_t = 0)]
     pub straggler_every: usize,
     /// Extra delay for stragglers
-    #[arg(long, default_value = "200ms")]
+    #[arg(long, default_value = "200ms", value_parser = parse::duration, allow_hyphen_values = true)]
     pub straggler: String,
     /// Return 503 SlowDown when more than N requests are in flight
     #[arg(long)]
@@ -858,7 +1012,7 @@ pub struct LabArgs {
     #[arg(long)]
     pub throttle_early_close: bool,
     /// Delay for CompleteMultipartUpload
-    #[arg(long, default_value = "0ms")]
+    #[arg(long, default_value = "0ms", value_parser = parse::duration, allow_hyphen_values = true)]
     pub complete_delay: String,
     /// Write the lab CA certificate (for --ca-cert) to this file
     #[arg(long, value_name = "FILE")]
@@ -870,17 +1024,20 @@ pub struct CleanupArgs {
     #[command(flatten)]
     pub target: TargetArgs,
     /// Only remove run prefixes older than this
-    #[arg(long, default_value = "1h")]
+    #[arg(long, default_value = "1h", value_parser = parse::duration)]
     pub older_than: String,
     /// Also remove persisted datasets (oprobe-dataset/)
     #[arg(long)]
     pub datasets: bool,
-    /// Show what would be deleted
-    #[arg(long)]
+    /// Show what would be deleted (the default without --yes)
+    #[arg(long, conflicts_with = "yes")]
     pub dry_run: bool,
     /// Refuse to delete anything (implies --dry-run)
-    #[arg(long)]
+    #[arg(long, conflicts_with = "yes")]
     pub read_only: bool,
+    /// Delete what was found (without it, cleanup only lists it)
+    #[arg(long, short = 'y')]
+    pub yes: bool,
 }
 
 #[derive(Args, Debug)]
@@ -936,16 +1093,16 @@ pub struct McpArgs {
     #[arg(long = "allow-target", value_name = "NAME|URL-PREFIX")]
     pub allow_targets: Vec<String>,
     /// Budget applied to every run the server starts: estimated request cost (USD)
-    #[arg(long, value_name = "USD")]
+    #[arg(long, value_name = "USD", value_parser = parse::non_negative, allow_hyphen_values = true)]
     pub max_cost_usd: Option<f64>,
     /// Budget applied to every run: backend requests
     #[arg(long, value_name = "N")]
     pub max_requests: Option<u64>,
     /// Budget applied to every run: bytes transferred (e.g. 1GiB)
-    #[arg(long, value_name = "SIZE")]
+    #[arg(long, value_name = "SIZE", value_parser = parse::size)]
     pub max_bytes: Option<String>,
     /// Budget applied to every run: wall time (e.g. 2m)
-    #[arg(long, value_name = "DURATION")]
+    #[arg(long, value_name = "DURATION", value_parser = parse::duration)]
     pub max_duration: Option<String>,
     /// Runs executing at the same time (others wait)
     #[arg(long, default_value_t = 1, value_parser = at_least::<1>)]
@@ -1061,10 +1218,10 @@ pub struct WatchArgs {
     #[command(flatten)]
     pub safety: SafetyArgs,
     /// Time between probe windows (each window lasts --duration, default 5s)
-    #[arg(long, default_value = "10s", help_heading = "Watch")]
+    #[arg(long, default_value = "10s", value_parser = parse::positive_duration, help_heading = "Watch")]
     pub interval: String,
     /// Rolling window the SLOs are evaluated over
-    #[arg(long, default_value = "5m", help_heading = "Watch")]
+    #[arg(long, default_value = "5m", value_parser = parse::positive_duration, help_heading = "Watch")]
     pub window: String,
     /// Service level objective, repeatable: p99<200ms, p50<50ms, errors<1%, throttle<1%,
     /// availability>99.9%

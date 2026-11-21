@@ -1,5 +1,51 @@
 {
   "$defs": {
+    "McpCall": {
+      "description": "An MCP tool call: the tool and its arguments.",
+      "properties": {
+        "arguments": {
+          "additionalProperties": true,
+          "type": "object"
+        },
+        "tool": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "arguments"
+      ],
+      "type": "object"
+    },
+    "NextStep": {
+      "description": "A suggested next step: what it does, the CLI command, and the MCP call doing the same.",
+      "properties": {
+        "cli": {
+          "description": "The command line (`oprobe …`).",
+          "type": "string"
+        },
+        "mcp": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/McpCall"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The same step as an MCP tool call, when a tool does it."
+        },
+        "title": {
+          "description": "What the step does, in a few words.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "title",
+        "cli"
+      ],
+      "type": "object"
+    },
     "SweepEntry": {
       "properties": {
         "age_s": {
@@ -31,7 +77,7 @@
       "type": "object"
     }
   },
-  "$id": "https://github.com/hxddh/oprobe/schemas/3/cleanup.json",
+  "$id": "https://github.com/hxddh/oprobe/schemas/4/cleanup.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "Result of `oprobe cleanup`",
   "properties": {
@@ -44,18 +90,34 @@
       },
       "type": "array"
     },
+    "next": {
+      "description": "Suggested next steps.",
+      "items": {
+        "$ref": "#/$defs/NextStep"
+      },
+      "type": "array"
+    },
     "older_than": {
       "type": "string"
     },
     "target": {
       "type": "string"
+    },
+    "warnings": {
+      "description": "Warnings of the command (also printed on stderr in text mode).",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
     }
   },
   "required": [
     "target",
     "dry_run",
     "older_than",
-    "entries"
+    "entries",
+    "next",
+    "warnings"
   ],
   "title": "oprobe cleanup",
   "type": "object",

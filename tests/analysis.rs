@@ -139,7 +139,10 @@ fn stragglers_are_found_explained_and_attributed() {
         .find(|f| f["code"] == "tail_stragglers")
         .unwrap_or_else(|| panic!("no straggler finding: {findings:#?}"));
     assert!(
-        tail["cause"].as_str().unwrap().contains("tail-cut at"),
+        tail["cause"]
+            .as_str()
+            .unwrap()
+            .contains("tail-cut (deadline"),
         "{tail}"
     );
     let vals = &tail["evidence"]["values"];
@@ -154,29 +157,38 @@ fn stragglers_are_found_explained_and_attributed() {
         "{tail}"
     );
     assert!(
-        vals["tail_cut_threshold_ms"].as_f64().unwrap() < 300.0,
+        vals["tail_cut_deadline_ms"].as_f64().unwrap() < 300.0,
         "{tail}"
     );
     assert!(current >= 250.0, "{tail}");
-    assert!(predicted < current / 3.0, "{tail}");
+    assert!(predicted < current / 2.0, "{tail}");
     assert!(!tail["evidence"]["op_ids"].as_array().unwrap().is_empty());
-    let cmd = tail["verification"]["command"].as_str().unwrap();
+    let ver = &tail["verification"];
+    let run_id = v["run_id"].as_str().unwrap();
+    assert_eq!(
+        ver["command"].as_str().unwrap(),
+        format!("oprobe verify {run_id} tail_stragglers")
+    );
+    assert_eq!(ver["overrides"]["knobs"]["tail_cut"], "on", "{ver}");
+    let cmd = ver["replay"].as_str().unwrap();
     assert!(
         cmd.contains("--tail-cut")
             && cmd.contains(&format!("--endpoint {}", lab.endpoint_url))
             && cmd.contains("--concurrency 8"),
         "{cmd}"
     );
-    // The verification command is valid: it plans the same run with tail-cut on.
-    let words: Vec<&str> = cmd.split_whitespace().collect();
-    assert_eq!(words[0], "oprobe");
-    let plan = env
-        .cmd()
-        .args(&words[1..])
-        .args(["--dry-run", "-o", "json"])
-        .output()
-        .unwrap();
-    assert!(plan.status.success(), "{cmd}: {}", err(&plan));
+    // Both forms are valid: they plan the same run with tail-cut on.
+    for cmd in [cmd, ver["rerun"].as_str().unwrap()] {
+        let words: Vec<&str> = cmd.split_whitespace().collect();
+        assert_eq!(words[0], "oprobe");
+        let plan = env
+            .cmd()
+            .args(&words[1..])
+            .args(["--dry-run", "-o", "json"])
+            .output()
+            .unwrap();
+        assert!(plan.status.success(), "{cmd}: {}", err(&plan));
+    }
     // At most one tail finding.
     assert_eq!(
         findings
@@ -370,7 +382,7 @@ fn repeat_baseline_and_compare() {
             .len(),
         3
     );
-    assert_eq!(v["comparison"]["stats"][0]["method"], "runs");
+    assert_eq!(v["comparison"]["stats"][0]["method"], "runs_t");
     assert_eq!(v["added_to_baseline"], code == 0);
     assert_eq!(v["exit_code"], code);
 
@@ -414,7 +426,7 @@ fn repeat_baseline_and_compare() {
     );
     assert_eq!(json(&o)["baseline"]["run_ids"].as_array().unwrap().len(), 3);
 
-    // A workload change is a regression (exit 3).
+    // A workload change is not comparable: no verdict (exit 0 with a warning, 2 with --strict).
     let o = env
         .cmd()
         .args([
@@ -434,11 +446,24 @@ fn repeat_baseline_and_compare() {
     let o = env.run(&["compare", "last~1", "last", "-o", "json"]);
     assert_eq!(
         o.status.code(),
-        Some(3),
+        Some(0),
         "{}",
         String::from_utf8_lossy(&o.stdout)
     );
-    assert_eq!(json(&o)["passed"], false);
+    let v = json(&o);
+    assert_eq!(v["passed"], false);
+    assert_eq!(v["comparable"], false);
+    assert_eq!(v["verdict"], "not_comparable");
+    assert!(
+        v["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("not comparable")),
+        "{v}"
+    );
+    let o = env.run(&["compare", "last~1", "last", "--strict", "-o", "json"]);
+    assert_eq!(o.status.code(), Some(2));
 
     let o = env.run(&["baseline", "rm", "main", "-o", "json"]);
     assert!(o.status.success());

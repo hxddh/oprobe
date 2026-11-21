@@ -30,11 +30,14 @@ use crate::util::{fmt_ms, parse_duration};
 pub struct Slo {
     /// As given, e.g. `p99<200ms`.
     pub spec: String,
-    /// `p50_ms`, `p90_ms`, `p99_ms`, `error_ratio`, `throttle_ratio`, `availability_ratio`.
+    /// `p50_ms`, `p90_ms`, `p99_ms`, `error_ratio`, `throttled_request_ratio`, `availability_ratio`.
     pub metric: String,
     /// The value must stay below (`true`) or above (`false`) the limit.
     pub below: bool,
+    /// In `unit`.
     pub limit: f64,
+    /// Unit of `limit` and of the measured values: `ms` or `ratio`.
+    pub unit: String,
 }
 
 impl Slo {
@@ -71,7 +74,7 @@ impl Slo {
                 (format!("{k}_ms"), ms)
             }
             "errors" | "error" | "error_rate" => ("error_ratio".into(), pct(v)?),
-            "throttle" | "throttling" | "throttled" => ("throttle_ratio".into(), pct(v)?),
+            "throttle" | "throttling" | "throttled" => ("throttled_request_ratio".into(), pct(v)?),
             "availability" => ("availability_ratio".into(), pct(v)?),
             _ => {
                 return Err(format!(
@@ -81,6 +84,12 @@ impl Slo {
         };
         Ok(Self {
             spec: t.to_owned(),
+            unit: if metric.ends_with("_ms") {
+                "ms"
+            } else {
+                "ratio"
+            }
+            .into(),
             metric,
             below,
             limit,
@@ -115,7 +124,7 @@ pub struct Rolling {
     pub p90_ms: f64,
     pub p99_ms: f64,
     pub error_ratio: f64,
-    pub throttle_ratio: f64,
+    pub throttled_request_ratio: f64,
     pub availability_ratio: f64,
 }
 
@@ -137,7 +146,7 @@ impl Rolling {
             p90_ms: quantile_us_ms(&mut lat, 0.9),
             p99_ms: quantile_us_ms(&mut lat, 0.99),
             error_ratio: err,
-            throttle_ratio: thr as f64 / reqs.max(1) as f64,
+            throttled_request_ratio: thr as f64 / reqs.max(1) as f64,
             availability_ratio: if ops == 0 { 0.0 } else { 1.0 - err },
         }
     }
@@ -147,7 +156,7 @@ impl Rolling {
             "p90_ms" => self.p90_ms,
             "p99_ms" => self.p99_ms,
             "error_ratio" => self.error_ratio,
-            "throttle_ratio" => self.throttle_ratio,
+            "throttled_request_ratio" | "throttle_ratio" => self.throttled_request_ratio,
             _ => self.availability_ratio,
         }
     }
@@ -161,14 +170,20 @@ pub struct Transition {
     pub slo: String,
     /// `breached` or `recovered`.
     pub state: String,
+    /// In `unit`.
     pub value: f64,
+    /// `ms` or `ratio`.
+    pub unit: String,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 pub struct SloState {
     pub slo: Slo,
     pub ok: bool,
+    /// In `unit`.
     pub value: f64,
+    /// `ms` or `ratio`.
+    pub unit: String,
     /// Probe windows that ended with the SLO breached.
     pub breached_windows_count: u64,
 }
@@ -186,6 +201,13 @@ pub struct WatchOutput {
 }
 
 impl CommandOutput for WatchOutput {
+    fn next(&self) -> Vec<crate::output::NextStep> {
+        vec![
+            crate::cli::next::doctor(&self.target),
+            crate::cli::next::list_runs(),
+        ]
+    }
+
     fn text(&self) -> String {
         let r = &self.rolling;
         let mut o = format!(
@@ -196,7 +218,7 @@ impl CommandOutput for WatchOutput {
             fmt_ms(r.p50_ms),
             fmt_ms(r.p99_ms),
             r.error_ratio * 100.0,
-            r.throttle_ratio * 100.0
+            r.throttled_request_ratio * 100.0
         );
         for s in &self.slos {
             o += &format!(
@@ -377,6 +399,7 @@ pub async fn cmd_watch(a: WatchArgs, ctx: &Ctx) -> Result<u8> {
             warnings: Vec::new(),
             started_at,
             ended_at: SystemTime::now(),
+            spec: None,
         });
         count += 1;
         let r = &run.report;
@@ -425,7 +448,11 @@ pub async fn cmd_watch(a: WatchArgs, ctx: &Ctx) -> Result<u8> {
             g.gauge("window_p50_seconds", vec![], rolling.p50_ms / 1000.0);
             g.gauge("window_p99_seconds", vec![], rolling.p99_ms / 1000.0);
             g.gauge("window_error_ratio", vec![], rolling.error_ratio);
-            g.gauge("window_throttle_ratio", vec![], rolling.throttle_ratio);
+            g.gauge(
+                "window_throttled_request_ratio",
+                vec![],
+                rolling.throttled_request_ratio,
+            );
             for (i, s) in slos.iter().enumerate() {
                 let v = rolling.get(&s.metric);
                 let now = s.ok(v);
@@ -454,6 +481,7 @@ pub async fn cmd_watch(a: WatchArgs, ctx: &Ctx) -> Result<u8> {
                         slo: s.spec.clone(),
                         state: state.into(),
                         value: v,
+                        unit: s.unit.clone(),
                     });
                 }
             }
@@ -493,6 +521,7 @@ pub async fn cmd_watch(a: WatchArgs, ctx: &Ctx) -> Result<u8> {
                 slo: s.clone(),
                 ok: ok[i],
                 value: rolling.get(&s.metric),
+                unit: s.unit.clone(),
                 breached_windows_count: breached_windows[i],
             })
             .collect(),

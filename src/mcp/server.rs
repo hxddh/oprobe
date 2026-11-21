@@ -21,11 +21,14 @@ use super::tools::{self, CallCx, ProgressSink, State};
 
 /// Instructions sent to clients on `initialize`.
 const INSTRUCTIONS: &str = "oprobe measures object storage (S3, GCS, Azure Blob, …) and traces \
-every request. Safe workflow: list_targets → doctor → plan_run → start_run (budgets; returns a \
-run id, poll get_run) → explain_run → analyze_run → compare_runs. The server is read-only unless \
-started with --allow-write (memory:// and `existing` runs are always allowed); its budgets cap \
-every run. Errors carry a stable code (e.g. safety.read_only, safety.budget_exceeded) and a hint. \
-Read oprobe://docs/getting-started and oprobe://docs/findings.";
+every request. Workflow \"why is my bucket slow, and what should I change\": discover_targets \
+(credential sources by name) → doctor (read-only; includes a sample of the objects) → \
+sample_objects (pick an `existing` prefix) → plan_run → start_run (budgets; returns a run id, \
+poll get_run) → explain_run → verify_finding / recommend_config → start_run with `from` and \
+`set` → compare_runs. Every result has `next` steps with the MCP call to make. The server is \
+read-only unless started with --allow-write (memory://, lab:// and `existing` runs are always \
+allowed); its budgets cap every run. Errors carry a stable code (e.g. safety.read_only, \
+safety.budget_exceeded) and a hint. Read oprobe://docs/getting-started and oprobe://docs/findings.";
 
 /// The protocol versions this server speaks.
 pub fn protocol_versions() -> Vec<String> {

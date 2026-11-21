@@ -201,7 +201,14 @@ fn verdict_section(r: &Report) -> String {
     o += &tile(
         "Throughput",
         &format!("{:.1} ops/s", sm.ops_per_s),
-        &format!("{} operations", sm.ops),
+        &if sm.failed_ops > 0 {
+            format!(
+                "successful · {:.1} attempted/s · {} operations",
+                sm.attempted_ops_per_s, sm.ops
+            )
+        } else {
+            format!("{} operations", sm.ops)
+        },
     );
     o += &tile(
         "Data rate",
@@ -223,18 +230,29 @@ fn verdict_section(r: &Report) -> String {
         &format!("{:.2}% of operations", sm.error_rate * 100.0),
     );
     o += &tile(
-        "Throttled responses",
-        &r.resilience.throttled_responses.to_string(),
-        &format!("{} retries", r.resilience.retries),
+        "Throttled requests",
+        &format!("{:.2}%", sm.throttled_request_ratio * 100.0),
+        &format!(
+            "{} responses · {:.2}% of operations · {} retries",
+            r.resilience.throttled_responses,
+            sm.throttled_op_ratio * 100.0,
+            r.resilience.retries
+        ),
     );
     if r.cost.applicable {
+        let label = crate::analysis::cost::storage_label(&r.cost);
         o += &tile(
             "Projected cost",
             &format!("{} /month", fmt_usd(r.cost.selected.total_usd)),
             &format!(
-                "{} per 1M ops · {}",
+                "{} per 1M ops · {}{}",
                 fmt_usd(r.cost.selected.per_million_ops_usd),
-                r.cost.selected.provider
+                r.cost.selected.provider,
+                if label.is_empty() {
+                    label
+                } else {
+                    format!(" {label}")
+                }
             ),
         );
     } else {
@@ -260,9 +278,17 @@ fn verdict_section(r: &Report) -> String {
         },
         r.verdict.exit_code
     );
-    if r.run.interrupted {
-        o += "<p><span class=\"pill st-attention\">▲ partial</span> The run was stopped early: \
-              results cover a shorter window than configured.</p>";
+    if r.is_partial() {
+        let reason = r
+            .run
+            .partial
+            .as_ref()
+            .map_or("interrupted", |p| p.reason.as_str());
+        let _ = write!(
+            o,
+            "<p><span class=\"pill st-attention\">▲ partial · {reason}</span> The run was stopped early: \
+             results cover a shorter window than configured.</p>"
+        );
     }
     if r.run.sampled {
         let _ = write!(
@@ -309,8 +335,15 @@ fn findings_section(r: &Report, run: &Run) -> String {
         }
         if !f.evidence.values.is_empty() {
             o += "<dl class=\"kv\">";
-            for (k, v) in &f.evidence.values {
-                let _ = write!(o, "<dt>{}</dt><dd>{}</dd>", esc(k), fmt_num(*v));
+            for ((label, value), key) in f.evidence.labelled().iter().zip(f.evidence.values.keys())
+            {
+                let _ = write!(
+                    o,
+                    "<dt title=\"{}\">{}</dt><dd>{}</dd>",
+                    esc(key),
+                    esc(label),
+                    esc(value)
+                );
             }
             o += "</dl>";
         }
@@ -347,25 +380,13 @@ fn findings_section(r: &Report, run: &Run) -> String {
         let _ = write!(o, "<p class=\"advice\">→ {}</p>", esc(&f.advice));
         if let Some(v) = &f.verification {
             let _ = write!(o, "<p class=\"verify\">Verify: {}", esc(&v.description));
-            if let Some(c) = &v.command {
-                let _ = write!(o, " <code>{}</code>", esc(c));
-            }
+            let _ = write!(o, " <code>{}</code>", esc(&v.rerun));
             o += "</p>";
         }
         o += "</article>";
     }
     o += "</section>\n";
     o
-}
-
-fn fmt_num(v: f64) -> String {
-    if v.fract() == 0.0 && v.abs() < 1e15 {
-        format!("{v:.0}")
-    } else if v.abs() >= 100.0 {
-        format!("{v:.1}")
-    } else {
-        format!("{v:.3}")
-    }
 }
 
 /// Stage names, CSS colors and descriptions in the fixed categorical order.
@@ -1527,11 +1548,15 @@ fn cost_section(r: &Report) -> String {
     let _ = write!(
         o,
         "<p class=\"sub\">{} at {} operations per month, {:.0}% of downloads leaving the cloud, \
-         {:.0} GiB stored · prices as of {}.</p><div class=\"tiles\">",
+         {:.0} GiB stored{} · prices as of {}.</p><div class=\"tiles\">",
         esc(&s.provider),
         trim_num(c.monthly_ops),
         c.egress_fraction * 100.0,
         c.stored_gb,
+        match crate::analysis::cost::storage_label(c) {
+            l if l.is_empty() => l,
+            l => format!(" <strong>{}</strong>", esc(&l)),
+        },
         esc(&c.pricing_as_of)
     );
     o += &tile(
@@ -1541,7 +1566,15 @@ fn cost_section(r: &Report) -> String {
     );
     o += &tile("Requests", &fmt_usd(s.requests_usd), "per month");
     o += &tile("Egress", &fmt_usd(s.egress_usd), "per month");
-    o += &tile("Storage", &fmt_usd(s.storage_usd), "per month");
+    o += &tile(
+        "Storage",
+        &fmt_usd(s.storage_usd),
+        &if c.storage_assumed {
+            format!("per month · assumed {:.0} GiB", c.stored_gb)
+        } else {
+            format!("per month · {:.0} GiB", c.stored_gb)
+        },
+    );
     o += &tile("Total", &fmt_usd(s.total_usd), "per month");
     o += "</div>";
     if s.failed_requests_usd + s.overread_usd + s.cache_savings_usd > 0.0 {
@@ -1808,11 +1841,12 @@ fn environment_section(r: &Report) -> String {
 
 /// The regression gate (`oprobe compare -o html`) as a self-contained page.
 pub fn render_compare(d: &DiffReport) -> String {
+    use super::diff::GateVerdict;
     let mut b = String::new();
-    let (cls, icon, label) = if d.passed {
-        ("st-ok", "✓", "PASSED")
-    } else {
-        ("st-critical", "✖", "FAILED")
+    let (cls, icon, label) = match d.verdict {
+        GateVerdict::Passed => ("st-ok", "✓", "PASSED"),
+        GateVerdict::Regression => ("st-critical", "✖", "FAILED"),
+        GateVerdict::NotComparable => ("st-attention", "▲", "NOT COMPARABLE"),
     };
     let _ = write!(
         b,
@@ -1822,14 +1856,22 @@ pub fn render_compare(d: &DiffReport) -> String {
         esc(&d.baseline),
         esc(&d.candidate)
     );
-    let fails = d.checks.iter().filter(|c| c.status == Status::Fail).count();
+    let fails = d
+        .checks
+        .iter()
+        .filter(|c| c.verdict == Status::Fail)
+        .count();
     let _ = write!(
         b,
         "<section id=\"verdict\"><div class=\"verdict\"><span class=\"pill {cls}\">{icon} {label}</span><p class=\"headline\">{}</p></div>",
-        if d.passed {
-            "No check exceeded its limit.".to_owned()
-        } else {
-            format!("{fails} check(s) exceeded their limit (exit code 3).")
+        match d.verdict {
+            GateVerdict::Passed => "No check exceeded its limit.".to_owned(),
+            GateVerdict::Regression =>
+                format!("{fails} check(s) exceeded their limit (exit code 3)."),
+            GateVerdict::NotComparable => esc(&format!(
+                "No regression verdict: {}.",
+                d.identity.reasons.join("; ")
+            )),
         }
     );
     for w in &d.warnings {
@@ -1848,15 +1890,15 @@ pub fn render_compare(d: &DiffReport) -> String {
                 "<tr><td>{}</td><td class=\"l\"><code>{}</code></td><td class=\"l\">{}</td><td class=\"l\">{}</td></tr>",
                 c.kind.label(),
                 esc(&c.field),
-                esc(&c.baseline),
-                esc(&c.candidate)
+                esc(&super::diff::summarize(&c.baseline, 80)),
+                esc(&super::diff::summarize(&c.candidate, 80))
             );
         }
         b += "</tbody></table></div></section>";
     }
     b += "<section><h2>Checks</h2><div class=\"tablewrap\"><table><thead><tr><th>check</th><th>baseline</th><th>candidate</th><th>change</th><th class=\"l\">limit</th><th class=\"l\">result</th></tr></thead><tbody>";
     for c in &d.checks {
-        let (cls, txt) = match c.status {
+        let (cls, txt) = match c.verdict {
             Status::Pass => ("st-ok", "✓ pass"),
             Status::Improved => ("st-review", "▲ improved"),
             Status::Fail => ("st-critical", "✖ fail"),
@@ -1864,12 +1906,12 @@ pub fn render_compare(d: &DiffReport) -> String {
         };
         let _ = write!(
             b,
-            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{:+.1}%</td><td class=\"l\">{}</td><td class=\"l\"><span class=\"pill {cls}\">{txt}</span>{}</td></tr>",
-            esc(&c.name),
-            fmt_num(c.baseline),
-            fmt_num(c.candidate),
-            c.change_pct,
-            esc(&c.limit),
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td class=\"l\">{}</td><td class=\"l\"><span class=\"pill {cls}\">{txt}</span>{}</td></tr>",
+            esc(&c.label()),
+            esc(&c.fmt_value(c.baseline)),
+            esc(&c.fmt_value(c.candidate)),
+            esc(&c.fmt_delta()),
+            esc(&c.fmt_limit()),
             if c.note.is_empty() {
                 String::new()
             } else {
@@ -1975,23 +2017,29 @@ mod tests {
 
     #[test]
     fn compare_page_shows_the_gate() {
-        let d = DiffReport {
+        let mut d = DiffReport {
+            verdict: super::super::diff::GateVerdict::Passed,
             passed: false,
+            comparable: true,
             baseline: "a".into(),
             candidate: "<b>".into(),
             thresholds: Default::default(),
+            identity: Default::default(),
             config_changes: vec![],
             checks: vec![super::super::diff::Check {
-                name: "p99 read".into(),
+                id: "latency_p99.read".into(),
+                unit: "ms".into(),
                 baseline: 10.0,
                 candidate: 20.0,
-                change_pct: 100.0,
-                limit: "+20%".into(),
-                status: Status::Fail,
+                delta_ratio: Some(1.0),
+                limit_ratio: Some(0.2),
+                abs_limit: None,
+                verdict: Status::Fail,
                 note: String::new(),
             }],
             warnings: vec![],
         };
+        d.settle();
         let h = render_compare(&d);
         assert!(h.contains("FAILED") && h.contains("&lt;b&gt;") && h.contains("+100.0%"));
     }

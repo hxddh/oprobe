@@ -4,7 +4,7 @@ use std::fmt;
 use std::str::FromStr;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::Result;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// A byte quantity that (de)serializes as a human string (`"4MiB"`, `"512KiB"`, `"1GB"`) or a number.
@@ -31,34 +31,9 @@ impl ByteSize {
 
 impl FromStr for ByteSize {
     type Err = anyhow::Error;
+    /// Typed: see [`crate::input::size`].
     fn from_str(raw: &str) -> Result<Self> {
-        let s = raw.trim();
-        if s.is_empty() {
-            bail!("empty size");
-        }
-        let split = s
-            .find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '_'))
-            .unwrap_or(s.len());
-        let (num, unit) = s.split_at(split);
-        let num: f64 = num.replace('_', "").parse().with_context(|| {
-            format!("invalid size `{raw}` (examples: 4MiB, 512KiB, 1GB, 65536)")
-        })?;
-        let mult: f64 = match unit.trim().to_ascii_lowercase().as_str() {
-            "" | "b" => 1.0,
-            "k" | "kb" => 1e3,
-            "ki" | "kib" => 1024.0,
-            "m" | "mb" => 1e6,
-            "mi" | "mib" => 1024.0 * 1024.0,
-            "g" | "gb" => 1e9,
-            "gi" | "gib" => 1024.0 * 1024.0 * 1024.0,
-            "t" | "tb" => 1e12,
-            "ti" | "tib" => 1024.0_f64.powi(4),
-            other => bail!("unknown size unit `{other}` in `{raw}`"),
-        };
-        if num < 0.0 {
-            bail!("size must be non-negative");
-        }
-        Ok(Self((num * mult).round() as u64))
+        Ok(crate::input::size(raw)?)
     }
 }
 
@@ -77,6 +52,18 @@ impl fmt::Display for ByteSize {
             }
         }
         write!(f, "{v}B")
+    }
+}
+
+impl schemars::JsonSchema for ByteSize {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "ByteSize".into()
+    }
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "type": "string",
+            "description": "A byte size: `4MiB`, `512KiB`, `1GB` (a plain number of bytes is accepted on input)."
+        })
     }
 }
 
@@ -136,6 +123,18 @@ impl fmt::Display for HumanDuration {
     }
 }
 
+impl schemars::JsonSchema for HumanDuration {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "HumanDuration".into()
+    }
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "type": "string",
+            "description": "A duration: `10s`, `500ms`, `2m` (plain seconds are accepted on input)."
+        })
+    }
+}
+
 impl Serialize for HumanDuration {
     fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
         s.serialize_str(&self.to_string())
@@ -158,33 +157,10 @@ impl<'de> Deserialize<'de> for HumanDuration {
     }
 }
 
-/// Parse `"10s"`, `"500ms"`, `"1.5m"`, `"1h"`, `"250us"` or plain seconds (`"5"`).
+/// Parse `"10s"`, `"500ms"`, `"1.5m"`, `"1h"`, `"250us"` or plain seconds (`"5"`); typed errors
+/// from [`crate::input::duration`].
 pub fn parse_duration(raw: &str) -> Result<Duration> {
-    let s = raw.trim().to_ascii_lowercase();
-    if s.is_empty() {
-        bail!("duration cannot be empty");
-    }
-    let (num, mult) = if let Some(v) = s.strip_suffix("ms") {
-        (v, 1e-3)
-    } else if let Some(v) = s.strip_suffix("us").or_else(|| s.strip_suffix("µs")) {
-        (v, 1e-6)
-    } else if let Some(v) = s.strip_suffix('h') {
-        (v, 3600.0)
-    } else if let Some(v) = s.strip_suffix('m') {
-        (v, 60.0)
-    } else if let Some(v) = s.strip_suffix('s') {
-        (v, 1.0)
-    } else {
-        (s.as_str(), 1.0)
-    };
-    let val: f64 = num
-        .trim()
-        .parse()
-        .with_context(|| format!("invalid duration `{raw}` (examples: 10s, 500ms, 2m)"))?;
-    if val.is_nan() || val < 0.0 || !val.is_finite() {
-        bail!("duration must be a non-negative number");
-    }
-    Ok(Duration::from_secs_f64(val * mult))
+    Ok(crate::input::duration(raw)?)
 }
 
 /// Format bytes in binary units with one decimal (`"12.5 MiB"`).

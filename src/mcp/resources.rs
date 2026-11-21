@@ -41,8 +41,8 @@ pub const TEMPLATES: &[Template] = &[
     Template {
         uri_template: "oprobe://runs/{id}/html",
         name: "run-document",
-        description: "Human-readable report of a run (Markdown until the HTML renderer lands)",
-        mime_type: "text/markdown",
+        description: "Human-readable report of a run (self-contained HTML)",
+        mime_type: "text/html",
     },
     Template {
         uri_template: "oprobe://schema/{name}",
@@ -290,19 +290,28 @@ oprobe measures object storage (S3, GCS, Azure Blob, …) through Apache OpenDAL
 request: queue, DNS/TCP/TLS, send, time-to-first-byte, transfer. Every run is stored and can be
 explained, attributed and compared.
 
-## Safe workflow
+## Safe workflow: why is my bucket slow, and what should I change?
 
-1. `list_targets` — configured targets, what this server allows, its budgets.
-2. `doctor {target}` — reachability, TLS, clock, credentials, permissions.
-3. `plan_run {target, …}` — dry run: requests, bytes, objects written, cost, ETA; `allowed`.
-4. `start_run {target, duration, max_requests, …}` — returns a run id at once; pass a
+1. `discover_targets` — credential sources on this machine (names only) and configured
+   targets; `list_targets` — what this server allows, its budgets.
+2. `doctor {target}` — reachability, TLS, clock, credentials, permissions (read-only) and a
+   sample of the objects the target holds.
+3. `sample_objects {target}` — prefixes, counts and sizes; `suggested_existing` is the prefix to
+   measure without writing (`existing`).
+4. `plan_run {target, existing, …}` — dry run: requests, bytes, objects written, cost, ETA;
+   `allowed`.
+5. `start_run {target, existing, duration, max_requests, …}` — returns a run id at once; pass a
    progressToken for progress notifications; poll `get_run {run}`.
-5. `explain_run {run}` — verdict, findings with evidence, slowest-1% attribution, next steps.
-6. `analyze_run {run, selection}` — why a time window or latency band is slow.
-7. Change one knob, run again, `compare_runs {baseline, candidate}`.
+6. `explain_run {run}` — verdict, findings with evidence, slowest-1% attribution, and `next`
+   steps as MCP calls (`verify_finding`, `recommend_config`, `start_run {from, set}`).
+7. `verify_finding {run, code}` — replay with and without the change: confirmed, refuted or
+   inconclusive. `recommend_config {target}` — diagnose, tune and verify in one call: a
+   Recommendation with a profile patch.
+8. `start_run {from: run, set: [\"concurrency=16\"]}` — the change alone, then
+   `compare_runs {baseline, candidate}`.
 
-Targets: a configured name, or a URL (`memory://` needs no credentials and never leaves the
-process). `existing: PREFIX` benchmarks existing objects without writing anything.
+Targets: a configured name, or a URL (`memory://` and `lab://demo` need no credentials and never
+leave the process). `existing: PREFIX` benchmarks existing objects without writing anything.
 
 Resources: `oprobe://runs/{id}/report|events|slowest|html`, `oprobe://schema/{name}`,
 `oprobe://docs/findings`, `oprobe://presets`.
@@ -319,7 +328,8 @@ fn safety(st: &State) -> String {
          - budgets per run: cost {} · requests {} · bytes {} · duration {}\n\
          - concurrent runs: {}\n\n\
          Runs that would upload a dataset or write objects are refused (`safety.read_only`) unless \
-         the server was started with `--allow-write`; `memory://` and `existing: PREFIX` runs are \
+         the server was started with `--allow-write`; `memory://`, `lab://` (in-process) and \
+         `existing: PREFIX` runs are \
          always allowed. A budget stops a run early (`safety.budget_exceeded`); the partial run is \
          still saved. Writes are confined to `oprobe-run-<id>/` under the target prefix and \
          removed when the run ends.\n",

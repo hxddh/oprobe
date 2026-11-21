@@ -23,6 +23,52 @@
       ],
       "type": "object"
     },
+    "McpCall": {
+      "description": "An MCP tool call: the tool and its arguments.",
+      "properties": {
+        "arguments": {
+          "additionalProperties": true,
+          "type": "object"
+        },
+        "tool": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "arguments"
+      ],
+      "type": "object"
+    },
+    "NextStep": {
+      "description": "A suggested next step: what it does, the CLI command, and the MCP call doing the same.",
+      "properties": {
+        "cli": {
+          "description": "The command line (`oprobe …`).",
+          "type": "string"
+        },
+        "mcp": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/McpCall"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The same step as an MCP tool call, when a tool does it."
+        },
+        "title": {
+          "description": "What the step does, in a few words.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "title",
+        "cli"
+      ],
+      "type": "object"
+    },
     "RunSetStats": {
       "description": "Spread of a set of runs: medians across runs with 95 % bootstrap intervals.",
       "properties": {
@@ -95,6 +141,13 @@
           "format": "double",
           "type": "number"
         },
+        "partial": {
+          "description": "Why the run is partial: `budget` (a safety budget stopped it) or `interrupted`\n(stopped early); absent for a complete run.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "path": {
           "description": "The run file (filled in when listing; not stored).",
           "type": [
@@ -106,6 +159,10 @@
           "type": "string"
         },
         "target_display": {
+          "type": "string"
+        },
+        "target_id": {
+          "description": "The target identity of the run's spec (`store::TargetId`, empty when it does not\nresolve). Required, so sidecars written without it are rebuilt from the run file.",
           "type": "string"
         },
         "target_name": {
@@ -120,6 +177,10 @@
         "window_s": {
           "format": "double",
           "type": "number"
+        },
+        "workload_hash": {
+          "description": "`report.spec.workload_hash()`: runs with the same target and workload hash compare.",
+          "type": "string"
         }
       },
       "required": [
@@ -133,7 +194,9 @@
         "ops_per_s",
         "p50_ms",
         "p99_ms",
-        "error_ratio"
+        "error_ratio",
+        "target_id",
+        "workload_hash"
       ],
       "type": "object"
     },
@@ -164,7 +227,7 @@
       ]
     }
   },
-  "$id": "https://github.com/hxddh/oprobe/schemas/3/baseline-show.json",
+  "$id": "https://github.com/hxddh/oprobe/schemas/4/baseline-show.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "Result of `oprobe baseline show`",
   "properties": {
@@ -178,6 +241,13 @@
     "name": {
       "type": "string"
     },
+    "next": {
+      "description": "Suggested next steps.",
+      "items": {
+        "$ref": "#/$defs/NextStep"
+      },
+      "type": "array"
+    },
     "runs": {
       "items": {
         "$ref": "#/$defs/RunSummary"
@@ -187,7 +257,14 @@
     "stats": {
       "$ref": "#/$defs/RunSetStats"
     },
-    "window": {
+    "warnings": {
+      "description": "Warnings of the command (also printed on stderr in text mode).",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "window_count": {
       "format": "uint64",
       "minimum": 0,
       "type": "integer"
@@ -195,10 +272,12 @@
   },
   "required": [
     "name",
-    "window",
+    "window_count",
     "runs",
     "missing",
-    "stats"
+    "stats",
+    "next",
+    "warnings"
   ],
   "title": "oprobe baseline-show",
   "type": "object",

@@ -221,7 +221,9 @@ fn agent_workflow_over_stdio() {
     assert_eq!(
         names,
         [
+            "discover_targets",
             "doctor",
+            "sample_objects",
             "probe_endpoint",
             "plan_run",
             "start_run",
@@ -232,6 +234,8 @@ fn agent_workflow_over_stdio() {
             "analyze_run",
             "compare_runs",
             "start_tune",
+            "verify_finding",
+            "recommend_config",
             "estimate_cost",
             "cleanup",
             "list_targets"
@@ -272,7 +276,7 @@ fn agent_workflow_over_stdio() {
     assert!(started["plan"].is_object());
     let done = m.wait_run(&id1);
     assert_eq!(done["status"], "succeeded", "{done}");
-    assert_eq!(done["report"]["schema"], "oprobe.report/3");
+    assert_eq!(done["report"]["schema"], "oprobe.report/4");
     assert_eq!(done["report"]["run"]["label"], "first");
     assert_eq!(done["summary"]["id"], id1.as_str());
     // Give the last notifications a moment, then check progress arrived in order.
@@ -299,7 +303,8 @@ fn agent_workflow_over_stdio() {
     let ex = m.tool("explain_run", json!({"run": id1}));
     assert_eq!(ex["run_id"], id1.as_str());
     assert!(!ex["narrative"].as_array().unwrap().is_empty());
-    assert!(!ex["next_commands"].as_array().unwrap().is_empty());
+    assert!(!ex["next"].as_array().unwrap().is_empty());
+    assert!(ex["next"][0]["mcp"]["tool"].is_string(), "{ex}");
     let an = m.tool("analyze_run", json!({"run": "last", "slowest_pct": 5.0}));
     assert!(an["attribution"]["selected_count"].as_u64().unwrap() > 0);
     assert!(an["selection"]["min_total_us"].is_u64());
@@ -370,7 +375,7 @@ fn agent_workflow_over_stdio() {
     let schema: Value = serde_json::from_str(&schema).unwrap();
     assert_eq!(
         schema["$id"],
-        "https://github.com/hxddh/oprobe/schemas/3/report.json"
+        "https://github.com/hxddh/oprobe/schemas/4/report.json"
     );
     let (findings, _) = m.read("oprobe://docs/findings");
     assert!(findings.contains("throttling"));
@@ -660,7 +665,7 @@ async fn streamable_http_transport() {
     .await;
     assert_eq!(
         tools.unwrap()["result"]["tools"].as_array().unwrap().len(),
-        14
+        18
     );
     let (_, r) = http_post(
         &client,
@@ -683,4 +688,193 @@ async fn streamable_http_transport() {
         .await
         .unwrap();
     assert_eq!(other.status(), 404);
+}
+
+/// Whether this build has the CLI subcommand `name` (stream T adds `verify` and `fix`).
+fn has_subcommand(name: &str) -> bool {
+    Command::new(env!("CARGO_BIN_EXE_oprobe"))
+        .args([name, "--help"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// Every `next` step has a CLI command without placeholders; those with an MCP call name a
+/// tool this server has.
+fn check_next(m: &Mcp, v: &Value, what: &str) {
+    let next = v["next"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{what}: no next: {v}"));
+    assert!(!next.is_empty(), "{what}: empty next");
+    for n in next {
+        let cli = n["cli"].as_str().unwrap();
+        assert!(cli.starts_with("oprobe "), "{what}: {n}");
+        assert!(!cli.contains('<'), "{what}: placeholder in {cli}");
+        if let Some(tool) = n["mcp"]["tool"].as_str() {
+            assert!(m.schemas.contains_key(tool), "{what}: unknown tool {tool}");
+            assert!(
+                !n["mcp"]["arguments"].to_string().contains('<'),
+                "{what}: {n}"
+            );
+        }
+    }
+    assert!(
+        next.iter().any(|n| n["mcp"]["tool"].is_string()),
+        "{what}: no MCP call in next: {next:?}"
+    );
+}
+
+/// The agent workflow "find why my bucket is slow and fix the config" over MCP on a read-only
+/// server (design v4 §9): discover → doctor → sample → plan → run → explain → verify /
+/// recommend → replay with `from` + `set`, against the in-process `lab://demo`.
+#[test]
+fn read_only_slow_bucket_workflow_against_lab_demo() {
+    let mut m = Mcp::start(&["--max-requests", "200000"]);
+
+    // Extra arguments are refused (AG-6).
+    let e = m.tool_err("plan_run", json!({"target": "memory://", "bogus": 1}));
+    assert_eq!(e["code"], "usage.invalid_argument", "{e}");
+    assert!(e["message"].as_str().unwrap().contains("bogus"), "{e}");
+    let e = m.tool_err("plan_run", json!({"target": "memory://", "concurency": 4}));
+    assert!(e["hint"].as_str().unwrap().contains("concurrency"), "{e}");
+
+    // 1. Discover: credential sources by name, configured targets.
+    let d = m.tool("discover_targets", json!({}));
+    assert!(d["sources"].is_array(), "{d}");
+    check_next(&m, &d, "discover_targets");
+
+    // 2. Doctor: read-only by default, with a sample.
+    let doc = m.tool("doctor", json!({"target": "lab://demo"}));
+    assert_eq!(doc["ready"], true, "{doc}");
+    assert_eq!(doc["write_probe"], false);
+    assert_eq!(doc["permissions"]["write"], "skipped");
+    assert!(doc["sample"].is_object(), "{doc}");
+    check_next(&m, &doc, "doctor");
+    let e = m.tool_err(
+        "doctor",
+        json!({"target": "s3://some-bucket/x", "endpoint": "http://127.0.0.1:9", "write_probe": true}),
+    );
+    assert_eq!(e["code"], "safety.read_only", "{e}");
+
+    // 3. Sample: read-only listing.
+    let s = m.tool("sample_objects", json!({"target": "lab://demo"}));
+    assert!(s["objects_count"].is_u64(), "{s}");
+    check_next(&m, &s, "sample_objects");
+
+    // 4. Plan: lab:// writes only into the server's own process, so it is allowed read-only.
+    let run_args = json!({
+        "target": "lab://demo",
+        "preset": "small-files",
+        "objects": 16,
+        "object_size": "16KiB",
+        "duration": "2s",
+        "warmup": "0s",
+        "concurrency": 4
+    });
+    let plan = m.tool("plan_run", run_args.clone());
+    assert_eq!(plan["allowed"], true, "{plan}");
+    assert_eq!(plan["writes"], true);
+
+    // 5. Run; `done` only together with the final event (AG-6).
+    let (err, started, _) = m.tool_full(
+        "start_run",
+        run_args.clone(),
+        Some(json!({"progressToken": "w"})),
+    );
+    assert!(!err, "{started}");
+    let id = started["run_id"].as_str().unwrap().to_owned();
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let done = loop {
+        let st = m.tool("get_run", json!({"run": id, "include_report": false}));
+        let status = st["status"].as_str().unwrap().to_owned();
+        if let Some(p) = st["progress"].as_object() {
+            if p.get("phase").and_then(Value::as_str) == Some("done") {
+                assert!(
+                    !matches!(status.as_str(), "queued" | "running"),
+                    "phase done while {status}: {st}"
+                );
+            }
+            if let (Some(e), Some(t)) = (
+                p.get("elapsed_s").and_then(Value::as_f64),
+                p.get("total_s").and_then(Value::as_f64),
+            ) {
+                assert!(e <= t + 1e-9, "progress overshoots: {e} > {t}");
+            }
+        }
+        if !matches!(status.as_str(), "queued" | "running") {
+            break st;
+        }
+        assert!(Instant::now() < deadline, "run {id} did not finish");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(done["status"], "succeeded", "{done}");
+    check_next(&m, &done, "get_run");
+    let (events, _) = m.read(&format!("oprobe://runs/{id}/events"));
+    let last: Value = serde_json::from_str(events.lines().last().unwrap()).unwrap();
+    assert_eq!(last["type"], "result", "{events}");
+    let phases: Vec<String> = events
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|e| e["type"] == "phase")
+        .map(|e| e["phase"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        phases.last().map(String::as_str),
+        Some("done"),
+        "{phases:?}"
+    );
+    assert_eq!(
+        phases.iter().filter(|p| *p == "done").count(),
+        1,
+        "{phases:?}"
+    );
+    let total = started["plan"]["eta_s"].as_f64().unwrap();
+    for p in m
+        .notes
+        .iter()
+        .filter(|n| n["method"] == "notifications/progress")
+    {
+        let v = p["params"]["progress"].as_f64().unwrap();
+        assert!(v <= total + 1e-9, "progress {v} past its total {total}");
+    }
+
+    // 6. Explain: next steps are MCP calls.
+    let ex = m.tool("explain_run", json!({"run": id}));
+    check_next(&m, &ex, "explain_run");
+
+    // 7. Replay with a change: `from` + `set` (the CLI's `run --from RUN --set k=v`).
+    let r2 = m.tool(
+        "start_run",
+        json!({"from": id, "set": ["concurrency=2"], "wait": true}),
+    );
+    assert_eq!(r2["status"], "succeeded", "{r2}");
+    assert_eq!(
+        r2["report"]["spec"]["profile"]["knobs"]["concurrency"], 2,
+        "{r2}"
+    );
+    assert_eq!(r2["report"]["spec"]["target_ref"], "lab://demo");
+    let e = m.tool_err("start_run", json!({"from": id, "set": ["concurency=2"]}));
+    assert_eq!(e["code"], "usage.invalid_argument");
+
+    // 8. Recommend (and verify) a configuration: `oprobe fix` / `oprobe verify` as children.
+    if has_subcommand("verify") {
+        let (err, v, text) = m.tool_full("verify_finding", json!({"run": id, "repeat": 1}), None);
+        assert!(
+            !err || v["code"] != "internal",
+            "verify_finding: {text} {v}"
+        );
+    } else {
+        eprintln!("skipping verify_finding: this build has no `oprobe verify` (stream T)");
+    }
+    if has_subcommand("fix") {
+        let (err, v, text) = m.tool_full(
+            "recommend_config",
+            json!({"target": "lab://demo", "preset": "small-files", "objects": 16, "object_size": "16KiB", "budget": "1m"}),
+            None,
+        );
+        assert!(!err, "recommend_config: {text} {v}");
+    } else {
+        eprintln!("skipping recommend_config: this build has no `oprobe fix` (stream T)");
+    }
 }

@@ -116,6 +116,11 @@ fn command(out: &mut String, cmd: &Command, path: &str) {
     let usage = c.render_usage().to_string();
     let usage = usage.trim_start_matches("Usage: ").trim();
     let _ = writeln!(out, "```text\n{usage}\n```");
+    if !cmd.has_subcommands() {
+        let rel = path.strip_prefix("oprobe ").unwrap_or(path);
+        let f = super::formats::names(super::formats::formats_of(rel));
+        let _ = writeln!(out, "\nOutput formats (`-o`): {}", f.join(", "));
+    }
     args_table(out, cmd, false);
     for sub in cmd.get_subcommands() {
         command(out, sub, &format!("{path} {}", sub.get_name()));

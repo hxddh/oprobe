@@ -1,18 +1,47 @@
 #!/bin/sh
 # oprobe installer for Linux and macOS.
 #   curl -fsSL https://github.com/hxddh/oprobe/releases/latest/download/install.sh | sh
-# Options (env): OPROBE_VERSION=3.0.0  OPROBE_INSTALL_DIR=~/.local/bin
+#
+# Options (environment):
+#   OPROBE_VERSION=4.0.0        install this version instead of the latest
+#   OPROBE_INSTALL_DIR=DIR      where to put the binary (default ~/.local/bin)
+#   OPROBE_MODIFY_PATH=1|0      add DIR to PATH in your shell rc file without asking (1) or never (0);
+#                               unset: ask when a terminal is available, otherwise only print the line
+#   OPROBE_RELEASE_BASE=URL     release download base (mirrors, tests);
+#                               default https://github.com/hxddh/oprobe/releases
+#   OPROBE_API=URL              GitHub API base (default https://api.github.com)
+#
+# The latest version is resolved without the GitHub API when possible, falling back on any failure:
+#   1. <base>/latest/download/latest.json
+#   2. the <base>/latest redirect (its Location header names the tag)
+#   3. the GitHub API (rate limited to 60 anonymous requests per hour)
 set -eu
 
 repo="hxddh/oprobe"
+base="${OPROBE_RELEASE_BASE:-https://github.com/$repo/releases}"
+base="${base%/}"
+api="${OPROBE_API:-https://api.github.com}"
+api="${api%/}"
 dir="${OPROBE_INSTALL_DIR:-$HOME/.local/bin}"
 
 err() { echo "oprobe-install: $*" >&2; exit 1; }
+say() { echo "$*"; }
 need() { command -v "$1" >/dev/null 2>&1 || err "missing required tool: $1"; }
-need uname; need tar; need mkdir
-if command -v curl >/dev/null 2>&1; then fetch() { curl -fsSL "$1" -o "$2"; }
-elif command -v wget >/dev/null 2>&1; then fetch() { wget -q "$1" -O "$2"; }
-else err "need curl or wget"; fi
+need uname; need tar; need mkdir; need sed; need grep
+
+if command -v curl >/dev/null 2>&1; then
+  fetch() { curl -fsSL "$1" -o "$2"; }
+  # The final URL of a redirect chain (empty on failure).
+  final_url() { curl -fsSLI -o /dev/null -w '%{url_effective}' "$1" 2>/dev/null || true; }
+  # The Location header of the first answer (empty when there is none).
+  location() { curl -fsSI "$1" 2>/dev/null | tr -d '\r' | sed -n 's/^[Ll]ocation: *//p' | tail -n1; }
+elif command -v wget >/dev/null 2>&1; then
+  fetch() { wget -q "$1" -O "$2"; }
+  final_url() { :; }
+  location() { wget -S --spider --max-redirect=0 "$1" 2>&1 | tr -d '\r' | sed -n 's/^ *[Ll]ocation: *//p' | tail -n1; }
+else
+  err "need curl or wget"
+fi
 
 os=$(uname -s); arch=$(uname -m)
 case "$os" in
@@ -26,31 +55,91 @@ case "$os" in
   *) err "unsupported OS: $os (Windows: use install.ps1, the MSI or scoop)" ;;
 esac
 
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+
+# A version from a tag-like string (v4.0.0, .../tag/v4.0.0) or nothing.
+version_of() { printf '%s\n' "$1" | sed -n 's|.*/tag/v\{0,1\}\([0-9][^/?#]*\).*|\1|p' | head -n1; }
+
+resolve_latest() {
+  # 1. latest.json (a release asset; no API, no rate limit).
+  if fetch "$base/latest/download/latest.json" "$tmp/latest.json" 2>/dev/null; then
+    v=$(sed -n 's/.*"version": *"v\{0,1\}\([^"]*\)".*/\1/p' "$tmp/latest.json" | head -n1)
+    if [ -n "$v" ]; then echo "$v"; return 0; fi
+  fi
+  # 2. The releases/latest redirect: its Location (or the final URL) ends in /tag/vX.Y.Z.
+  v=$(version_of "$(location "$base/latest")")
+  [ -n "$v" ] || v=$(version_of "$(final_url "$base/latest")")
+  if [ -n "$v" ]; then echo "$v"; return 0; fi
+  # 3. The GitHub API.
+  if fetch "$api/repos/$repo/releases/latest" "$tmp/release.json" 2>/dev/null; then
+    v=$(sed -n 's/.*"tag_name": *"v\{0,1\}\([^"]*\)".*/\1/p' "$tmp/release.json" | head -n1)
+    if [ -n "$v" ]; then echo "$v"; return 0; fi
+  fi
+  return 1
+}
+
 if [ -n "${OPROBE_VERSION:-}" ]; then
   version="${OPROBE_VERSION#v}"
-  base="https://github.com/$repo/releases/download/v$version"
 else
-  need sed
-  tmpv=$(mktemp)
-  fetch "https://api.github.com/repos/$repo/releases/latest" "$tmpv" || err "cannot query latest release"
-  version=$(sed -n 's/.*"tag_name": *"v\{0,1\}\([^"]*\)".*/\1/p' "$tmpv" | head -n1)
-  rm -f "$tmpv"
-  [ -n "$version" ] || err "cannot determine latest version"
-  base="https://github.com/$repo/releases/download/v$version"
+  version=$(resolve_latest) || err "cannot determine the latest version (set OPROBE_VERSION=X.Y.Z, or download from https://github.com/$repo/releases)"
 fi
+url="$base/download/v$version"
 
 name="oprobe-$version-$target"
-tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
-echo "Downloading $name.tar.gz"
-fetch "$base/$name.tar.gz" "$tmp/$name.tar.gz" || err "download failed: $base/$name.tar.gz"
-fetch "$base/SHA256SUMS" "$tmp/SHA256SUMS" || err "cannot download SHA256SUMS"
-expected=$(grep " $name.tar.gz\$" "$tmp/SHA256SUMS" | cut -d' ' -f1)
+say "Downloading $name.tar.gz"
+fetch "$url/$name.tar.gz" "$tmp/$name.tar.gz" || err "download failed: $url/$name.tar.gz"
+fetch "$url/SHA256SUMS" "$tmp/SHA256SUMS" || err "cannot download $url/SHA256SUMS"
+expected=$(grep " \*\{0,1\}$name.tar.gz\$" "$tmp/SHA256SUMS" | cut -d' ' -f1)
 if command -v sha256sum >/dev/null 2>&1; then actual=$(sha256sum "$tmp/$name.tar.gz" | cut -d' ' -f1)
 else actual=$(shasum -a 256 "$tmp/$name.tar.gz" | cut -d' ' -f1); fi
-[ -n "$expected" ] && [ "$expected" = "$actual" ] || err "checksum mismatch for $name.tar.gz"
+{ [ -n "$expected" ] && [ "$expected" = "$actual" ]; } || err "checksum mismatch for $name.tar.gz"
 
 tar -xzf "$tmp/$name.tar.gz" -C "$tmp"
 mkdir -p "$dir"
 install -m 755 "$tmp/$name/oprobe" "$dir/oprobe" 2>/dev/null || { cp "$tmp/$name/oprobe" "$dir/oprobe"; chmod 755 "$dir/oprobe"; }
-echo "Installed oprobe $version to $dir/oprobe"
-case ":$PATH:" in *":$dir:"*) ;; *) echo "Add $dir to your PATH to run oprobe." ;; esac
+say "Installed oprobe $version to $dir/oprobe"
+
+# PATH: offer to add the directory to the shell's rc file.
+case ":$PATH:" in
+  *":$dir:"*) exit 0 ;;
+esac
+shell_name=$(basename "${SHELL:-sh}")
+case "$shell_name" in
+  zsh) rc="${ZDOTDIR:-$HOME}/.zshrc"; line="export PATH=\"$dir:\$PATH\"" ;;
+  bash)
+    if [ "$os" = Darwin ]; then rc="$HOME/.bash_profile"; else rc="$HOME/.bashrc"; fi
+    line="export PATH=\"$dir:\$PATH\"" ;;
+  fish) rc="${XDG_CONFIG_HOME:-$HOME/.config}/fish/config.fish"; line="fish_add_path \"$dir\"" ;;
+  *) rc="$HOME/.profile"; line="export PATH=\"$dir:\$PATH\"" ;;
+esac
+
+modify="${OPROBE_MODIFY_PATH:-}"
+if [ -z "$modify" ]; then
+  # Usually piped from curl: stdin is the script, so ask on the terminal when there is one.
+  # (A subshell: failing to open /dev/tty, e.g. without a controlling terminal, must not exit.)
+  if [ -r /dev/tty ] && [ -w /dev/tty ] && (exec </dev/tty) 2>/dev/null; then
+    printf '%s is not on your PATH. Add it to %s? [Y/n] ' "$dir" "$rc" >/dev/tty
+    answer=""
+    read -r answer </dev/tty || answer=n
+    case "$answer" in
+      ""|y|Y|yes|YES|Yes) modify=1 ;;
+      *) modify=0 ;;
+    esac
+  else
+    modify=0
+  fi
+fi
+
+if [ "$modify" = 1 ]; then
+  mkdir -p "$(dirname "$rc")"
+  if [ -f "$rc" ] && grep -F "$line" "$rc" >/dev/null 2>&1; then
+    say "$rc already adds $dir to PATH; open a new shell to use it."
+  else
+    printf '\n# Added by the oprobe installer\n%s\n' "$line" >> "$rc"
+    say "Added $dir to PATH in $rc; open a new shell (or run: $line)."
+  fi
+else
+  say "$dir is not on your PATH. Add it with:"
+  say "  echo '$line' >> $rc"
+fi

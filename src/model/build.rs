@@ -26,16 +26,116 @@ pub struct ReportInput<'a> {
     pub warnings: Vec<String>,
     pub started_at: SystemTime,
     pub ended_at: SystemTime,
+    /// The run's spec (`RunSpec::new` of the profile before the session normalised it, at the
+    /// target as given); `None`: derived from `profile` and `target_name`.
+    pub spec: Option<super::spec::RunSpec>,
 }
 
-/// Percentile (nearest rank) of `v` in ms; reorders `v`.
+/// Percentile of `v` in ms with the one estimator of reports (nearest rank); reorders `v`.
 fn p_ms(v: &mut [u64], q: f64) -> f64 {
-    if v.is_empty() {
-        return 0.0;
+    crate::analysis::stats::quantile_us_ms(v, q)
+}
+
+/// Replace the recorder's histogram percentiles (summary and per verb) with exact ones from
+/// the operation rows, so the report, its findings and compare all read the same estimator
+/// (design v4 §4). Only when the rows are complete: not sampled, and the rows of the window
+/// are the operations the recorder counted (within 1 %, for operations straddling the end).
+fn exact_latency(snapshot: &mut Snapshot, ops: &[super::OpRow], sampled: bool) {
+    if sampled || ops.is_empty() {
+        return;
     }
-    let i = ((v.len() as f64 * q).ceil() as usize).clamp(1, v.len()) - 1;
-    let (_, x, _) = v.select_nth_unstable(i);
-    *x as f64 / 1000.0
+    let window_us = (snapshot.elapsed_s * 1e6).ceil() as i64;
+    let rows: Vec<&super::OpRow> = ops
+        .iter()
+        .filter(|o| o.t_us >= 0 && o.t_us < window_us.max(1))
+        .collect();
+    let counted = snapshot.summary.ops;
+    let close = |n: u64, m: u64| n.abs_diff(m) as f64 <= (m as f64 * 0.01).max(1.0);
+    if !close(rows.len() as u64, counted) {
+        return;
+    }
+    let mut all: Vec<u64> = rows.iter().map(|o| o.latency_us).collect();
+    if let Some(q) = crate::analysis::stats::exact_quantiles(&mut all) {
+        snapshot.summary.latency = q;
+    }
+    for v in &mut snapshot.verbs {
+        let mut lat: Vec<u64> = rows
+            .iter()
+            .filter(|o| o.verb == v.verb.as_str())
+            .map(|o| o.latency_us)
+            .collect();
+        if close(lat.len() as u64, v.count)
+            && let Some(q) = crate::analysis::stats::exact_quantiles(&mut lat)
+        {
+            v.latency = q;
+        }
+    }
+}
+
+/// The warning a partial run carries in `report.warnings`.
+fn partial_warning(p: &PartialInfo, configured_s: f64, suppressed: bool) -> String {
+    format!(
+        "partial run: {} after {:.1} s of the {:.1} s window{}",
+        p.reason.describe(),
+        p.measured_s,
+        configured_s,
+        if suppressed {
+            "; performance findings are suppressed"
+        } else {
+            ""
+        }
+    )
+}
+
+/// Apply the run's validity to its findings, warnings, headline and verdict (after the
+/// findings are derived, and again when [`mark_partial`] learns more).
+fn finish(run: &mut Run, breached: bool) {
+    let findings = std::mem::take(&mut run.report.findings);
+    let (findings, validity) = crate::analysis::findings::validity(&run.report, findings);
+    let r = &mut run.report;
+    r.findings = findings;
+    r.warnings.retain(|w| !w.starts_with("partial run: "));
+    if let Some(p) = &r.run.partial {
+        let w = partial_warning(p, r.workload.duration_s, validity.suppress);
+        r.warnings.push(w);
+    }
+    if let Some(why) = &validity.invalid {
+        r.verdict.headline = format!("Run invalid: {why}.");
+    } else if let (Some(p), true) = (&r.run.partial, validity.suppress) {
+        r.verdict.headline = format!(
+            "Partial run ({} after {:.1} s): too short to judge performance.",
+            p.reason.describe(),
+            p.measured_s
+        );
+    }
+    let worst = r.worst_severity();
+    r.verdict.level = if (breached && r.verdict.sla.enforced) || worst == Severity::Critical {
+        VerdictLevel::Critical
+    } else if worst == Severity::Warning || breached {
+        VerdictLevel::Attention
+    } else if r.is_partial() || !r.warnings.is_empty() {
+        VerdictLevel::Review
+    } else {
+        VerdictLevel::Ok
+    };
+}
+
+/// Mark a built run as partial (a budget stopped it, it was cancelled after the window, …):
+/// `run.partial`, the warning, suppressed findings and the verdict follow. A budget stop is
+/// kept over a plain interruption (the budget is why it was interrupted).
+pub fn mark_partial(run: &mut Run, reason: PartialReason) {
+    let r = &mut run.report;
+    r.run.interrupted = true;
+    let reason = match &r.run.partial {
+        Some(p) if p.reason == PartialReason::Budget => PartialReason::Budget,
+        _ => reason,
+    };
+    r.run.partial = Some(PartialInfo {
+        reason,
+        measured_s: r.run.window_s,
+    });
+    let breached = !r.verdict.sla.passed;
+    finish(run, breached);
 }
 
 fn request_p99(reqs: &[ReqRow]) -> RequestStagesP99 {
@@ -221,19 +321,40 @@ fn ensure_slowest(snapshot: &Snapshot, trace: &mut TraceRows) {
 
 /// Build the report and keep the trace rows next to it.
 pub fn build_run(i: ReportInput<'_>) -> Run {
+    build_run_with(i, None)
+}
+
+/// [`build_run`] with the target's remembered capacity (`<data>/capacity.toml`, the same
+/// target and workload): a run that stayed under the ceiling keeps it
+/// ([`Capacity::with_history`](crate::analysis::capacity::Capacity::with_history)), so its
+/// findings never suggest going past it.
+pub fn build_run_with(
+    i: ReportInput<'_>,
+    history: Option<crate::analysis::capacity::Capacity>,
+) -> Run {
     let ReportInput {
         run_id,
         target_name,
         profile,
         knobs,
-        snapshot,
+        mut snapshot,
         mut trace,
         cleanup,
         warnings,
         started_at,
         ended_at,
+        spec,
     } = i;
+    let spec = spec.unwrap_or_else(|| {
+        let target_ref = target_name
+            .clone()
+            .or_else(|| profile.target.url.clone())
+            .unwrap_or_else(|| profile.target.display());
+        super::spec::RunSpec::new(profile, target_ref)
+    });
     ensure_slowest(&snapshot, &mut trace);
+    let sampled = trace.sampled();
+    exact_latency(&mut snapshot, &trace.ops, sampled);
     let t = &profile.target;
     let endpoint = t.endpoint();
     let diagnosis = diagnose(&snapshot, knobs, &profile.sla, t.is_network());
@@ -259,6 +380,16 @@ pub fn build_run(i: ReportInput<'_>) -> Run {
             t.scheme,
             crate::util::ByteSize(effective.write_chunk_bytes)
         ));
+    }
+    if knobs.tail_cut {
+        let blind = (crate::engine::stack::TAIL_CUT_BLIND_START.as_secs_f64() - workload.warmup_s)
+            .clamp(0.0, snapshot.elapsed_s.max(0.0));
+        if blind > 0.0 {
+            warnings.push(format!(
+                "tail-cut cut nothing during the first {blind:.1} s of the {:.1} s window: OpenDAL's TailCutLayer ignores the latencies of its first 10 s (a long-lived client is unaffected; measure longer to see its effect)",
+                snapshot.elapsed_s
+            ));
+        }
     }
     let breached = !sla_verdict.passed;
     let exit_code = if interrupted {
@@ -300,10 +431,21 @@ pub fn build_run(i: ReportInput<'_>) -> Run {
             .collect(),
         request_p99: request_p99(&trace.reqs),
     };
-    let sampled = trace.sampled();
     let region = t.options.get("region").cloned();
+    let capacity = crate::analysis::capacity::estimate(
+        &trace.reqs,
+        &trace.ops,
+        crate::analysis::capacity::Window::measured(snapshot.elapsed_s),
+    )
+    .with_history(history);
+    let partial = interrupted.then_some(PartialInfo {
+        reason: PartialReason::Interrupted,
+        measured_s: snapshot.elapsed_s,
+    });
     let report = Report {
         schema: REPORT_SCHEMA.to_owned(),
+        spec,
+        capacity,
         run: RunInfo {
             id: run_id.to_string(),
             label: profile.name.clone(),
@@ -311,6 +453,7 @@ pub fn build_run(i: ReportInput<'_>) -> Run {
             ended_at: crate::util::fmt_rfc3339(ended_at),
             window_s: snapshot.elapsed_s,
             interrupted,
+            partial,
             sampled,
             trace: trace.info.clone(),
             oprobe_version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -369,17 +512,7 @@ pub fn build_run(i: ReportInput<'_>) -> Run {
     };
     // Findings read the finished report and the trace rows (stream B3: analysis::findings).
     run.report.findings = crate::analysis::findings::derive(&run, &diagnosis.findings);
-    let worst = run.report.worst_severity();
-    let r = &mut run.report;
-    r.verdict.level = if (breached && r.verdict.sla.enforced) || worst == Severity::Critical {
-        VerdictLevel::Critical
-    } else if worst == Severity::Warning || breached {
-        VerdictLevel::Attention
-    } else if interrupted || !r.warnings.is_empty() {
-        VerdictLevel::Review
-    } else {
-        VerdictLevel::Ok
-    };
+    finish(&mut run, breached);
     run
 }
 

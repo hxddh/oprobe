@@ -1,4 +1,5 @@
-//! Report v3 (`oprobe.report/3`, design §6): the machine-clean result of one run.
+//! Report v4 (`oprobe.report/4`, design v3 §6 and v4 §1/§3): the machine-clean result of one
+//! run, with the run's replayable spec (`spec`) and the capacity estimate (`capacity`).
 //!
 //! Rules: every numeric field name carries its unit (`_us`, `_ms`, `_s`, `_bytes`, `_per_s`,
 //! `_pct`, `_ratio` for dimensionless fractions, `_usd`, `_count`); no human-formatted strings
@@ -22,23 +23,28 @@ use crate::trace::{
 };
 
 /// Schema id of [`Report`].
-pub const REPORT_SCHEMA: &str = "oprobe.report/3";
+pub const REPORT_SCHEMA: &str = "oprobe.report/4";
 
 /// Unit suffixes a numeric report field name ends with (design §6). Each names its unit:
 /// `_us` / `_ms` / `_s` time; `_bytes`, `_mib`, `_gib` sizes (`_mib`/`_gib` only where the
 /// value is naturally fractional: `client.rss_mib`, `cost.stored_gib`); `_bps` bits per second;
 /// `_per_s` rates (`ops_per_s`, `mib_per_s`, `requests_per_s`); `_pct` percent (0–100);
 /// `_ratio` dimensionless fractions and multipliers; `_usd` money; `_count` counts (also a
-/// count per something, e.g. `requests_per_op_count`, and maps of counts like
-/// `status_count`).
+/// count per something, e.g. `peak_inflight_per_op_count`, and maps of counts like
+/// `status_count`); `_mean` fractional means of counts (`inflight_mean`, v4 §4).
 pub const UNIT_SUFFIXES: &[&str] = &[
-    "_us", "_ms", "_s", "_bytes", "_mib", "_gib", "_bps", "_per_s", "_pct", "_ratio", "_usd",
-    "_count",
+    "_us", "_ms", "_s", "_bytes", "_mib", "_gib", "_bps", "_per_s", "_pct", "_pp", "_ratio",
+    "_usd", "_count", "_mean", "_days",
 ];
 
 /// Numeric report fields that are not quantities and so carry no unit: identifiers
 /// (`id`, `*_id`, `*_ids`, `slowest` op ids, tune trial ids), codes (`exit_code`), the
-/// workload `seed`, relative mix `weight`s and the heatmap's `counts` matrix (named by §6).
+/// workload `seed`, relative mix `weight`s, the heatmap's `counts` matrix (named by §6), a matrix
+/// cell's `rank`, a TCP `port`, HTTP `status` and exit `code`s; the parts of an interval
+/// (`estimate`, `low`, `high`) whose unit is in the name of the field holding it
+/// (`p99_ms.estimate`);
+/// and values whose unit is a sibling `unit` field (`Expectation`, gate checks, tune deltas:
+/// `predicted`, `lo`, `hi`, `baseline`, `candidate`, watch SLO `value` and `limit`).
 pub const UNITLESS_FIELDS: &[&str] = &[
     "id",
     "op_ids",
@@ -49,6 +55,21 @@ pub const UNITLESS_FIELDS: &[&str] = &[
     "seed",
     "weight",
     "counts",
+    "predicted",
+    "lo",
+    "hi",
+    "baseline",
+    "candidate",
+    "rank",
+    "port",
+    "status",
+    "code",
+    "value",
+    "limit",
+    "abs_limit",
+    "estimate",
+    "low",
+    "high",
 ];
 
 /// Whether a numeric report field name follows the unit rule.
@@ -65,6 +86,8 @@ pub struct Report {
     /// Always [`REPORT_SCHEMA`].
     pub schema: String,
     pub run: RunInfo,
+    /// The replayable definition of the run (`oprobe run --from RUN`).
+    pub spec: super::spec::RunSpec,
     pub target: TargetInfo,
     pub workload: WorkloadInfo,
     pub knobs: KnobsInfo,
@@ -86,6 +109,9 @@ pub struct Report {
     pub timeline: Vec<TimelinePoint>,
     pub heatmap: Heatmap,
     pub findings: Vec<Finding>,
+    /// How much load the target takes: the in-flight ceiling and the per-op request shape.
+    #[serde(default)]
+    pub capacity: crate::analysis::capacity::Capacity,
     pub cost: CostReport,
     /// Op ids of the slowest operations (slowest first); their rows are in the run file.
     pub slowest: Vec<u64>,
@@ -106,6 +132,34 @@ impl Report {
             .unwrap_or_default()
     }
 
+    /// The run stopped early (`run.partial`, or the legacy `run.interrupted` flag).
+    pub fn is_partial(&self) -> bool {
+        self.run.partial.is_some() || self.run.interrupted
+    }
+
+    /// Why this run cannot be a baseline (`None`: it can): a partial run, or one whose
+    /// findings say it is invalid, would make every later comparison wrong (design v4 §4).
+    pub fn baseline_refusal(&self) -> Option<String> {
+        if let Some(p) = &self.run.partial {
+            return Some(format!(
+                "run {} is partial ({} after {:.1} s of measurement)",
+                self.run.id,
+                p.reason.describe(),
+                p.measured_s
+            ));
+        }
+        if self.run.interrupted {
+            return Some(format!(
+                "run {} is partial (interrupted after {:.1} s of measurement)",
+                self.run.id, self.run.window_s
+            ));
+        }
+        self.findings
+            .iter()
+            .find(|f| f.code == "run_invalid")
+            .map(|f| format!("run {} is invalid: {}", self.run.id, f.cause))
+    }
+
     /// Parse a report from JSON: a bare report, a `{"report": …}` command result, or a
     /// `{"kind":"report", …}` run-file line. Other schemas are rejected with a clear error.
     pub fn from_json_value(mut v: serde_json::Value) -> anyhow::Result<Self> {
@@ -114,12 +168,19 @@ impl Report {
         {
             v = inner.take();
         }
+        let bad = |m: String| -> anyhow::Error {
+            crate::errors::OprobeError::new(crate::errors::ErrorCode::UsageInvalidArgument, m)
+                .with_hint("reports of other oprobe versions are not read: re-run the workload with this oprobe")
+                .into()
+        };
         match v.get("schema").and_then(|s| s.as_str()) {
             Some(REPORT_SCHEMA) => {}
-            Some(other) => anyhow::bail!(
-                "report schema `{other}` is not supported; this oprobe reads `{REPORT_SCHEMA}` (re-run with this oprobe)"
-            ),
-            None => anyhow::bail!("not an oprobe report"),
+            Some(other) => {
+                return Err(bad(format!(
+                    "report schema `{other}` is not supported; this oprobe reads `{REPORT_SCHEMA}`"
+                )));
+            }
+            None => return Err(bad("not an oprobe report".into())),
         }
         if let Some(o) = v.as_object_mut() {
             o.remove("kind");
@@ -143,12 +204,56 @@ pub struct RunInfo {
     pub window_s: f64,
     /// Stopped early (Ctrl-C, Stop, budget): the window is shorter than configured.
     pub interrupted: bool,
+    /// Why and when the run stopped early (absent for a complete run). A partial run is never
+    /// accepted as a baseline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partial: Option<PartialInfo>,
     /// Trace rows were sampled (more requests than `trace.max_requests`); aggregates are exact.
     pub sampled: bool,
     pub trace: TraceInfo,
     pub oprobe_version: String,
     pub host: HostInfo,
     pub env: EnvInfo,
+}
+
+/// Why a run stopped before its configured end.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PartialReason {
+    /// Ctrl-C, Stop or a cancelled job.
+    #[default]
+    Interrupted,
+    /// A safety budget (`--max-requests`, `--max-bytes`, `--max-duration`, `--max-cost-usd`).
+    Budget,
+    /// A fatal error ended the measurement.
+    Error,
+}
+
+impl PartialReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Interrupted => "interrupted",
+            Self::Budget => "budget",
+            Self::Error => "error",
+        }
+    }
+
+    /// `interrupted` / `stopped by a budget` / `stopped by an error`.
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::Interrupted => "interrupted",
+            Self::Budget => "stopped by a budget",
+            Self::Error => "stopped by an error",
+        }
+    }
+}
+
+/// A run that stopped early (`report.run.partial`).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct PartialInfo {
+    pub reason: PartialReason,
+    /// Seconds of the measurement window that ran.
+    pub measured_s: f64,
 }
 
 /// What the run file's trace rows cover.
@@ -402,7 +507,12 @@ pub struct SlaInfo {
     /// A breach fails the command (exit 3).
     pub enforced: bool,
     pub max_error_ratio: f64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Throttled responses / requests the run may have (`sla.max_throttle_rate`).
+    #[serde(
+        default,
+        rename = "max_throttled_request_ratio",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub max_throttle_ratio: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub p99_ms: Option<f64>,
@@ -648,19 +758,136 @@ pub struct Evidence {
     pub windows: Vec<TimeWindow>,
 }
 
+impl Evidence {
+    /// The named values for people (P2-8): a label without the unit suffix and the value in
+    /// its unit — ratios as percentages, times as ms/s, sizes in bytes units, counts as whole
+    /// numbers.
+    pub fn labelled(&self) -> Vec<(String, String)> {
+        self.values
+            .iter()
+            .map(|(k, v)| evidence_label(k, *v))
+            .collect()
+    }
+}
+
+/// `throttled_request_ratio` = 0.047 → (`Throttled requests`, `4.7%`).
+pub fn evidence_label(key: &str, v: f64) -> (String, String) {
+    use crate::util::{fmt_bytes, fmt_ms, fmt_usd};
+    let known: Option<&str> = match key {
+        "throttled_request_ratio" => Some("Throttled requests"),
+        "throttled_op_ratio" => Some("Throttled operations"),
+        "error_ratio" => Some("Failed operations"),
+        "p99_to_p50_ratio" => Some("p99 / p50"),
+        "overread_ratio" => Some("Over-read"),
+        "ttfb_pct" => Some("Time waiting for the first byte"),
+        "retry_pct" => Some("Time in retry backoff"),
+        "queue_pct" => Some("Time queued"),
+        "connect_pct" => Some("Time connecting"),
+        "reuse_pct" => Some("Connection reuse"),
+        "straggler_pct" => Some("Stragglers"),
+        "straggler_ttfb_ms" => Some("Straggler wait (p50)"),
+        "ceiling_lo_inflight_count" => Some("Clean up to (in flight)"),
+        "ceiling_hi_inflight_count" => Some("Throttled from (in flight)"),
+        "peak_inflight_per_op_count" => Some("In flight per operation (peak)"),
+        "safe_concurrency_count" => Some("Safe concurrency"),
+        "extra_requests_per_1k_ops_mean" => Some("Extra requests per 1 000 ops"),
+        "mean_request_bytes" => Some("Mean request size"),
+        "tail_cut_deadline_ms" => Some("Tail-cut deadline"),
+        "tail_cut_blind_s" => Some("Tail-cut blind for"),
+        "accepted_requests_per_s" => Some("Accepted while throttled"),
+        "monthly_usd" => Some("Projected monthly bill"),
+        _ => None,
+    };
+    let label = known.map(str::to_owned).unwrap_or_else(|| {
+        let bare = UNIT_SUFFIXES
+            .iter()
+            .filter(|s| key.ends_with(*s))
+            .max_by_key(|s| s.len())
+            .map_or(key, |s| &key[..key.len() - s.len()]);
+        let words = bare.replace('_', " ");
+        let mut c = words.chars();
+        match c.next() {
+            Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+            None => key.to_owned(),
+        }
+    });
+    let multiplier = key.contains("_to_") || key == "overread_ratio";
+    let value = if key.ends_with("_ratio") && multiplier {
+        format!("{v:.2}×")
+    } else if key.ends_with("_ratio") {
+        pct(v * 100.0)
+    } else if key.ends_with("_pct") {
+        pct(v)
+    } else if key.ends_with("_ms") {
+        fmt_ms(v)
+    } else if key.ends_with("_us") {
+        fmt_ms(v / 1000.0)
+    } else if key.ends_with("_s") && !key.ends_with("_per_s") {
+        format!("{v:.1} s")
+    } else if key.ends_with("_bytes") {
+        fmt_bytes(v.max(0.0) as u64)
+    } else if key.ends_with("_usd") {
+        fmt_usd(v)
+    } else if key.ends_with("_per_s") {
+        let unit = if key.contains("requests") {
+            "requests/s"
+        } else if key.contains("mib") {
+            "MiB/s"
+        } else {
+            "ops/s"
+        };
+        format!(
+            "{} {unit}",
+            group_thousands(v, if v.abs() < 10.0 { 1 } else { 0 })
+        )
+    } else if key.ends_with("_count") {
+        group_thousands(v, 0)
+    } else {
+        group_thousands(v, 2)
+    };
+    (label, value)
+}
+
+/// A percentage with as many decimals as it needs: `4.7%`, `0.12%`, `100%`.
+fn pct(p: f64) -> String {
+    if p == 0.0 || p.abs() >= 10.0 {
+        format!("{p:.0}%")
+    } else if p.abs() >= 0.1 {
+        format!("{p:.1}%")
+    } else {
+        format!("{p:.2}%")
+    }
+}
+
+/// `12345.6` → `12 346` (thin groups of three, `decimals` after the point).
+fn group_thousands(v: f64, decimals: usize) -> String {
+    let s = format!("{:.*}", decimals, v.abs());
+    let (int, frac) = s.split_once('.').map_or((s.as_str(), ""), |(a, b)| (a, b));
+    let mut out = String::new();
+    for (i, ch) in int.chars().enumerate() {
+        if i > 0 && (int.len() - i) % 3 == 0 {
+            out.push('\u{202f}');
+        }
+        out.push(ch);
+    }
+    if !frac.is_empty() {
+        out.push('.');
+        out.push_str(frac);
+    }
+    if v < 0.0 && v.abs() >= 0.5 * 10f64.powi(-(decimals as i32)) {
+        out.insert(0, '−');
+    }
+    out
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct TimeWindow {
     pub from_s: f64,
     pub to_s: f64,
 }
 
-/// A concrete way to test a finding's advice.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
-pub struct Verification {
-    pub description: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub command: Option<String>,
-}
+/// A concrete way to test a finding's advice (v4 §5).
+pub use crate::analysis::verification::{Expectation, Verification};
 
 impl From<&crate::analysis::diagnosis::Finding> for Finding {
     fn from(f: &crate::analysis::diagnosis::Finding) -> Self {
@@ -678,20 +905,55 @@ impl From<&crate::analysis::diagnosis::Finding> for Finding {
     }
 }
 
-/// The tuner's search, embedded in the winner's report.
+/// The tuner's search, embedded in the winner's report (design v4 §6).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct TuneReport {
+    /// `goodput`, `p99`, `cost` or `balanced`.
     pub objective: String,
+    /// What goodput was measured in: `ops_per_s` or `mib_per_s`.
+    pub metric_unit: String,
     pub trials: Vec<TrialRow>,
     pub baseline_trial: u64,
+    /// The trial whose knobs are recommended.
+    pub recommended_trial_id: u64,
+    /// The recommendation's confirmation run.
     pub winner_trial: u64,
-    /// Objective change of the winner vs the baseline trial.
-    pub improvement_pct: f64,
+    /// The best trial within the SLA and the throttle budget, ignoring the safety margin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub best_feasible_trial_id: Option<u64>,
+    /// The baseline met the SLA and the throttle budget. When it did not, deltas are taken
+    /// against the best feasible trial.
+    pub baseline_feasible: bool,
+    /// Objective improvement of the recommendation vs the baseline (positive = better);
+    /// absent when the baseline was infeasible or above the safety margin. Never negative.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub improvement_ratio: Option<f64>,
+    /// One line: what is recommended and why.
+    pub headline: String,
+    /// How much better the best feasible trial measured than the recommendation: what the
+    /// safety margin costs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub margin_cost_ratio: Option<f64>,
+    /// Lowest concurrency that exceeded the throttle budget.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub throttle_ceiling_count: Option<u64>,
+    /// The capacity model's concurrency within the safety margin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub safe_concurrency_count: Option<u64>,
+    /// The throttle budget (share of throttled requests a feasible trial may cause).
+    pub max_throttle_ratio: f64,
+    /// The capacity model over every trial (`source: tune`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity: Option<crate::analysis::capacity::Capacity>,
+    /// Trials not dominated on (goodput, p99, cost, throttling).
+    #[serde(default)]
+    pub pareto_trial_ids: Vec<u64>,
     /// No trial met the SLA: the winner is the least-bad configuration.
     pub no_feasible_trial: bool,
     pub notes: Vec<String>,
+    /// The recommended configuration: knobs, profile, code, deltas.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recommendation: Option<crate::tune::recommend::Recommendation>,
 }
 
 /// One tuner trial.
@@ -706,8 +968,16 @@ pub struct TrialRow {
     pub p50_ms: f64,
     pub p99_ms: f64,
     pub error_ratio: f64,
-    pub throttle_ratio: f64,
+    /// Throttled responses / requests (the throttle budget applies to this).
+    pub throttled_request_ratio: f64,
+    /// Operations with ≥ 1 throttled response / operations.
+    pub throttled_op_ratio: f64,
     pub throttled_responses_count: u64,
+    pub requests_count: u64,
+    /// Requests in flight at the trial's peak.
+    pub peak_inflight_count: u64,
+    /// The most requests one operation had in flight at once (maximum over operations).
+    pub peak_inflight_per_op_count: u64,
     pub cost_per_million_ops_usd: f64,
     pub feasible: bool,
     pub note: String,
@@ -724,8 +994,12 @@ impl From<&crate::tune::Trial> for TrialRow {
             p50_ms: t.p50_ms,
             p99_ms: t.p99_ms,
             error_ratio: t.error_rate,
-            throttle_ratio: t.throttle_rate,
+            throttled_request_ratio: t.throttled_request_ratio,
+            throttled_op_ratio: t.throttled_op_ratio,
             throttled_responses_count: t.throttled_responses,
+            requests_count: t.requests,
+            peak_inflight_count: t.peak_inflight,
+            peak_inflight_per_op_count: t.peak_inflight_per_op.round().max(0.0) as u64,
             cost_per_million_ops_usd: t.cost_per_million_ops,
             feasible: t.feasible,
             note: t.note.clone(),
@@ -737,13 +1011,98 @@ impl From<&crate::report::TuneSummary> for TuneReport {
     fn from(s: &crate::report::TuneSummary) -> Self {
         Self {
             objective: s.objective.clone(),
+            metric_unit: s.metric_unit.clone(),
             trials: s.trials.iter().map(TrialRow::from).collect(),
             baseline_trial: s.baseline_trial as u64,
+            recommended_trial_id: s.recommended_trial as u64,
             winner_trial: s.winner_trial as u64,
-            improvement_pct: s.improvement * 100.0,
+            best_feasible_trial_id: s.best_feasible_trial.map(|t| t as u64),
+            baseline_feasible: s.baseline_feasible,
+            improvement_ratio: s.improvement.filter(|i| *i >= 0.0),
+            headline: s.headline.clone(),
+            margin_cost_ratio: s.margin_cost_ratio,
             throttle_ceiling_count: s.throttle_ceiling.map(|c| c as u64),
+            safe_concurrency_count: s.safe_concurrency.map(|c| c as u64),
+            max_throttle_ratio: s.max_throttle_ratio,
+            capacity: s.capacity.clone(),
+            pareto_trial_ids: s.pareto.iter().map(|t| *t as u64).collect(),
             no_feasible_trial: s.no_feasible_trial,
             notes: s.notes.clone(),
+            recommendation: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every `*_count` field of every registered schema is an integer (design v4 §4).
+    #[test]
+    fn counts_are_integers_in_every_schema() {
+        fn walk(v: &serde_json::Value, path: &str, bad: &mut Vec<String>) {
+            match v {
+                serde_json::Value::Object(m) => {
+                    if let Some(serde_json::Value::Object(props)) = m.get("properties") {
+                        for (k, p) in props {
+                            let number = p.get("type").is_some_and(|t| {
+                                t == "number"
+                                    || t.as_array()
+                                        .is_some_and(|a| a.iter().any(|x| x == "number"))
+                            });
+                            let map_of_numbers = p
+                                .get("additionalProperties")
+                                .and_then(|a| a.get("type"))
+                                .is_some_and(|t| t == "number");
+                            if k.ends_with("_count") && (number || map_of_numbers) {
+                                bad.push(format!("{path}.{k}"));
+                            }
+                        }
+                    }
+                    for (k, x) in m {
+                        walk(x, &format!("{path}/{k}"), bad);
+                    }
+                }
+                serde_json::Value::Array(a) => a.iter().for_each(|x| walk(x, path, bad)),
+                _ => {}
+            }
+        }
+        let mut bad = Vec::new();
+        for e in crate::mcp::schemas::entries() {
+            if let Some(s) = crate::mcp::schemas::schema(e.name) {
+                walk(&s, e.name, &mut bad);
+            }
+        }
+        assert!(bad.is_empty(), "fractional `_count` fields: {bad:#?}");
+    }
+
+    #[test]
+    fn evidence_values_read_as_labels_units_and_percentages() {
+        let e = Evidence {
+            values: [
+                ("throttled_request_ratio", 0.0468),
+                ("p99_ms", 262.918),
+                ("retry_pct", 12.0),
+                ("safe_concurrency_count", 20.0),
+                ("mean_request_bytes", 65536.0),
+                ("p99_to_p50_ratio", 30.0),
+                ("ceiling_requests_per_s", 2410.4),
+                ("extra_requests_per_1k_ops_mean", -1031.0),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), v))
+            .collect(),
+            ..Default::default()
+        };
+        let l: BTreeMap<String, String> = e.labelled().into_iter().collect();
+        assert_eq!(l["Throttled requests"], "4.7%");
+        assert_eq!(l["Time in retry backoff"], "12%");
+        assert_eq!(l["Safe concurrency"], "20");
+        assert_eq!(l["p99 / p50"], "30.00×");
+        assert_eq!(l["Ceiling requests"], "2\u{202f}410 requests/s");
+        assert_eq!(l["Extra requests per 1 000 ops"], "−1\u{202f}031.00");
+        assert!(l["Mean request size"].contains("KiB"), "{l:?}");
+        assert!(l["P99"].ends_with("ms"), "{l:?}");
+        assert!(!l.keys().any(|k| k.contains('_')), "{l:?}");
     }
 }

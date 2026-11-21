@@ -20,6 +20,13 @@ use crate::util::{ByteSize, parse_duration};
 struct SchemaDoc(serde_json::Value);
 
 impl CommandOutput for SchemaDoc {
+    fn formats() -> &'static [crate::output::OutputFormat] {
+        crate::output::WITH_MD
+    }
+    fn enveloped(&self) -> bool {
+        false
+    }
+
     fn text(&self) -> String {
         serde_json::to_string_pretty(&self.0).unwrap_or_default()
     }

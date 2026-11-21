@@ -40,6 +40,23 @@ pub struct RepeatOutput {
 }
 
 impl CommandOutput for RepeatOutput {
+    fn next(&self) -> Vec<crate::output::NextStep> {
+        let mut v = Vec::new();
+        if let (Some(a), Some(b)) = (self.runs.first(), self.runs.last())
+            && a.id != b.id
+        {
+            v.push(crate::cli::next::compare(&a.id, &b.id));
+        }
+        if let Some(r) = self.runs.last() {
+            v.push(crate::cli::next::explain(&r.id));
+        }
+        v
+    }
+
+    fn formats() -> &'static [crate::output::OutputFormat] {
+        crate::output::WITH_MD
+    }
+
     fn text(&self) -> String {
         let mut o = String::new();
         if self.runs.len() > 1 {
@@ -121,9 +138,7 @@ impl CommandOutput for RepeatOutput {
 }
 
 pub async fn cmd_run_repeat(a: RunArgs, ctx: &Ctx) -> Result<u8> {
-    let (mut profile, target_name) =
-        super::resolve_profile(ctx, &a.target, &a.workload, &a.knobs, &a.cost)?;
-    super::apply_sla(&mut profile, &a.sla)?;
+    let (mut profile, target_name) = super::run_profile(ctx, &a)?;
     let first = super::run::rails(ctx, &profile, &a.safety)?;
     if a.safety.dry_run {
         let mut plan = first.plan(&profile);
@@ -226,7 +241,10 @@ pub async fn cmd_run_repeat(a: RunArgs, ctx: &Ctx) -> Result<u8> {
         if added && exit_code == exit::OK {
             let mut b = Baselines::load(&file)?;
             for r in &runs {
-                b.add_run(name, r.id());
+                // Partial or invalid runs never join a baseline (design v4 §4).
+                if let Err(e) = b.add_report(name, &r.report) {
+                    ctx.out.warn(e.to_string());
+                }
             }
             b.save(&file)?;
         } else {

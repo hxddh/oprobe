@@ -102,6 +102,24 @@ pub fn bar(frac: f64, width: usize) -> String {
     s
 }
 
+/// `s` without ANSI color sequences.
+pub fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_esc = false;
+    for c in s.chars() {
+        if in_esc {
+            if c == 'm' {
+                in_esc = false;
+            }
+        } else if c == '\x1b' {
+            in_esc = true;
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Visible width of a string ignoring ANSI escape sequences.
 pub fn visible_width(s: &str) -> usize {
     let mut w = 0;
