@@ -308,3 +308,152 @@ fn zero_to_one_throttled_response_does_not_fail_the_gate() {
         assert!(chk.get(k).is_some(), "{k}: {chk}");
     }
 }
+
+/// A throttling run on `lab://demo` with a bounded number of operations (a stable size).
+fn throttled_demo_run(env: &Env) -> Value {
+    let o = env.run(&[
+        "run",
+        "lab://demo",
+        "--preset",
+        "small-files",
+        "--objects",
+        "16",
+        "--object-size",
+        "16KiB",
+        "-c",
+        "40",
+        "--max-ops",
+        "300",
+        "-d",
+        "10s",
+        "--warmup",
+        "0s",
+        "-o",
+        "json",
+    ]);
+    assert!(
+        o.status.code().is_some_and(|c| c == 0 || c == 3),
+        "{}",
+        err(&o)
+    );
+    json(&o)
+}
+
+fn saved_runs(env: &Env) -> usize {
+    std::fs::read_dir(env.path("data").join("runs"))
+        .map(|rd| {
+            rd.filter(|e| {
+                e.as_ref()
+                    .is_ok_and(|e| e.path().extension().is_some_and(|x| x == "oprobe"))
+            })
+            .count()
+        })
+        .unwrap_or(0)
+}
+
+#[test]
+fn verify_and_calibrate_budgets_cover_every_replay() {
+    let env = Env::new();
+    let run = throttled_demo_run(&env);
+    let codes: Vec<&str> = run["report"]["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["code"].as_str().unwrap())
+        .collect();
+    assert!(codes.contains(&"throttling"), "{codes:?}");
+    // One replay fits the budget with room to spare; the six replays of `--repeat 3` do not.
+    let one = run["report"]["connections"]["requests_count"]
+        .as_u64()
+        .unwrap()
+        + 16;
+    let budget = (one * 5 / 2).to_string();
+    let before = saved_runs(&env);
+    let o = env.run(&[
+        "verify",
+        "last",
+        "throttling",
+        "--repeat",
+        "3",
+        "--max-requests",
+        &budget,
+        "-o",
+        "json",
+    ]);
+    assert_eq!(o.status.code(), Some(4), "{}", err(&o));
+    assert_eq!(json(&o)["error"]["code"], "safety.budget_exceeded");
+    let replays = saved_runs(&env) - before;
+    assert!(
+        (1..6).contains(&replays),
+        "{replays} replays saved: the budget covers the whole command"
+    );
+    // `baseline calibrate --from` shares one budget too.
+    let before = saved_runs(&env);
+    let o = env.run(&[
+        "baseline",
+        "calibrate",
+        "--from",
+        run["run_id"].as_str().unwrap(),
+        "--repeat",
+        "4",
+        "--max-requests",
+        &budget,
+        "-o",
+        "json",
+    ]);
+    assert_eq!(o.status.code(), Some(4), "{}", err(&o));
+    assert!(saved_runs(&env) - before < 4);
+}
+
+#[test]
+fn fix_without_saving_verifies_from_the_in_memory_diagnosis() {
+    let env = Env::new();
+    let o = env.run(&[
+        "fix",
+        "lab://demo",
+        "--preset",
+        "small-files",
+        "--objects",
+        "16",
+        "--object-size",
+        "16KiB",
+        "-c",
+        "40",
+        "-d",
+        "1s",
+        "--warmup",
+        "0s",
+        "--trial-duration",
+        "500ms",
+        "--trial-warmup",
+        "0s",
+        "--cooldown",
+        "0s",
+        "--max-trials",
+        "6",
+        "--repeat",
+        "1",
+        "--no-save",
+        "-o",
+        "json",
+    ]);
+    assert!(
+        o.status.code().is_some_and(|c| c == 0 || c == 3),
+        "{}",
+        err(&o)
+    );
+    let v = json(&o);
+    assert!(
+        v["recommendation"]["overrides"]["knobs"]
+            .as_object()
+            .is_some_and(|k| !k.is_empty()),
+        "the throttled demo needs a change: {v}"
+    );
+    assert!(v["verify"].is_object(), "{v}");
+    assert_eq!(saved_runs(&env), 0, "--no-save stores nothing");
+    // The next step cannot replay an unsaved run by id: it is a self-contained command.
+    for n in v["next"].as_array().unwrap() {
+        let cli = n["cli"].as_str().unwrap();
+        assert!(!cli.contains("--from"), "{cli}");
+    }
+}

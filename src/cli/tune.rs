@@ -250,6 +250,9 @@ pub(super) fn options_for(
 }
 
 /// Run the tuner on `profile` under the safety rails and build the result (no output).
+/// `guard` is the command's guard ([`super::run::guard_for`]): `fix` shares one across its
+/// diagnosis, tuning and verification.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn run_tune(
     ctx: &Ctx,
     profile: Profile,
@@ -257,9 +260,9 @@ pub(super) async fn run_tune(
     opts: TuneOptions,
     safety: &SafetyArgs,
     output: &OutputArgs,
+    guard: Option<Arc<crate::guard::Guard>>,
 ) -> Result<TuneOutput> {
     let rails = rails(ctx, &profile, safety)?;
-    let guard = guard_for(ctx, &profile, &rails.budgets);
     let cancel = Cancel::new();
     super::install_ctrl_c(cancel.clone());
     let quiet = ctx.out.quiet;
@@ -402,7 +405,8 @@ pub async fn cmd_tune(a: TuneArgs, ctx: &Ctx) -> Result<u8> {
             .unwrap_or_default(),
         eta
     )));
-    let mut out = run_tune(ctx, profile, target_name, opts, &a.safety, &a.output).await?;
+    let guard = guard_for(ctx, &profile, &super::run::budgets(ctx, &a.safety)?);
+    let mut out = run_tune(ctx, profile, target_name, opts, &a.safety, &a.output, guard).await?;
     let header = format!("{} · {}", out.tune.headline, crate::util::now_rfc3339());
     let rec = out.recommendation.clone();
     if let Some(p) = &a.emit_profile {

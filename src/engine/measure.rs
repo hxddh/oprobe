@@ -38,7 +38,8 @@ pub struct Rails {
 
 impl Rails {
     /// Decide the rails of one measurement of `profile`; refuses (`safety.read_only`) a
-    /// read-only run that would write.
+    /// read-only run that would write, and any run that would write when a read-only MCP server
+    /// started this command ([`crate::guard::check_server_read_only`]).
     pub fn new(
         profile: &Profile,
         read_only: bool,
@@ -59,6 +60,7 @@ impl Rails {
         if read_only {
             crate::guard::check_read_only(profile)?;
         }
+        crate::guard::check_server_read_only(profile)?;
         Ok(Self {
             run_id,
             run_prefix,

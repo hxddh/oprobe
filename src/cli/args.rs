@@ -414,6 +414,13 @@ pub struct FixArgs {
     /// Total wall-time budget of the tuning step, e.g. 5m (caps the trials so the estimate fits)
     #[arg(long, value_name = "DURATION", value_parser = parse::positive_duration, help_heading = "Tuning")]
     pub budget: Option<String>,
+    /// Fix the workload of a stored run (RUNREF): its spec, with credentials resolved again
+    /// from the target; other flags and --set override it (as `run --from`)
+    #[arg(long, value_name = "RUNREF", value_parser = parse::run_ref, conflicts_with = "profile", help_heading = "Replay")]
+    pub from: Option<String>,
+    /// Override one setting of the workload, repeatable (as `run --set`)
+    #[arg(long = "set", value_name = "KEY=VALUE", value_parser = parse::set, help_heading = "Replay")]
+    pub set: Vec<String>,
 }
 
 /// `oprobe baseline calibrate TARGET`.
