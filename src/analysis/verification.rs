@@ -90,7 +90,7 @@ impl Verification {
 }
 
 /// What `verify` concluded about one hypothesis.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum VerifyOutcome {
     /// The change moved the metrics as expected.
@@ -98,7 +98,18 @@ pub enum VerifyOutcome {
     /// The change did not help (or made things worse).
     Refuted,
     /// Noise or too few samples to tell.
+    #[default]
     Inconclusive,
+}
+
+impl VerifyOutcome {
+    pub fn label(self) -> &'static str {
+        match self {
+            VerifyOutcome::Confirmed => "confirmed",
+            VerifyOutcome::Refuted => "refuted",
+            VerifyOutcome::Inconclusive => "inconclusive",
+        }
+    }
 }
 
 #[cfg(test)]

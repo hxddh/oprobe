@@ -173,18 +173,22 @@ pub fn compare_view() -> impl IntoElement {
                                     .child(small("Limit").flex_1()),
                             )
                             .children(c.diff.checks.iter().map(|ch| {
-                                let tone = status_tone(ch.status);
-                                let st = ch.status;
+                                let tone = status_tone(ch.verdict);
+                                let st = ch.verdict;
                                 view()
                                     .flex_row()
                                     .gap_3()
                                     .items_center()
                                     .py(px(2.0))
-                                    .child(body(ch.name.clone()).w(px(200.0)).number_of_lines(1))
+                                    .child(body(ch.label()).w(px(200.0)).number_of_lines(1))
                                     .child(num(fmt::sig3(ch.baseline)).w(px(90.0)))
                                     .child(num(fmt::sig3(ch.candidate)).w(px(90.0)))
                                     .child(
-                                        num(fmt::delta_pct(ch.change_pct)).w(px(80.0)).text_color(
+                                        num(fmt::delta_pct(
+                                            ch.delta_ratio.map_or(f64::INFINITY, |d| d * 100.0),
+                                        ))
+                                        .w(px(80.0))
+                                        .text_color(
                                             move || match tone {
                                                 Tone::Neutral => theme().foreground,
                                                 t => t.color(),
@@ -197,7 +201,7 @@ pub fn compare_view() -> impl IntoElement {
                                             .gap_2()
                                             .flex_1()
                                             .child(badge(status_label(st), move || tone))
-                                            .child(small(ch.limit.clone())),
+                                            .child(small(ch.fmt_limit())),
                                     )
                             })),
                     )

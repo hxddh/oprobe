@@ -1,12 +1,17 @@
-//! Repeat-aware run comparison (`oprobe compare`, `run --baseline`): the per-check gate of
-//! [`crate::report::diff`] on representative runs, made statistical.
+//! Repeat-aware run comparison (`oprobe compare`, `run --baseline`, `verify`): the gate of
+//! [`crate::report::diff`] on representative runs, made statistical (design v4 §7).
 //!
-//! - Either side may hold several runs (a `--repeat` group or a named baseline). Latency and
-//!   throughput are then compared as medians across runs with bootstrap confidence intervals.
-//! - With one run per side the operation rows are bootstrapped instead (latency), and the
-//!   per-second throughput series (throughput).
-//! - A latency or throughput check fails only when the change exceeds its limit *and* the 95 %
-//!   interval of the change excludes zero; otherwise it passes with a "not significant" note.
+//! - **One run per side:** a block bootstrap over per-second windows (each second's operations
+//!   move together, so autocorrelation within a second does not inflate the confidence),
+//!   always reported as `confidence: low`.
+//! - **Several runs per side:** run-level variance — a Welch t-interval over the per-run
+//!   values (medians, p99s, good-op rates).
+//! - **Noise floor:** a change is significant only when its 95 % interval excludes zero *and*
+//!   it is larger than the metric's noise floor, learned from repeated identical runs of the
+//!   target (`<data>/noise.toml`, [`crate::store::baselines::NoiseFloors`]) or a default.
+//! - A latency or throughput check fails only when the change exceeds its limit and is
+//!   significant; otherwise it passes with a "not significant" note.
+//! - Runs of different targets or workloads get no verdict (`comparable: false`).
 //! - Findings are diffed: new, resolved and persisting codes.
 
 use std::collections::BTreeMap;
@@ -15,9 +20,11 @@ use std::fmt::Write as _;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use super::capacity::Confidence;
 use super::stats::{self, Interval};
 use crate::model::{Report, Run};
-use crate::report::diff::{DiffReport, Status, Thresholds, diff};
+use crate::report::diff::{DiffReport, GateVerdict, Status, Thresholds, diff, good_ops_per_s};
+use crate::store::baselines::{NoiseEntry, noise_ratio};
 
 /// One side of a comparison.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -29,19 +36,36 @@ pub struct Side {
     pub representative: String,
 }
 
+/// How a [`MetricStat`] interval was computed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Method {
+    /// One run per side: block bootstrap over per-second windows.
+    BlockBootstrap,
+    /// Several runs per side: a t-interval over the per-run values.
+    RunsT,
+    /// Too few samples: point estimates only, never significant.
+    #[default]
+    Unavailable,
+}
+
 /// A headline metric with confidence intervals.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct MetricStat {
     /// `p50_ms`, `p99_ms`, `ops_per_s`.
     pub metric: String,
+    /// Unit of `baseline` and `candidate`.
+    pub unit: String,
     pub baseline: Interval,
     pub candidate: Interval,
-    /// Relative change of the candidate (fraction; +0.1 = 10 % higher).
+    /// Relative change of the candidate (ratio; +0.1 = 10 % higher), with its 95 % interval.
     pub change: Interval,
-    /// The 95 % interval of the change excludes zero.
+    /// Changes smaller than this are noise for this target and workload.
+    pub noise_floor_ratio: f64,
+    /// The 95 % interval excludes zero and the change exceeds the noise floor.
     pub significant: bool,
-    /// `runs` (medians across runs) or `samples` (operations / seconds of one run each).
-    pub method: String,
+    pub method: Method,
+    pub confidence: Confidence,
 }
 
 /// A finding code on one side only, or on both.
@@ -62,15 +86,20 @@ pub struct FindingsDiff {
 /// Result of `oprobe compare`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Comparison {
+    /// `passed`, `regression` or `not_comparable` (no verdict).
+    pub verdict: GateVerdict,
+    /// The verdict is `passed`.
     pub passed: bool,
+    /// Same target identity and workload hash (design v4 §7).
+    pub comparable: bool,
     pub baseline: Side,
     pub candidate: Side,
     pub stats: Vec<MetricStat>,
     pub findings: FindingsDiff,
     /// p99 (ms) of every baseline run then every candidate run, in time order.
     pub p99_trend_ms: Vec<f64>,
-    /// The per-check gate (configuration changes, per-operation latency, errors, throttling,
-    /// amplification, cost), with significance applied to latency and throughput checks.
+    /// The per-check gate (per-operation latency, errors, throttling, amplification, cost),
+    /// with significance applied to latency and throughput checks.
     pub gate: DiffReport,
 }
 
@@ -87,25 +116,191 @@ fn median_run(runs: &[Run]) -> &Run {
     &runs[idx[idx.len() / 2]]
 }
 
-fn op_lat_ms(run: &Run, verb: Option<&str>) -> Vec<f64> {
-    run.ops
-        .iter()
-        .filter(|o| o.ok && verb.is_none_or(|v| o.verb == v))
-        .map(|o| o.latency_us as f64 / 1000.0)
-        .collect()
+/// Most samples per window kept for the latency bootstrap.
+const MAX_PER_BLOCK: usize = 400;
+
+/// Width of the bootstrap's time windows (µs): one second, or a tenth of the measurement
+/// window for runs shorter than 10 s (at least 100 ms), so short runs still have blocks.
+fn block_us(run: &Run) -> i64 {
+    let w = run.report.run.window_s.max(0.0);
+    ((w / 10.0).clamp(0.1, 1.0) * 1e6) as i64
 }
 
-fn per_second_ops(run: &Run) -> Vec<f64> {
-    super::segments::segments(&run.ops, run.report.run.window_s)
-        .per_second
-        .iter()
-        .map(|s| s.ops_count as f64)
-        .collect()
+/// Successful-op latencies (ms) of `verb` (all when `None`) by time window of the
+/// measurement ([`block_us`]).
+fn latency_seconds(run: &Run, verb: Option<&str>) -> Vec<Vec<f64>> {
+    let width = block_us(run);
+    let w_us = (run.report.run.window_s.max(0.0) * 1e6) as i64;
+    let n = ((w_us + width - 1) / width).max(1) as usize;
+    let mut b: Vec<Vec<f64>> = vec![Vec::new(); n];
+    for o in &run.ops {
+        if !o.ok || o.t_us < 0 || verb.is_some_and(|v| o.verb != v) {
+            continue;
+        }
+        let s = (o.t_us / width) as usize;
+        if s < n {
+            b[s].push(o.latency_us as f64 / 1000.0);
+        }
+    }
+    for v in &mut b {
+        if v.len() > MAX_PER_BLOCK {
+            let step = v.len() as f64 / MAX_PER_BLOCK as f64;
+            *v = (0..MAX_PER_BLOCK)
+                .map(|i| v[(i as f64 * step) as usize])
+                .collect();
+        }
+    }
+    b.retain(|v| !v.is_empty());
+    b
 }
 
-/// Per-run values of `f`, or `None` when it is unavailable.
-fn per_run(runs: &[Run], f: impl Fn(&Report) -> Option<f64>) -> Option<Vec<f64>> {
-    runs.iter().map(|r| f(&r.report)).collect()
+/// Successful operations per second in each whole time window ([`block_us`]).
+fn ops_seconds(run: &Run) -> Vec<f64> {
+    let width = block_us(run);
+    let w_us = (run.report.run.window_s.max(0.0) * 1e6) as i64;
+    let full = (w_us / width) as usize;
+    if full == 0 {
+        return Vec::new();
+    }
+    let mut b = vec![0f64; full];
+    for o in &run.ops {
+        if o.ok && o.t_us >= 0 {
+            let s = (o.t_us / width) as usize;
+            if s < full {
+                b[s] += 1e6 / width as f64;
+            }
+        }
+    }
+    b
+}
+
+fn pooled(blocks: &[Vec<f64>], pick: &[usize]) -> Vec<f64> {
+    let mut v = Vec::new();
+    for &i in pick {
+        v.extend_from_slice(&blocks[i]);
+    }
+    v
+}
+
+/// Indices of a moving-block resample of `n` items with blocks of `len`.
+fn block_indices(n: usize, len: usize, rng: &mut stats::Rng, out: &mut Vec<usize>) {
+    out.clear();
+    let len = len.clamp(1, n);
+    while out.len() < n {
+        let start = rng.index(n);
+        for k in 0..len {
+            if out.len() == n {
+                break;
+            }
+            out.push((start + k) % n);
+        }
+    }
+}
+
+const ITERS: usize = 1000;
+
+/// `(baseline, candidate, change)` for one run per side: a block bootstrap of `stat` over
+/// per-second blocks of samples.
+fn block_bootstrap(
+    a: &[Vec<f64>],
+    b: &[Vec<f64>],
+    block_len: usize,
+    stat: &dyn Fn(&mut [f64]) -> f64,
+    seed: u64,
+) -> (Interval, Interval, Interval) {
+    let full = |x: &[Vec<f64>]| {
+        let mut v: Vec<f64> = x.iter().flatten().copied().collect();
+        stat(&mut v)
+    };
+    let (ea, eb) = (full(a), full(b));
+    let rel = |x: f64, y: f64| if x.abs() > 0.0 { y / x - 1.0 } else { 0.0 };
+    let mut rng = stats::Rng::new(seed);
+    let (mut ia, mut ib) = (Vec::new(), Vec::new());
+    let (mut sa, mut sb, mut sc) = (
+        Vec::with_capacity(ITERS),
+        Vec::with_capacity(ITERS),
+        Vec::with_capacity(ITERS),
+    );
+    for _ in 0..ITERS {
+        block_indices(a.len(), block_len, &mut rng, &mut ia);
+        block_indices(b.len(), block_len, &mut rng, &mut ib);
+        let x = stat(&mut pooled(a, &ia));
+        let y = stat(&mut pooled(b, &ib));
+        sa.push(x);
+        sb.push(y);
+        sc.push(rel(x, y));
+    }
+    let iv = |e: f64, s: &mut Vec<f64>| Interval {
+        estimate: e,
+        low: stats::quantile_mut(s, 0.025),
+        high: stats::quantile_mut(s, 0.975),
+    };
+    (iv(ea, &mut sa), iv(eb, &mut sb), iv(rel(ea, eb), &mut sc))
+}
+
+/// Two-sided 97.5 % quantile of Student's t with `df` degrees of freedom.
+pub fn t975(df: f64) -> f64 {
+    const T: [f64; 30] = [
+        12.706, 4.303, 3.182, 2.776, 2.571, 2.447, 2.365, 2.306, 2.262, 2.228, 2.201, 2.179, 2.160,
+        2.145, 2.131, 2.120, 2.110, 2.101, 2.093, 2.086, 2.080, 2.074, 2.069, 2.064, 2.060, 2.056,
+        2.052, 2.048, 2.045, 2.042,
+    ];
+    if !df.is_finite() || df < 1.0 {
+        return T[0];
+    }
+    let i = df.floor() as usize;
+    if i > 30 { 1.96 } else { T[i - 1] }
+}
+
+fn var(v: &[f64]) -> f64 {
+    let n = v.len();
+    if n < 2 {
+        return 0.0;
+    }
+    let m = stats::mean(v);
+    v.iter().map(|x| (x - m) * (x - m)).sum::<f64>() / (n - 1) as f64
+}
+
+/// `(baseline, candidate, change)` over per-run values: means with t-intervals, and the
+/// relative change with a Welch interval. A side with one run borrows the other side's
+/// variance.
+pub fn runs_t(a: &[f64], b: &[f64]) -> (Interval, Interval, Interval) {
+    let (ma, mb) = (stats::mean(a), stats::mean(b));
+    let (mut va, mut vb) = (var(a), var(b));
+    if a.len() < 2 {
+        va = vb;
+    }
+    if b.len() < 2 {
+        vb = va;
+    }
+    let (na, nb) = (a.len() as f64, b.len() as f64);
+    let side = |m: f64, v: f64, n: f64| {
+        let h = t975(n - 1.0) * (v / n).sqrt();
+        Interval {
+            estimate: m,
+            low: m - h,
+            high: m + h,
+        }
+    };
+    let se2 = va / na + vb / nb;
+    let df = if se2 > 0.0 {
+        let num = se2 * se2;
+        let den = (va / na).powi(2) / (na - 1.0).max(1.0) + (vb / nb).powi(2) / (nb - 1.0).max(1.0);
+        if den > 0.0 { num / den } else { na + nb - 2.0 }
+    } else {
+        na + nb - 2.0
+    };
+    let h = t975(df) * se2.sqrt();
+    let change = if ma.abs() > 0.0 {
+        Interval {
+            estimate: (mb - ma) / ma,
+            low: (mb - ma - h) / ma,
+            high: (mb - ma + h) / ma,
+        }
+    } else {
+        Interval::default()
+    };
+    (side(ma, va, na), side(mb, vb, nb), change)
 }
 
 fn verb_q(r: &Report, verb: &str, p99: bool) -> Option<f64> {
@@ -115,68 +310,68 @@ fn verb_q(r: &Report, verb: &str, p99: bool) -> Option<f64> {
         .map(|v| if p99 { v.latency.p99 } else { v.latency.p50 })
 }
 
-/// Change interval for a latency quantile (`q`) of `verb` (all operations when `None`).
-fn latency_change(
-    base: &[Run],
-    cand: &[Run],
-    verb: Option<&str>,
-    q: f64,
-) -> Option<(Interval, Interval, Interval, &'static str)> {
-    let seed = (q * 1000.0) as u64 ^ verb.map_or(0, |v| crate::model::ids::fnv1a(v.as_bytes()));
-    if base.len() > 1 || cand.len() > 1 {
-        let get = |r: &Report| match verb {
-            Some(v) => verb_q(r, v, q > 0.9),
-            None => Some(if q > 0.9 {
-                r.summary.latency.p99
-            } else {
-                r.summary.latency.p50
-            }),
-        };
-        let (a, b) = (per_run(base, get)?, per_run(cand, get)?);
-        return Some((
-            stats::bootstrap(&a, stats::med, seed),
-            stats::bootstrap(&b, stats::med, seed + 1),
-            stats::bootstrap_rel_change(&a, &b, stats::med, seed + 2),
-            "runs",
-        ));
+type Change = (Interval, Interval, Interval, Method, Confidence);
+
+fn runs_confidence(na: usize, nb: usize) -> Confidence {
+    match na.min(nb) {
+        n if n >= 5 => Confidence::High,
+        n if n >= 3 => Confidence::Medium,
+        _ => Confidence::Low,
     }
-    let (a, b) = (op_lat_ms(&base[0], verb), op_lat_ms(&cand[0], verb));
-    if a.len() < 10 || b.len() < 10 {
-        return None;
-    }
-    Some((
-        stats::bootstrap(&a, stats::p(q), seed),
-        stats::bootstrap(&b, stats::p(q), seed + 1),
-        stats::bootstrap_rel_change(&a, &b, stats::p(q), seed + 2),
-        "samples",
-    ))
 }
 
-fn throughput_change(
-    base: &[Run],
-    cand: &[Run],
-) -> Option<(Interval, Interval, Interval, &'static str)> {
+/// Change of a latency quantile `q` of `verb` (all operations when `None`).
+fn latency_change(base: &[Run], cand: &[Run], verb: Option<&str>, q: f64) -> Option<Change> {
+    let seed = (q * 1000.0) as u64 ^ verb.map_or(0, |v| crate::model::ids::fnv1a(v.as_bytes()));
     if base.len() > 1 || cand.len() > 1 {
-        let get = |r: &Report| Some(r.summary.ops_per_s);
-        let (a, b) = (per_run(base, get)?, per_run(cand, get)?);
-        return Some((
-            stats::bootstrap(&a, stats::med, 11),
-            stats::bootstrap(&b, stats::med, 12),
-            stats::bootstrap_rel_change(&a, &b, stats::med, 13),
-            "runs",
-        ));
+        let get = |r: &Run| match verb {
+            Some(v) => verb_q(&r.report, v, q > 0.9),
+            None => Some(if q > 0.9 {
+                r.report.summary.latency.p99
+            } else {
+                r.report.summary.latency.p50
+            }),
+        };
+        let a: Option<Vec<f64>> = base.iter().map(get).collect();
+        let b: Option<Vec<f64>> = cand.iter().map(get).collect();
+        let (a, b) = (a?, b?);
+        let (x, y, c) = runs_t(&a, &b);
+        return Some((x, y, c, Method::RunsT, runs_confidence(a.len(), b.len())));
     }
-    let (a, b) = (per_second_ops(&base[0]), per_second_ops(&cand[0]));
+    let (a, b) = (
+        latency_seconds(&base[0], verb),
+        latency_seconds(&cand[0], verb),
+    );
+    let count = |x: &[Vec<f64>]| x.iter().map(Vec::len).sum::<usize>();
+    if a.len() < 3 || b.len() < 3 || count(&a) < 10 || count(&b) < 10 {
+        return None;
+    }
+    let (x, y, c) = block_bootstrap(&a, &b, 1, &stats::p(q), seed);
+    Some((x, y, c, Method::BlockBootstrap, Confidence::Low))
+}
+
+/// Change of the good-op rate.
+fn throughput_change(base: &[Run], cand: &[Run]) -> Option<Change> {
+    if base.len() > 1 || cand.len() > 1 {
+        let a: Vec<f64> = base.iter().map(|r| good_ops_per_s(&r.report)).collect();
+        let b: Vec<f64> = cand.iter().map(|r| good_ops_per_s(&r.report)).collect();
+        let (x, y, c) = runs_t(&a, &b);
+        return Some((x, y, c, Method::RunsT, runs_confidence(a.len(), b.len())));
+    }
+    let (a, b) = (ops_seconds(&base[0]), ops_seconds(&cand[0]));
     if a.len() < 3 || b.len() < 3 {
         return None;
     }
+    let block = ((a.len().min(b.len()) as f64).cbrt().ceil() as usize).max(1);
+    let wrap = |v: &[f64]| v.iter().map(|x| vec![*x]).collect::<Vec<_>>();
     let mean = |v: &mut [f64]| stats::mean(v);
-    Some((
-        stats::bootstrap(&a, mean, 11),
-        stats::bootstrap(&b, mean, 12),
-        stats::bootstrap_rel_change(&a, &b, mean, 13),
-        "samples",
-    ))
+    let (x, y, c) = block_bootstrap(&wrap(&a), &wrap(&b), block, &mean, 11);
+    Some((x, y, c, Method::BlockBootstrap, Confidence::Low))
+}
+
+/// The change is significant: its interval excludes zero and it exceeds the noise floor.
+pub fn significant(change: &Interval, floor: f64) -> bool {
+    change.excludes_zero() && change.estimate.abs() > floor
 }
 
 fn majority_codes(runs: &[Run]) -> BTreeMap<String, FindingRef> {
@@ -232,7 +427,20 @@ fn fmt_ci(i: &Interval) -> String {
     )
 }
 
-/// Compare `cand` runs against `base` runs (each non-empty).
+fn method_label(m: Method, c: Confidence) -> String {
+    let conf = match c {
+        Confidence::Low => "low confidence",
+        Confidence::Medium => "medium confidence",
+        Confidence::High => "high confidence",
+    };
+    match m {
+        Method::BlockBootstrap => format!("per-second block bootstrap, {conf}"),
+        Method::RunsT => format!("t-interval over runs, {conf}"),
+        Method::Unavailable => "too few samples".into(),
+    }
+}
+
+/// Compare `cand` runs against `base` runs (each non-empty) with the default noise floors.
 pub fn compare(
     base: &[Run],
     cand: &[Run],
@@ -240,56 +448,123 @@ pub fn compare(
     cand_label: &str,
     t: &Thresholds,
 ) -> Comparison {
+    compare_with_noise(base, cand, base_label, cand_label, t, None)
+}
+
+/// [`compare`] with the noise floors learned for the target and workload.
+pub fn compare_with_noise(
+    base: &[Run],
+    cand: &[Run],
+    base_label: &str,
+    cand_label: &str,
+    t: &Thresholds,
+    noise: Option<&NoiseEntry>,
+) -> Comparison {
     assert!(
         !base.is_empty() && !cand.is_empty(),
         "compare needs runs on both sides"
     );
     let (rb, rc) = (median_run(base), median_run(cand));
     let mut gate = diff(&rb.report, &rc.report, t);
+    // Every run of a side must be comparable with the other side's representative.
+    if gate.comparable {
+        for r in base.iter().chain(cand.iter()) {
+            let other = if base.iter().any(|b| b.id() == r.id()) {
+                &rc.report
+            } else {
+                &rb.report
+            };
+            let id = crate::report::diff::identity(&r.report, other, &[], t);
+            if !id.comparable {
+                gate.comparable = false;
+                gate.identity.comparable = false;
+                gate.identity.reasons.push(format!(
+                    "run {} of the comparison: {}",
+                    r.id(),
+                    id.reasons.join("; ")
+                ));
+            }
+        }
+    }
     let repeated = base.len() > 1 || cand.len() > 1;
     // Significance for latency and throughput checks.
     for chk in gate.checks.iter_mut() {
-        let interval = if let Some(verb) = chk.name.strip_suffix(" p99 ms") {
-            latency_change(base, cand, Some(verb), 0.99)
-        } else if let Some(verb) = chk.name.strip_suffix(" p50 ms") {
-            latency_change(base, cand, Some(verb), 0.50)
-        } else if chk.name == "throughput ops/s" {
-            throughput_change(base, cand)
+        let (iv, metric) = if let Some(verb) = chk.id.strip_prefix("latency_p99.") {
+            (latency_change(base, cand, Some(verb), 0.99), "p99_ms")
+        } else if let Some(verb) = chk.id.strip_prefix("latency_p50.") {
+            (latency_change(base, cand, Some(verb), 0.50), "p50_ms")
+        } else if chk.id == "throughput" {
+            (throughput_change(base, cand), "ops_per_s")
         } else {
             continue;
         };
-        let Some((b, c, change, method)) = interval else {
+        let Some((b, c, change, method, conf)) = iv else {
             continue;
         };
+        if chk.verdict == Status::Skipped {
+            continue;
+        }
         if repeated {
             chk.baseline = b.estimate;
             chk.candidate = c.estimate;
-            chk.change_pct = change.estimate * 100.0;
+            chk.delta_ratio = Some(change.estimate);
         }
+        let floor = noise_ratio(noise, metric);
         let ci = fmt_ci(&change);
-        if chk.status == Status::Fail && !change.excludes_zero() {
-            chk.status = Status::Pass;
-            chk.note = format!("not significant: 95% CI of the change {ci} ({method})");
-        } else if chk.status == Status::Fail || chk.status == Status::Improved {
-            chk.note = format!("95% CI {ci} ({method})");
+        let sig = significant(&change, floor);
+        let how = method_label(method, conf);
+        if (chk.verdict == Status::Fail || chk.verdict == Status::Improved) && !sig {
+            chk.verdict = Status::Pass;
+            chk.note = format!(
+                "not significant: 95% CI of the change {ci}, noise floor ±{:.1}% ({how})",
+                floor * 100.0
+            );
+        } else if chk.verdict == Status::Fail || chk.verdict == Status::Improved {
+            chk.note = format!("95% CI {ci} ({how})");
         }
     }
-    gate.passed = !gate.checks.iter().any(|c| c.status == Status::Fail);
+    gate.settle();
     let mut stats_out = Vec::new();
-    for (metric, iv) in [
-        ("p50_ms", latency_change(base, cand, None, 0.50)),
-        ("p99_ms", latency_change(base, cand, None, 0.99)),
-        ("ops_per_s", throughput_change(base, cand)),
+    for (metric, unit, iv) in [
+        ("p50_ms", "ms", latency_change(base, cand, None, 0.50)),
+        ("p99_ms", "ms", latency_change(base, cand, None, 0.99)),
+        ("ops_per_s", "ops_per_s", throughput_change(base, cand)),
     ] {
-        if let Some((b, c, change, method)) = iv {
-            stats_out.push(MetricStat {
+        let floor = noise_ratio(noise, metric);
+        match iv {
+            Some((b, c, change, method, confidence)) => stats_out.push(MetricStat {
                 metric: metric.into(),
+                unit: unit.into(),
                 baseline: b,
                 candidate: c,
-                significant: change.excludes_zero(),
+                // Latency changes below the absolute floor (`min_latency_delta_ms`) are
+                // never significant, however tight the interval.
+                significant: significant(&change, floor)
+                    && (unit != "ms" || (c.estimate - b.estimate).abs() > t.min_latency_delta_ms),
                 change,
-                method: method.into(),
-            });
+                noise_floor_ratio: floor,
+                method,
+                confidence,
+            }),
+            None => {
+                let v = |r: &Report| match metric {
+                    "p50_ms" => r.summary.latency.p50,
+                    "p99_ms" => r.summary.latency.p99,
+                    _ => good_ops_per_s(r),
+                };
+                let (x, y) = (v(&rb.report), v(&rc.report));
+                stats_out.push(MetricStat {
+                    metric: metric.into(),
+                    unit: unit.into(),
+                    baseline: Interval::point(x),
+                    candidate: Interval::point(y),
+                    change: Interval::point(if x.abs() > 0.0 { y / x - 1.0 } else { 0.0 }),
+                    noise_floor_ratio: floor,
+                    significant: false,
+                    method: Method::Unavailable,
+                    confidence: Confidence::Low,
+                });
+            }
         }
     }
     let mut trend: Vec<(&str, f64)> = base
@@ -309,7 +584,9 @@ pub fn compare(
         representative: rep.id().to_owned(),
     };
     Comparison {
+        verdict: gate.verdict,
         passed: gate.passed,
+        comparable: gate.comparable,
         baseline: side(base_label, base, rb),
         candidate: side(cand_label, cand, rc),
         stats: stats_out,
@@ -320,6 +597,15 @@ pub fn compare(
 }
 
 impl Comparison {
+    pub fn stat(&self, metric: &str) -> Option<&MetricStat> {
+        self.stats.iter().find(|s| s.metric == metric)
+    }
+
+    /// The exit code (3 on a regression, 2 for non-comparable runs under `--strict`).
+    pub fn exit_code(&self) -> u8 {
+        self.gate.exit_code()
+    }
+
     fn stat_rows(&self) -> Vec<Vec<String>> {
         self.stats
             .iter()
@@ -336,11 +622,13 @@ impl Comparison {
                     v(&s.baseline),
                     v(&s.candidate),
                     fmt_ci(&s.change),
+                    format!("±{:.1}%", s.noise_floor_ratio * 100.0),
                     if s.significant {
                         "yes".into()
                     } else {
                         "no".into()
                     },
+                    method_label(s.method, s.confidence),
                 ]
             })
             .collect()
@@ -363,7 +651,9 @@ impl Comparison {
                 "baseline",
                 "candidate",
                 "change (95% CI)",
+                "noise",
                 "significant",
+                "method",
             ],
             &self.stat_rows(),
             2,
@@ -384,6 +674,14 @@ impl Comparison {
                 );
             }
         }
+        if !self.comparable {
+            let _ = writeln!(
+                o,
+                "\n  {} {}",
+                yellow("not comparable:"),
+                self.gate.identity.reasons.join("; ")
+            );
+        }
         o
     }
 
@@ -400,7 +698,7 @@ impl Comparison {
         );
         let _ = writeln!(
             md,
-            "| metric | baseline | candidate | change (95% CI) | significant |\n|---|---:|---:|---:|---|"
+            "| metric | baseline | candidate | change (95% CI) | noise | significant | method |\n|---|---:|---:|---:|---:|---|---|"
         );
         for r in self.stat_rows() {
             let _ = writeln!(md, "| {} |", r.join(" | "));
@@ -427,7 +725,7 @@ impl Comparison {
             .iter()
             .map(|f| {
                 let esc = f.cause.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;");
-                if f.severity >= super::diagnosis::Severity::Warning {
+                if f.severity >= super::diagnosis::Severity::Warning && self.comparable {
                     format!("  <testcase classname=\"oprobe.findings\" name=\"new finding {}\"><failure message=\"{esc}\"/></testcase>\n", f.code)
                 } else {
                     format!("  <testcase classname=\"oprobe.findings\" name=\"new finding {}\"/>\n", f.code)
@@ -452,9 +750,12 @@ mod tests {
         r.report.run.id = id.into();
         r.report.run.started_at = format!("2026-11-20T00:00:{id}Z");
         r.report.run.window_s = 5.0;
-        for o in &mut r.ops {
+        let n = r.ops.len() as i64;
+        for (i, o) in r.ops.iter_mut().enumerate() {
             o.latency_us = (o.latency_us as f64 * scale) as u64;
             o.verb = "read.range".into();
+            o.ok = true;
+            o.t_us = i as i64 * 5_000_000 / n.max(1);
         }
         let mut lat: Vec<f64> = r.ops.iter().map(|o| o.latency_us as f64 / 1000.0).collect();
         let q = Quantiles {
@@ -465,6 +766,8 @@ mod tests {
         };
         r.report.summary.latency = q;
         r.report.summary.ops_per_s = ops_per_s;
+        r.report.summary.ops = (ops_per_s * 5.0) as u64;
+        r.report.summary.failed_ops = 0;
         r.report.verbs = vec![VerbStats {
             verb: "read.range".into(),
             count: 1000,
@@ -482,9 +785,12 @@ mod tests {
         let worse = vec![run("02", 1.6, 200.0)];
         let c = compare(&base, &worse, "a", "b", &t);
         assert!(!c.passed, "{:#?}", c.gate.checks);
-        let p50 = c.stats.iter().find(|s| s.metric == "p50_ms").unwrap();
-        assert!(p50.significant && p50.change.estimate > 0.5);
-        // Repeats: per-run medians; a 25 % p99 change in one noisy run of five is not significant.
+        assert_eq!(c.verdict, GateVerdict::Regression);
+        let p50 = c.stat("p50_ms").unwrap();
+        assert!(p50.significant && p50.change.estimate > 0.5, "{p50:?}");
+        assert_eq!(p50.method, Method::BlockBootstrap);
+        assert_eq!(p50.confidence, Confidence::Low);
+        // Repeats: per-run values; a 25 % p99 change in one noisy run of five is not significant.
         let bs: Vec<Run> = (0..5)
             .map(|i| run(&format!("1{i}"), 1.0 + i as f64 * 0.05, 200.0))
             .collect();
@@ -499,12 +805,55 @@ mod tests {
             .collect();
         let c = compare(&bs, &cs, "base", "cand", &t);
         assert!(c.passed, "{:#?}", c.gate.checks);
-        assert_eq!(c.stats[0].method, "runs");
+        assert_eq!(c.stats[0].method, Method::RunsT);
+        assert_eq!(c.stats[0].confidence, Confidence::High);
         assert_eq!(c.p99_trend_ms.len(), 10);
         let md = c.render_markdown();
         assert!(md.starts_with("<!-- oprobe-compare -->"));
         assert!(md.contains("p99 trend"));
         assert!(c.render_junit().contains("</testsuite>"));
+    }
+
+    #[test]
+    fn identical_runs_are_not_significant() {
+        let a = run("01", 1.0, 200.0);
+        let mut b = run("02", 1.0, 200.0);
+        // A 1 % shift (the AN-10 case: +0.9 % with a tight interval) is below the noise floor.
+        for o in &mut b.ops {
+            o.latency_us = (o.latency_us as f64 * 1.01) as u64;
+        }
+        let c = compare(&[a], &[b], "a", "b", &Thresholds::default());
+        for s in &c.stats {
+            assert!(!s.significant, "{s:?}");
+        }
+        assert!(c.passed);
+    }
+
+    #[test]
+    fn t_interval_over_runs() {
+        let (a, b, c) = runs_t(&[100.0, 102.0, 98.0], &[110.0, 112.0, 108.0]);
+        assert!((a.estimate - 100.0).abs() < 1e-9 && (b.estimate - 110.0).abs() < 1e-9);
+        assert!(c.low > 0.0 && (c.estimate - 0.1).abs() < 1e-9, "{c:?}");
+        let (_, _, c) = runs_t(&[100.0, 120.0, 80.0], &[101.0, 121.0, 81.0]);
+        assert!(!c.excludes_zero(), "{c:?}");
+        assert!((t975(1.0) - 12.706).abs() < 1e-9);
+        assert_eq!(t975(100.0), 1.96);
+        assert!(significant(
+            &Interval {
+                estimate: 0.2,
+                low: 0.1,
+                high: 0.3
+            },
+            0.05
+        ));
+        assert!(!significant(
+            &Interval {
+                estimate: 0.02,
+                low: 0.01,
+                high: 0.03
+            },
+            0.05
+        ));
     }
 
     #[test]

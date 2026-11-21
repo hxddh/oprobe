@@ -455,21 +455,13 @@ async fn execute(job: &Arc<Job>, spec: JobSpec) -> anyhow::Result<Outcome> {
     let path = m.path.map(|p| p.display().to_string()).unwrap_or_default();
     // The tuner's answer as a recommendation (AG-1): the winner's knobs, profile, snippet and
     // deltas, in `start_tune` / `get_run` structured output.
-    let recommendation = m.tuned.as_ref().and_then(|t| {
-        match crate::tune::recommend::Recommendation::from_tune(
-            &t.profile,
-            &t.winner,
-            &t.summary,
-            &t.capability,
-        ) {
-            Ok(r) => Some(Box::new(r)),
-            Err(e) => {
-                job.bus
-                    .log(LogLevel::Warn, format!("no recommendation: {e:#}"));
-                None
-            }
-        }
-    });
+    let recommendation = m
+        .run
+        .report
+        .tune
+        .as_ref()
+        .and_then(|t| t.recommendation.clone())
+        .map(Box::new);
     let _ = run_id;
     Ok(Outcome {
         path,

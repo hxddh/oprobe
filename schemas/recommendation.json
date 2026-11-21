@@ -49,7 +49,7 @@
           "type": "number"
         },
         "metric": {
-          "description": "`ops_per_s` (throughput, goodput), `p99_ms` (latency) or `cost_per_million_ops_usd`.",
+          "description": "`ops_per_s` / `mib_per_s` (goodput), `p99_ms` (latency) or\n`cost_per_million_ops_usd`.",
           "type": "string"
         },
         "unit": {
@@ -286,7 +286,8 @@
         {
           "type": "null"
         }
-      ]
+      ],
+      "description": "What `oprobe verify` concluded about the recommendation (set by `oprobe fix`)."
     },
     "knobs": {
       "$ref": "#/$defs/KnobValues",
@@ -304,7 +305,7 @@
       "description": "The change from the baseline's knobs (`--set` vocabulary): apply with\n`oprobe run --from RUN …` or `RunSpec::with`."
     },
     "profile_toml": {
-      "description": "A profile with the recommended knobs (environment defaults such as `proxy` omitted).",
+      "description": "A profile with the recommended knobs (environment defaults such as `proxy` and\nredacted secrets omitted).",
       "type": "string"
     },
     "rust_snippet": {
@@ -312,11 +313,12 @@
       "type": "string"
     },
     "vs_baseline": {
-      "$ref": "#/$defs/Delta"
+      "$ref": "#/$defs/Delta",
+      "description": "Against the baseline trial (`baseline_feasible: false` when it violated the SLA or\nthe throttle budget)."
     },
     "vs_best": {
       "$ref": "#/$defs/Delta",
-      "description": "Against the best measured trial: the cost of the safety margin."
+      "description": "Against the best feasible trial: the cost of the safety margin."
     }
   },
   "required": [

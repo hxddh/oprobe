@@ -113,6 +113,11 @@ pub enum Command {
     Tune(TuneArgs),
     /// Regression gate: compare two runs (RUNREFs or files) and fail on regressions
     Compare(CompareArgs),
+    /// Test a finding's advice: replay the run with and without the change (A B A B…) and
+    /// answer confirmed, refuted or inconclusive
+    Verify(VerifyArgs),
+    /// Diagnose a target, tune it and verify the recommendation; prints a profile patch
+    Fix(FixArgs),
     /// Saved runs: list, show, open, export, rm, gc
     #[command(subcommand)]
     Runs(RunsCommand),
@@ -340,6 +345,8 @@ pub struct TargetNameArg {
     pub name: String,
 }
 
+// Parsed once per process.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand, Debug)]
 pub enum BaselineCommand {
     /// Create or update a named baseline
@@ -350,6 +357,82 @@ pub enum BaselineCommand {
     Rm(BaselineNameArg),
     /// Show a baseline's runs and their spread
     Show(BaselineNameArg),
+    /// Learn the target's noise floor from repeated identical runs (<data>/noise.toml)
+    Calibrate(CalibrateArgs),
+}
+
+/// `oprobe verify RUNREF [CODE|--all] [--repeat N]`.
+#[derive(Args, Debug)]
+pub struct VerifyArgs {
+    /// The run whose findings to test (RUNREF: id, prefix, last, last~N, label)
+    #[arg(value_name = "RUNREF", value_parser = parse::run_ref)]
+    pub run: String,
+    /// The finding code to verify (default: every finding with a verification)
+    #[arg(value_name = "CODE", conflicts_with = "all")]
+    pub code: Option<String>,
+    /// Verify every finding that has a verification
+    #[arg(long)]
+    pub all: bool,
+    /// Baseline / candidate pairs to run (interleaved A B A B…)
+    #[arg(long, value_name = "N", default_value_t = 3, value_parser = at_least::<1>)]
+    pub repeat: usize,
+    /// Do not store the outcomes or calibrate the capacity history and noise floor
+    #[arg(long)]
+    pub no_calibrate: bool,
+    #[command(flatten)]
+    pub safety: SafetyArgs,
+    /// Do not save the replayed runs in the run store
+    #[arg(long)]
+    pub no_save: bool,
+}
+
+/// `oprobe fix TARGET`: diagnose → tune → verify.
+#[derive(Args, Debug)]
+pub struct FixArgs {
+    #[command(flatten)]
+    pub target: TargetArgs,
+    #[command(flatten)]
+    pub workload: WorkloadArgs,
+    #[command(flatten)]
+    pub knobs: KnobArgs,
+    #[command(flatten)]
+    pub cost: CostArgs,
+    #[command(flatten)]
+    pub sla: SlaArgs,
+    #[command(flatten)]
+    pub output: OutputArgs,
+    #[command(flatten)]
+    pub safety: SafetyArgs,
+    #[command(flatten)]
+    pub search: TuneSearchArgs,
+    /// Baseline / candidate pairs of the verification
+    #[arg(long, value_name = "N", default_value_t = 2, value_parser = at_least::<1>, help_heading = "Verification")]
+    pub repeat: usize,
+    /// Write the recommended profile (TOML) to this file
+    #[arg(long, value_name = "FILE", help_heading = "Verification")]
+    pub write_profile: Option<PathBuf>,
+}
+
+/// `oprobe baseline calibrate TARGET`.
+#[derive(Args, Debug)]
+pub struct CalibrateArgs {
+    #[command(flatten)]
+    pub target: TargetArgs,
+    #[command(flatten)]
+    pub workload: WorkloadArgs,
+    #[command(flatten)]
+    pub knobs: KnobArgs,
+    #[command(flatten)]
+    pub safety: SafetyArgs,
+    /// Identical runs to measure (N − 1 A/A pairs)
+    #[arg(long, value_name = "N", default_value_t = 4, value_parser = at_least::<2>)]
+    pub repeat: usize,
+    /// Calibrate the workload of a stored run instead (RUNREF; its spec is replayed)
+    #[arg(long, value_name = "RUNREF", value_parser = parse::run_ref)]
+    pub from: Option<String>,
+    /// Do not save the calibration runs in the run store
+    #[arg(long)]
+    pub no_save: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -640,9 +723,62 @@ pub struct RunArgs {
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub enum ObjectiveArg {
-    Throughput,
-    Latency,
+    /// Successful ops/s (or MiB/s) within the throttle budget (`throughput` is an alias)
+    #[value(alias = "throughput")]
+    Goodput,
+    /// Lowest worst-case p99 at ≥ 80 % of the best goodput (`latency` is an alias)
+    #[value(alias = "latency")]
+    P99,
+    /// Lowest cost per operation at ≥ 80 % of the best goodput
     Cost,
+    /// Best goodput-to-p99 trade at ≥ 80 % of the best goodput
+    Balanced,
+}
+
+impl ObjectiveArg {
+    pub fn objective(self) -> crate::tune::Objective {
+        use crate::tune::Objective;
+        match self {
+            ObjectiveArg::Goodput => Objective::Throughput,
+            ObjectiveArg::P99 => Objective::Latency,
+            ObjectiveArg::Cost => Objective::Cost,
+            ObjectiveArg::Balanced => Objective::Balanced,
+        }
+    }
+}
+
+/// The tuner's search flags (shared by `tune` and `fix`).
+#[derive(Args, Debug, Clone)]
+#[command(next_help_heading = "Tuning")]
+pub struct TuneSearchArgs {
+    /// What to optimize
+    #[arg(long, value_enum, default_value_t = ObjectiveArg::Goodput)]
+    pub objective: ObjectiveArg,
+    /// Measurement window per trial
+    #[arg(long, default_value = tune_defaults::TRIAL_DURATION, value_parser = parse::positive_duration)]
+    pub trial_duration: String,
+    /// Warmup per trial
+    #[arg(long, default_value = tune_defaults::TRIAL_WARMUP, value_parser = parse::duration)]
+    pub trial_warmup: String,
+    /// Maximum number of trials
+    #[arg(long, default_value_t = tune_defaults::MAX_TRIALS, value_parser = at_least::<{ tune_defaults::MIN_TRIALS }>)]
+    pub max_trials: usize,
+    /// Highest concurrency to try
+    #[arg(long, default_value_t = tune_defaults::MAX_CONCURRENCY, value_parser = at_least::<1>)]
+    pub max_concurrency: usize,
+    /// Pause after a throttled trial
+    #[arg(long, default_value = tune_defaults::COOLDOWN, value_parser = parse::duration)]
+    pub cooldown: String,
+    /// Share of throttled requests a configuration may cause and still be feasible
+    /// (default 0.001, or the profile's `sla.max_throttle_rate`)
+    #[arg(long, value_name = "RATIO", value_parser = parse::fraction)]
+    pub max_throttle_ratio: Option<f64>,
+    /// Runs of each bisection trial near the throttle boundary
+    #[arg(long, default_value_t = tune_defaults::BOUNDARY_REPEATS, value_parser = at_least::<1>)]
+    pub boundary_repeats: usize,
+    /// In-flight headroom kept below the throttling ceiling (default 0.15)
+    #[arg(long, value_name = "RATIO", value_parser = parse::fraction)]
+    pub headroom_ratio: Option<f64>,
 }
 
 #[derive(Args, Debug)]
@@ -661,24 +797,8 @@ pub struct TuneArgs {
     pub output: OutputArgs,
     #[command(flatten)]
     pub safety: SafetyArgs,
-    /// What to optimize
-    #[arg(long, value_enum, default_value_t = ObjectiveArg::Throughput, help_heading = "Tuning")]
-    pub objective: ObjectiveArg,
-    /// Measurement window per trial
-    #[arg(long, default_value = tune_defaults::TRIAL_DURATION, value_parser = parse::positive_duration, help_heading = "Tuning")]
-    pub trial_duration: String,
-    /// Warmup per trial
-    #[arg(long, default_value = tune_defaults::TRIAL_WARMUP, value_parser = parse::duration, help_heading = "Tuning")]
-    pub trial_warmup: String,
-    /// Maximum number of trials
-    #[arg(long, default_value_t = tune_defaults::MAX_TRIALS, value_parser = at_least::<{ tune_defaults::MIN_TRIALS }>, help_heading = "Tuning")]
-    pub max_trials: usize,
-    /// Highest concurrency to try
-    #[arg(long, default_value_t = tune_defaults::MAX_CONCURRENCY, value_parser = at_least::<1>, help_heading = "Tuning")]
-    pub max_concurrency: usize,
-    /// Pause after a throttled trial
-    #[arg(long, default_value = tune_defaults::COOLDOWN, value_parser = parse::duration, help_heading = "Tuning")]
-    pub cooldown: String,
+    #[command(flatten)]
+    pub search: TuneSearchArgs,
     /// Total wall-time budget of the tuner, e.g. 5m: caps the trials so the estimate fits
     /// (add --max-duration for a hard stop)
     #[arg(long, value_name = "DURATION", value_parser = parse::positive_duration, help_heading = "Tuning")]
@@ -741,6 +861,9 @@ pub struct CompareArgs {
     /// Do not fail when the target differs (scheme, bucket/prefix, endpoint, options)
     #[arg(long)]
     pub allow_target_change: bool,
+    /// Runs of different targets or workloads are an error (exit 2) instead of a warning
+    #[arg(long)]
+    pub strict: bool,
     /// Write a Markdown summary (PR comment / job summary)
     #[arg(long, value_name = "FILE")]
     pub markdown: Option<PathBuf>,

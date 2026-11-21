@@ -26,7 +26,16 @@
       ]
     },
     "Check": {
+      "description": "One gate check, machine-grade (design v4 §7).",
       "properties": {
+        "abs_limit": {
+          "description": "Absolute limit or floor in `unit` (e.g. the minimum latency change in ms, the\nfailed-ratio increase).",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
         "baseline": {
           "format": "double",
           "type": "number"
@@ -35,31 +44,45 @@
           "format": "double",
           "type": "number"
         },
-        "change_pct": {
-          "description": "Relative change in percent (positive = higher).",
+        "delta_ratio": {
+          "description": "`(candidate − baseline) / baseline`; absent when the baseline is 0 and the candidate\nis not.",
           "format": "double",
-          "type": "number"
+          "type": [
+            "number",
+            "null"
+          ]
         },
-        "limit": {
+        "id": {
+          "description": "Stable id: `throughput`, `throughput_bytes`, `latency_p50.VERB`, `latency_p99.VERB`,\n`present.VERB`, `error_ratio`, `throttled_request_ratio`, `open_loop_missed_ratio`,\n`corrupted_objects`, `requests_per_op`, `read_amplification`, `cost_per_million_ops`.",
           "type": "string"
         },
-        "name": {
-          "type": "string"
+        "limit_ratio": {
+          "description": "Relative change in the bad direction that fails the check (absent: no relative limit).",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
         },
         "note": {
           "type": "string"
         },
-        "status": {
+        "unit": {
+          "description": "Unit of `baseline`, `candidate` and `abs_limit` (`ops_per_s`, `mib_per_s`, `ms`,\n`ratio`, `count`, `requests_per_op`, `usd`).",
+          "type": "string"
+        },
+        "verdict": {
           "$ref": "#/$defs/Status"
         }
       },
       "required": [
-        "name",
+        "id",
+        "unit",
         "baseline",
         "candidate",
-        "change_pct",
-        "limit",
-        "status"
+        "delta_ratio",
+        "limit_ratio",
+        "verdict"
       ],
       "type": "object"
     },
@@ -72,12 +95,16 @@
         "candidate": {
           "$ref": "#/$defs/Side"
         },
+        "comparable": {
+          "description": "Same target identity and workload hash (design v4 §7).",
+          "type": "boolean"
+        },
         "findings": {
           "$ref": "#/$defs/FindingsDiff"
         },
         "gate": {
           "$ref": "#/$defs/DiffReport",
-          "description": "The per-check gate (configuration changes, per-operation latency, errors, throttling,\namplification, cost), with significance applied to latency and throughput checks."
+          "description": "The per-check gate (per-operation latency, errors, throttling, amplification, cost),\nwith significance applied to latency and throughput checks."
         },
         "p99_trend_ms": {
           "description": "p99 (ms) of every baseline run then every candidate run, in time order.",
@@ -88,6 +115,7 @@
           "type": "array"
         },
         "passed": {
+          "description": "The verdict is `passed`.",
           "type": "boolean"
         },
         "stats": {
@@ -95,10 +123,16 @@
             "$ref": "#/$defs/MetricStat"
           },
           "type": "array"
+        },
+        "verdict": {
+          "$ref": "#/$defs/GateVerdict",
+          "description": "`passed`, `regression` or `not_comparable` (no verdict)."
         }
       },
       "required": [
+        "verdict",
         "passed",
+        "comparable",
         "baseline",
         "candidate",
         "stats",
@@ -107,6 +141,15 @@
         "gate"
       ],
       "type": "object"
+    },
+    "Confidence": {
+      "description": "How far to trust the estimate.",
+      "enum": [
+        "low",
+        "medium",
+        "high"
+      ],
+      "type": "string"
     },
     "ConfigChange": {
       "description": "One setting that differs between baseline and candidate.",
@@ -147,6 +190,9 @@
           },
           "type": "array"
         },
+        "comparable": {
+          "type": "boolean"
+        },
         "config_changes": {
           "description": "Every workload / target / knob / host setting that differs between the two runs.",
           "items": {
@@ -154,11 +200,18 @@
           },
           "type": "array"
         },
+        "identity": {
+          "$ref": "#/$defs/Identity"
+        },
         "passed": {
+          "description": "The verdict is `passed`.",
           "type": "boolean"
         },
         "thresholds": {
           "$ref": "#/$defs/Thresholds"
+        },
+        "verdict": {
+          "$ref": "#/$defs/GateVerdict"
         },
         "warnings": {
           "items": {
@@ -168,10 +221,13 @@
         }
       },
       "required": [
+        "verdict",
         "passed",
+        "comparable",
         "baseline",
         "candidate",
         "thresholds",
+        "identity",
         "config_changes",
         "checks",
         "warnings"
@@ -226,6 +282,70 @@
       ],
       "type": "object"
     },
+    "GateVerdict": {
+      "description": "The gate's answer.",
+      "oneOf": [
+        {
+          "const": "passed",
+          "description": "Comparable and no check failed.",
+          "type": "string"
+        },
+        {
+          "const": "regression",
+          "description": "Comparable and at least one check failed (exit 3).",
+          "type": "string"
+        },
+        {
+          "const": "not_comparable",
+          "description": "Different target or workload: no regression verdict (exit 0 with a warning, exit 2\nwith `--strict`).",
+          "type": "string"
+        }
+      ]
+    },
+    "Identity": {
+      "description": "Whether two runs may be gated against each other (design v4 §7).",
+      "properties": {
+        "baseline_target": {
+          "type": "string"
+        },
+        "baseline_workload_hash": {
+          "type": "string"
+        },
+        "candidate_target": {
+          "type": "string"
+        },
+        "candidate_workload_hash": {
+          "type": "string"
+        },
+        "comparable": {
+          "description": "Same target identity and workload hash (or the difference was allowed).",
+          "type": "boolean"
+        },
+        "reasons": {
+          "description": "Why the runs are not comparable (empty when they are).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "same_target": {
+          "type": "boolean"
+        },
+        "same_workload": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "comparable",
+        "same_target",
+        "same_workload",
+        "baseline_target",
+        "candidate_target",
+        "baseline_workload_hash",
+        "candidate_workload_hash"
+      ],
+      "type": "object"
+    },
     "Interval": {
       "description": "An estimate with a confidence interval.",
       "properties": {
@@ -266,6 +386,26 @@
       ],
       "type": "object"
     },
+    "Method": {
+      "description": "How a [`MetricStat`] interval was computed.",
+      "oneOf": [
+        {
+          "const": "block_bootstrap",
+          "description": "One run per side: block bootstrap over per-second windows.",
+          "type": "string"
+        },
+        {
+          "const": "runs_t",
+          "description": "Several runs per side: a t-interval over the per-run values.",
+          "type": "string"
+        },
+        {
+          "const": "unavailable",
+          "description": "Too few samples: point estimates only, never significant.",
+          "type": "string"
+        }
+      ]
+    },
     "MetricStat": {
       "description": "A headline metric with confidence intervals.",
       "properties": {
@@ -277,28 +417,42 @@
         },
         "change": {
           "$ref": "#/$defs/Interval",
-          "description": "Relative change of the candidate (fraction; +0.1 = 10 % higher)."
+          "description": "Relative change of the candidate (ratio; +0.1 = 10 % higher), with its 95 % interval."
+        },
+        "confidence": {
+          "$ref": "#/$defs/Confidence"
         },
         "method": {
-          "description": "`runs` (medians across runs) or `samples` (operations / seconds of one run each).",
-          "type": "string"
+          "$ref": "#/$defs/Method"
         },
         "metric": {
           "description": "`p50_ms`, `p99_ms`, `ops_per_s`.",
           "type": "string"
         },
+        "noise_floor_ratio": {
+          "description": "Changes smaller than this are noise for this target and workload.",
+          "format": "double",
+          "type": "number"
+        },
         "significant": {
-          "description": "The 95 % interval of the change excludes zero.",
+          "description": "The 95 % interval excludes zero and the change exceeds the noise floor.",
           "type": "boolean"
+        },
+        "unit": {
+          "description": "Unit of `baseline` and `candidate`.",
+          "type": "string"
         }
       },
       "required": [
         "metric",
+        "unit",
         "baseline",
         "candidate",
         "change",
+        "noise_floor_ratio",
         "significant",
-        "method"
+        "method",
+        "confidence"
       ],
       "type": "object"
     },
@@ -479,6 +633,7 @@
       "type": "object"
     },
     "Status": {
+      "description": "The verdict of one check.",
       "enum": [
         "pass",
         "improved",
@@ -488,33 +643,39 @@
       "type": "string"
     },
     "Thresholds": {
-      "description": "Regression limits. Percentages are relative changes in the \"bad\" direction.",
+      "description": "Regression limits. Relative limits are ratios of the baseline in the \"bad\" direction\n(0.2 = 20 % worse).",
       "properties": {
         "allow_target_change": {
           "default": false,
-          "description": "Compare runs against different targets without failing (otherwise a gate failure).",
+          "description": "Compare runs against different targets anyway (otherwise `comparable: false`).",
           "type": "boolean"
         },
         "allow_workload_change": {
           "default": false,
-          "description": "Compare runs of different workloads without failing (otherwise a gate failure).",
+          "description": "Compare runs of different workloads anyway (otherwise `comparable: false`).",
           "type": "boolean"
         },
-        "cost_pct": {
+        "cost_increase_ratio": {
           "format": "double",
           "type": "number"
         },
-        "error_rate_pp": {
-          "description": "Max increase of the failed-operation rate in percentage points.",
+        "error_increase_ratio": {
+          "description": "Max increase of the failed-operation ratio (absolute, 0.005 = 0.5 percentage points).",
           "format": "double",
           "type": "number"
         },
         "fail_on_new_throttling": {
-          "description": "Gate throttling: fail when the candidate is throttled and the baseline was not, or when\nits throttle rate (throttled responses per request) grew by more than\n[`THROTTLE_RATE_PCT`] and [`THROTTLE_RATE_FLOOR`].",
+          "description": "Gate throttling: fail when the candidate's throttled-request ratio grows past\n[`Thresholds::throttle_increase_ratio`] (relative), [`THROTTLE_RATIO_FLOOR`] (absolute)\nand [`Thresholds::min_throttled_count`] (count floor).",
           "type": "boolean"
         },
+        "min_failed_ops_count": {
+          "description": "Fewer additional failed operations than this are never a regression (count floor).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "min_latency_delta_ms": {
-          "description": "Latency changes smaller than this (ms) are never regressions (noise floor).",
+          "description": "Latency changes smaller than this (ms) are never regressions.",
           "format": "double",
           "type": "number"
         },
@@ -524,40 +685,60 @@
           "minimum": 0,
           "type": "integer"
         },
-        "p50_pct": {
+        "min_throttled_count": {
+          "description": "Fewer throttled responses than this in the candidate are never a regression\n(0 → 1 throttled response is noise).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "p50_increase_ratio": {
           "format": "double",
           "type": "number"
         },
-        "p99_pct": {
+        "p99_increase_ratio": {
           "format": "double",
           "type": "number"
         },
-        "read_amp_pct": {
+        "read_amp_increase_ratio": {
           "format": "double",
           "type": "number"
         },
-        "request_amp_pct": {
+        "request_amp_increase_ratio": {
           "format": "double",
           "type": "number"
         },
-        "throughput_drop_pct": {
+        "strict": {
+          "default": false,
+          "description": "Runs that are not comparable are an error (exit 2) instead of a warning (exit 0).",
+          "type": "boolean"
+        },
+        "throttle_increase_ratio": {
+          "description": "Relative growth of the throttled-request ratio that fails the gate.",
+          "format": "double",
+          "type": "number"
+        },
+        "throughput_drop_ratio": {
           "format": "double",
           "type": "number"
         }
       },
       "required": [
-        "p99_pct",
-        "p50_pct",
+        "p99_increase_ratio",
+        "p50_increase_ratio",
         "min_latency_delta_ms",
-        "throughput_drop_pct",
-        "error_rate_pp",
-        "request_amp_pct",
-        "read_amp_pct",
-        "cost_pct",
+        "throughput_drop_ratio",
+        "error_increase_ratio",
+        "min_failed_ops_count",
+        "request_amp_increase_ratio",
+        "read_amp_increase_ratio",
+        "cost_increase_ratio",
         "fail_on_new_throttling",
+        "throttle_increase_ratio",
+        "min_throttled_count",
         "min_samples_count",
         "allow_workload_change",
-        "allow_target_change"
+        "allow_target_change",
+        "strict"
       ],
       "type": "object"
     },

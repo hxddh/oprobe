@@ -86,6 +86,8 @@ pub fn guard_for(budgets: &Budgets, profile: &Profile) -> Option<Arc<Guard>> {
 }
 
 /// Measure a workload window, or run the tuner.
+// One per measurement; the tuner options are not worth a box.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone)]
 pub enum Mode {
     Run,
@@ -300,6 +302,14 @@ pub async fn measure(req: Request) -> Result<Measured> {
             if session.guard().is_some_and(|g| g.tripped()) {
                 snap.interrupted = true;
             }
+            let recommendation = crate::tune::recommend::Recommendation::from_tune(
+                &spec,
+                &session.profile,
+                &outcome.winner,
+                &outcome.summary,
+                &session.capability,
+            )
+            .ok();
             // The tuner's run replays as its winner.
             spec.profile.knobs = outcome.winner.clone();
             let mut run = crate::model::build_run(crate::model::ReportInput {
@@ -316,7 +326,14 @@ pub async fn measure(req: Request) -> Result<Measured> {
                 ended_at: SystemTime::now(),
                 spec: Some(spec),
             });
-            run.report.tune = Some(TuneReport::from(&outcome.summary));
+            // The winner's window kept no rows: the report's capacity is the tuner's pooled
+            // estimate (`source: tune`).
+            if let Some(c) = &outcome.summary.capacity {
+                run.report.capacity = c.clone();
+            }
+            let mut tr = TuneReport::from(&outcome.summary);
+            tr.recommendation = recommendation;
+            run.report.tune = Some(tr);
             let tuned = Tuned {
                 winner: outcome.winner,
                 summary: outcome.summary,
