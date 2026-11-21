@@ -1,6 +1,13 @@
-//! `oprobe self-update`: check GitHub Releases, download this platform's archive, verify it
-//! against the release's `SHA256SUMS`, check that the new binary runs, and replace the running
-//! one atomically (Windows: rename the running executable aside, then move the new one in).
+//! `oprobe self-update`: find the release, download this platform's archive, verify its
+//! SHA-256, check that the new binary runs, and replace the running one atomically (Windows:
+//! rename the running executable aside, then move the new one in).
+//!
+//! The release is resolved like the installers do (design v4 §10), falling back on any failure:
+//! 1. the release's `latest.json` index (`releases/latest/download/latest.json`; no API, no rate
+//!    limit), with each asset's URL, size and SHA-256;
+//! 2. the GitHub API (`/repos/…/releases/latest`), checksums from `SHA256SUMS`.
+//!
+//! A GitHub refusal (403, 429, 5xx) is a network error (`net.unreachable`), never a storage one.
 //!
 //! Installs owned by a package manager (Homebrew, apt/dnf, the macOS .pkg or .app, Scoop,
 //! winget, the MSI, cargo) are refused with the manager's own update command, so the manager's
@@ -24,6 +31,9 @@ use crate::report::style::{bold, dim, green, yellow};
 pub const REPO: &str = "hxddh/oprobe";
 /// API base; `OPROBE_UPDATE_API` overrides it (mirrors, tests).
 const DEFAULT_API: &str = "https://api.github.com";
+/// Release download base (`…/latest/download/NAME`, `…/download/TAG/NAME`);
+/// `OPROBE_RELEASE_BASE` overrides it (mirrors, tests), as for `install.sh` / `install.ps1`.
+const DEFAULT_RELEASE_BASE: &str = "https://github.com/hxddh/oprobe/releases";
 /// Largest archive accepted.
 const MAX_ASSET_BYTES: u64 = 256 * 1024 * 1024;
 
@@ -52,7 +62,7 @@ impl InstallMethod {
     pub fn update_instruction(&self) -> &'static str {
         match self {
             Self::Standalone => "oprobe self-update",
-            Self::Homebrew => "brew upgrade oprobe   (the app: brew upgrade --cask oprobe)",
+            Self::Homebrew => "brew upgrade oprobe   (the app: brew upgrade --cask oprobe-app)",
             Self::SystemPackage => {
                 "download the new .deb/.rpm from the release page and install it (sudo apt install ./oprobe_*.deb / sudo dnf install ./oprobe-*.rpm)"
             }
@@ -61,8 +71,8 @@ impl InstallMethod {
                 "download the new oprobe-*-macos-universal.dmg and replace oprobe.app"
             }
             Self::Scoop => "scoop update oprobe",
-            Self::Winget => "winget upgrade oprobe",
-            Self::Msi => "download and run the new oprobe-*.msi (or: winget upgrade oprobe)",
+            Self::Winget => "winget upgrade hxddh.oprobe",
+            Self::Msi => "download and run the new oprobe-*.msi (or: winget upgrade hxddh.oprobe)",
             Self::Cargo => "cargo install oprobe --locked",
         }
     }
@@ -265,6 +275,18 @@ pub struct UpdateOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
     pub release_url: String,
+    /// Where the release was found.
+    pub release_source: ReleaseSource,
+}
+
+/// Where `self-update` found the release.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ReleaseSource {
+    /// The release's `latest.json` index.
+    LatestJson,
+    /// The GitHub REST API.
+    Api,
 }
 
 impl CommandOutput for UpdateOutput {
@@ -302,18 +324,110 @@ impl CommandOutput for UpdateOutput {
 }
 
 #[derive(Deserialize)]
-struct Release {
+struct ApiRelease {
     tag_name: String,
     html_url: String,
-    assets: Vec<ReleaseAsset>,
+    assets: Vec<ApiAsset>,
 }
 
 #[derive(Deserialize)]
-struct ReleaseAsset {
+struct ApiAsset {
     name: String,
     browser_download_url: String,
     #[serde(default)]
     size: u64,
+}
+
+/// `latest.json` of a release (`scripts/release-manifests.sh`, schema `oprobe.release/1`).
+#[derive(Deserialize)]
+struct IndexDoc {
+    version: String,
+    #[serde(default)]
+    tag: Option<String>,
+    #[serde(default)]
+    release_url: Option<String>,
+    assets: Vec<IndexAsset>,
+}
+
+#[derive(Deserialize)]
+struct IndexAsset {
+    name: String,
+    url: String,
+    #[serde(default)]
+    size_bytes: Option<u64>,
+    #[serde(default)]
+    sha256: Option<String>,
+}
+
+/// A release, wherever it was found.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Release {
+    pub tag: String,
+    pub html_url: String,
+    pub assets: Vec<Asset>,
+    pub source: ReleaseSource,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Asset {
+    pub name: String,
+    pub url: String,
+    pub size: u64,
+    /// From `latest.json`; API releases verify against `SHA256SUMS`.
+    pub sha256: Option<String>,
+}
+
+/// A release from its `latest.json` index.
+pub fn parse_index(bytes: &[u8]) -> Result<Release> {
+    let d: IndexDoc = serde_json::from_slice(bytes).context("unexpected latest.json")?;
+    anyhow::ensure!(
+        version_key(&d.version).is_some(),
+        "latest.json names no version"
+    );
+    let tag = d
+        .tag
+        .unwrap_or_else(|| format!("v{}", d.version.trim_start_matches('v')));
+    Ok(Release {
+        html_url: d
+            .release_url
+            .unwrap_or_else(|| format!("https://github.com/{REPO}/releases/tag/{tag}")),
+        tag,
+        assets: d
+            .assets
+            .into_iter()
+            .map(|a| Asset {
+                name: a.name,
+                url: a.url,
+                size: a.size_bytes.unwrap_or(0),
+                sha256: a
+                    .sha256
+                    .filter(|h| h.len() == 64 && h.chars().all(|c| c.is_ascii_hexdigit()))
+                    .map(|h| h.to_ascii_lowercase()),
+            })
+            .collect(),
+        source: ReleaseSource::LatestJson,
+    })
+}
+
+/// A release from the GitHub API.
+pub fn parse_api(bytes: &[u8]) -> Result<Release> {
+    let r: ApiRelease =
+        serde_json::from_slice(bytes).context("unexpected answer from the GitHub API")?;
+    Ok(Release {
+        tag: r.tag_name,
+        html_url: r.html_url,
+        assets: r
+            .assets
+            .into_iter()
+            .map(|a| Asset {
+                name: a.name,
+                url: a.browser_download_url,
+                size: a.size,
+                sha256: None,
+            })
+            .collect(),
+        source: ReleaseSource::Api,
+    })
 }
 
 fn client() -> Result<reqwest::Client> {
@@ -328,6 +442,31 @@ fn client() -> Result<reqwest::Client> {
         .build()?)
 }
 
+/// The error of a GitHub answer with `status` (not 2xx) for `url`. A refusal (403 — GitHub's
+/// rate limit or a blocked network —, 429, 5xx) is `net.unreachable` (retryable), never
+/// `storage.throttled`: GitHub is not the storage being measured.
+pub fn status_error(status: u16, url: &str) -> OprobeError {
+    match status {
+        403 | 429 => OprobeError::new(
+            ErrorCode::NetUnreachable,
+            format!("GitHub refused the request ({status}) for {url}: rate limited or blocked"),
+        )
+        .with_hint(
+            "set GITHUB_TOKEN, wait for the rate limit to reset, or download the release from \
+             https://github.com/hxddh/oprobe/releases",
+        ),
+        404 => OprobeError::new(ErrorCode::UsageInvalidArgument, format!("not found: {url}"))
+            .with_hint(
+                "check the tag name (`--to v4.0.0`); releases: https://github.com/hxddh/oprobe/releases",
+            ),
+        _ => OprobeError::new(
+            ErrorCode::NetUnreachable,
+            format!("GitHub answered {status} for {url}"),
+        )
+        .with_hint("retry later; releases: https://github.com/hxddh/oprobe/releases"),
+    }
+}
+
 async fn get(c: &reqwest::Client, url: &str, api: bool) -> Result<bytes::Bytes> {
     let mut req = c.get(url);
     if api {
@@ -339,34 +478,69 @@ async fn get(c: &reqwest::Client, url: &str, api: bool) -> Result<bytes::Bytes> 
             req = req.bearer_auth(t);
         }
     }
-    let resp = req
-        .send()
-        .await
-        .with_context(|| format!("cannot reach {url}"))?;
+    let resp = req.send().await.map_err(|e| {
+        OprobeError::new(
+            if e.is_timeout() {
+                ErrorCode::NetTimeout
+            } else {
+                ErrorCode::NetUnreachable
+            },
+            format!("cannot reach {url}: {e}"),
+        )
+        .with_hint("check the network (or HTTPS_PROXY), then retry")
+    })?;
     let status = resp.status();
-    if status.as_u16() == 403 || status.as_u16() == 429 {
-        return Err(OprobeError::new(
-            ErrorCode::StorageThrottled,
-            format!("GitHub refused the request ({status}): rate limited"),
-        )
-        .with_hint("wait an hour or set GITHUB_TOKEN, then retry")
-        .into());
+    if !status.is_success() {
+        return Err(status_error(status.as_u16(), url).into());
     }
-    if status.as_u16() == 404 {
-        return Err(OprobeError::new(
-            ErrorCode::StorageNotFound,
-            format!("not found: {url}"),
-        )
-        .with_hint("check the tag name (`--to v3.0.0`); releases: https://github.com/hxddh/oprobe/releases")
-        .into());
-    }
-    let resp = resp
-        .error_for_status()
-        .with_context(|| format!("GET {url}"))?;
     if resp.content_length().unwrap_or(0) > MAX_ASSET_BYTES {
         anyhow::bail!("{url} is larger than {MAX_ASSET_BYTES} bytes");
     }
     Ok(resp.bytes().await?)
+}
+
+fn env_url(var: &str) -> Option<String> {
+    std::env::var(var)
+        .ok()
+        .map(|v| v.trim().trim_end_matches('/').to_owned())
+        .filter(|v| !v.is_empty())
+}
+
+/// `v`-prefixed tag of a `--to` value.
+fn tag_of(t: &str) -> String {
+    if t.starts_with('v') {
+        t.to_owned()
+    } else {
+        format!("v{t}")
+    }
+}
+
+/// Resolve the release: `latest.json` first, then the API (design v4 §10). The API's error is
+/// returned when both fail (it is the more specific one: a 404 for an unknown `--to` tag).
+async fn resolve_release(http: &reqwest::Client, to: Option<&str>, ctx: &Ctx) -> Result<Release> {
+    let api = env_url("OPROBE_UPDATE_API");
+    // A configured API mirror without a release base: do not reach github.com behind its back.
+    let base = env_url("OPROBE_RELEASE_BASE")
+        .or_else(|| api.is_none().then(|| DEFAULT_RELEASE_BASE.to_owned()));
+    if let Some(base) = base {
+        let url = match to {
+            Some(t) => format!("{base}/download/{}/latest.json", tag_of(t)),
+            None => format!("{base}/latest/download/latest.json"),
+        };
+        match get(http, &url, false).await.and_then(|b| parse_index(&b)) {
+            Ok(r) => return Ok(r),
+            Err(e) => ctx.out.info(dim(&format!(
+                "latest.json unavailable ({}); asking the GitHub API",
+                crate::errors::classify(&e, "").message
+            ))),
+        }
+    }
+    let api = api.unwrap_or_else(|| DEFAULT_API.to_owned());
+    let url = match to {
+        Some(t) => format!("{api}/repos/{REPO}/releases/tags/{}", tag_of(t)),
+        None => format!("{api}/repos/{REPO}/releases/latest"),
+    };
+    parse_api(&get(http, &url, true).await?)
 }
 
 pub async fn cmd_self_update(a: SelfUpdateArgs, ctx: &Ctx) -> Result<u8> {
@@ -376,27 +550,10 @@ pub async fn cmd_self_update(a: SelfUpdateArgs, ctx: &Ctx) -> Result<u8> {
     #[cfg(windows)]
     let _ = std::fs::remove_file(exe.with_extension("exe.old"));
     let method = install_method(&exe, std::env::consts::OS, &|p| p.exists());
-    let api = std::env::var("OPROBE_UPDATE_API")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| DEFAULT_API.to_owned());
-    let api = api.trim_end_matches('/');
-    let url = match &a.to {
-        Some(tag) => format!(
-            "{api}/repos/{REPO}/releases/tags/{}",
-            if tag.starts_with('v') {
-                tag.clone()
-            } else {
-                format!("v{tag}")
-            }
-        ),
-        None => format!("{api}/repos/{REPO}/releases/latest"),
-    };
     let http = client()?;
     ctx.out.info(dim("checking GitHub Releases…"));
-    let rel: Release = serde_json::from_slice(&get(&http, &url, true).await?)
-        .context("unexpected answer from the GitHub API")?;
-    let latest = rel.tag_name.trim_start_matches('v').to_owned();
+    let rel = resolve_release(&http, a.to.as_deref(), ctx).await?;
+    let latest = rel.tag.trim_start_matches('v').to_owned();
     let available = newer(&latest, &current) || (a.to.is_some() && latest != current);
     let mut out = UpdateOutput {
         current_version: current.clone(),
@@ -409,6 +566,7 @@ pub async fn cmd_self_update(a: SelfUpdateArgs, ctx: &Ctx) -> Result<u8> {
         asset: None,
         sha256: None,
         release_url: rel.html_url.clone(),
+        release_source: rel.source,
     };
     if a.check || (!available && !a.force) {
         return ctx.out.finish(&out);
@@ -434,7 +592,7 @@ pub async fn cmd_self_update(a: SelfUpdateArgs, ctx: &Ctx) -> Result<u8> {
                 ErrorCode::StorageNotFound,
                 format!(
                     "release {} has no archive for this platform (looked for {})",
-                    rel.tag_name,
+                    rel.tag,
                     names.join(", ")
                 ),
             )
@@ -447,34 +605,38 @@ pub async fn cmd_self_update(a: SelfUpdateArgs, ctx: &Ctx) -> Result<u8> {
             asset.size
         );
     }
-    let sums = rel
-        .assets
-        .iter()
-        .find(|x| x.name == "SHA256SUMS")
-        .ok_or_else(|| {
-            OprobeError::new(
-                ErrorCode::SafetyRefused,
-                format!(
-                    "release {} has no SHA256SUMS: refusing to install an unverified download",
-                    rel.tag_name
-                ),
-            )
-        })?;
-    let sums = parse_sums(&String::from_utf8_lossy(
-        &get(&http, &sums.browser_download_url, false).await?,
-    ));
-    let expected = sums
-        .iter()
-        .find(|(_, n)| n == &asset.name)
-        .map(|(h, _)| h.clone())
-        .ok_or_else(|| {
-            OprobeError::new(
-                ErrorCode::SafetyRefused,
-                format!("SHA256SUMS does not list {}", asset.name),
-            )
-        })?;
+    let expected = match &asset.sha256 {
+        Some(h) => h.clone(),
+        None => {
+            let sums = rel
+                .assets
+                .iter()
+                .find(|x| x.name == "SHA256SUMS")
+                .ok_or_else(|| {
+                    OprobeError::new(
+                        ErrorCode::SafetyRefused,
+                        format!(
+                            "release {} has no SHA256SUMS: refusing to install an unverified download",
+                            rel.tag
+                        ),
+                    )
+                })?;
+            let sums = parse_sums(&String::from_utf8_lossy(
+                &get(&http, &sums.url, false).await?,
+            ));
+            sums.iter()
+                .find(|(_, n)| n == &asset.name)
+                .map(|(h, _)| h.clone())
+                .ok_or_else(|| {
+                    OprobeError::new(
+                        ErrorCode::SafetyRefused,
+                        format!("SHA256SUMS does not list {}", asset.name),
+                    )
+                })?
+        }
+    };
     ctx.out.info(format!("downloading {}…", asset.name));
-    let bytes = get(&http, &asset.browser_download_url, false).await?;
+    let bytes = get(&http, &asset.url, false).await?;
     let got = sha256_hex(&bytes);
     if got != expected {
         return Err(OprobeError::new(
@@ -615,6 +777,46 @@ mod tests {
         }
         assert!(extract_binary("x.rar", &tarball).is_err());
         assert!(!asset_names("3.0.0").is_empty());
+    }
+
+    #[test]
+    fn github_refusals_are_network_errors() {
+        for s in [403, 429, 502] {
+            let e = status_error(s, "https://api.github.com/x");
+            assert_eq!(e.code, ErrorCode::NetUnreachable, "{s}");
+            assert!(e.code.retryable());
+        }
+        assert_ne!(status_error(403, "u").code, ErrorCode::StorageThrottled);
+        assert!(
+            status_error(403, "u")
+                .hint
+                .unwrap_or_default()
+                .contains("GITHUB_TOKEN")
+        );
+        assert_eq!(status_error(404, "u").code, ErrorCode::UsageInvalidArgument);
+    }
+
+    #[test]
+    fn releases_parse_from_latest_json_and_the_api() {
+        let h = sha256_hex(b"x");
+        let idx = format!(
+            r#"{{"schema":"oprobe.release/1","version":"4.0.0","tag":"v4.0.0",
+               "release_url":"https://example.invalid/r",
+               "assets":[{{"name":"a.tar.gz","url":"https://example.invalid/a.tar.gz","size_bytes":3,"sha256":"{h}"}},
+                         {{"name":"b.zip","url":"https://example.invalid/b.zip","size_bytes":null,"sha256":"bad"}}]}}"#
+        );
+        let r = parse_index(idx.as_bytes()).unwrap();
+        assert_eq!(r.tag, "v4.0.0");
+        assert_eq!(r.source, ReleaseSource::LatestJson);
+        assert_eq!(r.assets[0].sha256.as_deref(), Some(h.as_str()));
+        assert_eq!(r.assets[1].sha256, None);
+        assert!(parse_index(br#"{"version":"","assets":[]}"#).is_err());
+        let api = br#"{"tag_name":"v4.0.1","html_url":"h","assets":[{"name":"SHA256SUMS","browser_download_url":"u","size":1}]}"#;
+        let r = parse_api(api).unwrap();
+        assert_eq!((r.tag.as_str(), r.source), ("v4.0.1", ReleaseSource::Api));
+        assert_eq!(r.assets[0].url, "u");
+        assert_eq!(tag_of("4.0.0"), "v4.0.0");
+        assert_eq!(tag_of("v4.0.0"), "v4.0.0");
     }
 
     #[test]

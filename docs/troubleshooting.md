@@ -43,8 +43,8 @@ the writes). Every error of every command carries a stable code (`-o json`: `err
 | `cannot open a window` / `built without native windows` | Linux server packages are headless: `oprobe top`, the `oprobe-desktop` tarball, or `cargo install oprobe --features gui` |
 | `runs open` says no display | over SSH: `oprobe runs show RUNREF`, or `oprobe top --open FILE` in the terminal |
 | `config edit` opens the wrong editor | set `VISUAL` or `EDITOR` (`export EDITOR="code -w"`) |
-| `self-update` refuses | oprobe was installed by a package manager; the message names its update command (`brew upgrade oprobe`, `winget upgrade oprobe`, …) |
-| `self-update` rate limited | GitHub's anonymous API limit: wait an hour or set `GITHUB_TOKEN` |
+| `self-update` refuses | oprobe was installed by a package manager; the message names its update command (`brew upgrade oprobe`, `winget upgrade hxddh.oprobe`, …) |
+| `self-update` rate limited (`net.unreachable`) | GitHub refused the request (403/429): `self-update` reads the release's `latest.json` first, so this means both it and the API were refused; wait or set `GITHUB_TOKEN` |
 | macOS: "cannot be opened because the developer cannot be verified" / Windows SmartScreen | the packages are unsigned: [first open](install.md#first-open-of-unsigned-packages) |
 
 ## Error codes

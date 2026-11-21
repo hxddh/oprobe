@@ -84,6 +84,21 @@
         "cli"
       ],
       "type": "object"
+    },
+    "ReleaseSource": {
+      "description": "Where `self-update` found the release.",
+      "oneOf": [
+        {
+          "const": "latest_json",
+          "description": "The release's `latest.json` index.",
+          "type": "string"
+        },
+        {
+          "const": "api",
+          "description": "The GitHub REST API.",
+          "type": "string"
+        }
+      ]
     }
   },
   "$id": "https://github.com/hxddh/oprobe/schemas/4/self-update.json",
@@ -119,6 +134,10 @@
       },
       "type": "array"
     },
+    "release_source": {
+      "$ref": "#/$defs/ReleaseSource",
+      "description": "Where the release was found."
+    },
     "release_url": {
       "type": "string"
     },
@@ -152,6 +171,7 @@
     "update_command",
     "executable",
     "release_url",
+    "release_source",
     "next",
     "warnings"
   ],
