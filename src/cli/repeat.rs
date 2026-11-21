@@ -228,7 +228,10 @@ pub async fn cmd_run_repeat(a: RunArgs, ctx: &Ctx) -> Result<u8> {
         if added && exit_code == exit::OK {
             let mut b = Baselines::load(&file)?;
             for r in &runs {
-                b.add_run(name, r.id());
+                // Partial or invalid runs never join a baseline (design v4 §4).
+                if let Err(e) = b.add_report(name, &r.report) {
+                    ctx.out.warn(e.to_string());
+                }
             }
             b.save(&file)?;
         } else {
