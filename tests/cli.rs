@@ -401,6 +401,59 @@ fn read_only_refuses_runs_that_write() {
 }
 
 #[test]
+fn children_of_a_read_only_mcp_server_refuse_to_write() {
+    let env = Env::new();
+    let bucket = env.dir.path().join("bucket");
+    std::fs::create_dir_all(bucket.join("data")).unwrap();
+    std::fs::write(bucket.join("data").join("obj"), vec![1u8; 4096]).unwrap();
+    let url = format!("fs://{}", bucket.display());
+    let mut args = small_run(&["--no-save", "-o", "json"]);
+    args[1] = url.clone();
+    // Any workload that would write to a real target is refused, before anything is sent.
+    for cmd in ["run", "fix"] {
+        let mut a = args.clone();
+        a[0] = cmd.into();
+        let o = env
+            .cmd()
+            .env("OPROBE_MCP_READ_ONLY", "1")
+            .args(&a)
+            .output()
+            .unwrap();
+        assert_eq!(o.status.code(), Some(5), "{cmd}: {}", stderr(&o));
+        assert_eq!(error_code(&o), "safety.read_only");
+    }
+    let names: Vec<_> = std::fs::read_dir(&bucket).unwrap().collect();
+    assert_eq!(names.len(), 1, "nothing was written");
+    // Reading existing objects and in-process targets stay allowed.
+    let o = env
+        .cmd()
+        .env("OPROBE_MCP_READ_ONLY", "1")
+        .args([
+            "run",
+            &url,
+            "--existing",
+            "data/",
+            "-d",
+            "200ms",
+            "--warmup",
+            "0s",
+            "--no-save",
+            "-o",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", stderr(&o));
+    let o = env
+        .cmd()
+        .env("OPROBE_MCP_READ_ONLY", "1")
+        .args(small_run(&["--no-save", "-o", "json"]))
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", stderr(&o));
+}
+
+#[test]
 fn budgets_stop_the_run_with_exit_4() {
     let env = Env::new();
     let mut args: Vec<String> = ["run", "memory://", "-d", "30s"]

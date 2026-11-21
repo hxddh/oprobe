@@ -567,6 +567,70 @@ fn read_only_server_refuses_writes_to_a_real_endpoint() {
     );
 }
 
+/// `recommend_config { from }` of a read-only (`existing`) run keeps the run's `existing`
+/// prefix: the child `fix` never generates a dataset on a read-only server.
+#[test]
+fn read_only_server_recommends_from_an_existing_run_without_writing() {
+    let bucket = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(bucket.path().join("data")).unwrap();
+    for i in 0..8 {
+        std::fs::write(
+            bucket.path().join("data").join(format!("obj-{i}")),
+            vec![7u8; 16 * 1024],
+        )
+        .unwrap();
+    }
+    let url = format!("fs://{}", bucket.path().display());
+    let listing = || -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(bucket.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    };
+    let mut m = Mcp::start(&[]);
+    let r = m.tool(
+        "start_run",
+        json!({
+            "target": url,
+            "existing": "data/",
+            "preset": "small-files",
+            "duration": "1s",
+            "warmup": "0s",
+            "concurrency": 2,
+            "wait": true
+        }),
+    );
+    assert_eq!(r["status"], "succeeded", "{r}");
+    assert_eq!(r["report"]["spec"]["existing"], "data/", "{r}");
+    let id = r["run_id"].as_str().unwrap().to_owned();
+    assert_eq!(listing(), ["data"]);
+
+    let (err, v, text) = m.tool_full(
+        "recommend_config",
+        json!({"from": id, "set": ["concurrency=3"], "budget": "30s"}),
+        None,
+    );
+    // Nothing was written next to the existing objects, whatever the outcome…
+    assert_eq!(listing(), ["data"], "recommend_config wrote: {text} {v}");
+    // …and a recommendation measured the same read-only workload.
+    if !err {
+        let diag = v["diagnosis_run_id"].as_str().unwrap();
+        let d = m.tool("get_run", json!({"run": diag}));
+        assert_eq!(d["report"]["spec"]["existing"], "data/", "{d}");
+        assert_eq!(
+            d["report"]["spec"]["profile"]["knobs"]["concurrency"], 3,
+            "`set` reaches the child: {d}"
+        );
+    } else {
+        assert!(
+            v["code"].as_str().unwrap().starts_with("safety."),
+            "{text} {v}"
+        );
+    }
+}
+
 /// POST one JSON-RPC message to a Streamable HTTP endpoint; returns the session id and the
 /// JSON-RPC response (from a JSON body or the SSE stream), if any.
 async fn http_post(

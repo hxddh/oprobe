@@ -1170,15 +1170,7 @@ fn check_probe(cfg: &McpConfig, a: &ProbeIn) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Targets that live in this process: `memory://` and the in-process `lab://` S3 server.
-/// Writing to them touches nothing outside the server, so a read-only server allows it
-/// (design v4 §9, AG-2).
-pub fn in_process(t: &crate::config::TargetSpec) -> bool {
-    t.scheme == "memory"
-        || t.url
-            .as_deref()
-            .is_some_and(|u| u.trim().to_ascii_lowercase().starts_with("lab://"))
-}
+pub use crate::guard::in_process;
 
 /// The write rail of this server: refuses runs that write unless `--allow-write`
 /// (`memory://` and `lab://` write only into this process and are always allowed).
@@ -1370,6 +1362,11 @@ fn prepare(st: &State, a: &PlanIn) -> anyhow::Result<Prepared> {
 async fn child_json(st: &State, args: Vec<String>, timeout: Duration) -> anyhow::Result<Value> {
     let exe = std::env::current_exe()?;
     let mut c = tokio::process::Command::new(exe);
+    if !st.cfg.allow_write {
+        // Defense in depth: the child refuses any measurement that would write to a target
+        // outside its own process, whatever arguments it was given.
+        c.env(crate::guard::READ_ONLY_SERVER_ENV, "1");
+    }
     c.args(&args)
         .args(["-o", "json", "--color", "never", "--non-interactive"])
         .env("OPROBE_DATA_DIR", &st.cfg.paths.data_dir)
@@ -2209,6 +2206,11 @@ async fn verify_finding(st: &Arc<State>, a: VerifyIn, cx: CallCx) -> anyhow::Res
     if let Some(n) = a.repeat {
         args.extend(["--repeat".into(), n.clamp(1, 20).to_string()]);
     }
+    // The replays are the stored run's spec (what `prepare` checked); a read-only server's
+    // child refuses any replay that would write all the same.
+    if !write_allowed(&st.cfg, &p.profile) {
+        args.push("--read-only".into());
+    }
     args.extend(budget_flags(&p.budgets));
     let v = child_job(st, args, &cx).await?;
     let text = verify_text(&v, &run_id);
@@ -2245,31 +2247,77 @@ fn verify_text(v: &Value, run_id: &str) -> String {
     }
 }
 
-async fn recommend_config(st: &Arc<State>, a: RecommendIn, cx: CallCx) -> anyhow::Result<Reply> {
-    let p = prepare(st, &a.plan)?;
-    if let Some(e) = p.refusals.into_iter().next() {
-        return Err(e);
-    }
-    let mut args = vec!["fix".to_owned()];
-    let t = effective_target(&a.plan, &p.profile);
-    args.extend(target_cli(&t));
-    let w = &a.plan.workload;
-    let mut flag = |f: &str, v: Option<String>| {
-        if let Some(v) = v {
-            args.extend([f.to_owned(), v]);
+/// Every workload, knob and cost argument of a tool's workload input as CLI flags (the
+/// inverse of [`workload_args`]), so a child command resolves the same profile.
+fn workload_cli(w: &WorkloadIn) -> Vec<String> {
+    let mut v = Vec::new();
+    let mut flag = |f: &str, x: Option<String>| {
+        if let Some(x) = x {
+            v.extend([f.to_owned(), x]);
         }
     };
     flag("--preset", w.preset.clone());
     flag("--duration", w.duration.clone());
     flag("--warmup", w.warmup.clone());
+    flag("--max-ops", w.max_ops.map(|n| n.to_string()));
+    flag("--rate", w.rate.map(|r| r.to_string()));
     flag("--existing", w.existing.clone());
     flag("--objects", w.objects.map(|n| n.to_string()));
     flag("--object-size", w.object_size.clone());
     flag("--access", w.access.clone());
-    flag("--rate", w.rate.map(|r| r.to_string()));
+    flag("--concurrency", w.concurrency.map(|n| n.to_string()));
+    flag("--io-concurrency", w.io_concurrency.map(|n| n.to_string()));
+    flag("--chunk-size", w.chunk_size.clone());
+    flag("--http", w.http.clone());
+    flag("--retries", w.retries.map(|n| n.to_string()));
     flag("--provider", w.provider.clone());
-    flag("--objective", a.objective.clone());
-    flag("--budget", a.budget.clone());
+    flag("--label", w.label.clone());
+    v
+}
+
+/// The CLI arguments that make a child command resolve the profile [`prepare`] checked: the
+/// target (unless `from` names it), every workload flag, `--from` and each `--set`; plus
+/// `--read-only` whenever this server would refuse a write to the target, so the child refuses
+/// one too.
+fn plan_cli(st: &State, a: &PlanIn, p: &Prepared) -> Vec<String> {
+    let mut args = Vec::new();
+    if !a.target.target.trim().is_empty() {
+        args.extend(target_cli(&a.target));
+    } else if a.from.is_none() {
+        args.extend(target_cli(&effective_target(a, &p.profile)));
+    }
+    args.extend(workload_cli(&a.workload));
+    if let Some(f) = &a.from {
+        args.extend(["--from".to_owned(), f.clone()]);
+    }
+    for s in &a.set {
+        args.extend(["--set".to_owned(), s.clone()]);
+    }
+    if a.read_only || !write_allowed(&st.cfg, &p.profile) {
+        args.push("--read-only".into());
+    }
+    args
+}
+
+/// Whether this server lets a run write to the profile's target.
+fn write_allowed(cfg: &McpConfig, p: &Profile) -> bool {
+    cfg.allow_write || in_process(&p.target)
+}
+
+async fn recommend_config(st: &Arc<State>, a: RecommendIn, cx: CallCx) -> anyhow::Result<Reply> {
+    let mut p = prepare(st, &a.plan)?;
+    if let Some(e) = std::mem::take(&mut p.refusals).into_iter().next() {
+        return Err(e);
+    }
+    let mut args = vec!["fix".to_owned()];
+    args.extend(plan_cli(st, &a.plan, &p));
+    let t = effective_target(&a.plan, &p.profile);
+    if let Some(o) = &a.objective {
+        args.extend(["--objective".to_owned(), o.clone()]);
+    }
+    if let Some(b) = &a.budget {
+        args.extend(["--budget".to_owned(), b.clone()]);
+    }
     args.extend(budget_flags(&p.budgets));
     let v = child_job(st, args, &cx).await?;
     let rec = v.get("recommendation").unwrap_or(&v);

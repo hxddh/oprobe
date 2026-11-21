@@ -224,6 +224,41 @@ pub fn usd_per_request(profile: &Profile) -> Option<f64> {
     Some(p.write_per_million.max(p.read_per_million) / 1e6)
 }
 
+/// Targets that live in this process: `memory://` and the in-process `lab://` S3 server.
+/// Writing to them touches nothing outside the process, so a read-only MCP server allows it
+/// (design v4 §9, AG-2).
+pub fn in_process(t: &crate::config::TargetSpec) -> bool {
+    t.scheme == "memory"
+        || t.url
+            .as_deref()
+            .is_some_and(|u| u.trim().to_ascii_lowercase().starts_with("lab://"))
+}
+
+/// Set (to `1`) by a read-only MCP server on the commands it runs as children (`fix`,
+/// `verify`, …): they then refuse any measurement that would write to a target outside their
+/// own process, whatever their arguments say ([`check_server_read_only`]).
+pub const READ_ONLY_SERVER_ENV: &str = "OPROBE_MCP_READ_ONLY";
+
+/// The rail of [`READ_ONLY_SERVER_ENV`]: refuse a run of `profile` that would write, unless
+/// its target lives in this process.
+pub fn check_server_read_only(profile: &Profile) -> anyhow::Result<()> {
+    let on = std::env::var(READ_ONLY_SERVER_ENV).is_ok_and(|v| !v.is_empty() && v != "0");
+    if !on || in_process(&profile.target) {
+        return Ok(());
+    }
+    check_read_only(profile).map_err(|_| {
+        OprobeError::new(
+            ErrorCode::SafetyReadOnly,
+            format!(
+                "the MCP server that started this command is read-only: refusing a run that would write to {}",
+                profile.target.display()
+            ),
+        )
+        .with_hint("benchmark existing objects with `existing: PREFIX`, or restart the server with `oprobe mcp --allow-write`")
+        .into()
+    })
+}
+
 /// `--read-only` (implied by `--existing`): refuse a run that would write or delete.
 pub fn check_read_only(profile: &Profile) -> anyhow::Result<()> {
     let ds = profile.workload.effective_dataset();
