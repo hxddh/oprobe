@@ -87,7 +87,7 @@ const ENTRIES: &[Entry] = &[
         verify: &[
             "report.resilience.error_classes and report.summary.error_ratio",
             "`oprobe doctor TARGET` for credentials, permissions and the endpoint",
-            "`oprobe analyze RUNREF --where error` / MCP analyze_run to see which requests failed",
+            "`oprobe analyze RUNREF --by status` (then `--where status=CODE`) / MCP analyze_run to see which requests failed",
         ],
         knobs: &["--retries", "--max-error-rate", "--concurrency"],
     },

@@ -973,6 +973,8 @@
         "net.dns",
         "net.tls",
         "net.timeout",
+        "net.rate_limited",
+        "net.http",
         "storage.not_found",
         "storage.throttled",
         "storage.unsupported",

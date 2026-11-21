@@ -359,7 +359,7 @@
           "format": "double",
           "type": "number"
         },
-        "min_samples": {
+        "min_samples_count": {
           "description": "Skip latency checks for operations with fewer samples.",
           "format": "uint64",
           "minimum": 0,
@@ -396,7 +396,7 @@
         "read_amp_pct",
         "cost_pct",
         "fail_on_new_throttling",
-        "min_samples",
+        "min_samples_count",
         "allow_workload_change",
         "allow_target_change"
       ],

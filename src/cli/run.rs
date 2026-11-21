@@ -36,6 +36,10 @@ pub struct RunOutput {
 }
 
 impl CommandOutput for RunOutput {
+    fn next(&self) -> Vec<crate::output::NextStep> {
+        crate::cli::next::after_run(&self.report)
+    }
+
     fn formats() -> &'static [crate::output::OutputFormat] {
         crate::output::WITH_MD_HTML
     }
@@ -75,6 +79,27 @@ pub struct PlanOutput {
 }
 
 impl CommandOutput for PlanOutput {
+    fn warnings(&self) -> Vec<String> {
+        self.plan.warnings.clone()
+    }
+    fn next(&self) -> Vec<crate::output::NextStep> {
+        let p = &self.plan;
+        if p.command.is_empty() {
+            return Vec::new();
+        }
+        vec![
+            crate::output::NextStep::new("run it", p.command.clone()).with_mcp(
+                "start_run",
+                serde_json::json!({
+                    "target": p.target_ref,
+                    "preset": p.preset,
+                    "duration": format!("{}s", p.duration_s),
+                    "warmup": format!("{}s", p.warmup_s),
+                    "concurrency": p.concurrency_count,
+                }),
+            ),
+        ]
+    }
     fn text(&self) -> String {
         let p = &self.plan;
         let mut o = format!(
@@ -106,6 +131,9 @@ impl CommandOutput for PlanOutput {
         );
         for a in &p.assumptions {
             o += &format!("  {}\n", dim(&format!("assumes {a}")));
+        }
+        for w in &p.warnings {
+            o += &format!("  {} {w}\n", crate::report::style::yellow("warning:"));
         }
         o += &dim("dry run: nothing was sent to the target\n");
         o
@@ -284,6 +312,9 @@ pub(super) async fn measure(
         let plan = rails.plan(&profile);
         return Ok(Measured::Plan(Box::new(PlanOutput { plan })));
     }
+    for w in crate::guard::workload_warnings(&profile) {
+        ctx.out.warn(w);
+    }
     let guard = guard_for(ctx, &profile, &rails.budgets);
     let cancel = Cancel::new();
     install_ctrl_c(cancel.clone());
@@ -336,6 +367,15 @@ pub struct TuneOutput {
 }
 
 impl CommandOutput for TuneOutput {
+    fn next(&self) -> Vec<crate::output::NextStep> {
+        let mut v = vec![
+            crate::cli::next::explain(&self.run_id),
+            crate::cli::next::show(&self.run_id),
+        ];
+        v.push(crate::cli::next::replay(&self.run_id));
+        v
+    }
+
     fn formats() -> &'static [crate::output::OutputFormat] {
         crate::output::WITH_MD
     }

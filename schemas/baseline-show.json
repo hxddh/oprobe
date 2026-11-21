@@ -247,7 +247,7 @@
       },
       "type": "array"
     },
-    "window": {
+    "window_count": {
       "format": "uint64",
       "minimum": 0,
       "type": "integer"
@@ -255,7 +255,7 @@
   },
   "required": [
     "name",
-    "window",
+    "window_count",
     "runs",
     "missing",
     "stats",

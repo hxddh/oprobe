@@ -119,6 +119,11 @@
         "budgets": {
           "$ref": "#/$defs/Budgets"
         },
+        "command": {
+          "default": "",
+          "description": "The command that runs this plan (`oprobe run …`, every non-default setting).",
+          "type": "string"
+        },
         "concurrency_count": {
           "format": "uint64",
           "minimum": 0,
@@ -181,9 +186,22 @@
         "target": {
           "type": "string"
         },
+        "target_ref": {
+          "default": "",
+          "description": "The target as given (URL or `lab://` scenario), for the run command.",
+          "type": "string"
+        },
         "warmup_s": {
           "format": "double",
           "type": "number"
+        },
+        "warnings": {
+          "default": [],
+          "description": "Things that would run, but probably not as meant (e.g. warmup ≥ window).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
         }
       },
       "required": [
@@ -201,7 +219,10 @@
         "objects_deleted_count",
         "eta_s",
         "budgets",
-        "assumptions"
+        "assumptions",
+        "target_ref",
+        "command",
+        "warnings"
       ],
       "type": "object"
     }

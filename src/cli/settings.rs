@@ -24,6 +24,13 @@ pub struct ConfigPaths {
 }
 
 impl CommandOutput for ConfigPaths {
+    fn next(&self) -> Vec<crate::output::NextStep> {
+        vec![
+            crate::cli::next::list_targets(),
+            crate::cli::next::discover(),
+        ]
+    }
+
     fn text(&self) -> String {
         format!(
             "config  {}{}\ndata    {}\nruns    {}\n",
@@ -58,6 +65,13 @@ pub struct ConfigShow {
 }
 
 impl CommandOutput for ConfigShow {
+    fn next(&self) -> Vec<crate::output::NextStep> {
+        vec![
+            crate::cli::next::list_targets(),
+            crate::cli::next::discover(),
+        ]
+    }
+
     fn text(&self) -> String {
         let rows: Vec<Vec<String>> = self
             .settings
@@ -101,6 +115,13 @@ pub struct TargetShow {
 }
 
 impl CommandOutput for TargetShow {
+    fn next(&self) -> Vec<crate::output::NextStep> {
+        vec![
+            crate::cli::next::doctor(&self.name),
+            crate::cli::next::plan(&self.name),
+        ]
+    }
+
     fn text(&self) -> String {
         let t = &self.target;
         let mut o = format!("{} {}\n", bold(&self.name), t.url);
@@ -127,6 +148,16 @@ pub struct TargetList {
 }
 
 impl CommandOutput for TargetList {
+    fn next(&self) -> Vec<crate::output::NextStep> {
+        match self.targets.first() {
+            Some(t) => vec![
+                crate::cli::next::doctor(&t.name),
+                crate::cli::next::plan(&t.name),
+            ],
+            None => vec![crate::cli::next::discover()],
+        }
+    }
+
     fn text(&self) -> String {
         if self.targets.is_empty() {
             return "no targets — add one with `oprobe target add NAME URL`\n".into();
@@ -213,7 +244,7 @@ pub async fn target_add(a: TargetAddArgs, ctx: &Ctx) -> Result<u8> {
     }
     // A quick read-only doctor: reachability, TLS, clock, credentials and listing.
     ctx.out.info(dim(
-        "quick check (read-only; `oprobe target test` also writes a probe object):",
+        "quick check (read-only; `oprobe target test --write-probe` also writes a probe object):",
     ));
     // A fresh context: the config was loaded (and cached) before the target was added.
     let fresh = Ctx::new(ctx.out.clone(), ctx.paths.clone());
@@ -224,6 +255,7 @@ pub async fn target_add(a: TargetAddArgs, ctx: &Ctx) -> Result<u8> {
                 ..Default::default()
             },
             read_only: true,
+            ..Default::default()
         },
         &fresh,
     )
@@ -254,6 +286,8 @@ pub async fn target_test(a: TargetTestArgs, ctx: &Ctx) -> Result<u8> {
                 ..Default::default()
             },
             read_only: a.read_only,
+            write_probe: a.write_probe,
+            verbose: false,
         },
         ctx,
     )
@@ -289,6 +323,10 @@ pub struct ConfigEdited {
 }
 
 impl CommandOutput for ConfigEdited {
+    fn next(&self) -> Vec<crate::output::NextStep> {
+        vec![crate::cli::next::list_targets()]
+    }
+
     fn text(&self) -> String {
         format!(
             "{} {} is valid{}\n",

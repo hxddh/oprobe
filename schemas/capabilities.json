@@ -20,6 +20,26 @@
         }
       ]
     },
+    "CommandInfo": {
+      "description": "One command and the output formats it offers (`-o`).",
+      "properties": {
+        "command": {
+          "description": "The command path, e.g. `runs show`.",
+          "type": "string"
+        },
+        "formats": {
+          "items": {
+            "$ref": "#/$defs/OutputFormat"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "command",
+        "formats"
+      ],
+      "type": "object"
+    },
     "DatasetInfo": {
       "properties": {
         "existing_prefix": {
@@ -118,6 +138,8 @@
         "net.dns",
         "net.tls",
         "net.timeout",
+        "net.rate_limited",
+        "net.http",
         "storage.not_found",
         "storage.throttled",
         "storage.unsupported",
@@ -528,6 +550,17 @@
       ],
       "type": "object"
     },
+    "OutputFormat": {
+      "description": "`-o/--output`.",
+      "enum": [
+        "text",
+        "json",
+        "ndjson",
+        "md",
+        "html"
+      ],
+      "type": "string"
+    },
     "PresetInfo": {
       "properties": {
         "dataset": {
@@ -680,6 +713,13 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "Result of `oprobe capabilities`",
   "properties": {
+    "commands": {
+      "description": "Every command with its output formats (`-o` outside them is a usage error).",
+      "items": {
+        "$ref": "#/$defs/CommandInfo"
+      },
+      "type": "array"
+    },
     "defaults": {
       "$ref": "#/$defs/Defaults"
     },
@@ -724,6 +764,7 @@
       "type": "string"
     },
     "output_formats": {
+      "description": "Every output format; `commands` says which command offers which.",
       "items": {
         "type": "string"
       },
@@ -786,6 +827,7 @@
     "transports",
     "http_versions",
     "output_formats",
+    "commands",
     "exit_codes",
     "error_codes",
     "finding_codes",

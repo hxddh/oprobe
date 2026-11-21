@@ -260,6 +260,16 @@ pub fn entries() -> Vec<Entry> {
             "Result of `oprobe target show`"
         ),
         entry!(
+            cmd "target-discover",
+            cli::discover::Discovery,
+            "Result of `oprobe target discover` (MCP discover_targets): credential sources by name"
+        ),
+        entry!(
+            cmd "target-sample",
+            cli::sample::ObjectSample,
+            "Result of `oprobe target sample` (MCP sample_objects): prefixes, counts and sizes"
+        ),
+        entry!(
             cmd "config-show",
             cli::settings::ConfigShow,
             "Result of `oprobe config show`"

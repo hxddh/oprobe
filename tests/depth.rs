@@ -141,7 +141,7 @@ async fn doctor_reports_tls_chain_permissions_and_capabilities() {
         .await
         .unwrap();
     let t = lab.profile("bkt").target.normalized().unwrap();
-    let d = doctor(t.clone(), false, "mylab").await;
+    let d = doctor(t.clone(), false, "mylab", false).await;
     assert!(d.ready, "{:#?}", d.checks);
     let tls = d.tls.as_ref().expect("tls details");
     assert_eq!(tls.version, "TLS1.3");
@@ -169,7 +169,19 @@ async fn doctor_reports_tls_chain_permissions_and_capabilities() {
     let v = serde_json::to_value(&d).unwrap();
     assert!(v["capabilities"]["write_with_if_match"].as_bool().unwrap());
 
-    let ro = doctor(t, true, "mylab").await;
+    let ro = doctor(t, true, "mylab", false).await;
     assert_eq!(ro.permissions.write, Access::Skipped);
-    assert!(ro.next[0].cli.contains("--existing"), "{:?}", ro.next);
+    assert!(!ro.write_probe);
+    assert!(ro.sample.is_some(), "doctor includes a sample");
+    // Read-only: plan, test writes on request, list the objects; never a placeholder.
+    assert!(
+        ro.next.iter().any(|n| n.cli.contains("--write-probe")),
+        "{:?}",
+        ro.next
+    );
+    assert!(
+        ro.next.iter().all(|n| !n.cli.contains('<')),
+        "{:?}",
+        ro.next
+    );
 }

@@ -1005,6 +1005,8 @@
         "net.dns",
         "net.tls",
         "net.timeout",
+        "net.rate_limited",
+        "net.http",
         "storage.not_found",
         "storage.throttled",
         "storage.unsupported",
@@ -4083,12 +4085,12 @@
           "format": "double",
           "type": "number"
         },
-        "ops": {
+        "ops_count": {
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
-        "requests": {
+        "requests_count": {
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -4108,15 +4110,15 @@
       "required": [
         "type",
         "elapsed_s",
-        "ops",
-        "requests"
+        "ops_count",
+        "requests_count"
       ],
       "type": "object"
     },
     {
       "description": "One second of the measurement window.",
       "properties": {
-        "errors": {
+        "errors_count": {
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -4142,7 +4144,7 @@
           "format": "double",
           "type": "number"
         },
-        "throttled": {
+        "throttled_count": {
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -4159,8 +4161,8 @@
         "mib_per_s",
         "p50_ms",
         "p99_ms",
-        "errors",
-        "throttled"
+        "errors_count",
+        "throttled_count"
       ],
       "type": "object"
     },

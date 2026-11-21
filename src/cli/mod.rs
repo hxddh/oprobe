@@ -7,17 +7,21 @@ pub(crate) mod analyze;
 pub mod args;
 pub(crate) mod compare;
 pub(crate) mod demo;
+pub mod discover;
 pub mod doctor;
 pub(crate) mod export;
+pub mod formats;
 mod live;
 pub(crate) mod matrix;
 mod measure;
 pub(crate) mod misc;
+pub mod next;
 mod onboard;
 pub mod reference;
 pub(crate) mod repeat;
 pub(crate) mod run;
 pub(crate) mod runs;
+pub mod sample;
 pub(crate) mod self_update;
 pub(crate) mod settings;
 pub(crate) mod watch;
@@ -26,7 +30,7 @@ use std::io::IsTerminal;
 use std::process::ExitCode;
 use std::sync::OnceLock;
 
-use anyhow::{Context, Result, bail};
+use anyhow::Result;
 use clap::CommandFactory;
 
 pub use args::Cli;
@@ -38,7 +42,7 @@ use crate::errors::{ErrorCode, OprobeError, exit};
 use crate::output::{Output, OutputFormat};
 use crate::report::style::{self, bold, red, yellow};
 use crate::store::{ConfigFile, Paths};
-use crate::util::{ByteSize, HumanDuration, parse_duration};
+use crate::util::{ByteSize, HumanDuration};
 
 pub use run::{RunOutput, TuneOutput};
 
@@ -88,17 +92,21 @@ pub async fn main(cli: Cli) -> ExitCode {
         ColorChoice::Auto => {}
     }
     let Some(command) = cli.command else {
-        let _ = Cli::command().print_help();
-        return ExitCode::SUCCESS;
+        return onboarding_without_tty(&cli);
     };
     let paths = Paths::resolve(cli.config.as_deref());
-    let format = cli.output.unwrap_or_else(|| {
+    let mut format = cli.output.unwrap_or_else(|| {
         ConfigFile::load(&paths.config_file)
             .ok()
             .and_then(|c| c.defaults.output)
             .and_then(|o| OutputFormat::parse(&o))
             .unwrap_or_default()
     });
+    // A default (`OPROBE_OUTPUT`, `[defaults] output`) the command cannot render is text; an
+    // explicit `-o` was checked by `parse_cli`.
+    if !command_formats().contains(&format) {
+        format = OutputFormat::Text;
+    }
     let non_interactive = cli.non_interactive || !crate::output::interactive_terminal();
     let mut ctx = Ctx::new(Output::new(format, cli.quiet, non_interactive), paths);
     if let Some(o) = cli.output
@@ -166,6 +174,7 @@ fn scheme_of(cmd: &Command) -> String {
         Command::Watch(a) => a.target.target.clone(),
         Command::Matrix(a) => a.target.target.clone(),
         Command::Cleanup(a) => a.target.target.clone(),
+        Command::Target(TargetCommand::Sample(a)) => a.target.target.clone(),
         _ => None,
     };
     t.and_then(|u| u.split_once("://").map(|(s, _)| s.to_owned()))
@@ -202,7 +211,7 @@ pub fn parse_cli(args: Vec<std::ffi::OsString>) -> std::result::Result<Cli, Exit
     use clap::Parser;
     use clap::error::ErrorKind;
     let e = match Cli::try_parse_from(&args) {
-        Ok(cli) => return Ok(cli),
+        Ok(cli) => return check_output_format(cli, &args),
         Err(e) => e,
     };
     let machine = machine_output(&args);
@@ -235,6 +244,80 @@ pub fn parse_cli(args: Vec<std::ffi::OsString>) -> std::result::Result<Cli, Exit
     let err: anyhow::Error = OprobeError::new(code, message).with_hint(hint).into();
     let body = crate::errors::classify(&err, "s3");
     let out = Output::new(machine.unwrap_or_default(), true, true);
+    Err(ExitCode::from(out.error(&body)))
+}
+
+/// The command path of this process (`runs show`), set by [`parse_cli`].
+static COMMAND_PATH: OnceLock<String> = OnceLock::new();
+
+/// The formats the parsed command offers.
+fn command_formats() -> &'static [OutputFormat] {
+    match COMMAND_PATH.get() {
+        Some(p) => formats::formats_of(p),
+        None => crate::output::WITH_MD_HTML,
+    }
+}
+
+/// Refuse an explicit `-o` the command cannot render (design v4 §8): a usage error before
+/// anything runs. `OPROBE_OUTPUT` and the config's default fall back to text instead.
+fn check_output_format(
+    cli: Cli,
+    args: &[std::ffi::OsString],
+) -> std::result::Result<Cli, ExitCode> {
+    let path = Cli::command()
+        .try_get_matches_from(args)
+        .map(|m| formats::command_path(&m))
+        .unwrap_or_default();
+    let path = match path.as_str() {
+        "tui" => "top".to_owned(),
+        "app" => "gui".to_owned(),
+        "serve-s3" => "lab".to_owned(),
+        _ => path,
+    };
+    let _ = COMMAND_PATH.set(path.clone());
+    let Some(given) = formats::explicit_output(args).and_then(|v| OutputFormat::parse(&v)) else {
+        return Ok(cli);
+    };
+    let offered = formats::formats_of(&path);
+    if offered.contains(&given) || cli.command.is_none() {
+        return Ok(cli);
+    }
+    let name = formats::names(&[given])[0];
+    let label = match given {
+        OutputFormat::Text => "text",
+        OutputFormat::Json => "JSON",
+        OutputFormat::Ndjson => "NDJSON",
+        OutputFormat::Md => "Markdown",
+        OutputFormat::Html => "HTML",
+    };
+    let mut choices: Vec<String> = formats::names(offered)
+        .iter()
+        .map(|f| format!("-o {f}"))
+        .collect();
+    let last = choices.pop().unwrap_or_default();
+    let hint = if choices.is_empty() {
+        format!("use {last} (or no -o)")
+    } else {
+        format!("use {} or {last}", choices.join(", "))
+    };
+    let err: anyhow::Error = OprobeError::new(
+        ErrorCode::UsageInvalidArgument,
+        format!("`oprobe {path}` has no {label} output (-o {name})"),
+    )
+    .with_hint(hint)
+    .into();
+    let body = crate::errors::classify(&err, "s3");
+    // The error itself as JSON when JSON was asked for and the command offers none (man,
+    // completions), so a script still gets a parseable answer.
+    let out = Output::new(
+        if given.is_machine() {
+            given
+        } else {
+            OutputFormat::Text
+        },
+        true,
+        true,
+    );
     Err(ExitCode::from(out.error(&body)))
 }
 
@@ -287,8 +370,7 @@ pub fn ui_entry(cli: &Cli) -> Option<ExitCode> {
         };
         let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
         if cli.command.is_none() && !window && !interactive {
-            let _ = Cli::command().print_help();
-            return Some(ExitCode::SUCCESS);
+            return Some(onboarding_without_tty(cli));
         }
         let monochrome = match cli.color {
             ColorChoice::Always => false,
@@ -343,13 +425,41 @@ pub fn ui_entry(cli: &Cli) -> Option<ExitCode> {
                 "this oprobe was built without its interactive UI",
                 "reinstall with `cargo install oprobe` (default features) or use `oprobe run`",
             )),
-            None => {
-                let _ = Cli::command().print_help();
-                Some(ExitCode::SUCCESS)
-            }
+            None => Some(onboarding_without_tty(cli)),
             Some(_) => None,
         }
     }
+}
+
+/// `oprobe` without a command off a terminal (scripts, agents; AG-9): the help, then the
+/// credential sources found on this machine and what to run with them — the same discovery
+/// as `oprobe target discover`. With `-o json` only the discovery result is printed.
+fn onboarding_without_tty(cli: &Cli) -> ExitCode {
+    let format = cli
+        .output
+        .filter(|f| {
+            matches!(
+                f,
+                OutputFormat::Text | OutputFormat::Json | OutputFormat::Ndjson
+            )
+        })
+        .unwrap_or_default();
+    let paths = Paths::resolve(cli.config.as_deref());
+    let ctx = Ctx::new(Output::new(format, cli.quiet, true), paths);
+    if format == OutputFormat::Text {
+        let _ = Cli::command().print_help();
+        println!("\n");
+    }
+    let code = match discover::discover(&ctx) {
+        Ok(d) => ctx.out.finish(&d).unwrap_or(exit::RUNTIME),
+        Err(e) => ctx.out.error(&crate::errors::classify(&e, "s3")),
+    };
+    if format == OutputFormat::Text {
+        println!(
+            "\nnext: `oprobe demo` (local lab, 30 s) · `oprobe target add NAME URL` · `oprobe run lab://demo -o json`"
+        );
+    }
+    ExitCode::from(code)
 }
 
 /// Whether a native window can be shown: built with `gui`, and a display is present.
@@ -463,6 +573,8 @@ async fn dispatch(cmd: Command, ctx: &Ctx) -> Result<u8> {
             TargetCommand::Show(a) => settings::target_show(a, ctx),
             TargetCommand::Rm(a) => settings::target_rm(a, ctx),
             TargetCommand::Test(a) => settings::target_test(a, ctx).await,
+            TargetCommand::Discover => discover::cmd_discover(ctx),
+            TargetCommand::Sample(a) => sample::cmd_sample(a, ctx).await,
         },
         Command::Config(c) => match c {
             ConfigCommand::Show => settings::config_show(ctx),
@@ -961,29 +1073,39 @@ pub fn tune_options(
     s: &TuneSettings<'_>,
     rate: Option<f64>,
 ) -> Result<crate::tune::TuneOptions> {
-    let duration = parse_duration(s.trial_duration).context("invalid trial duration")?;
-    anyhow::ensure!(
-        !duration.is_zero(),
-        "the trial duration must be greater than zero"
-    );
-    anyhow::ensure!(
-        s.max_trials >= tune_defaults::MIN_TRIALS,
-        "max trials must be at least {}",
-        tune_defaults::MIN_TRIALS
-    );
-    anyhow::ensure!(s.max_concurrency >= 1, "max concurrency must be at least 1");
+    let dur = |what: &str, v: &str| -> Result<std::time::Duration> {
+        crate::input::duration(v).map_err(|e| {
+            let mut o = OprobeError::new(e.code, format!("invalid {what}: {}", e.message));
+            o.hint = e.hint;
+            o.into()
+        })
+    };
+    let duration = dur("trial duration", s.trial_duration)?;
+    if duration.is_zero() {
+        return Err(crate::input::invalid("the trial duration must be greater than zero").into());
+    }
+    if s.max_trials < tune_defaults::MIN_TRIALS {
+        return Err(crate::input::invalid(format!(
+            "max trials must be at least {}",
+            tune_defaults::MIN_TRIALS
+        ))
+        .into());
+    }
+    if s.max_concurrency < 1 {
+        return Err(crate::input::invalid("max concurrency must be at least 1").into());
+    }
     Ok(crate::tune::TuneOptions {
         objective,
         trial: RunOptions {
             duration,
-            warmup: parse_duration(s.trial_warmup).context("invalid trial warmup")?,
+            warmup: dur("trial warmup", s.trial_warmup)?,
             max_ops: None,
             rate,
             trace_slow_ops: false,
         },
         max_concurrency: s.max_concurrency,
         max_trials: s.max_trials,
-        cooldown: parse_duration(s.cooldown).context("invalid cooldown")?,
+        cooldown: dur("cooldown", s.cooldown)?,
     })
 }
 
@@ -996,7 +1118,12 @@ fn cmd_init(a: InitArgs) -> Result<u8> {
     match &a.file {
         Some(p) => {
             if p.exists() {
-                bail!("`{}` already exists", p.display());
+                return Err(OprobeError::new(
+                    ErrorCode::UsageInvalidArgument,
+                    format!("`{}` already exists", p.display()),
+                )
+                .with_hint("pass another --out path, or delete the file first")
+                .into());
             }
             crate::report::write_file(p, &text)?;
             eprintln!(

@@ -104,6 +104,7 @@
           "type": "boolean"
         },
         "limit": {
+          "description": "In `unit`.",
           "format": "double",
           "type": "number"
         },
@@ -114,13 +115,18 @@
         "spec": {
           "description": "As given, e.g. `p99<200ms`.",
           "type": "string"
+        },
+        "unit": {
+          "description": "Unit of `limit` and of the measured values: `ms` or `ratio`.",
+          "type": "string"
         }
       },
       "required": [
         "spec",
         "metric",
         "below",
-        "limit"
+        "limit",
+        "unit"
       ],
       "type": "object"
     },
@@ -138,7 +144,12 @@
         "slo": {
           "$ref": "#/$defs/Slo"
         },
+        "unit": {
+          "description": "`ms` or `ratio`.",
+          "type": "string"
+        },
         "value": {
+          "description": "In `unit`.",
           "format": "double",
           "type": "number"
         }
@@ -147,6 +158,7 @@
         "slo",
         "ok",
         "value",
+        "unit",
         "breached_windows_count"
       ],
       "type": "object"
@@ -165,7 +177,12 @@
           "description": "`breached` or `recovered`.",
           "type": "string"
         },
+        "unit": {
+          "description": "`ms` or `ratio`.",
+          "type": "string"
+        },
         "value": {
+          "description": "In `unit`.",
           "format": "double",
           "type": "number"
         }
@@ -174,7 +191,8 @@
         "at",
         "slo",
         "state",
-        "value"
+        "value",
+        "unit"
       ],
       "type": "object"
     }

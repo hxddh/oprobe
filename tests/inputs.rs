@@ -544,3 +544,105 @@ fn missing_gcs_credentials_are_auth_no_credentials() {
     assert_eq!(code, "auth.no_credentials", "{err}");
     assert_eq!(exit, 1);
 }
+
+/// `-o` outside a command's formats is a usage error before it runs (design v4 §8, AG-4);
+/// `completions` and `man` are text only.
+#[test]
+fn unsupported_output_formats_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    for args in [
+        vec!["completions", "bash", "-o", "json"],
+        vec!["man", "-o", "json"],
+        vec!["doctor", "memory://", "-o", "json"],
+    ] {
+        let o = cmd(dir.path()).args(&args).output().unwrap();
+        if args[0] == "doctor" {
+            // Supported: a JSON result.
+            assert!(o.status.success(), "{args:?}");
+            continue;
+        }
+        assert_eq!(o.status.code(), Some(2), "{args:?}");
+        let v: Value = serde_json::from_slice(&o.stdout)
+            .unwrap_or_else(|e| panic!("{args:?}: {e}: {}", String::from_utf8_lossy(&o.stdout)));
+        assert_eq!(v["error"]["code"], "usage.invalid_argument", "{v}");
+        assert!(
+            v["error"]["hint"].as_str().unwrap().contains("-o text"),
+            "{v}"
+        );
+    }
+    let o = cmd(dir.path())
+        .args(["doctor", "memory://", "-o", "html"])
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(2));
+    assert!(o.stdout.is_empty(), "nothing ran");
+    assert!(String::from_utf8_lossy(&o.stderr).contains("usage.invalid_argument"));
+    // OPROBE_OUTPUT that a command cannot render falls back to text.
+    let o = cmd(dir.path())
+        .args(["completions", "bash"])
+        .env("OPROBE_OUTPUT", "json")
+        .output()
+        .unwrap();
+    assert!(o.status.success());
+    assert!(String::from_utf8_lossy(&o.stdout).contains("oprobe"));
+    // Capabilities lists the formats per command.
+    let o = cmd(dir.path())
+        .args(["capabilities", "-o", "json"])
+        .output()
+        .unwrap();
+    let v: Value = serde_json::from_slice(&o.stdout).unwrap();
+    let cmds = v["commands"].as_array().unwrap();
+    let of = |name: &str| -> Vec<String> {
+        cmds.iter()
+            .find(|c| c["command"] == name)
+            .unwrap_or_else(|| panic!("{name} missing"))["formats"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f.as_str().unwrap().to_owned())
+            .collect()
+    };
+    assert_eq!(of("completions"), ["text"]);
+    assert_eq!(of("man"), ["text"]);
+    assert!(of("runs show").contains(&"html".to_owned()));
+    assert!(!of("doctor").contains(&"html".to_owned()));
+}
+
+/// More inputs that were `internal` or silently accepted: probe and proxy URLs, an existing
+/// `init --out` file, conflicting safety flags.
+#[test]
+fn more_bad_inputs_are_usage_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let existing = dir.path().join("exists.toml");
+    std::fs::write(&existing, "x").unwrap();
+    let existing = existing.display().to_string();
+    for args in [
+        vec!["probe", "ftp://example.com"],
+        vec!["probe", "https://"],
+        vec!["init", "--out", existing.as_str()],
+        vec!["cleanup", "memory://", "--yes", "--dry-run"],
+        vec!["doctor", "memory://", "--write-probe", "--read-only"],
+        vec!["target", "sample", "memory://", "--limit", "0"],
+    ] {
+        let (exit, code, err) = cli_error(dir.path(), &args);
+        assert_eq!(code, "usage.invalid_argument", "{args:?}: {err}");
+        assert_eq!(exit, 2, "{args:?}");
+    }
+    let mut mcp = Mcp::start(dir.path());
+    assert_eq!(
+        mcp.tool_error("probe_endpoint", json!({"endpoint": "ftp://example.com"})),
+        "usage.invalid_argument"
+    );
+    assert_eq!(
+        mcp.tool_error("plan_run", json!({"target": "memory://", "bogus": true})),
+        "usage.invalid_argument"
+    );
+    assert_eq!(
+        mcp.tool_error("start_run", json!({"from": "nope"})),
+        "usage.unknown_run"
+    );
+    assert_eq!(
+        mcp.tool_error("sample_objects", json!({"target": "foo://bar"})),
+        "usage.invalid_argument"
+    );
+}

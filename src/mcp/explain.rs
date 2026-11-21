@@ -248,23 +248,41 @@ pub fn explain_run(run: &Run, top: usize) -> ExplainRun {
     ];
     for f in findings.iter().take(top.max(1)) {
         if let Some(v) = &f.verification {
-            next.push(NextStep::new(
-                format!("test it: {}", v.description),
-                v.rerun.clone(),
-            ));
+            // The hypothesis tested both ways (A B A B…), then the changed run alone.
+            next.push(
+                NextStep::new(format!("verify: {}", v.description), v.command.clone()).with_mcp(
+                    "verify_finding",
+                    serde_json::json!({ "run": id, "code": f.code }),
+                ),
+            );
+            if !v.overrides.is_empty() {
+                let sets: Vec<String> = v
+                    .overrides
+                    .entries()
+                    .into_iter()
+                    .map(|(k, val)| format!("{k}={val}"))
+                    .collect();
+                next.push(
+                    NextStep::new(format!("measure it: {}", sets.join(" ")), v.rerun.clone())
+                        .with_mcp("start_run", serde_json::json!({ "from": id, "set": sets })),
+                );
+            }
         }
         let step = match f.code.as_str() {
-            "throttling" | "sla_p99" | "server_latency" | "tail_latency" | "tail_stragglers" => {
-                Some(
-                    NextStep::new(
-                        "plan a tuner search",
-                        Command::for_target("tune", &r.target)
-                            .set("--dry-run", None)
-                            .to_string(),
-                    )
-                    .with_mcp("plan_run", serde_json::json!({ "target": target_ref })),
+            "throttling" | "sla_p99" | "server_latency" | "tail_latency" | "tail_stragglers"
+            | "small_objects" => Some(
+                NextStep::new(
+                    "find and verify a better configuration",
+                    format!(
+                        "oprobe fix {}",
+                        crate::model::spec::shell_quote(&target_ref)
+                    ),
                 )
-            }
+                .with_mcp(
+                    "recommend_config",
+                    serde_json::json!({ "target": target_ref }),
+                ),
+            ),
             "errors" | "cold_connections" | "high_rtt" | "tcp_retransmits" => Some(
                 NextStep::new(
                     "check the target",
@@ -372,7 +390,65 @@ impl CommandOutput for ExplainOutput {
     fn next(&self) -> Vec<NextStep> {
         match self {
             Self::Run(e) => e.next.clone(),
-            _ => Vec::new(),
+            Self::FindingCode(_) | Self::FindingCodes { .. } => vec![
+                NextStep::new("stored runs to explain", "oprobe runs list")
+                    .with_mcp("list_runs", serde_json::json!({})),
+                NextStep::new("explain the latest run", "oprobe explain last")
+                    .with_mcp("explain_run", serde_json::json!({ "run": "last" })),
+            ],
+        }
+    }
+    fn formats() -> &'static [crate::output::OutputFormat] {
+        crate::output::WITH_MD
+    }
+    fn markdown(&self) -> String {
+        let doc_md = |d: &FindingDoc| {
+            let mut o = format!(
+                "### `{}` — {}\n\n{} *({}, usually {})*\n\n",
+                d.code,
+                d.title,
+                d.meaning,
+                d.category,
+                d.typical_severity.label()
+            );
+            for (h, items) in [
+                ("Causes", d.causes),
+                ("Verify", d.verify),
+                ("Knobs", d.knobs),
+            ] {
+                if !items.is_empty() {
+                    o += &format!("- **{h}:** {}\n", items.join("; "));
+                }
+            }
+            o
+        };
+        match self {
+            Self::FindingCode(d) => doc_md(d),
+            Self::FindingCodes { codes } => {
+                let mut o = String::from("| Code | Category | Title |\n|---|---|---|\n");
+                for d in codes {
+                    o += &format!("| `{}` | {} | {} |\n", d.code, d.category, d.title);
+                }
+                o
+            }
+            Self::Run(e) => {
+                let mut o = format!(
+                    "## Run `{}` — {}\n\n**{}**\n\n",
+                    e.run_id,
+                    e.level.as_str(),
+                    e.headline
+                );
+                for s in e.narrative.iter().skip(1) {
+                    o += &format!("- {s}\n");
+                }
+                if !e.next.is_empty() {
+                    o += "\n### Next\n\n";
+                    for n in &e.next {
+                        o += &format!("- {}: `{}`\n", n.title, n.cli);
+                    }
+                }
+                o
+            }
         }
     }
     fn text(&self) -> String {

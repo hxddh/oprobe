@@ -26,6 +26,10 @@ pub struct CompatOutput {
 }
 
 impl CommandOutput for CompatOutput {
+    fn next(&self) -> Vec<crate::output::NextStep> {
+        vec![crate::cli::next::list_targets()]
+    }
+
     fn text(&self) -> String {
         let r = &self.report;
         let mut o = format!("{} {}\n", bold("oprobe compat"), r.target);
@@ -103,6 +107,10 @@ pub struct CompatPlan {
 }
 
 impl CommandOutput for CompatPlan {
+    fn next(&self) -> Vec<crate::output::NextStep> {
+        vec![crate::cli::next::list_targets()]
+    }
+
     fn text(&self) -> String {
         format!(
             "{} {} · writes, overwrites and deletes test objects under {}\n  ≤{} requests · ≤{} uploaded · cost {}\n{}",

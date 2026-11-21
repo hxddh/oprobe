@@ -51,11 +51,6 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "Result of `oprobe runs export`",
   "properties": {
-    "bytes": {
-      "format": "uint64",
-      "minimum": 0,
-      "type": "integer"
-    },
     "endpoint": {
       "type": [
         "string",
@@ -104,12 +99,18 @@
         "type": "string"
       },
       "type": "array"
+    },
+    "written_bytes": {
+      "description": "Bytes written.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
     }
   },
   "required": [
     "run_id",
     "format",
-    "bytes",
+    "written_bytes",
     "ops_count",
     "requests_count",
     "next",

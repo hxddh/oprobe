@@ -61,17 +61,25 @@ fn checked_in_schemas_match_the_code() {
     );
 }
 
-/// Types embedded in the report whose field names are input names (not unit-suffixed).
-const INPUT_MODELS: &[&str] = &["Profile"];
+/// Types whose field names are input names (the profile: config-file keys such as
+/// `concurrency`, `objects`) or compact trace-row names of the run file (`OpRow`, `ReqRow`:
+/// documented in docs/metrics.md), not unit-suffixed.
+const INPUT_MODELS: &[&str] = &["Profile", "OpRow", "ReqRow", "TcpRow", "TlsRow"];
+/// Output schemas whose field names are config-file names (`oprobe schema defaults`).
+const CONFIG_NAMED: &[&str] = &["defaults"];
 
-/// Design §6: every numeric property of the report carries its unit in its name.
+/// Design §6 and v4 §8: every numeric property of every registered output schema carries its
+/// unit in its name, and every enum value is `snake_case` (error codes are dotted
+/// `family.snake_case`). Input schemas (the config file, MCP inputs) are named after flags and
+/// are checked for enum casing only.
 #[test]
-fn report_schema_numeric_fields_carry_units() {
-    let schema = serde_json::to_value(schemars::schema_for!(oprobe::model::Report)).unwrap();
-    let defs = schema["$defs"].as_object().cloned().unwrap_or_default();
+fn every_schema_has_unit_suffixes_and_snake_case_enums() {
     fn resolve<'a>(s: &'a Value, defs: &'a serde_json::Map<String, Value>) -> &'a Value {
         match s.get("$ref").and_then(Value::as_str) {
-            Some(r) => resolve(&defs[r.rsplit('/').next().unwrap()], defs),
+            Some(r) => match defs.get(r.rsplit('/').next().unwrap()) {
+                Some(d) => resolve(d, defs),
+                None => s,
+            },
             None => s,
         }
     }
@@ -90,57 +98,108 @@ fn report_schema_numeric_fields_carry_units() {
             })
             || (types.contains(&"array") && numeric(&s["items"], defs))
     }
-    fn walk(
-        s: &Value,
-        path: &str,
-        defs: &serde_json::Map<String, Value>,
-        seen: &mut Vec<String>,
-        bad: &mut Vec<String>,
-    ) {
-        if let Some(r) = s.get("$ref").and_then(Value::as_str) {
-            let name = r.rsplit('/').next().unwrap().to_owned();
-            // `report.spec.profile` is the profile (TOML) model: its keys are the config
-            // file's input names (`concurrency`, `objects`, …), documented in docs/workloads.md.
-            if seen.contains(&name) || INPUT_MODELS.contains(&name.as_str()) {
+    fn snake(v: &str) -> bool {
+        let body = v.split_once('.').map(|(f, _)| {
+            // `family.snake_case` (error codes).
+            f.chars().all(|c| c.is_ascii_lowercase()) && !f.is_empty()
+        });
+        let rest = v.split_once('.').map(|(_, r)| r).unwrap_or(v);
+        body.unwrap_or(true)
+            && !rest.is_empty()
+            && rest
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+    }
+    struct Walk<'a> {
+        defs: &'a serde_json::Map<String, Value>,
+        units: bool,
+        seen: Vec<String>,
+        bad_units: Vec<String>,
+        bad_enums: Vec<String>,
+    }
+    impl Walk<'_> {
+        fn walk(&mut self, s: &Value, path: &str) {
+            if let Some(r) = s.get("$ref").and_then(Value::as_str) {
+                let name = r.rsplit('/').next().unwrap().to_owned();
+                // `report.spec.profile` is the profile (TOML) model: its keys are the config
+                // file's input names (`concurrency`, `objects`, …), documented in
+                // docs/workloads.md.
+                if self.seen.contains(&name) || INPUT_MODELS.contains(&name.as_str()) {
+                    return;
+                }
+                let Some(d) = self.defs.get(&name).cloned() else {
+                    return;
+                };
+                self.seen.push(name);
+                self.walk(&d, path);
+                self.seen.pop();
                 return;
             }
-            seen.push(name.clone());
-            walk(&defs[&name], path, defs, seen, bad);
-            seen.pop();
-            return;
-        }
-        for k in ["anyOf", "oneOf", "allOf"] {
-            for x in s[k].as_array().into_iter().flatten() {
-                walk(x, path, defs, seen, bad);
+            for v in s["enum"].as_array().into_iter().flatten() {
+                if let Some(v) = v.as_str()
+                    && !snake(v)
+                {
+                    self.bad_enums.push(format!("{path}: `{v}`"));
+                }
             }
-        }
-        if s["items"].is_object() {
-            walk(&s["items"], &format!("{path}[]"), defs, seen, bad);
-        }
-        if s["additionalProperties"].is_object() {
-            walk(
-                &s["additionalProperties"],
-                &format!("{path}.*"),
-                defs,
-                seen,
-                bad,
-            );
-        }
-        for (name, p) in s["properties"].as_object().into_iter().flatten() {
-            if numeric(p, defs) && !oprobe::model::has_unit(name) {
-                bad.push(format!("{path}.{name}"));
+            if let Some(v) = s["const"].as_str()
+                && s["type"] == "string"
+                && !snake(v)
+            {
+                self.bad_enums.push(format!("{path}: `{v}`"));
             }
-            walk(p, &format!("{path}.{name}"), defs, seen, bad);
+            for k in ["anyOf", "oneOf", "allOf"] {
+                for x in s[k].as_array().into_iter().flatten() {
+                    self.walk(x, path);
+                }
+            }
+            if s["items"].is_object() {
+                self.walk(&s["items"], &format!("{path}[]"));
+            }
+            if s["additionalProperties"].is_object() {
+                self.walk(&s["additionalProperties"], &format!("{path}.*"));
+            }
+            for (name, p) in s["properties"].as_object().into_iter().flatten() {
+                if self.units && numeric(p, self.defs) && !oprobe::model::has_unit(name) {
+                    self.bad_units.push(format!("{path}.{name}"));
+                }
+                self.walk(p, &format!("{path}.{name}"));
+            }
         }
     }
-    let mut bad = Vec::new();
-    walk(&schema, "", &defs, &mut Vec::new(), &mut bad);
-    bad.sort();
-    bad.dedup();
+    let mut bad_units = Vec::new();
+    let mut bad_enums = Vec::new();
+    for e in oprobe::mcp::schemas::entries() {
+        // Config-named schemas use the config file's vocabulary (flag names, preset slugs
+        // such as `small-files`).
+        if CONFIG_NAMED.contains(&e.name) {
+            continue;
+        }
+        let schema = oprobe::mcp::schemas::generate(&e);
+        let defs = schema["$defs"].as_object().cloned().unwrap_or_default();
+        let mut w = Walk {
+            defs: &defs,
+            units: e.direction == oprobe::mcp::schemas::Direction::Output,
+            seen: Vec::new(),
+            bad_units: Vec::new(),
+            bad_enums: Vec::new(),
+        };
+        w.walk(&schema, e.name);
+        bad_units.extend(w.bad_units);
+        bad_enums.extend(w.bad_enums);
+    }
+    for v in [&mut bad_units, &mut bad_enums] {
+        v.sort();
+        v.dedup();
+    }
     assert!(
-        bad.is_empty(),
-        "numeric report fields without a unit suffix ({:?}): {bad:#?}",
+        bad_units.is_empty(),
+        "numeric fields without a unit suffix ({:?}): {bad_units:#?}",
         oprobe::model::UNIT_SUFFIXES
+    );
+    assert!(
+        bad_enums.is_empty(),
+        "enum values that are not snake_case: {bad_enums:#?}"
     );
 }
 
@@ -283,7 +342,7 @@ fn json_only_agent_workflow_validates_against_the_schemas() {
         .iter()
         .map(|t| t["name"].as_str().unwrap())
         .collect();
-    assert_eq!(tools[0], "doctor");
+    assert_eq!(tools[0], "discover_targets");
     assert!(tools.contains(&"start_run") && tools.contains(&"compare_runs"));
     assert!(caps["error_codes"].as_array().unwrap().iter().any(|e| {
         e["code"] == "safety.budget_exceeded" && e["exit_code"] == 4 && e["retryable"] == false

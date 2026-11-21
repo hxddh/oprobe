@@ -120,7 +120,7 @@ pub enum Command {
     Analyze(AnalyzeArgs),
     /// Narrate a run's causes and advice, or document a finding code
     Explain(ExplainArgs),
-    /// Named targets: add, list, show, rm, test
+    /// Named targets: add, list, show, rm, test, discover (credential sources), sample
     #[command(subcommand)]
     Target(TargetCommand),
     /// Check endpoint reachability, TLS, clock skew, credentials and permissions
@@ -279,6 +279,23 @@ pub enum TargetCommand {
     Rm(TargetNameArg),
     /// Check a target (doctor: reachability, TLS, clock, credentials, permissions)
     Test(TargetTestArgs),
+    /// Credential sources on this machine (AWS profiles and environment, GCP ADC, Azure
+    /// environment), by name only, with the targets they can reach
+    Discover,
+    /// What a target holds (read-only): prefixes, object counts, size distribution, examples
+    Sample(TargetSampleArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct TargetSampleArgs {
+    #[command(flatten)]
+    pub target: TargetArgs,
+    /// List under this prefix (relative to the target root)
+    #[arg(long, value_name = "PREFIX")]
+    pub prefix: Option<String>,
+    /// List at most N objects
+    #[arg(long, value_name = "N", default_value_t = crate::cli::sample::DEFAULT_LIMIT, value_parser = at_least::<1>)]
+    pub limit: usize,
 }
 
 #[derive(Args, Debug)]
@@ -310,9 +327,12 @@ pub struct TargetAddArgs {
 pub struct TargetTestArgs {
     /// Target name (or a storage URL)
     pub name: String,
-    /// Only check reachability and listing; never write
-    #[arg(long)]
+    /// Only check reachability and listing; never write (the default)
+    #[arg(long, conflicts_with = "write_probe")]
     pub read_only: bool,
+    /// Also write, read back and delete a probe object
+    #[arg(long)]
+    pub write_probe: bool,
 }
 
 #[derive(Args, Debug)]
@@ -586,7 +606,7 @@ pub struct OutputArgs {
     pub label: Option<String>,
 }
 
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Default)]
 pub struct RunArgs {
     #[command(flatten)]
     pub target: TargetArgs,
@@ -784,9 +804,16 @@ pub struct CompatArgs {
 pub struct DoctorArgs {
     #[command(flatten)]
     pub target: TargetArgs,
-    /// Only check reachability and listing; never write
-    #[arg(long)]
+    /// Only check reachability and listing; never write (the default; kept for scripts)
+    #[arg(long, conflicts_with = "write_probe")]
     pub read_only: bool,
+    /// Also write, read back, stat and delete a 256 KiB probe object under
+    /// `oprobe-run-<time>-doctor/` (the default is read-only)
+    #[arg(long)]
+    pub write_probe: bool,
+    /// Show the raw backend error of failed checks
+    #[arg(short, long)]
+    pub verbose: bool,
 }
 
 #[derive(Args, Debug)]
@@ -876,12 +903,15 @@ pub struct CleanupArgs {
     /// Also remove persisted datasets (oprobe-dataset/)
     #[arg(long)]
     pub datasets: bool,
-    /// Show what would be deleted
-    #[arg(long)]
+    /// Show what would be deleted (the default without --yes)
+    #[arg(long, conflicts_with = "yes")]
     pub dry_run: bool,
     /// Refuse to delete anything (implies --dry-run)
-    #[arg(long)]
+    #[arg(long, conflicts_with = "yes")]
     pub read_only: bool,
+    /// Delete what was found (without it, cleanup only lists it)
+    #[arg(long, short = 'y')]
+    pub yes: bool,
 }
 
 #[derive(Args, Debug)]

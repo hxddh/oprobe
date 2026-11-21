@@ -68,6 +68,7 @@ pub struct Factor {
     /// Share of the other requests with this value (0–1).
     pub rest_ratio: f64,
     /// `selected_ratio / rest_ratio`, smoothed (add-one) and capped.
+    #[serde(rename = "lift_ratio", alias = "lift")]
     pub lift: f64,
     /// Selected requests with this value.
     pub selected_count: u64,

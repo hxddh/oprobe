@@ -45,7 +45,9 @@ pub enum EventKind {
         elapsed_s: f64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         total_s: Option<f64>,
+        #[serde(rename = "ops_count", alias = "ops")]
         ops: u64,
+        #[serde(rename = "requests_count", alias = "requests")]
         requests: u64,
     },
     /// One second of the measurement window.
@@ -56,7 +58,9 @@ pub enum EventKind {
         mib_per_s: f64,
         p50_ms: f64,
         p99_ms: f64,
+        #[serde(rename = "errors_count", alias = "errors")]
         errors: u64,
+        #[serde(rename = "throttled_count", alias = "throttled")]
         throttled: u64,
     },
     Finding {
@@ -200,7 +204,8 @@ impl EventBus {
                     bus.emit(EventKind::Phase { phase: s.phase });
                 }
                 // Every second but the last (still filling) is final.
-                let done = if s.phase == Phase::Done {
+                // The window is over (`cleanup` follows it): every second is final.
+                let done = if matches!(s.phase, Phase::Done | Phase::Cleanup) {
                     s.timeline.len()
                 } else {
                     s.timeline.len().saturating_sub(1)

@@ -34,7 +34,10 @@ pub struct Slo {
     pub metric: String,
     /// The value must stay below (`true`) or above (`false`) the limit.
     pub below: bool,
+    /// In `unit`.
     pub limit: f64,
+    /// Unit of `limit` and of the measured values: `ms` or `ratio`.
+    pub unit: String,
 }
 
 impl Slo {
@@ -81,6 +84,12 @@ impl Slo {
         };
         Ok(Self {
             spec: t.to_owned(),
+            unit: if metric.ends_with("_ms") {
+                "ms"
+            } else {
+                "ratio"
+            }
+            .into(),
             metric,
             below,
             limit,
@@ -161,14 +170,20 @@ pub struct Transition {
     pub slo: String,
     /// `breached` or `recovered`.
     pub state: String,
+    /// In `unit`.
     pub value: f64,
+    /// `ms` or `ratio`.
+    pub unit: String,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 pub struct SloState {
     pub slo: Slo,
     pub ok: bool,
+    /// In `unit`.
     pub value: f64,
+    /// `ms` or `ratio`.
+    pub unit: String,
     /// Probe windows that ended with the SLO breached.
     pub breached_windows_count: u64,
 }
@@ -186,6 +201,13 @@ pub struct WatchOutput {
 }
 
 impl CommandOutput for WatchOutput {
+    fn next(&self) -> Vec<crate::output::NextStep> {
+        vec![
+            crate::cli::next::doctor(&self.target),
+            crate::cli::next::list_runs(),
+        ]
+    }
+
     fn text(&self) -> String {
         let r = &self.rolling;
         let mut o = format!(
@@ -455,6 +477,7 @@ pub async fn cmd_watch(a: WatchArgs, ctx: &Ctx) -> Result<u8> {
                         slo: s.spec.clone(),
                         state: state.into(),
                         value: v,
+                        unit: s.unit.clone(),
                     });
                 }
             }
@@ -494,6 +517,7 @@ pub async fn cmd_watch(a: WatchArgs, ctx: &Ctx) -> Result<u8> {
                 slo: s.clone(),
                 ok: ok[i],
                 value: rolling.get(&s.metric),
+                unit: s.unit.clone(),
                 breached_windows_count: breached_windows[i],
             })
             .collect(),

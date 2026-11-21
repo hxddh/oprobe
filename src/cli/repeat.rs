@@ -40,6 +40,19 @@ pub struct RepeatOutput {
 }
 
 impl CommandOutput for RepeatOutput {
+    fn next(&self) -> Vec<crate::output::NextStep> {
+        let mut v = Vec::new();
+        if let (Some(a), Some(b)) = (self.runs.first(), self.runs.last())
+            && a.id != b.id
+        {
+            v.push(crate::cli::next::compare(&a.id, &b.id));
+        }
+        if let Some(r) = self.runs.last() {
+            v.push(crate::cli::next::explain(&r.id));
+        }
+        v
+    }
+
     fn formats() -> &'static [crate::output::OutputFormat] {
         crate::output::WITH_MD
     }

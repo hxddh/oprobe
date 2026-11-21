@@ -274,6 +274,15 @@ pub struct Plan {
     pub budgets: Budgets,
     /// How the estimates were made.
     pub assumptions: Vec<String>,
+    /// The target as given (URL or `lab://` scenario), for the run command.
+    #[serde(default)]
+    pub target_ref: String,
+    /// The command that runs this plan (`oprobe run …`, every non-default setting).
+    #[serde(default)]
+    pub command: String,
+    /// Things that would run, but probably not as meant (e.g. warmup ≥ window).
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 /// Build the plan of a run without touching the target.
@@ -417,7 +426,35 @@ pub fn plan(profile: &Profile, run_prefix: &str, read_only: bool, budgets: &Budg
         eta_s: prepare_s + window + cleanup_s,
         budgets: budgets.clone(),
         assumptions,
+        target_ref: target_ref(profile),
+        command: crate::model::RunSpec::new(profile, target_ref(profile)).command(),
+        warnings: workload_warnings(profile),
     }
+}
+
+/// The target of a profile as typed: its URL (or `lab://` scenario), else its display form.
+pub fn target_ref(profile: &Profile) -> String {
+    profile
+        .target
+        .url
+        .clone()
+        .unwrap_or_else(|| profile.target.display())
+}
+
+/// Warnings about a workload that would run but probably not as meant (AG-9): a warmup at
+/// least as long as the measurement window spends most of the run unmeasured.
+pub fn workload_warnings(profile: &Profile) -> Vec<String> {
+    let w = &profile.workload;
+    let (warmup, window) = (w.warmup.get(), w.duration.get());
+    let mut out = Vec::new();
+    if !warmup.is_zero() && warmup >= window && w.max_ops.is_none() {
+        out.push(format!(
+            "the warmup ({}) is as long as the measurement window ({}) or longer: most of the \
+             run is not measured (shorten --warmup or lengthen -d)",
+            w.warmup, w.duration
+        ));
+    }
+    out
 }
 
 /// Outcome of [`preflight`].
@@ -439,7 +476,13 @@ pub async fn preflight(
     let classify = |what: &str, e: opendal::Error| -> anyhow::Error {
         // Typed from the OpenDAL error (a credential that cannot be loaded is
         // `auth.no_credentials`).
-        let code = crate::errors::opendal_code(&e).unwrap_or(ErrorCode::Internal);
+        // An error that says nothing more than "unexpected" is a failing service or network
+        // path when OpenDAL marks it temporary.
+        let code = crate::errors::opendal_code(&e).unwrap_or(if e.is_temporary() {
+            ErrorCode::NetUnreachable
+        } else {
+            ErrorCode::Internal
+        });
         let hint = if code == ErrorCode::AuthNoCredentials {
             "no credentials were found: set them for the target (`oprobe doctor TARGET` shows which sources it tried), or pass --anonymous for a public bucket"
         } else {

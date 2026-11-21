@@ -33,15 +33,18 @@ pub const REPORT_SCHEMA: &str = "oprobe.report/4";
 /// count per something, e.g. `requests_per_op_count`, and maps of counts like
 /// `status_count`); `_mean` fractional means of counts (`inflight_mean`, v4 §4).
 pub const UNIT_SUFFIXES: &[&str] = &[
-    "_us", "_ms", "_s", "_bytes", "_mib", "_gib", "_bps", "_per_s", "_pct", "_ratio", "_usd",
-    "_count", "_mean",
+    "_us", "_ms", "_s", "_bytes", "_mib", "_gib", "_bps", "_per_s", "_pct", "_pp", "_ratio",
+    "_usd", "_count", "_mean", "_days",
 ];
 
 /// Numeric report fields that are not quantities and so carry no unit: identifiers
 /// (`id`, `*_id`, `*_ids`, `slowest` op ids, tune trial ids), codes (`exit_code`), the
-/// workload `seed`, relative mix `weight`s and the heatmap's `counts` matrix (named by §6);
+/// workload `seed`, relative mix `weight`s, the heatmap's `counts` matrix (named by §6), a matrix
+/// cell's `rank`, a TCP `port`, HTTP `status` and exit `code`s; the parts of an interval
+/// (`estimate`, `low`, `high`) whose unit is in the name of the field holding it
+/// (`p99_ms.estimate`);
 /// and values whose unit is a sibling `unit` field (`Expectation`, gate checks, tune deltas:
-/// `predicted`, `lo`, `hi`, `baseline`, `candidate`).
+/// `predicted`, `lo`, `hi`, `baseline`, `candidate`, watch SLO `value` and `limit`).
 pub const UNITLESS_FIELDS: &[&str] = &[
     "id",
     "op_ids",
@@ -57,6 +60,15 @@ pub const UNITLESS_FIELDS: &[&str] = &[
     "hi",
     "baseline",
     "candidate",
+    "rank",
+    "port",
+    "status",
+    "code",
+    "value",
+    "limit",
+    "estimate",
+    "low",
+    "high",
 ];
 
 /// Whether a numeric report field name follows the unit rule.

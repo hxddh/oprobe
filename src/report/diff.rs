@@ -26,6 +26,7 @@ pub struct Thresholds {
     /// [`THROTTLE_RATE_PCT`] and [`THROTTLE_RATE_FLOOR`].
     pub fail_on_new_throttling: bool,
     /// Skip latency checks for operations with fewer samples.
+    #[serde(rename = "min_samples_count", alias = "min_samples")]
     pub min_samples: u64,
     /// Compare runs of different workloads without failing (otherwise a gate failure).
     #[serde(default)]

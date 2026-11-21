@@ -238,6 +238,7 @@ fn summaries(ctx: &Ctx, ids: &[String]) -> Result<(Vec<RunSummary>, Vec<String>)
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 pub struct BaselineShow {
     pub name: String,
+    #[serde(rename = "window_count")]
     pub window: u64,
     pub runs: Vec<RunSummary>,
     /// Run ids the baseline lists that are no longer stored.
@@ -304,6 +305,7 @@ pub struct BaselineList {
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 pub struct BaselineEntry {
     pub name: String,
+    #[serde(rename = "window_count")]
     pub window: u64,
     pub runs_count: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
