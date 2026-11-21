@@ -584,3 +584,28 @@ fn the_terminal_at_120x30_keeps_tabs_visible_and_tiles_unwrapped() {
     app.wait_for("text:/^Cost (not applicable|shows)|^PROJECTED/")
         .unwrap();
 }
+
+#[test]
+fn add_target_asks_for_the_bucket_tests_read_only_and_saves() {
+    let cx = Ctx::new();
+    let mut app = cx.start();
+    app.wait_for("text:Try the demo").unwrap();
+    // The welcome view's path in.
+    app.press("role:button[Add Target…] >> nth=0").unwrap();
+    app.wait_for("id:Target URL").unwrap();
+    // A credentials source has no bucket: saving `s3://` asks for one.
+    app.type_text("id:Target URL", "s3://").unwrap();
+    app.press("role:button[Save Target]").unwrap();
+    app.wait_for("text:/bucket/").unwrap();
+    assert!(!cx.dir.path().join("config.toml").exists());
+    app.clear("id:Target URL").unwrap();
+    app.type_text("id:Target URL", "memory://").unwrap();
+    app.type_text("id:Target name", "scratch").unwrap();
+    app.press("role:button[Test Connection]").unwrap();
+    wait_long(&mut app, "text:/^Connected to memory/");
+    // Enter in a field saves.
+    app.submit("id:Target name").unwrap();
+    wait_long(&mut app, "text:TARGETS (1)");
+    let cfg = ConfigFile::load(&cx.dir.path().join("config.toml")).unwrap();
+    assert_eq!(cfg.targets["scratch"].url, "memory://");
+}
