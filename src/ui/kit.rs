@@ -573,12 +573,20 @@ pub fn empty(
 }
 
 /// A key and what it does, for the footer and the help overlay.
+/// Never wraps: a footer too narrow for all of them clips the last ones.
 pub fn key_hint(keys: &'static str, what: &'static str) -> View {
     view()
         .flex_row()
         .gap_1()
-        .child(text(keys).text_size(px(11.0)).font_weight(FontWeight::BOLD))
-        .child(small(what))
+        .flex_shrink_0()
+        .child(
+            text(keys)
+                .text_size(px(11.0))
+                .font_weight(FontWeight::BOLD)
+                .number_of_lines(1)
+                .flex_shrink_0(),
+        )
+        .child(small(what).number_of_lines(1).flex_shrink_0())
 }
 
 /// A two-column property list row (inspector).

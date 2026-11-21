@@ -525,6 +525,7 @@ fn run_row(s: Store, r: RunSummary) -> impl IntoElement {
     };
     let today = crate::util::now_rfc3339();
     let when = fmt::short_time(&r.started_at, fmt::day_of(&today));
+    let has_label = r.label.is_some();
     let label = r.label.clone().unwrap_or_else(|| when.clone());
     let tone = verdict_tone(&r);
     let partial = runs::partial_badge(&r);
@@ -533,7 +534,7 @@ fn run_row(s: Store, r: RunSummary) -> impl IntoElement {
         "Run {} · {} · {}{}",
         r.id,
         label,
-        numbers,
+        &numbers,
         partial
             .as_ref()
             .map(|p| format!(" · {p}"))
@@ -567,9 +568,14 @@ fn run_row(s: Store, r: RunSummary) -> impl IntoElement {
                         .child(partial.map(|p| badge(p, || Tone::Warn).flex_shrink_0())),
                 )
                 .child(
-                    small(format!("{when} · {numbers}"))
-                        .number_of_lines(1)
-                        .tabular_nums(),
+                    // The time is the title of a run without a label: not twice.
+                    small(if has_label {
+                        format!("{when} · {numbers}")
+                    } else {
+                        numbers
+                    })
+                    .number_of_lines(1)
+                    .tabular_nums(),
                 ),
         )
         .child(
@@ -1812,17 +1818,21 @@ fn status_bar(s: Store) -> impl IntoElement {
                 .overflow_hidden()
                 .children(if term {
                     vec![
+                        // The essentials first: at 80 columns the last two are left out.
                         key_hint("r", "rerun"),
                         key_hint("s", "stop"),
                         key_hint("n", "new"),
-                        key_hint("v", "verify"),
                         key_hint("1-6", "tabs"),
                         key_hint("/", "filter"),
-                        key_hint("j/k", "move"),
                         key_hint("c", "compare"),
                         key_hint("?", "help"),
                         key_hint("q", "quit"),
+                        key_hint("v", "verify"),
+                        key_hint("j/k", "move"),
                     ]
+                    .into_iter()
+                    .take(if narrow() { 8 } else { 10 })
+                    .collect()
                 } else {
                     vec![
                         view().child(

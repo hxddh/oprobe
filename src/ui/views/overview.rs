@@ -384,7 +384,7 @@ fn finished(s: Store) -> View {
                 .child(kpi_detail(
                     "THROTTLED",
                     num(|r| fmt::ratio(metrics::throttled_request_ratio(r)).into()),
-                    num(|r| format!("retries {}", fmt::ratio(metrics::retry_share(r))).into()),
+                    num(|r| format!("retry {}", fmt::ratio(metrics::retry_share(r))).into()),
                     move || {
                         if r.with(|r| {
                             r.as_ref()
@@ -743,7 +743,7 @@ fn live(s: Store) -> View {
                         snap.with(|s| {
                             s.as_ref()
                                 .map(|(_, r, c)| {
-                                    format!("retries {}", fmt::ratio(metrics::retry_share_of(r, c)))
+                                    format!("retry {}", fmt::ratio(metrics::retry_share_of(r, c)))
                                         .into()
                                 })
                                 .unwrap_or_default()

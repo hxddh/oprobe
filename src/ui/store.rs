@@ -320,8 +320,11 @@ pub struct Store {
     pub run_limit: Signal<usize>,
     /// The verdict of the last Verify (shown over its comparison).
     pub verdict: Signal<Option<Verdict>>,
-    /// Compare opened without a pair: the run that is side B (the selectors start there).
-    pub compare_pick: Signal<Option<String>>,
+    /// What Compare shows now, side A and side B (set at once, before the comparison has
+    /// loaded; Compare opened without a pair has only B).
+    pub compare_pick: Signal<(Option<String>, Option<String>)>,
+    /// A comparison is loading.
+    pub comparing: Signal<bool>,
     pending_verify: Stored<Option<PendingVerify>>,
     /// Bumped by the run-directory watcher when the directory changes.
     runs_changed: Stored<Arc<std::sync::atomic::AtomicU64>>,
@@ -461,7 +464,8 @@ impl Store {
             run_query: signal(String::new()),
             run_limit: signal(crate::ui::model::runs::PAGE),
             verdict: signal(None),
-            compare_pick: signal(None),
+            compare_pick: signal((None, None)),
+            comparing: signal(false),
             pending_verify: stored(None),
             runs_seen: stored(runs_changed.load(std::sync::atomic::Ordering::Relaxed)),
             runs_changed: stored(runs_changed),
@@ -1507,8 +1511,12 @@ impl Store {
         let store = self.run_store();
         let (a, b) = (a.to_owned(), b.to_owned());
         let s = *self;
-        self.mode.set(Mode::Compare);
-        self.comparison.set(None);
+        batch(|| {
+            self.mode.set(Mode::Compare);
+            self.comparison.set(None);
+            self.compare_pick.set((Some(a.clone()), Some(b.clone())));
+            self.comparing.set(true);
+        });
         spawn(async move {
             let res = off_thread(move || {
                 let load = |id: &str| -> anyhow::Result<(crate::model::Run, std::path::PathBuf)> {
@@ -1534,12 +1542,16 @@ impl Store {
                     });
                     batch(|| {
                         s.verdict.set(verdict);
+                        s.comparing.set(false);
                         s.comparison
                             .set(Some((Shared(Arc::new(va)), Shared(Arc::new(vb)), c)));
                     });
                 }
-                Some(Err(e)) => s.toast(format!("cannot compare: {e:#}"), Tone::Crit),
-                None => {}
+                Some(Err(e)) => {
+                    s.comparing.set(false);
+                    s.toast(format!("cannot compare: {e:#}"), Tone::Crit)
+                }
+                None => s.comparing.set(false),
             }
         });
     }
@@ -1574,7 +1586,7 @@ impl Store {
                 batch(|| {
                     self.verdict.set(None);
                     self.comparison.set(None);
-                    self.compare_pick.set(Some(cur.clone()));
+                    self.compare_pick.set((None, Some(cur.clone())));
                     self.mode.set(Mode::Compare);
                 });
                 self.toast(

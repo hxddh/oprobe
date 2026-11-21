@@ -247,63 +247,75 @@ pub fn findings() -> impl IntoElement {
     }))
 }
 
+/// Below this width the Cost tab's three columns become one (the terminal at 120×30 with
+/// the sidebar, narrow windows): names and numbers never wrap.
+const COST_COLUMNS_MIN_W: f32 = 760.0;
+
 pub fn cost() -> impl IntoElement {
     let s = store();
-    scroll().flex_1().child(dynamic(move || {
-        let data = s.current.with(|c| {
-            c.as_ref().map(|c| {
-                (
-                    c.run.report.cost.clone(),
-                    crate::ui::model::metrics::storage_note(&c.run.report),
-                )
-            })
-        });
-        untracked(|| {
-            let Some((c, assumed)) = data else {
-                return empty("Cost shows when the run has finished", "").into_element();
-            };
-            if !c.applicable {
-                return empty(
-                    "Cost not applicable",
-                    c.not_applicable_reason
-                        .unwrap_or_else(|| "No price table applies to this target.".into()),
-                )
-                .into_element();
-            }
-            let sel = c.selected.clone();
-            let u = c.per_op.clone();
-            view()
-                .p_4()
-                .gap_4()
-                .child(
-                    view()
-                        .gap_1()
-                        .child(caption(format!(
-                            "PROJECTED MONTHLY COST · {} · prices as of {}",
-                            sel.provider, c.pricing_as_of
-                        )))
-                        .child(
-                            strong(format!("{} / month", fmt::usd(sel.total_usd)))
-                                .text_size(px(22.0)),
-                        )
-                        .child(small(format!(
-                            "at {} operations a month, {} stored{}, {} of reads leaving the cloud",
-                            fmt::compact(c.monthly_ops),
-                            fmt::bytes(c.stored_gb * 1_073_741_824.0),
-                            if assumed.is_empty() {
-                                String::new()
-                            } else {
-                                format!(" {assumed}")
-                            },
-                            fmt::ratio(c.egress_fraction)
-                        ))),
-                )
-                // Three columns when they fit, one under the other when they do not.
-                .child(
-                    view()
-                        .flex_row()
-                        .flex_wrap()
-                        .gap_6()
+    let width = signal(0.0_f32);
+    scroll()
+        .flex_1()
+        .on_layout(move |f: &Bounds<Points>| width.set(f.size.width.0))
+        .child(dynamic(move || {
+            let wide = width.get() >= COST_COLUMNS_MIN_W;
+            let data = s.current.with(|c| {
+                c.as_ref().map(|c| {
+                    (
+                        c.run.report.cost.clone(),
+                        crate::ui::model::metrics::storage_note(&c.run.report),
+                    )
+                })
+            });
+            untracked(|| {
+                let Some((c, assumed)) = data else {
+                    return empty("Cost shows when the run has finished", "").into_element();
+                };
+                if !c.applicable {
+                    return empty(
+                        "Cost not applicable",
+                        c.not_applicable_reason
+                            .unwrap_or_else(|| "No price table applies to this target.".into()),
+                    )
+                    .into_element();
+                }
+                let sel = c.selected.clone();
+                let u = c.per_op.clone();
+                view()
+                    .p_4()
+                    .gap_4()
+                    .child(
+                        view()
+                            .gap_1()
+                            .child(caption(format!(
+                                "PROJECTED MONTHLY COST · {} · prices as of {}",
+                                sel.provider, c.pricing_as_of
+                            )))
+                            .child(
+                                strong(format!("{} / month", fmt::usd(sel.total_usd)))
+                                    .text_size(px(22.0)),
+                            )
+                            .child(small(format!(
+                                "at {} operations a month{}, {} of reads leaving the cloud",
+                                fmt::compact(c.monthly_ops),
+                                if assumed.is_empty() {
+                                    format!(
+                                        ", {} stored",
+                                        fmt::bytes(c.stored_gb * 1_073_741_824.0)
+                                    )
+                                } else {
+                                    format!(" {assumed}")
+                                },
+                                fmt::ratio(c.egress_fraction)
+                            ))),
+                    )
+                    // Three columns when they fit, one under the other when they do not.
+                    .child(
+                        if wide {
+                            view().flex_row().gap_6()
+                        } else {
+                            view().gap_3()
+                        }
                         .child(
                             view()
                                 .gap_1()
@@ -338,50 +350,50 @@ pub fn cost() -> impl IntoElement {
                                 .child(prop_row("Down", fmt::bytes(u.download_bytes)))
                                 .child(prop_row("Over-read", fmt::bytes(u.overread_bytes))),
                         ),
-                )
-                .child(caption("THE SAME WORKLOAD ELSEWHERE"))
-                .child(view().gap_0p5().children(c.comparison.iter().map(|p| {
-                    let ratio = if sel.total_usd > 0.0 {
-                        p.total_usd / sel.total_usd
-                    } else {
-                        1.0
-                    };
-                    let tone = if ratio < 0.95 {
-                        Tone::Ok
-                    } else if ratio > 1.05 {
-                        Tone::Warn
-                    } else {
-                        Tone::Neutral
-                    };
-                    view()
-                        .flex_row()
-                        .gap_3()
-                        .min_w(px(0.0))
-                        .child(
-                            body(p.provider.clone())
-                                .number_of_lines(1)
-                                .flex_1()
-                                .min_w(px(0.0))
-                                .max_w(px(180.0)),
-                        )
-                        .child(
-                            num(fmt::usd(p.total_usd))
-                                .number_of_lines(1)
-                                .w(px(90.0))
-                                .flex_shrink_0(),
-                        )
-                        .child(
-                            small(format!("{}× this target", fmt::sig3(ratio)))
-                                .number_of_lines(1)
-                                .text_color(move || match tone {
-                                    Tone::Neutral => theme().muted_foreground,
-                                    t => t.color(),
-                                }),
-                        )
-                })))
-                .into_element()
-        })
-    }))
+                    )
+                    .child(caption("THE SAME WORKLOAD ELSEWHERE"))
+                    .child(view().gap_0p5().children(c.comparison.iter().map(|p| {
+                        let ratio = if sel.total_usd > 0.0 {
+                            p.total_usd / sel.total_usd
+                        } else {
+                            1.0
+                        };
+                        let tone = if ratio < 0.95 {
+                            Tone::Ok
+                        } else if ratio > 1.05 {
+                            Tone::Warn
+                        } else {
+                            Tone::Neutral
+                        };
+                        view()
+                            .flex_row()
+                            .gap_3()
+                            .min_w(px(0.0))
+                            .child(
+                                body(p.provider.clone())
+                                    .number_of_lines(1)
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .max_w(px(180.0)),
+                            )
+                            .child(
+                                num(fmt::usd(p.total_usd))
+                                    .number_of_lines(1)
+                                    .w(px(90.0))
+                                    .flex_shrink_0(),
+                            )
+                            .child(
+                                small(format!("{}× this target", fmt::sig3(ratio)))
+                                    .number_of_lines(1)
+                                    .text_color(move || match tone {
+                                        Tone::Neutral => theme().muted_foreground,
+                                        t => t.color(),
+                                    }),
+                            )
+                    })))
+                    .into_element()
+            })
+        }))
 }
 
 /// A name and its value on one line (summary rows).

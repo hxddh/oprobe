@@ -110,12 +110,9 @@ pub fn compare_view() -> impl IntoElement {
     let b = signal(None::<SharedString>);
     // Follow what is compared (or the run Compare was opened on, as B).
     effect(move || {
-        if let Some((va, vb, _)) = s.comparison.get() {
-            a.set(Some(va.id().to_owned().into()));
-            b.set(Some(vb.id().to_owned().into()));
-        } else if let Some(id) = s.compare_pick.get() {
-            b.set(Some(id.into()));
-        }
+        let (pa, pb) = s.compare_pick.get();
+        a.set(pa.map(Into::into));
+        b.set(pb.map(Into::into));
     });
     // Each side lists the other side's target and workload first; built once per change of
     // the runs or of the other side, not on every render.
@@ -179,7 +176,15 @@ pub fn compare_view() -> impl IntoElement {
             let c = cmp.get();
             let log = s.log_latency.get();
             let verdict = s.verdict.get();
+            let loading = s.comparing.get();
             untracked(|| {
+                if c.is_none() && loading {
+                    return empty(
+                        "Comparing…",
+                        "Loading both runs and running the regression gate.",
+                    )
+                    .into_element();
+                }
                 let Some((va, vb, c)) = c else {
                     return empty(
                         "Pick two runs",
