@@ -1,4 +1,4 @@
-//! Shared data model of oprobe 3.0 (design §4–§6): run ids, trace rows and the Report v3.
+//! Shared data model (design v3 §4–§6, v4 §1): run ids, trace rows, the run spec and Report v4.
 //!
 //! Everything here is `Serialize + Deserialize + JsonSchema`; these types are the public,
 //! machine-facing contract (run files, `-o json`, MCP, exporters).
@@ -6,6 +6,7 @@
 pub mod build;
 pub mod ids;
 pub mod report;
+pub mod spec;
 pub mod trace;
 
 use schemars::JsonSchema;
@@ -14,10 +15,11 @@ use serde::{Deserialize, Serialize};
 pub use build::{ReportInput, build_report, build_run, workload_info};
 pub use ids::RunId;
 pub use report::*;
+pub use spec::{Overrides, RunSpec};
 pub use trace::{OpBreakdownUs, OpRow, ReqRow, TcpRow, TlsRow, WireProtocol};
 
 /// Format id of a run file (design §4).
-pub const RUN_FORMAT: &str = "oprobe.run/3";
+pub const RUN_FORMAT: &str = "oprobe.run/4";
 
 /// One complete run: its report and trace rows (what a `.oprobe` file holds).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]

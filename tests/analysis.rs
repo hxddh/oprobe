@@ -160,23 +160,32 @@ fn stragglers_are_found_explained_and_attributed() {
     assert!(current >= 250.0, "{tail}");
     assert!(predicted < current / 3.0, "{tail}");
     assert!(!tail["evidence"]["op_ids"].as_array().unwrap().is_empty());
-    let cmd = tail["verification"]["command"].as_str().unwrap();
+    let ver = &tail["verification"];
+    let run_id = v["run_id"].as_str().unwrap();
+    assert_eq!(
+        ver["command"].as_str().unwrap(),
+        format!("oprobe verify {run_id} tail_stragglers")
+    );
+    assert_eq!(ver["overrides"]["knobs"]["tail_cut"], "on", "{ver}");
+    let cmd = ver["replay"].as_str().unwrap();
     assert!(
         cmd.contains("--tail-cut")
             && cmd.contains(&format!("--endpoint {}", lab.endpoint_url))
             && cmd.contains("--concurrency 8"),
         "{cmd}"
     );
-    // The verification command is valid: it plans the same run with tail-cut on.
-    let words: Vec<&str> = cmd.split_whitespace().collect();
-    assert_eq!(words[0], "oprobe");
-    let plan = env
-        .cmd()
-        .args(&words[1..])
-        .args(["--dry-run", "-o", "json"])
-        .output()
-        .unwrap();
-    assert!(plan.status.success(), "{cmd}: {}", err(&plan));
+    // Both forms are valid: they plan the same run with tail-cut on.
+    for cmd in [cmd, ver["rerun"].as_str().unwrap()] {
+        let words: Vec<&str> = cmd.split_whitespace().collect();
+        assert_eq!(words[0], "oprobe");
+        let plan = env
+            .cmd()
+            .args(&words[1..])
+            .args(["--dry-run", "-o", "json"])
+            .output()
+            .unwrap();
+        assert!(plan.status.success(), "{cmd}: {}", err(&plan));
+    }
     // At most one tail finding.
     assert_eq!(
         findings

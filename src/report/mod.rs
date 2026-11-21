@@ -107,6 +107,8 @@ pub(crate) mod fixture {
             max: p99 * 2.0,
         };
         let mut r = Report {
+            spec: Default::default(),
+            capacity: Default::default(),
             schema: REPORT_SCHEMA.into(),
             run: RunInfo {
                 id: "20261120-143005-a1b2".into(),
@@ -184,7 +186,8 @@ pub(crate) mod fixture {
                 advice: "Lower the concurrency to 16".into(),
                 verification: Some(Verification {
                     description: "re-run with fewer workers".into(),
-                    command: Some("oprobe run prod -c 16".into()),
+                    rerun: "oprobe run --from 20261120-143005-a1b2 --set concurrency=16".into(),
+                    ..Default::default()
                 }),
             }],
             cost: Default::default(),

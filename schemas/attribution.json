@@ -43,7 +43,7 @@
       "type": "object"
     }
   },
-  "$id": "https://github.com/hxddh/oprobe/schemas/3/attribution.json",
+  "$id": "https://github.com/hxddh/oprobe/schemas/4/attribution.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "Outlier attribution (MCP analyze_run, explain)",
   "properties": {

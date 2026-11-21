@@ -139,16 +139,20 @@ pub enum Scenario {
     Lossy,
     /// 4% `500 InternalError` and 2% connection resets.
     Flaky,
+    /// The demo's limit without stragglers, for the parquet preset (HEAD, footer, then 4
+    /// parallel column reads): 503 above 24 in flight, so 6 parquet workers fit and 8 throttle.
+    Parquet,
 }
 
 impl Scenario {
-    pub const ALL: [Scenario; 6] = [
+    pub const ALL: [Scenario; 7] = [
         Scenario::Clean,
         Scenario::Demo,
         Scenario::Throttle,
         Scenario::Stragglers,
         Scenario::Lossy,
         Scenario::Flaky,
+        Scenario::Parquet,
     ];
 
     pub fn name(self) -> &'static str {
@@ -159,6 +163,7 @@ impl Scenario {
             Scenario::Stragglers => "stragglers",
             Scenario::Lossy => "lossy",
             Scenario::Flaky => "flaky",
+            Scenario::Parquet => "parquet",
         }
     }
 
@@ -172,23 +177,15 @@ impl Scenario {
             Scenario::Stragglers => "5 ms latency, 3% of requests wait 400 ms",
             Scenario::Lossy => "20 ms latency, responses capped at 4 MiB/s per stream",
             Scenario::Flaky => "5 ms latency, 4% 500 InternalError, 2% connection resets",
+            Scenario::Parquet => {
+                "8 ms latency, 503 SlowDown above 24 concurrent requests, no stragglers (for the parquet preset)"
+            }
         }
     }
 
+    /// Typed: see [`crate::input::lab_scenario`].
     pub fn parse(s: &str) -> Result<Self> {
-        let s = s.trim().to_ascii_lowercase();
-        if s.is_empty() {
-            return Ok(Scenario::Clean);
-        }
-        Scenario::ALL
-            .into_iter()
-            .find(|x| x.name() == s)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "unknown lab scenario `{s}` (choose: {})",
-                    Scenario::ALL.map(|x| x.name()).join(", ")
-                )
-            })
+        Ok(crate::input::lab_scenario(s)?)
     }
 
     /// The server configuration of this scenario (plain HTTP/1.1 + h2c, S3 part-size rules).
@@ -228,6 +225,11 @@ impl Scenario {
                 base_ttfb_delay: ms(5),
                 error_every_n: Some(25),
                 reset_every_n: Some(50),
+                ..base
+            },
+            Scenario::Parquet => LabConfig {
+                base_ttfb_delay: ms(8),
+                max_inflight_before_503: Some(24),
                 ..base
             },
         }

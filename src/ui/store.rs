@@ -662,7 +662,8 @@ impl Store {
 
     /// Run a finding's verification command as a new run.
     pub fn verify(&self, f: &Finding) {
-        let Some(cmd) = f.verification.as_ref().and_then(|v| v.command.clone()) else {
+        // The self-contained form: the launcher parses `oprobe run TARGET --flag …`.
+        let Some(cmd) = f.verification.as_ref().map(|v| v.replay.clone()) else {
             return;
         };
         let form = self.current.with_untracked(|c| {

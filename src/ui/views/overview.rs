@@ -226,11 +226,11 @@ fn verdict_word(r: &Report) -> &'static str {
 /// A finding as a compact row (Overview's top findings and the Findings tab).
 pub fn finding_row(s: Store, f: Finding, full: bool) -> View {
     let tone = Tone::of_severity(f.severity);
-    let has_cmd = f.verification.as_ref().is_some_and(|v| v.command.is_some());
+    let has_cmd = f.verification.is_some();
     let verify_label = f
         .verification
         .as_ref()
-        .and_then(|v| v.command.clone())
+        .map(|v| v.rerun.clone())
         .unwrap_or_default();
     let f2 = f.clone();
     view()
@@ -257,12 +257,9 @@ pub fn finding_row(s: Store, f: Finding, full: bool) -> View {
         )
         .child(
             full.then(|| {
-                f.verification.as_ref().map(|v| {
-                    small(match &v.command {
-                        Some(c) => format!("verify: {} ({c})", v.description),
-                        None => format!("verify: {}", v.description),
-                    })
-                })
+                f.verification
+                    .as_ref()
+                    .map(|v| small(format!("verify: {} ({})", v.description, v.rerun)))
             })
             .flatten(),
         )

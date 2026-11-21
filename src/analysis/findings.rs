@@ -154,85 +154,26 @@ impl std::fmt::Display for Command {
     }
 }
 
-/// `oprobe run TARGET …` reproducing the run's workload and the client knobs that shape it
-/// (concurrency, I/O concurrency, chunk size, HTTP version, tail-cut, …), so a verification
-/// measures the same configuration except the proposed change.
-pub fn rerun_command(r: &Report) -> Command {
-    let mut c = Command::for_target("run", &r.target);
-    let k = &r.knobs.requested;
-    let def = crate::config::Knobs::default();
-    let size = |b: u64| Some(crate::util::ByteSize(b).to_string());
-    c.set("--preset", Some(r.workload.preset.clone()));
-    c.set(
-        "--duration",
-        Some(format!("{}s", r.workload.duration_s.round().max(1.0))),
-    );
-    if let Some(rate) = r.workload.rate_per_s {
-        c.set("--rate", Some(rate.to_string()));
-    }
-    let ds = &r.workload.dataset;
-    match &ds.existing_prefix {
-        Some(p) => {
-            c.set("--existing", Some(p.clone()));
-        }
-        None if ds.objects_count > 0 => {
-            c.set("--objects", Some(ds.objects_count.to_string()));
-            c.set("--object-size", size(ds.object_size_bytes));
-        }
-        None => {}
-    }
-    if !r.workload.access.is_empty() && r.workload.access != "uniform" {
-        c.set("--access", Some(r.workload.access.clone()));
-    }
-    c.set("--concurrency", Some(k.concurrency_count.to_string()));
-    c.set("--io-concurrency", Some(k.io_concurrency_count.to_string()));
-    c.set("--chunk-size", size(k.chunk_bytes));
-    let http = match k.http_version {
-        crate::net::HttpVersion::Auto => "auto",
-        crate::net::HttpVersion::H1 => "h1",
-        crate::net::HttpVersion::H2 => "h2",
-    };
-    c.set("--http", Some(http.into()));
-    if k.tail_cut {
-        c.set("--tail-cut", None);
-    }
-    if k.range_gap_bytes != def.range_gap.0 {
-        c.set("--range-gap", size(k.range_gap_bytes));
-    }
-    if k.max_inflight_requests_count != def.max_inflight_requests as u64 {
-        c.set(
-            "--max-inflight",
-            Some(k.max_inflight_requests_count.to_string()),
-        );
-    }
-    if !k.keep_alive {
-        c.set("--no-keep-alive", None);
-    }
-    if k.cache {
-        c.set("--cache", size(k.cache_bytes));
-    }
-    if k.retries_count != def.retries as u64 {
-        c.set("--retries", Some(k.retries_count.to_string()));
-    }
-    if k.transport == crate::config::TransportMode::Microscope {
-        c.set("--microscope", None);
-    }
-    c
-}
-
 impl Ctx<'_> {
-    /// `oprobe run TARGET …` reproducing this run, with `extra` flags replacing its own.
-    fn rerun(&self, extra: &str) -> String {
-        let mut cmd = rerun_command(self.r);
-        cmd.apply(extra);
-        cmd.to_string()
-    }
-
-    fn verify(&self, description: impl Into<String>, extra: &str) -> Option<Verification> {
-        Some(Verification {
-            description: description.into(),
-            command: Some(self.rerun(extra)),
-        })
+    /// A verification of this run with `sets` (`--set` key/value pairs) applied to its spec:
+    /// `oprobe run --from RUN --set …` and the self-contained replay, so nothing but the change
+    /// differs. The `oprobe verify RUN CODE` command is filled in by [`derive`].
+    fn verify(
+        &self,
+        description: impl Into<String>,
+        sets: &[(&str, String)],
+    ) -> Option<Verification> {
+        let mut o = crate::model::Overrides::new();
+        for (k, v) in sets {
+            o.set(k, v).ok()?;
+        }
+        Some(Verification::new(
+            &self.r.run.id,
+            "",
+            &self.r.spec,
+            o,
+            description,
+        ))
     }
 }
 
@@ -437,17 +378,14 @@ fn throttling(c: &Ctx) -> Option<Finding> {
             format!(
                 "re-run at concurrency {safe_c}: throttling should disappear at a similar throughput"
             ),
-            &format!("--concurrency {safe_c}"),
+            &[("concurrency", safe_c.to_string())],
         );
     } else {
-        verification = Some(Verification {
-            description: "let the tuner find the throttle ceiling".into(),
-            command: Some(
-                Command::for_target("tune", &r.target)
-                    .set("--objective", Some("throughput".into()))
-                    .to_string(),
-            ),
-        });
+        let half = (r.knobs.requested.concurrency_count / 2).max(1);
+        verification = c.verify(
+            format!("re-run at half the concurrency ({half}); `oprobe tune` finds the ceiling"),
+            &[("concurrency", half.to_string())],
+        );
     }
     let ids = c.run.ops.iter().filter(|o| o.throttled).map(|o| o.op_id);
     Some(Finding {
@@ -643,7 +581,7 @@ fn tail(c: &Ctx, have: &[Finding]) -> Option<Finding> {
                     "enable tail-cut and compare p99 (predicted ~{})",
                     fmt_ms(pred.predicted)
                 ),
-                "--tail-cut",
+                &[("tail_cut", "on".into())],
             )
         };
         return Some(Finding {
@@ -728,7 +666,7 @@ fn client_queue(c: &Ctx) -> Option<Finding> {
         },
         advice: "Raise `max_inflight_requests` (0 = unlimited) or lower `concurrency × io_concurrency` so requests stop queueing behind each other.".into(),
         verification: (cap > 0)
-            .then(|| c.verify("remove the in-flight cap and compare p99", "--max-inflight 0"))
+            .then(|| c.verify("remove the in-flight cap and compare p99", &[("max_inflight_requests", "0".into())]))
             .flatten(),
     })
 }
@@ -810,12 +748,12 @@ fn cold_connections(c: &Ctx) -> Option<Finding> {
             "Turn keep-alive back on: every request currently pays DNS + TCP + TLS.".into()
         },
         verification: if keep_alive {
-            c.verify("multiplex on fewer connections", "--http h2")
+            c.verify(
+                "multiplex on fewer connections",
+                &[("http_version", "h2".into())],
+            )
         } else {
-            Some(Verification {
-                description: "re-run with keep-alive (drop --no-keep-alive)".into(),
-                command: Some(rerun_command(c.r).unset("--no-keep-alive").to_string()),
-            })
+            c.verify("re-run with keep-alive", &[("keep_alive", "on".into())])
         },
     })
 }
@@ -860,7 +798,7 @@ fn http1(c: &Ctx) -> Option<Finding> {
             ..Default::default()
         },
         advice: "If the service speaks HTTP/2, `--http h2` multiplexes requests over a few connections (fewer handshakes, no per-connection pool limits). Compare both: some S3-compatible services are faster on HTTP/1.1.".into(),
-        verification: c.verify("measure the same workload over HTTP/2", "--http h2"),
+        verification: c.verify("measure the same workload over HTTP/2", &[("http_version", "h2".into())]),
     })
 }
 
@@ -1052,7 +990,7 @@ fn small_objects(c: &Ctx) -> Option<Finding> {
         advice: "Raise parallelism (`concurrency`) until throttling or the latency SLA stops you, batch or pack small objects, and coalesce neighbouring ranges (`range_gap`).".into(),
         verification: pred
             .is_some()
-            .then(|| c.verify(format!("double the concurrency to {}", cc * 2), &format!("--concurrency {}", cc * 2)))
+            .then(|| c.verify(format!("double the concurrency to {}", cc * 2), &[("concurrency", (cc * 2).to_string())]))
             .flatten(),
     })
 }
@@ -1103,7 +1041,7 @@ fn cache_opportunity(c: &Ctx) -> Option<Finding> {
             ..Default::default()
         },
         advice: "Enable the read cache (`--cache 256MiB`) when the working set is re-read; in production, a cache in front of OpenDAL (or `CacheLayer`) does the same.".into(),
-        verification: c.verify("measure with a 256 MiB read cache", "--cache 256MiB"),
+        verification: c.verify("measure with a 256 MiB read cache", &[("cache", "256MiB".into())]),
     })
 }
 
@@ -1201,7 +1139,7 @@ fn slow_start(c: &Ctx) -> Option<Finding> {
             windows: vec![start.window()],
         },
         advice: "Cold connections, DNS, TLS or server-side scaling at the start skew short runs: use a longer `--warmup` or judge by the steady segment (`oprobe analyze RUN --by second`).".into(),
-        verification: c.verify("re-run with a longer warmup", &format!("--warmup {:.0}s", start.to_s.max(2.0))),
+        verification: c.verify("re-run with a longer warmup", &[("warmup", format!("{:.0}s", start.to_s.max(2.0)))]),
     })
 }
 
@@ -1220,7 +1158,7 @@ fn carry(c: &Ctx, f: &diagnosis::Finding) -> Finding {
                 out.evidence.values = values(&pred_values(&p));
                 out.verification = c.verify(
                     format!("double the concurrency to {}", cc * 2),
-                    &format!("--concurrency {}", cc * 2),
+                    &[("concurrency", (cc * 2).to_string())],
                 );
             }
         }
@@ -1228,10 +1166,10 @@ fn carry(c: &Ctx, f: &diagnosis::Finding) -> Finding {
             out.evidence.values = values(&[("overread_ratio", c.r.bytes.overread_ratio)]);
             out.verification = c.verify(
                 "halve the range gap",
-                &format!(
-                    "--range-gap {}",
-                    crate::util::ByteSize(c.r.knobs.requested.range_gap_bytes / 2)
-                ),
+                &[(
+                    "range_gap",
+                    crate::util::ByteSize(c.r.knobs.requested.range_gap_bytes / 2).to_string(),
+                )],
             );
         }
         "consumer_stall" => {
@@ -1338,6 +1276,15 @@ pub fn derive(run: &Run, legacy: &[diagnosis::Finding]) -> Vec<Finding> {
     out.retain(|f| !(specific && matches!(f.code.as_str(), "client_overhead" | "local_backend")));
     // Stable order: severity, then the order above.
     out.sort_by_key(|f| std::cmp::Reverse(f.severity));
+    for f in &mut out {
+        if let Some(v) = &mut f.verification {
+            v.command = crate::model::spec::command_line(&[
+                "verify".into(),
+                r.run.id.clone(),
+                f.code.clone(),
+            ]);
+        }
+    }
     out
 }
 
@@ -1351,6 +1298,8 @@ pub(crate) mod tests {
         let r = crate::model::Report {
             schema: crate::model::REPORT_SCHEMA.into(),
             run: Default::default(),
+            spec: Default::default(),
+            capacity: Default::default(),
             target: crate::model::TargetInfo {
                 scheme: "s3".into(),
                 display: "s3://bkt/x".into(),
@@ -1412,17 +1361,9 @@ pub(crate) mod tests {
         assert!(t.evidence.values["predicted_p99_ms"] < 100.0, "{t:#?}");
         assert!(!t.evidence.op_ids.is_empty());
         let v = t.verification.as_ref().unwrap();
-        assert!(
-            v.command.as_deref().unwrap().contains("--tail-cut"),
-            "{v:?}"
-        );
-        assert!(
-            v.command
-                .as_deref()
-                .unwrap()
-                .starts_with("oprobe run s3://bkt/x"),
-            "{v:?}"
-        );
+        assert!(v.replay.contains("--tail-cut"), "{v:?}");
+        assert!(v.rerun.contains("--set tail_cut=on"), "{v:?}");
+        assert_eq!(v.overrides.knobs["tail_cut"], "on");
         assert!(CODES.contains(&"tail_stragglers"));
     }
 
@@ -1446,8 +1387,8 @@ pub(crate) mod tests {
             "{t:#?}"
         );
         assert!(!t.evidence.windows.is_empty());
-        let cmd = t.verification.as_ref().unwrap().command.clone().unwrap();
-        assert!(!cmd.contains("-c 32"), "{cmd}");
+        let v = t.verification.as_ref().unwrap();
+        assert_ne!(v.overrides.knobs["concurrency"], "32", "{v:?}");
         // Throttling explains the run: no separate tail item about retries.
         assert!(f.iter().all(|x| x.code != "retries"));
     }
@@ -1496,74 +1437,59 @@ pub(crate) mod tests {
     #[test]
     fn verification_commands_reproduce_the_run_except_the_change() {
         let mut run = straggler_run();
-        let r = &mut run.report;
-        r.target
-            .options
+        run.report.run.id = "20261121-101010-abcd".into();
+        let mut t = crate::config::TargetSpec::from_url("s3://bkt/x").unwrap();
+        t.options
             .insert("endpoint".into(), "https://minio.local:9000".into());
-        r.target.options.insert("region".into(), "eu-west-1".into());
-        r.target.options.insert("bucket".into(), "bkt".into());
-        r.target.endpoint = Some("https://minio.local:9000".into());
-        r.workload.preset = "small-files".into();
-        r.workload.duration_s = 12.0;
-        r.workload.dataset.objects_count = 64;
-        r.workload.dataset.object_size_bytes = 64 << 10;
-        let k = &mut r.knobs.requested;
-        *k = crate::model::KnobValues::from(&crate::config::Knobs::default());
-        k.concurrency_count = 24;
-        k.io_concurrency_count = 3;
-        k.chunk_bytes = 4 << 20;
-        k.http_version = crate::net::HttpVersion::H1;
-        k.max_inflight_requests_count = 16;
-        k.keep_alive = false;
-        let mut cmd = rerun_command(&run.report);
-        cmd.apply("--tail-cut --concurrency 48");
-        let text = cmd.to_string();
-        let a = parse_run(&text);
-        assert_eq!(a.target.target.as_deref(), Some("s3://bkt/x"), "{text}");
-        assert_eq!(
-            a.target.endpoint.as_deref(),
-            Some("https://minio.local:9000")
-        );
-        assert_eq!(a.target.region.as_deref(), Some("eu-west-1"));
-        let p = crate::cli::build_profile(&a.target, &a.workload, &a.knobs, &a.cost).unwrap();
-        assert_eq!(p.workload.preset.slug(), "small-files");
-        assert_eq!(p.workload.duration.get().as_secs(), 12);
-        let ds = p.workload.dataset.as_ref().unwrap();
-        assert_eq!((ds.objects, ds.object_size.0), (64, 64 << 10));
-        // Same knobs except the two that the verification changes.
-        let mut want = run.report.knobs.requested.clone();
-        want.tail_cut = true;
-        want.concurrency_count = 48;
-        assert_eq!(crate::model::KnobValues::from(&p.knobs), want, "{text}");
-
-        // Dropping a switch, and a flag the run did not set.
-        let text = rerun_command(&run.report)
-            .unset("--no-keep-alive")
-            .to_string();
-        assert!(!parse_run(&text).knobs.no_keep_alive, "{text}");
-
-        // A named target is re-run by name; a lab target by its scenario, never by the
-        // ephemeral endpoint of its in-process server.
-        run.report.target.name = Some("prod".into());
-        let a = parse_run(&rerun_command(&run.report).to_string());
-        assert_eq!(a.target.target.as_deref(), Some("prod"));
-        assert!(a.target.endpoint.is_none() && a.target.region.is_none());
-        run.report.target.name = None;
-        run.report.target.display = "lab://throttle".into();
-        run.report
-            .target
-            .options
-            .insert("endpoint".into(), "http://127.0.0.1:43373".into());
-        let text = rerun_command(&run.report).to_string();
-        let a = parse_run(&text);
-        assert_eq!(a.target.target.as_deref(), Some("lab://throttle"));
-        assert!(!text.contains("127.0.0.1"), "{text}");
-        // Every verification a run produces parses.
-        for f in derive(&run, &[]) {
-            if let Some(c) = f.verification.and_then(|v| v.command) {
-                let a = parse_run(&c);
-                assert_eq!(a.target.target.as_deref(), Some("lab://throttle"), "{c}");
-            }
+        t.options.insert("region".into(), "eu-west-1".into());
+        let mut p = crate::config::Profile::from_target(t);
+        p.workload.preset = crate::config::Preset::SmallFiles;
+        p.workload.duration = crate::util::HumanDuration::secs(12);
+        p.workload.warmup = crate::util::HumanDuration(std::time::Duration::from_millis(500));
+        p.workload.seed = 9;
+        p.workload.max_ops = Some(5000);
+        p.knobs.concurrency = 24;
+        p.knobs.io_concurrency = 3;
+        p.knobs.http_version = crate::net::HttpVersion::H1;
+        p.knobs.max_inflight_requests = 16;
+        p.knobs.keep_alive = false;
+        run.report.spec = crate::model::RunSpec::new(&p, "s3://bkt/x");
+        let found = derive(&run, &[]);
+        assert!(found.iter().any(|f| f.verification.is_some()), "{found:#?}");
+        for f in &found {
+            let Some(v) = &f.verification else { continue };
+            assert_eq!(
+                v.command,
+                format!("oprobe verify 20261121-101010-abcd {}", f.code)
+            );
+            assert!(
+                v.rerun
+                    .starts_with("oprobe run --from 20261121-101010-abcd --set "),
+                "{}",
+                v.rerun
+            );
+            assert!(!v.overrides.is_empty(), "{v:?}");
+            // The self-contained replay builds the run's profile with only the change applied.
+            let a = parse_run(&v.replay);
+            assert_eq!(
+                a.target.target.as_deref(),
+                Some("s3://bkt/x"),
+                "{}",
+                v.replay
+            );
+            let mut got =
+                crate::cli::build_profile(&a.target, &a.workload, &a.knobs, &a.cost).unwrap();
+            let mut label = None;
+            crate::model::Overrides::parse(&a.set)
+                .unwrap()
+                .apply(&mut got, &mut label)
+                .unwrap();
+            let want = run.report.spec.with(&v.overrides).resolved_profile();
+            assert_eq!(got.workload, want.workload, "{}", v.replay);
+            assert_eq!(got.knobs, want.knobs, "{}", v.replay);
+            assert_eq!(got.target.options["endpoint"], "https://minio.local:9000");
+            assert_eq!(got.workload.seed, 9);
+            assert_eq!(got.workload.warmup.get().as_millis(), 500);
         }
     }
 

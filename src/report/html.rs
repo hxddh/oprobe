@@ -347,9 +347,7 @@ fn findings_section(r: &Report, run: &Run) -> String {
         let _ = write!(o, "<p class=\"advice\">→ {}</p>", esc(&f.advice));
         if let Some(v) = &f.verification {
             let _ = write!(o, "<p class=\"verify\">Verify: {}", esc(&v.description));
-            if let Some(c) = &v.command {
-                let _ = write!(o, " <code>{}</code>", esc(c));
-            }
+            let _ = write!(o, " <code>{}</code>", esc(&v.rerun));
             o += "</p>";
         }
         o += "</article>";

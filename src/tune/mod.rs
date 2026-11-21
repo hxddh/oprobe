@@ -2,6 +2,7 @@
 //! refines workload-relevant knobs by coordinate descent and confirms the winner.
 
 pub mod codegen;
+pub mod recommend;
 
 use std::sync::Arc;
 use std::time::Duration;

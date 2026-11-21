@@ -437,16 +437,16 @@ pub async fn preflight(
     write_probe: bool,
 ) -> anyhow::Result<Preflight> {
     let classify = |what: &str, e: opendal::Error| -> anyhow::Error {
-        let code = match e.kind() {
-            opendal::ErrorKind::PermissionDenied => ErrorCode::AuthDenied,
-            opendal::ErrorKind::NotFound => ErrorCode::StorageNotFound,
-            opendal::ErrorKind::Unsupported => ErrorCode::StorageUnsupported,
-            opendal::ErrorKind::RateLimited => ErrorCode::StorageThrottled,
-            opendal::ErrorKind::ConfigInvalid => ErrorCode::ConfigInvalid,
-            _ => ErrorCode::from_class(&crate::engine::ops::error_class_of(&e, None)),
+        // Typed from the OpenDAL error (a credential that cannot be loaded is
+        // `auth.no_credentials`).
+        let code = crate::errors::opendal_code(&e).unwrap_or(ErrorCode::Internal);
+        let hint = if code == ErrorCode::AuthNoCredentials {
+            "no credentials were found: set them for the target (`oprobe doctor TARGET` shows which sources it tried), or pass --anonymous for a public bucket"
+        } else {
+            "check credentials and permissions with `oprobe doctor TARGET`"
         };
         OprobeError::new(code, format!("preflight: cannot {what}: {e}"))
-            .with_hint("check credentials and permissions with `oprobe doctor TARGET`")
+            .with_hint(hint)
             .into()
     };
     let mut out = Preflight::default();

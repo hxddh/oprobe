@@ -108,7 +108,7 @@ oprobe run [OPTIONS] [TARGET]
 
 | argument | description |
 |---|---|
-| `--provider <PROVIDER>` | Pricing preset: aws-s3, gcs, azure-blob, cloudflare-r2, backblaze-b2, aliyun-oss |
+| `--provider <PROVIDER>` | Pricing preset: aws-s3, gcs, azure-blob, cloudflare-r2, backblaze-b2, aliyun-oss (aliases: aws, gcp, google, azure, r2, b2, oss, aliyun) |
 | `--monthly-ops <MONTHLY_OPS>` | Logical operations per month to project costs for |
 | `--egress-fraction <EGRESS_FRACTION>` | Fraction of downloads leaving the cloud (0..1) |
 | `--stored-gib <STORED_GIB>` | Stored data in GiB |
@@ -145,6 +145,13 @@ oprobe run [OPTIONS] [TARGET]
 | `--idempotency-key <KEY>` | Name the run prefix after KEY: a retried command reuses and cleans it up |
 | `--repeat <N>` | Repeat the run N times and report the spread · default `1` |
 | `--baseline <NAME>` | Compare against (and add to) a named baseline |
+
+*Replay*
+
+| argument | description |
+|---|---|
+| `--from <RUNREF>` | Replay a stored run (RUNREF): its spec, with credentials resolved again from the target; other flags and --set override it |
+| `--set <KEY=VALUE>` | Override one setting, repeatable (e.g. --set concurrency=8 --set warmup=1s); keys: the profile's knob, workload, SLA and cost names, `endpoint`, `region`, `label` |
 
 ## `oprobe demo`
 
@@ -216,7 +223,7 @@ oprobe tune [OPTIONS] [TARGET]
 
 | argument | description |
 |---|---|
-| `--provider <PROVIDER>` | Pricing preset: aws-s3, gcs, azure-blob, cloudflare-r2, backblaze-b2, aliyun-oss |
+| `--provider <PROVIDER>` | Pricing preset: aws-s3, gcs, azure-blob, cloudflare-r2, backblaze-b2, aliyun-oss (aliases: aws, gcp, google, azure, r2, b2, oss, aliyun) |
 | `--monthly-ops <MONTHLY_OPS>` | Logical operations per month to project costs for |
 | `--egress-fraction <EGRESS_FRACTION>` | Fraction of downloads leaving the cloud (0..1) |
 | `--stored-gib <STORED_GIB>` | Stored data in GiB |
@@ -424,7 +431,7 @@ oprobe target [OPTIONS] <COMMAND>
 
 ## `oprobe target add`
 
-Add (or replace) a named target
+Add a named target (`--replace` overwrites one of the same name)
 
 ```text
 oprobe target add [OPTIONS] <NAME> <URL>
@@ -439,6 +446,7 @@ oprobe target add [OPTIONS] <NAME> <URL>
 | `--credentials <CREDENTIALS>` | env \| profile:NAME \| anonymous |
 | `--option <KEY=VALUE>` | OpenDAL option, repeatable (KEY=VALUE) |
 | `--no-test` | Save without the quick read-only check |
+| `--replace` | Replace a target of the same name (otherwise an existing name is refused) |
 
 ## `oprobe target list`
 
@@ -590,7 +598,7 @@ oprobe watch [OPTIONS] [TARGET]
 
 | argument | description |
 |---|---|
-| `--provider <PROVIDER>` | Pricing preset: aws-s3, gcs, azure-blob, cloudflare-r2, backblaze-b2, aliyun-oss |
+| `--provider <PROVIDER>` | Pricing preset: aws-s3, gcs, azure-blob, cloudflare-r2, backblaze-b2, aliyun-oss (aliases: aws, gcp, google, azure, r2, b2, oss, aliyun) |
 | `--monthly-ops <MONTHLY_OPS>` | Logical operations per month to project costs for |
 | `--egress-fraction <EGRESS_FRACTION>` | Fraction of downloads leaving the cloud (0..1) |
 | `--stored-gib <STORED_GIB>` | Stored data in GiB |
@@ -680,7 +688,7 @@ oprobe matrix [OPTIONS] [TARGET]
 
 | argument | description |
 |---|---|
-| `--provider <PROVIDER>` | Pricing preset: aws-s3, gcs, azure-blob, cloudflare-r2, backblaze-b2, aliyun-oss |
+| `--provider <PROVIDER>` | Pricing preset: aws-s3, gcs, azure-blob, cloudflare-r2, backblaze-b2, aliyun-oss (aliases: aws, gcp, google, azure, r2, b2, oss, aliyun) |
 | `--monthly-ops <MONTHLY_OPS>` | Logical operations per month to project costs for |
 | `--egress-fraction <EGRESS_FRACTION>` | Fraction of downloads leaving the cloud (0..1) |
 | `--stored-gib <STORED_GIB>` | Stored data in GiB |
@@ -819,7 +827,7 @@ oprobe lab [OPTIONS]
 | argument | description |
 |---|---|
 | `--bind <BIND>` | · default `127.0.0.1:9000` |
-| `--scenario <SCENARIO>` | Start from a fault preset: clean, demo, throttle, stragglers, lossy, flaky (the flags below override it) |
+| `--scenario <SCENARIO>` | Start from a fault preset: clean, demo, throttle, stragglers, lossy, flaky, parquet (the flags below override it) |
 | `--error-every <ERROR_EVERY>` | Answer every Nth request with 500 InternalError |
 | `--reset-every <RESET_EVERY>` | Drop the connection on every Nth request |
 | `--tls` | Serve HTTPS (certificate for localhost / 127.0.0.1) |

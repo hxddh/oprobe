@@ -890,6 +890,7 @@ mod tests {
             warnings: vec![],
             started_at: std::time::SystemTime::now(),
             ended_at: std::time::SystemTime::now(),
+            spec: None,
         })
     }
 

@@ -620,10 +620,8 @@ fn render_with(r: &Report, run: Option<&Run>, detail: bool) -> String {
             for (i, l) in wrap_text(&f.advice, WIDTH - 6).iter().enumerate() {
                 let _ = writeln!(out, "    {} {l}", if i == 0 { "→" } else { " " });
             }
-            if let Some(v) = &f.verification
-                && let Some(c) = &v.command
-            {
-                let _ = writeln!(out, "    {} {}", dim("try:"), c);
+            if let Some(v) = &f.verification {
+                let _ = writeln!(out, "    {} {}", dim("try:"), v.rerun);
             }
         }
     }
@@ -1076,7 +1074,7 @@ mod tests {
             "OPERATIONS",
             "SLOWEST OPERATION",
             "CLEANUP",
-            "try: oprobe run prod -c 16",
+            "try: oprobe run --from 20261120-143005-a1b2 --set concurrency=16",
             "--detail",
         ] {
             assert!(text.contains(s), "{s}\n{text}");

@@ -282,6 +282,8 @@ mod tests {
             vec!["oprobe", "run", "s3://a b", "--concurrency", "8"]
         );
         let r = Report {
+            spec: Default::default(),
+            capacity: Default::default(),
             schema: crate::model::REPORT_SCHEMA.into(),
             run: Default::default(),
             target: crate::model::TargetInfo {

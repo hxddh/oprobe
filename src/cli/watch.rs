@@ -377,6 +377,7 @@ pub async fn cmd_watch(a: WatchArgs, ctx: &Ctx) -> Result<u8> {
             warnings: Vec::new(),
             started_at,
             ended_at: SystemTime::now(),
+            spec: None,
         });
         count += 1;
         let r = &run.report;

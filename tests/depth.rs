@@ -162,18 +162,14 @@ async fn doctor_reports_tls_chain_permissions_and_capabilities() {
     assert!(d.capabilities.copy && d.capabilities.read_with_suffix);
     assert_eq!(d.capabilities.delete_max_count, 1000);
     assert!(
-        d.next_command.starts_with("oprobe run mylab"),
-        "{}",
-        d.next_command
+        d.next[0].cli.starts_with("oprobe run mylab"),
+        "{:?}",
+        d.next
     );
     let v = serde_json::to_value(&d).unwrap();
     assert!(v["capabilities"]["write_with_if_match"].as_bool().unwrap());
 
     let ro = doctor(t, true, "mylab").await;
     assert_eq!(ro.permissions.write, Access::Skipped);
-    assert!(
-        ro.next_command.contains("--existing"),
-        "{}",
-        ro.next_command
-    );
+    assert!(ro.next[0].cli.contains("--existing"), "{:?}", ro.next);
 }

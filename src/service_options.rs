@@ -10,7 +10,7 @@
 use std::collections::BTreeSet;
 use std::fmt;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use serde::Deserialize;
 use serde::de::{self, Visitor};
 
@@ -95,38 +95,9 @@ pub fn accepted_keys(scheme: &str) -> Option<BTreeSet<&'static str>> {
 /// Options oprobe itself consumes (never passed to OpenDAL).
 const OPROBE_KEYS: [&str; 1] = ["ca_cert_pem"];
 
-/// Levenshtein distance (small strings only).
-fn distance(a: &str, b: &str) -> usize {
-    let b: Vec<char> = b.chars().collect();
-    let mut prev: Vec<usize> = (0..=b.len()).collect();
-    for (i, ca) in a.chars().enumerate() {
-        let mut cur = vec![i + 1];
-        for (j, cb) in b.iter().enumerate() {
-            let sub = prev[j] + usize::from(ca != *cb);
-            cur.push(sub.min(prev[j + 1] + 1).min(cur[j] + 1));
-        }
-        prev = cur;
-    }
-    prev[b.len()]
-}
-
 /// The closest accepted key, if it is plausibly what was meant.
 fn suggestion<'a>(key: &str, accepted: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
-    let key = key.to_ascii_lowercase();
-    accepted
-        .into_iter()
-        .map(|k| {
-            // A key that contains the typed one (or vice versa) is a strong hint too.
-            let d = if k.contains(key.as_str()) || key.contains(k) {
-                k.len().abs_diff(key.len()).min(2)
-            } else {
-                distance(&key, k)
-            };
-            (d, k)
-        })
-        .filter(|(d, k)| *d <= (k.len() / 3).max(2))
-        .min()
-        .map(|(_, k)| k)
+    crate::input::suggest(key, accepted)
 }
 
 /// Reject option keys the service would silently ignore.
@@ -142,10 +113,17 @@ pub fn validate_keys<'a>(scheme: &str, keys: impl IntoIterator<Item = &'a String
             Some(s) => format!("did you mean `{s}`? "),
             None => String::new(),
         };
-        bail!(
-            "unknown option `{key}` for the `{scheme}` service (OpenDAL would silently ignore it); {hint}accepted options: {}",
+        return Err(crate::errors::OprobeError::new(
+            crate::errors::ErrorCode::ConfigUnknownOption,
+            format!(
+                "unknown option `{key}` for the `{scheme}` service (OpenDAL would silently ignore it)"
+            ),
+        )
+        .with_hint(format!(
+            "{hint}accepted options: {}",
             accepted.iter().copied().collect::<Vec<_>>().join(", ")
-        );
+        ))
+        .into());
     }
     Ok(())
 }
@@ -188,14 +166,15 @@ mod tests {
     fn unknown_keys_are_rejected_with_a_suggestion() {
         let keys = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         validate_keys("s3", &keys(&["bucket", "region", "ca_cert_pem"])).unwrap();
-        let e = validate_keys("s3", &keys(&["bucket", "regin"]))
-            .unwrap_err()
-            .to_string();
+        let full = |e: anyhow::Error| {
+            let b = crate::errors::classify(&e, "s3");
+            assert_eq!(b.code, crate::errors::ErrorCode::ConfigUnknownOption);
+            format!("{} {}", b.message, b.hint.unwrap_or_default())
+        };
+        let e = full(validate_keys("s3", &keys(&["bucket", "regin"])).unwrap_err());
         assert!(e.contains("unknown option `regin`"), "{e}");
         assert!(e.contains("did you mean `region`?"), "{e}");
-        let e = validate_keys("s3", &keys(&["virtual_host_style"]))
-            .unwrap_err()
-            .to_string();
+        let e = full(validate_keys("s3", &keys(&["virtual_host_style"])).unwrap_err());
         assert!(
             e.contains("did you mean `enable_virtual_host_style`?"),
             "{e}"

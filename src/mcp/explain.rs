@@ -10,7 +10,7 @@ use crate::analysis::diagnosis::{Bottleneck, Severity};
 use crate::analysis::findings::Command;
 use crate::analysis::outliers::{self, Attribution, Selection};
 use crate::model::{Evidence, Run, VerdictLevel, Verification};
-use crate::output::CommandOutput;
+use crate::output::{CommandOutput, NextStep};
 use crate::report::style::{bold, dim, yellow};
 use crate::util::fmt_ms;
 
@@ -78,8 +78,11 @@ pub struct ExplainRun {
     pub slowest: Option<SlowestAnalysis>,
     /// The explanation in sentences.
     pub narrative: Vec<String>,
-    /// Commands worth running next.
-    pub next_commands: Vec<String>,
+    /// Steps worth taking next, each with its CLI command and MCP call (the JSON envelope's
+    /// `next`).
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub next: Vec<NextStep>,
     /// Findings shown in text output.
     #[serde(skip)]
     #[schemars(skip)]
@@ -236,33 +239,61 @@ pub fn explain_run(run: &Run, top: usize) -> ExplainRun {
         ),
     }
 
-    let mut next = vec![format!("oprobe runs show {id}")];
+    let target_ref = r.spec.target_ref.clone();
+    let mut next = vec![
+        NextStep::new("the full report", format!("oprobe runs show {id}")).with_mcp(
+            "get_run",
+            serde_json::json!({ "run": id, "include_report": true }),
+        ),
+    ];
     for f in findings.iter().take(top.max(1)) {
-        if let Some(c) = f.verification.as_ref().and_then(|v| v.command.clone()) {
-            next.push(c);
+        if let Some(v) = &f.verification {
+            next.push(NextStep::new(
+                format!("test it: {}", v.description),
+                v.rerun.clone(),
+            ));
         }
-        let cmd = match f.code.as_str() {
+        let step = match f.code.as_str() {
             "throttling" | "sla_p99" | "server_latency" | "tail_latency" | "tail_stragglers" => {
                 Some(
-                    Command::for_target("tune", &r.target)
-                        .set("--dry-run", None)
-                        .to_string(),
+                    NextStep::new(
+                        "plan a tuner search",
+                        Command::for_target("tune", &r.target)
+                            .set("--dry-run", None)
+                            .to_string(),
+                    )
+                    .with_mcp("plan_run", serde_json::json!({ "target": target_ref })),
                 )
             }
-            "errors" | "cold_connections" | "high_rtt" | "tcp_retransmits" => {
-                Some(Command::for_target("doctor", &r.target).to_string())
-            }
+            "errors" | "cold_connections" | "high_rtt" | "tcp_retransmits" => Some(
+                NextStep::new(
+                    "check the target",
+                    Command::for_target("doctor", &r.target).to_string(),
+                )
+                .with_mcp("doctor", serde_json::json!({ "target": target_ref })),
+            ),
             _ => None,
         };
-        if let Some(c) = cmd
-            && !next.contains(&c)
+        if let Some(s) = step
+            && !next.iter().any(|n| n.cli == s.cli)
         {
-            next.push(c);
+            next.push(s);
         }
     }
-    next.push(format!("oprobe analyze {id} --by api"));
-    next.push(format!("oprobe compare last~1 {id}"));
-    next.dedup();
+    next.push(
+        NextStep::new("requests by API", format!("oprobe analyze {id} --by api"))
+            .with_mcp("analyze_run", serde_json::json!({ "run": id })),
+    );
+    next.push(
+        NextStep::new(
+            "compare with the previous run",
+            format!("oprobe compare last~1 {id}"),
+        )
+        .with_mcp(
+            "compare_runs",
+            serde_json::json!({ "baseline": "last~1", "candidate": id }),
+        ),
+    );
 
     ExplainRun {
         run_id: id,
@@ -276,7 +307,7 @@ pub fn explain_run(run: &Run, top: usize) -> ExplainRun {
         findings,
         slowest: slow,
         narrative,
-        next_commands: next,
+        next,
         top,
     }
 }
@@ -328,7 +359,22 @@ fn doc_text(d: &FindingDoc) -> String {
     o
 }
 
+impl CommandOutput for ExplainRun {
+    fn text(&self) -> String {
+        ExplainOutput::Run(self.clone()).text()
+    }
+    fn next(&self) -> Vec<NextStep> {
+        self.next.clone()
+    }
+}
+
 impl CommandOutput for ExplainOutput {
+    fn next(&self) -> Vec<NextStep> {
+        match self {
+            Self::Run(e) => e.next.clone(),
+            _ => Vec::new(),
+        }
+    }
     fn text(&self) -> String {
         match self {
             Self::FindingCode(d) => doc_text(d),
@@ -375,8 +421,8 @@ impl CommandOutput for ExplainOutput {
                     }
                 }
                 o += &format!("  {}\n", bold("next:"));
-                for c in e.next_commands.iter().take(4) {
-                    o += &format!("    {c}\n");
+                for c in e.next.iter().take(4) {
+                    o += &format!("    {}\n", c.cli);
                 }
                 o
             }

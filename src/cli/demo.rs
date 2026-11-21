@@ -42,7 +42,9 @@ pub struct DemoOutput {
     pub path: Option<String>,
     /// The narration, step by step.
     pub steps: Vec<DemoStep>,
-    /// Commands to try next.
+    /// Commands to try next (the JSON envelope's `next`).
+    #[serde(skip)]
+    #[schemars(skip)]
     pub next_commands: Vec<String>,
     pub report: Report,
     #[serde(skip)]
@@ -51,6 +53,17 @@ pub struct DemoOutput {
 }
 
 impl CommandOutput for DemoOutput {
+    fn formats() -> &'static [crate::output::OutputFormat] {
+        crate::output::WITH_MD_HTML
+    }
+
+    fn next(&self) -> Vec<crate::output::NextStep> {
+        self.next_commands
+            .iter()
+            .map(|c| crate::output::NextStep::new("try it on your storage", c.clone()))
+            .collect()
+    }
+
     fn text(&self) -> String {
         let mut o = String::new();
         for (i, s) in self.steps.iter().enumerate() {
@@ -144,7 +157,7 @@ pub fn narrate(r: &Report, run_id: &str) -> (Vec<DemoStep>, Vec<String>) {
         for l in wrap(&format!("What to do: {}", f.advice)) {
             found.push(format!("  {l}"));
         }
-        if let Some(c) = f.verification.as_ref().and_then(|v| v.command.as_ref()) {
+        if let Some(c) = f.verification.as_ref().map(|v| &v.rerun) {
             found.push(format!("  Check it: {c}"));
         }
     }
@@ -278,7 +291,10 @@ mod tests {
             .join("\n");
         assert!(text.contains("503 SlowDown"), "{text}");
         assert!(text.contains("What to do: Lower the concurrency"), "{text}");
-        assert!(text.contains("Check it: oprobe run prod -c 16"), "{text}");
+        assert!(
+            text.contains("Check it: oprobe run --from 20261120-143005-a1b2 --set concurrency=16"),
+            "{text}"
+        );
         assert!(text.contains("oprobe runs show 20261120-143005-a1b2"));
         assert!(next[0].starts_with("oprobe target add"));
         assert_eq!(steps.len(), 5);

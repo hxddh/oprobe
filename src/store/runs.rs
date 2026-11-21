@@ -1,4 +1,4 @@
-//! The run store: `runs/<id>.oprobe` (zstd NDJSON, format `oprobe.run/3`, design §4) plus a
+//! The run store: `runs/<id>.oprobe` (zstd NDJSON, format `oprobe.run/4`, design §4) plus a
 //! `runs/<id>.json` sidecar summary for fast listing, and RUNREF resolution (design §2).
 
 use std::io::{BufRead, Read, Write};
@@ -76,7 +76,7 @@ fn kind_line<T: Serialize>(out: &mut impl Write, kind: &str, v: &T) -> Result<()
     Ok(())
 }
 
-/// Encode a run as `oprobe.run/3` (zstd-compressed NDJSON).
+/// Encode a run as `oprobe.run/4` (zstd-compressed NDJSON).
 pub fn encode_run(run: &Run) -> Result<Vec<u8>> {
     let mut enc = zstd::stream::Encoder::new(Vec::new(), ZSTD_LEVEL)?;
     {
@@ -102,7 +102,7 @@ pub fn encode_run(run: &Run) -> Result<Vec<u8>> {
     Ok(enc.finish()?)
 }
 
-/// Decode an `oprobe.run/3` stream. Unknown line kinds are skipped.
+/// Decode an `oprobe.run/4` stream. Unknown line kinds are skipped.
 pub fn decode_run(r: impl Read) -> Result<Run> {
     let dec = zstd::stream::Decoder::new(r).context("not a zstd stream")?;
     let mut report = None;
@@ -127,10 +127,14 @@ pub fn decode_run(r: impl Read) -> Result<Run> {
         match v.get("kind").and_then(|k| k.as_str()) {
             Some("header") => {
                 let f = v.get("format").and_then(|f| f.as_str()).unwrap_or("");
-                anyhow::ensure!(
-                    f == RUN_FORMAT,
-                    "unsupported run file format `{f}` (this oprobe reads `{RUN_FORMAT}`)"
-                );
+                if f != RUN_FORMAT {
+                    return Err(crate::errors::OprobeError::new(
+                        crate::errors::ErrorCode::UsageInvalidArgument,
+                        format!("unsupported run file format `{f}` (this oprobe reads `{RUN_FORMAT}`)"),
+                    )
+                    .with_hint("run files of other oprobe versions are not read: re-run the workload with this oprobe")
+                    .into());
+                }
                 header_seen = true;
             }
             Some("report") => report = Some(Report::from_json_value(v).with_context(at)?),
@@ -139,7 +143,13 @@ pub fn decode_run(r: impl Read) -> Result<Run> {
             _ => {}
         }
     }
-    anyhow::ensure!(header_seen, "not an oprobe run file (no header)");
+    if !header_seen {
+        return Err(crate::errors::OprobeError::new(
+            crate::errors::ErrorCode::UsageInvalidArgument,
+            "not an oprobe run file (no header)",
+        )
+        .into());
+    }
     let report = report.context("the run file has no report")?;
     Ok(Run { report, ops, reqs })
 }
@@ -421,6 +431,7 @@ mod tests {
             warnings: vec![],
             started_at: std::time::SystemTime::now(),
             ended_at: std::time::SystemTime::now(),
+            spec: None,
         });
         run.report.run.label = label.map(str::to_owned);
         run.ops = (1..=2)
@@ -503,7 +514,7 @@ mod tests {
             text.lines()
                 .next()
                 .unwrap()
-                .contains("\"format\":\"oprobe.run/3\"")
+                .contains("\"format\":\"oprobe.run/4\"")
         );
         // Unknown kinds are skipped.
         let mut extra = text.clone();

@@ -26,6 +26,9 @@ pub struct ReportInput<'a> {
     pub warnings: Vec<String>,
     pub started_at: SystemTime,
     pub ended_at: SystemTime,
+    /// The run's spec (`RunSpec::new` of the profile before the session normalised it, at the
+    /// target as given); `None`: derived from `profile` and `target_name`.
+    pub spec: Option<super::spec::RunSpec>,
 }
 
 /// Percentile (nearest rank) of `v` in ms; reorders `v`.
@@ -232,7 +235,15 @@ pub fn build_run(i: ReportInput<'_>) -> Run {
         warnings,
         started_at,
         ended_at,
+        spec,
     } = i;
+    let spec = spec.unwrap_or_else(|| {
+        let target_ref = target_name
+            .clone()
+            .or_else(|| profile.target.url.clone())
+            .unwrap_or_else(|| profile.target.display());
+        super::spec::RunSpec::new(profile, target_ref)
+    });
     ensure_slowest(&snapshot, &mut trace);
     let t = &profile.target;
     let endpoint = t.endpoint();
@@ -302,8 +313,15 @@ pub fn build_run(i: ReportInput<'_>) -> Run {
     };
     let sampled = trace.sampled();
     let region = t.options.get("region").cloned();
+    let capacity = crate::analysis::capacity::estimate(
+        &trace.reqs,
+        &trace.ops,
+        crate::analysis::capacity::Window::measured(snapshot.elapsed_s),
+    );
     let report = Report {
         schema: REPORT_SCHEMA.to_owned(),
+        spec,
+        capacity,
         run: RunInfo {
             id: run_id.to_string(),
             label: profile.name.clone(),

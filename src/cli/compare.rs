@@ -18,6 +18,10 @@ use crate::store::{Baseline, Baselines, RunSummary};
 use crate::util::fmt_ms;
 
 impl CommandOutput for Comparison {
+    fn formats() -> &'static [crate::output::OutputFormat] {
+        crate::output::WITH_MD_HTML
+    }
+
     fn text(&self) -> String {
         self.render_terminal()
     }
@@ -86,7 +90,7 @@ pub(super) fn baseline_runs(ctx: &Ctx, name: &str) -> Result<Vec<Run>> {
     let Some(bl) = b.get(name) else {
         let known: Vec<&str> = b.baselines.keys().map(String::as_str).collect();
         return Err(OprobeError::new(
-            ErrorCode::UsageInvalidArgument,
+            ErrorCode::UsageUnknownBaseline,
             format!("no baseline named `{name}`"),
         )
         .with_hint(if known.is_empty() {
@@ -418,7 +422,7 @@ pub fn cmd_baseline(c: BaselineCommand, ctx: &Ctx) -> Result<u8> {
             let mut b = Baselines::load(&file)?;
             if b.remove(&a.name).is_none() {
                 return Err(OprobeError::new(
-                    ErrorCode::UsageInvalidArgument,
+                    ErrorCode::UsageUnknownBaseline,
                     format!("no baseline named `{}`", a.name),
                 )
                 .into());
@@ -430,7 +434,7 @@ pub fn cmd_baseline(c: BaselineCommand, ctx: &Ctx) -> Result<u8> {
             let b = Baselines::load(&file)?;
             let Some(bl) = b.get(&a.name) else {
                 return Err(OprobeError::new(
-                    ErrorCode::UsageInvalidArgument,
+                    ErrorCode::UsageUnknownBaseline,
                     format!("no baseline named `{}`", a.name),
                 )
                 .into());

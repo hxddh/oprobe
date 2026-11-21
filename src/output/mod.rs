@@ -9,6 +9,11 @@
 //! stdout carries data only; logs and progress go to stderr (or become `log` events in
 //! ndjson mode). Errors are printed by [`Output::error`]: JSON on stdout in json/ndjson modes,
 //! `error:` + `hint:` on stderr otherwise.
+//!
+//! Every JSON result is wrapped in the common envelope (design v4 §8, [`Envelope`]): the
+//! result's own fields plus `next` ([`NextStep`]s, each with its CLI command and, where one
+//! exists, the equivalent MCP tool call) and `warnings` (the result's own plus every
+//! [`Output::warn`] of the command).
 
 use std::io::Write;
 
@@ -49,6 +54,105 @@ impl OutputFormat {
     }
 }
 
+/// An MCP tool call: the tool and its arguments.
+#[derive(Clone, Debug, PartialEq, Serialize, serde::Deserialize, JsonSchema)]
+pub struct McpCall {
+    pub tool: String,
+    pub arguments: serde_json::Map<String, serde_json::Value>,
+}
+
+/// A suggested next step: what it does, the CLI command, and the MCP call doing the same.
+#[derive(Clone, Debug, PartialEq, Serialize, serde::Deserialize, JsonSchema)]
+pub struct NextStep {
+    /// What the step does, in a few words.
+    pub title: String,
+    /// The command line (`oprobe …`).
+    pub cli: String,
+    /// The same step as an MCP tool call, when a tool does it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp: Option<McpCall>,
+}
+
+impl NextStep {
+    pub fn new(title: impl Into<String>, cli: impl Into<String>) -> Self {
+        Self {
+            title: title.into(),
+            cli: cli.into(),
+            mcp: None,
+        }
+    }
+
+    /// Add the MCP call (`arguments` must be a JSON object; anything else is ignored).
+    pub fn with_mcp(mut self, tool: impl Into<String>, arguments: serde_json::Value) -> Self {
+        if let serde_json::Value::Object(arguments) = arguments {
+            self.mcp = Some(McpCall {
+                tool: tool.into(),
+                arguments,
+            });
+        }
+        self
+    }
+}
+
+/// The common envelope of every JSON command result: the result's fields, then `next` and
+/// `warnings`.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct Envelope<T> {
+    #[serde(flatten)]
+    pub result: T,
+    /// Suggested next steps.
+    pub next: Vec<NextStep>,
+    /// Warnings of the command (also printed on stderr in text mode).
+    pub warnings: Vec<String>,
+}
+
+impl<'a, T: CommandOutput> Envelope<&'a T> {
+    /// `v` with its own next steps and warnings, plus `extra_warnings`.
+    pub fn of(v: &'a T, extra_warnings: Vec<String>) -> Self {
+        let mut warnings = v.warnings();
+        for w in extra_warnings {
+            if !warnings.contains(&w) {
+                warnings.push(w);
+            }
+        }
+        Self {
+            next: v.next(),
+            warnings,
+            result: v,
+        }
+    }
+}
+
+/// The JSON of `v` in its envelope (what `-o json` prints; MCP structured content of results
+/// that are command outputs).
+pub fn envelope_value<T: CommandOutput>(v: &T, extra_warnings: Vec<String>) -> serde_json::Value {
+    if !v.enveloped() {
+        return serde_json::to_value(v).unwrap_or_default();
+    }
+    serde_json::to_value(Envelope::of(v, extra_warnings)).unwrap_or_default()
+}
+
+/// Formats every command supports.
+pub const DEFAULT_FORMATS: &[OutputFormat] =
+    &[OutputFormat::Text, OutputFormat::Json, OutputFormat::Ndjson];
+
+/// The default formats plus Markdown.
+pub const WITH_MD: &[OutputFormat] = &[
+    OutputFormat::Text,
+    OutputFormat::Json,
+    OutputFormat::Ndjson,
+    OutputFormat::Md,
+];
+
+/// The default formats plus Markdown and HTML.
+pub const WITH_MD_HTML: &[OutputFormat] = &[
+    OutputFormat::Text,
+    OutputFormat::Json,
+    OutputFormat::Ndjson,
+    OutputFormat::Md,
+    OutputFormat::Html,
+];
+
 /// The typed result of a command.
 pub trait CommandOutput: Serialize + JsonSchema {
     /// Human text (may contain ANSI colors when enabled).
@@ -67,6 +171,33 @@ pub trait CommandOutput: Serialize + JsonSchema {
     /// Exit code of the command for this result (0 unless a gate failed).
     fn exit_code(&self) -> u8 {
         0
+    }
+
+    /// Suggested next steps (`next` in the JSON envelope).
+    fn next(&self) -> Vec<NextStep> {
+        Vec::new()
+    }
+
+    /// Warnings that belong to the result (`warnings` in the JSON envelope; the command's
+    /// `Output::warn` lines are added).
+    fn warnings(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// The output formats this result renders (design v4 §8): text, JSON and NDJSON always;
+    /// commands with a Markdown or HTML renderer add theirs. `capabilities` lists them and
+    /// `-o` outside them is a usage error.
+    fn formats() -> &'static [OutputFormat]
+    where
+        Self: Sized,
+    {
+        DEFAULT_FORMATS
+    }
+
+    /// Whether the JSON form is wrapped in the [`Envelope`] (false only for documents printed
+    /// verbatim, such as a JSON Schema).
+    fn enveloped(&self) -> bool {
+        true
     }
 
     /// The final `result` event of an ndjson stream.
@@ -100,6 +231,8 @@ pub struct Output {
     /// No prompts, no live terminal redraws (implied when stdin/stdout is not a TTY).
     pub non_interactive: bool,
     bus: EventBus,
+    /// Every `warn` of the command (the JSON envelope's `warnings`).
+    warned: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 impl Output {
@@ -120,6 +253,7 @@ impl Output {
             quiet,
             non_interactive,
             bus,
+            warned: Default::default(),
         }
     }
 
@@ -130,6 +264,7 @@ impl Output {
             quiet: true,
             non_interactive: true,
             bus: EventBus::new(),
+            warned: Default::default(),
         }
     }
 
@@ -151,10 +286,18 @@ impl Output {
     /// A warning: stderr (even with `-q`) or a `log` event.
     pub fn warn(&self, msg: impl Into<String>) {
         let msg = msg.into();
+        if let Ok(mut w) = self.warned.lock() {
+            w.push(crate::report::style::strip_ansi(&msg));
+        }
         match self.format {
             OutputFormat::Ndjson => self.bus.log(LogLevel::Warn, msg),
             _ => eprintln!("{} {msg}", yellow("warning:")),
         }
+    }
+
+    /// The warnings given so far.
+    pub fn warnings(&self) -> Vec<String> {
+        self.warned.lock().map(|w| w.clone()).unwrap_or_default()
     }
 
     /// Print a command's result and return its exit code.
@@ -176,12 +319,24 @@ impl Output {
                 }
             }
             OutputFormat::Json => {
-                serde_json::to_writer_pretty(&mut out, v)?;
+                if v.enveloped() {
+                    serde_json::to_writer_pretty(&mut out, &Envelope::of(v, self.warnings()))?;
+                } else {
+                    serde_json::to_writer_pretty(&mut out, v)?;
+                }
                 out.write_all(b"\n")?;
             }
             OutputFormat::Ndjson => {
                 drop(out);
-                self.bus.emit(v.result_event());
+                let mut ev = v.result_event();
+                if let EventKind::Result {
+                    data: Some(data), ..
+                } = &mut ev
+                    && v.enveloped()
+                {
+                    *data = envelope_value(v, self.warnings());
+                }
+                self.bus.emit(ev);
             }
             OutputFormat::Html => match v.html() {
                 Some(h) => out.write_all(h.as_bytes())?,
@@ -284,6 +439,40 @@ mod tests {
     }
 
     #[test]
+    fn the_envelope_adds_next_and_warnings() {
+        #[derive(Serialize, JsonSchema)]
+        struct R {
+            n_count: u64,
+        }
+        impl CommandOutput for R {
+            fn text(&self) -> String {
+                String::new()
+            }
+            fn next(&self) -> Vec<NextStep> {
+                vec![
+                    NextStep::new("show it", "oprobe runs show last")
+                        .with_mcp("get_run", serde_json::json!({"run": "last"})),
+                ]
+            }
+            fn warnings(&self) -> Vec<String> {
+                vec!["own".into()]
+            }
+        }
+        let v = envelope_value(&R { n_count: 3 }, vec!["own".into(), "warned".into()]);
+        assert_eq!(v["n_count"], 3);
+        assert_eq!(v["next"][0]["cli"], "oprobe runs show last");
+        assert_eq!(v["next"][0]["mcp"]["tool"], "get_run");
+        assert_eq!(v["next"][0]["mcp"]["arguments"]["run"], "last");
+        assert_eq!(v["warnings"], serde_json::json!(["own", "warned"]));
+        let t = envelope_value(&TextOutput { text: "x".into() }, vec![]);
+        assert_eq!(t["next"], serde_json::json!([]));
+        assert_eq!(R::formats(), DEFAULT_FORMATS);
+        let o = Output::silent();
+        o.warn("careful");
+        assert_eq!(o.warnings(), vec!["careful".to_owned()]);
+    }
+
+    #[test]
     fn broken_pipes_are_recognized() {
         let e: anyhow::Error = std::io::Error::from(std::io::ErrorKind::BrokenPipe).into();
         assert!(is_broken_pipe(&e.context("writing the result")));
@@ -298,6 +487,7 @@ mod tests {
             quiet: true,
             non_interactive: true,
             bus: EventBus::new(),
+            warned: Default::default(),
         };
         let e = o.finish(&TextOutput { text: "x".into() }).unwrap_err();
         let body = crate::errors::classify(&e, "s3");

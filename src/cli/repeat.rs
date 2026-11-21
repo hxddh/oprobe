@@ -40,6 +40,10 @@ pub struct RepeatOutput {
 }
 
 impl CommandOutput for RepeatOutput {
+    fn formats() -> &'static [crate::output::OutputFormat] {
+        crate::output::WITH_MD
+    }
+
     fn text(&self) -> String {
         let mut o = String::new();
         if self.runs.len() > 1 {
@@ -121,9 +125,7 @@ impl CommandOutput for RepeatOutput {
 }
 
 pub async fn cmd_run_repeat(a: RunArgs, ctx: &Ctx) -> Result<u8> {
-    let (mut profile, target_name) =
-        super::resolve_profile(ctx, &a.target, &a.workload, &a.knobs, &a.cost)?;
-    super::apply_sla(&mut profile, &a.sla)?;
+    let (mut profile, target_name) = super::run_profile(ctx, &a)?;
     let first = super::run::rails(ctx, &profile, &a.safety)?;
     if a.safety.dry_run {
         let mut plan = first.plan(&profile);

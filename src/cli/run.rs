@@ -36,6 +36,10 @@ pub struct RunOutput {
 }
 
 impl CommandOutput for RunOutput {
+    fn formats() -> &'static [crate::output::OutputFormat] {
+        crate::output::WITH_MD_HTML
+    }
+
     fn text(&self) -> String {
         brief::render(&self.report, &self.run_id)
     }
@@ -237,6 +241,7 @@ pub async fn cmd_run(mut a: RunArgs, ctx: &Ctx) -> Result<u8> {
     // `oprobe run` without a target in an interactive terminal: guided first run.
     if a.target.target.is_none()
         && a.target.profile.is_none()
+        && a.from.is_none()
         && ctx.config()?.defaults.target.is_none()
         && super::onboard::should_offer(ctx)
     {
@@ -251,12 +256,7 @@ pub async fn cmd_run(mut a: RunArgs, ctx: &Ctx) -> Result<u8> {
     if a.repeat > 1 || a.baseline.is_some() {
         return super::repeat::cmd_run_repeat(a, ctx).await;
     }
-    let (mut profile, target_name) =
-        resolve_profile(ctx, &a.target, &a.workload, &a.knobs, &a.cost)?;
-    apply_sla(&mut profile, &a.sla)?;
-    if a.output.label.is_some() {
-        profile.name = a.output.label.clone();
-    }
+    let (profile, target_name) = super::run_profile(ctx, &a)?;
     match measure(ctx, profile, target_name, &a.safety, &a.output).await? {
         Measured::Plan(plan) => ctx.out.finish(plan.as_ref()),
         Measured::Run(out) => ctx.out.finish(out.as_ref()),
@@ -336,6 +336,10 @@ pub struct TuneOutput {
 }
 
 impl CommandOutput for TuneOutput {
+    fn formats() -> &'static [crate::output::OutputFormat] {
+        crate::output::WITH_MD
+    }
+
     fn text(&self) -> String {
         let s = &self.tune;
         let mut o = String::new();

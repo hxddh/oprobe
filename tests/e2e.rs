@@ -38,6 +38,7 @@ fn build(prof: &Profile, s: Snapshot, c: oprobe::engine::CleanupSummary) -> Repo
         warnings: vec![],
         started_at: std::time::SystemTime::now(),
         ended_at: std::time::SystemTime::now(),
+        spec: None,
     })
 }
 
@@ -731,7 +732,7 @@ fn cli_binary_end_to_end() {
         .output()
         .unwrap();
     let rep: serde_json::Value = serde_json::from_slice(&fail_on.stdout).unwrap();
-    assert_eq!(rep["report"]["schema"], "oprobe.report/3");
+    assert_eq!(rep["report"]["schema"], "oprobe.report/4");
     assert_eq!(
         rep["report"]["verdict"]["exit_code"].as_u64(),
         fail_on.status.code().map(|c| c as u64)

@@ -32,7 +32,7 @@ use clap::CommandFactory;
 pub use args::Cli;
 use args::*;
 
-use crate::config::{Access, DatasetSpec, Preset, Profile, TargetSpec};
+use crate::config::{DatasetSpec, Preset, Profile, TargetSpec};
 use crate::engine::RunOptions;
 use crate::errors::{ErrorCode, OprobeError, exit};
 use crate::output::{Output, OutputFormat};
@@ -114,6 +114,30 @@ pub async fn main(cli: Cli) -> ExitCode {
         );
     }
     let scheme_hint = scheme_of(&command);
+    // An explicit `--config` that does not exist is a typo, except for the commands that
+    // create the file.
+    if let Some(p) = &cli.config
+        && !p.exists()
+        && !matches!(
+            command,
+            Command::Target(TargetCommand::Add(_))
+                | Command::Config(ConfigCommand::Path | ConfigCommand::Edit)
+        )
+    {
+        let body = crate::errors::classify(
+            &OprobeError::new(
+                ErrorCode::ConfigInvalid,
+                format!("config file `{}` does not exist", p.display()),
+            )
+            .with_hint(format!(
+                "check the path, create it with `oprobe --config {} target add NAME URL`, or drop --config",
+                p.display()
+            ))
+            .into(),
+            "s3",
+        );
+        return ExitCode::from(ctx.out.error(&body));
+    }
     let code = match dispatch(command, &ctx).await {
         Ok(code) => code,
         Err(err) if crate::output::is_broken_pipe(&err) => crate::output::EXIT_BROKEN_PIPE,
@@ -202,9 +226,13 @@ pub fn parse_cli(args: Vec<std::ffi::OsString>) -> std::result::Result<Cli, Exit
         Some(u) => format!("usage: {u} (see `--help`)"),
         None => "see `oprobe --help`".to_owned(),
     };
-    let err: anyhow::Error = OprobeError::new(ErrorCode::UsageInvalidArgument, message)
-        .with_hint(hint)
-        .into();
+    // A value rejected by one of `crate::input`'s parsers keeps its code and hint.
+    let typed = std::error::Error::source(&e).and_then(|c| c.downcast_ref::<OprobeError>());
+    let (code, hint) = match typed {
+        Some(t) => (t.code, t.hint.clone().unwrap_or(hint)),
+        None => (ErrorCode::UsageInvalidArgument, hint),
+    };
+    let err: anyhow::Error = OprobeError::new(code, message).with_hint(hint).into();
     let body = crate::errors::classify(&err, "s3");
     let out = Output::new(machine.unwrap_or_default(), true, true);
     Err(ExitCode::from(out.error(&body)))
@@ -290,15 +318,14 @@ pub fn ui_entry(cli: &Cli) -> Option<ExitCode> {
         }
         crate::ui::set_launch(launch);
         if window {
-            return Some(run_window());
+            return Some(run_window(cli));
         }
         if !interactive {
-            eprintln!(
-                "{} `oprobe top` needs an interactive terminal; use `oprobe run` for scripts \
-                 (or `oprobe gui` for a window).",
-                red(&bold("error:"))
-            );
-            return Some(ExitCode::from(EXIT_USAGE));
+            return Some(ui_refusal(
+                cli,
+                "`oprobe top` needs an interactive terminal",
+                "use `oprobe run` for scripts (or `oprobe gui` for a window)",
+            ));
         }
         Some(match crate::ui::run_tui() {
             Ok(()) => ExitCode::SUCCESS,
@@ -311,14 +338,11 @@ pub fn ui_entry(cli: &Cli) -> Option<ExitCode> {
     #[cfg(not(feature = "tui"))]
     {
         match &cli.command {
-            Some(Command::Top(_)) | Some(Command::Gui(_)) => {
-                eprintln!(
-                    "{} this oprobe was built without its interactive UI; reinstall with \
-                     `cargo install oprobe` (default features) or use `oprobe run`.",
-                    red(&bold("error:"))
-                );
-                Some(ExitCode::FAILURE)
-            }
+            Some(Command::Top(_)) | Some(Command::Gui(_)) => Some(ui_refusal(
+                cli,
+                "this oprobe was built without its interactive UI",
+                "reinstall with `cargo install oprobe` (default features) or use `oprobe run`",
+            )),
             None => {
                 let _ = Cli::command().print_help();
                 Some(ExitCode::SUCCESS)
@@ -355,10 +379,31 @@ fn gui_available() -> std::result::Result<(), &'static str> {
     }
 }
 
+/// An interactive command this environment cannot run: a `usage.invalid_argument` error
+/// (exit 2), as JSON on stdout under `-o json|ndjson`.
+fn ui_refusal(cli: &Cli, message: &str, hint: &str) -> ExitCode {
+    let format = cli
+        .output
+        .or_else(|| {
+            std::env::var("OPROBE_OUTPUT")
+                .ok()
+                .and_then(|v| OutputFormat::parse(&v))
+        })
+        .unwrap_or_default();
+    let body = crate::errors::classify(
+        &OprobeError::new(ErrorCode::UsageInvalidArgument, message)
+            .with_hint(hint)
+            .into(),
+        "s3",
+    );
+    ExitCode::from(Output::new(format, true, true).error(&body))
+}
+
 #[cfg(feature = "tui")]
-fn run_window() -> ExitCode {
+fn run_window(cli: &Cli) -> ExitCode {
     #[cfg(feature = "gui")]
     {
+        let _ = cli;
         if let Err(why) = gui_available() {
             let msg = format!(
                 "cannot open a window: {why}. Use `oprobe top` for the same workbench in this \
@@ -373,13 +418,12 @@ fn run_window() -> ExitCode {
     }
     #[cfg(not(feature = "gui"))]
     {
-        eprintln!(
-            "{} this oprobe was built without native windows; use `oprobe top` for the same \
-             workbench in this terminal, or install a desktop build (release page, or \
-             `cargo install oprobe --features gui`).",
-            red(&bold("error:"))
-        );
-        ExitCode::FAILURE
+        ui_refusal(
+            cli,
+            "this oprobe was built without native windows",
+            "use `oprobe top` for the same workbench in this terminal, or install a desktop build \
+             (release page, or `cargo install oprobe --features gui`)",
+        )
     }
 }
 
@@ -499,6 +543,16 @@ pub fn resolve_target(t: &TargetArgs, cfg: &ConfigFile) -> Result<(TargetArgs, O
         .into());
     };
     entry.validate()?;
+    crate::input::storage_url(&entry.url).map_err(|e| {
+        let mut o = OprobeError::new(
+            ErrorCode::ConfigInvalid,
+            format!("target `{given}` in the config file: {}", e.message),
+        );
+        o.hint = e
+            .hint
+            .map(|h| format!("{h}; fix it with `oprobe config edit`"));
+        o
+    })?;
     t.target = Some(entry.url.clone());
     if t.endpoint.is_none() {
         t.endpoint = entry.endpoint.clone();
@@ -575,9 +629,14 @@ pub fn trace_max_requests(ctx: &Ctx) -> usize {
 }
 
 fn parse_size(flag: &str, v: &str) -> Result<ByteSize> {
-    v.parse().with_context(|| format!("invalid {flag}"))
+    crate::input::size(v).map_err(|e| {
+        let mut o = OprobeError::new(e.code, format!("invalid {flag}: {}", e.message));
+        o.hint = e.hint;
+        o.into()
+    })
 }
 
+/// The profile of flags (or a `--profile` file with flags on top), validated.
 pub fn build_profile(
     t: &TargetArgs,
     w: &WorkloadArgs,
@@ -605,8 +664,23 @@ pub fn build_profile(
         nt.proxy = p.target.proxy.clone();
         p.target = nt;
     }
+    apply_flags(&mut p, t, w, k, c)?;
+    p.validate()?;
+    Ok(p)
+}
+
+/// Apply the target, workload, knob and cost flags that were given to `p` (unset flags leave
+/// `p` alone): `build_profile` and `run --from` share it. Not validated.
+pub fn apply_flags(
+    p: &mut Profile,
+    t: &TargetArgs,
+    w: &WorkloadArgs,
+    k: &KnobArgs,
+    c: &CostArgs,
+) -> Result<()> {
     let tg = &mut p.target;
     if let Some(e) = &t.endpoint {
+        let e = crate::input::endpoint(e)?;
         tg.options.insert("endpoint".into(), e.clone());
         if tg.scheme == "s3" || tg.url.as_deref().is_some_and(|u| u.starts_with("s3")) {
             tg.options
@@ -618,11 +692,8 @@ pub fn build_profile(
         tg.options.insert("region".into(), r.clone());
     }
     for kv in &t.options {
-        let (key, val) = kv
-            .split_once('=')
-            .with_context(|| format!("invalid --option `{kv}` (expected KEY=VALUE)"))?;
-        tg.options
-            .insert(key.trim().to_owned(), val.trim().to_owned());
+        let (key, val) = crate::input::key_value("--option", kv)?;
+        tg.options.insert(key, val);
     }
     if t.anonymous {
         let scheme = tg.service_scheme()?;
@@ -642,24 +713,24 @@ pub fn build_profile(
 
     let wl = &mut p.workload;
     if let Some(pr) = &w.preset {
-        wl.preset = Preset::parse(pr)?;
+        wl.preset = crate::input::preset(pr)?;
         wl.mix.clear();
         wl.dataset = None;
     }
     if let Some(d) = &w.duration {
-        wl.duration = HumanDuration(parse_duration(d)?);
+        wl.duration = HumanDuration(crate::input::duration(d)?);
     }
     if let Some(d) = &w.warmup {
-        wl.warmup = HumanDuration(parse_duration(d)?);
+        wl.warmup = HumanDuration(crate::input::duration(d)?);
     }
     if w.max_ops.is_some() {
         wl.max_ops = w.max_ops;
     }
-    if w.rate.is_some() {
-        wl.rate = w.rate;
+    if let Some(r) = w.rate {
+        wl.rate = Some(crate::input::positive("--rate", &r.to_string())?);
     }
     if let Some(a) = &w.access {
-        wl.access = a.parse::<Access>()?;
+        wl.access = crate::input::access(a)?;
     }
     if w.existing.is_some() || w.objects.is_some() || w.object_size.is_some() || w.persist_dataset {
         let mut ds: DatasetSpec = wl.effective_dataset();
@@ -669,8 +740,13 @@ pub fn build_profile(
         if let Some(n) = w.objects {
             ds.objects = n;
         }
+        if let Some(n) = w.objects
+            && n == 0
+        {
+            return Err(crate::input::invalid("--objects must be at least 1").into());
+        }
         if let Some(s) = &w.object_size {
-            ds.object_size = parse_size("--object-size", s)?;
+            ds.object_size = crate::input::nonzero_size(s)?;
         }
         if w.persist_dataset {
             ds.persist = true;
@@ -686,11 +762,15 @@ pub fn build_profile(
 
     let kn = &mut p.knobs;
     if let Some(v) = k.concurrency {
-        anyhow::ensure!(v >= 1, "concurrency must be at least 1");
+        if v < 1 {
+            return Err(crate::input::invalid("concurrency must be at least 1").into());
+        }
         kn.concurrency = v;
     }
     if let Some(v) = k.io_concurrency {
-        anyhow::ensure!(v >= 1, "I/O concurrency must be at least 1");
+        if v < 1 {
+            return Err(crate::input::invalid("I/O concurrency must be at least 1").into());
+        }
         kn.io_concurrency = v;
     }
     if let Some(v) = &k.chunk_size {
@@ -722,12 +802,7 @@ pub fn build_profile(
         kn.tail_cut = true;
     }
     if let Some(a) = &k.addressing {
-        kn.provider.addressing = match a.trim().to_ascii_lowercase().as_str() {
-            "auto" => crate::config::Addressing::Auto,
-            "virtual" | "virtual-host" | "vhost" => crate::config::Addressing::Virtual,
-            "path" => crate::config::Addressing::Path,
-            other => anyhow::bail!("invalid --addressing `{other}` (auto, virtual or path)"),
-        };
+        kn.provider.addressing = crate::input::addressing(a)?;
     }
     if k.checksum.is_some() {
         kn.provider.checksum = k.checksum.clone();
@@ -738,23 +813,18 @@ pub fn build_profile(
 
     let cs = &mut p.cost;
     if let Some(v) = &c.provider {
-        anyhow::ensure!(
-            crate::analysis::cost::preset(v).is_some(),
-            "unknown pricing provider `{v}` (aws-s3, gcs, azure-blob, cloudflare-r2, backblaze-b2, aliyun-oss)"
-        );
-        cs.provider = Some(v.clone());
+        cs.provider = Some(crate::input::provider(v)?.to_owned());
     }
     if let Some(v) = c.monthly_ops {
-        cs.monthly_ops = v;
+        cs.monthly_ops = crate::input::non_negative("--monthly-ops", &v.to_string())?;
     }
     if let Some(v) = c.egress_fraction {
-        cs.egress_fraction = v;
+        cs.egress_fraction = crate::input::share("--egress-fraction", &v.to_string())?;
     }
     if let Some(v) = c.stored_gib {
-        cs.stored_gib = v;
+        cs.stored_gib = crate::input::non_negative("--stored-gib", &v.to_string())?;
     }
-    p.validate()?;
-    Ok(p)
+    Ok(())
 }
 
 /// Install a Ctrl-C handler: first press cancels gracefully (cleanup still runs), second exits.
@@ -780,17 +850,7 @@ fn install_ctrl_c(cancel: crate::engine::Cancel) {
 
 /// A share given as `1%`, `0.5 %` or a fraction (`0.01`).
 fn parse_rate(flag: &str, v: &str) -> Result<f64> {
-    let t = v.trim();
-    let r = match t.strip_suffix('%') {
-        Some(p) => p.trim().parse::<f64>().map(|x| x / 100.0),
-        None => t.parse::<f64>(),
-    }
-    .map_err(|_| anyhow::anyhow!("invalid {flag} `{v}` (examples: 1%, 0.01)"))?;
-    anyhow::ensure!(
-        (0.0..=1.0).contains(&r),
-        "{flag} must be between 0% and 100%"
-    );
-    Ok(r)
+    Ok(crate::input::share(flag, v)?)
 }
 
 /// Apply `--sla`, `--max-error-rate`, `--max-throttle-rate` and `--p99-ms` to the profile.
@@ -805,9 +865,71 @@ pub fn apply_sla(p: &mut Profile, a: &SlaArgs) -> Result<()> {
         p.sla.max_throttle_rate = Some(parse_rate("--max-throttle-rate", v)?);
     }
     if let Some(ms) = a.p99_ms {
-        p.sla.p99_ms = Some(ms);
+        p.sla.p99_ms = Some(crate::input::positive("--p99-ms", &ms.to_string())?);
     }
     p.sla.validate()
+}
+
+/// The profile `oprobe run` measures: built from the flags (and `[defaults]`), or — with
+/// `--from RUNREF` — the stored run's spec with its target resolved again (credentials come
+/// from the target, never from the spec) and the given flags on top; `--set` pairs last.
+/// Returns the configured target name.
+pub fn run_profile(ctx: &Ctx, a: &RunArgs) -> Result<(Profile, Option<String>)> {
+    let sets = crate::model::Overrides::parse(&a.set)?;
+    let (mut p, name) = match &a.from {
+        Some(r) => replay_profile(ctx, r, a)?,
+        None => {
+            let (mut p, name) = resolve_profile(ctx, &a.target, &a.workload, &a.knobs, &a.cost)?;
+            apply_sla(&mut p, &a.sla)?;
+            (p, name)
+        }
+    };
+    if a.output.label.is_some() {
+        p.name = a.output.label.clone();
+    }
+    let mut label = p.name.clone();
+    sets.apply(&mut p, &mut label)?;
+    p.name = label;
+    p.validate()?;
+    Ok((p, name))
+}
+
+/// `run --from RUNREF`: the stored spec, the target re-resolved, the flags on top.
+fn replay_profile(ctx: &Ctx, r: &str, a: &RunArgs) -> Result<(Profile, Option<String>)> {
+    use crate::model::spec::REDACTED;
+    let run = ctx.store().load(r)?;
+    let spec = run.report.spec;
+    let mut ta = a.target.clone();
+    let same = ta.target.is_none() || ta.target.as_deref() == Some(spec.target_ref.as_str());
+    if ta.target.is_none() {
+        ta.target = Some(spec.target_ref.clone());
+    }
+    let (ta, name) = resolve_target(&ta, ctx.config()?)?;
+    let url = ta.target.clone().ok_or_else(|| {
+        OprobeError::new(
+            ErrorCode::UsageUnknownTarget,
+            "the stored run names no target",
+        )
+    })?;
+    let mut p = spec.resolved_profile();
+    let mut tgt = TargetSpec::from_url(&url)?;
+    if same {
+        let st = &spec.profile.target;
+        for (k, v) in &st.options {
+            if v != REDACTED {
+                tgt.options.insert(k.clone(), v.clone());
+            }
+        }
+        tgt.insecure = st.insecure;
+        tgt.ca_cert = st.ca_cert.clone();
+        if st.proxy.is_some() {
+            tgt.proxy = st.proxy.clone();
+        }
+    }
+    p.target = tgt;
+    apply_flags(&mut p, &ta, &a.workload, &a.knobs, &a.cost)?;
+    apply_sla(&mut p, &a.sla)?;
+    Ok((p, name))
 }
 
 /// The tuner's search settings, as text the user typed (flags or the app's Tune page).

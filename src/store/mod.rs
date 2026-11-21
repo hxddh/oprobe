@@ -8,6 +8,7 @@
 pub mod baselines;
 pub mod config;
 pub mod runs;
+pub mod target_id;
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -17,6 +18,7 @@ use anyhow::{Context, Result};
 pub use baselines::{Baseline, Baselines};
 pub use config::{ConfigFile, Defaults, TargetEntry};
 pub use runs::{RunStore, RunSummary, read_run_file, resolve_run, write_run_file};
+pub use target_id::TargetId;
 
 /// Environment variable overriding the config file path.
 pub const ENV_CONFIG: &str = "OPROBE_CONFIG";
@@ -65,6 +67,11 @@ impl Paths {
 
     pub fn baselines_file(&self) -> PathBuf {
         self.data_dir.join("baselines.toml")
+    }
+
+    /// Ceilings learned per target and workload (`analysis::capacity`).
+    pub fn capacity_file(&self) -> PathBuf {
+        self.data_dir.join("capacity.toml")
     }
 
     /// The run store under this data directory.

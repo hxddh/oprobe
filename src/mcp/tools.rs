@@ -28,8 +28,8 @@ use crate::guard::{Budgets, Plan};
 use crate::model::{Report, RunId};
 use crate::output::Output;
 use crate::report::diff::Thresholds;
-use crate::store::RunSummary;
-use crate::util::{ByteSize, fmt_ms, parse_duration};
+use crate::store::{RunSummary, TargetId};
+use crate::util::fmt_ms;
 
 // ---------------------------------------------------------------------------------------
 // Inputs
@@ -349,8 +349,8 @@ pub struct RunStatusOut {
     pub summary: Option<RunSummary>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub report: Option<Box<Report>>,
-    /// Suggested next tool calls.
-    pub next: Vec<String>,
+    /// Suggested next steps (each with its MCP call and CLI command).
+    pub next: Vec<crate::output::NextStep>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -471,7 +471,7 @@ pub const SPECS: &[ToolSpec] = &[
         read_only: true,
         open_world: true,
         input: input::<DoctorIn>,
-        output: output::<crate::cli::doctor::DoctorOutput>,
+        output: output::<crate::output::Envelope<crate::cli::doctor::DoctorOutput>>,
     },
     ToolSpec {
         name: "probe_endpoint",
@@ -481,7 +481,7 @@ pub const SPECS: &[ToolSpec] = &[
         read_only: true,
         open_world: true,
         input: input::<ProbeIn>,
-        output: output::<crate::net::probe::ProbeReport>,
+        output: output::<crate::output::Envelope<crate::net::probe::ProbeReport>>,
     },
     ToolSpec {
         name: "plan_run",
@@ -541,7 +541,7 @@ pub const SPECS: &[ToolSpec] = &[
         read_only: true,
         open_world: false,
         input: input::<ExplainIn>,
-        output: output::<ExplainRun>,
+        output: output::<crate::output::Envelope<ExplainRun>>,
     },
     ToolSpec {
         name: "analyze_run",
@@ -591,7 +591,7 @@ pub const SPECS: &[ToolSpec] = &[
         read_only: false,
         open_world: true,
         input: input::<CleanupIn>,
-        output: output::<crate::cli::misc::CleanupOutput>,
+        output: output::<crate::output::Envelope<crate::cli::misc::CleanupOutput>>,
     },
     ToolSpec {
         name: "list_targets",
@@ -706,19 +706,12 @@ fn err(e: anyhow::Error) -> ErrorBody {
 // --- helpers --------------------------------------------------------------------------
 
 fn http_arg(v: Option<&str>) -> anyhow::Result<Option<HttpArg>> {
-    Ok(match v.map(|s| s.trim().to_ascii_lowercase()) {
+    Ok(match v {
         None => None,
-        Some(s) => Some(match s.as_str() {
-            "auto" => HttpArg::Auto,
-            "h1" | "http1" | "http/1.1" => HttpArg::H1,
-            "h2" | "http2" => HttpArg::H2,
-            _ => {
-                return Err(OprobeError::new(
-                    ErrorCode::UsageInvalidArgument,
-                    format!("invalid http `{s}` (auto, h1, h2)"),
-                )
-                .into());
-            }
+        Some(s) => Some(match crate::input::http_version(s)? {
+            crate::net::HttpVersion::Auto => HttpArg::Auto,
+            crate::net::HttpVersion::H1 => HttpArg::H1,
+            crate::net::HttpVersion::H2 => HttpArg::H2,
         }),
     })
 }
@@ -802,47 +795,96 @@ fn profile_of(
         ..Default::default()
     };
     let ctx = st.ctx();
-    crate::cli::resolve_profile(&ctx, &target_args(t), &wa, &ka, &ca).map_err(|e| {
-        // Everything here comes from the call's arguments.
-        if crate::errors::classify(&e, "s3").code == ErrorCode::Internal {
-            OprobeError::new(ErrorCode::UsageInvalidArgument, format!("{e:#}")).into()
-        } else {
-            e
-        }
-    })
+    // The same parsers and codes as the CLI: no remapping here (design v4 §8).
+    crate::cli::resolve_profile(&ctx, &target_args(t), &wa, &ka, &ca)
 }
 
-/// Whether `url` starts with `prefix` at a path boundary.
-fn url_prefix(url: &str, prefix: &str) -> bool {
-    url == prefix
-        || (url.starts_with(prefix)
-            && (prefix.ends_with('/') || url[prefix.len()..].starts_with('/')))
+/// The identity of a configured target (its URL, endpoint and options).
+fn entry_id(e: &crate::store::TargetEntry) -> Option<TargetId> {
+    if let Some(id) = TargetId::parse(&e.url).ok().filter(|i| i.scheme == "lab") {
+        return Some(id);
+    }
+    let mut t = crate::config::TargetSpec::from_url(&e.url).ok()?;
+    if let Some(ep) = &e.endpoint {
+        t.options.insert("endpoint".into(), ep.clone());
+    }
+    for (k, v) in &e.options {
+        t.options.insert(k.clone(), v.clone());
+    }
+    TargetId::of(&t).ok()
 }
 
-/// `--allow-target`: `given` (as the caller typed it) or its URL must be allowed.
-fn check_allowed(cfg: &McpConfig, given: &str, url: Option<&str>) -> anyhow::Result<()> {
-    if allowed(cfg, given, url) {
+/// Whether one `--allow-target` entry allows `given` (as typed) at identity `id`: a URL entry
+/// (or a local path) contains `id` on whole path segments after both are normalised
+/// (`store::TargetId`); a name entry matches the name, or contains `id` as its target does.
+fn entry_allows(
+    entry: &str,
+    config: Option<&crate::store::ConfigFile>,
+    given: &str,
+    id: Option<&TargetId>,
+) -> bool {
+    let named = config.and_then(|c| c.target(entry));
+    if named.is_none() && (entry.contains("://") || entry.contains('/') || entry.contains('\\')) {
+        return match (TargetId::parse(entry), id) {
+            (Ok(a), Some(i)) => a.contains(i),
+            _ => false,
+        };
+    }
+    entry == given
+        || named
+            .and_then(entry_id)
+            .zip(id)
+            .is_some_and(|(a, i)| a.contains(i))
+}
+
+/// `--allow-target`: `given` (as the caller typed it) at identity `id` must be allowed.
+fn check_allowed(
+    cfg: &McpConfig,
+    config: Option<&crate::store::ConfigFile>,
+    given: &str,
+    id: Option<&TargetId>,
+) -> anyhow::Result<()> {
+    if allowed(cfg, config, given, id) {
         return Ok(());
     }
     Err(OprobeError::new(
         ErrorCode::SafetyRefused,
-        format!("target `{given}` is not allowed on this MCP server"),
+        format!(
+            "target `{given}` is not allowed on this MCP server{}",
+            id.map(|i| format!(" (it resolves to {i})"))
+                .unwrap_or_default()
+        ),
     )
     .with_hint(format!("allowed: {}", cfg.allow_targets.join(", ")))
     .into())
 }
 
-fn allowed(cfg: &McpConfig, given: &str, url: Option<&str>) -> bool {
+fn allowed(
+    cfg: &McpConfig,
+    config: Option<&crate::store::ConfigFile>,
+    given: &str,
+    id: Option<&TargetId>,
+) -> bool {
     cfg.allow_targets.is_empty()
-        || cfg.allow_targets.iter().any(|a| {
-            a == given
-                || (a.contains("://")
-                    && (url_prefix(given, a) || url.is_some_and(|u| url_prefix(u, a))))
-        })
+        || cfg
+            .allow_targets
+            .iter()
+            .any(|a| entry_allows(a, config, given, id))
 }
 
-fn target_url(p: &Profile, given: &str) -> String {
-    p.target.url.clone().unwrap_or_else(|| given.to_owned())
+/// A target identity, or the `safety.refused` error of a target that leaves its root.
+fn identity(t: &crate::config::TargetSpec, given: &str) -> anyhow::Result<TargetId> {
+    TargetId::of(t).map_err(|e| {
+        OprobeError::new(
+            ErrorCode::SafetyRefused,
+            format!(
+                "target `{given}` is refused on this MCP server: {}",
+                e.message
+            ),
+        )
+        .with_hint("pass the target without `..` segments")
+        .into()
+    })
 }
 
 /// Options that never change where requests go or which bucket/root they touch.
@@ -891,18 +933,34 @@ fn check_target(st: &State, t: &TargetIn, effective: &Profile) -> anyhow::Result
         ..Default::default()
     };
     let ctx = st.ctx();
-    let (ta, _) = crate::cli::resolve_target(&target_args(&bare), ctx.config()?)?;
+    let config = ctx.config()?;
+    let (ta, _) = crate::cli::resolve_target(&target_args(&bare), config)?;
     let reference = crate::cli::build_profile(
         &ta,
         &WorkloadArgs::default(),
         &KnobArgs::default(),
         &CostArgs::default(),
     )?;
-    check_allowed(
-        &st.cfg,
-        &bare_given,
-        Some(&target_url(&reference, &bare_given)),
-    )?;
+    // Both sides normalised (`..`, `//`, `./`, case, default ports, trailing `/`): what the
+    // run would really touch must lie inside an allowed location (SEC-1, MCP-1).
+    let id = identity(&effective.target, &bare_given)?;
+    check_allowed(&st.cfg, Some(config), &bare_given, Some(&id))?;
+    if let Some(prefix) = effective.workload.effective_dataset().existing_prefix {
+        let leaves = prefix.split(['/', '\\']).any(|seg| seg == "..");
+        let inside = id
+            .join(&prefix)
+            .is_ok_and(|e| allowed(&st.cfg, Some(config), &bare_given, Some(&e)));
+        if leaves || !inside {
+            return Err(OprobeError::new(
+                ErrorCode::SafetyRefused,
+                format!(
+                    "`existing: {prefix}` leaves the allowed target `{bare_given}` on this MCP server"
+                ),
+            )
+            .with_hint("pass a prefix below the target root, without `..` segments")
+            .into());
+        }
+    }
     let diff = identity_diff(&reference.target, &effective.target);
     if diff.is_empty() {
         return Ok(());
@@ -924,7 +982,9 @@ fn check_target(st: &State, t: &TargetIn, effective: &Profile) -> anyhow::Result
 /// `--allow-target` for `probe_endpoint`: the endpoint must be allowed, and no proxy or TLS
 /// override may be given.
 fn check_probe(cfg: &McpConfig, a: &ProbeIn) -> anyhow::Result<()> {
-    check_allowed(cfg, &a.endpoint, Some(&a.endpoint))?;
+    let id = TargetId::parse(&a.endpoint).ok();
+    let config = crate::store::ConfigFile::load(&cfg.paths.config_file).ok();
+    check_allowed(cfg, config.as_ref(), &a.endpoint, id.as_ref())?;
     if !cfg.allow_targets.is_empty() && (a.insecure || a.proxy.is_some()) {
         return Err(OprobeError::new(
             ErrorCode::SafetyRefused,
@@ -969,11 +1029,10 @@ fn min_opt<T: PartialOrd + Copy>(a: Option<T>, b: Option<T>) -> Option<T> {
 }
 
 fn bad(flag: &str, e: anyhow::Error) -> anyhow::Error {
-    OprobeError::new(
-        ErrorCode::UsageInvalidArgument,
-        format!("invalid {flag}: {e:#}"),
-    )
-    .into()
+    let b = crate::errors::classify(&e, "s3");
+    let mut o = OprobeError::new(b.code, format!("invalid {flag}: {}", b.message));
+    o.hint = b.hint;
+    o.into()
 }
 
 fn budgets_of(server: &Budgets, b: &BudgetIn) -> anyhow::Result<Budgets> {
@@ -986,15 +1045,15 @@ fn budgets_of(server: &Budgets, b: &BudgetIn) -> anyhow::Result<Budgets> {
     let bytes = b
         .max_bytes
         .as_deref()
-        .map(|v| v.parse::<ByteSize>().map(|x| x.0))
+        .map(|v| crate::input::size(v).map(|x| x.0))
         .transpose()
-        .map_err(|e| bad("max_bytes", e))?;
+        .map_err(|e| bad("max_bytes", e.into()))?;
     let dur = b
         .max_duration
         .as_deref()
-        .map(|v| parse_duration(v).map(|d| d.as_secs_f64()))
+        .map(|v| crate::input::duration(v).map(|d| d.as_secs_f64()))
         .transpose()
-        .map_err(|e| bad("max_duration", e))?;
+        .map_err(|e| bad("max_duration", e.into()))?;
     Ok(Budgets {
         max_cost_usd: min_opt(server.max_cost_usd, b.max_cost_usd),
         max_requests_count: min_opt(server.max_requests_count, b.max_requests),
@@ -1257,20 +1316,18 @@ fn status_of(st: &State, job: &Job, include_report: bool) -> RunStatusOut {
         _ => (None, None),
     };
     let _ = st;
+    use crate::output::NextStep;
+    let id = job.id.as_str();
     let next = match v.status {
-        JobStatus::Queued | JobStatus::Running => vec![format!(
-            "get_run {{\"run\": \"{}\"}} (poll every few seconds)",
-            job.id
-        )],
-        _ if v.path.is_some() => vec![
-            format!("explain_run {{\"run\": \"{}\"}}", job.id),
-            format!("analyze_run {{\"run\": \"{}\"}}", job.id),
-            format!(
-                "compare_runs {{\"baseline\": \"<previous run>\", \"candidate\": \"{}\"}}",
-                job.id
-            ),
+        JobStatus::Queued | JobStatus::Running => vec![
+            NextStep::new("poll every few seconds", format!("oprobe runs show {id}"))
+                .with_mcp("get_run", serde_json::json!({ "run": id })),
         ],
-        _ => vec!["doctor {\"target\": …} to check the target".into()],
+        _ if v.path.is_some() => finished_steps(id),
+        _ => vec![
+            NextStep::new("list stored runs", "oprobe runs list")
+                .with_mcp("list_runs", serde_json::json!({})),
+        ],
     };
     RunStatusOut {
         run_id: job.id.clone(),
@@ -1286,6 +1343,28 @@ fn status_of(st: &State, job: &Job, include_report: bool) -> RunStatusOut {
         report,
         next,
     }
+}
+
+/// Next steps of a finished, stored run.
+fn finished_steps(id: &str) -> Vec<crate::output::NextStep> {
+    use crate::output::NextStep;
+    vec![
+        NextStep::new("explain the run", format!("oprobe explain {id}"))
+            .with_mcp("explain_run", serde_json::json!({ "run": id })),
+        NextStep::new(
+            "attribute the slowest requests",
+            format!("oprobe analyze {id}"),
+        )
+        .with_mcp("analyze_run", serde_json::json!({ "run": id })),
+        NextStep::new(
+            "compare with the previous run",
+            format!("oprobe compare last~1 {id}"),
+        )
+        .with_mcp(
+            "compare_runs",
+            serde_json::json!({ "baseline": "last~1", "candidate": id }),
+        ),
+    ]
 }
 
 fn status_text(s: &RunStatusOut) -> String {
@@ -1499,10 +1578,7 @@ fn get_run(st: &Arc<State>, a: GetRunIn) -> anyhow::Result<Reply> {
         path: Some(path.display().to_string()),
         summary: Some(RunSummary::from(&run.report)),
         report: include.then(|| Box::new(run.report)),
-        next: vec![
-            format!("explain_run {{\"run\": \"{id}\"}}"),
-            format!("analyze_run {{\"run\": \"{id}\"}}"),
-        ],
+        next: finished_steps(&id),
     };
     let text = status_text(&out);
     reply(&out, text)
@@ -1584,7 +1660,10 @@ fn explain_run(st: &Arc<State>, a: ExplainIn) -> anyhow::Result<Reply> {
     let run = load_run(st, &a.run)?;
     let e = explain::explain_run(&run, a.top.unwrap_or(3));
     let text = e.narrative.join("\n");
-    reply(&e, text)
+    Ok(Reply {
+        structured: crate::output::envelope_value(&e, Vec::new()),
+        text,
+    })
 }
 
 fn analyze_run(st: &Arc<State>, a: AnalyzeIn) -> anyhow::Result<Reply> {
@@ -1764,7 +1843,7 @@ fn list_targets(st: &Arc<State>) -> anyhow::Result<Reply> {
             options: crate::util::redact_options(&t.options)
                 .into_iter()
                 .collect(),
-            allowed: allowed(&st.cfg, n, Some(&t.url)),
+            allowed: allowed(&st.cfg, Some(cfg), n, entry_id(t).as_ref()),
         })
         .collect();
     let out = TargetsOut {
@@ -1826,17 +1905,23 @@ mod tests {
             },
             max_concurrent_runs: 1,
         };
-        assert!(allowed(&cfg, "anything", None));
+        let id = |u: &str| TargetId::parse(u).unwrap();
+        let ok = |cfg: &McpConfig, given: &str| allowed(cfg, None, given, Some(&id(given)));
+        assert!(allowed(&cfg, None, "anything", None));
         cfg.allow_targets = vec!["prod".into(), "s3://bench".into()];
-        assert!(allowed(&cfg, "prod", None));
-        assert!(allowed(&cfg, "s3://bench/x", Some("s3://bench/x")));
-        assert!(allowed(&cfg, "s3://bench", None));
-        assert!(!allowed(
-            &cfg,
-            "s3://bench-evil/x",
-            Some("s3://bench-evil/x")
-        ));
-        assert!(!allowed(&cfg, "memory://", Some("memory://")));
+        assert!(allowed(&cfg, None, "prod", None));
+        assert!(ok(&cfg, "s3://bench/x"));
+        assert!(ok(&cfg, "s3://bench"));
+        assert!(!ok(&cfg, "s3://bench-evil/x"));
+        assert!(!ok(&cfg, "memory://"));
+        // Normalised on both sides (MCP-1): case, trailing slash, default port, `//`, `./`.
+        assert!(ok(&cfg, "S3://BENCH/x/"));
+        assert!(ok(&cfg, "s3://bench//x/./y"));
+        assert!(!ok(&cfg, "s3://bench2/x"));
+        cfg.allow_targets = vec!["S3://Bench/Data/".into()];
+        assert!(ok(&cfg, "s3://bench/Data/x"));
+        assert!(!ok(&cfg, "s3://bench/data/x"), "paths are case-sensitive");
+        assert!(!ok(&cfg, "s3://bench/Database"));
     }
 
     fn allow_state(dir: &std::path::Path, allow: &[&str]) -> State {
@@ -1910,6 +1995,55 @@ mod tests {
             ..Default::default()
         };
         assert!(check_probe(&st.cfg, &probe).is_err());
+    }
+
+    /// SEC-1 / MCP-1: `..`, `//`, `./`, case, ports and `existing: ../` never escape an
+    /// allowed location.
+    #[test]
+    fn allowlist_bypasses_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().display().to_string().replace('\\', "/");
+        let allowed_url = format!("fs://{root}/allowed/");
+        let st = allow_state(dir.path(), &[allowed_url.as_str(), "s3://bench/oprobe"]);
+        let t = |target: &str| TargetIn {
+            target: target.into(),
+            ..Default::default()
+        };
+        let refused = Err(ErrorCode::SafetyRefused);
+        assert_eq!(check(&st, t(&format!("fs://{root}/allowed/run"))), Ok(()));
+        assert_eq!(check(&st, t(&format!("fs://{root}/allowed"))), Ok(()));
+        // The 3.0 bypass: a raw prefix test let this write into `other/`.
+        assert_eq!(
+            check(&st, t(&format!("fs://{root}/allowed/../other"))),
+            refused
+        );
+        assert_eq!(
+            check(&st, t(&format!("fs://{root}//allowed/./../other"))),
+            refused
+        );
+        assert_eq!(check(&st, t(&format!("fs://{root}/allowed-evil"))), refused);
+        assert_eq!(check(&st, t("s3://bench/oprobe/x")), Ok(()));
+        assert_eq!(check(&st, t("S3://BENCH/oprobe/x/")), Ok(()));
+        assert_eq!(check(&st, t("s3://bench//oprobe/./x")), Ok(()));
+        assert_eq!(check(&st, t("s3://bench/oprobe/../prod")), refused);
+        assert_eq!(check(&st, t("s3://bench/prod")), refused);
+        // `existing` with `..` is refused; a prefix inside the root is fine.
+        let with_existing = |target: &str, existing: &str| {
+            let tin = t(target);
+            let w = WorkloadIn {
+                existing: Some(existing.into()),
+                ..Default::default()
+            };
+            let (p, _) = profile_of(&st, &tin, &w).unwrap();
+            check_target(&st, &tin, &p).map_err(|e| crate::errors::classify(&e, "s3").code)
+        };
+        assert_eq!(with_existing("s3://bench/oprobe", "tables/events/"), Ok(()));
+        assert_eq!(with_existing("s3://bench/oprobe", "../../prod/"), refused);
+        assert_eq!(with_existing("s3://bench/oprobe", "x/../../prod"), refused);
+        assert_eq!(
+            with_existing(&format!("fs://{root}/allowed"), "../other"),
+            refused
+        );
     }
 
     #[test]

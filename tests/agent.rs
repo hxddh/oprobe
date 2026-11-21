@@ -61,6 +61,9 @@ fn checked_in_schemas_match_the_code() {
     );
 }
 
+/// Types embedded in the report whose field names are input names (not unit-suffixed).
+const INPUT_MODELS: &[&str] = &["Profile"];
+
 /// Design §6: every numeric property of the report carries its unit in its name.
 #[test]
 fn report_schema_numeric_fields_carry_units() {
@@ -96,7 +99,9 @@ fn report_schema_numeric_fields_carry_units() {
     ) {
         if let Some(r) = s.get("$ref").and_then(Value::as_str) {
             let name = r.rsplit('/').next().unwrap().to_owned();
-            if seen.contains(&name) {
+            // `report.spec.profile` is the profile (TOML) model: its keys are the config
+            // file's input names (`concurrency`, `objects`, …), documented in docs/workloads.md.
+            if seen.contains(&name) || INPUT_MODELS.contains(&name.as_str()) {
                 return;
             }
             seen.push(name.clone());
@@ -289,7 +294,7 @@ fn json_only_agent_workflow_validates_against_the_schemas() {
     let rs: Value = serde_json::from_slice(&report_schema.stdout).unwrap();
     assert_eq!(
         rs["$id"],
-        "https://github.com/hxddh/oprobe/schemas/3/report.json"
+        "https://github.com/hxddh/oprobe/schemas/4/report.json"
     );
 
     // 2. Preflight and plan.
@@ -325,11 +330,11 @@ fn json_only_agent_workflow_validates_against_the_schemas() {
             > 0
     );
     assert!(
-        ex["next_commands"]
+        ex["next"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|c| c.as_str().unwrap().contains(&id2))
+            .any(|c| c["cli"].as_str().unwrap().contains(&id2) && c["mcp"]["tool"].is_string())
     );
     let code = env.json(&["explain", "throttling"], "explain", 0);
     assert_eq!(code["kind"], "finding_code");

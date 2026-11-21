@@ -97,7 +97,7 @@ fn run_saves_the_run_and_prints_one_json_document() {
     assert!(o.status.success(), "{}", stderr(&o));
     let v = json(&o);
     let id = v["run_id"].as_str().unwrap().to_owned();
-    assert_eq!(v["report"]["schema"], "oprobe.report/3");
+    assert_eq!(v["report"]["schema"], "oprobe.report/4");
     assert_eq!(v["report"]["run"]["id"], id.as_str());
     assert_eq!(v["report"]["run"]["label"], "first");
     for key in [
@@ -266,7 +266,7 @@ fn ndjson_streams_events_then_the_result() {
     assert!(lines.iter().any(|l| l["type"] == "progress"));
     let last = lines.last().unwrap();
     assert_eq!(last["type"], "result");
-    assert_eq!(last["report"]["schema"], "oprobe.report/3");
+    assert_eq!(last["report"]["schema"], "oprobe.report/4");
     assert!(Path::new(last["path"].as_str().unwrap()).is_file());
 }
 
@@ -665,7 +665,7 @@ fn demo_narrates_and_saves_a_run() {
     assert_eq!(env.runs().len(), 1);
     let o = env.run(&["demo", "--duration", "1s", "-o", "json"]);
     let v = json(&o);
-    assert_eq!(v["report"]["schema"], "oprobe.report/3");
+    assert_eq!(v["report"]["schema"], "oprobe.report/4");
     assert!(v["steps"].as_array().unwrap().len() >= 4);
 }
 

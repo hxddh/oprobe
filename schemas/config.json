@@ -141,7 +141,7 @@
       "type": "object"
     }
   },
-  "$id": "https://github.com/hxddh/oprobe/schemas/3/config.json",
+  "$id": "https://github.com/hxddh/oprobe/schemas/4/config.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "description": "The config file (config.toml): [defaults] and [targets.NAME]",

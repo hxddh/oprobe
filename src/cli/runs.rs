@@ -25,6 +25,10 @@ pub struct RunsList {
 }
 
 impl CommandOutput for RunsList {
+    fn formats() -> &'static [crate::output::OutputFormat] {
+        crate::output::WITH_MD
+    }
+
     fn text(&self) -> String {
         if self.runs.is_empty() {
             return format!(
@@ -173,6 +177,10 @@ pub struct RunReportOnly {
 }
 
 impl CommandOutput for RunShow {
+    fn formats() -> &'static [crate::output::OutputFormat] {
+        crate::output::WITH_MD_HTML
+    }
+
     fn text(&self) -> String {
         match &self.full {
             Some(run) => terminal::render_run_with(run, self.detail),
@@ -368,6 +376,10 @@ pub fn cmd_gc(a: RunsGcArgs, ctx: &Ctx) -> Result<u8> {
 }
 
 impl CommandOutput for DiffReport {
+    fn formats() -> &'static [crate::output::OutputFormat] {
+        crate::output::WITH_MD_HTML
+    }
+
     fn text(&self) -> String {
         self.render_terminal()
     }

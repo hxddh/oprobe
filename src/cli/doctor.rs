@@ -143,11 +143,16 @@ pub struct DoctorOutput {
     pub warned_count: u64,
     /// No check failed: the target can be benchmarked.
     pub ready: bool,
-    /// A command to run next.
-    pub next_command: String,
+    /// What to run next (the JSON envelope's `next`).
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub next: Vec<crate::output::NextStep>,
 }
 
 impl CommandOutput for DoctorOutput {
+    fn next(&self) -> Vec<crate::output::NextStep> {
+        self.next.clone()
+    }
     fn text(&self) -> String {
         let mut o = format!("{} {}\n", bold("oprobe doctor"), self.target);
         for c in &self.checks {
@@ -191,7 +196,9 @@ impl CommandOutput for DoctorOutput {
         } else {
             let _ = writeln!(o, "{} {} check(s) failed", red("●"), self.failed_count);
         }
-        let _ = writeln!(o, "  next: {}", bold(&self.next_command));
+        if let Some(n) = self.next.first() {
+            let _ = writeln!(o, "  next: {}", bold(&n.cli));
+        }
         o
     }
     fn exit_code(&self) -> u8 {
@@ -378,7 +385,7 @@ pub async fn doctor(mut target: TargetSpec, read_only: bool, target_arg: &str) -
         failed_count: 0,
         warned_count: 0,
         ready: false,
-        next_command: String::new(),
+        next: Vec::new(),
     };
     run_checks(&mut target, read_only, &mut c, &mut out).await;
     out.failed_count = c
@@ -398,13 +405,33 @@ pub async fn doctor(mut target: TargetSpec, read_only: bool, target_arg: &str) -
     } else {
         target_arg.to_owned()
     };
-    out.next_command = if !out.ready {
-        format!("oprobe doctor {arg}   # again, after fixing the failed checks")
+    use crate::output::NextStep;
+    let target = serde_json::json!({ "target": target_arg });
+    out.next = vec![if !out.ready {
+        NextStep::new(
+            "check again after fixing the failed checks",
+            format!("oprobe doctor {arg}"),
+        )
+        .with_mcp("doctor", target)
     } else if read_only || out.permissions.write != Access::Allowed {
-        format!("oprobe run {arg} --existing <PREFIX>   # read-only: measure your own objects")
+        NextStep::new(
+            "read-only: measure your own objects",
+            format!("oprobe run {arg} --existing <PREFIX>"),
+        )
+        .with_mcp(
+            "start_run",
+            serde_json::json!({ "target": target_arg, "existing": "<PREFIX>" }),
+        )
     } else {
-        format!("oprobe run {arg} --preset mixed --duration 30s")
-    };
+        NextStep::new(
+            "measure a mixed workload",
+            format!("oprobe run {arg} --preset mixed --duration 30s"),
+        )
+        .with_mcp(
+            "start_run",
+            serde_json::json!({ "target": target_arg, "preset": "mixed", "duration": "30s" }),
+        )
+    }];
     out
 }
 

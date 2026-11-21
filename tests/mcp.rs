@@ -272,7 +272,7 @@ fn agent_workflow_over_stdio() {
     assert!(started["plan"].is_object());
     let done = m.wait_run(&id1);
     assert_eq!(done["status"], "succeeded", "{done}");
-    assert_eq!(done["report"]["schema"], "oprobe.report/3");
+    assert_eq!(done["report"]["schema"], "oprobe.report/4");
     assert_eq!(done["report"]["run"]["label"], "first");
     assert_eq!(done["summary"]["id"], id1.as_str());
     // Give the last notifications a moment, then check progress arrived in order.
@@ -299,7 +299,8 @@ fn agent_workflow_over_stdio() {
     let ex = m.tool("explain_run", json!({"run": id1}));
     assert_eq!(ex["run_id"], id1.as_str());
     assert!(!ex["narrative"].as_array().unwrap().is_empty());
-    assert!(!ex["next_commands"].as_array().unwrap().is_empty());
+    assert!(!ex["next"].as_array().unwrap().is_empty());
+    assert!(ex["next"][0]["mcp"]["tool"].is_string(), "{ex}");
     let an = m.tool("analyze_run", json!({"run": "last", "slowest_pct": 5.0}));
     assert!(an["attribution"]["selected_count"].as_u64().unwrap() > 0);
     assert!(an["selection"]["min_total_us"].is_u64());
@@ -370,7 +371,7 @@ fn agent_workflow_over_stdio() {
     let schema: Value = serde_json::from_str(&schema).unwrap();
     assert_eq!(
         schema["$id"],
-        "https://github.com/hxddh/oprobe/schemas/3/report.json"
+        "https://github.com/hxddh/oprobe/schemas/4/report.json"
     );
     let (findings, _) = m.read("oprobe://docs/findings");
     assert!(findings.contains("throttling"));

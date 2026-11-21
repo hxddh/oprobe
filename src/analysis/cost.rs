@@ -7,7 +7,7 @@ use crate::config::CostSpec;
 use crate::trace::{BillingClass, Snapshot};
 
 /// Provider list prices in USD (request prices per million, data per GB = 1e9 bytes).
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Pricing {
     pub provider: String,

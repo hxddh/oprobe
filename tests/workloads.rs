@@ -223,7 +223,7 @@ fn lab_urls_resolve_to_an_in_process_server() {
         !toml.contains("endpoint") && !toml.contains("secret"),
         "{toml}"
     );
-    let e = TargetSpec::from_url("lab://nope").unwrap_err().to_string();
+    let e = full(TargetSpec::from_url("lab://nope").unwrap_err());
     assert!(
         e.contains("unknown lab scenario") && e.contains("stragglers"),
         "{e}"
@@ -258,7 +258,7 @@ fn every_compiled_service_resolves_from_its_url() {
         .unwrap_err();
     let e = format!("{e:#}");
     assert!(e.contains("endpoint"), "{e}");
-    let e = TargetSpec::from_url("ftp://x").unwrap_err().to_string();
+    let e = full(TargetSpec::from_url("ftp://x").unwrap_err());
     assert!(
         e.contains("unsupported storage scheme") && e.contains("azdls"),
         "{e}"
@@ -335,4 +335,16 @@ async fn lab_scenarios_inject_their_faults() {
         0
     );
     assert_eq!(s.summary.failed_ops, 0);
+}
+
+/// An error's message and hint (typed errors carry the choices in the hint).
+fn full(e: anyhow::Error) -> String {
+    let b = oprobe::errors::classify(&e, "s3");
+    assert_eq!(
+        b.code,
+        oprobe::errors::ErrorCode::UsageInvalidArgument,
+        "{}",
+        b.message
+    );
+    format!("{} {}", b.message, b.hint.unwrap_or_default())
 }

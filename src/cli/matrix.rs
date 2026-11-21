@@ -148,6 +148,10 @@ pub struct MatrixOutput {
 }
 
 impl CommandOutput for MatrixOutput {
+    fn formats() -> &'static [crate::output::OutputFormat] {
+        crate::output::WITH_MD
+    }
+
     fn text(&self) -> String {
         let keys: Vec<String> = self
             .cells

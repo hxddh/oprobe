@@ -45,7 +45,7 @@ pub fn render(r: &Report, run_id: &str) -> String {
             lines.push(format!("    {}", dim(&cut(&f.evidence.text, WIDTH - 4))));
         }
         lines.push(format!("    → {}", cut(&f.advice, WIDTH - 6)));
-        if let Some(c) = f.verification.as_ref().and_then(|v| v.command.as_ref()) {
+        if let Some(c) = f.verification.as_ref().map(|v| &v.rerun) {
             lines.push(format!("    {} {}", dim("next:"), cut(c, WIDTH - 10)));
         }
     }
@@ -101,6 +101,8 @@ mod tests {
     fn brief_fits_20_lines_of_80_columns() {
         set(false);
         let mut r = crate::model::Report {
+            spec: Default::default(),
+            capacity: Default::default(),
             schema: crate::model::REPORT_SCHEMA.into(),
             run: Default::default(),
             target: Default::default(),
@@ -138,7 +140,8 @@ mod tests {
                 advice: "a".repeat(120),
                 verification: Some(crate::model::Verification {
                     description: "d".into(),
-                    command: Some("oprobe run x ".repeat(20)),
+                    rerun: "oprobe run x ".repeat(20),
+                    ..Default::default()
                 }),
                 ..Default::default()
             });

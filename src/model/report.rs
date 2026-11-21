@@ -1,4 +1,5 @@
-//! Report v3 (`oprobe.report/3`, design §6): the machine-clean result of one run.
+//! Report v4 (`oprobe.report/4`, design v3 §6 and v4 §1/§3): the machine-clean result of one
+//! run, with the run's replayable spec (`spec`) and the capacity estimate (`capacity`).
 //!
 //! Rules: every numeric field name carries its unit (`_us`, `_ms`, `_s`, `_bytes`, `_per_s`,
 //! `_pct`, `_ratio` for dimensionless fractions, `_usd`, `_count`); no human-formatted strings
@@ -22,7 +23,7 @@ use crate::trace::{
 };
 
 /// Schema id of [`Report`].
-pub const REPORT_SCHEMA: &str = "oprobe.report/3";
+pub const REPORT_SCHEMA: &str = "oprobe.report/4";
 
 /// Unit suffixes a numeric report field name ends with (design §6). Each names its unit:
 /// `_us` / `_ms` / `_s` time; `_bytes`, `_mib`, `_gib` sizes (`_mib`/`_gib` only where the
@@ -30,15 +31,17 @@ pub const REPORT_SCHEMA: &str = "oprobe.report/3";
 /// `_per_s` rates (`ops_per_s`, `mib_per_s`, `requests_per_s`); `_pct` percent (0–100);
 /// `_ratio` dimensionless fractions and multipliers; `_usd` money; `_count` counts (also a
 /// count per something, e.g. `requests_per_op_count`, and maps of counts like
-/// `status_count`).
+/// `status_count`); `_mean` fractional means of counts (`inflight_mean`, v4 §4).
 pub const UNIT_SUFFIXES: &[&str] = &[
     "_us", "_ms", "_s", "_bytes", "_mib", "_gib", "_bps", "_per_s", "_pct", "_ratio", "_usd",
-    "_count",
+    "_count", "_mean",
 ];
 
 /// Numeric report fields that are not quantities and so carry no unit: identifiers
 /// (`id`, `*_id`, `*_ids`, `slowest` op ids, tune trial ids), codes (`exit_code`), the
-/// workload `seed`, relative mix `weight`s and the heatmap's `counts` matrix (named by §6).
+/// workload `seed`, relative mix `weight`s and the heatmap's `counts` matrix (named by §6);
+/// and values whose unit is a sibling `unit` field (`Expectation`, gate checks, tune deltas:
+/// `predicted`, `lo`, `hi`, `baseline`, `candidate`).
 pub const UNITLESS_FIELDS: &[&str] = &[
     "id",
     "op_ids",
@@ -49,6 +52,11 @@ pub const UNITLESS_FIELDS: &[&str] = &[
     "seed",
     "weight",
     "counts",
+    "predicted",
+    "lo",
+    "hi",
+    "baseline",
+    "candidate",
 ];
 
 /// Whether a numeric report field name follows the unit rule.
@@ -65,6 +73,8 @@ pub struct Report {
     /// Always [`REPORT_SCHEMA`].
     pub schema: String,
     pub run: RunInfo,
+    /// The replayable definition of the run (`oprobe run --from RUN`).
+    pub spec: super::spec::RunSpec,
     pub target: TargetInfo,
     pub workload: WorkloadInfo,
     pub knobs: KnobsInfo,
@@ -86,6 +96,9 @@ pub struct Report {
     pub timeline: Vec<TimelinePoint>,
     pub heatmap: Heatmap,
     pub findings: Vec<Finding>,
+    /// How much load the target takes: the in-flight ceiling and the per-op request shape.
+    #[serde(default)]
+    pub capacity: crate::analysis::capacity::Capacity,
     pub cost: CostReport,
     /// Op ids of the slowest operations (slowest first); their rows are in the run file.
     pub slowest: Vec<u64>,
@@ -114,12 +127,19 @@ impl Report {
         {
             v = inner.take();
         }
+        let bad = |m: String| -> anyhow::Error {
+            crate::errors::OprobeError::new(crate::errors::ErrorCode::UsageInvalidArgument, m)
+                .with_hint("reports of other oprobe versions are not read: re-run the workload with this oprobe")
+                .into()
+        };
         match v.get("schema").and_then(|s| s.as_str()) {
             Some(REPORT_SCHEMA) => {}
-            Some(other) => anyhow::bail!(
-                "report schema `{other}` is not supported; this oprobe reads `{REPORT_SCHEMA}` (re-run with this oprobe)"
-            ),
-            None => anyhow::bail!("not an oprobe report"),
+            Some(other) => {
+                return Err(bad(format!(
+                    "report schema `{other}` is not supported; this oprobe reads `{REPORT_SCHEMA}`"
+                )));
+            }
+            None => return Err(bad("not an oprobe report".into())),
         }
         if let Some(o) = v.as_object_mut() {
             o.remove("kind");
@@ -654,13 +674,8 @@ pub struct TimeWindow {
     pub to_s: f64,
 }
 
-/// A concrete way to test a finding's advice.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
-pub struct Verification {
-    pub description: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub command: Option<String>,
-}
+/// A concrete way to test a finding's advice (v4 §5).
+pub use crate::analysis::verification::{Expectation, Verification};
 
 impl From<&crate::analysis::diagnosis::Finding> for Finding {
     fn from(f: &crate::analysis::diagnosis::Finding) -> Self {

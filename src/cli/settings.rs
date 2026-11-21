@@ -181,6 +181,16 @@ pub async fn target_add(a: TargetAddArgs, ctx: &Ctx) -> Result<u8> {
     };
     entry.validate()?;
     let mut cfg = ctx.config()?.clone();
+    if cfg.targets.contains_key(&name) && !a.replace {
+        return Err(OprobeError::new(
+            ErrorCode::UsageInvalidArgument,
+            format!("target `{name}` already exists"),
+        )
+        .with_hint(format!(
+            "pass --replace to overwrite it, or remove it first with `oprobe target rm {name}`"
+        ))
+        .into());
+    }
     cfg.targets.insert(a.name.clone(), entry.clone());
     cfg.save(&ctx.paths.config_file)?;
     let text = ctx.out.format == crate::output::OutputFormat::Text;
