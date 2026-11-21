@@ -359,3 +359,228 @@ fn a_large_run_opens_fast_and_scrolls() {
     eprintln!("ui-perf: 100k-row run opened and listed in {open:?}");
     assert!(open < Duration::from_secs(20), "{open:?}");
 }
+
+// ---------------------------------------------------------------------------------------
+// oprobe 4.0 (design v4 §11)
+// ---------------------------------------------------------------------------------------
+
+/// Wait until `f` holds (polling the app), or fail after `secs`.
+fn wait_until(app: &mut Headless, secs: u64, what: &str, mut f: impl FnMut(&Headless) -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    while !f(app) {
+        assert!(Instant::now() < deadline, "timed out: {what}");
+        app.wait(Duration::from_millis(100)).unwrap();
+    }
+}
+
+/// The visible text views of the screen with their bounds.
+fn text_bounds(app: &Headless) -> Vec<(String, nsh_engine::Bounds<Points>)> {
+    app.screen()
+        .layout_nodes()
+        .into_iter()
+        .filter(|n| !n.hidden)
+        .filter_map(|n| n.text.as_ref().map(|t| (t.text.text.clone(), n.bounds)))
+        .collect()
+}
+
+#[test]
+fn the_palette_lists_every_command_with_the_menu_states() {
+    let cx = Ctx::new();
+    let mut app = cx.start();
+    app.wait_for("text:Try the demo").unwrap();
+    app.press("role:button[Commands]").unwrap();
+    for label in [
+        "Verify Top Finding",
+        "Open Run…",
+        "Switch Target…",
+        "Add Target…",
+        "Fix: Recommend Settings…",
+        "Export Run…",
+    ] {
+        app.wait_for(&format!("text:{label}"))
+            .unwrap_or_else(|e| panic!("{label}: {e}"));
+    }
+    // Nothing to verify yet: the palette shows it disabled (the menu's state, from
+    // `model::commands`), and choosing it does nothing.
+    app.press("text:Verify Top Finding").ok();
+    app.wait(Duration::from_millis(300)).unwrap();
+    assert!(app.shows("Try the demo"));
+    assert!(!app.shows("Verifying"));
+}
+
+#[test]
+fn single_letter_shortcuts_stay_out_of_text_fields() {
+    let cx = Ctx::new();
+    let a = cx.seed("memory://", 1, "2");
+    let b = cx.seed("memory://", 1, "2");
+    let mut app = cx.start_on(Idiom::Terminal, Size::new(Points(960.0), Points(480.0)));
+    wait_long(&mut app, "text:WHERE OPERATION TIME GOES");
+    // `/` focuses the filter; keys pressed there must not run `c` (compare), `n` (new run),
+    // `r` (run again) or `v` (verify): the keymap leaves them to the field.
+    app.press_key("/").unwrap();
+    app.wait_for("id:requests-table").unwrap();
+    app.wait(Duration::from_millis(200)).unwrap();
+    for k in ["c", "n", "r", "v"] {
+        app.press_key(k).unwrap();
+    }
+    app.wait(Duration::from_millis(300)).unwrap();
+    assert!(!app.shows("Pick two runs"), "c switched to Compare");
+    assert!(!app.shows("Start Run"), "n opened the New Run sheet");
+    assert!(!oprobe::ui::jobs_running(), "r started a run");
+    // The letters went into the field as text.
+    app.type_text("id:Filter requests", "api:c").unwrap();
+    assert_eq!(
+        app.screen().input_text("id:Filter requests").unwrap(),
+        Some("cnrvapi:c")
+    );
+    assert!(!app.shows("Pick two runs"), "typing c switched to Compare");
+    // Esc leaves the field; out of it, the same key acts.
+    app.press_key("escape").unwrap();
+    app.press_key("x").unwrap();
+    assert_eq!(
+        app.screen().input_text("id:Filter requests").unwrap(),
+        Some("cnrvapi:c"),
+        "Esc did not leave the field"
+    );
+    app.press("text:Overview").unwrap();
+    app.press_key("c").unwrap();
+    wait_long(&mut app, &format!("text:{a} → {b}"));
+}
+
+#[test]
+fn rerun_replays_the_runs_spec_without_loss() {
+    let cx = Ctx::new();
+    let id = cx.seed("memory://", 1, "3");
+    let before = load(&cx.store(), &id).report.spec;
+    let mut app = cx.start();
+    wait_long(&mut app, "text:WHERE OPERATION TIME GOES");
+    app.press("role:button[Re-run]").unwrap();
+    wait_until(&mut app, 120, "the re-run is saved", |_| {
+        cx.store().list().map(|l| l.len() == 2).unwrap_or(false)
+    });
+    let runs = cx.store().list().unwrap();
+    let after = load(&cx.store(), &runs[0].id).report.spec;
+    assert_ne!(runs[0].id, id);
+    assert_eq!(after.workload_hash(), before.workload_hash());
+    assert_eq!(after.hash(), before.hash());
+    assert_eq!(after.seed, before.seed);
+    assert_eq!(after.profile.knobs, before.profile.knobs);
+    assert_eq!(after.target_ref, before.target_ref);
+}
+
+#[test]
+fn compare_pairs_the_same_target_and_workload_by_default() {
+    let cx = Ctx::new();
+    let a = cx.seed("memory://", 1, "2");
+    // Another workload in between (a different duration): never the default partner.
+    cx.seed("memory://", 2, "2");
+    let c = cx.seed("memory://", 1, "2");
+    let mut app = cx.start();
+    wait_long(&mut app, "text:WHERE OPERATION TIME GOES");
+    app.press("role:button[Compare] >> nth=0").unwrap();
+    wait_long(&mut app, &format!("text:{a} → {c}"));
+    app.wait_for("text:/^CHANGES \\(regression gate/").unwrap();
+    assert!(!app.shows("not comparable"));
+}
+
+#[test]
+fn a_budget_stop_keeps_the_partial_run_with_a_badge() {
+    let cx = Ctx::new();
+    std::fs::write(
+        cx.dir.path().join("config.toml"),
+        "[defaults.budgets]\nmax_requests = 40\n",
+    )
+    .unwrap();
+    let mut app = cx.start();
+    app.wait_for("text:Try the demo").unwrap();
+    app.press("role:button[Run]").unwrap();
+    app.wait_for("id:Target").unwrap();
+    app.clear("id:Target").unwrap();
+    app.type_text("id:Target", "memory://").unwrap();
+    // Enter in the field starts the run.
+    app.submit("id:Target").unwrap();
+    wait_until(&mut app, 120, "the partial run is saved", |_| {
+        cx.store().list().map(|l| l.len() == 1).unwrap_or(false)
+    });
+    let r = &cx.store().list().unwrap()[0];
+    assert_eq!(r.partial.as_deref(), Some("budget"));
+    // Not a failure: the run is listed, shown, and badged.
+    wait_long(&mut app, "text:partial · budget");
+    assert!(!app.shows("The run failed"));
+}
+
+#[test]
+fn runs_saved_elsewhere_appear_without_a_restart() {
+    let cx = Ctx::new();
+    cx.seed("memory://", 1, "2");
+    let mut app = cx.start();
+    wait_long(&mut app, "text:RUNS (1)");
+    // The CLI (here: the engine directly) saves another run while the app is open.
+    let id = cx.seed("memory://", 1, "2");
+    wait_long(&mut app, "text:RUNS (2)");
+    assert!(
+        app.shows(&format!("Run {id}"))
+            || app.screen().count(&format!("role:button[/{id}/]")).unwrap() > 0
+    );
+}
+
+#[test]
+fn the_terminal_at_120x30_keeps_tabs_visible_and_tiles_unwrapped() {
+    let cx = Ctx::new();
+    cx.seed("memory://", 1, "2");
+    let mut app = cx.start_on(Idiom::Terminal, Size::new(Points(960.0), Points(480.0)));
+    wait_long(&mut app, "text:WHERE OPERATION TIME GOES");
+    let texts = text_bounds(&app);
+    let find = |label: &str| {
+        texts
+            .iter()
+            .find(|(t, _)| t == label)
+            .map(|(_, b)| *b)
+            .unwrap_or_else(|| panic!("{label} is not shown"))
+    };
+    let right = |b: &nsh_engine::Bounds<Points>| b.origin.x.0 + b.size.width.0;
+    let mut tab_right = 0.0_f32;
+    for t in [
+        "Overview",
+        "Requests",
+        "Timeline",
+        "Connections",
+        "Findings",
+        "Cost",
+    ] {
+        let b = find(t);
+        assert!(b.origin.x.0 >= 0.0 && right(&b) <= 960.0, "tab {t}: {b:?}");
+        tab_right = tab_right.max(right(&b));
+    }
+    // The run info yields to the tabs: on their row it starts right of the last one.
+    let row_y = find("Cost").origin.y.0;
+    for (t, b) in &texts {
+        if t.contains("memory") && (b.origin.y.0 - row_y).abs() < 1.0 {
+            assert!(
+                b.origin.x.0 >= tab_right - 0.5,
+                "run info over the tabs: {t} {b:?}"
+            );
+        }
+    }
+    // Every tile is shown at full width (the row wraps instead of squeezing them).
+    for t in [
+        "OPS/S",
+        "MiB/S",
+        "P50",
+        "P99",
+        "ERRORS",
+        "THROTTLED",
+        "REQ/OP",
+        "COST/MO",
+    ] {
+        let b = find(t);
+        assert!(
+            b.size.width.0 >= 8.0 * t.chars().count() as f32 - 0.5,
+            "tile {t}: {b:?}"
+        );
+        assert!(right(&b) <= 960.0, "tile {t}: {b:?}");
+    }
+    app.press_key("6").unwrap();
+    app.wait_for("text:/^Cost (not applicable|shows)|^PROJECTED/")
+        .unwrap();
+}

@@ -16,14 +16,15 @@ use crate::ui::kit::{
     self, Kind, Tone, badge, body, btn, caption, field, form_row, key_hint, picker, row_button,
     small, strong, switch_row, tool,
 };
-use crate::ui::model::{Tab, fmt};
-use crate::ui::store::{Inspect, JobKind, Mode, Overlay, Phase, Sel, Store, store};
+use crate::ui::model::commands::{self, COMMANDS, CmdCtx};
+use crate::ui::model::{Tab, fmt, runs};
+use crate::ui::store::{Inspect, JobKind, Mode, Overlay, Phase, Sel, Stage, Store, store};
 use crate::ui::views::{
     compare, inspector, overview, requests, tabs as tabviews, timeline, tools, welcome,
 };
 
 // ---------------------------------------------------------------------------------------
-// Commands: one list for the menu, the palette and the help
+// Commands: one list for the menu, the palette and the help (`model::commands`)
 // ---------------------------------------------------------------------------------------
 
 #[derive(Clone)]
@@ -32,23 +33,9 @@ pub struct Cmd {
     pub label: &'static str,
     pub group: &'static str,
     pub keys: Option<&'static str>,
+    /// Whether it can run now: the menu and the palette show the same state.
+    pub enabled: bool,
     pub run: Rc<dyn Fn()>,
-}
-
-fn cmd(
-    id: &'static str,
-    label: &'static str,
-    group: &'static str,
-    keys: Option<&'static str>,
-    f: impl Fn() + 'static,
-) -> Cmd {
-    Cmd {
-        id,
-        label,
-        group,
-        keys,
-        run: Rc::new(f),
-    }
 }
 
 /// Start a run, or stop the one running: one control.
@@ -56,155 +43,108 @@ pub fn run_or_stop(s: Store) {
     if s.busy() {
         s.stop();
     } else {
-        s.open(Overlay::NewRun);
+        s.open_new_run();
     }
 }
 
+/// What the commands' enabled states depend on, now (tracked: menus follow it).
+pub fn cmd_ctx(s: Store) -> CmdCtx {
+    CmdCtx {
+        busy: s.busy(),
+        has_run: s.current.with(|c| c.is_some()) && s.sel.get() != Sel::Live,
+        has_verify: s.current.with(|c| {
+            c.as_ref().is_some_and(|c| {
+                c.run
+                    .report
+                    .findings
+                    .iter()
+                    .any(|f| f.verification.is_some())
+            })
+        }),
+        runs: s.runs.with(|r| r.len()),
+        targets: s.targets.with(|t| t.len()),
+    }
+}
+
+/// The action of command `id`.
+fn action(s: Store, id: &'static str) -> Rc<dyn Fn()> {
+    let f: Rc<dyn Fn()> = match id {
+        "new" | "run" => Rc::new(move || s.open_new_run()),
+        "open-run" => Rc::new(move || s.open(Overlay::PickRun)),
+        "open" => Rc::new(move || crate::ui::files::open(s)),
+        "add-target" => Rc::new(move || s.open_add_target(None)),
+        "switch-target" => Rc::new(move || s.open(Overlay::PickTarget)),
+        "export" => Rc::new(move || crate::ui::files::export_run(s, "oprobe")),
+        "export-json" => Rc::new(move || crate::ui::files::export_run(s, "json")),
+        "export-md" => Rc::new(move || crate::ui::files::export_run(s, "md")),
+        "export-csv" => Rc::new(move || requests::export_csv(s)),
+        "settings" => Rc::new(move || open_settings(s)),
+        "stop" => Rc::new(move || s.stop()),
+        "rerun" => Rc::new(move || s.rerun()),
+        "edit-rerun" => Rc::new(move || s.edit_rerun()),
+        "verify" => Rc::new(move || s.verify_top()),
+        "fix" => Rc::new(move || s.fix()),
+        "demo" => Rc::new(move || s.demo()),
+        "compare" => Rc::new(move || s.compare_default()),
+        "tune" => Rc::new(move || s.mode.set(Mode::Tune)),
+        "probe" => Rc::new(move || s.mode.set(Mode::Probe)),
+        "slowest" => Rc::new(move || s.explain_slowest()),
+        "sidebar" => Rc::new(move || s.toggle_sidebar()),
+        "inspector" => Rc::new(move || s.toggle_inspector()),
+        "log" => Rc::new(move || s.set_log_latency(!s.log_latency.get_untracked())),
+        "palette" => Rc::new(move || s.open(Overlay::Palette)),
+        "help" => Rc::new(move || s.open(Overlay::Help)),
+        "docs" => Rc::new(|| {
+            let _ = open_url("https://github.com/hxddh/oprobe/tree/main/docs");
+        }),
+        tab if tab.starts_with("tab-") => {
+            let i: usize = tab[4..].parse().unwrap_or(0);
+            let t = Tab::ALL[i.min(Tab::ALL.len() - 1)];
+            Rc::new(move || s.set_tab(t))
+        }
+        _ => Rc::new(|| {}),
+    };
+    f
+}
+
+/// Every command with its state now. Reading it tracks what the states depend on.
 pub fn commands(s: Store) -> Vec<Cmd> {
-    let mut v = vec![
-        cmd("new", "New Run…", "File", Some("mod+n"), move || {
-            s.open(Overlay::NewRun)
-        }),
-        cmd(
-            "open",
-            "Open Run File…",
-            "File",
-            Some("mod+o"),
-            move || crate::ui::files::open(s),
-        ),
-        cmd(
-            "export",
-            "Export Run…",
-            "File",
-            Some("mod+s"),
-            move || crate::ui::files::export_run(s, "oprobe"),
-        ),
-        cmd(
-            "export-json",
-            "Export Report as JSON…",
-            "File",
-            None,
-            move || crate::ui::files::export_run(s, "json"),
-        ),
-        cmd(
-            "export-md",
-            "Export Report as Markdown…",
-            "File",
-            None,
-            move || crate::ui::files::export_run(s, "md"),
-        ),
-        cmd(
-            "export-csv",
-            "Export Requests as CSV…",
-            "File",
-            None,
-            move || requests::export_csv(s),
-        ),
-        cmd("run", "Run", "Run", Some("mod+r"), move || {
-            if !s.busy() {
-                s.open(Overlay::NewRun)
-            }
-        }),
-        cmd("stop", "Stop", "Run", Some("mod+."), move || s.stop()),
-        cmd(
-            "rerun",
-            "Run Again",
-            "Run",
-            Some("shift+mod+r"),
-            move || s.rerun(),
-        ),
-        cmd("demo", "Run the Demo", "Run", None, move || s.demo()),
-        cmd(
-            "compare",
-            "Compare Runs",
-            "Run",
-            Some("shift+mod+c"),
-            move || s.compare_default(),
-        ),
-        cmd("tune", "Tune…", "Run", None, move || {
-            s.mode.set(Mode::Tune)
-        }),
-        cmd("probe", "Probe…", "Run", None, move || {
-            s.mode.set(Mode::Probe)
-        }),
-        cmd(
-            "slowest",
-            "Explain the Slowest Requests",
-            "Run",
-            None,
-            move || s.explain_slowest(),
-        ),
-        cmd(
-            "sidebar",
-            "Toggle Sidebar",
-            "View",
-            Some("mod+alt+s"),
-            move || s.toggle_sidebar(),
-        ),
-        cmd(
-            "inspector",
-            "Toggle Inspector",
-            "View",
-            Some("mod+alt+i"),
-            move || s.toggle_inspector(),
-        ),
-        cmd("log", "Logarithmic Latency Axis", "View", None, move || {
-            s.set_log_latency(!s.log_latency.get_untracked())
-        }),
-        cmd(
-            "palette",
-            "Command Palette…",
-            "View",
-            Some("mod+k"),
-            move || s.open(Overlay::Palette),
-        ),
-        cmd(
-            "settings",
-            "Settings…",
-            if os() == nsh_core::platform::Os::MacOs {
+    let x = cmd_ctx(s);
+    let mac = os() == nsh_core::platform::Os::MacOs;
+    COMMANDS
+        .iter()
+        .map(|c| Cmd {
+            id: c.id,
+            label: c.label,
+            group: if c.id == "settings" && mac {
                 "App"
             } else {
-                "File"
+                c.group
             },
-            Some("mod+,"),
-            move || open_settings(s),
-        ),
-    ];
-    for (i, t) in Tab::ALL.into_iter().enumerate() {
-        const KEYS: [&str; 6] = ["mod+1", "mod+2", "mod+3", "mod+4", "mod+5", "mod+6"];
-        v.push(cmd(
-            ["tab-0", "tab-1", "tab-2", "tab-3", "tab-4", "tab-5"][i],
-            t.label(),
-            "View",
-            Some(KEYS[i]),
-            move || s.set_tab(t),
-        ));
+            keys: c.keys,
+            enabled: commands::enabled(c.id, &x),
+            run: action(s, c.id),
+        })
+        .collect()
+}
+
+/// Run command `id` if it is enabled now.
+pub fn run_command(s: Store, id: &str) {
+    if let Some(c) = untracked(|| commands(s)).into_iter().find(|c| c.id == id)
+        && c.enabled
+    {
+        (c.run)();
     }
-    v.push(cmd("help", "Keyboard Shortcuts", "Help", None, move || {
-        s.open(Overlay::Help)
-    }));
-    v.push(cmd("docs", "oprobe Documentation", "Help", None, || {
-        let _ = open_url("https://github.com/hxddh/oprobe/tree/main/docs");
-    }));
-    v
 }
 
 fn menu_items(s: Store, group: &'static str) -> Vec<MenuItem> {
-    let busy = s.busy();
-    let has_run = s.current.with(|c| c.is_some());
     commands(s)
         .into_iter()
         .filter(|c| c.group == group)
         .map(|c| {
-            let disabled = match c.id {
-                "stop" => !busy,
-                "run" | "rerun" | "demo" => busy,
-                "export" | "export-json" | "export-md" | "export-csv" | "slowest" => !has_run,
-                _ => false,
-            };
             let run = c.run.clone();
             let mut m = MenuItem::new(c.label)
-                .disabled(disabled)
+                .disabled(!c.enabled)
                 .on_select(move || run());
             if let Some(k) = c.keys {
                 m = m.shortcut(k);
@@ -277,22 +217,40 @@ fn install_menu(s: Store) {
     });
 }
 
-/// Keys of the terminal (keyboard-first): r run, s stop, n new, 1–6 tabs, / filter, j/k move,
-/// enter inspect, c compare, ? help, q quit (asks while a run is in progress).
+/// A single-letter shortcut: only while no text field has the keyboard focus, so typing
+/// `api:GetObject` in a filter never switches to Compare on `c` (UI-15).
+pub fn letter_key(key: &str, f: impl Fn() + 'static) {
+    on_key_with(
+        key,
+        KeyOptions {
+            when: nsh_core::keymap::When::NotEditing,
+            ..Default::default()
+        },
+        move |_| f(),
+    );
+}
+
+/// Keys of the terminal (keyboard-first): r run again, s stop, n new, 1–6 tabs, / filter,
+/// j/k move, enter inspect, c compare, v verify, o open run, ? help, q quit (asks while a run
+/// is in progress). Letters fire only outside text fields.
 fn install_terminal_keys(s: Store, filter: ElementRef) {
-    on_key("r", move |_| {
-        if !s.busy() {
-            s.rerun()
-        }
-    });
-    on_key("s", move |_| s.stop());
-    on_key("n", move |_| s.open(Overlay::NewRun));
+    letter_key("r", move || run_command(s, "rerun"));
+    letter_key("s", move || s.stop());
+    letter_key("n", move || run_command(s, "new"));
+    letter_key("v", move || run_command(s, "verify"));
+    letter_key("o", move || run_command(s, "open-run"));
+    letter_key("t", move || run_command(s, "add-target"));
     for (i, t) in Tab::ALL.into_iter().enumerate() {
-        on_key(["1", "2", "3", "4", "5", "6"][i], move |_| s.set_tab(t));
+        letter_key(["1", "2", "3", "4", "5", "6"][i], move || s.set_tab(t));
     }
-    on_key("/", move |_| {
+    letter_key("/", move || {
         s.set_tab(Tab::Requests);
-        filter.focus();
+        // The Requests tab mounts in the next frame: focus its filter once it is there.
+        spawn(async move {
+            next_frame().await;
+            next_frame().await;
+            filter.focus();
+        });
     });
     let step = move |d: i64| {
         if s.tab.get_untracked() == Tab::Requests && s.mode.get_untracked() == Mode::Run {
@@ -317,19 +275,28 @@ fn install_terminal_keys(s: Store, filter: ElementRef) {
             s.select_run(&r.id.clone());
         }
     };
-    on_key("j", move |_| step(1));
-    on_key("k", move |_| step(-1));
-    on_key("enter", move |_| {
-        if !s.prefs.with_untracked(|p| p.inspector_visible) || narrow() {
+    letter_key("j", move || step(1));
+    letter_key("k", move || step(-1));
+    letter_key("enter", move || {
+        if s.overlay.get_untracked().is_none()
+            && (!s.prefs.with_untracked(|p| p.inspector_visible) || side_panel_hidden())
+        {
             s.open(Overlay::Inspector);
         }
     });
-    on_key("c", move |_| s.compare_default());
-    on_key("shift+/", move |_| s.open(Overlay::Help));
-    on_key("q", move |_| confirm_quit(s));
-    on_key("escape", move |_| {
+    letter_key("c", move || run_command(s, "compare"));
+    letter_key("shift+/", move || s.open(Overlay::Help));
+    letter_key("q", move || confirm_quit(s));
+    // Esc closes the overlay, else leaves the filter field (so the letters act again).
+    let always = KeyOptions {
+        when: nsh_core::keymap::When::Always,
+        ..Default::default()
+    };
+    on_key_with("escape", always, move |_| {
         if s.overlay.get_untracked().is_some() {
             s.overlay.set(None);
+        } else {
+            filter.blur();
         }
     });
 }
@@ -357,6 +324,12 @@ pub fn confirm_quit(s: Store) {
 /// The terminal at 80×24 (and narrow windows): one pane at a time.
 fn narrow() -> bool {
     window().width.0 < 900.0
+}
+
+/// Below this width (120 columns in a terminal) the inspector panel opens over the content
+/// (Enter) instead of taking a column: the run's tabs keep their room.
+fn side_panel_hidden() -> bool {
+    window().width.0 < 1200.0
 }
 
 // ---------------------------------------------------------------------------------------
@@ -399,9 +372,9 @@ fn toolbar_view(s: Store) -> impl IntoElement {
                             "↻",
                             "Re-run",
                             "Run the shown run again (⇧⌘R)",
-                            move || s.rerun(),
+                            move || run_command(s, "rerun"),
                         )
-                        .disabled(busy),
+                        .disabled(move || busy() || s.current.with(|c| c.is_none())),
                     )
                     .child(tool(
                         "⇄",
@@ -499,13 +472,14 @@ fn toolbar_view(s: Store) -> impl IntoElement {
 fn status_line(s: Store) -> String {
     s.live.with(|l| match l {
         Some(l) if l.phase == Phase::Running => match &l.snapshot {
-            Some(snap) if l.total_s > 0.0 => format!(
+            Some(snap) if l.total_s > 0.0 && l.stage == Stage::Measuring => format!(
                 "{} · {} / {} · {} ops/s",
                 l.title,
                 fmt::clock_s(snap.elapsed_s),
                 fmt::clock_s(l.total_s),
                 fmt::compact(snap.summary.ops_per_s)
             ),
+            _ if l.kind == JobKind::Run => format!("{} · {}…", l.title, l.stage.label()),
             _ => format!(
                 "{} · {}",
                 l.title,
@@ -553,7 +527,18 @@ fn run_row(s: Store, r: RunSummary) -> impl IntoElement {
     let when = fmt::short_time(&r.started_at, fmt::day_of(&today));
     let label = r.label.clone().unwrap_or_else(|| when.clone());
     let tone = verdict_tone(&r);
-    let a11y = format!("Run {} · {} · p99 {}", r.id, label, fmt::dur_ms(r.p99_ms));
+    let partial = runs::partial_badge(&r);
+    let numbers = runs::row_numbers(&r);
+    let a11y = format!(
+        "Run {} · {} · {}{}",
+        r.id,
+        label,
+        numbers,
+        partial
+            .as_ref()
+            .map(|p| format!(" · {p}"))
+            .unwrap_or_default()
+    );
     row_button(a11y, selected, move || s.select_run(&id))
         .flex_row()
         .items_center()
@@ -563,6 +548,7 @@ fn run_row(s: Store, r: RunSummary) -> impl IntoElement {
             view()
                 .w(px(7.0))
                 .h(px(7.0))
+                .flex_shrink_0()
                 .rounded_full()
                 .bg(move || tone.color()),
         )
@@ -570,16 +556,20 @@ fn run_row(s: Store, r: RunSummary) -> impl IntoElement {
             view()
                 .flex_1()
                 .min_w(px(0.0))
-                .child(body(label).number_of_lines(1))
                 .child(
-                    small(format!(
-                        "{} · {} ops/s · p99 {}",
-                        when,
-                        fmt::compact(r.ops_per_s),
-                        fmt::dur_ms(r.p99_ms)
-                    ))
-                    .number_of_lines(1)
-                    .tabular_nums(),
+                    view()
+                        .flex_row()
+                        .items_center()
+                        .gap_1()
+                        .min_w(px(0.0))
+                        .child(body(label).number_of_lines(1).flex_1().min_w(px(0.0)))
+                        // A budget stop is not a failure: a partial run, with a badge.
+                        .child(partial.map(|p| badge(p, || Tone::Warn).flex_shrink_0())),
+                )
+                .child(
+                    small(format!("{when} · {numbers}"))
+                        .number_of_lines(1)
+                        .tabular_nums(),
                 ),
         )
         .child(
@@ -588,16 +578,25 @@ fn run_row(s: Store, r: RunSummary) -> impl IntoElement {
                 .on_press(move || s.toggle_mark(&id3))
                 .w(px(18.0))
                 .h(px(18.0))
+                .flex_shrink_0()
                 .items_center()
                 .justify_center()
                 .rounded(px(4.0))
                 .hover(|st| st.bg(move || theme().secondary))
+                .focus_visible(kit::ring)
                 .child(small(move || if marked() { "◆" } else { "◇" })),
         )
 }
 
 fn run_menu(s: Store, id: String) {
-    let (a, b, c, d, e) = (id.clone(), id.clone(), id.clone(), id.clone(), id.clone());
+    let (a, b, c, d, e, f) = (
+        id.clone(),
+        id.clone(),
+        id.clone(),
+        id.clone(),
+        id.clone(),
+        id.clone(),
+    );
     let path = s.run_store().run_path(&id);
     let _ = popup_menu(vec![
         MenuItem::new("Open").on_select(move || s.select_run(&a)),
@@ -607,10 +606,20 @@ fn run_menu(s: Store, id: String) {
                 s.compare(&c, &cur);
             }
         }),
-        MenuItem::new("Run Again").on_select(move || {
-            s.select_run(&d);
-            set_timeout(std::time::Duration::from_millis(300), move || s.rerun());
-        }),
+        MenuItem::new("Run Again")
+            .disabled(s.busy())
+            .on_select(move || {
+                s.select_run(&d);
+                set_timeout(std::time::Duration::from_millis(300), move || s.rerun());
+            }),
+        MenuItem::new("Edit and Run Again…")
+            .disabled(s.busy())
+            .on_select(move || {
+                s.select_run(&f);
+                set_timeout(std::time::Duration::from_millis(300), move || {
+                    s.edit_rerun()
+                });
+            }),
         MenuItem::separator(),
         MenuItem::new("Reveal Run File").on_select(move || {
             let _ = reveal_path(path.clone());
@@ -621,7 +630,7 @@ fn run_menu(s: Store, id: String) {
     ]);
 }
 
-/// Runs grouped by target, newest first; each group by day.
+/// Runs grouped by target, newest first.
 fn grouped(runs: &[RunSummary]) -> Vec<(String, Vec<RunSummary>)> {
     let mut out: Vec<(String, Vec<RunSummary>)> = Vec::new();
     for r in runs {
@@ -638,6 +647,15 @@ fn grouped(runs: &[RunSummary]) -> Vec<(String, Vec<RunSummary>)> {
 }
 
 fn sidebar(s: Store) -> impl IntoElement {
+    // What the list shows: the search's matches, `run_limit` of them (`RUNS (n)` is true).
+    let listed = computed(move || {
+        let q = s.run_query.get();
+        let limit = s.run_limit.get();
+        s.runs.with(|r| {
+            let (shown, matched) = runs::visible(r, &q, limit);
+            (shown, matched, r.len())
+        })
+    });
     view()
         .flex_1()
         .min_w(px(0.0))
@@ -687,25 +705,108 @@ fn sidebar(s: Store) -> impl IntoElement {
                                             .flex_1()
                                             .min_w(px(0.0))
                                             .child(body(title).number_of_lines(1))
-                                            .child(small(move || {
-                                                s.live_progress()
-                                                    .map(|(e, t)| {
-                                                        format!(
-                                                            "{} of {}",
-                                                            fmt::clock_s(e),
-                                                            fmt::clock_s(t)
-                                                        )
-                                                    })
-                                                    .unwrap_or_else(|| "stopping…".into())
-                                            })),
+                                            .child(
+                                                small(move || live_line(s))
+                                                    .number_of_lines(1)
+                                                    .tabular_nums(),
+                                            ),
                                     ),
                                 )
                                 .into_element(),
                             None => view().into_element(),
                         })
                     }))
+                    .child(
+                        view()
+                            .gap_1()
+                            .child(
+                                view()
+                                    .flex_row()
+                                    .items_center()
+                                    .px_2()
+                                    .child(
+                                        caption(move || {
+                                            listed.with(|(shown, matched, all)| {
+                                                runs::header(shown.len(), *matched, *all)
+                                            })
+                                        })
+                                        .number_of_lines(1)
+                                        .flex_1(),
+                                    )
+                                    .child(dynamic(move || {
+                                        let n = s.marked.with(|m| m.len());
+                                        untracked(|| {
+                                            if n == 2 {
+                                                btn(
+                                                    "Compare",
+                                                    || Kind::Ghost,
+                                                    move || s.compare_default(),
+                                                )
+                                                .accessibility_label("Compare the marked runs")
+                                                .into_element()
+                                            } else {
+                                                view().into_element()
+                                            }
+                                        })
+                                    })),
+                            )
+                            .child(dynamic(move || {
+                                let many = s.runs.with(|r| r.len() > 8);
+                                untracked(|| {
+                                    if many {
+                                        field("Search runs", "Search runs", s.run_query)
+                                            .into_element()
+                                    } else {
+                                        view().into_element()
+                                    }
+                                })
+                            }))
+                            .child(dynamic(move || {
+                                let (shown, matched, all) = listed.get();
+                                untracked(|| {
+                                    let more = matched.saturating_sub(shown.len());
+                                    view()
+                                        .gap_1()
+                                        .child((all == 0).then(|| small("No runs yet.").px_2()))
+                                        .child(
+                                            (all > 0 && matched == 0).then(|| {
+                                                small("No run matches the search.").px_2()
+                                            }),
+                                        )
+                                        .children(grouped(&shown).into_iter().map(
+                                            move |(target, rs)| {
+                                                view()
+                                                    .gap_0p5()
+                                                    .child(
+                                                        small(target)
+                                                            .px_2()
+                                                            .pt_1()
+                                                            .number_of_lines(1),
+                                                    )
+                                                    .children(
+                                                        rs.into_iter().map(move |r| run_row(s, r)),
+                                                    )
+                                            },
+                                        ))
+                                        .child((more > 0).then(|| {
+                                            btn(
+                                                format!("Show {} more", more.min(runs::PAGE)),
+                                                || Kind::Ghost,
+                                                move || {
+                                                    s.run_limit.update(|n| *n += runs::PAGE);
+                                                },
+                                            )
+                                            .accessibility_label(format!(
+                                                "Show more runs ({more} not listed)"
+                                            ))
+                                            .self_start()
+                                        }))
+                                        .into_element()
+                                })
+                            })),
+                    )
                     .child(dynamic(move || {
-                        let runs = s.runs.get();
+                        let targets = s.targets.get();
                         untracked(|| {
                             view()
                                 .gap_1()
@@ -714,53 +815,42 @@ fn sidebar(s: Store) -> impl IntoElement {
                                         .flex_row()
                                         .items_center()
                                         .px_2()
-                                        .child(caption(format!("RUNS ({})", runs.len())).flex_1())
-                                        .child(dynamic(move || {
-                                            let n = s.marked.with(|m| m.len());
-                                            untracked(|| {
-                                                if n == 2 {
-                                                    btn(
-                                                        "Compare",
-                                                        || Kind::Ghost,
-                                                        move || s.compare_default(),
-                                                    )
-                                                    .into_element()
-                                                } else {
-                                                    view().into_element()
-                                                }
-                                            })
-                                        })),
-                                )
-                                .child((runs.is_empty()).then(|| small("No runs yet.").px_2()))
-                                .children(grouped(&runs).into_iter().map(move |(target, rs)| {
-                                    view()
-                                        .gap_0p5()
-                                        .child(small(target).px_2().pt_1().number_of_lines(1))
-                                        .children(
-                                            rs.into_iter().take(50).map(move |r| run_row(s, r)),
+                                        .child(
+                                            caption(format!("TARGETS ({})", targets.len()))
+                                                .flex_1(),
                                         )
-                                }))
-                                .into_element()
-                        })
-                    }))
-                    .child(dynamic(move || {
-                        let targets = s.targets.get();
-                        untracked(|| {
-                            view()
-                                .gap_1()
-                                .child(caption(format!("TARGETS ({})", targets.len())).px_2())
+                                        .child(
+                                            btn(
+                                                "Add…",
+                                                || Kind::Ghost,
+                                                move || s.open_add_target(None),
+                                            )
+                                            .accessibility_label("Add Target"),
+                                        ),
+                                )
                                 .child(targets.is_empty().then(|| {
-                                    small("Add one with `oprobe target add NAME URL`.").px_2()
+                                    view()
+                                        .gap_1()
+                                        .px_2()
+                                        .child(small(
+                                            "No targets yet: save a bucket with its region, \
+                                             endpoint and credentials to run it by name.",
+                                        ))
+                                        .child(
+                                            btn(
+                                                "Add Target…",
+                                                || Kind::Plain,
+                                                move || s.open_add_target(None),
+                                            )
+                                            .self_start(),
+                                        )
                                 }))
                                 .children(targets.into_iter().map(move |(name, url)| {
                                     let n2 = name.clone();
                                     row_button(
-                                        format!("Target {name}"),
+                                        format!("Target {name}: new run"),
                                         || false,
-                                        move || {
-                                            s.form.target.set(n2.clone());
-                                            s.open(Overlay::NewRun);
-                                        },
+                                        move || s.switch_target(&n2),
                                     )
                                     .child(body(name).number_of_lines(1))
                                     .child(small(url).number_of_lines(1))
@@ -791,16 +881,39 @@ fn sidebar(s: Store) -> impl IntoElement {
                                         },
                                     )
                                     .child(body(name).number_of_lines(1))
-                                    .child(small(format!(
-                                        "{} runs · compare with the shown run",
-                                        runs.len()
-                                    )))
+                                    .child(
+                                        small(format!(
+                                            "{} runs · compare with the shown run",
+                                            runs.len()
+                                        ))
+                                        .number_of_lines(1),
+                                    )
                                 }))
                                 .into_element()
                         })
                     })),
             ),
         )
+}
+
+/// The live run's line in the sidebar: its phase, and the measured time once measuring.
+fn live_line(s: Store) -> String {
+    s.live.with(|l| {
+        let Some(l) = l else {
+            return String::new();
+        };
+        if l.phase == Phase::Stopping {
+            return "stopping · cleaning up…".into();
+        }
+        match l.stage {
+            Stage::Measuring => format!(
+                "measuring · {} of {}",
+                fmt::clock_s(l.snapshot.as_ref().map(|s| s.elapsed_s).unwrap_or(0.0)),
+                fmt::clock_s(l.total_s)
+            ),
+            st => st.label().to_owned(),
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------------------
@@ -817,7 +930,7 @@ fn tab_bar(s: Store) -> impl IntoElement {
             .h(px(26.0))
             .justify_center()
             .rounded(px(5.0))
-            .focus_visible(|st| st.outline(px(2.0)).outline_color(move || theme().ring))
+            .focus_visible(kit::ring)
             .child(
                 text(t.label())
                     .number_of_lines(1)
@@ -851,12 +964,15 @@ fn tab_bar(s: Store) -> impl IntoElement {
 }
 
 fn run_header(s: Store) -> impl IntoElement {
+    // The run's info yields to the tabs: it takes what the tab bar leaves and is cut with an
+    // ellipsis (or left out on narrow windows), never covering a tab.
     view()
         .flex_row()
         .items_center()
         .gap_3()
         .px_3()
         .py(px(6.0))
+        .min_w(px(0.0))
         .border_b_1()
         .border_color(move || theme().border)
         .child(tab_bar(s))
@@ -864,6 +980,7 @@ fn run_header(s: Store) -> impl IntoElement {
             view()
                 .flex_1()
                 .min_w(px(0.0))
+                .overflow_hidden()
                 .items_end()
                 .child(dynamic(move || {
                     let info = s.current.with(|c| {
@@ -953,6 +1070,8 @@ fn new_run_sheet(s: Store) -> impl IntoElement {
         .iter()
         .map(|p| (p.slug().into(), p.slug().into()))
         .collect();
+    // Enter in any field starts the run.
+    let submit = move |_: &str| s.submit_form();
     sheet()
         .side(Placement::Right)
         .open(move || Some(s.overlay.get() == Some(Overlay::NewRun)))
@@ -966,6 +1085,7 @@ fn new_run_sheet(s: Store) -> impl IntoElement {
         .child(
             view()
                 .w(px(440.0))
+                .max_w(relative(1.0))
                 .h_full()
                 .p_4()
                 .gap_3()
@@ -973,11 +1093,40 @@ fn new_run_sheet(s: Store) -> impl IntoElement {
                 .border_l_1()
                 .border_color(move || theme().border)
                 .shadow_xl()
-                .child(kit::title("New Run"))
-                .child(form_row("Target", field("Target", "s3://bucket/prefix · a target name · lab://demo", f.target)))
+                .child(kit::title(move || {
+                    if f.spec.with(|x| x.is_some()) {
+                        "Run Again"
+                    } else {
+                        "New Run"
+                    }
+                }))
+                .child(dynamic(move || {
+                    let run = f.spec_run.get();
+                    untracked(|| match run {
+                        Some(id) => small(format!(
+                            "Repeats run {id}: the fields below change its spec; its dataset, \
+                             mix, warmup, seed and every other setting are kept."
+                        ))
+                        .into_element(),
+                        None => view().into_element(),
+                    })
+                }))
+                // The first field has the focus when the sheet opens.
+                .child(form_row(
+                    "Target",
+                    field(
+                        "Target",
+                        "s3://bucket/prefix · a target name · lab://demo",
+                        f.target,
+                    )
+                    .auto_focus(true)
+                    .on_submit(submit),
+                ))
                 .child(dynamic(move || {
                     let recent = s.prefs.with(|p| p.recent_targets.clone());
-                    let targets = s.targets.with(|t| t.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>());
+                    let targets = s
+                        .targets
+                        .with(|t| t.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>());
                     untracked(|| {
                         let mut chips: Vec<String> = targets;
                         for r in recent {
@@ -990,17 +1139,36 @@ fn new_run_sheet(s: Store) -> impl IntoElement {
                         }
                         form_row(
                             "",
-                            view().flex_row().flex_wrap().gap_1().children(chips.into_iter().take(8).map(move |c| {
-                                let c2 = c.clone();
-                                btn(c, || Kind::Ghost, move || f.target.set(c2.clone())).h(px(22.0))
-                            })),
+                            view()
+                                .flex_row()
+                                .flex_wrap()
+                                .gap_1()
+                                .children(chips.into_iter().take(8).map(move |c| {
+                                    let c2 = c.clone();
+                                    btn(c, || Kind::Ghost, move || f.target.set(c2.clone()))
+                                        .h(px(22.0))
+                                }))
+                                .child(
+                                    btn(
+                                        "Add target…",
+                                        || Kind::Ghost,
+                                        move || s.open_add_target(None),
+                                    )
+                                    .h(px(22.0)),
+                                ),
                         )
                         .into_element()
                     })
                 }))
                 .child(form_row("Workload", picker("Preset", presets, f.preset)))
-                .child(form_row("Duration", field("Duration", "e.g. 10s", f.duration)))
-                .child(form_row("Concurrency", field("Concurrency", "e.g. 16", f.concurrency)))
+                .child(form_row(
+                    "Duration",
+                    field("Duration", "e.g. 10s", f.duration).on_submit(submit),
+                ))
+                .child(form_row(
+                    "Concurrency",
+                    field("Concurrency", "e.g. 16", f.concurrency).on_submit(submit),
+                ))
                 .child(form_row("", switch_row("Advanced settings", f.advanced)))
                 .child(dynamic(move || {
                     let adv = f.advanced.get();
@@ -1010,31 +1178,187 @@ fn new_run_sheet(s: Store) -> impl IntoElement {
                         }
                         view()
                             .gap_3()
-                            .child(form_row("I/O per op", field("I/O per op", "e.g. 4", f.io_concurrency)))
-                            .child(form_row("Chunk", field("Chunk", "e.g. 8MiB", f.chunk)))
-                            .child(form_row("Endpoint", field("Endpoint", "https://… (S3-compatible)", f.endpoint)))
-                            .child(form_row("Region", field("Region", "e.g. eu-west-1", f.region)))
-                            .child(form_row("Label", field("Label", "a name for this run", f.label)))
-                            .child(form_row("", switch_row("Anonymous (public bucket)", f.anonymous)))
+                            .child(form_row(
+                                "I/O per op",
+                                field("I/O per op", "e.g. 4", f.io_concurrency).on_submit(submit),
+                            ))
+                            .child(form_row(
+                                "Chunk",
+                                field("Chunk", "e.g. 8MiB", f.chunk).on_submit(submit),
+                            ))
+                            .child(form_row(
+                                "Endpoint",
+                                field("Endpoint", "https://… (S3-compatible)", f.endpoint)
+                                    .on_submit(submit),
+                            ))
+                            .child(form_row(
+                                "Region",
+                                field("Region", "e.g. eu-west-1", f.region).on_submit(submit),
+                            ))
+                            .child(form_row(
+                                "Stored data",
+                                field(
+                                    "Stored GiB",
+                                    "GiB for the cost projection (default: assumed 1 TiB)",
+                                    f.stored_gib,
+                                )
+                                .on_submit(submit),
+                            ))
+                            .child(form_row(
+                                "Label",
+                                field("Label", "a name for this run", f.label).on_submit(submit),
+                            ))
+                            .child(form_row(
+                                "",
+                                switch_row("Anonymous (public bucket)", f.anonymous),
+                            ))
                             .into_element()
                     })
                 }))
                 .child(dynamic(move || {
                     let e = f.error.get();
                     untracked(|| match e {
-                        Some(e) => small(e).text_color(move || Tone::Crit.color()).selectable(true).into_element(),
+                        Some(e) => small(e)
+                            .text_color(move || Tone::Crit.color())
+                            .selectable(true)
+                            .role(AccessibilityRole::Alert)
+                            .into_element(),
                         None => view().into_element(),
                     })
                 }))
                 .child(view().flex_1())
-                .child(small("oprobe writes test objects only under oprobe-run-<id>/ and deletes them when the run ends."))
+                .child(small(
+                    "oprobe writes test objects only under oprobe-run-<id>/ and deletes them \
+                     when the run ends. Enter starts the run, Esc cancels.",
+                ))
                 .child(
                     view()
                         .flex_row()
                         .justify_end()
                         .gap_2()
                         .child(btn("Cancel", || Kind::Plain, move || s.overlay.set(None)))
-                        .child(btn("Start Run", || Kind::Primary, move || s.submit_form()).test_id("start-run")),
+                        .child(
+                            btn("Start Run", || Kind::Primary, move || s.submit_form())
+                                .test_id("start-run"),
+                        ),
+                ),
+        )
+}
+
+/// Add Target: URL (with its bucket), region, endpoint and the credentials source (found on
+/// this machine, names only); a read-only connection test; saved to the config file.
+fn add_target_sheet(s: Store) -> impl IntoElement {
+    let a = s.add;
+    let submit = move |_: &str| s.save_target();
+    sheet()
+        .side(Placement::Right)
+        .open(move || Some(s.overlay.get() == Some(Overlay::AddTarget)))
+        .on_open_change(move |e: &SheetEvent| {
+            if let SheetEvent::OpenChange(false, _) = e {
+                s.overlay.set(None);
+            }
+        })
+        .accessibility_label("Add Target")
+        .backdrop_style(|st| st.bg(move || theme().foreground.opacity(0.12)))
+        .child(
+            view()
+                .w(px(460.0))
+                .max_w(relative(1.0))
+                .h_full()
+                .p_4()
+                .gap_3()
+                .bg(move || theme().popover)
+                .border_l_1()
+                .border_color(move || theme().border)
+                .shadow_xl()
+                .child(kit::title("Add Target"))
+                .child(small(
+                    "A named target keeps its URL, region, endpoint and credentials source in \
+                     the config file; runs then use its name.",
+                ))
+                .child(form_row(
+                    "URL",
+                    field("Target URL", "s3://bucket/prefix", a.url)
+                        .auto_focus(true)
+                        .on_submit(submit),
+                ))
+                .child(form_row(
+                    "Name",
+                    field("Target name", "default: the bucket", a.name).on_submit(submit),
+                ))
+                .child(form_row(
+                    "Region",
+                    field("Target region", "e.g. eu-west-1 (S3)", a.region).on_submit(submit),
+                ))
+                .child(form_row(
+                    "Endpoint",
+                    field(
+                        "Target endpoint",
+                        "https://… (S3-compatible, optional)",
+                        a.endpoint,
+                    )
+                    .on_submit(submit),
+                ))
+                .child(form_row("Credentials", {
+                    let found = crate::ui::model::cloud::detect();
+                    let items: Vec<(SharedString, SharedString)> =
+                        crate::ui::model::target::cred_choices(&found)
+                            .into_iter()
+                            .map(|c| (c.value.into(), c.title.into()))
+                            .collect();
+                    picker("Credentials source", items, a.credentials)
+                }))
+                .child(small(
+                    "Sources found on this machine are listed by name; no secret is read or \
+                     stored.",
+                ))
+                .child(dynamic(move || {
+                    let e = a.error.get();
+                    let t = a.test.get();
+                    untracked(|| {
+                        view()
+                            .gap_1()
+                            .child(e.map(|e| {
+                                small(e)
+                                    .text_color(move || Tone::Crit.color())
+                                    .selectable(true)
+                                    .role(AccessibilityRole::Alert)
+                            }))
+                            .child(t.map(|(tone, msg)| {
+                                small(msg)
+                                    .text_color(move || tone.color())
+                                    .selectable(true)
+                                    .role(AccessibilityRole::Alert)
+                            }))
+                            .into_element()
+                    })
+                }))
+                .child(view().flex_1())
+                .child(
+                    view()
+                        .flex_row()
+                        .justify_end()
+                        .gap_2()
+                        .child(btn("Cancel", || Kind::Plain, move || s.overlay.set(None)))
+                        .child(
+                            btn(
+                                move || {
+                                    if a.testing.get() {
+                                        "Testing…"
+                                    } else {
+                                        "Test Connection"
+                                    }
+                                },
+                                || Kind::Plain,
+                                move || s.test_target(),
+                            )
+                            .disabled(move || a.testing.get()),
+                        )
+                        .child(btn(
+                            "Save Target",
+                            || Kind::Primary,
+                            move || s.save_target(),
+                        )),
                 ),
         )
 }
@@ -1048,65 +1372,147 @@ fn centered(content: impl IntoElement) -> View {
         .child(content)
 }
 
+/// The palette's frame (the command list, or a list of runs or targets to pick from).
+fn palette_frame(s: Store, list: nsh_base::CommandElement) -> impl IntoElement {
+    dialog()
+        .on_cancel(move || s.overlay.set(None))
+        .flex_1()
+        .child(centered(
+            view()
+                .w(px(560.0))
+                .max_w(relative(0.95))
+                .max_h(px(420.0))
+                .rounded(px(10.0))
+                .border_1()
+                .border_color(move || theme().border)
+                .bg(move || theme().popover)
+                .shadow_xl()
+                .overflow_hidden()
+                .child(
+                    list.auto_focus(true)
+                        .empty(small("Nothing matches").p_3())
+                        .search_bar_style(|st| {
+                            st.px_3()
+                                .h(px(40.0))
+                                .justify_center()
+                                .flex_row()
+                                .items_center()
+                                .border_b_1()
+                                .border_color(move || theme().border)
+                        })
+                        .item_class(
+                            "px-3 py-1.5 rounded-md text-sm focus:bg-accent disabled:opacity-40",
+                        )
+                        .group_class("px-3 pt-2 pb-1 text-xs text-muted-foreground")
+                        .list_style(|st| st.p_1())
+                        .on_cancel(move || s.overlay.set(None))
+                        .flex_1(),
+                ),
+        ))
+}
+
+/// ⌘K: every command, with the menu's enabled states (disabled ones are shown, not run).
 fn palette(s: Store) -> impl IntoElement {
     when(
         move || s.overlay.get() == Some(Overlay::Palette),
         move || {
-            let cmds = commands(s);
-            let items: Vec<CommandItem> = cmds
+            let items: Vec<CommandItem> = commands(s)
                 .iter()
                 .map(|c| {
-                    let mut it = CommandItem::new(c.id, c.label).group(c.group);
+                    let mut it = CommandItem::new(c.id, c.label)
+                        .group(c.group)
+                        .disabled(!c.enabled);
                     if let Some(k) = c.keys {
                         it = it.shortcut(k);
                     }
                     it
                 })
                 .collect();
-            dialog()
-                .on_cancel(move || s.overlay.set(None))
-                .flex_1()
-                .child(centered(
-                    view()
-                        .w(px(560.0))
-                        .max_h(px(420.0))
-                        .rounded(px(10.0))
-                        .border_1()
-                        .border_color(move || theme().border)
-                        .bg(move || theme().popover)
-                        .shadow_xl()
-                        .overflow_hidden()
-                        .child(
-                            command()
-                                .items(items)
-                                .placeholder("Type a command")
-                                .accessibility_label("Commands")
-                                .auto_focus(true)
-                                .empty(small("No matching command").p_3())
-                                .search_bar_style(|st| {
-                                    st.px_3()
-                                        .h(px(40.0))
-                                        .justify_center()
-                                        .flex_row()
-                                        .items_center()
-                                        .border_b_1()
-                                        .border_color(move || theme().border)
-                                })
-                                .item_class("px-3 py-1.5 rounded-md text-sm focus:bg-accent")
-                                .group_class("px-3 pt-2 pb-1 text-xs text-muted-foreground")
-                                .list_style(|st| st.p_1())
-                                .on_select(move |id: &SharedString| {
-                                    s.overlay.set(None);
-                                    if let Some(c) =
-                                        commands(s).into_iter().find(|c| c.id == id.as_ref())
-                                    {
-                                        (c.run)();
-                                    }
-                                })
-                                .on_cancel(move || s.overlay.set(None))
-                                .flex_1(),
-                        ),
-                ))
+            palette_frame(
+                s,
+                command()
+                    .items(items)
+                    .placeholder("Type a command")
+                    .accessibility_label("Commands")
+                    .on_select(move |id: &SharedString| {
+                        s.overlay.set(None);
+                        run_command(s, id.as_ref());
+                    }),
+            )
+        },
+    )
+}
+
+/// Open Run…: the history, searchable by id, label, target and verdict.
+fn run_picker(s: Store) -> impl IntoElement {
+    when(
+        move || s.overlay.get() == Some(Overlay::PickRun),
+        move || {
+            let items: Vec<CommandItem> = s.runs.with_untracked(|runs| {
+                runs.iter()
+                    .map(|r| {
+                        let title = format!(
+                            "{} · {} · {}{}",
+                            r.id,
+                            r.label.clone().unwrap_or_else(|| r.target_display.clone()),
+                            runs::row_numbers(r),
+                            runs::partial_badge(r)
+                                .map(|p| format!(" · {p}"))
+                                .unwrap_or_default()
+                        );
+                        CommandItem::new(r.id.clone(), title)
+                            .group(
+                                r.target_name
+                                    .clone()
+                                    .unwrap_or_else(|| r.target_display.clone()),
+                            )
+                            .keywords([r.headline.clone(), r.target_display.clone()])
+                    })
+                    .collect()
+            });
+            palette_frame(
+                s,
+                command()
+                    .items(items)
+                    .placeholder("Open a run: id, label or target")
+                    .accessibility_label("Open Run")
+                    .on_select(move |id: &SharedString| {
+                        s.overlay.set(None);
+                        s.select_run(id.as_ref());
+                    }),
+            )
+        },
+    )
+}
+
+/// Switch Target…: the configured targets; the New Run sheet opens on the one picked.
+fn target_picker(s: Store) -> impl IntoElement {
+    when(
+        move || s.overlay.get() == Some(Overlay::PickTarget),
+        move || {
+            let mut items: Vec<CommandItem> = s.targets.with_untracked(|t| {
+                t.iter()
+                    .map(|(n, url)| {
+                        CommandItem::new(n.clone(), format!("{n} · {url}")).group("Targets")
+                    })
+                    .collect()
+            });
+            items.push(CommandItem::new("+add", "Add Target…").group("New"));
+            palette_frame(
+                s,
+                command()
+                    .items(items)
+                    .placeholder("Switch to a target")
+                    .accessibility_label("Switch Target")
+                    .on_select(move |id: &SharedString| {
+                        s.overlay.set(None);
+                        if id.as_ref() == "+add" {
+                            s.open_add_target(None);
+                        } else {
+                            s.switch_target(id.as_ref());
+                        }
+                    }),
+            )
         },
     )
 }
@@ -1118,9 +1524,12 @@ fn help(s: Store) -> impl IntoElement {
             let term = kit::in_terminal();
             let rows: Vec<(&'static str, &'static str)> = if term {
                 vec![
-                    ("r", "run again"),
+                    ("r", "run again (the run's spec)"),
                     ("s", "stop"),
                     ("n", "new run"),
+                    ("v", "verify the top finding"),
+                    ("o", "open a run"),
+                    ("t", "add a target"),
                     ("1–6", "tabs"),
                     ("/", "filter requests"),
                     ("j / k", "next / previous"),
@@ -1129,6 +1538,7 @@ fn help(s: Store) -> impl IntoElement {
                     ("?", "this help"),
                     ("q", "quit"),
                     ("F10", "menu"),
+                    ("tab", "move the focus"),
                     ("esc", "close"),
                 ]
             } else {
@@ -1143,6 +1553,7 @@ fn help(s: Store) -> impl IntoElement {
                 .child(centered(
                     view()
                         .w(px(420.0))
+                        .max_w(relative(0.95))
                         .p_4()
                         .gap_1()
                         .rounded(px(10.0))
@@ -1401,9 +1812,10 @@ fn status_bar(s: Store) -> impl IntoElement {
                 .overflow_hidden()
                 .children(if term {
                     vec![
-                        key_hint("r", "run"),
+                        key_hint("r", "rerun"),
                         key_hint("s", "stop"),
                         key_hint("n", "new"),
+                        key_hint("v", "verify"),
                         key_hint("1-6", "tabs"),
                         key_hint("/", "filter"),
                         key_hint("j/k", "move"),
@@ -1455,7 +1867,7 @@ pub fn shell() -> impl IntoElement {
             let (sb, ins) = s.prefs.with(|p| (p.sidebar_visible, p.inspector_visible));
             let narrow = narrow();
             let mode = s.mode.get();
-            let show_ins = ins && !narrow && mode == Mode::Run;
+            let show_ins = ins && !side_panel_hidden() && mode == Mode::Run;
             let show_sb = sb && !narrow;
             untracked(|| {
                 let (sw, iw) = s
@@ -1493,8 +1905,11 @@ pub fn shell() -> impl IntoElement {
         .child(body_view)
         .child(status_bar(s))
         .child(new_run_sheet(s))
+        .child(add_target_sheet(s))
         .child(inspector_overlay(s))
         .child(palette(s))
+        .child(run_picker(s))
+        .child(target_picker(s))
         .child(help(s))
         .child(settings_overlay(s))
         .child(toasts(s))

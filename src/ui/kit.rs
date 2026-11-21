@@ -141,6 +141,17 @@ pub fn mono(t: impl IntoReactive<SharedString>) -> Text {
 // Buttons
 // ---------------------------------------------------------------------------------------
 
+/// The focus ring: an outline in a window; in a terminal (where outlines draw nothing) a
+/// reversed band in the accent, so the keyboard focus is always visible.
+pub fn ring(s: nsh_core::element::StyleRefinement) -> nsh_core::element::StyleRefinement {
+    if in_terminal() {
+        s.bg(move || theme().primary)
+            .text_color(move || theme().primary_foreground)
+    } else {
+        s.outline(px(2.0)).outline_color(move || theme().ring)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     /// The default action (filled accent).
@@ -154,12 +165,15 @@ pub enum Kind {
 }
 
 /// The app's push button. `kind` may follow state (Run ⇄ Stop stays one element, so the
-/// keyboard focus stays on it).
+/// keyboard focus stays on it). Its accessible label is its label (a caller may give a
+/// longer one with `.accessibility_label(…)`), so no button depends on a derived name.
 pub fn btn(
     label: impl IntoReactive<SharedString>,
     kind: impl Fn() -> Kind + Copy + 'static,
     on_press: impl Fn() + 'static,
 ) -> nsh_base::ButtonElement {
+    let label = label.into_reactive();
+    let a11y = label.clone();
     let bg = move || match kind() {
         Kind::Primary => theme().primary,
         Kind::Danger => theme().destructive,
@@ -172,8 +186,10 @@ pub fn btn(
     };
     button()
         .on_press(on_press)
+        .accessibility_label(move || Some(a11y.get()))
         .h(px(26.0))
         .px(px(10.0))
+        .flex_shrink_0()
         .flex_row()
         .gap_1()
         .items_center()
@@ -188,7 +204,7 @@ pub fn btn(
         })
         .hover(|s| s.opacity(0.88))
         .active(|s| s.opacity(0.7))
-        .focus_visible(|s| s.outline(px(2.0)).outline_color(move || theme().ring))
+        .focus_visible(ring)
         .disabled_style(|s| s.opacity(0.4))
         .child(
             text(label)
@@ -243,7 +259,7 @@ pub fn tool_dyn(
         .hover(|s| s.bg(move || theme().secondary))
         .active(|s| s.opacity(0.7))
         .selected_style(|s| s.bg(move || theme().accent))
-        .focus_visible(|s| s.outline(px(2.0)).outline_color(move || theme().ring))
+        .focus_visible(ring)
         .disabled_style(|s| s.opacity(0.4))
         .child(inner)
 }
@@ -284,7 +300,7 @@ pub fn row_button(
                 transparent_black().into()
             }
         })
-        .focus_visible(|s| s.outline(px(2.0)).outline_color(move || theme().ring))
+        .focus_visible(ring)
 }
 
 // ---------------------------------------------------------------------------------------
@@ -369,15 +385,21 @@ pub fn picker(
                 .border_1()
                 .border_color(move || theme().input)
                 .bg(move || theme().background)
-                .child(body(move || {
-                    let v = value.get();
-                    titles
-                        .iter()
-                        .find(|(k, _)| Some(k) == v.as_ref())
-                        .map(|(_, t)| t.clone())
-                        .unwrap_or_else(|| "Choose…".into())
-                }))
-                .child(small("⌄")),
+                .min_w(px(0.0))
+                .child(
+                    body(move || {
+                        let v = value.get();
+                        titles
+                            .iter()
+                            .find(|(k, _)| Some(k) == v.as_ref())
+                            .map(|(_, t)| t.clone())
+                            .unwrap_or_else(|| "Choose…".into())
+                    })
+                    .number_of_lines(1)
+                    .flex_1()
+                    .min_w(px(0.0)),
+                )
+                .child(small("⌄").flex_shrink_0()),
         )
 }
 
@@ -440,7 +462,7 @@ pub fn segmented(
                         transparent_black().into()
                     }
                 })
-                .focus_visible(|s| s.outline(px(2.0)).outline_color(move || theme().ring))
+                .focus_visible(ring)
                 .child(text(*title).text_size(px(12.0)))
         }))
 }
@@ -485,15 +507,38 @@ pub fn swatch(c: impl Fn() -> AdaptiveColor + 'static) -> View {
 }
 
 /// A key number. Fixed height and no wrapping: values arriving never move the layout.
+/// Tiles share a row and flow onto a second one when it is too narrow ([`kpi_row`]).
 pub fn kpi(
     label: &'static str,
     value: impl Fn() -> SharedString + 'static,
     tone: impl Fn() -> Tone + Copy + 'static,
 ) -> View {
+    kpi_detail(label, value, || SharedString::default(), tone)
+}
+
+/// The row of key numbers: one row when it fits, two (or more) when it does not.
+pub fn kpi_row() -> View {
+    view()
+        .flex_row()
+        .flex_wrap()
+        .rounded(px(6.0))
+        .border_1()
+        .border_color(move || theme().border)
+        .overflow_hidden()
+}
+
+/// A key number with a small line under it (what it is made of, an assumption).
+pub fn kpi_detail(
+    label: &'static str,
+    value: impl Fn() -> SharedString + 'static,
+    detail: impl Fn() -> SharedString + 'static,
+    tone: impl Fn() -> Tone + Copy + 'static,
+) -> View {
+    let term = in_terminal();
     view()
         .flex_1()
-        .min_w(px(78.0))
-        .h(px(48.0))
+        .min_w(px(if term { 104.0 } else { 96.0 }))
+        .h(px(if term { 48.0 } else { 58.0 }))
         .justify_center()
         .gap(px(2.0))
         .px(px(10.0))
@@ -509,6 +554,7 @@ pub fn kpi(
                     t => t.color(),
                 }),
         )
+        .child(small(detail).number_of_lines(1).tabular_nums())
 }
 
 /// A centered message for an empty pane.
@@ -554,6 +600,7 @@ pub fn prop_row(
             text(value)
                 .text_size(px(12.0))
                 .tabular_nums()
+                .number_of_lines(1)
                 .flex_1()
                 .min_w(px(0.0))
                 .selectable(true),

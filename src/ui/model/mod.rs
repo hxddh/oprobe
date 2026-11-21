@@ -3,12 +3,17 @@
 //! Unit-tested here; the views only read it.
 
 pub mod cloud;
+pub mod commands;
 pub mod compare;
 pub mod fmt;
+pub mod metrics;
 pub mod requests;
 pub mod run;
+pub mod runs;
 pub mod scale;
 pub mod series;
+pub mod target;
+pub mod verify;
 
 use serde::{Deserialize, Serialize};
 
@@ -74,7 +79,9 @@ pub struct Prefs {
 }
 
 impl Default for Prefs {
+    /// New runs start from the CLI's built-in defaults ([`crate::config::defaults`]).
     fn default() -> Self {
+        let d = crate::config::defaults();
         Self {
             sidebar_width: 240.0,
             inspector_width: 300.0,
@@ -82,9 +89,9 @@ impl Default for Prefs {
             inspector_visible: true,
             tab: Tab::Overview,
             recent_targets: Vec::new(),
-            preset: "parquet".into(),
-            duration: "10s".into(),
-            concurrency: crate::config::Knobs::default().concurrency.to_string(),
+            preset: d.workload.preset.slug().into(),
+            duration: d.workload.duration.to_string(),
+            concurrency: d.knobs.concurrency.to_string(),
             log_latency: true,
             notify: true,
             appearance: "system".into(),

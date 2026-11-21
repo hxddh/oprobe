@@ -250,11 +250,16 @@ pub fn findings() -> impl IntoElement {
 pub fn cost() -> impl IntoElement {
     let s = store();
     scroll().flex_1().child(dynamic(move || {
-        let data = s
-            .current
-            .with(|c| c.as_ref().map(|c| c.run.report.cost.clone()));
+        let data = s.current.with(|c| {
+            c.as_ref().map(|c| {
+                (
+                    c.run.report.cost.clone(),
+                    crate::ui::model::metrics::storage_note(&c.run.report),
+                )
+            })
+        });
         untracked(|| {
-            let Some(c) = data else {
+            let Some((c, assumed)) = data else {
                 return empty("Cost shows when the run has finished", "").into_element();
             };
             if !c.applicable {
@@ -282,19 +287,28 @@ pub fn cost() -> impl IntoElement {
                                 .text_size(px(22.0)),
                         )
                         .child(small(format!(
-                            "at {} operations a month, {} stored, {} of reads leaving the cloud",
+                            "at {} operations a month, {} stored{}, {} of reads leaving the cloud",
                             fmt::compact(c.monthly_ops),
                             fmt::bytes(c.stored_gb * 1_073_741_824.0),
+                            if assumed.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" {assumed}")
+                            },
                             fmt::ratio(c.egress_fraction)
                         ))),
                 )
+                // Three columns when they fit, one under the other when they do not.
                 .child(
                     view()
                         .flex_row()
+                        .flex_wrap()
                         .gap_6()
                         .child(
                             view()
                                 .gap_1()
+                                .flex_1()
+                                .min_w(px(190.0))
                                 .child(caption("BREAKDOWN"))
                                 .child(prop_row("Requests", fmt::usd(sel.requests_usd)))
                                 .child(prop_row("Egress", fmt::usd(sel.egress_usd)))
@@ -304,6 +318,8 @@ pub fn cost() -> impl IntoElement {
                         .child(
                             view()
                                 .gap_1()
+                                .flex_1()
+                                .min_w(px(190.0))
                                 .child(caption("WASTE"))
                                 .child(prop_row("Failed req.", fmt::usd(sel.failed_requests_usd)))
                                 .child(prop_row("Over-read", fmt::usd(sel.overread_usd)))
@@ -312,6 +328,8 @@ pub fn cost() -> impl IntoElement {
                         .child(
                             view()
                                 .gap_1()
+                                .flex_1()
+                                .min_w(px(190.0))
                                 .child(caption("PER OPERATION"))
                                 .child(prop_row("Reads", fmt::sig3(u.read_requests)))
                                 .child(prop_row("Writes", fmt::sig3(u.write_requests)))
@@ -338,15 +356,27 @@ pub fn cost() -> impl IntoElement {
                     view()
                         .flex_row()
                         .gap_3()
-                        .child(body(p.provider.clone()).w(px(180.0)))
-                        .child(num(fmt::usd(p.total_usd)).w(px(90.0)))
+                        .min_w(px(0.0))
                         .child(
-                            small(format!("{}× this target", fmt::sig3(ratio))).text_color(
-                                move || match tone {
+                            body(p.provider.clone())
+                                .number_of_lines(1)
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .max_w(px(180.0)),
+                        )
+                        .child(
+                            num(fmt::usd(p.total_usd))
+                                .number_of_lines(1)
+                                .w(px(90.0))
+                                .flex_shrink_0(),
+                        )
+                        .child(
+                            small(format!("{}× this target", fmt::sig3(ratio)))
+                                .number_of_lines(1)
+                                .text_color(move || match tone {
                                     Tone::Neutral => theme().muted_foreground,
                                     t => t.color(),
-                                },
-                            ),
+                                }),
                         )
                 })))
                 .into_element()

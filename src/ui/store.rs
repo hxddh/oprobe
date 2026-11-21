@@ -10,6 +10,7 @@ use nsh_core::storage::Storage;
 
 use crate::analysis::outliers::{Attribution, Selection, attribute};
 use crate::model::Finding;
+use crate::model::spec::{Overrides, RunSpec};
 use crate::net::probe::ProbeReport;
 use crate::store::{ConfigFile, Paths, RunStore, RunSummary};
 use crate::trace::Snapshot;
@@ -21,6 +22,8 @@ use crate::ui::model::compare::{Comparison, compare};
 use crate::ui::model::requests::{Col, Filter, sort};
 use crate::ui::model::run::{RunView, Shared};
 use crate::ui::model::series::Series;
+use crate::ui::model::target::TargetDraft;
+use crate::ui::model::verify::Verdict;
 use crate::ui::model::{Prefs, Tab};
 
 /// What the main area shows.
@@ -53,6 +56,71 @@ pub enum JobKind {
     Probe,
 }
 
+/// Where a running job is (design v4 §11: progress per phase).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Stage {
+    /// Before the engine reports anything (resolving the target, the preflight).
+    #[default]
+    Starting,
+    /// Uploading the dataset.
+    Preparing,
+    Warmup,
+    Measuring,
+    /// Verifying what was written.
+    Verifying,
+    /// Removing test data.
+    Cleanup,
+}
+
+impl Stage {
+    pub fn label(self) -> &'static str {
+        match self {
+            Stage::Starting => "starting",
+            Stage::Preparing => "preparing",
+            Stage::Warmup => "warmup",
+            Stage::Measuring => "measuring",
+            Stage::Verifying => "verifying",
+            Stage::Cleanup => "cleanup",
+        }
+    }
+
+    /// The stages a run goes through, in order (the live view's steps).
+    pub const STEPS: [Stage; 4] = [
+        Stage::Preparing,
+        Stage::Warmup,
+        Stage::Measuring,
+        Stage::Cleanup,
+    ];
+
+    fn rank(self) -> u8 {
+        match self {
+            Stage::Starting => 0,
+            Stage::Preparing => 1,
+            Stage::Warmup => 2,
+            Stage::Measuring => 3,
+            Stage::Verifying => 4,
+            Stage::Cleanup => 5,
+        }
+    }
+
+    /// Whether this stage is behind `now` (a step already done).
+    pub fn before(self, now: Stage) -> bool {
+        self.rank() < now.rank()
+    }
+
+    fn of(p: crate::trace::Phase) -> Stage {
+        use crate::trace::Phase as P;
+        match p {
+            P::Idle => Stage::Starting,
+            P::Preparing => Stage::Preparing,
+            P::Warmup => Stage::Warmup,
+            P::Measure => Stage::Measuring,
+            P::Verify => Stage::Verifying,
+            P::Cleanup | P::Done => Stage::Cleanup,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
     Running,
@@ -82,6 +150,8 @@ pub struct Live {
     pub failure: Option<Failure>,
     /// The run it produced.
     pub run_id: Option<String>,
+    /// Where the job is (from the engine's snapshots and its cleanup stage).
+    pub stage: Stage,
 }
 
 /// What the inspector panel (right) shows.
@@ -115,6 +185,12 @@ pub enum Overlay {
     ConfirmQuit,
     /// The inspector panel over the content (narrow windows, the terminal).
     Inspector,
+    /// The Add Target sheet.
+    AddTarget,
+    /// Pick a stored run to open (the palette's list of runs).
+    PickRun,
+    /// Pick a configured target for the next run.
+    PickTarget,
 }
 
 /// Request table rows: indices into the current run's rows (shared, compared by identity).
@@ -139,9 +215,65 @@ pub struct Form {
     pub endpoint: Signal<String>,
     pub region: Signal<String>,
     pub label: Signal<String>,
+    pub stored_gib: Signal<String>,
     pub anonymous: Signal<bool>,
     pub advanced: Signal<bool>,
     pub error: Signal<Option<String>>,
+    /// The run the sheet repeats (Edit and Run Again): its spec, which the fields edit.
+    pub spec: Signal<Option<RunSpec>>,
+    /// The id of that run.
+    pub spec_run: Signal<Option<String>>,
+}
+
+/// The Add Target sheet's fields.
+#[derive(Clone, Copy)]
+pub struct AddForm {
+    pub name: Signal<String>,
+    pub url: Signal<String>,
+    pub region: Signal<String>,
+    pub endpoint: Signal<String>,
+    /// A [`crate::ui::model::target::CredChoice`] value (`""`: the default chain).
+    pub credentials: Signal<Option<SharedString>>,
+    pub error: Signal<Option<String>>,
+    /// The connection test's result (tone and message), or `None` before one.
+    pub test: Signal<Option<(Tone, String)>>,
+    pub testing: Signal<bool>,
+}
+
+impl AddForm {
+    pub fn draft(&self) -> TargetDraft {
+        TargetDraft {
+            name: self.name.get_untracked(),
+            url: self.url.get_untracked(),
+            region: self.region.get_untracked(),
+            endpoint: self.endpoint.get_untracked(),
+            credentials: self
+                .credentials
+                .get_untracked()
+                .map(|c| c.to_string())
+                .unwrap_or_default(),
+        }
+    }
+
+    pub fn fill(&self, d: &TargetDraft) {
+        batch(|| {
+            self.name.set(d.name.clone());
+            self.url.set(d.url.clone());
+            self.region.set(d.region.clone());
+            self.endpoint.set(d.endpoint.clone());
+            self.credentials.set(Some(d.credentials.clone().into()));
+            self.error.set(None);
+            self.test.set(None);
+        });
+    }
+}
+
+/// A Verify in flight: when its run lands, it is compared with the run it verifies.
+#[derive(Clone, Debug, PartialEq)]
+struct PendingVerify {
+    base_id: String,
+    code: String,
+    expect: Vec<crate::analysis::verification::Expectation>,
 }
 
 #[derive(Clone, Copy)]
@@ -180,6 +312,20 @@ pub struct Store {
     pub tune_objective: Signal<Option<SharedString>>,
     pub tune_trial: Signal<String>,
     pub tune_max: Signal<String>,
+    /// The spec the tuner started from (what its winner is applied to).
+    pub tune_base: Signal<Option<(String, RunSpec)>>,
+    pub add: AddForm,
+    /// The sidebar's run search and how many runs it lists.
+    pub run_query: Signal<String>,
+    pub run_limit: Signal<usize>,
+    /// The verdict of the last Verify (shown over its comparison).
+    pub verdict: Signal<Option<Verdict>>,
+    /// Compare opened without a pair: the run that is side B (the selectors start there).
+    pub compare_pick: Signal<Option<String>>,
+    pending_verify: Stored<Option<PendingVerify>>,
+    /// Bumped by the run-directory watcher when the directory changes.
+    runs_changed: Stored<Arc<std::sync::atomic::AtomicU64>>,
+    runs_seen: Stored<u64>,
     paths: Stored<Paths>,
     job: Stored<Option<Arc<Job>>>,
     quit_pending: Stored<bool>,
@@ -259,10 +405,25 @@ impl Store {
             endpoint: signal(launch.endpoint.clone().unwrap_or_default()),
             region: signal(launch.region.clone().unwrap_or_default()),
             label: signal(String::new()),
+            stored_gib: signal(String::new()),
             anonymous: signal(launch.anonymous),
             advanced: signal(false),
             error: signal(None),
+            spec: signal(None),
+            spec_run: signal(None),
         };
+        let add = AddForm {
+            name: signal(String::new()),
+            url: signal(String::new()),
+            region: signal(String::new()),
+            endpoint: signal(String::new()),
+            credentials: signal(Some(SharedString::default())),
+            error: signal(None),
+            test: signal(None),
+            testing: signal(false),
+        };
+        let tune = crate::config::defaults().tune;
+        let runs_changed = watch_dir(paths.run_store().dir().to_path_buf());
         let s = Self {
             mode: signal(Mode::Welcome),
             runs: signal(Vec::new()),
@@ -293,8 +454,17 @@ impl Store {
             probe_endpoint: signal(String::new()),
             filter_ref: element_ref(),
             tune_objective: signal(Some("throughput".into())),
-            tune_trial: signal(crate::cli::args::tune_defaults::TRIAL_DURATION.to_owned()),
-            tune_max: signal("8".to_owned()),
+            tune_trial: signal(tune.trial_duration.to_string()),
+            tune_max: signal(tune.max_trials.to_string()),
+            tune_base: signal(None),
+            add,
+            run_query: signal(String::new()),
+            run_limit: signal(crate::ui::model::runs::PAGE),
+            verdict: signal(None),
+            compare_pick: signal(None),
+            pending_verify: stored(None),
+            runs_seen: stored(runs_changed.load(std::sync::atomic::Ordering::Relaxed)),
+            runs_changed: stored(runs_changed),
             paths: stored(paths),
             job: stored(None),
             quit_pending: stored(false),
@@ -560,6 +730,7 @@ impl Store {
                 trials: Vec::new(),
                 failure: None,
                 run_id: None,
+                stage: Stage::Starting,
             }));
             if kind == JobKind::Run {
                 self.select_live();
@@ -576,7 +747,7 @@ impl Store {
         let req = form.prepare(&self.config(), Some(self.run_store()), self.trace_max())?;
         self.update_prefs(|p| {
             p.push_recent(&form.target);
-            if !form.preset.trim().is_empty() {
+            if form.spec.is_none() && !form.preset.trim().is_empty() {
                 p.preset = form.preset.trim().to_owned();
             }
         });
@@ -586,17 +757,18 @@ impl Store {
 
     pub fn start_request(&self, req: RunRequest) {
         let title = req
-            .display
+            .target_name
             .clone()
+            .or_else(|| req.profile.target.url.clone())
             .unwrap_or_else(|| req.profile.target.display());
         let total = req.profile.workload.duration.get().as_secs_f64();
         self.begin(Job::run(req), JobKind::Run, title, total);
     }
 
-    /// The New Run sheet's Start.
-    pub fn submit_form(&self) {
+    /// The New Run sheet's values.
+    pub fn form_values(&self) -> RunForm {
         let f = self.form;
-        let form = RunForm {
+        RunForm {
             target: f.target.get_untracked(),
             preset: f
                 .preset
@@ -610,9 +782,76 @@ impl Store {
             endpoint: f.endpoint.get_untracked(),
             region: f.region.get_untracked(),
             label: f.label.get_untracked(),
+            stored_gib: f.stored_gib.get_untracked(),
             anonymous: f.anonymous.get_untracked(),
-            knobs: None,
-        };
+            spec: f.spec.get_untracked(),
+        }
+    }
+
+    /// Show `form` in the New Run sheet's fields.
+    pub fn fill_form(&self, form: &RunForm, run_id: Option<String>) {
+        let f = self.form;
+        batch(|| {
+            f.target.set(form.target.clone());
+            f.preset.set(Some(form.preset.clone().into()));
+            f.duration.set(form.duration.clone());
+            f.concurrency.set(form.concurrency.clone());
+            f.io_concurrency.set(form.io_concurrency.clone());
+            f.chunk.set(form.chunk.clone());
+            f.endpoint.set(form.endpoint.clone());
+            f.region.set(form.region.clone());
+            f.label.set(form.label.clone());
+            f.stored_gib.set(form.stored_gib.clone());
+            f.anonymous.set(form.anonymous);
+            f.spec.set(form.spec.clone());
+            f.spec_run.set(run_id);
+            f.error.set(None);
+        });
+    }
+
+    /// New Run…: a fresh form (the last target and the defaults), not tied to a run.
+    pub fn open_new_run(&self) {
+        let f = self.form;
+        if f.spec.get_untracked().is_some() {
+            let p = self.prefs.get_untracked();
+            batch(|| {
+                f.spec.set(None);
+                f.spec_run.set(None);
+                f.preset.set(Some(p.preset.clone().into()));
+                f.duration.set(p.duration.clone());
+                f.concurrency.set(p.concurrency.clone());
+                f.io_concurrency.set(String::new());
+                f.chunk.set(String::new());
+                f.label.set(String::new());
+                f.stored_gib.set(String::new());
+            });
+        }
+        self.open(Overlay::NewRun);
+    }
+
+    /// The shown run's spec and id.
+    pub fn current_spec(&self) -> Option<(String, RunSpec)> {
+        self.current.with_untracked(|c| {
+            c.as_ref()
+                .map(|c| (c.id().to_owned(), c.run.report.spec.clone()))
+        })
+    }
+
+    /// Edit and Run Again…: the sheet on the shown run's spec (its fields edit the spec).
+    pub fn edit_rerun(&self) {
+        match self.current_spec() {
+            Some((id, spec)) => {
+                self.fill_form(&RunForm::from_spec(&spec), Some(id));
+                self.open(Overlay::NewRun);
+            }
+            None => self.open_new_run(),
+        }
+    }
+
+    /// The New Run sheet's Start.
+    pub fn submit_form(&self) {
+        let f = self.form;
+        let form = self.form_values();
         if form.target.trim().is_empty() {
             f.error.set(Some(
                 "Choose a target: a storage URL, a configured target name, or lab://demo.".into(),
@@ -628,14 +867,15 @@ impl Store {
         }
     }
 
-    /// "Try the demo": the lab's demo scenario (throttling and stragglers), no credentials.
+    /// "Try the demo": `lab://demo` with the CLI's demo defaults ([`crate::config::defaults`]).
+    /// TODO(v4 stream D): the lab://demo workload defaults land with `oprobe demo` = lab://demo.
     pub fn demo(&self) {
+        let d = crate::config::defaults();
         let duration = crate::ui::launch()
             .duration
-            .unwrap_or_else(|| "8s".to_owned());
+            .unwrap_or_else(|| d.demo_duration.to_string());
         let form = RunForm {
-            target: "lab://demo".into(),
-            preset: "mixed".into(),
+            target: d.demo_target.clone(),
             duration,
             label: "demo".into(),
             ..Default::default()
@@ -645,55 +885,181 @@ impl Store {
         }
     }
 
-    /// Repeat the shown run (target, workload, knobs).
+    /// Run the shown run again: its spec, exactly (`oprobe run --from RUN`).
     pub fn rerun(&self) {
-        let form = self
-            .current
-            .with_untracked(|c| c.as_ref().map(|c| RunForm::from_report(&c.run.report)));
-        match form {
-            Some(f) => {
-                if let Err(e) = self.start_form(f) {
+        match self.current_spec() {
+            Some((_, spec)) => {
+                if let Err(e) = self.start_form(RunForm::from_spec(&spec)) {
                     self.toast(e, Tone::Crit);
                 }
             }
-            None => self.open(Overlay::NewRun),
+            None => self.open_new_run(),
         }
     }
 
-    /// Run a finding's verification command as a new run.
+    /// Run the spec of run `base_id` with `overrides`; when it lands it is compared with
+    /// `base_id` and the hypothesis `code` judged against `expect`.
+    fn start_verify(
+        &self,
+        base_id: String,
+        spec: &RunSpec,
+        overrides: &Overrides,
+        code: &str,
+        expect: Vec<crate::analysis::verification::Expectation>,
+    ) {
+        let mut next = match spec.try_with(overrides) {
+            Ok(s) => s,
+            Err(e) => {
+                self.toast(format!("cannot verify: {}", e.message), Tone::Crit);
+                return;
+            }
+        };
+        next.label = Some(format!("verify {code}"));
+        next.profile.name = next.label.clone();
+        let form = RunForm::from_spec(&next);
+        match self.start_form(form) {
+            Ok(()) => {
+                self.pending_verify.replace(Some(PendingVerify {
+                    base_id,
+                    code: code.to_owned(),
+                    expect,
+                }));
+                self.verdict.set(None);
+                self.toast(
+                    format!("Verifying {code}: {}", overrides.summary()),
+                    Tone::Info,
+                );
+            }
+            Err(e) => self.toast(e, Tone::Crit),
+        }
+    }
+
+    /// Verify a finding of the shown run: replay its spec with the finding's overrides, then
+    /// compare the two runs and judge the hypothesis (design v4 §5).
     pub fn verify(&self, f: &Finding) {
-        // The self-contained form: the launcher parses `oprobe run TARGET --flag …`.
-        let Some(cmd) = f.verification.as_ref().map(|v| v.replay.clone()) else {
+        let Some(v) = f.verification.clone() else {
             return;
         };
-        let form = self.current.with_untracked(|c| {
-            c.as_ref()
-                .map(|c| RunForm::from_command(&cmd, &c.run.report))
-        });
-        match form {
-            Some(Ok(form)) => {
-                if let Err(e) = self.start_form(form) {
-                    self.toast(e, Tone::Crit);
-                }
-            }
-            Some(Err(e)) => self.toast(e, Tone::Crit),
-            None => {}
+        let Some((id, spec)) = self.current_spec() else {
+            return;
+        };
+        self.start_verify(id, &spec, &v.overrides, &f.code, v.expect);
+    }
+
+    /// The most severe finding of the shown run that has a verification.
+    pub fn top_verifiable(&self) -> Option<Finding> {
+        self.current.with(|c| {
+            c.as_ref().and_then(|c| {
+                c.run
+                    .report
+                    .findings
+                    .iter()
+                    .filter(|f| f.verification.is_some())
+                    .max_by_key(|f| f.severity)
+                    .cloned()
+            })
+        })
+    }
+
+    pub fn verify_top(&self) {
+        match self.top_verifiable() {
+            Some(f) => self.verify(&f),
+            None => self.toast("The shown run has no finding to verify", Tone::Warn),
         }
     }
 
-    /// Run the tuner on the shown run's target.
+    /// The tuner's winner as overrides of the spec it started from.
+    fn tuned_overrides(&self) -> Option<(String, RunSpec, Overrides)> {
+        let (id, spec) = self.tune_base.get_untracked()?;
+        let k = self
+            .tuned
+            .with_untracked(|t| t.as_ref().map(|t| t.knobs.clone()))?;
+        let base = spec.resolved_profile().knobs;
+        let mut o = Overrides::default();
+        let mut set = |key: &str, a: String, b: String| {
+            if a != b {
+                let _ = o.set(key, &b);
+            }
+        };
+        set(
+            "concurrency",
+            base.concurrency.to_string(),
+            k.concurrency.to_string(),
+        );
+        set(
+            "io_concurrency",
+            base.io_concurrency.to_string(),
+            k.io_concurrency.to_string(),
+        );
+        set(
+            "chunk_size",
+            base.chunk_size.to_string(),
+            k.chunk_size.to_string(),
+        );
+        set(
+            "max_inflight_requests",
+            base.max_inflight_requests.to_string(),
+            k.max_inflight_requests.to_string(),
+        );
+        set(
+            "http_version",
+            format!("{:?}", base.http_version).to_lowercase(),
+            format!("{:?}", k.http_version).to_lowercase(),
+        );
+        Some((id, spec, o))
+    }
+
+    /// The tune result's "Run with these settings": the spec tuned, with the winner applied.
+    pub fn run_tuned(&self) {
+        let Some((_, spec, o)) = self.tuned_overrides() else {
+            self.toast("No tuning result to run", Tone::Warn);
+            return;
+        };
+        let mut next = spec.with(&o);
+        next.label = Some("tuned settings".into());
+        next.profile.name = next.label.clone();
+        if let Err(e) = self.start_form(RunForm::from_spec(&next)) {
+            self.toast(e, Tone::Crit);
+        }
+    }
+
+    /// The tune result's "Verify": the winner against the run tuned, compared and judged.
+    pub fn verify_tuned(&self) {
+        let Some((id, spec, o)) = self.tuned_overrides() else {
+            self.toast("No tuning result to verify", Tone::Warn);
+            return;
+        };
+        let expect = vec![crate::analysis::verification::Expectation {
+            metric: "summary.ops_per_s".into(),
+            direction: crate::analysis::verification::Direction::Increase,
+            unit: "ops_per_s".into(),
+            ..Default::default()
+        }];
+        self.start_verify(id, &spec, &o, "tune", expect);
+    }
+
+    /// Fix (recommend): diagnose → tune → verify on the shown run's target. In the App this
+    /// is the tuner on the shown run (its result offers Run, Verify and Save profile).
+    /// TODO(v4 stream T): run `oprobe fix` / `recommend_config` once it lands.
+    pub fn fix(&self) {
+        self.mode.set(Mode::Tune);
+        self.start_tune();
+    }
+
+    /// Run the tuner on the shown run's target (its spec), with the CLI's search defaults.
     pub fn start_tune(&self) {
         if self.busy() {
             self.toast("a job is in progress: stop it first", Tone::Warn);
             return;
         }
-        let form = self
-            .current
-            .with_untracked(|c| c.as_ref().map(|c| RunForm::from_report(&c.run.report)))
-            .unwrap_or_else(|| RunForm {
+        let base = self.current_spec();
+        let form = match &base {
+            Some((_, spec)) => RunForm::from_spec(spec),
+            None => RunForm {
                 target: self.form.target.get_untracked(),
                 ..Default::default()
-            });
+            },
+        };
         let objective = match self.tune_objective.get_untracked().as_deref() {
             Some("latency") => crate::tune::Objective::Latency,
             Some("cost") => crate::tune::Objective::Cost,
@@ -707,12 +1073,12 @@ impl Store {
                 return;
             }
         };
+        // The CLI's own defaults for everything the page does not show (trial warmup,
+        // cooldown, max concurrency): `config::defaults().tune` through `TuneSettings`.
         let settings = crate::cli::TuneSettings {
             trial_duration: &trial,
-            trial_warmup: "0s",
             max_trials: max,
-            cooldown: "1s",
-            ..Default::default()
+            ..crate::cli::TuneSettings::default()
         };
         let opts = match crate::cli::tune_options(objective, &settings, None) {
             Ok(o) => o,
@@ -728,14 +1094,11 @@ impl Store {
                 return;
             }
         };
-        if req.lab.is_some() {
-            self.toast(
-                "the tuner needs a real target (or `oprobe lab` + its URL)",
-                Tone::Warn,
-            );
-            return;
-        }
-        let title = req.profile.target.display();
+        let title = req
+            .target_name
+            .clone()
+            .or_else(|| req.profile.target.url.clone())
+            .unwrap_or_else(|| req.profile.target.display());
         let job = Job::tune(
             req.profile,
             req.target_name,
@@ -743,9 +1106,81 @@ impl Store {
             req.budgets,
             Some(self.run_store()),
         );
-        self.tuned.set(None);
+        batch(|| {
+            self.tuned.set(None);
+            self.tune_base.set(base);
+        });
         self.begin(job, JobKind::Tune, title, 0.0);
         self.mode.set(Mode::Tune);
+    }
+
+    // -----------------------------------------------------------------------------------
+    // Targets
+    // -----------------------------------------------------------------------------------
+
+    /// Add Target…: the sheet, empty or started from a credentials source found here.
+    pub fn open_add_target(&self, from: Option<TargetDraft>) {
+        self.add.fill(&from.unwrap_or_default());
+        self.open(Overlay::AddTarget);
+    }
+
+    /// Test the sheet's target, read-only: list at most one entry under its root.
+    pub fn test_target(&self) {
+        let draft = self.add.draft();
+        let add = self.add;
+        let (name, entry) = match draft.entry() {
+            Ok(x) => x,
+            Err(e) => {
+                add.error.set(Some(e));
+                return;
+            }
+        };
+        let mut cfg = self.config();
+        cfg.targets.insert(name.clone(), entry);
+        batch(|| {
+            add.error.set(None);
+            add.testing.set(true);
+            add.test
+                .set(Some((Tone::Info, "Testing (read-only)…".into())));
+        });
+        spawn(async move {
+            let res = off_thread(move || test_connection(&name, &cfg)).await;
+            batch(|| {
+                add.testing.set(false);
+                add.test.set(Some(match res {
+                    Some(Ok(msg)) => (Tone::Ok, msg),
+                    Some(Err(e)) => (Tone::Crit, e),
+                    None => (Tone::Crit, "the test did not finish".into()),
+                }));
+            });
+        });
+    }
+
+    /// Save the sheet's target to the config file (`[targets.NAME]`).
+    pub fn save_target(&self) {
+        let draft = self.add.draft();
+        let path = self.paths.with(|p| p.config_file.clone());
+        let mut cfg = self.config();
+        match draft.add_to(&mut cfg, false) {
+            Ok(name) => match cfg.save(&path) {
+                Ok(()) => {
+                    self.refresh();
+                    batch(|| {
+                        self.overlay.set(None);
+                        self.form.target.set(name.clone());
+                    });
+                    self.toast(format!("Saved target {name}"), Tone::Ok);
+                }
+                Err(e) => self.add.error.set(Some(format!("{e:#}"))),
+            },
+            Err(e) => self.add.error.set(Some(e)),
+        }
+    }
+
+    /// Switch target: the next run uses `name` (the New Run sheet opens on it).
+    pub fn switch_target(&self, name: &str) {
+        self.form.target.set(name.to_owned());
+        self.open_new_run();
     }
 
     /// Probe an endpoint's handshakes.
@@ -842,11 +1277,25 @@ impl Store {
                 }
             });
         }
+        // Runs saved elsewhere (the CLI, another window): the watcher saw the directory change.
+        let stamp = self
+            .runs_changed
+            .with(|g| g.load(std::sync::atomic::Ordering::Relaxed));
+        if self.runs_seen.with(|s| *s != stamp) {
+            self.runs_seen.replace(stamp);
+            self.refresh();
+        }
         let Some(job) = self.job.with(|j| j.clone()) else {
             return;
         };
         let up = job.take();
-        if up.snapshot.is_none() && up.log.is_empty() && up.trials.is_none() && up.outcome.is_none()
+        let stage_now = self.live.with_untracked(|l| l.as_ref().map(|l| l.stage));
+        let cleaning = up.cleaning && stage_now != Some(Stage::Cleanup);
+        if up.snapshot.is_none()
+            && up.log.is_empty()
+            && up.trials.is_none()
+            && up.outcome.is_none()
+            && !cleaning
         {
             return;
         }
@@ -854,11 +1303,16 @@ impl Store {
         self.live.update(|l| {
             let Some(l) = l else { return };
             if let Some(snap) = up.snapshot {
-                l.series = Series::from_timeline(&snap.timeline, snap.elapsed_s);
-                if l.total_s > 0.0 {
+                // Append what is new to the series (finished seconds never change).
+                l.series.update_timeline(&snap.timeline, snap.elapsed_s);
+                l.stage = Stage::of(snap.phase);
+                if l.total_s > 0.0 && l.stage == Stage::Measuring {
                     progress = Some((snap.elapsed_s / l.total_s).clamp(0.0, 1.0));
                 }
                 l.snapshot = Some(snap);
+            }
+            if up.cleaning {
+                l.stage = Stage::Cleanup;
             }
             l.log.extend(up.log);
             if l.log.len() > 200 {
@@ -876,7 +1330,12 @@ impl Store {
         self.job.replace(None);
         main_progress(None);
         match outcome {
-            Outcome::Run { run, path, tuned } => {
+            Outcome::Run {
+                run,
+                path,
+                tuned,
+                partial,
+            } => {
                 let id = run.id().to_owned();
                 let headline = run.report.verdict.headline.clone();
                 let kind = self.live.with_untracked(|l| l.as_ref().map(|l| l.kind));
@@ -902,7 +1361,18 @@ impl Store {
                     });
                 }
                 self.finished_in_background(&format!("Run {id} finished"), &headline);
-                self.toast(format!("Run {id} finished · {headline}"), Tone::Ok);
+                match &partial {
+                    // A budget stop is not a failure: the partial run is kept and shown.
+                    Some(why) => self.toast(
+                        format!("Run {id} stopped by a budget (partial run kept): {why}"),
+                        Tone::Warn,
+                    ),
+                    None => self.toast(format!("Run {id} finished · {headline}"), Tone::Ok),
+                }
+                // A Verify's run: compare it with the run it verifies and judge.
+                if let Some(v) = self.pending_verify.with(|p| p.take()) {
+                    self.compare_verify(v, id.clone());
+                }
             }
             Outcome::Probe(r) => {
                 self.live.update(|l| {
@@ -913,6 +1383,7 @@ impl Store {
                 self.probe.set(Some(*r));
             }
             Outcome::Failed { error, hint } => {
+                self.pending_verify.replace(None);
                 let stopped = self
                     .live
                     .with_untracked(|l| l.as_ref().is_some_and(|l| l.phase == Phase::Stopping));
@@ -958,8 +1429,12 @@ impl Store {
     /// The window came to the front: the badge has been seen.
     pub fn window_focused(&self, on: bool) {
         self.focused.set(on);
-        if on && !kit_in_terminal() {
-            set_badge(0);
+        if on {
+            // Coming back: runs may have been saved meanwhile.
+            self.refresh();
+            if !kit_in_terminal() {
+                set_badge(0);
+            }
         }
     }
 
@@ -1018,6 +1493,17 @@ impl Store {
 
     /// Compare two stored runs (A = baseline, B = candidate).
     pub fn compare(&self, a: &str, b: &str) {
+        self.verdict.set(None);
+        self.compare_then(a, b, None);
+    }
+
+    /// A Verify's run landed: compare it with the original and judge the hypothesis.
+    fn compare_verify(&self, v: PendingVerify, cand: String) {
+        let base = v.base_id.clone();
+        self.compare_then(&base, &cand, Some(v));
+    }
+
+    fn compare_then(&self, a: &str, b: &str, verify: Option<PendingVerify>) {
         let store = self.run_store();
         let (a, b) = (a.to_owned(), b.to_owned());
         let s = *self;
@@ -1037,8 +1523,20 @@ impl Store {
             .await;
             match res {
                 Some(Ok((va, vb, c))) => {
-                    s.comparison
-                        .set(Some((Shared(Arc::new(va)), Shared(Arc::new(vb)), c)))
+                    let verdict = verify.map(|v| {
+                        crate::ui::model::verify::judge(
+                            &v.code,
+                            &v.expect,
+                            &va.run.report,
+                            &vb.run.report,
+                            &c.diff,
+                        )
+                    });
+                    batch(|| {
+                        s.verdict.set(verdict);
+                        s.comparison
+                            .set(Some((Shared(Arc::new(va)), Shared(Arc::new(vb)), c)));
+                    });
                 }
                 Some(Err(e)) => s.toast(format!("cannot compare: {e:#}"), Tone::Crit),
                 None => {}
@@ -1046,7 +1544,8 @@ impl Store {
         });
     }
 
-    /// Compare the marked runs, or the shown run with the one before it.
+    /// Compare the marked runs, or the shown run with the newest earlier run of the same
+    /// target and workload (design v4 §2: never an unrelated run).
     pub fn compare_default(&self) {
         let marked = self.marked.get_untracked();
         if marked.len() == 2 {
@@ -1067,13 +1566,23 @@ impl Store {
             self.toast("Compare needs two runs", Tone::Warn);
             return;
         };
-        let pos = runs.iter().position(|r| r.id == cur).unwrap_or(0);
-        match runs.get(pos + 1) {
-            Some(prev) => self.compare(&prev.id.clone(), &cur),
-            None => self.toast(
-                "Compare needs two runs: mark two in the sidebar",
-                Tone::Warn,
-            ),
+        match crate::ui::model::runs::default_pair(&runs, &cur) {
+            Some((a, b)) => self.compare(&a, &b),
+            None => {
+                // No earlier run measured the same thing: open Compare on the shown run so
+                // the other side can be picked (a non-comparable pair says why).
+                batch(|| {
+                    self.verdict.set(None);
+                    self.comparison.set(None);
+                    self.compare_pick.set(Some(cur.clone()));
+                    self.mode.set(Mode::Compare);
+                });
+                self.toast(
+                    "No earlier run of the same target and workload: pick the other run, \
+                     or mark two in the sidebar",
+                    Tone::Warn,
+                );
+            }
         }
     }
 
@@ -1094,8 +1603,108 @@ impl Store {
     }
 }
 
+/// Read-only connection test of configured target `name` (the Add Target sheet's "Test"):
+/// resolve it as a run would (credentials included), then list at most one entry under its
+/// root. Nothing is written. Runs on an engine thread (blocking).
+pub fn test_connection(name: &str, cfg: &ConfigFile) -> Result<String, String> {
+    use crate::cli::args::{CostArgs, KnobArgs, TargetArgs, WorkloadArgs};
+    use futures::TryStreamExt;
+    let l = crate::ui::launch();
+    let ta = TargetArgs {
+        target: Some(name.to_owned()),
+        ca_cert: l.ca_cert,
+        insecure: l.insecure,
+        proxy: l.proxy,
+        ..Default::default()
+    };
+    let err = |e: anyhow::Error| format!("{e:#}");
+    let (ta, _) = crate::cli::resolve_target(&ta, cfg).map_err(err)?;
+    let p = crate::cli::build_profile(
+        &ta,
+        &WorkloadArgs::default(),
+        &KnobArgs::default(),
+        &CostArgs::default(),
+    )
+    .map_err(err)?;
+    let mut target = p.target.clone();
+    let shown = target.display();
+    let fut = async move {
+        crate::engine::operator::prepare_target(&mut target, &p.knobs).await?;
+        let op = crate::engine::operator::base_operator(&target)?;
+        let mut lister = op.lister_with("").limit(2).await?;
+        let mut n = 0usize;
+        while lister.try_next().await?.is_some() {
+            n += 1;
+            if n >= 2 {
+                break;
+            }
+        }
+        anyhow::Ok(n)
+    };
+    let res = tokio::runtime::Handle::current()
+        .block_on(async { tokio::time::timeout(Duration::from_secs(20), fut).await });
+    match res {
+        Err(_) => Err(format!("no answer from {shown} within 20 s")),
+        Ok(Ok(0)) => Ok(format!(
+            "Connected to {shown} (read-only): nothing stored yet"
+        )),
+        Ok(Ok(_)) => Ok(format!(
+            "Connected to {shown} (read-only): objects are listed"
+        )),
+        Ok(Err(e)) => {
+            let kind = e
+                .downcast_ref::<opendal::Error>()
+                .map(|o| o.kind())
+                .unwrap_or(opendal::ErrorKind::Unexpected);
+            let first = format!("{e:#}");
+            Err(match kind {
+                opendal::ErrorKind::PermissionDenied => format!(
+                    "the credentials were rejected (permission denied): check the credentials \
+                     source — {first}"
+                ),
+                opendal::ErrorKind::NotFound => {
+                    format!("the bucket or container was not found: check the URL — {first}")
+                }
+                _ => first,
+            })
+        }
+    }
+}
+
 fn kit_in_terminal() -> bool {
     crate::ui::kit::in_terminal()
+}
+
+/// What changes in a directory when a run file is written, renamed or removed: its own
+/// modification time and its entry count (cheap: one `stat` and one listing).
+fn dir_stamp(dir: &std::path::Path) -> (Option<std::time::SystemTime>, usize) {
+    let mtime = std::fs::metadata(dir).and_then(|m| m.modified()).ok();
+    let n = std::fs::read_dir(dir).map(|d| d.count()).unwrap_or(0);
+    (mtime, n)
+}
+
+/// Watch the runs directory on a background thread (about once a second) and bump the
+/// counter it returns whenever it changes: runs saved by the CLI (or another window) appear
+/// without a restart. The thread ends when the store drops the counter.
+fn watch_dir(dir: PathBuf) -> Arc<std::sync::atomic::AtomicU64> {
+    use std::sync::atomic::Ordering;
+    let stamp = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let weak = Arc::downgrade(&stamp);
+    let _ = std::thread::Builder::new()
+        .name("oprobe-runs-watch".into())
+        .spawn(move || {
+            let mut last = dir_stamp(&dir);
+            loop {
+                std::thread::sleep(Duration::from_millis(1000));
+                let Some(g) = weak.upgrade() else { return };
+                let now = dir_stamp(&dir);
+                if now != last {
+                    last = now;
+                    g.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        });
+    stamp
 }
 
 /// Dock / taskbar progress of the main window (`None` clears it).
