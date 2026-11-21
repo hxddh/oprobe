@@ -661,7 +661,9 @@ fn demo_narrates_and_saves_a_run() {
     assert!(o.status.success(), "{}", stderr(&o));
     let text = stdout(&o);
     assert!(text.contains("What oprobe found"), "{text}");
-    assert!(text.contains("oprobe target add"), "{text}");
+    // The next steps are replays of the demo run (design v4 §10), one on your own bucket.
+    assert!(text.contains("oprobe run --from "), "{text}");
+    assert!(text.contains("s3://YOUR-BUCKET"), "{text}");
     assert_eq!(env.runs().len(), 1);
     let o = env.run(&["demo", "--duration", "1s", "-o", "json"]);
     let v = json(&o);
