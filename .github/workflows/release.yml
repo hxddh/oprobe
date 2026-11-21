@@ -9,9 +9,14 @@ name: Release
 #   oprobe-desktop-<ver>-x86_64-unknown-linux-gnu.tar.gz  (Linux build with windows; needs GTK 4)
 # One binary everywhere: macOS and Windows builds include native windows (`--features gui`);
 # Linux packages stay headless (CLI + terminal workbench) so servers need no GTK.
-#   SHA256SUMS, oprobe.rb (Homebrew formula), oprobe.cask.rb (Homebrew cask for the .dmg),
-#   oprobe.json (Scoop manifest), winget-manifests.zip (submit to microsoft/winget-pkgs),
+#   SHA256SUMS, oprobe.rb (Homebrew formula `oprobe`), oprobe-app.rb (Homebrew cask `oprobe-app`
+#   for the .dmg), oprobe.json (Scoop manifest), winget-manifests.zip (winget manifests),
 #   latest.json (index of every asset with URL, size and SHA-256), install.sh, install.ps1
+# After publishing, package managers are updated when their secret exists (skipped with a
+# warning otherwise; stable releases only; docs/releasing.md):
+#   homebrew-tap  TAP_TOKEN     Formula/oprobe.rb + Casks/oprobe-app.rb -> hxddh/homebrew-tap
+#   scoop-bucket  SCOOP_TOKEN   bucket/oprobe.json -> hxddh/scoop-bucket
+#   winget        WINGET_TOKEN  a pull request to microsoft/winget-pkgs (hxddh.oprobe)
 # Every asset gets a SLSA build provenance attestation (`gh attestation verify FILE --repo …`).
 # Nothing is code-signed (no Apple/Microsoft certificates): docs/install.md explains the first open.
 # Release notes are the CHANGELOG section of the version.
@@ -355,7 +360,8 @@ jobs:
             echo
             echo "---"
             echo "**Install:** \`curl -fsSL https://github.com/${{ github.repository }}/releases/download/v$VERSION/install.sh | sh\` ·"
-            echo "Windows: \`winget install hxddh.oprobe\` or the \`.msi\` · update: \`oprobe self-update\`."
+            echo "Homebrew: \`brew install hxddh/tap/oprobe\` (the app: \`brew install --cask hxddh/tap/oprobe-app\`) ·"
+            echo "Windows: the \`.msi\`, Scoop (\`scoop bucket add hxddh https://github.com/hxddh/scoop-bucket\` then \`scoop install oprobe\`), or \`winget install hxddh.oprobe\` once its winget-pkgs pull request is merged · update: \`oprobe self-update\`."
             echo "The macOS and Windows packages are not code-signed; first open: [docs/install.md](https://github.com/${{ github.repository }}/blob/v$VERSION/docs/install.md#first-open-of-unsigned-packages)."
             echo "Verify: \`sha256sum -c SHA256SUMS --ignore-missing\` and \`gh attestation verify <file> --repo ${{ github.repository }}\`."
           } >> notes.md
@@ -366,7 +372,7 @@ jobs:
           body_path: notes.md
           files: out/*
           fail_on_unmatched_files: true
-      # `uses: hxddh/oprobe@v3` (the GitHub Action) follows the newest 3.x release.
+      # `uses: hxddh/oprobe@v<major>` (the GitHub Action) installs the newest release of its major.
       # GitHub refuses to let the workflow token move a tag across commits that change
       # `.github/workflows/`, which a major release usually does: set the RELEASE_TAG_TOKEN
       # secret (a token with `contents` and `workflows` write) to move it here. Without it, a
@@ -409,3 +415,115 @@ jobs:
             echo "::warning::CARGO_REGISTRY_TOKEN not set; skipping crates.io publish"; exit 0
           fi
           cargo publish --locked
+
+  # Package managers. Each job is gated on its secret: without it, the job ends with a warning
+  # and the release stays green. Pre-releases are never published to them.
+  homebrew-tap:
+    name: Homebrew tap (hxddh/homebrew-tap)
+    needs: [plan, meta, publish]
+    if: ${{ !contains(needs.meta.outputs.version, '-') }}
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
+      TAG: ${{ needs.plan.outputs.tag }}
+      TAP_TOKEN: ${{ secrets.TAP_TOKEN }}
+    steps:
+      - id: gate
+        run: |
+          if [ -z "$TAP_TOKEN" ]; then
+            echo "::warning::TAP_TOKEN not set; skipping the Homebrew tap update (docs/releasing.md#homebrew)"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Download the formula and the cask
+        if: steps.gate.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: gh release download "$TAG" --repo "$REPO" --pattern oprobe.rb --pattern oprobe-app.rb --dir manifests
+      - uses: actions/checkout@v4
+        if: steps.gate.outputs.skip != 'true'
+        with:
+          repository: hxddh/homebrew-tap
+          token: ${{ secrets.TAP_TOKEN }}
+          path: tap
+      - name: Commit and push
+        if: steps.gate.outputs.skip != 'true'
+        run: |
+          mkdir -p tap/Formula tap/Casks
+          cp manifests/oprobe.rb tap/Formula/oprobe.rb
+          cp manifests/oprobe-app.rb tap/Casks/oprobe-app.rb
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/oprobe.rb Casks/oprobe-app.rb
+          if git diff --cached --quiet; then echo "the tap already has oprobe $VERSION"; exit 0; fi
+          git commit -m "oprobe $VERSION"
+          git push
+
+  scoop-bucket:
+    name: Scoop bucket (hxddh/scoop-bucket)
+    needs: [plan, meta, publish]
+    if: ${{ !contains(needs.meta.outputs.version, '-') }}
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
+      TAG: ${{ needs.plan.outputs.tag }}
+      SCOOP_TOKEN: ${{ secrets.SCOOP_TOKEN }}
+    steps:
+      - id: gate
+        run: |
+          if [ -z "$SCOOP_TOKEN" ]; then
+            echo "::warning::SCOOP_TOKEN not set; skipping the Scoop bucket update (docs/releasing.md#scoop)"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Download the manifest
+        if: steps.gate.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: gh release download "$TAG" --repo "$REPO" --pattern oprobe.json --dir manifests
+      - uses: actions/checkout@v4
+        if: steps.gate.outputs.skip != 'true'
+        with:
+          repository: hxddh/scoop-bucket
+          token: ${{ secrets.SCOOP_TOKEN }}
+          path: bucket-repo
+      - name: Commit and push
+        if: steps.gate.outputs.skip != 'true'
+        run: |
+          mkdir -p bucket-repo/bucket
+          cp manifests/oprobe.json bucket-repo/bucket/oprobe.json
+          cd bucket-repo
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add bucket/oprobe.json
+          if git diff --cached --quiet; then echo "the bucket already has oprobe $VERSION"; exit 0; fi
+          git commit -m "oprobe: update to version $VERSION"
+          git push
+
+  # winget-releaser forks microsoft/winget-pkgs into the token owner's account and opens a pull
+  # request with the new version (both MSIs). It updates an existing package: the first version
+  # of hxddh.oprobe is submitted by hand from winget-manifests.zip (docs/releasing.md#winget).
+  winget:
+    name: winget pull request (hxddh.oprobe)
+    needs: [plan, meta, publish]
+    if: ${{ !contains(needs.meta.outputs.version, '-') }}
+    runs-on: windows-latest
+    env:
+      WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+    steps:
+      - id: gate
+        shell: bash
+        run: |
+          if [ -z "$WINGET_TOKEN" ]; then
+            echo "::warning::WINGET_TOKEN not set; skipping the winget pull request (submit winget-manifests.zip by hand; docs/releasing.md#winget)"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: vedantmgoyal9/winget-releaser@v2
+        if: steps.gate.outputs.skip != 'true'
+        with:
+          identifier: hxddh.oprobe
+          version: ${{ needs.meta.outputs.version }}
+          release-tag: ${{ needs.plan.outputs.tag }}
+          installers-regex: '\.msi$'
+          token: ${{ secrets.WINGET_TOKEN }}

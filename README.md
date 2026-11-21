@@ -5,8 +5,9 @@
 oprobe drives realistic workloads through [Apache OpenDAL](https://opendal.apache.org/) against S3, GCS,
 Azure Blob, R2, OSS, COS, B2, MinIO or local storage and traces **every backend request**: time queued,
 DNS/TCP/proxy/TLS on new connections, sending, waiting for the first byte, transferring, and waiting for your
-code. It names the cause of what it finds, backs it with evidence, says what to change and how to verify it.
-Every run is saved as one `.oprobe` file you can reopen, compare, export or hand to an agent.
+code. It names the cause of what it finds, backs it with evidence and says what to change — and then checks
+that the change works. Every run is saved as one `.oprobe` file with its full spec: you can reopen it,
+replay it exactly, compare it, export it or hand it to an agent.
 
 It is built for people (a terminal, a native app, a single-file HTML report), for CI (a GitHub Action, exit
 codes, Markdown/JUnit) and for agents (JSON everywhere, an event stream, an MCP server).
@@ -29,10 +30,12 @@ oprobe target add prod s3://my-bucket/oprobe --region eu-west-1
 oprobe run prod
 ```
 
-`oprobe demo` starts a local S3 lab that throttles above 24 requests in flight and turns 1 in 40 requests into
-stragglers, measures it with 32 workers for 8 seconds and explains, step by step, what it found. `oprobe run`
-without a target asks what to measure: the demo, the AWS profiles, Google credentials or Azure variables it
-finds on your machine, or a URL — and saves your choice as a named target.
+`oprobe demo` is `oprobe run lab://demo`: a local S3 lab that throttles above 24 requests in flight and turns
+1 in 40 requests into stragglers, measured with its default workload (small files, 32 workers, 8 seconds).
+It explains, step by step, what it found, and suggests replays of the run (`oprobe run --from RUN`) so every
+follow-up compares like for like. `oprobe run` without a target asks what to measure: the demo, the AWS
+profiles, Google credentials or Azure variables it finds on your machine (`oprobe target discover`), or a
+URL — and saves your choice as a named target.
 
 ```text
 $ oprobe run prod
@@ -58,9 +61,25 @@ advice · next command), the key numbers, and where the full report is.
 | `oprobe runs show last` | The full report in the terminal (80 columns; `--detail` for everything). |
 | `oprobe runs show last -o html > report.html` | One self-contained HTML file: charts with real axes, a latency heatmap, the slowest operations as request waterfalls, every request in a filterable table. Works offline, light and dark, prints cleanly. |
 | `oprobe runs open last` | The run in the native app. |
-| `oprobe compare base last` | A regression gate between two runs (exit 3 on regression). |
-| `oprobe tune prod` | The best client configuration that does not trip throttling, as a profile and Rust/Python code. |
+| `oprobe run --from last --set concurrency=16` | Replay a run from its stored spec — same workload, dataset, warmup, seed, endpoint, region — with one change. |
+| `oprobe verify last throttling` | Test a finding's advice: replays baseline and change interleaved (A B A B…) and answers *confirmed*, *refuted* or *inconclusive* against the predicted numbers. |
+| `oprobe fix prod` | Diagnose → tune → verify in one go: the recommended settings as a profile patch and code. |
+| `oprobe compare base last` | A regression gate between two runs of the same target and workload (exit 3 on regression). |
+| `oprobe tune prod` | The best goodput within a throttle budget, as a profile and Rust/Python code. |
 | `oprobe runs list` | Every saved run: when, verdict, ops/s, p99, cost. |
+
+## One model, one spec, one loop
+
+- **One capacity model.** oprobe reconstructs the requests in flight over time and finds the level where the
+  service starts to throttle (a ceiling with an interval, never a guess from mean latency × rate). Every
+  recommendation that mentions concurrency — the findings, `tune`, `verify`, the app — comes from that one
+  model and keeps a 15 % headroom below the ceiling, taking into account how many requests one operation
+  keeps in flight.
+- **One spec.** Every report carries the run's resolved spec. `oprobe run --from RUN` replays it, `--set
+  key=value` changes one thing, and every suggested command is such a replay, so nothing (warmup, seed, mix,
+  dataset, endpoint, region, HTTP version, rate) is silently dropped.
+- **One loop.** A recommendation is a hypothesis with an expected result. `oprobe verify` measures it and
+  says whether it held; `compare` refuses to judge runs of different targets or workloads.
 
 ![The HTML report of the demo run](docs/images/report-html.png)
 
@@ -79,7 +98,7 @@ Findings and Cost; the selected request or operation on the right. [More →](do
 |---|---|
 | Network, server or my client? | Each operation's wall time split into queue / connect / upload / server / download / retry / client from the real request timeline. |
 | Why is p99 so much worse than p50? | The slowest operations keep every request with its stages, connection (cold/warm), status and request ID, plus an async call stack captured while they were stuck. |
-| Is it throttling? | 429/503 counts, Retry-After, retry backoff as its own share of time, and the concurrency where it starts (`oprobe tune`). |
+| Is it throttling? | 429/503 counts, Retry-After, retry backoff as its own share of time, the in-flight ceiling where it starts and the safe concurrency below it (the capacity model). |
 | Are connections reused? Is TLS slow? | Per-dial DNS/TCP/proxy/TLS times, reuse ratio, peak in-flight requests, per remote address. |
 | Am I paying for bytes I do not use? | Read amplification, over-read from range coalescing, requests per operation. |
 | What will it cost? | The measured request mix × provider price tables, waste from failed requests and over-reads. |
@@ -88,15 +107,16 @@ Findings and Cost; the selected request or operation on the right. [More →](do
 ## In CI
 
 ```yaml
-- uses: hxddh/oprobe@v3
+- uses: hxddh/oprobe@v4
   with:
     target: s3://ci-bucket/oprobe
     preset: small-files
     baseline: main
 ```
 
-The action installs a pinned oprobe, runs, compares against the baseline, uploads the `.oprobe` file and the
-HTML report, keeps one sticky PR comment up to date and fails on regression. [CI guide →](docs/ci.md)
+The action installs the newest oprobe 4.x (or the `version` you pin), runs, compares against the baseline,
+uploads the `.oprobe` file and the HTML report, keeps one sticky PR comment up to date and fails on
+regression. [CI guide →](docs/ci.md)
 
 ## For agents
 
@@ -109,8 +129,9 @@ codes and exit codes; `oprobe schema` prints the JSON Schemas; `oprobe mcp` is a
 | Platform | |
 |---|---|
 | macOS / Linux | `curl -fsSL https://github.com/hxddh/oprobe/releases/latest/download/install.sh \| sh` |
-| Windows | `winget install hxddh.oprobe`, the `.msi`, or `irm https://github.com/hxddh/oprobe/releases/latest/download/install.ps1 \| iex` |
-| Homebrew | `oprobe.rb` (CLI) and `oprobe.cask.rb` (the app) in every release — [docs/install.md](docs/install.md#homebrew) |
+| Homebrew | `brew install hxddh/tap/oprobe` (the app: `brew install --cask hxddh/tap/oprobe-app`) |
+| Windows | `irm https://github.com/hxddh/oprobe/releases/latest/download/install.ps1 \| iex`, the `.msi`, or Scoop (`scoop bucket add hxddh https://github.com/hxddh/scoop-bucket`, `scoop install oprobe`) |
+| winget | `winget install hxddh.oprobe` once the package is accepted into winget-pkgs — [status](docs/install.md#windows) |
 | Debian / Ubuntu, Fedora / RHEL | `.deb` / `.rpm` from the release page |
 | Rust | `cargo install oprobe --locked` (`--features gui` for the window on Linux) |
 

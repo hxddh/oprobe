@@ -1,6 +1,7 @@
-//! `oprobe demo`: a zero-flag tour. Starts an in-process S3 lab that throttles above a
-//! concurrency limit and turns a few requests into stragglers, measures it like any bucket,
-//! then explains the result step by step and shows how to measure a real bucket next.
+//! `oprobe demo`: a zero-flag tour. Runs exactly `oprobe run lab://demo` — the in-process S3
+//! lab that throttles above a concurrency limit and turns a few requests into stragglers, with
+//! the scenario's default workload ([`crate::lab::Scenario::defaults`]) — then explains the
+//! result step by step and suggests `--from` replays, so every follow-up run is comparable.
 
 use anyhow::Result;
 use schemars::JsonSchema;
@@ -9,23 +10,16 @@ use serde::Serialize;
 use super::Ctx;
 use super::args::{DemoArgs, OutputArgs, SafetyArgs};
 use super::run::{Measured, RunOutput, measure};
-use crate::config::{DatasetSpec, Preset};
+use crate::config::{Profile, TargetSpec};
 use crate::errors::{ErrorCode, OprobeError};
-use crate::lab::{LabConfig, LabServer};
+pub use crate::lab::{
+    DEMO_CONCURRENCY, DEMO_STRAGGLER_EVERY, DEMO_STRAGGLER_MS, DEMO_THROTTLE_ABOVE,
+};
 use crate::model::Report;
-use crate::output::CommandOutput;
+use crate::output::{CommandOutput, NextStep};
 use crate::report::style::{bold, cyan, dim};
 use crate::report::terminal::{severity_icon, wrap_text};
-use crate::util::{ByteSize, HumanDuration, fmt_ms, parse_duration};
-
-/// Requests in flight above which the lab answers `503 SlowDown`.
-pub const DEMO_THROTTLE_ABOVE: usize = 24;
-/// Workers of the demo run (more than the lab accepts at once).
-pub const DEMO_CONCURRENCY: usize = 32;
-/// Every Nth request is a straggler.
-pub const DEMO_STRAGGLER_EVERY: usize = 40;
-/// Extra delay of a straggler.
-pub const DEMO_STRAGGLER_MS: u64 = 250;
+use crate::util::{HumanDuration, fmt_ms, parse_duration};
 
 /// One narrated step.
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -42,10 +36,10 @@ pub struct DemoOutput {
     pub path: Option<String>,
     /// The narration, step by step.
     pub steps: Vec<DemoStep>,
-    /// Commands to try next (the JSON envelope's `next`).
+    /// Steps to try next (the JSON envelope's `next`): `--from` replays of this run.
     #[serde(skip)]
     #[schemars(skip)]
-    pub next_commands: Vec<String>,
+    pub next_steps: Vec<NextStep>,
     pub report: Report,
     #[serde(skip)]
     #[schemars(skip)]
@@ -57,11 +51,8 @@ impl CommandOutput for DemoOutput {
         crate::output::WITH_MD_HTML
     }
 
-    fn next(&self) -> Vec<crate::output::NextStep> {
-        self.next_commands
-            .iter()
-            .map(|c| crate::output::NextStep::new("try it on your storage", c.clone()))
-            .collect()
+    fn next(&self) -> Vec<NextStep> {
+        self.next_steps.clone()
     }
 
     fn text(&self) -> String {
@@ -76,9 +67,12 @@ impl CommandOutput for DemoOutput {
                 o += &format!("   {l}\n");
             }
         }
-        o += &format!("\n{}\n", bold("Now try your bucket:"));
-        for c in &self.next_commands {
-            o += &format!("   {c}\n");
+        o += &format!(
+            "\n{}\n",
+            bold("Next (replays of this run, so they compare):")
+        );
+        for n in &self.next_steps {
+            o += &format!("   {}\n     {}\n", n.cli, dim(&n.title));
         }
         o
     }
@@ -90,9 +84,9 @@ impl CommandOutput for DemoOutput {
                 o += &format!("   {l}\n");
             }
         }
-        o += "\nNow try your bucket:\n\n```sh\n";
-        for c in &self.next_commands {
-            o += &format!("{c}\n");
+        o += "\nNext (replays of this run, so they compare):\n\n```sh\n";
+        for n in &self.next_steps {
+            o += &format!("{}   # {}\n", n.cli, n.title);
         }
         o += "```\n";
         o
@@ -110,14 +104,8 @@ impl CommandOutput for DemoOutput {
     }
 }
 
-/// The lab's fault profile for the demo: exactly the `lab://demo` scenario, so the commands the
-/// demo suggests (`oprobe run lab://demo …`) measure the same server.
-pub fn demo_lab() -> LabConfig {
-    crate::lab::Scenario::Demo.config()
-}
-
 /// Plain-language narration of a demo run.
-pub fn narrate(r: &Report, run_id: &str) -> (Vec<DemoStep>, Vec<String>) {
+pub fn narrate(r: &Report, run_id: &str) -> (Vec<DemoStep>, Vec<NextStep>) {
     let s = &r.summary;
     let mut steps = vec![DemoStep {
         title: "What ran".into(),
@@ -210,16 +198,52 @@ pub fn narrate(r: &Report, run_id: &str) -> (Vec<DemoStep>, Vec<String>) {
             format!("oprobe runs open {run_id}                 # in the app"),
         ],
     });
-    let next = vec![
-        "oprobe target add prod s3://YOUR-BUCKET/oprobe --region YOUR-REGION".into(),
-        "oprobe run prod".into(),
-        dim("(or just `oprobe run` for a guided choice of the credentials on this machine)"),
+    let mut next = vec![
+        NextStep::new(
+            "replay the demo exactly (same target and workload, so compare is comparable)",
+            format!("oprobe run --from {run_id}"),
+        )
+        .with_mcp("start_run", serde_json::json!({ "from": run_id })),
+        NextStep::new(
+            "compare the replay with the demo",
+            format!("oprobe compare {run_id} last"),
+        )
+        .with_mcp(
+            "compare_runs",
+            serde_json::json!({ "baseline": run_id, "candidate": "last" }),
+        ),
     ];
+    if let Some(f) = fs.iter().find(|f| f.verification.is_some()) {
+        next.push(
+            NextStep::new(
+                "test the top finding: replay with its change, A/B, verdict",
+                format!("oprobe verify {run_id} {}", f.code),
+            )
+            .with_mcp(
+                "verify_finding",
+                serde_json::json!({ "run": run_id, "code": f.code }),
+            ),
+        );
+    }
+    next.push(NextStep::new(
+        "the same workload on your bucket",
+        format!("oprobe run --from {run_id} s3://YOUR-BUCKET/oprobe --region YOUR-REGION"),
+    ));
     (steps, next)
 }
 
 fn wrap(s: &str) -> Vec<String> {
     wrap_text(s, 74)
+}
+
+/// The profile of `oprobe demo`: `lab://demo` with its scenario defaults (the same as
+/// `oprobe run lab://demo`), measured for `duration`.
+pub fn demo_profile(duration: std::time::Duration) -> Result<Profile> {
+    let def = crate::config::defaults();
+    let mut profile = Profile::from_target(TargetSpec::from_url(&def.demo_target)?);
+    profile.workload.duration = HumanDuration(duration);
+    profile.name = Some("demo".into());
+    Ok(profile)
 }
 
 pub async fn cmd_demo(a: DemoArgs, ctx: &Ctx) -> Result<u8> {
@@ -230,45 +254,26 @@ pub async fn cmd_demo(a: DemoArgs, ctx: &Ctx) -> Result<u8> {
         )
     })?;
     ctx.out.info(format!(
-        "{} starting a local S3 lab with throttling above {DEMO_THROTTLE_ABOVE} requests in flight \
-         and 1-in-{DEMO_STRAGGLER_EVERY} stragglers…",
-        bold("oprobe demo")
+        "{} running {}: a local S3 lab with throttling above {DEMO_THROTTLE_ABOVE} requests in \
+         flight and 1-in-{DEMO_STRAGGLER_EVERY} stragglers…",
+        bold("oprobe demo"),
+        crate::config::defaults().demo_target
     ));
-    let lab = LabServer::spawn("127.0.0.1:0", demo_lab()).await?;
-    let mut profile = lab.profile("demo");
-    profile.name = Some("demo".into());
-    profile.workload.preset = Preset::SmallFiles;
-    profile.workload.duration = HumanDuration(duration);
-    profile.workload.warmup = HumanDuration(std::time::Duration::from_millis(500));
-    profile.workload.dataset = Some(DatasetSpec {
-        objects: 64,
-        object_size: ByteSize::kib(64),
-        ..DatasetSpec::default()
-    });
-    profile.knobs.concurrency = DEMO_CONCURRENCY;
+    let profile = demo_profile(duration)?;
     let output = OutputArgs {
         label: Some("demo".into()),
         ..Default::default()
     };
-    let out = match measure(
-        ctx,
-        profile,
-        Some("lab://demo".into()),
-        &SafetyArgs::default(),
-        &output,
-    )
-    .await?
-    {
+    let out = match measure(ctx, profile, None, &SafetyArgs::default(), &output).await? {
         Measured::Run(r) => r,
         Measured::Plan(p) => return ctx.out.finish(p.as_ref()),
     };
-    drop(lab);
-    let (steps, next_commands) = narrate(&out.report, &out.run_id);
+    let (steps, next_steps) = narrate(&out.report, &out.run_id);
     ctx.out.finish(&DemoOutput {
         run_id: out.run_id.clone(),
         path: out.path.clone(),
         steps,
-        next_commands,
+        next_steps,
         report: out.report.clone(),
         run: Some(out),
     })
@@ -296,7 +301,9 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("oprobe runs show 20261120-143005-a1b2"));
-        assert!(next[0].starts_with("oprobe target add"));
+        assert_eq!(next[0].cli, "oprobe run --from 20261120-143005-a1b2");
+        assert!(next.iter().all(|n| n.cli.contains("20261120-143005-a1b2")));
+        assert!(next.iter().any(|n| n.cli.starts_with("oprobe compare")));
         assert_eq!(steps.len(), 5);
     }
 }
@@ -305,12 +312,41 @@ mod tests {
 mod scenario_tests {
     #[test]
     fn narration_matches_the_lab_demo_scenario() {
-        let c = super::demo_lab();
+        let c = crate::lab::Scenario::Demo.config();
         assert_eq!(c.max_inflight_before_503, Some(super::DEMO_THROTTLE_ABOVE));
         assert_eq!(c.straggler_every_n, super::DEMO_STRAGGLER_EVERY);
         assert_eq!(
             c.straggler_delay.as_millis() as u64,
             super::DEMO_STRAGGLER_MS
         );
+    }
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use crate::config::{Preset, Profile, TargetSpec};
+
+    #[test]
+    fn the_demo_is_lab_demo_with_its_defaults() {
+        let def = crate::config::defaults();
+        let demo = super::demo_profile(def.demo_duration.get()).unwrap();
+        let run = Profile::from_target(TargetSpec::from_url("lab://demo").unwrap());
+        assert_eq!(demo.workload, run.workload);
+        assert_eq!(demo.knobs, run.knobs);
+        assert_eq!(demo.workload.preset, Preset::SmallFiles);
+        let ds = demo.workload.effective_dataset();
+        assert_eq!(ds.objects, 64);
+        assert_eq!(ds.object_size, crate::util::ByteSize::kib(64));
+        assert_eq!(demo.workload.warmup.get().as_millis(), 500);
+        assert_eq!(demo.workload.duration, def.demo_duration);
+        assert_eq!(demo.knobs.concurrency, super::DEMO_CONCURRENCY);
+        let a = crate::model::RunSpec::new(&demo, "lab://demo");
+        let b = crate::model::RunSpec::new(&run, "lab://demo");
+        assert_eq!(a.workload_hash(), b.workload_hash());
+        assert_eq!(a.hash(), b.hash());
+        // `lab://parquet` runs the parquet preset.
+        let pq = Profile::from_target(TargetSpec::from_url("lab://parquet").unwrap());
+        assert_eq!(pq.workload.preset, Preset::Parquet);
+        assert_eq!(pq.knobs.concurrency, crate::lab::PARQUET_CONCURRENCY);
     }
 }

@@ -8,7 +8,7 @@
 |---|---|
 | `run`, `tune`, `doctor`, `target test`, `probe`, `watch`, `matrix`, `compat`, `cleanup`, the app | the storage endpoint you give it (and your proxy, if `HTTPS_PROXY` / `--proxy` is set); credential providers of that cloud (instance metadata, STS, SSO) when the provider chain needs them |
 | `demo`, `lab`, `lab://…` targets | nothing: the lab runs inside oprobe on 127.0.0.1 |
-| `self-update` | `api.github.com` and GitHub's release download host (set `OPROBE_UPDATE_API` to use a mirror) |
+| `self-update` | GitHub's release download host (`latest.json`, the archive) and, as a fallback, `api.github.com` (set `OPROBE_RELEASE_BASE` / `OPROBE_UPDATE_API` to use a mirror) |
 | the GitHub Action | GitHub (to download a pinned release and comment on the pull request) |
 
 Nothing else. The HTML report is one self-contained file: opening it loads nothing from the network.

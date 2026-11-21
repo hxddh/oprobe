@@ -42,6 +42,39 @@ or reports.
   `recommendation`, `next-step`, `target-id`, `defaults`.
 - **Lab**: new `lab://parquet` scenario (503 above 24 in flight, no stragglers) for the parquet preset.
 
+### Onboarding and distribution
+
+- **The demo is the lab**: `oprobe demo` runs exactly `oprobe run lab://demo`. Every lab scenario has a
+  default workload, applied when no flag says otherwise: `lab://demo` is small-files (64 objects of 64 KiB),
+  32 workers, 0.5 s warmup, 8 s; `lab://parquet` is the parquet preset with 8 workers. The demo used to
+  measure `s3://demo/bench`, so `compare` flagged a different target, dataset and mix against
+  `run lab://demo`; now both have the same target identity and `workload_hash`.
+- **Demo next steps are replays**: `oprobe run --from RUN`, `oprobe compare RUN last`, `oprobe verify RUN
+  CODE` and `oprobe run --from RUN s3://YOUR-BUCKET/…`, with MCP calls in the envelope's `next`.
+- **Installers**: `install.sh` and `install.ps1` resolve the latest version from the release's `latest.json`,
+  then the `releases/latest` redirect, then the API, so GitHub's anonymous API rate limit no longer breaks an
+  install. `OPROBE_VERSION` still pins a version; `OPROBE_RELEASE_BASE` points them at a mirror. `install.sh`
+  offers to add the install directory to the zsh, bash or fish rc file (asking on `/dev/tty` when piped;
+  `OPROBE_MODIFY_PATH=1|0` decides without asking). `install.ps1` updates the user `PATH` and the current
+  session's `$env:Path`, uses `-UseBasicParsing` and a silent progress bar, and detects ARM64 Windows from the
+  OS (it used to install the x64 build under emulation).
+- **`self-update`** reads `latest.json` before the API (`release_source: latest_json | api` in its output)
+  and verifies against the SHA-256 listed there. A GitHub 403 or 429 is `net.unreachable` (retryable), never
+  `storage.throttled`; an unknown `--to` tag is `usage.invalid_argument`.
+- **Package managers are published**: on each stable release, the workflow updates the Homebrew tap
+  `hxddh/homebrew-tap` (`brew install hxddh/tap/oprobe`, `brew install --cask hxddh/tap/oprobe-app`), the
+  Scoop bucket `hxddh/scoop-bucket` and opens a winget-pkgs pull request, each when its secret (`TAP_TOKEN`,
+  `SCOOP_TOKEN`, `WINGET_TOKEN`) exists and skipped with a warning otherwise. The formula and the cask have
+  distinct names (`oprobe`, `oprobe-app`; the cask asset is now `oprobe-app.rb`). The Scoop manifest's
+  `checkver` reads `latest.json` and its `autoupdate` takes hashes from `SHA256SUMS`. The docs say that
+  `winget install hxddh.oprobe` works only once the package is accepted.
+- **GitHub Action** (`uses: hxddh/oprobe@v4`): `version` defaults to `latest-major`, the newest release of
+  the action's major version (`latest` and exact versions still work). The pull-request comment step has
+  `continue-on-error` (fork PRs get a read-only token), a named baseline is saved to the cache only when it
+  is replaced, and `args` / `compare-args` are split with shell quoting but never evaluated.
+- **CI** runs both installers against a local fake release (`scripts/test-install.sh`,
+  `scripts/test-install.ps1`), shellchecks the scripts strictly and checks the generated manifests.
+
 ## v3.0.0 — 2026-11-20
 
 oprobe 3 turns a benchmark into a product: **see every request your object-storage client makes, know where

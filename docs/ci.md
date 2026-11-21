@@ -27,25 +27,28 @@ jobs:
         with:
           role-to-assume: arn:aws:iam::123456789012:role/oprobe-ci
           aws-region: eu-west-1
-      - uses: hxddh/oprobe@v3
+      - uses: hxddh/oprobe@v4
         with:
           target: s3://ci-bucket/oprobe
           preset: small-files
           duration: 20s
-          args: -c 16 --max-cost-usd 0.25
+          args: -c 16 --max-cost-usd 0.25 --option "user_agent=oprobe ci"
           baseline: main            # a name: kept in the Actions cache, refreshed by pushes to main
 ```
 
 What it does:
 
-1. installs the pinned oprobe release (`version`, default the release that matches the action tag) after
-   checking its SHA-256 against the release's `SHA256SUMS`;
-2. `oprobe run TARGET` with the preset, duration and extra `args`, labelled with the commit SHA;
+1. installs oprobe (`version`: by default the newest release of the action's major version, so `@v4`
+   installs the newest 4.x) after checking its SHA-256 against the release's `SHA256SUMS`;
+2. `oprobe run TARGET` with the preset, duration and extra `args`, labelled with the commit SHA. `args`
+   and `compare-args` are split like a shell would split them — quotes keep a value with spaces together —
+   but never evaluated (no `$VAR`, no `$(…)`);
 3. compares the run with the baseline (`oprobe compare`), writing Markdown and JUnit;
 4. writes the comparison and the report to the job summary;
 5. uploads an artifact with the `.oprobe` run file, `oprobe-report.html`, `oprobe-report.md` and the gate
    files — open the run later with `oprobe runs show oprobe-report/<id>.oprobe` or `oprobe runs open …`;
-6. posts one pull-request comment and updates it on every push (it finds its own comment by a marker);
+6. posts one pull-request comment and updates it on every push (it finds its own comment by a marker). The
+   comment step may fail without failing the job: pull requests from forks get a read-only token;
 7. fails the step on a regression (exit 3) or when the run breaches its SLA (`fail-on-regression: false`
    only reports).
 
@@ -54,7 +57,7 @@ What it does:
 | Input | Default | |
 |---|---|---|
 | `target` | — | URL or configured name; `memory://` and `lab://demo` need no credentials |
-| `version` | the action's release | `latest` follows new releases |
+| `version` | `latest-major` | the newest release of the action's major (`@v4` → newest 4.x; resolved from `latest.json`, then the release list); `latest` = the newest release of any major; or an exact version such as `4.0.0` |
 | `preset`, `duration` | preset's default, `20s` | |
 | `args` | | extra `oprobe run` flags (`-c 32`, `--region`, budgets, `--existing PREFIX`, …) |
 | `baseline` | | a `.oprobe` / report `.json` path in the workspace, or a **name** stored in the Actions cache |
@@ -70,7 +73,8 @@ Outputs: `run-id`, `run-file`, `html-report`, `run-exit-code`, `regression`.
 
 - **A name** (`baseline: main`): the first passing push to the default branch stores its run in the Actions
   cache; later runs compare against it, and every passing push to the default branch replaces it. Pull
-  requests never replace it.
+  requests never replace it. A cache entry is written only when the baseline is replaced, never for a run
+  that merely restored it.
 - **A file** (`baseline: benchmarks/baseline.oprobe`): commit a run file (or download one from an earlier
   artifact) and compare against it. Refresh it on purpose: `oprobe run … && cp <run file> benchmarks/`.
 
@@ -105,8 +109,8 @@ The default SLA of `oprobe run`: at most 1% failed operations and no corrupted d
 
 | Check | Default limit | Flag |
 |---|---|---|
-| same workload (preset, mix, dataset, access, rate, verify, seed) | must be identical | `--allow-workload-change` |
-| same target (scheme, bucket/prefix, endpoint, options) | must be identical | `--allow-target-change` |
+| same workload (`workload_hash`: dataset, mix, access, rate, warmup, duration) | must be identical | `--allow-workload-change` |
+| same target (normalised target identity: scheme, bucket, prefix) | must be identical | `--allow-target-change` |
 | throughput (ops/s, MiB/s) | −10 % | `--max-throughput-drop` |
 | p50 per operation | +20 % and > 1 ms | `--max-p50-increase`, `--min-latency-delta-ms` |
 | p99 per operation | +20 % and > 1 ms | `--max-p99-increase` |
@@ -118,8 +122,10 @@ The default SLA of `oprobe run`: at most 1% failed operations and no corrupted d
 | cost per 1M operations (when a price table applies to both) | +10 % | `--max-cost-increase` |
 
 Operations with fewer than `--min-samples` (30) samples are skipped for latency checks. Every setting that
-differs is listed first: a different workload or target fails (not comparable), different client knobs are
-an A/B comparison, a different host, proxy or oprobe version is a warning.
+differs is listed first. A different workload or target gives no regression verdict: the result is
+`comparable: false` with the differing spec keys (exit 0 with a warning, exit 2 under `--strict`).
+Different client knobs are an A/B comparison; a different host, proxy or oprobe version is a warning. Runs
+replayed from one spec (`oprobe run --from RUN`) are always comparable.
 
 ## Keeping it stable
 

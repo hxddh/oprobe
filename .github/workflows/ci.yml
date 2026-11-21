@@ -78,11 +78,54 @@ jobs:
       - name: Action metadata
         run: |
           python3 -c "import yaml,sys; d=yaml.safe_load(open('action.yml')); assert d['runs']['using']=='composite'; print('action.yml ok:', len(d['runs']['steps']), 'steps')"
-      - name: Install scripts
+
+  install-script:
+    name: install script (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Shellcheck
+        if: runner.os == 'Linux'
+        run: shellcheck scripts/install.sh scripts/test-install.sh scripts/release-manifests.sh scripts/macos-app.sh
+      # install.sh against a local fake release (python http.server): latest.json, the
+      # releases/latest redirect, the API, OPROBE_VERSION, PATH rc files, a checksum mismatch.
+      - name: install.sh against a fake release
+        if: runner.os != 'Windows'
+        run: sh scripts/test-install.sh
+      - name: install.sh under dash
+        if: runner.os == 'Linux'
+        run: dash -n scripts/install.sh
+      - name: install.ps1 against a fake release
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/test-install.ps1
+      - name: install.ps1 under Windows PowerShell 5.1 (parse)
+        if: runner.os == 'Windows'
+        shell: powershell
         run: |
-          sh -n scripts/install.sh
-          bash -n scripts/release-manifests.sh
-          shellcheck scripts/install.sh scripts/release-manifests.sh scripts/macos-app.sh || true
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile("$PWD\scripts\install.ps1", [ref]$null, [ref]$errors) | Out-Null
+          if ($errors) { $errors; exit 1 }
+      # The package-manager manifests from a fake asset set: valid Ruby and JSON, distinct names.
+      - name: Release manifests
+        if: runner.os == 'Linux'
+        run: |
+          d="$RUNNER_TEMP/dist"; mkdir -p "$d"; v=0.0.0-ci
+          for f in universal-apple-darwin.tar.gz x86_64-unknown-linux-musl.tar.gz aarch64-unknown-linux-musl.tar.gz \
+                   macos-universal.dmg x86_64-pc-windows-msvc.zip aarch64-pc-windows-msvc.zip x64.msi arm64.msi; do
+            echo "$f" > "$d/oprobe-$v-$f"
+          done
+          (cd "$d" && sha256sum -- * > SHA256SUMS)
+          scripts/release-manifests.sh "$v" "$d" hxddh/oprobe
+          ruby -c "$d/oprobe.rb" && ruby -c "$d/oprobe-app.rb"
+          grep -q '^class Oprobe < Formula' "$d/oprobe.rb"
+          grep -q '^cask "oprobe-app" do' "$d/oprobe-app.rb"
+          python3 -c "import json,sys; d=json.load(open(sys.argv[1])); assert d['autoupdate']['hash']['url'].endswith('/SHA256SUMS')" "$d/oprobe.json"
+          python3 -m json.tool "$d/latest.json" > /dev/null
 
   backends:
     name: real backends (MinIO, fake-gcs-server, Azurite)

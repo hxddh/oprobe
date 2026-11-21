@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 # Generate the package-manager manifests of a release from its assets and SHA256SUMS:
-#   oprobe.rb             Homebrew formula (CLI; macOS universal + Linux musl archives)
-#   oprobe.cask.rb        Homebrew cask (oprobe.app from the .dmg)
-#   oprobe.json           Scoop manifest (Windows zip)
-#   winget-manifests.zip  winget manifests for the MSI (submit to microsoft/winget-pkgs; docs/releasing.md)
+#   oprobe.rb             Homebrew formula `oprobe` (CLI; macOS universal + Linux musl archives);
+#                         the release job copies it to Formula/oprobe.rb of hxddh/homebrew-tap
+#   oprobe-app.rb         Homebrew cask `oprobe-app` (oprobe.app from the .dmg): Casks/oprobe-app.rb
+#                         (a distinct token: a formula and a cask of one tap must not share a name)
+#   oprobe.json           Scoop manifest (Windows zip): bucket/oprobe.json of hxddh/scoop-bucket
+#   winget-manifests.zip  winget manifests for the MSI (the release job opens a winget-pkgs PR)
 #   latest.json           machine-readable index: version + every asset's URL, size and SHA-256
+#                         (install.sh, install.ps1 and `oprobe self-update` read it first)
 # usage: scripts/release-manifests.sh <version> <dist-dir> <owner/repo>
 # Missing assets are skipped with a warning (e.g. a partial rebuild), never guessed.
 set -euo pipefail
@@ -51,7 +54,10 @@ class Oprobe < Formula
   end
 
   def caveats
-    "Update with \`brew upgrade oprobe\` (oprobe self-update refuses Homebrew installs)."
+    <<~EOS
+      Update with \`brew upgrade oprobe\` (oprobe self-update refuses Homebrew installs).
+      The app (native windows): brew install --cask hxddh/tap/oprobe-app
+    EOS
   end
 
   test do
@@ -64,8 +70,8 @@ fi
 
 dmg="oprobe-$version-macos-universal.dmg"
 if have "$dmg"; then
-cat > "$dist/oprobe.cask.rb" <<RB
-cask "oprobe" do
+cat > "$dist/oprobe-app.rb" <<RB
+cask "oprobe-app" do
   version "$version"
   sha256 "$(sha "$dmg")"
 
@@ -109,11 +115,18 @@ cat > "$dist/oprobe.json" <<JSON
     }
   },
   "bin": "oprobe.exe",
-  "checkver": "github",
+  "checkver": {
+    "url": "https://github.com/$repo/releases/latest/download/latest.json",
+    "jsonpath": "\$.version"
+  },
   "autoupdate": {
     "architecture": {
       "64bit": { "url": "https://github.com/$repo/releases/download/v\$version/oprobe-\$version-x86_64-pc-windows-msvc.zip", "extract_dir": "oprobe-\$version-x86_64-pc-windows-msvc" },
       "arm64": { "url": "https://github.com/$repo/releases/download/v\$version/oprobe-\$version-aarch64-pc-windows-msvc.zip", "extract_dir": "oprobe-\$version-aarch64-pc-windows-msvc" }
+    },
+    "hash": {
+      "url": "https://github.com/$repo/releases/download/v\$version/SHA256SUMS",
+      "regex": "\$sha256\\\\s+\\\\*?\$basename"
     }
   }
 }
@@ -217,4 +230,7 @@ with open(os.path.join(dist, "latest.json"), "w") as f:
     f.write("\n")
 PY
 echo "wrote manifests to $dist:"
-ls "$dist" | grep -E '^(oprobe\.rb|oprobe\.cask\.rb|oprobe\.json|winget-manifests\.zip|latest\.json)$' || true
+for f in oprobe.rb oprobe-app.rb oprobe.json winget-manifests.zip latest.json; do
+  [ -f "$dist/$f" ] && echo "$f"
+done
+exit 0

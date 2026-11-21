@@ -12,8 +12,9 @@
 oprobe drives realistic workloads through [Apache OpenDAL](https://opendal.apache.org/) against S3, GCS,
 Azure Blob, R2, OSS, COS, B2, MinIO or local storage and traces **every backend request**: time queued,
 DNS/TCP/proxy/TLS on new connections, sending, waiting for the first byte, transferring, and waiting for your
-code. It names the cause of what it finds, backs it with evidence, says what to change and how to verify it.
-Every run is saved as one `.oprobe` file you can reopen, compare, export or hand to an agent.
+code. It names the cause of what it finds, backs it with evidence and says what to change — and then checks
+that the change works. Every run is saved as one `.oprobe` file with its full spec: you can reopen it,
+replay it exactly, compare it, export it or hand it to an agent.
 
 It is built for people (a terminal, a native app, a single-file HTML report), for CI (a GitHub Action, exit
 codes, Markdown/JUnit) and for agents (JSON everywhere, an event stream, an MCP server).
@@ -36,10 +37,12 @@ oprobe target add prod s3://my-bucket/oprobe --region eu-west-1
 oprobe run prod
 ```
 
-`oprobe demo` starts a local S3 lab that throttles above 24 requests in flight and turns 1 in 40 requests into
-stragglers, measures it with 32 workers for 8 seconds and explains, step by step, what it found. `oprobe run`
-without a target asks what to measure: the demo, the AWS profiles, Google credentials or Azure variables it
-finds on your machine, or a URL — and saves your choice as a named target.
+`oprobe demo` is `oprobe run lab://demo`: a local S3 lab that throttles above 24 requests in flight and turns
+1 in 40 requests into stragglers, measured with its default workload (small files, 32 workers, 8 seconds).
+It explains, step by step, what it found, and suggests replays of the run (`oprobe run --from RUN`) so every
+follow-up compares like for like. `oprobe run` without a target asks what to measure: the demo, the AWS
+profiles, Google credentials or Azure variables it finds on your machine (`oprobe target discover`), or a
+URL — and saves your choice as a named target.
 
 ```text
 $ oprobe run prod
@@ -65,9 +68,25 @@ advice · next command), the key numbers, and where the full report is.
 | `oprobe runs show last` | The full report in the terminal (80 columns; `--detail` for everything). |
 | `oprobe runs show last -o html > report.html` | One self-contained HTML file: charts with real axes, a latency heatmap, the slowest operations as request waterfalls, every request in a filterable table. Works offline, light and dark, prints cleanly. |
 | `oprobe runs open last` | The run in the native app. |
-| `oprobe compare base last` | A regression gate between two runs (exit 3 on regression). |
-| `oprobe tune prod` | The best client configuration that does not trip throttling, as a profile and Rust/Python code. |
+| `oprobe run --from last --set concurrency=16` | Replay a run from its stored spec — same workload, dataset, warmup, seed, endpoint, region — with one change. |
+| `oprobe verify last throttling` | Test a finding's advice: replays baseline and change interleaved (A B A B…) and answers *confirmed*, *refuted* or *inconclusive* against the predicted numbers. |
+| `oprobe fix prod` | Diagnose → tune → verify in one go: the recommended settings as a profile patch and code. |
+| `oprobe compare base last` | A regression gate between two runs of the same target and workload (exit 3 on regression). |
+| `oprobe tune prod` | The best goodput within a throttle budget, as a profile and Rust/Python code. |
 | `oprobe runs list` | Every saved run: when, verdict, ops/s, p99, cost. |
+
+## One model, one spec, one loop
+
+- **One capacity model.** oprobe reconstructs the requests in flight over time and finds the level where the
+  service starts to throttle (a ceiling with an interval, never a guess from mean latency × rate). Every
+  recommendation that mentions concurrency — the findings, `tune`, `verify`, the app — comes from that one
+  model and keeps a 15 % headroom below the ceiling, taking into account how many requests one operation
+  keeps in flight.
+- **One spec.** Every report carries the run's resolved spec. `oprobe run --from RUN` replays it, `--set
+  key=value` changes one thing, and every suggested command is such a replay, so nothing (warmup, seed, mix,
+  dataset, endpoint, region, HTTP version, rate) is silently dropped.
+- **One loop.** A recommendation is a hypothesis with an expected result. `oprobe verify` measures it and
+  says whether it held; `compare` refuses to judge runs of different targets or workloads.
 
 ![The HTML report of the demo run](docs/images/report-html.png)
 
@@ -86,7 +105,7 @@ Findings and Cost; the selected request or operation on the right. [More →](do
 |---|---|
 | Network, server or my client? | Each operation's wall time split into queue / connect / upload / server / download / retry / client from the real request timeline. |
 | Why is p99 so much worse than p50? | The slowest operations keep every request with its stages, connection (cold/warm), status and request ID, plus an async call stack captured while they were stuck. |
-| Is it throttling? | 429/503 counts, Retry-After, retry backoff as its own share of time, and the concurrency where it starts (`oprobe tune`). |
+| Is it throttling? | 429/503 counts, Retry-After, retry backoff as its own share of time, the in-flight ceiling where it starts and the safe concurrency below it (the capacity model). |
 | Are connections reused? Is TLS slow? | Per-dial DNS/TCP/proxy/TLS times, reuse ratio, peak in-flight requests, per remote address. |
 | Am I paying for bytes I do not use? | Read amplification, over-read from range coalescing, requests per operation. |
 | What will it cost? | The measured request mix × provider price tables, waste from failed requests and over-reads. |
@@ -95,15 +114,16 @@ Findings and Cost; the selected request or operation on the right. [More →](do
 ## In CI
 
 ```yaml
-- uses: hxddh/oprobe@v3
+- uses: hxddh/oprobe@v4
   with:
     target: s3://ci-bucket/oprobe
     preset: small-files
     baseline: main
 ```
 
-The action installs a pinned oprobe, runs, compares against the baseline, uploads the `.oprobe` file and the
-HTML report, keeps one sticky PR comment up to date and fails on regression. [CI guide →](docs/ci.md)
+The action installs the newest oprobe 4.x (or the `version` you pin), runs, compares against the baseline,
+uploads the `.oprobe` file and the HTML report, keeps one sticky PR comment up to date and fails on
+regression. [CI guide →](docs/ci.md)
 
 ## For agents
 
@@ -116,8 +136,9 @@ codes and exit codes; `oprobe schema` prints the JSON Schemas; `oprobe mcp` is a
 | Platform | |
 |---|---|
 | macOS / Linux | `curl -fsSL https://github.com/hxddh/oprobe/releases/latest/download/install.sh \| sh` |
-| Windows | `winget install hxddh.oprobe`, the `.msi`, or `irm https://github.com/hxddh/oprobe/releases/latest/download/install.ps1 \| iex` |
-| Homebrew | `oprobe.rb` (CLI) and `oprobe.cask.rb` (the app) in every release — [docs/install.md](docs/install.md#homebrew) |
+| Homebrew | `brew install hxddh/tap/oprobe` (the app: `brew install --cask hxddh/tap/oprobe-app`) |
+| Windows | `irm https://github.com/hxddh/oprobe/releases/latest/download/install.ps1 \| iex`, the `.msi`, or Scoop (`scoop bucket add hxddh https://github.com/hxddh/scoop-bucket`, `scoop install oprobe`) |
+| winget | `winget install hxddh.oprobe` once the package is accepted into winget-pkgs — [status](docs/install.md#windows) |
 | Debian / Ubuntu, Fedora / RHEL | `.deb` / `.rpm` from the release page |
 | Rust | `cargo install oprobe --locked` (`--features gui` for the window on Linux) |
 
@@ -144,10 +165,16 @@ Five minutes from install to a report on your own bucket.
 
 ```bash
 curl -fsSL https://github.com/hxddh/oprobe/releases/latest/download/install.sh | sh   # macOS, Linux
-winget install hxddh.oprobe                                                           # Windows
+brew install hxddh/tap/oprobe                                                         # Homebrew
 ```
 
-Other ways (Homebrew, `.deb`/`.rpm`, `.msi`, `.dmg`, cargo) are in [install.md](install.md). Check it works:
+```powershell
+irm https://github.com/hxddh/oprobe/releases/latest/download/install.ps1 | iex       # Windows
+```
+
+The scripts offer to add the install directory to your `PATH` (Windows: the user `PATH` and the current
+window). Other ways (Scoop, `.deb`/`.rpm`, `.msi`, `.dmg`, cargo; winget once accepted) are in
+[install.md](install.md). Check it works:
 
 ```bash
 oprobe --version
@@ -159,9 +186,10 @@ oprobe --version
 oprobe demo
 ```
 
-No account, no flags. oprobe starts an S3-compatible lab inside its own process that answers `503 SlowDown`
-above 24 requests in flight and delays 1 in 40 requests by 250 ms, measures it with 32 workers for 8 seconds,
-and narrates the result:
+No account, no flags. The demo is exactly `oprobe run lab://demo`: an S3-compatible lab inside oprobe's own
+process that answers `503 SlowDown` above 24 requests in flight and delays 1 in 40 requests by 250 ms,
+measured with the scenario's default workload (small files: 64 objects of 64 KiB, 32 workers, 0.5 s warmup,
+8 seconds). It narrates the result:
 
 1. **What ran** — the workload and its headline numbers.
 2. **The verdict** — where the time went, in one sentence.
@@ -169,7 +197,18 @@ and narrates the result:
 4. **Where the time went** — the shares of operation time, retries, stragglers.
 5. **Look closer** — the commands for the full report, the HTML report and the app.
 
-The demo run is saved like any other (`oprobe runs list`).
+Then it suggests what to try next. Each suggestion replays the demo run from its stored spec, so the results
+compare like for like:
+
+```bash
+oprobe run --from RUN                       # the same run again (same target, workload, seed)
+oprobe compare RUN last                     # comparable: same target identity and workload
+oprobe verify RUN throttling                # does the advice hold? A/B replays, then a verdict
+oprobe run --from RUN s3://my-bucket/oprobe --region eu-west-1   # the same workload on your bucket
+```
+
+`oprobe run lab://demo` with no flags measures the same thing as the demo; other lab scenarios have their own
+defaults (`lab://parquet` runs the parquet preset). The demo run is saved like any other (`oprobe runs list`).
 
 ## 3. Your bucket
 
@@ -186,12 +225,13 @@ oprobe target add az azblob://container/oprobe --endpoint https://<account>.blob
 
 Or run `oprobe run` with no target in a terminal: it lists what it finds on this machine (AWS profiles in
 `~/.aws/config` and `~/.aws/credentials`, Google application default credentials, `AZURE_STORAGE_*`
-variables), asks for the bucket and saves the target for you.
+variables), asks for the bucket and saves the target for you. `oprobe target discover` lists the same
+credential sources (names only, never secrets) without asking anything.
 
 Then measure:
 
 ```bash
-oprobe target test prod        # full doctor: also writes, reads and deletes a probe object
+oprobe target test prod        # read-only doctor; --write-probe also writes, reads and deletes a probe object
 oprobe run prod                # 10 s of the parquet preset with 16 workers
 oprobe run prod --preset small-files -c 64 -d 30s
 oprobe run prod --existing tables/events/        # read-only, on objects that already exist
@@ -217,11 +257,22 @@ oprobe runs open last                  # in the app
 
 ## 5. Act on it
 
+Every finding that suggests a change carries a hypothesis: the change (`--set key=value`), the command that
+tests it and the expected result with an interval. Concurrency advice comes from the capacity model: the
+in-flight level where the service starts to throttle, minus 15 % headroom, divided by the requests one
+operation keeps in flight.
+
 ```bash
-oprobe tune prod --emit-profile tuned.toml --emit-rust storage.rs    # best knobs below the throttling ceiling
-oprobe run prod -c 32 --label after
-oprobe compare before after                                          # did it help? (exit 3 on regression)
+oprobe verify last throttling                    # replay with the finding's change, A B A B…: confirmed / refuted / inconclusive
+oprobe verify last --all                         # every finding with a change
+oprobe run --from last --set concurrency=24      # replay with your own change
+oprobe compare last~1 last                       # same target and workload, or no verdict (exit 3 on regression)
+oprobe fix prod                                  # diagnose → tune → verify: a profile patch and code
+oprobe tune prod --emit-profile tuned.toml --emit-rust storage.rs    # best goodput within the throttle budget
 ```
+
+`compare` judges only runs of the same target and the same workload (`workload_hash`); otherwise it reports
+`comparable: false` and lists what differs. Replays (`--from`) are always comparable.
 
 Next: [concepts](concepts.md) (targets, runs, baselines, findings), [workloads](workloads.md),
 [the CI gate](ci.md).
@@ -876,25 +927,28 @@ jobs:
         with:
           role-to-assume: arn:aws:iam::123456789012:role/oprobe-ci
           aws-region: eu-west-1
-      - uses: hxddh/oprobe@v3
+      - uses: hxddh/oprobe@v4
         with:
           target: s3://ci-bucket/oprobe
           preset: small-files
           duration: 20s
-          args: -c 16 --max-cost-usd 0.25
+          args: -c 16 --max-cost-usd 0.25 --option "user_agent=oprobe ci"
           baseline: main            # a name: kept in the Actions cache, refreshed by pushes to main
 ```
 
 What it does:
 
-1. installs the pinned oprobe release (`version`, default the release that matches the action tag) after
-   checking its SHA-256 against the release's `SHA256SUMS`;
-2. `oprobe run TARGET` with the preset, duration and extra `args`, labelled with the commit SHA;
+1. installs oprobe (`version`: by default the newest release of the action's major version, so `@v4`
+   installs the newest 4.x) after checking its SHA-256 against the release's `SHA256SUMS`;
+2. `oprobe run TARGET` with the preset, duration and extra `args`, labelled with the commit SHA. `args`
+   and `compare-args` are split like a shell would split them — quotes keep a value with spaces together —
+   but never evaluated (no `$VAR`, no `$(…)`);
 3. compares the run with the baseline (`oprobe compare`), writing Markdown and JUnit;
 4. writes the comparison and the report to the job summary;
 5. uploads an artifact with the `.oprobe` run file, `oprobe-report.html`, `oprobe-report.md` and the gate
    files — open the run later with `oprobe runs show oprobe-report/<id>.oprobe` or `oprobe runs open …`;
-6. posts one pull-request comment and updates it on every push (it finds its own comment by a marker);
+6. posts one pull-request comment and updates it on every push (it finds its own comment by a marker). The
+   comment step may fail without failing the job: pull requests from forks get a read-only token;
 7. fails the step on a regression (exit 3) or when the run breaches its SLA (`fail-on-regression: false`
    only reports).
 
@@ -903,7 +957,7 @@ What it does:
 | Input | Default | |
 |---|---|---|
 | `target` | — | URL or configured name; `memory://` and `lab://demo` need no credentials |
-| `version` | the action's release | `latest` follows new releases |
+| `version` | `latest-major` | the newest release of the action's major (`@v4` → newest 4.x; resolved from `latest.json`, then the release list); `latest` = the newest release of any major; or an exact version such as `4.0.0` |
 | `preset`, `duration` | preset's default, `20s` | |
 | `args` | | extra `oprobe run` flags (`-c 32`, `--region`, budgets, `--existing PREFIX`, …) |
 | `baseline` | | a `.oprobe` / report `.json` path in the workspace, or a **name** stored in the Actions cache |
@@ -919,7 +973,8 @@ Outputs: `run-id`, `run-file`, `html-report`, `run-exit-code`, `regression`.
 
 - **A name** (`baseline: main`): the first passing push to the default branch stores its run in the Actions
   cache; later runs compare against it, and every passing push to the default branch replaces it. Pull
-  requests never replace it.
+  requests never replace it. A cache entry is written only when the baseline is replaced, never for a run
+  that merely restored it.
 - **A file** (`baseline: benchmarks/baseline.oprobe`): commit a run file (or download one from an earlier
   artifact) and compare against it. Refresh it on purpose: `oprobe run … && cp <run file> benchmarks/`.
 
@@ -954,8 +1009,8 @@ The default SLA of `oprobe run`: at most 1% failed operations and no corrupted d
 
 | Check | Default limit | Flag |
 |---|---|---|
-| same workload (preset, mix, dataset, access, rate, verify, seed) | must be identical | `--allow-workload-change` |
-| same target (scheme, bucket/prefix, endpoint, options) | must be identical | `--allow-target-change` |
+| same workload (`workload_hash`: dataset, mix, access, rate, warmup, duration) | must be identical | `--allow-workload-change` |
+| same target (normalised target identity: scheme, bucket, prefix) | must be identical | `--allow-target-change` |
 | throughput (ops/s, MiB/s) | −10 % | `--max-throughput-drop` |
 | p50 per operation | +20 % and > 1 ms | `--max-p50-increase`, `--min-latency-delta-ms` |
 | p99 per operation | +20 % and > 1 ms | `--max-p99-increase` |
@@ -967,8 +1022,10 @@ The default SLA of `oprobe run`: at most 1% failed operations and no corrupted d
 | cost per 1M operations (when a price table applies to both) | +10 % | `--max-cost-increase` |
 
 Operations with fewer than `--min-samples` (30) samples are skipped for latency checks. Every setting that
-differs is listed first: a different workload or target fails (not comparable), different client knobs are
-an A/B comparison, a different host, proxy or oprobe version is a warning.
+differs is listed first. A different workload or target gives no regression verdict: the result is
+`comparable: false` with the differing spec keys (exit 0 with a warning, exit 2 under `--strict`).
+Different client knobs are an A/B comparison; a different host, proxy or oprobe version is a warning. Runs
+replayed from one spec (`oprobe run --from RUN`) are always comparable.
 
 ## Keeping it stable
 
@@ -1644,12 +1701,37 @@ measure them with `oprobe run` against each provider.
 | Platform | Command |
 |---|---|
 | macOS, Linux | `curl -fsSL https://github.com/hxddh/oprobe/releases/latest/download/install.sh \| sh` |
-| Windows | `winget install hxddh.oprobe` |
-| Windows (no winget) | `irm https://github.com/hxddh/oprobe/releases/latest/download/install.ps1 \| iex` |
+| Homebrew | `brew install hxddh/tap/oprobe` (the app: `brew install --cask hxddh/tap/oprobe-app`) |
+| Windows | `irm https://github.com/hxddh/oprobe/releases/latest/download/install.ps1 \| iex`, or the `.msi` |
+| Windows, Scoop | `scoop bucket add hxddh https://github.com/hxddh/scoop-bucket` then `scoop install oprobe` |
+| Windows, winget | `winget install hxddh.oprobe` — only once the package is accepted into winget-pkgs ([below](#windows)) |
 | Rust ≥ 1.97 | `cargo install oprobe --locked` (`--features gui` adds the window on Linux; needs `libgtk-4-dev`) |
 
-The install scripts download the archive for your platform, verify it against `SHA256SUMS` and put `oprobe`
-in `~/.local/bin` (`OPROBE_INSTALL_DIR` to change). Update later with `oprobe self-update`.
+Then try it with no account: `oprobe demo` ([getting started](getting-started.md)).
+
+### The install scripts
+
+`install.sh` and `install.ps1` download the archive for your platform, verify it against `SHA256SUMS` and
+install `oprobe` (Linux and macOS: `~/.local/bin`; Windows: `%LOCALAPPDATA%\Programs\oprobe`). Update later
+with `oprobe self-update`.
+
+They find the latest version without the rate-limited GitHub API when they can, trying in order and falling
+back on any failure: the release's `latest.json`, the `releases/latest` redirect, then the API.
+
+| Variable | Effect |
+|---|---|
+| `OPROBE_VERSION=4.0.0` | install this version instead of the latest |
+| `OPROBE_INSTALL_DIR=DIR` | install somewhere else |
+| `OPROBE_MODIFY_PATH=1` / `0` | add the directory to `PATH` without asking / never touch `PATH` |
+| `OPROBE_RELEASE_BASE=URL` | release download base (mirrors, tests; default `https://github.com/hxddh/oprobe/releases`) |
+
+**PATH.** When the install directory is not on `PATH`, `install.sh` offers to append it to your shell's rc
+file: `~/.zshrc` (zsh), `~/.bashrc` (bash; `~/.bash_profile` on macOS), `~/.config/fish/config.fish` (fish),
+else `~/.profile`. Piped from `curl`, the script asks on the terminal (`/dev/tty`) when there is one; without
+a terminal (CI, `docker build`) it changes nothing and prints the line to add, unless `OPROBE_MODIFY_PATH=1`.
+`install.ps1` adds its directory to the user `PATH` and to the current session's `$env:Path`, so `oprobe`
+works in the same window (`OPROBE_MODIFY_PATH=0` to skip). It detects ARM64 Windows from the OS (also under
+x64 emulation) and installs the native ARM64 build.
 
 ## Release assets
 
@@ -1668,7 +1750,7 @@ Every release publishes the same program in each platform's native format:
 | `oprobe-<ver>-macos-universal.dmg` | macOS app: `oprobe.app` (same binary as the `.pkg`) |
 | `oprobe-<ver>-x64.msi` / `-arm64.msi` | Windows installer: `PATH`, Start menu entry, removable in *Apps* |
 | `oprobe-<ver>-x86_64-pc-windows-msvc.zip` / `aarch64-…` | Windows portable |
-| `oprobe.rb` / `oprobe.cask.rb` | Homebrew formula (CLI) and cask (`oprobe.app` from the `.dmg`) |
+| `oprobe.rb` / `oprobe-app.rb` | Homebrew formula `oprobe` (CLI) and cask `oprobe-app` (`oprobe.app` from the `.dmg`) |
 | `oprobe.json` | Scoop manifest |
 | `winget-manifests.zip` | winget manifests (version, installer, locale) for the `.msi` |
 | `latest.json` | machine-readable index: version, every asset's URL, size and SHA-256 |
@@ -1682,29 +1764,29 @@ PowerShell, elvish), `profiles/` and `docs/`.
 
 ## Homebrew
 
-Each release ships a formula (the CLI) and a cask (the app). Until they are in a public tap, install them from a
-local tap:
+The `hxddh/homebrew-tap` tap (`github.com/hxddh/homebrew-tap`) is updated by the release workflow:
 
 ```bash
-brew tap-new "$USER/tools" --no-git
-base=https://github.com/hxddh/oprobe/releases/latest/download
-curl -fsSL "$base/oprobe.rb" -o "$(brew --repository "$USER/tools")/Formula/oprobe.rb"
-curl -fsSL "$base/oprobe.cask.rb" --create-dirs -o "$(brew --repository "$USER/tools")/Casks/oprobe.rb"
-brew install "$USER/tools/oprobe"            # the command line
-brew install --cask "$USER/tools/oprobe"     # oprobe.app
+brew install hxddh/tap/oprobe               # the command line (macOS and Linux)
+brew install --cask hxddh/tap/oprobe-app    # oprobe.app, the native window (macOS)
 ```
 
-Update with `brew upgrade oprobe` (`brew upgrade --cask oprobe`).
+Update with `brew upgrade oprobe` (`brew upgrade --cask oprobe-app`). The formula and the cask have different
+names, so both can be installed. Each release also attaches them (`oprobe.rb`, `oprobe-app.rb`), for a
+local tap if you cannot use this one.
 
 ## Windows
 
 ```powershell
-winget install hxddh.oprobe        # the MSI; update: winget upgrade oprobe
-scoop install https://github.com/hxddh/oprobe/releases/latest/download/oprobe.json
+irm https://github.com/hxddh/oprobe/releases/latest/download/install.ps1 | iex   # no admin rights
+scoop bucket add hxddh https://github.com/hxddh/scoop-bucket; scoop install oprobe
 ```
 
-Maintainers submit each release to [winget-pkgs](https://github.com/microsoft/winget-pkgs) — see
-[releasing.md](releasing.md#winget).
+The `.msi` installs for all users (Start menu entry, `PATH`, removable in *Apps*).
+
+**winget:** each release opens a pull request to [winget-pkgs](https://github.com/microsoft/winget-pkgs);
+`winget install hxddh.oprobe` works only after Microsoft's review accepts the package. Until then (check with
+`winget search hxddh.oprobe`), use one of the commands above or the `.msi`.
 
 ## Debian, Ubuntu, Fedora
 
@@ -1718,22 +1800,26 @@ sudo dnf install ./oprobe-<ver>-1.x86_64.rpm
 ```bash
 cargo install oprobe --locked
 cargo install oprobe --locked --features gui
-cargo install --locked --git https://github.com/hxddh/oprobe --tag v3.0.0 oprobe
+cargo install --locked --git https://github.com/hxddh/oprobe --tag v4.0.0 oprobe
 ```
 
 ## Updating
 
-`oprobe self-update` checks GitHub Releases, downloads the archive for this platform, verifies it against
-`SHA256SUMS`, checks that the new binary starts, and replaces the running one in place
-(`oprobe self-update --check` only reports; `--to v3.0.1` picks a release; `-o json` for scripts). When
+`oprobe self-update` finds the release (the release's `latest.json` first, then the GitHub API), downloads
+the archive for this platform, verifies its SHA-256 (from `latest.json`, or the release's `SHA256SUMS`),
+checks that the new binary starts, and replaces the running one in place (`oprobe self-update --check` only
+reports; `--to v4.0.1` picks a release; `-o json` for scripts). A GitHub refusal (403, rate limit) is a
+network error (`net.unreachable`, retryable): set `GITHUB_TOKEN` or retry later. When
 oprobe was installed by a package manager (Homebrew, apt/dnf, the `.pkg` or `.app`, Scoop, winget, the MSI,
 cargo), it refuses and prints that manager's update command instead.
 
 `SHA256SUMS` comes from the same GitHub release as the archive, so the check proves the download is
 intact, not who built it: oprobe releases are not code-signed (no signing certificates), and the
-checksums are as trustworthy as the GitHub release itself. `OPROBE_UPDATE_API` replaces the GitHub API
-base URL (default `https://api.github.com`); it exists for internal mirrors and tests — point it only at a
-server you trust, since it decides which binary is installed.
+checksums are as trustworthy as the GitHub release itself. `OPROBE_RELEASE_BASE` replaces the release
+download base (default `https://github.com/hxddh/oprobe/releases`) and `OPROBE_UPDATE_API` the GitHub API base
+(default `https://api.github.com`; set alone, `latest.json` is not fetched from github.com). They exist for
+internal mirrors and tests — point them only at a server you trust, since they decide which binary is
+installed.
 
 ## Verifying downloads
 
@@ -1742,14 +1828,14 @@ The checksums detect corrupted or truncated downloads; they are not a signature 
 ```bash
 sha256sum --ignore-missing -c SHA256SUMS                    # Linux
 shasum -a 256 --ignore-missing -c SHA256SUMS                # macOS
-Get-FileHash oprobe-3.0.0-x64.msi -Algorithm SHA256          # Windows
+Get-FileHash oprobe-4.0.0-x64.msi -Algorithm SHA256          # Windows
 ```
 
 Every asset also has a [SLSA build provenance](https://slsa.dev/) attestation signed by GitHub Actions, which
 proves it was built by this repository's release workflow from a given commit:
 
 ```bash
-gh attestation verify oprobe-3.0.0-x86_64-unknown-linux-musl.tar.gz --repo hxddh/oprobe
+gh attestation verify oprobe-4.0.0-x86_64-unknown-linux-musl.tar.gz --repo hxddh/oprobe
 ```
 
 ## First open of unsigned packages
@@ -1828,8 +1914,8 @@ and usually a `hint:` line.
 | `cannot open a window` / `built without native windows` | Linux server packages are headless: `oprobe top`, the `oprobe-desktop` tarball, or `cargo install oprobe --features gui` |
 | `runs open` says no display | over SSH: `oprobe runs show RUNREF`, or `oprobe top --open FILE` in the terminal |
 | `config edit` opens the wrong editor | set `VISUAL` or `EDITOR` (`export EDITOR="code -w"`) |
-| `self-update` refuses | oprobe was installed by a package manager; the message names its update command (`brew upgrade oprobe`, `winget upgrade oprobe`, …) |
-| `self-update` rate limited | GitHub's anonymous API limit: wait an hour or set `GITHUB_TOKEN` |
+| `self-update` refuses | oprobe was installed by a package manager; the message names its update command (`brew upgrade oprobe`, `winget upgrade hxddh.oprobe`, …) |
+| `self-update` rate limited (`net.unreachable`) | GitHub refused the request (403/429): `self-update` reads the release's `latest.json` first, so this means both it and the API were refused; wait or set `GITHUB_TOKEN` |
 | macOS: "cannot be opened because the developer cannot be verified" / Windows SmartScreen | the packages are unsigned: [first open](install.md#first-open-of-unsigned-packages) |
 
 ## Error codes
@@ -2010,7 +2096,7 @@ command line and the error message.
 |---|---|
 | `run`, `tune`, `doctor`, `target test`, `probe`, `watch`, `matrix`, `compat`, `cleanup`, the app | the storage endpoint you give it (and your proxy, if `HTTPS_PROXY` / `--proxy` is set); credential providers of that cloud (instance metadata, STS, SSO) when the provider chain needs them |
 | `demo`, `lab`, `lab://…` targets | nothing: the lab runs inside oprobe on 127.0.0.1 |
-| `self-update` | `api.github.com` and GitHub's release download host (set `OPROBE_UPDATE_API` to use a mirror) |
+| `self-update` | GitHub's release download host (`latest.json`, the archive) and, as a fallback, `api.github.com` (set `OPROBE_RELEASE_BASE` / `OPROBE_UPDATE_API` to use a mirror) |
 | the GitHub Action | GitHub (to download a pinned release and comment on the pull request) |
 
 Nothing else. The HTML report is one self-contained file: opening it loads nothing from the network.
