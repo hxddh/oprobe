@@ -379,7 +379,7 @@ fn repeat_baseline_and_compare() {
             .len(),
         3
     );
-    assert_eq!(v["comparison"]["stats"][0]["method"], "runs");
+    assert_eq!(v["comparison"]["stats"][0]["method"], "runs_t");
     assert_eq!(v["added_to_baseline"], code == 0);
     assert_eq!(v["exit_code"], code);
 
@@ -423,7 +423,7 @@ fn repeat_baseline_and_compare() {
     );
     assert_eq!(json(&o)["baseline"]["run_ids"].as_array().unwrap().len(), 3);
 
-    // A workload change is a regression (exit 3).
+    // A workload change is not comparable: no verdict (exit 0 with a warning, 2 with --strict).
     let o = env
         .cmd()
         .args([
@@ -443,11 +443,24 @@ fn repeat_baseline_and_compare() {
     let o = env.run(&["compare", "last~1", "last", "-o", "json"]);
     assert_eq!(
         o.status.code(),
-        Some(3),
+        Some(0),
         "{}",
         String::from_utf8_lossy(&o.stdout)
     );
-    assert_eq!(json(&o)["passed"], false);
+    let v = json(&o);
+    assert_eq!(v["passed"], false);
+    assert_eq!(v["comparable"], false);
+    assert_eq!(v["verdict"], "not_comparable");
+    assert!(
+        v["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("not comparable")),
+        "{v}"
+    );
+    let o = env.run(&["compare", "last~1", "last", "--strict", "-o", "json"]);
+    assert_eq!(o.status.code(), Some(2));
 
     let o = env.run(&["baseline", "rm", "main", "-o", "json"]);
     assert!(o.status.success());
