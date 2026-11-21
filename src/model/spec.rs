@@ -89,8 +89,8 @@ fn is_env_reference(v: &str) -> bool {
     v.starts_with("${") && v.ends_with('}') && !v[2..v.len() - 1].contains(['{', '}', '$'])
 }
 
-/// `t` as a spec stores it: URL credentials stripped, URL-implied options dropped, secrets
-/// redacted.
+/// `t` as a spec stores it: URL credentials and secret query parameters stripped, URL-implied
+/// options dropped, secrets redacted.
 fn redact_target(t: &TargetSpec) -> TargetSpec {
     let mut t = t.clone();
     if let Some(url) = &t.url {
@@ -101,7 +101,7 @@ fn redact_target(t: &TargetSpec) -> TargetSpec {
             Some(i) => i != v,
             None => true,
         });
-        t.url = Some(crate::util::strip_url_credentials(url));
+        t.url = Some(crate::util::redact_url(url));
     }
     t.options.remove("ca_cert_pem");
     for (k, v) in t.options.iter_mut() {
@@ -110,10 +110,10 @@ fn redact_target(t: &TargetSpec) -> TargetSpec {
                 *v = REDACTED.to_owned();
             }
         } else {
-            *v = crate::util::strip_url_credentials(v);
+            *v = crate::util::redact_url(v);
         }
     }
-    t.proxy = t.proxy.as_deref().map(crate::util::strip_url_credentials);
+    t.proxy = t.proxy.as_deref().map(crate::util::redact_url);
     t
 }
 
@@ -148,13 +148,15 @@ pub fn command_line(args: &[String]) -> String {
 
 impl RunSpec {
     /// The spec of a run of `profile` (as built from flags, a profile file or tool arguments,
-    /// before the session normalises it) at `target_ref`.
+    /// before the session normalises it) at `target_ref`. Secrets in a target URL (a password,
+    /// `secret_access_key=…`, a SAS signature) are removed from `target_ref` and from the
+    /// profile's URL ([`crate::util::redact_url`]): replay resolves credentials again.
     pub fn new(profile: &Profile, target_ref: impl Into<String>) -> Self {
         let mut p = profile.clone();
         p.target = redact_target(&p.target);
         let existing = p.workload.effective_dataset().existing_prefix;
         Self {
-            target_ref: target_ref.into(),
+            target_ref: crate::util::redact_url(&target_ref.into()),
             seed: p.workload.seed,
             existing,
             label: p.name.clone(),
@@ -1177,6 +1179,45 @@ mod tests {
         );
         assert!(!s.command().contains("127.0.0.1"), "{}", s.command());
         assert!(!s.command().contains("--proxy"), "{}", s.command());
+    }
+
+    #[test]
+    fn secrets_in_target_urls_are_removed_from_the_spec_and_its_commands() {
+        for (url, clean) in [
+            ("webdav://alice:hunter2@host/files", "webdav://host/files"),
+            (
+                "s3://bucket/p?region=eu-west-1&secret_access_key=hunter2",
+                "s3://bucket/p?region=eu-west-1",
+            ),
+            (
+                "s3://bucket?session_token=hunter2&sig=hunter2",
+                "s3://bucket",
+            ),
+        ] {
+            let p = Profile::from_target(TargetSpec::from_url(url).unwrap());
+            let s = RunSpec::new(&p, url);
+            assert_eq!(s.target_ref, clean);
+            assert_eq!(s.profile.target.url.as_deref(), Some(clean));
+            let json = serde_json::to_string(&s).unwrap();
+            assert!(!json.contains("hunter2"), "{json}");
+            assert!(!s.command().contains("hunter2"), "{}", s.command());
+            let o = Overrides::new().with_set("concurrency", "5");
+            assert!(!s.with(&o).command().contains("hunter2"));
+            // The redacted spec still replays: its target parses again.
+            TargetSpec::from_url(&s.target_ref).unwrap();
+            // A report carrying the spec (what run files store) holds no secret either.
+            let mut r = crate::report::fixture::report();
+            r.spec = s.clone();
+            let json = serde_json::to_string(&r).unwrap();
+            assert!(!json.contains("hunter2"), "{json}");
+        }
+        // The dry-run plan's target and command.
+        let p = Profile::from_target(
+            TargetSpec::from_url("s3://bucket?secret_access_key=hunter2").unwrap(),
+        );
+        let plan = crate::guard::plan(&p, "oprobe-run-x/", false, &Default::default());
+        let json = serde_json::to_string(&plan).unwrap();
+        assert!(!json.contains("hunter2"), "{json}");
     }
 
     #[test]

@@ -204,6 +204,58 @@ fn runs_open_without_a_window_points_to_the_terminal_workbench() {
 }
 
 #[test]
+fn secrets_in_the_target_url_never_reach_reports_or_run_files() {
+    let env = Env::new();
+    let url = "lab://demo?secret_access_key=hunter2&session_token=hunter2";
+    let mut args: Vec<String> = ["run", url, "-d", "300ms"]
+        .iter()
+        .chain(SMALL)
+        .map(|s| s.to_string())
+        .collect();
+    args.extend(["-o", "json"].map(String::from));
+    let o = env.cmd().args(&args).output().unwrap();
+    assert!(
+        o.status.code().is_some_and(|c| c == 0 || c == 3),
+        "{}",
+        stderr(&o)
+    );
+    let out = stdout(&o);
+    assert!(!out.contains("hunter2"), "{out}");
+    let v = json(&o);
+    assert_eq!(v["report"]["spec"]["target_ref"], "lab://demo");
+    // The run file (zstd NDJSON) and its sidecar.
+    let runs = env.runs();
+    assert_eq!(runs.len(), 1);
+    let raw = zstd::decode_all(std::fs::File::open(&runs[0]).unwrap()).unwrap();
+    assert!(!String::from_utf8_lossy(&raw).contains("hunter2"));
+    let sidecar = std::fs::read_to_string(runs[0].with_extension("json")).unwrap();
+    assert!(!sidecar.contains("hunter2"), "{sidecar}");
+    // The replay of the stored run still works (credentials are resolved again).
+    let o = env.run(&[
+        "run",
+        "--from",
+        "last",
+        "-d",
+        "300ms",
+        "--no-save",
+        "-o",
+        "json",
+    ]);
+    assert!(
+        o.status.code().is_some_and(|c| c == 0 || c == 3),
+        "{}",
+        stderr(&o)
+    );
+    assert!(!stdout(&o).contains("hunter2"));
+    // The dry-run plan does not echo them either.
+    let mut args = args.clone();
+    args.push("--dry-run".into());
+    let o = env.cmd().args(&args).output().unwrap();
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert!(!stdout(&o).contains("hunter2"), "{}", stdout(&o));
+}
+
+#[test]
 fn an_empty_existing_prefix_is_not_found() {
     let env = Env::new();
     let dir = env.dir.path().join("bucket");

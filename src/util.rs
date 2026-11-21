@@ -258,6 +258,52 @@ pub fn strip_url_credentials(s: &str) -> String {
     out
 }
 
+/// Query parameter names whose values must never be printed or persisted: the option names
+/// of [`is_secret_key`] plus the short forms URLs use (`sig` of an Azure SAS, `X-Amz-*`
+/// presigning parameters, session tokens).
+pub fn is_secret_query_key(key: &str) -> bool {
+    let k = key.to_ascii_lowercase();
+    is_secret_key(&k) || k == "sig" || k.contains("session") || k.contains("signature")
+}
+
+/// A URL safe to store and to replay: `user:password@` removed and query parameters with
+/// secret names ([`is_secret_query_key`]) dropped; the other parameters stay, in order
+/// (`s3://b/p?region=x&secret_access_key=y` → `s3://b/p?region=x`). Credentials are resolved
+/// again (environment, profile) when the URL is used. Text without `://` is returned unchanged.
+pub fn redact_url(raw: &str) -> String {
+    let s = strip_url_credentials(raw);
+    let Some(q) = s.find('?') else {
+        return s;
+    };
+    if !s[..q].contains("://") {
+        return s;
+    }
+    let (base, rest) = s.split_at(q);
+    let rest = &rest[1..];
+    let (query, fragment) = match rest.find('#') {
+        Some(h) => rest.split_at(h),
+        None => (rest, ""),
+    };
+    let kept: Vec<&str> = query
+        .split('&')
+        .filter(|p| !p.is_empty())
+        .filter(|p| {
+            let name = url::form_urlencoded::parse(p.as_bytes())
+                .next()
+                .map(|(k, _)| k.into_owned())
+                .unwrap_or_default();
+            !is_secret_query_key(&name)
+        })
+        .collect();
+    let mut out = base.to_owned();
+    if !kept.is_empty() {
+        out.push('?');
+        out.push_str(&kept.join("&"));
+    }
+    out.push_str(fragment);
+    out
+}
+
 /// A storage URL safe to print: credentials and the query string (SAS tokens, signatures)
 /// removed.
 pub fn display_url(raw: &str) -> String {
@@ -508,6 +554,36 @@ mod tests {
         ] {
             assert!(!is_secret_key(k), "{k} is not secret");
         }
+    }
+
+    #[test]
+    fn redacted_urls_keep_only_what_is_not_secret() {
+        assert_eq!(
+            redact_url("webdav://alice:hunter2@host/files"),
+            "webdav://host/files"
+        );
+        assert_eq!(
+            redact_url("s3://bucket/p?region=eu-west-1&secret_access_key=hunter2"),
+            "s3://bucket/p?region=eu-west-1"
+        );
+        assert_eq!(
+            redact_url("s3://bucket?secret_access_key=hunter2"),
+            "s3://bucket"
+        );
+        assert_eq!(
+            redact_url(
+                "azblob://c/p?sv=2024&sig=hunter2&SessionToken=hunter2&X-Amz-Signature=hunter2&sas_token=hunter2&password=hunter2&endpoint=http://h#f"
+            ),
+            "azblob://c/p?sv=2024&endpoint=http://h#f"
+        );
+        // Percent-encoded names are recognised.
+        assert_eq!(
+            redact_url("s3://b?secret%5Faccess%5Fkey=x&a=1"),
+            "s3://b?a=1"
+        );
+        assert_eq!(redact_url("memory://"), "memory://");
+        assert_eq!(redact_url("prod-bucket"), "prod-bucket");
+        assert_eq!(redact_url("lab://demo?x=1"), "lab://demo?x=1");
     }
 
     #[test]

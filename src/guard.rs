@@ -432,12 +432,14 @@ pub fn plan(profile: &Profile, run_prefix: &str, read_only: bool, budgets: &Budg
     }
 }
 
-/// The target of a profile as typed: its URL (or `lab://` scenario), else its display form.
+/// The target of a profile as typed: its URL (or `lab://` scenario) without secrets, else its
+/// display form.
 pub fn target_ref(profile: &Profile) -> String {
     profile
         .target
         .url
-        .clone()
+        .as_deref()
+        .map(crate::util::redact_url)
         .unwrap_or_else(|| profile.target.display())
 }
 
