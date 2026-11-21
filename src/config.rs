@@ -1568,15 +1568,22 @@ pub fn expand_env(v: &str) -> Result<String> {
 }
 
 impl Profile {
+    /// A `lab://NAME` target starts from its scenario's default workload
+    /// ([`crate::lab::Scenario::defaults`]).
     pub fn from_target(target: TargetSpec) -> Self {
-        Self {
+        let scenario = target.url.as_deref().and_then(crate::lab::Scenario::of_url);
+        let mut p = Self {
             name: None,
             target,
             workload: WorkloadSpec::default(),
             knobs: Knobs::default(),
             sla: Sla::default(),
             cost: CostSpec::default(),
+        };
+        if let Some(sc) = scenario {
+            sc.apply_defaults(&mut p);
         }
+        p
     }
 
     /// Load and validate a profile file: a missing file is `usage.invalid_argument`, a file that
