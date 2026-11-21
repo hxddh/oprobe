@@ -4,6 +4,43 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## v4.0.1 — 2026-11-21
+
+A patch release for four review findings in 4.0.0; no breaking changes.
+
+### Security
+
+- **MCP `recommend_config` could write on a read-only server.** With `from` naming a run that used
+  `--existing`, the call passed the read-only check, but the child `oprobe fix` was rebuilt from the call's own
+  arguments: the `--existing` prefix (and any `set`) was lost and the child uploaded a generated dataset to the
+  target, bypassing `--allow-write`. The child is now `fix --from RUN --set …` with every workload flag, so it
+  measures exactly the checked workload, plus `--read-only` whenever the server would refuse the write;
+  `verify_finding` passes `--read-only` the same way. As defense in depth, a read-only server sets
+  `OPROBE_MCP_READ_ONLY=1` on its child commands, which then refuse any measurement that would write to a
+  target outside their own process.
+- **Secrets in target URLs were stored in reports and run files.** `spec.target_ref` kept the target as typed
+  (`webdav://alice:hunter2@host/files`, `s3://bucket?secret_access_key=…`) and `spec.profile.target.url` kept
+  secret query parameters; both reached run files, `--json` reports, replay commands, next steps and the
+  dry-run plan. Passwords and query parameters with secret names (`secret`, `key`, `token`, `password`,
+  `credential`, `sas`, `sig`, `signature`, `session`, …) are now removed; replay resolves credentials again from
+  the environment, profile or configured target. Run files written by 4.0.0 keep what they stored.
+- **`verify`, `fix` and `baseline calibrate` budgets now cover the whole command.** Each replay of `verify
+  --repeat N` used a fresh guard, so the command could spend N × (findings + 1) times `--max-requests`,
+  `--max-bytes`, `--max-cost-usd` and `--max-duration` (MCP `verify_finding` forwards the server's budgets into
+  the same path). One guard is now shared by every replay, by the diagnosis, tuning and verification of
+  `fix`, and by the runs of `baseline calibrate`, as with `run --repeat`; the first breach stops the command
+  (exit 4, the partial run kept).
+
+### Fixed
+
+- `oprobe fix --no-save` failed at verification (it replayed the diagnosis run by id, and that run was never
+  stored); the replays now start from the diagnosis in memory.
+- `oprobe baseline calibrate --from RUN --dry-run` replayed the run instead of printing the plan.
+
+### Added
+
+- `oprobe fix --from RUNREF [--set KEY=VALUE]…`: fix the workload of a stored run (resolved like `run --from`).
+
 ## v4.0.0 — 2026-11-21
 
 oprobe 4: *one model, one spec, one loop* ([docs/design/v4.md](docs/design/v4.md)). Nothing reads 3.x run files

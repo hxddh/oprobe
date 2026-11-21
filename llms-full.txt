@@ -2613,6 +2613,13 @@ Output formats (`-o`): text, json, ndjson, md
 | `--repeat <N>` | Baseline / candidate pairs of the verification · default `2` |
 | `--write-profile <FILE>` | Write the recommended profile (TOML) to this file |
 
+*Replay*
+
+| argument | description |
+|---|---|
+| `--from <RUNREF>` | Fix the workload of a stored run (RUNREF): its spec, with credentials resolved again from the target; other flags and --set override it (as `run --from`) |
+| `--set <KEY=VALUE>` | Override one setting of the workload, repeatable (as `run --set`) |
+
 ## `oprobe runs`
 
 Saved runs: list, show, open, export, rm, gc
