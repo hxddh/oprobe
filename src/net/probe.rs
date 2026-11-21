@@ -163,16 +163,26 @@ where
 
 /// Probe an `http(s)://` endpoint.
 pub async fn probe_endpoint(endpoint: &str, opts: &ProbeOptions) -> Result<ProbeReport> {
-    let url =
-        url::Url::parse(endpoint).with_context(|| format!("invalid endpoint URL `{endpoint}`"))?;
+    use crate::errors::{ErrorCode, OprobeError};
+    let usage = |m: String| {
+        OprobeError::new(ErrorCode::UsageInvalidArgument, m)
+            .with_hint("pass an http(s):// endpoint such as https://s3.us-east-1.amazonaws.com, or a storage URL")
+    };
+    let url = url::Url::parse(endpoint)
+        .map_err(|e| usage(format!("invalid endpoint URL `{endpoint}`: {e}")))?;
     let https = match url.scheme() {
         "https" => true,
         "http" => false,
-        s => anyhow::bail!("unsupported scheme `{s}` (expected http:// or https://)"),
+        s => {
+            return Err(usage(format!(
+                "unsupported scheme `{s}` (expected http:// or https://)"
+            ))
+            .into());
+        }
     };
     let host = url
         .host_str()
-        .context("endpoint has no host")?
+        .ok_or_else(|| usage(format!("endpoint `{endpoint}` has no host")))?
         .trim_matches(['[', ']'])
         .to_owned();
     let port = url

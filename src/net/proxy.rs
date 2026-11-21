@@ -23,16 +23,24 @@ impl ProxyConfig {
         } else {
             format!("http://{raw}")
         };
+        use crate::errors::{ErrorCode, OprobeError};
+        let usage = |m: String| {
+            OprobeError::new(ErrorCode::UsageInvalidArgument, m).with_hint(
+                "pass --proxy http://HOST:PORT, or `none` to ignore HTTPS_PROXY/HTTP_PROXY",
+            )
+        };
         let u = url::Url::parse(&with_scheme)
-            .map_err(|e| anyhow::anyhow!("invalid proxy URL `{raw}`: {e}"))?;
-        anyhow::ensure!(
-            u.scheme() == "http",
-            "only http:// proxies (HTTP CONNECT) are supported, got `{}`",
-            u.scheme()
-        );
+            .map_err(|e| usage(format!("invalid proxy URL `{raw}`: {e}")))?;
+        if u.scheme() != "http" {
+            return Err(usage(format!(
+                "only http:// proxies (HTTP CONNECT) are supported, got `{}`",
+                u.scheme()
+            ))
+            .into());
+        }
         let host = u
             .host_str()
-            .ok_or_else(|| anyhow::anyhow!("proxy URL `{raw}` has no host"))?
+            .ok_or_else(|| usage(format!("proxy URL `{raw}` has no host")))?
             .trim_matches(['[', ']'])
             .to_owned();
         let port = u.port().unwrap_or(80);

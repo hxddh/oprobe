@@ -8,9 +8,10 @@ oprobe doctor s3://bucket/prefix   # any URL
 ```
 
 It checks configuration, credentials, the network path (DNS, proxy, TCP, TLS, HTTP), clock skew and
-list/write/read/stat/delete permissions one by one, and prints a fix for each failure (`--read-only` skips
-the writes). Every error of every command carries a stable code (`-o json`: `error.code`) and usually a
-`hint:` line.
+list permission and a sample of the objects, and prints a summarized cause and a fix for each failure
+(`-v` adds the raw backend error). It never writes unless you pass `--write-probe`, which also tests
+write/read/stat/delete. Every error of every command carries a stable code (`-o json`: `error.code`)
+and usually a `hint:` line.
 
 ## Errors
 
@@ -36,7 +37,7 @@ the writes). Every error of every command carries a stable code (`-o json`: `err
 
 | Situation | What to do |
 |---|---|
-| leftover `oprobe-run-*` prefixes | a run was killed (second Ctrl-C, OOM, power loss): `oprobe cleanup TARGET --dry-run`, then without `--dry-run` |
+| leftover `oprobe-run-*` prefixes | a run was killed (second Ctrl-C, OOM, power loss): `oprobe cleanup TARGET` lists them, `oprobe cleanup TARGET --yes` deletes them |
 | "client processing-bound" on a remote store | client CPU, CRC verification or tiny objects: check `client cpu` in `runs show --detail`; `--no-verify`; larger objects |
 | `oprobe run` asks questions in a script | it never does: prompts appear only on an interactive terminal with text output; pass a target, or `--non-interactive` |
 | `oprobe top` fails in CI | it needs an interactive terminal; use `oprobe run` |
@@ -130,6 +131,21 @@ certificate): a private CA or a TLS-inspecting proxy. `--ca-cert corp.pem` (or `
 
 A request or connection timed out. Check the network path with `oprobe doctor`; lower the
 concurrency if the client or the link is saturated.
+
+<a id="net-rate_limited"></a>
+### `net.rate_limited` (exit 1, retryable)
+
+An HTTP API other than the storage target (GitHub releases for `oprobe self-update`, an OTLP
+collector) refused the request because its rate limit is exhausted (429, or 403 with no quota
+left). Wait and retry; for GitHub, set `GITHUB_TOKEN` to raise the limit. Your storage
+credentials are not involved.
+
+<a id="net-http"></a>
+### `net.http` (exit 1)
+
+An HTTP API other than the storage target answered with an error (for example GitHub 403 or 404
+for a release, or an OTLP collector rejecting a push). The message names the URL and the status.
+Check the URL, the release tag or the collector; your storage credentials are not involved.
 
 <a id="storage-not_found"></a>
 ### `storage.not_found` (exit 1)

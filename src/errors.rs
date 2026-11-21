@@ -75,6 +75,8 @@ codes! {
     NetDns => "net.dns", exit::RUNTIME, true;
     NetTls => "net.tls", exit::RUNTIME, false;
     NetTimeout => "net.timeout", exit::RUNTIME, true;
+    NetRateLimited => "net.rate_limited", exit::RUNTIME, true;
+    NetHttp => "net.http", exit::RUNTIME, false;
     StorageNotFound => "storage.not_found", exit::RUNTIME, false;
     StorageThrottled => "storage.throttled", exit::RUNTIME, true;
     StorageUnsupported => "storage.unsupported", exit::RUNTIME, false;
@@ -118,6 +120,19 @@ impl ErrorCode {
             400..=499 => Some(Self::Internal),
             500..=599 => Some(Self::Internal),
             _ => None,
+        }
+    }
+
+    /// The code of a non-storage HTTP API (GitHub releases, an OTLP collector) answering
+    /// `status`: rate limits (429, or 403 with an exhausted quota) are `net.rate_limited`,
+    /// anything else `net.http`. Never `storage.*` or `auth.*`: the storage target's
+    /// credentials are not involved (design v4 §8).
+    pub fn from_api_status(status: u16, rate_limited: bool) -> Self {
+        match status {
+            0 => Self::NetUnreachable,
+            429 => Self::NetRateLimited,
+            403 if rate_limited => Self::NetRateLimited,
+            _ => Self::NetHttp,
         }
     }
 
@@ -389,7 +404,7 @@ mod tests {
             };
             assert_eq!(c.exit_code(), want, "{c}");
         }
-        assert_eq!(ErrorCode::ALL.len(), 22);
+        assert_eq!(ErrorCode::ALL.len(), 24);
     }
 
     #[test]
@@ -431,6 +446,22 @@ mod tests {
         assert_eq!(classify(&e, "s3").code, ErrorCode::AuthNoCredentials);
         let e = anyhow::anyhow!("something odd");
         assert_eq!(classify(&e, "s3").code, ErrorCode::Internal);
+    }
+
+    #[test]
+    fn api_statuses_are_network_codes() {
+        assert_eq!(
+            ErrorCode::from_api_status(403, true),
+            ErrorCode::NetRateLimited
+        );
+        assert_eq!(
+            ErrorCode::from_api_status(429, false),
+            ErrorCode::NetRateLimited
+        );
+        assert_eq!(ErrorCode::from_api_status(403, false), ErrorCode::NetHttp);
+        assert_eq!(ErrorCode::from_api_status(404, false), ErrorCode::NetHttp);
+        assert!(ErrorCode::NetRateLimited.retryable());
+        assert_eq!(ErrorCode::NetHttp.exit_code(), 1);
     }
 
     #[test]

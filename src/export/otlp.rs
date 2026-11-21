@@ -450,14 +450,27 @@ pub async fn push(endpoint: &str, signal: &str, body: &Value) -> anyhow::Result<
         .body(serde_json::to_vec(body)?)
         .send()
         .await
-        .map_err(|e| anyhow::anyhow!("OTLP push to {url} failed: {e}"))?;
+        .map_err(|e| {
+            let code = if e.is_timeout() {
+                crate::errors::ErrorCode::NetTimeout
+            } else {
+                crate::errors::ErrorCode::NetUnreachable
+            };
+            crate::errors::OprobeError::new(code, format!("OTLP push to {url} failed: {e}"))
+                .with_hint("check that the collector runs and --endpoint is its base URL")
+        })?;
     let status = resp.status();
     if !status.is_success() {
         let text = resp.text().await.unwrap_or_default();
-        anyhow::bail!(
-            "OTLP collector at {url} answered {status}: {}",
-            text.chars().take(200).collect::<String>()
-        );
+        return Err(crate::errors::OprobeError::new(
+            crate::errors::ErrorCode::from_api_status(status.as_u16(), false),
+            format!(
+                "OTLP collector at {url} answered {status}: {}",
+                text.chars().take(200).collect::<String>()
+            ),
+        )
+        .with_hint("check the collector's logs and that it accepts OTLP/HTTP JSON")
+        .into());
     }
     Ok(())
 }
