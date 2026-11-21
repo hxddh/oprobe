@@ -421,21 +421,40 @@ pub fn estimate(reqs: &[ReqRow], ops: &[OpRow], window: Window) -> Capacity {
 /// `k`: `lo` is the highest level at or below `k` where at most 10 % of (≥ 3) arrivals were
 /// throttled, `hi` the lowest level above `lo` where at least half of them were. `None` when no
 /// throttled arrival lies above the best threshold.
+/// The highest class-balanced error a ceiling split may have (1.0 = no better than no split).
+const MAX_SPLIT_COST: f64 = 0.75;
+
 fn find_ceiling(levels: &BTreeMap<u64, (u64, u64)>) -> Option<(Ceiling, u64)> {
     let lv: Vec<(u64, u64, u64)> = levels.iter().map(|(l, (n, t))| (*l, n - t, *t)).collect();
     let total_clean: u64 = lv.iter().map(|x| x.1).sum();
+    let total_thr: u64 = lv.iter().map(|x| x.2).sum();
+    // The split minimises the class-balanced error: throttled responses are usually a small
+    // minority (11 of ~2000 requests on a parquet lab), and client-side in-flight levels read a
+    // little high, so with equal weights "no split" wins and throttling looks unrelated to load.
+    // Each class weighs 1/its size, so a throttled response below the split costs as much as
+    // the clean requests above it in proportion.
+    let (wt, wc) = (
+        1.0 / total_thr.max(1) as f64,
+        1.0 / total_clean.max(1) as f64,
+    );
     // k = 0 (everything throttled-side) first, then each observed level.
-    let mut best = (total_clean, 0u64);
+    let mut best = (1.0f64, 0u64, total_clean);
     let (mut thr_below, mut clean_below) = (0u64, 0u64);
     for (l, c, t) in &lv {
         thr_below += t;
         clean_below += c;
-        let errors = thr_below + (total_clean - clean_below);
-        if errors < best.0 {
-            best = (errors, *l);
+        let clean_above = total_clean - clean_below;
+        let cost = thr_below as f64 * wt + clean_above as f64 * wc;
+        if cost < best.0 - 1e-12 {
+            best = (cost, *l, thr_below + clean_above);
         }
     }
-    let (errors, k) = best;
+    let (cost, k, errors) = best;
+    // No split (cost 1.0) explains throttling unrelated to load just as well; a ceiling needs a
+    // split that clearly separates the classes (balanced accuracy above 62.5 %).
+    if cost > MAX_SPLIT_COST {
+        return None;
+    }
     // A throttled arrival must exist above the split, or throttling does not follow load.
     lv.iter().find(|(l, _, t)| *l > k && *t > 0)?;
     let share = |c: u64, t: u64| t as f64 / (c + t).max(1) as f64;
@@ -1021,6 +1040,24 @@ mod tests {
         assert!(p2.ops_lo_per_s < p2.ops_per_s && p2.ops_hi_per_s > p2.ops_per_s);
         assert!(p2.throttle_probability_ratio > 0.0);
         assert!(estimate(&[], &[], Window::all()).inflight_ceiling.is_none());
+    }
+
+    #[test]
+    fn a_few_throttled_responses_above_the_limit_still_bracket_it() {
+        // A parquet lab on a slow CI machine: 11 throttled responses, all above 24 in flight,
+        // and clean requests up to 28 (client-side levels read a little high). With equal
+        // weights "no split" (11 errors) beat the right split (80 clean above 24).
+        let mut levels = BTreeMap::new();
+        for l in 1..=23u64 {
+            levels.insert(l, (100, 0));
+        }
+        levels.insert(24, (60, 0));
+        for l in 25..=28u64 {
+            levels.insert(l, (20 + 3, 3));
+        }
+        levels.insert(29, (2, 2));
+        let (c, _) = find_ceiling(&levels).expect("a ceiling");
+        assert!(c.lo <= 24.0 && 24.0 < c.hi, "{c:?}");
     }
 
     #[test]
