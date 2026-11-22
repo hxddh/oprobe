@@ -1,168 +1,148 @@
 # oprobe
 
-**See every request your object-storage client makes. Know where the time and the money go, and what to change.**
+> **oprobe is a profiler for OpenDAL operators.**
+> It shows what your `Operator` really does on the wire, names the layer that fixes it, and proves
+> the fix before you ship it.
 
-oprobe drives realistic workloads through [Apache OpenDAL](https://opendal.apache.org/) against S3, GCS,
-Azure Blob, R2, OSS, COS, B2, MinIO or local storage and traces **every backend request**: time queued,
-DNS/TCP/proxy/TLS on new connections, sending, waiting for the first byte, transferring, and waiting for your
-code. It names the cause of what it finds, backs it with evidence and says what to change — and then checks
-that the change works. Every run is saved as one `.oprobe` file with its full spec: you can reopen it,
-replay it exactly, compare it, export it or hand it to an agent.
-
-It is built for people (a terminal, a native app, a single-file HTML report), for CI (a GitHub Action, exit
-codes, Markdown/JUnit) and for agents (JSON everywhere, an event stream, an MCP server).
+A program has `perf` and flame graphs. An [Apache OpenDAL](https://opendal.apache.org/) operator
+has oprobe. It traces every backend request under every operation, stage by stage (queue, connect,
+send, time to first byte, body, retry backoff), explains what it finds as **one OpenDAL change**,
+and proves that change with an interleaved A/B test on the objective you care about.
 
 [中文](README.zh-CN.md) · [Getting started](docs/getting-started.md) · [Concepts](docs/concepts.md) ·
-[CLI reference](docs/cli.md) · [Reading the report](docs/reading-the-report.md) · [Metrics](docs/metrics.md) ·
-[Workloads](docs/workloads.md) · [CI](docs/ci.md) · [Install](docs/install.md) · [Troubleshooting](docs/troubleshooting.md)
+[op.toml](docs/operator.md) · [CLI](docs/cli.md) · [Reading the profile](docs/reading-the-profile.md) ·
+[Embedding](docs/embedding.md) · [App](docs/app.md) · [Install](docs/install.md) ·
+[Troubleshooting](docs/troubleshooting.md)
+
+## The loop: Profile → Explain → Prove
+
+1. **Profile.** Drive a workload through an operator (`oprobe run s3://bucket/prefix`), or open a
+   `.oprobe` file that [`oprobe-trace`](docs/embedding.md) wrote in production.
+2. **Explain.** Each finding names a cause, shows the requests that are its evidence, and names the
+   one OpenDAL remedy. It gives no numbers: a single run varies no load and cannot size a change.
+3. **Prove.** `oprobe prove` runs the current operator and the one with the remedy interleaved
+   (A B A B …), sizes the remedy where it has a size, and decides on your objective (goodput by
+   default, or p99). The result is a **proven layer diff** you can copy.
 
 ## Start in 60 seconds
 
 ```bash
-# 1. install (macOS / Linux; Windows and packages: docs/install.md)
+# install (macOS / Linux; Windows, packages and cargo: docs/install.md)
 curl -fsSL https://github.com/hxddh/oprobe/releases/latest/download/install.sh | sh
 
-# 2. see what oprobe finds, with no account and no flags
-oprobe demo
-
-# 3. your bucket
-oprobe target add prod s3://my-bucket/oprobe --region eu-west-1
-oprobe run prod
+oprobe demo                      # profile a misbehaving S3 lab on your laptop: no account needed
+oprobe prove last throttling     # A/B-test the remedy of the throttling finding
+oprobe                           # the app: runs, profile, operator, compare
 ```
 
-`oprobe demo` is `oprobe run lab://demo`: a local S3 lab that throttles above 24 requests in flight and turns
-1 in 40 requests into stragglers, measured with its default workload (small files, 32 workers, 8 seconds).
-It explains, step by step, what it found, and suggests replays of the run (`oprobe run --from RUN`) so every
-follow-up compares like for like. `oprobe run` without a target asks what to measure: the demo, the AWS
-profiles, Google credentials or Azure variables it finds on your machine (`oprobe target discover`), or a
-URL — and saves your choice as a named target.
+`oprobe demo` is `oprobe run lab://demo`: a local S3 that throttles above 24 requests in flight and
+turns some requests into stragglers. The brief names at most three findings, each with its remedy
+as an `op.toml` path, and the next command. `prove` ends with the diff, for example:
 
 ```text
-$ oprobe run prod
-[CRITICAL] Throttling-bound: the service rejected 3.6% of requests with 429/503
-  ✖ 626 throttled responses (429/503)
-    3.57% of requests throttled; 609 retries, 63.02s total backoff (25% of operation time)
-    → The service is rate-limiting this request rate. Lower `concurrency` / `max_inflight`
-      below the ceiling, or spread keys over more prefixes.
-    next: oprobe run --from 20261120-084637-d873 --set concurrency=20
-  2114.0 ops/s · 119.2 MiB/s · p50 5.04ms · p99 257ms · errors 0.10%
-  626 throttled (3.57% of requests) · SLA met (throttling not checked: --max-throttle-ratio)
-full report: oprobe runs show 20261120-084637-d873
+proved on goodput: +31 % [+27, +35], p99 −42 %, 0 throttled (4 A/B pairs)
++ ConcurrentLimitLayer::new(24)
+~ RetryLayer::new().with_jitter().with_max_times(4)
 ```
 
-The default output is the verdict, the top findings (cause · evidence · advice · next command), the key
-numbers, and where the full report is. It wraps to your terminal (100 columns when piped) and never cuts a
-command. `--lang zh-CN` (or a `zh_CN` locale) prints it in 简体中文; JSON output stays English.
+Then point it at your own storage:
 
-## Look closer
+```bash
+oprobe run s3://my-bucket/oprobe --set options.region=eu-west-1
+oprobe run op.toml --preset range-reads           # your operator, a parquet-like workload
+oprobe run s3://a/x r2://b/x fs:///nvme/x         # several operators, one workload: a race
+```
 
-| | |
-|---|---|
-| `oprobe runs show last` | The full report in the terminal (80 columns; `--detail` for everything). |
-| `oprobe runs show last -o html > report.html` | One self-contained HTML file: charts with real axes, a latency heatmap, the slowest operations as request waterfalls, every request in a filterable table. Works offline, light and dark, prints cleanly. |
-| `oprobe runs open last` | The run in the native app. |
-| `oprobe run --from last --set concurrency=16` | Replay a run from its stored spec — same workload, dataset, warmup, seed, endpoint, region — with one change. |
-| `oprobe verify last throttling` | Test a finding's advice: replays baseline and change interleaved (A B A B…) and answers *confirmed*, *refuted* or *inconclusive* against the predicted numbers. |
-| `oprobe fix prod` | Diagnose → tune → verify in one go: the recommended settings as a profile patch and code. |
-| `oprobe compare base last` | A regression gate between two runs of the same target and workload (exit 3 on regression). |
-| `oprobe tune prod` | The best goodput within a throttle budget, as a profile and Rust/Python code. |
-| `oprobe runs list` | Every saved run: when, verdict, ops/s, p99, cost. |
+Writes go under a fresh `oprobe-run-<id>/` prefix and are cleaned up; `--dry-run` prints the plan,
+`--read-only` refuses every write, and `--max-requests/--max-bytes/--max-duration` are hard budgets.
 
-## One model, one spec, one loop
+## Your operator: `op.toml`
 
-- **One capacity model.** oprobe reconstructs the requests in flight over time and finds the level where the
-  service starts to throttle (a ceiling with an interval, never a guess from mean latency × rate). Every
-  recommendation that mentions concurrency — the findings, `tune`, `verify`, the app — comes from that one
-  model and keeps a 15 % headroom below the ceiling, taking into account how many requests one operation
-  keeps in flight.
-- **One spec.** Every report carries the run's resolved spec. `oprobe run --from RUN` replays it, `--set
-  key=value` changes one thing, and every suggested command is such a replay, so nothing (warmup, seed, mix,
-  dataset, endpoint, region, HTTP version, rate) is silently dropped.
-- **One loop.** A recommendation is a hypothesis with an expected result. `oprobe verify` measures it and
-  says whether it held; `compare` refuses to judge runs of different targets or workloads.
+The unit of everything is the OpenDAL `Operator`: a service, a layer stack, and read/write options.
+oprobe reads it from a URL, from a file, or from `[operators.NAME]` in its config file.
 
-![The HTML report of the demo run](docs/images/report-html.png)
+```toml
+url = "s3://bucket/prefix"
+[options]                       # OpenDAL service options
+region = "eu-west-1"
+[layers]                        # each key is one OpenDAL layer; absent = not in the stack
+concurrent_limit = { http = 24 }
+retry = { max_times = 3, jitter = true }
+timeout = { op = "30s", io = "10s" }
+[read]
+chunk = "8MiB"
+concurrent = 4
+[http]
+version = "auto"                # auto | h1 | h2
+```
+
+`--set layers.retry.max_times=5` or `--set read.gap=1MiB` changes one value. The diff between two
+operators renders as Rust and as TOML. [The reference →](docs/operator.md)
+
+## Findings and their remedy
+
+| Finding | Cause | Remedy (`op.toml` path) |
+|---|---|---|
+| `throttling` | 429/503 above an in-flight level | `layers.concurrent_limit.http`, plus `layers.retry.jitter` |
+| `rate_limit` | a request-rate ceiling | `layers.concurrent_limit.http` |
+| `key_limit` | a hot prefix or key | the key layout (advice, not a layer) |
+| `bandwidth_cap` | a bytes-per-second ceiling | `layers.throttle.bandwidth` |
+| `tail_stragglers` | a few very slow server responses | `layers.tail_cut` |
+| `hung_requests` | requests that never finish | `layers.timeout.io` |
+| `small_ranges` | many small range reads | `read.gap` / `read.concurrent` |
+| `slow_multipart` | multipart uploads that crawl | `write.chunk` / `write.concurrent` |
+| `repeated_reads` | the same bytes read again and again | `layers.cache` (`FoyerLayer`) |
+| `cold_connections` | handshakes on the critical path, HTTP version | `http.keep_alive` / `http.version` |
+| `client_bound` | your process is the bottleneck | none in storage; reported as such |
+
+`run` names the remedy; only `prove` puts a number on it.
+
+## Profile production: `oprobe-trace`
+
+Add one layer to your own operator and save a profile the workbench opens like any other run:
+
+```rust
+let (layer, handle) = oprobe_trace::layer(oprobe_trace::Config::default());
+let op = op.layer(layer);
+handle.save("prod.oprobe")?;          // later: oprobe show prod.oprobe
+```
+
+`oprobe-trace` is an OpenDAL layer plus an instrumented `HttpFetch` (OpenDAL's own reqwest client,
+observed). Memory stays bounded, the overhead is benchmarked (budget ≤ 2 µs per operation), and an
+`Exporter` hook (with OpenTelemetry metrics behind the `otel` feature) sees every request.
+[Embedding →](docs/embedding.md)
 
 ## The app
 
-Run `oprobe` with no arguments: a native window (AppKit on macOS, Win32/Direct2D on Windows, GTK 4 on Linux)
-when there is a display, the same workbench in your terminal otherwise (`oprobe top`, also over SSH). Targets,
-run history and baselines on the left; the run inspector with Overview, Requests, Timeline, Connections,
-Findings and Cost; the selected request or operation on the right. [More →](docs/app.md)
+Run `oprobe` with no arguments: a native window when there is a display, the same app in your
+terminal otherwise (also over SSH). Four views: **Runs**, **Profile** (verdict, where the time
+went, the request waterfall of the slowest operations, timeline, heatmap), **Operator** (your layer
+stack beside each remedy: toggle a layer, press *Prove*, watch the A/B pairs stream in, copy the
+diff) and **Compare**. It speaks 简体中文 and English. [More →](docs/app.md)
 
-![oprobe workbench](docs/images/app-workbench.png)
+## For scripts and agents
 
-## What it answers
-
-| Question | How |
-|---|---|
-| Network, server or my client? | Each operation's wall time split into queue / connect / upload / server / download / retry / client from the real request timeline. |
-| Why is p99 so much worse than p50? | The slowest operations keep every request with its stages, connection (cold/warm), status and request ID, plus an async call stack captured while they were stuck. |
-| Is it throttling? | 429/503 counts, Retry-After, retry backoff as its own share of time, the in-flight ceiling where it starts and the safe concurrency below it (the capacity model). |
-| Are connections reused? Is TLS slow? | Per-dial DNS/TCP/proxy/TLS times, reuse ratio, peak in-flight requests, per remote address. |
-| Am I paying for bytes I do not use? | Read amplification, over-read from range coalescing, requests per operation. |
-| What will it cost? | The measured request mix × provider price tables, waste from failed requests and over-reads. |
-| Did my change make storage I/O worse? | `oprobe compare` or the GitHub Action: noise floors, configuration differences, Markdown + JUnit. |
-
-## In CI
-
-```yaml
-- uses: hxddh/oprobe@v5
-  with:
-    target: s3://ci-bucket/oprobe
-    preset: small-files
-    baseline: main
-    repeat: 3
-```
-
-The action installs the newest oprobe 5.x (or the `version` you pin), runs, compares against the baseline
-(`--strict`: different targets or workloads fail), learns the target's noise floor once and keeps it with
-the capacity history in the Actions cache, uploads the `.oprobe` file and the HTML report, keeps one sticky
-PR comment up to date and fails on regression. `oprobe watch` probes production continuously and exports
-Prometheus (`/metrics`, `/healthz`) and OTLP metrics. [CI guide →](docs/ci.md)
-
-## For agents
-
-Every command prints one JSON document with `-o json` and an event stream with `-o ndjson`; errors carry stable
-codes and exit codes; `oprobe schema` prints the JSON Schemas; `oprobe mcp` is an MCP server (read-only unless
-`--allow-write`). See [docs/agents.md](docs/agents.md) and [llms.txt](llms.txt).
-
-## Embed it
-
-oprobe 5.0 is three crates in one workspace:
-
-| Crate | For |
-|---|---|
-| [`oprobe-trace`](crates/oprobe-trace) | The instrumentation as an OpenDAL layer for your own operator in production: per-stage timing of every request, bounded memory, optional OpenTelemetry metrics (`otel`). `let (layer, handle) = oprobe_trace::layer(Config::default());` |
-| [`oprobe-core`](crates/oprobe-core) | The engine, diagnosis, cost model, tuner, run store and the service layer (`oprobe_core::app::App`) that every front end calls. |
-| [`oprobe`](crates/oprobe) | The binary: the CLI, the MCP server and the app. |
-
-## Shell
-
-`oprobe completions bash|zsh|fish|powershell|elvish` prints a completion script that completes target
-names, run ids, labels and finding codes as you type. `--help` shows the common flags of a command;
-`--help-all` shows all of them.
+Every command prints one JSON document with `-o json` (stdout carries only the result; progress
+goes to stderr), errors carry stable codes and exit codes (0 ok · 1 runtime · 2 usage · 3 prove
+refuted · 4 budget · 5 safety · 130 interrupted), and the JSON Schemas are in [`schemas/`](schemas).
+Agents: [`skills/oprobe/SKILL.md`](skills/oprobe/SKILL.md) and [llms.txt](llms.txt).
 
 ## Install
 
 | Platform | |
 |---|---|
-| macOS / Linux | `curl -fsSL https://github.com/hxddh/oprobe/releases/latest/download/install.sh \| sh` |
-| Homebrew | `brew install hxddh/tap/oprobe` (the app: `brew install --cask hxddh/tap/oprobe-app`) |
-| Windows | `irm https://github.com/hxddh/oprobe/releases/latest/download/install.ps1 \| iex`, the `.msi`, or Scoop (`scoop bucket add hxddh https://github.com/hxddh/scoop-bucket`, `scoop install oprobe`) |
-| winget | `winget install hxddh.oprobe` once the package is accepted into winget-pkgs — [status](docs/install.md#windows) |
+| macOS / Linux | `curl -fsSL https://github.com/hxddh/oprobe/releases/latest/download/install.sh \| sh` (`-s -- --cli` for the CLI without the app) |
+| Homebrew | `brew install hxddh/tap/oprobe` (the app bundle: `brew install --cask hxddh/tap/oprobe-app`) |
+| Windows | `irm https://github.com/hxddh/oprobe/releases/latest/download/install.ps1 \| iex`, the `.msi`, Scoop (`scoop bucket add hxddh https://github.com/hxddh/scoop-bucket`, `scoop install oprobe`) or `winget install hxddh.oprobe` |
 | Debian / Ubuntu, Fedora / RHEL | `.deb` / `.rpm` from the release page |
-| Rust | `cargo install oprobe --locked` (`--features gui` for the window on Linux) |
+| Rust | `cargo install oprobe --locked` (`--no-default-features --features cli` for the CLI only, `--features gui` for native windows on Linux) |
 
-The macOS and Windows packages are **not code-signed** (no certificates): the first open needs one
-confirmation — [how](docs/install.md#first-open-of-unsigned-packages). Every asset has a SHA-256 in
-`SHA256SUMS` and a signed SLSA build provenance attestation; `install.sh`, `install.ps1` and
-`oprobe self-update` verify it with `gh attestation verify` when the GitHub CLI is logged in, and otherwise
-a minisign signature over `SHA256SUMS` ([verifying](docs/install.md#verifying-a-download)). Update with
-`oprobe self-update` (or your package manager).
+The macOS and Windows packages are **not code-signed**: the first open needs one confirmation
+([how](docs/install.md#first-open-of-unsigned-packages)). Every asset has a SHA-256 in `SHA256SUMS`
+and a SLSA build provenance attestation; the install scripts check the SHA-256 and, when the GitHub
+CLI is logged in, the attestation ([verifying](docs/install.md#verifying-a-download)).
 
-oprobe sends no telemetry. It talks only to the storage you point it at, and to GitHub when you run
-`oprobe self-update`. [Privacy →](docs/privacy.md)
+oprobe sends no telemetry and talks only to the storage you point it at. [Privacy →](docs/privacy.md)
 
 ## License
 

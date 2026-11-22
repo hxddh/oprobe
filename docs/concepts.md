@@ -1,126 +1,114 @@
 # Concepts
 
-Four things: **targets** you measure, **runs** that record a measurement, **baselines** you compare against,
-and **findings** that explain a run.
+oprobe has six ideas: the **operator** you profile, the **workload** you drive through it, the
+**profile** that comes out, the **findings** in it, each finding's **remedy**, and **prove**, which
+turns a remedy into a number.
 
-## Targets
+## Operator
 
-A target is a named storage endpoint: a URL, options and where its credentials come from. Any command that
-takes a target accepts:
+An OpenDAL `Operator` is a service (S3, GCS, Azure Blob, a file system, …), a stack of layers
+(retry, timeout, concurrency limit, …) and the options of its reads and writes. That is OpenDAL's
+own model, and it is the unit of everything in oprobe.
 
-- a **name** from the config file (`oprobe target add prod s3://bucket/prefix`);
-- a **URL**: `s3://bucket/prefix`, `gcs://bucket`, `azblob://container`, `oss://`, `cos://`, `b2://`,
-  `webdav://`, `fs:///path`, `memory://` (with `--endpoint`, `--region`, `--option KEY=VALUE` as needed);
-- `lab://SCENARIO`: an S3-compatible server with programmable faults inside oprobe (no credentials).
-  Scenarios: `clean`, `demo` (8 ms, 503 above 24 requests in flight, 2.5 % stragglers), `throttle`
-  (503 above 8 in flight), `stragglers`, `lossy`, `flaky` and `parquet` (the demo's 24-in-flight limit
-  without stragglers, for `--preset parquet`: a HEAD, a footer read, then 4 parallel column reads per
-  operation, so 6 workers fit under the limit and 8 throttle).
+oprobe reads an operator from:
 
-```toml
-# <config dir>/oprobe/config.toml   (oprobe config path · oprobe config edit)
-[defaults]
-target = "prod"            # used when a command is given none
-duration = "30s"
+- a URL: `s3://bucket/prefix`, `gcs://bucket`, `azblob://container`, `fs:///nvme/x`, `memory://`,
+  or `lab://SCENARIO` for the built-in lab; the layers are OpenDAL's defaults plus `retry` and
+  `timeout`;
+- an operator file, `op.toml` (format `oprobe.operator/6`): the URL, service options, layers,
+  read/write options and HTTP client settings ([reference](operator.md));
+- a name, `[operators.NAME]` in the config file.
 
-[targets.prod]
-url = "s3://my-bucket/oprobe"
-region = "eu-west-1"
-credentials = "profile:prod"     # env | profile:NAME | anonymous; default: the provider's chain
-options = { enable_virtual_host_style = "true" }   # OpenDAL options, checked against the service
-```
+`--set PATH=VALUE` changes one value (`--set layers.retry.max_times=5`, `--set read.gap=1MiB`).
+The difference between two operators is itself a value: it renders as Rust builder code and as
+TOML, and it is what `prove` hands you.
 
-Every setting has a precedence: flags > `OPROBE_*` environment > target > `[defaults]` > built-in.
-`oprobe config show` prints each effective value and where it comes from.
+Comparing two operators that differ in a layer is the same thing as comparing two that differ in
+service. So `oprobe run s3://a/x r2://b/x fs:///nvme/x` races three backends with no extra
+feature.
 
-| Command | |
-|---|---|
-| `oprobe target add NAME URL [--region --endpoint --credentials --option K=V]` | Save (or replace) a target; a quick read-only check follows (`--no-test` skips it). |
-| `oprobe target list` / `show NAME` / `rm NAME` | Manage. Secrets in options are never printed. |
-| `oprobe target test NAME [--write-probe]` | The doctor: DNS, TCP, TLS, HTTP, clock skew, credentials, list and an object sample (read-only); `--write-probe` adds write/read/stat/delete. |
-| `oprobe target discover` | Credential sources on this machine (AWS profiles and environment, GCP ADC, Azure environment), by name only. |
-| `oprobe target sample TARGET` | What a target holds: prefixes, object counts, size distribution, the prefix to use with `--existing`. |
+## Workload
 
-## Runs
+A workload is an OpenDAL access pattern. Four presets cover the common ones:
 
-A run is one measurement. It is immutable once finished and saved as one file,
-`<data dir>/oprobe/runs/<run-id>.oprobe` (`oprobe config path` shows where; `OPROBE_DATA_DIR` moves it).
-The file holds the full resolved configuration, the environment, the report and the trace: one row per
-operation and one per backend request (up to 1 000 000 requests, sampled beyond that — aggregates stay exact).
+| Preset | What it does | Default dataset |
+|---|---|---|
+| `small-files` (default) | whole-object reads (60 %) and writes (30 %), stats (10 %) | 256 × 64 KiB |
+| `large-objects` | multipart writes (80 %) and full reads (20 %) | 2 × 32 MiB |
+| `range-reads` | parquet-like: a stat, the footer, then vectored column-chunk ranges | 8 × 16 MiB |
+| `list-stat` | lists (40 %) and stats (60 %) over a partitioned prefix | 512 × 4 KiB in 16 partitions |
 
-Commands refer to runs with a **RUNREF**:
+Shape it with `-c/--concurrency`, `-d/--duration`, `--objects`, `--object-size`, `--rate`
+(open loop: operations start on a schedule and latency counts from the intended start, so a slow
+server cannot hide behind fewer requests), `--seed` and `--existing PREFIX` (read the objects
+that are already there, write nothing).
 
-| RUNREF | Means |
-|---|---|
-| `20261120-143005-a1b2` | a run id |
-| `20261120-14` | a unique id prefix |
-| `last`, `last~1`, `last~2` | the newest run, the one before, … |
-| `before` | the newest run with that `--label` |
-| `./ci/run.oprobe` | a run file anywhere |
+oprobe writes its dataset under a fresh `oprobe-run-<id>/` prefix, warms up, measures, and
+deletes the prefix. The guard enforces budgets (`--max-requests`, `--max-bytes`,
+`--max-duration`), `--read-only` and `--dry-run`.
 
-| Command | |
-|---|---|
-| `oprobe runs list [-n N]` | Saved runs: id, label, target, when, window, verdict, ops/s, p99, cost/month. |
-| `oprobe runs show [RUNREF] [--detail]` | The full report (`-o html`, `-o md`, `-o json`). |
-| `oprobe runs open RUNREF` | Open the run in the app. |
-| `oprobe runs export RUNREF --format html\|md\|json\|ndjson\|csv\|har\|otlp` | Export. |
-| `oprobe runs rm RUNREF…` | Delete runs. |
-| `oprobe runs gc --keep 50 --older-than 30d [--dry-run]` | Delete old runs; runs in a baseline are kept. |
+## Profile
 
-## Baselines
+A profile is what one operator did on one workload, saved as one `.oprobe` file:
 
-A baseline is a named, rolling set of runs (default: the last 10) that new runs are compared against.
+- the operator spec and the workload, so the run replays exactly;
+- every operation and every backend request under it, stage by stage: **queue** (waiting for a
+  connection or a permit), **connect** (DNS, TCP, proxy, TLS on a fresh connection), **send**,
+  **TTFB** (the server's time to the first byte), **body** (the transfer), **stall** (the body
+  waiting for your code), and **retry backoff** between attempts;
+- the aggregates: throughput and goodput, latency percentiles, per API and per stage, connection
+  reuse, bytes and amplification, a per-second timeline and a latency heatmap;
+- the findings.
 
-```bash
-oprobe run prod --baseline main          # compare against `main`, then add this run to it
-oprobe baseline list
-oprobe compare --baseline main last      # gate the last run against the baseline
-```
+Each operation's wall time splits exactly into queue + backend + retry + client, so "network,
+server or my code?" has a measured answer. Long runs keep every aggregate exact and sample whole
+operations (failed, throttled and slowest ones are always kept), so memory stays bounded.
 
-`oprobe compare A B` compares two runs directly. A comparison lists every configuration difference first:
-a different workload or target fails (the numbers are not comparable), different client knobs are an A/B
-comparison, a different host or oprobe version is a warning. Exit code 3 means a regression.
+`.oprobe` files come from `oprobe run` and from [`oprobe-trace`](embedding.md) in production;
+`oprobe show FILE` and the app open both. [Reading the profile →](reading-the-profile.md)
 
-## Findings
+## Finding
 
-A finding is one diagnosis item with:
+A finding names a cause and shows its evidence. It is derived from the profile by fitting simple
+limit models to the requests in flight over time (an in-flight ceiling where 429/503 start, a
+request-rate ceiling, a bandwidth plateau, a hot key) and by reading the stage split (stragglers,
+hung I/O, cold connections, small ranges, slow multipart, repeated reads, a busy client).
 
-- a stable **code** (`throttling`, `tail_stragglers`, `cold_connections`, `server_latency`, …) — `oprobe explain CODE`
-  documents it;
-- a **severity**: info, warning or critical;
-- a one-sentence **cause**;
-- **evidence**: the numbers, and references to the operations and time windows that show it;
-- **advice**: what to change;
-- optionally a **verification**: a concrete command that tests the advice.
+Every finding has a confidence: **high** only when the model explains most of the effect and
+agrees across repeats. Throttling that made operations fail is reported as throttling, never as
+an invalid run. The codes and their remedies are in the [README](../README.md#findings-and-their-remedy);
+besides those, `errors` reports failures that are not throttling and `invalid_run` a run whose
+numbers cannot be trusted (too short, nothing measured).
 
-The **verdict** sums a run up: `ok`, `review` (worth a look), `attention` (warnings) or `critical`
-(critical findings or a breached SLA), with a one-sentence headline of where the time went.
+## Remedy
 
-## Exit codes
+Each finding names exactly **one** remedy, as an `op.toml` path: `layers.concurrent_limit.http`,
+`layers.tail_cut`, `read.gap`, `http.keep_alive`, … A remedy that is not a layer (spreading keys
+over prefixes for `key_limit`) is reported as advice, and `client_bound` has no storage remedy.
 
-| Code | Meaning |
-|---|---|
-| 0 | ok |
-| 1 | runtime failure (authentication, network, storage, internal) |
-| 2 | usage or configuration error |
-| 3 | SLA failed or regression |
-| 4 | a budget stopped the run (`--max-cost-usd`, `--max-requests`, `--max-bytes`, `--max-duration`) |
-| 5 | safety refusal (e.g. a write under `--read-only`) |
-| 130 | interrupted (Ctrl-C); the partial run is saved |
+`run` gives the remedy and **no number**. A single run varies no load, so it cannot say how
+large a limit should be or how much it would help; claiming so would be a guess.
 
-With `-o json` or `-o ndjson`, errors are printed on stdout as `{"type":"error","error":{"code":…}}`
-with a stable dotted code such as `auth.denied` or `net.timeout`.
+## Prove
 
-## Safety rails
+`oprobe prove RUN [FINDING]` is the only source of numbers:
 
-Every command that sends requests (`run`, `demo`, `tune`, `matrix`, `watch`, `compat`, the app and
-MCP runs) goes through the same rails:
+1. **Choose the change**: the finding's remedy (the top finding by default), or `--with PATH=VALUE`.
+2. **Size it**: when the remedy has a size (a limit, a chunk), short trials over that one value
+   find the knee of the objective, within `--max-throttle`.
+3. **A/B test**: A and B alternate (A B A B …); a sequential test on the objective, against a
+   noise floor learned from A/A pairs, stops as soon as it can decide, or at `--budget`.
+4. **Decide**: `improved`, `worse` (exit 3) or `inconclusive` on the objective: **goodput**
+   (successful operations per second; the default) or **p99**. Intervals are Wilson/beta and stay
+   in range; secondary metrics are shown and never decide.
+5. **Save**: every trial run is saved as a child of the prove run, hidden from `show --list`.
 
-- `--dry-run` prints the plan (requests, bytes, objects written/deleted, cost, ETA) and exits;
-- `--read-only` refuses writes and deletes (exit 5); `--existing PREFIX` implies it;
-- writes stay under `oprobe-run-<id>/` (or the prefix `--idempotency-key` names), which
-  `oprobe cleanup` sweeps;
-- budgets (`--max-cost-usd`, `--max-requests`, `--max-bytes`, `--max-duration`, defaults under
-  `[defaults.budgets]` in the config file) stop the command with exit 4. A budget covers the whole
-  command: all runs of `run --repeat N`, all cells of `matrix`, all windows of `watch`, all trials
-  of `tune`. `tune --budget 10m` additionally caps the number of trials so the tuner's estimate fits.
+The result is a **proven layer diff**: the objective's change with its interval, the evidence,
+and the change as Rust and as TOML. Every result states where it was validated (the lab, MinIO,
+your bucket).
+
+## Where oprobe stops
+
+oprobe is not a load generator for benchmarking storage servers (use warp or elbencho), not a
+monitoring system (use OpenDAL's metrics and OpenTelemetry layers, or `oprobe-trace`'s
+exporter), not a CI regression gate and not a cloud bill estimator.

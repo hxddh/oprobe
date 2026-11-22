@@ -1,6 +1,5 @@
 //! Raw trace records produced by instrumentation (one per backend request).
 
-use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// Storage API classification of a single backend request. Derived from the real HTTP
@@ -10,6 +9,7 @@ use serde::{Deserialize, Serialize};
 /// Serialized as the API's name (`GetObject`, `UploadPart`, …): the same string a request row
 /// carries in `api`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(not(feature = "__internal"), non_exhaustive)]
 pub enum Api {
     #[default]
     GetObject,
@@ -28,22 +28,6 @@ pub enum Api {
     Other,
 }
 
-/// Billing bucket used by the cost model.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum BillingClass {
-    /// PUT / POST / COPY (S3 "tier 1", GCS "class A").
-    Write,
-    /// LIST requests (class A on S3/GCS, class C on B2).
-    List,
-    /// GET / HEAD (S3 "tier 2", GCS "class B").
-    Read,
-    /// DELETE / abort, free on most providers.
-    Delete,
-    /// Not billed (control plane, in-process backends).
-    Free,
-}
-
 impl Serialize for Api {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         s.serialize_str(self.label())
@@ -57,7 +41,8 @@ impl<'de> Deserialize<'de> for Api {
     }
 }
 
-impl JsonSchema for Api {
+#[cfg(feature = "schemars")]
+impl schemars::JsonSchema for Api {
     fn schema_name() -> std::borrow::Cow<'static, str> {
         "Api".into()
     }
@@ -191,24 +176,13 @@ impl Api {
         }
     }
 
-    pub fn billing_class(&self) -> BillingClass {
-        match self {
-            Api::PutObject
-            | Api::CreateMultipart
-            | Api::UploadPart
-            | Api::CompleteMultipart
-            | Api::CopyObject => BillingClass::Write,
-            Api::ListObjects => BillingClass::List,
-            Api::GetObject | Api::HeadObject | Api::Other => BillingClass::Read,
-            Api::DeleteObject | Api::DeleteObjects | Api::AbortMultipart => BillingClass::Delete,
-            Api::Control => BillingClass::Free,
-        }
-    }
 }
 
 /// Transport protocol a request travelled over.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(not(feature = "__internal"), non_exhaustive)]
 pub enum Protocol {
     #[default]
     Http1,
@@ -219,7 +193,9 @@ pub enum Protocol {
 
 /// Sequential, non-overlapping phases of one backend request in microseconds.
 /// `total_us == queue + dns + tcp + proxy + tls + send + ttfb + body + stall` (±rounding).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[cfg_attr(not(feature = "__internal"), non_exhaustive)]
 pub struct RequestTiming {
     /// Waiting for an in-flight request permit or a usable pooled connection.
     pub queue_us: u64,
@@ -249,7 +225,9 @@ impl RequestTiming {
 }
 
 /// One backend request (HTTP request or in-process backend call).
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[cfg_attr(not(feature = "__internal"), non_exhaustive)]
 pub struct RequestRecord {
     pub api: Api,
     pub method: String,
@@ -272,10 +250,10 @@ pub struct RequestRecord {
     pub error: Option<String>,
     /// Remote address of the connection (the proxy's when tunnelling), when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(with = "Option<String>")]
+    #[cfg_attr(feature = "schemars", schemars(with = "Option<String>"))]
     pub remote: Option<std::net::SocketAddr>,
     /// The exact backend API (OpenDAL `ServiceOperation`) when the service attached one; the
-    /// request row's `api`. `api` above is its class (aggregation, billing).
+    /// request row's `api`. `api` above is its class (aggregation).
     #[serde(skip)]
     pub service_op: Option<&'static str>,
     /// TLS handshake of the connection, on the request that dialed it.

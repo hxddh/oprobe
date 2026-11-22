@@ -4,6 +4,95 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## v6.0.0 — unreleased
+
+Design [v6](docs/design/v6.md), from the review in [v6-review.md](docs/design/v6-review.md).
+oprobe 6 is **a profiler for OpenDAL operators**: one workbench (the app and four CLI commands),
+one layer (`oprobe-trace`) and one file (`.oprobe`). It is a deep cut, built around one loop.
+Everything under **Changed** and **Removed** is breaking; 5.x run files are not read.
+
+### The new model
+
+- **The operator is the unit.** An OpenDAL `Operator` (a service, a layer stack, read/write and
+  HTTP options) is given as a URL, an operator file (`op.toml`, `oprobe.operator/6`) or a
+  configured name (`[operators.NAME]`). `OperatorSpec` replaces targets, knobs and client
+  stacks; `--set PATH=VALUE` changes one value, and the difference between two operators renders
+  as Rust and TOML.
+- **Profile → Explain → Prove.** `run` profiles one or more operators on one workload and
+  explains each finding with its evidence and exactly one OpenDAL remedy (an `op.toml` path) and
+  no number. `prove` is the only source of numbers: it sizes the remedy, runs A and B
+  interleaved with a sequential test against a learned noise floor, and decides
+  `improved | worse | inconclusive` on your objective (goodput by default, or p99). The result is
+  a proven layer diff.
+- **Findings use OpenDAL's layers:** `ConcurrentLimitLayer`, `RetryLayer` with jitter,
+  `ThrottleLayer`, `TailCutLayer`, `TimeoutLayer`, `FoyerLayer`, read/write chunking and the
+  `HttpFetch` settings. The catalog is `throttling`, `rate_limit`, `key_limit`, `bandwidth_cap`,
+  `tail_stragglers`, `hung_requests`, `small_ranges`, `slow_multipart`, `repeated_reads`,
+  `cold_connections`, `client_bound`, `errors` and `invalid_run`.
+- **Four workload presets** (`small-files`, `large-objects`, `range-reads`, `list-stat`) replace
+  the five of 5.0.
+
+### Changed
+
+- **CLI: four commands** (29 in 5.0): `oprobe run OPERATOR…`, `oprobe prove RUN [FINDING]`,
+  `oprobe show [RUN|FILE]` (with `--list`, `--rm`, `--detail`, `--by`) and `oprobe lab
+  [SCENARIO]`; `oprobe demo` is `oprobe run lab://demo`, and a bare `oprobe` opens the app.
+  Global flags: `-o text|json`, `-q`, `--color`, `--non-interactive`.
+- **Exit code 3** means that `prove` refuted the change (worse on the objective); 0, 1, 2, 4, 5
+  and 130 are unchanged.
+- **The app** is rebuilt on nsh with four views (Runs, Profile, Operator, Compare); in the
+  Operator view a toggled layer is proven live. It speaks 简体中文 and English; the CLI and JSON
+  output are English only.
+- **Files and schemas:** `oprobe.run/6` and `oprobe.report/6`; `oprobe-trace` writes
+  `oprobe.trace/6`. Six schemas are published (`report`, `prove`, `run-list`, `operator`,
+  `error`, `events`).
+- **Prove trials** are saved as children of their prove run and hidden from `show --list`.
+- **Trust fixes:** censored open-loop arrivals count in every percentile; tail attribution
+  follows the stage split (retry backoff is not "TTFB"); a saturated client feeds the verdict;
+  "high" confidence requires the fit to explain most of the effect; intervals stay in range;
+  throttle-driven failures are reported as throttling, not as an invalid run; counts agree with
+  totals.
+- **`oprobe-trace` is slim and stable.** The API is `layer(Config) -> (TraceLayer, Handle)`,
+  `Handle::snapshot()`, `Handle::save(path)` / `Snapshot::save(path)` (a `.oprobe` profile that
+  `oprobe show FILE` opens) and the `Exporter` hook; `Config` is a builder and public types are
+  `#[non_exhaustive]`. The CLI's error codes and exit codes moved to `oprobe-core`; trace rows
+  carry `FailureCode`. `schemars` is optional; the probe code, the microscope dialer, hyper and
+  the root-store builder are gone. A real overhead benchmark
+  (`cargo bench -p oprobe-trace --bench overhead`) replaces the self-reported number; the budget
+  is 2 µs per operation.
+- **Crates:** `oprobe-trace` is the published API. `oprobe-core` is still published, only so
+  that `cargo install oprobe` works; it is documented as internal with no semver promise, and
+  the crates pin each other with exact versions.
+- **Releases:** every platform gets the app build and a CLI-only build
+  (`oprobe-cli-<ver>-<target>` archives; `--no-default-features --features cli`). `install.sh
+  --cli` / `install.ps1 -Cli` install it; `install.sh --help` prints help instead of installing.
+- **Docs** are rewritten around the loop: getting started, concepts, `op.toml`, the CLI,
+  reading the profile, embedding, the app, install, troubleshooting, privacy and releasing.
+
+### Removed
+
+- **Commands:** `tune` (and its Bayesian optimiser), `verify` and `fix` as commands (they are
+  `prove` now), `compare`, `baseline`, `watch`, `matrix`, `compat`, `doctor`, `probe`, `target`,
+  `analyze`, `explain`, `runs` (now `show`), `top`/`gui` (now a bare `oprobe`), `config`,
+  `cleanup`, `schema`, `capabilities`, `self-update`, `completions` and `man`.
+- **The MCP server** (`oprobe mcp`, 21 tools, prompts and resources). Agents use `-o json` and
+  the skill in `skills/oprobe/SKILL.md`.
+- **The GitHub Action** (`action.yml`), baselines, noise-floor caching for CI, JUnit and PR
+  comments.
+- **Distributed workers**, the SDK clients (`aws-sdk`, `exec:`) and the language adapters.
+- **The cost model** and price tables.
+- **Output formats:** HTML, Markdown, NDJSON (the event stream on stdout), CSV, HAR and OTLP
+  export; `-o` is `text` or `json`.
+- **The microscope transport** (oprobe's own HTTP pool) and the in-house cache layer
+  (`FoyerLayer` replaces it).
+- **Internationalisation of the CLI** (`--lang`); the app keeps its own catalog.
+- **Profiles** (`profiles/*.toml`), shell completions and man pages in the packages; the MSI's
+  `.oprobe` file association and `oprobe://` links.
+- **The minisign claim:** the README no longer promises a signature check; the installers verify
+  a minisign signature only for releases that embed a public key.
+- Docs: `ci.md`, `cost.md`, `agents.md`, `metrics.md`, `tuning.md`, `workloads.md`,
+  `reading-the-report.md` (what is still true moved into the new pages).
+
 ## v5.0.0 — 2026-11-22
 
 Design [v5](docs/design/v5.md). The changes under **Changed** are breaking.

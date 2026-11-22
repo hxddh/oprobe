@@ -1,4 +1,4 @@
-# Updates for the SHA-pinned GitHub Actions (workflows and action.yml) and for Cargo
+# Updates for the SHA-pinned GitHub Actions (workflows) and for Cargo
 # dependencies (design v5 §5 "Supply chain"). Security updates are opened as they appear.
 version: 2
 updates:

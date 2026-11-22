@@ -7,13 +7,13 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 documentation = "https://docs.rs/oprobe-core"
-description = "The engine of oprobe: workloads, operators, diagnosis, prove, the run store and the service layer the oprobe front ends call"
+description = "Internal engine of the oprobe binary (no semver promise; to profile your own OpenDAL operator use oprobe-trace)"
 readme = "README.md"
 keywords = ["opendal", "s3", "benchmark", "profiler", "object-storage"]
 categories = ["development-tools::profiling"]
 include = ["src/**/*", "Cargo.toml", "README.md", "LICENSE"]
-# Internal to the oprobe binary (design v6 §8): no semver promise, not published.
-publish = false
+# Internal to the oprobe binary (design v6 §8): published only so that `cargo install oprobe`
+# works, with no semver promise; `oprobe` pins it with an exact version.
 
 [features]
 default = ["default-services"]

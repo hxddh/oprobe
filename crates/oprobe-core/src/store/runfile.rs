@@ -27,11 +27,11 @@ use anyhow::{Context, Result, bail};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::errors::ErrorCode;
 use crate::model::{
     OpBreakdownUs, OpRow, RUN_FORMAT, Report, ReqDetail, ReqRow, Run, RunSpec, TcpRow, TlsRow,
     WireProtocol,
 };
+use crate::trace::rows::FailureCode;
 
 const ZSTD_LEVEL: i32 = 3;
 /// Rows per segment when a finished run is written in one go ([`write_run`]).
@@ -161,7 +161,7 @@ struct OpColumns {
     latency_us: Vec<u32>,
     bytes: Vec<u64>,
     ok: Vec<bool>,
-    error_code: Vec<Option<ErrorCode>>,
+    error_code: Vec<Option<FailureCode>>,
     error: Vec<Option<u32>>,
     throttled: Vec<bool>,
     attempts: Vec<u32>,
@@ -190,7 +190,7 @@ struct ReqColumns {
     bytes_down: Vec<u64>,
     request_id: Vec<Option<u32>>,
     retry_after_ms: Vec<Option<u64>>,
-    error_code: Vec<Option<ErrorCode>>,
+    error_code: Vec<Option<FailureCode>>,
     error: Vec<Option<u32>>,
     /// Sparse: (row index, value).
     tls: Vec<(u32, TlsRow)>,

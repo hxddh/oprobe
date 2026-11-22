@@ -4,7 +4,6 @@
 pub mod config;
 pub mod dial;
 pub mod fidelity;
-pub mod probe;
 pub mod proxy;
 pub mod signals;
 pub mod stats;
@@ -15,7 +14,44 @@ pub mod tlsinfo;
 pub use config::{HttpVersion, TransportConfig};
 pub use fidelity::FidelityTransport;
 pub use proxy::ProxyConfig;
+#[allow(unused_imports)]
 pub use tls::TlsClientOptions;
+
+/// The transport's settings are invalid (a malformed proxy URL, an unreadable CA bundle). The
+/// oprobe CLI reports it as a usage error.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct ConfigError {
+    message: String,
+    hint: Option<String>,
+}
+
+impl ConfigError {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            hint: None,
+        }
+    }
+
+    pub(crate) fn with_hint(mut self, hint: impl Into<String>) -> Self {
+        self.hint = Some(hint.into());
+        self
+    }
+
+    /// What to do about it.
+    pub fn hint(&self) -> Option<&str> {
+        self.hint.as_deref()
+    }
+}
+
+impl std::fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ConfigError {}
 
 /// `Retry-After` in milliseconds: delay-seconds (RFC 9110 allows only integers; fractions are
 /// accepted) or an HTTP-date, relative to now. Nonsense (negative, non-finite, unparsable)

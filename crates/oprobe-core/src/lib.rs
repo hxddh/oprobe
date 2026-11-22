@@ -1,11 +1,8 @@
-//! oprobe-core — the engine of oprobe, a white-box microscope for cloud object storage built on
-//! Apache OpenDAL.
-//!
-//! Every backend request issued through OpenDAL is traced at the transport level
-//! ([`oprobe_trace`]: queue wait, DNS/TCP/proxy/TLS on fresh connections, request send,
-//! time-to-first-byte, transfer and consumer stall) and attributed to the logical operation
-//! that caused it. On top of that: bottleneck diagnosis, a measured cost model, a closed-loop
-//! tuner and a CI regression gate.
+//! **Internal: no semver promise.** oprobe-core is the engine of the `oprobe` binary (a
+//! profiler for OpenDAL operators): the operator spec, workloads, the profile and its findings,
+//! `prove`, the run store and the lab. It is published only so that `cargo install oprobe`
+//! works, and `oprobe` pins it with an exact version. To profile your own operator, use
+//! [`oprobe_trace`].
 //!
 //! Front ends call the service layer, [`app::App`]; the other modules are its building blocks.
 
@@ -29,6 +26,5 @@ pub mod util;
 
 /// The instrumentation (re-exported): the recorder, op scopes, records and aggregates.
 pub use oprobe_trace as trace;
-/// Networking (re-exported from `oprobe-trace`): TLS, proxies, the fidelity and microscope
-/// transports, the handshake probe.
+/// Networking (re-exported from `oprobe-trace`): TLS, proxies, the instrumented transport.
 pub use oprobe_trace::net;

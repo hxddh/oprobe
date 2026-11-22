@@ -3,13 +3,13 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::rows::ReqRow;
 
 /// TLS handshakes of the window (one per dialed connection).
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct TlsHandshakeStats {
     pub handshakes_count: u64,
     pub full_count: u64,
@@ -25,7 +25,8 @@ pub struct TlsHandshakeStats {
 }
 
 /// Kernel TCP statistics (`TCP_INFO`) over the requests of the window.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct TcpKernelStats {
     /// Requests that carried kernel statistics.
     pub samples_count: u64,

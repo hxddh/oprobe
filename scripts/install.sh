@@ -1,27 +1,14 @@
 #!/bin/sh
-# oprobe installer for Linux and macOS.
+# oprobe installer for Linux and macOS. Run `sh install.sh --help` for the options.
 #   curl -fsSL https://github.com/hxddh/oprobe/releases/latest/download/install.sh | sh
+#   curl -fsSL https://github.com/hxddh/oprobe/releases/latest/download/install.sh | sh -s -- --cli
 #
-# Options (environment):
-#   OPROBE_VERSION=4.0.0        install this version instead of the latest
-#   OPROBE_INSTALL_DIR=DIR      where to put the binary (default ~/.local/bin)
-#   OPROBE_MODIFY_PATH=1|0      add DIR to PATH in your shell rc file without asking (1) or never (0);
-#                               unset: ask when a terminal is available, otherwise only print the line
-#   OPROBE_RELEASE_BASE=URL     release download base (mirrors, tests);
-#                               default https://github.com/hxddh/oprobe/releases
-#   OPROBE_API=URL              GitHub API base (default https://api.github.com)
-#   OPROBE_VERIFY=auto|require|checksum
-#                               signature policy after the SHA-256 check (default auto):
-#                               auto     verify what this machine can, warn when nothing can
-#                               require  fail unless the provenance or the signature verified
-#                               checksum only the SHA-256 check (SHA256SUMS from the same release)
-#   OPROBE_MINISIGN_PUBKEY=KEY  minisign public key (overrides the one embedded below)
-#
-# Verification (design v5 §5), after the archive's SHA-256 matched SHA256SUMS:
+# Verification, after the archive's SHA-256 matched SHA256SUMS:
 #   1. the GitHub build provenance attestation (`gh attestation verify`), when `gh` is installed
 #      and logged in (GH_TOKEN / `gh auth login`);
-#   2. otherwise a minisign signature over SHA256SUMS (SHA256SUMS.minisig), when `minisign` is
-#      installed, the release is signed and a public key is known;
+#   2. otherwise a minisign signature over SHA256SUMS (SHA256SUMS.minisig), but only when this
+#      script embeds a public key (or OPROBE_MINISIGN_PUBKEY is set), `minisign` is installed
+#      and the release is signed;
 #   3. otherwise a warning (an error with OPROBE_VERIFY=require).
 #
 # The latest version is resolved without the GitHub API when possible, falling back on any failure:
@@ -30,6 +17,61 @@
 #   3. the GitHub API (rate limited to 60 anonymous requests per hour)
 set -eu
 
+usage() {
+  cat <<'EOF'
+oprobe installer for Linux and macOS
+
+Usage:
+  curl -fsSL https://github.com/hxddh/oprobe/releases/latest/download/install.sh | sh
+  curl -fsSL https://github.com/hxddh/oprobe/releases/latest/download/install.sh | sh -s -- [OPTIONS]
+  sh install.sh [OPTIONS]
+
+Options:
+  --cli              install the CLI-only build (no app)            (OPROBE_FLAVOR=cli)
+  --version X.Y.Z    install this version instead of the latest     (OPROBE_VERSION)
+  --dir DIR          install into DIR (default ~/.local/bin)        (OPROBE_INSTALL_DIR)
+  --no-modify-path   never touch the shell rc files                 (OPROBE_MODIFY_PATH=0)
+  -h, --help         print this help and exit
+
+Environment:
+  OPROBE_VERSION=X.Y.Z        install this version instead of the latest
+  OPROBE_INSTALL_DIR=DIR      where to put the binary (default ~/.local/bin)
+  OPROBE_FLAVOR=app|cli       the build to install (default app)
+  OPROBE_MODIFY_PATH=1|0      add DIR to PATH in your shell rc file without asking (1) or never (0);
+                              unset: ask when a terminal is available, otherwise only print the line
+  OPROBE_RELEASE_BASE=URL     release download base (mirrors, tests);
+                              default https://github.com/hxddh/oprobe/releases
+  OPROBE_API=URL              GitHub API base (default https://api.github.com)
+  OPROBE_VERIFY=auto|require|checksum
+                              after the SHA-256 check (default auto):
+                              auto     also verify the build provenance when `gh` is logged in
+                              require  fail unless the provenance (or a signature) verified
+                              checksum only the SHA-256 check (SHA256SUMS from the same release)
+  OPROBE_MINISIGN_PUBKEY=KEY  verify SHA256SUMS.minisig with this minisign public key; without it
+                              (and without a key embedded in this script) no signature is checked
+
+The SHA-256 is always checked; the GitHub build provenance is checked when `gh` is installed
+and logged in. Docs: https://github.com/hxddh/oprobe/blob/main/docs/install.md
+EOF
+}
+
+flavor="${OPROBE_FLAVOR:-app}"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --cli) flavor=cli ;;
+    --app) flavor=app ;;
+    --version) [ $# -ge 2 ] || { echo "oprobe-install: --version needs a value" >&2; exit 2; }; OPROBE_VERSION="$2"; shift ;;
+    --version=*) OPROBE_VERSION="${1#--version=}" ;;
+    --dir) [ $# -ge 2 ] || { echo "oprobe-install: --dir needs a value" >&2; exit 2; }; OPROBE_INSTALL_DIR="$2"; shift ;;
+    --dir=*) OPROBE_INSTALL_DIR="${1#--dir=}" ;;
+    --no-modify-path) OPROBE_MODIFY_PATH=0 ;;
+    *) echo "oprobe-install: unknown option: $1 (see --help)" >&2; exit 2 ;;
+  esac
+  shift
+done
+case "$flavor" in app|cli) ;; *) echo "oprobe-install: OPROBE_FLAVOR must be app or cli" >&2; exit 2 ;; esac
+
 repo="hxddh/oprobe"
 base="${OPROBE_RELEASE_BASE:-https://github.com/$repo/releases}"
 base="${base%/}"
@@ -37,8 +79,8 @@ api="${OPROBE_API:-https://api.github.com}"
 api="${api%/}"
 dir="${OPROBE_INSTALL_DIR:-$HOME/.local/bin}"
 verify="${OPROBE_VERIFY:-auto}"
-# The release's minisign public key; the release workflow fills it in (repository variable
-# MINISIGN_PUBKEY, docs/releasing.md#signing). Empty: the minisign step is skipped.
+# The release's minisign public key. The release workflow fills it in only when the repository
+# variable MINISIGN_PUBKEY is set (docs/releasing.md#signing); empty: no signature is checked.
 embedded_pubkey=""
 pubkey="${OPROBE_MINISIGN_PUBKEY:-$embedded_pubkey}"
 case "$verify" in auto|require|checksum) ;; *) echo "oprobe-install: OPROBE_VERIFY must be auto, require or checksum" >&2; exit 1 ;; esac
@@ -105,7 +147,8 @@ else
 fi
 url="$base/download/v$version"
 
-name="oprobe-$version-$target"
+# The app build is `oprobe-<ver>-<target>`, the CLI-only build `oprobe-cli-<ver>-<target>`.
+if [ "$flavor" = cli ]; then name="oprobe-cli-$version-$target"; else name="oprobe-$version-$target"; fi
 say "Downloading $name.tar.gz"
 fetch "$url/$name.tar.gz" "$tmp/$name.tar.gz" || err "download failed: $url/$name.tar.gz"
 fetch "$url/SHA256SUMS" "$tmp/SHA256SUMS" || err "cannot download $url/SHA256SUMS"
@@ -149,7 +192,8 @@ fi
 tar -xzf "$tmp/$name.tar.gz" -C "$tmp"
 mkdir -p "$dir"
 install -m 755 "$tmp/$name/oprobe" "$dir/oprobe" 2>/dev/null || { cp "$tmp/$name/oprobe" "$dir/oprobe"; chmod 755 "$dir/oprobe"; }
-say "Installed oprobe $version to $dir/oprobe"
+if [ "$flavor" = cli ]; then say "Installed oprobe $version (CLI only) to $dir/oprobe"
+else say "Installed oprobe $version to $dir/oprobe"; fi
 
 # PATH: offer to add the directory to the shell's rc file.
 case ":$PATH:" in

@@ -1,4 +1,4 @@
-# cargo-deny configuration (design v5 §5 "Supply chain"): advisories, licenses, bans and
+# cargo-deny configuration (supply chain): advisories, licenses, bans and
 # sources of every crate in the workspace. CI runs `cargo deny check` (.github/workflows/ci.yml).
 # Run it locally with `cargo install cargo-deny --locked && cargo deny check`.
 
