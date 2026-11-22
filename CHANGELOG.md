@@ -110,6 +110,8 @@ Design [v5](docs/design/v5.md). The changes under **Changed** are breaking.
 - **Arrival shapes.** `--arrivals constant|poisson` and a time-varying rate with
   `--shape ramp:FROM..TO/D | step:R1,R2,…/D | diurnal[:MIN..MAX/PERIOD]`. Over `--workers` the
   shape is scaled by each worker's weight and every worker draws its own Poisson seed.
+  A constant pace never bursts its backlog after a stall: late arrivals leave at most 4 at
+  once, then at the nominal spacing, keeping their intended start (the lag shows in latency).
 - **Log replay.** `--replay FILE` replays an S3 server access log, CloudTrail S3 data events or
   an oprobe run file, with `--speed N` and `--map-prefix FROM=TO` (repeatable); writes outside
   the run prefix are refused. Replays are split by key over local workers and refused for
