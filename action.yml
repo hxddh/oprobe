@@ -158,7 +158,7 @@ runs:
     - name: Restore the named baseline
       id: base
       if: inputs.baseline != '' && !endsWith(inputs.baseline, '.oprobe') && !endsWith(inputs.baseline, '.json')
-      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: ${{ runner.temp }}/oprobe-baseline
         key: oprobe-baseline-${{ inputs.baseline }}-${{ github.run_id }}
@@ -169,7 +169,7 @@ runs:
     - name: Restore the data directory
       id: data
       if: inputs.cache-data == 'true'
-      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: |
           ${{ runner.temp }}/oprobe-data
@@ -295,14 +295,14 @@ runs:
     # Only a replaced baseline is saved: a restored one is already in the cache (no churn).
     - name: Save the named baseline
       if: steps.update.outcome == 'success'
-      uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: ${{ runner.temp }}/oprobe-baseline
         key: oprobe-baseline-${{ inputs.baseline }}-${{ github.run_id }}
 
     - name: Save the data directory
       if: always() && inputs.cache-data == 'true' && steps.run.outputs.run-id != ''
-      uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: |
           ${{ runner.temp }}/oprobe-data
@@ -322,7 +322,7 @@ runs:
 
     - name: Upload the run and reports
       id: upload
-      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
       with:
         name: ${{ inputs.artifact-name }}
         path: ${{ steps.run.outputs.out }}
@@ -332,7 +332,7 @@ runs:
     - name: Sticky pull-request comment
       if: inputs.comment == 'true' && github.event.pull_request
       continue-on-error: true
-      uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
       env:
         BODY_FILE: ${{ steps.run.outputs.out }}/oprobe-comment.md
         ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}
