@@ -370,11 +370,17 @@ impl Output {
             }
             OutputFormat::Ndjson => self.bus.emit(EventKind::Error { error: e.clone() }),
             _ => {
-                eprintln!("{} {}", red(&bold("error:")), e.message);
+                // Labels and the code's description follow `--lang`; the message and hint
+                // stay as raised (they carry names, values and commands).
+                use crate::i18n::{error_code, t};
+                eprintln!("{} {}", red(&bold(t("label.error"))), e.message);
                 if let Some(h) = &e.hint {
-                    eprintln!("{} {h}", yellow(&bold("hint:")));
+                    eprintln!("{} {h}", yellow(&bold(t("label.hint"))));
                 }
-                eprintln!("{}", dim(&format!("({})", e.code)));
+                match error_code(e.code.as_str()) {
+                    Some(d) => eprintln!("{}", dim(&format!("({} · {d})", e.code))),
+                    None => eprintln!("{}", dim(&format!("({})", e.code))),
+                }
             }
         }
         e.exit_code()

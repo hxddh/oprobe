@@ -333,16 +333,16 @@ fn parse_rate(flag: &str, v: &str) -> Result<f64> {
     Ok(crate::input::share(flag, v)?)
 }
 
-/// Apply `--sla`, `--max-error-rate`, `--max-throttle-rate` and `--p99-ms` to the profile.
+/// Apply `--sla`, `--max-error-ratio`, `--max-throttle-ratio` and `--p99-ms` to the profile.
 pub fn apply_sla(p: &mut Profile, a: &SlaInput) -> Result<()> {
     if let Some(m) = a.sla {
         p.sla.enforce = m == SlaMode::Enforce;
     }
     if let Some(v) = &a.max_error_rate {
-        p.sla.max_error_rate = parse_rate("--max-error-rate", v)?;
+        p.sla.max_error_rate = parse_rate("--max-error-ratio", v)?;
     }
     if let Some(v) = &a.max_throttle_rate {
-        p.sla.max_throttle_rate = Some(parse_rate("--max-throttle-rate", v)?);
+        p.sla.max_throttle_rate = Some(parse_rate("--max-throttle-ratio", v)?);
     }
     if let Some(ms) = a.p99_ms {
         p.sla.p99_ms = Some(crate::input::positive("--p99-ms", &ms.to_string())?);

@@ -5,8 +5,10 @@
 mod agent;
 pub mod args;
 mod commands;
+pub mod complete;
 pub mod convert;
 pub mod formats;
+pub mod help;
 pub mod reference;
 #[cfg(test)]
 mod replay_tests;
@@ -162,10 +164,23 @@ where
 /// is a `usage.invalid_argument` error (exit 2): JSON on stdout when `-o json|ndjson` (or
 /// `OPROBE_OUTPUT`) asks for machine output, clap's text on stderr otherwise.
 pub fn parse_cli(args: Vec<std::ffi::OsString>) -> std::result::Result<Cli, ExitCode> {
-    use clap::Parser;
+    use clap::FromArgMatches;
     use clap::error::ErrorKind;
-    let e = match Cli::try_parse_from(&args) {
-        Ok(cli) => return check_output_format(cli, &args),
+    // `--help` shows the common flags, `--help-all` every flag (design v5 §6).
+    let all = help::wants_help_all(&args);
+    let args = if all {
+        help::help_all_args(&args)
+    } else {
+        args
+    };
+    let parsed = help::command(all)
+        .try_get_matches_from(&args)
+        .and_then(|m| Cli::from_arg_matches(&m));
+    let e = match parsed {
+        Ok(cli) => {
+            crate::i18n::set_lang(crate::i18n::detect(cli.lang.as_deref()));
+            return check_output_format(cli, &args);
+        }
         Err(e) => e,
     };
     let machine = machine_output(&args);
@@ -549,8 +564,16 @@ async fn dispatch(cmd: Command, ctx: &Ctx) -> Result<u8> {
             .out
             .finish(&ctx.app().cleanup(a.into(), &ctx.out).await?),
         Command::Init(a) => cmd_init(a),
-        Command::Completions { shell } => {
+        Command::Completions {
+            shell,
+            static_script: true,
+        } => {
             clap_complete::generate(shell, &mut Cli::command(), "oprobe", &mut std::io::stdout());
+            Ok(exit::OK)
+        }
+        Command::Completions { shell, .. } => {
+            use std::io::Write;
+            std::io::stdout().write_all(&complete::registration(shell, "oprobe")?)?;
             Ok(exit::OK)
         }
         Command::Man { markdown: true, .. } => {

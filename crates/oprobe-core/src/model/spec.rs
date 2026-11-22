@@ -360,10 +360,10 @@ impl RunSpec {
             flag("--sla", Some("none".into()));
         }
         if s.max_error_rate != ds_.max_error_rate {
-            flag("--max-error-rate", Some(s.max_error_rate.to_string()));
+            flag("--max-error-ratio", Some(s.max_error_rate.to_string()));
         }
         if let Some(t) = s.max_throttle_rate {
-            flag("--max-throttle-rate", Some(t.to_string()));
+            flag("--max-throttle-ratio", Some(t.to_string()));
         }
         if let Some(ms) = s.p99_ms {
             flag("--p99-ms", Some(ms.to_string()));

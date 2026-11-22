@@ -118,7 +118,9 @@ impl From<TuneSearchArgs> for i::TuneSearch {
             max_trials: a.max_trials,
             max_concurrency: a.max_concurrency,
             cooldown: a.cooldown,
-            max_throttle_ratio: a.max_throttle_ratio,
+            // One throttle flag (design v5 §6): `--max-throttle-ratio` of the SLA, which the
+            // tuner reads from the profile when this is unset.
+            max_throttle_ratio: None,
             boundary_repeats: a.boundary_repeats,
             headroom_ratio: a.headroom_ratio,
         }

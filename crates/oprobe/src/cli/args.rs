@@ -43,6 +43,16 @@ fn at_least<const MIN: usize>(v: &str) -> Result<usize, String> {
     Ok(n)
 }
 
+/// `--lang`: a language the message catalog has (`en`, `zh-CN`, or `auto`).
+fn parse_lang(v: &str) -> Result<String, String> {
+    if v.eq_ignore_ascii_case("auto") {
+        return Ok("auto".into());
+    }
+    crate::i18n::Lang::parse(v)
+        .map(|l| l.tag().to_owned())
+        .ok_or_else(|| format!("unknown language `{v}` (en, zh-CN)"))
+}
+
 /// `-o/--output` (the clap side of [`OutputFormat`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum OutputArg {
@@ -109,6 +119,15 @@ pub struct Cli {
     /// Config file (default: $OPROBE_CONFIG or <config dir>/oprobe/config.toml)
     #[arg(long, global = true, value_name = "PATH")]
     pub config: Option<PathBuf>,
+
+    /// Language of text output: en, zh-CN (default: LC_ALL / LC_MESSAGES / LANG); JSON stays
+    /// English
+    #[arg(long, global = true, value_name = "LANG", env = "OPROBE_LANG", value_parser = parse_lang)]
+    pub lang: Option<String>,
+
+    /// Print help with every flag (`--help` shows the common ones of large commands)
+    #[arg(long = "help-all", global = true)]
+    pub help_all: bool,
 
     /// Without a command, oprobe opens its workbench: a window when a display is available
     /// (builds with the `gui` feature), otherwise in this terminal.
@@ -192,10 +211,14 @@ pub enum Command {
     /// The same workbench in a native window (macOS, Windows, Linux with GTK 4)
     #[command(visible_alias = "app")]
     Gui(TopArgs),
-    /// Generate shell completions
+    /// Generate shell completions (dynamic: target names and run ids complete live)
     Completions {
         #[arg(value_enum)]
         shell: clap_complete::Shell,
+        /// Print a static script (no target or run completion; for shells that cannot call
+        /// back into oprobe)
+        #[arg(long = "static")]
+        static_script: bool,
     },
     /// Generate the man page
     Man {
@@ -237,7 +260,7 @@ pub struct RunsListArgs {
 #[derive(Args, Debug)]
 pub struct RunsShowArgs {
     /// Run id, id prefix, `last`, `last~N`, label, or path to a .oprobe / report .json file
-    #[arg(value_name = "RUNREF", default_value = "last", value_parser = parse::run_ref)]
+    #[arg(value_name = "RUNREF", add = super::complete::runs(), default_value = "last", value_parser = parse::run_ref)]
     pub run: String,
     /// Every column, per-stage and per-verb breakdowns, the timeline and the 5 slowest operations
     #[arg(long)]
@@ -293,14 +316,14 @@ pub enum VerifyPolicy {
 #[derive(Args, Debug)]
 pub struct RunRefArg {
     /// Run id, id prefix, `last`, `last~N`, label, or path to a .oprobe / report .json file
-    #[arg(value_name = "RUNREF")]
+    #[arg(value_name = "RUNREF", add = super::complete::runs())]
     pub run: String,
 }
 
 #[derive(Args, Debug)]
 pub struct RunsRmArgs {
     /// Runs to delete (RUNREFs)
-    #[arg(value_name = "RUNREF", required = true)]
+    #[arg(value_name = "RUNREF", add = super::complete::runs(), required = true)]
     pub runs: Vec<String>,
 }
 
@@ -376,6 +399,7 @@ pub struct TargetAddArgs {
 #[derive(Args, Debug)]
 pub struct TargetTestArgs {
     /// Target name (or a storage URL)
+    #[arg(add = super::complete::targets())]
     pub name: String,
     /// Only check reachability and listing; never write (the default)
     #[arg(long, conflicts_with = "write_probe")]
@@ -387,6 +411,7 @@ pub struct TargetTestArgs {
 
 #[derive(Args, Debug)]
 pub struct TargetNameArg {
+    #[arg(add = super::complete::targets())]
     pub name: String,
 }
 
@@ -410,7 +435,7 @@ pub enum BaselineCommand {
 #[derive(Args, Debug)]
 pub struct VerifyArgs {
     /// The run whose findings to test (RUNREF: id, prefix, last, last~N, label)
-    #[arg(value_name = "RUNREF", value_parser = parse::run_ref)]
+    #[arg(value_name = "RUNREF", add = super::complete::runs(), value_parser = parse::run_ref)]
     pub run: String,
     /// The finding code to verify (default: every finding with a verification)
     #[arg(value_name = "CODE", conflicts_with = "all")]
@@ -461,7 +486,7 @@ pub struct FixArgs {
     pub budget: Option<String>,
     /// Fix the workload of a stored run (RUNREF): its spec, with credentials resolved again
     /// from the target; other flags and --set override it (as `run --from`)
-    #[arg(long, value_name = "RUNREF", value_parser = parse::run_ref, conflicts_with = "profile", help_heading = "Replay")]
+    #[arg(long, value_name = "RUNREF", add = super::complete::runs(), value_parser = parse::run_ref, conflicts_with = "profile", help_heading = "Replay")]
     pub from: Option<String>,
     /// Override one setting of the workload, repeatable (as `run --set`)
     #[arg(long = "set", value_name = "KEY=VALUE", value_parser = parse::set, help_heading = "Replay")]
@@ -483,7 +508,7 @@ pub struct CalibrateArgs {
     #[arg(long, value_name = "N", default_value_t = 4, value_parser = at_least::<2>)]
     pub repeat: usize,
     /// Calibrate the workload of a stored run instead (RUNREF; its spec is replayed)
-    #[arg(long, value_name = "RUNREF", value_parser = parse::run_ref)]
+    #[arg(long, value_name = "RUNREF", add = super::complete::runs(), value_parser = parse::run_ref)]
     pub from: Option<String>,
     /// Do not save the calibration runs in the run store
     #[arg(long)]
@@ -533,7 +558,7 @@ pub struct SafetyArgs {
 pub struct TargetArgs {
     /// Target name (see `oprobe target list`) or storage URL: s3://bucket/prefix, gcs://bucket,
     /// azblob://container, oss://, cos://, b2://, fs:///path, memory://
-    #[arg(value_name = "TARGET")]
+    #[arg(value_name = "TARGET", add = super::complete::targets())]
     pub target: Option<String>,
     /// Load a profile (TOML); flags override its values
     #[arg(short, long, value_name = "FILE")]
@@ -712,11 +737,11 @@ pub struct SlaArgs {
     #[arg(long, value_enum, value_name = "MODE")]
     pub sla: Option<SlaMode>,
     /// Max share of failed operations, e.g. 1% or 0.01 (default 1%)
-    #[arg(long, value_name = "RATE", value_parser = parse::share, allow_hyphen_values = true)]
+    #[arg(long = "max-error-ratio", alias = "max-error-rate", value_name = "RATIO", value_parser = parse::share, allow_hyphen_values = true)]
     pub max_error_rate: Option<String>,
-    /// Max share of throttled (429/503) operations, e.g. 0% (default: not checked by `run`;
-    /// `tune` rejects any throttling)
-    #[arg(long, value_name = "RATE", value_parser = parse::share, allow_hyphen_values = true)]
+    /// Max share of throttled (429/503) requests, e.g. 0% or 0.001: an SLA of `run` (default:
+    /// not checked) and the throttle budget of `tune` and `fix` (default 0.1%)
+    #[arg(long = "max-throttle-ratio", alias = "max-throttle-rate", value_name = "RATIO", value_parser = parse::share, allow_hyphen_values = true)]
     pub max_throttle_rate: Option<String>,
     /// Max p99 latency per operation in ms (tune rejects trials above it)
     #[arg(long, value_name = "MS", value_parser = parse::positive, allow_hyphen_values = true)]
@@ -768,7 +793,7 @@ pub struct RunArgs {
     pub baseline: Option<String>,
     /// Replay a stored run (RUNREF): its spec, with credentials resolved again from the
     /// target; other flags and --set override it
-    #[arg(long, value_name = "RUNREF", value_parser = parse::run_ref, conflicts_with = "profile", help_heading = "Replay")]
+    #[arg(long, value_name = "RUNREF", add = super::complete::runs(), value_parser = parse::run_ref, conflicts_with = "profile", help_heading = "Replay")]
     pub from: Option<String>,
     /// Override one setting, repeatable (e.g. --set concurrency=8 --set warmup=1s); keys:
     /// the profile's knob, workload, SLA and cost names, `endpoint`, `region`, `label`
@@ -824,10 +849,6 @@ pub struct TuneSearchArgs {
     /// Pause after a throttled trial
     #[arg(long, default_value = tune_defaults::COOLDOWN, value_parser = parse::duration)]
     pub cooldown: String,
-    /// Share of throttled requests a configuration may cause and still be feasible
-    /// (default 0.001, or the profile's `sla.max_throttle_rate`)
-    #[arg(long, value_name = "RATIO", value_parser = parse::fraction)]
-    pub max_throttle_ratio: Option<f64>,
     /// Runs of each bisection trial near the throttle boundary
     #[arg(long, default_value_t = tune_defaults::BOUNDARY_REPEATS, value_parser = at_least::<1>)]
     pub boundary_repeats: usize,
@@ -872,40 +893,75 @@ pub struct TuneArgs {
 #[derive(Args, Debug)]
 pub struct CompareArgs {
     /// Baseline: RUNREF (id, prefix, last~N, label) or a .oprobe / report .json file
-    #[arg(value_name = "A")]
+    #[arg(value_name = "A", add = super::complete::runs())]
     pub baseline: Option<String>,
     /// Candidate: RUNREF or file (default: `last`)
-    #[arg(value_name = "B")]
+    #[arg(value_name = "B", add = super::complete::runs())]
     pub candidate: Option<String>,
     /// Compare against a named baseline instead of A
     #[arg(long = "baseline", value_name = "NAME")]
     pub baseline_name: Option<String>,
     /// Max p99 increase per operation (%)
-    #[arg(long, default_value_t = 20.0)]
+    #[arg(
+        long = "max-p99-increase-pct",
+        alias = "max-p99-increase",
+        value_name = "PCT",
+        default_value_t = 20.0
+    )]
     pub max_p99_increase: f64,
     /// Max p50 increase per operation (%)
-    #[arg(long, default_value_t = 20.0)]
+    #[arg(
+        long = "max-p50-increase-pct",
+        alias = "max-p50-increase",
+        value_name = "PCT",
+        default_value_t = 20.0
+    )]
     pub max_p50_increase: f64,
     /// Ignore latency changes smaller than this (ms)
-    #[arg(long, default_value_t = 1.0)]
+    #[arg(long, value_name = "MS", default_value_t = 1.0)]
     pub min_latency_delta_ms: f64,
     /// Max throughput drop (%)
-    #[arg(long, default_value_t = 10.0)]
+    #[arg(
+        long = "max-throughput-drop-pct",
+        alias = "max-throughput-drop",
+        value_name = "PCT",
+        default_value_t = 10.0
+    )]
     pub max_throughput_drop: f64,
     /// Max increase of failed operations (percentage points)
-    #[arg(long, default_value_t = 0.5)]
+    #[arg(
+        long = "max-error-increase-pp",
+        alias = "max-error-increase",
+        value_name = "PP",
+        default_value_t = 0.5
+    )]
     pub max_error_increase: f64,
     /// Max increase of requests per operation (%)
-    #[arg(long, default_value_t = 10.0)]
+    #[arg(
+        long = "max-request-amp-increase-pct",
+        alias = "max-request-amp-increase",
+        value_name = "PCT",
+        default_value_t = 10.0
+    )]
     pub max_request_amp_increase: f64,
     /// Max increase of read amplification (%)
-    #[arg(long, default_value_t = 10.0)]
+    #[arg(
+        long = "max-read-amp-increase-pct",
+        alias = "max-read-amp-increase",
+        value_name = "PCT",
+        default_value_t = 10.0
+    )]
     pub max_read_amp_increase: f64,
     /// Max increase of cost per operation (%)
-    #[arg(long, default_value_t = 10.0)]
+    #[arg(
+        long = "max-cost-increase-pct",
+        alias = "max-cost-increase",
+        value_name = "PCT",
+        default_value_t = 10.0
+    )]
     pub max_cost_increase: f64,
     /// Minimum samples per operation for latency checks
-    #[arg(long, default_value_t = 30)]
+    #[arg(long, value_name = "N", default_value_t = 30)]
     pub min_samples: u64,
     /// Do not fail when the candidate starts getting throttled
     #[arg(long)]
@@ -933,6 +989,7 @@ pub struct CompareArgs {
 #[derive(Args, Debug)]
 pub struct TopArgs {
     /// Storage URL, e.g. s3://bucket/prefix, memory://
+    #[arg(add = super::complete::targets())]
     pub target: Option<String>,
     /// Custom endpoint (MinIO, R2, oprobe lab)
     #[arg(long, value_parser = parse::endpoint)]
@@ -974,7 +1031,7 @@ pub struct CompatArgs {
     #[command(flatten)]
     pub safety: SafetyArgs,
     /// Exit 3 when the score (percent of the checks that ran) is below this
-    #[arg(long, value_name = "PCT")]
+    #[arg(long = "min-score-pct", alias = "min-score", value_name = "PCT")]
     pub min_score: Option<f64>,
 }
 
@@ -1109,7 +1166,7 @@ pub struct InitArgs {
 pub struct ExplainArgs {
     /// A RUNREF (id, prefix, `last`, `last~N`, label, .oprobe path) or a finding code
     /// (e.g. `throttling`); `oprobe explain --list` lists the codes
-    #[arg(value_name = "RUNREF|FINDING_CODE", required_unless_present = "list")]
+    #[arg(value_name = "RUNREF|FINDING_CODE", required_unless_present = "list", add = super::complete::explain())]
     pub subject: Option<String>,
     /// List every finding code
     #[arg(long, conflicts_with = "subject")]
@@ -1166,7 +1223,7 @@ pub struct BaselineSetArgs {
     /// Baseline name (letters, digits, - _ .)
     pub name: String,
     /// Runs: RUNREFs, comma lists, or `all:LABEL`
-    #[arg(value_name = "RUNREF")]
+    #[arg(value_name = "RUNREF", add = super::complete::runs())]
     pub runs: Vec<String>,
     /// Use the newest N stored runs
     #[arg(long, value_name = "N")]
@@ -1187,7 +1244,7 @@ pub struct BaselineNameArg {
 #[derive(Args, Debug)]
 pub struct AnalyzeArgs {
     /// Run id, id prefix, `last`, `last~N`, label, or path to a .oprobe file
-    #[arg(value_name = "RUNREF", default_value = "last")]
+    #[arg(value_name = "RUNREF", add = super::complete::runs(), default_value = "last")]
     pub run: String,
     /// Group requests by: api, conn, remote, stage, second, status
     #[arg(long, value_name = "KEY")]
@@ -1217,7 +1274,7 @@ pub enum ExportFormat {
 #[derive(Args, Debug)]
 pub struct ExportArgs {
     /// Run id, id prefix, `last`, `last~N`, label, or path to a .oprobe file
-    #[arg(value_name = "RUNREF")]
+    #[arg(value_name = "RUNREF", add = super::complete::runs())]
     pub run: String,
     /// Export format
     #[arg(long, short = 'f', value_enum)]

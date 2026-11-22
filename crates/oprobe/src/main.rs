@@ -2,6 +2,8 @@ use std::process::ExitCode;
 
 fn main() -> ExitCode {
     oprobe::output::quiet_broken_pipes();
+    // A shell asking for completions (`OPROBE_COMPLETE=bash oprobe -- …`): answer and exit.
+    oprobe::cli::complete::handle_request();
     let cli = match oprobe::cli::parse_cli(oprobe::cli::launch_args(std::env::args_os())) {
         Ok(cli) => cli,
         Err(code) => return code,

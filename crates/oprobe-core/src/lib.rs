@@ -20,6 +20,7 @@ pub mod errors;
 pub mod events;
 pub mod export;
 pub mod guard;
+pub mod i18n;
 pub mod input;
 pub mod lab;
 pub mod layers;
