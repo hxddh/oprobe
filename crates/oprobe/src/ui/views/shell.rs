@@ -2073,16 +2073,18 @@ fn status_bar(s: Store) -> impl IntoElement {
                         .take(if narrow() { 8 } else { 10 })
                         .collect()
                     } else {
-                        vec![view().child(
-                            small(move || {
-                                format!(
-                                    "{} runs · {}",
-                                    s.runs.with(|r| r.len()),
-                                    s.run_store().dir().display()
-                                )
-                            })
-                            .number_of_lines(1),
-                        )]
+                        vec![
+                            view().child(
+                                small(move || {
+                                    format!(
+                                        "{} runs · {}",
+                                        s.runs.with(|r| r.len()),
+                                        s.run_store().dir().display()
+                                    )
+                                })
+                                .number_of_lines(1),
+                            ),
+                        ]
                     })
                     .into_element()
             })

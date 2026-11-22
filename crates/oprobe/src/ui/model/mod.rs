@@ -9,6 +9,7 @@ pub mod fmt;
 pub mod health;
 pub mod hints;
 pub mod i18n;
+pub mod icons;
 pub mod link;
 pub mod live;
 pub mod metrics;

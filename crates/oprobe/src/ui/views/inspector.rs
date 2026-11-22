@@ -509,9 +509,8 @@ fn setup(r: Report) -> View {
             .into_iter()
             .filter_map(|(title, v)| {
                 let rows = v.map(|v| fmt::section_rows(&v, 6)).unwrap_or_default();
-                (!rows.is_empty()).then(|| {
-                    group(title).children(rows.into_iter().map(|(k, v)| prop_row(k, v)))
-                })
+                (!rows.is_empty())
+                    .then(|| group(title).children(rows.into_iter().map(|(k, v)| prop_row(k, v))))
             }),
         )
         .child(small(

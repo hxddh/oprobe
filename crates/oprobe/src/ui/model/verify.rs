@@ -127,11 +127,17 @@ pub fn judge(
             .map(|c| c.id.as_str())
             .collect();
         if !worse.is_empty() {
-            let w: Vec<String> = worse.iter().map(|m| crate::ui::model::verdicts::metric_name(m)).collect();
+            let w: Vec<String> = worse
+                .iter()
+                .map(|m| crate::ui::model::verdicts::metric_name(m))
+                .collect();
             lines.push(format!("worse: {}", w.join(", ")));
         }
         if !improved.is_empty() {
-            let b: Vec<String> = improved.iter().map(|m| crate::ui::model::verdicts::metric_name(m)).collect();
+            let b: Vec<String> = improved
+                .iter()
+                .map(|m| crate::ui::model::verdicts::metric_name(m))
+                .collect();
             lines.push(format!("better: {}", b.join(", ")));
         }
         if !worse.is_empty() {
@@ -155,7 +161,9 @@ pub fn judge(
                     outs.push(VerifyOutcome::Inconclusive);
                     lines.push(format!(
                         "{}: not measured",
-                        crate::ui::model::verdicts::metric_name(e.metric.trim_start_matches("summary."))
+                        crate::ui::model::verdicts::metric_name(
+                            e.metric.trim_start_matches("summary.")
+                        )
                     ));
                 }
             }
@@ -169,8 +177,7 @@ pub fn judge(
         }
     };
     lines.push(
-        "one run per side: low confidence (the command-line verify repeats and interleaves)"
-            .into(),
+        "one run per side: low confidence (the command-line verify repeats and interleaves)".into(),
     );
     Verdict {
         code: code.to_owned(),

@@ -115,7 +115,7 @@ pub fn check_state(c: &Check, significant: Option<bool>) -> CheckState {
         Status::Pass => {
             let big = c.delta_ratio.is_none_or(|d| {
                 let half_limit = c.limit_ratio.map(|l| l * 0.5).unwrap_or(INCONCLUSIVE_RATIO);
-                d.abs() >= half_limit.min(INCONCLUSIVE_RATIO).max(0.01)
+                d.abs() >= half_limit.clamp(0.01, INCONCLUSIVE_RATIO)
             }) && c.baseline != c.candidate;
             // A big change the comparison's own statistics call noise is within the limits.
             if big && significant != Some(false) {

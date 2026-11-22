@@ -189,7 +189,8 @@ pub fn tune_page() -> impl IntoElement {
 
 /// Trials the running tuner has finished.
 fn l_trials(s: crate::ui::store::Store) -> usize {
-    s.live.with_untracked(|l| l.as_ref().map(|l| l.trials.len()).unwrap_or(0))
+    s.live
+        .with_untracked(|l| l.as_ref().map(|l| l.trials.len()).unwrap_or(0))
 }
 
 pub fn probe_page() -> impl IntoElement {

@@ -341,7 +341,13 @@ mod section_tests {
         assert_eq!(get("phases available"), Some("queue, server"));
         assert_eq!(get("empty"), None);
         let w = super::section_rows(&serde_json::json!([{"id": "w1"}, {"id": "w2"}]), 5);
-        assert_eq!(w, vec![("1 · id".into(), "w1".into()), ("2 · id".into(), "w2".into())]);
+        assert_eq!(
+            w,
+            vec![
+                ("1 · id".into(), "w1".into()),
+                ("2 · id".into(), "w2".into())
+            ]
+        );
         assert!(super::section_rows(&serde_json::json!([]), 5).is_empty());
     }
 }

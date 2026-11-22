@@ -304,8 +304,7 @@ mod tests {
     #[test]
     fn every_translation_has_an_english_key_with_the_same_placeholders() {
         for (k, v) in ZH_CN {
-            if k.starts_with("cmd.") {
-                let id = &k[4..];
+            if let Some(id) = k.strip_prefix("cmd.") {
                 assert!(
                     crate::ui::model::commands::spec(id).is_some(),
                     "{k}: no such command"

@@ -696,8 +696,10 @@ fn keyboard_sorts_pages_and_brushes() {
     app.press_key("pagedown").unwrap();
     app.press_key("shift+g").unwrap();
     app.press_key("g").unwrap();
-    app.wait_for("text:/^GetObject|^PutObject|^HeadObject|^ListObjects|^DeleteObject|Stat|Read|Write/")
-        .ok();
+    app.wait_for(
+        "text:/^GetObject|^PutObject|^HeadObject|^ListObjects|^DeleteObject|Stat|Read|Write/",
+    )
+    .ok();
 }
 
 #[test]

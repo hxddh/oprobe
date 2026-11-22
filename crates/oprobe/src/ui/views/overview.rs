@@ -14,9 +14,9 @@ use crate::ui::kit::{
 use crate::ui::model::Tab;
 use crate::ui::model::fmt;
 use crate::ui::model::metrics;
-use crate::ui::model::verdicts;
 use crate::ui::model::scale::Scale;
 use crate::ui::model::series::Series;
+use crate::ui::model::verdicts;
 use crate::ui::store::{Phase, Sel, Stage, Store, store};
 
 /// The throughput chart's plot.
@@ -244,21 +244,25 @@ fn hint_button(s: Store, f: &Finding, cmd: String) -> nsh_base::ButtonElement {
     let a = action(&cmd);
     let label = a.label();
     let f = f.clone();
-    btn(label, || Kind::Plain, move || match &a {
-        CliAction::Requests(q) => {
-            s.req_query.set(q.clone());
-            s.set_tab(Tab::Requests);
-        }
-        CliAction::Verify => s.verify(&f),
-        CliAction::Tune => s.tune_for("throughput"),
-        CliAction::Compare => s.compare_default(),
-        CliAction::Findings => s.set_tab(Tab::Findings),
-        CliAction::Probe => s.mode.set(crate::ui::store::Mode::Probe),
-        CliAction::Copy(c) => {
-            set_clipboard(c.clone());
-            s.toast(format!("Copied: {c}"), Tone::Neutral);
-        }
-    })
+    btn(
+        label,
+        || Kind::Plain,
+        move || match &a {
+            CliAction::Requests(q) => {
+                s.req_query.set(q.clone());
+                s.set_tab(Tab::Requests);
+            }
+            CliAction::Verify => s.verify(&f),
+            CliAction::Tune => s.tune_for("throughput"),
+            CliAction::Compare => s.compare_default(),
+            CliAction::Findings => s.set_tab(Tab::Findings),
+            CliAction::Probe => s.mode.set(crate::ui::store::Mode::Probe),
+            CliAction::Copy(c) => {
+                set_clipboard(c.clone());
+                s.toast(format!("Copied: {c}"), Tone::Neutral);
+            }
+        },
+    )
     .accessibility_label(format!("{label}: {cmd}"))
 }
 
@@ -313,7 +317,9 @@ pub fn finding_row(s: Store, f: Finding, full: bool) -> View {
                 .text_size(crate::ui::kit::sz(12.0))
                 .text_color(move || theme().foreground),
         )
-        .child((!buttons.is_empty()).then(|| view().flex_row().flex_wrap().gap_2().children(buttons)))
+        .child(
+            (!buttons.is_empty()).then(|| view().flex_row().flex_wrap().gap_2().children(buttons)),
+        )
         .child(
             full.then(|| verify_desc.map(|d| small(format!("verify: {d}"))))
                 .flatten(),
@@ -814,10 +820,16 @@ fn live(s: Store) -> View {
                     .gap_1()
                     .test_id("provisional")
                     .child(early.map(|n| {
-                        small(crate::ui::model::i18n::trf("app.early_numbers", &[("n", &n)]))
-                            .text_color(move || Tone::Inconclusive.color())
+                        small(crate::ui::model::i18n::trf(
+                            "app.early_numbers",
+                            &[("n", &n)],
+                        ))
+                        .text_color(move || Tone::Inconclusive.color())
                     }))
-                    .child((!prov.is_empty()).then(|| caption(crate::ui::model::i18n::tr("app.provisional"))))
+                    .child(
+                        (!prov.is_empty())
+                            .then(|| caption(crate::ui::model::i18n::tr("app.provisional"))),
+                    )
                     .children(prov.into_iter().map(|p| {
                         let (word, level) = verdicts::severity(p.severity);
                         view()

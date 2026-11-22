@@ -254,9 +254,30 @@ pub fn tool_dyn(
         .gap(px(5.0))
         .items_center()
         .child((!term).then(|| {
-            text(glyph)
-                .text_size(sz(13.0))
-                .text_color(move || theme().muted_foreground)
+            // Windows draws its own icon set (Segoe Fluent) where the glyph has one (U11).
+            let native = move || {
+                if os() == nsh_core::platform::Os::Windows {
+                    native_icon(glyph())
+                } else {
+                    None
+                }
+            };
+            text(move || match native() {
+                Some(c) => SharedString::from(c.to_string()),
+                None => SharedString::from(glyph()),
+            })
+            .text_size(sz(13.0))
+            .font_family(move || {
+                if native().is_some() {
+                    crate::ui::model::icons::WINDOWS_ICON_FONT.into()
+                } else {
+                    theme()
+                        .font_sans
+                        .clone()
+                        .unwrap_or_else(|| "system-ui".into())
+                }
+            })
+            .text_color(move || theme().muted_foreground)
         }))
         .child(text(label).text_size(sz(12.0)).number_of_lines(1));
     let inner = if hint.is_empty() || in_terminal() {
@@ -278,6 +299,26 @@ pub fn tool_dyn(
         .focus_visible(ring)
         .disabled_style(|s| s.opacity(0.4))
         .child(inner)
+}
+
+/// The Segoe Fluent code point of a toolbar glyph, when the icon set has it.
+fn native_icon(glyph: &str) -> Option<char> {
+    use crate::ui::model::icons::{Icon, names};
+    let icon = match glyph {
+        "▶" => Icon::Run,
+        "■" => Icon::Stop,
+        "↻" => Icon::Rerun,
+        "⇄" => Icon::Compare,
+        "♥" => Icon::Health,
+        "⚙" => Icon::Tune,
+        "⌁" => Icon::Probe,
+        "⇪" => Icon::Export,
+        "≡" => Icon::Commands,
+        "◧" => Icon::Sidebar,
+        "◨" => Icon::Inspector,
+        _ => return None,
+    };
+    Some(names(icon).1)
 }
 
 /// A tooltip bubble.

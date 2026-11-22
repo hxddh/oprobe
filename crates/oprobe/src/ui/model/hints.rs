@@ -100,16 +100,18 @@ mod tests {
 
     #[test]
     fn commands_leave_the_prose_and_become_actions() {
-        let (p, c) = split(
-            "Look at the failing APIs and status codes (`oprobe analyze RUN --by status`)",
-        );
+        let (p, c) =
+            split("Look at the failing APIs and status codes (`oprobe analyze RUN --by status`)");
         assert_eq!(p, "Look at the failing APIs and status codes (see below)");
         assert_eq!(c, vec!["oprobe analyze RUN --by status"]);
         assert_eq!(action(&c[0]), CliAction::Requests("error".into()));
         let (p, c) = split("Set prices in `[cost.pricing]`");
         assert_eq!(p, "Set prices in the cost pricing settings");
         assert!(c.is_empty());
-        assert_eq!(action("oprobe compat s3://b"), CliAction::Copy("oprobe compat s3://b".into()));
+        assert_eq!(
+            action("oprobe compat s3://b"),
+            CliAction::Copy("oprobe compat s3://b".into())
+        );
         assert_eq!(action("oprobe verify last").label(), "Verify");
         assert_eq!(split("no code here").0, "no code here");
         assert_eq!(split("odd `tick").0, "odd `tick");
