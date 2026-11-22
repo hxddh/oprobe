@@ -11,6 +11,7 @@ pub mod findings;
 pub mod gate;
 pub mod hints;
 pub mod hypothesis;
+pub mod limits;
 pub mod outliers;
 pub mod segments;
 pub mod simulate;
