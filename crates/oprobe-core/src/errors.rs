@@ -425,12 +425,12 @@ mod tests {
     fn classified_errors_survive_context() {
         let e = anyhow::Error::new(
             OprobeError::new(ErrorCode::UsageUnknownRun, "no run `x`")
-                .with_hint("oprobe runs list"),
+                .with_hint("oprobe show --list"),
         )
         .context("cannot show the run");
         let b = classify(&e, "s3");
         assert_eq!(b.code, ErrorCode::UsageUnknownRun);
-        assert_eq!(b.hint.as_deref(), Some("oprobe runs list"));
+        assert_eq!(b.hint.as_deref(), Some("oprobe show --list"));
         assert!(b.message.contains("no run `x`"));
         assert_eq!(b.exit_code(), 2);
     }

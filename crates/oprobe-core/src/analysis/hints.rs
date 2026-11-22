@@ -111,7 +111,7 @@ pub fn hint_for(error_chain: &str, scheme: &str) -> Option<Hint> {
             "Local clock is out of sync",
             &[
                 "Signed requests are rejected when the clock is >15 min off: enable NTP (`timedatectl set-ntp true`) and retry.",
-                "`oprobe probe <endpoint>` reports the measured skew.",
+                "Compare `date -u` with the `Date` header of a response from the endpoint (`curl -sI URL`).",
             ],
         ));
     }
@@ -221,7 +221,7 @@ pub fn hint_for(error_chain: &str, scheme: &str) -> Option<Hint> {
         return Some(h(
             "Network timeout",
             &[
-                "Check reachability (`oprobe probe <endpoint>`), firewalls and proxies; raise `knobs.timeout` for very large objects.",
+                "Check reachability, firewalls and proxies (`oprobe show RUN --by conn` shows the DNS, TCP and TLS times of every dial); raise `layers.timeout.io` for very large objects.",
             ],
         ));
     }
