@@ -6,6 +6,10 @@ pub mod cloud;
 pub mod commands;
 pub mod compare;
 pub mod fmt;
+pub mod health;
+pub mod i18n;
+pub mod live;
+pub mod link;
 pub mod metrics;
 pub mod requests;
 pub mod run;
@@ -13,7 +17,9 @@ pub mod runs;
 pub mod scale;
 pub mod series;
 pub mod target;
+pub mod verdicts;
 pub mod verify;
+pub mod waterfall;
 
 use serde::{Deserialize, Serialize};
 

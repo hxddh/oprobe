@@ -122,6 +122,50 @@ impl TargetDraft {
     }
 }
 
+/// An error of the service layer in one line: its message, then its hint (`code` errors from
+/// [`crate::errors::classify`]).
+pub fn error_text(e: &anyhow::Error, scheme: &str) -> String {
+    let body = crate::errors::classify(e, scheme);
+    match body.hint.as_deref().filter(|h| !h.is_empty()) {
+        Some(h) => format!("{} — {h}", body.message),
+        None => body.message,
+    }
+}
+
+/// What a read-only `doctor` of a new target says, for the Add Target sheet: `Ok` once every
+/// check passed (warnings named), else the first failure with its hint.
+pub fn connection_summary(d: &crate::app::doctor::DoctorOutput) -> Result<String, String> {
+    use crate::app::doctor::CheckStatus;
+    if let Some(c) = d.checks.iter().find(|c| c.status == CheckStatus::Fail) {
+        let mut msg = format!("{}: {}", c.name, c.detail);
+        if let Some(h) = c.hint.as_deref().filter(|h| !h.is_empty()) {
+            msg.push_str(" — ");
+            msg.push_str(h);
+        }
+        return Err(msg);
+    }
+    let ok = d
+        .checks
+        .iter()
+        .filter(|c| c.status == CheckStatus::Ok)
+        .count();
+    let warn: Vec<&str> = d
+        .checks
+        .iter()
+        .filter(|c| c.status == CheckStatus::Warn)
+        .map(|c| c.name.as_str())
+        .collect();
+    let mut msg = format!(
+        "Connected to {} (read-only): {ok} of {} checks passed",
+        d.target,
+        d.checks.len()
+    );
+    if !warn.is_empty() {
+        msg.push_str(&format!("; warnings: {}", warn.join(", ")));
+    }
+    Ok(msg)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

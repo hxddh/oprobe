@@ -36,6 +36,7 @@ pub const COMMANDS: &[CmdSpec] = &[
     c("export-json", "Export Report as JSON…", "File", None),
     c("export-md", "Export Report as Markdown…", "File", None),
     c("export-csv", "Export Requests as CSV…", "File", None),
+    c("copy-link", "Copy Link to This View", "File", Some("shift+mod+l")),
     c("settings", "Settings…", "File", Some("mod+,")),
     c("run", "Run", "Run", Some("mod+r")),
     c("stop", "Stop", "Run", Some("mod+.")),
@@ -48,6 +49,8 @@ pub const COMMANDS: &[CmdSpec] = &[
     c("tune", "Tune…", "Run", None),
     c("probe", "Probe…", "Run", None),
     c("slowest", "Explain the Slowest Requests", "Run", None),
+    c("health", "Target Health", "View", Some("mod+0")),
+    c("waterfall", "Waterfall of the Slowest Operation", "View", Some("mod+j")),
     c("sidebar", "Toggle Sidebar", "View", Some("mod+alt+s")),
     c("inspector", "Toggle Inspector", "View", Some("mod+alt+i")),
     c("log", "Logarithmic Latency Axis", "View", None),
@@ -85,12 +88,120 @@ pub fn enabled(id: &str, x: &CmdCtx) -> bool {
         "rerun" | "edit-rerun" | "fix" => !x.busy && x.has_run,
         "tune" => !x.busy && (x.has_run || x.targets > 0),
         "verify" => !x.busy && x.has_run && x.has_verify,
-        "export" | "export-json" | "export-md" | "export-csv" | "slowest" => x.has_run,
+        "export" | "export-json" | "export-md" | "export-csv" | "slowest" | "copy-link"
+        | "waterfall" => x.has_run,
+        "health" => x.runs > 0,
         "compare" => x.runs >= 2,
         "open-run" => x.runs > 0,
         "switch-target" => x.targets > 0,
         _ => true,
     }
+}
+
+/// Why command `id` cannot run now (`None` when it can): the palette shows it next to a
+/// disabled command (U6), the same words in every language.
+pub fn disabled_reason(id: &str, x: &CmdCtx) -> Option<&'static str> {
+    use crate::ui::model::i18n::tr;
+    if enabled(id, x) {
+        return None;
+    }
+    Some(match id {
+        "stop" => tr("why.idle"),
+        "run" | "demo" | "probe" | "new" => tr("why.busy"),
+        "rerun" | "edit-rerun" | "fix" | "verify" | "tune" if x.busy => tr("why.busy"),
+        "verify" if x.has_run => tr("why.no_verify"),
+        "tune" => tr("why.tune"),
+        "compare" => tr("why.two_runs"),
+        "open-run" | "health" => tr("why.no_runs"),
+        "switch-target" => tr("why.no_targets"),
+        _ => tr("why.no_run"),
+    })
+}
+
+/// How well `query` matches `text` (fuzzy, case-insensitive): every query character in order,
+/// scored higher for a prefix, word starts and consecutive runs; `None` when it does not match.
+/// `"exm"` finds "Export Report as Markdown…", `"cmp"` finds "Compare Runs" (U6).
+pub fn fuzzy_score(query: &str, text: &str) -> Option<i32> {
+    let q: Vec<char> = query
+        .trim()
+        .to_lowercase()
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    if q.is_empty() {
+        return Some(0);
+    }
+    let t: Vec<char> = text.to_lowercase().chars().collect();
+    let mut score = 0i32;
+    let mut qi = 0usize;
+    let mut prev: Option<usize> = None;
+    for (ti, ch) in t.iter().enumerate() {
+        if qi == q.len() {
+            break;
+        }
+        if *ch != q[qi] {
+            continue;
+        }
+        let word_start = ti == 0 || !t[ti - 1].is_alphanumeric();
+        score += 1;
+        if word_start {
+            score += 8;
+        }
+        if ti == 0 {
+            score += 6;
+        }
+        match prev {
+            Some(p) if p + 1 == ti => score += 5,
+            Some(p) => score -= ((ti - p) as i32).min(6),
+            None => score -= (ti as i32).min(6),
+        }
+        prev = Some(ti);
+        qi += 1;
+    }
+    (qi == q.len()).then_some(score)
+}
+
+/// The best score of `query` against a command's title and its extra words.
+pub fn match_score(query: &str, label: &str, keywords: &[&str]) -> Option<i32> {
+    std::iter::once(label)
+        .chain(keywords.iter().copied())
+        .enumerate()
+        // A keyword counts a little less than the title.
+        .filter_map(|(i, t)| fuzzy_score(query, t).map(|s| if i == 0 { s + 2 } else { s }))
+        .max()
+}
+
+/// Indices of `items` (title, keywords) that match `query`, best first; with an empty query,
+/// all of them in their order.
+pub fn ranked(query: &str, items: &[(&str, Vec<&str>)]) -> Vec<usize> {
+    if query.trim().is_empty() {
+        return (0..items.len()).collect();
+    }
+    let mut hits: Vec<(i32, usize)> = items
+        .iter()
+        .enumerate()
+        .filter_map(|(i, (l, k))| match_score(query, l, k).map(|s| (s, i)))
+        .collect();
+    hits.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    hits.into_iter().map(|(_, i)| i).collect()
+}
+
+/// Extra words a command is found by (its group, its id's words, common synonyms).
+pub fn keywords(c: &CmdSpec) -> Vec<&'static str> {
+    let mut k = vec![c.group, c.id];
+    k.extend(match c.id {
+        "export" | "export-json" | "export-md" | "export-csv" => &["save", "download"][..],
+        "compare" => &["diff", "regression", "gate"],
+        "verify" => &["check", "hypothesis", "confirm"],
+        "fix" => &["recommend", "tune", "settings"],
+        "probe" => &["tls", "dns", "handshake", "ttfb"],
+        "copy-link" => &["share", "url", "oprobe://"],
+        "health" => &["home", "target", "dashboard"],
+        "waterfall" => &["trace", "drilldown", "slowest"],
+        "help" => &["keys", "shortcuts"],
+        _ => &[],
+    });
+    k
 }
 
 /// The commands of `group` with their enabled states.
@@ -133,6 +244,51 @@ mod tests {
         let n = keys.len();
         keys.dedup();
         assert_eq!(keys.len(), n, "duplicate shortcuts");
+    }
+
+    #[test]
+    fn fuzzy_matching_ranks_word_starts_and_prefixes_first() {
+        assert!(fuzzy_score("exm", "Export Report as Markdown…").is_some());
+        assert!(fuzzy_score("cmp", "Compare Runs").is_some());
+        assert!(fuzzy_score("zzz", "Compare Runs").is_none());
+        let items: Vec<(&str, Vec<&str>)> = COMMANDS
+            .iter()
+            .map(|c| (c.label, keywords(c)))
+            .collect();
+        let first = |q: &str| COMMANDS[ranked(q, &items)[0]].id;
+        assert_eq!(first("compare"), "compare");
+        assert_eq!(first("export csv"), "export-csv");
+        assert_eq!(first("stop"), "stop");
+        assert_eq!(first("save"), "export");
+        assert_eq!(first("wf"), "waterfall");
+        assert_eq!(ranked("", &items).len(), COMMANDS.len());
+    }
+
+    #[test]
+    fn every_disabled_command_says_why() {
+        let idle = CmdCtx::default();
+        for c in COMMANDS {
+            let why = disabled_reason(c.id, &idle);
+            assert_eq!(why.is_some(), !enabled(c.id, &idle), "{}", c.id);
+        }
+        assert_eq!(disabled_reason("stop", &idle), Some("nothing is running"));
+        let busy = CmdCtx {
+            busy: true,
+            has_run: true,
+            ..idle
+        };
+        assert_eq!(
+            disabled_reason("rerun", &busy),
+            Some("a job is running: stop it first")
+        );
+        let shown = CmdCtx {
+            has_run: true,
+            ..idle
+        };
+        assert_eq!(
+            disabled_reason("verify", &shown),
+            Some("the shown run has no finding to verify")
+        );
     }
 
     #[test]

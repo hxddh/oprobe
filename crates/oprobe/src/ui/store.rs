@@ -335,6 +335,9 @@ pub struct Store {
     next_toast: Stored<u64>,
     /// When the app started (cold-start timing).
     pub started: Stored<std::time::Instant>,
+    /// The root's owner: commands run under it, so the tasks they start outlive the overlay
+    /// (palette, menu) they were chosen from (U6: Export from the palette did nothing).
+    pub root: Owner,
 }
 
 impl Default for Store {
@@ -474,6 +477,7 @@ impl Store {
             quit_pending: stored(false),
             next_toast: stored(1),
             started: stored(started),
+            root: Owner::current(),
         };
         s.refresh();
         // Open the newest run (or the welcome view when there is none).
@@ -1147,8 +1151,9 @@ impl Store {
             add.test
                 .set(Some((Tone::Info, "Testing (read-only)…".into())));
         });
+        let paths = self.paths.with(|p| p.clone());
         spawn(async move {
-            let res = off_thread(move || test_connection(&name, &cfg)).await;
+            let res = off_thread(move || test_connection(&name, &cfg, &paths)).await;
             batch(|| {
                 add.testing.set(false);
                 add.test.set(Some(match res {
@@ -1616,72 +1621,73 @@ impl Store {
     }
 }
 
-/// Read-only connection test of configured target `name` (the Add Target sheet's "Test"):
-/// resolve it as a run would (credentials included), then list at most one entry under its
-/// root. Nothing is written. Runs on an engine thread (blocking).
-pub fn test_connection(name: &str, cfg: &ConfigFile) -> Result<String, String> {
-    use crate::app::input::{CostInput, KnobInput, TargetInput, WorkloadInput};
-    use futures::TryStreamExt;
-    let l = crate::ui::launch();
-    let ta = TargetInput {
-        target: Some(name.to_owned()),
-        ca_cert: l.ca_cert,
-        insecure: l.insecure,
-        proxy: l.proxy,
-        ..Default::default()
-    };
-    let err = |e: anyhow::Error| format!("{e:#}");
-    let (ta, _) = crate::app::profile::resolve_target(&ta, cfg).map_err(err)?;
-    let p = crate::app::profile::build_profile(
-        &ta,
-        &WorkloadInput::default(),
-        &KnobInput::default(),
-        &CostInput::default(),
-    )
-    .map_err(err)?;
-    let mut target = p.target.clone();
-    let shown = target.display();
-    let fut = async move {
-        crate::engine::operator::prepare_target(&mut target, &p.knobs).await?;
-        let op = crate::engine::operator::base_operator(&target)?;
-        let mut lister = op.lister_with("").limit(2).await?;
-        let mut n = 0usize;
-        while lister.try_next().await?.is_some() {
-            n += 1;
-            if n >= 2 {
-                break;
+/// Read-only connection test of target `name` as `cfg` defines it (the Add Target sheet's
+/// "Test", before the target is saved): `oprobe doctor` through [`crate::app::App`] — the same
+/// transport, TLS, proxy and credential resolution as a run (U1) — with nothing written.
+/// Runs on an engine thread (blocking).
+pub fn test_connection(name: &str, cfg: &ConfigFile, paths: &Paths) -> Result<String, String> {
+    use crate::app::input::{DoctorRequest, TargetInput};
+    // The draft is not saved yet: the App reads it from a private, temporary config file.
+    let dir = private_temp_dir().map_err(|e| format!("cannot test the target: {e}"))?;
+    let config_file = dir.join("config.toml");
+    let res = (|| {
+        cfg.save(&config_file).map_err(|e| format!("{e:#}"))?;
+        let app = crate::app::App::new(Paths {
+            config_file: config_file.clone(),
+            data_dir: paths.data_dir.clone(),
+        });
+        let l = crate::ui::launch();
+        let req = DoctorRequest {
+            target: TargetInput {
+                target: Some(name.to_owned()),
+                ca_cert: l.ca_cert,
+                insecure: l.insecure,
+                proxy: l.proxy,
+                ..Default::default()
+            },
+            read_only: true,
+            write_probe: false,
+            verbose: false,
+        };
+        let sink = crate::app::EventSink::silent();
+        let out = tokio::runtime::Handle::current().block_on(async {
+            tokio::time::timeout(Duration::from_secs(30), app.doctor(req, &sink)).await
+        });
+        match out {
+            Err(_) => Err(format!("no answer from {name} within 30 s")),
+            Ok(Err(e)) => {
+                let scheme = cfg
+                    .targets
+                    .get(name)
+                    .and_then(|t| t.url.split_once("://").map(|(s, _)| s.to_owned()))
+                    .unwrap_or_default();
+                Err(crate::ui::model::target::error_text(&e, &scheme))
             }
+            Ok(Ok(d)) => crate::ui::model::target::connection_summary(&d),
         }
-        anyhow::Ok(n)
-    };
-    let res = tokio::runtime::Handle::current()
-        .block_on(async { tokio::time::timeout(Duration::from_secs(20), fut).await });
-    match res {
-        Err(_) => Err(format!("no answer from {shown} within 20 s")),
-        Ok(Ok(0)) => Ok(format!(
-            "Connected to {shown} (read-only): nothing stored yet"
-        )),
-        Ok(Ok(_)) => Ok(format!(
-            "Connected to {shown} (read-only): objects are listed"
-        )),
-        Ok(Err(e)) => {
-            let kind = e
-                .downcast_ref::<opendal::Error>()
-                .map(|o| o.kind())
-                .unwrap_or(opendal::ErrorKind::Unexpected);
-            let first = format!("{e:#}");
-            Err(match kind {
-                opendal::ErrorKind::PermissionDenied => format!(
-                    "the credentials were rejected (permission denied): check the credentials \
-                     source — {first}"
-                ),
-                opendal::ErrorKind::NotFound => {
-                    format!("the bucket or container was not found: check the URL — {first}")
-                }
-                _ => first,
-            })
-        }
-    }
+    })();
+    let _ = std::fs::remove_dir_all(&dir);
+    res
+}
+
+/// A new directory only this user can read, under the system's temporary directory.
+fn private_temp_dir() -> std::io::Result<PathBuf> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let dir = std::env::temp_dir().join(format!(
+        "oprobe-test-{}-{nanos}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut b = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
+    b.create(&dir)?;
+    Ok(dir)
 }
 
 /// Set when the terminal regains the focus (`term.rs`): the next poll reloads the runs.

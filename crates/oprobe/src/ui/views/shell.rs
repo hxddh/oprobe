@@ -104,7 +104,10 @@ fn action(s: Store, id: &'static str) -> Rc<dyn Fn()> {
         }
         _ => Rc::new(|| {}),
     };
-    f
+    // Under the root's owner: a task the command starts (a save dialog, a load) is not ended
+    // when the palette or menu it was chosen from closes.
+    let root = s.root;
+    Rc::new(move || root.run(|| f()))
 }
 
 /// Every command with its state now. Reading it tracks what the states depend on.
