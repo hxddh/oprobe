@@ -317,6 +317,34 @@ fn served_rate(obs: &[Obs], by: Option<&dyn Fn(&Obs) -> u32>, nkeys: usize) -> f
     super::stats::median(&rates)
 }
 
+/// Median served requests per second over the fully covered 250 ms bins of `obs` that saw
+/// throttling. A segment of a time-varying limit starts at a change point placed on a coarse
+/// grid, so it can begin with a few bins of the other rate: pooled (as in [`served_rate`])
+/// they pull the estimate toward it — the lower limit of 150/s read as up to ≈200/s, and the
+/// advised pace exceeded it — while the median keeps the segment's own rate.
+fn served_rate_median(obs: &[Obs]) -> f64 {
+    const BIN_US: i64 = 250_000;
+    let (Some(t0), Some(t1)) = (obs.first().map(|o| o.t), obs.last().map(|o| o.t)) else {
+        return 0.0;
+    };
+    let full = ((t1 - t0) / BIN_US).max(1);
+    let mut bins: HashMap<i64, (u64, u64)> = HashMap::new();
+    for o in obs {
+        let e = bins.entry((o.t - t0) / BIN_US).or_default();
+        e.0 += u64::from(!o.thr);
+        e.1 += u64::from(o.thr);
+    }
+    let rates: Vec<f64> = bins
+        .iter()
+        .filter(|(b, (_, t))| *t > 0 && (**b < full || full == 1))
+        .map(|(_, (served, _))| *served as f64 / (BIN_US as f64 / 1e6))
+        .collect();
+    if rates.is_empty() {
+        return served_rate(obs, None, 0);
+    }
+    super::stats::median(&rates)
+}
+
 /// The best token bucket over `obs`: `(rate, burst, split)`.
 fn best_rate(
     obs: &[Obs],
@@ -582,7 +610,7 @@ fn throttle_family(
         && obs.len() >= 40
     {
         let seg_fit = |seg: &[Obs]| -> Option<(f64, Split)> {
-            let base = served_rate(seg, None, 0).max(r_all * 0.05);
+            let base = served_rate_median(seg).max(r_all * 0.05);
             log_grid(base * 0.85, base * 1.15, 9)
                 .into_iter()
                 .filter_map(|r| {
@@ -590,7 +618,13 @@ fn throttle_family(
                     best_threshold(sc.iter().zip(seg).map(|(v, o)| (*v, o.thr)))
                         .map(|(_, s)| (r, s))
                 })
-                .max_by(|x, y| x.1.ll().total_cmp(&y.1.ll()))
+                // The first (lowest) rate of equally likely ones: `max_by` keeps the last, so a
+                // flat likelihood put the lower limit at the top of the grid (+15 %), and the
+                // pacing advice derived from it at the limit itself.
+                .fold(None::<(f64, Split)>, |best, x| match best {
+                    Some(b) if b.1.ll() >= x.1.ll() => Some(b),
+                    _ => Some(x),
+                })
         };
         let mut best: Option<(usize, f64, f64, Split)> = None;
         for q in (2..=18).map(|i| i as f64 / 20.0) {

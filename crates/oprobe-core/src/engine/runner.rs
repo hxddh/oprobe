@@ -648,6 +648,20 @@ impl Session {
                 // Bounded backlog: an arrival more than `timeout` behind schedule could only
                 // time out; such arrivals are dropped (missed, censored) instead of queued.
                 let max_queue_delay = knobs.timeout.get().max(Duration::from_secs(1));
+                // A constant pace never dispatches faster than itself (GCRA): arrivals that fell
+                // behind — the timer woke late, coalesced on macOS, or the process stalled — go
+                // out at most `CATCH_UP_BURST` at once and then at the nominal spacing, keeping
+                // their intended start (the lag shows in latency; what the window cannot fit
+                // is missed). Released all at once, the backlog of a 100 ms stall at 250/s was a
+                // burst of 25 requests: more than a service's token bucket allows, so `--rate`
+                // advice throttled although the pace was well below the limit. Poisson, shaped
+                // and replayed schedules keep their own bursts.
+                let mut pacer = (self.replay.is_none()
+                    && wl.arrivals == super::schedule::Arrivals::Constant
+                    && wl.shape.is_none()
+                    && rate.is_finite()
+                    && rate > 0.0)
+                    .then(|| Pacer::new(Duration::from_secs_f64(1.0 / rate)));
                 let mut rng = SmallRng::seed_from_u64(seed);
                 let mut missed = 0u64;
                 let mut issued = 0u64;
@@ -706,6 +720,24 @@ impl Session {
                     };
                     while let Some(r) = set.try_join_next() {
                         worker_result(r)?;
+                    }
+                    if let Some(pacer) = pacer.as_mut() {
+                        if let Some(allowed) = pacer.earliest() {
+                            loop {
+                                let now = Instant::now();
+                                if now >= allowed {
+                                    break;
+                                }
+                                if now >= deadline || self.cancel.is_cancelled() {
+                                    drop(permit);
+                                    break 'arrivals;
+                                }
+                                let wake =
+                                    allowed.min(deadline).min(now + Duration::from_millis(100));
+                                tokio::time::sleep_until(wake.into()).await;
+                            }
+                        }
+                        pacer.dispatched(Instant::now());
                     }
                     // Arrivals too far behind are dropped: each is missed, with its wait so far
                     // as the lower bound of its latency.
@@ -981,9 +1013,62 @@ impl Source<'_> {
     }
 }
 
+/// Arrivals that fell behind a constant pace go out at most this many at once.
+const CATCH_UP_BURST: u32 = 4;
+
+/// The dispatch shaper of a constant pace (GCRA): the next dispatch may happen at the
+/// theoretical arrival time less `CATCH_UP_BURST − 1` gaps. On-time arrivals (one per gap) are
+/// never held; a backlog left by a late timer or a stall leaves in a burst of at most
+/// `CATCH_UP_BURST`, then at the nominal spacing.
+#[derive(Clone, Copy, Debug)]
+struct Pacer {
+    gap: Duration,
+    tat: Option<Instant>,
+}
+
+impl Pacer {
+    fn new(gap: Duration) -> Self {
+        Self { gap, tat: None }
+    }
+
+    /// The earliest time the next dispatch may happen (`None`: now).
+    fn earliest(&self) -> Option<Instant> {
+        let tolerance = self.gap * (CATCH_UP_BURST - 1);
+        self.tat.map(|t| t.checked_sub(tolerance).unwrap_or(t))
+    }
+
+    fn dispatched(&mut self, now: Instant) {
+        self.tat = Some(self.tat.map_or(now, |t| t.max(now)) + self.gap);
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_paced_backlog_leaves_in_a_small_burst_then_at_the_pace() {
+        let gap = Duration::from_millis(4);
+        let mut p = Pacer::new(gap);
+        let t = Instant::now();
+        // On time: one arrival per gap is never held.
+        for k in 0..10u32 {
+            let now = t + gap * k;
+            assert!(p.earliest().is_none_or(|e| e <= now), "{k}");
+            p.dispatched(now);
+        }
+        // A 100 ms stall leaves 25 arrivals due at once: 4 go now, then one per gap.
+        let woke = t + gap * 10 + Duration::from_millis(100);
+        let mut at = Vec::new();
+        for _ in 0..25 {
+            let when = p.earliest().map_or(woke, |e| e.max(woke));
+            p.dispatched(when);
+            at.push(when);
+        }
+        assert!(at[..4].iter().all(|w| *w == woke), "{at:?}");
+        for w in at[4..].windows(2) {
+            assert_eq!(w[1] - w[0], gap);
+        }
+    }
     use crate::config::{Arrivals, TargetSpec};
 
     fn quiet() -> ProgressFn {
