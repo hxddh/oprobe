@@ -1,89 +1,26 @@
 {
   "$defs": {
-    "ActiveRun": {
+    "NextStep": {
+      "description": "A suggested next step: what it does and the CLI command.",
       "properties": {
-        "kind": {
-          "$ref": "#/$defs/JobKind"
-        },
-        "run_id": {
+        "cli": {
+          "description": "The command line (`oprobe …`).",
           "type": "string"
         },
-        "status": {
-          "$ref": "#/$defs/JobStatus"
+        "title": {
+          "description": "What the step does, in a few words.",
+          "type": "string"
         }
       },
       "required": [
-        "run_id",
-        "kind",
-        "status"
+        "title",
+        "cli"
       ],
       "type": "object"
-    },
-    "JobKind": {
-      "description": "What a job does.",
-      "oneOf": [
-        {
-          "enum": [
-            "run",
-            "tune",
-            "doctor",
-            "probe",
-            "sample",
-            "cleanup"
-          ],
-          "type": "string"
-        },
-        {
-          "const": "verify",
-          "description": "`verify_finding`.",
-          "type": "string"
-        },
-        {
-          "const": "fix",
-          "description": "`recommend_config` (`oprobe fix`).",
-          "type": "string"
-        }
-      ]
-    },
-    "JobStatus": {
-      "description": "Lifecycle of a job.",
-      "oneOf": [
-        {
-          "enum": [
-            "running",
-            "succeeded",
-            "cancelled"
-          ],
-          "type": "string"
-        },
-        {
-          "const": "queued",
-          "description": "Waiting for a run slot.",
-          "type": "string"
-        },
-        {
-          "const": "failed",
-          "description": "Ended with an error (a budget breach still saves the partial run).",
-          "type": "string"
-        },
-        {
-          "const": "stored",
-          "description": "Not started by this server: a stored run.",
-          "type": "string"
-        }
-      ]
     },
     "RunSummary": {
       "description": "Sidecar summary of a run (`runs/<id>.json`).",
       "properties": {
-        "cost_per_month_usd": {
-          "description": "Projected monthly cost, where cost applies.",
-          "format": "double",
-          "type": [
-            "number",
-            "null"
-          ]
-        },
         "error_ratio": {
           "format": "double",
           "type": "number"
@@ -216,16 +153,16 @@
       ]
     }
   },
-  "$id": "https://github.com/hxddh/oprobe/schemas/5/mcp-runs.json",
+  "$id": "https://github.com/hxddh/oprobe/schemas/6/run-list.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "description": "MCP list_runs: one page of stored runs and the jobs this server started",
+  "description": "The result of `oprobe show --list -o json`: the stored runs",
   "properties": {
-    "next_cursor": {
-      "description": "Pass as `cursor` for the next page (absent on the last page).",
-      "type": [
-        "string",
-        "null"
-      ]
+    "next": {
+      "description": "Suggested next steps.",
+      "items": {
+        "$ref": "#/$defs/NextStep"
+      },
+      "type": "array"
     },
     "runs": {
       "items": {
@@ -233,25 +170,27 @@
       },
       "type": "array"
     },
-    "started": {
-      "description": "Runs and jobs this server started (any status).",
-      "items": {
-        "$ref": "#/$defs/ActiveRun"
-      },
-      "type": "array"
-    },
     "total_count": {
+      "description": "Runs stored in total (the list may be limited).",
       "format": "uint64",
       "minimum": 0,
       "type": "integer"
+    },
+    "warnings": {
+      "description": "Warnings of the command (also printed on stderr in text mode).",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
     }
   },
   "required": [
     "runs",
     "total_count",
-    "started"
+    "next",
+    "warnings"
   ],
-  "title": "oprobe mcp-runs",
+  "title": "oprobe run-list",
   "type": "object",
-  "x-rust-type": "ListRunsOut"
+  "x-rust-type": "RunList"
 }

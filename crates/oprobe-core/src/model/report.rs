@@ -1,4 +1,4 @@
-//! Report v5 (`oprobe.report/5`, design v3 §6, v4 §1/§3 and v5 §2): the machine-clean result of one
+//! Report v6 (`oprobe.report/6`, design v3 §6, v4 §1/§3 and v5 §2): the machine-clean result of one
 //! run, with the run's replayable spec (`spec`) and the capacity estimate (`capacity`).
 //!
 //! Rules: every numeric field name carries its unit (`_us`, `_ms`, `_s`, `_bytes`, `_per_s`,
@@ -23,7 +23,7 @@ use crate::trace::{
 };
 
 /// Schema id of [`Report`].
-pub const REPORT_SCHEMA: &str = "oprobe.report/5";
+pub const REPORT_SCHEMA: &str = "oprobe.report/6";
 
 /// Unit suffixes a numeric report field name ends with (design §6). Each names its unit:
 /// `_us` / `_ms` / `_s` time; `_bytes`, `_mib`, `_gib` sizes (`_mib`/`_gib` only where the

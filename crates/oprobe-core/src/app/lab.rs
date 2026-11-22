@@ -4,7 +4,6 @@ use anyhow::Result;
 use schemars::JsonSchema;
 use serde::Serialize;
 
-use super::Ctx;
 use super::input::*;
 use crate::output::CommandOutput;
 use crate::report::style::{bold, dim, green};
@@ -38,8 +37,24 @@ impl CommandOutput for LabOutput {
     }
 }
 
+impl LabOutput {
+    /// What `lab` serves: its endpoint and a command that profiles it.
+    pub fn of(lab: &crate::lab::LabHandle) -> Self {
+        let tls = lab.endpoint_url.starts_with("https://");
+        Self {
+            endpoint: lab.endpoint_url.clone(),
+            tls,
+            try_command: format!(
+                "AWS_ACCESS_KEY_ID=lab AWS_SECRET_ACCESS_KEY=lab oprobe run s3://bench/demo --set options.endpoint={} --set options.region=us-east-1 --set http.proxy=none{}",
+                lab.endpoint_url,
+                if tls { " --set http.insecure=true" } else { "" }
+            ),
+        }
+    }
+}
+
 /// `oprobe lab`: start the server (it serves until the returned handle is dropped).
-pub async fn lab(_ctx: &Ctx, a: LabRequest) -> Result<(crate::lab::LabHandle, LabOutput)> {
+pub async fn lab(a: LabRequest) -> Result<crate::lab::LabHandle> {
     use crate::lab::{LabConfig, LabServer, lab_ca_pem};
     if let Some(p) = &a.write_ca {
         write_file(p, lab_ca_pem())?;
@@ -84,16 +99,6 @@ pub async fn lab(_ctx: &Ctx, a: LabRequest) -> Result<(crate::lab::LabHandle, La
         limits.max_connections = n.max(1);
     }
     let lab = LabServer::spawn_with(&a.bind, cfg, limits).await?;
-    // An operator file for the lab: `oprobe run lab.toml` (credentials are the lab's dummies).
-    let out = LabOutput {
-        endpoint: lab.endpoint_url.clone(),
-        tls: a.tls,
-        try_command: format!(
-            "AWS_ACCESS_KEY_ID=lab AWS_SECRET_ACCESS_KEY=lab oprobe run s3://bench/demo --set options.endpoint={} --set options.region=us-east-1 --set http.proxy=none{}",
-            lab.endpoint_url,
-            if a.tls { " --set http.insecure=true" } else { "" }
-        ),
-    };
-    Ok((lab, out))
+    Ok(lab)
 }
 

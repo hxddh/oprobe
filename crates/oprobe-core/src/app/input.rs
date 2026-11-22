@@ -289,46 +289,10 @@ impl Default for FixRequest {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
-#[serde(default)]
-pub struct RunsListRequest {
-    /// Show at most N runs
-    pub limit: usize,
-}
 
-impl Default for RunsListRequest {
-    fn default() -> Self {
-        Self { limit: 20 }
-    }
-}
 
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
-#[serde(default)]
-pub struct RunsShowRequest {
-    /// Run id, id prefix, `last`, `last~N`, label, or path to a .oprobe / report .json file
-    pub run: String,
-    /// Every column, per-stage and per-verb breakdowns, the timeline and the 5 slowest operations
-    pub detail: bool,
-    /// Group the requests: by dominant stage, API or connection
-    pub by: Option<crate::analysis::slice::By>,
-}
 
-impl Default for RunsShowRequest {
-    fn default() -> Self {
-        Self {
-            run: "last".into(),
-            detail: Default::default(),
-            by: None,
-        }
-    }
-}
 
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, Default)]
-#[serde(default)]
-pub struct RunsRmRequest {
-    /// Runs to delete (RUNREFs)
-    pub runs: Vec<String>,
-}
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]

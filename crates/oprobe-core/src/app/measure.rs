@@ -20,6 +20,8 @@ use crate::report::style::dim;
 /// What one CLI measurement needs besides the profile.
 pub struct Opts<'a> {
     pub target_name: Option<String>,
+    /// The operator as given (the spec's `operator_ref`; default: the target name or URL).
+    pub operator_ref: Option<String>,
     pub rails: Rails,
     /// The command's guard: shared by every measurement of the command (one aggregate budget).
     pub guard: Option<Arc<Guard>>,
@@ -74,7 +76,12 @@ pub async fn measure(ctx: &Ctx, profile: Profile, o: Opts<'_>) -> Result<Measure
     let gate = Arc::new(AtomicU8::new(0));
     let g2 = gate.clone();
     let fail_on = o.output.fail_on;
+    let profile_for_spec = profile.clone();
     let mut req = Request::new(profile, o.rails, o.cancel.clone(), progress);
+    req.spec = o
+        .operator_ref
+        .as_ref()
+        .map(|r| crate::model::RunSpec::new(&profile_for_spec, r.clone()));
     req.target_name = o.target_name;
     req.guard = o.guard;
     req.trace_max_requests = super::profile::trace_max_requests(ctx);

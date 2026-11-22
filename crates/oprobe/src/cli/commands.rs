@@ -6,7 +6,7 @@ use anyhow::Result;
 
 use super::args::*;
 use super::install_ctrl_c;
-use crate::app::{Cancel, Ctx, RunOutcome, RunRequest, input as i};
+use crate::app::{Cancel, Ctx, RunOutcome, RunRef, RunRequest, input as i};
 use crate::errors::exit;
 use crate::report::style::dim;
 
@@ -28,10 +28,12 @@ fn safety(a: &SafetyArgs) -> i::Safety {
     }
 }
 
-fn profile_request(operator: &str, f: &RunFlags) -> i::ProfileRequest {
+/// `oprobe run OPERATOR…` (and `oprobe demo`): the operators one after another on the same
+/// workload.
+pub async fn run(operators: Vec<String>, f: RunFlags, ctx: &Ctx) -> Result<u8> {
     let w = &f.workload;
-    i::ProfileRequest {
-        operator: operator.to_owned(),
+    let req = RunRequest {
+        operators,
         workload: i::WorkloadInput {
             preset: w.preset.clone(),
             concurrency: w.concurrency,
@@ -44,53 +46,41 @@ fn profile_request(operator: &str, f: &RunFlags) -> i::ProfileRequest {
             object_size: w.object_size.clone(),
             ..Default::default()
         },
-        set: f.set.clone(),
+        set: f.set,
+        safety: safety(&f.safety),
         ..Default::default()
+    };
+    match ctx.app().run(req, ctx.out.clone(), ctrl_c()).await? {
+        RunOutcome::Plan(p) => ctx.out.finish(p.as_ref()),
+        RunOutcome::Run(r) => ctx.out.finish(r.as_ref()),
     }
-}
-
-/// `oprobe run OPERATOR…` (and `oprobe demo`): the operators one after another on the same
-/// workload.
-pub async fn run(operators: Vec<String>, f: RunFlags, ctx: &Ctx) -> Result<u8> {
-    let cancel = ctrl_c();
-    let mut code = exit::OK;
-    for op in &operators {
-        if cancel.is_cancelled() {
-            break;
-        }
-        let resolved = ctx.app().resolve(&profile_request(op, &f))?;
-        let req = RunRequest::new(resolved).with_safety(safety(&f.safety));
-        let c = match ctx.app().run(req, &ctx.out, cancel.clone()).await? {
-            RunOutcome::Plan(p) => ctx.out.finish(p.as_ref())?,
-            RunOutcome::Run(r) => ctx.out.finish(r.as_ref())?,
-        };
-        code = code.max(c);
-    }
-    Ok(code)
 }
 
 /// `oprobe show`: a run, the history (`--list`) or removal (`--rm`).
 pub fn show(a: ShowArgs, ctx: &Ctx) -> Result<u8> {
     let app = ctx.app();
     if a.list {
-        return ctx
-            .out
-            .finish(&app.runs_list(i::RunsListRequest { limit: a.limit })?);
+        return ctx.out.finish(&app.list()?.truncate(a.limit));
     }
     if !a.rm.is_empty() {
-        return ctx
-            .out
-            .finish(&app.runs_rm(i::RunsRmRequest { runs: a.rm })?);
+        let refs: Vec<RunRef> = a.rm.into_iter().map(RunRef).collect();
+        let ids = app.run_ids(&refs)?;
+        app.rm(&refs)?;
+        return ctx.out.finish(&crate::app::RemovedRuns {
+            removed: ids,
+            dry_run: false,
+        });
     }
-    ctx.out.finish(&app.runs_show(i::RunsShowRequest {
-        run: a.run.unwrap_or_else(|| "last".into()),
-        detail: a.detail,
-        by: a.by.map(|b| match b {
-            ByArg::Stage => crate::analysis::slice::By::Stage,
-            ByArg::Api => crate::analysis::slice::By::Api,
-            ByArg::Conn => crate::analysis::slice::By::Conn,
-        }),
-    })?)
+    let by = a.by.map(|b| match b {
+        ByArg::Stage => crate::analysis::slice::By::Stage,
+        ByArg::Api => crate::analysis::slice::By::Api,
+        ByArg::Conn => crate::analysis::slice::By::Conn,
+    });
+    let p = app
+        .show(RunRef(a.run.unwrap_or_else(|| "last".into())))?
+        .with_detail(a.detail)
+        .with_by(by);
+    ctx.out.finish(&p)
 }
 
 /// `oprobe prove`.
@@ -112,7 +102,7 @@ pub async fn prove(a: ProveArgs, ctx: &Ctx) -> Result<u8> {
         budget: a.budget,
         ..Default::default()
     };
-    match ctx.app().prove(req, &ctx.out, ctrl_c()).await? {
+    match ctx.app().prove(req, ctx.out.clone(), ctrl_c()).await? {
         ProveOutcome::Plan(p) => ctx.out.finish(p.as_ref()),
         ProveOutcome::Proved(p) => ctx.out.finish(p.as_ref()),
     }
@@ -120,7 +110,7 @@ pub async fn prove(a: ProveArgs, ctx: &Ctx) -> Result<u8> {
 
 /// `oprobe lab`: serve until Ctrl-C.
 pub async fn lab(a: LabArgs, ctx: &Ctx) -> Result<u8> {
-    let (lab, out) = ctx
+    let lab = ctx
         .app()
         .lab(i::LabRequest {
             bind: a.bind,
@@ -128,7 +118,7 @@ pub async fn lab(a: LabArgs, ctx: &Ctx) -> Result<u8> {
             ..Default::default()
         })
         .await?;
-    ctx.out.finish(&out)?;
+    ctx.out.finish(&crate::app::LabOutput::of(&lab))?;
     tokio::signal::ctrl_c().await?;
     ctx.out.info(format!(
         "{} served {} requests",

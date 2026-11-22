@@ -1,4 +1,4 @@
-//! The run store: `runs/<id>.oprobe` (segmented zstd stream, format `oprobe.run/5`,
+//! The run store: `runs/<id>.oprobe` (segmented zstd stream, format `oprobe.run/6`,
 //! [`super::runfile`]) plus a
 //! `runs/<id>.json` sidecar summary for fast listing, and RUNREF resolution (design §2).
 
@@ -86,7 +86,7 @@ impl From<&Report> for RunSummary {
     }
 }
 
-/// Encode a run as `oprobe.run/5` in memory (tests and small exports; the store streams to
+/// Encode a run as `oprobe.run/6` in memory (tests and small exports; the store streams to
 /// disk with [`super::runfile::write_run`]).
 pub fn encode_run(run: &Run) -> Result<Vec<u8>> {
     let dir = tempdir_for_encode()?;
@@ -107,7 +107,7 @@ fn tempdir_for_encode() -> Result<PathBuf> {
     Ok(d)
 }
 
-/// Decode an `oprobe.run/5` stream (a v4 or older file is refused with a hint).
+/// Decode an `oprobe.run/6` stream (a v4 or older file is refused with a hint).
 pub fn decode_run(r: impl Read) -> Result<Run> {
     super::runfile::read_run(r).map_err(|e| {
         let msg = format!("{e:#}");

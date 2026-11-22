@@ -226,6 +226,7 @@ pub async fn fix(ctx: &Ctx, a: FixRequest, cancel: Cancel) -> Result<FixOutcome>
         ctx,
         profile.clone(),
         target_name.clone(),
+        None,
         &a.safety,
         &a.output,
         guard.clone(),
@@ -308,6 +309,7 @@ pub async fn fix(ctx: &Ctx, a: FixRequest, cancel: Cancel) -> Result<FixOutcome>
         let replayer = Replayer {
             base: profile.clone(),
             target_name: target_name.clone(),
+            operator_ref: None,
             safety: &a.safety,
             no_save: a.output.no_save,
             guard: guard.clone(),

@@ -314,6 +314,7 @@ pub async fn run_tune(
         profile,
         super::measure::Opts {
             target_name,
+            operator_ref: None,
             rails,
             guard,
             output,

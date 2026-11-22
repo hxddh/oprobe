@@ -217,6 +217,8 @@ pub struct Replayer<'a> {
     /// The profile the run measured, its target resolved (credentials included).
     pub base: crate::config::Profile,
     pub target_name: Option<String>,
+    /// The replayed run's operator as given (the replays' spec keeps it).
+    pub operator_ref: Option<String>,
     pub safety: &'a Safety,
     pub no_save: bool,
     /// The command's guard (none without budgets).
@@ -239,7 +241,9 @@ impl<'a> Replayer<'a> {
             crate::operator::resolve::resolve(&run.report.spec.operator_ref, ctx.config()?)
                 .ok()
                 .and_then(|(_, s)| s.name());
-        Self::new(ctx, base, target_name, safety, no_save, cancel)
+        let mut r = Self::new(ctx, base, target_name, safety, no_save, cancel)?;
+        r.operator_ref = Some(run.report.spec.operator_ref.clone());
+        Ok(r)
     }
 
     /// Replays of `base` (a profile in memory, e.g. the diagnosis of `fix --no-save`) under a
@@ -256,6 +260,7 @@ impl<'a> Replayer<'a> {
         Ok(Self {
             base,
             target_name,
+            operator_ref: None,
             safety,
             no_save,
             guard,
@@ -280,6 +285,7 @@ impl<'a> Replayer<'a> {
             ctx,
             p,
             self.target_name.clone(),
+            self.operator_ref.clone(),
             &safety,
             &output,
             self.guard.clone(),

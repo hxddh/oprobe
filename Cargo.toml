@@ -3,7 +3,7 @@ members = ["crates/*"]
 resolver = "3"
 
 [workspace.package]
-version = "5.0.0"
+version = "6.0.0-dev"
 edition = "2024"
 rust-version = "1.97"
 license = "Apache-2.0"
@@ -12,8 +12,8 @@ homepage = "https://github.com/hxddh/oprobe"
 documentation = "https://github.com/hxddh/oprobe/tree/main/docs"
 
 [workspace.dependencies]
-oprobe-trace = { version = "5.0.0", path = "crates/oprobe-trace" }
-oprobe-core = { version = "5.0.0", path = "crates/oprobe-core", default-features = false }
+oprobe-trace = { version = "6.0.0-dev", path = "crates/oprobe-trace" }
+oprobe-core = { version = "6.0.0-dev", path = "crates/oprobe-core", default-features = false }
 
 opendal = { version = "0.59", default-features = false }
 opendal-core = { version = "0.59", default-features = false }

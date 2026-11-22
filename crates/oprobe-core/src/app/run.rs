@@ -47,6 +47,79 @@ impl CommandOutput for RunOutput {
     }
 }
 
+/// Result of `oprobe run OPERATOR…`: one run per operator, in order, on the same workload.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct RunSet {
+    pub runs: Vec<RunOutput>,
+}
+
+impl CommandOutput for RunSet {
+    fn next(&self) -> Vec<crate::output::NextStep> {
+        match self.runs.as_slice() {
+            [one] => one.next(),
+            _ => vec![crate::app::next::list_runs()],
+        }
+    }
+
+    fn text(&self) -> String {
+        let mut o: String = self
+            .runs
+            .iter()
+            .map(|r| r.text())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if self.runs.len() > 1 {
+            // Side by side (phase A builds the comparison view).
+            let rows: Vec<Vec<String>> = self
+                .runs
+                .iter()
+                .map(|r| {
+                    let rep = &r.report;
+                    vec![
+                        rep.spec.operator_ref.clone(),
+                        r.run_id.clone(),
+                        format!("{:.1}", rep.summary.ops_per_s),
+                        format!("{:.1}", rep.summary.mib_per_s),
+                        crate::util::fmt_ms(rep.summary.latency.p99),
+                        rep.resilience.throttled_responses.to_string(),
+                    ]
+                })
+                .collect();
+            o += "\n";
+            o += &crate::report::style::table(
+                &["operator", "run", "ops/s", "MiB/s", "p99", "throttled"],
+                &rows,
+                0,
+            );
+        }
+        o
+    }
+
+    fn exit_code(&self) -> u8 {
+        self.runs.iter().map(|r| r.exit_code()).max().unwrap_or(0)
+    }
+}
+
+/// Result of `oprobe run --dry-run`: the plan of every operator.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct RunPlan {
+    pub plans: Vec<Plan>,
+}
+
+impl CommandOutput for RunPlan {
+    fn warnings(&self) -> Vec<String> {
+        self.plans.iter().flat_map(|p| p.warnings.clone()).collect()
+    }
+
+    fn text(&self) -> String {
+        self.plans
+            .iter()
+            .map(|p| PlanOutput { plan: p.clone() }.text())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
 /// Result of `--dry-run`.
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 pub struct PlanOutput {
@@ -221,16 +294,18 @@ pub async fn measure(
     } else {
         guard_for(ctx, &profile, &budgets(ctx, safety)?)
     };
-    measure_guarded(ctx, profile, target_name, safety, output, guard, &cancel).await
+    measure_guarded(ctx, profile, target_name, None, safety, output, guard, &cancel).await
 }
 
 /// [`measure`] under the command's guard: every measurement of a command that measures
 /// several times (`verify`, `fix`, `baseline calibrate`) passes the same guard, so the budgets
 /// cover the whole command; once it has tripped, the next measurement refuses at once.
+#[allow(clippy::too_many_arguments)]
 pub async fn measure_guarded(
     ctx: &Ctx,
     profile: Profile,
     target_name: Option<String>,
+    operator_ref: Option<String>,
     safety: &Safety,
     output: &OutputOptions,
     guard: Option<Arc<Guard>>,
@@ -262,6 +337,7 @@ pub async fn measure_guarded(
         profile,
         super::measure::Opts {
             target_name,
+            operator_ref,
             rails,
             guard,
             output,

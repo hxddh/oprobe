@@ -1,4 +1,4 @@
-//! The run file `oprobe.run/5` (design v5 §2): a zstd stream of framed blocks, written while
+//! The run file `oprobe.run/6` (design v5 §2): a zstd stream of framed blocks, written while
 //! the run is in progress and read back block by block. The process never encodes the whole
 //! file in memory.
 //!
@@ -671,7 +671,7 @@ fn read_exact_or_eof(r: &mut impl Read, buf: &mut [u8]) -> Result<bool> {
     Ok(true)
 }
 
-/// Write a finished run as `oprobe.run/5` (rows in segments of [`SEGMENT_ROWS`], by time).
+/// Write a finished run as `oprobe.run/6` (rows in segments of [`SEGMENT_ROWS`], by time).
 pub fn write_run(path: &Path, run: &Run) -> Result<PathBuf> {
     let header = RunHeader::new(run.report.run.id.clone(), run.report.spec.clone());
     let mut w = RunFileWriter::create(path, &header)?;
@@ -910,7 +910,7 @@ impl crate::trace::RowSink for RunFileStream {
     }
 }
 
-/// Read a whole `oprobe.run/5` file into a [`Run`] (rows sorted by start time).
+/// Read a whole `oprobe.run/6` file into a [`Run`] (rows sorted by start time).
 pub fn read_run(r: impl Read) -> Result<Run> {
     let mut rd = RunFileReader::new(r)?;
     let mut header = None;

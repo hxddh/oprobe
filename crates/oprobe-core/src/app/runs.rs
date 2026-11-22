@@ -4,8 +4,7 @@ use anyhow::Result;
 use schemars::JsonSchema;
 use serde::Serialize;
 
-use super::Ctx;
-use super::input::*;
+use super::{App, RunRef};
 use crate::errors::{ErrorCode, OprobeError};
 use crate::model::Run;
 use crate::model::VerdictLevel;
@@ -17,13 +16,13 @@ use crate::util::fmt_ms;
 
 /// Result of `oprobe runs list`.
 #[derive(Clone, Debug, Serialize, JsonSchema)]
-pub struct RunsList {
+pub struct RunList {
     pub runs: Vec<RunSummary>,
     /// Runs stored in total (the list may be limited).
     pub total_count: u64,
 }
 
-impl CommandOutput for RunsList {
+impl CommandOutput for RunList {
     fn next(&self) -> Vec<crate::output::NextStep> {
         match self.runs.first() {
             Some(r) => vec![
@@ -125,19 +124,27 @@ fn when(id: &str, now: std::time::SystemTime) -> String {
     }
 }
 
-pub fn list(ctx: &Ctx, a: RunsListRequest) -> Result<RunsList> {
-    let mut runs = ctx.store().list()?;
-    let total = runs.len() as u64;
-    runs.truncate(a.limit);
-    Ok(RunsList {
+impl RunList {
+    /// Keep the newest `n` runs (`total_count` stays the number stored).
+    pub fn truncate(mut self, n: usize) -> Self {
+        self.runs.truncate(n);
+        self
+    }
+}
+
+/// The stored runs, newest first.
+pub fn list(app: &App) -> Result<RunList> {
+    let runs = app.store().list()?;
+    Ok(RunList {
+        total_count: runs.len() as u64,
         runs,
-        total_count: total,
     })
 }
 
-/// Result of `oprobe runs show`: the full report (and where it is stored).
+/// A shown run (`oprobe show`): the full report, where it is stored, and its rows for the
+/// renderers.
 #[derive(Clone, Debug, Serialize, JsonSchema)]
-pub struct RunShow {
+pub struct Profile {
     pub path: String,
     #[serde(flatten)]
     pub run: RunReportOnly,
@@ -247,7 +254,7 @@ pub struct RunReportOnly {
     pub requests_count: u64,
 }
 
-impl CommandOutput for RunShow {
+impl CommandOutput for Profile {
     fn next(&self) -> Vec<crate::output::NextStep> {
         crate::app::next::after_run(&self.run.report)
     }
@@ -263,20 +270,37 @@ impl CommandOutput for RunShow {
     }
 }
 
-pub fn show(ctx: &Ctx, a: RunsShowRequest) -> Result<RunShow> {
-    let store = ctx.store();
-    let path = store.resolve(&a.run)?;
+impl Profile {
+    /// Render every section (`--detail`).
+    pub fn with_detail(mut self, detail: bool) -> Self {
+        self.detail = detail;
+        self
+    }
+
+    /// Group the request rows (`--by`).
+    pub fn with_by(mut self, by: Option<crate::analysis::slice::By>) -> Self {
+        self.by = match (by, &self.full) {
+            (Some(b), Some(run)) => Some(ByTable::of(run, b)),
+            _ => None,
+        };
+        self
+    }
+}
+
+/// The run `r` names, with its rows.
+pub fn show(app: &App, r: &RunRef) -> Result<Profile> {
+    let path = app.store().resolve(&r.0)?;
     let run = crate::store::runs::load_path(&path)?;
-    Ok(RunShow {
+    Ok(Profile {
         path: path.display().to_string(),
         run: RunReportOnly {
             report: run.report.clone(),
             ops_count: run.ops.len() as u64,
             requests_count: run.reqs.len() as u64,
         },
-        by: a.by.map(|b| ByTable::of(&run, b)),
+        by: None,
         full: Some(Box::new(run)),
-        detail: a.detail,
+        detail: false,
     })
 }
 
@@ -308,10 +332,11 @@ impl CommandOutput for RemovedRuns {
     }
 }
 
-pub fn rm(ctx: &Ctx, a: RunsRmRequest) -> Result<RemovedRuns> {
-    let store = ctx.store();
+/// The ids of the stored runs `refs` name (a file outside the store is refused).
+pub fn stored_ids(app: &App, refs: &[RunRef]) -> Result<Vec<String>> {
+    let store = app.store();
     let mut ids = Vec::new();
-    for r in &a.runs {
+    for RunRef(r) in refs {
         let p = store.resolve(r)?;
         if p.parent() != Some(store.dir()) {
             return Err(OprobeError::new(
@@ -326,6 +351,13 @@ pub fn rm(ctx: &Ctx, a: RunsRmRequest) -> Result<RemovedRuns> {
             .unwrap_or_default();
         ids.push(id);
     }
+    Ok(ids)
+}
+
+/// Delete the stored runs `refs` name; returns their ids.
+pub fn rm(app: &App, refs: &[RunRef]) -> Result<RemovedRuns> {
+    let ids = stored_ids(app, refs)?;
+    let store = app.store();
     for id in &ids {
         store.delete(id)?;
     }

@@ -5,6 +5,7 @@
 
 pub mod args;
 mod commands;
+pub mod schema;
 
 use std::process::ExitCode;
 

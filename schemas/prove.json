@@ -1,0 +1,341 @@
+{
+  "$defs": {
+    "Change": {
+      "description": "One changed value (`path` in `--set` form; values in TOML form, absent when unset).",
+      "properties": {
+        "from": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "$ref": "#/$defs/ChangeKind"
+        },
+        "path": {
+          "type": "string"
+        },
+        "to": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "path",
+        "kind"
+      ],
+      "type": "object"
+    },
+    "ChangeKind": {
+      "description": "How one part of the operator changed.",
+      "enum": [
+        "added",
+        "changed",
+        "removed"
+      ],
+      "type": "string"
+    },
+    "Confidence": {
+      "description": "How far to trust the estimate.",
+      "enum": [
+        "low",
+        "medium",
+        "high"
+      ],
+      "type": "string"
+    },
+    "Interval": {
+      "description": "An estimate with a confidence interval.",
+      "properties": {
+        "estimate": {
+          "format": "double",
+          "type": "number"
+        },
+        "high": {
+          "format": "double",
+          "type": "number"
+        },
+        "low": {
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "estimate",
+        "low",
+        "high"
+      ],
+      "type": "object"
+    },
+    "Method": {
+      "description": "How a [`MetricStat`] interval was computed.",
+      "oneOf": [
+        {
+          "const": "block_bootstrap",
+          "description": "One run per side: block bootstrap over per-second windows.",
+          "type": "string"
+        },
+        {
+          "const": "runs_t",
+          "description": "Several runs per side: a t-interval over the per-run values.",
+          "type": "string"
+        },
+        {
+          "const": "unavailable",
+          "description": "Too few samples: point estimates only, never significant.",
+          "type": "string"
+        }
+      ]
+    },
+    "MetricStat": {
+      "description": "A headline metric with confidence intervals.",
+      "properties": {
+        "baseline": {
+          "$ref": "#/$defs/Interval"
+        },
+        "candidate": {
+          "$ref": "#/$defs/Interval"
+        },
+        "change": {
+          "$ref": "#/$defs/Interval",
+          "description": "Relative change of the candidate (ratio; +0.1 = 10 % higher), with its 95 % interval."
+        },
+        "confidence": {
+          "$ref": "#/$defs/Confidence"
+        },
+        "method": {
+          "$ref": "#/$defs/Method"
+        },
+        "metric": {
+          "description": "`p50_ms`, `p99_ms`, `ops_per_s`.",
+          "type": "string"
+        },
+        "noise_floor_ratio": {
+          "description": "Changes smaller than this are noise for this target and workload.",
+          "format": "double",
+          "type": "number"
+        },
+        "significant": {
+          "description": "The 95 % interval excludes zero and the change exceeds the noise floor.",
+          "type": "boolean"
+        },
+        "unit": {
+          "description": "Unit of `baseline` and `candidate`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "metric",
+        "unit",
+        "baseline",
+        "candidate",
+        "change",
+        "noise_floor_ratio",
+        "significant",
+        "method",
+        "confidence"
+      ],
+      "type": "object"
+    },
+    "NextStep": {
+      "description": "A suggested next step: what it does and the CLI command.",
+      "properties": {
+        "cli": {
+          "description": "The command line (`oprobe …`).",
+          "type": "string"
+        },
+        "title": {
+          "description": "What the step does, in a few words.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "title",
+        "cli"
+      ],
+      "type": "object"
+    },
+    "OperatorDiff": {
+      "description": "The changes from operator `a` to operator `b`, with their Rust and TOML renderings.",
+      "properties": {
+        "changes": {
+          "items": {
+            "$ref": "#/$defs/Change"
+          },
+          "type": "array"
+        },
+        "rust": {
+          "description": "The changed layers and options as Rust (`+` added, `~` changed, `-` removed).",
+          "type": "string"
+        },
+        "toml": {
+          "description": "The changed parts of `b` as `op.toml` lines.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "changes",
+        "rust",
+        "toml"
+      ],
+      "type": "object"
+    },
+    "Overrides": {
+      "description": "A change to a run: operator paths, workload and SLA keys, and the label. Built with\n[`Overrides::set`], which validates.",
+      "properties": {
+        "label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "operator": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Operator paths (`layers.retry.max_times`, `read.gap`, `options.region`, …).",
+          "type": "object"
+        },
+        "sla": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "workload": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        }
+      },
+      "type": "object"
+    },
+    "ProveObjective": {
+      "description": "What prove judges a change on.",
+      "oneOf": [
+        {
+          "const": "goodput",
+          "description": "Successful operations per second.",
+          "type": "string"
+        },
+        {
+          "const": "p99",
+          "description": "The worst per-operation p99 latency.",
+          "type": "string"
+        }
+      ]
+    },
+    "ProveVerdict": {
+      "description": "The verdict on the objective.",
+      "enum": [
+        "improved",
+        "worse",
+        "inconclusive"
+      ],
+      "type": "string"
+    }
+  },
+  "$id": "https://github.com/hxddh/oprobe/schemas/6/prove.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "The result of `oprobe prove -o json`: the verdict on the objective and the operator diff",
+  "properties": {
+    "baseline_run_ids": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "candidate_run_ids": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "change": {
+      "$ref": "#/$defs/Overrides",
+      "description": "The change, as `--set` pairs."
+    },
+    "diff": {
+      "$ref": "#/$defs/OperatorDiff",
+      "description": "The operator change as Rust and TOML."
+    },
+    "finding": {
+      "description": "The finding whose remedy was proven (absent for `--with` alone).",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "next": {
+      "description": "Suggested next steps.",
+      "items": {
+        "$ref": "#/$defs/NextStep"
+      },
+      "type": "array"
+    },
+    "objective": {
+      "$ref": "#/$defs/ProveObjective"
+    },
+    "objective_delta": {
+      "$ref": "#/$defs/Interval",
+      "description": "Relative change of the objective (candidate vs baseline), with its 95 % interval."
+    },
+    "operator_ref": {
+      "description": "The run's operator as given.",
+      "type": "string"
+    },
+    "pairs_count": {
+      "description": "Interleaved baseline / candidate pairs that ran.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "run_id": {
+      "description": "The run whose operator was changed.",
+      "type": "string"
+    },
+    "secondary": {
+      "description": "The other metrics (shown, never decisive).",
+      "items": {
+        "$ref": "#/$defs/MetricStat"
+      },
+      "type": "array"
+    },
+    "significant": {
+      "description": "The change exceeded the noise floor and its interval excludes zero.",
+      "type": "boolean"
+    },
+    "verdict": {
+      "$ref": "#/$defs/ProveVerdict"
+    },
+    "warnings": {
+      "description": "Warnings of the command (also printed on stderr in text mode).",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "run_id",
+    "operator_ref",
+    "change",
+    "objective",
+    "verdict",
+    "objective_delta",
+    "significant",
+    "pairs_count",
+    "baseline_run_ids",
+    "candidate_run_ids",
+    "secondary",
+    "diff",
+    "next",
+    "warnings"
+  ],
+  "title": "oprobe prove",
+  "type": "object",
+  "x-rust-type": "ProveOutput"
+}
