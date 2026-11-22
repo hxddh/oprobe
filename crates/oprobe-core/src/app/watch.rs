@@ -2,7 +2,9 @@
 //! open-loop at `--rate` for `--duration`, every `--interval`; a rolling window of the last
 //! `--window` is checked against the SLOs (`--slo p99<200ms`, `errors<1%`, `throttle<1%`,
 //! `availability>99.9%`), and SLO transitions are logged as events. `--listen ADDR` serves
-//! Prometheus text on `/metrics`; `--otlp-endpoint URL` pushes OTLP metrics each window.
+//! Prometheus text on `/metrics` (every series labelled with the target) and `/healthz`;
+//! `--otlp-endpoint URL` pushes cumulative OTLP metrics after each window (design v5 §6:
+//! a stable `service.instance.id`, no run id, `OTEL_EXPORTER_OTLP_HEADERS`, protobuf).
 //! Runs until Ctrl-C (or `--count` windows); budgets apply to the whole session.
 
 use std::collections::VecDeque;
@@ -222,11 +224,12 @@ impl CommandOutput for WatchOutput {
         );
         for s in &self.slos {
             o += &format!(
-                "  {} {} (now {:.4}; breached in {} windows)\n",
+                "  {} {} (now {}; breached in {} of {} windows)\n",
                 if s.ok { green("ok") } else { red("BREACHED") },
                 s.slo.spec,
-                s.value,
-                s.breached_windows_count
+                fmt_slo_value(s.value, &s.unit),
+                s.breached_windows_count,
+                self.windows_count
             );
         }
         for t in &self.transitions {
@@ -243,8 +246,18 @@ impl CommandOutput for WatchOutput {
     }
 }
 
-/// Serve `/metrics` from `reg` on `addr` until the process ends.
-async fn serve_metrics(addr: &str, reg: Arc<Mutex<Registry>>) -> Result<String> {
+/// An SLO value for people: `38.7ms`, `0.25%` (review C14: not `38.6810`).
+fn fmt_slo_value(v: f64, unit: &str) -> String {
+    match unit {
+        "ms" => fmt_ms(v),
+        "ratio" => format!("{:.2}%", v * 100.0),
+        _ => format!("{v:.3}"),
+    }
+}
+
+/// Serve `/metrics` and `/healthz` from `reg` on `addr` until the process ends. `/healthz` is
+/// 503 when no probe window succeeded within `stale` (or none succeeded after the first).
+async fn serve_metrics(addr: &str, reg: Arc<Mutex<Registry>>, stale: Duration) -> Result<String> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
         OprobeError::new(
@@ -267,8 +280,27 @@ async fn serve_metrics(addr: &str, reg: Arc<Mutex<Registry>>) -> Result<String> 
                 let (status, ctype, body) = if path == "/metrics" || path.starts_with("/metrics?") {
                     let text = reg.lock().map(|r| r.render()).unwrap_or_default();
                     ("200 OK", "text/plain; version=0.0.4; charset=utf-8", text)
+                } else if path == "/healthz" {
+                    let now = unix_s(SystemTime::now());
+                    let (ok, why) = reg
+                        .lock()
+                        .map(|r| r.health(now, stale.as_secs_f64()))
+                        .unwrap_or((false, "unhealthy: state unavailable\n".into()));
+                    (
+                        if ok {
+                            "200 OK"
+                        } else {
+                            "503 Service Unavailable"
+                        },
+                        "text/plain; charset=utf-8",
+                        why,
+                    )
                 } else {
-                    ("404 Not Found", "text/plain", "see /metrics\n".to_owned())
+                    (
+                        "404 Not Found",
+                        "text/plain",
+                        "see /metrics or /healthz\n".to_owned(),
+                    )
                 };
                 let head = format!(
                     "HTTP/1.1 {status}\r\ncontent-type: {ctype}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
@@ -281,6 +313,12 @@ async fn serve_metrics(addr: &str, reg: Arc<Mutex<Registry>>) -> Result<String> 
         }
     });
     Ok(local)
+}
+
+fn unix_s(t: SystemTime) -> f64 {
+    t.duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
 }
 
 /// What [`watch`] produced.
@@ -340,10 +378,15 @@ pub async fn watch(ctx: &Ctx, a: WatchRequest, cancel: Cancel) -> Result<WatchOu
         })));
     }
     let guard = super::run::guard_for(ctx, &profile, &rails.budgets);
-    let reg = Arc::new(Mutex::new(Registry::default()));
+    let display = profile.target.display();
+    let reg = Arc::new(Mutex::new(Registry::for_target(crate::util::display_url(
+        &display,
+    ))));
+    // Unhealthy after three missed intervals (each window lasts `window`).
+    let stale = (interval.max(window) + window) * 3;
     let listen = match &a.listen {
         Some(addr) => {
-            let local = serve_metrics(addr, reg.clone()).await?;
+            let local = serve_metrics(addr, reg.clone(), stale).await?;
             ctx.out.info(format!(
                 "serving Prometheus metrics on http://{local}/metrics"
             ));
@@ -351,7 +394,6 @@ pub async fn watch(ctx: &Ctx, a: WatchRequest, cancel: Cancel) -> Result<WatchOu
         }
         None => None,
     };
-    let display = profile.target.display();
     ctx.out.info(format!(
         "{} {display} · {rate} ops/s for {} every {} · rolling {} · Ctrl-C to stop",
         bold("watching"),
@@ -384,6 +426,11 @@ pub async fn watch(ctx: &Ctx, a: WatchRequest, cancel: Cancel) -> Result<WatchOu
     let mut count = 0u64;
     let mut rolling = Rolling::default();
     let mut failure: Option<anyhow::Error> = None;
+    let session_start_ns = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let mut otlp: Option<crate::export::otlp::WatchMetrics> = None;
     loop {
         if cancel.is_cancelled() || a.count.is_some_and(|c| count >= c) {
             break;
@@ -454,6 +501,7 @@ pub async fn watch(ctx: &Ctx, a: WatchRequest, cancel: Cancel) -> Result<WatchOu
         {
             let mut g = reg.lock().unwrap_or_else(|e| e.into_inner());
             g.observe(&run);
+            g.probe_done(unix_s(SystemTime::now()), r.summary.failed_ops == 0);
             g.gauge("window_p50_seconds", vec![], rolling.p50_ms / 1000.0);
             g.gauge("window_p99_seconds", vec![], rolling.p99_ms / 1000.0);
             g.gauge("window_error_ratio", vec![], rolling.error_ratio);
@@ -476,7 +524,12 @@ pub async fn watch(ctx: &Ctx, a: WatchRequest, cancel: Cancel) -> Result<WatchOu
                 if now != ok[i] {
                     ok[i] = now;
                     let state = if now { "recovered" } else { "breached" };
-                    let msg = format!("SLO {} {state}: {} = {v:.4}", s.spec, s.metric);
+                    let msg = format!(
+                        "SLO {} {state}: {} = {}",
+                        s.spec,
+                        s.metric,
+                        fmt_slo_value(v, &s.unit)
+                    );
                     if now {
                         ctx.out.bus().log(LogLevel::Info, msg.clone());
                         if ctx.out.format != crate::output::OutputFormat::Ndjson {
@@ -495,11 +548,20 @@ pub async fn watch(ctx: &Ctx, a: WatchRequest, cancel: Cancel) -> Result<WatchOu
                 }
             }
         }
-        if let Some(ep) = &a.otlp_endpoint
-            && let Err(e) =
-                crate::export::otlp::push(ep, "metrics", &crate::export::otlp::metrics(&run)).await
-        {
-            ctx.out.warn(format!("{e:#}"));
+        if let Some(ep) = &a.otlp_endpoint {
+            let now = SystemTime::now();
+            let m = otlp.get_or_insert_with(|| {
+                crate::export::otlp::WatchMetrics::new(
+                    &crate::util::display_url(&display),
+                    &r.run.host.hostname_hash,
+                    session_start_ns,
+                )
+            });
+            m.observe(&run, unix_s(now));
+            let now_ns = (unix_s(now) * 1e9) as u64;
+            if let Err(e) = crate::export::otlp::push_metrics(ep, &m.doc(now_ns)).await {
+                ctx.out.warn(format!("{e:#}"));
+            }
         }
         if session.guard().is_some_and(|g| g.tripped()) {
             break;

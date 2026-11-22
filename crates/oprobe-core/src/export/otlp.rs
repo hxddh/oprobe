@@ -438,27 +438,44 @@ pub fn signal_url(endpoint: &str, signal: &str) -> String {
 }
 
 /// POST an OTLP/JSON body to `endpoint` (a collector base URL such as
-/// `http://localhost:4318`; `/v1/traces` or `/v1/metrics` is appended unless present).
+/// `http://localhost:4318`; `/v1/traces` or `/v1/metrics` is appended unless present), with
+/// the headers of `OTEL_EXPORTER_OTLP_HEADERS`.
 pub async fn push(endpoint: &str, signal: &str, body: &Value) -> anyhow::Result<()> {
+    let headers = env_headers(signal);
+    post(
+        endpoint,
+        signal,
+        "application/json",
+        serde_json::to_vec(body)?,
+        &headers,
+    )
+    .await
+}
+
+async fn post(
+    endpoint: &str,
+    signal: &str,
+    content_type: &str,
+    body: Vec<u8>,
+    headers: &[(String, String)],
+) -> anyhow::Result<()> {
     let url = signal_url(endpoint, signal);
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()?;
-    let resp = client
-        .post(&url)
-        .header("content-type", "application/json")
-        .body(serde_json::to_vec(body)?)
-        .send()
-        .await
-        .map_err(|e| {
-            let code = if e.is_timeout() {
-                crate::errors::ErrorCode::NetTimeout
-            } else {
-                crate::errors::ErrorCode::NetUnreachable
-            };
-            crate::errors::OprobeError::new(code, format!("OTLP push to {url} failed: {e}"))
-                .with_hint("check that the collector runs and --endpoint is its base URL")
-        })?;
+    let mut req = client.post(&url).header("content-type", content_type);
+    for (k, v) in headers {
+        req = req.header(k.as_str(), v.as_str());
+    }
+    let resp = req.body(body).send().await.map_err(|e| {
+        let code = if e.is_timeout() {
+            crate::errors::ErrorCode::NetTimeout
+        } else {
+            crate::errors::ErrorCode::NetUnreachable
+        };
+        crate::errors::OprobeError::new(code, format!("OTLP push to {url} failed: {e}"))
+            .with_hint("check that the collector runs and --endpoint is its base URL")
+    })?;
     let status = resp.status();
     if !status.is_success() {
         let text = resp.text().await.unwrap_or_default();
@@ -469,10 +486,579 @@ pub async fn push(endpoint: &str, signal: &str, body: &Value) -> anyhow::Result<
                 text.chars().take(200).collect::<String>()
             ),
         )
-        .with_hint("check the collector's logs and that it accepts OTLP/HTTP JSON")
+        .with_hint(
+            "check the collector's logs, OTEL_EXPORTER_OTLP_HEADERS (authentication) and \
+             OTEL_EXPORTER_OTLP_PROTOCOL (http/protobuf or http/json)",
+        )
         .into());
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------------------
+// `oprobe watch --otlp-endpoint` (design v5 §6, review C7): one cumulative metric stream per
+// watch session. The resource carries a stable `service.instance.id` and the target, never a
+// run id (no series churn per window); counters and histograms are cumulative from the start
+// of the session; headers come from `OTEL_EXPORTER_OTLP_HEADERS`; the body is protobuf unless
+// `OTEL_EXPORTER_OTLP_PROTOCOL=http/json`.
+// ---------------------------------------------------------------------------------------
+
+/// An attribute value of the format-independent metrics model.
+#[derive(Clone, Debug, PartialEq, PartialOrd)]
+pub enum AttrValue {
+    Str(String),
+    Int(i64),
+    Bool(bool),
+}
+
+/// `key = value`.
+pub type Attr = (String, AttrValue);
+
+/// A histogram data point (explicit bounds; `bucket_counts.len() == bounds.len() + 1`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct HistPoint {
+    pub attrs: Vec<Attr>,
+    pub start_ns: u64,
+    pub time_ns: u64,
+    pub count: u64,
+    pub sum: f64,
+    pub min: f64,
+    pub max: f64,
+    pub bucket_counts: Vec<u64>,
+    pub bounds: Vec<f64>,
+}
+
+/// A number data point.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NumPoint {
+    pub attrs: Vec<Attr>,
+    pub start_ns: u64,
+    pub time_ns: u64,
+    pub value: f64,
+    /// Encode as an integer (`asInt`) rather than a double.
+    pub int: bool,
+}
+
+/// The data of a metric.
+#[derive(Clone, Debug, PartialEq)]
+pub enum MetricData {
+    /// Cumulative histogram.
+    Histogram(Vec<HistPoint>),
+    /// Cumulative monotonic sum.
+    Counter(Vec<NumPoint>),
+    Gauge(Vec<NumPoint>),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Metric {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub unit: &'static str,
+    pub data: MetricData,
+}
+
+/// An `ExportMetricsServiceRequest` with one resource and one scope.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MetricsDoc {
+    pub resource: Vec<Attr>,
+    pub metrics: Vec<Metric>,
+}
+
+fn attr_json((k, v): &Attr) -> Value {
+    let value = match v {
+        AttrValue::Str(x) => s(x.clone()),
+        AttrValue::Int(x) => i(*x),
+        AttrValue::Bool(x) => b(*x),
+    };
+    kv(k, value)
+}
+
+impl MetricsDoc {
+    /// The OTLP/JSON encoding.
+    pub fn to_json(&self) -> Value {
+        let metrics: Vec<Value> = self
+            .metrics
+            .iter()
+            .map(|m| {
+                let num = |p: &NumPoint| {
+                    let mut v = json!({
+                        "attributes": p.attrs.iter().map(attr_json).collect::<Vec<_>>(),
+                        "startTimeUnixNano": p.start_ns.to_string(),
+                        "timeUnixNano": p.time_ns.to_string(),
+                    });
+                    if p.int {
+                        v["asInt"] = json!((p.value as i64).to_string());
+                    } else {
+                        v["asDouble"] = json!(p.value);
+                    }
+                    v
+                };
+                let mut v = json!({ "name": m.name, "description": m.description, "unit": m.unit });
+                match &m.data {
+                    MetricData::Histogram(points) => {
+                        v["histogram"] = json!({
+                            "aggregationTemporality": 2,
+                            "dataPoints": points.iter().map(|p| json!({
+                                "attributes": p.attrs.iter().map(attr_json).collect::<Vec<_>>(),
+                                "startTimeUnixNano": p.start_ns.to_string(),
+                                "timeUnixNano": p.time_ns.to_string(),
+                                "count": p.count.to_string(),
+                                "sum": p.sum,
+                                "min": p.min,
+                                "max": p.max,
+                                "bucketCounts": p.bucket_counts.iter().map(u64::to_string).collect::<Vec<_>>(),
+                                "explicitBounds": p.bounds,
+                            })).collect::<Vec<_>>(),
+                        })
+                    }
+                    MetricData::Counter(points) => {
+                        v["sum"] = json!({
+                            "aggregationTemporality": 2,
+                            "isMonotonic": true,
+                            "dataPoints": points.iter().map(num).collect::<Vec<_>>(),
+                        })
+                    }
+                    MetricData::Gauge(points) => {
+                        v["gauge"] = json!({ "dataPoints": points.iter().map(num).collect::<Vec<_>>() })
+                    }
+                }
+                v
+            })
+            .collect();
+        json!({
+            "resourceMetrics": [{
+                "resource": { "attributes": self.resource.iter().map(attr_json).collect::<Vec<_>>() },
+                "scopeMetrics": [{ "scope": scope(), "metrics": metrics }],
+            }]
+        })
+    }
+
+    /// The OTLP protobuf encoding (`opentelemetry.proto.collector.metrics.v1`), hand-written:
+    /// no code generator or protobuf runtime in the binary.
+    pub fn to_protobuf(&self) -> Vec<u8> {
+        use pb::*;
+        let attr = |a: &Attr| {
+            let mut val = Vec::new();
+            match &a.1 {
+                AttrValue::Str(x) => string(&mut val, 1, x),
+                AttrValue::Bool(x) => varint_field(&mut val, 2, u64::from(*x)),
+                AttrValue::Int(x) => varint_field(&mut val, 3, *x as u64),
+            }
+            let mut kvb = Vec::new();
+            string(&mut kvb, 1, &a.0);
+            message(&mut kvb, 2, &val);
+            kvb
+        };
+        let num = |p: &NumPoint| {
+            let mut d = Vec::new();
+            for a in &p.attrs {
+                message(&mut d, 7, &attr(a));
+            }
+            fixed64_field(&mut d, 2, p.start_ns);
+            fixed64_field(&mut d, 3, p.time_ns);
+            if p.int {
+                fixed64_field(&mut d, 6, p.value as i64 as u64);
+            } else {
+                fixed64_field(&mut d, 4, p.value.to_bits());
+            }
+            d
+        };
+        let mut metrics = Vec::new();
+        for m in &self.metrics {
+            let mut mb = Vec::new();
+            string(&mut mb, 1, m.name);
+            string(&mut mb, 2, m.description);
+            string(&mut mb, 3, m.unit);
+            match &m.data {
+                MetricData::Histogram(points) => {
+                    let mut h = Vec::new();
+                    for p in points {
+                        let mut d = Vec::new();
+                        for a in &p.attrs {
+                            message(&mut d, 9, &attr(a));
+                        }
+                        fixed64_field(&mut d, 2, p.start_ns);
+                        fixed64_field(&mut d, 3, p.time_ns);
+                        fixed64_field(&mut d, 4, p.count);
+                        fixed64_field(&mut d, 5, p.sum.to_bits());
+                        packed_fixed64(&mut d, 6, p.bucket_counts.iter().copied());
+                        packed_fixed64(&mut d, 7, p.bounds.iter().map(|b| b.to_bits()));
+                        fixed64_field(&mut d, 11, p.min.to_bits());
+                        fixed64_field(&mut d, 12, p.max.to_bits());
+                        message(&mut h, 1, &d);
+                    }
+                    varint_field(&mut h, 2, 2); // AGGREGATION_TEMPORALITY_CUMULATIVE
+                    message(&mut mb, 9, &h);
+                }
+                MetricData::Counter(points) => {
+                    let mut sm = Vec::new();
+                    for p in points {
+                        message(&mut sm, 1, &num(p));
+                    }
+                    varint_field(&mut sm, 2, 2);
+                    varint_field(&mut sm, 3, 1); // is_monotonic
+                    message(&mut mb, 7, &sm);
+                }
+                MetricData::Gauge(points) => {
+                    let mut g = Vec::new();
+                    for p in points {
+                        message(&mut g, 1, &num(p));
+                    }
+                    message(&mut mb, 5, &g);
+                }
+            }
+            metrics.push(mb);
+        }
+        let mut sc = Vec::new();
+        string(&mut sc, 1, "oprobe");
+        string(&mut sc, 2, env!("CARGO_PKG_VERSION"));
+        let mut scope_metrics = Vec::new();
+        message(&mut scope_metrics, 1, &sc);
+        for m in &metrics {
+            message(&mut scope_metrics, 2, m);
+        }
+        let mut res = Vec::new();
+        for a in &self.resource {
+            message(&mut res, 1, &attr(a));
+        }
+        let mut rm = Vec::new();
+        message(&mut rm, 1, &res);
+        message(&mut rm, 2, &scope_metrics);
+        let mut out = Vec::new();
+        message(&mut out, 1, &rm);
+        out
+    }
+}
+
+/// The few protobuf wire-format primitives OTLP metrics need.
+mod pb {
+    pub fn varint(out: &mut Vec<u8>, mut v: u64) {
+        while v >= 0x80 {
+            out.push((v as u8) | 0x80);
+            v >>= 7;
+        }
+        out.push(v as u8);
+    }
+    fn key(out: &mut Vec<u8>, field: u32, wire: u8) {
+        varint(out, (u64::from(field) << 3) | u64::from(wire));
+    }
+    pub fn varint_field(out: &mut Vec<u8>, field: u32, v: u64) {
+        key(out, field, 0);
+        varint(out, v);
+    }
+    pub fn fixed64_field(out: &mut Vec<u8>, field: u32, v: u64) {
+        key(out, field, 1);
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    pub fn bytes(out: &mut Vec<u8>, field: u32, b: &[u8]) {
+        key(out, field, 2);
+        varint(out, b.len() as u64);
+        out.extend_from_slice(b);
+    }
+    pub fn string(out: &mut Vec<u8>, field: u32, s: &str) {
+        bytes(out, field, s.as_bytes());
+    }
+    pub fn message(out: &mut Vec<u8>, field: u32, m: &[u8]) {
+        bytes(out, field, m);
+    }
+    pub fn packed_fixed64(out: &mut Vec<u8>, field: u32, vals: impl Iterator<Item = u64>) {
+        let mut b = Vec::new();
+        for v in vals {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        bytes(out, field, &b);
+    }
+}
+
+/// A stable `service.instance.id` for a watch of `target` on this host: the same host and
+/// target give the same id across restarts (UUID-shaped, from a hash).
+pub fn instance_id(host: &str, target: &str) -> String {
+    let a = fnv(&[host.as_bytes(), target.as_bytes(), b"oprobe-watch-a"]);
+    let b = fnv(&[host.as_bytes(), target.as_bytes(), b"oprobe-watch-b"]);
+    let h = hex(&[a.to_be_bytes(), b.to_be_bytes()].concat());
+    format!(
+        "{}-{}-{}-{}-{}",
+        &h[0..8],
+        &h[8..12],
+        &h[12..16],
+        &h[16..20],
+        &h[20..32]
+    )
+}
+
+type Key = Vec<(String, String)>;
+
+/// Cumulative metrics of one `oprobe watch` session (one series per label set for the whole
+/// session; see the section comment).
+#[derive(Default)]
+pub struct WatchMetrics {
+    resource: Vec<Attr>,
+    start_ns: u64,
+    req: BTreeMap<Key, Hist>,
+    stage: BTreeMap<Key, Hist>,
+    ops: BTreeMap<Key, Hist>,
+    requests: BTreeMap<String, u64>,
+    throttled: BTreeMap<String, u64>,
+    windows: u64,
+    last_success_s: Option<f64>,
+}
+
+impl WatchMetrics {
+    /// A session watching `target` (its display URL) from `host` (an identifier such as the
+    /// report's host name hash; it only feeds the instance id), started at `start_ns` (Unix
+    /// nanoseconds).
+    pub fn new(target: &str, host: &str, start_ns: u64) -> Self {
+        let resource = vec![
+            ("service.name".to_owned(), AttrValue::Str("oprobe".into())),
+            (
+                "service.version".to_owned(),
+                AttrValue::Str(env!("CARGO_PKG_VERSION").into()),
+            ),
+            (
+                "service.instance.id".to_owned(),
+                AttrValue::Str(instance_id(host, target)),
+            ),
+            (
+                "oprobe.target".to_owned(),
+                AttrValue::Str(target.to_owned()),
+            ),
+        ];
+        Self {
+            resource,
+            start_ns,
+            ..Self::default()
+        }
+    }
+
+    /// Add one probe window (its kept request and operation rows), ended at `unix_s`.
+    pub fn observe(&mut self, run: &Run, unix_s: f64) {
+        self.windows += 1;
+        if run.report.summary.failed_ops == 0 {
+            self.last_success_s = Some(unix_s);
+        }
+        for q in run.reqs.iter().filter(|q| q.t_us >= 0) {
+            let mut labels = vec![
+                ("http.request.method".to_owned(), q.method.to_string()),
+                ("oprobe.api".to_owned(), q.api.to_string()),
+            ];
+            if q.status > 0 {
+                labels.push(("http.response.status_code".into(), q.status.to_string()));
+            }
+            self.req
+                .entry(labels)
+                .or_default()
+                .observe(q.total_us as f64 / 1e6, &DURATION_BOUNDS_S);
+            for (name, us) in [
+                ("queue", q.queue_us),
+                ("connect", q.connect_us()),
+                ("send", q.send_us),
+                ("ttfb", q.ttfb_us),
+                ("body", q.body_us),
+            ] {
+                if name == "connect" && (q.reused || us == 0) {
+                    continue;
+                }
+                self.stage
+                    .entry(vec![
+                        ("oprobe.api".into(), q.api.to_string()),
+                        ("oprobe.stage".into(), name.into()),
+                    ])
+                    .or_default()
+                    .observe(us as f64 / 1e6, &DURATION_BOUNDS_S);
+            }
+            *self.requests.entry(q.api.to_string()).or_default() += 1;
+            if q.is_throttle() {
+                *self.throttled.entry(q.api.to_string()).or_default() += 1;
+            }
+        }
+        for o in run.ops.iter().filter(|o| o.t_us >= 0) {
+            self.ops
+                .entry(vec![
+                    ("oprobe.op.verb".into(), o.verb.to_string()),
+                    ("oprobe.op.ok".into(), o.ok.to_string()),
+                ])
+                .or_default()
+                .observe(o.latency_us as f64 / 1e6, &DURATION_BOUNDS_S);
+        }
+    }
+
+    /// The cumulative state at `now_ns`.
+    pub fn doc(&self, now_ns: u64) -> MetricsDoc {
+        let start = self.start_ns;
+        let attrs = |k: &Key| -> Vec<Attr> {
+            k.iter()
+                .map(|(n, v)| {
+                    let val = if n == "http.response.status_code" {
+                        AttrValue::Int(v.parse().unwrap_or(0))
+                    } else {
+                        AttrValue::Str(v.clone())
+                    };
+                    (n.clone(), val)
+                })
+                .collect()
+        };
+        let hist = |m: &BTreeMap<Key, Hist>| {
+            MetricData::Histogram(
+                m.iter()
+                    .map(|(k, h)| HistPoint {
+                        attrs: attrs(k),
+                        start_ns: start,
+                        time_ns: now_ns,
+                        count: h.count,
+                        sum: h.sum,
+                        min: h.min,
+                        max: h.max,
+                        bucket_counts: h.counts.clone(),
+                        bounds: DURATION_BOUNDS_S.to_vec(),
+                    })
+                    .collect(),
+            )
+        };
+        let counter = |m: &BTreeMap<String, u64>| {
+            MetricData::Counter(
+                m.iter()
+                    .map(|(api, n)| NumPoint {
+                        attrs: vec![("oprobe.api".into(), AttrValue::Str(api.clone()))],
+                        start_ns: start,
+                        time_ns: now_ns,
+                        value: *n as f64,
+                        int: true,
+                    })
+                    .collect(),
+            )
+        };
+        let mut metrics = vec![
+            Metric {
+                name: "http.client.request.duration",
+                description: "Duration of HTTP client requests.",
+                unit: "s",
+                data: hist(&self.req),
+            },
+            Metric {
+                name: "oprobe.request.stage.duration",
+                description: "Time requests spent in each stage.",
+                unit: "s",
+                data: hist(&self.stage),
+            },
+            Metric {
+                name: "oprobe.operation.duration",
+                description: "Duration of logical storage operations.",
+                unit: "s",
+                data: hist(&self.ops),
+            },
+            Metric {
+                name: "oprobe.requests",
+                description: "Backend requests sent.",
+                unit: "{request}",
+                data: counter(&self.requests),
+            },
+            Metric {
+                name: "oprobe.requests.throttled",
+                description: "Requests answered with 429/503.",
+                unit: "{request}",
+                data: counter(&self.throttled),
+            },
+            Metric {
+                name: "oprobe.watch.windows",
+                description: "Probe windows completed.",
+                unit: "{window}",
+                data: MetricData::Counter(vec![NumPoint {
+                    attrs: vec![],
+                    start_ns: start,
+                    time_ns: now_ns,
+                    value: self.windows as f64,
+                    int: true,
+                }]),
+            },
+        ];
+        if let Some(t) = self.last_success_s {
+            metrics.push(Metric {
+                name: "oprobe.watch.last_success",
+                description: "End of the last probe window without failed operations (Unix time).",
+                unit: "s",
+                data: MetricData::Gauge(vec![NumPoint {
+                    attrs: vec![],
+                    start_ns: start,
+                    time_ns: now_ns,
+                    value: t,
+                    int: false,
+                }]),
+            });
+        }
+        MetricsDoc {
+            resource: self.resource.clone(),
+            metrics,
+        }
+    }
+}
+
+/// `OTEL_EXPORTER_OTLP_{signal}_HEADERS`, else `OTEL_EXPORTER_OTLP_HEADERS`: `k=v` pairs
+/// separated by commas, values percent-decoded (the OTel specification's format).
+pub fn env_headers(signal: &str) -> Vec<(String, String)> {
+    let var = format!("OTEL_EXPORTER_OTLP_{}_HEADERS", signal.to_ascii_uppercase());
+    let raw = std::env::var(&var)
+        .ok()
+        .or_else(|| std::env::var("OTEL_EXPORTER_OTLP_HEADERS").ok())
+        .unwrap_or_default();
+    parse_headers(&raw)
+}
+
+/// Parse `k=v,k2=v2` (values percent-decoded; malformed pairs skipped).
+pub fn parse_headers(raw: &str) -> Vec<(String, String)> {
+    raw.split(',')
+        .filter_map(|pair| {
+            let (k, v) = pair.split_once('=')?;
+            let k = k.trim();
+            (!k.is_empty()).then(|| {
+                let v = url::form_urlencoded::parse(
+                    format!("v={}", v.trim().replace('+', "%2B")).as_bytes(),
+                )
+                .next()
+                .map(|(_, v)| v.into_owned())
+                .unwrap_or_default();
+                (k.to_owned(), v)
+            })
+        })
+        .collect()
+}
+
+/// The OTLP/HTTP encoding to push `signal` with: `OTEL_EXPORTER_OTLP_{signal}_PROTOCOL`, else
+/// `OTEL_EXPORTER_OTLP_PROTOCOL`; `http/protobuf` (the specification's default) unless it says
+/// `http/json`. Only metrics have a protobuf encoder; traces are always JSON.
+pub fn env_protobuf(signal: &str) -> bool {
+    let var = format!(
+        "OTEL_EXPORTER_OTLP_{}_PROTOCOL",
+        signal.to_ascii_uppercase()
+    );
+    let p = std::env::var(&var)
+        .ok()
+        .or_else(|| std::env::var("OTEL_EXPORTER_OTLP_PROTOCOL").ok())
+        .unwrap_or_default();
+    signal == "metrics" && !p.trim().eq_ignore_ascii_case("http/json")
+}
+
+/// POST watch metrics to `endpoint` with the environment's headers and protocol.
+pub async fn push_metrics(endpoint: &str, doc: &MetricsDoc) -> anyhow::Result<()> {
+    let headers = env_headers("metrics");
+    if env_protobuf("metrics") {
+        post(
+            endpoint,
+            "metrics",
+            "application/x-protobuf",
+            doc.to_protobuf(),
+            &headers,
+        )
+        .await
+    } else {
+        post(
+            endpoint,
+            "metrics",
+            "application/json",
+            serde_json::to_vec(&doc.to_json())?,
+            &headers,
+        )
+        .await
+    }
 }
 
 #[cfg(test)]
@@ -492,6 +1078,140 @@ mod tests {
         }
     }
     use crate::analysis::simulate::tests::straggler_run;
+
+    #[test]
+    fn watch_metrics_are_cumulative_with_a_stable_identity() {
+        let run = straggler_run();
+        let mut w = WatchMetrics::new("s3://b/p", "host-1", 1_000);
+        w.observe(&run, 10.0);
+        w.observe(&run, 20.0);
+        let d = w.doc(5_000);
+        // No run id anywhere; a stable instance id; the target.
+        let res: Vec<&str> = d.resource.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(!res.contains(&"oprobe.run.id"), "{res:?}");
+        assert!(res.contains(&"service.instance.id") && res.contains(&"oprobe.target"));
+        assert_eq!(
+            instance_id("host-1", "s3://b/p"),
+            instance_id("host-1", "s3://b/p")
+        );
+        assert_ne!(
+            instance_id("host-1", "s3://b/p"),
+            instance_id("host-2", "s3://b/p")
+        );
+        assert_eq!(instance_id("h", "t").len(), 36);
+        let MetricData::Histogram(points) = &d.metrics[0].data else {
+            panic!()
+        };
+        assert_eq!(points[0].count, 2000, "two windows accumulate");
+        assert_eq!((points[0].start_ns, points[0].time_ns), (1_000, 5_000));
+        let MetricData::Counter(c) = &d.metrics[3].data else {
+            panic!()
+        };
+        assert!(c.iter().all(|p| p.int && p.start_ns == 1_000));
+        let j = d.to_json();
+        assert_eq!(
+            j["resourceMetrics"][0]["scopeMetrics"][0]["metrics"][0]["histogram"]["aggregationTemporality"],
+            2
+        );
+        assert_eq!(
+            j["resourceMetrics"][0]["scopeMetrics"][0]["metrics"][3]["sum"]["isMonotonic"],
+            true
+        );
+    }
+
+    /// A minimal protobuf reader: (field, wire type, payload) of one message level.
+    fn fields(mut b: &[u8]) -> Vec<(u32, u8, Vec<u8>)> {
+        fn varint(b: &mut &[u8]) -> u64 {
+            let (mut v, mut shift) = (0u64, 0);
+            loop {
+                let x = b[0];
+                *b = &b[1..];
+                v |= u64::from(x & 0x7f) << shift;
+                if x < 0x80 {
+                    return v;
+                }
+                shift += 7;
+            }
+        }
+        let mut out = Vec::new();
+        while !b.is_empty() {
+            let k = varint(&mut b);
+            let (field, wire) = ((k >> 3) as u32, (k & 7) as u8);
+            let payload = match wire {
+                0 => varint(&mut b).to_le_bytes().to_vec(),
+                1 => {
+                    let p = b[..8].to_vec();
+                    b = &b[8..];
+                    p
+                }
+                2 => {
+                    let n = varint(&mut b) as usize;
+                    let p = b[..n].to_vec();
+                    b = &b[n..];
+                    p
+                }
+                w => panic!("wire type {w}"),
+            };
+            out.push((field, wire, payload));
+        }
+        out
+    }
+
+    #[test]
+    fn protobuf_follows_the_otlp_schema() {
+        let mut w = WatchMetrics::new("s3://b/p", "h", 7);
+        w.observe(&straggler_run(), 1.0);
+        let pb = w.doc(9).to_protobuf();
+        let top = fields(&pb);
+        assert_eq!(top.len(), 1);
+        assert_eq!((top[0].0, top[0].1), (1, 2), "resource_metrics");
+        let rm = fields(&top[0].2);
+        let resource = fields(&rm.iter().find(|f| f.0 == 1).unwrap().2);
+        let keys: Vec<String> = resource
+            .iter()
+            .map(|kv| String::from_utf8(fields(&kv.2)[0].2.clone()).unwrap())
+            .collect();
+        assert!(keys.contains(&"service.instance.id".to_owned()), "{keys:?}");
+        let sm = fields(&rm.iter().find(|f| f.0 == 2).unwrap().2);
+        let scope = fields(&sm[0].2);
+        assert_eq!(scope[0].2, b"oprobe");
+        let metric = fields(&sm[1].2);
+        assert_eq!(metric[0].2, b"http.client.request.duration");
+        let hist = fields(&metric.iter().find(|f| f.0 == 9).expect("histogram = 9").2);
+        let temporality = hist.iter().find(|f| f.0 == 2).unwrap();
+        assert_eq!(temporality.2[0], 2, "cumulative");
+        let dp = fields(&hist[0].2);
+        let get = |n: u32| dp.iter().find(|f| f.0 == n).unwrap().2.clone();
+        assert_eq!(u64::from_le_bytes(get(2).try_into().unwrap()), 7, "start");
+        assert_eq!(u64::from_le_bytes(get(3).try_into().unwrap()), 9, "time");
+        assert_eq!(
+            u64::from_le_bytes(get(4).try_into().unwrap()),
+            1000,
+            "count"
+        );
+        assert_eq!(
+            get(6).len(),
+            (DURATION_BOUNDS_S.len() + 1) * 8,
+            "packed bucket counts"
+        );
+        assert_eq!(get(7).len(), DURATION_BOUNDS_S.len() * 8, "packed bounds");
+    }
+
+    #[test]
+    fn otlp_headers_follow_the_specification_format() {
+        assert_eq!(
+            parse_headers("api-key=abc%3D%3D, x-tenant = t1 ,bad,=x"),
+            vec![
+                ("api-key".to_owned(), "abc==".to_owned()),
+                ("x-tenant".to_owned(), "t1".to_owned())
+            ]
+        );
+        assert_eq!(
+            parse_headers("authorization=Basic a+b"),
+            vec![("authorization".to_owned(), "Basic a+b".to_owned())]
+        );
+        assert!(parse_headers("").is_empty());
+    }
 
     #[test]
     fn traces_have_op_roots_request_children_and_stage_events() {

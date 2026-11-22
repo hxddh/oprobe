@@ -831,3 +831,135 @@ fn self_update_check_reports_a_newer_release() {
     assert_eq!(v["update_available"], true);
     assert_eq!(v["installed"], false);
 }
+
+/// `oprobe watch` exports (design v5 §6, review C7/C8): OTLP metrics are protobuf with the
+/// `OTEL_EXPORTER_OTLP_HEADERS` headers and no run id; Prometheus series carry the target,
+/// `oprobe_build_info` and HELP text, and `/healthz` answers.
+#[test]
+fn watch_exports_otlp_protobuf_and_labelled_prometheus() {
+    use std::io::{Read, Write};
+    // An OTLP/HTTP collector stub recording each request's head and body.
+    let collector = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let otlp = format!("http://{}", collector.local_addr().unwrap());
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(String, Vec<u8>)>::new()));
+    let rec = seen.clone();
+    std::thread::spawn(move || {
+        for s in collector.incoming() {
+            let Ok(mut s) = s else { continue };
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 65536];
+            // Read the head, then content-length bytes of body.
+            let (head, body) = loop {
+                let n = s.read(&mut chunk).unwrap_or(0);
+                if n == 0 {
+                    break (String::new(), Vec::new());
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&buf[..i]).to_ascii_lowercase();
+                    let len: usize = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .and_then(|v| v.trim().parse().ok())
+                        .unwrap_or(0);
+                    while buf.len() < i + 4 + len {
+                        let n = s.read(&mut chunk).unwrap_or(0);
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                    }
+                    break (head, buf[i + 4..].to_vec());
+                }
+            };
+            let _ =
+                s.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
+            rec.lock().unwrap().push((head, body));
+        }
+    });
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let listen = format!("127.0.0.1:{port}");
+    let env = Env::new();
+    let child = env
+        .cmd()
+        .env(
+            "OTEL_EXPORTER_OTLP_HEADERS",
+            "x-api-key=s3cr%3Dt,x-tenant=t1",
+        )
+        .env_remove("OTEL_EXPORTER_OTLP_PROTOCOL")
+        .env_remove("OTEL_EXPORTER_OTLP_METRICS_PROTOCOL")
+        .args([
+            "watch",
+            "memory://",
+            "--count",
+            "3",
+            "--interval",
+            "1s",
+            "-d",
+            "300ms",
+            "--listen",
+            &listen,
+            "--otlp-endpoint",
+            &otlp,
+            "-q",
+            "-o",
+            "json",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let get = |path: &str| -> Option<String> {
+        let mut s = std::net::TcpStream::connect(&listen).ok()?;
+        write!(s, "GET {path} HTTP/1.1\r\nhost: x\r\n\r\n").ok()?;
+        let mut out = Vec::new();
+        let _ = s.read_to_end(&mut out);
+        (!out.is_empty()).then(|| String::from_utf8_lossy(&out).into_owned())
+    };
+    let mut metrics = None;
+    let mut health = None;
+    for _ in 0..100 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        if let Some(m) =
+            get("/metrics").filter(|m| m.contains("oprobe_probes_total{target=\"memory://\"} 1"))
+        {
+            metrics = Some(m);
+            health = get("/healthz");
+            break;
+        }
+    }
+    let o = child.wait_with_output().unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let m = metrics.expect("no /metrics after the first window");
+    assert!(
+        m.contains("oprobe_build_info{target=\"memory://\",version=\""),
+        "{m}"
+    );
+    assert!(m.contains("# HELP oprobe_window_p99_seconds"), "{m}");
+    assert!(
+        m.contains("oprobe_last_success_timestamp_seconds{target=\"memory://\"}"),
+        "{m}"
+    );
+    let h = health.expect("no /healthz");
+    assert!(h.starts_with("HTTP/1.1 200"), "{h}");
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 3, "one push per window");
+    for (head, body) in seen.iter() {
+        assert!(head.starts_with("post /v1/metrics"), "{head}");
+        assert!(
+            head.contains("content-type: application/x-protobuf"),
+            "{head}"
+        );
+        assert!(head.contains("x-api-key: s3cr=t"), "{head}");
+        assert!(head.contains("x-tenant: t1"), "{head}");
+        let text = String::from_utf8_lossy(body);
+        assert!(text.contains("service.instance.id") && text.contains("memory://"));
+        assert!(
+            !text.contains("oprobe.run.id"),
+            "a run id per window churns series"
+        );
+    }
+}
