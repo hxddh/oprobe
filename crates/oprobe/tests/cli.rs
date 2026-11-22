@@ -952,7 +952,15 @@ fn watch_exports_otlp_protobuf_and_labelled_prometheus() {
             get("/metrics").filter(|m| m.contains("oprobe_probes_total{target=\"memory://\"} 1"))
         {
             metrics = Some(m);
-            health = get("/healthz");
+            // A loaded runner may refuse or drop one connection; ask again (the session runs
+            // for two more windows).
+            for _ in 0..10 {
+                health = get("/healthz");
+                if health.is_some() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
             break;
         }
     }
