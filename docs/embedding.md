@@ -85,8 +85,14 @@ body wrapper that times the transfer and your code's consumption. Nothing is dec
 proxied. For `memory` and `fs` it records one request per backend call.
 
 Without oprobe's workload driving it, requests are not grouped into operations: a profile from
-`oprobe-trace` has requests and their aggregates, and the findings that need operations
-(`small_ranges`, `slow_multipart`) are not derived from it.
+`oprobe-trace` has requests and their aggregates. `oprobe show FILE` marks its report
+`run.source = "trace"` and shows `production trace` instead of a workload. Each request counts
+as one operation there. The findings that requests support are derived: `errors`, `throttling`
+(and `rate_limit`, `key_limit`), `hung_requests`, `tail_stragglers` and `cold_connections`.
+The ones that need operations or a load oprobe varied are not: `small_ranges`,
+`slow_multipart`, `repeated_reads`, `bandwidth_cap` and `client_bound`. A trace has no workload
+to replay, so `oprobe prove` refuses it. Reproduce the traffic with `oprobe run OPERATOR` and
+prove that run.
 
 ## Overhead
 
@@ -123,8 +129,12 @@ oprobe binary and has no semver promise; do not enable it.
 
 ```text
 { "format": "oprobe.trace/6", "oprobe_trace_version": "6.0.0", "created_at": "…",
+  "service": { "scheme": "s3", "name": "my-bucket", "root": "/data/" },
   "snapshot": { … }, "rows": { "ops": [], "reqs": [ … ], "info": { … }, "sampling": { … } } }
 ```
+
+`service` is the OpenDAL service the layer was applied to: its scheme, name (the bucket or
+container) and root, with no options. A bare `snapshot.save` has neither `service` nor `rows`.
 
 Object keys, request IDs and remote addresses can be in it; credentials never are. Treat a
 profile like a log file before you paste it into an issue.

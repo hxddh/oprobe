@@ -48,6 +48,8 @@ async fn a_memory_operator_reports_its_requests() {
     let doc = read_json(&path);
     assert_eq!(doc["format"], "oprobe.trace/6");
     assert_eq!(doc["oprobe_trace_version"], env!("CARGO_PKG_VERSION"));
+    // The service the layer was applied to (no options, no credentials).
+    assert_eq!(doc["service"]["scheme"], "memory");
     let reqs = doc["rows"]["reqs"].as_array().unwrap();
     assert_eq!(reqs.len(), 21);
     assert!(reqs.iter().all(|r| r["op_id"] == 0));

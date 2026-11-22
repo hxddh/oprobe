@@ -154,6 +154,29 @@ impl Report {
         }
     }
 
+    /// A production trace (`run.source = trace`), not a run oprobe drove.
+    pub fn is_trace(&self) -> bool {
+        self.run.source == RunSource::Trace
+    }
+
+    /// What `oprobe show` takes to open this report again: the run id, or a trace's file (its
+    /// `run.label`, the path as it was given).
+    pub fn show_ref(&self) -> &str {
+        match (&self.run.label, self.is_trace()) {
+            (Some(path), true) => path,
+            _ => &self.run.id,
+        }
+    }
+
+    /// The workload in words: the preset, or `production trace`.
+    pub fn workload_label(&self) -> &str {
+        if self.is_trace() {
+            TRACE_WORKLOAD_LABEL
+        } else {
+            &self.workload.preset
+        }
+    }
+
     /// The run stopped early (`run.partial`, or the legacy `run.interrupted` flag).
     pub fn is_partial(&self) -> bool {
         self.run.partial.is_some() || self.run.interrupted
@@ -193,6 +216,10 @@ impl Report {
 pub struct RunInfo {
     /// Run id (`YYYYMMDD-HHMMSS-xxxx`).
     pub id: String,
+    /// Where the traffic came from: a workload oprobe drove (`run`), or a production trace
+    /// an embedded `oprobe-trace` layer recorded (`trace`: no workload, nothing to replay).
+    #[serde(default)]
+    pub source: RunSource,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
     /// The `oprobe prove` this run is a trial of (trials are hidden from `show --list`).
@@ -217,6 +244,30 @@ pub struct RunInfo {
     pub host: HostInfo,
     pub env: EnvInfo,
 }
+
+/// Where a run's traffic came from.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RunSource {
+    /// A workload `oprobe run` drove (replayable: `oprobe prove` can A/B it).
+    #[default]
+    Run,
+    /// A production trace written by the `oprobe-trace` layer (`oprobe.trace/6`): the
+    /// application's own traffic, with no workload to replay.
+    Trace,
+}
+
+impl RunSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Run => "run",
+            Self::Trace => "trace",
+        }
+    }
+}
+
+/// What a production trace's report shows where a run shows its workload preset.
+pub const TRACE_WORKLOAD_LABEL: &str = "production trace";
 
 /// Why a run stopped before its configured end.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

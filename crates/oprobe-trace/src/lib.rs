@@ -100,7 +100,7 @@ pub use snapshot::{
     VerbStats,
 };
 
-internal_use!(file::{TRACE_FORMAT, TraceFile});
+internal_use!(file::{ServiceRecord, TRACE_FORMAT, TraceFile});
 internal_use!(layer::{InProcessObserveLayer, TraceContextLayer});
 internal_use!(log::{DEFAULT_MAX_REQUESTS, TraceLog, TraceRows});
 internal_use!(record::classify_http);
@@ -233,6 +233,7 @@ impl Config {
 pub struct TraceLayer {
     recorder: Arc<Recorder>,
     context: Option<TraceContextLayer>,
+    service: Arc<std::sync::OnceLock<file::ServiceRecord>>,
 }
 
 impl std::fmt::Debug for TraceLayer {
@@ -249,7 +250,13 @@ fn in_process(scheme: &str) -> bool {
 impl opendal_core::raw::Layer for TraceLayer {
     fn apply_service(&self, srv: opendal_core::raw::Servicer) -> opendal_core::raw::Servicer {
         use opendal_core::raw::*;
-        if in_process(srv.info().scheme()) {
+        let info = srv.info();
+        self.service.get_or_init(|| file::ServiceRecord {
+            scheme: info.scheme().to_owned(),
+            name: info.name().to_string(),
+            root: info.root().to_string(),
+        });
+        if in_process(info.scheme()) {
             InProcessObserveLayer::new(self.recorder.clone()).apply_service(srv)
         } else {
             srv
@@ -273,6 +280,7 @@ impl opendal_core::raw::Layer for TraceLayer {
 pub struct Handle {
     recorder: Arc<Recorder>,
     transport_error: Option<Arc<str>>,
+    service: Arc<std::sync::OnceLock<file::ServiceRecord>>,
 }
 
 impl std::fmt::Debug for Handle {
@@ -296,7 +304,7 @@ impl Handle {
     pub fn save(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
         let snapshot = self.snapshot();
         let rows = self.recorder.take_trace();
-        file::write(path.as_ref(), &snapshot, Some(&rows))
+        file::write(path.as_ref(), self.service.get(), &snapshot, Some(&rows))
     }
 
     /// Why HTTP requests are not instrumented (the transport could not be built, for example
@@ -324,7 +332,7 @@ impl Snapshot {
     /// Write this snapshot to `path` as a `.oprobe` profile without request rows (the
     /// aggregates only). [`Handle::save`] also writes the sampled requests.
     pub fn save(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
-        file::write(path.as_ref(), self, None)
+        file::write(path.as_ref(), None, self, None)
     }
 }
 
@@ -339,14 +347,17 @@ pub fn layer(cfg: Config) -> (TraceLayer, Handle) {
             Ok(t) => (Some(TraceContextLayer::new(t)), None),
             Err(e) => (None, Some(Arc::from(format!("{e:#}")))),
         };
+    let service = Arc::new(std::sync::OnceLock::new());
     (
         TraceLayer {
             recorder: recorder.clone(),
             context,
+            service: service.clone(),
         },
         Handle {
             recorder,
             transport_error,
+            service,
         },
     )
 }

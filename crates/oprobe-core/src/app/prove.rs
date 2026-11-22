@@ -1116,6 +1116,17 @@ fn secondary(
 /// `oprobe prove`.
 pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<ProveOutcome> {
     let run = ctx.store().load(&req.run)?;
+    if run.report.is_trace() {
+        return Err(OprobeError::new(
+            ErrorCode::UsageInvalidArgument,
+            format!(
+                "`{}` is a production trace: there is no workload to replay",
+                req.run
+            ),
+        )
+        .with_hint("prove needs a run oprobe drove: `oprobe run OPERATOR`")
+        .into());
+    }
     if run.report.run.parent_id.is_some() {
         return Err(OprobeError::new(
             ErrorCode::UsageInvalidArgument,
