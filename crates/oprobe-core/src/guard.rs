@@ -74,7 +74,9 @@ impl BudgetBreach {
 
     pub fn to_error(&self) -> anyhow::Error {
         OprobeError::new(ErrorCode::SafetyBudgetExceeded, self.message())
-            .with_hint("raise the budget (--max-requests, --max-bytes, --max-duration) or shorten the run")
+            .with_hint(
+                "raise the budget (--max-requests, --max-bytes, --max-duration) or shorten the run",
+            )
             .into()
     }
 }
@@ -261,7 +263,7 @@ pub struct Plan {
 /// Build the plan of a run without touching the target.
 pub fn plan(profile: &Profile, run_prefix: &str, read_only: bool, budgets: &Budgets) -> Plan {
     let w = &profile.workload;
-    let k = &crate::config::Knobs::of(&profile);
+    let k = &crate::config::Knobs::of(profile);
     let ds = w.effective_dataset();
     let mut mix = w.effective_mix();
     if ds.existing_prefix.is_some() {

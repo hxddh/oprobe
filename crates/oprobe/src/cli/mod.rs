@@ -208,7 +208,10 @@ fn install_ctrl_c(cancel: crate::engine::Cancel) {
                 yellow("■")
             );
             if tokio::signal::ctrl_c().await.is_ok() {
-                eprintln!("{} aborted; test data may be left under oprobe-run-*/", red("■"));
+                eprintln!(
+                    "{} aborted; test data may be left under oprobe-run-*/",
+                    red("■")
+                );
                 std::process::exit(EXIT_INTERRUPTED.into());
             }
         }

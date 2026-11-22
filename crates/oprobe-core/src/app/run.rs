@@ -135,9 +135,7 @@ impl CommandOutput for PlanOutput {
         if p.command.is_empty() {
             return Vec::new();
         }
-        vec![
-            crate::output::NextStep::new("run it", p.command.clone()),
-        ]
+        vec![crate::output::NextStep::new("run it", p.command.clone())]
     }
     fn text(&self) -> String {
         let p = &self.plan;
@@ -294,7 +292,17 @@ pub async fn measure(
     } else {
         guard_for(ctx, &profile, &budgets(ctx, safety)?)
     };
-    measure_guarded(ctx, profile, target_name, None, safety, output, guard, &cancel).await
+    measure_guarded(
+        ctx,
+        profile,
+        target_name,
+        None,
+        safety,
+        output,
+        guard,
+        &cancel,
+    )
+    .await
 }
 
 /// [`measure`] under the command's guard: every measurement of a command that measures

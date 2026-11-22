@@ -176,7 +176,10 @@ pub fn spec_profile(ctx: &Ctx, spec: crate::model::RunSpec) -> Result<Profile> {
         .into_iter()
         .filter_map(|(k, v)| {
             if v == REDACTED {
-                known.as_ref().and_then(|o| o.get(&k).cloned()).map(|v| (k, v))
+                known
+                    .as_ref()
+                    .and_then(|o| o.get(&k).cloned())
+                    .map(|v| (k, v))
             } else {
                 Some((k, v))
             }

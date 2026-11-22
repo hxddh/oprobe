@@ -102,7 +102,6 @@ pub fn trial_table(t: &TuneReport) -> String {
 }
 
 impl CommandOutput for TuneOutput {
-
     fn text(&self) -> String {
         let s = &self.tune;
         let mut o = String::new();
@@ -335,7 +334,9 @@ pub async fn run_tune(
         tune,
         wrote: Vec::new(),
         report,
-        session: m.tuned.map(|t| (t.profile.target(), t.winner, t.capability)),
+        session: m
+            .tuned
+            .map(|t| (t.profile.target(), t.winner, t.capability)),
     })
 }
 
@@ -419,7 +420,11 @@ pub async fn tune(ctx: &Ctx, a: TuneRequest, cancel: Cancel) -> Result<TuneOutco
             Some(r) => r.profile_toml.clone(),
             None => {
                 let tp = crate::tune::recommend::portable_profile(&out.report.spec);
-                codegen::profile_toml(&tp, &crate::config::Knobs::of(&out.report.spec.profile), &header)?
+                codegen::profile_toml(
+                    &tp,
+                    &crate::config::Knobs::of(&out.report.spec.profile),
+                    &header,
+                )?
             }
         };
         write_file(p, &text)?;

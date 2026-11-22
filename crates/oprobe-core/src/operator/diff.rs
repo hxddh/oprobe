@@ -74,7 +74,10 @@ fn values(s: &OperatorSpec) -> BTreeMap<String, String> {
     let doc = |v: &dyn erased::Ser| v.toml();
     out.insert("url".into(), toml::Value::String(s.url.clone()).to_string());
     for (k, v) in &s.options {
-        out.insert(format!("options.{k}"), toml::Value::String(v.clone()).to_string());
+        out.insert(
+            format!("options.{k}"),
+            toml::Value::String(v.clone()).to_string(),
+        );
     }
     let l = &s.layers;
     let mut layer = |name: &str, v: Option<toml::Value>| {
@@ -83,7 +86,10 @@ fn values(s: &OperatorSpec) -> BTreeMap<String, String> {
             flatten(&format!("layers.{name}"), &v, &mut out);
         }
     };
-    layer("concurrent_limit", l.concurrent_limit.as_ref().map(|v| doc(v)));
+    layer(
+        "concurrent_limit",
+        l.concurrent_limit.as_ref().map(|v| doc(v)),
+    );
     layer("retry", l.retry.as_ref().map(|v| doc(v)));
     layer("timeout", l.timeout.as_ref().map(|v| doc(v)));
     layer("tail_cut", l.tail_cut.as_ref().map(|v| doc(v)));
@@ -101,8 +107,7 @@ mod erased {
     }
     impl<T: serde::Serialize> Ser for T {
         fn toml(&self) -> toml::Value {
-            toml::Value::try_from(self)
-                .unwrap_or_else(|_| toml::Value::Table(Default::default()))
+            toml::Value::try_from(self).unwrap_or_else(|_| toml::Value::Table(Default::default()))
         }
     }
 }
@@ -162,7 +167,11 @@ fn rust_duration(d: Duration) -> String {
 
 fn rust_size(b: ByteSize) -> String {
     let v = b.0;
-    for (unit, name) in [(1u64 << 30, "1024 * 1024 * 1024"), (1 << 20, "1024 * 1024"), (1 << 10, "1024")] {
+    for (unit, name) in [
+        (1u64 << 30, "1024 * 1024 * 1024"),
+        (1 << 20, "1024 * 1024"),
+        (1 << 10, "1024"),
+    ] {
         if v >= unit && v.is_multiple_of(unit) {
             return if v == unit {
                 name.to_owned()
@@ -227,7 +236,10 @@ pub fn layer_rust(s: &OperatorSpec, name: &str) -> Option<String> {
             if *t == TailCut::default() {
                 "TailCutLayer::new()".to_owned()
             } else {
-                format!("TailCutLayer::builder().percentile({}).build()", t.percentile)
+                format!(
+                    "TailCutLayer::builder().percentile({}).build()",
+                    t.percentile
+                )
             }
         }
         "throttle" => {
@@ -304,7 +316,10 @@ fn rust_diff(a: &OperatorSpec, b: &OperatorSpec, changes: &[Change]) -> String {
             .iter()
             .any(|c| c.path == prefix || c.path.starts_with(&format!("{prefix}.")))
     };
-    for c in changes.iter().filter(|c| c.path.starts_with("options.") || c.path == "url") {
+    for c in changes
+        .iter()
+        .filter(|c| c.path.starts_with("options.") || c.path == "url")
+    {
         let _ = writeln!(
             out,
             "{} {} = {}",
@@ -350,7 +365,12 @@ fn rust_diff(a: &OperatorSpec, b: &OperatorSpec, changes: &[Change]) -> String {
 fn toml_diff(b: &OperatorSpec, changes: &[Change]) -> String {
     use erased::Ser;
     let mut doc = toml::map::Map::new();
-    fn put(doc: &mut toml::map::Map<String, toml::Value>, section: &str, key: &str, v: toml::Value) {
+    fn put(
+        doc: &mut toml::map::Map<String, toml::Value>,
+        section: &str,
+        key: &str,
+        v: toml::Value,
+    ) {
         if let Some(t) = doc
             .entry(section.to_owned())
             .or_insert_with(|| toml::Value::Table(Default::default()))
@@ -368,7 +388,10 @@ fn toml_diff(b: &OperatorSpec, changes: &[Change]) -> String {
             }
             "options" | "read" | "write" | "http" => {
                 let value = match parts[0] {
-                    "options" => b.options.get(parts[1]).map(|v| toml::Value::String(v.clone())),
+                    "options" => b
+                        .options
+                        .get(parts[1])
+                        .map(|v| toml::Value::String(v.clone())),
                     "read" => b.read.toml().get(parts[1]).cloned(),
                     "write" => b.write.toml().get(parts[1]).cloned(),
                     _ => b.http.toml().get(parts[1]).cloned(),
@@ -417,7 +440,10 @@ fn toml_diff(b: &OperatorSpec, changes: &[Change]) -> String {
 fn inline(v: &toml::Value) -> String {
     match v {
         toml::Value::Table(t) => {
-            let items: Vec<String> = t.iter().map(|(k, v)| format!("{k} = {}", inline(v))).collect();
+            let items: Vec<String> = t
+                .iter()
+                .map(|(k, v)| format!("{k} = {}", inline(v)))
+                .collect();
             format!("{{ {} }}", items.join(", "))
         }
         other => other.to_string(),
@@ -464,15 +490,36 @@ mod tests {
         let d = diff(&a, &b);
         let paths: Vec<&str> = d.changes.iter().map(|c| c.path.as_str()).collect();
         assert!(paths.contains(&"layers.concurrent_limit"), "{paths:?}");
-        assert!(!paths.contains(&"layers.concurrent_limit.http"), "{paths:?}");
+        assert!(
+            !paths.contains(&"layers.concurrent_limit.http"),
+            "{paths:?}"
+        );
         assert!(paths.contains(&"layers.retry.jitter"), "{paths:?}");
         assert!(paths.contains(&"read.gap"), "{paths:?}");
-        assert!(d.rust.contains("+ ConcurrentLimitLayer::new(1048576).with_http_concurrent_limit(24)"), "{}", d.rust);
-        assert!(d.rust.contains("~ RetryLayer::new().with_jitter().with_max_times(4)"), "{}", d.rust);
+        assert!(
+            d.rust
+                .contains("+ ConcurrentLimitLayer::new(1048576).with_http_concurrent_limit(24)"),
+            "{}",
+            d.rust
+        );
+        assert!(
+            d.rust
+                .contains("~ RetryLayer::new().with_jitter().with_max_times(4)"),
+            "{}",
+            d.rust
+        );
         assert!(d.rust.contains("- TimeoutLayer"), "{}", d.rust);
-        assert!(d.rust.contains("op.reader_with(path).gap(1024 * 1024)"), "{}", d.rust);
+        assert!(
+            d.rust.contains("op.reader_with(path).gap(1024 * 1024)"),
+            "{}",
+            d.rust
+        );
         assert!(d.toml.contains("[layers]"), "{}", d.toml);
-        assert!(d.toml.contains("concurrent_limit = { http = 24 }"), "{}", d.toml);
+        assert!(
+            d.toml.contains("concurrent_limit = { http = 24 }"),
+            "{}",
+            d.toml
+        );
         assert!(d.toml.contains("timeout = false"), "{}", d.toml);
         assert!(d.toml.contains("[read]\ngap = \"1MiB\""), "{}", d.toml);
         // The TOML applied to `a` gives `b`.
@@ -503,10 +550,16 @@ mod tests {
         .unwrap();
         let r = to_rust(&s);
         assert!(r.contains("Operator::from_uri(\"s3://b/x\")"), "{r}");
-        assert!(r.contains(".layer(ThrottleLayer::new(100 * 1024 * 1024, 16 * 1024 * 1024))"), "{r}");
+        assert!(
+            r.contains(".layer(ThrottleLayer::new(100 * 1024 * 1024, 16 * 1024 * 1024))"),
+            "{r}"
+        );
         assert!(r.contains(".layer(TailCutLayer::new())"), "{r}");
         assert!(r.contains(".layer(RetryLayer::new())"), "{r}");
-        assert!(r.contains("FoyerLayer::new(HybridCacheBuilder::new().memory(256 * 1024 * 1024)"), "{r}");
+        assert!(
+            r.contains("FoyerLayer::new(HybridCacheBuilder::new().memory(256 * 1024 * 1024)"),
+            "{r}"
+        );
         assert!(r.contains("op.reader_with(path).concurrent(4)"), "{r}");
         // Innermost first: throttle before retry, cache last.
         assert!(r.find("ThrottleLayer").unwrap() < r.find("RetryLayer").unwrap());

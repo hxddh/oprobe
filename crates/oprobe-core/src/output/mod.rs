@@ -127,7 +127,6 @@ pub trait CommandOutput: Serialize + JsonSchema {
     fn enveloped(&self) -> bool {
         true
     }
-
 }
 
 /// Plain text that is still a typed result (`{"text": …}` in JSON).
@@ -305,10 +304,7 @@ mod tests {
 
     #[test]
     fn formats_parse() {
-        for (s, f) in [
-            ("text", OutputFormat::Text),
-            ("JSON", OutputFormat::Json),
-        ] {
+        for (s, f) in [("text", OutputFormat::Text), ("JSON", OutputFormat::Json)] {
             assert_eq!(OutputFormat::parse(s), Some(f));
         }
         assert!(OutputFormat::parse("xml").is_none());

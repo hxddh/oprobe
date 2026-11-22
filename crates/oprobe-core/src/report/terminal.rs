@@ -785,7 +785,6 @@ fn render_with(r: &Report, run: Option<&Run>, detail: bool) -> String {
         );
     }
 
-
     if detail && !r.timeline.is_empty() {
         section(&mut out, "TIMELINE  (per second)");
         let rows: Vec<Vec<String>> = r

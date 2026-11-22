@@ -11,11 +11,11 @@ use hyper::client::conn::{http1, http2};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use serde::{Deserialize, Serialize};
 
+use super::config::HttpVersion;
 use super::dial::Dialer;
 use super::proxy::ProxyConfig;
 use super::tls::{TlsClientOptions, build_tls_connector};
 use super::tlsinfo::CertChain;
-use super::config::HttpVersion;
 use crate::Quantiles;
 use crate::recorder::quantiles;
 use crate::rows::TlsRow;

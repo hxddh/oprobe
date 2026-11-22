@@ -59,7 +59,11 @@ pub fn retry_layer(r: &Retry) -> RetryLayer {
 
 /// Wrap `op` (the service, already traced) in the spec's layers. Retries are reported to the
 /// operation's [`OpScope`] (backoff, throttling) when `observe` is set.
-pub async fn apply_layers(mut op: Operator, spec: &OperatorSpec, observe: bool) -> Result<Operator> {
+pub async fn apply_layers(
+    mut op: Operator,
+    spec: &OperatorSpec,
+    observe: bool,
+) -> Result<Operator> {
     let l = &spec.layers;
     if let Some(t) = &l.throttle {
         op = op.layer(ThrottleLayer::new(

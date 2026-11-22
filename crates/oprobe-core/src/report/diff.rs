@@ -99,7 +99,6 @@ impl DiffReport {
         ));
         out
     }
-
 }
 
 /// Wrap `s` at `width` columns, continuation lines indented by `indent` spaces.

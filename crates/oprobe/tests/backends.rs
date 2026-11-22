@@ -14,38 +14,40 @@ use std::time::Duration;
 
 use oprobe::config::*;
 use oprobe::engine::{Cancel, RunOptions, Session};
+use oprobe::operator::OperatorSpec;
 use oprobe::trace::Api;
 use oprobe::util::ByteSize;
 
-fn target(scheme: &str, opts: &[(&str, &str)]) -> TargetSpec {
+/// The operator of a backend: `scheme://BUCKET/oprobe-it` with `opts` (the bucket or container
+/// option names the URL's bucket).
+fn target(scheme: &str, opts: &[(&str, &str)]) -> OperatorSpec {
     let mut options: BTreeMap<String, String> = opts
         .iter()
         .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
         .collect();
-    options.insert("root".into(), "/oprobe-it".into());
-    TargetSpec {
-        url: None,
-        scheme: scheme.into(),
-        options,
-        proxy: Some("none".into()),
-        ..Default::default()
-    }
+    let bucket = options
+        .remove("bucket")
+        .or_else(|| options.remove("container"))
+        .expect("a bucket or container");
+    let mut op = OperatorSpec::from_url(format!("{scheme}://{bucket}/oprobe-it"));
+    op.options = options;
+    op.http.proxy = Some("none".into());
+    op
 }
 
-/// A mixed read/write/stat workload through `mode`; asserts what must hold on any backend.
-async fn exercise(t: TargetSpec, mode: TransportMode, expect_put: Api) {
-    let mut p = Profile::from_target(t);
-    p.workload.preset = Preset::Mixed;
-    let (mut ds, _) = Preset::Mixed.defaults();
+/// A mixed read/write/stat workload; asserts what must hold on any backend.
+async fn exercise(t: OperatorSpec, expect_put: Api) {
+    let mut p = Profile::from_operator(t);
+    p.workload.preset = Preset::SmallFiles;
+    let (mut ds, _) = Preset::SmallFiles.defaults();
     ds.objects = 8;
     ds.object_size = ByteSize::kib(256);
     p.workload.dataset = Some(ds);
-    p.knobs.concurrency = 4;
-    p.knobs.transport = mode;
+    p.workload.concurrency = 4;
     let s = Session::open(p, Cancel::new(), Arc::new(|_| {}))
         .await
         .expect("session opens");
-    let knobs = s.profile.knobs.clone();
+    let knobs = oprobe::config::Knobs::of(&s.profile);
     let snap = s
         .run(
             &knobs,
@@ -84,39 +86,6 @@ async fn exercise(t: TargetSpec, mode: TransportMode, expect_put: Api) {
     assert!(cleanup.verified, "cleanup not verified: {cleanup:?}");
 }
 
-/// The compatibility suite (`oprobe compat`): what the emulator implements passes; checks it
-/// cannot run are skipped; the report is printed for the CI log. Test objects are removed.
-async fn compat(t: TargetSpec) {
-    let t = t.normalized().unwrap();
-    let base = oprobe::engine::operator::base_operator(&t).unwrap();
-    let op = oprobe::engine::operator::preflight_operator(&base, &t).unwrap();
-    let prefix = "oprobe-compat-it/";
-    let mut r = oprobe::compat::run_suite(&op, &t.display(), &t.scheme, prefix).await;
-    r.push(oprobe::compat::checksum_check(&t, prefix).await);
-    let admin = oprobe::engine::operator::admin_operator(&base, &t).unwrap();
-    let cleaned = oprobe::engine::cleanup::delete_prefix(&admin, prefix).await;
-    for c in &r.checks {
-        eprintln!("{:?} {} {}: {}", c.status, c.category, c.id, c.detail);
-    }
-    eprintln!("{}: score {:.0}%", t.scheme, r.score_pct);
-    assert!(cleaned.verified, "{cleaned:?}");
-    // The basics hold everywhere.
-    for id in [
-        "read_after_write",
-        "read_after_overwrite",
-        "range_reads",
-        "delete_idempotent",
-    ] {
-        let c = r.checks.iter().find(|c| c.id == id).unwrap();
-        assert_eq!(
-            c.status,
-            oprobe::compat::CompatStatus::Pass,
-            "{id}: {}",
-            c.detail
-        );
-    }
-}
-
 fn env(name: &str) -> Option<String> {
     let v = std::env::var(name).ok().filter(|v| !v.is_empty());
     if v.is_none() {
@@ -130,23 +99,18 @@ async fn minio_s3() {
     let Some(ep) = env("OPROBE_IT_S3_ENDPOINT") else {
         return;
     };
-    for mode in [TransportMode::Opendal, TransportMode::Microscope] {
-        let t = target(
-            "s3",
-            &[
-                ("endpoint", &ep),
-                ("bucket", "bench"),
-                ("region", "us-east-1"),
-                ("access_key_id", "minioadmin"),
-                ("secret_access_key", "minioadmin"),
-                ("disable_config_load", "true"),
-            ],
-        );
-        if mode == TransportMode::Opendal {
-            compat(t.clone()).await;
-        }
-        exercise(t, mode, Api::PutObject).await;
-    }
+    let t = target(
+        "s3",
+        &[
+            ("endpoint", &ep),
+            ("bucket", "bench"),
+            ("region", "us-east-1"),
+            ("access_key_id", "minioadmin"),
+            ("secret_access_key", "minioadmin"),
+            ("disable_config_load", "true"),
+        ],
+    );
+    exercise(t, Api::PutObject).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -154,22 +118,17 @@ async fn fake_gcs() {
     let Some(ep) = env("OPROBE_IT_GCS_ENDPOINT") else {
         return;
     };
-    for mode in [TransportMode::Opendal, TransportMode::Microscope] {
-        let t = target(
-            "gcs",
-            &[
-                ("endpoint", &ep),
-                ("bucket", "bench"),
-                ("allow_anonymous", "true"),
-                ("disable_vm_metadata", "true"),
-                ("disable_config_load", "true"),
-            ],
-        );
-        if mode == TransportMode::Opendal {
-            compat(t.clone()).await;
-        }
-        exercise(t, mode, Api::PutObject).await;
-    }
+    let t = target(
+        "gcs",
+        &[
+            ("endpoint", &ep),
+            ("bucket", "bench"),
+            ("allow_anonymous", "true"),
+            ("disable_vm_metadata", "true"),
+            ("disable_config_load", "true"),
+        ],
+    );
+    exercise(t, Api::PutObject).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -181,19 +140,14 @@ async fn azurite_blob() {
     ) else {
         return;
     };
-    for mode in [TransportMode::Opendal, TransportMode::Microscope] {
-        let t = target(
-            "azblob",
-            &[
-                ("endpoint", &ep),
-                ("container", "bench"),
-                ("account_name", &account),
-                ("account_key", &key),
-            ],
-        );
-        if mode == TransportMode::Opendal {
-            compat(t.clone()).await;
-        }
-        exercise(t, mode, Api::PutObject).await;
-    }
+    let t = target(
+        "azblob",
+        &[
+            ("endpoint", &ep),
+            ("container", "bench"),
+            ("account_name", &account),
+            ("account_key", &key),
+        ],
+    );
+    exercise(t, Api::PutObject).await;
 }

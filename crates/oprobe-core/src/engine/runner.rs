@@ -214,8 +214,7 @@ impl Session {
         let mut mix = profile.workload.effective_mix();
         // The mix runs on what the service can do.
         let measured_cap = base.info().capability();
-        let mut warnings =
-            super::workloads::adapt_mix(&mut mix, &measured_cap, &target.scheme);
+        let mut warnings = super::workloads::adapt_mix(&mut mix, &measured_cap, &target.scheme);
         if spec.existing_prefix.is_some() && mix.iter().any(|m| m.op.is_write()) {
             mix.retain(|m| !m.op.is_write());
             warnings.push("existing_prefix datasets are read-only: write operations were removed from the mix".into());
@@ -344,7 +343,8 @@ impl Session {
         }
         let mut spec = self.profile.operator.clone();
         knobs.apply_to(&mut spec);
-        let op = measured_operator(&self.base, &self.target, &spec, &recorder, tree.clone()).await?;
+        let op =
+            measured_operator(&self.base, &self.target, &spec, &recorder, tree.clone()).await?;
         let ctx = Arc::new(OpCtx {
             op,
             picker: Picker::new(self.dataset.objects.len(), self.profile.workload.access),
@@ -554,6 +554,9 @@ impl Session {
                                 tree.as_ref(),
                             )
                             .await;
+                            // In-process services (memory://) complete without yielding: let
+                            // the runtime run the sampler and cancellation between operations.
+                            tokio::task::yield_now().await;
                         }
                         // The first worker to stop ends the window; the rest drain.
                         close();
@@ -1133,5 +1136,4 @@ mod tests {
         assert!(c.hint.unwrap_or_default().contains("proto=h2c"));
         assert!(crate::lab::LabProto::parse("h3").is_err());
     }
-
 }

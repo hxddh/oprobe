@@ -48,7 +48,7 @@ pub struct ProfileRequest {
 }
 
 /// Safety rails of commands that touch storage (design §10).
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct Safety {
     /// Print the plan (requests, bytes, objects written/deleted, cost, ETA) and exit
@@ -63,19 +63,6 @@ pub struct Safety {
     pub max_duration: Option<String>,
     /// Name the run prefix after KEY: a retried command reuses and cleans it up
     pub idempotency_key: Option<String>,
-}
-
-impl Default for Safety {
-    fn default() -> Self {
-        Self {
-            dry_run: false,
-            read_only: false,
-            max_requests: None,
-            max_bytes: None,
-            max_duration: None,
-            idempotency_key: None,
-        }
-    }
 }
 
 impl Safety {
@@ -289,11 +276,6 @@ impl Default for FixRequest {
     }
 }
 
-
-
-
-
-
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct LabRequest {
@@ -366,4 +348,3 @@ impl Default for LabRequest {
         }
     }
 }
-

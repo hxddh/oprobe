@@ -45,11 +45,8 @@ impl Defaults {
         if let Some(o) = &self.output
             && crate::output::OutputFormat::parse(o).is_none()
         {
-            return Err(
-                crate::input::invalid(format!("unknown output `{o}`")).with_hint(
-                    crate::input::choices_hint(o, &["text", "json"]),
-                ),
-            );
+            return Err(crate::input::invalid(format!("unknown output `{o}`"))
+                .with_hint(crate::input::choices_hint(o, &["text", "json"])));
         }
         if let Some(c) = &self.color {
             crate::input::choice("color", c, &[("auto", ()), ("always", ()), ("never", ())])?;

@@ -279,13 +279,22 @@ impl App {
 
     /// Measure every operator of `req`, one after another, under one guard (the budgets cover
     /// the whole command); or plan them (`safety.dry_run`).
-    pub async fn run(&self, req: RunRequest, sink: EventSink, cancel: Cancel) -> Result<RunOutcome> {
+    pub async fn run(
+        &self,
+        req: RunRequest,
+        sink: EventSink,
+        cancel: Cancel,
+    ) -> Result<RunOutcome> {
         if req.safety.dry_run {
             return Ok(RunOutcome::Plan(Box::new(self.plan(&req)?)));
         }
         let resolved = self.resolve(&req)?;
         let ctx = self.ctx(&sink);
-        let guard = run::guard_for(&ctx, &resolved[0].profile, &run::budgets(&ctx, &req.safety)?);
+        let guard = run::guard_for(
+            &ctx,
+            &resolved[0].profile,
+            &run::budgets(&ctx, &req.safety)?,
+        );
         let mut runs = Vec::new();
         for r in resolved {
             if cancel.is_cancelled() {

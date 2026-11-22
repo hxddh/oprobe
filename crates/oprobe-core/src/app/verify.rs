@@ -103,7 +103,6 @@ fn outcome_text(o: VerifyOutcome) -> String {
 }
 
 impl CommandOutput for VerifyResult {
-
     fn text(&self) -> String {
         let mut o = format!(
             "{} run {} · {} pair(s) per finding · baseline runs {}\n",
@@ -181,12 +180,10 @@ impl CommandOutput for VerifyResult {
         if let (Some(b), Some(f)) = (self.baseline_run_ids.first(), self.findings.first())
             && let Some(c) = f.candidate_run_ids.first()
         {
-            v.push(
-                NextStep::new(
-                    "compare a baseline replay with a candidate",
-                    format!("oprobe compare {b} {c}"),
-                ),
-            );
+            v.push(NextStep::new(
+                "compare a baseline replay with a candidate",
+                format!("oprobe compare {b} {c}"),
+            ));
         }
         v
     }
@@ -1142,5 +1139,4 @@ mod tests {
         assert!(!resolve);
         assert!(default_expectations("small_objects", 0.001).1);
     }
-
 }

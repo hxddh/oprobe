@@ -36,17 +36,104 @@ impl Out {
     }
 }
 
+/// The operation mixes of the 5.x presets (still available through `--set mix=…`).
+fn legacy(name: &str) -> (DatasetSpec, Vec<OpSpec>) {
+    let ds = |objects, size| DatasetSpec {
+        objects,
+        object_size: size,
+        ..DatasetSpec::default()
+    };
+    let one = |op| vec![OpSpec { weight: 100, op }];
+    match name {
+        "suffix" => (
+            ds(8, ByteSize::mib(16)),
+            one(OpKind::ParquetScan {
+                columns: 4,
+                column_size: ByteSize::kib(512),
+                footer_size: ByteSize::kib(64),
+                suffix: true,
+            }),
+        ),
+        "delete" => (
+            ds(1, ByteSize::kib(4)),
+            vec![
+                OpSpec {
+                    weight: 95,
+                    op: OpKind::Write {
+                        size: ByteSize::kib(4),
+                    },
+                },
+                OpSpec {
+                    weight: 5,
+                    op: OpKind::Delete { batch: 20 },
+                },
+            ],
+        ),
+        "copy" => (ds(16, ByteSize::mib(1)), one(OpKind::Copy)),
+        "list-paged" => (
+            DatasetSpec {
+                objects: 512,
+                object_size: ByteSize::kib(1),
+                partitions: 4,
+                ..DatasetSpec::default()
+            },
+            one(OpKind::ListPaged { limit: 32 }),
+        ),
+        "presign" => (ds(32, ByteSize::kib(256)), one(OpKind::PresignedRead)),
+        "conditional" => (
+            ds(1, ByteSize::kib(16)),
+            one(OpKind::ConditionalWrite {
+                size: ByteSize::kib(16),
+            }),
+        ),
+        "metadata-heavy" => (
+            DatasetSpec {
+                objects: 256,
+                object_size: ByteSize::kib(4),
+                partitions: 8,
+                ..DatasetSpec::default()
+            },
+            vec![
+                OpSpec {
+                    weight: 60,
+                    op: OpKind::Stat,
+                },
+                OpSpec {
+                    weight: 40,
+                    op: OpKind::MetadataWrite {
+                        size: ByteSize::kib(4),
+                        entries: 8,
+                    },
+                },
+            ],
+        ),
+        other => panic!("no legacy workload {other}"),
+    }
+}
+
 async fn run(url: &str, preset: Preset, tweak: impl FnOnce(&mut Profile)) -> Out {
-    let mut p = Profile::from_target(TargetSpec::from_url(url).unwrap());
-    p.workload.preset = preset;
-    let (mut ds, _) = preset.defaults();
+    run_mix(url, preset.defaults(), tweak).await
+}
+
+async fn run_legacy(url: &str, name: &str, tweak: impl FnOnce(&mut Profile)) -> Out {
+    run_mix(url, legacy(name), tweak).await
+}
+
+async fn run_mix(
+    url: &str,
+    (ds, mix): (DatasetSpec, Vec<OpSpec>),
+    tweak: impl FnOnce(&mut Profile),
+) -> Out {
+    let mut p = Profile::from_url(url);
+    p.workload.mix = mix;
+    let mut ds = ds;
     ds.objects = ds.objects.min(32);
     ds.object_size = ByteSize(ds.object_size.0.min(256 * 1024));
     p.workload.dataset = Some(ds);
-    p.knobs.concurrency = 4;
+    p.workload.concurrency = 4;
     tweak(&mut p);
     let s = Session::open(p, Cancel::new(), quiet()).await.unwrap();
-    let knobs = s.profile.knobs.clone();
+    let knobs = oprobe::config::Knobs::of(&s.profile);
     let opts = RunOptions {
         duration: Duration::from_millis(400),
         warmup: Duration::from_millis(50),
@@ -74,8 +161,8 @@ async fn run(url: &str, preset: Preset, tweak: impl FnOnce(&mut Profile)) -> Out
 
 #[tokio::test(flavor = "multi_thread")]
 async fn suffix_footer_reads_skip_the_head() {
-    let plain = run("lab://clean/suffix", Preset::Parquet, |_| {}).await;
-    let suffix = run("lab://clean/suffix", Preset::ParquetSuffix, |_| {}).await;
+    let plain = run("lab://clean/suffix", Preset::RangeReads, |_| {}).await;
+    let suffix = run_legacy("lab://clean/suffix", "suffix", |_| {}).await;
     for o in [&plain, &suffix] {
         assert!(o.failed().is_empty(), "{:?}", o.failed());
         assert!(o.cleaned);
@@ -110,7 +197,7 @@ async fn suffix_footer_reads_skip_the_head() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn batched_deletes_remove_what_writes_created() {
-    let o = run("lab://clean/delete", Preset::Delete, |p| {
+    let o = run_legacy("lab://clean/delete", "delete", |p| {
         p.workload.mix = vec![
             OpSpec {
                 weight: 4,
@@ -134,12 +221,12 @@ async fn batched_deletes_remove_what_writes_created() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn copies_paged_listings_and_presigned_reads() {
-    let o = run("lab://clean/copy", Preset::Copy, |_| {}).await;
+    let o = run_legacy("lab://clean/copy", "copy", |_| {}).await;
     assert!(o.failed().is_empty(), "{:?}", o.failed());
     assert!(o.apis().contains_key("CopyObject"), "{:?}", o.apis());
     assert!(o.cleaned);
 
-    let o = run("lab://clean/paged", Preset::ListPaged, |p| {
+    let o = run_legacy("lab://clean/paged", "list-paged", |p| {
         p.workload.dataset = Some(DatasetSpec {
             objects: 64,
             object_size: ByteSize::kib(1),
@@ -161,7 +248,7 @@ async fn copies_paged_listings_and_presigned_reads() {
         o.ops.len()
     );
 
-    let o = run("lab://clean/presign", Preset::Presign, |_| {}).await;
+    let o = run_legacy("lab://clean/presign", "presign", |_| {}).await;
     assert!(o.failed().is_empty(), "{:?}", o.failed());
     let apis = o.apis();
     assert!(apis.contains_key("PresignedGetObject"), "{apis:?}");
@@ -170,7 +257,7 @@ async fn copies_paged_listings_and_presigned_reads() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn conditional_and_metadata_writes() {
-    let o = run("lab://clean/cond", Preset::Conditional, |_| {}).await;
+    let o = run_legacy("lab://clean/cond", "conditional", |_| {}).await;
     assert!(o.failed().is_empty(), "{:?}", o.failed());
     // Creates, then If-Match overwrites of the same key: few distinct keys.
     let keys: std::collections::BTreeSet<&str> = o.ops.iter().map(|x| x.key.as_str()).collect();
@@ -181,7 +268,7 @@ async fn conditional_and_metadata_writes() {
         o.ops.len()
     );
 
-    let o = run("lab://clean/meta", Preset::MetadataHeavy, |_| {}).await;
+    let o = run_legacy("lab://clean/meta", "metadata-heavy", |_| {}).await;
     assert!(o.failed().is_empty(), "{:?}", o.failed());
     let apis = o.apis();
     assert!(
@@ -193,7 +280,7 @@ async fn conditional_and_metadata_writes() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn unsupported_operations_are_adapted_on_memory() {
-    let o = run("memory://", Preset::Presign, |_| {}).await;
+    let o = run_legacy("memory://", "presign", |_| {}).await;
     assert!(o.failed().is_empty());
     assert!(
         o.warnings.iter().any(|w| w.contains("presign")),
@@ -217,12 +304,6 @@ fn lab_urls_resolve_to_an_in_process_server() {
     assert_eq!(again.endpoint(), t.endpoint());
     let clean = TargetSpec::from_url("lab://").unwrap();
     assert_ne!(clean.endpoint(), t.endpoint());
-    // A profile keeps only the URL.
-    let toml = Profile::from_target(n).to_toml().unwrap();
-    assert!(
-        !toml.contains("endpoint") && !toml.contains("secret"),
-        "{toml}"
-    );
     let e = full(TargetSpec::from_url("lab://nope").unwrap_err());
     assert!(
         e.contains("unknown lab scenario") && e.contains("stragglers"),
@@ -275,30 +356,12 @@ fn every_compiled_service_resolves_from_its_url() {
     );
 }
 
-#[test]
-fn provider_knobs_become_s3_options() {
-    let k = ProviderKnobs {
-        addressing: Addressing::Virtual,
-        checksum: Some("CRC32C".into()),
-        sse: Some("AES256".into()),
-    };
-    let o = k.options("s3").unwrap();
-    assert!(o.contains(&("enable_virtual_host_style", "true".into())));
-    assert!(o.contains(&("checksum_algorithm", "crc32c".into())));
-    assert!(o.contains(&("server_side_encryption", "AES256".into())));
-    assert!(k.options("gcs").is_err());
-    assert!(ProviderKnobs::default().options("gcs").unwrap().is_empty());
-    let bad = ProviderKnobs {
-        checksum: Some("md5".into()),
-        ..Default::default()
-    };
-    assert!(bad.options("s3").is_err());
-}
-
 #[tokio::test(flavor = "multi_thread")]
 async fn checksums_are_sent_and_verified_by_the_lab() {
     let o = run("lab://clean/crc", Preset::SmallFiles, |p| {
-        p.knobs.provider.checksum = Some("crc32c".into());
+        p.operator
+            .options
+            .insert("checksum_algorithm".into(), "crc32c".into());
     })
     .await;
     assert!(o.failed().is_empty(), "{:?}", o.failed());
@@ -308,16 +371,16 @@ async fn checksums_are_sent_and_verified_by_the_lab() {
 #[tokio::test(flavor = "multi_thread")]
 async fn lab_scenarios_inject_their_faults() {
     async fn snap(url: &str, concurrency: usize) -> oprobe::trace::Snapshot {
-        let mut p = Profile::from_target(TargetSpec::from_url(url).unwrap());
+        let mut p = Profile::from_url(url);
         p.workload.preset = Preset::SmallFiles;
         p.workload.dataset = Some(DatasetSpec {
             objects: 8,
             object_size: ByteSize::kib(16),
             ..Default::default()
         });
-        p.knobs.concurrency = concurrency;
+        p.workload.concurrency = concurrency;
         let s = Session::open(p, Cancel::new(), quiet()).await.unwrap();
-        let knobs = s.profile.knobs.clone();
+        let knobs = oprobe::config::Knobs::of(&s.profile);
         let opts = RunOptions {
             duration: Duration::from_millis(600),
             warmup: Duration::ZERO,
@@ -382,7 +445,7 @@ fn a_streamed_run_keeps_memory_flat() {
             "run",
             "memory://",
             "--preset",
-            "metadata",
+            "list-stat",
             "-d",
             "10s",
             "--warmup",
@@ -404,7 +467,7 @@ fn a_streamed_run_keeps_memory_flat() {
     );
     let rss = children_max_rss_mib();
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    let r = v.get("report").unwrap_or(&v);
+    let r = &v["runs"][0]["report"];
     let seen = r["sampling"]["seen_requests_count"].as_u64().unwrap();
     let kept = r["sampling"]["kept_requests_count"].as_u64().unwrap();
     // The file holds every request (up to trace.max_requests), more than memory keeps.

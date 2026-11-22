@@ -2482,7 +2482,9 @@ pub(crate) mod tests {
         p.operator
             .options
             .insert("endpoint".into(), "https://minio.local:9000".into());
-        p.operator.options.insert("region".into(), "eu-west-1".into());
+        p.operator
+            .options
+            .insert("region".into(), "eu-west-1".into());
         p.workload.preset = crate::config::Preset::SmallFiles;
         p.workload.duration = crate::util::HumanDuration::secs(12);
         p.workload.warmup = crate::util::HumanDuration(std::time::Duration::from_millis(500));

@@ -48,7 +48,6 @@ pub struct FixOutput {
 }
 
 impl CommandOutput for FixOutput {
-
     fn text(&self) -> String {
         let r = &self.recommendation;
         let verdict = match r.confirmed {
@@ -178,9 +177,10 @@ pub async fn fix(ctx: &Ctx, a: FixRequest, cancel: Cancel) -> Result<FixOutcome>
         // A stored run's workload and operator, replayed.
         Some(r) => {
             let run = ctx.store().load(r)?;
-            let name = crate::operator::resolve::resolve(&run.report.spec.operator_ref, ctx.config()?)
-                .ok()
-                .and_then(|(_, s)| s.name());
+            let name =
+                crate::operator::resolve::resolve(&run.report.spec.operator_ref, ctx.config()?)
+                    .ok()
+                    .and_then(|(_, s)| s.name());
             let mut p = super::profile::spec_profile(ctx, run.report.spec)?;
             let mut label = p.name.clone();
             crate::model::Overrides::parse(&a.set)?.apply(&mut p, &mut label)?;
@@ -256,8 +256,10 @@ pub async fn fix(ctx: &Ctx, a: FixRequest, cancel: Cancel) -> Result<FixOutcome>
         .context("the tuner produced no recommendation")?;
     // The change relative to the diagnosis run.
     let winner = crate::config::Knobs::of(&tuned.report.spec.profile);
-    rec.overrides =
-        crate::tune::recommend::knob_overrides(&crate::config::Knobs::of(&diag.report.spec.profile), &winner);
+    rec.overrides = crate::tune::recommend::knob_overrides(
+        &crate::config::Knobs::of(&diag.report.spec.profile),
+        &winner,
+    );
     if let Some(r) = tuned
         .tune
         .trials
@@ -401,7 +403,10 @@ pub async fn fix(ctx: &Ctx, a: FixRequest, cancel: Cancel) -> Result<FixOutcome>
             .map(|f| f.code.clone())
             .collect(),
         tune_run_id: tuned.run_id.clone(),
-        profile_patch: knobs_patch(&crate::config::Knobs::of(&diag.report.spec.profile), &winner),
+        profile_patch: knobs_patch(
+            &crate::config::Knobs::of(&diag.report.spec.profile),
+            &winner,
+        ),
         recommendation: rec,
         options,
         verify,

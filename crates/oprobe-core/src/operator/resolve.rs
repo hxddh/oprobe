@@ -37,10 +37,16 @@ pub fn resolve(arg: &str, cfg: &ConfigFile) -> Result<(OperatorSpec, OperatorSou
     let path = Path::new(arg);
     if arg.ends_with(".toml") || path.is_file() {
         if !path.exists() {
-            return Err(invalid(format!("operator file `{arg}` does not exist"))
-                .with_hint("pass a URL (s3://bucket/prefix), an op.toml file or a configured name"));
+            return Err(
+                invalid(format!("operator file `{arg}` does not exist")).with_hint(
+                    "pass a URL (s3://bucket/prefix), an op.toml file or a configured name",
+                ),
+            );
         }
-        return Ok((OperatorSpec::load(path)?, OperatorSource::File(path.to_path_buf())));
+        return Ok((
+            OperatorSpec::load(path)?,
+            OperatorSource::File(path.to_path_buf()),
+        ));
     }
     if let Some(op) = cfg.operator(arg) {
         return Ok((op.clone(), OperatorSource::Config(arg.to_owned())));

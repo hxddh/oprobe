@@ -165,7 +165,9 @@ impl Preset {
         match self {
             Preset::SmallFiles => "small objects: whole-object reads and writes, some stats",
             Preset::LargeObjects => "large objects: multipart writes and full reads",
-            Preset::RangeReads => "range reads: footer + vectored column-chunk ranges (parquet-like)",
+            Preset::RangeReads => {
+                "range reads: footer + vectored column-chunk ranges (parquet-like)"
+            }
             Preset::ListStat => "metadata: list + stat over partitions",
         }
     }
@@ -721,7 +723,11 @@ impl Knobs {
             o.read.gap = optional(self.range_gap);
         }
         if self.max_inflight_requests != cur.max_inflight_requests {
-            let ops = o.layers.concurrent_limit.as_ref().and_then(|c| c.operations);
+            let ops = o
+                .layers
+                .concurrent_limit
+                .as_ref()
+                .and_then(|c| c.operations);
             o.layers.concurrent_limit = match (self.max_inflight_requests, ops) {
                 (0, None) => None,
                 (0, Some(n)) => Some(ConcurrentLimit {
@@ -751,7 +757,11 @@ impl Knobs {
             o.layers.tail_cut = self.tail_cut.then(TailCut::default);
         }
         if self.timeout != cur.timeout {
-            let io = o.layers.timeout.as_ref().map_or(Timeout::default().io, |t| t.io);
+            let io = o
+                .layers
+                .timeout
+                .as_ref()
+                .map_or(Timeout::default().io, |t| t.io);
             o.layers.timeout = Some(Timeout {
                 op: self.timeout,
                 io: io.min(self.timeout),
@@ -759,7 +769,6 @@ impl Knobs {
         }
     }
 }
-
 
 /// Service level objectives. `oprobe run` / `oprobe tune` exit with code 3 when the measured
 /// result breaches them (unless `enforce = false` / `--sla none`); the tuner rejects trials that
@@ -1229,6 +1238,8 @@ pub fn supported_schemes() -> Vec<&'static str> {
 
 /// Service options of `raw` from the OpenDAL service's own `Config::from_uri` (bucket /
 /// container / account / endpoint / root, per service), or `None` for a scheme not compiled in.
+// Without the optional services (`all-services`), only the `http` arm is compiled.
+#[allow(unused_imports, dead_code, unreachable_code)]
 fn uri_options(scheme: &str, raw: &str) -> Result<Option<BTreeMap<String, String>>> {
     use opendal::services::*;
     fn opts<C: opendal::Configurator>(raw: &str) -> Result<BTreeMap<String, String>> {

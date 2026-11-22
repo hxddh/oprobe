@@ -1,42 +1,9 @@
 //! Documentation generated from the code stays in sync with it.
 //!
-//! `docs/cli.md` is the CLI reference generated from the clap definitions and `llms-full.txt`
-//! the docs in one file. Refresh both with `OPROBE_BLESS=1 cargo test --test docs` after
-//! changing a command, a flag or a page.
+//! `llms-full.txt` is the docs in one file. Refresh it with `OPROBE_BLESS=1 cargo test --test
+//! docs` after changing a page.
 
 use std::path::Path;
-
-#[test]
-fn cli_reference_matches_the_code() {
-    let want = oprobe::cli::reference::markdown();
-    let path = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../..")).join("docs/cli.md");
-    if std::env::var_os("OPROBE_BLESS").is_some() {
-        std::fs::write(&path, &want).unwrap();
-        return;
-    }
-    let have = std::fs::read_to_string(&path).unwrap_or_default();
-    assert!(
-        have == want,
-        "docs/cli.md is out of date with the command definitions; regenerate it with \
-         `OPROBE_BLESS=1 cargo test --test docs` (or `oprobe man --markdown > docs/cli.md`)"
-    );
-}
-
-#[test]
-fn cli_reference_documents_every_command() {
-    let md = oprobe::cli::reference::markdown();
-    for c in [
-        "run",
-        "demo",
-        "runs show",
-        "target add",
-        "self-update",
-        "config edit",
-    ] {
-        assert!(md.contains(&format!("## `oprobe {c}`")), "{c}");
-    }
-    assert!(md.contains("--detail"));
-}
 
 /// Pages concatenated into `llms-full.txt` (llmstxt.org), in reading order.
 const LLMS_FULL: &[&str] = &[

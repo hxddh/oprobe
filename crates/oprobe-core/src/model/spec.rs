@@ -403,7 +403,12 @@ const fn key(
 
 /// Every non-operator `--set` key.
 pub const SET_KEYS: &[SetKey] = &[
-    key("concurrency", Section::Workload, &["c"], "concurrent operations"),
+    key(
+        "concurrency",
+        Section::Workload,
+        &["c"],
+        "concurrent operations",
+    ),
     key(
         "preset",
         Section::Workload,
@@ -424,9 +429,24 @@ pub const SET_KEYS: &[SetKey] = &[
         &[],
         "open-loop arrival rate in ops/s (0 = closed loop)",
     ),
-    key("access", Section::Workload, &[], "uniform, zipf:S or hotset:F/P"),
-    key("objects", Section::Workload, &[], "dataset objects to generate"),
-    key("object_size", Section::Workload, &[], "size of each generated object"),
+    key(
+        "access",
+        Section::Workload,
+        &[],
+        "uniform, zipf:S or hotset:F/P",
+    ),
+    key(
+        "objects",
+        Section::Workload,
+        &[],
+        "dataset objects to generate",
+    ),
+    key(
+        "object_size",
+        Section::Workload,
+        &[],
+        "size of each generated object",
+    ),
     key(
         "partitions",
         Section::Workload,
@@ -445,9 +465,24 @@ pub const SET_KEYS: &[SetKey] = &[
         &["persist_dataset"],
         "keep the generated dataset (on/off)",
     ),
-    key("verify", Section::Workload, &[], "CRC32C verification (on/off)"),
-    key("cleanup", Section::Workload, &[], "delete test data at the end (on/off)"),
-    key("seed", Section::Workload, &[], "dataset and key-choice seed"),
+    key(
+        "verify",
+        Section::Workload,
+        &[],
+        "CRC32C verification (on/off)",
+    ),
+    key(
+        "cleanup",
+        Section::Workload,
+        &[],
+        "delete test data at the end (on/off)",
+    ),
+    key(
+        "seed",
+        Section::Workload,
+        &[],
+        "dataset and key-choice seed",
+    ),
     key(
         "arrivals",
         Section::Workload,
@@ -466,7 +501,12 @@ pub const SET_KEYS: &[SetKey] = &[
         &[],
         "operation mix as JSON ([{\"op\":\"read\",\"weight\":1}]), or empty for the preset's",
     ),
-    key("max_error_rate", Section::Sla, &[], "SLA: max share of failed operations"),
+    key(
+        "max_error_rate",
+        Section::Sla,
+        &[],
+        "SLA: max share of failed operations",
+    ),
     key(
         "max_throttle_rate",
         Section::Sla,
@@ -594,11 +634,7 @@ fn apply_one(
         "access" => p.workload.access = input::access(v)?,
         "arrivals" => p.workload.arrivals = v.parse()?,
         "shape" => {
-            p.workload.shape = if none_word(v) {
-                None
-            } else {
-                Some(v.parse()?)
-            };
+            p.workload.shape = if none_word(v) { None } else { Some(v.parse()?) };
         }
         "objects" => {
             let n = usize_of(1)?;
@@ -884,7 +920,10 @@ mod tests {
         let c = s.command();
         assert!(c.contains("--set layers.tail_cut=on"), "{c}");
         assert!(c.contains("--set options.region=eu-west-1"), "{c}");
-        assert!(c.contains("-c 24") && c.contains("--set warmup=500ms"), "{c}");
+        assert!(
+            c.contains("-c 24") && c.contains("--set warmup=500ms"),
+            "{c}"
+        );
     }
 
     #[test]
@@ -910,20 +949,32 @@ mod tests {
         let op_only = s.with(&Overrides::new().with_set("read.gap", "1MiB"));
         assert_eq!(op_only.workload_hash(), s.workload_hash());
         assert_ne!(op_only.hash(), s.hash());
-        let relabel = s.with(&Overrides::new().with_set("label", "x").with_set("seed", "9"));
+        let relabel = s.with(
+            &Overrides::new()
+                .with_set("label", "x")
+                .with_set("seed", "9"),
+        );
         assert_eq!(relabel.hash(), s.hash());
         assert_eq!(relabel.seed, 9);
         assert!(n.command().contains("-c 48"), "{}", n.command());
         assert_eq!(
-            RunSpec::prove_command("20261121-101010-abcd", &Overrides::new().with_set("tail_cut", "on")),
+            RunSpec::prove_command(
+                "20261121-101010-abcd",
+                &Overrides::new().with_set("tail_cut", "on")
+            ),
             "oprobe prove 20261121-101010-abcd --with layers.tail_cut=on"
         );
     }
 
     #[test]
     fn aliases_map_to_operator_paths() {
-        let o = Overrides::parse(&["http=h2", "max-inflight=4", "cache=128MiB", "io_concurrency=3"])
-            .unwrap();
+        let o = Overrides::parse(&[
+            "http=h2",
+            "max-inflight=4",
+            "cache=128MiB",
+            "io_concurrency=3",
+        ])
+        .unwrap();
         assert_eq!(o.operator["http.version"], "h2");
         assert_eq!(o.operator["layers.concurrent_limit.http"], "4");
         assert_eq!(o.operator["read.concurrent"], "3");

@@ -7,18 +7,24 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use oprobe::analysis::capacity::{self, DEFAULT_HEADROOM_RATIO, Window};
-use oprobe::config::{Preset, Profile, TargetSpec};
+use oprobe::config::{Preset, Profile};
 use oprobe::engine::Cancel;
 use oprobe::engine::measure::{Rails, Request, measure};
 use oprobe::guard::Budgets;
 use oprobe::util::HumanDuration;
 
 async fn lab_run(scenario: &str, preset: Preset, workers: usize) -> oprobe::model::Run {
-    let mut p = Profile::from_target(TargetSpec::from_url(&format!("lab://{scenario}")).unwrap());
+    let mut p = Profile::from_url(&format!("lab://{scenario}"));
     p.workload.preset = preset;
+    if preset == Preset::RangeReads {
+        // The parquet lab models 4 parallel column reads per scan, ranges 64 KiB apart kept
+        // apart.
+        p.operator.read.concurrent = Some(4);
+        p.operator.read.gap = Some(oprobe::util::ByteSize::kib(64));
+    }
     p.workload.duration = HumanDuration(Duration::from_millis(2500));
     p.workload.warmup = HumanDuration(Duration::from_millis(300));
-    p.knobs.concurrency = workers;
+    p.workload.concurrency = workers;
     let rails = Rails::new(&p, false, None, Budgets::default()).unwrap();
     let req = Request::new(p, rails, Cancel::new(), Arc::new(|_| {}));
     measure(req).await.unwrap().run
@@ -53,13 +59,13 @@ async fn demo_lab_ceiling_brackets_its_limit_and_small_files_fit_twenty_workers(
     let again = capacity::estimate(&run.reqs, &run.ops, Window::measured(r.run.window_s));
     assert_eq!(again.inflight_ceiling, c.inflight_ceiling);
     // The spec replays the same workload and target.
-    assert_eq!(r.spec.target_ref, "lab://demo");
+    assert_eq!(r.spec.operator_ref, "lab://demo");
     assert_eq!(r.spec.target_id().unwrap().to_string(), "lab://demo/");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn parquet_lab_ops_peak_at_four_requests_in_flight() {
-    let run = lab_run("parquet", Preset::Parquet, 8).await;
+    let run = lab_run("parquet", Preset::RangeReads, 8).await;
     let c = &run.report.capacity;
     let s = c.per_op;
     assert_eq!(s.peak_inflight_per_op, 4.0, "{s:?}");

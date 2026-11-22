@@ -774,7 +774,6 @@ impl Comparison {
         }
         o
     }
-
 }
 
 #[cfg(test)]

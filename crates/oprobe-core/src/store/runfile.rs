@@ -29,8 +29,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::errors::ErrorCode;
 use crate::model::{
-    OpBreakdownUs, OpRow, RUN_FORMAT, Report, ReqDetail, ReqRow, Run, RunSpec, TcpRow,
-    TlsRow, WireProtocol,
+    OpBreakdownUs, OpRow, RUN_FORMAT, Report, ReqDetail, ReqRow, Run, RunSpec, TcpRow, TlsRow,
+    WireProtocol,
 };
 
 const ZSTD_LEVEL: i32 = 3;

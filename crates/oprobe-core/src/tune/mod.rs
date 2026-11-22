@@ -1044,7 +1044,11 @@ pub async fn tune(
             "read cache not tried: under uniform access its benefit depends on the real working set, not the generated test dataset".into(),
         );
     }
-    if p.target().endpoint().is_some_and(|e| e.starts_with("https")) && t.budget_left() {
+    if p.target()
+        .endpoint()
+        .is_some_and(|e| e.starts_with("https"))
+        && t.budget_left()
+    {
         let mut k = t.trials[current].knobs.clone();
         k.http_version = match k.http_version {
             HttpVersion::H2 => HttpVersion::Auto,

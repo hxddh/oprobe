@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use oprobe::analysis::capacity::DEFAULT_HEADROOM_RATIO;
-use oprobe::config::{Preset, Profile, TargetSpec};
+use oprobe::config::{Preset, Profile};
 use oprobe::engine::Cancel;
 use oprobe::engine::measure::{Rails, Request, measure};
 use oprobe::guard::Budgets;
@@ -40,7 +40,7 @@ fn suggested(findings: &[Finding]) -> Vec<(String, u64)> {
         .iter()
         .filter_map(|f| {
             let v = f.verification.as_ref()?;
-            let c = v.overrides.knobs.get("concurrency")?.parse().ok()?;
+            let c = v.overrides.workload.get("concurrency")?.parse().ok()?;
             Some((f.code.clone(), c))
         })
         .collect()
@@ -59,9 +59,15 @@ async fn converges(scenario: &str, preset: Preset, workers: usize) {
     let dir = tempfile::tempdir().unwrap();
     let store = RunStore::new(dir.path().join("runs"));
     let target = format!("lab://{scenario}");
-    let mut p = Profile::from_target(TargetSpec::from_url(&target).unwrap());
+    let mut p = Profile::from_url(&target);
     p.workload.preset = preset;
-    p.knobs.concurrency = workers;
+    p.workload.concurrency = workers;
+    if preset == Preset::RangeReads {
+        // The parquet lab models 4 parallel column reads per scan, ranges 64 KiB apart kept
+        // apart.
+        p.operator.read.concurrent = Some(4);
+        p.operator.read.gap = Some(oprobe::util::ByteSize::kib(64));
+    }
     short(&mut p);
     let first = measure_profile(p, &target, &store).await;
     let r = &first.report;
@@ -81,7 +87,11 @@ async fn converges(scenario: &str, preset: Preset, workers: usize) {
         .find(|f| f.code == "throttling")
         .expect("throttling finding");
     let v = thr.verification.as_ref().expect("throttling verification");
-    assert_eq!(v.overrides.knobs["concurrency"], safe.to_string(), "{v:#?}");
+    assert_eq!(
+        v.overrides.workload["concurrency"],
+        safe.to_string(),
+        "{v:#?}"
+    );
     assert!(
         v.expect
             .iter()
@@ -96,7 +106,7 @@ async fn converges(scenario: &str, preset: Preset, workers: usize) {
         let mut p = spec.with(&overrides).resolved_profile();
         // A spec keeps nothing of the ephemeral lab server; resolve the target again, as
         // `oprobe run --from` does.
-        p.target = TargetSpec::from_url(&target).unwrap();
+        p.operator.url = target.clone();
         short(&mut p);
         let run = measure_profile(p, &target, &store).await;
         let fr = &run.report;
@@ -126,5 +136,5 @@ async fn demo_findings_converge_under_the_ceiling() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn parquet_findings_converge_under_the_ceiling() {
-    converges("parquet", Preset::Parquet, 16).await;
+    converges("parquet", Preset::RangeReads, 16).await;
 }

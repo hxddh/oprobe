@@ -154,25 +154,23 @@ pub fn menu(m: &MenuInputs<'_>) -> Vec<FixOption> {
         m.reference.feasible && m.reference.throttled_request_ratio <= m.max_throttle_ratio;
     let mut out: Vec<FixOption> = picks
         .into_iter()
-        .map(|(t, label)| {
-            FixOption {
-                label: label.to_owned(),
-                overrides: (m.overrides_of)(t),
-                trial_id: t.id as u64,
-                goodput: g(t),
-                goodput_unit: if m.use_bytes {
-                    "mib_per_s"
-                } else {
-                    "ops_per_s"
-                }
-                .into(),
-                goodput_delta_ratio: crate::util::ratio(g(t), g(m.reference)) - 1.0,
-                p99_ms: t.p99_ms,
-                throttled_request_ratio: t.throttled_request_ratio,
-                feasible: within(&t),
-                recommended: false,
-                verify: OptionVerify::NotVerified,
+        .map(|(t, label)| FixOption {
+            label: label.to_owned(),
+            overrides: (m.overrides_of)(t),
+            trial_id: t.id as u64,
+            goodput: g(t),
+            goodput_unit: if m.use_bytes {
+                "mib_per_s"
+            } else {
+                "ops_per_s"
             }
+            .into(),
+            goodput_delta_ratio: crate::util::ratio(g(t), g(m.reference)) - 1.0,
+            p99_ms: t.p99_ms,
+            throttled_request_ratio: t.throttled_request_ratio,
+            feasible: within(&t),
+            recommended: false,
+            verify: OptionVerify::NotVerified,
         })
         .collect();
     // Never recommend a change predicted (measured) worse on the objective than a diagnosis

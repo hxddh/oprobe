@@ -442,8 +442,9 @@ impl OperatorSpec {
 
     /// Parse an `op.toml` document (validated).
     pub fn parse(toml_text: &str) -> Result<Self, OprobeError> {
-        let s: Self = toml::from_str(toml_text)
-            .map_err(|e| OprobeError::new(ErrorCode::ConfigInvalid, format!("invalid operator: {e}")))?;
+        let s: Self = toml::from_str(toml_text).map_err(|e| {
+            OprobeError::new(ErrorCode::ConfigInvalid, format!("invalid operator: {e}"))
+        })?;
         s.validate()?;
         Ok(s)
     }
@@ -451,13 +452,13 @@ impl OperatorSpec {
     /// Load an operator file (`op.toml`).
     pub fn load(path: &Path) -> Result<Self, OprobeError> {
         let raw = std::fs::read_to_string(path).map_err(|e| {
-            invalid(format!("cannot read operator file `{}`: {e}", path.display()))
+            invalid(format!(
+                "cannot read operator file `{}`: {e}",
+                path.display()
+            ))
         })?;
         Self::parse(&raw).map_err(|e| {
-            let mut o = OprobeError::new(
-                e.code,
-                format!("`{}`: {}", path.display(), e.message),
-            );
+            let mut o = OprobeError::new(e.code, format!("`{}`: {}", path.display(), e.message));
             o.hint = e.hint;
             o
         })
@@ -525,7 +526,10 @@ impl OperatorSpec {
                 return Err(invalid(format!("{what} must be at least 1")));
             }
         }
-        for (what, v) in [("read.chunk", self.read.chunk), ("write.chunk", self.write.chunk)] {
+        for (what, v) in [
+            ("read.chunk", self.read.chunk),
+            ("write.chunk", self.write.chunk),
+        ] {
             if v.is_some_and(|c| c.0 < 4096) {
                 return Err(invalid(format!("{what} must be at least 4KiB")));
             }
@@ -580,10 +584,20 @@ impl OperatorSpec {
             }
         }
         let next: Self = doc.try_into().map_err(|e: toml::de::Error| {
-            invalid(format!("invalid value `{value}` for {path}: {}", e.message()))
+            let why = e.message();
+            let why = if why.contains("untagged enum") {
+                "not a value of this field's type"
+            } else {
+                why
+            };
+            invalid(format!("invalid value `{value}` for {path}: {why}")).with_hint(
+                "counts and percentiles are numbers, sizes like 8MiB, durations like 50ms, \
+                 switches on/off; a layer itself is on or off",
+            )
         })?;
-        next.validate()
-            .map_err(|e| OprobeError::new(e.code, format!("--set {path}={value}: {}", e.message)))?;
+        next.validate().map_err(|e| {
+            OprobeError::new(e.code, format!("--set {path}={value}: {}", e.message))
+        })?;
         *self = next;
         Ok(())
     }
@@ -695,7 +709,10 @@ keep_alive = true
         let r = s.layers.retry.as_ref().unwrap();
         assert!(r.jitter);
         assert_eq!(r.min_delay.get(), Duration::from_millis(50));
-        assert_eq!(s.layers.timeout.as_ref().unwrap().op.get(), Duration::from_secs(30));
+        assert_eq!(
+            s.layers.timeout.as_ref().unwrap().op.get(),
+            Duration::from_secs(30)
+        );
         assert_eq!(s.layers.tail_cut.as_ref().unwrap().percentile, 95);
         assert_eq!(s.layers.cache.as_ref().unwrap().memory, ByteSize::mib(256));
         assert_eq!(s.read.gap, Some(ByteSize::kib(64)));
@@ -719,8 +736,9 @@ keep_alive = true
         off.layers.retry = None;
         assert!(off.to_toml().contains("retry = false"), "{}", off.to_toml());
         assert_eq!(OperatorSpec::parse(&off.to_toml()).unwrap(), off);
-        let on = OperatorSpec::parse("url = \"memory://\"\n[layers]\ntail_cut = true\nretry = false\n")
-            .unwrap();
+        let on =
+            OperatorSpec::parse("url = \"memory://\"\n[layers]\ntail_cut = true\nretry = false\n")
+                .unwrap();
         assert_eq!(on.layers.tail_cut, Some(TailCut::default()));
         assert!(on.layers.retry.is_none());
     }
@@ -730,7 +748,10 @@ keep_alive = true
         let mut s = OperatorSpec::from_url("s3://b/x");
         s.set("layers.retry.max_times", "5").unwrap();
         assert_eq!(s.retries(), 5);
-        assert_eq!(s.layers.retry.as_ref().unwrap().max_delay, HumanDuration::secs(60));
+        assert_eq!(
+            s.layers.retry.as_ref().unwrap().max_delay,
+            HumanDuration::secs(60)
+        );
         s.set("read.gap", "1MiB").unwrap();
         assert_eq!(s.read.gap, Some(ByteSize::mib(1)));
         s.set("layers.cache.memory", "1GiB").unwrap();

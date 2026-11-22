@@ -94,7 +94,10 @@ fn code(o: &Output) -> i32 {
 }
 
 fn error_code(o: &Output) -> String {
-    json(o)["error"]["code"].as_str().unwrap_or_default().to_owned()
+    json(o)["error"]["code"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned()
 }
 
 fn root() -> PathBuf {
@@ -235,15 +238,26 @@ fn operators_come_from_urls_files_and_the_config() {
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     let r = &json(&o)["runs"][0]["report"];
     assert_eq!(r["spec"]["operator_ref"], "mem");
-    assert_eq!(r["spec"]["profile"]["operator"]["layers"]["cache"]["memory"], "8MiB");
+    assert_eq!(
+        r["spec"]["profile"]["operator"]["layers"]["cache"]["memory"],
+        "8MiB"
+    );
     // An unknown name, a mistyped path, a missing file.
     let o = env.run(&run_args(&["men"], &["-o", "json"]));
     assert_eq!(code(&o), 2);
     assert_eq!(error_code(&o), "usage.unknown_target");
     assert!(json(&o)["error"]["hint"].as_str().unwrap().contains("mem"));
-    let o = env.run(&run_args(&["memory://"], &["--set", "layers.retry.max_tims=5", "-o", "json"]));
+    let o = env.run(&run_args(
+        &["memory://"],
+        &["--set", "layers.retry.max_tims=5", "-o", "json"],
+    ));
     assert_eq!(code(&o), 2);
-    assert!(json(&o)["error"]["hint"].as_str().unwrap().contains("layers.retry.max_times"));
+    assert!(
+        json(&o)["error"]["hint"]
+            .as_str()
+            .unwrap()
+            .contains("layers.retry.max_times")
+    );
     let o = env.run(&run_args(&["nope.toml"], &["-o", "json"]));
     assert_eq!(code(&o), 2, "{}", stdout(&o));
 }
@@ -296,12 +310,20 @@ fn errors_are_classified_with_exit_codes() {
     assert!(o.stdout.is_empty() && stderr(&o).contains("OPERATOR"));
     let o = env.run(&["run", "memory://", "--preset", "nope", "-o", "json"]);
     assert_eq!(code(&o), 2);
-    assert!(json(&o)["error"]["hint"].as_str().unwrap().contains("small-files"));
+    assert!(
+        json(&o)["error"]["hint"]
+            .as_str()
+            .unwrap()
+            .contains("small-files")
+    );
     // Text errors: message, hint and code on stderr.
     let o = env.run(&["show", "nothing"]);
     assert_eq!(code(&o), 2);
     let e = stderr(&o);
-    assert!(e.contains("error:") && e.contains("(usage.unknown_run)"), "{e}");
+    assert!(
+        e.contains("error:") && e.contains("(usage.unknown_run)"),
+        "{e}"
+    );
 }
 
 #[test]
@@ -313,13 +335,25 @@ fn safety_rails_refuse_or_stop_runs() {
     assert_eq!(error_code(&o), "safety.read_only");
     // A request budget stops the run (exit 4) and keeps the partial run.
     let o = env.run(&[
-        "run", "memory://", "-d", "5s", "--warmup", "0s", "--max-requests", "50", "-o", "json",
+        "run",
+        "memory://",
+        "-d",
+        "5s",
+        "--warmup",
+        "0s",
+        "--max-requests",
+        "50",
+        "-o",
+        "json",
     ]);
     assert_eq!(code(&o), 4, "{}", stdout(&o));
     assert_eq!(error_code(&o), "safety.budget_exceeded");
     // --dry-run: the plan of every operator; nothing is written.
     let env = Env::new();
-    let o = env.run(&run_args(&["memory://", "lab://clean"], &["--dry-run", "-o", "json"]));
+    let o = env.run(&run_args(
+        &["memory://", "lab://clean"],
+        &["--dry-run", "-o", "json"],
+    ));
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     let v = json(&o);
     assert_eq!(v["plans"].as_array().unwrap().len(), 2);
@@ -334,27 +368,66 @@ fn demo_is_run_lab_demo() {
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     let r = &json(&o)["runs"][0]["report"];
     assert_eq!(r["spec"]["operator_ref"], "lab://demo");
-    assert!(r["resilience"]["throttled_responses_count"].as_u64().unwrap() > 0, "{r}");
+    assert!(
+        r["resilience"]["throttled_responses_count"]
+            .as_u64()
+            .unwrap()
+            > 0,
+        "{r}"
+    );
 }
 
 #[test]
 fn prove_judges_a_change_and_renders_the_diff() {
     let env = Env::new();
     let o = env.run(&[
-        "run", "lab://demo", "-d", "1s", "--warmup", "0s", "--preset", "small-files", "-q",
+        "run",
+        "lab://demo",
+        "-d",
+        "1s",
+        "--warmup",
+        "0s",
+        "--preset",
+        "small-files",
+        "-q",
     ]);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
-    let o = env.run(&["prove", "last", "--with", "layers.tail_cut=on", "-o", "json", "-q"]);
+    let o = env.run(&[
+        "prove",
+        "last",
+        "--with",
+        "layers.tail_cut=on",
+        "-o",
+        "json",
+        "-q",
+    ]);
     assert!(matches!(code(&o), 0 | 3), "{}\n{}", stdout(&o), stderr(&o));
     let v = json(&o);
     validate("prove", &v);
     assert!(["improved", "worse", "inconclusive"].contains(&v["verdict"].as_str().unwrap()));
     assert_eq!(v["change"]["operator"]["layers.tail_cut"], "on");
-    assert!(v["diff"]["rust"].as_str().unwrap().contains("+ TailCutLayer::new()"), "{v}");
-    assert!(v["diff"]["toml"].as_str().unwrap().contains("tail_cut"), "{v}");
+    assert!(
+        v["diff"]["rust"]
+            .as_str()
+            .unwrap()
+            .contains("+ TailCutLayer::new()"),
+        "{v}"
+    );
+    assert!(
+        v["diff"]["toml"].as_str().unwrap().contains("tail_cut"),
+        "{v}"
+    );
     assert!(v["pairs_count"].as_u64().unwrap() >= 2);
     // A dry run plans the replays and sends nothing.
-    let o = env.run(&["prove", "last", "--with", "read.gap=1MiB", "--dry-run", "-o", "json"]);
+    let o = env.run(&[
+        "prove",
+        "last",
+        "--with",
+        "read.gap=1MiB",
+        "--dry-run",
+        "-o",
+        "json",
+    ]);
     assert_eq!(code(&o), 2, "prove has no --dry-run flag: {}", stdout(&o));
 }
 

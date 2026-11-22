@@ -61,21 +61,18 @@ jobs:
       - run: cargo nextest run --workspace --locked --all-targets --no-fail-fast
       # nextest does not run doctests.
       - run: cargo test --workspace --locked --doc
-      - name: CLI smoke (demo, run → compare gate, HTML report)
+      - name: CLI smoke (demo, run, show, prove)
         shell: bash
         env:
           OPROBE_DATA_DIR: ${{ runner.temp }}/oprobe-data
         run: |
           cargo build --locked
           o=target/debug/oprobe
-          $o demo --duration 2s
-          $o run memory:// --preset mixed -d 2s --warmup 500ms -q --label base
-          $o run memory:// --preset mixed -d 2s --warmup 500ms -q --label cand
-          $o compare base cand --max-p99-increase-pct 400 --max-p50-increase-pct 400 --max-throughput-drop-pct 80 --markdown gate.md
-          $o runs show cand -o html > report.html
-          grep -q '<svg class="viz"' report.html
-          $o runs list
-          cat gate.md >> "$GITHUB_STEP_SUMMARY"
+          $o demo -d 2s
+          $o run memory:// lab://clean --preset small-files -d 2s -q
+          $o show --list
+          $o show last --by stage
+          $o prove last --with layers.tail_cut=on -q || test $? -eq 3
 
   deny:
     name: cargo deny (advisories, licenses, bans, sources)
@@ -252,8 +249,8 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
-      # Every crate of the workspace, in dependency order (oprobe-trace, oprobe-core, oprobe).
-      - run: cargo package --workspace --locked
+      # oprobe-trace is the published crate (oprobe-core is internal: publish = false).
+      - run: cargo package -p oprobe-trace --locked
       - name: cargo install (debug profile; release builds run on main and nightly)
         run: cargo install --locked --debug --path crates/oprobe --root "$RUNNER_TEMP/inst" && "$RUNNER_TEMP/inst/bin/oprobe" --version
 

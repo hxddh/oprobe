@@ -9,11 +9,11 @@ use opendal::Operator;
 use opendal::layers::{RetryLayer, TimeoutLayer};
 
 use crate::config::TargetSpec;
-use crate::operator::{HttpOptions, OperatorSpec};
 use crate::errors::{ErrorCode, OprobeError};
 use crate::net::{FidelityTransport, TlsClientOptions, TransportConfig};
-use crate::trace::layer::{InProcessObserveLayer, TraceContextLayer};
+use crate::operator::{HttpOptions, OperatorSpec};
 use crate::trace::Recorder;
+use crate::trace::layer::{InProcessObserveLayer, TraceContextLayer};
 
 static REGISTRY: Once = Once::new();
 
@@ -220,7 +220,7 @@ pub fn proxy_setting(target: &TargetSpec) -> Option<Option<String>> {
 }
 
 /// The instrumented `HttpFetch`'s settings: the operator's HTTP options and the target's TLS
-/// and proxy. The HTTP in-flight cap is the operator's `ConcurrentLimitLayer`, not the transport.
+/// and proxy (no in-flight cap: see [`measured_operator`]).
 pub fn transport_config(target: &TargetSpec, http: &HttpOptions) -> Result<TransportConfig> {
     Ok(TransportConfig {
         http: http.version,
@@ -260,14 +260,32 @@ pub async fn measured_operator(
     if !target.is_network() {
         op = op.layer(InProcessObserveLayer::new(recorder.clone()));
     }
-    op = op.layer(trace_layer(target, &spec.http, Some(recorder.clone()))?);
+    // `layers.concurrent_limit.http` is enforced by the instrumented transport itself, with the
+    // semantics of `ConcurrentLimitLayer::with_http_concurrent_limit` (a permit per request,
+    // held until its body is consumed), so the wait is measured as the request's queue stage;
+    // the layer would wait outside the transport, where it cannot be attributed.
+    let https = target.endpoint().is_none_or(|e| e.starts_with("https"));
+    let mut cfg = transport_config(target, &spec.http)?;
+    cfg.max_inflight = spec.http_limit();
+    op = op.layer(TraceContextLayer::new(FidelityTransport::new(
+        cfg,
+        https,
+        Some(recorder.clone()),
+    )?));
     // Async call stacks: operations are registered as await-tree roots by the runner, OpenDAL
     // sub-tasks by `ScopePropagatingExecutor`, and the transports add zero-allocation spans per
     // request. OpenDAL's `AwaitTreeLayer` is not used: it wraps every call and read chunk and
     // cost ~14% throughput on small requests (examples/overhead.rs).
     let _ = tree_registry;
     recorder.set_cache_enabled(spec.layers.cache.is_some());
-    crate::operator::build::apply_layers(op, spec, true).await
+    let mut layers = spec.clone();
+    if let Some(c) = &mut layers.layers.concurrent_limit {
+        c.http = None;
+        if c.operations.is_none() {
+            layers.layers.concurrent_limit = None;
+        }
+    }
+    crate::operator::build::apply_layers(op, &layers, true).await
 }
 
 /// Fail fast when the endpoint cannot be reached at all (connection refused, unknown host):
@@ -338,7 +356,11 @@ pub async fn check_reachable_with(
 /// With `--http h2`, check the target speaks HTTP/2 before anything else (design v5 §3, M6):
 /// an endpoint without h2c (plain HTTP) or without `h2` in ALPN (TLS) would otherwise fail
 /// every request of the run.
-pub async fn check_protocol(base: &Operator, target: &TargetSpec, http: &HttpOptions) -> Result<()> {
+pub async fn check_protocol(
+    base: &Operator,
+    target: &TargetSpec,
+    http: &HttpOptions,
+) -> Result<()> {
     if http.version != crate::net::HttpVersion::H2 || !target.is_network() {
         return Ok(());
     }

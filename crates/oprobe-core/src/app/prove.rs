@@ -203,9 +203,11 @@ pub async fn prove(ctx: &Ctx, a: ProveRequest, cancel: Cancel) -> Result<ProveOu
         }
     };
     if hyp.overrides.is_empty() {
-        return Err(OprobeError::new(ErrorCode::UsageInvalidArgument, "nothing to prove")
-            .with_hint("pass --with PATH=VALUE")
-            .into());
+        return Err(
+            OprobeError::new(ErrorCode::UsageInvalidArgument, "nothing to prove")
+                .with_hint("pass --with PATH=VALUE")
+                .into(),
+        );
     }
     let base = run.report.spec.profile.operator.clone();
     let mut changed = run.report.spec.resolved_profile();
@@ -221,7 +223,9 @@ pub async fn prove(ctx: &Ctx, a: ProveRequest, cancel: Cancel) -> Result<ProveOu
             "up to {runs} replays of this plan: interleaved baseline and candidate runs of {}",
             hyp.overrides.summary()
         ));
-        return Ok(ProveOutcome::Plan(Box::new(super::run::PlanOutput { plan })));
+        return Ok(ProveOutcome::Plan(Box::new(super::run::PlanOutput {
+            plan,
+        })));
     }
     let mut safety = a.safety.clone();
     if safety.max_duration.is_none() {

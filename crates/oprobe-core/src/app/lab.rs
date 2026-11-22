@@ -21,9 +21,10 @@ pub struct LabOutput {
 
 impl CommandOutput for LabOutput {
     fn next(&self) -> Vec<crate::output::NextStep> {
-        vec![
-            crate::output::NextStep::new("measure the lab", self.try_command.clone()),
-        ]
+        vec![crate::output::NextStep::new(
+            "measure the lab",
+            self.try_command.clone(),
+        )]
     }
 
     fn text(&self) -> String {
@@ -101,4 +102,3 @@ pub async fn lab(a: LabRequest) -> Result<crate::lab::LabHandle> {
     let lab = LabServer::spawn_with(&a.bind, cfg, limits).await?;
     Ok(lab)
 }
-

@@ -12,10 +12,10 @@ pub mod tcpinfo;
 pub mod tls;
 pub mod tlsinfo;
 
+pub use config::{HttpVersion, TransportConfig};
 pub use fidelity::FidelityTransport;
 pub use proxy::ProxyConfig;
 pub use tls::TlsClientOptions;
-pub use config::{HttpVersion, TransportConfig};
 
 /// `Retry-After` in milliseconds: delay-seconds (RFC 9110 allows only integers; fractions are
 /// accepted) or an HTTP-date, relative to now. Nonsense (negative, non-finite, unparsable)

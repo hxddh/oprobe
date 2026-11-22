@@ -25,15 +25,11 @@ pub struct RunList {
 impl CommandOutput for RunList {
     fn next(&self) -> Vec<crate::output::NextStep> {
         match self.runs.first() {
-            Some(r) => vec![
-                crate::app::next::show(&r.id),
-            ],
-            None => vec![
-                crate::output::NextStep::new(
-                    "measure a local lab target",
-                    "oprobe run lab://demo -d 5s",
-                ),
-            ],
+            Some(r) => vec![crate::app::next::show(&r.id)],
+            None => vec![crate::output::NextStep::new(
+                "measure a local lab target",
+                "oprobe run lab://demo -d 5s",
+            )],
         }
     }
 
@@ -97,7 +93,6 @@ impl CommandOutput for RunList {
         o += &dim("show one: oprobe show RUN  (id, prefix, last, last~1, label)\n");
         o
     }
-
 }
 
 fn cut(s: &str, max: usize) -> String {
@@ -217,7 +212,9 @@ impl ByTable {
             0,
         );
         if !self.stages.is_empty() {
-            let q = |s: &crate::analysis::slice::StageQ| format!("{}/{}", fmt_ms(s.p50_ms), fmt_ms(s.p99_ms));
+            let q = |s: &crate::analysis::slice::StageQ| {
+                format!("{}/{}", fmt_ms(s.p50_ms), fmt_ms(s.p99_ms))
+            };
             let rows: Vec<Vec<String>> = self
                 .stages
                 .iter()
@@ -236,7 +233,9 @@ impl ByTable {
                 .collect();
             o += "\n";
             o += &crate::report::style::table(
-                &["api", "requests", "queue", "connect", "send", "ttfb", "body", "total"],
+                &[
+                    "api", "requests", "queue", "connect", "send", "ttfb", "body", "total",
+                ],
                 &rows,
                 0,
             );
