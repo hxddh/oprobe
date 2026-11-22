@@ -60,7 +60,8 @@ pub async fn run(operators: Vec<String>, f: RunFlags, ctx: &Ctx) -> Result<u8> {
 pub fn show(a: ShowArgs, ctx: &Ctx) -> Result<u8> {
     let app = ctx.app();
     if a.list {
-        return ctx.out.finish(&app.list()?.truncate(a.limit));
+        let list = if a.all { app.list_all()? } else { app.list()? };
+        return ctx.out.finish(&list.truncate(a.limit));
     }
     if !a.rm.is_empty() {
         let refs: Vec<RunRef> = a.rm.into_iter().map(RunRef).collect();
@@ -100,7 +101,9 @@ pub async fn prove(a: ProveArgs, ctx: &Ctx) -> Result<u8> {
             .map(|v| crate::input::share("--max-throttle", v))
             .transpose()?,
         budget: a.budget,
-        ..Default::default()
+        trial_duration: a.trial,
+        pairs: a.pairs.unwrap_or(crate::config::prove_defaults::MAX_PAIRS),
+        safety: safety(&a.safety),
     };
     match ctx.app().prove(req, ctx.out.clone(), ctrl_c()).await? {
         ProveOutcome::Plan(p) => ctx.out.finish(p.as_ref()),

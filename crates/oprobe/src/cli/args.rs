@@ -225,12 +225,20 @@ pub struct ProveArgs {
     /// What the change is judged on
     #[arg(long, value_enum, default_value_t = ObjectiveArg::Goodput)]
     pub objective: ObjectiveArg,
-    /// Share of throttled requests a change may cause, e.g. 0.1% or 0.001
+    /// Share of throttled requests a sized value may cause, e.g. 0.1% or 0.001 (default 0.1%)
     #[arg(long, value_name = "RATIO", value_parser = parse::share, allow_hyphen_values = true)]
     pub max_throttle: Option<String>,
     /// Wall-time budget of the whole proof, e.g. 5m
     #[arg(long, value_name = "DURATION", value_parser = parse::duration, allow_hyphen_values = true)]
     pub budget: Option<String>,
+    /// Measurement window of one trial (default 2s)
+    #[arg(long, value_name = "DURATION", value_parser = parse::duration, hide = true)]
+    pub trial: Option<String>,
+    /// A/B pairs at most (default 6)
+    #[arg(long, value_name = "N", value_parser = at_least::<2>, hide = true)]
+    pub pairs: Option<usize>,
+    #[command(flatten)]
+    pub safety: SafetyArgs,
 }
 
 /// `--by`.
@@ -246,9 +254,12 @@ pub struct ShowArgs {
     /// The run: id, id prefix, `last`, `last~N`, label, or a .oprobe / report .json file
     #[arg(value_name = "RUN|FILE")]
     pub run: Option<String>,
-    /// List the stored runs
+    /// List the stored runs (prove trials are hidden; --all lists them)
     #[arg(long, conflicts_with_all = ["rm", "detail", "by"])]
     pub list: bool,
+    /// With --list: also the trial runs of every prove
+    #[arg(long, requires = "list")]
+    pub all: bool,
     /// Delete stored runs
     #[arg(long, value_name = "RUN", num_args = 1.., conflicts_with_all = ["detail", "by"])]
     pub rm: Vec<String>,

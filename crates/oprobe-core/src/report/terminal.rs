@@ -1,4 +1,5 @@
-//! Human-oriented terminal rendering of reports.
+//! The full profile of `oprobe show` (`--detail` adds every section), rendered from the
+//! presentation model ([`super::view`]).
 
 use std::fmt::Write as _;
 
@@ -31,35 +32,28 @@ pub fn severity_icon(s: Severity) -> String {
     }
 }
 
-/// Render the time-share bars (used by run reports and the TUI-less live view).
-pub fn time_share_lines(r: &Report) -> String {
-    let time = super::view::TimeView::of(r);
+/// Bars of stage shares: `(key, title, ratio)`, the largest highlighted.
+fn share_bars(rows: &[super::view::StageShare]) -> String {
     let mut out = String::new();
-    let rows: Vec<(&str, f64, &str)> = time
-        .stages
-        .iter()
-        .map(|s| (s.name, s.ratio, s.description))
-        .collect();
-    let max = rows.iter().map(|r| r.1).fold(0.0, f64::max).max(1e-9);
-    for (name, v, desc) in rows {
-        if v < 0.0005 && name != "server" {
+    let max = rows.iter().map(|r| r.ratio).fold(0.0, f64::max).max(1e-9);
+    for r in rows {
+        if r.ratio < 0.0005 && r.key != "server" {
             continue;
         }
-        let b = bar(v / max, 20);
-        let colored = if (v - max).abs() < 1e-12 {
+        let b = bar(r.ratio / max, 20);
+        let colored = if (r.ratio - max).abs() < 1e-12 {
             magenta(&b)
         } else {
             dim(&b)
         };
-        let _ = writeln!(
-            out,
-            "  {:<9} {colored} {:>5.1}%  {}",
-            name,
-            v * 100.0,
-            dim(desc)
-        );
+        let _ = writeln!(out, "  {:<14} {colored} {:>5.1}%", r.title, r.ratio * 100.0);
     }
     out
+}
+
+/// The time-share bars of every operation.
+pub fn time_share_lines(r: &Report) -> String {
+    share_bars(&super::view::TimeView::of(r, None).stages)
 }
 
 /// `✓ met (failed ops ≤ 1%, no corrupted data)` or `✖ BREACHED: …`.
@@ -458,7 +452,7 @@ fn render_with(r: &Report, run: Option<&Run>, detail: bool) -> String {
             if let Some(rate) = r.workload.rate_per_s {
                 format!("open loop {rate} ops/s")
             } else {
-                format!("{} workers", r.knobs.requested.concurrency_count)
+                format!("{} workers", r.spec.profile.workload.concurrency)
             },
             r.run.started_at
         ))
@@ -570,17 +564,18 @@ fn render_with(r: &Report, run: Option<&Run>, detail: bool) -> String {
         );
     }
 
-    if !r.findings.is_empty() {
+    let view = super::view::ProfileView::of(r, run);
+    if !view.findings.is_empty() {
         section(&mut out, "FINDINGS");
-        for f in super::view::findings_by_severity(r) {
+        for f in &view.findings {
             let _ = writeln!(
                 out,
                 "  {} {} {}",
                 severity_icon(f.severity),
-                bold(f.cause),
+                bold(&f.cause),
                 dim(&format!("[{}]", f.code))
             );
-            for l in wrap_text(f.evidence, WIDTH - 4) {
+            for l in wrap_text(&f.evidence, WIDTH - 4) {
                 let _ = writeln!(out, "    {}", dim(&l));
             }
             if detail {
@@ -593,11 +588,17 @@ fn render_with(r: &Report, run: Option<&Run>, detail: bool) -> String {
                     let _ = writeln!(out, "    {}", dim(&l));
                 }
             }
-            for (i, l) in wrap_text(f.advice, WIDTH - 6).iter().enumerate() {
+            for (i, l) in wrap_text(
+                &format!("remedy: {} — {}", f.remedy_label(), f.remedy),
+                WIDTH - 6,
+            )
+            .iter()
+            .enumerate()
+            {
                 let _ = writeln!(out, "    {} {l}", if i == 0 { "→" } else { " " });
             }
-            if let Some(rerun) = f.rerun {
-                let _ = writeln!(out, "    {} {}", dim("try:"), rerun);
+            if let Some(next) = &f.next {
+                let _ = writeln!(out, "    {} {next}", dim("next:"));
             }
         }
     }
@@ -606,7 +607,11 @@ fn render_with(r: &Report, run: Option<&Run>, detail: bool) -> String {
         &mut out,
         "WHERE THE TIME GOES  (share of operation wall time)",
     );
-    out.push_str(&time_share_lines(r));
+    out.push_str(&share_bars(&view.time.stages));
+    if !view.time.tail.is_empty() {
+        let _ = writeln!(out, "  {}", dim("the slowest 1% of operations:"));
+        out.push_str(&share_bars(&view.time.tail));
+    }
     if detail {
         let p = &r.stages.request_p99;
         let _ = writeln!(
@@ -834,18 +839,36 @@ fn render_with(r: &Report, run: Option<&Run>, detail: bool) -> String {
     }
 
     if detail {
-        section(&mut out, "CONFIGURATION");
-        let k = &r.knobs.requested;
-        let _ = writeln!(out, "  knobs      {}", k.to_knobs().summary());
-        let e = &r.knobs.effective;
-        if e.write_chunk_clamped() {
-            let _ = writeln!(
-                out,
-                "  effective  write chunk {} (requested {})",
-                fmt_bytes(e.write_chunk_bytes),
-                fmt_bytes(k.chunk_bytes)
-            );
+        section(
+            &mut out,
+            "OPERATOR  (layers innermost first; ← the findings they remedy)",
+        );
+        let _ = writeln!(out, "  {}", view.operator.url);
+        for l in &view.operator.layers {
+            let mark = if l.remedy_of.is_empty() {
+                String::new()
+            } else {
+                yellow(&format!("  ← {}", l.remedy_of.join(", ")))
+            };
+            match &l.rust {
+                Some(code) => {
+                    let _ = writeln!(out, "  {} {code}{mark}", green("●"));
+                }
+                None => {
+                    let _ = writeln!(out, "  {} {}{mark}", dim("○"), dim(&l.name));
+                }
+            }
         }
+        let opts: Vec<String> = view
+            .operator
+            .options
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect();
+        for l in wrap_text(&opts.join(" · "), WIDTH - 4) {
+            let _ = writeln!(out, "  {}", dim(&l));
+        }
+        section(&mut out, "CONFIGURATION");
         let w = &r.workload;
         let _ = writeln!(
             out,
@@ -882,7 +905,7 @@ fn render_with(r: &Report, run: Option<&Run>, detail: bool) -> String {
     if !cl.enabled {
         let _ = writeln!(
             out,
-            "  {} test data kept under {} (remove with `oprobe cleanup`)",
+            "  {} test data kept under {} (cleanup was off)",
             yellow("●"),
             cl.prefix
         );
@@ -900,7 +923,7 @@ fn render_with(r: &Report, run: Option<&Run>, detail: bool) -> String {
     } else {
         let _ = writeln!(
             out,
-            "  {} {} objects remain under {}{} — run `oprobe cleanup`",
+            "  {} {} objects remain under {}{} — remove them with your storage tools",
             red("✖"),
             cl.remaining,
             cl.prefix,
@@ -919,7 +942,7 @@ fn render_with(r: &Report, run: Option<&Run>, detail: bool) -> String {
             out,
             "\n{}",
             dim(&format!(
-                "more: oprobe runs show {} --detail · -o html > report.html",
+                "more: oprobe show {0} --detail · oprobe show {0} --by stage|api|conn",
                 r.run.id
             ))
         );
@@ -964,7 +987,7 @@ mod tests {
     fn full_report_fits_80_columns_and_detail_adds_sections() {
         set(false);
         let mut run = super::super::fixture::run();
-        run.report.findings[0].advice = "word ".repeat(60);
+        run.report.findings[0].remedy.text = "word ".repeat(60);
         run.report.target.display = format!("s3://{}", "b".repeat(120));
         let text = render_run(&run);
         for l in text.lines() {
@@ -977,13 +1000,20 @@ mod tests {
             "OPERATIONS",
             "SLOWEST OPERATION",
             "CLEANUP",
-            "try: oprobe run --from 20261120-143005-a1b2 --set concurrency=16",
+            "next: oprobe prove 20261120-143005-a1b2 throttling",
+            "remedy: layers.concurrent_limit.http",
             "--detail",
         ] {
             assert!(text.contains(s), "{s}\n{text}");
         }
         let detail = render_run_with(&run, true);
-        for s in ["TIMELINE", "CONFIGURATION", "SLOWEST OPERATIONS", "p99.9"] {
+        for s in [
+            "TIMELINE",
+            "CONFIGURATION",
+            "OPERATOR",
+            "SLOWEST OPERATIONS",
+            "p99.9",
+        ] {
             assert!(detail.contains(s), "{s}");
         }
     }
