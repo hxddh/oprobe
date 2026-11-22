@@ -26,12 +26,6 @@
    the Homebrew tap, the Scoop bucket and winget follow, each when its secret is set (below). A
    job whose secret is missing ends with a warning, not a failure.
 
-### 6.0.0
-
-The tree carries `6.0.0-dev` until the release. For 6.0.0: steps 1–5 with `6.0.0`, and in
-`CHANGELOG.md` turn `## v6.0.0 — unreleased` into `## v6.0.0 — <date>`. The release-notes step
-matches `## v6.0.0` (with or without the `v`), so the heading keeps working.
-
 ## Crates
 
 | Crate | Published | Promise |

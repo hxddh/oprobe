@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
-## v6.0.0 — unreleased
+## v6.0.0 — 2026-11-22
 
 Design [v6](docs/design/v6.md), from the review in [v6-review.md](docs/design/v6-review.md).
 oprobe 6 is **a profiler for OpenDAL operators**: one workbench (the app and four CLI commands),
