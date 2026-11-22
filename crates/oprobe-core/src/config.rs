@@ -997,11 +997,22 @@ pub struct CostSpec {
     /// Custom price overrides (USD).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pricing: Option<crate::analysis::cost::Pricing>,
+    /// Storage class the data is kept in: `standard` (default), `infrequent` or `archive`
+    /// (the provider's equivalents: S3 Standard-IA / Glacier IR, GCS Nearline / Archive, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_class: Option<String>,
+    /// Fraction of downloaded bytes that cross regions (inter-region transfer).
+    #[serde(default, skip_serializing_if = "crate::config::is_zero_f64")]
+    pub inter_region_fraction: f64,
 }
 
 fn default_monthly_ops() -> f64 {
     100_000_000.0
 }
+pub(crate) fn is_zero_f64(v: &f64) -> bool {
+    *v == 0.0
+}
+
 fn default_stored_gib() -> f64 {
     1024.0
 }
@@ -1014,6 +1025,8 @@ impl Default for CostSpec {
             stored_gib: default_stored_gib(),
             egress_fraction: 0.0,
             pricing: None,
+            storage_class: None,
+            inter_region_fraction: 0.0,
         }
     }
 }

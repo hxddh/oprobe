@@ -14,9 +14,9 @@
 use super::Trial;
 
 /// Length scale of the kernel in normalised units.
-const LENGTH: f64 = 0.18;
+const LENGTH: f64 = 0.08;
 /// Measurement noise (as a share of the output variance).
-const NOISE: f64 = 0.05;
+const NOISE: f64 = 0.02;
 /// Throttle ratios are clamped to this floor before the logit (0 throttled ≈ 1e-4).
 const THR_FLOOR: f64 = 1e-4;
 
