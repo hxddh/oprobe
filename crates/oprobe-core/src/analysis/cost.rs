@@ -207,28 +207,83 @@ pub fn presets() -> Vec<(&'static str, Pricing)> {
             let full = match k {
                 "aws-s3" => with(base, &|p| {
                     p.egress_free_gb = 100.0;
-                    p.egress_tiers = tiers(&[(10.0 * TB, 0.09), (50.0 * TB, 0.085), (150.0 * TB, 0.07), (f64::MAX, 0.05)]);
+                    p.egress_tiers = tiers(&[
+                        (10.0 * TB, 0.09),
+                        (50.0 * TB, 0.085),
+                        (150.0 * TB, 0.07),
+                        (f64::MAX, 0.05),
+                    ]);
                     p.inter_region_per_gb = 0.02;
                     p.storage_classes = vec![
-                        class("infrequent", "S3 Standard-IA", 0.0125, 10.0, 1.0, 0.01, 128, 30.0),
-                        class("archive", "S3 Glacier Instant Retrieval", 0.004, 20.0, 10.0, 0.03, 128, 90.0),
+                        class(
+                            "infrequent",
+                            "S3 Standard-IA",
+                            0.0125,
+                            10.0,
+                            1.0,
+                            0.01,
+                            128,
+                            30.0,
+                        ),
+                        class(
+                            "archive",
+                            "S3 Glacier Instant Retrieval",
+                            0.004,
+                            20.0,
+                            10.0,
+                            0.03,
+                            128,
+                            90.0,
+                        ),
                     ];
                 }),
                 "gcs" => with(base, &|p| {
                     p.egress_tiers = tiers(&[(TB, 0.12), (10.0 * TB, 0.11), (f64::MAX, 0.08)]);
                     p.inter_region_per_gb = 0.02;
                     p.storage_classes = vec![
-                        class("infrequent", "GCS Nearline", 0.010, 10.0, 1.0, 0.01, 0, 30.0),
+                        class(
+                            "infrequent",
+                            "GCS Nearline",
+                            0.010,
+                            10.0,
+                            1.0,
+                            0.01,
+                            0,
+                            30.0,
+                        ),
                         class("archive", "GCS Archive", 0.0012, 50.0, 50.0, 0.05, 0, 365.0),
                     ];
                 }),
                 "azure-blob" => with(base, &|p| {
                     p.egress_free_gb = 100.0;
-                    p.egress_tiers = tiers(&[(10.0 * TB, 0.087), (50.0 * TB, 0.083), (150.0 * TB, 0.07), (f64::MAX, 0.05)]);
+                    p.egress_tiers = tiers(&[
+                        (10.0 * TB, 0.087),
+                        (50.0 * TB, 0.083),
+                        (150.0 * TB, 0.07),
+                        (f64::MAX, 0.05),
+                    ]);
                     p.inter_region_per_gb = 0.02;
                     p.storage_classes = vec![
-                        class("infrequent", "Azure Blob Cool", 0.010, 10.0, 1.0, 0.01, 0, 30.0),
-                        class("archive", "Azure Blob Cold", 0.0036, 18.0, 10.0, 0.03, 0, 90.0),
+                        class(
+                            "infrequent",
+                            "Azure Blob Cool",
+                            0.010,
+                            10.0,
+                            1.0,
+                            0.01,
+                            0,
+                            30.0,
+                        ),
+                        class(
+                            "archive",
+                            "Azure Blob Cold",
+                            0.0036,
+                            18.0,
+                            10.0,
+                            0.03,
+                            0,
+                            90.0,
+                        ),
                     ];
                 }),
                 "cloudflare-r2" => with(base, &|p| {
@@ -614,10 +669,15 @@ fn price(key: &str, p: &Pricing, u: &PerOpUsage, spec: &CostSpec) -> ProviderCos
         + billed(u.read_requests) * read_pm
         + billed(u.delete_requests) * p.delete_per_million;
     let stored_gb = spec.stored_gib;
-    let monthly_egress_gb = u.download_bytes * spec.monthly_ops.max(0.0) / BILLING_GB * spec.egress_fraction;
+    let monthly_egress_gb =
+        u.download_bytes * spec.monthly_ops.max(0.0) / BILLING_GB * spec.egress_fraction;
     let egress = egress_usd(p, monthly_egress_gb, stored_gb);
     let egress_per_m = if m > 0.0 { egress / m } else { 0.0 };
-    let avg_req_price = if total_req > 0.0 { req_per_m / total_req } else { 0.0 };
+    let avg_req_price = if total_req > 0.0 {
+        req_per_m / total_req
+    } else {
+        0.0
+    };
     // Minimum billable size: small objects are billed as the minimum.
     let object_bytes = if u.read_requests > 0.0 && u.download_bytes > 0.0 {
         u.download_bytes / u.read_requests
@@ -638,8 +698,8 @@ fn price(key: &str, p: &Pricing, u: &PerOpUsage, spec: &CostSpec) -> ProviderCos
     });
     // Deletes before the minimum duration: on average half of it is still billed.
     let early_delete_usd = class.map_or(0.0, |c| {
-        let deleted_gb = u.delete_requests * spec.monthly_ops.max(0.0) * object_bytes.max(1.0)
-            / BILLING_GB;
+        let deleted_gb =
+            u.delete_requests * spec.monthly_ops.max(0.0) * object_bytes.max(1.0) / BILLING_GB;
         deleted_gb * c.storage_gb_month * size_factor * (c.min_duration_days / 30.0) * 0.5
     });
     let inter_region_usd = u.download_bytes * spec.monthly_ops.max(0.0) / BILLING_GB
@@ -984,7 +1044,11 @@ mod bill_tests {
         let b = price("aws-s3", &p, &u, &ia);
         assert_eq!(a.storage_class, "standard");
         assert_eq!(b.storage_class, "S3 Standard-IA");
-        assert!((b.storage_usd - 100.0 * 0.0125 * 8.0).abs() < 1e-9, "{}", b.storage_usd);
+        assert!(
+            (b.storage_usd - 100.0 * 0.0125 * 8.0).abs() < 1e-9,
+            "{}",
+            b.storage_usd
+        );
         assert!(b.retrieval_usd > 0.0 && a.retrieval_usd == 0.0);
         assert!(b.requests_usd > a.requests_usd);
     }
@@ -992,7 +1056,10 @@ mod bill_tests {
     #[test]
     fn throttled_responses_are_not_billed_where_the_provider_does_not() {
         let mut p = preset("aws-s3").unwrap();
-        assert!(p.bills_server_errors, "billed unless a table says otherwise");
+        assert!(
+            p.bills_server_errors,
+            "billed unless a table says otherwise"
+        );
         p.bills_server_errors = false;
         let u = PerOpUsage {
             read_requests: 2.0,

@@ -27,8 +27,8 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::analysis::capacity::{self, Capacity, Window};
-use crate::analysis::hypothesis::HypothesisKind as capacity_kind;
 use crate::analysis::cost::cost_report;
+use crate::analysis::hypothesis::HypothesisKind as capacity_kind;
 use crate::config::{Access, Knobs, OpKind, TransportMode};
 use crate::engine::{RunOptions, Session};
 use crate::model::{OpRow, ReqRow};
@@ -927,14 +927,21 @@ pub async fn tune(
             .filter(|c| (1..=max_c).contains(c))
             .collect();
         // Stay near what was measured: far outside it the surrogate knows nothing.
-        let measured_max = t.trials.iter().map(|x| x.knobs.concurrency).max().unwrap_or(1);
+        let measured_max = t
+            .trials
+            .iter()
+            .map(|x| x.knobs.concurrency)
+            .max()
+            .unwrap_or(1);
         cands.retain(|c| *c * 2 <= measured_max * 3);
         cands.dedup();
         let pick = cands
             .into_iter()
             .filter(|c| {
                 !t.trials.iter().any(|x| {
-                    x.knobs.concurrency == *c && x.rate_per_s == cur.rate_per_s && x.knobs.io_concurrency == cur.knobs.io_concurrency
+                    x.knobs.concurrency == *c
+                        && x.rate_per_s == cur.rate_per_s
+                        && x.knobs.io_concurrency == cur.knobs.io_concurrency
                 })
             })
             .filter_map(|c| {

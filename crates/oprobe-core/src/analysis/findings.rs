@@ -12,8 +12,8 @@
 use std::collections::{BTreeMap, HashMap};
 
 use super::capacity::Capacity;
-use super::hypothesis::HypothesisKind;
 use super::diagnosis::{self, Severity};
+use super::hypothesis::HypothesisKind;
 use super::outliers::{Selection, attribute, dominant_stage};
 use super::simulate::{self, Prediction, TailCutReplay, TailCutSetup};
 use super::stats::{median, quantile_us_ms};
@@ -630,7 +630,10 @@ fn throttling(c: &Ctx) -> Option<Finding> {
         }
     }
     let headroom = super::capacity::DEFAULT_HEADROOM_RATIO;
-    let inflight = matches!(sel.as_ref().map(|h| h.kind), Some(HypothesisKind::InflightLimit) | None);
+    let inflight = matches!(
+        sel.as_ref().map(|h| h.kind),
+        Some(HypothesisKind::InflightLimit) | None
+    );
     match (cap.inflight_ceiling, c.safe) {
         (Some(ce), Some(safe)) if inflight => {
             // Always fewer workers than now: the run throttled at its own concurrency.
@@ -688,7 +691,11 @@ fn throttling(c: &Ctx) -> Option<Finding> {
                 let share = h.params.key_share_ratio.unwrap_or(0.0);
                 vals.push(("key_limit_requests_per_s", rps));
                 vals.push(("hot_key_share_ratio", share));
-                let reads = c.r.workload.mix.iter().any(|m| m.op == "read" || m.op == "parquet_scan");
+                let reads =
+                    c.r.workload
+                        .mix
+                        .iter()
+                        .any(|m| m.op == "read" || m.op == "parquet_scan");
                 let rate = cap.safe_rate(headroom).unwrap_or(1.0).floor().max(1.0);
                 advice = format!(
                     "Hot keys exceed a per-key limit of ≈{rps:.0} requests/s (`{key}` takes {:.0}% of the requests): spread hot objects over more keys or prefixes (salting, replicas), cache them (`--cache 256MiB`, a CDN), or pace the whole client at ≤ {rate:.0} operations/s; adding or removing workers only moves the throttling.",
@@ -727,7 +734,9 @@ fn throttling(c: &Ctx) -> Option<Finding> {
                 verification = None;
             }
             _ => {
-                let best = sel.as_ref().map_or_else(|| "none".to_owned(), |h| h.summary());
+                let best = sel
+                    .as_ref()
+                    .map_or_else(|| "none".to_owned(), |h| h.summary());
                 advice = format!(
                     "Inconclusive: no limit model explains the throttling with confidence (best: {best}). Run `oprobe tune {}` (it steps the load up and down and fits the limit) before changing the load; keep retries with jitter.",
                     target_args(&c.r.target).join(" ")

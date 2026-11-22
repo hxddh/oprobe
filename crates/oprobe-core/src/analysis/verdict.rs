@@ -172,7 +172,11 @@ pub fn log_ratio(a: &[f64], b: &[f64], paired: bool) -> super::stats::Interval {
         }
         let se2 = va / na + vb / nb;
         let den = (va / na).powi(2) / (na - 1.0).max(1.0) + (vb / nb).powi(2) / (nb - 1.0).max(1.0);
-        let df = if den > 0.0 { se2 * se2 / den } else { na + nb - 2.0 };
+        let df = if den > 0.0 {
+            se2 * se2 / den
+        } else {
+            na + nb - 2.0
+        };
         (mb - ma, t975(df) * se2.sqrt())
     };
     super::stats::Interval {
@@ -304,11 +308,26 @@ mod tests {
         let goodput_up = ch("ops_per_s", 0.3, 0.2, 0.4, false);
         let p99_flat = ch("p99_ms", 0.0, -0.01, 0.01, true);
         let p99_noisy = ch("p99_ms", 0.05, -0.3, 0.4, true);
-        assert_eq!(assess(&[thr_down.clone(), goodput_down.clone()]).verdict, NetVerdict::Traded);
-        assert_eq!(assess(&[goodput_up.clone(), p99_flat.clone()]).verdict, NetVerdict::Improved);
-        assert_eq!(assess(&[goodput_down, p99_flat.clone()]).verdict, NetVerdict::Regressed);
-        assert_eq!(assess(&[p99_flat.clone()]).verdict, NetVerdict::NoChange);
-        assert_eq!(assess(&[p99_flat, p99_noisy]).verdict, NetVerdict::Inconclusive);
+        assert_eq!(
+            assess(&[thr_down.clone(), goodput_down.clone()]).verdict,
+            NetVerdict::Traded
+        );
+        assert_eq!(
+            assess(&[goodput_up.clone(), p99_flat.clone()]).verdict,
+            NetVerdict::Improved
+        );
+        assert_eq!(
+            assess(&[goodput_down, p99_flat.clone()]).verdict,
+            NetVerdict::Regressed
+        );
+        assert_eq!(
+            assess(std::slice::from_ref(&p99_flat)).verdict,
+            NetVerdict::NoChange
+        );
+        assert_eq!(
+            assess(&[p99_flat, p99_noisy]).verdict,
+            NetVerdict::Inconclusive
+        );
         let t = assess(&[thr_down, goodput_up]);
         assert_eq!(t.verdict, NetVerdict::Improved);
         assert_eq!(t.better.len(), 2);

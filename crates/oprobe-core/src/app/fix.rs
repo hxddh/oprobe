@@ -104,7 +104,11 @@ impl CommandOutput for FixOutput {
             for (i, opt) in self.options.iter().enumerate() {
                 o += &format!(
                     "  {} {:<40} {} — {}{}\n",
-                    if opt.recommended { green("▶") } else { dim(&format!("{}", i + 1)) },
+                    if opt.recommended {
+                        green("▶")
+                    } else {
+                        dim(&format!("{}", i + 1))
+                    },
                     opt.label,
                     opt.summary(),
                     if opt.overrides.is_empty() {
@@ -114,7 +118,13 @@ impl CommandOutput for FixOutput {
                     },
                     match opt.verify {
                         crate::analysis::menu::OptionVerify::NotVerified => String::new(),
-                        v => format!(" [{}]", serde_json::to_value(v).ok().and_then(|x| x.as_str().map(str::to_owned)).unwrap_or_default()),
+                        v => format!(
+                            " [{}]",
+                            serde_json::to_value(v)
+                                .ok()
+                                .and_then(|x| x.as_str().map(str::to_owned))
+                                .unwrap_or_default()
+                        ),
                     }
                 );
             }
@@ -329,7 +339,12 @@ pub async fn fix(ctx: &Ctx, a: FixRequest, cancel: Cancel) -> Result<FixOutcome>
             stage: "diagnosis".into(),
             ops_per_s: crate::report::diff::good_ops_per_s(&diag.report),
             mib_per_s: diag.report.summary.mib_per_s,
-            p99_ms: diag.report.verbs.iter().map(|v| v.latency.p99).fold(0.0, f64::max),
+            p99_ms: diag
+                .report
+                .verbs
+                .iter()
+                .map(|v| v.latency.p99)
+                .fold(0.0, f64::max),
             error_rate: diag.report.summary.error_rate,
             throttled_request_ratio: crate::report::diff::throttled_request_ratio(&diag.report),
             throttled_responses: diag.report.resilience.throttled_responses,

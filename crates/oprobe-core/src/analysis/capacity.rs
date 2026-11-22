@@ -22,8 +22,8 @@ use std::path::Path;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-pub use super::limits::FitInputs;
 use super::hypothesis::{Hypothesis, HypothesisKind};
+pub use super::limits::FitInputs;
 use crate::model::{OpRow, ReqRow};
 use crate::store::TargetId;
 
@@ -325,7 +325,12 @@ pub fn fit(reqs: &[ReqRow], ops: &[OpRow], window: Window, inputs: &FitInputs) -
 /// the per-op shape and the fitted limit models. The ceiling (and the rate) are kept only
 /// when the selected hypothesis asserts them: a rate limit is never reported as an in-flight
 /// ceiling (A1), and random throttling sets no rate (A5).
-pub fn estimate_with(reqs: &[ReqRow], ops: &[OpRow], window: Window, inputs: &FitInputs) -> Capacity {
+pub fn estimate_with(
+    reqs: &[ReqRow],
+    ops: &[OpRow],
+    window: Window,
+    inputs: &FitInputs,
+) -> Capacity {
     let mut c = estimate_ceiling(reqs, ops, window);
     c.hypotheses = fit(reqs, ops, window, inputs);
     c.reconcile();
@@ -612,7 +617,8 @@ impl Capacity {
             // The remembered ceiling is the hypothesis; this run's fits are alternatives.
             let mut hs = super::hypothesis::from_capacity(&c);
             for h in &mut hs {
-                h.evidence.push("remembered from an earlier run of this target and workload".into());
+                h.evidence
+                    .push("remembered from an earlier run of this target and workload".into());
             }
             for mut h in std::mem::take(&mut c.hypotheses) {
                 h.selected = false;
@@ -787,15 +793,14 @@ impl Capacity {
                 HypothesisKind::RateLimit | HypothesisKind::TimeVarying => {
                     h.params.requests_per_s.map(|r| r / rpo)
                 }
-                HypothesisKind::KeyLimit => h.params.requests_per_s.map(|r| {
-                    r / rpo / h.params.key_share_ratio.unwrap_or(1.0).clamp(1e-3, 1.0)
-                }),
-                HypothesisKind::Queueing => {
-                    match (h.params.servers_count, h.params.service_ms) {
-                        (Some(n), Some(ms)) if ms > 0.0 => Some(n as f64 * 1000.0 / ms / rpo),
-                        _ => None,
-                    }
-                }
+                HypothesisKind::KeyLimit => h
+                    .params
+                    .requests_per_s
+                    .map(|r| r / rpo / h.params.key_share_ratio.unwrap_or(1.0).clamp(1e-3, 1.0)),
+                HypothesisKind::Queueing => match (h.params.servers_count, h.params.service_ms) {
+                    (Some(n), Some(ms)) if ms > 0.0 => Some(n as f64 * 1000.0 / ms / rpo),
+                    _ => None,
+                },
                 HypothesisKind::BandwidthCap => h
                     .params
                     .bytes_per_s
@@ -848,10 +853,7 @@ impl Capacity {
     /// sends).
     pub fn clean_requests_per_op(&self) -> f64 {
         let o = &self.observed;
-        let thr = crate::util::ratio(
-            o.throttled_requests_count as f64,
-            o.requests_count as f64,
-        );
+        let thr = crate::util::ratio(o.throttled_requests_count as f64, o.requests_count as f64);
         (self.per_op.requests_per_op * (1.0 - thr)).max(1.0)
     }
 

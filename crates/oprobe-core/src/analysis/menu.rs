@@ -79,7 +79,11 @@ impl FixOption {
         if let Some(d) = self.cost_delta_per_month_usd
             && d.abs() >= 0.01
         {
-            s += &format!(", {}{}/month", if d >= 0.0 { "+" } else { "−" }, crate::util::fmt_usd(d.abs()));
+            s += &format!(
+                ", {}{}/month",
+                if d >= 0.0 { "+" } else { "−" },
+                crate::util::fmt_usd(d.abs())
+            );
         }
         s
     }
@@ -125,7 +129,11 @@ pub fn menu(m: &MenuInputs<'_>) -> Vec<FixOption> {
         })
     };
     let front: Vec<&Trial> = cand.iter().copied().filter(|t| !dominated(t)).collect();
-    let pool = if front.is_empty() { cand.clone() } else { front };
+    let pool = if front.is_empty() {
+        cand.clone()
+    } else {
+        front
+    };
     let best_by = |f: &dyn Fn(&&Trial) -> bool, key: &dyn Fn(&Trial) -> f64| {
         pool.iter()
             .copied()
@@ -134,7 +142,11 @@ pub fn menu(m: &MenuInputs<'_>) -> Vec<FixOption> {
     };
     let within = |t: &&Trial| t.throttled_request_ratio <= m.max_throttle_ratio && t.feasible;
     let mut picks: Vec<(&Trial, &str)> = Vec::new();
-    fn add<'t>(t: Option<&'t Trial>, label: &'static str, picks: &mut Vec<(&'t Trial, &'static str)>) {
+    fn add<'t>(
+        t: Option<&'t Trial>,
+        label: &'static str,
+        picks: &mut Vec<(&'t Trial, &'static str)>,
+    ) {
         if let Some(t) = t
             && !picks.iter().any(|(p, _)| p.id == t.id)
         {
@@ -148,7 +160,11 @@ pub fn menu(m: &MenuInputs<'_>) -> Vec<FixOption> {
         "no throttling",
         &mut picks,
     );
-    add(best_by(&|_| true, &|t| g(t)), "highest goodput (throttles)", &mut picks);
+    add(
+        best_by(&|_| true, &|t| g(t)),
+        "highest goodput (throttles)",
+        &mut picks,
+    );
     add(best_by(&|_| true, &|t| -t.p99_ms), "lowest p99", &mut picks);
     picks.truncate(4);
     let month = |t: &Trial| {
@@ -156,8 +172,8 @@ pub fn menu(m: &MenuInputs<'_>) -> Vec<FixOption> {
             .filter(|_| t.cost_per_million_ops > 0.0)
             .map(|ops| t.cost_per_million_ops * ops / 1e6)
     };
-    let reference_feasible = m.reference.feasible
-        && m.reference.throttled_request_ratio <= m.max_throttle_ratio;
+    let reference_feasible =
+        m.reference.feasible && m.reference.throttled_request_ratio <= m.max_throttle_ratio;
     let mut out: Vec<FixOption> = picks
         .into_iter()
         .map(|(t, label)| {
@@ -167,7 +183,12 @@ pub fn menu(m: &MenuInputs<'_>) -> Vec<FixOption> {
                 overrides: (m.overrides_of)(t),
                 trial_id: t.id as u64,
                 goodput: g(t),
-                goodput_unit: if m.use_bytes { "mib_per_s" } else { "ops_per_s" }.into(),
+                goodput_unit: if m.use_bytes {
+                    "mib_per_s"
+                } else {
+                    "ops_per_s"
+                }
+                .into(),
                 goodput_delta_ratio: crate::util::ratio(g(t), g(m.reference)) - 1.0,
                 p99_ms: t.p99_ms,
                 throttled_request_ratio: t.throttled_request_ratio,
@@ -195,7 +216,12 @@ pub fn menu(m: &MenuInputs<'_>) -> Vec<FixOption> {
                     overrides: Overrides::new(),
                     trial_id: m.reference.id as u64,
                     goodput: g(m.reference),
-                    goodput_unit: if m.use_bytes { "mib_per_s" } else { "ops_per_s" }.into(),
+                    goodput_unit: if m.use_bytes {
+                        "mib_per_s"
+                    } else {
+                        "ops_per_s"
+                    }
+                    .into(),
                     goodput_delta_ratio: 0.0,
                     p99_ms: m.reference.p99_ms,
                     throttled_request_ratio: m.reference.throttled_request_ratio,
@@ -254,7 +280,10 @@ mod tests {
         assert!((2..=4).contains(&m.len()), "{m:#?}");
         assert!(m[0].recommended);
         assert_eq!(m[0].trial_id, 2);
-        assert!(m.iter().any(|o| o.trial_id == 1 && o.throttled_request_ratio == 0.0));
+        assert!(
+            m.iter()
+                .any(|o| o.trial_id == 1 && o.throttled_request_ratio == 0.0)
+        );
         assert!(m.iter().all(|o| o.trial_id != 4));
         assert!(m[0].summary().contains("goodput"));
         assert_eq!(m[0].cost_per_month_usd, Some(500.0));

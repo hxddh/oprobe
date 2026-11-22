@@ -526,7 +526,11 @@ pub fn compare_with_noise(
         // warns under it; not significant passes only when the interval rules out a change
         // past the limit, else it is inconclusive (never "same").
         let higher_worse = metric != "ops_per_s";
-        let worse_end = if higher_worse { change.high } else { -change.low };
+        let worse_end = if higher_worse {
+            change.high
+        } else {
+            -change.low
+        };
         let worse = if higher_worse {
             change.estimate > 0.0
         } else {
@@ -534,8 +538,8 @@ pub fn compare_with_noise(
         };
         let limit = chk.limit_ratio.unwrap_or(f64::INFINITY);
         // Latency changes below the absolute floor are never regressions.
-        let abs_ok = metric == "ops_per_s"
-            || (chk.candidate - chk.baseline).abs() > t.min_latency_delta_ms;
+        let abs_ok =
+            metric == "ops_per_s" || (chk.candidate - chk.baseline).abs() > t.min_latency_delta_ms;
         chk.verdict = if sig && worse && abs_ok && chk.verdict == Status::Fail {
             Status::Fail
         } else if sig && worse && abs_ok {
@@ -662,7 +666,10 @@ fn net_of(stats_out: &[MetricStat], base: &[Run], cand: &[Run]) -> super::verdic
     let thr = |r: &Report| (r.resilience.throttled_responses, r.connections.requests);
     let err = |r: &Report| (r.summary.failed_ops, r.summary.ops);
     for (metric, f) in [
-        ("throttled_request_ratio", &thr as &dyn Fn(&Report) -> (u64, u64)),
+        (
+            "throttled_request_ratio",
+            &thr as &dyn Fn(&Report) -> (u64, u64),
+        ),
         ("error_ratio", &err),
     ] {
         let ((ka, na), (kb, nb)) = (pooled(base, f), pooled(cand, f));

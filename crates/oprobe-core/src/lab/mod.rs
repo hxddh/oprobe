@@ -1419,9 +1419,7 @@ async fn handle_s3_request(
                 build_shaped_body(
                     slice,
                     faults.stream_bandwidth_kib_s,
-                    faults
-                        .aggregate_bandwidth_kib_s
-                        .map(|k| (store.clone(), k)),
+                    faults.aggregate_bandwidth_kib_s.map(|k| (store.clone(), k)),
                 )
                 .await
             };

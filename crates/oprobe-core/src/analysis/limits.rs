@@ -82,10 +82,7 @@ fn prefix_of(key: &str) -> &str {
 }
 
 /// The rows as observations, in arrival order, with their in-flight levels.
-fn observations(
-    reqs: &[&ReqRow],
-    ops: &[&OpRow],
-) -> (Vec<Obs>, Vec<String>, Vec<String>) {
+fn observations(reqs: &[&ReqRow], ops: &[&OpRow]) -> (Vec<Obs>, Vec<String>, Vec<String>) {
     let key_of: HashMap<u64, &str> = ops.iter().map(|o| (o.op_id, o.key.as_str())).collect();
     let mut keys: Vec<String> = Vec::new();
     let mut prefixes: Vec<String> = Vec::new();
@@ -122,8 +119,7 @@ fn observations(
                 prefixes.push(pre.to_owned());
                 n
             });
-            let body_start =
-                q.t_us + (q.queue_us + q.connect_us() + q.send_us + q.ttfb_us) as i64;
+            let body_start = q.t_us + (q.queue_us + q.connect_us() + q.send_us + q.ttfb_us) as i64;
             Obs {
                 t: iv[i].0,
                 level: level[i],
@@ -345,7 +341,6 @@ fn best_rate(
     }
     best
 }
-
 
 fn throttle_family(obs: &[Obs], keys: &[String], prefixes: &[String]) -> Vec<Fit> {
     let n = obs.len() as u64;
@@ -763,7 +758,12 @@ fn rank(mut fits: Vec<Fit>, n: f64, enough: bool) -> Vec<Hypothesis> {
 
 /// Fit the limit models to the rows that started in `[from_us, to_us)`; the selected
 /// hypothesis first.
-pub fn fit(reqs: &[ReqRow], ops: &[OpRow], window: (i64, i64), inputs: &FitInputs) -> Vec<Hypothesis> {
+pub fn fit(
+    reqs: &[ReqRow],
+    ops: &[OpRow],
+    window: (i64, i64),
+    inputs: &FitInputs,
+) -> Vec<Hypothesis> {
     let inw = |t: i64| t >= window.0 && t < window.1;
     let reqs: Vec<&ReqRow> = reqs.iter().filter(|q| inw(q.t_us)).collect();
     let ops: Vec<&OpRow> = ops.iter().filter(|o| inw(o.t_us)).collect();
@@ -820,7 +820,9 @@ fn fit_rows(reqs: &[&ReqRow], ops: &[&OpRow], inputs: &FitInputs) -> Vec<Hypothe
     let bw = bandwidth_fits(&obs);
     let gain = |a: &Fit, b: &Fit| b.bic(n) - a.bic(n);
     let q_gain = q.as_ref().map_or(f64::NEG_INFINITY, |(q, nl)| gain(q, nl));
-    let bw_gain = bw.as_ref().map_or(f64::NEG_INFINITY, |(a, p, _)| gain(a, p));
+    let bw_gain = bw
+        .as_ref()
+        .map_or(f64::NEG_INFINITY, |(a, p, _)| gain(a, p));
     let mut pick: Option<Vec<Hypothesis>> = None;
     if bw_gain > 0.0 && bw_gain >= q_gain {
         let (a, p, _) = bw.clone().expect("gain implies a fit");
@@ -916,7 +918,11 @@ mod tests {
         while t < dur_ms {
             let key = if keys > 1 {
                 // A skewed key choice: key 0 every third request.
-                if i % 3 == 0 { 0 } else { 1 + i % (keys - 1) }
+                if i.is_multiple_of(3) {
+                    0
+                } else {
+                    1 + i % (keys - 1)
+                }
             } else {
                 0
             };
@@ -940,16 +946,22 @@ mod tests {
         // 1000 arrivals/s against a bucket of 300/s.
         let mut tokens = 10.0f64;
         let mut last = 0.0;
-        let (reqs, ops) = synth(1.0, 4000.0, |_| 5.0, 1, |t, _, _| {
-            tokens = (tokens + (t - last) / 1000.0 * 300.0).min(10.0);
-            last = t;
-            if tokens >= 1.0 {
-                tokens -= 1.0;
-                false
-            } else {
-                true
-            }
-        });
+        let (reqs, ops) = synth(
+            1.0,
+            4000.0,
+            |_| 5.0,
+            1,
+            |t, _, _| {
+                tokens = (tokens + (t - last) / 1000.0 * 300.0).min(10.0);
+                last = t;
+                if tokens >= 1.0 {
+                    tokens -= 1.0;
+                    false
+                } else {
+                    true
+                }
+            },
+        );
         let hs = fit(&reqs, &ops, (i64::MIN, i64::MAX), &FitInputs::default());
         let s = selected(&hs);
         assert_eq!(s.kind, HypothesisKind::RateLimit, "{hs:#?}");
@@ -971,7 +983,12 @@ mod tests {
             for j in 0..width {
                 id += 1;
                 let thr = j >= 24;
-                reqs.push(req(t0 + j as f64 * 0.01, if thr { 0.3 } else { 10.0 }, if thr { 503 } else { 200 }, id));
+                reqs.push(req(
+                    t0 + j as f64 * 0.01,
+                    if thr { 0.3 } else { 10.0 },
+                    if thr { 503 } else { 200 },
+                    id,
+                ));
                 ops.push(op(id, "k", t0));
             }
         }
@@ -985,10 +1002,18 @@ mod tests {
     #[test]
     fn random_throttling_is_no_limit() {
         let mut x = 7u64;
-        let (reqs, ops) = synth(1.0, 4000.0, |_| 5.0, 1, |_, _, _| {
-            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            (x >> 33) % 20 == 0
-        });
+        let (reqs, ops) = synth(
+            1.0,
+            4000.0,
+            |_| 5.0,
+            1,
+            |_, _, _| {
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (x >> 33).is_multiple_of(20)
+            },
+        );
         let hs = fit(&reqs, &ops, (i64::MIN, i64::MAX), &FitInputs::default());
         assert_eq!(selected(&hs).kind, HypothesisKind::None, "{hs:#?}");
     }
@@ -996,17 +1021,23 @@ mod tests {
     #[test]
     fn a_hot_key_is_a_key_limit() {
         let mut buckets = [(4.0f64, 0.0f64); 8];
-        let (reqs, ops) = synth(1.0, 4000.0, |_| 5.0, 8, |t, _, k| {
-            let (tok, last) = &mut buckets[k];
-            *tok = (*tok + (t - *last) / 1000.0 * 100.0).min(4.0);
-            *last = t;
-            if *tok >= 1.0 {
-                *tok -= 1.0;
-                false
-            } else {
-                true
-            }
-        });
+        let (reqs, ops) = synth(
+            1.0,
+            4000.0,
+            |_| 5.0,
+            8,
+            |t, _, k| {
+                let (tok, last) = &mut buckets[k];
+                *tok = (*tok + (t - *last) / 1000.0 * 100.0).min(4.0);
+                *last = t;
+                if *tok >= 1.0 {
+                    *tok -= 1.0;
+                    false
+                } else {
+                    true
+                }
+            },
+        );
         let hs = fit(&reqs, &ops, (i64::MIN, i64::MAX), &FitInputs::default());
         let s = selected(&hs);
         assert_eq!(s.kind, HypothesisKind::KeyLimit, "{hs:#?}");
@@ -1017,17 +1048,23 @@ mod tests {
     fn a_rate_that_drops_is_time_varying() {
         let mut tokens = 10.0f64;
         let mut last = 0.0;
-        let (reqs, ops) = synth(1.0, 4000.0, |_| 5.0, 1, |t, _, _| {
-            let rate = if t < 2000.0 { 600.0 } else { 150.0 };
-            tokens = (tokens + (t - last) / 1000.0 * rate).min(10.0);
-            last = t;
-            if tokens >= 1.0 {
-                tokens -= 1.0;
-                false
-            } else {
-                true
-            }
-        });
+        let (reqs, ops) = synth(
+            1.0,
+            4000.0,
+            |_| 5.0,
+            1,
+            |t, _, _| {
+                let rate = if t < 2000.0 { 600.0 } else { 150.0 };
+                tokens = (tokens + (t - last) / 1000.0 * rate).min(10.0);
+                last = t;
+                if tokens >= 1.0 {
+                    tokens -= 1.0;
+                    false
+                } else {
+                    true
+                }
+            },
+        );
         let hs = fit(&reqs, &ops, (i64::MIN, i64::MAX), &FitInputs::default());
         let s = selected(&hs);
         assert_eq!(s.kind, HypothesisKind::TimeVarying, "{hs:#?}");
@@ -1047,7 +1084,9 @@ mod tests {
             let width = 2 + burst % 14;
             for j in 0..width {
                 id += 1;
-                x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 let noise = 1.0 + ((x >> 40) as f64 / (1u64 << 24) as f64 - 0.5) * 0.2;
                 let lat = 10.0 * (1.0 + ((j as u64 + 1).saturating_sub(4)) as f64 / 4.0) * noise;
                 reqs.push(req(t0 + j as f64 * 0.01, lat, 200, id));

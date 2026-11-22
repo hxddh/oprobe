@@ -328,7 +328,11 @@ impl DiffReport {
             GateVerdict::Regression
         } else if self.checks.iter().any(|c| c.verdict == Status::Warn) {
             GateVerdict::Warned
-        } else if self.checks.iter().any(|c| c.verdict == Status::Inconclusive) {
+        } else if self
+            .checks
+            .iter()
+            .any(|c| c.verdict == Status::Inconclusive)
+        {
             GateVerdict::Inconclusive
         } else {
             GateVerdict::Passed

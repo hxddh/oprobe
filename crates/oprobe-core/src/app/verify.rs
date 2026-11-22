@@ -133,7 +133,11 @@ impl CommandOutput for VerifyResult {
                     dim(&format!(
                         " ({} pair(s){})",
                         f.pairs_count,
-                        if f.stopped_early { ", stopped early" } else { "" }
+                        if f.stopped_early {
+                            ", stopped early"
+                        } else {
+                            ""
+                        }
                     ))
                 );
             }
@@ -871,7 +875,9 @@ pub fn net_assessment(
     noise: Option<&crate::store::baselines::NoiseEntry>,
 ) -> NetAssessment {
     use crate::analysis::verdict::{MetricChange, log_ratio, ratio_difference};
-    let vals = |rs: &[Run], f: &dyn Fn(&Report) -> f64| rs.iter().map(|r| f(&r.report)).collect::<Vec<f64>>();
+    let vals = |rs: &[Run], f: &dyn Fn(&Report) -> f64| {
+        rs.iter().map(|r| f(&r.report)).collect::<Vec<f64>>()
+    };
     let paired = a.len() == b.len();
     let mut changes = vec![
         MetricChange {
@@ -900,7 +906,10 @@ pub fn net_assessment(
     let thr = |r: &Report| (r.resilience.throttled_responses, r.connections.requests);
     let err = |r: &Report| (r.summary.failed_ops, r.summary.ops);
     for (metric, f) in [
-        ("throttled_request_ratio", &thr as &dyn Fn(&Report) -> (u64, u64)),
+        (
+            "throttled_request_ratio",
+            &thr as &dyn Fn(&Report) -> (u64, u64),
+        ),
         ("error_ratio", &err),
     ] {
         let ((ka, na), (kb, nb)) = (pooled(a, f), pooled(b, f));

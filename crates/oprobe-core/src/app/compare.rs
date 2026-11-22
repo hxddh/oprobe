@@ -211,7 +211,11 @@ pub fn compare(ctx: &Ctx, a: CompareRequest) -> Result<Comparison> {
             )))),
             GateVerdict::Warned => ctx.out.info(yellow(&bold(&format!(
                 "passed with warnings: a check is significantly worse within its limit{}",
-                if a.fail_on_warn { " (--fail-on-warn: exit 3)" } else { "" }
+                if a.fail_on_warn {
+                    " (--fail-on-warn: exit 3)"
+                } else {
+                    ""
+                }
             )))),
             GateVerdict::Inconclusive => ctx.out.info(yellow(&bold(
                 "inconclusive: a check could not rule out a regression (repeat the runs)",

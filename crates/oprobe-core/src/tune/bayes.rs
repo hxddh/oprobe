@@ -159,7 +159,11 @@ pub fn phi(z: f64) -> f64 {
             + 0.254_829_592)
             * t
             * (-(z * z) / 2.0).exp();
-    if z >= 0.0 { 0.5 * (1.0 + y) } else { 0.5 * (1.0 - y) }
+    if z >= 0.0 {
+        0.5 * (1.0 + y)
+    } else {
+        0.5 * (1.0 - y)
+    }
 }
 
 fn pdf(z: f64) -> f64 {
@@ -192,7 +196,10 @@ impl Surrogate {
         let pts: Vec<&Trial> = trials.iter().filter(|t| t.stage != "confirm").collect();
         let xs: Vec<Vec<f64>> = pts.iter().map(|t| features(t, &space)).collect();
         let g: Vec<f64> = pts.iter().map(|t| net_goodput(t, bytes)).collect();
-        let th: Vec<f64> = pts.iter().map(|t| logit(t.throttled_request_ratio)).collect();
+        let th: Vec<f64> = pts
+            .iter()
+            .map(|t| logit(t.throttled_request_ratio))
+            .collect();
         let best = pts
             .iter()
             .filter(|t| t.throttled_request_ratio <= budget && t.feasible)

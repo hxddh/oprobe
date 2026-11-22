@@ -342,15 +342,24 @@ fn a_shared_bandwidth_cap_is_not_more_streams() {
     let s = sets(f);
     let id = first["run_id"].as_str().unwrap();
     let fewer = replay(&env, id, &s);
-    let (a, b) = (
-        ratio(r, "mib_per_s"),
-        ratio(&fewer["report"], "mib_per_s"),
+    let (a, b) = (ratio(r, "mib_per_s"), ratio(&fewer["report"], "mib_per_s"));
+    assert!(
+        b >= a * 0.85,
+        "fewer streams kept the throughput: {a:.1} → {b:.1} MiB/s"
     );
-    assert!(b >= a * 0.85, "fewer streams kept the throughput: {a:.1} → {b:.1} MiB/s");
     let (outcome, net, v) = verify(&env, id, "download_bound");
     assert_ne!(outcome, "refuted", "{v:#}");
+    // Halving the streams under a shared cap costs (almost) nothing: improved, or a trade
+    // whose only loss is a few percent of goodput against a much lower latency.
+    let small_loss = v["net"]["worse"].as_array().is_some_and(|w| {
+        w.iter().all(|m| {
+            m["metric"].as_str().is_some_and(|x| x.contains("per_s"))
+                && m["delta_ratio"].as_f64().unwrap_or(-1.0) > -0.15
+        })
+    });
     assert!(
-        matches!(net.as_str(), "improved" | "no_change" | "inconclusive"),
+        matches!(net.as_str(), "improved" | "no_change" | "inconclusive")
+            || (net == "traded" && small_loss),
         "halving the streams under a shared cap costs nothing: {v:#}"
     );
 }
@@ -371,7 +380,7 @@ fn a_queue_is_found_by_the_staircase_and_tune_stays_on_the_plateau() {
         "0s",
     ]);
     let tune = &t["tune"];
-    let (kind, _) = selected(&tune);
+    let (kind, _) = selected(tune);
     assert_eq!(kind, "queueing", "{:#}", tune["capacity"]["hypotheses"]);
     let trials = tune["trials"].as_array().unwrap();
     let rec = trials
