@@ -407,7 +407,12 @@ fn repeat_baseline_and_compare() {
         "-o",
         "json",
     ]);
-    assert!(o.status.success(), "{}", err(&o));
+    assert!(
+        o.status.success(),
+        "{}\n{}",
+        err(&o),
+        String::from_utf8_lossy(&o.stdout)
+    );
     assert!(
         std::fs::read_to_string(&md)
             .unwrap()
