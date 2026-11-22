@@ -158,13 +158,38 @@ fn run_saves_the_run_and_prints_one_json_document() {
 
 #[test]
 fn text_output_is_brief() {
+    // Design v5 §6: off a terminal the brief wraps to 100 columns (COLUMNS overrides), and
+    // only a command printed whole may be longer.
     let env = Env::new();
-    let o = run_small(&env, &[]);
-    assert!(o.status.success(), "{}", stderr(&o));
-    let text = stdout(&o);
-    assert!(text.lines().count() <= 20, "{text}");
-    assert!(text.lines().all(|l| l.chars().count() <= 80), "{text}");
-    assert!(text.contains("full report: oprobe runs show"), "{text}");
+    for (columns, width) in [(None, 100), (Some("80"), 80), (Some("60"), 60)] {
+        let mut c = env.cmd();
+        c.env_remove("COLUMNS")
+            .env_remove("OPROBE_LANG")
+            .env("LANG", "C");
+        if let Some(cols) = columns {
+            c.env("COLUMNS", cols);
+        }
+        let mut args = small_run(&[]);
+        args.push("-q".into());
+        let o = c.args(&args).output().unwrap();
+        assert!(o.status.success(), "{}", stderr(&o));
+        let text = stdout(&o);
+        assert!(text.lines().count() <= 30, "{text}");
+        for l in text.lines() {
+            let t = l.trim_start();
+            let command = t.starts_with("oprobe ")
+                || t.contains("next: oprobe")
+                || t.starts_with("full report: oprobe");
+            assert!(
+                command || l.chars().count() <= width,
+                "{width}: {l}\n{text}"
+            );
+        }
+        assert!(
+            text.contains("full report:") && text.contains("oprobe runs show"),
+            "{text}"
+        );
+    }
 }
 
 #[test]

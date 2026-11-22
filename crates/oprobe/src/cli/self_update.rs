@@ -15,6 +15,7 @@
 //! 2. otherwise the minisign signature over `SHA256SUMS` (`SHA256SUMS.minisig`) with the public
 //!    key embedded at build time (`OPROBE_MINISIGN_PUBKEY`, set by the release workflow);
 //! 3. otherwise a warning, or a refusal with `--verify require`.
+//!
 //! A verification that fails always refuses the update.
 //!
 //! Installs owned by a package manager (Homebrew, apt/dnf, the macOS .pkg or .app, Scoop,
