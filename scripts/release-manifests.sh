@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
 # Generate the package-manager manifests of a release from its assets and SHA256SUMS:
-#   oprobe.rb             Homebrew formula `oprobe` (CLI; macOS universal + Linux musl archives);
+#   oprobe.rb             Homebrew formula `oprobe` (macOS universal + Linux musl archives);
 #                         the release job copies it to Formula/oprobe.rb of hxddh/homebrew-tap
 #   oprobe-app.rb         Homebrew cask `oprobe-app` (oprobe.app from the .dmg): Casks/oprobe-app.rb
 #                         (a distinct token: a formula and a cask of one tap must not share a name)
 #   oprobe.json           Scoop manifest (Windows zip): bucket/oprobe.json of hxddh/scoop-bucket
 #   winget-manifests.zip  winget manifests for the MSI (the release job opens a winget-pkgs PR)
 #   latest.json           machine-readable index: version + every asset's URL, size and SHA-256
-#                         (install.sh, install.ps1 and `oprobe self-update` read it first)
+#                         (install.sh and install.ps1 read it first)
 # usage: scripts/release-manifests.sh <version> <dist-dir> <owner/repo>
 # Missing assets are skipped with a warning (e.g. a partial rebuild), never guessed.
 set -euo pipefail
 version="$1"; dist="$(cd "$2" && pwd)"; repo="$3"
 url="https://github.com/$repo/releases/download/v$version"
-desc="See every request your object-storage client makes: where time and money go, and what to change"
+desc="A profiler for Apache OpenDAL operators: what your Operator does on the wire, the layer that fixes it, and an A/B test that proves the fix"
 sha() { grep " \*\?$1\$" "$dist/SHA256SUMS" | cut -d' ' -f1; }
 have() { [ -f "$dist/$1" ] || { echo "warning: $1 missing; skipping what needs it" >&2; return 1; }; }
 
@@ -46,23 +46,19 @@ class Oprobe < Formula
 
   def install
     bin.install "oprobe"
-    man1.install Dir["man/*.1"]
-    bash_completion.install "completions/oprobe.bash" => "oprobe"
-    zsh_completion.install "completions/_oprobe"
-    fish_completion.install "completions/oprobe.fish"
-    pkgshare.install "profiles"
   end
 
   def caveats
     <<~EOS
-      Update with \`brew upgrade oprobe\` (oprobe self-update refuses Homebrew installs).
-      The app (native windows): brew install --cask hxddh/tap/oprobe-app
+      Run oprobe for the app in the terminal, or oprobe demo for a first profile.
+      The app in a native window: brew install --cask hxddh/tap/oprobe-app
     EOS
   end
 
   test do
     assert_match version.to_s, shell_output("#{bin}/oprobe --version")
-    system bin/"oprobe", "run", "memory://", "-d", "1s", "--warmup", "0s", "-q", "-o", "json"
+    ENV["OPROBE_DATA_DIR"] = testpath/"data"
+    system bin/"oprobe", "run", "memory://", "-d", "1s", "-q", "-o", "json"
   end
 end
 RB
@@ -185,12 +181,12 @@ PackageUrl: https://github.com/$repo
 License: Apache-2.0
 LicenseUrl: https://github.com/$repo/blob/main/LICENSE
 ShortDescription: $desc
-Description: oprobe drives realistic workloads through Apache OpenDAL against S3, GCS, Azure Blob and other object stores, traces every backend request, explains the bottleneck and the bill, tunes the client and gates regressions in CI.
+Description: oprobe is a profiler for Apache OpenDAL operators. It traces every backend request of an Operator stage by stage (queue, connect, send, time to first byte, body, retry backoff), names the OpenDAL layer that fixes what it finds, and proves the fix with an interleaved A/B test.
 Moniker: oprobe
 Tags:
 - s3
 - object-storage
-- benchmark
+- profiler
 - opendal
 - observability
 ReleaseNotesUrl: https://github.com/$repo/releases/tag/v$version

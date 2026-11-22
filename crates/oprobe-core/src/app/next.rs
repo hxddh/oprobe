@@ -1,121 +1,55 @@
-//! Next steps shared by command results (design v4 §8, AG-3): each with its CLI command and
-//! the MCP call doing the same, built from real run ids and targets (no placeholders).
-
-use serde_json::json;
+//! Next steps shared by command results: each with its CLI command, built from real run ids
+//! (no placeholders), and only real 6.0 commands (`run`, `prove`, `show`, `lab`).
 
 use crate::model::spec::shell_quote;
 use crate::output::NextStep;
 
-/// `oprobe explain RUN` / `explain_run`.
-pub fn explain(run: &str) -> NextStep {
-    NextStep::new(
-        "explain the run: causes, evidence, advice",
-        format!("oprobe explain {}", shell_quote(run)),
-    )
-    .with_mcp("explain_run", json!({ "run": run }))
-}
-
-/// `oprobe runs show RUN` / `get_run`.
+/// `oprobe show RUN --detail`.
 pub fn show(run: &str) -> NextStep {
     NextStep::new(
-        "the full report",
-        format!("oprobe runs show {}", shell_quote(run)),
+        "the full profile",
+        format!("oprobe show {} --detail", shell_quote(run)),
     )
-    .with_mcp("get_run", json!({ "run": run }))
 }
 
-/// `oprobe analyze RUN --by api` / `analyze_run`.
-pub fn analyze(run: &str) -> NextStep {
+/// `oprobe show RUN --by stage`.
+pub fn by_stage(run: &str) -> NextStep {
     NextStep::new(
-        "attribute the slowest requests",
-        format!("oprobe analyze {} --by api", shell_quote(run)),
+        "where the time went, stage by stage",
+        format!("oprobe show {} --by stage", shell_quote(run)),
     )
-    .with_mcp("analyze_run", json!({ "run": run }))
 }
 
-/// `oprobe compare A B` / `compare_runs`.
-pub fn compare(a: &str, b: &str) -> NextStep {
+/// `oprobe run OPERATOR --dry-run`.
+pub fn plan(operator: &str) -> NextStep {
     NextStep::new(
-        format!("compare {a} with {b}"),
-        format!("oprobe compare {} {}", shell_quote(a), shell_quote(b)),
+        "plan a run (nothing touches the operator's storage)",
+        format!("oprobe run {} --dry-run", shell_quote(operator)),
     )
-    .with_mcp("compare_runs", json!({ "baseline": a, "candidate": b }))
 }
 
-/// `oprobe run --from RUN` / `start_run {from}`: the same run again.
-pub fn replay(run: &str) -> NextStep {
-    NextStep::new(
-        "run it again (same spec)",
-        format!("oprobe run --from {}", shell_quote(run)),
-    )
-    .with_mcp("start_run", json!({ "from": run }))
-}
-
-/// `oprobe fix TARGET` / `recommend_config`.
-pub fn fix(target: &str) -> NextStep {
-    NextStep::new(
-        "find and verify a better client configuration",
-        format!("oprobe fix {}", shell_quote(target)),
-    )
-    .with_mcp("recommend_config", json!({ "target": target }))
-}
-
-/// `oprobe doctor TARGET` / `doctor`.
-pub fn doctor(target: &str) -> NextStep {
-    NextStep::new(
-        "check the target",
-        format!("oprobe doctor {}", shell_quote(target)),
-    )
-    .with_mcp("doctor", json!({ "target": target }))
-}
-
-/// `oprobe run TARGET --dry-run` / `plan_run`.
-pub fn plan(target: &str) -> NextStep {
-    NextStep::new(
-        "plan a run (nothing touches the target)",
-        format!("oprobe run {} --dry-run", shell_quote(target)),
-    )
-    .with_mcp("plan_run", json!({ "target": target }))
-}
-
-/// `oprobe runs list` / `list_runs`.
+/// `oprobe show --list`.
 pub fn list_runs() -> NextStep {
-    NextStep::new("list stored runs", "oprobe runs list").with_mcp("list_runs", json!({}))
+    NextStep::new("list stored runs", "oprobe show --list")
 }
 
-/// `oprobe target list` / `list_targets`.
-pub fn list_targets() -> NextStep {
-    NextStep::new("list configured targets", "oprobe target list")
-        .with_mcp("list_targets", json!({}))
-}
-
-/// `oprobe target discover` / `discover_targets`.
-pub fn discover() -> NextStep {
-    NextStep::new(
-        "credential sources on this machine",
-        "oprobe target discover",
-    )
-    .with_mcp("discover_targets", json!({}))
-}
-
-/// The steps after a finished run: explain, attribute, verify the top finding, replay.
+/// The steps after a finished run: the top finding's next command (`oprobe prove RUN CODE`),
+/// the profile by stage, the details.
 pub fn after_run(report: &crate::model::Report) -> Vec<NextStep> {
-    let id = report.run.id.as_str();
-    let mut v = vec![explain(id)];
-    if let Some((code, ver)) = report
+    let id = report.show_ref();
+    let mut v = Vec::new();
+    if let Some((f, next)) = report
         .findings
         .iter()
-        .find_map(|f| f.verification.as_ref().map(|v| (f.code.as_str(), v)))
+        .find_map(|f| f.remedy.next.as_ref().map(|n| (f, n)))
+        && next.starts_with("oprobe prove")
     {
-        v.push(
-            NextStep::new(format!("verify: {}", ver.description), ver.command.clone())
-                .with_mcp("verify_finding", json!({ "run": id, "code": code })),
-        );
+        v.push(NextStep::new(
+            format!("prove the {} remedy with an A/B test", f.code),
+            next.clone(),
+        ));
     }
-    v.push(analyze(id));
-    if !report.findings.is_empty() && report.tune.is_none() {
-        v.push(fix(&report.spec.target_ref));
-    }
-    v.push(replay(id));
+    v.push(by_stage(id));
+    v.push(show(id));
     v
 }

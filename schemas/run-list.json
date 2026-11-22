@@ -1,0 +1,286 @@
+{
+  "$defs": {
+    "NextStep": {
+      "description": "A suggested next step: what it does and the CLI command.",
+      "properties": {
+        "cli": {
+          "description": "The command line (`oprobe …`).",
+          "type": "string"
+        },
+        "title": {
+          "description": "What the step does, in a few words.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "title",
+        "cli"
+      ],
+      "type": "object"
+    },
+    "ProveObjective": {
+      "description": "What prove judges a change on.",
+      "oneOf": [
+        {
+          "const": "goodput",
+          "description": "Successful operations per second.",
+          "type": "string"
+        },
+        {
+          "const": "p99",
+          "description": "The p99 operation latency.",
+          "type": "string"
+        }
+      ]
+    },
+    "ProveSummary": {
+      "description": "One stored prove (`<id>.prove.json`).",
+      "properties": {
+        "change": {
+          "description": "The change as `PATH=VALUE` pairs.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "finding": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "objective": {
+          "$ref": "#/$defs/ProveObjective"
+        },
+        "objective_delta_ratio": {
+          "description": "The objective's relative change (estimate).",
+          "format": "double",
+          "type": "number"
+        },
+        "prove_id": {
+          "type": "string"
+        },
+        "run_id": {
+          "description": "The run whose operator was changed.",
+          "type": "string"
+        },
+        "verdict": {
+          "$ref": "#/$defs/ProveVerdict"
+        }
+      },
+      "required": [
+        "prove_id",
+        "run_id",
+        "objective",
+        "verdict",
+        "objective_delta_ratio",
+        "change"
+      ],
+      "type": "object"
+    },
+    "ProveVerdict": {
+      "description": "The verdict on the objective.",
+      "enum": [
+        "improved",
+        "worse",
+        "inconclusive"
+      ],
+      "type": "string"
+    },
+    "RunSummary": {
+      "description": "Sidecar summary of a run (`runs/<id>.json`).",
+      "properties": {
+        "error_ratio": {
+          "format": "double",
+          "type": "number"
+        },
+        "headline": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "interrupted": {
+          "type": "boolean"
+        },
+        "label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ops_per_s": {
+          "format": "double",
+          "type": "number"
+        },
+        "p50_ms": {
+          "format": "double",
+          "type": "number"
+        },
+        "p99_ms": {
+          "format": "double",
+          "type": "number"
+        },
+        "parent_id": {
+          "description": "The `oprobe prove` this run is a trial of (hidden from `show --list` unless `--all`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "partial": {
+          "description": "Why the run is partial: `budget` (a safety budget stopped it) or `interrupted`\n(stopped early); absent for a complete run.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path": {
+          "description": "The run file (filled in when listing; not stored).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "preset": {
+          "description": "The workload preset (absent in summaries written before 5.0).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "started_at": {
+          "type": "string"
+        },
+        "target_display": {
+          "type": "string"
+        },
+        "target_id": {
+          "description": "The target identity of the run's spec (`store::TargetId`, empty when it does not\nresolve). Required, so sidecars written without it are rebuilt from the run file.",
+          "type": "string"
+        },
+        "target_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "throttled_request_ratio": {
+          "description": "Throttled responses / requests (absent in summaries written before 5.0).",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "verdict_level": {
+          "$ref": "#/$defs/VerdictLevel"
+        },
+        "window_s": {
+          "format": "double",
+          "type": "number"
+        },
+        "workload_hash": {
+          "description": "`report.spec.workload_hash()`: runs with the same target and workload hash compare.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "target_display",
+        "started_at",
+        "window_s",
+        "interrupted",
+        "verdict_level",
+        "headline",
+        "ops_per_s",
+        "p50_ms",
+        "p99_ms",
+        "error_ratio",
+        "target_id",
+        "workload_hash"
+      ],
+      "type": "object"
+    },
+    "VerdictLevel": {
+      "description": "Overall judgement.",
+      "oneOf": [
+        {
+          "enum": [
+            "ok"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "review",
+          "description": "Worth a look (informational findings, warnings, partial run).",
+          "type": "string"
+        },
+        {
+          "const": "attention",
+          "description": "Warning findings.",
+          "type": "string"
+        },
+        {
+          "const": "critical",
+          "description": "Critical findings or a breached SLA.",
+          "type": "string"
+        }
+      ]
+    }
+  },
+  "$id": "https://github.com/hxddh/oprobe/schemas/6/run-list.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "The result of `oprobe show --list -o json`: the stored runs",
+  "properties": {
+    "hidden_trials_count": {
+      "description": "Prove trial runs not listed (`--all` lists them).",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "next": {
+      "description": "Suggested next steps.",
+      "items": {
+        "$ref": "#/$defs/NextStep"
+      },
+      "type": "array"
+    },
+    "proves": {
+      "items": {
+        "$ref": "#/$defs/ProveSummary"
+      },
+      "type": "array"
+    },
+    "runs": {
+      "items": {
+        "$ref": "#/$defs/RunSummary"
+      },
+      "type": "array"
+    },
+    "total_count": {
+      "description": "Runs listed in total before `-n` (the list may be limited).",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "warnings": {
+      "description": "Warnings of the command (also printed on stderr in text mode).",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "runs",
+    "total_count",
+    "hidden_trials_count",
+    "proves",
+    "next",
+    "warnings"
+  ],
+  "title": "oprobe run-list",
+  "type": "object",
+  "x-rust-type": "RunList"
+}

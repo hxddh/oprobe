@@ -7,31 +7,35 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 documentation = "https://docs.rs/oprobe-trace"
-description = "Embeddable request tracing for Apache OpenDAL: per-stage timing of every backend request, bounded-memory aggregates, optional OpenTelemetry metrics"
+description = "Profile any Apache OpenDAL operator in production: one layer times every backend request by stage, keeps bounded aggregates and writes .oprobe files the oprobe workbench opens"
 readme = "README.md"
-keywords = ["opendal", "tracing", "s3", "observability", "opentelemetry"]
+keywords = ["opendal", "profiler", "tracing", "s3", "observability"]
 categories = ["development-tools::profiling", "network-programming"]
-include = ["src/**/*", "tests/**/*", "Cargo.toml", "README.md", "LICENSE"]
+include = ["src/**/*", "tests/**/*", "benches/**/*", "Cargo.toml", "README.md", "LICENSE"]
+
+[package.metadata.docs.rs]
+features = ["otel", "schemars"]
 
 [features]
 default = []
 # OpenTelemetry metrics (`http.client.request.duration` with `oprobe.stage`/`oprobe.api`).
 otel = ["dep:opentelemetry"]
+# `schemars::JsonSchema` for the snapshot types.
+schemars = ["dep:schemars"]
+# For the oprobe binary only (no semver promise): exposes the recorder, rows and transport
+# internals, lifts `#[non_exhaustive]`, and adds the lab's TLS acceptor.
+__internal = ["schemars", "dep:tokio-rustls"]
 
 [dependencies]
 opendal-core = { workspace = true, features = ["executors-tokio"] }
 await-tree.workspace = true
-hyper.workspace = true
-hyper-util.workspace = true
+hyper-util = { version = "0.1", default-features = false, features = ["client-legacy"] }
 http.workspace = true
 http-body.workspace = true
-http-body-util.workspace = true
 httpdate.workspace = true
+# The same TLS stack as OpenDAL's default reqwest client (rustls with aws-lc-rs).
 rustls.workspace = true
-tokio-rustls.workspace = true
 rustls-pki-types.workspace = true
-webpki-roots.workspace = true
-rustls-native-certs.workspace = true
 rustls-platform-verifier.workspace = true
 reqwest.workspace = true
 tower-layer.workspace = true
@@ -39,17 +43,22 @@ tower-service.workspace = true
 url.workspace = true
 bytes.workspace = true
 futures.workspace = true
-tokio.workspace = true
+tokio = { version = "1.52", features = ["rt", "net", "sync", "time", "macros"] }
 hdrhistogram.workspace = true
 rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-schemars.workspace = true
 anyhow.workspace = true
 libc.workspace = true
+schemars = { workspace = true, optional = true }
+tokio-rustls = { workspace = true, optional = true }
 opentelemetry = { version = "0.31", default-features = false, features = ["metrics"], optional = true }
 
 [dev-dependencies]
 opendal-core = { workspace = true, features = ["executors-tokio", "services-memory"] }
 opentelemetry_sdk = { version = "0.31", default-features = false, features = ["metrics", "testing"] }
-tokio.workspace = true
+tokio = { version = "1.52", features = ["rt-multi-thread", "macros"] }
+
+[[bench]]
+name = "overhead"
+harness = false

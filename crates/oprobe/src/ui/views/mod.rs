@@ -1,12 +1,7 @@
-//! The screens, composed from `kit` and `chart`.
+//! The four views (design v6 §4) and the frame around them.
 
 pub mod compare;
-pub mod health;
-pub mod inspector;
-pub mod overview;
-pub mod requests;
+pub mod operator;
+pub mod profile;
+pub mod runs;
 pub mod shell;
-pub mod tabs;
-pub mod timeline;
-pub mod tools;
-pub mod welcome;

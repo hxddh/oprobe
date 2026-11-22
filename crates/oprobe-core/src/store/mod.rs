@@ -1,5 +1,5 @@
 //! Persistent state (design §3): the config file (targets, defaults), the run store
-//! (`runs/<id>.oprobe` + `.json` sidecars) and named baselines.
+//! (`runs/<id>.oprobe` + `.json` sidecars).
 //!
 //! Locations: `$OPROBE_CONFIG` or `<config_dir>/oprobe/config.toml`; data in
 //! `$OPROBE_DATA_DIR` or `<data_dir>/oprobe/` (platform dirs from the `dirs` crate). Every
@@ -9,7 +9,6 @@
 //! every directory it creates `0700` ([`private_file`], [`create_private_dir_all`]): the config
 //! may hold inline secrets, and run files name buckets, endpoints and object keys.
 
-pub mod baselines;
 pub mod config;
 pub mod runfile;
 pub mod runs;
@@ -20,8 +19,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-pub use baselines::{Baseline, Baselines};
-pub use config::{ConfigFile, Defaults, TargetEntry};
+pub use config::{ConfigFile, Defaults};
 pub use runs::{RunStore, RunSummary, read_run_file, resolve_run, write_run_file};
 pub use target_id::TargetId;
 
@@ -68,15 +66,6 @@ impl Paths {
 
     pub fn runs_dir(&self) -> PathBuf {
         self.data_dir.join("runs")
-    }
-
-    pub fn baselines_file(&self) -> PathBuf {
-        self.data_dir.join("baselines.toml")
-    }
-
-    /// Ceilings learned per target and workload (`analysis::capacity`).
-    pub fn capacity_file(&self) -> PathBuf {
-        self.data_dir.join("capacity.toml")
     }
 
     /// The run store under this data directory.

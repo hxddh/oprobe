@@ -1,44 +1,37 @@
-//! Honest charts on a canvas, shared by every chart of the app: real axes with units and nice
-//! ticks, a log latency axis, straight or stepped lines (never smoothed), a hover crosshair
-//! with a readout, one color per stage or series. Data arrives downsampled (`model::series`).
-//! In a terminal the same drawing has labels on whole cells, no grid (a braille grid drowns
-//! the data — U4), gutters as wide as their labels, and text swatches in the legends.
+//! Honest charts on a canvas: real axes with units and nice ticks, a log latency axis, stepped
+//! lines (never smoothed), a hover crosshair with a readout, one colour per series; and the live
+//! sparkline of a running measurement. In a terminal the same drawing has labels on whole
+//! cells and no grid (a braille grid drowns the data).
 
 use nsh_base::theme;
 use nsh_core::canvas::{CanvasTextAlign, CanvasTextBaseline};
 use nsh_core::prelude::*;
 
-use crate::ui::kit::{self, caption, paint, small, swatch, token};
-use crate::ui::model::scale::Scale;
+use crate::ui::fmt::{self, Scale};
+use crate::ui::kit::{self, caption, paint, small, swatch};
 
 /// One series of a plot.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Line {
     pub label: &'static str,
-    /// Theme token of its color.
+    /// Theme token of its colour.
     pub token: &'static str,
-    /// `(x, y)` sorted by x. With `step`, each point holds until the next (bucket aggregates).
+    /// `(x, y)` sorted by x; each point holds until the next (one-second buckets).
     pub pts: Vec<(f64, f64)>,
-    pub step: bool,
-    pub dashed: bool,
 }
 
-/// The unit of an axis (how its values read).
+/// How the values of an axis read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Unit {
-    Seconds,
     Ms,
     Rate,
-    Mib,
 }
 
 impl Unit {
     pub fn f(self) -> fn(f64) -> String {
         match self {
-            Unit::Seconds => fmt_s,
-            Unit::Ms => fmt_ms,
-            Unit::Rate => fmt_rate,
-            Unit::Mib => fmt_mib,
+            Unit::Ms => fmt::dur_ms,
+            Unit::Rate => |v| format!("{}/s", fmt::compact(v)),
         }
     }
 }
@@ -48,32 +41,25 @@ impl Unit {
 pub struct Plot {
     pub x: Scale,
     pub y: Scale,
-    /// Width of a step (the bucket), in x units; the last step ends there.
+    /// Width of a step in x units (the last step ends there).
     pub step_w: f64,
-    pub x_fmt: Unit,
     pub y_fmt: Unit,
     pub lines: Vec<Line>,
 }
 
 impl Plot {
-    /// Each line's value at `x` (the step holding it, or the nearest point).
-    pub fn values_at(&self, x: f64) -> Vec<(&'static str, &'static str, Option<f64>)> {
+    /// Each line's value at `x` (the step holding it).
+    pub fn values_at(&self, x: f64) -> Vec<(&'static str, Option<f64>)> {
         self.lines
             .iter()
             .map(|l| {
-                let v = if l.step {
-                    l.pts
-                        .iter()
-                        .rev()
-                        .find(|(px, _)| *px <= x && x < *px + self.step_w.max(1e-12))
-                        .map(|p| p.1)
-                } else {
-                    l.pts
-                        .iter()
-                        .min_by(|a, b| (a.0 - x).abs().total_cmp(&(b.0 - x).abs()))
-                        .map(|p| p.1)
-                };
-                (l.label, l.token, v)
+                let v = l
+                    .pts
+                    .iter()
+                    .rev()
+                    .find(|(px, _)| *px <= x && x < *px + self.step_w.max(1e-12))
+                    .map(|p| p.1);
+                (l.label, v)
             })
             .collect()
     }
@@ -89,74 +75,36 @@ pub struct Frame {
 }
 
 impl Frame {
-    pub fn standard() -> Self {
-        if kit::in_terminal() {
-            Self {
-                left: 56.0,
-                right: 8.0,
-                top: 0.0,
-                bottom: 16.0,
-            }
-        } else {
-            Self {
-                left: 52.0,
-                right: 10.0,
-                top: 6.0,
-                bottom: 18.0,
-            }
-        }
-    }
-    /// Points per character of an axis label (a terminal cell, or 11 px system text).
-    pub fn char_w() -> f32 {
-        if kit::in_terminal() { 8.0 } else { 6.6 }
-    }
-
-    /// [`Frame::standard`] with a left gutter as wide as the widest of `labels` (U4: no
-    /// clipped `.00k/s`).
+    /// A frame whose left gutter is as wide as the widest of `labels`.
     pub fn fit<S: AsRef<str>>(labels: &[S]) -> Self {
-        let mut f = Self::standard();
+        let term = kit::in_terminal();
         let chars = labels
             .iter()
             .map(|l| l.as_ref().chars().count())
             .max()
             .unwrap_or(0) as f32;
-        let gap = if kit::in_terminal() { 8.0 } else { 7.0 };
-        f.left = f.left.max(chars * Self::char_w() + gap);
-        f
+        let (cw, gap) = if term { (8.0, 8.0) } else { (6.6, 7.0) };
+        Self {
+            left: (chars * cw + gap).max(if term { 56.0 } else { 48.0 }),
+            right: if term { 8.0 } else { 10.0 },
+            top: if term { 0.0 } else { 6.0 },
+            bottom: if term { 16.0 } else { 18.0 },
+        }
     }
 
-    /// The frame of `plot` on a canvas `h` high: its y tick labels decide the gutter.
-    pub fn of(plot: &Plot, h: f32) -> Self {
-        let f = Self::standard();
-        let labels: Vec<String> = y_ticks(&plot.y, f.y0(h) - f.y1(), h)
-            .into_iter()
-            .map(plot.y_fmt.f())
-            .collect();
-        Self::fit(&labels)
-    }
-
-    pub fn x0(&self) -> f32 {
-        self.left
-    }
     pub fn x1(&self, w: f32) -> f32 {
         (w - self.right).max(self.left + 1.0)
     }
     pub fn y0(&self, h: f32) -> f32 {
         (h - self.bottom).max(self.top + 1.0)
     }
-    pub fn y1(&self) -> f32 {
-        self.top
-    }
 }
 
-const DASH: &[Points] = &[Points(4.0), Points(3.0)];
-
-/// The y ticks an axis `span` points tall shows (never closer than a label's height; a log
-/// axis keeps its decades first).
-pub fn y_ticks(y: &Scale, span: f32, h: f32) -> Vec<f64> {
+/// The y ticks an axis `h` points tall shows (never closer than a label's height).
+pub fn y_ticks(y: &Scale, h: f32) -> Vec<f64> {
     let mut ticks = y.ticks(if h < 120.0 { 3 } else { 4 });
     let line = if kit::in_terminal() { 16.0 } else { 14.0 };
-    let room = (span / line).max(2.0) as usize;
+    let room = (h / line).max(2.0) as usize;
     if ticks.len() > room && y.log {
         ticks.retain(|t| (t.log10() - t.log10().round()).abs() < 1e-6);
     }
@@ -167,10 +115,15 @@ pub fn y_ticks(y: &Scale, span: f32, h: f32) -> Vec<f64> {
     ticks
 }
 
-pub const FONT: &str = "11px system-ui";
+/// The frame of a y axis of `y` (formatted by `f`) on a canvas `h` high.
+pub fn frame_for(y: &Scale, f: fn(f64) -> String, h: f32) -> Frame {
+    let labels: Vec<String> = y_ticks(y, h).into_iter().map(f).collect();
+    Frame::fit(&labels)
+}
 
-#[allow(clippy::too_many_arguments)]
-/// Axes, grid and tick labels for `x` / `y` over a `w`×`h` canvas.
+const FONT: &str = "11px system-ui";
+
+/// Axes, grid and tick labels over a `w`×`h` canvas (x in seconds).
 pub fn axes(
     p: Painter,
     f: Frame,
@@ -178,21 +131,18 @@ pub fn axes(
     h: f32,
     x: &Scale,
     y: &Scale,
-    x_fmt: fn(f64) -> String,
     y_fmt: fn(f64) -> String,
 ) -> Painter {
-    let (x0, x1, y0, y1) = (f.x0(), f.x1(w), f.y0(h), f.y1());
-    let grid = paint("grid");
-    let axis = paint("axis");
-    let mut p = p.font(FONT).line_width(1.0);
-    // Horizontal grid (not in a terminal) and y labels.
-    let y_ticks = y_ticks(y, y0 - y1, h);
+    let (x0, x1, y0, y1) = (f.left, f.x1(w), f.y0(h), f.top);
+    let (grid, axis) = (paint("grid"), paint("axis"));
     let term = kit::in_terminal();
-    p = p
+    let mut p = p
+        .font(FONT)
+        .line_width(1.0)
         .text_align(CanvasTextAlign::Right)
         .text_baseline(CanvasTextBaseline::Middle);
-    for t in &y_ticks {
-        let py = y0 - (y.norm(*t) as f32) * (y0 - y1);
+    for t in y_ticks(y, y0 - y1) {
+        let py = y0 - (y.norm(t) as f32) * (y0 - y1);
         if !term {
             p = p
                 .stroke_color(grid)
@@ -201,17 +151,10 @@ pub fn axes(
                 .line_to(x1, py.round() + 0.5)
                 .stroke();
         }
-        p = p.fill_color(axis).fill_text(&y_fmt(*t), x0 - 5.0, py);
+        p = p.fill_color(axis).fill_text(&y_fmt(t), x0 - 5.0, py);
     }
-    // x labels (and short ticks), never closer than a label and two characters (U4).
-    let widest = x
-        .ticks(4)
-        .into_iter()
-        .map(|t| x_fmt(t).chars().count())
-        .max()
-        .unwrap_or(4) as f32;
-    let spacing = ((widest + 2.0) * Frame::char_w()).max(48.0);
-    let target = ((x1 - x0) / spacing).clamp(2.0, 8.0) as usize;
+    let cw = if term { 8.0 } else { 6.6 };
+    let target = ((x1 - x0) / (8.0_f32 * cw).max(48.0)).clamp(2.0, 8.0) as usize;
     p = p
         .text_align(CanvasTextAlign::Center)
         .text_baseline(CanvasTextBaseline::Top);
@@ -224,9 +167,8 @@ pub fn axes(
             .line_to(px.round() + 0.5, y0 + 3.0)
             .stroke()
             .fill_color(axis)
-            .fill_text(&x_fmt(t), px.min(w - 18.0), y0 + 4.0);
+            .fill_text(&fmt::clock_s(t), px.min(w - 18.0), y0 + 4.0);
     }
-    // The axes themselves.
     p.stroke_color(axis)
         .begin_path()
         .move_to(x0 + 0.5, y1)
@@ -235,58 +177,13 @@ pub fn axes(
         .stroke()
 }
 
-/// A line projected onto the canvas: its color token, dash, and its path in canvas points.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Path {
-    pub token: &'static str,
-    pub dashed: bool,
-    pub pts: Vec<(f32, f32)>,
-}
-
-/// The lines of `plot` projected onto a `w`×`h` canvas (steps expanded). Computed once per
-/// plot and size, not on every paint or mouse move.
-pub fn project(plot: &Plot, w: f32, h: f32) -> Vec<Path> {
-    let f = Frame::of(plot, h);
-    let (x0, x1, y0, y1) = (f.x0(), f.x1(w), f.y0(h), f.y1());
+/// The plot's axes and its stepped lines.
+pub fn paint_plot(plot: &Plot, w: f32, h: f32) -> Painter {
+    let f = frame_for(&plot.y, plot.y_fmt.f(), h);
+    let (x0, x1, y0, y1) = (f.left, f.x1(w), f.y0(h), f.top);
     let sx = |v: f64| x0 + (plot.x.norm(v) as f32) * (x1 - x0);
     let sy = |v: f64| y0 - (plot.y.norm(v) as f32) * (y0 - y1);
-    plot.lines
-        .iter()
-        .filter(|l| !l.pts.is_empty())
-        .map(|l| {
-            let mut pts = Vec::with_capacity(l.pts.len() * if l.step { 2 } else { 1 });
-            for (i, (x, y)) in l.pts.iter().enumerate() {
-                let py = sy(*y);
-                pts.push((sx(*x), py));
-                if l.step {
-                    let next = l.pts.get(i + 1).map(|n| n.0).unwrap_or(x + plot.step_w);
-                    pts.push((sx(next), py));
-                }
-            }
-            Path {
-                token: l.token,
-                dashed: l.dashed,
-                pts,
-            }
-        })
-        .collect()
-}
-
-/// The plot's axes and its (already projected) lines.
-pub fn paint_plot(plot: &Plot, paths: &[Path], w: f32, h: f32) -> Painter {
-    let f = Frame::of(plot, h);
-    let (x0, x1, y0, y1) = (f.x0(), f.x1(w), f.y0(h), f.y1());
-    let mut p = axes(
-        Painter::new(),
-        f,
-        w,
-        h,
-        &plot.x,
-        &plot.y,
-        plot.x_fmt.f(),
-        plot.y_fmt.f(),
-    );
-    p = p
+    let mut p = axes(Painter::new(), f, w, h, &plot.x, &plot.y, plot.y_fmt.f())
         .save()
         .begin_path()
         .rect(bounds(
@@ -294,33 +191,29 @@ pub fn paint_plot(plot: &Plot, paths: &[Path], w: f32, h: f32) -> Painter {
             size(px(x1 - x0), px(y0 - y1)),
         ))
         .clip();
-    for l in paths {
-        p = p
-            .stroke_color(paint(l.token))
-            .line_width(1.5)
-            .line_dash(if l.dashed { DASH } else { &[] })
-            .begin_path();
+    for l in plot.lines.iter().filter(|l| !l.pts.is_empty()) {
+        p = p.stroke_color(paint(l.token)).line_width(1.5).begin_path();
         for (i, (x, y)) in l.pts.iter().enumerate() {
+            let next = l.pts.get(i + 1).map(|n| n.0).unwrap_or(x + plot.step_w);
             p = if i == 0 {
-                p.move_to(*x, *y)
+                p.move_to(sx(*x), sy(*y))
             } else {
-                p.line_to(*x, *y)
+                p.line_to(sx(*x), sy(*y))
             };
+            p = p.line_to(sx(next), sy(*y));
         }
         p = p.stroke();
     }
-    p.line_dash(&[]).restore()
+    p.restore()
 }
 
-/// The crosshair at canvas x `hx` with a dot on each line (its own layer over the plot, so a
-/// mouse move repaints only this).
-pub fn paint_crosshair(plot: &Plot, w: f32, h: f32, hx: f32) -> Painter {
-    let f = Frame::of(plot, h);
-    let (x0, x1, y0, y1) = (f.x0(), f.x1(w), f.y0(h), f.y1());
+/// The hover crosshair at canvas x `hx` (its own layer: a mouse move repaints only this).
+fn paint_crosshair(plot: &Plot, w: f32, h: f32, hx: f32) -> Painter {
+    let f = frame_for(&plot.y, plot.y_fmt.f(), h);
+    let (x0, x1, y0, y1) = (f.left, f.x1(w), f.y0(h), f.top);
     if hx < x0 || hx > x1 {
         return Painter::new();
     }
-    let sy = |v: f64| y0 - (plot.y.norm(v) as f32) * (y0 - y1);
     let xv = plot.x.value(((hx - x0) / (x1 - x0)) as f64);
     let mut p = Painter::new()
         .stroke_color(paint("axis"))
@@ -329,106 +222,28 @@ pub fn paint_crosshair(plot: &Plot, w: f32, h: f32, hx: f32) -> Painter {
         .move_to(hx.round() + 0.5, y1)
         .line_to(hx.round() + 0.5, y0)
         .stroke();
-    for (_, tok, v) in plot.values_at(xv) {
+    for ((_, v), l) in plot.values_at(xv).into_iter().zip(&plot.lines) {
         if let Some(v) = v {
+            let py = y0 - (plot.y.norm(v) as f32) * (y0 - y1);
             p = p
-                .fill_color(paint(tok))
+                .fill_color(paint(l.token))
                 .begin_path()
-                .arc(hx, sy(v), 3.0, 0.0, std::f32::consts::TAU)
+                .arc(hx, py, 3.0, 0.0, std::f32::consts::TAU)
                 .fill();
         }
     }
     p
 }
 
-/// What a chart says to assistive technology: per line, its range and mean over the axis.
-pub fn summary(heading: &str, p: &Plot) -> String {
-    let yf = p.y_fmt.f();
-    let xf = p.x_fmt.f();
-    let mut s = format!("{heading}, {} to {}", xf(p.x.min), xf(p.x.max));
-    for l in &p.lines {
-        if l.pts.is_empty() {
-            continue;
-        }
-        let (mut lo, mut hi, mut sum) = (f64::INFINITY, f64::NEG_INFINITY, 0.0);
-        for (_, y) in &l.pts {
-            lo = lo.min(*y);
-            hi = hi.max(*y);
-            sum += y;
-        }
-        let mean = sum / l.pts.len() as f64;
-        let name = if l.dashed && l.token == "series-b" {
-            format!("{} (B)", l.label)
-        } else {
-            l.label.to_owned()
-        };
-        s += &format!(
-            "; {name}: min {}, mean {}, max {}",
-            yf(lo),
-            yf(mean),
-            yf(hi)
-        );
-    }
-    s
-}
-
-/// The plot as a table: one row per x, one column per line (the chart's data, readable).
-pub fn table(p: &Plot) -> (Vec<String>, Vec<Vec<String>>) {
-    let mut head = vec!["at".to_owned()];
-    head.extend(p.lines.iter().map(|l| {
-        if l.dashed && l.token == "series-b" {
-            format!("{} (B)", l.label)
-        } else {
-            l.label.to_owned()
-        }
-    }));
-    let mut xs: Vec<f64> = p
-        .lines
-        .iter()
-        .flat_map(|l| l.pts.iter().map(|q| q.0))
-        .collect();
-    xs.sort_by(f64::total_cmp);
-    xs.dedup();
-    let yf = p.y_fmt.f();
-    let rows = xs
-        .into_iter()
-        .map(|x| {
-            let mut r = vec![(p.x_fmt.f())(x)];
-            for l in &p.lines {
-                r.push(
-                    l.pts
-                        .iter()
-                        .find(|q| q.0 == x)
-                        .map(|q| yf(q.1))
-                        .unwrap_or_else(|| "—".into()),
-                );
-            }
-            r
-        })
-        .collect();
-    (head, rows)
-}
-
-/// A chart: its title, legend and hover readout above the canvas. The plot and the crosshair
-/// are two layers; the canvas carries a text summary, and "Data" shows the numbers as a
-/// table (accessibility, design v4 §11).
+/// A chart: its heading, legend and hover readout above the canvas.
 pub fn chart(
-    heading: &'static str,
+    heading: impl IntoReactive<SharedString>,
     height: f32,
     data: impl Fn() -> Option<Plot> + 'static,
 ) -> View {
     let plot = computed(data);
     let size = signal((0.0_f32, 0.0_f32));
     let hover = signal(None::<f32>);
-    let show_table = signal(false);
-    // Projected once per plot and size (not per paint or mouse move).
-    let paths = computed(move || {
-        let (w, h) = size.get();
-        plot.with(|p| match p {
-            Some(p) if w > 0.0 => project(p, w, h),
-            _ => Vec::new(),
-        })
-    });
     let readout = move || -> SharedString {
         let Some(hx) = hover.get() else {
             return "".into();
@@ -438,15 +253,13 @@ pub fn chart(
             let Some(p) = p else {
                 return SharedString::default();
             };
-            let f = Frame::of(p, h);
-            let t = ((hx - f.x0()) / (f.x1(w) - f.x0())).clamp(0.0, 1.0) as f64;
+            let f = frame_for(&p.y, p.y_fmt.f(), h);
+            let t = ((hx - f.left) / (f.x1(w) - f.left)).clamp(0.0, 1.0) as f64;
             let xv = p.x.value(t);
-            let mut s = format!("at {}", (p.x_fmt.f())(xv));
-            for (label, _, v) in p.values_at(xv) {
-                s += &format!(
-                    " · {label} {}",
-                    v.map(|v| (p.y_fmt.f())(v)).unwrap_or_else(|| "—".into())
-                );
+            let mut s = fmt::clock_s(xv);
+            for (label, v) in p.values_at(xv) {
+                let v = v.map(p.y_fmt.f()).unwrap_or_else(|| "—".into());
+                s += &format!(" · {label} {v}");
             }
             s.into()
         })
@@ -457,16 +270,10 @@ pub fn chart(
                 .map(|p| {
                     p.lines
                         .iter()
-                        .map(|l| (l.label, l.token, l.dashed))
+                        .map(|l| (l.label, l.token))
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default()
-        })
-    };
-    let described = move || -> SharedString {
-        plot.with(|p| match p {
-            Some(p) => summary(heading, p).into(),
-            None => format!("{heading}: no data yet").into(),
         })
     };
     view()
@@ -486,17 +293,13 @@ pub fn chart(
                         view()
                             .flex_row()
                             .gap_3()
-                            .children(items.into_iter().map(|(label, tok, dashed)| {
+                            .children(items.into_iter().map(|(label, tok)| {
                                 view()
                                     .flex_row()
                                     .items_center()
                                     .gap_1()
-                                    .child(legend_swatch(tok, dashed))
-                                    .child(small(if dashed && tok == "series-b" {
-                                        format!("{label} (B)")
-                                    } else {
-                                        label.to_owned()
-                                    }))
+                                    .child(swatch(tok))
+                                    .child(small(label))
                             }))
                             .into_element()
                     })
@@ -507,142 +310,96 @@ pub fn chart(
                         .number_of_lines(1)
                         .flex_1()
                         .min_w(px(0.0)),
-                )
-                .child(
-                    nsh_base::button()
-                        .on_press(move || show_table.set(!show_table.get_untracked()))
-                        .accessibility_label(format!("{heading}: show the data as a table"))
-                        .px(px(4.0))
-                        .rounded(px(4.0))
-                        .flex_shrink_0()
-                        .hover(|st| st.bg(move || theme().secondary))
-                        .focus_visible(kit::ring)
-                        .child(small(
-                            move || {
-                                if show_table.get() { "Chart" } else { "Data" }
-                            },
-                        )),
                 ),
         )
-        .child(dynamic(move || {
-            if show_table.get() {
-                let t = plot.with(|p| p.as_ref().map(table));
-                return untracked(|| data_table(heading, height, t).into_element());
-            }
-            untracked(|| {
-                view()
-                    .h(px(height))
-                    .min_w(px(0.0))
-                    .child(
-                        canvas(move || {
-                            let (w, h) = size.get();
-                            // Repaint when the appearance changes (token colors).
-                            let _ = theme();
-                            paths.with(|ps| {
-                                plot.with(|p| match p {
-                                    Some(p) if w > 0.0 => paint_plot(p, ps, w, h),
-                                    _ => Painter::new(),
-                                })
-                            })
-                        })
-                        .absolute()
-                        .top(px(0.0))
-                        .left(px(0.0))
-                        .right(px(0.0))
-                        .bottom(px(0.0))
-                        .label(described)
-                        .on_layout(move |frame: &Bounds<Points>| {
-                            size.set((frame.size.width.0, frame.size.height.0))
-                        }),
-                    )
-                    .child(
-                        // The crosshair layer: only this repaints as the mouse moves.
-                        canvas(move || {
-                            let (w, h) = size.get();
-                            let Some(hx) = hover.get() else {
-                                return Painter::new();
-                            };
-                            plot.with(|p| match p {
-                                Some(p) if w > 0.0 => paint_crosshair(p, w, h, hx),
-                                _ => Painter::new(),
-                            })
-                        })
-                        .absolute()
-                        .top(px(0.0))
-                        .left(px(0.0))
-                        .right(px(0.0))
-                        .bottom(px(0.0))
-                        .on_mouse_move(move |e: &MouseEvent| hover.set(Some(e.position.x.0)))
-                        .on_mouse_leave(move |_: &MouseEvent| hover.set(None)),
-                    )
-                    .into_element()
-            })
-        }))
-}
-
-/// A legend's swatch: a coloured square in a window; in a terminal a coloured `■` (or `╌` for a
-/// dashed line), since an 8-point box is less than a cell (U4).
-pub fn legend_swatch(tok: &'static str, dashed: bool) -> View {
-    if kit::in_terminal() {
-        view().child(
-            text(if dashed { "╌" } else { "■" })
-                .text_size(kit::sz(11.0))
-                .text_color(token(tok)),
-        )
-    } else {
-        swatch(token(tok))
-    }
-}
-
-/// A chart's numbers as a scrollable table of the same height.
-fn data_table(
-    heading: &'static str,
-    height: f32,
-    t: Option<(Vec<String>, Vec<Vec<String>>)>,
-) -> View {
-    let Some((head, rows)) = t else {
-        return view().h(px(height)).child(small("No data yet"));
-    };
-    let cell = |s: String| {
-        small(s)
-            .tabular_nums()
-            .number_of_lines(1)
-            .w(px(90.0))
-            .flex_shrink_0()
-    };
-    view().h(px(height)).min_w(px(0.0)).child(
-        scroll().flex_1().label(format!("{heading} data")).child(
+        .child(
             view()
+                .h(px(height))
+                .min_w(px(0.0))
                 .child(
-                    view()
-                        .flex_row()
-                        .gap_2()
-                        .children(head.into_iter().map(|h| caption(h).w(px(90.0)))),
+                    canvas(move || {
+                        let (w, h) = size.get();
+                        let _ = theme();
+                        plot.with(|p| match p {
+                            Some(p) if w > 0.0 => paint_plot(p, w, h),
+                            _ => Painter::new(),
+                        })
+                    })
+                    .absolute()
+                    .top(px(0.0))
+                    .left(px(0.0))
+                    .right(px(0.0))
+                    .bottom(px(0.0))
+                    .on_layout(move |frame: &Bounds<Points>| {
+                        size.set((frame.size.width.0, frame.size.height.0))
+                    }),
                 )
-                .children(
-                    rows.into_iter()
-                        .map(move |r| view().flex_row().gap_2().children(r.into_iter().map(cell))),
+                .child(
+                    canvas(move || {
+                        let (w, h) = size.get();
+                        let Some(hx) = hover.get() else {
+                            return Painter::new();
+                        };
+                        plot.with(|p| match p {
+                            Some(p) if w > 0.0 => paint_crosshair(p, w, h, hx),
+                            _ => Painter::new(),
+                        })
+                    })
+                    .absolute()
+                    .top(px(0.0))
+                    .left(px(0.0))
+                    .right(px(0.0))
+                    .bottom(px(0.0))
+                    .on_mouse_move(move |e: &MouseEvent| hover.set(Some(e.position.x.0)))
+                    .on_mouse_leave(move |_: &MouseEvent| hover.set(None)),
                 ),
-        ),
-    )
+        )
 }
 
-/// Time axis label (seconds).
-pub fn fmt_s(v: f64) -> String {
-    crate::ui::model::fmt::clock_s(v)
-}
-
-/// Latency axis label (ms).
-pub fn fmt_ms(v: f64) -> String {
-    crate::ui::model::fmt::dur_ms(v)
-}
-
-/// Rate axis label.
-pub fn fmt_rate(v: f64) -> String {
-    format!("{}/s", crate::ui::model::fmt::compact(v))
-}
-
-/// MiB/s axis label.
-pub fn fmt_mib(v: f64) -> String {
-    crate::ui::model::fmt::compact(v)
+/// The live sparkline of a running measurement: the values so far, scaled to their maximum,
+/// with the area under them tinted.
+pub fn sparkline(height: f32, values: impl Fn() -> Vec<f64> + 'static) -> impl IntoElement {
+    let size = signal((0.0_f32, 0.0_f32));
+    let values = computed(values);
+    canvas(move || {
+        let (w, h) = size.get();
+        let _ = theme();
+        values.with(|v| {
+            if v.len() < 2 || w <= 0.0 {
+                return Painter::new();
+            }
+            let max = v.iter().copied().fold(0.0, f64::max).max(1e-9);
+            let step = w / (v.len() - 1) as f32;
+            let y = |x: f64| h - 1.0 - (x / max) as f32 * (h - 2.0);
+            let mut p = Painter::new()
+                .global_alpha(0.18)
+                .fill_color(paint("series-a"))
+                .begin_path()
+                .move_to(0.0, h);
+            for (i, x) in v.iter().enumerate() {
+                p = p.line_to(i as f32 * step, y(*x));
+            }
+            p = p
+                .line_to(w, h)
+                .close_path()
+                .fill()
+                .global_alpha(1.0)
+                .stroke_color(paint("series-a"))
+                .line_width(1.5)
+                .begin_path();
+            for (i, x) in v.iter().enumerate() {
+                let px = i as f32 * step;
+                p = if i == 0 {
+                    p.move_to(px, y(*x))
+                } else {
+                    p.line_to(px, y(*x))
+                };
+            }
+            p.stroke()
+        })
+    })
+    .h(px(height))
+    .min_w(px(0.0))
+    .test_id("sparkline")
+    .on_layout(move |frame: &Bounds<Points>| size.set((frame.size.width.0, frame.size.height.0)))
 }

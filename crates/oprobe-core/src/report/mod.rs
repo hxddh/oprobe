@@ -1,11 +1,8 @@
-//! Renderers of the Report v3 (`crate::model::Report`) and the regression gate.
+//! Renderers of the report (`crate::model::Report`): the presentation model ([`view`]), the
+//! brief result of `run` ([`brief`]) and the full profile of `show` ([`terminal`]).
 
 pub mod brief;
 
-pub mod diff;
-pub mod html;
-mod html_assets;
-pub mod markdown;
 pub mod style;
 pub mod terminal;
 pub mod view;
@@ -13,57 +10,8 @@ pub mod view;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
 
 pub use crate::model::{REPORT_SCHEMA as SCHEMA, Report, Run};
-
-/// Summary of an auto-tuning session (the tuner's own form; reports embed
-/// [`crate::model::TuneReport`]).
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct TuneSummary {
-    /// `goodput`, `p99`, `cost` or `balanced`.
-    pub objective: String,
-    /// What goodput was measured in: `ops_per_s` or `mib_per_s`.
-    pub metric_unit: String,
-    pub trials: Vec<crate::tune::Trial>,
-    pub baseline_trial: usize,
-    /// The trial whose knobs are recommended.
-    pub recommended_trial: usize,
-    /// The recommendation's confirmation run (a longer window).
-    pub winner_trial: usize,
-    /// The best trial within the SLA and the throttle budget, ignoring the safety margin.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub best_feasible_trial: Option<usize>,
-    /// The baseline met the SLA and the throttle budget.
-    pub baseline_feasible: bool,
-    /// Objective improvement of the recommendation vs the baseline (ratio, positive =
-    /// better); absent when the baseline was infeasible or above the margin (never negative).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub improvement: Option<f64>,
-    /// One line: what is recommended and why (never a negative improvement).
-    pub headline: String,
-    /// How much better the best feasible trial measured than the recommendation (the cost of
-    /// the safety margin).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub margin_cost_ratio: Option<f64>,
-    /// Lowest concurrency that exceeded the throttle budget.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub throttle_ceiling: Option<usize>,
-    /// The capacity model's concurrency within the margin.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub safe_concurrency: Option<usize>,
-    /// The pooled capacity estimate over every trial.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub capacity: Option<crate::analysis::capacity::Capacity>,
-    pub max_throttle_ratio: f64,
-    /// Trials not dominated on (goodput, p99, cost, throttling).
-    #[serde(default)]
-    pub pareto: Vec<usize>,
-    /// No trial met the SLA: the winner is the least-bad configuration, not a recommendation.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub no_feasible_trial: bool,
-    pub notes: Vec<String>,
-}
 
 /// Load a report from a JSON file (a bare report or a `-o json` command result).
 pub fn load_json(path: &Path) -> Result<Report> {
@@ -157,12 +105,12 @@ pub mod fixture {
                 ..Default::default()
             },
             workload: WorkloadInfo {
-                preset: "parquet".into(),
+                preset: "range-reads".into(),
                 duration_s: 10.0,
                 access: "uniform".into(),
                 ..Default::default()
             },
-            knobs: Default::default(),
+            effective_write: Default::default(),
             sla: Default::default(),
             verdict: Verdict {
                 level: VerdictLevel::Attention,
@@ -187,10 +135,8 @@ pub mod fixture {
             bytes: Default::default(),
             cache: Default::default(),
             integrity: Default::default(),
-            client: Default::default(),
             self_stats: Default::default(),
             schedule: Default::default(),
-            workers: Vec::new(),
             dimensions: Default::default(),
             sampling: Default::default(),
             open_loop: None,
@@ -221,18 +167,16 @@ pub mod fixture {
                     }],
                     ..Default::default()
                 },
-                advice: "Lower the concurrency to 16".into(),
-                verification: Some(Verification {
-                    description: "re-run with fewer workers".into(),
-                    rerun: "oprobe run --from 20261120-143005-a1b2 --set concurrency=16".into(),
-                    ..Default::default()
-                }),
+                remedy: {
+                    let mut r = crate::analysis::findings::remedy("throttling", None);
+                    r.next = Some("oprobe prove 20261120-143005-a1b2 throttling".into());
+                    r
+                },
+                ..Default::default()
             }],
-            cost: Default::default(),
             slowest: vec![2, 1],
             cleanup: Default::default(),
             warnings: vec![],
-            tune: None,
         };
         r.summary.ops = 1000;
         r.summary.ops_per_s = 100.0;

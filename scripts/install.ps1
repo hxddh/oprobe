@@ -1,24 +1,66 @@
-# oprobe installer for Windows.
-#   irm https://github.com/hxddh/oprobe/releases/latest/download/install.ps1 | iex
-# Installs to %LOCALAPPDATA%\Programs\oprobe and adds it to the user PATH and to this session.
-#
-# Options (environment):
-#   OPROBE_VERSION=4.0.0       install this version instead of the latest
-#   OPROBE_INSTALL_DIR=DIR     where to install (default %LOCALAPPDATA%\Programs\oprobe)
-#   OPROBE_MODIFY_PATH=0       do not touch the user PATH (default: add the directory)
-#   OPROBE_RELEASE_BASE=URL    release download base (mirrors, tests)
-#   OPROBE_API=URL             GitHub API base (default https://api.github.com)
-#   OPROBE_VERIFY=auto|require|checksum
-#                              signature policy after the SHA-256 check (default auto; see install.sh)
-#   OPROBE_MINISIGN_PUBKEY=KEY minisign public key (overrides the embedded one)
-#
-# Verification (design v5 §5), after the SHA-256 check: the GitHub build provenance
-# (`gh attestation verify`, when gh is installed and logged in), otherwise a minisign signature
-# over SHA256SUMS (when minisign.exe is installed and the release is signed), otherwise a warning
-# (an error with OPROBE_VERIFY=require). A verification that fails is always an error.
-#
+<#
+.SYNOPSIS
+  oprobe installer for Windows.
+.DESCRIPTION
+  Downloads the oprobe archive for this machine, verifies it against SHA256SUMS (and its GitHub
+  build provenance when `gh` is installed and logged in), installs it to
+  %LOCALAPPDATA%\Programs\oprobe and adds that directory to the user PATH and to this session.
+
+    irm https://github.com/hxddh/oprobe/releases/latest/download/install.ps1 | iex
+    & ([scriptblock]::Create((irm https://github.com/hxddh/oprobe/releases/latest/download/install.ps1))) -Cli
+
+  Environment: OPROBE_VERSION, OPROBE_INSTALL_DIR, OPROBE_FLAVOR=app|cli, OPROBE_MODIFY_PATH=0,
+  OPROBE_RELEASE_BASE (mirrors, tests), OPROBE_API, OPROBE_VERIFY=auto|require|checksum,
+  OPROBE_MINISIGN_PUBKEY (a minisign signature over SHA256SUMS is checked only with a key: this
+  one, or one embedded by the release workflow when the release is signed).
+.PARAMETER Cli
+  Install the CLI-only build (no app).
+.PARAMETER Version
+  Install this version (X.Y.Z) instead of the latest.
+.PARAMETER InstallDir
+  Install into this directory.
+.PARAMETER Help
+  Print this help and exit.
+.LINK
+  https://github.com/hxddh/oprobe/blob/main/docs/install.md
+#>
 # The latest version is resolved without the GitHub API when possible, falling back on any failure:
 #   1. <base>/latest/download/latest.json   2. the <base>/latest redirect   3. the GitHub API
+param(
+  [switch]$Cli,
+  [string]$Version = '',
+  [string]$InstallDir = '',
+  [switch]$Help
+)
+if ($Help) {
+  Write-Host @'
+oprobe installer for Windows
+
+Usage:
+  irm https://github.com/hxddh/oprobe/releases/latest/download/install.ps1 | iex
+  & ([scriptblock]::Create((irm https://github.com/hxddh/oprobe/releases/latest/download/install.ps1))) [OPTIONS]
+  ./install.ps1 [OPTIONS]
+
+Options:
+  -Cli               install the CLI-only build (no app)          (OPROBE_FLAVOR=cli)
+  -Version X.Y.Z     install this version instead of the latest   (OPROBE_VERSION)
+  -InstallDir DIR    install into DIR                             (OPROBE_INSTALL_DIR)
+  -Help              print this help and exit
+
+Environment:
+  OPROBE_MODIFY_PATH=0        do not touch the user PATH (default: add the directory)
+  OPROBE_RELEASE_BASE=URL     release download base (mirrors, tests)
+  OPROBE_API=URL              GitHub API base (default https://api.github.com)
+  OPROBE_VERIFY=auto|require|checksum
+                              after the SHA-256 check: also verify the build provenance when gh is
+                              logged in (auto, default), insist on it (require), or skip it
+  OPROBE_MINISIGN_PUBKEY=KEY  verify SHA256SUMS.minisig with this key; without a key no signature
+                              is checked
+
+Docs: https://github.com/hxddh/oprobe/blob/main/docs/install.md
+'@
+  return
+}
 $ErrorActionPreference = 'Stop'
 # The progress bar makes Invoke-WebRequest many times slower on Windows PowerShell 5.1.
 $ProgressPreference = 'SilentlyContinue'
@@ -29,7 +71,8 @@ $base = if ($env:OPROBE_RELEASE_BASE) { $env:OPROBE_RELEASE_BASE.TrimEnd('/') } 
 $api = if ($env:OPROBE_API) { $env:OPROBE_API.TrimEnd('/') } else { 'https://api.github.com' }
 $verify = if ($env:OPROBE_VERIFY) { $env:OPROBE_VERIFY } else { 'auto' }
 if (@('auto', 'require', 'checksum') -notcontains $verify) { throw 'oprobe-install: OPROBE_VERIFY must be auto, require or checksum' }
-# The release's minisign public key; the release workflow fills it in (docs/releasing.md#signing).
+# The release's minisign public key. The release workflow fills it in only when the repository
+# variable MINISIGN_PUBKEY is set (docs/releasing.md#signing); empty: no signature is checked.
 $embeddedPubkey = ''
 $pubkey = if ($env:OPROBE_MINISIGN_PUBKEY) { $env:OPROBE_MINISIGN_PUBKEY } else { $embeddedPubkey }
 
@@ -89,10 +132,13 @@ function Resolve-Latest {
   throw "oprobe-install: cannot determine the latest version (set `$env:OPROBE_VERSION, or download from https://github.com/$repo/releases)"
 }
 
-$version = $env:OPROBE_VERSION
+$flavor = if ($Cli) { 'cli' } elseif ($env:OPROBE_FLAVOR) { $env:OPROBE_FLAVOR } else { 'app' }
+if (@('app', 'cli') -notcontains $flavor) { throw 'oprobe-install: OPROBE_FLAVOR must be app or cli' }
+$version = if ($Version) { $Version } else { $env:OPROBE_VERSION }
 if (-not $version) { $version = Resolve-Latest }
 $version = $version.TrimStart('v')
-$name = "oprobe-$version-$target"
+# The app build is `oprobe-<ver>-<target>`, the CLI-only build `oprobe-cli-<ver>-<target>`.
+$name = if ($flavor -eq 'cli') { "oprobe-cli-$version-$target" } else { "oprobe-$version-$target" }
 $url = "$base/download/v$version"
 $tmp = New-Item -ItemType Directory -Path (Join-Path ([IO.Path]::GetTempPath()) ([guid]::NewGuid()))
 try {
@@ -128,10 +174,11 @@ try {
     else { Write-Warning 'only the SHA-256 checksum was verified; install gh and run `gh auth login` to check the build provenance too' }
   }
   Expand-Archive "$tmp\$name.zip" -DestinationPath $tmp -Force
-  $dest = if ($env:OPROBE_INSTALL_DIR) { $env:OPROBE_INSTALL_DIR } else { Join-Path $env:LOCALAPPDATA 'Programs\oprobe' }
+  $dest = if ($InstallDir) { $InstallDir } elseif ($env:OPROBE_INSTALL_DIR) { $env:OPROBE_INSTALL_DIR } else { Join-Path $env:LOCALAPPDATA 'Programs\oprobe' }
   New-Item -ItemType Directory -Force -Path $dest | Out-Null
   Copy-Item "$tmp\$name\*" $dest -Recurse -Force
-  Write-Host "Installed oprobe $version to $dest\oprobe.exe"
+  $what = if ($flavor -eq 'cli') { "oprobe $version (CLI only)" } else { "oprobe $version" }
+  Write-Host "Installed $what to $dest\oprobe.exe"
 
   $onPath = ($env:Path -split ';' | Where-Object { $_ -and ($_.TrimEnd('\') -ieq $dest.TrimEnd('\')) })
   if ($env:OPROBE_MODIFY_PATH -eq '0') {

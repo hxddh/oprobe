@@ -1,12 +1,11 @@
 //! Observer-effect benchmark: the same workload through
 //!   A. plain OpenDAL with its default reqwest client and the same timeout/retry layers (no oprobe),
 //!   B. oprobe's default tracing (OpenDAL's reqwest client, observed),
-//!   C. oprobe `--microscope` (oprobe's own instrumented pool),
 //! against a local TLS lab server. Prints throughput, latency and client CPU per GiB.
 //!
 //! cargo run --release --example overhead [-- <seconds per round> <rounds>]
 //!
-//! Maintainers: OVERHEAD_DEBUG=1 MODES=plain,client,fbare,fnorec,mbare,traced,micro selects
+//! Maintainers: OVERHEAD_DEBUG=1 MODES=plain,client,fbare,fnorec,traced selects
 //! bisection variants (configured client only, bare transports without layers).
 
 use std::sync::Arc;
@@ -18,10 +17,10 @@ use opendal_core::HttpTransporter;
 use opendal_core::OperationContext;
 use opendal_core::raw::{Layer, Servicer};
 use opendal_http_transport_reqwest::ReqwestTransport;
-use oprobe::config::{Knobs, TransportMode};
 use oprobe::engine::operator::{base_operator, measured_operator};
 use oprobe::engine::procstat::usage;
 use oprobe::lab::{LabConfig, LabServer, lab_ca_pem};
+use oprobe::operator::{HttpOptions, OperatorSpec};
 use oprobe::trace::{OpCompletion, OpScope, Phase, Recorder};
 
 /// Exactly what the `opendal` facade installs by default, with the lab CA trusted.
@@ -38,13 +37,10 @@ impl Layer for PlainOpendal {
 enum Mode {
     Plain,
     Traced,
-    Microscope,
     /// Bisect: the fidelity transport's reqwest client, no oprobe wrapper or layers.
     ConfiguredClient,
     /// Bisect: the fidelity transport alone (no other layers, no scopes).
     FidelityBare,
-    /// Bisect: the microscope transport alone.
-    MicroscopeBare,
     /// Bisect: the fidelity transport without a recorder.
     FidelityNoRec,
 }
@@ -54,10 +50,8 @@ impl Mode {
         match self {
             Mode::Plain => "OpenDAL, no oprobe",
             Mode::Traced => "oprobe default",
-            Mode::Microscope => "oprobe --microscope",
             Mode::ConfiguredClient => "[bisect] client only",
             Mode::FidelityBare => "[bisect] fidelity bare",
-            Mode::MicroscopeBare => "[bisect] microscope bare",
             Mode::FidelityNoRec => "[bisect] fidelity no-rec",
         }
     }
@@ -151,7 +145,8 @@ async fn main() -> anyhow::Result<()> {
     let rounds: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(3);
     let lab = LabServer::spawn("127.0.0.1:0", LabConfig::default()).await?;
     let profile = lab.profile("bench");
-    let base = base_operator(&profile.target)?;
+    let target = profile.operator.target()?;
+    let base = base_operator(&target)?;
     let client = reqwest::Client::builder()
         .add_root_certificate(reqwest::Certificate::from_pem(lab_ca_pem().as_bytes())?)
         .build()?;
@@ -192,7 +187,7 @@ async fn main() -> anyhow::Result<()> {
             "client", "ops/s", "MiB/s", "p50 ms", "p99 ms", "CPU s / GiB"
         );
         let mut base_row = None;
-        let mut modes = vec![Mode::Plain, Mode::Traced, Mode::Microscope];
+        let mut modes = vec![Mode::Plain, Mode::Traced];
         if std::env::var("OVERHEAD_DEBUG").is_ok() {
             modes = std::env::var("MODES")
                 .map(|m| {
@@ -200,11 +195,10 @@ async fn main() -> anyhow::Result<()> {
                         .map(|x| match x {
                             "plain" => Mode::Plain,
                             "traced" => Mode::Traced,
-                            "micro" => Mode::Microscope,
                             "client" => Mode::ConfiguredClient,
                             "fbare" => Mode::FidelityBare,
                             "fnorec" => Mode::FidelityNoRec,
-                            _ => Mode::MicroscopeBare,
+                            _ => Mode::Traced,
                         })
                         .collect()
                 })
@@ -218,8 +212,8 @@ async fn main() -> anyhow::Result<()> {
                 Mode::ConfiguredClient => {
                     let t = oprobe::net::FidelityTransport::new(
                         oprobe::engine::operator::transport_config(
-                            &profile.target,
-                            &Knobs::default(),
+                            &target,
+                            &HttpOptions::default(),
                         )?,
                         false,
                         None,
@@ -232,8 +226,8 @@ async fn main() -> anyhow::Result<()> {
                 Mode::FidelityBare => {
                     let t = oprobe::net::FidelityTransport::new(
                         oprobe::engine::operator::transport_config(
-                            &profile.target,
-                            &Knobs::default(),
+                            &target,
+                            &HttpOptions::default(),
                         )?,
                         false,
                         Some(rec.clone()),
@@ -243,46 +237,34 @@ async fn main() -> anyhow::Result<()> {
                 Mode::FidelityNoRec => {
                     let t = oprobe::net::FidelityTransport::new(
                         oprobe::engine::operator::transport_config(
-                            &profile.target,
-                            &Knobs::default(),
+                            &target,
+                            &HttpOptions::default(),
                         )?,
                         false,
                         None,
                     )?;
                     base.clone().layer(PlainOpendal(HttpTransporter::new(t)))
                 }
-                Mode::MicroscopeBare => {
-                    let t = oprobe::engine::operator::transport(
-                        &profile.target,
-                        &Knobs::default(),
-                        Some(rec.clone()),
-                    )?;
-                    base.clone().layer(PlainOpendal(HttpTransporter::new(t)))
-                }
-                Mode::Traced | Mode::Microscope => {
-                    let knobs = Knobs {
-                        transport: if mode == Mode::Traced {
-                            TransportMode::Opendal
-                        } else {
-                            TransportMode::Microscope
-                        },
-                        ..Knobs::default()
-                    };
+                Mode::Traced => {
+                    // The same layers as the baseline: timeout and jittered retries.
+                    let mut spec = OperatorSpec::from_url("s3://bench");
+                    spec.set("layers.timeout.io", "30s")?;
+                    spec.set("layers.retry.jitter", "on")?;
+                    spec.set("layers.retry.min_delay", "50ms")?;
+                    spec.set("layers.retry.max_delay", "5s")?;
                     let reg = std::env::var("NO_TREE")
                         .is_err()
                         .then(|| await_tree::Registry::new(await_tree::Config::default()));
-                    measured_operator(&base, &profile.target, &knobs, &rec, reg)?
+                    measured_operator(&base, &target, &spec, &rec, reg).await?
                 }
             };
-            let r = matches!(mode, Mode::Traced | Mode::Microscope).then_some(&rec);
+            let r = matches!(mode, Mode::Traced).then_some(&rec);
             round(&op, r, &objs, conc, 1.0).await; // warm connections
             let mut rs = Vec::new();
             for _ in 0..rounds {
                 rs.push(round(&op, r, &objs, conc, secs).await);
             }
-            if std::env::var("OVERHEAD_DEBUG").is_ok()
-                && matches!(mode, Mode::Traced | Mode::Microscope)
-            {
+            if std::env::var("OVERHEAD_DEBUG").is_ok() && matches!(mode, Mode::Traced) {
                 let c = rec.snapshot().connections;
                 eprintln!(
                     "    [{}] requests {} dialed {} reuse {:.1}%",

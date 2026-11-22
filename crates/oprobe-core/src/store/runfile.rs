@@ -1,10 +1,10 @@
-//! The run file `oprobe.run/5` (design v5 §2): a zstd stream of framed blocks, written while
+//! The run file `oprobe.run/6` (design v5 §2): a zstd stream of framed blocks, written while
 //! the run is in progress and read back block by block. The process never encodes the whole
 //! file in memory.
 //!
 //! ```text
 //! zstd( frame* )         frame = kind:u8  len:u32 (LE)  payload[len] (JSON)
-//! kind 1  header         RunHeader: format, run id, spec, client, versions
+//! kind 1  header         RunHeader: format, run id, spec, versions
 //! kind 2  segment        Segment: columnar op and request rows of one time slice
 //! kind 3  interval       IntervalBlock: one per-second slice of the timeline
 //! kind 4  report         the Report, written last
@@ -27,11 +27,11 @@ use anyhow::{Context, Result, bail};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::errors::ErrorCode;
 use crate::model::{
-    ClientInfo, OpBreakdownUs, OpRow, RUN_FORMAT, Report, ReqDetail, ReqRow, Run, RunSpec, TcpRow,
-    TlsRow, WireProtocol,
+    OpBreakdownUs, OpRow, RUN_FORMAT, Report, ReqDetail, ReqRow, Run, RunSpec, TcpRow, TlsRow,
+    WireProtocol,
 };
+use crate::trace::rows::FailureCode;
 
 const ZSTD_LEVEL: i32 = 3;
 /// Rows per segment when a finished run is written in one go ([`write_run`]).
@@ -53,18 +53,16 @@ pub struct RunHeader {
     pub oprobe_version: String,
     pub created_at: String,
     pub spec: RunSpec,
-    pub client: ClientInfo,
 }
 
 impl RunHeader {
-    pub fn new(run_id: impl Into<String>, spec: RunSpec, client: ClientInfo) -> Self {
+    pub fn new(run_id: impl Into<String>, spec: RunSpec) -> Self {
         Self {
             format: RUN_FORMAT.to_owned(),
             run_id: run_id.into(),
             oprobe_version: env!("CARGO_PKG_VERSION").to_owned(),
             created_at: crate::util::now_rfc3339(),
             spec,
-            client,
         }
     }
 }
@@ -163,7 +161,7 @@ struct OpColumns {
     latency_us: Vec<u32>,
     bytes: Vec<u64>,
     ok: Vec<bool>,
-    error_code: Vec<Option<ErrorCode>>,
+    error_code: Vec<Option<FailureCode>>,
     error: Vec<Option<u32>>,
     throttled: Vec<bool>,
     attempts: Vec<u32>,
@@ -192,7 +190,7 @@ struct ReqColumns {
     bytes_down: Vec<u64>,
     request_id: Vec<Option<u32>>,
     retry_after_ms: Vec<Option<u64>>,
-    error_code: Vec<Option<ErrorCode>>,
+    error_code: Vec<Option<FailureCode>>,
     error: Vec<Option<u32>>,
     /// Sparse: (row index, value).
     tls: Vec<(u32, TlsRow)>,
@@ -673,13 +671,9 @@ fn read_exact_or_eof(r: &mut impl Read, buf: &mut [u8]) -> Result<bool> {
     Ok(true)
 }
 
-/// Write a finished run as `oprobe.run/5` (rows in segments of [`SEGMENT_ROWS`], by time).
+/// Write a finished run as `oprobe.run/6` (rows in segments of [`SEGMENT_ROWS`], by time).
 pub fn write_run(path: &Path, run: &Run) -> Result<PathBuf> {
-    let header = RunHeader::new(
-        run.report.run.id.clone(),
-        run.report.spec.clone(),
-        run.report.client.clone(),
-    );
+    let header = RunHeader::new(run.report.run.id.clone(), run.report.spec.clone());
     let mut w = RunFileWriter::create(path, &header)?;
     for p in &run.report.timeline {
         w.write_interval(&IntervalBlock::of(p))?;
@@ -916,7 +910,7 @@ impl crate::trace::RowSink for RunFileStream {
     }
 }
 
-/// Read a whole `oprobe.run/5` file into a [`Run`] (rows sorted by start time).
+/// Read a whole `oprobe.run/6` file into a [`Run`] (rows sorted by start time).
 pub fn read_run(r: impl Read) -> Result<Run> {
     let mut rd = RunFileReader::new(r)?;
     let mut header = None;
@@ -1026,7 +1020,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("r.oprobe");
         let run = crate::report::fixture::run();
-        let header = RunHeader::new("x", run.report.spec.clone(), ClientInfo::opendal());
+        let header = RunHeader::new("x", run.report.spec.clone());
         {
             let mut w = RunFileWriter::create(&path, &header).unwrap();
             w.write_rows(&run.ops, &run.reqs).unwrap();
@@ -1042,7 +1036,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("s.oprobe");
         let base = crate::report::fixture::run();
-        let header = RunHeader::new("x", base.report.spec.clone(), ClientInfo::opendal());
+        let header = RunHeader::new("x", base.report.spec.clone());
         let op0 = base.ops[0].clone();
         let req0 = base
             .requests_of(op0.op_id)

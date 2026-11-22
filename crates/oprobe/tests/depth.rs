@@ -1,5 +1,5 @@
 //! Observability depth against the local lab over real sockets: exact API names from OpenDAL's
-//! `ServiceOperation`, TLS handshake details and kernel TCP statistics in both transports.
+//! `ServiceOperation`, TLS handshake details and kernel TCP statistics in the fidelity transport.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -25,7 +25,7 @@ fn opts(ms: u64) -> RunOptions {
 }
 
 async fn rows(mut p: Profile, ms: u64) -> Vec<ReqRow> {
-    p.workload.preset = Preset::Mixed;
+    p.workload.preset = Preset::SmallFiles;
     p.workload.dataset = Some(DatasetSpec {
         objects: 4,
         object_size: ByteSize::kib(64),
@@ -48,24 +48,24 @@ async fn rows(mut p: Profile, ms: u64) -> Vec<ReqRow> {
             op: OpKind::List { recursive: false },
         },
     ];
-    p.knobs.concurrency = 2;
+    p.workload.concurrency = 2;
     let s = Session::open(p, Cancel::new(), quiet()).await.unwrap();
-    let knobs = s.profile.knobs.clone();
+    let knobs = oprobe::config::Knobs::of(&s.profile);
     s.run(&knobs, &opts(ms), None).await.unwrap();
     let trace = s.take_trace().unwrap();
     s.close().await;
     trace.reqs
 }
 
-async fn depth_in(mode: TransportMode) {
+async fn depth_in() {
+    let mode = "opendal";
     let lab = LabServer::spawn("127.0.0.1:0", LabConfig::clean_https_h2())
         .await
         .unwrap();
     let mut p = lab.profile("bkt");
-    p.knobs.transport = mode;
-    p.knobs.http_version = oprobe::net::HttpVersion::H1;
+    p.operator.http.version = oprobe::net::HttpVersion::H1;
     // Every request dials: handshakes are full first, resumed afterwards.
-    p.knobs.keep_alive = false;
+    p.operator.http.keep_alive = false;
     let reqs = rows(p, 600).await;
     assert!(!reqs.is_empty());
     let apis: std::collections::BTreeSet<&str> = reqs.iter().map(|r| r.api.as_ref()).collect();
@@ -103,8 +103,7 @@ async fn depth_in(mode: TransportMode) {
 
     // Kernel TCP statistics at request end, on pooled connections (a connection closed with
     // its request may already be gone by then).
-    let mut p = lab.profile("bkt");
-    p.knobs.transport = mode;
+    let p = lab.profile("bkt");
     let reqs = rows(p, 300).await;
     if oprobe::net::tcpinfo::SUPPORTED {
         // Every connection is sampled: its first request always, then at most every 10 ms.
@@ -126,62 +125,5 @@ async fn depth_in(mode: TransportMode) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn opendal_transport_reports_api_names_tls_and_tcp() {
-    depth_in(TransportMode::Opendal).await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn microscope_transport_reports_api_names_tls_and_tcp() {
-    depth_in(TransportMode::Microscope).await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn doctor_reports_tls_chain_permissions_and_capabilities() {
-    use oprobe::app::doctor::{Access, doctor};
-    let lab = LabServer::spawn("127.0.0.1:0", LabConfig::clean_https_h2())
-        .await
-        .unwrap();
-    let t = lab.profile("bkt").target.normalized().unwrap();
-    let d = doctor(t.clone(), false, "mylab", false).await;
-    assert!(d.ready, "{:#?}", d.checks);
-    let tls = d.tls.as_ref().expect("tls details");
-    assert_eq!(tls.version, "TLS1.3");
-    assert!(tls.resumption, "the lab resumes sessions");
-    assert!(tls.group.is_some());
-    let chain = tls.chain.as_ref().expect("certificate chain");
-    assert_eq!(chain.certs[0].subject, "localhost");
-    assert_eq!(chain.certs[0].issuer, "oprobe lab CA (generated)");
-    assert!(chain.min_expiry_days().unwrap() > 20);
-    assert_eq!(d.credentials.source, "options");
-    assert_eq!(d.addressing.as_deref(), Some("path"));
-    assert_eq!(d.dns.as_ref().unwrap().a, vec!["127.0.0.1".to_owned()]);
-    assert!(d.clock_skew_s.is_some());
-    let p = &d.permissions;
-    for a in [p.list, p.read, p.write, p.stat, p.delete] {
-        assert_eq!(a, Access::Allowed);
-    }
-    assert!(d.capabilities.copy && d.capabilities.read_with_suffix);
-    assert_eq!(d.capabilities.delete_max_count, 1000);
-    assert!(
-        d.next[0].cli.starts_with("oprobe run mylab"),
-        "{:?}",
-        d.next
-    );
-    let v = serde_json::to_value(&d).unwrap();
-    assert!(v["capabilities"]["write_with_if_match"].as_bool().unwrap());
-
-    let ro = doctor(t, true, "mylab", false).await;
-    assert_eq!(ro.permissions.write, Access::Skipped);
-    assert!(!ro.write_probe);
-    assert!(ro.sample.is_some(), "doctor includes a sample");
-    // Read-only: plan, test writes on request, list the objects; never a placeholder.
-    assert!(
-        ro.next.iter().any(|n| n.cli.contains("--write-probe")),
-        "{:?}",
-        ro.next
-    );
-    assert!(
-        ro.next.iter().all(|n| !n.cli.contains('<')),
-        "{:?}",
-        ro.next
-    );
+    depth_in().await;
 }

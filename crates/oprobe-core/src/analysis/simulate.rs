@@ -1,6 +1,6 @@
 //! Trace-driven what-if estimates: replay the recorded request and operation rows of a run
-//! under a different client setting (tail-cut, in-flight cap, suffix reads, a read cache,
-//! concurrency) and predict the effect on latency, request count and throughput.
+//! under a different client setting (tail-cut, a read cache) and predict the effect on
+//! latency and request count. Findings use them as evidence; `oprobe prove` measures.
 //!
 //! These are *estimates*: the replay keeps everything else as measured (server behaviour,
 //! network, the order of operations) and changes one thing. Findings quote them as such and
@@ -13,9 +13,8 @@ use serde::{Deserialize, Serialize};
 
 use std::time::Duration;
 
-use super::capacity::Capacity;
 use super::stats::{Rng, quantile_us_ms};
-use crate::engine::stack::{ClientStack, TAIL_CUT_BLIND_START, TailCutHistogram, TailCutParams};
+use crate::engine::stack::{RetryParams, TAIL_CUT_BLIND_START, TailCutHistogram, TailCutParams};
 use crate::model::{OpRow, ReqRow, Run};
 
 /// The predicted effect of one setting change.
@@ -86,16 +85,19 @@ pub struct TailCutSetup {
 }
 
 impl TailCutSetup {
-    /// The layer of a client with the run's knobs (tail-cut switched on), built when the
-    /// warmup began. `None` when retries are off: a cut request would fail instead of being
-    /// re-issued.
+    /// The layer on the run's operator (tail-cut switched on), built when the warmup began.
+    /// `None` when retries are off: a cut request would fail instead of being re-issued.
     pub fn of(r: &crate::model::Report) -> Option<Self> {
-        let mut k = r.knobs.requested.to_knobs();
-        k.tail_cut = true;
-        let stack = ClientStack::from_knobs(&k);
-        let retry = stack.retry?;
+        let op = &r.spec.profile.operator;
+        let retry = RetryParams::of(op.layers.retry.as_ref()?);
+        let params = op
+            .layers
+            .tail_cut
+            .clone()
+            .unwrap_or_default()
+            .params(op.op_timeout());
         Some(Self {
-            params: stack.tail_cut?,
+            params,
             backoff_us: retry.first_backoff_mean().as_micros() as u64,
             blind_until_us: ((TAIL_CUT_BLIND_START.as_secs_f64() - r.workload.warmup_s) * 1e6)
                 as i64,
@@ -230,81 +232,6 @@ pub fn tail_cut(run: &Run, api: &str, setup: &TailCutSetup) -> Option<TailCutRep
     })
 }
 
-/// No in-flight cap: every operation loses the time its requests waited for a permit.
-pub fn uncapped_inflight(run: &Run) -> Option<Prediction> {
-    let queued: u64 = run.ops.iter().map(|o| o.breakdown.queue_us).sum();
-    if run.ops.len() < 20 || queued == 0 {
-        return None;
-    }
-    let before = op_p99_ms(run.ops.iter().map(|o| o.latency_us));
-    let after = op_p99_ms(
-        run.ops
-            .iter()
-            .map(|o| o.latency_us.saturating_sub(o.breakdown.queue_us)),
-    );
-    Some(Prediction {
-        kind: "uncapped_inflight".into(),
-        setting: "max_inflight_requests = 0 (unlimited)".into(),
-        metric: "p99_ms of all operations".into(),
-        current: before,
-        predicted: after,
-        predicted_lo: 0.0,
-        predicted_hi: 0.0,
-        requests_per_1k_ops_delta: 0.0,
-        replayed_ops_count: run.ops.len() as u64,
-        note: "estimate: the queue wait is removed and nothing else changes (more parallel requests may slow the server or trigger throttling)".into(),
-    }
-    .bounded())
-}
-
-/// Operations that `HEAD` (stat) an object and then read it: a suffix range read
-/// (`bytes=-N`) of the footer needs no HEAD.
-pub fn suffix_read(run: &Run) -> Option<Prediction> {
-    let by_op = reqs_by_op(&run.reqs);
-    let mut ops = 0u64;
-    let mut heads = 0u64;
-    let lat: Vec<(u64, u64)> = run
-        .ops
-        .iter()
-        .map(|o| {
-            let v = by_op.get(&o.op_id).map(Vec::as_slice).unwrap_or(&[]);
-            let has_get = v.iter().any(|r| r.api == "GetObject");
-            let head_us: u64 = v
-                .iter()
-                .filter(|r| r.api == "HeadObject" && has_get)
-                .map(|r| {
-                    heads += 1;
-                    r.total_us
-                })
-                .sum();
-            if head_us > 0 {
-                ops += 1;
-            }
-            (o.latency_us, o.latency_us.saturating_sub(head_us))
-        })
-        .collect();
-    if ops < 20 || (ops as f64) < 0.1 * run.ops.len() as f64 {
-        return None;
-    }
-    let mut a: Vec<u64> = lat.iter().map(|x| x.0).collect();
-    let mut b: Vec<u64> = lat.iter().map(|x| x.1).collect();
-    Some(Prediction {
-        kind: "suffix_read".into(),
-        setting: "suffix range reads (no HEAD before the footer read)".into(),
-        metric: "p50_ms of all operations".into(),
-        current: quantile_us_ms(&mut a, 0.5),
-        predicted: quantile_us_ms(&mut b, 0.5),
-        predicted_lo: 0.0,
-        predicted_hi: 0.0,
-        requests_per_1k_ops_delta: -(heads as f64) * 1000.0 / run.ops.len().max(1) as f64,
-        replayed_ops_count: run.ops.len() as u64,
-        note: format!(
-            "estimate: {ops} operations issued a HEAD before reading; their HEAD time is removed"
-        ),
-    }
-    .bounded())
-}
-
 /// Replay the read operations' keys through an LRU cache of `capacity_bytes` (object size =
 /// the bytes each read returned); a hit costs no backend request.
 pub fn cache(run: &Run, capacity_bytes: u64) -> Option<Prediction> {
@@ -370,43 +297,6 @@ pub fn cache(run: &Run, capacity_bytes: u64) -> Option<Prediction> {
     .bounded())
 }
 
-/// Closed-loop throughput at `to` workers, from the capacity model ([`Capacity::predict`]):
-/// throughput scales from the measured rate per worker and saturates at the in-flight
-/// ceiling (when one is known). Open-loop runs and runs with too few operations predict
-/// nothing.
-pub fn concurrency(run: &Run, to: u64, cap: &Capacity) -> Option<Prediction> {
-    let r = &run.report;
-    if r.summary.ops < 20 || r.summary.ops_per_s <= 0.0 || r.workload.rate_per_s.is_some() {
-        return None;
-    }
-    let p = cap.predict(to.clamp(1, u64::from(u32::MAX)) as u32);
-    if p.ops_per_s <= 0.0 {
-        return None;
-    }
-    let note = match cap.inflight_ceiling {
-        Some(c) => format!(
-            "estimate (capacity model): {} requests in flight at the peak against a ceiling of {:.0}; throughput scales with workers until the ceiling",
-            p.peak_inflight_count, c.lo
-        ),
-        None => format!(
-            "estimate (capacity model): {} requests in flight at the peak; no ceiling was seen (holds while the server, network and client CPU keep up)",
-            p.peak_inflight_count
-        ),
-    };
-    Some(Prediction {
-        kind: "concurrency".into(),
-        setting: format!("concurrency {to}"),
-        metric: "ops_per_s".into(),
-        current: r.summary.ops_per_s,
-        predicted: p.ops_per_s,
-        predicted_lo: p.ops_lo_per_s,
-        predicted_hi: p.ops_hi_per_s,
-        requests_per_1k_ops_delta: 0.0,
-        replayed_ops_count: r.summary.ops,
-        note,
-    })
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -451,8 +341,12 @@ pub(crate) mod tests {
             serde_json::from_value(crate::analysis::findings::tests::empty_report_json()).unwrap();
         report.summary.ops = 1000;
         report.summary.ops_per_s = 200.0;
-        report.knobs.requested = (&crate::config::Knobs::default()).into();
-        report.knobs.requested.concurrency_count = 2;
+        report.spec.profile.workload.concurrency = 2;
+        report.spec.profile.operator.layers.retry = Some(crate::operator::Retry {
+            min_delay: crate::util::HumanDuration(std::time::Duration::from_millis(50)),
+            jitter: true,
+            ..Default::default()
+        });
         Run { report, ops, reqs }
     }
 
@@ -478,7 +372,7 @@ pub(crate) mod tests {
         assert!((setup.blind_s(5.0) - 5.0).abs() < 1e-9);
         // Without retries a cut request would fail: no estimate.
         let mut r = run.report.clone();
-        r.knobs.requested.retries_count = 0;
+        r.spec.profile.operator.layers.retry = None;
         assert!(TailCutSetup::of(&r).is_none());
     }
 
@@ -498,27 +392,10 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn cache_and_concurrency_estimates() {
+    fn cache_estimates() {
         let run = straggler_run();
         // Ten keys of 1 KiB: everything after the first touch hits.
         let c = cache(&run, 1 << 20).unwrap();
         assert!(c.requests_per_1k_ops_delta < -900.0, "{c:?}");
-        let mut cap = crate::analysis::capacity::Capacity::default();
-        cap.per_op.peak_inflight_per_op = 1.0;
-        cap.per_op.mean_inflight_per_op = 1.0;
-        cap.observed.ops_per_s = 200.0;
-        cap.observed.ops_inflight_mean = 2.0;
-        let c2 = concurrency(&run, 8, &cap).unwrap();
-        assert!((c2.predicted - 800.0).abs() < 1e-6, "{c2:?}");
-        assert!(c2.predicted_lo < c2.predicted && c2.predicted_hi > c2.predicted);
-        // A ceiling of 6 requests in flight: 8 workers do no better than 6.
-        cap.inflight_ceiling = Some(crate::analysis::capacity::Ceiling {
-            requests: 5.0,
-            lo: 5.0,
-            hi: 6.0,
-        });
-        let c3 = concurrency(&run, 8, &cap).unwrap();
-        assert!((c3.predicted - 600.0).abs() < 1e-6, "{c3:?}");
-        assert!(uncapped_inflight(&run).is_none());
     }
 }

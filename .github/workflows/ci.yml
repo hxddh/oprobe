@@ -1,8 +1,9 @@
 name: CI
 
-# Per pull request (design v5 §10): fmt + clippy, tests on Linux, macOS and Windows in debug with
-# cargo-nextest, docs, cargo-deny, the GUI build check, MSRV, packaging and the installers.
-# Release builds, the macOS app bundle and the MSI run on pushes to main and nightly only.
+# Per pull request (design v6 §8): fmt + clippy (default, CLI only, oprobe-trace's public API,
+# gui), tests on Linux, macOS and Windows in debug with cargo-nextest, the oprobe-trace overhead
+# bench, docs, cargo-deny, MSRV, packaging and the installers. Release builds (app and CLI-only),
+# the macOS app bundle and the MSI run on pushes to main and nightly only.
 #
 # Every action is pinned by commit SHA (the tag in the comment); Dependabot proposes updates
 # (.github/dependabot.yml).
@@ -41,6 +42,26 @@ jobs:
       - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # The CLI-only build (`cli` = the services without the app), and no features at all.
+      - run: cargo clippy --workspace --all-targets --locked --no-default-features --features oprobe/cli -- -D warnings
+      - run: cargo clippy --workspace --all-targets --locked --no-default-features -- -D warnings
+      # oprobe-trace alone: its public API, without the `__internal` feature the workspace enables.
+      - run: cargo clippy -p oprobe-trace --all-targets --locked --features otel,schemars -- -D warnings
+      - run: cargo clippy -p oprobe-trace --all-targets --locked -- -D warnings
+
+  overhead:
+    name: oprobe-trace overhead (≤ 2 µs/op)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
+        with:
+          key: bench
+      # Plain OpenDAL vs the traced operator on memory://, interleaved; fails above the budget.
+      - run: cargo bench -p oprobe-trace --locked --bench overhead -- --quick | tee -a "$GITHUB_STEP_SUMMARY"
 
   test:
     name: test (${{ matrix.os }})
@@ -61,21 +82,18 @@ jobs:
       - run: cargo nextest run --workspace --locked --all-targets --no-fail-fast
       # nextest does not run doctests.
       - run: cargo test --workspace --locked --doc
-      - name: CLI smoke (demo, run → compare gate, HTML report)
+      - name: CLI smoke (demo, run, show, prove)
         shell: bash
         env:
           OPROBE_DATA_DIR: ${{ runner.temp }}/oprobe-data
         run: |
           cargo build --locked
           o=target/debug/oprobe
-          $o demo --duration 2s
-          $o run memory:// --preset mixed -d 2s --warmup 500ms -q --label base
-          $o run memory:// --preset mixed -d 2s --warmup 500ms -q --label cand
-          $o compare base cand --max-p99-increase-pct 400 --max-p50-increase-pct 400 --max-throughput-drop-pct 80 --markdown gate.md
-          $o runs show cand -o html > report.html
-          grep -q '<svg class="viz"' report.html
-          $o runs list
-          cat gate.md >> "$GITHUB_STEP_SUMMARY"
+          $o demo -d 2s
+          $o run memory:// lab://clean --preset small-files -d 2s -q
+          $o show --list
+          $o show last --by stage
+          $o prove last --with layers.tail_cut=on -q || test $? -eq 3
 
   deny:
     name: cargo deny (advisories, licenses, bans, sources)
@@ -85,11 +103,11 @@ jobs:
       - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
           tool: cargo-deny
-      # deny.toml documents every ignored advisory (RUSTSEC-2023-0071: rsa via reqsign, signing only).
+      # deny.toml documents every ignored advisory.
       - run: cargo deny --locked check
 
   docs:
-    name: docs (links, CLI reference drift)
+    name: docs (links, CLI reference drift, rustdoc)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -97,11 +115,16 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
-      # docs/cli.md is generated from the command definitions; regenerate it with
-      # `OPROBE_BLESS=1 cargo test --test docs`. The same test checks relative links.
+      # docs/cli.md must name every flag of `--help`, llms-full.txt must match the docs
+      # (`OPROBE_BLESS=1 cargo test --test docs`), and relative links must resolve.
       - run: cargo test --locked --test docs
-      - name: rustdoc of the library crates
-        run: cargo doc --locked --no-deps -p oprobe-trace -p oprobe-core
+      # The published API's docs must be clean (as docs.rs builds them); oprobe-core is internal.
+      - name: rustdoc of oprobe-trace
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --no-deps -p oprobe-trace --features otel,schemars
+      - name: rustdoc of oprobe-core
+        run: cargo doc --locked --no-deps -p oprobe-core
       - name: Links (external included)
         uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2.9.0
         with:
@@ -113,11 +136,10 @@ jobs:
             --remap 'https://github.com/hxddh/oprobe/blob/main/(.*) file://${{ github.workspace }}/$1'
             README.md README.zh-CN.md CHANGELOG.md llms.txt docs/*.md
           fail: true
-      - name: Action and workflow metadata (every action pinned by SHA)
+      - name: Workflow metadata (every action pinned by SHA)
         run: |
-          python3 -c "import yaml,sys; d=yaml.safe_load(open('action.yml')); assert d['runs']['using']=='composite'; print('action.yml ok:', len(d['runs']['steps']), 'steps')"
           # `uses: owner/repo@<40 hex>` only (local `./` actions excepted).
-          if grep -nE '^\s*-?\s*uses:\s*[^.][^@]*@' action.yml .github/workflows/*.yml | grep -vE '@[0-9a-f]{40}( |$)'; then
+          if grep -nE '^\s*-?\s*uses:\s*[^.][^@]*@' .github/workflows/*.yml | grep -vE '@[0-9a-f]{40}( |$)'; then
             echo "::error::actions must be pinned by commit SHA"; exit 1
           fi
 
@@ -133,9 +155,9 @@ jobs:
       - name: Shellcheck
         if: runner.os == 'Linux'
         run: shellcheck scripts/install.sh scripts/test-install.sh scripts/release-manifests.sh scripts/macos-app.sh
-      # install.sh against a local fake release (python http.server): latest.json, the
-      # releases/latest redirect, the API, OPROBE_VERSION, PATH rc files, a checksum mismatch,
-      # and the signature policy (OPROBE_VERIFY).
+      # install.sh against a local fake release (python http.server): --help, the CLI-only
+      # build (--cli), latest.json, the releases/latest redirect, the API, OPROBE_VERSION, PATH rc
+      # files, a checksum mismatch, and the verification policy (OPROBE_VERIFY).
       - name: install.sh against a fake release
         if: runner.os != 'Windows'
         run: sh scripts/test-install.sh
@@ -162,13 +184,17 @@ jobs:
                    macos-universal.dmg x86_64-pc-windows-msvc.zip aarch64-pc-windows-msvc.zip x64.msi arm64.msi; do
             echo "$f" > "$d/oprobe-$v-$f"
           done
+          for f in universal-apple-darwin.tar.gz x86_64-unknown-linux-musl.tar.gz x86_64-pc-windows-msvc.zip; do
+            echo "cli $f" > "$d/oprobe-cli-$v-$f"
+          done
           (cd "$d" && sha256sum -- * > SHA256SUMS)
           scripts/release-manifests.sh "$v" "$d" hxddh/oprobe
           ruby -c "$d/oprobe.rb" && ruby -c "$d/oprobe-app.rb"
           grep -q '^class Oprobe < Formula' "$d/oprobe.rb"
           grep -q '^cask "oprobe-app" do' "$d/oprobe-app.rb"
           python3 -c "import json,sys; d=json.load(open(sys.argv[1])); assert d['autoupdate']['hash']['url'].endswith('/SHA256SUMS')" "$d/oprobe.json"
-          python3 -m json.tool "$d/latest.json" > /dev/null
+          python3 -c "import json,sys; d=json.load(open(sys.argv[1])); n=[a['name'] for a in d['assets']]; assert any(x.startswith('oprobe-cli-') for x in n), n" "$d/latest.json"
+          if grep -q 'completions\|profiles\|self-update' "$d/oprobe.rb"; then echo "::error::oprobe.rb names removed files"; exit 1; fi
 
   backends:
     name: real backends (MinIO, fake-gcs-server, Azurite)
@@ -252,7 +278,8 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
-      # Every crate of the workspace, in dependency order (oprobe-trace, oprobe-core, oprobe).
+      # All three crates are published (oprobe-core as an internal crate pinned with `=`), so
+      # `cargo install oprobe` works; `--workspace` packages them against each other.
       - run: cargo package --workspace --locked
       - name: cargo install (debug profile; release builds run on main and nightly)
         run: cargo install --locked --debug --path crates/oprobe --root "$RUNNER_TEMP/inst" && "$RUNNER_TEMP/inst/bin/oprobe" --version
@@ -290,6 +317,7 @@ jobs:
       matrix:
         include:
           - { os: ubuntu-latest, target: x86_64-unknown-linux-musl, musl: true }
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl, musl: true, cli: true }
           - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, musl: true }
           - { os: macos-latest, target: x86_64-apple-darwin, features: gui }
           - { os: windows-latest, target: aarch64-pc-windows-msvc, features: gui }
@@ -301,19 +329,19 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
         with:
-          key: ${{ matrix.target }}
+          key: ${{ matrix.target }}${{ matrix.cli && '-cli' || '' }}
       - name: Install musl tools
         if: matrix.musl
         run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - run: cargo build --release --locked --target ${{ matrix.target }} ${{ matrix.features && format('--features {0}', matrix.features) || '' }}
-      # The size target of design v5 §1 (≤ 45 MB for the CLI + TUI musl binary): reported in
-      # the job summary, not enforced.
+      - run: cargo build --release --locked --target ${{ matrix.target }} ${{ matrix.cli && '--no-default-features --features cli' || (matrix.features && format('--features {0}', matrix.features) || '') }}
+      # The size target of design v6 §4 (≤ 35 MB for the binary with the app): reported in the
+      # job summary, not enforced.
       - name: Binary size
         shell: bash
         run: |
           f="target/${{ matrix.target }}/release/oprobe"; [ -f "$f.exe" ] && f="$f.exe"
           bytes=$(wc -c < "$f" | tr -d ' ')
-          echo "oprobe ${{ matrix.target }}: $((bytes / 1048576)) MiB ($bytes bytes)" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "oprobe ${{ matrix.target }}${{ matrix.cli && ' (CLI only)' || '' }}: $((bytes / 1048576)) MiB ($bytes bytes)" | tee -a "$GITHUB_STEP_SUMMARY"
 
   installers:
     name: app bundle + MSI (${{ matrix.os }})
@@ -354,10 +382,8 @@ jobs:
           New-Item -ItemType Directory -Force -Path $stage, out | Out-Null
           Copy-Item target/release/oprobe.exe, README.md, CHANGELOG.md $stage
           Copy-Item LICENSE "$stage/LICENSE.txt"
-          ./target/release/oprobe.exe completions powershell > "$stage/_oprobe.ps1"
-          Copy-Item -Recurse profiles $stage
           dotnet tool install --global wix --version 5.0.2
           wix build packaging/windows/oprobe.wxs -arch x64 `
-            -d Version=5.0.0 -d BinDir=$stage -d IconFile=packaging/desktop/oprobe.ico `
+            -d Version=6.0.0 -d BinDir=$stage -d IconFile=packaging/desktop/oprobe.ico `
             -o out/oprobe-ci-x64.msi
           Get-Item out/oprobe-ci-x64.msi

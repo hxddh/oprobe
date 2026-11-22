@@ -8,9 +8,8 @@
 
 use std::borrow::Cow;
 
-use crate::error::ErrorCode;
 use crate::record::RequestRecord;
-use crate::rows::{OpBreakdownUs, OpRow, ReqRow, TraceInfo};
+use crate::rows::{FailureCode, OpBreakdownUs, OpRow, ReqRow, TraceInfo};
 use crate::sample::{OpSampler, SampleConfig, SamplingStats};
 
 /// Default cap of kept trace rows.
@@ -170,7 +169,7 @@ fn method_name(m: String) -> Cow<'static, str> {
 pub fn req_row(r: RequestRecord, op_id: u64, op_t_us: i64, attempt: u32) -> ReqRow {
     let t = r.timing;
     let error_code = if r.is_error() && r.status != 404 || r.error.is_some() {
-        ErrorCode::from_status(r.status).or(Some(ErrorCode::Internal))
+        FailureCode::from_status(r.status).or(Some(FailureCode::Internal))
     } else {
         None
     };
@@ -251,7 +250,7 @@ pub fn op_row(
         latency_us,
         bytes,
         ok: error.is_none(),
-        error_code: error.as_deref().map(ErrorCode::from_class),
+        error_code: error.as_deref().map(FailureCode::from_class),
         error,
         throttled,
         attempts: (retries as u32).saturating_add(1),
@@ -366,7 +365,7 @@ mod tests {
         let row = req_row(reqs[1].clone(), 7, 1000, 1);
         assert_eq!(row.t_us, 1000);
         assert_eq!(row.api, "GetObject");
-        assert_eq!(row.error_code, Some(ErrorCode::StorageThrottled));
+        assert_eq!(row.error_code, Some(FailureCode::StorageThrottled));
         assert!(matches!(row.method, Cow::Borrowed("GET")));
     }
 }

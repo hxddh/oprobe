@@ -2,18 +2,18 @@ use std::process::ExitCode;
 
 fn main() -> ExitCode {
     oprobe::output::quiet_broken_pipes();
-    // A shell asking for completions (`OPROBE_COMPLETE=bash oprobe -- …`): answer and exit.
-    oprobe::cli::complete::handle_request();
     let cli = match oprobe::cli::parse_cli(oprobe::cli::launch_args(std::env::args_os())) {
         Ok(cli) => cli,
         Err(code) => return code,
     };
-    if let Some(code) = oprobe::cli::ui_entry(&cli) {
-        return code;
+    // A bare `oprobe` is the app: it owns the main thread (native windows need it) and runs
+    // its work on a runtime of its own.
+    if cli.command.is_none() {
+        return oprobe::launch::bare(&cli);
     }
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        // The same deep stacks as the main thread (see build.rs): tasks render schemas and reports.
+        // The same deep stacks as the main thread (see build.rs).
         .thread_stack_size(8 * 1024 * 1024)
         .build()
     {

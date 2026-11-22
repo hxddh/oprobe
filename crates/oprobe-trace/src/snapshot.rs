@@ -2,13 +2,14 @@
 
 use std::collections::BTreeMap;
 
-use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::record::{Api, RequestRecord};
 
 /// Latency distribution in milliseconds.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[cfg_attr(not(feature = "__internal"), non_exhaustive)]
 pub struct Quantiles {
     /// Samples in the distribution.
     #[serde(rename = "samples_count", alias = "count")]
@@ -27,8 +28,10 @@ pub struct Quantiles {
     pub max: f64,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(not(feature = "__internal"), non_exhaustive)]
 pub enum Phase {
     #[default]
     Idle,
@@ -56,7 +59,9 @@ impl Phase {
 
 /// Where the wall-clock time of a logical operation went (mean ms per op).
 /// `queue + cache + backend + retry + client == latency mean` (exact for each op; see docs/metrics.md).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[cfg_attr(not(feature = "__internal"), non_exhaustive)]
 pub struct OpBreakdown {
     /// Waiting for in-flight request permits / connections, with nothing on the wire.
     pub queue_ms: f64,
@@ -72,7 +77,9 @@ pub struct OpBreakdown {
     pub client_ms: f64,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[cfg_attr(not(feature = "__internal"), non_exhaustive)]
 pub struct VerbStats {
     pub verb: String,
     #[serde(rename = "ops_count", alias = "count")]
@@ -94,7 +101,9 @@ pub struct VerbStats {
 }
 
 /// Request stage distribution for one API (ms).
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[cfg_attr(not(feature = "__internal"), non_exhaustive)]
 pub struct StageStats {
     pub queue: Quantiles,
     /// DNS+TCP+proxy+TLS; only requests that dialed are counted.
@@ -106,7 +115,9 @@ pub struct StageStats {
     pub total: Quantiles,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[cfg_attr(not(feature = "__internal"), non_exhaustive)]
 pub struct ApiStats {
     pub api: Api,
     #[serde(rename = "requests_count", alias = "count")]
@@ -125,7 +136,9 @@ pub struct ApiStats {
     pub stages: StageStats,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[cfg_attr(not(feature = "__internal"), non_exhaustive)]
 pub struct ConnStats {
     #[serde(rename = "dialed_count")]
     pub dialed: u64,
@@ -160,7 +173,9 @@ pub struct ConnStats {
 
 /// The cold start of a run: the connections dialed at the start of warmup and the operations
 /// that waited for them.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[cfg_attr(not(feature = "__internal"), non_exhaustive)]
 pub struct ColdStartStats {
     pub connections_count: u64,
     /// DNS + TCP + proxy + TLS of a fresh connection.
@@ -169,7 +184,9 @@ pub struct ColdStartStats {
     pub first_ops: Quantiles,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[cfg_attr(not(feature = "__internal"), non_exhaustive)]
 pub struct ResilienceStats {
     #[serde(rename = "retries_count")]
     pub retries: u64,
@@ -193,7 +210,9 @@ pub struct ResilienceStats {
     pub error_classes: BTreeMap<String, u64>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[cfg_attr(not(feature = "__internal"), non_exhaustive)]
 pub struct ByteStats {
     /// Bytes the application asked to read.
     #[serde(rename = "logical_read_bytes")]
@@ -227,7 +246,9 @@ pub struct ByteStats {
     pub request_amplification: f64,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[cfg_attr(not(feature = "__internal"), non_exhaustive)]
 pub struct CacheStats {
     pub enabled: bool,
     #[serde(rename = "lookups_count")]
@@ -239,7 +260,9 @@ pub struct CacheStats {
     pub lookup_ms_mean: f64,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[cfg_attr(not(feature = "__internal"), non_exhaustive)]
 pub struct IntegrityStats {
     #[serde(rename = "verified_count")]
     pub verified: u64,
@@ -247,7 +270,9 @@ pub struct IntegrityStats {
     pub corrupted: u64,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[cfg_attr(not(feature = "__internal"), non_exhaustive)]
 pub struct TimelinePoint {
     /// Start of this one-second interval, seconds from the measurement window start (the same
     /// convention as `heatmap.t_buckets_s` and `oprobe analyze --by second`).
@@ -303,7 +328,9 @@ fn is_zero(v: &u64) -> bool {
     *v == 0
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[cfg_attr(not(feature = "__internal"), non_exhaustive)]
 pub struct SlowOp {
     /// Id of the operation (its row in the run file).
     #[serde(default)]
@@ -323,7 +350,9 @@ pub struct SlowOp {
     pub error: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[cfg_attr(not(feature = "__internal"), non_exhaustive)]
 pub struct ClientStats {
     #[serde(rename = "cpu_cores_count")]
     pub cpu_cores: usize,
@@ -334,7 +363,9 @@ pub struct ClientStats {
     pub rss_mib: f64,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[cfg_attr(not(feature = "__internal"), non_exhaustive)]
 pub struct OpenLoopStats {
     #[serde(rename = "target_per_s")]
     pub target_rate: f64,
@@ -362,7 +393,9 @@ pub struct OpenLoopStats {
     pub schedule: Option<Quantiles>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[cfg_attr(not(feature = "__internal"), non_exhaustive)]
 pub struct Summary {
     #[serde(rename = "ops_count")]
     pub ops: u64,
@@ -391,7 +424,9 @@ pub struct Summary {
 
 /// The load generator's own health over the measurement window (design v5 §3): what the
 /// self probe and the recorder measured. `report.self` is built from it.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[cfg_attr(not(feature = "__internal"), non_exhaustive)]
 pub struct SelfObservation {
     /// Measured observer cost per operation (recorder bookkeeping).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -422,7 +457,9 @@ pub struct SelfObservation {
 }
 
 /// Complete aggregated view of one measurement window.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[cfg_attr(not(feature = "__internal"), non_exhaustive)]
 pub struct Snapshot {
     pub phase: Phase,
     pub elapsed_s: f64,
@@ -454,7 +491,9 @@ pub struct Snapshot {
 }
 
 /// Knob values as OpenDAL applies them, which can differ from what was requested.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[cfg_attr(not(feature = "__internal"), non_exhaustive)]
 pub struct EffectiveKnobs {
     /// `knobs.chunk_size` as requested (bytes).
     #[serde(rename = "requested_chunk_bytes")]
@@ -517,6 +556,7 @@ impl Snapshot {
 
 /// Mean per-request stage durations (ms) across all APIs.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[cfg_attr(not(feature = "__internal"), non_exhaustive)]
 pub struct RequestStageMeans {
     pub queue: f64,
     pub connect: f64,

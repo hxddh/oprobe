@@ -4,63 +4,9 @@
       "description": "Key popularity: `uniform`, `zipf:S` (e.g. `zipf:1.1`) or `hotset:F/P` (e.g. `hotset:0.2/0.8`).",
       "type": "string"
     },
-    "Addressing": {
-      "description": "S3 bucket addressing.",
-      "oneOf": [
-        {
-          "const": "auto",
-          "description": "As the target configures it (OpenDAL's default: path style unless\n`enable_virtual_host_style`).",
-          "type": "string"
-        },
-        {
-          "const": "virtual",
-          "description": "`https://bucket.s3.region.amazonaws.com/key`.",
-          "type": "string"
-        },
-        {
-          "const": "path",
-          "description": "`https://s3.region.amazonaws.com/bucket/key`.",
-          "type": "string"
-        }
-      ]
-    },
     "Api": {
       "description": "Storage API name, e.g. GetObject (OpenDAL ServiceOperation)",
       "type": "string"
-    },
-    "ApiCost": {
-      "description": "Request spend of one storage API.",
-      "properties": {
-        "api": {
-          "type": "string"
-        },
-        "billing_class": {
-          "$ref": "#/$defs/BillingClass"
-        },
-        "monthly_usd": {
-          "description": "Monthly spend at the projected operation volume.",
-          "format": "double",
-          "type": "number"
-        },
-        "requests_per_op_mean": {
-          "description": "Billed requests of this API per logical operation.",
-          "format": "double",
-          "type": "number"
-        },
-        "share_pct": {
-          "description": "Share of the monthly request spend (0–100).",
-          "format": "double",
-          "type": "number"
-        }
-      },
-      "required": [
-        "api",
-        "billing_class",
-        "requests_per_op_mean",
-        "monthly_usd",
-        "share_pct"
-      ],
-      "type": "object"
     },
     "ApiStats": {
       "properties": {
@@ -135,36 +81,6 @@
         {
           "const": "poisson",
           "description": "A Poisson process: exponentially distributed gaps with mean `1 / rate` (bursty, like\nindependent clients).",
-          "type": "string"
-        }
-      ]
-    },
-    "BillingClass": {
-      "description": "Billing bucket used by the cost model.",
-      "oneOf": [
-        {
-          "const": "write",
-          "description": "PUT / POST / COPY (S3 \"tier 1\", GCS \"class A\").",
-          "type": "string"
-        },
-        {
-          "const": "list",
-          "description": "LIST requests (class A on S3/GCS, class C on B2).",
-          "type": "string"
-        },
-        {
-          "const": "read",
-          "description": "GET / HEAD (S3 \"tier 2\", GCS \"class B\").",
-          "type": "string"
-        },
-        {
-          "const": "delete",
-          "description": "DELETE / abort, free on most providers.",
-          "type": "string"
-        },
-        {
-          "const": "free",
-          "description": "Not billed (control plane, in-process backends).",
           "type": "string"
         }
       ]
@@ -308,6 +224,20 @@
       ],
       "type": "object"
     },
+    "Cache": {
+      "additionalProperties": false,
+      "description": "`FoyerLayer` over an in-memory foyer cache.",
+      "properties": {
+        "memory": {
+          "$ref": "#/$defs/ByteSize",
+          "default": "256MiB"
+        }
+      },
+      "required": [
+        "memory"
+      ],
+      "type": "object"
+    },
     "CacheStats": {
       "properties": {
         "enabled": {
@@ -436,7 +366,7 @@
           "type": "integer"
         },
         "inflight_count": {
-          "description": "In-flight requests the service accepts: the estimate (the likeliest split), which the\nmargins (safe concurrency, caps) apply their headroom to; `lo ≤ inflight_count < hi`.",
+          "description": "In-flight requests the service accepts: the estimate (the likeliest split);\n`lo ≤ inflight_count < hi`.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -504,34 +434,6 @@
       ],
       "type": "object"
     },
-    "ClientInfo": {
-      "description": "What generated the load (`report.client`, design v5 §7).",
-      "properties": {
-        "kind": {
-          "description": "`opendal`, `aws_sdk` or `exec`.",
-          "type": "string"
-        },
-        "phases_available": {
-          "default": [],
-          "description": "Request stages this client reports (findings that need others are suppressed).",
-          "items": {
-            "type": "string"
-          },
-          "type": "array"
-        },
-        "version": {
-          "type": [
-            "string",
-            "null"
-          ]
-        }
-      },
-      "required": [
-        "kind",
-        "phases_available"
-      ],
-      "type": "object"
-    },
     "ClientStats": {
       "properties": {
         "cpu_cores_count": {
@@ -583,6 +485,31 @@
         "connect",
         "first_ops"
       ],
+      "type": "object"
+    },
+    "ConcurrentLimit": {
+      "additionalProperties": false,
+      "description": "`ConcurrentLimitLayer`.",
+      "properties": {
+        "http": {
+          "description": "HTTP requests in flight (`with_http_concurrent_limit`).",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "operations": {
+          "description": "Operations in flight (`ConcurrentLimitLayer::new`; unset: unlimited).",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
       "type": "object"
     },
     "Confidence": {
@@ -700,149 +627,6 @@
       ],
       "type": "object"
     },
-    "CostReport": {
-      "properties": {
-        "applicable": {
-          "description": "A price table applies: the target is a recognised cloud endpoint, or the profile chose a\nprovider / custom pricing. Otherwise `selected` and `comparison` are empty.",
-          "type": "boolean"
-        },
-        "by_api": {
-          "description": "Monthly request spend per storage API under the selected prices (largest first).",
-          "items": {
-            "$ref": "#/$defs/ApiCost"
-          },
-          "type": "array"
-        },
-        "comparison": {
-          "items": {
-            "$ref": "#/$defs/ProviderCost"
-          },
-          "type": "array"
-        },
-        "egress_ratio": {
-          "format": "double",
-          "type": "number"
-        },
-        "monthly_ops_count": {
-          "description": "Projected operations per month (a whole number).",
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "not_applicable_reason": {
-          "description": "Why no cost is projected (when not applicable).",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "per_op": {
-          "$ref": "#/$defs/PerOpUsage"
-        },
-        "pricing_as_of": {
-          "type": "string"
-        },
-        "provider": {
-          "description": "Pricing key of `selected` (e.g. `aws-s3`, `custom`), when applicable.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "selected": {
-          "$ref": "#/$defs/ProviderCost",
-          "description": "The provider matching the target (or the profile's choice / custom pricing)."
-        },
-        "storage_assumed": {
-          "default": false,
-          "description": "`stored_gib` is the default assumption (1 TiB), not a size the user gave\n(`--stored-gib`); renderers label it so.",
-          "type": "boolean"
-        },
-        "stored_gib": {
-          "format": "double",
-          "type": "number"
-        },
-        "waste_usd": {
-          "default": 0.0,
-          "description": "Monthly spend that buys nothing: failed/throttled requests and over-read egress.",
-          "format": "double",
-          "type": "number"
-        }
-      },
-      "required": [
-        "applicable",
-        "pricing_as_of",
-        "monthly_ops_count",
-        "stored_gib",
-        "storage_assumed",
-        "egress_ratio",
-        "per_op",
-        "selected",
-        "comparison",
-        "waste_usd"
-      ],
-      "type": "object"
-    },
-    "CostSpec": {
-      "additionalProperties": false,
-      "description": "Business volume used to project measured per-operation costs to a monthly bill.",
-      "properties": {
-        "egress_fraction": {
-          "default": 0.0,
-          "description": "Fraction of downloaded bytes that leave the cloud (internet egress).",
-          "format": "double",
-          "type": "number"
-        },
-        "inter_region_fraction": {
-          "description": "Fraction of downloaded bytes that cross regions (inter-region transfer).",
-          "format": "double",
-          "type": "number"
-        },
-        "monthly_ops": {
-          "default": 100000000.0,
-          "description": "Logical operations per month at this workload mix.",
-          "format": "double",
-          "type": "number"
-        },
-        "pricing": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Pricing"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Custom price overrides (USD)."
-        },
-        "provider": {
-          "description": "Pricing preset: aws-s3, gcs, azure-blob, cloudflare-r2, backblaze-b2, aliyun-oss.\nDefaults to the target's provider.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "storage_class": {
-          "description": "Storage class the data is kept in: `standard` (default), `infrequent` or `archive`\n(the provider's equivalents: S3 Standard-IA / Glacier IR, GCS Nearline / Archive, …).",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "stored_gib": {
-          "default": 1024.0,
-          "description": "Data kept at rest (GiB).",
-          "format": "double",
-          "type": "number"
-        }
-      },
-      "required": [
-        "monthly_ops",
-        "stored_gib",
-        "egress_fraction"
-      ],
-      "type": "object"
-    },
     "DatasetInfo": {
       "properties": {
         "existing_prefix": {
@@ -908,7 +692,7 @@
         },
         "persist": {
           "default": false,
-          "description": "Keep the generated dataset between runs (`oprobe-dataset/<fingerprint>/`) to avoid\nre-uploading it every time. Remove with `oprobe cleanup --datasets`.",
+          "description": "Keep the generated dataset between runs (`oprobe-dataset/<fingerprint>/`) to avoid\nre-uploading it every time (remove it with your storage tools).",
           "type": "boolean"
         },
         "size_dist": {
@@ -928,54 +712,6 @@
         "object_size",
         "partitions",
         "persist"
-      ],
-      "type": "object"
-    },
-    "Delta": {
-      "description": "One objective metric, recommended vs a reference trial.",
-      "properties": {
-        "baseline": {
-          "description": "The reference trial's value.",
-          "format": "double",
-          "type": "number"
-        },
-        "baseline_feasible": {
-          "description": "The reference met the SLA and the throttle budget; deltas against an infeasible\nreference are not improvements.",
-          "type": "boolean"
-        },
-        "baseline_trial": {
-          "description": "Trial id of the reference.",
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "candidate": {
-          "description": "The recommended configuration's value.",
-          "format": "double",
-          "type": "number"
-        },
-        "delta_ratio": {
-          "description": "`(candidate − baseline) / baseline` (0 when the baseline is 0).",
-          "format": "double",
-          "type": "number"
-        },
-        "metric": {
-          "description": "`ops_per_s` / `mib_per_s` (goodput), `p99_ms` (latency) or\n`cost_per_million_ops_usd`.",
-          "type": "string"
-        },
-        "unit": {
-          "description": "Unit of `baseline` and `candidate`.",
-          "type": "string"
-        }
-      },
-      "required": [
-        "metric",
-        "unit",
-        "baseline",
-        "candidate",
-        "delta_ratio",
-        "baseline_feasible",
-        "baseline_trial"
       ],
       "type": "object"
     },
@@ -1090,84 +826,11 @@
       ],
       "type": "object"
     },
-    "Direction": {
-      "description": "Which way a metric should move.",
-      "oneOf": [
-        {
-          "const": "increase",
-          "description": "Higher than the baseline.",
-          "type": "string"
-        },
-        {
-          "const": "decrease",
-          "description": "Lower than the baseline.",
-          "type": "string"
-        },
-        {
-          "const": "at_most",
-          "description": "At most the predicted value (e.g. a throttle budget).",
-          "type": "string"
-        },
-        {
-          "const": "at_least",
-          "description": "At least the predicted value.",
-          "type": "string"
-        },
-        {
-          "const": "unchanged",
-          "description": "Within the interval of the baseline (a change that must not cost anything).",
-          "type": "string"
-        }
-      ]
-    },
-    "EffectiveKnobValues": {
-      "description": "The effective configuration: the requested values with the service's limits applied.",
+    "EffectiveKnobs": {
+      "description": "Knob values as OpenDAL applies them, which can differ from what was requested.",
       "properties": {
-        "cache": {
-          "type": "boolean"
-        },
-        "cache_bytes": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "chunk_bytes": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "concurrency_count": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "http_version": {
-          "$ref": "#/$defs/HttpVersion"
-        },
-        "io_concurrency_count": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "keep_alive": {
-          "type": "boolean"
-        },
-        "max_inflight_requests_count": {
-          "description": "0 = unlimited.",
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "provider": {
-          "$ref": "#/$defs/ProviderKnobs",
-          "description": "Addressing style, checksum and SSE (S3)."
-        },
-        "range_gap_bytes": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "retries_count": {
+        "requested_chunk_bytes": {
+          "description": "`knobs.chunk_size` as requested (bytes).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -1188,57 +851,16 @@
             "null"
           ]
         },
-        "tail_cut": {
-          "type": "boolean"
-        },
-        "timeout_ms": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "transport": {
-          "$ref": "#/$defs/TransportMode"
-        },
         "write_chunk_bytes": {
-          "description": "Multipart part size OpenDAL writes with (the chunk clamped to the service's limits).",
+          "description": "Chunk (multipart part size) OpenDAL writes with: the requested chunk clamped to the\nservice's `write_multi_min_size ..= write_multi_max_size` (reads use it unchanged).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         }
       },
       "required": [
-        "concurrency_count",
-        "io_concurrency_count",
-        "chunk_bytes",
-        "range_gap_bytes",
-        "max_inflight_requests_count",
-        "http_version",
-        "transport",
-        "keep_alive",
-        "cache",
-        "cache_bytes",
-        "retries_count",
-        "tail_cut",
-        "timeout_ms",
+        "requested_chunk_bytes",
         "write_chunk_bytes"
-      ],
-      "type": "object"
-    },
-    "EgressTier": {
-      "description": "One egress price tier: the monthly GB up to `up_to_gb` (counted from 0, the free allowance\nincluded) cost `per_gb` (the last tier may use a huge bound).",
-      "properties": {
-        "per_gb": {
-          "format": "double",
-          "type": "number"
-        },
-        "up_to_gb": {
-          "format": "double",
-          "type": "number"
-        }
-      },
-      "required": [
-        "up_to_gb",
-        "per_gb"
       ],
       "type": "object"
     },
@@ -1298,84 +920,39 @@
       ],
       "type": "object"
     },
-    "Expectation": {
-      "description": "What a change should do to one metric: a predicted value with an interval.",
-      "properties": {
-        "direction": {
-          "$ref": "#/$defs/Direction"
-        },
-        "hi": {
-          "description": "Upper end of the prediction interval, in `unit`.",
-          "format": "double",
-          "type": "number"
-        },
-        "lo": {
-          "description": "Lower end of the prediction interval, in `unit`.",
-          "format": "double",
-          "type": "number"
-        },
-        "metric": {
-          "description": "A report metric path, e.g. `summary.ops_per_s`, `throttled_request_ratio`, `p99_ms`.",
-          "type": "string"
-        },
-        "predicted": {
-          "description": "Predicted value, in `unit`.",
-          "format": "double",
-          "type": "number"
-        },
-        "unit": {
-          "description": "Unit of `predicted`, `lo` and `hi` (`ops_per_s`, `ms`, `ratio`, …).",
-          "type": "string"
-        }
-      },
-      "required": [
-        "metric",
-        "direction",
-        "predicted",
-        "lo",
-        "hi",
-        "unit"
-      ],
-      "type": "object"
-    },
     "Finding": {
-      "description": "A diagnosis item (design §1).",
+      "description": "A finding (design v6 §3 \"Explain\"): a cause, the evidence (the requests themselves) and\n**one** OpenDAL remedy. No sizing numbers: a single run varies no load (T1, T2); `oprobe\nprove` sizes the remedy.",
       "properties": {
-        "advice": {
-          "description": "What to change.",
-          "type": "string"
-        },
         "cause": {
           "description": "One sentence: what is wrong.",
           "type": "string"
         },
         "code": {
-          "description": "Stable code, e.g. `throttling`, `cold_connections`.",
+          "description": "Stable code ([`crate::analysis::catalog`]), e.g. `throttling`, `tail_stragglers`.",
           "type": "string"
+        },
+        "confidence": {
+          "$ref": "#/$defs/Confidence",
+          "default": "low",
+          "description": "How sure the cause is: `high` only when the limit model explains most of the effect\nand agrees across the run's halves (T8)."
         },
         "evidence": {
           "$ref": "#/$defs/Evidence"
         },
+        "remedy": {
+          "$ref": "#/$defs/Remedy"
+        },
         "severity": {
           "$ref": "#/$defs/Severity"
-        },
-        "verification": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Verification"
-            },
-            {
-              "type": "null"
-            }
-          ]
         }
       },
       "required": [
         "code",
         "severity",
+        "confidence",
         "cause",
         "evidence",
-        "advice"
+        "remedy"
       ],
       "type": "object"
     },
@@ -1473,6 +1050,45 @@
         "requests_count",
         "share_ratio",
         "throttle_share_ratio"
+      ],
+      "type": "object"
+    },
+    "HttpOptions": {
+      "additionalProperties": false,
+      "description": "The HTTP client (OpenDAL's reqwest `HttpFetch`).",
+      "properties": {
+        "ca_cert": {
+          "description": "An extra PEM CA bundle to trust.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "insecure": {
+          "description": "Skip TLS certificate verification (self-signed development endpoints only).",
+          "type": "boolean"
+        },
+        "keep_alive": {
+          "default": true,
+          "description": "Reuse connections.",
+          "type": "boolean"
+        },
+        "proxy": {
+          "description": "Egress proxy URL; `none` ignores HTTPS_PROXY/HTTP_PROXY (unset: the environment).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "version": {
+          "$ref": "#/$defs/HttpVersion",
+          "default": "auto",
+          "description": "`auto` (OpenDAL's default: HTTP/1.1), `h1` or `h2`."
+        }
+      },
+      "required": [
+        "version",
+        "keep_alive"
       ],
       "type": "object"
     },
@@ -1729,197 +1345,77 @@
       ],
       "type": "object"
     },
-    "KnobValues": {
-      "description": "Client knob values in machine units.",
-      "properties": {
-        "cache": {
-          "type": "boolean"
-        },
-        "cache_bytes": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "chunk_bytes": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "concurrency_count": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "http_version": {
-          "$ref": "#/$defs/HttpVersion"
-        },
-        "io_concurrency_count": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "keep_alive": {
-          "type": "boolean"
-        },
-        "max_inflight_requests_count": {
-          "description": "0 = unlimited.",
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "provider": {
-          "$ref": "#/$defs/ProviderKnobs",
-          "description": "Addressing style, checksum and SSE (S3)."
-        },
-        "range_gap_bytes": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "retries_count": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "tail_cut": {
-          "type": "boolean"
-        },
-        "timeout_ms": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "transport": {
-          "$ref": "#/$defs/TransportMode"
-        }
-      },
-      "required": [
-        "concurrency_count",
-        "io_concurrency_count",
-        "chunk_bytes",
-        "range_gap_bytes",
-        "max_inflight_requests_count",
-        "http_version",
-        "transport",
-        "keep_alive",
-        "cache",
-        "cache_bytes",
-        "retries_count",
-        "tail_cut",
-        "timeout_ms"
-      ],
-      "type": "object"
-    },
-    "Knobs": {
+    "Layers": {
       "additionalProperties": false,
-      "description": "Client-side configuration under test / being tuned.",
+      "description": "The layer stack: each key is one OpenDAL layer.",
       "properties": {
         "cache": {
-          "default": false,
-          "description": "In-memory read cache.",
-          "type": "boolean"
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Cache"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "`FoyerLayer` with an in-memory cache (off by default)."
         },
-        "cache_size": {
-          "$ref": "#/$defs/ByteSize",
-          "default": "256MiB"
+        "concurrent_limit": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ConcurrentLimit"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "`ConcurrentLimitLayer` (off by default)."
         },
-        "chunk_size": {
-          "$ref": "#/$defs/ByteSize",
-          "default": "8MiB",
-          "description": "Reader/writer chunk size (`.chunk(n)`), also the multipart part size."
-        },
-        "concurrency": {
-          "default": 16,
-          "description": "Concurrent logical operations (closed-loop workers, or open-loop in-flight cap).",
-          "format": "uint",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "http_version": {
-          "$ref": "#/$defs/HttpVersion",
-          "default": "auto"
-        },
-        "io_concurrency": {
-          "default": 4,
-          "description": "Per-operation reader/writer concurrency (`.concurrent(n)`).",
-          "format": "uint",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "keep_alive": {
-          "default": true,
-          "type": "boolean"
-        },
-        "max_inflight_requests": {
-          "default": 0,
-          "description": "Cap on in-flight HTTP requests across the client (0 = unlimited).",
-          "format": "uint",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "provider": {
-          "$ref": "#/$defs/ProviderKnobs",
-          "description": "Provider request options (addressing style, checksums, SSE), applied when the session\nopens."
-        },
-        "range_gap": {
-          "$ref": "#/$defs/ByteSize",
-          "default": "64KiB",
-          "description": "Merge vectored ranges closer than this (`.gap(n)`)."
-        },
-        "retries": {
-          "default": 3,
-          "description": "Retry attempts on temporary errors (OpenDAL `RetryLayer`).",
-          "format": "uint",
-          "minimum": 0,
-          "type": "integer"
+        "retry": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Retry"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "`RetryLayer` (on by default)."
         },
         "tail_cut": {
-          "default": false,
-          "description": "Cancel & retry straggler requests above the adaptive p95 deadline (`TailCutLayer`).",
-          "type": "boolean"
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TailCut"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "`TailCutLayer` (off by default)."
+        },
+        "throttle": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Throttle"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "`ThrottleLayer` (off by default)."
         },
         "timeout": {
-          "$ref": "#/$defs/HumanDuration",
-          "default": "1m",
-          "description": "Per-operation timeout."
-        },
-        "transport": {
-          "$ref": "#/$defs/TransportMode",
-          "default": "opendal",
-          "description": "How requests are made and observed: `opendal` = OpenDAL's own reqwest client (what\nproduction runs; the default), `microscope` = oprobe's instrumented connection pool\n(exact queue / per-dial phases / HTTP/2 streams, but a different client)."
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Timeout"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "`TimeoutLayer` (on by default)."
         }
       },
-      "required": [
-        "concurrency",
-        "io_concurrency",
-        "chunk_size",
-        "range_gap",
-        "max_inflight_requests",
-        "http_version",
-        "transport",
-        "keep_alive",
-        "cache",
-        "cache_size",
-        "retries",
-        "tail_cut",
-        "timeout"
-      ],
-      "type": "object"
-    },
-    "KnobsInfo": {
-      "description": "Knobs as requested and as OpenDAL applied them.",
-      "properties": {
-        "effective": {
-          "$ref": "#/$defs/EffectiveKnobValues"
-        },
-        "requested": {
-          "$ref": "#/$defs/KnobValues"
-        }
-      },
-      "required": [
-        "requested",
-        "effective"
-      ],
       "type": "object"
     },
     "MixEntry": {
@@ -2506,46 +2002,41 @@
       ],
       "type": "object"
     },
-    "Overrides": {
-      "description": "A change to a run: `--set key=value` pairs grouped by the part of the profile they change\n(canonical key names, see [`SET_KEYS`]). Built with [`Overrides::set`], which validates.",
+    "OperatorSpec": {
+      "additionalProperties": false,
+      "description": "One OpenDAL operator: service, layers, read/write options, HTTP client settings.",
       "properties": {
-        "cost": {
+        "http": {
+          "$ref": "#/$defs/HttpOptions",
+          "description": "The `HttpFetch` client's settings."
+        },
+        "layers": {
+          "$ref": "#/$defs/Layers",
+          "description": "The layer stack."
+        },
+        "options": {
           "additionalProperties": {
             "type": "string"
           },
+          "description": "OpenDAL service options (checked against the service). Values may reference\nenvironment variables as `${NAME}`.",
           "type": "object"
         },
-        "knobs": {
-          "additionalProperties": {
-            "type": "string"
-          },
-          "type": "object"
+        "read": {
+          "$ref": "#/$defs/ReadOptions",
+          "description": "`read_with(path)` / `reader_with(path)` options."
         },
-        "label": {
-          "type": [
-            "string",
-            "null"
-          ]
+        "url": {
+          "description": "The service: any OpenDAL scheme oprobe is built with (`s3://bucket/prefix`,\n`gcs://bucket`, `fs:///tmp/x`, `memory://`), or `lab://SCENARIO` for the local lab.",
+          "type": "string"
         },
-        "sla": {
-          "additionalProperties": {
-            "type": "string"
-          },
-          "type": "object"
-        },
-        "target": {
-          "additionalProperties": {
-            "type": "string"
-          },
-          "type": "object"
-        },
-        "workload": {
-          "additionalProperties": {
-            "type": "string"
-          },
-          "type": "object"
+        "write": {
+          "$ref": "#/$defs/WriteOptions",
+          "description": "`writer_with(path)` options."
         }
       },
+      "required": [
+        "url"
+      ],
       "type": "object"
     },
     "PartialInfo": {
@@ -2586,270 +2077,43 @@
         }
       ]
     },
-    "PerOpUsage": {
-      "description": "Measured usage per logical operation.",
-      "properties": {
-        "cache_saved_bytes": {
-          "format": "double",
-          "type": "number"
-        },
-        "cache_saved_reads_mean": {
-          "description": "GETs avoided thanks to cache hits.",
-          "format": "double",
-          "type": "number"
-        },
-        "delete_requests_mean": {
-          "format": "double",
-          "type": "number"
-        },
-        "download_bytes": {
-          "format": "double",
-          "type": "number"
-        },
-        "failed_requests_mean": {
-          "description": "Requests that failed or were throttled (billed on most providers, add no value).",
-          "format": "double",
-          "type": "number"
-        },
-        "list_requests_mean": {
-          "format": "double",
-          "type": "number"
-        },
-        "overread_bytes": {
-          "description": "Downloaded bytes the application never asked for (range coalescing / chunk over-fetch).",
-          "format": "double",
-          "type": "number"
-        },
-        "read_requests_mean": {
-          "format": "double",
-          "type": "number"
-        },
-        "server_error_requests_mean": {
-          "default": 0.0,
-          "description": "Of `failed_requests`, those answered 5xx (incl. 503 SlowDown): not billed by most\nproviders.",
-          "format": "double",
-          "type": "number"
-        },
-        "upload_bytes": {
-          "format": "double",
-          "type": "number"
-        },
-        "write_requests_mean": {
-          "format": "double",
-          "type": "number"
-        }
-      },
-      "required": [
-        "write_requests_mean",
-        "list_requests_mean",
-        "read_requests_mean",
-        "delete_requests_mean",
-        "failed_requests_mean",
-        "server_error_requests_mean",
-        "download_bytes",
-        "upload_bytes",
-        "overread_bytes",
-        "cache_saved_reads_mean",
-        "cache_saved_bytes"
-      ],
-      "type": "object"
-    },
     "Preset": {
+      "description": "The workload presets: OpenDAL access patterns (design v6 §8).",
       "oneOf": [
         {
-          "const": "parquet",
-          "description": "Lakehouse scan: stat + footer read + vectored column-chunk range reads.",
-          "type": "string"
-        },
-        {
-          "const": "checkpoint",
-          "description": "AI/ML checkpoint: large multipart writes plus occasional full restores.",
-          "type": "string"
-        },
-        {
           "const": "small-files",
-          "description": "Many small objects: whole-object GETs and PUTs.",
+          "description": "Many small objects: whole-object reads and writes, some stats.",
           "type": "string"
         },
         {
-          "const": "metadata",
-          "description": "Metadata-heavy: LIST and HEAD storms over a partitioned prefix.",
+          "const": "large-objects",
+          "description": "Large objects: multipart writes and full reads.",
           "type": "string"
         },
         {
-          "const": "mixed",
-          "description": "General purpose 70/20/10 read/write/stat mix.",
+          "const": "range-reads",
+          "description": "Range reads (parquet-like): a stat, the footer, then vectored column-chunk ranges.",
           "type": "string"
         },
         {
-          "const": "parquet-suffix",
-          "description": "Lakehouse scan reading the footer with a suffix range (no HEAD per file).",
-          "type": "string"
-        },
-        {
-          "const": "delete",
-          "description": "Churn: small writes removed again by batched deletes (OpenDAL `Deleter`).",
-          "type": "string"
-        },
-        {
-          "const": "copy",
-          "description": "Server-side copies of dataset objects.",
-          "type": "string"
-        },
-        {
-          "const": "list-paged",
-          "description": "LIST with a page size (`limit`): every page is a billed request.",
-          "type": "string"
-        },
-        {
-          "const": "presign",
-          "description": "GETs through presigned URLs.",
-          "type": "string"
-        },
-        {
-          "const": "conditional",
-          "description": "Optimistic concurrency: conditional create (`If-None-Match: *`) and overwrite (`If-Match`).",
-          "type": "string"
-        },
-        {
-          "const": "metadata-heavy",
-          "description": "HEAD storm plus small writes carrying user metadata.",
+          "const": "list-stat",
+          "description": "Metadata: list and stat over a partitioned prefix.",
           "type": "string"
         }
       ]
     },
-    "Pricing": {
-      "additionalProperties": false,
-      "description": "Provider list prices in USD (request prices per million, data per GB = 1e9 bytes).",
-      "properties": {
-        "bills_client_errors": {
-          "default": true,
-          "description": "Requests answered 4xx are billed (most providers).",
-          "type": "boolean"
-        },
-        "bills_server_errors": {
-          "default": true,
-          "description": "Requests answered 5xx (incl. 503 SlowDown) are billed (the presets assume so; check\nyour provider's terms and set `false` in `[cost.pricing]` where they are free).",
-          "type": "boolean"
-        },
-        "delete_per_million": {
-          "default": 0.0,
-          "format": "double",
-          "type": "number"
-        },
-        "egress_free_gb": {
-          "default": 0.0,
-          "description": "Internet egress free per month (GB).",
-          "format": "double",
-          "type": "number"
-        },
-        "egress_free_stored_multiple": {
-          "default": 0.0,
-          "description": "Free egress as a multiple of the stored data (Backblaze B2: 3×).",
-          "format": "double",
-          "type": "number"
-        },
-        "egress_per_gb": {
-          "description": "Internet egress per GB (the first paid tier when `egress_tiers` is given).",
-          "format": "double",
-          "type": "number"
-        },
-        "egress_tiers": {
-          "description": "Internet egress price tiers by monthly volume (absolute bounds, the free allowance\nincluded in the first); empty: the flat `egress_per_gb`.",
-          "items": {
-            "$ref": "#/$defs/EgressTier"
-          },
-          "type": "array"
-        },
-        "inter_region_per_gb": {
-          "default": 0.0,
-          "description": "Inter-region transfer per GB.",
-          "format": "double",
-          "type": "number"
-        },
-        "list_per_million": {
-          "format": "double",
-          "type": "number"
-        },
-        "note": {
-          "type": "string"
-        },
-        "provider": {
-          "type": "string"
-        },
-        "read_per_million": {
-          "description": "GET / HEAD.",
-          "format": "double",
-          "type": "number"
-        },
-        "storage_classes": {
-          "description": "Storage classes besides standard (`infrequent`, `archive`).",
-          "items": {
-            "$ref": "#/$defs/StorageClassPrice"
-          },
-          "type": "array"
-        },
-        "storage_gb_month": {
-          "format": "double",
-          "type": "number"
-        },
-        "write_per_million": {
-          "description": "PUT / POST / COPY / multipart part & complete.",
-          "format": "double",
-          "type": "number"
-        }
-      },
-      "required": [
-        "provider",
-        "storage_gb_month",
-        "write_per_million",
-        "list_per_million",
-        "read_per_million",
-        "delete_per_million",
-        "egress_per_gb",
-        "egress_free_gb",
-        "egress_free_stored_multiple",
-        "inter_region_per_gb",
-        "bills_client_errors",
-        "bills_server_errors"
-      ],
-      "type": "object"
-    },
     "Profile": {
       "additionalProperties": false,
-      "description": "Complete, round-trippable benchmark profile.",
+      "description": "Complete, round-trippable profile of a run: the operator, the workload and the SLA.",
       "properties": {
-        "cost": {
-          "$ref": "#/$defs/CostSpec",
-          "default": {
-            "egress_fraction": 0.0,
-            "monthly_ops": 100000000.0,
-            "stored_gib": 1024.0
-          }
-        },
-        "knobs": {
-          "$ref": "#/$defs/Knobs",
-          "default": {
-            "cache": false,
-            "cache_size": "256MiB",
-            "chunk_size": "8MiB",
-            "concurrency": 16,
-            "http_version": "auto",
-            "io_concurrency": 4,
-            "keep_alive": true,
-            "max_inflight_requests": 0,
-            "range_gap": "64KiB",
-            "retries": 3,
-            "tail_cut": false,
-            "timeout": "1m",
-            "transport": "opendal"
-          }
-        },
         "name": {
           "type": [
             "string",
             "null"
           ]
+        },
+        "operator": {
+          "$ref": "#/$defs/OperatorSpec"
         },
         "sla": {
           "$ref": "#/$defs/Sla",
@@ -2858,16 +2122,14 @@
             "max_error_rate": 0.01
           }
         },
-        "target": {
-          "$ref": "#/$defs/TargetSpec"
-        },
         "workload": {
           "$ref": "#/$defs/WorkloadSpec",
           "default": {
             "access": "uniform",
             "cleanup": true,
+            "concurrency": 16,
             "duration": "10s",
-            "preset": "parquet",
+            "preset": "small-files",
             "seed": 42,
             "verify": true,
             "warmup": "2s"
@@ -2875,125 +2137,9 @@
         }
       },
       "required": [
-        "target",
+        "operator",
         "workload",
-        "knobs",
-        "sla",
-        "cost"
-      ],
-      "type": "object"
-    },
-    "ProviderCost": {
-      "properties": {
-        "cache_savings_usd": {
-          "description": "Monthly spend avoided by the local cache.",
-          "format": "double",
-          "type": "number"
-        },
-        "early_delete_usd": {
-          "default": 0.0,
-          "description": "Monthly charges for objects deleted before the class's minimum duration.",
-          "format": "double",
-          "type": "number"
-        },
-        "egress_usd": {
-          "format": "double",
-          "type": "number"
-        },
-        "failed_requests_usd": {
-          "description": "Monthly spend on failed/throttled requests.",
-          "format": "double",
-          "type": "number"
-        },
-        "inter_region_usd": {
-          "default": 0.0,
-          "description": "Monthly inter-region transfer.",
-          "format": "double",
-          "type": "number"
-        },
-        "key": {
-          "type": "string"
-        },
-        "overread_usd": {
-          "description": "Monthly egress spend on over-read bytes.",
-          "format": "double",
-          "type": "number"
-        },
-        "per_million_ops_usd": {
-          "description": "Requests + egress per million logical operations.",
-          "format": "double",
-          "type": "number"
-        },
-        "provider": {
-          "type": "string"
-        },
-        "requests_usd": {
-          "format": "double",
-          "type": "number"
-        },
-        "retrieval_usd": {
-          "default": 0.0,
-          "description": "Monthly data-retrieval fees of the storage class.",
-          "format": "double",
-          "type": "number"
-        },
-        "storage_class": {
-          "default": "",
-          "description": "The storage class priced (`standard`, or the provider's name of the class).",
-          "type": "string"
-        },
-        "storage_usd": {
-          "format": "double",
-          "type": "number"
-        },
-        "total_usd": {
-          "format": "double",
-          "type": "number"
-        }
-      },
-      "required": [
-        "key",
-        "provider",
-        "requests_usd",
-        "egress_usd",
-        "storage_usd",
-        "total_usd",
-        "per_million_ops_usd",
-        "failed_requests_usd",
-        "overread_usd",
-        "cache_savings_usd",
-        "storage_class",
-        "retrieval_usd",
-        "inter_region_usd",
-        "early_delete_usd"
-      ],
-      "type": "object"
-    },
-    "ProviderKnobs": {
-      "additionalProperties": false,
-      "description": "Provider request options measured for their overhead (S3 service options).",
-      "properties": {
-        "addressing": {
-          "$ref": "#/$defs/Addressing",
-          "default": "auto"
-        },
-        "checksum": {
-          "description": "Checksum the client computes and the server verifies on writes (`crc32c`).",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "sse": {
-          "description": "Server-side encryption: `AES256` or `aws:kms`.",
-          "type": [
-            "string",
-            "null"
-          ]
-        }
-      },
-      "required": [
-        "addressing"
+        "sla"
       ],
       "type": "object"
     },
@@ -3046,61 +2192,81 @@
       "description": "Time-varying open-loop rate: ramp:FROM..TO/DURATION, step:R1,R2,…/DURATION or diurnal[:MIN..MAX/PERIOD]",
       "type": "string"
     },
-    "Recommendation": {
-      "description": "What `oprobe tune` / `oprobe fix` / MCP `recommend_config` recommend.",
+    "ReadOptions": {
+      "additionalProperties": false,
+      "description": "`read_with` / `reader_with` options (unset: OpenDAL's default).",
       "properties": {
-        "confirmed": {
+        "chunk": {
           "anyOf": [
             {
-              "$ref": "#/$defs/VerifyOutcome"
+              "$ref": "#/$defs/ByteSize"
             },
             {
               "type": "null"
             }
-          ],
-          "description": "What `oprobe verify` concluded about the recommendation (set by `oprobe fix`)."
+          ]
         },
-        "knobs": {
-          "$ref": "#/$defs/KnobValues",
-          "description": "The recommended knob values."
+        "concurrent": {
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
         },
-        "no_feasible_trial": {
-          "description": "No trial met the SLA: this is the least-bad configuration, not a recommendation.",
+        "gap": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ByteSize"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "Remedy": {
+      "description": "The one remedy of a finding: an `OperatorSpec` path (design v6 §8 \"Findings → remedies\").",
+      "properties": {
+        "next": {
+          "description": "The next command (`oprobe prove RUN CODE`, or `oprobe show RUN --by …` when there is\nnothing to prove).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "opendal": {
+          "description": "The OpenDAL API, e.g. `ConcurrentLimitLayer::with_http_concurrent_limit`.",
+          "type": "string"
+        },
+        "path": {
+          "description": "The operator path the remedy changes (`layers.concurrent_limit.http`, `read.gap`);\nabsent when the remedy is not a layer (`key_limit`, `client_bound`, `errors`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sized": {
+          "description": "`oprobe prove` sizes the value with a bracket search (otherwise it switches it on).",
           "type": "boolean"
         },
-        "objective": {
+        "text": {
+          "description": "The remedy in one sentence (no numbers).",
           "type": "string"
         },
-        "overrides": {
-          "$ref": "#/$defs/Overrides",
-          "description": "The change from the baseline's knobs (`--set` vocabulary): apply with\n`oprobe run --from RUN …` or `RunSpec::with`."
-        },
-        "profile_toml": {
-          "description": "A profile with the recommended knobs (environment defaults such as `proxy` and\nredacted secrets omitted).",
-          "type": "string"
-        },
-        "rust_snippet": {
-          "description": "Rust/OpenDAL code configuring the same client.",
-          "type": "string"
-        },
-        "vs_baseline": {
-          "$ref": "#/$defs/Delta",
-          "description": "Against the baseline trial (`baseline_feasible: false` when it violated the SLA or\nthe throttle budget)."
-        },
-        "vs_best": {
-          "$ref": "#/$defs/Delta",
-          "description": "Against the best feasible trial: the cost of the safety margin."
+        "with": {
+          "description": "Paths changed together with it (`layers.retry.jitter`).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
         }
       },
       "required": [
-        "objective",
-        "knobs",
-        "overrides",
-        "profile_toml",
-        "rust_snippet",
-        "vs_baseline",
-        "vs_best",
-        "no_feasible_trial"
+        "sized",
+        "text"
       ],
       "type": "object"
     },
@@ -3141,44 +2307,6 @@
         "down_bytes",
         "p50_ms",
         "p99_ms"
-      ],
-      "type": "object"
-    },
-    "ReplaySpec": {
-      "additionalProperties": false,
-      "description": "What to replay (`workload.replay`).",
-      "properties": {
-        "file": {
-          "description": "The log: an S3 server access log, CloudTrail JSON (S3 data events) or an oprobe run file.",
-          "type": "string"
-        },
-        "map_prefix": {
-          "description": "Key rewrites, the first matching prefix wins (`$RUN/` targets the run prefix).",
-          "items": {
-            "maxItems": 2,
-            "minItems": 2,
-            "prefixItems": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "string"
-              }
-            ],
-            "type": "array"
-          },
-          "type": "array"
-        },
-        "speed": {
-          "default": 1.0,
-          "description": "Speed factor: 2 replays twice as fast as recorded.",
-          "format": "double",
-          "type": "number"
-        }
-      },
-      "required": [
-        "file",
-        "speed"
       ],
       "type": "object"
     },
@@ -3300,6 +2428,43 @@
       ],
       "type": "object"
     },
+    "Retry": {
+      "additionalProperties": false,
+      "description": "`RetryLayer` (OpenDAL's defaults: 3 times, 1 s to 60 s, factor 2, no jitter).",
+      "properties": {
+        "factor": {
+          "default": 2.0,
+          "format": "float",
+          "type": "number"
+        },
+        "jitter": {
+          "default": false,
+          "type": "boolean"
+        },
+        "max_delay": {
+          "$ref": "#/$defs/HumanDuration",
+          "default": "1m"
+        },
+        "max_times": {
+          "default": 3,
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "min_delay": {
+          "$ref": "#/$defs/HumanDuration",
+          "default": "1s"
+        }
+      },
+      "required": [
+        "max_times",
+        "jitter",
+        "min_delay",
+        "max_delay",
+        "factor"
+      ],
+      "type": "object"
+    },
     "RunInfo": {
       "description": "Identity and context of the run.",
       "properties": {
@@ -3330,6 +2495,13 @@
         "oprobe_version": {
           "type": "string"
         },
+        "parent_id": {
+          "description": "The `oprobe prove` this run is a trial of (trials are hidden from `show --list`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "partial": {
           "anyOf": [
             {
@@ -3344,6 +2516,11 @@
         "sampled": {
           "description": "Trace rows were sampled (more requests than `trace.max_requests`); aggregates are exact.",
           "type": "boolean"
+        },
+        "source": {
+          "$ref": "#/$defs/RunSource",
+          "default": "run",
+          "description": "Where the traffic came from: a workload oprobe drove (`run`), or a production trace\nan embedded `oprobe-trace` layer recorded (`trace`: no workload, nothing to replay)."
         },
         "started_at": {
           "description": "RFC 3339.",
@@ -3360,6 +2537,7 @@
       },
       "required": [
         "id",
+        "source",
         "started_at",
         "ended_at",
         "window_s",
@@ -3372,11 +2550,26 @@
       ],
       "type": "object"
     },
+    "RunSource": {
+      "description": "Where a run's traffic came from.",
+      "oneOf": [
+        {
+          "const": "run",
+          "description": "A workload `oprobe run` drove (replayable: `oprobe prove` can A/B it).",
+          "type": "string"
+        },
+        {
+          "const": "trace",
+          "description": "A production trace written by the `oprobe-trace` layer (`oprobe.trace/6`): the\napplication's own traffic, with no workload to replay.",
+          "type": "string"
+        }
+      ]
+    },
     "RunSpec": {
       "description": "One replayable definition of a run.",
       "properties": {
         "existing": {
-          "description": "`--existing PREFIX`: benchmark existing objects (read-only).",
+          "description": "`--existing PREFIX`: profile existing objects (read-only).",
           "type": [
             "string",
             "null"
@@ -3388,24 +2581,24 @@
             "null"
           ]
         },
+        "operator_ref": {
+          "description": "The operator as given: a URL, an operator file or a configured name.",
+          "type": "string"
+        },
         "profile": {
           "$ref": "#/$defs/Profile",
-          "description": "The fully resolved profile (preset defaults are kept implicit, as in a profile file).\nSecret options are `\"<redacted>\"` (environment references such as\n`${AWS_SECRET_ACCESS_KEY}` are kept: they are not secrets); options the target URL\nimplies are left out, so the profile's target holds only what was added on top."
+          "description": "The fully resolved profile (preset defaults are kept implicit). Secret options of the\noperator are `\"<redacted>\"` (environment references such as `${AWS_SECRET_ACCESS_KEY}`\nare kept: they are not secrets)."
         },
         "seed": {
           "description": "The dataset / key-choice seed the run used.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
-        },
-        "target_ref": {
-          "description": "The target as given: a configured target name, a storage URL or `lab://SCENARIO`.",
-          "type": "string"
         }
       },
       "required": [
         "profile",
-        "target_ref",
+        "operator_ref",
         "seed"
       ],
       "type": "object"
@@ -3809,58 +3002,6 @@
       ],
       "type": "object"
     },
-    "StorageClassPrice": {
-      "description": "A storage class: its storage, request and retrieval prices, minimum billable object size\nand minimum storage duration.",
-      "properties": {
-        "class": {
-          "description": "`infrequent` or `archive`.",
-          "type": "string"
-        },
-        "min_billable_bytes": {
-          "description": "Smaller objects are billed as this size (bytes).",
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "min_duration_days": {
-          "description": "Objects deleted earlier are billed for the rest of this duration (days).",
-          "format": "double",
-          "type": "number"
-        },
-        "name": {
-          "description": "The provider's name for it.",
-          "type": "string"
-        },
-        "read_per_million": {
-          "format": "double",
-          "type": "number"
-        },
-        "retrieval_per_gb": {
-          "description": "Data retrieval per GB read.",
-          "format": "double",
-          "type": "number"
-        },
-        "storage_gb_month": {
-          "format": "double",
-          "type": "number"
-        },
-        "write_per_million": {
-          "format": "double",
-          "type": "number"
-        }
-      },
-      "required": [
-        "class",
-        "name",
-        "storage_gb_month",
-        "write_per_million",
-        "read_per_million",
-        "retrieval_per_gb",
-        "min_billable_bytes",
-        "min_duration_days"
-      ],
-      "type": "object"
-    },
     "Summary": {
       "properties": {
         "attempted_ops_per_s": {
@@ -3937,6 +3078,62 @@
       ],
       "type": "object"
     },
+    "TailCut": {
+      "additionalProperties": false,
+      "description": "`TailCutLayer`: cancel (and, through `RetryLayer`, re-issue) a request slower than the\n`percentile` of the recent latencies × `safety_factor`, the deadline clamped to\n`[min_deadline, max_deadline]`.\n\nThe defaults are what oprobe measures with, not OpenDAL's (1.3, 200 samples, 500 ms, 30 s):\na shorter warm-up and floor so that short runs can see the layer work, and a ceiling at the\noperation timeout. Generated Rust spells out every value that differs from OpenDAL's default.",
+      "properties": {
+        "max_deadline": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HumanDuration"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The longest deadline (unset: the operation timeout, `layers.timeout.op`, or 60 s without\nthe timeout layer)."
+        },
+        "min_deadline": {
+          "$ref": "#/$defs/HumanDuration",
+          "default": "50ms",
+          "description": "The shortest deadline."
+        },
+        "min_samples": {
+          "default": 32,
+          "description": "Latencies recorded before the layer cuts anything.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "percentile": {
+          "default": 95,
+          "description": "The latency percentile the deadline follows (50..99).",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "safety_factor": {
+          "default": 1.5,
+          "description": "The deadline = percentile × this factor (1..5).",
+          "format": "double",
+          "type": "number"
+        },
+        "window": {
+          "$ref": "#/$defs/HumanDuration",
+          "default": "1m",
+          "description": "The sliding window of latencies (at most 120 s)."
+        }
+      },
+      "required": [
+        "percentile",
+        "safety_factor",
+        "min_samples",
+        "min_deadline",
+        "window"
+      ],
+      "type": "object"
+    },
     "TargetInfo": {
       "description": "The target, with secrets redacted.",
       "properties": {
@@ -3976,52 +3173,6 @@
       "required": [
         "display",
         "scheme",
-        "options"
-      ],
-      "type": "object"
-    },
-    "TargetSpec": {
-      "additionalProperties": false,
-      "description": "Storage target. Either `url = \"s3://bucket/prefix\"` or explicit `scheme` + `options`.",
-      "properties": {
-        "ca_cert": {
-          "description": "Extra PEM CA bundle to trust.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "insecure": {
-          "description": "Skip TLS certificate verification (self-signed dev endpoints only).",
-          "type": "boolean"
-        },
-        "options": {
-          "additionalProperties": {
-            "type": "string"
-          },
-          "default": {},
-          "description": "OpenDAL service options. Values may reference environment variables as `${NAME}`.",
-          "type": "object"
-        },
-        "proxy": {
-          "description": "Egress proxy URL; `\"none\"` disables proxies; unset = `HTTPS_PROXY`/`HTTP_PROXY` env.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "scheme": {
-          "description": "OpenDAL scheme; derived from `url` when empty (and then not written back).",
-          "type": "string"
-        },
-        "url": {
-          "type": [
-            "string",
-            "null"
-          ]
-        }
-      },
-      "required": [
         "options"
       ],
       "type": "object"
@@ -4135,6 +3286,25 @@
         "delivery_rate_p50_bits_per_s",
         "rwnd_limited_ratio",
         "sndbuf_limited_ratio"
+      ],
+      "type": "object"
+    },
+    "Throttle": {
+      "additionalProperties": false,
+      "description": "`ThrottleLayer` (bytes per second, and the largest burst).",
+      "properties": {
+        "bandwidth": {
+          "$ref": "#/$defs/ByteSize",
+          "default": "100MiB"
+        },
+        "burst": {
+          "$ref": "#/$defs/ByteSize",
+          "default": "16MiB"
+        }
+      },
+      "required": [
+        "bandwidth",
+        "burst"
       ],
       "type": "object"
     },
@@ -4261,6 +3431,27 @@
         "max_ms",
         "inflight_peak_count",
         "new_connections_count"
+      ],
+      "type": "object"
+    },
+    "Timeout": {
+      "additionalProperties": false,
+      "description": "`TimeoutLayer` (OpenDAL's defaults: 60 s per operation, 10 s per I/O).",
+      "properties": {
+        "io": {
+          "$ref": "#/$defs/HumanDuration",
+          "default": "10s",
+          "description": "`with_io_timeout`: one read or write call."
+        },
+        "op": {
+          "$ref": "#/$defs/HumanDuration",
+          "default": "1m",
+          "description": "`with_timeout`: one operation."
+        }
+      },
+      "required": [
+        "op",
+        "io"
       ],
       "type": "object"
     },
@@ -4412,276 +3603,6 @@
       ],
       "type": "object"
     },
-    "TransportMode": {
-      "oneOf": [
-        {
-          "const": "opendal",
-          "description": "OpenDAL's default HTTP client (reqwest), observed through its extension points.",
-          "type": "string"
-        },
-        {
-          "const": "microscope",
-          "description": "oprobe's own instrumented connection pool.",
-          "type": "string"
-        }
-      ]
-    },
-    "TrialRow": {
-      "description": "One tuner trial.",
-      "properties": {
-        "cost_per_million_ops_usd": {
-          "format": "double",
-          "type": "number"
-        },
-        "error_ratio": {
-          "format": "double",
-          "type": "number"
-        },
-        "feasible": {
-          "type": "boolean"
-        },
-        "id": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "knobs": {
-          "$ref": "#/$defs/KnobValues"
-        },
-        "mib_per_s": {
-          "format": "double",
-          "type": "number"
-        },
-        "note": {
-          "type": "string"
-        },
-        "ops_per_s": {
-          "description": "Successful operations per second.",
-          "format": "double",
-          "type": "number"
-        },
-        "p50_ms": {
-          "format": "double",
-          "type": "number"
-        },
-        "p99_ms": {
-          "format": "double",
-          "type": "number"
-        },
-        "peak_inflight_count": {
-          "description": "Requests in flight at the trial's peak.",
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "peak_inflight_per_op_count": {
-          "description": "The most requests one operation had in flight at once (maximum over operations).",
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "rate_per_s": {
-          "description": "The pace of an open-loop trial (operations per second).",
-          "format": "double",
-          "type": [
-            "number",
-            "null"
-          ]
-        },
-        "requests_count": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "stage": {
-          "type": "string"
-        },
-        "throttled_op_ratio": {
-          "description": "Operations with ≥ 1 throttled response / operations.",
-          "format": "double",
-          "type": "number"
-        },
-        "throttled_request_ratio": {
-          "description": "Throttled responses / requests (the throttle budget applies to this).",
-          "format": "double",
-          "type": "number"
-        },
-        "throttled_responses_count": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        }
-      },
-      "required": [
-        "id",
-        "stage",
-        "knobs",
-        "ops_per_s",
-        "mib_per_s",
-        "p50_ms",
-        "p99_ms",
-        "error_ratio",
-        "throttled_request_ratio",
-        "throttled_op_ratio",
-        "throttled_responses_count",
-        "requests_count",
-        "peak_inflight_count",
-        "peak_inflight_per_op_count",
-        "cost_per_million_ops_usd",
-        "feasible",
-        "note"
-      ],
-      "type": "object"
-    },
-    "TuneReport": {
-      "description": "The tuner's search, embedded in the winner's report (design v4 §6).",
-      "properties": {
-        "baseline_feasible": {
-          "description": "The baseline met the SLA and the throttle budget. When it did not, deltas are taken\nagainst the best feasible trial.",
-          "type": "boolean"
-        },
-        "baseline_trial": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "best_feasible_trial_id": {
-          "description": "The best trial within the SLA and the throttle budget, ignoring the safety margin.",
-          "format": "uint64",
-          "minimum": 0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "capacity": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Capacity"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "The capacity model over every trial (`source: tune`)."
-        },
-        "headline": {
-          "description": "One line: what is recommended and why.",
-          "type": "string"
-        },
-        "improvement_ratio": {
-          "description": "Objective improvement of the recommendation vs the baseline (positive = better);\nabsent when the baseline was infeasible or above the safety margin. Never negative.",
-          "format": "double",
-          "type": [
-            "number",
-            "null"
-          ]
-        },
-        "margin_cost_ratio": {
-          "description": "How much better the best feasible trial measured than the recommendation: what the\nsafety margin costs.",
-          "format": "double",
-          "type": [
-            "number",
-            "null"
-          ]
-        },
-        "max_throttle_ratio": {
-          "description": "The throttle budget (share of throttled requests a feasible trial may cause).",
-          "format": "double",
-          "type": "number"
-        },
-        "metric_unit": {
-          "description": "What goodput was measured in: `ops_per_s` or `mib_per_s`.",
-          "type": "string"
-        },
-        "no_feasible_trial": {
-          "description": "No trial met the SLA: the winner is the least-bad configuration.",
-          "type": "boolean"
-        },
-        "notes": {
-          "items": {
-            "type": "string"
-          },
-          "type": "array"
-        },
-        "objective": {
-          "description": "`goodput`, `p99`, `cost` or `balanced`.",
-          "type": "string"
-        },
-        "pareto_trial_ids": {
-          "default": [],
-          "description": "Trials not dominated on (goodput, p99, cost, throttling).",
-          "items": {
-            "format": "uint64",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "type": "array"
-        },
-        "recommendation": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Recommendation"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "The recommended configuration: knobs, profile, code, deltas."
-        },
-        "recommended_trial_id": {
-          "description": "The trial whose knobs are recommended.",
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "safe_concurrency_count": {
-          "description": "The capacity model's concurrency within the safety margin.",
-          "format": "uint64",
-          "minimum": 0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "throttle_ceiling_count": {
-          "description": "Lowest concurrency that exceeded the throttle budget.",
-          "format": "uint64",
-          "minimum": 0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "trials": {
-          "items": {
-            "$ref": "#/$defs/TrialRow"
-          },
-          "type": "array"
-        },
-        "winner_trial": {
-          "description": "The recommendation's confirmation run.",
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        }
-      },
-      "required": [
-        "objective",
-        "metric_unit",
-        "trials",
-        "baseline_trial",
-        "recommended_trial_id",
-        "winner_trial",
-        "baseline_feasible",
-        "headline",
-        "max_throttle_ratio",
-        "pareto_trial_ids",
-        "no_feasible_trial",
-        "notes"
-      ],
-      "type": "object"
-    },
     "VerbBreakdown": {
       "properties": {
         "breakdown": {
@@ -4818,114 +3739,6 @@
         }
       ]
     },
-    "Verification": {
-      "description": "How to test a finding's advice (design v4 §5).",
-      "properties": {
-        "command": {
-          "description": "`oprobe verify RUN CODE`: replays the run with and without the change and judges it.",
-          "type": "string"
-        },
-        "description": {
-          "description": "The hypothesis in words.",
-          "type": "string"
-        },
-        "expect": {
-          "description": "What the change should do (filled by the findings that can predict it).",
-          "items": {
-            "$ref": "#/$defs/Expectation"
-          },
-          "type": "array"
-        },
-        "overrides": {
-          "$ref": "#/$defs/Overrides",
-          "description": "The change to the run's spec."
-        },
-        "replay": {
-          "description": "The changed run as a self-contained `oprobe run TARGET …` command (no stored run\nneeded).",
-          "type": "string"
-        },
-        "rerun": {
-          "description": "`oprobe run --from RUN --set …`: the changed run alone.",
-          "type": "string"
-        }
-      },
-      "required": [
-        "description",
-        "overrides",
-        "command",
-        "rerun",
-        "replay"
-      ],
-      "type": "object"
-    },
-    "VerifyOutcome": {
-      "description": "What `verify` concluded about one hypothesis.",
-      "oneOf": [
-        {
-          "const": "confirmed",
-          "description": "The change moved the metrics as expected.",
-          "type": "string"
-        },
-        {
-          "const": "refuted",
-          "description": "The change did not help (or made things worse).",
-          "type": "string"
-        },
-        {
-          "const": "inconclusive",
-          "description": "Noise or too few samples to tell.",
-          "type": "string"
-        }
-      ]
-    },
-    "WorkerInfo": {
-      "description": "One worker of a distributed run (`report.workers[]`, design v5 §8).",
-      "properties": {
-        "addr": {
-          "description": "`host:port`, or `local` for a local worker process.",
-          "type": "string"
-        },
-        "clock_offset_ms": {
-          "description": "The worker's clock minus the coordinator's (NTP-style exchange).",
-          "format": "double",
-          "type": "number"
-        },
-        "id": {
-          "type": "string"
-        },
-        "ops_count": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "ops_per_s": {
-          "format": "double",
-          "type": "number"
-        },
-        "requests_count": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "warnings": {
-          "default": [],
-          "items": {
-            "type": "string"
-          },
-          "type": "array"
-        }
-      },
-      "required": [
-        "id",
-        "addr",
-        "clock_offset_ms",
-        "ops_count",
-        "requests_count",
-        "ops_per_s",
-        "warnings"
-      ],
-      "type": "object"
-    },
     "WorkloadInfo": {
       "description": "The workload, resolved (preset defaults applied).",
       "properties": {
@@ -5010,6 +3823,13 @@
           "description": "Delete everything written under the run prefix when the run ends.",
           "type": "boolean"
         },
+        "concurrency": {
+          "default": 16,
+          "description": "Concurrent logical operations (closed-loop workers, or the open-loop in-flight cap).",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
         "dataset": {
           "anyOf": [
             {
@@ -5043,7 +3863,7 @@
         },
         "preset": {
           "$ref": "#/$defs/Preset",
-          "default": "parquet"
+          "default": "small-files"
         },
         "rate": {
           "description": "Open-loop arrival rate in ops/s. Unset = closed loop (`knobs.concurrency` workers).",
@@ -5052,17 +3872,6 @@
             "number",
             "null"
           ]
-        },
-        "replay": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ReplaySpec"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Replay a traffic log instead of the mix (open loop on the log's timing)."
         },
         "seed": {
           "default": 42,
@@ -5093,6 +3902,7 @@
       },
       "required": [
         "preset",
+        "concurrency",
         "duration",
         "warmup",
         "access",
@@ -5101,11 +3911,36 @@
         "seed"
       ],
       "type": "object"
+    },
+    "WriteOptions": {
+      "additionalProperties": false,
+      "description": "`writer_with` options (unset: OpenDAL's default).",
+      "properties": {
+        "chunk": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ByteSize"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "concurrent": {
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
     }
   },
-  "$id": "https://github.com/hxddh/oprobe/schemas/5/report.json",
+  "$id": "https://github.com/hxddh/oprobe/schemas/6/report.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "description": "Report v5 (oprobe.report/5): the result of one run",
+  "description": "Report v6 (oprobe.report/6): the profile of one run, as `run -o json` and `show -o json` carry it",
   "properties": {
     "apis": {
       "items": {
@@ -5150,28 +3985,8 @@
     "cleanup": {
       "$ref": "#/$defs/CleanupSummary"
     },
-    "client": {
-      "$ref": "#/$defs/ClientInfo",
-      "default": {
-        "kind": "opendal",
-        "phases_available": [
-          "queue",
-          "connect",
-          "send",
-          "ttfb",
-          "body",
-          "stall",
-          "backoff"
-        ],
-        "version": "0.59"
-      },
-      "description": "What generated the load (design v5 §7)."
-    },
     "connections": {
       "$ref": "#/$defs/ConnStats"
-    },
-    "cost": {
-      "$ref": "#/$defs/CostReport"
     },
     "dimensions": {
       "$ref": "#/$defs/Dimensions",
@@ -5186,6 +4001,14 @@
       },
       "description": "Where the traffic and the trouble are: prefixes, hot keys, sizes, cold/warm, tenants."
     },
+    "effective_write": {
+      "$ref": "#/$defs/EffectiveKnobs",
+      "default": {
+        "requested_chunk_bytes": 0,
+        "write_chunk_bytes": 0
+      },
+      "description": "The multipart part size OpenDAL wrote with (the requested `write.chunk` clamped to the\nservice's part-size limits)."
+    },
     "findings": {
       "items": {
         "$ref": "#/$defs/Finding"
@@ -5197,9 +4020,6 @@
     },
     "integrity": {
       "$ref": "#/$defs/IntegrityStats"
-    },
-    "knobs": {
-      "$ref": "#/$defs/KnobsInfo"
     },
     "network": {
       "$ref": "#/$defs/Network"
@@ -5275,7 +4095,7 @@
     },
     "spec": {
       "$ref": "#/$defs/RunSpec",
-      "description": "The replayable definition of the run (`oprobe run --from RUN`)."
+      "description": "The replayable definition of the run (what `oprobe prove` replays)."
     },
     "stages": {
       "$ref": "#/$defs/Stages"
@@ -5291,16 +4111,6 @@
         "$ref": "#/$defs/TimelinePoint"
       },
       "type": "array"
-    },
-    "tune": {
-      "anyOf": [
-        {
-          "$ref": "#/$defs/TuneReport"
-        },
-        {
-          "type": "null"
-        }
-      ]
     },
     "verbs": {
       "items": {
@@ -5318,14 +4128,6 @@
       },
       "type": "array"
     },
-    "workers": {
-      "default": [],
-      "description": "Workers of a distributed run (empty: this process; design v5 §8).",
-      "items": {
-        "$ref": "#/$defs/WorkerInfo"
-      },
-      "type": "array"
-    },
     "workload": {
       "$ref": "#/$defs/WorkloadInfo"
     }
@@ -5336,7 +4138,7 @@
     "spec",
     "target",
     "workload",
-    "knobs",
+    "effective_write",
     "sla",
     "verdict",
     "summary",
@@ -5349,17 +4151,14 @@
     "bytes",
     "cache",
     "integrity",
-    "client",
     "self",
     "schedule",
-    "workers",
     "dimensions",
     "sampling",
     "timeline",
     "heatmap",
     "findings",
     "capacity",
-    "cost",
     "slowest",
     "cleanup",
     "warnings"

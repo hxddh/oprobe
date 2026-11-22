@@ -1,8 +1,13 @@
-//! The 3.0 CLI contract: output modes, classified errors and exit codes, safety rails, the
-//! run store and configured targets. Every invocation uses its own config and data directory.
+//! The 6.0 CLI contract (design v6 §8): four commands and the bare app, JSON output validated
+//! against the checked-in schemas, classified errors and exit codes, safety rails, the run
+//! store and the operator argument. Every invocation uses its own config and data directory.
+//!
+//! Regenerate `schemas/` with `OPROBE_BLESS=1 cargo test --test cli`.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Output};
+
+use serde_json::Value;
 
 struct Env {
     dir: tempfile::TempDir,
@@ -15,14 +20,18 @@ impl Env {
         }
     }
 
+    fn path(&self, name: &str) -> PathBuf {
+        self.dir.path().join(name)
+    }
+
     fn data(&self) -> PathBuf {
-        self.dir.path().join("data")
+        self.path("data")
     }
 
     fn cmd(&self) -> Command {
         let mut c = Command::new(env!("CARGO_BIN_EXE_oprobe"));
         c.env("OPROBE_DATA_DIR", self.data())
-            .env("OPROBE_CONFIG", self.dir.path().join("config.toml"))
+            .env("OPROBE_CONFIG", self.path("config.toml"))
             .env_remove("OPROBE_OUTPUT")
             .args(["--color", "never"]);
         c
@@ -43,6 +52,7 @@ impl Env {
     }
 }
 
+/// A short, small workload.
 const SMALL: &[&str] = &[
     "--preset",
     "small-files",
@@ -52,22 +62,18 @@ const SMALL: &[&str] = &[
     "16KiB",
     "-c",
     "2",
+    "-d",
+    "300ms",
     "--warmup",
     "0s",
 ];
 
-fn small_run(extra: &[&str]) -> Vec<String> {
-    let mut v: Vec<String> = ["run", "memory://", "-d", "300ms"]
-        .iter()
-        .chain(SMALL)
-        .map(|s| s.to_string())
-        .collect();
-    v.extend(extra.iter().map(|s| s.to_string()));
+fn run_args<'a>(operators: &[&'a str], extra: &[&'a str]) -> Vec<&'a str> {
+    let mut v = vec!["run"];
+    v.extend_from_slice(operators);
+    v.extend_from_slice(SMALL);
+    v.extend_from_slice(extra);
     v
-}
-
-fn run_small(env: &Env, extra: &[&str]) -> Output {
-    env.cmd().args(small_run(extra)).output().unwrap()
 }
 
 fn stdout(o: &Output) -> String {
@@ -78,921 +84,734 @@ fn stderr(o: &Output) -> String {
     String::from_utf8_lossy(&o.stderr).into_owned()
 }
 
-/// `-o json`: exactly one JSON document on stdout, logs on stderr.
-fn json(o: &Output) -> serde_json::Value {
+fn json(o: &Output) -> Value {
     serde_json::from_slice(&o.stdout)
-        .unwrap_or_else(|e| panic!("stdout is not one JSON document ({e}): {}", stdout(o)))
+        .unwrap_or_else(|e| panic!("not one JSON document ({e}): {}\n{}", stdout(o), stderr(o)))
+}
+
+fn code(o: &Output) -> i32 {
+    o.status.code().unwrap_or(-1)
 }
 
 fn error_code(o: &Output) -> String {
-    let v = json(o);
-    assert_eq!(v["type"], "error", "{v}");
-    v["error"]["code"].as_str().unwrap().to_owned()
+    json(o)["error"]["code"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned()
+}
+
+fn root() -> PathBuf {
+    PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."))
+}
+
+fn bless() -> bool {
+    std::env::var_os("OPROBE_BLESS").is_some_and(|v| !v.is_empty() && v != "0")
+}
+
+/// Validate `v` against the registered schema `name` (`sub`: a JSON pointer into `v`).
+fn validate(name: &str, v: &Value) {
+    let schema = oprobe::cli::schema::schema(name).unwrap();
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    let errors: Vec<String> = validator.iter_errors(v).map(|e| e.to_string()).collect();
+    assert!(errors.is_empty(), "{name}: {errors:#?}\n{v:#}");
+}
+
+#[test]
+fn checked_in_schemas_match_the_code() {
+    let dir = root().join("schemas");
+    let mut stale = Vec::new();
+    let names = oprobe::cli::schema::names();
+    assert_eq!(
+        names,
+        ["report", "prove", "run-list", "operator", "error", "events"]
+    );
+    for name in &names {
+        let v = oprobe::cli::schema::schema(name).unwrap();
+        assert_eq!(
+            v["$id"],
+            format!("https://github.com/hxddh/oprobe/schemas/6/{name}.json")
+        );
+        let want = serde_json::to_string_pretty(&v).unwrap() + "\n";
+        let path = dir.join(format!("{name}.json"));
+        let have = std::fs::read_to_string(&path).unwrap_or_default();
+        if have.replace("\r\n", "\n") != want {
+            if bless() {
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(&path, want).unwrap();
+            } else {
+                stale.push(path.display().to_string());
+            }
+        }
+    }
+    // Nothing else in schemas/.
+    for e in std::fs::read_dir(&dir).unwrap() {
+        let p = e.unwrap().path();
+        let stem = p.file_stem().unwrap().to_string_lossy().into_owned();
+        if !names.contains(&stem.as_str()) {
+            if bless() {
+                std::fs::remove_file(&p).unwrap();
+            } else {
+                stale.push(p.display().to_string());
+            }
+        }
+    }
+    assert!(
+        stale.is_empty(),
+        "schemas/ is out of date: {stale:?}\nregenerate with `OPROBE_BLESS=1 cargo test --test cli`"
+    );
 }
 
 #[test]
 fn run_saves_the_run_and_prints_one_json_document() {
     let env = Env::new();
-    let o = run_small(&env, &["-o", "json", "--label", "first"]);
-    assert!(o.status.success(), "{}", stderr(&o));
+    let o = env.run(&run_args(&["memory://"], &["-o", "json"]));
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
     let v = json(&o);
-    let id = v["run_id"].as_str().unwrap().to_owned();
-    assert_eq!(v["report"]["schema"], "oprobe.report/5");
-    assert_eq!(v["report"]["run"]["id"], id.as_str());
-    assert_eq!(v["report"]["run"]["label"], "first");
-    for key in [
-        "run",
-        "target",
-        "workload",
-        "knobs",
-        "sla",
-        "verdict",
-        "summary",
-        "stages",
-        "apis",
-        "verbs",
-        "connections",
-        "network",
-        "timeline",
-        "heatmap",
-        "findings",
-        "cost",
-        "slowest",
-        "cleanup",
-    ] {
-        assert!(v["report"].get(key).is_some(), "report.{key} missing");
-    }
-    assert!(v["report"]["knobs"]["requested"]["chunk_bytes"].is_u64());
-    assert!(v["report"]["summary"]["latency"]["p99_ms"].is_number());
-    assert!(
-        !v["report"]["heatmap"]["counts"]
-            .as_array()
-            .unwrap()
-            .is_empty()
-    );
-    let path = PathBuf::from(v["path"].as_str().unwrap());
-    assert!(path.is_file());
-    assert_eq!(env.runs(), vec![path.clone()]);
-
-    // RUNREFs: id, prefix, last, label and path all resolve to it.
-    let prefix = &id[..17];
-    for r in [id.as_str(), prefix, "last", "first", path.to_str().unwrap()] {
-        let o = env.run(&["runs", "show", r, "-o", "json"]);
-        assert!(o.status.success(), "{r}: {}", stderr(&o));
-        assert_eq!(json(&o)["report"]["run"]["id"], id.as_str(), "{r}");
-    }
-    let list = json(&env.run(&["runs", "list", "-o", "json"]));
-    assert_eq!(list["runs"][0]["id"], id.as_str());
-    assert_eq!(list["total_count"], 1);
-    // A run compares cleanly with itself (RUNREFs and paths alike).
-    let o = env.run(&["compare", "last", path.to_str().unwrap(), "-o", "json"]);
-    assert!(o.status.success(), "{}", stdout(&o));
-    assert_eq!(json(&o)["passed"], true);
-    // rm + unknown run.
-    assert!(env.run(&["runs", "rm", "last"]).status.success());
-    assert!(env.runs().is_empty());
-    let o = env.run(&["runs", "show", "last", "-o", "json"]);
-    assert_eq!(o.status.code(), Some(2));
-    assert_eq!(error_code(&o), "usage.unknown_run");
-}
-
-#[test]
-fn text_output_is_brief() {
-    // Design v5 §6: off a terminal the brief wraps to 100 columns (COLUMNS overrides), and
-    // only a command printed whole may be longer.
-    let env = Env::new();
-    for (columns, width) in [(None, 100), (Some("80"), 80), (Some("60"), 60)] {
-        let mut c = env.cmd();
-        c.env_remove("COLUMNS")
-            .env_remove("OPROBE_LANG")
-            .env("LANG", "C");
-        if let Some(cols) = columns {
-            c.env("COLUMNS", cols);
-        }
-        let mut args = small_run(&[]);
-        args.push("-q".into());
-        let o = c.args(&args).output().unwrap();
-        assert!(o.status.success(), "{}", stderr(&o));
-        let text = stdout(&o);
-        assert!(text.lines().count() <= 30, "{text}");
-        for l in text.lines() {
-            let t = l.trim_start();
-            let command = t.starts_with("oprobe ")
-                || t.contains("next: oprobe")
-                || t.starts_with("full report: oprobe");
+    let run = &v["runs"][0];
+    let report = &run["report"];
+    validate("report", report);
+    assert_eq!(report["schema"], "oprobe.report/6");
+    assert_eq!(report["spec"]["operator_ref"], "memory://");
+    assert_eq!(report["spec"]["profile"]["operator"]["url"], "memory://");
+    assert_eq!(report["workload"]["preset"], "small-files");
+    assert!(v["next"].is_array() && v["warnings"].is_array());
+    assert_eq!(env.runs().len(), 1);
+    // The run file is oprobe.run/6 and opens with `show`.
+    let id = run["run_id"].as_str().unwrap();
+    let o = env.run(&["show", id, "-o", "json"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let s = json(&o);
+    validate("report", &s["report"]);
+    assert_eq!(s["report"]["run"]["id"], id);
+    assert!(s["requests_count"].as_u64().unwrap() > 0);
+    // Every finding names a 6.0 code and its next command is a real 6.0 command.
+    for f in report["findings"].as_array().unwrap() {
+        let code = f["code"].as_str().unwrap();
+        assert!(oprobe::analysis::findings::CODES.contains(&code), "{code}");
+        if let Some(n) = f["remedy"]["next"].as_str() {
             assert!(
-                command || l.chars().count() <= width,
-                "{width}: {l}\n{text}"
+                n.starts_with("oprobe prove ") || n.starts_with("oprobe show "),
+                "{n}"
             );
         }
-        assert!(
-            text.contains("full report:") && text.contains("oprobe runs show"),
-            "{text}"
-        );
     }
+    for n in v["next"].as_array().unwrap() {
+        let cli = n["cli"].as_str().unwrap();
+        let cmd = cli.split_whitespace().nth(1).unwrap();
+        assert!(["run", "prove", "show", "lab"].contains(&cmd), "{cli}");
+    }
+    // Text output is the brief (not JSON), naming the run.
+    let o = env.run(&run_args(&["memory://"], &[]));
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let t = stdout(&o);
+    assert!(serde_json::from_str::<Value>(&t).is_err());
+    assert!(t.lines().count() <= 30, "the brief is one screen: {t}");
 }
 
 #[test]
-fn markdown_and_html_outputs() {
+fn several_operators_run_one_after_another_on_the_same_workload() {
     let env = Env::new();
-    let o = run_small(&env, &["-o", "md", "--no-save"]);
-    assert!(o.status.success(), "{}", stderr(&o));
-    assert!(stdout(&o).contains("## oprobe report"), "{}", stdout(&o));
-    assert!(env.runs().is_empty(), "--no-save");
-    // A command without an HTML renderer: a usage error naming the formats it has.
-    let o = env.run(&["runs", "list", "-o", "html"]);
-    assert_eq!(o.status.code(), Some(2));
-    assert!(stderr(&o).contains("no HTML output"), "{}", stderr(&o));
-    assert!(stderr(&o).contains("-o md"), "{}", stderr(&o));
-    assert!(!stderr(&o).contains("not implemented"), "{}", stderr(&o));
+    let o = env.run(&run_args(&["memory://", "lab://clean"], &["-o", "json"]));
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let v = json(&o);
+    let runs = v["runs"].as_array().unwrap();
+    assert_eq!(runs.len(), 2);
+    assert_eq!(runs[0]["report"]["spec"]["operator_ref"], "memory://");
+    assert_eq!(runs[1]["report"]["spec"]["operator_ref"], "lab://clean");
+    assert_eq!(
+        runs[0]["report"]["spec"]["seed"],
+        runs[1]["report"]["spec"]["seed"]
+    );
+    assert_eq!(env.runs().len(), 2);
+    // One comparison: a row per operator, and how each differs from the first.
+    let cmp = &v["comparison"];
+    let rows = cmp["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[1]["operator"], "lab://clean");
+    for k in [
+        "goodput_ops_per_s",
+        "p50_ms",
+        "p99_ms",
+        "throttled_request_ratio",
+        "failed_ops_count",
+    ] {
+        assert!(rows[0][k].is_number(), "{k}: {cmp}");
+    }
+    let d = cmp["differences"][0].as_str().unwrap();
+    assert!(d.contains("service"), "{d}");
+    // The same service with a layer changed differs in layers.
+    let op = env.path("cap.toml");
+    std::fs::write(
+        &op,
+        "url = \"memory://\"\n[layers]\nconcurrent_limit = { http = 2 }\n",
+    )
+    .unwrap();
+    let o = env.run(&run_args(
+        &["memory://", op.to_str().unwrap()],
+        &["-o", "json"],
+    ));
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let d = json(&o)["comparison"]["differences"][0]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(d.contains("layers") && !d.contains("service"), "{d}");
+    // One run alone has no comparison.
+    let o = env.run(&run_args(&["memory://"], &["-o", "json"]));
+    assert!(json(&o)["comparison"].is_null());
 }
 
 #[test]
-fn runs_open_without_a_window_points_to_the_terminal_workbench() {
+fn operators_come_from_urls_files_and_the_config() {
     let env = Env::new();
-    assert!(run_small(&env, &["-q"]).status.success());
-    // Not a terminal here: no fallback to start, the hint names it.
-    let o = env
-        .cmd()
-        .env_remove("DISPLAY")
-        .env_remove("WAYLAND_DISPLAY")
-        .args(["runs", "open", "last", "-o", "json"])
-        .output()
-        .unwrap();
-    assert_eq!(o.status.code(), Some(2), "{}", stdout(&o));
+    let op = env.path("op.toml");
+    std::fs::write(
+        &op,
+        "url = \"memory://\"\n[layers]\nconcurrent_limit = { http = 4 }\ntail_cut = true\n[read]\nconcurrent = 2\n",
+    )
+    .unwrap();
+    let o = env.run(&run_args(
+        &[op.to_str().unwrap()],
+        &["--set", "layers.retry.max_times=5", "-o", "json"],
+    ));
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let spec = &json(&o)["runs"][0]["report"]["spec"]["profile"]["operator"];
+    validate("operator", spec);
+    assert_eq!(spec["layers"]["concurrent_limit"]["http"], 4);
+    assert_eq!(spec["layers"]["retry"]["max_times"], 5);
+    assert_eq!(spec["read"]["concurrent"], 2);
+    std::fs::write(
+        env.path("config.toml"),
+        "[operators.mem]\nurl = \"memory://\"\n[operators.mem.layers]\ncache = { memory = \"8MiB\" }\n",
+    )
+    .unwrap();
+    let o = env.run(&run_args(&["mem"], &["-o", "json"]));
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let r = &json(&o)["runs"][0]["report"];
+    assert_eq!(r["spec"]["operator_ref"], "mem");
+    assert_eq!(
+        r["spec"]["profile"]["operator"]["layers"]["cache"]["memory"],
+        "8MiB"
+    );
+    // An unknown name, a mistyped path, a missing file.
+    let o = env.run(&run_args(&["men"], &["-o", "json"]));
+    assert_eq!(code(&o), 2);
+    assert_eq!(error_code(&o), "usage.unknown_target");
+    assert!(json(&o)["error"]["hint"].as_str().unwrap().contains("mem"));
+    let o = env.run(&run_args(
+        &["memory://"],
+        &["--set", "layers.retry.max_tims=5", "-o", "json"],
+    ));
+    assert_eq!(code(&o), 2);
     assert!(
         json(&o)["error"]["hint"]
             .as_str()
             .unwrap()
-            .contains("oprobe top --open")
+            .contains("layers.retry.max_times")
     );
+    let o = env.run(&run_args(&["nope.toml"], &["-o", "json"]));
+    assert_eq!(code(&o), 2, "{}", stdout(&o));
 }
 
 #[test]
-fn secrets_in_the_target_url_never_reach_reports_or_run_files() {
+fn show_lists_groups_and_removes_runs() {
     let env = Env::new();
-    let url = "lab://demo?secret_access_key=hunter2&session_token=hunter2";
-    let mut args: Vec<String> = ["run", url, "-d", "300ms"]
-        .iter()
-        .chain(SMALL)
-        .map(|s| s.to_string())
-        .collect();
-    args.extend(["-o", "json"].map(String::from));
-    let o = env.cmd().args(&args).output().unwrap();
-    assert!(
-        o.status.code().is_some_and(|c| c == 0 || c == 3),
-        "{}",
-        stderr(&o)
-    );
-    let out = stdout(&o);
-    assert!(!out.contains("hunter2"), "{out}");
+    for _ in 0..2 {
+        let o = env.run(&run_args(&["memory://"], &["-q"]));
+        assert_eq!(code(&o), 0, "{}", stderr(&o));
+    }
+    let o = env.run(&["show", "--list", "-o", "json"]);
+    assert_eq!(code(&o), 0);
     let v = json(&o);
-    assert_eq!(v["report"]["spec"]["target_ref"], "lab://demo");
-    // The run file (zstd NDJSON) and its sidecar.
-    let runs = env.runs();
-    assert_eq!(runs.len(), 1);
-    let raw = zstd::decode_all(std::fs::File::open(&runs[0]).unwrap()).unwrap();
-    assert!(!String::from_utf8_lossy(&raw).contains("hunter2"));
-    let sidecar = std::fs::read_to_string(runs[0].with_extension("json")).unwrap();
-    assert!(!sidecar.contains("hunter2"), "{sidecar}");
-    // The replay of the stored run still works (credentials are resolved again).
-    let o = env.run(&[
-        "run",
-        "--from",
-        "last",
-        "-d",
-        "300ms",
-        "--no-save",
-        "-o",
-        "json",
-    ]);
-    assert!(
-        o.status.code().is_some_and(|c| c == 0 || c == 3),
-        "{}",
-        stderr(&o)
-    );
-    assert!(!stdout(&o).contains("hunter2"));
-    // The dry-run plan does not echo them either.
-    let mut args = args.clone();
-    args.push("--dry-run".into());
-    let o = env.cmd().args(&args).output().unwrap();
-    assert!(o.status.success(), "{}", stderr(&o));
-    assert!(!stdout(&o).contains("hunter2"), "{}", stdout(&o));
-}
-
-#[test]
-fn an_empty_existing_prefix_is_not_found() {
-    let env = Env::new();
-    let dir = env.dir.path().join("bucket");
-    std::fs::create_dir_all(dir.join("empty")).unwrap();
-    let url = format!("fs://{}", dir.display());
-    let o = env.run(&[
-        "run",
-        &url,
-        "--existing",
-        "empty/",
-        "-d",
-        "200ms",
-        "--no-save",
-        "-o",
-        "json",
-    ]);
-    assert_eq!(o.status.code(), Some(1), "{}", stdout(&o));
-    assert_eq!(error_code(&o), "storage.not_found");
-    assert!(json(&o)["error"]["hint"].is_string());
-}
-
-#[test]
-fn a_closed_stdout_ends_quietly() {
-    use std::io::Read;
-    let env = Env::new();
-    // Larger than a pipe buffer: the writer hits the closed pipe.
-    let mut child = env
-        .cmd()
-        .args(["schema", "report"])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut first = [0u8; 16];
-    child.stdout.take().unwrap().read_exact(&mut first).unwrap();
-    let o = child.wait_with_output().unwrap();
-    let code = o.status.code();
-    assert!(matches!(code, Some(0) | Some(141)), "{code:?}");
-    assert!(!stderr(&o).contains("panicked"), "{}", stderr(&o));
-    assert!(!stderr(&o).contains("error"), "{}", stderr(&o));
-}
-
-#[test]
-fn ndjson_streams_events_then_the_result() {
-    let env = Env::new();
-    let o = run_small(&env, &["-o", "ndjson"]);
-    assert!(o.status.success(), "{}", stderr(&o));
-    let lines: Vec<serde_json::Value> = stdout(&o)
-        .lines()
-        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("{e}: {l}")))
-        .collect();
-    assert_eq!(lines[0]["type"], "version");
-    assert_eq!(lines[0]["schema"], "oprobe.events/1");
-    assert!(
-        lines
-            .iter()
-            .all(|l| l["ts"].is_string() && l["type"].is_string())
-    );
-    assert!(lines.iter().any(|l| l["type"] == "phase"));
-    assert!(lines.iter().any(|l| l["type"] == "progress"));
-    let last = lines.last().unwrap();
-    assert_eq!(last["type"], "result");
-    assert_eq!(last["report"]["schema"], "oprobe.report/5");
-    assert!(Path::new(last["path"].as_str().unwrap()).is_file());
+    validate("run-list", &v);
+    assert_eq!(v["total_count"], 2);
+    let first = v["runs"][0]["id"].as_str().unwrap().to_owned();
+    for by in ["stage", "api", "conn"] {
+        let o = env.run(&["show", "last", "--by", by, "-o", "json"]);
+        assert_eq!(code(&o), 0, "{}", stderr(&o));
+        let b = &json(&o)["by"];
+        assert_eq!(b["by"], by);
+        assert!(!b["groups"].as_array().unwrap().is_empty(), "{b}");
+    }
+    let detail = stdout(&env.run(&["show", "last", "--detail"]));
+    assert!(detail.len() > stdout(&env.run(&["show", "last"])).len());
+    let o = env.run(&["show", "--rm", &first, "-o", "json"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(json(&o)["removed"][0], first.as_str());
+    assert_eq!(env.runs().len(), 1);
+    let o = env.run(&["show", "no-such-run", "-o", "json"]);
+    assert_eq!(code(&o), 2);
+    assert_eq!(error_code(&o), "usage.unknown_run");
 }
 
 #[test]
 fn errors_are_classified_with_exit_codes() {
     let env = Env::new();
-    // usage
-    let o = env.run(&["run", "no-such-target", "-o", "json"]);
-    assert_eq!(o.status.code(), Some(2));
-    assert_eq!(error_code(&o), "usage.unknown_target");
-    // `target test` is the doctor of a configured target.
-    let o = env.run(&["target", "test", "x", "-o", "json"]);
-    assert_eq!(o.status.code(), Some(2));
-    assert_eq!(error_code(&o), "usage.unknown_target");
-    // ndjson: version line, then the error event.
-    let o = env.run(&["runs", "show", "nope", "-o", "ndjson"]);
-    assert_eq!(o.status.code(), Some(2));
-    let lines: Vec<serde_json::Value> = stdout(&o)
-        .lines()
-        .map(|l| serde_json::from_str(l).unwrap())
-        .collect();
-    assert_eq!(lines[0]["type"], "version");
-    assert_eq!(lines[1]["type"], "error");
-    assert_eq!(lines[1]["error"]["code"], "usage.unknown_run");
-    // text: error + hint on stderr, nothing on stdout.
-    let o = env.run(&["runs", "show", "nope"]);
-    assert!(stdout(&o).is_empty());
-    assert!(stderr(&o).contains("error:") && stderr(&o).contains("hint:"));
-}
-
-#[test]
-fn argument_errors_follow_the_output_mode() {
-    let env = Env::new();
-    // json: the error document on stdout, exit 2.
-    let o = env.run(&["run", "x", "--bogus", "-o", "json"]);
-    assert_eq!(o.status.code(), Some(2));
+    let o = env.run(&["run", "ftp://x", "-o", "json"]);
+    assert_eq!(code(&o), 2);
+    validate("error", &json(&o));
+    // clap errors follow the output mode.
+    let o = env.run(&["run", "-o", "json"]);
+    assert_eq!(code(&o), 2);
     assert_eq!(error_code(&o), "usage.invalid_argument");
+    let o = env.run(&["run"]);
+    assert_eq!(code(&o), 2);
+    assert!(o.stdout.is_empty() && stderr(&o).contains("OPERATOR"));
+    let o = env.run(&["run", "memory://", "--preset", "nope", "-o", "json"]);
+    assert_eq!(code(&o), 2);
     assert!(
-        json(&o)["error"]["message"]
+        json(&o)["error"]["hint"]
             .as_str()
             .unwrap()
-            .contains("--bogus")
+            .contains("small-files")
     );
-    // ndjson (also through OPROBE_OUTPUT): version line, then the error event.
-    let o = env
-        .cmd()
-        .env("OPROBE_OUTPUT", "ndjson")
-        .args(["run", "--bogus"])
-        .output()
-        .unwrap();
-    assert_eq!(o.status.code(), Some(2));
-    let lines: Vec<serde_json::Value> = stdout(&o)
-        .lines()
-        .map(|l| serde_json::from_str(l).unwrap())
-        .collect();
-    assert_eq!(lines[0]["type"], "version");
-    assert_eq!(lines[1]["error"]["code"], "usage.invalid_argument");
-    // text: clap's message on stderr; help and version still exit 0.
-    let o = env.run(&["run", "x", "--bogus"]);
-    assert_eq!(o.status.code(), Some(2));
-    assert!(stdout(&o).is_empty() && stderr(&o).contains("--bogus"));
-    for args in [&["--help", "-o", "json"][..], &["--version"][..]] {
-        let o = env.run(args);
-        assert_eq!(o.status.code(), Some(0), "{args:?}");
-        assert!(!stdout(&o).is_empty());
-    }
+    // Text errors: message, hint and code on stderr.
+    let o = env.run(&["show", "nothing"]);
+    assert_eq!(code(&o), 2);
+    let e = stderr(&o);
+    assert!(
+        e.contains("error:") && e.contains("(usage.unknown_run)"),
+        "{e}"
+    );
 }
 
 #[test]
-fn read_only_refuses_runs_that_write() {
+fn safety_rails_refuse_or_stop_runs() {
     let env = Env::new();
-    let o = env
-        .cmd()
-        .args(small_run(&["--read-only", "-o", "json"]))
-        .output()
-        .unwrap();
-    assert_eq!(o.status.code(), Some(5), "{}", stderr(&o));
+    // --read-only: a generated dataset would be written (exit 5).
+    let o = env.run(&run_args(&["memory://"], &["--read-only", "-o", "json"]));
+    assert_eq!(code(&o), 5, "{}", stdout(&o));
     assert_eq!(error_code(&o), "safety.read_only");
+    // A request budget stops the run (exit 4) and keeps the partial run.
+    let o = env.run(&[
+        "run",
+        "memory://",
+        "-d",
+        "5s",
+        "--warmup",
+        "0s",
+        "--max-requests",
+        "50",
+        "-o",
+        "json",
+    ]);
+    assert_eq!(code(&o), 4, "{}", stdout(&o));
+    assert_eq!(error_code(&o), "safety.budget_exceeded");
+    // --dry-run: the plan of every operator; nothing is written.
+    let env = Env::new();
+    let o = env.run(&run_args(
+        &["memory://", "lab://clean"],
+        &["--dry-run", "-o", "json"],
+    ));
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let v = json(&o);
+    assert_eq!(v["plans"].as_array().unwrap().len(), 2);
+    assert!(v["plans"][0]["estimated_requests_count"].as_u64().unwrap() > 0);
     assert!(env.runs().is_empty());
 }
 
 #[test]
-fn children_of_a_read_only_mcp_server_refuse_to_write() {
+fn demo_is_run_lab_demo() {
     let env = Env::new();
-    let bucket = env.dir.path().join("bucket");
-    std::fs::create_dir_all(bucket.join("data")).unwrap();
-    std::fs::write(bucket.join("data").join("obj"), vec![1u8; 4096]).unwrap();
-    let url = format!("fs://{}", bucket.display());
-    let mut args = small_run(&["--no-save", "-o", "json"]);
-    args[1] = url.clone();
-    // Any workload that would write to a real target is refused, before anything is sent.
-    for cmd in ["run", "fix"] {
-        let mut a = args.clone();
-        a[0] = cmd.into();
-        let o = env
-            .cmd()
-            .env("OPROBE_MCP_READ_ONLY", "1")
-            .args(&a)
-            .output()
-            .unwrap();
-        assert_eq!(o.status.code(), Some(5), "{cmd}: {}", stderr(&o));
-        assert_eq!(error_code(&o), "safety.read_only");
-    }
-    let names: Vec<_> = std::fs::read_dir(&bucket).unwrap().collect();
-    assert_eq!(names.len(), 1, "nothing was written");
-    // Reading existing objects and in-process targets stay allowed.
-    let o = env
-        .cmd()
-        .env("OPROBE_MCP_READ_ONLY", "1")
-        .args([
-            "run",
-            &url,
-            "--existing",
-            "data/",
-            "-d",
-            "200ms",
-            "--warmup",
-            "0s",
-            "--no-save",
+    let o = env.run(&["demo", "-d", "1s", "--warmup", "0s", "-o", "json"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let r = &json(&o)["runs"][0]["report"];
+    assert_eq!(r["spec"]["operator_ref"], "lab://demo");
+    assert!(
+        r["resilience"]["throttled_responses_count"]
+            .as_u64()
+            .unwrap()
+            > 0,
+        "{r}"
+    );
+}
+
+#[test]
+fn prove_judges_a_change_and_hides_its_trials() {
+    let env = Env::new();
+    let o = env.run(&[
+        "run",
+        "lab://demo",
+        "-d",
+        "1s",
+        "--warmup",
+        "0s",
+        "--preset",
+        "small-files",
+        "-q",
+        "-o",
+        "json",
+    ]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let run_id = json(&o)["runs"][0]["run_id"].as_str().unwrap().to_owned();
+    let o = env.run(&[
+        "prove",
+        "last",
+        "--with",
+        "read.gap=1MiB",
+        "--trial",
+        "300ms",
+        "--pairs",
+        "3",
+        "-o",
+        "json",
+        "-q",
+    ]);
+    assert!(matches!(code(&o), 0 | 3), "{}\n{}", stdout(&o), stderr(&o));
+    let v = json(&o);
+    validate("prove", &v);
+    assert!(["improved", "worse", "inconclusive"].contains(&v["verdict"].as_str().unwrap()));
+    assert_eq!(v["run_id"], run_id.as_str());
+    assert_eq!(v["change"][0], "read.gap=1MiB");
+    assert!(v["diff"]["toml"].as_str().unwrap().contains("gap"), "{v}");
+    assert_eq!(v["pairs_count"], 3);
+    let d = &v["objective_delta"];
+    assert!(d["low"].as_f64().unwrap() > -1.0, "never below -100 %: {d}");
+    assert!(d["low"].as_f64().unwrap() <= d["high"].as_f64().unwrap());
+    let trials = v["trials"].as_array().unwrap();
+    assert_eq!(trials.len(), 6);
+    // The trials are children of the prove: hidden from the list, and `last` is still the
+    // run the user made (U4).
+    let o = env.run(&["show", "--list", "-o", "json"]);
+    let list = json(&o);
+    validate("run-list", &list);
+    assert_eq!(list["total_count"], 1);
+    assert_eq!(list["hidden_trials_count"], 6);
+    assert_eq!(list["proves"][0]["prove_id"], v["prove_id"]);
+    let all = json(&env.run(&["show", "--list", "--all", "-o", "json"]));
+    assert_eq!(all["total_count"], 7);
+    let trial = json(&env.run(&["show", trials[0]["run_id"].as_str().unwrap(), "-o", "json"]));
+    assert_eq!(trial["report"]["run"]["parent_id"], v["prove_id"]);
+    let last = json(&env.run(&["show", "last", "-o", "json"]));
+    assert_eq!(last["report"]["run"]["id"], run_id.as_str());
+    // Removing the prove removes its trials.
+    let o = env.run(&[
+        "show",
+        "--rm",
+        v["prove_id"].as_str().unwrap(),
+        "-o",
+        "json",
+    ]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(env.runs().len(), 1);
+    // A finding the run does not have; a dry run plans and sends nothing.
+    let o = env.run(&["prove", "last", "hung_requests", "-o", "json"]);
+    assert_eq!(code(&o), 2, "{}", stdout(&o));
+    assert_eq!(error_code(&o), "usage.invalid_argument");
+    let o = env.run(&[
+        "prove",
+        "last",
+        "--with",
+        "read.gap=1MiB",
+        "--dry-run",
+        "-o",
+        "json",
+    ]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(
+        json(&o)["plan"]["estimated_requests_count"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert_eq!(env.runs().len(), 1);
+}
+
+/// A budget breach in the middle of a prove (`--max-requests`) stops the trials, keeps exit 4
+/// and prints and saves the partial result, so the trials stay attached to the prove.
+#[test]
+fn a_budget_breach_keeps_the_partial_prove() {
+    let env = Env::new();
+    let o = env.run(&run_args(&["lab://clean"], &["-q", "-o", "json"]));
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let prove = |max_requests: &str| {
+        env.run(&[
+            "prove",
+            "last",
+            "--with",
+            "read.gap=1MiB",
+            "--trial",
+            "300ms",
+            "--pairs",
+            "3",
+            "--max-requests",
+            max_requests,
             "-o",
             "json",
         ])
-        .output()
-        .unwrap();
-    assert!(o.status.success(), "{}", stderr(&o));
-    let o = env
-        .cmd()
-        .env("OPROBE_MCP_READ_ONLY", "1")
-        .args(small_run(&["--no-save", "-o", "json"]))
-        .output()
-        .unwrap();
-    assert!(o.status.success(), "{}", stderr(&o));
-}
-
-#[test]
-fn budgets_stop_the_run_with_exit_4() {
-    let env = Env::new();
-    let mut args: Vec<String> = ["run", "memory://", "-d", "30s"]
-        .iter()
-        .chain(SMALL)
-        .map(|s| s.to_string())
-        .collect();
-    args.extend(["--max-requests", "40", "-o", "json"].map(String::from));
-    let t = std::time::Instant::now();
-    let o = env.cmd().args(&args).output().unwrap();
-    assert_eq!(o.status.code(), Some(4), "{}", stderr(&o));
-    assert_eq!(error_code(&o), "safety.budget_exceeded");
-    assert!(t.elapsed().as_secs() < 20, "the budget stops the 30 s run");
-    // The partial run is saved and marked.
-    let runs = env.runs();
-    assert_eq!(runs.len(), 1);
-    let show = json(&env.run(&["runs", "show", "last", "-o", "json"]));
-    assert_eq!(show["report"]["run"]["interrupted"], true);
-    assert_eq!(show["report"]["verdict"]["exit_code"], 4);
-
-    let mut args: Vec<String> = ["run", "memory://", "-d", "30s"]
-        .iter()
-        .chain(SMALL)
-        .map(|s| s.to_string())
-        .collect();
-    args.extend(["--max-duration", "1s", "-o", "json"].map(String::from));
-    let t = std::time::Instant::now();
-    let o = env.cmd().args(&args).output().unwrap();
-    assert_eq!(o.status.code(), Some(4), "{}", stderr(&o));
-    assert!(error_code(&o).contains("budget"));
-    assert!(t.elapsed().as_secs() < 20);
-}
-
-#[test]
-fn budgets_cover_the_whole_command() {
-    let env = Env::new();
-    // Each run alone fits the 1 s budget; three of them do not.
-    let mut args: Vec<String> = ["run", "memory://", "-d", "600ms", "--repeat", "3"]
-        .iter()
-        .chain(SMALL)
-        .map(|s| s.to_string())
-        .collect();
-    args.extend(["--max-duration", "1s", "-o", "json"].map(String::from));
-    let o = env.cmd().args(&args).output().unwrap();
-    assert_eq!(o.status.code(), Some(4), "{}", stderr(&o));
-    assert_eq!(error_code(&o), "safety.budget_exceeded");
-    assert!(env.runs().len() < 3, "the budget stopped the group");
-}
-
-#[test]
-fn every_measuring_command_honours_dry_run() {
-    let env = Env::new();
-    // watch: the plan of its windows, nothing measured.
-    let o = env.run(&[
-        "watch",
-        "memory://",
-        "--count",
-        "3",
-        "--dry-run",
-        "-o",
-        "json",
-    ]);
-    assert!(o.status.success(), "{}", stderr(&o));
-    let v = json(&o);
-    assert!(v["plan"]["estimated_requests_count"].is_u64(), "{v:#}");
-    // matrix: a typed document, one plan per cell.
-    let o = env.run(&[
-        "matrix",
-        "memory://",
-        "--vary",
-        "concurrency=2,4",
-        "--dry-run",
-        "-o",
-        "json",
-    ]);
-    assert!(o.status.success(), "{}", stderr(&o));
-    let v = json(&o);
-    assert_eq!(v["cells"].as_array().unwrap().len(), 2, "{v:#}");
-    assert!(v["cells"][1]["plan"]["concurrency_count"] == 4, "{v:#}");
-    assert!(v["estimated_requests_count"].is_u64());
-    // compat: the plan under the standard run prefix.
-    let o = env.run(&["compat", "memory://", "--dry-run", "-o", "json"]);
-    assert!(o.status.success(), "{}", stderr(&o));
-    assert!(
-        json(&o)["run_prefix"]
-            .as_str()
-            .unwrap()
-            .starts_with("oprobe-run-")
-    );
-    // tune --budget: the trials are capped to fit, or refused when two do not fit.
-    let o = env.run(&[
-        "tune",
-        "memory://",
-        "--budget",
-        "1h",
-        "--max-trials",
-        "5",
-        "--dry-run",
-        "-o",
-        "json",
-    ]);
-    assert!(o.status.success(), "{}", stderr(&o));
-    let o = env.run(&[
-        "tune",
-        "memory://",
-        "--budget",
-        "5s",
-        "--dry-run",
-        "-o",
-        "json",
-    ]);
-    assert_eq!(o.status.code(), Some(2));
-    assert_eq!(error_code(&o), "usage.invalid_argument");
-    assert!(env.runs().is_empty(), "dry runs save nothing");
-}
-
-#[test]
-fn dry_run_prints_the_plan_and_touches_nothing() {
-    let env = Env::new();
-    let root = env.dir.path().join("bucket");
-    std::fs::create_dir_all(&root).unwrap();
-    let url = format!("fs://{}/", root.display());
-    let o = env.run(&[
-        "run",
-        &url,
-        "--dry-run",
-        "--max-requests",
-        "1000",
-        "--idempotency-key",
-        "ci-42",
-        "-o",
-        "json",
-    ]);
-    assert!(o.status.success(), "{}", stderr(&o));
-    let p = &json(&o)["plan"];
-    for k in [
-        "estimated_requests_count",
-        "estimated_bytes",
-        "objects_written_count",
-        "objects_deleted_count",
-        "eta_s",
-    ] {
-        assert!(p[k].is_number(), "{k}: {p}");
+    };
+    // How many requests a trial makes, then a budget that breaks in the third trial.
+    let o = prove("100000000");
+    assert!(matches!(code(&o), 0 | 3), "{}", stderr(&o));
+    let full = json(&o);
+    let per_trial = full["trials"][0]["requests_count"].as_u64().unwrap();
+    let o = env.run(&["show", "--rm", full["prove_id"].as_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    for max in [per_trial * 5 / 2, 10] {
+        let o = prove(&max.to_string());
+        assert_eq!(code(&o), 4, "{}\n{}", stdout(&o), stderr(&o));
+        let v = json(&o);
+        validate("prove", &v);
+        assert_eq!(v["budget_exceeded"], true, "{v}");
+        assert!(v["pairs_count"].as_u64().unwrap() <= 1, "{v}");
+        assert_eq!(v["verdict"], "inconclusive", "{v}");
+        assert!(
+            v["notes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|n| n.as_str().unwrap().contains("a budget stopped the prove")),
+            "{v}"
+        );
+        let id = v["prove_id"].as_str().unwrap();
+        assert!(
+            env.data()
+                .join("runs")
+                .join(format!("{id}.prove.json"))
+                .is_file(),
+            "the partial prove is saved"
+        );
+        assert!(env.runs().len() > 1, "the trial runs are saved");
+        // No trial is orphaned: removing the prove removes them all.
+        let o = env.run(&["show", "--rm", id]);
+        assert_eq!(code(&o), 0, "{}", stderr(&o));
+        assert_eq!(env.runs().len(), 1, "max {max}");
     }
-    assert!(p["objects_written_count"].as_u64().unwrap() > 0);
-    assert!(
-        p["run_prefix"]
-            .as_str()
-            .unwrap()
-            .starts_with("oprobe-run-key-ci-42-")
-    );
-    assert_eq!(p["budgets"]["max_requests_count"], 1000);
-    assert_eq!(
-        std::fs::read_dir(&root).unwrap().count(),
-        0,
-        "nothing written"
-    );
-    assert!(env.runs().is_empty());
 }
 
+/// A budget that allows fewer than three A/B pairs cannot decide: the verdict is
+/// `inconclusive` (exit 0), with a note, however large the measured difference.
 #[test]
-fn preflight_fails_before_any_write() {
+fn prove_needs_three_pairs_to_decide() {
     let env = Env::new();
-    let dir = env.dir.path().join("pf");
-    std::fs::create_dir_all(&dir).unwrap();
-    // The target root is a file: listing or writing under it fails before the dataset upload.
-    std::fs::write(dir.join("root"), b"x").unwrap();
-    let url = format!("fs://{}/", dir.join("root").display());
-    let o = env
-        .cmd()
-        .args(["run", &url, "-d", "1s", "-o", "json"])
-        .output()
-        .unwrap();
-    assert_eq!(o.status.code(), Some(1), "{}", stdout(&o));
+    let o = env.run(&run_args(&["lab://clean"], &["-q", "-o", "json"]));
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    // Whatever one pair measures, it cannot decide.
+    let o = env.run(&[
+        "prove",
+        "last",
+        "--with",
+        "layers.retry.min_delay=10ms",
+        "--trial",
+        "300ms",
+        "--budget",
+        "1s",
+        "-o",
+        "json",
+    ]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
     let v = json(&o);
+    validate("prove", &v);
+    assert_eq!(v["pairs_count"], 1, "{v}");
+    assert_eq!(v["verdict"], "inconclusive", "{v}");
     assert!(
-        v["error"]["message"]
-            .as_str()
+        v["notes"]
+            .as_array()
             .unwrap()
-            .contains("preflight"),
+            .iter()
+            .any(|n| n.as_str().unwrap().contains("allowed only 1 A/B pair")),
         "{v}"
     );
-    let left: Vec<_> = std::fs::read_dir(&dir).unwrap().collect();
-    assert_eq!(left.len(), 1, "only the file itself remains");
-    assert_eq!(std::fs::read(dir.join("root")).unwrap(), b"x");
-    assert!(env.runs().is_empty());
+    // `--pairs` below three is refused.
+    let o = env.run(&["prove", "last", "--with", "read.gap=1MiB", "--pairs", "2"]);
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
 }
 
+/// `--with` (and `--set`) pairs apply as one change, in any order: a layer switched on with its
+/// field, as the app sends its edits.
 #[test]
-fn configured_targets_and_config_commands() {
+fn with_and_set_pairs_apply_in_any_order() {
     let env = Env::new();
-    let o = env.run(&["target", "add", "local", "memory://", "-o", "json"]);
-    assert!(o.status.success(), "{}", stderr(&o));
-    assert_eq!(json(&o)["name"], "local");
-    let list = json(&env.run(&["target", "list", "-o", "json"]));
-    assert_eq!(list["targets"][0]["url"], "memory://");
-    let mut args = vec!["run", "local", "-d", "200ms", "-o", "json"];
-    args.extend(SMALL);
-    let o = env.run(&args);
-    assert!(o.status.success(), "{}", stderr(&o));
-    assert_eq!(json(&o)["report"]["target"]["name"], "local");
-    let paths = json(&env.run(&["config", "path", "-o", "json"]));
-    assert!(paths["config_exists"].as_bool().unwrap());
-    let show = json(&env.run(&["config", "show", "-o", "json"]));
-    let output = show["settings"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|s| s["key"] == "output")
-        .unwrap()
-        .clone();
-    assert_eq!(output["source"], "flag");
-    assert!(env.run(&["target", "rm", "local"]).status.success());
-    let o = env.run(&["target", "show", "local", "-o", "json"]);
-    assert_eq!(o.status.code(), Some(2));
-    assert_eq!(error_code(&o), "usage.unknown_target");
-}
-
-#[test]
-fn every_contract_command_is_in_help() {
-    let env = Env::new();
-    let help = stdout(&env.run(&["--help"]));
-    for c in [
-        "run",
-        "demo",
-        "tune",
-        "compare",
-        "runs",
-        "analyze",
-        "explain",
-        "target",
-        "doctor",
-        "probe",
-        "watch",
-        "matrix",
-        "compat",
-        "baseline",
-        "lab",
-        "mcp",
-        "schema",
-        "capabilities",
-        "config",
-        "cleanup",
-        "self-update",
-        "top",
-        "gui",
-        "completions",
-        "man",
+    let o = env.run(&run_args(&["memory://"], &["-q", "-o", "json"]));
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    for with in [
+        [
+            "layers.concurrent_limit=on",
+            "layers.concurrent_limit.http=24",
+        ],
+        [
+            "layers.concurrent_limit.http=24",
+            "layers.concurrent_limit=on",
+        ],
     ] {
-        assert!(
-            help.lines()
-                .any(|l| l.trim_start().starts_with(&format!("{c} ")) || l.trim() == c),
-            "`{c}` missing from --help:\n{help}"
-        );
+        let o = env.run(&[
+            "prove",
+            "last",
+            "--with",
+            with[0],
+            "--with",
+            with[1],
+            "--dry-run",
+            "-o",
+            "json",
+        ]);
+        assert_eq!(code(&o), 0, "{with:?}: {}\n{}", stdout(&o), stderr(&o));
+        let o = env.run(&run_args(
+            &["memory://"],
+            &[
+                "--set",
+                with[0],
+                "--set",
+                with[1],
+                "--dry-run",
+                "-o",
+                "json",
+            ],
+        ));
+        assert_eq!(code(&o), 0, "{with:?}: {}\n{}", stdout(&o), stderr(&o));
+    }
+    // A limit layer without a limit is still refused.
+    let o = env.run(&[
+        "prove",
+        "last",
+        "--with",
+        "layers.concurrent_limit=on",
+        "--dry-run",
+        "-o",
+        "json",
+    ]);
+    assert_eq!(code(&o), 2, "{}", stdout(&o));
+    assert!(stdout(&o).contains("needs `http`"), "{}", stdout(&o));
+}
+
+/// Every file under `dir`, recursively, as text (`.oprobe` run files decompressed too).
+fn files_text(dir: &std::path::Path) -> Vec<(PathBuf, String)> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in rd {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                stack.push(p);
+                continue;
+            }
+            let raw = std::fs::read(&p).unwrap();
+            let mut text = String::from_utf8_lossy(&raw).into_owned();
+            // Run files are zstd segments: read every frame that decodes.
+            if let Ok(mut dec) = zstd::stream::read::Decoder::new(&raw[..]) {
+                let mut buf = Vec::new();
+                let _ = std::io::Read::read_to_end(&mut dec, &mut buf);
+                text.push_str(&String::from_utf8_lossy(&buf));
+            }
+            out.push((p, text));
+        }
+    }
+    out
+}
+
+/// A secret given with `--with` or in `op.toml` never shows in what prove prints (the plan,
+/// the diff, the next command) or stores (`<id>.prove.json`, the trial runs).
+#[test]
+fn prove_never_prints_or_stores_secrets() {
+    let env = Env::new();
+    let op = env.path("op.toml");
+    std::fs::write(
+        &op,
+        "url = \"lab://clean\"\n[options]\nsecret_access_key = \"SEKRIT2\"\n",
+    )
+    .unwrap();
+    let op = op.to_str().unwrap();
+    let mut outputs = Vec::new();
+    let o = env.run(&run_args(&[op], &["-q", "-o", "json"]));
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    outputs.push(o);
+    let with = [
+        "--with",
+        "options.secret_access_key=SEKRIT1",
+        "--with",
+        "read.gap=1MiB",
+    ];
+    for extra in [
+        &["--dry-run"][..],
+        &["--dry-run", "-o", "json"],
+        &["--trial", "300ms", "--pairs", "3"],
+        &["--trial", "300ms", "--pairs", "3", "-o", "json"],
+    ] {
+        let mut args = vec!["prove", "last"];
+        args.extend_from_slice(&with);
+        args.extend_from_slice(extra);
+        let o = env.run(&args);
+        assert!(matches!(code(&o), 0 | 3), "{args:?}: {}", stderr(&o));
+        outputs.push(o);
+    }
+    // The change is still shown, redacted, and the next command reads it from the
+    // environment.
+    let v = json(outputs.last().unwrap());
+    assert!(
+        v["change"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c == "options.secret_access_key=<redacted>"),
+        "{v}"
+    );
+    let next = v["next"].to_string();
+    assert!(next.contains("${SECRET_ACCESS_KEY}"), "{next}");
+    for o in &outputs {
+        for secret in ["SEKRIT1", "SEKRIT2"] {
+            assert!(
+                !stdout(o).contains(secret),
+                "{secret} on stdout: {}",
+                stdout(o)
+            );
+            assert!(
+                !stderr(o).contains(secret),
+                "{secret} on stderr: {}",
+                stderr(o)
+            );
+        }
+    }
+    let files = files_text(&env.data());
+    assert!(
+        files
+            .iter()
+            .any(|(p, _)| p.to_string_lossy().ends_with(".prove.json"))
+    );
+    for (p, text) in files {
+        for secret in ["SEKRIT1", "SEKRIT2"] {
+            assert!(!text.contains(secret), "{secret} in {}", p.display());
+        }
     }
 }
 
 #[test]
-fn html_report_of_run_and_runs_show() {
+fn bare_oprobe_is_the_app() {
     let env = Env::new();
-    let o = run_small(&env, &["-o", "html"]);
-    assert!(o.status.success(), "{}", stderr(&o));
-    let html = stdout(&o);
-    assert!(html.starts_with("<!doctype html>"), "{html}");
-    assert!(html.contains("id=\"oprobe-rows\""));
-    assert!(!html.contains("src=\"http"));
-    let o = env.run(&["runs", "show", "last", "-o", "html"]);
-    assert!(o.status.success(), "{}", stderr(&o));
-    assert!(stdout(&o).contains("id=\"requests\""));
-    let o = env.run(&["runs", "show", "-o", "md"]);
-    assert!(stdout(&o).contains("## oprobe report"), "{}", stdout(&o));
-    let o = env.run(&["compare", "last", "last", "-o", "html"]);
-    assert!(stdout(&o).contains("Regression gate"), "{}", stderr(&o));
+    let o = env.run(&[]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(stdout(&o).contains("app"), "{}", stdout(&o));
+    let o = env.run(&["-o", "json"]);
+    assert_eq!(code(&o), 2);
+    validate("error", &json(&o));
 }
 
 #[test]
-fn runs_show_fits_80_columns_and_detail_adds_sections() {
+fn help_names_the_four_commands() {
     let env = Env::new();
-    assert!(run_small(&env, &[]).status.success());
-    let text = stdout(&env.run(&["runs", "show"]));
-    assert!(text.contains("KEY NUMBERS"), "{text}");
-    assert!(text.lines().all(|l| l.chars().count() <= 80), "{text}");
-    let detail = stdout(&env.run(&["runs", "show", "last", "--detail"]));
-    assert!(detail.contains("CONFIGURATION"), "{detail}");
-    let list = stdout(&env.run(&["runs", "list"]));
-    assert!(
-        list.contains("verdict") && list.contains("just now"),
-        "{list}"
-    );
-    let o = env.run(&[
-        "runs",
-        "gc",
-        "--keep",
-        "0",
-        "--older-than",
-        "30d",
-        "-o",
-        "json",
-    ]);
-    assert!(o.status.success(), "{}", stderr(&o));
-    assert!(json(&o)["removed"].as_array().unwrap().is_empty());
-    let o = env.run(&["runs", "gc", "--older-than", "soon"]);
-    assert_eq!(o.status.code(), Some(2));
+    let h = stdout(&env.run(&["--help"]));
+    for c in ["run", "prove", "show", "lab", "demo"] {
+        assert!(h.contains(&format!("  {c}")), "{c}: {h}");
+    }
+    for gone in ["mcp", "tune", "compare", "doctor", "target", "watch"] {
+        assert!(!h.contains(&format!("\n  {gone} ")), "{gone}: {h}");
+    }
 }
 
 #[test]
-fn demo_narrates_and_saves_a_run() {
+fn a_closed_stdout_ends_quietly() {
     let env = Env::new();
-    let o = env.run(&["demo", "--duration", "1s"]);
-    assert!(o.status.success(), "{}", stderr(&o));
-    let text = stdout(&o);
-    assert!(text.contains("What oprobe found"), "{text}");
-    // The next steps are replays of the demo run (design v4 §10), one on your own bucket.
-    assert!(text.contains("oprobe run --from "), "{text}");
-    assert!(text.contains("s3://YOUR-BUCKET"), "{text}");
-    assert_eq!(env.runs().len(), 1);
-    let o = env.run(&["demo", "--duration", "1s", "-o", "json"]);
-    let v = json(&o);
-    assert_eq!(v["report"]["schema"], "oprobe.report/5");
-    assert!(v["steps"].as_array().unwrap().len() >= 4);
-}
-
-#[test]
-fn target_test_runs_the_doctor() {
-    let env = Env::new();
-    let o = env.run(&["target", "add", "local", "memory://"]);
-    assert!(o.status.success(), "{}", stderr(&o));
-    assert!(stdout(&o).contains("ready to benchmark"), "{}", stdout(&o));
-    let o = env.run(&["target", "test", "local", "-o", "json"]);
-    assert!(o.status.success(), "{}", stderr(&o));
-    assert_eq!(json(&o)["ready"], true);
-    let o = env.run(&["target", "test", "nope", "-o", "json"]);
-    assert_eq!(error_code(&o), "usage.unknown_target");
-    // `config edit` refuses without a terminal.
-    let o = env.run(&["config", "edit", "-o", "json"]);
-    assert_eq!(error_code(&o), "usage.invalid_argument");
-}
-
-/// A one-shot HTTP server answering every request with `body`.
-fn serve(body: String) -> String {
-    use std::io::{Read, Write};
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = l.local_addr().unwrap();
-    std::thread::spawn(move || {
-        for s in l.incoming().take(4) {
-            let Ok(mut s) = s else { continue };
-            let mut buf = [0u8; 4096];
-            let _ = s.read(&mut buf);
-            let _ = write!(
-                s,
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-        }
-    });
-    format!("http://{addr}")
-}
-
-#[test]
-fn self_update_check_reports_a_newer_release() {
-    let env = Env::new();
-    let api = serve(
-        r#"{"tag_name":"v99.0.0","html_url":"https://example.invalid/r","assets":[]}"#.into(),
-    );
-    let o = env
+    let _ = env.run(&run_args(&["memory://"], &["-q"]));
+    let mut child = env
         .cmd()
-        .env("OPROBE_UPDATE_API", &api)
-        .args(["self-update", "--check", "-o", "json"])
-        .output()
-        .unwrap();
-    assert!(o.status.success(), "{}", stderr(&o));
-    let v = json(&o);
-    assert_eq!(v["latest_version"], "99.0.0");
-    assert_eq!(v["update_available"], true);
-    assert_eq!(v["installed"], false);
-}
-
-/// `oprobe watch` exports (design v5 §6, review C7/C8): OTLP metrics are protobuf with the
-/// `OTEL_EXPORTER_OTLP_HEADERS` headers and no run id; Prometheus series carry the target,
-/// `oprobe_build_info` and HELP text, and `/healthz` answers.
-#[test]
-fn watch_exports_otlp_protobuf_and_labelled_prometheus() {
-    use std::io::{Read, Write};
-    // An OTLP/HTTP collector stub recording each request's head and body.
-    let collector = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let otlp = format!("http://{}", collector.local_addr().unwrap());
-    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(String, Vec<u8>)>::new()));
-    let rec = seen.clone();
-    std::thread::spawn(move || {
-        for s in collector.incoming() {
-            let Ok(mut s) = s else { continue };
-            let mut buf = Vec::new();
-            let mut chunk = [0u8; 65536];
-            // Read the head, then content-length bytes of body.
-            let (head, body) = loop {
-                let n = s.read(&mut chunk).unwrap_or(0);
-                if n == 0 {
-                    break (String::new(), Vec::new());
-                }
-                buf.extend_from_slice(&chunk[..n]);
-                if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                    let head = String::from_utf8_lossy(&buf[..i]).to_ascii_lowercase();
-                    let len: usize = head
-                        .lines()
-                        .find_map(|l| l.strip_prefix("content-length:"))
-                        .and_then(|v| v.trim().parse().ok())
-                        .unwrap_or(0);
-                    while buf.len() < i + 4 + len {
-                        let n = s.read(&mut chunk).unwrap_or(0);
-                        if n == 0 {
-                            break;
-                        }
-                        buf.extend_from_slice(&chunk[..n]);
-                    }
-                    break (head, buf[i + 4..].to_vec());
-                }
-            };
-            let _ =
-                s.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
-            rec.lock().unwrap().push((head, body));
-        }
-    });
-    let port = {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        l.local_addr().unwrap().port()
-    };
-    let listen = format!("127.0.0.1:{port}");
-    let env = Env::new();
-    let child = env
-        .cmd()
-        .env(
-            "OTEL_EXPORTER_OTLP_HEADERS",
-            "x-api-key=s3cr%3Dt,x-tenant=t1",
-        )
-        .env_remove("OTEL_EXPORTER_OTLP_PROTOCOL")
-        .env_remove("OTEL_EXPORTER_OTLP_METRICS_PROTOCOL")
-        .args([
-            "watch",
-            "memory://",
-            "--count",
-            "3",
-            "--interval",
-            "1s",
-            "-d",
-            "300ms",
-            "--listen",
-            &listen,
-            "--otlp-endpoint",
-            &otlp,
-            "-q",
-            "-o",
-            "json",
-        ])
+        .args(["show", "last", "--detail"])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    let get = |path: &str| -> Option<String> {
-        let mut s = std::net::TcpStream::connect(&listen).ok()?;
-        write!(s, "GET {path} HTTP/1.1\r\nhost: x\r\n\r\n").ok()?;
-        let mut out = Vec::new();
-        let _ = s.read_to_end(&mut out);
-        (!out.is_empty()).then(|| String::from_utf8_lossy(&out).into_owned())
-    };
-    let mut metrics = None;
-    let mut health = None;
-    for _ in 0..100 {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        if let Some(m) =
-            get("/metrics").filter(|m| m.contains("oprobe_probes_total{target=\"memory://\"} 1"))
-        {
-            metrics = Some(m);
-            // A loaded runner may refuse or drop one connection; ask again (the session runs
-            // for two more windows).
-            for _ in 0..10 {
-                health = get("/healthz");
-                if health.is_some() {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-            break;
-        }
-    }
-    let o = child.wait_with_output().unwrap();
-    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
-    let m = metrics.expect("no /metrics after the first window");
-    assert!(
-        m.contains("oprobe_build_info{target=\"memory://\",version=\""),
-        "{m}"
-    );
-    assert!(m.contains("# HELP oprobe_window_p99_seconds"), "{m}");
-    assert!(
-        m.contains("oprobe_last_success_timestamp_seconds{target=\"memory://\"}"),
-        "{m}"
-    );
-    let h = health.expect("no /healthz");
-    assert!(h.starts_with("HTTP/1.1 200"), "{h}");
-    let seen = seen.lock().unwrap();
-    assert_eq!(seen.len(), 3, "one push per window");
-    for (head, body) in seen.iter() {
-        assert!(head.starts_with("post /v1/metrics"), "{head}");
-        assert!(
-            head.contains("content-type: application/x-protobuf"),
-            "{head}"
-        );
-        assert!(head.contains("x-api-key: s3cr=t"), "{head}");
-        assert!(head.contains("x-tenant: t1"), "{head}");
-        let text = String::from_utf8_lossy(body);
-        assert!(text.contains("service.instance.id") && text.contains("memory://"));
-        assert!(
-            !text.contains("oprobe.run.id"),
-            "a run id per window churns series"
-        );
-    }
+    drop(child.stdout.take());
+    let out = child.wait_with_output().unwrap();
+    assert!(!stderr(&out).contains("panicked"), "{}", stderr(&out));
 }

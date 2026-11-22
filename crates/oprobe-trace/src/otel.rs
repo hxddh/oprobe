@@ -85,7 +85,7 @@ impl Exporter for OtelExporter {
 
 /// A [`crate::Config`] that exports to `meter`.
 pub fn config(meter: &Meter) -> crate::Config {
-    crate::Config::default().with_exporter(Arc::new(OtelExporter::new(meter)))
+    crate::Config::default().exporter(Arc::new(OtelExporter::new(meter)))
 }
 
 #[cfg(test)]

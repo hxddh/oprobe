@@ -37,6 +37,9 @@ use crate::model::{OpRow, ReqRow};
 pub struct FitInputs {
     /// Busy CPU of the load generator as a share of its cores (1 = every core busy).
     pub client_cpu_busy_ratio: Option<f64>,
+    /// The client's scheduler lagged (`report.self.client_saturated`, T7): its timing, not
+    /// the service, set the pace.
+    pub client_saturated: bool,
 }
 
 /// BIC gap to the runner-up for high confidence.
@@ -890,6 +893,14 @@ fn confidence_of(gap: f64, enough: bool) -> Confidence {
 }
 
 fn to_hypothesis(f: Fit, n: f64, selected: bool, confidence: Confidence) -> Hypothesis {
+    // T8: "high" only when the model explains most of the effect.
+    let confidence = if f.kind != HypothesisKind::None
+        && f.explains < crate::analysis::findings::HIGH_EXPLAINS_RATIO
+    {
+        confidence.min(Confidence::Medium)
+    } else {
+        confidence
+    };
     Hypothesis {
         kind: f.kind,
         bic: Some(f.bic(n)),
@@ -960,16 +971,21 @@ fn fit_rows(reqs: &[&ReqRow], ops: &[&OpRow], inputs: &FitInputs) -> Vec<Hypothe
     let thr = obs.iter().filter(|o| o.thr).count() as u64;
     let thr_ratio = thr as f64 / n;
     let cpu = inputs.client_cpu_busy_ratio.unwrap_or(0.0);
-    let client_bound = cpu >= CLIENT_BOUND_RATIO;
+    let client_bound = cpu >= CLIENT_BOUND_RATIO || inputs.client_saturated;
     let client = || Hypothesis {
         kind: HypothesisKind::ClientBound,
         params: HypothesisParams::default(),
         log_likelihood: None,
         bic: None,
-        evidence: vec![format!(
-            "the load generator kept {:.0}% of its CPU busy: it, not the service, set the pace",
-            cpu * 100.0
-        )],
+        evidence: vec![if cpu >= CLIENT_BOUND_RATIO {
+            format!(
+                "the load generator kept {:.0}% of its CPU busy: it, not the service, set the pace",
+                cpu * 100.0
+            )
+        } else {
+            "the load generator's scheduler lagged: its timing, not the service, set the pace"
+                .to_owned()
+        }],
         confidence: if cpu >= 0.95 {
             Confidence::High
         } else {
@@ -986,7 +1002,7 @@ fn fit_rows(reqs: &[&ReqRow], ops: &[&OpRow], inputs: &FitInputs) -> Vec<Hypothe
         {
             h.confidence = h.confidence.min(cap);
             h.evidence.push(
-                "a token bucket restating this limit fits about as well (one closed-loop run cannot tell them apart; `oprobe tune` varies the concurrency)"
+                "a token bucket restating this limit fits about as well (one closed-loop run cannot tell them apart; `oprobe prove` varies the limit)"
                     .into(),
             );
         }
@@ -1393,6 +1409,7 @@ mod tests {
             (i64::MIN, i64::MAX),
             &FitInputs {
                 client_cpu_busy_ratio: Some(0.97),
+                client_saturated: false,
             },
         );
         assert_eq!(selected(&hs).kind, HypothesisKind::ClientBound);

@@ -1,33 +1,42 @@
 # Privacy
 
-**oprobe sends no telemetry.** No usage statistics, crash reports or analytics, and no setting to turn any on.
+**oprobe sends no telemetry.** No usage statistics, crash reports or analytics, and no setting to
+turn any on. Neither does `oprobe-trace`.
 
 ## What oprobe connects to
 
 | When | Where |
 |---|---|
-| `run`, `tune`, `doctor`, `target test`, `probe`, `watch`, `matrix`, `compat`, `cleanup`, the app | the storage endpoint you give it (and your proxy, if `HTTPS_PROXY` / `--proxy` is set); credential providers of that cloud (instance metadata, STS, SSO) when the provider chain needs them |
-| `demo`, `lab`, `lab://…` targets | nothing: the lab runs inside oprobe on 127.0.0.1 |
-| `self-update` | GitHub's release download host (`latest.json`, the archive) and, as a fallback, `api.github.com` (set `OPROBE_RELEASE_BASE` / `OPROBE_UPDATE_API` to use a mirror) |
-| the GitHub Action | GitHub (to download a pinned release and comment on the pull request) |
+| `run`, `prove`, the app | the storage endpoint of the operator you give it (and your proxy, if `HTTPS_PROXY` or `http.proxy` is set); that cloud's credential providers (instance metadata, STS, SSO) when the credential chain needs them |
+| `demo`, `lab`, `lab://…` operators | nothing: the lab runs inside oprobe on 127.0.0.1 |
+| `show`, `show --list`, `show --rm` | nothing |
 
-Nothing else. The HTML report is one self-contained file: opening it loads nothing from the network.
+Nothing else. oprobe never checks for updates by itself; the install scripts talk to GitHub when
+you run them.
 
 ## What oprobe stores
 
-- **Runs** in `<data dir>/oprobe/runs/` (`oprobe config path`): the report, the resolved configuration and one
-  row per operation and request. Object keys, request IDs and remote IP addresses are part of a run; secrets
-  are not: credential options (`secret_access_key`, `account_key`, `sas_token`, `password`, `*_key`, …) are
-  redacted before anything is printed or saved, and URLs lose embedded credentials and query strings.
-- **The host** is recorded as OS, architecture, CPU count and a hash of the host name, never the name itself.
-- **The config file** holds what you put there (`oprobe target add` stores the URL, region, endpoint, the
-  credential *source* such as `profile:prod`, and options — never keys unless you write them yourself).
+- **Runs** in `<data dir>/oprobe/runs/` (or `$OPROBE_DATA_DIR`): the report, the operator spec,
+  the workload and one row per operation and request. Object keys, request IDs and remote IP
+  addresses are part of a run. Secrets are not: credential options (`secret_access_key`,
+  `account_key`, `sas_token`, `password`, `*_key`, …) are redacted before anything is printed or
+  saved, and URLs lose embedded credentials and query strings.
+- **The host** is recorded as OS, architecture, CPU count and a hash of the host name, never the
+  name itself.
+- **The config file** holds what you put there.
 
-Delete runs with `oprobe runs rm` / `oprobe runs gc`, or remove the data directory.
+Delete runs with `oprobe show --rm RUN…`, or remove the data directory.
+
+## `.oprobe` files from `oprobe-trace`
+
+`Handle::save` writes what the layer saw in your process: the aggregates and a sample of requests
+with their API, method, status, timing, bytes, connection and request ID. Object keys are not part
+of request rows, but request IDs and remote addresses are. Credentials never are. Review a file
+before you attach it to an issue.
 
 ## Test data in your bucket
 
-`oprobe run` writes under `<prefix>/oprobe-run-<id>/` and deletes it at the end, verifying the prefix is empty.
-`--read-only` and `--existing` never write; `--dry-run` sends nothing; `oprobe doctor` writes only with
-`--write-probe`. Leftovers from killed runs are listed with `oprobe cleanup TARGET` (a dry run) and
-removed with `oprobe cleanup TARGET --yes`.
+`oprobe run` writes under `<prefix>/oprobe-run-<id>/` and deletes it at the end, verifying the
+prefix is empty. `--read-only` and `--existing` never write; `--dry-run` sends nothing. A run
+killed hard (a second Ctrl-C, OOM, power loss) can leave its prefix behind; delete it with your
+usual tools.

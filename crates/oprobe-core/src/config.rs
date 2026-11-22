@@ -1,7 +1,8 @@
-//! Profile model (`*.toml`): target, workload, knobs, SLA and cost assumptions.
+//! The profile of a run: the operator under test ([`crate::operator::OperatorSpec`]), the
+//! workload and the SLA; and the service targets an operator URL resolves to ([`TargetSpec`]).
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -17,56 +18,41 @@ fn invalid(msg: impl Into<String>) -> anyhow::Error {
     crate::input::invalid(msg).into()
 }
 
-fn usage(msg: impl Into<String>) -> anyhow::Error {
-    invalid(msg)
-}
-
-/// Defaults of `oprobe tune`, shared with the app's Tune page and MCP so every surface runs
-/// the same search (clap needs them as `&'static str`; [`defaults`] parses them).
-pub mod tune_defaults {
-    /// Measurement window per trial.
-    pub const TRIAL_DURATION: &str = "5s";
-    /// Warmup per trial.
-    pub const TRIAL_WARMUP: &str = "1s";
-    /// Maximum number of trials.
-    pub const MAX_TRIALS: usize = 24;
-    /// Fewest trials a search can run (a baseline and one candidate).
-    pub const MIN_TRIALS: usize = 2;
-    /// Highest concurrency to try.
-    pub const MAX_CONCURRENCY: usize = 256;
-    /// Pause after a throttled trial.
-    pub const COOLDOWN: &str = "5s";
-    /// Share of throttled requests a configuration may cause and still be feasible (v4 §6).
+/// Defaults of `oprobe prove` (design v6 §8 "Prove").
+pub mod prove_defaults {
+    /// Measurement window of one trial (sizing and A/B).
+    pub const TRIAL_DURATION: &str = "2s";
+    /// Warmup of one trial.
+    pub const TRIAL_WARMUP: &str = "300ms";
+    /// Share of throttled requests a sized value may cause (`--max-throttle`).
     pub const MAX_THROTTLE_RATIO: f64 = 0.001;
-    /// Repeats of each trial near the throttle boundary (v4 §6).
-    pub const BOUNDARY_REPEATS: usize = 2;
+    /// A/B pairs at most (the sequential test usually stops earlier).
+    pub const MAX_PAIRS: usize = 6;
+    /// A/B pairs at least before a decision (fewer give `inconclusive`).
+    pub const MIN_PAIRS: usize = 3;
+    /// Sizing trials at most (the bracket search).
+    pub const MAX_SIZING_TRIALS: usize = 8;
 }
 
-/// The tuner's built-in search settings, parsed.
+/// The built-in defaults of `oprobe prove`, parsed.
 #[derive(Clone, Debug, PartialEq, Serialize, schemars::JsonSchema)]
-pub struct TuneDefaults {
+pub struct ProveDefaults {
     pub trial_duration: HumanDuration,
     pub trial_warmup: HumanDuration,
-    pub max_trials: usize,
-    pub min_trials: usize,
-    pub max_concurrency: usize,
-    pub cooldown: HumanDuration,
     pub max_throttle_ratio: f64,
-    pub boundary_repeats: usize,
+    pub max_pairs: usize,
+    pub min_pairs: usize,
+    pub max_sizing_trials: usize,
 }
 
-/// Every built-in default in one place (design v4 §1): the CLI, the App, MCP and tune read
-/// these instead of hard-coding their own. A profile's defaults are `Profile::from_target`'s
+/// Every built-in default in one place (design v4 §1): the CLI, the App and prove read these
+/// instead of hard-coding their own. A profile's defaults are `Profile::from_target`'s
 /// (the same values); `[defaults]` in the config file and flags override them.
 #[derive(Clone, Debug, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct BuiltinDefaults {
     pub workload: WorkloadSpec,
-    pub knobs: Knobs,
     pub sla: Sla,
-    pub cost: CostSpec,
-    pub tune: TuneDefaults,
-    /// Spare in-flight capacity kept below a measured ceiling (`analysis::capacity`).
-    pub headroom_ratio: f64,
+    pub prove: ProveDefaults,
     /// The demo target (`oprobe demo`, the App's Demo button).
     pub demo_target: String,
     /// The demo's measurement window.
@@ -78,48 +64,35 @@ pub fn defaults() -> BuiltinDefaults {
     let d = |s: &str| HumanDuration(crate::util::parse_duration(s).unwrap_or_default());
     BuiltinDefaults {
         workload: WorkloadSpec::default(),
-        knobs: Knobs::default(),
         sla: Sla::default(),
-        cost: CostSpec::default(),
-        tune: TuneDefaults {
-            trial_duration: d(tune_defaults::TRIAL_DURATION),
-            trial_warmup: d(tune_defaults::TRIAL_WARMUP),
-            max_trials: tune_defaults::MAX_TRIALS,
-            min_trials: tune_defaults::MIN_TRIALS,
-            max_concurrency: tune_defaults::MAX_CONCURRENCY,
-            cooldown: d(tune_defaults::COOLDOWN),
-            max_throttle_ratio: tune_defaults::MAX_THROTTLE_RATIO,
-            boundary_repeats: tune_defaults::BOUNDARY_REPEATS,
+        prove: ProveDefaults {
+            trial_duration: d(prove_defaults::TRIAL_DURATION),
+            trial_warmup: d(prove_defaults::TRIAL_WARMUP),
+            max_throttle_ratio: prove_defaults::MAX_THROTTLE_RATIO,
+            max_pairs: prove_defaults::MAX_PAIRS,
+            min_pairs: prove_defaults::MIN_PAIRS,
+            max_sizing_trials: prove_defaults::MAX_SIZING_TRIALS,
         },
-        headroom_ratio: crate::analysis::capacity::DEFAULT_HEADROOM_RATIO,
         demo_target: "lab://demo".into(),
         demo_duration: HumanDuration::secs(8),
     }
 }
 
-/// Complete, round-trippable benchmark profile.
+/// Complete, round-trippable profile of a run: the operator, the workload and the SLA.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Profile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    pub target: TargetSpec,
+    pub operator: crate::operator::OperatorSpec,
     #[serde(default)]
     pub workload: WorkloadSpec,
     #[serde(default)]
-    pub knobs: Knobs,
-    #[serde(default)]
     pub sla: Sla,
-    #[serde(default)]
-    pub cost: CostSpec,
-    /// What generates the load (`--client`, design v5 §7). Runtime only: never serialized, so
-    /// a stored spec cannot start a command; a replay uses the default client.
-    #[serde(skip)]
-    #[schemars(skip)]
-    pub client: crate::clients::ClientChoice,
 }
 
-/// Storage target. Either `url = "s3://bucket/prefix"` or explicit `scheme` + `options`.
+/// The service an operator URL resolves to (`url` plus `options`, or explicit `scheme` +
+/// `options`): the internal form OpenDAL's service builders take.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TargetSpec {
@@ -142,87 +115,48 @@ pub struct TargetSpec {
     pub proxy: Option<String>,
 }
 
+/// The workload presets: OpenDAL access patterns (design v6 §8).
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
 )]
 #[serde(rename_all = "kebab-case")]
 pub enum Preset {
-    /// Lakehouse scan: stat + footer read + vectored column-chunk range reads.
+    /// Many small objects: whole-object reads and writes, some stats.
     #[default]
-    Parquet,
-    /// AI/ML checkpoint: large multipart writes plus occasional full restores.
-    Checkpoint,
-    /// Many small objects: whole-object GETs and PUTs.
     SmallFiles,
-    /// Metadata-heavy: LIST and HEAD storms over a partitioned prefix.
-    Metadata,
-    /// General purpose 70/20/10 read/write/stat mix.
-    Mixed,
-    /// Lakehouse scan reading the footer with a suffix range (no HEAD per file).
-    ParquetSuffix,
-    /// Churn: small writes removed again by batched deletes (OpenDAL `Deleter`).
-    Delete,
-    /// Server-side copies of dataset objects.
-    Copy,
-    /// LIST with a page size (`limit`): every page is a billed request.
-    ListPaged,
-    /// GETs through presigned URLs.
-    Presign,
-    /// Optimistic concurrency: conditional create (`If-None-Match: *`) and overwrite (`If-Match`).
-    Conditional,
-    /// HEAD storm plus small writes carrying user metadata.
-    MetadataHeavy,
+    /// Large objects: multipart writes and full reads.
+    LargeObjects,
+    /// Range reads (parquet-like): a stat, the footer, then vectored column-chunk ranges.
+    RangeReads,
+    /// Metadata: list and stat over a partitioned prefix.
+    ListStat,
 }
 
 impl Preset {
-    pub const ALL: [Preset; 12] = [
-        Preset::Parquet,
-        Preset::Checkpoint,
+    pub const ALL: [Preset; 4] = [
         Preset::SmallFiles,
-        Preset::Metadata,
-        Preset::Mixed,
-        Preset::ParquetSuffix,
-        Preset::Delete,
-        Preset::Copy,
-        Preset::ListPaged,
-        Preset::Presign,
-        Preset::Conditional,
-        Preset::MetadataHeavy,
+        Preset::LargeObjects,
+        Preset::RangeReads,
+        Preset::ListStat,
     ];
 
     pub fn slug(&self) -> &'static str {
         match self {
-            Preset::Parquet => "parquet",
-            Preset::Checkpoint => "checkpoint",
             Preset::SmallFiles => "small-files",
-            Preset::Metadata => "metadata",
-            Preset::Mixed => "mixed",
-            Preset::ParquetSuffix => "parquet-suffix",
-            Preset::Delete => "delete",
-            Preset::Copy => "copy",
-            Preset::ListPaged => "list-paged",
-            Preset::Presign => "presign",
-            Preset::Conditional => "conditional",
-            Preset::MetadataHeavy => "metadata-heavy",
+            Preset::LargeObjects => "large-objects",
+            Preset::RangeReads => "range-reads",
+            Preset::ListStat => "list-stat",
         }
     }
 
     pub fn describe(&self) -> &'static str {
         match self {
-            Preset::Parquet => "lakehouse scan: footer + vectored column-chunk range reads",
-            Preset::Checkpoint => "ML checkpoint: large multipart writes + full restores",
-            Preset::SmallFiles => "small objects: whole-object GET/PUT",
-            Preset::Metadata => "metadata storm: LIST + HEAD over partitions",
-            Preset::Mixed => "general purpose: 70% reads / 20% writes / 10% stat",
-            Preset::ParquetSuffix => {
-                "lakehouse scan without HEAD: suffix footer read + vectored column chunks"
+            Preset::SmallFiles => "small objects: whole-object reads and writes, some stats",
+            Preset::LargeObjects => "large objects: multipart writes and full reads",
+            Preset::RangeReads => {
+                "range reads: footer + vectored column-chunk ranges (parquet-like)"
             }
-            Preset::Delete => "churn: 4 KiB writes removed by batched deletes (20 keys/batch)",
-            Preset::Copy => "server-side copies of 1 MiB objects",
-            Preset::ListPaged => "paged LIST: 32 keys per page over 128-object partitions",
-            Preset::Presign => "GETs through presigned URLs",
-            Preset::Conditional => "optimistic concurrency: If-None-Match / If-Match writes",
-            Preset::MetadataHeavy => "60% HEAD / 40% small writes with user metadata",
+            Preset::ListStat => "metadata: list + stat over partitions",
         }
     }
 
@@ -239,7 +173,7 @@ impl Preset {
             ..DatasetSpec::default()
         };
         match self {
-            Preset::Parquet => (
+            Preset::RangeReads => (
                 ds(8, ByteSize::mib(16)),
                 vec![OpSpec {
                     weight: 100,
@@ -251,90 +185,7 @@ impl Preset {
                     },
                 }],
             ),
-            Preset::ParquetSuffix => (
-                ds(8, ByteSize::mib(16)),
-                vec![OpSpec {
-                    weight: 100,
-                    op: OpKind::ParquetScan {
-                        columns: 4,
-                        column_size: ByteSize::kib(512),
-                        footer_size: ByteSize::kib(64),
-                        suffix: true,
-                    },
-                }],
-            ),
-            Preset::Delete => (
-                ds(1, ByteSize::kib(4)),
-                vec![
-                    OpSpec {
-                        weight: 95,
-                        op: OpKind::Write {
-                            size: ByteSize::kib(4),
-                        },
-                    },
-                    OpSpec {
-                        weight: 5,
-                        op: OpKind::Delete { batch: 20 },
-                    },
-                ],
-            ),
-            Preset::Copy => (
-                ds(16, ByteSize::mib(1)),
-                vec![OpSpec {
-                    weight: 100,
-                    op: OpKind::Copy,
-                }],
-            ),
-            Preset::ListPaged => (
-                DatasetSpec {
-                    objects: 512,
-                    object_size: ByteSize::kib(1),
-                    partitions: 4,
-                    ..DatasetSpec::default()
-                },
-                vec![OpSpec {
-                    weight: 100,
-                    op: OpKind::ListPaged { limit: 32 },
-                }],
-            ),
-            Preset::Presign => (
-                ds(32, ByteSize::kib(256)),
-                vec![OpSpec {
-                    weight: 100,
-                    op: OpKind::PresignedRead,
-                }],
-            ),
-            Preset::Conditional => (
-                ds(1, ByteSize::kib(16)),
-                vec![OpSpec {
-                    weight: 100,
-                    op: OpKind::ConditionalWrite {
-                        size: ByteSize::kib(16),
-                    },
-                }],
-            ),
-            Preset::MetadataHeavy => (
-                DatasetSpec {
-                    objects: 256,
-                    object_size: ByteSize::kib(4),
-                    partitions: 8,
-                    ..DatasetSpec::default()
-                },
-                vec![
-                    OpSpec {
-                        weight: 60,
-                        op: OpKind::Stat,
-                    },
-                    OpSpec {
-                        weight: 40,
-                        op: OpKind::MetadataWrite {
-                            size: ByteSize::kib(4),
-                            entries: 8,
-                        },
-                    },
-                ],
-            ),
-            Preset::Checkpoint => (
+            Preset::LargeObjects => (
                 ds(2, ByteSize::mib(32)),
                 vec![
                     OpSpec {
@@ -368,7 +219,7 @@ impl Preset {
                     },
                 ],
             ),
-            Preset::Metadata => (
+            Preset::ListStat => (
                 DatasetSpec {
                     objects: 512,
                     object_size: ByteSize::kib(4),
@@ -382,31 +233,6 @@ impl Preset {
                     },
                     OpSpec {
                         weight: 60,
-                        op: OpKind::Stat,
-                    },
-                ],
-            ),
-            Preset::Mixed => (
-                ds(32, ByteSize::mib(4)),
-                vec![
-                    OpSpec {
-                        weight: 60,
-                        op: OpKind::Read {
-                            size: Some(ByteSize::mib(1)),
-                        },
-                    },
-                    OpSpec {
-                        weight: 10,
-                        op: OpKind::Read { size: None },
-                    },
-                    OpSpec {
-                        weight: 20,
-                        op: OpKind::Write {
-                            size: ByteSize::mib(1),
-                        },
-                    },
-                    OpSpec {
-                        weight: 10,
                         op: OpKind::Stat,
                     },
                 ],
@@ -592,7 +418,7 @@ pub struct DatasetSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub existing_prefix: Option<String>,
     /// Keep the generated dataset between runs (`oprobe-dataset/<fingerprint>/`) to avoid
-    /// re-uploading it every time. Remove with `oprobe cleanup --datasets`.
+    /// re-uploading it every time (remove it with your storage tools).
     #[serde(default)]
     pub persist: bool,
 }
@@ -625,6 +451,9 @@ impl Default for DatasetSpec {
 pub struct WorkloadSpec {
     #[serde(default)]
     pub preset: Preset,
+    /// Concurrent logical operations (closed-loop workers, or the open-loop in-flight cap).
+    #[serde(default = "default_concurrency")]
+    pub concurrency: usize,
     #[serde(default = "default_duration")]
     pub duration: HumanDuration,
     #[serde(default = "default_warmup")]
@@ -642,9 +471,6 @@ pub struct WorkloadSpec {
     /// `diurnal[:MIN..MAX/PERIOD]` (makes the run open-loop; `rate` is then the diurnal peak).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shape: Option<RateShape>,
-    /// Replay a traffic log instead of the mix (open loop on the log's timing).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub replay: Option<crate::engine::replay::ReplaySpec>,
     #[serde(default)]
     pub access: Access,
     /// Dataset override (defaults come from the preset).
@@ -680,13 +506,13 @@ impl Default for WorkloadSpec {
     fn default() -> Self {
         Self {
             preset: Preset::default(),
+            concurrency: default_concurrency(),
             duration: default_duration(),
             warmup: default_warmup(),
             max_ops: None,
             rate: None,
             arrivals: Arrivals::Constant,
             shape: None,
-            replay: None,
             access: Access::Uniform,
             dataset: None,
             mix: Vec::new(),
@@ -700,7 +526,7 @@ impl Default for WorkloadSpec {
 impl WorkloadSpec {
     /// Whether arrivals follow a schedule (`rate` or `shape`) instead of closed-loop workers.
     pub fn open_loop(&self) -> bool {
-        self.rate.is_some() || self.shape.is_some() || self.replay.is_some()
+        self.rate.is_some() || self.shape.is_some()
     }
 
     /// Expected open-loop arrivals over `window` (`None`: closed loop). The plan's estimate.
@@ -734,28 +560,10 @@ impl WorkloadSpec {
     }
 }
 
-#[derive(
-    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
-)]
-#[serde(rename_all = "lowercase")]
-pub enum TransportMode {
-    /// OpenDAL's default HTTP client (reqwest), observed through its extension points.
-    #[default]
-    Opendal,
-    /// oprobe's own instrumented connection pool.
-    Microscope,
-}
-
-impl TransportMode {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Opendal => "opendal",
-            Self::Microscope => "microscope",
-        }
-    }
-}
-
-/// Client-side configuration under test / being tuned.
+/// The tuner's search vector (transitional, until `prove` replaces the tuner): the workload's
+/// concurrency and the operator values the tuner varies, flattened. Derived from a profile
+/// ([`Knobs::of`]) and written back to one ([`Knobs::apply`]); never stored in a profile.
+/// `chunk_size` and `range_gap` are 0 when unset (OpenDAL's default).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Knobs {
@@ -776,11 +584,6 @@ pub struct Knobs {
     pub max_inflight_requests: usize,
     #[serde(default)]
     pub http_version: HttpVersion,
-    /// How requests are made and observed: `opendal` = OpenDAL's own reqwest client (what
-    /// production runs; the default), `microscope` = oprobe's instrumented connection pool
-    /// (exact queue / per-dial phases / HTTP/2 streams, but a different client).
-    #[serde(default)]
-    pub transport: TransportMode,
     #[serde(default = "default_true")]
     pub keep_alive: bool,
     /// In-memory read cache.
@@ -797,99 +600,19 @@ pub struct Knobs {
     /// Per-operation timeout.
     #[serde(default = "default_timeout")]
     pub timeout: HumanDuration,
-    /// Provider request options (addressing style, checksums, SSE), applied when the session
-    /// opens.
-    #[serde(default, skip_serializing_if = "ProviderKnobs::is_default")]
-    pub provider: ProviderKnobs,
-}
-
-/// S3 bucket addressing.
-#[derive(
-    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
-)]
-#[serde(rename_all = "lowercase")]
-pub enum Addressing {
-    /// As the target configures it (OpenDAL's default: path style unless
-    /// `enable_virtual_host_style`).
-    #[default]
-    Auto,
-    /// `https://bucket.s3.region.amazonaws.com/key`.
-    Virtual,
-    /// `https://s3.region.amazonaws.com/bucket/key`.
-    Path,
-}
-
-/// Provider request options measured for their overhead (S3 service options).
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct ProviderKnobs {
-    #[serde(default)]
-    pub addressing: Addressing,
-    /// Checksum the client computes and the server verifies on writes (`crc32c`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub checksum: Option<String>,
-    /// Server-side encryption: `AES256` or `aws:kms`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sse: Option<String>,
-}
-
-impl ProviderKnobs {
-    pub fn is_default(&self) -> bool {
-        *self == Self::default()
-    }
-
-    /// The target options these knobs set (S3 only; an error elsewhere).
-    pub fn options(&self, scheme: &str) -> Result<Vec<(&'static str, String)>> {
-        if self.is_default() {
-            return Ok(Vec::new());
-        }
-        if scheme != "s3" {
-            return Err(usage(format!(
-                "addressing / checksum / sse knobs apply to S3-compatible targets only (this target is `{scheme}`)"
-            )));
-        }
-        let mut o = Vec::new();
-        match self.addressing {
-            Addressing::Auto => {}
-            Addressing::Virtual => o.push(("enable_virtual_host_style", "true".to_owned())),
-            Addressing::Path => o.push(("enable_virtual_host_style", "false".to_owned())),
-        }
-        if let Some(c) = &self.checksum {
-            let c = c.trim().to_ascii_lowercase();
-            if c != "crc32c" {
-                return Err(crate::input::invalid(format!("unsupported checksum `{c}`"))
-                    .with_hint("OpenDAL's S3 service supports crc32c")
-                    .into());
-            }
-            o.push(("checksum_algorithm", c));
-        }
-        if let Some(s) = &self.sse {
-            let s = s.trim();
-            if !matches!(s, "AES256" | "aws:kms" | "aws:kms:dsse") {
-                return Err(crate::input::invalid(format!("unsupported sse `{s}`"))
-                    .with_hint(crate::input::choices_hint(
-                        s,
-                        &["AES256", "aws:kms", "aws:kms:dsse"],
-                    ))
-                    .into());
-            }
-            o.push(("server_side_encryption", s.to_owned()));
-        }
-        Ok(o)
-    }
 }
 
 fn default_concurrency() -> usize {
     16
 }
 fn default_io_concurrency() -> usize {
-    4
+    1
 }
 fn default_chunk() -> ByteSize {
-    ByteSize::mib(8)
+    ByteSize(0)
 }
 fn default_gap() -> ByteSize {
-    ByteSize::kib(64)
+    ByteSize(0)
 }
 fn default_cache_size() -> ByteSize {
     ByteSize::mib(256)
@@ -901,6 +624,10 @@ fn default_timeout() -> HumanDuration {
     HumanDuration::secs(60)
 }
 
+fn optional(b: ByteSize) -> Option<ByteSize> {
+    (b.0 > 0).then_some(b)
+}
+
 impl Default for Knobs {
     fn default() -> Self {
         Self {
@@ -910,14 +637,12 @@ impl Default for Knobs {
             range_gap: default_gap(),
             max_inflight_requests: 0,
             http_version: HttpVersion::Auto,
-            transport: TransportMode::Opendal,
             keep_alive: true,
             cache: false,
             cache_size: default_cache_size(),
             retries: default_retries(),
             tail_cut: false,
             timeout: default_timeout(),
-            provider: ProviderKnobs::default(),
         }
     }
 }
@@ -925,7 +650,7 @@ impl Default for Knobs {
 impl Knobs {
     pub fn summary(&self) -> String {
         format!(
-            "concurrency={} io={} chunk={} gap={} inflight={} http={:?} keep-alive={} cache={} retries={}{}{}",
+            "concurrency={} io={} chunk={} gap={} inflight={} http={:?} keep-alive={} cache={} retries={}{}",
             self.concurrency,
             self.io_concurrency,
             self.chunk_size,
@@ -936,25 +661,100 @@ impl Knobs {
             if self.cache { self.cache_size.to_string() } else { "off".into() },
             self.retries,
             if self.tail_cut { " tail-cut" } else { "" },
-            if self.transport == TransportMode::Microscope { " (microscope)" } else { "" },
         )
         .to_ascii_lowercase()
-            + &self.provider_summary()
     }
 
-    fn provider_summary(&self) -> String {
-        let p = &self.provider;
-        let mut s = String::new();
-        if p.addressing != Addressing::Auto {
-            s += &format!(" addressing={:?}", p.addressing).to_ascii_lowercase();
+    /// The knobs of `p`: its workload's concurrency and its operator's values.
+    pub fn of(p: &Profile) -> Self {
+        Self::of_spec(&p.operator, p.workload.concurrency)
+    }
+
+    /// The knobs of operator `o` at `concurrency`.
+    pub fn of_spec(o: &crate::operator::OperatorSpec, concurrency: usize) -> Self {
+        let cache = o.layers.cache.as_ref();
+        Self {
+            concurrency,
+            io_concurrency: o.read_concurrent(),
+            chunk_size: o.read.chunk.or(o.write.chunk).unwrap_or_default(),
+            range_gap: o.read.gap.unwrap_or_default(),
+            max_inflight_requests: o.http_limit().unwrap_or(0),
+            http_version: o.http.version,
+            keep_alive: o.http.keep_alive,
+            cache: cache.is_some(),
+            cache_size: cache.map_or_else(default_cache_size, |c| c.memory),
+            retries: o.retries(),
+            tail_cut: o.layers.tail_cut.is_some(),
+            timeout: HumanDuration(o.op_timeout()),
         }
-        if let Some(c) = &p.checksum {
-            s += &format!(" checksum={c}");
+    }
+
+    /// Write these knobs back to `p` (only the values that differ from `p`'s own).
+    pub fn apply(&self, p: &mut Profile) {
+        p.workload.concurrency = self.concurrency;
+        self.apply_to(&mut p.operator);
+    }
+
+    /// Write every knob but the concurrency to operator `o` (only the values that differ).
+    pub fn apply_to(&self, o: &mut crate::operator::OperatorSpec) {
+        use crate::operator::{Cache, ConcurrentLimit, Retry, TailCut, Timeout};
+        let cur = Self::of_spec(o, self.concurrency);
+        if self.io_concurrency != cur.io_concurrency {
+            o.read.concurrent = Some(self.io_concurrency.max(1));
+            o.write.concurrent = Some(self.io_concurrency.max(1));
         }
-        if let Some(e) = &p.sse {
-            s += &format!(" sse={e}");
+        if self.chunk_size != cur.chunk_size {
+            o.read.chunk = optional(self.chunk_size);
+            o.write.chunk = optional(self.chunk_size);
         }
-        s
+        if self.range_gap != cur.range_gap {
+            o.read.gap = optional(self.range_gap);
+        }
+        if self.max_inflight_requests != cur.max_inflight_requests {
+            let ops = o
+                .layers
+                .concurrent_limit
+                .as_ref()
+                .and_then(|c| c.operations);
+            o.layers.concurrent_limit = match (self.max_inflight_requests, ops) {
+                (0, None) => None,
+                (0, Some(n)) => Some(ConcurrentLimit {
+                    http: None,
+                    operations: Some(n),
+                }),
+                (h, ops) => Some(ConcurrentLimit {
+                    http: Some(h),
+                    operations: ops,
+                }),
+            };
+        }
+        o.http.version = self.http_version;
+        o.http.keep_alive = self.keep_alive;
+        if self.cache != cur.cache || (self.cache && self.cache_size != cur.cache_size) {
+            o.layers.cache = self.cache.then_some(Cache {
+                memory: self.cache_size,
+            });
+        }
+        if self.retries != cur.retries {
+            o.layers.retry = (self.retries > 0).then(|| Retry {
+                max_times: self.retries,
+                ..o.layers.retry.clone().unwrap_or_default()
+            });
+        }
+        if self.tail_cut != cur.tail_cut {
+            o.layers.tail_cut = self.tail_cut.then(TailCut::default);
+        }
+        if self.timeout != cur.timeout {
+            let io = o
+                .layers
+                .timeout
+                .as_ref()
+                .map_or(Timeout::default().io, |t| t.io);
+            o.layers.timeout = Some(Timeout {
+                op: self.timeout,
+                io: io.min(self.timeout),
+            });
+        }
     }
 }
 
@@ -1018,60 +818,6 @@ impl Sla {
             return Err(invalid("sla.p99_ms must be > 0"));
         }
         Ok(())
-    }
-}
-
-/// Business volume used to project measured per-operation costs to a monthly bill.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct CostSpec {
-    /// Pricing preset: aws-s3, gcs, azure-blob, cloudflare-r2, backblaze-b2, aliyun-oss.
-    /// Defaults to the target's provider.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provider: Option<String>,
-    /// Logical operations per month at this workload mix.
-    #[serde(default = "default_monthly_ops")]
-    pub monthly_ops: f64,
-    /// Data kept at rest (GiB).
-    #[serde(default = "default_stored_gib")]
-    pub stored_gib: f64,
-    /// Fraction of downloaded bytes that leave the cloud (internet egress).
-    #[serde(default)]
-    pub egress_fraction: f64,
-    /// Custom price overrides (USD).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pricing: Option<crate::analysis::cost::Pricing>,
-    /// Storage class the data is kept in: `standard` (default), `infrequent` or `archive`
-    /// (the provider's equivalents: S3 Standard-IA / Glacier IR, GCS Nearline / Archive, …).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub storage_class: Option<String>,
-    /// Fraction of downloaded bytes that cross regions (inter-region transfer).
-    #[serde(default, skip_serializing_if = "crate::config::is_zero_f64")]
-    pub inter_region_fraction: f64,
-}
-
-fn default_monthly_ops() -> f64 {
-    100_000_000.0
-}
-pub(crate) fn is_zero_f64(v: &f64) -> bool {
-    *v == 0.0
-}
-
-fn default_stored_gib() -> f64 {
-    1024.0
-}
-
-impl Default for CostSpec {
-    fn default() -> Self {
-        Self {
-            provider: None,
-            monthly_ops: default_monthly_ops(),
-            stored_gib: default_stored_gib(),
-            egress_fraction: 0.0,
-            pricing: None,
-            storage_class: None,
-            inter_region_fraction: 0.0,
-        }
     }
 }
 
@@ -1318,7 +1064,7 @@ impl TargetSpec {
                     .join(" and "),
             ))
             .with_hint(format!(
-                "add `--option {}=VALUE` (or `?{}=VALUE` in the URL, or under [targets.NAME.options] in the config file)",
+                "add `--set options.{}=VALUE` (or `?{}=VALUE` in the URL, or under [operators.NAME.options] in the config file)",
                 missing[0], missing[0]
             ))
             .into());
@@ -1366,7 +1112,7 @@ impl TargetSpec {
                             "r2:// needs your Cloudflare account_id or an endpoint",
                         )
                         .with_hint(
-                            "add `--option account_id=<ACCOUNT_ID>` (or `account_id = \"${R2_ACCOUNT_ID}\"` \
+                            "add `--set options.account_id=<ACCOUNT_ID>` (or `account_id = \"${R2_ACCOUNT_ID}\"` \
                              under [targets.NAME.options]), or pass \
                              `--endpoint https://<ACCOUNT_ID>.r2.cloudflarestorage.com`",
                         )
@@ -1480,6 +1226,8 @@ pub fn supported_schemes() -> Vec<&'static str> {
 
 /// Service options of `raw` from the OpenDAL service's own `Config::from_uri` (bucket /
 /// container / account / endpoint / root, per service), or `None` for a scheme not compiled in.
+// Without the optional services (`all-services`), only the `http` arm is compiled.
+#[allow(unused_imports, dead_code, unreachable_code)]
 fn uri_options(scheme: &str, raw: &str) -> Result<Option<BTreeMap<String, String>>> {
     use opendal::services::*;
     fn opts<C: opendal::Configurator>(raw: &str) -> Result<BTreeMap<String, String>> {
@@ -1579,38 +1327,10 @@ pub fn anonymous_options(scheme: &str) -> Result<&'static [(&'static str, &'stat
             return Err(crate::input::invalid(format!(
                 "--anonymous is not supported for `{other}` (OpenDAL's {other} service has no unsigned mode)"
             ))
-            .with_hint("configure credentials instead (`oprobe doctor TARGET` shows which it finds)")
+            .with_hint("configure credentials instead")
             .into());
         }
     })
-}
-
-/// Options `from_url` derives from URL credentials: always kept (as `${ENV}` references) when
-/// writing a profile, since the URL written back no longer carries them.
-fn is_url_secret(k: &str) -> bool {
-    matches!(k, "username" | "password")
-}
-
-/// A value made only of `${NAME}` references (e.g. `${AWS_SECRET_ACCESS_KEY}`).
-fn is_env_reference(v: &str) -> bool {
-    let mut rest = v.trim();
-    if rest.is_empty() {
-        return false;
-    }
-    while !rest.is_empty() {
-        let Some(after) = rest.strip_prefix("${") else {
-            return false;
-        };
-        let Some(end) = after.find('}') else {
-            return false;
-        };
-        let name = &after[..end];
-        if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
-            return false;
-        }
-        rest = &after[end + 1..];
-    }
-    true
 }
 
 /// Expand `${NAME}` references from the environment.
@@ -1639,18 +1359,15 @@ pub fn expand_env(v: &str) -> Result<String> {
 }
 
 impl Profile {
-    /// A `lab://NAME` target starts from its scenario's default workload
-    /// ([`crate::lab::Scenario::defaults`]).
-    pub fn from_target(target: TargetSpec) -> Self {
-        let scenario = target.url.as_deref().and_then(crate::lab::Scenario::of_url);
+    /// The default profile of `operator`. A `lab://NAME` operator starts from its scenario's
+    /// default workload ([`crate::lab::Scenario::defaults`]).
+    pub fn from_operator(operator: crate::operator::OperatorSpec) -> Self {
+        let scenario = crate::lab::Scenario::of_url(&operator.url);
         let mut p = Self {
             name: None,
-            target,
+            operator,
             workload: WorkloadSpec::default(),
-            knobs: Knobs::default(),
             sla: Sla::default(),
-            cost: CostSpec::default(),
-            client: Default::default(),
         };
         if let Some(sc) = scenario {
             sc.apply_defaults(&mut p);
@@ -1658,52 +1375,26 @@ impl Profile {
         p
     }
 
-    /// Load and validate a profile file: a missing file is `usage.invalid_argument`, a file that
-    /// does not parse or validate is `config.invalid`.
-    pub fn load(path: &Path) -> Result<Self> {
-        use crate::errors::{ErrorCode, OprobeError};
-        let raw = std::fs::read_to_string(path).map_err(|e| {
-            OprobeError::new(
-                ErrorCode::UsageInvalidArgument,
-                format!("cannot read profile `{}`: {e}", path.display()),
-            )
-            .with_hint(
-                "pass the path of a profile TOML file (`oprobe init > profile.toml` writes one)",
-            )
-        })?;
-        let p: Profile = toml::from_str(&raw).map_err(|e| {
-            OprobeError::new(
-                ErrorCode::ConfigInvalid,
-                format!("invalid profile `{}`: {e}", path.display()),
-            )
-        })?;
-        p.validate().map_err(|e| {
-            let body = crate::errors::classify(&e, "s3");
-            let mut o = OprobeError::new(
-                ErrorCode::ConfigInvalid,
-                format!("invalid profile `{}`: {}", path.display(), body.message),
-            );
-            o.hint = body.hint;
-            o
-        })?;
-        Ok(p)
+    /// The default profile of a URL.
+    pub fn from_url(url: &str) -> Self {
+        Self::from_operator(crate::operator::OperatorSpec::from_url(url))
+    }
+
+    /// The service target of the operator, normalized when it resolves (else as written).
+    pub fn target(&self) -> TargetSpec {
+        let t = self.operator.target_spec();
+        t.normalized().unwrap_or(t)
     }
 
     /// Check every value; errors are typed (`usage.invalid_argument`, or `config.unknown_option`
-    /// for backend options the service would ignore).
+    /// for service options the service would ignore).
     pub fn validate(&self) -> Result<()> {
-        self.target.normalized()?;
-        let k = &self.knobs;
-        if k.concurrency < 1 {
-            return Err(invalid("knobs.concurrency must be >= 1"));
-        }
-        if k.io_concurrency < 1 {
-            return Err(invalid("knobs.io_concurrency must be >= 1"));
-        }
-        if k.chunk_size.0 < 4096 {
-            return Err(invalid("knobs.chunk_size must be >= 4KiB"));
-        }
+        self.operator.validate()?;
+        let target = self.operator.target()?;
         let w = &self.workload;
+        if w.concurrency < 1 {
+            return Err(invalid("workload.concurrency must be >= 1"));
+        }
         if let Some(r) = w.rate
             && !(r.is_finite() && r > 0.0)
         {
@@ -1727,20 +1418,7 @@ impl Profile {
                 "workload.mix needs at least one op with weight > 0",
             ));
         }
-        let c = &self.cost;
-        if !(0.0..=1.0).contains(&c.egress_fraction) {
-            return Err(invalid("cost.egress_fraction must be within 0..1"));
-        }
-        if !(c.monthly_ops.is_finite() && c.monthly_ops >= 0.0) {
-            return Err(invalid("cost.monthly_ops must be >= 0"));
-        }
-        if !(c.stored_gib.is_finite() && c.stored_gib >= 0.0) {
-            return Err(invalid("cost.stored_gib must be >= 0"));
-        }
-        if let Some(p) = &c.provider {
-            crate::input::provider(p)?;
-        }
-        if let Some(e) = self.target.options.get("endpoint")
+        if let Some(e) = target.options.get("endpoint")
             && !e.contains("${")
         {
             crate::input::endpoint(e)?;
@@ -1749,44 +1427,10 @@ impl Profile {
         Ok(())
     }
 
-    /// Serialize to TOML. Secrets are never stored: secret options become `${ENV}` references
-    /// (existing references are kept as written), credentials embedded in URLs are dropped, and
-    /// options that merely restate the target URL are left out so the file stays as the user
-    /// wrote it.
+    /// Serialize to TOML (secrets redacted).
     pub fn to_toml(&self) -> Result<String> {
         let mut p = self.clone();
-        let t = &mut p.target;
-        if let Some(url) = t.url.clone() {
-            // Options derived from the URL (bucket, root, scheme...) are re-derived on load.
-            if let Ok(base) = TargetSpec::from_url(&url) {
-                t.options.retain(|k, v| {
-                    base.options
-                        .get(k)
-                        .is_none_or(|b| b != v || is_url_secret(k))
-                });
-                if t.scheme == base.scheme {
-                    t.scheme.clear();
-                }
-            }
-            t.url = Some(crate::util::strip_url_credentials(&url));
-        }
-        t.options = std::mem::take(&mut t.options)
-            .into_iter()
-            .map(|(k, v)| {
-                if crate::util::is_secret_key(&k) {
-                    if is_env_reference(&v) {
-                        (k, v)
-                    } else {
-                        let env = k.to_ascii_uppercase().replace('-', "_");
-                        (k, format!("${{{env}}}"))
-                    }
-                } else {
-                    let v = crate::util::strip_url_credentials(&v);
-                    (k, v)
-                }
-            })
-            .collect();
-        t.proxy = t.proxy.as_deref().map(crate::util::strip_url_credentials);
+        p.operator = p.operator.redacted();
         Ok(toml::to_string_pretty(&p)?)
     }
 
@@ -1861,14 +1505,6 @@ mod tests {
         );
         assert_eq!(n.options["region"], "auto");
         assert!(!n.options.contains_key("account_id"));
-        assert_eq!(
-            crate::analysis::cost::detect_provider("s3", n.endpoint().as_deref()),
-            Some("cloudflare-r2")
-        );
-        // A profile written from it reloads to the same target.
-        let toml = Profile::from_target(n.clone()).to_toml().unwrap();
-        let back: Profile = toml::from_str(&toml).unwrap();
-        assert_eq!(back.target.normalized().unwrap().endpoint(), n.endpoint());
 
         let mut m = TargetSpec::from_url("minio://bkt").unwrap();
         m.options
@@ -1881,12 +1517,14 @@ mod tests {
     #[test]
     fn profile_roundtrip_and_presets() {
         let src = r#"
-            [target]
+            [operator]
             url = "s3://bucket/bench"
             options = { endpoint = "http://127.0.0.1:9000" }
+            read = { chunk = "4MiB" }
 
             [workload]
-            preset = "mixed"
+            preset = "small-files"
+            concurrency = 8
             duration = "5s"
             access = "zipf:1.2"
             [[workload.mix]]
@@ -1899,15 +1537,13 @@ mod tests {
             column_size = "128KiB"
             footer_size = "16KiB"
 
-            [knobs]
-            concurrency = 8
-            chunk_size = "4MiB"
         "#;
         let p: Profile = toml::from_str(src).unwrap();
         p.validate().unwrap();
         assert_eq!(p.workload.access, Access::Zipf(1.2));
         assert_eq!(p.workload.mix.len(), 2);
-        assert_eq!(p.knobs.chunk_size, ByteSize::mib(4));
+        assert_eq!(p.operator.read.chunk, Some(ByteSize::mib(4)));
+        assert_eq!(p.workload.concurrency, 8);
         let back: Profile = toml::from_str(&p.to_toml().unwrap()).unwrap();
         assert_eq!(back, p);
         for preset in Preset::ALL {
@@ -1924,51 +1560,12 @@ mod tests {
             expand_env("a-${OPROBE_TEST_SECRET}-b").unwrap(),
             "a-s3cr3t-b"
         );
-        let mut t = TargetSpec::from_url("s3://b").unwrap();
-        t.options.insert("secret_access_key".into(), "plain".into());
-        let toml = Profile::from_target(t).to_toml().unwrap();
-        assert!(!toml.contains("plain"));
-        assert!(toml.contains("${SECRET_ACCESS_KEY}"));
-    }
-
-    #[test]
-    fn to_toml_keeps_env_references_and_drops_derived_values() {
-        let mut t = TargetSpec::from_url("s3://bkt/pre").unwrap();
-        t.options
-            .insert("secret_access_key".into(), "${MY_SK}".into());
-        t.options.insert(
-            "server_side_encryption_customer_key".into(),
-            "c3VwZXJzZWNyZXQ=".into(),
-        );
-        t.options
-            .insert("endpoint".into(), "http://ak:sk@minio:9000".into());
-        let p = Profile::from_target(t.normalized().unwrap());
+        let mut p = Profile::from_url("s3://b");
+        p.operator
+            .options
+            .insert("secret_access_key".into(), "plain".into());
         let toml = p.to_toml().unwrap();
-        assert!(toml.contains("secret_access_key = \"${MY_SK}\""), "{toml}");
-        assert!(
-            toml.contains("${SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY}"),
-            "{toml}"
-        );
-        assert!(!toml.contains("c3VwZXJzZWNyZXQ"), "{toml}");
-        assert!(!toml.contains("ak:sk"), "{toml}");
-        assert!(
-            !toml.contains("region"),
-            "defaulted region is not persisted: {toml}"
-        );
-        assert!(
-            !toml.contains("bucket"),
-            "URL-derived options are not repeated: {toml}"
-        );
-        assert!(
-            !toml.contains("scheme"),
-            "derived scheme is not written: {toml}"
-        );
-        let back: Profile = toml::from_str(&toml).unwrap();
-        back.validate().unwrap();
-        let n = back.target.normalized().unwrap();
-        assert_eq!(n.scheme, "s3");
-        assert_eq!(n.options["bucket"], "bkt");
-        assert_eq!(n.options["endpoint"], "http://minio:9000");
+        assert!(!toml.contains("plain"), "{toml}");
     }
 
     #[test]
@@ -1981,9 +1578,6 @@ mod tests {
         assert_eq!(t.options["password"], "hunter2");
         assert!(!t.display().contains("hunter2"), "{}", t.display());
         assert!(!t.endpoint().unwrap().contains("alice"));
-        let toml = Profile::from_target(t).to_toml().unwrap();
-        assert!(!toml.contains("hunter2"), "{toml}");
-        assert!(toml.contains("${PASSWORD}"), "{toml}");
         let mut s3 = TargetSpec::from_url("s3://b").unwrap();
         s3.options
             .insert("endpoint".into(), "https://k:s@minio.local".into());
@@ -1993,96 +1587,6 @@ mod tests {
         assert!(!n.options.contains_key("region"));
         if std::env::var("AWS_REGION").is_err() {
             assert!(n.resolved_options().unwrap().contains_key("region"));
-        }
-    }
-}
-
-/// Fully commented profile template for `oprobe init`.
-pub fn template(preset: Preset, target: &str) -> String {
-    let (ds, mix) = preset.defaults();
-    let mix_toml: String = mix
-        .iter()
-        .map(|m| {
-            let mut t = toml::to_string(m).unwrap_or_default();
-            t = t.lines().map(|l| format!("{l}\n")).collect();
-            format!("[[workload.mix]]\n{t}\n")
-        })
-        .collect();
-    format!(
-        r#"# oprobe profile — {desc}
-# Run:  oprobe run --profile this.toml        Tune: oprobe tune --profile this.toml
-# Docs: https://github.com/hxddh/oprobe/blob/main/docs/workloads.md
-
-[target]
-url = "{target}"
-# Backend options are passed to Apache OpenDAL. Never paste secrets: reference env vars.
-[target.options]
-# region = "us-east-1"
-# endpoint = "https://s3.us-east-1.amazonaws.com"     # MinIO / R2 / Ceph / private clouds
-# access_key_id = "${{AWS_ACCESS_KEY_ID}}"
-# secret_access_key = "${{AWS_SECRET_ACCESS_KEY}}"
-
-[workload]
-preset = "{slug}"
-duration = "30s"            # measurement window
-warmup = "5s"               # connections & caches warm up before measuring
-access = "uniform"          # uniform | zipf:1.1 | hotset:0.2/0.8
-# rate = 200.0              # open-loop ops/s (latency measured from intended start)
-# max_ops = 10000           # stop after N ops (deterministic CI runs)
-verify = true               # CRC32C-verify whole-object reads and sampled writes
-cleanup = true              # delete test data under oprobe-run-*/ afterwards
-
-[workload.dataset]
-objects = {objects}
-object_size = "{size}"
-partitions = {parts}
-# existing_prefix = "warehouse/events/"   # benchmark your real objects (read-only)
-# persist = true                          # keep the generated dataset for later runs
-
-# Operation mix (defaults of the preset; edit or extend):
-{mix_toml}[knobs]
-concurrency = 16            # concurrent operations
-io_concurrency = 4          # per-operation reader/writer parallelism
-chunk_size = "8MiB"         # reader/writer chunk = multipart part size
-range_gap = "64KiB"         # merge vectored ranges closer than this
-max_inflight_requests = 0   # cap on in-flight HTTP requests (0 = unlimited)
-http_version = "auto"       # auto | h1 | h2
-keep_alive = true
-cache = false               # in-memory read cache
-cache_size = "256MiB"
-retries = 3
-tail_cut = false            # cancel & retry stragglers above adaptive p95
-timeout = "60s"
-
-[sla]                       # `oprobe run` / `tune` exit 3 when breached (`--sla none` disables)
-enforce = true              # corrupted data always breaches the SLA
-max_error_rate = 0.01       # fraction of failed operations
-# p99_ms = 200.0            # per-operation p99 limit; tune rejects configurations above it
-# max_throttle_rate = 0.0   # fraction of throttled operations (unset: tune rejects any throttling)
-
-[cost]
-# provider = "aws-s3"       # aws-s3 | gcs | azure-blob | cloudflare-r2 | backblaze-b2 | aliyun-oss
-monthly_ops = 100000000     # project measured per-op cost to this monthly volume
-stored_gib = 1024
-egress_fraction = 0.0       # share of downloads leaving the cloud
-"#,
-        desc = preset.describe(),
-        slug = preset.slug(),
-        objects = ds.objects,
-        size = ds.object_size,
-        parts = ds.partitions,
-    )
-}
-
-#[cfg(test)]
-mod template_tests {
-    #[test]
-    fn templates_parse() {
-        for p in super::Preset::ALL {
-            let t = super::template(p, "s3://b/x");
-            let prof: super::Profile =
-                toml::from_str(&t).unwrap_or_else(|e| panic!("{p:?}: {e}\n{t}"));
-            prof.validate().unwrap();
         }
     }
 }

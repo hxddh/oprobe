@@ -7,10 +7,91 @@
 use std::borrow::Cow;
 use std::net::SocketAddr;
 
-use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::error::ErrorCode;
+
+/// Why a request or an operation failed: the stable dotted codes a trace row carries
+/// (`storage.throttled`, `net.timeout`, …). They are a subset of the oprobe CLI's error codes and
+/// serialize to the same strings, so files stay readable when the CLI adds codes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[non_exhaustive]
+pub enum FailureCode {
+    /// No response: the connection could not be made or broke.
+    #[serde(rename = "net.unreachable")]
+    NetUnreachable,
+    /// The request or I/O timed out (including a tail-cut).
+    #[serde(rename = "net.timeout")]
+    NetTimeout,
+    /// 401 or 403, or a permission error.
+    #[serde(rename = "auth.denied")]
+    AuthDenied,
+    /// 404.
+    #[serde(rename = "storage.not_found")]
+    StorageNotFound,
+    /// 429 or 503 (`SlowDown`, `TooManyRequests`, …).
+    #[serde(rename = "storage.throttled")]
+    StorageThrottled,
+    /// The service does not support the operation.
+    #[serde(rename = "storage.unsupported")]
+    StorageUnsupported,
+    /// The operator is misconfigured.
+    #[serde(rename = "config.invalid")]
+    ConfigInvalid,
+    /// Anything else (other 4xx/5xx, unexpected errors).
+    #[serde(rename = "internal")]
+    Internal,
+}
+
+impl FailureCode {
+    /// The dotted string (`storage.throttled`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NetUnreachable => "net.unreachable",
+            Self::NetTimeout => "net.timeout",
+            Self::AuthDenied => "auth.denied",
+            Self::StorageNotFound => "storage.not_found",
+            Self::StorageThrottled => "storage.throttled",
+            Self::StorageUnsupported => "storage.unsupported",
+            Self::ConfigInvalid => "config.invalid",
+            Self::Internal => "internal",
+        }
+    }
+
+    /// The code of an operation that failed with error class `class` (`rate_limited`,
+    /// `timeout`, …).
+    pub fn from_class(class: &str) -> Self {
+        match class {
+            "rate_limited" => Self::StorageThrottled,
+            "permission_denied" => Self::AuthDenied,
+            "not_found" => Self::StorageNotFound,
+            "config_invalid" => Self::ConfigInvalid,
+            "unsupported" => Self::StorageUnsupported,
+            "timeout" | "tail_cut" => Self::NetTimeout,
+            "connect" | "network" => Self::NetUnreachable,
+            _ => Self::Internal,
+        }
+    }
+
+    /// The code of a backend request answered with HTTP `status` (0: no response); `None` for
+    /// a success.
+    pub fn from_status(status: u16) -> Option<Self> {
+        match status {
+            0 => Some(Self::NetUnreachable),
+            429 | 503 => Some(Self::StorageThrottled),
+            401 | 403 => Some(Self::AuthDenied),
+            404 => Some(Self::StorageNotFound),
+            400..=599 => Some(Self::Internal),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for FailureCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 
 fn is_zero(v: &u64) -> bool {
     *v == 0
@@ -21,7 +102,9 @@ fn is_false(v: &bool) -> bool {
 }
 
 /// Wire protocol of one request.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[cfg_attr(not(feature = "__internal"), non_exhaustive)]
 pub enum WireProtocol {
     #[default]
     #[serde(rename = "h1")]
@@ -44,7 +127,9 @@ impl From<crate::Protocol> for WireProtocol {
 }
 
 /// TLS details of the connection a request used (when the transport reports them).
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[cfg_attr(not(feature = "__internal"), non_exhaustive)]
 pub struct TlsRow {
     pub resumed: bool,
     pub version: String,
@@ -59,7 +144,9 @@ pub struct TlsRow {
 
 /// Kernel TCP statistics of the connection at request end (Linux `TCP_INFO`, macOS
 /// `TCP_CONNECTION_INFO`). Counters are totals over the connection's life so far.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[cfg_attr(not(feature = "__internal"), non_exhaustive)]
 pub struct TcpRow {
     /// Smoothed round-trip time.
     pub rtt_us: u64,
@@ -103,7 +190,9 @@ pub struct TcpRow {
 /// Details of one request beyond the stage timings (design v5 §3): what the server said
 /// (M10), kernel upload timing (M4), HTTP/2 stream waits (M5) and dial waits. Sparse: only
 /// requests that have any of them carry it.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[cfg_attr(not(feature = "__internal"), non_exhaustive)]
 pub struct ReqDetail {
     /// The provider's error code from the error body or header (S3 `SlowDown`,
     /// `InternalError`; GCS `rateLimitExceeded`; Azure `ServerBusy`), read from the first
@@ -157,7 +246,9 @@ impl ReqDetail {
 }
 
 /// One backend request (an HTTP exchange, or an in-process backend call).
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[cfg_attr(not(feature = "__internal"), non_exhaustive)]
 pub struct ReqRow {
     /// Start, µs from the measurement window start (negative: before the window).
     pub t_us: i64,
@@ -176,7 +267,7 @@ pub struct ReqRow {
     pub conn_id: u64,
     /// Remote `ip:port` (the proxy's when tunnelling).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(with = "Option<String>")]
+    #[cfg_attr(feature = "schemars", schemars(with = "Option<String>"))]
     pub remote: Option<SocketAddr>,
     pub queue_us: u64,
     #[serde(default, skip_serializing_if = "is_zero")]
@@ -200,7 +291,7 @@ pub struct ReqRow {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_after_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error_code: Option<ErrorCode>,
+    pub error_code: Option<FailureCode>,
     /// Error detail (transport or backend message).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -226,7 +317,9 @@ impl ReqRow {
 }
 
 /// Where the wall time of one operation went (µs; the parts sum to `latency_us`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[cfg_attr(not(feature = "__internal"), non_exhaustive)]
 pub struct OpBreakdownUs {
     pub queue_us: u64,
     pub cache_us: u64,
@@ -236,7 +329,9 @@ pub struct OpBreakdownUs {
 }
 
 /// One measured logical operation.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[cfg_attr(not(feature = "__internal"), non_exhaustive)]
 pub struct OpRow {
     pub op_id: u64,
     /// Workload verb, e.g. `read.range`, `write.multipart`.
@@ -250,7 +345,7 @@ pub struct OpRow {
     pub bytes: u64,
     pub ok: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error_code: Option<ErrorCode>,
+    pub error_code: Option<FailureCode>,
     /// Error class / detail of a failed operation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -268,7 +363,9 @@ pub struct OpRow {
 }
 
 /// What the run file's trace rows cover.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[cfg_attr(not(feature = "__internal"), non_exhaustive)]
 pub struct TraceInfo {
     pub max_requests_count: u64,
     pub ops_seen_count: u64,

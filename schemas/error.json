@@ -70,9 +70,9 @@
       "type": "string"
     }
   },
-  "$id": "https://github.com/hxddh/oprobe/schemas/5/error.json",
+  "$id": "https://github.com/hxddh/oprobe/schemas/6/error.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "description": "The error document of json/ndjson modes",
+  "description": "The error document printed under `-o json`",
   "properties": {
     "error": {
       "$ref": "#/$defs/ErrorBody"

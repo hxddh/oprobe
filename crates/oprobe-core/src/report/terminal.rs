@@ -1,4 +1,5 @@
-//! Human-oriented terminal rendering of reports.
+//! The full profile of `oprobe show` (`--detail` adds every section), rendered from the
+//! presentation model ([`super::view`]).
 
 use std::fmt::Write as _;
 
@@ -7,7 +8,7 @@ use super::style::*;
 use crate::analysis::diagnosis::Severity;
 use crate::model::{OpRow, ReqRow, Run, VerdictLevel, WireProtocol};
 use crate::trace::{ApiStats, VerbStats};
-use crate::util::{fmt_bytes, fmt_ms, fmt_usd};
+use crate::util::{fmt_bytes, fmt_ms};
 
 /// `HEALTHY` / `REVIEW` / `ATTENTION` / `CRITICAL` badge of a verdict level.
 pub fn verdict_badge(level: VerdictLevel) -> String {
@@ -31,35 +32,28 @@ pub fn severity_icon(s: Severity) -> String {
     }
 }
 
-/// Render the time-share bars (used by run reports and the TUI-less live view).
-pub fn time_share_lines(r: &Report) -> String {
-    let time = super::view::TimeView::of(r);
+/// Bars of stage shares: `(key, title, ratio)`, the largest highlighted.
+fn share_bars(rows: &[super::view::StageShare]) -> String {
     let mut out = String::new();
-    let rows: Vec<(&str, f64, &str)> = time
-        .stages
-        .iter()
-        .map(|s| (s.name, s.ratio, s.description))
-        .collect();
-    let max = rows.iter().map(|r| r.1).fold(0.0, f64::max).max(1e-9);
-    for (name, v, desc) in rows {
-        if v < 0.0005 && name != "server" {
+    let max = rows.iter().map(|r| r.ratio).fold(0.0, f64::max).max(1e-9);
+    for r in rows {
+        if r.ratio < 0.0005 && r.key != "server" {
             continue;
         }
-        let b = bar(v / max, 20);
-        let colored = if (v - max).abs() < 1e-12 {
+        let b = bar(r.ratio / max, 20);
+        let colored = if (r.ratio - max).abs() < 1e-12 {
             magenta(&b)
         } else {
             dim(&b)
         };
-        let _ = writeln!(
-            out,
-            "  {:<9} {colored} {:>5.1}%  {}",
-            name,
-            v * 100.0,
-            dim(desc)
-        );
+        let _ = writeln!(out, "  {:<14} {colored} {:>5.1}%", r.title, r.ratio * 100.0);
     }
     out
+}
+
+/// The time-share bars of every operation.
+pub fn time_share_lines(r: &Report) -> String {
+    share_bars(&super::view::TimeView::of(r, None).stages)
 }
 
 /// `✓ met (failed ops ≤ 1%, no corrupted data)` or `✖ BREACHED: …`.
@@ -452,17 +446,16 @@ fn render_with(r: &Report, run: Option<&Run>, detail: bool) -> String {
         out,
         "{}",
         dim(&format!(
-            "{} · {:.1}s measured · {} · client {} · {}",
-            r.workload.preset,
+            "{} · {:.1}s {} · {} · {}",
+            r.workload_label(),
             r.run.window_s,
-            if let Some(rate) = r.workload.rate_per_s {
+            if r.is_trace() { "recorded" } else { "measured" },
+            if r.is_trace() {
+                format!("{} requests", r.connections.requests)
+            } else if let Some(rate) = r.workload.rate_per_s {
                 format!("open loop {rate} ops/s")
             } else {
-                format!("{} workers", r.knobs.requested.concurrency_count)
-            },
-            match r.knobs.requested.transport {
-                crate::config::TransportMode::Opendal => "OpenDAL reqwest",
-                crate::config::TransportMode::Microscope => "microscope",
+                format!("{} workers", r.spec.profile.workload.concurrency)
             },
             r.run.started_at
         ))
@@ -560,22 +553,6 @@ fn render_with(r: &Report, run: Option<&Run>, detail: bool) -> String {
         ),
     );
     kv(&mut out, "sla", &sla_line(r));
-    if r.cost.applicable && sm.ops > 0 {
-        kv(
-            &mut out,
-            "cost",
-            &format!(
-                "{} per 1M ops · {} /month ({}){}",
-                fmt_usd(r.cost.selected.per_million_ops_usd),
-                fmt_usd(r.cost.selected.total_usd),
-                r.cost.selected.provider,
-                match crate::analysis::cost::storage_label(&r.cost) {
-                    l if l.is_empty() => l,
-                    l => format!(" {}", dim(&l)),
-                }
-            ),
-        );
-    }
     if let Some(ol) = &r.open_loop {
         kv(
             &mut out,
@@ -590,17 +567,18 @@ fn render_with(r: &Report, run: Option<&Run>, detail: bool) -> String {
         );
     }
 
-    if !r.findings.is_empty() {
+    let view = super::view::ProfileView::of(r, run);
+    if !view.findings.is_empty() {
         section(&mut out, "FINDINGS");
-        for f in super::view::findings_by_severity(r) {
+        for f in &view.findings {
             let _ = writeln!(
                 out,
                 "  {} {} {}",
                 severity_icon(f.severity),
-                bold(f.cause),
+                bold(&f.cause),
                 dim(&format!("[{}]", f.code))
             );
-            for l in wrap_text(f.evidence, WIDTH - 4) {
+            for l in wrap_text(&f.evidence, WIDTH - 4) {
                 let _ = writeln!(out, "    {}", dim(&l));
             }
             if detail {
@@ -613,11 +591,17 @@ fn render_with(r: &Report, run: Option<&Run>, detail: bool) -> String {
                     let _ = writeln!(out, "    {}", dim(&l));
                 }
             }
-            for (i, l) in wrap_text(f.advice, WIDTH - 6).iter().enumerate() {
+            for (i, l) in wrap_text(
+                &format!("remedy: {} — {}", f.remedy_label(), f.remedy),
+                WIDTH - 6,
+            )
+            .iter()
+            .enumerate()
+            {
                 let _ = writeln!(out, "    {} {l}", if i == 0 { "→" } else { " " });
             }
-            if let Some(rerun) = f.rerun {
-                let _ = writeln!(out, "    {} {}", dim("try:"), rerun);
+            if let Some(next) = &f.next {
+                let _ = writeln!(out, "    {} {next}", dim("next:"));
             }
         }
     }
@@ -626,7 +610,11 @@ fn render_with(r: &Report, run: Option<&Run>, detail: bool) -> String {
         &mut out,
         "WHERE THE TIME GOES  (share of operation wall time)",
     );
-    out.push_str(&time_share_lines(r));
+    out.push_str(&share_bars(&view.time.stages));
+    if !view.time.tail.is_empty() {
+        let _ = writeln!(out, "  {}", dim("the slowest 1% of operations:"));
+        out.push_str(&share_bars(&view.time.tail));
+    }
     if detail {
         let p = &r.stages.request_p99;
         let _ = writeln!(
@@ -805,84 +793,6 @@ fn render_with(r: &Report, run: Option<&Run>, detail: bool) -> String {
         );
     }
 
-    if r.cost.applicable && sm.ops > 0 {
-        let cst = &r.cost;
-        section(
-            &mut out,
-            &format!(
-                "COST  ({} · {:.0}M ops/month · egress {:.0}%)",
-                cst.selected.provider,
-                cst.monthly_ops / 1e6,
-                cst.egress_fraction * 100.0
-            ),
-        );
-        let sel = &cst.selected;
-        let _ = writeln!(
-            out,
-            "  {} per 1M ops → {} /month",
-            bold(&fmt_usd(sel.per_million_ops_usd)),
-            bold(&fmt_usd(sel.total_usd))
-        );
-        let _ = writeln!(
-            out,
-            "  requests {} · egress {} · storage {} for {:.0} GiB{}",
-            fmt_usd(sel.requests_usd),
-            fmt_usd(sel.egress_usd),
-            fmt_usd(sel.storage_usd),
-            cst.stored_gb,
-            match crate::analysis::cost::storage_label(cst) {
-                l if l.is_empty() => l,
-                l => format!(" {}", dim(&l)),
-            }
-        );
-        if sel.failed_requests_usd > 0.005
-            || sel.overread_usd > 0.005
-            || sel.cache_savings_usd > 0.005
-        {
-            let _ = writeln!(
-                out,
-                "  waste: failed {} · over-read {} · cache saved {}",
-                fmt_usd(sel.failed_requests_usd),
-                fmt_usd(sel.overread_usd),
-                fmt_usd(sel.cache_savings_usd)
-            );
-        }
-        if detail {
-            let u = &cst.per_op;
-            let _ = writeln!(
-                out,
-                "  {}",
-                dim(&format!(
-                    "per op: {:.2} write · {:.2} list · {:.2} read requests · {} down · {} up",
-                    u.write_requests,
-                    u.list_requests,
-                    u.read_requests,
-                    fmt_bytes(u.download_bytes as u64),
-                    fmt_bytes(u.upload_bytes as u64)
-                ))
-            );
-        }
-        let mut cmp: Vec<_> = cst.comparison.iter().collect();
-        cmp.sort_by(|a, b| a.total_usd.total_cmp(&b.total_usd));
-        if !cmp.is_empty() {
-            let line: Vec<String> = cmp
-                .iter()
-                .map(|c| format!("{} {}", c.key, fmt_usd(c.total_usd)))
-                .collect();
-            if detail {
-                let _ = writeln!(
-                    out,
-                    "  {}",
-                    dim(&format!("elsewhere: {}", line.join(" · ")))
-                );
-            } else {
-                for chunk in line.chunks(3) {
-                    let _ = writeln!(out, "  {}", dim(&chunk.join(" · ")));
-                }
-            }
-        }
-    }
-
     if detail && !r.timeline.is_empty() {
         section(&mut out, "TIMELINE  (per second)");
         let rows: Vec<Vec<String>> = r
@@ -932,37 +842,79 @@ fn render_with(r: &Report, run: Option<&Run>, detail: bool) -> String {
     }
 
     if detail {
-        section(&mut out, "CONFIGURATION");
-        let k = &r.knobs.requested;
-        let _ = writeln!(out, "  knobs      {}", k.to_knobs().summary());
-        let e = &r.knobs.effective;
-        if e.write_chunk_clamped() {
+        section(
+            &mut out,
+            "OPERATOR  (layers innermost first; ← the findings they remedy)",
+        );
+        let _ = writeln!(out, "  {}", view.operator.url);
+        let layers: &[_] = if r.is_trace() {
             let _ = writeln!(
                 out,
-                "  effective  write chunk {} (requested {})",
-                fmt_bytes(e.write_chunk_bytes),
-                fmt_bytes(k.chunk_bytes)
+                "  {}",
+                dim(
+                    "layers and options not recorded: the trace saw the requests, not the application's operator"
+                )
+            );
+            &[]
+        } else {
+            &view.operator.layers
+        };
+        for l in layers {
+            let mark = if l.remedy_of.is_empty() {
+                String::new()
+            } else {
+                yellow(&format!("  ← {}", l.remedy_of.join(", ")))
+            };
+            match &l.rust {
+                Some(code) => {
+                    let _ = writeln!(out, "  {} {code}{mark}", green("●"));
+                }
+                None => {
+                    let _ = writeln!(out, "  {} {}{mark}", dim("○"), dim(&l.name));
+                }
+            }
+        }
+        let opts: Vec<String> = view
+            .operator
+            .options
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .filter(|_| !r.is_trace())
+            .collect();
+        for l in wrap_text(&opts.join(" · "), WIDTH - 4) {
+            let _ = writeln!(out, "  {}", dim(&l));
+        }
+        section(&mut out, "CONFIGURATION");
+        let w = &r.workload;
+        if r.is_trace() {
+            let _ = writeln!(
+                out,
+                "  workload   {} · the application's own traffic (oprobe drove nothing; written by oprobe-trace {})",
+                r.workload_label(),
+                r.run.oprobe_version
+            );
+        } else {
+            let _ = writeln!(
+                out,
+                "  workload   {} · {} objects × {} · access {} · seed {}",
+                w.preset,
+                w.dataset.objects_count,
+                fmt_bytes(w.dataset.object_size_bytes),
+                w.access,
+                w.seed
             );
         }
-        let w = &r.workload;
-        let _ = writeln!(
-            out,
-            "  workload   {} · {} objects × {} · access {} · seed {}",
-            w.preset,
-            w.dataset.objects_count,
-            fmt_bytes(w.dataset.object_size_bytes),
-            w.access,
-            w.seed
-        );
         for (k, v) in &r.target.options {
             let _ = writeln!(out, "  option     {k}={v}");
         }
         let h = &r.run.host;
-        let _ = writeln!(
-            out,
-            "  host       {}/{} · {} CPUs · {}",
-            h.os, h.arch, h.cpus_count, h.hostname_hash
-        );
+        if !h.os.is_empty() {
+            let _ = writeln!(
+                out,
+                "  host       {}/{} · {} CPUs · {}",
+                h.os, h.arch, h.cpus_count, h.hostname_hash
+            );
+        }
         let t = &r.run.trace;
         let _ = writeln!(
             out,
@@ -975,12 +927,38 @@ fn render_with(r: &Report, run: Option<&Run>, detail: bool) -> String {
         );
     }
 
-    section(&mut out, "CLEANUP");
-    let cl = &r.cleanup;
+    // A production trace wrote nothing: there is no cleanup to report.
+    if !r.is_trace() {
+        cleanup_section(&mut out, &r.cleanup);
+    }
+
+    if !r.run.id.is_empty() {
+        let _ = writeln!(
+            out,
+            "\n{}",
+            dim(&format!(
+                "more: oprobe show {0} --detail · oprobe show {0} --by stage|api|conn",
+                crate::model::spec::shell_quote(r.show_ref())
+            ))
+        );
+    }
+    if detail {
+        out
+    } else {
+        out.lines()
+            .map(|l| fit(l, WIDTH))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n"
+    }
+}
+
+fn cleanup_section(out: &mut String, cl: &crate::engine::CleanupSummary) {
+    section(out, "CLEANUP");
     if !cl.enabled {
         let _ = writeln!(
             out,
-            "  {} test data kept under {} (remove with `oprobe cleanup`)",
+            "  {} test data kept under {} (cleanup was off)",
             yellow("●"),
             cl.prefix
         );
@@ -998,7 +976,7 @@ fn render_with(r: &Report, run: Option<&Run>, detail: bool) -> String {
     } else {
         let _ = writeln!(
             out,
-            "  {} {} objects remain under {}{} — run `oprobe cleanup`",
+            "  {} {} objects remain under {}{} — remove them with your storage tools",
             red("✖"),
             cl.remaining,
             cl.prefix,
@@ -1010,26 +988,6 @@ fn render_with(r: &Report, run: Option<&Run>, detail: bool) -> String {
     }
     if let Some(ds) = &cl.kept_dataset {
         let _ = writeln!(out, "  {}", dim(&format!("dataset left in place: {ds}")));
-    }
-
-    if !r.run.id.is_empty() {
-        let _ = writeln!(
-            out,
-            "\n{}",
-            dim(&format!(
-                "more: oprobe runs show {} --detail · -o html > report.html",
-                r.run.id
-            ))
-        );
-    }
-    if detail {
-        out
-    } else {
-        out.lines()
-            .map(|l| fit(l, WIDTH))
-            .collect::<Vec<_>>()
-            .join("\n")
-            + "\n"
     }
 }
 
@@ -1062,7 +1020,7 @@ mod tests {
     fn full_report_fits_80_columns_and_detail_adds_sections() {
         set(false);
         let mut run = super::super::fixture::run();
-        run.report.findings[0].advice = "word ".repeat(60);
+        run.report.findings[0].remedy.text = "word ".repeat(60);
         run.report.target.display = format!("s3://{}", "b".repeat(120));
         let text = render_run(&run);
         for l in text.lines() {
@@ -1075,13 +1033,20 @@ mod tests {
             "OPERATIONS",
             "SLOWEST OPERATION",
             "CLEANUP",
-            "try: oprobe run --from 20261120-143005-a1b2 --set concurrency=16",
+            "next: oprobe prove 20261120-143005-a1b2 throttling",
+            "remedy: layers.concurrent_limit.http",
             "--detail",
         ] {
             assert!(text.contains(s), "{s}\n{text}");
         }
         let detail = render_run_with(&run, true);
-        for s in ["TIMELINE", "CONFIGURATION", "SLOWEST OPERATIONS", "p99.9"] {
+        for s in [
+            "TIMELINE",
+            "CONFIGURATION",
+            "OPERATOR",
+            "SLOWEST OPERATIONS",
+            "p99.9",
+        ] {
             assert!(detail.contains(s), "{s}");
         }
     }

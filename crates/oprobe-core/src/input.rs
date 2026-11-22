@@ -11,7 +11,7 @@
 
 use std::time::Duration;
 
-use crate::config::{Access, Addressing, Preset};
+use crate::config::{Access, Preset};
 use crate::errors::{ErrorCode, OprobeError};
 use crate::net::HttpVersion;
 use crate::util::ByteSize;
@@ -303,17 +303,18 @@ pub fn boolean(what: &str, raw: &str) -> Result<bool, OprobeError> {
 /// A workload preset (aliases: `lakehouse`, `small`, `meta`, `ckpt`, …).
 pub fn preset(raw: &str) -> Result<Preset, OprobeError> {
     let mut table: Vec<(&str, Preset)> = Preset::ALL.iter().map(|p| (p.slug(), *p)).collect();
+    // The 5.x names map to the preset that keeps their access pattern.
     table.extend([
-        ("lakehouse", Preset::Parquet),
-        ("ckpt", Preset::Checkpoint),
         ("small", Preset::SmallFiles),
-        ("meta", Preset::Metadata),
-        ("suffix", Preset::ParquetSuffix),
-        ("deleter", Preset::Delete),
-        ("churn", Preset::Delete),
-        ("paged-list", Preset::ListPaged),
-        ("presigned", Preset::Presign),
-        ("conditional-writes", Preset::Conditional),
+        ("large", Preset::LargeObjects),
+        ("checkpoint", Preset::LargeObjects),
+        ("parquet", Preset::RangeReads),
+        ("parquet-suffix", Preset::RangeReads),
+        ("ranges", Preset::RangeReads),
+        ("metadata", Preset::ListStat),
+        ("metadata-heavy", Preset::ListStat),
+        ("list-paged", Preset::ListStat),
+        ("mixed", Preset::SmallFiles),
     ]);
     let s = raw.trim().to_ascii_lowercase().replace('_', "-");
     if let Some((_, p)) = table.iter().find(|(n, _)| *n == s) {
@@ -388,47 +389,6 @@ pub fn access(raw: &str) -> Result<Access, OprobeError> {
     )
 }
 
-/// Pricing provider keys (`cost.provider`, `--provider`).
-pub const PROVIDERS: &[&str] = &[
-    "aws-s3",
-    "gcs",
-    "azure-blob",
-    "cloudflare-r2",
-    "backblaze-b2",
-    "aliyun-oss",
-];
-
-/// A pricing provider, canonical key returned. Aliases: `aws`/`s3` → `aws-s3`, `gcp`/`google`
-/// → `gcs`, `azure` → `azure-blob`, `r2` → `cloudflare-r2`, `b2` → `backblaze-b2`,
-/// `oss`/`aliyun` → `aliyun-oss`; a price table's full provider name works too.
-pub fn provider(raw: &str) -> Result<&'static str, OprobeError> {
-    let s = raw.trim().to_ascii_lowercase().replace('_', "-");
-    let alias = match s.as_str() {
-        "aws" | "s3" | "amazon" | "amazon-s3" | "aws-s3" => Some("aws-s3"),
-        "gcp" | "google" | "gcs" | "google-cloud-storage" => Some("gcs"),
-        "azure" | "azblob" | "azure-blob" => Some("azure-blob"),
-        "r2" | "cloudflare" | "cloudflare-r2" => Some("cloudflare-r2"),
-        "b2" | "backblaze" | "backblaze-b2" => Some("backblaze-b2"),
-        "oss" | "aliyun" | "alibaba" | "aliyun-oss" => Some("aliyun-oss"),
-        _ => None,
-    };
-    if let Some(a) = alias {
-        return Ok(a);
-    }
-    // The provider name of a price table (`AWS S3 Standard`).
-    if let Some(key) = crate::analysis::cost::presets()
-        .into_iter()
-        .find(|(_, p)| p.provider.eq_ignore_ascii_case(raw.trim()))
-        .map(|(k, _)| k)
-    {
-        return Ok(key);
-    }
-    Err(
-        invalid(format!("unknown pricing provider `{}`", raw.trim()))
-            .with_hint(choices_hint(raw, PROVIDERS)),
-    )
-}
-
 /// HTTP version: `auto`, `h1` (`http1`, `http/1.1`), `h2` (`http2`).
 pub fn http_version(raw: &str) -> Result<HttpVersion, OprobeError> {
     let s = raw.trim().to_ascii_lowercase();
@@ -439,21 +399,6 @@ pub fn http_version(raw: &str) -> Result<HttpVersion, OprobeError> {
         _ => Err(invalid(format!("invalid HTTP version `{}`", raw.trim()))
             .with_hint(choices_hint(&s, &["auto", "h1", "h2"]))),
     }
-}
-
-/// S3 bucket addressing: `auto`, `virtual` (`vhost`, `virtual-host`), `path`.
-pub fn addressing(raw: &str) -> Result<Addressing, OprobeError> {
-    choice(
-        "addressing style",
-        raw,
-        &[
-            ("auto", Addressing::Auto),
-            ("virtual", Addressing::Virtual),
-            ("virtual-host", Addressing::Virtual),
-            ("vhost", Addressing::Virtual),
-            ("path", Addressing::Path),
-        ],
-    )
 }
 
 /// A `lab://` scenario name.
@@ -660,12 +605,6 @@ pub mod clap {
     pub fn access(s: &str) -> Result<String, OprobeError> {
         super::access(s).map(|_| s.trim().to_owned())
     }
-    pub fn provider(s: &str) -> Result<String, OprobeError> {
-        super::provider(s).map(str::to_owned)
-    }
-    pub fn addressing(s: &str) -> Result<String, OprobeError> {
-        super::addressing(s).map(|_| s.trim().to_owned())
-    }
     pub fn endpoint(s: &str) -> Result<String, OprobeError> {
         super::endpoint(s)
     }
@@ -679,11 +618,11 @@ pub mod clap {
         super::run_ref(s)
     }
     pub fn key_value(s: &str) -> Result<String, OprobeError> {
-        super::key_value("--option", s).map(|_| s.to_owned())
+        super::key_value("PATH=VALUE", s).map(|_| s.to_owned())
     }
     pub fn set(s: &str) -> Result<String, OprobeError> {
         let (k, v) = super::key_value("--set", s)?;
-        crate::model::spec::check_set(&k, &v)?;
+        crate::model::Overrides::new().set(&k, &v)?;
         Ok(s.to_owned())
     }
     /// Money, volumes, fractions given as numbers: finite and `>= 0`.
@@ -760,10 +699,11 @@ mod tests {
     #[test]
     fn presets_access_and_providers() {
         assert_eq!(preset("small_files").unwrap(), Preset::SmallFiles);
-        assert_eq!(preset("lakehouse").unwrap(), Preset::Parquet);
-        let (c, h) = code(preset("parqet"));
+        assert_eq!(preset("parquet").unwrap(), Preset::RangeReads);
+        assert_eq!(preset("large-objects").unwrap(), Preset::LargeObjects);
+        let (c, h) = code(preset("range-raeds"));
         assert_eq!(c, ErrorCode::UsageInvalidArgument);
-        assert!(h.contains("did you mean `parquet`"), "{h}");
+        assert!(h.contains("did you mean `range-reads`"), "{h}");
         let (_, h) = code(preset("zzzzzz"));
         assert!(h.starts_with("choose:"), "{h}");
         assert_eq!(access("zipf:1.2").unwrap(), Access::Zipf(1.2));
@@ -780,25 +720,6 @@ mod tests {
         assert!(access("weird").is_err());
         assert!(access("zipf:-1").is_err());
         assert!(access("hotset:2/0.5").is_err());
-        for (a, want) in [
-            ("aws", "aws-s3"),
-            ("gcp", "gcs"),
-            ("google", "gcs"),
-            ("azure", "azure-blob"),
-            ("r2", "cloudflare-r2"),
-            ("b2", "backblaze-b2"),
-            ("oss", "aliyun-oss"),
-            ("aliyun", "aliyun-oss"),
-            ("AWS-S3", "aws-s3"),
-        ] {
-            assert_eq!(provider(a).unwrap(), want, "{a}");
-        }
-        // Every canonical key is a price table.
-        for p in PROVIDERS {
-            assert!(crate::analysis::cost::preset(p).is_some(), "{p}");
-        }
-        let (_, h) = code(provider("gcss"));
-        assert!(h.contains("did you mean `gcs`"), "{h}");
     }
 
     #[test]
@@ -829,7 +750,6 @@ mod tests {
         assert!(endpoint("not a url").is_err());
         assert_eq!(http_version("HTTP2").unwrap(), HttpVersion::H2);
         assert!(http_version("h3").is_err());
-        assert_eq!(addressing("vhost").unwrap(), Addressing::Virtual);
         assert!(lab_scenario("demo").is_ok());
         assert!(
             lab_scenario("dmeo")

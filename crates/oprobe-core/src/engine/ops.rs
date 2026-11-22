@@ -10,7 +10,8 @@ use rand::Rng;
 
 use super::dataset::{Dataset, PayloadPool, Picker};
 use super::workloads::WorkloadState;
-use crate::config::{Knobs, OpKind};
+use crate::config::OpKind;
+use crate::operator::OperatorSpec;
 use crate::trace::Recorder;
 
 /// Shared context for workers.
@@ -18,7 +19,8 @@ pub struct OpCtx {
     pub op: Operator,
     pub dataset: Arc<Dataset>,
     pub picker: Arc<Picker>,
-    pub knobs: Knobs,
+    /// The operator under test (read and write options).
+    pub spec: OperatorSpec,
     pub pool: Arc<PayloadPool>,
     pub verify: bool,
     pub recorder: Arc<Recorder>,
@@ -33,6 +35,22 @@ pub struct OpCtx {
 pub struct OpOutcome {
     pub logical_read: u64,
     pub logical_write: u64,
+}
+
+/// A reader of `path` with the operator's read options (OpenDAL's defaults where unset).
+async fn reader(ctx: &OpCtx, path: &str) -> opendal::Result<opendal::Reader> {
+    let r = &ctx.spec.read;
+    let mut b = ctx.op.reader_with(path);
+    if let Some(c) = r.chunk {
+        b = b.chunk(c.as_usize());
+    }
+    if let Some(c) = r.concurrent {
+        b = b.concurrent(c);
+    }
+    if let Some(g) = r.gap {
+        b = b.gap(g.as_usize());
+    }
+    b.await
 }
 
 pub fn verb(kind: &OpKind) -> &'static str {
@@ -76,9 +94,9 @@ pub async fn execute(
     slot: u64,
     key: &mut String,
 ) -> Result<OpOutcome> {
-    let k = &ctx.knobs;
-    let chunk = k.chunk_size.as_usize();
-    let io = k.io_concurrency.max(1);
+    let spec = &ctx.spec;
+    // The pieces a streaming multipart write hands to the writer.
+    let piece = spec.write.chunk.map_or(8 << 20, |c| c.as_usize());
     let ds = &ctx.dataset;
     let pick = |rng: &mut (dyn rand::RngCore + Send)| -> Result<&super::dataset::DataObject> {
         if ds.objects.is_empty() {
@@ -98,13 +116,7 @@ pub async fn execute(
                 let off = aligned_offset(rng, obj.size - len);
                 off..off + len
             };
-            let reader = ctx
-                .op
-                .reader_with(&obj.path)
-                .chunk(chunk)
-                .concurrent(io)
-                .await?;
-            let buf = reader.read(range).await?;
+            let buf = reader(ctx, &obj.path).await?.read(range).await?;
             if full
                 && ctx.verify
                 && let Some(expected) = obj.crc
@@ -137,13 +149,7 @@ pub async fn execute(
                 (ctx.op.stat(&obj.path).await?.content_length(), None)
             };
             let footer = footer_size.0.min(size);
-            let reader = ctx
-                .op
-                .reader_with(&obj.path)
-                .chunk(chunk)
-                .gap(k.range_gap.as_usize())
-                .concurrent(io)
-                .await?;
+            let reader = reader(ctx, &obj.path).await?;
             let f = match f {
                 Some(f) => f,
                 None => reader.read(size - footer..size).await?,
@@ -204,15 +210,17 @@ pub async fn execute(
             let data = ctx.pool.slice(rng, size.as_usize());
             let len = data.len() as u64;
             let crc = (ctx.verify && slot.is_multiple_of(8)).then(|| crate::util::crc32c(&data));
-            let mut w = ctx
-                .op
-                .writer_with(&path)
-                .chunk(chunk)
-                .concurrent(io)
-                .await?;
+            let mut w = ctx.op.writer_with(&path);
+            if let Some(c) = spec.write.chunk {
+                w = w.chunk(c.as_usize());
+            }
+            if let Some(c) = spec.write.concurrent {
+                w = w.concurrent(c);
+            }
+            let mut w = w.await?;
             let mut off = 0;
             while off < data.len() {
-                let end = (off + chunk).min(data.len());
+                let end = (off + piece).min(data.len());
                 w.write(data.slice(off..end)).await?;
                 off = end;
             }

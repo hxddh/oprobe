@@ -1,14 +1,14 @@
-//! The one measurement pipeline (design §10 safety rails included). Every surface that measures
-//! goes through here: `oprobe run` / `demo` / `run --repeat` / `matrix` / `tune`, the windows
-//! of `oprobe watch` (through [`open`]), MCP jobs and the app's runs and tunes.
+//! The one measurement pipeline (safety rails included). Every surface that measures goes
+//! through here: `oprobe run` (each operator), `demo`, every trial of `oprobe prove` and the
+//! app's runs.
 //!
 //! Order: [`Rails`] (run id, prefix, read-only check, budgets) → `--dry-run` plan (callers
 //! return [`Rails::plan`] instead of measuring) → [`open`] (refuses a spent budget, arms the
-//! guard on the cancel token, preflight before any write) → the workload window (or the tuner)
-//! → write verification → cleanup → interrupted marking → Report v3 → save.
+//! guard on the cancel token, preflight before any write) → the workload window → write
+//! verification → cleanup → interrupted marking → the report → save.
 //!
-//! Budgets are per [`Guard`]: pass the same guard to several measurements (`run --repeat`,
-//! `matrix`) to enforce one aggregate budget across the whole command.
+//! Budgets are per [`Guard`]: pass the same guard to several measurements (several operators,
+//! prove's trials) to enforce one aggregate budget across the whole command.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -17,13 +17,11 @@ use std::time::SystemTime;
 use anyhow::Result;
 
 use super::{Cancel, ProgressFn, RunOptions, Session, SessionOptions};
-use crate::config::{Knobs, Profile};
+use crate::config::Profile;
 use crate::errors::exit;
 use crate::guard::{BudgetBreach, Budgets, Guard, Plan};
-use crate::model::{Run, RunId, RunSpec, TuneReport};
-use crate::report::TuneSummary;
+use crate::model::{Run, RunId, RunSpec};
 use crate::store::RunStore;
-use crate::tune::{TuneEvent, TuneOptions};
 
 /// What the safety rails decide before a session opens.
 #[derive(Clone, Debug)]
@@ -38,8 +36,7 @@ pub struct Rails {
 
 impl Rails {
     /// Decide the rails of one measurement of `profile`; refuses (`safety.read_only`) a
-    /// read-only run that would write, and any run that would write when a read-only MCP server
-    /// started this command ([`crate::guard::check_server_read_only`]).
+    /// read-only run that would write.
     pub fn new(
         profile: &Profile,
         read_only: bool,
@@ -60,7 +57,6 @@ impl Rails {
         if read_only {
             crate::guard::check_read_only(profile)?;
         }
-        crate::guard::check_server_read_only(profile)?;
         Ok(Self {
             run_id,
             run_prefix,
@@ -82,27 +78,14 @@ impl Rails {
 
 /// A live guard enforcing `budgets` (none when empty). Share it between measurements for one
 /// aggregate budget.
-pub fn guard_for(budgets: &Budgets, profile: &Profile) -> Option<Arc<Guard>> {
-    (!budgets.is_empty())
-        .then(|| Guard::with_pricing(budgets.clone(), crate::guard::usd_per_request(profile)))
-}
-
-/// Measure a workload window, or run the tuner.
-// One per measurement; the tuner options are not worth a box.
-#[allow(clippy::large_enum_variant)]
-#[derive(Clone)]
-pub enum Mode {
-    Run,
-    Tune {
-        opts: TuneOptions,
-        on_event: Arc<dyn Fn(TuneEvent) + Send + Sync>,
-    },
+pub fn guard_for(budgets: &Budgets, _profile: &Profile) -> Option<Arc<Guard>> {
+    (!budgets.is_empty()).then(|| Guard::new(budgets.clone()))
 }
 
 /// Steps the caller may want to show.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stage {
-    /// The workload (or the tuner) ended; verification and cleanup follow.
+    /// The workload ended; verification and cleanup follow.
     Measured,
     /// Removing test data.
     CleaningUp,
@@ -126,7 +109,8 @@ pub struct Request {
     pub progress: ProgressFn,
     /// Where the run is saved (none: not saved).
     pub store: Option<RunStore>,
-    pub mode: Mode,
+    /// The `oprobe prove` this measurement is a trial of (`report.run.parent_id`).
+    pub parent_id: Option<String>,
     pub on_stage: Option<StageFn>,
     pub finalize: Option<FinalizeFn>,
     /// The run's spec. `None`: `RunSpec::new(&profile, target)` with the target name, else the
@@ -146,7 +130,7 @@ impl Request {
             cancel,
             progress,
             store: None,
-            mode: Mode::Run,
+            parent_id: None,
             on_stage: None,
             finalize: None,
             spec: None,
@@ -156,20 +140,10 @@ impl Request {
 
 /// The spec of measuring `profile` at `target_name` (or the profile's own URL).
 pub fn spec_of(profile: &Profile, target_name: Option<&str>) -> RunSpec {
-    let target_ref = target_name
+    let operator_ref = target_name
         .map(str::to_owned)
-        .or_else(|| profile.target.url.clone())
-        .unwrap_or_else(|| profile.target.display());
-    RunSpec::new(profile, target_ref)
-}
-
-/// What the tuner adds.
-pub struct Tuned {
-    pub winner: Knobs,
-    pub summary: TuneSummary,
-    /// The profile the session ran (normalized target), for code generation.
-    pub profile: Profile,
-    pub capability: opendal::Capability,
+        .unwrap_or_else(|| profile.operator.url.clone());
+    RunSpec::new(profile, operator_ref)
 }
 
 /// A finished measurement.
@@ -182,7 +156,6 @@ pub struct Measured {
     /// The cancel token fired (Ctrl-C, Stop, `cancel_run`, a budget).
     pub cancelled: bool,
     pub warnings: Vec<String>,
-    pub tuned: Option<Tuned>,
 }
 
 /// Open a session under the rails: a spent (shared) budget refuses at once, the guard is armed
@@ -227,12 +200,12 @@ pub async fn measure(req: Request) -> Result<Measured> {
         cancel,
         progress,
         store,
-        mode,
+        parent_id,
         on_stage,
         finalize,
         spec,
     } = req;
-    let mut spec = spec.unwrap_or_else(|| spec_of(&profile, target_name.as_deref()));
+    let spec = spec.unwrap_or_else(|| spec_of(&profile, target_name.as_deref()));
     let stage = |s: Stage| {
         if let Some(f) = &on_stage {
             f(s)
@@ -263,129 +236,53 @@ pub async fn measure(req: Request) -> Result<Measured> {
             return Err(e);
         }
     };
-    let (mut run, tuned) = match mode {
-        Mode::Run => {
-            let knobs = session.profile.knobs.clone();
-            // The run file is written while the run is in progress (design v5 §2).
-            if let Some(s) = &store {
-                let header = crate::store::runfile::RunHeader::new(
-                    rails.run_id.to_string(),
-                    spec.clone(),
-                    crate::model::ClientInfo::opendal(),
-                );
-                let st = crate::store::runfile::RunFileStream::create(
-                    &s.run_path(&rails.run_id.to_string()),
-                    &header,
-                    trace_max_requests,
-                )?;
-                session.stream_rows(st.clone());
-                stream = Some(st);
-            }
-            let res = session
-                .run(
-                    &knobs,
-                    &RunOptions::from_profile(&session.profile),
-                    Some(progress.clone()),
-                )
-                .await;
-            stage(Stage::Measured);
-            let (ok, bad) = if res.is_ok() && session.profile.workload.verify {
-                session.verify_writes(None).await
-            } else {
-                (0, 0)
-            };
-            stage(Stage::CleaningUp);
-            let cleanup = session.close().await;
-            let mut snap = res?;
-            snap.integrity.verified += ok;
-            snap.integrity.corrupted += bad;
-            if session.guard().is_some_and(|g| g.tripped()) {
-                snap.interrupted = true;
-            }
-            // The ceiling remembered for this target and workload (design v4 §3).
-            let history = store.as_ref().and_then(|s| {
-                let dir = s.dir().parent()?;
-                crate::analysis::capacity::load(
-                    &dir.join("capacity.toml"),
-                    &spec.target_id()?,
-                    &crate::analysis::capacity::history_key(&spec),
-                )
-            });
-            let run = crate::model::build::build_run_with(
-                crate::model::ReportInput {
-                    run_id: &rails.run_id,
-                    target_name,
-                    profile: &session.profile,
-                    knobs: &knobs,
-                    snapshot: snap,
-                    trace: session.take_trace().unwrap_or_default(),
-                    cleanup,
-                    warnings: session.warnings.clone(),
-                    started_at,
-                    ended_at: SystemTime::now(),
-                    spec: Some(spec),
-                },
-                history,
-            );
-            (run, None)
-        }
-        Mode::Tune { opts, on_event } => {
-            let outcome = crate::tune::tune(&session, &opts, on_event).await;
-            stage(Stage::Measured);
-            stage(Stage::CleaningUp);
-            let cleanup = session.close().await;
-            let outcome = outcome?;
-            let mut snap = outcome.winner_snapshot.clone();
-            if session.guard().is_some_and(|g| g.tripped()) {
-                snap.interrupted = true;
-            }
-            let recommendation = crate::tune::recommend::Recommendation::from_tune(
-                &spec,
-                &session.profile,
-                &outcome.winner,
-                &outcome.summary,
-                &session.capability,
-            )
-            .ok();
-            // The tuner's run replays as its winner.
-            spec.profile.knobs = outcome.winner.clone();
-            let mut run = crate::model::build_run(crate::model::ReportInput {
-                run_id: &rails.run_id,
-                target_name,
-                profile: &session.profile,
-                knobs: &outcome.winner,
-                snapshot: snap,
-                // The winner's window is a trial: its rows were not kept (slow ops still are).
-                trace: Default::default(),
-                cleanup,
-                warnings: session.warnings.clone(),
-                started_at,
-                ended_at: SystemTime::now(),
-                spec: Some(spec),
-            });
-            // The winner's window kept no rows: the report's capacity is the tuner's pooled
-            // estimate (`source: tune`).
-            if let Some(c) = &outcome.summary.capacity {
-                run.report.capacity = c.clone();
-            }
-            let mut tr = TuneReport::from(&outcome.summary);
-            tr.recommendation = recommendation;
-            run.report.tune = Some(tr);
-            let tuned = Tuned {
-                winner: outcome.winner,
-                summary: outcome.summary,
-                profile: session.profile.clone(),
-                capability: session.capability,
-            };
-            (run, Some(tuned))
-        }
-    };
-    // The load generator (design v5 §7): its name, version and stages, and no finding that
-    // needs a stage it cannot observe.
-    if let Some(c) = session.client() {
-        run.report.client = c.info();
-        crate::clients::suppress_unsupported(&mut run.report);
+    let knobs = crate::config::Knobs::of(&session.profile);
+    // The run file is written while the run is in progress (design v5 §2).
+    if let Some(s) = &store {
+        let header = crate::store::runfile::RunHeader::new(rails.run_id.to_string(), spec.clone());
+        let st = crate::store::runfile::RunFileStream::create(
+            &s.run_path(&rails.run_id.to_string()),
+            &header,
+            trace_max_requests,
+        )?;
+        session.stream_rows(st.clone());
+        stream = Some(st);
     }
+    let res = session
+        .run(
+            &knobs,
+            &RunOptions::from_profile(&session.profile),
+            Some(progress.clone()),
+        )
+        .await;
+    stage(Stage::Measured);
+    let (ok, bad) = if res.is_ok() && session.profile.workload.verify {
+        session.verify_writes(None).await
+    } else {
+        (0, 0)
+    };
+    stage(Stage::CleaningUp);
+    let cleanup = session.close().await;
+    let mut snap = res?;
+    snap.integrity.verified += ok;
+    snap.integrity.corrupted += bad;
+    if session.guard().is_some_and(|g| g.tripped()) {
+        snap.interrupted = true;
+    }
+    let mut run = crate::model::build::build_run(crate::model::ReportInput {
+        run_id: &rails.run_id,
+        target_name,
+        profile: &session.profile,
+        knobs: &knobs,
+        snapshot: snap,
+        trace: session.take_trace().unwrap_or_default(),
+        cleanup,
+        warnings: session.warnings.clone(),
+        started_at,
+        ended_at: SystemTime::now(),
+        spec: Some(spec),
+    });
+    run.report.run.parent_id = parent_id;
     let breach = session.guard().and_then(|g| g.breach());
     if breach.is_some() {
         run.report.verdict.exit_code = exit::BUDGET;
@@ -410,40 +307,24 @@ pub async fn measure(req: Request) -> Result<Measured> {
         })?),
         None => None,
     };
-    // Remember the ceiling for later runs of the same target and workload (best effort).
-    if let (Some(s), Some(_)) = (&store, run.report.capacity.inflight_ceiling)
-        && !run.report.run.interrupted
-        && let Some(id) = run.report.spec.target_id()
-        && let Some(dir) = s.dir().parent()
-    {
-        let _ = crate::analysis::capacity::save(
-            &dir.join("capacity.toml"),
-            &id,
-            &crate::analysis::capacity::history_key(&run.report.spec),
-            &run.report.capacity,
-            Some(run.id()),
-        );
-    }
     Ok(Measured {
         run,
         path,
         breach,
         cancelled: cancel.is_cancelled(),
         warnings: session.warnings.clone(),
-        tuned,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::TargetSpec;
 
     fn quick(url: &str) -> Profile {
-        let mut p = Profile::from_target(TargetSpec::from_url(url).unwrap());
+        let mut p = Profile::from_url(url);
         p.workload.duration = crate::util::HumanDuration(std::time::Duration::from_millis(200));
         p.workload.warmup = crate::util::HumanDuration(std::time::Duration::ZERO);
-        p.knobs.concurrency = 2;
+        p.workload.concurrency = 2;
         p
     }
 

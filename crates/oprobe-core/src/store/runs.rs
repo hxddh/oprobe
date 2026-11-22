@@ -1,4 +1,4 @@
-//! The run store: `runs/<id>.oprobe` (segmented zstd stream, format `oprobe.run/5`,
+//! The run store: `runs/<id>.oprobe` (segmented zstd stream, format `oprobe.run/6`,
 //! [`super::runfile`]) plus a
 //! `runs/<id>.json` sidecar summary for fast listing, and RUNREF resolution (design §2).
 
@@ -18,6 +18,9 @@ pub struct RunSummary {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// The `oprobe prove` this run is a trial of (hidden from `show --list` unless `--all`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_name: Option<String>,
     pub target_display: String,
@@ -30,9 +33,6 @@ pub struct RunSummary {
     pub p50_ms: f64,
     pub p99_ms: f64,
     pub error_ratio: f64,
-    /// Projected monthly cost, where cost applies.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cost_per_month_usd: Option<f64>,
     /// The run file (filled in when listing; not stored).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
@@ -58,6 +58,7 @@ impl From<&Report> for RunSummary {
         Self {
             id: r.run.id.clone(),
             label: r.run.label.clone(),
+            parent_id: r.run.parent_id.clone(),
             target_name: r.target.name.clone(),
             target_display: r.target.display.clone(),
             started_at: r.run.started_at.clone(),
@@ -69,7 +70,6 @@ impl From<&Report> for RunSummary {
             p50_ms: r.summary.latency.p50,
             p99_ms: r.summary.latency.p99,
             error_ratio: r.summary.error_rate,
-            cost_per_month_usd: r.cost.applicable.then_some(r.cost.selected.total_usd),
             path: None,
             partial: if r.verdict.exit_code == crate::errors::exit::BUDGET {
                 Some("budget".into())
@@ -90,7 +90,7 @@ impl From<&Report> for RunSummary {
     }
 }
 
-/// Encode a run as `oprobe.run/5` in memory (tests and small exports; the store streams to
+/// Encode a run as `oprobe.run/6` in memory (tests and small exports; the store streams to
 /// disk with [`super::runfile::write_run`]).
 pub fn encode_run(run: &Run) -> Result<Vec<u8>> {
     let dir = tempdir_for_encode()?;
@@ -111,7 +111,7 @@ fn tempdir_for_encode() -> Result<PathBuf> {
     Ok(d)
 }
 
-/// Decode an `oprobe.run/5` stream (a v4 or older file is refused with a hint).
+/// Decode an `oprobe.run/6` stream (a v4 or older file is refused with a hint).
 pub fn decode_run(r: impl Read) -> Result<Run> {
     super::runfile::read_run(r).map_err(|e| {
         let msg = format!("{e:#}");
@@ -259,7 +259,7 @@ impl RunStore {
     pub fn resolve(&self, r: &str) -> Result<PathBuf> {
         let unknown = |msg: String| -> anyhow::Error {
             OprobeError::new(ErrorCode::UsageUnknownRun, msg)
-                .with_hint("list runs with `oprobe runs list`")
+                .with_hint("list runs with `oprobe show --list`")
                 .into()
         };
         let p = Path::new(r);
@@ -276,6 +276,8 @@ impl RunStore {
         }
         let ids = self.ids()?;
         if let Some(rest) = r.strip_prefix("last") {
+            // `last` names the runs the user made, never prove's trials (U4).
+            let ids = self.top_level_ids()?;
             let n = match rest {
                 "" => 0,
                 _ => rest
@@ -356,40 +358,148 @@ impl RunStore {
         Ok(())
     }
 
-    /// Runs `gc` would delete: all but the newest `keep` runs, and (when given) only those
-    /// older than `older_than`; ids in `protect` (baselines) are kept.
-    pub fn gc_candidates(
-        &self,
-        keep: usize,
-        older_than: Option<std::time::Duration>,
-        protect: &std::collections::BTreeSet<String>,
-    ) -> Result<Vec<String>> {
-        let ids = self.ids()?;
-        let now = std::time::SystemTime::now();
-        let n = ids.len();
-        Ok(ids
+    /// Ids of the runs the user made (not prove trials), oldest first.
+    pub fn top_level_ids(&self) -> Result<Vec<String>> {
+        let mut v: Vec<String> = self
+            .list()?
             .into_iter()
-            .enumerate()
-            .filter(|(i, _)| *i + keep < n)
-            .map(|(_, id)| id)
-            .filter(|id| !protect.contains(id))
-            .filter(|id| match older_than {
-                None => true,
-                Some(age) => RunId::parse(id)
-                    .and_then(|r| r.started_at())
-                    .and_then(|t| now.duration_since(t).ok())
-                    .is_some_and(|a| a >= age),
-            })
+            .filter(|s| s.parent_id.is_none())
+            .map(|s| s.id)
+            .collect();
+        v.reverse();
+        Ok(v)
+    }
+
+    /// Ids of the trial runs of prove `parent`.
+    pub fn children(&self, parent: &str) -> Result<Vec<String>> {
+        Ok(self
+            .list()?
+            .into_iter()
+            .filter(|s| s.parent_id.as_deref() == Some(parent))
+            .map(|s| s.id)
             .collect())
+    }
+
+    fn prove_path(&self, id: &str) -> PathBuf {
+        self.dir.join(format!("{id}.prove.json"))
+    }
+
+    /// Save the result of a prove (`<id>.prove.json`).
+    pub fn save_prove(&self, id: &str, result: &serde_json::Value) -> Result<PathBuf> {
+        anyhow::ensure!(RunId::parse(id).is_some(), "invalid prove id `{id}`");
+        let path = self.prove_path(id);
+        super::atomic_write(&path, serde_json::to_string_pretty(result)?.as_bytes())?;
+        Ok(path)
+    }
+
+    /// The stored proves (their JSON results), newest first.
+    pub fn proves(&self) -> Result<Vec<serde_json::Value>> {
+        let rd = match std::fs::read_dir(&self.dir) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let mut v: Vec<(String, serde_json::Value)> = rd
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                let id = name.strip_suffix(".prove.json")?.to_owned();
+                let raw = std::fs::read(e.path()).ok()?;
+                Some((id, serde_json::from_slice(&raw).ok()?))
+            })
+            .collect();
+        v.sort_by(|a, b| b.0.cmp(&a.0));
+        Ok(v.into_iter().map(|x| x.1).collect())
+    }
+
+    /// Delete a stored prove and its trial runs. `false` when `id` is not a prove.
+    pub fn delete_prove(&self, id: &str) -> Result<bool> {
+        let p = self.prove_path(id);
+        if !p.is_file() {
+            return Ok(false);
+        }
+        for c in self.children(id)? {
+            self.delete(&c)?;
+        }
+        std::fs::remove_file(&p)?;
+        Ok(true)
     }
 }
 
-/// Load a run file, or a report `.json` (without trace rows).
+/// The value of the first `"format": "…"` member in `head` (the start of a JSON document;
+/// oprobe and oprobe-trace write it first).
+fn format_in_prefix(head: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(head).ok().or_else(|| {
+        // A prefix cut inside a multi-byte character: read up to it.
+        let e = std::str::from_utf8(head).err()?;
+        std::str::from_utf8(&head[..e.valid_up_to()]).ok()
+    })?;
+    let rest = &text[text.find("\"format\"")? + 8..];
+    let rest = rest.trim_start().strip_prefix(':')?.trim_start();
+    let rest = rest.strip_prefix('"')?;
+    let end = rest.find('"')?;
+    let v = &rest[..end];
+    (!v.contains('\\')).then(|| v.to_owned())
+}
+
+/// The whole file and its `format`, when `path` starts like a JSON document (a run file is a
+/// zstd stream: only its first bytes are read).
+fn json_document(path: &Path) -> Option<(Vec<u8>, String)> {
+    use std::io::Read;
+    let mut head = [0u8; 512];
+    let n = std::fs::File::open(path).ok()?.read(&mut head).ok()?;
+    if !crate::trace::TraceFile::sniff(&head[..n]) {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    let format = format_in_prefix(&bytes[..bytes.len().min(4096)]).or_else(|| {
+        #[derive(serde::Deserialize)]
+        struct Format {
+            #[serde(default)]
+            format: Option<String>,
+        }
+        serde_json::from_slice::<Format>(&bytes)
+            .ok()
+            .map(|f| f.format.unwrap_or_default())
+    });
+    Some((bytes, format.unwrap_or_default()))
+}
+
+/// Load a run file, a production trace written by `oprobe-trace` (`oprobe.trace/6`, whatever
+/// its extension: recognised by its content), or a report `.json` (without trace rows).
 pub fn load_path(path: &Path) -> Result<Run> {
+    let doc = json_document(path);
+    let format = doc.as_ref().map(|(_, f)| f.clone());
+    if let Some((bytes, f)) = doc.filter(|(_, f)| f.starts_with("oprobe.trace/")) {
+        if f != crate::trace::TRACE_FORMAT {
+            return Err(OprobeError::new(
+                ErrorCode::UsageInvalidArgument,
+                format!(
+                    "`{}` is a trace of format `{f}`; this oprobe reads `{}`",
+                    path.display(),
+                    crate::trace::TRACE_FORMAT
+                ),
+            )
+            .with_hint("open it with the oprobe release that matches the oprobe-trace version that wrote it")
+            .into());
+        }
+        let file = crate::trace::TraceFile::from_slice(&bytes, &path.display().to_string())
+            .map_err(|e| {
+                anyhow::Error::new(
+                    OprobeError::new(
+                        ErrorCode::UsageInvalidArgument,
+                        format!("cannot read trace file `{}`: {e}", path.display()),
+                    )
+                    .with_hint("save the profile again with oprobe-trace's `Handle::save`"),
+                )
+            })?;
+        drop(bytes);
+        return Ok(crate::model::trace_file::trace_run(file, path)?);
+    }
     let is_json = path
         .extension()
         .is_some_and(|e| e.eq_ignore_ascii_case("json"));
-    if is_json {
+    if is_json || format.is_some() {
         let report = crate::report::load_json(path)?;
         return Ok(Run {
             report,
@@ -403,12 +513,29 @@ pub fn load_path(path: &Path) -> Result<Run> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_format_is_read_from_the_start_of_a_document() {
+        let f = |s: &str| format_in_prefix(s.as_bytes());
+        assert_eq!(
+            f(r#"{"format":"oprobe.trace/6","x":1}"#).as_deref(),
+            Some("oprobe.trace/6")
+        );
+        assert_eq!(
+            f("{ \"format\" : \"oprobe.report/6\" }").as_deref(),
+            Some("oprobe.report/6")
+        );
+        assert_eq!(f(r#"{"x":1}"#), None);
+        assert_eq!(f(r#"{"format":"oprobe.tr"#), None);
+        // Cut inside a multi-byte character.
+        let mut b = r#"{"format":"a","k":"é"#.as_bytes().to_vec();
+        b.pop();
+        assert_eq!(format_in_prefix(&b).as_deref(), Some("a"));
+    }
     use crate::model::*;
 
     pub(crate) fn sample_run(id: &str, label: Option<&str>) -> Run {
-        let p = crate::config::Profile::from_target(
-            crate::config::TargetSpec::from_url("memory://").unwrap(),
-        );
+        let p = crate::config::Profile::from_url("memory://");
         let mut snap = crate::trace::Snapshot {
             elapsed_s: 2.0,
             ..Default::default()
@@ -419,7 +546,7 @@ mod tests {
             run_id: &rid,
             target_name: Some("local".into()),
             profile: &p,
-            knobs: &p.knobs,
+            knobs: &crate::config::Knobs::of(&p),
             snapshot: snap,
             trace: Default::default(),
             cleanup: Default::default(),
@@ -558,12 +685,28 @@ mod tests {
         // Sidecars are rebuilt when missing.
         std::fs::remove_file(d.path().join("runs/20261120-150000-c3d4.json")).unwrap();
         assert_eq!(store.list().unwrap().len(), 3);
-        // gc keeps the newest and protected runs.
-        let protect = ["20261120-143005-a1b2".to_owned()].into_iter().collect();
+        // A prove trial is a child: `last` skips it, and deleting the prove removes it.
+        let mut trial = sample_run("20261122-100000-a0a0", None);
+        trial.report.run.parent_id = Some("20261122-095959-b1b1".into());
+        store.save(&trial).unwrap();
         assert_eq!(
-            store.gc_candidates(1, None, &protect).unwrap(),
-            vec!["20261120-150000-c3d4".to_owned()]
+            store.resolve("last").unwrap(),
+            store.run_path("20261121-090000-e5f6")
         );
+        assert_eq!(
+            store.children("20261122-095959-b1b1").unwrap(),
+            vec!["20261122-100000-a0a0".to_owned()]
+        );
+        store
+            .save_prove(
+                "20261122-095959-b1b1",
+                &serde_json::json!({"prove_id": "20261122-095959-b1b1"}),
+            )
+            .unwrap();
+        assert_eq!(store.proves().unwrap().len(), 1);
+        assert!(store.delete_prove("20261122-095959-b1b1").unwrap());
+        assert!(store.children("20261122-095959-b1b1").unwrap().is_empty());
+        assert!(!store.delete_prove("20261122-095959-b1b1").unwrap());
         store.delete("20261120-150000-c3d4").unwrap();
         assert_eq!(store.ids().unwrap().len(), 2);
         assert!(store.delete("20261120-150000-c3d4").is_err());

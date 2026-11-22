@@ -1,0 +1,386 @@
+{
+  "$defs": {
+    "ByteSize": {
+      "description": "A byte size: `4MiB`, `512KiB`, `1GB` (a plain number of bytes is accepted on input).",
+      "type": "string"
+    },
+    "Cache": {
+      "additionalProperties": false,
+      "description": "`FoyerLayer` over an in-memory foyer cache.",
+      "properties": {
+        "memory": {
+          "$ref": "#/$defs/ByteSize",
+          "default": "256MiB"
+        }
+      },
+      "type": "object"
+    },
+    "ConcurrentLimit": {
+      "additionalProperties": false,
+      "description": "`ConcurrentLimitLayer`.",
+      "properties": {
+        "http": {
+          "description": "HTTP requests in flight (`with_http_concurrent_limit`).",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "operations": {
+          "description": "Operations in flight (`ConcurrentLimitLayer::new`; unset: unlimited).",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "HttpOptions": {
+      "additionalProperties": false,
+      "description": "The HTTP client (OpenDAL's reqwest `HttpFetch`).",
+      "properties": {
+        "ca_cert": {
+          "description": "An extra PEM CA bundle to trust.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "insecure": {
+          "description": "Skip TLS certificate verification (self-signed development endpoints only).",
+          "type": "boolean"
+        },
+        "keep_alive": {
+          "default": true,
+          "description": "Reuse connections.",
+          "type": "boolean"
+        },
+        "proxy": {
+          "description": "Egress proxy URL; `none` ignores HTTPS_PROXY/HTTP_PROXY (unset: the environment).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "version": {
+          "$ref": "#/$defs/HttpVersion",
+          "default": "auto",
+          "description": "`auto` (OpenDAL's default: HTTP/1.1), `h1` or `h2`."
+        }
+      },
+      "type": "object"
+    },
+    "HttpVersion": {
+      "description": "HTTP protocol preference.",
+      "oneOf": [
+        {
+          "const": "auto",
+          "description": "Negotiate via ALPN (h2 preferred for https), HTTP/1.1 for plain http.",
+          "type": "string"
+        },
+        {
+          "const": "h1",
+          "description": "Force HTTP/1.1.",
+          "type": "string"
+        },
+        {
+          "const": "h2",
+          "description": "Require HTTP/2 (ALPN for https, prior knowledge for plain http).",
+          "type": "string"
+        }
+      ]
+    },
+    "HumanDuration": {
+      "description": "A duration: `10s`, `500ms`, `2m` (plain seconds are accepted on input).",
+      "type": "string"
+    },
+    "Layers": {
+      "additionalProperties": false,
+      "description": "The layer stack: each key is one OpenDAL layer.",
+      "properties": {
+        "cache": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Cache"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "`FoyerLayer` with an in-memory cache (off by default)."
+        },
+        "concurrent_limit": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ConcurrentLimit"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "`ConcurrentLimitLayer` (off by default)."
+        },
+        "retry": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Retry"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "`RetryLayer` (on by default)."
+        },
+        "tail_cut": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TailCut"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "`TailCutLayer` (off by default)."
+        },
+        "throttle": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Throttle"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "`ThrottleLayer` (off by default)."
+        },
+        "timeout": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Timeout"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "`TimeoutLayer` (on by default)."
+        }
+      },
+      "type": "object"
+    },
+    "ReadOptions": {
+      "additionalProperties": false,
+      "description": "`read_with` / `reader_with` options (unset: OpenDAL's default).",
+      "properties": {
+        "chunk": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ByteSize"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "concurrent": {
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "gap": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ByteSize"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "Retry": {
+      "additionalProperties": false,
+      "description": "`RetryLayer` (OpenDAL's defaults: 3 times, 1 s to 60 s, factor 2, no jitter).",
+      "properties": {
+        "factor": {
+          "default": 2.0,
+          "format": "float",
+          "type": "number"
+        },
+        "jitter": {
+          "default": false,
+          "type": "boolean"
+        },
+        "max_delay": {
+          "$ref": "#/$defs/HumanDuration",
+          "default": "1m"
+        },
+        "max_times": {
+          "default": 3,
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "min_delay": {
+          "$ref": "#/$defs/HumanDuration",
+          "default": "1s"
+        }
+      },
+      "type": "object"
+    },
+    "TailCut": {
+      "additionalProperties": false,
+      "description": "`TailCutLayer`: cancel (and, through `RetryLayer`, re-issue) a request slower than the\n`percentile` of the recent latencies × `safety_factor`, the deadline clamped to\n`[min_deadline, max_deadline]`.\n\nThe defaults are what oprobe measures with, not OpenDAL's (1.3, 200 samples, 500 ms, 30 s):\na shorter warm-up and floor so that short runs can see the layer work, and a ceiling at the\noperation timeout. Generated Rust spells out every value that differs from OpenDAL's default.",
+      "properties": {
+        "max_deadline": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HumanDuration"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The longest deadline (unset: the operation timeout, `layers.timeout.op`, or 60 s without\nthe timeout layer)."
+        },
+        "min_deadline": {
+          "$ref": "#/$defs/HumanDuration",
+          "default": "50ms",
+          "description": "The shortest deadline."
+        },
+        "min_samples": {
+          "default": 32,
+          "description": "Latencies recorded before the layer cuts anything.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "percentile": {
+          "default": 95,
+          "description": "The latency percentile the deadline follows (50..99).",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "safety_factor": {
+          "default": 1.5,
+          "description": "The deadline = percentile × this factor (1..5).",
+          "format": "double",
+          "type": "number"
+        },
+        "window": {
+          "$ref": "#/$defs/HumanDuration",
+          "default": "1m",
+          "description": "The sliding window of latencies (at most 120 s)."
+        }
+      },
+      "type": "object"
+    },
+    "Throttle": {
+      "additionalProperties": false,
+      "description": "`ThrottleLayer` (bytes per second, and the largest burst).",
+      "properties": {
+        "bandwidth": {
+          "$ref": "#/$defs/ByteSize",
+          "default": "100MiB"
+        },
+        "burst": {
+          "$ref": "#/$defs/ByteSize",
+          "default": "16MiB"
+        }
+      },
+      "type": "object"
+    },
+    "Timeout": {
+      "additionalProperties": false,
+      "description": "`TimeoutLayer` (OpenDAL's defaults: 60 s per operation, 10 s per I/O).",
+      "properties": {
+        "io": {
+          "$ref": "#/$defs/HumanDuration",
+          "default": "10s",
+          "description": "`with_io_timeout`: one read or write call."
+        },
+        "op": {
+          "$ref": "#/$defs/HumanDuration",
+          "default": "1m",
+          "description": "`with_timeout`: one operation."
+        }
+      },
+      "type": "object"
+    },
+    "WriteOptions": {
+      "additionalProperties": false,
+      "description": "`writer_with` options (unset: OpenDAL's default).",
+      "properties": {
+        "chunk": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ByteSize"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "concurrent": {
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    }
+  },
+  "$id": "https://github.com/hxddh/oprobe/schemas/6/operator.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "An operator spec (oprobe.operator/6, op.toml): service, layers, read/write and HTTP options",
+  "properties": {
+    "http": {
+      "$ref": "#/$defs/HttpOptions",
+      "description": "The `HttpFetch` client's settings."
+    },
+    "layers": {
+      "$ref": "#/$defs/Layers",
+      "description": "The layer stack."
+    },
+    "options": {
+      "additionalProperties": {
+        "type": "string"
+      },
+      "description": "OpenDAL service options (checked against the service). Values may reference\nenvironment variables as `${NAME}`.",
+      "type": "object"
+    },
+    "read": {
+      "$ref": "#/$defs/ReadOptions",
+      "description": "`read_with(path)` / `reader_with(path)` options."
+    },
+    "url": {
+      "description": "The service: any OpenDAL scheme oprobe is built with (`s3://bucket/prefix`,\n`gcs://bucket`, `fs:///tmp/x`, `memory://`), or `lab://SCENARIO` for the local lab.",
+      "type": "string"
+    },
+    "write": {
+      "$ref": "#/$defs/WriteOptions",
+      "description": "`writer_with(path)` options."
+    }
+  },
+  "required": [
+    "url"
+  ],
+  "title": "oprobe operator",
+  "type": "object",
+  "x-rust-type": "OperatorSpec"
+}

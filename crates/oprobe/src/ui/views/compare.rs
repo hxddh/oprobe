@@ -1,361 +1,190 @@
-//! Compare two runs: overlaid charts (A solid, B dashed), the regression gate's checks with
-//! their significance, configuration differences and which findings came and went.
+//! Compare: two runs, or several operators run on one workload, side by side: the key numbers
+//! with the change against the first, where the time went, the findings and how each operator
+//! differs from the first.
+
+use std::rc::Rc;
 
 use nsh_base::theme;
 use nsh_core::prelude::*;
 
-use crate::analysis::verdict::NetAssessment;
-use crate::ui::chart::chart;
-use crate::ui::kit::{
-    Kind, Tone, badge, body, btn, caption, empty, num, picker, small, strong, title,
-};
-use crate::ui::model::compare::FindingChange;
-use crate::ui::model::verdicts::{self, CheckState};
-use crate::ui::model::verify::Verdict;
-use crate::ui::model::{fmt, runs};
-use crate::ui::store::store;
-use crate::ui::views::overview::{latency_plot, throughput_plot};
+use super::profile::{stage_bar, verdict_badge};
+use super::shell::{fill, page};
+use crate::ui::data::{self, ProfileModel};
+use crate::ui::fmt;
+use crate::ui::i18n::{finding_title, tr};
+use crate::ui::kit::{Kind, Tone, btn, caption, empty, mono, row_button, section, small, strong};
+use crate::ui::store::{Store, store};
 
-/// The Verify verdict over its comparison (U2): the net verdict first — the same one the
-/// comparison below shows — then whether the finding's predicted metric moved, with numbers.
-fn verdict_banner(v: Verdict, net: NetAssessment) -> View {
-    let (net_word, net_level) = verdicts::net(net.verdict);
-    let (hyp_word, _) = verdicts::verify_outcome(v.outcome);
-    let tone = Tone::of_level(net_level);
+pub fn compare() -> impl IntoElement {
+    let s = store();
+    page(view().child(picker(s)).child(dynamic(move || {
+        let (ms, loading) = (s.compared.get(), s.loading.get());
+        untracked(|| {
+            if loading {
+                empty(tr("app.loading"), "").into_element()
+            } else if ms.len() < 2 {
+                empty(tr("compare.none"), tr("compare.none_hint")).into_element()
+            } else {
+                table(&ms).into_element()
+            }
+        })
+    })))
+}
+
+fn picker(s: Store) -> View {
+    section(tr("compare.pick"))
+        .child(dynamic(move || {
+            let runs = s.runs.get();
+            untracked(|| {
+                view()
+                    .flex_row()
+                    .flex_wrap()
+                    .gap_1()
+                    .children(runs.into_iter().take(24).map(|r| {
+                        let (id, id2) = (r.id.clone(), r.id.clone());
+                        let on = computed(move || s.picked.with(|p| p.contains(&id2)));
+                        let on = move || on.get();
+                        row_button(fill("runs.pick", &[&r.id]), on, move || s.toggle_pick(&id))
+                            .border_1()
+                            .border_color(move || theme().border)
+                            .child(mono(r.id.clone()))
+                            .child(
+                                small(r.operator.clone())
+                                    .number_of_lines(1)
+                                    .max_w(px(180.0)),
+                            )
+                    }))
+                    .into_element()
+            })
+        }))
+        .child(
+            btn(
+                move || {
+                    SharedString::from(fill("runs.compare_picked", &[&s.picked.with(|p| p.len())]))
+                },
+                || Kind::Primary,
+                move || {
+                    let ids = s.picked.get_untracked();
+                    if ids.len() >= 2 {
+                        s.compare(ids)
+                    }
+                },
+            )
+            .disabled(move || s.picked.with(|p| p.len() < 2))
+            .test_id("compare-go"),
+        )
+}
+
+const COL: f32 = 170.0;
+const HEAD: f32 = 120.0;
+
+fn cell(content: impl IntoElement) -> View {
     view()
-        .gap_1()
-        .p_3()
-        .rounded(px(6.0))
-        .border_1()
-        .border_color(move || tone.color())
-        .role(AccessibilityRole::Alert)
-        .child(
-            view()
-                .flex_row()
-                .items_center()
-                .gap_2()
-                .child(badge(net_word, move || tone))
-                .child(strong(format!(
-                    "Verify {}: {}",
-                    v.code,
-                    verdicts::net_sentence(&net)
-                ))),
-        )
-        .child(
-            small(format!(
-                "hypothesis {hyp_word}: the predicted metric moved as the finding said"
-            ))
-            .selectable(true),
-        )
-        .children(
-            v.lines
-                .into_iter()
-                .map(|l| small(l).tabular_nums().selectable(true)),
-        )
+        .w(px(COL))
+        .flex_shrink_0()
+        .min_w(px(0.0))
+        .child(content)
 }
 
-/// A run as a selector item: `id · label or target`, with a mark when it measured the same
-/// target and workload as the other side.
-fn item(r: &crate::store::RunSummary, same: bool) -> (SharedString, SharedString) {
-    (
-        SharedString::from(r.id.clone()),
-        SharedString::from(format!(
-            "{}{} · {}",
-            if same { "= " } else { "" },
-            r.id,
-            r.label.clone().unwrap_or(r.target_display.clone())
-        )),
-    )
-}
-
-/// One side's selector: it shrinks (ellipsis) instead of wrapping or overlapping.
-fn side(
-    name: &'static str,
-    label: &'static str,
-    items: Memo<Vec<(SharedString, SharedString)>>,
-    value: Signal<Option<SharedString>>,
-) -> View {
+fn row(label: impl IntoReactive<SharedString>) -> View {
     view()
         .flex_row()
         .items_center()
         .gap_2()
-        .flex_1()
-        .min_w(px(0.0))
-        .max_w(px(300.0))
-        .child(strong(name).flex_shrink_0())
-        .child(dynamic(move || {
-            let it = items.get();
-            untracked(|| {
-                view()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .child(picker(label, it, value))
-                    .into_element()
-            })
-        }))
-}
-
-pub fn compare_view() -> impl IntoElement {
-    let s = store();
-    let a = signal(None::<SharedString>);
-    let b = signal(None::<SharedString>);
-    // Follow what is compared (or the run Compare was opened on, as B).
-    effect(move || {
-        let (pa, pb) = s.compare_pick.get();
-        a.set(pa.map(Into::into));
-        b.set(pb.map(Into::into));
-    });
-    // Each side lists the other side's target and workload first; built once per change of
-    // the runs or of the other side, not on every render.
-    let choices = move |other: Signal<Option<SharedString>>| {
-        computed(move || {
-            let o = other.get();
-            s.runs.with(|runs| {
-                let other_run = o
-                    .as_deref()
-                    .and_then(|id| runs.iter().find(|r| r.id == id).cloned());
-                runs::compare_choices(runs, o.as_deref())
-                    .iter()
-                    .map(|r| {
-                        let same = other_run
-                            .as_ref()
-                            .is_some_and(|x| x.id != r.id && runs::same_workload(x, r));
-                        item(r, same)
-                    })
-                    .collect::<Vec<_>>()
-            })
-        })
-    };
-    let items_a = choices(b);
-    let items_b = choices(a);
-    let cmp = s.comparison;
-    view()
-        .flex_1()
-        .min_w(px(0.0))
+        .py_1()
+        .border_b_1()
+        .border_color(move || theme().border)
         .child(
             view()
-                .flex_row()
-                .items_center()
-                .gap_2()
-                .px_3()
-                .py_2()
-                .min_w(px(0.0))
-                .border_b_1()
-                .border_color(move || theme().border)
-                .child(side("A", "Baseline run", items_a, a))
-                .child(side("B", "Candidate run", items_b, b))
-                .child(btn(
-                    "Compare",
-                    || Kind::Primary,
-                    move || {
-                        if let (Some(x), Some(y)) = (a.get_untracked(), b.get_untracked()) {
-                            s.compare(&x, &y);
-                        }
-                    },
-                ))
-                .child(btn(
-                    "Swap",
-                    || Kind::Plain,
-                    move || {
-                        if let (Some(x), Some(y)) = (a.get_untracked(), b.get_untracked()) {
-                            s.compare(&y, &x);
-                        }
-                    },
-                )),
+                .w(px(HEAD))
+                .flex_shrink_0()
+                .child(caption(label).number_of_lines(1)),
         )
-        .child(scroll().flex_1().child(dynamic(move || {
-            let c = cmp.get();
-            let log = s.log_latency.get();
-            let verdict = s.verdict.get();
-            let loading = s.comparing.get();
-            untracked(|| {
-                if c.is_none() && loading {
-                    return empty(
-                        "Comparing…",
-                        "Loading both runs and running the regression gate.",
-                    )
-                    .into_element();
-                }
-                let Some((va, vb, c)) = c else {
-                    return empty(
-                        "Pick two runs",
-                        "A is the baseline, B the candidate. Runs of the same target and \
-                         workload (marked =) compare; others show why they do not.",
-                    )
-                    .into_element();
-                };
-                let comparable = c.comparable();
-                let net = c.net.clone();
-                let (net_word, net_level) = verdicts::net(net.verdict);
-                let gate_word = c.diff.verdict.label();
-                let (sa, sb) = (va.series.clone(), vb.series.clone());
-                let (sa2, sb2) = (sa.clone(), sb.clone());
+}
+
+fn value(key: &str, v: f64) -> String {
+    match key {
+        "goodput" => format!("{}/s", fmt::compact(v)),
+        "bandwidth" => format!("{} MiB/s", fmt::sig3(v)),
+        "p50" | "p99" => fmt::dur_ms(v),
+        _ => fmt::ratio(v),
+    }
+}
+
+fn table(ms: &[Rc<ProfileModel>]) -> View {
+    let plain: Vec<ProfileModel> = ms.iter().map(|m| (**m).clone()).collect();
+    let first = plain[0].operator.clone();
+    let mut t = section(fill("compare.of", &[&ms.len()]))
+        .test_id("compare-table")
+        .child(row("").children(ms.iter().map(|m| {
+            cell(
                 view()
-                    .p_4()
-                    .gap_4()
-                    .min_w(px(0.0))
-                    .child(verdict.map(|v| verdict_banner(v, net.clone())))
-                    .child(
-                        view()
-                            .flex_row()
-                            .items_center()
-                            .gap_2()
-                            .min_w(px(0.0))
-                            .child(if comparable {
-                                badge(net_word, move || Tone::of_level(net_level))
-                            } else {
-                                badge("not comparable", || Tone::Warn)
-                            })
-                            .child(
-                                title(format!("{} → {}", va.id(), vb.id()))
-                                    .number_of_lines(1)
-                                    .flex_1()
-                                    .min_w(px(0.0)),
-                            )
-                            .child(small(format!("gate: {gate_word}")).flex_shrink_0()),
-                    )
-                    .child(
-                        comparable.then(|| small(verdicts::net_sentence(&c.net)).selectable(true)),
-                    )
-                    .child((!comparable).then(|| {
-                        view()
-                            .gap_0p5()
-                            .p_3()
-                            .rounded(px(6.0))
-                            .border_1()
-                            .border_color(move || Tone::Warn.color())
-                            .child(strong(
-                                "These runs measured different things: no regression verdict.",
-                            ))
-                            .children(
-                                c.not_comparable
-                                    .iter()
-                                    .map(|w| small(format!("• {w}")).selectable(true)),
-                            )
-                            .child(small(
-                                "Compare runs of the same target and workload (replay one with \
-                                 Run Again or `oprobe run --from RUN`).",
-                            ))
-                    }))
-                    .child(
-                        view()
-                            .flex_row()
-                            .gap_4()
-                            .child(view().flex_1().min_w(px(0.0)).child(chart(
-                                "THROUGHPUT · A solid, B dashed",
-                                120.0,
-                                move || throughput_plot(&sa, Some(&sb)),
-                            )))
-                            .child(view().flex_1().min_w(px(0.0)).child(chart(
-                                "LATENCY · A solid, B dashed",
-                                120.0,
-                                move || latency_plot(&sa2, Some(&sb2), log),
-                            ))),
-                    )
-                    .child(caption(if comparable {
-                        "CHANGES (regression gate, default thresholds)"
-                    } else {
-                        "CHANGES (for information only: not comparable)"
-                    }))
-                    .child(
-                        view()
-                            .gap_0p5()
-                            .child(
-                                view()
-                                    .flex_row()
-                                    .gap_3()
-                                    .child(small("Metric").w(px(200.0)))
-                                    .child(small("A").w(px(90.0)))
-                                    .child(small("B").w(px(90.0)))
-                                    .child(small("Change").w(px(80.0)))
-                                    .child(small("Limit").flex_1()),
-                            )
-                            .children(c.diff.checks.iter().map(|ch| {
-                                let st: CheckState = verdicts::check_state(
-                                    ch,
-                                    verdicts::significance_of(&c.full, ch),
-                                );
-                                let tone = Tone::of_level(st.level());
-                                view()
-                                    .flex_row()
-                                    .gap_3()
-                                    .items_center()
-                                    .py(px(2.0))
-                                    .child(
-                                        body(verdicts::metric_name(&ch.id))
-                                            .w(px(200.0))
-                                            .number_of_lines(1),
-                                    )
-                                    .child(num(fmt::sig3(ch.baseline)).w(px(90.0)))
-                                    .child(num(fmt::sig3(ch.candidate)).w(px(90.0)))
-                                    .child(
-                                        num(fmt::delta_pct(
-                                            ch.delta_ratio.map_or(f64::INFINITY, |d| d * 100.0),
-                                        ))
-                                        .w(px(80.0))
-                                        .text_color(
-                                            move || match tone {
-                                                Tone::Neutral => theme().foreground,
-                                                t => t.color(),
-                                            },
-                                        ),
-                                    )
-                                    .child(
-                                        view()
-                                            .flex_row()
-                                            .gap_2()
-                                            .flex_1()
-                                            .child(badge(st.word(), move || tone))
-                                            .child(small(ch.fmt_limit())),
-                                    )
-                            })),
-                    )
-                    .child(caption("CONFIGURATION DIFFERENCES"))
-                    .child(if c.diff.config_changes.is_empty() {
-                        small("Same target, workload and client settings.").into_element()
-                    } else {
-                        view()
-                            .gap_0p5()
-                            .children(c.diff.config_changes.iter().map(|ch| {
-                                view()
-                                    .flex_row()
-                                    .gap_3()
-                                    .child(small(ch.kind.label()).w(px(70.0)))
-                                    .child(body(ch.field.clone()).w(px(220.0)))
-                                    .child(
-                                        body(format!("{} → {}", ch.baseline, ch.candidate))
-                                            .flex_1(),
-                                    )
-                            }))
-                            .into_element()
-                    })
-                    .child(caption("FINDINGS"))
-                    .child(if c.findings.is_empty() {
-                        small("Neither run has findings.").into_element()
-                    } else {
-                        view()
-                            .gap_1()
-                            .children(c.findings.iter().map(|(ch, f)| {
-                                let tone = match ch {
-                                    FindingChange::New => Tone::Crit,
-                                    FindingChange::Resolved => Tone::Ok,
-                                    FindingChange::Persisting => Tone::Neutral,
-                                };
-                                view()
-                                    .flex_row()
-                                    .gap_2()
-                                    .items_center()
-                                    .child(badge(ch.label(), move || tone))
-                                    .child(body(f.cause.clone()).flex_1())
-                            }))
-                            .into_element()
-                    })
-                    .child(
-                        view()
-                            .gap_0p5()
-                            .children(c.diff.warnings.iter().map(|w| small(format!("⚠ {w}")))),
-                    )
-                    .into_element()
-            })
+                    .gap(px(2.0))
+                    .child(strong(m.id.clone()))
+                    .child(small(m.operator_ref.clone()).number_of_lines(1))
+                    .child(verdict_badge(m.verdict)),
+            )
+        })));
+    for r in data::compare_rows(&plain) {
+        let base = r.values[0];
+        t = t.child(
+            row(tr(match r.key {
+                "goodput" => "metric.goodput",
+                "bandwidth" => "metric.bandwidth",
+                "p50" => "metric.p50",
+                "p99" => "metric.p99",
+                "errors" => "metric.errors",
+                _ => "metric.throttled",
+            }))
+            .children(r.values.iter().enumerate().map(|(i, v)| {
+                let d = if base > 0.0 { v / base - 1.0 } else { 0.0 };
+                let better = if r.higher_is_better { d > 0.0 } else { d < 0.0 };
+                let tone = if i == 0 || d.abs() < 0.02 {
+                    Tone::Neutral
+                } else if better {
+                    Tone::Ok
+                } else {
+                    Tone::Crit
+                };
+                cell(
+                    view()
+                        .flex_row()
+                        .gap_2()
+                        .child(text(value(r.key, *v)).text_size(px(13.0)).tabular_nums())
+                        .child((i > 0).then(|| {
+                            text(fmt::delta(d))
+                                .text_size(px(11.0))
+                                .tabular_nums()
+                                .text_color(move || tone.color())
+                        })),
+                )
+            })),
+        );
+    }
+    t.child(row(tr("profile.time")).children(ms.iter().map(|m| cell(stage_bar(&m.stages)))))
+        .child(row(tr("compare.findings")).children(ms.iter().map(|m| {
+            cell(
+                view().gap(px(2.0)).children(
+                    m.findings
+                        .iter()
+                        .take(4)
+                        .map(|f| small(finding_title(&f.code)).number_of_lines(1)),
+                ),
+            )
         })))
+        .child(
+            row(tr("compare.operator")).children(ms.iter().enumerate().map(|(i, m)| {
+                let toml = if i == 0 {
+                    tr("compare.baseline").to_owned()
+                } else {
+                    let (_, toml) = data::diff(&first, &m.operator);
+                    if toml.trim().is_empty() {
+                        tr("compare.same").to_owned()
+                    } else {
+                        toml
+                    }
+                };
+                cell(mono(toml).selectable(true))
+            })),
+        )
 }

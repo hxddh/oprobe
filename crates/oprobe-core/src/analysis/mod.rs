@@ -1,22 +1,17 @@
-//! Interpretation of measurements: findings (diagnosis), outlier attribution, trace-driven
-//! what-if estimates, time segments, re-slicing, run comparison statistics, the cost model
-//! and error hints.
+//! Interpretation of measurements: findings and their remedies, the limit models they rest on
+//! (capacity, hypotheses, limit fitting), outlier attribution, trace replays, time segments,
+//! re-slicing (`show --by`) and the statistics prove decides with.
 
 pub mod capacity;
 pub mod catalog;
-pub mod compare;
-pub mod cost;
 pub mod diagnosis;
 pub mod findings;
-pub mod gate;
 pub mod hints;
 pub mod hypothesis;
 pub mod limits;
-pub mod menu;
 pub mod outliers;
 pub mod segments;
 pub mod simulate;
 pub mod slice;
 pub mod stats;
 pub mod verdict;
-pub mod verification;

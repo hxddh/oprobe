@@ -8,6 +8,7 @@ pub mod ids;
 pub mod report;
 pub mod sections;
 pub mod spec;
+pub mod trace_file;
 /// Trace rows (`oprobe_trace::rows`).
 pub use oprobe_trace::rows as trace;
 
@@ -22,7 +23,7 @@ pub use spec::{Overrides, RunSpec};
 pub use trace::{OpBreakdownUs, OpRow, ReqDetail, ReqRow, TcpRow, TlsRow, TraceInfo, WireProtocol};
 
 /// Format id of a run file (design §4).
-pub const RUN_FORMAT: &str = "oprobe.run/5";
+pub const RUN_FORMAT: &str = "oprobe.run/6";
 
 /// One complete run: its report and trace rows (what a `.oprobe` file holds).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]

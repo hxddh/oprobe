@@ -38,7 +38,7 @@ pub mod faults;
 
 pub use faults::{KeyRateLimitFault, QueueFault, RateLimitFault};
 
-use crate::config::{DatasetSpec, Preset, Profile, TargetSpec};
+use crate::config::{DatasetSpec, Preset, Profile};
 use crate::net::tls::build_tls_acceptor;
 
 pub mod caps;
@@ -466,7 +466,7 @@ impl Scenario {
                 ..Default::default()
             },
             Scenario::Parquet => ScenarioDefaults {
-                preset: Some(Preset::Parquet),
+                preset: Some(Preset::RangeReads),
                 concurrency: Some(PARQUET_CONCURRENCY),
                 ..Default::default()
             },
@@ -510,7 +510,7 @@ impl Scenario {
             w.mix = m;
         }
         if let Some(c) = d.concurrency {
-            p.knobs.concurrency = c;
+            p.workload.concurrency = c;
         }
     }
 
@@ -1717,7 +1717,6 @@ impl LabHandle {
     /// Profile targeting this lab server (credentials are dummies; TLS trusts the lab CA).
     pub fn profile(&self, bucket: &str) -> Profile {
         let mut opts = BTreeMap::new();
-        opts.insert("bucket".to_owned(), bucket.to_owned());
         opts.insert("region".to_owned(), "us-east-1".to_owned());
         opts.insert("endpoint".to_owned(), self.endpoint_url.clone());
         opts.insert("access_key_id".to_owned(), "oprobe-lab".to_owned());
@@ -1726,17 +1725,13 @@ impl LabHandle {
             "oprobe-lab-secret".to_owned(),
         );
         opts.insert("disable_config_load".to_owned(), "true".to_owned());
-        opts.insert("root".to_owned(), "/bench".to_owned());
         if self.endpoint_url.starts_with("https://") {
             opts.insert("ca_cert_pem".to_owned(), lab_ca_pem().to_owned());
         }
-        Profile::from_target(TargetSpec {
-            url: None,
-            scheme: "s3".to_owned(),
-            options: opts,
-            proxy: Some("none".to_owned()),
-            ..Default::default()
-        })
+        let mut op = crate::operator::OperatorSpec::from_url(format!("s3://{bucket}/bench"));
+        op.options = opts;
+        op.http.proxy = Some("none".to_owned());
+        Profile::from_operator(op)
     }
 
     /// Total requests served.

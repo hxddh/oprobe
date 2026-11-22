@@ -16,7 +16,7 @@
 //! - the kernel's TCP statistics of the connection at request end (`net::tcpinfo`: the socket
 //!   is found by its addresses and only queried, never owned).
 //!
-//! What this mode cannot see (use `--microscope`): time waiting inside reqwest's pool for an
+//! What this transport cannot see: time waiting inside reqwest's pool for an
 //! idle connection or HTTP/2 stream is part of TTFB.
 
 use std::collections::HashMap;

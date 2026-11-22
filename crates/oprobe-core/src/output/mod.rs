@@ -1,27 +1,25 @@
-//! Output plumbing for every command (design §9): `-o/--output text|json|ndjson|md|html`.
+//! Output plumbing for every command: `-o/--output text|json`.
 //!
 //! A command returns a typed result implementing [`CommandOutput`] (`Serialize + JsonSchema`
-//! plus text/Markdown renderers) and hands it to [`Output::finish`]:
-//! - `text` / `md`: the renderer's output on stdout;
-//! - `json`: exactly one JSON document on stdout;
-//! - `ndjson`: the event stream (`oprobe.events/1`) on stdout, ending with a `result` event.
+//! plus a text renderer) and hands it to [`Output::finish`]:
+//! - `text`: the renderer's output on stdout;
+//! - `json`: exactly one JSON document on stdout.
 //!
-//! stdout carries data only; logs and progress go to stderr (or become `log` events in
-//! ndjson mode). Errors are printed by [`Output::error`]: JSON on stdout in json/ndjson modes,
-//! `error:` + `hint:` on stderr otherwise.
+//! stdout carries data only; logs and progress go to stderr. Errors are printed by
+//! [`Output::error`]: JSON on stdout in json mode, `error:` + `hint:` on stderr otherwise.
+//! In-process consumers (the app) read the command's events from [`Output::bus`].
 //!
-//! Every JSON result is wrapped in the common envelope (design v4 §8, [`Envelope`]): the
-//! result's own fields plus `next` ([`NextStep`]s, each with its CLI command and, where one
-//! exists, the equivalent MCP tool call) and `warnings` (the result's own plus every
-//! [`Output::warn`] of the command).
+//! Every JSON result is wrapped in the common envelope ([`Envelope`]): the result's own fields
+//! plus `next` ([`NextStep`]s, each with its CLI command) and `warnings` (the result's own plus
+//! every [`Output::warn`] of the command).
 
 use std::io::Write;
 
 use schemars::JsonSchema;
 use serde::Serialize;
 
-use crate::errors::{ErrorBody, ErrorCode, OprobeError};
-use crate::events::{Event, EventBus, EventKind, LogLevel, NdjsonWriter};
+use crate::errors::ErrorBody;
+use crate::events::{EventBus, LogLevel};
 use crate::report::style::{bold, dim, red, yellow};
 
 /// `-o/--output`.
@@ -31,9 +29,6 @@ pub enum OutputFormat {
     #[default]
     Text,
     Json,
-    Ndjson,
-    Md,
-    Html,
 }
 
 impl OutputFormat {
@@ -41,36 +36,23 @@ impl OutputFormat {
         match s.trim().to_ascii_lowercase().as_str() {
             "text" => Some(Self::Text),
             "json" => Some(Self::Json),
-            "ndjson" => Some(Self::Ndjson),
-            "md" | "markdown" => Some(Self::Md),
-            "html" => Some(Self::Html),
             _ => None,
         }
     }
 
     /// Machine formats print JSON (also for errors).
     pub fn is_machine(self) -> bool {
-        matches!(self, Self::Json | Self::Ndjson)
+        self == Self::Json
     }
 }
 
-/// An MCP tool call: the tool and its arguments.
-#[derive(Clone, Debug, PartialEq, Serialize, serde::Deserialize, JsonSchema)]
-pub struct McpCall {
-    pub tool: String,
-    pub arguments: serde_json::Map<String, serde_json::Value>,
-}
-
-/// A suggested next step: what it does, the CLI command, and the MCP call doing the same.
+/// A suggested next step: what it does and the CLI command.
 #[derive(Clone, Debug, PartialEq, Serialize, serde::Deserialize, JsonSchema)]
 pub struct NextStep {
     /// What the step does, in a few words.
     pub title: String,
     /// The command line (`oprobe …`).
     pub cli: String,
-    /// The same step as an MCP tool call, when a tool does it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mcp: Option<McpCall>,
 }
 
 impl NextStep {
@@ -78,19 +60,7 @@ impl NextStep {
         Self {
             title: title.into(),
             cli: cli.into(),
-            mcp: None,
         }
-    }
-
-    /// Add the MCP call (`arguments` must be a JSON object; anything else is ignored).
-    pub fn with_mcp(mut self, tool: impl Into<String>, arguments: serde_json::Value) -> Self {
-        if let serde_json::Value::Object(arguments) = arguments {
-            self.mcp = Some(McpCall {
-                tool: tool.into(),
-                arguments,
-            });
-        }
-        self
     }
 }
 
@@ -123,8 +93,7 @@ impl<'a, T: CommandOutput> Envelope<&'a T> {
     }
 }
 
-/// The JSON of `v` in its envelope (what `-o json` prints; MCP structured content of results
-/// that are command outputs).
+/// The JSON of `v` in its envelope (what `-o json` prints).
 pub fn envelope_value<T: CommandOutput>(v: &T, extra_warnings: Vec<String>) -> serde_json::Value {
     if !v.enveloped() {
         return serde_json::to_value(v).unwrap_or_default();
@@ -132,41 +101,10 @@ pub fn envelope_value<T: CommandOutput>(v: &T, extra_warnings: Vec<String>) -> s
     serde_json::to_value(Envelope::of(v, extra_warnings)).unwrap_or_default()
 }
 
-/// Formats every command supports.
-pub const DEFAULT_FORMATS: &[OutputFormat] =
-    &[OutputFormat::Text, OutputFormat::Json, OutputFormat::Ndjson];
-
-/// The default formats plus Markdown.
-pub const WITH_MD: &[OutputFormat] = &[
-    OutputFormat::Text,
-    OutputFormat::Json,
-    OutputFormat::Ndjson,
-    OutputFormat::Md,
-];
-
-/// The default formats plus Markdown and HTML.
-pub const WITH_MD_HTML: &[OutputFormat] = &[
-    OutputFormat::Text,
-    OutputFormat::Json,
-    OutputFormat::Ndjson,
-    OutputFormat::Md,
-    OutputFormat::Html,
-];
-
 /// The typed result of a command.
 pub trait CommandOutput: Serialize + JsonSchema {
     /// Human text (may contain ANSI colors when enabled).
     fn text(&self) -> String;
-
-    /// Markdown; defaults to the text in a code block.
-    fn markdown(&self) -> String {
-        format!("```text\n{}```\n", self.text())
-    }
-
-    /// HTML (`-o html`); `None` until the HTML renderer exists for this result.
-    fn html(&self) -> Option<String> {
-        None
-    }
 
     /// Exit code of the command for this result (0 unless a gate failed).
     fn exit_code(&self) -> u8 {
@@ -184,30 +122,10 @@ pub trait CommandOutput: Serialize + JsonSchema {
         Vec::new()
     }
 
-    /// The output formats this result renders (design v4 §8): text, JSON and NDJSON always;
-    /// commands with a Markdown or HTML renderer add theirs. `capabilities` lists them and
-    /// `-o` outside them is a usage error.
-    fn formats() -> &'static [OutputFormat]
-    where
-        Self: Sized,
-    {
-        DEFAULT_FORMATS
-    }
-
     /// Whether the JSON form is wrapped in the [`Envelope`] (false only for documents printed
     /// verbatim, such as a JSON Schema).
     fn enveloped(&self) -> bool {
         true
-    }
-
-    /// The final `result` event of an ndjson stream.
-    fn result_event(&self) -> EventKind {
-        EventKind::Result {
-            run_id: None,
-            path: None,
-            report: None,
-            data: serde_json::to_value(self).ok(),
-        }
     }
 }
 
@@ -236,17 +154,12 @@ pub struct Output {
 }
 
 impl Output {
-    /// Set up output for `format`. In ndjson mode the event stream starts on stdout now
-    /// (with its `version` line).
+    /// Set up output for `format`.
     pub fn new(format: OutputFormat, quiet: bool, non_interactive: bool) -> Self {
         let bus = EventBus::new();
         if format != OutputFormat::Text {
-            // Machine and document formats never carry ANSI colors.
+            // Machine formats never carry ANSI colors.
             crate::report::style::set(false);
-        }
-        if format == OutputFormat::Ndjson {
-            NdjsonWriter::new(std::io::stdout()).attach(&bus);
-            bus.emit_event(&Event::version());
         }
         Self {
             format,
@@ -268,31 +181,28 @@ impl Output {
         }
     }
 
-    /// The event bus of this command (ndjson output is subscribed when `-o ndjson`).
+    /// The event bus of this command (in-process consumers subscribe to it).
     pub fn bus(&self) -> &EventBus {
         &self.bus
     }
 
-    /// A progress/log line: stderr in text/json/md, a `log` event in ndjson; nothing with `-q`.
+    /// A progress/log line on stderr (and a `log` event); nothing on stderr with `-q`.
     pub fn info(&self, msg: impl Into<String>) {
         let msg = msg.into();
-        match self.format {
-            OutputFormat::Ndjson => self.bus.log(LogLevel::Info, msg),
-            _ if self.quiet => {}
-            _ => eprintln!("{msg}"),
+        if !self.quiet {
+            eprintln!("{msg}");
         }
+        self.bus.log(LogLevel::Info, msg);
     }
 
-    /// A warning: stderr (even with `-q`) or a `log` event.
+    /// A warning: stderr (even with `-q`) and a `log` event.
     pub fn warn(&self, msg: impl Into<String>) {
         let msg = msg.into();
         if let Ok(mut w) = self.warned.lock() {
             w.push(crate::report::style::strip_ansi(&msg));
         }
-        match self.format {
-            OutputFormat::Ndjson => self.bus.log(LogLevel::Warn, msg),
-            _ => eprintln!("{} {msg}", yellow("warning:")),
-        }
+        eprintln!("{} {msg}", yellow("warning:"));
+        self.bus.log(LogLevel::Warn, msg);
     }
 
     /// The warnings given so far.
@@ -311,13 +221,6 @@ impl Output {
                     out.write_all(b"\n")?;
                 }
             }
-            OutputFormat::Md => {
-                let t = v.markdown();
-                out.write_all(t.as_bytes())?;
-                if !t.ends_with('\n') {
-                    out.write_all(b"\n")?;
-                }
-            }
             OutputFormat::Json => {
                 if v.enveloped() {
                     serde_json::to_writer_pretty(&mut out, &Envelope::of(v, self.warnings()))?;
@@ -326,35 +229,12 @@ impl Output {
                 }
                 out.write_all(b"\n")?;
             }
-            OutputFormat::Ndjson => {
-                drop(out);
-                let mut ev = v.result_event();
-                if let EventKind::Result {
-                    data: Some(data), ..
-                } = &mut ev
-                    && v.enveloped()
-                {
-                    *data = envelope_value(v, self.warnings());
-                }
-                self.bus.emit(ev);
-            }
-            OutputFormat::Html => match v.html() {
-                Some(h) => out.write_all(h.as_bytes())?,
-                None => {
-                    return Err(OprobeError::new(
-                        ErrorCode::UsageInvalidArgument,
-                        "this command has no HTML output",
-                    )
-                    .with_hint("use -o text, -o md, -o json or -o ndjson")
-                    .into());
-                }
-            },
         }
         let _ = std::io::stdout().flush();
         Ok(v.exit_code())
     }
 
-    /// Print a classified error (JSON on stdout in json/ndjson modes) and return its exit code.
+    /// Print a classified error (JSON on stdout in json mode) and return its exit code.
     pub fn error(&self, e: &ErrorBody) -> u8 {
         match self.format {
             OutputFormat::Json => {
@@ -368,19 +248,12 @@ impl Output {
                 );
                 let _ = out.flush();
             }
-            OutputFormat::Ndjson => self.bus.emit(EventKind::Error { error: e.clone() }),
-            _ => {
-                // Labels and the code's description follow `--lang`; the message and hint
-                // stay as raised (they carry names, values and commands).
-                use crate::i18n::{error_code, t};
-                eprintln!("{} {}", red(&bold(t("label.error"))), e.message);
+            OutputFormat::Text => {
+                eprintln!("{} {}", red(&bold("error:")), e.message);
                 if let Some(h) = &e.hint {
-                    eprintln!("{} {h}", yellow(&bold(t("label.hint"))));
+                    eprintln!("{} {h}", yellow(&bold("hint:")));
                 }
-                match error_code(e.code.as_str()) {
-                    Some(d) => eprintln!("{}", dim(&format!("({} · {d})", e.code))),
-                    None => eprintln!("{}", dim(&format!("({})", e.code))),
-                }
+                eprintln!("{}", dim(&format!("({})", e.code)));
             }
         }
         e.exit_code()
@@ -431,17 +304,12 @@ mod tests {
 
     #[test]
     fn formats_parse() {
-        for (s, f) in [
-            ("text", OutputFormat::Text),
-            ("JSON", OutputFormat::Json),
-            ("ndjson", OutputFormat::Ndjson),
-            ("markdown", OutputFormat::Md),
-            ("html", OutputFormat::Html),
-        ] {
+        for (s, f) in [("text", OutputFormat::Text), ("JSON", OutputFormat::Json)] {
             assert_eq!(OutputFormat::parse(s), Some(f));
         }
         assert!(OutputFormat::parse("xml").is_none());
-        assert!(OutputFormat::Ndjson.is_machine());
+        assert!(OutputFormat::parse("html").is_none());
+        assert!(OutputFormat::Json.is_machine());
     }
 
     #[test]
@@ -455,10 +323,7 @@ mod tests {
                 String::new()
             }
             fn next(&self) -> Vec<NextStep> {
-                vec![
-                    NextStep::new("show it", "oprobe runs show last")
-                        .with_mcp("get_run", serde_json::json!({"run": "last"})),
-                ]
+                vec![NextStep::new("show it", "oprobe show last")]
             }
             fn warnings(&self) -> Vec<String> {
                 vec!["own".into()]
@@ -466,13 +331,10 @@ mod tests {
         }
         let v = envelope_value(&R { n_count: 3 }, vec!["own".into(), "warned".into()]);
         assert_eq!(v["n_count"], 3);
-        assert_eq!(v["next"][0]["cli"], "oprobe runs show last");
-        assert_eq!(v["next"][0]["mcp"]["tool"], "get_run");
-        assert_eq!(v["next"][0]["mcp"]["arguments"]["run"], "last");
+        assert_eq!(v["next"][0]["cli"], "oprobe show last");
         assert_eq!(v["warnings"], serde_json::json!(["own", "warned"]));
         let t = envelope_value(&TextOutput { text: "x".into() }, vec![]);
         assert_eq!(t["next"], serde_json::json!([]));
-        assert_eq!(R::formats(), DEFAULT_FORMATS);
         let o = Output::silent();
         o.warn("careful");
         assert_eq!(o.warnings(), vec!["careful".to_owned()]);
@@ -484,21 +346,5 @@ mod tests {
         assert!(is_broken_pipe(&e.context("writing the result")));
         let e: anyhow::Error = std::io::Error::from(std::io::ErrorKind::NotFound).into();
         assert!(!is_broken_pipe(&e));
-    }
-
-    #[test]
-    fn html_without_a_renderer_is_a_usage_error() {
-        let o = Output {
-            format: OutputFormat::Html,
-            quiet: true,
-            non_interactive: true,
-            bus: EventBus::new(),
-            warned: Default::default(),
-        };
-        let e = o.finish(&TextOutput { text: "x".into() }).unwrap_err();
-        let body = crate::errors::classify(&e, "s3");
-        assert_eq!(body.code, ErrorCode::UsageInvalidArgument);
-        assert_eq!(body.exit_code(), 2);
-        assert!(body.hint.unwrap().contains("-o md"));
     }
 }

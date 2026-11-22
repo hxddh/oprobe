@@ -1,52 +1,56 @@
-//! `oprobe runs list|show|rm|gc` (`compare` lives in `compare.rs`).
+//! The run history: list, show and remove stored runs (`oprobe show`).
 
 use anyhow::Result;
 use schemars::JsonSchema;
 use serde::Serialize;
 
-use super::Ctx;
-use super::input::*;
+use super::{App, RunRef};
 use crate::errors::{ErrorCode, OprobeError};
 use crate::model::Run;
 use crate::model::VerdictLevel;
 use crate::output::CommandOutput;
-use crate::report::diff::DiffReport;
 use crate::report::style::{bold, dim, green, red, yellow};
-use crate::report::{markdown, terminal};
+use crate::report::terminal;
 use crate::store::RunSummary;
 use crate::util::fmt_ms;
 
-/// Result of `oprobe runs list`.
+/// One stored prove (`<id>.prove.json`).
 #[derive(Clone, Debug, Serialize, JsonSchema)]
-pub struct RunsList {
-    pub runs: Vec<RunSummary>,
-    /// Runs stored in total (the list may be limited).
-    pub total_count: u64,
+pub struct ProveSummary {
+    pub prove_id: String,
+    /// The run whose operator was changed.
+    pub run_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finding: Option<String>,
+    pub objective: super::prove::ProveObjective,
+    pub verdict: super::prove::ProveVerdict,
+    /// The objective's relative change (estimate).
+    pub objective_delta_ratio: f64,
+    /// The change as `PATH=VALUE` pairs.
+    pub change: Vec<String>,
 }
 
-impl CommandOutput for RunsList {
+/// Result of `oprobe show --list`: the runs you made, newest first, and the proves; prove
+/// trials are hidden unless `--all` (U4).
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct RunList {
+    pub runs: Vec<RunSummary>,
+    /// Runs listed in total before `-n` (the list may be limited).
+    pub total_count: u64,
+    /// Prove trial runs not listed (`--all` lists them).
+    pub hidden_trials_count: u64,
+    pub proves: Vec<ProveSummary>,
+}
+
+impl CommandOutput for RunList {
     fn next(&self) -> Vec<crate::output::NextStep> {
         match self.runs.first() {
-            Some(r) => vec![
-                crate::app::next::explain(&r.id),
-                crate::app::next::show(&r.id),
-            ],
-            None => vec![
-                crate::output::NextStep::new(
-                    "measure a local lab target",
-                    "oprobe run lab://demo -d 5s",
-                )
-                .with_mcp(
-                    "start_run",
-                    serde_json::json!({ "target": "lab://demo", "duration": "5s" }),
-                ),
-                crate::app::next::discover(),
-            ],
+            Some(r) => vec![crate::app::next::show(&r.id)],
+            None => vec![crate::output::NextStep::new(
+                "measure a local lab target",
+                "oprobe run lab://demo -d 5s",
+            )],
         }
-    }
-
-    fn formats() -> &'static [crate::output::OutputFormat] {
-        crate::output::WITH_MD
     }
 
     fn text(&self) -> String {
@@ -86,21 +90,51 @@ impl CommandOutput for RunsList {
                     },
                     format!("{:.1}", r.ops_per_s),
                     fmt_ms(r.p99_ms),
-                    r.cost_per_month_usd
-                        .map(crate::util::fmt_usd)
-                        .unwrap_or_else(|| "–".into()),
                 ]
             })
             .collect();
         let mut o = crate::report::style::table(
             &[
-                "run", "label", "target", "when", "window", "verdict", "ops/s", "p99", "$/month",
+                "run", "label", "target", "when", "window", "verdict", "ops/s", "p99",
             ],
             &rows,
             0,
         );
         if self.runs.iter().any(|r| r.interrupted) {
             o += &dim("* stopped early (partial run)\n");
+        }
+        if !self.proves.is_empty() {
+            o += "\n";
+            let rows: Vec<Vec<String>> = self
+                .proves
+                .iter()
+                .take(5)
+                .map(|p| {
+                    vec![
+                        p.prove_id.clone(),
+                        p.run_id.clone(),
+                        p.finding.clone().unwrap_or_else(|| "--with".into()),
+                        format!("{:?}", p.verdict).to_lowercase(),
+                        format!(
+                            "{} {:+.1}%",
+                            p.objective.label(),
+                            p.objective_delta_ratio * 100.0
+                        ),
+                        cut(&p.change.join(" "), 40),
+                    ]
+                })
+                .collect();
+            o += &crate::report::style::table(
+                &["prove", "run", "finding", "verdict", "objective", "change"],
+                &rows,
+                0,
+            );
+        }
+        if self.hidden_trials_count > 0 {
+            o += &dim(&format!(
+                "{} prove trial runs hidden (--all lists them)\n",
+                self.hidden_trials_count
+            ));
         }
         if self.total_count as usize > self.runs.len() {
             o += &dim(&format!(
@@ -109,31 +143,7 @@ impl CommandOutput for RunsList {
                 self.total_count
             ));
         }
-        o += &dim("show one: oprobe runs show RUNREF  (id, prefix, last, last~1, label)\n");
-        o
-    }
-
-    fn markdown(&self) -> String {
-        let mut o = String::from(
-            "| run | label | target | started | verdict | ops/s | p99 | $/month |\n|---|---|---|---|---|---:|---:|---:|\n",
-        );
-        for r in &self.runs {
-            o += &format!(
-                "| `{}` | {} | {} | {} | {} | {:.1} | {} | {} |\n",
-                r.id,
-                r.label.as_deref().unwrap_or(""),
-                r.target_name
-                    .clone()
-                    .unwrap_or_else(|| crate::util::display_url(&r.target_display)),
-                r.started_at,
-                r.verdict_level.as_str(),
-                r.ops_per_s,
-                fmt_ms(r.p99_ms),
-                r.cost_per_month_usd
-                    .map(crate::util::fmt_usd)
-                    .unwrap_or_else(|| "–".into()),
-            );
-        }
+        o += &dim("show one: oprobe show RUN  (id, prefix, last, last~1, label)\n");
         o
     }
 }
@@ -162,19 +172,51 @@ fn when(id: &str, now: std::time::SystemTime) -> String {
     }
 }
 
-pub fn list(ctx: &Ctx, a: RunsListRequest) -> Result<RunsList> {
-    let mut runs = ctx.store().list()?;
-    let total = runs.len() as u64;
-    runs.truncate(a.limit);
-    Ok(RunsList {
+impl RunList {
+    /// Keep the newest `n` runs (`total_count` stays the number stored).
+    pub fn truncate(mut self, n: usize) -> Self {
+        self.runs.truncate(n);
+        self
+    }
+}
+
+/// The stored runs, newest first: the runs you made (and, with `all`, prove trials too),
+/// and the proves.
+pub fn list(app: &App, all: bool) -> Result<RunList> {
+    let store = app.store();
+    let every = store.list()?;
+    let trials = every.iter().filter(|r| r.parent_id.is_some()).count() as u64;
+    let runs: Vec<RunSummary> = every
+        .into_iter()
+        .filter(|r| all || r.parent_id.is_none())
+        .collect();
+    let proves = store
+        .proves()?
+        .into_iter()
+        .filter_map(|v| {
+            Some(ProveSummary {
+                prove_id: v["prove_id"].as_str()?.to_owned(),
+                run_id: v["run_id"].as_str()?.to_owned(),
+                finding: v["finding"].as_str().map(str::to_owned),
+                objective: serde_json::from_value(v["objective"].clone()).ok()?,
+                verdict: serde_json::from_value(v["verdict"].clone()).ok()?,
+                objective_delta_ratio: v["objective_delta"]["estimate"].as_f64().unwrap_or(0.0),
+                change: serde_json::from_value(v["change"].clone()).unwrap_or_default(),
+            })
+        })
+        .collect();
+    Ok(RunList {
+        total_count: runs.len() as u64,
+        hidden_trials_count: if all { 0 } else { trials },
         runs,
-        total_count: total,
+        proves,
     })
 }
 
-/// Result of `oprobe runs show`: the full report (and where it is stored).
+/// A shown run (`oprobe show`): the full report, where it is stored, and its rows for the
+/// renderers.
 #[derive(Clone, Debug, Serialize, JsonSchema)]
-pub struct RunShow {
+pub struct Profile {
     pub path: String,
     #[serde(flatten)]
     pub run: RunReportOnly,
@@ -186,6 +228,98 @@ pub struct RunShow {
     #[serde(skip)]
     #[schemars(skip)]
     pub detail: bool,
+    /// `--by`: the request rows grouped.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub by: Option<ByTable>,
+}
+
+/// `show --by`: the request rows grouped (and, by stage, the per-stage latency per API).
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct ByTable {
+    pub by: crate::analysis::slice::By,
+    pub groups: Vec<crate::analysis::slice::GroupRow>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub stages: Vec<crate::analysis::slice::StageRow>,
+}
+
+impl ByTable {
+    fn of(run: &Run, by: crate::analysis::slice::By) -> Self {
+        use crate::analysis::slice;
+        let reqs: Vec<&crate::model::ReqRow> = run.reqs.iter().collect();
+        Self {
+            by,
+            groups: slice::group(&reqs, by),
+            stages: if by == slice::By::Stage {
+                slice::stage_table(&reqs)
+            } else {
+                Vec::new()
+            },
+        }
+    }
+
+    fn text(&self) -> String {
+        let rows: Vec<Vec<String>> = self
+            .groups
+            .iter()
+            .map(|g| {
+                vec![
+                    g.key.clone(),
+                    g.requests_count.to_string(),
+                    format!("{:.1}%", g.time_pct),
+                    fmt_ms(g.p50_ms),
+                    fmt_ms(g.p99_ms),
+                    g.errors_count.to_string(),
+                    g.throttled_count.to_string(),
+                    g.cold_count.to_string(),
+                ]
+            })
+            .collect();
+        let mut o = crate::report::style::table(
+            &[
+                self.by.label(),
+                "requests",
+                "time",
+                "p50",
+                "p99",
+                "errors",
+                "throttled",
+                "cold",
+            ],
+            &rows,
+            0,
+        );
+        if !self.stages.is_empty() {
+            let q = |s: &crate::analysis::slice::StageQ| {
+                format!("{}/{}", fmt_ms(s.p50_ms), fmt_ms(s.p99_ms))
+            };
+            let rows: Vec<Vec<String>> = self
+                .stages
+                .iter()
+                .map(|s| {
+                    vec![
+                        s.api.clone(),
+                        s.requests_count.to_string(),
+                        q(&s.queue),
+                        q(&s.connect),
+                        q(&s.send),
+                        q(&s.ttfb),
+                        q(&s.body),
+                        q(&s.total),
+                    ]
+                })
+                .collect();
+            o += "\n";
+            o += &crate::report::style::table(
+                &[
+                    "api", "requests", "queue", "connect", "send", "ttfb", "body", "total",
+                ],
+                &rows,
+                0,
+            );
+            o += &dim("stage columns: p50/p99\n");
+        }
+        o
+    }
 }
 
 /// The report of a shown run.
@@ -196,94 +330,57 @@ pub struct RunReportOnly {
     pub requests_count: u64,
 }
 
-impl CommandOutput for RunShow {
+impl CommandOutput for Profile {
     fn next(&self) -> Vec<crate::output::NextStep> {
         crate::app::next::after_run(&self.run.report)
     }
 
-    fn formats() -> &'static [crate::output::OutputFormat] {
-        crate::output::WITH_MD_HTML
-    }
-
     fn text(&self) -> String {
+        if let Some(b) = &self.by {
+            return b.text();
+        }
         match &self.full {
             Some(run) => terminal::render_run_with(run, self.detail),
             None => terminal::render(&self.run.report),
         }
     }
-    fn html(&self) -> Option<String> {
-        Some(match &self.full {
-            Some(run) => crate::report::html::render(run),
-            None => crate::report::html::render_report(&self.run.report),
-        })
+}
+
+impl Profile {
+    /// Render every section (`--detail`).
+    pub fn with_detail(mut self, detail: bool) -> Self {
+        self.detail = detail;
+        self
     }
-    fn markdown(&self) -> String {
-        match &self.full {
-            Some(run) => markdown::render(run),
-            None => markdown::render_report(&self.run.report),
-        }
+
+    /// Group the request rows (`--by`).
+    pub fn with_by(mut self, by: Option<crate::analysis::slice::By>) -> Self {
+        self.by = match (by, &self.full) {
+            (Some(b), Some(run)) => Some(ByTable::of(run, b)),
+            _ => None,
+        };
+        self
     }
 }
 
-pub fn show(ctx: &Ctx, a: RunsShowRequest) -> Result<RunShow> {
-    let store = ctx.store();
-    let path = store.resolve(&a.run)?;
+/// The run `r` names, with its rows.
+pub fn show(app: &App, r: &RunRef) -> Result<Profile> {
+    let path = app.store().resolve(&r.0)?;
     let run = crate::store::runs::load_path(&path)?;
-    Ok(RunShow {
+    Ok(Profile {
         path: path.display().to_string(),
         run: RunReportOnly {
             report: run.report.clone(),
             ops_count: run.ops.len() as u64,
             requests_count: run.reqs.len() as u64,
         },
+        by: None,
         full: Some(Box::new(run)),
-        detail: a.detail,
+        detail: false,
     })
 }
 
-/// Result of `oprobe runs open`.
-#[derive(Clone, Debug, Serialize, JsonSchema)]
-pub struct OpenedRun {
-    pub path: String,
-    /// The app was started (it runs on its own).
-    pub launched: bool,
-}
-
-impl CommandOutput for OpenedRun {
-    fn next(&self) -> Vec<crate::output::NextStep> {
-        vec![crate::app::next::list_runs()]
-    }
-
-    fn text(&self) -> String {
-        format!("{} opening {} in the app\n", green("●"), self.path)
-    }
-}
-
-/// `30d`, `2w`, `12h`, `90m`: days and weeks on top of [`crate::util::parse_duration`].
-pub fn parse_age(v: &str) -> Result<std::time::Duration> {
-    let bad = || -> anyhow::Error {
-        OprobeError::new(
-            ErrorCode::UsageInvalidArgument,
-            format!("invalid age `{v}` (examples: 30d, 2w, 12h)"),
-        )
-        .into()
-    };
-    let t = v.trim().to_ascii_lowercase();
-    let mult = if t.ends_with('d') {
-        86_400.0
-    } else if t.ends_with('w') {
-        7.0 * 86_400.0
-    } else {
-        return crate::util::parse_duration(&t).map_err(|_| bad());
-    };
-    let n: f64 = t[..t.len() - 1].trim().parse().map_err(|_| bad())?;
-    if !n.is_finite() || n < 0.0 {
-        return Err(bad());
-    }
-    Ok(std::time::Duration::from_secs_f64(n * mult))
-}
-
-/// Result of `oprobe runs rm` / `runs gc`.
+/// Result of `oprobe show --rm`.
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 pub struct RemovedRuns {
     pub removed: Vec<String>,
@@ -311,10 +408,15 @@ impl CommandOutput for RemovedRuns {
     }
 }
 
-pub fn rm(ctx: &Ctx, a: RunsRmRequest) -> Result<RemovedRuns> {
-    let store = ctx.store();
+/// The ids of the stored runs (or proves) `refs` name (a file outside the store is refused).
+pub fn stored_ids(app: &App, refs: &[RunRef]) -> Result<Vec<String>> {
+    let store = app.store();
     let mut ids = Vec::new();
-    for r in &a.runs {
+    for RunRef(r) in refs {
+        if store.dir().join(format!("{r}.prove.json")).is_file() {
+            ids.push(r.clone());
+            continue;
+        }
         let p = store.resolve(r)?;
         if p.parent() != Some(store.dir()) {
             return Err(OprobeError::new(
@@ -329,8 +431,18 @@ pub fn rm(ctx: &Ctx, a: RunsRmRequest) -> Result<RemovedRuns> {
             .unwrap_or_default();
         ids.push(id);
     }
+    Ok(ids)
+}
+
+/// Delete the stored runs `refs` name; returns their ids.
+pub fn rm(app: &App, refs: &[RunRef]) -> Result<RemovedRuns> {
+    let ids = stored_ids(app, refs)?;
+    let store = app.store();
     for id in &ids {
-        store.delete(id)?;
+        // A prove goes with its trial runs.
+        if !store.delete_prove(id)? {
+            store.delete(id)?;
+        }
     }
     Ok(RemovedRuns {
         removed: ids,
@@ -338,52 +450,9 @@ pub fn rm(ctx: &Ctx, a: RunsRmRequest) -> Result<RemovedRuns> {
     })
 }
 
-pub fn gc(ctx: &Ctx, a: RunsGcRequest) -> Result<RemovedRuns> {
-    let older = a.older_than.as_deref().map(parse_age).transpose()?;
-    let protect = crate::store::Baselines::load(&ctx.paths.baselines_file())?.referenced();
-    let store = ctx.store();
-    let ids = store.gc_candidates(a.keep, older, &protect)?;
-    if !a.dry_run {
-        for id in &ids {
-            store.delete(id)?;
-        }
-    }
-    Ok(RemovedRuns {
-        removed: ids,
-        dry_run: a.dry_run,
-    })
-}
-
-impl CommandOutput for DiffReport {
-    fn formats() -> &'static [crate::output::OutputFormat] {
-        crate::output::WITH_MD_HTML
-    }
-
-    fn text(&self) -> String {
-        self.render_terminal()
-    }
-    fn markdown(&self) -> String {
-        self.render_markdown()
-    }
-    fn html(&self) -> Option<String> {
-        Some(crate::report::html::render_compare(self))
-    }
-    fn exit_code(&self) -> u8 {
-        DiffReport::exit_code(self)
-    }
-}
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn ages_accept_days_and_weeks() {
-        assert_eq!(parse_age("30d").unwrap().as_secs(), 30 * 86_400);
-        assert_eq!(parse_age("2w").unwrap().as_secs(), 14 * 86_400);
-        assert_eq!(parse_age("12h").unwrap().as_secs(), 12 * 3600);
-        assert!(parse_age("xd").is_err());
-        assert!(parse_age("soon").is_err());
-    }
 
     #[test]
     fn relative_times() {

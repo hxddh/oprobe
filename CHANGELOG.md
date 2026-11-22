@@ -4,6 +4,123 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## v6.0.0 — 2026-11-22
+
+Design [v6](docs/design/v6.md), from the review in [v6-review.md](docs/design/v6-review.md).
+oprobe 6 is **a profiler for OpenDAL operators**: one workbench (the app and four CLI commands),
+one layer (`oprobe-trace`) and one file (`.oprobe`). It is a deep cut, built around one loop.
+Everything under **Changed** and **Removed** is breaking; 5.x run files are not read.
+
+### The new model
+
+- **The operator is the unit.** An OpenDAL `Operator` (a service, a layer stack, read/write and
+  HTTP options) is given as a URL, an operator file (`op.toml`, `oprobe.operator/6`) or a
+  configured name (`[operators.NAME]`). `OperatorSpec` replaces targets, knobs and client
+  stacks; `--set PATH=VALUE` changes one value, and the difference between two operators renders
+  as Rust and TOML.
+- **Profile → Explain → Prove.** `run` profiles one or more operators on one workload and
+  explains each finding with its evidence and exactly one OpenDAL remedy (an `op.toml` path) and
+  no number. `prove` is the only source of numbers: it sizes the remedy, runs A and B
+  interleaved with a sequential test against a learned noise floor, and decides
+  `improved | worse | inconclusive` on your objective (goodput by default, or p99). The result is
+  a proven layer diff.
+- **Findings use OpenDAL's layers:** `ConcurrentLimitLayer`, `RetryLayer` with jitter,
+  `ThrottleLayer`, `TailCutLayer`, `TimeoutLayer`, `FoyerLayer`, read/write chunking and the
+  `HttpFetch` settings. The catalog is `throttling`, `rate_limit`, `key_limit`, `bandwidth_cap`,
+  `tail_stragglers`, `hung_requests`, `small_ranges`, `slow_multipart`, `repeated_reads`,
+  `cold_connections`, `client_bound`, `errors` and `invalid_run`.
+- **Four workload presets** (`small-files`, `large-objects`, `range-reads`, `list-stat`) replace
+  the five of 5.0.
+
+### Changed
+
+- **CLI: four commands** (29 in 5.0): `oprobe run OPERATOR…`, `oprobe prove RUN [FINDING]`,
+  `oprobe show [RUN|FILE]` (with `--list`, `--rm`, `--detail`, `--by`) and `oprobe lab
+  [SCENARIO]`; `oprobe demo` is `oprobe run lab://demo`, and a bare `oprobe` opens the app.
+  Global flags: `-o text|json`, `-q`, `--color`, `--non-interactive`.
+- **Exit code 3** means that `prove` refuted the change (worse on the objective); 0, 1, 2, 4, 5
+  and 130 are unchanged.
+- **The app** is rebuilt on nsh with four views (Runs, Profile, Operator, Compare); in the
+  Operator view a toggled layer is proven live. It speaks 简体中文 and English; the CLI and JSON
+  output are English only.
+- **Files and schemas:** `oprobe.run/6` and `oprobe.report/6`; `oprobe-trace` writes
+  `oprobe.trace/6`. Six schemas are published (`report`, `prove`, `run-list`, `operator`,
+  `error`, `events`).
+- **Prove trials** are saved as children of their prove run and hidden from `show --list`.
+- **Trust fixes:** censored open-loop arrivals count in every percentile; tail attribution
+  follows the stage split (retry backoff is not "TTFB"); a saturated client feeds the verdict;
+  "high" confidence requires the fit to explain most of the effect; intervals stay in range;
+  throttle-driven failures are reported as throttling, not as an invalid run; counts agree with
+  totals.
+- **`oprobe-trace` is slim and stable.** The API is `layer(Config) -> (TraceLayer, Handle)`,
+  `Handle::snapshot()`, `Handle::save(path)` / `Snapshot::save(path)` (a `.oprobe` profile that
+  `oprobe show FILE` opens) and the `Exporter` hook; `Config` is a builder and public types are
+  `#[non_exhaustive]`. The CLI's error codes and exit codes moved to `oprobe-core`; trace rows
+  carry `FailureCode`. `schemars` is optional; the probe code, the microscope dialer, hyper and
+  the root-store builder are gone. A real overhead benchmark
+  (`cargo bench -p oprobe-trace --bench overhead`) replaces the self-reported number; the budget
+  is 2 µs per operation.
+- **Crates:** `oprobe-trace` is the published API. `oprobe-core` is still published, only so
+  that `cargo install oprobe` works; it is documented as internal with no semver promise, and
+  the crates pin each other with exact versions.
+- **Releases:** every platform gets the app build and a CLI-only build
+  (`oprobe-cli-<ver>-<target>` archives; `--no-default-features --features cli`). `install.sh
+  --cli` / `install.ps1 -Cli` install it; `install.sh --help` prints help instead of installing.
+- **`prove` needs at least 3 A/B pairs to decide:** with fewer (a small `--budget`), the verdict
+  is `inconclusive` with a note; `--pairs` is at least 3. The objective's interval uses Student's
+  t for the number of pairs, and a noise floor from a single A/A difference is doubled.
+- **A budget breach mid-prove keeps the partial result:** the prove stops, prints and saves what
+  it measured (`budget_exceeded: true`) and exits 4; its trials stay removable with `show --rm`.
+- **`layers.tail_cut` carries every parameter oprobe applies:** `percentile` (50..99),
+  `safety_factor` (1.5), `min_samples` (32), `min_deadline` ("50ms"), `max_deadline` (the
+  operation timeout) and `window` ("60s"). The measured layer and the generated Rust are built
+  from one parameter list, and the Rust spells out every value that differs from OpenDAL's
+  defaults, so pasted code behaves as measured.
+- **Docs** are rewritten around the loop: getting started, concepts, `op.toml`, the CLI,
+  reading the profile, embedding, the app, install, troubleshooting, privacy and releasing.
+
+### Removed
+
+- **Commands:** `tune` (and its Bayesian optimiser), `verify` and `fix` as commands (they are
+  `prove` now), `compare`, `baseline`, `watch`, `matrix`, `compat`, `doctor`, `probe`, `target`,
+  `analyze`, `explain`, `runs` (now `show`), `top`/`gui` (now a bare `oprobe`), `config`,
+  `cleanup`, `schema`, `capabilities`, `self-update`, `completions` and `man`.
+- **The MCP server** (`oprobe mcp`, 21 tools, prompts and resources). Agents use `-o json` and
+  the skill in `skills/oprobe/SKILL.md`.
+- **The GitHub Action** (`action.yml`), baselines, noise-floor caching for CI, JUnit and PR
+  comments.
+- **Distributed workers**, the SDK clients (`aws-sdk`, `exec:`) and the language adapters.
+- **The cost model** and price tables.
+- **Output formats:** HTML, Markdown, NDJSON (the event stream on stdout), CSV, HAR and OTLP
+  export; `-o` is `text` or `json`.
+- **The microscope transport** (oprobe's own HTTP pool) and the in-house cache layer
+  (`FoyerLayer` replaces it).
+- **Internationalisation of the CLI** (`--lang`); the app keeps its own catalog.
+- **Profiles** (`profiles/*.toml`), shell completions and man pages in the packages; the MSI's
+  `.oprobe` file association and `oprobe://` links.
+- **The minisign claim:** the README no longer promises a signature check; the installers verify
+  a minisign signature only for releases that embed a public key.
+- Docs: `ci.md`, `cost.md`, `agents.md`, `metrics.md`, `tuning.md`, `workloads.md`,
+  `reading-the-report.md` (what is still true moved into the new pages).
+
+### Known limitations
+
+- **Validated without cloud credentials.** Every finding and every `prove` verdict has been
+  checked against the lab, a fault-injecting proxy, MinIO, fake-gcs-server and Azurite — not
+  yet against AWS S3, R2, GCS or Azure. Results name the environment they were measured in.
+- **Throttling on OpenDAL's default retry** (1 s backoff, no jitter): a concurrency cap removes
+  the throttling but often leaves goodput unchanged, so `prove` reports *inconclusive* on
+  goodput; use `--objective p99` to judge such changes on latency.
+- **`bandwidth_cap` on reads:** OpenDAL 0.59's `ThrottleLayer` shapes writes only, so `prove`
+  sizes the cap from the fitted limit but cannot show a read-side gain.
+- **`key_limit`'s remedy** is a change to the key layout, not a layer; `prove` tests a client-side
+  cap as a stand-in and says so.
+- **Production profiles** (`oprobe.trace/6`) hold requests, not operations: each request counts
+  as one operation, findings that need operations or load variation are not derived, and
+  `prove` refuses them.
+- **`client_bound`** fires when the scheduler lags more than 5 ms at p99; on a busy shared
+  machine it can lead the brief. Latency findings whose delay dwarfs that lag are kept.
+
 ## v5.0.0 — 2026-11-22
 
 Design [v5](docs/design/v5.md). The changes under **Changed** are breaking.
@@ -88,7 +205,7 @@ Design [v5](docs/design/v5.md). The changes under **Changed** are breaking.
 - **`--client aws-sdk | exec:COMMAND`.** Drive any workload with aws-sdk-s3 (cargo feature
   `aws-sdk`, over oprobe's instrumented transport) or with an external adapter speaking the
   versioned oprobe client protocol `oprobe.client/1` (NDJSON over stdin/stdout, documented in
-  [docs/clients.md](docs/clients.md); schemas `client-hello`, `client-hello-reply`,
+  [docs/clients.md](https://github.com/hxddh/oprobe/blob/v5.0.0/docs/clients.md); schemas `client-hello`, `client-hello-reply`,
   `client-op`, `client-result`). `report.client` names the client, its version and the stages
   it observes; findings that need other stages are suppressed with a warning. The client is
   never stored in a run's spec. Reference adapters in `adapters/`: `minimal` (Python standard
