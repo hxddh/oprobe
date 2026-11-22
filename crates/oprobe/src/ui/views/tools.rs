@@ -94,6 +94,37 @@ pub fn tune_page() -> impl IntoElement {
                             if running() { s.stop() } else { s.start_tune() }
                         })))),
             )
+            // How long the tuner still needs (U14): the trials left at the pace so far, plus the
+            // confirmation run.
+            .child(small(move || {
+                let max: usize = s.tune_max.get().trim().parse().unwrap_or(0);
+                let trial_s = crate::util::parse_duration(s.tune_trial.get().trim())
+                    .map(|d| d.as_secs_f64())
+                    .unwrap_or(0.0);
+                s.live.with(|l| {
+                    l.as_ref()
+                        .filter(|l| l.kind == JobKind::Tune && l.phase == Phase::Running)
+                        .and_then(|l| {
+                            crate::ui::model::live::tune_eta_s(
+                                l.trials.len(),
+                                max,
+                                trial_s,
+                                l.started.elapsed().as_secs_f64(),
+                            )
+                        })
+                        .map(|eta| {
+                            format!(
+                                "trial {} of up to {max} · {}",
+                                l_trials(s) + 1,
+                                crate::ui::model::i18n::trf(
+                                    "app.eta",
+                                    &[("eta", &crate::ui::model::fmt::clock_s(eta))]
+                                )
+                            )
+                        })
+                        .unwrap_or_default()
+                })
+            }).tabular_nums().test_id("tune-eta"))
             .child(dynamic(move || {
                 let trials = s.live.with(|l| l.as_ref().filter(|l| l.kind == JobKind::Tune).map(|l| l.trials.clone())).unwrap_or_default();
                 untracked(|| {
@@ -154,6 +185,11 @@ pub fn tune_page() -> impl IntoElement {
                 })
             })),
     )
+}
+
+/// Trials the running tuner has finished.
+fn l_trials(s: crate::ui::store::Store) -> usize {
+    s.live.with_untracked(|l| l.as_ref().map(|l| l.trials.len()).unwrap_or(0))
 }
 
 pub fn probe_page() -> impl IntoElement {

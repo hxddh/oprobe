@@ -86,9 +86,20 @@ pub fn nudge(h: &ReqHeatmap, brush: Option<Brush>, key: char) -> Option<Brush> {
     Some(b)
 }
 
+/// The heatmap's frame: a gutter as wide as its latency labels (U4).
+fn frame(h: &ReqHeatmap, hh: f32) -> Frame {
+    let (_, y) = scales(h);
+    let f = Frame::standard();
+    let labels: Vec<String> = crate::ui::chart::y_ticks(&y, f.y0(hh) - f.y1(), hh)
+        .into_iter()
+        .map(fmt_ms)
+        .collect();
+    Frame::fit(&labels)
+}
+
 /// Paint the heatmap and the brush.
 pub fn paint_heatmap(h: &ReqHeatmap, w: f32, hh: f32, brush: Option<Brush>) -> Painter {
-    let f = Frame::standard();
+    let f = frame(h, hh);
     let (x, y) = scales(h);
     let (x0, x1, y0, y1) = (f.x0(), f.x1(w), f.y0(hh), f.y1());
     let mut p = Painter::new();
@@ -142,7 +153,7 @@ pub fn paint_heatmap(h: &ReqHeatmap, w: f32, hh: f32, brush: Option<Brush>) -> P
 
 /// Where a canvas point falls: (seconds, ms).
 pub fn heat_at(h: &ReqHeatmap, w: f32, hh: f32, at: (f32, f32)) -> (f64, f64) {
-    let f = Frame::standard();
+    let f = frame(h, hh);
     let (x, y) = scales(h);
     let (x0, x1, y0, y1) = (f.x0(), f.x1(w), f.y0(hh), f.y1());
     let tx = ((at.0 - x0) / (x1 - x0)).clamp(0.0, 1.0) as f64;

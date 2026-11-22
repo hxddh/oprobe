@@ -217,3 +217,131 @@ mod tests {
         );
     }
 }
+
+/// A report section as `(name, value)` rows for a property list, whatever its shape: nested
+/// objects flatten to `a · b`, arrays of objects show one row per element (the first `max`),
+/// zeros, empties and `false` are left out, names lose their unit suffix into the value
+/// (`missed_arrivals_ratio: 0.02` → `missed arrivals` `2.00 %`). Sections other streams fill
+/// later (schedule, self, dimensions, client, workers) light up without a view change.
+pub fn section_rows(v: &serde_json::Value, max: usize) -> Vec<(String, String)> {
+    fn name(k: &str) -> String {
+        let base = [
+            "_count", "_ratio", "_ms", "_us", "_bytes", "_usd", "_per_s", "_pct",
+        ]
+        .iter()
+        .find_map(|s| k.strip_suffix(s))
+        .unwrap_or(k);
+        base.replace('_', " ")
+    }
+    fn value(k: &str, v: &serde_json::Value) -> Option<String> {
+        use serde_json::Value as J;
+        match v {
+            J::Null => None,
+            J::Bool(false) => None,
+            J::Bool(true) => Some("yes".into()),
+            J::Number(n) => {
+                let x = n.as_f64()?;
+                if x == 0.0 {
+                    return None;
+                }
+                Some(if k.ends_with("_ratio") {
+                    ratio(x)
+                } else if k.ends_with("_ms") {
+                    dur_ms(x)
+                } else if k.ends_with("_us") {
+                    dur_us(x)
+                } else if k.ends_with("_bytes") {
+                    bytes(x)
+                } else if k.ends_with("_usd") {
+                    usd(x)
+                } else if k.ends_with("_pct") {
+                    format!("{} %", sig3(x))
+                } else {
+                    compact(x)
+                })
+            }
+            J::String(s) if s.is_empty() => None,
+            J::String(s) => Some(s.clone()),
+            J::Array(a) if a.is_empty() => None,
+            J::Array(a) if a.iter().all(|x| !x.is_object()) => Some(
+                a.iter()
+                    .filter_map(|x| value("", x))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ),
+            _ => None,
+        }
+    }
+    fn walk(prefix: &str, v: &serde_json::Value, out: &mut Vec<(String, String)>, max: usize) {
+        use serde_json::Value as J;
+        match v {
+            J::Object(m) => {
+                for (k, x) in m {
+                    let n = if prefix.is_empty() {
+                        name(k)
+                    } else {
+                        format!("{prefix} · {}", name(k))
+                    };
+                    match x {
+                        J::Object(_) => walk(&n, x, out, max),
+                        J::Array(a) if a.iter().any(|e| e.is_object()) => {
+                            for (i, e) in a.iter().take(max).enumerate() {
+                                walk(&format!("{n} {}", i + 1), e, out, max);
+                            }
+                        }
+                        _ => {
+                            if let Some(s) = value(k, x) {
+                                out.push((n, s));
+                            }
+                        }
+                    }
+                }
+            }
+            other => {
+                if let Some(s) = value("", other) {
+                    out.push((prefix.to_owned(), s));
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    match v {
+        // A list of records (workers): one group of rows each.
+        serde_json::Value::Array(a) if a.iter().any(|e| e.is_object()) => {
+            for (i, e) in a.iter().take(max).enumerate() {
+                walk(&format!("{}", i + 1), e, &mut out, max);
+            }
+        }
+        _ => walk("", v, &mut out, max),
+    }
+    out.truncate(max * 4);
+    out
+}
+
+#[cfg(test)]
+mod section_tests {
+    #[test]
+    fn sections_become_property_rows() {
+        let v = serde_json::json!({
+            "open_loop": true,
+            "missed_arrivals_ratio": 0.02,
+            "intended_ops_count": 0,
+            "lag": {"p99_ms": 12.5},
+            "workers": [{"id": "w1", "ops_per_s": 1200.0}],
+            "phases_available": ["queue", "server"],
+            "empty": "",
+        });
+        let rows = super::section_rows(&v, 5);
+        let get = |k: &str| rows.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+        assert_eq!(get("open loop"), Some("yes"));
+        assert_eq!(get("missed arrivals"), Some("2.00 %"));
+        assert_eq!(get("intended ops"), None);
+        assert_eq!(get("lag · p99"), Some("12.5 ms"));
+        assert_eq!(get("workers 1 · id"), Some("w1"));
+        assert_eq!(get("phases available"), Some("queue, server"));
+        assert_eq!(get("empty"), None);
+        let w = super::section_rows(&serde_json::json!([{"id": "w1"}, {"id": "w2"}]), 5);
+        assert_eq!(w, vec![("1 · id".into(), "w1".into()), ("2 · id".into(), "w2".into())]);
+        assert!(super::section_rows(&serde_json::json!([]), 5).is_empty());
+    }
+}

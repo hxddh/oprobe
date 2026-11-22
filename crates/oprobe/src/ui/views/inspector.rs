@@ -495,6 +495,25 @@ fn setup(r: Report) -> View {
                     ),
                 )),
         )
+        // The 5.0 sections, whatever they hold (the client that made the load, distributed
+        // workers, the open-loop schedule, oprobe's own cost, key dimensions): shown generically
+        // so they appear as the measurement fills them.
+        .children(
+            [
+                ("LOAD GENERATOR", serde_json::to_value(&r.client).ok()),
+                ("WORKERS", serde_json::to_value(&r.workers).ok()),
+                ("SCHEDULE", serde_json::to_value(&r.schedule).ok()),
+                ("OPROBE ITSELF", serde_json::to_value(&r.self_stats).ok()),
+                ("DIMENSIONS", serde_json::to_value(&r.dimensions).ok()),
+            ]
+            .into_iter()
+            .filter_map(|(title, v)| {
+                let rows = v.map(|v| fmt::section_rows(&v, 6)).unwrap_or_default();
+                (!rows.is_empty()).then(|| {
+                    group(title).children(rows.into_iter().map(|(k, v)| prop_row(k, v)))
+                })
+            }),
+        )
         .child(small(
             "Select a request, an operation, or drag across the heatmap to inspect it.",
         ))

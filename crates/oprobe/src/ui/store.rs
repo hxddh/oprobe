@@ -154,6 +154,8 @@ pub struct Live {
     pub run_id: Option<String>,
     /// Where the job is (from the engine's snapshots and its cleanup stage).
     pub stage: Stage,
+    /// When the job started (the tuner's ETA).
+    pub started: std::time::Instant,
 }
 
 /// What the inspector panel (right) shows.
@@ -627,8 +629,11 @@ impl Store {
             }
         });
         let toasts = self.toasts;
-        set_timeout(Duration::from_secs(5), move || {
-            toasts.update(|t| t.retain(|(i, ..)| *i != id));
+        // Under the root: a toast raised from an overlay still goes away when it closes.
+        self.root.run(|| {
+            set_timeout(Duration::from_secs(5), move || {
+                toasts.update(|t| t.retain(|(i, ..)| *i != id));
+            });
         });
     }
 
@@ -821,6 +826,7 @@ impl Store {
                 failure: None,
                 run_id: None,
                 stage: Stage::Starting,
+                started: std::time::Instant::now(),
             }));
             if kind == JobKind::Run {
                 self.select_live();
@@ -1577,9 +1583,8 @@ impl Store {
             batch(|| {
                 self.inspect.set(Inspect::Attribution { what, attr });
             });
-            if !self.prefs.with_untracked(|p| p.inspector_visible) {
-                self.update_prefs(|p| p.inspector_visible = true);
-            }
+            // Beside the content, or over it where there is no room (the terminal).
+            self.show_inspector();
         }
     }
 

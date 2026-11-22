@@ -662,17 +662,16 @@ fn run_row(s: Store, r: RunSummary) -> impl IntoElement {
         move || s.marked.with(|m| m.contains(&id))
     };
     let today = crate::util::now_rfc3339();
-    let when = fmt::short_time(&r.started_at, fmt::day_of(&today));
-    let has_label = r.label.is_some();
-    let label = r.label.clone().unwrap_or_else(|| when.clone());
+    // Descriptive rows (U10): date and time (or the label), then preset, verdict and numbers;
+    // the id only in the accessible name and the menu.
+    let (label, detail) = crate::ui::model::health::row(&r, fmt::day_of(&today));
     let tone = verdict_tone(&r);
     let partial = runs::partial_badge(&r);
-    let numbers = runs::row_numbers(&r);
     let a11y = format!(
         "Run {} · {} · {}{}",
         r.id,
         label,
-        numbers,
+        detail,
         partial
             .as_ref()
             .map(|p| format!(" · {p}"))
@@ -705,16 +704,7 @@ fn run_row(s: Store, r: RunSummary) -> impl IntoElement {
                         // A budget stop is not a failure: a partial run, with a badge.
                         .child(partial.map(|p| badge(p, || Tone::Warn).flex_shrink_0())),
                 )
-                .child(
-                    // The time is the title of a run without a label: not twice.
-                    small(if has_label {
-                        format!("{when} · {numbers}")
-                    } else {
-                        numbers
-                    })
-                    .number_of_lines(1)
-                    .tabular_nums(),
-                ),
+                .child(small(detail).number_of_lines(1).tabular_nums()),
         )
         .child(
             nsh_base::button()
@@ -1970,6 +1960,10 @@ fn settings_overlay(s: Store) -> impl IntoElement {
 }
 
 fn toasts(s: Store) -> impl IntoElement {
+    // A terminal shows them in the status row instead, never over the content (U13).
+    if kit::in_terminal() {
+        return view();
+    }
     view()
         .absolute()
         .right(px(16.0))
@@ -2028,33 +2022,58 @@ fn status_bar(s: Store) -> impl IntoElement {
                 _ => view().into_element(),
             })
         }))
-        .child(
-            view()
-                .flex_row()
-                .gap_3()
-                .flex_1()
-                .min_w(px(0.0))
-                .overflow_hidden()
-                .children(if term {
-                    vec![
-                        // The essentials first: at 80 columns the last two are left out.
-                        key_hint("r", "rerun"),
-                        key_hint("s", "stop"),
-                        key_hint("n", "new"),
-                        key_hint("1-6", "tabs"),
-                        key_hint("/", "filter"),
-                        key_hint("c", "compare"),
-                        key_hint("?", "help"),
-                        key_hint("q", "quit"),
-                        key_hint("v", "verify"),
-                        key_hint("j/k", "move"),
-                    ]
-                    .into_iter()
-                    .take(if narrow() { 8 } else { 10 })
-                    .collect()
-                } else {
-                    vec![
-                        view().child(
+        // The newest toast takes the terminal's status row while it lasts (U13).
+        .child(term.then(|| {
+            dynamic(move || {
+                let last = s.toasts.with(|t| t.last().cloned());
+                untracked(|| match last {
+                    Some((_, msg, tone)) => text(msg)
+                        .text_size(kit::sz(11.0))
+                        .number_of_lines(1)
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .role(AccessibilityRole::Alert)
+                        .text_color(move || match tone {
+                            Tone::Neutral => theme().foreground,
+                            t => t.color(),
+                        })
+                        .test_id("status-toast")
+                        .into_element(),
+                    None => view().into_element(),
+                })
+            })
+        }))
+        .child(dynamic(move || {
+            let toast = term && s.toasts.with(|t| !t.is_empty());
+            untracked(|| {
+                if toast {
+                    return view().into_element();
+                }
+                view()
+                    .flex_row()
+                    .gap_3()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .overflow_hidden()
+                    .children(if term {
+                        vec![
+                            // The essentials first: at 80 columns the last two are left out.
+                            key_hint("r", "rerun"),
+                            key_hint("s", "stop"),
+                            key_hint("n", "new"),
+                            key_hint("1-6", "tabs"),
+                            key_hint("/", "filter"),
+                            key_hint("c", "compare"),
+                            key_hint("?", "help"),
+                            key_hint("q", "quit"),
+                            key_hint("v", "verify"),
+                            key_hint("j/k", "move"),
+                        ]
+                        .into_iter()
+                        .take(if narrow() { 8 } else { 10 })
+                        .collect()
+                    } else {
+                        vec![view().child(
                             small(move || {
                                 format!(
                                     "{} runs · {}",
@@ -2063,10 +2082,11 @@ fn status_bar(s: Store) -> impl IntoElement {
                                 )
                             })
                             .number_of_lines(1),
-                        ),
-                    ]
-                }),
-        )
+                        )]
+                    })
+                    .into_element()
+            })
+        }))
 }
 
 // ---------------------------------------------------------------------------------------

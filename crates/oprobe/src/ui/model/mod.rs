@@ -7,6 +7,7 @@ pub mod commands;
 pub mod compare;
 pub mod fmt;
 pub mod health;
+pub mod hints;
 pub mod i18n;
 pub mod link;
 pub mod live;

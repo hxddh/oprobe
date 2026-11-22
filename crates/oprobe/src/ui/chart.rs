@@ -1,7 +1,8 @@
 //! Honest charts on a canvas, shared by every chart of the app: real axes with units and nice
 //! ticks, a log latency axis, straight or stepped lines (never smoothed), a hover crosshair
 //! with a readout, one color per stage or series. Data arrives downsampled (`model::series`).
-//! In a terminal the same drawing is braille dots with labels on whole cells.
+//! In a terminal the same drawing has labels on whole cells, no grid (a braille grid drowns
+//! the data — U4), gutters as wide as their labels, and text swatches in the legends.
 
 use nsh_base::theme;
 use nsh_core::canvas::{CanvasTextAlign, CanvasTextBaseline};
@@ -105,6 +106,35 @@ impl Frame {
             }
         }
     }
+    /// Points per character of an axis label (a terminal cell, or 11 px system text).
+    pub fn char_w() -> f32 {
+        if kit::in_terminal() { 8.0 } else { 6.6 }
+    }
+
+    /// [`Frame::standard`] with a left gutter as wide as the widest of `labels` (U4: no
+    /// clipped `.00k/s`).
+    pub fn fit<S: AsRef<str>>(labels: &[S]) -> Self {
+        let mut f = Self::standard();
+        let chars = labels
+            .iter()
+            .map(|l| l.as_ref().chars().count())
+            .max()
+            .unwrap_or(0) as f32;
+        let gap = if kit::in_terminal() { 8.0 } else { 7.0 };
+        f.left = f.left.max(chars * Self::char_w() + gap);
+        f
+    }
+
+    /// The frame of `plot` on a canvas `h` high: its y tick labels decide the gutter.
+    pub fn of(plot: &Plot, h: f32) -> Self {
+        let f = Self::standard();
+        let labels: Vec<String> = y_ticks(&plot.y, f.y0(h) - f.y1(), h)
+            .into_iter()
+            .map(plot.y_fmt.f())
+            .collect();
+        Self::fit(&labels)
+    }
+
     pub fn x0(&self) -> f32 {
         self.left
     }
@@ -120,6 +150,22 @@ impl Frame {
 }
 
 const DASH: &[Points] = &[Points(4.0), Points(3.0)];
+
+/// The y ticks an axis `span` points tall shows (never closer than a label's height; a log
+/// axis keeps its decades first).
+pub fn y_ticks(y: &Scale, span: f32, h: f32) -> Vec<f64> {
+    let mut ticks = y.ticks(if h < 120.0 { 3 } else { 4 });
+    let line = if kit::in_terminal() { 16.0 } else { 14.0 };
+    let room = (span / line).max(2.0) as usize;
+    if ticks.len() > room && y.log {
+        ticks.retain(|t| (t.log10() - t.log10().round()).abs() < 1e-6);
+    }
+    if ticks.len() > room {
+        let k = ticks.len().div_ceil(room);
+        ticks = ticks.into_iter().step_by(k).collect();
+    }
+    ticks
+}
 
 pub const FONT: &str = "11px system-ui";
 
@@ -139,33 +185,33 @@ pub fn axes(
     let grid = paint("grid");
     let axis = paint("axis");
     let mut p = p.font(FONT).line_width(1.0);
-    // Horizontal grid and y labels.
-    let mut y_ticks = y.ticks(if h < 120.0 { 3 } else { 4 });
-    // Never closer than a label's height: a log axis keeps its decades first.
-    let room = ((y0 - y1) / 14.0).max(2.0) as usize;
-    if y_ticks.len() > room && y.log {
-        y_ticks.retain(|t| (t.log10() - t.log10().round()).abs() < 1e-6);
-    }
-    if y_ticks.len() > room {
-        let k = y_ticks.len().div_ceil(room);
-        y_ticks = y_ticks.into_iter().step_by(k).collect();
-    }
+    // Horizontal grid (not in a terminal) and y labels.
+    let y_ticks = y_ticks(y, y0 - y1, h);
+    let term = kit::in_terminal();
     p = p
         .text_align(CanvasTextAlign::Right)
         .text_baseline(CanvasTextBaseline::Middle);
     for t in &y_ticks {
         let py = y0 - (y.norm(*t) as f32) * (y0 - y1);
-        p = p
-            .stroke_color(grid)
-            .begin_path()
-            .move_to(x0, py.round() + 0.5)
-            .line_to(x1, py.round() + 0.5)
-            .stroke()
-            .fill_color(axis)
-            .fill_text(&y_fmt(*t), x0 - 5.0, py);
+        if !term {
+            p = p
+                .stroke_color(grid)
+                .begin_path()
+                .move_to(x0, py.round() + 0.5)
+                .line_to(x1, py.round() + 0.5)
+                .stroke();
+        }
+        p = p.fill_color(axis).fill_text(&y_fmt(*t), x0 - 5.0, py);
     }
-    // x labels (and short ticks).
-    let target = ((x1 - x0) / 90.0).clamp(2.0, 8.0) as usize;
+    // x labels (and short ticks), never closer than a label and two characters (U4).
+    let widest = x
+        .ticks(4)
+        .into_iter()
+        .map(|t| x_fmt(t).chars().count())
+        .max()
+        .unwrap_or(4) as f32;
+    let spacing = ((widest + 2.0) * Frame::char_w()).max(48.0);
+    let target = ((x1 - x0) / spacing).clamp(2.0, 8.0) as usize;
     p = p
         .text_align(CanvasTextAlign::Center)
         .text_baseline(CanvasTextBaseline::Top);
@@ -200,7 +246,7 @@ pub struct Path {
 /// The lines of `plot` projected onto a `w`×`h` canvas (steps expanded). Computed once per
 /// plot and size, not on every paint or mouse move.
 pub fn project(plot: &Plot, w: f32, h: f32) -> Vec<Path> {
-    let f = Frame::standard();
+    let f = Frame::of(plot, h);
     let (x0, x1, y0, y1) = (f.x0(), f.x1(w), f.y0(h), f.y1());
     let sx = |v: f64| x0 + (plot.x.norm(v) as f32) * (x1 - x0);
     let sy = |v: f64| y0 - (plot.y.norm(v) as f32) * (y0 - y1);
@@ -228,7 +274,7 @@ pub fn project(plot: &Plot, w: f32, h: f32) -> Vec<Path> {
 
 /// The plot's axes and its (already projected) lines.
 pub fn paint_plot(plot: &Plot, paths: &[Path], w: f32, h: f32) -> Painter {
-    let f = Frame::standard();
+    let f = Frame::of(plot, h);
     let (x0, x1, y0, y1) = (f.x0(), f.x1(w), f.y0(h), f.y1());
     let mut p = axes(
         Painter::new(),
@@ -269,7 +315,7 @@ pub fn paint_plot(plot: &Plot, paths: &[Path], w: f32, h: f32) -> Painter {
 /// The crosshair at canvas x `hx` with a dot on each line (its own layer over the plot, so a
 /// mouse move repaints only this).
 pub fn paint_crosshair(plot: &Plot, w: f32, h: f32, hx: f32) -> Painter {
-    let f = Frame::standard();
+    let f = Frame::of(plot, h);
     let (x0, x1, y0, y1) = (f.x0(), f.x1(w), f.y0(h), f.y1());
     if hx < x0 || hx > x1 {
         return Painter::new();
@@ -387,12 +433,12 @@ pub fn chart(
         let Some(hx) = hover.get() else {
             return "".into();
         };
-        let (w, _) = size.get_untracked();
+        let (w, h) = size.get_untracked();
         plot.with_untracked(|p| {
             let Some(p) = p else {
                 return SharedString::default();
             };
-            let f = Frame::standard();
+            let f = Frame::of(p, h);
             let t = ((hx - f.x0()) / (f.x1(w) - f.x0())).clamp(0.0, 1.0) as f64;
             let xv = p.x.value(t);
             let mut s = format!("at {}", (p.x_fmt.f())(xv));
@@ -445,7 +491,7 @@ pub fn chart(
                                     .flex_row()
                                     .items_center()
                                     .gap_1()
-                                    .child(swatch(token(tok)))
+                                    .child(legend_swatch(tok, dashed))
                                     .child(small(if dashed && tok == "series-b" {
                                         format!("{label} (B)")
                                     } else {
@@ -532,6 +578,20 @@ pub fn chart(
                     .into_element()
             })
         }))
+}
+
+/// A legend's swatch: a coloured square in a window; in a terminal a coloured `■` (or `╌` for a
+/// dashed line), since an 8-point box is less than a cell (U4).
+pub fn legend_swatch(tok: &'static str, dashed: bool) -> View {
+    if kit::in_terminal() {
+        view().child(
+            text(if dashed { "╌" } else { "■" })
+                .text_size(kit::sz(11.0))
+                .text_color(token(tok)),
+        )
+    } else {
+        swatch(token(tok))
+    }
 }
 
 /// A chart's numbers as a scrollable table of the same height.
