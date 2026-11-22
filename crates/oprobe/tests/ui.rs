@@ -216,8 +216,10 @@ fn operator_toggles_a_layer_and_proves_it_against_the_lab() {
     );
     assert!(app.shows("The proven diff"));
     app.wait_for("text:/Pair 1/").unwrap();
-    // The trial runs were saved by Prove.
-    assert!(App::new(cx.paths()).list().unwrap().runs.len() > 1);
+    // Prove saved its trial runs as children of the prove run: stored, hidden from the list.
+    let app_ = App::new(cx.paths());
+    let all = app_.list_all().unwrap().runs.len();
+    assert!(all > app_.list().unwrap().runs.len(), "trials are stored and hidden");
 }
 
 #[test]

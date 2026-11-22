@@ -53,7 +53,7 @@ pub fn list(app: &App) -> Result<Vec<RunRow>> {
 /// One stage's share of operation time.
 #[derive(Clone, Debug, PartialEq)]
 pub struct StageBar {
-    pub key: &'static str,
+    pub key: String,
     pub ratio: f64,
 }
 
@@ -184,7 +184,8 @@ pub fn profile(app: &App, id: &str) -> Result<ProfileModel> {
 /// The model of a run with its trace rows.
 pub fn of_run(run: &Run) -> ProfileModel {
     let r = &run.report;
-    let v = view::ReportView::of(r);
+    let n = view::NumbersView::of(r);
+    let time = view::TimeView::of(r, Some(run));
     let c = &r.connections;
     ProfileModel {
         id: r.run.id.clone(),
@@ -194,15 +195,14 @@ pub fn of_run(run: &Run) -> ProfileModel {
         window_s: r.run.window_s,
         verdict: r.verdict.level,
         headline: r.verdict.headline.clone(),
-        good_ops_per_s: v.summary.good_ops_per_s,
-        mib_per_s: v.summary.mib_per_s,
-        p50_ms: v.summary.p50_ms,
-        p99_ms: v.summary.p99_ms,
-        error_ratio: v.summary.error_ratio,
-        throttled_ratio: v.summary.throttled_request_ratio,
-        stages: v
-            .time
-            .stacked()
+        good_ops_per_s: n.goodput_ops_per_s,
+        mib_per_s: n.mib_per_s,
+        p50_ms: n.p50_ms,
+        p99_ms: n.p99_ms,
+        error_ratio: n.error_ratio,
+        throttled_ratio: n.throttled_request_ratio,
+        stages: time
+            .stages
             .into_iter()
             .map(|s| StageBar {
                 key: s.key,
@@ -247,16 +247,16 @@ pub fn of_run(run: &Run) -> ProfileModel {
 }
 
 fn findings(r: &Report) -> Vec<FindingRow> {
-    view::findings_by_severity(r)
+    view::findings(r)
         .into_iter()
         .map(|f| {
             let src = r.findings.iter().find(|x| x.code == f.code);
             FindingRow {
-                code: f.code.to_owned(),
+                code: f.code.clone(),
                 severity: f.severity,
-                cause: f.cause.to_owned(),
-                evidence: f.evidence.to_owned(),
-                advice: f.advice.to_owned(),
+                cause: f.cause,
+                evidence: f.evidence,
+                advice: f.remedy,
                 items: f.items.into_iter().map(|i| (i.label, i.value)).collect(),
                 remedy: src.map(remedy).unwrap_or_default(),
             }
@@ -264,17 +264,14 @@ fn findings(r: &Report) -> Vec<FindingRow> {
         .collect()
 }
 
-/// The remedy of a finding as operator paths: its verification's operator overrides, else the
-/// remedy path of its code (design v6 §8 "Findings → remedies").
+/// The remedy of a finding as operator paths: the finding's own remedy path (and the paths
+/// changed with it), else the remedy path of its code (design v6 §8 "Findings → remedies").
+/// Values are left empty: `oprobe prove` sizes them.
 pub fn remedy(f: &Finding) -> Vec<(String, String)> {
-    if let Some(v) = &f.verification
-        && !v.overrides.operator.is_empty()
-    {
-        return v
-            .overrides
-            .operator
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
+    if let Some(path) = &f.remedy.path {
+        return std::iter::once(path)
+            .chain(f.remedy.with.iter())
+            .map(|p| (p.clone(), String::new()))
             .collect();
     }
     remedy_paths(&f.code)

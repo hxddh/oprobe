@@ -151,7 +151,7 @@ pub fn stage_bar(stages: &[crate::ui::data::StageBar]) -> View {
             view()
                 .h_full()
                 .w(relative((s.ratio / total) as f32))
-                .bg(token(stage_token(s.key)))
+                .bg(token(stage_token(&s.key)))
         }))
 }
 
@@ -169,13 +169,17 @@ fn time_went(m: &ProfileModel) -> View {
                 .flex_row()
                 .items_center()
                 .gap_2()
-                .child(swatch(stage_token(st.key)))
+                .child(swatch(stage_token(&st.key)))
                 .child(
-                    body(tr_dyn(&format!("stage.{}", st.key)).unwrap_or(st.key))
-                        .w(px(150.0))
-                        .number_of_lines(1),
+                    body(
+                        tr_dyn(&format!("stage.{}", st.key))
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| st.key.clone()),
+                    )
+                    .w(px(150.0))
+                    .number_of_lines(1),
                 )
-                .child(meter(st.ratio / max, stage_token(st.key)))
+                .child(meter(st.ratio / max, stage_token(&st.key)))
                 .child(small(fmt::ratio(st.ratio)).w(px(64.0)).tabular_nums())
         }))
 }

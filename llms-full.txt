@@ -646,6 +646,7 @@ Print a profile: a stored run, or a file (`.oprobe` from `run` or from
 | Flag | Meaning |
 |---|---|
 | `--list` | list the stored runs (prove trials hidden) |
+| `--all` | with `--list`: include the prove trials |
 | `--rm RUN…` | delete stored runs |
 | `--detail` | every section of the profile |
 | `--by stage\|api\|conn` | group the requests by stage, storage API or connection |

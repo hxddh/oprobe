@@ -223,7 +223,7 @@ impl Job {
                         p.objective_delta.low,
                         p.objective_delta.high,
                     ),
-                    significant: p.significant,
+                    significant: p.objective_delta.low > 0.0 || p.objective_delta.high < 0.0,
                     pairs: p.pairs_count,
                     secondary: p
                         .secondary
