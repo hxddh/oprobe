@@ -72,6 +72,8 @@ tokio-util.workspace = true
 tar.workspace = true
 flate2.workspace = true
 sha2.workspace = true
+# `oprobe self-update`: the minisign signature over SHA256SUMS (design v5 §5; tiny, no deps).
+minisign-verify = "0.3"
 
 # Interactive UI (Native Shell): the terminal workbench (`tui`, default) and native windows (`gui`).
 nsh-core = { version = "0.6", optional = true }

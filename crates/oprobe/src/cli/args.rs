@@ -272,6 +272,22 @@ pub struct SelfUpdateArgs {
     /// Reinstall even when already on that version
     #[arg(long)]
     pub force: bool,
+    /// After the SHA-256 check: verify the build provenance (gh) or the minisign signature
+    /// when possible (auto), insist on one of them (require), or skip both (checksum)
+    #[arg(long, value_enum, default_value_t = VerifyPolicy::Auto, env = "OPROBE_VERIFY")]
+    pub verify: VerifyPolicy,
+}
+
+/// `self-update --verify` (and `OPROBE_VERIFY`, shared with install.sh / install.ps1).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub enum VerifyPolicy {
+    /// Verify what this machine can; warn when only the checksum could be checked
+    #[default]
+    Auto,
+    /// Refuse to install unless the provenance or the signature verified
+    Require,
+    /// Only the SHA-256 checksum
+    Checksum,
 }
 
 #[derive(Args, Debug)]

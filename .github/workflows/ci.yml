@@ -1,28 +1,44 @@
 name: CI
 
+# Per pull request (design v5 §10): fmt + clippy, tests on Linux, macOS and Windows in debug with
+# cargo-nextest, docs, cargo-deny, the GUI build check, MSRV, packaging and the installers.
+# Release builds, the macOS app bundle and the MSI run on pushes to main and nightly only.
+#
+# Every action is pinned by commit SHA (the tag in the comment); Dependabot proposes updates
+# (.github/dependabot.yml).
+
 on:
   push:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * *"   # nightly: release builds on every target
 
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Debug builds in CI: no incremental state worth caching, smaller caches.
+  CARGO_INCREMENTAL: 0
 
 jobs:
   lint:
     name: fmt + clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
+          toolchain: stable
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
@@ -32,40 +48,62 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace --locked --all-targets
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: stable
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
+        with:
+          tool: cargo-nextest
+      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
+      - run: cargo nextest run --workspace --locked --all-targets --no-fail-fast
+      # nextest does not run doctests.
+      - run: cargo test --workspace --locked --doc
       - name: CLI smoke (demo, run → compare gate, HTML report)
         shell: bash
         env:
           OPROBE_DATA_DIR: ${{ runner.temp }}/oprobe-data
         run: |
-          cargo build --release --locked
-          o=target/release/oprobe
+          cargo build --locked
+          o=target/debug/oprobe
           $o demo --duration 2s
           $o run memory:// --preset mixed -d 2s --warmup 500ms -q --label base
           $o run memory:// --preset mixed -d 2s --warmup 500ms -q --label cand
-          $o compare base cand --max-p99-increase 400 --max-p50-increase 400 --max-throughput-drop 80 --markdown gate.md
+          $o compare base cand --max-p99-increase-pct 400 --max-p50-increase-pct 400 --max-throughput-drop-pct 80 --markdown gate.md
           $o runs show cand -o html > report.html
           grep -q '<svg class="viz"' report.html
           $o runs list
           cat gate.md >> "$GITHUB_STEP_SUMMARY"
 
+  deny:
+    name: cargo deny (advisories, licenses, bans, sources)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
+        with:
+          tool: cargo-deny
+      # deny.toml documents every ignored advisory (RUSTSEC-2023-0071: rsa via reqsign, signing only).
+      - run: cargo deny --locked check
+
   docs:
     name: docs (links, CLI reference drift)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
       # docs/cli.md is generated from the command definitions; regenerate it with
       # `OPROBE_BLESS=1 cargo test --test docs`. The same test checks relative links.
       - run: cargo test --locked --test docs
+      - name: rustdoc of the library crates
+        run: cargo doc --locked --no-deps -p oprobe-trace -p oprobe-core
       - name: Links (external included)
-        uses: lycheeverse/lychee-action@v2
+        uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2.9.0
         with:
           args: >-
             --no-progress --max-retries 3 --accept 200,206,429
@@ -75,9 +113,13 @@ jobs:
             --remap 'https://github.com/hxddh/oprobe/blob/main/(.*) file://${{ github.workspace }}/$1'
             README.md README.zh-CN.md CHANGELOG.md llms.txt docs/*.md
           fail: true
-      - name: Action metadata
+      - name: Action and workflow metadata (every action pinned by SHA)
         run: |
           python3 -c "import yaml,sys; d=yaml.safe_load(open('action.yml')); assert d['runs']['using']=='composite'; print('action.yml ok:', len(d['runs']['steps']), 'steps')"
+          # `uses: owner/repo@<40 hex>` only (local `./` actions excepted).
+          if grep -nE '^\s*-?\s*uses:\s*[^.][^@]*@' action.yml .github/workflows/*.yml | grep -vE '@[0-9a-f]{40}( |$)'; then
+            echo "::error::actions must be pinned by commit SHA"; exit 1
+          fi
 
   install-script:
     name: install script (${{ matrix.os }})
@@ -87,12 +129,13 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Shellcheck
         if: runner.os == 'Linux'
         run: shellcheck scripts/install.sh scripts/test-install.sh scripts/release-manifests.sh scripts/macos-app.sh
       # install.sh against a local fake release (python http.server): latest.json, the
-      # releases/latest redirect, the API, OPROBE_VERSION, PATH rc files, a checksum mismatch.
+      # releases/latest redirect, the API, OPROBE_VERSION, PATH rc files, a checksum mismatch,
+      # and the signature policy (OPROBE_VERIFY).
       - name: install.sh against a fake release
         if: runner.os != 'Windows'
         run: sh scripts/test-install.sh
@@ -136,13 +179,13 @@ jobs:
       OPROBE_IT_AZBLOB_ENDPOINT: http://127.0.0.1:10000/oprobeit
       OPROBE_IT_AZBLOB_ACCOUNT: oprobeit
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # MinIO no longer publishes container images; build a pinned revision from source.
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version: stable
           cache: false
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ~/go/bin/minio
           key: minio-v0.0.0-20260212201848-7aac2a2c5b7c
@@ -178,8 +221,10 @@ jobs:
           curl -sf -X POST -H 'Content-Type: application/json' -d '{"name":"bench"}' http://127.0.0.1:4443/storage/v1/b
           az storage container create -n bench --connection-string \
             "DefaultEndpointsProtocol=http;AccountName=oprobeit;AccountKey=$OPROBE_IT_AZBLOB_KEY;BlobEndpoint=$OPROBE_IT_AZBLOB_ENDPOINT;"
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
       - run: cargo test --locked --test backends -- --nocapture
       - name: Container logs on failure
         if: failure()
@@ -191,13 +236,54 @@ jobs:
     name: MSRV (1.97)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.97
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo check --locked --all-targets
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: "1.97"
+      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
+      - run: cargo check --workspace --locked --all-targets
 
+  package:
+    name: cargo package (cargo install readiness)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
+      # Every crate of the workspace, in dependency order (oprobe-trace, oprobe-core, oprobe).
+      - run: cargo package --workspace --locked
+      - name: cargo install (debug profile; release builds run on main and nightly)
+        run: cargo install --locked --debug --path crates/oprobe --root "$RUNNER_TEMP/inst" && "$RUNNER_TEMP/inst/bin/oprobe" --version
+
+  gui:
+    name: gui build check (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: stable
+          components: clippy
+      - name: GTK 4 (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libgtk-4-dev
+      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
+        with:
+          key: gui
+      - run: cargo clippy --workspace --locked --all-targets --features gui -- -D warnings
+
+  # ---------------------------------------------------------------------------------------
+  # main and nightly only: release builds and installers (design v5 §10, review X7).
+  # ---------------------------------------------------------------------------------------
   release-targets:
-    name: build ${{ matrix.target }}
+    name: release build ${{ matrix.target }}
+    if: github.event_name != 'pull_request'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -208,48 +294,43 @@ jobs:
           - { os: macos-latest, target: x86_64-apple-darwin, features: gui }
           - { os: windows-latest, target: aarch64-pc-windows-msvc, features: gui }
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
         with:
           key: ${{ matrix.target }}
       - name: Install musl tools
         if: matrix.musl
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - run: cargo build --release --locked --target ${{ matrix.target }} ${{ matrix.features && format('--features {0}', matrix.features) || '' }}
+      # The size target of design v5 §1 (≤ 45 MB for the CLI + TUI musl binary): reported in
+      # the job summary, not enforced.
+      - name: Binary size
+        shell: bash
+        run: |
+          f="target/${{ matrix.target }}/release/oprobe"; [ -f "$f.exe" ] && f="$f.exe"
+          bytes=$(wc -c < "$f" | tr -d ' ')
+          echo "oprobe ${{ matrix.target }}: $((bytes / 1048576)) MiB ($bytes bytes)" | tee -a "$GITHUB_STEP_SUMMARY"
 
-  package:
-    name: cargo package (cargo install readiness)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      # Every crate of the workspace, in dependency order (oprobe-trace, oprobe-core, oprobe).
-      - run: cargo package --workspace --locked
-      - run: cargo install --locked --path crates/oprobe --root "$RUNNER_TEMP/inst" && "$RUNNER_TEMP/inst/bin/oprobe" --version
-
-  gui:
-    name: gui build (${{ matrix.os }})
+  installers:
+    name: app bundle + MSI (${{ matrix.os }})
+    if: github.event_name != 'pull_request'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-latest, windows-latest]
+        os: [macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
-          components: clippy
-      - name: GTK 4 (Linux)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libgtk-4-dev
-      - uses: Swatinem/rust-cache@v2
+          toolchain: stable
+      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
         with:
-          key: gui
-      - run: cargo clippy --locked --all-targets --features gui -- -D warnings
+          key: installers
       - run: cargo build --locked --release --features gui
       # Like the MSI below, the macOS app and disk image are otherwise only built at release
       # time; the script also opens the app through LaunchServices and fails if it does not stay up.
@@ -277,6 +358,6 @@ jobs:
           Copy-Item -Recurse profiles $stage
           dotnet tool install --global wix --version 5.0.2
           wix build packaging/windows/oprobe.wxs -arch x64 `
-            -d Version=4.0.0 -d BinDir=$stage -d IconFile=packaging/desktop/oprobe.ico `
+            -d Version=5.0.0 -d BinDir=$stage -d IconFile=packaging/desktop/oprobe.ico `
             -o out/oprobe-ci-x64.msi
           Get-Item out/oprobe-ci-x64.msi

@@ -10,6 +10,19 @@
 #   OPROBE_RELEASE_BASE=URL     release download base (mirrors, tests);
 #                               default https://github.com/hxddh/oprobe/releases
 #   OPROBE_API=URL              GitHub API base (default https://api.github.com)
+#   OPROBE_VERIFY=auto|require|checksum
+#                               signature policy after the SHA-256 check (default auto):
+#                               auto     verify what this machine can, warn when nothing can
+#                               require  fail unless the provenance or the signature verified
+#                               checksum only the SHA-256 check (SHA256SUMS from the same release)
+#   OPROBE_MINISIGN_PUBKEY=KEY  minisign public key (overrides the one embedded below)
+#
+# Verification (design v5 §5), after the archive's SHA-256 matched SHA256SUMS:
+#   1. the GitHub build provenance attestation (`gh attestation verify`), when `gh` is installed
+#      and logged in (GH_TOKEN / `gh auth login`);
+#   2. otherwise a minisign signature over SHA256SUMS (SHA256SUMS.minisig), when `minisign` is
+#      installed, the release is signed and a public key is known;
+#   3. otherwise a warning (an error with OPROBE_VERIFY=require).
 #
 # The latest version is resolved without the GitHub API when possible, falling back on any failure:
 #   1. <base>/latest/download/latest.json
@@ -23,6 +36,12 @@ base="${base%/}"
 api="${OPROBE_API:-https://api.github.com}"
 api="${api%/}"
 dir="${OPROBE_INSTALL_DIR:-$HOME/.local/bin}"
+verify="${OPROBE_VERIFY:-auto}"
+# The release's minisign public key; the release workflow fills it in (repository variable
+# MINISIGN_PUBKEY, docs/releasing.md#signing). Empty: the minisign step is skipped.
+embedded_pubkey=""
+pubkey="${OPROBE_MINISIGN_PUBKEY:-$embedded_pubkey}"
+case "$verify" in auto|require|checksum) ;; *) echo "oprobe-install: OPROBE_VERIFY must be auto, require or checksum" >&2; exit 1 ;; esac
 
 err() { echo "oprobe-install: $*" >&2; exit 1; }
 say() { echo "$*"; }
@@ -94,6 +113,38 @@ expected=$(grep " \*\{0,1\}$name.tar.gz\$" "$tmp/SHA256SUMS" | cut -d' ' -f1)
 if command -v sha256sum >/dev/null 2>&1; then actual=$(sha256sum "$tmp/$name.tar.gz" | cut -d' ' -f1)
 else actual=$(shasum -a 256 "$tmp/$name.tar.gz" | cut -d' ' -f1); fi
 { [ -n "$expected" ] && [ "$expected" = "$actual" ]; } || err "checksum mismatch for $name.tar.gz"
+
+# Provenance or signature (see the header). A failed verification is always fatal; a check
+# this machine cannot run is a warning, or fatal with OPROBE_VERIFY=require.
+verified=""
+if [ "$verify" != checksum ]; then
+  if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+    if gh attestation verify "$tmp/$name.tar.gz" --repo "$repo" \
+         --signer-workflow "$repo/.github/workflows/release.yml" >"$tmp/attest.log" 2>&1; then
+      verified="GitHub build provenance (gh attestation verify)"
+    else
+      cat "$tmp/attest.log" >&2
+      err "the build provenance of $name.tar.gz does not verify; nothing was installed"
+    fi
+  elif [ -n "$pubkey" ] && command -v minisign >/dev/null 2>&1 \
+       && fetch "$url/SHA256SUMS.minisig" "$tmp/SHA256SUMS.minisig" 2>/dev/null; then
+    if minisign -Vq -P "$pubkey" -m "$tmp/SHA256SUMS" -x "$tmp/SHA256SUMS.minisig" >/dev/null 2>&1; then
+      verified="minisign signature over SHA256SUMS"
+    else
+      err "the minisign signature of SHA256SUMS does not verify; nothing was installed"
+    fi
+  fi
+  if [ -z "$verified" ]; then
+    why="install gh and log in (gh auth login), or install minisign"
+    [ -n "$pubkey" ] || why="install gh and log in (gh auth login)"
+    if [ "$verify" = require ]; then
+      err "cannot verify the provenance or signature of $name.tar.gz ($why), or set OPROBE_VERIFY=auto"
+    fi
+    echo "oprobe-install: warning: only the SHA-256 checksum was verified; to check the provenance too, $why" >&2
+  else
+    say "Verified: $verified"
+  fi
+fi
 
 tar -xzf "$tmp/$name.tar.gz" -C "$tmp"
 mkdir -p "$dir"

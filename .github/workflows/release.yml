@@ -11,13 +11,18 @@ name: Release
 # Linux packages stay headless (CLI + terminal workbench) so servers need no GTK.
 #   SHA256SUMS, oprobe.rb (Homebrew formula `oprobe`), oprobe-app.rb (Homebrew cask `oprobe-app`
 #   for the .dmg), oprobe.json (Scoop manifest), winget-manifests.zip (winget manifests),
-#   latest.json (index of every asset with URL, size and SHA-256), install.sh, install.ps1
+#   latest.json (index of every asset with URL, size and SHA-256), install.sh, install.ps1,
+#   SHA256SUMS.minisig (minisign signature over SHA256SUMS; only when MINISIGN_KEY is set)
 # After publishing, package managers are updated when their secret exists (skipped with a
 # warning otherwise; stable releases only; docs/releasing.md):
 #   homebrew-tap  TAP_TOKEN     Formula/oprobe.rb + Casks/oprobe-app.rb -> hxddh/homebrew-tap
 #   scoop-bucket  SCOOP_TOKEN   bucket/oprobe.json -> hxddh/scoop-bucket
 #   winget        WINGET_TOKEN  a pull request to microsoft/winget-pkgs (hxddh.oprobe)
 # Every asset gets a SLSA build provenance attestation (`gh attestation verify FILE --repo …`).
+# Supply chain (design v5 §5): every action is pinned by commit SHA, and no release job uses a
+# cache (a poisoned cache could otherwise reach a published binary).
+#   crates.io     CARGO_REGISTRY_TOKEN  oprobe-trace, oprobe-core, oprobe (in that order)
+#   minisign      MINISIGN_KEY          SHA256SUMS.minisig
 # Nothing is code-signed (no Apple/Microsoft certificates): docs/install.md explains the first open.
 # Release notes are the CHANGELOG section of the version.
 
@@ -56,7 +61,7 @@ jobs:
       tag: ${{ steps.p.outputs.tag }}
       release: ${{ steps.p.outputs.release }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - id: p
         shell: bash
         env:
@@ -95,7 +100,7 @@ jobs:
     outputs:
       version: ${{ steps.v.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ env.TAG }}
       - id: v
@@ -107,22 +112,24 @@ jobs:
             echo "::error::tag $TAG does not match Cargo.toml version $crate"; exit 1
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: stable
       - name: Test
         run: cargo test --locked --all-targets
       - name: Generate man pages and shell completions
         run: |
-          cargo build --release --locked
+          # A debug build is enough to print the man pages and completions.
+          cargo build --locked
           mkdir -p dist/extras/man dist/extras/completions
-          ./target/release/oprobe man --out-dir dist/extras/man
+          ./target/debug/oprobe man --out-dir dist/extras/man
           for sh in bash zsh fish powershell elvish; do
-            ./target/release/oprobe completions "$sh" > "dist/extras/completions/$(case $sh in
+            ./target/debug/oprobe completions "$sh" > "dist/extras/completions/$(case $sh in
               bash) echo oprobe.bash;; zsh) echo _oprobe;; fish) echo oprobe.fish;;
               powershell) echo _oprobe.ps1;; elvish) echo oprobe.elv;; esac)"
           done
           ls -R dist/extras
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: extras
           path: dist/extras
@@ -146,20 +153,20 @@ jobs:
     env:
       VERSION: ${{ needs.meta.outputs.version }}
       TAG: ${{ needs.plan.outputs.tag }}
+      # Embedded in `oprobe self-update` (minisign verification of SHA256SUMS; docs/releasing.md).
+      OPROBE_MINISIGN_PUBKEY: ${{ vars.MINISIGN_PUBKEY }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ env.TAG }}
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
       - name: Install musl tools
         if: matrix.musl
         run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: extras
           path: dist/extras
@@ -230,11 +237,11 @@ jobs:
           "$bin" run memory:// -d 1s --warmup 200ms -q -o html --no-save > smoke.html
           grep -q '<svg class="viz"' smoke.html
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: dist-${{ matrix.target }}
           path: out/*
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: runner.os == 'macOS'
         with:
           name: bin-${{ matrix.target }}
@@ -248,12 +255,12 @@ jobs:
       VERSION: ${{ needs.meta.outputs.version }}
       TAG: ${{ needs.plan.outputs.tag }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ env.TAG }}
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with: { pattern: "bin-*", merge-multiple: true, path: bin }
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with: { name: extras, path: dist/extras }
       - name: lipo + archive + pkg
         run: |
@@ -283,7 +290,7 @@ jobs:
           hdiutil create -volname "oprobe $VERSION" -srcfolder dmg -fs HFS+ -size "${size_mb}m" \
             -ov -format UDZO "out/oprobe-${VERSION}-macos-universal.dmg"
           hdiutil verify "out/oprobe-${VERSION}-macos-universal.dmg"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: dist-universal-apple-darwin
           path: out/*
@@ -295,15 +302,15 @@ jobs:
     env:
       VERSION: ${{ needs.meta.outputs.version }}
       TAG: ${{ needs.plan.outputs.tag }}
+      OPROBE_MINISIGN_PUBKEY: ${{ vars.MINISIGN_PUBKEY }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ env.TAG }}
-      - uses: dtolnay/rust-toolchain@stable
-      - run: sudo apt-get update && sudo apt-get install -y libgtk-4-dev
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
-          key: desktop
+          toolchain: stable
+      - run: sudo apt-get update && sudo apt-get install -y libgtk-4-dev
       - run: cargo build --release --locked --features gui
       - name: Tarball with .desktop entry, icon and install.sh
         run: |
@@ -318,7 +325,7 @@ jobs:
           chmod +x "$d/install.sh"
           ./target/release/oprobe --version
           tar -C stage -czf "out/$name.tar.gz" "$name"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: dist-linux-desktop
           path: out/*
@@ -335,21 +342,50 @@ jobs:
       VERSION: ${{ needs.meta.outputs.version }}
       TAG: ${{ needs.plan.outputs.tag }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ env.TAG }}
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with: { pattern: "dist-*", merge-multiple: true, path: out }
       - name: Checksums, Homebrew formula + cask, Scoop, winget, latest.json, installers
+        env:
+          MINISIGN_PUBKEY: ${{ vars.MINISIGN_PUBKEY }}
         run: |
           cp scripts/install.sh scripts/install.ps1 out/
+          # The installers embed the minisign public key (repository variable MINISIGN_PUBKEY).
+          if [ -n "$MINISIGN_PUBKEY" ]; then
+            case "$MINISIGN_PUBKEY" in *[!A-Za-z0-9+/=]*) echo "::error::MINISIGN_PUBKEY is not a base64 minisign key"; exit 1;; esac
+            sed -i "s|^embedded_pubkey=\"\"|embedded_pubkey=\"$MINISIGN_PUBKEY\"|" out/install.sh
+            sed -i "s|^\\\$embeddedPubkey = ''|\$embeddedPubkey = '$MINISIGN_PUBKEY'|" out/install.ps1
+            grep -q "$MINISIGN_PUBKEY" out/install.sh && grep -q "$MINISIGN_PUBKEY" out/install.ps1
+          fi
           (cd out && sha256sum * | sort -k2 > SHA256SUMS)
           scripts/release-manifests.sh "$VERSION" out "${{ github.repository }}"
           # The checksums cover the generated manifests too.
           (cd out && rm SHA256SUMS && sha256sum * | sort -k2 > SHA256SUMS)
           cat out/SHA256SUMS
+      # A minisign signature over SHA256SUMS, for installs without `gh` (install.sh, install.ps1
+      # and `oprobe self-update` verify it with the public key they embed). The MINISIGN_KEY
+      # secret holds an unencrypted minisign secret key (`minisign -G -W`; docs/releasing.md).
+      # Without the secret the step is skipped with a warning and the release stays green.
+      - name: Sign SHA256SUMS (minisign)
+        env:
+          MINISIGN_KEY: ${{ secrets.MINISIGN_KEY }}
+        run: |
+          if [ -z "$MINISIGN_KEY" ]; then
+            echo "::warning::MINISIGN_KEY not set; SHA256SUMS is not signed (installers then rely on the build provenance attestation; docs/releasing.md#signing)"
+            exit 0
+          fi
+          sudo apt-get update -qq && sudo apt-get install -y -qq minisign
+          umask 077
+          key="$RUNNER_TEMP/minisign.key"
+          printf '%s\n' "$MINISIGN_KEY" > "$key"
+          minisign -S -s "$key" -m out/SHA256SUMS -x out/SHA256SUMS.minisig \
+            -t "oprobe $VERSION SHA256SUMS"
+          rm -f "$key"
+          cat out/SHA256SUMS.minisig
       - name: Build provenance (SLSA) for every asset
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
         with:
           subject-path: out/*
       - name: Release notes from CHANGELOG
@@ -363,9 +399,9 @@ jobs:
             echo "Homebrew: \`brew install hxddh/tap/oprobe\` (the app: \`brew install --cask hxddh/tap/oprobe-app\`) ·"
             echo "Windows: the \`.msi\`, Scoop (\`scoop bucket add hxddh https://github.com/hxddh/scoop-bucket\` then \`scoop install oprobe\`), or \`winget install hxddh.oprobe\` once its winget-pkgs pull request is merged · update: \`oprobe self-update\`."
             echo "The macOS and Windows packages are not code-signed; first open: [docs/install.md](https://github.com/${{ github.repository }}/blob/v$VERSION/docs/install.md#first-open-of-unsigned-packages)."
-            echo "Verify: \`sha256sum -c SHA256SUMS --ignore-missing\` and \`gh attestation verify <file> --repo ${{ github.repository }}\`."
+            echo "Verify: \`sha256sum -c SHA256SUMS --ignore-missing\`, then \`gh attestation verify <file> --repo ${{ github.repository }}\` or \`minisign -Vm SHA256SUMS -P <key from docs/install.md>\`."
           } >> notes.md
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           tag_name: ${{ env.TAG }}
           name: oprobe ${{ env.VERSION }}
@@ -403,10 +439,12 @@ jobs:
     env:
       TAG: ${{ needs.plan.outputs.tag }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ env.TAG }}
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: stable
       - name: cargo publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
@@ -414,8 +452,16 @@ jobs:
           if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
             echo "::warning::CARGO_REGISTRY_TOKEN not set; skipping crates.io publish"; exit 0
           fi
-          # oprobe-trace, then oprobe-core, then oprobe (cargo orders the workspace).
-          cargo publish --workspace --locked
+          # In dependency order; each `cargo publish` waits until the crate is in the index. A
+          # crate of this version that is already published (a re-run) is skipped.
+          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          for crate in oprobe-trace oprobe-core oprobe; do
+            if curl -fsS -A "oprobe-release (github.com/${{ github.repository }})" \
+                 "https://crates.io/api/v1/crates/$crate/$version" >/dev/null 2>&1; then
+              echo "$crate $version is already on crates.io"; continue
+            fi
+            cargo publish --locked -p "$crate"
+          done
 
   # Package managers. Each job is gated on its secret: without it, the job ends with a warning
   # and the release stays green. Pre-releases are never published to them.
@@ -441,7 +487,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
         run: gh release download "$TAG" --repo "$REPO" --pattern oprobe.rb --pattern oprobe-app.rb --dir manifests
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         if: steps.gate.outputs.skip != 'true'
         with:
           repository: hxddh/homebrew-tap
@@ -483,7 +529,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
         run: gh release download "$TAG" --repo "$REPO" --pattern oprobe.json --dir manifests
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         if: steps.gate.outputs.skip != 'true'
         with:
           repository: hxddh/scoop-bucket
@@ -520,7 +566,7 @@ jobs:
             echo "::warning::WINGET_TOKEN not set; skipping the winget pull request (submit winget-manifests.zip by hand; docs/releasing.md#winget)"
             echo "skip=true" >> "$GITHUB_OUTPUT"
           fi
-      - uses: vedantmgoyal9/winget-releaser@v2
+      - uses: vedantmgoyal9/winget-releaser@b7370d4d152efdce803a26cc6ca9eee58cb2ad54 # v2
         if: steps.gate.outputs.skip != 'true'
         with:
           identifier: hxddh.oprobe

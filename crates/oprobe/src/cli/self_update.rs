@@ -9,6 +9,14 @@
 //!
 //! A GitHub refusal (403, 429, 5xx) is a network error (`net.unreachable`), never a storage one.
 //!
+//! After the SHA-256 check the download is verified further (design v5 §5), as the installers do:
+//! 1. its GitHub build provenance attestation (`gh attestation verify`), when `gh` is installed
+//!    and logged in;
+//! 2. otherwise the minisign signature over `SHA256SUMS` (`SHA256SUMS.minisig`) with the public
+//!    key embedded at build time (`OPROBE_MINISIGN_PUBKEY`, set by the release workflow);
+//! 3. otherwise a warning, or a refusal with `--verify require`.
+//! A verification that fails always refuses the update.
+//!
 //! Installs owned by a package manager (Homebrew, apt/dnf, the macOS .pkg or .app, Scoop,
 //! winget, the MSI, cargo) are refused with the manager's own update command, so the manager's
 //! records stay true.
@@ -22,7 +30,7 @@ use serde::{Deserialize, Serialize};
 use sha2::Digest;
 
 use super::Ctx;
-use super::args::SelfUpdateArgs;
+use super::args::{SelfUpdateArgs, VerifyPolicy};
 use crate::errors::{ErrorCode, OprobeError};
 use crate::output::CommandOutput;
 use crate::report::style::{bold, dim, green, yellow};
@@ -36,6 +44,89 @@ const DEFAULT_API: &str = "https://api.github.com";
 const DEFAULT_RELEASE_BASE: &str = "https://github.com/hxddh/oprobe/releases";
 /// Largest archive accepted.
 const MAX_ASSET_BYTES: u64 = 256 * 1024 * 1024;
+/// The release workflow that builds and attests every asset (`gh attestation verify
+/// --signer-workflow`).
+const SIGNER_WORKFLOW: &str = "hxddh/oprobe/.github/workflows/release.yml";
+/// The minisign public key of the releases, embedded at build time by the release workflow
+/// (repository variable `MINISIGN_PUBKEY`; docs/releasing.md). `OPROBE_MINISIGN_PUBKEY` at run
+/// time overrides it (mirrors, tests).
+const EMBEDDED_MINISIGN_KEY: Option<&str> = option_env!("OPROBE_MINISIGN_PUBKEY");
+
+/// How a download was verified beyond its SHA-256 (`SHA256SUMS` comes from the same release).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum VerifiedBy {
+    /// The GitHub build provenance attestation of the release workflow (`gh attestation verify`).
+    GithubAttestation,
+    /// The minisign signature over `SHA256SUMS` with the embedded public key.
+    Minisign,
+    /// Only the SHA-256 checksum (neither check could run here).
+    ChecksumOnly,
+}
+
+/// The minisign public key to verify `SHA256SUMS.minisig` with, if any.
+fn minisign_key() -> Option<String> {
+    std::env::var("OPROBE_MINISIGN_PUBKEY")
+        .ok()
+        .or_else(|| EMBEDDED_MINISIGN_KEY.map(str::to_owned))
+        .map(|k| k.trim().to_owned())
+        .filter(|k| !k.is_empty())
+}
+
+/// Verify the minisign signature `sig` (a `.minisig` file) of `sums` with `pubkey` (base64).
+/// Only prehashed (current minisign) signatures are accepted.
+pub fn verify_minisign(pubkey: &str, sums: &[u8], sig: &str) -> Result<()> {
+    let pk = minisign_verify::PublicKey::from_base64(pubkey.trim())
+        .map_err(|e| anyhow::anyhow!("invalid minisign public key: {e}"))?;
+    let sig = minisign_verify::Signature::decode(sig)
+        .map_err(|e| anyhow::anyhow!("invalid SHA256SUMS.minisig: {e}"))?;
+    pk.verify(sums, &sig, false)
+        .map_err(|e| anyhow::anyhow!("the minisign signature of SHA256SUMS does not verify: {e}"))
+}
+
+/// `gh` is installed and logged in (so `gh attestation verify` can reach the API).
+fn gh_ready() -> bool {
+    std::process::Command::new("gh")
+        .args(["auth", "status"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// `gh attestation verify` on the downloaded archive (written to a temporary file).
+fn gh_attestation_verify(name: &str, bytes: &[u8]) -> Result<()> {
+    let dir = std::env::temp_dir().join(format!("oprobe-update-{}", std::process::id()));
+    std::fs::create_dir_all(&dir)?;
+    let file = dir.join(name);
+    let res = (|| -> Result<std::process::Output> {
+        std::fs::write(&file, bytes)?;
+        Ok(std::process::Command::new("gh")
+            .arg("attestation")
+            .arg("verify")
+            .arg(&file)
+            .args(["--repo", REPO, "--signer-workflow", SIGNER_WORKFLOW])
+            .stdin(std::process::Stdio::null())
+            .output()?)
+    })();
+    let _ = std::fs::remove_dir_all(&dir);
+    let o = res?;
+    if o.status.success() {
+        return Ok(());
+    }
+    Err(OprobeError::new(
+        ErrorCode::SafetyRefused,
+        format!(
+            "the build provenance of {name} does not verify: {}; nothing was installed",
+            String::from_utf8_lossy(&o.stderr).trim()
+        ),
+    )
+    .with_hint(format!(
+        "download it by hand and check it with `gh attestation verify {name} --repo {REPO}`"
+    ))
+    .into())
+}
 
 /// How this binary was installed.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, JsonSchema)]
@@ -277,6 +368,9 @@ pub struct UpdateOutput {
     pub release_url: String,
     /// Where the release was found.
     pub release_source: ReleaseSource,
+    /// How the installed download was verified beyond its SHA-256 (set when installed).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verified_by: Option<VerifiedBy>,
 }
 
 /// Where `self-update` found the release.
@@ -299,8 +393,13 @@ impl CommandOutput for UpdateOutput {
                 bold(&self.latest_version),
                 dim(&format!("({})", self.executable)),
                 dim(&format!(
-                    "verified sha256 {} · release notes: {}",
+                    "verified sha256 {}{} · release notes: {}",
                     self.sha256.as_deref().unwrap_or("-"),
+                    match self.verified_by {
+                        Some(VerifiedBy::GithubAttestation) => " and the build provenance",
+                        Some(VerifiedBy::Minisign) => " and the minisign signature",
+                        _ => "",
+                    },
                     self.release_url
                 ))
             );
@@ -567,6 +666,7 @@ pub async fn cmd_self_update(a: SelfUpdateArgs, ctx: &Ctx) -> Result<u8> {
         sha256: None,
         release_url: rel.html_url.clone(),
         release_source: rel.source,
+        verified_by: None,
     };
     if a.check || (!available && !a.force) {
         return ctx.out.finish(&out);
@@ -648,6 +748,8 @@ pub async fn cmd_self_update(a: SelfUpdateArgs, ctx: &Ctx) -> Result<u8> {
         )
         .into());
     }
+    let verified_by =
+        verify_download(&http, &rel, &asset.name, &bytes, &got, a.verify, ctx).await?;
     let bin = extract_binary(&asset.name, &bytes)?;
     // The new binary must run here before it replaces this one.
     let probe = exe.with_file_name(format!(".oprobe-check-{}", std::process::id()));
@@ -661,7 +763,77 @@ pub async fn cmd_self_update(a: SelfUpdateArgs, ctx: &Ctx) -> Result<u8> {
     out.installed = true;
     out.asset = Some(asset.name.clone());
     out.sha256 = Some(got);
+    out.verified_by = Some(verified_by);
     ctx.out.finish(&out)
+}
+
+/// The provenance or signature check after the SHA-256 matched (see the module docs).
+async fn verify_download(
+    http: &reqwest::Client,
+    rel: &Release,
+    name: &str,
+    bytes: &[u8],
+    sha256: &str,
+    policy: VerifyPolicy,
+    ctx: &Ctx,
+) -> Result<VerifiedBy> {
+    if policy == VerifyPolicy::Checksum {
+        return Ok(VerifiedBy::ChecksumOnly);
+    }
+    if gh_ready() {
+        ctx.out.info(dim(
+            "verifying the build provenance (gh attestation verify)…",
+        ));
+        gh_attestation_verify(name, bytes)?;
+        return Ok(VerifiedBy::GithubAttestation);
+    }
+    if let Some(key) = minisign_key() {
+        let url_of = |file: &str| {
+            rel.assets
+                .iter()
+                .find(|x| x.name == file)
+                .map(|x| x.url.clone())
+                .unwrap_or_else(|| {
+                    let base = env_url("OPROBE_RELEASE_BASE")
+                        .unwrap_or_else(|| DEFAULT_RELEASE_BASE.to_owned());
+                    format!("{base}/download/{}/{file}", rel.tag)
+                })
+        };
+        // An unsigned release (no MINISIGN_KEY secret at release time) is not an error here.
+        if let Ok(sig) = get(http, &url_of("SHA256SUMS.minisig"), false).await {
+            let sums = get(http, &url_of("SHA256SUMS"), false).await?;
+            verify_minisign(&key, &sums, &String::from_utf8_lossy(&sig)).map_err(|e| {
+                OprobeError::new(
+                    ErrorCode::SafetyRefused,
+                    format!("{e:#}; nothing was installed"),
+                )
+            })?;
+            let listed = parse_sums(&String::from_utf8_lossy(&sums))
+                .into_iter()
+                .any(|(h, n)| n == name && h == sha256);
+            if !listed {
+                return Err(OprobeError::new(
+                    ErrorCode::SafetyRefused,
+                    format!("the signed SHA256SUMS does not list {name} with sha256 {sha256}; nothing was installed"),
+                )
+                .into());
+            }
+            return Ok(VerifiedBy::Minisign);
+        }
+    }
+    if policy == VerifyPolicy::Require {
+        return Err(OprobeError::new(
+            ErrorCode::SafetyRefused,
+            format!("cannot verify the provenance or signature of {name}; nothing was installed"),
+        )
+        .with_hint("install the GitHub CLI and run `gh auth login`, or use `--verify auto`")
+        .into());
+    }
+    ctx.out.warn(format!(
+        "only the SHA-256 of {name} was verified (from the same release); install the GitHub CLI and \
+         run `gh auth login` to check its build provenance too"
+    ));
+    Ok(VerifiedBy::ChecksumOnly)
 }
 
 /// Write `bin` to `path`, run `--version` and expect `version` in its output.
@@ -817,6 +989,32 @@ mod tests {
         assert_eq!(r.assets[0].url, "u");
         assert_eq!(tag_of("4.0.0"), "v4.0.0");
         assert_eq!(tag_of("v4.0.0"), "v4.0.0");
+    }
+
+    #[test]
+    fn minisign_signatures_verify_sha256sums() {
+        // A throwaway key made for this test (prehashed signature, as `minisign -S` writes).
+        const PK: &str = "RWT5BelBCpdB7JZFeDj9viCtmo6Tow9Vzc2nDqm095pRgF+Xxu8IBcqR";
+        const SIG: &str = "untrusted comment: signature from minisign secret key
+RUT5BelBCpdB7K6uKmM0T/3YNhamXtGJ5BH7k9uv5EgDmqZw6qljOKYxYFu1e3bWFu35L917AlG9SufjYEYA6CoXkuxCfzcA9QA=
+trusted comment: timestamp:1795000000\tfile:SHA256SUMS\tprehashed
+SgikQTFX/Syln1hI+LDybO9kMP7+PBjqgdwu7DQBQ/JbllOgTMfZxOBhKm49HpLxsylv4HxymuGry0ivJoVSDg==";
+        let sums = b"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad  oprobe-5.0.0-x.tar.gz\n";
+        verify_minisign(PK, sums, SIG).unwrap();
+        let mut tampered = sums.to_vec();
+        tampered[0] = b'c';
+        assert!(verify_minisign(PK, &tampered, SIG).is_err());
+        // Another key (the minisign-verify crate's test key) is refused.
+        assert!(
+            verify_minisign(
+                "RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3",
+                sums,
+                SIG
+            )
+            .is_err()
+        );
+        assert!(verify_minisign("not a key", sums, SIG).is_err());
+        assert!(verify_minisign(PK, sums, "garbage").is_err());
     }
 
     #[test]
