@@ -185,6 +185,9 @@ pub struct ConfigFile {
     pub defaults: Defaults,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub targets: BTreeMap<String, TargetEntry>,
+    /// Workers of distributed runs (`oprobe run --workers config`, design v5 §8).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workers: Option<crate::distributed::WorkersConfig>,
 }
 
 /// Where an effective value comes from.

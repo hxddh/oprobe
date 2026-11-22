@@ -46,7 +46,23 @@ pub struct WorkerSet {
     /// `local:N`: spawn N local worker processes instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local: Option<u32>,
-    /// The shared token (`--worker-token-file`; else `$OPROBE_WORKER_TOKEN`).
+    /// The shared token (`--worker-token-file`; else `[workers].token_file`, else
+    /// `$OPROBE_WORKER_TOKEN`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_file: Option<PathBuf>,
+    /// `--workers config`: the workers of the config file's `[workers]` table.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub from_config: bool,
+}
+
+/// `[workers]` in the config file.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkersConfig {
+    /// `host:port[*WEIGHT]` of each `oprobe worker` (`https://host:port` for TLS workers).
+    #[serde(default)]
+    pub addrs: Vec<String>,
+    /// The token file the workers were started with.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_file: Option<PathBuf>,
 }
@@ -55,13 +71,20 @@ pub struct WorkerSet {
 pub const MAX_LOCAL_WORKERS: u32 = 64;
 
 impl WorkerSet {
-    /// Parse `--workers`: `local:N` or `host:port[*WEIGHT][,host:port…]`.
+    /// Parse `--workers`: `local:N`, `config` (the config file's `[workers]`) or
+    /// `host:port[*WEIGHT][,host:port…]`.
     pub fn parse(v: &str) -> Result<Self, OprobeError> {
         let v = v.trim();
         let bad = |m: String| {
             OprobeError::new(ErrorCode::UsageInvalidArgument, m)
-                .with_hint("use host:port,host:port or local:N")
+                .with_hint("use host:port,host:port, local:N or config")
         };
+        if v == "config" {
+            return Ok(Self {
+                from_config: true,
+                ..Self::default()
+            });
+        }
         if let Some(n) = v.strip_prefix("local:") {
             let n: u32 = n
                 .trim()
@@ -118,13 +141,32 @@ impl WorkerSet {
 
     /// Check a worker set before a run.
     pub fn check_supported(&self) -> Result<(), OprobeError> {
-        if self.local.is_none() && self.workers.is_empty() {
+        if self.local.is_none() && self.workers.is_empty() && !self.from_config {
             return Err(
                 OprobeError::new(ErrorCode::UsageInvalidArgument, "no workers given")
                     .with_hint("use host:port,host:port or local:N"),
             );
         }
         Ok(())
+    }
+
+    /// Fill a `--workers config` set (and a missing token file) from `[workers]`.
+    pub fn with_config(mut self, cfg: Option<&WorkersConfig>) -> Result<Self> {
+        if self.from_config {
+            let cfg = cfg.filter(|c| !c.addrs.is_empty()).ok_or_else(|| {
+                OprobeError::new(
+                    ErrorCode::ConfigInvalid,
+                    "--workers config needs a [workers] table with addrs in the config file",
+                )
+                .with_hint("add [workers] addrs = [\"host:port\", …] to the config file (`oprobe config edit`)")
+            })?;
+            self.workers = Self::parse(&cfg.addrs.join(","))?.workers;
+            self.from_config = false;
+        }
+        if self.token_file.is_none() && self.local.is_none() {
+            self.token_file = cfg.and_then(|c| c.token_file.clone());
+        }
+        Ok(self)
     }
 
     /// The token remote workers expect.
@@ -166,6 +208,7 @@ pub async fn run(
         .with_hint("run the distributed run once per repetition")
         .into());
     }
+    let set = &set.clone().with_config(ctx.config()?.workers.as_ref())?;
     let profile = r.profile;
     profile.validate()?;
     let rails = crate::app::run::rails(ctx, &profile, &req.safety)?;
@@ -393,6 +436,7 @@ mod tests {
                 .collect(),
             token_file: Some(w.token_file.clone()),
             local: None,
+            from_config: false,
         });
         req
     }
@@ -567,5 +611,23 @@ mod tests {
         assert!(WorkerSet::parse("a:1*0").is_err());
         assert!(w.check_supported().is_ok());
         assert!(WorkerSet::default().check_supported().is_err());
+        // `config`: the [workers] table, its token file unless one was given.
+        let c = WorkersConfig {
+            addrs: vec!["h1:7070".into(), "h2:7070*3".into()],
+            token_file: Some("/t".into()),
+        };
+        let set = WorkerSet::parse("config")
+            .unwrap()
+            .with_config(Some(&c))
+            .unwrap();
+        assert_eq!(set.workers.len(), 2);
+        assert_eq!(set.workers[1].weight, 3.0);
+        assert_eq!(set.token_file.as_deref(), Some(std::path::Path::new("/t")));
+        assert!(
+            WorkerSet::parse("config")
+                .unwrap()
+                .with_config(None)
+                .is_err()
+        );
     }
 }

@@ -1,0 +1,56 @@
+{
+  "$id": "https://github.com/hxddh/oprobe/schemas/4/client-hello-reply.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "oprobe client protocol: the adapter's answer to hello",
+  "properties": {
+    "client": {
+      "description": "The client library, e.g. `boto3`, `awscrt`, `aws-sdk-go-v2`.",
+      "type": "string"
+    },
+    "features": {
+      "description": "Optional features: `if_match`, `if_none_match`, `metadata`, `batch_delete`.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "ops": {
+      "description": "Operations it implements (default: all of `get put head delete list copy`).",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "phases": {
+      "default": [],
+      "description": "Request stages the adapter measures (`queue`, `connect`, `send`, `ttfb`, `body`):\nfindings that need other stages are suppressed.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "protocol": {
+      "description": "The protocol the adapter speaks (`oprobe.client/1`); the major version must match.",
+      "type": "string"
+    },
+    "type": {
+      "default": "",
+      "description": "`hello`.",
+      "type": "string"
+    },
+    "version": {
+      "description": "Its version.",
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "protocol",
+    "client"
+  ],
+  "title": "oprobe client-hello-reply",
+  "type": "object",
+  "x-rust-type": "HelloReply"
+}

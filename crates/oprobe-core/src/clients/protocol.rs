@@ -115,14 +115,26 @@ pub enum OpName {
 /// A byte range of a `get`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct WireRange {
-    /// First byte (absent with `suffix`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// First byte (absent with `suffix_bytes`).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "offset_bytes"
+    )]
     pub offset: Option<u64>,
-    /// Bytes from `offset` (absent: to the end).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Bytes from the offset (absent: to the end).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "length_bytes"
+    )]
     pub length: Option<u64>,
     /// The last N bytes (`Range: bytes=-N`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "suffix_bytes"
+    )]
     pub suffix: Option<u64>,
 }
 
@@ -143,7 +155,11 @@ pub struct WireOp {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub range: Option<WireRange>,
     /// `put`: payload size.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "size_bytes"
+    )]
     pub size: Option<u64>,
     /// `put`: the payload, base64 (standard alphabet, padded).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -231,7 +247,7 @@ pub struct WireAttempt {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct WireEntry {
     pub key: String,
-    #[serde(default)]
+    #[serde(default, rename = "size_bytes")]
     pub size: u64,
     /// A common prefix (non-recursive listings).
     #[serde(default)]
@@ -261,7 +277,11 @@ pub struct WireResult {
     #[serde(default)]
     pub bytes: u64,
     /// The object's total size (`get`, `head`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "size_bytes"
+    )]
     pub size: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub etag: Option<String>,
@@ -275,10 +295,10 @@ pub struct WireResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phases: Option<WirePhases>,
     /// Attempts made (1 + retries).
-    #[serde(default = "one")]
+    #[serde(default = "one", rename = "attempts_count")]
     pub attempts: u32,
-    /// HTTP requests the operation issued (list pages, batch deletes); default 1.
-    #[serde(default = "one")]
+    /// HTTP requests the operation issued (list pages, per-key deletes); default 1.
+    #[serde(default = "one", rename = "requests_count")]
     pub requests: u32,
     /// Every attempt, when the client reports them (status, timing).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

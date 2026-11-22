@@ -95,6 +95,9 @@ pub async fn spawn(n: u32) -> Result<LocalWorkers> {
             .args(["worker", "--listen", "127.0.0.1:0", "--token-file"])
             .arg(&token_file)
             .arg("--exit-with-stdin")
+            // This machine's user started them: an exec client here is no wider than running
+            // it directly (the token is private and random).
+            .arg("--allow-exec")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit())

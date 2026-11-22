@@ -117,7 +117,7 @@ def finish(op, status, extra=None, error=None, body_us=0):
         "t_start_us": log[0]["t_start_us"],
         "t_end_us": log[-1]["t_end_us"],
         "phases": log[-1]["phases"],
-        "attempts": len([a for a in log if a.get("status", 0) or a.get("error")]) or 1,
+        "attempts_count": len([a for a in log if a.get("status", 0) or a.get("error")]) or 1,
         "http_version": "http1",
     }
     if len(log) > 1:
@@ -147,10 +147,10 @@ def do(s3, bucket, op):
             args = {"Bucket": bucket, "Key": op["key"]}
             rg = op.get("range")
             if rg:
-                if rg.get("suffix") is not None:
-                    args["Range"] = f"bytes=-{rg['suffix']}"
+                if rg.get("suffix_bytes") is not None:
+                    args["Range"] = f"bytes=-{rg['suffix_bytes']}"
                 else:
-                    off, ln = rg.get("offset", 0), rg.get("length")
+                    off, ln = rg.get("offset_bytes", 0), rg.get("length_bytes")
                     args["Range"] = f"bytes={off}-" + (str(off + ln - 1) if ln else "")
             resp = s3.get_object(**args)
             t0 = now_us()
@@ -161,7 +161,7 @@ def do(s3, bucket, op):
             if cr and "/" in cr:
                 size = int(cr.rsplit("/", 1)[1])
             return finish(op, resp["ResponseMetadata"]["HTTPStatusCode"],
-                          {"bytes": len(data), "size": size, "etag": resp.get("ETag")}, body_us=body_us)
+                          {"bytes": len(data), "size_bytes": size, "etag": resp.get("ETag")}, body_us=body_us)
         if kind == "put":
             body = base64.b64decode(op.get("data_b64") or "")
             args = {"Bucket": bucket, "Key": op["key"], "Body": body}
@@ -179,7 +179,7 @@ def do(s3, bucket, op):
         if kind == "head":
             resp = s3.head_object(Bucket=bucket, Key=op["key"])
             return finish(op, resp["ResponseMetadata"]["HTTPStatusCode"],
-                          {"size": resp.get("ContentLength", 0), "etag": resp.get("ETag")})
+                          {"size_bytes": resp.get("ContentLength", 0), "etag": resp.get("ETag")})
         if kind == "delete":
             keys = op.get("keys") or []
             if len(keys) == 1:
@@ -198,9 +198,9 @@ def do(s3, bucket, op):
             for page in s3.get_paginator("list_objects_v2").paginate(**args):
                 pages += 1
                 status = page["ResponseMetadata"]["HTTPStatusCode"]
-                entries += [{"key": o["Key"], "size": o.get("Size", 0)} for o in page.get("Contents", [])]
+                entries += [{"key": o["Key"], "size_bytes": o.get("Size", 0)} for o in page.get("Contents", [])]
                 entries += [{"key": p["Prefix"], "dir": True} for p in page.get("CommonPrefixes", [])]
-            r = finish(op, status, {"entries": entries, "requests": max(1, pages)})
+            r = finish(op, status, {"entries": entries, "requests_count": max(1, pages)})
             r.pop("attempt_log", None)
             return r
         if kind == "copy":

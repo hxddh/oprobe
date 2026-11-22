@@ -772,11 +772,12 @@ pub struct LoadArgs {
     /// speaking the oprobe client protocol, see docs/clients.md). Not stored in the run's spec
     #[arg(long, value_name = "CLIENT")]
     pub client: Option<String>,
-    /// Distribute the run over workers: host:port[*WEIGHT],… of `oprobe worker`, or local:N
-    /// to start N worker processes here
+    /// Distribute the run over workers: host:port[*WEIGHT],… of `oprobe worker`, local:N to
+    /// start N worker processes here, or config for the config file's [workers]
     #[arg(long, value_name = "WORKERS")]
     pub workers: Option<String>,
-    /// The token file the remote workers were started with (default: $OPROBE_WORKER_TOKEN)
+    /// The token file the remote workers were started with (default: [workers].token_file,
+    /// then $OPROBE_WORKER_TOKEN)
     #[arg(long, value_name = "FILE", requires = "workers")]
     pub worker_token_file: Option<std::path::PathBuf>,
 }

@@ -78,9 +78,9 @@ type hello struct {
 }
 
 type wireRange struct {
-	Offset *uint64 `json:"offset"`
-	Length *uint64 `json:"length"`
-	Suffix *uint64 `json:"suffix"`
+	Offset *uint64 `json:"offset_bytes"`
+	Length *uint64 `json:"length_bytes"`
+	Suffix *uint64 `json:"suffix_bytes"`
 }
 
 type op struct {
@@ -121,7 +121,7 @@ type attempt struct {
 
 type entry struct {
 	Key  string `json:"key"`
-	Size int64  `json:"size"`
+	Size int64  `json:"size_bytes"`
 	Dir  bool   `json:"dir,omitempty"`
 }
 
@@ -135,13 +135,13 @@ type result struct {
 	OK          bool      `json:"ok"`
 	Status      int       `json:"status"`
 	Bytes       uint64    `json:"bytes"`
-	Size        *uint64   `json:"size,omitempty"`
+	Size        *uint64   `json:"size_bytes,omitempty"`
 	ETag        string    `json:"etag,omitempty"`
 	TStartUS    uint64    `json:"t_start_us"`
 	TEndUS      uint64    `json:"t_end_us"`
 	Phases      *phases   `json:"phases,omitempty"`
-	Attempts    int       `json:"attempts"`
-	Requests    int       `json:"requests"`
+	Attempts    int       `json:"attempts_count"`
+	Requests    int       `json:"requests_count"`
 	AttemptLog  []attempt `json:"attempt_log,omitempty"`
 	Entries     []entry   `json:"entries,omitempty"`
 	FailedKeys  []string  `json:"failed_keys,omitempty"`

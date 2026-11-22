@@ -131,7 +131,7 @@ def result(op, status, log, **extra):
         "status": status,
         "t_start_us": log[0]["t_start_us"],
         "t_end_us": log[-1]["t_end_us"],
-        "attempts": len(log),
+        "attempts_count": len(log),
         "phases": log[-1]["phases"],
         "http_version": "http1",
     }
@@ -147,11 +147,11 @@ def do(cli, op):
         headers = {}
         rg = op.get("range")
         if rg:
-            if rg.get("suffix") is not None:
-                headers["Range"] = f"bytes=-{rg['suffix']}"
+            if rg.get("suffix_bytes") is not None:
+                headers["Range"] = f"bytes=-{rg['suffix_bytes']}"
             else:
-                off = rg.get("offset", 0)
-                ln = rg.get("length")
+                off = rg.get("offset_bytes", 0)
+                ln = rg.get("length_bytes")
                 headers["Range"] = f"bytes={off}-" + (str(off + ln - 1) if ln else "")
         status, hdrs, data, log = cli.exchange("GET", cli.path(op["key"]), headers=headers)
         size = None
@@ -162,7 +162,7 @@ def do(cli, op):
             size = len(data)
         extra = {"bytes": len(data) if 200 <= status < 300 else 0, "etag": hdrs.get("ETag")}
         if size is not None:
-            extra["size"] = size
+            extra["size_bytes"] = size
         if not 200 <= status < 300:
             extra["error"] = error_of(status, data, log[-1].get("error", ""))
         return result(op, status, log, **extra)
@@ -183,7 +183,7 @@ def do(cli, op):
         status, hdrs, data, log = cli.exchange("HEAD", cli.path(op["key"]))
         extra = {"etag": hdrs.get("ETag")}
         if 200 <= status < 300:
-            extra["size"] = int(hdrs.get("Content-Length") or 0)
+            extra["size_bytes"] = int(hdrs.get("Content-Length") or 0)
         else:
             extra["error"] = error_of(status, b"", "NoSuchKey" if status == 404 else "")
         return result(op, status, log, **extra)
@@ -197,7 +197,7 @@ def do(cli, op):
                 failed.append(key)
         status = 204 if not failed else last
         return result(op, status, logs or [{"t_start_us": now_us(), "t_end_us": now_us(), "phases": {}}],
-                      requests=max(1, len(op.get("keys") or [])), failed_keys=failed)
+                      requests_count=max(1, len(op.get("keys") or [])), failed_keys=failed)
     if kind == "list":
         entries, logs, token = [], [], None
         while True:
@@ -211,17 +211,17 @@ def do(cli, op):
             status, _, data, log = cli.exchange("GET", cli.path(query=q))
             logs.extend(log)
             if not 200 <= status < 300:
-                return result(op, status, logs, requests=len(logs), error=error_of(status, data))
+                return result(op, status, logs, requests_count=len(logs), error=error_of(status, data))
             root = ET.fromstring(data)
             ns = root.tag.split("}")[0] + "}" if root.tag.startswith("{") else ""
             for c in root.findall(f"{ns}Contents"):
-                entries.append({"key": c.findtext(f"{ns}Key"), "size": int(c.findtext(f"{ns}Size") or 0)})
+                entries.append({"key": c.findtext(f"{ns}Key"), "size_bytes": int(c.findtext(f"{ns}Size") or 0)})
             for p in root.findall(f"{ns}CommonPrefixes"):
                 entries.append({"key": p.findtext(f"{ns}Prefix"), "dir": True})
             token = root.findtext(f"{ns}NextContinuationToken")
             if (root.findtext(f"{ns}IsTruncated") or "false") != "true" or not token:
                 break
-        r = result(op, 200, logs, requests=len(logs), entries=entries)
+        r = result(op, 200, logs, requests_count=len(logs), entries=entries)
         r.pop("attempt_log", None)
         return r
     if kind == "copy":

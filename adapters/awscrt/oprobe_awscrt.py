@@ -151,7 +151,7 @@ def error_of(status, data, error):
 
 def reply(op, status, timing, error=None, data=b"", **extra):
     ok = error is None and 200 <= status < 300
-    r = {"id": op["id"], "ok": ok, "status": status, "attempts": 1, "http_version": "http1", **timing}
+    r = {"id": op["id"], "ok": ok, "status": status, "attempts_count": 1, "http_version": "http1", **timing}
     if not ok:
         r["error"] = error_of(status, data, error)
     r.update(extra)
@@ -164,10 +164,10 @@ def do(crt, op):
         headers = []
         rg = op.get("range")
         if rg:
-            if rg.get("suffix") is not None:
-                headers.append(("Range", f"bytes=-{rg['suffix']}"))
+            if rg.get("suffix_bytes") is not None:
+                headers.append(("Range", f"bytes=-{rg['suffix_bytes']}"))
             else:
-                off, ln = rg.get("offset", 0), rg.get("length")
+                off, ln = rg.get("offset_bytes", 0), rg.get("length_bytes")
                 headers.append(("Range", f"bytes={off}-" + (str(off + ln - 1) if ln else "")))
 
         def done(status, hdrs, data, timing, error):
@@ -176,7 +176,7 @@ def do(crt, op):
             if cr and "/" in cr:
                 size = int(cr.rsplit("/", 1)[1])
             reply(op, status, timing, error, data, bytes=len(data) if error is None else 0,
-                  size=size, etag=hdrs.get("etag"))
+                  size_bytes=size, etag=hdrs.get("etag"))
         crt.request(op, S3RequestType.GET_OBJECT, "GET", crt.path(op["key"]), headers, done=done)
     elif kind == "put":
         body = base64.b64decode(op.get("data_b64") or "")
@@ -190,7 +190,7 @@ def do(crt, op):
                     done=lambda s, h, d, t, e: reply(op, s, t, e, d, bytes=len(body), etag=h.get("etag")))
     elif kind == "head":
         crt.request(op, S3RequestType.DEFAULT, "HEAD", crt.path(op["key"]), operation="HeadObject",
-                    done=lambda s, h, d, t, e: reply(op, s, t, e, d, size=int(h.get("content-length") or 0),
+                    done=lambda s, h, d, t, e: reply(op, s, t, e, d, size_bytes=int(h.get("content-length") or 0),
                                                      etag=h.get("etag")))
     elif kind == "delete":
         keys = list(op.get("keys") or [])
@@ -209,7 +209,7 @@ def do(crt, op):
                 if last:
                     reply(op, 204 if not state["failed"] else state["status"],
                           {"t_start_us": state["t0"], "t_end_us": now_us()},
-                          requests=len(keys), failed_keys=state["failed"])
+                          requests_count=len(keys), failed_keys=state["failed"])
             crt.request(op, S3RequestType.DEFAULT, "DELETE", crt.path(key), operation="DeleteObject", done=done)
         for k in keys:
             one(k)
@@ -229,17 +229,17 @@ def do(crt, op):
                 acc["pages"] += 1
                 timing = dict(timing, t_start_us=acc["t0"])
                 if error is not None or not 200 <= status < 300:
-                    return reply(op, status, timing, error or "list failed", data, requests=acc["pages"])
+                    return reply(op, status, timing, error or "list failed", data, requests_count=acc["pages"])
                 root = ET.fromstring(data)
                 ns = root.tag.split("}")[0] + "}" if root.tag.startswith("{") else ""
                 for c in root.findall(f"{ns}Contents"):
-                    acc["entries"].append({"key": c.findtext(f"{ns}Key"), "size": int(c.findtext(f"{ns}Size") or 0)})
+                    acc["entries"].append({"key": c.findtext(f"{ns}Key"), "size_bytes": int(c.findtext(f"{ns}Size") or 0)})
                 for p in root.findall(f"{ns}CommonPrefixes"):
                     acc["entries"].append({"key": p.findtext(f"{ns}Prefix"), "dir": True})
                 nxt = root.findtext(f"{ns}NextContinuationToken")
                 if (root.findtext(f"{ns}IsTruncated") or "false") == "true" and nxt:
                     return page(nxt)
-                reply(op, status, timing, requests=acc["pages"], entries=acc["entries"])
+                reply(op, status, timing, requests_count=acc["pages"], entries=acc["entries"])
             crt.request(op, S3RequestType.DEFAULT, "GET", crt.path(query=q), operation="ListObjectsV2", done=done)
         page(None)
     elif kind == "copy":

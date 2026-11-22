@@ -1,0 +1,268 @@
+{
+  "$defs": {
+    "WireAttempt": {
+      "description": "One attempt of a retried operation (optional detail of a result).",
+      "properties": {
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "phases": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WirePhases"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "default": 0,
+          "description": "HTTP status; 0: no response (network error).",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "t_end_us": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "t_start_us": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "t_start_us",
+        "t_end_us"
+      ],
+      "type": "object"
+    },
+    "WireEntry": {
+      "description": "A listed key.",
+      "properties": {
+        "dir": {
+          "default": false,
+          "description": "A common prefix (non-recursive listings).",
+          "type": "boolean"
+        },
+        "key": {
+          "type": "string"
+        },
+        "size_bytes": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "key"
+      ],
+      "type": "object"
+    },
+    "WireError": {
+      "description": "Why an operation failed.",
+      "properties": {
+        "code": {
+          "default": "",
+          "description": "The service's error code (`NoSuchKey`, `SlowDown`, `PreconditionFailed`, …) or the\nclient's exception name.",
+          "type": "string"
+        },
+        "message": {
+          "default": "",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "WirePhases": {
+      "description": "Stage durations of one request, as far as the client can see them (µs).",
+      "properties": {
+        "body_us": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "connect_us": {
+          "default": 0,
+          "description": "DNS + TCP + TLS when the client cannot split them.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "dns_us": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "queue_us": {
+          "default": 0,
+          "description": "Waiting for a connection or a pool slot.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "send_us": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "tcp_us": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "tls_us": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "ttfb_us": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    }
+  },
+  "$id": "https://github.com/hxddh/oprobe/schemas/4/client-result.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "oprobe client protocol: the adapter's result of one operation",
+  "properties": {
+    "attempt_log": {
+      "description": "Every attempt, when the client reports them (status, timing).",
+      "items": {
+        "$ref": "#/$defs/WireAttempt"
+      },
+      "type": "array"
+    },
+    "attempts_count": {
+      "default": 1,
+      "description": "Attempts made (1 + retries).",
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "bytes": {
+      "default": 0,
+      "description": "Payload bytes transferred (downloaded for `get`, uploaded for `put`).",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "entries": {
+      "description": "`list`: the keys.",
+      "items": {
+        "$ref": "#/$defs/WireEntry"
+      },
+      "type": "array"
+    },
+    "error": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/WireError"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "etag": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "failed_keys": {
+      "description": "`delete`: keys that could not be deleted.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "http_version": {
+      "description": "`http1` or `http2`, when known.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "id": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "ok": {
+      "type": "boolean"
+    },
+    "phases": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/WirePhases"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Stages of the final attempt, when the client can observe them."
+    },
+    "requests_count": {
+      "default": 1,
+      "description": "HTTP requests the operation issued (list pages, per-key deletes); default 1.",
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "size_bytes": {
+      "description": "The object's total size (`get`, `head`).",
+      "format": "uint64",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "status": {
+      "default": 0,
+      "description": "HTTP status of the final attempt; 0: no response.",
+      "format": "uint16",
+      "maximum": 65535,
+      "minimum": 0,
+      "type": "integer"
+    },
+    "t_end_us": {
+      "default": 0,
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "t_start_us": {
+      "default": 0,
+      "description": "Start and end of the operation inside the client, on any monotonic clock (µs). oprobe\nuses only their difference: the time the SDK took, without the protocol's own cost.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "id",
+    "ok"
+  ],
+  "title": "oprobe client-result",
+  "type": "object",
+  "x-rust-type": "WireResult"
+}
