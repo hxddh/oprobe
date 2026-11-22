@@ -1176,6 +1176,10 @@ Output formats (`-o`): text, json, ndjson
 | `--throttle-early-close` | Answer throttled requests without reading the upload and close the connection (as real gateways do), so clients see resets mid-upload |
 | `--complete-delay <COMPLETE_DELAY>` | Delay for CompleteMultipartUpload · default `0ms` |
 | `--write-ca <FILE>` | Write the lab CA certificate (for --ca-cert) to this file |
+| `--allow-remote` | Accept a non-loopback --bind address (the lab has no authentication: anyone who can reach it can read and write its objects) |
+| `--max-object-size <SIZE>` | Largest object body accepted (PUT or multipart part), e.g. 1GiB |
+| `--max-store-size <SIZE>` | Largest in-memory store (objects plus staged parts), e.g. 8GiB |
+| `--max-connections <N>` | Most open connections (more are closed at once) |
 
 ## `oprobe mcp`
 
@@ -1190,7 +1194,7 @@ Output formats (`-o`): text, json, ndjson
 | argument | description |
 |---|---|
 | `--http <ADDR>` | Serve MCP over Streamable HTTP on this address (e.g. 127.0.0.1:8765) instead of stdio |
-| `--http-allow-remote` | Allow --http on a non-loopback address (anyone who can reach it can use the tools and the configured credentials; there is no authentication) |
+| `--http-allow-remote` | Allow --http on a non-loopback address (needs --tls-cert/--tls-key or --insecure-remote; anyone with the token can use the tools and the configured credentials) |
 | `--allow-write` | Enable tools that write test data (runs that upload a dataset, tune, cleanup) |
 | `--allow-target <NAME\|URL-PREFIX>` | Only these targets: a configured target name or a URL prefix (repeatable) |
 | `--max-cost-usd <USD>` | Budget applied to every run the server starts: estimated request cost (USD) |
@@ -1198,6 +1202,12 @@ Output formats (`-o`): text, json, ndjson
 | `--max-bytes <SIZE>` | Budget applied to every run: bytes transferred (e.g. 1GiB) |
 | `--max-duration <DURATION>` | Budget applied to every run: wall time (e.g. 2m) |
 | `--max-concurrent-runs <MAX_CONCURRENT_RUNS>` | Runs executing at the same time (others wait) · default `1` |
+| `--token-file <FILE>` | Bearer token of --http, read from this file (default: a new token written to <data>/mcp-token, mode 0600, at every start) |
+| `--tls-cert <FILE>` | Serve --http over HTTPS with this PEM certificate chain |
+| `--tls-key <FILE>` | The PEM private key of --tls-cert |
+| `--insecure-remote` | Accept --http-allow-remote without TLS (the token then crosses the network in clear) |
+| `--max-connections <N>` | Most open --http connections (more are closed at once) · default `64` |
+| `--allow-private-endpoints` | Let probe_endpoint and endpoint overrides reach loopback, private and link-local addresses (cloud metadata services answer on link-local ones) |
 
 ## `oprobe schema`
 
