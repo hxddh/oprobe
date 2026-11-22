@@ -239,6 +239,14 @@ pub async fn measure(req: Request) -> Result<Measured> {
         }
     };
     let started_at = SystemTime::now();
+    let mut stream: Option<Arc<crate::store::runfile::RunFileStream>> = None;
+    // Unsaved runs keep only the in-memory sample a streamed run keeps: nothing would ever
+    // read more rows (bounded memory, design v5 §2).
+    let trace_max_requests = if store.is_none() {
+        trace_max_requests.min(crate::store::runfile::STREAM_MEMORY_ROWS)
+    } else {
+        trace_max_requests
+    };
     let session = match open(
         profile,
         &rails,
@@ -258,6 +266,21 @@ pub async fn measure(req: Request) -> Result<Measured> {
     let (mut run, tuned) = match mode {
         Mode::Run => {
             let knobs = session.profile.knobs.clone();
+            // The run file is written while the run is in progress (design v5 §2).
+            if let Some(s) = &store {
+                let header = crate::store::runfile::RunHeader::new(
+                    rails.run_id.to_string(),
+                    spec.clone(),
+                    crate::model::ClientInfo::opendal(),
+                );
+                let st = crate::store::runfile::RunFileStream::create(
+                    &s.run_path(&rails.run_id.to_string()),
+                    &header,
+                    trace_max_requests,
+                )?;
+                session.stream_rows(st.clone());
+                stream = Some(st);
+            }
             let res = session
                 .run(
                     &knobs,
@@ -367,8 +390,16 @@ pub async fn measure(req: Request) -> Result<Measured> {
     if let Some(f) = finalize {
         f(&mut run);
     }
-    let path = match &store {
-        Some(s) => Some(s.save(&run).map_err(|e| {
+    let saved = match (&store, &stream) {
+        (Some(s), Some(st)) => {
+            st.describe(&mut run.report);
+            Some(s.save_streamed(&run, st))
+        }
+        (Some(s), None) => Some(s.save(&run)),
+        (None, _) => None,
+    };
+    let path = match saved {
+        Some(r) => Some(r.map_err(|e| {
             e.context("cannot save the run (set OPROBE_DATA_DIR or pass --no-save)")
         })?),
         None => None,

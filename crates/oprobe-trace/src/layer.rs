@@ -82,6 +82,7 @@ fn push(
         service_op: None,
         tls: None,
         tcp: None,
+        detail: None,
     };
     match scope {
         Some(s) => s.push_request(rec),

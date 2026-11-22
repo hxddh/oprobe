@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -99,6 +99,24 @@ struct H2Conn {
     id: u64,
     sender: http2::SendRequest<TracedBody>,
     clock: Arc<ConnClock>,
+    /// Streams open on the connection (requests whose response has not ended).
+    streams: Arc<AtomicUsize>,
+}
+
+/// HTTP/2 streams a pooled connection carries before another connection is dialed (servers
+/// commonly advertise `max_concurrent_streams` of 100–128; beyond it requests would wait in
+/// `ready()`, the `stream_wait` stage).
+pub const H2_STREAMS_PER_CONN: usize = 100;
+/// HTTP/2 connections per host at most (then requests share the least busy one).
+pub const H2_MAX_CONNS_PER_HOST: usize = 8;
+
+/// Holds one HTTP/2 stream slot of a connection until dropped.
+struct StreamSlot(Arc<AtomicUsize>);
+
+impl Drop for StreamSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 #[derive(Default)]
@@ -136,6 +154,7 @@ enum Checked {
         id: u64,
         sender: http2::SendRequest<TracedBody>,
         clock: Arc<ConnClock>,
+        streams: Arc<AtomicUsize>,
     },
 }
 
@@ -209,12 +228,24 @@ impl Inner {
                 let mut pool = self.lock_pool();
                 let hp = pool.entry(key.clone()).or_default();
                 hp.h2.retain(|c| !c.sender.is_closed());
-                if let Some(c) = hp.h2.first() {
+                // The least busy connection; a new one is dialed while every connection is
+                // at its stream budget and the host has room for more.
+                if let Some(c) = hp
+                    .h2
+                    .iter()
+                    .min_by_key(|c| c.streams.load(Ordering::Acquire))
+                    && (c.streams.load(Ordering::Acquire) < H2_STREAMS_PER_CONN
+                        || hp.h2.len() >= H2_MAX_CONNS_PER_HOST)
+                {
                     return Some(Checked::H2 {
                         id: c.id,
                         sender: c.sender.clone(),
                         clock: c.clock.clone(),
+                        streams: c.streams.clone(),
                     });
+                }
+                if !hp.h2.is_empty() {
+                    return None;
                 }
                 let timeout = self.cfg.idle_timeout;
                 hp.idle_h1
@@ -273,6 +304,7 @@ impl Inner {
             tokio::spawn(async move {
                 let _ = conn.await;
             });
+            let streams = Arc::new(AtomicUsize::new(0));
             if self.cfg.keep_alive {
                 let mut pool = self.lock_pool();
                 let hp = pool.entry(key.clone()).or_default();
@@ -281,12 +313,14 @@ impl Inner {
                     id,
                     sender: sender.clone(),
                     clock: d.clock.clone(),
+                    streams: streams.clone(),
                 });
             }
             Checked::H2 {
                 id,
                 sender,
                 clock: d.clock,
+                streams,
             }
         } else {
             let (sender, conn) = http1::Builder::new().handshake(io).await.map_err(hs_err)?;
@@ -368,12 +402,30 @@ struct Dial {
     tls: Option<TlsRow>,
 }
 
-/// Request body that records when its last byte was handed to the connection.
+/// Request body frame size: the body goes out in frames, so hyper (and HTTP/2 flow control)
+/// pulls it as the connection can take it and "last byte handed over" means what it says.
+const SEND_FRAME: usize = 64 * 1024;
+
+/// Request body that records when its last byte was handed to the connection, and how long
+/// the connection kept it waiting between frames (HTTP/2: flow-control window at 0, or a
+/// full socket).
 pub struct TracedBody {
     buf: Buffer,
+    pending: Bytes,
     start: Instant,
     end_us: Arc<AtomicU64>,
+    last_frame: Option<Instant>,
+    stall_us: Arc<AtomicU64>,
 }
+
+impl TracedBody {
+    fn remaining(&self) -> usize {
+        self.pending.len() + self.buf.len()
+    }
+}
+
+/// Gaps between frames shorter than this are scheduling noise, not a stalled stream.
+const FLOW_STALL_MIN: Duration = Duration::from_micros(500);
 
 impl Body for TracedBody {
     type Data = Bytes;
@@ -383,29 +435,42 @@ impl Body for TracedBody {
         mut self: Pin<&mut Self>,
         _cx: &mut Context<'_>,
     ) -> Poll<Option<std::result::Result<Frame<Bytes>, Infallible>>> {
-        match self.buf.next() {
-            Some(chunk) => {
-                if self.buf.is_empty() {
-                    // hyper stops polling once `is_end_stream()` is true: last chunk handed over.
-                    let us = self.start.elapsed().as_micros() as u64;
-                    self.end_us.store(us.max(1), Ordering::Release);
+        let this = &mut *self;
+        while this.pending.is_empty() {
+            match this.buf.next() {
+                Some(b) => this.pending = b,
+                None => {
+                    let us = this.start.elapsed().as_micros() as u64;
+                    this.end_us.store(us.max(1), Ordering::Release);
+                    return Poll::Ready(None);
                 }
-                Poll::Ready(Some(Ok(Frame::data(chunk))))
-            }
-            None => {
-                let us = self.start.elapsed().as_micros() as u64;
-                self.end_us.store(us.max(1), Ordering::Release);
-                Poll::Ready(None)
             }
         }
+        let now = Instant::now();
+        if let Some(t) = this.last_frame {
+            let gap = now.saturating_duration_since(t);
+            if gap >= FLOW_STALL_MIN {
+                this.stall_us
+                    .fetch_add(gap.as_micros() as u64, Ordering::Relaxed);
+            }
+        }
+        this.last_frame = Some(now);
+        let n = this.pending.len().min(SEND_FRAME);
+        let frame = this.pending.split_to(n);
+        if this.remaining() == 0 {
+            // hyper stops polling once `is_end_stream()` is true: last frame handed over.
+            let us = this.start.elapsed().as_micros() as u64;
+            this.end_us.store(us.max(1), Ordering::Release);
+        }
+        Poll::Ready(Some(Ok(Frame::data(frame))))
     }
 
     fn is_end_stream(&self) -> bool {
-        self.buf.is_empty()
+        self.remaining() == 0
     }
 
     fn size_hint(&self) -> SizeHint {
-        SizeHint::with_exact(self.buf.len() as u64)
+        SizeHint::with_exact(self.remaining() as u64)
     }
 }
 
@@ -432,6 +497,10 @@ struct Pending {
     h1_return: Option<H1Return>,
     /// The connection, for its TCP statistics at request end.
     clock: Option<Arc<ConnClock>>,
+    /// The first bytes of an error response (its provider error code).
+    sniff: Option<super::signals::ErrorSniffer>,
+    /// The HTTP/2 stream slot, released when the response ends.
+    _stream: Option<StreamSlot>,
 }
 
 impl Pending {
@@ -450,6 +519,7 @@ impl Pending {
         if error.is_some() && self.record.error.is_none() {
             self.record.error = error;
         }
+        self.record.detail = super::signals::finish(self.record.detail.take(), self.sniff.as_ref());
         // After the clock stopped: the query is not part of the request's time. The pooled
         // connection is still referenced here, so the socket is alive (`net::tcpinfo`).
         if let Some(sock) = self.clock.as_ref().and_then(|c| c.sock.as_ref()) {
@@ -504,6 +574,9 @@ impl Stream for TracedResponseBody {
                         if let Some(p) = this.pending.as_mut() {
                             p.record.bytes_down += data.len() as u64;
                             p.last_yield = Some(Instant::now());
+                            if let Some(s) = p.sniff.as_mut() {
+                                s.push(&data);
+                            }
                         }
                         return Poll::Ready(Some(Ok(Buffer::from(data))));
                     }
@@ -629,6 +702,7 @@ impl HttpTransport for TracingTransport {
             service_op,
             tls: None,
             tcp: None,
+            detail: None,
         };
 
         // A request dropped before its response (timeout layer, tail-cut) still gets a record.
@@ -698,14 +772,27 @@ impl HttpTransport for TracingTransport {
 
         // 3. Build the request.
         let end_us = Arc::new(AtomicU64::new(0));
+        let body_stall_us = Arc::new(AtomicU64::new(0));
         let body = TracedBody {
             buf: body_buf,
+            pending: Bytes::new(),
             start: t_start,
             end_us: end_us.clone(),
+            last_frame: None,
+            stall_us: body_stall_us.clone(),
         };
         let mut builder = Request::builder().method(method.clone());
         let (id, clock) = match &checked {
             Checked::H1 { id, clock, .. } | Checked::H2 { id, clock, .. } => (*id, clock.clone()),
+        };
+        // HTTP/2: this request holds one of the connection's stream slots until its response
+        // ends.
+        let (stream_slot, streams_now) = match &checked {
+            Checked::H2 { streams, .. } => {
+                let n = streams.fetch_add(1, Ordering::AcqRel) + 1;
+                (Some(StreamSlot(streams.clone())), Some(n as u32))
+            }
+            Checked::H1 { .. } => (None, None),
         };
         record.conn_id = id;
         match &checked {
@@ -739,7 +826,8 @@ impl HttpTransport for TracingTransport {
         *hreq.headers_mut() = parts.headers;
 
         // 4. Send and await response headers.
-        let t_dispatch = Instant::now();
+        let mut stream_wait_us: Option<u64> = None;
+        let t_dispatch0 = Instant::now();
         let span = format!(
             "http::{} {} {}",
             service_op.unwrap_or_else(|| api.label()),
@@ -752,15 +840,24 @@ impl HttpTransport for TracingTransport {
                 (r, Some(sender))
             }
             Checked::H2 { mut sender, .. } => {
-                let r = async {
-                    sender.ready().await?;
-                    sender.send_request(hreq).await
+                // Waiting for a stream (`max_concurrent_streams` reached) is the `stream_wait`
+                // stage, part of the queue, not of the server's time.
+                let ready = sender.ready().instrument_await("http2::stream_wait").await;
+                let waited = t_dispatch0.elapsed();
+                if waited >= FLOW_STALL_MIN {
+                    stream_wait_us = Some(waited.as_micros() as u64);
                 }
-                .instrument_await(span)
-                .await;
+                let r = match ready {
+                    Ok(()) => sender.send_request(hreq).instrument_await(span).await,
+                    Err(e) => Err(e),
+                };
                 (r, None)
             }
         };
+        let t_dispatch = t_dispatch0 + Duration::from_micros(stream_wait_us.unwrap_or(0));
+        // The request goes on the wire once it has a stream.
+        let t_ready = t_ready + Duration::from_micros(stream_wait_us.unwrap_or(0));
+        record.timing.queue_us += stream_wait_us.unwrap_or(0);
         let t_headers = Instant::now();
         cancel_guard.disarm();
         let resp = match resp {
@@ -814,6 +911,15 @@ impl HttpTransport for TracingTransport {
         record.timing.ttfb_us = t_headers.saturating_duration_since(sent_at).as_micros() as u64;
         record.status = resp.status().as_u16();
         record.request_id = REQUEST_ID_HEADERS.iter().find_map(|h| header_str(&resp, h));
+        let mut detail = super::signals::from_headers(resp.headers(), record.status);
+        detail.stream_wait_us = stream_wait_us;
+        detail.streams_count = streams_now;
+        let stalled = body_stall_us.load(Ordering::Relaxed);
+        if streams_now.is_some() && stalled > 0 {
+            detail.flow_stall_us = Some(stalled);
+        }
+        record.detail = Some(Box::new(detail));
+        let sniff = (record.status >= 400).then(super::signals::ErrorSniffer::default);
         if record.is_throttle() {
             record.retry_after_ms = header_str(&resp, "retry-after")
                 .as_deref()
@@ -844,6 +950,8 @@ impl HttpTransport for TracingTransport {
             _permit: permit,
             _inflight: inflight,
             clock: inner.cfg.tcp_info.then(|| clock.clone()),
+            sniff,
+            _stream: stream_slot,
             h1_return: h1_sender.map(|s| (inner.clone(), key, id, s, clock)),
         };
         let mut out = Response::builder()

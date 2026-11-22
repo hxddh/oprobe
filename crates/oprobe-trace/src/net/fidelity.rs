@@ -680,6 +680,7 @@ impl Drop for CancelGuard {
             service_op: self.service_op,
             tls: None,
             tcp: None,
+            detail: None,
         };
         Finisher::emit(record, &self.scope, &self.recorder);
     }
@@ -700,6 +701,8 @@ struct Finisher {
     recorder: Option<Arc<Recorder>>,
     _permit: Option<OwnedSemaphorePermit>,
     _inflight: InflightGuard,
+    /// The first bytes of an error response (its provider error code).
+    sniff: Option<super::signals::ErrorSniffer>,
 }
 
 impl Finisher {
@@ -728,6 +731,7 @@ impl Finisher {
         if error.is_some() && self.record.error.is_none() {
             self.record.error = error;
         }
+        self.record.detail = super::signals::finish(self.record.detail.take(), self.sniff.as_ref());
         // After the clock stopped: the query is not part of the request's time.
         if let Some(addr) = self.conn {
             let sock = std::mem::take(&mut self.sock);
@@ -771,6 +775,9 @@ impl<S: Stream<Item = reqwest::Result<Bytes>>> Stream for TimedResponseBody<S> {
                     if let Some(f) = this.fin.as_mut() {
                         f.record.bytes_down += b.len() as u64;
                         f.last_yield = Some(Instant::now());
+                        if let Some(s) = f.sniff.as_mut() {
+                            s.push(&b);
+                        }
                     }
                     return Poll::Ready(Some(Ok(Buffer::from(b))));
                 }
@@ -890,6 +897,7 @@ impl HttpTransport for FidelityTransport {
             service_op,
             tls: None,
             tcp: None,
+            detail: None,
         };
 
         let permit = match &self.limiter {
@@ -1020,6 +1028,11 @@ impl HttpTransport for FidelityTransport {
                 .map(str::to_owned)
         };
         record.request_id = REQUEST_ID_HEADERS.iter().find_map(|h| header(h));
+        record.detail = Some(Box::new(super::signals::from_headers(
+            resp.headers(),
+            record.status,
+        )));
+        let sniff = (record.status >= 400).then(super::signals::ErrorSniffer::default);
         if record.is_throttle() {
             record.retry_after_ms = header("retry-after")
                 .as_deref()
@@ -1064,6 +1077,7 @@ impl HttpTransport for FidelityTransport {
             recorder,
             _permit: permit,
             _inflight: inflight,
+            sniff,
         };
         let stream = TimedResponseBody {
             inner: Box::pin(resp.bytes_stream()),

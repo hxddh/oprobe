@@ -274,6 +274,7 @@ pub mod fixture {
             error: None,
             tls: None,
             tcp: None,
+            detail: None,
         }
     }
 

@@ -171,6 +171,30 @@ impl RunStore {
         Ok(path)
     }
 
+    /// Save a run whose rows were streamed to its run file during the run
+    /// ([`super::runfile::RunFileStream`]): the report is appended and the file moved into
+    /// place; `run.ops` / `run.reqs` (the in-memory sample) are not written again.
+    pub fn save_streamed(
+        &self,
+        run: &Run,
+        stream: &super::runfile::RunFileStream,
+    ) -> Result<PathBuf> {
+        let id = run.id();
+        anyhow::ensure!(RunId::parse(id).is_some(), "invalid run id `{id}`");
+        anyhow::ensure!(
+            stream.path() == self.run_path(id),
+            "the streamed run file is not `{}`",
+            self.run_path(id).display()
+        );
+        let path = stream.finish(&run.report)?;
+        let summary = RunSummary::from(&run.report);
+        super::atomic_write(
+            &self.sidecar_path(id),
+            serde_json::to_string_pretty(&summary)?.as_bytes(),
+        )?;
+        Ok(path)
+    }
+
     /// Ids of stored runs, oldest first.
     pub fn ids(&self) -> Result<Vec<String>> {
         let rd = match std::fs::read_dir(&self.dir) {
@@ -446,6 +470,7 @@ mod tests {
                 error: None,
                 tls: None,
                 tcp: None,
+                detail: None,
             })
             .collect();
         run

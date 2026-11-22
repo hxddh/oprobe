@@ -505,6 +505,7 @@ pub(crate) mod tests {
             error: None,
             tls: None,
             tcp: None,
+            detail: None,
         }
     }
 

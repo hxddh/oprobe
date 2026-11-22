@@ -185,6 +185,8 @@ pub struct Session {
     replay: Option<Arc<super::replay::ReplayLog>>,
     /// Next log event to replay (windows continue where the previous one stopped).
     replay_cursor: Mutex<usize>,
+    /// Where the next window streams its rows (the run file), taken by [`Session::run`].
+    row_sink: Mutex<Option<Arc<dyn crate::trace::RowSink>>>,
 }
 
 impl Session {
@@ -303,6 +305,7 @@ impl Session {
             last_trace: Mutex::new(None),
             replay,
             replay_cursor: Mutex::new(0),
+            row_sink: Mutex::new(None),
         })
     }
 
@@ -312,6 +315,13 @@ impl Session {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take()
+    }
+
+    /// Stream every row of the next [`Session::run`] window to `sink` (the run file, written
+    /// while the run is in progress); the in-memory sample then keeps at most
+    /// [`crate::store::runfile::STREAM_MEMORY_ROWS`] rows.
+    pub fn stream_rows(&self, sink: Arc<dyn crate::trace::RowSink>) {
+        *self.row_sink.lock().unwrap_or_else(|e| e.into_inner()) = Some(sink);
     }
 
     /// The budget guard, when the session has one.
@@ -329,6 +339,18 @@ impl Session {
         let trial = self.trial.fetch_add(1, Ordering::Relaxed);
         let recorder = Recorder::new();
         recorder.set_trace_limit(self.trace_max_requests);
+        if let Some(sink) = self
+            .row_sink
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            recorder.set_row_sink(sink);
+            recorder.set_trace_limit(
+                self.trace_max_requests
+                    .min(crate::store::runfile::STREAM_MEMORY_ROWS),
+            );
+        }
         if let Some(g) = &self.guard {
             recorder.set_guard(g.clone());
         }

@@ -447,6 +447,18 @@ pub trait Exporter: Send + Sync {
     }
 }
 
+/// Receives every trace row of the measurement window as operations complete (design v5 §2):
+/// the run file is written while the run is in progress, so the in-memory sample can stay
+/// small. Called on the completion path: keep it cheap (hand rows to a writer thread).
+pub trait RowSink: Send + Sync {
+    /// One completed operation with all its requests.
+    fn on_op(&self, op: &crate::rows::OpRow, reqs: &[crate::rows::ReqRow]);
+    /// A request issued outside any operation.
+    fn on_unscoped(&self, req: &crate::rows::ReqRow) {
+        let _ = req;
+    }
+}
+
 /// Trace log shards (each keeps `max_requests / TRACE_SHARDS` rows).
 const TRACE_SHARDS: usize = 16;
 
@@ -484,6 +496,8 @@ pub struct Recorder {
     guard: OnceLock<Arc<dyn Budget>>,
     /// The exporter hook (all phases).
     exporter: OnceLock<Arc<dyn Exporter>>,
+    /// Streams the window's rows (the run file writer).
+    row_sink: OnceLock<Arc<dyn RowSink>>,
     /// Spreads requests issued outside any operation over the shards.
     unscoped_seq: AtomicU64,
     /// Observer cost: nanoseconds spent recording sampled operations, and how many.
@@ -525,6 +539,7 @@ impl Recorder {
                 .collect(),
             guard: OnceLock::new(),
             exporter: OnceLock::new(),
+            row_sink: OnceLock::new(),
             unscoped_seq: AtomicU64::new(0),
             observer_ns: AtomicU64::new(0),
             observer_samples: AtomicU64::new(0),
@@ -551,6 +566,12 @@ impl Recorder {
         self.trace[(op_id as usize) % TRACE_SHARDS]
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Stream every row of the measurement window to `sink` (the first call wins; returns
+    /// whether it was installed).
+    pub fn set_row_sink(&self, sink: Arc<dyn RowSink>) -> bool {
+        self.row_sink.set(sink).is_ok()
     }
 
     /// Cap of kept trace rows (`trace.max_requests`).
@@ -776,6 +797,9 @@ impl Recorder {
             let now_us = self.window_start().elapsed().as_micros() as i64;
             let mut row = req_row(r.clone(), 0, 0, 1);
             row.t_us = now_us - r.timing.total_us as i64;
+            if let Some(sink) = self.row_sink.get() {
+                sink.on_unscoped(&row);
+            }
             // Spread over every shard (each holds its share of the row budget).
             let n = self.unscoped_seq.fetch_add(1, Ordering::Relaxed) as usize;
             self.trace[n % TRACE_SHARDS]
@@ -1015,6 +1039,9 @@ impl Recorder {
             .enumerate()
             .map(|(i, r)| req_row(r, c.op_id, op_t_us, att(i)))
             .collect();
+        if let Some(sink) = self.row_sink.get() {
+            sink.on_op(&row, &reqs);
+        }
         // Whole operations: kept with all their requests, or not at all.
         self.trace(c.op_id).push_whole_op(row, reqs);
     }
@@ -1432,6 +1459,7 @@ mod tests {
             service_op: None,
             tls: None,
             tcp: None,
+            detail: None,
         }
     }
 

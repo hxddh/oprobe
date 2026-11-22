@@ -358,3 +358,75 @@ fn full(e: anyhow::Error) -> String {
     );
     format!("{} {}", b.message, b.hint.unwrap_or_default())
 }
+
+/// Peak resident memory of the largest child process this test waited for (Linux: KiB).
+#[cfg(target_os = "linux")]
+fn children_max_rss_mib() -> f64 {
+    // SAFETY: getrusage(RUSAGE_CHILDREN) fills the zero-initialised struct it is given.
+    let r = unsafe {
+        let mut r: libc::rusage = std::mem::zeroed();
+        libc::getrusage(libc::RUSAGE_CHILDREN, &mut r);
+        r
+    };
+    r.ru_maxrss as f64 / 1024.0
+}
+
+/// Design v5 §2 (fixes M3): the run file is written while the run is in progress, so memory
+/// stays flat however many rows the run produces (4.x held up to 1M rows, ~1 KB each).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_streamed_run_keeps_memory_flat() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_oprobe"))
+        .args([
+            "run",
+            "memory://",
+            "--preset",
+            "metadata",
+            "-d",
+            "10s",
+            "--warmup",
+            "0s",
+            "-c",
+            "8",
+            "-o",
+            "json",
+        ])
+        .env("OPROBE_DATA_DIR", dir.path())
+        .env("OPROBE_CONFIG", dir.path().join("config.toml"))
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let rss = children_max_rss_mib();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let r = v.get("report").unwrap_or(&v);
+    let seen = r["sampling"]["seen_requests_count"].as_u64().unwrap();
+    let kept = r["sampling"]["kept_requests_count"].as_u64().unwrap();
+    // The file holds every request (up to trace.max_requests), more than memory keeps.
+    let run_file = std::fs::read_dir(dir.path().join("runs"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .find(|e| e.path().extension().is_some_and(|x| x == "oprobe"))
+        .unwrap()
+        .path();
+    let run = oprobe::store::read_run_file(&run_file).unwrap();
+    assert_eq!(run.reqs.len() as u64, kept);
+    if seen > 2 * oprobe::store::runfile::STREAM_MEMORY_ROWS as u64 {
+        assert!(
+            kept > oprobe::store::runfile::STREAM_MEMORY_ROWS as u64,
+            "{kept} of {seen}"
+        );
+    }
+    // 4.x: ~1 KB per kept row on top of the process (hundreds of MB here).
+    let budget = 220.0 + (seen.min(1_000_000) as f64) * 50.0 / 1e6;
+    eprintln!("peak RSS {rss:.0} MiB, {seen} requests seen, {kept} in the run file");
+    assert!(
+        rss < budget,
+        "peak RSS {rss:.0} MiB for {seen} requests (budget {budget:.0} MiB)"
+    );
+}
