@@ -260,6 +260,26 @@ impl RateShape {
         }
     }
 
+    /// The same shape at `f` times the rate (a distributed run's share of it).
+    pub fn scaled(&self, f: f64) -> RateShape {
+        match self {
+            RateShape::Ramp { from, to, over } => RateShape::Ramp {
+                from: from * f,
+                to: to * f,
+                over: *over,
+            },
+            RateShape::Step { rates, every } => RateShape::Step {
+                rates: rates.iter().map(|r| r * f).collect(),
+                every: *every,
+            },
+            RateShape::Diurnal { min, max, period } => RateShape::Diurnal {
+                min: min.map(|v| v * f),
+                max: max.map(|v| v * f),
+                period: *period,
+            },
+        }
+    }
+
     /// The highest rate the shape reaches (the plan's and the slot pool's sizing).
     pub fn peak(&self, base: f64) -> f64 {
         match self {

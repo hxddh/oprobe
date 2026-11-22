@@ -119,6 +119,17 @@ pub struct ReplayEvent {
     pub op: Arc<ReplayOp>,
 }
 
+/// The worker (of `count`) that replays `key` in a distributed run: a stable hash (FNV-1a),
+/// the same on every machine and build.
+pub fn shard_of(key: &str, count: u32) -> u32 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in key.bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    (h % u64::from(count.max(1))) as u32
+}
+
 /// A parsed, mapped log ready to replay.
 #[derive(Clone, Debug, Default)]
 pub struct ReplayLog {
@@ -537,6 +548,22 @@ pub async fn execute(ctx: &OpCtx, op: &ReplayOp, key: &mut String) -> Result<OpO
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn shards_split_every_key_to_exactly_one_worker() {
+        let keys: Vec<String> = (0..1000).map(|i| format!("logs/k{i}")).collect();
+        let mut counts = [0u32; 3];
+        for k in &keys {
+            let s = shard_of(k, 3);
+            assert!(s < 3);
+            assert_eq!(s, shard_of(k, 3), "stable");
+            counts[s as usize] += 1;
+        }
+        assert!(counts.iter().all(|c| *c > 250), "{counts:?}");
+        assert_eq!(shard_of("x", 1), 0);
+        assert_eq!(shard_of("x", 0), 0);
+    }
+
     use super::*;
 
     const ACCESS_LOG: &str = r#"79a5 awsexamplebucket1 [06/Feb/2019:00:00:38 +0000] 192.0.2.3 79a5 3E57427F3EXAMPLE REST.GET.OBJECT data/a.parquet "GET /awsexamplebucket1/data/a.parquet HTTP/1.1" 206 - 4096 8388608 70 10 "-" "S3Console/0.4" - s9lzHYrFp76ZVxRcpX9+5cjAnEH2ROuNkd2BHfIa6UkFVdtjf5mKR3/eTPFvsiP/XV/VLi31234= SigV4 ECDHE-RSA-AES128-GCM-SHA256 AuthHeader awsexamplebucket1.s3.us-west-1.amazonaws.com TLSV1.2 - -

@@ -368,6 +368,8 @@ async fn run_job(
         progress.clone(),
     )
     .await?;
+    // A replayed log is split by key: each worker replays its own keys.
+    session.shard_replay(&job.run_prefix, job.index, job.count);
     // An existing dataset is listed by every worker: each reads its own key range.
     if session.dataset.read_only && job.count > 1 {
         let d = &session.dataset;
