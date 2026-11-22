@@ -24,7 +24,6 @@ pub mod output;
 pub mod report;
 pub mod service_options;
 pub mod store;
-pub mod tune;
 pub mod util;
 
 /// The instrumentation (re-exported): the recorder, op scopes, records and aggregates.

@@ -6,6 +6,7 @@ use std::time::SystemTime;
 use super::report::*;
 use super::{ReqRow, Run, RunId};
 use crate::analysis::diagnosis::{Severity, check_sla, diagnose};
+use crate::analysis::hypothesis::HypothesisKind;
 use crate::config::{Knobs, OpKind, Profile};
 use crate::engine::CleanupSummary;
 use crate::errors::exit;
@@ -36,11 +37,17 @@ fn p_ms(v: &mut [u64], q: f64) -> f64 {
 }
 
 /// Replace the recorder's histogram percentiles (summary and per verb) with exact ones from
-/// the operation rows, so the report, its findings and compare all read the same estimator
-/// (design v4 §4). Only when the rows are complete: not sampled, and the rows of the window
-/// are the operations the recorder counted (within 1 %, for operations straddling the end).
+/// the operation rows, so the report and its findings read the same estimator (design v4
+/// §4). Only when the rows are complete: not sampled, the rows of the window are the
+/// operations the recorder counted (within 1 %, for operations straddling the end), and no
+/// open-loop arrival was censored: a missed arrival has no row, and its lower bound must stay
+/// in the percentiles (T3: no coordinated omission), so the recorder's histogram is kept.
 fn exact_latency(snapshot: &mut Snapshot, ops: &[super::OpRow], sampled: bool) {
-    if sampled || ops.is_empty() {
+    let censored = snapshot
+        .open_loop
+        .as_ref()
+        .is_some_and(|ol| ol.censored_count > 0 || ol.missed > 0);
+    if sampled || ops.is_empty() || censored {
         return;
     }
     let window_us = (snapshot.elapsed_s * 1e6).ceil() as i64;
@@ -98,6 +105,7 @@ fn finish(run: &mut Run, breached: bool) {
         let w = partial_warning(p, r.workload.duration_s, validity.suppress);
         r.warnings.push(w);
     }
+    r.verdict.headline = headline(r);
     if let Some(why) = &validity.invalid {
         r.verdict.headline = format!("Run invalid: {why}.");
     } else if let (Some(p), true) = (&r.run.partial, validity.suppress) {
@@ -117,6 +125,44 @@ fn finish(run: &mut Run, breached: bool) {
     } else {
         VerdictLevel::Ok
     };
+}
+
+/// The verdict line (design v6 §3): the top finding's cause; with no finding, where the time
+/// went — and when nothing throttled and no load was varied, that a plateau is not a limit
+/// one run can size (N2: prove sizes it).
+pub fn headline(r: &Report) -> String {
+    if let Some(f) = r.findings.first() {
+        return f.cause.clone();
+    }
+    if r.summary.ops == 0 {
+        return "No operations completed in the measurement window.".into();
+    }
+    let kind = r.capacity.selected().map(|h| h.kind);
+    let stage = r.stages.bottleneck.label();
+    match kind {
+        Some(HypothesisKind::Queueing) => format!(
+            "Inconclusive: latency grows with the requests in flight ({stage}), but one run varies no load — prove sizes a change."
+        ),
+        _ if r.resilience.throttled_responses == 0
+            && matches!(
+                r.stages.bottleneck,
+                crate::analysis::diagnosis::Bottleneck::ServerLatency
+                    | crate::analysis::diagnosis::Bottleneck::Download
+                    | crate::analysis::diagnosis::Bottleneck::Upload
+            ) =>
+        {
+            format!(
+                "No limit reached: {stage} dominates (p50 {} · p99 {}); one run varies no load — prove sizes a change.",
+                crate::util::fmt_ms(r.summary.latency.p50),
+                crate::util::fmt_ms(r.summary.latency.p99)
+            )
+        }
+        _ => format!(
+            "No finding: {stage} dominates (p50 {} · p99 {}).",
+            crate::util::fmt_ms(r.summary.latency.p50),
+            crate::util::fmt_ms(r.summary.latency.p99)
+        ),
+    }
 }
 
 /// Mark a built run as partial (a budget stopped it, it was cancelled after the window, …):
@@ -320,17 +366,6 @@ fn ensure_slowest(snapshot: &Snapshot, trace: &mut TraceRows) {
 
 /// Build the report and keep the trace rows next to it.
 pub fn build_run(i: ReportInput<'_>) -> Run {
-    build_run_with(i, None)
-}
-
-/// [`build_run`] with the target's remembered capacity (`<data>/capacity.toml`, the same
-/// target and workload): a run that stayed under the ceiling keeps it
-/// ([`Capacity::with_history`](crate::analysis::capacity::Capacity::with_history)), so its
-/// findings never suggest going past it.
-pub fn build_run_with(
-    i: ReportInput<'_>,
-    history: Option<crate::analysis::capacity::Capacity>,
-) -> Run {
     let ReportInput {
         run_id,
         target_name,
@@ -356,25 +391,28 @@ pub fn build_run_with(
     exact_latency(&mut snapshot, &trace.ops, sampled);
     let t = &profile.target();
     let endpoint = t.endpoint();
-    let diagnosis = diagnose(&snapshot, knobs, &profile.sla, t.is_network());
+    let diagnosis = diagnose(&snapshot, t.is_network());
     let sla_verdict = check_sla(&snapshot, &profile.sla);
     let breached = !sla_verdict.passed;
     let mut options = crate::util::redact_options(&t.options);
     options.remove("ca_cert_pem");
     let interrupted = snapshot.interrupted;
-    let effective = EffectiveKnobValues::new(knobs, &snapshot.effective_knobs);
+    let effective = snapshot.effective_knobs.clone();
     let workload = workload_info(profile);
     let mut warnings = warnings;
     let chunked_writes = workload
         .mix
         .iter()
         .any(|m| m.weight > 0 && m.op == "multipart_write");
-    if chunked_writes && effective.write_chunk_clamped() {
+    if chunked_writes
+        && effective.write_chunk_size != 0
+        && effective.write_chunk_size != knobs.chunk_size.0
+    {
         warnings.push(format!(
             "chunk_size {} is outside {}'s multipart part-size limits: OpenDAL wrote {} parts (the requested size was not measured)",
             crate::util::ByteSize(knobs.chunk_size.0),
             t.scheme,
-            crate::util::ByteSize(effective.write_chunk_bytes)
+            crate::util::ByteSize(effective.write_chunk_size)
         ));
     }
     if knobs.tail_cut {
@@ -435,9 +473,13 @@ pub fn build_run_with(
             client_cpu_busy_ratio: Some(
                 snapshot.client.cpu_pct / 100.0 / snapshot.client.cpu_cores.max(1) as f64,
             ),
+            client_saturated: snapshot
+                .self_obs
+                .as_ref()
+                .is_some_and(|o| o.client_saturated),
         },
     )
-    .with_history(history);
+    .finished();
     let partial = interrupted.then_some(PartialInfo {
         reason: PartialReason::Interrupted,
         measured_s: snapshot.elapsed_s,
@@ -449,6 +491,7 @@ pub fn build_run_with(
         run: RunInfo {
             id: run_id.to_string(),
             label: profile.name.clone(),
+            parent_id: None,
             started_at: crate::util::fmt_rfc3339(started_at),
             ended_at: crate::util::fmt_rfc3339(ended_at),
             window_s: snapshot.elapsed_s,
@@ -472,10 +515,7 @@ pub fn build_run_with(
             proxy: c.proxy.as_deref().map(crate::util::strip_url_credentials),
         },
         workload,
-        knobs: KnobsInfo {
-            requested: knobs.into(),
-            effective,
-        },
+        effective_write: effective,
         sla: (&profile.sla).into(),
         verdict: Verdict {
             level: VerdictLevel::Ok,
@@ -511,7 +551,6 @@ pub fn build_run_with(
         slowest: snapshot.slow_ops.iter().map(|s| s.op_id).collect(),
         cleanup,
         warnings,
-        tune: None,
     };
     let mut run = Run {
         report,
@@ -519,7 +558,7 @@ pub fn build_run_with(
         reqs: trace.reqs,
     };
     // Findings read the finished report and the trace rows (stream B3: analysis::findings).
-    run.report.findings = crate::analysis::findings::derive(&run, &diagnosis.findings);
+    run.report.findings = crate::analysis::findings::derive(&run);
     finish(&mut run, breached);
     run
 }

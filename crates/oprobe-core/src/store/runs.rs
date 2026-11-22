@@ -18,6 +18,9 @@ pub struct RunSummary {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// The `oprobe prove` this run is a trial of (hidden from `show --list` unless `--all`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_name: Option<String>,
     pub target_display: String,
@@ -55,6 +58,7 @@ impl From<&Report> for RunSummary {
         Self {
             id: r.run.id.clone(),
             label: r.run.label.clone(),
+            parent_id: r.run.parent_id.clone(),
             target_name: r.target.name.clone(),
             target_display: r.target.display.clone(),
             started_at: r.run.started_at.clone(),
@@ -255,7 +259,7 @@ impl RunStore {
     pub fn resolve(&self, r: &str) -> Result<PathBuf> {
         let unknown = |msg: String| -> anyhow::Error {
             OprobeError::new(ErrorCode::UsageUnknownRun, msg)
-                .with_hint("list runs with `oprobe runs list`")
+                .with_hint("list runs with `oprobe show --list`")
                 .into()
         };
         let p = Path::new(r);
@@ -272,6 +276,8 @@ impl RunStore {
         }
         let ids = self.ids()?;
         if let Some(rest) = r.strip_prefix("last") {
+            // `last` names the runs the user made, never prove's trials (U4).
+            let ids = self.top_level_ids()?;
             let n = match rest {
                 "" => 0,
                 _ => rest
@@ -352,31 +358,71 @@ impl RunStore {
         Ok(())
     }
 
-    /// Runs `gc` would delete: all but the newest `keep` runs, and (when given) only those
-    /// older than `older_than`; ids in `protect` (baselines) are kept.
-    pub fn gc_candidates(
-        &self,
-        keep: usize,
-        older_than: Option<std::time::Duration>,
-        protect: &std::collections::BTreeSet<String>,
-    ) -> Result<Vec<String>> {
-        let ids = self.ids()?;
-        let now = std::time::SystemTime::now();
-        let n = ids.len();
-        Ok(ids
+    /// Ids of the runs the user made (not prove trials), oldest first.
+    pub fn top_level_ids(&self) -> Result<Vec<String>> {
+        let mut v: Vec<String> = self
+            .list()?
             .into_iter()
-            .enumerate()
-            .filter(|(i, _)| *i + keep < n)
-            .map(|(_, id)| id)
-            .filter(|id| !protect.contains(id))
-            .filter(|id| match older_than {
-                None => true,
-                Some(age) => RunId::parse(id)
-                    .and_then(|r| r.started_at())
-                    .and_then(|t| now.duration_since(t).ok())
-                    .is_some_and(|a| a >= age),
-            })
+            .filter(|s| s.parent_id.is_none())
+            .map(|s| s.id)
+            .collect();
+        v.reverse();
+        Ok(v)
+    }
+
+    /// Ids of the trial runs of prove `parent`.
+    pub fn children(&self, parent: &str) -> Result<Vec<String>> {
+        Ok(self
+            .list()?
+            .into_iter()
+            .filter(|s| s.parent_id.as_deref() == Some(parent))
+            .map(|s| s.id)
             .collect())
+    }
+
+    fn prove_path(&self, id: &str) -> PathBuf {
+        self.dir.join(format!("{id}.prove.json"))
+    }
+
+    /// Save the result of a prove (`<id>.prove.json`).
+    pub fn save_prove(&self, id: &str, result: &serde_json::Value) -> Result<PathBuf> {
+        anyhow::ensure!(RunId::parse(id).is_some(), "invalid prove id `{id}`");
+        let path = self.prove_path(id);
+        super::atomic_write(&path, serde_json::to_string_pretty(result)?.as_bytes())?;
+        Ok(path)
+    }
+
+    /// The stored proves (their JSON results), newest first.
+    pub fn proves(&self) -> Result<Vec<serde_json::Value>> {
+        let rd = match std::fs::read_dir(&self.dir) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let mut v: Vec<(String, serde_json::Value)> = rd
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                let id = name.strip_suffix(".prove.json")?.to_owned();
+                let raw = std::fs::read(e.path()).ok()?;
+                Some((id, serde_json::from_slice(&raw).ok()?))
+            })
+            .collect();
+        v.sort_by(|a, b| b.0.cmp(&a.0));
+        Ok(v.into_iter().map(|x| x.1).collect())
+    }
+
+    /// Delete a stored prove and its trial runs. `false` when `id` is not a prove.
+    pub fn delete_prove(&self, id: &str) -> Result<bool> {
+        let p = self.prove_path(id);
+        if !p.is_file() {
+            return Ok(false);
+        }
+        for c in self.children(id)? {
+            self.delete(&c)?;
+        }
+        std::fs::remove_file(&p)?;
+        Ok(true)
     }
 }
 
@@ -386,6 +432,21 @@ pub fn load_path(path: &Path) -> Result<Run> {
         .extension()
         .is_some_and(|e| e.eq_ignore_ascii_case("json"));
     if is_json {
+        // INTEGRATION HOOK (show FILE): an embedder trace file (`oprobe.trace/6`, written by
+        // oprobe-trace's `Handle::save`) is opened with `oprobe_trace::TraceFile::read` and
+        // built into a report from its snapshot and request rows (`model::build`). Wired at
+        // integration, where that API exists.
+        if let Ok(raw) = std::fs::read(path)
+            && let Ok(v) = serde_json::from_slice::<serde_json::Value>(&raw)
+            && v.get("schema").and_then(|s| s.as_str()) == Some("oprobe.trace/6")
+        {
+            return Err(OprobeError::new(
+                ErrorCode::UsageInvalidArgument,
+                format!("`{}` is an oprobe-trace file", path.display()),
+            )
+            .with_hint("this build cannot open trace files yet")
+            .into());
+        }
         let report = crate::report::load_json(path)?;
         return Ok(Run {
             report,
@@ -552,12 +613,28 @@ mod tests {
         // Sidecars are rebuilt when missing.
         std::fs::remove_file(d.path().join("runs/20261120-150000-c3d4.json")).unwrap();
         assert_eq!(store.list().unwrap().len(), 3);
-        // gc keeps the newest and protected runs.
-        let protect = ["20261120-143005-a1b2".to_owned()].into_iter().collect();
+        // A prove trial is a child: `last` skips it, and deleting the prove removes it.
+        let mut trial = sample_run("20261122-100000-a0a0", None);
+        trial.report.run.parent_id = Some("20261122-095959-b1b1".into());
+        store.save(&trial).unwrap();
         assert_eq!(
-            store.gc_candidates(1, None, &protect).unwrap(),
-            vec!["20261120-150000-c3d4".to_owned()]
+            store.resolve("last").unwrap(),
+            store.run_path("20261121-090000-e5f6")
         );
+        assert_eq!(
+            store.children("20261122-095959-b1b1").unwrap(),
+            vec!["20261122-100000-a0a0".to_owned()]
+        );
+        store
+            .save_prove(
+                "20261122-095959-b1b1",
+                &serde_json::json!({"prove_id": "20261122-095959-b1b1"}),
+            )
+            .unwrap();
+        assert_eq!(store.proves().unwrap().len(), 1);
+        assert!(store.delete_prove("20261122-095959-b1b1").unwrap());
+        assert!(store.children("20261122-095959-b1b1").unwrap().is_empty());
+        assert!(!store.delete_prove("20261122-095959-b1b1").unwrap());
         store.delete("20261120-150000-c3d4").unwrap();
         assert_eq!(store.ids().unwrap().len(), 2);
         assert!(store.delete("20261120-150000-c3d4").is_err());
