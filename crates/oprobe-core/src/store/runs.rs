@@ -30,9 +30,6 @@ pub struct RunSummary {
     pub p50_ms: f64,
     pub p99_ms: f64,
     pub error_ratio: f64,
-    /// Projected monthly cost, where cost applies.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cost_per_month_usd: Option<f64>,
     /// The run file (filled in when listing; not stored).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
@@ -69,7 +66,6 @@ impl From<&Report> for RunSummary {
             p50_ms: r.summary.latency.p50,
             p99_ms: r.summary.latency.p99,
             error_ratio: r.summary.error_rate,
-            cost_per_month_usd: r.cost.applicable.then_some(r.cost.selected.total_usd),
             path: None,
             partial: if r.verdict.exit_code == crate::errors::exit::BUDGET {
                 Some("budget".into())

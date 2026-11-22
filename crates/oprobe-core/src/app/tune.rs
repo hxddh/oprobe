@@ -18,7 +18,7 @@ use crate::events::EventKind;
 use crate::model::{Report, TuneReport};
 use crate::output::{CommandOutput, NextStep, OutputFormat};
 use crate::report::style::{self, bold, dim, green, red, yellow};
-use crate::report::{brief, markdown, write_file};
+use crate::report::{brief, write_file};
 use crate::tune::recommend::Recommendation;
 use crate::tune::{TuneEvent, TuneOptions, codegen};
 use crate::util::parse_duration;
@@ -102,9 +102,6 @@ pub fn trial_table(t: &TuneReport) -> String {
 }
 
 impl CommandOutput for TuneOutput {
-    fn formats() -> &'static [crate::output::OutputFormat] {
-        crate::output::WITH_MD
-    }
 
     fn text(&self) -> String {
         let s = &self.tune;
@@ -135,7 +132,7 @@ impl CommandOutput for TuneOutput {
         }
         if !s.pareto_trial_ids.is_empty() {
             o += &format!(
-                "  {} Pareto front (goodput, p99, cost, throttling): trials {}\n",
+                "  {} Pareto front (goodput, p99, throttling): trials {}\n",
                 dim("·"),
                 s.pareto_trial_ids
                     .iter()
@@ -153,13 +150,6 @@ impl CommandOutput for TuneOutput {
         );
         o += &brief::render(&self.report, &self.run_id);
         o
-    }
-    fn markdown(&self) -> String {
-        let mut md = format!("## oprobe tune — {}\n\n", self.tune.headline);
-        if let Some(r) = &self.recommendation {
-            md += &format!("```toml\n{}```\n\n", r.profile_toml);
-        }
-        md + &markdown::render_report(&self.report)
     }
     fn exit_code(&self) -> u8 {
         self.report.verdict.exit_code
@@ -179,14 +169,6 @@ impl CommandOutput for TuneOutput {
             ));
         }
         v
-    }
-    fn result_event(&self) -> EventKind {
-        EventKind::Result {
-            run_id: Some(self.run_id.clone()),
-            path: self.path.clone(),
-            report: Some(Box::new(self.report.clone())),
-            data: None,
-        }
     }
 }
 
@@ -234,7 +216,6 @@ pub fn options_for(
             max_throttle_ratio: s.max_throttle_ratio.or(profile.sla.max_throttle_rate),
             boundary_repeats: s.boundary_repeats,
             headroom_ratio: s.headroom_ratio,
-            risk_ratio: s.risk_ratio,
         },
         profile.workload.rate,
     )
@@ -266,14 +247,13 @@ pub async fn run_tune(
 ) -> Result<TuneOutput> {
     let rails = rails(ctx, &profile, safety)?;
     let quiet = ctx.out.quiet;
-    let ndjson = ctx.out.format == OutputFormat::Ndjson;
     // The trial lines are report content: stdout in text mode (even with `-q`); otherwise
-    // progress (stderr, or `trial` events in ndjson mode).
+    // progress on stderr. In-process consumers get `trial` events.
     let table_on_stdout = ctx.out.format == OutputFormat::Text;
     let table_line = move |line: String| {
         if table_on_stdout {
             println!("{line}");
-        } else if !quiet && !ndjson {
+        } else if !quiet {
             eprintln!("{line}");
         }
     };
@@ -297,17 +277,13 @@ pub async fn run_tune(
     let on_event: Arc<dyn Fn(TuneEvent) + Send + Sync> = Arc::new(move |ev| match ev {
         TuneEvent::Started { .. } => {}
         TuneEvent::Message(m) => {
-            if ndjson {
-                bus.log(crate::events::LogLevel::Info, m);
-            } else if !quiet {
+            if !quiet {
                 eprintln!("   {}", dim(&m));
             }
+            bus.log(crate::events::LogLevel::Info, m);
         }
         TuneEvent::Finished(t) => {
-            if ndjson {
-                bus.emit(EventKind::Trial { trial: (&t).into() });
-                return;
-            }
+            bus.emit(EventKind::Trial { trial: (&t).into() });
             let k = &t.knobs;
             let verdict = if t.feasible {
                 green("ok")
@@ -374,7 +350,7 @@ pub enum TuneOutcome {
 /// [`trial_table`] before it in text mode).
 pub async fn tune(ctx: &Ctx, a: TuneRequest, cancel: Cancel) -> Result<TuneOutcome> {
     let (mut profile, target_name) =
-        super::profile::resolve_profile(ctx, &a.target, &a.workload, &a.knobs, &a.cost)?;
+        super::profile::resolve_profile(ctx, &a.target, &a.workload, &a.knobs)?;
     super::profile::apply_sla(&mut profile, &a.sla)?;
     if a.output.label.is_some() {
         profile.name = a.output.label.clone();

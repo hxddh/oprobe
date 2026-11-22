@@ -67,7 +67,6 @@ fn metric(o: Objective, mib: bool, t: &Trial) -> (&'static str, &'static str, f6
         }
         Objective::Throughput | Objective::Balanced => ("ops_per_s", "ops_per_s", t.ops_per_s),
         Objective::Latency => ("p99_ms", "ms", t.p99_ms),
-        Objective::Cost => ("cost_per_million_ops_usd", "usd", t.cost_per_million_ops),
     }
 }
 
@@ -241,7 +240,6 @@ mod tests {
             ops_per_s: ops,
             p50_ms: 1.0,
             p99_ms: 2.0,
-            cost_per_million_ops: 0.4,
             feasible,
             ..Default::default()
         }

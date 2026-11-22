@@ -1,5 +1,5 @@
 //! The Fix 5 menu (design v5 §4, fixes C3): `oprobe fix` answers with 2–4 Pareto options —
-//! goodput, p99, throttling, cost per month and verify status each — instead of one "go
+//! goodput, p99, throttling, and verify status each — instead of one "go
 //! slower". Example: "0 % throttling at −28 % goodput, or 0.4 % throttling at −3 %".
 //!
 //! - The options are the measured trials not dominated on (goodput ↑, throttling ↓, p99 ↓),
@@ -56,12 +56,6 @@ pub struct FixOption {
     pub goodput_delta_ratio: f64,
     pub p99_ms: f64,
     pub throttled_request_ratio: f64,
-    /// Cost per month at the profile's monthly operations (USD; absent without a price table).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cost_per_month_usd: Option<f64>,
-    /// Monthly cost change against the diagnosis (USD; retries and amplification).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cost_delta_per_month_usd: Option<f64>,
     /// Within the throttle budget and the SLA.
     pub feasible: bool,
     pub recommended: bool,
@@ -69,24 +63,14 @@ pub struct FixOption {
 }
 
 impl FixOption {
-    /// "0.00% throttling at −28% goodput (p99 12 ms, +$3/month)".
+    /// "0.00% throttling at −28% goodput (p99 12 ms)".
     pub fn summary(&self) -> String {
-        let mut s = format!(
+        format!(
             "{:.2}% throttling at {:+.0}% goodput (p99 {})",
             self.throttled_request_ratio * 100.0,
             self.goodput_delta_ratio * 100.0,
             crate::util::fmt_ms(self.p99_ms)
-        );
-        if let Some(d) = self.cost_delta_per_month_usd
-            && d.abs() >= 0.01
-        {
-            s += &format!(
-                ", {}{}/month",
-                if d >= 0.0 { "+" } else { "−" },
-                crate::util::fmt_usd(d.abs())
-            );
-        }
-        s
+        )
     }
 }
 
@@ -98,8 +82,6 @@ pub struct MenuInputs<'a> {
     /// Goodput in MiB/s instead of ops/s.
     pub use_bytes: bool,
     pub max_throttle_ratio: f64,
-    /// Operations per month (cost) and whether a price table applies.
-    pub monthly_ops: Option<f64>,
     /// The change of a trial from the diagnosis' configuration.
     pub overrides_of: &'a dyn Fn(&Trial) -> Overrides,
 }
@@ -168,17 +150,11 @@ pub fn menu(m: &MenuInputs<'_>) -> Vec<FixOption> {
     );
     add(best_by(&|_| true, &|t| -t.p99_ms), "lowest p99", &mut picks);
     picks.truncate(4);
-    let month = |t: &Trial| {
-        m.monthly_ops
-            .filter(|_| t.cost_per_million_ops > 0.0)
-            .map(|ops| t.cost_per_million_ops * ops / 1e6)
-    };
     let reference_feasible =
         m.reference.feasible && m.reference.throttled_request_ratio <= m.max_throttle_ratio;
     let mut out: Vec<FixOption> = picks
         .into_iter()
         .map(|(t, label)| {
-            let cost = month(t);
             FixOption {
                 label: label.to_owned(),
                 overrides: (m.overrides_of)(t),
@@ -193,8 +169,6 @@ pub fn menu(m: &MenuInputs<'_>) -> Vec<FixOption> {
                 goodput_delta_ratio: crate::util::ratio(g(t), g(m.reference)) - 1.0,
                 p99_ms: t.p99_ms,
                 throttled_request_ratio: t.throttled_request_ratio,
-                cost_per_month_usd: cost,
-                cost_delta_per_month_usd: cost.zip(month(m.reference)).map(|(a, b)| a - b),
                 feasible: within(&t),
                 recommended: false,
                 verify: OptionVerify::NotVerified,
@@ -226,8 +200,6 @@ pub fn menu(m: &MenuInputs<'_>) -> Vec<FixOption> {
                     goodput_delta_ratio: 0.0,
                     p99_ms: m.reference.p99_ms,
                     throttled_request_ratio: m.reference.throttled_request_ratio,
-                    cost_per_month_usd: month(m.reference),
-                    cost_delta_per_month_usd: month(m.reference).map(|_| 0.0),
                     feasible: true,
                     recommended: true,
                     verify: OptionVerify::NotVerified,
@@ -253,7 +225,6 @@ mod tests {
             throttled_request_ratio: thr,
             throttled_responses: (thr * 10_000.0) as u64,
             requests: 10_000,
-            cost_per_million_ops: 5.0,
             feasible: thr <= 0.005,
             ..Default::default()
         }
@@ -275,7 +246,6 @@ mod tests {
             reference: &base,
             use_bytes: false,
             max_throttle_ratio: 0.005,
-            monthly_ops: Some(1e8),
             overrides_of: &ov,
         });
         assert!((2..=4).contains(&m.len()), "{m:#?}");
@@ -287,7 +257,6 @@ mod tests {
         );
         assert!(m.iter().all(|o| o.trial_id != 4));
         assert!(m[0].summary().contains("goodput"));
-        assert_eq!(m[0].cost_per_month_usd, Some(500.0));
     }
 
     #[test]
@@ -300,7 +269,6 @@ mod tests {
             reference: &base,
             use_bytes: false,
             max_throttle_ratio: 0.001,
-            monthly_ops: None,
             overrides_of: &ov,
         });
         let r = m.iter().find(|o| o.recommended).unwrap();

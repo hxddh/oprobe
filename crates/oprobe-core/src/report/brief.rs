@@ -4,13 +4,39 @@
 //!
 //! The brief wraps to the terminal width (or 100 columns off a terminal, `COLUMNS` when set;
 //! [`style::term_width`]) and never truncates: prose wraps at words, and `next` commands are
-//! printed whole on their own line so they can be copied. Labels, finding causes and advice
-//! follow `--lang` ([`crate::i18n`]); numbers and commands do not change.
+//! printed whole on their own line so they can be copied. The CLI is English only.
 
 use super::Report;
 use super::style::*;
-use crate::i18n::{self, t, tf};
-use crate::util::{fmt_ms, fmt_usd};
+use crate::util::fmt_ms;
+
+/// The brief's English strings.
+fn t(key: &str) -> &'static str {
+    match key {
+        "label.next" => "next:",
+        "brief.partial" => "partial: the run was stopped early",
+        "brief.more_findings" => "… {n} more findings: {cmd}",
+        "brief.numbers" => "{ops} ops/s · {mib} MiB/s · p50 {p50} · p99 {p99} · errors {errors}%",
+        "brief.throttled" => "{n} throttled ({ratio}% of requests)",
+        "brief.sla_met" => "SLA met",
+        "brief.sla_met_unchecked_throttle" => {
+            "SLA met (throttling not checked: --max-throttle-ratio)"
+        }
+        "brief.sla_breached" => "SLA BREACHED",
+        "brief.sla_breached_soft" => "SLA breached (not enforced)",
+        "brief.full_report" => "full report: {cmd}",
+        _ => "",
+    }
+}
+
+/// [`t`] with `{name}` placeholders filled.
+fn tf(key: &str, args: &[(&str, &dyn std::fmt::Display)]) -> String {
+    let mut s = t(key).to_owned();
+    for (name, v) in args {
+        s = s.replace(&format!("{{{name}}}"), &v.to_string());
+    }
+    s
+}
 
 /// Render the brief result of a run saved as `run_id`, for this terminal.
 pub fn render(r: &Report, run_id: &str) -> String {
@@ -50,10 +76,7 @@ pub fn render_width(r: &Report, run_id: &str, width: usize) -> String {
     let mut findings: Vec<_> = r.findings.iter().collect();
     findings.sort_by_key(|f| std::cmp::Reverse(f.severity));
     for f in findings.iter().take(3) {
-        let (cause, advice) = match i18n::finding(&f.code) {
-            Some((c, a)) => (c.to_owned(), a.to_owned()),
-            None => (f.cause.clone(), f.advice.clone()),
-        };
+        let (cause, advice) = (f.cause.clone(), f.advice.clone());
         let icon = super::terminal::severity_icon(f.severity);
         for (i, l) in wrap_text(&cause, width, "    ", "    ")
             .into_iter()
@@ -89,7 +112,7 @@ pub fn render_width(r: &Report, run_id: &str, width: usize) -> String {
             "  ",
             "brief.more_findings",
             &[("n", &n)],
-            &format!("oprobe explain {run_id}"),
+            &format!("oprobe show {run_id}"),
         );
     }
     let s = &r.summary;
@@ -117,18 +140,6 @@ pub fn render_width(r: &Report, run_id: &str, width: usize) -> String {
             "brief.throttled",
             &[("n", &throttled), ("ratio", &format!("{ratio:.2}"))],
         ));
-    }
-    if r.cost.applicable {
-        let label = crate::analysis::cost::storage_label(&r.cost);
-        let usd = tf(
-            "brief.per_month",
-            &[("usd", &fmt_usd(r.cost.selected.total_usd))],
-        );
-        extra.push(if label.is_empty() {
-            usd
-        } else {
-            format!("{usd} {label}")
-        });
     }
     let v = &r.verdict.sla;
     extra.push(
@@ -160,7 +171,7 @@ pub fn render_width(r: &Report, run_id: &str, width: usize) -> String {
         "",
         "brief.full_report",
         &[],
-        &format!("oprobe runs show {run_id}"),
+        &format!("oprobe show {run_id} --detail"),
     );
     let mut out = lines.join("\n");
     out.push('\n');
@@ -218,17 +229,14 @@ mod tests {
             bytes: Default::default(),
             cache: Default::default(),
             integrity: Default::default(),
-            client: Default::default(),
             self_stats: Default::default(),
             schedule: Default::default(),
-            workers: Default::default(),
             dimensions: Default::default(),
             sampling: Default::default(),
             open_loop: None,
             timeline: vec![],
             heatmap: Default::default(),
             findings: vec![],
-            cost: Default::default(),
             slowest: vec![],
             cleanup: Default::default(),
             warnings: vec![],
@@ -276,6 +284,6 @@ mod tests {
             assert!(!out.contains('…') || out.contains("more findings"), "{out}");
         }
         let out = render_width(&r, "20261120-143005-a1b2", 80);
-        assert!(out.contains("oprobe runs show 20261120-143005-a1b2"));
+        assert!(out.contains("oprobe show 20261120-143005-a1b2"));
     }
 }

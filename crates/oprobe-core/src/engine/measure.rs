@@ -38,8 +38,7 @@ pub struct Rails {
 
 impl Rails {
     /// Decide the rails of one measurement of `profile`; refuses (`safety.read_only`) a
-    /// read-only run that would write, and any run that would write when a read-only MCP server
-    /// started this command ([`crate::guard::check_server_read_only`]).
+    /// read-only run that would write.
     pub fn new(
         profile: &Profile,
         read_only: bool,
@@ -60,7 +59,6 @@ impl Rails {
         if read_only {
             crate::guard::check_read_only(profile)?;
         }
-        crate::guard::check_server_read_only(profile)?;
         Ok(Self {
             run_id,
             run_prefix,
@@ -82,9 +80,8 @@ impl Rails {
 
 /// A live guard enforcing `budgets` (none when empty). Share it between measurements for one
 /// aggregate budget.
-pub fn guard_for(budgets: &Budgets, profile: &Profile) -> Option<Arc<Guard>> {
-    (!budgets.is_empty())
-        .then(|| Guard::with_pricing(budgets.clone(), crate::guard::usd_per_request(profile)))
+pub fn guard_for(budgets: &Budgets, _profile: &Profile) -> Option<Arc<Guard>> {
+    (!budgets.is_empty()).then(|| Guard::new(budgets.clone()))
 }
 
 /// Measure a workload window, or run the tuner.
@@ -268,11 +265,8 @@ pub async fn measure(req: Request) -> Result<Measured> {
             let knobs = session.profile.knobs.clone();
             // The run file is written while the run is in progress (design v5 §2).
             if let Some(s) = &store {
-                let header = crate::store::runfile::RunHeader::new(
-                    rails.run_id.to_string(),
-                    spec.clone(),
-                    crate::model::ClientInfo::opendal(),
-                );
+                let header =
+                    crate::store::runfile::RunHeader::new(rails.run_id.to_string(), spec.clone());
                 let st = crate::store::runfile::RunFileStream::create(
                     &s.run_path(&rails.run_id.to_string()),
                     &header,
@@ -380,12 +374,6 @@ pub async fn measure(req: Request) -> Result<Measured> {
             (run, Some(tuned))
         }
     };
-    // The load generator (design v5 §7): its name, version and stages, and no finding that
-    // needs a stage it cannot observe.
-    if let Some(c) = session.client() {
-        run.report.client = c.info();
-        crate::clients::suppress_unsupported(&mut run.report);
-    }
     let breach = session.guard().and_then(|g| g.breach());
     if breach.is_some() {
         run.report.verdict.exit_code = exit::BUDGET;

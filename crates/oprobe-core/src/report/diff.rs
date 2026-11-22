@@ -100,127 +100,6 @@ impl DiffReport {
         out
     }
 
-    pub fn render_markdown(&self) -> String {
-        let mut md = String::new();
-        let _ = writeln!(
-            md,
-            "## {} oprobe storage gate — {}\n\nBaseline: {}  \nCandidate: {}\n",
-            match self.verdict {
-                GateVerdict::Passed => "✅",
-                GateVerdict::Regression => "❌",
-                GateVerdict::Warned | GateVerdict::Inconclusive => "🟡",
-                GateVerdict::NotComparable => "⚠️",
-            },
-            self.verdict.label(),
-            self.baseline,
-            self.candidate
-        );
-        if !self.config_changes.is_empty() {
-            let _ = writeln!(
-                md,
-                "**Configuration changes**\n\n| kind | setting | baseline | candidate |\n|---|---|---|---|"
-            );
-            for c in &self.config_changes {
-                let _ = writeln!(
-                    md,
-                    "| {} | `{}` | {} | {} |",
-                    c.kind.label(),
-                    c.field,
-                    summarize(&c.baseline, 60).replace('|', "\\|"),
-                    summarize(&c.candidate, 60).replace('|', "\\|")
-                );
-            }
-            md.push('\n');
-        }
-        for w in &self.warnings {
-            let _ = writeln!(md, "> ⚠️ {w}\n");
-        }
-        let _ = writeln!(
-            md,
-            "| check | baseline | candidate | change | limit | result |\n|---|---:|---:|---:|---|---|"
-        );
-        for c in &self.checks {
-            let st = match c.verdict {
-                Status::Pass => "✅ pass",
-                Status::Improved => "🚀 improved",
-                Status::Fail => "❌ **FAIL**",
-                Status::Skipped => "⏭ skipped",
-                Status::Warn => "🟡 warn",
-                Status::Inconclusive => "❔ inconclusive",
-            };
-            let _ = writeln!(
-                md,
-                "| {} | {} | {} | {} | {} | {} |",
-                c.label(),
-                c.fmt_value(c.baseline),
-                c.fmt_value(c.candidate),
-                c.fmt_delta(),
-                c.fmt_limit(),
-                st
-            );
-        }
-        md
-    }
-
-    /// JUnit XML (one test case per check) for CI systems that render test reports.
-    pub fn render_junit(&self) -> String {
-        let esc = |s: &str| {
-            s.replace('&', "&amp;")
-                .replace('<', "&lt;")
-                .replace('>', "&gt;")
-                .replace('"', "&quot;")
-        };
-        let failing = |c: &Check| self.comparable && c.verdict == Status::Fail;
-        let failures = self.checks.iter().filter(|c| failing(c)).count();
-        let skipped = self
-            .checks
-            .iter()
-            .filter(|c| c.verdict == Status::Skipped)
-            .count();
-        let mut x = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
-        let _ = writeln!(
-            x,
-            "<testsuite name=\"oprobe compare\" tests=\"{}\" failures=\"{failures}\" skipped=\"{skipped}\">",
-            self.checks.len() + 1
-        );
-        let _ = write!(
-            x,
-            "  <testcase classname=\"oprobe.gate\" name=\"comparable\">"
-        );
-        if !self.comparable {
-            let _ = write!(
-                x,
-                "<skipped message=\"{}\"/>",
-                esc(&self.identity.reasons.join("; "))
-            );
-        }
-        let _ = writeln!(x, "</testcase>");
-        for c in &self.checks {
-            let _ = write!(
-                x,
-                "  <testcase classname=\"oprobe.gate\" name=\"{}\">",
-                esc(&c.id)
-            );
-            if failing(c) {
-                let _ = write!(
-                    x,
-                    "<failure message=\"{}\">baseline={} candidate={} unit={} delta_ratio={} limit={}</failure>",
-                    esc(&format!("{} regressed {}", c.label(), c.fmt_delta())),
-                    c.baseline,
-                    c.candidate,
-                    esc(&c.unit),
-                    c.delta_ratio
-                        .map_or("null".to_owned(), |d| format!("{d:.4}")),
-                    esc(&c.fmt_limit())
-                );
-            } else if c.verdict == Status::Skipped {
-                let _ = write!(x, "<skipped message=\"{}\"/>", esc(&c.note));
-            }
-            let _ = writeln!(x, "</testcase>");
-        }
-        x.push_str("</testsuite>\n");
-        x
-    }
 }
 
 /// Wrap `s` at `width` columns, continuation lines indented by `indent` spaces.
@@ -388,7 +267,6 @@ mod tests {
         assert!(!d.identity.same_workload && d.identity.same_target);
         assert!(!d.identity.reasons.is_empty());
         assert!(d.warnings.iter().any(|w| w.contains("not comparable")));
-        assert!(!d.render_junit().contains("<failure"));
         let strict = Thresholds {
             strict: true,
             ..Thresholds::default()

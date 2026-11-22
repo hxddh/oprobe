@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! zstd( frame* )         frame = kind:u8  len:u32 (LE)  payload[len] (JSON)
-//! kind 1  header         RunHeader: format, run id, spec, client, versions
+//! kind 1  header         RunHeader: format, run id, spec, versions
 //! kind 2  segment        Segment: columnar op and request rows of one time slice
 //! kind 3  interval       IntervalBlock: one per-second slice of the timeline
 //! kind 4  report         the Report, written last
@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::errors::ErrorCode;
 use crate::model::{
-    ClientInfo, OpBreakdownUs, OpRow, RUN_FORMAT, Report, ReqDetail, ReqRow, Run, RunSpec, TcpRow,
+    OpBreakdownUs, OpRow, RUN_FORMAT, Report, ReqDetail, ReqRow, Run, RunSpec, TcpRow,
     TlsRow, WireProtocol,
 };
 
@@ -53,18 +53,16 @@ pub struct RunHeader {
     pub oprobe_version: String,
     pub created_at: String,
     pub spec: RunSpec,
-    pub client: ClientInfo,
 }
 
 impl RunHeader {
-    pub fn new(run_id: impl Into<String>, spec: RunSpec, client: ClientInfo) -> Self {
+    pub fn new(run_id: impl Into<String>, spec: RunSpec) -> Self {
         Self {
             format: RUN_FORMAT.to_owned(),
             run_id: run_id.into(),
             oprobe_version: env!("CARGO_PKG_VERSION").to_owned(),
             created_at: crate::util::now_rfc3339(),
             spec,
-            client,
         }
     }
 }
@@ -675,11 +673,7 @@ fn read_exact_or_eof(r: &mut impl Read, buf: &mut [u8]) -> Result<bool> {
 
 /// Write a finished run as `oprobe.run/5` (rows in segments of [`SEGMENT_ROWS`], by time).
 pub fn write_run(path: &Path, run: &Run) -> Result<PathBuf> {
-    let header = RunHeader::new(
-        run.report.run.id.clone(),
-        run.report.spec.clone(),
-        run.report.client.clone(),
-    );
+    let header = RunHeader::new(run.report.run.id.clone(), run.report.spec.clone());
     let mut w = RunFileWriter::create(path, &header)?;
     for p in &run.report.timeline {
         w.write_interval(&IntervalBlock::of(p))?;
@@ -1026,7 +1020,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("r.oprobe");
         let run = crate::report::fixture::run();
-        let header = RunHeader::new("x", run.report.spec.clone(), ClientInfo::opendal());
+        let header = RunHeader::new("x", run.report.spec.clone());
         {
             let mut w = RunFileWriter::create(&path, &header).unwrap();
             w.write_rows(&run.ops, &run.reqs).unwrap();
@@ -1042,7 +1036,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("s.oprobe");
         let base = crate::report::fixture::run();
-        let header = RunHeader::new("x", base.report.spec.clone(), ClientInfo::opendal());
+        let header = RunHeader::new("x", base.report.spec.clone());
         let op0 = base.ops[0].clone();
         let req0 = base
             .requests_of(op0.op_id)

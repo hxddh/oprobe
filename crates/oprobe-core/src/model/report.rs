@@ -12,9 +12,8 @@ use std::collections::BTreeMap;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::analysis::cost::CostReport;
 use crate::analysis::diagnosis::{Bottleneck, Severity, SlaVerdict};
-use crate::config::{Knobs, TransportMode};
+use crate::config::Knobs;
 use crate::engine::CleanupSummary;
 use crate::model::TraceInfo;
 use crate::net::HttpVersion;
@@ -107,9 +106,6 @@ pub struct Report {
     pub bytes: ByteStats,
     pub cache: CacheStats,
     pub integrity: IntegrityStats,
-    /// What generated the load (design v5 §7).
-    #[serde(default)]
-    pub client: super::ClientInfo,
     /// The observer's own cost and the client's health (design v5 §3; `report.self`).
     #[serde(rename = "self", default)]
     pub self_stats: super::SelfStats,
@@ -118,9 +114,6 @@ pub struct Report {
     /// Arrival schedule: missed arrivals and the schedule stage (design v5 §3).
     #[serde(default)]
     pub schedule: super::ScheduleStats,
-    /// Workers of a distributed run (empty: this process; design v5 §8).
-    #[serde(default)]
-    pub workers: Vec<super::WorkerInfo>,
     /// Where the traffic and the trouble are: prefixes, hot keys, sizes, cold/warm, tenants.
     #[serde(default)]
     pub dimensions: super::Dimensions,
@@ -133,7 +126,6 @@ pub struct Report {
     /// How much load the target takes: the in-flight ceiling and the per-op request shape.
     #[serde(default)]
     pub capacity: crate::analysis::capacity::Capacity,
-    pub cost: CostReport,
     /// Op ids of the slowest operations (slowest first); their rows are in the run file.
     pub slowest: Vec<u64>,
     pub cleanup: CleanupSummary,
@@ -412,7 +404,6 @@ pub struct KnobValues {
     /// 0 = unlimited.
     pub max_inflight_requests_count: u64,
     pub http_version: HttpVersion,
-    pub transport: TransportMode,
     pub keep_alive: bool,
     pub cache: bool,
     pub cache_bytes: u64,
@@ -436,7 +427,6 @@ impl From<&Knobs> for KnobValues {
             range_gap_bytes: k.range_gap.0,
             max_inflight_requests_count: k.max_inflight_requests as u64,
             http_version: k.http_version,
-            transport: k.transport,
             keep_alive: k.keep_alive,
             cache: k.cache,
             cache_bytes: k.cache_size.0,
@@ -458,7 +448,6 @@ impl KnobValues {
             range_gap: crate::util::ByteSize(self.range_gap_bytes),
             max_inflight_requests: self.max_inflight_requests_count as usize,
             http_version: self.http_version,
-            transport: self.transport,
             keep_alive: self.keep_alive,
             cache: self.cache,
             cache_size: crate::util::ByteSize(self.cache_bytes),
@@ -1030,7 +1019,6 @@ pub struct TrialRow {
     pub peak_inflight_count: u64,
     /// The most requests one operation had in flight at once (maximum over operations).
     pub peak_inflight_per_op_count: u64,
-    pub cost_per_million_ops_usd: f64,
     pub feasible: bool,
     pub note: String,
     /// The pace of an open-loop trial (operations per second).
@@ -1054,7 +1042,6 @@ impl TrialRow {
             throttled_op_ratio: self.throttled_op_ratio,
             throttled_responses: self.throttled_responses_count,
             requests: self.requests_count,
-            cost_per_million_ops: self.cost_per_million_ops_usd,
             peak_inflight: self.peak_inflight_count,
             peak_inflight_per_op: self.peak_inflight_per_op_count as f64,
             feasible: self.feasible,
@@ -1081,7 +1068,6 @@ impl From<&crate::tune::Trial> for TrialRow {
             requests_count: t.requests,
             peak_inflight_count: t.peak_inflight,
             peak_inflight_per_op_count: t.peak_inflight_per_op.round().max(0.0) as u64,
-            cost_per_million_ops_usd: t.cost_per_million_ops,
             feasible: t.feasible,
             note: t.note.clone(),
             rate_per_s: t.rate_per_s,

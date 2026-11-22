@@ -48,9 +48,6 @@ pub struct FixOutput {
 }
 
 impl CommandOutput for FixOutput {
-    fn formats() -> &'static [crate::output::OutputFormat] {
-        crate::output::WITH_MD
-    }
 
     fn text(&self) -> String {
         let r = &self.recommendation;
@@ -186,7 +183,6 @@ pub async fn fix(ctx: &Ctx, a: FixRequest, cancel: Cancel) -> Result<FixOutcome>
                 target: a.target.clone(),
                 workload: a.workload.clone(),
                 knobs: a.knobs.clone(),
-                cost: a.cost.clone(),
                 sla: a.sla.clone(),
                 from: a.from.clone(),
                 set: a.set.clone(),
@@ -195,7 +191,7 @@ pub async fn fix(ctx: &Ctx, a: FixRequest, cancel: Cancel) -> Result<FixOutcome>
         )?
     } else {
         let (mut p, name) =
-            super::profile::resolve_profile(ctx, &a.target, &a.workload, &a.knobs, &a.cost)?;
+            super::profile::resolve_profile(ctx, &a.target, &a.workload, &a.knobs)?;
         super::profile::apply_sla(&mut p, &a.sla)?;
         (p, name)
     };
@@ -349,7 +345,6 @@ pub async fn fix(ctx: &Ctx, a: FixRequest, cancel: Cancel) -> Result<FixOutcome>
             throttled_request_ratio: crate::report::diff::throttled_request_ratio(&diag.report),
             throttled_responses: diag.report.resilience.throttled_responses,
             requests: diag.report.connections.requests,
-            cost_per_million_ops: diag.report.cost.selected.per_million_ops_usd,
             feasible: crate::report::diff::throttled_request_ratio(&diag.report) <= budget
                 && diag.report.summary.error_rate <= diag.report.sla.max_error_ratio,
             ..Default::default()
@@ -371,11 +366,6 @@ pub async fn fix(ctx: &Ctx, a: FixRequest, cancel: Cancel) -> Result<FixOutcome>
             reference: &reference,
             use_bytes: t.metric_unit == "mib_per_s",
             max_throttle_ratio: budget,
-            monthly_ops: diag
-                .report
-                .cost
-                .applicable
-                .then_some(profile.cost.monthly_ops),
             overrides_of: &ov,
         });
         // The verified option carries the outcome.

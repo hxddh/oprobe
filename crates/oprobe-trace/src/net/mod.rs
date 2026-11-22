@@ -1,6 +1,7 @@
-//! Networking: TLS, proxy tunnelling, instrumented dialing, the tracing HTTP transport and
+//! Networking: TLS, proxy tunnelling, instrumented dialing, the fidelity HTTP transport and
 //! the stand-alone handshake probe.
 
+pub mod config;
 pub mod dial;
 pub mod fidelity;
 pub mod probe;
@@ -10,12 +11,11 @@ pub mod stats;
 pub mod tcpinfo;
 pub mod tls;
 pub mod tlsinfo;
-pub mod transport;
 
 pub use fidelity::FidelityTransport;
 pub use proxy::ProxyConfig;
 pub use tls::TlsClientOptions;
-pub use transport::{HttpVersion, TracingTransport, TransportConfig};
+pub use config::{HttpVersion, TransportConfig};
 
 /// `Retry-After` in milliseconds: delay-seconds (RFC 9110 allows only integers; fractions are
 /// accepted) or an HTTP-date, relative to now. Nonsense (negative, non-finite, unparsable)

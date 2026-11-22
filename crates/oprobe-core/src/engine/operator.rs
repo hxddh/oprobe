@@ -9,10 +9,10 @@ use opendal::Operator;
 use opendal::layers::{RetryLayer, TimeoutLayer};
 
 use super::stack::ClientStack;
-use crate::config::{Knobs, TargetSpec, TransportMode};
+use crate::config::{Knobs, TargetSpec};
 use crate::errors::{ErrorCode, OprobeError};
-use crate::layers::{InProcessObserveLayer, TraceContextLayer, WhiteboxCacheLayer};
-use crate::net::{FidelityTransport, TlsClientOptions, TracingTransport, TransportConfig};
+use crate::net::{FidelityTransport, TlsClientOptions, TransportConfig};
+use crate::trace::layer::{InProcessObserveLayer, TraceContextLayer};
 use crate::trace::{OpScope, Recorder};
 
 static REGISTRY: Once = Once::new();
@@ -231,36 +231,21 @@ pub fn transport_config(target: &TargetSpec, knobs: &Knobs) -> Result<TransportC
         proxy: proxy_setting(target),
         // `OPROBE_TCP_INFO=0` turns the per-request kernel statistics off.
         tcp_info: std::env::var("OPROBE_TCP_INFO").map_or(true, |v| v != "0"),
-        ..Default::default()
     })
 }
 
-/// oprobe's instrumented connection pool (`--microscope`).
-pub fn transport(
-    target: &TargetSpec,
-    knobs: &Knobs,
-    recorder: Option<Arc<Recorder>>,
-) -> Result<TracingTransport> {
-    TracingTransport::new(transport_config(target, knobs)?, recorder)
-}
-
-/// The tracing layer for the configured transport mode.
+/// The tracing layer: OpenDAL's own HTTP client, instrumented (the fidelity transport).
 pub fn trace_layer(
     target: &TargetSpec,
     knobs: &Knobs,
     recorder: Option<Arc<Recorder>>,
 ) -> Result<TraceContextLayer> {
-    Ok(match knobs.transport {
-        TransportMode::Microscope => TraceContextLayer::new(transport(target, knobs, recorder)?),
-        TransportMode::Opendal => {
-            let https = target.endpoint().is_none_or(|e| e.starts_with("https"));
-            TraceContextLayer::new(FidelityTransport::new(
-                transport_config(target, knobs)?,
-                https,
-                recorder,
-            )?)
-        }
-    })
+    let https = target.endpoint().is_none_or(|e| e.starts_with("https"));
+    Ok(TraceContextLayer::new(FidelityTransport::new(
+        transport_config(target, knobs)?,
+        https,
+        recorder,
+    )?))
 }
 
 /// Instrumented operator: every request is traced into `recorder`.
@@ -299,10 +284,7 @@ pub fn measured_operator(
     // request. OpenDAL's `AwaitTreeLayer` is not used: it wraps every call and read chunk and
     // cost ~14% throughput on small requests (examples/overhead.rs).
     let _ = tree_registry;
-    if knobs.cache {
-        op = op.layer(WhiteboxCacheLayer::new(knobs.cache_size.as_u64()));
-    }
-    recorder.set_cache_enabled(knobs.cache);
+    recorder.set_cache_enabled(false);
     Ok(op)
 }
 
@@ -322,7 +304,6 @@ pub async fn check_reachable_with(
 ) -> Result<()> {
     let k = Knobs {
         http_version: knobs.http_version,
-        transport: knobs.transport,
         ..Knobs::default()
     };
     let probe = base
@@ -366,7 +347,7 @@ pub async fn check_reachable_with(
                 target.display()
             ),
         )
-        .with_hint("check the endpoint, the network path and the proxy (`oprobe doctor TARGET`)")
+        .with_hint("check the endpoint, the network path and the proxy ")
         .into());
     }
     Ok(())

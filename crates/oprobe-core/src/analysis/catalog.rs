@@ -348,23 +348,6 @@ const ENTRIES: &[Entry] = &[
         knobs: &["--cache SIZE", "--access"],
     },
     Entry {
-        code: "cost_hotspot",
-        title: "One API or wasted requests dominate the bill",
-        severity: Severity::Info,
-        category: "cost",
-        meaning: "One API is at least 60% of the projected request spend, or at least 10% of the projected monthly bill buys nothing (failed or throttled requests, over-read egress).",
-        causes: &[
-            "many small requests of one kind (HEAD, LIST, small GETs)",
-            "throttled or failed requests that are billed anyway",
-            "over-read downloads",
-        ],
-        verify: &[
-            "report.cost.by_api and report.cost.waste_usd",
-            "`oprobe run TARGET --provider NAME --monthly-ops N` for your own volume",
-        ],
-        knobs: &["--range-gap", "--chunk-size", "--concurrency", "--provider"],
-    },
-    Entry {
         code: "slow_start",
         title: "The first seconds are much slower than the steady state",
         severity: Severity::Info,

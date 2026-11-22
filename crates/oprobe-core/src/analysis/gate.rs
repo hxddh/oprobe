@@ -970,17 +970,6 @@ pub fn diff(base: &Report, cand: &Report, t: &Thresholds) -> DiffReport {
             false,
         );
     }
-    if base.cost.applicable && cand.cost.applicable {
-        b.higher_worse(
-            "cost_per_million_ops".into(),
-            "usd",
-            base.cost.selected.per_million_ops_usd,
-            cand.cost.selected.per_million_ops_usd,
-            t.cost_increase_ratio,
-            0.0001,
-            false,
-        );
-    }
     let mut d = DiffReport {
         verdict: GateVerdict::Passed,
         passed: true,

@@ -234,48 +234,25 @@ pub fn findings_by_severity(r: &Report) -> Vec<FindingView<'_>> {
     v
 }
 
-/// Bytes, amplification and the cost projection.
+/// Bytes and amplification.
 #[derive(Clone, Debug, PartialEq)]
-pub struct CostView<'a> {
+pub struct BytesView {
     pub read_amplification: f64,
     pub overread_ratio: f64,
     pub requests_per_op: f64,
     pub downloaded_bytes: u64,
     pub uploaded_bytes: u64,
-    /// `None`: cost does not apply (with the reason).
-    pub applicable: bool,
-    pub not_applicable_reason: &'a str,
-    pub provider: &'a str,
-    pub per_million_ops_usd: f64,
-    pub requests_usd: f64,
-    pub egress_usd: f64,
-    pub storage_usd: f64,
-    pub monthly_ops: f64,
-    pub stored_gib: f64,
-    /// `(assumed 1 TiB stored — set --stored-gib)` when the storage is assumed, else empty.
-    pub storage_label: String,
 }
 
-impl<'a> CostView<'a> {
-    pub fn of(r: &'a Report) -> Self {
+impl BytesView {
+    pub fn of(r: &Report) -> Self {
         let b = &r.bytes;
-        let c = &r.cost.selected;
         Self {
             read_amplification: b.read_amplification,
             overread_ratio: b.overread_ratio,
             requests_per_op: b.request_amplification,
             downloaded_bytes: b.backend_down,
             uploaded_bytes: b.backend_up,
-            applicable: r.cost.applicable,
-            not_applicable_reason: r.cost.not_applicable_reason.as_deref().unwrap_or_default(),
-            provider: &c.provider,
-            per_million_ops_usd: c.per_million_ops_usd,
-            requests_usd: c.requests_usd,
-            egress_usd: c.egress_usd,
-            storage_usd: c.storage_usd,
-            monthly_ops: r.cost.monthly_ops,
-            stored_gib: r.cost.stored_gb,
-            storage_label: crate::analysis::cost::storage_label(&r.cost),
         }
     }
 }
@@ -287,7 +264,7 @@ pub struct ReportView<'a> {
     pub sla: SlaView<'a>,
     pub time: TimeView,
     pub findings: Vec<FindingView<'a>>,
-    pub cost: CostView<'a>,
+    pub bytes: BytesView,
     /// The run stopped early and no warning says so yet.
     pub partial_note: bool,
     pub warnings: &'a [String],
@@ -300,7 +277,7 @@ impl<'a> ReportView<'a> {
             sla: SlaView::of(r),
             time: TimeView::of(r),
             findings: findings(r),
-            cost: CostView::of(r),
+            bytes: BytesView::of(r),
             partial_note: r.is_partial()
                 && !r.warnings.iter().any(|w| w.starts_with("partial run: ")),
             warnings: &r.warnings,

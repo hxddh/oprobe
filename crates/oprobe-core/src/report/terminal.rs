@@ -7,7 +7,7 @@ use super::style::*;
 use crate::analysis::diagnosis::Severity;
 use crate::model::{OpRow, ReqRow, Run, VerdictLevel, WireProtocol};
 use crate::trace::{ApiStats, VerbStats};
-use crate::util::{fmt_bytes, fmt_ms, fmt_usd};
+use crate::util::{fmt_bytes, fmt_ms};
 
 /// `HEALTHY` / `REVIEW` / `ATTENTION` / `CRITICAL` badge of a verdict level.
 pub fn verdict_badge(level: VerdictLevel) -> String {
@@ -452,17 +452,13 @@ fn render_with(r: &Report, run: Option<&Run>, detail: bool) -> String {
         out,
         "{}",
         dim(&format!(
-            "{} · {:.1}s measured · {} · client {} · {}",
+            "{} · {:.1}s measured · {} · {}",
             r.workload.preset,
             r.run.window_s,
             if let Some(rate) = r.workload.rate_per_s {
                 format!("open loop {rate} ops/s")
             } else {
                 format!("{} workers", r.knobs.requested.concurrency_count)
-            },
-            match r.knobs.requested.transport {
-                crate::config::TransportMode::Opendal => "OpenDAL reqwest",
-                crate::config::TransportMode::Microscope => "microscope",
             },
             r.run.started_at
         ))
@@ -560,22 +556,6 @@ fn render_with(r: &Report, run: Option<&Run>, detail: bool) -> String {
         ),
     );
     kv(&mut out, "sla", &sla_line(r));
-    if r.cost.applicable && sm.ops > 0 {
-        kv(
-            &mut out,
-            "cost",
-            &format!(
-                "{} per 1M ops · {} /month ({}){}",
-                fmt_usd(r.cost.selected.per_million_ops_usd),
-                fmt_usd(r.cost.selected.total_usd),
-                r.cost.selected.provider,
-                match crate::analysis::cost::storage_label(&r.cost) {
-                    l if l.is_empty() => l,
-                    l => format!(" {}", dim(&l)),
-                }
-            ),
-        );
-    }
     if let Some(ol) = &r.open_loop {
         kv(
             &mut out,
@@ -805,83 +785,6 @@ fn render_with(r: &Report, run: Option<&Run>, detail: bool) -> String {
         );
     }
 
-    if r.cost.applicable && sm.ops > 0 {
-        let cst = &r.cost;
-        section(
-            &mut out,
-            &format!(
-                "COST  ({} · {:.0}M ops/month · egress {:.0}%)",
-                cst.selected.provider,
-                cst.monthly_ops / 1e6,
-                cst.egress_fraction * 100.0
-            ),
-        );
-        let sel = &cst.selected;
-        let _ = writeln!(
-            out,
-            "  {} per 1M ops → {} /month",
-            bold(&fmt_usd(sel.per_million_ops_usd)),
-            bold(&fmt_usd(sel.total_usd))
-        );
-        let _ = writeln!(
-            out,
-            "  requests {} · egress {} · storage {} for {:.0} GiB{}",
-            fmt_usd(sel.requests_usd),
-            fmt_usd(sel.egress_usd),
-            fmt_usd(sel.storage_usd),
-            cst.stored_gb,
-            match crate::analysis::cost::storage_label(cst) {
-                l if l.is_empty() => l,
-                l => format!(" {}", dim(&l)),
-            }
-        );
-        if sel.failed_requests_usd > 0.005
-            || sel.overread_usd > 0.005
-            || sel.cache_savings_usd > 0.005
-        {
-            let _ = writeln!(
-                out,
-                "  waste: failed {} · over-read {} · cache saved {}",
-                fmt_usd(sel.failed_requests_usd),
-                fmt_usd(sel.overread_usd),
-                fmt_usd(sel.cache_savings_usd)
-            );
-        }
-        if detail {
-            let u = &cst.per_op;
-            let _ = writeln!(
-                out,
-                "  {}",
-                dim(&format!(
-                    "per op: {:.2} write · {:.2} list · {:.2} read requests · {} down · {} up",
-                    u.write_requests,
-                    u.list_requests,
-                    u.read_requests,
-                    fmt_bytes(u.download_bytes as u64),
-                    fmt_bytes(u.upload_bytes as u64)
-                ))
-            );
-        }
-        let mut cmp: Vec<_> = cst.comparison.iter().collect();
-        cmp.sort_by(|a, b| a.total_usd.total_cmp(&b.total_usd));
-        if !cmp.is_empty() {
-            let line: Vec<String> = cmp
-                .iter()
-                .map(|c| format!("{} {}", c.key, fmt_usd(c.total_usd)))
-                .collect();
-            if detail {
-                let _ = writeln!(
-                    out,
-                    "  {}",
-                    dim(&format!("elsewhere: {}", line.join(" · ")))
-                );
-            } else {
-                for chunk in line.chunks(3) {
-                    let _ = writeln!(out, "  {}", dim(&chunk.join(" · ")));
-                }
-            }
-        }
-    }
 
     if detail && !r.timeline.is_empty() {
         section(&mut out, "TIMELINE  (per second)");

@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use sha2::Digest;
 
 use crate::config::{
-    Access, DatasetSpec, OpSpec, Profile, TargetSpec, TransportMode, WorkloadSpec,
+    Access, DatasetSpec, OpSpec, Profile, TargetSpec, WorkloadSpec,
 };
 use crate::errors::{ErrorCode, OprobeError};
 use crate::input;
@@ -333,9 +333,6 @@ impl RunSpec {
         if !k.keep_alive {
             flag("--no-keep-alive", None);
         }
-        if k.transport == TransportMode::Microscope {
-            flag("--microscope", None);
-        }
         if k.cache {
             flag("--cache", Some(k.cache_size.to_string()));
         }
@@ -375,27 +372,6 @@ impl RunSpec {
         }
         if let Some(ms) = s.p99_ms {
             flag("--p99-ms", Some(ms.to_string()));
-        }
-        // Cost.
-        let c = &p.cost;
-        let dc = &def.cost;
-        if let Some(pr) = &c.provider {
-            flag("--provider", Some(pr.clone()));
-        }
-        if c.monthly_ops != dc.monthly_ops {
-            flag("--monthly-ops", Some(c.monthly_ops.to_string()));
-        }
-        if c.egress_fraction != dc.egress_fraction {
-            flag("--egress-fraction", Some(c.egress_fraction.to_string()));
-        }
-        if c.stored_gib != dc.stored_gib {
-            flag("--stored-gib", Some(c.stored_gib.to_string()));
-        }
-        if let Some(pr) = &c.pricing {
-            sets.push((
-                "pricing".into(),
-                serde_json::to_string(pr).unwrap_or_default(),
-            ));
         }
         if let Some(l) = &self.label {
             flag("--label", Some(l.clone()));
@@ -505,7 +481,6 @@ pub enum Section {
     Workload,
     Target,
     Sla,
-    Cost,
     Run,
 }
 
@@ -565,7 +540,6 @@ pub const SET_KEYS: &[SetKey] = &[
         "cap on in-flight HTTP requests (0 = unlimited)",
     ),
     key("http_version", Section::Knobs, &["http"], "auto, h1 or h2"),
-    key("transport", Section::Knobs, &[], "opendal or microscope"),
     key(
         "keep_alive",
         Section::Knobs,
@@ -723,26 +697,6 @@ pub const SET_KEYS: &[SetKey] = &[
         "SLA: max p99 per operation in ms (none: unchecked)",
     ),
     key("sla", Section::Sla, &[], "enforce or none"),
-    key("provider", Section::Cost, &[], "pricing preset"),
-    key(
-        "monthly_ops",
-        Section::Cost,
-        &[],
-        "operations per month for the cost projection",
-    ),
-    key("stored_gib", Section::Cost, &[], "stored data in GiB"),
-    key(
-        "egress_fraction",
-        Section::Cost,
-        &[],
-        "share of downloads leaving the cloud",
-    ),
-    key(
-        "pricing",
-        Section::Cost,
-        &[],
-        "custom price table as JSON, or none",
-    ),
     key("label", Section::Run, &[], "label stored with the run"),
 ];
 
@@ -814,16 +768,6 @@ fn apply_one(
         "range_gap" => k.range_gap = input::size(v)?,
         "max_inflight_requests" => k.max_inflight_requests = usize_of(0)?,
         "http_version" => k.http_version = input::http_version(v)?,
-        "transport" => {
-            k.transport = input::choice(
-                "transport",
-                v,
-                &[
-                    ("opendal", TransportMode::Opendal),
-                    ("microscope", TransportMode::Microscope),
-                ],
-            )?
-        }
         "keep_alive" => k.keep_alive = input::boolean(&what, v)?,
         "cache" => match input::boolean(&what, v) {
             Ok(b) => k.cache = b,
@@ -950,29 +894,6 @@ fn apply_one(
         "sla" => {
             p.sla.enforce = input::choice("SLA mode", v, &[("enforce", true), ("none", false)])?
         }
-        "provider" => {
-            p.cost.provider = if none_word(v) {
-                None
-            } else {
-                Some(input::provider(v)?.to_owned())
-            }
-        }
-        "monthly_ops" => p.cost.monthly_ops = input::non_negative(&what, v)?,
-        "stored_gib" => p.cost.stored_gib = input::non_negative(&what, v)?,
-        "egress_fraction" => {
-            let f = input::share(&what, v)?;
-            p.cost.egress_fraction = f;
-        }
-        "pricing" => {
-            p.cost.pricing = if none_word(v) {
-                None
-            } else {
-                Some(serde_json::from_str(v).map_err(|e| {
-                    input::invalid(format!("invalid {what}: {e}"))
-                        .with_hint("a JSON object with the fields of [cost.pricing]")
-                })?)
-            }
-        }
         "label" => *label = (!v.is_empty()).then(|| v.to_owned()),
         other => {
             return Err(OprobeError::new(
@@ -1003,8 +924,6 @@ pub struct Overrides {
     pub target: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub sla: BTreeMap<String, String>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub cost: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
 }
@@ -1024,7 +943,6 @@ impl Overrides {
             Section::Workload => self.workload.insert(k.name.into(), v),
             Section::Target => self.target.insert(k.name.into(), v),
             Section::Sla => self.sla.insert(k.name.into(), v),
-            Section::Cost => self.cost.insert(k.name.into(), v),
             Section::Run => {
                 self.label = Some(v);
                 None
@@ -1067,7 +985,6 @@ impl Overrides {
             &self.knobs,
             &self.target,
             &self.sla,
-            &self.cost,
         ] {
             for (k, val) in m {
                 if k != "preset" {
@@ -1152,7 +1069,6 @@ mod tests {
         p.knobs.tail_cut = true;
         p.knobs.timeout = HumanDuration::secs(9);
         p.sla.max_throttle_rate = Some(0.01);
-        p.cost.provider = Some("aws-s3".into());
         p.name = Some("base".into());
         p
     }
@@ -1298,7 +1214,6 @@ mod tests {
             "warmup=5x",
             "preset=nope",
             "access=weird",
-            "provider=nope",
             "mix=[",
             "endpoint=ftp://x",
             "chunk_size=1",
@@ -1307,22 +1222,17 @@ mod tests {
             let e = Overrides::parse(&[bad]).unwrap_err();
             assert_eq!(e.code, ErrorCode::UsageInvalidArgument, "{bad}");
         }
-        let o = Overrides::parse(&["http=h2", "max-inflight=4", "provider=aws", "cache=128MiB"])
-            .unwrap();
+        let o = Overrides::parse(&["http=h2", "max-inflight=4", "cache=128MiB"]).unwrap();
         assert_eq!(o.knobs["http_version"], "h2");
         assert_eq!(o.knobs["max_inflight_requests"], "4");
-        assert_eq!(o.cost["provider"], "aws");
         let s = RunSpec::default().with(&o);
-        assert_eq!(s.profile.cost.provider.as_deref(), Some("aws-s3"));
         assert!(s.profile.knobs.cache);
         assert_eq!(s.profile.knobs.cache_size, ByteSize::mib(128));
         // Every key has a setter and accepts a plausible value.
         for k in SET_KEYS {
             let v = match k.name {
                 "mix" => r#"[{"op":"stat"}]"#,
-                "pricing" => "none",
                 "endpoint" => "http://127.0.0.1:9000",
-                "transport" => "microscope",
                 "http_version" => "h2",
                 "addressing" => "path",
                 "checksum" => "crc32c",
@@ -1331,7 +1241,6 @@ mod tests {
                 "access" => "uniform",
                 "arrivals" => "poisson",
                 "shape" => "ramp:1..10/2s",
-                "provider" => "gcs",
                 "sla" => "none",
                 "region" | "existing" | "label" => "x",
                 "keep_alive" | "tail_cut" | "persist" | "verify" | "cleanup" | "cache" => "on",

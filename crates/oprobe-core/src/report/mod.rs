@@ -1,11 +1,8 @@
 //! Renderers of the Report v3 (`crate::model::Report`) and the regression gate.
 
 pub mod brief;
-
 pub mod diff;
-pub mod html;
-mod html_assets;
-pub mod markdown;
+
 pub mod style;
 pub mod terminal;
 pub mod view;
@@ -187,10 +184,8 @@ pub mod fixture {
             bytes: Default::default(),
             cache: Default::default(),
             integrity: Default::default(),
-            client: Default::default(),
             self_stats: Default::default(),
             schedule: Default::default(),
-            workers: Vec::new(),
             dimensions: Default::default(),
             sampling: Default::default(),
             open_loop: None,
@@ -228,7 +223,6 @@ pub mod fixture {
                     ..Default::default()
                 }),
             }],
-            cost: Default::default(),
             slowest: vec![2, 1],
             cleanup: Default::default(),
             warnings: vec![],

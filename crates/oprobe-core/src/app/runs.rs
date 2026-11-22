@@ -1,4 +1,4 @@
-//! `oprobe runs list|show|rm|gc` (`compare` lives in `compare.rs`).
+//! The run history: list, show and remove stored runs (`oprobe show`).
 
 use anyhow::Result;
 use schemars::JsonSchema;
@@ -10,9 +10,8 @@ use crate::errors::{ErrorCode, OprobeError};
 use crate::model::Run;
 use crate::model::VerdictLevel;
 use crate::output::CommandOutput;
-use crate::report::diff::DiffReport;
 use crate::report::style::{bold, dim, green, red, yellow};
-use crate::report::{markdown, terminal};
+use crate::report::terminal;
 use crate::store::RunSummary;
 use crate::util::fmt_ms;
 
@@ -28,25 +27,15 @@ impl CommandOutput for RunsList {
     fn next(&self) -> Vec<crate::output::NextStep> {
         match self.runs.first() {
             Some(r) => vec![
-                crate::app::next::explain(&r.id),
                 crate::app::next::show(&r.id),
             ],
             None => vec![
                 crate::output::NextStep::new(
                     "measure a local lab target",
                     "oprobe run lab://demo -d 5s",
-                )
-                .with_mcp(
-                    "start_run",
-                    serde_json::json!({ "target": "lab://demo", "duration": "5s" }),
                 ),
-                crate::app::next::discover(),
             ],
         }
-    }
-
-    fn formats() -> &'static [crate::output::OutputFormat] {
-        crate::output::WITH_MD
     }
 
     fn text(&self) -> String {
@@ -86,15 +75,12 @@ impl CommandOutput for RunsList {
                     },
                     format!("{:.1}", r.ops_per_s),
                     fmt_ms(r.p99_ms),
-                    r.cost_per_month_usd
-                        .map(crate::util::fmt_usd)
-                        .unwrap_or_else(|| "–".into()),
                 ]
             })
             .collect();
         let mut o = crate::report::style::table(
             &[
-                "run", "label", "target", "when", "window", "verdict", "ops/s", "p99", "$/month",
+                "run", "label", "target", "when", "window", "verdict", "ops/s", "p99",
             ],
             &rows,
             0,
@@ -109,33 +95,10 @@ impl CommandOutput for RunsList {
                 self.total_count
             ));
         }
-        o += &dim("show one: oprobe runs show RUNREF  (id, prefix, last, last~1, label)\n");
+        o += &dim("show one: oprobe show RUN  (id, prefix, last, last~1, label)\n");
         o
     }
 
-    fn markdown(&self) -> String {
-        let mut o = String::from(
-            "| run | label | target | started | verdict | ops/s | p99 | $/month |\n|---|---|---|---|---|---:|---:|---:|\n",
-        );
-        for r in &self.runs {
-            o += &format!(
-                "| `{}` | {} | {} | {} | {} | {:.1} | {} | {} |\n",
-                r.id,
-                r.label.as_deref().unwrap_or(""),
-                r.target_name
-                    .clone()
-                    .unwrap_or_else(|| crate::util::display_url(&r.target_display)),
-                r.started_at,
-                r.verdict_level.as_str(),
-                r.ops_per_s,
-                fmt_ms(r.p99_ms),
-                r.cost_per_month_usd
-                    .map(crate::util::fmt_usd)
-                    .unwrap_or_else(|| "–".into()),
-            );
-        }
-        o
-    }
 }
 
 fn cut(s: &str, max: usize) -> String {
@@ -201,26 +164,10 @@ impl CommandOutput for RunShow {
         crate::app::next::after_run(&self.run.report)
     }
 
-    fn formats() -> &'static [crate::output::OutputFormat] {
-        crate::output::WITH_MD_HTML
-    }
-
     fn text(&self) -> String {
         match &self.full {
             Some(run) => terminal::render_run_with(run, self.detail),
             None => terminal::render(&self.run.report),
-        }
-    }
-    fn html(&self) -> Option<String> {
-        Some(match &self.full {
-            Some(run) => crate::report::html::render(run),
-            None => crate::report::html::render_report(&self.run.report),
-        })
-    }
-    fn markdown(&self) -> String {
-        match &self.full {
-            Some(run) => markdown::render(run),
-            None => markdown::render_report(&self.run.report),
         }
     }
 }
@@ -241,49 +188,7 @@ pub fn show(ctx: &Ctx, a: RunsShowRequest) -> Result<RunShow> {
     })
 }
 
-/// Result of `oprobe runs open`.
-#[derive(Clone, Debug, Serialize, JsonSchema)]
-pub struct OpenedRun {
-    pub path: String,
-    /// The app was started (it runs on its own).
-    pub launched: bool,
-}
-
-impl CommandOutput for OpenedRun {
-    fn next(&self) -> Vec<crate::output::NextStep> {
-        vec![crate::app::next::list_runs()]
-    }
-
-    fn text(&self) -> String {
-        format!("{} opening {} in the app\n", green("●"), self.path)
-    }
-}
-
-/// `30d`, `2w`, `12h`, `90m`: days and weeks on top of [`crate::util::parse_duration`].
-pub fn parse_age(v: &str) -> Result<std::time::Duration> {
-    let bad = || -> anyhow::Error {
-        OprobeError::new(
-            ErrorCode::UsageInvalidArgument,
-            format!("invalid age `{v}` (examples: 30d, 2w, 12h)"),
-        )
-        .into()
-    };
-    let t = v.trim().to_ascii_lowercase();
-    let mult = if t.ends_with('d') {
-        86_400.0
-    } else if t.ends_with('w') {
-        7.0 * 86_400.0
-    } else {
-        return crate::util::parse_duration(&t).map_err(|_| bad());
-    };
-    let n: f64 = t[..t.len() - 1].trim().parse().map_err(|_| bad())?;
-    if !n.is_finite() || n < 0.0 {
-        return Err(bad());
-    }
-    Ok(std::time::Duration::from_secs_f64(n * mult))
-}
-
-/// Result of `oprobe runs rm` / `runs gc`.
+/// Result of `oprobe show --rm`.
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 pub struct RemovedRuns {
     pub removed: Vec<String>,
@@ -338,52 +243,9 @@ pub fn rm(ctx: &Ctx, a: RunsRmRequest) -> Result<RemovedRuns> {
     })
 }
 
-pub fn gc(ctx: &Ctx, a: RunsGcRequest) -> Result<RemovedRuns> {
-    let older = a.older_than.as_deref().map(parse_age).transpose()?;
-    let protect = crate::store::Baselines::load(&ctx.paths.baselines_file())?.referenced();
-    let store = ctx.store();
-    let ids = store.gc_candidates(a.keep, older, &protect)?;
-    if !a.dry_run {
-        for id in &ids {
-            store.delete(id)?;
-        }
-    }
-    Ok(RemovedRuns {
-        removed: ids,
-        dry_run: a.dry_run,
-    })
-}
-
-impl CommandOutput for DiffReport {
-    fn formats() -> &'static [crate::output::OutputFormat] {
-        crate::output::WITH_MD_HTML
-    }
-
-    fn text(&self) -> String {
-        self.render_terminal()
-    }
-    fn markdown(&self) -> String {
-        self.render_markdown()
-    }
-    fn html(&self) -> Option<String> {
-        Some(crate::report::html::render_compare(self))
-    }
-    fn exit_code(&self) -> u8 {
-        DiffReport::exit_code(self)
-    }
-}
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn ages_accept_days_and_weeks() {
-        assert_eq!(parse_age("30d").unwrap().as_secs(), 30 * 86_400);
-        assert_eq!(parse_age("2w").unwrap().as_secs(), 14 * 86_400);
-        assert_eq!(parse_age("12h").unwrap().as_secs(), 12 * 3600);
-        assert!(parse_age("xd").is_err());
-        assert!(parse_age("soon").is_err());
-    }
 
     #[test]
     fn relative_times() {

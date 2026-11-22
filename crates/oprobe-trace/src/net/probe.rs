@@ -15,7 +15,7 @@ use super::dial::Dialer;
 use super::proxy::ProxyConfig;
 use super::tls::{TlsClientOptions, build_tls_connector};
 use super::tlsinfo::CertChain;
-use super::transport::HttpVersion;
+use super::config::HttpVersion;
 use crate::Quantiles;
 use crate::recorder::quantiles;
 use crate::rows::TlsRow;

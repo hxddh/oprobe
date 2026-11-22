@@ -13,12 +13,11 @@ use crate::config::Profile;
 use crate::engine::measure::{Mode, Rails};
 use crate::engine::{Cancel, Progress, ProgressFn};
 use crate::errors::{ErrorCode, OprobeError, exit};
-use crate::events::EventKind;
 use crate::guard::{Budgets, Guard, Plan};
 use crate::model::{Report, Run};
 use crate::output::{CommandOutput, OutputFormat};
 use crate::report::style::{bold, dim};
-use crate::report::{brief, markdown, write_file};
+use crate::report::{brief, write_file};
 use crate::util::{ByteSize, parse_duration};
 
 /// Result of `oprobe run`.
@@ -29,7 +28,7 @@ pub struct RunOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
     pub report: Report,
-    /// The run with its trace rows (not serialized; the HTML and Markdown renderers use it).
+    /// The run with its trace rows (not serialized).
     #[serde(skip)]
     #[schemars(skip)]
     pub full: Option<Box<Run>>,
@@ -40,35 +39,11 @@ impl CommandOutput for RunOutput {
         crate::app::next::after_run(&self.report)
     }
 
-    fn formats() -> &'static [crate::output::OutputFormat] {
-        crate::output::WITH_MD_HTML
-    }
-
     fn text(&self) -> String {
         brief::render(&self.report, &self.run_id)
     }
-    fn markdown(&self) -> String {
-        match &self.full {
-            Some(run) => markdown::render(run),
-            None => markdown::render_report(&self.report),
-        }
-    }
-    fn html(&self) -> Option<String> {
-        Some(match &self.full {
-            Some(run) => crate::report::html::render(run),
-            None => crate::report::html::render_report(&self.report),
-        })
-    }
     fn exit_code(&self) -> u8 {
         self.report.verdict.exit_code
-    }
-    fn result_event(&self) -> EventKind {
-        EventKind::Result {
-            run_id: Some(self.run_id.clone()),
-            path: self.path.clone(),
-            report: Some(Box::new(self.report.clone())),
-            data: None,
-        }
     }
 }
 
@@ -88,16 +63,7 @@ impl CommandOutput for PlanOutput {
             return Vec::new();
         }
         vec![
-            crate::output::NextStep::new("run it", p.command.clone()).with_mcp(
-                "start_run",
-                serde_json::json!({
-                    "target": p.target_ref,
-                    "preset": p.preset,
-                    "duration": format!("{}s", p.duration_s),
-                    "warmup": format!("{}s", p.warmup_s),
-                    "concurrency": p.concurrency_count,
-                }),
-            ),
+            crate::output::NextStep::new("run it", p.command.clone()),
         ]
     }
     fn text(&self) -> String {
@@ -122,13 +88,7 @@ impl CommandOutput for PlanOutput {
             "  writes {} objects under {} · deletes {}\n",
             p.objects_written_count, p.run_prefix, p.objects_deleted_count
         );
-        o += &format!(
-            "  cost {} · ETA {:.0}s\n",
-            p.estimated_cost_usd
-                .map(crate::util::fmt_usd)
-                .unwrap_or_else(|| "not applicable".into()),
-            p.eta_s
-        );
+        o += &format!("  ETA {:.0}s\n", p.eta_s);
         for a in &p.assumptions {
             o += &format!("  {}\n", dim(&format!("assumes {a}")));
         }
@@ -149,17 +109,7 @@ pub fn budgets(ctx: &Ctx, s: &Safety) -> Result<Budgets> {
         )
         .into()
     };
-    if let Some(c) = s.max_cost_usd {
-        anyhow::ensure!(
-            c.is_finite() && c >= 0.0,
-            OprobeError::new(
-                ErrorCode::UsageInvalidArgument,
-                "--max-cost-usd must be >= 0"
-            )
-        );
-    }
     let mut b = Budgets {
-        max_cost_usd: s.max_cost_usd,
         max_requests_count: s.max_requests,
         max_bytes: s
             .max_bytes
@@ -180,9 +130,6 @@ pub fn budgets(ctx: &Ctx, s: &Safety) -> Result<Budgets> {
 
 /// The safety rails of one measurement (a new run id each call).
 pub fn rails(ctx: &Ctx, profile: &Profile, s: &Safety) -> Result<Rails> {
-    if !s.allow_write {
-        crate::guard::refuse_server_writes(profile)?;
-    }
     Rails::new(
         profile,
         s.read_only,
@@ -193,22 +140,12 @@ pub fn rails(ctx: &Ctx, profile: &Profile, s: &Safety) -> Result<Rails> {
 
 /// The command's live guard (one per command: every measurement of `run --repeat` or `matrix`
 /// shares it, so its budgets cover the whole command).
-pub fn guard_for(ctx: &Ctx, profile: &Profile, b: &Budgets) -> Option<Arc<Guard>> {
-    let g = crate::engine::measure::guard_for(b, profile)?;
-    if b.max_cost_usd.is_some() && crate::guard::usd_per_request(profile).is_none() {
-        ctx.out.warn(
-            "--max-cost-usd is not enforced: no price table applies to this target (set --provider)",
-        );
-    }
-    Some(g)
+pub fn guard_for(_ctx: &Ctx, profile: &Profile, b: &Budgets) -> Option<Arc<Guard>> {
+    crate::engine::measure::guard_for(b, profile)
 }
 
-/// Progress for this output mode: a live line on a terminal, events in ndjson mode,
-/// messages on stderr otherwise.
+/// Progress for this output mode: a live line on a terminal, messages on stderr otherwise.
 pub fn progress_for(ctx: &Ctx, total_s: f64) -> (ProgressFn, Option<Arc<live::LiveLine>>) {
-    if ctx.out.format == OutputFormat::Ndjson {
-        return (ctx.out.bus().progress_fn(Some(total_s)), None);
-    }
     let quiet = ctx.out.quiet;
     if quiet || ctx.out.non_interactive || !std::io::stderr().is_terminal() {
         let msg: ProgressFn = Arc::new(move |p| {
@@ -227,11 +164,8 @@ pub fn progress_for(ctx: &Ctx, total_s: f64) -> (ProgressFn, Option<Arc<live::Li
     (Arc::new(move |p| l2.update(p)), Some(line))
 }
 
-/// Progress of the tuner: messages on stderr, or events in ndjson mode.
+/// Progress of the tuner: messages on stderr.
 pub fn tune_progress(ctx: &Ctx) -> ProgressFn {
-    if ctx.out.format == OutputFormat::Ndjson {
-        return ctx.out.bus().progress_fn(None);
-    }
     let quiet = ctx.out.quiet;
     Arc::new(move |p| {
         if let Progress::Message(m) = p
@@ -242,13 +176,10 @@ pub fn tune_progress(ctx: &Ctx) -> ProgressFn {
     })
 }
 
-/// `--json` / `--markdown` report files.
+/// The `--json` report file.
 pub fn save_outputs(r: &Report, o: &OutputOptions) -> Result<()> {
     if let Some(p) = &o.json {
         write_file(p, &serde_json::to_string_pretty(r)?)?;
-    }
-    if let Some(p) = &o.markdown {
-        write_file(p, &markdown::render_report(r))?;
     }
     Ok(())
 }

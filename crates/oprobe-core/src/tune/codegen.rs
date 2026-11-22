@@ -8,7 +8,7 @@
 use std::fmt::Write as _;
 use std::time::Duration;
 
-use crate::config::{Knobs, Profile, TargetSpec, TransportMode};
+use crate::config::{Knobs, Profile, TargetSpec};
 use crate::engine::ClientStack;
 use crate::engine::stack::effective_write_chunk;
 use crate::net::HttpVersion;
@@ -37,13 +37,6 @@ fn custom_http_client(k: &Knobs) -> bool {
 /// Header lines shared by the Rust and Python snippets (`prefix` = comment marker).
 fn caveats(prefix: &str, k: &Knobs) -> String {
     let mut s = String::new();
-    if k.transport == TransportMode::Microscope {
-        let _ = writeln!(
-            s,
-            "{prefix} WARNING: measured with oprobe's own connection pool (`--microscope`), not OpenDAL's\n\
-             {prefix} HTTP client. Re-run `oprobe tune` without `--microscope` to measure the client this code uses."
-        );
-    }
     if k.cache {
         let _ = writeln!(
             s,

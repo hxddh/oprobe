@@ -103,9 +103,6 @@ fn outcome_text(o: VerifyOutcome) -> String {
 }
 
 impl CommandOutput for VerifyResult {
-    fn formats() -> &'static [crate::output::OutputFormat] {
-        crate::output::WITH_MD
-    }
 
     fn text(&self) -> String {
         let mut o = format!(
@@ -188,10 +185,6 @@ impl CommandOutput for VerifyResult {
                 NextStep::new(
                     "compare a baseline replay with a candidate",
                     format!("oprobe compare {b} {c}"),
-                )
-                .with_mcp(
-                    "compare_runs",
-                    serde_json::json!({ "baseline": b, "candidate": c }),
                 ),
             );
         }
@@ -232,7 +225,7 @@ pub fn replay_request(run_id: &str, o: &Overrides, label: &str) -> ProfileReques
 }
 
 /// Replays of one run (`run --from RUN --set …`, in process): the run's resolved profile and
-/// one guard for the whole command, so `--max-requests`, `--max-bytes`, `--max-cost-usd` and
+/// one guard for the whole command, so `--max-requests`, `--max-bytes` and
 /// `--max-duration` cap every replay together (as with `run --repeat`).
 pub struct Replayer<'a> {
     /// The profile the run measured, its target resolved (credentials included).
@@ -335,7 +328,6 @@ pub fn metric_value(r: &Report, metric: &str) -> Option<f64> {
         "requests_per_op" | "requests_per_op_mean" | "bytes.request_amplification" => {
             r.bytes.request_amplification
         }
-        "cost_per_million_ops_usd" => r.cost.selected.per_million_ops_usd,
         _ => {
             let mut v = serde_json::to_value(r).ok()?;
             for part in m.split('.') {
@@ -964,7 +956,6 @@ pub async fn verify(ctx: &Ctx, a: VerifyRequest, cancel: Cancel) -> Result<Verif
         plan.estimated_ops_count *= runs as u64;
         plan.estimated_requests_count *= runs as u64;
         plan.estimated_bytes *= runs as u64;
-        plan.estimated_cost_usd = plan.estimated_cost_usd.map(|c| c * runs as f64);
         plan.assumptions.push(format!(
             "{runs} replays: {} baseline and {} candidate run(s) of {}",
             a.repeat,

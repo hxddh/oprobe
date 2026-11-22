@@ -1,4 +1,4 @@
-//! Profile model (`*.toml`): target, workload, knobs, SLA and cost assumptions.
+//! Profile model (`*.toml`): target, workload, knobs and SLA.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -63,7 +63,6 @@ pub struct BuiltinDefaults {
     pub workload: WorkloadSpec,
     pub knobs: Knobs,
     pub sla: Sla,
-    pub cost: CostSpec,
     pub tune: TuneDefaults,
     /// Spare in-flight capacity kept below a measured ceiling (`analysis::capacity`).
     pub headroom_ratio: f64,
@@ -80,7 +79,6 @@ pub fn defaults() -> BuiltinDefaults {
         workload: WorkloadSpec::default(),
         knobs: Knobs::default(),
         sla: Sla::default(),
-        cost: CostSpec::default(),
         tune: TuneDefaults {
             trial_duration: d(tune_defaults::TRIAL_DURATION),
             trial_warmup: d(tune_defaults::TRIAL_WARMUP),
@@ -110,13 +108,6 @@ pub struct Profile {
     pub knobs: Knobs,
     #[serde(default)]
     pub sla: Sla,
-    #[serde(default)]
-    pub cost: CostSpec,
-    /// What generates the load (`--client`, design v5 §7). Runtime only: never serialized, so
-    /// a stored spec cannot start a command; a replay uses the default client.
-    #[serde(skip)]
-    #[schemars(skip)]
-    pub client: crate::clients::ClientChoice,
 }
 
 /// Storage target. Either `url = "s3://bucket/prefix"` or explicit `scheme` + `options`.
@@ -642,9 +633,6 @@ pub struct WorkloadSpec {
     /// `diurnal[:MIN..MAX/PERIOD]` (makes the run open-loop; `rate` is then the diurnal peak).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shape: Option<RateShape>,
-    /// Replay a traffic log instead of the mix (open loop on the log's timing).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub replay: Option<crate::engine::replay::ReplaySpec>,
     #[serde(default)]
     pub access: Access,
     /// Dataset override (defaults come from the preset).
@@ -686,7 +674,6 @@ impl Default for WorkloadSpec {
             rate: None,
             arrivals: Arrivals::Constant,
             shape: None,
-            replay: None,
             access: Access::Uniform,
             dataset: None,
             mix: Vec::new(),
@@ -700,7 +687,7 @@ impl Default for WorkloadSpec {
 impl WorkloadSpec {
     /// Whether arrivals follow a schedule (`rate` or `shape`) instead of closed-loop workers.
     pub fn open_loop(&self) -> bool {
-        self.rate.is_some() || self.shape.is_some() || self.replay.is_some()
+        self.rate.is_some() || self.shape.is_some()
     }
 
     /// Expected open-loop arrivals over `window` (`None`: closed loop). The plan's estimate.
@@ -734,27 +721,6 @@ impl WorkloadSpec {
     }
 }
 
-#[derive(
-    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
-)]
-#[serde(rename_all = "lowercase")]
-pub enum TransportMode {
-    /// OpenDAL's default HTTP client (reqwest), observed through its extension points.
-    #[default]
-    Opendal,
-    /// oprobe's own instrumented connection pool.
-    Microscope,
-}
-
-impl TransportMode {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Opendal => "opendal",
-            Self::Microscope => "microscope",
-        }
-    }
-}
-
 /// Client-side configuration under test / being tuned.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -776,11 +742,6 @@ pub struct Knobs {
     pub max_inflight_requests: usize,
     #[serde(default)]
     pub http_version: HttpVersion,
-    /// How requests are made and observed: `opendal` = OpenDAL's own reqwest client (what
-    /// production runs; the default), `microscope` = oprobe's instrumented connection pool
-    /// (exact queue / per-dial phases / HTTP/2 streams, but a different client).
-    #[serde(default)]
-    pub transport: TransportMode,
     #[serde(default = "default_true")]
     pub keep_alive: bool,
     /// In-memory read cache.
@@ -910,7 +871,6 @@ impl Default for Knobs {
             range_gap: default_gap(),
             max_inflight_requests: 0,
             http_version: HttpVersion::Auto,
-            transport: TransportMode::Opendal,
             keep_alive: true,
             cache: false,
             cache_size: default_cache_size(),
@@ -925,7 +885,7 @@ impl Default for Knobs {
 impl Knobs {
     pub fn summary(&self) -> String {
         format!(
-            "concurrency={} io={} chunk={} gap={} inflight={} http={:?} keep-alive={} cache={} retries={}{}{}",
+            "concurrency={} io={} chunk={} gap={} inflight={} http={:?} keep-alive={} cache={} retries={}{}",
             self.concurrency,
             self.io_concurrency,
             self.chunk_size,
@@ -936,7 +896,6 @@ impl Knobs {
             if self.cache { self.cache_size.to_string() } else { "off".into() },
             self.retries,
             if self.tail_cut { " tail-cut" } else { "" },
-            if self.transport == TransportMode::Microscope { " (microscope)" } else { "" },
         )
         .to_ascii_lowercase()
             + &self.provider_summary()
@@ -1018,60 +977,6 @@ impl Sla {
             return Err(invalid("sla.p99_ms must be > 0"));
         }
         Ok(())
-    }
-}
-
-/// Business volume used to project measured per-operation costs to a monthly bill.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct CostSpec {
-    /// Pricing preset: aws-s3, gcs, azure-blob, cloudflare-r2, backblaze-b2, aliyun-oss.
-    /// Defaults to the target's provider.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provider: Option<String>,
-    /// Logical operations per month at this workload mix.
-    #[serde(default = "default_monthly_ops")]
-    pub monthly_ops: f64,
-    /// Data kept at rest (GiB).
-    #[serde(default = "default_stored_gib")]
-    pub stored_gib: f64,
-    /// Fraction of downloaded bytes that leave the cloud (internet egress).
-    #[serde(default)]
-    pub egress_fraction: f64,
-    /// Custom price overrides (USD).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pricing: Option<crate::analysis::cost::Pricing>,
-    /// Storage class the data is kept in: `standard` (default), `infrequent` or `archive`
-    /// (the provider's equivalents: S3 Standard-IA / Glacier IR, GCS Nearline / Archive, …).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub storage_class: Option<String>,
-    /// Fraction of downloaded bytes that cross regions (inter-region transfer).
-    #[serde(default, skip_serializing_if = "crate::config::is_zero_f64")]
-    pub inter_region_fraction: f64,
-}
-
-fn default_monthly_ops() -> f64 {
-    100_000_000.0
-}
-pub(crate) fn is_zero_f64(v: &f64) -> bool {
-    *v == 0.0
-}
-
-fn default_stored_gib() -> f64 {
-    1024.0
-}
-
-impl Default for CostSpec {
-    fn default() -> Self {
-        Self {
-            provider: None,
-            monthly_ops: default_monthly_ops(),
-            stored_gib: default_stored_gib(),
-            egress_fraction: 0.0,
-            pricing: None,
-            storage_class: None,
-            inter_region_fraction: 0.0,
-        }
     }
 }
 
@@ -1649,9 +1554,7 @@ impl Profile {
             workload: WorkloadSpec::default(),
             knobs: Knobs::default(),
             sla: Sla::default(),
-            cost: CostSpec::default(),
-            client: Default::default(),
-        };
+            };
         if let Some(sc) = scenario {
             sc.apply_defaults(&mut p);
         }
@@ -1726,19 +1629,6 @@ impl Profile {
             return Err(invalid(
                 "workload.mix needs at least one op with weight > 0",
             ));
-        }
-        let c = &self.cost;
-        if !(0.0..=1.0).contains(&c.egress_fraction) {
-            return Err(invalid("cost.egress_fraction must be within 0..1"));
-        }
-        if !(c.monthly_ops.is_finite() && c.monthly_ops >= 0.0) {
-            return Err(invalid("cost.monthly_ops must be >= 0"));
-        }
-        if !(c.stored_gib.is_finite() && c.stored_gib >= 0.0) {
-            return Err(invalid("cost.stored_gib must be >= 0"));
-        }
-        if let Some(p) = &c.provider {
-            crate::input::provider(p)?;
         }
         if let Some(e) = self.target.options.get("endpoint")
             && !e.contains("${")
@@ -1861,10 +1751,6 @@ mod tests {
         );
         assert_eq!(n.options["region"], "auto");
         assert!(!n.options.contains_key("account_id"));
-        assert_eq!(
-            crate::analysis::cost::detect_provider("s3", n.endpoint().as_deref()),
-            Some("cloudflare-r2")
-        );
         // A profile written from it reloads to the same target.
         let toml = Profile::from_target(n.clone()).to_toml().unwrap();
         let back: Profile = toml::from_str(&toml).unwrap();
@@ -1993,96 +1879,6 @@ mod tests {
         assert!(!n.options.contains_key("region"));
         if std::env::var("AWS_REGION").is_err() {
             assert!(n.resolved_options().unwrap().contains_key("region"));
-        }
-    }
-}
-
-/// Fully commented profile template for `oprobe init`.
-pub fn template(preset: Preset, target: &str) -> String {
-    let (ds, mix) = preset.defaults();
-    let mix_toml: String = mix
-        .iter()
-        .map(|m| {
-            let mut t = toml::to_string(m).unwrap_or_default();
-            t = t.lines().map(|l| format!("{l}\n")).collect();
-            format!("[[workload.mix]]\n{t}\n")
-        })
-        .collect();
-    format!(
-        r#"# oprobe profile — {desc}
-# Run:  oprobe run --profile this.toml        Tune: oprobe tune --profile this.toml
-# Docs: https://github.com/hxddh/oprobe/blob/main/docs/workloads.md
-
-[target]
-url = "{target}"
-# Backend options are passed to Apache OpenDAL. Never paste secrets: reference env vars.
-[target.options]
-# region = "us-east-1"
-# endpoint = "https://s3.us-east-1.amazonaws.com"     # MinIO / R2 / Ceph / private clouds
-# access_key_id = "${{AWS_ACCESS_KEY_ID}}"
-# secret_access_key = "${{AWS_SECRET_ACCESS_KEY}}"
-
-[workload]
-preset = "{slug}"
-duration = "30s"            # measurement window
-warmup = "5s"               # connections & caches warm up before measuring
-access = "uniform"          # uniform | zipf:1.1 | hotset:0.2/0.8
-# rate = 200.0              # open-loop ops/s (latency measured from intended start)
-# max_ops = 10000           # stop after N ops (deterministic CI runs)
-verify = true               # CRC32C-verify whole-object reads and sampled writes
-cleanup = true              # delete test data under oprobe-run-*/ afterwards
-
-[workload.dataset]
-objects = {objects}
-object_size = "{size}"
-partitions = {parts}
-# existing_prefix = "warehouse/events/"   # benchmark your real objects (read-only)
-# persist = true                          # keep the generated dataset for later runs
-
-# Operation mix (defaults of the preset; edit or extend):
-{mix_toml}[knobs]
-concurrency = 16            # concurrent operations
-io_concurrency = 4          # per-operation reader/writer parallelism
-chunk_size = "8MiB"         # reader/writer chunk = multipart part size
-range_gap = "64KiB"         # merge vectored ranges closer than this
-max_inflight_requests = 0   # cap on in-flight HTTP requests (0 = unlimited)
-http_version = "auto"       # auto | h1 | h2
-keep_alive = true
-cache = false               # in-memory read cache
-cache_size = "256MiB"
-retries = 3
-tail_cut = false            # cancel & retry stragglers above adaptive p95
-timeout = "60s"
-
-[sla]                       # `oprobe run` / `tune` exit 3 when breached (`--sla none` disables)
-enforce = true              # corrupted data always breaches the SLA
-max_error_rate = 0.01       # fraction of failed operations
-# p99_ms = 200.0            # per-operation p99 limit; tune rejects configurations above it
-# max_throttle_rate = 0.0   # fraction of throttled operations (unset: tune rejects any throttling)
-
-[cost]
-# provider = "aws-s3"       # aws-s3 | gcs | azure-blob | cloudflare-r2 | backblaze-b2 | aliyun-oss
-monthly_ops = 100000000     # project measured per-op cost to this monthly volume
-stored_gib = 1024
-egress_fraction = 0.0       # share of downloads leaving the cloud
-"#,
-        desc = preset.describe(),
-        slug = preset.slug(),
-        objects = ds.objects,
-        size = ds.object_size,
-        parts = ds.partitions,
-    )
-}
-
-#[cfg(test)]
-mod template_tests {
-    #[test]
-    fn templates_parse() {
-        for p in super::Preset::ALL {
-            let t = super::template(p, "s3://b/x");
-            let prof: super::Profile =
-                toml::from_str(&t).unwrap_or_else(|e| panic!("{p:?}: {e}\n{t}"));
-            prof.validate().unwrap();
         }
     }
 }

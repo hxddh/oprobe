@@ -3,7 +3,7 @@
 //!
 //! - **Objective:** `goodput` by default — successful ops/s (or MiB/s for large objects)
 //!   while the share of throttled requests stays within `max_throttle_ratio` (default
-//!   0.001); also `p99`, `cost` and `balanced`. Throttling within the budget is acceptable:
+//!   0.001); also `p99` and `balanced`. Throttling within the budget is acceptable:
 //!   the ceiling search does not stop at the first 503.
 //! - **Search:** a concurrency ladder, then bisection between the highest feasible and the
 //!   lowest infeasible concurrency, each boundary trial repeated (`boundary_repeats`). Every
@@ -16,7 +16,6 @@
 //!   negative "improvement". The cost of the safety margin (best measured vs recommended)
 //!   and the Pareto front of the trials are reported.
 
-pub mod bayes;
 pub mod codegen;
 pub mod recommend;
 
@@ -27,9 +26,8 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::analysis::capacity::{self, Capacity, Window};
-use crate::analysis::cost::cost_report;
 use crate::analysis::hypothesis::HypothesisKind as capacity_kind;
-use crate::config::{Access, Knobs, OpKind, TransportMode};
+use crate::config::{Access, Knobs, OpKind};
 use crate::engine::{RunOptions, Session};
 use crate::model::{OpRow, ReqRow};
 use crate::net::HttpVersion;
@@ -47,8 +45,6 @@ pub enum Objective {
     Throughput,
     /// Minimize worst p99 while keeping ≥ 80% of the best goodput.
     Latency,
-    /// Minimize cost per operation while keeping ≥ 80% of the best goodput.
-    Cost,
     /// Goodput and p99 together: the best goodput-to-latency trade among trials within 80 %
     /// of the best goodput.
     Balanced,
@@ -59,18 +55,15 @@ impl Objective {
         match self {
             Objective::Throughput => "goodput",
             Objective::Latency => "p99",
-            Objective::Cost => "cost",
             Objective::Balanced => "balanced",
         }
     }
 
-    /// Parse an objective label (`goodput`/`throughput`, `p99`/`latency`, `cost`,
-    /// `balanced`).
+    /// Parse an objective label (`goodput`/`throughput`, `p99`/`latency`, `balanced`).
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "goodput" | "throughput" => Some(Objective::Throughput),
             "p99" | "latency" => Some(Objective::Latency),
-            "cost" => Some(Objective::Cost),
             "balanced" => Some(Objective::Balanced),
             _ => None,
         }
@@ -94,11 +87,6 @@ pub struct TuneOptions {
     pub headroom_ratio: f64,
     /// A remembered capacity of this target and workload (`<data>/capacity.toml`).
     pub prior: Option<Capacity>,
-    /// Posterior chance of exceeding the throttle budget a recommendation may carry
-    /// ([`bayes`]; `--risk`).
-    pub risk_ratio: f64,
-    /// Trials the Bayesian stage may add after the concurrency search.
-    pub bayes_trials: usize,
 }
 
 impl TuneOptions {
@@ -116,14 +104,9 @@ impl TuneOptions {
             boundary_repeats: d.tune.boundary_repeats,
             headroom_ratio: d.headroom_ratio,
             prior: None,
-            risk_ratio: DEFAULT_RISK_RATIO,
-            bayes_trials: 2,
         }
     }
 }
-
-/// Default posterior risk of exceeding the throttle budget (`--risk`).
-pub const DEFAULT_RISK_RATIO: f64 = 0.05;
 
 /// Longest `Retry-After` the tuner waits for between trials.
 pub const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
@@ -146,7 +129,6 @@ pub struct Trial {
     pub throttled_op_ratio: f64,
     pub throttled_responses: u64,
     pub requests: u64,
-    pub cost_per_million_ops: f64,
     /// Requests in flight at the trial's peak.
     pub peak_inflight: u64,
     /// The most requests one operation had in flight at once (maximum over operations).
@@ -286,12 +268,6 @@ impl Tuner<'_> {
         let worst_p99 = snap.verbs.iter().map(|v| v.latency.p99).fold(0.0, f64::max);
         let throttled_ops: u64 = snap.verbs.iter().map(|v| v.throttled).sum();
         let ops = snap.summary.ops.max(1) as f64;
-        let cost = cost_report(
-            &snap,
-            &p.cost,
-            &p.target.scheme,
-            p.target.endpoint().as_deref(),
-        );
         let requests = snap.connections.requests;
         let throttled = snap.resilience.throttled_responses;
         let (done_ops, done_bytes) = completed_in_window(&rows.ops, snap.elapsed_s);
@@ -310,7 +286,6 @@ impl Tuner<'_> {
             throttled_op_ratio: throttled_ops as f64 / ops,
             throttled_responses: throttled,
             requests,
-            cost_per_million_ops: cost.selected.per_million_ops_usd,
             peak_inflight: cap.observed.peak_inflight_count,
             peak_inflight_per_op: cap.per_op.peak_inflight_per_op.max(1.0),
             feasible: true,
@@ -462,11 +437,6 @@ impl Tuner<'_> {
                 .into_iter()
                 .filter(near)
                 .min_by(|&a, &b| self.trials[a].p99_ms.total_cmp(&self.trials[b].p99_ms)),
-            Objective::Cost => pool.into_iter().filter(near).min_by(|&a, &b| {
-                self.trials[a]
-                    .cost_per_million_ops
-                    .total_cmp(&self.trials[b].cost_per_million_ops)
-            }),
             Objective::Balanced => {
                 let pool: Vec<usize> = pool.into_iter().filter(near).collect();
                 let min_p99 = pool
@@ -520,10 +490,6 @@ impl Tuner<'_> {
             Objective::Throughput => self.metric(ta) > self.metric(tb) * 1.03,
             Objective::Latency => {
                 ta.p99_ms < tb.p99_ms * 0.97 && self.metric(ta) >= 0.8 * self.metric(tb)
-            }
-            Objective::Cost => {
-                ta.cost_per_million_ops < tb.cost_per_million_ops * 0.97
-                    && self.metric(ta) >= 0.8 * self.metric(tb)
             }
             Objective::Balanced => {
                 let s = |t: &Trial| self.metric(t) / t.p99_ms.max(1e-6);
@@ -590,18 +556,16 @@ impl Tuner<'_> {
     }
 }
 
-/// The trials that are not dominated on (goodput, p99, cost, throttled ratio).
+/// The trials that are not dominated on (goodput, p99, throttled ratio).
 pub fn pareto_front(trials: &[Trial], use_bytes: bool) -> Vec<usize> {
     let m = |t: &Trial| if use_bytes { t.mib_per_s } else { t.ops_per_s };
     let cand: Vec<&Trial> = trials.iter().filter(|t| t.stage != "confirm").collect();
     let dominates = |a: &Trial, b: &Trial| {
         let ge = m(a) >= m(b)
             && a.p99_ms <= b.p99_ms
-            && a.cost_per_million_ops <= b.cost_per_million_ops
             && a.throttled_request_ratio <= b.throttled_request_ratio;
         let gt = m(a) > m(b)
             || a.p99_ms < b.p99_ms
-            || a.cost_per_million_ops < b.cost_per_million_ops
             || a.throttled_request_ratio < b.throttled_request_ratio;
         ge && gt
     };
@@ -643,7 +607,6 @@ fn score(o: Objective, use_bytes: bool, t: &Trial) -> f64 {
     match o {
         Objective::Throughput | Objective::Balanced => m,
         Objective::Latency => -t.p99_ms,
-        Objective::Cost => -t.cost_per_million_ops,
     }
 }
 
@@ -664,17 +627,6 @@ pub async fn tune(
     on_event: Arc<dyn Fn(TuneEvent) + Send + Sync>,
 ) -> Result<TuneOutcome> {
     let p = &session.profile;
-    if opts.objective == Objective::Cost {
-        let probe = cost_report(
-            &Snapshot::default(),
-            &p.cost,
-            &p.target.scheme,
-            p.target.endpoint().as_deref(),
-        );
-        if let Some(why) = probe.not_applicable_reason {
-            anyhow::bail!("the cost objective needs a price table: {why}");
-        }
-    }
     let mut t = Tuner {
         session,
         opts,
@@ -933,102 +885,6 @@ pub async fn tune(
             }
         }
     }
-    // 3c. Bayesian optimisation: the candidate concurrency (at the current pace) with the best
-    // constrained expected improvement under the goodput / throttle surrogates.
-    let space = |t: &Tuner<'_>| bayes::Space {
-        max_concurrency: max_c,
-        max_rate: t
-            .trials
-            .iter()
-            .filter_map(|x| x.rate_per_s)
-            .fold(0.0, f64::max),
-    };
-    for _ in 0..opts.bayes_trials {
-        if !t.budget_left() || t.trials.len() < 3 || t.saturated {
-            break;
-        }
-        let s = bayes::Surrogate::fit(&t.trials, space(&t), t.use_bytes, opts.max_throttle_ratio);
-        let cur = t.trials[current].clone();
-        let mut cands: Vec<usize> = (0..=(2.0 * (max_c as f64).log2()).floor() as u32)
-            .map(|i| (2f64.powf(f64::from(i) / 2.0)).round() as usize)
-            .filter(|c| (1..=max_c).contains(c))
-            .collect();
-        // Stay near what was measured: far outside it the surrogate knows nothing.
-        let measured_max = t
-            .trials
-            .iter()
-            .map(|x| x.knobs.concurrency)
-            .max()
-            .unwrap_or(1);
-        cands.retain(|c| *c * 2 <= measured_max * 3);
-        cands.dedup();
-        let pick = cands
-            .into_iter()
-            .filter(|c| {
-                !t.trials.iter().any(|x| {
-                    x.knobs.concurrency == *c
-                        && x.rate_per_s == cur.rate_per_s
-                        && x.knobs.io_concurrency == cur.knobs.io_concurrency
-                })
-            })
-            .filter_map(|c| {
-                let mut probe = cur.clone();
-                probe.knobs.concurrency = c;
-                s.acquisition(&probe).map(|a| (c, a))
-            })
-            .max_by(|a, b| a.1.total_cmp(&b.1));
-        let Some((c, a)) = pick else { break };
-        if a <= 1e-6 {
-            break;
-        }
-        let k = Knobs {
-            concurrency: c,
-            ..cur.knobs.clone()
-        };
-        let ro = RunOptions {
-            rate: cur.rate_per_s.or(opts.trial.rate),
-            ..opts.trial.clone()
-        };
-        let id = t.measure("bayes", &k, Some(&ro)).await?;
-        if t.trials[id].feasible && t.better(id, current) {
-            current = id;
-        }
-    }
-    // 3d. Headroom as a posterior quantile (A4): a measured-feasible trial with more goodput
-    // than the margin's pick is accepted when the surrogate gives it at most `risk` chance of
-    // exceeding the throttle budget.
-    if t.trials.len() >= 3 && !t.saturated {
-        let s = bayes::Surrogate::fit(&t.trials, space(&t), t.use_bytes, opts.max_throttle_ratio);
-        let base_metric = t.metric(&t.trials[current]);
-        let best = (0..t.trials.len())
-            .filter(|&i| {
-                let x = &t.trials[i];
-                x.feasible && x.stage != "confirm" && t.metric(x) > base_metric * 1.03
-            })
-            .filter(|&i| {
-                s.exceed_probability(&t.trials[i])
-                    .is_some_and(|p| p <= opts.risk_ratio)
-            })
-            .max_by(|&a, &b| t.metric(&t.trials[a]).total_cmp(&t.metric(&t.trials[b])));
-        if let Some(i) = best {
-            let p = s.exceed_probability(&t.trials[i]).unwrap_or(0.0);
-            notes.push(format!(
-                "posterior headroom: trial #{i} ({}) has a {:.1}% chance of exceeding the throttle budget (risk {:.0}%), so it is accepted beyond the fixed margin",
-                t.trials[i].knobs.summary(),
-                p * 100.0,
-                opts.risk_ratio * 100.0
-            ));
-            t.posterior_ok.push(i);
-            // The margin is now the posterior's: report its concurrency as the safe one (a
-            // paced trial's limit is its rate, not its workers).
-            if t.trials[i].rate_per_s.is_none() {
-                let c = t.trials[i].knobs.concurrency;
-                safe = Some(safe.map_or(c, |s| s.max(c)));
-            }
-            current = i;
-        }
-    }
-
     // 4. Workload-relevant knobs.
     let mix = &session.mix;
     let has = |f: &dyn Fn(&OpKind) -> bool| mix.iter().any(|m| m.weight > 0 && f(&m.op));
@@ -1190,11 +1046,9 @@ pub async fn tune(
     }
     if p.target.endpoint().is_some_and(|e| e.starts_with("https")) && t.budget_left() {
         let mut k = t.trials[current].knobs.clone();
-        k.http_version = match (k.transport, k.http_version) {
-            (TransportMode::Opendal, HttpVersion::H2) => HttpVersion::Auto,
-            (TransportMode::Opendal, _) => HttpVersion::H2,
-            (TransportMode::Microscope, HttpVersion::H1) => HttpVersion::Auto,
-            (TransportMode::Microscope, _) => HttpVersion::H1,
+        k.http_version = match k.http_version {
+            HttpVersion::H2 => HttpVersion::Auto,
+            _ => HttpVersion::H2,
         };
         let id = t.trial("http_version", &k).await?;
         if t.better(id, current) {
@@ -1412,13 +1266,12 @@ mod tests {
         assert_eq!(cooldown_after(true, Duration::ZERO, 0), Duration::ZERO);
     }
 
-    fn tr(id: usize, ops: f64, p99: f64, cost: f64, thr: f64) -> Trial {
+    fn tr(id: usize, ops: f64, p99: f64, _cost: f64, thr: f64) -> Trial {
         Trial {
             id,
             stage: "concurrency".into(),
             ops_per_s: ops,
             p99_ms: p99,
-            cost_per_million_ops: cost,
             throttled_request_ratio: thr,
             ..Default::default()
         }
@@ -1445,7 +1298,6 @@ mod tests {
         let (a, b) = (tr(0, 100.0, 20.0, 1.0, 0.0), tr(1, 150.0, 10.0, 0.5, 0.0));
         assert!((improvement(Objective::Throughput, false, &a, &b) - 0.5).abs() < 1e-9);
         assert!((improvement(Objective::Latency, false, &a, &b) - 0.5).abs() < 1e-9);
-        assert!((improvement(Objective::Cost, false, &a, &b) - 0.5).abs() < 1e-9);
         assert!(improvement(Objective::Throughput, false, &b, &a) < 0.0);
         let o = TuneOptions::new(
             Objective::Throughput,

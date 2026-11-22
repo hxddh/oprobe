@@ -5,7 +5,6 @@
 pub mod capacity;
 pub mod catalog;
 pub mod compare;
-pub mod cost;
 pub mod diagnosis;
 pub mod findings;
 pub mod gate;

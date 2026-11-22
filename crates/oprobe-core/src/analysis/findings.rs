@@ -19,7 +19,7 @@ use super::simulate::{self, Prediction, TailCutReplay, TailCutSetup};
 use super::stats::{median, quantile_us_ms};
 use super::verification::{Direction, Expectation};
 use crate::model::{Evidence, Finding, Report, ReqRow, Run, TimeWindow, Verification};
-use crate::util::{fmt_bytes, fmt_ms, fmt_usd};
+use crate::util::{fmt_bytes, fmt_ms};
 
 /// Every finding code this engine can emit (canonical, `snake_case`). The 2.x diagnosis it
 /// carries uses the same codes. `crate::mcp::catalog` documents exactly this set (a test
@@ -42,7 +42,6 @@ pub const CODES: &[&str] = &[
     "small_objects",
     "suffix_read",
     "cache_opportunity",
-    "cost_hotspot",
     "slow_start",
     "server_latency",
     "download_bound",
@@ -1719,13 +1718,11 @@ fn cache_opportunity(c: &Ctx) -> Option<Finding> {
     if c.r.knobs.requested.cache {
         return None;
     }
-    // A generated dataset smaller than the data the user keeps (`cost.stored_gib`) says
-    // nothing about the real hit ratio (A15): only real objects, or a stated skew, count.
+    // A generated dataset says nothing about the real hit ratio (A15): only real objects, or
+    // a stated skew, count.
     let ds = &c.r.workload.dataset;
-    let generated_bytes = ds.objects_count.saturating_mul(ds.object_size_bytes) as f64;
-    let stated_bytes = c.r.cost.stored_gb * (1u64 << 30) as f64;
     let skewed = c.r.workload.access != "uniform";
-    if ds.existing_prefix.is_none() && !skewed && generated_bytes < stated_bytes {
+    if ds.existing_prefix.is_none() && !skewed {
         return None;
     }
     let p = simulate::cache(c.run, 256 << 20)?;
@@ -1748,65 +1745,6 @@ fn cache_opportunity(c: &Ctx) -> Option<Finding> {
         },
         advice: "Enable the read cache (`--cache 256MiB`) when the working set is re-read; in production, a cache in front of OpenDAL (or `CacheLayer`) does the same.".into(),
         verification: c.verify("measure with a 256 MiB read cache", &[("cache", "256MiB".into())]),
-    })
-}
-
-fn cost_hotspot(c: &Ctx) -> Option<Finding> {
-    let cost = &c.r.cost;
-    if !cost.applicable || cost.selected.total_usd <= 0.0 {
-        return None;
-    }
-    let top = cost.by_api.first();
-    let waste_pct = cost.waste_usd * 100.0 / cost.selected.total_usd;
-    let top_hot = top.filter(|t| t.share_pct >= 60.0 && t.monthly_usd > 0.0);
-    if top_hot.is_none() && waste_pct < 10.0 {
-        return None;
-    }
-    let mut parts = Vec::new();
-    let mut vals = vec![
-        ("monthly_usd", cost.selected.total_usd),
-        ("waste_usd", cost.waste_usd),
-        ("waste_pct", waste_pct),
-    ];
-    if let Some(t) = top_hot {
-        parts.push(format!(
-            "{} is {:.0}% of request spend ({}/month, {:.2} requests per operation)",
-            t.api,
-            t.share_pct,
-            fmt_usd(t.monthly_usd),
-            t.requests_per_op
-        ));
-        vals.push(("top_api_share_pct", t.share_pct));
-    }
-    if waste_pct >= 10.0 {
-        parts.push(format!(
-            "{} of {} per month buys nothing (failed/throttled requests {}, over-read egress {})",
-            fmt_usd(cost.waste_usd),
-            fmt_usd(cost.selected.total_usd),
-            fmt_usd(cost.selected.failed_requests_usd),
-            fmt_usd(cost.selected.overread_usd)
-        ));
-    }
-    Some(Finding {
-        code: "cost_hotspot".into(),
-        severity: if waste_pct >= 25.0 { Severity::Warning } else { Severity::Info },
-        cause: match top_hot {
-            Some(t) if waste_pct < 10.0 => format!("{} requests dominate the projected bill.", t.api),
-            _ => format!("{waste_pct:.0}% of the projected bill is waste."),
-        },
-        evidence: Evidence {
-            text: format!(
-                "{} at {:.0} operations/month ({} prices, {})",
-                parts.join("; "),
-                cost.monthly_ops,
-                cost.provider.as_deref().unwrap_or("selected"),
-                cost.pricing_as_of
-            ),
-            values: values(&vals),
-            ..Default::default()
-        },
-        advice: "Fewer, larger requests cut request spend (coalesce ranges, bigger parts, skip HEADs); stop throttling and over-reading to cut waste.".into(),
-        verification: None,
     })
 }
 
@@ -2007,7 +1945,6 @@ pub fn derive(run: &Run, legacy: &[diagnosis::Finding]) -> Vec<Finding> {
     }
     push(suffix_read(&c), &mut out);
     push(cache_opportunity(&c), &mut out);
-    push(cost_hotspot(&c), &mut out);
     push(slow_start(&c), &mut out);
     // Bottleneck items restate the headline: keep them only when nothing more specific
     // explains the run.
@@ -2190,17 +2127,14 @@ pub(crate) mod tests {
             bytes: Default::default(),
             cache: Default::default(),
             integrity: Default::default(),
-            client: Default::default(),
             self_stats: Default::default(),
             schedule: Default::default(),
-            workers: Default::default(),
             dimensions: Default::default(),
             sampling: Default::default(),
             open_loop: None,
             timeline: vec![],
             heatmap: Default::default(),
             findings: vec![],
-            cost: Default::default(),
             slowest: vec![],
             cleanup: Default::default(),
             warnings: vec![],

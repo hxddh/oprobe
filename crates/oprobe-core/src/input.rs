@@ -388,47 +388,6 @@ pub fn access(raw: &str) -> Result<Access, OprobeError> {
     )
 }
 
-/// Pricing provider keys (`cost.provider`, `--provider`).
-pub const PROVIDERS: &[&str] = &[
-    "aws-s3",
-    "gcs",
-    "azure-blob",
-    "cloudflare-r2",
-    "backblaze-b2",
-    "aliyun-oss",
-];
-
-/// A pricing provider, canonical key returned. Aliases: `aws`/`s3` → `aws-s3`, `gcp`/`google`
-/// → `gcs`, `azure` → `azure-blob`, `r2` → `cloudflare-r2`, `b2` → `backblaze-b2`,
-/// `oss`/`aliyun` → `aliyun-oss`; a price table's full provider name works too.
-pub fn provider(raw: &str) -> Result<&'static str, OprobeError> {
-    let s = raw.trim().to_ascii_lowercase().replace('_', "-");
-    let alias = match s.as_str() {
-        "aws" | "s3" | "amazon" | "amazon-s3" | "aws-s3" => Some("aws-s3"),
-        "gcp" | "google" | "gcs" | "google-cloud-storage" => Some("gcs"),
-        "azure" | "azblob" | "azure-blob" => Some("azure-blob"),
-        "r2" | "cloudflare" | "cloudflare-r2" => Some("cloudflare-r2"),
-        "b2" | "backblaze" | "backblaze-b2" => Some("backblaze-b2"),
-        "oss" | "aliyun" | "alibaba" | "aliyun-oss" => Some("aliyun-oss"),
-        _ => None,
-    };
-    if let Some(a) = alias {
-        return Ok(a);
-    }
-    // The provider name of a price table (`AWS S3 Standard`).
-    if let Some(key) = crate::analysis::cost::presets()
-        .into_iter()
-        .find(|(_, p)| p.provider.eq_ignore_ascii_case(raw.trim()))
-        .map(|(k, _)| k)
-    {
-        return Ok(key);
-    }
-    Err(
-        invalid(format!("unknown pricing provider `{}`", raw.trim()))
-            .with_hint(choices_hint(raw, PROVIDERS)),
-    )
-}
-
 /// HTTP version: `auto`, `h1` (`http1`, `http/1.1`), `h2` (`http2`).
 pub fn http_version(raw: &str) -> Result<HttpVersion, OprobeError> {
     let s = raw.trim().to_ascii_lowercase();
@@ -660,9 +619,6 @@ pub mod clap {
     pub fn access(s: &str) -> Result<String, OprobeError> {
         super::access(s).map(|_| s.trim().to_owned())
     }
-    pub fn provider(s: &str) -> Result<String, OprobeError> {
-        super::provider(s).map(str::to_owned)
-    }
     pub fn addressing(s: &str) -> Result<String, OprobeError> {
         super::addressing(s).map(|_| s.trim().to_owned())
     }
@@ -780,25 +736,6 @@ mod tests {
         assert!(access("weird").is_err());
         assert!(access("zipf:-1").is_err());
         assert!(access("hotset:2/0.5").is_err());
-        for (a, want) in [
-            ("aws", "aws-s3"),
-            ("gcp", "gcs"),
-            ("google", "gcs"),
-            ("azure", "azure-blob"),
-            ("r2", "cloudflare-r2"),
-            ("b2", "backblaze-b2"),
-            ("oss", "aliyun-oss"),
-            ("aliyun", "aliyun-oss"),
-            ("AWS-S3", "aws-s3"),
-        ] {
-            assert_eq!(provider(a).unwrap(), want, "{a}");
-        }
-        // Every canonical key is a price table.
-        for p in PROVIDERS {
-            assert!(crate::analysis::cost::preset(p).is_some(), "{p}");
-        }
-        let (_, h) = code(provider("gcss"));
-        assert!(h.contains("did you mean `gcs`"), "{h}");
     }
 
     #[test]

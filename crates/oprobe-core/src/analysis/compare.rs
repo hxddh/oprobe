@@ -775,58 +775,6 @@ impl Comparison {
         o
     }
 
-    /// Markdown for a sticky PR comment (starts with a stable HTML marker to find and update).
-    pub fn render_markdown(&self) -> String {
-        let mut md = String::from("<!-- oprobe-compare -->\n");
-        md += &self.gate.render_markdown();
-        let _ = writeln!(
-            md,
-            "\n**Statistics** — baseline {} run(s), candidate {} run(s) · p99 trend `{}`\n",
-            self.baseline.run_ids.len(),
-            self.candidate.run_ids.len(),
-            stats::sparkline(&self.p99_trend_ms, 24)
-        );
-        let _ = writeln!(
-            md,
-            "| metric | baseline | candidate | change (95% CI) | noise | significant | method |\n|---|---:|---:|---:|---:|---|---|"
-        );
-        for r in self.stat_rows() {
-            let _ = writeln!(md, "| {} |", r.join(" | "));
-        }
-        let f = &self.findings;
-        if !f.new.is_empty() || !f.resolved.is_empty() {
-            md += "\n**Findings**\n\n";
-            for x in &f.new {
-                let _ = writeln!(md, "- 🆕 `{}` ({}) {}", x.code, x.severity.label(), x.cause);
-            }
-            for x in &f.resolved {
-                let _ = writeln!(md, "- ✅ resolved `{}` {}", x.code, x.cause);
-            }
-        }
-        md
-    }
-
-    pub fn render_junit(&self) -> String {
-        let mut x = self.gate.render_junit();
-        // One test case per new finding of warning severity or worse (informational ones pass).
-        let extra: String = self
-            .findings
-            .new
-            .iter()
-            .map(|f| {
-                let esc = f.cause.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;");
-                if f.severity >= super::diagnosis::Severity::Warning && self.comparable {
-                    format!("  <testcase classname=\"oprobe.findings\" name=\"new finding {}\"><failure message=\"{esc}\"/></testcase>\n", f.code)
-                } else {
-                    format!("  <testcase classname=\"oprobe.findings\" name=\"new finding {}\"/>\n", f.code)
-                }
-            })
-            .collect();
-        if let Some(i) = x.rfind("</testsuite>") {
-            x.insert_str(i, &extra);
-        }
-        x
-    }
 }
 
 #[cfg(test)]
@@ -898,10 +846,6 @@ mod tests {
         assert_eq!(c.stats[0].method, Method::RunsT);
         assert_eq!(c.stats[0].confidence, Confidence::High);
         assert_eq!(c.p99_trend_ms.len(), 10);
-        let md = c.render_markdown();
-        assert!(md.starts_with("<!-- oprobe-compare -->"));
-        assert!(md.contains("p99 trend"));
-        assert!(c.render_junit().contains("</testsuite>"));
     }
 
     #[test]
@@ -962,6 +906,5 @@ mod tests {
         let c = compare(&[a], &[b], "a", "b", &Thresholds::default());
         assert_eq!(c.findings.new[0].code, "cold_connections");
         assert_eq!(c.findings.resolved[0].code, "throttling");
-        assert!(c.render_junit().contains("new finding cold_connections"));
     }
 }

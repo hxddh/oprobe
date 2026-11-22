@@ -26,31 +26,17 @@
 //! `oprobe.events/1` stream). The MCP server runs them in-process; turning them into polled jobs
 //! (design v5 §6) only wraps these calls.
 
-pub mod analyze;
-pub mod compare;
-pub mod compat;
-pub mod demo;
-pub mod discover;
-pub mod doctor;
-pub mod explain;
-pub mod export;
 pub mod fix;
 pub mod input;
 pub mod live;
-pub mod matrix;
 pub mod measure;
-pub mod misc;
+pub mod lab;
 pub mod next;
-pub mod onboard;
 pub mod profile;
-pub mod repeat;
 pub mod run;
 pub mod runs;
-pub mod sample;
-pub mod settings;
 pub mod tune;
 pub mod verify;
-pub mod watch;
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
@@ -59,9 +45,7 @@ use anyhow::Result;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-pub use crate::clients::ClientChoice;
 use crate::config::Profile;
-pub use crate::distributed::WorkerSet;
 pub use crate::engine::Cancel;
 use crate::errors::{ErrorCode, OprobeError};
 use crate::model::{Overrides, RunSpec};
@@ -190,26 +174,10 @@ pub struct RunRequest {
     /// Saving, report files, `--fail-on`.
     #[serde(default)]
     pub output: OutputOptions,
-    /// Repeat the run N times and summarise the spread (`run --repeat`).
-    #[serde(default = "one")]
-    pub repeat: usize,
-    /// Compare against (and add to) a named baseline (`run --baseline`).
-    #[serde(default)]
-    pub baseline: Option<String>,
-    /// What generates the load (design v5 §7).
-    #[serde(default)]
-    pub client: ClientChoice,
-    /// Distributed load (design v5 §8; `None`: this process).
-    #[serde(default)]
-    pub workers: Option<WorkerSet>,
     /// The profile the spec came from, with credentials (not serialized).
     #[serde(skip)]
     #[schemars(skip)]
     pub resolved: Option<Resolved>,
-}
-
-fn one() -> usize {
-    1
 }
 
 impl RunRequest {
@@ -230,10 +198,6 @@ impl RunRequest {
             overrides: Overrides::default(),
             safety: Safety::default(),
             output: OutputOptions::default(),
-            repeat: 1,
-            baseline: None,
-            client: ClientChoice::default(),
-            workers: None,
             resolved: None,
         }
     }
@@ -256,8 +220,6 @@ pub enum RunOutcome {
     Plan(Box<run::PlanOutput>),
     /// One run.
     Run(Box<run::RunOutput>),
-    /// `repeat > 1` or a `baseline`: the group and its spread.
-    Repeat(Box<repeat::RepeatOutput>),
 }
 
 impl App {
@@ -314,24 +276,8 @@ impl App {
         sink: &EventSink,
         cancel: Cancel,
     ) -> Result<RunOutcome> {
-        req.client.check_supported()?;
-        if let Some(w) = &req.workers {
-            w.check_supported()?;
-        }
         let ctx = self.ctx(sink);
-        let mut r = self.profile_of(&req)?;
-        // Runtime only (design v5 §7): the engine starts this client; specs never carry it.
-        r.profile.client = req.client.clone();
-        if let Some(w) = &req.workers
-            && !req.safety.dry_run
-        {
-            return crate::distributed::run(&ctx, r, &req, w, cancel)
-                .await
-                .map(|o| RunOutcome::Run(Box::new(o)));
-        }
-        if req.repeat > 1 || req.baseline.is_some() {
-            return repeat::run_repeat(&ctx, r, &req, cancel).await;
-        }
+        let r = self.profile_of(&req)?;
         Ok(
             match run::measure(
                 &ctx,
@@ -379,94 +325,9 @@ impl App {
         fix::fix(&self.ctx(sink), req, cancel).await
     }
 
-    /// `oprobe compare`: the regression gate between two runs or run sets.
-    pub fn compare(
-        &self,
-        req: CompareRequest,
-        sink: &EventSink,
-    ) -> Result<crate::analysis::compare::Comparison> {
-        compare::compare(&self.ctx(sink), req)
-    }
-
-    /// `oprobe explain RUNREF|CODE`.
-    pub fn explain(&self, req: ExplainRequest) -> Result<explain::ExplainOutput> {
-        explain::explain(self, req)
-    }
-
-    /// `oprobe analyze`: slice a stored run.
-    pub fn analyze(&self, req: AnalyzeRequest) -> Result<analyze::AnalyzeOutput> {
-        analyze::analyze(&self.ctx(&EventSink::silent()), req)
-    }
-
-    /// `oprobe doctor`: connectivity, TLS, clock, credentials, permissions.
-    pub async fn doctor(
-        &self,
-        req: DoctorRequest,
-        sink: &EventSink,
-    ) -> Result<doctor::DoctorOutput> {
-        doctor::run(&self.ctx(sink), req).await
-    }
-
-    /// `oprobe target sample`: what a target holds (read-only).
-    pub async fn sample(
-        &self,
-        req: SampleRequest,
-        sink: &EventSink,
-    ) -> Result<sample::ObjectSample> {
-        sample::run(&self.ctx(sink), req).await
-    }
-
-    /// `oprobe target discover`: credential sources on this machine (names only).
-    pub fn discover(&self) -> Result<discover::Discovery> {
-        discover::discover(&self.ctx(&EventSink::silent()))
-    }
-
-    /// `oprobe cleanup`: leftover run prefixes (dry run unless `yes`).
-    pub async fn cleanup(
-        &self,
-        req: CleanupRequest,
-        sink: &EventSink,
-    ) -> Result<misc::CleanupOutput> {
-        misc::cleanup(&self.ctx(sink), req).await
-    }
-
-    /// `oprobe probe`: the DNS/TCP/TLS/TTFB microscope of one endpoint.
-    pub async fn probe(
-        &self,
-        req: ProbeRequest,
-        sink: &EventSink,
-    ) -> Result<crate::net::probe::ProbeReport> {
-        misc::probe(&self.ctx(sink), req).await
-    }
-
-    // --- targets ---------------------------------------------------------------------
-
-    pub fn targets(&self) -> Result<settings::TargetList> {
-        settings::target_list(&self.ctx(&EventSink::silent()))
-    }
-
-    pub fn target_show(&self, name: &str) -> Result<settings::TargetShow> {
-        settings::target_show(&self.ctx(&EventSink::silent()), name)
-    }
-
-    pub async fn target_add(
-        &self,
-        req: TargetAddRequest,
-        sink: &EventSink,
-    ) -> Result<settings::TargetShow> {
-        settings::target_add(&self.ctx(sink), req).await
-    }
-
-    pub fn target_rm(&self, name: &str) -> Result<settings::TargetShow> {
-        settings::target_rm(&self.ctx(&EventSink::silent()), name)
-    }
-
-    pub async fn target_test(
-        &self,
-        req: TargetTestRequest,
-        sink: &EventSink,
-    ) -> Result<doctor::DoctorOutput> {
-        settings::target_test(&self.ctx(sink), req).await
+    /// `oprobe lab`: start the server (it serves until the returned handle is dropped).
+    pub async fn lab(&self, req: LabRequest) -> Result<(crate::lab::LabHandle, lab::LabOutput)> {
+        lab::lab(&self.ctx(&EventSink::silent()), req).await
     }
 
     // --- runs ------------------------------------------------------------------------
@@ -483,46 +344,4 @@ impl App {
         runs::rm(&self.ctx(&EventSink::silent()), req)
     }
 
-    pub fn runs_gc(&self, req: RunsGcRequest) -> Result<runs::RemovedRuns> {
-        runs::gc(&self.ctx(&EventSink::silent()), req)
-    }
-
-    pub async fn runs_export(
-        &self,
-        req: ExportRequest,
-        sink: &EventSink,
-    ) -> Result<export::Exported> {
-        export::export(&self.ctx(sink), req).await
-    }
-
-    // --- baselines -------------------------------------------------------------------
-
-    pub fn baselines(&self) -> Result<compare::BaselineList> {
-        compare::baseline_list(&self.ctx(&EventSink::silent()))
-    }
-
-    pub fn baseline_show(&self, name: &str) -> Result<compare::BaselineShow> {
-        compare::baseline_show(&self.ctx(&EventSink::silent()), name)
-    }
-
-    pub fn baseline_set(
-        &self,
-        req: BaselineSetRequest,
-        sink: &EventSink,
-    ) -> Result<compare::BaselineShow> {
-        compare::baseline_set(&self.ctx(sink), req)
-    }
-
-    pub fn baseline_rm(&self, name: &str) -> Result<compare::BaselineRemoved> {
-        compare::baseline_rm(&self.ctx(&EventSink::silent()), name)
-    }
-
-    pub async fn baseline_calibrate(
-        &self,
-        req: CalibrateRequest,
-        sink: &EventSink,
-        cancel: Cancel,
-    ) -> Result<compare::CalibrateOutcome> {
-        compare::calibrate(&self.ctx(sink), req, cancel).await
-    }
 }

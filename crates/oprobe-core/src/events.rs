@@ -1,11 +1,9 @@
 //! Events (`oprobe.events/1`, design §7): what a running command reports while it works.
 //!
-//! One [`Event`] enum feeds every consumer: `--output ndjson` (one JSON object per line on
-//! stdout, see [`NdjsonWriter`]), the TUI/GUI in-process, and MCP progress. Producers emit
+//! One [`Event`] enum feeds every in-process consumer (the app, Prove's live pairs). Producers emit
 //! into an [`EventBus`]; [`EventBus::progress_fn`] adapts the engine's progress callback
 //! ([`crate::engine::ProgressFn`]) into `phase` / `progress` / `interval` / `log` events.
 
-use std::io::Write;
 use std::sync::{Arc, Mutex};
 
 use schemars::JsonSchema;
@@ -277,64 +275,21 @@ impl EventBus {
     }
 }
 
-/// Writes events as NDJSON (one object per line, flushed per line).
-pub struct NdjsonWriter<W: Write> {
-    out: Mutex<W>,
-}
-
-impl<W: Write> NdjsonWriter<W> {
-    pub fn new(out: W) -> Self {
-        Self {
-            out: Mutex::new(out),
-        }
-    }
-
-    pub fn write(&self, e: &Event) -> std::io::Result<()> {
-        let line = serde_json::to_string(e).map_err(std::io::Error::other)?;
-        let mut o = self.out.lock().unwrap_or_else(|e| e.into_inner());
-        o.write_all(line.as_bytes())?;
-        o.write_all(b"\n")?;
-        o.flush()
-    }
-
-    pub fn into_inner(self) -> W {
-        self.out.into_inner().unwrap_or_else(|e| e.into_inner())
-    }
-}
-
-impl<W: Write + Send + 'static> NdjsonWriter<W> {
-    /// Subscribe this writer to `bus` (write errors such as a closed pipe are ignored).
-    pub fn attach(self, bus: &EventBus) -> Arc<Self> {
-        let w = Arc::new(self);
-        let w2 = w.clone();
-        bus.subscribe(Arc::new(move |e| {
-            let _ = w2.write(e);
-        }));
-        w
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::trace::{Snapshot, TimelinePoint};
 
     #[test]
-    fn ndjson_lines_have_type_and_ts() {
-        #[derive(Clone, Default)]
-        struct Shared(Arc<Mutex<Vec<u8>>>);
-        impl Write for Shared {
-            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(b);
-                Ok(b.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
+    fn events_serialize_with_type_and_ts() {
         let bus = EventBus::new();
-        let buf = Shared::default();
-        NdjsonWriter::new(buf.clone()).attach(&bus);
+        let buf: Arc<Mutex<String>> = Default::default();
+        let b2 = buf.clone();
+        bus.subscribe(Arc::new(move |e| {
+            let mut b = b2.lock().unwrap();
+            b.push_str(&serde_json::to_string(e).unwrap());
+            b.push('\n');
+        }));
         bus.emit_event(&Event::version());
         let progress = bus.progress_fn(Some(10.0));
         progress(Progress::Message("preparing".into()));
@@ -356,7 +311,7 @@ mod tests {
         bus.emit(EventKind::Error {
             error: ErrorBody::new(crate::errors::ErrorCode::NetTimeout, "slow"),
         });
-        let text = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        let text = buf.lock().unwrap().clone();
         let lines: Vec<serde_json::Value> = text
             .lines()
             .map(|l| serde_json::from_str(l).unwrap())

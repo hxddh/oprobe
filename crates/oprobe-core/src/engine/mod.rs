@@ -6,7 +6,6 @@ pub mod measure;
 pub mod operator;
 pub mod ops;
 pub mod procstat;
-pub mod replay;
 pub mod runner;
 pub mod schedule;
 pub mod selfobs;

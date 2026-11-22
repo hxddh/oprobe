@@ -104,7 +104,6 @@ pub fn resolve_profile(
     t: &TargetInput,
     w: &WorkloadInput,
     k: &KnobInput,
-    c: &CostInput,
 ) -> Result<(Profile, Option<String>)> {
     let cfg = ctx.config()?;
     let (t, name) = resolve_target(t, cfg)?;
@@ -112,7 +111,7 @@ pub fn resolve_profile(
     if t.profile.is_none() {
         apply_defaults(&mut w, &mut k, cfg);
     }
-    Ok((build_profile(&t, &w, &k, c)?, name))
+    Ok((build_profile(&t, &w, &k)?, name))
 }
 
 /// Budgets of the safety flags, unset ones from `[defaults.budgets]`.
@@ -142,7 +141,6 @@ pub fn build_profile(
     t: &TargetInput,
     w: &WorkloadInput,
     k: &KnobInput,
-    c: &CostInput,
 ) -> Result<Profile> {
     let mut p = match (&t.profile, &t.target) {
         (Some(path), _) => Profile::load(path)?,
@@ -165,19 +163,18 @@ pub fn build_profile(
         nt.proxy = p.target.proxy.clone();
         p.target = nt;
     }
-    apply_flags(&mut p, t, w, k, c)?;
+    apply_flags(&mut p, t, w, k)?;
     p.validate()?;
     Ok(p)
 }
 
-/// Apply the target, workload, knob and cost flags that were given to `p` (unset flags leave
+/// Apply the target, workload and knob flags that were given to `p` (unset flags leave
 /// `p` alone): `build_profile` and `run --from` share it. Not validated.
 pub fn apply_flags(
     p: &mut Profile,
     t: &TargetInput,
     w: &WorkloadInput,
     k: &KnobInput,
-    c: &CostInput,
 ) -> Result<()> {
     let tg = &mut p.target;
     if let Some(e) = &t.endpoint {
@@ -238,19 +235,6 @@ pub fn apply_flags(
     }
     if let Some(sh) = &w.shape {
         wl.shape = Some(sh.parse()?);
-    }
-    if let Some(file) = &w.replay {
-        let mut r = crate::engine::replay::ReplaySpec::new(file.clone());
-        if let Some(sp) = w.speed {
-            r.speed = crate::input::positive("--speed", &sp.to_string())?;
-        }
-        for m in &w.map_prefix {
-            let (from, to) = crate::input::key_value("--map-prefix", m)?;
-            r.map_prefix.push((from, to));
-        }
-        wl.replay = Some(r);
-    } else if w.speed.is_some() || !w.map_prefix.is_empty() {
-        return Err(crate::input::invalid("--speed and --map-prefix need --replay FILE").into());
     }
     if w.existing.is_some() || w.objects.is_some() || w.object_size.is_some() || w.persist_dataset {
         let mut ds: DatasetSpec = wl.effective_dataset();
@@ -315,9 +299,6 @@ pub fn apply_flags(
     if k.no_keep_alive {
         kn.keep_alive = false;
     }
-    if k.microscope {
-        kn.transport = crate::config::TransportMode::Microscope;
-    }
     if let Some(sz) = &k.cache {
         kn.cache = true;
         kn.cache_size = parse_size("--cache", sz)?;
@@ -336,20 +317,6 @@ pub fn apply_flags(
     }
     if k.sse.is_some() {
         kn.provider.sse = k.sse.clone();
-    }
-
-    let cs = &mut p.cost;
-    if let Some(v) = &c.provider {
-        cs.provider = Some(crate::input::provider(v)?.to_owned());
-    }
-    if let Some(v) = c.monthly_ops {
-        cs.monthly_ops = crate::input::non_negative("--monthly-ops", &v.to_string())?;
-    }
-    if let Some(v) = c.egress_fraction {
-        cs.egress_fraction = crate::input::share("--egress-fraction", &v.to_string())?;
-    }
-    if let Some(v) = c.stored_gib {
-        cs.stored_gib = crate::input::non_negative("--stored-gib", &v.to_string())?;
     }
     Ok(())
 }
@@ -385,7 +352,7 @@ pub fn run_profile(ctx: &Ctx, a: &ProfileRequest) -> Result<(Profile, Option<Str
     let (mut p, name) = match &a.from {
         Some(r) => replay_profile(ctx, r, a)?,
         None => {
-            let (mut p, name) = resolve_profile(ctx, &a.target, &a.workload, &a.knobs, &a.cost)?;
+            let (mut p, name) = resolve_profile(ctx, &a.target, &a.workload, &a.knobs)?;
             apply_sla(&mut p, &a.sla)?;
             (p, name)
         }
@@ -442,7 +409,7 @@ pub fn spec_profile(
         }
     }
     p.target = tgt;
-    apply_flags(&mut p, &ta, &a.workload, &a.knobs, &a.cost)?;
+    apply_flags(&mut p, &ta, &a.workload, &a.knobs)?;
     apply_sla(&mut p, &a.sla)?;
     Ok((p, name))
 }
@@ -460,8 +427,6 @@ pub struct TuneSettings<'a> {
     pub boundary_repeats: usize,
     /// In-flight headroom below the ceiling (unset: `config::defaults().headroom_ratio`).
     pub headroom_ratio: Option<f64>,
-    /// Posterior risk of exceeding the throttle budget (unset: 0.05).
-    pub risk_ratio: Option<f64>,
 }
 
 impl Default for TuneSettings<'static> {
@@ -476,7 +441,6 @@ impl Default for TuneSettings<'static> {
             max_throttle_ratio: None,
             boundary_repeats: tune_defaults::BOUNDARY_REPEATS,
             headroom_ratio: None,
-            risk_ratio: None,
         }
     }
 }
@@ -533,11 +497,5 @@ pub fn tune_options(
     o.max_throttle_ratio = max_throttle_ratio;
     o.boundary_repeats = s.boundary_repeats.max(1);
     o.headroom_ratio = headroom_ratio;
-    if let Some(r) = s.risk_ratio {
-        if !(0.0..0.5).contains(&r) {
-            return Err(crate::input::invalid("the risk must be within 0..0.5").into());
-        }
-        o.risk_ratio = r;
-    }
     Ok(o)
 }

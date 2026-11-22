@@ -5,7 +5,6 @@ use std::time::SystemTime;
 
 use super::report::*;
 use super::{ReqRow, Run, RunId};
-use crate::analysis::cost::cost_report;
 use crate::analysis::diagnosis::{Severity, check_sla, diagnose};
 use crate::config::{Knobs, OpKind, Profile};
 use crate::engine::CleanupSummary;
@@ -359,10 +358,6 @@ pub fn build_run_with(
     let endpoint = t.endpoint();
     let diagnosis = diagnose(&snapshot, knobs, &profile.sla, t.is_network());
     let sla_verdict = check_sla(&snapshot, &profile.sla);
-    let mut cost = cost_report(&snapshot, &profile.cost, &t.scheme, endpoint.as_deref());
-    if cost.applicable && cost.provider.is_none() {
-        cost.provider = Some(cost.selected.key.clone());
-    }
     let mut options = crate::util::redact_options(&t.options);
     options.remove("ca_cert_pem");
     let interrupted = snapshot.interrupted;
@@ -466,7 +461,7 @@ pub fn build_run_with(
             host: HostInfo::current(),
             env: EnvInfo {
                 region,
-                provider: cost.provider.clone(),
+                provider: None,
             },
         },
         target: TargetInfo {
@@ -500,7 +495,6 @@ pub fn build_run_with(
         bytes: snapshot.bytes.clone(),
         cache: snapshot.cache.clone(),
         integrity: snapshot.integrity.clone(),
-        client: crate::model::ClientInfo::opendal(),
         self_stats: crate::model::SelfStats::from_observation(
             &snapshot.client,
             snapshot.self_obs.as_ref(),
@@ -509,14 +503,12 @@ pub fn build_run_with(
             snapshot.open_loop.as_ref(),
             snapshot.elapsed_s,
         ),
-        workers: Vec::new(),
         dimensions: crate::model::Dimensions::from_stats(snapshot.dimensions.as_ref()),
         sampling: crate::model::Sampling::from_stats(&trace.sampling),
         open_loop: snapshot.open_loop.clone(),
         timeline: snapshot.timeline.clone(),
         heatmap,
         findings: Vec::new(),
-        cost,
         slowest: snapshot.slow_ops.iter().map(|s| s.op_id).collect(),
         cleanup,
         warnings,

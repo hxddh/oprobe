@@ -1,75 +1,11 @@
-//! Report sections added by `oprobe.report/5` (design v5 §2): the load generator
-//! ([`ClientInfo`]), the workers of a distributed run ([`WorkerInfo`]), the arrival schedule
-//! ([`ScheduleStats`]), dimensions ([`Dimensions`]), sampling ([`Sampling`]) and the observer's
-//! own cost and health ([`SelfStats`], `report.self`).
-//!
-//! The foundation defines the types and fills what 4.x already measured; the streams fill the
-//! rest: MEAS (`schedule`, `dimensions`, `self`), SCALE (`client`, `workers`).
+//! Report sections: the arrival schedule ([`ScheduleStats`]), dimensions ([`Dimensions`]),
+//! sampling ([`Sampling`]) and the observer's own cost and health ([`SelfStats`],
+//! `report.self`).
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::trace::{ClientStats, OpenLoopStats, Quantiles};
-
-/// The OpenDAL version oprobe links (`report.client.version` of the default client).
-pub const OPENDAL_VERSION: &str = "0.59";
-
-/// What generated the load (`report.client`, design v5 §7).
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
-pub struct ClientInfo {
-    /// `opendal`, `aws_sdk` or `exec`.
-    pub kind: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub version: Option<String>,
-    /// Request stages this client reports (findings that need others are suppressed).
-    #[serde(default)]
-    pub phases_available: Vec<String>,
-}
-
-impl ClientInfo {
-    /// Stages the white-box OpenDAL client observes.
-    pub const OPENDAL_PHASES: &'static [&'static str] = &[
-        "queue", "connect", "send", "ttfb", "body", "stall", "backoff",
-    ];
-
-    /// The default client (OpenDAL through oprobe's transport).
-    pub fn opendal() -> Self {
-        Self {
-            kind: "opendal".into(),
-            version: Some(OPENDAL_VERSION.into()),
-            phases_available: Self::OPENDAL_PHASES
-                .iter()
-                .map(|s| (*s).to_owned())
-                .collect(),
-        }
-    }
-
-    /// Whether this client reports `phase`.
-    pub fn has_phase(&self, phase: &str) -> bool {
-        self.phases_available.iter().any(|p| p == phase)
-    }
-}
-
-impl Default for ClientInfo {
-    fn default() -> Self {
-        Self::opendal()
-    }
-}
-
-/// One worker of a distributed run (`report.workers[]`, design v5 §8).
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
-pub struct WorkerInfo {
-    pub id: String,
-    /// `host:port`, or `local` for a local worker process.
-    pub addr: String,
-    /// The worker's clock minus the coordinator's (NTP-style exchange).
-    pub clock_offset_ms: f64,
-    pub ops_count: u64,
-    pub requests_count: u64,
-    pub ops_per_s: f64,
-    #[serde(default)]
-    pub warnings: Vec<String>,
-}
 
 /// The arrival schedule (`report.schedule`, design v5 §3): open-loop arrivals that started
 /// late or never, and the `schedule` stage (intended → actual start).

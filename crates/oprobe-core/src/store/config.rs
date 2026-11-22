@@ -16,7 +16,7 @@ use crate::errors::{ErrorCode, OprobeError};
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Defaults {
-    /// `text`, `json`, `ndjson`, `md`, `html`.
+    /// `text` or `json`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<String>,
     /// `auto`, `always`, `never`.
@@ -49,7 +49,7 @@ impl Defaults {
         {
             return Err(
                 crate::input::invalid(format!("unknown output `{o}`")).with_hint(
-                    crate::input::choices_hint(o, &["text", "json", "ndjson", "md", "html"]),
+                    crate::input::choices_hint(o, &["text", "json"]),
                 ),
             );
         }
@@ -72,11 +72,6 @@ impl Defaults {
         if let Some(v) = &b.max_duration {
             crate::input::duration(v)?;
         }
-        if let Some(c) = b.max_cost_usd
-            && !(c.is_finite() && c >= 0.0)
-        {
-            return Err(crate::input::invalid("budgets.max_cost_usd must be >= 0"));
-        }
         Ok(())
     }
 }
@@ -85,9 +80,6 @@ impl Defaults {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BudgetDefaults {
-    /// Estimated request cost (USD).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_cost_usd: Option<f64>,
     /// Backend requests.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_requests: Option<u64>,
@@ -113,14 +105,6 @@ impl BudgetDefaults {
             )
             .into()
         };
-        if b.max_cost_usd.is_none() {
-            if let Some(c) = self.max_cost_usd
-                && !(c.is_finite() && c >= 0.0)
-            {
-                return Err(bad("max_cost_usd", anyhow::anyhow!("must be >= 0")));
-            }
-            b.max_cost_usd = self.max_cost_usd;
-        }
         if b.max_requests_count.is_none() {
             b.max_requests_count = self.max_requests;
         }
@@ -185,9 +169,6 @@ pub struct ConfigFile {
     pub defaults: Defaults,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub targets: BTreeMap<String, TargetEntry>,
-    /// Workers of distributed runs (`oprobe run --workers config`, design v5 §8).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workers: Option<crate::distributed::WorkersConfig>,
 }
 
 /// Where an effective value comes from.
@@ -345,12 +326,6 @@ impl ConfigFile {
         );
         let b = &d.budgets;
         put(
-            "budgets.max_cost_usd",
-            None,
-            b.max_cost_usd.map(|c| c.to_string()),
-            "",
-        );
-        put(
             "budgets.max_requests",
             None,
             b.max_requests.map(|c| c.to_string()),
@@ -445,7 +420,6 @@ mod tests {
         assert_eq!(b.max_requests_count, Some(5), "flags win");
         assert_eq!(b.max_bytes, Some(1 << 20));
         assert_eq!(b.max_duration_s, Some(120.0));
-        assert!(b.max_cost_usd.is_none());
         let bad = BudgetDefaults {
             max_bytes: Some("lots".into()),
             ..Default::default()
