@@ -59,6 +59,9 @@ pub enum Outcome {
     },
 }
 
+/// A run and where it was saved.
+type SavedRun = (Box<Run>, Option<PathBuf>);
+
 /// What the tuner adds to its confirmation run.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TunedExtras {
@@ -319,36 +322,90 @@ impl Job {
         })
     }
 
-    /// Run one workload window, build the run (report + trace rows) and save it — through the
-    /// same pipeline as `oprobe run` (rails, budgets, preflight, cleanup).
+    /// Run one workload window, build the run (report + trace rows) and save it — through
+    /// [`crate::app::App::run`], the service layer `oprobe run` uses (rails, budgets, preflight,
+    /// cleanup). The live view follows the bus's in-process stream ([`crate::events::Live`]):
+    /// full snapshots, the cleanup stage and the finished run (a budget stop keeps it).
     pub fn run(req: RunRequest) -> Arc<Self> {
         Self::spawn(move |state, cancel| async move {
             let scheme = req.profile.target.scheme.clone();
-            let progress = Self::progress(&state);
-            let res: anyhow::Result<Outcome> = async {
-                let m = measure_in_app(
-                    req.profile.clone(),
-                    req.target_name.clone(),
-                    &req.budgets,
-                    req.trace_max_requests,
-                    req.store.clone(),
-                    cancel,
-                    progress,
-                    Mode::Run,
-                    Box::new(|_| {}),
-                    state.clone(),
-                )
-                .await?;
-                let partial = breach_text(&m);
-                Ok(Outcome::Run {
-                    run: Box::new(m.run),
-                    path: m.path,
-                    tuned: None,
-                    partial,
-                })
+            let mut paths = crate::ui::launch()
+                .paths
+                .unwrap_or_else(|| crate::store::Paths::resolve(None));
+            // The run store the request names (its directory is `<data>/runs`).
+            if let Some(dir) = req.store.as_ref().and_then(|s| s.dir().parent()) {
+                paths.data_dir = dir.to_path_buf();
             }
-            .await;
-            res.unwrap_or_else(|e| failed(&e, &scheme))
+            let sink = crate::app::EventSink::silent();
+            let finished: Arc<Mutex<Option<SavedRun>>> = Arc::default();
+            {
+                let progress = Self::progress(&state);
+                let (st, fin) = (state.clone(), finished.clone());
+                sink.bus().subscribe_live(Arc::new(move |e| match e {
+                    crate::events::Live::Progress(p) => progress(p.clone()),
+                    crate::events::Live::CleaningUp => {
+                        let mut s = st.lock().unwrap_or_else(|e| e.into_inner());
+                        s.cleaning = true;
+                        s.log.push("cleaning up test data…".into());
+                    }
+                    crate::events::Live::Finished { run, path } => {
+                        *fin.lock().unwrap_or_else(|e| e.into_inner()) =
+                            Some((run.clone(), path.clone()));
+                    }
+                }));
+            }
+            let mut r = crate::app::RunRequest::new(crate::app::Resolved {
+                profile: req.profile.clone(),
+                target_name: req.target_name.clone(),
+            });
+            r.output.no_save = req.store.is_none();
+            let res = crate::app::App::new(paths).run(r, &sink, cancel).await;
+            let warnings = sink.warnings();
+            {
+                let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+                s.log
+                    .extend(warnings.iter().map(|w| format!("warning: {w}")));
+            }
+            let fin = finished.lock().unwrap_or_else(|e| e.into_inner()).take();
+            match res {
+                Ok(crate::app::RunOutcome::Run(o)) => {
+                    let (run, path) = match (o.full, fin) {
+                        (Some(run), _) => (run, o.path.map(PathBuf::from)),
+                        (None, Some(f)) => f,
+                        (None, None) => {
+                            return failed(&anyhow::anyhow!("the run returned no data"), &scheme);
+                        }
+                    };
+                    Outcome::Run {
+                        run,
+                        path,
+                        tuned: None,
+                        partial: None,
+                    }
+                }
+                Ok(_) => failed(&anyhow::anyhow!("the run returned no run"), &scheme),
+                // A budget stop is not a failure: the partial run was saved and is shown.
+                Err(e)
+                    if crate::errors::classify(&e, &scheme).code
+                        == crate::errors::ErrorCode::SafetyBudgetExceeded
+                        && fin.is_some() =>
+                {
+                    let (run, path) = fin.expect("checked");
+                    {
+                        let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+                        s.log.push(format!(
+                            "stopped by a budget (the partial run was kept): {e:#}"
+                        ));
+                    }
+                    Outcome::Run {
+                        run,
+                        path,
+                        tuned: None,
+                        partial: Some(format!("{e:#}")),
+                    }
+                }
+                Err(e) => failed(&e, &scheme),
+            }
         })
     }
 

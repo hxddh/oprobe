@@ -41,10 +41,28 @@ pub async fn measure(ctx: &Ctx, profile: Profile, o: Opts<'_>) -> Result<Measure
         Mode::Run => progress_for(ctx, total_s),
         Mode::Tune { .. } => (super::run::tune_progress(ctx), None),
     };
+    // In-process front ends (the App) also get the engine's full snapshots.
+    let bus = ctx.out.bus().clone();
+    let progress: crate::engine::ProgressFn = if bus.has_live() {
+        let (inner, b) = (progress, bus.clone());
+        Arc::new(move |p| {
+            b.emit_live(&crate::events::Live::Progress(p.clone()));
+            inner(p)
+        })
+    } else {
+        progress
+    };
+    let live_bus = bus.clone();
     let announce_cleanup = matches!(o.mode, Mode::Run);
     let l2 = line.clone();
     let out = ctx.out.clone();
     let on_stage: pipeline::StageFn = Arc::new(move |s| match s {
+        Stage::CleaningUp if live_bus.has_live() => {
+            live_bus.emit_live(&crate::events::Live::CleaningUp);
+            if announce_cleanup {
+                out.info(dim("cleaning up…"));
+            }
+        }
         Stage::Measured => {
             if let Some(l) = &l2 {
                 l.finish();
@@ -75,6 +93,12 @@ pub async fn measure(ctx: &Ctx, profile: Profile, o: Opts<'_>) -> Result<Measure
         l.finish();
     }
     let m = res?;
+    if bus.has_live() {
+        bus.emit_live(&crate::events::Live::Finished {
+            run: Box::new(m.run.clone()),
+            path: m.path.clone(),
+        });
+    }
     for w in &m.warnings {
         ctx.out.warn(w.clone());
     }

@@ -111,6 +111,8 @@ pub fn run_gui() -> std::process::ExitCode {
     {
         options.file_types = file_types();
         options.single_instance = true;
+        // `oprobe://run/ID?view=…` links open the app (design v5 §9).
+        options.schemes = vec!["oprobe".to_owned()];
     }
     // `run_app` returns `ExitCode` on macOS / Windows and `glib::ExitCode` on Linux.
     let code = exit_code(platform::run_app(
@@ -255,6 +257,7 @@ fn listen_for_files(s: store::Store) {
         loop {
             let second = next_second_instance().await;
             for a in second.args.iter().skip(1) {
+                let a = &file_uri_path(a);
                 if a.starts_with("oprobe://") {
                     s.open_link(a);
                     continue;
@@ -266,6 +269,16 @@ fn listen_for_files(s: store::Store) {
             }
         }
     });
+}
+
+/// A desktop launcher's `file://` URI (`Exec=oprobe gui %U`) as a path; anything else as is.
+pub(crate) fn file_uri_path(a: &str) -> String {
+    if a.starts_with("file://")
+        && let Some(p) = url::Url::parse(a).ok().and_then(|u| u.to_file_path().ok())
+    {
+        return p.display().to_string();
+    }
+    a.to_owned()
 }
 
 /// Saved-view links the system opens the app with (`oprobe://run/ID?view=…`, design v5 §9).
@@ -296,7 +309,8 @@ pub fn App() -> impl IntoElement {
     listen_for_links(s);
     // `oprobe gui --open FILE` / `oprobe runs open RUNREF` / `oprobe gui run.oprobe`: open it;
     // `oprobe gui 'oprobe://run/ID?view=…'`: the run and its view.
-    let l = launch();
+    let mut l = launch();
+    l.target = l.target.map(|t| file_uri_path(&t));
     if let Some(link) = l.target.clone().filter(|t| t.starts_with("oprobe://")) {
         s.overlay.set(None);
         s.open_link(&link);
