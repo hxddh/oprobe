@@ -11,7 +11,6 @@ use oprobe::lab::{LabConfig, LabServer};
 #[allow(unused_imports)]
 use oprobe::operator::OperatorSpec;
 use oprobe::report::Report;
-use oprobe::report::diff::{Thresholds, diff};
 use oprobe::trace::{Api, Snapshot};
 use oprobe::util::ByteSize;
 
@@ -298,13 +297,10 @@ async fn throttling_is_detected_and_diagnosed() {
         .map(|v| v.breakdown.retry_ms * v.count as f64)
         .sum();
     assert!(retry_ms > 0.0 && retry_ms <= r.resilience.retry_backoff_ms + 1.0);
-    assert!(
-        r.verdict.headline.contains("retry backoff"),
-        "{}",
-        r.verdict.headline
-    );
-    let text = oprobe::report::terminal::render(&r);
-    assert!(!text.contains("COST"), "{text}");
+    // The verdict line is the top finding's cause, and its remedy is a layer path.
+    assert_eq!(r.verdict.headline, r.findings[0].cause);
+    let f = r.findings.iter().find(|f| f.code == "throttling").unwrap();
+    assert!(f.remedy.path.is_some(), "{f:?}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -472,73 +468,7 @@ async fn proxy_connect_is_used_and_timed_with() {
     assert!(s.connections.tls.count > 0);
 }
 #[tokio::test(flavor = "multi_thread")]
-async fn tuner_finds_throttling_ceiling() {
-    use oprobe::tune::{Objective, TuneOptions, tune};
-    let lab = lab(LabConfig {
-        base_ttfb_delay: Duration::from_millis(5),
-        max_inflight_before_503: Some(6),
-        ..Default::default()
-    })
-    .await;
-    let mut p = lab.profile("bkt");
-    small(&mut p, Preset::SmallFiles);
-    p.workload.concurrency = 32;
-    let s = Session::open(p, Cancel::new(), quiet()).await.unwrap();
-    let mut o = TuneOptions::new(
-        Objective::Throughput,
-        RunOptions {
-            duration: Duration::from_millis(500),
-            warmup: Duration::from_millis(100),
-            max_ops: None,
-            rate: None,
-            trace_slow_ops: false,
-        },
-    );
-    o.max_concurrency = 64;
-    o.max_trials = 14;
-    o.cooldown = Duration::ZERO;
-    let out = tune(&s, &o, Arc::new(|_| {})).await.unwrap();
-    s.close().await;
-    let sum = &out.summary;
-    // Over the throttle budget from some concurrency on; the in-flight ceiling brackets the
-    // lab's limit of 6.
-    let over = sum
-        .throttle_ceiling
-        .expect("over budget at some concurrency");
-    assert!((4..=16).contains(&over), "over budget from {over}");
-    let cap = sum.capacity.as_ref().expect("capacity estimate");
-    let ce = cap.inflight_ceiling.expect("in-flight ceiling");
-    assert!(ce.lo <= 6.0 && 6.0 < ce.hi + 1.0, "{ce:?}");
-    // The winner stays within the capacity model's margin and the throttle budget.
-    let safe = sum.safe_concurrency.expect("a margin");
-    assert!(safe < over, "safe {safe} over {over}");
-    assert!(
-        out.winner.concurrency <= safe,
-        "winner {} > safe {safe}",
-        out.winner.concurrency
-    );
-    assert!(out.winner.concurrency < over);
-    let w = &sum.trials[sum.winner_trial];
-    assert!(
-        w.throttled_request_ratio <= o.max_throttle_ratio * 5.0,
-        "winner throttled {:.4}",
-        w.throttled_request_ratio
-    );
-    // An infeasible baseline: no improvement headline, deltas against the best feasible trial.
-    assert!(!sum.baseline_feasible);
-    assert!(sum.improvement.is_none());
-    assert!(
-        sum.headline.starts_with("baseline infeasible"),
-        "{}",
-        sum.headline
-    );
-    let notes = sum.notes.join("\n");
-    assert!(notes.contains("throttling ceiling:"), "{notes}");
-    assert!(!sum.pareto.is_empty());
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn report_roundtrip_and_diff_gate() {
+async fn report_roundtrips_through_json() {
     let mut p = Profile::from_url("memory://");
     small(&mut p, Preset::SmallFiles);
     let (s, c, prof) = run_once(p, 400).await;
@@ -548,27 +478,11 @@ async fn report_roundtrip_and_diff_gate() {
     oprobe::report::write_file(&path, &oprobe::report::to_json(&r)).unwrap();
     let back = oprobe::report::load_json(&path).unwrap();
     assert_eq!(back, r);
-    let same = diff(&r, &back, &Thresholds::default());
-    assert!(same.passed, "{}", same.render_terminal());
-
-    let mut worse = r.clone();
-    worse.summary.ops /= 2;
-    worse.summary.ops_per_s *= 0.5;
-    for v in &mut worse.verbs {
-        v.latency.p99 = v.latency.p99 * 3.0 + 10.0;
-    }
-    worse.integrity.corrupted = 1;
-    let d = diff(&r, &worse, &Thresholds::default());
-    assert!(!d.passed);
-    let fails: Vec<_> = d
-        .checks
-        .iter()
-        .filter(|c| c.verdict == oprobe::report::diff::Status::Fail)
-        .map(|c| c.id.clone())
-        .collect();
-    assert!(fails.iter().any(|n| n.contains("throughput")));
-    assert!(fails.iter().any(|n| n.contains("p99")));
-    assert!(fails.iter().any(|n| n.contains("corrupted")));
+    // Another version's schema is refused, never misread.
+    let mut v = serde_json::to_value(&r).unwrap();
+    v["schema"] = "oprobe.report/5".into();
+    std::fs::write(&path, v.to_string()).unwrap();
+    assert!(oprobe::report::load_json(&path).is_err());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -884,8 +798,7 @@ async fn connection_refused_fails_fast() {
     assert!(hint.title.contains("refused"), "{}", hint.title);
 }
 
-/// A run stopped with Cancel is flagged `interrupted` in the snapshot and report, and
-/// `oprobe diff` warns about it.
+/// A run stopped with Cancel is flagged `interrupted` (and partial) in the snapshot and report.
 #[tokio::test(flavor = "multi_thread")]
 async fn cancelled_run_is_marked_interrupted() {
     let mut p = Profile::from_url("memory://");
@@ -910,23 +823,13 @@ async fn cancelled_run_is_marked_interrupted() {
     let r = build(&prof, snap, c);
     assert!(r.run.interrupted);
     assert_eq!(r.verdict.exit_code, 130);
-    let json = oprobe::report::to_json(&r);
-    assert!(json.contains("\"interrupted\": true"));
-    assert!(oprobe::report::terminal::render(&r).contains("PARTIAL · interrupted"));
+    let json: serde_json::Value = serde_json::to_value(&r).unwrap();
+    assert_eq!(json["run"]["interrupted"], true);
+    assert_eq!(json["run"]["partial"]["reason"], "interrupted");
     assert_eq!(
         r.run.partial.as_ref().map(|p| p.reason),
         Some(oprobe::model::PartialReason::Interrupted)
     );
-    assert!(r.baseline_refusal().is_some());
-    let mut done = r.clone();
-    done.run.interrupted = false;
-    let d = diff(&done, &r, &Thresholds::default());
-    assert!(
-        d.warnings.iter().any(|w| w.contains("interrupted")),
-        "{:?}",
-        d.warnings
-    );
-    assert!(oprobe::report::to_json(&done).contains("\"interrupted\": false"));
 }
 
 // ---------------------------------------------------------------------------------------
@@ -994,7 +897,9 @@ fn run_cli_against(endpoint: &str, extra: &[&str]) -> std::process::Output {
             "small-files",
         ])
         .args(["--objects", "4", "--object-size", "16KiB", "-c", "2"])
-        .args(["-d", "400ms", "--warmup", "0s", "-q", "--color", "never"])
+        .args([
+            "-d", "400ms", "--warmup", "0s", "-q", "--color", "never", "-o", "json",
+        ])
         .args(extra)
         .output()
         .unwrap()
@@ -1011,9 +916,11 @@ fn failed_operations_breach_the_default_sla() {
     let no_retry = ["--set", "layers.retry=off"];
     let out = run_cli_against(&lab.endpoint_url, &no_retry);
     let err = String::from_utf8_lossy(&out.stderr);
-    let text = String::from_utf8_lossy(&out.stdout);
-    assert_eq!(out.status.code(), Some(0), "{err}\n{text}");
-    assert!(text.contains("SLA BREACHED"), "{err}\n{text}");
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let sla = &v["runs"][0]["report"]["verdict"]["sla"];
+    assert_eq!(sla["passed"], false, "{sla}");
+    assert!(!sla["breaches"].as_array().unwrap().is_empty());
     for relaxed in [
         &["--set", "sla=none"][..],
         &["--set", "max_error_rate=100%"][..],
@@ -1056,8 +963,8 @@ async fn effective_write_chunk_is_reported() {
     let writes = s.verbs.iter().map(|v| v.count).sum::<u64>() as f64;
     assert!(parts / writes <= 2.5, "{parts} parts for {writes} writes");
     let r = build(&prof, s, c);
-    assert_eq!(r.knobs.effective.write_chunk_bytes, ByteSize::mib(5).0);
-    assert_eq!(r.knobs.requested.chunk_bytes, ByteSize::mib(1).0);
+    assert_eq!(r.effective_write.write_chunk_size, ByteSize::mib(5).0);
+    assert_eq!(r.effective_write.requested_chunk_size, ByteSize::mib(1).0);
     assert!(
         r.warnings.iter().any(|w| w.contains("5MiB parts")),
         "{:?}",

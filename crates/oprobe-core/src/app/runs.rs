@@ -14,12 +14,32 @@ use crate::report::terminal;
 use crate::store::RunSummary;
 use crate::util::fmt_ms;
 
-/// Result of `oprobe runs list`.
+/// One stored prove (`<id>.prove.json`).
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct ProveSummary {
+    pub prove_id: String,
+    /// The run whose operator was changed.
+    pub run_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finding: Option<String>,
+    pub objective: super::prove::ProveObjective,
+    pub verdict: super::prove::ProveVerdict,
+    /// The objective's relative change (estimate).
+    pub objective_delta_ratio: f64,
+    /// The change as `PATH=VALUE` pairs.
+    pub change: Vec<String>,
+}
+
+/// Result of `oprobe show --list`: the runs you made, newest first, and the proves; prove
+/// trials are hidden unless `--all` (U4).
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 pub struct RunList {
     pub runs: Vec<RunSummary>,
-    /// Runs stored in total (the list may be limited).
+    /// Runs listed in total before `-n` (the list may be limited).
     pub total_count: u64,
+    /// Prove trial runs not listed (`--all` lists them).
+    pub hidden_trials_count: u64,
+    pub proves: Vec<ProveSummary>,
 }
 
 impl CommandOutput for RunList {
@@ -83,6 +103,39 @@ impl CommandOutput for RunList {
         if self.runs.iter().any(|r| r.interrupted) {
             o += &dim("* stopped early (partial run)\n");
         }
+        if !self.proves.is_empty() {
+            o += "\n";
+            let rows: Vec<Vec<String>> = self
+                .proves
+                .iter()
+                .take(5)
+                .map(|p| {
+                    vec![
+                        p.prove_id.clone(),
+                        p.run_id.clone(),
+                        p.finding.clone().unwrap_or_else(|| "--with".into()),
+                        format!("{:?}", p.verdict).to_lowercase(),
+                        format!(
+                            "{} {:+.1}%",
+                            p.objective.label(),
+                            p.objective_delta_ratio * 100.0
+                        ),
+                        cut(&p.change.join(" "), 40),
+                    ]
+                })
+                .collect();
+            o += &crate::report::style::table(
+                &["prove", "run", "finding", "verdict", "objective", "change"],
+                &rows,
+                0,
+            );
+        }
+        if self.hidden_trials_count > 0 {
+            o += &dim(&format!(
+                "{} prove trial runs hidden (--all lists them)\n",
+                self.hidden_trials_count
+            ));
+        }
         if self.total_count as usize > self.runs.len() {
             o += &dim(&format!(
                 "{} of {} runs (-n/--limit)\n",
@@ -127,12 +180,36 @@ impl RunList {
     }
 }
 
-/// The stored runs, newest first.
-pub fn list(app: &App) -> Result<RunList> {
-    let runs = app.store().list()?;
+/// The stored runs, newest first: the runs you made (and, with `all`, prove trials too),
+/// and the proves.
+pub fn list(app: &App, all: bool) -> Result<RunList> {
+    let store = app.store();
+    let every = store.list()?;
+    let trials = every.iter().filter(|r| r.parent_id.is_some()).count() as u64;
+    let runs: Vec<RunSummary> = every
+        .into_iter()
+        .filter(|r| all || r.parent_id.is_none())
+        .collect();
+    let proves = store
+        .proves()?
+        .into_iter()
+        .filter_map(|v| {
+            Some(ProveSummary {
+                prove_id: v["prove_id"].as_str()?.to_owned(),
+                run_id: v["run_id"].as_str()?.to_owned(),
+                finding: v["finding"].as_str().map(str::to_owned),
+                objective: serde_json::from_value(v["objective"].clone()).ok()?,
+                verdict: serde_json::from_value(v["verdict"].clone()).ok()?,
+                objective_delta_ratio: v["objective_delta"]["estimate"].as_f64().unwrap_or(0.0),
+                change: serde_json::from_value(v["change"].clone()).unwrap_or_default(),
+            })
+        })
+        .collect();
     Ok(RunList {
         total_count: runs.len() as u64,
+        hidden_trials_count: if all { 0 } else { trials },
         runs,
+        proves,
     })
 }
 
@@ -331,11 +408,15 @@ impl CommandOutput for RemovedRuns {
     }
 }
 
-/// The ids of the stored runs `refs` name (a file outside the store is refused).
+/// The ids of the stored runs (or proves) `refs` name (a file outside the store is refused).
 pub fn stored_ids(app: &App, refs: &[RunRef]) -> Result<Vec<String>> {
     let store = app.store();
     let mut ids = Vec::new();
     for RunRef(r) in refs {
+        if store.dir().join(format!("{r}.prove.json")).is_file() {
+            ids.push(r.clone());
+            continue;
+        }
         let p = store.resolve(r)?;
         if p.parent() != Some(store.dir()) {
             return Err(OprobeError::new(
@@ -358,7 +439,10 @@ pub fn rm(app: &App, refs: &[RunRef]) -> Result<RemovedRuns> {
     let ids = stored_ids(app, refs)?;
     let store = app.store();
     for id in &ids {
-        store.delete(id)?;
+        // A prove goes with its trial runs.
+        if !store.delete_prove(id)? {
+            store.delete(id)?;
+        }
     }
     Ok(RemovedRuns {
         removed: ids,

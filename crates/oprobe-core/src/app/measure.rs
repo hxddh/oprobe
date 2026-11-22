@@ -1,6 +1,6 @@
-//! The CLI side of the measurement pipeline ([`crate::engine::measure`]): progress for this
-//! output mode, `--fail-on`, `--no-save` and the report files, budget-breach and Ctrl-C
-//! messages. Used by `run`, `demo`, `run --repeat` / `--baseline`, `matrix` and `tune`.
+//! The front-end side of the measurement pipeline ([`crate::engine::measure`]): progress for
+//! this output mode, `--no-save` and the report files, budget-breach and Ctrl-C messages.
+//! Used by `run` (each operator), `demo` and every trial of `prove`.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -12,7 +12,7 @@ use super::input::OutputOptions;
 use super::run::{fail_on_gate, progress_for, save_outputs};
 use crate::config::Profile;
 use crate::engine::Cancel;
-use crate::engine::measure::{self as pipeline, Measured, Mode, Rails, Request, Stage};
+use crate::engine::measure::{self as pipeline, Measured, Rails, Request, Stage};
 use crate::errors::exit;
 use crate::guard::Guard;
 use crate::report::style::dim;
@@ -27,21 +27,19 @@ pub struct Opts<'a> {
     pub guard: Option<Arc<Guard>>,
     pub output: &'a OutputOptions,
     pub cancel: &'a Cancel,
-    pub mode: Mode,
+    /// The prove this measurement is a trial of (its progress stays quiet).
+    pub parent_id: Option<String>,
 }
 
 /// Measure `profile` once through the pipeline and save the run (unless `--no-save`). A budget
 /// breach saves the partial run and returns its error (exit 4).
 pub async fn measure(ctx: &Ctx, profile: Profile, o: Opts<'_>) -> Result<Measured> {
-    let total_s = match &o.mode {
-        Mode::Run => profile.workload.duration.get().as_secs_f64(),
-        Mode::Tune { opts, .. } => {
-            (opts.trial.duration + opts.trial.warmup).as_secs_f64() * opts.max_trials as f64
-        }
-    };
-    let (progress, line) = match &o.mode {
-        Mode::Run => progress_for(ctx, total_s),
-        Mode::Tune { .. } => (super::run::tune_progress(ctx), None),
+    let total_s = profile.workload.duration.get().as_secs_f64();
+    let trial = o.parent_id.is_some();
+    let (progress, line) = if trial {
+        (super::run::quiet_progress(), None)
+    } else {
+        progress_for(ctx, total_s)
     };
     // In-process front ends (the App) also get the engine's full snapshots.
     let bus = ctx.out.bus().clone();
@@ -55,7 +53,7 @@ pub async fn measure(ctx: &Ctx, profile: Profile, o: Opts<'_>) -> Result<Measure
         progress
     };
     let live_bus = bus.clone();
-    let announce_cleanup = matches!(o.mode, Mode::Run);
+    let announce_cleanup = !trial;
     let l2 = line.clone();
     let out = ctx.out.clone();
     let on_stage: pipeline::StageFn = Arc::new(move |s| match s {
@@ -86,7 +84,7 @@ pub async fn measure(ctx: &Ctx, profile: Profile, o: Opts<'_>) -> Result<Measure
     req.guard = o.guard;
     req.trace_max_requests = super::profile::trace_max_requests(ctx);
     req.store = (!o.output.no_save).then(|| ctx.store());
-    req.mode = o.mode;
+    req.parent_id = o.parent_id;
     req.on_stage = Some(on_stage);
     req.finalize = Some(Box::new(move |run| {
         if let Some(level) = fail_on
@@ -120,7 +118,7 @@ pub async fn measure(ctx: &Ctx, profile: Profile, o: Opts<'_>) -> Result<Measure
     if let Some(b) = &m.breach {
         if m.path.is_some() {
             ctx.out.warn(format!(
-                "the partial run was saved: oprobe runs show {}",
+                "the partial run was saved: oprobe show {}",
                 m.run.id()
             ));
         }

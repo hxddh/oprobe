@@ -142,12 +142,22 @@ async fn run_mix(
         trace_slow_ops: false,
     };
     let snap = s.run(&knobs, &opts, None).await.unwrap();
-    let findings = oprobe::analysis::diagnosis::diagnose(&snap, &knobs, &s.profile.sla, true)
-        .findings
-        .into_iter()
-        .map(|f| f.code)
-        .collect();
     let t = s.take_trace().unwrap();
+    let report = oprobe::model::build_run(oprobe::model::ReportInput {
+        run_id: &oprobe::model::RunId::new(),
+        target_name: None,
+        profile: &s.profile,
+        knobs: &knobs,
+        snapshot: snap,
+        trace: t.clone(),
+        cleanup: Default::default(),
+        warnings: vec![],
+        started_at: std::time::SystemTime::now(),
+        ended_at: std::time::SystemTime::now(),
+        spec: None,
+    })
+    .report;
+    let findings = report.findings.into_iter().map(|f| f.code).collect();
     let warnings = s.warnings.clone();
     let c = s.close().await;
     Out {
@@ -178,13 +188,13 @@ async fn suffix_footer_reads_skip_the_head() {
         suffix.apis()
     );
     assert!(suffix.ops.iter().all(|o| o.verb == "parquet.scan.suffix"));
-    // The plain scan gets the advice, the suffix scan does not need it.
-    assert!(
-        plain.findings.iter().any(|c| c == "suffix_read"),
-        "{:?}",
-        plain.findings
-    );
-    assert!(!suffix.findings.iter().any(|c| c == "suffix_read"));
+    // Every finding is a 6.0 code.
+    for c in plain.findings.iter().chain(&suffix.findings) {
+        assert!(
+            oprobe::analysis::findings::CODES.contains(&c.as_str()),
+            "{c}"
+        );
+    }
     // One request fewer per file.
     let per_op = |o: &Out| o.reqs.len() as f64 / o.ops.len() as f64;
     assert!(

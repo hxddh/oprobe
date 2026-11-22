@@ -13,11 +13,10 @@
 //! chance of throttling at a concurrency. Every finding, simulator, tuner margin and App
 //! action that talks about concurrency uses these; nothing else computes a safe concurrency.
 //!
-//! Ceilings are saved per target and workload in `<data>/capacity.toml` ([`History`]), so
-//! later runs and tune can start from them (`source: history`).
+//! Findings report the fitted model as evidence only; sizing a change is `oprobe prove`'s job
+//! (a single run varies no load).
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::Path;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -25,7 +24,6 @@ use serde::{Deserialize, Serialize};
 use super::hypothesis::{Hypothesis, HypothesisKind};
 pub use super::limits::FitInputs;
 use crate::model::{OpRow, ReqRow};
-use crate::store::TargetId;
 
 /// Spare in-flight capacity kept below the ceiling by default (15 %).
 pub const DEFAULT_HEADROOM_RATIO: f64 = 0.15;
@@ -688,30 +686,13 @@ fn rate_ceiling(reqs: &[&ReqRow]) -> Option<f64> {
 }
 
 impl Capacity {
-    /// This run's estimate, completed by a remembered one (`<data>/capacity.toml`, the same
-    /// target and workload): a run that stayed under the ceiling sees no throttling and so no
-    /// ceiling of its own, yet the ceiling still holds. The remembered ceiling is used
-    /// (`source: history`) unless this run has its own, or served requests cleanly above the
-    /// remembered limit (the service changed: the memory is stale). This run's per-op shape
-    /// and observations are kept.
-    pub fn with_history(self, history: Option<Capacity>) -> Capacity {
-        let mut c = self.merge_history(history);
-        if c.source == CapacitySource::History {
-            // The remembered ceiling is the hypothesis; this run's fits are alternatives.
-            let mut hs = super::hypothesis::from_capacity(&c);
-            for h in &mut hs {
-                h.evidence
-                    .push("remembered from an earlier run of this target and workload".into());
-            }
-            for mut h in std::mem::take(&mut c.hypotheses) {
-                h.selected = false;
-                hs.push(h);
-            }
-            c.hypotheses = hs;
-        } else if c.hypotheses.is_empty() {
-            c.hypotheses = super::hypothesis::from_capacity(&c);
+    /// The estimate with its hypotheses filled in (from the 4.x fields when the fit left
+    /// none).
+    pub fn finished(mut self) -> Capacity {
+        if self.hypotheses.is_empty() {
+            self.hypotheses = super::hypothesis::from_capacity(&self);
         }
-        c
+        self
     }
 
     /// The selected limit model.
@@ -774,32 +755,6 @@ impl Capacity {
                 }
             }
         }
-    }
-
-    fn merge_history(mut self, history: Option<Capacity>) -> Capacity {
-        let Some(h) = history else { return self };
-        let Some(hc) = h.inflight_ceiling else {
-            return self;
-        };
-        if self.inflight_ceiling.is_some()
-            || self
-                .observed
-                .max_clean_inflight_count
-                .is_some_and(|m| m as f64 >= hc.hi)
-        {
-            return self;
-        }
-        self.inflight_ceiling = Some(hc);
-        if self.rate_ceiling_requests_per_s.is_none() {
-            self.rate_ceiling_requests_per_s = h.rate_ceiling_requests_per_s;
-        }
-        self.confidence = h.confidence;
-        self.confidence_reason = format!(
-            "remembered from an earlier run of this target and workload ({}); this run peaked at {} requests in flight without crossing it",
-            h.confidence_reason, self.observed.peak_inflight_count
-        );
-        self.source = CapacitySource::History;
-        self
     }
 
     /// The most workers any advice may suggest: [`Capacity::safe_concurrency`] with the
@@ -956,266 +911,6 @@ impl Capacity {
         let h = headroom_ratio.clamp(0.0, 0.95);
         Some((rps / rpo / share * (1.0 - h)).max(1.0))
     }
-}
-
-// ---------------------------------------------------------------------------------------
-// History: <data>/capacity.toml
-// ---------------------------------------------------------------------------------------
-
-/// One remembered estimate.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
-pub struct HistoryEntry {
-    pub capacity: Capacity,
-    /// The run it was estimated from.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub run_id: Option<String>,
-    /// RFC 3339.
-    pub updated_at: String,
-    /// What verifications of this target and workload taught ([`calibrate`]).
-    #[serde(default, skip_serializing_if = "Calibration::is_empty")]
-    pub calibration: Calibration,
-}
-
-/// One verified prediction (`oprobe verify`), as remembered.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
-pub struct Observation {
-    /// The finding (or `recommendation`) whose change was verified.
-    pub code: String,
-    pub outcome: crate::analysis::verification::VerifyOutcome,
-    /// Workers of the verified configuration.
-    pub concurrency_count: u64,
-    /// What [`Capacity::predict`] expected (successful ops/s).
-    pub predicted_ops_per_s: f64,
-    /// What the candidate runs measured (successful ops/s, mean).
-    pub measured_ops_per_s: f64,
-    /// Peak requests in flight of the candidate runs (max).
-    pub peak_inflight_count: u64,
-    /// Throttled responses / requests of the candidate runs.
-    pub throttled_request_ratio: f64,
-    /// The throttle budget the outcome was judged against.
-    pub max_throttle_ratio: f64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub run_id: Option<String>,
-    /// RFC 3339.
-    #[serde(default)]
-    pub at: String,
-}
-
-/// Verification outcomes stored next to the capacity history, and the prediction bias they
-/// imply.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
-pub struct Calibration {
-    /// Measured / predicted throughput (exponential moving average; 1 = unbiased).
-    #[serde(default)]
-    pub ops_bias_ratio: f64,
-    /// Observations folded into the bias.
-    #[serde(default)]
-    pub observations_count: u64,
-    /// The newest observations (at most [`CALIBRATION_KEEP`]).
-    #[serde(default)]
-    pub observations: Vec<Observation>,
-}
-
-impl Calibration {
-    pub fn is_empty(&self) -> bool {
-        self.observations_count == 0 && self.observations.is_empty()
-    }
-}
-
-/// Observations kept per target and workload.
-pub const CALIBRATION_KEEP: usize = 20;
-
-/// Fold a verification into the estimate `cap` (in place):
-/// - the throughput bias (measured / predicted) moves toward this observation (weight 0.3);
-/// - a clean run (throttled ratio within the budget) at a peak above the ceiling's clean
-///   level raises it; a throttled run below the ceiling's throttled level lowers it.
-pub fn calibrate_capacity(cap: &mut Capacity, cal: &mut Calibration, obs: &Observation) {
-    if obs.predicted_ops_per_s > 0.0 && obs.measured_ops_per_s > 0.0 {
-        let r = (obs.measured_ops_per_s / obs.predicted_ops_per_s).clamp(0.2, 5.0);
-        cal.ops_bias_ratio = if cal.observations_count == 0 || cal.ops_bias_ratio <= 0.0 {
-            r
-        } else {
-            0.7 * cal.ops_bias_ratio + 0.3 * r
-        };
-        cal.observations_count += 1;
-    }
-    let peak = obs.peak_inflight_count as f64;
-    if peak > 0.0 {
-        let clean = obs.throttled_request_ratio <= obs.max_throttle_ratio;
-        match cap.inflight_ceiling.as_mut() {
-            Some(ce) if clean && peak > ce.lo => {
-                ce.lo = peak;
-                ce.requests = ce.requests.max(peak);
-                ce.hi = ce.hi.max(ce.requests + 1.0);
-            }
-            Some(ce) if !clean && peak < ce.hi => {
-                ce.hi = peak.max(1.0);
-                ce.lo = ce.lo.min((peak - 1.0).max(0.0));
-                ce.requests = ce.requests.min(ce.hi - 1.0).max(ce.lo);
-            }
-            None if !clean && peak > 1.0 => {
-                cap.inflight_ceiling = Some(Ceiling {
-                    requests: peak - 1.0,
-                    lo: peak - 1.0,
-                    hi: peak,
-                });
-                cap.confidence = Confidence::Low;
-                cap.confidence_reason =
-                    format!("throttled at {peak:.0} requests in flight in a verification run");
-            }
-            _ => {}
-        }
-    }
-    cal.observations.push(obs.clone());
-    if cal.observations.len() > CALIBRATION_KEEP {
-        let n = cal.observations.len() - CALIBRATION_KEEP;
-        cal.observations.drain(..n);
-    }
-    if cal.observations_count > 0 {
-        cap.calibration_bias_ratio = Some(cal.ops_bias_ratio);
-    }
-}
-
-/// Store a verification outcome in the history file at `path` and calibrate the remembered
-/// capacity of `target` / `workload_hash` (starting from `base` when nothing is remembered).
-/// Returns the calibrated capacity.
-pub fn calibrate(
-    path: &Path,
-    target: &TargetId,
-    workload_hash: &str,
-    base: &Capacity,
-    obs: &Observation,
-) -> anyhow::Result<Capacity> {
-    let mut h = History::load(path)?;
-    let entry = h
-        .targets
-        .entry(target.to_string())
-        .or_default()
-        .entry(workload_hash.to_owned())
-        .or_insert_with(|| {
-            let mut c = base.clone();
-            c.observed.levels.clear();
-            HistoryEntry {
-                capacity: c,
-                run_id: obs.run_id.clone(),
-                updated_at: String::new(),
-                calibration: Calibration::default(),
-            }
-        });
-    calibrate_capacity(&mut entry.capacity, &mut entry.calibration, obs);
-    entry.updated_at = crate::util::now_rfc3339();
-    let out = entry.capacity.clone();
-    h.save(path)?;
-    Ok(out)
-}
-
-/// `<data>/capacity.toml`: estimates keyed by target identity, then workload hash.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
-pub struct History {
-    #[serde(default)]
-    pub targets: BTreeMap<String, BTreeMap<String, HistoryEntry>>,
-}
-
-impl History {
-    /// Load `path` (missing: empty).
-    pub fn load(path: &Path) -> anyhow::Result<Self> {
-        match std::fs::read_to_string(path) {
-            Ok(raw) => toml::from_str(&raw).map_err(|e| {
-                crate::errors::OprobeError::new(
-                    crate::errors::ErrorCode::ConfigInvalid,
-                    format!("invalid capacity history `{}`: {e}", path.display()),
-                )
-                .with_hint("delete the file; it is rebuilt by later runs")
-                .into()
-            }),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(e) => {
-                Err(anyhow::Error::from(e).context(format!("cannot read `{}`", path.display())))
-            }
-        }
-    }
-
-    pub fn save(&self, path: &Path) -> anyhow::Result<()> {
-        let text = toml::to_string_pretty(self)?;
-        crate::store::atomic_write(path, text.as_bytes())
-    }
-
-    /// The remembered capacity of `target` for `workload_hash` (`source: history`).
-    pub fn get(&self, target: &TargetId, workload_hash: &str) -> Option<Capacity> {
-        let e = self.targets.get(&target.to_string())?.get(workload_hash)?;
-        let mut c = e.capacity.clone();
-        c.source = CapacitySource::History;
-        if e.calibration.observations_count > 0 {
-            c.calibration_bias_ratio = Some(e.calibration.ops_bias_ratio);
-        }
-        Some(c)
-    }
-
-    /// Remember `cap` (its per-level evidence is not kept).
-    pub fn put(
-        &mut self,
-        target: &TargetId,
-        workload_hash: &str,
-        cap: &Capacity,
-        run_id: Option<&str>,
-    ) {
-        let mut c = cap.clone();
-        c.observed.levels.clear();
-        let m = self.targets.entry(target.to_string()).or_default();
-        // Verification outcomes outlive a new estimate; the bias keeps applying.
-        let calibration = m
-            .remove(workload_hash)
-            .map(|e| e.calibration)
-            .unwrap_or_default();
-        if calibration.observations_count > 0 {
-            c.calibration_bias_ratio = Some(calibration.ops_bias_ratio);
-        }
-        m.insert(
-            workload_hash.to_owned(),
-            HistoryEntry {
-                capacity: c,
-                run_id: run_id.map(str::to_owned),
-                updated_at: crate::util::now_rfc3339(),
-                calibration,
-            },
-        );
-    }
-}
-
-/// The workload key a target's capacity is remembered under: the spec's workload hash with
-/// the run's length left out (duration, warmup, `max_ops`). How long a run lasts does not
-/// change how much load the target takes, so a verification that only lengthens the run (or
-/// a replay with a shorter warmup) still finds the remembered ceiling.
-pub fn history_key(spec: &crate::model::RunSpec) -> String {
-    let mut s = spec.clone();
-    let d = crate::config::WorkloadSpec::default();
-    let w = &mut s.profile.workload;
-    w.duration = d.duration;
-    w.warmup = d.warmup;
-    w.max_ops = None;
-    s.workload_hash()
-}
-
-/// The remembered capacity of `target` / `workload_hash` in the history file at `path`.
-pub fn load(path: &Path, target: &TargetId, workload_hash: &str) -> Option<Capacity> {
-    History::load(path).ok()?.get(target, workload_hash)
-}
-
-/// Remember `cap` for `target` / `workload_hash` in the history file at `path` (only
-/// estimates with a ceiling are worth keeping; others are ignored).
-pub fn save(
-    path: &Path,
-    target: &TargetId,
-    workload_hash: &str,
-    cap: &Capacity,
-    run_id: Option<&str>,
-) -> anyhow::Result<()> {
-    if cap.inflight_ceiling.is_none() {
-        return Ok(());
-    }
-    let mut h = History::load(path)?;
-    h.put(target, workload_hash, cap, run_id);
-    h.save(path)
 }
 
 #[cfg(test)]
@@ -1578,122 +1273,5 @@ mod tests {
         assert!(v["per_op"]["peak_inflight_per_op_count"].is_u64(), "{v}");
         let back: Capacity = serde_json::from_value(v).unwrap();
         assert_eq!(back.inflight_ceiling, c.inflight_ceiling);
-    }
-
-    #[test]
-    fn calibrate_adjusts_the_ceiling_and_the_bias() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("capacity.toml");
-        let (reqs, ops) = synthetic(30, 24, &[1], 5, 30);
-        let c = estimate(&reqs, &ops, Window::all());
-        let lo = c.inflight_ceiling.unwrap().lo;
-        let t = TargetId::parse("s3://bench/data").unwrap();
-        let p = c.predict(10);
-        let obs = Observation {
-            code: "throttling".into(),
-            outcome: crate::analysis::verification::VerifyOutcome::Confirmed,
-            concurrency_count: 10,
-            predicted_ops_per_s: p.ops_per_s,
-            measured_ops_per_s: p.ops_per_s * 0.5,
-            peak_inflight_count: lo as u64 + 3,
-            throttled_request_ratio: 0.0,
-            max_throttle_ratio: 0.001,
-            ..Default::default()
-        };
-        let after = calibrate(&path, &t, "sha256:aa", &c, &obs).unwrap();
-        // A clean run above the clean level raises it.
-        assert_eq!(after.inflight_ceiling.unwrap().lo, lo + 3.0);
-        assert!((after.calibration_bias_ratio.unwrap() - 0.5).abs() < 1e-9);
-        let back = load(&path, &t, "sha256:aa").unwrap();
-        assert!(
-            (back.predict(10).ops_per_s - p.ops_per_s * 0.5).abs() < 1e-6 * p.ops_per_s.max(1.0)
-        );
-        // A throttled run below the throttled level lowers it.
-        let obs2 = Observation {
-            peak_inflight_count: 20,
-            throttled_request_ratio: 0.05,
-            measured_ops_per_s: p.ops_per_s,
-            ..obs
-        };
-        let after = calibrate(&path, &t, "sha256:aa", &c, &obs2).unwrap();
-        let ce = after.inflight_ceiling.unwrap();
-        assert_eq!(ce.hi, 20.0);
-        assert!(ce.lo <= 19.0);
-        let h = History::load(&path).unwrap();
-        let e = &h.targets[&t.to_string()]["sha256:aa"];
-        assert_eq!(e.calibration.observations.len(), 2);
-        assert!((e.calibration.ops_bias_ratio - (0.7 * 0.5 + 0.3)).abs() < 1e-9);
-        // A new estimate keeps the outcomes.
-        save(&path, &t, "sha256:aa", &c, Some("run-2")).unwrap();
-        let h = History::load(&path).unwrap();
-        assert_eq!(
-            h.targets[&t.to_string()]["sha256:aa"]
-                .calibration
-                .observations
-                .len(),
-            2
-        );
-    }
-
-    #[test]
-    fn a_run_under_the_ceiling_keeps_the_remembered_one() {
-        let (reqs, ops) = synthetic(30, 24, &[1], 5, 60);
-        let throttled = estimate(&reqs, &ops, Window::all());
-        let (reqs, ops) = synthetic(20, 24, &[1], 5, 60);
-        let clean = estimate(&reqs, &ops, Window::all());
-        assert!(clean.inflight_ceiling.is_none());
-        let merged = clean.clone().with_history(Some(throttled.clone()));
-        assert_eq!(merged.inflight_ceiling, throttled.inflight_ceiling);
-        assert_eq!(merged.source, CapacitySource::History);
-        assert_eq!(merged.per_op, clean.per_op);
-        assert_eq!(
-            merged.safe_concurrency(0.15),
-            throttled.safe_concurrency(0.15)
-        );
-        assert!(merged.confidence_reason.contains("remembered"));
-        // Its own ceiling wins; no memory changes nothing.
-        let own = throttled.clone().with_history(Some(clean.clone()));
-        assert_eq!(own.source, CapacitySource::ThisRun);
-        assert_eq!(clean.clone().with_history(None), clean);
-        // Clean arrivals above the remembered limit: the memory is stale.
-        let (reqs, ops) = synthetic(40, 1000, &[1], 5, 30);
-        let bigger = estimate(&reqs, &ops, Window::all());
-        let stale = bigger.clone().with_history(Some(throttled));
-        assert!(stale.inflight_ceiling.is_none(), "{stale:#?}");
-        assert_eq!(stale.max_advisable_concurrency(), None);
-    }
-
-    #[test]
-    fn history_key_ignores_the_run_length() {
-        use crate::model::{Overrides, RunSpec};
-        let s = RunSpec::default();
-        let longer = s.with(&Overrides::new().with_set("duration", "60s"));
-        let warm = s.with(&Overrides::new().with_set("warmup", "0s"));
-        assert_ne!(s.workload_hash(), longer.workload_hash());
-        assert_eq!(history_key(&s), history_key(&longer));
-        assert_eq!(history_key(&s), history_key(&warm));
-        let other = s.with(&Overrides::new().with_set("objects", "7"));
-        assert_ne!(history_key(&s), history_key(&other));
-    }
-
-    #[test]
-    fn history_is_keyed_by_target_and_workload() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("capacity.toml");
-        let (reqs, ops) = synthetic(30, 24, &[1], 5, 30);
-        let c = estimate(&reqs, &ops, Window::all());
-        let t = TargetId::parse("s3://bench/data").unwrap();
-        assert!(load(&path, &t, "sha256:aa").is_none());
-        save(&path, &t, "sha256:aa", &c, Some("run-1")).unwrap();
-        let back = load(&path, &t, "sha256:aa").expect("saved");
-        assert_eq!(back.source, CapacitySource::History);
-        assert_eq!(back.inflight_ceiling, c.inflight_ceiling);
-        assert!(back.observed.levels.is_empty());
-        assert!(load(&path, &t, "sha256:bb").is_none());
-        let other = TargetId::parse("s3://bench/other").unwrap();
-        assert!(load(&path, &other, "sha256:aa").is_none());
-        // Estimates without a ceiling are not remembered.
-        save(&path, &other, "sha256:aa", &Capacity::default(), None).unwrap();
-        assert!(load(&path, &other, "sha256:aa").is_none());
     }
 }

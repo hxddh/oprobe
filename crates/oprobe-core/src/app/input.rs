@@ -10,9 +10,6 @@ use std::path::PathBuf;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-pub use crate::config::tune_defaults;
-pub use crate::tune::Objective;
-
 /// `--fail-on`: findings of this severity or worse fail the command (exit 3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -130,7 +127,7 @@ pub struct SlaInput {
 #[serde(default)]
 /// What to do with a measured run besides returning it.
 pub struct OutputOptions {
-    /// Also save the report as JSON (input for `oprobe compare`)
+    /// Also save the report as JSON
     pub json: Option<PathBuf>,
     /// Do not save the run in the run store
     pub no_save: bool,
@@ -139,141 +136,6 @@ pub struct OutputOptions {
     pub fail_on: Option<FailOn>,
     /// Label stored in the report (e.g. a git SHA)
     pub label: Option<String>,
-}
-
-/// The tuner's search flags (shared by `tune` and `fix`).
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
-#[serde(default)]
-pub struct TuneSearch {
-    /// What to optimize
-    pub objective: Objective,
-    /// Measurement window per trial
-    pub trial_duration: String,
-    /// Warmup per trial
-    pub trial_warmup: String,
-    /// Maximum number of trials
-    pub max_trials: usize,
-    /// Highest concurrency to try
-    pub max_concurrency: usize,
-    /// Pause after a throttled trial
-    pub cooldown: String,
-    /// Share of throttled requests a configuration may cause and still be feasible
-    /// (default 0.001, or the profile's `sla.max_throttle_rate`)
-    pub max_throttle_ratio: Option<f64>,
-    /// Runs of each bisection trial near the throttle boundary
-    pub boundary_repeats: usize,
-    /// In-flight headroom kept below the throttling ceiling (default 0.15)
-    pub headroom_ratio: Option<f64>,
-}
-
-impl Default for TuneSearch {
-    fn default() -> Self {
-        Self {
-            objective: Objective::Throughput,
-            trial_duration: tune_defaults::TRIAL_DURATION.into(),
-            trial_warmup: tune_defaults::TRIAL_WARMUP.into(),
-            max_trials: tune_defaults::MAX_TRIALS,
-            max_concurrency: tune_defaults::MAX_CONCURRENCY,
-            cooldown: tune_defaults::COOLDOWN.into(),
-            max_throttle_ratio: Default::default(),
-            boundary_repeats: tune_defaults::BOUNDARY_REPEATS,
-            headroom_ratio: Default::default(),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, Default)]
-#[serde(default)]
-pub struct TuneRequest {
-    /// The operator (as `oprobe run OPERATOR`)
-    pub operator: String,
-    pub workload: WorkloadInput,
-    pub sla: SlaInput,
-    pub output: OutputOptions,
-    pub safety: Safety,
-    pub search: TuneSearch,
-    /// Total wall-time budget of the tuner, e.g. 5m: caps the trials so the estimate fits
-    /// (add --max-duration for a hard stop)
-    pub budget: Option<String>,
-    /// Write the tuned profile (TOML)
-    pub emit_profile: Option<PathBuf>,
-    /// Write a Rust/OpenDAL snippet with the tuned settings
-    pub emit_rust: Option<PathBuf>,
-}
-
-/// `oprobe verify RUNREF [CODE|--all] [--repeat N]`.
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
-#[serde(default)]
-pub struct VerifyRequest {
-    /// The run whose findings to test (RUNREF: id, prefix, last, last~N, label)
-    pub run: String,
-    /// The finding code to verify (default: every finding with a verification)
-    pub code: Option<String>,
-    /// Verify every finding that has a verification
-    pub all: bool,
-    /// Baseline / candidate pairs to run (interleaved A B A B…)
-    pub repeat: usize,
-    /// Do not store the outcomes or calibrate the capacity history and noise floor
-    pub no_calibrate: bool,
-    pub safety: Safety,
-    /// Do not save the replayed runs in the run store
-    pub no_save: bool,
-}
-
-impl Default for VerifyRequest {
-    fn default() -> Self {
-        Self {
-            run: Default::default(),
-            code: Default::default(),
-            all: Default::default(),
-            repeat: 3,
-            no_calibrate: Default::default(),
-            safety: Default::default(),
-            no_save: Default::default(),
-        }
-    }
-}
-
-/// `oprobe fix TARGET`: diagnose → tune → verify.
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
-#[serde(default)]
-pub struct FixRequest {
-    /// The operator (as `oprobe run OPERATOR`)
-    pub operator: String,
-    pub workload: WorkloadInput,
-    pub sla: SlaInput,
-    pub output: OutputOptions,
-    pub safety: Safety,
-    pub search: TuneSearch,
-    /// Baseline / candidate pairs of the verification
-    pub repeat: usize,
-    /// Write the recommended profile (TOML) to this file
-    pub write_profile: Option<PathBuf>,
-    /// Total wall-time budget of the tuning step, e.g. 5m (caps the trials so the estimate fits)
-    pub budget: Option<String>,
-    /// Fix the workload of a stored run (RUNREF): its spec, with credentials resolved again
-    /// from the target; other flags and --set override it (as `run --from`)
-    pub from: Option<String>,
-    /// Override one setting of the workload, repeatable (as `run --set`)
-    pub set: Vec<String>,
-}
-
-impl Default for FixRequest {
-    fn default() -> Self {
-        Self {
-            operator: Default::default(),
-            workload: Default::default(),
-            sla: Default::default(),
-            output: Default::default(),
-            safety: Default::default(),
-            search: Default::default(),
-            repeat: 2,
-            write_profile: Default::default(),
-            budget: Default::default(),
-            from: Default::default(),
-            set: Default::default(),
-        }
-    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]

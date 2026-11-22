@@ -1,4 +1,4 @@
-//! `oprobe run` and `oprobe tune`: measure, build the Report v3, save the run.
+//! `oprobe run`: measure each operator, build the report, save the run.
 
 use std::io::IsTerminal;
 use std::sync::Arc;
@@ -10,7 +10,7 @@ use serde::Serialize;
 use super::input::*;
 use super::{Ctx, live};
 use crate::config::Profile;
-use crate::engine::measure::{Mode, Rails};
+use crate::engine::measure::Rails;
 use crate::engine::{Cancel, Progress, ProgressFn};
 use crate::errors::{ErrorCode, OprobeError, exit};
 use crate::guard::{Budgets, Guard, Plan};
@@ -40,17 +40,32 @@ impl CommandOutput for RunOutput {
     }
 
     fn text(&self) -> String {
-        brief::render(&self.report, &self.run_id)
+        brief::render(&self.report)
     }
     fn exit_code(&self) -> u8 {
         self.report.verdict.exit_code
     }
 }
 
-/// Result of `oprobe run OPERATOR…`: one run per operator, in order, on the same workload.
+/// Result of `oprobe run OPERATOR…`: one run per operator, in order, on the same workload;
+/// with several operators, the comparison side by side.
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 pub struct RunSet {
     pub runs: Vec<RunOutput>,
+    /// Several operators: the side-by-side table and how each differs from the first.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub comparison: Option<crate::report::view::CompareView>,
+}
+
+impl RunSet {
+    /// The runs, with the comparison when there are several.
+    pub fn new(runs: Vec<RunOutput>) -> Self {
+        let comparison = (runs.len() > 1).then(|| {
+            let reports: Vec<&Report> = runs.iter().map(|r| &r.report).collect();
+            crate::report::view::CompareView::of(&reports)
+        });
+        Self { runs, comparison }
+    }
 }
 
 impl CommandOutput for RunSet {
@@ -62,36 +77,59 @@ impl CommandOutput for RunSet {
     }
 
     fn text(&self) -> String {
-        let mut o: String = self
-            .runs
+        let Some(cmp) = &self.comparison else {
+            return self.runs.iter().map(|r| r.text()).collect();
+        };
+        // Side by side: one row per operator, then each operator's top finding.
+        let rows: Vec<Vec<String>> = cmp
+            .rows
             .iter()
-            .map(|r| r.text())
-            .collect::<Vec<_>>()
-            .join("\n");
-        if self.runs.len() > 1 {
-            // Side by side (phase A builds the comparison view).
-            let rows: Vec<Vec<String>> = self
-                .runs
-                .iter()
-                .map(|r| {
-                    let rep = &r.report;
-                    vec![
-                        rep.spec.operator_ref.clone(),
-                        r.run_id.clone(),
-                        format!("{:.1}", rep.summary.ops_per_s),
-                        format!("{:.1}", rep.summary.mib_per_s),
-                        crate::util::fmt_ms(rep.summary.latency.p99),
-                        rep.resilience.throttled_responses.to_string(),
-                    ]
-                })
-                .collect();
-            o += "\n";
-            o += &crate::report::style::table(
-                &["operator", "run", "ops/s", "MiB/s", "p99", "throttled"],
-                &rows,
-                0,
-            );
+            .map(|r| {
+                vec![
+                    r.operator.clone(),
+                    format!("{:.1}", r.goodput_ops_per_s),
+                    crate::util::fmt_ms(r.p50_ms),
+                    crate::util::fmt_ms(r.p99_ms),
+                    format!("{:.2}%", r.throttled_request_ratio * 100.0),
+                    r.failed_ops_count.to_string(),
+                    r.top_finding.clone().unwrap_or_else(|| "—".into()),
+                ]
+            })
+            .collect();
+        let mut o = format!(
+            "{} {} operators · the same workload\n",
+            bold("compare"),
+            cmp.rows.len()
+        );
+        o += &crate::report::style::table(
+            &[
+                "operator",
+                "ops/s",
+                "p50",
+                "p99",
+                "throttled",
+                "errors",
+                "top finding",
+            ],
+            &rows,
+            2,
+        );
+        for d in &cmp.differences {
+            o += &format!("  {}\n", dim(d));
         }
+        for r in &self.runs {
+            if let Some(f) = r.report.findings.first() {
+                let next = f.remedy.next.clone().unwrap_or_default();
+                o += &format!(
+                    "  {} {}: {} {}\n",
+                    dim("·"),
+                    r.report.spec.operator_ref,
+                    f.cause,
+                    dim(&next)
+                );
+            }
+        }
+        o += &dim("  each run: oprobe show RUN --detail\n");
         o
     }
 
@@ -171,6 +209,28 @@ impl CommandOutput for PlanOutput {
     }
 }
 
+/// `layers: retry, timeout · read.concurrent=1 · http=auto`: the operator in one line.
+pub fn operator_summary(o: &crate::operator::OperatorSpec) -> String {
+    let layers: Vec<&str> = crate::operator::diff::LAYER_ORDER
+        .iter()
+        .copied()
+        .filter(|n| crate::operator::diff::layer_rust(o, n).is_some())
+        .collect();
+    let mut parts = vec![if layers.is_empty() {
+        "no layers".to_owned()
+    } else {
+        format!("layers: {}", layers.join(", "))
+    }];
+    if let Some(n) = o.http_limit() {
+        parts.push(format!("http limit {n}"));
+    }
+    parts.push(format!("read.concurrent={}", o.read_concurrent()));
+    if !o.http.keep_alive {
+        parts.push("keep-alive off".into());
+    }
+    parts.join(" · ")
+}
+
 /// Parse the safety flags into budgets; unset ones come from `[defaults.budgets]`.
 pub fn budgets(ctx: &Ctx, s: &Safety) -> Result<Budgets> {
     let bad = |flag: &str, e: anyhow::Error| -> anyhow::Error {
@@ -235,16 +295,9 @@ pub fn progress_for(ctx: &Ctx, total_s: f64) -> (ProgressFn, Option<Arc<live::Li
     (Arc::new(move |p| l2.update(p)), Some(line))
 }
 
-/// Progress of the tuner: messages on stderr.
-pub fn tune_progress(ctx: &Ctx) -> ProgressFn {
-    let quiet = ctx.out.quiet;
-    Arc::new(move |p| {
-        if let Progress::Message(m) = p
-            && !quiet
-        {
-            eprintln!("{} {m}", dim("·"));
-        }
-    })
+/// No progress at all (prove's trials report through prove's own lines).
+pub fn quiet_progress() -> ProgressFn {
+    Arc::new(|_| {})
 }
 
 /// The `--json` report file.
@@ -335,7 +388,7 @@ pub async fn measure_guarded(
             dim(&format!(
                 "· {} · {} · run {}",
                 profile.workload.preset.slug(),
-                crate::config::Knobs::of(&profile).summary(),
+                operator_summary(&profile.operator),
                 rails.run_id
             ))
         ));
@@ -350,7 +403,7 @@ pub async fn measure_guarded(
             guard,
             output,
             cancel,
-            mode: Mode::Run,
+            parent_id: None,
         },
     )
     .await?;

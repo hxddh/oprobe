@@ -6,8 +6,7 @@ use anyhow::Result;
 use super::Ctx;
 use super::input::*;
 use crate::config::{DatasetSpec, Profile};
-use crate::engine::RunOptions;
-use crate::errors::OprobeError;
+
 use crate::operator::resolve::OperatorSource;
 use crate::util::HumanDuration;
 
@@ -186,90 +185,4 @@ pub fn spec_profile(ctx: &Ctx, spec: crate::model::RunSpec) -> Result<Profile> {
         })
         .collect();
     Ok(p)
-}
-
-/// The tuner's search settings, as text the user typed (flags or the app's Tune page).
-#[derive(Clone, Copy, Debug)]
-pub struct TuneSettings<'a> {
-    pub trial_duration: &'a str,
-    pub trial_warmup: &'a str,
-    pub max_trials: usize,
-    pub max_concurrency: usize,
-    pub cooldown: &'a str,
-    /// Throttle budget (unset: `config::defaults().tune.max_throttle_ratio`).
-    pub max_throttle_ratio: Option<f64>,
-    pub boundary_repeats: usize,
-    /// In-flight headroom below the ceiling (unset: `config::defaults().headroom_ratio`).
-    pub headroom_ratio: Option<f64>,
-}
-
-impl Default for TuneSettings<'static> {
-    /// `oprobe tune`'s defaults.
-    fn default() -> Self {
-        Self {
-            trial_duration: tune_defaults::TRIAL_DURATION,
-            trial_warmup: tune_defaults::TRIAL_WARMUP,
-            max_trials: tune_defaults::MAX_TRIALS,
-            max_concurrency: tune_defaults::MAX_CONCURRENCY,
-            cooldown: tune_defaults::COOLDOWN,
-            max_throttle_ratio: None,
-            boundary_repeats: tune_defaults::BOUNDARY_REPEATS,
-            headroom_ratio: None,
-        }
-    }
-}
-
-/// Validate tuner settings and build the options `oprobe tune` and the app both run.
-pub fn tune_options(
-    objective: crate::tune::Objective,
-    s: &TuneSettings<'_>,
-    rate: Option<f64>,
-) -> Result<crate::tune::TuneOptions> {
-    let dur = |what: &str, v: &str| -> Result<std::time::Duration> {
-        crate::input::duration(v).map_err(|e| {
-            let mut o = OprobeError::new(e.code, format!("invalid {what}: {}", e.message));
-            o.hint = e.hint;
-            o.into()
-        })
-    };
-    let duration = dur("trial duration", s.trial_duration)?;
-    if duration.is_zero() {
-        return Err(crate::input::invalid("the trial duration must be greater than zero").into());
-    }
-    if s.max_trials < tune_defaults::MIN_TRIALS {
-        return Err(crate::input::invalid(format!(
-            "max trials must be at least {}",
-            tune_defaults::MIN_TRIALS
-        ))
-        .into());
-    }
-    if s.max_concurrency < 1 {
-        return Err(crate::input::invalid("max concurrency must be at least 1").into());
-    }
-    let d = crate::config::defaults();
-    let max_throttle_ratio = s.max_throttle_ratio.unwrap_or(d.tune.max_throttle_ratio);
-    if !(0.0..=1.0).contains(&max_throttle_ratio) {
-        return Err(crate::input::invalid("the throttle budget must be within 0..1").into());
-    }
-    let headroom_ratio = s.headroom_ratio.unwrap_or(d.headroom_ratio);
-    if !(0.0..0.95).contains(&headroom_ratio) {
-        return Err(crate::input::invalid("the headroom must be within 0..0.95").into());
-    }
-    let mut o = crate::tune::TuneOptions::new(
-        objective,
-        RunOptions {
-            duration,
-            warmup: dur("trial warmup", s.trial_warmup)?,
-            max_ops: None,
-            rate,
-            trace_slow_ops: false,
-        },
-    );
-    o.max_concurrency = s.max_concurrency;
-    o.max_trials = s.max_trials;
-    o.cooldown = dur("cooldown", s.cooldown)?;
-    o.max_throttle_ratio = max_throttle_ratio;
-    o.boundary_repeats = s.boundary_repeats.max(1);
-    o.headroom_ratio = headroom_ratio;
-    Ok(o)
 }

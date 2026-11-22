@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::engine::{Progress, ProgressFn};
 use crate::errors::ErrorBody;
-use crate::model::{Finding, Report, TrialRow};
+use crate::model::{Finding, Report};
 use crate::trace::Phase;
 
 /// Schema id of the event stream.
@@ -67,7 +67,7 @@ pub enum EventKind {
     },
     Trial {
         #[serde(flatten)]
-        trial: TrialRow,
+        trial: crate::app::prove::ProveTrial,
     },
     Log {
         level: LogLevel,

@@ -130,7 +130,6 @@ pub fn hint_for(error_chain: &str, scheme: &str) -> Option<Hint> {
                 creds,
                 "Using a named profile? Export AWS_PROFILE (or set `credential_path` / `config_path` for other services).",
                 "Public bucket? Pass `--anonymous` to send unsigned requests.",
-                "Run `oprobe doctor` to see which credential sources were found.",
             ],
         ));
     }
@@ -150,8 +149,7 @@ pub fn hint_for(error_chain: &str, scheme: &str) -> Option<Hint> {
             &[
                 creds,
                 "The credentials need list, read, write and delete permission on the target prefix (oprobe writes under `oprobe-run-*/`).",
-                "For read-only access to existing data use `--existing <prefix>`; for public buckets use `--anonymous`.",
-                "Run `oprobe doctor` to test each permission individually.",
+                "For read-only access to existing data use `--existing <prefix>`.",
             ],
         ));
     }
@@ -171,8 +169,8 @@ pub fn hint_for(error_chain: &str, scheme: &str) -> Option<Hint> {
         return Some(h(
             "The service is throttling requests",
             &[
-                "Lower `--concurrency` or set `--max-inflight`.",
-                "`oprobe tune` finds the highest safe concurrency automatically and backs off on 429/503.",
+                "Cap the requests in flight (`--set layers.concurrent_limit.http=N`) and retry with jitter (`--set layers.retry.jitter=on`).",
+                "`oprobe prove RUN throttling` sizes the cap with short trials and A/B-tests it.",
             ],
         ));
     }

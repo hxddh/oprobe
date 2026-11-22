@@ -18,48 +18,41 @@ fn invalid(msg: impl Into<String>) -> anyhow::Error {
     crate::input::invalid(msg).into()
 }
 
-/// Defaults of `oprobe tune`, shared with the app's Tune page and MCP so every surface runs
-/// the same search (clap needs them as `&'static str`; [`defaults`] parses them).
-pub mod tune_defaults {
-    /// Measurement window per trial.
-    pub const TRIAL_DURATION: &str = "5s";
-    /// Warmup per trial.
-    pub const TRIAL_WARMUP: &str = "1s";
-    /// Maximum number of trials.
-    pub const MAX_TRIALS: usize = 24;
-    /// Fewest trials a search can run (a baseline and one candidate).
-    pub const MIN_TRIALS: usize = 2;
-    /// Highest concurrency to try.
-    pub const MAX_CONCURRENCY: usize = 256;
-    /// Pause after a throttled trial.
-    pub const COOLDOWN: &str = "5s";
-    /// Share of throttled requests a configuration may cause and still be feasible (v4 §6).
+/// Defaults of `oprobe prove` (design v6 §8 "Prove").
+pub mod prove_defaults {
+    /// Measurement window of one trial (sizing and A/B).
+    pub const TRIAL_DURATION: &str = "2s";
+    /// Warmup of one trial.
+    pub const TRIAL_WARMUP: &str = "300ms";
+    /// Share of throttled requests a sized value may cause (`--max-throttle`).
     pub const MAX_THROTTLE_RATIO: f64 = 0.001;
-    /// Repeats of each trial near the throttle boundary (v4 §6).
-    pub const BOUNDARY_REPEATS: usize = 2;
+    /// A/B pairs at most (the sequential test usually stops earlier).
+    pub const MAX_PAIRS: usize = 6;
+    /// A/B pairs at least before a decision.
+    pub const MIN_PAIRS: usize = 2;
+    /// Sizing trials at most (the bracket search).
+    pub const MAX_SIZING_TRIALS: usize = 8;
 }
 
-/// The tuner's built-in search settings, parsed.
+/// The built-in defaults of `oprobe prove`, parsed.
 #[derive(Clone, Debug, PartialEq, Serialize, schemars::JsonSchema)]
-pub struct TuneDefaults {
+pub struct ProveDefaults {
     pub trial_duration: HumanDuration,
     pub trial_warmup: HumanDuration,
-    pub max_trials: usize,
-    pub min_trials: usize,
-    pub max_concurrency: usize,
-    pub cooldown: HumanDuration,
     pub max_throttle_ratio: f64,
-    pub boundary_repeats: usize,
+    pub max_pairs: usize,
+    pub min_pairs: usize,
+    pub max_sizing_trials: usize,
 }
 
-/// Every built-in default in one place (design v4 §1): the CLI, the App, MCP and tune read
-/// these instead of hard-coding their own. A profile's defaults are `Profile::from_target`'s
+/// Every built-in default in one place (design v4 §1): the CLI, the App and prove read these
+/// instead of hard-coding their own. A profile's defaults are `Profile::from_target`'s
 /// (the same values); `[defaults]` in the config file and flags override them.
 #[derive(Clone, Debug, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct BuiltinDefaults {
     pub workload: WorkloadSpec,
     pub sla: Sla,
-    pub tune: TuneDefaults,
+    pub prove: ProveDefaults,
     /// Spare in-flight capacity kept below a measured ceiling (`analysis::capacity`).
     pub headroom_ratio: f64,
     /// The demo target (`oprobe demo`, the App's Demo button).
@@ -74,15 +67,13 @@ pub fn defaults() -> BuiltinDefaults {
     BuiltinDefaults {
         workload: WorkloadSpec::default(),
         sla: Sla::default(),
-        tune: TuneDefaults {
-            trial_duration: d(tune_defaults::TRIAL_DURATION),
-            trial_warmup: d(tune_defaults::TRIAL_WARMUP),
-            max_trials: tune_defaults::MAX_TRIALS,
-            min_trials: tune_defaults::MIN_TRIALS,
-            max_concurrency: tune_defaults::MAX_CONCURRENCY,
-            cooldown: d(tune_defaults::COOLDOWN),
-            max_throttle_ratio: tune_defaults::MAX_THROTTLE_RATIO,
-            boundary_repeats: tune_defaults::BOUNDARY_REPEATS,
+        prove: ProveDefaults {
+            trial_duration: d(prove_defaults::TRIAL_DURATION),
+            trial_warmup: d(prove_defaults::TRIAL_WARMUP),
+            max_throttle_ratio: prove_defaults::MAX_THROTTLE_RATIO,
+            max_pairs: prove_defaults::MAX_PAIRS,
+            min_pairs: prove_defaults::MIN_PAIRS,
+            max_sizing_trials: prove_defaults::MAX_SIZING_TRIALS,
         },
         headroom_ratio: crate::analysis::capacity::DEFAULT_HEADROOM_RATIO,
         demo_target: "lab://demo".into(),
@@ -430,7 +421,7 @@ pub struct DatasetSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub existing_prefix: Option<String>,
     /// Keep the generated dataset between runs (`oprobe-dataset/<fingerprint>/`) to avoid
-    /// re-uploading it every time. Remove with `oprobe cleanup --datasets`.
+    /// re-uploading it every time (remove it with your storage tools).
     #[serde(default)]
     pub persist: bool,
 }
@@ -1339,7 +1330,7 @@ pub fn anonymous_options(scheme: &str) -> Result<&'static [(&'static str, &'stat
             return Err(crate::input::invalid(format!(
                 "--anonymous is not supported for `{other}` (OpenDAL's {other} service has no unsigned mode)"
             ))
-            .with_hint("configure credentials instead (`oprobe doctor TARGET` shows which it finds)")
+            .with_hint("configure credentials instead")
             .into());
         }
     })

@@ -1,51 +1,54 @@
-//! The concise text result of `oprobe run` (design §9 "Text output default", v5 §6 "Brief
-//! output"): verdict, top findings (cause · evidence · advice · next command), key numbers,
-//! and where the full report is.
+//! The brief result of `oprobe run` (design v6 §8): one screen — the verdict line, at most
+//! three findings (cause · evidence · remedy path · `next: oprobe prove RUN CODE`), the key
+//! numbers, and where the full profile is. No sizing numbers: prove sizes the remedy.
 //!
 //! The brief wraps to the terminal width (or 100 columns off a terminal, `COLUMNS` when set;
 //! [`style::term_width`]) and never truncates: prose wraps at words, and `next` commands are
-//! printed whole on their own line so they can be copied. The CLI is English only.
+//! printed whole on their own line so they can be copied. Everything it says comes from the
+//! presentation model ([`super::view`]).
 
 use super::Report;
 use super::style::*;
+use super::view::{FindingView, NumbersView, VerdictView};
 use crate::util::fmt_ms;
 
-/// The brief's English strings.
-fn t(key: &str) -> &'static str {
-    match key {
-        "label.next" => "next:",
-        "brief.partial" => "partial: the run was stopped early",
-        "brief.more_findings" => "… {n} more findings: {cmd}",
-        "brief.numbers" => "{ops} ops/s · {mib} MiB/s · p50 {p50} · p99 {p99} · errors {errors}%",
-        "brief.throttled" => "{n} throttled ({ratio}% of requests)",
-        "brief.sla_met" => "SLA met",
-        "brief.sla_met_unchecked_throttle" => {
-            "SLA met (throttling not checked: --max-throttle-ratio)"
-        }
-        "brief.sla_breached" => "SLA BREACHED",
-        "brief.sla_breached_soft" => "SLA breached (not enforced)",
-        "brief.full_report" => "full report: {cmd}",
-        _ => "",
+/// Render the brief result of a run, for this terminal.
+pub fn render(r: &Report) -> String {
+    render_width(r, term_width())
+}
+
+fn confidence(c: crate::analysis::capacity::Confidence) -> &'static str {
+    match c {
+        crate::analysis::capacity::Confidence::Low => "low confidence",
+        crate::analysis::capacity::Confidence::Medium => "medium confidence",
+        crate::analysis::capacity::Confidence::High => "high confidence",
     }
 }
 
-/// [`t`] with `{name}` placeholders filled.
-fn tf(key: &str, args: &[(&str, &dyn std::fmt::Display)]) -> String {
-    let mut s = t(key).to_owned();
-    for (name, v) in args {
-        s = s.replace(&format!("{{{name}}}"), &v.to_string());
+/// The key numbers on one line.
+pub fn numbers_line(n: &NumbersView) -> String {
+    let mut s = format!(
+        "{:.1} ops/s · {:.1} MiB/s · p50 {} · p99 {} · errors {:.2}%",
+        n.goodput_ops_per_s,
+        n.mib_per_s,
+        fmt_ms(n.p50_ms),
+        fmt_ms(n.p99_ms),
+        n.error_ratio * 100.0
+    );
+    if n.throttled_requests_count > 0 {
+        s += &format!(
+            " · {:.2}% of requests throttled",
+            n.throttled_request_ratio * 100.0
+        );
     }
     s
 }
 
-/// Render the brief result of a run saved as `run_id`, for this terminal.
-pub fn render(r: &Report, run_id: &str) -> String {
-    render_width(r, run_id, term_width())
-}
-
 /// [`render`] for `width` columns.
-pub fn render_width(r: &Report, run_id: &str, width: usize) -> String {
+pub fn render_width(r: &Report, width: usize) -> String {
     let width = width.max(40);
+    let v = VerdictView::of(r);
+    let findings: Vec<FindingView> = super::view::findings(r);
     let mut lines: Vec<String> = Vec::new();
     let prose = |lines: &mut Vec<String>,
                  text: &str,
@@ -58,9 +61,9 @@ pub fn render_width(r: &Report, run_id: &str, width: usize) -> String {
             lines.push(format!("{indent}{}", paint(body)));
         }
     };
-    let badge = super::terminal::verdict_badge(r.verdict.level);
+    let badge = super::terminal::verdict_badge(v.level);
     let badge_pad = " ".repeat(visible_width(&badge) + 1);
-    for (i, l) in wrap_text(&r.verdict.headline, width, &badge_pad, "  ")
+    for (i, l) in wrap_text(&v.headline, width, &badge_pad, "  ")
         .into_iter()
         .enumerate()
     {
@@ -70,135 +73,82 @@ pub fn render_width(r: &Report, run_id: &str, width: usize) -> String {
             lines.push(format!("  {}", bold(l.trim_start())));
         }
     }
-    if r.run.interrupted {
-        lines.push(yellow(&format!("  {}", t("brief.partial"))));
+    prose(
+        &mut lines,
+        &format!(
+            "{} · {} · {:.1} s · run {}",
+            v.operator, v.preset, v.window_s, v.run_id
+        ),
+        "  ",
+        "  ",
+        dim,
+    );
+    if let Some(p) = &v.partial {
+        lines.push(yellow(&format!("  partial: {p}")));
     }
-    let mut findings: Vec<_> = r.findings.iter().collect();
-    findings.sort_by_key(|f| std::cmp::Reverse(f.severity));
-    for f in findings.iter().take(3) {
-        let (cause, advice) = (f.cause.clone(), f.advice.clone());
+    for (i, f) in findings.iter().take(3).enumerate() {
         let icon = super::terminal::severity_icon(f.severity);
-        for (i, l) in wrap_text(&cause, width, "    ", "    ")
-            .into_iter()
-            .enumerate()
-        {
-            let body = l.trim_start().to_owned();
-            lines.push(if i == 0 {
-                format!("  {icon} {body}")
-            } else {
-                format!("    {body}")
-            });
-        }
-        if !f.evidence.text.is_empty() {
-            prose(&mut lines, &f.evidence.text, "    ", "    ", dim);
-        }
         prose(
             &mut lines,
-            &format!("→ {advice}"),
-            "    ",
+            &format!(
+                "{} {} ({}) — {}",
+                i + 1,
+                f.code,
+                confidence(f.confidence),
+                f.cause
+            ),
+            &format!("  {icon} "),
             "      ",
             |s| s.to_owned(),
         );
-        if let Some(c) = f.verification.as_ref().map(|v| &v.rerun) {
+        if !f.evidence.is_empty() {
+            prose(&mut lines, &f.evidence, "      ", "      ", dim);
+        }
+        let remedy = match &f.remedy_path {
+            Some(_) => format!(
+                "remedy: {} — {} ({})",
+                f.remedy_label(),
+                f.remedy,
+                f.remedy_opendal
+            ),
+            None => format!("remedy: {}", f.remedy),
+        };
+        prose(&mut lines, &remedy, "      ", "        ", |s| s.to_owned());
+        if let Some(c) = &f.next {
             // Whole, on its own line: a command is copied, never cut or wrapped.
-            lines.push(format!("    {} {c}", dim(t("label.next"))));
+            lines.push(format!("      {} {c}", dim("next:")));
         }
     }
-    if r.findings.len() > 3 {
-        let n = r.findings.len() - 3;
-        with_command(
-            &mut lines,
-            width,
-            "  ",
-            "brief.more_findings",
-            &[("n", &n)],
-            &format!("oprobe show {run_id}"),
-        );
+    if findings.len() > 3 {
+        lines.push(dim(&format!(
+            "  … {} more findings: oprobe show {} --detail",
+            findings.len() - 3,
+            v.run_id
+        )));
     }
-    let s = &r.summary;
     prose(
         &mut lines,
-        &tf(
-            "brief.numbers",
-            &[
-                ("ops", &format!("{:.1}", s.ops_per_s)),
-                ("mib", &format!("{:.1}", s.mib_per_s)),
-                ("p50", &fmt_ms(s.latency.p50)),
-                ("p99", &fmt_ms(s.latency.p99)),
-                ("errors", &format!("{:.2}", s.error_rate * 100.0)),
-            ],
-        ),
+        &numbers_line(&NumbersView::of(r)),
         "  ",
         "  ",
         |s| s.to_owned(),
     );
-    let mut extra = Vec::new();
-    let throttled = r.resilience.throttled_responses;
-    if throttled > 0 {
-        let ratio = crate::util::ratio(throttled as f64, r.connections.requests as f64) * 100.0;
-        extra.push(tf(
-            "brief.throttled",
-            &[("n", &throttled), ("ratio", &format!("{ratio:.2}"))],
-        ));
+    if !v.sla_breaches.is_empty() {
+        prose(
+            &mut lines,
+            &format!("SLA breached: {}", v.sla_breaches.join("; ")),
+            "  ",
+            "    ",
+            red,
+        );
     }
-    let v = &r.verdict.sla;
-    extra.push(
-        if v.passed {
-            // "1105 throttled · SLA met" read as if throttling had been checked (review C5).
-            if throttled > 0 && r.sla.max_throttle_ratio.is_none() {
-                t("brief.sla_met_unchecked_throttle")
-            } else {
-                t("brief.sla_met")
-            }
-        } else if v.enforced {
-            t("brief.sla_breached")
-        } else {
-            t("brief.sla_breached_soft")
-        }
-        .to_owned(),
-    );
-    prose(&mut lines, &extra.join(" · "), "  ", "  ", |s| {
-        s.to_owned()
-    });
-    if !v.passed {
-        for b in v.breaches.iter().take(3) {
-            prose(&mut lines, b, "    ", "      ", red);
-        }
-    }
-    with_command(
-        &mut lines,
-        width,
-        "",
-        "brief.full_report",
-        &[],
-        &format!("oprobe show {run_id} --detail"),
-    );
+    lines.push(dim(&format!(
+        "  full profile: oprobe show {} --detail",
+        v.run_id
+    )));
     let mut out = lines.join("\n");
     out.push('\n');
     out
-}
-
-/// A dimmed message ending in a command (`{cmd}`): on one line when it fits, else the message,
-/// then the command whole on the next line.
-fn with_command(
-    lines: &mut Vec<String>,
-    width: usize,
-    indent: &str,
-    key: &'static str,
-    args: &[(&str, &dyn std::fmt::Display)],
-    cmd: &str,
-) {
-    let mut all: Vec<(&str, &dyn std::fmt::Display)> = args.to_vec();
-    all.push(("cmd", &cmd));
-    let one = format!("{indent}{}", tf(key, &all));
-    if display_width(&one) <= width {
-        lines.push(dim(&one));
-        return;
-    }
-    all.pop();
-    all.push(("cmd", &""));
-    lines.push(dim(&format!("{indent}{}", tf(key, &all).trim_end())));
-    lines.push(dim(&format!("{indent}  {cmd}")));
 }
 
 #[cfg(test)]
@@ -209,66 +159,28 @@ mod tests {
     #[test]
     fn brief_wraps_to_the_width_and_never_truncates() {
         set(false);
-        let mut r = crate::model::Report {
-            spec: Default::default(),
-            capacity: Default::default(),
-            schema: crate::model::REPORT_SCHEMA.into(),
-            run: Default::default(),
-            target: Default::default(),
-            workload: Default::default(),
-            knobs: Default::default(),
-            sla: Default::default(),
-            verdict: Default::default(),
-            summary: Default::default(),
-            stages: Default::default(),
-            apis: vec![],
-            verbs: vec![],
-            connections: Default::default(),
-            network: Default::default(),
-            resilience: Default::default(),
-            bytes: Default::default(),
-            cache: Default::default(),
-            integrity: Default::default(),
-            self_stats: Default::default(),
-            schedule: Default::default(),
-            dimensions: Default::default(),
-            sampling: Default::default(),
-            open_loop: None,
-            timeline: vec![],
-            heatmap: Default::default(),
-            findings: vec![],
-            slowest: vec![],
-            cleanup: Default::default(),
-            warnings: vec![],
-            tune: None,
-        };
+        let mut r = crate::report::fixture::report();
+        r.run.id = "20261120-143005-a1b2".into();
         r.verdict.headline = "x".repeat(200);
         r.verdict.sla.passed = false;
-        r.verdict.sla.breaches = vec!["y".repeat(300); 5];
+        r.verdict.sla.breaches = vec!["y".repeat(300); 2];
         for _ in 0..10 {
             r.findings.push(Finding {
+                code: "throttling".into(),
                 cause: "c".repeat(120),
-                advice: "a".repeat(120),
-                verification: Some(crate::model::Verification {
-                    description: "d".into(),
-                    rerun: "oprobe run x ".repeat(20),
+                remedy: crate::model::Remedy {
+                    path: Some("layers.concurrent_limit.http".into()),
+                    text: "a".repeat(120),
+                    next: Some("oprobe prove 20261120-143005-a1b2 throttling".into()),
                     ..Default::default()
-                }),
+                },
                 ..Default::default()
             });
         }
         for width in [40, 80, 100, 160] {
-            let out = render_width(&r, "20261120-143005-a1b2", width);
+            let out = render_width(&r, width);
             for l in out.lines() {
-                // Commands are printed whole; every other line fits.
-                if l.trim_start().starts_with("oprobe ") {
-                    continue;
-                }
-                if l.contains("next: oprobe") {
-                    assert!(
-                        l.trim_end().ends_with("oprobe run x oprobe run x"),
-                        "cut command: {l}"
-                    );
+                if l.contains("oprobe ") {
                     continue;
                 }
                 assert!(
@@ -277,13 +189,28 @@ mod tests {
                     display_width(l)
                 );
             }
-            // Nothing is truncated: the whole headline and advice are there.
             let flat: String = out.split_whitespace().collect();
             assert!(flat.contains(&"x".repeat(200)), "{out}");
             assert!(flat.contains(&"a".repeat(120)), "{out}");
-            assert!(!out.contains('…') || out.contains("more findings"), "{out}");
         }
-        let out = render_width(&r, "20261120-143005-a1b2", 80);
-        assert!(out.contains("oprobe show 20261120-143005-a1b2"));
+        let out = render_width(&r, 100);
+        assert!(out.contains("next: oprobe prove 20261120-143005-a1b2 throttling"));
+        assert!(out.contains("oprobe show 20261120-143005-a1b2 --detail"));
+        // At most three findings.
+        assert_eq!(out.matches("remedy:").count(), 3, "{out}");
+    }
+
+    #[test]
+    fn the_brief_names_the_remedy_path_and_no_sizing_number() {
+        set(false);
+        let r = crate::report::fixture::report();
+        let out = render_width(&r, 100);
+        assert!(
+            out.contains("remedy: layers.concurrent_limit.http + layers.retry.jitter"),
+            "{out}"
+        );
+        let remedy = out.lines().find(|l| l.contains("remedy:")).unwrap();
+        assert!(!remedy.chars().any(|c| c.is_ascii_digit()), "{remedy}");
+        assert!(out.lines().count() <= 24, "{out}");
     }
 }

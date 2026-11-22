@@ -13,10 +13,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::analysis::diagnosis::{Bottleneck, Severity, SlaVerdict};
-use crate::config::Knobs;
 use crate::engine::CleanupSummary;
 use crate::model::TraceInfo;
-use crate::net::HttpVersion;
 use crate::trace::{
     ApiStats, ByteStats, CacheStats, ConnStats, EffectiveKnobs, IntegrityStats, OpBreakdown,
     OpenLoopStats, Quantiles, ResilienceStats, Summary, TimelinePoint, VerbStats,
@@ -89,11 +87,14 @@ pub struct Report {
     /// Always [`REPORT_SCHEMA`].
     pub schema: String,
     pub run: RunInfo,
-    /// The replayable definition of the run (`oprobe run --from RUN`).
+    /// The replayable definition of the run (what `oprobe prove` replays).
     pub spec: super::spec::RunSpec,
     pub target: TargetInfo,
     pub workload: WorkloadInfo,
-    pub knobs: KnobsInfo,
+    /// The multipart part size OpenDAL wrote with (the requested `write.chunk` clamped to the
+    /// service's part-size limits).
+    #[serde(default)]
+    pub effective_write: EffectiveKnobs,
     pub sla: SlaInfo,
     pub verdict: Verdict,
     pub summary: Summary,
@@ -131,8 +132,6 @@ pub struct Report {
     pub cleanup: CleanupSummary,
     #[serde(default)]
     pub warnings: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tune: Option<TuneReport>,
 }
 
 impl Report {
@@ -145,32 +144,19 @@ impl Report {
             .unwrap_or_default()
     }
 
+    /// Goodput: successful operations per second (failed operations never count).
+    pub fn good_ops_per_s(&self) -> f64 {
+        let s = &self.summary;
+        if self.run.window_s > 0.0 {
+            s.ops.saturating_sub(s.failed_ops) as f64 / self.run.window_s
+        } else {
+            s.ops_per_s
+        }
+    }
+
     /// The run stopped early (`run.partial`, or the legacy `run.interrupted` flag).
     pub fn is_partial(&self) -> bool {
         self.run.partial.is_some() || self.run.interrupted
-    }
-
-    /// Why this run cannot be a baseline (`None`: it can): a partial run, or one whose
-    /// findings say it is invalid, would make every later comparison wrong (design v4 §4).
-    pub fn baseline_refusal(&self) -> Option<String> {
-        if let Some(p) = &self.run.partial {
-            return Some(format!(
-                "run {} is partial ({} after {:.1} s of measurement)",
-                self.run.id,
-                p.reason.describe(),
-                p.measured_s
-            ));
-        }
-        if self.run.interrupted {
-            return Some(format!(
-                "run {} is partial (interrupted after {:.1} s of measurement)",
-                self.run.id, self.run.window_s
-            ));
-        }
-        self.findings
-            .iter()
-            .find(|f| f.code == "run_invalid")
-            .map(|f| format!("run {} is invalid: {}", self.run.id, f.cause))
     }
 
     /// Parse a report from JSON: a bare report, a `{"report": …}` command result, or a
@@ -209,6 +195,9 @@ pub struct RunInfo {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// The `oprobe prove` this run is a trial of (trials are hidden from `show --list`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
     /// RFC 3339.
     pub started_at: String,
     /// RFC 3339.
@@ -392,103 +381,6 @@ pub struct MixEntry {
     /// `metadata_write`: user-metadata pairs per object.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata_entries_count: Option<u32>,
-}
-
-/// Client knob values in machine units.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
-pub struct KnobValues {
-    pub concurrency_count: u64,
-    pub io_concurrency_count: u64,
-    pub chunk_bytes: u64,
-    pub range_gap_bytes: u64,
-    /// 0 = unlimited.
-    pub max_inflight_requests_count: u64,
-    pub http_version: HttpVersion,
-    pub keep_alive: bool,
-    pub cache: bool,
-    pub cache_bytes: u64,
-    pub retries_count: u64,
-    pub tail_cut: bool,
-    pub timeout_ms: u64,
-}
-
-impl From<&Knobs> for KnobValues {
-    fn from(k: &Knobs) -> Self {
-        Self {
-            concurrency_count: k.concurrency as u64,
-            io_concurrency_count: k.io_concurrency as u64,
-            chunk_bytes: k.chunk_size.0,
-            range_gap_bytes: k.range_gap.0,
-            max_inflight_requests_count: k.max_inflight_requests as u64,
-            http_version: k.http_version,
-            keep_alive: k.keep_alive,
-            cache: k.cache,
-            cache_bytes: k.cache_size.0,
-            retries_count: k.retries as u64,
-            tail_cut: k.tail_cut,
-            timeout_ms: k.timeout.get().as_millis() as u64,
-        }
-    }
-}
-
-impl KnobValues {
-    /// Back to the profile form (e.g. to re-run with these knobs).
-    pub fn to_knobs(&self) -> Knobs {
-        Knobs {
-            concurrency: self.concurrency_count as usize,
-            io_concurrency: self.io_concurrency_count as usize,
-            chunk_size: crate::util::ByteSize(self.chunk_bytes),
-            range_gap: crate::util::ByteSize(self.range_gap_bytes),
-            max_inflight_requests: self.max_inflight_requests_count as usize,
-            http_version: self.http_version,
-            keep_alive: self.keep_alive,
-            cache: self.cache,
-            cache_size: crate::util::ByteSize(self.cache_bytes),
-            retries: self.retries_count as usize,
-            tail_cut: self.tail_cut,
-            timeout: crate::util::HumanDuration(std::time::Duration::from_millis(self.timeout_ms)),
-        }
-    }
-}
-
-/// Knobs as requested and as OpenDAL applied them.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
-pub struct KnobsInfo {
-    pub requested: KnobValues,
-    pub effective: EffectiveKnobValues,
-}
-
-/// The effective configuration: the requested values with the service's limits applied.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
-pub struct EffectiveKnobValues {
-    #[serde(flatten)]
-    pub values: KnobValues,
-    /// Multipart part size OpenDAL writes with (the chunk clamped to the service's limits).
-    pub write_chunk_bytes: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub service_min_part_bytes: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub service_max_part_bytes: Option<u64>,
-}
-
-impl EffectiveKnobValues {
-    pub fn new(requested: &Knobs, e: &EffectiveKnobs) -> Self {
-        Self {
-            values: requested.into(),
-            write_chunk_bytes: if e.write_chunk_size == 0 {
-                requested.chunk_size.0
-            } else {
-                e.write_chunk_size
-            },
-            service_min_part_bytes: e.service_min_part_size,
-            service_max_part_bytes: e.service_max_part_size,
-        }
-    }
-
-    /// OpenDAL changed the requested write chunk.
-    pub fn write_chunk_clamped(&self) -> bool {
-        self.write_chunk_bytes != self.values.chunk_bytes
-    }
 }
 
 /// Service level objectives the run was checked against.
@@ -760,19 +652,52 @@ impl Heatmap {
     }
 }
 
-/// A diagnosis item (design §1).
+/// A finding (design v6 §3 "Explain"): a cause, the evidence (the requests themselves) and
+/// **one** OpenDAL remedy. No sizing numbers: a single run varies no load (T1, T2); `oprobe
+/// prove` sizes the remedy.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Finding {
-    /// Stable code, e.g. `throttling`, `cold_connections`.
+    /// Stable code ([`crate::analysis::catalog`]), e.g. `throttling`, `tail_stragglers`.
     pub code: String,
     pub severity: Severity,
+    /// How sure the cause is: `high` only when the limit model explains most of the effect
+    /// and agrees across the run's halves (T8).
+    #[serde(default)]
+    pub confidence: crate::analysis::capacity::Confidence,
     /// One sentence: what is wrong.
     pub cause: String,
     pub evidence: Evidence,
-    /// What to change.
-    pub advice: String,
+    pub remedy: Remedy,
+}
+
+/// The one remedy of a finding: an `OperatorSpec` path (design v6 §8 "Findings → remedies").
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Remedy {
+    /// The operator path the remedy changes (`layers.concurrent_limit.http`, `read.gap`);
+    /// absent when the remedy is not a layer (`key_limit`, `client_bound`, `errors`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub verification: Option<Verification>,
+    pub path: Option<String>,
+    /// Paths changed together with it (`layers.retry.jitter`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub with: Vec<String>,
+    /// The OpenDAL API, e.g. `ConcurrentLimitLayer::with_http_concurrent_limit`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub opendal: String,
+    /// `oprobe prove` sizes the value with a bracket search (otherwise it switches it on).
+    pub sized: bool,
+    /// The remedy in one sentence (no numbers).
+    pub text: String,
+    /// The next command (`oprobe prove RUN CODE`, or `oprobe show RUN --by …` when there is
+    /// nothing to prove).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next: Option<String>,
+}
+
+impl Remedy {
+    /// `oprobe prove` can test this remedy (it changes the operator).
+    pub fn provable(&self) -> bool {
+        self.path.is_some()
+    }
 }
 
 /// The numbers and trace references behind a finding.
@@ -917,180 +842,6 @@ fn group_thousands(v: f64, decimals: usize) -> String {
 pub struct TimeWindow {
     pub from_s: f64,
     pub to_s: f64,
-}
-
-/// A concrete way to test a finding's advice (v4 §5).
-pub use crate::analysis::verification::{Expectation, Verification};
-
-impl From<&crate::analysis::diagnosis::Finding> for Finding {
-    fn from(f: &crate::analysis::diagnosis::Finding) -> Self {
-        Self {
-            code: f.code.clone(),
-            severity: f.severity,
-            cause: f.title.clone(),
-            evidence: Evidence {
-                text: f.evidence.clone(),
-                ..Default::default()
-            },
-            advice: f.action.clone(),
-            verification: None,
-        }
-    }
-}
-
-/// The tuner's search, embedded in the winner's report (design v4 §6).
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
-pub struct TuneReport {
-    /// `goodput`, `p99`, `cost` or `balanced`.
-    pub objective: String,
-    /// What goodput was measured in: `ops_per_s` or `mib_per_s`.
-    pub metric_unit: String,
-    pub trials: Vec<TrialRow>,
-    pub baseline_trial: u64,
-    /// The trial whose knobs are recommended.
-    pub recommended_trial_id: u64,
-    /// The recommendation's confirmation run.
-    pub winner_trial: u64,
-    /// The best trial within the SLA and the throttle budget, ignoring the safety margin.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub best_feasible_trial_id: Option<u64>,
-    /// The baseline met the SLA and the throttle budget. When it did not, deltas are taken
-    /// against the best feasible trial.
-    pub baseline_feasible: bool,
-    /// Objective improvement of the recommendation vs the baseline (positive = better);
-    /// absent when the baseline was infeasible or above the safety margin. Never negative.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub improvement_ratio: Option<f64>,
-    /// One line: what is recommended and why.
-    pub headline: String,
-    /// How much better the best feasible trial measured than the recommendation: what the
-    /// safety margin costs.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub margin_cost_ratio: Option<f64>,
-    /// Lowest concurrency that exceeded the throttle budget.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub throttle_ceiling_count: Option<u64>,
-    /// The capacity model's concurrency within the safety margin.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub safe_concurrency_count: Option<u64>,
-    /// The throttle budget (share of throttled requests a feasible trial may cause).
-    pub max_throttle_ratio: f64,
-    /// The capacity model over every trial (`source: tune`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub capacity: Option<crate::analysis::capacity::Capacity>,
-    /// Trials not dominated on (goodput, p99, cost, throttling).
-    #[serde(default)]
-    pub pareto_trial_ids: Vec<u64>,
-    /// No trial met the SLA: the winner is the least-bad configuration.
-    pub no_feasible_trial: bool,
-    pub notes: Vec<String>,
-    /// The recommended configuration: knobs, profile, code, deltas.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub recommendation: Option<crate::tune::recommend::Recommendation>,
-}
-
-/// One tuner trial.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
-pub struct TrialRow {
-    pub id: u64,
-    pub stage: String,
-    pub knobs: KnobValues,
-    /// Successful operations per second.
-    pub ops_per_s: f64,
-    pub mib_per_s: f64,
-    pub p50_ms: f64,
-    pub p99_ms: f64,
-    pub error_ratio: f64,
-    /// Throttled responses / requests (the throttle budget applies to this).
-    pub throttled_request_ratio: f64,
-    /// Operations with ≥ 1 throttled response / operations.
-    pub throttled_op_ratio: f64,
-    pub throttled_responses_count: u64,
-    pub requests_count: u64,
-    /// Requests in flight at the trial's peak.
-    pub peak_inflight_count: u64,
-    /// The most requests one operation had in flight at once (maximum over operations).
-    pub peak_inflight_per_op_count: u64,
-    pub feasible: bool,
-    pub note: String,
-    /// The pace of an open-loop trial (operations per second).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rate_per_s: Option<f64>,
-}
-
-impl TrialRow {
-    /// Back to the tuner's form (knobs in profile units).
-    pub fn to_trial(&self) -> crate::tune::Trial {
-        crate::tune::Trial {
-            id: self.id as usize,
-            stage: self.stage.clone(),
-            knobs: self.knobs.to_knobs(),
-            ops_per_s: self.ops_per_s,
-            mib_per_s: self.mib_per_s,
-            p50_ms: self.p50_ms,
-            p99_ms: self.p99_ms,
-            error_rate: self.error_ratio,
-            throttled_request_ratio: self.throttled_request_ratio,
-            throttled_op_ratio: self.throttled_op_ratio,
-            throttled_responses: self.throttled_responses_count,
-            requests: self.requests_count,
-            peak_inflight: self.peak_inflight_count,
-            peak_inflight_per_op: self.peak_inflight_per_op_count as f64,
-            feasible: self.feasible,
-            note: self.note.clone(),
-            rate_per_s: self.rate_per_s,
-        }
-    }
-}
-
-impl From<&crate::tune::Trial> for TrialRow {
-    fn from(t: &crate::tune::Trial) -> Self {
-        Self {
-            id: t.id as u64,
-            stage: t.stage.clone(),
-            knobs: (&t.knobs).into(),
-            ops_per_s: t.ops_per_s,
-            mib_per_s: t.mib_per_s,
-            p50_ms: t.p50_ms,
-            p99_ms: t.p99_ms,
-            error_ratio: t.error_rate,
-            throttled_request_ratio: t.throttled_request_ratio,
-            throttled_op_ratio: t.throttled_op_ratio,
-            throttled_responses_count: t.throttled_responses,
-            requests_count: t.requests,
-            peak_inflight_count: t.peak_inflight,
-            peak_inflight_per_op_count: t.peak_inflight_per_op.round().max(0.0) as u64,
-            feasible: t.feasible,
-            note: t.note.clone(),
-            rate_per_s: t.rate_per_s,
-        }
-    }
-}
-
-impl From<&crate::report::TuneSummary> for TuneReport {
-    fn from(s: &crate::report::TuneSummary) -> Self {
-        Self {
-            objective: s.objective.clone(),
-            metric_unit: s.metric_unit.clone(),
-            trials: s.trials.iter().map(TrialRow::from).collect(),
-            baseline_trial: s.baseline_trial as u64,
-            recommended_trial_id: s.recommended_trial as u64,
-            winner_trial: s.winner_trial as u64,
-            best_feasible_trial_id: s.best_feasible_trial.map(|t| t as u64),
-            baseline_feasible: s.baseline_feasible,
-            improvement_ratio: s.improvement.filter(|i| *i >= 0.0),
-            headline: s.headline.clone(),
-            margin_cost_ratio: s.margin_cost_ratio,
-            throttle_ceiling_count: s.throttle_ceiling.map(|c| c as u64),
-            safe_concurrency_count: s.safe_concurrency.map(|c| c as u64),
-            max_throttle_ratio: s.max_throttle_ratio,
-            capacity: s.capacity.clone(),
-            pareto_trial_ids: s.pareto.iter().map(|t| *t as u64).collect(),
-            no_feasible_trial: s.no_feasible_trial,
-            notes: s.notes.clone(),
-            recommendation: None,
-        }
-    }
 }
 
 #[cfg(test)]
