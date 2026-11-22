@@ -6,6 +6,11 @@ fn main() -> ExitCode {
         Ok(cli) => cli,
         Err(code) => return code,
     };
+    // A bare `oprobe` is the app: it owns the main thread (native windows need it) and runs
+    // its work on a runtime of its own.
+    if cli.command.is_none() {
+        return oprobe::launch::bare(&cli);
+    }
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         // The same deep stacks as the main thread (see build.rs).

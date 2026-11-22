@@ -31,7 +31,7 @@ pub async fn main(cli: Cli) -> ExitCode {
         ColorChoice::Auto => {}
     }
     let Some(command) = cli.command else {
-        return ExitCode::from(crate::app_stub::launch(&cli));
+        return crate::launch::bare(&cli);
     };
     let paths = Paths::resolve(cli.config.as_deref());
     let format = cli.output.map(OutputFormat::from).unwrap_or_else(|| {
