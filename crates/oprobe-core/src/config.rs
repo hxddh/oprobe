@@ -7,6 +7,7 @@ use std::time::Duration;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+pub use crate::engine::schedule::{Arrivals, RateShape};
 use crate::net::HttpVersion;
 use crate::util::{ByteSize, HumanDuration};
 
@@ -625,6 +626,16 @@ pub struct WorkloadSpec {
     /// Open-loop arrival rate in ops/s. Unset = closed loop (`knobs.concurrency` workers).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate: Option<f64>,
+    /// Open-loop arrival process: `constant` (evenly spaced) or `poisson` (design v5 §3).
+    #[serde(default, skip_serializing_if = "Arrivals::is_constant")]
+    pub arrivals: Arrivals,
+    /// Time-varying open-loop rate: `ramp:FROM..TO/D`, `step:R1,R2,…/D` or
+    /// `diurnal[:MIN..MAX/PERIOD]` (makes the run open-loop; `rate` is then the diurnal peak).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shape: Option<RateShape>,
+    /// Replay a traffic log instead of the mix (open loop on the log's timing).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay: Option<crate::engine::replay::ReplaySpec>,
     #[serde(default)]
     pub access: Access,
     /// Dataset override (defaults come from the preset).
@@ -664,6 +675,9 @@ impl Default for WorkloadSpec {
             warmup: default_warmup(),
             max_ops: None,
             rate: None,
+            arrivals: Arrivals::Constant,
+            shape: None,
+            replay: None,
             access: Access::Uniform,
             dataset: None,
             mix: Vec::new(),
@@ -675,6 +689,27 @@ impl Default for WorkloadSpec {
 }
 
 impl WorkloadSpec {
+    /// Whether arrivals follow a schedule (`rate` or `shape`) instead of closed-loop workers.
+    pub fn open_loop(&self) -> bool {
+        self.rate.is_some() || self.shape.is_some() || self.replay.is_some()
+    }
+
+    /// Expected open-loop arrivals over `window` (`None`: closed loop). The plan's estimate.
+    pub fn expected_arrivals(&self, window: std::time::Duration) -> Option<f64> {
+        match &self.shape {
+            Some(s) => Some(s.expected_arrivals(self.rate.unwrap_or(0.0), window)),
+            None => self.rate.map(|r| r * window.as_secs_f64()),
+        }
+    }
+
+    /// The highest open-loop arrival rate of the run (ops/s), when it is open-loop.
+    pub fn peak_rate(&self) -> Option<f64> {
+        match &self.shape {
+            Some(s) => Some(s.peak(self.rate.unwrap_or(0.0))),
+            None => self.rate,
+        }
+    }
+
     pub fn effective_dataset(&self) -> DatasetSpec {
         self.dataset
             .clone()

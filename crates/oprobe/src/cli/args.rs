@@ -585,6 +585,21 @@ pub struct WorkloadArgs {
     /// Do not delete test data when the run ends
     #[arg(long)]
     pub keep_data: bool,
+    /// Open-loop arrival process: constant (evenly spaced) or poisson
+    #[arg(long, value_name = "PROCESS")]
+    pub arrivals: Option<String>,
+    /// Time-varying open-loop rate: ramp:FROM..TO/D, step:R1,R2,…/D, diurnal[:MIN..MAX/PERIOD]
+    #[arg(long, value_name = "SHAPE")]
+    pub shape: Option<String>,
+    /// Replay a traffic log: S3 server access log, CloudTrail S3 data events, oprobe run file
+    #[arg(long, value_name = "FILE")]
+    pub replay: Option<PathBuf>,
+    /// Replay speed factor (2 = twice as fast as recorded)
+    #[arg(long, value_name = "N", value_parser = parse::positive, allow_hyphen_values = true)]
+    pub speed: Option<f64>,
+    /// Rewrite replayed keys: FROM=TO prefix pair, repeatable
+    #[arg(long, value_name = "FROM=TO")]
+    pub map_prefix: Vec<String>,
 }
 
 /// Client configuration under test.

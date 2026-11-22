@@ -91,26 +91,46 @@ pub struct ScheduleStats {
     pub max_schedule_lag_ms: f64,
 }
 
+/// Missed-arrival share above which capacity advice is suppressed and `schedule_backlog`
+/// explains the backlog (design v5 §3).
+pub const SCHEDULE_BACKLOG_RATIO: f64 = 0.01;
+
 impl ScheduleStats {
-    /// What 4.x measured: the open-loop counters.
+    /// The schedule of a run: open-loop arrivals (intended, missed, the schedule stage), or a
+    /// closed-loop run (`open_loop: false`: subject to coordinated omission).
     pub fn from_open_loop(o: Option<&OpenLoopStats>, window_s: f64) -> Self {
         let Some(o) = o else {
             return Self::default();
         };
-        let intended = (o.target_rate * window_s).round().max(0.0) as u64;
+        // Runs recorded before the intended count existed: estimate it from the rate.
+        let intended = if o.intended_count > 0 {
+            o.intended_count
+        } else {
+            (o.target_rate * window_s).round().max(0.0) as u64
+        };
         Self {
             open_loop: true,
-            arrivals: Some("constant".into()),
-            intended_ops_count: intended,
+            arrivals: Some(if o.arrivals.is_empty() {
+                "constant".into()
+            } else {
+                o.arrivals.clone()
+            }),
+            intended_ops_count: intended.max(o.missed),
             missed_arrivals_count: o.missed,
             missed_arrivals_ratio: if intended > 0 {
                 (o.missed as f64 / intended as f64).min(1.0)
             } else {
                 0.0
             },
-            schedule_stage: None,
+            schedule_stage: o.schedule,
             max_schedule_lag_ms: o.max_schedule_lag_ms,
         }
+    }
+
+    /// More than [`SCHEDULE_BACKLOG_RATIO`] of the arrivals never started: the latency tail
+    /// holds censored values and the throughput is what the client managed, not the target.
+    pub fn backlogged(&self) -> bool {
+        self.open_loop && self.missed_arrivals_ratio > SCHEDULE_BACKLOG_RATIO
     }
 }
 
@@ -225,5 +245,22 @@ impl SelfStats {
             rss_peak_bytes: (p.rss_mib > 0.0).then_some((p.rss_mib * 1024.0 * 1024.0) as u64),
             ..Self::default()
         }
+    }
+
+    /// The process stats plus what the self probe measured over the window.
+    pub fn from_observation(p: &ClientStats, o: Option<&crate::trace::SelfObservation>) -> Self {
+        let mut s = Self::from_process(p);
+        let Some(o) = o else {
+            return s;
+        };
+        s.observer_per_op_us = o.observer_per_op_us;
+        s.runtime_busy_ratio = o.runtime_busy_ratio;
+        s.global_queue_depth_count = o.global_queue_depth_max_count;
+        s.sched_lag_p99_ms = o.sched_lag_p99_ms;
+        s.cpu_ratio = o.cpu_ratio;
+        s.rss_current_bytes = o.rss_current_bytes;
+        s.rss_peak_bytes = o.rss_peak_bytes.or(s.rss_peak_bytes);
+        s.client_saturated = o.client_saturated;
+        s
     }
 }

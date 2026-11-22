@@ -505,6 +505,7 @@ mod tests {
             achieved_rate: 100.0,
             missed,
             max_schedule_lag_ms: 0.0,
+            ..Default::default()
         };
         b.open_loop = Some(ol(0));
         c.open_loop = Some(ol(100));

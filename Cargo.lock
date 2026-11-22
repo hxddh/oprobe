@@ -4074,6 +4074,7 @@ dependencies = [
  "crc32c",
  "dirs",
  "futures",
+ "hdrhistogram",
  "http",
  "http-body",
  "http-body-util",

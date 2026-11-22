@@ -61,6 +61,7 @@ fn main() {
                     error: None,
                     key: String::new(),
                     data: scope.take(),
+                    schedule_us: None,
                 },
             );
         }

@@ -19,10 +19,6 @@ fn hist() -> Histogram<u64> {
     Histogram::new_with_bounds(1, HIST_MAX_US, 3).expect("valid histogram bounds")
 }
 
-fn small_hist() -> Histogram<u64> {
-    Histogram::new_with_bounds(1, HIST_MAX_US, 2).expect("valid histogram bounds")
-}
-
 fn rec(h: &mut Histogram<u64>, us: u64) {
     let _ = h.record(us.min(HIST_MAX_US));
 }
@@ -127,17 +123,67 @@ impl VerbAgg {
     }
 }
 
+/// Fixed log-scale latency bounds of the per-interval heatmap columns (ms; the last bucket is
+/// open-ended). The same bounds as the report's heatmap, so runs compare.
+pub const HEAT_BOUNDS_MS: [f64; 20] = [
+    0.0, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1_000.0, 2_000.0,
+    5_000.0, 10_000.0, 20_000.0, 50_000.0, 100_000.0,
+];
+
+/// The heatmap row of a latency.
+pub fn heat_index(latency_us: u64) -> usize {
+    let ms = latency_us as f64 / 1000.0;
+    HEAT_BOUNDS_MS.iter().rposition(|b| ms >= *b).unwrap_or(0)
+}
+
+/// Interval resolution (design v5 §3, M11): one-second intervals for the first ten minutes,
+/// ten-second intervals afterwards, so an hour-long run keeps about 900 intervals.
+const FINE_INTERVALS: usize = 600;
+const COARSE_S: usize = 10;
+
+/// The interval holding second `secs` of the window.
+fn bucket_index(secs: u64) -> usize {
+    let s = secs as usize;
+    if s < FINE_INTERVALS {
+        s
+    } else {
+        FINE_INTERVALS + (s - FINE_INTERVALS) / COARSE_S
+    }
+}
+
+/// Start and length (s) of interval `idx`.
+fn bucket_span(idx: usize) -> (f64, f64) {
+    if idx < FINE_INTERVALS {
+        (idx as f64, 1.0)
+    } else {
+        (
+            (FINE_INTERVALS + (idx - FINE_INTERVALS) * COARSE_S) as f64,
+            COARSE_S as f64,
+        )
+    }
+}
+
 struct Bucket {
     ops: u64,
     bytes: u64,
     errors: u64,
     throttled: u64,
-    /// Latencies of the second while it is open; dropped (and its quantiles kept) once a later
-    /// second starts, so a long run holds a few numbers per second, not a histogram each, and a
-    /// snapshot does not recompute quantiles over every second of the run.
+    /// Open-loop arrivals due in this interval that never started.
+    missed: u64,
+    /// Latencies of the interval while it is open; dropped (and its quantiles kept) once every
+    /// operation that started in it finished, so a long run holds a few numbers per interval,
+    /// not a histogram each, and a snapshot does not recompute quantiles over the whole run.
     latency: Option<Histogram<u64>>,
-    p50_us: u64,
-    p99_us: u64,
+    /// p50, p90, p99, p99.9, max (µs) of a closed interval, at full histogram precision.
+    q_us: [u64; 5],
+    /// Operations per heatmap latency row ([`HEAT_BOUNDS_MS`]).
+    heat: [u32; 20],
+    /// Peak requests in flight seen by the series probe.
+    inflight_peak: u64,
+    /// Connections dialed during the interval.
+    dials: u64,
+    /// Client CPU (percent of one core) sampled in the interval.
+    cpu_pct: Option<f64>,
 }
 
 impl Bucket {
@@ -147,26 +193,39 @@ impl Bucket {
             bytes: 0,
             errors: 0,
             throttled: 0,
-            latency: Some(small_hist()),
-            p50_us: 0,
-            p99_us: 0,
+            missed: 0,
+            latency: Some(hist()),
+            q_us: [0; 5],
+            heat: [0; 20],
+            inflight_peak: 0,
+            dials: 0,
+            cpu_pct: None,
         }
+    }
+
+    fn qs(h: &Histogram<u64>) -> [u64; 5] {
+        if h.is_empty() {
+            return [0; 5];
+        }
+        [
+            h.value_at_quantile(0.5),
+            h.value_at_quantile(0.9),
+            h.value_at_quantile(0.99),
+            h.value_at_quantile(0.999),
+            h.max(),
+        ]
     }
 
     fn close(&mut self) {
-        if let Some(h) = self.latency.take()
-            && !h.is_empty()
-        {
-            self.p50_us = h.value_at_quantile(0.5);
-            self.p99_us = h.value_at_quantile(0.99);
+        if let Some(h) = self.latency.take() {
+            self.q_us = Self::qs(&h);
         }
     }
 
-    fn quantiles(&self) -> (u64, u64) {
+    fn quantiles(&self) -> [u64; 5] {
         match &self.latency {
-            Some(h) if !h.is_empty() => (h.value_at_quantile(0.5), h.value_at_quantile(0.99)),
-            Some(_) => (0, 0),
-            None => (self.p50_us, self.p99_us),
+            Some(h) => Self::qs(h),
+            None => self.q_us,
         }
     }
 }
@@ -183,7 +242,8 @@ struct ConnInfo {
 
 struct Agg {
     all_latency: Histogram<u64>,
-    verbs: BTreeMap<String, VerbAgg>,
+    /// Keyed by the static verb name: no allocation per operation (X6).
+    verbs: BTreeMap<&'static str, VerbAgg>,
     apis: BTreeMap<Api, ApiAgg>,
     buckets: Vec<Bucket>,
     slow: Vec<SlowOp>,
@@ -207,6 +267,12 @@ struct Agg {
     logical_read: u64,
     logical_write: u64,
     open_loop: Option<OpenLoopStats>,
+    /// The `schedule` stage of open-loop operations (intended → actual start).
+    schedule: Histogram<u64>,
+    /// Missed arrivals recorded as censored latencies.
+    censored: u64,
+    /// `conn.dialed` at the last series probe.
+    dials_seen: u64,
 }
 
 impl Agg {
@@ -237,6 +303,9 @@ impl Agg {
             logical_read: 0,
             logical_write: 0,
             open_loop: None,
+            schedule: hist(),
+            censored: 0,
+            dials_seen: 0,
         }
     }
 
@@ -320,6 +389,9 @@ pub struct OpCompletion {
     /// Object key (or listed prefix) the operation worked on.
     pub key: String,
     pub data: OpScopeData,
+    /// Open-loop operations: time from the intended to the actual start (the `schedule`
+    /// stage, part of `latency_us`); `None` in closed-loop runs.
+    pub schedule_us: Option<u64>,
 }
 
 /// Dial outcome reported by the transport.
@@ -378,6 +450,9 @@ pub trait Exporter: Send + Sync {
 /// Trace log shards (each keeps `max_requests / TRACE_SHARDS` rows).
 const TRACE_SHARDS: usize = 16;
 
+/// One completed operation in this many is timed for the observer cost.
+pub const OBSERVER_SAMPLE_EVERY: u64 = 16;
+
 /// `Recorder::frozen_elapsed_us` while the measurement window is open.
 const WINDOW_OPEN: u64 = u64::MAX;
 
@@ -411,6 +486,10 @@ pub struct Recorder {
     exporter: OnceLock<Arc<dyn Exporter>>,
     /// Spreads requests issued outside any operation over the shards.
     unscoped_seq: AtomicU64,
+    /// Observer cost: nanoseconds spent recording sampled operations, and how many.
+    observer_ns: AtomicU64,
+    observer_samples: AtomicU64,
+    completions: AtomicU64,
 }
 
 impl Recorder {
@@ -447,6 +526,9 @@ impl Recorder {
             guard: OnceLock::new(),
             exporter: OnceLock::new(),
             unscoped_seq: AtomicU64::new(0),
+            observer_ns: AtomicU64::new(0),
+            observer_samples: AtomicU64::new(0),
+            completions: AtomicU64::new(0),
         })
     }
 
@@ -716,6 +798,23 @@ impl Recorder {
         self.agg().open_loop = Some(s);
     }
 
+    /// An open-loop arrival due at `intended` that never started (dropped behind schedule, or
+    /// still waiting when the window ended): its latency is unknown but at least
+    /// `lower_bound_us`. It is counted in the latency distribution as that censored value (so
+    /// the tail cannot hide a backlog: no coordinated omission) and in the second it was due.
+    pub fn record_missed_arrival(&self, intended: Instant, lower_bound_us: u64) {
+        if !self.is_measuring() {
+            return;
+        }
+        let window_start = self.window_start();
+        let idx = bucket_index(intended.saturating_duration_since(window_start).as_secs());
+        let mut a = self.agg();
+        a.censored += 1;
+        rec(&mut a.all_latency, lower_bound_us.max(1));
+        self.ensure_bucket(&mut a, idx, window_start);
+        a.buckets[idx].missed += 1;
+    }
+
     pub fn op_started(&self, op_id: u64) {
         self.op_started_at(op_id, Instant::now());
     }
@@ -729,8 +828,28 @@ impl Recorder {
             .insert(op_id, at);
     }
 
+    /// Measured observer cost per operation (µs): the recorder's bookkeeping of one completed
+    /// operation, timed on one operation in [`OBSERVER_SAMPLE_EVERY`].
+    pub fn observer_per_op_us(&self) -> Option<f64> {
+        let n = self.observer_samples.load(Ordering::Relaxed);
+        (n > 0).then(|| self.observer_ns.load(Ordering::Relaxed) as f64 / n as f64 / 1000.0)
+    }
+
     /// Record a completed logical operation (only if it started inside the window).
     pub fn complete_op(&self, measured: bool, c: OpCompletion) {
+        let n = self.completions.fetch_add(1, Ordering::Relaxed);
+        if n.is_multiple_of(OBSERVER_SAMPLE_EVERY) {
+            let t = Instant::now();
+            self.complete_op_inner(measured, c);
+            self.observer_ns
+                .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            self.observer_samples.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.complete_op_inner(measured, c);
+        }
+    }
+
+    fn complete_op_inner(&self, measured: bool, c: OpCompletion) {
         self.inflight_ops.fetch_sub(1, Ordering::Relaxed);
         if let Some(e) = self.exporter.get() {
             for r in &c.data.requests {
@@ -770,7 +889,14 @@ impl Recorder {
             .started
             .saturating_duration_since(window_start)
             .as_secs_f64();
-        let bd = breakdown_us(&c.data, c.latency_us);
+        let mut bd = breakdown_us(&c.data, c.latency_us);
+        if let Some(s) = c.schedule_us {
+            // Waiting for an open-loop slot is queueing (an in-flight cap), not client work:
+            // no request of the operation runs before it starts.
+            let moved = s.min(bd[4]);
+            bd[4] -= moved;
+            bd[0] += moved;
+        }
         let ok = c.error.is_none();
         let throttled = c.data.throttled;
         let bytes = c.logical_read + c.logical_write;
@@ -798,11 +924,11 @@ impl Recorder {
             *a.res.error_classes.entry(e.clone()).or_default() += 1;
         }
         rec(&mut a.all_latency, c.latency_us);
+        if let Some(s) = c.schedule_us {
+            rec(&mut a.schedule, s);
+        }
         {
-            let v = a
-                .verbs
-                .entry(c.verb.to_owned())
-                .or_insert_with(VerbAgg::new);
+            let v = a.verbs.entry(c.verb).or_insert_with(VerbAgg::new);
             rec(&mut v.latency, c.latency_us);
             v.count += 1;
             if !ok {
@@ -820,29 +946,8 @@ impl Recorder {
             v.retry_us += bd[3];
             v.client_us += bd[4];
         }
-        let idx = at_s.max(0.0) as usize;
-        if a.buckets.len() <= idx {
-            // A second is complete once every operation that started in it has finished: close
-            // the seconds before the oldest operation still running (its start, or this one's).
-            // (`live_ops` is never held while taking `agg`, so this nesting cannot deadlock.)
-            let oldest_live = self
-                .live_ops
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .values()
-                .min()
-                .copied();
-            let first_open = oldest_live
-                .map(|t| t.saturating_duration_since(window_start).as_secs_f64() as usize)
-                .unwrap_or(idx)
-                .min(idx);
-            for b in a.buckets.iter_mut().take(first_open) {
-                b.close();
-            }
-            while a.buckets.len() <= idx {
-                a.buckets.push(Bucket::new());
-            }
-        }
+        let idx = bucket_index(at_s.max(0.0) as u64);
+        self.ensure_bucket(&mut a, idx, window_start);
         let b = &mut a.buckets[idx];
         b.ops += 1;
         b.bytes += bytes;
@@ -855,6 +960,7 @@ impl Recorder {
         if let Some(h) = b.latency.as_mut() {
             rec(h, c.latency_us);
         }
+        b.heat[heat_index(c.latency_us)] += 1;
 
         // Keep the slowest operations with their full request timelines.
         let lat_ms = c.latency_us as f64 / 1000.0;
@@ -911,6 +1017,52 @@ impl Recorder {
             .collect();
         // Whole operations: kept with all their requests, or not at all.
         self.trace(c.op_id).push_whole_op(row, reqs);
+    }
+
+    /// Make interval `idx` exist. A new interval closes the earlier ones that are complete:
+    /// an interval is complete once every operation that started in it has finished (the
+    /// intervals before the oldest operation still running). `live_ops` is never held while
+    /// taking `agg`, so taking it here (under `agg`) cannot deadlock.
+    fn ensure_bucket(&self, a: &mut Agg, idx: usize, window_start: Instant) {
+        if a.buckets.len() > idx {
+            return;
+        }
+        let oldest_live = self
+            .live_ops
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .min()
+            .copied();
+        let first_open = oldest_live
+            .map(|t| bucket_index(t.saturating_duration_since(window_start).as_secs()))
+            .unwrap_or(idx)
+            .min(idx);
+        for b in a.buckets.iter_mut().take(first_open) {
+            b.close();
+        }
+        while a.buckets.len() <= idx {
+            a.buckets.push(Bucket::new());
+        }
+    }
+
+    /// The per-interval series probe (call it every few ms while measuring): requests in
+    /// flight and connections dialed land in the current interval.
+    pub fn sample_series(&self) {
+        if !self.window_open() {
+            return;
+        }
+        let window_start = self.window_start();
+        let idx = bucket_index(window_start.elapsed().as_secs());
+        let inflight = self.inflight_requests.load(Ordering::Relaxed);
+        let mut a = self.agg();
+        self.ensure_bucket(&mut a, idx, window_start);
+        let dialed = a.conn.dialed;
+        let new = dialed.saturating_sub(a.dials_seen);
+        a.dials_seen = dialed;
+        let b = &mut a.buckets[idx];
+        b.inflight_peak = b.inflight_peak.max(inflight);
+        b.dials += new;
     }
 
     /// Capture await-tree call stacks of operations running longer than `threshold_us`.
@@ -977,6 +1129,14 @@ impl Recorder {
             c.cpu_pct_peak = c.cpu_pct_peak.max(cpu_pct);
         }
         c.rss_mib = rss_mib;
+        drop(c);
+        if self.window_open() {
+            let window_start = self.window_start();
+            let idx = bucket_index(window_start.elapsed().as_secs());
+            let mut a = self.agg();
+            self.ensure_bucket(&mut a, idx, window_start);
+            a.buckets[idx].cpu_pct = Some(cpu_pct);
+        }
     }
 
     pub fn snapshot(&self) -> Snapshot {
@@ -990,7 +1150,7 @@ impl Recorder {
             .map(|(name, v)| {
                 let n = v.count.max(1) as f64;
                 VerbStats {
-                    verb: name.clone(),
+                    verb: (*name).to_owned(),
                     count: v.count,
                     errors: v.errors,
                     throttled: v.throttled,
@@ -1083,27 +1243,42 @@ impl Recorder {
                 / 1000.0,
         };
 
-        // The last bucket is usually partial; scale its rates by its covered fraction.
+        // The last interval is usually partial; scale its rates by its covered fraction.
         let nb = a.buckets.len();
+        let ms = |v: u64| v as f64 / 1000.0;
         let timeline = a
             .buckets
             .iter()
             .enumerate()
             .map(|(i, b)| {
+                let (t_s, len_s) = bucket_span(i);
                 let width = if i + 1 == nb {
-                    (elapsed - i as f64).clamp(0.05, 1.0)
+                    (elapsed - t_s).clamp(0.05, len_s)
                 } else {
-                    1.0
+                    len_s
                 };
-                let (p50, p99) = b.quantiles();
+                let q = b.quantiles();
                 TimelinePoint {
-                    t_s: i as f64,
+                    t_s,
                     ops_per_s: b.ops as f64 / width,
                     mib_per_s: mib(b.bytes) / width,
-                    p50_ms: p50 as f64 / 1000.0,
-                    p99_ms: p99 as f64 / 1000.0,
+                    p50_ms: ms(q[0]),
+                    p99_ms: ms(q[2]),
                     errors: b.errors,
                     throttled: b.throttled,
+                    missed_arrivals: b.missed,
+                    len_s,
+                    p90_ms: ms(q[1]),
+                    p999_ms: ms(q[3]),
+                    max_ms: ms(q[4]),
+                    inflight_peak: b.inflight_peak,
+                    new_connections: b.dials,
+                    cpu_cores: b.cpu_pct.map(|p| p / 100.0),
+                    latency_counts: if b.ops > 0 {
+                        b.heat.iter().map(|c| u64::from(*c)).collect()
+                    } else {
+                        Vec::new()
+                    },
                 }
             })
             .collect();
@@ -1143,11 +1318,18 @@ impl Recorder {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone(),
-            open_loop: a.open_loop.clone(),
+            open_loop: a.open_loop.clone().map(|mut o| {
+                o.censored_count = a.censored;
+                if !a.schedule.is_empty() {
+                    o.schedule = Some(quantiles(&a.schedule));
+                }
+                o
+            }),
             interrupted: false,
             effective_knobs: EffectiveKnobs::default(),
             timeline,
             slow_ops: a.slow.clone(),
+            self_obs: None,
         }
     }
 }
@@ -1292,6 +1474,7 @@ mod tests {
                 error: None,
                 key: String::new(),
                 data: OpScopeData::default(),
+                schedule_us: None,
             },
         );
         r.set_phase(Phase::Verify);

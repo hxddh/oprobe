@@ -233,6 +233,25 @@ pub fn apply_flags(
     if let Some(a) = &w.access {
         wl.access = crate::input::access(a)?;
     }
+    if let Some(a) = &w.arrivals {
+        wl.arrivals = a.parse()?;
+    }
+    if let Some(sh) = &w.shape {
+        wl.shape = Some(sh.parse()?);
+    }
+    if let Some(file) = &w.replay {
+        let mut r = crate::engine::replay::ReplaySpec::new(file.clone());
+        if let Some(sp) = w.speed {
+            r.speed = crate::input::positive("--speed", &sp.to_string())?;
+        }
+        for m in &w.map_prefix {
+            let (from, to) = crate::input::key_value("--map-prefix", m)?;
+            r.map_prefix.push((from, to));
+        }
+        wl.replay = Some(r);
+    } else if w.speed.is_some() || !w.map_prefix.is_empty() {
+        return Err(crate::input::invalid("--speed and --map-prefix need --replay FILE").into());
+    }
     if w.existing.is_some() || w.objects.is_some() || w.object_size.is_some() || w.persist_dataset {
         let mut ds: DatasetSpec = wl.effective_dataset();
         if let Some(e) = &w.existing {

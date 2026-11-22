@@ -183,6 +183,16 @@ pub struct WorkloadInput {
     pub no_verify: bool,
     /// Do not delete test data when the run ends
     pub keep_data: bool,
+    /// Open-loop arrival process: constant or poisson
+    pub arrivals: Option<String>,
+    /// Time-varying open-loop rate: ramp:FROM..TO/D, step:R1,R2,…/D, diurnal[:MIN..MAX/P]
+    pub shape: Option<String>,
+    /// Replay a traffic log (S3 server access log, CloudTrail S3 data events, oprobe run file)
+    pub replay: Option<PathBuf>,
+    /// Replay speed factor (2 = twice as fast as recorded)
+    pub speed: Option<f64>,
+    /// Rewrite replayed keys: FROM=TO prefix pairs, repeatable
+    pub map_prefix: Vec<String>,
 }
 
 /// Client configuration under test.

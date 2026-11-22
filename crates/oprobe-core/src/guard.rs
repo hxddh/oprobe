@@ -415,8 +415,8 @@ pub fn plan(profile: &Profile, run_prefix: &str, read_only: bool, budgets: &Budg
     };
     let window = w.warmup.get().as_secs_f64() + w.duration.get().as_secs_f64();
     let conc = k.concurrency.max(1) as f64;
-    let mut ops = match w.rate {
-        Some(rate) => rate * window,
+    let mut ops = match w.expected_arrivals(std::time::Duration::from_secs_f64(window)) {
+        Some(n) => n,
         None => conc * window / op_latency_s,
     };
     if let Some(m) = w.max_ops {
