@@ -14,4 +14,3 @@ pub mod workloads;
 
 pub use cleanup::CleanupSummary;
 pub use runner::{Cancel, Progress, ProgressFn, RunOptions, Session, SessionOptions};
-pub use stack::ClientStack;

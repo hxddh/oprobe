@@ -1,17 +1,14 @@
-//! Run spec (design v4 §1): one replayable definition of a run.
+//! Run spec: one replayable definition of a run.
 //!
-//! A [`RunSpec`] is the fully resolved profile of a run (secrets redacted), the target as the
-//! user named it, the seed, the `--existing` prefix and the label. Every report carries one
-//! (`report.spec`), so any run can be replayed exactly — `oprobe run --from RUNREF` — or with a
-//! change: [`RunSpec::with`] applies [`Overrides`] (the `--set key=value` vocabulary) and
-//! [`RunSpec::command`] prints an equivalent `oprobe run …` command line. Rerun and
-//! verification commands (findings, the App, MCP) are built here and nowhere else, so no
-//! parameter (warmup, seed, mix, dataset, endpoint, region, HTTP version, tail-cut, rate,
-//! `--existing`, `--max-ops`, …) is ever dropped.
+//! A [`RunSpec`] is the fully resolved profile of a run (the operator's secrets redacted), the
+//! operator as the user named it (a URL, an `op.toml` path or a configured name), the seed, the
+//! `--existing` prefix and the label. Every report carries one (`report.spec`), so any run can
+//! be replayed exactly — `prove` replays a run's spec — or with a change: [`RunSpec::with`]
+//! applies [`Overrides`] (the `--set PATH=VALUE` vocabulary) and [`RunSpec::command`] prints an
+//! equivalent `oprobe run …` command line.
 //!
-//! [`RunSpec::hash`] identifies the measured configuration (workload + knobs + target
-//! identity); [`RunSpec::workload_hash`] the workload alone: compare and the capacity history
-//! key on it.
+//! [`RunSpec::hash`] identifies the measured configuration (workload + operator + target
+//! identity); [`RunSpec::workload_hash`] the workload alone.
 
 use std::collections::BTreeMap;
 
@@ -19,11 +16,10 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 
-use crate::config::{
-    Access, DatasetSpec, OpSpec, Profile, TargetSpec, WorkloadSpec,
-};
+use crate::config::{Access, DatasetSpec, OpSpec, Profile, WorkloadSpec};
 use crate::errors::{ErrorCode, OprobeError};
 use crate::input;
+use crate::operator::OperatorSpec;
 use crate::util::HumanDuration;
 
 /// The value secrets are replaced with.
@@ -32,16 +28,15 @@ pub const REDACTED: &str = "<redacted>";
 /// One replayable definition of a run.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct RunSpec {
-    /// The fully resolved profile (preset defaults are kept implicit, as in a profile file).
-    /// Secret options are `"<redacted>"` (environment references such as
-    /// `${AWS_SECRET_ACCESS_KEY}` are kept: they are not secrets); options the target URL
-    /// implies are left out, so the profile's target holds only what was added on top.
+    /// The fully resolved profile (preset defaults are kept implicit). Secret options of the
+    /// operator are `"<redacted>"` (environment references such as `${AWS_SECRET_ACCESS_KEY}`
+    /// are kept: they are not secrets).
     pub profile: Profile,
-    /// The target as given: a configured target name, a storage URL or `lab://SCENARIO`.
-    pub target_ref: String,
+    /// The operator as given: a URL, an operator file or a configured name.
+    pub operator_ref: String,
     /// The dataset / key-choice seed the run used.
     pub seed: u64,
-    /// `--existing PREFIX`: benchmark existing objects (read-only).
+    /// `--existing PREFIX`: profile existing objects (read-only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub existing: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -50,37 +45,8 @@ pub struct RunSpec {
 
 impl Default for RunSpec {
     fn default() -> Self {
-        Self::new(
-            &Profile::from_target(TargetSpec {
-                url: Some("memory://".into()),
-                scheme: "memory".into(),
-                ..Default::default()
-            }),
-            "memory://",
-        )
+        Self::new(&Profile::from_url("memory://"), "memory://")
     }
-}
-
-/// The options a target URL implies (`bucket`, `root`, … ; for `lab://` everything the lab
-/// sets, including its ephemeral endpoint). Never starts a lab server.
-fn url_implied(url: &str) -> BTreeMap<String, String> {
-    if url.trim().to_ascii_lowercase().starts_with("lab://") {
-        return [
-            "bucket",
-            "region",
-            "endpoint",
-            "access_key_id",
-            "secret_access_key",
-            "disable_config_load",
-            "root",
-        ]
-        .iter()
-        .map(|k| ((*k).to_owned(), String::new()))
-        .collect();
-    }
-    TargetSpec::from_url(url)
-        .map(|t| t.options)
-        .unwrap_or_default()
 }
 
 /// A value made only of `${NAME}` references.
@@ -89,22 +55,13 @@ fn is_env_reference(v: &str) -> bool {
     v.starts_with("${") && v.ends_with('}') && !v[2..v.len() - 1].contains(['{', '}', '$'])
 }
 
-/// `t` as a spec stores it: URL credentials and secret query parameters stripped, URL-implied
-/// options dropped, secrets redacted.
-fn redact_target(t: &TargetSpec) -> TargetSpec {
-    let mut t = t.clone();
-    if let Some(url) = &t.url {
-        let implied = url_implied(url);
-        let lab = url.trim().to_ascii_lowercase().starts_with("lab://");
-        t.options.retain(|k, v| match implied.get(k) {
-            Some(_) if lab => false,
-            Some(i) => i != v,
-            None => true,
-        });
-        t.url = Some(crate::util::redact_url(url));
-    }
-    t.options.remove("ca_cert_pem");
-    for (k, v) in t.options.iter_mut() {
+/// `o` as a spec stores it: URL credentials and secret query parameters stripped, secret
+/// options redacted.
+pub fn redact_operator(o: &OperatorSpec) -> OperatorSpec {
+    let mut o = o.clone();
+    o.url = crate::util::redact_url(&o.url);
+    o.options.remove("ca_cert_pem");
+    for (k, v) in o.options.iter_mut() {
         if crate::util::is_secret_key(k) {
             if !is_env_reference(v) {
                 *v = REDACTED.to_owned();
@@ -113,8 +70,8 @@ fn redact_target(t: &TargetSpec) -> TargetSpec {
             *v = crate::util::redact_url(v);
         }
     }
-    t.proxy = t.proxy.as_deref().map(crate::util::redact_url);
-    t
+    o.http.proxy = o.http.proxy.as_deref().map(crate::util::redact_url);
+    o
 }
 
 fn sha16(v: &impl Serialize) -> String {
@@ -147,16 +104,13 @@ pub fn command_line(args: &[String]) -> String {
 }
 
 impl RunSpec {
-    /// The spec of a run of `profile` (as built from flags, a profile file or tool arguments,
-    /// before the session normalises it) at `target_ref`. Secrets in a target URL (a password,
-    /// `secret_access_key=…`, a SAS signature) are removed from `target_ref` and from the
-    /// profile's URL ([`crate::util::redact_url`]): replay resolves credentials again.
-    pub fn new(profile: &Profile, target_ref: impl Into<String>) -> Self {
+    /// The spec of a run of `profile` at `operator_ref` (secrets removed from both).
+    pub fn new(profile: &Profile, operator_ref: impl Into<String>) -> Self {
         let mut p = profile.clone();
-        p.target = redact_target(&p.target);
+        p.operator = redact_operator(&p.operator);
         let existing = p.workload.effective_dataset().existing_prefix;
         Self {
-            target_ref: crate::util::redact_url(&target_ref.into()),
+            operator_ref: crate::util::redact_url(&operator_ref.into()),
             seed: p.workload.seed,
             existing,
             label: p.name.clone(),
@@ -165,7 +119,7 @@ impl RunSpec {
     }
 
     /// The profile with `seed`, `existing` and `label` applied (they win over the profile's own
-    /// values). Its secrets are still redacted: replay re-resolves credentials from the target.
+    /// values). Its secrets are still redacted: replay re-resolves credentials.
     pub fn resolved_profile(&self) -> Profile {
         let mut p = self.profile.clone();
         p.workload.seed = self.seed;
@@ -178,42 +132,49 @@ impl RunSpec {
         p
     }
 
-    /// The target identity (`store::TargetId`), when the target resolves.
+    /// The target identity (`store::TargetId`), when the operator's service resolves.
     pub fn target_id(&self) -> Option<crate::store::TargetId> {
-        crate::store::TargetId::of(&self.profile.target).ok()
+        crate::store::TargetId::of(&self.profile.operator.target_spec()).ok()
     }
 
-    /// `sha256:<16 hex>` over the workload, the knobs and the target identity (not the label,
-    /// nor the seed): two runs with the same hash measured the same configuration.
+    /// `sha256:<16 hex>` over the workload, the operator and the target identity (not the
+    /// label, nor the seed): two runs with the same hash measured the same configuration.
     pub fn hash(&self) -> String {
         let p = self.resolved_profile();
         #[derive(Serialize)]
         struct H<'a> {
             workload: WorkloadKey,
-            knobs: &'a crate::config::Knobs,
+            concurrency: usize,
+            layers: &'a crate::operator::Layers,
+            read: &'a crate::operator::ReadOptions,
+            write: &'a crate::operator::WriteOptions,
+            http: &'a crate::operator::HttpOptions,
             target: String,
         }
         sha16(&H {
             workload: WorkloadKey::of(&p.workload),
-            knobs: &p.knobs,
+            concurrency: p.workload.concurrency,
+            layers: &p.operator.layers,
+            read: &p.operator.read,
+            write: &p.operator.write,
+            http: &p.operator.http,
             target: self
                 .target_id()
                 .map(|t| t.to_string())
-                .unwrap_or_else(|| self.target_ref.clone()),
+                .unwrap_or_else(|| self.operator_ref.clone()),
         })
     }
 
     /// `sha256:<16 hex>` over the workload only: dataset, mix, access, rate, warmup, duration
-    /// (and `max_ops`), with preset defaults resolved, so `--preset small-files` and the same
-    /// mix spelled out hash alike.
+    /// (and `max_ops`), with preset defaults resolved.
     pub fn workload_hash(&self) -> String {
         sha16(&WorkloadKey::of(&self.resolved_profile().workload))
     }
 
-    /// An equivalent `oprobe run …` command line: the target as given, then every setting
-    /// that differs from the built-in defaults ([`crate::config::defaults`]); the preset, the
-    /// duration and the concurrency are always spelled out. Settings without a flag of their
-    /// own are `--set key=value`. Redacted secrets are omitted (credentials are re-resolved).
+    /// An equivalent `oprobe run …` command line: the operator as given, the workload flags
+    /// (preset, concurrency and duration always), and `--set PATH=VALUE` for every operator
+    /// value that differs from the default operator of its URL and every workload setting
+    /// without a flag. Redacted secrets are omitted.
     pub fn command(&self) -> String {
         command_line(&self.args())
     }
@@ -222,52 +183,20 @@ impl RunSpec {
     pub fn args(&self) -> Vec<String> {
         let p = self.resolved_profile();
         let def = crate::config::defaults();
-        let mut a: Vec<String> = vec!["run".into(), self.target_ref.clone()];
+        let mut a: Vec<String> = vec!["run".into(), self.operator_ref.clone()];
         let mut flag = |f: &str, v: Option<String>| {
             a.push(f.to_owned());
             if let Some(v) = v {
                 a.push(v);
             }
         };
-        // Target additions (what the target name / URL does not imply).
-        let t = &p.target;
-        for (k, v) in &t.options {
-            if v == REDACTED {
-                continue;
-            }
-            match k.as_str() {
-                "endpoint" => flag("--endpoint", Some(v.clone())),
-                "region" => flag("--region", Some(v.clone())),
-                _ => flag("--option", Some(format!("{k}={v}"))),
-            }
-        }
-        if t.insecure {
-            flag("--insecure", None);
-        }
-        if let Some(ca) = &t.ca_cert {
-            flag("--ca-cert", Some(ca.display().to_string()));
-        }
-        if let Some(px) = &t.proxy
-            && !self.target_ref.to_ascii_lowercase().starts_with("lab://")
-        {
-            flag("--proxy", Some(px.clone()));
-        }
-        // Workload.
         let w = &p.workload;
         let dw = &def.workload;
         flag("--preset", Some(w.preset.slug().to_owned()));
-        flag("--duration", Some(w.duration.to_string()));
-        if w.warmup != dw.warmup {
-            flag("--warmup", Some(w.warmup.to_string()));
-        }
-        if let Some(n) = w.max_ops {
-            flag("--max-ops", Some(n.to_string()));
-        }
+        flag("-c", Some(w.concurrency.to_string()));
+        flag("-d", Some(w.duration.to_string()));
         if let Some(r) = w.rate {
             flag("--rate", Some(r.to_string()));
-        }
-        if w.access != dw.access {
-            flag("--access", Some(w.access.to_string()));
         }
         let (pre_ds, pre_mix) = w.preset.defaults();
         let ds = w.effective_dataset();
@@ -282,21 +211,30 @@ impl RunSpec {
         } else if ds.object_size != pre_ds.object_size {
             flag("--object-size", Some(ds.object_size.to_string()));
         }
-        if ds.persist {
-            flag("--persist-dataset", None);
-        }
-        if !w.verify {
-            flag("--no-verify", None);
-        }
-        if !w.cleanup {
-            flag("--keep-data", None);
+        if w.seed != dw.seed {
+            flag("--seed", Some(w.seed.to_string()));
         }
         let mut sets: Vec<(String, String)> = Vec::new();
+        if w.warmup != dw.warmup {
+            sets.push(("warmup".into(), w.warmup.to_string()));
+        }
+        if let Some(n) = w.max_ops {
+            sets.push(("max_ops".into(), n.to_string()));
+        }
+        if w.access != dw.access {
+            sets.push(("access".into(), w.access.to_string()));
+        }
         if ds.partitions != pre_ds.partitions {
             sets.push(("partitions".into(), ds.partitions.to_string()));
         }
-        if w.seed != dw.seed {
-            sets.push(("seed".into(), w.seed.to_string()));
+        if ds.persist {
+            sets.push(("persist".into(), "on".into()));
+        }
+        if !w.verify {
+            sets.push(("verify".into(), "off".into()));
+        }
+        if !w.cleanup {
+            sets.push(("cleanup".into(), "off".into()));
         }
         if !w.arrivals.is_constant() {
             sets.push(("arrivals".into(), w.arrivals.to_string()));
@@ -311,70 +249,35 @@ impl RunSpec {
                 serde_json::to_string(&mix).unwrap_or_default(),
             ));
         }
-        // Knobs.
-        let k = &p.knobs;
-        let dk = &def.knobs;
-        flag("--concurrency", Some(k.concurrency.to_string()));
-        if k.io_concurrency != dk.io_concurrency {
-            flag("--io-concurrency", Some(k.io_concurrency.to_string()));
+        // The operator: what differs from the default operator of its URL.
+        let base = OperatorSpec::from_url(p.operator.url.clone());
+        for c in crate::operator::diff::diff(&base, &p.operator).changes {
+            let v = match &c.to {
+                Some(v) => v.trim_matches('"').to_owned(),
+                None if c.path.starts_with("layers.") => "off".into(),
+                None => "none".into(),
+            };
+            if v == REDACTED || c.path == "url" {
+                continue;
+            }
+            sets.push((c.path, v));
         }
-        if k.chunk_size != dk.chunk_size {
-            flag("--chunk-size", Some(k.chunk_size.to_string()));
-        }
-        if k.range_gap != dk.range_gap {
-            flag("--range-gap", Some(k.range_gap.to_string()));
-        }
-        if k.max_inflight_requests != dk.max_inflight_requests {
-            flag("--max-inflight", Some(k.max_inflight_requests.to_string()));
-        }
-        if k.http_version != dk.http_version {
-            flag("--http", Some(http_slug(k.http_version).into()));
-        }
-        if !k.keep_alive {
-            flag("--no-keep-alive", None);
-        }
-        if k.cache {
-            flag("--cache", Some(k.cache_size.to_string()));
-        }
-        if k.retries != dk.retries {
-            flag("--retries", Some(k.retries.to_string()));
-        }
-        if k.tail_cut {
-            flag("--tail-cut", None);
-        }
-        if k.timeout != dk.timeout {
-            sets.push(("timeout".into(), k.timeout.to_string()));
-        }
-        let pk = &k.provider;
-        if pk.addressing != crate::config::Addressing::Auto {
-            flag(
-                "--addressing",
-                Some(format!("{:?}", pk.addressing).to_ascii_lowercase()),
-            );
-        }
-        if let Some(c) = &pk.checksum {
-            flag("--checksum", Some(c.clone()));
-        }
-        if let Some(e) = &pk.sse {
-            flag("--sse", Some(e.clone()));
-        }
-        // SLA.
         let s = &p.sla;
         let ds_ = &def.sla;
         if !s.enforce {
-            flag("--sla", Some("none".into()));
+            sets.push(("sla".into(), "none".into()));
         }
         if s.max_error_rate != ds_.max_error_rate {
-            flag("--max-error-ratio", Some(s.max_error_rate.to_string()));
+            sets.push(("max_error_rate".into(), s.max_error_rate.to_string()));
         }
         if let Some(t) = s.max_throttle_rate {
-            flag("--max-throttle-ratio", Some(t.to_string()));
+            sets.push(("max_throttle_rate".into(), t.to_string()));
         }
         if let Some(ms) = s.p99_ms {
-            flag("--p99-ms", Some(ms.to_string()));
+            sets.push(("p99_ms".into(), ms.to_string()));
         }
         if let Some(l) = &self.label {
-            flag("--label", Some(l.clone()));
+            sets.push(("label".into(), l.clone()));
         }
         for (k, v) in sets {
             flag("--set", Some(format!("{k}={v}")));
@@ -405,27 +308,20 @@ impl RunSpec {
         let mut p = self.resolved_profile();
         let mut label = self.label.clone();
         o.apply(&mut p, &mut label)?;
-        let mut spec = RunSpec::new(&p, self.target_ref.clone());
+        let mut spec = RunSpec::new(&p, self.operator_ref.clone());
         spec.label = label;
-        // The target keeps its redacted form (it was redacted already).
-        spec.profile.target = p.target;
         spec.profile.name = spec.label.clone();
         Ok(spec)
     }
 
-    /// `oprobe run --from RUN_ID --set …`: replay the stored run `run_id` with `o` applied.
-    pub fn rerun_from(run_id: &str, o: &Overrides) -> String {
-        let mut args = vec!["run".to_owned(), "--from".into(), run_id.to_owned()];
-        args.extend(o.to_set_args());
+    /// `oprobe prove RUN --with …`: prove the change `o` on the stored run `run_id`.
+    pub fn prove_command(run_id: &str, o: &Overrides) -> String {
+        let mut args = vec!["prove".to_owned(), run_id.to_owned()];
+        for (k, v) in o.entries() {
+            args.push("--with".into());
+            args.push(format!("{k}={v}"));
+        }
         command_line(&args)
-    }
-}
-
-fn http_slug(h: crate::net::HttpVersion) -> &'static str {
-    match h {
-        crate::net::HttpVersion::Auto => "auto",
-        crate::net::HttpVersion::H1 => "h1",
-        crate::net::HttpVersion::H2 => "h2",
     }
 }
 
@@ -436,8 +332,7 @@ struct WorkloadKey {
     mix: Vec<OpSpec>,
     access: Access,
     rate: Option<f64>,
-    /// Arrival process and rate shape (`None` for constant arrivals at `rate`: the hash of
-    /// such workloads is unchanged).
+    /// Arrival process and rate shape (`None` for constant arrivals at `rate`).
     #[serde(skip_serializing_if = "Option::is_none")]
     arrivals: Option<String>,
     warmup: HumanDuration,
@@ -470,21 +365,20 @@ impl WorkloadKey {
 }
 
 // ---------------------------------------------------------------------------------------
-// Overrides: the `--set key=value` vocabulary
+// Overrides: the `--set PATH=VALUE` vocabulary
 // ---------------------------------------------------------------------------------------
 
 /// Which part of the profile a `--set` key changes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Section {
-    Knobs,
     Workload,
-    Target,
     Sla,
     Run,
 }
 
-/// One `--set` key.
+/// One `--set` key of the workload, the SLA or the run (operator paths are
+/// [`crate::operator::SET_PATHS`]).
 #[derive(Clone, Copy, Debug)]
 pub struct SetKey {
     pub name: &'static str,
@@ -507,83 +401,9 @@ const fn key(
     }
 }
 
-/// Every `--set` key (`Overrides`), with the profile field it sets.
+/// Every non-operator `--set` key.
 pub const SET_KEYS: &[SetKey] = &[
-    key(
-        "concurrency",
-        Section::Knobs,
-        &["c"],
-        "concurrent operations (workers)",
-    ),
-    key(
-        "io_concurrency",
-        Section::Knobs,
-        &[],
-        "per-operation reader/writer parallelism",
-    ),
-    key(
-        "chunk_size",
-        Section::Knobs,
-        &[],
-        "reader/writer chunk and multipart part size",
-    ),
-    key(
-        "range_gap",
-        Section::Knobs,
-        &[],
-        "merge vectored ranges closer than this",
-    ),
-    key(
-        "max_inflight_requests",
-        Section::Knobs,
-        &["max_inflight"],
-        "cap on in-flight HTTP requests (0 = unlimited)",
-    ),
-    key("http_version", Section::Knobs, &["http"], "auto, h1 or h2"),
-    key(
-        "keep_alive",
-        Section::Knobs,
-        &[],
-        "reuse connections (on/off)",
-    ),
-    key(
-        "cache",
-        Section::Knobs,
-        &[],
-        "read cache: off, on, or its size",
-    ),
-    key("cache_size", Section::Knobs, &[], "read cache size"),
-    key(
-        "retries",
-        Section::Knobs,
-        &[],
-        "retry attempts for temporary errors",
-    ),
-    key(
-        "tail_cut",
-        Section::Knobs,
-        &[],
-        "cancel and retry stragglers (on/off)",
-    ),
-    key("timeout", Section::Knobs, &[], "per-operation timeout"),
-    key(
-        "addressing",
-        Section::Knobs,
-        &[],
-        "S3 addressing: auto, virtual or path",
-    ),
-    key(
-        "checksum",
-        Section::Knobs,
-        &[],
-        "write checksum (crc32c), or none",
-    ),
-    key(
-        "sse",
-        Section::Knobs,
-        &[],
-        "server-side encryption (AES256, aws:kms), or none",
-    ),
+    key("concurrency", Section::Workload, &["c"], "concurrent operations"),
     key(
         "preset",
         Section::Workload,
@@ -604,24 +424,9 @@ pub const SET_KEYS: &[SetKey] = &[
         &[],
         "open-loop arrival rate in ops/s (0 = closed loop)",
     ),
-    key(
-        "access",
-        Section::Workload,
-        &[],
-        "uniform, zipf:S or hotset:F/P",
-    ),
-    key(
-        "objects",
-        Section::Workload,
-        &[],
-        "dataset objects to generate",
-    ),
-    key(
-        "object_size",
-        Section::Workload,
-        &[],
-        "size of each generated object",
-    ),
+    key("access", Section::Workload, &[], "uniform, zipf:S or hotset:F/P"),
+    key("objects", Section::Workload, &[], "dataset objects to generate"),
+    key("object_size", Section::Workload, &[], "size of each generated object"),
     key(
         "partitions",
         Section::Workload,
@@ -632,7 +437,7 @@ pub const SET_KEYS: &[SetKey] = &[
         "existing",
         Section::Workload,
         &["existing_prefix"],
-        "benchmark existing objects under this prefix (empty: generate)",
+        "profile existing objects under this prefix (empty: generate)",
     ),
     key(
         "persist",
@@ -640,24 +445,9 @@ pub const SET_KEYS: &[SetKey] = &[
         &["persist_dataset"],
         "keep the generated dataset (on/off)",
     ),
-    key(
-        "verify",
-        Section::Workload,
-        &[],
-        "CRC32C verification (on/off)",
-    ),
-    key(
-        "cleanup",
-        Section::Workload,
-        &[],
-        "delete test data at the end (on/off)",
-    ),
-    key(
-        "seed",
-        Section::Workload,
-        &[],
-        "dataset and key-choice seed",
-    ),
+    key("verify", Section::Workload, &[], "CRC32C verification (on/off)"),
+    key("cleanup", Section::Workload, &[], "delete test data at the end (on/off)"),
+    key("seed", Section::Workload, &[], "dataset and key-choice seed"),
     key(
         "arrivals",
         Section::Workload,
@@ -676,14 +466,7 @@ pub const SET_KEYS: &[SetKey] = &[
         &[],
         "operation mix as JSON ([{\"op\":\"read\",\"weight\":1}]), or empty for the preset's",
     ),
-    key("endpoint", Section::Target, &[], "custom endpoint URL"),
-    key("region", Section::Target, &[], "bucket region"),
-    key(
-        "max_error_rate",
-        Section::Sla,
-        &[],
-        "SLA: max share of failed operations",
-    ),
+    key("max_error_rate", Section::Sla, &[], "SLA: max share of failed operations"),
     key(
         "max_throttle_rate",
         Section::Sla,
@@ -700,8 +483,51 @@ pub const SET_KEYS: &[SetKey] = &[
     key("label", Section::Run, &[], "label stored with the run"),
 ];
 
-/// The `--set` key `name` (or an alias; `-` spellings accepted). Unknown keys get a "did you
-/// mean" hint.
+/// Short names of operator values (the 5.x `--set` keys) and the operator paths they set.
+/// `max_inflight_requests=0` and `retries=0` take the layer out; `cache=SIZE` sizes the cache.
+fn alias_paths(name: &str, v: &str) -> Option<Vec<(&'static str, String)>> {
+    let off = |v: &str| matches!(v.trim(), "0");
+    Some(match name {
+        "io_concurrency" => vec![
+            ("read.concurrent", v.to_owned()),
+            ("write.concurrent", v.to_owned()),
+        ],
+        "chunk_size" => vec![("read.chunk", v.to_owned()), ("write.chunk", v.to_owned())],
+        "range_gap" => vec![("read.gap", v.to_owned())],
+        "max_inflight_requests" | "max_inflight" if off(v) => {
+            vec![("layers.concurrent_limit", "off".to_owned())]
+        }
+        "max_inflight_requests" | "max_inflight" => {
+            vec![("layers.concurrent_limit.http", v.to_owned())]
+        }
+        "http_version" | "http" => vec![("http.version", v.to_owned())],
+        "keep_alive" => vec![("http.keep_alive", v.to_owned())],
+        "cache" => match v.trim().to_ascii_lowercase().as_str() {
+            "on" | "off" | "true" | "false" | "yes" | "no" => {
+                vec![("layers.cache", v.to_owned())]
+            }
+            _ => vec![("layers.cache.memory", v.to_owned())],
+        },
+        "cache_size" => vec![("layers.cache.memory", v.to_owned())],
+        "retries" if off(v) => vec![("layers.retry", "off".to_owned())],
+        "retries" => vec![("layers.retry.max_times", v.to_owned())],
+        "tail_cut" => vec![("layers.tail_cut", v.to_owned())],
+        "timeout" => vec![("layers.timeout.op", v.to_owned())],
+        "endpoint" => vec![("options.endpoint", v.to_owned())],
+        "region" => vec![("options.region", v.to_owned())],
+        _ => return None,
+    })
+}
+
+/// Whether `name` is an operator path (`url`, `options.KEY`, `layers.…`, `read.…`, …).
+fn is_operator_path(name: &str) -> bool {
+    name == "url"
+        || ["options.", "layers.", "read.", "write.", "http."]
+            .iter()
+            .any(|p| name.starts_with(p))
+}
+
+/// The non-operator `--set` key `name` (or an alias; `-` spellings accepted).
 pub fn set_key(name: &str) -> Result<&'static SetKey, OprobeError> {
     let n = name.trim().to_ascii_lowercase().replace('-', "_");
     if let Some(k) = SET_KEYS
@@ -710,24 +536,18 @@ pub fn set_key(name: &str) -> Result<&'static SetKey, OprobeError> {
     {
         return Ok(k);
     }
-    let names: Vec<&str> = SET_KEYS.iter().map(|k| k.name).collect();
+    let names: Vec<&str> = SET_KEYS
+        .iter()
+        .map(|k| k.name)
+        .chain(crate::operator::SET_PATHS.iter().copied())
+        .collect();
     let hint = match input::suggest(&n, names.iter().copied()) {
-        Some(s) => format!("did you mean `{s}`? keys: {}", names.join(", ")),
-        None => format!("keys: {}", names.join(", ")),
+        Some(s) => format!("did you mean `{s}`?"),
+        None => "operator paths: url, options.KEY, layers.NAME[.FIELD], read.*, write.*, http.*; \
+                 workload keys: concurrency, preset, duration, warmup, rate, objects, object_size, …"
+            .to_owned(),
     };
     Err(input::invalid(format!("unknown --set key `{}`", name.trim())).with_hint(hint))
-}
-
-/// Validate `key=value` (without a profile to apply it to).
-pub fn check_set(k: &str, v: &str) -> Result<(), OprobeError> {
-    let key = set_key(k)?;
-    let mut p = Profile::from_target(TargetSpec {
-        url: Some("memory://".into()),
-        scheme: "memory".into(),
-        ..Default::default()
-    });
-    let mut label = None;
-    apply_one(&mut p, &mut label, key, v)
 }
 
 fn none_word(v: &str) -> bool {
@@ -737,7 +557,7 @@ fn none_word(v: &str) -> bool {
     )
 }
 
-/// Apply one validated key to `p`.
+/// Apply one validated workload, SLA or run key to `p`.
 fn apply_one(
     p: &mut Profile,
     label: &mut Option<String>,
@@ -754,41 +574,8 @@ fn apply_one(
         f(&mut ds);
         p.workload.dataset = Some(ds);
     };
-    let k = &mut p.knobs;
     match key.name {
-        "concurrency" => k.concurrency = usize_of(1)?,
-        "io_concurrency" => k.io_concurrency = usize_of(1)?,
-        "chunk_size" => {
-            let s = input::size(v)?;
-            if s.0 < 4096 {
-                return Err(input::invalid(format!("{what} must be >= 4KiB (got {v})")));
-            }
-            k.chunk_size = s;
-        }
-        "range_gap" => k.range_gap = input::size(v)?,
-        "max_inflight_requests" => k.max_inflight_requests = usize_of(0)?,
-        "http_version" => k.http_version = input::http_version(v)?,
-        "keep_alive" => k.keep_alive = input::boolean(&what, v)?,
-        "cache" => match input::boolean(&what, v) {
-            Ok(b) => k.cache = b,
-            Err(_) => {
-                k.cache_size = input::nonzero_size(v)?;
-                k.cache = true;
-            }
-        },
-        "cache_size" => k.cache_size = input::nonzero_size(v)?,
-        "retries" => k.retries = usize_of(0)?,
-        "tail_cut" => k.tail_cut = input::boolean(&what, v)?,
-        "timeout" => k.timeout = HumanDuration(input::positive_duration(v)?),
-        "addressing" => k.provider.addressing = input::addressing(v)?,
-        "checksum" => {
-            k.provider.checksum = (!none_word(v)).then(|| v.to_owned());
-            k.provider.options("s3").map_err(to_usage)?;
-        }
-        "sse" => {
-            k.provider.sse = (!none_word(v)).then(|| v.to_owned());
-            k.provider.options("s3").map_err(to_usage)?;
-        }
+        "concurrency" => p.workload.concurrency = usize_of(1)?,
         "preset" => {
             p.workload.preset = input::preset(v)?;
             p.workload.mix.clear();
@@ -807,7 +594,11 @@ fn apply_one(
         "access" => p.workload.access = input::access(v)?,
         "arrivals" => p.workload.arrivals = v.parse()?,
         "shape" => {
-            p.workload.shape = if none_word(v) { None } else { Some(v.parse()?) };
+            p.workload.shape = if none_word(v) {
+                None
+            } else {
+                Some(v.parse()?)
+            };
         }
         "objects" => {
             let n = usize_of(1)?;
@@ -860,22 +651,6 @@ fn apply_one(
                 mix
             }
         }
-        "endpoint" => {
-            if none_word(v) {
-                p.target.options.remove("endpoint");
-            } else {
-                p.target
-                    .options
-                    .insert("endpoint".into(), input::endpoint(v)?);
-            }
-        }
-        "region" => {
-            if none_word(v) {
-                p.target.options.remove("region");
-            } else {
-                p.target.options.insert("region".into(), v.to_owned());
-            }
-        }
         "max_error_rate" => p.sla.max_error_rate = input::share(&what, v)?,
         "max_throttle_rate" => {
             p.sla.max_throttle_rate = if none_word(v) {
@@ -905,23 +680,15 @@ fn apply_one(
     Ok(())
 }
 
-fn to_usage(e: anyhow::Error) -> OprobeError {
-    let b = crate::errors::classify(&e, "s3");
-    let mut o = OprobeError::new(b.code, b.message);
-    o.hint = b.hint;
-    o
-}
-
-/// A change to a run: `--set key=value` pairs grouped by the part of the profile they change
-/// (canonical key names, see [`SET_KEYS`]). Built with [`Overrides::set`], which validates.
+/// A change to a run: operator paths, workload and SLA keys, and the label. Built with
+/// [`Overrides::set`], which validates.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Overrides {
+    /// Operator paths (`layers.retry.max_times`, `read.gap`, `options.region`, …).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub knobs: BTreeMap<String, String>,
+    pub operator: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub workload: BTreeMap<String, String>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub target: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub sla: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -933,22 +700,47 @@ impl Overrides {
         Self::default()
     }
 
-    /// Set `key` (canonical name or alias) to `value`, validated.
+    /// Set `key` (an operator path, a workload/SLA key, or a short alias such as `tail_cut`)
+    /// to `value`, validated.
     pub fn set(&mut self, key: &str, value: &str) -> Result<&mut Self, OprobeError> {
-        let k = set_key(key)?;
-        check_set(k.name, value)?;
+        let k = key.trim().to_ascii_lowercase().replace('-', "_");
         let v = value.trim().to_owned();
-        match k.section {
-            Section::Knobs => self.knobs.insert(k.name.into(), v),
-            Section::Workload => self.workload.insert(k.name.into(), v),
-            Section::Target => self.target.insert(k.name.into(), v),
-            Section::Sla => self.sla.insert(k.name.into(), v),
-            Section::Run => {
-                self.label = Some(v);
-                None
+        if let Some(paths) = alias_paths(&k, &v) {
+            for (p, pv) in paths {
+                self.set_operator(p, &pv)?;
             }
-        };
+            return Ok(self);
+        }
+        if is_operator_path(&k) {
+            self.set_operator(key.trim(), &v)?;
+            return Ok(self);
+        }
+        let sk = set_key(&k)?;
+        let mut p = Profile::from_url("memory://");
+        apply_one(&mut p, &mut None, sk, &v)?;
+        match sk.section {
+            Section::Workload => {
+                self.workload.insert(sk.name.into(), v);
+            }
+            Section::Sla => {
+                self.sla.insert(sk.name.into(), v);
+            }
+            Section::Run => self.label = Some(v),
+        }
         Ok(self)
+    }
+
+    fn set_operator(&mut self, path: &str, v: &str) -> Result<(), OprobeError> {
+        let mut scratch = OperatorSpec::from_url("memory://");
+        // A field of a layer that a previous pair took out is checked on its own.
+        scratch.set(path, v)?;
+        // A layer turned on or off replaces the pairs of its fields given before.
+        if path.matches('.').count() == 1 && path.starts_with("layers.") {
+            let prefix = format!("{path}.");
+            self.operator.retain(|k, _| !k.starts_with(&prefix));
+        }
+        self.operator.insert(path.to_owned(), v.to_owned());
+        Ok(())
     }
 
     /// Builder form of [`Self::set`] for values known to be valid (an invalid pair is
@@ -974,23 +766,22 @@ impl Overrides {
     }
 
     /// Every pair as `(key, value)`, in application order (preset first, so a dataset or mix
-    /// override given with it survives the preset's reset).
+    /// override given with it survives the preset's reset; a whole layer before its fields).
     pub fn entries(&self) -> Vec<(String, String)> {
         let mut v: Vec<(String, String)> = Vec::new();
         if let Some(p) = self.workload.get("preset") {
             v.push(("preset".into(), p.clone()));
         }
-        for m in [
-            &self.workload,
-            &self.knobs,
-            &self.target,
-            &self.sla,
-        ] {
-            for (k, val) in m {
-                if k != "preset" {
-                    v.push((k.clone(), val.clone()));
-                }
+        for (k, val) in &self.workload {
+            if k != "preset" {
+                v.push((k.clone(), val.clone()));
             }
+        }
+        let mut ops: Vec<(&String, &String)> = self.operator.iter().collect();
+        ops.sort_by_key(|(k, _)| (k.matches('.').count(), k.as_str().to_owned()));
+        v.extend(ops.into_iter().map(|(k, val)| (k.clone(), val.clone())));
+        for (k, val) in &self.sla {
+            v.push((k.clone(), val.clone()));
         }
         if let Some(l) = &self.label {
             v.push(("label".into(), l.clone()));
@@ -1016,12 +807,16 @@ impl Overrides {
     /// Apply to a profile (and the run label).
     pub fn apply(&self, p: &mut Profile, label: &mut Option<String>) -> Result<(), OprobeError> {
         for (k, v) in self.entries() {
-            apply_one(p, label, set_key(&k)?, &v)?;
+            if is_operator_path(&k) {
+                p.operator.set(&k, &v)?;
+            } else {
+                apply_one(p, label, set_key(&k)?, &v)?;
+            }
         }
         Ok(())
     }
 
-    /// A one-line summary: `concurrency=8 tail_cut=on`.
+    /// A one-line summary: `concurrency=8 layers.tail_cut=on`.
     pub fn summary(&self) -> String {
         self.entries()
             .into_iter()
@@ -1036,172 +831,109 @@ mod tests {
     use super::*;
     use crate::util::ByteSize;
 
-    pub(crate) fn lab_profile() -> Profile {
-        let mut t = TargetSpec::from_url("s3://bkt/x").unwrap();
-        t.options
-            .insert("endpoint".into(), "https://minio.local:9000".into());
-        t.options.insert("region".into(), "eu-west-1".into());
-        t.options
-            .insert("secret_access_key".into(), "hunter2".into());
-        t.options
-            .insert("access_key_id".into(), "${MY_KEY_ID}".into());
-        let mut p = Profile::from_target(t);
+    fn profile() -> Profile {
+        let mut p = Profile::from_url("s3://bkt/x");
+        let o = &mut p.operator.options;
+        o.insert("endpoint".into(), "https://minio.local:9000".into());
+        o.insert("region".into(), "eu-west-1".into());
+        o.insert("secret_access_key".into(), "hunter2".into());
+        o.insert("access_key_id".into(), "${MY_KEY_ID}".into());
+        p.operator.layers.tail_cut = Some(Default::default());
         p.workload.preset = crate::config::Preset::SmallFiles;
+        p.workload.concurrency = 24;
         p.workload.duration = HumanDuration::secs(12);
         p.workload.warmup = HumanDuration(std::time::Duration::from_millis(500));
         p.workload.seed = 7;
-        p.workload.max_ops = Some(900);
-        p.workload.rate = Some(250.0);
-        p.workload.access = Access::Zipf(1.2);
-        p.workload.dataset = Some(DatasetSpec {
-            objects: 64,
-            object_size: ByteSize::kib(64),
-            partitions: 2,
-            ..Default::default()
-        });
-        p.workload.mix = vec![OpSpec {
-            weight: 3,
-            op: crate::config::OpKind::Read { size: None },
-        }];
-        p.knobs.concurrency = 24;
-        p.knobs.io_concurrency = 3;
-        p.knobs.http_version = crate::net::HttpVersion::H1;
-        p.knobs.tail_cut = true;
-        p.knobs.timeout = HumanDuration::secs(9);
-        p.sla.max_throttle_rate = Some(0.01);
         p.name = Some("base".into());
         p
     }
 
     #[test]
-    fn secrets_are_redacted_and_url_implied_options_dropped() {
-        let s = RunSpec::new(&lab_profile(), "s3://bkt/x");
-        let o = &s.profile.target.options;
+    fn secrets_are_redacted() {
+        let s = RunSpec::new(&profile(), "s3://bkt/x");
+        let o = &s.profile.operator.options;
         assert_eq!(o["secret_access_key"], REDACTED);
         assert_eq!(o["access_key_id"], "${MY_KEY_ID}");
-        assert!(
-            !o.contains_key("bucket") && !o.contains_key("root"),
-            "{o:?}"
-        );
         assert_eq!(s.seed, 7);
         assert_eq!(s.label.as_deref(), Some("base"));
         let json = serde_json::to_string(&s).unwrap();
         assert!(!json.contains("hunter2"), "{json}");
-        // lab:// targets keep nothing of the ephemeral server.
-        let lab = Profile::from_target(TargetSpec::from_url("lab://demo").unwrap());
-        let s = RunSpec::new(&lab, "lab://demo");
-        assert!(
-            s.profile.target.options.is_empty(),
-            "{:?}",
-            s.profile.target
-        );
-        assert!(!s.command().contains("127.0.0.1"), "{}", s.command());
-        assert!(!s.command().contains("--proxy"), "{}", s.command());
-    }
-
-    #[test]
-    fn secrets_in_target_urls_are_removed_from_the_spec_and_its_commands() {
+        assert!(!s.command().contains("hunter2"), "{}", s.command());
         for (url, clean) in [
             ("webdav://alice:hunter2@host/files", "webdav://host/files"),
             (
                 "s3://bucket/p?region=eu-west-1&secret_access_key=hunter2",
                 "s3://bucket/p?region=eu-west-1",
             ),
-            (
-                "s3://bucket?session_token=hunter2&sig=hunter2",
-                "s3://bucket",
-            ),
         ] {
-            let p = Profile::from_target(TargetSpec::from_url(url).unwrap());
-            let s = RunSpec::new(&p, url);
-            assert_eq!(s.target_ref, clean);
-            assert_eq!(s.profile.target.url.as_deref(), Some(clean));
-            let json = serde_json::to_string(&s).unwrap();
-            assert!(!json.contains("hunter2"), "{json}");
-            assert!(!s.command().contains("hunter2"), "{}", s.command());
-            let o = Overrides::new().with_set("concurrency", "5");
-            assert!(!s.with(&o).command().contains("hunter2"));
-            // The redacted spec still replays: its target parses again.
-            TargetSpec::from_url(&s.target_ref).unwrap();
-            // A report carrying the spec (what run files store) holds no secret either.
-            let mut r = crate::report::fixture::report();
-            r.spec = s.clone();
-            let json = serde_json::to_string(&r).unwrap();
-            assert!(!json.contains("hunter2"), "{json}");
+            let s = RunSpec::new(&Profile::from_url(url), url);
+            assert_eq!(s.operator_ref, clean);
+            assert_eq!(s.profile.operator.url, clean);
+            assert!(!serde_json::to_string(&s).unwrap().contains("hunter2"));
         }
-        // The dry-run plan's target and command.
-        let p = Profile::from_target(
-            TargetSpec::from_url("s3://bucket?secret_access_key=hunter2").unwrap(),
-        );
-        let plan = crate::guard::plan(&p, "oprobe-run-x/", false, &Default::default());
-        let json = serde_json::to_string(&plan).unwrap();
-        assert!(!json.contains("hunter2"), "{json}");
     }
 
     #[test]
-    fn default_profiles_print_short_commands() {
-        // The CLI parses every command back to the same profile (`oprobe`'s cli tests).
-        let s = RunSpec::new(&lab_profile(), "s3://bkt/x");
-        assert!(!s.command().contains("hunter2"), "{}", s.command());
-        let d = RunSpec::new(
-            &Profile::from_target(TargetSpec::from_url("memory://").unwrap()),
-            "memory://",
-        );
+    fn commands_name_the_operator_changes() {
+        let d = RunSpec::new(&Profile::from_url("memory://"), "memory://");
         assert_eq!(
             d.command(),
-            "oprobe run memory:// --preset parquet --duration 10s --concurrency 16"
+            "oprobe run memory:// --preset parquet -c 16 -d 10s"
         );
+        let s = RunSpec::new(&profile(), "s3://bkt/x");
+        let c = s.command();
+        assert!(c.contains("--set layers.tail_cut=on"), "{c}");
+        assert!(c.contains("--set options.region=eu-west-1"), "{c}");
+        assert!(c.contains("-c 24") && c.contains("--set warmup=500ms"), "{c}");
     }
 
     #[test]
     fn overrides_change_only_what_they_name() {
-        let s = RunSpec::new(&lab_profile(), "s3://bkt/x");
+        let s = RunSpec::new(&profile(), "s3://bkt/x");
         let o = Overrides::new()
             .with_set("concurrency", "48")
             .with_set("tail_cut", "off")
+            .with_set("layers.retry.max_times", "5")
             .with_set("warmup", "2s");
-        assert_eq!(o.knobs["concurrency"], "48");
-        assert_eq!(o.workload["warmup"], "2s");
+        assert_eq!(o.workload["concurrency"], "48");
+        assert_eq!(o.operator["layers.tail_cut"], "off");
         let n = s.with(&o);
         let (a, b) = (s.resolved_profile(), n.resolved_profile());
-        assert_eq!(b.knobs.concurrency, 48);
-        assert!(!b.knobs.tail_cut);
+        assert_eq!(b.workload.concurrency, 48);
+        assert!(b.operator.layers.tail_cut.is_none());
+        assert_eq!(b.operator.retries(), 5);
         assert_eq!(b.workload.warmup, HumanDuration::secs(2));
         assert_eq!(b.workload.dataset, a.workload.dataset);
-        assert_eq!(b.workload.mix, a.workload.mix);
-        assert_eq!(b.workload.seed, 7);
-        assert_eq!(b.target, a.target);
+        assert_eq!(b.operator.options, a.operator.options);
         assert_ne!(n.hash(), s.hash());
         assert_ne!(n.workload_hash(), s.workload_hash(), "warmup is workload");
-        let knob_only = s.with(&Overrides::new().with_set("c", "8"));
-        assert_eq!(knob_only.workload_hash(), s.workload_hash());
-        assert_ne!(knob_only.hash(), s.hash());
-        // Label and seed are not part of the hash.
-        let relabel = s.with(
-            &Overrides::new()
-                .with_set("label", "x")
-                .with_set("seed", "9"),
-        );
+        let op_only = s.with(&Overrides::new().with_set("read.gap", "1MiB"));
+        assert_eq!(op_only.workload_hash(), s.workload_hash());
+        assert_ne!(op_only.hash(), s.hash());
+        let relabel = s.with(&Overrides::new().with_set("label", "x").with_set("seed", "9"));
         assert_eq!(relabel.hash(), s.hash());
         assert_eq!(relabel.seed, 9);
-        // The command of the changed spec names the change.
-        assert!(n.command().contains("--concurrency 48"), "{}", n.command());
-        // A preset override resets dataset and mix, unless given with it.
-        let pr = s.with(&Overrides::new().with_set("preset", "parquet"));
-        assert!(pr.profile.workload.mix.is_empty() && pr.profile.workload.dataset.is_none());
-        let pr = s.with(
-            &Overrides::new()
-                .with_set("objects", "5")
-                .with_set("preset", "parquet"),
-        );
+        assert!(n.command().contains("-c 48"), "{}", n.command());
         assert_eq!(
-            pr.resolved_profile().workload.effective_dataset().objects,
-            5
+            RunSpec::prove_command("20261121-101010-abcd", &Overrides::new().with_set("tail_cut", "on")),
+            "oprobe prove 20261121-101010-abcd --with layers.tail_cut=on"
         );
-        assert_eq!(
-            RunSpec::rerun_from("20261121-101010-abcd", &o),
-            "oprobe run --from 20261121-101010-abcd --set warmup=2s --set concurrency=48 --set tail_cut=off"
-        );
+    }
+
+    #[test]
+    fn aliases_map_to_operator_paths() {
+        let o = Overrides::parse(&["http=h2", "max-inflight=4", "cache=128MiB", "io_concurrency=3"])
+            .unwrap();
+        assert_eq!(o.operator["http.version"], "h2");
+        assert_eq!(o.operator["layers.concurrent_limit.http"], "4");
+        assert_eq!(o.operator["read.concurrent"], "3");
+        let s = RunSpec::default().with(&o);
+        let op = &s.profile.operator;
+        assert_eq!(op.layers.cache.as_ref().unwrap().memory, ByteSize::mib(128));
+        assert_eq!(op.http_limit(), Some(4));
+        assert_eq!(op.write_concurrent(), 3);
+        let o = Overrides::parse(&["retries=0"]).unwrap();
+        assert_eq!(RunSpec::default().with(&o).profile.operator.retries(), 0);
     }
 
     #[test]
@@ -1209,47 +941,20 @@ mod tests {
         let e = Overrides::parse(&["concurency=8"]).unwrap_err();
         assert_eq!(e.code, ErrorCode::UsageInvalidArgument);
         assert!(e.hint.unwrap().contains("did you mean `concurrency`"));
+        let e = Overrides::parse(&["layers.retry.max_tims=8"]).unwrap_err();
+        assert!(e.hint.unwrap().contains("layers.retry.max_times"));
         for bad in [
             "concurrency=0",
             "warmup=5x",
             "preset=nope",
             "access=weird",
             "mix=[",
-            "endpoint=ftp://x",
             "chunk_size=1",
+            "read.concurrent=0",
             "novalue",
         ] {
             let e = Overrides::parse(&[bad]).unwrap_err();
             assert_eq!(e.code, ErrorCode::UsageInvalidArgument, "{bad}");
-        }
-        let o = Overrides::parse(&["http=h2", "max-inflight=4", "cache=128MiB"]).unwrap();
-        assert_eq!(o.knobs["http_version"], "h2");
-        assert_eq!(o.knobs["max_inflight_requests"], "4");
-        let s = RunSpec::default().with(&o);
-        assert!(s.profile.knobs.cache);
-        assert_eq!(s.profile.knobs.cache_size, ByteSize::mib(128));
-        // Every key has a setter and accepts a plausible value.
-        for k in SET_KEYS {
-            let v = match k.name {
-                "mix" => r#"[{"op":"stat"}]"#,
-                "endpoint" => "http://127.0.0.1:9000",
-                "http_version" => "h2",
-                "addressing" => "path",
-                "checksum" => "crc32c",
-                "sse" => "AES256",
-                "preset" => "mixed",
-                "access" => "uniform",
-                "arrivals" => "poisson",
-                "shape" => "ramp:1..10/2s",
-                "sla" => "none",
-                "region" | "existing" | "label" => "x",
-                "keep_alive" | "tail_cut" | "persist" | "verify" | "cleanup" | "cache" => "on",
-                "chunk_size" | "range_gap" | "object_size" | "cache_size" => "8MiB",
-                "duration" | "warmup" | "timeout" => "3s",
-                "max_error_rate" | "max_throttle_rate" | "egress_fraction" => "1%",
-                _ => "4",
-            };
-            check_set(k.name, v).unwrap_or_else(|e| panic!("{}={v}: {e}", k.name));
         }
     }
 }

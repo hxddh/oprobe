@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 pub use baselines::{Baseline, Baselines};
-pub use config::{ConfigFile, Defaults, TargetEntry};
+pub use config::{ConfigFile, Defaults};
 pub use runs::{RunStore, RunSummary, read_run_file, resolve_run, write_run_file};
 pub use target_id::TargetId;
 

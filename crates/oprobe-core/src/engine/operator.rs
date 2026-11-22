@@ -8,12 +8,12 @@ use anyhow::{Context, Result};
 use opendal::Operator;
 use opendal::layers::{RetryLayer, TimeoutLayer};
 
-use super::stack::ClientStack;
-use crate::config::{Knobs, TargetSpec};
+use crate::config::TargetSpec;
+use crate::operator::{HttpOptions, OperatorSpec};
 use crate::errors::{ErrorCode, OprobeError};
 use crate::net::{FidelityTransport, TlsClientOptions, TransportConfig};
 use crate::trace::layer::{InProcessObserveLayer, TraceContextLayer};
-use crate::trace::{OpScope, Recorder};
+use crate::trace::Recorder;
 
 static REGISTRY: Once = Once::new();
 
@@ -105,8 +105,8 @@ pub fn backend_config_hint(
         format!("set {}", missing.join(" and "))
     };
     format!(
-        "{what}: pass `--option KEY=VALUE` (or `?KEY=VALUE` in the URL), or add it under \
-         [targets.NAME.options] in the config file (`oprobe config edit`)"
+        "{what}: pass `--set options.KEY=VALUE` (or `?KEY=VALUE` in the URL), or add it under \
+         [operators.NAME.options] in the config file"
     )
 }
 
@@ -187,12 +187,9 @@ pub async fn detect_s3_region(target: &TargetSpec) -> Option<String> {
     }
 }
 
-/// Prepare a target before its operator is built: apply the provider knobs (addressing style,
-/// checksum, SSE) and detect the region of an S3 bucket that has none configured.
-pub async fn prepare_target(target: &mut TargetSpec, knobs: &Knobs) -> Result<()> {
-    for (k, v) in knobs.provider.options(&target.scheme)? {
-        target.options.insert(k.to_owned(), v);
-    }
+/// Prepare a target before its operator is built: detect the region of an S3 bucket that has
+/// none configured.
+pub async fn prepare_target(target: &mut TargetSpec) -> Result<()> {
     if let Some((region, RegionSource::Detected)) = s3_region(target).await {
         target.options.insert("region".into(), region);
     }
@@ -222,11 +219,13 @@ pub fn proxy_setting(target: &TargetSpec) -> Option<Option<String>> {
     }
 }
 
-pub fn transport_config(target: &TargetSpec, knobs: &Knobs) -> Result<TransportConfig> {
+/// The instrumented `HttpFetch`'s settings: the operator's HTTP options and the target's TLS
+/// and proxy. The HTTP in-flight cap is the operator's `ConcurrentLimitLayer`, not the transport.
+pub fn transport_config(target: &TargetSpec, http: &HttpOptions) -> Result<TransportConfig> {
     Ok(TransportConfig {
-        http: knobs.http_version,
-        keep_alive: knobs.keep_alive,
-        max_inflight: ClientStack::from_knobs(knobs).http_concurrent_limit,
+        http: http.version,
+        keep_alive: http.keep_alive,
+        max_inflight: None,
         tls: tls_options(target)?,
         proxy: proxy_setting(target),
         // `OPROBE_TCP_INFO=0` turns the per-request kernel statistics off.
@@ -237,22 +236,23 @@ pub fn transport_config(target: &TargetSpec, knobs: &Knobs) -> Result<TransportC
 /// The tracing layer: OpenDAL's own HTTP client, instrumented (the fidelity transport).
 pub fn trace_layer(
     target: &TargetSpec,
-    knobs: &Knobs,
+    http: &HttpOptions,
     recorder: Option<Arc<Recorder>>,
 ) -> Result<TraceContextLayer> {
     let https = target.endpoint().is_none_or(|e| e.starts_with("https"));
     Ok(TraceContextLayer::new(FidelityTransport::new(
-        transport_config(target, knobs)?,
+        transport_config(target, http)?,
         https,
         recorder,
     )?))
 }
 
-/// Instrumented operator: every request is traced into `recorder`.
-pub fn measured_operator(
+/// The measured operator: the service through the instrumented `HttpFetch` (every request is
+/// traced into `recorder`), wrapped in `spec`'s layers.
+pub async fn measured_operator(
     base: &Operator,
     target: &TargetSpec,
-    knobs: &Knobs,
+    spec: &OperatorSpec,
     recorder: &Arc<Recorder>,
     tree_registry: Option<await_tree::Registry>,
 ) -> Result<Operator> {
@@ -260,39 +260,21 @@ pub fn measured_operator(
     if !target.is_network() {
         op = op.layer(InProcessObserveLayer::new(recorder.clone()));
     }
-    op = op.layer(trace_layer(target, knobs, Some(recorder.clone()))?);
-    let stack = ClientStack::from_knobs(knobs);
-    op = op.layer(stack.timeout_layer());
-    if let Some(l) = stack.tail_cut_layer() {
-        op = op.layer(l);
-    }
-    if let Some(l) = stack.retry_layer() {
-        op = op.layer(l.with_notify(|ev: opendal::layers::RetryEvent<'_>| {
-            if let Some(s) = OpScope::current() {
-                // 429/503 responses mark the scope throttled when they are recorded
-                // (`OpScope::push_request`); OpenDAL's kind covers the rest. The error text is
-                // never matched: object names and ports contain digits.
-                s.record_retry(
-                    ev.retry_after,
-                    ev.err.kind() == opendal::ErrorKind::RateLimited,
-                );
-            }
-        }));
-    }
+    op = op.layer(trace_layer(target, &spec.http, Some(recorder.clone()))?);
     // Async call stacks: operations are registered as await-tree roots by the runner, OpenDAL
     // sub-tasks by `ScopePropagatingExecutor`, and the transports add zero-allocation spans per
     // request. OpenDAL's `AwaitTreeLayer` is not used: it wraps every call and read chunk and
     // cost ~14% throughput on small requests (examples/overhead.rs).
     let _ = tree_registry;
-    recorder.set_cache_enabled(false);
-    Ok(op)
+    recorder.set_cache_enabled(spec.layers.cache.is_some());
+    crate::operator::build::apply_layers(op, spec, true).await
 }
 
 /// Fail fast when the endpoint cannot be reached at all (connection refused, unknown host):
 /// the admin operator would otherwise retry every dataset upload for minutes. One `stat` on a
 /// key that does not exist, without retries; any HTTP answer (404, 403, ...) passes.
 pub async fn check_reachable(base: &Operator, target: &TargetSpec) -> Result<()> {
-    check_reachable_with(base, target, &Knobs::default()).await
+    check_reachable_with(base, target, &HttpOptions::default()).await
 }
 
 /// [`check_reachable`] with the run's transport and HTTP version (a server that only speaks
@@ -300,15 +282,15 @@ pub async fn check_reachable(base: &Operator, target: &TargetSpec) -> Result<()>
 pub async fn check_reachable_with(
     base: &Operator,
     target: &TargetSpec,
-    knobs: &Knobs,
+    http: &HttpOptions,
 ) -> Result<()> {
-    let k = Knobs {
-        http_version: knobs.http_version,
-        ..Knobs::default()
+    let h = HttpOptions {
+        version: http.version,
+        ..http.clone()
     };
     let probe = base
         .clone()
-        .layer(trace_layer(target, &k, None)?)
+        .layer(trace_layer(target, &h, None)?)
         .layer(TimeoutLayer::new().with_timeout(Duration::from_secs(20)));
     let Err(e) = probe.stat(".oprobe-reachability-check").await else {
         return Ok(());
@@ -356,13 +338,13 @@ pub async fn check_reachable_with(
 /// With `--http h2`, check the target speaks HTTP/2 before anything else (design v5 §3, M6):
 /// an endpoint without h2c (plain HTTP) or without `h2` in ALPN (TLS) would otherwise fail
 /// every request of the run.
-pub async fn check_protocol(base: &Operator, target: &TargetSpec, knobs: &Knobs) -> Result<()> {
-    if knobs.http_version != crate::net::HttpVersion::H2 || !target.is_network() {
+pub async fn check_protocol(base: &Operator, target: &TargetSpec, http: &HttpOptions) -> Result<()> {
+    if http.version != crate::net::HttpVersion::H2 || !target.is_network() {
         return Ok(());
     }
     let probe = base
         .clone()
-        .layer(trace_layer(target, knobs, None)?)
+        .layer(trace_layer(target, http, None)?)
         .layer(TimeoutLayer::new().with_timeout(Duration::from_secs(10)));
     let Err(e) = probe.stat(".oprobe-protocol-check").await else {
         return Ok(());
@@ -426,7 +408,7 @@ pub fn preflight_operator_with(
     target: &TargetSpec,
     recorder: Option<Arc<crate::trace::Recorder>>,
 ) -> Result<Operator> {
-    let knobs = Knobs::default();
+    let http = HttpOptions::default();
     let mut op = base.clone();
     if let Some(r) = &recorder
         && !target.is_network()
@@ -434,7 +416,7 @@ pub fn preflight_operator_with(
         op = op.layer(InProcessObserveLayer::new(r.clone()));
     }
     Ok(op
-        .layer(trace_layer(target, &knobs, recorder)?)
+        .layer(trace_layer(target, &http, recorder)?)
         .layer(
             TimeoutLayer::new()
                 .with_timeout(Duration::from_secs(30))
@@ -451,10 +433,9 @@ pub fn preflight_operator_with(
 }
 
 pub fn admin_operator(base: &Operator, target: &TargetSpec) -> Result<Operator> {
-    let knobs = Knobs::default();
     Ok(base
         .clone()
-        .layer(trace_layer(target, &knobs, None)?)
+        .layer(trace_layer(target, &HttpOptions::default(), None)?)
         .layer(
             TimeoutLayer::new()
                 .with_timeout(Duration::from_secs(300))
@@ -480,8 +461,8 @@ mod tests {
         let h = backend_config_hint("azblob", &o);
         assert!(!h.contains("`container`"), "{h}");
         assert!(h.contains("`endpoint`"), "{h}");
-        assert!(h.contains("--option KEY=VALUE"), "{h}");
-        assert!(h.contains("[targets.NAME.options]"), "{h}");
+        assert!(h.contains("--set options.KEY=VALUE"), "{h}");
+        assert!(h.contains("[operators.NAME.options]"), "{h}");
         assert!(!h.contains("-o KEY"), "{h}");
         let h = backend_config_hint("s3", &Default::default());
         assert!(h.contains("set `bucket`"), "{h}");
@@ -491,6 +472,6 @@ mod tests {
         assert_eq!(b.code, ErrorCode::ConfigInvalid, "{b:?}");
         let hint = b.hint.unwrap_or_default();
         assert!(!hint.contains("`container`"), "{hint}");
-        assert!(hint.contains("--option"), "{hint}");
+        assert!(hint.contains("--set options."), "{hint}");
     }
 }

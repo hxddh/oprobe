@@ -639,7 +639,7 @@ pub async fn tune(
         posterior_ok: Vec::new(),
         saturated: false,
     };
-    let base_knobs = p.knobs.clone();
+    let base_knobs = Knobs::of(p);
     let baseline = t.trial("baseline", &base_knobs).await?;
     let bs = &t.snapshots[baseline];
     t.use_bytes = bs.summary.ops > 0
@@ -901,7 +901,7 @@ pub async fn tune(
     if has(&|o| matches!(o, OpKind::MultipartWrite { .. })) && !multipart {
         notes.push(format!(
             "`{}` has no multipart uploads: write chunk sizes are not tuned (each object is one request)",
-            session.profile.target.scheme
+            session.profile.target().scheme
         ));
     }
     let vectored = has(&|o| matches!(o, OpKind::ParquetScan { .. }));
@@ -1044,7 +1044,7 @@ pub async fn tune(
             "read cache not tried: under uniform access its benefit depends on the real working set, not the generated test dataset".into(),
         );
     }
-    if p.target.endpoint().is_some_and(|e| e.starts_with("https")) && t.budget_left() {
+    if p.target().endpoint().is_some_and(|e| e.starts_with("https")) && t.budget_left() {
         let mut k = t.trials[current].knobs.clone();
         k.http_version = match k.http_version {
             HttpVersion::H2 => HttpVersion::Auto,

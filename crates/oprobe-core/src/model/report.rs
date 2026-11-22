@@ -410,12 +410,6 @@ pub struct KnobValues {
     pub retries_count: u64,
     pub tail_cut: bool,
     pub timeout_ms: u64,
-    /// Addressing style, checksum and SSE (S3).
-    #[serde(
-        default,
-        skip_serializing_if = "crate::config::ProviderKnobs::is_default"
-    )]
-    pub provider: crate::config::ProviderKnobs,
 }
 
 impl From<&Knobs> for KnobValues {
@@ -433,7 +427,6 @@ impl From<&Knobs> for KnobValues {
             retries_count: k.retries as u64,
             tail_cut: k.tail_cut,
             timeout_ms: k.timeout.get().as_millis() as u64,
-            provider: k.provider.clone(),
         }
     }
 }
@@ -454,7 +447,6 @@ impl KnobValues {
             retries: self.retries_count as usize,
             tail_cut: self.tail_cut,
             timeout: crate::util::HumanDuration(std::time::Duration::from_millis(self.timeout_ms)),
-            provider: self.provider.clone(),
         }
     }
 }

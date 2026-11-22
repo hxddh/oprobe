@@ -153,11 +153,10 @@ impl Request {
 
 /// The spec of measuring `profile` at `target_name` (or the profile's own URL).
 pub fn spec_of(profile: &Profile, target_name: Option<&str>) -> RunSpec {
-    let target_ref = target_name
+    let operator_ref = target_name
         .map(str::to_owned)
-        .or_else(|| profile.target.url.clone())
-        .unwrap_or_else(|| profile.target.display());
-    RunSpec::new(profile, target_ref)
+        .unwrap_or_else(|| profile.operator.url.clone());
+    RunSpec::new(profile, operator_ref)
 }
 
 /// What the tuner adds.
@@ -262,7 +261,7 @@ pub async fn measure(req: Request) -> Result<Measured> {
     };
     let (mut run, tuned) = match mode {
         Mode::Run => {
-            let knobs = session.profile.knobs.clone();
+            let knobs = crate::config::Knobs::of(&session.profile);
             // The run file is written while the run is in progress (design v5 §2).
             if let Some(s) = &store {
                 let header =
@@ -342,7 +341,7 @@ pub async fn measure(req: Request) -> Result<Measured> {
             )
             .ok();
             // The tuner's run replays as its winner.
-            spec.profile.knobs = outcome.winner.clone();
+            (outcome.winner.clone()).apply(&mut spec.profile);
             let mut run = crate::model::build_run(crate::model::ReportInput {
                 run_id: &rails.run_id,
                 target_name,
@@ -425,13 +424,12 @@ pub async fn measure(req: Request) -> Result<Measured> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::TargetSpec;
 
     fn quick(url: &str) -> Profile {
-        let mut p = Profile::from_target(TargetSpec::from_url(url).unwrap());
+        let mut p = Profile::from_url(url);
         p.workload.duration = crate::util::HumanDuration(std::time::Duration::from_millis(200));
         p.workload.warmup = crate::util::HumanDuration(std::time::Duration::ZERO);
-        p.knobs.concurrency = 2;
+        p.workload.concurrency = 2;
         p
     }
 

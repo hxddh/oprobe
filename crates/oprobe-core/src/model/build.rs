@@ -347,14 +347,14 @@ pub fn build_run_with(
     let spec = spec.unwrap_or_else(|| {
         let target_ref = target_name
             .clone()
-            .or_else(|| profile.target.url.clone())
-            .unwrap_or_else(|| profile.target.display());
+            .or_else(|| profile.target().url.clone())
+            .unwrap_or_else(|| profile.target().display());
         super::spec::RunSpec::new(profile, target_ref)
     });
     ensure_slowest(&snapshot, &mut trace);
     let sampled = trace.sampled();
     exact_latency(&mut snapshot, &trace.ops, sampled);
-    let t = &profile.target;
+    let t = &profile.target();
     let endpoint = t.endpoint();
     let diagnosis = diagnose(&snapshot, knobs, &profile.sla, t.is_network());
     let sla_verdict = check_sla(&snapshot, &profile.sla);

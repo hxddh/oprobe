@@ -16,7 +16,7 @@ use super::cleanup::{CleanupSummary, delete_prefix, new_run_prefix};
 use super::dataset::{Dataset, PayloadPool, Picker};
 use super::operator::{admin_operator, base_operator, measured_operator};
 use super::ops::{OpCtx, error_class, execute, verb};
-use crate::config::{Knobs, OpKind, OpSpec, Profile};
+use crate::config::{Knobs, OpKind, OpSpec, Profile, TargetSpec};
 use crate::guard::Guard;
 use crate::trace::{OpCompletion, OpScope, OpenLoopStats, Phase, Recorder, Snapshot, TraceRows};
 
@@ -166,6 +166,8 @@ impl Default for SessionOptions {
 
 pub struct Session {
     pub profile: Profile,
+    /// The operator's service target, normalized (the region of an S3 bucket detected).
+    pub target: TargetSpec,
     pub base: Operator,
     pub admin: Operator,
     pub run_prefix: String,
@@ -194,16 +196,16 @@ impl Session {
     /// [`Session::open`] with safety rails: preflight before any write, budgets armed on
     /// `cancel`, a chosen run prefix.
     pub async fn open_with(
-        mut profile: Profile,
+        profile: Profile,
         cancel: Cancel,
         progress: ProgressFn,
         opts: SessionOptions,
     ) -> Result<Self> {
-        profile.target = profile.target.normalized()?;
         profile.validate()?;
-        super::operator::prepare_target(&mut profile.target, &profile.knobs).await?;
-        let base = base_operator(&profile.target)?;
-        let admin = admin_operator(&base, &profile.target)?;
+        let mut target = profile.operator.target()?;
+        super::operator::prepare_target(&mut target).await?;
+        let base = base_operator(&target)?;
+        let admin = admin_operator(&base, &target)?;
         let run_prefix = opts.run_prefix.clone().unwrap_or_else(new_run_prefix);
         if let Some(g) = &opts.guard {
             g.arm(cancel.clone());
@@ -213,7 +215,7 @@ impl Session {
         // The mix runs on what the service can do.
         let measured_cap = base.info().capability();
         let mut warnings =
-            super::workloads::adapt_mix(&mut mix, &measured_cap, &profile.target.scheme);
+            super::workloads::adapt_mix(&mut mix, &measured_cap, &target.scheme);
         if spec.existing_prefix.is_some() && mix.iter().any(|m| m.op.is_write()) {
             mix.retain(|m| !m.op.is_write());
             warnings.push("existing_prefix datasets are read-only: write operations were removed from the mix".into());
@@ -227,16 +229,16 @@ impl Session {
                 "the workload mix needs at least one operation with weight > 0"
             }
         );
-        if profile.target.is_network() {
-            super::operator::check_reachable_with(&base, &profile.target, &profile.knobs).await?;
-            super::operator::check_protocol(&base, &profile.target, &profile.knobs).await?;
+        if target.is_network() {
+            super::operator::check_reachable_with(&base, &target, &profile.operator.http).await?;
+            super::operator::check_protocol(&base, &target, &profile.operator.http).await?;
         }
         let needs_objects = mix.iter().any(|m| m.op.needs_dataset() && m.weight > 0);
         if opts.preflight {
             let writes = spec.existing_prefix.is_none()
                 && (needs_objects || mix.iter().any(|m| m.weight > 0 && m.op.is_write()));
             // Fail fast: few retries, short timeouts (the admin operator retries for minutes).
-            let quick = super::operator::preflight_operator(&base, &profile.target)?;
+            let quick = super::operator::preflight_operator(&base, &target)?;
             crate::guard::preflight(&quick, &run_prefix, writes).await?;
         }
         let p2 = progress.clone();
@@ -270,6 +272,7 @@ impl Session {
         let capability = measured_cap;
         Ok(Self {
             profile,
+            target,
             base,
             admin,
             run_prefix,
@@ -339,18 +342,14 @@ impl Session {
         if let Some(t) = &tree {
             recorder.set_tree_registry(t.clone());
         }
-        let op = measured_operator(
-            &self.base,
-            &self.profile.target,
-            knobs,
-            &recorder,
-            tree.clone(),
-        )?;
+        let mut spec = self.profile.operator.clone();
+        knobs.apply_to(&mut spec);
+        let op = measured_operator(&self.base, &self.target, &spec, &recorder, tree.clone()).await?;
         let ctx = Arc::new(OpCtx {
             op,
             picker: Picker::new(self.dataset.objects.len(), self.profile.workload.access),
             dataset: self.dataset.clone(),
-            knobs: knobs.clone(),
+            spec,
             pool: self.pool.clone(),
             verify: self.profile.workload.verify,
             recorder: recorder.clone(),
@@ -954,14 +953,14 @@ mod tests {
             assert_eq!(w[1] - w[0], gap);
         }
     }
-    use crate::config::{Arrivals, TargetSpec};
+    use crate::config::Arrivals;
 
     fn quiet() -> ProgressFn {
         Arc::new(|_| {})
     }
 
     fn profile(url: &str) -> Profile {
-        let mut p = Profile::from_target(TargetSpec::from_url(url).unwrap());
+        let mut p = Profile::from_url(url);
         p.workload.preset = crate::config::Preset::Metadata;
         p.workload.dataset = Some(crate::config::DatasetSpec {
             objects: 4,
@@ -969,7 +968,7 @@ mod tests {
             ..Default::default()
         });
         p.workload.verify = false;
-        p.knobs.concurrency = 1;
+        p.workload.concurrency = 1;
         p
     }
 
@@ -987,7 +986,7 @@ mod tests {
     async fn closed_loop_runs_say_so() {
         let p = profile("memory://");
         let s = Session::open(p, Cancel::new(), quiet()).await.unwrap();
-        let knobs = s.profile.knobs.clone();
+        let knobs = Knobs::of(&s.profile);
         let snap = s.run(&knobs, &opts(150, None), None).await.unwrap();
         assert!(snap.summary.ops > 0);
         // Every operation is in the dimensions (aggregates, not sampled rows).
@@ -1015,9 +1014,9 @@ mod tests {
         .unwrap();
         let mut p = lab.profile("b");
         p.workload = profile("memory://").workload;
-        p.knobs.concurrency = 1;
+        p.workload.concurrency = 1;
         let s = Session::open(p, Cancel::new(), quiet()).await.unwrap();
-        let knobs = s.profile.knobs.clone();
+        let knobs = Knobs::of(&s.profile);
         let snap = s.run(&knobs, &opts(600, Some(500.0)), None).await.unwrap();
         let ol = snap.open_loop.clone().expect("open-loop stats");
         assert_eq!(ol.arrivals, "constant");
@@ -1054,9 +1053,9 @@ mod tests {
     async fn poisson_and_shaped_arrivals_follow_their_schedule() {
         let mut p = profile("memory://");
         p.workload.arrivals = Arrivals::Poisson;
-        p.knobs.concurrency = 8;
+        p.workload.concurrency = 8;
         let s = Session::open(p, Cancel::new(), quiet()).await.unwrap();
-        let knobs = s.profile.knobs.clone();
+        let knobs = Knobs::of(&s.profile);
         let snap = s.run(&knobs, &opts(1000, Some(400.0)), None).await.unwrap();
         let ol = snap.open_loop.unwrap();
         assert_eq!(ol.arrivals, "poisson");
@@ -1074,9 +1073,9 @@ mod tests {
 
         let mut p = profile("memory://");
         p.workload.shape = Some("ramp:0..400/1s".parse().unwrap());
-        p.knobs.concurrency = 8;
+        p.workload.concurrency = 8;
         let s = Session::open(p, Cancel::new(), quiet()).await.unwrap();
-        let knobs = s.profile.knobs.clone();
+        let knobs = Knobs::of(&s.profile);
         let o = RunOptions::from_profile(&s.profile);
         assert!(o.rate.is_none());
         let snap = s.run(&knobs, &opts(1000, None), None).await.unwrap();
@@ -1096,12 +1095,12 @@ mod tests {
             ("lab://clean?proto=h2", HttpVersion::H2, false),
         ] {
             let mut p = profile(url);
-            p.knobs.http_version = http;
-            p.knobs.concurrency = 4;
+            p.operator.http.version = http;
+            p.workload.concurrency = 4;
             let s = Session::open(p, Cancel::new(), quiet())
                 .await
                 .unwrap_or_else(|e| panic!("{url} {http:?} {microscope}: {e:#}"));
-            let knobs = s.profile.knobs.clone();
+            let knobs = Knobs::of(&s.profile);
             let snap = s.run(&knobs, &opts(300, None), None).await.unwrap();
             assert_eq!(snap.summary.failed_ops, 0, "{url} {http:?}");
             // (OpenDAL's own client negotiates HTTP/1.1 unless HTTP/2 is asked for.)
@@ -1124,7 +1123,7 @@ mod tests {
         }
         // A server without HTTP/2 is refused up front with a hint, not failed request by request.
         let mut p = profile("lab://clean?proto=h1");
-        p.knobs.http_version = HttpVersion::H2;
+        p.operator.http.version = HttpVersion::H2;
         let e = Session::open(p, Cancel::new(), quiet())
             .await
             .err()

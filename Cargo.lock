@@ -4162,6 +4162,7 @@ dependencies = [
  "bytes",
  "crc32c",
  "dirs",
+ "foyer",
  "futures",
  "hdrhistogram",
  "http",

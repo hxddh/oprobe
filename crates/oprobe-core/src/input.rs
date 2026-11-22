@@ -11,7 +11,7 @@
 
 use std::time::Duration;
 
-use crate::config::{Access, Addressing, Preset};
+use crate::config::{Access, Preset};
 use crate::errors::{ErrorCode, OprobeError};
 use crate::net::HttpVersion;
 use crate::util::ByteSize;
@@ -400,21 +400,6 @@ pub fn http_version(raw: &str) -> Result<HttpVersion, OprobeError> {
     }
 }
 
-/// S3 bucket addressing: `auto`, `virtual` (`vhost`, `virtual-host`), `path`.
-pub fn addressing(raw: &str) -> Result<Addressing, OprobeError> {
-    choice(
-        "addressing style",
-        raw,
-        &[
-            ("auto", Addressing::Auto),
-            ("virtual", Addressing::Virtual),
-            ("virtual-host", Addressing::Virtual),
-            ("vhost", Addressing::Virtual),
-            ("path", Addressing::Path),
-        ],
-    )
-}
-
 /// A `lab://` scenario name.
 pub fn lab_scenario(raw: &str) -> Result<crate::lab::Scenario, OprobeError> {
     let s = raw.trim().to_ascii_lowercase();
@@ -619,9 +604,6 @@ pub mod clap {
     pub fn access(s: &str) -> Result<String, OprobeError> {
         super::access(s).map(|_| s.trim().to_owned())
     }
-    pub fn addressing(s: &str) -> Result<String, OprobeError> {
-        super::addressing(s).map(|_| s.trim().to_owned())
-    }
     pub fn endpoint(s: &str) -> Result<String, OprobeError> {
         super::endpoint(s)
     }
@@ -635,11 +617,11 @@ pub mod clap {
         super::run_ref(s)
     }
     pub fn key_value(s: &str) -> Result<String, OprobeError> {
-        super::key_value("--option", s).map(|_| s.to_owned())
+        super::key_value("PATH=VALUE", s).map(|_| s.to_owned())
     }
     pub fn set(s: &str) -> Result<String, OprobeError> {
         let (k, v) = super::key_value("--set", s)?;
-        crate::model::spec::check_set(&k, &v)?;
+        crate::model::Overrides::new().set(&k, &v)?;
         Ok(s.to_owned())
     }
     /// Money, volumes, fractions given as numbers: finite and `>= 0`.
@@ -766,7 +748,6 @@ mod tests {
         assert!(endpoint("not a url").is_err());
         assert_eq!(http_version("HTTP2").unwrap(), HttpVersion::H2);
         assert!(http_version("h3").is_err());
-        assert_eq!(addressing("vhost").unwrap(), Addressing::Virtual);
         assert!(lab_scenario("demo").is_ok());
         assert!(
             lab_scenario("dmeo")

@@ -146,13 +146,16 @@ impl std::ops::DerefMut for Ctx {
 #[derive(Clone, Debug)]
 pub struct Resolved {
     pub profile: Profile,
+    /// The configured operator's name, when one was used.
     pub target_name: Option<String>,
+    /// The operator as given (URL, operator file, configured name).
+    pub operator_ref: String,
 }
 
 impl Resolved {
     /// The replayable spec of this profile (secrets redacted).
     pub fn spec(&self) -> RunSpec {
-        crate::engine::measure::spec_of(&self.profile, self.target_name.as_deref())
+        RunSpec::new(&self.profile, self.operator_ref.clone())
     }
 }
 
@@ -226,10 +229,11 @@ impl App {
     /// Assemble and validate a profile (target names, `[defaults]`, flags, `--from`, `--set`).
     pub fn resolve(&self, req: &ProfileRequest) -> Result<Resolved> {
         let ctx = self.ctx(&EventSink::silent());
-        let (profile, target_name) = profile::run_profile(&ctx, req)?;
+        let (profile, source) = profile::run_profile(&ctx, req)?;
         Ok(Resolved {
             profile,
-            target_name,
+            target_name: source.name(),
+            operator_ref: req.operator.clone(),
         })
     }
 
@@ -240,11 +244,11 @@ impl App {
             Some(r) => r.clone(),
             None => {
                 let ctx = self.ctx(&EventSink::silent());
-                let (profile, target_name) =
-                    profile::spec_profile(&ctx, req.spec.clone(), &ProfileRequest::default())?;
+                let profile = profile::spec_profile(&ctx, req.spec.clone())?;
                 Resolved {
                     profile,
-                    target_name,
+                    target_name: None,
+                    operator_ref: req.spec.operator_ref.clone(),
                 }
             }
         };

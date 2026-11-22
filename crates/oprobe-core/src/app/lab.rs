@@ -84,20 +84,14 @@ pub async fn lab(_ctx: &Ctx, a: LabRequest) -> Result<(crate::lab::LabHandle, La
         limits.max_connections = n.max(1);
     }
     let lab = LabServer::spawn_with(&a.bind, cfg, limits).await?;
-    let tls_flag = if a.tls {
-        match &a.write_ca {
-            Some(p) => format!(" --ca-cert {}", p.display()),
-            None => " --insecure".into(),
-        }
-    } else {
-        String::new()
-    };
+    // An operator file for the lab: `oprobe run lab.toml` (credentials are the lab's dummies).
     let out = LabOutput {
         endpoint: lab.endpoint_url.clone(),
         tls: a.tls,
         try_command: format!(
-            "AWS_ACCESS_KEY_ID=lab AWS_SECRET_ACCESS_KEY=lab oprobe run s3://bench/demo --endpoint {} --proxy none{tls_flag}",
-            lab.endpoint_url
+            "AWS_ACCESS_KEY_ID=lab AWS_SECRET_ACCESS_KEY=lab oprobe run s3://bench/demo --set options.endpoint={} --set options.region=us-east-1 --set http.proxy=none{}",
+            lab.endpoint_url,
+            if a.tls { " --set http.insecure=true" } else { "" }
         ),
     };
     Ok((lab, out))

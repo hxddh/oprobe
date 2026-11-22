@@ -1955,7 +1955,7 @@ pub fn derive(run: &Run, legacy: &[diagnosis::Finding]) -> Vec<Finding> {
     for f in &mut out {
         if let Some(v) = &mut f.verification {
             v.command = crate::model::spec::command_line(&[
-                "verify".into(),
+                "prove".into(),
                 r.run.id.clone(),
                 f.code.clone(),
             ]);
@@ -2167,9 +2167,9 @@ pub(crate) mod tests {
         assert!(t.evidence.values["predicted_p99_ms"] < 200.0, "{t:#?}");
         assert!(!t.evidence.op_ids.is_empty());
         let v = t.verification.as_ref().unwrap();
-        assert!(v.replay.contains("--tail-cut"), "{v:?}");
-        assert!(v.rerun.contains("--set tail_cut=on"), "{v:?}");
-        assert_eq!(v.overrides.knobs["tail_cut"], "on");
+        assert!(v.replay.contains("--set layers.tail_cut=on"), "{v:?}");
+        assert!(v.rerun.contains("--with layers.tail_cut=on"), "{v:?}");
+        assert_eq!(v.overrides.operator["layers.tail_cut"], "on");
         assert!(CODES.contains(&"tail_stragglers"));
     }
 
@@ -2198,7 +2198,7 @@ pub(crate) mod tests {
         assert!(!t.evidence.windows.is_empty());
         assert!(t.advice.contains("concurrency ≤ 20"), "{}", t.advice);
         let v = t.verification.as_ref().unwrap();
-        assert_eq!(v.overrides.knobs["concurrency"], "20", "{v:?}");
+        assert_eq!(v.overrides.workload["concurrency"], "20", "{v:?}");
         let thr = v
             .expect
             .iter()
@@ -2292,7 +2292,7 @@ pub(crate) mod tests {
         let f = derive(&run, &legacy);
         let s = f.iter().find(|x| x.code == "server_latency").unwrap();
         assert_eq!(
-            s.verification.as_ref().unwrap().overrides.knobs["concurrency"],
+            s.verification.as_ref().unwrap().overrides.workload["concurrency"],
             "24"
         );
         // A ceiling of 24 in flight: at most 20 workers.
@@ -2300,7 +2300,7 @@ pub(crate) mod tests {
         let f = derive(&run, &legacy);
         let s = f.iter().find(|x| x.code == "server_latency").unwrap();
         let v = s.verification.as_ref().unwrap();
-        assert_eq!(v.overrides.knobs["concurrency"], "20", "{s:#?}");
+        assert_eq!(v.overrides.workload["concurrency"], "20", "{s:#?}");
         assert!(s.advice.contains("at most 20 workers"), "{}", s.advice);
         assert!(v.expect.iter().any(|e| e.metric == "summary.ops_per_s"));
         // Already at the safe concurrency: no more workers, and no verification.
@@ -2311,7 +2311,7 @@ pub(crate) mod tests {
         assert!(s.advice.starts_with("Do not add workers"), "{}", s.advice);
         for f in &f {
             if let Some(v) = &f.verification
-                && let Some(c) = v.overrides.knobs.get("concurrency")
+                && let Some(c) = v.overrides.workload.get("concurrency")
             {
                 assert!(c.parse::<u64>().unwrap() <= 20, "{f:#?}");
             }
@@ -2380,7 +2380,7 @@ pub(crate) mod tests {
         let e = f.iter().find(|x| x.code == "errors").unwrap();
         assert!(e.advice.contains("HTTP/2"), "{}", e.advice);
         assert_eq!(
-            e.verification.as_ref().unwrap().overrides.knobs["http_version"],
+            e.verification.as_ref().unwrap().overrides.operator["http.version"],
             "h1"
         );
         // Idempotent: validity applied twice changes nothing.
@@ -2478,21 +2478,24 @@ pub(crate) mod tests {
     fn verification_commands_reproduce_the_run_except_the_change() {
         let mut run = straggler_run();
         run.report.run.id = "20261121-101010-abcd".into();
-        let mut t = crate::config::TargetSpec::from_url("s3://bkt/x").unwrap();
-        t.options
+        let mut p = crate::config::Profile::from_url("s3://bkt/x");
+        p.operator
+            .options
             .insert("endpoint".into(), "https://minio.local:9000".into());
-        t.options.insert("region".into(), "eu-west-1".into());
-        let mut p = crate::config::Profile::from_target(t);
+        p.operator.options.insert("region".into(), "eu-west-1".into());
         p.workload.preset = crate::config::Preset::SmallFiles;
         p.workload.duration = crate::util::HumanDuration::secs(12);
         p.workload.warmup = crate::util::HumanDuration(std::time::Duration::from_millis(500));
         p.workload.seed = 9;
         p.workload.max_ops = Some(5000);
-        p.knobs.concurrency = 24;
-        p.knobs.io_concurrency = 3;
-        p.knobs.http_version = crate::net::HttpVersion::H1;
-        p.knobs.max_inflight_requests = 16;
-        p.knobs.keep_alive = false;
+        p.workload.concurrency = 24;
+        p.operator.read.concurrent = Some(3);
+        p.operator.http.version = crate::net::HttpVersion::H1;
+        p.operator.layers.concurrent_limit = Some(crate::operator::ConcurrentLimit {
+            http: Some(16),
+            operations: None,
+        });
+        p.operator.http.keep_alive = false;
         run.report.spec = crate::model::RunSpec::new(&p, "s3://bkt/x");
         let found = derive(&run, &[]);
         assert!(found.iter().any(|f| f.verification.is_some()), "{found:#?}");
@@ -2500,11 +2503,11 @@ pub(crate) mod tests {
             let Some(v) = &f.verification else { continue };
             assert_eq!(
                 v.command,
-                format!("oprobe verify 20261121-101010-abcd {}", f.code)
+                format!("oprobe prove 20261121-101010-abcd {}", f.code)
             );
             assert!(
                 v.rerun
-                    .starts_with("oprobe run --from 20261121-101010-abcd --set "),
+                    .starts_with("oprobe prove 20261121-101010-abcd --with "),
                 "{}",
                 v.rerun
             );
@@ -2513,9 +2516,9 @@ pub(crate) mod tests {
             // CLI parses `RunSpec::command` back to the same profile: `oprobe`'s cli tests).
             let changed = run.report.spec.with(&v.overrides);
             assert_eq!(v.replay, changed.command());
-            assert_eq!(changed.target_ref, "s3://bkt/x", "{}", v.replay);
+            assert_eq!(changed.operator_ref, "s3://bkt/x", "{}", v.replay);
             let got = changed.resolved_profile();
-            assert_eq!(got.target.options["endpoint"], "https://minio.local:9000");
+            assert_eq!(got.operator.options["endpoint"], "https://minio.local:9000");
             assert_eq!(got.workload.seed, 9);
             assert_eq!(got.workload.warmup.get().as_millis(), 500);
         }

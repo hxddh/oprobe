@@ -174,7 +174,7 @@ impl CommandOutput for VerifyResult {
             if f.outcome == VerifyOutcome::Confirmed {
                 v.push(NextStep::new(
                     format!("apply the confirmed change of `{}`", f.code),
-                    crate::model::RunSpec::rerun_from(&self.run_id, &f.overrides),
+                    crate::model::RunSpec::prove_command(&self.run_id, &f.overrides),
                 ));
             }
         }
@@ -210,20 +210,6 @@ pub struct VerifyCfg<'a> {
     pub max_throttle_ratio: f64,
 }
 
-/// The profile request of a replay: `run --from RUN --set … --label LABEL`.
-pub fn replay_request(run_id: &str, o: &Overrides, label: &str) -> ProfileRequest {
-    ProfileRequest {
-        from: Some(run_id.to_owned()),
-        set: o
-            .entries()
-            .into_iter()
-            .map(|(k, v)| format!("{k}={v}"))
-            .collect(),
-        label: Some(label.to_owned()),
-        ..ProfileRequest::default()
-    }
-}
-
 /// Replays of one run (`run --from RUN --set …`, in process): the run's resolved profile and
 /// one guard for the whole command, so `--max-requests`, `--max-bytes` and
 /// `--max-duration` cap every replay together (as with `run --repeat`).
@@ -248,8 +234,11 @@ impl<'a> Replayer<'a> {
         no_save: bool,
         cancel: Cancel,
     ) -> Result<Self> {
-        let (base, target_name) =
-            super::profile::spec_profile(ctx, run.report.spec.clone(), &ProfileRequest::default())?;
+        let base = super::profile::spec_profile(ctx, run.report.spec.clone())?;
+        let target_name =
+            crate::operator::resolve::resolve(&run.report.spec.operator_ref, ctx.config()?)
+                .ok()
+                .and_then(|(_, s)| s.name());
         Self::new(ctx, base, target_name, safety, no_save, cancel)
     }
 
@@ -797,7 +786,7 @@ pub async fn verify_hypotheses(
                 .unwrap_or_else(|| run.report.capacity.clone());
             let c = h
                 .overrides
-                .knobs
+                .workload
                 .get("concurrency")
                 .and_then(|v| v.parse::<u32>().ok())
                 .or_else(|| {
@@ -947,8 +936,7 @@ pub async fn verify(ctx: &Ctx, a: VerifyRequest, cancel: Cancel) -> Result<Verif
         .max_throttle_rate
         .unwrap_or(crate::config::defaults().tune.max_throttle_ratio);
     if a.safety.dry_run {
-        let ra = replay_request(run.id(), &Overrides::new(), "verify");
-        let (profile, _) = super::profile::run_profile(ctx, &ra)?;
+        let profile = super::profile::spec_profile(ctx, run.report.spec.clone())?;
         let rails = super::run::rails(ctx, &profile, &a.safety)?;
         let mut plan = rails.plan(&profile);
         let runs = a.repeat * (hyps.len() + 1);
@@ -971,7 +959,7 @@ pub async fn verify(ctx: &Ctx, a: VerifyRequest, cancel: Cancel) -> Result<Verif
         "{} {} · {} · {} pair(s): {}",
         bold("oprobe verify"),
         run.id(),
-        shell_quote(&run.report.spec.target_ref),
+        shell_quote(&run.report.spec.operator_ref),
         a.repeat,
         hyps.iter()
             .map(|h| format!("{} ({})", h.code, h.overrides.summary()))
@@ -1149,12 +1137,4 @@ mod tests {
         assert!(default_expectations("small_objects", 0.001).1);
     }
 
-    #[test]
-    fn replays_name_the_run_and_the_change() {
-        let o = Overrides::new().with_set("concurrency", "5");
-        let ra = replay_request("20261121-101010-abcd", &o, "verify-x");
-        assert_eq!(ra.from.as_deref(), Some("20261121-101010-abcd"));
-        assert_eq!(ra.set, vec!["concurrency=5".to_owned()]);
-        assert_eq!(ra.label.as_deref(), Some("verify-x"));
-    }
 }

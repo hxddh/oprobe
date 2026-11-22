@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use super::capacity::Capacity;
 use super::stats::{Rng, quantile_us_ms};
-use crate::engine::stack::{ClientStack, TAIL_CUT_BLIND_START, TailCutHistogram, TailCutParams};
+use crate::engine::stack::{RetryParams, TAIL_CUT_BLIND_START, TailCutHistogram, TailCutParams};
 use crate::model::{OpRow, ReqRow, Run};
 
 /// The predicted effect of one setting change.
@@ -86,16 +86,17 @@ pub struct TailCutSetup {
 }
 
 impl TailCutSetup {
-    /// The layer of a client with the run's knobs (tail-cut switched on), built when the
-    /// warmup began. `None` when retries are off: a cut request would fail instead of being
-    /// re-issued.
+    /// The layer on the run's operator (tail-cut switched on), built when the warmup began.
+    /// `None` when retries are off: a cut request would fail instead of being re-issued.
     pub fn of(r: &crate::model::Report) -> Option<Self> {
-        let mut k = r.knobs.requested.to_knobs();
-        k.tail_cut = true;
-        let stack = ClientStack::from_knobs(&k);
-        let retry = stack.retry?;
+        let op = &r.spec.profile.operator;
+        let retry = RetryParams::of(op.layers.retry.as_ref()?);
+        let mut params = TailCutParams::for_timeout(op.op_timeout());
+        if let Some(t) = &op.layers.tail_cut {
+            params.percentile = t.percentile;
+        }
         Some(Self {
-            params: stack.tail_cut?,
+            params,
             backoff_us: retry.first_backoff_mean().as_micros() as u64,
             blind_until_us: ((TAIL_CUT_BLIND_START.as_secs_f64() - r.workload.warmup_s) * 1e6)
                 as i64,
@@ -453,6 +454,11 @@ pub(crate) mod tests {
         report.summary.ops_per_s = 200.0;
         report.knobs.requested = (&crate::config::Knobs::default()).into();
         report.knobs.requested.concurrency_count = 2;
+        report.spec.profile.operator.layers.retry = Some(crate::operator::Retry {
+            min_delay: crate::util::HumanDuration(std::time::Duration::from_millis(50)),
+            jitter: true,
+            ..Default::default()
+        });
         Run { report, ops, reqs }
     }
 
@@ -478,7 +484,7 @@ pub(crate) mod tests {
         assert!((setup.blind_s(5.0) - 5.0).abs() < 1e-9);
         // Without retries a cut request would fail: no estimate.
         let mut r = run.report.clone();
-        r.knobs.requested.retries_count = 0;
+        r.spec.profile.operator.layers.retry = None;
         assert!(TailCutSetup::of(&r).is_none());
     }
 

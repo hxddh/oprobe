@@ -11,7 +11,6 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 pub use crate::config::tune_defaults;
-use crate::net::HttpVersion;
 pub use crate::tune::Objective;
 
 /// `--fail-on`: findings of this severity or worse fail the command (exit 3).
@@ -32,19 +31,17 @@ pub enum SlaMode {
     None,
 }
 
-/// How a run's profile is put together: the flag groups, or a stored run (`from`) with the
-/// flags on top, then `set` pairs and the label (as `oprobe run`).
+/// How a run's profile is put together: the operator, the workload flags and `[defaults]`,
+/// then `set` pairs and the label (as `oprobe run`).
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct ProfileRequest {
-    pub target: TargetInput,
+    /// The operator: a URL (`s3://bucket/prefix`, `lab://demo`), an operator file (`op.toml`)
+    /// or a name of the config file's `[operators.NAME]`
+    pub operator: String,
     pub workload: WorkloadInput,
-    pub knobs: KnobInput,
     pub sla: SlaInput,
-    /// Replay a stored run (RUNREF): its spec, with credentials resolved again from the
-    /// target; the flag groups and `set` override it
-    pub from: Option<String>,
-    /// `--set KEY=VALUE` pairs, applied last
+    /// `--set PATH=VALUE` pairs (operator paths, workload and SLA keys), applied last
     pub set: Vec<String>,
     /// Label stored in the report
     pub label: Option<String>,
@@ -88,37 +85,16 @@ impl Safety {
     }
 }
 
-/// Where to benchmark.
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, Default)]
-#[serde(default)]
-pub struct TargetInput {
-    /// Target name (see `oprobe target list`) or storage URL: s3://bucket/prefix, gcs://bucket,
-    /// azblob://container, oss://, cos://, b2://, fs:///path, memory://
-    pub target: Option<String>,
-    /// Load a profile (TOML); flags override its values
-    pub profile: Option<PathBuf>,
-    /// Custom endpoint (MinIO, R2, Ceph, private clouds)
-    pub endpoint: Option<String>,
-    /// Region of the bucket (e.g. us-east-1); most S3-compatible services accept any value
-    pub region: Option<String>,
-    /// Extra backend option, repeatable (e.g. --option enable_virtual_host_style=true)
-    pub options: Vec<String>,
-    /// Access a public bucket without credentials (s3, gcs, azblob, oss: unsigned requests)
-    pub anonymous: bool,
-    /// Trust an extra PEM CA bundle
-    pub ca_cert: Option<PathBuf>,
-    /// Skip TLS certificate verification (development only)
-    pub insecure: bool,
-    /// Egress proxy URL, or `none` to ignore HTTPS_PROXY/HTTP_PROXY
-    pub proxy: Option<String>,
-}
-
 /// What to run.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, Default)]
 #[serde(default)]
 pub struct WorkloadInput {
-    /// Workload preset: parquet, checkpoint, small-files, metadata, mixed
+    /// Workload preset: small-files, large-objects, range-reads, list-stat
     pub preset: Option<String>,
+    /// Concurrent operations
+    pub concurrency: Option<usize>,
+    /// Seed of the workload's random choices
+    pub seed: Option<u64>,
     /// Measurement window (e.g. 30s, 2m)
     pub duration: Option<String>,
     /// Warmup before measuring (connections, caches)
@@ -145,38 +121,6 @@ pub struct WorkloadInput {
     pub arrivals: Option<String>,
     /// Time-varying open-loop rate: ramp:FROM..TO/D, step:R1,R2,…/D, diurnal[:MIN..MAX/P]
     pub shape: Option<String>,
-}
-
-/// Client configuration under test.
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, Default)]
-#[serde(default)]
-pub struct KnobInput {
-    /// Concurrent operations (workers)
-    pub concurrency: Option<usize>,
-    /// Per-operation reader/writer parallelism
-    pub io_concurrency: Option<usize>,
-    /// Reader/writer chunk and multipart part size (e.g. 8MiB)
-    pub chunk_size: Option<String>,
-    /// Merge vectored ranges closer than this (e.g. 64KiB)
-    pub range_gap: Option<String>,
-    /// Cap in-flight HTTP requests (0 = unlimited)
-    pub max_inflight: Option<usize>,
-    /// HTTP version
-    pub http: Option<HttpVersion>,
-    /// Open a new connection for every request
-    pub no_keep_alive: bool,
-    /// Enable the in-memory read cache with this size (e.g. 512MiB)
-    pub cache: Option<String>,
-    /// Retry attempts for temporary errors
-    pub retries: Option<usize>,
-    /// Cancel and retry straggler requests (TailCutLayer)
-    pub tail_cut: bool,
-    /// S3 bucket addressing: auto (as configured), virtual (bucket.host) or path (host/bucket)
-    pub addressing: Option<String>,
-    /// Checksum computed by the client and verified by the server on writes (S3: crc32c)
-    pub checksum: Option<String>,
-    /// Server-side encryption of written objects (S3: AES256, aws:kms)
-    pub sse: Option<String>,
 }
 
 /// Service level objectives (`[sla]` in a profile). By default `oprobe run` / `tune` exit with
@@ -254,9 +198,9 @@ impl Default for TuneSearch {
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, Default)]
 #[serde(default)]
 pub struct TuneRequest {
-    pub target: TargetInput,
+    /// The operator (as `oprobe run OPERATOR`)
+    pub operator: String,
     pub workload: WorkloadInput,
-    pub knobs: KnobInput,
     pub sla: SlaInput,
     pub output: OutputOptions,
     pub safety: Safety,
@@ -268,8 +212,6 @@ pub struct TuneRequest {
     pub emit_profile: Option<PathBuf>,
     /// Write a Rust/OpenDAL snippet with the tuned settings
     pub emit_rust: Option<PathBuf>,
-    /// Write a Python/OpenDAL snippet with the tuned settings
-    pub emit_python: Option<PathBuf>,
 }
 
 /// `oprobe verify RUNREF [CODE|--all] [--repeat N]`.
@@ -309,9 +251,9 @@ impl Default for VerifyRequest {
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct FixRequest {
-    pub target: TargetInput,
+    /// The operator (as `oprobe run OPERATOR`)
+    pub operator: String,
     pub workload: WorkloadInput,
-    pub knobs: KnobInput,
     pub sla: SlaInput,
     pub output: OutputOptions,
     pub safety: Safety,
@@ -332,9 +274,8 @@ pub struct FixRequest {
 impl Default for FixRequest {
     fn default() -> Self {
         Self {
-            target: Default::default(),
+            operator: Default::default(),
             workload: Default::default(),
-            knobs: Default::default(),
             sla: Default::default(),
             output: Default::default(),
             safety: Default::default(),

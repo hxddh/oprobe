@@ -98,6 +98,8 @@ rcgen.workspace = true
 rustls.workspace = true
 tokio-rustls.workspace = true
 rustls-pki-types.workspace = true
+# The in-memory cache behind `layers.cache` (OpenDAL `FoyerLayer`).
+foyer = "0.22"
 
 [target."cfg(windows)".dependencies]
 windows-sys.workspace = true

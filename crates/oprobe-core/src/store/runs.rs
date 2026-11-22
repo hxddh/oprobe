@@ -402,9 +402,7 @@ mod tests {
     use crate::model::*;
 
     pub(crate) fn sample_run(id: &str, label: Option<&str>) -> Run {
-        let p = crate::config::Profile::from_target(
-            crate::config::TargetSpec::from_url("memory://").unwrap(),
-        );
+        let p = crate::config::Profile::from_url("memory://");
         let mut snap = crate::trace::Snapshot {
             elapsed_s: 2.0,
             ..Default::default()
@@ -415,7 +413,7 @@ mod tests {
             run_id: &rid,
             target_name: Some("local".into()),
             profile: &p,
-            knobs: &p.knobs,
+            knobs: &crate::config::Knobs::of(&p),
             snapshot: snap,
             trace: Default::default(),
             cleanup: Default::default(),

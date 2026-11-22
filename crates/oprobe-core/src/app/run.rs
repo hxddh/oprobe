@@ -248,11 +248,11 @@ pub async fn measure_guarded(
         ctx.out.info(format!(
             "{} {} {}",
             bold("oprobe"),
-            profile.target.display(),
+            profile.target().display(),
             dim(&format!(
                 "· {} · {} · run {}",
                 profile.workload.preset.slug(),
-                profile.knobs.summary(),
+                crate::config::Knobs::of(&profile).summary(),
                 rails.run_id
             ))
         ));

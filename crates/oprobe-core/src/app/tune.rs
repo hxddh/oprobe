@@ -164,7 +164,7 @@ impl CommandOutput for TuneOutput {
                 "save the recommended profile",
                 format!(
                     "oprobe tune {} --emit-profile tuned.toml",
-                    crate::model::spec::shell_quote(&self.report.spec.target_ref)
+                    crate::model::spec::shell_quote(&self.report.spec.operator_ref)
                 ),
             ));
         }
@@ -260,7 +260,7 @@ pub async fn run_tune(
     table_line(format!(
         "{} {} {}",
         bold("oprobe tune"),
-        profile.target.display(),
+        profile.target().display(),
         dim(&format!(
             "· {} · objective {} · throttle budget {:.2}% · ≤{} trials of {:.1}s",
             profile.workload.preset.slug(),
@@ -334,7 +334,7 @@ pub async fn run_tune(
         tune,
         wrote: Vec::new(),
         report,
-        session: m.tuned.map(|t| (t.profile.target, t.winner, t.capability)),
+        session: m.tuned.map(|t| (t.profile.target(), t.winner, t.capability)),
     })
 }
 
@@ -349,9 +349,17 @@ pub enum TuneOutcome {
 /// `oprobe tune`: search, write the requested files, and return the result (the CLI prints
 /// [`trial_table`] before it in text mode).
 pub async fn tune(ctx: &Ctx, a: TuneRequest, cancel: Cancel) -> Result<TuneOutcome> {
-    let (mut profile, target_name) =
-        super::profile::resolve_profile(ctx, &a.target, &a.workload, &a.knobs)?;
-    super::profile::apply_sla(&mut profile, &a.sla)?;
+    let (mut profile, src) = super::profile::run_profile(
+        ctx,
+        &ProfileRequest {
+            operator: a.operator.clone(),
+            workload: a.workload.clone(),
+            sla: a.sla.clone(),
+            set: Vec::new(),
+            label: None,
+        },
+    )?;
+    let target_name = src.name();
     if a.output.label.is_some() {
         profile.name = a.output.label.clone();
     }
@@ -410,35 +418,23 @@ pub async fn tune(ctx: &Ctx, a: TuneRequest, cancel: Cancel) -> Result<TuneOutco
             Some(r) => r.profile_toml.clone(),
             None => {
                 let tp = crate::tune::recommend::portable_profile(&out.report.spec);
-                codegen::profile_toml(&tp, &out.report.spec.profile.knobs, &header)?
+                codegen::profile_toml(&tp, &crate::config::Knobs::of(&out.report.spec.profile), &header)?
             }
         };
         write_file(p, &text)?;
         out.wrote
             .push(("profile".to_owned(), p.display().to_string()));
     }
-    let (session_target, knobs, capability) = out.session.clone().unwrap_or_else(|| {
-        (
-            out.report.spec.profile.target.clone(),
-            out.report.spec.profile.knobs.clone(),
-            opendal::Capability::default(),
-        )
-    });
     if let Some(p) = &a.emit_rust {
         let text = match &rec {
             Some(r) => r.rust_snippet.clone(),
-            None => codegen::rust_snippet(&session_target, &knobs, &capability),
+            None => codegen::rust_snippet(
+                &out.report.spec.profile,
+                &crate::config::Knobs::of(&out.report.spec.profile),
+            ),
         };
         write_file(p, &text)?;
         out.wrote.push(("rust".to_owned(), p.display().to_string()));
-    }
-    if let Some(p) = &a.emit_python {
-        write_file(
-            p,
-            &codegen::python_snippet(&session_target, &knobs, &capability),
-        )?;
-        out.wrote
-            .push(("python".to_owned(), p.display().to_string()));
     }
     Ok(TuneOutcome::Tuned(Box::new(out)))
 }

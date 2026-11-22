@@ -31,22 +31,17 @@ fn safety(a: &SafetyArgs) -> i::Safety {
 fn profile_request(operator: &str, f: &RunFlags) -> i::ProfileRequest {
     let w = &f.workload;
     i::ProfileRequest {
-        target: i::TargetInput {
-            target: Some(operator.to_owned()),
-            ..Default::default()
-        },
+        operator: operator.to_owned(),
         workload: i::WorkloadInput {
             preset: w.preset.clone(),
+            concurrency: w.concurrency,
+            seed: w.seed,
             duration: w.duration.clone(),
             warmup: w.warmup.clone(),
             rate: w.rate,
             existing: w.existing.clone(),
             objects: w.objects,
             object_size: w.object_size.clone(),
-            ..Default::default()
-        },
-        knobs: i::KnobInput {
-            concurrency: w.concurrency,
             ..Default::default()
         },
         set: f.set.clone(),

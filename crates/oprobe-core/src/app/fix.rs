@@ -139,7 +139,7 @@ impl CommandOutput for FixOutput {
             return Vec::new();
         }
         let cli = self.unsaved_replay.clone().unwrap_or_else(|| {
-            crate::model::RunSpec::rerun_from(
+            crate::model::RunSpec::prove_command(
                 &self.diagnosis_run_id,
                 &self.recommendation.overrides,
             )
@@ -174,26 +174,32 @@ pub type FixOutcome = FixOutput;
 
 /// `oprobe fix`: diagnose → tune → verify.
 pub async fn fix(ctx: &Ctx, a: FixRequest, cancel: Cancel) -> Result<FixOutcome> {
-    let (mut profile, target_name) = if a.from.is_some() || !a.set.is_empty() {
-        // `--from RUN --set …`: the workload exactly as `run --from` replays it (MCP
-        // `recommend_config` passes a stored run this way, `--existing` prefix included).
-        super::profile::run_profile(
-            ctx,
-            &ProfileRequest {
-                target: a.target.clone(),
-                workload: a.workload.clone(),
-                knobs: a.knobs.clone(),
-                sla: a.sla.clone(),
-                from: a.from.clone(),
-                set: a.set.clone(),
-                label: None,
-            },
-        )?
-    } else {
-        let (mut p, name) =
-            super::profile::resolve_profile(ctx, &a.target, &a.workload, &a.knobs)?;
-        super::profile::apply_sla(&mut p, &a.sla)?;
-        (p, name)
+    let (mut profile, target_name) = match &a.from {
+        // A stored run's workload and operator, replayed.
+        Some(r) => {
+            let run = ctx.store().load(r)?;
+            let name = crate::operator::resolve::resolve(&run.report.spec.operator_ref, ctx.config()?)
+                .ok()
+                .and_then(|(_, s)| s.name());
+            let mut p = super::profile::spec_profile(ctx, run.report.spec)?;
+            let mut label = p.name.clone();
+            crate::model::Overrides::parse(&a.set)?.apply(&mut p, &mut label)?;
+            p.name = label;
+            (p, name)
+        }
+        None => {
+            let (p, src) = super::profile::run_profile(
+                ctx,
+                &ProfileRequest {
+                    operator: a.operator.clone(),
+                    workload: a.workload.clone(),
+                    sla: a.sla.clone(),
+                    set: a.set.clone(),
+                    label: None,
+                },
+            )?;
+            (p, src.name())
+        }
     };
     if a.output.label.is_some() {
         profile.name = a.output.label.clone();
@@ -248,9 +254,9 @@ pub async fn fix(ctx: &Ctx, a: FixRequest, cancel: Cancel) -> Result<FixOutcome>
         .clone()
         .context("the tuner produced no recommendation")?;
     // The change relative to the diagnosis run.
-    let winner = tuned.report.spec.profile.knobs.clone();
+    let winner = crate::config::Knobs::of(&tuned.report.spec.profile);
     rec.overrides =
-        crate::tune::recommend::knob_overrides(&diag.report.spec.profile.knobs, &winner);
+        crate::tune::recommend::knob_overrides(&crate::config::Knobs::of(&diag.report.spec.profile), &winner);
     if let Some(r) = tuned
         .tune
         .trials
@@ -349,7 +355,7 @@ pub async fn fix(ctx: &Ctx, a: FixRequest, cancel: Cancel) -> Result<FixOutcome>
                 && diag.report.summary.error_rate <= diag.report.sla.max_error_ratio,
             ..Default::default()
         };
-        let from = diag.report.spec.profile.knobs.clone();
+        let from = crate::config::Knobs::of(&diag.report.spec.profile);
         let diag_rate = diag.report.spec.profile.workload.rate;
         let ov = move |tr: &crate::tune::Trial| {
             let mut o = crate::tune::recommend::knob_overrides(&from, &tr.knobs);
@@ -393,7 +399,7 @@ pub async fn fix(ctx: &Ctx, a: FixRequest, cancel: Cancel) -> Result<FixOutcome>
             .map(|f| f.code.clone())
             .collect(),
         tune_run_id: tuned.run_id.clone(),
-        profile_patch: knobs_patch(&diag.report.spec.profile.knobs, &winner),
+        profile_patch: knobs_patch(&crate::config::Knobs::of(&diag.report.spec.profile), &winner),
         recommendation: rec,
         options,
         verify,

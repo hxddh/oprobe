@@ -1,7 +1,8 @@
-//! Profile model (`*.toml`): target, workload, knobs and SLA.
+//! The profile of a run: the operator under test ([`crate::operator::OperatorSpec`]), the
+//! workload and the SLA; and the service targets an operator URL resolves to ([`TargetSpec`]).
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -15,10 +16,6 @@ use crate::util::{ByteSize, HumanDuration};
 /// profile; [`Profile::load`] re-codes them `config.invalid`).
 fn invalid(msg: impl Into<String>) -> anyhow::Error {
     crate::input::invalid(msg).into()
-}
-
-fn usage(msg: impl Into<String>) -> anyhow::Error {
-    invalid(msg)
 }
 
 /// Defaults of `oprobe tune`, shared with the app's Tune page and MCP so every surface runs
@@ -61,7 +58,6 @@ pub struct TuneDefaults {
 #[derive(Clone, Debug, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct BuiltinDefaults {
     pub workload: WorkloadSpec,
-    pub knobs: Knobs,
     pub sla: Sla,
     pub tune: TuneDefaults,
     /// Spare in-flight capacity kept below a measured ceiling (`analysis::capacity`).
@@ -77,7 +73,6 @@ pub fn defaults() -> BuiltinDefaults {
     let d = |s: &str| HumanDuration(crate::util::parse_duration(s).unwrap_or_default());
     BuiltinDefaults {
         workload: WorkloadSpec::default(),
-        knobs: Knobs::default(),
         sla: Sla::default(),
         tune: TuneDefaults {
             trial_duration: d(tune_defaults::TRIAL_DURATION),
@@ -95,22 +90,21 @@ pub fn defaults() -> BuiltinDefaults {
     }
 }
 
-/// Complete, round-trippable benchmark profile.
+/// Complete, round-trippable profile of a run: the operator, the workload and the SLA.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Profile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    pub target: TargetSpec,
+    pub operator: crate::operator::OperatorSpec,
     #[serde(default)]
     pub workload: WorkloadSpec,
-    #[serde(default)]
-    pub knobs: Knobs,
     #[serde(default)]
     pub sla: Sla,
 }
 
-/// Storage target. Either `url = "s3://bucket/prefix"` or explicit `scheme` + `options`.
+/// The service an operator URL resolves to (`url` plus `options`, or explicit `scheme` +
+/// `options`): the internal form OpenDAL's service builders take.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TargetSpec {
@@ -616,6 +610,9 @@ impl Default for DatasetSpec {
 pub struct WorkloadSpec {
     #[serde(default)]
     pub preset: Preset,
+    /// Concurrent logical operations (closed-loop workers, or the open-loop in-flight cap).
+    #[serde(default = "default_concurrency")]
+    pub concurrency: usize,
     #[serde(default = "default_duration")]
     pub duration: HumanDuration,
     #[serde(default = "default_warmup")]
@@ -668,6 +665,7 @@ impl Default for WorkloadSpec {
     fn default() -> Self {
         Self {
             preset: Preset::default(),
+            concurrency: default_concurrency(),
             duration: default_duration(),
             warmup: default_warmup(),
             max_ops: None,
@@ -721,7 +719,10 @@ impl WorkloadSpec {
     }
 }
 
-/// Client-side configuration under test / being tuned.
+/// The tuner's search vector (transitional, until `prove` replaces the tuner): the workload's
+/// concurrency and the operator values the tuner varies, flattened. Derived from a profile
+/// ([`Knobs::of`]) and written back to one ([`Knobs::apply`]); never stored in a profile.
+/// `chunk_size` and `range_gap` are 0 when unset (OpenDAL's default).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Knobs {
@@ -758,99 +759,19 @@ pub struct Knobs {
     /// Per-operation timeout.
     #[serde(default = "default_timeout")]
     pub timeout: HumanDuration,
-    /// Provider request options (addressing style, checksums, SSE), applied when the session
-    /// opens.
-    #[serde(default, skip_serializing_if = "ProviderKnobs::is_default")]
-    pub provider: ProviderKnobs,
-}
-
-/// S3 bucket addressing.
-#[derive(
-    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
-)]
-#[serde(rename_all = "lowercase")]
-pub enum Addressing {
-    /// As the target configures it (OpenDAL's default: path style unless
-    /// `enable_virtual_host_style`).
-    #[default]
-    Auto,
-    /// `https://bucket.s3.region.amazonaws.com/key`.
-    Virtual,
-    /// `https://s3.region.amazonaws.com/bucket/key`.
-    Path,
-}
-
-/// Provider request options measured for their overhead (S3 service options).
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct ProviderKnobs {
-    #[serde(default)]
-    pub addressing: Addressing,
-    /// Checksum the client computes and the server verifies on writes (`crc32c`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub checksum: Option<String>,
-    /// Server-side encryption: `AES256` or `aws:kms`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sse: Option<String>,
-}
-
-impl ProviderKnobs {
-    pub fn is_default(&self) -> bool {
-        *self == Self::default()
-    }
-
-    /// The target options these knobs set (S3 only; an error elsewhere).
-    pub fn options(&self, scheme: &str) -> Result<Vec<(&'static str, String)>> {
-        if self.is_default() {
-            return Ok(Vec::new());
-        }
-        if scheme != "s3" {
-            return Err(usage(format!(
-                "addressing / checksum / sse knobs apply to S3-compatible targets only (this target is `{scheme}`)"
-            )));
-        }
-        let mut o = Vec::new();
-        match self.addressing {
-            Addressing::Auto => {}
-            Addressing::Virtual => o.push(("enable_virtual_host_style", "true".to_owned())),
-            Addressing::Path => o.push(("enable_virtual_host_style", "false".to_owned())),
-        }
-        if let Some(c) = &self.checksum {
-            let c = c.trim().to_ascii_lowercase();
-            if c != "crc32c" {
-                return Err(crate::input::invalid(format!("unsupported checksum `{c}`"))
-                    .with_hint("OpenDAL's S3 service supports crc32c")
-                    .into());
-            }
-            o.push(("checksum_algorithm", c));
-        }
-        if let Some(s) = &self.sse {
-            let s = s.trim();
-            if !matches!(s, "AES256" | "aws:kms" | "aws:kms:dsse") {
-                return Err(crate::input::invalid(format!("unsupported sse `{s}`"))
-                    .with_hint(crate::input::choices_hint(
-                        s,
-                        &["AES256", "aws:kms", "aws:kms:dsse"],
-                    ))
-                    .into());
-            }
-            o.push(("server_side_encryption", s.to_owned()));
-        }
-        Ok(o)
-    }
 }
 
 fn default_concurrency() -> usize {
     16
 }
 fn default_io_concurrency() -> usize {
-    4
+    1
 }
 fn default_chunk() -> ByteSize {
-    ByteSize::mib(8)
+    ByteSize(0)
 }
 fn default_gap() -> ByteSize {
-    ByteSize::kib(64)
+    ByteSize(0)
 }
 fn default_cache_size() -> ByteSize {
     ByteSize::mib(256)
@@ -860,6 +781,10 @@ fn default_retries() -> usize {
 }
 fn default_timeout() -> HumanDuration {
     HumanDuration::secs(60)
+}
+
+fn optional(b: ByteSize) -> Option<ByteSize> {
+    (b.0 > 0).then_some(b)
 }
 
 impl Default for Knobs {
@@ -877,7 +802,6 @@ impl Default for Knobs {
             retries: default_retries(),
             tail_cut: false,
             timeout: default_timeout(),
-            provider: ProviderKnobs::default(),
         }
     }
 }
@@ -898,24 +822,93 @@ impl Knobs {
             if self.tail_cut { " tail-cut" } else { "" },
         )
         .to_ascii_lowercase()
-            + &self.provider_summary()
     }
 
-    fn provider_summary(&self) -> String {
-        let p = &self.provider;
-        let mut s = String::new();
-        if p.addressing != Addressing::Auto {
-            s += &format!(" addressing={:?}", p.addressing).to_ascii_lowercase();
+    /// The knobs of `p`: its workload's concurrency and its operator's values.
+    pub fn of(p: &Profile) -> Self {
+        Self::of_spec(&p.operator, p.workload.concurrency)
+    }
+
+    /// The knobs of operator `o` at `concurrency`.
+    pub fn of_spec(o: &crate::operator::OperatorSpec, concurrency: usize) -> Self {
+        let cache = o.layers.cache.as_ref();
+        Self {
+            concurrency,
+            io_concurrency: o.read_concurrent(),
+            chunk_size: o.read.chunk.or(o.write.chunk).unwrap_or_default(),
+            range_gap: o.read.gap.unwrap_or_default(),
+            max_inflight_requests: o.http_limit().unwrap_or(0),
+            http_version: o.http.version,
+            keep_alive: o.http.keep_alive,
+            cache: cache.is_some(),
+            cache_size: cache.map_or_else(default_cache_size, |c| c.memory),
+            retries: o.retries(),
+            tail_cut: o.layers.tail_cut.is_some(),
+            timeout: HumanDuration(o.op_timeout()),
         }
-        if let Some(c) = &p.checksum {
-            s += &format!(" checksum={c}");
+    }
+
+    /// Write these knobs back to `p` (only the values that differ from `p`'s own).
+    pub fn apply(&self, p: &mut Profile) {
+        p.workload.concurrency = self.concurrency;
+        self.apply_to(&mut p.operator);
+    }
+
+    /// Write every knob but the concurrency to operator `o` (only the values that differ).
+    pub fn apply_to(&self, o: &mut crate::operator::OperatorSpec) {
+        use crate::operator::{Cache, ConcurrentLimit, Retry, TailCut, Timeout};
+        let cur = Self::of_spec(o, self.concurrency);
+        if self.io_concurrency != cur.io_concurrency {
+            o.read.concurrent = Some(self.io_concurrency.max(1));
+            o.write.concurrent = Some(self.io_concurrency.max(1));
         }
-        if let Some(e) = &p.sse {
-            s += &format!(" sse={e}");
+        if self.chunk_size != cur.chunk_size {
+            o.read.chunk = optional(self.chunk_size);
+            o.write.chunk = optional(self.chunk_size);
         }
-        s
+        if self.range_gap != cur.range_gap {
+            o.read.gap = optional(self.range_gap);
+        }
+        if self.max_inflight_requests != cur.max_inflight_requests {
+            let ops = o.layers.concurrent_limit.as_ref().and_then(|c| c.operations);
+            o.layers.concurrent_limit = match (self.max_inflight_requests, ops) {
+                (0, None) => None,
+                (0, Some(n)) => Some(ConcurrentLimit {
+                    http: None,
+                    operations: Some(n),
+                }),
+                (h, ops) => Some(ConcurrentLimit {
+                    http: Some(h),
+                    operations: ops,
+                }),
+            };
+        }
+        o.http.version = self.http_version;
+        o.http.keep_alive = self.keep_alive;
+        if self.cache != cur.cache || (self.cache && self.cache_size != cur.cache_size) {
+            o.layers.cache = self.cache.then_some(Cache {
+                memory: self.cache_size,
+            });
+        }
+        if self.retries != cur.retries {
+            o.layers.retry = (self.retries > 0).then(|| Retry {
+                max_times: self.retries,
+                ..o.layers.retry.clone().unwrap_or_default()
+            });
+        }
+        if self.tail_cut != cur.tail_cut {
+            o.layers.tail_cut = self.tail_cut.then(TailCut::default);
+        }
+        if self.timeout != cur.timeout {
+            let io = o.layers.timeout.as_ref().map_or(Timeout::default().io, |t| t.io);
+            o.layers.timeout = Some(Timeout {
+                op: self.timeout,
+                io: io.min(self.timeout),
+            });
+        }
     }
 }
+
 
 /// Service level objectives. `oprobe run` / `oprobe tune` exit with code 3 when the measured
 /// result breaches them (unless `enforce = false` / `--sla none`); the tuner rejects trials that
@@ -1223,7 +1216,7 @@ impl TargetSpec {
                     .join(" and "),
             ))
             .with_hint(format!(
-                "add `--option {}=VALUE` (or `?{}=VALUE` in the URL, or under [targets.NAME.options] in the config file)",
+                "add `--set options.{}=VALUE` (or `?{}=VALUE` in the URL, or under [operators.NAME.options] in the config file)",
                 missing[0], missing[0]
             ))
             .into());
@@ -1271,7 +1264,7 @@ impl TargetSpec {
                             "r2:// needs your Cloudflare account_id or an endpoint",
                         )
                         .with_hint(
-                            "add `--option account_id=<ACCOUNT_ID>` (or `account_id = \"${R2_ACCOUNT_ID}\"` \
+                            "add `--set options.account_id=<ACCOUNT_ID>` (or `account_id = \"${R2_ACCOUNT_ID}\"` \
                              under [targets.NAME.options]), or pass \
                              `--endpoint https://<ACCOUNT_ID>.r2.cloudflarestorage.com`",
                         )
@@ -1490,34 +1483,6 @@ pub fn anonymous_options(scheme: &str) -> Result<&'static [(&'static str, &'stat
     })
 }
 
-/// Options `from_url` derives from URL credentials: always kept (as `${ENV}` references) when
-/// writing a profile, since the URL written back no longer carries them.
-fn is_url_secret(k: &str) -> bool {
-    matches!(k, "username" | "password")
-}
-
-/// A value made only of `${NAME}` references (e.g. `${AWS_SECRET_ACCESS_KEY}`).
-fn is_env_reference(v: &str) -> bool {
-    let mut rest = v.trim();
-    if rest.is_empty() {
-        return false;
-    }
-    while !rest.is_empty() {
-        let Some(after) = rest.strip_prefix("${") else {
-            return false;
-        };
-        let Some(end) = after.find('}') else {
-            return false;
-        };
-        let name = &after[..end];
-        if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
-            return false;
-        }
-        rest = &after[end + 1..];
-    }
-    true
-}
-
 /// Expand `${NAME}` references from the environment.
 pub fn expand_env(v: &str) -> Result<String> {
     let mut out = String::with_capacity(v.len());
@@ -1544,69 +1509,42 @@ pub fn expand_env(v: &str) -> Result<String> {
 }
 
 impl Profile {
-    /// A `lab://NAME` target starts from its scenario's default workload
-    /// ([`crate::lab::Scenario::defaults`]).
-    pub fn from_target(target: TargetSpec) -> Self {
-        let scenario = target.url.as_deref().and_then(crate::lab::Scenario::of_url);
+    /// The default profile of `operator`. A `lab://NAME` operator starts from its scenario's
+    /// default workload ([`crate::lab::Scenario::defaults`]).
+    pub fn from_operator(operator: crate::operator::OperatorSpec) -> Self {
+        let scenario = crate::lab::Scenario::of_url(&operator.url);
         let mut p = Self {
             name: None,
-            target,
+            operator,
             workload: WorkloadSpec::default(),
-            knobs: Knobs::default(),
             sla: Sla::default(),
-            };
+        };
         if let Some(sc) = scenario {
             sc.apply_defaults(&mut p);
         }
         p
     }
 
-    /// Load and validate a profile file: a missing file is `usage.invalid_argument`, a file that
-    /// does not parse or validate is `config.invalid`.
-    pub fn load(path: &Path) -> Result<Self> {
-        use crate::errors::{ErrorCode, OprobeError};
-        let raw = std::fs::read_to_string(path).map_err(|e| {
-            OprobeError::new(
-                ErrorCode::UsageInvalidArgument,
-                format!("cannot read profile `{}`: {e}", path.display()),
-            )
-            .with_hint(
-                "pass the path of a profile TOML file (`oprobe init > profile.toml` writes one)",
-            )
-        })?;
-        let p: Profile = toml::from_str(&raw).map_err(|e| {
-            OprobeError::new(
-                ErrorCode::ConfigInvalid,
-                format!("invalid profile `{}`: {e}", path.display()),
-            )
-        })?;
-        p.validate().map_err(|e| {
-            let body = crate::errors::classify(&e, "s3");
-            let mut o = OprobeError::new(
-                ErrorCode::ConfigInvalid,
-                format!("invalid profile `{}`: {}", path.display(), body.message),
-            );
-            o.hint = body.hint;
-            o
-        })?;
-        Ok(p)
+    /// The default profile of a URL.
+    pub fn from_url(url: &str) -> Self {
+        Self::from_operator(crate::operator::OperatorSpec::from_url(url))
+    }
+
+    /// The service target of the operator, normalized when it resolves (else as written).
+    pub fn target(&self) -> TargetSpec {
+        let t = self.operator.target_spec();
+        t.normalized().unwrap_or(t)
     }
 
     /// Check every value; errors are typed (`usage.invalid_argument`, or `config.unknown_option`
-    /// for backend options the service would ignore).
+    /// for service options the service would ignore).
     pub fn validate(&self) -> Result<()> {
-        self.target.normalized()?;
-        let k = &self.knobs;
-        if k.concurrency < 1 {
-            return Err(invalid("knobs.concurrency must be >= 1"));
-        }
-        if k.io_concurrency < 1 {
-            return Err(invalid("knobs.io_concurrency must be >= 1"));
-        }
-        if k.chunk_size.0 < 4096 {
-            return Err(invalid("knobs.chunk_size must be >= 4KiB"));
-        }
+        self.operator.validate()?;
+        let target = self.operator.target()?;
         let w = &self.workload;
+        if w.concurrency < 1 {
+            return Err(invalid("workload.concurrency must be >= 1"));
+        }
         if let Some(r) = w.rate
             && !(r.is_finite() && r > 0.0)
         {
@@ -1630,7 +1568,7 @@ impl Profile {
                 "workload.mix needs at least one op with weight > 0",
             ));
         }
-        if let Some(e) = self.target.options.get("endpoint")
+        if let Some(e) = target.options.get("endpoint")
             && !e.contains("${")
         {
             crate::input::endpoint(e)?;
@@ -1639,44 +1577,10 @@ impl Profile {
         Ok(())
     }
 
-    /// Serialize to TOML. Secrets are never stored: secret options become `${ENV}` references
-    /// (existing references are kept as written), credentials embedded in URLs are dropped, and
-    /// options that merely restate the target URL are left out so the file stays as the user
-    /// wrote it.
+    /// Serialize to TOML (secrets redacted).
     pub fn to_toml(&self) -> Result<String> {
         let mut p = self.clone();
-        let t = &mut p.target;
-        if let Some(url) = t.url.clone() {
-            // Options derived from the URL (bucket, root, scheme...) are re-derived on load.
-            if let Ok(base) = TargetSpec::from_url(&url) {
-                t.options.retain(|k, v| {
-                    base.options
-                        .get(k)
-                        .is_none_or(|b| b != v || is_url_secret(k))
-                });
-                if t.scheme == base.scheme {
-                    t.scheme.clear();
-                }
-            }
-            t.url = Some(crate::util::strip_url_credentials(&url));
-        }
-        t.options = std::mem::take(&mut t.options)
-            .into_iter()
-            .map(|(k, v)| {
-                if crate::util::is_secret_key(&k) {
-                    if is_env_reference(&v) {
-                        (k, v)
-                    } else {
-                        let env = k.to_ascii_uppercase().replace('-', "_");
-                        (k, format!("${{{env}}}"))
-                    }
-                } else {
-                    let v = crate::util::strip_url_credentials(&v);
-                    (k, v)
-                }
-            })
-            .collect();
-        t.proxy = t.proxy.as_deref().map(crate::util::strip_url_credentials);
+        p.operator = p.operator.redacted();
         Ok(toml::to_string_pretty(&p)?)
     }
 
@@ -1751,10 +1655,6 @@ mod tests {
         );
         assert_eq!(n.options["region"], "auto");
         assert!(!n.options.contains_key("account_id"));
-        // A profile written from it reloads to the same target.
-        let toml = Profile::from_target(n.clone()).to_toml().unwrap();
-        let back: Profile = toml::from_str(&toml).unwrap();
-        assert_eq!(back.target.normalized().unwrap().endpoint(), n.endpoint());
 
         let mut m = TargetSpec::from_url("minio://bkt").unwrap();
         m.options
@@ -1767,12 +1667,14 @@ mod tests {
     #[test]
     fn profile_roundtrip_and_presets() {
         let src = r#"
-            [target]
+            [operator]
             url = "s3://bucket/bench"
             options = { endpoint = "http://127.0.0.1:9000" }
+            read = { chunk = "4MiB" }
 
             [workload]
             preset = "mixed"
+            concurrency = 8
             duration = "5s"
             access = "zipf:1.2"
             [[workload.mix]]
@@ -1785,15 +1687,13 @@ mod tests {
             column_size = "128KiB"
             footer_size = "16KiB"
 
-            [knobs]
-            concurrency = 8
-            chunk_size = "4MiB"
         "#;
         let p: Profile = toml::from_str(src).unwrap();
         p.validate().unwrap();
         assert_eq!(p.workload.access, Access::Zipf(1.2));
         assert_eq!(p.workload.mix.len(), 2);
-        assert_eq!(p.knobs.chunk_size, ByteSize::mib(4));
+        assert_eq!(p.operator.read.chunk, Some(ByteSize::mib(4)));
+        assert_eq!(p.workload.concurrency, 8);
         let back: Profile = toml::from_str(&p.to_toml().unwrap()).unwrap();
         assert_eq!(back, p);
         for preset in Preset::ALL {
@@ -1810,51 +1710,12 @@ mod tests {
             expand_env("a-${OPROBE_TEST_SECRET}-b").unwrap(),
             "a-s3cr3t-b"
         );
-        let mut t = TargetSpec::from_url("s3://b").unwrap();
-        t.options.insert("secret_access_key".into(), "plain".into());
-        let toml = Profile::from_target(t).to_toml().unwrap();
-        assert!(!toml.contains("plain"));
-        assert!(toml.contains("${SECRET_ACCESS_KEY}"));
-    }
-
-    #[test]
-    fn to_toml_keeps_env_references_and_drops_derived_values() {
-        let mut t = TargetSpec::from_url("s3://bkt/pre").unwrap();
-        t.options
-            .insert("secret_access_key".into(), "${MY_SK}".into());
-        t.options.insert(
-            "server_side_encryption_customer_key".into(),
-            "c3VwZXJzZWNyZXQ=".into(),
-        );
-        t.options
-            .insert("endpoint".into(), "http://ak:sk@minio:9000".into());
-        let p = Profile::from_target(t.normalized().unwrap());
+        let mut p = Profile::from_url("s3://b");
+        p.operator
+            .options
+            .insert("secret_access_key".into(), "plain".into());
         let toml = p.to_toml().unwrap();
-        assert!(toml.contains("secret_access_key = \"${MY_SK}\""), "{toml}");
-        assert!(
-            toml.contains("${SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY}"),
-            "{toml}"
-        );
-        assert!(!toml.contains("c3VwZXJzZWNyZXQ"), "{toml}");
-        assert!(!toml.contains("ak:sk"), "{toml}");
-        assert!(
-            !toml.contains("region"),
-            "defaulted region is not persisted: {toml}"
-        );
-        assert!(
-            !toml.contains("bucket"),
-            "URL-derived options are not repeated: {toml}"
-        );
-        assert!(
-            !toml.contains("scheme"),
-            "derived scheme is not written: {toml}"
-        );
-        let back: Profile = toml::from_str(&toml).unwrap();
-        back.validate().unwrap();
-        let n = back.target.normalized().unwrap();
-        assert_eq!(n.scheme, "s3");
-        assert_eq!(n.options["bucket"], "bkt");
-        assert_eq!(n.options["endpoint"], "http://minio:9000");
+        assert!(!toml.contains("plain"), "{toml}");
     }
 
     #[test]
@@ -1867,9 +1728,6 @@ mod tests {
         assert_eq!(t.options["password"], "hunter2");
         assert!(!t.display().contains("hunter2"), "{}", t.display());
         assert!(!t.endpoint().unwrap().contains("alice"));
-        let toml = Profile::from_target(t).to_toml().unwrap();
-        assert!(!toml.contains("hunter2"), "{toml}");
-        assert!(toml.contains("${PASSWORD}"), "{toml}");
         let mut s3 = TargetSpec::from_url("s3://b").unwrap();
         s3.options
             .insert("endpoint".into(), "https://k:s@minio.local".into());

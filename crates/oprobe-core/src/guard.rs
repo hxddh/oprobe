@@ -261,13 +261,13 @@ pub struct Plan {
 /// Build the plan of a run without touching the target.
 pub fn plan(profile: &Profile, run_prefix: &str, read_only: bool, budgets: &Budgets) -> Plan {
     let w = &profile.workload;
-    let k = &profile.knobs;
+    let k = &crate::config::Knobs::of(&profile);
     let ds = w.effective_dataset();
     let mut mix = w.effective_mix();
     if ds.existing_prefix.is_some() {
         mix.retain(|m| !m.op.is_write());
     }
-    let network = profile.target.is_network();
+    let network = profile.target().is_network();
     let total_w: u64 = mix.iter().map(|m| m.weight as u64).sum::<u64>().max(1);
     let chunk = k.chunk_size.0.max(1);
     let obj = ds.object_size.0;
@@ -383,7 +383,7 @@ pub fn plan(profile: &Profile, run_prefix: &str, read_only: bool, budgets: &Budg
         0.0
     };
     Plan {
-        target: profile.target.display(),
+        target: profile.target().display(),
         preset: w.preset.slug().to_owned(),
         run_prefix: run_prefix.to_owned(),
         read_only,
@@ -408,11 +408,11 @@ pub fn plan(profile: &Profile, run_prefix: &str, read_only: bool, budgets: &Budg
 /// display form.
 pub fn target_ref(profile: &Profile) -> String {
     profile
-        .target
+        .target()
         .url
         .as_deref()
         .map(crate::util::redact_url)
-        .unwrap_or_else(|| profile.target.display())
+        .unwrap_or_else(|| profile.target().display())
 }
 
 /// Warnings about a workload that would run but probably not as meant (AG-9): a warmup at
@@ -541,7 +541,7 @@ mod sec_tests {
 
     #[test]
     fn read_only_refuses_generated_datasets_but_not_existing_ones() {
-        let mut p = Profile::from_target(crate::config::TargetSpec::from_url("memory://").unwrap());
+        let mut p = Profile::from_url("memory://");
         let e = check_read_only(&p).unwrap_err();
         assert_eq!(
             crate::errors::classify(&e, "memory").code,
@@ -555,7 +555,7 @@ mod sec_tests {
 
     #[test]
     fn plan_counts_dataset_writes_and_cleanup() {
-        let mut p = Profile::from_target(crate::config::TargetSpec::from_url("memory://").unwrap());
+        let mut p = Profile::from_url("memory://");
         p.workload.max_ops = Some(100);
         p.workload.warmup = crate::util::HumanDuration(Duration::ZERO);
         let pl = plan(&p, "oprobe-run-x/", false, &Budgets::default());

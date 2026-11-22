@@ -19,6 +19,7 @@ pub mod guard;
 pub mod input;
 pub mod lab;
 pub mod model;
+pub mod operator;
 pub mod output;
 pub mod report;
 pub mod service_options;

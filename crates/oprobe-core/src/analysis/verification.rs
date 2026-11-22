@@ -72,11 +72,11 @@ impl Verification {
         Self {
             description: description.into(),
             command: crate::model::spec::command_line(&[
-                "verify".into(),
+                "prove".into(),
                 run_id.into(),
                 code.into(),
             ]),
-            rerun: RunSpec::rerun_from(run_id, &overrides),
+            rerun: RunSpec::prove_command(run_id, &overrides),
             replay: spec.with(&overrides).command(),
             overrides,
             expect: Vec::new(),
@@ -127,12 +127,12 @@ mod tests {
             o,
             "fewer workers",
         );
-        assert_eq!(v.command, "oprobe verify 20261121-101010-abcd throttling");
+        assert_eq!(v.command, "oprobe prove 20261121-101010-abcd throttling");
         assert_eq!(
             v.rerun,
-            "oprobe run --from 20261121-101010-abcd --set concurrency=8"
+            "oprobe prove 20261121-101010-abcd --with concurrency=8"
         );
         assert!(v.replay.starts_with("oprobe run memory://"), "{}", v.replay);
-        assert!(v.replay.contains("--concurrency 8"), "{}", v.replay);
+        assert!(v.replay.contains("-c 8"), "{}", v.replay);
     }
 }

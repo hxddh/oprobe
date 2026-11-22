@@ -151,9 +151,9 @@ pub fn knob_overrides(from: &Knobs, to: &Knobs) -> Overrides {
 pub fn portable_profile(spec: &RunSpec) -> Profile {
     let mut p = spec.resolved_profile();
     p.name = None;
-    p.target.options.retain(|_, v| v != REDACTED);
-    if p.target.proxy.as_deref() == Some("none") {
-        p.target.proxy = None;
+    p.operator.options.retain(|_, v| v != REDACTED);
+    if p.operator.http.proxy.as_deref() == Some("none") {
+        p.operator.http.proxy = None;
     }
     p
 }
@@ -164,10 +164,10 @@ impl Recommendation {
     /// target, for the code snippet).
     pub fn from_tune(
         spec: &RunSpec,
-        session: &Profile,
+        _session: &Profile,
         winner: &Knobs,
         summary: &TuneSummary,
-        capability: &opendal::Capability,
+        _capability: &opendal::Capability,
     ) -> anyhow::Result<Self> {
         let o = Objective::parse(&summary.objective).unwrap_or_default();
         let mib = summary.metric_unit == "mib_per_s";
@@ -204,7 +204,7 @@ impl Recommendation {
             summary.objective, summary.headline
         );
         let tp = portable_profile(spec);
-        let mut overrides = knob_overrides(&spec.profile.knobs, winner);
+        let mut overrides = knob_overrides(&crate::config::Knobs::of(&spec.profile), winner);
         // A paced winner (rate limits): the pace is part of the change.
         if let Some(r) = win.and_then(|w| w.rate_per_s)
             && Some(r) != spec.profile.workload.rate
@@ -216,7 +216,7 @@ impl Recommendation {
             knobs: winner.into(),
             overrides,
             profile_toml: super::codegen::profile_toml(&tp, winner, &header)?,
-            rust_snippet: super::codegen::rust_snippet(&session.target, winner, capability),
+            rust_snippet: super::codegen::rust_snippet(&spec.profile, winner),
             vs_baseline,
             vs_best,
             no_feasible_trial: summary.no_feasible_trial,
@@ -247,9 +247,9 @@ mod tests {
 
     #[test]
     fn deltas_against_baseline_and_best() {
-        let mut p = Profile::from_target(crate::config::TargetSpec::from_url("memory://").unwrap());
-        p.target.proxy = Some("none".into());
-        p.target
+        let mut p = Profile::from_url("memory://");
+        p.operator.http.proxy = Some("none".into());
+        p.operator
             .options
             .insert("secret_access_key".into(), "hunter2".into());
         let spec = RunSpec::new(&p, "memory://");
@@ -275,8 +275,9 @@ mod tests {
         let r = Recommendation::from_tune(&spec, &p, &winner, &s, &opendal::Capability::default())
             .unwrap();
         assert_eq!(r.knobs.concurrency_count, 8);
-        assert_eq!(r.overrides.knobs["concurrency"], "8");
-        assert_eq!(r.overrides.knobs.len(), 1);
+        assert_eq!(r.overrides.workload["concurrency"], "8");
+        assert_eq!(r.overrides.workload.len(), 1);
+        assert!(r.overrides.operator.is_empty(), "{:?}", r.overrides);
         assert!(!r.vs_baseline.baseline_feasible);
         assert!((r.vs_baseline.delta_ratio - 0.5).abs() < 1e-9);
         // The best feasible trial (12 workers, 180 ops/s), not the infeasible 400.

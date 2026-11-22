@@ -125,11 +125,11 @@ pub fn wrap(s: &str, width: usize, indent: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Profile, TargetSpec};
+    use crate::config::Profile;
     use crate::trace::{OpenLoopStats, Quantiles, Snapshot, VerbStats};
 
     fn report(verbs: &[&str], throttled: u64, requests: u64) -> Report {
-        let p = Profile::from_target(TargetSpec::from_url("memory://").unwrap());
+        let p = Profile::from_url("memory://");
         let mut s = Snapshot {
             elapsed_s: 10.0,
             ..Default::default()
@@ -156,7 +156,7 @@ mod tests {
             run_id: &id,
             target_name: None,
             profile: &p,
-            knobs: &p.knobs,
+            knobs: &crate::config::Knobs::of(&p),
             snapshot: s,
             trace: Default::default(),
             cleanup: Default::default(),
@@ -283,7 +283,7 @@ mod tests {
         assert!(d.comparable && d.verdict == GateVerdict::Regression);
 
         let mut c = report(&["stat"], 0, 1000);
-        c.spec.profile.target = TargetSpec::from_url("s3://other/x").unwrap();
+        c.spec.profile.operator = crate::operator::OperatorSpec::from_url("s3://other/x");
         let d = diff(&b, &c, &Thresholds::default());
         assert!(!d.identity.same_target);
         assert_eq!(d.verdict, GateVerdict::NotComparable);
