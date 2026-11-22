@@ -1157,4 +1157,65 @@ mod tests {
         assert!(c.hint.unwrap_or_default().contains("proto=h2c"));
         assert!(crate::lab::LabProto::parse("h3").is_err());
     }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn microscope_uploads_end_at_the_kernel_acknowledgement() {
+        // The server thinks 20 ms before answering: the acknowledgement comes well before
+        // the first byte (on loopback with no delay they are indistinguishable).
+        let lab = crate::lab::LabServer::spawn(
+            "127.0.0.1:0",
+            crate::lab::LabConfig {
+                base_ttfb_delay: Duration::from_millis(20),
+                throttle_status_code: 503,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let mut p = lab.profile("b");
+        p.workload = profile("memory://").workload;
+        p.knobs.concurrency = 1;
+        p.knobs.transport = crate::config::TransportMode::Microscope;
+        p.workload.mix = vec![crate::config::OpSpec {
+            op: OpKind::Write {
+                size: crate::util::ByteSize::kib(512),
+            },
+            weight: 1,
+        }];
+        let s = Session::open(p, Cancel::new(), quiet()).await.unwrap();
+        let knobs = s.profile.knobs.clone();
+        s.run(&knobs, &opts(400, None), None).await.unwrap();
+        let rows = s.take_trace().unwrap();
+        let puts: Vec<_> = rows
+            .reqs
+            .iter()
+            .filter(|r| r.bytes_up >= 512 * 1024)
+            .collect();
+        assert!(!puts.is_empty());
+        let acked: Vec<_> = puts
+            .iter()
+            .filter_map(|r| {
+                r.detail
+                    .as_ref()
+                    .and_then(|d| Some((r, d.upload_acked_us?, d.send_buffered_us?)))
+            })
+            .collect();
+        assert!(
+            acked.len() * 2 >= puts.len(),
+            "{} of {}",
+            acked.len(),
+            puts.len()
+        );
+        for (r, at, buffered) in acked {
+            assert!(r.send_us >= buffered, "{r:?}");
+            assert!(at <= r.total_us, "{r:?}");
+        }
+        // Kernel fields beyond the smoothed RTT are kept.
+        assert!(
+            rows.reqs
+                .iter()
+                .any(|r| r.tcp.as_ref().is_some_and(|t| t.bytes_acked > 0))
+        );
+    }
 }

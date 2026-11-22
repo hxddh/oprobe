@@ -79,6 +79,25 @@ pub struct TcpRow {
     /// Time sending was limited by the send buffer (Linux ≥ 4.10).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub sndbuf_limited_us: u64,
+    /// Minimum RTT the kernel observed: the network's RTT, which server delay does not
+    /// inflate (unlike the smoothed `rtt_us`; Linux).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub min_rtt_us: u64,
+    /// Bytes written but not yet sent (Linux).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub notsent_bytes: u64,
+    /// Segments sent and not yet acknowledged (Linux).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub unacked_count: u64,
+    /// Segments considered lost (Linux).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub lost_count: u64,
+    /// Bytes acknowledged by the peer over the connection's life (Linux).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub bytes_acked: u64,
+    /// Pacing rate, bits per second (Linux).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub pacing_rate_bps: u64,
 }
 
 /// Details of one request beyond the stage timings (design v5 §3): what the server said

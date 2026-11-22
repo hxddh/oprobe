@@ -133,7 +133,11 @@ struct Shared {
 impl Shared {
     /// Kernel TCP statistics of connection `addr` now (see `net::tcpinfo` for why this is safe).
     /// `known` is what the connection table said when the response arrived.
-    fn tcp_info(&self, addr: (SocketAddr, SocketAddr), known: Sock) -> Option<TcpRow> {
+    fn tcp_info(
+        &self,
+        addr: (SocketAddr, SocketAddr),
+        known: Sock,
+    ) -> Option<(TcpRow, Option<u64>)> {
         if !self.tcp_info {
             return None;
         }
@@ -151,7 +155,7 @@ impl Shared {
                 found?
             }
         };
-        id.sample()
+        id.sample_with_retrans()
     }
 }
 
@@ -735,7 +739,15 @@ impl Finisher {
         // After the clock stopped: the query is not part of the request's time.
         if let Some(addr) = self.conn {
             let sock = std::mem::take(&mut self.sock);
-            self.record.tcp = self.shared.tcp_info(addr, sock).map(Box::new);
+            if let Some((row, retrans)) = self.shared.tcp_info(addr, sock) {
+                self.record.tcp = Some(Box::new(row));
+                if let Some(n) = retrans.filter(|n| *n > 0) {
+                    self.record
+                        .detail
+                        .get_or_insert_with(Default::default)
+                        .retrans_count = Some(n);
+                }
+            }
         }
         Self::emit(self.record, &self.scope, &self.recorder);
     }

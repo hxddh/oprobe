@@ -18,16 +18,12 @@
 //!
 //! No descriptor is ever duplicated, so no connection is kept open by oprobe.
 //!
-//! Cost: three syscalls per sample (≈1–3 µs). A connection is sampled at most every
-//! [`TcpProbe::MAX_AGE`]: a request ending sooner after the previous sample carries none (on
-//! real storage, with milliseconds per request, practically every request is sampled; the
-//! first request of every connection always is). In OpenDAL mode the descriptor table is
-//! scanned once per connection, at the end of its first request.
+//! Cost: three syscalls per sample (≈1–3 µs), once per request (retransmits are attributed
+//! per request). In OpenDAL mode the descriptor table is scanned once per connection, at the
+//! end of its first request.
 
 use std::net::SocketAddr;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
 
 use crate::rows::TcpRow;
 
@@ -46,41 +42,40 @@ impl SockId {
     }
 }
 
-/// Rate-limited sampling of one connection's statistics.
+/// Sampling of one connection's statistics, with the retransmits since the previous sample
+/// (attributed to the request that took it).
 #[derive(Debug)]
 pub struct TcpProbe {
     pub id: SockId,
-    /// When the last sample was taken, µs since [`epoch`] (0: never).
-    last_us: AtomicU64,
-}
-
-fn epoch() -> Instant {
-    static E: OnceLock<Instant> = OnceLock::new();
-    *E.get_or_init(Instant::now)
+    /// `total_retrans` at the previous sample (`u64::MAX`: none yet).
+    last_retrans: AtomicU64,
 }
 
 impl TcpProbe {
-    /// A connection is sampled at most this often; requests ending sooner carry no sample.
-    pub const MAX_AGE: Duration = Duration::from_millis(10);
-
     pub fn new(id: SockId) -> Self {
         Self {
             id,
-            last_us: AtomicU64::new(0),
+            last_retrans: AtomicU64::new(u64::MAX),
         }
     }
 
-    /// The connection's statistics now, unless it was sampled less than [`Self::MAX_AGE`] ago
-    /// (lock-free; concurrent requests on one HTTP/2 connection take turns).
+    /// The connection's statistics now (every request is sampled: per-request retransmits
+    /// need every sample, design v5 §3 M9).
     pub fn sample(&self) -> Option<TcpRow> {
-        let now = (epoch().elapsed().as_micros() as u64).max(1);
-        let last = self.last_us.load(Ordering::Relaxed);
-        if last != 0 && now.saturating_sub(last) < Self::MAX_AGE.as_micros() as u64 {
-            return None;
-        }
-        self.last_us
-            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
-            .ok()?;
+        self.sample_with_retrans().map(|(r, _)| r)
+    }
+
+    /// [`Self::sample`] plus the retransmitted segments since the previous sample of this
+    /// connection (`None` for the first).
+    pub fn sample_with_retrans(&self) -> Option<(TcpRow, Option<u64>)> {
+        let row = self.id.query()?;
+        let prev = self.last_retrans.swap(row.retrans, Ordering::AcqRel);
+        let delta = (prev != u64::MAX).then(|| row.retrans.saturating_sub(prev));
+        Some((row, delta))
+    }
+
+    /// Raw statistics without touching the retransmit baseline (upload-acknowledgement polls).
+    pub fn peek(&self) -> Option<TcpRow> {
         self.id.query()
     }
 }
@@ -305,6 +300,12 @@ mod imp {
             busy_us: i.busy_time,
             rwnd_limited_us: i.rwnd_limited,
             sndbuf_limited_us: i.sndbuf_limited,
+            min_rtt_us: i.min_rtt as u64,
+            notsent_bytes: i.notsent_bytes as u64,
+            unacked_count: i.unacked as u64,
+            lost_count: i.lost as u64,
+            bytes_acked: i.bytes_acked,
+            pacing_rate_bps: i.pacing_rate.saturating_mul(8),
         })
     }
 

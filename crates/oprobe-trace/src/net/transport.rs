@@ -474,6 +474,27 @@ impl Body for TracedBody {
     }
 }
 
+/// Uploads at least this large get their acknowledgement time from the kernel.
+pub const UPLOAD_ACK_MIN_BYTES: u64 = 64 * 1024;
+
+/// When the kernel reports every byte of the request sent and acknowledged (polled every
+/// millisecond once the body was handed over). Never resolves without `TCP_INFO`.
+async fn wait_acked(clock: Arc<ConnClock>, end_us: Arc<AtomicU64>) -> Instant {
+    let mut tick = tokio::time::interval(Duration::from_millis(1));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        if end_us.load(Ordering::Acquire) == 0 {
+            continue;
+        }
+        match clock.sock.as_ref().and_then(|s| s.peek()) {
+            Some(r) if r.notsent_bytes == 0 && r.unacked_count == 0 => return Instant::now(),
+            Some(_) => {}
+            None => std::future::pending::<()>().await,
+        }
+    }
+}
+
 /// HTTP/1 connection to hand back to the pool once its response body is drained.
 type H1Return = (
     Arc<Inner>,
@@ -522,8 +543,16 @@ impl Pending {
         self.record.detail = super::signals::finish(self.record.detail.take(), self.sniff.as_ref());
         // After the clock stopped: the query is not part of the request's time. The pooled
         // connection is still referenced here, so the socket is alive (`net::tcpinfo`).
-        if let Some(sock) = self.clock.as_ref().and_then(|c| c.sock.as_ref()) {
-            self.record.tcp = sock.sample().map(Box::new);
+        if let Some(sock) = self.clock.as_ref().and_then(|c| c.sock.as_ref())
+            && let Some((row, retrans)) = sock.sample_with_retrans()
+        {
+            self.record.tcp = Some(Box::new(row));
+            if let Some(n) = retrans.filter(|n| *n > 0) {
+                self.record
+                    .detail
+                    .get_or_insert_with(Default::default)
+                    .retrans_count = Some(n);
+            }
         }
         if complete && let Some((inner, key, id, sender, clock)) = self.h1_return.take() {
             inner.return_h1(key, id, sender, clock);
@@ -834,9 +863,26 @@ impl HttpTransport for TracingTransport {
             method,
             uri.path()
         );
+        let mut upload_acked: Option<Instant> = None;
         let (resp, h1_sender) = match checked {
             Checked::H1 { mut sender, .. } => {
-                let r = sender.send_request(hreq).instrument_await(span).await;
+                let send = sender.send_request(hreq).instrument_await(span);
+                // Uploads: poll the kernel until the server acknowledged the last request byte
+                // (the end of the `upload` phase; design v5 §3 M4). HTTP/1 only: the socket
+                // carries this request alone.
+                let r = if bytes_up >= UPLOAD_ACK_MIN_BYTES && clock.sock.is_some() {
+                    let ack = wait_acked(clock.clone(), end_us.clone());
+                    tokio::pin!(send, ack);
+                    loop {
+                        tokio::select! {
+                            biased;
+                            r = &mut send => break r,
+                            at = &mut ack, if upload_acked.is_none() => upload_acked = Some(at),
+                        }
+                    }
+                } else {
+                    send.await
+                };
                 (r, Some(sender))
             }
             Checked::H2 { mut sender, .. } => {
@@ -909,10 +955,25 @@ impl HttpTransport for TracingTransport {
         };
         record.timing.send_us = sent_at.saturating_duration_since(t_ready).as_micros() as u64;
         record.timing.ttfb_us = t_headers.saturating_duration_since(sent_at).as_micros() as u64;
+        // With the acknowledgement known, `send` lasts until it (upload) and `ttfb` starts
+        // from it (server).
+        let mut acked_detail = None;
+        if let Some(at) = upload_acked.filter(|at| *at >= sent_at && *at <= t_headers) {
+            acked_detail = Some((
+                at.saturating_duration_since(t_start).as_micros() as u64,
+                record.timing.send_us,
+            ));
+            record.timing.send_us = at.saturating_duration_since(t_ready).as_micros() as u64;
+            record.timing.ttfb_us = t_headers.saturating_duration_since(at).as_micros() as u64;
+        }
         record.status = resp.status().as_u16();
         record.request_id = REQUEST_ID_HEADERS.iter().find_map(|h| header_str(&resp, h));
         let mut detail = super::signals::from_headers(resp.headers(), record.status);
         detail.stream_wait_us = stream_wait_us;
+        if let Some((acked_us, buffered_us)) = acked_detail {
+            detail.upload_acked_us = Some(acked_us);
+            detail.send_buffered_us = Some(buffered_us);
+        }
         detail.streams_count = streams_now;
         let stalled = body_stall_us.load(Ordering::Relaxed);
         if streams_now.is_some() && stalled > 0 {
