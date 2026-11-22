@@ -426,27 +426,56 @@ impl RunStore {
     }
 }
 
-/// Load a run file, or a report `.json` (without trace rows).
+/// The `format` of a JSON document, when `path` starts like one (a run file is a zstd stream).
+fn json_format(path: &Path) -> Option<String> {
+    use std::io::Read;
+    let mut head = [0u8; 512];
+    let n = std::fs::File::open(path).ok()?.read(&mut head).ok()?;
+    if !crate::trace::TraceFile::sniff(&head[..n]) {
+        return None;
+    }
+    #[derive(serde::Deserialize)]
+    struct Format {
+        #[serde(default)]
+        format: Option<String>,
+    }
+    let f: Format =
+        serde_json::from_reader(std::io::BufReader::new(std::fs::File::open(path).ok()?)).ok()?;
+    Some(f.format.unwrap_or_default())
+}
+
+/// Load a run file, a production trace written by `oprobe-trace` (`oprobe.trace/6`, whatever
+/// its extension: recognised by its content), or a report `.json` (without trace rows).
 pub fn load_path(path: &Path) -> Result<Run> {
+    let format = json_format(path);
+    if let Some(f) = format.as_deref().filter(|f| f.starts_with("oprobe.trace/")) {
+        if f != crate::trace::TRACE_FORMAT {
+            return Err(OprobeError::new(
+                ErrorCode::UsageInvalidArgument,
+                format!(
+                    "`{}` is a trace of format `{f}`; this oprobe reads `{}`",
+                    path.display(),
+                    crate::trace::TRACE_FORMAT
+                ),
+            )
+            .with_hint("open it with the oprobe release that matches the oprobe-trace version that wrote it")
+            .into());
+        }
+        let file = crate::trace::TraceFile::read(path).map_err(|e| {
+            anyhow::Error::new(
+                OprobeError::new(
+                    ErrorCode::UsageInvalidArgument,
+                    format!("cannot read trace file `{}`: {e}", path.display()),
+                )
+                .with_hint("save the profile again with oprobe-trace's `Handle::save`"),
+            )
+        })?;
+        return Ok(crate::model::trace_file::trace_run(file, path));
+    }
     let is_json = path
         .extension()
         .is_some_and(|e| e.eq_ignore_ascii_case("json"));
-    if is_json {
-        // INTEGRATION HOOK (show FILE): an embedder trace file (`oprobe.trace/6`, written by
-        // oprobe-trace's `Handle::save`) is opened with `oprobe_trace::TraceFile::read` and
-        // built into a report from its snapshot and request rows (`model::build`). Wired at
-        // integration, where that API exists.
-        if let Ok(raw) = std::fs::read(path)
-            && let Ok(v) = serde_json::from_slice::<serde_json::Value>(&raw)
-            && v.get("schema").and_then(|s| s.as_str()) == Some("oprobe.trace/6")
-        {
-            return Err(OprobeError::new(
-                ErrorCode::UsageInvalidArgument,
-                format!("`{}` is an oprobe-trace file", path.display()),
-            )
-            .with_hint("this build cannot open trace files yet")
-            .into());
-        }
+    if is_json || format.is_some() {
         let report = crate::report::load_json(path)?;
         return Ok(Run {
             report,

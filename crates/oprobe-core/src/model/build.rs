@@ -95,7 +95,7 @@ fn partial_warning(p: &PartialInfo, configured_s: f64, suppressed: bool) -> Stri
 
 /// Apply the run's validity to its findings, warnings, headline and verdict (after the
 /// findings are derived, and again when [`mark_partial`] learns more).
-fn finish(run: &mut Run, breached: bool) {
+pub(super) fn finish(run: &mut Run, breached: bool) {
     let findings = std::mem::take(&mut run.report.findings);
     let (findings, validity) = crate::analysis::findings::validity(&run.report, findings);
     let r = &mut run.report;
@@ -490,6 +490,7 @@ pub fn build_run(i: ReportInput<'_>) -> Run {
         capacity,
         run: RunInfo {
             id: run_id.to_string(),
+            source: RunSource::Run,
             label: profile.name.clone(),
             parent_id: None,
             started_at: crate::util::fmt_rfc3339(started_at),

@@ -106,6 +106,12 @@ Print a profile: a stored run, or a file (`.oprobe` from `run` or from
 `-o json` prints the report (`schemas/report.json`); `--list -o json` the run list
 (`schemas/run-list.json`).
 
+A trace from `oprobe-trace` is recognised by its content, whatever its name. Its report has
+`run.source = "trace"` and shows `production trace` where a run shows its workload. Each
+request counts as one operation, and only the findings that requests support are derived:
+errors, throttling, hung requests, stragglers and cold connections. `prove` refuses a trace
+(exit 2): it needs a run oprobe drove.
+
 | Flag | Meaning |
 |---|---|
 | `--list` | list the stored runs (prove trials hidden) |

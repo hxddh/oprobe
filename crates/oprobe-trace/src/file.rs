@@ -9,6 +9,7 @@
 //!   "format": "oprobe.trace/6",
 //!   "oprobe_trace_version": "6.0.0",
 //!   "created_at": "2026-11-22T10:00:00Z",
+//!   "service": { "scheme": "s3", "name": "my-bucket", "root": "/data/" },   // optional
 //!   "snapshot": { … the aggregates: per API and stage, connections, bytes, timeline … },
 //!   "rows": { "ops": [ … ], "reqs": [ … ], "info": { … }, "sampling": { … } }   // optional
 //! }
@@ -29,11 +30,29 @@ use crate::sample::SamplingStats;
 /// The `format` of a file written by `oprobe-trace`.
 pub const TRACE_FORMAT: &str = "oprobe.trace/6";
 
+/// The OpenDAL service the traced operator talks to, as the layer saw it (the first operator
+/// the layer was applied to). No options or credentials: the scheme, the service's name (the
+/// bucket or container) and the root.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(not(feature = "__internal"), non_exhaustive)]
+pub struct ServiceRecord {
+    /// The OpenDAL scheme (`s3`, `gcs`, `memory`, ...).
+    pub scheme: String,
+    /// The service's name: the bucket or container (empty when the service has none).
+    #[serde(default)]
+    pub name: String,
+    /// The operator's root (`/` by default).
+    #[serde(default)]
+    pub root: String,
+}
+
 #[derive(Serialize)]
 struct FileRef<'a> {
     format: &'static str,
     oprobe_trace_version: &'static str,
     created_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    service: Option<&'a ServiceRecord>,
     snapshot: &'a Snapshot,
     #[serde(skip_serializing_if = "Option::is_none")]
     rows: Option<RowsRef<'a>>,
@@ -49,11 +68,17 @@ struct RowsRef<'a> {
 
 /// Write `snapshot` (and, when given, the sampled rows) to `path`, atomically: the file is
 /// written next to `path` and renamed into place.
-pub(crate) fn write(path: &Path, snapshot: &Snapshot, rows: Option<&TraceRows>) -> io::Result<()> {
+pub(crate) fn write(
+    path: &Path,
+    service: Option<&ServiceRecord>,
+    snapshot: &Snapshot,
+    rows: Option<&TraceRows>,
+) -> io::Result<()> {
     let doc = FileRef {
         format: TRACE_FORMAT,
         oprobe_trace_version: env!("CARGO_PKG_VERSION"),
         created_at: crate::util::now_rfc3339(),
+        service,
         snapshot,
         rows: rows.map(|r| RowsRef {
             ops: &r.ops,
@@ -88,6 +113,9 @@ pub struct TraceFile {
     pub format: String,
     pub oprobe_trace_version: String,
     pub created_at: String,
+    /// The service the traced operator talks to (absent in a bare [`Snapshot::save`]).
+    #[serde(default)]
+    pub service: Option<ServiceRecord>,
     pub snapshot: Snapshot,
     #[serde(default)]
     rows: Option<OwnedRows>,

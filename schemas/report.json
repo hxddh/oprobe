@@ -2517,6 +2517,11 @@
           "description": "Trace rows were sampled (more requests than `trace.max_requests`); aggregates are exact.",
           "type": "boolean"
         },
+        "source": {
+          "$ref": "#/$defs/RunSource",
+          "default": "run",
+          "description": "Where the traffic came from: a workload oprobe drove (`run`), or a production trace\nan embedded `oprobe-trace` layer recorded (`trace`: no workload, nothing to replay)."
+        },
         "started_at": {
           "description": "RFC 3339.",
           "type": "string"
@@ -2532,6 +2537,7 @@
       },
       "required": [
         "id",
+        "source",
         "started_at",
         "ended_at",
         "window_s",
@@ -2543,6 +2549,21 @@
         "env"
       ],
       "type": "object"
+    },
+    "RunSource": {
+      "description": "Where a run's traffic came from.",
+      "oneOf": [
+        {
+          "const": "run",
+          "description": "A workload `oprobe run` drove (replayable: `oprobe prove` can A/B it).",
+          "type": "string"
+        },
+        {
+          "const": "trace",
+          "description": "A production trace written by the `oprobe-trace` layer (`oprobe.trace/6`): the\napplication's own traffic, with no workload to replay.",
+          "type": "string"
+        }
+      ]
     },
     "RunSpec": {
       "description": "One replayable definition of a run.",

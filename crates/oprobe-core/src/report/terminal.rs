@@ -446,10 +446,13 @@ fn render_with(r: &Report, run: Option<&Run>, detail: bool) -> String {
         out,
         "{}",
         dim(&format!(
-            "{} · {:.1}s measured · {} · {}",
-            r.workload.preset,
+            "{} · {:.1}s {} · {} · {}",
+            r.workload_label(),
             r.run.window_s,
-            if let Some(rate) = r.workload.rate_per_s {
+            if r.is_trace() { "recorded" } else { "measured" },
+            if r.is_trace() {
+                format!("{} requests", r.connections.requests)
+            } else if let Some(rate) = r.workload.rate_per_s {
                 format!("open loop {rate} ops/s")
             } else {
                 format!("{} workers", r.spec.profile.workload.concurrency)
@@ -844,7 +847,19 @@ fn render_with(r: &Report, run: Option<&Run>, detail: bool) -> String {
             "OPERATOR  (layers innermost first; ← the findings they remedy)",
         );
         let _ = writeln!(out, "  {}", view.operator.url);
-        for l in &view.operator.layers {
+        let layers: &[_] = if r.is_trace() {
+            let _ = writeln!(
+                out,
+                "  {}",
+                dim(
+                    "layers and options not recorded: the trace saw the requests, not the application's operator"
+                )
+            );
+            &[]
+        } else {
+            &view.operator.layers
+        };
+        for l in layers {
             let mark = if l.remedy_of.is_empty() {
                 String::new()
             } else {
@@ -864,30 +879,42 @@ fn render_with(r: &Report, run: Option<&Run>, detail: bool) -> String {
             .options
             .iter()
             .map(|(k, v)| format!("{k}={v}"))
+            .filter(|_| !r.is_trace())
             .collect();
         for l in wrap_text(&opts.join(" · "), WIDTH - 4) {
             let _ = writeln!(out, "  {}", dim(&l));
         }
         section(&mut out, "CONFIGURATION");
         let w = &r.workload;
-        let _ = writeln!(
-            out,
-            "  workload   {} · {} objects × {} · access {} · seed {}",
-            w.preset,
-            w.dataset.objects_count,
-            fmt_bytes(w.dataset.object_size_bytes),
-            w.access,
-            w.seed
-        );
+        if r.is_trace() {
+            let _ = writeln!(
+                out,
+                "  workload   {} · the application's own traffic (oprobe drove nothing; written by oprobe-trace {})",
+                r.workload_label(),
+                r.run.oprobe_version
+            );
+        } else {
+            let _ = writeln!(
+                out,
+                "  workload   {} · {} objects × {} · access {} · seed {}",
+                w.preset,
+                w.dataset.objects_count,
+                fmt_bytes(w.dataset.object_size_bytes),
+                w.access,
+                w.seed
+            );
+        }
         for (k, v) in &r.target.options {
             let _ = writeln!(out, "  option     {k}={v}");
         }
         let h = &r.run.host;
-        let _ = writeln!(
-            out,
-            "  host       {}/{} · {} CPUs · {}",
-            h.os, h.arch, h.cpus_count, h.hostname_hash
-        );
+        if !h.os.is_empty() {
+            let _ = writeln!(
+                out,
+                "  host       {}/{} · {} CPUs · {}",
+                h.os, h.arch, h.cpus_count, h.hostname_hash
+            );
+        }
         let t = &r.run.trace;
         let _ = writeln!(
             out,
@@ -900,8 +927,34 @@ fn render_with(r: &Report, run: Option<&Run>, detail: bool) -> String {
         );
     }
 
-    section(&mut out, "CLEANUP");
-    let cl = &r.cleanup;
+    // A production trace wrote nothing: there is no cleanup to report.
+    if !r.is_trace() {
+        cleanup_section(&mut out, &r.cleanup);
+    }
+
+    if !r.run.id.is_empty() {
+        let _ = writeln!(
+            out,
+            "\n{}",
+            dim(&format!(
+                "more: oprobe show {0} --detail · oprobe show {0} --by stage|api|conn",
+                crate::model::spec::shell_quote(r.show_ref())
+            ))
+        );
+    }
+    if detail {
+        out
+    } else {
+        out.lines()
+            .map(|l| fit(l, WIDTH))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n"
+    }
+}
+
+fn cleanup_section(out: &mut String, cl: &crate::engine::CleanupSummary) {
+    section(out, "CLEANUP");
     if !cl.enabled {
         let _ = writeln!(
             out,
@@ -935,26 +988,6 @@ fn render_with(r: &Report, run: Option<&Run>, detail: bool) -> String {
     }
     if let Some(ds) = &cl.kept_dataset {
         let _ = writeln!(out, "  {}", dim(&format!("dataset left in place: {ds}")));
-    }
-
-    if !r.run.id.is_empty() {
-        let _ = writeln!(
-            out,
-            "\n{}",
-            dim(&format!(
-                "more: oprobe show {0} --detail · oprobe show {0} --by stage|api|conn",
-                r.run.id
-            ))
-        );
-    }
-    if detail {
-        out
-    } else {
-        out.lines()
-            .map(|l| fit(l, WIDTH))
-            .collect::<Vec<_>>()
-            .join("\n")
-            + "\n"
     }
 }
 

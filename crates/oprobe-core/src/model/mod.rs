@@ -8,6 +8,7 @@ pub mod ids;
 pub mod report;
 pub mod sections;
 pub mod spec;
+pub mod trace_file;
 /// Trace rows (`oprobe_trace::rows`).
 pub use oprobe_trace::rows as trace;
 

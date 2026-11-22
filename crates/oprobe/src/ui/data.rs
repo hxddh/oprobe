@@ -191,7 +191,7 @@ pub fn of_run(run: &Run) -> ProfileModel {
         id: r.run.id.clone(),
         operator_ref: r.spec.operator_ref.clone(),
         operator: r.spec.profile.operator.clone(),
-        preset: r.workload.preset.clone(),
+        preset: r.workload_label().to_owned(),
         window_s: r.run.window_s,
         verdict: r.verdict.level,
         headline: r.verdict.headline.clone(),

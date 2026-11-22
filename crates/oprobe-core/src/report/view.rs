@@ -52,7 +52,7 @@ impl VerdictView {
             } else {
                 r.spec.operator_ref.clone()
             },
-            preset: r.workload.preset.clone(),
+            preset: r.workload_label().to_owned(),
             window_s: r.run.window_s,
             partial: r
                 .run

@@ -36,7 +36,7 @@ pub fn list_runs() -> NextStep {
 /// The steps after a finished run: the top finding's next command (`oprobe prove RUN CODE`),
 /// the profile by stage, the details.
 pub fn after_run(report: &crate::model::Report) -> Vec<NextStep> {
-    let id = report.run.id.as_str();
+    let id = report.show_ref();
     let mut v = Vec::new();
     if let Some((f, next)) = report
         .findings
