@@ -1,39 +1,40 @@
-//! Documentation generated from the code stays in sync with it.
+//! The documentation stays in sync with the code.
 //!
-//! `llms-full.txt` is the docs in one file. Refresh it with `OPROBE_BLESS=1 cargo test --test
-//! docs` after changing a page.
+//! - `llms-full.txt` is the docs in one file. Refresh it with `OPROBE_BLESS=1 cargo test --test
+//!   docs` after changing a page.
+//! - `docs/cli.md` names every command and every flag that `--help` shows.
+//! - Relative links between the docs resolve.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+fn root() -> PathBuf {
+    Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../..")).to_path_buf()
+}
 
 /// Pages concatenated into `llms-full.txt` (llmstxt.org), in reading order.
 const LLMS_FULL: &[&str] = &[
     "README.md",
     "docs/getting-started.md",
     "docs/concepts.md",
-    "docs/reading-the-report.md",
-    "docs/metrics.md",
-    "docs/workloads.md",
-    "docs/ci.md",
-    "docs/agents.md",
-    "docs/tuning.md",
-    "docs/cost.md",
+    "docs/operator.md",
+    "docs/cli.md",
+    "docs/reading-the-profile.md",
+    "docs/embedding.md",
+    "docs/app.md",
     "docs/install.md",
     "docs/troubleshooting.md",
     "docs/privacy.md",
-    "docs/cli.md",
 ];
 
 fn llms_full() -> String {
-    let root = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."));
     let mut out = String::from(
         "# oprobe — full documentation\n\n> Every page of the oprobe documentation in one file \
          (generated from README.md and docs/; see llms.txt for the index).\n",
     );
     for p in LLMS_FULL {
-        // A page another stream adds later is simply absent until it lands.
-        let Ok(text) = std::fs::read_to_string(root.join(p)) else {
-            continue;
-        };
+        let text = std::fs::read_to_string(root().join(p))
+            .unwrap_or_else(|e| panic!("{p} is listed in LLMS_FULL but cannot be read: {e}"));
         out.push_str(&format!("\n\n<!-- source: {p} -->\n\n"));
         out.push_str(text.trim_end());
         out.push('\n');
@@ -43,7 +44,7 @@ fn llms_full() -> String {
 
 #[test]
 fn llms_full_matches_the_docs() {
-    let path = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../..")).join("llms-full.txt");
+    let path = root().join("llms-full.txt");
     let want = llms_full();
     if std::env::var_os("OPROBE_BLESS").is_some() {
         std::fs::write(&path, &want).unwrap();
@@ -57,13 +58,13 @@ fn llms_full_matches_the_docs() {
     );
 }
 
-/// Files other parts of the project add (links to them may land before the file does).
-const LINKED_ELSEWHERE: &[&str] = &["docs/agents.md", "agents.md", "../AGENTS.md", "AGENTS.md"];
+/// Files other parts of the project own (links to them may land before the file does).
+const LINKED_ELSEWHERE: &[&str] = &["../AGENTS.md", "AGENTS.md"];
 
 /// Relative links between the docs point at files that exist.
 #[test]
 fn relative_doc_links_resolve() {
-    let root = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."));
+    let root = root();
     let mut files = vec![root.join("README.md"), root.join("README.zh-CN.md")];
     for e in std::fs::read_dir(root.join("docs")).unwrap() {
         let p = e.unwrap().path();
@@ -92,4 +93,105 @@ fn relative_doc_links_resolve() {
         }
     }
     assert!(broken.is_empty(), "broken links:\n{}", broken.join("\n"));
+}
+
+/// `oprobe [COMMAND] --help`, as the user sees it.
+fn help(args: &[&str]) -> String {
+    let out = Command::new(env!("CARGO_BIN_EXE_oprobe"))
+        .args(args)
+        .arg("--help")
+        .env("NO_COLOR", "1")
+        .env("COLUMNS", "200")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "oprobe {args:?} --help failed");
+    String::from_utf8(out.stdout).unwrap()
+}
+
+/// The long flags of a help text (`--max-requests`), from its option lines.
+fn long_flags(help: &str) -> Vec<String> {
+    let mut flags = Vec::new();
+    for line in help.lines() {
+        let l = line.trim_start();
+        if !l.starts_with('-') {
+            continue;
+        }
+        for word in l.split([' ', ',', '=', '<', '[']) {
+            if let Some(name) = word.strip_prefix("--")
+                && !name.is_empty()
+                && name.chars().all(|c| c.is_ascii_lowercase() || c == '-')
+                && !flags.contains(&format!("--{name}"))
+            {
+                flags.push(format!("--{name}"));
+            }
+        }
+    }
+    flags
+}
+
+/// `doc` names `flag` as a whole word (`--max` is not `--max-bytes`).
+fn mentions(doc: &str, flag: &str) -> bool {
+    doc.match_indices(flag).any(|(i, _)| {
+        doc[i + flag.len()..]
+            .chars()
+            .next()
+            .is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '-'))
+    })
+}
+
+/// The subcommands `oprobe --help` lists.
+fn commands(help: &str) -> Vec<String> {
+    let Some((_, rest)) = help.split_once("Commands:") else {
+        return Vec::new();
+    };
+    rest.lines()
+        .skip(1)
+        .take_while(|l| !l.trim().is_empty())
+        .filter_map(|l| l.split_whitespace().next())
+        .filter(|c| *c != "help")
+        .map(str::to_owned)
+        .collect()
+}
+
+#[test]
+fn the_cli_reference_names_every_command_and_flag() {
+    let doc = std::fs::read_to_string(root().join("docs/cli.md")).unwrap();
+    let top = help(&[]);
+    let cmds = commands(&top);
+    assert!(
+        cmds.iter().any(|c| c == "run") && cmds.iter().any(|c| c == "prove"),
+        "unexpected `oprobe --help`: {top}"
+    );
+    let mut missing = Vec::new();
+    for c in &cmds {
+        if !doc.contains(&format!("## `oprobe {c}")) {
+            missing.push(format!("a `## `oprobe {c}` section"));
+        }
+    }
+    for args in std::iter::once(Vec::new()).chain(cmds.iter().map(|c| vec![c.as_str()])) {
+        for f in long_flags(&help(&args)) {
+            if !mentions(&doc, &f) {
+                missing.push(format!("{f} (oprobe {})", args.join(" ")));
+            }
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "docs/cli.md does not mention:\n{}",
+        missing.join("\n")
+    );
+}
+
+/// The README promises only the checks the installers always run (design v6 §8, U7): the
+/// minisign signature is checked only when a release embeds a key, so the README does not
+/// mention it (docs/install.md explains when it applies).
+#[test]
+fn the_readme_does_not_promise_a_signature_check() {
+    for f in ["README.md", "README.zh-CN.md"] {
+        let text = std::fs::read_to_string(root().join(f)).unwrap();
+        assert!(
+            !text.to_lowercase().contains("minisign"),
+            "{f} mentions minisign; see docs/install.md#verifying-a-download"
+        );
+    }
 }

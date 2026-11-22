@@ -4,52 +4,73 @@
 
 `.github/workflows/release.yml` builds and publishes a release when:
 
-- a commit lands on `main` whose `Cargo.toml` version has no `v<version>` tag yet (the workflow tags it);
+- a commit lands on `main` whose `Cargo.toml` version has no `v<version>` tag yet (the workflow
+  tags it);
 - a `v*` tag is pushed by hand;
 - the workflow is run manually (optionally naming an existing tag to rebuild).
 
-Checklist:
+## Checklist
 
-1. Set the version in `Cargo.toml` and run `cargo build` (updates `Cargo.lock`).
-2. Date the `## <version>` section at the top of `CHANGELOG.md`: it becomes the release notes.
-3. Nothing to bump in `action.yml`: its `version` input defaults to `latest-major`, the newest release of the
-   action's major (`uses: hxddh/oprobe@v<major>`). The workflow moves the `v<major>` tag to the release commit
-   after publishing; GitHub lets it do so only with the `RELEASE_TAG_TOKEN` secret (a token with `contents`
-   and `workflows` write) whenever the release changes `.github/workflows/`. Without it the run warns and
-   the tag is moved by hand:
-   `git fetch --tags && git tag -f v<major> v<version>^{commit} && git push -f origin refs/tags/v<major>`.
-4. Regenerate the CLI reference if commands changed: `OPROBE_BLESS=1 cargo test --test docs`.
-5. Merge. The workflow tests, builds every platform, generates the package manifests, attests every asset and
-   publishes; then crates.io, the Homebrew tap, the Scoop bucket and winget follow, each when its secret is
-   set (below). A job whose secret is missing ends with a warning, not a failure.
+1. Set the version in **three places** of the root `Cargo.toml`: `workspace.package.version`, and
+   the exact pins `oprobe-trace = { version = "=X.Y.Z", … }` and
+   `oprobe-core = { version = "=X.Y.Z", … }` under `[workspace.dependencies]`. Run `cargo build`
+   (updates `Cargo.lock`).
+2. Date the `## vX.Y.Z` section at the top of `CHANGELOG.md` (replace `unreleased`): it becomes
+   the release notes.
+3. Refresh generated files if anything changed: `OPROBE_BLESS=1 cargo test --test cli` (schemas)
+   and `OPROBE_BLESS=1 cargo test --test docs` (`llms-full.txt`).
+4. Check locally: `cargo package --workspace` and
+   `cargo bench -p oprobe-trace --bench overhead -- --quick`.
+5. Merge. The workflow tests, builds every platform (the app build and the CLI-only build of each
+   target), generates the package manifests, attests every asset and publishes; then crates.io,
+   the Homebrew tap, the Scoop bucket and winget follow, each when its secret is set (below). A
+   job whose secret is missing ends with a warning, not a failure.
+
+### 6.0.0
+
+The tree carries `6.0.0-dev` until the release. For 6.0.0: steps 1–5 with `6.0.0`, and in
+`CHANGELOG.md` turn `## v6.0.0 — unreleased` into `## v6.0.0 — <date>`. The release-notes step
+matches `## v6.0.0` (with or without the `v`), so the heading keeps working.
+
+## Crates
+
+| Crate | Published | Promise |
+|---|---|---|
+| `oprobe-trace` | yes | semver: the documented API and the `oprobe.trace/6` format are stable across 6.x |
+| `oprobe-core` | yes, so that `cargo install oprobe` works | none: internal, documented as such; `oprobe` pins it with `=` |
+| `oprobe` | yes | the CLI, the JSON output and the `.oprobe` files are stable across 6.x |
+
+The crates-io job publishes them in that order (`oprobe-trace`, `oprobe-core`, `oprobe`); a crate
+already on crates.io at this version is skipped, so a re-run is safe. CI runs
+`cargo package --workspace` on every pull request.
 
 ## Secrets
 
 | Secret | Job | What it needs |
 |---|---|---|
-| `RELEASE_TAG_TOKEN` | publish (move `v<major>`) | fine-grained token on `hxddh/oprobe`: Contents and Workflows read/write |
-| `CARGO_REGISTRY_TOKEN` | crates-io | a crates.io API token with publish rights for `oprobe-trace`, `oprobe-core` and `oprobe` (published in that order; a crate already on crates.io at this version is skipped, so a re-run is safe) |
+| `CARGO_REGISTRY_TOKEN` | crates-io | a crates.io API token with publish rights for `oprobe-trace`, `oprobe-core` and `oprobe` |
 | `MINISIGN_KEY` | publish (sign `SHA256SUMS`) | an unencrypted minisign secret key, see [Signing](#signing) |
 | `TAP_TOKEN` | homebrew-tap | fine-grained token on `hxddh/homebrew-tap`: Contents read/write |
 | `SCOOP_TOKEN` | scoop-bucket | fine-grained token on `hxddh/scoop-bucket`: Contents read/write |
 | `WINGET_TOKEN` | winget | classic token (`public_repo`) of the account that owns a fork of `microsoft/winget-pkgs` |
 
-Package-manager jobs run for stable releases only (no `-rc` versions) and never fail the release: without
-their secret they print `::warning::… not set; skipping …`.
+Package-manager jobs run for stable releases only (no `-rc` versions) and never fail the release:
+without their secret they print `::warning::… not set; skipping …`.
 
-Repository **variable** (not a secret): `MINISIGN_PUBKEY`, the public half of `MINISIGN_KEY` (one base64
-line). The release embeds it in `install.sh`, `install.ps1` and `oprobe self-update`.
+Repository **variable** (not a secret): `MINISIGN_PUBKEY`, the public half of `MINISIGN_KEY` (one
+base64 line). The release embeds it in `install.sh` and `install.ps1`.
 
 ## Signing
 
-Nothing is code-signed by an OS vendor, but downloads are verifiable (design v5 §5):
+Nothing is code-signed by an OS vendor, but downloads are verifiable:
 
 - every asset gets a SLSA build provenance attestation (`actions/attest-build-provenance`), which
-  `install.sh`, `install.ps1` and `oprobe self-update` check with `gh attestation verify --signer-workflow
+  `install.sh` and `install.ps1` check with `gh attestation verify --signer-workflow
   hxddh/oprobe/.github/workflows/release.yml` when the GitHub CLI is logged in;
-- with `MINISIGN_KEY` set, the publish job signs `SHA256SUMS` into `SHA256SUMS.minisig`, which the
-  installers and self-update verify with the embedded `MINISIGN_PUBKEY` when `gh` is unavailable. Without
-  the secret the step warns and the release stays unsigned.
+- with `MINISIGN_KEY` set, the publish job signs `SHA256SUMS` into `SHA256SUMS.minisig`, and with
+  `MINISIGN_PUBKEY` set the installers embed the public key and verify the signature when `gh` is
+  unavailable. Without them the release is unsigned, the installers check no signature, and the
+  release notes say so. Do not describe a minisign fallback anywhere unless both are set.
 
 Create the key once, offline:
 
@@ -59,71 +80,60 @@ gh secret set MINISIGN_KEY < minisign.key        # then delete minisign.key or k
 gh variable set MINISIGN_PUBKEY --body "$(tail -n1 minisign.pub)"
 ```
 
-Rotating the key: set both again; releases signed with the old key keep verifying with the old binaries
-and scripts, new releases with the new ones. Put the public key in the release notes too.
-
 ## Supply chain
 
-- Every action in `.github/workflows/` and `action.yml` is pinned by commit SHA (the tag in a comment);
-  Dependabot (`.github/dependabot.yml`) proposes updates weekly. CI fails on an unpinned `uses:`.
+- Every action in `.github/workflows/` is pinned by commit SHA (the tag in a comment); Dependabot
+  (`.github/dependabot.yml`) proposes updates weekly. CI fails on an unpinned `uses:`.
 - No release job restores a cache: every release binary is built from a clean checkout.
-- `cargo deny check` (`deny.toml`) runs on every pull request: advisories, licenses, bans and sources.
-  Ignored advisories are listed in `deny.toml` with the reason (RUSTSEC-2023-0071: `rsa` through OpenDAL's
-  signer, used only to sign, never to decrypt; no fixed version exists for it yet).
+- `cargo deny check` (`deny.toml`) runs on every pull request: advisories, licenses, bans and
+  sources. Ignored advisories are listed in `deny.toml` with the reason.
 
 ## Assets
 
-Archives per target, `.deb`, `.rpm`, `.pkg`, `.dmg` (with `oprobe.app`, smoke-launched through LaunchServices
-in CI), `.msi` (WiX 5), the Linux desktop tarball, and generated by `scripts/release-manifests.sh`:
-`oprobe.rb`, `oprobe-app.rb`, `oprobe.json`, `winget-manifests.zip`, `latest.json`; plus `install.sh`,
-`install.ps1`, `SHA256SUMS` (covering everything) and `SHA256SUMS.minisig` (when signed).
-`actions/attest-build-provenance` attests every asset.
+For each target: the app archive `oprobe-<ver>-<target>` and the CLI-only archive
+`oprobe-cli-<ver>-<target>` (`--no-default-features --features cli`: the cloud services without
+the app), `.tar.gz` on Linux and macOS, `.zip` on Windows. Plus the `.deb` and `.rpm` (Linux gnu
+targets), the macOS universal archives, `.pkg` and `.dmg` (with `oprobe.app`, smoke-launched
+through LaunchServices in CI), the `.msi` (WiX 5), the Linux desktop tarball, and, generated by
+`scripts/release-manifests.sh`: `oprobe.rb`, `oprobe-app.rb`, `oprobe.json`,
+`winget-manifests.zip` and `latest.json`; plus `install.sh`, `install.ps1`, `SHA256SUMS` (covering
+everything) and `SHA256SUMS.minisig` (when signed).
 
-`latest.json` is load-bearing: `install.sh`, `install.ps1` and `oprobe self-update` read
-`releases/latest/download/latest.json` before the rate-limited API. Keep its `version` field and its asset
-`name` / `url` / `sha256` fields stable. CI (`install-script` jobs) runs both installers against a local fake
-release (`scripts/test-install.sh`, `scripts/test-install.ps1`).
-
-Nothing is code-signed: there are no Apple or Microsoft certificates. The `.app` is signed ad hoc only (so it
-launches on Apple Silicon); `docs/install.md` tells users how to open unsigned packages the first time.
+`latest.json` is load-bearing: `install.sh` and `install.ps1` read
+`releases/latest/download/latest.json` before the rate-limited API. Keep its `version` field and
+its asset `name` / `url` / `sha256` fields stable, and keep the archive names
+(`oprobe-<ver>-<target>`, `oprobe-cli-<ver>-<target>`): the installers build them. CI
+(`install-script` jobs) runs both installers against a local fake release
+(`scripts/test-install.sh`, `scripts/test-install.ps1`).
 
 ## Homebrew
 
 The `homebrew-tap` job copies `oprobe.rb` to `Formula/oprobe.rb` and `oprobe-app.rb` to
-`Casks/oprobe-app.rb` of `hxddh/homebrew-tap` and pushes (needs `TAP_TOKEN`). The formula (`oprobe`, the CLI
-from the macOS universal and Linux musl archives) and the cask (`oprobe-app`, `oprobe.app` from the `.dmg`)
-have distinct tokens, so `brew install hxddh/tap/oprobe` is never ambiguous. One-time setup: create the
-public repository `hxddh/homebrew-tap` (a `Formula/` and a `Casks/` directory).
+`Casks/oprobe-app.rb` of `hxddh/homebrew-tap` and pushes (needs `TAP_TOKEN`). The formula
+(`oprobe`, from the macOS universal and Linux musl app archives) and the cask (`oprobe-app`,
+`oprobe.app` from the `.dmg`) have distinct tokens, so `brew install hxddh/tap/oprobe` is never
+ambiguous.
 
 ## Scoop
 
-The `scoop-bucket` job copies `oprobe.json` to `bucket/oprobe.json` of `hxddh/scoop-bucket` and pushes (needs
-`SCOOP_TOKEN`). The manifest's `checkver` reads `latest.json` and its `autoupdate` takes hashes from the
-release's `SHA256SUMS`, so Scoop's own `checkver -u` tooling also works on the bucket. One-time setup: create
-the public repository `hxddh/scoop-bucket` with a `bucket/` directory. Users run
-`scoop bucket add hxddh https://github.com/hxddh/scoop-bucket` then `scoop install oprobe`.
+The `scoop-bucket` job copies `oprobe.json` to `bucket/oprobe.json` of `hxddh/scoop-bucket` and
+pushes (needs `SCOOP_TOKEN`). The manifest's `checkver` reads `latest.json` and its `autoupdate`
+takes hashes from the release's `SHA256SUMS`.
 
 ## winget
 
-`winget-manifests.zip` holds the three manifests (version, installer with both MSIs and the MSI's upgrade
-code, en-US locale) in the layout of
-[microsoft/winget-pkgs](https://github.com/microsoft/winget-pkgs) (`manifests/h/hxddh/oprobe/<version>/`).
+`winget-manifests.zip` holds the three manifests (version, installer with both MSIs and the MSI's
+upgrade code, en-US locale) in the layout of
+[microsoft/winget-pkgs](https://github.com/microsoft/winget-pkgs)
+(`manifests/h/hxddh/oprobe/<version>/`).
 
 ```powershell
-# validate locally (Windows)
 Expand-Archive winget-manifests.zip -DestinationPath winget
-winget validate --manifest winget\manifests\h\hxddh\oprobe\5.0.0
-winget install --manifest winget\manifests\h\hxddh\oprobe\5.0.0    # needs: winget settings --enable LocalManifestFiles
+winget validate --manifest winget\manifests\h\hxddh\oprobe\6.0.0
 ```
 
-**Automated (later versions):** the `winget` job runs `vedantmgoyal9/winget-releaser`, which updates the
-existing `hxddh.oprobe` package from the release's MSIs and opens a pull request to `microsoft/winget-pkgs`
-from the token owner's fork (needs `WINGET_TOKEN`; create the fork once).
-
-**First version (by hand):** winget-releaser only updates packages that already exist, so submit the first
-one yourself: fork `microsoft/winget-pkgs`, add the folder under `manifests/h/hxddh/oprobe/<version>/`, open a
-pull request (or `wingetcreate submit` with the folder). Unsigned MSIs are accepted; the automated
-validation installs and uninstalls the package.
-
-`winget install hxddh.oprobe` works only once a pull request is merged; the docs say so, and the release notes
-name the `.msi`, Scoop and `install.ps1` as the ways that always work.
+The `winget` job runs `vedantmgoyal9/winget-releaser`, which updates the existing `hxddh.oprobe`
+package from the release's MSIs and opens a pull request to `microsoft/winget-pkgs` from the token
+owner's fork (needs `WINGET_TOKEN`). winget-releaser only updates packages that already exist, so
+the first version is submitted by hand from `winget-manifests.zip`. `winget install hxddh.oprobe`
+works only once a pull request is merged; the docs say so.
