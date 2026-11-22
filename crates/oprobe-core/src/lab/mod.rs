@@ -37,6 +37,9 @@ use tokio::sync::oneshot;
 use crate::config::{DatasetSpec, Preset, Profile, TargetSpec};
 use crate::net::tls::build_tls_acceptor;
 
+pub mod caps;
+pub use caps::LabLimits;
+
 struct LabTls {
     ca_pem: String,
     cert_pem: String,
@@ -490,6 +493,9 @@ struct S3Store {
     peak_inflight: AtomicUsize,
     emitted_throttles: AtomicU64,
     faults: RwLock<LabConfig>,
+    /// Body, store and connection caps (`caps`).
+    limits: LabLimits,
+    usage: caps::StoreUsage,
 }
 
 type BoxBody = http_body_util::combinators::BoxBody<Bytes, Infallible>;
@@ -647,6 +653,17 @@ async fn serve_s3_request(
     let _inflight_guard = ServerInflightGuard {
         store: store.clone(),
     };
+    if let Some((status, code, msg)) = caps::admit(&store, req.method(), req.headers()) {
+        let req_id = format!(
+            "oprobe-s3-req-{:06}",
+            store.req_seq.fetch_add(1, Ordering::Relaxed) + 1
+        );
+        let mut resp = s3_error(status, code, &msg, &req_id);
+        // The body is not read: ask the client to close the connection.
+        resp.headers_mut()
+            .insert(http::header::CONNECTION, http::HeaderValue::from_static("close"));
+        return Ok(resp);
+    }
     let mut straggle = Duration::ZERO;
     let resp = handle_s3_request(req, store, cur_inflight, &mut straggle).await;
     if !straggle.is_zero() {
@@ -1443,12 +1460,24 @@ impl Drop for LabHandle {
 pub struct LabServer;
 
 impl LabServer {
-    pub async fn spawn(bind_addr: &str, mut faults: LabConfig) -> Result<LabHandle> {
+    /// Spawn with the default [`LabLimits`] (loopback only).
+    pub async fn spawn(bind_addr: &str, faults: LabConfig) -> Result<LabHandle> {
+        Self::spawn_with(bind_addr, faults, LabLimits::default()).await
+    }
+
+    /// Spawn with explicit exposure limits.
+    pub async fn spawn_with(
+        bind_addr: &str,
+        mut faults: LabConfig,
+        limits: LabLimits,
+    ) -> Result<LabHandle> {
         if faults.throttle_status_code == 0 {
             faults.throttle_status_code = 503;
         }
         let listener = TcpListener::bind(bind_addr).await?;
         let local_addr = listener.local_addr()?;
+        caps::check_bind(local_addr, limits.allow_remote)?;
+        let connections = Arc::new(tokio::sync::Semaphore::new(limits.max_connections.max(1)));
 
         let tls_acceptor = if faults.enable_tls {
             let tls = lab_tls();
@@ -1489,6 +1518,8 @@ impl LabServer {
             peak_inflight: AtomicUsize::new(0),
             emitted_throttles: AtomicU64::new(0),
             faults: RwLock::new(faults.clone()),
+            limits,
+            usage: caps::StoreUsage::default(),
         });
 
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
@@ -1505,25 +1536,36 @@ impl LabServer {
                         let Ok((tcp, _peer)) = accepted else {
                             continue;
                         };
+                        // Over the connection cap: close it at once.
+                        let Ok(permit) = connections.clone().try_acquire_owned() else {
+                            drop(tcp);
+                            continue;
+                        };
                         let _ = tcp.set_nodelay(true);
                         let st = store_bg.clone();
                         let tls_acc = tls_acceptor.clone();
 
                         tokio::spawn(async move {
+                            let _permit = permit;
                             let svc = service_fn(move |req| serve_s3_request(req, st.clone()));
                             let mut builder = AutoServerBuilder::new(TokioExecutor::new());
                             builder.http2().adaptive_window(true);
+                            // A timer enables hyper's 30 s header-read timeout (slow clients
+                            // cannot hold a connection open forever before sending a request).
+                            builder.http1().timer(hyper_util::rt::TokioTimer::new());
                             if !allow_h2 {
                                 let io_plain_or_tls = tls_acc;
                                 if let Some(acc) = io_plain_or_tls {
                                     if let Ok(tls_s) = acc.accept(tcp).await {
                                         let _ = hyper::server::conn::http1::Builder::new()
+                                            .timer(hyper_util::rt::TokioTimer::new())
                                             .keep_alive(true)
                                             .serve_connection(TokioIo::new(tls_s), svc)
                                             .await;
                                     }
                                 } else {
                                     let _ = hyper::server::conn::http1::Builder::new()
+                                        .timer(hyper_util::rt::TokioTimer::new())
                                         .keep_alive(true)
                                         .serve_connection(TokioIo::new(tcp), svc)
                                         .await;

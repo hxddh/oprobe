@@ -139,7 +139,20 @@ pub async fn lab(_ctx: &Ctx, a: LabRequest) -> Result<(crate::lab::LabHandle, La
     cfg.stream_bandwidth_kib_s = a.bandwidth_kib.or(cfg.stream_bandwidth_kib_s);
     cfg.error_every_n = a.error_every.or(cfg.error_every_n);
     cfg.reset_every_n = a.reset_every.or(cfg.reset_every_n);
-    let lab = LabServer::spawn(&a.bind, cfg).await?;
+    let mut limits = crate::lab::LabLimits {
+        allow_remote: a.allow_remote,
+        ..Default::default()
+    };
+    if let Some(v) = &a.max_object_size {
+        limits.max_object_bytes = crate::input::size(v)?.0;
+    }
+    if let Some(v) = &a.max_store_size {
+        limits.max_store_bytes = crate::input::size(v)?.0;
+    }
+    if let Some(n) = a.max_connections {
+        limits.max_connections = n.max(1);
+    }
+    let lab = LabServer::spawn_with(&a.bind, cfg, limits).await?;
     let tls_flag = if a.tls {
         match &a.write_ca {
             Some(p) => format!(" --ca-cert {}", p.display()),

@@ -438,11 +438,11 @@ impl RunFileWriter {
     /// Start a run file with its header.
     pub fn create(path: &Path, header: &RunHeader) -> Result<Self> {
         if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)
+            super::create_private_dir_all(dir)
                 .with_context(|| format!("cannot create {}", dir.display()))?;
         }
         let tmp = path.with_extension("oprobe.tmp");
-        let file = std::fs::File::create(&tmp)
+        let file = super::private_file(&tmp)
             .with_context(|| format!("cannot write {}", tmp.display()))?;
         let enc = zstd::stream::Encoder::new(BufWriter::new(file), ZSTD_LEVEL)?;
         let mut w = Self {

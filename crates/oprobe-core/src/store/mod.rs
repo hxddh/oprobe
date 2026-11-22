@@ -4,6 +4,10 @@
 //! Locations: `$OPROBE_CONFIG` or `<config_dir>/oprobe/config.toml`; data in
 //! `$OPROBE_DATA_DIR` or `<data_dir>/oprobe/` (platform dirs from the `dirs` crate). Every
 //! file is written atomically (temporary file + rename).
+//!
+//! Permissions (design v5 §5, S5): on unix every file oprobe writes here is created `0600` and
+//! every directory it creates `0700` ([`private_file`], [`create_private_dir_all`]): the config
+//! may hold inline secrets, and run files name buckets, endpoints and object keys.
 
 pub mod baselines;
 pub mod config;
@@ -88,7 +92,7 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
         _ => PathBuf::from("."),
     };
-    std::fs::create_dir_all(&dir)
+    create_private_dir_all(&dir)
         .with_context(|| format!("cannot create directory `{}`", dir.display()))?;
     let name = path
         .file_name()
@@ -100,7 +104,7 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         rand::random::<u16>()
     ));
     let res = (|| -> std::io::Result<()> {
-        let mut f = std::fs::File::create(&tmp)?;
+        let mut f = private_file(&tmp)?;
         f.write_all(bytes)?;
         f.sync_all()?;
         drop(f);
@@ -113,9 +117,69 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Create (or truncate) `path` for writing, readable by its owner only (`0600` on unix).
+pub fn private_file(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.mode(0o600);
+    }
+    let f = o.open(path)?;
+    // `mode` applies only when the file is created: tighten a file that already existed.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(f)
+}
+
+/// `create_dir_all`, with the directories it creates accessible to their owner only (`0700`
+/// on unix). Existing directories keep their permissions.
+pub fn create_private_dir_all(dir: &Path) -> std::io::Result<()> {
+    let mut b = std::fs::DirBuilder::new();
+    b.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        b.mode(0o700);
+    }
+    b.create(dir)
+}
+
+/// Write a small secret (a token) to `path`: `0600`, atomically.
+pub fn write_secret(path: &Path, secret: &str) -> Result<()> {
+    atomic_write(path, secret.as_bytes())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// S5: files `0600`, created directories `0700`, also when a file already existed with
+    /// wider permissions.
+    #[cfg(unix)]
+    #[test]
+    fn files_are_private_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("new/dir/config.toml");
+        atomic_write(&p, b"x").unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&p), 0o600);
+        assert_eq!(mode(&d.path().join("new")), 0o700);
+        assert_eq!(mode(&d.path().join("new/dir")), 0o700);
+        let wide = d.path().join("wide.toml");
+        std::fs::write(&wide, b"old").unwrap();
+        std::fs::set_permissions(&wide, std::fs::Permissions::from_mode(0o644)).unwrap();
+        atomic_write(&wide, b"new").unwrap();
+        assert_eq!(mode(&wide), 0o600);
+        let f = d.path().join("direct");
+        drop(private_file(&f).unwrap());
+        assert_eq!(mode(&f), 0o600);
+    }
 
     #[test]
     fn atomic_write_replaces_and_leaves_no_temp_files() {

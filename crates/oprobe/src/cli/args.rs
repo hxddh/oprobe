@@ -1053,6 +1053,19 @@ pub struct LabArgs {
     /// Write the lab CA certificate (for --ca-cert) to this file
     #[arg(long, value_name = "FILE")]
     pub write_ca: Option<PathBuf>,
+    /// Accept a non-loopback --bind address (the lab has no authentication: anyone who can
+    /// reach it can read and write its objects)
+    #[arg(long)]
+    pub allow_remote: bool,
+    /// Largest object body accepted (PUT or multipart part), e.g. 1GiB
+    #[arg(long, value_name = "SIZE", value_parser = parse::size)]
+    pub max_object_size: Option<String>,
+    /// Largest in-memory store (objects plus staged parts), e.g. 8GiB
+    #[arg(long, value_name = "SIZE", value_parser = parse::size)]
+    pub max_store_size: Option<String>,
+    /// Most open connections (more are closed at once)
+    #[arg(long, value_name = "N", value_parser = at_least::<1>)]
+    pub max_connections: Option<usize>,
 }
 
 #[derive(Args, Debug)]

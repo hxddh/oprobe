@@ -30,6 +30,27 @@ pub struct Budgets {
 }
 
 impl Budgets {
+    /// The budgets of every run an MCP server starts unless its own flags set others (design
+    /// v5 §5, S6): 50 000 requests, 2 minutes, $1 and 5 GiB. A tool call can only lower them.
+    pub fn mcp_default() -> Self {
+        Self {
+            max_cost_usd: Some(1.0),
+            max_requests_count: Some(50_000),
+            max_bytes: Some(5 << 30),
+            max_duration_s: Some(120.0),
+        }
+    }
+
+    /// Every limit `self` leaves unset taken from `defaults`.
+    pub fn or(self, defaults: &Budgets) -> Self {
+        Self {
+            max_cost_usd: self.max_cost_usd.or(defaults.max_cost_usd),
+            max_requests_count: self.max_requests_count.or(defaults.max_requests_count),
+            max_bytes: self.max_bytes.or(defaults.max_bytes),
+            max_duration_s: self.max_duration_s.or(defaults.max_duration_s),
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.max_cost_usd.is_none()
             && self.max_requests_count.is_none()
@@ -233,11 +254,141 @@ pub fn usd_per_request(profile: &Profile) -> Option<f64> {
 /// Targets that live in this process: `memory://` and the in-process `lab://` S3 server.
 /// Writing to them touches nothing outside the process, so a read-only MCP server allows it
 /// (design v4 §9, AG-2).
+///
+/// A `lab://` target counts only while it still points at a loopback address without an egress
+/// proxy: an `endpoint` or `proxy` override would send its requests elsewhere (design v5 §5).
 pub fn in_process(t: &crate::config::TargetSpec) -> bool {
-    t.scheme == "memory"
-        || t.url
-            .as_deref()
-            .is_some_and(|u| u.trim().to_ascii_lowercase().starts_with("lab://"))
+    if t.scheme == "memory" {
+        return true;
+    }
+    let lab = t
+        .url
+        .as_deref()
+        .is_some_and(|u| u.trim().to_ascii_lowercase().starts_with("lab://"));
+    if !lab {
+        return false;
+    }
+    let proxied = t
+        .proxy
+        .as_deref()
+        .is_some_and(|p| !p.trim().is_empty() && !p.trim().eq_ignore_ascii_case("none"));
+    let loopback = t
+        .options
+        .get("endpoint")
+        .is_none_or(|e| endpoint_host(e).is_some_and(|h| host_is_loopback(&h)));
+    loopback && !proxied
+}
+
+/// The host of an `http(s)://host[:port]/…` endpoint (brackets of an IPv6 literal removed).
+pub fn endpoint_host(endpoint: &str) -> Option<String> {
+    let u = url::Url::parse(endpoint.trim()).ok()?;
+    let h = u.host_str()?;
+    Some(h.trim_matches(['[', ']']).to_ascii_lowercase())
+}
+
+fn host_is_loopback(host: &str) -> bool {
+    host == "localhost"
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| address_class(ip) == AddressClass::Loopback)
+}
+
+/// A fresh random bearer token: 32 bytes from the OS-seeded CSPRNG, hex encoded (64 chars).
+pub fn random_token() -> String {
+    use rand::RngCore;
+    let mut b = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut b);
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// Compare a presented secret with the expected one in time independent of where they differ
+/// (the length is not secret: tokens have a fixed length).
+pub fn secrets_equal(given: &[u8], expected: &[u8]) -> bool {
+    if given.len() != expected.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (a, b) in given.iter().zip(expected) {
+        diff |= a ^ b;
+    }
+    // Keep the optimiser from short-circuiting the loop.
+    std::hint::black_box(diff) == 0
+}
+
+/// What kind of network an address belongs to (`probe_endpoint`, endpoint overrides and the
+/// lab's bind check refuse the non-public ones unless allowed).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AddressClass {
+    Loopback,
+    /// 169.254.0.0/16 and fe80::/10: where cloud metadata services answer.
+    LinkLocal,
+    /// RFC 1918, carrier-grade NAT (100.64.0.0/10) and unique-local IPv6 (fc00::/7).
+    Private,
+    /// 0.0.0.0, ::, broadcast, multicast and other reserved ranges.
+    Reserved,
+    Public,
+}
+
+/// Classify `ip` (IPv4-mapped IPv6 addresses as their IPv4 address).
+pub fn address_class(ip: std::net::IpAddr) -> AddressClass {
+    use std::net::IpAddr;
+    let ip = match ip {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => IpAddr::V6(v6),
+        },
+        v4 => v4,
+    };
+    match ip {
+        IpAddr::V4(a) => {
+            let o = a.octets();
+            if a.is_loopback() {
+                AddressClass::Loopback
+            } else if a.is_link_local() {
+                AddressClass::LinkLocal
+            } else if a.is_private() || (o[0] == 100 && (o[1] & 0xc0) == 64) {
+                AddressClass::Private
+            } else if a.is_unspecified()
+                || a.is_broadcast()
+                || a.is_multicast()
+                || o[0] == 0
+                || o[0] >= 240
+            {
+                AddressClass::Reserved
+            } else {
+                AddressClass::Public
+            }
+        }
+        IpAddr::V6(a) => {
+            let seg = a.segments();
+            if a.is_loopback() {
+                AddressClass::Loopback
+            } else if (seg[0] & 0xffc0) == 0xfe80 {
+                AddressClass::LinkLocal
+            } else if (seg[0] & 0xfe00) == 0xfc00 {
+                AddressClass::Private
+            } else if a.is_unspecified() || a.is_multicast() {
+                AddressClass::Reserved
+            } else {
+                AddressClass::Public
+            }
+        }
+    }
+}
+
+/// Resolve `host:port` and classify every address it resolves to.
+pub async fn resolve_classes(
+    host: &str,
+    port: u16,
+) -> anyhow::Result<Vec<(std::net::IpAddr, AddressClass)>> {
+    let addrs = tokio::net::lookup_host((host, port)).await.map_err(|e| {
+        OprobeError::new(
+            ErrorCode::NetDns,
+            format!("cannot resolve `{host}`: {e}"),
+        )
+    })?;
+    Ok(addrs.map(|a| (a.ip(), address_class(a.ip()))).collect())
 }
 
 /// Set (to `1`) by a read-only MCP server on the commands it runs as children (`fix`,
@@ -564,6 +715,80 @@ pub async fn preflight(
         out.write_delete = Some(true);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod sec_tests {
+    use super::*;
+
+    #[test]
+    fn addresses_are_classified() {
+        let c = |s: &str| address_class(s.parse().unwrap());
+        assert_eq!(c("127.0.0.1"), AddressClass::Loopback);
+        assert_eq!(c("::1"), AddressClass::Loopback);
+        assert_eq!(c("169.254.169.254"), AddressClass::LinkLocal);
+        assert_eq!(c("fe80::1"), AddressClass::LinkLocal);
+        assert_eq!(c("::ffff:169.254.169.254"), AddressClass::LinkLocal);
+        assert_eq!(c("10.1.2.3"), AddressClass::Private);
+        assert_eq!(c("172.16.0.1"), AddressClass::Private);
+        assert_eq!(c("192.168.1.1"), AddressClass::Private);
+        assert_eq!(c("100.64.0.1"), AddressClass::Private);
+        assert_eq!(c("fd00::1"), AddressClass::Private);
+        assert_eq!(c("0.0.0.0"), AddressClass::Reserved);
+        assert_eq!(c("::"), AddressClass::Reserved);
+        assert_eq!(c("8.8.8.8"), AddressClass::Public);
+        assert_eq!(c("2606:4700::1111"), AddressClass::Public);
+    }
+
+    #[test]
+    fn tokens_are_random_and_compared_exactly() {
+        let a = random_token();
+        let b = random_token();
+        assert_eq!(a.len(), 64);
+        assert_ne!(a, b);
+        assert!(secrets_equal(a.as_bytes(), a.clone().as_bytes()));
+        assert!(!secrets_equal(a.as_bytes(), b.as_bytes()));
+        assert!(!secrets_equal(&a.as_bytes()[..63], a.as_bytes()));
+        assert!(!secrets_equal(b"", a.as_bytes()));
+    }
+
+    #[test]
+    fn mcp_default_budgets_fill_only_unset_limits() {
+        let d = Budgets::mcp_default();
+        assert_eq!(d.max_requests_count, Some(50_000));
+        assert_eq!(d.max_duration_s, Some(120.0));
+        assert_eq!(d.max_cost_usd, Some(1.0));
+        assert_eq!(d.max_bytes, Some(5 * 1024 * 1024 * 1024));
+        let b = Budgets {
+            max_requests_count: Some(1_000_000),
+            ..Default::default()
+        }
+        .or(&d);
+        assert_eq!(b.max_requests_count, Some(1_000_000));
+        assert_eq!(b.max_duration_s, Some(120.0));
+    }
+
+    #[test]
+    fn a_lab_target_with_a_foreign_endpoint_is_not_in_process() {
+        let mut t = crate::config::TargetSpec {
+            url: Some("lab://demo".into()),
+            scheme: "s3".into(),
+            ..Default::default()
+        };
+        t.options
+            .insert("endpoint".into(), "http://127.0.0.1:9000".into());
+        assert!(in_process(&t));
+        t.proxy = Some("none".into());
+        assert!(in_process(&t));
+        t.options
+            .insert("endpoint".into(), "https://evil.example.com".into());
+        assert!(!in_process(&t));
+        t.options
+            .insert("endpoint".into(), "http://[::1]:9000".into());
+        assert!(in_process(&t));
+        t.proxy = Some("http://proxy.example.com:3128".into());
+        assert!(!in_process(&t));
+    }
 }
 
 #[cfg(test)]
