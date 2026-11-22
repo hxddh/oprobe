@@ -1069,7 +1069,7 @@ mod tests {
     use super::*;
     use crate::util::ByteSize;
 
-    fn lab_profile() -> Profile {
+    pub(crate) fn lab_profile() -> Profile {
         let mut t = TargetSpec::from_url("s3://bkt/x").unwrap();
         t.options
             .insert("endpoint".into(), "https://minio.local:9000".into());
@@ -1105,54 +1105,6 @@ mod tests {
         p.cost.provider = Some("aws-s3".into());
         p.name = Some("base".into());
         p
-    }
-
-    /// Parse a printed command with the CLI and build its profile.
-    fn replay(cmd: &str) -> Profile {
-        use clap::Parser;
-        let words = shell_words(cmd);
-        assert_eq!(words[0], "oprobe");
-        let cli =
-            crate::cli::args::Cli::try_parse_from(&words).unwrap_or_else(|e| panic!("{cmd}: {e}"));
-        let Some(crate::cli::args::Command::Run(a)) = cli.command else {
-            panic!("not a run: {cmd}");
-        };
-        let mut p = crate::cli::build_profile(&a.target, &a.workload, &a.knobs, &a.cost).unwrap();
-        crate::cli::apply_sla(&mut p, &a.sla).unwrap();
-        let mut label = a.output.label.clone();
-        Overrides::parse(&a.set)
-            .unwrap()
-            .apply(&mut p, &mut label)
-            .unwrap();
-        p.name = label;
-        p
-    }
-
-    /// Minimal POSIX word splitting with single quotes (what `command_line` produces).
-    fn shell_words(s: &str) -> Vec<String> {
-        let mut out = Vec::new();
-        let mut cur = String::new();
-        let mut q = false;
-        let mut any = false;
-        for c in s.chars() {
-            match (c, q) {
-                ('\'', _) => {
-                    q = !q;
-                    any = true;
-                }
-                (' ', false) => {
-                    if any || !cur.is_empty() {
-                        out.push(std::mem::take(&mut cur));
-                    }
-                    any = false;
-                }
-                (c, _) => cur.push(c),
-            }
-        }
-        if any || !cur.is_empty() {
-            out.push(cur);
-        }
-        out
     }
 
     #[test]
@@ -1221,22 +1173,10 @@ mod tests {
     }
 
     #[test]
-    fn command_replays_every_setting() {
-        let p = lab_profile();
-        let s = RunSpec::new(&p, "s3://bkt/x");
-        let cmd = s.command();
-        let back = replay(&cmd);
-        // Same workload, knobs, SLA, cost and label; the secret is not in the command.
-        assert!(!cmd.contains("hunter2"), "{cmd}");
-        assert_eq!(back.workload, p.workload, "{cmd}");
-        assert_eq!(back.knobs, p.knobs, "{cmd}");
-        assert_eq!(back.sla, p.sla, "{cmd}");
-        assert_eq!(back.cost, p.cost, "{cmd}");
-        assert_eq!(back.name, p.name, "{cmd}");
-        assert_eq!(back.target.options["endpoint"], "https://minio.local:9000");
-        assert_eq!(back.target.options["region"], "eu-west-1");
-        assert_eq!(RunSpec::new(&back, "s3://bkt/x").hash(), s.hash());
-        // A default profile prints a short command.
+    fn default_profiles_print_short_commands() {
+        // The CLI parses every command back to the same profile (`oprobe`'s cli tests).
+        let s = RunSpec::new(&lab_profile(), "s3://bkt/x");
+        assert!(!s.command().contains("hunter2"), "{}", s.command());
         let d = RunSpec::new(
             &Profile::from_target(TargetSpec::from_url("memory://").unwrap()),
             "memory://",
@@ -1278,10 +1218,8 @@ mod tests {
         );
         assert_eq!(relabel.hash(), s.hash());
         assert_eq!(relabel.seed, 9);
-        // The command of the changed spec replays the change.
-        let back = replay(&n.command());
-        assert_eq!(back.knobs.concurrency, 48);
-        assert_eq!(back.workload.mix, a.workload.mix);
+        // The command of the changed spec names the change.
+        assert!(n.command().contains("--concurrency 48"), "{}", n.command());
         // A preset override resets dataset and mix, unless given with it.
         let pr = s.with(&Overrides::new().with_set("preset", "parquet"));
         assert!(pr.profile.workload.mix.is_empty() && pr.profile.workload.dataset.is_none());

@@ -5,7 +5,7 @@
 use schemars::JsonSchema;
 use serde::Serialize;
 
-use super::catalog::{self, FindingDoc};
+use crate::analysis::catalog::{self, FindingDoc};
 use crate::analysis::diagnosis::{Bottleneck, Severity};
 use crate::analysis::findings::Command;
 use crate::analysis::outliers::{self, Attribution, Selection};
@@ -539,4 +539,15 @@ pub fn explain_subject(
             )))
         }
     }
+}
+
+/// `oprobe explain`: the finding catalog (`list`), one finding code, or a stored run.
+pub fn explain(app: &super::App, req: super::ExplainRequest) -> anyhow::Result<ExplainOutput> {
+    if req.list {
+        return Ok(ExplainOutput::FindingCodes {
+            codes: catalog::all(),
+        });
+    }
+    let subject = req.subject.as_deref().unwrap_or_default();
+    explain_subject(&app.store(), subject, req.top)
 }

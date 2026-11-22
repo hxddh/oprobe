@@ -7,7 +7,7 @@ use schemars::JsonSchema;
 use serde::Serialize;
 
 use super::Ctx;
-use super::args::*;
+use super::input::*;
 use crate::errors::{ErrorCode, OprobeError};
 use crate::output::CommandOutput;
 use crate::report::style::{bold, dim, green};
@@ -26,8 +26,8 @@ pub struct ConfigPaths {
 impl CommandOutput for ConfigPaths {
     fn next(&self) -> Vec<crate::output::NextStep> {
         vec![
-            crate::cli::next::list_targets(),
-            crate::cli::next::discover(),
+            crate::app::next::list_targets(),
+            crate::app::next::discover(),
         ]
     }
 
@@ -46,9 +46,9 @@ impl CommandOutput for ConfigPaths {
     }
 }
 
-pub fn config_path(ctx: &Ctx) -> Result<u8> {
+pub fn config_path(ctx: &Ctx) -> Result<ConfigPaths> {
     let p = &ctx.paths;
-    ctx.out.finish(&ConfigPaths {
+    Ok(ConfigPaths {
         config_file: p.config_file.display().to_string(),
         config_exists: p.config_file.is_file(),
         data_dir: p.data_dir.display().to_string(),
@@ -67,8 +67,8 @@ pub struct ConfigShow {
 impl CommandOutput for ConfigShow {
     fn next(&self) -> Vec<crate::output::NextStep> {
         vec![
-            crate::cli::next::list_targets(),
-            crate::cli::next::discover(),
+            crate::app::next::list_targets(),
+            crate::app::next::discover(),
         ]
     }
 
@@ -97,9 +97,9 @@ impl CommandOutput for ConfigShow {
     }
 }
 
-pub fn config_show(ctx: &Ctx) -> Result<u8> {
+pub fn config_show(ctx: &Ctx) -> Result<ConfigShow> {
     let cfg = ctx.config()?;
-    ctx.out.finish(&ConfigShow {
+    Ok(ConfigShow {
         config_file: ctx.paths.config_file.display().to_string(),
         settings: cfg.effective(&ctx.flags),
         targets: cfg.targets.keys().cloned().collect(),
@@ -117,8 +117,8 @@ pub struct TargetShow {
 impl CommandOutput for TargetShow {
     fn next(&self) -> Vec<crate::output::NextStep> {
         vec![
-            crate::cli::next::doctor(&self.name),
-            crate::cli::next::plan(&self.name),
+            crate::app::next::doctor(&self.name),
+            crate::app::next::plan(&self.name),
         ]
     }
 
@@ -151,10 +151,10 @@ impl CommandOutput for TargetList {
     fn next(&self) -> Vec<crate::output::NextStep> {
         match self.targets.first() {
             Some(t) => vec![
-                crate::cli::next::doctor(&t.name),
-                crate::cli::next::plan(&t.name),
+                crate::app::next::doctor(&t.name),
+                crate::app::next::plan(&t.name),
             ],
-            None => vec![crate::cli::next::discover()],
+            None => vec![crate::app::next::discover()],
         }
     }
 
@@ -182,7 +182,8 @@ fn redacted(name: &str, t: &TargetEntry) -> TargetShow {
     }
 }
 
-pub async fn target_add(a: TargetAddArgs, ctx: &Ctx) -> Result<u8> {
+/// `oprobe target add`: validate and save the target (the CLI runs the quick check after).
+pub async fn target_add(ctx: &Ctx, a: TargetAddRequest) -> Result<TargetShow> {
     ConfigFile::check_target_name(&a.name)?;
     let spec = crate::config::TargetSpec::from_url(&a.url).map_err(|e| {
         OprobeError::new(
@@ -202,7 +203,6 @@ pub async fn target_add(a: TargetAddArgs, ctx: &Ctx) -> Result<u8> {
         options.insert(k.trim().to_owned(), v.trim().to_owned());
     }
     let name = a.name.clone();
-    let no_test = a.no_test;
     let entry = TargetEntry {
         url: a.url,
         region: a.region,
@@ -222,10 +222,9 @@ pub async fn target_add(a: TargetAddArgs, ctx: &Ctx) -> Result<u8> {
         ))
         .into());
     }
-    cfg.targets.insert(a.name.clone(), entry.clone());
+    cfg.targets.insert(name.clone(), entry.clone());
     cfg.save(&ctx.paths.config_file)?;
-    let text = ctx.out.format == crate::output::OutputFormat::Text;
-    if text {
+    if ctx.out.format == crate::output::OutputFormat::Text {
         ctx.out.info(format!(
             "{} saved target {} in {}",
             green("✓"),
@@ -233,55 +232,17 @@ pub async fn target_add(a: TargetAddArgs, ctx: &Ctx) -> Result<u8> {
             ctx.paths.config_file.display()
         ));
     }
-    let code = ctx.out.finish(&redacted(&name, &entry))?;
-    if no_test {
-        return Ok(code);
-    }
-    if !text {
-        ctx.out
-            .info(format!("check it with `oprobe target test {name}`"));
-        return Ok(code);
-    }
-    // A quick read-only doctor: reachability, TLS, clock, credentials and listing.
-    ctx.out.info(dim(
-        "quick check (read-only; `oprobe target test --write-probe` also writes a probe object):",
-    ));
-    // A fresh context: the config was loaded (and cached) before the target was added.
-    let fresh = Ctx::new(ctx.out.clone(), ctx.paths.clone());
-    let checked = super::doctor::run(
-        DoctorArgs {
-            target: TargetArgs {
-                target: Some(name.clone()),
-                ..Default::default()
-            },
-            read_only: true,
-            ..Default::default()
-        },
-        &fresh,
-    )
-    .await;
-    match checked {
-        Ok(0) => Ok(code),
-        Ok(c) => {
-            ctx.out.warn(format!(
-                "the target is saved, but the check failed: fix it, then `oprobe target test {name}`"
-            ));
-            Ok(c)
-        }
-        Err(e) => {
-            ctx.out.warn(format!(
-                "the target is saved, but the check failed: fix it, then `oprobe target test {name}`"
-            ));
-            Err(e)
-        }
-    }
+    Ok(redacted(&name, &entry))
 }
 
 /// `oprobe target test NAME`: the doctor on a configured target (or a URL).
-pub async fn target_test(a: TargetTestArgs, ctx: &Ctx) -> Result<u8> {
+pub async fn target_test(ctx: &Ctx, a: TargetTestRequest) -> Result<super::doctor::DoctorOutput> {
+    // A fresh context: the config may have changed since this one cached it.
+    let fresh = Ctx::new(ctx.out.clone(), ctx.paths.clone());
     super::doctor::run(
-        DoctorArgs {
-            target: TargetArgs {
+        &fresh,
+        DoctorRequest {
+            target: TargetInput {
                 target: Some(a.name),
                 ..Default::default()
             },
@@ -289,7 +250,6 @@ pub async fn target_test(a: TargetTestArgs, ctx: &Ctx) -> Result<u8> {
             write_probe: a.write_probe,
             verbose: false,
         },
-        ctx,
     )
     .await
 }
@@ -324,7 +284,7 @@ pub struct ConfigEdited {
 
 impl CommandOutput for ConfigEdited {
     fn next(&self) -> Vec<crate::output::NextStep> {
-        vec![crate::cli::next::list_targets()]
+        vec![crate::app::next::list_targets()]
     }
 
     fn text(&self) -> String {
@@ -356,7 +316,7 @@ pub fn editor_command(env: &dyn Fn(&str) -> Option<String>) -> Vec<String> {
     raw.split_whitespace().map(str::to_owned).collect()
 }
 
-pub fn config_edit(ctx: &Ctx) -> Result<u8> {
+pub fn config_edit(ctx: &Ctx) -> Result<ConfigEdited> {
     let path = &ctx.paths.config_file;
     if ctx.out.non_interactive {
         return Err(OprobeError::new(
@@ -392,16 +352,16 @@ pub fn config_edit(ctx: &Ctx) -> Result<u8> {
         OprobeError::new(ErrorCode::ConfigInvalid, format!("{e:#}"))
             .with_hint("fix it with `oprobe config edit` (the file was kept as you saved it)")
     })?;
-    ctx.out.finish(&ConfigEdited {
+    Ok(ConfigEdited {
         config_file: path.display().to_string(),
         created,
         targets: cfg.targets.keys().cloned().collect(),
     })
 }
 
-pub fn target_list(ctx: &Ctx) -> Result<u8> {
+pub fn target_list(ctx: &Ctx) -> Result<TargetList> {
     let cfg = ctx.config()?;
-    ctx.out.finish(&TargetList {
+    Ok(TargetList {
         targets: cfg.targets.iter().map(|(n, t)| redacted(n, t)).collect(),
     })
 }
@@ -415,20 +375,20 @@ fn unknown_target(name: &str) -> anyhow::Error {
     .into()
 }
 
-pub fn target_show(a: TargetNameArg, ctx: &Ctx) -> Result<u8> {
+pub fn target_show(ctx: &Ctx, name: &str) -> Result<TargetShow> {
     let cfg = ctx.config()?;
-    let t = cfg.target(&a.name).ok_or_else(|| unknown_target(&a.name))?;
-    ctx.out.finish(&redacted(&a.name, t))
+    let t = cfg.target(name).ok_or_else(|| unknown_target(name))?;
+    Ok(redacted(name, t))
 }
 
-pub fn target_rm(a: TargetNameArg, ctx: &Ctx) -> Result<u8> {
+pub fn target_rm(ctx: &Ctx, name: &str) -> Result<TargetShow> {
     let mut cfg = ctx.config()?.clone();
     let t = cfg
         .targets
-        .remove(&a.name)
-        .ok_or_else(|| unknown_target(&a.name))?;
+        .remove(name)
+        .ok_or_else(|| unknown_target(name))?;
     cfg.save(&ctx.paths.config_file)?;
-    ctx.out.finish(&redacted(&a.name, &t))
+    Ok(redacted(name, &t))
 }
 
 #[cfg(test)]

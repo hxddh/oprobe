@@ -213,7 +213,7 @@ fn docs_list_every_finding_code() {
     let begin_end = begin + text[begin..].find("-->").unwrap() + 3;
     let end = text.find("<!-- END finding-codes -->").expect("END marker");
     let mut block = String::from("\n\n");
-    for d in oprobe::mcp::catalog::all() {
+    for d in oprobe::analysis::catalog::all() {
         block += &format!(
             "<a id=\"finding-{}\"></a>\n### `{}` — {}\n\n{} *({}, usually {})*\n\n",
             d.code,

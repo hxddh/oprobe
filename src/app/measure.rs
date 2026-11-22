@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use anyhow::Result;
 
 use super::Ctx;
-use super::args::OutputArgs;
+use super::input::OutputOptions;
 use super::run::{fail_on_gate, progress_for, save_outputs};
 use crate::config::Profile;
 use crate::engine::Cancel;
@@ -18,19 +18,19 @@ use crate::guard::Guard;
 use crate::report::style::dim;
 
 /// What one CLI measurement needs besides the profile.
-pub(super) struct Opts<'a> {
+pub struct Opts<'a> {
     pub target_name: Option<String>,
     pub rails: Rails,
     /// The command's guard: shared by every measurement of the command (one aggregate budget).
     pub guard: Option<Arc<Guard>>,
-    pub output: &'a OutputArgs,
+    pub output: &'a OutputOptions,
     pub cancel: &'a Cancel,
     pub mode: Mode,
 }
 
 /// Measure `profile` once through the pipeline and save the run (unless `--no-save`). A budget
 /// breach saves the partial run and returns its error (exit 4).
-pub(super) async fn measure(ctx: &Ctx, profile: Profile, o: Opts<'_>) -> Result<Measured> {
+pub async fn measure(ctx: &Ctx, profile: Profile, o: Opts<'_>) -> Result<Measured> {
     let total_s = match &o.mode {
         Mode::Run => profile.workload.duration.get().as_secs_f64(),
         Mode::Tune { opts, .. } => {
@@ -59,7 +59,7 @@ pub(super) async fn measure(ctx: &Ctx, profile: Profile, o: Opts<'_>) -> Result<
     let mut req = Request::new(profile, o.rails, o.cancel.clone(), progress);
     req.target_name = o.target_name;
     req.guard = o.guard;
-    req.trace_max_requests = super::trace_max_requests(ctx);
+    req.trace_max_requests = super::profile::trace_max_requests(ctx);
     req.store = (!o.output.no_save).then(|| ctx.store());
     req.mode = o.mode;
     req.on_stage = Some(on_stage);

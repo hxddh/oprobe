@@ -6,6 +6,7 @@
 pub mod build;
 pub mod ids;
 pub mod report;
+pub mod sections;
 pub mod spec;
 pub mod trace;
 
@@ -15,6 +16,7 @@ use serde::{Deserialize, Serialize};
 pub use build::{ReportInput, build_report, build_run, workload_info};
 pub use ids::RunId;
 pub use report::*;
+pub use sections::*;
 pub use spec::{Overrides, RunSpec};
 pub use trace::{OpBreakdownUs, OpRow, ReqRow, TcpRow, TlsRow, WireProtocol};
 

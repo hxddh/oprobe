@@ -245,9 +245,9 @@ impl Capabilities {
             warmup_s: prof.workload.warmup.get().as_secs_f64(),
             knobs: KnobValues::from(&prof.knobs),
             trace_max_requests_count: crate::trace::DEFAULT_MAX_REQUESTS as u64,
-            tune_trial_duration: crate::cli::args::tune_defaults::TRIAL_DURATION.into(),
-            tune_max_trials_count: crate::cli::args::tune_defaults::MAX_TRIALS as u64,
-            tune_max_concurrency_count: crate::cli::args::tune_defaults::MAX_CONCURRENCY as u64,
+            tune_trial_duration: crate::config::tune_defaults::TRIAL_DURATION.into(),
+            tune_max_trials_count: crate::config::tune_defaults::MAX_TRIALS as u64,
+            tune_max_concurrency_count: crate::config::tune_defaults::MAX_CONCURRENCY as u64,
         };
         Self {
             schema: CAPABILITIES_SCHEMA.into(),
@@ -350,7 +350,7 @@ fn short_exit(code: u8) -> &'static str {
 impl CommandOutput for Capabilities {
     fn next(&self) -> Vec<crate::output::NextStep> {
         vec![
-            crate::cli::next::discover(),
+            crate::app::next::discover(),
             crate::output::NextStep::new("the JSON Schemas of every output", "oprobe schema"),
         ]
     }

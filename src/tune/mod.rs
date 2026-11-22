@@ -35,7 +35,9 @@ use crate::report::TuneSummary;
 use crate::trace::Snapshot;
 use crate::util::ByteSize;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum Objective {
     /// Maximize goodput (successful ops/s or MiB/s) within the SLA and the throttle budget.

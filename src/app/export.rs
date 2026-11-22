@@ -1,14 +1,12 @@
 //! `oprobe runs export RUNREF --format json|ndjson|csv|har|otlp|md|html [--out PATH]
 //! [--endpoint URL]`.
 
-use std::io::Write;
-
 use anyhow::Result;
 use schemars::JsonSchema;
 use serde::Serialize;
 
 use super::Ctx;
-use super::args::{ExportArgs, ExportFormat};
+use super::input::{ExportFormat, ExportRequest};
 use crate::errors::{ErrorCode, OprobeError};
 use crate::export;
 use crate::model::Run;
@@ -35,7 +33,7 @@ pub struct ExportOutput {
 
 impl CommandOutput for ExportOutput {
     fn next(&self) -> Vec<crate::output::NextStep> {
-        vec![crate::cli::next::show(&self.run_id)]
+        vec![crate::app::next::show(&self.run_id)]
     }
 
     fn text(&self) -> String {
@@ -72,7 +70,7 @@ fn otlp(run: &Run, signal: &str) -> serde_json::Value {
 }
 
 /// Render `run` in `format` (OTLP: the one selected signal).
-fn render(run: &Run, a: &ExportArgs) -> Result<String> {
+fn render(run: &Run, a: &ExportRequest) -> Result<String> {
     Ok(match a.format {
         ExportFormat::Json => serde_json::to_string_pretty(run)? + "\n",
         ExportFormat::Ndjson => export::ndjson::to_string(run, true)?,
@@ -104,7 +102,16 @@ fn render(run: &Run, a: &ExportArgs) -> Result<String> {
     })
 }
 
-pub async fn cmd_export(a: ExportArgs, ctx: &Ctx) -> Result<u8> {
+/// What [`export`] produced: a file (or an OTLP push) described by [`ExportOutput`], or the
+/// export itself for stdout (no `out`).
+#[derive(Clone, Debug)]
+pub enum Exported {
+    Written(Box<ExportOutput>),
+    Stdout(String),
+}
+
+/// `oprobe runs export`.
+pub async fn export(ctx: &Ctx, a: ExportRequest) -> Result<Exported> {
     let run = ctx.store().load(&a.run)?;
     let base = || ExportOutput {
         run_id: run.id().to_owned(),
@@ -132,14 +139,14 @@ pub async fn cmd_export(a: ExportArgs, ctx: &Ctx) -> Result<u8> {
                 .await
                 .map_err(|e| OprobeError::new(ErrorCode::NetUnreachable, format!("{e:#}")))?;
         }
-        return ctx.out.finish(&ExportOutput {
+        return Ok(Exported::Written(Box::new(ExportOutput {
             endpoint: Some(ep.clone()),
             bytes,
             ..base()
-        });
+        })));
     }
     if matches!(a.format, ExportFormat::Otlp)
-        && a.signal == super::args::OtlpSignal::All
+        && a.signal == super::input::OtlpSignal::All
         && let Some(dir) = &a.out
     {
         // One valid OTLP document per signal, in the directory `--out` names.
@@ -158,31 +165,24 @@ pub async fn cmd_export(a: ExportArgs, ctx: &Ctx) -> Result<u8> {
             bytes += text.len() as u64;
             files.push(p.display().to_string());
         }
-        return ctx.out.finish(&ExportOutput {
+        return Ok(Exported::Written(Box::new(ExportOutput {
             path: Some(dir.display().to_string()),
             files,
             bytes,
             ..base()
-        });
+        })));
     }
     let text = render(&run, &a)?;
     match &a.out {
         Some(p) => {
             crate::report::write_file(p, &text)?;
-            ctx.out.finish(&ExportOutput {
+            Ok(Exported::Written(Box::new(ExportOutput {
                 path: Some(p.display().to_string()),
                 bytes: text.len() as u64,
                 ..base()
-            })
+            })))
         }
-        None => {
-            // The export itself is the result on stdout.
-            let mut out = std::io::stdout().lock();
-            // A closed pipe (`| head`) is the reader's choice, not a failure.
-            match out.write_all(text.as_bytes()).and_then(|()| out.flush()) {
-                Err(e) if e.kind() != std::io::ErrorKind::BrokenPipe => Err(e.into()),
-                _ => Ok(0),
-            }
-        }
+        // The export itself is the result on stdout.
+        None => Ok(Exported::Stdout(text)),
     }
 }

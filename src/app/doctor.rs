@@ -11,7 +11,7 @@ use schemars::JsonSchema;
 use serde::Serialize;
 
 use super::Ctx;
-use super::args::{CostArgs, DoctorArgs, KnobArgs, WorkloadArgs};
+use super::input::{CostInput, DoctorRequest, KnobInput, WorkloadInput};
 use crate::analysis::hints::hint_for;
 use crate::config::TargetSpec;
 use crate::engine::operator::{self, RegionSource};
@@ -965,20 +965,20 @@ async fn run_checks(
     }
 }
 
-pub async fn run(a: DoctorArgs, ctx: &Ctx) -> Result<u8> {
-    let (profile, _) = super::resolve_profile(
+pub async fn run(ctx: &Ctx, a: DoctorRequest) -> Result<DoctorOutput> {
+    let (profile, _) = super::profile::resolve_profile(
         ctx,
         &a.target,
-        &WorkloadArgs::default(),
-        &KnobArgs::default(),
-        &CostArgs::default(),
+        &WorkloadInput::default(),
+        &KnobInput::default(),
+        &CostInput::default(),
     )?;
     let target = profile.target.normalized()?;
     let arg = a.target.target.clone().unwrap_or_else(|| target.display());
     // Read-only unless --write-probe (design v4 §10).
     let read_only = a.read_only || !a.write_probe;
     let out = doctor(target, read_only, &arg, a.verbose).await;
-    ctx.out.finish(&out)
+    Ok(out)
 }
 
 pub fn render_probe(r: &crate::net::probe::ProbeReport) -> String {

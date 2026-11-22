@@ -5,9 +5,10 @@ use schemars::JsonSchema;
 use serde::Serialize;
 
 use super::Ctx;
-use super::args::*;
+use super::input::*;
 use crate::analysis::compare::{Comparison, compare_with_noise};
 use crate::analysis::stats::{self, Interval};
+use crate::engine::Cancel;
 use crate::errors::{ErrorCode, OprobeError};
 use crate::model::Run;
 use crate::output::CommandOutput;
@@ -51,7 +52,7 @@ impl CommandOutput for Comparison {
     }
 }
 
-pub(super) fn thresholds(a: &CompareArgs) -> Thresholds {
+pub fn thresholds(a: &CompareRequest) -> Thresholds {
     Thresholds {
         p99_increase_ratio: a.max_p99_increase / 100.0,
         p50_increase_ratio: a.max_p50_increase / 100.0,
@@ -71,7 +72,7 @@ pub(super) fn thresholds(a: &CompareArgs) -> Thresholds {
 }
 
 /// The noise floors learned for the target and workload of `r` (none when unknown).
-pub(super) fn noise_for(ctx: &Ctx, r: &Run) -> Option<crate::store::baselines::NoiseEntry> {
+pub fn noise_for(ctx: &Ctx, r: &Run) -> Option<crate::store::baselines::NoiseEntry> {
     let file = crate::store::baselines::noise_file(&ctx.paths);
     crate::store::baselines::NoiseFloors::load(&file)
         .ok()?
@@ -81,7 +82,7 @@ pub(super) fn noise_for(ctx: &Ctx, r: &Run) -> Option<crate::store::baselines::N
 
 /// Load one side: a RUNREF, a comma-separated list of RUNREFs, or `all:LABEL` (every stored run
 /// with that label, e.g. a `--repeat` group).
-pub(super) fn load_side(ctx: &Ctx, spec: &str) -> Result<Vec<Run>> {
+pub fn load_side(ctx: &Ctx, spec: &str) -> Result<Vec<Run>> {
     let store = ctx.store();
     if let Some(label) = spec.strip_prefix("all:") {
         let ids: Vec<String> = store
@@ -107,7 +108,7 @@ pub(super) fn load_side(ctx: &Ctx, spec: &str) -> Result<Vec<Run>> {
 }
 
 /// The runs of a named baseline (oldest first); missing runs are skipped with a warning.
-pub(super) fn baseline_runs(ctx: &Ctx, name: &str) -> Result<Vec<Run>> {
+pub fn baseline_runs(ctx: &Ctx, name: &str) -> Result<Vec<Run>> {
     let b = Baselines::load(&ctx.paths.baselines_file())?;
     let Some(bl) = b.get(name) else {
         let known: Vec<&str> = b.baselines.keys().map(String::as_str).collect();
@@ -144,7 +145,7 @@ pub(super) fn baseline_runs(ctx: &Ctx, name: &str) -> Result<Vec<Run>> {
 }
 
 /// Write `--markdown` / `--junit` / `--json` files of a comparison.
-pub(super) fn write_compare_files(c: &Comparison, a: &CompareArgs) -> Result<()> {
+pub fn write_compare_files(c: &Comparison, a: &CompareRequest) -> Result<()> {
     if let Some(p) = &a.markdown {
         write_file(p, &c.render_markdown())?;
     }
@@ -157,7 +158,8 @@ pub(super) fn write_compare_files(c: &Comparison, a: &CompareArgs) -> Result<()>
     Ok(())
 }
 
-pub fn cmd_compare(a: CompareArgs, ctx: &Ctx) -> Result<u8> {
+/// `oprobe compare`: load both sides, gate, write the requested files.
+pub fn compare(ctx: &Ctx, a: CompareRequest) -> Result<Comparison> {
     let (base_label, base) = match (&a.baseline_name, &a.baseline) {
         (Some(name), _) => (format!("baseline {name}"), baseline_runs(ctx, name)?),
         (None, Some(r)) => (r.clone(), load_side(ctx, r)?),
@@ -209,7 +211,7 @@ pub fn cmd_compare(a: CompareArgs, ctx: &Ctx) -> Result<u8> {
             GateVerdict::Passed => {}
         }
     }
-    ctx.out.finish(&c)
+    Ok(c)
 }
 
 // ---------------------------------------------------------------------------------------
@@ -443,12 +445,21 @@ impl CommandOutput for CalibrateOutput {
 
 /// `oprobe baseline calibrate TARGET [--repeat N]`: identical runs, consecutive pairs feed the
 /// noise floor (`<data>/noise.toml`) that compare and verify use.
-pub async fn cmd_calibrate(a: CalibrateArgs, ctx: &Ctx) -> Result<u8> {
+/// What [`calibrate`] produced.
+#[derive(Clone, Debug)]
+pub enum CalibrateOutcome {
+    /// `safety.dry_run`: the plan.
+    Plan(Box<super::run::PlanOutput>),
+    Calibrated(Box<CalibrateOutput>),
+}
+
+pub async fn calibrate(ctx: &Ctx, a: CalibrateRequest, cancel: Cancel) -> Result<CalibrateOutcome> {
     use crate::store::baselines::{NOISE_METRICS, NoiseFloors, noise_file, noise_ratio};
     let mut runs: Vec<Run> = Vec::new();
     if let Some(from) = &a.from {
         let base = ctx.store().load(from)?;
-        let replayer = super::verify::Replayer::of_run(ctx, &base, &a.safety, a.no_save)?;
+        let replayer =
+            super::verify::Replayer::of_run(ctx, &base, &a.safety, a.no_save, cancel.clone())?;
         if a.safety.dry_run {
             let rails = super::run::rails(ctx, &replayer.base, &a.safety)?;
             let mut plan = rails.plan(&replayer.base);
@@ -458,7 +469,9 @@ pub async fn cmd_calibrate(a: CalibrateArgs, ctx: &Ctx) -> Result<u8> {
                 a.repeat,
                 base.id()
             ));
-            return ctx.out.finish(&super::run::PlanOutput { plan });
+            return Ok(CalibrateOutcome::Plan(Box::new(super::run::PlanOutput {
+                plan,
+            })));
         }
         for i in 0..a.repeat {
             ctx.out.info(dim(&format!(
@@ -478,12 +491,17 @@ pub async fn cmd_calibrate(a: CalibrateArgs, ctx: &Ctx) -> Result<u8> {
             );
         }
     } else {
-        let (profile, target_name) =
-            super::resolve_profile(ctx, &a.target, &a.workload, &a.knobs, &CostArgs::default())?;
-        let output = OutputArgs {
+        let (profile, target_name) = super::profile::resolve_profile(
+            ctx,
+            &a.target,
+            &a.workload,
+            &a.knobs,
+            &CostInput::default(),
+        )?;
+        let output = OutputOptions {
             no_save: a.no_save,
             label: Some(format!("calibrate-{}", crate::model::RunId::new())),
-            ..OutputArgs::default()
+            ..OutputOptions::default()
         };
         if a.safety.dry_run {
             let rails = super::run::rails(ctx, &profile, &a.safety)?;
@@ -493,7 +511,9 @@ pub async fn cmd_calibrate(a: CalibrateArgs, ctx: &Ctx) -> Result<u8> {
                 "{} identical runs (this plan is one of them)",
                 a.repeat
             ));
-            return ctx.out.finish(&super::run::PlanOutput { plan });
+            return Ok(CalibrateOutcome::Plan(Box::new(super::run::PlanOutput {
+                plan,
+            })));
         }
         // One guard for the whole command: the budgets cap all calibration runs together.
         let guard = super::run::guard_for(ctx, &profile, &super::run::budgets(ctx, &a.safety)?);
@@ -507,6 +527,7 @@ pub async fn cmd_calibrate(a: CalibrateArgs, ctx: &Ctx) -> Result<u8> {
                 &a.safety,
                 &output,
                 guard.clone(),
+                &cancel,
             )
             .await?
             {
@@ -529,7 +550,7 @@ pub async fn cmd_calibrate(a: CalibrateArgs, ctx: &Ctx) -> Result<u8> {
     floors.save(&file)?;
     let first = &runs[0].report;
     let entry = floors.of(first).cloned();
-    ctx.out.finish(&CalibrateOutput {
+    Ok(CalibrateOutcome::Calibrated(Box::new(CalibrateOutput {
         target: crate::report::diff::target_identity(first),
         workload_hash: first.spec.workload_hash(),
         run_ids: runs.iter().map(|r| r.id().to_owned()).collect(),
@@ -540,94 +561,97 @@ pub async fn cmd_calibrate(a: CalibrateArgs, ctx: &Ctx) -> Result<u8> {
             .map(|m| ((*m).to_owned(), noise_ratio(entry.as_ref(), m)))
             .collect(),
         path: file.display().to_string(),
+    })))
+}
+
+fn unknown_baseline(name: &str) -> anyhow::Error {
+    OprobeError::new(
+        ErrorCode::UsageUnknownBaseline,
+        format!("no baseline named `{name}`"),
+    )
+    .into()
+}
+
+/// `baseline set NAME RUNREF… | --last N`.
+pub fn baseline_set(ctx: &Ctx, a: BaselineSetRequest) -> Result<BaselineShow> {
+    let file = ctx.paths.baselines_file();
+    valid_name(&a.name)?;
+    let store = ctx.store();
+    let mut ids: Vec<String> = Vec::new();
+    if let Some(n) = a.last {
+        // The newest N complete runs: partial ones cannot be baselines.
+        let mut all: Vec<_> = store
+            .list()?
+            .into_iter()
+            .filter(|s| !s.interrupted)
+            .collect();
+        all.truncate(n);
+        ids.extend(all.into_iter().rev().map(|s| s.id));
+    }
+    for r in &a.runs {
+        for run in load_side(ctx, r)? {
+            crate::store::baselines::check_baseline_run(&run.report)?;
+            ids.push(run.id().to_owned());
+        }
+    }
+    if ids.is_empty() {
+        return Err(OprobeError::new(
+            ErrorCode::UsageInvalidArgument,
+            "name the baseline's runs: `baseline set NAME RUNREF…` or `--last N`",
+        )
+        .into());
+    }
+    let mut b = Baselines::load(&file)?;
+    let entry = b.baselines.entry(a.name.clone()).or_default();
+    if !a.append {
+        entry.runs.clear();
+    }
+    if let Some(w) = a.window {
+        entry.window = w.max(1);
+    } else if ids.len() > entry.window {
+        entry.window = ids.len();
+    }
+    for id in &ids {
+        entry.push(id);
+    }
+    let snapshot = entry.clone();
+    b.save(&file)?;
+    show(ctx, &a.name, &snapshot)
+}
+
+/// `baseline list`.
+pub fn baseline_list(ctx: &Ctx) -> Result<BaselineList> {
+    let b = Baselines::load(&ctx.paths.baselines_file())?;
+    Ok(BaselineList {
+        baselines: b
+            .baselines
+            .iter()
+            .map(|(name, bl)| BaselineEntry {
+                name: name.clone(),
+                window: bl.window as u64,
+                runs_count: bl.runs.len() as u64,
+                newest_run: bl.runs.last().cloned(),
+            })
+            .collect(),
     })
 }
 
-pub fn cmd_baseline(c: BaselineCommand, ctx: &Ctx) -> Result<u8> {
+/// `baseline rm NAME`.
+pub fn baseline_rm(ctx: &Ctx, name: &str) -> Result<BaselineRemoved> {
     let file = ctx.paths.baselines_file();
-    match c {
-        BaselineCommand::Set(a) => {
-            valid_name(&a.name)?;
-            let store = ctx.store();
-            let mut ids: Vec<String> = Vec::new();
-            if let Some(n) = a.last {
-                // The newest N complete runs: partial ones cannot be baselines.
-                let mut all: Vec<_> = store
-                    .list()?
-                    .into_iter()
-                    .filter(|s| !s.interrupted)
-                    .collect();
-                all.truncate(n);
-                ids.extend(all.into_iter().rev().map(|s| s.id));
-            }
-            for r in &a.runs {
-                for run in load_side(ctx, r)? {
-                    crate::store::baselines::check_baseline_run(&run.report)?;
-                    ids.push(run.id().to_owned());
-                }
-            }
-            if ids.is_empty() {
-                return Err(OprobeError::new(
-                    ErrorCode::UsageInvalidArgument,
-                    "name the baseline's runs: `baseline set NAME RUNREF…` or `--last N`",
-                )
-                .into());
-            }
-            let mut b = Baselines::load(&file)?;
-            let entry = b.baselines.entry(a.name.clone()).or_default();
-            if !a.append {
-                entry.runs.clear();
-            }
-            if let Some(w) = a.window {
-                entry.window = w.max(1);
-            } else if ids.len() > entry.window {
-                entry.window = ids.len();
-            }
-            for id in &ids {
-                entry.push(id);
-            }
-            let snapshot = entry.clone();
-            b.save(&file)?;
-            ctx.out.finish(&show(ctx, &a.name, &snapshot)?)
-        }
-        BaselineCommand::List => {
-            let b = Baselines::load(&file)?;
-            ctx.out.finish(&BaselineList {
-                baselines: b
-                    .baselines
-                    .iter()
-                    .map(|(name, bl)| BaselineEntry {
-                        name: name.clone(),
-                        window: bl.window as u64,
-                        runs_count: bl.runs.len() as u64,
-                        newest_run: bl.runs.last().cloned(),
-                    })
-                    .collect(),
-            })
-        }
-        BaselineCommand::Rm(a) => {
-            let mut b = Baselines::load(&file)?;
-            if b.remove(&a.name).is_none() {
-                return Err(OprobeError::new(
-                    ErrorCode::UsageUnknownBaseline,
-                    format!("no baseline named `{}`", a.name),
-                )
-                .into());
-            }
-            b.save(&file)?;
-            ctx.out.finish(&BaselineRemoved { name: a.name })
-        }
-        BaselineCommand::Show(a) => {
-            let b = Baselines::load(&file)?;
-            let Some(bl) = b.get(&a.name) else {
-                return Err(OprobeError::new(
-                    ErrorCode::UsageUnknownBaseline,
-                    format!("no baseline named `{}`", a.name),
-                )
-                .into());
-            };
-            ctx.out.finish(&show(ctx, &a.name, bl)?)
-        }
-        BaselineCommand::Calibrate(_) => unreachable!("dispatched to cmd_calibrate"),
+    let mut b = Baselines::load(&file)?;
+    if b.remove(name).is_none() {
+        return Err(unknown_baseline(name));
     }
+    b.save(&file)?;
+    Ok(BaselineRemoved { name: name.into() })
+}
+
+/// `baseline show NAME`.
+pub fn baseline_show(ctx: &Ctx, name: &str) -> Result<BaselineShow> {
+    let b = Baselines::load(&ctx.paths.baselines_file())?;
+    let Some(bl) = b.get(name) else {
+        return Err(unknown_baseline(name));
+    };
+    show(ctx, name, bl)
 }

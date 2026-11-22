@@ -2,6 +2,7 @@
 //! ranked. `--targets a,b --vary concurrency=8,16,32 --vary http=h1,h2
 //! --vary addressing=virtual,path`.
 
+use crate::net::HttpVersion;
 use std::collections::BTreeMap;
 
 use anyhow::Result;
@@ -9,7 +10,7 @@ use schemars::JsonSchema;
 use serde::Serialize;
 
 use super::Ctx;
-use super::args::*;
+use super::input::*;
 use super::measure::{Opts, measure};
 use crate::engine::Cancel;
 use crate::engine::measure::Mode;
@@ -68,9 +69,9 @@ fn on(v: &str) -> Result<bool, String> {
 fn apply(
     k: &str,
     v: &str,
-    t: &mut TargetArgs,
-    w: &mut WorkloadArgs,
-    kn: &mut KnobArgs,
+    t: &mut TargetInput,
+    w: &mut WorkloadInput,
+    kn: &mut KnobInput,
 ) -> Result<(), String> {
     let num = |v: &str| {
         v.parse::<usize>()
@@ -85,9 +86,9 @@ fn apply(
         "retries" => kn.retries = Some(num(v)?),
         "http" => {
             kn.http = Some(match v.to_ascii_lowercase().as_str() {
-                "h1" | "http1" | "1.1" => HttpArg::H1,
-                "h2" | "http2" | "2" => HttpArg::H2,
-                "auto" => HttpArg::Auto,
+                "h1" | "http1" | "1.1" => HttpVersion::H1,
+                "h2" | "http2" | "2" => HttpVersion::H2,
+                "auto" => HttpVersion::Auto,
                 _ => return Err(format!("http must be h1, h2 or auto, got `{v}`")),
             })
         }
@@ -149,7 +150,7 @@ pub struct MatrixOutput {
 
 impl CommandOutput for MatrixOutput {
     fn next(&self) -> Vec<crate::output::NextStep> {
-        vec![crate::cli::next::list_runs()]
+        vec![crate::app::next::list_runs()]
     }
 
     fn formats() -> &'static [crate::output::OutputFormat] {
@@ -266,7 +267,7 @@ impl MatrixPlanOutput {
 
 impl CommandOutput for MatrixPlanOutput {
     fn next(&self) -> Vec<crate::output::NextStep> {
-        vec![crate::cli::next::list_runs()]
+        vec![crate::app::next::list_runs()]
     }
 
     fn text(&self) -> String {
@@ -334,7 +335,15 @@ fn score(c: &MatrixCell, by: &str) -> f64 {
     }
 }
 
-pub async fn cmd_matrix(a: MatrixArgs, ctx: &Ctx) -> Result<u8> {
+/// What [`matrix`] produced.
+#[derive(Clone, Debug)]
+pub enum MatrixOutcome {
+    Plan(Box<MatrixPlanOutput>),
+    Measured(Box<MatrixOutput>),
+}
+
+/// `oprobe matrix`: measure every cell of targets × knob values and rank them.
+pub async fn matrix(ctx: &Ctx, a: MatrixRequest, cancel: Cancel) -> Result<MatrixOutcome> {
     let bad = |m: String| -> anyhow::Error {
         OprobeError::new(ErrorCode::UsageInvalidArgument, m).into()
     };
@@ -404,8 +413,8 @@ pub async fn cmd_matrix(a: MatrixArgs, ctx: &Ctx) -> Result<u8> {
             for (k, v) in combo {
                 apply(k, v, &mut ta, &mut wa, &mut ka).map_err(bad)?;
             }
-            let (mut profile, name) = super::resolve_profile(ctx, &ta, &wa, &ka, &a.cost)?;
-            super::apply_sla(&mut profile, &a.sla)?;
+            let (mut profile, name) = super::profile::resolve_profile(ctx, &ta, &wa, &ka, &a.cost)?;
+            super::profile::apply_sla(&mut profile, &a.sla)?;
             plans.push((profile, name, combo.clone()));
         }
     }
@@ -423,21 +432,19 @@ pub async fn cmd_matrix(a: MatrixArgs, ctx: &Ctx) -> Result<u8> {
                 plan: r.plan(p),
             })
             .collect();
-        return ctx.out.finish(&MatrixPlanOutput::new(cells));
+        return Ok(MatrixOutcome::Plan(Box::new(MatrixPlanOutput::new(cells))));
     }
     // One guard for the whole matrix: the budgets cap all cells together.
     let guard = plans
         .first()
         .zip(rails.first())
         .and_then(|((p, _, _), r)| super::run::guard_for(ctx, p, &r.budgets));
-    let cancel = Cancel::new();
-    super::install_ctrl_c(cancel.clone());
     let mut cells = Vec::new();
     let label = a
         .label
         .clone()
         .unwrap_or_else(|| format!("matrix-{}", crate::model::RunId::new()));
-    let output = OutputArgs {
+    let output = OutputOptions {
         label: Some(label.clone()),
         ..Default::default()
     };
@@ -513,7 +520,10 @@ pub async fn cmd_matrix(a: MatrixArgs, ctx: &Ctx) -> Result<u8> {
     for (i, c) in cells.iter_mut().enumerate() {
         c.rank = i as u64 + 1;
     }
-    ctx.out.finish(&MatrixOutput { rank_by, cells })
+    Ok(MatrixOutcome::Measured(Box::new(MatrixOutput {
+        rank_by,
+        cells,
+    })))
 }
 
 #[cfg(test)]
@@ -525,12 +535,12 @@ mod tests {
         let (k, v) = parse_vary("concurrency=8,16").unwrap();
         assert_eq!((k.as_str(), v.len()), ("concurrency", 2));
         assert!(parse_vary("bogus=1").is_err());
-        let (mut t, mut w, mut kn): (TargetArgs, WorkloadArgs, KnobArgs) = Default::default();
+        let (mut t, mut w, mut kn): (TargetInput, WorkloadInput, KnobInput) = Default::default();
         apply("addressing", "path", &mut t, &mut w, &mut kn).unwrap();
         apply("addressing", "virtual", &mut t, &mut w, &mut kn).unwrap();
         assert_eq!(t.options, vec!["enable_virtual_host_style=true".to_owned()]);
         apply("http", "h2", &mut t, &mut w, &mut kn).unwrap();
-        assert!(matches!(kn.http, Some(HttpArg::H2)));
+        assert!(matches!(kn.http, Some(HttpVersion::H2)));
         apply("keep_alive", "off", &mut t, &mut w, &mut kn).unwrap();
         assert!(kn.no_keep_alive);
         assert!(apply("http", "h3", &mut t, &mut w, &mut kn).is_err());

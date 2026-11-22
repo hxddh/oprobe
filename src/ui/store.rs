@@ -1079,12 +1079,12 @@ impl Store {
         };
         // The CLI's own defaults for everything the page does not show (trial warmup,
         // cooldown, max concurrency): `config::defaults().tune` through `TuneSettings`.
-        let settings = crate::cli::TuneSettings {
+        let settings = crate::app::TuneSettings {
             trial_duration: &trial,
             max_trials: max,
-            ..crate::cli::TuneSettings::default()
+            ..crate::app::TuneSettings::default()
         };
-        let opts = match crate::cli::tune_options(objective, &settings, None) {
+        let opts = match crate::app::tune_options(objective, &settings, None) {
             Ok(o) => o,
             Err(e) => {
                 self.toast(format!("{e:#}"), Tone::Crit);
@@ -1620,10 +1620,10 @@ impl Store {
 /// resolve it as a run would (credentials included), then list at most one entry under its
 /// root. Nothing is written. Runs on an engine thread (blocking).
 pub fn test_connection(name: &str, cfg: &ConfigFile) -> Result<String, String> {
-    use crate::cli::args::{CostArgs, KnobArgs, TargetArgs, WorkloadArgs};
+    use crate::app::input::{CostInput, KnobInput, TargetInput, WorkloadInput};
     use futures::TryStreamExt;
     let l = crate::ui::launch();
-    let ta = TargetArgs {
+    let ta = TargetInput {
         target: Some(name.to_owned()),
         ca_cert: l.ca_cert,
         insecure: l.insecure,
@@ -1631,12 +1631,12 @@ pub fn test_connection(name: &str, cfg: &ConfigFile) -> Result<String, String> {
         ..Default::default()
     };
     let err = |e: anyhow::Error| format!("{e:#}");
-    let (ta, _) = crate::cli::resolve_target(&ta, cfg).map_err(err)?;
-    let p = crate::cli::build_profile(
+    let (ta, _) = crate::app::profile::resolve_target(&ta, cfg).map_err(err)?;
+    let p = crate::app::profile::build_profile(
         &ta,
-        &WorkloadArgs::default(),
-        &KnobArgs::default(),
-        &CostArgs::default(),
+        &WorkloadInput::default(),
+        &KnobInput::default(),
+        &CostInput::default(),
     )
     .map_err(err)?;
     let mut target = p.target.clone();

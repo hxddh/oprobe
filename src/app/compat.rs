@@ -6,9 +6,9 @@ use anyhow::Result;
 use schemars::JsonSchema;
 use serde::Serialize;
 
-use super::{CompatReport, CompatStatus, checksum_check, run_suite};
-use crate::cli::Ctx;
-use crate::cli::args::{CompatArgs, CostArgs, KnobArgs, WorkloadArgs};
+use crate::app::Ctx;
+use crate::app::input::{CompatRequest, CostInput, KnobInput, WorkloadInput};
+use crate::compat::{CompatReport, CompatStatus, checksum_check, run_suite};
 use crate::config::Knobs;
 use crate::engine::operator;
 use crate::errors::{ErrorCode, OprobeError};
@@ -27,7 +27,7 @@ pub struct CompatOutput {
 
 impl CommandOutput for CompatOutput {
     fn next(&self) -> Vec<crate::output::NextStep> {
-        vec![crate::cli::next::list_targets()]
+        vec![crate::app::next::list_targets()]
     }
 
     fn text(&self) -> String {
@@ -108,7 +108,7 @@ pub struct CompatPlan {
 
 impl CommandOutput for CompatPlan {
     fn next(&self) -> Vec<crate::output::NextStep> {
-        vec![crate::cli::next::list_targets()]
+        vec![crate::app::next::list_targets()]
     }
 
     fn text(&self) -> String {
@@ -127,8 +127,16 @@ impl CommandOutput for CompatPlan {
     }
 }
 
-pub async fn run(a: CompatArgs, ctx: &Ctx) -> Result<u8> {
-    if a.safety.read_only {
+/// What [`run`] produced.
+#[derive(Clone, Debug)]
+pub enum CompatOutcome {
+    Plan(Box<CompatPlan>),
+    Checked(Box<CompatOutput>),
+}
+
+/// `oprobe compat`: the conformance suite under the run prefix.
+pub async fn run(ctx: &Ctx, a: CompatRequest) -> Result<CompatOutcome> {
+    if a.safety.refuses_writes() {
         return Err(OprobeError::new(
             ErrorCode::SafetyReadOnly,
             "compat writes, overwrites and deletes test objects (under its own prefix): refused with --read-only",
@@ -136,14 +144,14 @@ pub async fn run(a: CompatArgs, ctx: &Ctx) -> Result<u8> {
         .with_hint("use `oprobe doctor --read-only TARGET` for read-only checks")
         .into());
     }
-    let (profile, _) = crate::cli::resolve_profile(
+    let (profile, _) = crate::app::profile::resolve_profile(
         ctx,
         &a.target,
-        &WorkloadArgs::default(),
-        &KnobArgs::default(),
-        &CostArgs::default(),
+        &WorkloadInput::default(),
+        &KnobInput::default(),
+        &CostInput::default(),
     )?;
-    let budgets = crate::cli::safety_budgets(ctx, &a.safety)?;
+    let budgets = crate::app::profile::safety_budgets(ctx, &a.safety)?;
     // Writes stay under the standard run prefix, so `oprobe cleanup` and
     // `--idempotency-key` apply as for every other command.
     let run_prefix = match &a.safety.idempotency_key {
@@ -153,14 +161,14 @@ pub async fn run(a: CompatArgs, ctx: &Ctx) -> Result<u8> {
     if a.safety.dry_run {
         let min_part = 5u64 * 1024 * 1024;
         let price = crate::guard::usd_per_request(&profile);
-        return ctx.out.finish(&CompatPlan {
+        return Ok(CompatOutcome::Plan(Box::new(CompatPlan {
             target: profile.target.display(),
             run_prefix,
             estimated_requests_count: SUITE_MAX_REQUESTS,
             estimated_bytes: 4 * min_part + 1024 * 1024,
             estimated_cost_usd: price.map(|p| p * SUITE_MAX_REQUESTS as f64),
             budgets,
-        });
+        })));
     }
     let mut target = profile.target.normalized()?;
     operator::prepare_target(&mut target, &Knobs::default()).await?;
@@ -205,10 +213,10 @@ pub async fn run(a: CompatArgs, ctx: &Ctx) -> Result<u8> {
     let mut report = report
         .ok_or_else(|| OprobeError::new(ErrorCode::RunInterrupted, "compat was interrupted"))?;
     report.cleaned_up = cleaned_up;
-    ctx.out.finish(&CompatOutput {
+    Ok(CompatOutcome::Checked(Box::new(CompatOutput {
         report,
         min_score_pct: a.min_score,
-    })
+    })))
 }
 
 #[cfg(test)]
@@ -225,12 +233,12 @@ mod tests {
                 data_dir: dir.path().join("data"),
             },
         );
-        let args = |max_requests: Option<u64>, dry_run: bool| CompatArgs {
-            target: crate::cli::args::TargetArgs {
+        let args = |max_requests: Option<u64>, dry_run: bool| CompatRequest {
+            target: crate::app::input::TargetInput {
                 target: Some("memory://".into()),
                 ..Default::default()
             },
-            safety: crate::cli::args::SafetyArgs {
+            safety: crate::app::input::Safety {
                 dry_run,
                 max_requests,
                 idempotency_key: Some("compat-test".into()),
@@ -238,9 +246,15 @@ mod tests {
             },
             min_score: None,
         };
-        assert_eq!(run(args(None, true), &ctx).await.unwrap(), 0);
-        assert_eq!(run(args(None, false), &ctx).await.unwrap(), 0);
-        let e = run(args(Some(3), false), &ctx).await.unwrap_err();
+        assert!(matches!(
+            run(&ctx, args(None, true)).await.unwrap(),
+            CompatOutcome::Plan(_)
+        ));
+        match run(&ctx, args(None, false)).await.unwrap() {
+            CompatOutcome::Checked(o) => assert_eq!(o.exit_code(), 0),
+            CompatOutcome::Plan(_) => panic!("not a dry run"),
+        }
+        let e = run(&ctx, args(Some(3), false)).await.unwrap_err();
         assert_eq!(
             crate::errors::classify(&e, "memory").code,
             ErrorCode::SafetyBudgetExceeded

@@ -6,11 +6,10 @@ use schemars::JsonSchema;
 use serde::Serialize;
 
 use super::Ctx;
-use super::args::{CapabilitiesArgs, ExplainArgs, McpArgs, SchemaArgs};
+use super::args::{CapabilitiesArgs, McpArgs, SchemaArgs};
 use crate::errors::{ErrorCode, OprobeError, exit};
 use crate::guard::Budgets;
-use crate::mcp::explain::{ExplainOutput, explain_subject};
-use crate::mcp::{McpConfig, catalog, schemas};
+use crate::mcp::{McpConfig, schemas};
 use crate::output::{CommandOutput, OutputFormat};
 use crate::util::{ByteSize, parse_duration};
 
@@ -56,17 +55,6 @@ pub fn cmd_schema(a: SchemaArgs, ctx: &Ctx) -> Result<u8> {
 pub fn cmd_capabilities(_a: CapabilitiesArgs, ctx: &Ctx) -> Result<u8> {
     ctx.out
         .finish(&crate::mcp::capabilities::Capabilities::current())
-}
-
-pub fn cmd_explain(a: ExplainArgs, ctx: &Ctx) -> Result<u8> {
-    if a.list {
-        return ctx.out.finish(&ExplainOutput::FindingCodes {
-            codes: catalog::all(),
-        });
-    }
-    let subject = a.subject.as_deref().unwrap_or_default();
-    let out = explain_subject(&ctx.store(), subject, a.top)?;
-    ctx.out.finish(&out)
 }
 
 fn server_budgets(a: &McpArgs) -> Result<Budgets> {

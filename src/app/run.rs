@@ -7,8 +7,8 @@ use anyhow::Result;
 use schemars::JsonSchema;
 use serde::Serialize;
 
-use super::args::*;
-use super::{Ctx, install_ctrl_c, live};
+use super::input::*;
+use super::{Ctx, live};
 use crate::config::Profile;
 use crate::engine::measure::{Mode, Rails};
 use crate::engine::{Cancel, Progress, ProgressFn};
@@ -37,7 +37,7 @@ pub struct RunOutput {
 
 impl CommandOutput for RunOutput {
     fn next(&self) -> Vec<crate::output::NextStep> {
-        crate::cli::next::after_run(&self.report)
+        crate::app::next::after_run(&self.report)
     }
 
     fn formats() -> &'static [crate::output::OutputFormat] {
@@ -141,7 +141,7 @@ impl CommandOutput for PlanOutput {
 }
 
 /// Parse the safety flags into budgets; unset ones come from `[defaults.budgets]`.
-pub(super) fn budgets(ctx: &Ctx, s: &SafetyArgs) -> Result<Budgets> {
+pub fn budgets(ctx: &Ctx, s: &Safety) -> Result<Budgets> {
     let bad = |flag: &str, e: anyhow::Error| -> anyhow::Error {
         OprobeError::new(
             ErrorCode::UsageInvalidArgument,
@@ -179,7 +179,10 @@ pub(super) fn budgets(ctx: &Ctx, s: &SafetyArgs) -> Result<Budgets> {
 }
 
 /// The safety rails of one measurement (a new run id each call).
-pub(super) fn rails(ctx: &Ctx, profile: &Profile, s: &SafetyArgs) -> Result<Rails> {
+pub fn rails(ctx: &Ctx, profile: &Profile, s: &Safety) -> Result<Rails> {
+    if !s.allow_write {
+        crate::guard::refuse_server_writes(profile)?;
+    }
     Rails::new(
         profile,
         s.read_only,
@@ -190,7 +193,7 @@ pub(super) fn rails(ctx: &Ctx, profile: &Profile, s: &SafetyArgs) -> Result<Rail
 
 /// The command's live guard (one per command: every measurement of `run --repeat` or `matrix`
 /// shares it, so its budgets cover the whole command).
-pub(super) fn guard_for(ctx: &Ctx, profile: &Profile, b: &Budgets) -> Option<Arc<Guard>> {
+pub fn guard_for(ctx: &Ctx, profile: &Profile, b: &Budgets) -> Option<Arc<Guard>> {
     let g = crate::engine::measure::guard_for(b, profile)?;
     if b.max_cost_usd.is_some() && crate::guard::usd_per_request(profile).is_none() {
         ctx.out.warn(
@@ -202,7 +205,7 @@ pub(super) fn guard_for(ctx: &Ctx, profile: &Profile, b: &Budgets) -> Option<Arc
 
 /// Progress for this output mode: a live line on a terminal, events in ndjson mode,
 /// messages on stderr otherwise.
-pub(super) fn progress_for(ctx: &Ctx, total_s: f64) -> (ProgressFn, Option<Arc<live::LiveLine>>) {
+pub fn progress_for(ctx: &Ctx, total_s: f64) -> (ProgressFn, Option<Arc<live::LiveLine>>) {
     if ctx.out.format == OutputFormat::Ndjson {
         return (ctx.out.bus().progress_fn(Some(total_s)), None);
     }
@@ -225,7 +228,7 @@ pub(super) fn progress_for(ctx: &Ctx, total_s: f64) -> (ProgressFn, Option<Arc<l
 }
 
 /// Progress of the tuner: messages on stderr, or events in ndjson mode.
-pub(super) fn tune_progress(ctx: &Ctx) -> ProgressFn {
+pub fn tune_progress(ctx: &Ctx) -> ProgressFn {
     if ctx.out.format == OutputFormat::Ndjson {
         return ctx.out.bus().progress_fn(None);
     }
@@ -240,7 +243,7 @@ pub(super) fn tune_progress(ctx: &Ctx) -> ProgressFn {
 }
 
 /// `--json` / `--markdown` report files.
-pub(super) fn save_outputs(r: &Report, o: &OutputArgs) -> Result<()> {
+pub fn save_outputs(r: &Report, o: &OutputOptions) -> Result<()> {
     if let Some(p) = &o.json {
         write_file(p, &serde_json::to_string_pretty(r)?)?;
     }
@@ -252,7 +255,7 @@ pub(super) fn save_outputs(r: &Report, o: &OutputArgs) -> Result<()> {
 
 /// `--fail-on`: exit 3 when the diagnosis has findings of this severity or worse. Returns
 /// whether the gate changed the exit code.
-pub(super) fn fail_on_gate(r: &mut Report, level: FailOn) -> bool {
+pub fn fail_on_gate(r: &mut Report, level: FailOn) -> bool {
     use crate::analysis::diagnosis::Severity;
     let min = match level {
         FailOn::Warning => Severity::Warning,
@@ -265,34 +268,8 @@ pub(super) fn fail_on_gate(r: &mut Report, level: FailOn) -> bool {
     false
 }
 
-pub async fn cmd_run(mut a: RunArgs, ctx: &Ctx) -> Result<u8> {
-    // `oprobe run` without a target in an interactive terminal: guided first run.
-    if a.target.target.is_none()
-        && a.target.profile.is_none()
-        && a.from.is_none()
-        && ctx.config()?.defaults.target.is_none()
-        && super::onboard::should_offer(ctx)
-    {
-        match super::onboard::choose(ctx)? {
-            super::onboard::Choice::Demo => {
-                return super::demo::cmd_demo(DemoArgs::default(), ctx).await;
-            }
-            super::onboard::Choice::Target(name) => a.target.target = Some(name),
-            super::onboard::Choice::Saved => return Ok(exit::OK),
-        }
-    }
-    if a.repeat > 1 || a.baseline.is_some() {
-        return super::repeat::cmd_run_repeat(a, ctx).await;
-    }
-    let (profile, target_name) = super::run_profile(ctx, &a)?;
-    match measure(ctx, profile, target_name, &a.safety, &a.output).await? {
-        Measured::Plan(plan) => ctx.out.finish(plan.as_ref()),
-        Measured::Run(out) => ctx.out.finish(out.as_ref()),
-    }
-}
-
 /// What [`measure`] produced.
-pub(super) enum Measured {
+pub enum Measured {
     /// `--dry-run`: the plan; nothing was sent.
     Plan(Box<PlanOutput>),
     Run(Box<RunOutput>),
@@ -300,31 +277,33 @@ pub(super) enum Measured {
 
 /// Measure a resolved profile under the safety rails, build the report and save the run
 /// (shared by `oprobe run` and `oprobe demo`).
-pub(super) async fn measure(
+pub async fn measure(
     ctx: &Ctx,
     profile: Profile,
     target_name: Option<String>,
-    safety: &SafetyArgs,
-    output: &OutputArgs,
+    safety: &Safety,
+    output: &OutputOptions,
+    cancel: Cancel,
 ) -> Result<Measured> {
     let guard = if safety.dry_run {
         None
     } else {
         guard_for(ctx, &profile, &budgets(ctx, safety)?)
     };
-    measure_guarded(ctx, profile, target_name, safety, output, guard).await
+    measure_guarded(ctx, profile, target_name, safety, output, guard, &cancel).await
 }
 
 /// [`measure`] under the command's guard: every measurement of a command that measures
 /// several times (`verify`, `fix`, `baseline calibrate`) passes the same guard, so the budgets
 /// cover the whole command; once it has tripped, the next measurement refuses at once.
-pub(super) async fn measure_guarded(
+pub async fn measure_guarded(
     ctx: &Ctx,
     profile: Profile,
     target_name: Option<String>,
-    safety: &SafetyArgs,
-    output: &OutputArgs,
+    safety: &Safety,
+    output: &OutputOptions,
     guard: Option<Arc<Guard>>,
+    cancel: &Cancel,
 ) -> Result<Measured> {
     let rails = rails(ctx, &profile, safety)?;
     if safety.dry_run {
@@ -334,8 +313,6 @@ pub(super) async fn measure_guarded(
     for w in crate::guard::workload_warnings(&profile) {
         ctx.out.warn(w);
     }
-    let cancel = Cancel::new();
-    install_ctrl_c(cancel.clone());
     if ctx.out.format == OutputFormat::Text {
         ctx.out.info(format!(
             "{} {} {}",
@@ -357,7 +334,7 @@ pub(super) async fn measure_guarded(
             rails,
             guard,
             output,
-            cancel: &cancel,
+            cancel,
             mode: Mode::Run,
         },
     )

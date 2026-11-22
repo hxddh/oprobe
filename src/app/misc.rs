@@ -5,7 +5,7 @@ use schemars::JsonSchema;
 use serde::Serialize;
 
 use super::Ctx;
-use super::args::*;
+use super::input::*;
 use crate::config::TargetSpec;
 use crate::engine::cleanup::SweepEntry;
 use crate::errors::{ErrorCode, OprobeError};
@@ -18,8 +18,8 @@ use crate::util::parse_duration;
 impl CommandOutput for ProbeReport {
     fn next(&self) -> Vec<crate::output::NextStep> {
         vec![
-            crate::cli::next::discover(),
-            crate::cli::next::list_targets(),
+            crate::app::next::discover(),
+            crate::app::next::list_targets(),
         ]
     }
 
@@ -28,7 +28,7 @@ impl CommandOutput for ProbeReport {
     }
 }
 
-pub async fn cmd_probe(a: ProbeArgs, ctx: &Ctx) -> Result<u8> {
+pub async fn probe(_ctx: &Ctx, a: ProbeRequest) -> Result<crate::net::probe::ProbeReport> {
     use crate::net::probe::{ProbeOptions, probe_endpoint};
     let endpoint = if a.endpoint.starts_with("http://") || a.endpoint.starts_with("https://") {
         a.endpoint.clone()
@@ -56,7 +56,7 @@ pub async fn cmd_probe(a: ProbeArgs, ctx: &Ctx) -> Result<u8> {
     let opts = ProbeOptions {
         samples: a.samples,
         timeout: parse_duration(&a.timeout)?,
-        http: a.http.into(),
+        http: a.http,
         tls,
         proxy: match a.proxy.as_deref() {
             None => None,
@@ -74,7 +74,7 @@ pub async fn cmd_probe(a: ProbeArgs, ctx: &Ctx) -> Result<u8> {
     if let Some(p) = &a.json {
         write_file(p, &serde_json::to_string_pretty(&r)?)?;
     }
-    ctx.out.finish(&r)
+    Ok(r)
 }
 
 /// What `oprobe lab` serves (printed once it listens).
@@ -107,7 +107,8 @@ impl CommandOutput for LabOutput {
     }
 }
 
-pub async fn cmd_lab(a: LabArgs, ctx: &Ctx) -> Result<u8> {
+/// `oprobe lab`: start the server (it serves until the returned handle is dropped).
+pub async fn lab(_ctx: &Ctx, a: LabRequest) -> Result<(crate::lab::LabHandle, LabOutput)> {
     use crate::lab::{LabConfig, LabServer, lab_ca_pem};
     if let Some(p) = &a.write_ca {
         write_file(p, lab_ca_pem())?;
@@ -147,21 +148,15 @@ pub async fn cmd_lab(a: LabArgs, ctx: &Ctx) -> Result<u8> {
     } else {
         String::new()
     };
-    ctx.out.finish(&LabOutput {
+    let out = LabOutput {
         endpoint: lab.endpoint_url.clone(),
         tls: a.tls,
         try_command: format!(
             "AWS_ACCESS_KEY_ID=lab AWS_SECRET_ACCESS_KEY=lab oprobe run s3://bench/demo --endpoint {} --proxy none{tls_flag}",
             lab.endpoint_url
         ),
-    })?;
-    tokio::signal::ctrl_c().await?;
-    ctx.out.info(format!(
-        "{} served {} requests",
-        dim("lab stopped:"),
-        lab.requests_served()
-    ));
-    Ok(0)
+    };
+    Ok((lab, out))
 }
 
 /// Result of `oprobe cleanup`.
@@ -238,13 +233,13 @@ impl CommandOutput for CleanupOutput {
     }
 }
 
-pub async fn cmd_cleanup(a: CleanupArgs, ctx: &Ctx) -> Result<u8> {
-    let (p, _) = super::resolve_profile(
+pub async fn cleanup(ctx: &Ctx, a: CleanupRequest) -> Result<CleanupOutput> {
+    let (p, _) = super::profile::resolve_profile(
         ctx,
         &a.target,
-        &WorkloadArgs::default(),
-        &KnobArgs::default(),
-        &CostArgs::default(),
+        &WorkloadInput::default(),
+        &KnobInput::default(),
+        &CostInput::default(),
     )?;
     let target = p.target.normalized()?;
     let base = crate::engine::operator::base_operator(&target)?;
@@ -257,7 +252,7 @@ pub async fn cmd_cleanup(a: CleanupArgs, ctx: &Ctx) -> Result<u8> {
             .info(dim("--read-only: listing only, nothing is deleted"));
     }
     let entries = crate::engine::cleanup::sweep(&admin, older, a.datasets, dry_run).await?;
-    ctx.out.finish(&CleanupOutput {
+    Ok(CleanupOutput {
         target: target.display(),
         dry_run,
         older_than: a.older_than,

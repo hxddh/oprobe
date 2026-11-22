@@ -7,7 +7,6 @@ use schemars::JsonSchema;
 use serde::Serialize;
 
 use super::Ctx;
-use super::args::*;
 use super::compare::{RunSetStats, baseline_runs};
 use super::measure::{Opts, measure};
 use crate::analysis::compare::{Comparison, compare};
@@ -45,10 +44,10 @@ impl CommandOutput for RepeatOutput {
         if let (Some(a), Some(b)) = (self.runs.first(), self.runs.last())
             && a.id != b.id
         {
-            v.push(crate::cli::next::compare(&a.id, &b.id));
+            v.push(crate::app::next::compare(&a.id, &b.id));
         }
         if let Some(r) = self.runs.last() {
-            v.push(crate::cli::next::explain(&r.id));
+            v.push(crate::app::next::explain(&r.id));
         }
         v
     }
@@ -137,8 +136,17 @@ impl CommandOutput for RepeatOutput {
     }
 }
 
-pub async fn cmd_run_repeat(a: RunArgs, ctx: &Ctx) -> Result<u8> {
-    let (mut profile, target_name) = super::run_profile(ctx, &a)?;
+/// `run --repeat N` / `run --baseline NAME` of a resolved profile.
+pub async fn run_repeat(
+    ctx: &Ctx,
+    resolved: super::Resolved,
+    a: &super::RunRequest,
+    cancel: Cancel,
+) -> Result<super::RunOutcome> {
+    let super::Resolved {
+        mut profile,
+        target_name,
+    } = resolved;
     let first = super::run::rails(ctx, &profile, &a.safety)?;
     if a.safety.dry_run {
         let mut plan = first.plan(&profile);
@@ -148,7 +156,9 @@ pub async fn cmd_run_repeat(a: RunArgs, ctx: &Ctx) -> Result<u8> {
                 a.repeat
             ));
         }
-        return ctx.out.finish(&super::run::PlanOutput { plan });
+        return Ok(super::RunOutcome::Plan(Box::new(super::run::PlanOutput {
+            plan,
+        })));
     }
     // One guard for the whole command: the budgets cap all repeated runs together.
     let guard = super::run::guard_for(ctx, &profile, &first.budgets);
@@ -164,8 +174,6 @@ pub async fn cmd_run_repeat(a: RunArgs, ctx: &Ctx) -> Result<u8> {
     if !group.is_empty() {
         profile.name = Some(group.clone());
     }
-    let cancel = Cancel::new();
-    super::install_ctrl_c(cancel.clone());
     let mut runs = Vec::new();
     let mut paths = Vec::new();
     for i in 0..a.repeat {
@@ -251,7 +259,7 @@ pub async fn cmd_run_repeat(a: RunArgs, ctx: &Ctx) -> Result<u8> {
             added = false;
         }
     }
-    ctx.out.finish(&RepeatOutput {
+    Ok(super::RunOutcome::Repeat(Box::new(RepeatOutput {
         group,
         stats: RunSetStats::of(&summaries),
         runs: summaries,
@@ -260,5 +268,5 @@ pub async fn cmd_run_repeat(a: RunArgs, ctx: &Ctx) -> Result<u8> {
         comparison,
         added_to_baseline: added,
         exit_code,
-    })
+    })))
 }

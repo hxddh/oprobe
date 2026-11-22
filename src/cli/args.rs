@@ -299,7 +299,7 @@ pub struct TargetSampleArgs {
     #[arg(long, value_name = "PREFIX")]
     pub prefix: Option<String>,
     /// List at most N objects
-    #[arg(long, value_name = "N", default_value_t = crate::cli::sample::DEFAULT_LIMIT, value_parser = at_least::<1>)]
+    #[arg(long, value_name = "N", default_value_t = crate::app::sample::DEFAULT_LIMIT, value_parser = at_least::<1>)]
     pub limit: usize,
 }
 

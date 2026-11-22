@@ -8,7 +8,7 @@ use schemars::JsonSchema;
 use serde::Serialize;
 
 use super::Ctx;
-use super::args::{DemoArgs, OutputArgs, SafetyArgs};
+use super::input::{DemoRequest, OutputOptions, Safety};
 use super::run::{Measured, RunOutput, measure};
 use crate::config::{Profile, TargetSpec};
 use crate::errors::{ErrorCode, OprobeError};
@@ -246,7 +246,8 @@ pub fn demo_profile(duration: std::time::Duration) -> Result<Profile> {
     Ok(profile)
 }
 
-pub async fn cmd_demo(a: DemoArgs, ctx: &Ctx) -> Result<u8> {
+/// `oprobe demo`: run `lab://demo` and narrate the result.
+pub async fn demo(ctx: &Ctx, a: DemoRequest, cancel: crate::engine::Cancel) -> Result<DemoOutput> {
     let duration = parse_duration(&a.duration).map_err(|e| {
         OprobeError::new(
             ErrorCode::UsageInvalidArgument,
@@ -260,16 +261,16 @@ pub async fn cmd_demo(a: DemoArgs, ctx: &Ctx) -> Result<u8> {
         crate::config::defaults().demo_target
     ));
     let profile = demo_profile(duration)?;
-    let output = OutputArgs {
+    let output = OutputOptions {
         label: Some("demo".into()),
         ..Default::default()
     };
-    let out = match measure(ctx, profile, None, &SafetyArgs::default(), &output).await? {
+    let out = match measure(ctx, profile, None, &Safety::default(), &output, cancel).await? {
         Measured::Run(r) => r,
-        Measured::Plan(p) => return ctx.out.finish(p.as_ref()),
+        Measured::Plan(_) => unreachable!("the demo is never a dry run"),
     };
     let (steps, next_steps) = narrate(&out.report, &out.run_id);
-    ctx.out.finish(&DemoOutput {
+    Ok(DemoOutput {
         run_id: out.run_id.clone(),
         path: out.path.clone(),
         steps,

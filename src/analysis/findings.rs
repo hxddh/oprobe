@@ -2275,19 +2275,6 @@ pub(crate) mod tests {
         assert!(skew.cause.contains("10.0.0.9"));
     }
 
-    /// Parse `cmd` (as printed) with the CLI parser; the `run` arguments.
-    fn parse_run(cmd: &str) -> crate::cli::args::RunArgs {
-        use clap::Parser;
-        let words: Vec<&str> = cmd.split_whitespace().collect();
-        assert_eq!(words[0], "oprobe");
-        let cli =
-            crate::cli::args::Cli::try_parse_from(&words).unwrap_or_else(|e| panic!("{cmd}: {e}"));
-        match cli.command {
-            Some(crate::cli::args::Command::Run(a)) => a,
-            other => panic!("not a run: {other:?}"),
-        }
-    }
-
     #[test]
     fn verification_commands_reproduce_the_run_except_the_change() {
         let mut run = straggler_run();
@@ -2323,24 +2310,12 @@ pub(crate) mod tests {
                 v.rerun
             );
             assert!(!v.overrides.is_empty(), "{v:?}");
-            // The self-contained replay builds the run's profile with only the change applied.
-            let a = parse_run(&v.replay);
-            assert_eq!(
-                a.target.target.as_deref(),
-                Some("s3://bkt/x"),
-                "{}",
-                v.replay
-            );
-            let mut got =
-                crate::cli::build_profile(&a.target, &a.workload, &a.knobs, &a.cost).unwrap();
-            let mut label = None;
-            crate::model::Overrides::parse(&a.set)
-                .unwrap()
-                .apply(&mut got, &mut label)
-                .unwrap();
-            let want = run.report.spec.with(&v.overrides).resolved_profile();
-            assert_eq!(got.workload, want.workload, "{}", v.replay);
-            assert_eq!(got.knobs, want.knobs, "{}", v.replay);
+            // The self-contained replay is the run's spec with only the change applied (the
+            // CLI parses `RunSpec::command` back to the same profile: `oprobe`'s cli tests).
+            let changed = run.report.spec.with(&v.overrides);
+            assert_eq!(v.replay, changed.command());
+            assert_eq!(changed.target_ref, "s3://bkt/x", "{}", v.replay);
+            let got = changed.resolved_profile();
             assert_eq!(got.target.options["endpoint"], "https://minio.local:9000");
             assert_eq!(got.workload.seed, 9);
             assert_eq!(got.workload.warmup.get().as_millis(), 500);

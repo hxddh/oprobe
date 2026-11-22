@@ -136,7 +136,7 @@ async fn microscope_transport_reports_api_names_tls_and_tcp() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn doctor_reports_tls_chain_permissions_and_capabilities() {
-    use oprobe::cli::doctor::{Access, doctor};
+    use oprobe::app::doctor::{Access, doctor};
     let lab = LabServer::spawn("127.0.0.1:0", LabConfig::clean_https_h2())
         .await
         .unwrap();

@@ -326,12 +326,6 @@ impl CommandOutput for Discovery {
     }
 }
 
-/// `oprobe target discover`.
-pub fn cmd_discover(ctx: &Ctx) -> Result<u8> {
-    let d = discover(ctx)?;
-    ctx.out.finish(&d)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

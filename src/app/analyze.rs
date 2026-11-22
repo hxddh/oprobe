@@ -6,7 +6,7 @@ use schemars::JsonSchema;
 use serde::Serialize;
 
 use super::Ctx;
-use super::args::AnalyzeArgs;
+use super::input::AnalyzeRequest;
 use crate::analysis::outliers::{Attribution, Selection, attribute};
 use crate::analysis::segments::{Segments, segments};
 use crate::analysis::slice::{By, Filter, GroupRow, StageRow, group, stage_table};
@@ -47,7 +47,7 @@ pub struct AnalyzeOutput {
 impl CommandOutput for AnalyzeOutput {
     fn next(&self) -> Vec<crate::output::NextStep> {
         vec![
-            crate::cli::next::explain(&self.run_id),
+            crate::app::next::explain(&self.run_id),
             crate::output::NextStep::new(
                 "requests by status (failures)",
                 format!(
@@ -56,7 +56,7 @@ impl CommandOutput for AnalyzeOutput {
                 ),
             )
             .with_mcp("analyze_run", serde_json::json!({ "run": self.run_id })),
-            crate::cli::next::show(&self.run_id),
+            crate::app::next::show(&self.run_id),
         ]
     }
 
@@ -184,7 +184,7 @@ impl CommandOutput for AnalyzeOutput {
     }
 }
 
-pub fn cmd_analyze(a: AnalyzeArgs, ctx: &Ctx) -> Result<u8> {
+pub fn analyze(ctx: &Ctx, a: AnalyzeRequest) -> Result<AnalyzeOutput> {
     let bad = |m: String| -> anyhow::Error {
         OprobeError::new(ErrorCode::UsageInvalidArgument, m).into()
     };
@@ -253,7 +253,7 @@ pub fn cmd_analyze(a: AnalyzeArgs, ctx: &Ctx) -> Result<u8> {
             .cloned()
             .collect()
     };
-    ctx.out.finish(&AnalyzeOutput {
+    Ok(AnalyzeOutput {
         run_id: run.id().to_owned(),
         requests_count: filtered.len() as u64,
         total_requests_count: run.reqs.len() as u64,

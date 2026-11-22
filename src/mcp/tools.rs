@@ -19,8 +19,8 @@ use super::explain::{self, ExplainRun};
 use super::jobs::{Job, JobKind, JobProgress, JobSpec, JobStatus, Jobs};
 use super::schemas::{Direction, schema_of};
 use crate::analysis::outliers::{self, Attribution, Selection};
-use crate::cli::Ctx;
-use crate::cli::args::{CostArgs, HttpArg, KnobArgs, TargetArgs, WorkloadArgs};
+use crate::app::Ctx;
+use crate::app::input::{CostInput, KnobInput, TargetInput, WorkloadInput};
 use crate::config::Profile;
 use crate::errors::{ErrorBody, ErrorCode, OprobeError};
 use crate::events::EventKind;
@@ -523,7 +523,7 @@ pub const SPECS: &[ToolSpec] = &[
         read_only: true,
         open_world: false,
         input: input::<EmptyIn>,
-        output: output::<crate::output::Envelope<crate::cli::discover::Discovery>>,
+        output: output::<crate::output::Envelope<crate::app::discover::Discovery>>,
     },
     ToolSpec {
         name: "doctor",
@@ -533,7 +533,7 @@ pub const SPECS: &[ToolSpec] = &[
         read_only: true,
         open_world: true,
         input: input::<DoctorIn>,
-        output: output::<crate::output::Envelope<crate::cli::doctor::DoctorOutput>>,
+        output: output::<crate::output::Envelope<crate::app::doctor::DoctorOutput>>,
     },
     ToolSpec {
         name: "sample_objects",
@@ -543,7 +543,7 @@ pub const SPECS: &[ToolSpec] = &[
         read_only: true,
         open_world: true,
         input: input::<SampleIn>,
-        output: output::<crate::output::Envelope<crate::cli::sample::ObjectSample>>,
+        output: output::<crate::output::Envelope<crate::app::sample::ObjectSample>>,
     },
     ToolSpec {
         name: "probe_endpoint",
@@ -683,7 +683,7 @@ pub const SPECS: &[ToolSpec] = &[
         read_only: false,
         open_world: true,
         input: input::<CleanupIn>,
-        output: output::<crate::output::Envelope<crate::cli::misc::CleanupOutput>>,
+        output: output::<crate::output::Envelope<crate::app::misc::CleanupOutput>>,
     },
     ToolSpec {
         name: "list_targets",
@@ -742,6 +742,11 @@ impl State {
 
     fn ctx(&self) -> Ctx {
         Ctx::new(Output::silent(), self.cfg.paths.clone())
+    }
+
+    /// The service layer, with the config file read afresh (edits apply to the next call).
+    fn app(&self) -> crate::app::App {
+        crate::app::App::new(self.cfg.paths.clone())
     }
 
     fn store(&self) -> crate::store::RunStore {
@@ -874,19 +879,15 @@ fn err(e: anyhow::Error) -> ErrorBody {
 
 // --- helpers --------------------------------------------------------------------------
 
-fn http_arg(v: Option<&str>) -> anyhow::Result<Option<HttpArg>> {
+fn http_arg(v: Option<&str>) -> anyhow::Result<Option<crate::net::HttpVersion>> {
     Ok(match v {
         None => None,
-        Some(s) => Some(match crate::input::http_version(s)? {
-            crate::net::HttpVersion::Auto => HttpArg::Auto,
-            crate::net::HttpVersion::H1 => HttpArg::H1,
-            crate::net::HttpVersion::H2 => HttpArg::H2,
-        }),
+        Some(s) => Some(crate::input::http_version(s)?),
     })
 }
 
-fn target_args(t: &TargetIn) -> TargetArgs {
-    TargetArgs {
+fn target_args(t: &TargetIn) -> TargetInput {
+    TargetInput {
         target: Some(t.target.clone()),
         profile: None,
         endpoint: t.endpoint.clone(),
@@ -899,38 +900,9 @@ fn target_args(t: &TargetIn) -> TargetArgs {
     }
 }
 
-/// The CLI arguments selecting `t` (for child commands).
-/// [`target_cli`] without the positional target: the override flags alone.
-fn target_flags_cli(t: &TargetIn) -> Vec<String> {
-    target_cli(t).into_iter().skip(1).collect()
-}
-
-fn target_cli(t: &TargetIn) -> Vec<String> {
-    let mut v = vec![t.target.clone()];
-    if let Some(e) = &t.endpoint {
-        v.extend(["--endpoint".into(), e.clone()]);
-    }
-    if let Some(r) = &t.region {
-        v.extend(["--region".into(), r.clone()]);
-    }
-    for (k, val) in &t.options {
-        v.extend(["--option".into(), format!("{k}={val}")]);
-    }
-    if t.anonymous {
-        v.push("--anonymous".into());
-    }
-    if t.insecure {
-        v.push("--insecure".into());
-    }
-    if let Some(p) = &t.proxy {
-        v.extend(["--proxy".into(), p.clone()]);
-    }
-    v
-}
-
-/// The CLI's workload, knob and cost arguments of a tool's workload input.
-fn workload_args(w: &WorkloadIn) -> anyhow::Result<(WorkloadArgs, KnobArgs, CostArgs)> {
-    let wa = WorkloadArgs {
+/// The workload, knob and cost inputs of a tool's workload input.
+fn workload_args(w: &WorkloadIn) -> anyhow::Result<(WorkloadInput, KnobInput, CostInput)> {
+    let wa = WorkloadInput {
         preset: w.preset.clone(),
         duration: w.duration.clone(),
         warmup: w.warmup.clone(),
@@ -944,7 +916,7 @@ fn workload_args(w: &WorkloadIn) -> anyhow::Result<(WorkloadArgs, KnobArgs, Cost
         no_verify: false,
         keep_data: false,
     };
-    let ka = KnobArgs {
+    let ka = KnobInput {
         concurrency: w.concurrency,
         io_concurrency: w.io_concurrency,
         chunk_size: w.chunk_size.clone(),
@@ -952,7 +924,7 @@ fn workload_args(w: &WorkloadIn) -> anyhow::Result<(WorkloadArgs, KnobArgs, Cost
         retries: w.retries,
         ..Default::default()
     };
-    let ca = CostArgs {
+    let ca = CostInput {
         provider: w.provider.clone(),
         ..Default::default()
     };
@@ -976,7 +948,7 @@ fn profile_of(
     let (wa, ka, ca) = workload_args(w)?;
     let ctx = st.ctx();
     // The same parsers and codes as the CLI: no remapping here (design v4 §8).
-    crate::cli::resolve_profile(&ctx, &target_args(t), &wa, &ka, &ca)
+    crate::app::profile::resolve_profile(&ctx, &target_args(t), &wa, &ka, &ca)
 }
 
 /// The identity of a configured target (its URL, endpoint and options).
@@ -1114,12 +1086,12 @@ fn check_target(st: &State, t: &TargetIn, effective: &Profile) -> anyhow::Result
     };
     let ctx = st.ctx();
     let config = ctx.config()?;
-    let (ta, _) = crate::cli::resolve_target(&target_args(&bare), config)?;
-    let reference = crate::cli::build_profile(
+    let (ta, _) = crate::app::profile::resolve_target(&target_args(&bare), config)?;
+    let reference = crate::app::profile::build_profile(
         &ta,
-        &WorkloadArgs::default(),
-        &KnobArgs::default(),
-        &CostArgs::default(),
+        &WorkloadInput::default(),
+        &KnobInput::default(),
+        &CostInput::default(),
     )?;
     // Both sides normalised (`..`, `//`, `./`, case, default ports, trailing `/`): what the
     // run would really touch must lie inside an allowed location (SEC-1, MCP-1).
@@ -1303,7 +1275,7 @@ fn call_profile(st: &State, a: &PlanIn) -> anyhow::Result<(Profile, Option<Strin
     if a.target.target.trim().is_empty() {
         ta.target = None;
     }
-    let ra = crate::cli::args::RunArgs {
+    let ra = crate::app::ProfileRequest {
         target: ta,
         workload: wa,
         knobs: ka,
@@ -1315,7 +1287,8 @@ fn call_profile(st: &State, a: &PlanIn) -> anyhow::Result<(Profile, Option<Strin
     if a.from.is_none() && ra.target.target.is_none() {
         return profile_of(st, &a.target, &a.workload);
     }
-    crate::cli::run_profile(&st.ctx(), &ra)
+    let r = st.app().resolve(&ra)?;
+    Ok((r.profile, r.target_name))
 }
 
 /// The target a call names (as typed), or the stored run's target with `from`.
@@ -1363,53 +1336,57 @@ fn prepare(st: &State, a: &PlanIn) -> anyhow::Result<Prepared> {
     })
 }
 
-/// Run `oprobe ARGS -o json` (same config and data directory) and parse its result.
-async fn child_json(st: &State, args: Vec<String>, timeout: Duration) -> anyhow::Result<Value> {
-    let exe = std::env::current_exe()?;
-    let mut c = tokio::process::Command::new(exe);
-    if !st.cfg.allow_write {
-        // Defense in depth: the child refuses any measurement that would write to a target
-        // outside its own process, whatever arguments it was given.
-        c.env(crate::guard::READ_ONLY_SERVER_ENV, "1");
-    }
-    c.args(&args)
-        .args(["-o", "json", "--color", "never", "--non-interactive"])
-        .env("OPROBE_DATA_DIR", &st.cfg.paths.data_dir)
-        .env("OPROBE_CONFIG", &st.cfg.paths.config_file)
-        .env_remove("OPROBE_OUTPUT")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
-    let out = match tokio::time::timeout(timeout, c.output()).await {
-        Ok(o) => o?,
-        Err(_) => {
-            return Err(OprobeError::new(
-                ErrorCode::NetTimeout,
-                format!("`oprobe {}` took longer than {timeout:?}", args[0]),
-            )
-            .into());
+/// Run one service-layer call in-process, bounded by `timeout` and cancelled with the MCP
+/// call (stream SEC turns the long ones into polled jobs: this is the seam).
+async fn in_process_call<T>(
+    what: &str,
+    timeout: Duration,
+    ct: Option<&CancellationToken>,
+    cancel: Option<crate::app::Cancel>,
+    fut: impl std::future::Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    let never = CancellationToken::new();
+    let ct = ct.unwrap_or(&never);
+    tokio::select! {
+        r = tokio::time::timeout(timeout, fut) => match r {
+            Ok(r) => r,
+            Err(_) => {
+                if let Some(c) = &cancel {
+                    c.cancel();
+                }
+                Err(OprobeError::new(
+                    ErrorCode::NetTimeout,
+                    format!("`{what}` took longer than {timeout:?}"),
+                )
+                .into())
+            }
+        },
+        _ = ct.cancelled() => {
+            if let Some(c) = &cancel {
+                c.cancel();
+            }
+            Err(OprobeError::new(ErrorCode::RunInterrupted, "the call was cancelled").into())
         }
-    };
-    let v: Value = serde_json::from_slice(&out.stdout).map_err(|e| {
-        OprobeError::new(
-            ErrorCode::Internal,
-            format!(
-                "`oprobe {}` printed no JSON result ({e}): {}",
-                args[0],
-                String::from_utf8_lossy(&out.stderr).trim()
-            ),
-        )
-    })?;
-    if v.get("type").and_then(|t| t.as_str()) == Some("error") {
-        let body: ErrorBody = serde_json::from_value(v["error"].clone())?;
-        let mut e = OprobeError::new(body.code, body.message);
-        if let Some(h) = body.hint {
-            e = e.with_hint(h);
-        }
-        return Err(e.into());
     }
-    Ok(v)
+}
+
+/// A result as `oprobe … -o json` prints it (the envelope with `next` and `warnings`).
+fn envelope<T: crate::output::CommandOutput>(v: &T, sink: &Output) -> Value {
+    crate::output::envelope_value(v, sink.warnings())
+}
+
+/// The safety rails of a workload this server runs: its budgets, and read-only unless it may
+/// write to the target.
+fn server_safety(b: &Budgets, read_only: bool, allow_write: bool) -> crate::app::Safety {
+    crate::app::Safety {
+        read_only,
+        allow_write,
+        max_cost_usd: b.max_cost_usd,
+        max_requests: b.max_requests_count,
+        max_bytes: b.max_bytes.map(|n| n.to_string()),
+        max_duration: b.max_duration_s.map(|s| format!("{s}s")),
+        ..crate::app::Safety::default()
+    }
 }
 
 // --- tools ----------------------------------------------------------------------------
@@ -1428,12 +1405,22 @@ async fn doctor(st: &Arc<State>, a: DoctorIn) -> anyhow::Result<Reply> {
         .into());
     }
     let read_only = !write_probe;
-    let mut args = vec!["doctor".to_owned()];
-    args.extend(target_cli(&a.target));
-    if write_probe {
-        args.push("--write-probe".into());
-    }
-    let v = child_json(st, args, Duration::from_secs(120)).await?;
+    let sink = Output::silent();
+    let req = crate::app::DoctorRequest {
+        target: target_args(&a.target),
+        read_only,
+        write_probe,
+        verbose: false,
+    };
+    let out = in_process_call(
+        "doctor",
+        Duration::from_secs(120),
+        None,
+        None,
+        st.app().doctor(req, &sink),
+    )
+    .await?;
+    let v = envelope(&out, &sink);
     let failed = v["failed_count"].as_u64().unwrap_or(0);
     let text = if v["ready"].as_bool() == Some(true) {
         format!(
@@ -1460,33 +1447,25 @@ async fn doctor(st: &Arc<State>, a: DoctorIn) -> anyhow::Result<Reply> {
 
 async fn probe(st: &Arc<State>, a: ProbeIn) -> anyhow::Result<Reply> {
     check_probe(&st.cfg, &a)?;
-    let mut args = vec![
-        "probe".to_owned(),
-        a.endpoint.clone(),
-        "-n".into(),
-        a.samples.unwrap_or(3).clamp(1, 50).to_string(),
-    ];
-    if let Some(h) = http_arg(a.http.as_deref())? {
-        args.extend([
-            "--http".into(),
-            match h {
-                HttpArg::Auto => "auto",
-                HttpArg::H1 => "h1",
-                HttpArg::H2 => "h2",
-            }
-            .into(),
-        ]);
-    }
-    if a.get {
-        args.push("--get".into());
-    }
-    if a.insecure {
-        args.push("--insecure".into());
-    }
-    if let Some(p) = &a.proxy {
-        args.extend(["--proxy".into(), p.clone()]);
-    }
-    let v = child_json(st, args, Duration::from_secs(120)).await?;
+    let sink = Output::silent();
+    let req = crate::app::ProbeRequest {
+        endpoint: a.endpoint.clone(),
+        samples: a.samples.unwrap_or(3).clamp(1, 50),
+        http: http_arg(a.http.as_deref())?.unwrap_or_default(),
+        get: a.get,
+        insecure: a.insecure,
+        proxy: a.proxy.clone(),
+        ..crate::app::ProbeRequest::default()
+    };
+    let out = in_process_call(
+        "probe",
+        Duration::from_secs(120),
+        None,
+        None,
+        st.app().probe(req, &sink),
+    )
+    .await?;
+    let v = envelope(&out, &sink);
     let ms = |k: &str| {
         v[k]["p50"]
             .as_f64()
@@ -1766,7 +1745,7 @@ async fn start_run(st: &Arc<State>, a: StartRunIn, cx: CallCx) -> anyhow::Result
         target_name: p.target_name,
         budgets: p.budgets,
         plan: p.plan,
-        trace_max_requests: crate::cli::trace_max_requests(&st.ctx()),
+        trace_max_requests: crate::app::profile::trace_max_requests(&st.ctx()),
         store: st.store(),
         label: a.plan.workload.label.clone(),
         tune: None,
@@ -1777,7 +1756,7 @@ async fn start_run(st: &Arc<State>, a: StartRunIn, cx: CallCx) -> anyhow::Result
 }
 
 async fn start_tune(st: &Arc<State>, a: StartTuneIn, cx: CallCx) -> anyhow::Result<Reply> {
-    use crate::cli::args::tune_defaults as d;
+    use crate::config::tune_defaults as d;
     let p = prepare(st, &a.plan)?;
     if let Some(e) = p.refusals.into_iter().next() {
         return Err(e);
@@ -1789,9 +1768,9 @@ async fn start_tune(st: &Arc<State>, a: StartTuneIn, cx: CallCx) -> anyhow::Resu
             format!("invalid objective `{o}` (goodput, p99, cost, balanced)"),
         )
     })?;
-    let opts = crate::cli::tune_options(
+    let opts = crate::app::tune_options(
         objective,
-        &crate::cli::TuneSettings {
+        &crate::app::TuneSettings {
             trial_duration: a.trial_duration.as_deref().unwrap_or(d::TRIAL_DURATION),
             trial_warmup: a.trial_warmup.as_deref().unwrap_or(d::TRIAL_WARMUP),
             max_trials: a.max_trials.unwrap_or(d::MAX_TRIALS),
@@ -1816,7 +1795,7 @@ async fn start_tune(st: &Arc<State>, a: StartTuneIn, cx: CallCx) -> anyhow::Resu
         target_name: p.target_name,
         budgets: p.budgets,
         plan,
-        trace_max_requests: crate::cli::trace_max_requests(&st.ctx()),
+        trace_max_requests: crate::app::profile::trace_max_requests(&st.ctx()),
         store: st.store(),
         label: a.plan.workload.label.clone(),
         tune: Some(opts),
@@ -2075,20 +2054,24 @@ async fn cleanup(st: &Arc<State>, a: CleanupIn) -> anyhow::Result<Reply> {
     let (p, _) = profile_of(st, &a.target, &WorkloadIn::default())?;
     check_target(st, &a.target, &p)?;
     let dry_run = !(a.confirm && (st.cfg.allow_write || in_process(&p.target)));
-    let mut args = vec!["cleanup".to_owned()];
-    args.extend(target_cli(&a.target));
-    args.extend([
-        "--older-than".into(),
-        a.older_than.clone().unwrap_or_else(|| "1h".into()),
-    ]);
-    if a.datasets {
-        args.push("--datasets".into());
-    }
-    // `oprobe cleanup` is a dry run unless --yes.
-    if !dry_run {
-        args.push("--yes".into());
-    }
-    let v = child_json(st, args, Duration::from_secs(600)).await?;
+    let sink = Output::silent();
+    let req = crate::app::CleanupRequest {
+        target: target_args(&a.target),
+        older_than: a.older_than.clone().unwrap_or_else(|| "1h".into()),
+        datasets: a.datasets,
+        // `oprobe cleanup` is a dry run unless `yes`.
+        yes: !dry_run,
+        ..crate::app::CleanupRequest::default()
+    };
+    let out = in_process_call(
+        "cleanup",
+        Duration::from_secs(600),
+        None,
+        None,
+        st.app().cleanup(req, &sink),
+    )
+    .await?;
+    let v = envelope(&out, &sink);
     let n = v["entries"].as_array().map(|e| e.len()).unwrap_or(0);
     let text = if dry_run {
         format!(
@@ -2109,7 +2092,7 @@ async fn cleanup(st: &Arc<State>, a: CleanupIn) -> anyhow::Result<Reply> {
 }
 
 fn discover_targets(st: &Arc<State>) -> anyhow::Result<Reply> {
-    let d = crate::cli::discover::discover(&st.ctx())?;
+    let d = crate::app::discover::discover(&st.ctx())?;
     let text = if d.sources.is_empty() {
         format!(
             "no credential sources found; {} configured target(s)",
@@ -2137,12 +2120,12 @@ async fn sample_objects(st: &Arc<State>, a: SampleIn) -> anyhow::Result<Reply> {
     let (p, _) = profile_of(st, &a.target, &WorkloadIn::default())?;
     check_target(st, &a.target, &p)?;
     let target = p.target.normalized()?;
-    let s = crate::cli::sample::sample(
+    let s = crate::app::sample::sample(
         &target,
         &a.target.target,
         a.prefix.as_deref().unwrap_or(""),
         a.limit
-            .unwrap_or(crate::cli::sample::DEFAULT_LIMIT)
+            .unwrap_or(crate::app::sample::DEFAULT_LIMIT)
             .clamp(1, 100_000),
     )
     .await?;
@@ -2161,37 +2144,6 @@ async fn sample_objects(st: &Arc<State>, a: SampleIn) -> anyhow::Result<Reply> {
     })
 }
 
-/// Budgets of this server as CLI flags (for child commands that run workloads).
-fn budget_flags(b: &Budgets) -> Vec<String> {
-    let mut v = Vec::new();
-    if let Some(c) = b.max_cost_usd {
-        v.extend(["--max-cost-usd".into(), c.to_string()]);
-    }
-    if let Some(n) = b.max_requests_count {
-        v.extend(["--max-requests".into(), n.to_string()]);
-    }
-    if let Some(n) = b.max_bytes {
-        v.extend(["--max-bytes".into(), n.to_string()]);
-    }
-    if let Some(s) = b.max_duration_s {
-        v.extend(["--max-duration".into(), format!("{s}s")]);
-    }
-    v
-}
-
-/// Run a CLI command that runs workloads (`verify`, `fix`) as a child; a cancelled call
-/// stops it.
-async fn child_job(st: &State, args: Vec<String>, cx: &CallCx) -> anyhow::Result<Value> {
-    tokio::select! {
-        r = child_json(st, args, Duration::from_secs(3600)) => r,
-        _ = cx.ct.cancelled() => Err(OprobeError::new(
-            ErrorCode::RunInterrupted,
-            "the call was cancelled",
-        )
-        .into()),
-    }
-}
-
 async fn verify_finding(st: &Arc<State>, a: VerifyIn, cx: CallCx) -> anyhow::Result<Reply> {
     // The replay writes what the run wrote: the same rails as start_run (`from`).
     let plan = PlanIn {
@@ -2203,21 +2155,35 @@ async fn verify_finding(st: &Arc<State>, a: VerifyIn, cx: CallCx) -> anyhow::Res
         return Err(e);
     }
     let run_id = load_run(st, &a.run)?.id().to_owned();
-    let mut args = vec!["verify".to_owned(), run_id.clone()];
-    match &a.code {
-        Some(c) => args.push(c.clone()),
-        None => args.push("--all".into()),
-    }
-    if let Some(n) = a.repeat {
-        args.extend(["--repeat".into(), n.clamp(1, 20).to_string()]);
-    }
-    // The replays are the stored run's spec (what `prepare` checked); a read-only server's
-    // child refuses any replay that would write all the same.
-    if !write_allowed(&st.cfg, &p.profile) {
-        args.push("--read-only".into());
-    }
-    args.extend(budget_flags(&p.budgets));
-    let v = child_job(st, args, &cx).await?;
+    let all = a.code.is_none();
+    // The replays are the stored run's spec (what `prepare` checked); a read-only server
+    // refuses any replay that would write all the same.
+    let req = crate::app::VerifyRequest {
+        run: run_id.clone(),
+        code: a.code.clone(),
+        all,
+        repeat: a
+            .repeat
+            .map_or(crate::app::VerifyRequest::default().repeat, |n| {
+                n.clamp(1, 20)
+            }),
+        safety: server_safety(&p.budgets, false, write_allowed(&st.cfg, &p.profile)),
+        ..crate::app::VerifyRequest::default()
+    };
+    let sink = Output::silent();
+    let cancel = crate::app::Cancel::new();
+    let v = match in_process_call(
+        "verify",
+        Duration::from_secs(3600),
+        Some(&cx.ct),
+        Some(cancel.clone()),
+        st.app().verify(req, &sink, cancel.clone()),
+    )
+    .await?
+    {
+        crate::app::verify::VerifyRun::Verified(r) => envelope(r.as_ref(), &sink),
+        crate::app::verify::VerifyRun::Plan(p) => envelope(p.as_ref(), &sink),
+    };
     let text = verify_text(&v, &run_id);
     Ok(Reply {
         structured: v,
@@ -2252,60 +2218,67 @@ fn verify_text(v: &Value, run_id: &str) -> String {
     }
 }
 
-/// Every workload, knob and cost argument of a tool's workload input as CLI flags (the
-/// inverse of [`workload_args`]), so a child command resolves the same profile.
-fn workload_cli(w: &WorkloadIn) -> Vec<String> {
-    let mut v = Vec::new();
-    let mut flag = |f: &str, x: Option<String>| {
-        if let Some(x) = x {
-            v.extend([f.to_owned(), x]);
+/// `--objective`: goodput (throughput), p99 (latency), cost or balanced.
+fn objective(v: &str) -> anyhow::Result<crate::tune::Objective> {
+    use crate::tune::Objective;
+    Ok(match v.trim().to_ascii_lowercase().as_str() {
+        "goodput" | "throughput" => Objective::Throughput,
+        "p99" | "latency" => Objective::Latency,
+        "cost" => Objective::Cost,
+        "balanced" => Objective::Balanced,
+        other => {
+            return Err(OprobeError::new(
+                ErrorCode::UsageInvalidArgument,
+                format!("invalid objective `{other}`"),
+            )
+            .with_hint("use goodput, p99, cost or balanced")
+            .into());
         }
-    };
-    flag("--preset", w.preset.clone());
-    flag("--duration", w.duration.clone());
-    flag("--warmup", w.warmup.clone());
-    flag("--max-ops", w.max_ops.map(|n| n.to_string()));
-    flag("--rate", w.rate.map(|r| r.to_string()));
-    flag("--existing", w.existing.clone());
-    flag("--objects", w.objects.map(|n| n.to_string()));
-    flag("--object-size", w.object_size.clone());
-    flag("--access", w.access.clone());
-    flag("--concurrency", w.concurrency.map(|n| n.to_string()));
-    flag("--io-concurrency", w.io_concurrency.map(|n| n.to_string()));
-    flag("--chunk-size", w.chunk_size.clone());
-    flag("--http", w.http.clone());
-    flag("--retries", w.retries.map(|n| n.to_string()));
-    flag("--provider", w.provider.clone());
-    flag("--label", w.label.clone());
-    v
+    })
 }
 
-/// The CLI arguments that make a child command resolve the profile [`prepare`] checked: the
-/// target (unless `from` names it), every workload flag, `--from` and each `--set`; plus
-/// `--read-only` whenever this server would refuse a write to the target, so the child refuses
-/// one too.
-fn plan_cli(st: &State, a: &PlanIn, p: &Prepared) -> Vec<String> {
-    let mut args = Vec::new();
-    if !a.target.target.trim().is_empty() {
-        args.extend(target_cli(&a.target));
-    } else if a.from.is_none() {
-        args.extend(target_cli(&effective_target(a, &p.profile)));
+/// The `fix` request resolving the profile [`prepare`] checked: the target (unless `from`
+/// names it), every workload input, `from` and each `set`; read-only whenever this server would
+/// refuse a write to the target.
+fn fix_request(
+    st: &State,
+    a: &RecommendIn,
+    p: &Prepared,
+) -> anyhow::Result<crate::app::FixRequest> {
+    let plan = &a.plan;
+    let mut target = if !plan.target.target.trim().is_empty() {
+        target_args(&plan.target)
+    } else if plan.from.is_none() {
+        target_args(&effective_target(plan, &p.profile))
     } else {
         // `from` names the target; its overrides (region, anonymous, endpoint, options…)
         // still apply, as they did to the profile `prepare` checked.
-        args.extend(target_flags_cli(&a.target));
+        target_args(&plan.target)
+    };
+    if plan.target.target.trim().is_empty() && plan.from.is_some() {
+        target.target = None;
     }
-    args.extend(workload_cli(&a.workload));
-    if let Some(f) = &a.from {
-        args.extend(["--from".to_owned(), f.clone()]);
+    let (workload, knobs, cost) = workload_args(&plan.workload)?;
+    let mut req = crate::app::FixRequest {
+        target,
+        workload,
+        knobs,
+        cost,
+        from: plan.from.clone(),
+        set: plan.set.clone(),
+        budget: a.budget.clone(),
+        safety: server_safety(
+            &p.budgets,
+            plan.read_only,
+            write_allowed(&st.cfg, &p.profile),
+        ),
+        ..crate::app::FixRequest::default()
+    };
+    req.output.label = plan.workload.label.clone();
+    if let Some(o) = &a.objective {
+        req.search.objective = objective(o)?;
     }
-    for s in &a.set {
-        args.extend(["--set".to_owned(), s.clone()]);
-    }
-    if a.read_only || !write_allowed(&st.cfg, &p.profile) {
-        args.push("--read-only".into());
-    }
-    args
+    Ok(req)
 }
 
 /// Whether this server lets a run write to the profile's target.
@@ -2318,17 +2291,19 @@ async fn recommend_config(st: &Arc<State>, a: RecommendIn, cx: CallCx) -> anyhow
     if let Some(e) = std::mem::take(&mut p.refusals).into_iter().next() {
         return Err(e);
     }
-    let mut args = vec!["fix".to_owned()];
-    args.extend(plan_cli(st, &a.plan, &p));
     let t = effective_target(&a.plan, &p.profile);
-    if let Some(o) = &a.objective {
-        args.extend(["--objective".to_owned(), o.clone()]);
-    }
-    if let Some(b) = &a.budget {
-        args.extend(["--budget".to_owned(), b.clone()]);
-    }
-    args.extend(budget_flags(&p.budgets));
-    let v = child_job(st, args, &cx).await?;
+    let req = fix_request(st, &a, &p)?;
+    let sink = Output::silent();
+    let cancel = crate::app::Cancel::new();
+    let out = in_process_call(
+        "fix",
+        Duration::from_secs(3600),
+        Some(&cx.ct),
+        Some(cancel.clone()),
+        st.app().fix(req, &sink, cancel.clone()),
+    )
+    .await?;
+    let v = envelope(&out, &sink);
     let rec = v.get("recommendation").unwrap_or(&v);
     let text = format!(
         "recommended for {}: {}",
@@ -2398,11 +2373,10 @@ mod tests {
             anonymous: true,
             ..Default::default()
         };
-        assert_eq!(
-            target_flags_cli(&t),
-            ["--region", "eu-west-1", "--anonymous"]
-        );
-        assert!(target_flags_cli(&TargetIn::default()).is_empty());
+        let a = target_args(&t);
+        assert_eq!(a.region.as_deref(), Some("eu-west-1"));
+        assert!(a.anonymous);
+        assert!(target_args(&TargetIn::default()).options.is_empty());
     }
 
     #[test]

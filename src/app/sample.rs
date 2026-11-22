@@ -12,7 +12,7 @@ use schemars::JsonSchema;
 use serde::Serialize;
 
 use super::Ctx;
-use super::args::{CostArgs, KnobArgs, TargetSampleArgs, WorkloadArgs};
+use super::input::{CostInput, KnobInput, SampleRequest, WorkloadInput};
 use crate::config::TargetSpec;
 use crate::output::{CommandOutput, NextStep};
 use crate::report::style::{bold, dim};
@@ -348,18 +348,18 @@ impl CommandOutput for ObjectSample {
 }
 
 /// `oprobe target sample TARGET`.
-pub async fn cmd_sample(a: TargetSampleArgs, ctx: &Ctx) -> Result<u8> {
-    let (profile, _) = super::resolve_profile(
+pub async fn run(ctx: &Ctx, a: SampleRequest) -> Result<ObjectSample> {
+    let (profile, _) = super::profile::resolve_profile(
         ctx,
         &a.target,
-        &WorkloadArgs::default(),
-        &KnobArgs::default(),
-        &CostArgs::default(),
+        &WorkloadInput::default(),
+        &KnobInput::default(),
+        &CostInput::default(),
     )?;
     let target = profile.target.normalized()?;
     let arg = a.target.target.clone().unwrap_or_else(|| target.display());
     let s = sample(&target, &arg, a.prefix.as_deref().unwrap_or(""), a.limit).await?;
-    ctx.out.finish(&s)
+    Ok(s)
 }
 
 #[cfg(test)]

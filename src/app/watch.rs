@@ -14,7 +14,7 @@ use schemars::JsonSchema;
 use serde::Serialize;
 
 use super::Ctx;
-use super::args::WatchArgs;
+use super::input::WatchRequest;
 use crate::analysis::stats::quantile_us_ms;
 use crate::engine::{Cancel, RunOptions};
 use crate::errors::{ErrorCode, OprobeError, exit};
@@ -203,8 +203,8 @@ pub struct WatchOutput {
 impl CommandOutput for WatchOutput {
     fn next(&self) -> Vec<crate::output::NextStep> {
         vec![
-            crate::cli::next::doctor(&self.target),
-            crate::cli::next::list_runs(),
+            crate::app::next::doctor(&self.target),
+            crate::app::next::list_runs(),
         ]
     }
 
@@ -283,7 +283,15 @@ async fn serve_metrics(addr: &str, reg: Arc<Mutex<Registry>>) -> Result<String> 
     Ok(local)
 }
 
-pub async fn cmd_watch(a: WatchArgs, ctx: &Ctx) -> Result<u8> {
+/// What [`watch`] produced.
+#[derive(Clone, Debug)]
+pub enum WatchOutcome {
+    Plan(Box<super::run::PlanOutput>),
+    Watched(Box<WatchOutput>),
+}
+
+/// `oprobe watch`: probe windows against SLOs until `count` windows or `cancel`.
+pub async fn watch(ctx: &Ctx, a: WatchRequest, cancel: Cancel) -> Result<WatchOutcome> {
     let bad = |m: String| -> anyhow::Error {
         OprobeError::new(ErrorCode::UsageInvalidArgument, m).into()
     };
@@ -297,7 +305,8 @@ pub async fn cmd_watch(a: WatchArgs, ctx: &Ctx) -> Result<u8> {
     if w.duration.is_none() {
         w.duration = Some("5s".into());
     }
-    let (mut profile, target_name) = super::resolve_profile(ctx, &a.target, &w, &a.knobs, &a.cost)?;
+    let (mut profile, target_name) =
+        super::profile::resolve_profile(ctx, &a.target, &w, &a.knobs, &a.cost)?;
     let window = profile.workload.duration.get();
     let interval =
         parse_duration(&a.interval).map_err(|e| bad(format!("invalid --interval: {e:#}")))?;
@@ -326,11 +335,11 @@ pub async fn cmd_watch(a: WatchArgs, ctx: &Ctx) -> Result<u8> {
                 a.interval
             ),
         });
-        return ctx.out.finish(&super::run::PlanOutput { plan });
+        return Ok(WatchOutcome::Plan(Box::new(super::run::PlanOutput {
+            plan,
+        })));
     }
     let guard = super::run::guard_for(ctx, &profile, &rails.budgets);
-    let cancel = Cancel::new();
-    super::install_ctrl_c(cancel.clone());
     let reg = Arc::new(Mutex::new(Registry::default()));
     let listen = match &a.listen {
         Some(addr) => {
@@ -355,7 +364,7 @@ pub async fn cmd_watch(a: WatchArgs, ctx: &Ctx) -> Result<u8> {
         profile,
         &rails,
         guard,
-        super::trace_max_requests(ctx),
+        super::profile::trace_max_requests(ctx),
         cancel.clone(),
         quiet,
     )
@@ -511,7 +520,7 @@ pub async fn cmd_watch(a: WatchArgs, ctx: &Ctx) -> Result<u8> {
     if let Some(b) = session.guard().and_then(|g| g.breach()) {
         return Err(b.to_error());
     }
-    ctx.out.finish(&WatchOutput {
+    Ok(WatchOutcome::Watched(Box::new(WatchOutput {
         target: display,
         windows_count: count,
         slos: slos
@@ -528,7 +537,7 @@ pub async fn cmd_watch(a: WatchArgs, ctx: &Ctx) -> Result<u8> {
         rolling,
         transitions,
         listen,
-    })
+    })))
 }
 
 #[cfg(test)]

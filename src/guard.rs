@@ -243,7 +243,16 @@ pub const READ_ONLY_SERVER_ENV: &str = "OPROBE_MCP_READ_ONLY";
 /// its target lives in this process.
 pub fn check_server_read_only(profile: &Profile) -> anyhow::Result<()> {
     let on = std::env::var(READ_ONLY_SERVER_ENV).is_ok_and(|v| !v.is_empty() && v != "0");
-    if !on || in_process(&profile.target) {
+    if !on {
+        return Ok(());
+    }
+    refuse_server_writes(profile)
+}
+
+/// A read-only MCP server's rail (`Safety::allow_write == false`): refuse a run of `profile`
+/// that would write, unless its target lives in this process.
+pub fn refuse_server_writes(profile: &Profile) -> anyhow::Result<()> {
+    if in_process(&profile.target) {
         return Ok(());
     }
     check_read_only(profile).map_err(|_| {

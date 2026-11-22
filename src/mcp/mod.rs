@@ -12,8 +12,8 @@
 //! targets tools may touch.
 
 pub mod capabilities;
-pub mod catalog;
-pub mod explain;
+pub use crate::analysis::catalog;
+pub use crate::app::explain;
 mod jobs;
 pub mod prompts;
 pub mod resources;

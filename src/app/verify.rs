@@ -6,16 +6,16 @@
 //! calibrate the capacity history (`capacity::calibrate`).
 
 use anyhow::{Context, Result};
-use clap::Parser;
 use schemars::JsonSchema;
 use serde::Serialize;
 
 use super::Ctx;
-use super::args::*;
+use super::input::*;
 use crate::analysis::capacity::{self, Observation};
 use crate::analysis::compare::{Comparison, compare_with_noise, runs_t, significant};
 use crate::analysis::stats::Interval;
 use crate::analysis::verification::{Direction, Expectation, VerifyOutcome};
+use crate::engine::Cancel;
 use crate::errors::{ErrorCode, OprobeError};
 use crate::model::spec::{Overrides, shell_quote};
 use crate::model::{Report, Run};
@@ -173,7 +173,7 @@ impl CommandOutput for VerifyResult {
 
 /// A change to test.
 #[derive(Clone, Debug)]
-pub(super) struct Hypothesis {
+pub struct Hypothesis {
     pub code: String,
     pub description: String,
     pub overrides: Overrides,
@@ -181,7 +181,7 @@ pub(super) struct Hypothesis {
 }
 
 /// How to replay and what to learn.
-pub(super) struct VerifyCfg<'a> {
+pub struct VerifyCfg<'a> {
     pub repeat: usize,
     pub replayer: &'a Replayer<'a>,
     pub calibrate: bool,
@@ -189,83 +189,47 @@ pub(super) struct VerifyCfg<'a> {
     pub max_throttle_ratio: f64,
 }
 
-/// The safety flags as `oprobe run` arguments.
-fn safety_args(s: &SafetyArgs) -> Vec<String> {
-    let mut a = Vec::new();
-    if s.read_only {
-        a.push("--read-only".to_owned());
-    }
-    if let Some(v) = s.max_cost_usd {
-        a.extend(["--max-cost-usd".to_owned(), v.to_string()]);
-    }
-    if let Some(v) = s.max_requests {
-        a.extend(["--max-requests".to_owned(), v.to_string()]);
-    }
-    if let Some(v) = &s.max_bytes {
-        a.extend(["--max-bytes".to_owned(), v.clone()]);
-    }
-    if let Some(v) = &s.max_duration {
-        a.extend(["--max-duration".to_owned(), v.clone()]);
-    }
-    a
-}
-
-/// `oprobe run --from RUN --set …` arguments of a replay.
-pub(super) fn replay_args(
-    run_id: &str,
-    o: &Overrides,
-    label: &str,
-    safety: &SafetyArgs,
-    no_save: bool,
-) -> Vec<String> {
-    let mut args: Vec<String> = vec![
-        "oprobe".into(),
-        "run".into(),
-        "--from".into(),
-        run_id.into(),
-    ];
-    args.extend(o.to_set_args());
-    args.extend(["--label".to_owned(), label.to_owned()]);
-    args.extend(safety_args(safety));
-    if no_save {
-        args.push("--no-save".into());
-    }
-    args
-}
-
-/// Parse `oprobe run …` arguments into the run command's flags.
-pub(super) fn parse_run(args: &[String]) -> Result<RunArgs> {
-    let cli = Cli::try_parse_from(args).map_err(|e| {
-        OprobeError::new(
-            ErrorCode::UsageInvalidArgument,
-            format!("cannot build the replay `{}`: {e}", args.join(" ")),
-        )
-    })?;
-    match cli.command {
-        Some(Command::Run(a)) => Ok(a),
-        _ => unreachable!("replay arguments are a run command"),
+/// The profile request of a replay: `run --from RUN --set … --label LABEL`.
+pub fn replay_request(run_id: &str, o: &Overrides, label: &str) -> ProfileRequest {
+    ProfileRequest {
+        from: Some(run_id.to_owned()),
+        set: o
+            .entries()
+            .into_iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect(),
+        label: Some(label.to_owned()),
+        ..ProfileRequest::default()
     }
 }
 
 /// Replays of one run (`run --from RUN --set …`, in process): the run's resolved profile and
 /// one guard for the whole command, so `--max-requests`, `--max-bytes`, `--max-cost-usd` and
 /// `--max-duration` cap every replay together (as with `run --repeat`).
-pub(super) struct Replayer<'a> {
+pub struct Replayer<'a> {
     /// The profile the run measured, its target resolved (credentials included).
     pub base: crate::config::Profile,
     pub target_name: Option<String>,
-    pub safety: &'a SafetyArgs,
+    pub safety: &'a Safety,
     pub no_save: bool,
     /// The command's guard (none without budgets).
     pub guard: Option<std::sync::Arc<crate::guard::Guard>>,
+    /// Cancels every replay of the command.
+    pub cancel: Cancel,
 }
 
 impl<'a> Replayer<'a> {
     /// Replays of a stored run: its spec, the target resolved again (as `run --from RUN`).
-    pub fn of_run(ctx: &Ctx, run: &Run, safety: &'a SafetyArgs, no_save: bool) -> Result<Self> {
+    pub fn of_run(
+        ctx: &Ctx,
+        run: &Run,
+        safety: &'a Safety,
+        no_save: bool,
+        cancel: Cancel,
+    ) -> Result<Self> {
         let (base, target_name) =
-            super::spec_profile(ctx, run.report.spec.clone(), &RunArgs::default())?;
-        Self::new(ctx, base, target_name, safety, no_save)
+            super::profile::spec_profile(ctx, run.report.spec.clone(), &ProfileRequest::default())?;
+        Self::new(ctx, base, target_name, safety, no_save, cancel)
     }
 
     /// Replays of `base` (a profile in memory, e.g. the diagnosis of `fix --no-save`) under a
@@ -274,8 +238,9 @@ impl<'a> Replayer<'a> {
         ctx: &Ctx,
         base: crate::config::Profile,
         target_name: Option<String>,
-        safety: &'a SafetyArgs,
+        safety: &'a Safety,
         no_save: bool,
+        cancel: Cancel,
     ) -> Result<Self> {
         let guard = super::run::guard_for(ctx, &base, &super::run::budgets(ctx, safety)?);
         Ok(Self {
@@ -284,6 +249,7 @@ impl<'a> Replayer<'a> {
             safety,
             no_save,
             guard,
+            cancel,
         })
     }
 
@@ -294,9 +260,9 @@ impl<'a> Replayer<'a> {
         o.apply(&mut p, &mut name)?;
         p.name = name;
         p.validate()?;
-        let output = OutputArgs {
+        let output = OutputOptions {
             no_save: self.no_save,
-            ..OutputArgs::default()
+            ..OutputOptions::default()
         };
         let mut safety = self.safety.clone();
         safety.dry_run = false;
@@ -307,6 +273,7 @@ impl<'a> Replayer<'a> {
             &safety,
             &output,
             self.guard.clone(),
+            &self.cancel,
         )
         .await?
         {
@@ -482,7 +449,7 @@ pub fn judge(e: &Expectation, a: &[f64], b: &[f64], floor: f64) -> ExpectationCh
 /// Expectations of a finding that names none: throttling must stay within the budget at
 /// ≥ 70 % of the goodput; anything else must not cost goodput (and should resolve the
 /// finding). Returns `(expectations, the finding must resolve)`.
-pub(super) fn default_expectations(code: &str, budget: f64) -> (Vec<Expectation>, bool) {
+pub fn default_expectations(code: &str, budget: f64) -> (Vec<Expectation>, bool) {
     let goodput = |min: f64| Expectation {
         metric: "summary.ops_per_s".into(),
         direction: Direction::AtLeast,
@@ -511,7 +478,7 @@ pub(super) fn default_expectations(code: &str, budget: f64) -> (Vec<Expectation>
 }
 
 /// The hypotheses of `run`: one finding (`code`) or every finding with a verification.
-pub(super) fn hypotheses(run: &Run, code: Option<&str>) -> Result<Vec<Hypothesis>> {
+pub fn hypotheses(run: &Run, code: Option<&str>) -> Result<Vec<Hypothesis>> {
     let with: Vec<&crate::model::Finding> = run
         .report
         .findings
@@ -588,7 +555,7 @@ fn has_code(r: &Run, code: &str) -> bool {
 }
 
 /// Replay `run` interleaved (A B₁ B₂ … A B₁ B₂ …), judge every hypothesis and learn from it.
-pub(super) async fn verify_hypotheses(
+pub async fn verify_hypotheses(
     ctx: &Ctx,
     run: &Run,
     hyps: Vec<Hypothesis>,
@@ -802,7 +769,16 @@ pub(super) async fn verify_hypotheses(
     })
 }
 
-pub async fn cmd_verify(a: VerifyArgs, ctx: &Ctx) -> Result<u8> {
+/// What [`verify`] produced.
+#[derive(Clone, Debug)]
+pub enum VerifyRun {
+    /// `safety.dry_run`: the plan of every replay.
+    Plan(Box<super::run::PlanOutput>),
+    Verified(Box<VerifyResult>),
+}
+
+/// `oprobe verify`: replay a run's findings interleaved with baselines and judge them.
+pub async fn verify(ctx: &Ctx, a: VerifyRequest, cancel: Cancel) -> Result<VerifyRun> {
     let run = ctx.store().load(&a.run)?;
     let hyps = hypotheses(&run, if a.all { None } else { a.code.as_deref() })?;
     let budget = run
@@ -813,14 +789,8 @@ pub async fn cmd_verify(a: VerifyArgs, ctx: &Ctx) -> Result<u8> {
         .max_throttle_rate
         .unwrap_or(crate::config::defaults().tune.max_throttle_ratio);
     if a.safety.dry_run {
-        let ra = parse_run(&replay_args(
-            run.id(),
-            &Overrides::new(),
-            "verify",
-            &a.safety,
-            true,
-        ))?;
-        let (profile, _) = super::run_profile(ctx, &ra)?;
+        let ra = replay_request(run.id(), &Overrides::new(), "verify");
+        let (profile, _) = super::profile::run_profile(ctx, &ra)?;
         let rails = super::run::rails(ctx, &profile, &a.safety)?;
         let mut plan = rails.plan(&profile);
         let runs = a.repeat * (hyps.len() + 1);
@@ -838,7 +808,7 @@ pub async fn cmd_verify(a: VerifyArgs, ctx: &Ctx) -> Result<u8> {
                 .collect::<Vec<_>>()
                 .join(", ")
         ));
-        return ctx.out.finish(&super::run::PlanOutput { plan });
+        return Ok(VerifyRun::Plan(Box::new(super::run::PlanOutput { plan })));
     }
     ctx.out.info(format!(
         "{} {} · {} · {} pair(s): {}",
@@ -851,7 +821,7 @@ pub async fn cmd_verify(a: VerifyArgs, ctx: &Ctx) -> Result<u8> {
             .collect::<Vec<_>>()
             .join(", ")
     ));
-    let replayer = Replayer::of_run(ctx, &run, &a.safety, a.no_save)?;
+    let replayer = Replayer::of_run(ctx, &run, &a.safety, a.no_save, cancel)?;
     let res = verify_hypotheses(
         ctx,
         &run,
@@ -864,7 +834,7 @@ pub async fn cmd_verify(a: VerifyArgs, ctx: &Ctx) -> Result<u8> {
         },
     )
     .await?;
-    ctx.out.finish(&res)
+    Ok(VerifyRun::Verified(Box::new(res)))
 }
 
 #[cfg(test)]
@@ -940,21 +910,9 @@ mod tests {
     #[test]
     fn replays_name_the_run_and_the_change() {
         let o = Overrides::new().with_set("concurrency", "5");
-        let s = SafetyArgs {
-            dry_run: false,
-            read_only: false,
-            max_cost_usd: Some(1.0),
-            max_requests: None,
-            max_bytes: None,
-            max_duration: None,
-            idempotency_key: None,
-        };
-        let args = replay_args("20261121-101010-abcd", &o, "verify-x", &s, true);
-        let ra = parse_run(&args).unwrap();
+        let ra = replay_request("20261121-101010-abcd", &o, "verify-x");
         assert_eq!(ra.from.as_deref(), Some("20261121-101010-abcd"));
         assert_eq!(ra.set, vec!["concurrency=5".to_owned()]);
-        assert_eq!(ra.output.label.as_deref(), Some("verify-x"));
-        assert!(ra.output.no_save);
-        assert_eq!(ra.safety.max_cost_usd, Some(1.0));
+        assert_eq!(ra.label.as_deref(), Some("verify-x"));
     }
 }

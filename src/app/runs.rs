@@ -5,7 +5,7 @@ use schemars::JsonSchema;
 use serde::Serialize;
 
 use super::Ctx;
-use super::args::*;
+use super::input::*;
 use crate::errors::{ErrorCode, OprobeError};
 use crate::model::Run;
 use crate::model::VerdictLevel;
@@ -28,8 +28,8 @@ impl CommandOutput for RunsList {
     fn next(&self) -> Vec<crate::output::NextStep> {
         match self.runs.first() {
             Some(r) => vec![
-                crate::cli::next::explain(&r.id),
-                crate::cli::next::show(&r.id),
+                crate::app::next::explain(&r.id),
+                crate::app::next::show(&r.id),
             ],
             None => vec![
                 crate::output::NextStep::new(
@@ -40,7 +40,7 @@ impl CommandOutput for RunsList {
                     "start_run",
                     serde_json::json!({ "target": "lab://demo", "duration": "5s" }),
                 ),
-                crate::cli::next::discover(),
+                crate::app::next::discover(),
             ],
         }
     }
@@ -162,11 +162,11 @@ fn when(id: &str, now: std::time::SystemTime) -> String {
     }
 }
 
-pub fn cmd_list(a: RunsListArgs, ctx: &Ctx) -> Result<u8> {
+pub fn list(ctx: &Ctx, a: RunsListRequest) -> Result<RunsList> {
     let mut runs = ctx.store().list()?;
     let total = runs.len() as u64;
     runs.truncate(a.limit);
-    ctx.out.finish(&RunsList {
+    Ok(RunsList {
         runs,
         total_count: total,
     })
@@ -198,7 +198,7 @@ pub struct RunReportOnly {
 
 impl CommandOutput for RunShow {
     fn next(&self) -> Vec<crate::output::NextStep> {
-        crate::cli::next::after_run(&self.run.report)
+        crate::app::next::after_run(&self.run.report)
     }
 
     fn formats() -> &'static [crate::output::OutputFormat] {
@@ -225,11 +225,11 @@ impl CommandOutput for RunShow {
     }
 }
 
-pub fn cmd_show(a: RunsShowArgs, ctx: &Ctx) -> Result<u8> {
+pub fn show(ctx: &Ctx, a: RunsShowRequest) -> Result<RunShow> {
     let store = ctx.store();
     let path = store.resolve(&a.run)?;
     let run = crate::store::runs::load_path(&path)?;
-    ctx.out.finish(&RunShow {
+    Ok(RunShow {
         path: path.display().to_string(),
         run: RunReportOnly {
             report: run.report.clone(),
@@ -251,65 +251,12 @@ pub struct OpenedRun {
 
 impl CommandOutput for OpenedRun {
     fn next(&self) -> Vec<crate::output::NextStep> {
-        vec![crate::cli::next::list_runs()]
+        vec![crate::app::next::list_runs()]
     }
 
     fn text(&self) -> String {
         format!("{} opening {} in the app\n", green("●"), self.path)
     }
-}
-
-pub fn cmd_open(a: RunRefArg, ctx: &Ctx) -> Result<u8> {
-    let path = ctx.store().resolve(&a.run)?;
-    let path = path.canonicalize().unwrap_or(path);
-    #[cfg(feature = "tui")]
-    let window = super::gui_available();
-    #[cfg(not(feature = "tui"))]
-    let window: std::result::Result<(), &str> = Err("this oprobe was built without native windows");
-    if let Err(why) = window {
-        // No window here (no `gui` feature, no display): the terminal workbench shows the same
-        // run when this is an interactive terminal.
-        if cfg!(feature = "tui")
-            && ctx.out.format == crate::output::OutputFormat::Text
-            && crate::output::interactive_terminal()
-        {
-            ctx.out.info(format!(
-                "cannot open a window ({why}); opening the run in the terminal workbench: oprobe top --open {}",
-                path.display()
-            ));
-            let status = std::process::Command::new(std::env::current_exe()?)
-                .arg("top")
-                .arg("--open")
-                .arg(&path)
-                .status()
-                .map_err(|e| anyhow::anyhow!("cannot start the terminal workbench: {e}"))?;
-            return Ok(status.code().map_or(1, |c| c.clamp(0, 255) as u8));
-        }
-        return Err(OprobeError::new(
-            ErrorCode::UsageInvalidArgument,
-            format!("cannot open a window: {why}"),
-        )
-        .with_hint(format!(
-            "read it here with `oprobe runs show {}`, or in the terminal workbench: `oprobe top --open {}`",
-            a.run,
-            path.display()
-        ))
-        .into());
-    }
-    let exe = std::env::current_exe()?;
-    std::process::Command::new(exe)
-        .arg("gui")
-        .arg("--open")
-        .arg(&path)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|e| anyhow::anyhow!("cannot start the app: {e}"))?;
-    ctx.out.finish(&OpenedRun {
-        path: path.display().to_string(),
-        launched: true,
-    })
 }
 
 /// `30d`, `2w`, `12h`, `90m`: days and weeks on top of [`crate::util::parse_duration`].
@@ -345,7 +292,7 @@ pub struct RemovedRuns {
 
 impl CommandOutput for RemovedRuns {
     fn next(&self) -> Vec<crate::output::NextStep> {
-        vec![crate::cli::next::list_runs()]
+        vec![crate::app::next::list_runs()]
     }
 
     fn text(&self) -> String {
@@ -364,7 +311,7 @@ impl CommandOutput for RemovedRuns {
     }
 }
 
-pub fn cmd_rm(a: RunsRmArgs, ctx: &Ctx) -> Result<u8> {
+pub fn rm(ctx: &Ctx, a: RunsRmRequest) -> Result<RemovedRuns> {
     let store = ctx.store();
     let mut ids = Vec::new();
     for r in &a.runs {
@@ -385,13 +332,13 @@ pub fn cmd_rm(a: RunsRmArgs, ctx: &Ctx) -> Result<u8> {
     for id in &ids {
         store.delete(id)?;
     }
-    ctx.out.finish(&RemovedRuns {
+    Ok(RemovedRuns {
         removed: ids,
         dry_run: false,
     })
 }
 
-pub fn cmd_gc(a: RunsGcArgs, ctx: &Ctx) -> Result<u8> {
+pub fn gc(ctx: &Ctx, a: RunsGcRequest) -> Result<RemovedRuns> {
     let older = a.older_than.as_deref().map(parse_age).transpose()?;
     let protect = crate::store::Baselines::load(&ctx.paths.baselines_file())?.referenced();
     let store = ctx.store();
@@ -401,7 +348,7 @@ pub fn cmd_gc(a: RunsGcArgs, ctx: &Ctx) -> Result<u8> {
             store.delete(id)?;
         }
     }
-    ctx.out.finish(&RemovedRuns {
+    Ok(RemovedRuns {
         removed: ids,
         dry_run: a.dry_run,
     })

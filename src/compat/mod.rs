@@ -5,8 +5,6 @@
 //! the service's capability rules out are skipped, not failed; the score is the share of the
 //! checks that ran and passed.
 
-pub mod command;
-
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};

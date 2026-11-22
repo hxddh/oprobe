@@ -104,7 +104,7 @@ macro_rules! entry {
 
 /// Every schema, in a stable order.
 pub fn entries() -> Vec<Entry> {
-    use crate::cli;
+    use crate::app;
     vec![
         entry!(
             "report",
@@ -142,13 +142,13 @@ pub fn entries() -> Vec<Entry> {
             crate::store::ConfigFile,
             "The config file (config.toml): [defaults] and [targets.NAME]"
         ),
-        entry!(cmd "run", cli::RunOutput, "Result of `oprobe run`"),
+        entry!(cmd "run", app::RunOutput, "Result of `oprobe run`"),
         entry!(
             cmd "plan",
-            cli::run::PlanOutput,
+            app::run::PlanOutput,
             "Result of `oprobe run --dry-run` / `tune --dry-run`"
         ),
-        entry!(cmd "tune", cli::TuneOutput, "Result of `oprobe tune`"),
+        entry!(cmd "tune", app::TuneOutput, "Result of `oprobe tune`"),
         entry!(
             cmd "compare",
             crate::analysis::compare::Comparison,
@@ -156,17 +156,17 @@ pub fn entries() -> Vec<Entry> {
         ),
         entry!(
             cmd "verify",
-            cli::verify::VerifyResult,
+            app::verify::VerifyResult,
             "Result of `oprobe verify`: confirmed, refuted or inconclusive per finding"
         ),
         entry!(
             cmd "fix",
-            cli::fix::FixOutput,
+            app::fix::FixOutput,
             "Result of `oprobe fix`: diagnose, tune, verify; a recommendation and a profile patch"
         ),
         entry!(
             cmd "baseline-calibrate",
-            cli::compare::CalibrateOutput,
+            app::compare::CalibrateOutput,
             "Result of `oprobe baseline calibrate`: the target's noise floor"
         ),
         entry!(
@@ -177,67 +177,67 @@ pub fn entries() -> Vec<Entry> {
         ),
         entry!(
             cmd "analyze",
-            cli::analyze::AnalyzeOutput,
+            app::analyze::AnalyzeOutput,
             "Result of `oprobe analyze`"
         ),
         entry!(
             cmd "watch",
-            cli::watch::WatchOutput,
+            app::watch::WatchOutput,
             "Result of `oprobe watch`"
         ),
         entry!(
             cmd "matrix",
-            cli::matrix::MatrixOutput,
+            app::matrix::MatrixOutput,
             "Result of `oprobe matrix`"
         ),
         entry!(
             cmd "matrix-plan",
-            cli::matrix::MatrixPlanOutput,
+            app::matrix::MatrixPlanOutput,
             "Result of `oprobe matrix --dry-run`"
         ),
         entry!(
             cmd "compat",
-            crate::compat::command::CompatOutput,
+            app::compat::CompatOutput,
             "Result of `oprobe compat`"
         ),
         entry!(
             cmd "compat-plan",
-            crate::compat::command::CompatPlan,
+            app::compat::CompatPlan,
             "Result of `oprobe compat --dry-run`"
         ),
         entry!(
             cmd "runs-export",
-            cli::export::ExportOutput,
+            app::export::ExportOutput,
             "Result of `oprobe runs export`"
         ),
         entry!(
             cmd "run-repeat",
-            cli::repeat::RepeatOutput,
+            app::repeat::RepeatOutput,
             "Result of `oprobe run --repeat N` / `--baseline NAME`"
         ),
         entry!(
             cmd "baseline-show",
-            cli::compare::BaselineShow,
+            app::compare::BaselineShow,
             "Result of `oprobe baseline show`"
         ),
         entry!(
             cmd "baseline-list",
-            cli::compare::BaselineList,
+            app::compare::BaselineList,
             "Result of `oprobe baseline list`"
         ),
         entry!(
             cmd "demo",
-            cli::demo::DemoOutput,
+            app::demo::DemoOutput,
             "Result of `oprobe demo`"
         ),
         entry!(
             cmd "self-update",
-            cli::self_update::UpdateOutput,
+            crate::cli::self_update::UpdateOutput,
             "Result of `oprobe self-update`"
         ),
         entry!(
             cmd "doctor",
-            cli::doctor::DoctorOutput,
+            app::doctor::DoctorOutput,
             "Result of `oprobe doctor`"
         ),
         entry!(
@@ -247,57 +247,57 @@ pub fn entries() -> Vec<Entry> {
         ),
         entry!(
             cmd "cleanup",
-            cli::misc::CleanupOutput,
+            app::misc::CleanupOutput,
             "Result of `oprobe cleanup`"
         ),
         entry!(
             cmd "lab",
-            cli::misc::LabOutput,
+            app::misc::LabOutput,
             "What `oprobe lab` serves"
         ),
         entry!(
             cmd "runs-list",
-            cli::runs::RunsList,
+            app::runs::RunsList,
             "Result of `oprobe runs list`"
         ),
         entry!(
             cmd "runs-show",
-            cli::runs::RunShow,
+            app::runs::RunShow,
             "Result of `oprobe runs show`"
         ),
         entry!(
             cmd "runs-rm",
-            cli::runs::RemovedRuns,
+            app::runs::RemovedRuns,
             "Result of `oprobe runs rm` / `runs gc`"
         ),
         entry!(
             cmd "target-list",
-            cli::settings::TargetList,
+            app::settings::TargetList,
             "Result of `oprobe target list`"
         ),
         entry!(
             cmd "target-show",
-            cli::settings::TargetShow,
+            app::settings::TargetShow,
             "Result of `oprobe target show`"
         ),
         entry!(
             cmd "target-discover",
-            cli::discover::Discovery,
+            app::discover::Discovery,
             "Result of `oprobe target discover` (MCP discover_targets): credential sources by name"
         ),
         entry!(
             cmd "target-sample",
-            cli::sample::ObjectSample,
+            app::sample::ObjectSample,
             "Result of `oprobe target sample` (MCP sample_objects): prefixes, counts and sizes"
         ),
         entry!(
             cmd "config-show",
-            cli::settings::ConfigShow,
+            app::settings::ConfigShow,
             "Result of `oprobe config show`"
         ),
         entry!(
             cmd "config-path",
-            cli::settings::ConfigPaths,
+            app::settings::ConfigPaths,
             "Result of `oprobe config path`"
         ),
         entry!(

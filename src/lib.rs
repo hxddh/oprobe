@@ -6,9 +6,12 @@
 //! bottleneck diagnosis, a measured cost model, a closed-loop tuner and a CI regression gate.
 
 pub mod analysis;
+pub mod app;
 pub mod cli;
+pub mod clients;
 pub mod compat;
 pub mod config;
+pub mod distributed;
 pub mod engine;
 pub mod errors;
 pub mod events;

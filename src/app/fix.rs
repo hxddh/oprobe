@@ -8,10 +8,11 @@ use schemars::JsonSchema;
 use serde::Serialize;
 
 use super::Ctx;
-use super::args::*;
+use super::input::*;
 use super::verify::{Hypothesis, Replayer, VerifyCfg, VerifyResult, verify_hypotheses};
 use crate::analysis::verification::{Direction, Expectation, VerifyOutcome};
 use crate::config::Knobs;
+use crate::engine::Cancel;
 use crate::errors::{ErrorCode, OprobeError};
 use crate::output::{CommandOutput, NextStep};
 use crate::report::style::{self, bold, dim, green, red, yellow};
@@ -138,13 +139,17 @@ pub fn knobs_patch(from: &Knobs, to: &Knobs) -> String {
     toml::to_string(&toml::Value::Table(root)).unwrap_or_default()
 }
 
-pub async fn cmd_fix(a: FixArgs, ctx: &Ctx) -> Result<u8> {
+/// What [`fix`] produced (fix has no dry run).
+pub type FixOutcome = FixOutput;
+
+/// `oprobe fix`: diagnose → tune → verify.
+pub async fn fix(ctx: &Ctx, a: FixRequest, cancel: Cancel) -> Result<FixOutcome> {
     let (mut profile, target_name) = if a.from.is_some() || !a.set.is_empty() {
         // `--from RUN --set …`: the workload exactly as `run --from` replays it (MCP
         // `recommend_config` passes a stored run this way, `--existing` prefix included).
-        super::run_profile(
+        super::profile::run_profile(
             ctx,
-            &RunArgs {
+            &ProfileRequest {
                 target: a.target.clone(),
                 workload: a.workload.clone(),
                 knobs: a.knobs.clone(),
@@ -152,12 +157,13 @@ pub async fn cmd_fix(a: FixArgs, ctx: &Ctx) -> Result<u8> {
                 sla: a.sla.clone(),
                 from: a.from.clone(),
                 set: a.set.clone(),
-                ..RunArgs::default()
+                label: None,
             },
         )?
     } else {
-        let (mut p, name) = super::resolve_profile(ctx, &a.target, &a.workload, &a.knobs, &a.cost)?;
-        super::apply_sla(&mut p, &a.sla)?;
+        let (mut p, name) =
+            super::profile::resolve_profile(ctx, &a.target, &a.workload, &a.knobs, &a.cost)?;
+        super::profile::apply_sla(&mut p, &a.sla)?;
         (p, name)
     };
     if a.output.label.is_some() {
@@ -188,6 +194,7 @@ pub async fn cmd_fix(a: FixArgs, ctx: &Ctx) -> Result<u8> {
         &a.safety,
         &a.output,
         guard.clone(),
+        &cancel,
     )
     .await?
     {
@@ -204,6 +211,7 @@ pub async fn cmd_fix(a: FixArgs, ctx: &Ctx) -> Result<u8> {
         &a.safety,
         &a.output,
         guard.clone(),
+        &cancel,
     )
     .await?;
     let mut rec = tuned
@@ -258,6 +266,7 @@ pub async fn cmd_fix(a: FixArgs, ctx: &Ctx) -> Result<u8> {
             safety: &a.safety,
             no_save: a.output.no_save,
             guard: guard.clone(),
+            cancel: cancel.clone(),
         };
         let v = verify_hypotheses(
             ctx,
@@ -285,7 +294,7 @@ pub async fn cmd_fix(a: FixArgs, ctx: &Ctx) -> Result<u8> {
         wrote.push(("profile".to_owned(), p.display().to_string()));
     }
     let rec_overrides = rec.overrides.clone();
-    ctx.out.finish(&FixOutput {
+    Ok(FixOutput {
         diagnosis_run_id: diag.id().to_owned(),
         finding_codes: diag
             .report

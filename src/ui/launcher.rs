@@ -7,7 +7,7 @@
 //! [`Overrides`] of the spec, and everything it does not show (dataset, mix, warmup, seed,
 //! access, rate, HTTP version, tail-cut, `--existing`, `--max-ops`, cost settings, …) is kept.
 
-use crate::cli::args::{CostArgs, KnobArgs, TargetArgs, WorkloadArgs};
+use crate::app::input::{CostInput, KnobInput, TargetInput, WorkloadInput};
 use crate::config::{Profile, TargetSpec};
 use crate::model::spec::{Overrides, REDACTED, RunSpec};
 use crate::store::{ConfigFile, RunStore};
@@ -53,9 +53,9 @@ fn err(e: impl std::fmt::Display) -> String {
 }
 
 /// Target flags the app adds to every run (`oprobe top --ca-cert … --insecure --proxy …`).
-fn launch_target_args() -> TargetArgs {
+fn launch_target_args() -> TargetInput {
     let l = crate::ui::launch();
-    TargetArgs {
+    TargetInput {
         ca_cert: l.ca_cert,
         insecure: l.insecure,
         proxy: l.proxy,
@@ -79,11 +79,11 @@ fn is_anonymous(t: &TargetSpec) -> bool {
 pub fn replay(
     spec: &RunSpec,
     cfg: &ConfigFile,
-    extra: &TargetArgs,
+    extra: &TargetInput,
 ) -> Result<(Profile, Option<String>), String> {
     let mut ta = extra.clone();
     ta.target = Some(spec.target_ref.clone());
-    let (ta, name) = crate::cli::resolve_target(&ta, cfg).map_err(err)?;
+    let (ta, name) = crate::app::profile::resolve_target(&ta, cfg).map_err(err)?;
     let url = ta
         .target
         .clone()
@@ -102,12 +102,12 @@ pub fn replay(
         tgt.proxy = st.proxy.clone();
     }
     p.target = tgt;
-    crate::cli::apply_flags(
+    crate::app::profile::apply_flags(
         &mut p,
         &ta,
-        &WorkloadArgs::default(),
-        &KnobArgs::default(),
-        &CostArgs::default(),
+        &WorkloadInput::default(),
+        &KnobInput::default(),
+        &CostInput::default(),
     )
     .map_err(err)?;
     p.validate().map_err(err)?;
@@ -218,23 +218,23 @@ impl RunForm {
     fn fresh_profile(
         &self,
         cfg: &ConfigFile,
-        extra: TargetArgs,
+        extra: TargetInput,
     ) -> Result<(Profile, Option<String>), String> {
-        let t = TargetArgs {
+        let t = TargetInput {
             target: opt(&self.target),
             endpoint: opt(&self.endpoint),
             region: opt(&self.region),
             anonymous: self.anonymous,
             ..extra
         };
-        let (t, target_name) = crate::cli::resolve_target(&t, cfg).map_err(err)?;
+        let (t, target_name) = crate::app::profile::resolve_target(&t, cfg).map_err(err)?;
         let d = &cfg.defaults;
-        let w = WorkloadArgs {
+        let w = WorkloadInput {
             preset: opt(&self.preset).or_else(|| d.preset.clone()),
             duration: opt(&self.duration).or_else(|| d.duration.clone()),
             ..Default::default()
         };
-        let k = KnobArgs {
+        let k = KnobInput {
             concurrency: num(&self.concurrency, "Concurrency")?.or(d.concurrency),
             io_concurrency: num(&self.io_concurrency, "I/O concurrency")?,
             chunk_size: opt(&self.chunk),
@@ -249,11 +249,11 @@ impl RunForm {
                     .ok_or_else(|| "Stored data must be a number of GiB".to_owned())?,
             ),
         };
-        let c = CostArgs {
+        let c = CostInput {
             stored_gib,
             ..Default::default()
         };
-        let mut profile = crate::cli::build_profile(&t, &w, &k, &c).map_err(err)?;
+        let mut profile = crate::app::profile::build_profile(&t, &w, &k, &c).map_err(err)?;
         if let Some(l) = opt(&self.label) {
             profile.name = Some(l);
         }

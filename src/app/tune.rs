@@ -8,7 +8,7 @@ use schemars::JsonSchema;
 use serde::Serialize;
 
 use super::Ctx;
-use super::args::*;
+use super::input::*;
 use super::run::{PlanOutput, guard_for, rails};
 use crate::config::Profile;
 use crate::engine::Cancel;
@@ -196,7 +196,7 @@ fn trial_wall(opts: &TuneOptions) -> std::time::Duration {
 }
 
 /// `tune --budget`: cap the trials so the estimated wall time fits `budget`.
-pub(super) fn fit_trials(opts: &mut TuneOptions, budget: std::time::Duration) -> Result<()> {
+pub fn fit_trials(opts: &mut TuneOptions, budget: std::time::Duration) -> Result<()> {
     let per = trial_wall(opts).as_secs_f64().max(1e-3);
     let fit = (budget.as_secs_f64() / per).floor() as usize;
     if fit < tune_defaults::MIN_TRIALS {
@@ -217,15 +217,15 @@ pub(super) fn fit_trials(opts: &mut TuneOptions, budget: std::time::Duration) ->
 
 /// The tuner options of `s` for `profile`: flags, then the profile's SLA, then the built-in
 /// defaults; the target's remembered capacity as the prior.
-pub(super) fn options_for(
+pub fn options_for(
     ctx: &Ctx,
     profile: &Profile,
     target_name: Option<&str>,
-    s: &TuneSearchArgs,
+    s: &TuneSearch,
 ) -> Result<TuneOptions> {
-    let mut opts = super::tune_options(
-        s.objective.objective(),
-        &super::TuneSettings {
+    let mut opts = super::profile::tune_options(
+        s.objective,
+        &super::profile::TuneSettings {
             trial_duration: &s.trial_duration,
             trial_warmup: &s.trial_warmup,
             max_trials: s.max_trials,
@@ -253,18 +253,17 @@ pub(super) fn options_for(
 /// `guard` is the command's guard ([`super::run::guard_for`]): `fix` shares one across its
 /// diagnosis, tuning and verification.
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn run_tune(
+pub async fn run_tune(
     ctx: &Ctx,
     profile: Profile,
     target_name: Option<String>,
     opts: TuneOptions,
-    safety: &SafetyArgs,
-    output: &OutputArgs,
+    safety: &Safety,
+    output: &OutputOptions,
     guard: Option<Arc<crate::guard::Guard>>,
+    cancel: &Cancel,
 ) -> Result<TuneOutput> {
     let rails = rails(ctx, &profile, safety)?;
-    let cancel = Cancel::new();
-    super::install_ctrl_c(cancel.clone());
     let quiet = ctx.out.quiet;
     let ndjson = ctx.out.format == OutputFormat::Ndjson;
     // The trial lines are report content: stdout in text mode (even with `-q`); otherwise
@@ -341,7 +340,7 @@ pub(super) async fn run_tune(
             rails,
             guard,
             output,
-            cancel: &cancel,
+            cancel,
             mode: Mode::Tune { opts, on_event },
         },
     )
@@ -362,10 +361,20 @@ pub(super) async fn run_tune(
     })
 }
 
-pub async fn cmd_tune(a: TuneArgs, ctx: &Ctx) -> Result<u8> {
+/// What [`tune`] produced.
+#[derive(Clone, Debug)]
+pub enum TuneOutcome {
+    /// `safety.dry_run`: the plan of the whole search.
+    Plan(Box<PlanOutput>),
+    Tuned(Box<TuneOutput>),
+}
+
+/// `oprobe tune`: search, write the requested files, and return the result (the CLI prints
+/// [`trial_table`] before it in text mode).
+pub async fn tune(ctx: &Ctx, a: TuneRequest, cancel: Cancel) -> Result<TuneOutcome> {
     let (mut profile, target_name) =
-        super::resolve_profile(ctx, &a.target, &a.workload, &a.knobs, &a.cost)?;
-    super::apply_sla(&mut profile, &a.sla)?;
+        super::profile::resolve_profile(ctx, &a.target, &a.workload, &a.knobs, &a.cost)?;
+    super::profile::apply_sla(&mut profile, &a.sla)?;
     if a.output.label.is_some() {
         profile.name = a.output.label.clone();
     }
@@ -394,7 +403,7 @@ pub async fn cmd_tune(a: TuneArgs, ctx: &Ctx) -> Result<u8> {
         p.workload.warmup = crate::util::HumanDuration(opts.trial.warmup * opts.max_trials as u32);
         let mut plan = r.plan(&p);
         plan.eta_s = plan.eta_s.max(eta);
-        return ctx.out.finish(&PlanOutput { plan });
+        return Ok(TuneOutcome::Plan(Box::new(PlanOutput { plan })));
     }
     ctx.out.info(dim(&format!(
         "tuning: up to {} trials of {}{} · ETA ≤ {:.0}s plus dataset upload",
@@ -406,7 +415,17 @@ pub async fn cmd_tune(a: TuneArgs, ctx: &Ctx) -> Result<u8> {
         eta
     )));
     let guard = guard_for(ctx, &profile, &super::run::budgets(ctx, &a.safety)?);
-    let mut out = run_tune(ctx, profile, target_name, opts, &a.safety, &a.output, guard).await?;
+    let mut out = run_tune(
+        ctx,
+        profile,
+        target_name,
+        opts,
+        &a.safety,
+        &a.output,
+        guard,
+        &cancel,
+    )
+    .await?;
     let header = format!("{} · {}", out.tune.headline, crate::util::now_rfc3339());
     let rec = out.recommendation.clone();
     if let Some(p) = &a.emit_profile {
@@ -444,10 +463,5 @@ pub async fn cmd_tune(a: TuneArgs, ctx: &Ctx) -> Result<u8> {
         out.wrote
             .push(("python".to_owned(), p.display().to_string()));
     }
-    // The search is report content: print the full trial table before the result.
-    if ctx.out.format == OutputFormat::Text {
-        println!("\n{}", dim("TRIALS (★ recommended, ◆ Pareto front)"));
-        print!("{}", trial_table(&out.tune));
-    }
-    ctx.out.finish(&out)
+    Ok(TuneOutcome::Tuned(Box::new(out)))
 }
