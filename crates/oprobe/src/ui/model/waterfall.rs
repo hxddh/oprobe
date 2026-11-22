@@ -261,7 +261,11 @@ mod tests {
             t_us: 1_000,
             ..op(61_000, "read", true)
         };
-        let ops = vec![op(10_000, "read", true), op(11_000, "read", true), op(12_000, "read", true)];
+        let ops = vec![
+            op(10_000, "read", true),
+            op(11_000, "read", true),
+            op(12_000, "read", true),
+        ];
         let w = build(&o, &[(5, &b), (4, &a)], &ops);
         assert_eq!(w.bars.len(), 3);
         assert_eq!(w.bars[0].req, Some(4));
@@ -295,6 +299,9 @@ mod tests {
         let crit: Vec<bool> = w.bars.iter().map(|b| b.critical).collect();
         assert_eq!(crit, vec![false, true, true]);
         assert!(w.typical.is_none());
-        assert_eq!(slowest_op(&[op(5, "a", true), op(9, "a", true)], None), Some(1));
+        assert_eq!(
+            slowest_op(&[op(5, "a", true), op(9, "a", true)], None),
+            Some(1)
+        );
     }
 }

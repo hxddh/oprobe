@@ -312,7 +312,13 @@ mod tests {
         let g = gate(
             GateVerdict::Regression,
             vec![
-                check("throttled_request_ratio", Status::Improved, 0.0458, 0.0001, None),
+                check(
+                    "throttled_request_ratio",
+                    Status::Improved,
+                    0.0458,
+                    0.0001,
+                    None,
+                ),
                 check("throughput", Status::Fail, 1480.0, 1175.0, Some(0.1)),
             ],
         );
@@ -322,16 +328,25 @@ mod tests {
         assert!(s.starts_with("traded: Throttled requests"), "{s}");
         assert!(s.contains("Throughput -20.6 %"), "{s}");
         let none = gate(GateVerdict::NotComparable, Vec::new());
-        assert_eq!(net_of_gate(&none, |_| None).verdict, NetVerdict::Inconclusive);
+        assert_eq!(
+            net_of_gate(&none, |_| None).verdict,
+            NetVerdict::Inconclusive
+        );
     }
 
     #[test]
     fn one_scale_for_every_judgement() {
-        assert_eq!(run_level(VerdictLevel::Attention).1, severity(Severity::Warning).1);
+        assert_eq!(
+            run_level(VerdictLevel::Attention).1,
+            severity(Severity::Warning).1
+        );
         assert_eq!(run_level(VerdictLevel::Attention).0, "Warning");
         assert_eq!(run_level(VerdictLevel::Critical).1, Level::Crit);
         assert_eq!(net(NetVerdict::Inconclusive).1, Level::Inconclusive);
-        assert_eq!(metric_name("latency_p99.read.range"), "p99 latency (read.range)");
+        assert_eq!(
+            metric_name("latency_p99.read.range"),
+            "p99 latency (read.range)"
+        );
         assert_eq!(metric_name("ops_per_s"), "Throughput");
         assert_eq!(metric_name("summary_weird_thing"), "summary weird thing");
     }

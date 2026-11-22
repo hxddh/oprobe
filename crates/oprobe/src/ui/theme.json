@@ -49,12 +49,13 @@
       "stage-server": "#8e44d8",
       "stage-download": "#0f9d8f",
       "stage-stall": "#d6336c",
-      "stage-retry": "#c81e1e",
+      "stage-retry": "#9a5b2e",
       "stage-client": "#8a8a92",
       "ok": "#1f9d55",
       "warn": "#b86e00",
       "crit": "#d70015",
-      "info": "#0a6ccf"
+      "info": "#0a6ccf",
+      "inconclusive": "#6b6b9a"
     },
     "dark": {
       "background": "#1e1e20",
@@ -99,12 +100,13 @@
       "stage-server": "#b47cf0",
       "stage-download": "#34d1bf",
       "stage-stall": "#f06595",
-      "stage-retry": "#ff5c5c",
+      "stage-retry": "#d4955f",
       "stage-client": "#8a8a92",
       "ok": "#3ecf7a",
       "warn": "#f2b33d",
       "crit": "#ff5c5c",
-      "info": "#5b9bff"
+      "info": "#5b9bff",
+      "inconclusive": "#a5a5cf"
     }
   }
 }

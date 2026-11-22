@@ -1,5 +1,7 @@
 //! The request heatmap (time × log latency) with a brush: drag across it to select a time
 //! window and a latency floor; the selection's outlier attribution opens in the inspector.
+//! The brush is keyboard-accessible too (U15): `[` `]` move it in time, `{` `}` lower or raise
+//! its latency floor ([`nudge`]).
 
 use std::rc::Rc;
 
@@ -25,6 +27,63 @@ fn scales(h: &ReqHeatmap) -> (Scale, Scale) {
         .map(|b| (b * 2.0).max(lo * 10.0))
         .unwrap_or(1000.0);
     (x, Scale::log(lo, hi))
+}
+
+/// The brush after key `key` (`[` earlier, `]` later, `{` lower floor, `}` higher floor),
+/// from `brush` (a tenth of the run, from its start or end, when there is none yet).
+pub fn nudge(h: &ReqHeatmap, brush: Option<Brush>, key: char) -> Option<Brush> {
+    let total = h.bucket_s * h.columns as f64;
+    if total <= 0.0 {
+        return None;
+    }
+    let tenth = (total / 10.0).max(h.bucket_s);
+    let mut b = brush.unwrap_or(match key {
+        ']' => Brush {
+            from_s: (total - tenth).max(0.0),
+            to_s: total,
+            min_ms: 0.0,
+        },
+        '[' => Brush {
+            from_s: 0.0,
+            to_s: tenth,
+            min_ms: 0.0,
+        },
+        _ => Brush {
+            from_s: 0.0,
+            to_s: total,
+            min_ms: 0.0,
+        },
+    });
+    let w = (b.to_s - b.from_s).max(h.bucket_s);
+    match (key, brush.is_some()) {
+        ('[', true) => {
+            b.from_s = (b.from_s - w).max(0.0);
+            b.to_s = b.from_s + w;
+        }
+        (']', true) => {
+            b.to_s = (b.to_s + w).min(total);
+            b.from_s = (b.to_s - w).max(0.0);
+        }
+        ('{', _) => {
+            b.min_ms = h
+                .bounds_ms
+                .iter()
+                .rev()
+                .find(|x| **x < b.min_ms)
+                .copied()
+                .unwrap_or(0.0);
+            if b.min_ms <= h.bounds_ms.first().copied().unwrap_or(0.0) {
+                b.min_ms = 0.0;
+            }
+        }
+        ('}', _) => {
+            if let Some(x) = h.bounds_ms.iter().find(|x| **x > b.min_ms) {
+                b.min_ms = *x;
+            }
+        }
+        _ => {}
+    }
+    Some(b)
 }
 
 /// Paint the heatmap and the brush.
@@ -139,7 +198,7 @@ pub fn heatmap(
                 .items_center()
                 .child(caption("REQUEST LATENCY OVER TIME"))
                 .child(small(
-                    "drag to select · the inspector shows what sets them apart",
+                    "drag to select, or [ ] { } from the keyboard · the inspector shows what sets them apart",
                 )),
         )
         .child(
@@ -182,4 +241,42 @@ pub fn heatmap(
             })
             .on_responder_terminate(move |_: &ResponderEvent| drag.set(None)),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn heat() -> ReqHeatmap {
+        ReqHeatmap {
+            bucket_s: 0.5,
+            columns: 20,
+            bounds_ms: vec![0.1, 1.0, 10.0, 100.0],
+            counts: vec![0; 80],
+            max: 0,
+        }
+    }
+
+    #[test]
+    fn the_brush_moves_and_resizes_from_the_keyboard() {
+        let h = heat();
+        let b = nudge(&h, None, ']').unwrap();
+        assert_eq!((b.from_s, b.to_s, b.min_ms), (9.0, 10.0, 0.0));
+        let b = nudge(&h, Some(b), '[').unwrap();
+        assert_eq!((b.from_s, b.to_s), (8.0, 9.0));
+        let b = nudge(&h, Some(b), '}').unwrap();
+        assert_eq!(b.min_ms, 0.1);
+        let b = nudge(&h, Some(b), '}').unwrap();
+        assert_eq!(b.min_ms, 1.0);
+        let b = nudge(&h, Some(b), '{').unwrap();
+        assert_eq!(b.min_ms, 0.0);
+        // It stays inside the run.
+        let mut b = nudge(&h, None, '[').unwrap();
+        for _ in 0..30 {
+            b = nudge(&h, Some(b), '[').unwrap();
+        }
+        assert_eq!(b.from_s, 0.0);
+        let empty = ReqHeatmap::default();
+        assert!(nudge(&empty, None, '[').is_none());
+    }
 }

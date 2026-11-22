@@ -89,8 +89,22 @@ impl Ctx {
     }
 }
 
+/// From the target's Health (the main screen at start), open its newest run.
+fn open_run(app: &mut Headless) {
+    wait_long(app, "role:button[Open Latest Run]");
+    app.press("role:button[Open Latest Run]").unwrap();
+}
+
 /// Open an inspector tab once the run has loaded.
 fn tab(app: &mut Headless, name: &str) {
+    if app
+        .screen()
+        .count("role:button[Open Latest Run]")
+        .unwrap_or(0)
+        > 0
+    {
+        open_run(app);
+    }
     wait_long(app, &format!("text:{name}"));
     app.press(&format!("text:{name}")).unwrap();
 }
@@ -202,7 +216,8 @@ fn brushing_the_heatmap_explains_the_selection() {
     let cx = Ctx::new();
     cx.seed("memory://", 1, "4");
     let mut app = cx.start();
-    app.wait_for("id:heatmap").unwrap();
+    open_run(&mut app);
+    wait_long(&mut app, "id:heatmap");
     app.drag("id:heatmap", point(px(-250.0), px(-40.0)))
         .unwrap();
     app.wait_for("text:What is different about these requests")
@@ -414,6 +429,7 @@ fn single_letter_shortcuts_stay_out_of_text_fields() {
     let a = cx.seed("memory://", 1, "2");
     let b = cx.seed("memory://", 1, "2");
     let mut app = cx.start_on(Idiom::Terminal, Size::new(Points(960.0), Points(480.0)));
+    open_run(&mut app);
     wait_long(&mut app, "text:WHERE OPERATION TIME GOES");
     // `/` focuses the filter; keys pressed there must not run `c` (compare), `n` (new run),
     // `r` (run again) or `v` (verify): the keymap leaves them to the field.
@@ -453,6 +469,7 @@ fn rerun_replays_the_runs_spec_without_loss() {
     let id = cx.seed("memory://", 1, "3");
     let before = load(&cx.store(), &id).report.spec;
     let mut app = cx.start();
+    open_run(&mut app);
     wait_long(&mut app, "text:WHERE OPERATION TIME GOES");
     app.press("role:button[Re-run]").unwrap();
     wait_until(&mut app, 120, "the re-run is saved", |_| {
@@ -476,6 +493,7 @@ fn compare_pairs_the_same_target_and_workload_by_default() {
     cx.seed("memory://", 2, "2");
     let c = cx.seed("memory://", 1, "2");
     let mut app = cx.start();
+    open_run(&mut app);
     wait_long(&mut app, "text:WHERE OPERATION TIME GOES");
     app.press("role:button[Compare] >> nth=0").unwrap();
     wait_long(&mut app, &format!("text:{a} → {c}"));
@@ -529,6 +547,7 @@ fn the_terminal_at_120x30_keeps_tabs_visible_and_tiles_unwrapped() {
     let cx = Ctx::new();
     cx.seed("memory://", 1, "2");
     let mut app = cx.start_on(Idiom::Terminal, Size::new(Points(960.0), Points(480.0)));
+    open_run(&mut app);
     wait_long(&mut app, "text:WHERE OPERATION TIME GOES");
     let texts = text_bounds(&app);
     let find = |label: &str| {

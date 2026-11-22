@@ -7,8 +7,8 @@
 //! repeats for a statistically stronger verdict.
 
 use crate::analysis::verification::{Direction, Expectation, VerifyOutcome};
+use crate::app::verify::metric_value as metric;
 use crate::model::Report;
-use crate::ui::model::metrics::metric;
 
 /// What the verify run says about the hypothesis.
 #[derive(Clone, Debug, PartialEq)]

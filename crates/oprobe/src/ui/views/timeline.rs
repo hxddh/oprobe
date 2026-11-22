@@ -1,6 +1,10 @@
 //! Timeline: a waterfall of operations (one row each, virtualized) with their requests drawn
 //! by stage on a shared time axis; zoom (buttons, slider, wheel on the axis, pinch) and pan
-//! (horizontal wheel, drag on the axis); a click inspects the operation.
+//! (horizontal wheel, drag on the axis); a click opens the operation's waterfall.
+//!
+//! It opens on the p99 operations, slowest first (U8): the ones worth reading, not ten
+//! thousand dots in start order. Retries draw their backoff in the retry colour, with a legend
+//! entry.
 
 use nsh_base::{slider, theme};
 use nsh_core::prelude::*;
@@ -88,8 +92,35 @@ fn paint_row(v: &RunView, op_i: u32, win: (f64, f64), w: f32, selected: bool) ->
             ROW_H - 6.0,
         )
         .global_alpha(1.0);
-    // Requests in up to three lanes.
+    // Requests in up to three lanes; the wait before a retry in the retry colour.
     let reqs = v.reqs_of_op_index(op_i);
+    for &ri in reqs {
+        let r = &v.run.reqs[ri as usize];
+        if r.attempt < 2 {
+            continue;
+        }
+        let prev = reqs
+            .iter()
+            .map(|&x| &v.run.reqs[x as usize])
+            .find(|x| x.api == r.api && x.attempt + 1 == r.attempt);
+        if let Some(pr) = prev {
+            let (a, b) = (
+                (pr.t_us as f64 + pr.total_us as f64) / 1e6,
+                r.t_us as f64 / 1e6,
+            );
+            if b > a {
+                let (xa, xb) = (x_of(win, w, a), x_of(win, w, b));
+                if xb >= 0.0 && xa <= w {
+                    p = p.fill_color(paint(stage_token("retry"))).fill_rect(
+                        xa.max(0.0),
+                        ROW_H / 2.0 - 0.75,
+                        (xb.min(w) - xa.max(0.0)).max(1.0),
+                        1.5,
+                    );
+                }
+            }
+        }
+    }
     let mut lane_end = [f64::MIN; 3];
     for &ri in reqs {
         let r = &v.run.reqs[ri as usize];
@@ -209,6 +240,7 @@ fn legend() -> View {
             ("send", "send"),
             ("ttfb", "server"),
             ("body", "transfer"),
+            ("retry", "retry backoff"),
         ]
         .into_iter()
         .map(|(st, label)| {
@@ -224,7 +256,8 @@ fn legend() -> View {
 
 pub fn timeline() -> impl IntoElement {
     let s = store();
-    let count = move || {
+    let count = move || s.tl_order.with(|o| o.0.len());
+    let all = move || {
         s.current
             .with(|c| c.as_ref().map(|c| c.op_order.len()).unwrap_or(0))
     };
@@ -300,6 +333,22 @@ pub fn timeline() -> impl IntoElement {
                         }),
                 )
                 .child(btn("Fit", || Kind::Plain, move || s.tl_window.set(None)).accessibility_label("Fit the whole run"))
+                .child(
+                    btn(
+                        move || if s.tl_p99_only.get() { "p99 operations" } else { "All operations" },
+                        || Kind::Plain,
+                        move || s.tl_p99_only.update(|v| *v = !*v),
+                    )
+                    .accessibility_label("Show only the p99 operations, or all"),
+                )
+                .child(
+                    btn(
+                        move || if s.tl_slowest.get() { "Slowest first" } else { "By start time" },
+                        || Kind::Plain,
+                        move || s.tl_slowest.update(|v| *v = !*v),
+                    )
+                    .accessibility_label("Order the operations by duration or by start"),
+                )
                 .child(small(range_label).tabular_nums().test_id("timeline-range"))
                 .child(view().flex_1())
                 .child(legend()),
@@ -314,7 +363,13 @@ pub fn timeline() -> impl IntoElement {
                         .w(px(LABEL_W))
                         .px_3()
                         .justify_center()
-                        .child(small(move || format!("{} operations", fmt::compact(count() as f64)))),
+                        .child(small(move || {
+                            if count() == all() {
+                                format!("{} operations", fmt::compact(count() as f64))
+                            } else {
+                                format!("{} of {} operations", fmt::compact(count() as f64), fmt::compact(all() as f64))
+                            }
+                        })),
                 )
                 .child(axis(s)),
         )
@@ -329,9 +384,7 @@ pub fn timeline() -> impl IntoElement {
                 // An operation inspected elsewhere (Reveal in Timeline): bring its row into view.
                 effect(move || {
                     let Inspect::Op(i) = s.inspect.get() else { return };
-                    let pos = untracked(|| {
-                        s.current.with(|c| c.as_ref().and_then(|c| c.op_order.iter().position(|o| *o == i)))
-                    });
+                    let pos = untracked(|| s.tl_order.with(|o| o.0.iter().position(|x| *x == i)));
                     if let Some(pos) = pos {
                         list.scroll_to_index(pos as u32, percentage(0.3), px(0.0), true);
                     }
@@ -341,24 +394,20 @@ pub fn timeline() -> impl IntoElement {
                     .on_pinch(move |e: &PinchEvent| zoom(s, 1.0 / (1.0 + e.delta.0 as f64), 0.5))
                     .child(
                         virtual_list(count, move |at| {
-                            let op_i = move || {
-                                s.current.with(|c| {
-                                    c.as_ref().and_then(|c| c.op_order.get(at.index()).copied())
-                                })
-                            };
+                            let op_i = move || s.tl_order.with(|o| o.0.get(at.index()).copied());
                             let label = move || {
+                                let Some(i) = op_i() else { return String::new() };
                                 s.current.with(|c| {
                                     let c = c.as_ref()?;
-                                    let i = *c.op_order.get(at.index())?;
                                     let o = c.run.ops.get(i as usize)?;
                                     Some(format!("{} {}", o.verb, o.key.rsplit('/').next().unwrap_or("")))
                                 })
                                 .unwrap_or_default()
                             };
                             let lat = move || {
+                                let Some(i) = op_i() else { return String::new() };
                                 s.current.with(|c| {
                                     let c = c.as_ref()?;
-                                    let i = *c.op_order.get(at.index())?;
                                     c.run.ops.get(i as usize).map(|o| fmt::dur_us(o.latency_us as f64))
                                 })
                                 .unwrap_or_default()
@@ -370,7 +419,7 @@ pub fn timeline() -> impl IntoElement {
                                 .accessibility_label(move || Some(SharedString::from(format!("{} · {}", label(), lat()))))
                                 .on_press(move || {
                                     if let Some(i) = op_i() {
-                                        s.inspect.set(Inspect::Op(i));
+                                        s.inspect_op(i);
                                     }
                                 })
                                 .hover(|st| st.bg(move || theme().secondary))
@@ -419,6 +468,6 @@ pub fn timeline() -> impl IntoElement {
                 .py_1()
                 .border_t_1()
                 .border_color(move || theme().border)
-                .child(body("Each row is an operation; bars are its requests by stage. Wheel or drag on the axis to zoom and pan.").text_size(px(11.0)).text_color(move || theme().muted_foreground)),
+                .child(body("Each row is an operation; bars are its requests by stage, the thin line a retry's backoff. Press a row for its waterfall; wheel or drag on the axis to zoom and pan.").text_size(crate::ui::kit::sz(11.0)).text_color(move || theme().muted_foreground)),
         )
 }

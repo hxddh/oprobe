@@ -196,7 +196,8 @@ pub fn health(
         band(&base_runs.iter().filter_map(|r| f(r)).collect::<Vec<_>>())
     };
     let first = mine.first().copied();
-    let ops = |r: &RunSummary| (!crate::ui::model::runs::stopped_in_warmup(r)).then_some(r.ops_per_s);
+    let ops =
+        |r: &RunSummary| (!crate::ui::model::runs::stopped_in_warmup(r)).then_some(r.ops_per_s);
     let p99 = |r: &RunSummary| (!crate::ui::model::runs::stopped_in_warmup(r)).then_some(r.p99_ms);
     let thr = |r: &RunSummary| r.throttled_request_ratio;
     let cost = |r: &RunSummary| r.cost_per_month_usd;
@@ -217,9 +218,8 @@ pub fn health(
             value: first.and_then(f).map(show).unwrap_or_else(|| "—".into()),
             series: series(f),
             band: b,
-            band_text: b.map(|(lo, hi)| {
-                trf("app.tile.baseline", &[("lo", &show(lo)), ("hi", &show(hi))])
-            }),
+            band_text: b
+                .map(|(lo, hi)| trf("app.tile.baseline", &[("lo", &show(lo)), ("hi", &show(hi))])),
             level,
         }
     };
@@ -269,7 +269,9 @@ pub fn health(
             }
         })
         .collect();
-    let hs = latest.map(|r| r.capacity.hypotheses.as_slice()).unwrap_or(&[]);
+    let hs = latest
+        .map(|r| r.capacity.hypotheses.as_slice())
+        .unwrap_or(&[]);
     Health {
         target: key.to_owned(),
         latest: first.map(|r| r.id.clone()),
@@ -334,7 +336,11 @@ mod tests {
         assert_eq!(h.tiles[3].value, "—");
         assert_eq!(h.history.len(), 4);
         assert_eq!(h.history[0].title, "Today 10:00");
-        assert!(h.history[0].detail.starts_with("parquet · Healthy · "), "{}", h.history[0].detail);
+        assert!(
+            h.history[0].detail.starts_with("parquet · Healthy · "),
+            "{}",
+            h.history[0].detail
+        );
         // r1 changed the workload against r0; r2 changed it back.
         assert_eq!(h.history[2].annotations, vec!["config changed: workload"]);
         assert_eq!(h.history[1].annotations, vec!["config changed: workload"]);
@@ -359,9 +365,18 @@ mod tests {
             },
         ];
         let h = health("prod", &runs(), &[], Some(&rep), "2026-11-23");
-        assert!(h.hypothesis.starts_with("rate limit: throttling starts at 3 400"), "{}", h.hypothesis);
+        assert!(
+            h.hypothesis
+                .starts_with("rate limit: throttling starts at 3 400"),
+            "{}",
+            h.hypothesis
+        );
         assert_eq!(h.alternatives.len(), 1);
-        assert!(h.alternatives[0].starts_with("in-flight limit"), "{:?}", h.alternatives);
+        assert!(
+            h.alternatives[0].starts_with("in-flight limit"),
+            "{:?}",
+            h.alternatives
+        );
         if rep.findings.iter().any(|f| f.verification.is_some()) {
             let a = h.action.unwrap();
             assert!(a.label.starts_with("Fix: "), "{}", a.label);
@@ -376,5 +391,36 @@ mod tests {
         assert_eq!(annotations(&b, Some(&a)), vec!["verify of a"]);
         a.label = Some("tuned settings".into());
         assert_eq!(annotations(&a, None), vec!["tuned settings"]);
+    }
+}
+
+/// A sparkline of `values` in block characters (`▁▂▃▅▇`), oldest first: honest in a terminal
+/// and a window alike (no braille grid — U4).
+pub fn sparkline(values: &[f64]) -> String {
+    const BARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let lo = values.iter().copied().fold(f64::INFINITY, f64::min);
+    let hi = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    if !lo.is_finite() || !hi.is_finite() {
+        return String::new();
+    }
+    values
+        .iter()
+        .map(|v| {
+            if hi - lo < 1e-12 {
+                BARS[3]
+            } else {
+                BARS[(((v - lo) / (hi - lo)) * 7.0).round().clamp(0.0, 7.0) as usize]
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod spark_tests {
+    #[test]
+    fn sparklines_span_their_range() {
+        assert_eq!(super::sparkline(&[1.0, 2.0, 3.0]), "▁▅█");
+        assert_eq!(super::sparkline(&[5.0, 5.0]), "▄▄");
+        assert_eq!(super::sparkline(&[]), "");
     }
 }

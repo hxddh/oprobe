@@ -1,6 +1,8 @@
 //! Comparing two runs: the regression gate's checks and config differences — the same
-//! [`crate::analysis::compare`] as `oprobe compare` and MCP `compare_runs`, significance
-//! included — plus which findings appeared, went away or stayed.
+//! [`crate::analysis::compare`] as `oprobe compare` and MCP `compare_runs` (the store asks
+//! [`crate::app::App::compare`]), significance included — plus which findings appeared, went
+//! away or stayed, and the one net verdict Compare and Verify both show
+//! ([`crate::ui::model::verdicts::net_of`]).
 
 use crate::model::{Finding, Report, Run};
 use crate::report::diff::{DiffReport, Thresholds};
@@ -26,6 +28,10 @@ impl FindingChange {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Comparison {
     pub diff: DiffReport,
+    /// The comparison as `oprobe compare` returns it (statistics, net verdict).
+    pub full: Box<crate::analysis::compare::Comparison>,
+    /// What the change did overall: the analysis's net verdict, else read off the gate.
+    pub net: crate::analysis::verdict::NetAssessment,
     pub findings: Vec<(FindingChange, Finding)>,
     /// Why the two runs are not comparable (design v4 §7: a different target identity or
     /// workload hash); empty when they are. A non-comparable pair gets no regression verdict.
@@ -97,15 +103,24 @@ fn j<T: serde::Serialize>(v: &T) -> String {
 
 /// Compare `base` (A) with `cand` (B) with the CLI's default thresholds.
 pub fn compare(base_run: &Run, cand_run: &Run) -> Comparison {
-    let d = crate::analysis::compare::compare(
+    let full = crate::analysis::compare::compare(
         std::slice::from_ref(base_run),
         std::slice::from_ref(cand_run),
         base_run.id(),
         cand_run.id(),
         &Thresholds::default(),
-    )
-    .gate;
-    let (base, cand) = (&base_run.report, &cand_run.report);
+    );
+    of_core(full, &base_run.report, &cand_run.report)
+}
+
+/// The App's comparison of a core comparison (`App::compare`) of `base` and `cand`.
+pub fn of_core(
+    full: crate::analysis::compare::Comparison,
+    base: &Report,
+    cand: &Report,
+) -> Comparison {
+    let net = crate::ui::model::verdicts::net_of(&full);
+    let d = full.gate.clone();
     let mut findings = Vec::new();
     for f in &cand.findings {
         let change = if base.findings.iter().any(|b| b.code == f.code) {
@@ -123,6 +138,8 @@ pub fn compare(base_run: &Run, cand_run: &Run) -> Comparison {
     findings.sort_by_key(|(c, f)| (*c as u8, std::cmp::Reverse(f.severity)));
     Comparison {
         diff: d,
+        full: Box::new(full),
+        net,
         findings,
         not_comparable: not_comparable(base, cand),
     }

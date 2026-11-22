@@ -18,7 +18,7 @@ use crate::tune::Trial;
 use crate::ui::bridge::{self, Job, Outcome, RunRequest, TunedExtras, off_thread};
 use crate::ui::kit::Tone;
 use crate::ui::launcher::RunForm;
-use crate::ui::model::compare::{Comparison, compare};
+use crate::ui::model::compare::Comparison;
 use crate::ui::model::requests::{Col, Filter, sort};
 use crate::ui::model::run::{RunView, Shared};
 use crate::ui::model::series::Series;
@@ -32,6 +32,8 @@ pub enum Mode {
     /// First run: no runs in the store.
     #[default]
     Welcome,
+    /// A target's health (design v5 §9: the main screen).
+    Health,
     /// The run inspector (a stored run, or the live one).
     Run,
     Compare,
@@ -283,6 +285,8 @@ pub struct Store {
     pub targets: Signal<Vec<(String, String)>>,
     pub baselines: Signal<Vec<(String, Vec<String>)>>,
     pub sel: Signal<Sel>,
+    /// The target the Health screen shows (its name, or URL for unnamed targets).
+    pub health_target: Signal<Option<String>>,
     pub current: Signal<Option<Shared>>,
     pub loading: Signal<bool>,
     /// Runs marked for comparison in the sidebar (at most two).
@@ -299,6 +303,8 @@ pub struct Store {
     pub tl_window: Signal<Option<(f64, f64)>>,
     pub brush: Signal<Option<Brush>>,
     pub log_latency: Signal<bool>,
+    /// The app's text scale (Settings → Text Size).
+    pub text_scale: Signal<f32>,
     pub prefs: Signal<Prefs>,
     pub overlay: Signal<Option<Overlay>>,
     pub form: Form,
@@ -309,6 +315,15 @@ pub struct Store {
     pub probe_endpoint: Signal<String>,
     /// The Requests filter field (the terminal's `/` focuses it).
     pub filter_ref: ElementRef,
+    /// The main area: the keyboard focus returns here when an overlay closes.
+    pub main_ref: ElementRef,
+    /// The Timeline's rows: operation indices, slowest first or in start order, all of them or
+    /// only the p99 tail (U8).
+    pub tl_order: Memo<Rows>,
+    /// The Timeline lists the slowest operations first (else in start order).
+    pub tl_slowest: Signal<bool>,
+    /// The Timeline lists only the operations at or above the run's p99.
+    pub tl_p99_only: Signal<bool>,
     pub tune_objective: Signal<Option<SharedString>>,
     pub tune_trial: Signal<String>,
     pub tune_max: Signal<String>,
@@ -380,6 +395,21 @@ impl Store {
                 Rows(Arc::new(idx))
             })
         });
+        let tl_slowest = signal(true);
+        let tl_p99_only = signal(true);
+        let tl_order = computed(move || {
+            let slowest = tl_slowest.get();
+            let tail = tl_p99_only.get();
+            current.with(|c| {
+                let Some(v) = c else { return Rows::default() };
+                Rows(Arc::new(crate::ui::model::run::timeline_order(
+                    &v.run.ops,
+                    &v.op_order,
+                    slowest,
+                    tail,
+                )))
+            })
+        });
         let form = Form {
             target: signal(
                 launch
@@ -436,6 +466,7 @@ impl Store {
             targets: signal(Vec::new()),
             baselines: signal(Vec::new()),
             sel: signal(Sel::None),
+            health_target: signal(None),
             current,
             loading: signal(false),
             marked: signal(Vec::new()),
@@ -450,6 +481,7 @@ impl Store {
             tl_window: signal(None),
             brush: signal(None),
             log_latency: signal(prefs.log_latency),
+            text_scale: signal(prefs.text_scale()),
             prefs: signal(prefs),
             overlay: signal(None),
             form,
@@ -459,6 +491,10 @@ impl Store {
             probe: signal(None),
             probe_endpoint: signal(String::new()),
             filter_ref: element_ref(),
+            main_ref: element_ref(),
+            tl_order,
+            tl_slowest,
+            tl_p99_only,
             tune_objective: signal(Some("throughput".into())),
             tune_trial: signal(tune.trial_duration.to_string()),
             tune_max: signal(tune.max_trials.to_string()),
@@ -480,10 +516,27 @@ impl Store {
             root: Owner::current(),
         };
         s.refresh();
-        // Open the newest run (or the welcome view when there is none).
-        if let Some(first) = s.runs.with_untracked(|r| r.first().map(|r| r.id.clone())) {
-            s.select_run(&first);
+        // The newest target's health (the main screen), or the newest run when the app was
+        // last left on a run (or the welcome view when there is none).
+        if let Some(first) = s.runs.with_untracked(|r| r.first().cloned()) {
+            if s.prefs.with_untracked(|p| p.start_on_run) {
+                s.select_run(&first.id);
+            } else {
+                s.show_health(Some(crate::ui::model::health::target_key(&first)));
+            }
         }
+        // Remember whether the app was left on a target's health or on a run.
+        effect(move || {
+            let m = s.mode.get();
+            if matches!(m, Mode::Health | Mode::Run) {
+                let on_run = m == Mode::Run;
+                untracked(|| {
+                    if s.prefs.with(|p| p.start_on_run != on_run) {
+                        s.update_prefs(|p| p.start_on_run = on_run);
+                    }
+                });
+            }
+        });
         // A target given on the command line: straight to the New Run sheet.
         if launch.target.is_some() {
             s.overlay.set(Some(Overlay::NewRun));
@@ -585,17 +638,46 @@ impl Store {
 
     /// Show a stored run.
     pub fn select_run(&self, id: &str) {
+        self.load_run(id, Mode::Run);
+    }
+
+    /// The health of target `key` (the newest run's target when `None`): its newest run is
+    /// loaded for the hypothesis and the primary action.
+    pub fn show_health(&self, key: Option<String>) {
+        use crate::ui::model::health::target_key;
+        let runs = self.runs.get_untracked();
+        let key = key.or_else(|| {
+            match self.sel.get_untracked() {
+                Sel::Run(id) => runs.iter().find(|r| r.id == id),
+                _ => None,
+            }
+            .or(runs.first())
+            .map(target_key)
+        });
+        let Some(key) = key else {
+            self.mode.set(Mode::Welcome);
+            return;
+        };
+        self.health_target.set(Some(key.clone()));
+        match runs.iter().find(|r| target_key(r) == key) {
+            Some(r) => self.load_run(&r.id.clone(), Mode::Health),
+            None => self.mode.set(Mode::Health),
+        }
+    }
+
+    /// Load run `id` and show it as `mode` (the inspector, or a target's health).
+    pub fn load_run(&self, id: &str, mode: Mode) {
         if self.sel.get_untracked() == Sel::Run(id.to_owned())
             && self
                 .current
                 .with_untracked(|c| c.as_ref().is_some_and(|c| c.id() == id))
         {
-            self.mode.set(Mode::Run);
+            self.mode.set(mode);
             return;
         }
         batch(|| {
             self.sel.set(Sel::Run(id.to_owned()));
-            self.mode.set(Mode::Run);
+            self.mode.set(mode);
             self.inspect.set(Inspect::None);
             self.brush.set(None);
             self.tl_window.set(None);
@@ -1424,7 +1506,21 @@ impl Store {
 
     /// Notification and badge when the window is not in front.
     fn finished_in_background(&self, title: &str, body: &str) {
-        if self.focused.get_untracked() || kit_in_terminal() {
+        if kit_in_terminal() {
+            // A terminal has no notification center: OSC 9 (iTerm2, WezTerm, kitty, Windows
+            // Terminal show it) and the bell, for a job long enough to have been left (U14).
+            let long = self.live.with_untracked(|l| {
+                l.as_ref().is_some_and(|l| {
+                    l.snapshot.as_ref().map(|s| s.elapsed_s).unwrap_or(0.0) >= 10.0
+                        || l.kind == JobKind::Tune
+                })
+            });
+            if long && self.prefs.with_untracked(|p| p.notify) {
+                terminal_notify(title, body);
+            }
+            return;
+        }
+        if self.focused.get_untracked() {
             return;
         }
         set_badge(1);
@@ -1487,6 +1583,165 @@ impl Store {
         }
     }
 
+    /// The waterfall of operation `i` (an index into the run's ops), in the inspector.
+    pub fn inspect_op(&self, i: u32) {
+        self.inspect.set(Inspect::Op(i));
+        self.show_inspector();
+    }
+
+    /// The inspector, beside the content or over it (narrow windows, the terminal).
+    pub fn show_inspector(&self) {
+        let narrow = window().width.0 < 1200.0;
+        if narrow {
+            self.overlay.set(Some(Overlay::Inspector));
+        } else if !self.prefs.with_untracked(|p| p.inspector_visible) {
+            self.update_prefs(|p| p.inspector_visible = true);
+        }
+    }
+
+    /// The waterfall of the slowest operation (in the brush's window when there is one).
+    pub fn waterfall_slowest(&self) {
+        let win = self
+            .brush
+            .get_untracked()
+            .map(|b| ((b.from_s * 1e6) as i64, (b.to_s * 1e6) as i64));
+        let op = self.current.with_untracked(|c| {
+            c.as_ref()
+                .and_then(|c| crate::ui::model::waterfall::slowest_op(&c.run.ops, win))
+        });
+        match op {
+            Some(i) => {
+                if self.mode.get_untracked() != Mode::Run {
+                    self.mode.set(Mode::Run);
+                }
+                self.inspect_op(i);
+            }
+            None => self.toast("This run kept no operation rows", Tone::Warn),
+        }
+    }
+
+    /// Move or resize the heatmap brush from the keyboard (U15: `[` `]` move it in time,
+    /// `{` `}` lower or raise its latency floor).
+    pub fn nudge_brush(&self, key: char) {
+        let next = self.current.with_untracked(|c| {
+            c.as_ref()
+                .map(|c| crate::ui::heatmap::nudge(&c.heatmap, self.brush.get_untracked(), key))
+        });
+        if let Some(b) = next.flatten() {
+            self.apply_brush(b);
+        }
+    }
+
+    /// The shown view as a link (`oprobe://run/ID?view=…`).
+    pub fn view_state(&self) -> Option<crate::ui::model::link::ViewState> {
+        use crate::ui::model::link::ViewState;
+        let id = self
+            .current
+            .with_untracked(|c| c.as_ref().map(|c| c.id().to_owned()))?;
+        let op_id = match self.inspect.get_untracked() {
+            Inspect::Op(i) => self.current.with_untracked(|c| {
+                c.as_ref()
+                    .and_then(|c| c.run.ops.get(i as usize))
+                    .map(|o| o.op_id)
+            }),
+            _ => None,
+        };
+        Some(ViewState {
+            run_id: id,
+            tab: (self.mode.get_untracked() == Mode::Run).then(|| self.tab.get_untracked()),
+            query: self.req_query.get_untracked(),
+            sort: self
+                .req_sort
+                .get_untracked()
+                .map(|(c, d)| (c.key().to_owned(), d)),
+            window_s: self.tl_window.get_untracked(),
+            brush: self
+                .brush
+                .get_untracked()
+                .map(|b| (b.from_s, b.to_s, b.min_ms)),
+            op_id,
+        })
+    }
+
+    /// Copy the link to the shown view.
+    pub fn copy_link(&self) {
+        match self.view_state() {
+            Some(v) => {
+                set_clipboard(v.to_link());
+                self.toast("Copied the link to this view", Tone::Neutral);
+            }
+            None => self.toast("Nothing to link to: open a run first", Tone::Warn),
+        }
+    }
+
+    /// Open an `oprobe://run/ID?view=…` link: the run, then its view once loaded.
+    pub fn open_link(&self, link: &str) {
+        use crate::ui::model::link::ViewState;
+        let Some(v) = ViewState::parse(link) else {
+            self.toast(format!("not an oprobe link: {link}"), Tone::Crit);
+            return;
+        };
+        if self.run_store().resolve(&v.run_id).is_err() {
+            self.toast(
+                format!("run {} is not in the history", v.run_id),
+                Tone::Crit,
+            );
+            return;
+        }
+        self.select_run(&v.run_id);
+        let s = *self;
+        spawn(async move {
+            // The view applies once the run has loaded.
+            for _ in 0..600 {
+                if s.current
+                    .with_untracked(|c| c.as_ref().is_some_and(|c| c.id() == v.run_id))
+                {
+                    break;
+                }
+                next_frame().await;
+            }
+            s.apply_view(&v);
+        });
+    }
+
+    /// Restore a view's filter, sort, zoom, brush and operation on the shown run.
+    pub fn apply_view(&self, v: &crate::ui::model::link::ViewState) {
+        let op = v.op_id.and_then(|id| {
+            self.current
+                .with_untracked(|c| c.as_ref().and_then(|c| c.op_index.get(&id).copied()))
+        });
+        batch(|| {
+            self.req_query.set(v.query.clone());
+            self.req_sort.set(
+                v.sort
+                    .as_ref()
+                    .and_then(|(k, d)| Col::from_key(k).map(|c| (c, *d))),
+            );
+            self.tl_window.set(v.window_s);
+            if let Some(t) = v.tab {
+                self.set_tab(t);
+            }
+        });
+        if let Some((a, b, ms)) = v.brush {
+            self.apply_brush(Brush {
+                from_s: a,
+                to_s: b,
+                min_ms: ms,
+            });
+        }
+        if let Some(i) = op {
+            self.inspect_op(i);
+        }
+    }
+
+    /// The Fix menu's tuning choices: the tuner on the shown run, for `objective`
+    /// (`throughput`, `latency`, `cost`).
+    pub fn tune_for(&self, objective: &str) {
+        self.tune_objective.set(Some(objective.to_owned().into()));
+        self.mode.set(Mode::Tune);
+        self.start_tune();
+    }
+
     /// Attribution of the slowest 1 % of requests.
     pub fn explain_slowest(&self) {
         let attr = self.current.with_untracked(|c| {
@@ -1515,6 +1770,7 @@ impl Store {
 
     fn compare_then(&self, a: &str, b: &str, verify: Option<PendingVerify>) {
         let store = self.run_store();
+        let paths = self.paths.with(|p| p.clone());
         let (a, b) = (a.to_owned(), b.to_owned());
         let s = *self;
         batch(|| {
@@ -1530,7 +1786,16 @@ impl Store {
                     Ok((crate::store::read_run_file(&path)?, path))
                 };
                 let ((ra, pa), (rb, pb)) = (load(&a)?, load(&b)?);
-                let c = compare(&ra, &rb);
+                // The comparison `oprobe compare` makes (thresholds, noise floors, net verdict).
+                let full = crate::app::App::new(paths).compare(
+                    crate::app::input::CompareRequest {
+                        baseline: Some(pa.display().to_string()),
+                        candidate: Some(pb.display().to_string()),
+                        ..Default::default()
+                    },
+                    &crate::app::EventSink::silent(),
+                )?;
+                let c = crate::ui::model::compare::of_core(full, &ra.report, &rb.report);
                 let (va, vb) = (RunView::new(ra, Some(pa)), RunView::new(rb, Some(pb)));
                 anyhow::Ok((va, vb, c))
             })
@@ -1734,6 +1999,21 @@ fn watch_dir(dir: PathBuf) -> Arc<std::sync::atomic::AtomicU64> {
     stamp
 }
 
+/// A desktop notification from the terminal: OSC 9 with the title and body (control
+/// characters removed), then the bell.
+fn terminal_notify(title: &str, body: &str) {
+    use std::io::Write;
+    let mut out = std::io::stdout();
+    let _ = out.write_all(osc9(title, body).as_bytes());
+    let _ = out.flush();
+}
+
+/// The bytes [`terminal_notify`] writes.
+fn osc9(title: &str, body: &str) -> String {
+    let clean = |s: &str| -> String { s.chars().filter(|c| !c.is_control()).take(200).collect() };
+    format!("\x1b]9;{}: {}\x07\x07", clean(title), clean(body))
+}
+
 /// Dock / taskbar progress of the main window (`None` clears it).
 fn main_progress(value: Option<f32>) {
     if kit_in_terminal() {
@@ -1746,4 +2026,13 @@ fn main_progress(value: Option<f32>) {
     let mut attrs = WindowAttributes::default();
     attrs.progress = Some(value.map(|_| progress));
     nsh_core::element::desktop::main_window().set(attrs);
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn terminal_notifications_cannot_inject_escapes() {
+        let s = super::osc9("Run done", "evil\x1b]0;title\x07 text");
+        assert_eq!(s, "\x1b]9;Run done: evil]0;title text\x07\x07");
+    }
 }

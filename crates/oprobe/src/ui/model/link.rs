@@ -58,7 +58,10 @@ impl ViewState {
             inner.append_pair("q", self.query.trim());
         }
         if let Some((col, desc)) = &self.sort {
-            inner.append_pair("sort", &format!("{col}:{}", if *desc { "desc" } else { "asc" }));
+            inner.append_pair(
+                "sort",
+                &format!("{col}:{}", if *desc { "desc" } else { "asc" }),
+            );
         }
         if let Some((a, b)) = self.window_s {
             inner.append_pair("win", &format!("{},{}", num(a), num(b)));
@@ -159,7 +162,10 @@ mod tests {
             op_id: Some(42),
         };
         let link = v.to_link();
-        assert!(link.starts_with("oprobe://run/20260101-120000-ab12?view="), "{link}");
+        assert!(
+            link.starts_with("oprobe://run/20260101-120000-ab12?view="),
+            "{link}"
+        );
         assert!(!link.contains(' '), "{link}");
         assert_eq!(ViewState::parse(&link), Some(v));
     }
@@ -169,7 +175,8 @@ mod tests {
         let v = ViewState::parse("oprobe://run/abc").unwrap();
         assert_eq!(v.run_id, "abc");
         assert_eq!(v.tab, None);
-        let v = ViewState::parse("oprobe://run/abc?view=tab%3Dnope%26win%3D5%2C1%26zz%3D1").unwrap();
+        let v =
+            ViewState::parse("oprobe://run/abc?view=tab%3Dnope%26win%3D5%2C1%26zz%3D1").unwrap();
         assert_eq!((v.tab, v.window_s), (None, None));
         assert!(ViewState::parse("https://run/abc").is_none());
         assert!(ViewState::parse("oprobe://run/").is_none());

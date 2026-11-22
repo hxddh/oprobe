@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use crate::model::{HEATMAP_LATENCY_BOUNDS_MS, ReqRow, Run};
+use crate::model::{HEATMAP_LATENCY_BOUNDS_MS, OpRow, ReqRow, Run};
 
 use super::series::{Series, quantiles};
 
@@ -214,6 +214,24 @@ impl RunView {
     }
 }
 
+/// The Timeline's rows (U8): the operations at or above the run's p99 latency (`tail`), or all
+/// of them; slowest first (`slowest`), else in start order (`by_start`, the run's own order).
+/// The p99 tail keeps at least 20 operations so a short run still shows something to read.
+pub fn timeline_order(ops: &[OpRow], by_start: &[u32], slowest: bool, tail: bool) -> Vec<u32> {
+    let mut idx: Vec<u32> = by_start.to_vec();
+    if tail && !ops.is_empty() {
+        let mut lat: Vec<u64> = ops.iter().map(|o| o.latency_us).collect();
+        lat.sort_unstable();
+        let keep = (ops.len() / 100).max(20).min(ops.len());
+        let floor = lat[lat.len() - keep];
+        idx.retain(|i| ops[*i as usize].latency_us >= floor);
+    }
+    if slowest {
+        idx.sort_by_key(|i| std::cmp::Reverse(ops[*i as usize].latency_us));
+    }
+    idx
+}
+
 fn tls_kind(r: &ReqRow) -> &'static str {
     match &r.tls {
         Some(t) if t.hrr => "hrr",
@@ -317,6 +335,28 @@ pub fn connections(reqs: &[ReqRow]) -> (Vec<ConnRow>, Vec<RemoteRow>) {
 mod tests {
     use super::super::requests::tests::req;
     use super::*;
+
+    #[test]
+    fn the_timeline_opens_on_the_slowest_operations() {
+        let ops: Vec<OpRow> = (0..100u64)
+            .map(|i| {
+                let mut o = crate::report::fixture::run().ops[0].clone();
+                o.t_us = i as i64;
+                o.latency_us = if i == 7 { 1_000_000 } else { 1_000 + i };
+                o
+            })
+            .collect();
+        let by_start: Vec<u32> = (0..100).collect();
+        let tail = timeline_order(&ops, &by_start, true, true);
+        assert_eq!(tail.len(), 20);
+        assert_eq!(tail[0], 7);
+        assert!(
+            tail.windows(2)
+                .all(|w| ops[w[0] as usize].latency_us >= ops[w[1] as usize].latency_us)
+        );
+        assert_eq!(timeline_order(&ops, &by_start, false, false), by_start);
+        assert!(timeline_order(&[], &[], true, true).is_empty());
+    }
 
     #[test]
     fn connections_and_remotes() {

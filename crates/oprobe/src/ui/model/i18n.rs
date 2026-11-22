@@ -121,7 +121,10 @@ static EN: &[(&str, &str)] = &[
     ("app.tile.baseline", "baseline {lo}–{hi}"),
     ("app.tile.last_runs", "last {n} runs"),
     ("app.hypothesis", "Likely limit"),
-    ("app.no_hypothesis", "No limit identified: the run was not throttled, saturated or failing."),
+    (
+        "app.no_hypothesis",
+        "No limit identified: the run was not throttled, saturated or failing.",
+    ),
     ("app.primary_fix", "Fix"),
     ("app.predicted", "predicted: {what}"),
     ("app.history", "HISTORY"),
@@ -141,7 +144,10 @@ static EN: &[(&str, &str)] = &[
     ("app.critical_path", "critical path"),
     ("app.backoff", "backoff"),
     ("app.typical_op", "Compare with a typical op"),
-    ("app.typical_line", "a typical {verb} takes {total} with {requests} requests"),
+    (
+        "app.typical_line",
+        "a typical {verb} takes {total} with {requests} requests",
+    ),
     ("app.slower_by", "{x}× slower than typical"),
     // run rows
     ("app.run_row", "{when} · {preset} · {verdict}"),
@@ -206,7 +212,10 @@ static ZH_CN: &[(&str, &str)] = &[
     ("app.tile.baseline", "基线 {lo}–{hi}"),
     ("app.tile.last_runs", "最近 {n} 次运行"),
     ("app.hypothesis", "可能的瓶颈"),
-    ("app.no_hypothesis", "未发现瓶颈：运行没有被限流、饱和或失败。"),
+    (
+        "app.no_hypothesis",
+        "未发现瓶颈：运行没有被限流、饱和或失败。",
+    ),
     ("app.primary_fix", "修复"),
     ("app.predicted", "预计：{what}"),
     ("app.history", "历史"),
@@ -224,7 +233,10 @@ static ZH_CN: &[(&str, &str)] = &[
     ("app.critical_path", "关键路径"),
     ("app.backoff", "退避"),
     ("app.typical_op", "与典型操作比较"),
-    ("app.typical_line", "典型的 {verb} 耗时 {total}，{requests} 个请求"),
+    (
+        "app.typical_line",
+        "典型的 {verb} 耗时 {total}，{requests} 个请求",
+    ),
     ("app.slower_by", "比典型慢 {x} 倍"),
     ("app.run_row", "{when} · {preset} · {verdict}"),
     ("app.palette.placeholder", "输入命令"),

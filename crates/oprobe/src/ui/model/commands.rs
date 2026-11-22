@@ -36,7 +36,12 @@ pub const COMMANDS: &[CmdSpec] = &[
     c("export-json", "Export Report as JSON…", "File", None),
     c("export-md", "Export Report as Markdown…", "File", None),
     c("export-csv", "Export Requests as CSV…", "File", None),
-    c("copy-link", "Copy Link to This View", "File", Some("shift+mod+l")),
+    c(
+        "copy-link",
+        "Copy Link to This View",
+        "File",
+        Some("shift+mod+l"),
+    ),
     c("settings", "Settings…", "File", Some("mod+,")),
     c("run", "Run", "Run", Some("mod+r")),
     c("stop", "Stop", "Run", Some("mod+.")),
@@ -50,7 +55,12 @@ pub const COMMANDS: &[CmdSpec] = &[
     c("probe", "Probe…", "Run", None),
     c("slowest", "Explain the Slowest Requests", "Run", None),
     c("health", "Target Health", "View", Some("mod+0")),
-    c("waterfall", "Waterfall of the Slowest Operation", "View", Some("mod+j")),
+    c(
+        "waterfall",
+        "Waterfall of the Slowest Operation",
+        "View",
+        Some("mod+j"),
+    ),
     c("sidebar", "Toggle Sidebar", "View", Some("mod+alt+s")),
     c("inspector", "Toggle Inspector", "View", Some("mod+alt+i")),
     c("log", "Logarithmic Latency Axis", "View", None),
@@ -251,10 +261,8 @@ mod tests {
         assert!(fuzzy_score("exm", "Export Report as Markdown…").is_some());
         assert!(fuzzy_score("cmp", "Compare Runs").is_some());
         assert!(fuzzy_score("zzz", "Compare Runs").is_none());
-        let items: Vec<(&str, Vec<&str>)> = COMMANDS
-            .iter()
-            .map(|c| (c.label, keywords(c)))
-            .collect();
+        let items: Vec<(&str, Vec<&str>)> =
+            COMMANDS.iter().map(|c| (c.label, keywords(c))).collect();
         let first = |q: &str| COMMANDS[ranked(q, &items)[0]].id;
         assert_eq!(first("compare"), "compare");
         assert_eq!(first("export csv"), "export-csv");
