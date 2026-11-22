@@ -189,10 +189,11 @@ pub fn layer_rust(s: &OperatorSpec, name: &str) -> Option<String> {
     Some(match name {
         "concurrent_limit" => {
             let c = l.concurrent_limit.as_ref()?;
-            let mut e = format!(
-                "ConcurrentLimitLayer::new({})",
-                c.operations.unwrap_or(UNLIMITED_OPERATIONS)
-            );
+            // No operation cap: OpenDAL needs a permit count, so a large one reads as such.
+            let mut e = match c.operations {
+                Some(n) => format!("ConcurrentLimitLayer::new({n})"),
+                None => "ConcurrentLimitLayer::new(1 << 20)".to_owned(),
+            };
             if let Some(h) = c.http {
                 let _ = write!(e, ".with_http_concurrent_limit({h})");
             }
@@ -498,7 +499,7 @@ mod tests {
         assert!(paths.contains(&"read.gap"), "{paths:?}");
         assert!(
             d.rust
-                .contains("+ ConcurrentLimitLayer::new(1048576).with_http_concurrent_limit(24)"),
+                .contains("+ ConcurrentLimitLayer::new(1 << 20).with_http_concurrent_limit(24)"),
             "{}",
             d.rust
         );
