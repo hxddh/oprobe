@@ -159,7 +159,7 @@ fn layer_of(path: &str) -> Option<&str> {
 
 fn rust_duration(d: Duration) -> String {
     let ms = d.as_millis();
-    if d.subsec_nanos() % 1_000_000 != 0 {
+    if !d.subsec_nanos().is_multiple_of(1_000_000) {
         format!("Duration::from_nanos({})", d.as_nanos())
     } else if ms.is_multiple_of(1000) {
         format!("Duration::from_secs({})", ms / 1000)
