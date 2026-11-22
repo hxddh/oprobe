@@ -139,10 +139,31 @@ fn now_rfc3339_ms() -> String {
 /// A subscriber.
 pub type EventFn = Arc<dyn Fn(&Event) + Send + Sync>;
 
+/// What an in-process front end sees of a measurement as it happens, beyond the serialized
+/// events: the engine's full snapshots (the App's live view draws them), the cleanup stage, and
+/// the finished run (a budget stop included, which the command returns as an error). Never
+/// serialized; CLI and MCP output are unaffected.
+#[derive(Clone, Debug)]
+pub enum Live {
+    /// The engine's progress: messages and full [`crate::trace::Snapshot`]s.
+    Progress(Progress),
+    /// The measurement window has ended; test data is being removed.
+    CleaningUp,
+    /// The run was built (and saved when `path` is set), before any budget error is returned.
+    Finished {
+        run: Box<crate::model::Run>,
+        path: Option<std::path::PathBuf>,
+    },
+}
+
+/// A [`Live`] subscriber.
+pub type LiveFn = Arc<dyn Fn(&Live) + Send + Sync>;
+
 /// In-process broadcast: every subscriber sees every event, in emission order.
 #[derive(Clone, Default)]
 pub struct EventBus {
     subs: Arc<Mutex<Vec<EventFn>>>,
+    live: Arc<Mutex<Vec<LiveFn>>>,
 }
 
 impl std::fmt::Debug for EventBus {
@@ -168,6 +189,28 @@ impl EventBus {
             let _ = tx.lock().unwrap_or_else(|e| e.into_inner()).send(e.clone());
         }));
         rx
+    }
+
+    /// Subscribe to the in-process [`Live`] stream (snapshots, cleanup, the finished run).
+    pub fn subscribe_live(&self, f: LiveFn) {
+        self.live.lock().unwrap_or_else(|e| e.into_inner()).push(f);
+    }
+
+    /// Whether anyone listens to the [`Live`] stream (producers skip cloning snapshots if not).
+    pub fn has_live(&self) -> bool {
+        !self
+            .live
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+    }
+
+    /// Send `e` to the [`Live`] subscribers.
+    pub fn emit_live(&self, e: &Live) {
+        let subs = self.live.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        for s in subs {
+            s(e);
+        }
     }
 
     pub fn emit_event(&self, e: &Event) {

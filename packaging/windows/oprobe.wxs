@@ -30,6 +30,22 @@
                     Description="See which layer makes object-storage I/O slow or expensive"
                     Arguments="gui" WorkingDirectory="INSTALLFOLDER" Icon="AppIcon" Advertise="yes" />
         </File>
+        <!-- `.oprobe` run files and `oprobe://run/…` view links open the workbench. -->
+        <ProgId Id="oprobe.run" Description="oprobe run" Icon="oprobe.exe" IconIndex="0">
+          <Extension Id="oprobe" ContentType="application/x-oprobe-run">
+            <Verb Id="open" Command="Open" TargetFile="oprobe.exe" Argument="gui &quot;%1&quot;" />
+          </Extension>
+        </ProgId>
+        <RegistryKey Root="HKLM" Key="Software\Classes\oprobe">
+          <RegistryValue Type="string" Value="URL:oprobe view link" />
+          <RegistryValue Name="URL Protocol" Type="string" Value="" />
+          <RegistryKey Key="DefaultIcon">
+            <RegistryValue Type="string" Value="[INSTALLFOLDER]oprobe.exe,0" />
+          </RegistryKey>
+          <RegistryKey Key="shell\open\command">
+            <RegistryValue Type="string" Value="&quot;[INSTALLFOLDER]oprobe.exe&quot; gui &quot;%1&quot;" />
+          </RegistryKey>
+        </RegistryKey>
         <Environment Id="PathEntry" Name="PATH" Value="[INSTALLFOLDER]" Permanent="no"
                      Part="last" Action="set" System="yes" />
       </Component>

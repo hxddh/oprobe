@@ -316,12 +316,13 @@ jobs:
         run: |
           name="oprobe-desktop-${VERSION}-x86_64-unknown-linux-gnu"
           d="stage/$name"
-          mkdir -p "$d/bin" "$d/share/applications" "$d/share/icons/hicolor/512x512/apps" out
+          mkdir -p "$d/bin" "$d/share/applications" "$d/share/icons/hicolor/512x512/apps" "$d/share/mime/packages" out
           cp target/release/oprobe "$d/bin/"
           cp packaging/desktop/io.github.hxddh.oprobe.desktop "$d/share/applications/"
           cp packaging/desktop/oprobe.png "$d/share/icons/hicolor/512x512/apps/io.github.hxddh.oprobe.png"
+          cp packaging/desktop/io.github.hxddh.oprobe.xml "$d/share/mime/packages/"
           cp LICENSE README.md "$d/"
-          printf '#!/bin/sh\n# Install for the current user: ./install.sh  (or PREFIX=/usr/local sudo ./install.sh)\nset -e\np="${PREFIX:-$HOME/.local}"\ncd "$(dirname "$0")"\nmkdir -p "$p"\ncp -r bin share "$p/"\necho "installed oprobe (with its window, GTK 4.14+ required) to $p/bin"\n' > "$d/install.sh"
+          printf '#!/bin/sh\n# Install for the current user: ./install.sh  (or PREFIX=/usr/local sudo ./install.sh)\nset -e\np="${PREFIX:-$HOME/.local}"\ncd "$(dirname "$0")"\nmkdir -p "$p"\ncp -r bin share "$p/"\nupdate-mime-database "$p/share/mime" 2>/dev/null || true\nupdate-desktop-database "$p/share/applications" 2>/dev/null || true\necho "installed oprobe (with its window, GTK 4.14+ required) to $p/bin"\n' > "$d/install.sh"
           chmod +x "$d/install.sh"
           ./target/release/oprobe --version
           tar -C stage -czf "out/$name.tar.gz" "$name"
