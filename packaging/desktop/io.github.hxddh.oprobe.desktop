@@ -1,12 +1,11 @@
 [Desktop Entry]
 Type=Application
 Name=oprobe
-GenericName=Storage Microscope
-Comment=See which layer makes object-storage I/O slow or expensive
-Exec=oprobe gui %U
+GenericName=OpenDAL Profiler
+Comment=See what your OpenDAL operator does on the wire, and prove the fix
+Exec=oprobe
 Icon=io.github.hxddh.oprobe
 Terminal=false
 Categories=Development;Network;Monitor;
-Keywords=s3;storage;benchmark;opendal;latency;
-MimeType=application/x-oprobe-run;x-scheme-handler/oprobe;
+Keywords=s3;storage;profiler;opendal;latency;
 StartupWMClass=io.github.hxddh.oprobe

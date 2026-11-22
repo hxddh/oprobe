@@ -1,5 +1,5 @@
 <!-- WiX Toolset v4 source for the oprobe MSI (per-machine): adds oprobe to PATH and a Start menu
-     shortcut that opens the workbench window (`oprobe gui`).
+     shortcut that opens the app (a bare `oprobe`).
      Built by .github/workflows/release.yml:
        wix build packaging/windows/oprobe.wxs -arch x64 -d Version=2.0.0 -d BinDir=... \
          -d IconFile=packaging/desktop/oprobe.ico -o oprobe-2.0.0-x64.msi -->
@@ -12,14 +12,12 @@
            Compressed="yes">
     <MajorUpgrade DowngradeErrorMessage="A newer version of oprobe is already installed." />
     <MediaTemplate EmbedCab="yes" />
-    <SummaryInformation Description="oprobe — white-box cloud storage microscope" />
+    <SummaryInformation Description="oprobe: a profiler for OpenDAL operators" />
     <Icon Id="AppIcon" SourceFile="$(var.IconFile)" />
     <Property Id="ARPPRODUCTICON" Value="AppIcon" />
 
     <StandardDirectory Id="ProgramFiles64Folder">
-      <Directory Id="INSTALLFOLDER" Name="oprobe">
-        <Directory Id="ProfilesFolder" Name="profiles" />
-      </Directory>
+      <Directory Id="INSTALLFOLDER" Name="oprobe" />
     </StandardDirectory>
     <StandardDirectory Id="ProgramMenuFolder" />
 
@@ -27,25 +25,9 @@
       <Component Id="Binary" Guid="3C2B8F5E-1D4A-4F6B-9A2C-7E8D1F0A3B42">
         <File Id="oprobe.exe" Source="$(var.BinDir)\oprobe.exe" KeyPath="yes">
           <Shortcut Id="StartMenuShortcut" Directory="ProgramMenuFolder" Name="oprobe"
-                    Description="See which layer makes object-storage I/O slow or expensive"
-                    Arguments="gui" WorkingDirectory="INSTALLFOLDER" Icon="AppIcon" Advertise="yes" />
+                    Description="A profiler for OpenDAL operators"
+                    WorkingDirectory="INSTALLFOLDER" Icon="AppIcon" Advertise="yes" />
         </File>
-        <!-- `.oprobe` run files and `oprobe://run/…` view links open the workbench. -->
-        <ProgId Id="oprobe.run" Description="oprobe run" Icon="oprobe.exe" IconIndex="0">
-          <Extension Id="oprobe" ContentType="application/x-oprobe-run">
-            <Verb Id="open" Command="Open" TargetFile="oprobe.exe" Argument="gui &quot;%1&quot;" />
-          </Extension>
-        </ProgId>
-        <RegistryKey Root="HKLM" Key="Software\Classes\oprobe">
-          <RegistryValue Type="string" Value="URL:oprobe view link" />
-          <RegistryValue Name="URL Protocol" Type="string" Value="" />
-          <RegistryKey Key="DefaultIcon">
-            <RegistryValue Type="string" Value="[INSTALLFOLDER]oprobe.exe,0" />
-          </RegistryKey>
-          <RegistryKey Key="shell\open\command">
-            <RegistryValue Type="string" Value="&quot;[INSTALLFOLDER]oprobe.exe&quot; gui &quot;%1&quot;" />
-          </RegistryKey>
-        </RegistryKey>
         <Environment Id="PathEntry" Name="PATH" Value="[INSTALLFOLDER]" Permanent="no"
                      Part="last" Action="set" System="yes" />
       </Component>
@@ -53,16 +35,11 @@
         <File Source="$(var.BinDir)\README.md" KeyPath="yes" />
         <File Source="$(var.BinDir)\LICENSE.txt" />
         <File Source="$(var.BinDir)\CHANGELOG.md" />
-        <File Source="$(var.BinDir)\_oprobe.ps1" />
       </Component>
-    </ComponentGroup>
-    <ComponentGroup Id="Profiles" Directory="ProfilesFolder">
-      <Files Include="$(var.BinDir)\profiles\*.toml" />
     </ComponentGroup>
 
     <Feature Id="Complete" Title="oprobe" Level="1">
       <ComponentGroupRef Id="Main" />
-      <ComponentGroupRef Id="Profiles" />
     </Feature>
   </Package>
 </Wix>

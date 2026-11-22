@@ -26,7 +26,10 @@ name = "oprobe"
 path = "src/main.rs"
 
 [features]
-default = ["app", "default-services"]
+default = ["app", "cli"]
+# The CLI with the common cloud services and without the app: the CLI-only release archives
+# (`--no-default-features --features cli`). `--no-default-features` alone drops the services too.
+cli = ["default-services"]
 # The app (bare `oprobe`): the nsh workbench in a terminal; `gui` adds native windows. Phase B of
 # oprobe 6 wires the nsh crates below into these features; today the app is a stub.
 app = []

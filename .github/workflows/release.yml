@@ -1,18 +1,22 @@
 name: Release
 
 # Builds platform-native artifacts for a version tag and publishes a GitHub release:
-#   oprobe-<ver>-<target>.tar.gz / .zip      portable archives (binary, man pages, completions, profiles)
-#   oprobe-<ver>-universal-apple-darwin.tar.gz + oprobe-<ver>-macos-universal.pkg
+#   oprobe-<ver>-<target>.tar.gz / .zip      portable archives: the app build (binary, README,
+#                                            CHANGELOG, LICENSE)
+#   oprobe-cli-<ver>-<target>.tar.gz / .zip  the CLI-only build (`--no-default-features --features cli`)
+#   oprobe-<ver>-universal-apple-darwin.tar.gz + oprobe-cli-<ver>-universal-apple-darwin.tar.gz
+#   oprobe-<ver>-macos-universal.pkg
 #   oprobe_<ver>-1_<arch>.deb, oprobe-<ver>-1.<arch>.rpm
 #   oprobe-<ver>-x64.msi, oprobe-<ver>-arm64.msi    (Start menu shortcut opens the window)
 #   oprobe-<ver>-macos-universal.dmg                 (oprobe.app; same binary as the .pkg)
 #   oprobe-desktop-<ver>-x86_64-unknown-linux-gnu.tar.gz  (Linux build with windows; needs GTK 4)
-# One binary everywhere: macOS and Windows builds include native windows (`--features gui`);
-# Linux packages stay headless (CLI + terminal workbench) so servers need no GTK.
+# The app build everywhere: macOS and Windows builds include native windows (`--features gui`);
+# Linux packages have the app in the terminal only, so servers need no GTK (design v6 D4).
 #   SHA256SUMS, oprobe.rb (Homebrew formula `oprobe`), oprobe-app.rb (Homebrew cask `oprobe-app`
 #   for the .dmg), oprobe.json (Scoop manifest), winget-manifests.zip (winget manifests),
 #   latest.json (index of every asset with URL, size and SHA-256), install.sh, install.ps1,
-#   SHA256SUMS.minisig (minisign signature over SHA256SUMS; only when MINISIGN_KEY is set)
+#   SHA256SUMS.minisig (minisign signature over SHA256SUMS; only when MINISIGN_KEY is set, and
+#   the installers embed the public key only when MINISIGN_PUBKEY is set)
 # After publishing, package managers are updated when their secret exists (skipped with a
 # warning otherwise; stable releases only; docs/releasing.md):
 #   homebrew-tap  TAP_TOKEN     Formula/oprobe.rb + Casks/oprobe-app.rb -> hxddh/homebrew-tap
@@ -91,7 +95,7 @@ jobs:
           echo "release=true" >> "$GITHUB_OUTPUT"
 
   meta:
-    name: Version & extras
+    name: Version & tests
     needs: plan
     if: needs.plan.outputs.release == 'true'
     runs-on: ubuntu-latest
@@ -117,22 +121,6 @@ jobs:
           toolchain: stable
       - name: Test
         run: cargo test --locked --all-targets
-      - name: Generate man pages and shell completions
-        run: |
-          # A debug build is enough to print the man pages and completions.
-          cargo build --locked
-          mkdir -p dist/extras/man dist/extras/completions
-          ./target/debug/oprobe man --out-dir dist/extras/man
-          for sh in bash zsh fish powershell elvish; do
-            ./target/debug/oprobe completions "$sh" > "dist/extras/completions/$(case $sh in
-              bash) echo oprobe.bash;; zsh) echo _oprobe;; fish) echo oprobe.fish;;
-              powershell) echo _oprobe.ps1;; elvish) echo oprobe.elv;; esac)"
-          done
-          ls -R dist/extras
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: extras
-          path: dist/extras
 
   build:
     name: ${{ matrix.target }}
@@ -153,8 +141,6 @@ jobs:
     env:
       VERSION: ${{ needs.meta.outputs.version }}
       TAG: ${{ needs.plan.outputs.tag }}
-      # Embedded in `oprobe self-update` (minisign verification of SHA256SUMS; docs/releasing.md).
-      OPROBE_MINISIGN_PUBKEY: ${{ vars.MINISIGN_PUBKEY }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -166,41 +152,52 @@ jobs:
       - name: Install musl tools
         if: matrix.musl
         run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          name: extras
-          path: dist/extras
-
-      - name: Build
+      - name: Build (app)
         shell: bash
         run: cargo build --release --locked --target ${{ matrix.target }} ${{ matrix.features && format('--features {0}', matrix.features) || '' }}
 
-      - name: Archive (Unix)
+      # The CLI-only build: the cloud services without the app (feature `cli`), in its own target
+      # directory so it does not overwrite the app binary.
+      - name: Build (CLI only)
+        shell: bash
+        run: cargo build --release --locked --target ${{ matrix.target }} --no-default-features --features cli --target-dir target/cli
+
+      - name: Archives (Unix)
         if: runner.os != 'Windows'
         shell: bash
         run: |
-          name="oprobe-${VERSION}-${{ matrix.target }}"
-          mkdir -p "stage/$name"
-          cp "target/${{ matrix.target }}/release/oprobe" "stage/$name/"
-          cp README.md CHANGELOG.md LICENSE "stage/$name/"
-          cp -r dist/extras/man dist/extras/completions profiles docs "stage/$name/"
-          tar -C stage -czf "$name.tar.gz" "$name"
-          mkdir -p out && mv "$name.tar.gz" out/
-          mkdir -p bin && cp "target/${{ matrix.target }}/release/oprobe" "bin/oprobe-${{ matrix.target }}"
+          mkdir -p out bin
+          for flavor in app cli; do
+            if [ "$flavor" = cli ]; then
+              name="oprobe-cli-${VERSION}-${{ matrix.target }}"; src="target/cli/${{ matrix.target }}/release/oprobe"
+            else
+              name="oprobe-${VERSION}-${{ matrix.target }}"; src="target/${{ matrix.target }}/release/oprobe"
+            fi
+            mkdir -p "stage/$name"
+            cp "$src" "stage/$name/oprobe"
+            cp README.md CHANGELOG.md LICENSE "stage/$name/"
+            tar -C stage -czf "out/$name.tar.gz" "$name"
+          done
+          cp "target/${{ matrix.target }}/release/oprobe" "bin/oprobe-${{ matrix.target }}"
+          cp "target/cli/${{ matrix.target }}/release/oprobe" "bin/oprobe-cli-${{ matrix.target }}"
 
-      - name: Archive (Windows)
+      - name: Archives (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $name = "oprobe-$env:VERSION-${{ matrix.target }}"
-          New-Item -ItemType Directory -Force -Path "stage/$name" | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/oprobe.exe" "stage/$name/"
-          Copy-Item README.md, CHANGELOG.md "stage/$name/"
-          Copy-Item LICENSE "stage/$name/LICENSE.txt"
-          Copy-Item dist/extras/completions/_oprobe.ps1 "stage/$name/"
-          Copy-Item -Recurse profiles, docs "stage/$name/"
           New-Item -ItemType Directory -Force -Path out | Out-Null
-          Compress-Archive -Path "stage/$name" -DestinationPath "out/$name.zip"
+          foreach ($flavor in @('app', 'cli')) {
+            if ($flavor -eq 'cli') {
+              $name = "oprobe-cli-$env:VERSION-${{ matrix.target }}"; $src = "target/cli/${{ matrix.target }}/release/oprobe.exe"
+            } else {
+              $name = "oprobe-$env:VERSION-${{ matrix.target }}"; $src = "target/${{ matrix.target }}/release/oprobe.exe"
+            }
+            New-Item -ItemType Directory -Force -Path "stage/$name" | Out-Null
+            Copy-Item $src "stage/$name/oprobe.exe"
+            Copy-Item README.md, CHANGELOG.md "stage/$name/"
+            Copy-Item LICENSE "stage/$name/LICENSE.txt"
+            Compress-Archive -Path "stage/$name" -DestinationPath "out/$name.zip"
+          }
 
       - name: MSI
         if: matrix.msi
@@ -224,18 +221,21 @@ jobs:
           cargo generate-rpm -p crates/oprobe --target ${{ matrix.target }} -o out/
           ls out
 
-      - name: Smoke test packaged binary
+      - name: Smoke test packaged binaries (app and CLI only)
         if: "!contains(matrix.target, 'aarch64-pc-windows')"
         shell: bash
+        env:
+          OPROBE_DATA_DIR: ${{ runner.temp }}/oprobe-data
         run: |
-          bin="target/${{ matrix.target }}/release/oprobe"
-          [ -f "$bin.exe" ] && bin="$bin.exe"
-          "$bin" --version
-          "$bin" run memory:// -d 1s --warmup 200ms -q -o json --no-save > /dev/null
-          # Write to a file first: `grep -q` stops reading at the first match, which would end
-          # the writer with SIGPIPE (exit 141) under `pipefail`.
-          "$bin" run memory:// -d 1s --warmup 200ms -q -o html --no-save > smoke.html
-          grep -q '<svg class="viz"' smoke.html
+          for bin in "target/${{ matrix.target }}/release/oprobe" "target/cli/${{ matrix.target }}/release/oprobe"; do
+            [ -f "$bin.exe" ] && bin="$bin.exe"
+            "$bin" --version
+            # Write to a file first: `grep -q` stops reading at the first match, which would end
+            # the writer with SIGPIPE (exit 141) under `pipefail`.
+            "$bin" run memory:// -d 1s -q -o json > smoke.json
+            grep -q '"oprobe.report/6"' smoke.json
+            "$bin" show --list -o json > list.json
+          done
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -260,23 +260,24 @@ jobs:
           ref: ${{ env.TAG }}
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with: { pattern: "bin-*", merge-multiple: true, path: bin }
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with: { name: extras, path: dist/extras }
-      - name: lipo + archive + pkg
+      - name: lipo + archives + pkg
         run: |
+          mkdir -p out cli
           lipo -create bin/oprobe-aarch64-apple-darwin bin/oprobe-x86_64-apple-darwin -output oprobe
-          chmod +x oprobe && lipo -info oprobe && ./oprobe --version
-          name="oprobe-${VERSION}-universal-apple-darwin"
-          mkdir -p "stage/$name" out
-          cp oprobe README.md CHANGELOG.md LICENSE "stage/$name/"
-          cp -r dist/extras/man dist/extras/completions profiles docs "stage/$name/"
-          tar -C stage -czf "out/$name.tar.gz" "$name"
+          lipo -create bin/oprobe-cli-aarch64-apple-darwin bin/oprobe-cli-x86_64-apple-darwin -output cli/oprobe
+          chmod +x oprobe cli/oprobe
+          lipo -info oprobe && ./oprobe --version && cli/oprobe --version
+          for flavor in app cli; do
+            if [ "$flavor" = cli ]; then name="oprobe-cli-${VERSION}-universal-apple-darwin"; src=cli/oprobe
+            else name="oprobe-${VERSION}-universal-apple-darwin"; src=oprobe; fi
+            mkdir -p "stage/$name"
+            cp "$src" "stage/$name/oprobe"
+            cp README.md CHANGELOG.md LICENSE "stage/$name/"
+            tar -C stage -czf "out/$name.tar.gz" "$name"
+          done
           root=pkgroot/usr/local
-          mkdir -p "$root/bin" "$root/share/man/man1" "$root/share/zsh/site-functions" "$root/share/oprobe/profiles"
+          mkdir -p "$root/bin"
           cp oprobe "$root/bin/"
-          cp dist/extras/man/*.1 "$root/share/man/man1/"
-          cp dist/extras/completions/_oprobe "$root/share/zsh/site-functions/"
-          cp profiles/*.toml "$root/share/oprobe/profiles/"
           pkgbuild --root pkgroot --identifier io.github.hxddh.oprobe --version "$VERSION" \
             --install-location / "out/oprobe-${VERSION}-macos-universal.pkg"
       - name: oprobe.app + disk image (unsigned preview; see docs/install.md)
@@ -302,7 +303,6 @@ jobs:
     env:
       VERSION: ${{ needs.meta.outputs.version }}
       TAG: ${{ needs.plan.outputs.tag }}
-      OPROBE_MINISIGN_PUBKEY: ${{ vars.MINISIGN_PUBKEY }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -365,16 +365,16 @@ jobs:
           # The checksums cover the generated manifests too.
           (cd out && rm SHA256SUMS && sha256sum * | sort -k2 > SHA256SUMS)
           cat out/SHA256SUMS
-      # A minisign signature over SHA256SUMS, for installs without `gh` (install.sh, install.ps1
-      # and `oprobe self-update` verify it with the public key they embed). The MINISIGN_KEY
-      # secret holds an unencrypted minisign secret key (`minisign -G -W`; docs/releasing.md).
-      # Without the secret the step is skipped with a warning and the release stays green.
+      # A minisign signature over SHA256SUMS, for installs without `gh` (install.sh and
+      # install.ps1 verify it with the public key they embed, when MINISIGN_PUBKEY is set). The
+      # MINISIGN_KEY secret holds an unencrypted minisign secret key (`minisign -G -W`;
+      # docs/releasing.md). Without the secret the step is skipped with a warning.
       - name: Sign SHA256SUMS (minisign)
         env:
           MINISIGN_KEY: ${{ secrets.MINISIGN_KEY }}
         run: |
           if [ -z "$MINISIGN_KEY" ]; then
-            echo "::warning::MINISIGN_KEY not set; SHA256SUMS is not signed (installers then rely on the build provenance attestation; docs/releasing.md#signing)"
+            echo "::warning::MINISIGN_KEY not set; SHA256SUMS is not signed (installers then check the SHA-256 and, with gh, the build provenance; docs/releasing.md#signing)"
             exit 0
           fi
           sudo apt-get update -qq && sudo apt-get install -y -qq minisign
@@ -390,17 +390,24 @@ jobs:
         with:
           subject-path: out/*
       - name: Release notes from CHANGELOG
+        env:
+          MINISIGN_PUBKEY: ${{ vars.MINISIGN_PUBKEY }}
         run: |
           awk -v v="$VERSION" '$0 ~ "^## \\[?v?"v {f=1; next} f && /^## / {exit} f' CHANGELOG.md > notes.md
           [ -s notes.md ] || echo "oprobe $VERSION" > notes.md
           {
             echo
             echo "---"
-            echo "**Install:** \`curl -fsSL https://github.com/${{ github.repository }}/releases/download/v$VERSION/install.sh | sh\` ·"
-            echo "Homebrew: \`brew install hxddh/tap/oprobe\` (the app: \`brew install --cask hxddh/tap/oprobe-app\`) ·"
-            echo "Windows: the \`.msi\`, Scoop (\`scoop bucket add hxddh https://github.com/hxddh/scoop-bucket\` then \`scoop install oprobe\`), or \`winget install hxddh.oprobe\` once its winget-pkgs pull request is merged · update: \`oprobe self-update\`."
+            echo "**Install:** \`curl -fsSL https://github.com/${{ github.repository }}/releases/download/v$VERSION/install.sh | sh\` (CLI only: \`| sh -s -- --cli\`) ·"
+            echo "Homebrew: \`brew install hxddh/tap/oprobe\` (the app bundle: \`brew install --cask hxddh/tap/oprobe-app\`) ·"
+            echo "Windows: the \`.msi\`, Scoop (\`scoop bucket add hxddh https://github.com/hxddh/scoop-bucket\` then \`scoop install oprobe\`), or \`winget install hxddh.oprobe\` once its winget-pkgs pull request is merged ·"
+            echo "Rust: \`cargo install oprobe --locked\` · the CLI-only build: the \`oprobe-cli-$VERSION-*\` archives."
             echo "The macOS and Windows packages are not code-signed; first open: [docs/install.md](https://github.com/${{ github.repository }}/blob/v$VERSION/docs/install.md#first-open-of-unsigned-packages)."
-            echo "Verify: \`sha256sum -c SHA256SUMS --ignore-missing\`, then \`gh attestation verify <file> --repo ${{ github.repository }}\` or \`minisign -Vm SHA256SUMS -P <key from docs/install.md>\`."
+            if [ -f out/SHA256SUMS.minisig ] && [ -n "$MINISIGN_PUBKEY" ]; then
+              echo "Verify: \`sha256sum -c SHA256SUMS --ignore-missing\`, then \`gh attestation verify <file> --repo ${{ github.repository }}\` or \`minisign -Vm SHA256SUMS -P $MINISIGN_PUBKEY\`."
+            else
+              echo "Verify: \`sha256sum -c SHA256SUMS --ignore-missing\`, then \`gh attestation verify <file> --repo ${{ github.repository }}\` (this release has no minisign signature)."
+            fi
           } >> notes.md
       - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
@@ -409,29 +416,6 @@ jobs:
           body_path: notes.md
           files: out/*
           fail_on_unmatched_files: true
-      # `uses: hxddh/oprobe@v<major>` (the GitHub Action) installs the newest release of its major.
-      # GitHub refuses to let the workflow token move a tag across commits that change
-      # `.github/workflows/`, which a major release usually does: set the RELEASE_TAG_TOKEN
-      # secret (a token with `contents` and `workflows` write) to move it here. Without it, a
-      # rejected move is a warning, not a failed release: the warning says how to move it by hand.
-      - name: Move the floating major tag
-        if: ${{ !contains(env.VERSION, '-') }}
-        env:
-          TAG_TOKEN: ${{ secrets.RELEASE_TAG_TOKEN }}
-          REPO: ${{ github.repository }}
-        run: |
-          major="v${VERSION%%.*}"
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if [ -n "$TAG_TOKEN" ]; then
-            git config --unset-all http.https://github.com/.extraheader || true
-            git remote set-url origin "https://x-access-token:${TAG_TOKEN}@github.com/${REPO}.git"
-          fi
-          git fetch --force origin "refs/tags/${TAG}:refs/tags/${TAG}"
-          git tag -f "$major" "${TAG}^{commit}"
-          if ! git push -f origin "refs/tags/$major"; then
-            echo "::warning::could not move $major to $TAG (set the RELEASE_TAG_TOKEN secret, or run: git fetch --tags && git tag -f $major $TAG^{commit} && git push -f origin refs/tags/$major)"
-          fi
 
   crates-io:
     name: Publish to crates.io
@@ -454,7 +438,8 @@ jobs:
             echo "::warning::CARGO_REGISTRY_TOKEN not set; skipping crates.io publish"; exit 0
           fi
           # In dependency order; each `cargo publish` waits until the crate is in the index. A
-          # crate of this version that is already published (a re-run) is skipped.
+          # crate of this version that is already published (a re-run) is skipped. oprobe-core is
+          # internal (no semver promise): oprobe pins it, and it pins oprobe-trace, with `=`.
           version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
           for crate in oprobe-trace oprobe-core oprobe; do
             if curl -fsS -A "oprobe-release (github.com/${{ github.repository }})" \

@@ -11,14 +11,20 @@ $target = "$arch-pc-windows-msvc"
 $server = $null
 $savedUserPath = [Environment]::GetEnvironmentVariable('Path', 'User')
 
+# Each version has the app archive and the CLI-only archive (`oprobe-cli-…`).
 function New-FakeRelease([string]$v) {
-  $name = "oprobe-$v-$target"
-  $stage = New-Item -ItemType Directory -Force -Path (Join-Path $work "stage\$name")
-  Set-Content -Path (Join-Path $stage 'oprobe.exe') -Value "fake oprobe $v"
   $dir = New-Item -ItemType Directory -Force -Path (Join-Path $work "root\releases\download\v$v")
-  Compress-Archive -Path $stage -DestinationPath (Join-Path $dir "$name.zip") -Force
-  $hash = (Get-FileHash (Join-Path $dir "$name.zip") -Algorithm SHA256).Hash.ToLowerInvariant()
-  Set-Content -Path (Join-Path $dir 'SHA256SUMS') -Value "$hash  $name.zip" -NoNewline
+  $sums = @()
+  foreach ($flavor in @('', 'cli')) {
+    $prefix = if ($flavor) { "oprobe-$flavor" } else { 'oprobe' }
+    $name = "$prefix-$v-$target"
+    $stage = New-Item -ItemType Directory -Force -Path (Join-Path $work "stage\$name")
+    Set-Content -Path (Join-Path $stage 'oprobe.exe') -Value "fake $prefix $v"
+    Compress-Archive -Path $stage -DestinationPath (Join-Path $dir "$name.zip") -Force
+    $hash = (Get-FileHash (Join-Path $dir "$name.zip") -Algorithm SHA256).Hash.ToLowerInvariant()
+    $sums += "$hash  $name.zip"
+  }
+  Set-Content -Path (Join-Path $dir 'SHA256SUMS') -Value ($sums -join "`n") -NoNewline
 }
 
 try {
@@ -53,6 +59,15 @@ try {
   $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
   if (-not (($userPath -split ';') -contains $dest)) { throw "the user PATH lacks $dest" }
   Write-Host "ok: latest.json -> 9.1.0, PATH updated"
+
+  # -Help prints the help and installs nothing; -Cli installs the CLI-only build.
+  $help = & $installer -Help *>&1 | Out-String
+  if ($help -notmatch 'Usage:' -or $help -notmatch '-Cli') { throw "-Help printed: $help" }
+  $dest = Join-Path $work 'install-cli'
+  & $installer -Cli -Version 9.0.0 -InstallDir $dest
+  $got = Get-Content (Join-Path $dest 'oprobe.exe') -Raw
+  if ($got.Trim() -ne 'fake oprobe-cli 9.0.0') { throw "-Cli: installed '$got'" }
+  Write-Host "ok: -Help, -Cli"
 
   # OPROBE_VERSION pin, OPROBE_MODIFY_PATH=0.
   $dest = Join-Path $work 'install-b'

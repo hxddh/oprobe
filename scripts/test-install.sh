@@ -21,16 +21,31 @@ case "$(uname -s)-$(uname -m)" in
   *) fail "unsupported platform $(uname -s) $(uname -m)" ;;
 esac
 
-# A fake release: <root>/releases/download/v<ver>/{archive,SHA256SUMS}, latest.json, an API answer.
+# A fake release: <root>/releases/download/v<ver>/{archives,SHA256SUMS}, latest.json, an API
+# answer. Each version has the app archive and the CLI-only archive (`oprobe-cli-…`).
 mkrel() {
-  v="$1"; name="oprobe-$v-$target"
-  mkdir -p "$work/stage/$name" "$work/root/releases/download/v$v"
-  printf '#!/bin/sh\necho "oprobe %s"\n' "$v" > "$work/stage/$name/oprobe"
-  chmod 755 "$work/stage/$name/oprobe"
-  tar -C "$work/stage" -czf "$work/root/releases/download/v$v/$name.tar.gz" "$name"
+  v="$1"
+  mkdir -p "$work/root/releases/download/v$v"
+  for flavor in "" "cli"; do
+    name="oprobe-${flavor:+$flavor-}$v-$target"
+    mkdir -p "$work/stage/$name"
+    printf '#!/bin/sh\necho "oprobe%s %s"\n' "${flavor:+-$flavor}" "$v" > "$work/stage/$name/oprobe"
+    chmod 755 "$work/stage/$name/oprobe"
+    tar -C "$work/stage" -czf "$work/root/releases/download/v$v/$name.tar.gz" "$name"
+  done
   (cd "$work/root/releases/download/v$v" &&
-    if command -v sha256sum >/dev/null 2>&1; then sha256sum "$name.tar.gz"; else shasum -a 256 "$name.tar.gz"; fi > SHA256SUMS)
+    if command -v sha256sum >/dev/null 2>&1; then sha256sum -- *.tar.gz; else shasum -a 256 -- *.tar.gz; fi > SHA256SUMS)
 }
+
+# --help prints the help and installs nothing (no server is needed for it).
+mkdir -p "$work/home-help"
+env HOME="$work/home-help" OPROBE_RELEASE_BASE="http://127.0.0.1:9/nowhere" sh "$installer" --help \
+  </dev/null > "$work/out-help" 2>&1 || { cat "$work/out-help"; fail "--help failed"; }
+grep -q "^Usage:" "$work/out-help" || { cat "$work/out-help"; fail "--help printed no usage"; }
+grep -q -- "--cli" "$work/out-help" || fail "--help does not mention --cli"
+[ ! -e "$work/home-help/.local/bin/oprobe" ] || fail "--help installed oprobe"
+if sh "$installer" --bogus </dev/null >/dev/null 2>&1; then fail "an unknown option was accepted"; fi
+echo "ok: --help prints help, unknown options are refused"
 mkrel 9.1.0   # latest.json
 mkrel 9.2.0   # the redirect
 mkrel 9.3.0   # the API
@@ -105,6 +120,20 @@ install_case api 9.3.0 OPROBE_MODIFY_PATH=1 SHELL=/usr/bin/fish
 grep -q "fish_add_path" "$work/home-api/.config/fish/config.fish" || fail "fish config not updated"
 
 install_case pinned 9.0.0 OPROBE_VERSION=v9.0.0 OPROBE_MODIFY_PATH=0
+
+# The CLI-only build, by flag and by variable.
+home="$work/home-cli"; mkdir -p "$home"
+env HOME="$home" SHELL=/bin/bash OPROBE_RELEASE_BASE="$base" OPROBE_VERIFY=checksum \
+  sh "$installer" --cli --version 9.0.0 --no-modify-path </dev/null > "$work/out-cli" 2>&1 ||
+  { cat "$work/out-cli"; fail "--cli: install.sh failed"; }
+[ "$("$home/.local/bin/oprobe")" = "oprobe-cli 9.0.0" ] || { cat "$work/out-cli"; fail "--cli installed the wrong build"; }
+grep -q "CLI only" "$work/out-cli" || fail "--cli: no CLI-only message"
+home="$work/home-cli-env"; mkdir -p "$home"
+env HOME="$home" OPROBE_RELEASE_BASE="$base" OPROBE_VERIFY=checksum OPROBE_FLAVOR=cli \
+  OPROBE_VERSION=9.0.0 OPROBE_MODIFY_PATH=0 sh "$installer" </dev/null > "$work/out-cli-env" 2>&1 ||
+  { cat "$work/out-cli-env"; fail "OPROBE_FLAVOR=cli: install.sh failed"; }
+[ "$("$home/.local/bin/oprobe")" = "oprobe-cli 9.0.0" ] || fail "OPROBE_FLAVOR=cli installed the wrong build"
+echo "ok: the CLI-only build (--cli, OPROBE_FLAVOR=cli)"
 
 # A tampered archive is refused.
 echo "0000000000000000000000000000000000000000000000000000000000000000  oprobe-9.0.0-$target.tar.gz" \
