@@ -52,8 +52,10 @@ impl CommandOutput for ExportOutput {
                 self.run_id, self.format, self.bytes
             ),
             (_, Some(e)) => format!(
-                "pushed run {} to {e} ({} operations, {} requests)\n",
-                self.run_id, self.ops_count, self.requests_count
+                "pushed run {} to {e} ({}, {})\n",
+                self.run_id,
+                crate::util::plural(self.ops_count as u64, "operation"),
+                crate::util::plural(self.requests_count as u64, "request")
             ),
             _ => String::new(),
         }

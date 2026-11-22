@@ -183,6 +183,17 @@ pub fn fmt_bytes(v: u64) -> String {
 }
 
 /// Format a millisecond latency with adaptive precision.
+/// `1 request`, `2 requests` (review C14: not `1 requests`). `noun` is the singular; the
+/// plural adds `s`.
+pub fn plural(n: impl Into<u64>, noun: &str) -> String {
+    let n = n.into();
+    if n == 1 {
+        format!("1 {noun}")
+    } else {
+        format!("{n} {noun}s")
+    }
+}
+
 pub fn fmt_ms(ms: f64) -> String {
     if !ms.is_finite() {
         "-".to_owned()
@@ -524,5 +535,15 @@ mod tests {
         let mut m = std::collections::BTreeMap::new();
         m.insert("endpoint".to_owned(), "http://ak:sk@minio:9000".to_owned());
         assert_eq!(redact_options(&m)["endpoint"], "http://minio:9000");
+    }
+}
+
+#[cfg(test)]
+mod plural_tests {
+    #[test]
+    fn plural_counts() {
+        assert_eq!(super::plural(1u64, "request"), "1 request");
+        assert_eq!(super::plural(0u64, "request"), "0 requests");
+        assert_eq!(super::plural(1105u64, "operation"), "1105 operations");
     }
 }

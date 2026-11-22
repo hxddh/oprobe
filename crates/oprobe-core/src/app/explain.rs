@@ -222,9 +222,9 @@ pub fn explain_run(run: &Run, top: usize) -> ExplainRun {
                 .map(factor_sentence)
                 .collect();
             narrative.push(format!(
-                "The slowest {}% of requests ({} requests, ≥ {}) are mostly {}.",
+                "The slowest {}% of requests ({}, ≥ {}) are mostly {}.",
                 a.slowest_pct,
-                a.attribution.selected_count,
+                crate::util::plural(a.attribution.selected_count as u64, "request"),
                 fmt_ms(min),
                 factors.join("; ")
             ));
@@ -486,8 +486,9 @@ impl CommandOutput for ExplainOutput {
                 }
                 if let Some(s) = &e.slowest {
                     o += &format!(
-                        "  slowest {}% ({} requests):\n",
-                        s.slowest_pct, s.attribution.selected_count
+                        "  slowest {}% ({}):\n",
+                        s.slowest_pct,
+                        crate::util::plural(s.attribution.selected_count as u64, "request")
                     );
                     if s.attribution.factors.is_empty() {
                         o += &dim("    no distinctive attribute\n");

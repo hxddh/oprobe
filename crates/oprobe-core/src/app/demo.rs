@@ -171,9 +171,13 @@ pub fn narrate(r: &Report, run_id: &str) -> (Vec<DemoStep>, Vec<NextStep>) {
     let mut time = vec![format!("Share of operation time: {}.", top.join(", "))];
     if r.resilience.throttled_responses > 0 {
         time.push(format!(
-            "{} requests were throttled and retried ({} of backoff in total): that is time and \
+            "{} throttled and retried ({} of backoff in total): that is time and \
              request cost your client pays for asking too much at once.",
-            r.resilience.throttled_responses,
+            if r.resilience.throttled_responses == 1 {
+                "1 request was".to_owned()
+            } else {
+                format!("{} requests were", r.resilience.throttled_responses)
+            },
             fmt_ms(r.resilience.retry_backoff_ms)
         ));
     }
