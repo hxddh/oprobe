@@ -100,7 +100,8 @@ large a limit should be or how much it would help; claiming so would be a guess.
    noise floor learned from A/A pairs, stops as soon as it can decide, or at `--budget`.
 4. **Decide**: `improved`, `worse` (exit 3) or `inconclusive` on the objective: **goodput**
    (successful operations per second; the default) or **p99**. Intervals are Wilson/beta and stay
-   in range; secondary metrics are shown and never decide.
+   in range; secondary metrics are shown and never decide. Deciding takes at least 3 A/B pairs;
+   with fewer, the verdict is `inconclusive`.
 5. **Save**: every trial run is saved as a child of the prove run, hidden from `show --list`.
 
 The result is a **proven layer diff**: the objective's change with its interval, the evidence,

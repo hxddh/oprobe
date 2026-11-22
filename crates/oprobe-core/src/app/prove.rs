@@ -40,6 +40,10 @@ pub const KNEE_RATIO: f64 = 0.03;
 const MIN_NOISE_SD: f64 = 0.02;
 /// The smallest effect the sequential test looks for.
 const MIN_EFFECT: f64 = 0.03;
+/// A/B pairs at least before a verdict other than `inconclusive`: with fewer, the spread of
+/// the pairs cannot be estimated (`--pairs` is raised to this, and a budget that allows
+/// fewer gives `inconclusive`).
+pub const MIN_DECISIVE_PAIRS: usize = 3;
 /// OpenDAL's TailCutLayer ignores its first 10 s: trials of a tail-cut change warm up longer.
 const TAIL_CUT_WARMUP: Duration = Duration::from_millis(11_500);
 
@@ -111,7 +115,7 @@ pub struct ProveRequest {
     pub max_throttle_ratio: Option<f64>,
     /// Wall-time budget of the whole proof, e.g. 5m
     pub budget: Option<String>,
-    /// A/B pairs at most (2–12)
+    /// A/B pairs at most (3–12; at least 3 are needed to decide)
     pub pairs: usize,
     /// Measurement window of one trial (default 2s, at most the run's own window)
     pub trial_duration: Option<String>,
@@ -1026,25 +1030,27 @@ fn mean(ts: &[&ProveTrial], f: impl Fn(&ProveTrial) -> f64) -> f64 {
 }
 
 /// The A/A noise floor: the RMS log ratio of consecutive baseline trials (a per-pair spread),
-/// at least [`MIN_NOISE_SD`].
+/// at least [`MIN_NOISE_SD`]. Fewer than two A/A differences cannot say how precise the floor
+/// is, so it is doubled (and with none, it is twice the minimum).
 fn noise_floor(a: &[f64]) -> f64 {
     let d: Vec<f64> = a
         .windows(2)
         .filter(|w| w[0] > 0.0 && w[1] > 0.0)
         .map(|w| (w[1] / w[0]).ln())
         .collect();
-    if d.is_empty() {
-        return MIN_NOISE_SD;
-    }
-    (d.iter().map(|x| x * x).sum::<f64>() / d.len() as f64)
-        .sqrt()
-        .max(MIN_NOISE_SD)
+    let rms = if d.is_empty() {
+        0.0
+    } else {
+        (d.iter().map(|x| x * x).sum::<f64>() / d.len() as f64).sqrt()
+    };
+    let floor = rms.max(MIN_NOISE_SD);
+    if d.len() < 2 { 2.0 * floor } else { floor }
 }
 
 /// The objective's relative change (candidate vs baseline) over the interleaved pairs: the
-/// mean paired log ratio ± 1.96 σ/√n, where σ is the larger of the pairs' own spread and the
-/// A/A noise floor (the spread the sequential test assumes), as `exp(·) − 1` — never below
-/// −100 %.
+/// mean paired log ratio ± t(0.975, n − 1) σ/√n (Student's t: few pairs give a wide
+/// interval), where σ is the larger of the pairs' own spread and the A/A noise floor (the
+/// spread the sequential test assumes), as `exp(·) − 1` — never below −100 %.
 fn objective_interval(obj: ProveObjective, a: &[f64], b: &[f64], floor: f64) -> Interval {
     let d: Vec<f64> = a
         .iter()
@@ -1061,7 +1067,7 @@ fn objective_interval(obj: ProveObjective, a: &[f64], b: &[f64], floor: f64) -> 
     } else {
         0.0
     };
-    let h = 1.96 * sd.max(floor) / n.sqrt();
+    let h = crate::analysis::verdict::t975(n - 1.0) * sd.max(floor) / n.sqrt();
     // Back to the metric's own direction (p99: lower is better, so the sign flips).
     let (est, lo, hi) = match obj {
         ProveObjective::Goodput => (m, m - h, m + h),
@@ -1186,8 +1192,8 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
         };
         plan.assumptions.push(format!(
             "up to {} trials of this plan: {sizing} sizing trials, then up to {} interleaved A/B pairs of {}",
-            sizing + 2 * req.pairs.clamp(2, 12),
-            req.pairs.clamp(2, 12),
+            sizing + 2 * req.pairs.clamp(MIN_DECISIVE_PAIRS, 12),
+            req.pairs.clamp(MIN_DECISIVE_PAIRS, 12),
             probe_sets
                 .iter()
                 .map(|(k, v)| crate::operator::redacted_edit(k, v))
@@ -1271,8 +1277,8 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
     }
     let sets = sets_at(&change, value, &run);
     // Step 3: interleaved A/B with the sequential test.
-    let max_pairs = req.pairs.clamp(2, 12);
-    let min_pairs = defaults.min_pairs;
+    let max_pairs = req.pairs.clamp(MIN_DECISIVE_PAIRS, 12);
+    let min_pairs = defaults.min_pairs.max(MIN_DECISIVE_PAIRS);
     let mut a_vals: Vec<f64> = Vec::new();
     let mut b_vals: Vec<f64> = Vec::new();
     let mut pairs = 0u64;
@@ -1328,8 +1334,9 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
         ProveObjective::P99 => x < 0.0,
     };
     let excludes_zero = delta.low > 0.0 || delta.high < 0.0;
+    let too_few = (pairs as usize) < MIN_DECISIVE_PAIRS;
     let verdict = match decision {
-        _ if !excludes_zero => ProveVerdict::Inconclusive,
+        _ if too_few || !excludes_zero => ProveVerdict::Inconclusive,
         SprtDecision::Better => ProveVerdict::Improved,
         SprtDecision::Worse => ProveVerdict::Worse,
         _ if (1.0 + delta.estimate).max(1e-9).ln().abs() > floor => {
@@ -1341,7 +1348,12 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
         }
         _ => ProveVerdict::Inconclusive,
     };
-    if decision == SprtDecision::Continue {
+    if too_few {
+        notes.push(format!(
+            "the budget allowed only {pairs} A/B pair{}: at least {MIN_DECISIVE_PAIRS} are needed to decide",
+            if pairs == 1 { "" } else { "s" }
+        ));
+    } else if decision == SprtDecision::Continue {
         notes.push(format!(
             "the sequential test did not decide within {pairs} pairs: the verdict reads the interval"
         ));
@@ -1461,8 +1473,32 @@ mod tests {
 
     #[test]
     fn the_noise_floor_has_a_minimum() {
-        assert_eq!(noise_floor(&[100.0]), MIN_NOISE_SD);
+        // No A/A difference yet: the minimum, widened.
+        assert_eq!(noise_floor(&[100.0]), 2.0 * MIN_NOISE_SD);
         let f = noise_floor(&[100.0, 120.0, 100.0]);
         assert!(f > 0.15 && f < 0.2, "{f}");
+    }
+
+    #[test]
+    fn one_aa_difference_is_not_a_precise_floor() {
+        let one = noise_floor(&[100.0, 110.0]);
+        let d = (110.0f64 / 100.0).ln();
+        assert!((one - 2.0 * d).abs() < 1e-12, "{one}");
+    }
+
+    #[test]
+    fn few_pairs_give_a_t_interval() {
+        // Three pairs, each +10 % with a little spread: t(0.975, 2) = 4.303, not 1.96.
+        let a = [100.0, 100.0, 100.0];
+        let b = [109.0, 110.0, 111.0];
+        let i = objective_interval(ProveObjective::Goodput, &a, &b, 0.0);
+        let d: Vec<f64> = a.iter().zip(&b).map(|(x, y)| (y / x).ln()).collect();
+        let m = d.iter().sum::<f64>() / 3.0;
+        let sd = (d.iter().map(|x| (x - m).powi(2)).sum::<f64>() / 2.0).sqrt();
+        let want = (m + 4.303 * sd / 3f64.sqrt()).exp() - 1.0;
+        assert!((i.high - want).abs() < 1e-9, "{i:?} vs {want}");
+        // One pair: the widest quantile, whatever the floor.
+        let one = objective_interval(ProveObjective::Goodput, &[100.0], &[110.0], 0.02);
+        assert!(one.high - one.low > 0.4, "{one:?}");
     }
 }

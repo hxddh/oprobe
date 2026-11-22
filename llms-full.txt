@@ -368,7 +368,8 @@ large a limit should be or how much it would help; claiming so would be a guess.
    noise floor learned from A/A pairs, stops as soon as it can decide, or at `--budget`.
 4. **Decide**: `improved`, `worse` (exit 3) or `inconclusive` on the objective: **goodput**
    (successful operations per second; the default) or **p99**. Intervals are Wilson/beta and stay
-   in range; secondary metrics are shown and never decide.
+   in range; secondary metrics are shown and never decide. Deciding takes at least 3 A/B pairs;
+   with fewer, the verdict is `inconclusive`.
 5. **Save**: every trial run is saved as a child of the prove run, hidden from `show --list`.
 
 The result is a **proven layer diff**: the objective's change with its interval, the evidence,
@@ -473,7 +474,7 @@ The `HttpFetch` client (OpenDAL's reqwest client).
 |---|---|
 | `version` | `auto` (OpenDAL's default: HTTP/1.1), `h1` or `h2` |
 | `keep_alive` | reuse connections (default true) |
-| `proxy` | egress proxy URL; `"none"` ignores `HTTPS_PROXY`/`HTTP_PROXY` (unset: the environment) |
+| `proxy` | egress proxy URL; `"none"` (also `--set http.proxy=none`) means no proxy, whatever `HTTPS_PROXY`/`HTTP_PROXY` say; unset (`--set http.proxy=unset`): the environment |
 | `ca_cert` | an extra PEM CA bundle to trust |
 | `insecure` | skip certificate verification (self-signed development endpoints only) |
 
@@ -483,7 +484,8 @@ The `HttpFetch` client (OpenDAL's reqwest client).
 takes the same paths. The paths: `url`, `options.KEY`, `layers.NAME` (`on`/`off`),
 `layers.NAME.FIELD`, `read.chunk`, `read.concurrent`, `read.gap`, `write.chunk`,
 `write.concurrent`, `http.version`, `http.keep_alive`, `http.proxy`, `http.ca_cert`,
-`http.insecure`. `none` removes an optional value.
+`http.insecure`. `none` removes an optional value, except for `http.proxy`, where it means no proxy
+(`unset` goes back to the environment's).
 
 ```bash
 oprobe run op.toml --set layers.concurrent_limit.http=32 --set read.gap=1MiB
@@ -617,6 +619,10 @@ finding), or `--with`. When the remedy has a size, short trials pick it first. T
 operator and the changed one run interleaved until a sequential test decides on the objective, or
 the budget ends. Prints the proven layer diff (Rust and TOML) with its evidence; `-o json` prints
 the prove result (`schemas/prove.json`). Exit 3 when the change is worse on the objective.
+
+A verdict other than `inconclusive` needs at least **3 A/B pairs**: when the budget allows fewer,
+the verdict is `inconclusive` (exit 0) with a note. The objective's interval uses Student's t for
+the number of pairs, and a noise floor learned from a single A/A difference is doubled.
 
 `RUN` is a run id, an id prefix, `last`, `last~N` or a label. `FINDING` is a finding code
 (`throttling`, `tail_stragglers`, …).

@@ -234,8 +234,8 @@ pub struct ProveArgs {
     /// Measurement window of one trial (default 2s)
     #[arg(long, value_name = "DURATION", value_parser = parse::duration, hide = true)]
     pub trial: Option<String>,
-    /// A/B pairs at most (default 6)
-    #[arg(long, value_name = "N", value_parser = at_least::<2>, hide = true)]
+    /// A/B pairs at most (default 6; at least 3, the fewest that can decide)
+    #[arg(long, value_name = "N", value_parser = at_least::<3>, hide = true)]
     pub pairs: Option<usize>,
     #[command(flatten)]
     pub safety: SafetyArgs,

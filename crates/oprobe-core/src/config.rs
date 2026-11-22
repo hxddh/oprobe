@@ -28,8 +28,8 @@ pub mod prove_defaults {
     pub const MAX_THROTTLE_RATIO: f64 = 0.001;
     /// A/B pairs at most (the sequential test usually stops earlier).
     pub const MAX_PAIRS: usize = 6;
-    /// A/B pairs at least before a decision.
-    pub const MIN_PAIRS: usize = 2;
+    /// A/B pairs at least before a decision (fewer give `inconclusive`).
+    pub const MIN_PAIRS: usize = 3;
     /// Sizing trials at most (the bracket search).
     pub const MAX_SIZING_TRIALS: usize = 8;
 }

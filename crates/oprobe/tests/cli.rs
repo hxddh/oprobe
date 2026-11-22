@@ -452,7 +452,7 @@ fn prove_judges_a_change_and_hides_its_trials() {
         "--trial",
         "300ms",
         "--pairs",
-        "2",
+        "3",
         "-o",
         "json",
         "-q",
@@ -464,22 +464,22 @@ fn prove_judges_a_change_and_hides_its_trials() {
     assert_eq!(v["run_id"], run_id.as_str());
     assert_eq!(v["change"][0], "read.gap=1MiB");
     assert!(v["diff"]["toml"].as_str().unwrap().contains("gap"), "{v}");
-    assert_eq!(v["pairs_count"], 2);
+    assert_eq!(v["pairs_count"], 3);
     let d = &v["objective_delta"];
     assert!(d["low"].as_f64().unwrap() > -1.0, "never below -100 %: {d}");
     assert!(d["low"].as_f64().unwrap() <= d["high"].as_f64().unwrap());
     let trials = v["trials"].as_array().unwrap();
-    assert_eq!(trials.len(), 4);
+    assert_eq!(trials.len(), 6);
     // The trials are children of the prove: hidden from the list, and `last` is still the
     // run the user made (U4).
     let o = env.run(&["show", "--list", "-o", "json"]);
     let list = json(&o);
     validate("run-list", &list);
     assert_eq!(list["total_count"], 1);
-    assert_eq!(list["hidden_trials_count"], 4);
+    assert_eq!(list["hidden_trials_count"], 6);
     assert_eq!(list["proves"][0]["prove_id"], v["prove_id"]);
     let all = json(&env.run(&["show", "--list", "--all", "-o", "json"]));
-    assert_eq!(all["total_count"], 5);
+    assert_eq!(all["total_count"], 7);
     let trial = json(&env.run(&["show", trials[0]["run_id"].as_str().unwrap(), "-o", "json"]));
     assert_eq!(trial["report"]["run"]["parent_id"], v["prove_id"]);
     let last = json(&env.run(&["show", "last", "-o", "json"]));
@@ -515,6 +515,44 @@ fn prove_judges_a_change_and_hides_its_trials() {
             > 0
     );
     assert_eq!(env.runs().len(), 1);
+}
+
+/// A budget that allows fewer than three A/B pairs cannot decide: the verdict is
+/// `inconclusive` (exit 0), with a note, however large the measured difference.
+#[test]
+fn prove_needs_three_pairs_to_decide() {
+    let env = Env::new();
+    let o = env.run(&run_args(&["lab://clean"], &["-q", "-o", "json"]));
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    // Whatever one pair measures, it cannot decide.
+    let o = env.run(&[
+        "prove",
+        "last",
+        "--with",
+        "layers.retry.min_delay=10ms",
+        "--trial",
+        "300ms",
+        "--budget",
+        "1s",
+        "-o",
+        "json",
+    ]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let v = json(&o);
+    validate("prove", &v);
+    assert_eq!(v["pairs_count"], 1, "{v}");
+    assert_eq!(v["verdict"], "inconclusive", "{v}");
+    assert!(
+        v["notes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n.as_str().unwrap().contains("allowed only 1 A/B pair")),
+        "{v}"
+    );
+    // `--pairs` below three is refused.
+    let o = env.run(&["prove", "last", "--with", "read.gap=1MiB", "--pairs", "2"]);
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
 }
 
 /// `--with` (and `--set`) pairs apply as one change, in any order: a layer switched on with its

@@ -81,6 +81,10 @@ operator and the changed one run interleaved until a sequential test decides on 
 the budget ends. Prints the proven layer diff (Rust and TOML) with its evidence; `-o json` prints
 the prove result (`schemas/prove.json`). Exit 3 when the change is worse on the objective.
 
+A verdict other than `inconclusive` needs at least **3 A/B pairs**: when the budget allows fewer,
+the verdict is `inconclusive` (exit 0) with a note. The objective's interval uses Student's t for
+the number of pairs, and a noise floor learned from a single A/A difference is doubled.
+
 `RUN` is a run id, an id prefix, `last`, `last~N` or a label. `FINDING` is a finding code
 (`throttling`, `tail_stragglers`, …).
 

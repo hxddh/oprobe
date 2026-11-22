@@ -66,6 +66,9 @@ Everything under **Changed** and **Removed** is breaking; 5.x run files are not 
 - **Releases:** every platform gets the app build and a CLI-only build
   (`oprobe-cli-<ver>-<target>` archives; `--no-default-features --features cli`). `install.sh
   --cli` / `install.ps1 -Cli` install it; `install.sh --help` prints help instead of installing.
+- **`prove` needs at least 3 A/B pairs to decide:** with fewer (a small `--budget`), the verdict
+  is `inconclusive` with a note; `--pairs` is at least 3. The objective's interval uses Student's
+  t for the number of pairs, and a noise floor from a single A/A difference is doubled.
 - **`layers.tail_cut` carries every parameter oprobe applies:** `percentile` (50..99),
   `safety_factor` (1.5), `min_samples` (32), `min_deadline` ("50ms"), `max_deadline` (the
   operation timeout) and `window` ("60s"). The measured layer and the generated Rust are built
