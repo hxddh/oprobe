@@ -1287,6 +1287,16 @@ fn default_budgets_and_probe_addresses() {
         json!({"endpoint": "https://8.8.8.8", "proxy": "http://192.168.1.1:3128"}),
     );
     assert_eq!(e["code"], "safety.refused", "{e}");
+
+    // The load generator and workers are never the caller's choice.
+    for args in [
+        json!({"target": "memory://", "client": {"kind": "exec", "command": "touch /tmp/pwned"}}),
+        json!({"target": "memory://", "workers": {"local": 2}}),
+        json!({"target": "memory://", "set": ["client=exec:sh"]}),
+    ] {
+        let e = m.tool_err("start_run", args.clone());
+        assert_eq!(e["code"], "safety.refused", "{args}: {e}");
+    }
 }
 
 /// S3: object keys are untrusted data: never in the text content, escaped and kept under

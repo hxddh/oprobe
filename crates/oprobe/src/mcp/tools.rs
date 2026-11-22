@@ -963,6 +963,41 @@ fn check_unknown(name: &str, a: &Map<String, Value>) -> anyhow::Result<()> {
     .into())
 }
 
+/// Arguments and `set` keys that would choose the load generator or remote workers: an MCP call
+/// runs only the in-process OpenDAL client (`exec:` spawns a command, workers receive the
+/// workload and its credentials).
+const LOAD_KEYS: [&str; 5] = ["client", "workers", "worker", "exec", "local_workers"];
+
+fn load_refusal(what: &str) -> anyhow::Error {
+    OprobeError::new(
+        ErrorCode::SafetyRefused,
+        format!("`{what}` cannot be set through MCP: tools run the in-process OpenDAL client only"),
+    )
+    .with_hint(
+        "other clients and distributed runs are started from the CLI (`--client`, `--workers`)",
+    )
+    .into()
+}
+
+fn check_load_arguments(a: &Map<String, Value>) -> anyhow::Result<()> {
+    if let Some(k) = a.keys().find(|k| LOAD_KEYS.contains(&k.as_str())) {
+        return Err(load_refusal(k));
+    }
+    for v in a.get("set").and_then(Value::as_array).into_iter().flatten() {
+        let key = v
+            .as_str()
+            .and_then(|s| s.split('=').next())
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        let root = key.split(['.', '_']).next().unwrap_or_default();
+        if LOAD_KEYS.contains(&key.as_str()) || LOAD_KEYS.contains(&root) {
+            return Err(load_refusal(&key));
+        }
+    }
+    Ok(())
+}
+
 fn args<T: DeserializeOwned>(v: Map<String, Value>) -> anyhow::Result<T> {
     serde_json::from_value(Value::Object(v)).map_err(|e| {
         OprobeError::new(
@@ -981,6 +1016,7 @@ pub async fn call(
     a: Map<String, Value>,
     cx: CallCx,
 ) -> Result<Reply, ErrorBody> {
+    check_load_arguments(&a).map_err(err)?;
     check_unknown(name, &a).map_err(err)?;
     let r = match name {
         "discover_targets" => discover_targets(st),
@@ -1507,6 +1543,9 @@ fn from_reference(st: &State, a: &PlanIn) -> anyhow::Result<Option<Profile>> {
 }
 
 async fn prepare(st: &State, a: &PlanIn) -> anyhow::Result<Prepared> {
+    if let Some(from) = &a.from {
+        crate::guard::refuse_foreign_load(&load_run(st, from)?.report)?;
+    }
     let (profile, target_name) = call_profile(st, a)?;
     let reference = from_reference(st, a)?;
     let budgets = budgets_of(&st.cfg.budgets, &a.budgets)?;
@@ -2996,6 +3035,7 @@ fn apply_profile(st: &Arc<State>, a: ApplyProfileIn) -> anyhow::Result<Reply> {
         .into());
     }
     let run = load_run(st, &a.from)?;
+    crate::guard::refuse_foreign_load(&run.report)?;
     let mut set = a.set.clone();
     if set.is_empty()
         && let Some(r) = run
@@ -3136,6 +3176,39 @@ mod tests {
             bytes <= super::super::responses::MAX_TOOLS_LIST_BYTES,
             "tools/list is {bytes} bytes"
         );
+    }
+
+    /// SCALE: an MCP call never picks the load generator or remote workers.
+    #[test]
+    fn client_and_workers_cannot_be_set() {
+        let code = |a: Value| {
+            let m = a.as_object().unwrap().clone();
+            check_load_arguments(&m).map_err(|e| crate::errors::classify(&e, "s3").code)
+        };
+        let refused = Err(ErrorCode::SafetyRefused);
+        assert_eq!(code(serde_json::json!({"target": "memory://"})), Ok(()));
+        assert_eq!(
+            code(serde_json::json!({"client": {"kind": "exec", "command": "sh"}})),
+            refused
+        );
+        assert_eq!(code(serde_json::json!({"workers": {"local": 4}})), refused);
+        assert_eq!(code(serde_json::json!({"set": ["concurrency=8"]})), Ok(()));
+        assert_eq!(
+            code(serde_json::json!({"set": ["client=exec:sh"]})),
+            refused
+        );
+        assert_eq!(
+            code(serde_json::json!({"set": ["workers=10.0.0.1:7000"]})),
+            refused
+        );
+        assert_eq!(
+            code(serde_json::json!({"set": ["client.command=sh"]})),
+            refused
+        );
+        let mut report = crate::report::fixture::report();
+        assert!(crate::guard::refuse_foreign_load(&report).is_ok());
+        report.client.kind = "exec".into();
+        assert!(crate::guard::refuse_foreign_load(&report).is_err());
     }
 
     #[test]
