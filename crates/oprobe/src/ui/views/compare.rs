@@ -21,6 +21,7 @@ fn status_tone(s: Status) -> Tone {
         Status::Improved => Tone::Ok,
         Status::Fail => Tone::Crit,
         Status::Skipped => Tone::Neutral,
+        Status::Warn | Status::Inconclusive => Tone::Warn,
     }
 }
 
@@ -60,6 +61,8 @@ fn status_label(s: Status) -> &'static str {
         Status::Improved => "better",
         Status::Fail => "worse",
         Status::Skipped => "skipped",
+        Status::Warn => "worse (within limit)",
+        Status::Inconclusive => "inconclusive",
     }
 }
 

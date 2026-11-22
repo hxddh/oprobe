@@ -211,6 +211,7 @@ impl From<CompareArgs> for i::CompareRequest {
             allow_workload_change: a.allow_workload_change,
             allow_target_change: a.allow_target_change,
             strict: a.strict,
+            fail_on_warn: a.fail_on_warn,
             markdown: a.markdown,
             junit: a.junit,
             json: a.json,

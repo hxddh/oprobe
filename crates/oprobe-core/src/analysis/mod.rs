@@ -12,6 +12,7 @@ pub mod gate;
 pub mod hints;
 pub mod hypothesis;
 pub mod limits;
+pub mod menu;
 pub mod outliers;
 pub mod segments;
 pub mod simulate;

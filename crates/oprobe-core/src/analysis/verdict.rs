@@ -322,7 +322,7 @@ mod tests {
         let p = log_ratio(&[100.0, 102.0, 98.0], &[80.0, 81.0, 79.0], true);
         assert!(p.low > -0.25 && p.high < -0.15, "{p:?}");
         let (lo, hi) = wilson(0.0, 1000.0);
-        assert_eq!(lo, 0.0);
+        assert!(lo.abs() < 1e-12);
         assert!(hi > 0.0 && hi < 0.01);
         let d = ratio_difference(50.0, 1000.0, 0.0, 1000.0);
         assert!(d.low >= -1.0 && d.high < 0.0, "{d:?}");

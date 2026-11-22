@@ -59,6 +59,9 @@ pub struct Thresholds {
     /// Runs that are not comparable are an error (exit 2) instead of a warning (exit 0).
     #[serde(default)]
     pub strict: bool,
+    /// A `warn` (significantly worse within the limit) fails the gate too (exit 3).
+    #[serde(default)]
+    pub fail_on_warn: bool,
 }
 
 impl Default for Thresholds {
@@ -80,6 +83,7 @@ impl Default for Thresholds {
             allow_workload_change: false,
             allow_target_change: false,
             strict: false,
+            fail_on_warn: false,
         }
     }
 }
@@ -95,8 +99,15 @@ pub const MISSED_RATIO: f64 = 0.01;
 pub enum Status {
     Pass,
     Improved,
+    /// Significantly worse and over the limit (design v5 §4: the `fail` tier).
     Fail,
     Skipped,
+    /// Significantly worse, but within the limit (the `warn` tier: a real, smaller
+    /// regression; A13).
+    Warn,
+    /// Not significant, yet the interval reaches past the limit: neither a pass nor a
+    /// regression (never shown as "same").
+    Inconclusive,
 }
 
 impl Status {
@@ -106,6 +117,8 @@ impl Status {
             Status::Improved => "improved",
             Status::Fail => "fail",
             Status::Skipped => "skipped",
+            Status::Warn => "warn",
+            Status::Inconclusive => "inconclusive",
         }
     }
 }
@@ -267,6 +280,12 @@ pub enum GateVerdict {
     Passed,
     /// Comparable and at least one check failed (exit 3).
     Regression,
+    /// Comparable, nothing failed, but a check is significantly worse within its limit (exit 0,
+    /// or 3 with `fail_on_warn`).
+    Warned,
+    /// Comparable, nothing failed or warned, but a check could not rule out a regression
+    /// (exit 0).
+    Inconclusive,
     /// Different target or workload: no regression verdict (exit 0 with a warning, exit 2
     /// with `--strict`).
     NotComparable,
@@ -277,6 +296,8 @@ impl GateVerdict {
         match self {
             GateVerdict::Passed => "passed",
             GateVerdict::Regression => "regression",
+            GateVerdict::Warned => "passed with warnings",
+            GateVerdict::Inconclusive => "inconclusive",
             GateVerdict::NotComparable => "not comparable",
         }
     }
@@ -305,17 +326,27 @@ impl DiffReport {
             GateVerdict::NotComparable
         } else if self.checks.iter().any(|c| c.verdict == Status::Fail) {
             GateVerdict::Regression
+        } else if self.checks.iter().any(|c| c.verdict == Status::Warn) {
+            GateVerdict::Warned
+        } else if self.checks.iter().any(|c| c.verdict == Status::Inconclusive) {
+            GateVerdict::Inconclusive
         } else {
             GateVerdict::Passed
         };
-        self.passed = self.verdict == GateVerdict::Passed;
+        self.passed = match self.verdict {
+            GateVerdict::Passed | GateVerdict::Inconclusive => true,
+            GateVerdict::Warned => !self.thresholds.fail_on_warn,
+            _ => false,
+        };
     }
 
     /// The exit code of this verdict (3 on a regression; 2 for non-comparable runs under
     /// `--strict`).
     pub fn exit_code(&self) -> u8 {
         match self.verdict {
-            GateVerdict::Passed => crate::errors::exit::OK,
+            GateVerdict::Passed | GateVerdict::Inconclusive => crate::errors::exit::OK,
+            GateVerdict::Warned if self.thresholds.fail_on_warn => crate::errors::exit::GATE,
+            GateVerdict::Warned => crate::errors::exit::OK,
             GateVerdict::Regression => crate::errors::exit::GATE,
             GateVerdict::NotComparable if self.thresholds.strict => crate::errors::exit::USAGE,
             GateVerdict::NotComparable => crate::errors::exit::OK,

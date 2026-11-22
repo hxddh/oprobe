@@ -2005,6 +2005,12 @@ fn compare_runs(st: &Arc<State>, a: CompareIn) -> anyhow::Result<Reply> {
         match d.verdict {
             crate::report::diff::GateVerdict::Passed => "passed (no regression)".to_owned(),
             crate::report::diff::GateVerdict::Regression => "REGRESSION (gate failed)".to_owned(),
+            crate::report::diff::GateVerdict::Warned => {
+                "passed with warnings (significantly worse within the limits)".to_owned()
+            }
+            crate::report::diff::GateVerdict::Inconclusive => {
+                "inconclusive (a regression could not be ruled out)".to_owned()
+            }
             crate::report::diff::GateVerdict::NotComparable => format!(
                 "not comparable, no verdict: {}",
                 d.gate.identity.reasons.join("; ")

@@ -141,6 +141,10 @@ pub struct Trial {
     pub peak_inflight_per_op: f64,
     pub feasible: bool,
     pub note: String,
+    /// The pace of an open-loop trial (operations per second; absent: closed loop at the
+    /// profile's rate).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_per_s: Option<f64>,
 }
 
 impl Trial {
@@ -267,6 +271,7 @@ impl Tuner<'_> {
             peak_inflight_per_op: cap.per_op.peak_inflight_per_op.max(1.0),
             feasible: true,
             note: String::new(),
+            rate_per_s: opts.unwrap_or(&self.opts.trial).rate,
         };
         let mut why = Vec::new();
         if snap.summary.ops == 0 {

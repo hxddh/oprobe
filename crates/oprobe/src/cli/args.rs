@@ -903,6 +903,9 @@ pub struct CompareArgs {
     /// Runs of different targets or workloads are an error (exit 2) instead of a warning
     #[arg(long)]
     pub strict: bool,
+    /// A significant regression within the limits (`warn`) fails the gate too (exit 3)
+    #[arg(long)]
+    pub fail_on_warn: bool,
     /// Write a Markdown summary (PR comment / job summary)
     #[arg(long, value_name = "FILE")]
     pub markdown: Option<PathBuf>,

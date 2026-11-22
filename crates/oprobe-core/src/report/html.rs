@@ -1850,6 +1850,8 @@ pub fn render_compare(d: &DiffReport) -> String {
     let (cls, icon, label) = match d.verdict {
         GateVerdict::Passed => ("st-ok", "✓", "PASSED"),
         GateVerdict::Regression => ("st-critical", "✖", "FAILED"),
+        GateVerdict::Warned => ("st-attention", "▲", "WARN"),
+        GateVerdict::Inconclusive => ("st-attention", "?", "INCONCLUSIVE"),
         GateVerdict::NotComparable => ("st-attention", "▲", "NOT COMPARABLE"),
     };
     let _ = write!(
@@ -1870,6 +1872,12 @@ pub fn render_compare(d: &DiffReport) -> String {
         "<section id=\"verdict\"><div class=\"verdict\"><span class=\"pill {cls}\">{icon} {label}</span><p class=\"headline\">{}</p></div>",
         match d.verdict {
             GateVerdict::Passed => "No check exceeded its limit.".to_owned(),
+            GateVerdict::Warned => {
+                "A check is significantly worse, but within its limit.".to_owned()
+            }
+            GateVerdict::Inconclusive => {
+                "No check failed, but some could not rule out a regression.".to_owned()
+            }
             GateVerdict::Regression =>
                 format!("{fails} check(s) exceeded their limit (exit code 3)."),
             GateVerdict::NotComparable => esc(&format!(
@@ -1907,6 +1915,8 @@ pub fn render_compare(d: &DiffReport) -> String {
             Status::Improved => ("st-review", "▲ improved"),
             Status::Fail => ("st-critical", "✖ fail"),
             Status::Skipped => ("", "– skipped"),
+            Status::Warn => ("st-attention", "▲ warn"),
+            Status::Inconclusive => ("st-attention", "? inconclusive"),
         };
         let _ = write!(
             b,

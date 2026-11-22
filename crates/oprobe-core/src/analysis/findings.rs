@@ -2270,19 +2270,37 @@ pub(crate) mod tests {
         // Throttling explains the run: no separate tail item about retries.
         assert!(f.iter().all(|x| x.code != "retries"));
 
-        // Throttling that does not follow concurrency: pace the request rate instead.
+        // Throttling that follows the request rate (a token bucket, design v5 §4): pace the
+        // request rate instead.
         run.report.capacity.inflight_ceiling = None;
-        run.report.capacity.rate_ceiling_requests_per_s = Some(1000.0);
+        run.report.capacity.hypotheses = vec![crate::analysis::hypothesis::Hypothesis {
+            kind: HypothesisKind::RateLimit,
+            params: crate::analysis::hypothesis::HypothesisParams {
+                requests_per_s: Some(1000.0),
+                ..Default::default()
+            },
+            confidence: crate::analysis::capacity::Confidence::High,
+            selected: true,
+            ..Default::default()
+        }];
+        let want = run.report.capacity.safe_rate(0.15).unwrap().floor();
         let f = derive(&run, &[]);
         let t = f.iter().find(|x| x.code == "throttling").unwrap();
         let v = t.verification.as_ref().unwrap();
-        assert_eq!(v.overrides.workload["rate"], "850", "{v:?}");
-        // Nothing known: halve.
+        assert_eq!(v.overrides.workload["rate"], format!("{want:.0}"), "{v:?}");
+        assert!(t.advice.contains("not concurrency"), "{}", t.advice);
+        // Random throttling: no slow-down advice at all (A5).
+        run.report.capacity.hypotheses[0].kind = HypothesisKind::None;
+        let f = derive(&run, &[]);
+        let t = f.iter().find(|x| x.code == "throttling").unwrap();
+        assert!(t.verification.is_none(), "{:?}", t.verification);
+        assert!(t.advice.contains("random"), "{}", t.advice);
+        // Nothing known with confidence: inconclusive, nothing to replay.
         run.report.capacity = Default::default();
         let f = derive(&run, &[]);
         let t = f.iter().find(|x| x.code == "throttling").unwrap();
-        let v = t.verification.as_ref().unwrap();
-        assert_eq!(v.overrides.knobs["concurrency"], "16", "{v:?}");
+        assert!(t.verification.is_none(), "{:?}", t.verification);
+        assert!(t.advice.starts_with("Inconclusive"), "{}", t.advice);
     }
 
     /// A capacity estimate with a ceiling of 24 requests in flight, one per operation, from a

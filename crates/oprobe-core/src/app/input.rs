@@ -475,6 +475,9 @@ pub struct CompareRequest {
     pub allow_target_change: bool,
     /// Runs of different targets or workloads are an error (exit 2) instead of a warning
     pub strict: bool,
+    /// A significant regression within the limits (`warn`) fails the gate too (exit 3)
+    #[serde(default)]
+    pub fail_on_warn: bool,
     /// Write a Markdown summary (PR comment / job summary)
     pub markdown: Option<PathBuf>,
     /// Write JUnit XML
@@ -502,6 +505,7 @@ impl Default for CompareRequest {
             allow_workload_change: Default::default(),
             allow_target_change: Default::default(),
             strict: Default::default(),
+            fail_on_warn: Default::default(),
             markdown: Default::default(),
             junit: Default::default(),
             json: Default::default(),
