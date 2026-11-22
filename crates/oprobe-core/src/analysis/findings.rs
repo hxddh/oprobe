@@ -12,6 +12,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use super::capacity::Capacity;
+use super::hypothesis::HypothesisKind;
 use super::diagnosis::{self, Severity};
 use super::outliers::{Selection, attribute, dominant_stage};
 use super::simulate::{self, Prediction, TailCutReplay, TailCutSetup};
@@ -251,6 +252,35 @@ impl Ctx<'_> {
         out
     }
 
+    /// The verification of pacing the client at `rate` operations/s: throttling within the
+    /// budget, goodput near the paced rate.
+    fn verify_rate(&self, rate: f64) -> Option<Verification> {
+        let v = self.verify(
+            format!("re-run paced at {rate:.0} operations/s: throttling should disappear"),
+            &[("rate", format!("{rate:.0}"))],
+        )?;
+        let goodput = super::gate::good_ops_per_s(self.r);
+        let mut v = v.expecting(Expectation {
+            metric: "summary.throttled_request_ratio".into(),
+            direction: Direction::AtMost,
+            predicted: 0.0,
+            lo: 0.0,
+            hi: THROTTLE_BUDGET_RATIO,
+            unit: "ratio".into(),
+        });
+        // Paced below what it achieved, the client gets what it asks for (or what it had).
+        let predicted = rate.min(goodput.max(rate * 0.5));
+        v = v.expecting(Expectation {
+            metric: "summary.ops_per_s".into(),
+            direction: Direction::AtLeast,
+            predicted,
+            lo: predicted * 0.8,
+            hi: rate * 1.05,
+            unit: "ops_per_s".into(),
+        });
+        Some(v)
+    }
+
     /// The verification of running at `to` workers.
     fn verify_concurrency(&self, description: String, to: u64) -> Option<Verification> {
         let mut v = self.verify(description, &[("concurrency", to.to_string())])?;
@@ -417,11 +447,49 @@ fn failure_classes(r: &Report) -> Vec<(&str, u64)> {
     v
 }
 
+/// Server errors (5xx other than 503) the client retried until they succeeded: reported even
+/// when the run also throttles (A6), since they are a different problem.
+fn retried_server_errors(c: &Ctx) -> Option<Finding> {
+    let r = c.r;
+    let n = r.resilience.server_errors;
+    let requests = r.connections.requests.max(1);
+    if n < 3 || (n as f64) < requests as f64 * 0.001 {
+        return None;
+    }
+    let ratio = n as f64 / requests as f64;
+    Some(Finding {
+        code: "errors".into(),
+        severity: Severity::Warning,
+        cause: format!(
+            "{:.2}% of requests failed with a server error (5xx) and were retried.",
+            ratio * 100.0
+        ),
+        evidence: Evidence {
+            text: format!(
+                "{n} server errors (5xx other than 503) in {requests} requests; every operation succeeded after retries{}",
+                if c.throttled {
+                    " (the run also throttles: see throttling)"
+                } else {
+                    ""
+                }
+            ),
+            values: values(&[
+                ("server_errors_count", n as f64),
+                ("server_error_ratio", ratio),
+            ]),
+            op_ids: Vec::new(),
+            windows: windows_where(&c.run.reqs, |q| q.status >= 500 && q.status != 503),
+        },
+        advice: "The service answers some requests with 5xx: keep retries with jitter; if the share grows or persists, check the service's health and contact the provider (each retry costs a request and latency).".into(),
+        verification: None,
+    })
+}
+
 fn errors(c: &Ctx) -> Option<Finding> {
     let r = c.r;
     let s = &r.summary;
     if s.failed_ops == 0 {
-        return None;
+        return retried_server_errors(c);
     }
     let rate_limited = r
         .resilience
@@ -430,9 +498,10 @@ fn errors(c: &Ctx) -> Option<Finding> {
         .copied()
         .unwrap_or(0);
     let classes = failure_classes(r);
-    // Every failure was a throttled request out of retries: the throttling finding says so.
+    // Every failure was a throttled request out of retries: the throttling finding says so
+    // (server errors among the retries are still reported).
     if rate_limited > 0 && classes.is_empty() && c.throttled {
-        return None;
+        return retried_server_errors(c);
     }
     let failed: Vec<u64> = c
         .run
@@ -550,9 +619,20 @@ fn throttling(c: &Ctx) -> Option<Finding> {
     }
     let advice;
     let verification;
+    let mut severity = Severity::Critical;
     let cap = c.cap;
+    let sel = cap.selected().cloned();
+    let asserted = cap.asserted().map(|h| h.kind);
+    if let Some(h) = &sel {
+        text += &format!("; limit model: {}", h.summary());
+        if let Some(e) = h.evidence.first() {
+            text += &format!(" — {e}");
+        }
+    }
+    let headroom = super::capacity::DEFAULT_HEADROOM_RATIO;
+    let inflight = matches!(sel.as_ref().map(|h| h.kind), Some(HypothesisKind::InflightLimit) | None);
     match (cap.inflight_ceiling, c.safe) {
-        (Some(ce), Some(safe)) => {
+        (Some(ce), Some(safe)) if inflight => {
             // Always fewer workers than now: the run throttled at its own concurrency.
             let to = u64::from(safe).min(cc.saturating_sub(1)).max(1);
             let peak = cap.per_op.peak_inflight_per_op;
@@ -568,11 +648,9 @@ fn throttling(c: &Ctx) -> Option<Finding> {
             advice = format!(
                 "The service throttles above ~{:.0} requests in flight: run at concurrency ≤ {to} ({peak:.0} requests in flight per operation at the peak, {:.0}% headroom; predicted {:.0} ops/s), or cap `max_inflight_requests` at {:.0}; keep retries with jitter.",
                 ce.lo,
-                super::capacity::DEFAULT_HEADROOM_RATIO * 100.0,
+                headroom * 100.0,
                 p.ops_per_s,
-                (ce.lo * (1.0 - super::capacity::DEFAULT_HEADROOM_RATIO))
-                    .floor()
-                    .max(1.0)
+                (ce.lo * (1.0 - headroom)).floor().max(1.0)
             );
             verification = c.verify_concurrency(
                 format!(
@@ -583,58 +661,85 @@ fn throttling(c: &Ctx) -> Option<Finding> {
                 to,
             );
         }
-        _ => {
-            let per_op = cap
-                .per_op
-                .requests_per_op
-                .max(r.bytes.request_amplification);
-            match cap.rate_ceiling_requests_per_s {
-                Some(rps) if per_op > 0.0 && rps > 0.0 => {
-                    let rate = ((rps / per_op) * (1.0 - super::capacity::DEFAULT_HEADROOM_RATIO))
-                        .floor()
-                        .max(1.0);
-                    text += &format!(
-                        "; throttling does not follow the requests in flight: while throttled the service accepted ≈{rps:.0} requests/s"
-                    );
-                    vals.push(("accepted_requests_per_s", rps));
-                    advice = format!(
-                        "The service limits the request rate (≈{rps:.0} requests/s), not concurrency: pace the client at ≤ {rate:.0} operations/s (`--rate {rate:.0}`; {per_op:.1} requests per operation), spread keys across more prefixes, keep retries with jitter."
-                    );
-                    verification = c
-                        .verify(
-                            format!("re-run paced at {rate:.0} operations/s: throttling should disappear"),
-                            &[("rate", format!("{rate:.0}"))],
-                        )
-                        .map(|v| {
-                            v.expecting(Expectation {
-                                metric: "summary.throttled_request_ratio".into(),
-                                direction: Direction::AtMost,
-                                predicted: 0.0,
-                                lo: 0.0,
-                                hi: THROTTLE_BUDGET_RATIO,
-                                unit: "ratio".into(),
-                            })
-                        });
-                }
-                _ => {
-                    let half = (cc / 2).max(1);
-                    advice = "The service is rate-limiting this load: lower `concurrency` / `max_inflight_requests` (`oprobe tune` finds the ceiling), spread keys across more prefixes, keep retries with jitter.".into();
-                    verification = (half < cc)
-                        .then(|| {
-                            c.verify_concurrency(
-                                format!("re-run at half the concurrency ({half}); `oprobe tune` finds the ceiling"),
-                                half,
-                            )
-                        })
-                        .flatten();
-                }
+        _ => match (asserted, sel.as_ref()) {
+            (Some(HypothesisKind::RateLimit | HypothesisKind::TimeVarying), Some(h)) => {
+                let rps = h.params.requests_per_s.unwrap_or(0.0);
+                let rate = cap.safe_rate(headroom).unwrap_or(1.0).floor().max(1.0);
+                let rpo = cap.clean_requests_per_op();
+                vals.push(("rate_limit_requests_per_s", rps));
+                vals.push(("safe_rate_ops_per_s", rate));
+                advice = if h.kind == HypothesisKind::TimeVarying {
+                    format!(
+                        "The service's rate limit changes over time ({}): pace the client below the lowest one, ≤ {rate:.0} operations/s (`--rate {rate:.0}`; {rpo:.1} requests per operation, {:.0}% headroom), or adapt the rate to the throttling (AIMD); fewer workers alone would not help; keep retries with jitter.",
+                        h.summary(),
+                        headroom * 100.0
+                    )
+                } else {
+                    format!(
+                        "The service limits the request rate (≈{rps:.0} requests/s), not concurrency: pace the client at ≤ {rate:.0} operations/s (`--rate {rate:.0}`; {rpo:.1} requests per operation, {:.0}% headroom) or with a client-side rate limiter; fewer workers would not help; keep retries with jitter.",
+                        headroom * 100.0
+                    )
+                };
+                verification = c.verify_rate(rate);
             }
-        }
+            (Some(HypothesisKind::KeyLimit), Some(h)) => {
+                let rps = h.params.requests_per_s.unwrap_or(0.0);
+                let key = h.params.key.clone().unwrap_or_default();
+                let share = h.params.key_share_ratio.unwrap_or(0.0);
+                vals.push(("key_limit_requests_per_s", rps));
+                vals.push(("hot_key_share_ratio", share));
+                let reads = c.r.workload.mix.iter().any(|m| m.op == "read" || m.op == "parquet_scan");
+                let rate = cap.safe_rate(headroom).unwrap_or(1.0).floor().max(1.0);
+                advice = format!(
+                    "Hot keys exceed a per-key limit of ≈{rps:.0} requests/s (`{key}` takes {:.0}% of the requests): spread hot objects over more keys or prefixes (salting, replicas), cache them (`--cache 256MiB`, a CDN), or pace the whole client at ≤ {rate:.0} operations/s; adding or removing workers only moves the throttling.",
+                    share * 100.0
+                );
+                verification = if reads && !c.r.knobs.requested.cache {
+                    c.verify(
+                        "cache the hot objects (256 MiB read cache): the per-key throttling should disappear",
+                        &[("cache", "256MiB".into())],
+                    )
+                    .map(|v| {
+                        v.expecting(Expectation {
+                            metric: "summary.throttled_request_ratio".into(),
+                            direction: Direction::AtMost,
+                            predicted: 0.0,
+                            lo: 0.0,
+                            hi: THROTTLE_BUDGET_RATIO,
+                            unit: "ratio".into(),
+                        })
+                        .expecting(Expectation {
+                            metric: "summary.ops_per_s".into(),
+                            direction: Direction::AtLeast,
+                            predicted: 1.0,
+                            lo: 1.0,
+                            hi: 2.0,
+                            unit: "baseline_ratio".into(),
+                        })
+                    })
+                } else {
+                    c.verify_rate(rate)
+                };
+            }
+            (Some(HypothesisKind::None), Some(_)) => {
+                severity = Severity::Warning;
+                advice = "The throttling follows neither the load nor the request rate nor the keys (random 503s: a noisy neighbour, a gateway, a partition split): slowing down would cost throughput without removing it. Keep retries with jitter and exponential backoff; if it persists, ask the provider.".into();
+                verification = None;
+            }
+            _ => {
+                let best = sel.as_ref().map_or_else(|| "none".to_owned(), |h| h.summary());
+                advice = format!(
+                    "Inconclusive: no limit model explains the throttling with confidence (best: {best}). Run `oprobe tune {}` (it steps the load up and down and fits the limit) before changing the load; keep retries with jitter.",
+                    target_args(&c.r.target).join(" ")
+                );
+                verification = None;
+            }
+        },
     }
     let ids = c.run.ops.iter().filter(|o| o.throttled).map(|o| o.op_id);
     Some(Finding {
         code: "throttling".into(),
-        severity: Severity::Critical,
+        severity,
         cause: format!(
             "The service throttled {:.1}% of requests (429/503).",
             req_ratio * 100.0
@@ -1385,7 +1490,110 @@ struct ScaleAdvice {
     verification: Option<Verification>,
 }
 
+/// More workers cannot help when the selected limit model is a queue, a shared bandwidth
+/// cap or the client itself: the advice then says what does (fixes A8, A9; Little's law on the
+/// fitted model instead of linear scaling, A3).
+fn saturation_advice(c: &Ctx) -> Option<ScaleAdvice> {
+    let h = c.cap.asserted()?;
+    let cc = c.concurrency();
+    match h.kind {
+        HypothesisKind::Queueing => {
+            let servers = h.params.servers_count.unwrap_or(1).max(1);
+            let service = h.params.service_ms.unwrap_or(0.0);
+            let per_op = c.cap.per_op.peak_inflight_per_op.max(1.0);
+            // Enough workers to keep every server busy, with one in line each.
+            let to = ((servers as f64 * 1.5 / per_op).ceil() as u64).max(1);
+            let max_ops = c.cap.predict(to as u32).ops_per_s;
+            let mut out = ScaleAdvice {
+                text: format!(
+                    "the service queues: {servers} requests are served at once (≈{service:.1} ms each), so throughput saturates near {max_ops:.0} ops/s and extra in-flight requests only wait"
+                ),
+                vals: vec![
+                    ("servers_count", servers as f64),
+                    ("service_ms", service),
+                ],
+                advice: format!(
+                    "Do not add workers: the service serves {servers} requests at once and the rest wait in line (latency grows with concurrency, throughput does not). Run at ≈{to} workers for the same throughput at a lower latency"
+                ),
+                verification: None,
+            };
+            if to < cc {
+                out.verification = c
+                    .verify(
+                        format!("re-run at concurrency {to}: the same goodput at a lower p99"),
+                        &[("concurrency", to.to_string())],
+                    )
+                    .map(|v| {
+                        v.expecting(Expectation {
+                            metric: "summary.ops_per_s".into(),
+                            direction: Direction::AtLeast,
+                            predicted: 0.9,
+                            lo: 0.9,
+                            hi: 1.1,
+                            unit: "baseline_ratio".into(),
+                        })
+                        .expecting(Expectation {
+                            metric: "p99_ms".into(),
+                            direction: Direction::Decrease,
+                            ..Default::default()
+                        })
+                    });
+            }
+            Some(out)
+        }
+        HypothesisKind::BandwidthCap => {
+            let bps = h.params.bytes_per_s.unwrap_or(0.0);
+            let to = (cc / 2).max(1);
+            let mut out = ScaleAdvice {
+                text: format!(
+                    "every stream shares ≈{:.1} MiB/s: a stream's rate falls as more run beside it",
+                    bps / (1024.0 * 1024.0)
+                ),
+                vals: vec![("bandwidth_cap_bytes_per_s", bps)],
+                advice: format!(
+                    "Do not add streams: the path is capped at ≈{:.1} MiB/s in total (a NIC, proxy, VPC endpoint or bucket limit), so more parallelism only splits it. Move fewer bytes (narrower ranges, compression), run closer to the data, or raise the cap; fewer streams keep the same throughput at a lower latency",
+                    bps / (1024.0 * 1024.0)
+                ),
+                verification: None,
+            };
+            if to < cc {
+                out.verification = c
+                    .verify(
+                        format!("re-run with {to} workers: the same MiB/s at a lower p99"),
+                        &[("concurrency", to.to_string())],
+                    )
+                    .map(|v| {
+                        v.expecting(Expectation {
+                            metric: "summary.mib_per_s".into(),
+                            direction: Direction::AtLeast,
+                            predicted: 0.9,
+                            lo: 0.9,
+                            hi: 1.1,
+                            unit: "baseline_ratio".into(),
+                        })
+                        .expecting(Expectation {
+                            metric: "p99_ms".into(),
+                            direction: Direction::Decrease,
+                            ..Default::default()
+                        })
+                    });
+            }
+            Some(out)
+        }
+        HypothesisKind::ClientBound => Some(ScaleAdvice {
+            text: h.evidence.first().cloned().unwrap_or_default(),
+            vals: Vec::new(),
+            advice: "Do not add workers: the load generator's CPU is saturated, so its numbers understate the service. Use a bigger client or several (`--workers`), or cut client work (`workload.verify = false`)".into(),
+            verification: None,
+        }),
+        _ => None,
+    }
+}
+
 fn scale_advice(c: &Ctx) -> ScaleAdvice {
+    if let Some(s) = saturation_advice(c) {
+        return s;
+    }
     match c.scale_up() {
         Ok(to) => {
             let pred = simulate::concurrency(c.run, to, c.cap);
@@ -1498,6 +1706,15 @@ fn suffix_read(c: &Ctx) -> Option<Finding> {
 
 fn cache_opportunity(c: &Ctx) -> Option<Finding> {
     if c.r.knobs.requested.cache {
+        return None;
+    }
+    // A generated dataset smaller than the data the user keeps (`cost.stored_gib`) says
+    // nothing about the real hit ratio (A15): only real objects, or a stated skew, count.
+    let ds = &c.r.workload.dataset;
+    let generated_bytes = ds.objects_count.saturating_mul(ds.object_size_bytes) as f64;
+    let stated_bytes = c.r.cost.stored_gb * (1u64 << 30) as f64;
+    let skewed = c.r.workload.access != "uniform";
+    if ds.existing_prefix.is_none() && !skewed && generated_bytes < stated_bytes {
         return None;
     }
     let p = simulate::cache(c.run, 256 << 20)?;
@@ -1643,6 +1860,20 @@ fn carry(c: &Ctx, f: &diagnosis::Finding) -> Finding {
                 scale.advice
             );
             out.verification = scale.verification;
+        }
+        "download_bound" | "upload_bound"
+            if c.cap.asserted().is_some_and(|h| {
+                matches!(
+                    h.kind,
+                    HypothesisKind::BandwidthCap | HypothesisKind::ClientBound
+                )
+            }) =>
+        {
+            let s = saturation_advice(c).expect("asserted saturation");
+            out.evidence.text += &format!("; {}", s.text);
+            out.evidence.values.extend(values(&s.vals));
+            out.advice = format!("{}.", s.advice);
+            out.verification = s.verification;
         }
         "download_bound" | "upload_bound" if c.safe.is_some() => {
             out.advice = format!(

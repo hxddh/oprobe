@@ -165,9 +165,6 @@ pub struct TuneOutcome {
     pub winner_snapshot: Snapshot,
 }
 
-/// Time offset between pooled trials (µs): far larger than any trial, so in-flight levels of
-/// different trials never overlap in the pooled estimate.
-const POOL_OFFSET_US: i64 = 10_000_000_000;
 /// Most request rows kept per trial for the pooled estimate.
 const POOL_MAX_PER_TRIAL: usize = 200_000;
 
@@ -178,9 +175,9 @@ struct Tuner<'a> {
     snapshots: Vec<Snapshot>,
     use_bytes: bool,
     on_event: Arc<dyn Fn(TuneEvent) + Send + Sync>,
-    /// Request and op rows of every trial, shifted apart in time.
-    pool_reqs: Vec<ReqRow>,
-    pool_ops: Vec<OpRow>,
+    /// Request and op rows of every trial with its measurement window (s), for the pooled
+    /// estimate.
+    pool: Vec<(Vec<ReqRow>, Vec<OpRow>, f64)>,
     /// The in-flight ceiling (requests), once known.
     ceiling: Option<capacity::Ceiling>,
 }
@@ -224,27 +221,21 @@ impl Tuner<'_> {
             .await?;
         let rows = self.session.take_trace().unwrap_or_default();
         let cap = capacity::estimate(&rows.reqs, &rows.ops, Window::measured(snap.elapsed_s));
-        let offset = id as i64 * POOL_OFFSET_US;
-        for q in rows
-            .reqs
-            .iter()
-            .filter(|q| q.t_us >= 0)
-            .take(POOL_MAX_PER_TRIAL)
-        {
-            let mut q = q.clone();
-            q.t_us += offset;
-            self.pool_reqs.push(q);
-        }
-        for o in rows
-            .ops
-            .iter()
-            .filter(|o| o.t_us >= 0)
-            .take(POOL_MAX_PER_TRIAL)
-        {
-            let mut o = o.clone();
-            o.t_us += offset;
-            self.pool_ops.push(o);
-        }
+        self.pool.push((
+            rows.reqs
+                .iter()
+                .filter(|q| q.t_us >= 0)
+                .take(POOL_MAX_PER_TRIAL)
+                .cloned()
+                .collect(),
+            rows.ops
+                .iter()
+                .filter(|o| o.t_us >= 0)
+                .take(POOL_MAX_PER_TRIAL)
+                .cloned()
+                .collect(),
+            snap.elapsed_s,
+        ));
         let p = &self.session.profile;
         let worst_p99 = snap.verbs.iter().map(|v| v.latency.p99).fold(0.0, f64::max);
         let throttled_ops: u64 = snap.verbs.iter().map(|v| v.throttled).sum();
@@ -325,7 +316,16 @@ impl Tuner<'_> {
 
     /// The pooled capacity estimate over every trial so far.
     fn pooled(&self) -> Capacity {
-        let mut c = capacity::estimate(&self.pool_reqs, &self.pool_ops, Window::all());
+        let trials: Vec<capacity::PooledTrial<'_>> = self
+            .pool
+            .iter()
+            .map(|(reqs, ops, w)| capacity::PooledTrial {
+                reqs,
+                ops,
+                window_s: *w,
+            })
+            .collect();
+        let mut c = capacity::estimate_pooled(&trials, &capacity::FitInputs::default());
         c.source = capacity::CapacitySource::Tune;
         c
     }
@@ -622,8 +622,7 @@ pub async fn tune(
         snapshots: Vec::new(),
         use_bytes: false,
         on_event,
-        pool_reqs: Vec::new(),
-        pool_ops: Vec::new(),
+        pool: Vec::new(),
         ceiling: None,
     };
     let base_knobs = p.knobs.clone();

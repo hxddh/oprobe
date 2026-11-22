@@ -432,10 +432,15 @@ pub fn build_run_with(
         request_p99: request_p99(&trace.reqs),
     };
     let region = t.options.get("region").cloned();
-    let capacity = crate::analysis::capacity::estimate(
+    let capacity = crate::analysis::capacity::estimate_with(
         &trace.reqs,
         &trace.ops,
         crate::analysis::capacity::Window::measured(snapshot.elapsed_s),
+        &crate::analysis::capacity::FitInputs {
+            client_cpu_busy_ratio: Some(
+                snapshot.client.cpu_pct / 100.0 / snapshot.client.cpu_cores.max(1) as f64,
+            ),
+        },
     )
     .with_history(history);
     let partial = interrupted.then_some(PartialInfo {

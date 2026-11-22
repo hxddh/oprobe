@@ -44,9 +44,7 @@ const BIC_HIGH: f64 = 10.0;
 /// BIC gap to the runner-up for medium confidence.
 const BIC_MEDIUM: f64 = 4.0;
 /// Throttled requests below this count are never fitted (a handful of 503s is noise).
-const MIN_THROTTLED: u64 = 3;
-/// Throttled share from which the throttle family wins over the latency family.
-const THROTTLE_FAMILY_RATIO: f64 = 0.002;
+const MIN_THROTTLED: u64 = 5;
 /// CPU busy share at which the client is the bottleneck.
 pub const CLIENT_BOUND_RATIO: f64 = 0.85;
 
@@ -290,6 +288,12 @@ fn served_rate(obs: &[Obs], by: Option<&dyn Fn(&Obs) -> u32>, nkeys: usize) -> f
     let Some(t0) = obs.first().map(|o| o.t) else {
         return 0.0;
     };
+    let t_end = obs.last().map_or(t0, |o| o.t);
+    // The length of bin `b` covered by the observations (the first and last are partial).
+    let cover = |b: i64| -> f64 {
+        let (lo, hi) = (t0 + b * BIN_US, t0 + (b + 1) * BIN_US);
+        (hi.min(t_end + 1) - lo).clamp(1, BIN_US) as f64 / 1e6
+    };
     let n = if by.is_some() { nkeys.max(1) } else { 1 };
     // Per key: bin → (served, throttled).
     let mut per: Vec<HashMap<i64, (u64, u64)>> = vec![HashMap::new(); n];
@@ -302,9 +306,10 @@ fn served_rate(obs: &[Obs], by: Option<&dyn Fn(&Obs) -> u32>, nkeys: usize) -> f
     let rates: Vec<f64> = per
         .iter()
         .filter_map(|bins| {
-            let hot: Vec<&(u64, u64)> = bins.values().filter(|b| b.1 > 0).collect();
+            let hot: Vec<(&i64, &(u64, u64))> = bins.iter().filter(|b| b.1.1 > 0).collect();
             (!hot.is_empty()).then(|| {
-                hot.iter().map(|b| b.0).sum::<u64>() as f64 / (hot.len() as f64 * 0.25)
+                hot.iter().map(|b| b.1.0).sum::<u64>() as f64
+                    / hot.iter().map(|b| cover(*b.0)).sum::<f64>()
             })
         })
         .collect();
@@ -477,6 +482,14 @@ fn throttle_family(obs: &[Obs], keys: &[String], prefixes: &[String]) -> Vec<Fit
             else {
                 continue;
             };
+            // Both sides must show the limit: enough throttling and at least half a second.
+            let side_ok = |seg: &[Obs], sp: &Split| {
+                sp.k0 + sp.k1 >= 10
+                    && seg.last().map_or(0, |o| o.t) - seg.first().map_or(0, |o| o.t) >= 500_000
+            };
+            if !side_ok(&obs[..cut], &s1) || !side_ok(&obs[cut..], &s2) {
+                continue;
+            }
             let s = s1.merge(s2);
             if best.as_ref().is_none_or(|x| s.ll() > x.3.ll()) {
                 best = Some((cut, r1, r2, s));
@@ -644,7 +657,7 @@ fn bandwidth_fits(obs: &[Obs]) -> Option<(Fit, Fit, f64)> {
     let mut ys = Vec::new();
     for o in obs
         .iter()
-        .filter(|o| o.ok && o.bytes_down >= 256 * 1024 && o.body.1 - o.body.0 >= 1000)
+        .filter(|o| o.ok && o.bytes_down >= 128 * 1024 && o.body.1 - o.body.0 >= 1000)
     {
         let d = (o.body.1 - o.body.0) as f64;
         let nbar = ((area_at(o.body.1) - area_at(o.body.0)) / d).max(1.0);
@@ -797,7 +810,7 @@ fn fit_rows(reqs: &[&ReqRow], ops: &[&OpRow], inputs: &FitInputs) -> Vec<Hypothe
         explains_ratio: 1.0,
         selected: true,
     };
-    if thr >= MIN_THROTTLED && thr_ratio >= THROTTLE_FAMILY_RATIO {
+    if thr >= MIN_THROTTLED {
         let fits = throttle_family(&obs, &keys, &prefixes);
         return rank(fits, n, thr >= 20);
     }

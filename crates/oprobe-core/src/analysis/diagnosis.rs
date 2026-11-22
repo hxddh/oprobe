@@ -262,6 +262,13 @@ pub fn diagnose(s: &Snapshot, knobs: &Knobs, sla: &Sla, network: bool) -> Diagno
     let stage = s.request_stage_means();
     let cores = s.client.cpu_cores.max(1) as f64;
     let cpu_busy = s.client.cpu_pct / 100.0;
+    // A saturated load generator overrides any stage share (A9): on one busy core every stage
+    // looks slow, and "add streams" would make it worse.
+    if cpu_busy >= crate::analysis::limits::CLIENT_BOUND_RATIO * cores
+        && !matches!(bottleneck, Bottleneck::Throttling | Bottleneck::None)
+    {
+        bottleneck = Bottleneck::Client;
+    }
     let headline = match bottleneck {
         Bottleneck::None => "No operations completed in the measurement window.".to_owned(),
         Bottleneck::Throttling if shares.retry >= 0.005 => format!(

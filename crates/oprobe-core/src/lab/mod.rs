@@ -231,7 +231,7 @@ impl Scenario {
             }
             Scenario::Bandwidth => {
                 "5 ms latency, all response bodies share 16 MiB/s; \
-                 default workload: reads of 16 × 2 MiB, 8 workers"
+                 default workload: reads of 32 × 512 KiB, 8 workers"
             }
             Scenario::Queueing => {
                 "M/M/4 queue, 10 ms mean service time (latency grows with the requests in flight); \
@@ -402,7 +402,7 @@ impl Scenario {
                 Some(crate::config::Access::Zipf(1.2)),
             ),
             Scenario::Noisy => reads(64, crate::util::ByteSize::kib(16), 8, None),
-            Scenario::Bandwidth => reads(16, crate::util::ByteSize::mib(2), 8, None),
+            Scenario::Bandwidth => reads(32, crate::util::ByteSize::kib(512), 8, None),
             _ => ScenarioDefaults::default(),
         }
     }

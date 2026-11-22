@@ -332,6 +332,62 @@ pub fn estimate_with(reqs: &[ReqRow], ops: &[OpRow], window: Window, inputs: &Fi
     c
 }
 
+/// Time between pooled trials (µs): far longer than any trial, so their in-flight levels and
+/// token buckets never interact.
+const POOL_GAP_US: i64 = 10_000_000_000;
+
+/// One trial of a pooled estimate: its rows (µs from its own window start) and the length of
+/// its measurement window.
+pub struct PooledTrial<'a> {
+    pub reqs: &'a [ReqRow],
+    pub ops: &'a [OpRow],
+    pub window_s: f64,
+}
+
+/// The capacity over several trials (tune, `probe limits`), each read over its own
+/// measurement window (fixes A11: never `Window::all()` across trials). Observed rates are per
+/// second of measurement (`window_s` is the sum of the trials' windows).
+pub fn estimate_pooled(trials: &[PooledTrial<'_>], inputs: &FitInputs) -> Capacity {
+    let mut reqs = Vec::new();
+    let mut ops = Vec::new();
+    let mut total_s = 0.0;
+    for (i, t) in trials.iter().enumerate() {
+        let w = Window::measured(t.window_s);
+        let off = i as i64 * POOL_GAP_US;
+        reqs.extend(t.reqs.iter().filter(|q| w.contains(q.t_us)).map(|q| {
+            let mut q = q.clone();
+            q.t_us += off;
+            q
+        }));
+        ops.extend(t.ops.iter().filter(|o| w.contains(o.t_us)).map(|o| {
+            let mut o = o.clone();
+            o.t_us += off;
+            o
+        }));
+        total_s += t.window_s.max(0.0);
+    }
+    let mut c = estimate_with(&reqs, &ops, Window::all(), inputs);
+    if total_s > 0.0 {
+        let o = &mut c.observed;
+        let span = o.window_s;
+        let ok = ops.iter().filter(|o| o.ok).count() as f64;
+        let busy: f64 = ops.iter().map(|o| o.latency_us as f64).sum();
+        let service: f64 = ops
+            .iter()
+            .map(|o| o.latency_us.saturating_sub(o.breakdown.retry_us) as f64)
+            .sum();
+        o.window_s = total_s;
+        o.ops_per_s = ok / total_s;
+        o.ops_inflight_mean = busy / (total_s * 1e6);
+        o.ops_service_inflight_mean = service / (total_s * 1e6);
+        if span > 0.0 {
+            // The time-weighted in-flight mean over the gaps is meaningless: rescale.
+            o.inflight_mean *= span / total_s;
+        }
+    }
+    c
+}
+
 fn estimate_ceiling(reqs: &[ReqRow], ops: &[OpRow], window: Window) -> Capacity {
     let reqs: Vec<&ReqRow> = reqs.iter().filter(|q| window.contains(q.t_us)).collect();
     let ops: Vec<&OpRow> = ops.iter().filter(|o| window.contains(o.t_us)).collect();
@@ -613,8 +669,14 @@ impl Capacity {
             }
             HypothesisKind::Queueing | HypothesisKind::BandwidthCap | HypothesisKind::None => {
                 self.rate_ceiling_requests_per_s = None;
-                if self.observed.throttled_requests_count > 0 {
-                    // Throttling that follows no limit (random 503s): no ceiling either.
+                if self.hypotheses.iter().any(|h| {
+                    matches!(
+                        h.kind,
+                        HypothesisKind::InflightLimit | HypothesisKind::RateLimit
+                    )
+                }) {
+                    // The throttle family was fitted and throttling follows no limit (random
+                    // 503s): no ceiling either.
                     self.inflight_ceiling = None;
                     self.confidence = sel.confidence;
                     self.confidence_reason = sel.evidence.join("; ");
