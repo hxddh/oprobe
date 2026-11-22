@@ -360,7 +360,16 @@ impl CommandOutput for ProveOutput {
     fn next(&self) -> Vec<NextStep> {
         let mut sets = String::new();
         for c in &self.change {
-            sets += &format!(" --set {}", crate::model::spec::shell_quote(c));
+            // A redacted secret is read from the environment when the command runs
+            // (`options.secret_access_key=${SECRET_ACCESS_KEY}`).
+            let c = match c.split_once('=') {
+                Some((k, "<redacted>")) => {
+                    let var = k.rsplit('.').next().unwrap_or(k).to_ascii_uppercase();
+                    format!("{k}=${{{var}}}")
+                }
+                _ => c.clone(),
+            };
+            sets += &format!(" --set {}", crate::model::spec::shell_quote(&c));
         }
         vec![
             NextStep::new(
@@ -1181,7 +1190,7 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
             req.pairs.clamp(2, 12),
             probe_sets
                 .iter()
-                .map(|(k, v)| format!("{k}={v}"))
+                .map(|(k, v)| crate::operator::redacted_edit(k, v))
                 .collect::<Vec<_>>()
                 .join(" ")
         ));
@@ -1369,7 +1378,11 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
         operator_ref: r.spec.operator_ref.clone(),
         environment,
         finding: change.finding.clone(),
-        change: sets.iter().map(|(k, v)| format!("{k}={v}")).collect(),
+        // Secret option values are redacted (the result is printed and stored).
+        change: sets
+            .iter()
+            .map(|(k, v)| crate::operator::redacted_edit(k, v))
+            .collect(),
         sizing,
         objective: obj,
         verdict,

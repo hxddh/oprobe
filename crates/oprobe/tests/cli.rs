@@ -574,6 +574,109 @@ fn with_and_set_pairs_apply_in_any_order() {
     assert!(stdout(&o).contains("needs `http`"), "{}", stdout(&o));
 }
 
+/// Every file under `dir`, recursively, as text (`.oprobe` run files decompressed too).
+fn files_text(dir: &std::path::Path) -> Vec<(PathBuf, String)> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in rd {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                stack.push(p);
+                continue;
+            }
+            let raw = std::fs::read(&p).unwrap();
+            let mut text = String::from_utf8_lossy(&raw).into_owned();
+            // Run files are zstd segments: read every frame that decodes.
+            if let Ok(mut dec) = zstd::stream::read::Decoder::new(&raw[..]) {
+                let mut buf = Vec::new();
+                let _ = std::io::Read::read_to_end(&mut dec, &mut buf);
+                text.push_str(&String::from_utf8_lossy(&buf));
+            }
+            out.push((p, text));
+        }
+    }
+    out
+}
+
+/// A secret given with `--with` or in `op.toml` never shows in what prove prints (the plan,
+/// the diff, the next command) or stores (`<id>.prove.json`, the trial runs).
+#[test]
+fn prove_never_prints_or_stores_secrets() {
+    let env = Env::new();
+    let op = env.path("op.toml");
+    std::fs::write(
+        &op,
+        "url = \"lab://clean\"\n[options]\nsecret_access_key = \"SEKRIT2\"\n",
+    )
+    .unwrap();
+    let op = op.to_str().unwrap();
+    let mut outputs = Vec::new();
+    let o = env.run(&run_args(&[op], &["-q", "-o", "json"]));
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    outputs.push(o);
+    let with = [
+        "--with",
+        "options.secret_access_key=SEKRIT1",
+        "--with",
+        "read.gap=1MiB",
+    ];
+    for extra in [
+        &["--dry-run"][..],
+        &["--dry-run", "-o", "json"],
+        &["--trial", "300ms", "--pairs", "3"],
+        &["--trial", "300ms", "--pairs", "3", "-o", "json"],
+    ] {
+        let mut args = vec!["prove", "last"];
+        args.extend_from_slice(&with);
+        args.extend_from_slice(extra);
+        let o = env.run(&args);
+        assert!(matches!(code(&o), 0 | 3), "{args:?}: {}", stderr(&o));
+        outputs.push(o);
+    }
+    // The change is still shown, redacted, and the next command reads it from the
+    // environment.
+    let v = json(outputs.last().unwrap());
+    assert!(
+        v["change"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c == "options.secret_access_key=<redacted>"),
+        "{v}"
+    );
+    let next = v["next"].to_string();
+    assert!(next.contains("${SECRET_ACCESS_KEY}"), "{next}");
+    for o in &outputs {
+        for secret in ["SEKRIT1", "SEKRIT2"] {
+            assert!(
+                !stdout(o).contains(secret),
+                "{secret} on stdout: {}",
+                stdout(o)
+            );
+            assert!(
+                !stderr(o).contains(secret),
+                "{secret} on stderr: {}",
+                stderr(o)
+            );
+        }
+    }
+    let files = files_text(&env.data());
+    assert!(
+        files
+            .iter()
+            .any(|(p, _)| p.to_string_lossy().ends_with(".prove.json"))
+    );
+    for (p, text) in files {
+        for secret in ["SEKRIT1", "SEKRIT2"] {
+            assert!(!text.contains(secret), "{secret} in {}", p.display());
+        }
+    }
+}
+
 #[test]
 fn bare_oprobe_is_the_app() {
     let env = Env::new();

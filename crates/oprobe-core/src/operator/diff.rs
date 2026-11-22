@@ -143,10 +143,30 @@ pub fn diff(a: &OperatorSpec, b: &OperatorSpec) -> OperatorDiff {
             to: y.cloned(),
         });
     }
+    // Secrets never leave as values: a changed secret option shows as changed, redacted.
+    for c in &mut changes {
+        for v in [&mut c.from, &mut c.to].into_iter().flatten() {
+            *v = redact_value(&c.path, v);
+        }
+    }
     OperatorDiff {
         rust: rust_diff(a, b, &changes),
         toml: toml_diff(b, &changes),
         changes,
+    }
+}
+
+/// A value of `path` (TOML or plain) safe to show: a secret option's redacted, a URL's
+/// credentials removed.
+fn redact_value(path: &str, v: &str) -> String {
+    let shown = super::redacted_edit(path, v.trim_matches('"'));
+    let value = shown.split_once('=').map_or("", |x| x.1);
+    if value == v.trim_matches('"') {
+        v.to_owned()
+    } else if v.starts_with('"') {
+        toml::Value::String(value.to_owned()).to_string()
+    } else {
+        value.to_owned()
     }
 }
 
@@ -362,11 +382,12 @@ fn toml_diff(b: &OperatorSpec, changes: &[Change]) -> String {
         let parts: Vec<&str> = c.path.split('.').collect();
         match parts[0] {
             "url" => {
-                doc.insert("url".into(), toml::Value::String(b.url.clone()));
+                doc.insert("url".into(), toml::Value::String(b.display_url()));
             }
             "options" | "read" | "write" | "http" => {
                 let value = match parts[0] {
                     "options" => b
+                        .redacted()
                         .options
                         .get(parts[1])
                         .map(|v| toml::Value::String(v.clone())),
@@ -431,7 +452,7 @@ fn inline(v: &toml::Value) -> String {
 /// The whole operator as Rust: the service from its URL and every layer of the stack.
 pub fn to_rust(s: &OperatorSpec) -> String {
     let mut out = format!("let op = Operator::from_uri({:?})?\n", s.display_url());
-    for (k, v) in &s.options {
+    for (k, v) in &s.redacted().options {
         let _ = writeln!(out, "    // option {k} = {v:?}");
     }
     for name in LAYER_ORDER {
@@ -705,6 +726,43 @@ mod tests {
             layer_rust(&s, "tail_cut")
                 .unwrap()
                 .contains(".max_deadline(Duration::from_secs(12))")
+        );
+    }
+
+    #[test]
+    fn secrets_never_show_in_a_diff() {
+        let a = OperatorSpec::parse(
+            "url = \"s3://b/x\"\n[options]\nsecret_access_key = \"OLDSEKRIT\"\nregion = \"r1\"\n",
+        )
+        .unwrap();
+        let mut b = a.clone();
+        b.set("options.secret_access_key", "NEWSEKRIT").unwrap();
+        b.set("options.session_token", "TOKSEKRIT").unwrap();
+        b.set("url", "s3://user:PWSEKRIT@b/x").unwrap();
+        b.set("read.gap", "1MiB").unwrap();
+        let d = diff(&a, &b);
+        let all = format!(
+            "{}\n{}\n{}\n{}",
+            serde_json::to_string(&d).unwrap(),
+            d.rust,
+            d.toml,
+            to_rust(&b)
+        );
+        for s in ["OLDSEKRIT", "NEWSEKRIT", "TOKSEKRIT", "PWSEKRIT"] {
+            assert!(!all.contains(s), "{s} in {all}");
+        }
+        // The secret's change is still shown.
+        assert!(
+            d.changes
+                .iter()
+                .any(|c| c.path == "options.secret_access_key"),
+            "{:?}",
+            d.changes
+        );
+        assert!(
+            d.toml.contains("secret_access_key = \"<redacted>\""),
+            "{}",
+            d.toml
         );
     }
 }
