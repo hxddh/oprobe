@@ -11,6 +11,7 @@ pub mod reference;
 #[cfg(test)]
 mod replay_tests;
 pub(crate) mod self_update;
+mod worker;
 
 use std::io::IsTerminal;
 use std::process::ExitCode;
@@ -545,6 +546,7 @@ async fn dispatch(cmd: Command, ctx: &Ctx) -> Result<u8> {
         Command::Doctor(a) => ctx.out.finish(&ctx.app().doctor(a.into(), &ctx.out).await?),
         Command::Probe(a) => ctx.out.finish(&ctx.app().probe(a.into(), &ctx.out).await?),
         Command::Lab(a) => c::lab(a, ctx).await,
+        Command::Worker(a) => worker::cmd_worker(a, ctx).await,
         Command::Cleanup(a) => ctx
             .out
             .finish(&ctx.app().cleanup(a.into(), &ctx.out).await?),

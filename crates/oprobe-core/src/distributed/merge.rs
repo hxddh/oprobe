@@ -304,6 +304,8 @@ fn merge_bytes(b: &[&ByteStats], requests: u64, ops: u64) -> ByteStats {
     o
 }
 
+// Fields the merge does not know (added to the trace types later) keep their defaults.
+#[allow(clippy::needless_update)]
 fn merge_timeline(parts: &[&Snapshot]) -> Vec<TimelinePoint> {
     let mut by: BTreeMap<i64, Vec<&TimelinePoint>> = BTreeMap::new();
     for s in parts {
@@ -323,11 +325,14 @@ fn merge_timeline(parts: &[&Snapshot]) -> Vec<TimelinePoint> {
             p99_ms: ps.iter().map(|p| p.p99_ms).fold(0.0, f64::max),
             errors: ps.iter().map(|p| p.errors).sum(),
             throttled: ps.iter().map(|p| p.throttled).sum(),
+            ..Default::default()
         })
         .collect()
 }
 
 /// One snapshot of the whole run from the workers' snapshots (in worker order).
+// Fields the merge does not know (added to the trace types later) keep their defaults.
+#[allow(clippy::needless_update)]
 pub fn merge_snapshots(parts: &[Snapshot]) -> Snapshot {
     let refs: Vec<&Snapshot> = parts.iter().collect();
     let Some(first) = refs.first() else {
@@ -396,11 +401,13 @@ pub fn merge_snapshots(parts: &[Snapshot]) -> Snapshot {
                 .iter()
                 .map(|o| o.max_schedule_lag_ms)
                 .fold(0.0, f64::max),
+            ..Default::default()
         }),
         interrupted: refs.iter().any(|s| s.interrupted),
         effective_knobs: first.effective_knobs.clone(),
         timeline: merge_timeline(&refs),
         slow_ops: slow,
+        ..Default::default()
     }
 }
 

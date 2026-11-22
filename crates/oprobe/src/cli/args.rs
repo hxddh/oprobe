@@ -173,6 +173,8 @@ pub enum Command {
     /// Start a local S3-compatible server with programmable faults
     #[command(visible_alias = "serve-s3")]
     Lab(LabArgs),
+    /// Serve load for distributed runs (`oprobe run --workers`)
+    Worker(WorkerArgs),
     /// MCP server for agents (stdio, or --http ADDR)
     Mcp(McpArgs),
     /// Print the JSON Schema of a machine output (report, events, …)
@@ -758,6 +760,48 @@ pub struct RunArgs {
     /// the profile's knob, workload, SLA and cost names, `endpoint`, `region`, `label`
     #[arg(long = "set", value_name = "KEY=VALUE", value_parser = parse::set, help_heading = "Replay")]
     pub set: Vec<String>,
+    #[command(flatten)]
+    pub load: LoadArgs,
+}
+
+/// What generates the load, and where (design v5 §7, §8).
+#[derive(Args, Debug, Clone, Default)]
+#[command(next_help_heading = "Load generation")]
+pub struct LoadArgs {
+    /// What drives the workload: opendal (default), aws-sdk, or exec:COMMAND (an adapter
+    /// speaking the oprobe client protocol, see docs/clients.md). Not stored in the run's spec
+    #[arg(long, value_name = "CLIENT")]
+    pub client: Option<String>,
+    /// Distribute the run over workers: host:port[*WEIGHT],… of `oprobe worker`, or local:N
+    /// to start N worker processes here
+    #[arg(long, value_name = "WORKERS")]
+    pub workers: Option<String>,
+    /// The token file the remote workers were started with (default: $OPROBE_WORKER_TOKEN)
+    #[arg(long, value_name = "FILE", requires = "workers")]
+    pub worker_token_file: Option<std::path::PathBuf>,
+}
+
+/// `oprobe worker`: serve load for distributed runs.
+#[derive(Args, Debug, Clone)]
+pub struct WorkerArgs {
+    /// Address to listen on (host:port; port 0 picks a free one)
+    #[arg(long, value_name = "ADDR")]
+    pub listen: String,
+    /// File holding the shared secret every coordinator request must carry
+    #[arg(long, value_name = "FILE")]
+    pub token_file: std::path::PathBuf,
+    /// Serve TLS with this PEM certificate (needs --tls-key)
+    #[arg(long, value_name = "FILE", requires = "tls_key")]
+    pub tls_cert: Option<std::path::PathBuf>,
+    /// PEM private key of --tls-cert
+    #[arg(long, value_name = "FILE", requires = "tls_cert")]
+    pub tls_key: Option<std::path::PathBuf>,
+    /// Let coordinators run `--client exec:COMMAND` on this machine
+    #[arg(long)]
+    pub allow_exec: bool,
+    /// Exit when stdin closes (local workers started by `--workers local:N`)
+    #[arg(long, hide = true)]
+    pub exit_with_stdin: bool,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]

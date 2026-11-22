@@ -373,6 +373,35 @@ pub fn entries() -> Vec<Entry> {
             crate::config::BuiltinDefaults,
             "Every built-in default (config::defaults)"
         ),
+        entry!(
+            cmd "worker",
+            crate::distributed::WorkerOutput,
+            "What `oprobe worker` serves (design v5 §8)"
+        ),
+        entry!(
+            "client-hello",
+            Output,
+            crate::clients::protocol::HelloRequest,
+            "oprobe client protocol (`--client exec:CMD`): the first line oprobe sends"
+        ),
+        entry!(
+            "client-hello-reply",
+            Input,
+            crate::clients::protocol::HelloReply,
+            "oprobe client protocol: the adapter's answer to hello"
+        ),
+        entry!(
+            "client-op",
+            Output,
+            crate::clients::protocol::WireOp,
+            "oprobe client protocol: one operation oprobe asks the adapter to run"
+        ),
+        entry!(
+            "client-result",
+            Input,
+            crate::clients::protocol::WireResult,
+            "oprobe client protocol: the adapter's result of one operation"
+        ),
     ]
 }
 

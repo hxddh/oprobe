@@ -398,4 +398,203 @@ mod tests {
         assert_eq!(codes, vec!["throttling"]);
         assert!(r.warnings.iter().any(|w| w.contains("server_latency")));
     }
+
+    /// `python3`, when this machine has it (the exec tests are skipped otherwise).
+    pub(crate) fn python3() -> Option<&'static str> {
+        std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|_| "python3")
+    }
+
+    /// The minimal reference adapter (`adapters/minimal`), as an `exec:` client.
+    pub(crate) fn minimal_adapter(py: &str) -> ClientChoice {
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../adapters/minimal/oprobe_minimal.py");
+        ClientChoice::Exec {
+            command: format!("{py} -u '{}'", script.display()),
+        }
+    }
+
+    /// Every operation the protocol has, against the lab, with `client`.
+    async fn every_operation(
+        client: ClientChoice,
+    ) -> (crate::model::Run, crate::lab::LabHandle, u64) {
+        let lab = crate::lab::LabServer::spawn("127.0.0.1:0", Default::default())
+            .await
+            .unwrap();
+        let mut p = lab.profile("bkt");
+        p.client = client;
+        p.workload.duration = crate::util::HumanDuration(std::time::Duration::from_millis(1500));
+        p.workload.warmup = crate::util::HumanDuration(std::time::Duration::ZERO);
+        p.knobs.concurrency = 4;
+        p.workload.mix = serde_json::from_value(serde_json::json!([
+            {"op": "read"},
+            {"op": "read", "size": "4KiB"},
+            {"op": "write", "size": "16KiB"},
+            {"op": "stat"},
+            {"op": "list", "recursive": true},
+            {"op": "delete", "batch": 2},
+            {"op": "copy"},
+            {"op": "conditional_write", "size": "4KiB"},
+            {"op": "metadata_write", "size": "4KiB"},
+        ]))
+        .unwrap();
+        let before = lab.requests_served();
+        let rails =
+            crate::engine::measure::Rails::new(&p, false, None, Default::default()).unwrap();
+        let m = crate::engine::measure::measure(crate::engine::measure::Request::new(
+            p,
+            rails,
+            crate::engine::Cancel::new(),
+            Arc::new(|_| {}),
+        ))
+        .await
+        .unwrap();
+        (m.run, lab, before)
+    }
+
+    fn check_every_operation(r: &crate::model::Report, lab: &crate::lab::LabHandle, before: u64) {
+        assert!(r.summary.ops > 20, "{:?}", r.summary);
+        assert_eq!(
+            r.summary.failed_ops, 0,
+            "{:?} {:?}",
+            r.resilience, r.warnings
+        );
+        for v in [
+            "read.full",
+            "read.range",
+            "write",
+            "stat",
+            "list",
+            "delete.batch",
+            "copy",
+            "write.conditional",
+            "write.metadata",
+        ] {
+            assert!(
+                r.verbs.iter().any(|x| x.verb == v && x.count > 0),
+                "{v} missing: {:?}",
+                r.verbs
+                    .iter()
+                    .map(|x| (&x.verb, x.count))
+                    .collect::<Vec<_>>()
+            );
+        }
+        // The requests the client issued are requests the lab served (the dataset and the
+        // cleanup went through OpenDAL's own client).
+        let recorded: u64 = r.apis.iter().map(|a| a.count).sum();
+        assert!(recorded > 0 && lab.requests_served() - before >= recorded);
+        let get = r
+            .apis
+            .iter()
+            .find(|a| a.api == crate::trace::Api::GetObject)
+            .unwrap();
+        assert!(get.stages.ttfb.count > 0 && get.bytes_down > 0);
+        // Nothing left behind.
+        assert!(
+            lab.stored_keys().iter().all(|k| !k.contains(&r.run.id)),
+            "{:?}",
+            lab.stored_keys()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_exec_adapter_drives_every_operation_against_the_lab() {
+        let Some(py) = python3() else {
+            eprintln!("skipped: python3 is not installed");
+            return;
+        };
+        let (run, lab, before) = every_operation(minimal_adapter(py)).await;
+        let r = &run.report;
+        assert_eq!(r.client.kind, "exec");
+        assert!(
+            r.client
+                .version
+                .as_deref()
+                .is_some_and(|v| v.starts_with("python-http.client")),
+            "{:?}",
+            r.client
+        );
+        assert!(r.client.has_phase("ttfb") && !r.client.has_phase("queue"));
+        check_every_operation(r, &lab, before);
+    }
+
+    /// Check any adapter against the lab by hand:
+    /// `OPROBE_TEST_ADAPTER="python3 adapters/boto3/oprobe_boto3.py" cargo test -p oprobe-core
+    /// --lib adapter_from_env -- --ignored` (the reference adapters need their SDK installed).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "needs OPROBE_TEST_ADAPTER and the adapter's SDK"]
+    async fn adapter_from_env() {
+        let command = std::env::var("OPROBE_TEST_ADAPTER").expect("OPROBE_TEST_ADAPTER");
+        let (run, lab, before) = every_operation(ClientChoice::Exec { command }).await;
+        let r = &run.report;
+        if let Some(o) = run.ops.iter().find(|o| !o.ok) {
+            panic!("{} failed: {:?}", o.verb, o.error);
+        }
+        eprintln!("client: {:?}", r.client);
+        check_every_operation(r, &lab, before);
+    }
+
+    #[cfg(feature = "aws-sdk")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_aws_sdk_drives_every_operation_against_the_lab() {
+        let (run, lab, before) = every_operation(ClientChoice::AwsSdk).await;
+        let r = &run.report;
+        if let Some(o) = run.ops.iter().find(|o| !o.ok) {
+            panic!("{} failed: {:?}", o.verb, o.error);
+        }
+        assert_eq!(r.client.kind, "aws_sdk");
+        assert!(
+            r.client
+                .version
+                .as_deref()
+                .is_some_and(|v| v.starts_with("aws-sdk-s3 1.")),
+            "{:?}",
+            r.client
+        );
+        check_every_operation(r, &lab, before);
+        // oprobe's transport saw the SDK's connections.
+        assert!(r.connections.dialed > 0, "{:?}", r.connections);
+        assert!(run.reqs.iter().any(|q| q.api == "ListObjects"));
+    }
+
+    #[tokio::test]
+    async fn a_broken_adapter_is_a_clear_error() {
+        let Some(py) = python3() else {
+            eprintln!("skipped: python3 is not installed");
+            return;
+        };
+        let t = TargetSpec::from_url("s3://b/p").unwrap();
+        let e = Driver::start(
+            &ClientChoice::Exec {
+                command: format!(
+                    "{py} -c 'import sys; print(\"boom\", file=sys.stderr); sys.exit(3)'"
+                ),
+            },
+            &t,
+            &Knobs::default(),
+        )
+        .await
+        .err()
+        .expect("refused");
+        let msg = format!("{e:#}");
+        assert!(
+            msg.contains("exited before answering") && msg.contains("boom"),
+            "{msg}"
+        );
+        let e = Driver::start(
+            &ClientChoice::Exec {
+                command: "/nonexistent/adapter".into(),
+            },
+            &t,
+            &Knobs::default(),
+        )
+        .await
+        .err()
+        .expect("refused");
+        assert!(format!("{e:#}").contains("cannot start"));
+    }
 }

@@ -392,19 +392,32 @@ impl Backend for AwsBackend {
                     }
                 }
                 ClientOp::Copy { source, key } => {
-                    let out = c
+                    let res = c
                         .copy_object()
                         .bucket(&bucket)
                         .key(&key)
                         .copy_source(format!("{bucket}/{}", encode_key(&source)))
                         .send()
-                        .await
-                        .map_err(sdk_error)?;
-                    ClientReply {
-                        etag: out
+                        .await;
+                    let etag = match res {
+                        Ok(out) => out
                             .copy_object_result()
                             .and_then(|r| r.e_tag())
                             .map(str::to_owned),
+                        // The copy succeeded (200) but its result document did not parse (some
+                        // S3-compatible servers, the lab among them, write `LastModified` in a
+                        // form the SDK rejects): the object is copied all the same. An error
+                        // S3 embeds in a 200 is a service error with a code, not this.
+                        Err(e)
+                            if e.code().is_none()
+                                && e.raw_response().is_some_and(|r| r.status().as_u16() == 200) =>
+                        {
+                            None
+                        }
+                        Err(e) => return Err(sdk_error(e)),
+                    };
+                    ClientReply {
+                        etag,
                         ..Default::default()
                     }
                 }

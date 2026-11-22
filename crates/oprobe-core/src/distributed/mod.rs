@@ -284,6 +284,43 @@ pub async fn run(
 #[doc(hidden)]
 pub use coordinator::Conn;
 
+/// What `oprobe worker` serves (printed once it listens).
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct WorkerOutput {
+    /// The bound `host:port` (with `--listen …:0`, the port chosen).
+    pub listening: String,
+    /// `oprobe.worker/1`.
+    pub protocol: String,
+    pub version: String,
+    pub tls: bool,
+    /// Clients coordinators may use here (`exec` only with `--allow-exec`).
+    pub clients: Vec<String>,
+}
+
+impl crate::output::CommandOutput for WorkerOutput {
+    fn next(&self) -> Vec<crate::output::NextStep> {
+        let scheme = if self.tls { "https://" } else { "" };
+        vec![crate::output::NextStep::new(
+            "run load from it",
+            format!(
+                "oprobe run TARGET --workers {scheme}{} --worker-token-file TOKEN_FILE",
+                self.listening
+            ),
+        )]
+    }
+
+    fn text(&self) -> String {
+        format!(
+            "{} oprobe worker listening on {} ({}{}; clients: {})\n",
+            crate::report::style::green("●"),
+            self.listening,
+            self.protocol,
+            if self.tls { ", TLS" } else { ", h2c" },
+            self.clients.join(", ")
+        )
+    }
+}
+
 /// Serve a worker in this process on `listener` (tests and `oprobe worker`).
 pub async fn serve_worker(
     listener: tokio::net::TcpListener,
