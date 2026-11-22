@@ -1,4 +1,8 @@
-//! Lab convergence (design v4 §12): the findings, the replay path and the capacity model agree.
+//! Lab convergence (design v4 §12, v5 §4 lab parity): the findings, the replay path and the
+//! capacity model agree, and on every limit fault of the lab the right hypothesis is selected,
+//! following the advice improves or trades as predicted, and verify's net verdict says so.
+//!
+//! Original (in-flight limit) cases:
 //! On a lab that throttles above 24 requests in flight, the throttling finding's suggested
 //! concurrency matches the capacity model's safe concurrency. Replaying the run at that
 //! concurrency (`run --from RUN --set concurrency=N`) stays within the throttle budget. The
@@ -143,4 +147,259 @@ fn demo_lab_findings_and_replay_agree() {
 #[test]
 fn parquet_lab_findings_and_replay_agree() {
     converges("lab://parquet", "8");
+}
+
+// ---------------------------------------------------------------------------------------
+// One case per limit fault (design v5 §4): the selected hypothesis, the advice replayed, and
+// verify's net verdict.
+// ---------------------------------------------------------------------------------------
+
+/// The selected hypothesis of a report: `(kind, confidence)`.
+fn selected(report: &Value) -> (String, String) {
+    let h = report["capacity"]["hypotheses"]
+        .as_array()
+        .and_then(|a| a.iter().find(|h| h["selected"] == true))
+        .unwrap_or_else(|| panic!("no selected hypothesis: {}", report["capacity"]));
+    (
+        h["kind"].as_str().unwrap_or_default().to_owned(),
+        h["confidence"].as_str().unwrap_or_default().to_owned(),
+    )
+}
+
+fn finding<'a>(report: &'a Value, code: &str) -> Option<&'a Value> {
+    report["findings"]
+        .as_array()?
+        .iter()
+        .find(|f| f["code"] == code)
+}
+
+/// `--set k=v` pairs of a finding's verification (knobs and workload).
+fn sets(f: &Value) -> Vec<String> {
+    let o = &f["verification"]["overrides"];
+    let mut v = Vec::new();
+    for part in ["knobs", "workload"] {
+        if let Some(m) = o[part].as_object() {
+            for (k, val) in m {
+                v.push(format!("{k}={}", val.as_str().unwrap_or_default()));
+            }
+        }
+    }
+    v
+}
+
+/// Run `target` until the selected hypothesis is `kind` (client-side timing on a loaded
+/// machine can blur one run): up to 3 attempts. Returns the run's JSON.
+fn run_until(env: &Env, target: &str, kind: &str) -> Value {
+    let mut last = Value::Null;
+    for _ in 0..3 {
+        last = env.run(&["run", target, "-d", "2s", "--warmup", "300ms"]);
+        if selected(&last["report"]).0 == kind {
+            return last;
+        }
+    }
+    panic!(
+        "{target}: selected {:?}, expected {kind}: {:#}",
+        selected(&last["report"]),
+        last["report"]["capacity"]["hypotheses"]
+    );
+}
+
+/// Replay `run_id` with `sets`.
+fn replay(env: &Env, run_id: &str, sets: &[String]) -> Value {
+    let mut args = vec!["run".to_owned(), "--from".into(), run_id.into()];
+    for s in sets {
+        args.push("--set".into());
+        args.push(s.clone());
+    }
+    let a: Vec<&str> = args.iter().map(String::as_str).collect();
+    env.run(&a)
+}
+
+/// `oprobe verify RUN CODE --repeat 2`: the finding's outcome and net verdict.
+fn verify(env: &Env, run_id: &str, code: &str) -> (String, String, Value) {
+    let v = env.run(&["verify", run_id, code, "--repeat", "2"]);
+    let f = &v["findings"][0];
+    (
+        f["outcome"].as_str().unwrap_or_default().to_owned(),
+        f["net"]["verdict"].as_str().unwrap_or_default().to_owned(),
+        f.clone(),
+    )
+}
+
+fn ratio(r: &Value, m: &str) -> f64 {
+    r["summary"][m].as_f64().unwrap_or(0.0)
+}
+
+#[test]
+fn a_rate_limit_is_paced_not_cut() {
+    let env = Env::new();
+    let first = run_until(&env, "lab://ratelimit", "rate_limit");
+    let r = &first["report"];
+    assert!(
+        r["capacity"]["inflight_ceiling"].is_null(),
+        "a rate limit is not an in-flight ceiling (A1): {}",
+        r["capacity"]
+    );
+    let f = finding(r, "throttling").expect("throttling finding");
+    let s = sets(f);
+    assert!(
+        s.iter().any(|x| x.starts_with("rate=")),
+        "the advice paces the client: {s:?} — {}",
+        f["advice"]
+    );
+    let id = first["run_id"].as_str().unwrap();
+    let paced = replay(&env, id, &s);
+    let thr = ratio(&paced["report"], "throttled_request_ratio");
+    assert!(thr <= 0.005, "paced, still {:.2}% throttled", thr * 100.0);
+    let (outcome, net, v) = verify(&env, id, "throttling");
+    assert_ne!(outcome, "refuted", "{v:#}");
+    assert!(matches!(net.as_str(), "improved" | "traded"), "{v:#}");
+}
+
+#[test]
+fn a_hot_key_is_a_key_limit_and_caching_it_helps() {
+    let env = Env::new();
+    let first = run_until(&env, "lab://hotkey", "key_limit");
+    let r = &first["report"];
+    let f = finding(r, "throttling").expect("throttling finding");
+    let s = sets(f);
+    assert!(
+        s.iter().any(|x| x.starts_with("cache=")),
+        "the advice caches the hot keys: {s:?} — {}",
+        f["advice"]
+    );
+    let id = first["run_id"].as_str().unwrap();
+    let cached = replay(&env, id, &s);
+    let (before, after) = (
+        ratio(r, "throttled_request_ratio"),
+        ratio(&cached["report"], "throttled_request_ratio"),
+    );
+    assert!(
+        after < before * 0.5,
+        "throttling {:.1}% → {:.1}%",
+        before * 100.0,
+        after * 100.0
+    );
+    let (outcome, net, v) = verify(&env, id, "throttling");
+    assert_ne!(outcome, "refuted", "{v:#}");
+    assert!(matches!(net.as_str(), "improved" | "traded"), "{v:#}");
+}
+
+#[test]
+fn a_rate_that_drops_is_time_varying_and_pacing_below_it_holds() {
+    let env = Env::new();
+    let first = run_until(&env, "lab://timevarying", "time_varying");
+    let r = &first["report"];
+    let h = r["capacity"]["hypotheses"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|h| h["selected"] == true)
+        .unwrap();
+    let low = h["params"]["requests_per_s"].as_f64().unwrap();
+    assert!((100.0..=200.0).contains(&low), "the lower rate ≈150/s: {h}");
+    let f = finding(r, "throttling").expect("throttling finding");
+    let s = sets(f);
+    let rate: f64 = s
+        .iter()
+        .find_map(|x| x.strip_prefix("rate=").and_then(|v| v.parse().ok()))
+        .unwrap_or_else(|| panic!("paced below the lowest limit: {s:?}"));
+    assert!(rate <= low, "{rate} > {low}");
+    let paced = replay(&env, first["run_id"].as_str().unwrap(), &s);
+    let thr = ratio(&paced["report"], "throttled_request_ratio");
+    assert!(thr <= 0.005, "paced, still {:.2}% throttled", thr * 100.0);
+}
+
+#[test]
+fn random_5xx_are_no_limit_and_never_slow_the_client() {
+    let env = Env::new();
+    let first = run_until(&env, "lab://noisy", "none");
+    let r = &first["report"];
+    let f = finding(r, "throttling").expect("throttling finding");
+    assert!(
+        f["verification"].is_null(),
+        "random throttling gets no slow-down advice (A5): {f:#}"
+    );
+    assert!(r["capacity"]["rate_ceiling_requests_per_s"].is_null());
+    assert!(
+        finding(r, "errors").is_some(),
+        "5xx are reported even when the run throttles (A6): {:?}",
+        suggestions(r)
+    );
+}
+
+#[test]
+fn a_shared_bandwidth_cap_is_not_more_streams() {
+    let env = Env::new();
+    let first = run_until(&env, "lab://bandwidth", "bandwidth_cap");
+    let r = &first["report"];
+    let f = finding(r, "download_bound").expect("download_bound finding");
+    let advice = f["advice"].as_str().unwrap_or_default();
+    assert!(
+        advice.contains("Do not add streams"),
+        "an aggregate cap never gets 'more streams' (A8): {advice}"
+    );
+    let s = sets(f);
+    let id = first["run_id"].as_str().unwrap();
+    let fewer = replay(&env, id, &s);
+    let (a, b) = (ratio(r, "mib_per_s"), ratio(&fewer["report"], "mib_per_s"));
+    assert!(
+        b >= a * 0.85,
+        "fewer streams kept the throughput: {a:.1} → {b:.1} MiB/s"
+    );
+    let (outcome, net, v) = verify(&env, id, "download_bound");
+    assert_ne!(outcome, "refuted", "{v:#}");
+    // Halving the streams under a shared cap costs (almost) nothing: improved, or a trade
+    // whose only loss is a few percent of goodput against a much lower latency.
+    let small_loss = v["net"]["worse"].as_array().is_some_and(|w| {
+        w.iter().all(|m| {
+            m["metric"].as_str().is_some_and(|x| x.contains("per_s"))
+                && m["delta_ratio"].as_f64().unwrap_or(-1.0) > -0.15
+        })
+    });
+    assert!(
+        matches!(net.as_str(), "improved" | "no_change" | "inconclusive")
+            || (net == "traded" && small_loss),
+        "halving the streams under a shared cap costs nothing: {v:#}"
+    );
+}
+
+#[test]
+fn a_queue_is_found_by_the_staircase_and_tune_stays_on_the_plateau() {
+    let env = Env::new();
+    let t = env.run(&[
+        "tune",
+        "lab://queueing",
+        "--trial-duration",
+        "1s",
+        "--trial-warmup",
+        "200ms",
+        "--max-trials",
+        "8",
+        "--cooldown",
+        "0s",
+    ]);
+    let tune = &t["tune"];
+    let (kind, _) = selected(tune);
+    assert_eq!(kind, "queueing", "{:#}", tune["capacity"]["hypotheses"]);
+    let trials = tune["trials"].as_array().unwrap();
+    let rec = trials
+        .iter()
+        .find(|x| x["id"] == tune["recommended_trial_id"])
+        .unwrap();
+    let base = trials
+        .iter()
+        .find(|x| x["id"] == tune["baseline_trial"])
+        .unwrap();
+    let c = rec["knobs"]["concurrency_count"].as_u64().unwrap();
+    assert!(
+        c <= 16,
+        "more workers only queue: recommended {c} ({})",
+        tune["headline"]
+    );
+    let (g, g0) = (
+        rec["ops_per_s"].as_f64().unwrap(),
+        base["ops_per_s"].as_f64().unwrap(),
+    );
+    assert!(g >= g0 * 0.85, "goodput kept: {g0:.0} → {g:.0}");
 }

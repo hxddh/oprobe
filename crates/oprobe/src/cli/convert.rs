@@ -128,6 +128,7 @@ impl From<TuneSearchArgs> for i::TuneSearch {
             max_throttle_ratio: None,
             boundary_repeats: a.boundary_repeats,
             headroom_ratio: a.headroom_ratio,
+            risk_ratio: a.risk,
         }
     }
 }
@@ -218,6 +219,7 @@ impl From<CompareArgs> for i::CompareRequest {
             allow_workload_change: a.allow_workload_change,
             allow_target_change: a.allow_target_change,
             strict: a.strict,
+            fail_on_warn: a.fail_on_warn,
             markdown: a.markdown,
             junit: a.junit,
             json: a.json,

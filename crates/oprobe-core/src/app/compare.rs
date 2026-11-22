@@ -67,6 +67,7 @@ pub fn thresholds(a: &CompareRequest) -> Thresholds {
         allow_workload_change: a.allow_workload_change,
         allow_target_change: a.allow_target_change,
         strict: a.strict,
+        fail_on_warn: a.fail_on_warn,
         ..Thresholds::default()
     }
 }
@@ -208,6 +209,17 @@ pub fn compare(ctx: &Ctx, a: CompareRequest) -> Result<Comparison> {
                 "not comparable: no regression verdict{}",
                 if a.strict { " (--strict: exit 2)" } else { "" }
             )))),
+            GateVerdict::Warned => ctx.out.info(yellow(&bold(&format!(
+                "passed with warnings: a check is significantly worse within its limit{}",
+                if a.fail_on_warn {
+                    " (--fail-on-warn: exit 3)"
+                } else {
+                    ""
+                }
+            )))),
+            GateVerdict::Inconclusive => ctx.out.info(yellow(&bold(
+                "inconclusive: a check could not rule out a regression (repeat the runs)",
+            ))),
             GateVerdict::Passed => {}
         }
     }

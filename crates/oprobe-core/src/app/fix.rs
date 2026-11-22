@@ -32,6 +32,9 @@ pub struct FixOutput {
     pub recommendation: Recommendation,
     /// The `[knobs]` that differ from the diagnosis run, as TOML to merge into a profile.
     pub profile_patch: String,
+    /// The fix menu (design v5 §4, Fix 5): 2–4 Pareto options with goodput, p99, throttling,
+    /// cost per month and verify status; the recommended one first.
+    pub options: Vec<crate::analysis::menu::FixOption>,
     /// The verification of the recommendation (absent when nothing changes).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verify: Option<VerifyResult>,
@@ -94,6 +97,36 @@ impl CommandOutput for FixOutput {
         if let Some(v) = &self.verify {
             for f in &v.findings {
                 o += &format!("  {} {}\n", dim("·"), f.reason);
+            }
+        }
+        if !self.options.is_empty() {
+            o += &format!("\n{}\n", bold("options"));
+            for (i, opt) in self.options.iter().enumerate() {
+                o += &format!(
+                    "  {} {:<40} {} — {}{}\n",
+                    if opt.recommended {
+                        green("▶")
+                    } else {
+                        dim(&format!("{}", i + 1))
+                    },
+                    opt.label,
+                    opt.summary(),
+                    if opt.overrides.is_empty() {
+                        "no change".to_owned()
+                    } else {
+                        opt.overrides.summary()
+                    },
+                    match opt.verify {
+                        crate::analysis::menu::OptionVerify::NotVerified => String::new(),
+                        v => format!(
+                            " [{}]",
+                            serde_json::to_value(v)
+                                .ok()
+                                .and_then(|x| x.as_str().map(str::to_owned))
+                                .unwrap_or_default()
+                        ),
+                    }
+                );
             }
         }
         if !self.profile_patch.is_empty() {
@@ -222,6 +255,16 @@ pub async fn fix(ctx: &Ctx, a: FixRequest, cancel: Cancel) -> Result<FixOutcome>
     let winner = tuned.report.spec.profile.knobs.clone();
     rec.overrides =
         crate::tune::recommend::knob_overrides(&diag.report.spec.profile.knobs, &winner);
+    if let Some(r) = tuned
+        .tune
+        .trials
+        .iter()
+        .find(|x| x.id == tuned.tune.recommended_trial_id)
+        .and_then(|x| x.rate_per_s)
+        && Some(r) != diag.report.spec.profile.workload.rate
+    {
+        let _ = rec.overrides.set("rate", &format!("{r:.0}"));
+    }
     // 3. Verify the recommendation against the diagnosis run.
     let verify = if rec.overrides.is_empty() {
         None
@@ -288,6 +331,63 @@ pub async fn fix(ctx: &Ctx, a: FixRequest, cancel: Cancel) -> Result<FixOutcome>
         rec.confirmed = v.findings.first().map(|f| f.outcome);
         Some(v)
     };
+    // The menu of Pareto options over the tuner's trials, against the diagnosis.
+    let options = {
+        let t = &tuned.tune;
+        let reference = crate::tune::Trial {
+            id: usize::MAX,
+            stage: "diagnosis".into(),
+            ops_per_s: crate::report::diff::good_ops_per_s(&diag.report),
+            mib_per_s: diag.report.summary.mib_per_s,
+            p99_ms: diag
+                .report
+                .verbs
+                .iter()
+                .map(|v| v.latency.p99)
+                .fold(0.0, f64::max),
+            error_rate: diag.report.summary.error_rate,
+            throttled_request_ratio: crate::report::diff::throttled_request_ratio(&diag.report),
+            throttled_responses: diag.report.resilience.throttled_responses,
+            requests: diag.report.connections.requests,
+            cost_per_million_ops: diag.report.cost.selected.per_million_ops_usd,
+            feasible: crate::report::diff::throttled_request_ratio(&diag.report) <= budget
+                && diag.report.summary.error_rate <= diag.report.sla.max_error_ratio,
+            ..Default::default()
+        };
+        let from = diag.report.spec.profile.knobs.clone();
+        let diag_rate = diag.report.spec.profile.workload.rate;
+        let ov = move |tr: &crate::tune::Trial| {
+            let mut o = crate::tune::recommend::knob_overrides(&from, &tr.knobs);
+            if tr.rate_per_s != diag_rate
+                && let Some(r) = tr.rate_per_s
+            {
+                let _ = o.set("rate", &format!("{r:.0}"));
+            }
+            o
+        };
+        let trials: Vec<crate::tune::Trial> = t.trials.iter().map(|x| x.to_trial()).collect();
+        let mut m = crate::analysis::menu::menu(&crate::analysis::menu::MenuInputs {
+            trials: &trials,
+            reference: &reference,
+            use_bytes: t.metric_unit == "mib_per_s",
+            max_throttle_ratio: budget,
+            monthly_ops: diag
+                .report
+                .cost
+                .applicable
+                .then_some(profile.cost.monthly_ops),
+            overrides_of: &ov,
+        });
+        // The verified option carries the outcome.
+        if let Some(outcome) = rec.confirmed {
+            for o in &mut m {
+                if o.overrides == rec.overrides {
+                    o.verify = outcome.into();
+                }
+            }
+        }
+        m
+    };
     let mut wrote = Vec::new();
     if let Some(p) = &a.write_profile {
         write_file(p, &rec.profile_toml)?;
@@ -305,6 +405,7 @@ pub async fn fix(ctx: &Ctx, a: FixRequest, cancel: Cancel) -> Result<FixOutcome>
         tune_run_id: tuned.run_id.clone(),
         profile_patch: knobs_patch(&diag.report.spec.profile.knobs, &winner),
         recommendation: rec,
+        options,
         verify,
         wrote,
         unsaved_replay: a

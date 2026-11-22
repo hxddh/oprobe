@@ -34,6 +34,10 @@ use hyper_util::server::conn::auto::Builder as AutoServerBuilder;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
+pub mod faults;
+
+pub use faults::{KeyRateLimitFault, QueueFault, RateLimitFault};
+
 use crate::config::{DatasetSpec, Preset, Profile, TargetSpec};
 use crate::net::tls::build_tls_acceptor;
 
@@ -174,6 +178,17 @@ pub struct LabConfig {
     /// Reject multipart uploads whose parts (except the last) are smaller than this, like S3
     /// (`EntityTooSmall`, 5 MiB). 0 = any size.
     pub min_part_size: usize,
+    /// A token bucket over every request (a rate limit; optionally time-varying).
+    pub rate_limit: Option<RateLimitFault>,
+    /// One token bucket per key or prefix (a hot key throttles, the others are served).
+    pub key_rate_limit: Option<KeyRateLimitFault>,
+    /// An M/M/c queue in front of the handler (latency grows with the requests in flight).
+    pub queue: Option<QueueFault>,
+    /// Cap the bandwidth of all response bodies together (KiB/s, shared by every stream).
+    pub aggregate_bandwidth_kib_s: Option<u64>,
+    /// Answer this share of requests with a random `503 SlowDown` (half) or `500` (half),
+    /// unrelated to the load.
+    pub server_error_ratio: Option<f64>,
 }
 
 /// Named fault presets for `lab://NAME` targets, `oprobe lab --scenario` and `oprobe demo`.
@@ -195,10 +210,22 @@ pub enum Scenario {
     /// The demo's limit without stragglers, for the parquet preset (HEAD, footer, then 4
     /// parallel column reads): 503 above 24 in flight, so 6 parquet workers fit and 8 throttle.
     Parquet,
+    /// A token bucket: 300 requests/s (burst 20), whatever the concurrency.
+    RateLimit,
+    /// One token bucket per key (40 requests/s): zipf reads make the hottest keys throttle.
+    HotKey,
+    /// An aggregate bandwidth cap: 16 MiB/s shared by every response stream.
+    Bandwidth,
+    /// An M/M/4 queue (10 ms mean service): latency grows with the requests in flight.
+    Queueing,
+    /// A rate limit that drops from 600 to 150 requests/s 1.5 s after the first request.
+    TimeVarying,
+    /// 5% random 5xx unrelated to the load (half 503 SlowDown, half 500 InternalError).
+    Noisy,
 }
 
 impl Scenario {
-    pub const ALL: [Scenario; 7] = [
+    pub const ALL: [Scenario; 13] = [
         Scenario::Clean,
         Scenario::Demo,
         Scenario::Throttle,
@@ -206,6 +233,12 @@ impl Scenario {
         Scenario::Lossy,
         Scenario::Flaky,
         Scenario::Parquet,
+        Scenario::RateLimit,
+        Scenario::HotKey,
+        Scenario::Bandwidth,
+        Scenario::Queueing,
+        Scenario::TimeVarying,
+        Scenario::Noisy,
     ];
 
     pub fn name(self) -> &'static str {
@@ -217,6 +250,12 @@ impl Scenario {
             Scenario::Lossy => "lossy",
             Scenario::Flaky => "flaky",
             Scenario::Parquet => "parquet",
+            Scenario::RateLimit => "ratelimit",
+            Scenario::HotKey => "hotkey",
+            Scenario::Bandwidth => "bandwidth",
+            Scenario::Queueing => "queueing",
+            Scenario::TimeVarying => "timevarying",
+            Scenario::Noisy => "noisy",
         }
     }
 
@@ -234,6 +273,30 @@ impl Scenario {
             Scenario::Parquet => {
                 "8 ms latency, 503 SlowDown above 24 concurrent requests, no stragglers; \
                  default workload: the parquet preset, 8 workers"
+            }
+            Scenario::RateLimit => {
+                "5 ms latency, 503 SlowDown above 300 requests/s (token bucket, burst 20); \
+                 default workload: whole-object reads of 64 × 16 KiB, 16 workers"
+            }
+            Scenario::HotKey => {
+                "5 ms latency, 503 SlowDown above 40 requests/s per key; \
+                 default workload: zipf(1.2) reads of 64 × 16 KiB, 16 workers"
+            }
+            Scenario::Bandwidth => {
+                "5 ms latency, all response bodies share 16 MiB/s; \
+                 default workload: reads of 32 × 512 KiB, 8 workers"
+            }
+            Scenario::Queueing => {
+                "M/M/4 queue, 10 ms mean service time (latency grows with the requests in flight); \
+                 default workload: reads of 64 × 16 KiB, 16 workers"
+            }
+            Scenario::TimeVarying => {
+                "5 ms latency, 503 SlowDown above 600 requests/s, dropping to 150 requests/s \
+                 1.5 s after the first request; default workload: reads of 64 × 16 KiB, 16 workers"
+            }
+            Scenario::Noisy => {
+                "5 ms latency, 5% random 5xx (half 503 SlowDown, half 500) unrelated to the load; \
+                 default workload: reads of 64 × 16 KiB, 8 workers"
             }
         }
     }
@@ -288,6 +351,50 @@ impl Scenario {
                 max_inflight_before_503: Some(24),
                 ..base
             },
+            Scenario::RateLimit => LabConfig {
+                base_ttfb_delay: ms(5),
+                rate_limit: Some(RateLimitFault {
+                    requests_per_s: 300.0,
+                    burst: 20,
+                    after: None,
+                }),
+                ..base
+            },
+            Scenario::HotKey => LabConfig {
+                base_ttfb_delay: ms(5),
+                key_rate_limit: Some(KeyRateLimitFault {
+                    requests_per_s: 40.0,
+                    burst: 4,
+                    by_prefix: false,
+                }),
+                ..base
+            },
+            Scenario::Bandwidth => LabConfig {
+                base_ttfb_delay: ms(5),
+                aggregate_bandwidth_kib_s: Some(16 * 1024),
+                ..base
+            },
+            Scenario::Queueing => LabConfig {
+                queue: Some(QueueFault {
+                    servers: 4,
+                    service: ms(10),
+                }),
+                ..base
+            },
+            Scenario::TimeVarying => LabConfig {
+                base_ttfb_delay: ms(5),
+                rate_limit: Some(RateLimitFault {
+                    requests_per_s: 600.0,
+                    burst: 20,
+                    after: Some((ms(1500), 150.0)),
+                }),
+                ..base
+            },
+            Scenario::Noisy => LabConfig {
+                base_ttfb_delay: ms(5),
+                server_error_ratio: Some(0.05),
+                ..base
+            },
         }
     }
 }
@@ -312,6 +419,10 @@ pub struct ScenarioDefaults {
     pub warmup: Option<Duration>,
     pub duration: Option<Duration>,
     pub concurrency: Option<usize>,
+    /// Key popularity (`None`: the profile's).
+    pub access: Option<crate::config::Access>,
+    /// Operation mix (`None`: the preset's).
+    pub mix: Option<Vec<crate::config::OpSpec>>,
 }
 
 impl Scenario {
@@ -328,12 +439,24 @@ impl Scenario {
                 warmup: Some(Duration::from_millis(500)),
                 duration: Some(crate::config::defaults().demo_duration.get()),
                 concurrency: Some(DEMO_CONCURRENCY),
+                ..Default::default()
             },
             Scenario::Parquet => ScenarioDefaults {
                 preset: Some(Preset::Parquet),
                 concurrency: Some(PARQUET_CONCURRENCY),
                 ..Default::default()
             },
+            Scenario::RateLimit | Scenario::Queueing | Scenario::TimeVarying => {
+                reads(64, crate::util::ByteSize::kib(16), 16, None)
+            }
+            Scenario::HotKey => reads(
+                64,
+                crate::util::ByteSize::kib(16),
+                16,
+                Some(crate::config::Access::Zipf(1.2)),
+            ),
+            Scenario::Noisy => reads(64, crate::util::ByteSize::kib(16), 8, None),
+            Scenario::Bandwidth => reads(32, crate::util::ByteSize::kib(512), 8, None),
             _ => ScenarioDefaults::default(),
         }
     }
@@ -356,6 +479,12 @@ impl Scenario {
         if let Some(v) = d.duration {
             w.duration = crate::util::HumanDuration(v);
         }
+        if let Some(a) = d.access {
+            w.access = a;
+        }
+        if let Some(m) = d.mix {
+            w.mix = m;
+        }
         if let Some(c) = d.concurrency {
             p.knobs.concurrency = c;
         }
@@ -367,6 +496,31 @@ impl Scenario {
         let rest = lower.strip_prefix("lab://")?;
         let name = rest.split(['/', '?', '#']).next().unwrap_or_default();
         crate::input::lab_scenario(name).ok()
+    }
+}
+
+/// A read-only workload over `objects` objects of `size` (the limit scenarios' default).
+fn reads(
+    objects: usize,
+    size: crate::util::ByteSize,
+    concurrency: usize,
+    access: Option<crate::config::Access>,
+) -> ScenarioDefaults {
+    ScenarioDefaults {
+        preset: Some(Preset::SmallFiles),
+        dataset: Some(DatasetSpec {
+            objects,
+            object_size: size,
+            ..DatasetSpec::default()
+        }),
+        warmup: Some(Duration::from_millis(300)),
+        duration: Some(Duration::from_secs(3)),
+        concurrency: Some(concurrency),
+        access,
+        mix: Some(vec![crate::config::OpSpec {
+            weight: 1,
+            op: crate::config::OpKind::Read { size: None },
+        }]),
     }
 }
 
@@ -552,6 +706,7 @@ struct S3Store {
     peak_inflight: AtomicUsize,
     emitted_throttles: AtomicU64,
     faults: RwLock<LabConfig>,
+    limits: faults::LimitState,
 }
 
 type BoxBody = http_body_util::combinators::BoxBody<Bytes, Infallible>;
@@ -670,27 +825,49 @@ impl Drop for ServerInflightGuard {
     }
 }
 
-async fn build_shaped_body(payload: Bytes, bandwidth_kib_s: Option<u64>) -> BoxBody {
-    let Some(rate_kib) = bandwidth_kib_s.filter(|&r| r > 0) else {
+async fn build_shaped_body(
+    payload: Bytes,
+    bandwidth_kib_s: Option<u64>,
+    aggregate: Option<(Arc<S3Store>, u64)>,
+) -> BoxBody {
+    let rate_kib = bandwidth_kib_s.filter(|&r| r > 0);
+    let aggregate = aggregate.filter(|a| a.1 > 0);
+    if rate_kib.is_none() && aggregate.is_none() {
         return full_body(payload);
-    };
-    if payload.len() <= 16_384 {
+    }
+    if payload.len() <= 16_384 && aggregate.is_none() {
         return full_body(payload);
     }
     let chunk_size = 32 * 1024_usize;
-    let sleep_per_chunk_us =
-        ((chunk_size as f64 / (rate_kib as f64 * 1024.0)) * 1_000_000.0) as u64;
+    let sleep_per_chunk_us = rate_kib.map_or(0, |rate_kib| {
+        ((chunk_size as f64 / (rate_kib as f64 * 1024.0)) * 1_000_000.0) as u64
+    });
 
-    let stream = futures::stream::unfold((payload, 0_usize), move |(buf, pos)| async move {
-        if pos >= buf.len() {
-            return None;
+    let stream = futures::stream::unfold((payload, 0_usize), move |(buf, pos)| {
+        let aggregate = aggregate.clone();
+        async move {
+            if pos >= buf.len() {
+                return None;
+            }
+            let end = (pos + chunk_size).min(buf.len());
+            let slice = buf.slice(pos..end);
+            let mut wait = Duration::ZERO;
+            if pos > 0 && sleep_per_chunk_us > 0 {
+                wait = Duration::from_micros(sleep_per_chunk_us);
+            }
+            if let Some((store, kib)) = &aggregate {
+                // The shared budget paces every stream together: the wait is the later of
+                // the two caps.
+                let shared = store
+                    .limits
+                    .pace_bytes(slice.len(), *kib, std::time::Instant::now());
+                wait = wait.max(shared);
+            }
+            if !wait.is_zero() {
+                tokio::time::sleep(wait).await;
+            }
+            Some((Ok::<_, Infallible>(Frame::data(slice)), (buf, end)))
         }
-        let end = (pos + chunk_size).min(buf.len());
-        let slice = buf.slice(pos..end);
-        if pos > 0 && sleep_per_chunk_us > 0 {
-            tokio::time::sleep(Duration::from_micros(sleep_per_chunk_us)).await;
-        }
-        Some((Ok::<_, Infallible>(Frame::data(slice)), (buf, end)))
     });
     StreamBody::new(stream).boxed()
 }
@@ -744,7 +921,32 @@ async fn handle_s3_request(
             .map(|n| seq.is_multiple_of(n as u64))
             .unwrap_or(false);
 
-        if over_conc || periodic_throttle {
+        // Limit faults (design v5 §4): token buckets, per key or prefix, and random 5xx.
+        let now = std::time::Instant::now();
+        let path = uri.path();
+        let rate_limited = faults
+            .rate_limit
+            .as_ref()
+            .is_some_and(|f| !store.limits.admit_global(f, now));
+        let key_limited = !rate_limited
+            && faults
+                .key_rate_limit
+                .as_ref()
+                .is_some_and(|f| !store.limits.admit_key(f, path, now));
+        let random_5xx = faults
+            .server_error_ratio
+            .filter(|r| *r > 0.0)
+            .is_some_and(|r| store.limits.uniform() < r);
+        if random_5xx && store.limits.uniform() < 0.5 {
+            let _ = req.into_body().collect().await;
+            return Ok(s3_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalError",
+                "We encountered an internal error. Please try again.",
+                &req_id,
+            ));
+        }
+        if over_conc || periodic_throttle || rate_limited || key_limited || random_5xx {
             store.emitted_throttles.fetch_add(1, Ordering::Relaxed);
             // By default read the request body first so every client sees the 503 itself;
             // `throttle_early_close` reproduces gateways that answer and hang up mid-upload.
@@ -809,6 +1011,12 @@ async fn handle_s3_request(
     if !faults.base_ttfb_delay.is_zero() {
         tokio::time::sleep(faults.base_ttfb_delay).await;
     }
+    // 2b. An M/M/c queue: wait for a server, then the service time (the permit is released
+    // once the handler has answered, before the body streams).
+    let _server = match (&faults.queue, is_delete_cleanup) {
+        (Some(q), false) => store.limits.serve_queued(q).await,
+        _ => None,
+    };
     if !is_delete_cleanup
         && faults.straggler_every_n > 0
         && seq.is_multiple_of(faults.straggler_every_n as u64)
@@ -1270,7 +1478,12 @@ async fn handle_s3_request(
             let body = if is_head {
                 full_body(Bytes::new())
             } else {
-                build_shaped_body(slice, faults.stream_bandwidth_kib_s).await
+                build_shaped_body(
+                    slice,
+                    faults.stream_bandwidth_kib_s,
+                    faults.aggregate_bandwidth_kib_s.map(|k| (store.clone(), k)),
+                )
+                .await
             };
             Ok(b.body(body).unwrap())
         }
@@ -1551,6 +1764,7 @@ impl LabServer {
             peak_inflight: AtomicUsize::new(0),
             emitted_throttles: AtomicU64::new(0),
             faults: RwLock::new(faults.clone()),
+            limits: faults::LimitState::default(),
         });
 
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();

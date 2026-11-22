@@ -76,6 +76,8 @@ pub enum CheckState {
     /// Within the limits, but the change is too large to call "no change" and not shown to
     /// be significant (one run per side, or an interval that includes zero).
     Inconclusive,
+    /// Worse, but within the limits: the gate warns (and fails with `--fail-on-warn`).
+    Warned,
     /// Within the limits and small.
     Within,
     Skipped,
@@ -87,6 +89,7 @@ impl CheckState {
             CheckState::Improved => tr("check.improved"),
             CheckState::Regressed => tr("check.regressed"),
             CheckState::Inconclusive => tr("check.inconclusive"),
+            CheckState::Warned => tr("check.warned"),
             CheckState::Within => tr("check.within"),
             CheckState::Skipped => tr("check.skipped"),
         }
@@ -97,6 +100,7 @@ impl CheckState {
             CheckState::Improved => Level::Ok,
             CheckState::Regressed => Level::Crit,
             CheckState::Inconclusive => Level::Inconclusive,
+            CheckState::Warned => Level::Warn,
             CheckState::Within | CheckState::Skipped => Level::Neutral,
         }
     }
@@ -112,6 +116,9 @@ pub fn check_state(c: &Check, significant: Option<bool>) -> CheckState {
         Status::Fail => CheckState::Regressed,
         Status::Improved => CheckState::Improved,
         Status::Skipped => CheckState::Skipped,
+        Status::Warn => CheckState::Warned,
+        // The gate itself could not judge the change: never shown as "within limits" (U3).
+        Status::Inconclusive => CheckState::Inconclusive,
         Status::Pass => {
             let big = c.delta_ratio.is_none_or(|d| {
                 let half_limit = c.limit_ratio.map(|l| l * 0.5).unwrap_or(INCONCLUSIVE_RATIO);

@@ -72,6 +72,8 @@ pub const UNITLESS_FIELDS: &[&str] = &[
     "low",
     "high",
     "log_likelihood",
+    // Bayesian information criterion of a limit model (a score; lower is better).
+    "bic",
 ];
 
 /// Whether a numeric report field name follows the unit rule.
@@ -1031,6 +1033,35 @@ pub struct TrialRow {
     pub cost_per_million_ops_usd: f64,
     pub feasible: bool,
     pub note: String,
+    /// The pace of an open-loop trial (operations per second).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_per_s: Option<f64>,
+}
+
+impl TrialRow {
+    /// Back to the tuner's form (knobs in profile units).
+    pub fn to_trial(&self) -> crate::tune::Trial {
+        crate::tune::Trial {
+            id: self.id as usize,
+            stage: self.stage.clone(),
+            knobs: self.knobs.to_knobs(),
+            ops_per_s: self.ops_per_s,
+            mib_per_s: self.mib_per_s,
+            p50_ms: self.p50_ms,
+            p99_ms: self.p99_ms,
+            error_rate: self.error_ratio,
+            throttled_request_ratio: self.throttled_request_ratio,
+            throttled_op_ratio: self.throttled_op_ratio,
+            throttled_responses: self.throttled_responses_count,
+            requests: self.requests_count,
+            cost_per_million_ops: self.cost_per_million_ops_usd,
+            peak_inflight: self.peak_inflight_count,
+            peak_inflight_per_op: self.peak_inflight_per_op_count as f64,
+            feasible: self.feasible,
+            note: self.note.clone(),
+            rate_per_s: self.rate_per_s,
+        }
+    }
 }
 
 impl From<&crate::tune::Trial> for TrialRow {
@@ -1053,6 +1084,7 @@ impl From<&crate::tune::Trial> for TrialRow {
             cost_per_million_ops_usd: t.cost_per_million_ops,
             feasible: t.feasible,
             note: t.note.clone(),
+            rate_per_s: t.rate_per_s,
         }
     }
 }

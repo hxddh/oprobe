@@ -14,6 +14,7 @@ use super::input::*;
 use crate::analysis::capacity::{self, Observation};
 use crate::analysis::compare::{Comparison, compare_with_noise, runs_t, significant};
 use crate::analysis::stats::Interval;
+use crate::analysis::verdict::{NetAssessment, NetVerdict, Sprt, SprtDecision};
 use crate::analysis::verification::{Direction, Expectation, VerifyOutcome};
 use crate::engine::Cancel;
 use crate::errors::{ErrorCode, OprobeError};
@@ -62,9 +63,16 @@ pub struct FindingVerdict {
     pub candidate_run_ids: Vec<String>,
     /// Baseline runs vs candidate runs (run-level statistics).
     pub comparison: Comparison,
-    /// The two-sided net verdict (design v5 §4; filled by stream ANA).
+    /// The two-sided net verdict (design v5 §4): improved, regressed, traded, no change or
+    /// inconclusive, with what got better and what got worse.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub net: Option<crate::analysis::verdict::NetAssessment>,
+    /// Interleaved baseline / candidate pairs measured for this finding.
+    #[serde(default)]
+    pub pairs_count: u64,
+    /// The sequential test decided before `--repeat` pairs ran.
+    #[serde(default)]
+    pub stopped_early: bool,
 }
 
 /// Result of `oprobe verify`.
@@ -72,7 +80,8 @@ pub struct FindingVerdict {
 pub struct VerifyResult {
     /// The verified run.
     pub run_id: String,
-    /// Baseline / candidate pairs per finding.
+    /// Baseline / candidate pairs per finding (the most any finding needed: the sequential test
+    /// stops a finding once the evidence is in, between 2 and 8 pairs).
     pub repeat_count: u64,
     /// The replays of the run without changes.
     pub baseline_run_ids: Vec<String>,
@@ -116,6 +125,22 @@ impl CommandOutput for VerifyResult {
                 f.overrides.summary(),
                 dim(&f.description)
             );
+            if let Some(n) = &f.net {
+                o += &format!(
+                    "  {} {}{}\n",
+                    dim("net:"),
+                    n.summary(),
+                    dim(&format!(
+                        " ({} pair(s){})",
+                        f.pairs_count,
+                        if f.stopped_early {
+                            ", stopped early"
+                        } else {
+                            ""
+                        }
+                    ))
+                );
+            }
             for e in &f.expectations {
                 o += &format!("    {} {}\n", outcome_text(e.outcome), e.note);
             }
@@ -349,12 +374,39 @@ fn fmt_unit(v: f64, metric: &str) -> String {
 
 /// Judge one expectation over per-run values of the baseline (`a`) and candidate (`b`).
 pub fn judge(e: &Expectation, a: &[f64], b: &[f64], floor: f64) -> ExpectationCheck {
-    let (ia, ib, ch) = runs_t(a, b);
+    let (mut ia, mut ib, mut ch) = runs_t(a, b);
+    // Positive metrics: a log-ratio interval (never below −100 %); ratios stay in [0, 1]
+    // (design v5 §4: no impossible intervals).
+    if a.iter().chain(b).all(|v| *v > 0.0) && a.len() == b.len() {
+        ch = crate::analysis::verdict::log_ratio(a, b, true);
+    } else if a.iter().chain(b).all(|v| *v > 0.0) {
+        ch = crate::analysis::verdict::log_ratio(a, b, false);
+    }
+    if e.metric.ends_with("_ratio") {
+        for i in [&mut ia, &mut ib] {
+            i.low = i.low.max(0.0);
+            i.high = i.high.min(1.0);
+        }
+    }
     let rel = e.unit == "baseline_ratio";
     let scale = |v: f64| if rel { v * ia.estimate } else { v };
     let (pred, lo, hi) = (scale(e.predicted), scale(e.lo), scale(e.hi));
     let sig = significant(&ch, floor);
+    // A predicted interval the measured one misses entirely refutes the prediction, whatever
+    // the direction (A2: "predicted 1474 [1122, 1826], measured 866" is not a confirmation).
+    let predicted_interval = !rel && e.hi > e.lo && e.hi > 0.0;
+    let missed = predicted_interval
+        && matches!(e.direction, Direction::Increase | Direction::Decrease)
+        && (ib.high < lo || ib.low > hi);
     let (outcome, rule) = match e.direction {
+        _ if missed => (
+            VerifyOutcome::Refuted,
+            format!(
+                "missed the predicted [{}, {}]",
+                fmt_unit(lo, &e.metric),
+                fmt_unit(hi, &e.metric)
+            ),
+        ),
         Direction::Increase => {
             if sig && ch.estimate > 0.0 {
                 (VerifyOutcome::Confirmed, "rose beyond the noise".to_owned())
@@ -565,39 +617,63 @@ pub async fn verify_hypotheses(
     cfg: VerifyCfg<'_>,
 ) -> Result<VerifyResult> {
     let id = run.id().to_owned();
+    // The noise floor known so far sets the sequential test's minimum effect.
+    let nfile = noise_file(&ctx.paths);
+    let mut floors = NoiseFloors::load(&nfile).unwrap_or_default();
+    let prior_noise = floors.of(&run.report).cloned();
+    let delta = noise_ratio(prior_noise.as_ref(), "ops_per_s").max(0.05);
+    // Sequential: at least 2 pairs, at most `--repeat` (2–8); a finding stops once its SPRT
+    // decides (design v5 §4, Verify 5).
+    let max_pairs = cfg.repeat.clamp(2, 8);
+    let min_pairs = 2;
     let mut a_runs: Vec<Run> = Vec::new();
-    let mut b_runs: Vec<Vec<Run>> = vec![Vec::new(); hyps.len()];
-    let total = cfg.repeat * (hyps.len() + 1);
+    // Per hypothesis: (pair index, candidate run).
+    let mut b_pairs: Vec<Vec<(usize, Run)>> = vec![Vec::new(); hyps.len()];
+    let mut sprts: Vec<Sprt> = hyps.iter().map(|_| Sprt::new(delta, 0.05, 0.10)).collect();
+    let mut decided = vec![false; hyps.len()];
     let mut n = 0;
-    for i in 0..cfg.repeat {
+    for i in 0..max_pairs {
+        if i >= min_pairs && decided.iter().all(|d| *d) {
+            break;
+        }
+        let open = decided.iter().filter(|d| !**d).count();
         n += 1;
         ctx.out.info(dim(&format!(
-            "verify {id}: run {n}/{total} — baseline replay (pair {}/{})",
+            "verify {id}: run {n} — baseline replay (pair {}/≤{max_pairs}, {open} finding(s) undecided)",
             i + 1,
-            cfg.repeat
         )));
         a_runs.push(
             cfg.replayer
                 .replay(ctx, &Overrides::new(), &format!("verify-{id}-baseline"))
                 .await?,
         );
-        for (h, out) in hyps.iter().zip(b_runs.iter_mut()) {
+        let base_goodput = good_ops_per_s(&a_runs[i].report);
+        for (k, h) in hyps.iter().enumerate() {
+            if decided[k] && i >= min_pairs {
+                continue;
+            }
             n += 1;
             ctx.out.info(dim(&format!(
-                "verify {id}: run {n}/{total} — `{}` with {}",
+                "verify {id}: run {n} — `{}` with {}",
                 h.code,
                 h.overrides.summary()
             )));
-            out.push(
-                cfg.replayer
-                    .replay(ctx, &h.overrides, &format!("verify-{id}-{}", h.code))
-                    .await?,
-            );
+            let r = cfg
+                .replayer
+                .replay(ctx, &h.overrides, &format!("verify-{id}-{}", h.code))
+                .await?;
+            sprts[k].push(base_goodput, good_ops_per_s(&r.report));
+            b_pairs[k].push((i, r));
+            if sprts[k].decision() != SprtDecision::Continue {
+                decided[k] = true;
+            }
         }
     }
+    let b_runs: Vec<Vec<Run>> = b_pairs
+        .iter()
+        .map(|v| v.iter().map(|(_, r)| r.clone()).collect())
+        .collect();
     // Noise: consecutive identical runs are A/A pairs.
-    let nfile = noise_file(&ctx.paths);
-    let mut floors = NoiseFloors::load(&nfile).unwrap_or_default();
     let mut pairs = 0u64;
     let mut warnings = Vec::new();
     if cfg.calibrate {
@@ -621,10 +697,14 @@ pub async fn verify_hypotheses(
     let history = ctx.paths.capacity_file();
     let mut calibrated = false;
     let mut findings = Vec::new();
-    for (h, bs) in hyps.iter().zip(b_runs.iter()) {
+    for (k, (h, bs)) in hyps.iter().zip(b_runs.iter()).enumerate() {
         let t = Thresholds::default();
+        // The baselines this finding was paired with.
+        let a_mine: Vec<Run> = b_pairs[k].iter().map(|(i, _)| a_runs[*i].clone()).collect();
+        let a_runs = &a_mine;
+        let net = net_assessment(a_runs, bs, noise.as_ref());
         let comparison = compare_with_noise(
-            &a_runs,
+            a_runs,
             bs,
             &format!("{id} replayed"),
             &format!("{id} with {}", h.overrides.summary()),
@@ -665,6 +745,13 @@ pub async fn verify_hypotheses(
             !checks.is_empty() && checks.iter().all(|c| c.outcome == VerifyOutcome::Confirmed);
         let (outcome, reason) = if let Some(r) = refuted.first() {
             (VerifyOutcome::Refuted, r.note.clone())
+        } else if net.verdict == NetVerdict::Regressed {
+            // Two-sided: a change that only made things worse is refuted whatever its
+            // expectations said.
+            (
+                VerifyOutcome::Refuted,
+                format!("the change made things worse: {}", net.summary()),
+            )
         } else if all_confirmed && (!must_resolve || resolved) {
             (
                 VerifyOutcome::Confirmed,
@@ -754,23 +841,89 @@ pub async fn verify_hypotheses(
             description: h.description.clone(),
             overrides: h.overrides.clone(),
             outcome,
-            reason,
             expectations: checks,
             resolved,
             candidate_run_ids: bs.iter().map(|r| r.id().to_owned()).collect(),
             comparison,
-            net: None,
+            pairs_count: bs.len() as u64,
+            stopped_early: bs.len() < max_pairs,
+            reason: if net.verdict == NetVerdict::Traded && outcome != VerifyOutcome::Refuted {
+                format!("{reason} — net {}", net.summary())
+            } else {
+                reason
+            },
+            net: Some(net),
         });
     }
     Ok(VerifyResult {
         run_id: id,
-        repeat_count: cfg.repeat as u64,
+        repeat_count: a_runs.len() as u64,
         baseline_run_ids: a_runs.iter().map(|r| r.id().to_owned()).collect(),
         findings,
         noise_pairs_count: pairs,
         calibrated,
         warnings,
     })
+}
+
+/// The two-sided net verdict of `bs` against the paired baselines `a` (same length, pair by
+/// pair): goodput and p99 as paired log ratios, throttling and errors as differences of pooled
+/// ratios (Newcombe intervals).
+pub fn net_assessment(
+    a: &[Run],
+    b: &[Run],
+    noise: Option<&crate::store::baselines::NoiseEntry>,
+) -> NetAssessment {
+    use crate::analysis::verdict::{MetricChange, log_ratio, ratio_difference};
+    let vals = |rs: &[Run], f: &dyn Fn(&Report) -> f64| {
+        rs.iter().map(|r| f(&r.report)).collect::<Vec<f64>>()
+    };
+    let paired = a.len() == b.len();
+    let mut changes = vec![
+        MetricChange {
+            metric: "ops_per_s".into(),
+            change: log_ratio(&vals(a, &good_ops_per_s), &vals(b, &good_ops_per_s), paired),
+            lower_is_better: false,
+            floor: noise_ratio(noise, "ops_per_s").max(0.02),
+        },
+        MetricChange {
+            metric: "p99_ms".into(),
+            change: log_ratio(
+                &vals(a, &|r| r.summary.latency.p99),
+                &vals(b, &|r| r.summary.latency.p99),
+                paired,
+            ),
+            lower_is_better: true,
+            floor: noise_ratio(noise, "p99_ms").max(0.05),
+        },
+    ];
+    let pooled = |rs: &[Run], k: &dyn Fn(&Report) -> (u64, u64)| {
+        rs.iter().fold((0.0, 0.0), |(x, y), r| {
+            let (a, b) = k(&r.report);
+            (x + a as f64, y + b as f64)
+        })
+    };
+    let thr = |r: &Report| (r.resilience.throttled_responses, r.connections.requests);
+    let err = |r: &Report| (r.summary.failed_ops, r.summary.ops);
+    for (metric, f) in [
+        (
+            "throttled_request_ratio",
+            &thr as &dyn Fn(&Report) -> (u64, u64),
+        ),
+        ("error_ratio", &err),
+    ] {
+        let ((ka, na), (kb, nb)) = (pooled(a, f), pooled(b, f));
+        if na > 0.0 && nb > 0.0 && (ka > 0.0 || kb > 0.0) {
+            changes.push(MetricChange {
+                metric: metric.into(),
+                change: ratio_difference(ka, na, kb, nb),
+                lower_is_better: true,
+                // 0.1 percentage points.
+                floor: 0.001,
+            });
+        }
+    }
+    crate::analysis::verdict::assess(&changes)
 }
 
 /// What [`verify`] produced.

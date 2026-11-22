@@ -61,6 +61,14 @@
     "Hypothesis": {
       "description": "One fitted limit model.",
       "properties": {
+        "bic": {
+          "description": "Bayesian information criterion `−2·LL + k·ln n` (lower is better; selection score).",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
         "confidence": {
           "$ref": "#/$defs/Confidence"
         },
@@ -177,10 +185,26 @@
             "null"
           ]
         },
+        "change_points_s": {
+          "description": "Seconds into the window where a [`HypothesisKind::TimeVarying`] limit changed.",
+          "items": {
+            "format": "double",
+            "type": "number"
+          },
+          "type": "array"
+        },
         "key": {
-          "description": "The key or prefix of a [`HypothesisKind::KeyLimit`].",
+          "description": "The key or prefix of a [`HypothesisKind::KeyLimit`] (the hottest one).",
           "type": [
             "string",
+            "null"
+          ]
+        },
+        "key_share_ratio": {
+          "description": "Share of the requests that went to `key`.",
+          "format": "double",
+          "type": [
+            "number",
             "null"
           ]
         },
@@ -190,6 +214,14 @@
             "number",
             "null"
           ]
+        },
+        "segment_requests_per_s": {
+          "description": "The rate of each segment between change points (requests per second).",
+          "items": {
+            "format": "double",
+            "type": "number"
+          },
+          "type": "array"
         },
         "servers_count": {
           "format": "uint64",
@@ -279,6 +311,12 @@
           "format": "double",
           "type": "number"
         },
+        "ops_service_inflight_mean": {
+          "default": 0.0,
+          "description": "Operations in flight on average, retry backoff left out: the time operations were\nserved, which throughput scales with (backoff is waiting, not work; A3).",
+          "format": "double",
+          "type": "number"
+        },
         "peak_inflight_count": {
           "format": "uint64",
           "minimum": 0,
@@ -307,6 +345,7 @@
         "peak_inflight_count",
         "inflight_mean",
         "ops_inflight_mean",
+        "ops_service_inflight_mean",
         "ops_per_s"
       ],
       "type": "object"
@@ -314,6 +353,12 @@
     "OpShape": {
       "description": "Request concurrency of one operation.",
       "properties": {
+        "bytes_per_op_mean": {
+          "default": 0.0,
+          "description": "Logical bytes per operation (mean).",
+          "format": "double",
+          "type": "number"
+        },
         "inflight_per_op_mean": {
           "description": "Requests one operation keeps in flight on average over its lifetime.",
           "format": "double",
@@ -347,7 +392,8 @@
         "peak_inflight_per_op_count",
         "inflight_per_op_mean",
         "sequential_ratio",
-        "ops_count"
+        "ops_count",
+        "bytes_per_op_mean"
       ],
       "type": "object"
     }
@@ -373,7 +419,7 @@
     },
     "hypotheses": {
       "default": [],
-      "description": "Competing limit models, the selected one first (design v5 §4; filled from the\nin-flight ceiling until stream ANA fits them).",
+      "description": "Competing limit models, the selected one first (design v5 §4).",
       "items": {
         "$ref": "#/$defs/Hypothesis"
       },
@@ -397,7 +443,7 @@
       "$ref": "#/$defs/OpShape"
     },
     "rate_ceiling_requests_per_s": {
-      "description": "Requests per second the service accepted while it throttled.",
+      "description": "The fitted rate limit (requests per second) when the selected hypothesis is a rate\nlimit (the lowest rate of a time-varying one); never the observed throughput.",
       "format": "double",
       "type": [
         "number",

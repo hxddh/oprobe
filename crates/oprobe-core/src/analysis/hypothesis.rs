@@ -1,9 +1,9 @@
 //! Competing limit models (design v5 §4): `capacity.hypotheses`.
 //!
-//! Stream ANA fits five limit models side by side (`capacity::fit`) and selects one by
-//! penalised likelihood. Until then the foundation maps the 4.x estimate onto this shape: the
-//! single in-flight ceiling becomes one [`HypothesisKind::InflightLimit`] hypothesis (selected),
-//! and a run without a ceiling has [`HypothesisKind::None`]. Advice is unchanged.
+//! [`super::limits::fit`] fits the limit models side by side and selects one by penalised
+//! likelihood; this module holds their shape and the helpers advice reads them with
+//! ([`selected`], [`asserted`]). A remembered in-flight ceiling (`source: history`) becomes an
+//! [`HypothesisKind::InflightLimit`] hypothesis ([`from_capacity`]).
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -57,15 +57,24 @@ pub struct HypothesisParams {
     pub requests_per_s: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub burst_count: Option<u64>,
-    /// The key or prefix of a [`HypothesisKind::KeyLimit`].
+    /// The key or prefix of a [`HypothesisKind::KeyLimit`] (the hottest one).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
+    /// Share of the requests that went to `key`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_share_ratio: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service_ms: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub servers_count: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bytes_per_s: Option<f64>,
+    /// Seconds into the window where a [`HypothesisKind::TimeVarying`] limit changed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub change_points_s: Vec<f64>,
+    /// The rate of each segment between change points (requests per second).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub segment_requests_per_s: Vec<f64>,
 }
 
 /// One fitted limit model.
@@ -76,6 +85,9 @@ pub struct Hypothesis {
     /// Log-likelihood of the data under the model (absent until fitted).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_likelihood: Option<f64>,
+    /// Bayesian information criterion `−2·LL + k·ln n` (lower is better; selection score).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bic: Option<f64>,
     /// Why the model fits, in words.
     #[serde(default)]
     pub evidence: Vec<String>,
@@ -105,6 +117,7 @@ pub fn from_capacity(c: &Capacity) -> Vec<Hypothesis> {
                     ..Default::default()
                 },
                 log_likelihood: None,
+                bic: None,
                 evidence,
                 confidence: c.confidence,
                 explains_ratio: if c.observed.throttled_requests_count > 0 {
@@ -128,6 +141,62 @@ pub fn from_capacity(c: &Capacity) -> Vec<Hypothesis> {
 /// The selected hypothesis, if any.
 pub fn selected(hs: &[Hypothesis]) -> Option<&Hypothesis> {
     hs.iter().find(|h| h.selected)
+}
+
+/// The selected hypothesis when it is confident enough to act on (medium or high): no limit
+/// is asserted below medium confidence (design v5 §4).
+pub fn asserted(hs: &[Hypothesis]) -> Option<&Hypothesis> {
+    selected(hs).filter(|h| h.confidence >= Confidence::Medium)
+}
+
+impl Hypothesis {
+    /// One line: "rate limit ≈300 requests/s (high confidence)".
+    pub fn summary(&self) -> String {
+        let p = &self.params;
+        let what = match self.kind {
+            HypothesisKind::InflightLimit => format!(
+                "in-flight limit ≈{} requests",
+                p.ceiling_inflight_count.unwrap_or(0)
+            ),
+            HypothesisKind::RateLimit => format!(
+                "rate limit ≈{:.0} requests/s",
+                p.requests_per_s.unwrap_or(0.0)
+            ),
+            HypothesisKind::KeyLimit => format!(
+                "per-key limit ≈{:.0} requests/s{}",
+                p.requests_per_s.unwrap_or(0.0),
+                p.key
+                    .as_deref()
+                    .map(|k| format!(" (hottest `{k}`)"))
+                    .unwrap_or_default()
+            ),
+            HypothesisKind::Queueing => format!(
+                "queueing: {} served at once, ≈{:.1} ms each",
+                p.servers_count.unwrap_or(0),
+                p.service_ms.unwrap_or(0.0)
+            ),
+            HypothesisKind::BandwidthCap => format!(
+                "bandwidth cap ≈{:.1} MiB/s across all streams",
+                p.bytes_per_s.unwrap_or(0.0) / (1024.0 * 1024.0)
+            ),
+            HypothesisKind::TimeVarying => format!(
+                "time-varying limit: {} requests/s",
+                p.segment_requests_per_s
+                    .iter()
+                    .map(|r| format!("{r:.0}"))
+                    .collect::<Vec<_>>()
+                    .join(" → ")
+            ),
+            HypothesisKind::ClientBound => "client-bound".into(),
+            HypothesisKind::None => "no limit".into(),
+        };
+        let conf = match self.confidence {
+            Confidence::Low => "low",
+            Confidence::Medium => "medium",
+            Confidence::High => "high",
+        };
+        format!("{what} ({conf} confidence)")
+    }
 }
 
 #[cfg(test)]

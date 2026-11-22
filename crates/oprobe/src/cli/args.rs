@@ -916,6 +916,11 @@ pub struct TuneSearchArgs {
     /// In-flight headroom kept below the throttling ceiling (default 0.15)
     #[arg(long, value_name = "RATIO", value_parser = parse::fraction)]
     pub headroom_ratio: Option<f64>,
+    /// Posterior chance of exceeding the throttle budget the recommendation may carry
+    /// (default 0.05): measured-clean configurations beyond the fixed headroom are accepted
+    /// when the surrogate is this sure
+    #[arg(long, value_name = "RATIO", value_parser = parse::fraction)]
+    pub risk: Option<f64>,
 }
 
 #[derive(Args, Debug)]
@@ -1036,6 +1041,9 @@ pub struct CompareArgs {
     /// Runs of different targets or workloads are an error (exit 2) instead of a warning
     #[arg(long)]
     pub strict: bool,
+    /// A significant regression within the limits (`warn`) fails the gate too (exit 3)
+    #[arg(long)]
+    pub fail_on_warn: bool,
     /// Write a Markdown summary (PR comment / job summary)
     #[arg(long, value_name = "FILE")]
     pub markdown: Option<PathBuf>,
@@ -1140,8 +1148,8 @@ pub struct ProbeArgs {
 pub struct LabArgs {
     #[arg(long, default_value = "127.0.0.1:9000")]
     pub bind: String,
-    /// Start from a fault preset: clean, demo, throttle, stragglers, lossy, flaky, parquet (the
-    /// flags below override it)
+    /// Start from a fault preset: clean, demo, throttle, stragglers, lossy, flaky, parquet,
+    /// ratelimit, hotkey, bandwidth, queueing, timevarying, noisy (the flags below override it)
     #[arg(long, value_parser = parse::lab_scenario)]
     pub scenario: Option<String>,
     /// Answer every Nth request with 500 InternalError

@@ -20,6 +20,8 @@ impl DiffReport {
         let badge_txt = match self.verdict {
             GateVerdict::Passed => badge("PASS", "42;30"),
             GateVerdict::Regression => badge("REGRESSION", "41"),
+            GateVerdict::Warned => badge("WARN", "43;30"),
+            GateVerdict::Inconclusive => badge("INCONCLUSIVE", "43;30"),
             GateVerdict::NotComparable => badge("NOT COMPARABLE", "43;30"),
         };
         let _ = writeln!(
@@ -69,6 +71,8 @@ impl DiffReport {
                     Status::Fail if self.comparable => red("FAIL"),
                     Status::Fail => yellow("fail (n/a)"),
                     Status::Skipped => dim("skipped"),
+                    Status::Warn => yellow("warn"),
+                    Status::Inconclusive => yellow("inconclusive"),
                 };
                 vec![
                     c.label(),
@@ -104,6 +108,7 @@ impl DiffReport {
             match self.verdict {
                 GateVerdict::Passed => "✅",
                 GateVerdict::Regression => "❌",
+                GateVerdict::Warned | GateVerdict::Inconclusive => "🟡",
                 GateVerdict::NotComparable => "⚠️",
             },
             self.verdict.label(),
@@ -140,6 +145,8 @@ impl DiffReport {
                 Status::Improved => "🚀 improved",
                 Status::Fail => "❌ **FAIL**",
                 Status::Skipped => "⏭ skipped",
+                Status::Warn => "🟡 warn",
+                Status::Inconclusive => "❔ inconclusive",
             };
             let _ = writeln!(
                 md,

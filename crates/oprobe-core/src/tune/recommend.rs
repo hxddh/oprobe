@@ -205,10 +205,17 @@ impl Recommendation {
             summary.objective, summary.headline
         );
         let tp = portable_profile(spec);
+        let mut overrides = knob_overrides(&spec.profile.knobs, winner);
+        // A paced winner (rate limits): the pace is part of the change.
+        if let Some(r) = win.and_then(|w| w.rate_per_s)
+            && Some(r) != spec.profile.workload.rate
+        {
+            let _ = overrides.set("rate", &format!("{r:.0}"));
+        }
         Ok(Self {
             objective: summary.objective.clone(),
             knobs: winner.into(),
-            overrides: knob_overrides(&spec.profile.knobs, winner),
+            overrides,
             profile_toml: super::codegen::profile_toml(&tp, winner, &header)?,
             rust_snippet: super::codegen::rust_snippet(&session.target, winner, capability),
             vs_baseline,

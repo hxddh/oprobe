@@ -323,10 +323,14 @@ fn runs_confidence(na: usize, nb: usize) -> Confidence {
     }
 }
 
-/// Change of a latency quantile `q` of `verb` (all operations when `None`).
+/// Change of a latency quantile `q` of `verb` (all operations when `None`). With three or
+/// more runs on a side, a Welch interval on the log ratio of the per-run values (never below
+/// −100 %; a side with one run borrows the other's variance); with fewer, a block bootstrap
+/// over the time windows of every run of a side pooled (a t-interval on two runs per side is
+/// meaningless: A12).
 fn latency_change(base: &[Run], cand: &[Run], verb: Option<&str>, q: f64) -> Option<Change> {
     let seed = (q * 1000.0) as u64 ^ verb.map_or(0, |v| crate::model::ids::fnv1a(v.as_bytes()));
-    if base.len() > 1 || cand.len() > 1 {
+    if base.len().max(cand.len()) >= 3 {
         let get = |r: &Run| match verb {
             Some(v) => verb_q(&r.report, v, q > 0.9),
             None => Some(if q > 0.9 {
@@ -338,13 +342,14 @@ fn latency_change(base: &[Run], cand: &[Run], verb: Option<&str>, q: f64) -> Opt
         let a: Option<Vec<f64>> = base.iter().map(get).collect();
         let b: Option<Vec<f64>> = cand.iter().map(get).collect();
         let (a, b) = (a?, b?);
-        let (x, y, c) = runs_t(&a, &b);
+        let (x, y, _) = runs_t(&a, &b);
+        let c = super::verdict::log_ratio(&a, &b, false);
         return Some((x, y, c, Method::RunsT, runs_confidence(a.len(), b.len())));
     }
-    let (a, b) = (
-        latency_seconds(&base[0], verb),
-        latency_seconds(&cand[0], verb),
-    );
+    let blocks = |runs: &[Run]| -> Vec<Vec<f64>> {
+        runs.iter().flat_map(|r| latency_seconds(r, verb)).collect()
+    };
+    let (a, b) = (blocks(base), blocks(cand));
     let count = |x: &[Vec<f64>]| x.iter().map(Vec::len).sum::<usize>();
     if a.len() < 3 || b.len() < 3 || count(&a) < 10 || count(&b) < 10 {
         return None;
@@ -353,15 +358,17 @@ fn latency_change(base: &[Run], cand: &[Run], verb: Option<&str>, q: f64) -> Opt
     Some((x, y, c, Method::BlockBootstrap, Confidence::Low))
 }
 
-/// Change of the good-op rate.
+/// Change of the good-op rate (as [`latency_change`]).
 fn throughput_change(base: &[Run], cand: &[Run]) -> Option<Change> {
-    if base.len() > 1 || cand.len() > 1 {
+    if base.len().max(cand.len()) >= 3 {
         let a: Vec<f64> = base.iter().map(|r| good_ops_per_s(&r.report)).collect();
         let b: Vec<f64> = cand.iter().map(|r| good_ops_per_s(&r.report)).collect();
-        let (x, y, c) = runs_t(&a, &b);
+        let (x, y, _) = runs_t(&a, &b);
+        let c = super::verdict::log_ratio(&a, &b, false);
         return Some((x, y, c, Method::RunsT, runs_confidence(a.len(), b.len())));
     }
-    let (a, b) = (ops_seconds(&base[0]), ops_seconds(&cand[0]));
+    let secs = |runs: &[Run]| -> Vec<f64> { runs.iter().flat_map(ops_seconds).collect() };
+    let (a, b) = (secs(base), secs(cand));
     if a.len() < 3 || b.len() < 3 {
         return None;
     }
@@ -516,15 +523,51 @@ pub fn compare_with_noise(
         let ci = fmt_ci(&change);
         let sig = significant(&change, floor);
         let how = method_label(method, conf);
-        if (chk.verdict == Status::Fail || chk.verdict == Status::Improved) && !sig {
-            chk.verdict = Status::Pass;
-            chk.note = format!(
+        // Three tiers (design v5 §4, A13): worse and significant fails over the limit and
+        // warns under it; not significant passes only when the interval rules out a change
+        // past the limit, else it is inconclusive (never "same").
+        let higher_worse = metric != "ops_per_s";
+        let worse_end = if higher_worse {
+            change.high
+        } else {
+            -change.low
+        };
+        let worse = if higher_worse {
+            change.estimate > 0.0
+        } else {
+            change.estimate < 0.0
+        };
+        let limit = chk.limit_ratio.unwrap_or(f64::INFINITY);
+        // Latency changes below the absolute floor are never regressions.
+        let abs_ok =
+            metric == "ops_per_s" || (chk.candidate - chk.baseline).abs() > t.min_latency_delta_ms;
+        chk.verdict = if sig && worse && abs_ok && chk.verdict == Status::Fail {
+            Status::Fail
+        } else if sig && worse && abs_ok {
+            Status::Warn
+        } else if sig && !worse {
+            Status::Improved
+        } else if worse_end > limit && abs_ok {
+            Status::Inconclusive
+        } else {
+            Status::Pass
+        };
+        chk.note = match chk.verdict {
+            Status::Fail => format!("95% CI {ci} ({how})"),
+            Status::Warn => format!(
+                "significantly worse but within the limit: 95% CI {ci}, noise floor ±{:.1}% ({how})",
+                floor * 100.0
+            ),
+            Status::Improved => format!("95% CI {ci} ({how})"),
+            Status::Inconclusive => format!(
+                "not significant, but a change past the limit is not ruled out: 95% CI {ci}, noise floor ±{:.1}% ({how}); repeat the runs",
+                floor * 100.0
+            ),
+            _ => format!(
                 "not significant: 95% CI of the change {ci}, noise floor ±{:.1}% ({how})",
                 floor * 100.0
-            );
-        } else if chk.verdict == Status::Fail || chk.verdict == Status::Improved {
-            chk.note = format!("95% CI {ci} ({how})");
-        }
+            ),
+        };
     }
     gate.settle();
     let mut stats_out = Vec::new();
@@ -586,6 +629,7 @@ pub fn compare_with_noise(
         run_ids: runs.iter().map(|r| r.id().to_owned()).collect(),
         representative: rep.id().to_owned(),
     };
+    let net = net_of(&stats_out, base, cand);
     Comparison {
         verdict: gate.verdict,
         passed: gate.passed,
@@ -595,9 +639,51 @@ pub fn compare_with_noise(
         stats: stats_out,
         findings: findings_diff(base, cand),
         p99_trend_ms: trend.into_iter().map(|x| x.1).collect(),
-        net: None,
+        net: Some(net),
         gate,
     }
+}
+
+/// The net verdict of a comparison: its headline statistics plus throttling and errors over
+/// pooled counts (the same rule as verify, [`super::verdict::assess`]).
+fn net_of(stats_out: &[MetricStat], base: &[Run], cand: &[Run]) -> super::verdict::NetAssessment {
+    use super::verdict::{MetricChange, ratio_difference};
+    let mut changes: Vec<MetricChange> = stats_out
+        .iter()
+        .filter(|s| s.method != Method::Unavailable)
+        .map(|s| MetricChange {
+            metric: s.metric.clone(),
+            change: s.change,
+            lower_is_better: s.unit == "ms",
+            floor: s.noise_floor_ratio,
+        })
+        .collect();
+    let pooled = |rs: &[Run], f: &dyn Fn(&Report) -> (u64, u64)| {
+        rs.iter().fold((0.0, 0.0), |(x, y), r| {
+            let (a, b) = f(&r.report);
+            (x + a as f64, y + b as f64)
+        })
+    };
+    let thr = |r: &Report| (r.resilience.throttled_responses, r.connections.requests);
+    let err = |r: &Report| (r.summary.failed_ops, r.summary.ops);
+    for (metric, f) in [
+        (
+            "throttled_request_ratio",
+            &thr as &dyn Fn(&Report) -> (u64, u64),
+        ),
+        ("error_ratio", &err),
+    ] {
+        let ((ka, na), (kb, nb)) = (pooled(base, f), pooled(cand, f));
+        if na > 0.0 && nb > 0.0 && (ka > 0.0 || kb > 0.0) {
+            changes.push(MetricChange {
+                metric: metric.into(),
+                change: ratio_difference(ka, na, kb, nb),
+                lower_is_better: true,
+                floor: 0.001,
+            });
+        }
+    }
+    super::verdict::assess(&changes)
 }
 
 impl Comparison {

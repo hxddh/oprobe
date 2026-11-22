@@ -302,6 +302,10 @@ pub struct TuneSearch {
     pub boundary_repeats: usize,
     /// In-flight headroom kept below the throttling ceiling (default 0.15)
     pub headroom_ratio: Option<f64>,
+    /// Posterior chance of exceeding the throttle budget the recommendation may carry
+    /// (default 0.05)
+    #[serde(default)]
+    pub risk_ratio: Option<f64>,
 }
 
 impl Default for TuneSearch {
@@ -316,6 +320,7 @@ impl Default for TuneSearch {
             max_throttle_ratio: Default::default(),
             boundary_repeats: tune_defaults::BOUNDARY_REPEATS,
             headroom_ratio: Default::default(),
+            risk_ratio: Default::default(),
         }
     }
 }
@@ -485,6 +490,9 @@ pub struct CompareRequest {
     pub allow_target_change: bool,
     /// Runs of different targets or workloads are an error (exit 2) instead of a warning
     pub strict: bool,
+    /// A significant regression within the limits (`warn`) fails the gate too (exit 3)
+    #[serde(default)]
+    pub fail_on_warn: bool,
     /// Write a Markdown summary (PR comment / job summary)
     pub markdown: Option<PathBuf>,
     /// Write JUnit XML
@@ -512,6 +520,7 @@ impl Default for CompareRequest {
             allow_workload_change: Default::default(),
             allow_target_change: Default::default(),
             strict: Default::default(),
+            fail_on_warn: Default::default(),
             markdown: Default::default(),
             junit: Default::default(),
             json: Default::default(),

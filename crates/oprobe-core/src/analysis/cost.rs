@@ -19,10 +19,64 @@ pub struct Pricing {
     pub read_per_million: f64,
     #[serde(default)]
     pub delete_per_million: f64,
-    /// Internet egress per GB.
+    /// Internet egress per GB (the first paid tier when `egress_tiers` is given).
     pub egress_per_gb: f64,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub note: String,
+    /// Internet egress price tiers by monthly volume (absolute bounds, the free allowance
+    /// included in the first); empty: the flat `egress_per_gb`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub egress_tiers: Vec<EgressTier>,
+    /// Internet egress free per month (GB).
+    #[serde(default)]
+    pub egress_free_gb: f64,
+    /// Free egress as a multiple of the stored data (Backblaze B2: 3×).
+    #[serde(default)]
+    pub egress_free_stored_multiple: f64,
+    /// Inter-region transfer per GB.
+    #[serde(default)]
+    pub inter_region_per_gb: f64,
+    /// Storage classes besides standard (`infrequent`, `archive`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub storage_classes: Vec<StorageClassPrice>,
+    /// Requests answered 4xx are billed (most providers).
+    #[serde(default = "yes")]
+    pub bills_client_errors: bool,
+    /// Requests answered 5xx (incl. 503 SlowDown) are billed (the presets assume so; check
+    /// your provider's terms and set `false` in `[cost.pricing]` where they are free).
+    #[serde(default = "yes")]
+    pub bills_server_errors: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+/// One egress price tier: the monthly GB up to `up_to_gb` (counted from 0, the free allowance
+/// included) cost `per_gb` (the last tier may use a huge bound).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct EgressTier {
+    pub up_to_gb: f64,
+    pub per_gb: f64,
+}
+
+/// A storage class: its storage, request and retrieval prices, minimum billable object size
+/// and minimum storage duration.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct StorageClassPrice {
+    /// `infrequent` or `archive`.
+    pub class: String,
+    /// The provider's name for it.
+    pub name: String,
+    pub storage_gb_month: f64,
+    pub write_per_million: f64,
+    pub read_per_million: f64,
+    /// Data retrieval per GB read.
+    pub retrieval_per_gb: f64,
+    /// Smaller objects are billed as this size (bytes).
+    pub min_billable_bytes: u64,
+    /// Objects deleted earlier are billed for the rest of this duration (days).
+    pub min_duration_days: f64,
 }
 
 /// Public list prices (standard/hot tier, cheapest common region). Verify against your
@@ -41,8 +95,40 @@ pub fn presets() -> Vec<(&'static str, Pricing)> {
         delete_per_million: 0.0,
         egress_per_gb: egress,
         note: note.to_owned(),
+        egress_tiers: Vec::new(),
+        egress_free_gb: 0.0,
+        egress_free_stored_multiple: 0.0,
+        inter_region_per_gb: 0.0,
+        storage_classes: Vec::new(),
+        bills_client_errors: true,
+        bills_server_errors: true,
     };
-    vec![
+    let tiers = |t: &[(f64, f64)]| {
+        t.iter()
+            .map(|(up_to_gb, per_gb)| EgressTier {
+                up_to_gb: *up_to_gb,
+                per_gb: *per_gb,
+            })
+            .collect::<Vec<_>>()
+    };
+    let class = |class: &str, name: &str, storage, write, read, retrieval, min_kib: u64, days| {
+        StorageClassPrice {
+            class: class.into(),
+            name: name.into(),
+            storage_gb_month: storage,
+            write_per_million: write,
+            read_per_million: read,
+            retrieval_per_gb: retrieval,
+            min_billable_bytes: min_kib * 1024,
+            min_duration_days: days,
+        }
+    };
+    const TB: f64 = 1024.0;
+    let with = |mut base: Pricing, f: &dyn Fn(&mut Pricing)| {
+        f(&mut base);
+        base
+    };
+    let raw = vec![
         (
             "aws-s3",
             p(
@@ -52,7 +138,7 @@ pub fn presets() -> Vec<(&'static str, Pricing)> {
                 5.00,
                 0.40,
                 0.09,
-                "us-east-1, first 50 TB tier",
+                "us-east-1; egress: first 100 GB/month free, $0.09/GB to 10 TB, then $0.085, $0.07, $0.05",
             ),
         ),
         (
@@ -115,7 +201,109 @@ pub fn presets() -> Vec<(&'static str, Pricing)> {
                 "international pricing, approx.",
             ),
         ),
-    ]
+    ];
+    raw.into_iter()
+        .map(|(k, base)| {
+            let full = match k {
+                "aws-s3" => with(base, &|p| {
+                    p.egress_free_gb = 100.0;
+                    p.egress_tiers = tiers(&[
+                        (10.0 * TB, 0.09),
+                        (50.0 * TB, 0.085),
+                        (150.0 * TB, 0.07),
+                        (f64::MAX, 0.05),
+                    ]);
+                    p.inter_region_per_gb = 0.02;
+                    p.storage_classes = vec![
+                        class(
+                            "infrequent",
+                            "S3 Standard-IA",
+                            0.0125,
+                            10.0,
+                            1.0,
+                            0.01,
+                            128,
+                            30.0,
+                        ),
+                        class(
+                            "archive",
+                            "S3 Glacier Instant Retrieval",
+                            0.004,
+                            20.0,
+                            10.0,
+                            0.03,
+                            128,
+                            90.0,
+                        ),
+                    ];
+                }),
+                "gcs" => with(base, &|p| {
+                    p.egress_tiers = tiers(&[(TB, 0.12), (10.0 * TB, 0.11), (f64::MAX, 0.08)]);
+                    p.inter_region_per_gb = 0.02;
+                    p.storage_classes = vec![
+                        class(
+                            "infrequent",
+                            "GCS Nearline",
+                            0.010,
+                            10.0,
+                            1.0,
+                            0.01,
+                            0,
+                            30.0,
+                        ),
+                        class("archive", "GCS Archive", 0.0012, 50.0, 50.0, 0.05, 0, 365.0),
+                    ];
+                }),
+                "azure-blob" => with(base, &|p| {
+                    p.egress_free_gb = 100.0;
+                    p.egress_tiers = tiers(&[
+                        (10.0 * TB, 0.087),
+                        (50.0 * TB, 0.083),
+                        (150.0 * TB, 0.07),
+                        (f64::MAX, 0.05),
+                    ]);
+                    p.inter_region_per_gb = 0.02;
+                    p.storage_classes = vec![
+                        class(
+                            "infrequent",
+                            "Azure Blob Cool",
+                            0.010,
+                            10.0,
+                            1.0,
+                            0.01,
+                            0,
+                            30.0,
+                        ),
+                        class(
+                            "archive",
+                            "Azure Blob Cold",
+                            0.0036,
+                            18.0,
+                            10.0,
+                            0.03,
+                            0,
+                            90.0,
+                        ),
+                    ];
+                }),
+                "cloudflare-r2" => with(base, &|p| {
+                    p.storage_classes = vec![class(
+                        "infrequent",
+                        "R2 Infrequent Access",
+                        0.010,
+                        9.0,
+                        0.9,
+                        0.01,
+                        0,
+                        30.0,
+                    )];
+                }),
+                "backblaze-b2" => with(base, &|p| p.egress_free_stored_multiple = 3.0),
+                _ => base,
+            };
+            (k, full)
+        })
+        .collect()
 }
 
 pub fn preset(name: &str) -> Option<Pricing> {
@@ -208,6 +396,10 @@ pub struct PerOpUsage {
     /// Requests that failed or were throttled (billed on most providers, add no value).
     #[serde(rename = "failed_requests_mean")]
     pub failed_requests: f64,
+    /// Of `failed_requests`, those answered 5xx (incl. 503 SlowDown): not billed by most
+    /// providers.
+    #[serde(default, rename = "server_error_requests_mean")]
+    pub server_error_requests: f64,
     pub download_bytes: f64,
     pub upload_bytes: f64,
     /// Downloaded bytes the application never asked for (range coalescing / chunk over-fetch).
@@ -234,6 +426,18 @@ pub struct ProviderCost {
     pub overread_usd: f64,
     /// Monthly spend avoided by the local cache.
     pub cache_savings_usd: f64,
+    /// The storage class priced (`standard`, or the provider's name of the class).
+    #[serde(default)]
+    pub storage_class: String,
+    /// Monthly data-retrieval fees of the storage class.
+    #[serde(default)]
+    pub retrieval_usd: f64,
+    /// Monthly inter-region transfer.
+    #[serde(default)]
+    pub inter_region_usd: f64,
+    /// Monthly charges for objects deleted before the class's minimum duration.
+    #[serde(default)]
+    pub early_delete_usd: f64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -377,8 +581,15 @@ pub fn per_op_usage(s: &Snapshot) -> PerOpUsage {
             .filter(|(code, _)| **code >= 400 && **code != 404)
             .map(|(_, c)| *c)
             .sum();
+        let server: u64 = a
+            .status
+            .iter()
+            .filter(|(code, _)| **code >= 500)
+            .map(|(_, c)| *c)
+            .sum();
         if a.api.billing_class() != BillingClass::Free {
             u.failed_requests += failed as f64 / ops;
+            u.server_error_requests += server as f64 / ops;
         }
     }
     let b = &s.bytes;
@@ -394,34 +605,134 @@ pub fn per_op_usage(s: &Snapshot) -> PerOpUsage {
 /// Providers' "GB" for egress and storage is a binary gigabyte (2^30 bytes).
 const BILLING_GB: f64 = 1024.0 * 1024.0 * 1024.0;
 
+/// The monthly bill of `gb` internet egress under `p`: the free allowance first (fixed, or a
+/// multiple of the stored data), then the price tiers.
+pub fn egress_usd(p: &Pricing, gb: f64, stored_gb: f64) -> f64 {
+    let free = (p.egress_free_gb + p.egress_free_stored_multiple * stored_gb).max(0.0);
+    if p.egress_tiers.is_empty() {
+        return (gb - free).max(0.0) * p.egress_per_gb;
+    }
+    // Paid GB lie in [free, gb]; each tier covers [floor, up_to).
+    let (mut usd, mut floor) = (0.0, 0.0f64);
+    for t in &p.egress_tiers {
+        let lo = floor.max(free);
+        let hi = t.up_to_gb.min(gb);
+        if hi > lo {
+            usd += (hi - lo) * t.per_gb;
+        }
+        floor = t.up_to_gb;
+        if floor >= gb {
+            break;
+        }
+    }
+    usd
+}
+
+/// The class of `spec.storage_class` in `p` (`None`: standard).
+fn class_of<'a>(p: &'a Pricing, spec: &CostSpec) -> Option<&'a StorageClassPrice> {
+    let want = spec.storage_class.as_deref()?.to_ascii_lowercase();
+    if want == "standard" {
+        return None;
+    }
+    p.storage_classes
+        .iter()
+        .find(|c| c.class == want || c.name.to_ascii_lowercase() == want)
+}
+
 fn price(key: &str, p: &Pricing, u: &PerOpUsage, spec: &CostSpec) -> ProviderCost {
     let m = spec.monthly_ops.max(0.0) / 1e6; // millions of ops
-    let req_per_m = u.write_requests * p.write_per_million
-        + u.list_requests * p.list_per_million
-        + u.read_requests * p.read_per_million
-        + u.delete_requests * p.delete_per_million;
-    let egress_per_m = u.download_bytes * 1e6 / BILLING_GB * spec.egress_fraction * p.egress_per_gb;
-    let avg_req_price = {
-        let n = u.write_requests + u.list_requests + u.read_requests + u.delete_requests;
-        if n > 0.0 { req_per_m / n } else { 0.0 }
+    let class = class_of(p, spec);
+    let (write_pm, read_pm, storage_pg) = match class {
+        Some(c) => (c.write_per_million, c.read_per_million, c.storage_gb_month),
+        None => (p.write_per_million, p.read_per_million, p.storage_gb_month),
     };
+    // Error responses the provider does not bill come off the request count.
+    let unbilled = |n: f64, total: f64| {
+        if total <= 0.0 {
+            return 0.0;
+        }
+        let server = u.server_error_requests.min(u.failed_requests);
+        let client = u.failed_requests - server;
+        let mut skip = 0.0;
+        if !p.bills_server_errors {
+            skip += server;
+        }
+        if !p.bills_client_errors {
+            skip += client;
+        }
+        n * (skip / total).clamp(0.0, 1.0)
+    };
+    let total_req = u.write_requests + u.list_requests + u.read_requests + u.delete_requests;
+    let billed = |n: f64| n - unbilled(n, total_req);
+    let req_per_m = billed(u.write_requests) * write_pm
+        + billed(u.list_requests) * p.list_per_million
+        + billed(u.read_requests) * read_pm
+        + billed(u.delete_requests) * p.delete_per_million;
     let stored_gb = spec.stored_gib;
+    let monthly_egress_gb =
+        u.download_bytes * spec.monthly_ops.max(0.0) / BILLING_GB * spec.egress_fraction;
+    let egress = egress_usd(p, monthly_egress_gb, stored_gb);
+    let egress_per_m = if m > 0.0 { egress / m } else { 0.0 };
+    let avg_req_price = if total_req > 0.0 {
+        req_per_m / total_req
+    } else {
+        0.0
+    };
+    // Minimum billable size: small objects are billed as the minimum.
+    let object_bytes = if u.read_requests > 0.0 && u.download_bytes > 0.0 {
+        u.download_bytes / u.read_requests
+    } else if u.write_requests > 0.0 && u.upload_bytes > 0.0 {
+        u.upload_bytes / u.write_requests
+    } else {
+        0.0
+    };
+    let size_factor = match class {
+        Some(c) if c.min_billable_bytes > 0 && object_bytes > 0.0 => {
+            (c.min_billable_bytes as f64 / object_bytes).max(1.0)
+        }
+        _ => 1.0,
+    };
+    let storage_usd = stored_gb * storage_pg * size_factor;
+    let retrieval_usd = class.map_or(0.0, |c| {
+        u.download_bytes * spec.monthly_ops.max(0.0) / BILLING_GB * c.retrieval_per_gb
+    });
+    // Deletes before the minimum duration: on average half of it is still billed.
+    let early_delete_usd = class.map_or(0.0, |c| {
+        let deleted_gb =
+            u.delete_requests * spec.monthly_ops.max(0.0) * object_bytes.max(1.0) / BILLING_GB;
+        deleted_gb * c.storage_gb_month * size_factor * (c.min_duration_days / 30.0) * 0.5
+    });
+    let inter_region_usd = u.download_bytes * spec.monthly_ops.max(0.0) / BILLING_GB
+        * spec.inter_region_fraction
+        * p.inter_region_per_gb;
+    let extra = retrieval_usd + early_delete_usd + inter_region_usd;
     ProviderCost {
         key: key.to_owned(),
         provider: p.provider.clone(),
         requests_usd: req_per_m * m,
-        egress_usd: egress_per_m * m,
-        storage_usd: stored_gb * p.storage_gb_month,
-        total_usd: (req_per_m + egress_per_m) * m + stored_gb * p.storage_gb_month,
-        per_million_ops_usd: req_per_m + egress_per_m,
-        failed_requests_usd: u.failed_requests * avg_req_price * m,
-        overread_usd: u.overread_bytes * 1e6 / BILLING_GB
-            * spec.egress_fraction
-            * p.egress_per_gb
-            * m,
-        cache_savings_usd: (u.cache_saved_reads * p.read_per_million
+        egress_usd: egress,
+        storage_usd,
+        total_usd: req_per_m * m + egress + storage_usd + extra,
+        per_million_ops_usd: req_per_m + egress_per_m + if m > 0.0 { extra / m } else { 0.0 },
+        failed_requests_usd: {
+            let server = u.server_error_requests.min(u.failed_requests);
+            let client = u.failed_requests - server;
+            let n = if p.bills_client_errors { client } else { 0.0 }
+                + if p.bills_server_errors { server } else { 0.0 };
+            n.min(total_req) * avg_req_price * m
+        },
+        overread_usd: if u.download_bytes > 0.0 {
+            egress * (u.overread_bytes / u.download_bytes).clamp(0.0, 1.0)
+        } else {
+            0.0
+        },
+        cache_savings_usd: (u.cache_saved_reads * read_pm
             + u.cache_saved_bytes * 1e6 / BILLING_GB * spec.egress_fraction * p.egress_per_gb)
             * m,
+        storage_class: class.map_or_else(|| "standard".to_owned(), |c| c.name.clone()),
+        retrieval_usd,
+        inter_region_usd,
+        early_delete_usd,
     }
 }
 
@@ -535,15 +846,16 @@ mod tests {
         };
         let r = cost_report(&s, &spec, "s3", Some("https://s3.us-east-1.amazonaws.com"));
         // per million ops: 2M GET * 0.40 + 1M PUT * 5.00 = 5.80 ;
-        // egress 1e12 B = 931.32 GiB (billed "GB") * 0.09 = 83.82
+        // egress 1e12 B = 931.32 GiB (billed "GB"): the first 100 GB/month are free, the rest
+        // at $0.09 (first tier, A14)
         assert!(
             (r.selected.requests_usd - 5.80).abs() < 1e-9,
             "{}",
             r.selected.requests_usd
         );
         let gib = 1e12 / (1u64 << 30) as f64;
-        assert!((r.selected.egress_usd - gib * 0.09).abs() < 1e-6);
-        assert!((r.selected.overread_usd - gib * 0.09 / 2.0).abs() < 1e-6);
+        assert!((r.selected.egress_usd - (gib - 100.0) * 0.09).abs() < 1e-6);
+        assert!((r.selected.overread_usd - (gib - 100.0) * 0.09 / 2.0).abs() < 1e-6);
         assert_eq!(r.comparison.len(), presets().len());
         let r2 = r
             .comparison
@@ -691,5 +1003,76 @@ mod tests {
         assert_eq!(r.selected.key, "aws-s3");
         let r = cost_report(&s, &spec, "s3", Some("https://s3.us-east-1.amazonaws.com"));
         assert!(r.applicable && r.selected.key == "aws-s3");
+    }
+}
+
+#[cfg(test)]
+mod bill_tests {
+    use super::*;
+
+    #[test]
+    fn egress_tiers_and_free_allowances() {
+        let aws = preset("aws-s3").unwrap();
+        assert_eq!(egress_usd(&aws, 50.0, 0.0), 0.0);
+        let ten_tb = 10.0 * 1024.0;
+        let want = (ten_tb - 100.0) * 0.09 + 1024.0 * 0.085;
+        assert!((egress_usd(&aws, ten_tb + 1024.0, 0.0) - want).abs() < 1e-6);
+        let b2 = preset("backblaze-b2").unwrap();
+        assert_eq!(egress_usd(&b2, 300.0, 100.0), 0.0);
+        assert!((egress_usd(&b2, 400.0, 100.0) - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn storage_classes_bill_minimum_sizes_and_retrieval() {
+        let p = preset("aws-s3").unwrap();
+        // 16 KiB objects read once each: Standard-IA bills 128 KiB each and a retrieval fee.
+        let u = PerOpUsage {
+            read_requests: 1.0,
+            download_bytes: 16.0 * 1024.0,
+            ..Default::default()
+        };
+        let std = CostSpec {
+            monthly_ops: 1e6,
+            stored_gib: 100.0,
+            ..Default::default()
+        };
+        let ia = CostSpec {
+            storage_class: Some("infrequent".into()),
+            ..std.clone()
+        };
+        let a = price("aws-s3", &p, &u, &std);
+        let b = price("aws-s3", &p, &u, &ia);
+        assert_eq!(a.storage_class, "standard");
+        assert_eq!(b.storage_class, "S3 Standard-IA");
+        assert!(
+            (b.storage_usd - 100.0 * 0.0125 * 8.0).abs() < 1e-9,
+            "{}",
+            b.storage_usd
+        );
+        assert!(b.retrieval_usd > 0.0 && a.retrieval_usd == 0.0);
+        assert!(b.requests_usd > a.requests_usd);
+    }
+
+    #[test]
+    fn throttled_responses_are_not_billed_where_the_provider_does_not() {
+        let mut p = preset("aws-s3").unwrap();
+        assert!(
+            p.bills_server_errors,
+            "billed unless a table says otherwise"
+        );
+        p.bills_server_errors = false;
+        let u = PerOpUsage {
+            read_requests: 2.0,
+            failed_requests: 1.0,
+            server_error_requests: 1.0,
+            ..Default::default()
+        };
+        let s = CostSpec {
+            monthly_ops: 1e6,
+            ..Default::default()
+        };
+        let c = price("aws-s3", &p, &u, &s);
+        assert!((c.requests_usd - 0.40).abs() < 1e-9, "{}", c.requests_usd);
+        assert_eq!(c.failed_requests_usd, 0.0);
     }
 }
