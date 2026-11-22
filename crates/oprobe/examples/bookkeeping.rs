@@ -44,6 +44,7 @@ fn main() {
                         service_op: None,
                         tls: None,
                         tcp: None,
+                        detail: None,
                     };
                     rec.request_finished();
                     OpScope::current().unwrap().push_request(r);
@@ -61,6 +62,7 @@ fn main() {
                     error: None,
                     key: String::new(),
                     data: scope.take(),
+                    schedule_us: None,
                 },
             );
         }

@@ -277,7 +277,9 @@ impl RunSpec {
         if ds.objects != pre_ds.objects {
             flag("--objects", Some(ds.objects.to_string()));
         }
-        if ds.object_size != pre_ds.object_size {
+        if let Some(d) = &ds.size_dist {
+            flag("--object-size", Some(d.to_string()));
+        } else if ds.object_size != pre_ds.object_size {
             flag("--object-size", Some(ds.object_size.to_string()));
         }
         if ds.persist {
@@ -295,6 +297,12 @@ impl RunSpec {
         }
         if w.seed != dw.seed {
             sets.push(("seed".into(), w.seed.to_string()));
+        }
+        if !w.arrivals.is_constant() {
+            sets.push(("arrivals".into(), w.arrivals.to_string()));
+        }
+        if let Some(sh) = &w.shape {
+            sets.push(("shape".into(), sh.to_string()));
         }
         let mix = w.effective_mix();
         if mix != pre_mix {
@@ -452,6 +460,10 @@ struct WorkloadKey {
     mix: Vec<OpSpec>,
     access: Access,
     rate: Option<f64>,
+    /// Arrival process and rate shape (`None` for constant arrivals at `rate`: the hash of
+    /// such workloads is unchanged).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    arrivals: Option<String>,
     warmup: HumanDuration,
     duration: HumanDuration,
     max_ops: Option<u64>,
@@ -464,6 +476,16 @@ impl WorkloadKey {
             mix: w.effective_mix(),
             access: w.access,
             rate: w.rate,
+            arrivals: (!w.arrivals.is_constant() || w.shape.is_some()).then(|| {
+                format!(
+                    "{}{}",
+                    w.arrivals,
+                    w.shape
+                        .as_ref()
+                        .map(|s| format!(" {s}"))
+                        .unwrap_or_default()
+                )
+            }),
             warmup: w.warmup,
             duration: w.duration,
             max_ops: w.max_ops,
@@ -663,6 +685,18 @@ pub const SET_KEYS: &[SetKey] = &[
         "dataset and key-choice seed",
     ),
     key(
+        "arrivals",
+        Section::Workload,
+        &[],
+        "open-loop arrival process: constant or poisson",
+    ),
+    key(
+        "shape",
+        Section::Workload,
+        &["rate_shape"],
+        "time-varying open-loop rate: ramp:FROM..TO/D, step:R1,R2/D, diurnal[:MIN..MAX/P], or none",
+    ),
+    key(
         "mix",
         Section::Workload,
         &[],
@@ -827,13 +861,29 @@ fn apply_one(
             p.workload.rate = (r > 0.0).then_some(r);
         }
         "access" => p.workload.access = input::access(v)?,
+        "arrivals" => p.workload.arrivals = v.parse()?,
+        "shape" => {
+            p.workload.shape = if none_word(v) { None } else { Some(v.parse()?) };
+        }
         "objects" => {
             let n = usize_of(1)?;
             dataset(p, &|d| d.objects = n);
         }
         "object_size" => {
-            let s = input::nonzero_size(v)?;
-            dataset(p, &|d| d.object_size = s);
+            if crate::config::SizeDist::is_dist(v) {
+                let dist: crate::config::SizeDist = v.parse()?;
+                let nominal = crate::util::ByteSize(dist.nominal());
+                dataset(p, &|d| {
+                    d.object_size = nominal;
+                    d.size_dist = Some(dist.clone());
+                });
+            } else {
+                let s = input::nonzero_size(v)?;
+                dataset(p, &|d| {
+                    d.object_size = s;
+                    d.size_dist = None;
+                });
+            }
         }
         "partitions" => {
             let n = usize_of(1)?;
@@ -1279,6 +1329,8 @@ mod tests {
                 "sse" => "AES256",
                 "preset" => "mixed",
                 "access" => "uniform",
+                "arrivals" => "poisson",
+                "shape" => "ramp:1..10/2s",
                 "provider" => "gcs",
                 "sla" => "none",
                 "region" | "existing" | "label" => "x",

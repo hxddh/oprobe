@@ -642,6 +642,15 @@ pub mod clap {
     pub fn nonzero_size(s: &str) -> Result<String, OprobeError> {
         super::nonzero_size(s).map(|_| s.trim().to_owned())
     }
+    /// A size, or a size distribution (`dist:lognormal(256KiB,1.5)`, `file:PATH`).
+    pub fn object_size(s: &str) -> Result<String, OprobeError> {
+        if crate::config::SizeDist::is_dist(s) {
+            s.parse::<crate::config::SizeDist>()
+                .map(|_| s.trim().to_owned())
+        } else {
+            nonzero_size(s)
+        }
+    }
     pub fn share(s: &str) -> Result<String, OprobeError> {
         super::share("share", s).map(|_| s.trim().to_owned())
     }

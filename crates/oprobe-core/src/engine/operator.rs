@@ -310,9 +310,24 @@ pub fn measured_operator(
 /// the admin operator would otherwise retry every dataset upload for minutes. One `stat` on a
 /// key that does not exist, without retries; any HTTP answer (404, 403, ...) passes.
 pub async fn check_reachable(base: &Operator, target: &TargetSpec) -> Result<()> {
+    check_reachable_with(base, target, &Knobs::default()).await
+}
+
+/// [`check_reachable`] with the run's transport and HTTP version (a server that only speaks
+/// HTTP/2 is reachable for an HTTP/2 client).
+pub async fn check_reachable_with(
+    base: &Operator,
+    target: &TargetSpec,
+    knobs: &Knobs,
+) -> Result<()> {
+    let k = Knobs {
+        http_version: knobs.http_version,
+        transport: knobs.transport,
+        ..Knobs::default()
+    };
     let probe = base
         .clone()
-        .layer(trace_layer(target, &Knobs::default(), None)?)
+        .layer(trace_layer(target, &k, None)?)
         .layer(TimeoutLayer::new().with_timeout(Duration::from_secs(20)));
     let Err(e) = probe.stat(".oprobe-reachability-check").await else {
         return Ok(());
@@ -355,6 +370,66 @@ pub async fn check_reachable(base: &Operator, target: &TargetSpec) -> Result<()>
         .into());
     }
     Ok(())
+}
+
+/// With `--http h2`, check the target speaks HTTP/2 before anything else (design v5 §3, M6):
+/// an endpoint without h2c (plain HTTP) or without `h2` in ALPN (TLS) would otherwise fail
+/// every request of the run.
+pub async fn check_protocol(base: &Operator, target: &TargetSpec, knobs: &Knobs) -> Result<()> {
+    if knobs.http_version != crate::net::HttpVersion::H2 || !target.is_network() {
+        return Ok(());
+    }
+    let probe = base
+        .clone()
+        .layer(trace_layer(target, knobs, None)?)
+        .layer(TimeoutLayer::new().with_timeout(Duration::from_secs(10)));
+    let Err(e) = probe.stat(".oprobe-protocol-check").await else {
+        return Ok(());
+    };
+    if e.kind() == opendal::ErrorKind::NotFound || e.kind() == opendal::ErrorKind::PermissionDenied
+    {
+        // The server answered over HTTP/2.
+        return Ok(());
+    }
+    let mut chain = e.to_string();
+    let mut src = std::error::Error::source(&e);
+    while let Some(s) = src {
+        chain.push_str(": ");
+        chain.push_str(&s.to_string());
+        src = s.source();
+    }
+    let l = chain.to_ascii_lowercase();
+    let protocol = [
+        "http2",
+        "h2",
+        "protocol",
+        "preface",
+        "frame",
+        "alpn",
+        "connection closed",
+        "connection reset",
+        "broken pipe",
+        "unexpected eof",
+        "error sending request",
+    ]
+    .iter()
+    .any(|n| l.contains(n));
+    if !protocol {
+        return Ok(());
+    }
+    let endpoint = target.endpoint().unwrap_or_else(|| target.display());
+    let plain = endpoint.starts_with("http://");
+    Err(OprobeError::new(
+        ErrorCode::NetHttp,
+        format!(
+            "{endpoint} does not speak HTTP/2{} (`--http h2`): {chain}",
+            if plain { " with prior knowledge (h2c)" } else { " (no `h2` in ALPN)" }
+        ),
+    )
+    .with_hint(
+        "use --http auto or --http h1; lab targets speak HTTP/2 as lab://NAME?proto=h2c (plain), h2 or https (TLS)",
+    )
+    .into())
 }
 
 /// Untraced operator for dataset seeding, verification and cleanup.

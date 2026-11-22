@@ -203,6 +203,7 @@ pub fn req_row(r: RequestRecord, op_id: u64, op_t_us: i64, attempt: u32) -> ReqR
         error: r.error,
         tls: r.tls,
         tcp: r.tcp,
+        detail: r.detail,
     }
 }
 
@@ -348,6 +349,7 @@ mod tests {
             service_op: None,
             tls: None,
             tcp: None,
+            detail: None,
         }
     }
 

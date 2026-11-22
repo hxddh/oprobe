@@ -52,6 +52,7 @@ pub const CODES: &[&str] = &[
     "cache_ineffective",
     "sla_p99",
     "rate_not_sustained",
+    "schedule_backlog",
     "run_invalid",
     "run_partial",
 ];
@@ -68,6 +69,7 @@ const VALID_ON_BROKEN_RUNS: &[&str] = &[
     "throttling",
     "retries",
     "client_cpu",
+    "schedule_backlog",
     "run_invalid",
     "run_partial",
 ];

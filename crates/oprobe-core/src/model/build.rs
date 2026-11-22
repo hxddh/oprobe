@@ -253,7 +253,7 @@ pub fn workload_info(p: &Profile) -> WorkloadInfo {
         duration_s: w.duration.get().as_secs_f64(),
         warmup_s: w.warmup.get().as_secs_f64(),
         max_ops_count: w.max_ops,
-        rate_per_s: w.rate,
+        rate_per_s: w.peak_rate(),
         access: w.access.to_string(),
         dataset: DatasetInfo {
             objects_count: ds.objects as u64,
@@ -417,7 +417,8 @@ pub fn build_run_with(
         },
         remotes: remotes(&trace.reqs),
     };
-    let heatmap = Heatmap::from_ops(&trace.ops, snapshot.elapsed_s, 120);
+    let heatmap = Heatmap::from_timeline(&snapshot.timeline, snapshot.elapsed_s, 120)
+        .unwrap_or_else(|| Heatmap::from_ops(&trace.ops, snapshot.elapsed_s, 120));
     let stages = Stages {
         bottleneck: diagnosis.bottleneck,
         shares: (&diagnosis.shares).into(),
@@ -495,13 +496,16 @@ pub fn build_run_with(
         cache: snapshot.cache.clone(),
         integrity: snapshot.integrity.clone(),
         client: crate::model::ClientInfo::opendal(),
-        self_stats: crate::model::SelfStats::from_process(&snapshot.client),
+        self_stats: crate::model::SelfStats::from_observation(
+            &snapshot.client,
+            snapshot.self_obs.as_ref(),
+        ),
         schedule: crate::model::ScheduleStats::from_open_loop(
             snapshot.open_loop.as_ref(),
             snapshot.elapsed_s,
         ),
         workers: Vec::new(),
-        dimensions: Default::default(),
+        dimensions: crate::model::Dimensions::from_stats(snapshot.dimensions.as_ref()),
         sampling: crate::model::Sampling::from_stats(&trace.sampling),
         open_loop: snapshot.open_loop.clone(),
         timeline: snapshot.timeline.clone(),

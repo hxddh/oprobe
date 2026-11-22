@@ -152,6 +152,21 @@ pub struct ConnStats {
     pub tls: Quantiles,
     #[serde(rename = "peak_inflight_requests_count")]
     pub peak_inflight_requests: u64,
+    /// Connection setup before warmup absorbed it (design v5 §3, M15): the dials and first
+    /// operations of the warmup's cold start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cold_start: Option<ColdStartStats>,
+}
+
+/// The cold start of a run: the connections dialed at the start of warmup and the operations
+/// that waited for them.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ColdStartStats {
+    pub connections_count: u64,
+    /// DNS + TCP + proxy + TLS of a fresh connection.
+    pub connect: Quantiles,
+    /// Latency of the operations whose requests dialed.
+    pub first_ops: Quantiles,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -245,6 +260,47 @@ pub struct TimelinePoint {
     pub errors: u64,
     #[serde(rename = "throttled_count")]
     pub throttled: u64,
+    /// Open-loop arrivals due in this interval that never started.
+    #[serde(
+        rename = "missed_arrivals_count",
+        default,
+        skip_serializing_if = "is_zero"
+    )]
+    pub missed_arrivals: u64,
+    /// Length of the interval: 1 s for the first ten minutes, 10 s afterwards.
+    #[serde(default = "one_s")]
+    pub len_s: f64,
+    #[serde(default)]
+    pub p90_ms: f64,
+    #[serde(default)]
+    pub p999_ms: f64,
+    #[serde(default)]
+    pub max_ms: f64,
+    /// Peak requests in flight during the interval.
+    #[serde(rename = "inflight_peak_count", default)]
+    pub inflight_peak: u64,
+    /// Connections dialed during the interval.
+    #[serde(rename = "new_connections_count", default)]
+    pub new_connections: u64,
+    /// Client CPU in percent of one core (350 = 3.5 cores busy), when sampled in the interval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_pct: Option<f64>,
+    /// Operations started in the interval per latency row of the heatmap
+    /// (`heatmap.latency_buckets_ms`): the heatmap is built from these, not from sampled rows.
+    #[serde(
+        rename = "latency_rows_count",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub latency_rows_count: Vec<u64>,
+}
+
+fn one_s() -> f64 {
+    1.0
+}
+
+fn is_zero(v: &u64) -> bool {
+    *v == 0
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -291,6 +347,19 @@ pub struct OpenLoopStats {
     #[serde(rename = "missed_count")]
     pub missed: u64,
     pub max_schedule_lag_ms: f64,
+    /// Arrival process: `constant`, `poisson`, `ramp`, `step`, `diurnal` (`+poisson`), `replay`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub arrivals: String,
+    /// Arrivals due inside the window: started plus missed.
+    #[serde(default)]
+    pub intended_count: u64,
+    /// Missed arrivals counted in the latency distribution as censored values (a lower bound:
+    /// window end − intended start): `summary.latency` percentiles are then "≥" values.
+    #[serde(default)]
+    pub censored_count: u64,
+    /// The `schedule` stage: intended → actual start of the operations that started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<Quantiles>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -320,6 +389,38 @@ pub struct Summary {
     pub inflight_ops: u64,
 }
 
+/// The load generator's own health over the measurement window (design v5 §3): what the
+/// self probe and the recorder measured. `report.self` is built from it.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct SelfObservation {
+    /// Measured observer cost per operation (recorder bookkeeping).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observer_per_op_us: Option<f64>,
+    /// Tokio runtime workers' busy share over the window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_busy_ratio: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_workers_count: Option<u64>,
+    /// Deepest global (injection) queue seen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub global_queue_depth_max_count: Option<u64>,
+    /// p99 / max lateness of a 1 ms timer task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sched_lag_p99_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sched_lag_max_ms: Option<f64>,
+    /// Process CPU over the window, as a share of the cores in use.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_ratio: Option<f64>,
+    pub cores_in_use_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rss_current_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rss_peak_bytes: Option<u64>,
+    /// Lag p99 > 5 ms or CPU ≥ 90 % of the cores in use.
+    pub client_saturated: bool,
+}
+
 /// Complete aggregated view of one measurement window.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Snapshot {
@@ -344,6 +445,12 @@ pub struct Snapshot {
     pub effective_knobs: EffectiveKnobs,
     pub timeline: Vec<TimelinePoint>,
     pub slow_ops: Vec<SlowOp>,
+    /// The client's health during the window (filled by the runner when the run ends).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_obs: Option<SelfObservation>,
+    /// Prefixes, hot keys, size buckets, cold vs warm reads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dimensions: Option<crate::dims::DimensionStats>,
 }
 
 /// Knob values as OpenDAL applies them, which can differ from what was requested.

@@ -19,7 +19,7 @@ pub use ids::RunId;
 pub use report::*;
 pub use sections::*;
 pub use spec::{Overrides, RunSpec};
-pub use trace::{OpBreakdownUs, OpRow, ReqRow, TcpRow, TlsRow, TraceInfo, WireProtocol};
+pub use trace::{OpBreakdownUs, OpRow, ReqDetail, ReqRow, TcpRow, TlsRow, TraceInfo, WireProtocol};
 
 /// Format id of a run file (design §4).
 pub const RUN_FORMAT: &str = "oprobe.run/5";

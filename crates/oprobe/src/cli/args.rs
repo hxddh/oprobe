@@ -613,8 +613,9 @@ pub struct WorkloadArgs {
     /// Number of dataset objects to generate
     #[arg(long)]
     pub objects: Option<usize>,
-    /// Size of each generated object (e.g. 16MiB)
-    #[arg(long, value_parser = parse::nonzero_size, allow_hyphen_values = true)]
+    /// Size of each generated object (e.g. 16MiB), or a distribution:
+    /// dist:lognormal(MEDIAN,SIGMA), file:PATH (one size per line)
+    #[arg(long, value_parser = parse::object_size, allow_hyphen_values = true)]
     pub object_size: Option<String>,
     /// Key popularity: uniform, zipf:1.1, hotset:0.2/0.8
     #[arg(long, value_parser = parse::access)]
@@ -628,6 +629,21 @@ pub struct WorkloadArgs {
     /// Do not delete test data when the run ends
     #[arg(long)]
     pub keep_data: bool,
+    /// Open-loop arrival process: constant (evenly spaced) or poisson
+    #[arg(long, value_name = "PROCESS")]
+    pub arrivals: Option<String>,
+    /// Time-varying open-loop rate: ramp:FROM..TO/D, step:R1,R2,…/D, diurnal[:MIN..MAX/PERIOD]
+    #[arg(long, value_name = "SHAPE")]
+    pub shape: Option<String>,
+    /// Replay a traffic log: S3 server access log, CloudTrail S3 data events, oprobe run file
+    #[arg(long, value_name = "FILE")]
+    pub replay: Option<PathBuf>,
+    /// Replay speed factor (2 = twice as fast as recorded)
+    #[arg(long, value_name = "N", value_parser = parse::positive, allow_hyphen_values = true)]
+    pub speed: Option<f64>,
+    /// Rewrite replayed keys: FROM=TO prefix pair, repeatable
+    #[arg(long, value_name = "FROM=TO")]
+    pub map_prefix: Vec<String>,
 }
 
 /// Client configuration under test.

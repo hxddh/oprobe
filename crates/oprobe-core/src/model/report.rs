@@ -711,6 +711,19 @@ pub const HEATMAP_LATENCY_BOUNDS_MS: [f64; 20] = [
     5_000.0, 10_000.0, 20_000.0, 50_000.0, 100_000.0,
 ];
 
+const _: () = {
+    // The recorder's interval columns use the heatmap's bounds.
+    let (a, b) = (
+        HEATMAP_LATENCY_BOUNDS_MS,
+        crate::trace::recorder::HEAT_BOUNDS_MS,
+    );
+    let mut i = 0;
+    while i < a.len() {
+        assert!(a[i] == b[i]);
+        i += 1;
+    }
+};
+
 impl Heatmap {
     /// At most `max_columns` time buckets of whole seconds over `window_s`.
     pub fn from_ops(ops: &[super::OpRow], window_s: f64, max_columns: usize) -> Self {
@@ -731,6 +744,36 @@ impl Heatmap {
             latency_buckets_ms: bounds.to_vec(),
             counts,
         }
+    }
+
+    /// The heatmap of the interval sketches (every operation, not the sampled rows; design v5
+    /// §3, M11): at most `max_columns` time buckets of whole seconds over `window_s`. `None`
+    /// when the timeline carries no per-interval counts.
+    pub fn from_timeline(
+        timeline: &[TimelinePoint],
+        window_s: f64,
+        max_columns: usize,
+    ) -> Option<Self> {
+        if timeline.iter().all(|p| p.latency_rows_count.is_empty()) {
+            return None;
+        }
+        let window = window_s.max(0.0);
+        let width = (window / max_columns.max(1) as f64).ceil().max(1.0);
+        let n_t = ((window / width).ceil() as usize).max(1);
+        let bounds = HEATMAP_LATENCY_BOUNDS_MS;
+        let mut counts = vec![vec![0u64; bounds.len()]; n_t];
+        for p in timeline {
+            let t = (p.t_s.max(0.0) / width) as usize;
+            for (row, n) in counts[t.min(n_t - 1)].iter_mut().zip(&p.latency_rows_count) {
+                *row += n;
+            }
+        }
+        Some(Self {
+            t_buckets_s: (0..n_t).map(|i| i as f64 * width).collect(),
+            bucket_width_s: width,
+            latency_buckets_ms: bounds.to_vec(),
+            counts,
+        })
     }
 }
 

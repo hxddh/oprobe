@@ -411,6 +411,7 @@ pub(crate) fn test_req(t_us: i64, total_us: u64) -> ReqRow {
         error: None,
         tls: None,
         tcp: None,
+        detail: None,
     }
 }
 

@@ -203,6 +203,8 @@ pub mod fixture {
                     p99_ms: if t == 6 { 900.0 } else { 110.0 },
                     errors: u64::from(t == 6),
                     throttled: if t == 6 { 12 } else { 0 },
+                    len_s: 1.0,
+                    ..Default::default()
                 })
                 .collect(),
             heatmap: Default::default(),
@@ -272,6 +274,7 @@ pub mod fixture {
             error: None,
             tls: None,
             tcp: None,
+            detail: None,
         }
     }
 

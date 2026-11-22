@@ -342,6 +342,7 @@ mod tests {
             service_op: None,
             tls: None,
             tcp: None,
+            detail: None,
         };
         req_row(r, op, 0, 1)
     }

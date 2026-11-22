@@ -86,11 +86,16 @@ Output formats (`-o`): text, json, ndjson, md, html
 | `--rate <RATE>` | Open-loop arrival rate (ops/s); latency is measured from the intended start time |
 | `--existing <PREFIX>` | Benchmark existing objects under this prefix (read-only) |
 | `--objects <OBJECTS>` | Number of dataset objects to generate |
-| `--object-size <OBJECT_SIZE>` | Size of each generated object (e.g. 16MiB) |
+| `--object-size <OBJECT_SIZE>` | Size of each generated object (e.g. 16MiB), or a distribution: dist:lognormal(MEDIAN,SIGMA), file:PATH (one size per line) |
 | `--access <ACCESS>` | Key popularity: uniform, zipf:1.1, hotset:0.2/0.8 |
 | `--persist-dataset` | Keep the generated dataset for later runs (oprobe-dataset/<fingerprint>/) |
 | `--no-verify` | Skip CRC32C verification |
 | `--keep-data` | Do not delete test data when the run ends |
+| `--arrivals <PROCESS>` | Open-loop arrival process: constant (evenly spaced) or poisson |
+| `--shape <SHAPE>` | Time-varying open-loop rate: ramp:FROM..TO/D, step:R1,R2,…/D, diurnal[:MIN..MAX/PERIOD] |
+| `--replay <FILE>` | Replay a traffic log: S3 server access log, CloudTrail S3 data events, oprobe run file |
+| `--speed <N>` | Replay speed factor (2 = twice as fast as recorded) |
+| `--map-prefix <FROM=TO>` | Rewrite replayed keys: FROM=TO prefix pair, repeatable |
 
 *Client knobs*
 
@@ -213,11 +218,16 @@ Output formats (`-o`): text, json, ndjson, md
 | `--rate <RATE>` | Open-loop arrival rate (ops/s); latency is measured from the intended start time |
 | `--existing <PREFIX>` | Benchmark existing objects under this prefix (read-only) |
 | `--objects <OBJECTS>` | Number of dataset objects to generate |
-| `--object-size <OBJECT_SIZE>` | Size of each generated object (e.g. 16MiB) |
+| `--object-size <OBJECT_SIZE>` | Size of each generated object (e.g. 16MiB), or a distribution: dist:lognormal(MEDIAN,SIGMA), file:PATH (one size per line) |
 | `--access <ACCESS>` | Key popularity: uniform, zipf:1.1, hotset:0.2/0.8 |
 | `--persist-dataset` | Keep the generated dataset for later runs (oprobe-dataset/<fingerprint>/) |
 | `--no-verify` | Skip CRC32C verification |
 | `--keep-data` | Do not delete test data when the run ends |
+| `--arrivals <PROCESS>` | Open-loop arrival process: constant (evenly spaced) or poisson |
+| `--shape <SHAPE>` | Time-varying open-loop rate: ramp:FROM..TO/D, step:R1,R2,…/D, diurnal[:MIN..MAX/PERIOD] |
+| `--replay <FILE>` | Replay a traffic log: S3 server access log, CloudTrail S3 data events, oprobe run file |
+| `--speed <N>` | Replay speed factor (2 = twice as fast as recorded) |
+| `--map-prefix <FROM=TO>` | Rewrite replayed keys: FROM=TO prefix pair, repeatable |
 
 *Client knobs*
 
@@ -393,11 +403,16 @@ Output formats (`-o`): text, json, ndjson, md
 | `--rate <RATE>` | Open-loop arrival rate (ops/s); latency is measured from the intended start time |
 | `--existing <PREFIX>` | Benchmark existing objects under this prefix (read-only) |
 | `--objects <OBJECTS>` | Number of dataset objects to generate |
-| `--object-size <OBJECT_SIZE>` | Size of each generated object (e.g. 16MiB) |
+| `--object-size <OBJECT_SIZE>` | Size of each generated object (e.g. 16MiB), or a distribution: dist:lognormal(MEDIAN,SIGMA), file:PATH (one size per line) |
 | `--access <ACCESS>` | Key popularity: uniform, zipf:1.1, hotset:0.2/0.8 |
 | `--persist-dataset` | Keep the generated dataset for later runs (oprobe-dataset/<fingerprint>/) |
 | `--no-verify` | Skip CRC32C verification |
 | `--keep-data` | Do not delete test data when the run ends |
+| `--arrivals <PROCESS>` | Open-loop arrival process: constant (evenly spaced) or poisson |
+| `--shape <SHAPE>` | Time-varying open-loop rate: ramp:FROM..TO/D, step:R1,R2,…/D, diurnal[:MIN..MAX/PERIOD] |
+| `--replay <FILE>` | Replay a traffic log: S3 server access log, CloudTrail S3 data events, oprobe run file |
+| `--speed <N>` | Replay speed factor (2 = twice as fast as recorded) |
+| `--map-prefix <FROM=TO>` | Rewrite replayed keys: FROM=TO prefix pair, repeatable |
 
 *Client knobs*
 
@@ -823,11 +838,16 @@ Output formats (`-o`): text, json, ndjson
 | `--rate <RATE>` | Open-loop arrival rate (ops/s); latency is measured from the intended start time |
 | `--existing <PREFIX>` | Benchmark existing objects under this prefix (read-only) |
 | `--objects <OBJECTS>` | Number of dataset objects to generate |
-| `--object-size <OBJECT_SIZE>` | Size of each generated object (e.g. 16MiB) |
+| `--object-size <OBJECT_SIZE>` | Size of each generated object (e.g. 16MiB), or a distribution: dist:lognormal(MEDIAN,SIGMA), file:PATH (one size per line) |
 | `--access <ACCESS>` | Key popularity: uniform, zipf:1.1, hotset:0.2/0.8 |
 | `--persist-dataset` | Keep the generated dataset for later runs (oprobe-dataset/<fingerprint>/) |
 | `--no-verify` | Skip CRC32C verification |
 | `--keep-data` | Do not delete test data when the run ends |
+| `--arrivals <PROCESS>` | Open-loop arrival process: constant (evenly spaced) or poisson |
+| `--shape <SHAPE>` | Time-varying open-loop rate: ramp:FROM..TO/D, step:R1,R2,…/D, diurnal[:MIN..MAX/PERIOD] |
+| `--replay <FILE>` | Replay a traffic log: S3 server access log, CloudTrail S3 data events, oprobe run file |
+| `--speed <N>` | Replay speed factor (2 = twice as fast as recorded) |
+| `--map-prefix <FROM=TO>` | Rewrite replayed keys: FROM=TO prefix pair, repeatable |
 
 *Client knobs*
 
@@ -915,11 +935,16 @@ Output formats (`-o`): text, json, ndjson, md
 | `--rate <RATE>` | Open-loop arrival rate (ops/s); latency is measured from the intended start time |
 | `--existing <PREFIX>` | Benchmark existing objects under this prefix (read-only) |
 | `--objects <OBJECTS>` | Number of dataset objects to generate |
-| `--object-size <OBJECT_SIZE>` | Size of each generated object (e.g. 16MiB) |
+| `--object-size <OBJECT_SIZE>` | Size of each generated object (e.g. 16MiB), or a distribution: dist:lognormal(MEDIAN,SIGMA), file:PATH (one size per line) |
 | `--access <ACCESS>` | Key popularity: uniform, zipf:1.1, hotset:0.2/0.8 |
 | `--persist-dataset` | Keep the generated dataset for later runs (oprobe-dataset/<fingerprint>/) |
 | `--no-verify` | Skip CRC32C verification |
 | `--keep-data` | Do not delete test data when the run ends |
+| `--arrivals <PROCESS>` | Open-loop arrival process: constant (evenly spaced) or poisson |
+| `--shape <SHAPE>` | Time-varying open-loop rate: ramp:FROM..TO/D, step:R1,R2,…/D, diurnal[:MIN..MAX/PERIOD] |
+| `--replay <FILE>` | Replay a traffic log: S3 server access log, CloudTrail S3 data events, oprobe run file |
+| `--speed <N>` | Replay speed factor (2 = twice as fast as recorded) |
+| `--map-prefix <FROM=TO>` | Rewrite replayed keys: FROM=TO prefix pair, repeatable |
 
 *Client knobs*
 
@@ -1115,11 +1140,16 @@ Output formats (`-o`): text, json, ndjson
 | `--rate <RATE>` | Open-loop arrival rate (ops/s); latency is measured from the intended start time |
 | `--existing <PREFIX>` | Benchmark existing objects under this prefix (read-only) |
 | `--objects <OBJECTS>` | Number of dataset objects to generate |
-| `--object-size <OBJECT_SIZE>` | Size of each generated object (e.g. 16MiB) |
+| `--object-size <OBJECT_SIZE>` | Size of each generated object (e.g. 16MiB), or a distribution: dist:lognormal(MEDIAN,SIGMA), file:PATH (one size per line) |
 | `--access <ACCESS>` | Key popularity: uniform, zipf:1.1, hotset:0.2/0.8 |
 | `--persist-dataset` | Keep the generated dataset for later runs (oprobe-dataset/<fingerprint>/) |
 | `--no-verify` | Skip CRC32C verification |
 | `--keep-data` | Do not delete test data when the run ends |
+| `--arrivals <PROCESS>` | Open-loop arrival process: constant (evenly spaced) or poisson |
+| `--shape <SHAPE>` | Time-varying open-loop rate: ramp:FROM..TO/D, step:R1,R2,…/D, diurnal[:MIN..MAX/PERIOD] |
+| `--replay <FILE>` | Replay a traffic log: S3 server access log, CloudTrail S3 data events, oprobe run file |
+| `--speed <N>` | Replay speed factor (2 = twice as fast as recorded) |
+| `--map-prefix <FROM=TO>` | Rewrite replayed keys: FROM=TO prefix pair, repeatable |
 
 *Client knobs*
 

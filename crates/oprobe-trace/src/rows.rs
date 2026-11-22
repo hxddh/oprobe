@@ -79,6 +79,81 @@ pub struct TcpRow {
     /// Time sending was limited by the send buffer (Linux ≥ 4.10).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub sndbuf_limited_us: u64,
+    /// Minimum RTT the kernel observed: the network's RTT, which server delay does not
+    /// inflate (unlike the smoothed `rtt_us`; Linux).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub min_rtt_us: u64,
+    /// Bytes written but not yet sent (Linux).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub notsent_bytes: u64,
+    /// Segments sent and not yet acknowledged (Linux).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub unacked_count: u64,
+    /// Segments considered lost (Linux).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub lost_count: u64,
+    /// Bytes acknowledged by the peer over the connection's life (Linux).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub bytes_acked: u64,
+    /// Pacing rate, bits per second (Linux).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub pacing_rate_bps: u64,
+}
+
+/// Details of one request beyond the stage timings (design v5 §3): what the server said
+/// (M10), kernel upload timing (M4), HTTP/2 stream waits (M5) and dial waits. Sparse: only
+/// requests that have any of them carry it.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ReqDetail {
+    /// The provider's error code from the error body or header (S3 `SlowDown`,
+    /// `InternalError`; GCS `rateLimitExceeded`; Azure `ServerBusy`), read from the first
+    /// 4 KiB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    /// S3 `x-amz-id-2` (extended request id), alongside the request id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_id: Option<String>,
+    /// The bucket's region (`x-amz-bucket-region`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    /// The `Server-Timing` header (capped at 256 bytes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_timing: Option<String>,
+    /// CDN cache status (`x-cache`, `cf-cache-status`, `x-cache-status`): `hit`, `miss`, …
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_status: Option<String>,
+    /// From the request start until the kernel saw the server acknowledge the last request
+    /// byte (Linux `TCP_INFO`): the end of the `upload` phase. `send_us` then counts until the
+    /// acknowledgement and `ttfb_us` from it (the `server` phase).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upload_acked_us: Option<u64>,
+    /// Time until the request body reached the kernel's send buffer (what `send_us` measured
+    /// before the acknowledgement was known).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub send_buffered_us: Option<u64>,
+    /// HTTP/2: time waiting for a stream slot (`max_concurrent_streams`) on a connection
+    /// (the `stream_wait` stage; part of `queue_us`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_wait_us: Option<u64>,
+    /// HTTP/2: time the request body waited for flow-control window (window at 0).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flow_stall_us: Option<u64>,
+    /// HTTP/2: streams open on the connection when the request started (itself included).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub streams_count: Option<u32>,
+    /// The request waited for a connection another request was dialing: it counts as cold and
+    /// the wait is in `connect` (fidelity transport).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dial_wait_us: Option<u64>,
+    /// Retransmitted segments on the connection during this request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retrans_count: Option<u64>,
+}
+
+impl ReqDetail {
+    pub fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
 }
 
 /// One backend request (an HTTP exchange, or an in-process backend call).
@@ -133,6 +208,9 @@ pub struct ReqRow {
     pub tls: Option<Box<TlsRow>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tcp: Option<Box<TcpRow>>,
+    /// Server signals, kernel upload timing, HTTP/2 stream waits ([`ReqDetail`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<Box<ReqDetail>>,
 }
 
 impl ReqRow {

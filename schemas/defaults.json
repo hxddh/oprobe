@@ -24,6 +24,21 @@
         }
       ]
     },
+    "Arrivals": {
+      "description": "How open-loop arrivals are spaced.",
+      "oneOf": [
+        {
+          "const": "constant",
+          "description": "Evenly spaced: one arrival every `1 / rate` seconds.",
+          "type": "string"
+        },
+        {
+          "const": "poisson",
+          "description": "A Poisson process: exponentially distributed gaps with mean `1 / rate` (bursty, like\nindependent clients).",
+          "type": "string"
+        }
+      ]
+    },
     "ByteSize": {
       "description": "A byte size: `4MiB`, `512KiB`, `1GB` (a plain number of bytes is accepted on input).",
       "type": "string"
@@ -108,6 +123,17 @@
           "default": false,
           "description": "Keep the generated dataset between runs (`oprobe-dataset/<fingerprint>/`) to avoid\nre-uploading it every time. Remove with `oprobe cleanup --datasets`.",
           "type": "boolean"
+        },
+        "size_dist": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SizeDist"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Object sizes drawn from a distribution (`object_size` is then its median)."
         }
       },
       "required": [
@@ -621,6 +647,52 @@
       ],
       "type": "object"
     },
+    "RateShape": {
+      "description": "Time-varying open-loop rate: ramp:FROM..TO/DURATION, step:R1,R2,…/DURATION or diurnal[:MIN..MAX/PERIOD]",
+      "type": "string"
+    },
+    "ReplaySpec": {
+      "additionalProperties": false,
+      "description": "What to replay (`workload.replay`).",
+      "properties": {
+        "file": {
+          "description": "The log: an S3 server access log, CloudTrail JSON (S3 data events) or an oprobe run file.",
+          "type": "string"
+        },
+        "map_prefix": {
+          "description": "Key rewrites, the first matching prefix wins (`$RUN/` targets the run prefix).",
+          "items": {
+            "maxItems": 2,
+            "minItems": 2,
+            "prefixItems": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "string"
+              }
+            ],
+            "type": "array"
+          },
+          "type": "array"
+        },
+        "speed": {
+          "default": 1.0,
+          "description": "Speed factor: 2 replays twice as fast as recorded.",
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "file",
+        "speed"
+      ],
+      "type": "object"
+    },
+    "SizeDist": {
+      "description": "Object size distribution: dist:lognormal(MEDIAN,SIGMA) or file:PATH",
+      "type": "string"
+    },
     "Sla": {
       "additionalProperties": false,
       "description": "Service level objectives. `oprobe run` / `oprobe tune` exit with code 3 when the measured\nresult breaches them (unless `enforce = false` / `--sla none`); the tuner rejects trials that\nbreach them and the diagnosis grades findings against them.",
@@ -729,6 +801,10 @@
           "$ref": "#/$defs/Access",
           "default": "uniform"
         },
+        "arrivals": {
+          "$ref": "#/$defs/Arrivals",
+          "description": "Open-loop arrival process: `constant` (evenly spaced) or `poisson` (design v5 §3)."
+        },
         "cleanup": {
           "default": true,
           "description": "Delete everything written under the run prefix when the run ends.",
@@ -777,11 +853,33 @@
             "null"
           ]
         },
+        "replay": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ReplaySpec"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Replay a traffic log instead of the mix (open loop on the log's timing)."
+        },
         "seed": {
           "default": 42,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
+        },
+        "shape": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RateShape"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Time-varying open-loop rate: `ramp:FROM..TO/D`, `step:R1,R2,…/D` or\n`diurnal[:MIN..MAX/PERIOD]` (makes the run open-loop; `rate` is then the diurnal peak)."
         },
         "verify": {
           "default": true,

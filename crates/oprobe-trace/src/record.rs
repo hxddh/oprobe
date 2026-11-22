@@ -284,6 +284,9 @@ pub struct RequestRecord {
     /// Kernel TCP statistics of the connection at request end.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tcp: Option<Box<crate::rows::TcpRow>>,
+    /// Server signals, kernel upload timing, HTTP/2 stream waits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<Box<crate::rows::ReqDetail>>,
 }
 
 impl RequestRecord {

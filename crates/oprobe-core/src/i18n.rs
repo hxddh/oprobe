@@ -279,6 +279,14 @@ static EN: &[(&str, &str)] = &[
         "Attribute the slowest requests by stage (`oprobe analyze RUN --slowest 1`)",
     ),
     (
+        "finding.schedule_backlog.cause",
+        "The open-loop schedule fell behind: some arrivals never started",
+    ),
+    (
+        "finding.schedule_backlog.advice",
+        "Raise --concurrency, lower --rate, or check report.self for a saturated client",
+    ),
+    (
         "finding.client_queue.cause",
         "Operations wait for in-flight request permits",
     ),
@@ -542,6 +550,14 @@ static ZH_CN: &[(&str, &str)] = &[
     (
         "finding.tail_latency.advice",
         "按阶段归因最慢的请求（`oprobe analyze RUN --slowest 1`）",
+    ),
+    (
+        "finding.schedule_backlog.cause",
+        "开环调度落后：部分到达请求从未开始",
+    ),
+    (
+        "finding.schedule_backlog.advice",
+        "提高 --concurrency、降低 --rate，或检查 report.self 中客户端是否饱和",
     ),
     ("finding.client_queue.cause", "操作在等待在途请求许可"),
     (

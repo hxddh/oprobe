@@ -7,6 +7,7 @@ use std::time::Duration;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+pub use crate::engine::schedule::{Arrivals, RateShape, SizeDist};
 use crate::net::HttpVersion;
 use crate::util::{ByteSize, HumanDuration};
 
@@ -581,6 +582,9 @@ pub struct DatasetSpec {
     pub objects: usize,
     #[serde(default = "default_object_size")]
     pub object_size: ByteSize,
+    /// Object sizes drawn from a distribution (`object_size` is then its median).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_dist: Option<SizeDist>,
     /// Spread objects across this many `part=NN/` prefixes.
     #[serde(default = "default_partitions")]
     pub partitions: usize,
@@ -608,6 +612,7 @@ impl Default for DatasetSpec {
         Self {
             objects: default_objects(),
             object_size: default_object_size(),
+            size_dist: None,
             partitions: default_partitions(),
             existing_prefix: None,
             persist: false,
@@ -630,6 +635,16 @@ pub struct WorkloadSpec {
     /// Open-loop arrival rate in ops/s. Unset = closed loop (`knobs.concurrency` workers).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate: Option<f64>,
+    /// Open-loop arrival process: `constant` (evenly spaced) or `poisson` (design v5 §3).
+    #[serde(default, skip_serializing_if = "Arrivals::is_constant")]
+    pub arrivals: Arrivals,
+    /// Time-varying open-loop rate: `ramp:FROM..TO/D`, `step:R1,R2,…/D` or
+    /// `diurnal[:MIN..MAX/PERIOD]` (makes the run open-loop; `rate` is then the diurnal peak).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shape: Option<RateShape>,
+    /// Replay a traffic log instead of the mix (open loop on the log's timing).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay: Option<crate::engine::replay::ReplaySpec>,
     #[serde(default)]
     pub access: Access,
     /// Dataset override (defaults come from the preset).
@@ -669,6 +684,9 @@ impl Default for WorkloadSpec {
             warmup: default_warmup(),
             max_ops: None,
             rate: None,
+            arrivals: Arrivals::Constant,
+            shape: None,
+            replay: None,
             access: Access::Uniform,
             dataset: None,
             mix: Vec::new(),
@@ -680,6 +698,27 @@ impl Default for WorkloadSpec {
 }
 
 impl WorkloadSpec {
+    /// Whether arrivals follow a schedule (`rate` or `shape`) instead of closed-loop workers.
+    pub fn open_loop(&self) -> bool {
+        self.rate.is_some() || self.shape.is_some() || self.replay.is_some()
+    }
+
+    /// Expected open-loop arrivals over `window` (`None`: closed loop). The plan's estimate.
+    pub fn expected_arrivals(&self, window: std::time::Duration) -> Option<f64> {
+        match &self.shape {
+            Some(s) => Some(s.expected_arrivals(self.rate.unwrap_or(0.0), window)),
+            None => self.rate.map(|r| r * window.as_secs_f64()),
+        }
+    }
+
+    /// The highest open-loop arrival rate of the run (ops/s), when it is open-loop.
+    pub fn peak_rate(&self) -> Option<f64> {
+        match &self.shape {
+            Some(s) => Some(s.peak(self.rate.unwrap_or(0.0))),
+            None => self.rate,
+        }
+    }
+
     pub fn effective_dataset(&self) -> DatasetSpec {
         self.dataset
             .clone()
@@ -1172,7 +1211,14 @@ impl TargetSpec {
             }
             "lab" => {
                 let scenario = crate::input::lab_scenario(host.as_deref().unwrap_or_default())?;
-                let lab = crate::lab::shared(scenario)?;
+                let proto = match options.remove("proto") {
+                    Some(p) => crate::lab::LabProto::parse(&p)?,
+                    None => crate::lab::LabProto::default(),
+                };
+                let lab = crate::lab::shared_with(scenario, proto)?;
+                if proto.tls() {
+                    options.insert("ca_cert_pem".into(), crate::lab::lab_ca_pem().into());
+                }
                 options.insert("bucket".into(), crate::lab::LAB_BUCKET.into());
                 options.insert("region".into(), "us-east-1".into());
                 options.insert("endpoint".into(), lab.endpoint_url.clone());

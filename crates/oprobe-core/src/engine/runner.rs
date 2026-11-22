@@ -184,6 +184,12 @@ pub struct Session {
     /// The non-default load generator (`profile.client`, design v5 §7), started for this
     /// session; `None`: OpenDAL's own HTTP stack.
     client: Option<Arc<crate::clients::Driver>>,
+    /// The traffic log replayed instead of the mix (`workload.replay`).
+    replay: Option<Arc<super::replay::ReplayLog>>,
+    /// Next log event to replay (windows continue where the previous one stopped).
+    replay_cursor: Mutex<usize>,
+    /// Where the next window streams its rows (the run file), taken by [`Session::run`].
+    row_sink: Mutex<Option<Arc<dyn crate::trace::RowSink>>>,
 }
 
 impl Session {
@@ -238,9 +244,25 @@ impl Session {
             }
         );
         if profile.target.is_network() {
-            super::operator::check_reachable(&base, &profile.target).await?;
+            super::operator::check_reachable_with(&base, &profile.target, &profile.knobs).await?;
+            super::operator::check_protocol(&base, &profile.target, &profile.knobs).await?;
         }
-        let needs_objects = mix.iter().any(|m| m.op.needs_dataset() && m.weight > 0);
+        let replay = match &profile.workload.replay {
+            Some(spec) => {
+                let log = super::replay::ReplayLog::load(spec, &run_prefix)?;
+                if log.refused_writes_count > 0 {
+                    warnings.push(format!(
+                        "replay: {} writes/deletes outside the run prefix were refused (map them with --map-prefix FROM={}…)",
+                        log.refused_writes_count,
+                        super::replay::RUN_PREFIX_TOKEN
+                    ));
+                }
+                Some(Arc::new(log))
+            }
+            None => None,
+        };
+        let needs_objects =
+            replay.is_none() && mix.iter().any(|m| m.op.needs_dataset() && m.weight > 0);
         if opts.preflight {
             let writes = spec.existing_prefix.is_none()
                 && (needs_objects || mix.iter().any(|m| m.weight > 0 && m.op.is_write()));
@@ -294,6 +316,9 @@ impl Session {
             trace_max_requests: opts.trace_max_requests,
             last_trace: Mutex::new(None),
             client,
+            replay,
+            replay_cursor: Mutex::new(0),
+            row_sink: Mutex::new(None),
         })
     }
 
@@ -308,6 +333,13 @@ impl Session {
     /// The non-default load generator of this session (design v5 §7).
     pub fn client(&self) -> Option<&Arc<crate::clients::Driver>> {
         self.client.as_ref()
+    }
+
+    /// Stream every row of the next [`Session::run`] window to `sink` (the run file, written
+    /// while the run is in progress); the in-memory sample then keeps at most
+    /// [`crate::store::runfile::STREAM_MEMORY_ROWS`] rows.
+    pub fn stream_rows(&self, sink: Arc<dyn crate::trace::RowSink>) {
+        *self.row_sink.lock().unwrap_or_else(|e| e.into_inner()) = Some(sink);
     }
 
     /// The budget guard, when the session has one.
@@ -325,6 +357,18 @@ impl Session {
         let trial = self.trial.fetch_add(1, Ordering::Relaxed);
         let recorder = Recorder::new();
         recorder.set_trace_limit(self.trace_max_requests);
+        if let Some(sink) = self
+            .row_sink
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            recorder.set_row_sink(sink);
+            recorder.set_trace_limit(
+                self.trace_max_requests
+                    .min(crate::store::runfile::STREAM_MEMORY_ROWS),
+            );
+        }
         if let Some(g) = &self.guard {
             recorder.set_guard(g.clone());
         }
@@ -375,6 +419,7 @@ impl Session {
                         g.tick();
                     }
                     rec.sample_trees(rec.current_p90_us().max(2_000));
+                    rec.sample_series();
                     if n.is_multiple_of(50)
                         && let Some((pct, rss)) = cpu.sample()
                     {
@@ -406,26 +451,31 @@ impl Session {
                 .await?;
             }
             recorder.set_phase(Phase::Measure);
-            self.drive(
-                &ctx,
-                knobs,
-                opts,
-                opts.duration,
-                opts.max_ops,
-                true,
-                trial,
-                &recorder,
-                tree.as_ref(),
-            )
-            .await?;
+            let probe = super::selfobs::SelfProbe::start();
+            let measured = self
+                .drive(
+                    &ctx,
+                    knobs,
+                    opts,
+                    opts.duration,
+                    opts.max_ops,
+                    true,
+                    trial,
+                    &recorder,
+                    tree.as_ref(),
+                )
+                .await;
+            let obs = probe.finish(recorder.observer_per_op_us()).await;
+            measured?;
             recorder.set_phase(Phase::Verify);
-            Ok::<_, anyhow::Error>(())
+            Ok::<_, anyhow::Error>(obs)
         }
         .await;
         stop.store(true, Ordering::Release);
         let _ = sampler.await;
-        result?;
+        let obs = result?;
         let mut snap = recorder.snapshot();
+        snap.self_obs = Some(obs);
         snap.phase = Phase::Done;
         snap.interrupted = self.cancel.is_cancelled();
         snap.effective_knobs = super::stack::effective_knobs(&self.capability, knobs);
@@ -499,7 +549,11 @@ impl Session {
         };
         let seed = self.profile.workload.seed ^ (trial << 32) ^ if measured { 0x5eed } else { 0 };
 
-        match opts.rate {
+        let rate = opts.rate.or_else(|| {
+            (self.profile.workload.shape.is_some() || self.replay.is_some())
+                .then(|| self.profile.workload.rate.unwrap_or(0.0))
+        });
+        match rate {
             None => {
                 let mut set = JoinSet::new();
                 for w in 0..knobs.concurrency.max(1) {
@@ -530,10 +584,11 @@ impl Session {
                             seq += 1;
                             run_one(
                                 &ctx,
-                                &kind,
+                                &Job::Mix(kind),
                                 &mut rng,
                                 slot,
                                 Instant::now(),
+                                false,
                                 in_window,
                                 &rec,
                                 tree.as_ref(),
@@ -551,18 +606,48 @@ impl Session {
                 let conc = knobs.concurrency.max(1);
                 let cap = Arc::new(Semaphore::new(conc));
                 let slots = SlotPool::new(conc as u64 * 4);
-                let interval = Duration::from_secs_f64(1.0 / rate.max(0.001));
-                // Bounded backlog: an arrival more than `timeout` behind schedule could only
-                // time out; such arrivals are dropped (counted as missed) instead of queued.
-                let max_queue_delay = knobs.timeout.get().max(Duration::from_secs(1));
+                let wl = &self.profile.workload;
                 let t0 = Instant::now();
-                let mut next = t0;
+                let horizon = deadline.saturating_duration_since(t0);
+                let mut src = match &self.replay {
+                    Some(log) => {
+                        let idx = *self.replay_cursor.lock().unwrap_or_else(|e| e.into_inner());
+                        Source::Replay {
+                            log,
+                            idx,
+                            base: log.events.get(idx).map_or(Duration::ZERO, |e| e.at),
+                        }
+                    }
+                    None => Source::Clock {
+                        clock: super::schedule::ArrivalClock::new(
+                            wl.arrivals,
+                            wl.shape.clone(),
+                            rate,
+                            horizon,
+                        ),
+                        rng: SmallRng::seed_from_u64(seed ^ 0xA771_7A15),
+                    },
+                };
+                // Bounded backlog: an arrival more than `timeout` behind schedule could only
+                // time out; such arrivals are dropped (missed, censored) instead of queued.
+                let max_queue_delay = knobs.timeout.get().max(Duration::from_secs(1));
                 let mut rng = SmallRng::seed_from_u64(seed);
                 let mut missed = 0u64;
                 let mut issued = 0u64;
                 let mut max_lag = Duration::ZERO;
                 let mut set = JoinSet::new();
-                'arrivals: loop {
+                let missed_arrival = |at: Instant, now: Instant| {
+                    if measured {
+                        recorder.record_missed_arrival(
+                            at,
+                            now.saturating_duration_since(at).as_micros() as u64,
+                        );
+                    }
+                };
+                let mut pending = src.next(horizon).map(|(d, j)| (t0 + d, j));
+                // `pending` holds the next arrival until it is dispatched, so the arrivals still
+                // due when the loop stops are counted as missed below.
+                'arrivals: while let Some((mut next, mut job)) = pending.clone() {
                     if next >= deadline
                         || self.cancel.is_cancelled()
                         || max_ops.is_some_and(|m| issued >= m)
@@ -578,13 +663,18 @@ impl Session {
                         }
                         let wake = next.min(deadline).min(now + Duration::from_millis(100));
                         tokio::time::sleep_until(wake.into()).await;
-                        if should_stop() {
+                        // (An arrival due before the deadline still starts when the timer wakes
+                        // a little after it.)
+                        if self.cancel.is_cancelled() {
                             break 'arrivals;
                         }
                     }
                     // Wait for a free slot (wrk2-style): the arrival stays queued and its latency
                     // keeps counting from the intended start, so saturation shows in latency.
                     let permit = loop {
+                        if let Ok(p) = cap.clone().try_acquire_owned() {
+                            break p;
+                        }
                         let now = Instant::now();
                         if now >= deadline || self.cancel.is_cancelled() {
                             break 'arrivals;
@@ -600,22 +690,31 @@ impl Session {
                     while let Some(r) = set.try_join_next() {
                         worker_result(r)?;
                     }
-                    let behind = Instant::now().saturating_duration_since(next);
-                    if behind > max_queue_delay {
-                        let skip = ((behind - max_queue_delay).as_secs_f64()
-                            / interval.as_secs_f64())
-                        .ceil()
-                        .max(1.0);
-                        missed += skip as u64;
-                        next += interval.mul_f64(skip);
-                        if next >= deadline {
-                            break;
+                    // Arrivals too far behind are dropped: each is missed, with its wait so far
+                    // as the lower bound of its latency.
+                    let now = Instant::now();
+                    while now.saturating_duration_since(next) > max_queue_delay {
+                        missed += 1;
+                        missed_arrival(next, now);
+                        match src.next(horizon) {
+                            Some((d, j)) if t0 + d < deadline => (next, job) = (t0 + d, j),
+                            Some((d, j)) => {
+                                pending = Some((t0 + d, j));
+                                break 'arrivals;
+                            }
+                            None => {
+                                pending = None;
+                                break 'arrivals;
+                            }
                         }
                     }
                     max_lag = max_lag.max(next.elapsed());
                     started.fetch_add(1, Ordering::Relaxed);
                     issued += 1;
-                    let kind = pick_kind(&mut rng, &cum);
+                    let job = match job {
+                        Some(r) => Job::Replay(r),
+                        None => Job::Mix(pick_kind(&mut rng, &cum)),
+                    };
                     let mut op_rng = SmallRng::seed_from_u64(rng.r#gen());
                     let lease = slots.take();
                     let ctx = ctx.clone();
@@ -627,10 +726,11 @@ impl Session {
                     set.spawn(async move {
                         run_one(
                             &ctx,
-                            &kind,
+                            &job,
                             &mut op_rng,
                             lease.1,
                             intended,
+                            true,
                             in_window,
                             &rec,
                             tree.as_ref(),
@@ -639,19 +739,24 @@ impl Session {
                         drop(lease);
                         drop(permit);
                     });
-                    next += interval;
+                    pending = src.next(horizon).map(|(d, j)| (t0 + d, j));
                 }
                 let window_end = Instant::now().min(deadline);
                 close_window();
-                // Arrivals that were due inside the window but never got a slot.
-                if next < window_end && !max_ops.is_some_and(|m| issued >= m) {
-                    missed +=
-                        ((window_end - next).as_secs_f64() / interval.as_secs_f64()).ceil() as u64;
+                // Arrivals that were due inside the window but never started: censored at
+                // (window end − intended start).
+                if !max_ops.is_some_and(|m| issued >= m) {
+                    while let Some((at, _)) = pending.as_ref().filter(|(t, _)| *t < window_end) {
+                        missed += 1;
+                        missed_arrival(*at, window_end);
+                        pending = src.next(horizon).map(|(d, j)| (t0 + d, j));
+                    }
                 }
+                src.save_cursor(pending.is_some(), &self.replay_cursor);
                 join_workers(set).await?;
                 if measured {
                     recorder.set_open_loop(OpenLoopStats {
-                        target_rate: rate,
+                        target_rate: src.mean_rate(horizon, issued + missed),
                         achieved_rate: issued as f64
                             / window_end
                                 .saturating_duration_since(t0)
@@ -659,6 +764,9 @@ impl Session {
                                 .max(1e-3),
                         missed,
                         max_schedule_lag_ms: max_lag.as_secs_f64() * 1000.0,
+                        arrivals: src.label(),
+                        intended_count: issued + missed,
+                        ..Default::default()
                     });
                 }
             }
@@ -722,22 +830,33 @@ impl Session {
 #[allow(clippy::too_many_arguments)]
 async fn run_one(
     ctx: &Arc<OpCtx>,
-    kind: &OpKind,
+    job: &Job,
     rng: &mut SmallRng,
     slot: u64,
     intended: Instant,
+    open_loop: bool,
     measured: bool,
     rec: &Arc<Recorder>,
     tree: Option<&await_tree::Registry>,
 ) {
+    // The `schedule` stage: how late the operation starts against its intended start.
+    let schedule_us = open_loop.then(|| intended.elapsed().as_micros() as u64);
     // `measured`: the caller decided, when it issued the operation, that it belongs to the
     // measurement window.
     let scope = OpScope::new_at(measured && rec.is_measuring(), intended, Some(rec.clone()));
     let measured = scope.measured;
-    let name = verb(kind);
+    let name = match job {
+        Job::Mix(kind) => verb(kind),
+        Job::Replay(op) => op.verb(),
+    };
     rec.op_started_at(scope.id, intended);
     let mut key = String::new();
-    let fut = scope.run(execute(ctx, kind, rng, slot, &mut key));
+    let fut = scope.run(async {
+        match job {
+            Job::Mix(kind) => execute(ctx, kind, rng, slot, &mut key).await,
+            Job::Replay(op) => super::replay::execute(ctx, op, &mut key).await,
+        }
+    });
     let res = match tree {
         Some(reg) => {
             scope.set_tree_registry(reg.clone());
@@ -765,6 +884,377 @@ async fn run_one(
             error,
             key,
             data: scope.take(),
+            schedule_us,
         },
     );
+}
+
+/// What one arrival runs: an operation of the mix, or a replayed log entry.
+enum Job {
+    Mix(OpKind),
+    Replay(Arc<super::replay::ReplayOp>),
+}
+
+/// Where open-loop arrivals come from.
+enum Source<'a> {
+    /// A rate (constant, Poisson, shaped); the operation is picked from the mix at dispatch.
+    Clock {
+        clock: super::schedule::ArrivalClock,
+        rng: SmallRng,
+    },
+    /// A traffic log from event `idx` on, its times relative to `base`.
+    Replay {
+        log: &'a super::replay::ReplayLog,
+        idx: usize,
+        base: Duration,
+    },
+}
+
+impl Source<'_> {
+    /// The next arrival (offset from the window start) before `horizon`.
+    fn next(
+        &mut self,
+        horizon: Duration,
+    ) -> Option<(Duration, Option<Arc<super::replay::ReplayOp>>)> {
+        match self {
+            Source::Clock { clock, rng } => clock.next(rng, horizon).map(|d| (d, None)),
+            Source::Replay { log, idx, base } => {
+                let e = log.events.get(*idx)?;
+                let at = e.at.saturating_sub(*base);
+                if at >= horizon {
+                    return None;
+                }
+                *idx += 1;
+                Some((at, Some(e.op.clone())))
+            }
+        }
+    }
+
+    fn label(&self) -> String {
+        match self {
+            Source::Clock { clock, .. } => clock.label(),
+            Source::Replay { .. } => "replay".into(),
+        }
+    }
+
+    /// The mean intended rate over the window (the target rate of a shaped schedule or log).
+    fn mean_rate(&self, window: Duration, intended: u64) -> f64 {
+        match self {
+            Source::Clock { clock, .. } => {
+                let steps = 200u32;
+                if window.is_zero() {
+                    return clock.rate_at(Duration::ZERO);
+                }
+                let dt = window / steps;
+                (0..steps)
+                    .map(|i| clock.rate_at(dt * i + dt / 2))
+                    .sum::<f64>()
+                    / f64::from(steps)
+            }
+            Source::Replay { .. } => intended as f64 / window.as_secs_f64().max(1e-3),
+        }
+    }
+
+    /// Remember where the next window of a replay starts (`holding`: one event was taken from
+    /// the log but not dispatched).
+    fn save_cursor(&self, holding: bool, cursor: &Mutex<usize>) {
+        if let Source::Replay { idx, .. } = self {
+            *cursor.lock().unwrap_or_else(|e| e.into_inner()) = idx - usize::from(holding);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Arrivals, TargetSpec};
+
+    fn quiet() -> ProgressFn {
+        Arc::new(|_| {})
+    }
+
+    fn profile(url: &str) -> Profile {
+        let mut p = Profile::from_target(TargetSpec::from_url(url).unwrap());
+        p.workload.preset = crate::config::Preset::Metadata;
+        p.workload.dataset = Some(crate::config::DatasetSpec {
+            objects: 4,
+            object_size: crate::util::ByteSize::kib(4),
+            ..Default::default()
+        });
+        p.workload.verify = false;
+        p.knobs.concurrency = 1;
+        p
+    }
+
+    fn opts(ms: u64, rate: Option<f64>) -> RunOptions {
+        RunOptions {
+            duration: Duration::from_millis(ms),
+            warmup: Duration::from_millis(if rate.is_none() { 100 } else { 0 }),
+            max_ops: None,
+            rate,
+            trace_slow_ops: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn closed_loop_runs_say_so() {
+        let p = profile("memory://");
+        let s = Session::open(p, Cancel::new(), quiet()).await.unwrap();
+        let knobs = s.profile.knobs.clone();
+        let snap = s.run(&knobs, &opts(150, None), None).await.unwrap();
+        assert!(snap.summary.ops > 0);
+        // Every operation is in the dimensions (aggregates, not sampled rows).
+        let dims = crate::model::Dimensions::from_stats(snap.dimensions.as_ref());
+        let ops: u64 = dims.prefixes.iter().map(|p| p.ops_count).sum();
+        assert_eq!(ops, snap.summary.ops);
+        assert!(!dims.hot_keys.is_empty());
+        assert!(snap.open_loop.is_none());
+        let sched = crate::model::ScheduleStats::from_open_loop(snap.open_loop.as_ref(), 0.15);
+        assert!(!sched.open_loop);
+    }
+
+    #[tokio::test]
+    async fn an_overloaded_open_loop_counts_censored_missed_arrivals() {
+        // One slot against a 20 ms server at 500 arrivals/s: most arrivals never start.
+        let lab = crate::lab::LabServer::spawn(
+            "127.0.0.1:0",
+            crate::lab::LabConfig {
+                base_ttfb_delay: Duration::from_millis(20),
+                throttle_status_code: 503,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let mut p = lab.profile("b");
+        p.workload = profile("memory://").workload;
+        p.knobs.concurrency = 1;
+        let s = Session::open(p, Cancel::new(), quiet()).await.unwrap();
+        let knobs = s.profile.knobs.clone();
+        let snap = s.run(&knobs, &opts(600, Some(500.0)), None).await.unwrap();
+        let ol = snap.open_loop.clone().expect("open-loop stats");
+        assert_eq!(ol.arrivals, "constant");
+        assert!(ol.missed > 100, "{ol:?}");
+        assert_eq!(ol.censored_count, ol.missed);
+        assert_eq!(ol.intended_count, snap.summary.ops + ol.missed, "{ol:?}");
+        // The intended count matches the schedule (500/s × 0.6 s), not what the client managed.
+        assert!((ol.intended_count as i64 - 300).abs() <= 3, "{ol:?}");
+        let stage = ol.schedule.expect("schedule stage");
+        assert_eq!(stage.count, snap.summary.ops);
+        assert!(stage.max > 50.0, "{stage:?}");
+        // Censored values are part of the latency distribution: the tail shows the backlog.
+        assert_eq!(snap.summary.latency.count, snap.summary.ops + ol.missed);
+        assert!(
+            snap.summary.latency.p99 > 300.0,
+            "{:?}",
+            snap.summary.latency
+        );
+        let missed_series: u64 = snap.timeline.iter().map(|t| t.missed_arrivals).sum();
+        assert_eq!(missed_series, ol.missed);
+        let sched = crate::model::ScheduleStats::from_open_loop(Some(&ol), snap.elapsed_s);
+        assert!(sched.open_loop && sched.backlogged());
+        assert!(sched.missed_arrivals_ratio > 0.3);
+        // The slot wait is queueing, not client work.
+        let v = &snap.verbs[0];
+        assert!(
+            v.breakdown.queue_ms > v.breakdown.client_ms,
+            "{:?}",
+            v.breakdown
+        );
+    }
+
+    #[tokio::test]
+    async fn poisson_and_shaped_arrivals_follow_their_schedule() {
+        let mut p = profile("memory://");
+        p.workload.arrivals = Arrivals::Poisson;
+        p.knobs.concurrency = 8;
+        let s = Session::open(p, Cancel::new(), quiet()).await.unwrap();
+        let knobs = s.profile.knobs.clone();
+        let snap = s.run(&knobs, &opts(1000, Some(400.0)), None).await.unwrap();
+        let ol = snap.open_loop.unwrap();
+        assert_eq!(ol.arrivals, "poisson");
+        assert!(
+            (ol.intended_count as f64 - 400.0).abs() < 400.0 * 0.15,
+            "{ol:?}"
+        );
+        assert_eq!(ol.missed, 0, "{ol:?}");
+
+        let mut p = profile("memory://");
+        p.workload.shape = Some("ramp:0..400/1s".parse().unwrap());
+        p.knobs.concurrency = 8;
+        let s = Session::open(p, Cancel::new(), quiet()).await.unwrap();
+        let knobs = s.profile.knobs.clone();
+        let o = RunOptions::from_profile(&s.profile);
+        assert!(o.rate.is_none());
+        let snap = s.run(&knobs, &opts(1000, None), None).await.unwrap();
+        let ol = snap.open_loop.unwrap();
+        assert_eq!(ol.arrivals, "ramp");
+        assert!((ol.intended_count as i64 - 200).abs() <= 5, "{ol:?}");
+        assert!((ol.target_rate - 200.0).abs() < 5.0, "{ol:?}");
+    }
+
+    #[tokio::test]
+    async fn replays_a_cloudtrail_log_on_its_timing() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("trail.json");
+        let rec = |t: &str, name: &str, key: &str| {
+            format!(
+                r#"{{"eventTime":"2024-03-01T10:00:{t}Z","eventName":"{name}","requestParameters":{{"key":"{key}"}},"additionalEventData":{{"bytesTransferredIn":2048}}}}"#
+            )
+        };
+        let lines = [
+            rec("00.000", "PutObject", "k/1"),
+            rec("00.100", "GetObject", "k/1"),
+            rec("00.200", "HeadObject", "k/1"),
+            rec("00.250", "PutObject", "outside/2"),
+            rec("00.300", "ListObjectsV2", ""),
+            rec("09.000", "GetObject", "k/1"),
+        ];
+        std::fs::write(&f, lines.join("\n")).unwrap();
+        let mut p = profile("memory://");
+        let mut spec = crate::engine::replay::ReplaySpec::new(f);
+        spec.map_prefix = vec![("k/".into(), "$RUN/k/".into())];
+        p.workload.replay = Some(spec);
+        p.knobs.concurrency = 4;
+        let s = Session::open(p, Cancel::new(), quiet()).await.unwrap();
+        assert!(
+            s.warnings.iter().any(|w| w.contains("1 writes/deletes")),
+            "{:?}",
+            s.warnings
+        );
+        let knobs = s.profile.knobs.clone();
+        // (A warmup would replay the start of the log.)
+        let o = RunOptions {
+            warmup: Duration::ZERO,
+            ..opts(800, None)
+        };
+        let snap = s.run(&knobs, &o, None).await.unwrap();
+        let ol = snap.open_loop.clone().unwrap();
+        assert_eq!(ol.arrivals, "replay");
+        // The 9 s event is outside the 0.8 s window.
+        assert_eq!(ol.intended_count, 4, "{ol:?}");
+        assert_eq!(snap.summary.failed_ops, 0, "{:?}", snap.resilience);
+        let verbs: Vec<&str> = snap.verbs.iter().map(|v| v.verb.as_str()).collect();
+        assert_eq!(
+            verbs,
+            ["replay.list", "replay.read", "replay.stat", "replay.write"]
+        );
+        // The next window continues with the rest of the log.
+        assert_eq!(*s.replay_cursor.lock().unwrap(), 4);
+    }
+
+    #[tokio::test]
+    async fn lab_protocols_and_the_http2_preflight() {
+        use crate::net::HttpVersion;
+        let mut ok = Vec::new();
+        for (url, http, microscope) in [
+            ("lab://clean", HttpVersion::H2, false),
+            ("lab://clean", HttpVersion::H2, true),
+            ("lab://clean?proto=https", HttpVersion::Auto, false),
+            ("lab://clean?proto=h2", HttpVersion::H2, false),
+            ("lab://clean?proto=h2", HttpVersion::H2, true),
+        ] {
+            let mut p = profile(url);
+            p.knobs.http_version = http;
+            if microscope {
+                p.knobs.transport = crate::config::TransportMode::Microscope;
+            }
+            p.knobs.concurrency = 4;
+            let s = Session::open(p, Cancel::new(), quiet())
+                .await
+                .unwrap_or_else(|e| panic!("{url} {http:?} {microscope}: {e:#}"));
+            let knobs = s.profile.knobs.clone();
+            let snap = s.run(&knobs, &opts(300, None), None).await.unwrap();
+            assert_eq!(snap.summary.failed_ops, 0, "{url} {http:?}");
+            // (OpenDAL's own client negotiates HTTP/1.1 unless HTTP/2 is asked for.)
+            if http == HttpVersion::H2 || microscope {
+                assert!(
+                    snap.connections.http2_requests > 0,
+                    "{url} {http:?} {microscope}"
+                );
+            }
+            // Warmup took the dials; the cold start keeps their cost.
+            let cold = snap.connections.cold_start.as_ref().expect("cold start");
+            assert!(
+                cold.connections_count > 0 && cold.connect.p50 > 0.0,
+                "{cold:?}"
+            );
+            if url.contains("https") || url.contains("proto=h2") {
+                assert!(!snap.connections.tls_version.is_empty(), "{url}");
+            }
+            ok.push(url);
+        }
+        // A server without HTTP/2 is refused up front with a hint, not failed request by request.
+        let mut p = profile("lab://clean?proto=h1");
+        p.knobs.http_version = HttpVersion::H2;
+        let e = Session::open(p, Cancel::new(), quiet())
+            .await
+            .err()
+            .expect("refused");
+        let c = crate::errors::classify(&e, "s3");
+        assert_eq!(c.code, crate::errors::ErrorCode::NetHttp, "{e:#}");
+        assert!(c.hint.unwrap_or_default().contains("proto=h2c"));
+        assert!(crate::lab::LabProto::parse("h3").is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn microscope_uploads_end_at_the_kernel_acknowledgement() {
+        // The server thinks 20 ms before answering: the acknowledgement comes well before
+        // the first byte (on loopback with no delay they are indistinguishable).
+        let lab = crate::lab::LabServer::spawn(
+            "127.0.0.1:0",
+            crate::lab::LabConfig {
+                base_ttfb_delay: Duration::from_millis(20),
+                throttle_status_code: 503,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let mut p = lab.profile("b");
+        p.workload = profile("memory://").workload;
+        p.knobs.concurrency = 1;
+        p.knobs.transport = crate::config::TransportMode::Microscope;
+        p.workload.mix = vec![crate::config::OpSpec {
+            op: OpKind::Write {
+                size: crate::util::ByteSize::kib(512),
+            },
+            weight: 1,
+        }];
+        let s = Session::open(p, Cancel::new(), quiet()).await.unwrap();
+        let knobs = s.profile.knobs.clone();
+        s.run(&knobs, &opts(400, None), None).await.unwrap();
+        let rows = s.take_trace().unwrap();
+        let puts: Vec<_> = rows
+            .reqs
+            .iter()
+            .filter(|r| r.bytes_up >= 512 * 1024)
+            .collect();
+        assert!(!puts.is_empty());
+        let acked: Vec<_> = puts
+            .iter()
+            .filter_map(|r| {
+                r.detail
+                    .as_ref()
+                    .and_then(|d| Some((r, d.upload_acked_us?, d.send_buffered_us?)))
+            })
+            .collect();
+        assert!(
+            acked.len() * 2 >= puts.len(),
+            "{} of {}",
+            acked.len(),
+            puts.len()
+        );
+        for (r, at, buffered) in acked {
+            assert!(r.send_us >= buffered, "{r:?}");
+            assert!(at <= r.total_us, "{r:?}");
+        }
+        // Kernel fields beyond the smoothed RTT are kept.
+        assert!(
+            rows.reqs
+                .iter()
+                .any(|r| r.tcp.as_ref().is_some_and(|t| t.bytes_acked > 0))
+        );
+    }
 }

@@ -97,11 +97,64 @@ pub fn lab_ca_pem() -> &'static str {
     &lab_tls().ca_pem
 }
 
+/// The protocol a lab server speaks (`lab://NAME?proto=…`, design v5 §3, M6).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum LabProto {
+    /// Plain HTTP/1.1 and HTTP/2 with prior knowledge (h2c), detected per connection (the
+    /// default: `--http h1` and `--http h2` both work).
+    #[default]
+    H2c,
+    /// Plain HTTP/1.1 only.
+    H1,
+    /// TLS 1.3 with ALPN offering `h2` and `http/1.1`.
+    Https,
+    /// TLS 1.3 with ALPN preferring `h2` (`http/1.1` stays offered: oprobe's own setup
+    /// traffic — preflight, dataset, cleanup — uses OpenDAL's default HTTP/1.1 client).
+    /// `LabConfig::h2_only` makes a server that refuses every other protocol.
+    H2,
+}
+
+impl LabProto {
+    pub const ALL: [LabProto; 4] = [LabProto::H2c, LabProto::H1, LabProto::Https, LabProto::H2];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            LabProto::H2c => "h2c",
+            LabProto::H1 => "h1",
+            LabProto::Https => "https",
+            LabProto::H2 => "h2",
+        }
+    }
+
+    pub fn parse(s: &str) -> std::result::Result<Self, crate::errors::OprobeError> {
+        let l = s.trim().to_ascii_lowercase();
+        LabProto::ALL
+            .into_iter()
+            .find(|p| p.name() == l)
+            .ok_or_else(|| {
+                crate::input::invalid(format!("unknown lab protocol `{}`", s.trim()))
+                    .with_hint("use proto=h1, h2c (plain), https or h2 (TLS with ALPN)")
+            })
+    }
+
+    pub fn tls(self) -> bool {
+        matches!(self, LabProto::Https | LabProto::H2)
+    }
+
+    /// The server settings of this protocol.
+    pub fn apply(self, c: &mut LabConfig) {
+        c.enable_tls = self.tls();
+        c.enable_http2 = !matches!(self, LabProto::H1);
+    }
+}
+
 /// Fault profile for the lab server.
 #[derive(Clone, Debug, Default)]
 pub struct LabConfig {
     pub enable_tls: bool,
     pub enable_http2: bool,
+    /// With TLS: offer only `h2` in ALPN (clients that cannot speak HTTP/2 fail the handshake).
+    pub h2_only: bool,
     pub base_ttfb_delay: Duration,
     pub multipart_merge_delay: Duration,
     pub straggler_every_n: usize,
@@ -194,6 +247,7 @@ impl Scenario {
     pub fn config(self) -> LabConfig {
         let ms = Duration::from_millis;
         let base = LabConfig {
+            enable_http2: true,
             throttle_status_code: 503,
             min_part_size: 5 * 1024 * 1024,
             ..Default::default()
@@ -322,15 +376,23 @@ pub const LAB_BUCKET: &str = "lab";
 /// The process-wide lab server of `scenario`, started on first use on its own runtime thread
 /// (it lives as long as the process; `lab://NAME` targets resolve to it).
 pub fn shared(scenario: Scenario) -> Result<&'static LabHandle> {
+    shared_with(scenario, LabProto::default())
+}
+
+/// [`shared`] speaking `proto` (one server per scenario and protocol).
+pub fn shared_with(scenario: Scenario, proto: LabProto) -> Result<&'static LabHandle> {
     use std::sync::{Mutex, OnceLock};
-    static SERVERS: OnceLock<Mutex<HashMap<Scenario, &'static LabHandle>>> = OnceLock::new();
+    type Servers = HashMap<(Scenario, LabProto), &'static LabHandle>;
+    static SERVERS: OnceLock<Mutex<Servers>> = OnceLock::new();
     let mut m = SERVERS
         .get_or_init(Default::default)
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    if let Some(h) = m.get(&scenario) {
+    if let Some(h) = m.get(&(scenario, proto)) {
         return Ok(h);
     }
+    let mut config = scenario.config();
+    proto.apply(&mut config);
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::Builder::new()
         .name(format!("oprobe-lab-{}", scenario.name()))
@@ -348,7 +410,7 @@ pub fn shared(scenario: Scenario) -> Result<&'static LabHandle> {
                 }
             };
             rt.block_on(async move {
-                let res = LabServer::spawn("127.0.0.1:0", scenario.config()).await;
+                let res = LabServer::spawn("127.0.0.1:0", config).await;
                 let ok = res.is_ok();
                 let _ = tx.send(res);
                 if ok {
@@ -360,7 +422,7 @@ pub fn shared(scenario: Scenario) -> Result<&'static LabHandle> {
         .recv()
         .map_err(|_| anyhow::anyhow!("the lab server thread exited"))??;
     let h: &'static LabHandle = Box::leak(Box::new(handle));
-    m.insert(scenario, h);
+    m.insert((scenario, proto), h);
     Ok(h)
 }
 
@@ -1452,11 +1514,11 @@ impl LabServer {
 
         let tls_acceptor = if faults.enable_tls {
             let tls = lab_tls();
-            Some(build_tls_acceptor(
-                &tls.cert_pem,
-                &tls.key_pem,
-                faults.enable_http2,
-            )?)
+            Some(if faults.h2_only {
+                crate::net::tls::build_tls_acceptor_alpn(&tls.cert_pem, &tls.key_pem, &[b"h2"])?
+            } else {
+                build_tls_acceptor(&tls.cert_pem, &tls.key_pem, faults.enable_http2)?
+            })
         } else {
             None
         };

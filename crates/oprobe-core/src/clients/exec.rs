@@ -476,6 +476,7 @@ pub fn records(
                 service_op: None,
                 tls: None,
                 tcp: None,
+                detail: None,
             }
         };
     let down = if bytes_up > 0 { 0 } else { r.bytes };

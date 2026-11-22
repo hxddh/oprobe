@@ -29,8 +29,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::errors::ErrorCode;
 use crate::model::{
-    ClientInfo, OpBreakdownUs, OpRow, RUN_FORMAT, Report, ReqRow, Run, RunSpec, TcpRow, TlsRow,
-    WireProtocol,
+    ClientInfo, OpBreakdownUs, OpRow, RUN_FORMAT, Report, ReqDetail, ReqRow, Run, RunSpec, TcpRow,
+    TlsRow, WireProtocol,
 };
 
 const ZSTD_LEVEL: i32 = 3;
@@ -69,7 +69,7 @@ impl RunHeader {
     }
 }
 
-/// One slice of the run's timeline (per-second; stream MEAS adds sketches).
+/// One slice of the run's timeline: 1 s for the first ten minutes, then 10 s (design v5 §3).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct IntervalBlock {
     /// Start of the slice, seconds from the window start.
@@ -81,9 +81,49 @@ pub struct IntervalBlock {
     pub transferred_bytes: u64,
     pub p50_ms: f64,
     pub p99_ms: f64,
-    /// Requests in flight at the end of the slice (when measured).
+    /// Peak requests in flight in the slice (when measured).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inflight_count: Option<u64>,
+    #[serde(default)]
+    pub p90_ms: f64,
+    #[serde(default)]
+    pub p999_ms: f64,
+    #[serde(default)]
+    pub max_ms: f64,
+    #[serde(default)]
+    pub missed_arrivals_count: u64,
+    #[serde(default)]
+    pub new_connections_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_pct: Option<f64>,
+    /// Operations per heatmap latency row (the interval's latency sketch).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub latency_rows_count: Vec<u64>,
+}
+
+impl IntervalBlock {
+    /// The block of one timeline point.
+    pub fn of(p: &crate::trace::TimelinePoint) -> Self {
+        let len = if p.len_s > 0.0 { p.len_s } else { 1.0 };
+        Self {
+            t_s: p.t_s,
+            len_s: len,
+            ops_count: (p.ops_per_s * len).round().max(0.0) as u64,
+            errors_count: p.errors,
+            throttled_count: p.throttled,
+            transferred_bytes: (p.mib_per_s * len * 1024.0 * 1024.0).round().max(0.0) as u64,
+            p50_ms: p.p50_ms,
+            p99_ms: p.p99_ms,
+            inflight_count: (p.inflight_peak > 0).then_some(p.inflight_peak),
+            p90_ms: p.p90_ms,
+            p999_ms: p.p999_ms,
+            max_ms: p.max_ms,
+            missed_arrivals_count: p.missed_arrivals,
+            new_connections_count: p.new_connections,
+            cpu_pct: p.cpu_pct,
+            latency_rows_count: p.latency_rows_count.clone(),
+        }
+    }
 }
 
 /// Interned strings of one segment.
@@ -157,6 +197,8 @@ struct ReqColumns {
     /// Sparse: (row index, value).
     tls: Vec<(u32, TlsRow)>,
     tcp: Vec<(u32, TcpRow)>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    detail: Vec<(u32, ReqDetail)>,
 }
 
 /// One block of rows: a time slice of the run (columnar, interned strings).
@@ -169,82 +211,123 @@ pub struct Segment {
     reqs: ReqColumns,
 }
 
+/// Builds one [`Segment`] row by row (rows in any order; times are rebased when it is
+/// finished), so a streaming writer never holds owned copies of the rows.
+#[derive(Debug, Default)]
+pub struct SegmentBuilder {
+    strings: Interner,
+    ops: OpColumns,
+    op_t: Vec<i64>,
+    reqs: ReqColumns,
+    req_t: Vec<i64>,
+}
+
+impl SegmentBuilder {
+    pub fn push_op(&mut self, o: &OpRow) {
+        let s = &mut self.strings;
+        let oc = &mut self.ops;
+        oc.op_id.push(o.op_id);
+        oc.verb.push(s.id(&o.verb));
+        oc.key.push(s.id(&o.key));
+        self.op_t.push(o.t_us);
+        oc.latency_us.push(u32_sat(o.latency_us));
+        oc.bytes.push(o.bytes);
+        oc.ok.push(o.ok);
+        oc.error_code.push(o.error_code);
+        oc.error.push(s.opt(o.error.as_deref()));
+        oc.throttled.push(o.throttled);
+        oc.attempts.push(o.attempts);
+        let b = &o.breakdown;
+        oc.breakdown.push(
+            [
+                b.queue_us,
+                b.cache_us,
+                b.backend_us,
+                b.retry_us,
+                b.client_us,
+            ]
+            .map(u32_sat),
+        );
+        oc.requests.push(o.requests);
+        oc.await_tree.push(s.opt(o.await_tree.as_deref()));
+    }
+
+    pub fn push_req(&mut self, r: &ReqRow) {
+        let s = &mut self.strings;
+        let rc = &mut self.reqs;
+        let i = rc.op_id.len();
+        self.req_t.push(r.t_us);
+        rc.op_id.push(r.op_id);
+        rc.attempt.push(r.attempt);
+        rc.api.push(s.id(&r.api));
+        rc.method.push(s.id(&r.method));
+        rc.status.push(r.status);
+        rc.protocol.push(r.protocol);
+        rc.reused.push(r.reused);
+        rc.conn_id.push(r.conn_id);
+        rc.remote.push(r.remote.map(|a| s.id(&a.to_string())));
+        rc.stages.push(
+            [
+                r.queue_us, r.dns_us, r.tcp_us, r.proxy_us, r.tls_us, r.send_us, r.ttfb_us,
+                r.body_us, r.stall_us, r.total_us,
+            ]
+            .map(u32_sat),
+        );
+        rc.bytes_up.push(r.bytes_up);
+        rc.bytes_down.push(r.bytes_down);
+        rc.request_id.push(s.opt(r.request_id.as_deref()));
+        rc.retry_after_ms.push(r.retry_after_ms);
+        rc.error_code.push(r.error_code);
+        rc.error.push(s.opt(r.error.as_deref()));
+        if let Some(t) = &r.tls {
+            rc.tls.push((i as u32, (**t).clone()));
+        }
+        if let Some(t) = &r.tcp {
+            rc.tcp.push((i as u32, (**t).clone()));
+        }
+        if let Some(x) = &r.detail {
+            rc.detail.push((i as u32, (**x).clone()));
+        }
+    }
+
+    /// Rows (operations plus requests) so far.
+    pub fn rows(&self) -> usize {
+        self.op_t.len() + self.req_t.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rows() == 0
+    }
+
+    /// The segment (times rebased on the earliest row); the builder is left empty.
+    pub fn finish(&mut self) -> Segment {
+        let b = std::mem::take(self);
+        let base_us = b.op_t.iter().chain(&b.req_t).copied().min().unwrap_or(0);
+        let rel = |t: i64| u32_sat((t - base_us).max(0) as u64);
+        let mut ops = b.ops;
+        ops.t_us = b.op_t.iter().map(|t| rel(*t)).collect();
+        let mut reqs = b.reqs;
+        reqs.t_us = b.req_t.iter().map(|t| rel(*t)).collect();
+        Segment {
+            base_us,
+            strings: b.strings.table,
+            ops,
+            reqs,
+        }
+    }
+}
+
 impl Segment {
     /// Encode rows (any order) into one segment.
     pub fn encode(ops: &[OpRow], reqs: &[ReqRow]) -> Self {
-        let base_us = ops
-            .iter()
-            .map(|o| o.t_us)
-            .chain(reqs.iter().map(|r| r.t_us))
-            .min()
-            .unwrap_or(0);
-        let rel = |t: i64| u32_sat((t - base_us).max(0) as u64);
-        let mut s = Interner::default();
-        let mut oc = OpColumns::default();
+        let mut b = SegmentBuilder::default();
         for o in ops {
-            oc.op_id.push(o.op_id);
-            oc.verb.push(s.id(&o.verb));
-            oc.key.push(s.id(&o.key));
-            oc.t_us.push(rel(o.t_us));
-            oc.latency_us.push(u32_sat(o.latency_us));
-            oc.bytes.push(o.bytes);
-            oc.ok.push(o.ok);
-            oc.error_code.push(o.error_code);
-            oc.error.push(s.opt(o.error.as_deref()));
-            oc.throttled.push(o.throttled);
-            oc.attempts.push(o.attempts);
-            let b = &o.breakdown;
-            oc.breakdown.push(
-                [
-                    b.queue_us,
-                    b.cache_us,
-                    b.backend_us,
-                    b.retry_us,
-                    b.client_us,
-                ]
-                .map(u32_sat),
-            );
-            oc.requests.push(o.requests);
-            oc.await_tree.push(s.opt(o.await_tree.as_deref()));
+            b.push_op(o);
         }
-        let mut rc = ReqColumns::default();
-        for (i, r) in reqs.iter().enumerate() {
-            rc.t_us.push(rel(r.t_us));
-            rc.op_id.push(r.op_id);
-            rc.attempt.push(r.attempt);
-            rc.api.push(s.id(&r.api));
-            rc.method.push(s.id(&r.method));
-            rc.status.push(r.status);
-            rc.protocol.push(r.protocol);
-            rc.reused.push(r.reused);
-            rc.conn_id.push(r.conn_id);
-            rc.remote.push(r.remote.map(|a| s.id(&a.to_string())));
-            rc.stages.push(
-                [
-                    r.queue_us, r.dns_us, r.tcp_us, r.proxy_us, r.tls_us, r.send_us, r.ttfb_us,
-                    r.body_us, r.stall_us, r.total_us,
-                ]
-                .map(u32_sat),
-            );
-            rc.bytes_up.push(r.bytes_up);
-            rc.bytes_down.push(r.bytes_down);
-            rc.request_id.push(s.opt(r.request_id.as_deref()));
-            rc.retry_after_ms.push(r.retry_after_ms);
-            rc.error_code.push(r.error_code);
-            rc.error.push(s.opt(r.error.as_deref()));
-            if let Some(t) = &r.tls {
-                rc.tls.push((i as u32, (**t).clone()));
-            }
-            if let Some(t) = &r.tcp {
-                rc.tcp.push((i as u32, (**t).clone()));
-            }
+        for r in reqs {
+            b.push_req(r);
         }
-        Segment {
-            base_us,
-            strings: s.table,
-            ops: oc,
-            reqs: rc,
-        }
+        b.finish()
     }
 
     /// Operation and request rows of this segment.
@@ -371,6 +454,7 @@ impl Segment {
                 error: sto(r.error[i])?,
                 tls: None,
                 tcp: None,
+                detail: None,
             });
         }
         for (i, v) in &r.tls {
@@ -381,6 +465,11 @@ impl Segment {
         for (i, v) in &r.tcp {
             if let Some(q) = reqs.get_mut(*i as usize) {
                 q.tcp = Some(Box::new(v.clone()));
+            }
+        }
+        for (i, v) in &r.detail {
+            if let Some(q) = reqs.get_mut(*i as usize) {
+                q.detail = Some(Box::new(v.clone()));
             }
         }
         Ok((ops, reqs))
@@ -593,17 +682,7 @@ pub fn write_run(path: &Path, run: &Run) -> Result<PathBuf> {
     );
     let mut w = RunFileWriter::create(path, &header)?;
     for p in &run.report.timeline {
-        w.write_interval(&IntervalBlock {
-            t_s: p.t_s,
-            len_s: 1.0,
-            ops_count: p.ops_per_s.round().max(0.0) as u64,
-            errors_count: p.errors,
-            throttled_count: p.throttled,
-            transferred_bytes: (p.mib_per_s * 1024.0 * 1024.0).round().max(0.0) as u64,
-            p50_ms: p.p50_ms,
-            p99_ms: p.p99_ms,
-            inflight_count: None,
-        })?;
+        w.write_interval(&IntervalBlock::of(p))?;
     }
     // Segments are time slices: rows sorted by start time (a run's rows are; others are
     // sorted here).
@@ -640,6 +719,201 @@ pub fn write_run(path: &Path, run: &Run) -> Result<PathBuf> {
         ri = re;
     }
     w.finish(&run.report)
+}
+
+/// Rows the in-memory sample keeps while a run streams its rows to the run file (the file
+/// holds them all, up to `trace.max_requests`): the report's row-based views use this sample.
+pub const STREAM_MEMORY_ROWS: usize = 100_000;
+
+/// Segments queued for the writer thread at most (back-pressure beyond).
+const STREAM_QUEUE: usize = 4;
+
+#[derive(Debug, Default)]
+struct StreamState {
+    seg: SegmentBuilder,
+    rows_kept: u64,
+    stats: crate::trace::SamplingStats,
+    closed: bool,
+    /// Thinning past the cap: the level (stride 2^level) and the rows kept at it.
+    level: u32,
+    level_rows: u64,
+}
+
+/// A run file written while the run is in progress (design v5 §2, fixes M3): the recorder
+/// hands it every row of the measurement window ([`crate::trace::RowSink`]); rows are packed
+/// into columnar segments and a writer thread compresses and appends them, so memory stays
+/// bounded by a few segments whatever the run's length. Up to `max_rows` rows are kept;
+/// beyond that every failed or throttled operation is still kept and the rest are thinned
+/// (every 2nd, 4th, … operation, an eighth of the cap per level), with all of an
+/// operation's requests or none.
+pub struct RunFileStream {
+    path: PathBuf,
+    max_rows: u64,
+    state: std::sync::Mutex<StreamState>,
+    tx: std::sync::Mutex<Option<std::sync::mpsc::SyncSender<Segment>>>,
+    thread: std::sync::Mutex<Option<std::thread::JoinHandle<Result<RunFileWriter>>>>,
+}
+
+impl std::fmt::Debug for RunFileStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RunFileStream")
+            .field("path", &self.path)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RunFileStream {
+    /// Start `path` (through `<path>.tmp`) with its header.
+    pub fn create(
+        path: &Path,
+        header: &RunHeader,
+        max_rows: usize,
+    ) -> Result<std::sync::Arc<Self>> {
+        let mut w = RunFileWriter::create(path, header)?;
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Segment>(STREAM_QUEUE);
+        let thread = std::thread::Builder::new()
+            .name("oprobe-runfile".into())
+            .spawn(move || -> Result<RunFileWriter> {
+                for seg in rx {
+                    w.write_segment(&seg)?;
+                }
+                Ok(w)
+            })?;
+        Ok(std::sync::Arc::new(Self {
+            path: path.to_owned(),
+            max_rows: max_rows.max(1) as u64,
+            state: Default::default(),
+            tx: std::sync::Mutex::new(Some(tx)),
+            thread: std::sync::Mutex::new(Some(thread)),
+        }))
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn send(&self, seg: Segment) {
+        let tx = self.tx.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(tx) = tx {
+            // A failed writer reports its error at `finish`.
+            let _ = tx.send(seg);
+        }
+    }
+
+    /// What the file holds: kept / seen operations and requests.
+    pub fn sampling(&self) -> crate::trace::SamplingStats {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).stats
+    }
+
+    /// The report's `run.trace` and `sampling` describe the file's rows.
+    pub fn describe(&self, report: &mut Report) {
+        let s = self.sampling();
+        report.sampling = crate::model::Sampling::from_stats(&s);
+        report.run.trace = crate::model::TraceInfo {
+            max_requests_count: self.max_rows,
+            ops_seen_count: s.seen_ops,
+            ops_kept_count: s.kept_ops,
+            requests_seen_count: s.seen_requests,
+            requests_kept_count: s.kept_requests,
+            sample_ratio: if s.seen_requests == 0 {
+                1.0
+            } else {
+                s.kept_requests as f64 / s.seen_requests as f64
+            },
+        };
+        report.run.sampled = s.kept_ops < s.seen_ops || s.kept_requests < s.seen_requests;
+    }
+
+    /// Write the intervals and the report, close the stream and move the file into place.
+    pub fn finish(&self, report: &Report) -> Result<PathBuf> {
+        let rest = {
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            st.closed = true;
+            (!st.seg.is_empty()).then(|| st.seg.finish())
+        };
+        if let Some(seg) = rest {
+            self.send(seg);
+        }
+        drop(self.tx.lock().unwrap_or_else(|e| e.into_inner()).take());
+        let thread = self
+            .thread
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .context("the run file was already finished")?;
+        let mut w = thread
+            .join()
+            .map_err(|_| anyhow::anyhow!("the run file writer panicked"))??;
+        for p in &report.timeline {
+            w.write_interval(&IntervalBlock::of(p))?;
+        }
+        w.finish(report)
+    }
+
+    fn keep(&self, st: &mut StreamState, op: &OpRow, rows: u64) -> bool {
+        if !op.ok || op.throttled {
+            return true;
+        }
+        if st.rows_kept + rows <= self.max_rows {
+            return true;
+        }
+        // Past the cap: thinning levels, each holding up to an eighth of the cap with twice
+        // the previous stride (every 2nd, 4th, 8th … operation), so the file keeps covering
+        // the whole run while growing only logarithmically with its length.
+        let budget = (self.max_rows / 8).max(1);
+        if st.level_rows + rows > budget {
+            st.level += 1;
+            st.level_rows = 0;
+        }
+        let stride = 1u64 << st.level.min(62);
+        let pick = op.op_id.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40 & (stride - 1) == 0;
+        if pick {
+            st.level_rows += rows;
+        }
+        pick
+    }
+}
+
+impl crate::trace::RowSink for RunFileStream {
+    fn on_op(&self, op: &OpRow, reqs: &[ReqRow]) {
+        let full = {
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if st.closed {
+                return;
+            }
+            st.stats.seen_ops += 1;
+            st.stats.seen_requests += reqs.len() as u64;
+            let rows = 1 + reqs.len() as u64;
+            if !self.keep(&mut st, op, rows) {
+                return;
+            }
+            if !op.ok || op.throttled {
+                st.stats.always_kept_ops += 1;
+            }
+            st.stats.kept_ops += 1;
+            st.stats.kept_requests += reqs.len() as u64;
+            st.rows_kept += rows;
+            st.seg.push_op(op);
+            for r in reqs {
+                st.seg.push_req(r);
+            }
+            (st.seg.rows() >= SEGMENT_ROWS).then(|| st.seg.finish())
+        };
+        if let Some(seg) = full {
+            self.send(seg);
+        }
+    }
+
+    fn on_unscoped(&self, req: &ReqRow) {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if st.closed || st.rows_kept >= self.max_rows {
+            return;
+        }
+        st.stats.seen_requests += 1;
+        st.stats.kept_requests += 1;
+        st.rows_kept += 1;
+        st.seg.push_req(req);
+    }
 }
 
 /// Read a whole `oprobe.run/5` file into a [`Run`] (rows sorted by start time).
@@ -760,5 +1034,61 @@ mod tests {
         }
         assert!(!path.exists());
         assert!(!path.with_extension("oprobe.tmp").exists());
+    }
+
+    #[test]
+    fn a_streamed_run_file_holds_every_row_and_thins_past_its_cap() {
+        use crate::trace::RowSink;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.oprobe");
+        let base = crate::report::fixture::run();
+        let header = RunHeader::new("x", base.report.spec.clone(), ClientInfo::opendal());
+        let op0 = base.ops[0].clone();
+        let req0 = base
+            .requests_of(op0.op_id)
+            .into_iter()
+            .next()
+            .unwrap()
+            .clone();
+        // Rows of 2 (op + request); a cap of 20_000 rows holds 10_000 operations.
+        let st = RunFileStream::create(&path, &header, 20_000).unwrap();
+        for i in 0..30_000u64 {
+            let mut o = op0.clone();
+            o.op_id = i + 1;
+            o.t_us = i as i64 * 100;
+            o.ok = i % 1000 != 7;
+            let mut r = req0.clone();
+            r.op_id = o.op_id;
+            r.t_us = o.t_us;
+            st.on_op(&o, std::slice::from_ref(&r));
+        }
+        let s = st.sampling();
+        assert_eq!(s.seen_ops, 30_000);
+        assert!(s.kept_ops >= 10_000 && s.kept_ops < 20_000, "{s:?}");
+        assert_eq!(s.kept_requests, s.kept_ops);
+        let mut report = base.report.clone();
+        st.describe(&mut report);
+        assert!(report.run.sampled);
+        assert_eq!(report.sampling.seen_ops_count, 30_000);
+        let out = st.finish(&report).unwrap();
+        assert_eq!(out, path);
+        assert!(!path.with_extension("oprobe.tmp").exists());
+        let back = read_run(std::fs::File::open(&path).unwrap()).unwrap();
+        assert_eq!(back.ops.len() as u64, s.kept_ops);
+        assert_eq!(back.reqs.len() as u64, s.kept_requests);
+        // Every failed operation was kept, past the cap too.
+        assert_eq!(back.ops.iter().filter(|o| !o.ok).count(), 30);
+        // The first 10_000 operations are all there, with their requests.
+        assert!((1..=10_000).all(|id| back.op(id).is_some()));
+        assert_eq!(back.report.sampling, report.sampling);
+        let mut rd = RunFileReader::open(&path).unwrap();
+        let mut intervals = 0;
+        while let Some(b) = rd.next_block().unwrap() {
+            if let Block::Interval(i) = b {
+                assert!(i.len_s > 0.0);
+                intervals += 1;
+            }
+        }
+        assert_eq!(intervals, report.timeline.len());
     }
 }

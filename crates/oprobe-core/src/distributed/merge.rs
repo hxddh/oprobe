@@ -258,6 +258,8 @@ fn merge_connections(c: &[&ConnStats]) -> ConnStats {
         proxy_connect: q(|x| x.proxy_connect),
         tls: q(|x| x.tls),
         peak_inflight_requests: c.iter().map(|x| x.peak_inflight_requests).sum(),
+        // Every worker dials its own first connection; the first worker's sample stands for all.
+        cold_start: c.iter().find_map(|x| x.cold_start.clone()),
     }
 }
 

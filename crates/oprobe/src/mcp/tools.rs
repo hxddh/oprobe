@@ -915,6 +915,7 @@ fn workload_args(w: &WorkloadIn) -> anyhow::Result<(WorkloadInput, KnobInput, Co
         persist_dataset: false,
         no_verify: false,
         keep_data: false,
+        ..Default::default()
     };
     let ka = KnobInput {
         concurrency: w.concurrency,

@@ -31,6 +31,7 @@
 //! operation scope are aggregated and sampled like the others, and memory stays bounded
 //! ([`Config::max_rows`]).
 
+pub mod dims;
 pub mod error;
 pub mod layer;
 pub mod log;
@@ -50,8 +51,8 @@ use std::sync::Arc;
 pub use layer::{InProcessObserveLayer, TraceContextLayer};
 pub use log::{DEFAULT_MAX_REQUESTS, TraceLog, TraceRows};
 pub use record::{Api, BillingClass, Protocol, RequestRecord, RequestTiming, classify_http};
-pub use recorder::{Budget, DialRecord, Exporter, InflightGuard, OpCompletion, Recorder};
-pub use rows::{OpBreakdownUs, OpRow, ReqRow, TcpRow, TlsRow, TraceInfo, WireProtocol};
+pub use recorder::{Budget, DialRecord, Exporter, InflightGuard, OpCompletion, Recorder, RowSink};
+pub use rows::{OpBreakdownUs, OpRow, ReqDetail, ReqRow, TcpRow, TlsRow, TraceInfo, WireProtocol};
 pub use sample::{OpSampler, SampleConfig, SamplingStats};
 pub use scope::{OpScope, ScopePropagatingExecutor};
 pub use snapshot::*;

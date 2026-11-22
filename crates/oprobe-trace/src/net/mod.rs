@@ -5,6 +5,7 @@ pub mod dial;
 pub mod fidelity;
 pub mod probe;
 pub mod proxy;
+pub mod signals;
 pub mod stats;
 pub mod tcpinfo;
 pub mod tls;

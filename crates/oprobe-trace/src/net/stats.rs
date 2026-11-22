@@ -152,6 +152,7 @@ mod tests {
                 service_op: Some("GetObject"),
                 tls: None,
                 tcp: None,
+                detail: None,
             },
             1,
             t,

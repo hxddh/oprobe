@@ -50,6 +50,11 @@ impl From<WorkloadArgs> for i::WorkloadInput {
             persist_dataset: a.persist_dataset,
             no_verify: a.no_verify,
             keep_data: a.keep_data,
+            arrivals: a.arrivals,
+            shape: a.shape,
+            replay: a.replay,
+            speed: a.speed,
+            map_prefix: a.map_prefix,
         }
     }
 }
