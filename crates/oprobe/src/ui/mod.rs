@@ -51,6 +51,7 @@ pub fn run_gui() -> std::process::ExitCode {
         ..Default::default()
     };
     // `run_app` returns `ExitCode` on macOS / Windows and `glib::ExitCode` on Linux.
+    #[cfg_attr(not(target_os = "linux"), allow(clippy::useless_conversion))]
     let code: std::process::ExitCode = platform::run_app(
         platform::AppSource::Rust(platform::Root::of::<App>()),
         options,
