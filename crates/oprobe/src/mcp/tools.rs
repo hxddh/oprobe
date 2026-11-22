@@ -2278,10 +2278,10 @@ fn explain_run(st: &Arc<State>, a: ExplainIn) -> anyhow::Result<Reply> {
         if let Some(Value::Object(sl)) = m.get_mut("slowest") {
             // The slowest operations name object keys (untrusted data): full detail only.
             sl.remove("ops");
-            if let Some(Value::Object(at)) = sl.get_mut("attribution") {
-                if let Some(Value::Array(f)) = at.get_mut("factors") {
-                    f.truncate(5);
-                }
+            if let Some(Value::Object(at)) = sl.get_mut("attribution")
+                && let Some(Value::Array(f)) = at.get_mut("factors")
+            {
+                f.truncate(5);
             }
         }
         if let Some(Value::Array(fs)) = m.get_mut("findings") {

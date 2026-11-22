@@ -344,7 +344,7 @@ pub fn ask(run_id: &str, question: &str, report: &Value) -> AskOut {
         })
         .filter(|(n, _)| *n > 0)
         .collect();
-    scored.sort_by(|a, b| b.0.cmp(&a.0));
+    scored.sort_by_key(|t| std::cmp::Reverse(t.0));
     let mut chosen: Vec<&Topic> = scored.iter().take(3).map(|(_, t)| *t).collect();
     if chosen.is_empty() {
         chosen.push(&TOPICS[0]);
