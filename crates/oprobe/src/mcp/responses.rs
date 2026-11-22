@@ -343,3 +343,215 @@ mod tests {
         assert!(!doc["error"]["message"].as_str().unwrap().contains("IGNORE"));
     }
 }
+
+/// Split a shell command written by `shell_quote` (single quotes, `'\''` escapes).
+fn shell_split(cmd: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_quote = false;
+    let mut any = false;
+    for c in cmd.chars() {
+        match c {
+            '\'' => {
+                in_quote = !in_quote;
+                any = true;
+            }
+            c if c.is_whitespace() && !in_quote => {
+                if any || !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+                any = false;
+            }
+            '\\' if !in_quote => {}
+            c => cur.push(c),
+        }
+    }
+    if any || !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// The MCP call equivalent to an `oprobe …` command, when there is one (C9: every `next` step
+/// carries its MCP call).
+pub fn mcp_call_of(cli: &str) -> Option<(&'static str, Value)> {
+    use serde_json::json;
+    let w = shell_split(cli);
+    if w.first().map(String::as_str) != Some("oprobe") {
+        return None;
+    }
+    let args: Vec<&str> = w[1..].iter().map(String::as_str).collect();
+    let pos: Vec<&str> = {
+        // Positional words, skipping `--flag value` pairs (flags we know take no value aside).
+        let mut v = Vec::new();
+        let mut i = 0;
+        while i < args.len() {
+            let a = args[i];
+            if a.starts_with("--") {
+                let boolean = matches!(
+                    a,
+                    "--yes" | "--all" | "--read-only" | "--dry-run" | "--anonymous" | "--insecure"
+                );
+                i += if a.contains('=') || boolean { 1 } else { 2 };
+                continue;
+            }
+            if a.starts_with('-') && a.len() == 2 {
+                i += 2;
+                continue;
+            }
+            v.push(a);
+            i += 1;
+        }
+        v
+    };
+    let flag = |name: &str| -> Option<String> {
+        args.iter().enumerate().find_map(|(i, a)| {
+            if *a == name {
+                args.get(i + 1).map(|s| (*s).to_owned())
+            } else {
+                a.strip_prefix(&format!("{name}=")).map(str::to_owned)
+            }
+        })
+    };
+    let flags = |name: &str| -> Vec<String> {
+        args.iter()
+            .enumerate()
+            .filter(|(_, a)| **a == name)
+            .filter_map(|(i, _)| args.get(i + 1).map(|s| (*s).to_owned()))
+            .collect()
+    };
+    let p = |i: usize| pos.get(i).map(|s| (*s).to_owned());
+    Some(match pos.first().copied()? {
+        "run" => match flag("--from") {
+            Some(from) => ("start_run", json!({ "from": from, "set": flags("--set") })),
+            None => ("plan_run", json!({ "target": p(1)? })),
+        },
+        "tune" => ("start_tune", json!({ "target": p(1)? })),
+        "fix" => match flag("--from") {
+            Some(from) => ("recommend_config", json!({ "from": from })),
+            None => ("recommend_config", json!({ "target": p(1)? })),
+        },
+        "verify" => match p(2) {
+            Some(code) => ("verify_finding", json!({ "run": p(1)?, "code": code })),
+            None => ("verify_finding", json!({ "run": p(1)? })),
+        },
+        "explain" => ("explain_run", json!({ "run": p(1)? })),
+        "analyze" => ("analyze_run", json!({ "run": p(1)? })),
+        "compare" => (
+            "compare_runs",
+            json!({ "baseline": p(1)?, "candidate": p(2).unwrap_or_else(|| "last".into()) }),
+        ),
+        "doctor" => ("doctor", json!({ "target": p(1)? })),
+        "probe" => ("probe_endpoint", json!({ "endpoint": p(1)? })),
+        "cleanup" => ("cleanup", json!({ "target": p(1)? })),
+        "runs" => match p(1)?.as_str() {
+            "show" => ("get_run", json!({ "run": p(2)? })),
+            "list" => ("list_runs", json!({})),
+            _ => return None,
+        },
+        "target" => match p(1)?.as_str() {
+            "add" => {
+                let mut a = json!({ "name": p(2)?, "url": p(3)? });
+                if let Some(r) = flag("--region") {
+                    a["region"] = r.into();
+                }
+                ("save_target", a)
+            }
+            "sample" => ("sample_objects", json!({ "target": p(2)? })),
+            "test" => ("doctor", json!({ "target": p(2)? })),
+            "list" => ("list_targets", json!({})),
+            "discover" => ("discover_targets", json!({})),
+            _ => return None,
+        },
+        _ => return None,
+    })
+}
+
+/// Give every `next` step of a result its MCP call where the CLI command has one, and replace a
+/// literal `RUN` placeholder with the result's run id (C9).
+pub fn fill_next(v: &mut Value) {
+    let run_id = v.get("run_id").and_then(Value::as_str).map(str::to_owned);
+    let fill = |steps: &mut Value| {
+        let Some(a) = steps.as_array_mut() else {
+            return;
+        };
+        for s in a {
+            let Some(o) = s.as_object_mut() else { continue };
+            if let (Some(id), Some(Value::String(cli))) = (&run_id, o.get_mut("cli")) {
+                let replaced: Vec<String> = cli
+                    .split(' ')
+                    .map(|w| if w == "RUN" { id.clone() } else { w.to_owned() })
+                    .collect();
+                *cli = replaced.join(" ");
+            }
+            if o.get("mcp").is_some_and(|m| !m.is_null()) {
+                continue;
+            }
+            let Some(cli) = o.get("cli").and_then(Value::as_str) else {
+                continue;
+            };
+            if cli.contains('<') {
+                continue;
+            }
+            if let Some((tool, arguments)) = mcp_call_of(cli) {
+                o.insert(
+                    "mcp".into(),
+                    serde_json::json!({ "tool": tool, "arguments": arguments }),
+                );
+            }
+        }
+    };
+    if let Some(n) = v.get_mut("next") {
+        fill(n);
+    }
+    if let Some(n) = v.pointer_mut("/result/next") {
+        fill(n);
+    }
+    if let Some(n) = v.pointer_mut("/job/next") {
+        fill(n);
+    }
+}
+
+#[cfg(test)]
+mod next_tests {
+    use super::*;
+
+    #[test]
+    fn cli_commands_map_to_mcp_calls() {
+        let c = |s: &str| mcp_call_of(s).map(|(t, a)| (t, a.to_string()));
+        assert_eq!(
+            c("oprobe target add prod 's3://b/p' --region us-east-1"),
+            Some((
+                "save_target",
+                r#"{"name":"prod","region":"us-east-1","url":"s3://b/p"}"#.into()
+            ))
+        );
+        assert_eq!(
+            c("oprobe run --from 20260101-000000-abcd --set concurrency=8 --set http=h2"),
+            Some((
+                "start_run",
+                r#"{"from":"20260101-000000-abcd","set":["concurrency=8","http=h2"]}"#.into()
+            ))
+        );
+        assert_eq!(
+            c("oprobe fix lab://demo -d 10s").unwrap().0,
+            "recommend_config"
+        );
+        assert_eq!(
+            c("oprobe verify r1 throttling").unwrap().1,
+            r#"{"code":"throttling","run":"r1"}"#
+        );
+        assert_eq!(c("oprobe compare last~1 r2").unwrap().0, "compare_runs");
+        assert_eq!(c("oprobe self-update"), None);
+        assert_eq!(c("aws s3 ls"), None);
+        let mut v = serde_json::json!({"run_id": "r9", "next": [
+            {"description": "x", "cli": "oprobe explain RUN"},
+            {"description": "y", "cli": "oprobe doctor prod", "mcp": {"tool": "doctor", "arguments": {}}}
+        ]});
+        fill_next(&mut v);
+        assert_eq!(v["next"][0]["cli"], "oprobe explain r9");
+        assert_eq!(v["next"][0]["mcp"]["tool"], "explain_run");
+        assert_eq!(v["next"][0]["mcp"]["arguments"]["run"], "r9");
+        assert_eq!(v["next"][1]["mcp"]["arguments"], serde_json::json!({}));
+    }
+}

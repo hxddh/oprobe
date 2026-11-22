@@ -520,7 +520,7 @@ pub struct EstimateOut {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub usd_per_request: Option<f64>,
+    pub per_request_usd: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub estimated_cost_usd: Option<f64>,
     pub estimated_requests_count: u64,
@@ -1010,6 +1010,7 @@ pub async fn call(
     // Whatever a result quotes from outside oprobe is escaped and bounded (S3).
     r.map(|mut r| {
         security::sanitize(&mut r.structured);
+        super::responses::fill_next(&mut r.structured);
         r
     })
     .map_err(err)
@@ -2430,7 +2431,7 @@ async fn estimate_cost(st: &Arc<State>, a: PlanIn) -> anyhow::Result<Reply> {
     let out = EstimateOut {
         applicable: price.is_some(),
         provider: price.and(provider),
-        usd_per_request: price,
+        per_request_usd: price,
         estimated_cost_usd: p.plan.estimated_cost_usd,
         estimated_requests_count: p.plan.estimated_requests_count,
         estimated_bytes: p.plan.estimated_bytes,
