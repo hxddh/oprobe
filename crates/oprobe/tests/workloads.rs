@@ -422,11 +422,15 @@ fn a_streamed_run_keeps_memory_flat() {
             "{kept} of {seen}"
         );
     }
-    // 4.x: ~1 KB per kept row on top of the process (hundreds of MB here).
-    let budget = 220.0 + (seen.min(1_000_000) as f64) * 50.0 / 1e6;
+    // 4.x held ~1 KB per row on top of the process (~150 MiB here): allow half of that
+    // growth (measured: ~150 MiB flat for 400k requests). Too few requests (a starved
+    // machine) cannot tell the two apart.
     eprintln!("peak RSS {rss:.0} MiB, {seen} requests seen, {kept} in the run file");
-    assert!(
-        rss < budget,
-        "peak RSS {rss:.0} MiB for {seen} requests (budget {budget:.0} MiB)"
-    );
+    if seen >= 200_000 {
+        let budget = 160.0 + 0.5 * seen.min(1_000_000) as f64 / 1024.0;
+        assert!(
+            rss < budget,
+            "peak RSS {rss:.0} MiB for {seen} requests (budget {budget:.0} MiB)"
+        );
+    }
 }
