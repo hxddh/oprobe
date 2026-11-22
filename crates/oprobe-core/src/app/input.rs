@@ -292,6 +292,10 @@ pub struct TuneSearch {
     pub boundary_repeats: usize,
     /// In-flight headroom kept below the throttling ceiling (default 0.15)
     pub headroom_ratio: Option<f64>,
+    /// Posterior chance of exceeding the throttle budget the recommendation may carry
+    /// (default 0.05)
+    #[serde(default)]
+    pub risk_ratio: Option<f64>,
 }
 
 impl Default for TuneSearch {
@@ -306,6 +310,7 @@ impl Default for TuneSearch {
             max_throttle_ratio: Default::default(),
             boundary_repeats: tune_defaults::BOUNDARY_REPEATS,
             headroom_ratio: Default::default(),
+            risk_ratio: Default::default(),
         }
     }
 }

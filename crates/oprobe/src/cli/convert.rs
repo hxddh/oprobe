@@ -121,6 +121,7 @@ impl From<TuneSearchArgs> for i::TuneSearch {
             max_throttle_ratio: a.max_throttle_ratio,
             boundary_repeats: a.boundary_repeats,
             headroom_ratio: a.headroom_ratio,
+            risk_ratio: a.risk,
         }
     }
 }

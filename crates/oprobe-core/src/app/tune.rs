@@ -234,6 +234,7 @@ pub fn options_for(
             max_throttle_ratio: s.max_throttle_ratio.or(profile.sla.max_throttle_rate),
             boundary_repeats: s.boundary_repeats,
             headroom_ratio: s.headroom_ratio,
+            risk_ratio: s.risk_ratio,
         },
         profile.workload.rate,
     )

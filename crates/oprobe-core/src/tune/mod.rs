@@ -16,6 +16,7 @@
 //!   negative "improvement". The cost of the safety margin (best measured vs recommended)
 //!   and the Pareto front of the trials are reported.
 
+pub mod bayes;
 pub mod codegen;
 pub mod recommend;
 
@@ -26,6 +27,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::analysis::capacity::{self, Capacity, Window};
+use crate::analysis::hypothesis::HypothesisKind as capacity_kind;
 use crate::analysis::cost::cost_report;
 use crate::config::{Access, Knobs, OpKind, TransportMode};
 use crate::engine::{RunOptions, Session};
@@ -92,6 +94,11 @@ pub struct TuneOptions {
     pub headroom_ratio: f64,
     /// A remembered capacity of this target and workload (`<data>/capacity.toml`).
     pub prior: Option<Capacity>,
+    /// Posterior chance of exceeding the throttle budget a recommendation may carry
+    /// ([`bayes`]; `--risk`).
+    pub risk_ratio: f64,
+    /// Trials the Bayesian stage may add after the concurrency search.
+    pub bayes_trials: usize,
 }
 
 impl TuneOptions {
@@ -109,9 +116,14 @@ impl TuneOptions {
             boundary_repeats: d.tune.boundary_repeats,
             headroom_ratio: d.headroom_ratio,
             prior: None,
+            risk_ratio: DEFAULT_RISK_RATIO,
+            bayes_trials: 2,
         }
     }
 }
+
+/// Default posterior risk of exceeding the throttle budget (`--risk`).
+pub const DEFAULT_RISK_RATIO: f64 = 0.05;
 
 /// Longest `Retry-After` the tuner waits for between trials.
 pub const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
@@ -184,6 +196,11 @@ struct Tuner<'a> {
     pool: Vec<(Vec<ReqRow>, Vec<OpRow>, f64)>,
     /// The in-flight ceiling (requests), once known.
     ceiling: Option<capacity::Ceiling>,
+    /// Trials the posterior accepts within the risk although they lie beyond the margin.
+    posterior_ok: Vec<usize>,
+    /// The limit model is a queue or a shared bandwidth cap: goodput plateaus, so within the
+    /// noise the lower-latency configuration wins (Little's law; A3, A8).
+    saturated: bool,
 }
 
 impl Tuner<'_> {
@@ -346,6 +363,9 @@ impl Tuner<'_> {
     /// Within the safety margin: its peak in-flight (concurrency × its per-op peak) stays
     /// under the ceiling with headroom.
     fn within_margin(&self, i: usize) -> bool {
+        if self.posterior_ok.contains(&i) {
+            return true;
+        }
         let t = &self.trials[i];
         self.safe_for(t.peak_inflight_per_op)
             .is_none_or(|s| t.knobs.concurrency <= s)
@@ -403,6 +423,10 @@ impl Tuner<'_> {
             .fold(0.0, f64::max);
         let near = |i: &usize| self.metric(&self.trials[*i]) >= 0.8 * top;
         match self.opts.objective {
+            Objective::Throughput if self.saturated => pool
+                .into_iter()
+                .filter(|i| self.metric(&self.trials[*i]) >= 0.9 * top)
+                .min_by(|&a, &b| self.trials[a].p99_ms.total_cmp(&self.trials[b].p99_ms)),
             Objective::Throughput => pool.into_iter().max_by(|&a, &b| {
                 self.metric(&self.trials[a])
                     .total_cmp(&self.metric(&self.trials[b]))
@@ -462,6 +486,10 @@ impl Tuner<'_> {
             return ea;
         }
         match self.opts.objective {
+            Objective::Throughput if self.saturated => {
+                self.metric(ta) > self.metric(tb) * 1.10
+                    || (self.metric(ta) >= self.metric(tb) * 0.92 && ta.p99_ms < tb.p99_ms * 0.9)
+            }
             Objective::Throughput => self.metric(ta) > self.metric(tb) * 1.03,
             Objective::Latency => {
                 ta.p99_ms < tb.p99_ms * 0.97 && self.metric(ta) >= 0.8 * self.metric(tb)
@@ -629,6 +657,8 @@ pub async fn tune(
         on_event,
         pool: Vec::new(),
         ceiling: None,
+        posterior_ok: Vec::new(),
+        saturated: false,
     };
     let base_knobs = p.knobs.clone();
     let baseline = t.trial("baseline", &base_knobs).await?;
@@ -829,6 +859,136 @@ pub async fn tune(
         }
     }
 
+    t.saturated = cap.asserted().is_some_and(|h| {
+        matches!(
+            h.kind,
+            capacity_kind::Queueing | capacity_kind::BandwidthCap | capacity_kind::ClientBound
+        )
+    });
+    if t.saturated {
+        notes.push(format!(
+            "limit model: {} — goodput plateaus, so the lowest-latency configuration within 10% of the best goodput wins",
+            cap.selected().map(|h| h.summary()).unwrap_or_default()
+        ));
+        if let Some(b) = t.best() {
+            current = b;
+        }
+    }
+    // 3b. A rate limit (or a per-key / time-varying one): pace the client instead of only
+    // cutting workers (design v5 §4, Tune 5 search space includes the rate).
+    if let Some(r0) = cap.safe_rate(0.0)
+        && opts.trial.rate.is_none()
+    {
+        let conc = infeasible_at
+            .unwrap_or(base_knobs.concurrency)
+            .max(base_knobs.concurrency)
+            .min(max_c);
+        notes.push(format!(
+            "limit model: {} — pacing trials at a fraction of it",
+            cap.selected().map(|h| h.summary()).unwrap_or_default()
+        ));
+        for f in [0.85, 0.95] {
+            if !t.budget_left() {
+                break;
+            }
+            let k = Knobs {
+                concurrency: conc,
+                ..base_knobs.clone()
+            };
+            let ro = RunOptions {
+                rate: Some((r0 * f).floor().max(1.0)),
+                ..opts.trial.clone()
+            };
+            let id = t.measure("rate", &k, Some(&ro)).await?;
+            if t.trials[id].feasible && (!t.trials[current].feasible || t.better(id, current)) {
+                t.posterior_ok.push(id);
+                current = id;
+            }
+        }
+    }
+    // 3c. Bayesian optimisation: the candidate concurrency (at the current pace) with the best
+    // constrained expected improvement under the goodput / throttle surrogates.
+    let space = |t: &Tuner<'_>| bayes::Space {
+        max_concurrency: max_c,
+        max_rate: t
+            .trials
+            .iter()
+            .filter_map(|x| x.rate_per_s)
+            .fold(0.0, f64::max),
+    };
+    for _ in 0..opts.bayes_trials {
+        if !t.budget_left() || t.trials.len() < 3 || t.saturated {
+            break;
+        }
+        let s = bayes::Surrogate::fit(&t.trials, space(&t), t.use_bytes, opts.max_throttle_ratio);
+        let cur = t.trials[current].clone();
+        let mut cands: Vec<usize> = (0..=(2.0 * (max_c as f64).log2()).floor() as u32)
+            .map(|i| (2f64.powf(f64::from(i) / 2.0)).round() as usize)
+            .filter(|c| (1..=max_c).contains(c))
+            .collect();
+        // Stay near what was measured: far outside it the surrogate knows nothing.
+        let measured_max = t.trials.iter().map(|x| x.knobs.concurrency).max().unwrap_or(1);
+        cands.retain(|c| *c * 2 <= measured_max * 3);
+        cands.dedup();
+        let pick = cands
+            .into_iter()
+            .filter(|c| {
+                !t.trials.iter().any(|x| {
+                    x.knobs.concurrency == *c && x.rate_per_s == cur.rate_per_s && x.knobs.io_concurrency == cur.knobs.io_concurrency
+                })
+            })
+            .filter_map(|c| {
+                let mut probe = cur.clone();
+                probe.knobs.concurrency = c;
+                s.acquisition(&probe).map(|a| (c, a))
+            })
+            .max_by(|a, b| a.1.total_cmp(&b.1));
+        let Some((c, a)) = pick else { break };
+        if a <= 1e-6 {
+            break;
+        }
+        let k = Knobs {
+            concurrency: c,
+            ..cur.knobs.clone()
+        };
+        let ro = RunOptions {
+            rate: cur.rate_per_s.or(opts.trial.rate),
+            ..opts.trial.clone()
+        };
+        let id = t.measure("bayes", &k, Some(&ro)).await?;
+        if t.trials[id].feasible && t.better(id, current) {
+            current = id;
+        }
+    }
+    // 3d. Headroom as a posterior quantile (A4): a measured-feasible trial with more goodput
+    // than the margin's pick is accepted when the surrogate gives it at most `risk` chance of
+    // exceeding the throttle budget.
+    if t.trials.len() >= 3 && !t.saturated {
+        let s = bayes::Surrogate::fit(&t.trials, space(&t), t.use_bytes, opts.max_throttle_ratio);
+        let base_metric = t.metric(&t.trials[current]);
+        let best = (0..t.trials.len())
+            .filter(|&i| {
+                let x = &t.trials[i];
+                x.feasible && x.stage != "confirm" && t.metric(x) > base_metric * 1.03
+            })
+            .filter(|&i| {
+                s.exceed_probability(&t.trials[i])
+                    .is_some_and(|p| p <= opts.risk_ratio)
+            })
+            .max_by(|&a, &b| t.metric(&t.trials[a]).total_cmp(&t.metric(&t.trials[b])));
+        if let Some(i) = best {
+            let p = s.exceed_probability(&t.trials[i]).unwrap_or(0.0);
+            notes.push(format!(
+                "posterior headroom: trial #{i} ({}) has a {:.1}% chance of exceeding the throttle budget (risk {:.0}%), so it is accepted beyond the fixed margin",
+                t.trials[i].knobs.summary(),
+                p * 100.0,
+                opts.risk_ratio * 100.0
+            ));
+            t.posterior_ok.push(i);
+            current = i;
+        }
+    }
+
     // 4. Workload-relevant knobs.
     let mix = &session.mix;
     let has = |f: &dyn Fn(&OpKind) -> bool| mix.iter().any(|m| m.weight > 0 && f(&m.op));
@@ -1022,6 +1182,7 @@ pub async fn tune(
     let winner = t.trials[winner_idx].knobs.clone();
     let confirm_opts = RunOptions {
         duration: opts.trial.duration * 2,
+        rate: t.trials[winner_idx].rate_per_s.or(opts.trial.rate),
         ..opts.trial.clone()
     };
     let confirm = if !session.cancel.is_cancelled() {

@@ -245,6 +245,16 @@ pub async fn fix(ctx: &Ctx, a: FixRequest, cancel: Cancel) -> Result<FixOutcome>
     let winner = tuned.report.spec.profile.knobs.clone();
     rec.overrides =
         crate::tune::recommend::knob_overrides(&diag.report.spec.profile.knobs, &winner);
+    if let Some(r) = tuned
+        .tune
+        .trials
+        .iter()
+        .find(|x| x.id == tuned.tune.recommended_trial_id)
+        .and_then(|x| x.rate_per_s)
+        && Some(r) != diag.report.spec.profile.workload.rate
+    {
+        let _ = rec.overrides.set("rate", &format!("{r:.0}"));
+    }
     // 3. Verify the recommendation against the diagnosis run.
     let verify = if rec.overrides.is_empty() {
         None

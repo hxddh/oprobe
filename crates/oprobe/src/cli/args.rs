@@ -818,6 +818,11 @@ pub struct TuneSearchArgs {
     /// In-flight headroom kept below the throttling ceiling (default 0.15)
     #[arg(long, value_name = "RATIO", value_parser = parse::fraction)]
     pub headroom_ratio: Option<f64>,
+    /// Posterior chance of exceeding the throttle budget the recommendation may carry
+    /// (default 0.05): measured-clean configurations beyond the fixed headroom are accepted
+    /// when the surrogate is this sure
+    #[arg(long, value_name = "RATIO", value_parser = parse::fraction)]
+    pub risk: Option<f64>,
 }
 
 #[derive(Args, Debug)]

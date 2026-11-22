@@ -434,6 +434,8 @@ pub struct TuneSettings<'a> {
     pub boundary_repeats: usize,
     /// In-flight headroom below the ceiling (unset: `config::defaults().headroom_ratio`).
     pub headroom_ratio: Option<f64>,
+    /// Posterior risk of exceeding the throttle budget (unset: 0.05).
+    pub risk_ratio: Option<f64>,
 }
 
 impl Default for TuneSettings<'static> {
@@ -448,6 +450,7 @@ impl Default for TuneSettings<'static> {
             max_throttle_ratio: None,
             boundary_repeats: tune_defaults::BOUNDARY_REPEATS,
             headroom_ratio: None,
+            risk_ratio: None,
         }
     }
 }
@@ -504,5 +507,11 @@ pub fn tune_options(
     o.max_throttle_ratio = max_throttle_ratio;
     o.boundary_repeats = s.boundary_repeats.max(1);
     o.headroom_ratio = headroom_ratio;
+    if let Some(r) = s.risk_ratio {
+        if !(0.0..0.5).contains(&r) {
+            return Err(crate::input::invalid("the risk must be within 0..0.5").into());
+        }
+        o.risk_ratio = r;
+    }
     Ok(o)
 }
