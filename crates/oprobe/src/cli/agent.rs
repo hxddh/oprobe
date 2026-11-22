@@ -74,6 +74,8 @@ fn server_budgets(a: &McpArgs) -> Result<Budgets> {
             )
         );
     }
+    // Unset flags take the MCP defaults (design v5 §5, S6): flags may raise or lower them,
+    // tool calls only lower them.
     Ok(Budgets {
         max_cost_usd: a.max_cost_usd,
         max_requests_count: a.max_requests,
@@ -89,7 +91,8 @@ fn server_budgets(a: &McpArgs) -> Result<Budgets> {
             .map(|v| parse_duration(v).map(|d| d.as_secs_f64()))
             .transpose()
             .map_err(|e| bad("--max-duration", e))?,
-    })
+    }
+    .or(&Budgets::mcp_default()))
 }
 
 /// What `oprobe mcp --http` serves (printed once it listens).
@@ -97,18 +100,22 @@ fn server_budgets(a: &McpArgs) -> Result<Budgets> {
 struct McpHttpOutput {
     url: String,
     allow_write: bool,
+    /// The file holding the bearer token (`Authorization: Bearer TOKEN`).
+    token_file: String,
+    tls: bool,
 }
 
 impl CommandOutput for McpHttpOutput {
     fn text(&self) -> String {
         format!(
-            "oprobe MCP server (Streamable HTTP) on {}{}\n",
+            "oprobe MCP server (Streamable HTTP) on {}{}\n  token: {} (send `Authorization: Bearer TOKEN`)\n",
             self.url,
             if self.allow_write {
                 " · writes allowed"
             } else {
                 " · read-only"
-            }
+            },
+            self.token_file
         )
     }
 }
@@ -128,23 +135,84 @@ async fn loopback_only(addr: &str) -> Result<bool> {
     Ok(!addrs.is_empty() && addrs.iter().all(|a| a.ip().is_loopback()))
 }
 
-/// `--http` serves without authentication: loopback only unless `--http-allow-remote`.
-async fn check_http_bind(addr: &str, allow_remote: bool, ctx: &Ctx) -> Result<()> {
+/// `--http` binds loopback unless `--http-allow-remote`, and a remote bind needs TLS or an
+/// explicit `--insecure-remote` (design v5 §5, S2).
+async fn check_http_bind(
+    addr: &str,
+    allow_remote: bool,
+    tls: bool,
+    insecure_remote: bool,
+    ctx: &Ctx,
+) -> Result<()> {
     if loopback_only(addr).await? {
         return Ok(());
     }
     if !allow_remote {
         return Err(OprobeError::new(
             ErrorCode::SafetyRefused,
-            format!("refusing to serve MCP on non-loopback address `{addr}`: the server has no authentication"),
+            format!("refusing to serve MCP on non-loopback address `{addr}`"),
         )
-        .with_hint("bind 127.0.0.1:PORT (tunnel it if needed), or pass --http-allow-remote to accept the risk")
+        .with_hint("bind 127.0.0.1:PORT (tunnel it if needed), or pass --http-allow-remote with --tls-cert/--tls-key")
+        .into());
+    }
+    if !tls && !insecure_remote {
+        return Err(OprobeError::new(
+            ErrorCode::SafetyRefused,
+            format!("refusing to serve MCP on `{addr}` without TLS: the bearer token would cross the network in clear"),
+        )
+        .with_hint("pass --tls-cert and --tls-key, or --insecure-remote to accept the risk")
         .into());
     }
     ctx.out.warn(format!(
-        "serving MCP on non-loopback address {addr} without authentication: anyone who can reach it can run tools with the configured credentials"
+        "serving MCP on non-loopback address {addr}{}: anyone with the token can run tools with the configured credentials",
+        if tls { "" } else { " without TLS" }
     ));
     Ok(())
+}
+
+/// The bearer token of `--http`: read from `--token-file`, or generated and written to
+/// `<data>/mcp-token` (mode 0600). Returns the token and its file.
+fn http_token(a: &McpArgs, ctx: &Ctx) -> Result<(String, std::path::PathBuf)> {
+    match &a.token_file {
+        Some(p) => {
+            let t = std::fs::read_to_string(p)
+                .map_err(|e| {
+                    OprobeError::new(
+                        ErrorCode::UsageInvalidArgument,
+                        format!("cannot read --token-file `{}`: {e}", p.display()),
+                    )
+                })?
+                .trim()
+                .to_owned();
+            if t.len() < 16 || t.chars().any(char::is_whitespace) {
+                return Err(OprobeError::new(
+                    ErrorCode::UsageInvalidArgument,
+                    format!(
+                        "--token-file `{}` must hold one token of at least 16 characters",
+                        p.display()
+                    ),
+                )
+                .into());
+            }
+            Ok((t, p.clone()))
+        }
+        None => {
+            let t = crate::guard::random_token();
+            let p = ctx.paths.data_dir.join("mcp-token");
+            crate::store::write_secret(&p, &t)?;
+            Ok((t, p))
+        }
+    }
+}
+
+fn read_pem(p: &std::path::Path, flag: &str) -> Result<String> {
+    std::fs::read_to_string(p).map_err(|e| {
+        OprobeError::new(
+            ErrorCode::UsageInvalidArgument,
+            format!("cannot read {flag} `{}`: {e}", p.display()),
+        )
+        .into()
+    })
 }
 
 pub async fn cmd_mcp(a: McpArgs, ctx: &Ctx) -> Result<u8> {
@@ -154,9 +222,13 @@ pub async fn cmd_mcp(a: McpArgs, ctx: &Ctx) -> Result<u8> {
         allow_targets: a.allow_targets.clone(),
         paths: ctx.paths.clone(),
         max_concurrent_runs: a.max_concurrent_runs,
+        allow_private_endpoints: a.allow_private_endpoints,
     };
     // Surface an invalid config file now rather than on the first tool call.
-    ctx.config()?;
+    let config = ctx.config()?;
+    if let Some(w) = config.inline_secrets_warning(&ctx.paths.config_file) {
+        ctx.out.warn(w);
+    }
     match &a.http {
         None => {
             if ctx.out.format == OutputFormat::Ndjson {
@@ -169,14 +241,32 @@ pub async fn cmd_mcp(a: McpArgs, ctx: &Ctx) -> Result<u8> {
             crate::mcp::serve_stdio(cfg).await?;
         }
         Some(addr) => {
-            check_http_bind(addr, a.http_allow_remote, ctx).await?;
+            let tls = match (&a.tls_cert, &a.tls_key) {
+                (Some(c), Some(k)) => Some((read_pem(c, "--tls-cert")?, read_pem(k, "--tls-key")?)),
+                _ => None,
+            };
+            check_http_bind(
+                addr,
+                a.http_allow_remote,
+                tls.is_some(),
+                a.insecure_remote,
+                ctx,
+            )
+            .await?;
+            let (token, token_file) = http_token(&a, ctx)?;
+            let mut http = crate::mcp::HttpOptions::new(token);
+            http.max_connections = a.max_connections;
+            let scheme = if tls.is_some() { "https" } else { "http" };
+            http.tls = tls;
             let out = &ctx.out;
             let allow_write = a.allow_write;
             let mut printed = Ok(exit::OK);
-            crate::mcp::serve_http(cfg, addr, |local| {
+            crate::mcp::serve_http(cfg, addr, http, |local| {
                 printed = out.finish(&McpHttpOutput {
-                    url: format!("http://{local}/mcp"),
+                    url: format!("{scheme}://{local}/mcp"),
                     allow_write,
+                    token_file: token_file.display().to_string(),
+                    tls: scheme == "https",
                 });
             })
             .await?;
@@ -203,12 +293,27 @@ mod tests {
                 data_dir: "d".into(),
             },
         );
-        let e = check_http_bind("0.0.0.0:0", false, &ctx).await.unwrap_err();
-        assert_eq!(
-            crate::errors::classify(&e, "s3").code,
-            ErrorCode::SafetyRefused
-        );
-        check_http_bind("0.0.0.0:0", true, &ctx).await.unwrap();
-        check_http_bind("127.0.0.1:0", false, &ctx).await.unwrap();
+        let refused =
+            |e: anyhow::Error| crate::errors::classify(&e, "s3").code == ErrorCode::SafetyRefused;
+        assert!(refused(
+            check_http_bind("0.0.0.0:0", false, false, false, &ctx)
+                .await
+                .unwrap_err()
+        ));
+        // Remote needs TLS, or an explicit --insecure-remote.
+        assert!(refused(
+            check_http_bind("0.0.0.0:0", true, false, false, &ctx)
+                .await
+                .unwrap_err()
+        ));
+        check_http_bind("0.0.0.0:0", true, true, false, &ctx)
+            .await
+            .unwrap();
+        check_http_bind("0.0.0.0:0", true, false, true, &ctx)
+            .await
+            .unwrap();
+        check_http_bind("127.0.0.1:0", false, false, false, &ctx)
+            .await
+            .unwrap();
     }
 }

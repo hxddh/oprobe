@@ -948,6 +948,14 @@ pub struct LabRequest {
     pub complete_delay: String,
     /// Write the lab CA certificate (for --ca-cert) to this file
     pub write_ca: Option<PathBuf>,
+    /// Accept a non-loopback `bind` address (the lab has no authentication)
+    pub allow_remote: bool,
+    /// Largest object body accepted, e.g. `1GiB` (unset: the built-in cap)
+    pub max_object_size: Option<String>,
+    /// Largest in-memory store, e.g. `8GiB` (unset: the built-in cap)
+    pub max_store_size: Option<String>,
+    /// Most open connections (unset: the built-in cap)
+    pub max_connections: Option<usize>,
 }
 
 impl Default for LabRequest {
@@ -969,6 +977,10 @@ impl Default for LabRequest {
             throttle_early_close: Default::default(),
             complete_delay: "0ms".into(),
             write_ca: Default::default(),
+            allow_remote: false,
+            max_object_size: None,
+            max_store_size: None,
+            max_connections: None,
         }
     }
 }

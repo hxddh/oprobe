@@ -452,6 +452,10 @@ impl From<LabArgs> for i::LabRequest {
             throttle_early_close: a.throttle_early_close,
             complete_delay: a.complete_delay,
             write_ca: a.write_ca,
+            allow_remote: a.allow_remote,
+            max_object_size: a.max_object_size,
+            max_store_size: a.max_store_size,
+            max_connections: a.max_connections,
         }
     }
 }

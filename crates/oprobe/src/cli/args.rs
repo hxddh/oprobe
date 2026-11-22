@@ -1195,6 +1195,19 @@ pub struct LabArgs {
     /// Write the lab CA certificate (for --ca-cert) to this file
     #[arg(long, value_name = "FILE")]
     pub write_ca: Option<PathBuf>,
+    /// Accept a non-loopback --bind address (the lab has no authentication: anyone who can
+    /// reach it can read and write its objects)
+    #[arg(long)]
+    pub allow_remote: bool,
+    /// Largest object body accepted (PUT or multipart part), e.g. 1GiB
+    #[arg(long, value_name = "SIZE", value_parser = parse::size)]
+    pub max_object_size: Option<String>,
+    /// Largest in-memory store (objects plus staged parts), e.g. 8GiB
+    #[arg(long, value_name = "SIZE", value_parser = parse::size)]
+    pub max_store_size: Option<String>,
+    /// Most open connections (more are closed at once)
+    #[arg(long, value_name = "N", value_parser = at_least::<1>)]
+    pub max_connections: Option<usize>,
 }
 
 #[derive(Args, Debug)]
@@ -1260,8 +1273,8 @@ pub struct McpArgs {
     /// Serve MCP over Streamable HTTP on this address (e.g. 127.0.0.1:8765) instead of stdio
     #[arg(long, value_name = "ADDR")]
     pub http: Option<String>,
-    /// Allow --http on a non-loopback address (anyone who can reach it can use the tools and
-    /// the configured credentials; there is no authentication)
+    /// Allow --http on a non-loopback address (needs --tls-cert/--tls-key or --insecure-remote;
+    /// anyone with the token can use the tools and the configured credentials)
     #[arg(long, requires = "http")]
     pub http_allow_remote: bool,
     /// Enable tools that write test data (runs that upload a dataset, tune, cleanup)
@@ -1285,6 +1298,26 @@ pub struct McpArgs {
     /// Runs executing at the same time (others wait)
     #[arg(long, default_value_t = 1, value_parser = at_least::<1>)]
     pub max_concurrent_runs: usize,
+    /// Bearer token of --http, read from this file (default: a new token written to
+    /// <data>/mcp-token, mode 0600, at every start)
+    #[arg(long, value_name = "FILE", requires = "http")]
+    pub token_file: Option<PathBuf>,
+    /// Serve --http over HTTPS with this PEM certificate chain
+    #[arg(long, value_name = "FILE", requires_all = ["http", "tls_key"])]
+    pub tls_cert: Option<PathBuf>,
+    /// The PEM private key of --tls-cert
+    #[arg(long, value_name = "FILE", requires_all = ["http", "tls_cert"])]
+    pub tls_key: Option<PathBuf>,
+    /// Accept --http-allow-remote without TLS (the token then crosses the network in clear)
+    #[arg(long, requires = "http_allow_remote")]
+    pub insecure_remote: bool,
+    /// Most open --http connections (more are closed at once)
+    #[arg(long, value_name = "N", default_value_t = 64, value_parser = at_least::<1>)]
+    pub max_connections: usize,
+    /// Let probe_endpoint and endpoint overrides reach loopback, private and link-local
+    /// addresses (cloud metadata services answer on link-local ones)
+    #[arg(long)]
+    pub allow_private_endpoints: bool,
 }
 
 #[derive(Args, Debug)]

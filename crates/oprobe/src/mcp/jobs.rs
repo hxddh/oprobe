@@ -1,6 +1,12 @@
-//! Background runs and tunes started by MCP tools: one [`Job`] per run id, executed on the
-//! server's runtime (at most `max_concurrent_runs` at a time), observable through its
-//! [`EventBus`] (progress notifications, `oprobe://runs/{id}/events`) and cancellable.
+//! Background work started by MCP tools: one [`Job`] per id, executed on the server's runtime,
+//! observable through its [`EventBus`] (progress notifications, `oprobe://runs/{id}/events`),
+//! polled with `get_run` and cancelled with `cancel_run` (design v5 §6: no tool blocks for
+//! longer than a few seconds).
+//!
+//! Runs and tunes ([`Jobs::spawn`]) take a run slot (at most `max_concurrent_runs` at a time).
+//! Every other long call — verify, fix, and doctor, probe, sample or cleanup when they outlast
+//! the inline wait — is a task ([`Jobs::spawn_task`]) whose result is the tool's structured
+//! output, kept on the job.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -28,6 +34,41 @@ const MAX_EVENTS: usize = 5000;
 pub enum JobKind {
     Run,
     Tune,
+    /// `verify_finding`.
+    Verify,
+    /// `recommend_config` (`oprobe fix`).
+    Fix,
+    Doctor,
+    Probe,
+    Sample,
+    Cleanup,
+}
+
+impl JobKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Run => "run",
+            Self::Tune => "tune",
+            Self::Verify => "verify",
+            Self::Fix => "fix",
+            Self::Doctor => "doctor",
+            Self::Probe => "probe",
+            Self::Sample => "sample",
+            Self::Cleanup => "cleanup",
+        }
+    }
+
+    /// Takes a run slot (measures the target with a workload).
+    pub fn is_run(self) -> bool {
+        matches!(self, Self::Run | Self::Tune)
+    }
+}
+
+/// The result of a finished task: the tool's structured output and its one-line text.
+#[derive(Clone, Debug)]
+pub struct TaskResult {
+    pub structured: serde_json::Value,
+    pub text: String,
 }
 
 /// Lifecycle of a job.
@@ -76,13 +117,15 @@ struct Inner {
     /// The final status, set by [`Job::finish`] and published with the final event.
     ending: Option<JobStatus>,
     recommendation: Option<Box<crate::tune::recommend::Recommendation>>,
+    result: Option<TaskResult>,
 }
 
-/// One background run or tune.
+/// One background run, tune or task.
 pub struct Job {
     pub id: String,
     pub kind: JobKind,
-    pub plan: Plan,
+    /// The plan of a run or tune (tasks have none).
+    pub plan: Option<Plan>,
     pub budgets: Budgets,
     pub cancel: Cancel,
     pub bus: EventBus,
@@ -100,10 +143,12 @@ pub struct JobView {
     pub wall_s: f64,
     /// The tuner's recommendation (finished tune jobs).
     pub recommendation: Option<Box<crate::tune::recommend::Recommendation>>,
+    /// A finished task's result.
+    pub result: Option<TaskResult>,
 }
 
 impl Job {
-    fn new(id: String, kind: JobKind, plan: Plan, budgets: Budgets) -> Arc<Self> {
+    fn new(id: String, kind: JobKind, plan: Option<Plan>, budgets: Budgets) -> Arc<Self> {
         let (status, _) = watch::channel(JobStatus::Queued);
         let job = Arc::new(Self {
             id,
@@ -122,6 +167,7 @@ impl Job {
                 ended_s: None,
                 ending: None,
                 recommendation: None,
+                result: None,
             }),
             status,
         });
@@ -209,6 +255,7 @@ impl Job {
                 .ended_s
                 .unwrap_or_else(|| self.started.elapsed().as_secs_f64()),
             recommendation: i.recommendation.clone(),
+            result: i.result.clone(),
         }
     }
 
@@ -319,7 +366,7 @@ impl Jobs {
         let job = Job::new(
             spec.run_id.to_string(),
             spec.kind,
-            spec.plan.clone(),
+            Some(spec.plan.clone()),
             spec.budgets.clone(),
         );
         self.map
@@ -371,6 +418,62 @@ impl Jobs {
             }
         });
         job
+    }
+}
+
+impl Jobs {
+    /// Start a task in the background: `make` receives the job's cancel token and builds the
+    /// future whose `Ok` is the tool's result. Returns at once.
+    pub fn spawn_task<F, Fut>(&self, kind: JobKind, budgets: Budgets, make: F) -> Arc<Job>
+    where
+        F: FnOnce(Cancel) -> Fut,
+        Fut: std::future::Future<Output = anyhow::Result<TaskResult>> + Send + 'static,
+    {
+        let job = Job::new(RunId::new().to_string(), kind, None, budgets);
+        self.map
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(job.id.clone(), job.clone());
+        let fut = make(job.cancel.clone());
+        let j = job.clone();
+        tokio::spawn(async move {
+            j.status.send_replace(JobStatus::Running);
+            let res = fut.await;
+            let cancelled = j.lock().user_cancelled;
+            match res {
+                Ok(r) => {
+                    j.lock().result = Some(r);
+                    let status = if cancelled {
+                        JobStatus::Cancelled
+                    } else {
+                        JobStatus::Succeeded
+                    };
+                    j.finish(status, None, None, None);
+                }
+                Err(e) => {
+                    let mut body = crate::errors::classify(&e, "s3");
+                    if cancelled {
+                        body.code = ErrorCode::RunInterrupted;
+                        body.retryable = true;
+                    }
+                    let status = if cancelled {
+                        JobStatus::Cancelled
+                    } else {
+                        JobStatus::Failed
+                    };
+                    j.finish(status, Some(body), None, None);
+                }
+            }
+        });
+        job
+    }
+
+    /// Forget a job (a task that finished within the inline wait was answered in full).
+    pub fn forget(&self, id: &str) {
+        self.map
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id);
     }
 }
 

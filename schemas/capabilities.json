@@ -20,6 +20,42 @@
         }
       ]
     },
+    "Budgets": {
+      "description": "Limits for one command.",
+      "properties": {
+        "max_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_cost_usd": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "max_duration_s": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "max_requests_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "CommandInfo": {
       "description": "One command and the output formats it offers (`-o`).",
       "properties": {
@@ -353,6 +389,14 @@
     },
     "McpInfo": {
       "properties": {
+        "default_budgets": {
+          "$ref": "#/$defs/Budgets",
+          "description": "Budgets of every run the server starts unless its flags set others (a tool call can\nonly lower them)."
+        },
+        "http_auth": {
+          "description": "Authentication of the Streamable HTTP transport: `bearer` (a token file).",
+          "type": "string"
+        },
         "prompts": {
           "items": {
             "type": "string"
@@ -390,7 +434,9 @@
         "protocol_versions",
         "tools",
         "resources",
-        "prompts"
+        "prompts",
+        "default_budgets",
+        "http_auth"
       ],
       "type": "object"
     },

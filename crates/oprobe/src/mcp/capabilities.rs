@@ -88,6 +88,11 @@ pub struct McpInfo {
     /// URI templates.
     pub resources: Vec<String>,
     pub prompts: Vec<String>,
+    /// Budgets of every run the server starts unless its flags set others (a tool call can
+    /// only lower them).
+    pub default_budgets: crate::guard::Budgets,
+    /// Authentication of the Streamable HTTP transport: `bearer` (a token file).
+    pub http_auth: String,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -295,6 +300,8 @@ impl Capabilities {
                     .iter()
                     .map(|p| p.name.to_string())
                     .collect(),
+                default_budgets: crate::guard::Budgets::mcp_default(),
+                http_auth: "bearer".into(),
             },
             defaults,
             features: Features {

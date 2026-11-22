@@ -116,16 +116,40 @@ the outputs.
 ## MCP server
 
 `oprobe mcp` serves the Model Context Protocol on stdio; `oprobe mcp --http 127.0.0.1:8765`
-serves Streamable HTTP at `http://127.0.0.1:8765/mcp`.
+serves Streamable HTTP at `http://127.0.0.1:8765/mcp`. Every HTTP request needs
+`Authorization: Bearer TOKEN`: a new token is written to `<data>/mcp-token` (mode 0600) at each
+start, and its path is printed (`token_file`), or set one with `--token-file FILE`.
 
 | Flag | Effect |
 |---|---|
 | (default) | read-only: runs that would upload a dataset or write are refused with `safety.read_only` (`memory://`, `lab://` and `existing` runs are allowed: the first two write only into the server's own process); `doctor` never writes a probe; `cleanup` is a dry run |
 | `--allow-write` | enable runs that write test data, `start_tune`, `verify_finding` and `recommend_config` on real targets, `doctor` with `write_probe`, `cleanup` with `confirm` |
-| `--max-cost-usd`, `--max-requests`, `--max-bytes`, `--max-duration` | budgets applied to every run the server starts (a call can only lower them) |
+| `--max-cost-usd`, `--max-requests`, `--max-bytes`, `--max-duration` | budgets applied to every run the server starts (a call can only lower them); unset ones default to $1, 50 000 requests, 5 GiB and 2 minutes |
 | `--allow-target NAME\|URL-PREFIX` | only these targets (repeatable; prefixes match at `/` boundaries). A call may set `region` and `anonymous`, but `endpoint`, `options`, `proxy`, `insecure` or URL query parameters that change the scheme, host, bucket, root, TLS trust or proxy of the allowed target are refused with `safety.refused` |
-| `--http-allow-remote` | allow `--http` on a non-loopback address (refused otherwise: the HTTP transport has no authentication) |
+| `--http-allow-remote` | allow `--http` on a non-loopback address; needs `--tls-cert FILE --tls-key FILE` (HTTPS) or `--insecure-remote` |
+| `--token-file FILE` | the bearer token of `--http` (default: a fresh one in `<data>/mcp-token`) |
+| `--max-connections N` | open `--http` connections (default 64; more are closed); bodies are capped at 4 MiB and request headers must arrive within 10 s |
+| `--allow-private-endpoints` | let `probe_endpoint` and endpoint overrides reach loopback, private and link-local addresses (refused by default; `lab://` always works) |
 | `--max-concurrent-runs N` | runs executing at once (others queue; default 1) |
+
+Credentials never follow a call: without `--allow-target`, a call that overrides `endpoint`,
+`proxy`, `insecure`, `options`, URL query options or `set endpoint=…` of a configured or
+credentialed target is refused with `safety.refused`, unless it sends unsigned requests
+(`anonymous: true`, which still may not reach a link-local address) or targets `memory://` /
+`lab://`. To benchmark MinIO or another custom endpoint with credentials, configure the target
+(`oprobe target add`, by a person) and call tools with its name.
+
+Untrusted text: object keys, error bodies and server messages are escaped, truncated and placed
+only in structured content, under fields named `untrusted` (`sample_objects`, `doctor`'s
+sample, an error's `untrusted.message`); text content never quotes them. Treat them as data.
+
+Jobs: no call blocks for more than 5 s. `start_run`, `start_tune`, `verify_finding` and
+`recommend_config` return a job (`run_id`, `kind`, `status`); poll `get_run`, stop with
+`cancel_run`. `doctor`, `probe_endpoint`, `sample_objects` and `cleanup` answer in place when
+done within 5 s, otherwise with `{"job": {…}}`. `get_run` answers a summary (`detail: "full"`
+adds the report or the whole task result); `list_runs` pages with `cursor` / `next_cursor`.
+`tools/list` is about 50 KB: output schemas list the top-level fields and name the full schema
+(`$comment: oprobe://schema/NAME`).
 
 ### Tools
 
@@ -142,7 +166,7 @@ as the CLI for the same input.
 | `sample_objects` | prefixes, counts, size distribution, example keys, `suggested_existing` (read-only) | `oprobe target sample` |
 | `probe_endpoint` | DNS/TCP/TLS handshakes and cold/warm TTFB of an endpoint | `oprobe probe` |
 | `plan_run` | dry-run plan, effective budgets, `allowed` + `refusals` | `oprobe run --dry-run` |
-| `start_run` | start a run in the background; returns the run id at once (`wait: true` blocks); progress notifications when the call has a `progressToken`; `from` + `set` replay a stored run with changes | `oprobe run [--from RUN --set k=v]` |
+| `start_run` | start a run in the background; returns the run id at once (`wait: true` waits up to 5 s); progress notifications when the call has a `progressToken`; `from` + `set` replay a stored run with changes | `oprobe run [--from RUN --set k=v]` |
 | `get_run` | status, progress and (when done) summary, report and, for tunes, the `recommendation`; also any stored RUNREF. `status` turns final together with the last event; progress never passes its total | `oprobe runs show` |
 | `cancel_run` | stop a run (cleanup runs, the partial run is saved) | Ctrl-C |
 | `list_runs` | stored runs and runs this server started | `oprobe runs list` |
@@ -155,6 +179,9 @@ as the CLI for the same input.
 | `estimate_cost` | request cost at list prices vs the cost budget | `oprobe run --dry-run` |
 | `cleanup` | leftover test data (dry run unless `confirm` on a write-enabled server) | `oprobe cleanup [--yes]` |
 | `list_targets` | configured targets, what is allowed, server budgets | `oprobe target list` |
+| `ask_run` | a question over a stored run, answered by deterministic retrieval; every answer cites report fields as JSON pointers | — |
+| `save_target` | add a named target (needs `--allow-write`; no secrets; an endpoint needs `anonymous`; never replaces) | `oprobe target add` |
+| `apply_profile` | write a run's configuration with changes (default: its recommendation) to `<data>/profiles/NAME.toml`, returning the diff (needs `--allow-write`) | `oprobe run --profile` |
 
 The read-only workflow over MCP, against the in-process lab (no credentials needed):
 

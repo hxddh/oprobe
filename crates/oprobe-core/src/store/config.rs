@@ -245,6 +245,43 @@ impl ConfigFile {
         super::atomic_write(path, text.as_bytes())
     }
 
+    /// Secrets written inline in the file (`targets.NAME.options.KEY`, never their values):
+    /// option names that hold credentials ([`crate::util::is_secret_key`]) whose value is not
+    /// an `${ENV}` reference, and URLs or endpoints with embedded credentials. Callers warn:
+    /// `${ENV}` references and `credentials = "profile:NAME"` are the safe way (design v5 §5).
+    pub fn inline_secrets(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for (name, t) in &self.targets {
+            for (k, v) in &t.options {
+                let reference = v.trim().starts_with("${") && v.trim().ends_with('}');
+                if crate::util::is_secret_key(k) && !v.is_empty() && !reference {
+                    out.push(format!("targets.{name}.options.{k}"));
+                }
+            }
+            for (field, v) in [("url", Some(&t.url)), ("endpoint", t.endpoint.as_ref())] {
+                if let Some(v) = v
+                    && crate::util::strip_url_credentials(v) != *v
+                {
+                    out.push(format!("targets.{name}.{field}"));
+                }
+            }
+        }
+        out
+    }
+
+    /// The warning for [`Self::inline_secrets`], if any.
+    pub fn inline_secrets_warning(&self, path: &Path) -> Option<String> {
+        let found = self.inline_secrets();
+        if found.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "{} holds secrets inline ({}): use `${{ENV}}` references or `credentials = \"profile:NAME\"` instead",
+            path.display(),
+            found.join(", ")
+        ))
+    }
+
     /// A configured target by name.
     pub fn target(&self, name: &str) -> Option<&TargetEntry> {
         self.targets.get(name)
@@ -322,6 +359,39 @@ impl ConfigFile {
         put("budgets.max_bytes", None, b.max_bytes.clone(), "");
         put("budgets.max_duration", None, b.max_duration.clone(), "");
         out
+    }
+}
+
+#[cfg(test)]
+mod secret_tests {
+    use super::*;
+
+    #[test]
+    fn inline_secrets_are_found_but_env_references_are_not() {
+        let mut c = ConfigFile::default();
+        let mut t = TargetEntry {
+            url: "s3://b/p".into(),
+            ..Default::default()
+        };
+        t.options
+            .insert("secret_access_key".into(), "${AWS_SECRET}".into());
+        t.options.insert("region".into(), "us-east-1".into());
+        c.targets.insert("ok".into(), t.clone());
+        assert!(c.inline_secrets().is_empty());
+        t.options
+            .insert("secret_access_key".into(), "hunter2".into());
+        t.endpoint = Some("https://user:pw@minio.local".into());
+        c.targets.insert("bad".into(), t);
+        let found = c.inline_secrets();
+        assert_eq!(
+            found,
+            [
+                "targets.bad.options.secret_access_key",
+                "targets.bad.endpoint"
+            ]
+        );
+        let w = c.inline_secrets_warning(Path::new("c.toml")).unwrap();
+        assert!(!w.contains("hunter2") && w.contains("${ENV}"), "{w}");
     }
 }
 
