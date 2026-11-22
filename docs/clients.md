@@ -183,8 +183,10 @@ always allow it); the command is resolved on the worker's machine.
 
 1. checks every worker: protocol and oprobe version (they must match), the clients it can
    drive, and its clock offset by an NTP-style exchange (8 pings, the shortest round trip wins);
-2. splits the run by weight (`host:port*WEIGHT`, default 1): concurrency, `--rate` and
-   `--max-ops` are divided; a generated dataset is divided (each worker seeds its share under
+2. splits the run by weight (`host:port*WEIGHT`, default 1): concurrency, `--rate`, a
+   `--shape` (scaled to each share; `--arrivals poisson` runs an independent process per
+   worker) and `--max-ops` are divided; `--replay` is split by key (local workers only:
+   each worker reads the log from its own disk); a generated dataset is divided (each worker seeds its share under
    its own prefix `oprobe-run-<id>/wN/`); an existing dataset (`--existing`) is split by key
    range;
 3. prepares every worker (session, preflight, dataset), then starts them all at one instant,
@@ -202,7 +204,8 @@ own configuration and environment, as `oprobe run --from` does.
 **The merged run** is saved like any other. Counters, bytes and rates are exact sums. Latency
 distributions are the mixture of the workers' distributions (exact counts, means and maxima;
 close quantiles), and where the run's trace rows are complete the report's percentiles come from
-the merged rows, so the capacity fit and the findings see the load of every worker. Operation ids
+the merged rows, so the capacity fit and the findings see the load of every worker. The trace row
+limit is shared by weight, so the saved run file keeps it. Operation ids
 are made unique per worker and row times are shifted onto the common window.
 
 - `report.workers[]`: `{ id, addr, clock_offset_ms, ops_count, requests_count, ops_per_s,

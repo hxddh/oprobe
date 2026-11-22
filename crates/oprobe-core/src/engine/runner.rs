@@ -330,6 +330,23 @@ impl Session {
             .take()
     }
 
+    /// Keep only this worker's share of the replayed log (a distributed run, design v5 §8):
+    /// events are split by key, so every key's operations stay in order on one worker. Keys are
+    /// compared without `run_prefix` (each worker maps `$RUN/` onto its own prefix).
+    pub fn shard_replay(&mut self, run_prefix: &str, index: u32, count: u32) {
+        let Some(log) = &self.replay else { return };
+        if count <= 1 {
+            return;
+        }
+        let mut log = (**log).clone();
+        log.events.retain(|e| {
+            let k = e.op.key();
+            let k = k.strip_prefix(run_prefix).unwrap_or(k);
+            super::replay::shard_of(k, count) == index
+        });
+        self.replay = Some(Arc::new(log));
+    }
+
     /// The non-default load generator of this session (design v5 §7).
     pub fn client(&self) -> Option<&Arc<crate::clients::Driver>> {
         self.client.as_ref()

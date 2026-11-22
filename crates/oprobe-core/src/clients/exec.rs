@@ -456,6 +456,18 @@ pub fn records(
         .as_ref()
         .map(|e| format!("{} {}", e.code, e.message).trim().to_owned());
     let final_status = if r.status == 0 && r.ok { 200 } else { r.status };
+    // The service's error code of a failed final attempt (`SlowDown`, `NoSuchKey`, …), as the
+    // fidelity transport reads it from the error body.
+    let final_detail = r
+        .error
+        .as_ref()
+        .filter(|e| !r.ok && !e.code.is_empty())
+        .map(|e| {
+            Box::new(crate::trace::ReqDetail {
+                error_code: Some(e.code.clone()),
+                ..Default::default()
+            })
+        });
     let rec =
         |status: u16, offset: u64, t: RequestTiming, up: u64, down: u64, err: Option<String>| {
             RequestRecord {
@@ -479,6 +491,12 @@ pub fn records(
                 detail: None,
             }
         };
+    let with_detail = |mut v: Vec<RequestRecord>| {
+        if let Some(last) = v.last_mut() {
+            last.detail = final_detail.clone();
+        }
+        v
+    };
     let down = if bytes_up > 0 { 0 } else { r.bytes };
     if !r.attempt_log.is_empty() {
         let t0 = r.attempt_log[0].t_start_us;
@@ -507,7 +525,7 @@ pub fn records(
                 )
             })
             .collect();
-        return (out, 0);
+        return (with_detail(out), 0);
     }
     let n = r.requests.max(1) as u64;
     let total = r.total_us();
@@ -535,7 +553,7 @@ pub fn records(
         })
         .collect();
     // Retries the adapter counted without detail.
-    (out, r.attempts.saturating_sub(1) as u64)
+    (with_detail(out), r.attempts.saturating_sub(1) as u64)
 }
 
 impl Backend for Arc<ExecBackend> {
@@ -668,6 +686,29 @@ mod tests {
         assert!(recs[0].is_throttle());
         assert_eq!(recs[1].start_offset_us, 300);
         assert_eq!(recs[1].bytes_up, 64);
+    }
+
+    #[test]
+    fn a_failed_result_carries_the_service_error_code() {
+        let r = WireResult {
+            ok: false,
+            status: 503,
+            error: Some(WireError {
+                code: "SlowDown".into(),
+                message: "Please reduce your request rate.".into(),
+            }),
+            ..Default::default()
+        };
+        let (recs, _) = records(Api::GetObject, &r, 0, 0);
+        let d = recs.last().and_then(|x| x.detail.as_ref()).expect("detail");
+        assert_eq!(d.error_code.as_deref(), Some("SlowDown"));
+        // A success carries none.
+        let ok = WireResult {
+            ok: true,
+            status: 200,
+            ..Default::default()
+        };
+        assert!(records(Api::GetObject, &ok, 0, 0).0[0].detail.is_none());
     }
 
     #[test]

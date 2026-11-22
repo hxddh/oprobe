@@ -134,6 +134,91 @@ fn local_workers_merge_into_one_saved_run() {
 }
 
 #[test]
+fn local_workers_share_poisson_arrivals_and_the_run_file() {
+    let env = Env::new();
+    let (_rt, lab) = background_lab();
+    let o = env
+        .cmd()
+        .arg("run")
+        .args(lab_args(&lab.endpoint_url))
+        .args([
+            "-c",
+            "6",
+            "-d",
+            "2s",
+            "--rate",
+            "60",
+            "--arrivals",
+            "poisson",
+            "--workers",
+            "local:3",
+            "-o",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", err(&o));
+    let v = json(&o);
+    let r = &v["report"];
+    let s = &r["schedule"];
+    assert_eq!(s["open_loop"], true, "{s:#}");
+    assert_eq!(s["arrivals"], "poisson", "{s:#}");
+    // About 120 arrivals in total (3 × 20/s for 2 s), not 3 × 120.
+    let intended = s["intended_ops_count"].as_u64().unwrap();
+    assert!((40..=240).contains(&intended), "{s:#}");
+    let ops = r["summary"]["ops_count"].as_u64().unwrap();
+    assert!(ops > 0 && ops <= intended, "{ops} of {intended}");
+    // The saved run file holds the rows of every worker (ids carry the worker above bit 48).
+    let id = v["run_id"].as_str().unwrap();
+    let csv = env
+        .cmd()
+        .args(["runs", "export", id, "-f", "csv", "--table", "ops"])
+        .output()
+        .unwrap();
+    assert!(csv.status.success(), "{}", err(&csv));
+    let text = String::from_utf8_lossy(&csv.stdout);
+    let mut lines = text.lines();
+    let header: Vec<&str> = lines.next().unwrap().split(',').collect();
+    let col = header
+        .iter()
+        .position(|h| *h == "op_id")
+        .expect("op_id column");
+    let mut workers = std::collections::BTreeSet::new();
+    let mut rows = 0u64;
+    for l in lines {
+        let id: u64 = l.split(',').nth(col).unwrap().parse().unwrap();
+        workers.insert(id >> 48);
+        rows += 1;
+    }
+    assert_eq!(rows, ops, "every measured operation has its row");
+    assert_eq!(workers.len(), 3, "{workers:?}");
+}
+
+#[test]
+fn replay_needs_local_workers() {
+    let env = Env::new();
+    let token = env.path("token");
+    std::fs::write(&token, "0123456789abcdef0123456789abcdef").unwrap();
+    let log = env.path("access.log");
+    std::fs::write(&log, "").unwrap();
+    let o = env
+        .cmd()
+        .args(["run", "memory://", "--replay"])
+        .arg(&log)
+        .args(["--workers", "127.0.0.1:9", "--worker-token-file"])
+        .arg(&token)
+        .args(["-o", "json"])
+        .output()
+        .unwrap();
+    assert!(!o.status.success());
+    let all = format!("{}{}", String::from_utf8_lossy(&o.stdout), err(&o));
+    assert!(
+        all.contains("usage.invalid_argument") && all.contains("local:N"),
+        "{all}"
+    );
+}
+
+#[test]
 fn workers_need_their_token() {
     let env = Env::new();
     let token = env.path("token");

@@ -292,15 +292,20 @@ pub fn split_profile(p: &Profile, weights: &[f64]) -> Vec<Profile> {
         .map(|i| {
             let mut q = p.clone();
             q.knobs.concurrency = conc[i] as usize;
-            q.workload.rate = p.workload.rate.map(|r| r * weights[i] / sum);
+            let f = weights[i] / sum;
+            q.workload.rate = p.workload.rate.map(|r| r * f);
+            // A shaped rate keeps its shape at the worker's share (the shares add up to it).
+            q.workload.shape = p.workload.shape.as_ref().map(|s| s.scaled(f));
             q.workload.max_ops = max_ops.as_ref().map(|m| m[i]);
             if ds.existing_prefix.is_none() {
                 let mut d = ds.clone();
                 d.objects = objects[i] as usize;
                 q.workload.dataset = Some(d);
-                // Distinct objects per worker (and distinct persisted datasets).
-                q.workload.seed = p.workload.seed.wrapping_add(i as u64);
             }
+            // Distinct objects per worker (and distinct persisted datasets), and independent
+            // arrival processes: identical seeds would fire every worker's Poisson arrivals at
+            // the same instants.
+            q.workload.seed = p.workload.seed.wrapping_add(i as u64);
             q
         })
         .collect()
@@ -397,7 +402,11 @@ pub async fn coordinate(p: Plan<'_>) -> Result<Coordinated> {
             run_prefix: format!("{}{}/", p.rails.run_prefix, c.id),
             budgets: budgets[i].clone(),
             read_only: p.rails.read_only,
-            trace_max_requests_count: p.trace_max_requests,
+            // The run's trace limit is shared by weight, so the merged run file keeps it.
+            trace_max_requests_count: ((p.trace_max_requests as f64 * weights[i]
+                / weights.iter().sum::<f64>())
+            .ceil() as usize)
+                .max(1),
         };
         async move { c.post::<_, Ack>("/v1/prepare", &job).await }
     });
@@ -733,6 +742,25 @@ mod tests {
             .map(|q| q.workload.effective_dataset().objects)
             .sum();
         assert_eq!(split, total.max(2));
+        // A shaped rate keeps its shape at each worker's share; an existing dataset still
+        // gets independent seeds (independent Poisson arrivals).
+        p.workload.shape = Some("step:30,90/10s".parse().unwrap());
+        p.workload.arrivals = crate::engine::schedule::Arrivals::Poisson;
+        p.workload.dataset = Some(crate::config::DatasetSpec {
+            existing_prefix: Some("logs/".into()),
+            ..p.workload.effective_dataset()
+        });
+        let ps = split_profile(&p, &[1.0, 2.0]);
+        assert_eq!(
+            ps[0].workload.shape.as_ref().unwrap().to_string(),
+            "step:10,30/10s"
+        );
+        assert_eq!(
+            ps[1].workload.shape.as_ref().unwrap().to_string(),
+            "step:20,60/10s"
+        );
+        assert_eq!(ps[1].workload.arrivals, p.workload.arrivals);
+        assert_ne!(ps[0].workload.seed, ps[1].workload.seed);
         let b = split_budgets(
             &Budgets {
                 max_requests_count: Some(100),

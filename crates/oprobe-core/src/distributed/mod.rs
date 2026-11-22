@@ -211,6 +211,16 @@ pub async fn run(
     let set = &set.clone().with_config(ctx.config()?.workers.as_ref())?;
     let profile = r.profile;
     profile.validate()?;
+    // Every worker reads the log from its own disk: only local workers are sure to read the
+    // same file (each replays its share of the keys).
+    if profile.workload.replay.is_some() && set.local.is_none() {
+        return Err(OprobeError::new(
+            ErrorCode::UsageInvalidArgument,
+            "--replay does not combine with remote --workers (each would read its own copy of the log)",
+        )
+        .with_hint("replay on one machine, or with --workers local:N to split the log by key over local processes")
+        .into());
+    }
     let rails = crate::app::run::rails(ctx, &profile, &req.safety)?;
     let guard = crate::app::run::guard_for(ctx, &profile, &rails.budgets);
     if let Some(g) = &guard {
