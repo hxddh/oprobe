@@ -219,7 +219,10 @@ fn operator_toggles_a_layer_and_proves_it_against_the_lab() {
     // Prove saved its trial runs as children of the prove run: stored, hidden from the list.
     let app_ = App::new(cx.paths());
     let all = app_.list_all().unwrap().runs.len();
-    assert!(all > app_.list().unwrap().runs.len(), "trials are stored and hidden");
+    assert!(
+        all > app_.list().unwrap().runs.len(),
+        "trials are stored and hidden"
+    );
 }
 
 #[test]
