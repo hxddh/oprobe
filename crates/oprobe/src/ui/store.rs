@@ -163,8 +163,14 @@ impl Store {
             prove_job: stored(None),
         };
         s.refresh();
-        if let Some(id) = l.open {
-            s.open_run(&id);
+        // A run to open, else the newest run is ready in Profile and Operator.
+        match l.open {
+            Some(id) => s.open_run(&id),
+            None => {
+                if let Some(id) = s.runs.with_untracked(|r| r.first().map(|r| r.id.clone())) {
+                    s.load_run(&id, false);
+                }
+            }
         }
         set_interval(Duration::from_millis(100), move || s.poll());
         s
@@ -269,9 +275,16 @@ impl Store {
 
     /// Show stored run `id` in the Profile view (`App::show`, off the UI thread).
     pub fn open_run(&self, id: &str) {
+        self.load_run(id, true);
+    }
+
+    /// Load stored run `id` as the current run; `show` switches to Profile.
+    fn load_run(&self, id: &str, show: bool) {
         let (app, id, s) = (self.app(), id.to_owned(), *self);
         self.loading.set(true);
-        self.page.set(Page::Profile);
+        if show {
+            self.page.set(Page::Profile);
+        }
         self.root.run(|| {
             spawn(async move {
                 let res = jobs::off_thread(move || {

@@ -170,11 +170,7 @@ fn field_row(
             } else {
                 base.clone()
             },
-            move || {
-                s.edits
-                    .with(|e| e.get(path).cloned())
-                    .unwrap_or_else(now)
-            },
+            move || s.edits.with(|e| e.get(path).cloned()).unwrap_or_else(now),
             move |v| s.edit(path, &v),
         )
         .w(px(110.0))

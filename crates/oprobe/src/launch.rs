@@ -36,13 +36,17 @@ fn open(_: &Cli, _: bool) -> ExitCode {
 
 #[cfg(feature = "app")]
 fn open(cli: &Cli, terminal: bool) -> ExitCode {
+    let window = desktop(terminal);
     #[cfg(feature = "gui")]
-    if desktop(terminal).is_ok() {
+    if window.is_ok() {
         detach_console();
         return crate::ui::run_gui();
     }
     if !terminal {
-        return help("the app opens when `oprobe` runs in a terminal or on a desktop");
+        let why = window.err().unwrap_or_default();
+        return help(&format!(
+            "the app opens when `oprobe` runs in a terminal or on a desktop (no window: {why})"
+        ));
     }
     let monochrome = match cli.color {
         crate::cli::args::ColorChoice::Always => false,
