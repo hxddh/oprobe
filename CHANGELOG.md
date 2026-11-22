@@ -158,6 +158,9 @@ Design [v5](docs/design/v5.md). The changes under **Changed** are breaking.
   (`capacity.hypotheses`); the 4.x ceiling and rate fields follow the selected hypothesis. The
   lab gains limit faults with one scenario each: `ratelimit`, `hotkey`, `bandwidth`, `queueing`
   (an M/M/4 queue), `timevarying` and `noisy` (random 5xx unrelated to the load).
+  The in-flight ceiling's `lo..hi` bracket spans every plausible split plus one level of
+  measurement error; `requests` is the likeliest split and the safe concurrency, tune and the
+  in-flight advice apply their headroom to it (4.x used `lo`).
 - **Advice per limit model.** The throttling finding's advice depends on the selected
   hypothesis (rate, per-key, time-varying, random, inconclusive); a queue, a bandwidth cap or a
   busy client no longer gets "add workers". Retried 5xx are reported even under throttling, and
@@ -165,7 +168,8 @@ Design [v5](docs/design/v5.md). The changes under **Changed** are breaking.
 - **Two-sided verify with an SPRT.** `verify` runs 2 to 8 interleaved pairs (`--repeat`) and
   stops a finding early once its sequential test decides, with bounded log-ratio and
   Wilson/Newcombe intervals; each finding gets a net verdict (`improved`, `regressed`,
-  `traded`, `no_change`, `inconclusive`).
+  `traded`, `no_change`, `inconclusive`), the same one `compare` shows for those runs. A loss
+  within a confirmed prediction (fewer streams under a bandwidth cap) never refutes a finding.
 - **Three-tier gate.** Each compare check is `fail` (significantly worse and over the limit),
   `warn` (significantly worse within the limit) or `inconclusive` (not significant, but the
   interval reaches past the limit), next to `pass`/`improved`; the gate verdict gains `warned`
