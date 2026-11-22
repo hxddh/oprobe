@@ -61,6 +61,16 @@ fn median(v: &mut [f64]) -> f64 {
 }
 
 fn main() {
+    // Test runners (cargo-nextest with `--all-targets`) list a harness-less bench with the
+    // libtest `--list` protocol: report one benchmark (none when asked for ignored ones), so it
+    // is listed and never run as a test.
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--list") {
+        if !args.iter().any(|a| a == "--ignored") {
+            println!("overhead: benchmark");
+        }
+        return;
+    }
     let o = opts();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
