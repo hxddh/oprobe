@@ -71,6 +71,12 @@ fn main() {
         }
         return;
     }
+    // A test runner runs listed targets without `--bench`; the budget is meant for an
+    // optimised `cargo bench` build (the CI overhead job), so do nothing here.
+    if !args.iter().any(|a| a == "--bench") {
+        println!("overhead: measured by `cargo bench -p oprobe-trace --bench overhead`");
+        return;
+    }
     let o = opts();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
