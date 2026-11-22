@@ -547,8 +547,7 @@ mod tests {
         let e = app
             .run(req, &EventSink::silent(), Cancel::new())
             .await
-            .err()
-            .expect("budget breach");
+            .expect_err("budget breach");
         assert_eq!(
             crate::errors::classify(&e, "s3").code,
             ErrorCode::SafetyBudgetExceeded
@@ -591,8 +590,7 @@ mod tests {
             "wrong",
         )
         .await
-        .err()
-        .expect("refused");
+        .expect_err("refused");
         assert_eq!(
             crate::errors::classify(&e, "s3").code,
             ErrorCode::AuthDenied

@@ -221,7 +221,7 @@ fn merge_apis(parts: &[&Snapshot]) -> Vec<ApiStats> {
             }
         })
         .collect();
-    out.sort_by(|a, b| b.count.cmp(&a.count));
+    out.sort_by_key(|a| std::cmp::Reverse(a.count));
     out
 }
 

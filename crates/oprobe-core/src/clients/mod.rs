@@ -578,8 +578,7 @@ mod tests {
             &Knobs::default(),
         )
         .await
-        .err()
-        .expect("refused");
+        .expect_err("refused");
         let msg = format!("{e:#}");
         assert!(
             msg.contains("exited before answering") && msg.contains("boom"),
@@ -593,8 +592,7 @@ mod tests {
             &Knobs::default(),
         )
         .await
-        .err()
-        .expect("refused");
+        .expect_err("refused");
         assert!(format!("{e:#}").contains("cannot start"));
     }
 }

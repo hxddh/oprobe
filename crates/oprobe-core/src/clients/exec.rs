@@ -300,13 +300,12 @@ impl ExecBackend {
     pub async fn shutdown(&self) {
         let _ = self.tx.send("{\"type\":\"shutdown\"}\n".into());
         let child = self.child.lock().unwrap_or_else(|e| e.into_inner()).take();
-        if let Some(mut c) = child {
-            if tokio::time::timeout(Duration::from_secs(2), c.wait())
+        if let Some(mut c) = child
+            && tokio::time::timeout(Duration::from_secs(2), c.wait())
                 .await
                 .is_err()
-            {
-                let _ = c.kill().await;
-            }
+        {
+            let _ = c.kill().await;
         }
     }
 }

@@ -46,6 +46,18 @@ pub struct Conn {
     pub trusted: bool,
 }
 
+impl std::fmt::Debug for Conn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never the token.
+        f.debug_struct("Conn")
+            .field("id", &self.id)
+            .field("addr", &self.addr)
+            .field("offset_us", &self.offset_us)
+            .field("rtt_us", &self.rtt_us)
+            .finish_non_exhaustive()
+    }
+}
+
 fn err(code: ErrorCode, msg: impl Into<String>) -> OprobeError {
     OprobeError::new(code, msg)
 }
