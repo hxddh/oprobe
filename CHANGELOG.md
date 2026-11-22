@@ -93,6 +93,24 @@ Everything under **Changed** and **Removed** is breaking; 5.x run files are not 
 - Docs: `ci.md`, `cost.md`, `agents.md`, `metrics.md`, `tuning.md`, `workloads.md`,
   `reading-the-report.md` (what is still true moved into the new pages).
 
+### Known limitations
+
+- **Validated without cloud credentials.** Every finding and every `prove` verdict has been
+  checked against the lab, a fault-injecting proxy, MinIO, fake-gcs-server and Azurite — not
+  yet against AWS S3, R2, GCS or Azure. Results name the environment they were measured in.
+- **Throttling on OpenDAL's default retry** (1 s backoff, no jitter): a concurrency cap removes
+  the throttling but often leaves goodput unchanged, so `prove` reports *inconclusive* on
+  goodput; use `--objective p99` to judge such changes on latency.
+- **`bandwidth_cap` on reads:** OpenDAL 0.59's `ThrottleLayer` shapes writes only, so `prove`
+  sizes the cap from the fitted limit but cannot show a read-side gain.
+- **`key_limit`'s remedy** is a change to the key layout, not a layer; `prove` tests a client-side
+  cap as a stand-in and says so.
+- **Production profiles** (`oprobe.trace/6`) hold requests, not operations: each request counts
+  as one operation, findings that need operations or load variation are not derived, and
+  `prove` refuses them.
+- **`client_bound`** fires when the scheduler lags more than 5 ms at p99; on a busy shared
+  machine it can lead the brief. Latency findings whose delay dwarfs that lag are kept.
+
 ## v5.0.0 — 2026-11-22
 
 Design [v5](docs/design/v5.md). The changes under **Changed** are breaking.
