@@ -530,6 +530,32 @@ fn estimate_ceiling(reqs: &[ReqRow], ops: &[OpRow], window: Window) -> Capacity 
 /// The highest class-balanced error a ceiling split may have (1.0 = no better than no split).
 const MAX_SPLIT_COST: f64 = 0.75;
 
+/// The level at or below which throttling is rarest and above which it is most common: the
+/// split of `lv` (`(level, clean, throttled)`, in level order) that maximises the likelihood of
+/// one throttled share below it and another above.
+fn likelihood_split(lv: &[(u64, u64, u64)]) -> u64 {
+    let bern = |k: u64, n: u64| {
+        if k == 0 || k == n {
+            return 0.0;
+        }
+        let p = k as f64 / n as f64;
+        k as f64 * p.ln() + (n - k) as f64 * (1.0 - p).ln()
+    };
+    let tot_c: u64 = lv.iter().map(|x| x.1).sum();
+    let tot_t: u64 = lv.iter().map(|x| x.2).sum();
+    let (mut c0, mut t0) = (0u64, 0u64);
+    let mut best = (f64::NEG_INFINITY, 0u64);
+    for (l, c, t) in lv {
+        c0 += c;
+        t0 += t;
+        let ll = bern(t0, c0 + t0) + bern(tot_t - t0, tot_c - c0 + tot_t - t0);
+        if ll > best.0 + 1e-9 {
+            best = (ll, *l);
+        }
+    }
+    best.1
+}
+
 /// Move the split `k` up past the levels right above it that were served (almost) cleanly:
 /// ≥ 3 arrivals, at most 10 % throttled. `lv` is `(level, clean, throttled)` in level order.
 pub(crate) fn nudge_past_clean_levels(lv: &[(u64, u64, u64)], mut k: u64) -> u64 {
@@ -570,12 +596,20 @@ fn find_ceiling(levels: &BTreeMap<u64, (u64, u64)>) -> Option<(Ceiling, u64)> {
             best = (cost, *l, thr_below + clean_above);
         }
     }
-    let (cost, k, errors) = best;
+    let (cost, _, errors) = best;
     // No split (cost 1.0) explains throttling unrelated to load just as well; a ceiling needs a
     // split that clearly separates the classes (balanced accuracy above 62.5 %).
     if cost > MAX_SPLIT_COST {
         return None;
     }
+    // Where the split lies is a question of rates, not of counts: the level at which the
+    // throttled share jumps (a two-rate Bernoulli likelihood). The balanced cost above decides
+    // only whether there is a ceiling at all. With a dozen throttled responses each weighs as
+    // much as hundreds of clean requests there, so on a loaded machine — where the client's
+    // in-flight count also reads a level or more low now and then — five stray throttles at
+    // 18–23 (≈ 0.7 % of those levels, against 25–60 % from 24 on) pulled the split down to
+    // 17 on a lab limited at 24.
+    let k = likelihood_split(&lv);
     // ±1 measurement error: the client's in-flight count is a level off the server's now and
     // then (coarse scheduling on Windows), so a lone throttled arrival can land one level low —
     // or a clean one a level high. A level just above the split that still served ≥ 90 % of
@@ -1378,6 +1412,42 @@ mod tests {
 
     /// Windows CI, parquet lab (limit 24): a clean level 25 (1 throttled of 13, the client's
     /// count a level high) must not lift the ceiling above 24 either.
+    /// A parquet lab (limit 24) on a loaded 4-core machine: stray throttles one per level at
+    /// 18–23 (the client's in-flight count reads low when it is descheduled) must not pull the
+    /// ceiling down to 17.
+    #[test]
+    fn stray_throttles_below_the_limit_do_not_lower_the_ceiling() {
+        let mut levels: BTreeMap<u64, (u64, u64)> = (1..=9u64).map(|l| (l, (200, 0))).collect();
+        for (l, n, t) in [
+            (10u64, 211u64, 0u64),
+            (11, 293, 0),
+            (12, 210, 0),
+            (13, 256, 0),
+            (14, 370, 0),
+            (15, 217, 0),
+            (16, 238, 0),
+            (17, 279, 0),
+            (18, 146, 1),
+            (19, 145, 1),
+            (20, 153, 1),
+            (21, 75, 1),
+            (22, 65, 0),
+            (23, 57, 1),
+            (24, 13, 1),
+            (25, 15, 5),
+            (26, 8, 1),
+            (27, 5, 3),
+            (28, 3, 1),
+            (29, 2, 1),
+        ] {
+            levels.insert(l, (n, t));
+        }
+        let (c, _) = find_ceiling(&levels).expect("a ceiling");
+        assert!(c.lo <= 24.0 && 24.0 < c.hi, "{c:?}");
+        // 24 × 0.85 / 4 parquet requests per op → 4 or 5 workers, not 3.
+        assert!(c.lo >= 22.0, "{c:?}");
+    }
+
     #[test]
     fn a_clean_level_one_above_the_limit_does_not_raise_the_ceiling() {
         let win: [(u64, u64, u64); 29] = [

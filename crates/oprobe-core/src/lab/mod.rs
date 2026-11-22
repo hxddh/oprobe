@@ -1051,12 +1051,11 @@ async fn handle_s3_request(
     if !faults.base_ttfb_delay.is_zero() {
         tokio::time::sleep(faults.base_ttfb_delay).await;
     }
-    // 2b. An M/M/c queue: wait for a server, then the service time (the permit is released
-    // once the handler has answered, before the body streams).
-    let _server = match (&faults.queue, is_delete_cleanup) {
-        (Some(q), false) => store.limits.serve_queued(q).await,
-        _ => None,
-    };
+    // 2b. An M/M/c queue: wait for a server, then the service time (the server is free again
+    // at its deadline, before the body streams).
+    if let (Some(q), false) = (&faults.queue, is_delete_cleanup) {
+        store.limits.serve_queued(q).await;
+    }
     if !is_delete_cleanup
         && faults.straggler_every_n > 0
         && seq.is_multiple_of(faults.straggler_every_n as u64)

@@ -13,7 +13,7 @@
 //! - **Random 5xx mix** ([`LabConfig::server_error_ratio`](super::LabConfig)): a share of
 //!   requests answered `503`/`500` at random, unrelated to the load.
 //!
-//! The runtime state (buckets, the queue's semaphore, the shared byte clock) lives in
+//! The runtime state (buckets, the queue's server clocks, the shared byte clock) lives in
 //! [`LimitState`], one per lab server.
 
 use std::collections::HashMap;
@@ -85,7 +85,9 @@ pub struct LimitState {
     first: Mutex<Option<Instant>>,
     global: Mutex<Option<Bucket>>,
     keys: Mutex<HashMap<String, Bucket>>,
-    queue: Mutex<Option<(usize, std::sync::Arc<tokio::sync::Semaphore>)>>,
+    /// When each of the queue's servers is next free (virtual time, see
+    /// [`LimitState::serve_queued`]).
+    queue: Mutex<Vec<Instant>>,
     /// When the shared byte budget is next free (the aggregate bandwidth cap).
     byte_clock: Mutex<Option<Instant>>,
     rng: AtomicU64,
@@ -97,7 +99,7 @@ impl Default for LimitState {
             first: Mutex::new(None),
             global: Mutex::new(None),
             keys: Mutex::new(HashMap::new()),
-            queue: Mutex::new(None),
+            queue: Mutex::new(Vec::new()),
             byte_clock: Mutex::new(None),
             rng: AtomicU64::new(0x9e37_79b9_7f4a_7c15),
         }
@@ -172,29 +174,39 @@ impl LimitState {
     }
 
     /// Wait in line for one of the queue's servers, then for an exponentially distributed
-    /// service time. The returned permit frees the server when dropped.
-    pub async fn serve_queued(&self, q: &QueueFault) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    /// service time (first come, first served).
+    ///
+    /// The servers run on virtual time: an arrival takes the server that frees first, starts
+    /// at `max(now, free_at)` and moves that server's `free_at` to its own end, then sleeps
+    /// until that deadline. A sleep that wakes late (timer coalescing on macOS, the 15.6 ms
+    /// park of an idle runtime on Windows) only delays its own response, never the next
+    /// request's start, so the capacity is exactly `servers / service` whatever the runtime's
+    /// timer resolution. Holding a semaphore for the sleep's actual length made the capacity
+    /// grow with the workers on those systems: a busier runtime overslept less.
+    pub async fn serve_queued(&self, q: &QueueFault) {
+        if let Some(end) = self.reserve_server(q, Instant::now()) {
+            tokio::time::sleep_until(end.into()).await;
+        }
+    }
+
+    /// Book the server that frees first for one request arriving at `now`; its deadline.
+    fn reserve_server(&self, q: &QueueFault, now: Instant) -> Option<Instant> {
         if q.servers == 0 {
             return None;
         }
-        let sem = {
-            let mut g = lock(&self.queue);
-            match g.as_ref() {
-                Some((n, s)) if *n == q.servers => s.clone(),
-                _ => {
-                    let s = std::sync::Arc::new(tokio::sync::Semaphore::new(q.servers));
-                    *g = Some((q.servers, s.clone()));
-                    s
-                }
-            }
-        };
-        let permit = sem.acquire_owned().await.ok()?;
         let u = self.uniform().max(1e-9);
-        let service = q.service.as_secs_f64() * -u.ln();
+        let mean = q.service.as_secs_f64();
         // Cap a single service time at 20 means so one sample cannot stall a short run.
-        let service = service.min(q.service.as_secs_f64() * 20.0);
-        tokio::time::sleep(Duration::from_secs_f64(service)).await;
-        Some(permit)
+        let service = Duration::from_secs_f64((mean * -u.ln()).min(mean * 20.0));
+        let mut free = lock(&self.queue);
+        if free.len() != q.servers {
+            *free = vec![now; q.servers];
+        }
+        let next = free.iter_mut().min().expect("at least one server");
+        // An idle server banks no credit: it starts now.
+        let end = (*next).max(now) + service;
+        *next = end;
+        Some(end)
     }
 
     /// Reserve `bytes` of the aggregate byte budget (`kib_s` KiB/s shared by every stream) and
@@ -280,5 +292,42 @@ mod tests {
         let b = s.pace_bytes(512 * 1024, 1024, t);
         assert!(b > a, "{a:?} {b:?}");
         assert!((b - a).as_secs_f64() > 0.45, "{a:?} {b:?}");
+    }
+
+    /// The queue's capacity is `servers / service` on virtual time, however late the sleeps
+    /// wake: 800 requests arriving at once on 4 servers of 10 ms finish ≈ 2 s later, and a
+    /// request booked late (its predecessor's sleep overslept) still starts at the server's
+    /// deadline, not at the late wake.
+    #[test]
+    fn the_queue_capacity_follows_deadlines_not_sleeps() {
+        let s = LimitState::default();
+        let q = QueueFault {
+            servers: 4,
+            service: Duration::from_millis(10),
+        };
+        let t = Instant::now();
+        let last = (0..800)
+            .map(|_| s.reserve_server(&q, t).unwrap())
+            .max()
+            .unwrap();
+        let span = (last - t).as_secs_f64();
+        assert!(
+            (1.7..=2.3).contains(&span),
+            "800 × 10 ms / 4 servers took {span:.2} s"
+        );
+        // Arrivals that keep the servers busy (each a little after the last booking, as when
+        // the runtime wakes late) still see the same throughput: the backlog sets the start.
+        let s = LimitState::default();
+        let mut now = t;
+        let mut end = t;
+        for i in 0..800 {
+            end = end.max(s.reserve_server(&q, now).unwrap());
+            if i % 4 == 3 {
+                now += Duration::from_millis(1);
+            }
+        }
+        let span = (end - t).as_secs_f64();
+        assert!((1.7..=2.3).contains(&span), "{span:.2} s");
+        assert_eq!(s.reserve_server(&QueueFault { servers: 0, ..q }, t), None);
     }
 }
