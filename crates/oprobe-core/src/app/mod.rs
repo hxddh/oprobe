@@ -196,7 +196,7 @@ pub struct RunRequest {
     /// Compare against (and add to) a named baseline (`run --baseline`).
     #[serde(default)]
     pub baseline: Option<String>,
-    /// What generates the load (design v5 §7; only `opendal` today).
+    /// What generates the load (design v5 §7).
     #[serde(default)]
     pub client: ClientChoice,
     /// Distributed load (design v5 §8; `None`: this process).
@@ -319,7 +319,16 @@ impl App {
             w.check_supported()?;
         }
         let ctx = self.ctx(sink);
-        let r = self.profile_of(&req)?;
+        let mut r = self.profile_of(&req)?;
+        // Runtime only (design v5 §7): the engine starts this client; specs never carry it.
+        r.profile.client = req.client.clone();
+        if let Some(w) = &req.workers
+            && !req.safety.dry_run
+        {
+            return crate::distributed::run(&ctx, r, &req, w, cancel)
+                .await
+                .map(|o| RunOutcome::Run(Box::new(o)));
+        }
         if req.repeat > 1 || req.baseline.is_some() {
             return repeat::run_repeat(&ctx, r, &req, cancel).await;
         }

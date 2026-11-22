@@ -83,6 +83,22 @@ The foundation of 5.0 (design [v5](docs/design/v5.md) §12 F). Everything below 
   nightly only. crates.io publishes `oprobe-trace`, `oprobe-core`, `oprobe` in order.
 - Text: "1 request" (not "1 requests"); watch prints SLO values in their unit.
 
+### Added (stream SCALE: clients and distributed load, design v5 §7–§8)
+
+- **`--client aws-sdk | exec:COMMAND`.** Drive any workload with aws-sdk-s3 (cargo feature
+  `aws-sdk`, over oprobe's instrumented transport) or with an external adapter speaking the
+  versioned oprobe client protocol `oprobe.client/1` (NDJSON over stdin/stdout, documented in
+  [docs/clients.md](docs/clients.md); schemas `client-hello`, `client-hello-reply`,
+  `client-op`, `client-result`). `report.client` names the client, its version and the stages
+  it observes; findings that need other stages are suppressed with a warning. The client is
+  never stored in a run's spec. Reference adapters in `adapters/`: `minimal` (Python standard
+  library), `boto3`, `awscrt` and `go-sdk` (aws-sdk-go-v2 with `httptrace`).
+- **`oprobe worker` and `--workers host:port[*WEIGHT],… | local:N`.** Token-authenticated
+  workers (`oprobe.worker/1`, h2c or TLS); the coordinator checks versions and clock offsets,
+  splits concurrency, rate, dataset and budgets, starts every worker at one instant, enforces
+  the global budgets, fans out cancellation and merges the workers' snapshots and trace rows
+  into one run with `report.workers[]` and `report.dimensions.workers[]`.
+
 ## v4.0.2 — 2026-11-21
 
 ### Fixed

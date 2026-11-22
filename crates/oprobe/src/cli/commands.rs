@@ -39,6 +39,17 @@ pub async fn run(mut a: RunArgs, ctx: &Ctx) -> Result<u8> {
     let req = RunRequest {
         repeat: a.repeat,
         baseline: a.baseline.clone(),
+        client: match &a.load.client {
+            Some(c) => app::ClientChoice::parse(c)?,
+            None => app::ClientChoice::default(),
+        },
+        workers: match &a.load.workers {
+            Some(w) => Some(app::WorkerSet {
+                token_file: a.load.worker_token_file.clone(),
+                ..app::WorkerSet::parse(w)?
+            }),
+            None => None,
+        },
         ..RunRequest::new(resolved)
             .with_safety(a.safety.into())
             .with_output(a.output.into())

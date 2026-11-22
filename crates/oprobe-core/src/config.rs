@@ -111,6 +111,11 @@ pub struct Profile {
     pub sla: Sla,
     #[serde(default)]
     pub cost: CostSpec,
+    /// What generates the load (`--client`, design v5 §7). Runtime only: never serialized, so
+    /// a stored spec cannot start a command; a replay uses the default client.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub client: crate::clients::ClientChoice,
 }
 
 /// Storage target. Either `url = "s3://bucket/prefix"` or explicit `scheme` + `options`.
@@ -1586,6 +1591,7 @@ impl Profile {
             knobs: Knobs::default(),
             sla: Sla::default(),
             cost: CostSpec::default(),
+            client: Default::default(),
         };
         if let Some(sc) = scenario {
             sc.apply_defaults(&mut p);

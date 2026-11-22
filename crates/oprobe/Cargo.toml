@@ -43,6 +43,8 @@ gui = ["tui", "dep:nsh-platform-linux", "dep:nsh-platform-macos", "dep:nsh-platf
 default-services = ["oprobe-core/default-services"]
 all-services = ["oprobe-core/all-services"]
 otel = ["oprobe-core/otel"]
+# `--client aws-sdk`: drive the workload with aws-sdk-s3 (Rust) instead of OpenDAL.
+aws-sdk = ["oprobe-core/aws-sdk"]
 
 [dependencies]
 oprobe-core.workspace = true

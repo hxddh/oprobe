@@ -139,6 +139,28 @@
         "url"
       ],
       "type": "object"
+    },
+    "WorkersConfig": {
+      "additionalProperties": false,
+      "description": "`[workers]` in the config file.",
+      "properties": {
+        "addrs": {
+          "default": [],
+          "description": "`host:port[*WEIGHT]` of each `oprobe worker` (`https://host:port` for TLS workers).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "token_file": {
+          "description": "The token file the workers were started with.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
     }
   },
   "$id": "https://github.com/hxddh/oprobe/schemas/4/config.json",
@@ -155,6 +177,17 @@
         "$ref": "#/$defs/TargetEntry"
       },
       "type": "object"
+    },
+    "workers": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/WorkersConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Workers of distributed runs (`oprobe run --workers config`, design v5 §8)."
     }
   },
   "title": "oprobe config",

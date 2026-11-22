@@ -48,6 +48,7 @@ pub fn table() -> Vec<(&'static str, &'static [OutputFormat])> {
         ("baseline show", f::<app::compare::BaselineShow>()),
         ("baseline calibrate", f::<app::compare::CalibrateOutput>()),
         ("lab", f::<app::misc::LabOutput>()),
+        ("worker", f::<crate::distributed::WorkerOutput>()),
         ("mcp", DEFAULT_FORMATS),
         ("schema", f::<crate::mcp::schemas::SchemaList>()),
         (
