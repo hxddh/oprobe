@@ -89,8 +89,22 @@ impl Ctx {
     }
 }
 
+/// From the target's Health (the main screen at start), open its newest run.
+fn open_run(app: &mut Headless) {
+    wait_long(app, "role:button[Open Latest Run]");
+    app.press("role:button[Open Latest Run]").unwrap();
+}
+
 /// Open an inspector tab once the run has loaded.
 fn tab(app: &mut Headless, name: &str) {
+    if app
+        .screen()
+        .count("role:button[Open Latest Run]")
+        .unwrap_or(0)
+        > 0
+    {
+        open_run(app);
+    }
     wait_long(app, &format!("text:{name}"));
     app.press(&format!("text:{name}")).unwrap();
 }
@@ -202,7 +216,8 @@ fn brushing_the_heatmap_explains_the_selection() {
     let cx = Ctx::new();
     cx.seed("memory://", 1, "4");
     let mut app = cx.start();
-    app.wait_for("id:heatmap").unwrap();
+    open_run(&mut app);
+    wait_long(&mut app, "id:heatmap");
     app.drag("id:heatmap", point(px(-250.0), px(-40.0)))
         .unwrap();
     app.wait_for("text:What is different about these requests")
@@ -414,6 +429,7 @@ fn single_letter_shortcuts_stay_out_of_text_fields() {
     let a = cx.seed("memory://", 1, "2");
     let b = cx.seed("memory://", 1, "2");
     let mut app = cx.start_on(Idiom::Terminal, Size::new(Points(960.0), Points(480.0)));
+    open_run(&mut app);
     wait_long(&mut app, "text:WHERE OPERATION TIME GOES");
     // `/` focuses the filter; keys pressed there must not run `c` (compare), `n` (new run),
     // `r` (run again) or `v` (verify): the keymap leaves them to the field.
@@ -453,6 +469,7 @@ fn rerun_replays_the_runs_spec_without_loss() {
     let id = cx.seed("memory://", 1, "3");
     let before = load(&cx.store(), &id).report.spec;
     let mut app = cx.start();
+    open_run(&mut app);
     wait_long(&mut app, "text:WHERE OPERATION TIME GOES");
     app.press("role:button[Re-run]").unwrap();
     wait_until(&mut app, 120, "the re-run is saved", |_| {
@@ -476,6 +493,7 @@ fn compare_pairs_the_same_target_and_workload_by_default() {
     cx.seed("memory://", 2, "2");
     let c = cx.seed("memory://", 1, "2");
     let mut app = cx.start();
+    open_run(&mut app);
     wait_long(&mut app, "text:WHERE OPERATION TIME GOES");
     app.press("role:button[Compare] >> nth=0").unwrap();
     wait_long(&mut app, &format!("text:{a} → {c}"));
@@ -529,6 +547,7 @@ fn the_terminal_at_120x30_keeps_tabs_visible_and_tiles_unwrapped() {
     let cx = Ctx::new();
     cx.seed("memory://", 1, "2");
     let mut app = cx.start_on(Idiom::Terminal, Size::new(Points(960.0), Points(480.0)));
+    open_run(&mut app);
     wait_long(&mut app, "text:WHERE OPERATION TIME GOES");
     let texts = text_bounds(&app);
     let find = |label: &str| {
@@ -608,4 +627,112 @@ fn add_target_asks_for_the_bucket_tests_read_only_and_saves() {
     wait_long(&mut app, "text:TARGETS (1)");
     let cfg = ConfigFile::load(&cx.dir.path().join("config.toml")).unwrap();
     assert_eq!(cfg.targets["scratch"].url, "memory://");
+}
+
+// ---------------------------------------------------------------------------------------
+// oprobe 5.0 (design v5 §9)
+// ---------------------------------------------------------------------------------------
+
+#[test]
+fn health_is_the_main_screen_with_tiles_hypothesis_and_history() {
+    let cx = Ctx::new();
+    let a = cx.seed("memory://", 1, "2");
+    let b = cx.seed("memory://", 1, "4");
+    let mut app = cx.start();
+    wait_long(&mut app, "id:health-ops");
+    for id in ["id:health-p99", "id:health-throttled", "id:health-cost"] {
+        app.wait_for(id).unwrap();
+    }
+    app.wait_for("text:/^Health of /").unwrap();
+    wait_long(&mut app, "id:health-hypothesis");
+    app.wait_for("text:HISTORY").unwrap();
+    // Both runs are in the history with their date, preset and verdict (U10).
+    assert!(
+        app.screen().count("text:/^small-files · /").unwrap_or(0) >= 2,
+        "the history names the preset of both runs ({a}, {b})"
+    );
+    // The latest run opens from here; the tabs come back.
+    open_run(&mut app);
+    wait_long(&mut app, "text:WHERE OPERATION TIME GOES");
+    // And the target's header in the sidebar leads back.
+    app.press("role:button[/^Health of /]").unwrap();
+    app.wait_for("id:health-ops").unwrap();
+}
+
+#[test]
+fn the_waterfall_opens_from_the_keyboard_with_the_critical_path() {
+    let cx = Ctx::new();
+    cx.seed("memory://", 1, "4");
+    let mut app = cx.start_on(Idiom::Terminal, Size::new(Points(960.0), Points(480.0)));
+    open_run(&mut app);
+    wait_long(&mut app, "text:WHERE OPERATION TIME GOES");
+    app.press_key("w").unwrap();
+    wait_long(&mut app, "id:waterfall");
+    app.wait_for("text:/critical path/").unwrap();
+    app.wait_for("text:WATERFALL").unwrap();
+}
+
+#[test]
+fn keyboard_sorts_pages_and_brushes() {
+    let cx = Ctx::new();
+    cx.seed("memory://", 1, "4");
+    let mut app = cx.start_on(Idiom::Terminal, Size::new(Points(960.0), Points(480.0)));
+    open_run(&mut app);
+    wait_long(&mut app, "text:WHERE OPERATION TIME GOES");
+    // [ ] { } brush the heatmap from the keyboard: the attribution follows.
+    app.press_key("]").unwrap();
+    wait_long(&mut app, "text:/requests between/");
+    app.press_key("shift+]").unwrap();
+    wait_long(&mut app, "text:/slower than/");
+    app.press_key("escape").unwrap();
+    // > sorts by the next column (slowest first), < reverses it.
+    app.press_key("2").unwrap();
+    app.wait_for("id:requests-table").unwrap();
+    app.press_key("shift+.").unwrap();
+    app.wait_for("text:sorted by Total ↓").unwrap();
+    app.press_key("shift+,").unwrap();
+    app.wait_for("text:sorted by Total ↑").unwrap();
+    // Page and jump keys move the focused row (the inspector follows it).
+    app.press_key("pagedown").unwrap();
+    app.press_key("shift+g").unwrap();
+    app.press_key("g").unwrap();
+    app.wait_for(
+        "text:/^GetObject|^PutObject|^HeadObject|^ListObjects|^DeleteObject|Stat|Read|Write/",
+    )
+    .ok();
+}
+
+#[test]
+fn palette_commands_run_under_the_app_and_toasts_use_the_terminal_status_row() {
+    let cx = Ctx::new();
+    let id = cx.seed("memory://", 1, "2");
+    let mut app = cx.start_on(Idiom::Terminal, Size::new(Points(960.0), Points(480.0)));
+    open_run(&mut app);
+    wait_long(&mut app, "text:WHERE OPERATION TIME GOES");
+    // `:` opens the palette; fuzzy matching finds "Copy Link to This View" from "cplink".
+    app.press_key("shift+;").unwrap();
+    app.wait_for("text:Copy Link to This View").unwrap();
+    app.type_text("role:searchbox >> nth=0", "cplink").ok();
+    app.press("text:Copy Link to This View").unwrap();
+    // The toast is in the status row (U13), not over the content.
+    wait_long(&mut app, "id:status-toast");
+    app.wait_for("text:Copied the link to this view").unwrap();
+    let link = app.screen().clipboard().unwrap_or_default().to_owned();
+    assert!(
+        link.starts_with(&format!("oprobe://run/{id}")),
+        "clipboard: {link}"
+    );
+    let v = oprobe::ui::model::link::ViewState::parse(&link).unwrap();
+    assert_eq!(v.run_id, id);
+}
+
+#[test]
+fn disabled_palette_commands_say_why() {
+    let cx = Ctx::new();
+    let mut app = cx.start();
+    app.wait_for("text:Try the demo").unwrap();
+    app.press("role:button[Commands]").unwrap();
+    app.wait_for("text:Verify Top Finding").unwrap();
+    app.wait_for("text:— nothing is running").unwrap();
+    app.wait_for("text:— needs two runs").unwrap();
 }

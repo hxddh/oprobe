@@ -1,6 +1,7 @@
 //! The screens, composed from `kit` and `chart`.
 
 pub mod compare;
+pub mod health;
 pub mod inspector;
 pub mod overview;
 pub mod requests;

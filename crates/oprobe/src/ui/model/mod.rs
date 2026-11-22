@@ -6,6 +6,12 @@ pub mod cloud;
 pub mod commands;
 pub mod compare;
 pub mod fmt;
+pub mod health;
+pub mod hints;
+pub mod i18n;
+pub mod icons;
+pub mod link;
+pub mod live;
 pub mod metrics;
 pub mod requests;
 pub mod run;
@@ -13,7 +19,9 @@ pub mod runs;
 pub mod scale;
 pub mod series;
 pub mod target;
+pub mod verdicts;
 pub mod verify;
+pub mod waterfall;
 
 use serde::{Deserialize, Serialize};
 
@@ -51,6 +59,19 @@ impl Tab {
         }
     }
 
+    /// The tab's title in the App's language.
+    pub fn title(self) -> &'static str {
+        use crate::ui::model::i18n::tr;
+        match self {
+            Tab::Overview => tr("tab.overview"),
+            Tab::Requests => tr("tab.requests"),
+            Tab::Timeline => tr("tab.timeline"),
+            Tab::Connections => tr("tab.connections"),
+            Tab::Findings => tr("tab.findings"),
+            Tab::Cost => tr("tab.cost"),
+        }
+    }
+
     pub fn index(self) -> usize {
         Tab::ALL.iter().position(|t| *t == self).unwrap_or(0)
     }
@@ -76,6 +97,10 @@ pub struct Prefs {
     pub notify: bool,
     /// `system`, `light` or `dark`.
     pub appearance: String,
+    /// The app's text size relative to the system's (Settings → Text Size; U15).
+    pub text_scale: f32,
+    /// The app was last left on a run (it opens there), not on a target's health.
+    pub start_on_run: bool,
 }
 
 impl Default for Prefs {
@@ -95,6 +120,8 @@ impl Default for Prefs {
             log_latency: true,
             notify: true,
             appearance: "system".into(),
+            text_scale: 1.0,
+            start_on_run: false,
         }
     }
 }
@@ -106,6 +133,23 @@ impl Prefs {
     pub fn from_json(s: Option<&str>) -> Self {
         s.and_then(|s| serde_json::from_str(s).ok())
             .unwrap_or_default()
+    }
+
+    /// The text scales Settings offers.
+    pub const TEXT_SCALES: [(f32, &'static str); 4] = [
+        (0.9, "Small"),
+        (1.0, "Default"),
+        (1.15, "Large"),
+        (1.3, "Larger"),
+    ];
+
+    /// [`Prefs::text_scale`], kept within what the layout supports.
+    pub fn text_scale(&self) -> f32 {
+        if self.text_scale.is_finite() {
+            self.text_scale.clamp(0.8, 1.5)
+        } else {
+            1.0
+        }
     }
 
     pub fn to_json(&self) -> String {

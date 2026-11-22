@@ -4,34 +4,24 @@
 use nsh_base::theme;
 use nsh_core::prelude::*;
 
-use crate::report::diff::Status;
+use crate::analysis::verdict::NetAssessment;
 use crate::ui::chart::chart;
 use crate::ui::kit::{
     Kind, Tone, badge, body, btn, caption, empty, num, picker, small, strong, title,
 };
 use crate::ui::model::compare::FindingChange;
+use crate::ui::model::verdicts::{self, CheckState};
 use crate::ui::model::verify::Verdict;
 use crate::ui::model::{fmt, runs};
 use crate::ui::store::store;
 use crate::ui::views::overview::{latency_plot, throughput_plot};
 
-fn status_tone(s: Status) -> Tone {
-    match s {
-        Status::Pass => Tone::Neutral,
-        Status::Improved => Tone::Ok,
-        Status::Fail => Tone::Crit,
-        Status::Skipped => Tone::Neutral,
-    }
-}
-
-/// The Verify verdict over its comparison: confirmed, refuted or inconclusive, with numbers.
-fn verdict_banner(v: Verdict) -> View {
-    use crate::analysis::verification::VerifyOutcome;
-    let tone = match v.outcome {
-        VerifyOutcome::Confirmed => Tone::Ok,
-        VerifyOutcome::Refuted => Tone::Crit,
-        VerifyOutcome::Inconclusive => Tone::Warn,
-    };
+/// The Verify verdict over its comparison (U2): the net verdict first — the same one the
+/// comparison below shows — then whether the finding's predicted metric moved, with numbers.
+fn verdict_banner(v: Verdict, net: NetAssessment) -> View {
+    let (net_word, net_level) = verdicts::net(net.verdict);
+    let (hyp_word, _) = verdicts::verify_outcome(v.outcome);
+    let tone = Tone::of_level(net_level);
     view()
         .gap_1()
         .p_3()
@@ -44,23 +34,24 @@ fn verdict_banner(v: Verdict) -> View {
                 .flex_row()
                 .items_center()
                 .gap_2()
-                .child(badge(v.word(), move || tone))
-                .child(strong(format!("Verify {}: {}", v.code, v.word()))),
+                .child(badge(net_word, move || tone))
+                .child(strong(format!(
+                    "Verify {}: {}",
+                    v.code,
+                    verdicts::net_sentence(&net)
+                ))),
+        )
+        .child(
+            small(format!(
+                "hypothesis {hyp_word}: the predicted metric moved as the finding said"
+            ))
+            .selectable(true),
         )
         .children(
             v.lines
                 .into_iter()
                 .map(|l| small(l).tabular_nums().selectable(true)),
         )
-}
-
-fn status_label(s: Status) -> &'static str {
-    match s {
-        Status::Pass => "same",
-        Status::Improved => "better",
-        Status::Fail => "worse",
-        Status::Skipped => "skipped",
-    }
 }
 
 /// A run as a selector item: `id · label or target`, with a mark when it measured the same
@@ -193,15 +184,17 @@ pub fn compare_view() -> impl IntoElement {
                     )
                     .into_element();
                 };
-                let d = c.diff.clone();
                 let comparable = c.comparable();
+                let net = c.net.clone();
+                let (net_word, net_level) = verdicts::net(net.verdict);
+                let gate_word = c.diff.verdict.label();
                 let (sa, sb) = (va.series.clone(), vb.series.clone());
                 let (sa2, sb2) = (sa.clone(), sb.clone());
                 view()
                     .p_4()
                     .gap_4()
                     .min_w(px(0.0))
-                    .child(verdict.map(verdict_banner))
+                    .child(verdict.map(|v| verdict_banner(v, net.clone())))
                     .child(
                         view()
                             .flex_row()
@@ -209,14 +202,7 @@ pub fn compare_view() -> impl IntoElement {
                             .gap_2()
                             .min_w(px(0.0))
                             .child(if comparable {
-                                badge(
-                                    if d.passed {
-                                        "no regression"
-                                    } else {
-                                        "regression"
-                                    },
-                                    move || if d.passed { Tone::Ok } else { Tone::Crit },
-                                )
+                                badge(net_word, move || Tone::of_level(net_level))
                             } else {
                                 badge("not comparable", || Tone::Warn)
                             })
@@ -225,7 +211,11 @@ pub fn compare_view() -> impl IntoElement {
                                     .number_of_lines(1)
                                     .flex_1()
                                     .min_w(px(0.0)),
-                            ),
+                            )
+                            .child(small(format!("gate: {gate_word}")).flex_shrink_0()),
+                    )
+                    .child(
+                        comparable.then(|| small(verdicts::net_sentence(&c.net)).selectable(true)),
                     )
                     .child((!comparable).then(|| {
                         view()
@@ -281,14 +271,21 @@ pub fn compare_view() -> impl IntoElement {
                                     .child(small("Limit").flex_1()),
                             )
                             .children(c.diff.checks.iter().map(|ch| {
-                                let tone = status_tone(ch.verdict);
-                                let st = ch.verdict;
+                                let st: CheckState = verdicts::check_state(
+                                    ch,
+                                    verdicts::significance_of(&c.full, ch),
+                                );
+                                let tone = Tone::of_level(st.level());
                                 view()
                                     .flex_row()
                                     .gap_3()
                                     .items_center()
                                     .py(px(2.0))
-                                    .child(body(ch.label()).w(px(200.0)).number_of_lines(1))
+                                    .child(
+                                        body(verdicts::metric_name(&ch.id))
+                                            .w(px(200.0))
+                                            .number_of_lines(1),
+                                    )
                                     .child(num(fmt::sig3(ch.baseline)).w(px(90.0)))
                                     .child(num(fmt::sig3(ch.candidate)).w(px(90.0)))
                                     .child(
@@ -308,7 +305,7 @@ pub fn compare_view() -> impl IntoElement {
                                             .flex_row()
                                             .gap_2()
                                             .flex_1()
-                                            .child(badge(status_label(st), move || tone))
+                                            .child(badge(st.word(), move || tone))
                                             .child(small(ch.fmt_limit())),
                                     )
                             })),

@@ -16,6 +16,7 @@ use crate::ui::model::fmt;
 use crate::ui::model::metrics;
 use crate::ui::model::scale::Scale;
 use crate::ui::model::series::Series;
+use crate::ui::model::verdicts;
 use crate::ui::store::{Phase, Sel, Stage, Store, store};
 
 /// The throughput chart's plot.
@@ -73,7 +74,8 @@ pub fn bandwidth_plot(s: &Series) -> Option<Plot> {
         x_fmt: Unit::Seconds,
         y_fmt: Unit::Mib,
         lines: vec![Line {
-            label: "MiB/s",
+            // The heading names the unit ("BANDWIDTH · MiB/s"): not twice (U12).
+            label: "read + write",
             token: "stage-download",
             pts: s.points.iter().map(|p| (p.t_s, p.mib_per_s)).collect(),
             step: true,
@@ -233,24 +235,66 @@ pub fn stopped_in_warmup(r: &Report) -> bool {
 }
 
 fn verdict_word(r: &Report) -> &'static str {
-    match r.verdict.level {
-        crate::model::VerdictLevel::Ok => "Healthy",
-        crate::model::VerdictLevel::Review => "Review",
-        crate::model::VerdictLevel::Attention => "Attention",
-        crate::model::VerdictLevel::Critical => "Critical",
-    }
+    verdicts::run_level(r.verdict.level).0
 }
 
-/// A finding as a compact row (Overview's top findings and the Findings tab).
+/// The button of a command a finding's advice names (U12): the App's own action for it.
+fn hint_button(s: Store, f: &Finding, cmd: String) -> nsh_base::ButtonElement {
+    use crate::ui::model::hints::{CliAction, action};
+    let a = action(&cmd);
+    let label = a.label();
+    let f = f.clone();
+    btn(
+        label,
+        || Kind::Plain,
+        move || match &a {
+            CliAction::Requests(q) => {
+                s.req_query.set(q.clone());
+                s.set_tab(Tab::Requests);
+            }
+            CliAction::Verify => s.verify(&f),
+            CliAction::Tune => s.tune_for("throughput"),
+            CliAction::Compare => s.compare_default(),
+            CliAction::Findings => s.set_tab(Tab::Findings),
+            CliAction::Probe => s.mode.set(crate::ui::store::Mode::Probe),
+            CliAction::Copy(c) => {
+                set_clipboard(c.clone());
+                s.toast(format!("Copied: {c}"), Tone::Neutral);
+            }
+        },
+    )
+    .accessibility_label(format!("{label}: {cmd}"))
+}
+
+/// A finding as a compact row (Overview's top findings and the Findings tab), from the shared
+/// presentation model ([`crate::report::view::FindingView`]): the same cause, evidence (with
+/// human labels) and advice as the text, Markdown and HTML reports, in the App's language.
 pub fn finding_row(s: Store, f: Finding, full: bool) -> View {
-    let tone = Tone::of_severity(f.severity);
+    let v = crate::report::view::FindingView::of(&f);
+    let (sev_word, sev_level) = verdicts::severity(v.severity);
+    let tone = Tone::of_level(sev_level);
+    let (cause, advice) = crate::i18n::finding(v.code)
+        .map(|(c, a)| (c.to_owned(), a.to_owned()))
+        .unwrap_or_else(|| (v.cause.to_owned(), v.advice.to_owned()));
+    let (advice, cmds) = crate::ui::model::hints::split(&advice);
+    let evidence = if v.items.is_empty() {
+        v.evidence.to_owned()
+    } else {
+        v.items
+            .iter()
+            .map(|i| format!("{} {}", i.label, i.value))
+            .collect::<Vec<_>>()
+            .join(" · ")
+    };
     let has_cmd = f.verification.is_some();
-    let verify_label = f
-        .verification
-        .as_ref()
-        .map(|v| v.rerun.clone())
-        .unwrap_or_default();
+    let verify_label = v.rerun.unwrap_or_default().to_owned();
+    let verify_desc = f.verification.as_ref().map(|x| x.description.clone());
     let f2 = f.clone();
+    let buttons: Vec<nsh_base::ButtonElement> = cmds
+        .into_iter()
+        .filter(|c| !(has_cmd && c.starts_with("oprobe verify")))
+        .map(|c| hint_button(s, &f, c))
+        .collect();
     view()
         .gap_1()
         .py(px(6.0))
@@ -260,26 +304,25 @@ pub fn finding_row(s: Store, f: Finding, full: bool) -> View {
                 .flex_row()
                 .items_center()
                 .gap_2()
-                .child(badge(f.severity.label(), move || tone))
-                .child(strong(f.cause.clone()).flex_1().min_w(px(0.0)))
+                .child(badge(sev_word, move || tone))
+                .child(strong(cause).flex_1().min_w(px(0.0)))
                 .child(has_cmd.then(|| {
                     btn("Verify", || Kind::Plain, move || s.verify(&f2))
                         .accessibility_label(format!("Verify: {verify_label}"))
                 })),
         )
-        .child(small(f.evidence.text.clone()))
+        .child(small(evidence).selectable(true))
         .child(
-            body(format!("→ {}", f.advice))
-                .text_size(px(12.0))
+            body(format!("→ {advice}"))
+                .text_size(crate::ui::kit::sz(12.0))
                 .text_color(move || theme().foreground),
         )
         .child(
-            full.then(|| {
-                f.verification
-                    .as_ref()
-                    .map(|v| small(format!("verify: {} ({})", v.description, v.rerun)))
-            })
-            .flatten(),
+            (!buttons.is_empty()).then(|| view().flex_row().flex_wrap().gap_2().children(buttons)),
+        )
+        .child(
+            full.then(|| verify_desc.map(|d| small(format!("verify: {d}"))))
+                .flatten(),
         )
 }
 
@@ -372,12 +415,13 @@ fn finished(s: Store) -> View {
                 .child(kpi(
                     "ERRORS",
                     num(|r| fmt::ratio(r.summary.error_rate).into()),
+                    // Coloured by the finding about errors, on the verdict's scale (U9).
                     move || {
-                        if r.with(|r| r.as_ref().is_some_and(|r| r.summary.error_rate > 0.0)) {
-                            Tone::Crit
-                        } else {
-                            Tone::Neutral
-                        }
+                        r.with(|r| {
+                            r.as_ref()
+                                .map(|r| Tone::of_level(verdicts::metric_level(r, "error_ratio")))
+                                .unwrap_or(Tone::Neutral)
+                        })
                     },
                 ))
                 // Throttling next to errors: a "throttling" verdict always has its number.
@@ -386,14 +430,16 @@ fn finished(s: Store) -> View {
                     num(|r| fmt::ratio(metrics::throttled_request_ratio(r)).into()),
                     num(|r| format!("retry {}", fmt::ratio(metrics::retry_share(r))).into()),
                     move || {
-                        if r.with(|r| {
+                        r.with(|r| {
                             r.as_ref()
-                                .is_some_and(|r| metrics::throttled_request_ratio(r) > 0.0)
-                        }) {
-                            Tone::Warn
-                        } else {
-                            Tone::Neutral
-                        }
+                                .map(|r| {
+                                    Tone::of_level(verdicts::metric_level(
+                                        r,
+                                        "throttled_request_ratio",
+                                    ))
+                                })
+                                .unwrap_or(Tone::Neutral)
+                        })
                     },
                 ))
                 .child(kpi(
@@ -589,15 +635,10 @@ fn live(s: Store) -> View {
                 .gap_2()
                 .child(badge(
                     move || {
+                        // The title says the stage ("Measuring lab://demo"): the badge says the
+                        // run is live, not "Measuring Measuring" (U12).
                         l.with(|l| match l.as_ref().map(|l| (l.phase, l.stage)) {
-                            Some((Phase::Running, st)) => match st {
-                                Stage::Starting => "Starting",
-                                Stage::Preparing => "Preparing",
-                                Stage::Warmup => "Warmup",
-                                Stage::Measuring => "Measuring",
-                                Stage::Verifying => "Verifying",
-                                Stage::Cleanup => "Cleanup",
-                            },
+                            Some((Phase::Running, _)) => "Live",
                             Some((Phase::Stopping, _)) => "Stopping",
                             Some((Phase::Done, _)) => "Finished",
                             Some((Phase::Failed, _)) => "Failed",
@@ -757,6 +798,57 @@ fn live(s: Store) -> View {
                     || Tone::Neutral,
                 )),
         )
+        // Early numbers are noisy; what the counts so far suggest, with how sure (U14).
+        .child(dynamic(move || {
+            let on = measuring();
+            let found = l.with(|l| {
+                l.as_ref()
+                    .and_then(|l| l.snapshot.as_ref())
+                    .filter(|_| on)
+                    .map(|s| {
+                        (
+                            crate::ui::model::live::early(s).then_some(s.summary.ops),
+                            crate::ui::model::live::provisional(s),
+                        )
+                    })
+            });
+            untracked(|| {
+                let Some((early, prov)) = found else {
+                    return view().into_element();
+                };
+                view()
+                    .gap_1()
+                    .test_id("provisional")
+                    .child(early.map(|n| {
+                        small(crate::ui::model::i18n::trf(
+                            "app.early_numbers",
+                            &[("n", &n)],
+                        ))
+                        .text_color(move || Tone::Inconclusive.color())
+                    }))
+                    .child(
+                        (!prov.is_empty())
+                            .then(|| caption(crate::ui::model::i18n::tr("app.provisional"))),
+                    )
+                    .children(prov.into_iter().map(|p| {
+                        let (word, level) = verdicts::severity(p.severity);
+                        view()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .child(badge(word, move || Tone::of_level(level)))
+                            .child(body(p.text).flex_1().min_w(px(0.0)).number_of_lines(1))
+                            .child(
+                                small(crate::ui::model::i18n::trf(
+                                    "app.confidence",
+                                    &[("pct", &format!("{:.0} %", p.confidence * 100.0))],
+                                ))
+                                .tabular_nums(),
+                            )
+                    }))
+                    .into_element()
+            })
+        }))
         .child(
             view()
                 .flex_row()

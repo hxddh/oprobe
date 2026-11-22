@@ -104,12 +104,20 @@ pub(crate) fn unused_path(path: &std::path::Path) -> PathBuf {
 
 /// Export the shown run: its file (`.oprobe`), the report as JSON or Markdown.
 pub fn export_run(store: Store, format: &'static str) {
+    let link = store.view_state().map(|v| v.to_link());
     let data = store.current.with_untracked(|c| {
         c.as_ref().map(|c| {
             let id = c.id().to_owned();
             let bytes = match format {
                 "json" => serde_json::to_vec_pretty(&c.run.report).unwrap_or_default(),
-                "md" => crate::report::markdown::render_report(&c.run.report).into_bytes(),
+                // The saved view travels with the export (design v5 §9).
+                "md" => {
+                    let mut md = crate::report::markdown::render_report(&c.run.report);
+                    if let Some(l) = &link {
+                        md.push_str(&format!("\n\n[Open this view in oprobe]({l})\n"));
+                    }
+                    md.into_bytes()
+                }
                 _ => crate::store::runs::encode_run(&c.run).unwrap_or_default(),
             };
             (id, bytes)

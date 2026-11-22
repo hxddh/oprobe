@@ -7,8 +7,8 @@
 //! repeats for a statistically stronger verdict.
 
 use crate::analysis::verification::{Direction, Expectation, VerifyOutcome};
+use crate::app::verify::metric_value as metric;
 use crate::model::Report;
-use crate::ui::model::metrics::metric;
 
 /// What the verify run says about the hypothesis.
 #[derive(Clone, Debug, PartialEq)]
@@ -81,9 +81,10 @@ fn judge_one(e: &Expectation, base: f64, cand: f64) -> (VerifyOutcome, String) {
             }
         }
     };
+    // The metric in words (U12: "Throughput", not "summary.ops_per_s").
     let line = format!(
         "{}: {} → {} (expected {} {}, {}–{})",
-        e.metric,
+        crate::ui::model::verdicts::metric_name(e.metric.trim_start_matches("summary.")),
         shown(base, &e.unit),
         shown(cand, &e.unit),
         match e.direction {
@@ -126,10 +127,18 @@ pub fn judge(
             .map(|c| c.id.as_str())
             .collect();
         if !worse.is_empty() {
-            lines.push(format!("worse: {}", worse.join(", ")));
+            let w: Vec<String> = worse
+                .iter()
+                .map(|m| crate::ui::model::verdicts::metric_name(m))
+                .collect();
+            lines.push(format!("worse: {}", w.join(", ")));
         }
         if !improved.is_empty() {
-            lines.push(format!("better: {}", improved.join(", ")));
+            let b: Vec<String> = improved
+                .iter()
+                .map(|m| crate::ui::model::verdicts::metric_name(m))
+                .collect();
+            lines.push(format!("better: {}", b.join(", ")));
         }
         if !worse.is_empty() {
             VerifyOutcome::Refuted
@@ -150,7 +159,12 @@ pub fn judge(
                 }
                 _ => {
                     outs.push(VerifyOutcome::Inconclusive);
-                    lines.push(format!("{}: not measured", e.metric));
+                    lines.push(format!(
+                        "{}: not measured",
+                        crate::ui::model::verdicts::metric_name(
+                            e.metric.trim_start_matches("summary.")
+                        )
+                    ));
                 }
             }
         }
@@ -162,7 +176,9 @@ pub fn judge(
             VerifyOutcome::Inconclusive
         }
     };
-    lines.push("one run per side: low confidence (`oprobe verify` repeats and interleaves)".into());
+    lines.push(
+        "one run per side: low confidence (the command-line verify repeats and interleaves)".into(),
+    );
     Verdict {
         code: code.to_owned(),
         outcome,
@@ -191,11 +207,14 @@ mod tests {
         let gate = crate::ui::model::compare::compare(&run, &run).diff;
         let base = run.report;
         let mut cand = base.clone();
+        // Goodput as the core measures it (successful operations over the window).
         cand.summary.ops_per_s = base.summary.ops_per_s * 1.5;
+        cand.summary.ops = base.summary.ops * 3 / 2;
+        cand.summary.failed_ops = base.summary.failed_ops;
         let up = exp("summary.ops_per_s", Direction::Increase, 1.0, 0.0, 2.0);
         let v = judge("throttling", std::slice::from_ref(&up), &base, &cand, &gate);
         assert_eq!(v.outcome, VerifyOutcome::Confirmed);
-        assert!(v.lines[0].contains("summary.ops_per_s"), "{:?}", v.lines);
+        assert!(v.lines[0].starts_with("Throughput:"), "{:?}", v.lines);
         let v = judge("throttling", std::slice::from_ref(&up), &cand, &base, &gate);
         assert_eq!(v.outcome, VerifyOutcome::Refuted);
         let v = judge("throttling", &[up], &base, &base, &gate);

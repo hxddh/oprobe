@@ -6,9 +6,13 @@ use nsh_base::theme;
 use nsh_core::prelude::*;
 
 use crate::model::{OpRow, Report, ReqRow};
-use crate::ui::kit::{Kind, btn, caption, mono, prop_row, row_button, small, strong};
+use crate::ui::kit::{
+    Kind, Tone, btn, caption, mono, prop_row, row_button, small, stage_color, strong,
+};
 use crate::ui::model::fmt;
+use crate::ui::model::i18n::{tr, trf};
 use crate::ui::model::requests::proto;
+use crate::ui::model::waterfall::{Bar, BarKind, Waterfall, build as build_waterfall};
 use crate::ui::store::{Inspect, Store, store};
 use crate::ui::views::overview::stage_bar;
 use crate::ui::views::requests::reveal_in_timeline;
@@ -171,7 +175,119 @@ fn request(s: Store, i: u32, r: ReqRow) -> View {
     )
 }
 
-fn operation(s: Store, o: OpRow, reqs: Vec<(u32, ReqRow)>) -> View {
+/// One bar of the waterfall: its label, then its stages on the operation's time axis (relative
+/// widths, so the same drawing works in a window and in character cells).
+fn waterfall_row(s: Store, b: Bar, total_us: u64) -> View {
+    let total = total_us.max(1) as f32;
+    let lead = b.start_us as f32 / total;
+    let label = b.label.clone();
+    let crit = b.critical;
+    let failed = b.failed;
+    let req = b.req;
+    let label_view = text(format!("{}{}", if crit { "● " } else { "  " }, label))
+        .text_size(crate::ui::kit::sz(11.0))
+        .number_of_lines(1)
+        .font_weight(if crit {
+            FontWeight::SEMIBOLD
+        } else {
+            FontWeight::NORMAL
+        })
+        .text_color(move || {
+            if failed {
+                Tone::Crit.color()
+            } else if b.kind == BarKind::Backoff {
+                theme().muted_foreground
+            } else {
+                theme().foreground
+            }
+        });
+    let track = view()
+        .flex_row()
+        .flex_1()
+        .min_w(px(0.0))
+        .h(px(10.0))
+        .items_center()
+        .child(view().w(relative(lead)).h_full())
+        .children(b.segs.iter().map(move |sg| {
+            view()
+                .w(relative(sg.us as f32 / total))
+                .min_w(px(1.0))
+                .h(px(if b.kind == BarKind::Backoff { 2.0 } else { 8.0 }))
+                .bg(stage_color(sg.stage))
+                .label(format!("{} {}", sg.stage, fmt::dur_us(sg.us as f64)))
+        }));
+    let row = view()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .min_w(px(0.0))
+        .child(view().w(px(150.0)).flex_shrink_0().child(label_view))
+        .child(track)
+        .child(
+            small(fmt::dur_us(b.len_us as f64))
+                .tabular_nums()
+                .w(px(56.0))
+                .flex_shrink_0(),
+        );
+    match req {
+        Some(i) => view().child(
+            row_button(
+                format!("{label} · {}", fmt::dur_us(b.len_us as f64)),
+                || false,
+                move || s.inspect.set(Inspect::Request(i)),
+            )
+            .px(px(0.0))
+            .py(px(1.0))
+            .child(row),
+        ),
+        None => view().py(px(1.0)).child(row),
+    }
+}
+
+/// The per-operation waterfall (design v5 §9 trace drilldown): the requests with their stages,
+/// retries with their backoff, the critical path (●), and the comparison with a typical
+/// operation of the same verb.
+fn waterfall(s: Store, w: Waterfall) -> View {
+    let total = w.total_us;
+    view()
+        .gap_1()
+        .test_id("waterfall")
+        .child(
+            view()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .child(caption(tr("app.waterfall")).flex_1())
+                .child(small(format!("● {}", tr("app.critical_path")))),
+        )
+        .children(w.bars.into_iter().map(move |b| waterfall_row(s, b, total)))
+        .child(w.typical.map(|t| {
+            let line = trf(
+                "app.typical_line",
+                &[
+                    ("verb", &w.verb),
+                    ("total", &fmt::dur_us(t.latency_us as f64)),
+                    ("requests", &t.requests),
+                ],
+            );
+            let slower = (t.ratio >= 1.5)
+                .then(|| trf("app.slower_by", &[("x", &format!("{:.1}", t.ratio))]));
+            view()
+                .gap_0p5()
+                .pt_1()
+                .child(small(line))
+                .child(slower.map(|x| small(x).text_color(move || Tone::Warn.color())))
+                .child(view().flex_row().child(btn(
+                    tr("app.typical_op"),
+                    || Kind::Plain,
+                    move || s.inspect_op(t.op_index),
+                )))
+        }))
+}
+
+fn operation(s: Store, o: OpRow, reqs: Vec<(u32, ReqRow)>, all_ops: &[OpRow]) -> View {
+    let refs: Vec<(u32, &ReqRow)> = reqs.iter().map(|(i, r)| (*i, r)).collect();
+    let wf = build_waterfall(&o, &refs, all_ops);
     let b = o.breakdown;
     let total = o.latency_us.max(1) as f64;
     let parts = vec![
@@ -201,6 +317,7 @@ fn operation(s: Store, o: OpRow, reqs: Vec<(u32, ReqRow)>) -> View {
                 ))),
         )
         .child(stage_bar(parts))
+        .child(waterfall(s, wf))
         .child(
             group("OPERATION")
                 .child(prop_row("Start", format!("{:.6} s", o.t_us as f64 / 1e6)))
@@ -248,9 +365,14 @@ fn operation(s: Store, o: OpRow, reqs: Vec<(u32, ReqRow)>) -> View {
         }))
 }
 
-fn attribution(what: String, a: crate::analysis::outliers::Attribution) -> View {
+fn attribution(s: Store, what: String, a: crate::analysis::outliers::Attribution) -> View {
     view()
         .gap_3()
+        .child(view().flex_row().child(btn(
+            "Waterfall of the Slowest Operation Here",
+            || Kind::Plain,
+            move || s.waterfall_slowest(),
+        )))
         .child(
             view()
                 .gap_0p5()
@@ -373,6 +495,24 @@ fn setup(r: Report) -> View {
                     ),
                 )),
         )
+        // The 5.0 sections, whatever they hold (the client that made the load, distributed
+        // workers, the open-loop schedule, oprobe's own cost, key dimensions): shown generically
+        // so they appear as the measurement fills them.
+        .children(
+            [
+                ("LOAD GENERATOR", serde_json::to_value(&r.client).ok()),
+                ("WORKERS", serde_json::to_value(&r.workers).ok()),
+                ("SCHEDULE", serde_json::to_value(&r.schedule).ok()),
+                ("OPROBE ITSELF", serde_json::to_value(&r.self_stats).ok()),
+                ("DIMENSIONS", serde_json::to_value(&r.dimensions).ok()),
+            ]
+            .into_iter()
+            .filter_map(|(title, v)| {
+                let rows = v.map(|v| fmt::section_rows(&v, 6)).unwrap_or_default();
+                (!rows.is_empty())
+                    .then(|| group(title).children(rows.into_iter().map(|(k, v)| prop_row(k, v))))
+            }),
+        )
         .child(small(
             "Select a request, an operation, or drag across the heatmap to inspect it.",
         ))
@@ -429,11 +569,13 @@ pub fn inspector() -> impl IntoElement {
                                 .iter()
                                 .map(|ri| (*ri, c.run.reqs[*ri as usize].clone()))
                                 .collect();
-                            operation(s, o.clone(), reqs).into_element()
+                            operation(s, o.clone(), reqs, &c.run.ops).into_element()
                         }
                         None => small("Nothing selected.").into_element(),
                     },
-                    Inspect::Attribution { what, attr } => attribution(what, attr).into_element(),
+                    Inspect::Attribution { what, attr } => {
+                        attribution(s, what, attr).into_element()
+                    }
                     Inspect::None => setup(c.run.report.clone()).into_element(),
                 }
             })

@@ -45,6 +45,12 @@ pub struct RunSummary {
     pub target_id: String,
     /// `report.spec.workload_hash()`: runs with the same target and workload hash compare.
     pub workload_hash: String,
+    /// The workload preset (absent in summaries written before 5.0).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preset: Option<String>,
+    /// Throttled responses / requests (absent in summaries written before 5.0).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub throttled_request_ratio: Option<f64>,
 }
 
 impl From<&Report> for RunSummary {
@@ -78,6 +84,8 @@ impl From<&Report> for RunSummary {
                 .map(|t| t.to_string())
                 .unwrap_or_default(),
             workload_hash: r.spec.workload_hash(),
+            preset: Some(r.workload.preset.clone()),
+            throttled_request_ratio: Some(r.summary.throttled_request_ratio),
         }
     }
 }

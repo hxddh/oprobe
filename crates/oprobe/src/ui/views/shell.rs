@@ -17,10 +17,11 @@ use crate::ui::kit::{
     small, strong, switch_row, tool,
 };
 use crate::ui::model::commands::{self, COMMANDS, CmdCtx};
+use crate::ui::model::i18n::{cmd_label, tr};
 use crate::ui::model::{Tab, fmt, runs};
 use crate::ui::store::{Inspect, JobKind, Mode, Overlay, Phase, Sel, Stage, Store, store};
 use crate::ui::views::{
-    compare, inspector, overview, requests, tabs as tabviews, timeline, tools, welcome,
+    compare, health, inspector, overview, requests, tabs as tabviews, timeline, tools, welcome,
 };
 
 // ---------------------------------------------------------------------------------------
@@ -35,6 +36,8 @@ pub struct Cmd {
     pub keys: Option<&'static str>,
     /// Whether it can run now: the menu and the palette show the same state.
     pub enabled: bool,
+    /// Why it cannot run now (U6).
+    pub reason: Option<&'static str>,
     pub run: Rc<dyn Fn()>,
 }
 
@@ -89,6 +92,9 @@ fn action(s: Store, id: &'static str) -> Rc<dyn Fn()> {
         "tune" => Rc::new(move || s.mode.set(Mode::Tune)),
         "probe" => Rc::new(move || s.mode.set(Mode::Probe)),
         "slowest" => Rc::new(move || s.explain_slowest()),
+        "health" => Rc::new(move || s.show_health(None)),
+        "waterfall" => Rc::new(move || s.waterfall_slowest()),
+        "copy-link" => Rc::new(move || s.copy_link()),
         "sidebar" => Rc::new(move || s.toggle_sidebar()),
         "inspector" => Rc::new(move || s.toggle_inspector()),
         "log" => Rc::new(move || s.set_log_latency(!s.log_latency.get_untracked())),
@@ -104,7 +110,10 @@ fn action(s: Store, id: &'static str) -> Rc<dyn Fn()> {
         }
         _ => Rc::new(|| {}),
     };
-    f
+    // Under the root's owner: a task the command starts (a save dialog, a load) is not ended
+    // when the palette or menu it was chosen from closes.
+    let root = s.root;
+    Rc::new(move || root.run(|| f()))
 }
 
 /// Every command with its state now. Reading it tracks what the states depend on.
@@ -115,7 +124,7 @@ pub fn commands(s: Store) -> Vec<Cmd> {
         .iter()
         .map(|c| Cmd {
             id: c.id,
-            label: c.label,
+            label: cmd_label(c.id, c.label),
             group: if c.id == "settings" && mac {
                 "App"
             } else {
@@ -123,6 +132,7 @@ pub fn commands(s: Store) -> Vec<Cmd> {
             },
             keys: c.keys,
             enabled: commands::enabled(c.id, &x),
+            reason: commands::disabled_reason(c.id, &x),
             run: action(s, c.id),
         })
         .collect()
@@ -230,9 +240,109 @@ pub fn letter_key(key: &str, f: impl Fn() + 'static) {
     );
 }
 
+/// Move the keyboard selection of the shown list by `d` rows (`i64::MIN` / `i64::MAX`: the
+/// first / last): the Requests table's focused row, the Timeline's inspected operation (in the
+/// order the Timeline shows), else the selected run of the history (U7).
+pub fn step(s: Store, d: i64) {
+    let to = |cur: i64, n: i64| -> i64 {
+        match d {
+            i64::MIN => 0,
+            i64::MAX => n - 1,
+            _ => (cur + d).clamp(0, n - 1),
+        }
+    };
+    if s.mode.get_untracked() == Mode::Run && s.sel.get_untracked() != Sel::Live {
+        match s.tab.get_untracked() {
+            Tab::Requests => {
+                let n = s.req_rows.with_untracked(|r| r.0.len()) as i64;
+                if n > 0 {
+                    let cur = s.req_focus.get_untracked().map(|c| c as i64).unwrap_or(-1);
+                    s.req_focus.set(Some(to(cur, n) as u32));
+                }
+                return;
+            }
+            Tab::Timeline => {
+                let order = s.tl_order.get_untracked();
+                let n = order.0.len() as i64;
+                if n > 0 {
+                    let cur = match s.inspect.get_untracked() {
+                        Inspect::Op(i) => order.0.iter().position(|o| *o == i).map(|p| p as i64),
+                        _ => None,
+                    }
+                    .unwrap_or(-1);
+                    s.inspect.set(Inspect::Op(order.0[to(cur, n) as usize]));
+                }
+                return;
+            }
+            _ => {}
+        }
+    }
+    let runs = s.runs.get_untracked();
+    if runs.is_empty() {
+        return;
+    }
+    let cur = match s.sel.get_untracked() {
+        Sel::Run(id) => runs
+            .iter()
+            .position(|r| r.id == id)
+            .map(|p| p as i64)
+            .unwrap_or(-1),
+        _ => -1,
+    };
+    if let Some(r) = runs.get(to(cur, runs.len() as i64) as usize) {
+        s.select_run(&r.id.clone());
+    }
+}
+
+/// Rows a page key moves by.
+const PAGE_ROWS: i64 = 20;
+
+/// Sort the Requests table from the keyboard (U7): `>` sorts by the next column (descending
+/// first, the slowest on top), `<` reverses the order.
+pub fn sort_key(s: Store, next: bool) {
+    use crate::ui::model::requests::Col;
+    s.req_sort.update(|so| {
+        *so = match (*so, next) {
+            (None, true) => Some((Col::Total, true)),
+            (Some((c, _)), true) => {
+                let i = Col::ALL.iter().position(|x| *x == c).unwrap_or(0);
+                Some((Col::ALL[(i + 1) % Col::ALL.len()], true))
+            }
+            (Some((c, d)), false) => Some((c, !d)),
+            (None, false) => Some((Col::Total, false)),
+        }
+    });
+}
+
+/// Keys of both hosts that act on what is shown (outside text fields): page and jump keys,
+/// sort keys, the heatmap brush.
+fn install_navigation_keys(s: Store) {
+    let repeat = KeyOptions {
+        when: nsh_core::keymap::When::NotEditing,
+        repeat: true,
+        ..Default::default()
+    };
+    on_key_with("pagedown", repeat, move |_| step(s, PAGE_ROWS));
+    on_key_with("pageup", repeat, move |_| step(s, -PAGE_ROWS));
+    on_key_with("home", repeat, move |_| step(s, i64::MIN));
+    on_key_with("end", repeat, move |_| step(s, i64::MAX));
+    letter_key("shift+.", move || sort_key(s, true));
+    letter_key("shift+,", move || sort_key(s, false));
+    for (k, c) in [("[", '['), ("]", ']'), ("shift+[", '{'), ("shift+]", '}')] {
+        letter_key(k, move || {
+            if matches!(s.mode.get_untracked(), Mode::Run)
+                && s.current.with_untracked(|c| c.is_some())
+            {
+                s.nudge_brush(c);
+            }
+        });
+    }
+}
+
 /// Keys of the terminal (keyboard-first): r run again, s stop, n new, 1–6 tabs, / filter,
-/// j/k move, enter inspect, c compare, v verify, o open run, ? help, q quit (asks while a run
-/// is in progress). Letters fire only outside text fields.
+/// j/k move, g/G first/last, enter inspect, c compare, v verify, o open run, h health,
+/// w waterfall, : commands, ? help, q quit (asks while a run is in progress). Letters fire only
+/// outside text fields.
 fn install_terminal_keys(s: Store, filter: ElementRef) {
     letter_key("r", move || run_command(s, "rerun"));
     letter_key("s", move || s.stop());
@@ -240,6 +350,9 @@ fn install_terminal_keys(s: Store, filter: ElementRef) {
     letter_key("v", move || run_command(s, "verify"));
     letter_key("o", move || run_command(s, "open-run"));
     letter_key("t", move || run_command(s, "add-target"));
+    letter_key("h", move || run_command(s, "health"));
+    letter_key("w", move || run_command(s, "waterfall"));
+    letter_key("shift+;", move || s.open(Overlay::Palette));
     for (i, t) in Tab::ALL.into_iter().enumerate() {
         letter_key(["1", "2", "3", "4", "5", "6"][i], move || s.set_tab(t));
     }
@@ -252,42 +365,37 @@ fn install_terminal_keys(s: Store, filter: ElementRef) {
             filter.focus();
         });
     });
-    let step = move |d: i64| {
-        if s.tab.get_untracked() == Tab::Requests && s.mode.get_untracked() == Mode::Run {
-            let n = s.req_rows.with_untracked(|r| r.0.len()) as i64;
-            if n > 0 {
-                let cur = s.req_focus.get_untracked().map(|c| c as i64).unwrap_or(-1);
-                s.req_focus.set(Some((cur + d).clamp(0, n - 1) as u32));
+    letter_key("j", move || step(s, 1));
+    letter_key("k", move || step(s, -1));
+    letter_key("g", move || step(s, i64::MIN));
+    letter_key("shift+g", move || step(s, i64::MAX));
+    // Enter inspects the focused request; it passes through, so a focused button still takes
+    // it (U5).
+    on_key_with(
+        "enter",
+        KeyOptions {
+            when: nsh_core::keymap::When::NotEditing,
+            pass_through: true,
+            ..Default::default()
+        },
+        move |_| {
+            if s.overlay.get_untracked().is_none()
+                && s.tab.get_untracked() == Tab::Requests
+                && s.req_focus.get_untracked().is_some()
+                && (!s.prefs.with_untracked(|p| p.inspector_visible) || side_panel_hidden())
+            {
+                s.open(Overlay::Inspector);
             }
-            return;
-        }
-        let runs = s.runs.get_untracked();
-        let cur = match s.sel.get_untracked() {
-            Sel::Run(id) => runs
-                .iter()
-                .position(|r| r.id == id)
-                .map(|p| p as i64)
-                .unwrap_or(-1),
-            _ => -1,
-        };
-        let next = (cur + d).clamp(0, runs.len() as i64 - 1);
-        if let Some(r) = runs.get(next as usize) {
-            s.select_run(&r.id.clone());
-        }
-    };
-    letter_key("j", move || step(1));
-    letter_key("k", move || step(-1));
-    letter_key("enter", move || {
-        if s.overlay.get_untracked().is_none()
-            && (!s.prefs.with_untracked(|p| p.inspector_visible) || side_panel_hidden())
-        {
-            s.open(Overlay::Inspector);
-        }
-    });
+        },
+    );
     letter_key("c", move || run_command(s, "compare"));
     letter_key("shift+/", move || s.open(Overlay::Help));
     letter_key("q", move || confirm_quit(s));
-    // Esc closes the overlay, else leaves the filter field (so the letters act again).
+}
+
+/// Esc closes the overlay and gives the keyboard focus back to the main area (U5: not to the
+/// filter field), else leaves the filter field (so the letters act again).
+fn install_escape(s: Store, filter: ElementRef) {
     let always = KeyOptions {
         when: nsh_core::keymap::When::Always,
         ..Default::default()
@@ -295,9 +403,18 @@ fn install_terminal_keys(s: Store, filter: ElementRef) {
     on_key_with("escape", always, move |_| {
         if s.overlay.get_untracked().is_some() {
             s.overlay.set(None);
+            focus_main(s);
         } else {
             filter.blur();
         }
+    });
+}
+
+/// Give the keyboard focus to the main area (after an overlay closes).
+pub fn focus_main(s: Store) {
+    spawn(async move {
+        next_frame().await;
+        s.main_ref.focus();
     });
 }
 
@@ -362,7 +479,7 @@ fn toolbar_view(s: Store) -> impl IntoElement {
                         kit::tool_dyn(
                             move || if busy() { "■" } else { "▶" },
                             move || if busy() { "Stop" } else { "Run" },
-                            "Run ⌘N · Stop ⌘.",
+                            format!("Run {} · Stop {}", key_label("mod+n"), key_label("mod+.")),
                             move || run_or_stop(s),
                         )
                         .test_id("run-stop"),
@@ -371,15 +488,24 @@ fn toolbar_view(s: Store) -> impl IntoElement {
                         tool(
                             "↻",
                             "Re-run",
-                            "Run the shown run again (⇧⌘R)",
+                            format!("Run the shown run again ({})", key_label("shift+mod+r")),
                             move || run_command(s, "rerun"),
                         )
                         .disabled(move || busy() || s.current.with(|c| c.is_none())),
                     )
+                    .child(
+                        tool(
+                            "♥",
+                            "Health",
+                            format!("The target's health ({})", key_label("mod+0")),
+                            move || run_command(s, "health"),
+                        )
+                        .selected(move || s.mode.get() == Mode::Health),
+                    )
                     .child(tool(
                         "⇄",
                         "Compare",
-                        "Compare two runs (⇧⌘C)",
+                        format!("Compare two runs ({})", key_label("shift+mod+c")),
                         move || s.compare_default(),
                     )),
             )
@@ -416,19 +542,26 @@ fn toolbar_view(s: Store) -> impl IntoElement {
                                 )
                                 .selected(move || s.mode.get() == Mode::Probe),
                             )
-                            .child(tool("⇪", "Export", "Export the run (⌘S)", move || {
-                                let _ = popup_menu(vec![
-                                    MenuItem::new("Run File (.oprobe)…").on_select(move || {
-                                        crate::ui::files::export_run(s, "oprobe")
-                                    }),
-                                    MenuItem::new("Report (JSON)…")
-                                        .on_select(move || crate::ui::files::export_run(s, "json")),
-                                    MenuItem::new("Report (Markdown)…")
-                                        .on_select(move || crate::ui::files::export_run(s, "md")),
-                                    MenuItem::new("Requests (CSV)…")
-                                        .on_select(move || requests::export_csv(s)),
-                                ]);
-                            })),
+                            .child(tool(
+                                "⇪",
+                                "Export",
+                                format!("Export the run ({})", key_label("mod+s")),
+                                move || {
+                                    let _ = popup_menu(vec![
+                                        MenuItem::new("Run File (.oprobe)…").on_select(move || {
+                                            crate::ui::files::export_run(s, "oprobe")
+                                        }),
+                                        MenuItem::new("Report (JSON)…").on_select(move || {
+                                            crate::ui::files::export_run(s, "json")
+                                        }),
+                                        MenuItem::new("Report (Markdown)…").on_select(move || {
+                                            crate::ui::files::export_run(s, "md")
+                                        }),
+                                        MenuItem::new("Requests (CSV)…")
+                                            .on_select(move || requests::export_csv(s)),
+                                    ]);
+                                },
+                            )),
                     )
             }))
             .child(
@@ -445,9 +578,9 @@ fn toolbar_view(s: Store) -> impl IntoElement {
                     .items_center()
                     .gap_1()
                     .child(tool(
-                        "⌘",
+                        "≡",
                         "Commands",
-                        "Command palette (⌘K)",
+                        format!("Command palette ({})", key_label("mod+k")),
                         move || s.open(Overlay::Palette),
                     ))
                     .child(
@@ -489,6 +622,11 @@ fn status_line(s: Store) -> String {
         Some(l) if l.phase == Phase::Stopping => "Stopping — cleaning up test data…".into(),
         _ => match s.mode.get() {
             Mode::Compare => "Compare".into(),
+            Mode::Health => s
+                .health_target
+                .get()
+                .map(|t| crate::ui::model::i18n::trf("app.health_of", &[("target", &t)]))
+                .unwrap_or_else(|| tr("app.health").into()),
             Mode::Tune => "Tune".into(),
             Mode::Probe => "Probe".into(),
             _ => s
@@ -524,17 +662,16 @@ fn run_row(s: Store, r: RunSummary) -> impl IntoElement {
         move || s.marked.with(|m| m.contains(&id))
     };
     let today = crate::util::now_rfc3339();
-    let when = fmt::short_time(&r.started_at, fmt::day_of(&today));
-    let has_label = r.label.is_some();
-    let label = r.label.clone().unwrap_or_else(|| when.clone());
+    // Descriptive rows (U10): date and time (or the label), then preset, verdict and numbers;
+    // the id only in the accessible name and the menu.
+    let (label, detail) = crate::ui::model::health::row(&r, fmt::day_of(&today));
     let tone = verdict_tone(&r);
     let partial = runs::partial_badge(&r);
-    let numbers = runs::row_numbers(&r);
     let a11y = format!(
         "Run {} · {} · {}{}",
         r.id,
         label,
-        numbers,
+        detail,
         partial
             .as_ref()
             .map(|p| format!(" · {p}"))
@@ -567,16 +704,7 @@ fn run_row(s: Store, r: RunSummary) -> impl IntoElement {
                         // A budget stop is not a failure: a partial run, with a badge.
                         .child(partial.map(|p| badge(p, || Tone::Warn).flex_shrink_0())),
                 )
-                .child(
-                    // The time is the title of a run without a label: not twice.
-                    small(if has_label {
-                        format!("{when} · {numbers}")
-                    } else {
-                        numbers
-                    })
-                    .number_of_lines(1)
-                    .tabular_nums(),
-                ),
+                .child(small(detail).number_of_lines(1).tabular_nums()),
         )
         .child(
             nsh_base::button()
@@ -781,13 +909,29 @@ fn sidebar(s: Store) -> impl IntoElement {
                                         )
                                         .children(grouped(&shown).into_iter().map(
                                             move |(target, rs)| {
+                                                let key = target.clone();
+                                                let selected = {
+                                                    let key = target.clone();
+                                                    computed(move || {
+                                                        s.mode.get() == Mode::Health
+                                                            && s.health_target.get().as_deref()
+                                                                == Some(key.as_str())
+                                                    })
+                                                };
                                                 view()
                                                     .gap_0p5()
                                                     .child(
-                                                        small(target)
-                                                            .px_2()
-                                                            .pt_1()
-                                                            .number_of_lines(1),
+                                                        row_button(
+                                                            format!("Health of {target}"),
+                                                            move || selected.get(),
+                                                            move || {
+                                                                s.show_health(Some(key.clone()))
+                                                            },
+                                                        )
+                                                        .child(
+                                                            small(format!("♥ {target}"))
+                                                                .number_of_lines(1),
+                                                        ),
                                                     )
                                                     .children(
                                                         rs.into_iter().map(move |r| run_row(s, r)),
@@ -938,9 +1082,9 @@ fn tab_bar(s: Store) -> impl IntoElement {
             .rounded(px(5.0))
             .focus_visible(kit::ring)
             .child(
-                text(t.label())
+                text(t.title())
                     .number_of_lines(1)
-                    .text_size(px(12.0))
+                    .text_size(kit::sz(12.0))
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(move || {
                         if selected() {
@@ -1052,11 +1196,16 @@ fn main_area(s: Store) -> impl IntoElement {
         .flex_1()
         .min_w(px(0.0))
         .bg(move || theme().background)
+        // Where the keyboard focus goes back to when an overlay closes (U5).
+        .focusable(true)
+        .label("Main area")
+        .element_ref(&s.main_ref)
         .child(dynamic(move || {
             let m = s.mode.get();
             let loading = s.loading.get() && s.current.with(|c| c.is_none());
             untracked(|| match m {
                 Mode::Welcome => welcome::welcome().into_element(),
+                Mode::Health => health::health_view().into_element(),
                 Mode::Run if loading => kit::empty("Opening the run…", "").into_element(),
                 Mode::Run => run_inspector(s).into_element(),
                 Mode::Compare => compare::compare_view().into_element(),
@@ -1084,6 +1233,7 @@ fn new_run_sheet(s: Store) -> impl IntoElement {
         .on_open_change(move |e: &SheetEvent| {
             if let SheetEvent::OpenChange(false, _) = e {
                 s.overlay.set(None);
+                focus_main(s);
             }
         })
         .accessibility_label("New Run")
@@ -1417,28 +1567,80 @@ fn palette_frame(s: Store, list: nsh_base::CommandElement) -> impl IntoElement {
         ))
 }
 
-/// ⌘K: every command, with the menu's enabled states (disabled ones are shown, not run).
+/// The command palette: every command with the menu's enabled states, matched fuzzily (U6),
+/// best match first; a disabled command says why, every row shows its shortcut as this
+/// platform writes it.
 fn palette(s: Store) -> impl IntoElement {
     when(
         move || s.overlay.get() == Some(Overlay::Palette),
         move || {
-            let items: Vec<CommandItem> = commands(s)
-                .iter()
-                .map(|c| {
-                    let mut it = CommandItem::new(c.id, c.label)
-                        .group(c.group)
-                        .disabled(!c.enabled);
-                    if let Some(k) = c.keys {
-                        it = it.shortcut(k);
-                    }
-                    it
-                })
-                .collect();
+            let cmds: Rc<Vec<Cmd>> = Rc::new(untracked(|| commands(s)));
+            let query = signal(SharedString::default());
+            let reasons: Rc<std::collections::HashMap<&'static str, &'static str>> = Rc::new(
+                cmds.iter()
+                    .filter_map(|c| c.reason.map(|r| (c.id, r)))
+                    .collect(),
+            );
+            let list = cmds.clone();
+            let items = computed(move || {
+                let q = query.get();
+                let specs: Vec<(&str, Vec<&str>)> = list
+                    .iter()
+                    .map(|c| {
+                        let mut k = commands::spec(c.id)
+                            .map(|sp| commands::keywords(&sp))
+                            .unwrap_or_default();
+                        // The English title too, for a translated palette.
+                        if let Some(sp) = commands::spec(c.id) {
+                            k.push(sp.label);
+                        }
+                        (c.label, k)
+                    })
+                    .collect();
+                commands::ranked(&q, &specs)
+                    .into_iter()
+                    .map(|i| {
+                        let c = &list[i];
+                        let mut it = CommandItem::new(c.id, c.label).disabled(!c.enabled);
+                        if q.trim().is_empty() {
+                            it = it.group(c.group);
+                        }
+                        if let Some(k) = c.keys {
+                            it = it.shortcut(k);
+                        }
+                        it
+                    })
+                    .collect::<Vec<_>>()
+            });
+            let render = move |e: &nsh_base::CommandEntry| {
+                let why = reasons.get(e.id.as_ref()).copied();
+                view()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .min_w(px(0.0))
+                    .child(body(e.label.clone()).number_of_lines(1).flex_shrink_0())
+                    .child(
+                        small(why.map(|w| format!("— {w}")).unwrap_or_default())
+                            .number_of_lines(1)
+                            .flex_1()
+                            .min_w(px(0.0)),
+                    )
+                    .child(
+                        small(e.shortcut_label.clone().unwrap_or_default())
+                            .number_of_lines(1)
+                            .flex_shrink_0(),
+                    )
+            };
             palette_frame(
                 s,
                 command()
-                    .items(items)
-                    .placeholder("Type a command")
+                    .items(move || items.get())
+                    .query(move || Some(query.get()))
+                    .filterable(false)
+                    .on_query_change(move |q: &SharedString| query.set(q.clone()))
+                    .render_item(render)
+                    .placeholder(tr("app.palette.placeholder"))
                     .accessibility_label("Commands")
                     .on_select(move |id: &SharedString| {
                         s.overlay.set(None);
@@ -1536,11 +1738,18 @@ fn help(s: Store) -> impl IntoElement {
                     ("v", "verify the top finding"),
                     ("o", "open a run"),
                     ("t", "add a target"),
+                    ("h", "the target's health"),
+                    ("w", "waterfall of the slowest operation"),
                     ("1–6", "tabs"),
                     ("/", "filter requests"),
                     ("j / k", "next / previous"),
+                    ("PgUp / PgDn", "a page up / down"),
+                    ("g / G", "first / last"),
+                    ("> / <", "sort by the next column / reverse"),
+                    ("[ ] { }", "move the brush in time / latency"),
                     ("enter", "inspect"),
                     ("c", "compare"),
+                    (":", "commands"),
                     ("?", "this help"),
                     ("q", "quit"),
                     ("F10", "menu"),
@@ -1751,6 +1960,10 @@ fn settings_overlay(s: Store) -> impl IntoElement {
 }
 
 fn toasts(s: Store) -> impl IntoElement {
+    // A terminal shows them in the status row instead, never over the content (U13).
+    if kit::in_terminal() {
+        return view();
+    }
     view()
         .absolute()
         .right(px(16.0))
@@ -1809,45 +2022,73 @@ fn status_bar(s: Store) -> impl IntoElement {
                 _ => view().into_element(),
             })
         }))
-        .child(
-            view()
-                .flex_row()
-                .gap_3()
-                .flex_1()
-                .min_w(px(0.0))
-                .overflow_hidden()
-                .children(if term {
-                    vec![
-                        // The essentials first: at 80 columns the last two are left out.
-                        key_hint("r", "rerun"),
-                        key_hint("s", "stop"),
-                        key_hint("n", "new"),
-                        key_hint("1-6", "tabs"),
-                        key_hint("/", "filter"),
-                        key_hint("c", "compare"),
-                        key_hint("?", "help"),
-                        key_hint("q", "quit"),
-                        key_hint("v", "verify"),
-                        key_hint("j/k", "move"),
-                    ]
-                    .into_iter()
-                    .take(if narrow() { 8 } else { 10 })
-                    .collect()
-                } else {
-                    vec![
-                        view().child(
-                            small(move || {
-                                format!(
-                                    "{} runs · {}",
-                                    s.runs.with(|r| r.len()),
-                                    s.run_store().dir().display()
-                                )
-                            })
-                            .number_of_lines(1),
-                        ),
-                    ]
-                }),
-        )
+        // The newest toast takes the terminal's status row while it lasts (U13).
+        .child(term.then(|| {
+            dynamic(move || {
+                let last = s.toasts.with(|t| t.last().cloned());
+                untracked(|| match last {
+                    Some((_, msg, tone)) => text(msg)
+                        .text_size(kit::sz(11.0))
+                        .number_of_lines(1)
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .role(AccessibilityRole::Alert)
+                        .text_color(move || match tone {
+                            Tone::Neutral => theme().foreground,
+                            t => t.color(),
+                        })
+                        .test_id("status-toast")
+                        .into_element(),
+                    None => view().into_element(),
+                })
+            })
+        }))
+        .child(dynamic(move || {
+            let toast = term && s.toasts.with(|t| !t.is_empty());
+            untracked(|| {
+                if toast {
+                    return view().into_element();
+                }
+                view()
+                    .flex_row()
+                    .gap_3()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .overflow_hidden()
+                    .children(if term {
+                        vec![
+                            // The essentials first: at 80 columns the last two are left out.
+                            key_hint("r", "rerun"),
+                            key_hint("s", "stop"),
+                            key_hint("n", "new"),
+                            key_hint("1-6", "tabs"),
+                            key_hint("/", "filter"),
+                            key_hint("c", "compare"),
+                            key_hint("?", "help"),
+                            key_hint("q", "quit"),
+                            key_hint("v", "verify"),
+                            key_hint("j/k", "move"),
+                        ]
+                        .into_iter()
+                        .take(if narrow() { 8 } else { 10 })
+                        .collect()
+                    } else {
+                        vec![
+                            view().child(
+                                small(move || {
+                                    format!(
+                                        "{} runs · {}",
+                                        s.runs.with(|r| r.len()),
+                                        s.run_store().dir().display()
+                                    )
+                                })
+                                .number_of_lines(1),
+                            ),
+                        ]
+                    })
+                    .into_element()
+            })
+        }))
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1860,7 +2101,9 @@ pub fn shell() -> impl IntoElement {
     let filter_ref = element_ref();
     if kit::in_terminal() {
         install_terminal_keys(s, s.filter_ref);
+        install_escape(s, s.filter_ref);
     }
+    install_navigation_keys(s);
     // Drop `.oprobe` files on the window to open them.
     let body_view = view()
         .flex_1()

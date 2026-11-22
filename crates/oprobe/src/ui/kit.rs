@@ -8,6 +8,7 @@ use nsh_core::prelude::*;
 
 use crate::analysis::diagnosis::Severity;
 use crate::model::VerdictLevel;
+use crate::ui::model::verdicts::{self, Level};
 
 // ---------------------------------------------------------------------------------------
 // Tokens
@@ -49,6 +50,8 @@ pub enum Tone {
     Warn,
     Crit,
     Info,
+    /// Not enough evidence either way: its own colour, never a pass (U3).
+    Inconclusive,
 }
 
 impl Tone {
@@ -59,22 +62,25 @@ impl Tone {
             Tone::Warn => token("warn")(),
             Tone::Crit => token("crit")(),
             Tone::Info => token("info")(),
+            Tone::Inconclusive => token("inconclusive")(),
+        }
+    }
+    /// The colour of a judgement's level ([`crate::ui::model::verdicts`]: one scale for all).
+    pub fn of_level(l: Level) -> Tone {
+        match l {
+            Level::Neutral => Tone::Neutral,
+            Level::Ok => Tone::Ok,
+            Level::Info => Tone::Info,
+            Level::Inconclusive => Tone::Inconclusive,
+            Level::Warn => Tone::Warn,
+            Level::Crit => Tone::Crit,
         }
     }
     pub fn of_severity(s: Severity) -> Tone {
-        match s {
-            Severity::Info => Tone::Info,
-            Severity::Warning => Tone::Warn,
-            Severity::Critical => Tone::Crit,
-        }
+        Tone::of_level(verdicts::severity(s).1)
     }
     pub fn of_verdict(v: VerdictLevel) -> Tone {
-        match v {
-            VerdictLevel::Ok => Tone::Ok,
-            VerdictLevel::Review => Tone::Info,
-            VerdictLevel::Attention => Tone::Warn,
-            VerdictLevel::Critical => Tone::Crit,
-        }
+        Tone::of_level(verdicts::run_level(v).1)
     }
 }
 
@@ -88,46 +94,55 @@ pub fn in_terminal() -> bool {
 }
 
 // ---------------------------------------------------------------------------------------
-// Typography: the system font at native desktop sizes (13 pt body), tabular numerals.
+// Typography: the system font at native desktop sizes (13 pt body), tabular numerals. Sizes
+// follow the app's Text Size setting (U15) on top of the system's text size, which the engine
+// applies itself.
 // ---------------------------------------------------------------------------------------
 
+/// A text size of `pt` points times the app's text scale (reactive: changing the setting
+/// resizes the text in place).
+pub fn sz(pt: f32) -> impl Fn() -> Length + Copy + 'static {
+    let scale = use_context::<crate::ui::store::Store>().map(|s| s.text_scale);
+    move || px(pt * scale.map(|s| s.get()).unwrap_or(1.0)).into()
+}
+
 pub fn body(t: impl IntoReactive<SharedString>) -> Text {
-    text(t).text_size(px(13.0))
+    text(t).text_size(sz(13.0))
 }
 
 pub fn strong(t: impl IntoReactive<SharedString>) -> Text {
     text(t)
-        .text_size(px(13.0))
+        .text_size(sz(13.0))
         .font_weight(FontWeight::SEMIBOLD)
 }
 
 pub fn title(t: impl IntoReactive<SharedString>) -> Text {
     text(t)
-        .text_size(px(17.0))
+        .text_size(sz(17.0))
         .font_weight(FontWeight::SEMIBOLD)
 }
 
 pub fn small(t: impl IntoReactive<SharedString>) -> Text {
     text(t)
-        .text_size(px(11.0))
+        .text_size(sz(11.0))
         .text_color(move || theme().muted_foreground)
 }
 
 /// A small caps-like section label.
 pub fn caption(t: impl IntoReactive<SharedString>) -> Text {
     text(t)
-        .text_size(px(11.0))
+        .text_size(sz(11.0))
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(move || theme().muted_foreground)
 }
 
 pub fn num(t: impl IntoReactive<SharedString>) -> Text {
-    text(t).text_size(px(13.0)).tabular_nums()
+    text(t).text_size(sz(13.0)).tabular_nums()
 }
 
 pub fn mono(t: impl IntoReactive<SharedString>) -> Text {
     text(t)
-        .text_size(px(12.0))
+        .text_size(sz(12.0))
         .font_family(move || {
             theme()
                 .font_mono
@@ -208,7 +223,7 @@ pub fn btn(
         .disabled_style(|s| s.opacity(0.4))
         .child(
             text(label)
-                .text_size(px(13.0))
+                .text_size(sz(13.0))
                 .font_weight(FontWeight::MEDIUM)
                 .number_of_lines(1)
                 .text_color(fg),
@@ -219,7 +234,7 @@ pub fn btn(
 pub fn tool(
     glyph: &'static str,
     label: &'static str,
-    hint: &'static str,
+    hint: impl Into<SharedString>,
     on_press: impl Fn() + 'static,
 ) -> nsh_base::ButtonElement {
     tool_dyn(move || glyph, move || label, hint, on_press)
@@ -229,20 +244,42 @@ pub fn tool(
 pub fn tool_dyn(
     glyph: impl Fn() -> &'static str + Copy + 'static,
     label: impl Fn() -> &'static str + Copy + 'static,
-    hint: &'static str,
+    hint: impl Into<SharedString>,
     on_press: impl Fn() + 'static,
 ) -> nsh_base::ButtonElement {
+    let hint: SharedString = hint.into();
     let term = in_terminal();
     let inner = view()
         .flex_row()
         .gap(px(5.0))
         .items_center()
         .child((!term).then(|| {
-            text(glyph)
-                .text_size(px(13.0))
-                .text_color(move || theme().muted_foreground)
+            // Windows draws its own icon set (Segoe Fluent) where the glyph has one (U11).
+            let native = move || {
+                if os() == nsh_core::platform::Os::Windows {
+                    native_icon(glyph())
+                } else {
+                    None
+                }
+            };
+            text(move || match native() {
+                Some(c) => SharedString::from(c.to_string()),
+                None => SharedString::from(glyph()),
+            })
+            .text_size(sz(13.0))
+            .font_family(move || {
+                if native().is_some() {
+                    crate::ui::model::icons::WINDOWS_ICON_FONT.into()
+                } else {
+                    theme()
+                        .font_sans
+                        .clone()
+                        .unwrap_or_else(|| "system-ui".into())
+                }
+            })
+            .text_color(move || theme().muted_foreground)
         }))
-        .child(text(label).text_size(px(12.0)).number_of_lines(1));
+        .child(text(label).text_size(sz(12.0)).number_of_lines(1));
     let inner = if hint.is_empty() || in_terminal() {
         inner
     } else {
@@ -264,8 +301,29 @@ pub fn tool_dyn(
         .child(inner)
 }
 
+/// The Segoe Fluent code point of a toolbar glyph, when the icon set has it.
+fn native_icon(glyph: &str) -> Option<char> {
+    use crate::ui::model::icons::{Icon, names};
+    let icon = match glyph {
+        "▶" => Icon::Run,
+        "■" => Icon::Stop,
+        "↻" => Icon::Rerun,
+        "⇄" => Icon::Compare,
+        "♥" => Icon::Health,
+        "⚙" => Icon::Tune,
+        "⌁" => Icon::Probe,
+        "⇪" => Icon::Export,
+        "≡" => Icon::Commands,
+        "◧" => Icon::Sidebar,
+        "◨" => Icon::Inspector,
+        _ => return None,
+    };
+    Some(names(icon).1)
+}
+
 /// A tooltip bubble.
-pub fn tip(label: &'static str) -> nsh_base::TooltipElement {
+pub fn tip(label: impl Into<SharedString>) -> nsh_base::TooltipElement {
+    let label: SharedString = label.into();
     tooltip().delay(500.0).child(
         view()
             .px_2()
@@ -319,7 +377,7 @@ pub fn field(label: &'static str, placeholder: &'static str, value: Signal<Strin
         .caret_color(|| color(theme().primary))
         .h(px(26.0))
         .px(px(8.0))
-        .text_size(px(13.0))
+        .text_size(sz(13.0))
         .rounded(radius)
         .border_1()
         .border_color(move || theme().input)
@@ -463,7 +521,7 @@ pub fn segmented(
                     }
                 })
                 .focus_visible(ring)
-                .child(text(*title).text_size(px(12.0)))
+                .child(text(*title).text_size(sz(12.0)))
         }))
 }
 
@@ -495,7 +553,7 @@ pub fn badge(
         .self_start()
         .child(
             text(label)
-                .text_size(px(11.0))
+                .text_size(sz(11.0))
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(move || tone().color()),
         )
@@ -545,7 +603,7 @@ pub fn kpi_detail(
         .child(caption(label).number_of_lines(1))
         .child(
             text(value)
-                .text_size(px(17.0))
+                .text_size(sz(17.0))
                 .font_weight(FontWeight::SEMIBOLD)
                 .tabular_nums()
                 .number_of_lines(1)
@@ -581,7 +639,7 @@ pub fn key_hint(keys: &'static str, what: &'static str) -> View {
         .flex_shrink_0()
         .child(
             text(keys)
-                .text_size(px(11.0))
+                .text_size(sz(11.0))
                 .font_weight(FontWeight::BOLD)
                 .number_of_lines(1)
                 .flex_shrink_0(),
@@ -606,7 +664,7 @@ pub fn prop_row(
         )
         .child(
             text(value)
-                .text_size(px(12.0))
+                .text_size(sz(12.0))
                 .tabular_nums()
                 .number_of_lines(1)
                 .flex_1()

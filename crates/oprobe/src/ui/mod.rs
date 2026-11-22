@@ -255,11 +255,25 @@ fn listen_for_files(s: store::Store) {
         loop {
             let second = next_second_instance().await;
             for a in second.args.iter().skip(1) {
+                if a.starts_with("oprobe://") {
+                    s.open_link(a);
+                    continue;
+                }
                 let p = std::path::Path::new(a);
                 if p.extension().is_some_and(|e| e == "oprobe") {
                     s.open_path(std::path::Path::new(&second.cwd).join(p));
                 }
             }
+        }
+    });
+}
+
+/// Saved-view links the system opens the app with (`oprobe://run/ID?view=…`, design v5 §9).
+fn listen_for_links(s: store::Store) {
+    spawn(async move {
+        loop {
+            let url = next_url_scheme_open().await;
+            s.open_link(&url);
         }
     });
 }
@@ -272,13 +286,21 @@ pub fn App() -> impl IntoElement {
         Ok(tokens) => set_tokens(tokens),
         Err(e) => eprintln!("oprobe: theme.json: {e}"),
     }
+    // The App's language: the CLI's, else the OS's (U15).
+    model::i18n::init();
     let s = store::Store::new();
     provide_context(s);
     views::shell::apply_appearance(&s.prefs.with_untracked(|p| p.appearance.clone()));
     setup_window(s);
     listen_for_files(s);
-    // `oprobe gui --open FILE` / `oprobe runs open RUNREF` / `oprobe gui run.oprobe`: open it.
+    listen_for_links(s);
+    // `oprobe gui --open FILE` / `oprobe runs open RUNREF` / `oprobe gui run.oprobe`: open it;
+    // `oprobe gui 'oprobe://run/ID?view=…'`: the run and its view.
     let l = launch();
+    if let Some(link) = l.target.clone().filter(|t| t.starts_with("oprobe://")) {
+        s.overlay.set(None);
+        s.open_link(&link);
+    }
     if let Some(p) = l.open.clone().or_else(|| {
         l.target
             .filter(|t| t.ends_with(".oprobe"))
