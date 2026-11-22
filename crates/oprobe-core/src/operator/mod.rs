@@ -617,6 +617,19 @@ impl OperatorSpec {
         let layer_toggle = parts.len() == 2 && parts[0] == "layers";
         let parsed = if parts[0] == "options" || path == "url" {
             Some(toml::Value::String(value.to_owned()))
+        } else if path == "http.proxy" {
+            // `none` is a value here (no proxy, whatever HTTPS_PROXY says); `unset` or
+            // `default` go back to the environment's proxy.
+            match value.to_ascii_lowercase().as_str() {
+                "unset" | "default" | "" => None,
+                "none" | "off" => Some(toml::Value::String("none".to_owned())),
+                _ => Some(toml::Value::String(value.to_owned())),
+            }
+        } else if path == "http.ca_cert" {
+            match value.to_ascii_lowercase().as_str() {
+                "none" | "unset" | "default" | "" => None,
+                _ => Some(toml::Value::String(value.to_owned())),
+            }
         } else {
             scalar(value, layer_toggle)
         };
@@ -830,6 +843,23 @@ keep_alive = true
         assert!(s.read.gap.is_none());
         s.set("layers.retry", "off").unwrap();
         assert_eq!(s.retries(), 0);
+        // `http.proxy=none` means no proxy (not the environment's); `unset` restores it.
+        s.set("http.proxy", "none").unwrap();
+        assert_eq!(s.http.proxy.as_deref(), Some("none"));
+        assert_eq!(
+            crate::engine::operator::proxy_setting(&s.target_spec()),
+            Some(None),
+            "the transport bypasses HTTPS_PROXY"
+        );
+        assert!(s.to_toml().contains("proxy = \"none\""), "{}", s.to_toml());
+        s.set("http.proxy", "http://p:3128").unwrap();
+        assert_eq!(s.http.proxy.as_deref(), Some("http://p:3128"));
+        s.set("http.proxy", "unset").unwrap();
+        assert_eq!(s.http.proxy, None);
+        assert_eq!(
+            crate::engine::operator::proxy_setting(&s.target_spec()),
+            None
+        );
         for (p, v) in [
             ("layers.retry.max_tims", "5"),
             ("read.concurrent", "0"),

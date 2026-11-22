@@ -87,7 +87,7 @@ The `HttpFetch` client (OpenDAL's reqwest client).
 |---|---|
 | `version` | `auto` (OpenDAL's default: HTTP/1.1), `h1` or `h2` |
 | `keep_alive` | reuse connections (default true) |
-| `proxy` | egress proxy URL; `"none"` ignores `HTTPS_PROXY`/`HTTP_PROXY` (unset: the environment) |
+| `proxy` | egress proxy URL; `"none"` (also `--set http.proxy=none`) means no proxy, whatever `HTTPS_PROXY`/`HTTP_PROXY` say; unset (`--set http.proxy=unset`): the environment |
 | `ca_cert` | an extra PEM CA bundle to trust |
 | `insecure` | skip certificate verification (self-signed development endpoints only) |
 
@@ -97,7 +97,8 @@ The `HttpFetch` client (OpenDAL's reqwest client).
 takes the same paths. The paths: `url`, `options.KEY`, `layers.NAME` (`on`/`off`),
 `layers.NAME.FIELD`, `read.chunk`, `read.concurrent`, `read.gap`, `write.chunk`,
 `write.concurrent`, `http.version`, `http.keep_alive`, `http.proxy`, `http.ca_cert`,
-`http.insecure`. `none` removes an optional value.
+`http.insecure`. `none` removes an optional value, except for `http.proxy`, where it means no proxy
+(`unset` goes back to the environment's).
 
 ```bash
 oprobe run op.toml --set layers.concurrent_limit.http=32 --set read.gap=1MiB
