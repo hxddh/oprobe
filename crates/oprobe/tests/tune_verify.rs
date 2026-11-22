@@ -126,9 +126,26 @@ fn tune_on_parquet_recommends_the_safe_concurrency() {
         "recommended {c}, tune's safe concurrency {safe}: {}",
         serde_json::to_string_pretty(t).unwrap()
     );
+    // Design v5 §4 (A4): the headroom is a posterior quantile, not a fixed 15 %. The
+    // recommendation is at least the fixed-headroom answer of a plain run (`model`), never past
+    // the in-flight ceiling (24 requests / 4 per operation = 6 workers), and was measured within
+    // the throttle budget ("c=4 against a feasible c=6" was the 4.x bug).
+    // `lab://parquet` answers 503 above 24 requests in flight: 6 parquet workers (4 in flight
+    // each) fit, 7 do not.
+    let ceiling_workers = 6;
     assert!(
-        c.abs_diff(model) <= 1,
-        "recommended {c}, the capacity model of a plain run says {model}"
+        c + 1 >= model && c <= ceiling_workers,
+        "recommended {c}: the plain run's fixed-headroom model says {model}, the lab's limit allows {ceiling_workers}"
+    );
+    let rt = t["trials"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["id"] == t["recommended_trial_id"])
+        .expect("the recommended trial");
+    assert!(
+        rt["feasible"] == true,
+        "the recommendation was measured within the budget: {rt}"
     );
     // Never a negative headline.
     if let Some(i) = t["improvement_ratio"].as_f64() {

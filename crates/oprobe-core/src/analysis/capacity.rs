@@ -530,6 +530,21 @@ fn estimate_ceiling(reqs: &[ReqRow], ops: &[OpRow], window: Window) -> Capacity 
 /// The highest class-balanced error a ceiling split may have (1.0 = no better than no split).
 const MAX_SPLIT_COST: f64 = 0.75;
 
+/// Move the split `k` up past the levels right above it that were served (almost) cleanly:
+/// ≥ 3 arrivals, at most 10 % throttled. `lv` is `(level, clean, throttled)` in level order.
+pub(crate) fn nudge_past_clean_levels(lv: &[(u64, u64, u64)], mut k: u64) -> u64 {
+    let start = k;
+    for (l, c, t) in lv.iter().filter(|x| x.0 > start) {
+        let n = c + t;
+        if *l == k + 1 && n >= 3 && (*t as f64) <= 0.1 * n as f64 {
+            k = *l;
+        } else {
+            break;
+        }
+    }
+    k
+}
+
 fn find_ceiling(levels: &BTreeMap<u64, (u64, u64)>) -> Option<(Ceiling, u64)> {
     let lv: Vec<(u64, u64, u64)> = levels.iter().map(|(l, (n, t))| (*l, n - t, *t)).collect();
     let total_clean: u64 = lv.iter().map(|x| x.1).sum();
@@ -555,12 +570,17 @@ fn find_ceiling(levels: &BTreeMap<u64, (u64, u64)>) -> Option<(Ceiling, u64)> {
             best = (cost, *l, thr_below + clean_above);
         }
     }
-    let (cost, k, errors) = best;
+    let (cost, mut k, errors) = best;
     // No split (cost 1.0) explains throttling unrelated to load just as well; a ceiling needs a
     // split that clearly separates the classes (balanced accuracy above 62.5 %).
     if cost > MAX_SPLIT_COST {
         return None;
     }
+    // ±1 measurement error: the client counts in-flight requests a level off the server now and
+    // then (coarse timers on Windows), so a lone throttled arrival lands one level low. A level
+    // just above the split that still served ≥ 90 % of its (≥ 3) arrivals cleanly is below the
+    // limit: move the split past it.
+    k = nudge_past_clean_levels(&lv, k);
     // A throttled arrival must exist above the split, or throttling does not follow load.
     lv.iter().find(|(l, _, t)| *l > k && *t > 0)?;
     let share = |c: u64, t: u64| t as f64 / (c + t).max(1) as f64;
@@ -1325,6 +1345,33 @@ mod tests {
         levels.insert(29, (2, 2));
         let (c, _) = find_ceiling(&levels).expect("a ceiling");
         assert!(c.lo <= 24.0 && 24.0 < c.hi, "{c:?}");
+    }
+
+    /// Windows CI, parquet lab (limit 24): one throttled arrival at level 24 (the client's
+    /// in-flight count a level off the server's) must not pull the ceiling below 24.
+    #[test]
+    fn a_lone_throttle_one_level_low_does_not_lower_the_ceiling() {
+        let ci = [
+            (23u64, 89u64, 0u64),
+            (24, 37, 1),
+            (25, 36, 8),
+            (26, 18, 6),
+            (27, 11, 3),
+            (28, 4, 1),
+        ];
+        let exactly: BTreeMap<u64, (u64, u64)> =
+            ci.iter().map(|(l, n, t)| (*l, (*n, *t))).collect();
+        // The same levels behind a run's many clean arrivals at lower levels: the
+        // class-balanced split alone then prefers 23.
+        let mut with_low = exactly.clone();
+        for l in 1..=22u64 {
+            with_low.insert(l, (200, 0));
+        }
+        for levels in [exactly, with_low] {
+            let (c, _) = find_ceiling(&levels).expect("a ceiling");
+            assert!(c.lo <= 24.0 && 24.0 < c.hi, "{c:?}");
+            assert_eq!(c.lo, 24.0, "{c:?}");
+        }
     }
 
     #[test]

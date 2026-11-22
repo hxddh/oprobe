@@ -358,8 +358,34 @@ fn throttle_family(obs: &[Obs], keys: &[String], prefixes: &[String]) -> Vec<Fit
             k as f64 / n.max(1) as f64 * 100.0
         )],
     });
-    // In-flight: a step at `c`.
+    // In-flight: a step at `c`, tolerant of ±1 level of client-side measurement error.
     if let Some((c, s)) = best_threshold(obs.iter().map(|o| (o.level, o.thr))) {
+        let lv: Vec<(u64, u64, u64)> = (1..=c + 64)
+            .map(|l| {
+                let (n, t) = obs
+                    .iter()
+                    .filter(|o| o.level == l)
+                    .fold((0u64, 0u64), |a, o| (a.0 + 1, a.1 + u64::from(o.thr)));
+                (u64::from(l), n - t, t)
+            })
+            .collect();
+        let c2 = super::capacity::nudge_past_clean_levels(&lv, u64::from(c)) as u32;
+        let s = if c2 == c {
+            s
+        } else {
+            let mut sp = Split::default();
+            for o in obs {
+                if o.level > c2 {
+                    sp.n1 += 1;
+                    sp.k1 += u64::from(o.thr);
+                } else {
+                    sp.n0 += 1;
+                    sp.k0 += u64::from(o.thr);
+                }
+            }
+            sp
+        };
+        let c = c2;
         let lo_share = s.k0 as f64 / s.n0.max(1) as f64;
         let hi_share = s.k1 as f64 / s.n1.max(1) as f64;
         fits.push(Fit {

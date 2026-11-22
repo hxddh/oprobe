@@ -324,12 +324,13 @@ fn runs_confidence(na: usize, nb: usize) -> Confidence {
 }
 
 /// Change of a latency quantile `q` of `verb` (all operations when `None`). With three or
-/// more runs on each side, a Welch interval on the log ratio of the per-run values (never
-/// below −100 %); with fewer, a block bootstrap over the time windows of every run of a side
-/// pooled (a t-interval on two runs is meaningless: A12).
+/// more runs on a side, a Welch interval on the log ratio of the per-run values (never below
+/// −100 %; a side with one run borrows the other's variance); with fewer, a block bootstrap
+/// over the time windows of every run of a side pooled (a t-interval on two runs per side is
+/// meaningless: A12).
 fn latency_change(base: &[Run], cand: &[Run], verb: Option<&str>, q: f64) -> Option<Change> {
     let seed = (q * 1000.0) as u64 ^ verb.map_or(0, |v| crate::model::ids::fnv1a(v.as_bytes()));
-    if base.len() >= 3 && cand.len() >= 3 {
+    if base.len().max(cand.len()) >= 3 {
         let get = |r: &Run| match verb {
             Some(v) => verb_q(&r.report, v, q > 0.9),
             None => Some(if q > 0.9 {
@@ -359,7 +360,7 @@ fn latency_change(base: &[Run], cand: &[Run], verb: Option<&str>, q: f64) -> Opt
 
 /// Change of the good-op rate (as [`latency_change`]).
 fn throughput_change(base: &[Run], cand: &[Run]) -> Option<Change> {
-    if base.len() >= 3 && cand.len() >= 3 {
+    if base.len().max(cand.len()) >= 3 {
         let a: Vec<f64> = base.iter().map(|r| good_ops_per_s(&r.report)).collect();
         let b: Vec<f64> = cand.iter().map(|r| good_ops_per_s(&r.report)).collect();
         let (x, y, _) = runs_t(&a, &b);

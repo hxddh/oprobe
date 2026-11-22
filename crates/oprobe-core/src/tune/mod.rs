@@ -992,6 +992,12 @@ pub async fn tune(
                 opts.risk_ratio * 100.0
             ));
             t.posterior_ok.push(i);
+            // The margin is now the posterior's: report its concurrency as the safe one (a
+            // paced trial's limit is its rate, not its workers).
+            if t.trials[i].rate_per_s.is_none() {
+                let c = t.trials[i].knobs.concurrency;
+                safe = Some(safe.map_or(c, |s| s.max(c)));
+            }
             current = i;
         }
     }
