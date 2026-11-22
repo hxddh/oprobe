@@ -271,14 +271,22 @@ pub fn plan(profile: &Profile, run_prefix: &str, read_only: bool, budgets: &Budg
     }
     let network = profile.target().is_network();
     let total_w: u64 = mix.iter().map(|m| m.weight as u64).sum::<u64>().max(1);
-    let chunk = k.chunk_size.0.max(1);
+    // Unset (0): OpenDAL reads in one request, and writes multipart parts of ~8 MiB.
+    let read_chunk = match k.chunk_size.0 {
+        0 => u64::MAX,
+        c => c,
+    };
+    let chunk = match k.chunk_size.0 {
+        0 => 8 << 20,
+        c => c,
+    };
     let obj = ds.object_size.0;
     // Requests and bytes of one operation of each kind.
     let per_op = |op: &OpKind| -> (f64, f64, bool) {
         match op {
             OpKind::Read { size } => {
                 let len = size.map(|s| s.0.min(obj)).unwrap_or(obj);
-                (len.div_ceil(chunk).max(1) as f64, len as f64, false)
+                (len.div_ceil(read_chunk).max(1) as f64, len as f64, false)
             }
             OpKind::ParquetScan {
                 columns,

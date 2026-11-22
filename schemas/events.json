@@ -692,7 +692,7 @@
         },
         "persist": {
           "default": false,
-          "description": "Keep the generated dataset between runs (`oprobe-dataset/<fingerprint>/`) to avoid\nre-uploading it every time. Remove with `oprobe cleanup --datasets`.",
+          "description": "Keep the generated dataset between runs (`oprobe-dataset/<fingerprint>/`) to avoid\nre-uploading it every time (remove it with your storage tools).",
           "type": "boolean"
         },
         "size_dist": {
@@ -2550,7 +2550,7 @@
         },
         "spec": {
           "$ref": "#/$defs/RunSpec",
-          "description": "The replayable definition of the run (`oprobe run --from RUN`)."
+          "description": "The replayable definition of the run (what `oprobe prove` replays)."
         },
         "stages": {
           "$ref": "#/$defs/Stages"

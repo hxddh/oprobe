@@ -105,9 +105,9 @@ pub fn remedy(code: &str, variant: Option<&str>) -> Remedy {
         ("tail_stragglers", _) => r(
             Some("layers.tail_cut"),
             &["layers.retry.min_delay"],
-            "TailCutLayer (with a short RetryLayer backoff for the re-issue)",
+            "TailCutLayer + RetryLayer::with_min_delay",
             false,
-            "re-issue requests far slower than their peers with TailCutLayer",
+            "re-issue requests far slower than their peers, after a short retry backoff",
         ),
         ("hung_requests", _) => r(
             Some("layers.timeout.io"),
