@@ -1,0 +1,54 @@
+[package]
+name = "oprobe-trace"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/oprobe-trace"
+description = "Embeddable request tracing for Apache OpenDAL: per-stage timing of every backend request, bounded-memory aggregates, optional OpenTelemetry metrics"
+readme = "README.md"
+keywords = ["opendal", "tracing", "s3", "observability", "opentelemetry"]
+categories = ["development-tools::profiling", "network-programming"]
+include = ["src/**/*", "tests/**/*", "Cargo.toml", "README.md", "LICENSE"]
+
+[features]
+default = []
+# OpenTelemetry metrics (`http.client.request.duration` with `oprobe.stage`/`oprobe.api`).
+otel = ["dep:opentelemetry"]
+
+[dependencies]
+opendal-core = { workspace = true, features = ["executors-tokio"] }
+await-tree.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http.workspace = true
+http-body.workspace = true
+http-body-util.workspace = true
+httpdate.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
+rustls-pki-types.workspace = true
+webpki-roots.workspace = true
+rustls-native-certs.workspace = true
+rustls-platform-verifier.workspace = true
+reqwest.workspace = true
+tower-layer.workspace = true
+tower-service.workspace = true
+url.workspace = true
+bytes.workspace = true
+futures.workspace = true
+tokio.workspace = true
+hdrhistogram.workspace = true
+rand.workspace = true
+serde.workspace = true
+schemars.workspace = true
+anyhow.workspace = true
+libc.workspace = true
+opentelemetry = { version = "0.31", default-features = false, features = ["metrics"], optional = true }
+
+[dev-dependencies]
+opendal-core = { workspace = true, features = ["executors-tokio", "services-memory"] }
+opentelemetry_sdk = { version = "0.31", default-features = false, features = ["metrics", "testing"] }
+tokio.workspace = true

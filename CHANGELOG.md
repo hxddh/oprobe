@@ -4,6 +4,47 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## v5.0.0 — unreleased
+
+The foundation of 5.0 (design [v5](docs/design/v5.md) §12 F). Everything below is breaking.
+
+### Changed
+
+- **Workspace split.** The repository is a cargo workspace of three crates:
+  `oprobe-trace` (the embeddable instrumentation: `TraceLayer`, the fidelity and microscope
+  transports, `ReqRow`/`OpRow`, the recorder and aggregates), `oprobe-core` (engine, analysis,
+  model, store, tune, lab, report renderers and the service layer) and `oprobe` (the binary:
+  CLI, MCP server, TUI/GUI). The `oprobe` library no longer exports the engine under its own
+  modules for embedding; depend on `oprobe-trace` or `oprobe-core`.
+- **Service layer.** `oprobe_core::app::App` is the only entry point of the front ends, with
+  typed requests and results (plan, run, tune, verify, fix, compare, explain, analyze, doctor,
+  sample, discover, targets, runs, baselines, cleanup). `RunRequest` is a `RunSpec` plus
+  `Overrides`, safety (budgets, read-only, allow-write), a `ClientChoice` and an optional
+  `WorkerSet`.
+- **MCP runs in-process.** `doctor`, `probe_endpoint`, `cleanup`, `verify_finding` and
+  `recommend_config` call `App` instead of spawning `oprobe` child processes; a read-only server
+  passes `allow_write: false` instead of `OPROBE_MCP_READ_ONLY`.
+- **Report `oprobe.report/5`.** New sections: `client` (what generated the load; the 4.x
+  `client` CPU/RSS block moved to `self.process`), `self`, `schedule`, `workers`, `dimensions`,
+  `sampling`, and `capacity.hypotheses` (today's in-flight ceiling is one `inflight_limit`
+  hypothesis). `compare` and `verify` gain an optional two-sided `net` verdict.
+- **Run file `oprobe.run/5`.** A zstd stream of framed blocks: `header` (spec and client),
+  columnar `segment`s of op and request rows, per-second `interval`s and the `report` last,
+  streamed to disk (never encoded whole in memory). 4.x run files are not read.
+- **Whole-operation sampling.** Beyond the row budget an operation is kept with all its
+  requests or not at all: a time-stratified reservoir plus every failed or throttled operation
+  and the slowest 1 % (`report.sampling`).
+- **Always-on recorder.** `oprobe_trace::layer(Config) -> (TraceLayer, Handle)` instruments any
+  OpenDAL operator; requests outside an operation scope are recorded in every shard. The `otel`
+  feature emits `http.client.request.duration` with `oprobe.stage` and `oprobe.api`.
+- The compare gate moved from `report/diff.rs` to `analysis/gate.rs`; `report/view.rs` is the
+  shared presentation model of the terminal, Markdown and HTML renderers. The lab is a module
+  directory (`lab/`), the finding catalog lives in `analysis/catalog.rs`.
+- **Smaller binary.** Release builds use one codegen unit, fat LTO and stripping. Rarely used
+  OpenDAL services (azdls, azfile, swift, tos, webhdfs, upyun, http) are behind cargo features
+  (`all-services`); the default build covers s3, gcs, azblob, oss, cos, obs, b2, webdav, fs and
+  memory.
+
 ## v4.0.2 — 2026-11-21
 
 ### Fixed

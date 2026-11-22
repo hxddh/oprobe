@@ -3983,8 +3983,38 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7e036b411754132fd6b74e94b74e9a13c5cf606fa93d1885c35860d3060820b1"
 
 [[package]]
+name = "opentelemetry"
+version = "0.31.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b84bcd6ae87133e903af7ef497404dda70c60d0ea14895fc8a5e6722754fc2a0"
+dependencies = [
+ "futures-core",
+ "futures-sink",
+ "js-sys",
+ "pin-project-lite",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "opentelemetry_sdk"
+version = "0.31.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e14ae4f5991976fd48df6d843de219ca6d31b01daaab2dad5af2badeded372bd"
+dependencies = [
+ "futures-channel",
+ "futures-executor",
+ "futures-util",
+ "opentelemetry",
+ "percent-encoding",
+ "rand 0.9.5",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-stream",
+]
+
+[[package]]
 name = "oprobe"
-version = "4.0.2"
+version = "5.0.0"
 dependencies = [
  "anyhow",
  "await-tree",
@@ -3992,16 +4022,12 @@ dependencies = [
  "clap",
  "clap_complete",
  "clap_mangen",
- "crc32c",
  "crossterm",
  "dirs",
  "flate2",
  "futures",
- "hdrhistogram",
  "http",
- "http-body",
  "http-body-util",
- "httpdate",
  "hyper",
  "hyper-util",
  "jsonschema",
@@ -4017,16 +4043,11 @@ dependencies = [
  "opendal",
  "opendal-core",
  "opendal-http-transport-reqwest",
- "rand 0.8.8",
+ "oprobe-core",
  "ratatui-core",
  "ratatui-crossterm",
- "rcgen",
  "reqwest",
  "rmcp",
- "rustls",
- "rustls-native-certs",
- "rustls-pki-types",
- "rustls-platform-verifier 0.6.2",
  "schemars",
  "serde",
  "serde_json",
@@ -4034,16 +4055,86 @@ dependencies = [
  "tar",
  "tempfile",
  "tokio",
- "tokio-rustls",
  "tokio-util",
  "toml 0.8.23",
+ "tower-service",
+ "url",
+ "windows-sys 0.61.2",
+ "zip",
+ "zstd",
+]
+
+[[package]]
+name = "oprobe-core"
+version = "5.0.0"
+dependencies = [
+ "anyhow",
+ "await-tree",
+ "bytes",
+ "crc32c",
+ "dirs",
+ "futures",
+ "http",
+ "http-body",
+ "http-body-util",
+ "httpdate",
+ "hyper",
+ "hyper-util",
+ "libc",
+ "opendal",
+ "opendal-core",
+ "oprobe-trace",
+ "rand 0.8.8",
+ "rcgen",
+ "reqwest",
+ "rustls",
+ "rustls-pki-types",
+ "schemars",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "tokio-rustls",
+ "toml 0.8.23",
+ "url",
+ "windows-sys 0.61.2",
+ "zstd",
+]
+
+[[package]]
+name = "oprobe-trace"
+version = "5.0.0"
+dependencies = [
+ "anyhow",
+ "await-tree",
+ "bytes",
+ "futures",
+ "hdrhistogram",
+ "http",
+ "http-body",
+ "http-body-util",
+ "httpdate",
+ "hyper",
+ "hyper-util",
+ "libc",
+ "opendal-core",
+ "opentelemetry",
+ "opentelemetry_sdk",
+ "rand 0.8.8",
+ "reqwest",
+ "rustls",
+ "rustls-native-certs",
+ "rustls-pki-types",
+ "rustls-platform-verifier 0.6.2",
+ "schemars",
+ "serde",
+ "tokio",
+ "tokio-rustls",
  "tower-layer",
  "tower-service",
  "url",
  "webpki-roots 0.26.11",
- "windows-sys 0.61.2",
- "zip",
- "zstd",
 ]
 
 [[package]]

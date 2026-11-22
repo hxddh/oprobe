@@ -212,9 +212,9 @@ jobs:
         shell: bash
         run: |
           cargo install --locked cargo-deb cargo-generate-rpm
-          cargo deb --no-build --no-strip --target ${{ matrix.target }} --output out/
+          cargo deb -p oprobe --no-build --no-strip --target ${{ matrix.target }} --output out/
           mkdir -p target/release && cp "target/${{ matrix.target }}/release/oprobe" target/release/oprobe
-          cargo generate-rpm --target ${{ matrix.target }} -o out/
+          cargo generate-rpm -p crates/oprobe --target ${{ matrix.target }} -o out/
           ls out
 
       - name: Smoke test packaged binary
@@ -414,7 +414,8 @@ jobs:
           if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
             echo "::warning::CARGO_REGISTRY_TOKEN not set; skipping crates.io publish"; exit 0
           fi
-          cargo publish --locked
+          # oprobe-trace, then oprobe-core, then oprobe (cargo orders the workspace).
+          cargo publish --workspace --locked
 
   # Package managers. Each job is gated on its secret: without it, the job ends with a warning
   # and the release stays green. Pre-releases are never published to them.

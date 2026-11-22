@@ -106,6 +106,17 @@
           "$ref": "#/$defs/DiffReport",
           "description": "The per-check gate (per-operation latency, errors, throttling, amplification, cost),\nwith significance applied to latency and throughput checks."
         },
+        "net": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NetAssessment"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The two-sided net verdict (design v5 §4; filled by stream ANA)."
+        },
         "p99_trend_ms": {
           "description": "p99 (ms) of every baseline run then every candidate run, in time order.",
           "items": {
@@ -370,6 +381,17 @@
           },
           "type": "array"
         },
+        "net": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NetAssessment"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The two-sided net verdict (design v5 §4; filled by stream ANA)."
+        },
         "outcome": {
           "$ref": "#/$defs/VerifyOutcome"
         },
@@ -551,6 +573,24 @@
         }
       ]
     },
+    "MetricMove": {
+      "description": "One metric that moved, with its relative change.",
+      "properties": {
+        "delta_ratio": {
+          "format": "double",
+          "type": "number"
+        },
+        "metric": {
+          "description": "`ops_per_s`, `p99_ms`, `throttled_request_ratio`, …",
+          "type": "string"
+        }
+      },
+      "required": [
+        "metric",
+        "delta_ratio"
+      ],
+      "type": "object"
+    },
     "MetricStat": {
       "description": "A headline metric with confidence intervals.",
       "properties": {
@@ -600,6 +640,64 @@
         "confidence"
       ],
       "type": "object"
+    },
+    "NetAssessment": {
+      "description": "A net verdict with what got better and what got worse.",
+      "properties": {
+        "better": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/MetricMove"
+          },
+          "type": "array"
+        },
+        "verdict": {
+          "$ref": "#/$defs/NetVerdict"
+        },
+        "worse": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/MetricMove"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "verdict",
+        "better",
+        "worse"
+      ],
+      "type": "object"
+    },
+    "NetVerdict": {
+      "description": "The net effect of a change.",
+      "oneOf": [
+        {
+          "const": "improved",
+          "description": "Better on the objective, nothing significantly worse.",
+          "type": "string"
+        },
+        {
+          "const": "regressed",
+          "description": "Worse on the objective.",
+          "type": "string"
+        },
+        {
+          "const": "traded",
+          "description": "Some metrics better, others worse (e.g. \"throttling −4.6 pp, goodput −21 %\").",
+          "type": "string"
+        },
+        {
+          "const": "no_change",
+          "description": "No significant change.",
+          "type": "string"
+        },
+        {
+          "const": "inconclusive",
+          "description": "Not enough evidence either way (never shown as \"same\").",
+          "type": "string"
+        }
+      ]
     },
     "NextStep": {
       "description": "A suggested next step: what it does, the CLI command, and the MCP call doing the same.",

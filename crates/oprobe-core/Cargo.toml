@@ -1,0 +1,102 @@
+[package]
+name = "oprobe-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/oprobe-core"
+description = "The engine of oprobe: workloads, diagnosis, cost, tuning, the run store and the service layer every oprobe front end calls"
+readme = "README.md"
+keywords = ["opendal", "s3", "benchmark", "profiler", "object-storage"]
+categories = ["development-tools::profiling"]
+include = ["src/**/*", "Cargo.toml", "README.md", "LICENSE"]
+
+[features]
+default = ["default-services"]
+# The common clouds and local backends.
+default-services = [
+  "services-s3",
+  "services-gcs",
+  "services-azblob",
+  "services-oss",
+  "services-cos",
+  "services-obs",
+  "services-b2",
+  "services-webdav",
+]
+# Every service oprobe knows.
+all-services = [
+  "default-services",
+  "services-azdls",
+  "services-azfile",
+  "services-swift",
+  "services-tos",
+  "services-webhdfs",
+  "services-upyun",
+  "services-http",
+]
+services-s3 = ["opendal/services-s3"]
+services-gcs = ["opendal/services-gcs"]
+services-azblob = ["opendal/services-azblob"]
+services-oss = ["opendal/services-oss"]
+services-cos = ["opendal/services-cos"]
+services-obs = ["opendal/services-obs"]
+services-b2 = ["opendal/services-b2"]
+services-webdav = ["opendal/services-webdav"]
+services-azdls = ["opendal/services-azdls"]
+services-azfile = ["opendal/services-azfile"]
+services-swift = ["opendal/services-swift"]
+services-tos = ["opendal/services-tos"]
+services-webhdfs = ["opendal/services-webhdfs"]
+services-upyun = ["opendal/services-upyun"]
+services-http = ["opendal/services-http"]
+# OpenTelemetry metrics in the embedded recorder (`oprobe_trace::otel`).
+otel = ["oprobe-trace/otel"]
+
+[dependencies]
+oprobe-trace.workspace = true
+opendal = { workspace = true, features = [
+  "executors-tokio",
+  "services-memory",
+  "services-fs",
+  "layers-retry",
+  "layers-timeout",
+  "layers-tail-cut",
+  "layers-await-tree",
+] }
+opendal-core = { workspace = true, features = ["executors-tokio", "services-memory"] }
+await-tree.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http.workspace = true
+http-body.workspace = true
+http-body-util.workspace = true
+httpdate.workspace = true
+reqwest.workspace = true
+url.workspace = true
+bytes.workspace = true
+futures.workspace = true
+tokio.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+anyhow.workspace = true
+crc32c.workspace = true
+libc.workspace = true
+schemars.workspace = true
+zstd.workspace = true
+dirs.workspace = true
+sha2.workspace = true
+rcgen.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
+rustls-pki-types.workspace = true
+
+[target."cfg(windows)".dependencies]
+windows-sys.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

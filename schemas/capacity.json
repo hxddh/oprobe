@@ -58,6 +58,157 @@
       ],
       "type": "string"
     },
+    "Hypothesis": {
+      "description": "One fitted limit model.",
+      "properties": {
+        "confidence": {
+          "$ref": "#/$defs/Confidence"
+        },
+        "evidence": {
+          "default": [],
+          "description": "Why the model fits, in words.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "explains_ratio": {
+          "description": "Share of the throttled (or slowed) requests the model explains.",
+          "format": "double",
+          "type": "number"
+        },
+        "kind": {
+          "$ref": "#/$defs/HypothesisKind"
+        },
+        "log_likelihood": {
+          "description": "Log-likelihood of the data under the model (absent until fitted).",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "params": {
+          "$ref": "#/$defs/HypothesisParams"
+        },
+        "selected": {
+          "description": "The chosen hypothesis (at most one).",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "kind",
+        "params",
+        "evidence",
+        "confidence",
+        "explains_ratio",
+        "selected"
+      ],
+      "type": "object"
+    },
+    "HypothesisKind": {
+      "description": "The kind of limit a hypothesis asserts.",
+      "oneOf": [
+        {
+          "const": "inflight_limit",
+          "description": "The service accepts a number of requests in flight (`ceiling`).",
+          "type": "string"
+        },
+        {
+          "const": "rate_limit",
+          "description": "A token bucket: requests per second (`rps`, `burst`).",
+          "type": "string"
+        },
+        {
+          "const": "key_limit",
+          "description": "A per-key or per-prefix rate (`key`, `rps`).",
+          "type": "string"
+        },
+        {
+          "const": "queueing",
+          "description": "Latency grows with in-flight requests (`service_ms`, `servers`).",
+          "type": "string"
+        },
+        {
+          "const": "bandwidth_cap",
+          "description": "Aggregate bytes per second flat across streams (`bytes_per_s`).",
+          "type": "string"
+        },
+        {
+          "const": "client_bound",
+          "description": "The client itself is saturated (CPU, scheduling lag).",
+          "type": "string"
+        },
+        {
+          "const": "time_varying",
+          "description": "The limit changes over the run (change points).",
+          "type": "string"
+        },
+        {
+          "const": "none",
+          "description": "No limit was reached.",
+          "type": "string"
+        }
+      ]
+    },
+    "HypothesisParams": {
+      "description": "The parameters of a limit model (the ones its kind uses are set).",
+      "properties": {
+        "burst_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "bytes_per_s": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "ceiling_inflight_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "key": {
+          "description": "The key or prefix of a [`HypothesisKind::KeyLimit`].",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "requests_per_s": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "servers_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "service_ms": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "InflightLevel": {
       "description": "Arrivals at one in-flight level.",
       "properties": {
@@ -220,6 +371,14 @@
       "description": "Why the confidence is what it is.",
       "type": "string"
     },
+    "hypotheses": {
+      "default": [],
+      "description": "Competing limit models, the selected one first (design v5 §4; filled from the\nin-flight ceiling until stream ANA fits them).",
+      "items": {
+        "$ref": "#/$defs/Hypothesis"
+      },
+      "type": "array"
+    },
     "inflight_ceiling": {
       "anyOf": [
         {
@@ -254,7 +413,8 @@
     "observed",
     "confidence",
     "confidence_reason",
-    "source"
+    "source",
+    "hypotheses"
   ],
   "title": "oprobe capacity",
   "type": "object",
