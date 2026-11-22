@@ -442,8 +442,8 @@ impl RunFileWriter {
                 .with_context(|| format!("cannot create {}", dir.display()))?;
         }
         let tmp = path.with_extension("oprobe.tmp");
-        let file = super::private_file(&tmp)
-            .with_context(|| format!("cannot write {}", tmp.display()))?;
+        let file =
+            super::private_file(&tmp).with_context(|| format!("cannot write {}", tmp.display()))?;
         let enc = zstd::stream::Encoder::new(BufWriter::new(file), ZSTD_LEVEL)?;
         let mut w = Self {
             path: path.to_owned(),

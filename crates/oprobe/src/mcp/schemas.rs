@@ -373,6 +373,61 @@ pub fn entries() -> Vec<Entry> {
             crate::config::BuiltinDefaults,
             "Every built-in default (config::defaults)"
         ),
+        // MCP tool results (design v5 §6: tools/list refers to these by name).
+        entry!(
+            "mcp-plan",
+            Output,
+            super::tools::PlanOut,
+            "MCP plan_run: the dry-run plan, budgets and whether the server accepts it"
+        ),
+        entry!(
+            "mcp-run-status",
+            Output,
+            super::tools::RunStatusOut,
+            "MCP start_run, start_tune, verify_finding, recommend_config, get_run, cancel_run: a run or job"
+        ),
+        entry!(
+            "mcp-runs",
+            Output,
+            super::tools::ListRunsOut,
+            "MCP list_runs: one page of stored runs and the jobs this server started"
+        ),
+        entry!(
+            "mcp-ask",
+            Output,
+            super::ask::AskOut,
+            "MCP ask_run: answers citing report fields"
+        ),
+        entry!(
+            "mcp-analyze",
+            Output,
+            super::tools::AnalyzeOut,
+            "MCP analyze_run: outlier attribution of selected requests"
+        ),
+        entry!(
+            "mcp-estimate",
+            Output,
+            super::tools::EstimateOut,
+            "MCP estimate_cost: request cost at list prices"
+        ),
+        entry!(
+            "mcp-targets",
+            Output,
+            super::tools::TargetsOut,
+            "MCP list_targets: configured targets and the server's rails"
+        ),
+        entry!(
+            "mcp-save-target",
+            Output,
+            super::tools::SaveTargetOut,
+            "MCP save_target: the target saved"
+        ),
+        entry!(
+            "mcp-apply-profile",
+            Output,
+            super::tools::ApplyProfileOut,
+            "MCP apply_profile: the profile file written and its diff"
+        ),
     ]
 }
 

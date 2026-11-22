@@ -660,8 +660,10 @@ async fn serve_s3_request(
         );
         let mut resp = s3_error(status, code, &msg, &req_id);
         // The body is not read: ask the client to close the connection.
-        resp.headers_mut()
-            .insert(http::header::CONNECTION, http::HeaderValue::from_static("close"));
+        resp.headers_mut().insert(
+            http::header::CONNECTION,
+            http::HeaderValue::from_static("close"),
+        );
         return Ok(resp);
     }
     let mut straggle = Duration::ZERO;

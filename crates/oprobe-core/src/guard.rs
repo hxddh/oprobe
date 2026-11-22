@@ -383,10 +383,7 @@ pub async fn resolve_classes(
     port: u16,
 ) -> anyhow::Result<Vec<(std::net::IpAddr, AddressClass)>> {
     let addrs = tokio::net::lookup_host((host, port)).await.map_err(|e| {
-        OprobeError::new(
-            ErrorCode::NetDns,
-            format!("cannot resolve `{host}`: {e}"),
-        )
+        OprobeError::new(ErrorCode::NetDns, format!("cannot resolve `{host}`: {e}"))
     })?;
     Ok(addrs.map(|a| (a.ip(), address_class(a.ip()))).collect())
 }
