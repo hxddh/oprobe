@@ -1953,9 +1953,14 @@ fn private_temp_dir() -> std::io::Result<PathBuf> {
         std::process::id(),
         N.fetch_add(1, Ordering::Relaxed)
     ));
-    let mut b = std::fs::DirBuilder::new();
     #[cfg(unix)]
-    std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
+    let b = {
+        let mut b = std::fs::DirBuilder::new();
+        std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
+        b
+    };
+    #[cfg(not(unix))]
+    let b = std::fs::DirBuilder::new();
     b.create(&dir)?;
     Ok(dir)
 }
