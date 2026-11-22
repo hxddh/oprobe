@@ -4405,7 +4405,7 @@ dependencies = [
  "aws-sdk-s3",
  "aws-smithy-runtime-api",
  "aws-smithy-types",
- "base64 0.22.1",
+ "base64 0.23.1",
  "bytes",
  "crc32c",
  "dirs",

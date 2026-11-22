@@ -104,7 +104,7 @@ rustls.workspace = true
 tokio-rustls.workspace = true
 rustls-pki-types.workspace = true
 # The oprobe client protocol (`--client exec:CMD`, docs/clients.md): write payloads.
-base64 = "0.22"
+base64 = "0.23"
 aws-sdk-s3 = { version = "1.161", default-features = false, features = ["rt-tokio"], optional = true }
 aws-smithy-runtime-api = { version = "1.22", features = ["client", "http-1x"], optional = true }
 aws-smithy-types = { version = "1.9", features = ["http-body-1-x"], optional = true }
