@@ -178,6 +178,10 @@ impl Dataset {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .push(path.clone());
+                let size = match &spec.size_dist {
+                    Some(d) => d.size_of(seed, i) as usize,
+                    None => size,
+                };
                 async move {
                     let (data, crc) = tokio::task::spawn_blocking(move || {
                         generate_payload(seed.wrapping_add(i as u64 * 7919), size)

@@ -7,7 +7,7 @@ use std::time::Duration;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-pub use crate::engine::schedule::{Arrivals, RateShape};
+pub use crate::engine::schedule::{Arrivals, RateShape, SizeDist};
 use crate::net::HttpVersion;
 use crate::util::{ByteSize, HumanDuration};
 
@@ -577,6 +577,9 @@ pub struct DatasetSpec {
     pub objects: usize,
     #[serde(default = "default_object_size")]
     pub object_size: ByteSize,
+    /// Object sizes drawn from a distribution (`object_size` is then its median).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_dist: Option<SizeDist>,
     /// Spread objects across this many `part=NN/` prefixes.
     #[serde(default = "default_partitions")]
     pub partitions: usize,
@@ -604,6 +607,7 @@ impl Default for DatasetSpec {
         Self {
             objects: default_objects(),
             object_size: default_object_size(),
+            size_dist: None,
             partitions: default_partitions(),
             existing_prefix: None,
             persist: false,

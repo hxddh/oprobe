@@ -277,7 +277,9 @@ impl RunSpec {
         if ds.objects != pre_ds.objects {
             flag("--objects", Some(ds.objects.to_string()));
         }
-        if ds.object_size != pre_ds.object_size {
+        if let Some(d) = &ds.size_dist {
+            flag("--object-size", Some(d.to_string()));
+        } else if ds.object_size != pre_ds.object_size {
             flag("--object-size", Some(ds.object_size.to_string()));
         }
         if ds.persist {
@@ -868,8 +870,20 @@ fn apply_one(
             dataset(p, &|d| d.objects = n);
         }
         "object_size" => {
-            let s = input::nonzero_size(v)?;
-            dataset(p, &|d| d.object_size = s);
+            if crate::config::SizeDist::is_dist(v) {
+                let dist: crate::config::SizeDist = v.parse()?;
+                let nominal = crate::util::ByteSize(dist.nominal());
+                dataset(p, &|d| {
+                    d.object_size = nominal;
+                    d.size_dist = Some(dist.clone());
+                });
+            } else {
+                let s = input::nonzero_size(v)?;
+                dataset(p, &|d| {
+                    d.object_size = s;
+                    d.size_dist = None;
+                });
+            }
         }
         "partitions" => {
             let n = usize_of(1)?;

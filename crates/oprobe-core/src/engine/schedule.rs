@@ -455,3 +455,173 @@ mod tests {
         assert!((shape.rate_at(Duration::from_secs(1), 100.0, w) - 100.0).abs() < 1e-9);
     }
 }
+
+/// Object sizes of a generated dataset (design v5 §3, M12): `--object-size
+/// dist:lognormal(MEDIAN,SIGMA)` (e.g. `dist:lognormal(256KiB,1.5)`) or `file:PATH` (one
+/// size per line, used in turn).
+#[derive(Clone, Debug, PartialEq)]
+pub enum SizeDist {
+    LogNormal {
+        median: u64,
+        sigma: f64,
+    },
+    File {
+        path: std::path::PathBuf,
+        sizes: Vec<u64>,
+    },
+}
+
+/// Largest generated object of a distribution.
+pub const MAX_DIST_OBJECT: u64 = 1 << 30;
+
+fn bad_dist(s: &str) -> OprobeError {
+    crate::input::invalid(format!("invalid object size distribution `{s}`"))
+        .with_hint("use dist:lognormal(MEDIAN,SIGMA), e.g. dist:lognormal(256KiB,1.5), or file:PATH with one size per line")
+}
+
+impl SizeDist {
+    /// Whether `s` names a distribution rather than one size.
+    pub fn is_dist(s: &str) -> bool {
+        let l = s.trim().to_ascii_lowercase();
+        l.starts_with("dist:") || l.starts_with("file:")
+    }
+
+    /// The median (lognormal) or the first size (file): the dataset's nominal size.
+    pub fn nominal(&self) -> u64 {
+        match self {
+            SizeDist::LogNormal { median, .. } => *median,
+            SizeDist::File { sizes, .. } => {
+                let mut v = sizes.clone();
+                v.sort_unstable();
+                v[v.len() / 2]
+            }
+        }
+    }
+
+    /// The size of object `i` (deterministic for a seed).
+    pub fn size_of(&self, seed: u64, i: usize) -> u64 {
+        match self {
+            SizeDist::LogNormal { median, sigma } => {
+                use rand::SeedableRng;
+                let mut rng = SmallRng::seed_from_u64(seed ^ (i as u64).wrapping_mul(0x9E37_79B9));
+                // Box–Muller.
+                let u1: f64 = rng.r#gen::<f64>().max(f64::MIN_POSITIVE);
+                let u2: f64 = rng.r#gen::<f64>();
+                let z = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
+                ((*median as f64) * (sigma * z).exp())
+                    .round()
+                    .clamp(1.0, MAX_DIST_OBJECT as f64) as u64
+            }
+            SizeDist::File { sizes, .. } => sizes[i % sizes.len()],
+        }
+    }
+}
+
+impl FromStr for SizeDist {
+    type Err = OprobeError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let t = s.trim();
+        let l = t.to_ascii_lowercase();
+        if let Some(rest) = l.strip_prefix("dist:lognormal(") {
+            let inner = rest.strip_suffix(')').ok_or_else(|| bad_dist(t))?;
+            let (m, sg) = inner.split_once(',').ok_or_else(|| bad_dist(t))?;
+            let median = crate::input::nonzero_size(m.trim())
+                .map_err(|_| bad_dist(t))?
+                .0;
+            let sigma: f64 = sg.trim().parse().map_err(|_| bad_dist(t))?;
+            if !(sigma.is_finite() && (0.0..=5.0).contains(&sigma)) {
+                return Err(bad_dist(t));
+            }
+            return Ok(SizeDist::LogNormal { median, sigma });
+        }
+        if l.starts_with("file:") {
+            let path = std::path::PathBuf::from(&t[5..]);
+            let text = std::fs::read_to_string(&path).map_err(|e| {
+                crate::input::invalid(format!("cannot read sizes from `{}`: {e}", path.display()))
+            })?;
+            let sizes = text
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .map(|l| crate::input::nonzero_size(l).map(|b| b.0.min(MAX_DIST_OBJECT)))
+                .collect::<Result<Vec<_>, _>>()?;
+            if sizes.is_empty() {
+                return Err(bad_dist(t));
+            }
+            return Ok(SizeDist::File { path, sizes });
+        }
+        Err(bad_dist(t))
+    }
+}
+
+impl fmt::Display for SizeDist {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SizeDist::LogNormal { median, sigma } => write!(
+                f,
+                "dist:lognormal({},{sigma})",
+                crate::util::ByteSize(*median)
+            ),
+            SizeDist::File { path, .. } => write!(f, "file:{}", path.display()),
+        }
+    }
+}
+
+impl Serialize for SizeDist {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for SizeDist {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        String::deserialize(d)?
+            .parse()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+impl schemars::JsonSchema for SizeDist {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "SizeDist".into()
+    }
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "type": "string",
+            "description": "Object size distribution: dist:lognormal(MEDIAN,SIGMA) or file:PATH"
+        })
+    }
+}
+
+#[cfg(test)]
+mod size_tests {
+    use super::*;
+
+    #[test]
+    fn lognormal_sizes_spread_around_the_median() {
+        let d: SizeDist = "dist:lognormal(64KiB,1.0)".parse().unwrap();
+        assert_eq!(d.to_string(), "dist:lognormal(64KiB,1)");
+        assert_eq!(d.nominal(), 65536);
+        let mut v: Vec<u64> = (0..2001).map(|i| d.size_of(7, i)).collect();
+        v.sort_unstable();
+        let med = v[1000] as f64;
+        assert!((med / 65536.0 - 1.0).abs() < 0.15, "{med}");
+        assert!(v[1990] > 4 * v[1000] && v[10] < v[1000] / 4);
+        assert_eq!(d.size_of(7, 3), d.size_of(7, 3));
+        for bad in [
+            "dist:lognormal(1MiB)",
+            "dist:pareto(1,2)",
+            "dist:lognormal(0,1)",
+            "file:/nope",
+        ] {
+            assert!(bad.parse::<SizeDist>().is_err(), "{bad}");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("sizes.txt");
+        std::fs::write(&f, "# sizes\n4KiB\n1MiB\n\n100\n").unwrap();
+        let d: SizeDist = format!("file:{}", f.display()).parse().unwrap();
+        assert_eq!(d.size_of(0, 1), 1 << 20);
+        assert_eq!(d.size_of(0, 4), 1 << 20);
+        assert_eq!(d.nominal(), 4096);
+    }
+}

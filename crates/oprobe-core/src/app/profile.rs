@@ -266,7 +266,14 @@ pub fn apply_flags(
             return Err(crate::input::invalid("--objects must be at least 1").into());
         }
         if let Some(s) = &w.object_size {
-            ds.object_size = crate::input::nonzero_size(s)?;
+            if crate::config::SizeDist::is_dist(s) {
+                let dist: crate::config::SizeDist = s.parse()?;
+                ds.object_size = crate::util::ByteSize(dist.nominal());
+                ds.size_dist = Some(dist);
+            } else {
+                ds.object_size = crate::input::nonzero_size(s)?;
+                ds.size_dist = None;
+            }
         }
         if w.persist_dataset {
             ds.persist = true;

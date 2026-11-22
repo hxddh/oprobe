@@ -570,8 +570,9 @@ pub struct WorkloadArgs {
     /// Number of dataset objects to generate
     #[arg(long)]
     pub objects: Option<usize>,
-    /// Size of each generated object (e.g. 16MiB)
-    #[arg(long, value_parser = parse::nonzero_size, allow_hyphen_values = true)]
+    /// Size of each generated object (e.g. 16MiB), or a distribution:
+    /// dist:lognormal(MEDIAN,SIGMA), file:PATH (one size per line)
+    #[arg(long, value_parser = parse::object_size, allow_hyphen_values = true)]
     pub object_size: Option<String>,
     /// Key popularity: uniform, zipf:1.1, hotset:0.2/0.8
     #[arg(long, value_parser = parse::access)]
