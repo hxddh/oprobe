@@ -191,6 +191,27 @@ pub struct LabConfig {
     pub server_error_ratio: Option<f64>,
 }
 
+/// Ask Windows for 1 ms timer resolution while a lab runs in this process (once; it lasts for
+/// the process). An idle Tokio runtime otherwise parks with the default 15.6 ms resolution while
+/// a busy one fires timers promptly, so the lab's delays — and with them its capacity — would
+/// depend on how many workers keep the runtime busy (an M/M/4 queue then seemed to gain goodput
+/// from more workers). Elsewhere a no-op.
+fn fine_timers() {
+    #[cfg(windows)]
+    {
+        #[link(name = "winmm")]
+        unsafe extern "system" {
+            fn timeBeginPeriod(period_ms: u32) -> u32;
+        }
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        // SAFETY: `timeBeginPeriod` takes a plain integer and has no memory-safety
+        // preconditions; a failure (TIMERR_NOCANDO) leaves the default resolution.
+        ONCE.call_once(|| unsafe {
+            timeBeginPeriod(1);
+        });
+    }
+}
+
 /// Named fault presets for `lab://NAME` targets, `oprobe lab --scenario` and `oprobe demo`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum Scenario {
@@ -1719,6 +1740,7 @@ pub struct LabServer;
 
 impl LabServer {
     pub async fn spawn(bind_addr: &str, mut faults: LabConfig) -> Result<LabHandle> {
+        fine_timers();
         if faults.throttle_status_code == 0 {
             faults.throttle_status_code = 503;
         }

@@ -570,17 +570,18 @@ fn find_ceiling(levels: &BTreeMap<u64, (u64, u64)>) -> Option<(Ceiling, u64)> {
             best = (cost, *l, thr_below + clean_above);
         }
     }
-    let (cost, mut k, errors) = best;
+    let (cost, k, errors) = best;
     // No split (cost 1.0) explains throttling unrelated to load just as well; a ceiling needs a
     // split that clearly separates the classes (balanced accuracy above 62.5 %).
     if cost > MAX_SPLIT_COST {
         return None;
     }
-    // ±1 measurement error: the client counts in-flight requests a level off the server now and
-    // then (coarse timers on Windows), so a lone throttled arrival lands one level low. A level
-    // just above the split that still served ≥ 90 % of its (≥ 3) arrivals cleanly is below the
-    // limit: move the split past it.
-    k = nudge_past_clean_levels(&lv, k);
+    // ±1 measurement error: the client's in-flight count is a level off the server's now and
+    // then (coarse scheduling on Windows), so a lone throttled arrival can land one level low —
+    // or a clean one a level high. A level just above the split that still served ≥ 90 % of
+    // its (≥ 3) arrivals cleanly may be below the limit: the bracket widens to cover it. `lo`
+    // stays at or below the split, `hi` lies above the levels that may still be clean.
+    let k_hi = nudge_past_clean_levels(&lv, k);
     // A throttled arrival must exist above the split, or throttling does not follow load.
     lv.iter().find(|(l, _, t)| *l > k && *t > 0)?;
     let share = |c: u64, t: u64| t as f64 / (c + t).max(1) as f64;
@@ -590,9 +591,11 @@ fn find_ceiling(levels: &BTreeMap<u64, (u64, u64)>) -> Option<(Ceiling, u64)> {
         .find(|(l, c, t)| *l <= k && c + t >= 3 && share(*c, *t) <= 0.1)
         .or_else(|| lv.iter().rev().find(|(l, c, _)| *l <= k && *c > 0))
         .map_or(0, |x| x.0);
+    let above = k_hi.max(lo);
     let hi = lv
         .iter()
-        .find(|(l, c, t)| *l > lo && c + t >= 2 && share(*c, *t) >= 0.5)
+        .find(|(l, c, t)| *l > above && c + t >= 2 && share(*c, *t) >= 0.5)
+        .or_else(|| lv.iter().find(|(l, _, t)| *l > above && *t > 0))
         .or_else(|| lv.iter().find(|(l, _, t)| *l > lo && *t > 0))?
         .0;
     Some((
@@ -1370,8 +1373,48 @@ mod tests {
         for levels in [exactly, with_low] {
             let (c, _) = find_ceiling(&levels).expect("a ceiling");
             assert!(c.lo <= 24.0 && 24.0 < c.hi, "{c:?}");
-            assert_eq!(c.lo, 24.0, "{c:?}");
         }
+    }
+
+    /// Windows CI, parquet lab (limit 24): a clean level 25 (1 throttled of 13, the client's
+    /// count a level high) must not lift the ceiling above 24 either.
+    #[test]
+    fn a_clean_level_one_above_the_limit_does_not_raise_the_ceiling() {
+        let win: [(u64, u64, u64); 29] = [
+            (1, 4, 0),
+            (2, 5, 0),
+            (3, 5, 0),
+            (4, 9, 0),
+            (5, 33, 0),
+            (6, 103, 0),
+            (7, 140, 0),
+            (8, 163, 0),
+            (9, 136, 0),
+            (10, 168, 0),
+            (11, 179, 0),
+            (12, 137, 0),
+            (13, 145, 1),
+            (14, 164, 0),
+            (15, 137, 1),
+            (16, 173, 0),
+            (17, 187, 0),
+            (18, 131, 0),
+            (19, 126, 0),
+            (20, 158, 0),
+            (21, 61, 0),
+            (22, 44, 0),
+            (23, 37, 0),
+            (24, 17, 0),
+            (25, 13, 1),
+            (26, 8, 1),
+            (27, 5, 2),
+            (28, 4, 2),
+            (29, 1, 0),
+        ];
+        let levels: BTreeMap<u64, (u64, u64)> =
+            win.iter().map(|(l, n, t)| (*l, (*n, *t))).collect();
+        let (c, _) = find_ceiling(&levels).expect("a ceiling");
+        assert!(c.lo <= 24.0 && 24.0 < c.hi, "{c:?}");
     }
 
     #[test]

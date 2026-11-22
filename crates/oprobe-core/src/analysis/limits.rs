@@ -43,6 +43,8 @@ pub struct FitInputs {
 const BIC_HIGH: f64 = 10.0;
 /// BIC gap to the runner-up for medium confidence.
 const BIC_MEDIUM: f64 = 4.0;
+/// The smallest token-bucket burst tried, as a share of its rate (per second).
+const MIN_BURST_FACTOR: f64 = 0.02;
 /// Throttled requests below this count are never fitted (a handful of 503s is noise).
 const MIN_THROTTLED: u64 = 5;
 /// CPU busy share at which the client is the bottleneck.
@@ -64,6 +66,8 @@ struct Obs {
     prefix: u32,
     body: (i64, i64),
     bytes_down: u64,
+    /// Service time as the server sees it: send + time to first byte (µs).
+    svc_us: i64,
 }
 
 /// `[start, end)` as the server sees a request (as in `capacity`).
@@ -130,6 +134,7 @@ fn observations(reqs: &[&ReqRow], ops: &[&OpRow]) -> (Vec<Obs>, Vec<String>, Vec
                 prefix: p,
                 body: (body_start, body_start + q.body_us as i64),
                 bytes_down: q.bytes_down,
+                svc_us: iv[i].1 - iv[i].0,
             }
         })
         .collect();
@@ -335,14 +340,107 @@ fn best_rate(
     // picks the burst and the exact rate.
     let mut best = None;
     for r in log_grid(base * 0.85, base * 1.15, 9) {
-        for bf in [0.02, 0.05, 0.1, 0.3] {
+        for bf in [MIN_BURST_FACTOR, 0.05, 0.1, 0.3] {
             best = better(&best, eval(r, (r * bf).max(1.0)));
         }
     }
     best
 }
 
-fn throttle_family(obs: &[Obs], keys: &[String], prefixes: &[String]) -> Vec<Fit> {
+/// A clean in-flight step: `(ceiling, log-likelihood, share throttled at or below, above)`.
+type Step = (u32, f64, f64, f64);
+
+/// Mean service time (s) of the served requests in `obs`.
+fn served_service_s(obs: &[Obs]) -> f64 {
+    let (sum, n) = obs
+        .iter()
+        .filter(|o| !o.thr)
+        .fold((0i64, 0u64), |a, o| (a.0 + o.svc_us.max(0), a.1 + 1));
+    if n == 0 {
+        0.0
+    } else {
+        sum as f64 / n as f64 / 1e6
+    }
+}
+
+/// Little's law under an in-flight cap: `rate × service` within ±35 % of `c`.
+fn little_matches(rate: f64, service_s: f64, c: f64) -> bool {
+    let l = rate * service_s;
+    c > 0.0 && l > 0.0 && (0.65..=1.35).contains(&(l / c))
+}
+
+/// Design v5 §4: in a saturated closed loop an in-flight cap `c` with service time `S` admits
+/// requests exactly as slots free — ≈ c/S per second, in bursts of ≈ c — which is what a token
+/// bucket of that rate and burst replays. A bucket that only restates the in-flight step adds
+/// no mechanism; it often fits a little better because arrival times are measured more
+/// precisely than the client's in-flight counts (coarse scheduling on Windows blurs the end of
+/// a request, so the step softens while arrivals stay sharp). Such a rate fit (`RateLimit`, or
+/// `TimeVarying` whose every segment obeys Little's law with its own service time) is evidence
+/// for the in-flight limit: the in-flight hypothesis takes its likelihood and, with fewer
+/// parameters, is selected. Returns the best such fit's log-likelihood and recall. A genuine
+/// bucket keeps its lead: its burst is not the in-flight ceiling, or throttling happens well
+/// below the step.
+fn rate_restatement(obs: &[Obs], fits: &mut [Fit], step: Step) -> Option<(f64, f64)> {
+    let (c, step_ll, lo_share, hi_share) = step;
+    let cf = f64::from(c);
+    // A clean step: (almost) no throttling at or below the ceiling, much more above it.
+    if c < 2 || lo_share > 0.03 || hi_share < 5.0 * lo_share.max(0.002) {
+        return None;
+    }
+    let s_all = served_service_s(obs);
+    let t0 = obs.first().map_or(0, |o| o.t);
+    let mut best: Option<(f64, f64)> = None;
+    for f in fits.iter_mut() {
+        // The burst of an in-flight cap is ≈ c; the burst grid starts at a share of the rate,
+        // so a bucket on that floor asked for a burst at most that small.
+        let burst_ok = match (f.params.burst_count, f.params.requests_per_s) {
+            (Some(b), Some(r)) => {
+                let b = b as f64;
+                b <= 2.0 * cf || b <= (r * MIN_BURST_FACTOR).max(1.0).round() + 1.0
+            }
+            _ => false,
+        };
+        let equivalent = match f.kind {
+            HypothesisKind::RateLimit => {
+                burst_ok
+                    && f.params
+                        .requests_per_s
+                        .is_some_and(|r| little_matches(r, s_all, cf))
+            }
+            HypothesisKind::TimeVarying => {
+                let cp = f.params.change_points_s.first().copied().unwrap_or(0.0);
+                let cut = t0 + (cp * 1e6) as i64;
+                let (a, b): (Vec<Obs>, Vec<Obs>) = obs.iter().partition(|o| o.t < cut);
+                let segs = &f.params.segment_requests_per_s;
+                burst_ok
+                    && segs.len() == 2
+                    && little_matches(segs[0], served_service_s(&a), cf)
+                    && little_matches(segs[1], served_service_s(&b), cf)
+            }
+            _ => false,
+        };
+        if equivalent && f.ll > step_ll {
+            if best.is_none_or(|b| f.ll > b.0) {
+                best = Some((f.ll, f.explains));
+            }
+            f.evidence.push(format!(
+                "indistinguishable from the in-flight limit of {c}: holding {c} requests in flight at ≈{:.1} ms of service admits ≈{:.0} requests/s in bursts of ≈{c}, which is this bucket",
+                s_all * 1e3,
+                cf / s_all.max(1e-9)
+            ));
+        }
+    }
+    best
+}
+
+/// The throttle-family fits, and the confidence cap of a selected in-flight limit that
+/// absorbed an equivalent rate fit.
+fn throttle_family(
+    obs: &[Obs],
+    keys: &[String],
+    prefixes: &[String],
+) -> (Vec<Fit>, Option<Confidence>) {
+    let mut step: Option<Step> = None;
     let n = obs.len() as u64;
     let k: u64 = obs.iter().filter(|o| o.thr).count() as u64;
     let mut fits = Vec::new();
@@ -388,6 +486,7 @@ fn throttle_family(obs: &[Obs], keys: &[String], prefixes: &[String]) -> Vec<Fit
         let c = c2;
         let lo_share = s.k0 as f64 / s.n0.max(1) as f64;
         let hi_share = s.k1 as f64 / s.n1.max(1) as f64;
+        step = Some((c, s.ll(), lo_share, hi_share));
         fits.push(Fit {
             kind: HypothesisKind::InflightLimit,
             params: HypothesisParams {
@@ -539,7 +638,16 @@ fn throttle_family(obs: &[Obs], keys: &[String], prefixes: &[String]) -> Vec<Fit
             }
         }
     }
-    fits
+    let restated = step.and_then(|st| rate_restatement(obs, &mut fits, st));
+    if let Some((ll, explains)) = restated
+        && let Some(f) = fits
+            .iter_mut()
+            .find(|f| f.kind == HypothesisKind::InflightLimit)
+    {
+        f.ll = f.ll.max(ll);
+        f.explains = f.explains.max(explains);
+    }
+    (fits, restated.map(|_| Confidence::Medium))
 }
 
 /// Gaussian log-likelihood at the MLE variance of residuals with sum of squares `sse`.
@@ -837,8 +945,18 @@ fn fit_rows(reqs: &[&ReqRow], ops: &[&OpRow], inputs: &FitInputs) -> Vec<Hypothe
         selected: true,
     };
     if thr >= MIN_THROTTLED {
-        let fits = throttle_family(&obs, &keys, &prefixes);
-        return rank(fits, n, thr >= 20);
+        let (fits, cap) = throttle_family(&obs, &keys, &prefixes);
+        let mut hs = rank(fits, n, thr >= 20);
+        if let (Some(cap), Some(h)) = (cap, hs.first_mut())
+            && h.kind == HypothesisKind::InflightLimit
+        {
+            h.confidence = h.confidence.min(cap);
+            h.evidence.push(
+                "a token bucket restating this limit fits about as well (one closed-loop run cannot tell them apart; `oprobe tune` varies the concurrency)"
+                    .into(),
+            );
+        }
+        return hs;
     }
     // Latency family.
     let mut out: Vec<Hypothesis> = Vec::new();
@@ -1023,6 +1141,112 @@ mod tests {
         assert_eq!(s.kind, HypothesisKind::InflightLimit, "{hs:#?}");
         let c = s.params.ceiling_inflight_count.unwrap();
         assert!((23..=25).contains(&c), "{c}");
+    }
+
+    /// A closed loop of `workers` against a server whose `admit(arrival_ms, in_flight)` decides
+    /// between serving (≈ `svc_ms`) and a fast 503 (retried after ≈ `backoff_ms`). The client
+    /// sees each response up to `late_ms` late (coarse scheduling on Windows) and only then
+    /// sends its next request, so its in-flight count at an arrival includes requests the
+    /// server already finished: the in-flight step softens while arrival times stay exact.
+    fn closed_loop(
+        workers: usize,
+        svc_ms: f64,
+        late_ms: f64,
+        backoff_ms: f64,
+        dur_ms: f64,
+        mut admit: impl FnMut(f64, usize) -> bool,
+    ) -> (Vec<ReqRow>, Vec<OpRow>) {
+        let mut x = 0x9e3779b97f4a7c15u64;
+        let mut rnd = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let mut next: Vec<f64> = (0..workers).map(|w| w as f64 * 0.05).collect();
+        let mut busy: Vec<f64> = Vec::new();
+        let (mut reqs, mut ops) = (Vec::new(), Vec::new());
+        let mut id = 0u64;
+        loop {
+            let (w, a) = next
+                .iter()
+                .copied()
+                .enumerate()
+                .min_by(|p, q| p.1.total_cmp(&q.1))
+                .unwrap();
+            if a >= dur_ms {
+                break;
+            }
+            busy.retain(|e| *e > a);
+            let thr = !admit(a, busy.len());
+            let end = if thr {
+                a + 0.3
+            } else {
+                let e = a + svc_ms * (0.6 + 0.8 * rnd());
+                busy.push(e);
+                e
+            };
+            let seen = end + rnd() * late_ms;
+            id += 1;
+            reqs.push(req(a, seen - a, if thr { 503 } else { 200 }, id));
+            let key = (rnd() * 500.0) as u64;
+            ops.push(op(id, &format!("p{}/k{key}", key % 5), a));
+            let backoff = if thr { backoff_ms * (0.5 + rnd()) } else { 0.0 };
+            next[w] = seen + 0.05 + rnd() * 0.2 + backoff;
+        }
+        (reqs, ops)
+    }
+
+    /// Windows CI (lab://demo, limit 24): the client's in-flight counts blur while arrivals stay
+    /// sharp, and a token bucket of ≈ c/S per second with a burst of ≈ c fitted better than the
+    /// step. The bucket restates the in-flight cap (Little's law), so the cap is selected.
+    #[test]
+    fn a_bucket_that_restates_an_inflight_cap_selects_the_cap() {
+        for (late, backoff) in [(3.0, 40.0), (3.0, 100.0), (2.0, 100.0)] {
+            let (reqs, ops) = closed_loop(32, 5.0, late, backoff, 3000.0, |_, n| n < 24);
+            let hs = fit(&reqs, &ops, (i64::MIN, i64::MAX), &FitInputs::default());
+            let s = selected(&hs);
+            assert_eq!(
+                s.kind,
+                HypothesisKind::InflightLimit,
+                "late {late}: {hs:#?}"
+            );
+            // Client-side levels read high: the step lies at or a few levels above 24.
+            let c = s.params.ceiling_inflight_count.unwrap();
+            assert!((22..=32).contains(&c), "late {late}: {c}");
+            assert!(s.confidence >= Confidence::Medium, "late {late}: {s:#?}");
+            let rate = hs
+                .iter()
+                .find(|h| h.kind == HypothesisKind::RateLimit)
+                .expect("the bucket stays listed");
+            assert!(
+                rate.evidence
+                    .iter()
+                    .any(|e| e.contains("indistinguishable")),
+                "{rate:#?}"
+            );
+        }
+    }
+
+    /// The same blurred client against a genuine bucket (300/s, burst 15): still a rate limit.
+    #[test]
+    fn a_genuine_bucket_under_the_same_blur_stays_a_rate_limit() {
+        let (mut tokens, mut last) = (15.0f64, 0.0f64);
+        let (reqs, ops) = closed_loop(16, 5.0, 3.0, 40.0, 3000.0, |t, _| {
+            tokens = (tokens + (t - last) / 1000.0 * 300.0).min(15.0);
+            last = t;
+            if tokens >= 1.0 {
+                tokens -= 1.0;
+                true
+            } else {
+                false
+            }
+        });
+        let hs = fit(&reqs, &ops, (i64::MIN, i64::MAX), &FitInputs::default());
+        let s = selected(&hs);
+        assert_eq!(s.kind, HypothesisKind::RateLimit, "{hs:#?}");
+        let rps = s.params.requests_per_s.unwrap();
+        assert!((rps - 300.0).abs() < 45.0, "{rps}");
     }
 
     #[test]
