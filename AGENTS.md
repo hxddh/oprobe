@@ -2,7 +2,7 @@
 
 Guidance for coding agents (and humans) changing oprobe itself. Agents *using* oprobe should
 read [`docs/agents.md`](docs/agents.md); the binding architecture contract is
-[`docs/design/v4.md`](docs/design/v4.md) (amending [`v3.md`](docs/design/v3.md)), the shared core APIs
+[`docs/design/v5.md`](docs/design/v5.md) (amending [`v4.md`](docs/design/v4.md) and [`v3.md`](docs/design/v3.md)), the shared core APIs
 are in [`docs/design/v3-core.md`](docs/design/v3-core.md).
 
 ## Build and test
