@@ -433,6 +433,9 @@ pub struct Snapshot {
     /// The client's health during the window (filled by the runner when the run ends).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub self_obs: Option<SelfObservation>,
+    /// Prefixes, hot keys, size buckets, cold vs warm reads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dimensions: Option<crate::dims::DimensionStats>,
 }
 
 /// Knob values as OpenDAL applies them, which can differ from what was requested.

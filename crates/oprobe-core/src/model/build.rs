@@ -505,7 +505,7 @@ pub fn build_run_with(
             snapshot.elapsed_s,
         ),
         workers: Vec::new(),
-        dimensions: Default::default(),
+        dimensions: crate::model::Dimensions::from_stats(snapshot.dimensions.as_ref()),
         sampling: crate::model::Sampling::from_stats(&trace.sampling),
         open_loop: snapshot.open_loop.clone(),
         timeline: snapshot.timeline.clone(),

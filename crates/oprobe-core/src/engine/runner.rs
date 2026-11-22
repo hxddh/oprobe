@@ -980,6 +980,11 @@ mod tests {
         let knobs = s.profile.knobs.clone();
         let snap = s.run(&knobs, &opts(150, None), None).await.unwrap();
         assert!(snap.summary.ops > 0);
+        // Every operation is in the dimensions (aggregates, not sampled rows).
+        let dims = crate::model::Dimensions::from_stats(snap.dimensions.as_ref());
+        let ops: u64 = dims.prefixes.iter().map(|p| p.ops_count).sum();
+        assert_eq!(ops, snap.summary.ops);
+        assert!(!dims.hot_keys.is_empty());
         assert!(snap.open_loop.is_none());
         let sched = crate::model::ScheduleStats::from_open_loop(snap.open_loop.as_ref(), 0.15);
         assert!(!sched.open_loop);

@@ -273,6 +273,8 @@ struct Agg {
     censored: u64,
     /// `conn.dialed` at the last series probe.
     dials_seen: u64,
+    /// Prefixes, hot keys, size buckets, cold vs warm (design v5 §3, M12).
+    dims: crate::dims::DimAgg,
 }
 
 impl Agg {
@@ -306,6 +308,7 @@ impl Agg {
             schedule: hist(),
             censored: 0,
             dials_seen: 0,
+            dims: crate::dims::DimAgg::default(),
         }
     }
 
@@ -935,6 +938,15 @@ impl Recorder {
             a.record_request(r);
         }
         a.ops += 1;
+        a.dims.record(&crate::dims::DimOp {
+            verb: c.verb,
+            key: &c.key,
+            bytes,
+            latency_us: c.latency_us,
+            requests: req_count,
+            throttled,
+            failed: !ok,
+        });
         a.logical_read += c.logical_read;
         a.logical_write += c.logical_write;
         a.cache_lookups += c.data.cache_lookups;
@@ -1357,6 +1369,7 @@ impl Recorder {
             timeline,
             slow_ops: a.slow.clone(),
             self_obs: None,
+            dimensions: Some(a.dims.stats()).filter(|d| !d.prefixes.is_empty()),
         }
     }
 }

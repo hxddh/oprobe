@@ -31,6 +31,7 @@
 //! operation scope are aggregated and sampled like the others, and memory stays bounded
 //! ([`Config::max_rows`]).
 
+pub mod dims;
 pub mod error;
 pub mod layer;
 pub mod log;

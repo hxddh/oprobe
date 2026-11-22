@@ -178,6 +178,55 @@ pub struct Dimensions {
     pub workers: Vec<DimensionSlice>,
 }
 
+impl Dimensions {
+    /// The report form of the recorder's dimension aggregates.
+    pub fn from_stats(d: Option<&crate::trace::dims::DimensionStats>) -> Self {
+        let Some(d) = d else {
+            return Self::default();
+        };
+        let total = d.total_requests_count.max(1) as f64;
+        let slice = |s: &crate::trace::dims::SliceStats| DimensionSlice {
+            key: s.key.clone(),
+            ops_count: s.ops_count,
+            requests_count: s.requests_count,
+            share_ratio: s.requests_count as f64 / total,
+            throttled_ratio: if s.ops_count == 0 {
+                0.0
+            } else {
+                s.throttled_count as f64 / s.ops_count as f64
+            },
+            error_ratio: if s.ops_count == 0 {
+                0.0
+            } else {
+                s.errors_count as f64 / s.ops_count as f64
+            },
+            p99_ms: s.p99_ms,
+        };
+        Self {
+            prefix_depth_count: d.prefix_depth_count,
+            prefixes: d.prefixes.iter().map(slice).collect(),
+            hot_keys: d
+                .hot_keys
+                .iter()
+                .map(|k| HotKey {
+                    key: k.key.clone(),
+                    requests_count: k.requests_count,
+                    share_ratio: k.requests_count as f64 / total,
+                    throttle_share_ratio: if d.total_throttled_count == 0 {
+                        0.0
+                    } else {
+                        k.throttled_count as f64 / d.total_throttled_count as f64
+                    },
+                })
+                .collect(),
+            size_buckets: d.size_buckets.iter().map(slice).collect(),
+            cold_warm: d.cold_warm.iter().map(slice).collect(),
+            tenants: Vec::new(),
+            workers: Vec::new(),
+        }
+    }
+}
+
 /// How the trace rows were sampled (`report.sampling`, design v5 §2): whole operations are
 /// kept with all their requests; findings use aggregate counts, never these.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
