@@ -24,6 +24,21 @@
         }
       ]
     },
+    "Arrivals": {
+      "description": "How open-loop arrivals are spaced.",
+      "oneOf": [
+        {
+          "const": "constant",
+          "description": "Evenly spaced: one arrival every `1 / rate` seconds.",
+          "type": "string"
+        },
+        {
+          "const": "poisson",
+          "description": "A Poisson process: exponentially distributed gaps with mean `1 / rate` (bursty, like\nindependent clients).",
+          "type": "string"
+        }
+      ]
+    },
     "ByteSize": {
       "description": "A byte size: `4MiB`, `512KiB`, `1GB` (a plain number of bytes is accepted on input).",
       "type": "string"
@@ -35,6 +50,11 @@
         "egress_fraction": {
           "default": 0.0,
           "description": "Fraction of downloaded bytes that leave the cloud (internet egress).",
+          "format": "double",
+          "type": "number"
+        },
+        "inter_region_fraction": {
+          "description": "Fraction of downloaded bytes that cross regions (inter-region transfer).",
           "format": "double",
           "type": "number"
         },
@@ -57,6 +77,13 @@
         },
         "provider": {
           "description": "Pricing preset: aws-s3, gcs, azure-blob, cloudflare-r2, backblaze-b2, aliyun-oss.\nDefaults to the target's provider.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "storage_class": {
+          "description": "Storage class the data is kept in: `standard` (default), `infrequent` or `archive`\n(the provider's equivalents: S3 Standard-IA / Glacier IR, GCS Nearline / Archive, …).",
           "type": [
             "string",
             "null"
@@ -108,6 +135,17 @@
           "default": false,
           "description": "Keep the generated dataset between runs (`oprobe-dataset/<fingerprint>/`) to avoid\nre-uploading it every time. Remove with `oprobe cleanup --datasets`.",
           "type": "boolean"
+        },
+        "size_dist": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SizeDist"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Object sizes drawn from a distribution (`object_size` is then its median)."
         }
       },
       "required": [
@@ -115,6 +153,24 @@
         "object_size",
         "partitions",
         "persist"
+      ],
+      "type": "object"
+    },
+    "EgressTier": {
+      "description": "One egress price tier: the monthly GB up to `up_to_gb` (counted from 0, the free allowance\nincluded) cost `per_gb` (the last tier may use a huge bound).",
+      "properties": {
+        "per_gb": {
+          "format": "double",
+          "type": "number"
+        },
+        "up_to_gb": {
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "up_to_gb",
+        "per_gb"
       ],
       "type": "object"
     },
@@ -547,13 +603,48 @@
       "additionalProperties": false,
       "description": "Provider list prices in USD (request prices per million, data per GB = 1e9 bytes).",
       "properties": {
+        "bills_client_errors": {
+          "default": true,
+          "description": "Requests answered 4xx are billed (most providers).",
+          "type": "boolean"
+        },
+        "bills_server_errors": {
+          "default": true,
+          "description": "Requests answered 5xx (incl. 503 SlowDown) are billed (the presets assume so; check\nyour provider's terms and set `false` in `[cost.pricing]` where they are free).",
+          "type": "boolean"
+        },
         "delete_per_million": {
           "default": 0.0,
           "format": "double",
           "type": "number"
         },
+        "egress_free_gb": {
+          "default": 0.0,
+          "description": "Internet egress free per month (GB).",
+          "format": "double",
+          "type": "number"
+        },
+        "egress_free_stored_multiple": {
+          "default": 0.0,
+          "description": "Free egress as a multiple of the stored data (Backblaze B2: 3×).",
+          "format": "double",
+          "type": "number"
+        },
         "egress_per_gb": {
-          "description": "Internet egress per GB.",
+          "description": "Internet egress per GB (the first paid tier when `egress_tiers` is given).",
+          "format": "double",
+          "type": "number"
+        },
+        "egress_tiers": {
+          "description": "Internet egress price tiers by monthly volume (absolute bounds, the free allowance\nincluded in the first); empty: the flat `egress_per_gb`.",
+          "items": {
+            "$ref": "#/$defs/EgressTier"
+          },
+          "type": "array"
+        },
+        "inter_region_per_gb": {
+          "default": 0.0,
+          "description": "Inter-region transfer per GB.",
           "format": "double",
           "type": "number"
         },
@@ -572,6 +663,13 @@
           "format": "double",
           "type": "number"
         },
+        "storage_classes": {
+          "description": "Storage classes besides standard (`infrequent`, `archive`).",
+          "items": {
+            "$ref": "#/$defs/StorageClassPrice"
+          },
+          "type": "array"
+        },
         "storage_gb_month": {
           "format": "double",
           "type": "number"
@@ -589,7 +687,12 @@
         "list_per_million",
         "read_per_million",
         "delete_per_million",
-        "egress_per_gb"
+        "egress_per_gb",
+        "egress_free_gb",
+        "egress_free_stored_multiple",
+        "inter_region_per_gb",
+        "bills_client_errors",
+        "bills_server_errors"
       ],
       "type": "object"
     },
@@ -620,6 +723,52 @@
         "addressing"
       ],
       "type": "object"
+    },
+    "RateShape": {
+      "description": "Time-varying open-loop rate: ramp:FROM..TO/DURATION, step:R1,R2,…/DURATION or diurnal[:MIN..MAX/PERIOD]",
+      "type": "string"
+    },
+    "ReplaySpec": {
+      "additionalProperties": false,
+      "description": "What to replay (`workload.replay`).",
+      "properties": {
+        "file": {
+          "description": "The log: an S3 server access log, CloudTrail JSON (S3 data events) or an oprobe run file.",
+          "type": "string"
+        },
+        "map_prefix": {
+          "description": "Key rewrites, the first matching prefix wins (`$RUN/` targets the run prefix).",
+          "items": {
+            "maxItems": 2,
+            "minItems": 2,
+            "prefixItems": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "string"
+              }
+            ],
+            "type": "array"
+          },
+          "type": "array"
+        },
+        "speed": {
+          "default": 1.0,
+          "description": "Speed factor: 2 replays twice as fast as recorded.",
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "file",
+        "speed"
+      ],
+      "type": "object"
+    },
+    "SizeDist": {
+      "description": "Object size distribution: dist:lognormal(MEDIAN,SIGMA) or file:PATH",
+      "type": "string"
     },
     "Sla": {
       "additionalProperties": false,
@@ -656,6 +805,58 @@
       "required": [
         "enforce",
         "max_error_rate"
+      ],
+      "type": "object"
+    },
+    "StorageClassPrice": {
+      "description": "A storage class: its storage, request and retrieval prices, minimum billable object size\nand minimum storage duration.",
+      "properties": {
+        "class": {
+          "description": "`infrequent` or `archive`.",
+          "type": "string"
+        },
+        "min_billable_bytes": {
+          "description": "Smaller objects are billed as this size (bytes).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "min_duration_days": {
+          "description": "Objects deleted earlier are billed for the rest of this duration (days).",
+          "format": "double",
+          "type": "number"
+        },
+        "name": {
+          "description": "The provider's name for it.",
+          "type": "string"
+        },
+        "read_per_million": {
+          "format": "double",
+          "type": "number"
+        },
+        "retrieval_per_gb": {
+          "description": "Data retrieval per GB read.",
+          "format": "double",
+          "type": "number"
+        },
+        "storage_gb_month": {
+          "format": "double",
+          "type": "number"
+        },
+        "write_per_million": {
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "class",
+        "name",
+        "storage_gb_month",
+        "write_per_million",
+        "read_per_million",
+        "retrieval_per_gb",
+        "min_billable_bytes",
+        "min_duration_days"
       ],
       "type": "object"
     },
@@ -729,6 +930,10 @@
           "$ref": "#/$defs/Access",
           "default": "uniform"
         },
+        "arrivals": {
+          "$ref": "#/$defs/Arrivals",
+          "description": "Open-loop arrival process: `constant` (evenly spaced) or `poisson` (design v5 §3)."
+        },
         "cleanup": {
           "default": true,
           "description": "Delete everything written under the run prefix when the run ends.",
@@ -777,11 +982,33 @@
             "null"
           ]
         },
+        "replay": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ReplaySpec"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Replay a traffic log instead of the mix (open loop on the log's timing)."
+        },
         "seed": {
           "default": 42,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
+        },
+        "shape": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RateShape"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Time-varying open-loop rate: `ramp:FROM..TO/D`, `step:R1,R2,…/D` or\n`diurnal[:MIN..MAX/PERIOD]` (makes the run open-loop; `rate` is then the diurnal peak)."
         },
         "verify": {
           "default": true,
@@ -805,7 +1032,7 @@
       "type": "object"
     }
   },
-  "$id": "https://github.com/hxddh/oprobe/schemas/4/defaults.json",
+  "$id": "https://github.com/hxddh/oprobe/schemas/5/defaults.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "Every built-in default (config::defaults)",
   "properties": {

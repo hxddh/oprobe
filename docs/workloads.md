@@ -139,7 +139,7 @@ max_throttle_rate = 0.0     # throttled-operation share (unset: `run` ignores th
 ```
 
 Corrupted data (a CRC32C mismatch on read-back) always breaches the SLA. Every SLA field can also
-be set from the command line: `--max-error-rate 1%`, `--max-throttle-rate 0%`, `--p99-ms 250`,
+be set from the command line: `--max-error-ratio 1%`, `--max-throttle-ratio 0%`, `--p99-ms 250`,
 `--sla none`.
 
 ```toml

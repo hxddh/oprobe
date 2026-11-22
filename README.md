@@ -39,20 +39,20 @@ URL — and saves your choice as a named target.
 
 ```text
 $ oprobe run prod
-[CRITICAL] Throttling-bound: the service rejected 3.6% of requests with 429/503;
+[CRITICAL] Throttling-bound: the service rejected 3.6% of requests with 429/503
   ✖ 626 throttled responses (429/503)
-    3.57% of requests throttled; 609 retries, 63.02s total backoff (25% of operat…
-    → The service is rate-limiting this request rate. Lower `concurrency` / `max…
-  ▲ `read.full` p99 is 50.9× its median
-    p50 5.04ms · p99 257ms · max 663ms
-    → See the slowest-operation timelines for the responsible stage. Server stra…
+    3.57% of requests throttled; 609 retries, 63.02s total backoff (25% of operation time)
+    → The service is rate-limiting this request rate. Lower `concurrency` / `max_inflight`
+      below the ceiling, or spread keys over more prefixes.
+    next: oprobe run --from 20261120-084637-d873 --set concurrency=20
   2114.0 ops/s · 119.2 MiB/s · p50 5.04ms · p99 257ms · errors 0.10%
-  626 throttled · SLA met
+  626 throttled (3.57% of requests) · SLA met (throttling not checked: --max-throttle-ratio)
 full report: oprobe runs show 20261120-084637-d873
 ```
 
-The default output is at most 20 lines that fit 80 columns: the verdict, the top findings (cause · evidence ·
-advice · next command), the key numbers, and where the full report is.
+The default output is the verdict, the top findings (cause · evidence · advice · next command), the key
+numbers, and where the full report is. It wraps to your terminal (100 columns when piped) and never cuts a
+command. `--lang zh-CN` (or a `zh_CN` locale) prints it in 简体中文; JSON output stays English.
 
 ## Look closer
 
@@ -107,22 +107,41 @@ Findings and Cost; the selected request or operation on the right. [More →](do
 ## In CI
 
 ```yaml
-- uses: hxddh/oprobe@v4
+- uses: hxddh/oprobe@v5
   with:
     target: s3://ci-bucket/oprobe
     preset: small-files
     baseline: main
+    repeat: 3
 ```
 
-The action installs the newest oprobe 4.x (or the `version` you pin), runs, compares against the baseline,
-uploads the `.oprobe` file and the HTML report, keeps one sticky PR comment up to date and fails on
-regression. [CI guide →](docs/ci.md)
+The action installs the newest oprobe 5.x (or the `version` you pin), runs, compares against the baseline
+(`--strict`: different targets or workloads fail), learns the target's noise floor once and keeps it with
+the capacity history in the Actions cache, uploads the `.oprobe` file and the HTML report, keeps one sticky
+PR comment up to date and fails on regression. `oprobe watch` probes production continuously and exports
+Prometheus (`/metrics`, `/healthz`) and OTLP metrics. [CI guide →](docs/ci.md)
 
 ## For agents
 
 Every command prints one JSON document with `-o json` and an event stream with `-o ndjson`; errors carry stable
 codes and exit codes; `oprobe schema` prints the JSON Schemas; `oprobe mcp` is an MCP server (read-only unless
 `--allow-write`). See [docs/agents.md](docs/agents.md) and [llms.txt](llms.txt).
+
+## Embed it
+
+oprobe 5.0 is three crates in one workspace:
+
+| Crate | For |
+|---|---|
+| [`oprobe-trace`](crates/oprobe-trace) | The instrumentation as an OpenDAL layer for your own operator in production: per-stage timing of every request, bounded memory, optional OpenTelemetry metrics (`otel`). `let (layer, handle) = oprobe_trace::layer(Config::default());` |
+| [`oprobe-core`](crates/oprobe-core) | The engine, diagnosis, cost model, tuner, run store and the service layer (`oprobe_core::app::App`) that every front end calls. |
+| [`oprobe`](crates/oprobe) | The binary: the CLI, the MCP server and the app. |
+
+## Shell
+
+`oprobe completions bash|zsh|fish|powershell|elvish` prints a completion script that completes target
+names, run ids, labels and finding codes as you type. `--help` shows the common flags of a command;
+`--help-all` shows all of them.
 
 ## Install
 
@@ -137,7 +156,9 @@ codes and exit codes; `oprobe schema` prints the JSON Schemas; `oprobe mcp` is a
 
 The macOS and Windows packages are **not code-signed** (no certificates): the first open needs one
 confirmation — [how](docs/install.md#first-open-of-unsigned-packages). Every asset has a SHA-256 in
-`SHA256SUMS` and a signed SLSA build provenance attestation (`gh attestation verify`). Update with
+`SHA256SUMS` and a signed SLSA build provenance attestation; `install.sh`, `install.ps1` and
+`oprobe self-update` verify it with `gh attestation verify` when the GitHub CLI is logged in, and otherwise
+a minisign signature over `SHA256SUMS` ([verifying](docs/install.md#verifying-a-download)). Update with
 `oprobe self-update` (or your package manager).
 
 oprobe sends no telemetry. It talks only to the storage you point it at, and to GitHub when you run

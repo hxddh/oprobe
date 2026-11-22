@@ -274,7 +274,7 @@
       ]
     }
   },
-  "$id": "https://github.com/hxddh/oprobe/schemas/4/recommendation.json",
+  "$id": "https://github.com/hxddh/oprobe/schemas/5/recommendation.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "A tuned configuration with its deltas (tune, fix, MCP recommend_config)",
   "properties": {

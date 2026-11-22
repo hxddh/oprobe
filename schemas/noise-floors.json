@@ -36,7 +36,7 @@
       "type": "object"
     }
   },
-  "$id": "https://github.com/hxddh/oprobe/schemas/4/noise-floors.json",
+  "$id": "https://github.com/hxddh/oprobe/schemas/5/noise-floors.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "Noise floors learned per target and workload (<data>/noise.toml)",
   "properties": {

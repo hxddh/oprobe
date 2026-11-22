@@ -748,7 +748,7 @@
       "type": "object"
     }
   },
-  "$id": "https://github.com/hxddh/oprobe/schemas/4/explain.json",
+  "$id": "https://github.com/hxddh/oprobe/schemas/5/explain.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "Result of `oprobe explain` (a run or a finding code)",
   "oneOf": [

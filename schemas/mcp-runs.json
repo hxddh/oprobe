@@ -1,0 +1,257 @@
+{
+  "$defs": {
+    "ActiveRun": {
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/JobKind"
+        },
+        "run_id": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/JobStatus"
+        }
+      },
+      "required": [
+        "run_id",
+        "kind",
+        "status"
+      ],
+      "type": "object"
+    },
+    "JobKind": {
+      "description": "What a job does.",
+      "oneOf": [
+        {
+          "enum": [
+            "run",
+            "tune",
+            "doctor",
+            "probe",
+            "sample",
+            "cleanup"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "verify",
+          "description": "`verify_finding`.",
+          "type": "string"
+        },
+        {
+          "const": "fix",
+          "description": "`recommend_config` (`oprobe fix`).",
+          "type": "string"
+        }
+      ]
+    },
+    "JobStatus": {
+      "description": "Lifecycle of a job.",
+      "oneOf": [
+        {
+          "enum": [
+            "running",
+            "succeeded",
+            "cancelled"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "queued",
+          "description": "Waiting for a run slot.",
+          "type": "string"
+        },
+        {
+          "const": "failed",
+          "description": "Ended with an error (a budget breach still saves the partial run).",
+          "type": "string"
+        },
+        {
+          "const": "stored",
+          "description": "Not started by this server: a stored run.",
+          "type": "string"
+        }
+      ]
+    },
+    "RunSummary": {
+      "description": "Sidecar summary of a run (`runs/<id>.json`).",
+      "properties": {
+        "cost_per_month_usd": {
+          "description": "Projected monthly cost, where cost applies.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "error_ratio": {
+          "format": "double",
+          "type": "number"
+        },
+        "headline": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "interrupted": {
+          "type": "boolean"
+        },
+        "label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ops_per_s": {
+          "format": "double",
+          "type": "number"
+        },
+        "p50_ms": {
+          "format": "double",
+          "type": "number"
+        },
+        "p99_ms": {
+          "format": "double",
+          "type": "number"
+        },
+        "partial": {
+          "description": "Why the run is partial: `budget` (a safety budget stopped it) or `interrupted`\n(stopped early); absent for a complete run.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path": {
+          "description": "The run file (filled in when listing; not stored).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "preset": {
+          "description": "The workload preset (absent in summaries written before 5.0).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "started_at": {
+          "type": "string"
+        },
+        "target_display": {
+          "type": "string"
+        },
+        "target_id": {
+          "description": "The target identity of the run's spec (`store::TargetId`, empty when it does not\nresolve). Required, so sidecars written without it are rebuilt from the run file.",
+          "type": "string"
+        },
+        "target_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "throttled_request_ratio": {
+          "description": "Throttled responses / requests (absent in summaries written before 5.0).",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "verdict_level": {
+          "$ref": "#/$defs/VerdictLevel"
+        },
+        "window_s": {
+          "format": "double",
+          "type": "number"
+        },
+        "workload_hash": {
+          "description": "`report.spec.workload_hash()`: runs with the same target and workload hash compare.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "target_display",
+        "started_at",
+        "window_s",
+        "interrupted",
+        "verdict_level",
+        "headline",
+        "ops_per_s",
+        "p50_ms",
+        "p99_ms",
+        "error_ratio",
+        "target_id",
+        "workload_hash"
+      ],
+      "type": "object"
+    },
+    "VerdictLevel": {
+      "description": "Overall judgement.",
+      "oneOf": [
+        {
+          "enum": [
+            "ok"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "review",
+          "description": "Worth a look (informational findings, warnings, partial run).",
+          "type": "string"
+        },
+        {
+          "const": "attention",
+          "description": "Warning findings.",
+          "type": "string"
+        },
+        {
+          "const": "critical",
+          "description": "Critical findings or a breached SLA.",
+          "type": "string"
+        }
+      ]
+    }
+  },
+  "$id": "https://github.com/hxddh/oprobe/schemas/5/mcp-runs.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "MCP list_runs: one page of stored runs and the jobs this server started",
+  "properties": {
+    "next_cursor": {
+      "description": "Pass as `cursor` for the next page (absent on the last page).",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "runs": {
+      "items": {
+        "$ref": "#/$defs/RunSummary"
+      },
+      "type": "array"
+    },
+    "started": {
+      "description": "Runs and jobs this server started (any status).",
+      "items": {
+        "$ref": "#/$defs/ActiveRun"
+      },
+      "type": "array"
+    },
+    "total_count": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "runs",
+    "total_count",
+    "started"
+  ],
+  "title": "oprobe mcp-runs",
+  "type": "object",
+  "x-rust-type": "ListRunsOut"
+}

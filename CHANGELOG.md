@@ -4,6 +4,274 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## v5.0.0 — 2026-11-22
+
+Design [v5](docs/design/v5.md). The changes under **Changed** are breaking.
+
+### Changed
+
+- **Workspace split.** The repository is a cargo workspace of three crates:
+  `oprobe-trace` (the embeddable instrumentation: `TraceLayer`, the fidelity and microscope
+  transports, `ReqRow`/`OpRow`, the recorder and aggregates), `oprobe-core` (engine, analysis,
+  model, store, tune, lab, report renderers and the service layer) and `oprobe` (the binary:
+  CLI, MCP server, TUI/GUI). The `oprobe` library no longer exports the engine under its own
+  modules for embedding; depend on `oprobe-trace` or `oprobe-core`.
+- **Service layer.** `oprobe_core::app::App` is the only entry point of the front ends, with
+  typed requests and results (plan, run, tune, verify, fix, compare, explain, analyze, doctor,
+  sample, discover, targets, runs, baselines, cleanup). `RunRequest` is a `RunSpec` plus
+  `Overrides`, safety (budgets, read-only, allow-write), a `ClientChoice` and an optional
+  `WorkerSet`.
+- **MCP runs in-process.** `doctor`, `probe_endpoint`, `cleanup`, `verify_finding` and
+  `recommend_config` call `App` instead of spawning `oprobe` child processes; a read-only server
+  passes `allow_write: false` instead of `OPROBE_MCP_READ_ONLY`.
+- **Report `oprobe.report/5`.** New sections: `client` (what generated the load; the 4.x
+  `client` CPU/RSS block moved to `self.process`), `self`, `schedule`, `workers`, `dimensions`,
+  `sampling`, and `capacity.hypotheses` (today's in-flight ceiling is one `inflight_limit`
+  hypothesis). `compare` and `verify` gain an optional two-sided `net` verdict.
+- **Run file `oprobe.run/5`.** A zstd stream of framed blocks: `header` (spec and client),
+  columnar `segment`s of op and request rows, per-second `interval`s and the `report` last,
+  streamed to disk (never encoded whole in memory). 4.x run files are not read.
+- **Whole-operation sampling.** Beyond the row budget an operation is kept with all its
+  requests or not at all: a time-stratified reservoir plus every failed or throttled operation
+  and the slowest 1 % (`report.sampling`).
+- **Always-on recorder.** `oprobe_trace::layer(Config) -> (TraceLayer, Handle)` instruments any
+  OpenDAL operator; requests outside an operation scope are recorded in every shard. The `otel`
+  feature emits `http.client.request.duration` with `oprobe.stage` and `oprobe.api`.
+- The compare gate moved from `report/diff.rs` to `analysis/gate.rs`; `report/view.rs` is the
+  shared presentation model of the terminal, Markdown and HTML renderers. The lab is a module
+  directory (`lab/`), the finding catalog lives in `analysis/catalog.rs`.
+- **Smaller binary.** Release builds use one codegen unit, fat LTO and stripping. Rarely used
+  OpenDAL services (azdls, azfile, swift, tos, webhdfs, upyun, http) are behind cargo features
+  (`all-services`); the default build covers s3, gcs, azblob, oss, cos, obs, b2, webdav, fs and
+  memory.
+
+### CLI, automation and distribution
+
+- **Brief output wraps** to the terminal width (100 columns off a terminal, `COLUMNS` when set)
+  and never truncates; `next` commands are printed whole. Throttled requests show their share,
+  and an SLA without a throttle objective says so instead of "SLA met" alone.
+- **Help tiers.** `--help` lists the common flags of large commands and names the headings of
+  the rest; `--help-all` lists every flag.
+- **Flags with units.** One throttle flag, `--max-throttle-ratio` (the SLA of `run`, the budget of
+  `tune` and `fix`; `tune --max-throttle-ratio` and `--max-throttle-rate` are merged into it);
+  `--max-error-ratio`; compare `--max-p99-increase-pct`, `--max-p50-increase-pct`,
+  `--max-throughput-drop-pct`, `--max-error-increase-pp`, `--max-request-amp-increase-pct`,
+  `--max-read-amp-increase-pct`, `--max-cost-increase-pct`; `compat --min-score-pct`. The 4.x
+  names remain as hidden aliases.
+- **Dynamic completions.** `oprobe completions SHELL` completes target names, run ids, labels and
+  finding codes live; `--static` prints the 4.x script.
+- **简体中文.** `--lang zh-CN` (or `OPROBE_LANG`, `LC_ALL`, `LC_MESSAGES`, `LANG`) localizes the
+  brief, the findings' cause and advice, and error labels and codes; the catalog
+  (`oprobe_core::i18n`) is shared with the app. JSON output stays English.
+- **watch exports.** OTLP metrics are one cumulative stream per session with a stable
+  `service.instance.id` and the target (no run id per window), honour
+  `OTEL_EXPORTER_OTLP_HEADERS` and are protobuf by default (`OTEL_EXPORTER_OTLP_PROTOCOL=http/json`
+  for JSON). Prometheus series carry a `target` label, with `oprobe_build_info`,
+  `oprobe_last_success_timestamp_seconds`, HELP text and `/healthz`.
+- **GitHub Action.** `compare --strict` by default (`strict`), the data directory (noise floor,
+  capacity history) cached per target across jobs (`cache-data`), and `repeat`, `calibrate`,
+  `calibrate-repeat` inputs.
+- **Verified updates.** `install.sh`, `install.ps1` and `oprobe self-update` check the GitHub
+  build provenance (`gh attestation verify`) when the GitHub CLI is logged in, else a minisign
+  signature over `SHA256SUMS` (`SHA256SUMS.minisig`, signed by the release when `MINISIGN_KEY`
+  is set); `OPROBE_VERIFY` / `--verify auto|require|checksum`. The self-update result gains
+  `verified_by`.
+- **Supply chain and CI.** Every action is pinned by commit SHA with Dependabot updates, release
+  jobs use no caches, `cargo deny` checks advisories, licenses, bans and sources (`deny.toml`;
+  RUSTSEC-2023-0071 documented), pull requests test on Linux, macOS and Windows in debug with
+  cargo-nextest with cancel-in-progress, and release builds and installers run on main and
+  nightly only. crates.io publishes `oprobe-trace`, `oprobe-core`, `oprobe` in order.
+- Text: "1 request" (not "1 requests"); watch prints SLO values in their unit.
+
+### Added (stream SCALE: clients and distributed load, design v5 §7–§8)
+
+- **`--client aws-sdk | exec:COMMAND`.** Drive any workload with aws-sdk-s3 (cargo feature
+  `aws-sdk`, over oprobe's instrumented transport) or with an external adapter speaking the
+  versioned oprobe client protocol `oprobe.client/1` (NDJSON over stdin/stdout, documented in
+  [docs/clients.md](docs/clients.md); schemas `client-hello`, `client-hello-reply`,
+  `client-op`, `client-result`). `report.client` names the client, its version and the stages
+  it observes; findings that need other stages are suppressed with a warning. The client is
+  never stored in a run's spec. Reference adapters in `adapters/`: `minimal` (Python standard
+  library), `boto3`, `awscrt` and `go-sdk` (aws-sdk-go-v2 with `httptrace`).
+- **`oprobe worker` and `--workers host:port[*WEIGHT],… | local:N`.** Token-authenticated
+  workers (`oprobe.worker/1`, h2c or TLS); the coordinator checks versions and clock offsets,
+  splits concurrency, rate, dataset and budgets, starts every worker at one instant, enforces
+  the global budgets, fans out cancellation and merges the workers' snapshots and trace rows
+  into one run with `report.workers[]` and `report.dimensions.workers[]`.
+
+### Added (stream MEAS: measurement, design v5 §3)
+
+- **Open-loop schedule stage.** Open-loop runs time every operation from its intended start: the
+  `schedule` stage (intended → actual start) is part of its latency, and arrivals that never
+  started before the window ended are counted as censored latencies in the tail ("≥" values)
+  instead of being dropped. `report.schedule` gives `open_loop`, `arrivals`,
+  `intended_ops_count`, `missed_arrivals_count`/`_ratio`, `schedule_stage` and
+  `max_schedule_lag_ms`; a closed-loop run says `open_loop: false`.
+- **Arrival shapes.** `--arrivals constant|poisson` and a time-varying rate with
+  `--shape ramp:FROM..TO/D | step:R1,R2,…/D | diurnal[:MIN..MAX/PERIOD]`. Over `--workers` the
+  shape is scaled by each worker's weight and every worker draws its own Poisson seed.
+  A constant pace never bursts its backlog after a stall: late arrivals leave at most 4 at
+  once, then at the nominal spacing, keeping their intended start (the lag shows in latency).
+- **Log replay.** `--replay FILE` replays an S3 server access log, CloudTrail S3 data events or
+  an oprobe run file, with `--speed N` and `--map-prefix FROM=TO` (repeatable); writes outside
+  the run prefix are refused. Replays are split by key over local workers and refused for
+  remote ones.
+- **Self probe.** `report.self` measures the load generator: scheduling lag, Tokio runtime busy
+  share, CPU after warmup, RSS, the observer's cost per operation and `client_saturated`.
+- **Streamed run file.** Rows go to a writer thread that appends columnar segments while the
+  run measures; past `trace.max_requests` every failed or throttled operation is kept and the
+  rest thinned. A run keeps only a 100k-row sample in memory, so memory stays flat on long runs.
+  The interval series adds p90, p99.9, max, in-flight, new connections, CPU, missed arrivals and
+  heatmap columns, at 1 s for the first ten minutes and 10 s after.
+- **Server signals.** Requests record the provider's error code (from the body, first 4 KiB),
+  S3 `x-amz-id-2`, the bucket region, `Server-Timing` and the CDN cache status.
+- **HTTP/2 stream waits.** The time a request waits for a stream slot (`stream_wait`, part of
+  `queue`), flow-control stalls and the streams open on the connection; the microscope transport
+  opens several HTTP/2 connections per host by stream budget.
+- **Lab protocols and HTTP/2 preflight.** `lab://NAME?proto=h1|h2c|https|h2`; lab servers speak
+  h2c by default, so `--http h2` works on `lab://` targets, and TLS variants trust the lab CA.
+  With `--http h2` a target without HTTP/2 is refused up front (`net.http`, with a hint) instead
+  of failing every request.
+- **Kernel upload acknowledgement, min RTT, retransmits.** TCP samples keep the minimum RTT,
+  unsent and unacknowledged bytes, lost segments, bytes acknowledged and pacing; every request
+  samples its connection and carries the retransmits since the previous sample. On Linux,
+  HTTP/1 uploads through the microscope transport poll `TCP_INFO` until the last byte is
+  acknowledged: `upload` ends at the acknowledgement and `server` (TTFB) starts from it.
+- **`report.dimensions`.** Where the traffic and the trouble are, from aggregates: prefixes,
+  hot keys (at most 20, with their share of the throttling), size buckets and cold vs warm reads,
+  each with its share, throttled and error ratios and p99.
+- **Object size distributions.** `--object-size dist:lognormal(MEDIAN,SIGMA)` or
+  `--object-size file:PATH` (one size per line) next to a fixed size.
+- **Cold-start sample.** Warmup used to absorb every dial; `connections.cold_start` now reports
+  the connections dialed at the start of warmup, their connect time and the latency of the
+  operations that waited for them.
+- **`schedule_backlog` finding.** More than 1 % of the open-loop arrivals never started: the
+  tail holds censored values and throughput is what the client managed; capacity advice is
+  suppressed.
+- Distributed runs merge all of the above across workers (self, dimensions, the open-loop
+  fields, timelines and cold starts).
+
+### Added (stream ANA: analysis, design v5 §4)
+
+- **Competing limit models.** Capacity fits in-flight, token-bucket rate, per-key,
+  time-varying, queueing, bandwidth-cap and client-bound hypotheses and selects one by BIC
+  (`capacity.hypotheses`); the 4.x ceiling and rate fields follow the selected hypothesis. The
+  lab gains limit faults with one scenario each: `ratelimit`, `hotkey`, `bandwidth`, `queueing`
+  (an M/M/4 queue), `timevarying` and `noisy` (random 5xx unrelated to the load).
+  The in-flight ceiling's `lo..hi` bracket spans every plausible split plus one level of
+  measurement error; `requests` is the likeliest split and the safe concurrency, tune and the
+  in-flight advice apply their headroom to it (4.x used `lo`).
+- **Advice per limit model.** The throttling finding's advice depends on the selected
+  hypothesis (rate, per-key, time-varying, random, inconclusive); a queue, a bandwidth cap or a
+  busy client no longer gets "add workers". Retried 5xx are reported even under throttling, and
+  `cache_opportunity` needs real data or a stated skew.
+- **Two-sided verify with an SPRT.** `verify` runs 2 to 8 interleaved pairs (`--repeat`) and
+  stops a finding early once its sequential test decides, with bounded log-ratio and
+  Wilson/Newcombe intervals; each finding gets a net verdict (`improved`, `regressed`,
+  `traded`, `no_change`, `inconclusive`), the same one `compare` shows for those runs. A loss
+  within a confirmed prediction (fewer streams under a bandwidth cap) never refutes a finding.
+- **Three-tier gate.** Each compare check is `fail` (significantly worse and over the limit),
+  `warn` (significantly worse within the limit) or `inconclusive` (not significant, but the
+  interval reaches past the limit), next to `pass`/`improved`; the gate verdict gains `warned`
+  and `inconclusive`. Intervals are log-ratio and pooled block bootstraps instead of
+  t-intervals on two runs (run-level once either side has 3+ runs), `compare` reports a net
+  verdict, and `compare --fail-on-warn` makes a warn fail the gate (exit 3).
+- **Fix menu.** `fix` offers 2 to 4 Pareto options, each with goodput, p99, throttling, monthly
+  cost and whether it was verified.
+- **Tune 5.** A rate-limit hypothesis adds paced rate trials; Gaussian-process surrogates of
+  goodput and the throttle ratio pick the next concurrency by constrained expected improvement;
+  a measured configuration beyond the fixed headroom is accepted when the posterior risk of
+  exceeding the throttle budget is at most `--risk` (default 0.05), and is then reported as
+  `safe_concurrency`. Under a queue or a bandwidth cap the tuner prefers the lowest-latency
+  configuration on the plateau. Trial goodput counts only the in-window operations that
+  finished by the deadline, so a large closed loop no longer looks faster than it is.
+- **Bill-grade cost.** Price tables gain storage classes (minimum billable size and duration,
+  retrieval fees), egress tiers with free allowances, inter-region transfer and per-provider
+  error billing; the cost spec takes `storage_class` (`standard`, `infrequent`, `archive`) and
+  `inter_region_fraction`. The AWS egress note is corrected.
+- **Deterministic lab queue.** The lab's queue runs on virtual time, so its capacity is exactly
+  servers ÷ service time whatever the timer resolution; on Windows the lab asks for 1 ms timers.
+  In-flight ceilings tolerate a client that counts in-flight requests one level off.
+
+### Security and MCP (stream SEC, design v5 §5–§6)
+
+- **Private store files.** On unix, store files are created `0600` and new directories `0700`.
+- **Lab exposure.** `oprobe lab` refuses a non-loopback `--bind` unless `--allow-remote`, caps
+  object bodies, the in-memory store and open connections (`--max-object-size`,
+  `--max-store-size`, `--max-connections`) and times out slow request headers.
+- **MCP default budgets.** Every run the MCP server starts is limited to 50 000 requests,
+  2 minutes, $1 and 5 GiB unless the server's own flags say otherwise; a tool call can only
+  lower them.
+- **Credential-safe overrides.** A tool call may not point a configured or credentialed target
+  elsewhere (endpoint, proxy, insecure, options, `set`): overrides are accepted only for
+  unsigned requests and `memory://` / `lab://`, never towards link-local addresses.
+  `probe_endpoint` refuses loopback, private, link-local and reserved addresses unless
+  `--allow-private-endpoints`.
+- **HTTP bearer token.** `oprobe mcp --http` requires a bearer token (a new one written to
+  `<data>/mcp-token`, mode 0600, at every start, or `--token-file`), compared in constant time.
+  A non-loopback bind needs `--http-allow-remote` and TLS (`--tls-cert`/`--tls-key`) or
+  `--insecure-remote`; connections (`--max-connections`), bodies and header time are limited.
+- **Untrusted text.** Object keys and service messages are escaped, bounded and kept in
+  untrusted fields, out of the tools' text content.
+- **No client or workers via MCP.** Tool arguments and `set` keys that name a load client or
+  workers are refused (`safety.refused`), and so are replays of runs that used them.
+- **Jobs.** `verify_finding` and `recommend_config` are jobs; `doctor`, probes, `sample` and
+  `cleanup` continue as jobs after 5 s; `start_run` waits at most 5 s; `get_run` and
+  `cancel_run` handle every job.
+- **Compact responses.** `tools/list` shrinks from 442 KB to 51 KB (compact input schemas,
+  output schemas that name their `oprobe://schema` resource); results are summaries by default
+  (`detail=summary|full`; `include_report` is accepted as an alias of `full`), `list_runs`
+  pages with a cursor and `oprobe://runs/{id}/slowest` pages five operations at a time.
+- **New tools.** `ask_run` (questions about a stored run, answered from its report with cited
+  fields, no model), `save_target` and `apply_profile` (both need `--allow-write`).
+- **Next steps as MCP calls.** Every next step carries an MCP call, derived from its CLI command
+  when it has none (`target add` → `save_target`, `fix` → `recommend_config`, `run --from` →
+  `start_run`, …); capabilities report the default budgets and the bearer auth.
+
+### App (terminal and native workbench, design v5 §9)
+
+- **Target Health main screen.** The app opens on live tiles with sparklines of the last runs
+  and the baseline band, the selected limit hypothesis, a primary Fix action with its
+  prediction (opening the fix menu) and an annotated run history.
+- **Per-operation waterfall.** Drill into one operation's requests (stages, retry backoff,
+  critical path, compared with a typical operation) from the timeline, the heatmap brush or the
+  waterfall command. The timeline opens on the p99 operations, slowest first.
+- **One verdict source.** Compare and Verify show one net verdict through `App::compare`, with
+  one vocabulary and colour scale for verdicts, severities and gate checks; a warn check reads
+  "worse (within limit)", and a large change without significance is inconclusive, never
+  "same". Test Connection runs a read-only doctor through `App`.
+- **Honest terminal charts.** Gutters as wide as their labels, no grid in a terminal, x labels
+  never overlapping, text swatches in legends.
+- **Toasts** take the terminal's status row instead of drawing over content; terminal
+  notifications use OSC 9 or the bell.
+- **Provisional live findings** with a confidence while a run measures, an early-numbers flag
+  and the tuner's ETA. Findings use the shared presentation with readable evidence labels, and
+  CLI commands in advice become buttons.
+- **`oprobe://` view links.** `oprobe://run/ID?view=…` (and `oprobe gui LINK`) opens the run and
+  restores its view; the scheme and `.oprobe` files are registered by the Linux desktop entry,
+  the macOS `Info.plist` and the Windows installer.
+- **Markdown exports carry links** to the shown view.
+- Also: keyboard heatmap brush and sort keys, a fuzzy command palette with shortcuts and the
+  reason a command is disabled, per-platform shortcut labels and icons, app text size, and the
+  language taken from the OS. `RunSummary` gains `preset` and `throttled_request_ratio`.
+- **Live snapshots on the event bus.** `EventBus` gains an in-process live stream (engine
+  snapshots, cleanup, the finished run, budget stops); it is never serialized, so CLI and MCP
+  output are unchanged. The app's run job goes through `App::run`.
+
+### Known limitations
+
+- There are no `oprobe probe limits` or `oprobe probe semantics` commands.
+- TCP info (RTT, retransmits, upload acknowledgement) is not collected on Windows; the upload
+  acknowledgement is Linux only.
+- `--workers` refuses `--repeat` and `--baseline`.
+- `compare` does not flag runs made with different load clients (`report.client`).
+- The app's tuner job still calls `engine::measure` directly instead of going through `App`.
+- Plain `oprobe run` reports still count operations that started in the window and finish
+  while draining after the deadline (the tuner's trials do not).
+- The release binary (about 60 MB with the default features) misses the 45 MB target of design
+  v5.
+- Installers are still not signed with a developer certificate (see 4.0's notes).
+
 ## v4.0.2 — 2026-11-21
 
 ### Fixed

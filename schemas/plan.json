@@ -203,7 +203,7 @@
       "type": "object"
     }
   },
-  "$id": "https://github.com/hxddh/oprobe/schemas/4/plan.json",
+  "$id": "https://github.com/hxddh/oprobe/schemas/5/plan.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "Result of `oprobe run --dry-run` / `tune --dry-run`",
   "properties": {

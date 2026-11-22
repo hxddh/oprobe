@@ -11,7 +11,7 @@ inputs:
   version:
     description: >-
       oprobe release to install: `latest-major` (the newest release of this action's major version,
-      e.g. the newest 4.x under `@v4`), `latest` (the newest release), or a version such as `4.0.0`.
+      e.g. the newest 5.x under `@v5`), `latest` (the newest release), or a version such as `5.0.0`.
     default: latest-major
   target:
     description: Target URL (s3://bucket/prefix, gcs://…, azblob://…, memory://, lab://demo) or a configured name.
@@ -25,6 +25,25 @@ inputs:
   args:
     description: Extra `oprobe run` arguments, e.g. "-c 32 --region eu-west-1 --max-cost-usd 0.25".
     default: ""
+  repeat:
+    description: >-
+      Measure the workload N times (`oprobe run --repeat N`) and report the spread; more repeats make
+      the comparison's verdict surer.
+    default: "1"
+  calibrate:
+    description: >-
+      Learn the target's noise floor (`oprobe baseline calibrate --from <this run>`) so compare can tell
+      noise from regressions: `auto` (only while the cached data directory has no noise floor yet),
+      `true` (every job) or `false`.
+    default: auto
+  calibrate-repeat:
+    description: Identical runs of the calibration (N − 1 A/A pairs).
+    default: "4"
+  cache-data:
+    description: >-
+      Keep oprobe's data directory (noise floor, capacity history; not the runs) in the Actions cache
+      across jobs, per target. Without it every job starts without history.
+    default: "true"
   baseline:
     description: >-
       Baseline to compare against: a path to a .oprobe (or report .json) file in the workspace, or a name.
@@ -35,8 +54,13 @@ inputs:
     description: Replace a named baseline with this run ("auto" = on pushes to the default branch).
     default: auto
   compare-args:
-    description: Extra `oprobe compare` arguments, e.g. "--max-p99-increase 30".
+    description: Extra `oprobe compare` arguments, e.g. "--max-p99-increase-pct 30".
     default: ""
+  strict:
+    description: >-
+      Fail when the baseline and this run measured different targets or workloads (`oprobe compare
+      --strict`, exit 2) instead of passing with a warning.
+    default: "true"
   fail-on-regression:
     description: Fail the step when the comparison finds a regression (exit 3) or the run breaches its SLA.
     default: "true"
@@ -134,11 +158,24 @@ runs:
     - name: Restore the named baseline
       id: base
       if: inputs.baseline != '' && !endsWith(inputs.baseline, '.oprobe') && !endsWith(inputs.baseline, '.json')
-      uses: actions/cache/restore@v4
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
       with:
         path: ${{ runner.temp }}/oprobe-baseline
         key: oprobe-baseline-${{ inputs.baseline }}-${{ github.run_id }}
         restore-keys: oprobe-baseline-${{ inputs.baseline }}-
+
+    # The data directory (noise floor, capacity history) survives across jobs, per target; the
+    # runs themselves are not cached (they are uploaded as artifacts).
+    - name: Restore the data directory
+      id: data
+      if: inputs.cache-data == 'true'
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      with:
+        path: |
+          ${{ runner.temp }}/oprobe-data
+          !${{ runner.temp }}/oprobe-data/runs
+        key: oprobe-data-${{ runner.os }}-${{ inputs.target }}-${{ github.run_id }}-${{ github.run_attempt }}
+        restore-keys: oprobe-data-${{ runner.os }}-${{ inputs.target }}-
 
     - name: Run
       id: run
@@ -148,9 +185,12 @@ runs:
         PRESET: ${{ inputs.preset }}
         DURATION: ${{ inputs.duration }}
         ARGS: ${{ inputs.args }}
+        REPEAT: ${{ inputs.repeat }}
       run: |
         set -uo pipefail
         export OPROBE_DATA_DIR="$RUNNER_TEMP/oprobe-data"
+        echo "OPROBE_DATA_DIR=$OPROBE_DATA_DIR" >> "$GITHUB_ENV"
+        case "$REPEAT" in ''|*[!0-9]*|0) echo "::error::repeat must be a positive whole number"; exit 2 ;; esac
         out="$RUNNER_TEMP/oprobe-out"
         mkdir -p "$out"
         preset=()
@@ -160,7 +200,7 @@ runs:
         if [ -n "$ARGS" ]; then
           mapfile -t extra < <(printf '%s' "$ARGS" | xargs -n1 printf '%s\n') || { echo "::error::cannot parse args: $ARGS"; exit 2; }
         fi
-        oprobe run "$TARGET" "${preset[@]}" -d "$DURATION" --label "${GITHUB_SHA::12}" \
+        oprobe run "$TARGET" "${preset[@]}" -d "$DURATION" --repeat "$REPEAT" --label "${GITHUB_SHA::12}" \
           --color never --non-interactive "${extra[@]}"
         code=$?
         file=$(ls -t "$OPROBE_DATA_DIR"/runs/*.oprobe 2>/dev/null | head -1 || true)
@@ -177,6 +217,24 @@ runs:
           echo "out=$out"
         } >> "$GITHUB_OUTPUT"
 
+    - name: Calibrate the noise floor
+      id: calibrate
+      if: steps.run.outputs.run-id != '' && inputs.calibrate != 'false'
+      shell: bash
+      env:
+        RUN_ID: ${{ steps.run.outputs.run-id }}
+        CAL_REPEAT: ${{ inputs.calibrate-repeat }}
+        MODE: ${{ inputs.calibrate }}
+      run: |
+        set -uo pipefail
+        if [ "$MODE" = auto ] && [ -s "$OPROBE_DATA_DIR/noise.toml" ]; then
+          echo "noise floor already known (restored data directory); skipping calibration"; exit 0
+        fi
+        # Replays this run's spec N times (A/A pairs) and stores <data>/noise.toml.
+        if ! oprobe baseline calibrate --from "$RUN_ID" --repeat "$CAL_REPEAT" --no-save --color never --non-interactive; then
+          echo "::warning::calibration failed; compare uses its default thresholds"
+        fi
+
     - name: Compare
       id: compare
       shell: bash
@@ -186,6 +244,7 @@ runs:
         CANDIDATE: ${{ steps.run.outputs.run-file }}
         OUT: ${{ steps.run.outputs.out }}
         ARGS: ${{ inputs.compare-args }}
+        STRICT: ${{ inputs.strict }}
       run: |
         set -uo pipefail
         base=""
@@ -205,11 +264,17 @@ runs:
         if [ -n "$ARGS" ]; then
           mapfile -t extra < <(printf '%s' "$ARGS" | xargs -n1 printf '%s\n') || { echo "::error::cannot parse compare-args: $ARGS"; exit 2; }
         fi
+        strict=()
+        [ "$STRICT" = true ] && strict=(--strict)
         oprobe compare "$base" "$CANDIDATE" --color never --markdown "$OUT/oprobe-gate.md" \
-          --junit "$OUT/oprobe-gate.xml" "${extra[@]}"
+          --junit "$OUT/oprobe-gate.xml" "${strict[@]}" "${extra[@]}"
         code=$?
         echo "compared=true" >> "$GITHUB_OUTPUT"
         if [ "$code" = 3 ]; then echo "regression=true" >> "$GITHUB_OUTPUT"; else echo "regression=false" >> "$GITHUB_OUTPUT"; fi
+        # 2 under --strict: the runs are not comparable (different target or workload).
+        if [ "$code" = 2 ] && [ "$STRICT" = true ]; then
+          echo "::error::the baseline and this run measured different targets or workloads (compare --strict); update the baseline or set strict: false"
+        fi
         if [ "$code" != 0 ] && [ "$code" != 3 ]; then exit "$code"; fi
 
     - name: Update the named baseline
@@ -230,10 +295,19 @@ runs:
     # Only a replaced baseline is saved: a restored one is already in the cache (no churn).
     - name: Save the named baseline
       if: steps.update.outcome == 'success'
-      uses: actions/cache/save@v4
+      uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
       with:
         path: ${{ runner.temp }}/oprobe-baseline
         key: oprobe-baseline-${{ inputs.baseline }}-${{ github.run_id }}
+
+    - name: Save the data directory
+      if: always() && inputs.cache-data == 'true' && steps.run.outputs.run-id != ''
+      uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      with:
+        path: |
+          ${{ runner.temp }}/oprobe-data
+          !${{ runner.temp }}/oprobe-data/runs
+        key: oprobe-data-${{ runner.os }}-${{ inputs.target }}-${{ github.run_id }}-${{ github.run_attempt }}
 
     - name: Summary
       shell: bash
@@ -248,7 +322,7 @@ runs:
 
     - name: Upload the run and reports
       id: upload
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
       with:
         name: ${{ inputs.artifact-name }}
         path: ${{ steps.run.outputs.out }}
@@ -258,7 +332,7 @@ runs:
     - name: Sticky pull-request comment
       if: inputs.comment == 'true' && github.event.pull_request
       continue-on-error: true
-      uses: actions/github-script@v7
+      uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
       env:
         BODY_FILE: ${{ steps.run.outputs.out }}/oprobe-comment.md
         ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}

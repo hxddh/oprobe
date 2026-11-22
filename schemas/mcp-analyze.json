@@ -1,0 +1,141 @@
+{
+  "$defs": {
+    "Attribution": {
+      "properties": {
+        "factors": {
+          "description": "Most distinctive first.",
+          "items": {
+            "$ref": "#/$defs/Factor"
+          },
+          "type": "array"
+        },
+        "rest_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "selected_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "selected_count",
+        "rest_count",
+        "factors"
+      ],
+      "type": "object"
+    },
+    "Factor": {
+      "description": "One attribute value and how much more common it is among the selected requests.",
+      "properties": {
+        "attribute": {
+          "description": "Attribute name: `api`, `status`, `protocol`, `connection`, `remote`, `attempt`,\n`error`, `stage` (the dominant stage of the request), `size` (bytes moved, binned),\n`rtt` (TCP RTT, binned), `time` (tenth of the run), `conn` (connection id).",
+          "type": "string"
+        },
+        "lift_ratio": {
+          "description": "`selected_ratio / rest_ratio`, smoothed (add-one) and capped.",
+          "format": "double",
+          "type": "number"
+        },
+        "rest_ratio": {
+          "description": "Share of the other requests with this value (0–1).",
+          "format": "double",
+          "type": "number"
+        },
+        "selected_count": {
+          "description": "Selected requests with this value.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "selected_ratio": {
+          "description": "Share of selected requests with this value (0–1).",
+          "format": "double",
+          "type": "number"
+        },
+        "value": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "attribute",
+        "value",
+        "selected_ratio",
+        "rest_ratio",
+        "lift_ratio",
+        "selected_count"
+      ],
+      "type": "object"
+    },
+    "Selection": {
+      "description": "Which requests are \"selected\" (everything else is the comparison set).",
+      "properties": {
+        "api": {
+          "description": "Restrict to one storage API (e.g. `GetObject`); applies to both sides.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "from_us": {
+          "description": "Window start, µs from the measurement window start (inclusive).",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "min_total_us": {
+          "description": "Requests at least this slow (total), µs.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "to_us": {
+          "description": "Window end, µs (exclusive).",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    }
+  },
+  "$id": "https://github.com/hxddh/oprobe/schemas/5/mcp-analyze.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "MCP analyze_run: outlier attribution of selected requests",
+  "properties": {
+    "attribution": {
+      "$ref": "#/$defs/Attribution"
+    },
+    "factors_text": {
+      "description": "The top factors in words.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "run_id": {
+      "type": "string"
+    },
+    "selection": {
+      "$ref": "#/$defs/Selection"
+    }
+  },
+  "required": [
+    "run_id",
+    "selection",
+    "attribution",
+    "factors_text"
+  ],
+  "title": "oprobe mcp-analyze",
+  "type": "object",
+  "x-rust-type": "AnalyzeOut"
+}

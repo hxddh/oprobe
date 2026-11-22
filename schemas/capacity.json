@@ -24,19 +24,19 @@
       "description": "The in-flight level the service accepts before it throttles.",
       "properties": {
         "hi_inflight_count": {
-          "description": "Lowest in-flight level whose arrivals were throttled (the limit is in `[lo, hi)`).",
+          "description": "First level clearly throttled above every plausible split, plus one level of\nmeasurement error (the limit is in `[lo, hi)`).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "inflight_count": {
-          "description": "In-flight requests the service accepted cleanly (the estimate; equals `lo`).",
+          "description": "In-flight requests the service accepts: the estimate (the likeliest split), which the\nmargins (safe concurrency, caps) apply their headroom to; `lo ≤ inflight_count < hi`.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "lo_inflight_count": {
-          "description": "Highest in-flight level whose arrivals were served without throttling.",
+          "description": "Lowest level the limit may lie at: the lowest split about as likely as the best, less\none level of client-side measurement error.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -57,6 +57,189 @@
         "high"
       ],
       "type": "string"
+    },
+    "Hypothesis": {
+      "description": "One fitted limit model.",
+      "properties": {
+        "bic": {
+          "description": "Bayesian information criterion `−2·LL + k·ln n` (lower is better; selection score).",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "confidence": {
+          "$ref": "#/$defs/Confidence"
+        },
+        "evidence": {
+          "default": [],
+          "description": "Why the model fits, in words.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "explains_ratio": {
+          "description": "Share of the throttled (or slowed) requests the model explains.",
+          "format": "double",
+          "type": "number"
+        },
+        "kind": {
+          "$ref": "#/$defs/HypothesisKind"
+        },
+        "log_likelihood": {
+          "description": "Log-likelihood of the data under the model (absent until fitted).",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "params": {
+          "$ref": "#/$defs/HypothesisParams"
+        },
+        "selected": {
+          "description": "The chosen hypothesis (at most one).",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "kind",
+        "params",
+        "evidence",
+        "confidence",
+        "explains_ratio",
+        "selected"
+      ],
+      "type": "object"
+    },
+    "HypothesisKind": {
+      "description": "The kind of limit a hypothesis asserts.",
+      "oneOf": [
+        {
+          "const": "inflight_limit",
+          "description": "The service accepts a number of requests in flight (`ceiling`).",
+          "type": "string"
+        },
+        {
+          "const": "rate_limit",
+          "description": "A token bucket: requests per second (`rps`, `burst`).",
+          "type": "string"
+        },
+        {
+          "const": "key_limit",
+          "description": "A per-key or per-prefix rate (`key`, `rps`).",
+          "type": "string"
+        },
+        {
+          "const": "queueing",
+          "description": "Latency grows with in-flight requests (`service_ms`, `servers`).",
+          "type": "string"
+        },
+        {
+          "const": "bandwidth_cap",
+          "description": "Aggregate bytes per second flat across streams (`bytes_per_s`).",
+          "type": "string"
+        },
+        {
+          "const": "client_bound",
+          "description": "The client itself is saturated (CPU, scheduling lag).",
+          "type": "string"
+        },
+        {
+          "const": "time_varying",
+          "description": "The limit changes over the run (change points).",
+          "type": "string"
+        },
+        {
+          "const": "none",
+          "description": "No limit was reached.",
+          "type": "string"
+        }
+      ]
+    },
+    "HypothesisParams": {
+      "description": "The parameters of a limit model (the ones its kind uses are set).",
+      "properties": {
+        "burst_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "bytes_per_s": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "ceiling_inflight_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "change_points_s": {
+          "description": "Seconds into the window where a [`HypothesisKind::TimeVarying`] limit changed.",
+          "items": {
+            "format": "double",
+            "type": "number"
+          },
+          "type": "array"
+        },
+        "key": {
+          "description": "The key or prefix of a [`HypothesisKind::KeyLimit`] (the hottest one).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "key_share_ratio": {
+          "description": "Share of the requests that went to `key`.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "requests_per_s": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "segment_requests_per_s": {
+          "description": "The rate of each segment between change points (requests per second).",
+          "items": {
+            "format": "double",
+            "type": "number"
+          },
+          "type": "array"
+        },
+        "servers_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "service_ms": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
     },
     "InflightLevel": {
       "description": "Arrivals at one in-flight level.",
@@ -128,6 +311,12 @@
           "format": "double",
           "type": "number"
         },
+        "ops_service_inflight_mean": {
+          "default": 0.0,
+          "description": "Operations in flight on average, retry backoff left out: the time operations were\nserved, which throughput scales with (backoff is waiting, not work; A3).",
+          "format": "double",
+          "type": "number"
+        },
         "peak_inflight_count": {
           "format": "uint64",
           "minimum": 0,
@@ -156,6 +345,7 @@
         "peak_inflight_count",
         "inflight_mean",
         "ops_inflight_mean",
+        "ops_service_inflight_mean",
         "ops_per_s"
       ],
       "type": "object"
@@ -163,6 +353,12 @@
     "OpShape": {
       "description": "Request concurrency of one operation.",
       "properties": {
+        "bytes_per_op_mean": {
+          "default": 0.0,
+          "description": "Logical bytes per operation (mean).",
+          "format": "double",
+          "type": "number"
+        },
         "inflight_per_op_mean": {
           "description": "Requests one operation keeps in flight on average over its lifetime.",
           "format": "double",
@@ -196,12 +392,13 @@
         "peak_inflight_per_op_count",
         "inflight_per_op_mean",
         "sequential_ratio",
-        "ops_count"
+        "ops_count",
+        "bytes_per_op_mean"
       ],
       "type": "object"
     }
   },
-  "$id": "https://github.com/hxddh/oprobe/schemas/4/capacity.json",
+  "$id": "https://github.com/hxddh/oprobe/schemas/5/capacity.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "The capacity model (report.capacity): in-flight ceiling and per-op request shape",
   "properties": {
@@ -219,6 +416,14 @@
     "confidence_reason": {
       "description": "Why the confidence is what it is.",
       "type": "string"
+    },
+    "hypotheses": {
+      "default": [],
+      "description": "Competing limit models, the selected one first (design v5 §4).",
+      "items": {
+        "$ref": "#/$defs/Hypothesis"
+      },
+      "type": "array"
     },
     "inflight_ceiling": {
       "anyOf": [
@@ -238,7 +443,7 @@
       "$ref": "#/$defs/OpShape"
     },
     "rate_ceiling_requests_per_s": {
-      "description": "Requests per second the service accepted while it throttled.",
+      "description": "The fitted rate limit (requests per second) when the selected hypothesis is a rate\nlimit (the lowest rate of a time-varying one); never the observed throughput.",
       "format": "double",
       "type": [
         "number",
@@ -254,7 +459,8 @@
     "observed",
     "confidence",
     "confidence_reason",
-    "source"
+    "source",
+    "hypotheses"
   ],
   "title": "oprobe capacity",
   "type": "object",

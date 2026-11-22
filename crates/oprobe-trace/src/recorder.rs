@@ -1,0 +1,1608 @@
+//! Thread-safe aggregation of trace records into histograms, timelines and slow-op samples.
+
+use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
+
+use hdrhistogram::Histogram;
+
+use crate::log::{TraceLog, TraceRows, attempts, op_row, req_row};
+use crate::record::{Api, Protocol, RequestRecord};
+use crate::scope::OpScopeData;
+use crate::snapshot::*;
+
+const HIST_MAX_US: u64 = 3_600_000_000;
+const SLOW_OPS_KEPT: usize = 8;
+
+fn hist() -> Histogram<u64> {
+    Histogram::new_with_bounds(1, HIST_MAX_US, 3).expect("valid histogram bounds")
+}
+
+fn rec(h: &mut Histogram<u64>, us: u64) {
+    let _ = h.record(us.min(HIST_MAX_US));
+}
+
+pub fn quantiles(h: &Histogram<u64>) -> Quantiles {
+    if h.is_empty() {
+        return Quantiles::default();
+    }
+    let ms = |v: u64| v as f64 / 1000.0;
+    Quantiles {
+        count: h.len(),
+        mean: h.mean() / 1000.0,
+        p50: ms(h.value_at_quantile(0.50)),
+        p90: ms(h.value_at_quantile(0.90)),
+        p99: ms(h.value_at_quantile(0.99)),
+        p999: ms(h.value_at_quantile(0.999)),
+        max: ms(h.max()),
+    }
+}
+
+struct StageHists {
+    queue: Histogram<u64>,
+    connect: Histogram<u64>,
+    send: Histogram<u64>,
+    ttfb: Histogram<u64>,
+    body: Histogram<u64>,
+    stall: Histogram<u64>,
+    total: Histogram<u64>,
+}
+
+impl StageHists {
+    fn new() -> Self {
+        Self {
+            queue: hist(),
+            connect: hist(),
+            send: hist(),
+            ttfb: hist(),
+            body: hist(),
+            stall: hist(),
+            total: hist(),
+        }
+    }
+}
+
+struct ApiAgg {
+    count: u64,
+    errors: u64,
+    throttled: u64,
+    reused: u64,
+    status: BTreeMap<u16, u64>,
+    bytes_up: u64,
+    bytes_down: u64,
+    stages: StageHists,
+}
+
+impl ApiAgg {
+    fn new() -> Self {
+        Self {
+            count: 0,
+            errors: 0,
+            throttled: 0,
+            reused: 0,
+            status: BTreeMap::new(),
+            bytes_up: 0,
+            bytes_down: 0,
+            stages: StageHists::new(),
+        }
+    }
+}
+
+struct VerbAgg {
+    latency: Histogram<u64>,
+    count: u64,
+    errors: u64,
+    throttled: u64,
+    bytes: u64,
+    requests: u64,
+    retries: u64,
+    queue_us: u64,
+    cache_us: u64,
+    backend_us: u64,
+    retry_us: u64,
+    client_us: u64,
+}
+
+impl VerbAgg {
+    fn new() -> Self {
+        Self {
+            latency: hist(),
+            count: 0,
+            errors: 0,
+            throttled: 0,
+            bytes: 0,
+            requests: 0,
+            retries: 0,
+            queue_us: 0,
+            cache_us: 0,
+            backend_us: 0,
+            retry_us: 0,
+            client_us: 0,
+        }
+    }
+}
+
+/// Fixed log-scale latency bounds of the per-interval heatmap columns (ms; the last bucket is
+/// open-ended). The same bounds as the report's heatmap, so runs compare.
+pub const HEAT_BOUNDS_MS: [f64; 20] = [
+    0.0, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1_000.0, 2_000.0,
+    5_000.0, 10_000.0, 20_000.0, 50_000.0, 100_000.0,
+];
+
+/// The heatmap row of a latency.
+pub fn heat_index(latency_us: u64) -> usize {
+    let ms = latency_us as f64 / 1000.0;
+    HEAT_BOUNDS_MS.iter().rposition(|b| ms >= *b).unwrap_or(0)
+}
+
+/// Interval resolution (design v5 §3, M11): one-second intervals for the first ten minutes,
+/// ten-second intervals afterwards, so an hour-long run keeps about 900 intervals.
+const FINE_INTERVALS: usize = 600;
+const COARSE_S: usize = 10;
+
+/// The interval holding second `secs` of the window.
+fn bucket_index(secs: u64) -> usize {
+    let s = secs as usize;
+    if s < FINE_INTERVALS {
+        s
+    } else {
+        FINE_INTERVALS + (s - FINE_INTERVALS) / COARSE_S
+    }
+}
+
+/// Start and length (s) of interval `idx`.
+fn bucket_span(idx: usize) -> (f64, f64) {
+    if idx < FINE_INTERVALS {
+        (idx as f64, 1.0)
+    } else {
+        (
+            (FINE_INTERVALS + (idx - FINE_INTERVALS) * COARSE_S) as f64,
+            COARSE_S as f64,
+        )
+    }
+}
+
+struct Bucket {
+    ops: u64,
+    bytes: u64,
+    errors: u64,
+    throttled: u64,
+    /// Open-loop arrivals due in this interval that never started.
+    missed: u64,
+    /// Latencies of the interval while it is open; dropped (and its quantiles kept) once every
+    /// operation that started in it finished, so a long run holds a few numbers per interval,
+    /// not a histogram each, and a snapshot does not recompute quantiles over the whole run.
+    latency: Option<Histogram<u64>>,
+    /// p50, p90, p99, p99.9, max (µs) of a closed interval, at full histogram precision.
+    q_us: [u64; 5],
+    /// Operations per heatmap latency row ([`HEAT_BOUNDS_MS`]).
+    heat: [u32; 20],
+    /// Peak requests in flight seen by the series probe.
+    inflight_peak: u64,
+    /// Connections dialed during the interval.
+    dials: u64,
+    /// Client CPU (percent of one core) sampled in the interval.
+    cpu_pct: Option<f64>,
+}
+
+impl Bucket {
+    fn new() -> Self {
+        Self {
+            ops: 0,
+            bytes: 0,
+            errors: 0,
+            throttled: 0,
+            missed: 0,
+            latency: Some(hist()),
+            q_us: [0; 5],
+            heat: [0; 20],
+            inflight_peak: 0,
+            dials: 0,
+            cpu_pct: None,
+        }
+    }
+
+    fn qs(h: &Histogram<u64>) -> [u64; 5] {
+        if h.is_empty() {
+            return [0; 5];
+        }
+        [
+            h.value_at_quantile(0.5),
+            h.value_at_quantile(0.9),
+            h.value_at_quantile(0.99),
+            h.value_at_quantile(0.999),
+            h.max(),
+        ]
+    }
+
+    fn close(&mut self) {
+        if let Some(h) = self.latency.take() {
+            self.q_us = Self::qs(&h);
+        }
+    }
+
+    fn quantiles(&self) -> [u64; 5] {
+        match &self.latency {
+            Some(h) => Self::qs(h),
+            None => self.q_us,
+        }
+    }
+}
+
+#[derive(Default)]
+struct ConnInfo {
+    dialed: u64,
+    failures: u64,
+    alpn: String,
+    tls_version: String,
+    cipher: String,
+    remote_addrs: Vec<String>,
+}
+
+struct Agg {
+    all_latency: Histogram<u64>,
+    /// Keyed by the static verb name: no allocation per operation (X6).
+    verbs: BTreeMap<&'static str, VerbAgg>,
+    apis: BTreeMap<Api, ApiAgg>,
+    buckets: Vec<Bucket>,
+    slow: Vec<SlowOp>,
+    dns: Histogram<u64>,
+    tcp: Histogram<u64>,
+    proxy: Histogram<u64>,
+    tls: Histogram<u64>,
+    conn: ConnInfo,
+    requests: u64,
+    reused_requests: u64,
+    h1_requests: u64,
+    h2_requests: u64,
+    res: ResilienceStats,
+    bytes: ByteStats,
+    cache_lookups: u64,
+    cache_hits: u64,
+    cache_lookup_us: u64,
+    integrity: IntegrityStats,
+    ops: u64,
+    failed_ops: u64,
+    logical_read: u64,
+    logical_write: u64,
+    open_loop: Option<OpenLoopStats>,
+    /// The `schedule` stage of open-loop operations (intended → actual start).
+    schedule: Histogram<u64>,
+    /// Missed arrivals recorded as censored latencies.
+    censored: u64,
+    /// `conn.dialed` at the last series probe.
+    dials_seen: u64,
+    /// Prefixes, hot keys, size buckets, cold vs warm (design v5 §3, M12).
+    dims: crate::dims::DimAgg,
+}
+
+impl Agg {
+    fn new() -> Self {
+        Self {
+            all_latency: hist(),
+            verbs: BTreeMap::new(),
+            apis: BTreeMap::new(),
+            buckets: Vec::new(),
+            slow: Vec::new(),
+            dns: hist(),
+            tcp: hist(),
+            proxy: hist(),
+            tls: hist(),
+            conn: ConnInfo::default(),
+            requests: 0,
+            reused_requests: 0,
+            h1_requests: 0,
+            h2_requests: 0,
+            res: ResilienceStats::default(),
+            bytes: ByteStats::default(),
+            cache_lookups: 0,
+            cache_hits: 0,
+            cache_lookup_us: 0,
+            integrity: IntegrityStats::default(),
+            ops: 0,
+            failed_ops: 0,
+            logical_read: 0,
+            logical_write: 0,
+            open_loop: None,
+            schedule: hist(),
+            censored: 0,
+            dials_seen: 0,
+            dims: crate::dims::DimAgg::default(),
+        }
+    }
+
+    fn record_request(&mut self, r: &RequestRecord) {
+        self.requests += 1;
+        if r.reused {
+            self.reused_requests += 1;
+        }
+        match r.protocol {
+            Protocol::Http1 => self.h1_requests += 1,
+            Protocol::Http2 => self.h2_requests += 1,
+            Protocol::InProcess => {}
+        }
+        self.bytes.backend_down += r.bytes_down;
+        self.bytes.backend_up += r.bytes_up;
+        match r.status {
+            0 => self.res.network_errors += 1,
+            429 => self.res.status_429 += 1,
+            503 => self.res.status_503 += 1,
+            s if s >= 500 => self.res.server_errors += 1,
+            s if s >= 400 && s != 404 => self.res.client_errors += 1,
+            _ => {}
+        }
+        if r.is_throttle() {
+            self.res.throttled_responses += 1;
+        }
+        if let Some(ra) = r.retry_after_ms {
+            self.res.max_retry_after_ms = self.res.max_retry_after_ms.max(ra);
+        }
+        let a = self.apis.entry(r.api).or_insert_with(ApiAgg::new);
+        a.count += 1;
+        if r.is_error() && r.status != 404 {
+            a.errors += 1;
+        }
+        if r.is_throttle() {
+            a.throttled += 1;
+        }
+        if r.reused {
+            a.reused += 1;
+        }
+        *a.status.entry(r.status).or_default() += 1;
+        a.bytes_up += r.bytes_up;
+        a.bytes_down += r.bytes_down;
+        let t = &r.timing;
+        rec(&mut a.stages.queue, t.queue_us);
+        if !r.reused && r.protocol != Protocol::InProcess {
+            rec(&mut a.stages.connect, t.connect_us());
+        }
+        // A connection counts as dialed in the window through the request that used it first,
+        // so "new connections" and "warm %" always describe the same requests (a dial finished
+        // just before the window opened would otherwise be missing from one of them).
+        if !r.reused && r.protocol != Protocol::InProcess && (r.status != 0 || t.connect_us() > 0) {
+            self.conn.dialed += 1;
+            rec(&mut self.dns, t.dns_us);
+            rec(&mut self.tcp, t.tcp_us);
+            if t.proxy_us > 0 {
+                rec(&mut self.proxy, t.proxy_us);
+            }
+            if t.tls_us > 0 {
+                rec(&mut self.tls, t.tls_us);
+            }
+        }
+        rec(&mut a.stages.send, t.send_us);
+        rec(&mut a.stages.ttfb, t.ttfb_us);
+        rec(&mut a.stages.body, t.body_us);
+        rec(&mut a.stages.stall, t.stall_us);
+        rec(&mut a.stages.total, t.total_us);
+    }
+}
+
+/// A completed logical operation handed to the recorder.
+pub struct OpCompletion {
+    pub verb: &'static str,
+    pub op_id: u64,
+    pub started: Instant,
+    /// Latency from the *intended* start (open-loop) or actual start (closed-loop).
+    pub latency_us: u64,
+    pub logical_read: u64,
+    pub logical_write: u64,
+    pub error: Option<String>,
+    /// Object key (or listed prefix) the operation worked on.
+    pub key: String,
+    pub data: OpScopeData,
+    /// Open-loop operations: time from the intended to the actual start (the `schedule`
+    /// stage, part of `latency_us`); `None` in closed-loop runs.
+    pub schedule_us: Option<u64>,
+}
+
+/// Dial outcome reported by the transport.
+pub struct DialRecord {
+    pub ok: bool,
+    /// Egress proxy the connection was tunnelled through.
+    pub proxy: Option<String>,
+    pub dns_us: u64,
+    pub tcp_us: u64,
+    pub proxy_us: u64,
+    pub tls_us: u64,
+    pub remote: String,
+    pub alpn: String,
+    pub tls_version: String,
+    pub cipher: String,
+}
+
+/// Marks one HTTP request in flight for its whole life: dropping it (normal completion, error,
+/// or the request future being cancelled by a timeout / tail-cut) releases the slot exactly once.
+pub struct InflightGuard(Option<Arc<Recorder>>);
+
+impl InflightGuard {
+    pub fn start(rec: Option<Arc<Recorder>>) -> Self {
+        if let Some(r) = &rec {
+            r.request_started();
+        }
+        Self(rec)
+    }
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        if let Some(r) = &self.0 {
+            r.request_finished();
+        }
+    }
+}
+
+/// Budgets fed by the recorder: every completed operation's requests and bytes (all phases).
+/// `oprobe-core`'s safety guard implements it.
+pub trait Budget: Send + Sync {
+    fn add(&self, requests: u64, bytes: u64);
+}
+
+/// The exporter hook: called for every recorded request and operation, in every phase
+/// (OpenTelemetry metrics with the `otel` feature, logs, your own sink). Keep it cheap: it
+/// runs on the request path.
+pub trait Exporter: Send + Sync {
+    fn on_request(&self, r: &RequestRecord);
+    /// A completed operation (`verb`, latency, failed).
+    fn on_op(&self, verb: &'static str, latency_us: u64, failed: bool) {
+        let _ = (verb, latency_us, failed);
+    }
+}
+
+/// Receives every trace row of the measurement window as operations complete (design v5 §2):
+/// the run file is written while the run is in progress, so the in-memory sample can stay
+/// small. Called on the completion path: keep it cheap (hand rows to a writer thread).
+pub trait RowSink: Send + Sync {
+    /// One completed operation with all its requests.
+    fn on_op(&self, op: &crate::rows::OpRow, reqs: &[crate::rows::ReqRow]);
+    /// A request issued outside any operation.
+    fn on_unscoped(&self, req: &crate::rows::ReqRow) {
+        let _ = req;
+    }
+}
+
+/// Trace log shards (each keeps `max_requests / TRACE_SHARDS` rows).
+const TRACE_SHARDS: usize = 16;
+
+/// One completed operation in this many is timed for the observer cost.
+pub const OBSERVER_SAMPLE_EVERY: u64 = 16;
+
+/// `Recorder::frozen_elapsed_us` while the measurement window is open.
+const WINDOW_OPEN: u64 = u64::MAX;
+
+/// Central sink shared by the transport, OpenDAL layers and workload workers.
+pub struct Recorder {
+    phase: AtomicU8,
+    measuring: AtomicBool,
+    /// Window length in microseconds once the window closed (no new operation is measured,
+    /// while operations that started inside it may still be completing); `WINDOW_OPEN` before.
+    frozen_elapsed_us: AtomicU64,
+    window_start: Mutex<Instant>,
+    agg: Mutex<Agg>,
+    inflight_ops: AtomicU64,
+    inflight_requests: AtomicU64,
+    peak_inflight_requests: AtomicU64,
+    wire_rx: AtomicU64,
+    wire_tx: AtomicU64,
+    cache_enabled: AtomicBool,
+    proxy: Mutex<Option<String>>,
+    // await-tree slow-path capture
+    tree_registry: Mutex<Option<await_tree::Registry>>,
+    live_ops: Mutex<HashMap<u64, Instant>>,
+    trees: Mutex<HashMap<u64, String>>,
+    client: Mutex<ClientStats>,
+    /// Per-request / per-operation rows of the measurement window, sharded by operation id so
+    /// concurrent completions rarely contend.
+    trace: Vec<Mutex<TraceLog>>,
+    /// Safety rails fed with every completed operation (all phases).
+    guard: OnceLock<Arc<dyn Budget>>,
+    /// The exporter hook (all phases).
+    exporter: OnceLock<Arc<dyn Exporter>>,
+    /// Streams the window's rows (the run file writer).
+    row_sink: OnceLock<Arc<dyn RowSink>>,
+    /// Spreads requests issued outside any operation over the shards.
+    unscoped_seq: AtomicU64,
+    /// Observer cost: nanoseconds spent recording sampled operations, and how many.
+    observer_ns: AtomicU64,
+    observer_samples: AtomicU64,
+    completions: AtomicU64,
+    /// Cold start sampled during warmup: connect times and first-operation latencies.
+    cold: Mutex<(Histogram<u64>, Histogram<u64>)>,
+}
+
+impl Recorder {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            phase: AtomicU8::new(0),
+            measuring: AtomicBool::new(false),
+            frozen_elapsed_us: AtomicU64::new(WINDOW_OPEN),
+            window_start: Mutex::new(Instant::now()),
+            agg: Mutex::new(Agg::new()),
+            inflight_ops: AtomicU64::new(0),
+            inflight_requests: AtomicU64::new(0),
+            peak_inflight_requests: AtomicU64::new(0),
+            wire_rx: AtomicU64::new(0),
+            wire_tx: AtomicU64::new(0),
+            cache_enabled: AtomicBool::new(false),
+            proxy: Mutex::new(None),
+            tree_registry: Mutex::new(None),
+            live_ops: Mutex::new(HashMap::new()),
+            trees: Mutex::new(HashMap::new()),
+            client: Mutex::new(ClientStats {
+                cpu_cores: std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(1),
+                ..Default::default()
+            }),
+            trace: (0..TRACE_SHARDS)
+                .map(|_| {
+                    Mutex::new(TraceLog::new(
+                        crate::log::DEFAULT_MAX_REQUESTS.div_ceil(TRACE_SHARDS),
+                    ))
+                })
+                .collect(),
+            guard: OnceLock::new(),
+            exporter: OnceLock::new(),
+            row_sink: OnceLock::new(),
+            unscoped_seq: AtomicU64::new(0),
+            observer_ns: AtomicU64::new(0),
+            observer_samples: AtomicU64::new(0),
+            completions: AtomicU64::new(0),
+            cold: Mutex::new((hist(), hist())),
+        })
+    }
+
+    /// A recorder not tied to a run (what an application embeds): measuring from now on, with
+    /// no window to open or close, keeping at most `max_rows` trace rows (whole operations are
+    /// sampled beyond it; aggregates stay exact).
+    pub fn always_on(max_rows: usize) -> Arc<Self> {
+        let r = Self::new();
+        r.set_trace_limit(max_rows);
+        r.set_phase(Phase::Measure);
+        r
+    }
+
+    /// Install the exporter hook (the first call wins; returns whether it was installed).
+    pub fn set_exporter(&self, e: Arc<dyn Exporter>) -> bool {
+        self.exporter.set(e).is_ok()
+    }
+
+    fn trace(&self, op_id: u64) -> std::sync::MutexGuard<'_, TraceLog> {
+        self.trace[(op_id as usize) % TRACE_SHARDS]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Stream every row of the measurement window to `sink` (the first call wins; returns
+    /// whether it was installed).
+    pub fn set_row_sink(&self, sink: Arc<dyn RowSink>) -> bool {
+        self.row_sink.set(sink).is_ok()
+    }
+
+    /// Cap of kept trace rows (`trace.max_requests`).
+    pub fn set_trace_limit(&self, max_requests: usize) {
+        for t in &self.trace {
+            t.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .set_max_requests(max_requests.div_ceil(TRACE_SHARDS));
+        }
+    }
+
+    /// Feed every completed operation's requests and bytes to `guard` (budgets).
+    pub fn set_guard(&self, guard: Arc<dyn Budget>) {
+        let _ = self.guard.set(guard);
+    }
+
+    /// Take the trace rows recorded in the measurement window.
+    pub fn take_trace(&self) -> TraceRows {
+        let parts: Vec<TraceRows> = self
+            .trace
+            .iter()
+            .map(|t| t.lock().unwrap_or_else(|e| e.into_inner()).take())
+            .collect();
+        TraceRows::merge(parts)
+    }
+
+    fn agg(&self) -> std::sync::MutexGuard<'_, Agg> {
+        self.agg.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn set_cache_enabled(&self, on: bool) {
+        self.cache_enabled.store(on, Ordering::Relaxed);
+    }
+
+    pub fn set_proxy(&self, proxy: Option<String>) {
+        *self.proxy.lock().unwrap_or_else(|e| e.into_inner()) =
+            proxy.map(|p| crate::util::strip_url_credentials(&p));
+    }
+
+    pub fn set_tree_registry(&self, reg: await_tree::Registry) {
+        *self.tree_registry.lock().unwrap_or_else(|e| e.into_inner()) = Some(reg);
+    }
+
+    pub fn phase(&self) -> Phase {
+        match self.phase.load(Ordering::Acquire) {
+            1 => Phase::Preparing,
+            2 => Phase::Warmup,
+            3 => Phase::Measure,
+            4 => Phase::Verify,
+            5 => Phase::Cleanup,
+            6 => Phase::Done,
+            _ => Phase::Idle,
+        }
+    }
+
+    /// Switch phase. Entering [`Phase::Measure`] resets every aggregate and starts the window.
+    pub fn set_phase(&self, p: Phase) {
+        let code = match p {
+            Phase::Idle => 0,
+            Phase::Preparing => 1,
+            Phase::Warmup => 2,
+            Phase::Measure => 3,
+            Phase::Verify => 4,
+            Phase::Cleanup => 5,
+            Phase::Done => 6,
+        };
+        if p == Phase::Measure {
+            let mut a = self.agg();
+            let conn = std::mem::take(&mut a.conn);
+            *a = Agg::new();
+            a.conn = ConnInfo {
+                dialed: 0,
+                failures: 0,
+                ..conn
+            };
+            drop(a);
+            for t in &self.trace {
+                t.lock().unwrap_or_else(|e| e.into_inner()).reset();
+            }
+            self.wire_rx.store(0, Ordering::Relaxed);
+            self.wire_tx.store(0, Ordering::Relaxed);
+            self.peak_inflight_requests.store(
+                self.inflight_requests.load(Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
+            *self.window_start.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
+            self.frozen_elapsed_us.store(WINDOW_OPEN, Ordering::Release);
+            self.measuring.store(true, Ordering::Release);
+        } else if self.measuring.load(Ordering::Acquire) {
+            // Freeze the window length at the moment measurement ends (unless the runner already
+            // closed it at its deadline).
+            self.close_window(Instant::now());
+            self.measuring.store(false, Ordering::Release);
+        }
+        self.phase.store(code, Ordering::Release);
+    }
+
+    /// End the measurement window at `at` (normally the deadline): rates are computed over
+    /// `window_start..at`, operations starting afterwards are not measured, but operations that
+    /// started inside the window keep being recorded until the phase changes (drain).
+    /// Idempotent: the first call wins.
+    pub fn close_window(&self, at: Instant) {
+        if !self.measuring.load(Ordering::Acquire) {
+            return;
+        }
+        let len = at.saturating_duration_since(self.window_start());
+        let us = (len.as_micros() as u64).min(WINDOW_OPEN - 1);
+        let _ = self.frozen_elapsed_us.compare_exchange(
+            WINDOW_OPEN,
+            us,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    /// Whether the measurement phase is active (including the drain after the window closed):
+    /// completions of operations that started in the window are still recorded.
+    #[inline]
+    pub fn is_measuring(&self) -> bool {
+        self.measuring.load(Ordering::Acquire)
+    }
+
+    /// Whether an operation starting now belongs to the measurement window.
+    #[inline]
+    pub fn window_open(&self) -> bool {
+        self.is_measuring() && self.frozen_elapsed_us.load(Ordering::Acquire) == WINDOW_OPEN
+    }
+
+    pub fn window_start(&self) -> Instant {
+        *self.window_start.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Length of the measurement window: time since it started, or its final length once
+    /// closed (draining operations do not stretch it).
+    pub fn elapsed_s(&self) -> f64 {
+        let frozen = self.frozen_elapsed_us.load(Ordering::Acquire);
+        if frozen != WINDOW_OPEN {
+            return frozen as f64 / 1e6;
+        }
+        self.window_start().elapsed().as_secs_f64()
+    }
+
+    pub fn add_wire(&self, rx: u64, tx: u64) {
+        if self.is_measuring() {
+            if rx > 0 {
+                self.wire_rx.fetch_add(rx, Ordering::Relaxed);
+            }
+            if tx > 0 {
+                self.wire_tx.fetch_add(tx, Ordering::Relaxed);
+            }
+        }
+    }
+
+    pub fn request_started(&self) {
+        let cur = self.inflight_requests.fetch_add(1, Ordering::AcqRel) + 1;
+        if self.is_measuring() {
+            self.peak_inflight_requests
+                .fetch_max(cur, Ordering::Relaxed);
+        }
+    }
+
+    pub fn request_finished(&self) {
+        self.inflight_requests.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    pub fn record_dial(&self, d: DialRecord) {
+        let measuring = self.is_measuring();
+        let mut a = self.agg();
+        if !d.ok {
+            if measuring {
+                a.conn.failures += 1;
+            }
+            return;
+        }
+        if let Some(p) = d.proxy {
+            *self.proxy.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some(crate::util::strip_url_credentials(&p));
+        }
+        a.conn.alpn = d.alpn;
+        a.conn.tls_version = d.tls_version;
+        a.conn.cipher = d.cipher;
+        if !d.remote.is_empty()
+            && !a.conn.remote_addrs.contains(&d.remote)
+            && a.conn.remote_addrs.len() < 16
+        {
+            a.conn.remote_addrs.push(d.remote);
+        }
+        // Dial counts and phase timings come from the cold request that used the connection
+        // (`record_request`); dials only contribute metadata and failures.
+    }
+
+    /// A connection whose handshake finished before any request waited on it: hyper's pool
+    /// races a new dial against an idle connection and keeps the loser. It is a new connection
+    /// (counted, with its handshake phases), but the request that later takes it saw it warm,
+    /// so the phases are not charged to that request.
+    pub fn record_unclaimed_dial(&self, dns_us: u64, tcp_us: u64, proxy_us: u64, tls_us: u64) {
+        if !self.is_measuring() {
+            return;
+        }
+        let mut a = self.agg();
+        a.conn.dialed += 1;
+        rec(&mut a.dns, dns_us);
+        rec(&mut a.tcp, tcp_us);
+        if proxy_us > 0 {
+            rec(&mut a.proxy, proxy_us);
+        }
+        if tls_us > 0 {
+            rec(&mut a.tls, tls_us);
+        }
+    }
+
+    /// Request issued outside any operation scope (rare: background OpenDAL work).
+    pub fn record_unscoped_request(&self, r: &RequestRecord) {
+        if let Some(g) = self.guard.get() {
+            g.add(1, r.bytes_up + r.bytes_down);
+        }
+        if let Some(e) = self.exporter.get() {
+            e.on_request(r);
+        }
+        if self.is_measuring() {
+            self.agg().record_request(r);
+            // Unscoped: its offset is not relative to an operation; it ended just now.
+            let now_us = self.window_start().elapsed().as_micros() as i64;
+            let mut row = req_row(r.clone(), 0, 0, 1);
+            row.t_us = now_us - r.timing.total_us as i64;
+            if let Some(sink) = self.row_sink.get() {
+                sink.on_unscoped(&row);
+            }
+            // Spread over every shard (each holds its share of the row budget).
+            let n = self.unscoped_seq.fetch_add(1, Ordering::Relaxed) as usize;
+            self.trace[n % TRACE_SHARDS]
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push_unscoped(row);
+        }
+    }
+
+    pub fn record_integrity(&self, ok: bool) {
+        let mut a = self.agg();
+        if ok {
+            a.integrity.verified += 1;
+        } else {
+            a.integrity.corrupted += 1;
+        }
+    }
+
+    pub fn set_open_loop(&self, s: OpenLoopStats) {
+        self.agg().open_loop = Some(s);
+    }
+
+    /// An open-loop arrival due at `intended` that never started (dropped behind schedule, or
+    /// still waiting when the window ended): its latency is unknown but at least
+    /// `lower_bound_us`. It is counted in the latency distribution as that censored value (so
+    /// the tail cannot hide a backlog: no coordinated omission) and in the second it was due.
+    pub fn record_missed_arrival(&self, intended: Instant, lower_bound_us: u64) {
+        if !self.is_measuring() {
+            return;
+        }
+        let window_start = self.window_start();
+        let idx = bucket_index(intended.saturating_duration_since(window_start).as_secs());
+        let mut a = self.agg();
+        a.censored += 1;
+        rec(&mut a.all_latency, lower_bound_us.max(1));
+        self.ensure_bucket(&mut a, idx, window_start);
+        a.buckets[idx].missed += 1;
+    }
+
+    pub fn op_started(&self, op_id: u64) {
+        self.op_started_at(op_id, Instant::now());
+    }
+
+    /// An operation started at `at` (its intended start in open-loop runs).
+    pub fn op_started_at(&self, op_id: u64, at: Instant) {
+        self.inflight_ops.fetch_add(1, Ordering::Relaxed);
+        self.live_ops
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(op_id, at);
+    }
+
+    /// Warmup operations that dialed: the cold start (connection setup is otherwise absorbed
+    /// by warmup and missing from short runs).
+    fn record_cold_start(&self, c: &OpCompletion) {
+        let cold: Vec<u64> = c
+            .data
+            .requests
+            .iter()
+            .filter(|r| !r.reused && r.protocol != Protocol::InProcess && r.timing.connect_us() > 0)
+            .map(|r| r.timing.connect_us())
+            .collect();
+        if cold.is_empty() {
+            return;
+        }
+        let mut g = self.cold.lock().unwrap_or_else(|e| e.into_inner());
+        for us in cold {
+            rec(&mut g.0, us);
+        }
+        rec(&mut g.1, c.latency_us);
+    }
+
+    /// Measured observer cost per operation (µs): the recorder's bookkeeping of one completed
+    /// operation, timed on one operation in [`OBSERVER_SAMPLE_EVERY`].
+    pub fn observer_per_op_us(&self) -> Option<f64> {
+        let n = self.observer_samples.load(Ordering::Relaxed);
+        (n > 0).then(|| self.observer_ns.load(Ordering::Relaxed) as f64 / n as f64 / 1000.0)
+    }
+
+    /// Record a completed logical operation (only if it started inside the window).
+    pub fn complete_op(&self, measured: bool, c: OpCompletion) {
+        let n = self.completions.fetch_add(1, Ordering::Relaxed);
+        if n.is_multiple_of(OBSERVER_SAMPLE_EVERY) {
+            let t = Instant::now();
+            self.complete_op_inner(measured, c);
+            self.observer_ns
+                .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            self.observer_samples.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.complete_op_inner(measured, c);
+        }
+    }
+
+    fn complete_op_inner(&self, measured: bool, c: OpCompletion) {
+        self.inflight_ops.fetch_sub(1, Ordering::Relaxed);
+        if let Some(e) = self.exporter.get() {
+            for r in &c.data.requests {
+                e.on_request(r);
+            }
+            e.on_op(c.verb, c.latency_us, c.error.is_some());
+        }
+        if let Some(g) = self.guard.get() {
+            let bytes: u64 = c
+                .data
+                .requests
+                .iter()
+                .map(|r| r.bytes_up + r.bytes_down)
+                .sum();
+            g.add(
+                c.data.requests.len() as u64 + c.data.dropped_requests,
+                bytes,
+            );
+        }
+        let forget_live = || {
+            self.live_ops
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&c.op_id);
+        };
+        let tree = self
+            .trees
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&c.op_id);
+        if !measured || !self.is_measuring() {
+            forget_live();
+            if self.phase() == Phase::Warmup {
+                self.record_cold_start(&c);
+            }
+            return;
+        }
+        let window_start = self.window_start();
+        let at_s = c
+            .started
+            .saturating_duration_since(window_start)
+            .as_secs_f64();
+        let mut bd = breakdown_us(&c.data, c.latency_us);
+        if let Some(s) = c.schedule_us {
+            // Waiting for an open-loop slot is queueing (an in-flight cap), not client work:
+            // no request of the operation runs before it starts.
+            let moved = s.min(bd[4]);
+            bd[4] -= moved;
+            bd[0] += moved;
+        }
+        let ok = c.error.is_none();
+        let throttled = c.data.throttled;
+        let bytes = c.logical_read + c.logical_write;
+        let req_count = c.data.requests.len() as u64 + c.data.dropped_requests;
+
+        let mut a = self.agg();
+        // Leave the live set only under the aggregate lock: until then this operation keeps
+        // its second open, so a concurrent completion cannot close that second before this
+        // sample is in it.
+        forget_live();
+        for r in &c.data.requests {
+            a.record_request(r);
+        }
+        a.ops += 1;
+        a.dims.record(&crate::dims::DimOp {
+            verb: c.verb,
+            key: &c.key,
+            bytes,
+            latency_us: c.latency_us,
+            requests: req_count,
+            throttled,
+            failed: !ok,
+        });
+        a.logical_read += c.logical_read;
+        a.logical_write += c.logical_write;
+        a.cache_lookups += c.data.cache_lookups;
+        a.cache_hits += c.data.cache_hits;
+        a.cache_lookup_us += c.data.cache_lookup_us;
+        a.bytes.cache_hit_bytes += c.data.cache_hit_bytes;
+        a.res.retries += c.data.retries;
+        a.res.retry_backoff_ms += c.data.retry_backoff_us as f64 / 1000.0;
+        if let Some(ref e) = c.error {
+            a.failed_ops += 1;
+            *a.res.error_classes.entry(e.clone()).or_default() += 1;
+        }
+        rec(&mut a.all_latency, c.latency_us);
+        if let Some(s) = c.schedule_us {
+            rec(&mut a.schedule, s);
+        }
+        {
+            let v = a.verbs.entry(c.verb).or_insert_with(VerbAgg::new);
+            rec(&mut v.latency, c.latency_us);
+            v.count += 1;
+            if !ok {
+                v.errors += 1;
+            }
+            if throttled {
+                v.throttled += 1;
+            }
+            v.bytes += bytes;
+            v.requests += req_count;
+            v.retries += c.data.retries;
+            v.queue_us += bd[0];
+            v.cache_us += bd[1];
+            v.backend_us += bd[2];
+            v.retry_us += bd[3];
+            v.client_us += bd[4];
+        }
+        let idx = bucket_index(at_s.max(0.0) as u64);
+        self.ensure_bucket(&mut a, idx, window_start);
+        let b = &mut a.buckets[idx];
+        b.ops += 1;
+        b.bytes += bytes;
+        if !ok {
+            b.errors += 1;
+        }
+        if throttled {
+            b.throttled += 1;
+        }
+        if let Some(h) = b.latency.as_mut() {
+            rec(h, c.latency_us);
+        }
+        b.heat[heat_index(c.latency_us)] += 1;
+
+        // Keep the slowest operations with their full request timelines.
+        let lat_ms = c.latency_us as f64 / 1000.0;
+        let qualifies = a.slow.len() < SLOW_OPS_KEPT
+            || a.slow.last().map(|s| lat_ms > s.latency_ms).unwrap_or(true);
+        if qualifies {
+            let ms = |v: u64| v as f64 / 1000.0;
+            a.slow.push(SlowOp {
+                op_id: c.op_id,
+                key: c.key.clone(),
+                verb: c.verb.to_owned(),
+                latency_ms: lat_ms,
+                at_s,
+                breakdown: OpBreakdown {
+                    queue_ms: ms(bd[0]),
+                    cache_ms: ms(bd[1]),
+                    backend_ms: ms(bd[2]),
+                    retry_ms: ms(bd[3]),
+                    client_ms: ms(bd[4]),
+                },
+                retries: c.data.retries,
+                requests: c.data.requests.clone(),
+                await_tree: tree,
+                error: c.error.clone(),
+            });
+            a.slow.sort_by(|x, y| y.latency_ms.total_cmp(&x.latency_ms));
+            a.slow.truncate(SLOW_OPS_KEPT);
+        }
+        drop(a);
+
+        // Trace rows (moved out of the scope data: no per-request allocation).
+        let op_t_us = signed_offset_us(window_start, c.started);
+        let att = attempts(&c.data.requests);
+        let att = |i: usize| att.as_ref().map_or(1, |a| a[i]);
+        let row = op_row(
+            c.op_id,
+            c.verb,
+            c.key,
+            op_t_us,
+            c.latency_us,
+            bytes,
+            c.error,
+            throttled,
+            c.data.retries,
+            bd,
+            req_count,
+        );
+        let reqs: Vec<_> = c
+            .data
+            .requests
+            .into_iter()
+            .enumerate()
+            .map(|(i, r)| req_row(r, c.op_id, op_t_us, att(i)))
+            .collect();
+        if let Some(sink) = self.row_sink.get() {
+            sink.on_op(&row, &reqs);
+        }
+        // Whole operations: kept with all their requests, or not at all.
+        self.trace(c.op_id).push_whole_op(row, reqs);
+    }
+
+    /// Make interval `idx` exist. A new interval closes the earlier ones that are complete:
+    /// an interval is complete once every operation that started in it has finished (the
+    /// intervals before the oldest operation still running). `live_ops` is never held while
+    /// taking `agg`, so taking it here (under `agg`) cannot deadlock.
+    fn ensure_bucket(&self, a: &mut Agg, idx: usize, window_start: Instant) {
+        if a.buckets.len() > idx {
+            return;
+        }
+        let oldest_live = self
+            .live_ops
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .min()
+            .copied();
+        let first_open = oldest_live
+            .map(|t| bucket_index(t.saturating_duration_since(window_start).as_secs()))
+            .unwrap_or(idx)
+            .min(idx);
+        for b in a.buckets.iter_mut().take(first_open) {
+            b.close();
+        }
+        while a.buckets.len() <= idx {
+            a.buckets.push(Bucket::new());
+        }
+    }
+
+    /// The per-interval series probe (call it every few ms while measuring): requests in
+    /// flight and connections dialed land in the current interval.
+    pub fn sample_series(&self) {
+        if !self.window_open() {
+            return;
+        }
+        let window_start = self.window_start();
+        let idx = bucket_index(window_start.elapsed().as_secs());
+        let inflight = self.inflight_requests.load(Ordering::Relaxed);
+        let mut a = self.agg();
+        self.ensure_bucket(&mut a, idx, window_start);
+        let dialed = a.conn.dialed;
+        let new = dialed.saturating_sub(a.dials_seen);
+        a.dials_seen = dialed;
+        let b = &mut a.buckets[idx];
+        b.inflight_peak = b.inflight_peak.max(inflight);
+        b.dials += new;
+    }
+
+    /// Capture await-tree call stacks of operations running longer than `threshold_us`.
+    pub fn sample_trees(&self, threshold_us: u64) {
+        let reg = self
+            .tree_registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let Some(reg) = reg else { return };
+        let old: Vec<u64> = self
+            .live_ops
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|(_, t)| t.elapsed().as_micros() as u64 >= threshold_us)
+            .map(|(id, _)| *id)
+            .collect();
+        if old.is_empty() {
+            return;
+        }
+        let subs = reg.collect::<crate::scope::SubTaskKey>();
+        let mut trees = self.trees.lock().unwrap_or_else(|e| e.into_inner());
+        for id in old {
+            if let Some(t) = reg.get(id) {
+                let mut dump = t.to_string().trim_end().to_owned();
+                for (k, st) in subs.iter().filter(|(k, _)| k.0 == id) {
+                    dump.push_str(&format!(
+                        "\n  [sub-task {}] {}",
+                        k.1,
+                        st.to_string().trim_end().replace('\n', "\n  ")
+                    ));
+                }
+                // Keep the most informative capture of this operation.
+                let keep = trees
+                    .get(&id)
+                    .map(|prev| dump.lines().count() >= prev.lines().count())
+                    .unwrap_or(true);
+                if keep {
+                    trees.insert(id, dump);
+                }
+            }
+        }
+    }
+
+    /// Current overall p90 latency in microseconds (used as slow-op capture threshold).
+    pub fn current_p90_us(&self) -> u64 {
+        let a = self.agg();
+        if a.all_latency.is_empty() {
+            0
+        } else {
+            a.all_latency.value_at_quantile(0.90)
+        }
+    }
+
+    pub fn update_client(&self, cpu_pct: f64, rss_mib: f64) {
+        let mut c = self.client.lock().unwrap_or_else(|e| e.into_inner());
+        c.cpu_pct = if c.cpu_pct == 0.0 {
+            cpu_pct
+        } else {
+            c.cpu_pct * 0.7 + cpu_pct * 0.3
+        };
+        if self.is_measuring() {
+            c.cpu_pct_peak = c.cpu_pct_peak.max(cpu_pct);
+        }
+        c.rss_mib = rss_mib;
+        drop(c);
+        if self.window_open() {
+            let window_start = self.window_start();
+            let idx = bucket_index(window_start.elapsed().as_secs());
+            let mut a = self.agg();
+            self.ensure_bucket(&mut a, idx, window_start);
+            a.buckets[idx].cpu_pct = Some(cpu_pct);
+        }
+    }
+
+    pub fn snapshot(&self) -> Snapshot {
+        let elapsed = self.elapsed_s().max(1e-3);
+        let a = self.agg();
+        let mib = |b: u64| b as f64 / (1024.0 * 1024.0);
+
+        let verbs: Vec<VerbStats> = a
+            .verbs
+            .iter()
+            .map(|(name, v)| {
+                let n = v.count.max(1) as f64;
+                VerbStats {
+                    verb: (*name).to_owned(),
+                    count: v.count,
+                    errors: v.errors,
+                    throttled: v.throttled,
+                    ops_per_s: v.count as f64 / elapsed,
+                    mib_per_s: mib(v.bytes) / elapsed,
+                    latency: quantiles(&v.latency),
+                    breakdown: OpBreakdown {
+                        queue_ms: v.queue_us as f64 / n / 1000.0,
+                        cache_ms: v.cache_us as f64 / n / 1000.0,
+                        backend_ms: v.backend_us as f64 / n / 1000.0,
+                        retry_ms: v.retry_us as f64 / n / 1000.0,
+                        client_ms: v.client_us as f64 / n / 1000.0,
+                    },
+                    requests_per_op: v.requests as f64 / n,
+                    bytes_per_op: v.bytes as f64 / n,
+                    retries: v.retries,
+                }
+            })
+            .collect();
+
+        let apis: Vec<ApiStats> = a
+            .apis
+            .iter()
+            .map(|(api, s)| ApiStats {
+                api: *api,
+                count: s.count,
+                errors: s.errors,
+                throttled: s.throttled,
+                status: s.status.clone(),
+                reused_pct: crate::util::pct(s.reused as f64, s.count as f64),
+                bytes_up: s.bytes_up,
+                bytes_down: s.bytes_down,
+                stages: StageStats {
+                    queue: quantiles(&s.stages.queue),
+                    connect: quantiles(&s.stages.connect),
+                    send: quantiles(&s.stages.send),
+                    ttfb: quantiles(&s.stages.ttfb),
+                    body: quantiles(&s.stages.body),
+                    stall: quantiles(&s.stages.stall),
+                    total: quantiles(&s.stages.total),
+                },
+            })
+            .collect();
+
+        let connections = ConnStats {
+            dialed: a.conn.dialed,
+            dial_failures: a.conn.failures,
+            requests: a.requests,
+            reused_requests: a.reused_requests,
+            reuse_pct: crate::util::pct(
+                a.reused_requests as f64,
+                (a.h1_requests + a.h2_requests) as f64,
+            ),
+            http1_requests: a.h1_requests,
+            http2_requests: a.h2_requests,
+            alpn: a.conn.alpn.clone(),
+            tls_version: a.conn.tls_version.clone(),
+            cipher: a.conn.cipher.clone(),
+            proxy: self.proxy.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+            remote_addrs: a.conn.remote_addrs.clone(),
+            dns: quantiles(&a.dns),
+            tcp: quantiles(&a.tcp),
+            proxy_connect: quantiles(&a.proxy),
+            tls: quantiles(&a.tls),
+            peak_inflight_requests: self.peak_inflight_requests.load(Ordering::Relaxed),
+            cold_start: {
+                let g = self.cold.lock().unwrap_or_else(|e| e.into_inner());
+                (!g.0.is_empty()).then(|| ColdStartStats {
+                    connections_count: g.0.len(),
+                    connect: quantiles(&g.0),
+                    first_ops: quantiles(&g.1),
+                })
+            },
+        };
+
+        let mut resilience = a.res.clone();
+        resilience.failed_ops = a.failed_ops;
+
+        let mut bytes = a.bytes.clone();
+        bytes.logical_read = a.logical_read;
+        bytes.logical_write = a.logical_write;
+        bytes.wire_rx = self.wire_rx.load(Ordering::Relaxed);
+        bytes.wire_tx = self.wire_tx.load(Ordering::Relaxed);
+        bytes.read_amplification =
+            crate::util::ratio(bytes.backend_down as f64, bytes.logical_read as f64);
+        let uncached = bytes.logical_read.saturating_sub(bytes.cache_hit_bytes);
+        bytes.overread_ratio = crate::util::ratio(bytes.backend_down as f64, uncached as f64);
+        bytes.write_amplification =
+            crate::util::ratio(bytes.backend_up as f64, bytes.logical_write as f64);
+        bytes.request_amplification = crate::util::ratio(a.requests as f64, a.ops as f64);
+
+        let cache = CacheStats {
+            enabled: self.cache_enabled.load(Ordering::Relaxed),
+            lookups: a.cache_lookups,
+            hits: a.cache_hits,
+            hit_ratio: crate::util::ratio(a.cache_hits as f64, a.cache_lookups as f64),
+            lookup_ms_mean: crate::util::ratio(a.cache_lookup_us as f64, a.cache_lookups as f64)
+                / 1000.0,
+        };
+
+        // The last interval is usually partial; scale its rates by its covered fraction.
+        let nb = a.buckets.len();
+        let ms = |v: u64| v as f64 / 1000.0;
+        let timeline = a
+            .buckets
+            .iter()
+            .enumerate()
+            .map(|(i, b)| {
+                let (t_s, len_s) = bucket_span(i);
+                let width = if i + 1 == nb {
+                    (elapsed - t_s).clamp(0.05, len_s)
+                } else {
+                    len_s
+                };
+                let q = b.quantiles();
+                TimelinePoint {
+                    t_s,
+                    ops_per_s: b.ops as f64 / width,
+                    mib_per_s: mib(b.bytes) / width,
+                    p50_ms: ms(q[0]),
+                    p99_ms: ms(q[2]),
+                    errors: b.errors,
+                    throttled: b.throttled,
+                    missed_arrivals: b.missed,
+                    len_s,
+                    p90_ms: ms(q[1]),
+                    p999_ms: ms(q[3]),
+                    max_ms: ms(q[4]),
+                    inflight_peak: b.inflight_peak,
+                    new_connections: b.dials,
+                    cpu_pct: b.cpu_pct,
+                    latency_rows_count: if b.ops > 0 {
+                        b.heat.iter().map(|c| u64::from(*c)).collect()
+                    } else {
+                        Vec::new()
+                    },
+                }
+            })
+            .collect();
+
+        let throttled_ops: u64 = verbs.iter().map(|v| v.throttled).sum();
+        let summary = Summary {
+            ops: a.ops,
+            ops_per_s: a.ops.saturating_sub(a.failed_ops) as f64 / elapsed,
+            attempted_ops_per_s: a.ops as f64 / elapsed,
+            failed_ops: a.failed_ops,
+            error_rate: crate::util::ratio(a.failed_ops as f64, a.ops as f64),
+            throttled_request_ratio: crate::util::ratio(
+                a.res.throttled_responses as f64,
+                a.requests as f64,
+            ),
+            throttled_op_ratio: crate::util::ratio(throttled_ops as f64, a.ops as f64),
+            mib_per_s: mib(a.logical_read + a.logical_write) / elapsed,
+            read_mib_per_s: mib(a.logical_read) / elapsed,
+            write_mib_per_s: mib(a.logical_write) / elapsed,
+            latency: quantiles(&a.all_latency),
+            inflight_ops: self.inflight_ops.load(Ordering::Relaxed),
+        };
+
+        Snapshot {
+            phase: self.phase(),
+            elapsed_s: elapsed,
+            summary,
+            verbs,
+            apis,
+            connections,
+            resilience,
+            bytes,
+            cache,
+            integrity: a.integrity.clone(),
+            client: self
+                .client
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+            open_loop: a.open_loop.clone().map(|mut o| {
+                o.censored_count = a.censored;
+                if !a.schedule.is_empty() {
+                    o.schedule = Some(quantiles(&a.schedule));
+                }
+                o
+            }),
+            interrupted: false,
+            effective_knobs: EffectiveKnobs::default(),
+            timeline,
+            slow_ops: a.slow.clone(),
+            self_obs: None,
+            dimensions: Some(a.dims.stats()).filter(|d| !d.prefixes.is_empty()),
+        }
+    }
+}
+
+/// `at - origin` in µs, negative when `at` is earlier.
+fn signed_offset_us(origin: Instant, at: Instant) -> i64 {
+    match at.checked_duration_since(origin) {
+        Some(d) => d.as_micros() as i64,
+        None => -(origin.duration_since(at).as_micros() as i64),
+    }
+}
+
+/// Exact split of one op's wall time into `[queue, cache, backend, retry, client]`
+/// microseconds using a sweep over its request intervals and retry backoff sleeps: an instant
+/// counts as *backend* if any request is on the network, else *queue* if any request is
+/// waiting for a permit/connection, else *retry* if the retry layer is sleeping before the
+/// next attempt, else *client*. Cache lookup time is carved out of the client share.
+pub fn breakdown_us(d: &OpScopeData, total_us: u64) -> [u64; 5] {
+    // events: (time, queue delta, network delta, retry delta)
+    let mut ev: Vec<(u64, i32, i32, i32)> =
+        Vec::with_capacity(d.requests.len() * 4 + d.retry_waits.len() * 2);
+    for r in &d.requests {
+        let s = r.start_offset_us;
+        let q_end = s + r.timing.queue_us;
+        let n_end = (s + r.timing.total_us)
+            .saturating_sub(r.timing.stall_us)
+            .max(q_end);
+        if r.timing.queue_us > 0 {
+            ev.push((s, 1, 0, 0));
+            ev.push((q_end, -1, 0, 0));
+        }
+        if n_end > q_end {
+            ev.push((q_end, 0, 1, 0));
+            ev.push((n_end, 0, -1, 0));
+        }
+    }
+    for &(s, e) in &d.retry_waits {
+        if e > s {
+            ev.push((s, 0, 0, 1));
+            ev.push((e, 0, 0, -1));
+        }
+    }
+    // Ends before starts at the same instant.
+    ev.sort_by_key(|e| (e.0, e.1.min(e.2).min(e.3)));
+    let (mut q, mut n, mut w) = (0i32, 0i32, 0i32);
+    let (mut queue, mut net, mut retry) = (0u64, 0u64, 0u64);
+    let mut last = 0u64;
+    for (t, dq, dn, dw) in ev {
+        let t = t.min(total_us);
+        if t > last {
+            if n > 0 {
+                net += t - last;
+            } else if q > 0 {
+                queue += t - last;
+            } else if w > 0 {
+                retry += t - last;
+            }
+            last = t;
+        }
+        q += dq;
+        n += dn;
+        w += dw;
+    }
+    let rest = total_us.saturating_sub(queue + net + retry);
+    let cache = d.cache_lookup_us.min(rest);
+    [queue, cache, net, retry, rest - cache]
+}
+
+impl std::fmt::Debug for Recorder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Recorder").finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::record::*;
+
+    fn req(start: u64, queue: u64, total: u64) -> RequestRecord {
+        RequestRecord {
+            api: Api::GetObject,
+            method: "GET".into(),
+            status: 200,
+            protocol: Protocol::Http1,
+            reused: true,
+            conn_id: 1,
+            start_offset_us: start,
+            timing: RequestTiming {
+                queue_us: queue,
+                total_us: total,
+                ..Default::default()
+            },
+            bytes_up: 0,
+            bytes_down: 0,
+            request_id: None,
+            retry_after_ms: None,
+            error: None,
+            remote: None,
+            service_op: None,
+            tls: None,
+            tcp: None,
+            detail: None,
+        }
+    }
+
+    #[test]
+    fn breakdown_merges_parallel_requests() {
+        let d = OpScopeData {
+            requests: vec![req(100, 0, 1000), req(500, 200, 1000)],
+            cache_lookup_us: 50,
+            ..Default::default()
+        };
+        // network covers [100,1500) = 1400us; queue [500,700) overlaps network -> 0
+        let b = breakdown_us(&d, 2000);
+        assert_eq!(b, [0, 50, 1400, 0, 550]);
+        assert_eq!(b.iter().sum::<u64>(), 2000);
+    }
+
+    #[test]
+    fn closed_window_freezes_rates_but_records_draining_ops() {
+        let r = Recorder::new();
+        r.set_phase(Phase::Measure);
+        let start = r.window_start();
+        assert!(r.window_open());
+        r.close_window(start + std::time::Duration::from_millis(500));
+        assert!(!r.window_open());
+        assert!(r.is_measuring());
+        // A second close (e.g. another worker) does not move the end.
+        r.close_window(start + std::time::Duration::from_secs(5));
+        assert!((r.elapsed_s() - 0.5).abs() < 1e-6, "{}", r.elapsed_s());
+        // An op that started inside the window completes during the drain.
+        r.op_started_at(7, start);
+        r.complete_op(
+            true,
+            OpCompletion {
+                verb: "stat",
+                op_id: 7,
+                started: start,
+                latency_us: 900_000,
+                logical_read: 0,
+                logical_write: 0,
+                error: None,
+                key: String::new(),
+                data: OpScopeData::default(),
+                schedule_us: None,
+            },
+        );
+        r.set_phase(Phase::Verify);
+        let s = r.snapshot();
+        assert_eq!(s.summary.ops, 1);
+        assert!((s.elapsed_s - 0.5).abs() < 1e-6);
+        assert!((s.summary.ops_per_s - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn breakdown_counts_pure_queue_time() {
+        let d = OpScopeData {
+            requests: vec![req(0, 300, 1000)],
+            ..Default::default()
+        };
+        assert_eq!(breakdown_us(&d, 1000), [300, 0, 700, 0, 0]);
+    }
+
+    #[test]
+    fn breakdown_attributes_retry_backoff_to_retry_not_client() {
+        // Attempt 1 [0, 1000) is throttled, the retry layer sleeps [1100, 5100), attempt 2
+        // runs [5150, 6150); 50us of client time before the retry and 50us after the sleep.
+        let mut ok = req(5150, 0, 1000);
+        ok.status = 200;
+        let mut throttled = req(0, 0, 1000);
+        throttled.status = 503;
+        let d = OpScopeData {
+            requests: vec![throttled, ok],
+            retries: 1,
+            retry_backoff_us: 4000,
+            retry_waits: vec![(1100, 5100)],
+            ..Default::default()
+        };
+        let b = breakdown_us(&d, 6200);
+        assert_eq!(b, [0, 0, 2000, 4000, 200]);
+        // A backoff overlapping another request's network time is backend time.
+        let d = OpScopeData {
+            requests: vec![req(0, 0, 3000)],
+            retry_waits: vec![(1000, 4000)],
+            ..Default::default()
+        };
+        assert_eq!(breakdown_us(&d, 4000), [0, 0, 3000, 1000, 0]);
+    }
+
+    #[test]
+    fn scope_records_retry_waits() {
+        let s = crate::OpScope::new(true);
+        s.record_retry(std::time::Duration::from_millis(5), true);
+        let d = s.take();
+        assert_eq!(d.retries, 1);
+        assert_eq!(d.retry_backoff_us, 5000);
+        assert_eq!(d.retry_waits.len(), 1);
+        assert_eq!(d.retry_waits[0].1 - d.retry_waits[0].0, 5000);
+        assert!(d.throttled);
+    }
+}

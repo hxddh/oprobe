@@ -83,7 +83,7 @@
       "type": "object"
     }
   },
-  "$id": "https://github.com/hxddh/oprobe/schemas/4/compat-plan.json",
+  "$id": "https://github.com/hxddh/oprobe/schemas/5/compat-plan.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "Result of `oprobe compat --dry-run`",
   "properties": {

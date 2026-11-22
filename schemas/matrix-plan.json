@@ -227,7 +227,7 @@
       "type": "object"
     }
   },
-  "$id": "https://github.com/hxddh/oprobe/schemas/4/matrix-plan.json",
+  "$id": "https://github.com/hxddh/oprobe/schemas/5/matrix-plan.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "Result of `oprobe matrix --dry-run`",
   "properties": {

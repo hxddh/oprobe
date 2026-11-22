@@ -1,0 +1,137 @@
+{
+  "$defs": {
+    "Answer": {
+      "description": "The answer of one topic.",
+      "properties": {
+        "evidence": {
+          "items": {
+            "$ref": "#/$defs/Evidence"
+          },
+          "type": "array"
+        },
+        "statement": {
+          "description": "The answer in one sentence, made only of the evidence below.",
+          "type": "string"
+        },
+        "topic": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "topic",
+        "statement",
+        "evidence"
+      ],
+      "type": "object"
+    },
+    "Evidence": {
+      "description": "One report field quoted by an answer.",
+      "properties": {
+        "field": {
+          "description": "JSON pointer into the report, e.g. `/summary/p99_ms`.",
+          "type": "string"
+        },
+        "value": true
+      },
+      "required": [
+        "field",
+        "value"
+      ],
+      "type": "object"
+    },
+    "McpCall": {
+      "description": "An MCP tool call: the tool and its arguments.",
+      "properties": {
+        "arguments": {
+          "additionalProperties": true,
+          "type": "object"
+        },
+        "tool": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "arguments"
+      ],
+      "type": "object"
+    },
+    "NextStep": {
+      "description": "A suggested next step: what it does, the CLI command, and the MCP call doing the same.",
+      "properties": {
+        "cli": {
+          "description": "The command line (`oprobe …`).",
+          "type": "string"
+        },
+        "mcp": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/McpCall"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The same step as an MCP tool call, when a tool does it."
+        },
+        "title": {
+          "description": "What the step does, in a few words.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "title",
+        "cli"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://github.com/hxddh/oprobe/schemas/5/mcp-ask.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "MCP ask_run: answers citing report fields",
+  "properties": {
+    "answers": {
+      "items": {
+        "$ref": "#/$defs/Answer"
+      },
+      "type": "array"
+    },
+    "available_topics": {
+      "description": "Topics a question can ask about.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "next": {
+      "items": {
+        "$ref": "#/$defs/NextStep"
+      },
+      "type": "array"
+    },
+    "question": {
+      "type": "string"
+    },
+    "run_id": {
+      "type": "string"
+    },
+    "topics": {
+      "description": "Topics the question matched (the verdict when none did).",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "run_id",
+    "question",
+    "topics",
+    "answers",
+    "available_topics",
+    "next"
+  ],
+  "title": "oprobe mcp-ask",
+  "type": "object",
+  "x-rust-type": "AskOut"
+}

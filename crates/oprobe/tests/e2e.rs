@@ -1,0 +1,1338 @@
+//! End-to-end tests against in-process backends and the local S3 lab over real sockets.
+
+use std::process::Command;
+use std::sync::Arc;
+use std::time::Duration;
+
+use oprobe::analysis::diagnosis::Bottleneck;
+use oprobe::config::*;
+use oprobe::engine::{Cancel, RunOptions, Session};
+use oprobe::lab::{LabConfig, LabServer};
+use oprobe::report::Report;
+use oprobe::report::diff::{Thresholds, diff};
+use oprobe::trace::{Api, Snapshot};
+use oprobe::util::ByteSize;
+
+/// The oprobe binary with its config and run store in a per-process temporary directory
+/// (tests never touch the user's files).
+fn oprobe_cmd() -> Command {
+    static HOME: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    let home = HOME.get_or_init(|| tempfile::tempdir().unwrap());
+    let mut c = Command::new(env!("CARGO_BIN_EXE_oprobe"));
+    c.env("OPROBE_DATA_DIR", home.path().join("data"))
+        .env("OPROBE_CONFIG", home.path().join("config.toml"))
+        .env_remove("OPROBE_OUTPUT");
+    c
+}
+
+/// Build the Report v3 of a measured window (no trace rows).
+fn build(prof: &Profile, s: Snapshot, c: oprobe::engine::CleanupSummary) -> Report {
+    oprobe::model::build_report(oprobe::model::ReportInput {
+        run_id: &oprobe::model::RunId::new(),
+        target_name: None,
+        profile: prof,
+        knobs: &prof.knobs,
+        snapshot: s,
+        trace: Default::default(),
+        cleanup: c,
+        warnings: vec![],
+        started_at: std::time::SystemTime::now(),
+        ended_at: std::time::SystemTime::now(),
+        spec: None,
+    })
+}
+
+fn quiet() -> oprobe::engine::ProgressFn {
+    Arc::new(|_| {})
+}
+
+fn opts(ms: u64) -> RunOptions {
+    RunOptions {
+        duration: Duration::from_millis(ms),
+        warmup: Duration::from_millis(200),
+        max_ops: None,
+        rate: None,
+        trace_slow_ops: true,
+    }
+}
+
+async fn lab(cfg: LabConfig) -> oprobe::lab::LabHandle {
+    LabServer::spawn(
+        "127.0.0.1:0",
+        LabConfig {
+            throttle_status_code: 503,
+            ..cfg
+        },
+    )
+    .await
+    .expect("lab starts")
+}
+
+fn small(p: &mut Profile, preset: Preset) {
+    p.workload.preset = preset;
+    let (mut ds, _) = preset.defaults();
+    ds.objects = ds.objects.min(8);
+    ds.object_size = ByteSize::kib(512);
+    p.workload.dataset = Some(ds);
+    p.knobs.concurrency = 4;
+    // The warmup `opts` runs with: a report judges its window against the profile's warmup.
+    p.workload.warmup = oprobe::util::HumanDuration(Duration::from_millis(200));
+}
+
+async fn run_once(p: Profile, ms: u64) -> (Snapshot, oprobe::engine::CleanupSummary, Profile) {
+    let s = Session::open(p, Cancel::new(), quiet())
+        .await
+        .expect("session opens");
+    let knobs = s.profile.knobs.clone();
+    let snap = s.run(&knobs, &opts(ms), None).await.expect("run succeeds");
+    let c = s.close().await;
+    (snap, c, s.profile.clone())
+}
+
+fn api(s: &Snapshot, a: Api) -> &oprobe::trace::ApiStats {
+    s.apis.iter().find(|x| x.api == a).unwrap_or_else(|| {
+        panic!(
+            "no {a:?} in {:?}",
+            s.apis.iter().map(|x| x.api).collect::<Vec<_>>()
+        )
+    })
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn every_preset_runs_and_cleans_up_on_memory_and_fs() {
+    let dir = tempfile::tempdir().unwrap();
+    for url in [
+        "memory://".to_owned(),
+        format!("fs://{}", dir.path().display()),
+    ] {
+        for preset in Preset::ALL {
+            let mut p = Profile::from_target(TargetSpec::from_url(&url).unwrap());
+            small(&mut p, preset);
+            if preset == Preset::Checkpoint {
+                p.workload.mix = vec![
+                    OpSpec {
+                        weight: 3,
+                        op: OpKind::MultipartWrite {
+                            size: ByteSize::mib(1),
+                        },
+                    },
+                    OpSpec {
+                        weight: 1,
+                        op: OpKind::Read { size: None },
+                    },
+                ];
+            }
+            let (snap, cleanup, _) = run_once(p, 300).await;
+            assert!(snap.summary.ops > 0, "{url} {preset:?}");
+            assert_eq!(
+                snap.summary.failed_ops, 0,
+                "{url} {preset:?}: {:?}",
+                snap.resilience.error_classes
+            );
+            assert_eq!(snap.integrity.corrupted, 0);
+            assert!(cleanup.verified, "{url} {preset:?}: {cleanup:?}");
+        }
+    }
+    // fs root contains no leftovers
+    let left: Vec<_> = walk(dir.path());
+    assert!(left.is_empty(), "leftover files: {left:?}");
+}
+
+fn walk(p: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(p) {
+        for e in rd.flatten() {
+            if e.path().is_dir() {
+                out.extend(walk(&e.path()));
+            } else {
+                out.push(e.path());
+            }
+        }
+    }
+    out
+}
+
+async fn http1_requests_are_attributed_stage_by_stage_with(mode: TransportMode) {
+    let lab = lab(LabConfig {
+        base_ttfb_delay: Duration::from_millis(15),
+        ..Default::default()
+    })
+    .await;
+    let mut p = lab.profile("bkt");
+    p.knobs.transport = mode;
+    small(&mut p, Preset::Mixed);
+    let (s, c, _) = run_once(p, 800).await;
+    assert!(c.verified);
+    assert_eq!(s.connections.http1_requests, s.connections.requests);
+    let get = api(&s, Api::GetObject);
+    // every request waited for the injected server latency, and TTFB captures it (not send/transfer)
+    assert!(
+        get.stages.ttfb.p50 >= 14.0,
+        "ttfb p50 {}",
+        get.stages.ttfb.p50
+    );
+    assert!(get.stages.send.p50 < 5.0);
+    assert!(get.stages.total.p50 >= get.stages.ttfb.p50);
+    // connections were dialed during warmup and reused in the window
+    assert!(
+        s.connections.reuse_pct > 95.0,
+        "reuse {}",
+        s.connections.reuse_pct
+    );
+    let put = api(&s, Api::PutObject);
+    assert!(put.bytes_up > 0);
+    // op breakdown sums to the latency mean
+    for v in &s.verbs {
+        let b = v.breakdown;
+        let sum = b.queue_ms + b.cache_ms + b.backend_ms + b.client_ms;
+        assert!(
+            (sum - v.latency.mean).abs() < v.latency.mean * 0.05 + 0.05,
+            "{}: {sum} vs {}",
+            v.verb,
+            v.latency.mean
+        );
+    }
+    assert_eq!(
+        s.bytes.request_amplification,
+        s.connections.requests as f64 / s.summary.ops as f64
+    );
+}
+
+async fn https_h2_multipart_upload_is_traced_per_api_with(mode: TransportMode) {
+    let lab = lab(LabConfig {
+        enable_tls: true,
+        enable_http2: true,
+        multipart_merge_delay: Duration::from_millis(30),
+        ..Default::default()
+    })
+    .await;
+    let mut p = lab.profile("bkt");
+    p.knobs.transport = mode;
+    p.workload.dataset = Some(DatasetSpec {
+        objects: 1,
+        object_size: ByteSize::kib(64),
+        ..Default::default()
+    });
+    p.workload.mix = vec![OpSpec {
+        weight: 1,
+        op: OpKind::MultipartWrite {
+            size: ByteSize::mib(12),
+        },
+    }];
+    p.knobs.chunk_size = ByteSize::mib(5);
+    p.knobs.concurrency = 2;
+    // OpenDAL's client speaks HTTP/1.1 unless the app enables reqwest's http2 feature.
+    p.knobs.http_version = oprobe::net::HttpVersion::H2;
+    let (s, c, _) = run_once(p, 1200).await;
+    assert!(c.verified);
+    assert_eq!(s.connections.alpn, "h2");
+    assert!(
+        s.connections.tls_version.contains("1.3"),
+        "{}",
+        s.connections.tls_version
+    );
+    assert!(s.connections.http2_requests > 0);
+    let complete = api(&s, Api::CompleteMultipart);
+    assert!(
+        complete.stages.ttfb.p50 >= 29.0,
+        "complete ttfb {}",
+        complete.stages.ttfb.p50
+    );
+    let parts = api(&s, Api::UploadPart);
+    let ops = s.verb("write.multipart").unwrap().count;
+    assert!(
+        parts.count >= 3 * ops - 3,
+        "{} parts for {ops} ops",
+        parts.count
+    );
+    assert!(api(&s, Api::CreateMultipart).count >= ops);
+    assert!(s.bytes.request_amplification >= 4.0);
+    assert_eq!(s.integrity.corrupted, 0);
+}
+
+async fn keep_alive_off_dials_for_every_request_with(mode: TransportMode) {
+    let lab = lab(LabConfig::default()).await;
+    let mut p = lab.profile("bkt");
+    p.knobs.transport = mode;
+    small(&mut p, Preset::SmallFiles);
+    p.knobs.keep_alive = false;
+    let (s, _, _) = run_once(p, 500).await;
+    assert!(s.connections.requests > 10);
+    assert!(
+        s.connections.reuse_pct < 1.0,
+        "reuse {}",
+        s.connections.reuse_pct
+    );
+    assert_eq!(s.connections.dialed, s.connections.requests);
+    assert!(s.apis.iter().all(|a| a.stages.connect.count == a.count));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn throttling_is_detected_and_diagnosed() {
+    let lab = lab(LabConfig {
+        throttle_every_n_requests: Some(4),
+        ..Default::default()
+    })
+    .await;
+    let mut p = lab.profile("bkt");
+    small(&mut p, Preset::SmallFiles);
+    let (s, c, prof) = run_once(p, 600).await;
+    assert!(c.verified, "cleanup must bypass throttling: {c:?}");
+    assert!(s.resilience.throttled_responses > 0);
+    assert!(s.resilience.status_503 > 0);
+    assert!(s.resilience.retries > 0);
+    assert!(s.resilience.max_retry_after_ms >= 1000);
+    let r = build(&prof, s, c);
+    assert_eq!(r.verdict.bottleneck, Bottleneck::Throttling);
+    assert_eq!(r.stages.bottleneck, Bottleneck::Throttling);
+    assert!(r.findings.iter().any(|f| f.code == "throttling"));
+    // Backoff between attempts is retry time, never "client" time (every retried op sleeps
+    // ≥ 50 ms; the lab answers in well under a millisecond).
+    let sh = &r.stages.shares;
+    assert!(
+        sh.retry_pct > 20.0 && sh.retry_pct > sh.client_pct,
+        "retry backoff must be its own share: {sh:?}"
+    );
+    let retry_ms: f64 = r
+        .verbs
+        .iter()
+        .map(|v| v.breakdown.retry_ms * v.count as f64)
+        .sum();
+    assert!(retry_ms > 0.0 && retry_ms <= r.resilience.retry_backoff_ms + 1.0);
+    assert!(
+        r.verdict.headline.contains("retry backoff"),
+        "{}",
+        r.verdict.headline
+    );
+    assert!(r.cost.per_op.failed_requests > 0.0);
+    // A localhost lab has no cloud bill: no AWS (or any) price is projected.
+    assert!(!r.cost.applicable, "{:?}", r.cost);
+    assert!(r.cost.comparison.is_empty());
+    assert!(oprobe::report::to_json(&r).contains("\"applicable\": false"));
+    let text = oprobe::report::terminal::render(&r);
+    assert!(!text.contains("COST"), "{text}");
+    assert!(oprobe::report::markdown::render_report(&r).contains("cost: not applicable"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stragglers_show_up_in_slow_op_timelines_with_call_stacks() {
+    let lab = lab(LabConfig {
+        straggler_every_n: 10,
+        straggler_delay: Duration::from_millis(150),
+        ..Default::default()
+    })
+    .await;
+    let mut p = lab.profile("bkt");
+    small(&mut p, Preset::Mixed);
+    let (s, _, _) = run_once(p, 1000).await;
+    let slow = s.slow_ops.first().expect("slow ops captured");
+    assert!(slow.latency_ms >= 150.0);
+    let worst = slow
+        .requests
+        .iter()
+        .map(|r| r.timing.ttfb_us)
+        .max()
+        .unwrap();
+    assert!(
+        worst >= 149_000,
+        "straggler must be attributed to TTFB, got {worst}us"
+    );
+    assert!(
+        s.slow_ops.iter().any(|o| o.await_tree.is_some()),
+        "await-tree stacks captured"
+    );
+    assert!(slow.requests.iter().all(|r| r.request_id.is_some()));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn open_loop_rate_is_respected() {
+    let mut p = Profile::from_target(TargetSpec::from_url("memory://").unwrap());
+    small(&mut p, Preset::SmallFiles);
+    let s = Session::open(p, Cancel::new(), quiet()).await.unwrap();
+    let mut o = opts(1500);
+    o.rate = Some(200.0);
+    let snap = s.run(&s.profile.knobs.clone(), &o, None).await.unwrap();
+    s.close().await;
+    let ol = snap.open_loop.expect("open-loop stats");
+    assert!(
+        (ol.achieved_rate - 200.0).abs() < 30.0,
+        "achieved {}",
+        ol.achieved_rate
+    );
+    assert!(
+        (snap.summary.ops_per_s - 200.0).abs() < 40.0,
+        "ops/s {}",
+        snap.summary.ops_per_s
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn inflight_cap_shows_up_as_queue_time() {
+    let lab = lab(LabConfig {
+        base_ttfb_delay: Duration::from_millis(10),
+        ..Default::default()
+    })
+    .await;
+    let mut p = lab.profile("bkt");
+    small(&mut p, Preset::SmallFiles);
+    p.knobs.concurrency = 16;
+    p.knobs.max_inflight_requests = 2;
+    let (s, _, _) = run_once(p, 800).await;
+    assert!(s.connections.peak_inflight_requests >= 2);
+    let q = s.request_stage_means().queue;
+    assert!(q > 20.0, "mean queue {q}ms");
+    let shares = oprobe::analysis::diagnosis::time_shares(&s);
+    assert!(shares.queue > 0.5, "queue share {}", shares.queue);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cache_hits_reduce_backend_bytes() {
+    let lab = lab(LabConfig::default()).await;
+    let mut p = lab.profile("bkt");
+    p.workload.dataset = Some(DatasetSpec {
+        objects: 4,
+        object_size: ByteSize::kib(256),
+        ..Default::default()
+    });
+    p.workload.mix = vec![OpSpec {
+        weight: 1,
+        op: OpKind::Read { size: None },
+    }];
+    p.workload.access = Access::Hotset {
+        fraction: 0.25,
+        probability: 0.9,
+    };
+    p.knobs.cache = true;
+    let (s, _, _) = run_once(p, 600).await;
+    assert!(s.cache.hits > 0);
+    assert!(s.bytes.cache_hit_bytes > 0);
+    assert!(
+        s.bytes.read_amplification < 0.5,
+        "read amp {}",
+        s.bytes.read_amplification
+    );
+    assert!(s.bytes.request_amplification < 0.5);
+}
+
+/// Minimal HTTP CONNECT proxy for tests.
+async fn connect_proxy() -> (String, Arc<std::sync::atomic::AtomicU64>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    let tunnels = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let t2 = tunnels.clone();
+    tokio::spawn(async move {
+        loop {
+            let (mut c, _) = l.accept().await.unwrap();
+            let t3 = t2.clone();
+            tokio::spawn(async move {
+                let mut head = Vec::new();
+                let mut b = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    if c.read(&mut b).await.unwrap_or(0) == 0 {
+                        return;
+                    }
+                    head.push(b[0]);
+                }
+                let line = String::from_utf8_lossy(&head)
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned();
+                let target = line
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or_default()
+                    .replace("localhost", "127.0.0.1");
+                let Ok(mut up) = tokio::net::TcpStream::connect(&target).await else {
+                    return;
+                };
+                t3.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                c.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                    .await
+                    .unwrap();
+                let _ = tokio::io::copy_bidirectional(&mut c, &mut up).await;
+            });
+        }
+    });
+    (format!("http://{addr}"), tunnels)
+}
+
+async fn proxy_connect_is_used_and_timed_with(mode: TransportMode) {
+    let lab = lab(LabConfig {
+        enable_tls: true,
+        enable_http2: true,
+        ..Default::default()
+    })
+    .await;
+    let (proxy, tunnels) = connect_proxy().await;
+    let mut p = lab.profile("bkt");
+    p.knobs.transport = mode;
+    p.target.proxy = Some(proxy.clone());
+    small(&mut p, Preset::SmallFiles);
+    p.knobs.keep_alive = false;
+    let (s, c, _) = run_once(p, 400).await;
+    assert!(c.verified);
+    assert!(tunnels.load(std::sync::atomic::Ordering::Relaxed) > 5);
+    assert_eq!(s.connections.proxy.as_deref(), Some(proxy.as_str()));
+    assert!(s.connections.proxy_connect.count > 0);
+    assert!(s.connections.tls.count > 0);
+}
+#[tokio::test(flavor = "multi_thread")]
+async fn tuner_finds_throttling_ceiling() {
+    use oprobe::tune::{Objective, TuneOptions, tune};
+    let lab = lab(LabConfig {
+        base_ttfb_delay: Duration::from_millis(5),
+        max_inflight_before_503: Some(6),
+        ..Default::default()
+    })
+    .await;
+    let mut p = lab.profile("bkt");
+    small(&mut p, Preset::SmallFiles);
+    p.knobs.concurrency = 32;
+    let s = Session::open(p, Cancel::new(), quiet()).await.unwrap();
+    let mut o = TuneOptions::new(
+        Objective::Throughput,
+        RunOptions {
+            duration: Duration::from_millis(500),
+            warmup: Duration::from_millis(100),
+            max_ops: None,
+            rate: None,
+            trace_slow_ops: false,
+        },
+    );
+    o.max_concurrency = 64;
+    o.max_trials = 14;
+    o.cooldown = Duration::ZERO;
+    let out = tune(&s, &o, Arc::new(|_| {})).await.unwrap();
+    s.close().await;
+    let sum = &out.summary;
+    // Over the throttle budget from some concurrency on; the in-flight ceiling brackets the
+    // lab's limit of 6.
+    let over = sum
+        .throttle_ceiling
+        .expect("over budget at some concurrency");
+    assert!((4..=16).contains(&over), "over budget from {over}");
+    let cap = sum.capacity.as_ref().expect("capacity estimate");
+    let ce = cap.inflight_ceiling.expect("in-flight ceiling");
+    assert!(ce.lo <= 6.0 && 6.0 < ce.hi + 1.0, "{ce:?}");
+    // The winner stays within the capacity model's margin and the throttle budget.
+    let safe = sum.safe_concurrency.expect("a margin");
+    assert!(safe < over, "safe {safe} over {over}");
+    assert!(
+        out.winner.concurrency <= safe,
+        "winner {} > safe {safe}",
+        out.winner.concurrency
+    );
+    assert!(out.winner.concurrency < over);
+    let w = &sum.trials[sum.winner_trial];
+    assert!(
+        w.throttled_request_ratio <= o.max_throttle_ratio * 5.0,
+        "winner throttled {:.4}",
+        w.throttled_request_ratio
+    );
+    // An infeasible baseline: no improvement headline, deltas against the best feasible trial.
+    assert!(!sum.baseline_feasible);
+    assert!(sum.improvement.is_none());
+    assert!(
+        sum.headline.starts_with("baseline infeasible"),
+        "{}",
+        sum.headline
+    );
+    let notes = sum.notes.join("\n");
+    assert!(notes.contains("throttling ceiling:"), "{notes}");
+    assert!(!sum.pareto.is_empty());
+}
+
+/// `oprobe tune` prints its whole report (trial table included) on stdout, only progress on
+/// stderr, and the emitted profile has no empty `scheme`.
+#[test]
+fn tune_report_goes_to_stdout_and_emits_a_clean_profile() {
+    let dir = tempfile::tempdir().unwrap();
+    let prof = dir.path().join("tuned.toml");
+    let out = oprobe_cmd()
+        .args(["tune", "memory://", "--preset", "small-files"])
+        .args(["--objects", "4", "--object-size", "16KiB"])
+        .args(["--trial-duration", "150ms", "--trial-warmup", "0s"])
+        .args(["--max-trials", "3", "--color", "never", "--emit-profile"])
+        .arg(&prof)
+        .output()
+        .unwrap();
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(out.status.success(), "{stderr}");
+    assert!(stdout.contains("stage"), "trial table on stdout: {stdout}");
+    assert!(stdout.contains("baseline"), "{stdout}");
+    assert!(stdout.contains("TUNED"), "{stdout}");
+    assert!(
+        !stderr.contains("baseline"),
+        "no report content on stderr: {stderr}"
+    );
+    let toml = std::fs::read_to_string(&prof).unwrap();
+    assert!(!toml.contains("scheme"), "{toml}");
+    Profile::load(&prof).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn report_roundtrip_and_diff_gate() {
+    let mut p = Profile::from_target(TargetSpec::from_url("memory://").unwrap());
+    small(&mut p, Preset::SmallFiles);
+    let (s, c, prof) = run_once(p, 400).await;
+    let r = build(&prof, s, c);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("r.json");
+    oprobe::report::write_file(&path, &oprobe::report::to_json(&r)).unwrap();
+    let back = oprobe::report::load_json(&path).unwrap();
+    assert_eq!(back, r);
+    let same = diff(&r, &back, &Thresholds::default());
+    assert!(same.passed, "{}", same.render_terminal());
+
+    let mut worse = r.clone();
+    worse.summary.ops /= 2;
+    worse.summary.ops_per_s *= 0.5;
+    for v in &mut worse.verbs {
+        v.latency.p99 = v.latency.p99 * 3.0 + 10.0;
+    }
+    worse.integrity.corrupted = 1;
+    let d = diff(&r, &worse, &Thresholds::default());
+    assert!(!d.passed);
+    let fails: Vec<_> = d
+        .checks
+        .iter()
+        .filter(|c| c.verdict == oprobe::report::diff::Status::Fail)
+        .map(|c| c.id.clone())
+        .collect();
+    assert!(fails.iter().any(|n| n.contains("throughput")));
+    assert!(fails.iter().any(|n| n.contains("p99")));
+    assert!(fails.iter().any(|n| n.contains("corrupted")));
+    assert!(d.render_junit().contains("<failure"));
+    assert!(d.render_markdown().contains("FAIL"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn kept_data_is_swept_by_cleanup() {
+    let lab = lab(LabConfig::default()).await;
+    let mut p = lab.profile("bkt");
+    small(&mut p, Preset::SmallFiles);
+    p.workload.cleanup = false;
+    let (_, c, prof) = run_once(p, 300).await;
+    assert!(!c.enabled);
+    assert!(lab.stored_object_count() > 0);
+    let t = prof.target.normalized().unwrap();
+    let base = oprobe::engine::operator::base_operator(&t).unwrap();
+    let admin = oprobe::engine::operator::admin_operator(&base, &t).unwrap();
+    let dry = oprobe::engine::cleanup::sweep(&admin, Duration::ZERO, false, true)
+        .await
+        .unwrap();
+    assert_eq!(dry.len(), 1);
+    assert!(lab.stored_object_count() > 0, "dry run deletes nothing");
+    let done = oprobe::engine::cleanup::sweep(&admin, Duration::ZERO, false, false)
+        .await
+        .unwrap();
+    assert!(done[0].deleted);
+    assert_eq!(lab.stored_object_count(), 0);
+}
+
+#[test]
+fn cli_binary_end_to_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("base.json");
+    let out = oprobe_cmd()
+        .args([
+            "run",
+            "memory://",
+            "--preset",
+            "small-files",
+            "-d",
+            "500ms",
+            "--warmup",
+            "100ms",
+            "--objects",
+            "8",
+            "--object-size",
+            "64KiB",
+            "-q",
+            "--color",
+            "never",
+            "--json",
+        ])
+        .arg(&base)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("full report: oprobe runs show"), "{text}");
+    assert!(text.lines().count() <= 20, "{text}");
+
+    // The saved run renders in full.
+    let show = oprobe_cmd()
+        .args(["runs", "show", "last", "--color", "never"])
+        .output()
+        .unwrap();
+    let full = String::from_utf8_lossy(&show.stdout);
+    assert!(
+        show.status.success(),
+        "{}",
+        String::from_utf8_lossy(&show.stderr)
+    );
+    assert!(full.contains("WHERE THE TIME GOES"), "{full}");
+    assert!(full.contains("CLEANUP"));
+
+    let junit = dir.path().join("gate.xml");
+    let d = oprobe_cmd()
+        .args(["compare", "--color", "never"])
+        .arg(&base)
+        .arg(&base)
+        .arg("--junit")
+        .arg(&junit)
+        .output()
+        .unwrap();
+    assert!(d.status.success(), "{}", String::from_utf8_lossy(&d.stdout));
+    assert!(
+        std::fs::read_to_string(&junit)
+            .unwrap()
+            .contains("testsuite")
+    );
+
+    let init = oprobe_cmd()
+        .args(["init", "--preset", "checkpoint"])
+        .output()
+        .unwrap();
+    let prof: Profile = toml::from_str(&String::from_utf8_lossy(&init.stdout)).unwrap();
+    assert_eq!(prof.workload.preset, Preset::Checkpoint);
+
+    let bad = oprobe_cmd().args(["run", "ftp://x"]).output().unwrap();
+    assert!(!bad.status.success());
+    assert!(String::from_utf8_lossy(&bad.stderr).contains("hint:"));
+
+    let comp = oprobe_cmd().args(["completions", "bash"]).output().unwrap();
+    assert!(String::from_utf8_lossy(&comp.stdout).contains("oprobe"));
+    let fail_on = oprobe_cmd()
+        .args([
+            "run",
+            "memory://",
+            "-d",
+            "200ms",
+            "--warmup",
+            "0s",
+            "-q",
+            "--objects",
+            "4",
+            "--object-size",
+            "64KiB",
+            "--fail-on",
+            "warning",
+            "-o",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    let rep: serde_json::Value = serde_json::from_slice(&fail_on.stdout).unwrap();
+    assert_eq!(rep["report"]["schema"], "oprobe.report/5");
+    assert_eq!(
+        rep["report"]["verdict"]["exit_code"].as_u64(),
+        fail_on.status.code().map(|c| c as u64)
+    );
+}
+
+#[test]
+fn shipped_profiles_are_valid() {
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("R2_ACCOUNT_ID", "x") };
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("MINIO_ROOT_USER", "x") };
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("MINIO_ROOT_PASSWORD", "x") };
+    let mut n = 0;
+    for e in std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../../profiles")).unwrap() {
+        let p = e.unwrap().path();
+        if p.extension().is_some_and(|x| x == "toml") {
+            let prof = Profile::load(&p).unwrap_or_else(|e| panic!("{}: {e:#}", p.display()));
+            prof.target
+                .normalized()
+                .unwrap()
+                .resolved_options()
+                .unwrap();
+            n += 1;
+        }
+    }
+    assert!(n >= 6);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn http1_requests_are_attributed_stage_by_stage() {
+    http1_requests_are_attributed_stage_by_stage_with(TransportMode::Opendal).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn http1_requests_are_attributed_stage_by_stage_microscope() {
+    http1_requests_are_attributed_stage_by_stage_with(TransportMode::Microscope).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn https_h2_multipart_upload_is_traced_per_api() {
+    https_h2_multipart_upload_is_traced_per_api_with(TransportMode::Opendal).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn https_h2_multipart_upload_is_traced_per_api_microscope() {
+    https_h2_multipart_upload_is_traced_per_api_with(TransportMode::Microscope).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn keep_alive_off_dials_for_every_request() {
+    keep_alive_off_dials_for_every_request_with(TransportMode::Opendal).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn keep_alive_off_dials_for_every_request_microscope() {
+    keep_alive_off_dials_for_every_request_with(TransportMode::Microscope).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn proxy_connect_is_used_and_timed() {
+    proxy_connect_is_used_and_timed_with(TransportMode::Opendal).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn proxy_connect_is_used_and_timed_microscope() {
+    proxy_connect_is_used_and_timed_with(TransportMode::Microscope).await;
+}
+
+/// Gateways answer 503 and hang up while the client is still uploading; the client sees a reset
+/// or abort (always on Windows) and must retry rather than fail the operation or the seeding.
+async fn early_close_throttling_is_retried_with(mode: TransportMode) {
+    let lab = lab(LabConfig {
+        throttle_every_n_requests: Some(5),
+        throttle_early_close: true,
+        ..Default::default()
+    })
+    .await;
+    let mut p = lab.profile("bkt");
+    p.knobs.transport = mode;
+    small(&mut p, Preset::SmallFiles);
+    p.knobs.retries = 6;
+    let (s, c, _) = run_once(p, 600).await;
+    assert!(c.verified, "{c:?}");
+    assert!(s.summary.ops > 0);
+    assert_eq!(s.summary.failed_ops, 0, "{:?}", s.verbs);
+    assert!(s.resilience.retries > 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn early_close_throttling_is_retried() {
+    early_close_throttling_is_retried_with(TransportMode::Opendal).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn early_close_throttling_is_retried_microscope() {
+    early_close_throttling_is_retried_with(TransportMode::Microscope).await;
+}
+
+/// Requests abandoned by the operation timeout must release their in-flight slot: a leak would
+/// make the in-flight count (and its peak) grow with every timeout.
+async fn timeouts_do_not_leak_inflight_requests_with(mode: TransportMode) {
+    let lab = lab(LabConfig {
+        straggler_every_n: 2,
+        straggler_delay: Duration::from_millis(800),
+        ..Default::default()
+    })
+    .await;
+    let mut p = lab.profile("bkt");
+    p.knobs.transport = mode;
+    small(&mut p, Preset::SmallFiles);
+    p.knobs.concurrency = 2;
+    p.knobs.io_concurrency = 1;
+    p.knobs.retries = 0;
+    p.knobs.timeout = oprobe::util::HumanDuration(Duration::from_millis(60));
+    let (s, _, _) = run_once(p, 1500).await;
+    assert!(
+        s.summary.failed_ops > 3,
+        "expected timeouts, got {:?}",
+        s.verbs
+    );
+    assert!(
+        s.connections.peak_inflight_requests <= 4,
+        "in-flight requests leaked: peak {}",
+        s.connections.peak_inflight_requests
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn timeouts_do_not_leak_inflight_requests() {
+    timeouts_do_not_leak_inflight_requests_with(TransportMode::Opendal).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn timeouts_do_not_leak_inflight_requests_microscope() {
+    timeouts_do_not_leak_inflight_requests_with(TransportMode::Microscope).await;
+}
+
+/// An open-loop arrival interval longer than the window must not run past it.
+#[tokio::test(flavor = "multi_thread")]
+async fn open_loop_never_runs_past_the_window() {
+    let mut p = Profile::from_target(TargetSpec::from_url("memory://").unwrap());
+    small(&mut p, Preset::SmallFiles);
+    let s = Session::open(p, Cancel::new(), quiet()).await.unwrap();
+    let mut o = opts(1000);
+    o.warmup = Duration::ZERO;
+    o.rate = Some(0.2); // one arrival every 5 s
+    let t = std::time::Instant::now();
+    let snap = s.run(&s.profile.knobs.clone(), &o, None).await.unwrap();
+    s.close().await;
+    assert!(
+        t.elapsed() < Duration::from_secs(3),
+        "took {:?}",
+        t.elapsed()
+    );
+    assert!(snap.summary.ops <= 1, "issued {} ops", snap.summary.ops);
+}
+
+/// A bare `oprobe` is what `oprobe.app` runs when opened from Finder (with `-psn_…` on some
+/// macOS versions): it must reach the workbench entry, never fail with a usage error (exit 2)
+/// before any window code runs. Here stdout is a pipe and the test build has no window, so
+/// the entry falls back to printing help and succeeding.
+#[test]
+fn bare_invocation_is_not_a_usage_error() {
+    for args in [&[][..], &["-psn_0_1234567"][..]] {
+        let out = oprobe_cmd()
+            .args(args)
+            .env_remove("DISPLAY")
+            .env_remove("WAYLAND_DISPLAY")
+            // macOS / Windows builds with `gui`: no window from a "remote" shell.
+            .env("SSH_CONNECTION", "test")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{args:?}: {:?}\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(String::from_utf8_lossy(&out.stdout).contains("Usage: oprobe"));
+    }
+}
+
+/// The window ends at the deadline: draining slow in-flight operations must not stretch it
+/// (which would understate ops/s and MiB/s), yet their latencies are still recorded.
+#[tokio::test(flavor = "multi_thread")]
+async fn drain_does_not_stretch_the_measurement_window() {
+    let lab = lab(LabConfig {
+        base_ttfb_delay: Duration::from_millis(300),
+        ..Default::default()
+    })
+    .await;
+    let mut p = lab.profile("bkt");
+    small(&mut p, Preset::SmallFiles);
+    p.knobs.concurrency = 4;
+    let s = Session::open(p, Cancel::new(), quiet()).await.unwrap();
+    let mut o = opts(1000);
+    o.warmup = Duration::ZERO;
+    let t = std::time::Instant::now();
+    let snap = s.run(&s.profile.knobs.clone(), &o, None).await.unwrap();
+    let wall = t.elapsed();
+    s.close().await;
+    assert!(
+        snap.elapsed_s <= 1.05,
+        "window {}s includes the drain",
+        snap.elapsed_s
+    );
+    assert!(
+        wall.as_secs_f64() > snap.elapsed_s + 0.1,
+        "ops drained after the window"
+    );
+    assert!(snap.summary.ops > 0);
+    let rate = snap.summary.ops as f64 / snap.elapsed_s;
+    assert!(
+        (snap.summary.ops_per_s - rate).abs() < 1e-6,
+        "{} vs {rate}",
+        snap.summary.ops_per_s
+    );
+    assert!(!snap.interrupted);
+}
+
+/// Closed-loop `max_ops` is exact under concurrency.
+#[tokio::test(flavor = "multi_thread")]
+async fn closed_loop_max_ops_is_exact() {
+    let mut p = Profile::from_target(TargetSpec::from_url("memory://").unwrap());
+    small(&mut p, Preset::SmallFiles);
+    p.knobs.concurrency = 16;
+    let s = Session::open(p, Cancel::new(), quiet()).await.unwrap();
+    let mut o = opts(10_000);
+    o.warmup = Duration::ZERO;
+    o.max_ops = Some(101);
+    let snap = s.run(&s.profile.knobs.clone(), &o, None).await.unwrap();
+    s.close().await;
+    assert_eq!(snap.summary.ops, 101);
+}
+
+/// An overloaded open-loop run queues arrivals: latency grows from the intended start
+/// (coordinated omission avoided), arrivals still queued at the end are `missed`, and
+/// concurrent writes never share a key (no false integrity failures).
+#[tokio::test(flavor = "multi_thread")]
+async fn open_loop_saturation_shows_in_latency() {
+    let lab = lab(LabConfig {
+        base_ttfb_delay: Duration::from_millis(40),
+        straggler_every_n: 7,
+        straggler_delay: Duration::from_millis(120),
+        ..Default::default()
+    })
+    .await;
+    let mut p = lab.profile("bkt");
+    small(&mut p, Preset::SmallFiles);
+    p.workload.mix = vec![OpSpec {
+        weight: 1,
+        op: OpKind::Write {
+            size: ByteSize::kib(16),
+        },
+    }];
+    p.knobs.concurrency = 2;
+    let s = Session::open(p, Cancel::new(), quiet()).await.unwrap();
+    let mut o = opts(1500);
+    o.warmup = Duration::ZERO;
+    o.rate = Some(200.0); // far above the ~40 ops/s two slots can serve
+    let snap = s.run(&s.profile.knobs.clone(), &o, None).await.unwrap();
+    let (_, bad) = s.verify_writes(None).await;
+    s.close().await;
+    let ol = snap.open_loop.clone().expect("open-loop stats");
+    assert!(ol.missed > 0, "{ol:?}");
+    assert!(ol.achieved_rate < 100.0, "{ol:?}");
+    // Queueing delay is part of latency: far above the ~40 ms service time.
+    assert!(
+        snap.summary.latency.p50 > 200.0,
+        "p50 {} must include queueing",
+        snap.summary.latency.p50
+    );
+    assert_eq!(snap.integrity.corrupted, 0);
+    assert_eq!(bad, 0, "concurrent writes raced on a slot");
+}
+
+/// A read-only dataset whose remaining operations all have weight 0 is a clear error, not a
+/// worker panic.
+#[tokio::test(flavor = "multi_thread")]
+async fn existing_prefix_with_only_weightless_reads_is_rejected() {
+    let mut p = Profile::from_target(TargetSpec::from_url("memory://").unwrap());
+    p.workload.dataset = Some(DatasetSpec {
+        existing_prefix: Some("data/".into()),
+        ..Default::default()
+    });
+    p.workload.mix = vec![
+        OpSpec {
+            weight: 1,
+            op: OpKind::Write {
+                size: ByteSize::kib(4),
+            },
+        },
+        OpSpec {
+            weight: 0,
+            op: OpKind::Read { size: None },
+        },
+    ];
+    let err = Session::open(p, Cancel::new(), quiet())
+        .await
+        .err()
+        .expect("must fail");
+    assert!(format!("{err:#}").contains("weight"), "{err:#}");
+}
+
+/// Cancelling during the dataset upload stops it and removes what was uploaded.
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelled_prepare_leaves_no_test_data() {
+    let lab = lab(LabConfig {
+        base_ttfb_delay: Duration::from_millis(60),
+        ..Default::default()
+    })
+    .await;
+    let mut p = lab.profile("bkt");
+    p.workload.dataset = Some(DatasetSpec {
+        objects: 200,
+        object_size: ByteSize::kib(64),
+        ..Default::default()
+    });
+    p.workload.mix = vec![OpSpec {
+        weight: 1,
+        op: OpKind::Read { size: None },
+    }];
+    let cancel = Cancel::new();
+    let c2 = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        c2.cancel();
+    });
+    let t = std::time::Instant::now();
+    let res = Session::open(p, cancel, quiet()).await;
+    assert!(res.is_err(), "open must report the cancellation");
+    assert!(t.elapsed() < Duration::from_secs(20), "{:?}", t.elapsed());
+    assert_eq!(lab.stored_object_count(), 0, "partial dataset left behind");
+}
+
+/// An endpoint with nothing listening fails fast instead of retrying uploads for minutes.
+#[tokio::test(flavor = "multi_thread")]
+async fn connection_refused_fails_fast() {
+    let lab = lab(LabConfig::default()).await;
+    let mut p = lab.profile("bkt");
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    p.target
+        .options
+        .insert("endpoint".into(), format!("http://127.0.0.1:{port}"));
+    small(&mut p, Preset::SmallFiles);
+    let t = std::time::Instant::now();
+    let err = Session::open(p, Cancel::new(), quiet())
+        .await
+        .err()
+        .expect("must fail");
+    assert!(t.elapsed() < Duration::from_secs(15), "{:?}", t.elapsed());
+    let msg = format!("{err:#}");
+    assert!(msg.contains("cannot reach"), "{msg}");
+    let hint = oprobe::analysis::hints::hint_for(&msg, "s3").expect("hint");
+    assert!(hint.title.contains("refused"), "{}", hint.title);
+}
+
+/// A run stopped with Cancel is flagged `interrupted` in the snapshot and report, and
+/// `oprobe diff` warns about it.
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelled_run_is_marked_interrupted() {
+    let mut p = Profile::from_target(TargetSpec::from_url("memory://").unwrap());
+    small(&mut p, Preset::SmallFiles);
+    let cancel = Cancel::new();
+    let s = Session::open(p, cancel.clone(), quiet()).await.unwrap();
+    let c2 = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        c2.cancel();
+    });
+    let mut o = opts(30_000);
+    o.warmup = Duration::ZERO;
+    let snap = s.run(&s.profile.knobs.clone(), &o, None).await.unwrap();
+    let c = s.close().await;
+    assert!(snap.interrupted);
+    assert!(snap.elapsed_s < 5.0, "{}", snap.elapsed_s);
+    let prof = s.profile.clone();
+    let r = build(&prof, snap, c);
+    assert!(r.run.interrupted);
+    assert_eq!(r.verdict.exit_code, 130);
+    let json = oprobe::report::to_json(&r);
+    assert!(json.contains("\"interrupted\": true"));
+    assert!(oprobe::report::terminal::render(&r).contains("PARTIAL · interrupted"));
+    assert!(oprobe::report::markdown::render_report(&r).contains("partial run: interrupted"));
+    assert_eq!(
+        r.run.partial.as_ref().map(|p| p.reason),
+        Some(oprobe::model::PartialReason::Interrupted)
+    );
+    assert!(r.baseline_refusal().is_some());
+    let mut done = r.clone();
+    done.run.interrupted = false;
+    let d = diff(&done, &r, &Thresholds::default());
+    assert!(
+        d.warnings.iter().any(|w| w.contains("interrupted")),
+        "{:?}",
+        d.warnings
+    );
+    assert!(oprobe::report::to_json(&done).contains("\"interrupted\": false"));
+}
+
+// ---------------------------------------------------------------------------------------
+// Interactive entry points and argument validation (UI/CLI review fixes).
+// ---------------------------------------------------------------------------------------
+
+/// `oprobe top` without a terminal explains itself and exits 2 (not a cryptic os error).
+#[test]
+fn top_without_a_terminal_is_a_clear_usage_error() {
+    let out = oprobe_cmd()
+        .args(["top", "memory://"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    if cfg!(feature = "tui") {
+        assert_eq!(out.status.code(), Some(2), "{err}");
+        assert!(err.contains("needs an interactive terminal"), "{err}");
+        assert!(err.contains("oprobe run"), "{err}");
+    } else {
+        assert!(!out.status.success());
+    }
+}
+
+/// `oprobe gui` without a display (or a window build) fails clearly and points to `top`.
+#[test]
+fn gui_without_a_display_fails_clearly() {
+    let out = oprobe_cmd()
+        .args(["gui", "memory://"])
+        .env_remove("DISPLAY")
+        .env_remove("WAYLAND_DISPLAY")
+        .env("SSH_CONNECTION", "test")
+        .env("XDG_STATE_HOME", tempfile::tempdir().unwrap().path())
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{err}");
+    assert!(err.contains("oprobe top"), "{err}");
+}
+
+/// Zero workers or too few tuner trials are rejected, never silently clamped.
+#[test]
+fn zero_concurrency_and_too_few_trials_are_rejected() {
+    for args in [
+        &["run", "memory://", "-c", "0"][..],
+        &["run", "memory://", "--io-concurrency", "0"][..],
+        &["tune", "memory://", "--max-trials", "1"][..],
+    ] {
+        let out = oprobe_cmd().args(args).output().unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {err}");
+        assert!(err.contains("must be at least"), "{args:?}: {err}");
+    }
+}
+
+/// Ctrl-C (SIGINT) during `oprobe run` still cleans up and prints partial results, but exits
+/// 130 so scripts never mistake them for a complete run.
+#[cfg(unix)]
+#[test]
+fn interrupted_run_exits_130() {
+    let child = oprobe_cmd()
+        .args(["run", "memory://", "-d", "60s", "--warmup", "0s", "--quiet"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    // SAFETY: plain signal to our own child process.
+    unsafe {
+        libc::kill(child.id() as libc::pid_t, libc::SIGINT);
+    }
+    let out = child.wait_with_output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(130), "{err}");
+    assert!(err.contains("partial results"), "{err}");
+}
+
+// ---------------------------------------------------------------------------------------
+// Trust fixes (v3): results must never lead to a wrong conclusion.
+// ---------------------------------------------------------------------------------------
+
+/// A lab served from a background runtime, for tests that drive the CLI binary.
+fn background_lab(cfg: LabConfig) -> (tokio::runtime::Runtime, oprobe::lab::LabHandle) {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let h = rt.block_on(lab(cfg));
+    (rt, h)
+}
+
+/// `oprobe run` against a lab with S3 credentials `x`/`x` and no proxy.
+fn run_cli_against(endpoint: &str, extra: &[&str]) -> std::process::Output {
+    oprobe_cmd()
+        .args([
+            "run",
+            "s3://bkt/x",
+            "--endpoint",
+            endpoint,
+            "--proxy",
+            "none",
+        ])
+        .args([
+            "--option",
+            "access_key_id=x",
+            "--option",
+            "secret_access_key=x",
+        ])
+        .args(["--region", "us-east-1", "--preset", "small-files"])
+        .args(["--objects", "4", "--object-size", "16KiB", "-c", "2"])
+        .args(["-d", "400ms", "--warmup", "0s", "-q", "--color", "never"])
+        .args(extra)
+        .output()
+        .unwrap()
+}
+
+/// Failed operations breach the default SLA (≤ 1% failed, no corruption): exit 3, unless the
+/// SLA is disabled or relaxed.
+#[test]
+fn failed_operations_breach_the_default_sla() {
+    let (_rt, lab) = background_lab(LabConfig {
+        throttle_every_n_requests: Some(3),
+        ..Default::default()
+    });
+    let out = run_cli_against(&lab.endpoint_url, &["--retries", "0"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(3), "{err}\n{text}");
+    assert!(text.contains("SLA BREACHED"), "{err}\n{text}");
+    for relaxed in [&["--sla", "none"][..], &["--max-error-rate", "100%"][..]] {
+        let args: Vec<&str> = ["--retries", "0"].iter().chain(relaxed).copied().collect();
+        let out = run_cli_against(&lab.endpoint_url, &args);
+        assert!(
+            out.status.success(),
+            "{relaxed:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let bad = run_cli_against(&lab.endpoint_url, &["--max-error-rate", "150%"]);
+    assert_eq!(bad.status.code(), Some(2), "a usage error");
+}
+
+/// OpenDAL raises S3 write chunks to the 5 MiB minimum part size: the report says which chunk
+/// was actually used instead of presenting the requested one as measured.
+#[tokio::test(flavor = "multi_thread")]
+async fn effective_write_chunk_is_reported() {
+    let lab = lab(LabConfig::default()).await;
+    let mut p = lab.profile("bkt");
+    small(&mut p, Preset::Checkpoint);
+    p.workload.mix = vec![OpSpec {
+        weight: 1,
+        op: OpKind::MultipartWrite {
+            size: ByteSize::mib(6),
+        },
+    }];
+    p.knobs.chunk_size = ByteSize::mib(1);
+    p.knobs.concurrency = 2;
+    let (s, c, prof) = run_once(p, 400).await;
+    let e = &s.effective_knobs;
+    assert_eq!(e.requested_chunk_size, ByteSize::mib(1).0);
+    assert_eq!(e.write_chunk_size, ByteSize::mib(5).0);
+    assert_eq!(e.service_min_part_size, Some(ByteSize::mib(5).0));
+    // 6 MiB in 5 MiB parts: two UploadPart requests per object, not six.
+    let parts = api(&s, Api::UploadPart).count as f64;
+    let writes = s.verbs.iter().map(|v| v.count).sum::<u64>() as f64;
+    assert!(parts / writes <= 2.5, "{parts} parts for {writes} writes");
+    let r = build(&prof, s, c);
+    assert_eq!(r.knobs.effective.write_chunk_bytes, ByteSize::mib(5).0);
+    assert_eq!(r.knobs.requested.chunk_bytes, ByteSize::mib(1).0);
+    assert!(
+        r.warnings.iter().any(|w| w.contains("5MiB parts")),
+        "{:?}",
+        r.warnings
+    );
+}
+
+/// Option keys OpenDAL would silently ignore are rejected with a suggestion, before anything
+/// connects.
+#[test]
+fn unknown_target_options_are_rejected() {
+    let out = oprobe_cmd()
+        .args([
+            "run",
+            "s3://bkt",
+            "--option",
+            "regin=eu-west-1",
+            "--color",
+            "never",
+        ])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{err}");
+    assert!(err.contains("unknown option `regin`"), "{err}");
+    assert!(err.contains("config.unknown_option"), "{err}");
+    assert!(err.contains("did you mean `region`?"), "{err}");
+}

@@ -1,0 +1,92 @@
+{
+  "$defs": {
+    "McpCall": {
+      "description": "An MCP tool call: the tool and its arguments.",
+      "properties": {
+        "arguments": {
+          "additionalProperties": true,
+          "type": "object"
+        },
+        "tool": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "arguments"
+      ],
+      "type": "object"
+    },
+    "NextStep": {
+      "description": "A suggested next step: what it does, the CLI command, and the MCP call doing the same.",
+      "properties": {
+        "cli": {
+          "description": "The command line (`oprobe …`).",
+          "type": "string"
+        },
+        "mcp": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/McpCall"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The same step as an MCP tool call, when a tool does it."
+        },
+        "title": {
+          "description": "What the step does, in a few words.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "title",
+        "cli"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://github.com/hxddh/oprobe/schemas/5/mcp-apply-profile.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "MCP apply_profile: the profile file written and its diff",
+  "properties": {
+    "applied": {
+      "description": "The changes applied (`key=value`).",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "created": {
+      "description": "The file did not exist before.",
+      "type": "boolean"
+    },
+    "diff": {
+      "description": "What changed, as unified-diff lines (`-` before, `+` after).",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "next": {
+      "items": {
+        "$ref": "#/$defs/NextStep"
+      },
+      "type": "array"
+    },
+    "path": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "path",
+    "created",
+    "diff",
+    "applied",
+    "next"
+  ],
+  "title": "oprobe mcp-apply-profile",
+  "type": "object",
+  "x-rust-type": "ApplyProfileOut"
+}

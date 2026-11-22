@@ -27,7 +27,7 @@
       ]
     }
   },
-  "$id": "https://github.com/hxddh/oprobe/schemas/4/run-summary.json",
+  "$id": "https://github.com/hxddh/oprobe/schemas/5/run-summary.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "Sidecar summary of a stored run (runs/<id>.json)",
   "properties": {
@@ -84,6 +84,13 @@
         "null"
       ]
     },
+    "preset": {
+      "description": "The workload preset (absent in summaries written before 5.0).",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "started_at": {
       "type": "string"
     },
@@ -97,6 +104,14 @@
     "target_name": {
       "type": [
         "string",
+        "null"
+      ]
+    },
+    "throttled_request_ratio": {
+      "description": "Throttled responses / requests (absent in summaries written before 5.0).",
+      "format": "double",
+      "type": [
+        "number",
         "null"
       ]
     },

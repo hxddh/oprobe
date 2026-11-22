@@ -15,6 +15,8 @@ Every command accepts the global options below. Exit codes: `0` ok · `1` runtim
 | `-q, --quiet` | No progress or informational messages on stderr |
 | `--non-interactive` | Never prompt or redraw (implied when stdin/stdout is not a terminal) |
 | `--config <PATH>` | Config file (default: $OPROBE_CONFIG or <config dir>/oprobe/config.toml) |
+| `--lang <LANG>` | Language of text output: en, zh-CN (default: LC_ALL / LC_MESSAGES / LANG); JSON stays English · env `OPROBE_LANG` |
+| `--help-all` | Print help with every flag (`--help` shows the common ones of large commands) |
 
 ## Commands
 
@@ -37,6 +39,7 @@ Every command accepts the global options below. Exit codes: `0` ok · `1` runtim
 | [`oprobe compat`](#oprobe-compat) | Correctness & compatibility suite for a target |
 | [`oprobe baseline`](#oprobe-baseline) | Named baselines: set, list, rm, show |
 | [`oprobe lab`](#oprobe-lab) | Start a local S3-compatible server with programmable faults |
+| [`oprobe worker`](#oprobe-worker) | Serve load for distributed runs (`oprobe run --workers`) |
 | [`oprobe mcp`](#oprobe-mcp) | MCP server for agents (stdio, or --http ADDR) |
 | [`oprobe schema`](#oprobe-schema) | Print the JSON Schema of a machine output (report, events, …) |
 | [`oprobe capabilities`](#oprobe-capabilities) | Describe what this oprobe can do (machine-readable) |
@@ -45,7 +48,7 @@ Every command accepts the global options below. Exit codes: `0` ok · `1` runtim
 | [`oprobe self-update`](#oprobe-self-update) | Check, download, verify and install the latest release |
 | [`oprobe top`](#oprobe-top) | Interactive workbench in this terminal: run, tune and probe with live charts |
 | [`oprobe gui`](#oprobe-gui) | The same workbench in a native window (macOS, Windows, Linux with GTK 4) |
-| [`oprobe completions`](#oprobe-completions) | Generate shell completions |
+| [`oprobe completions`](#oprobe-completions) | Generate shell completions (dynamic: target names and run ids complete live) |
 | [`oprobe man`](#oprobe-man) | Generate the man page |
 
 ## `oprobe run`
@@ -83,11 +86,16 @@ Output formats (`-o`): text, json, ndjson, md, html
 | `--rate <RATE>` | Open-loop arrival rate (ops/s); latency is measured from the intended start time |
 | `--existing <PREFIX>` | Benchmark existing objects under this prefix (read-only) |
 | `--objects <OBJECTS>` | Number of dataset objects to generate |
-| `--object-size <OBJECT_SIZE>` | Size of each generated object (e.g. 16MiB) |
+| `--object-size <OBJECT_SIZE>` | Size of each generated object (e.g. 16MiB), or a distribution: dist:lognormal(MEDIAN,SIGMA), file:PATH (one size per line) |
 | `--access <ACCESS>` | Key popularity: uniform, zipf:1.1, hotset:0.2/0.8 |
 | `--persist-dataset` | Keep the generated dataset for later runs (oprobe-dataset/<fingerprint>/) |
 | `--no-verify` | Skip CRC32C verification |
 | `--keep-data` | Do not delete test data when the run ends |
+| `--arrivals <PROCESS>` | Open-loop arrival process: constant (evenly spaced) or poisson |
+| `--shape <SHAPE>` | Time-varying open-loop rate: ramp:FROM..TO/D, step:R1,R2,…/D, diurnal[:MIN..MAX/PERIOD] |
+| `--replay <FILE>` | Replay a traffic log: S3 server access log, CloudTrail S3 data events, oprobe run file |
+| `--speed <N>` | Replay speed factor (2 = twice as fast as recorded) |
+| `--map-prefix <FROM=TO>` | Rewrite replayed keys: FROM=TO prefix pair, repeatable |
 
 *Client knobs*
 
@@ -122,8 +130,8 @@ Output formats (`-o`): text, json, ndjson, md, html
 | argument | description |
 |---|---|
 | `--sla <MODE>` | `none` reports the SLA verdict without failing the command · one of `enforce`, `none` |
-| `--max-error-rate <RATE>` | Max share of failed operations, e.g. 1% or 0.01 (default 1%) |
-| `--max-throttle-rate <RATE>` | Max share of throttled (429/503) operations, e.g. 0% (default: not checked by `run`; `tune` rejects any throttling) |
+| `--max-error-ratio <RATIO>` | Max share of failed operations, e.g. 1% or 0.01 (default 1%) |
+| `--max-throttle-ratio <RATIO>` | Max share of throttled (429/503) requests, e.g. 0% or 0.001: an SLA of `run` (default: not checked) and the throttle budget of `tune` and `fix` (default 0.1%) |
 | `--p99-ms <MS>` | Max p99 latency per operation in ms (tune rejects trials above it) |
 
 *Output*
@@ -156,6 +164,14 @@ Output formats (`-o`): text, json, ndjson, md, html
 |---|---|
 | `--from <RUNREF>` | Replay a stored run (RUNREF): its spec, with credentials resolved again from the target; other flags and --set override it |
 | `--set <KEY=VALUE>` | Override one setting, repeatable (e.g. --set concurrency=8 --set warmup=1s); keys: the profile's knob, workload, SLA and cost names, `endpoint`, `region`, `label` |
+
+*Load generation*
+
+| argument | description |
+|---|---|
+| `--client <CLIENT>` | What drives the workload: opendal (default), aws-sdk, or exec:COMMAND (an adapter speaking the oprobe client protocol, see docs/clients.md). Not stored in the run's spec |
+| `--workers <WORKERS>` | Distribute the run over workers: host:port[*WEIGHT],… of `oprobe worker`, local:N to start N worker processes here, or config for the config file's [workers] |
+| `--worker-token-file <FILE>` | The token file the remote workers were started with (default: [workers].token_file, then $OPROBE_WORKER_TOKEN) |
 
 ## `oprobe demo`
 
@@ -202,11 +218,16 @@ Output formats (`-o`): text, json, ndjson, md
 | `--rate <RATE>` | Open-loop arrival rate (ops/s); latency is measured from the intended start time |
 | `--existing <PREFIX>` | Benchmark existing objects under this prefix (read-only) |
 | `--objects <OBJECTS>` | Number of dataset objects to generate |
-| `--object-size <OBJECT_SIZE>` | Size of each generated object (e.g. 16MiB) |
+| `--object-size <OBJECT_SIZE>` | Size of each generated object (e.g. 16MiB), or a distribution: dist:lognormal(MEDIAN,SIGMA), file:PATH (one size per line) |
 | `--access <ACCESS>` | Key popularity: uniform, zipf:1.1, hotset:0.2/0.8 |
 | `--persist-dataset` | Keep the generated dataset for later runs (oprobe-dataset/<fingerprint>/) |
 | `--no-verify` | Skip CRC32C verification |
 | `--keep-data` | Do not delete test data when the run ends |
+| `--arrivals <PROCESS>` | Open-loop arrival process: constant (evenly spaced) or poisson |
+| `--shape <SHAPE>` | Time-varying open-loop rate: ramp:FROM..TO/D, step:R1,R2,…/D, diurnal[:MIN..MAX/PERIOD] |
+| `--replay <FILE>` | Replay a traffic log: S3 server access log, CloudTrail S3 data events, oprobe run file |
+| `--speed <N>` | Replay speed factor (2 = twice as fast as recorded) |
+| `--map-prefix <FROM=TO>` | Rewrite replayed keys: FROM=TO prefix pair, repeatable |
 
 *Client knobs*
 
@@ -241,8 +262,8 @@ Output formats (`-o`): text, json, ndjson, md
 | argument | description |
 |---|---|
 | `--sla <MODE>` | `none` reports the SLA verdict without failing the command · one of `enforce`, `none` |
-| `--max-error-rate <RATE>` | Max share of failed operations, e.g. 1% or 0.01 (default 1%) |
-| `--max-throttle-rate <RATE>` | Max share of throttled (429/503) operations, e.g. 0% (default: not checked by `run`; `tune` rejects any throttling) |
+| `--max-error-ratio <RATIO>` | Max share of failed operations, e.g. 1% or 0.01 (default 1%) |
+| `--max-throttle-ratio <RATIO>` | Max share of throttled (429/503) requests, e.g. 0% or 0.001: an SLA of `run` (default: not checked) and the throttle budget of `tune` and `fix` (default 0.1%) |
 | `--p99-ms <MS>` | Max p99 latency per operation in ms (tune rejects trials above it) |
 
 *Output*
@@ -277,9 +298,9 @@ Output formats (`-o`): text, json, ndjson, md
 | `--max-trials <MAX_TRIALS>` | Maximum number of trials · default `24` |
 | `--max-concurrency <MAX_CONCURRENCY>` | Highest concurrency to try · default `256` |
 | `--cooldown <COOLDOWN>` | Pause after a throttled trial · default `5s` |
-| `--max-throttle-ratio <RATIO>` | Share of throttled requests a configuration may cause and still be feasible (default 0.001, or the profile's `sla.max_throttle_rate`) |
 | `--boundary-repeats <BOUNDARY_REPEATS>` | Runs of each bisection trial near the throttle boundary · default `2` |
 | `--headroom-ratio <RATIO>` | In-flight headroom kept below the throttling ceiling (default 0.15) |
+| `--risk <RATIO>` | Posterior chance of exceeding the throttle budget the recommendation may carry (default 0.05): measured-clean configurations beyond the fixed headroom are accepted when the surrogate is this sure |
 | `--budget <DURATION>` | Total wall-time budget of the tuner, e.g. 5m: caps the trials so the estimate fits (add --max-duration for a hard stop) |
 | `--emit-profile <FILE>` | Write the tuned profile (TOML) |
 | `--emit-rust <FILE>` | Write a Rust/OpenDAL snippet with the tuned settings |
@@ -300,19 +321,20 @@ Output formats (`-o`): text, json, ndjson, md, html
 | `<A>` | Baseline: RUNREF (id, prefix, last~N, label) or a .oprobe / report .json file |
 | `<B>` | Candidate: RUNREF or file (default: `last`) |
 | `--baseline <NAME>` | Compare against a named baseline instead of A |
-| `--max-p99-increase <MAX_P99_INCREASE>` | Max p99 increase per operation (%) · default `20` |
-| `--max-p50-increase <MAX_P50_INCREASE>` | Max p50 increase per operation (%) · default `20` |
-| `--min-latency-delta-ms <MIN_LATENCY_DELTA_MS>` | Ignore latency changes smaller than this (ms) · default `1` |
-| `--max-throughput-drop <MAX_THROUGHPUT_DROP>` | Max throughput drop (%) · default `10` |
-| `--max-error-increase <MAX_ERROR_INCREASE>` | Max increase of failed operations (percentage points) · default `0.5` |
-| `--max-request-amp-increase <MAX_REQUEST_AMP_INCREASE>` | Max increase of requests per operation (%) · default `10` |
-| `--max-read-amp-increase <MAX_READ_AMP_INCREASE>` | Max increase of read amplification (%) · default `10` |
-| `--max-cost-increase <MAX_COST_INCREASE>` | Max increase of cost per operation (%) · default `10` |
-| `--min-samples <MIN_SAMPLES>` | Minimum samples per operation for latency checks · default `30` |
+| `--max-p99-increase-pct <PCT>` | Max p99 increase per operation (%) · default `20` |
+| `--max-p50-increase-pct <PCT>` | Max p50 increase per operation (%) · default `20` |
+| `--min-latency-delta-ms <MS>` | Ignore latency changes smaller than this (ms) · default `1` |
+| `--max-throughput-drop-pct <PCT>` | Max throughput drop (%) · default `10` |
+| `--max-error-increase-pp <PP>` | Max increase of failed operations (percentage points) · default `0.5` |
+| `--max-request-amp-increase-pct <PCT>` | Max increase of requests per operation (%) · default `10` |
+| `--max-read-amp-increase-pct <PCT>` | Max increase of read amplification (%) · default `10` |
+| `--max-cost-increase-pct <PCT>` | Max increase of cost per operation (%) · default `10` |
+| `--min-samples <N>` | Minimum samples per operation for latency checks · default `30` |
 | `--allow-throttling` | Do not fail when the candidate starts getting throttled |
 | `--allow-workload-change` | Do not fail when the workload differs (preset, mix, dataset, access, rate) |
 | `--allow-target-change` | Do not fail when the target differs (scheme, bucket/prefix, endpoint, options) |
 | `--strict` | Runs of different targets or workloads are an error (exit 2) instead of a warning |
+| `--fail-on-warn` | A significant regression within the limits (`warn`) fails the gate too (exit 3) |
 | `--markdown <FILE>` | Write a Markdown summary (PR comment / job summary) |
 | `--junit <FILE>` | Write JUnit XML |
 | `--json <FILE>` | Write the comparison as JSON |
@@ -383,11 +405,16 @@ Output formats (`-o`): text, json, ndjson, md
 | `--rate <RATE>` | Open-loop arrival rate (ops/s); latency is measured from the intended start time |
 | `--existing <PREFIX>` | Benchmark existing objects under this prefix (read-only) |
 | `--objects <OBJECTS>` | Number of dataset objects to generate |
-| `--object-size <OBJECT_SIZE>` | Size of each generated object (e.g. 16MiB) |
+| `--object-size <OBJECT_SIZE>` | Size of each generated object (e.g. 16MiB), or a distribution: dist:lognormal(MEDIAN,SIGMA), file:PATH (one size per line) |
 | `--access <ACCESS>` | Key popularity: uniform, zipf:1.1, hotset:0.2/0.8 |
 | `--persist-dataset` | Keep the generated dataset for later runs (oprobe-dataset/<fingerprint>/) |
 | `--no-verify` | Skip CRC32C verification |
 | `--keep-data` | Do not delete test data when the run ends |
+| `--arrivals <PROCESS>` | Open-loop arrival process: constant (evenly spaced) or poisson |
+| `--shape <SHAPE>` | Time-varying open-loop rate: ramp:FROM..TO/D, step:R1,R2,…/D, diurnal[:MIN..MAX/PERIOD] |
+| `--replay <FILE>` | Replay a traffic log: S3 server access log, CloudTrail S3 data events, oprobe run file |
+| `--speed <N>` | Replay speed factor (2 = twice as fast as recorded) |
+| `--map-prefix <FROM=TO>` | Rewrite replayed keys: FROM=TO prefix pair, repeatable |
 
 *Client knobs*
 
@@ -422,8 +449,8 @@ Output formats (`-o`): text, json, ndjson, md
 | argument | description |
 |---|---|
 | `--sla <MODE>` | `none` reports the SLA verdict without failing the command · one of `enforce`, `none` |
-| `--max-error-rate <RATE>` | Max share of failed operations, e.g. 1% or 0.01 (default 1%) |
-| `--max-throttle-rate <RATE>` | Max share of throttled (429/503) operations, e.g. 0% (default: not checked by `run`; `tune` rejects any throttling) |
+| `--max-error-ratio <RATIO>` | Max share of failed operations, e.g. 1% or 0.01 (default 1%) |
+| `--max-throttle-ratio <RATIO>` | Max share of throttled (429/503) requests, e.g. 0% or 0.001: an SLA of `run` (default: not checked) and the throttle budget of `tune` and `fix` (default 0.1%) |
 | `--p99-ms <MS>` | Max p99 latency per operation in ms (tune rejects trials above it) |
 
 *Output*
@@ -458,9 +485,9 @@ Output formats (`-o`): text, json, ndjson, md
 | `--max-trials <MAX_TRIALS>` | Maximum number of trials · default `24` |
 | `--max-concurrency <MAX_CONCURRENCY>` | Highest concurrency to try · default `256` |
 | `--cooldown <COOLDOWN>` | Pause after a throttled trial · default `5s` |
-| `--max-throttle-ratio <RATIO>` | Share of throttled requests a configuration may cause and still be feasible (default 0.001, or the profile's `sla.max_throttle_rate`) |
 | `--boundary-repeats <BOUNDARY_REPEATS>` | Runs of each bisection trial near the throttle boundary · default `2` |
 | `--headroom-ratio <RATIO>` | In-flight headroom kept below the throttling ceiling (default 0.15) |
+| `--risk <RATIO>` | Posterior chance of exceeding the throttle budget the recommendation may carry (default 0.05): measured-clean configurations beyond the fixed headroom are accepted when the surrogate is this sure |
 | `--budget <DURATION>` | Total wall-time budget of the tuning step, e.g. 5m (caps the trials so the estimate fits) |
 
 *Verification*
@@ -814,11 +841,16 @@ Output formats (`-o`): text, json, ndjson
 | `--rate <RATE>` | Open-loop arrival rate (ops/s); latency is measured from the intended start time |
 | `--existing <PREFIX>` | Benchmark existing objects under this prefix (read-only) |
 | `--objects <OBJECTS>` | Number of dataset objects to generate |
-| `--object-size <OBJECT_SIZE>` | Size of each generated object (e.g. 16MiB) |
+| `--object-size <OBJECT_SIZE>` | Size of each generated object (e.g. 16MiB), or a distribution: dist:lognormal(MEDIAN,SIGMA), file:PATH (one size per line) |
 | `--access <ACCESS>` | Key popularity: uniform, zipf:1.1, hotset:0.2/0.8 |
 | `--persist-dataset` | Keep the generated dataset for later runs (oprobe-dataset/<fingerprint>/) |
 | `--no-verify` | Skip CRC32C verification |
 | `--keep-data` | Do not delete test data when the run ends |
+| `--arrivals <PROCESS>` | Open-loop arrival process: constant (evenly spaced) or poisson |
+| `--shape <SHAPE>` | Time-varying open-loop rate: ramp:FROM..TO/D, step:R1,R2,…/D, diurnal[:MIN..MAX/PERIOD] |
+| `--replay <FILE>` | Replay a traffic log: S3 server access log, CloudTrail S3 data events, oprobe run file |
+| `--speed <N>` | Replay speed factor (2 = twice as fast as recorded) |
+| `--map-prefix <FROM=TO>` | Rewrite replayed keys: FROM=TO prefix pair, repeatable |
 
 *Client knobs*
 
@@ -906,11 +938,16 @@ Output formats (`-o`): text, json, ndjson, md
 | `--rate <RATE>` | Open-loop arrival rate (ops/s); latency is measured from the intended start time |
 | `--existing <PREFIX>` | Benchmark existing objects under this prefix (read-only) |
 | `--objects <OBJECTS>` | Number of dataset objects to generate |
-| `--object-size <OBJECT_SIZE>` | Size of each generated object (e.g. 16MiB) |
+| `--object-size <OBJECT_SIZE>` | Size of each generated object (e.g. 16MiB), or a distribution: dist:lognormal(MEDIAN,SIGMA), file:PATH (one size per line) |
 | `--access <ACCESS>` | Key popularity: uniform, zipf:1.1, hotset:0.2/0.8 |
 | `--persist-dataset` | Keep the generated dataset for later runs (oprobe-dataset/<fingerprint>/) |
 | `--no-verify` | Skip CRC32C verification |
 | `--keep-data` | Do not delete test data when the run ends |
+| `--arrivals <PROCESS>` | Open-loop arrival process: constant (evenly spaced) or poisson |
+| `--shape <SHAPE>` | Time-varying open-loop rate: ramp:FROM..TO/D, step:R1,R2,…/D, diurnal[:MIN..MAX/PERIOD] |
+| `--replay <FILE>` | Replay a traffic log: S3 server access log, CloudTrail S3 data events, oprobe run file |
+| `--speed <N>` | Replay speed factor (2 = twice as fast as recorded) |
+| `--map-prefix <FROM=TO>` | Rewrite replayed keys: FROM=TO prefix pair, repeatable |
 
 *Client knobs*
 
@@ -945,8 +982,8 @@ Output formats (`-o`): text, json, ndjson, md
 | argument | description |
 |---|---|
 | `--sla <MODE>` | `none` reports the SLA verdict without failing the command · one of `enforce`, `none` |
-| `--max-error-rate <RATE>` | Max share of failed operations, e.g. 1% or 0.01 (default 1%) |
-| `--max-throttle-rate <RATE>` | Max share of throttled (429/503) operations, e.g. 0% (default: not checked by `run`; `tune` rejects any throttling) |
+| `--max-error-ratio <RATIO>` | Max share of failed operations, e.g. 1% or 0.01 (default 1%) |
+| `--max-throttle-ratio <RATIO>` | Max share of throttled (429/503) requests, e.g. 0% or 0.001: an SLA of `run` (default: not checked) and the throttle budget of `tune` and `fix` (default 0.1%) |
 | `--p99-ms <MS>` | Max p99 latency per operation in ms (tune rejects trials above it) |
 
 *Safety*
@@ -1005,7 +1042,7 @@ Output formats (`-o`): text, json, ndjson
 | `--max-bytes <SIZE>` | Stop after transferring this many bytes, e.g. 10GiB (exit 4) |
 | `--max-duration <DURATION>` | Stop after this much wall time, e.g. 5m (exit 4) |
 | `--idempotency-key <KEY>` | Name the run prefix after KEY: a retried command reuses and cleans it up |
-| `--min-score <PCT>` | Exit 3 when the score (percent of the checks that ran) is below this |
+| `--min-score-pct <PCT>` | Exit 3 when the score (percent of the checks that ran) is below this |
 
 ## `oprobe baseline`
 
@@ -1106,11 +1143,16 @@ Output formats (`-o`): text, json, ndjson
 | `--rate <RATE>` | Open-loop arrival rate (ops/s); latency is measured from the intended start time |
 | `--existing <PREFIX>` | Benchmark existing objects under this prefix (read-only) |
 | `--objects <OBJECTS>` | Number of dataset objects to generate |
-| `--object-size <OBJECT_SIZE>` | Size of each generated object (e.g. 16MiB) |
+| `--object-size <OBJECT_SIZE>` | Size of each generated object (e.g. 16MiB), or a distribution: dist:lognormal(MEDIAN,SIGMA), file:PATH (one size per line) |
 | `--access <ACCESS>` | Key popularity: uniform, zipf:1.1, hotset:0.2/0.8 |
 | `--persist-dataset` | Keep the generated dataset for later runs (oprobe-dataset/<fingerprint>/) |
 | `--no-verify` | Skip CRC32C verification |
 | `--keep-data` | Do not delete test data when the run ends |
+| `--arrivals <PROCESS>` | Open-loop arrival process: constant (evenly spaced) or poisson |
+| `--shape <SHAPE>` | Time-varying open-loop rate: ramp:FROM..TO/D, step:R1,R2,…/D, diurnal[:MIN..MAX/PERIOD] |
+| `--replay <FILE>` | Replay a traffic log: S3 server access log, CloudTrail S3 data events, oprobe run file |
+| `--speed <N>` | Replay speed factor (2 = twice as fast as recorded) |
+| `--map-prefix <FROM=TO>` | Rewrite replayed keys: FROM=TO prefix pair, repeatable |
 
 *Client knobs*
 
@@ -1161,7 +1203,7 @@ Output formats (`-o`): text, json, ndjson
 | argument | description |
 |---|---|
 | `--bind <BIND>` | · default `127.0.0.1:9000` |
-| `--scenario <SCENARIO>` | Start from a fault preset: clean, demo, throttle, stragglers, lossy, flaky, parquet (the flags below override it) |
+| `--scenario <SCENARIO>` | Start from a fault preset: clean, demo, throttle, stragglers, lossy, flaky, parquet, ratelimit, hotkey, bandwidth, queueing, timevarying, noisy (the flags below override it) |
 | `--error-every <ERROR_EVERY>` | Answer every Nth request with 500 InternalError |
 | `--reset-every <RESET_EVERY>` | Drop the connection on every Nth request |
 | `--tls` | Serve HTTPS (certificate for localhost / 127.0.0.1) |
@@ -1176,6 +1218,28 @@ Output formats (`-o`): text, json, ndjson
 | `--throttle-early-close` | Answer throttled requests without reading the upload and close the connection (as real gateways do), so clients see resets mid-upload |
 | `--complete-delay <COMPLETE_DELAY>` | Delay for CompleteMultipartUpload · default `0ms` |
 | `--write-ca <FILE>` | Write the lab CA certificate (for --ca-cert) to this file |
+| `--allow-remote` | Accept a non-loopback --bind address (the lab has no authentication: anyone who can reach it can read and write its objects) |
+| `--max-object-size <SIZE>` | Largest object body accepted (PUT or multipart part), e.g. 1GiB |
+| `--max-store-size <SIZE>` | Largest in-memory store (objects plus staged parts), e.g. 8GiB |
+| `--max-connections <N>` | Most open connections (more are closed at once) |
+
+## `oprobe worker`
+
+Serve load for distributed runs (`oprobe run --workers`)
+
+```text
+oprobe worker [OPTIONS] --listen <ADDR> --token-file <FILE>
+```
+
+Output formats (`-o`): text, json, ndjson
+
+| argument | description |
+|---|---|
+| `--listen <ADDR>` | Address to listen on (host:port; port 0 picks a free one) |
+| `--token-file <FILE>` | File holding the shared secret every coordinator request must carry |
+| `--tls-cert <FILE>` | Serve TLS with this PEM certificate (needs --tls-key) |
+| `--tls-key <FILE>` | PEM private key of --tls-cert |
+| `--allow-exec` | Let coordinators run `--client exec:COMMAND` on this machine |
 
 ## `oprobe mcp`
 
@@ -1190,7 +1254,7 @@ Output formats (`-o`): text, json, ndjson
 | argument | description |
 |---|---|
 | `--http <ADDR>` | Serve MCP over Streamable HTTP on this address (e.g. 127.0.0.1:8765) instead of stdio |
-| `--http-allow-remote` | Allow --http on a non-loopback address (anyone who can reach it can use the tools and the configured credentials; there is no authentication) |
+| `--http-allow-remote` | Allow --http on a non-loopback address (needs --tls-cert/--tls-key or --insecure-remote; anyone with the token can use the tools and the configured credentials) |
 | `--allow-write` | Enable tools that write test data (runs that upload a dataset, tune, cleanup) |
 | `--allow-target <NAME\|URL-PREFIX>` | Only these targets: a configured target name or a URL prefix (repeatable) |
 | `--max-cost-usd <USD>` | Budget applied to every run the server starts: estimated request cost (USD) |
@@ -1198,6 +1262,12 @@ Output formats (`-o`): text, json, ndjson
 | `--max-bytes <SIZE>` | Budget applied to every run: bytes transferred (e.g. 1GiB) |
 | `--max-duration <DURATION>` | Budget applied to every run: wall time (e.g. 2m) |
 | `--max-concurrent-runs <MAX_CONCURRENT_RUNS>` | Runs executing at the same time (others wait) · default `1` |
+| `--token-file <FILE>` | Bearer token of --http, read from this file (default: a new token written to <data>/mcp-token, mode 0600, at every start) |
+| `--tls-cert <FILE>` | Serve --http over HTTPS with this PEM certificate chain |
+| `--tls-key <FILE>` | The PEM private key of --tls-cert |
+| `--insecure-remote` | Accept --http-allow-remote without TLS (the token then crosses the network in clear) |
+| `--max-connections <N>` | Most open --http connections (more are closed at once) · default `64` |
+| `--allow-private-endpoints` | Let probe_endpoint and endpoint overrides reach loopback, private and link-local addresses (cloud metadata services answer on link-local ones) |
 
 ## `oprobe schema`
 
@@ -1305,6 +1375,7 @@ Output formats (`-o`): text, json, ndjson
 | `--check` | Only check whether a newer release exists (exit 0 either way) |
 | `--to <TAG>` | Install this release tag instead of the latest (e.g. v3.0.1) |
 | `--force` | Reinstall even when already on that version |
+| `--verify <VERIFY>` | After the SHA-256 check: verify the build provenance (gh) or the minisign signature when possible (auto), insist on one of them (require), or skip both (checksum) · one of `auto`, `require`, `checksum` · default `auto` · env `OPROBE_VERIFY` |
 
 ## `oprobe top`
 
@@ -1360,7 +1431,7 @@ Output formats (`-o`): text
 
 ## `oprobe completions`
 
-Generate shell completions
+Generate shell completions (dynamic: target names and run ids complete live)
 
 ```text
 oprobe completions [OPTIONS] <SHELL>
@@ -1371,6 +1442,7 @@ Output formats (`-o`): text
 | argument | description |
 |---|---|
 | `<SHELL>` | · one of `bash`, `elvish`, `fish`, `powershell`, `zsh` |
+| `--static` | Print a static script (no target or run completion; for shells that cannot call back into oprobe) |
 
 ## `oprobe man`
 

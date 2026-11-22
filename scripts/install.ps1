@@ -8,6 +8,14 @@
 #   OPROBE_MODIFY_PATH=0       do not touch the user PATH (default: add the directory)
 #   OPROBE_RELEASE_BASE=URL    release download base (mirrors, tests)
 #   OPROBE_API=URL             GitHub API base (default https://api.github.com)
+#   OPROBE_VERIFY=auto|require|checksum
+#                              signature policy after the SHA-256 check (default auto; see install.sh)
+#   OPROBE_MINISIGN_PUBKEY=KEY minisign public key (overrides the embedded one)
+#
+# Verification (design v5 §5), after the SHA-256 check: the GitHub build provenance
+# (`gh attestation verify`, when gh is installed and logged in), otherwise a minisign signature
+# over SHA256SUMS (when minisign.exe is installed and the release is signed), otherwise a warning
+# (an error with OPROBE_VERIFY=require). A verification that fails is always an error.
 #
 # The latest version is resolved without the GitHub API when possible, falling back on any failure:
 #   1. <base>/latest/download/latest.json   2. the <base>/latest redirect   3. the GitHub API
@@ -19,6 +27,11 @@ $ProgressPreference = 'SilentlyContinue'
 $repo = 'hxddh/oprobe'
 $base = if ($env:OPROBE_RELEASE_BASE) { $env:OPROBE_RELEASE_BASE.TrimEnd('/') } else { "https://github.com/$repo/releases" }
 $api = if ($env:OPROBE_API) { $env:OPROBE_API.TrimEnd('/') } else { 'https://api.github.com' }
+$verify = if ($env:OPROBE_VERIFY) { $env:OPROBE_VERIFY } else { 'auto' }
+if (@('auto', 'require', 'checksum') -notcontains $verify) { throw 'oprobe-install: OPROBE_VERIFY must be auto, require or checksum' }
+# The release's minisign public key; the release workflow fills it in (docs/releasing.md#signing).
+$embeddedPubkey = ''
+$pubkey = if ($env:OPROBE_MINISIGN_PUBKEY) { $env:OPROBE_MINISIGN_PUBKEY } else { $embeddedPubkey }
 
 # The OS architecture, not this process's: an x64 PowerShell under emulation on ARM64 reports
 # PROCESSOR_ARCHITECTURE=AMD64, and a 32-bit one on x64 reports x86.
@@ -91,6 +104,29 @@ try {
   $expected = $line.Line.Split(' ')[0].ToLowerInvariant()
   $actual = (Get-FileHash "$tmp\$name.zip" -Algorithm SHA256).Hash.ToLowerInvariant()
   if ($expected -ne $actual) { throw "oprobe-install: checksum mismatch for $name.zip" }
+  if ($verify -ne 'checksum') {
+    $verified = $null
+    $gh = Get-Command gh -ErrorAction SilentlyContinue
+    $minisign = Get-Command minisign -ErrorAction SilentlyContinue
+    $ghReady = $false
+    if ($gh) { & $gh.Source auth status *> $null; $ghReady = ($LASTEXITCODE -eq 0); $global:LASTEXITCODE = 0 }
+    if ($ghReady) {
+      & $gh.Source attestation verify "$tmp\$name.zip" --repo $repo --signer-workflow "$repo/.github/workflows/release.yml"
+      if ($LASTEXITCODE -ne 0) { throw "oprobe-install: the build provenance of $name.zip does not verify; nothing was installed" }
+      $verified = 'GitHub build provenance (gh attestation verify)'
+    } elseif ($pubkey -and $minisign) {
+      $sig = $null
+      try { Invoke-WebRequest -UseBasicParsing "$url/SHA256SUMS.minisig" -OutFile "$tmp\SHA256SUMS.minisig"; $sig = "$tmp\SHA256SUMS.minisig" } catch { }
+      if ($sig) {
+        & $minisign.Source -Vq -P $pubkey -m "$tmp\SHA256SUMS" -x $sig *> $null
+        if ($LASTEXITCODE -ne 0) { throw 'oprobe-install: the minisign signature of SHA256SUMS does not verify; nothing was installed' }
+        $verified = 'minisign signature over SHA256SUMS'
+      }
+    }
+    if ($verified) { Write-Host "Verified: $verified" }
+    elseif ($verify -eq 'require') { throw "oprobe-install: cannot verify the provenance or signature of $name.zip (install gh and run gh auth login), or set OPROBE_VERIFY=auto" }
+    else { Write-Warning 'only the SHA-256 checksum was verified; install gh and run `gh auth login` to check the build provenance too' }
+  }
   Expand-Archive "$tmp\$name.zip" -DestinationPath $tmp -Force
   $dest = if ($env:OPROBE_INSTALL_DIR) { $env:OPROBE_INSTALL_DIR } else { Join-Path $env:LOCALAPPDATA 'Programs\oprobe' }
   New-Item -ItemType Directory -Force -Path $dest | Out-Null

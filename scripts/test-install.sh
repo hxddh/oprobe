@@ -76,12 +76,13 @@ done
 base="http://127.0.0.1:$port/releases"
 
 # install CASE EXPECTED_VERSION [ENV=VALUE...]: a fresh HOME, no terminal (stdin from /dev/null).
+# The fake archives carry no provenance: these cases check the checksum only (OPROBE_VERIFY).
 install_case() {
   case_name="$1"; want="$2"; shift 2
   home="$work/home-$case_name"
   mkdir -p "$home"
   env -u XDG_CONFIG_HOME HOME="$home" SHELL=/bin/bash OPROBE_RELEASE_BASE="$base" OPROBE_API="http://127.0.0.1:$port/api" \
-    "$@" sh "$installer" </dev/null > "$work/out-$case_name" 2>&1 ||
+    OPROBE_VERIFY=checksum "$@" sh "$installer" </dev/null > "$work/out-$case_name" 2>&1 ||
     { cat "$work/out-$case_name"; fail "$case_name: install.sh failed"; }
   got=$("$home/.local/bin/oprobe")
   [ "$got" = "oprobe $want" ] || { cat "$work/out-$case_name"; fail "$case_name: installed '$got', want $want"; }
@@ -113,4 +114,23 @@ if env HOME="$work/home-bad" OPROBE_RELEASE_BASE="$base" OPROBE_VERSION=9.0.0 OP
   fail "a checksum mismatch was installed"
 fi
 echo "ok: checksum mismatch refused"
+
+# Signature policy: without gh credentials or minisign nothing but the checksum verifies, so
+# OPROBE_VERIFY=require refuses, auto warns, and an unknown policy is an error.
+nogh() { h="$1"; shift; env -u GH_TOKEN -u GITHUB_TOKEN HOME="$h" XDG_CONFIG_HOME="$h/.config" GH_CONFIG_DIR="$h/.gh" \
+  OPROBE_RELEASE_BASE="$base" OPROBE_VERSION=9.1.0 OPROBE_MODIFY_PATH=0 OPROBE_MINISIGN_PUBKEY= "$@"; }
+mkdir -p "$work/home-req" "$work/home-auto" "$work/home-bogus"
+if nogh "$work/home-req" OPROBE_VERIFY=require sh "$installer" </dev/null >"$work/out-req" 2>&1; then
+  cat "$work/out-req"; fail "OPROBE_VERIFY=require installed an unverified download"
+fi
+grep -q "cannot verify" "$work/out-req" || { cat "$work/out-req"; fail "require: no reason given"; }
+echo "ok: OPROBE_VERIFY=require refuses an unverifiable download"
+nogh "$work/home-auto" sh "$installer" </dev/null >"$work/out-auto" 2>&1 ||
+  { cat "$work/out-auto"; fail "OPROBE_VERIFY=auto failed"; }
+grep -q "only the SHA-256 checksum was verified" "$work/out-auto" || { cat "$work/out-auto"; fail "auto: no warning"; }
+echo "ok: OPROBE_VERIFY=auto warns"
+if nogh "$work/home-bogus" OPROBE_VERIFY=maybe sh "$installer" </dev/null >/dev/null 2>&1; then
+  fail "an unknown OPROBE_VERIFY was accepted"
+fi
+echo "ok: unknown OPROBE_VERIFY refused"
 echo "install.sh: all cases passed"

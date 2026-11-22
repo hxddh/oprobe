@@ -113,7 +113,7 @@
       "type": "object"
     }
   },
-  "$id": "https://github.com/hxddh/oprobe/schemas/4/verification.json",
+  "$id": "https://github.com/hxddh/oprobe/schemas/5/verification.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "How to test a finding's advice: overrides, commands and expectations",
   "properties": {

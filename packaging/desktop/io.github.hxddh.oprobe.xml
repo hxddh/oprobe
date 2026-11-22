@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- shared-mime-info: `.oprobe` run files (install to ~/.local/share/mime/packages/ or
+     /usr/share/mime/packages/, then `update-mime-database`). -->
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="application/x-oprobe-run">
+    <comment>oprobe run</comment>
+    <glob pattern="*.oprobe"/>
+    <icon name="io.github.hxddh.oprobe"/>
+  </mime-type>
+</mime-info>

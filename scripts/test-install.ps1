@@ -41,6 +41,8 @@ try {
   $dest = Join-Path $work 'install-a'
   $env:OPROBE_RELEASE_BASE = $base
   $env:OPROBE_API = "http://127.0.0.1:$port/api"
+  # The fake archives carry no provenance: check the checksum only, then the policy below.
+  $env:OPROBE_VERIFY = 'checksum'
   $env:OPROBE_INSTALL_DIR = $dest
   Remove-Item Env:OPROBE_VERSION -ErrorAction SilentlyContinue
   Remove-Item Env:OPROBE_MODIFY_PATH -ErrorAction SilentlyContinue
@@ -70,7 +72,22 @@ try {
   try { & $installer } catch { $refused = $true }
   if (-not $refused) { throw 'a checksum mismatch was installed' }
   Write-Host 'ok: checksum mismatch refused'
+
+  # OPROBE_VERIFY=require refuses a download nothing can verify (no gh login, no minisign key).
+  $env:OPROBE_VERSION = 'v9.1.0'
+  $env:OPROBE_VERIFY = 'require'
+  $env:OPROBE_MINISIGN_PUBKEY = ''
+  $env:GH_TOKEN = ''
+  $env:GITHUB_TOKEN = ''
+  $env:GH_CONFIG_DIR = Join-Path $work 'gh-none'
+  $env:OPROBE_INSTALL_DIR = Join-Path $work 'install-d'
+  $refused = $false
+  try { & $installer } catch { $refused = $true }
+  if (-not $refused) { throw 'OPROBE_VERIFY=require installed an unverified download' }
+  Write-Host 'ok: OPROBE_VERIFY=require refuses an unverifiable download'
   Write-Host 'install.ps1: all cases passed'
+  # The refused case leaves gh's non-zero exit code behind; the runner would exit with it.
+  $global:LASTEXITCODE = 0
 } finally {
   [Environment]::SetEnvironmentVariable('Path', $savedUserPath, 'User')
   if ($server) { Stop-Process -Id $server.Id -Force -ErrorAction SilentlyContinue }

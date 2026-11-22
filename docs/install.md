@@ -15,8 +15,8 @@ Then try it with no account: `oprobe demo` ([getting started](getting-started.md
 
 ### The install scripts
 
-`install.sh` and `install.ps1` download the archive for your platform, verify it against `SHA256SUMS` and
-install `oprobe` (Linux and macOS: `~/.local/bin`; Windows: `%LOCALAPPDATA%\Programs\oprobe`). Update later
+`install.sh` and `install.ps1` download the archive for your platform, verify it against `SHA256SUMS`, check
+its build provenance or signature ([verifying](#verifying-a-download)) and install `oprobe` (Linux and macOS: `~/.local/bin`; Windows: `%LOCALAPPDATA%\Programs\oprobe`). Update later
 with `oprobe self-update`.
 
 They find the latest version without the rate-limited GitHub API when they can, trying in order and falling
@@ -24,10 +24,12 @@ back on any failure: the release's `latest.json`, the `releases/latest` redirect
 
 | Variable | Effect |
 |---|---|
-| `OPROBE_VERSION=4.0.0` | install this version instead of the latest |
+| `OPROBE_VERSION=5.0.0` | install this version instead of the latest |
 | `OPROBE_INSTALL_DIR=DIR` | install somewhere else |
 | `OPROBE_MODIFY_PATH=1` / `0` | add the directory to `PATH` without asking / never touch `PATH` |
 | `OPROBE_RELEASE_BASE=URL` | release download base (mirrors, tests; default `https://github.com/hxddh/oprobe/releases`) |
+| `OPROBE_VERIFY=auto` / `require` / `checksum` | after the checksum: verify the provenance or signature when this machine can (default), insist on it, or skip it |
+| `OPROBE_MINISIGN_PUBKEY=KEY` | the minisign public key to verify `SHA256SUMS.minisig` with (overrides the embedded one) |
 
 **PATH.** When the install directory is not on `PATH`, `install.sh` offers to append it to your shell's rc
 file: `~/.zshrc` (zsh), `~/.bashrc` (bash; `~/.bash_profile` on macOS), `~/.config/fish/config.fish` (fish),
@@ -104,43 +106,61 @@ sudo dnf install ./oprobe-<ver>-1.x86_64.rpm
 ```bash
 cargo install oprobe --locked
 cargo install oprobe --locked --features gui
-cargo install --locked --git https://github.com/hxddh/oprobe --tag v4.0.0 oprobe
+cargo install --locked --git https://github.com/hxddh/oprobe --tag v5.0.0 oprobe
 ```
 
 ## Updating
 
 `oprobe self-update` finds the release (the release's `latest.json` first, then the GitHub API), downloads
-the archive for this platform, verifies its SHA-256 (from `latest.json`, or the release's `SHA256SUMS`),
-checks that the new binary starts, and replaces the running one in place (`oprobe self-update --check` only
-reports; `--to v4.0.1` picks a release; `-o json` for scripts). A GitHub refusal (403, rate limit) is a
+the archive for this platform, verifies its SHA-256 (from `latest.json`, or the release's `SHA256SUMS`), then
+its build provenance or signature like the install scripts (`--verify auto|require|checksum`, or
+`OPROBE_VERIFY`; the result's `verified_by` says which check passed), checks that the new binary starts, and
+replaces the running one in place (`oprobe self-update --check` only reports; `--to v5.0.1` picks a release;
+`-o json` for scripts). A GitHub refusal (403, rate limit) is a
 network error (`net.unreachable`, retryable): set `GITHUB_TOKEN` or retry later. When
 oprobe was installed by a package manager (Homebrew, apt/dnf, the `.pkg` or `.app`, Scoop, winget, the MSI,
 cargo), it refuses and prints that manager's update command instead.
 
-`SHA256SUMS` comes from the same GitHub release as the archive, so the check proves the download is
-intact, not who built it: oprobe releases are not code-signed (no signing certificates), and the
-checksums are as trustworthy as the GitHub release itself. `OPROBE_RELEASE_BASE` replaces the release
+`SHA256SUMS` comes from the same GitHub release as the archive, so the checksum alone proves the download
+is intact, not who built it; the provenance attestation and the minisign signature below prove that. `OPROBE_RELEASE_BASE` replaces the release
 download base (default `https://github.com/hxddh/oprobe/releases`) and `OPROBE_UPDATE_API` the GitHub API base
 (default `https://api.github.com`; set alone, `latest.json` is not fetched from github.com). They exist for
 internal mirrors and tests — point them only at a server you trust, since they decide which binary is
 installed.
 
-## Verifying downloads
+## Verifying a download
 
-The checksums detect corrupted or truncated downloads; they are not a signature (see above).
+Three checks, from weakest to strongest. The install scripts and `oprobe self-update` run them
+automatically (design v5 §5): always the checksum, then the provenance when the GitHub CLI is installed and
+logged in, otherwise the minisign signature when `minisign` (or, for self-update, the embedded verifier) and
+the release's signature are available. A check that runs and fails always stops the install; a check that
+cannot run is a warning, or an error with `OPROBE_VERIFY=require` / `--verify require`.
+
+**Checksum.** Detects corrupted or truncated downloads; `SHA256SUMS` comes from the same release.
 
 ```bash
 sha256sum --ignore-missing -c SHA256SUMS                    # Linux
 shasum -a 256 --ignore-missing -c SHA256SUMS                # macOS
-Get-FileHash oprobe-4.0.0-x64.msi -Algorithm SHA256          # Windows
+Get-FileHash oprobe-5.0.0-x64.msi -Algorithm SHA256          # Windows
 ```
 
-Every asset also has a [SLSA build provenance](https://slsa.dev/) attestation signed by GitHub Actions, which
-proves it was built by this repository's release workflow from a given commit:
+**Build provenance.** Every asset has a [SLSA build provenance](https://slsa.dev/) attestation signed by
+GitHub Actions, which proves it was built by this repository's release workflow from a given commit:
 
 ```bash
-gh attestation verify oprobe-4.0.0-x86_64-unknown-linux-musl.tar.gz --repo hxddh/oprobe
+gh attestation verify oprobe-5.0.0-x86_64-unknown-linux-musl.tar.gz --repo hxddh/oprobe \
+  --signer-workflow hxddh/oprobe/.github/workflows/release.yml
 ```
+
+**minisign.** When the release is signed, `SHA256SUMS.minisig` is a [minisign](https://jedisct1.github.io/minisign/)
+signature over `SHA256SUMS`, made with a key held only by the release workflow. The public key is embedded in
+`install.sh`, `install.ps1` and the `oprobe` binary of the release (and printed in the release notes):
+
+```bash
+minisign -Vm SHA256SUMS -P <public key>     # then check the archive against SHA256SUMS as above
+```
+
+These signatures say who built a file; they are not operating-system code signing (below).
 
 ## First open of unsigned packages
 
@@ -155,7 +175,7 @@ signed or notarized**. The operating system asks for one confirmation the first 
 - **Windows**: SmartScreen says "Windows protected your PC": click **More info** → **Run anyway**.
 
 Homebrew, Scoop, winget, the install scripts, `cargo install` and the plain archives used from a terminal are
-not affected. Verify the download (above) before you confirm.
+not affected. Verify the download ([above](#verifying-a-download)) before you confirm.
 
 ## Shell completions (archives)
 
@@ -167,4 +187,6 @@ cp completions/oprobe.fish ~/.config/fish/completions/                         #
 ```
 
 Packages (deb, rpm, pkg, Homebrew) install completions and man pages themselves. `oprobe completions SHELL`
-and `oprobe man` generate them on any install.
+and `oprobe man` generate them on any install. The scripts are dynamic: they ask `oprobe` for candidates as
+you type, so target names, run ids, labels and finding codes complete (`oprobe` must be on `PATH`);
+`oprobe completions SHELL --static` prints the fixed script of earlier versions.

@@ -1,20 +1,36 @@
 # oprobe 3.0 — shared core APIs (stage A2)
 
-How streams build on the core. The contract is [`v3.md`](v3.md); this page names the Rust
-entry points that implement it.
+How streams build on the core. The contract is [`v3.md`](v3.md) as amended by [`v4.md`](v4.md)
+and [`v5.md`](v5.md); this page names the Rust entry points that implement it, with the 5.0
+module paths.
 
 ## Module map
 
-| Module | What it holds |
+Paths as of 5.0 (design [v5 §1](v5.md#1-workspace-and-crates)): three crates in one workspace.
+`oprobe-core` re-exports `oprobe_trace` as `trace` and `oprobe_trace::net` as `net`, and the
+`oprobe` binary crate re-exports everything of `oprobe-core` at its root, so `crate::model`,
+`crate::trace` etc. resolve the same way in every crate.
+
+| Module (crate) | What it holds |
 |---|---|
-| `model` | `RunId` (`ids.rs`), `ReqRow` / `OpRow` (`trace.rs`), Report v3 types (`report.rs`), `Run` (report + rows), the builder (`build.rs`: `build_run`, `build_report`, `ReportInput`, `workload_info`). |
-| `trace::log` | `TraceLog` (reservoir-sampled rows, cap `DEFAULT_MAX_REQUESTS` = 1 000 000), `TraceRows`, row constructors `req_row` / `op_row` / `attempts`. The recorder feeds it from `Recorder::complete_op`. |
-| `store` | `Paths` (`OPROBE_CONFIG`, `OPROBE_DATA_DIR`, `dirs`), `ConfigFile` (`[defaults]`, `[targets.NAME]`, `effective()` with sources), `RunStore` (save / list / resolve / load / delete / gc), `Baselines`, `atomic_write`, `write_run_file` / `read_run_file`, `resolve_run`. |
-| `events` | `Event` / `EventKind` (`oprobe.events/1`), `EventBus` (in-process broadcast), `EventBus::progress_fn` (engine progress → events), `NdjsonWriter`. |
-| `errors` | `ErrorCode` (stable dotted codes, `exit_code()`, `retryable()`), `ErrorBody`, `OprobeError`, `fail!`, `Classify::code`, `classify(&anyhow::Error, scheme)`, `exit::*`. |
-| `output` | `OutputFormat`, `CommandOutput` (typed result trait), `Output` (per command: `finish`, `error`, `info`, `warn`, `bus`). |
-| `guard` | `Budgets`, `Guard` (live budgets), `BudgetBreach`, `check_read_only`, `plan` / `Plan` (`--dry-run`), `preflight`, `usd_per_request`. |
-| `cli` | The §9 command tree (`args.rs`), `Ctx` (output, paths, lazily loaded config), `resolve_profile` (target names + `[defaults]`), command modules `run`, `runs`, `settings`, `doctor`, `misc`. |
+| `oprobe_trace` (`crates/oprobe-trace/src/lib.rs`) | `layer(Config) -> (TraceLayer, Handle)`, `Handle::snapshot()`, the `Exporter` and `Budget` hooks. |
+| `trace::{recorder, scope, log, sample}` (`crates/oprobe-trace/src/`) | The always-on `Recorder`, op scopes, `TraceLog` (row cap `DEFAULT_MAX_REQUESTS` = 1 000 000), `TraceRows`, the whole-operation sampler `OpSampler`. The recorder feeds them from `Recorder::complete_op`. |
+| `trace::{rows, record, snapshot}` | `ReqRow` / `OpRow` and their constructors, `RequestRecord`, the aggregates (`Summary`, `VerbStats`, `ApiStats`, `ConnStats`, `Quantiles`, …). |
+| `net` (`crates/oprobe-trace/src/net/`) | TLS, proxies, dialing, the fidelity and microscope transports, tcpinfo, the handshake probe. |
+| `errors` (`crates/oprobe-trace/src/error.rs`, re-exported with `classify` by `crates/oprobe-core/src/errors.rs`) | `ErrorCode` (stable dotted codes, `exit_code()`, `retryable()`), `ErrorBody`, `OprobeError`, `fail!`, `Classify::code`, `classify(&anyhow::Error, scheme)`, `exit::*`. |
+| `app` (`crates/oprobe-core/src/app/`) | The service layer every front end calls: `App`, `Ctx`, typed requests (`app::input`, `RunRequest`), one module per command family (`run`, `tune`, `verify`, `fix`, `compare`, `runs`, `settings`, `doctor`, `watch`, …), profile assembly (`profile.rs`: target names + `[defaults]`), next steps (`next.rs`). |
+| `model` (`crates/oprobe-core/src/model/`) | `RunId` (`ids.rs`), Report v5 types (`report.rs`, `sections.rs`), `Run` (report + rows), the run spec (`spec.rs`), the builder (`build.rs`: `build_run`, `build_report`, `ReportInput`, `workload_info`). |
+| `store` (`crates/oprobe-core/src/store/`) | `Paths` (`OPROBE_CONFIG`, `OPROBE_DATA_DIR`, `dirs`), `ConfigFile` (`[defaults]`, `[targets.NAME]`, `effective()` with sources), `RunStore` (save / list / resolve / load / delete / gc), the run file (`runfile.rs`: `oprobe.run/5` segments, `RunFileWriter` / `RunFileReader`), `Baselines`, `atomic_write`, `resolve_run`. |
+| `events` (`crates/oprobe-core/src/events.rs`) | `Event` / `EventKind` (`oprobe.events/1`), `EventBus` (in-process broadcast), `EventBus::progress_fn` (engine progress → events), `NdjsonWriter`. |
+| `output` (`crates/oprobe-core/src/output/`) | `OutputFormat`, `CommandOutput` (typed result trait), `Output` (per command: `finish`, `error`, `info`, `warn`, `bus`; `Output::silent()` for MCP and the UI). |
+| `guard` (`crates/oprobe-core/src/guard.rs`) | `Budgets`, `Guard` (live budgets), `BudgetBreach`, `check_read_only`, `plan` / `Plan` (`--dry-run`), `preflight`, `usd_per_request`. |
+| `engine` (`crates/oprobe-core/src/engine/`) | `Session` (`runner.rs`), `measure::open`, operators, datasets, workloads, cleanup. |
+| `analysis` (`crates/oprobe-core/src/analysis/`) | Findings, capacity and hypotheses, the compare gate (`gate.rs`), cost, hints, outliers, the finding catalog (`catalog.rs`). |
+| `report` (`crates/oprobe-core/src/report/`) | `view.rs` (one presentation model per section), the terminal, brief, Markdown, HTML and compare renderers, `style` (colors, `term_width`, `wrap_text`). |
+| `i18n` (`crates/oprobe-core/src/i18n.rs`) | The message catalog (English, 简体中文): `t`, `tf`, `detect`, `detect_os`, `finding`, `error_code`. Machine output never goes through it. |
+| `export` (`crates/oprobe-core/src/export/`) | CSV, NDJSON, HAR, OTLP (JSON traces and metrics, the protobuf metrics encoder, `WatchMetrics`) and Prometheus (`Registry`). |
+| `cli` (`crates/oprobe/src/cli/`) | The clap tree (`args.rs`), conversions to `app::input` requests (`convert.rs`), presentation (`commands.rs`), help tiers (`help.rs`), dynamic completions (`complete.rs`), `self_update.rs`, dispatch (`mod.rs`). |
+| `mcp`, `ui` (`crates/oprobe/src/`) | The MCP server and the terminal and native workbench; both call `app` in-process. |
 
 ## A command returns typed output
 
@@ -33,8 +49,10 @@ pub async fn cmd_mine(a: MyArgs, ctx: &Ctx) -> anyhow::Result<u8> {
 }
 ```
 
-Wire it in `cli::dispatch` (replace the `pending("…")` arm) and its arguments in
-`cli/args.rs` (replace the `PendingArgs` placeholder). stdout carries only the result; use
+Put the work in an `app` module (`crates/oprobe-core/src/app/`) behind a typed request from
+`app::input` (no clap types in `oprobe-core`), then wire the CLI: the arguments in
+`crates/oprobe/src/cli/args.rs`, the conversion to the request in `cli/convert.rs` and the arm in
+`cli::dispatch`. MCP tools and the UI call the same `App` method. stdout carries only the result; use
 `ctx.out.info/warn` for anything else. `-o html` is a `usage.invalid_argument` error unless a command
 implements `html()`.
 
@@ -84,7 +102,7 @@ rows). `Run::op(id)` / `Run::requests_of(id)` join rows; `report.slowest` holds 
 
 ## Safety rails
 
-`cli::run` shows the order: `guard::check_read_only` (when `--read-only` / `--existing`),
+`app::run` shows the order: `guard::check_read_only` (when `--read-only` / `--existing`),
 `guard::plan` for `--dry-run`, `Guard::with_pricing(budgets, usd_per_request(&profile))`
 passed in `SessionOptions` (the recorder feeds it every operation, the sampler ticks it; a
 breach cancels the run, the command saves the partial run and returns
@@ -102,8 +120,9 @@ breach cancels the run, the command saves the partial run and returns
   `req_row` without changing the row format.
 - `OpRow` adds `error` (detail) and `await_tree` (slow operations); `ReqRow` adds `error`.
 - The tuner's report carries no trace rows (only its slowest operations).
-- JSON Schema: `schemars::schema_for!(oprobe::model::Report)` (and `Run`, `events::Event`,
-  `errors::ErrorBody`, every `CommandOutput`) — stream B1 publishes them via `oprobe schema`.
+- JSON Schema: `schemars::schema_for!(oprobe_core::model::Report)` (and `Run`, `events::Event`,
+  `errors::ErrorBody`, every `CommandOutput`), registered in `crates/oprobe/src/mcp/schemas.rs`
+  and published via `oprobe schema` and `schemas/`.
 
 ## Outlier attribution (shared by B1, B3, B4)
 

@@ -124,6 +124,21 @@
       ],
       "type": "object"
     },
+    "Arrivals": {
+      "description": "How open-loop arrivals are spaced.",
+      "oneOf": [
+        {
+          "const": "constant",
+          "description": "Evenly spaced: one arrival every `1 / rate` seconds.",
+          "type": "string"
+        },
+        {
+          "const": "poisson",
+          "description": "A Poisson process: exponentially distributed gaps with mean `1 / rate` (bursty, like\nindependent clients).",
+          "type": "string"
+        }
+      ]
+    },
     "BillingClass": {
       "description": "Billing bucket used by the cost model.",
       "oneOf": [
@@ -344,6 +359,14 @@
           "description": "Why the confidence is what it is.",
           "type": "string"
         },
+        "hypotheses": {
+          "default": [],
+          "description": "Competing limit models, the selected one first (design v5 §4).",
+          "items": {
+            "$ref": "#/$defs/Hypothesis"
+          },
+          "type": "array"
+        },
         "inflight_ceiling": {
           "anyOf": [
             {
@@ -362,7 +385,7 @@
           "$ref": "#/$defs/OpShape"
         },
         "rate_ceiling_requests_per_s": {
-          "description": "Requests per second the service accepted while it throttled.",
+          "description": "The fitted rate limit (requests per second) when the selected hypothesis is a rate\nlimit (the lowest rate of a time-varying one); never the observed throughput.",
           "format": "double",
           "type": [
             "number",
@@ -378,7 +401,8 @@
         "observed",
         "confidence",
         "confidence_reason",
-        "source"
+        "source",
+        "hypotheses"
       ],
       "type": "object"
     },
@@ -406,19 +430,19 @@
       "description": "The in-flight level the service accepts before it throttles.",
       "properties": {
         "hi_inflight_count": {
-          "description": "Lowest in-flight level whose arrivals were throttled (the limit is in `[lo, hi)`).",
+          "description": "First level clearly throttled above every plausible split, plus one level of\nmeasurement error (the limit is in `[lo, hi)`).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "inflight_count": {
-          "description": "In-flight requests the service accepted cleanly (the estimate; equals `lo`).",
+          "description": "In-flight requests the service accepts: the estimate (the likeliest split), which the\nmargins (safe concurrency, caps) apply their headroom to; `lo ≤ inflight_count < hi`.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "lo_inflight_count": {
-          "description": "Highest in-flight level whose arrivals were served without throttling.",
+          "description": "Lowest level the limit may lie at: the lowest split about as likely as the best, less\none level of client-side measurement error.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -480,6 +504,34 @@
       ],
       "type": "object"
     },
+    "ClientInfo": {
+      "description": "What generated the load (`report.client`, design v5 §7).",
+      "properties": {
+        "kind": {
+          "description": "`opendal`, `aws_sdk` or `exec`.",
+          "type": "string"
+        },
+        "phases_available": {
+          "default": [],
+          "description": "Request stages this client reports (findings that need others are suppressed).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "kind",
+        "phases_available"
+      ],
+      "type": "object"
+    },
     "ClientStats": {
       "properties": {
         "cpu_cores_count": {
@@ -509,6 +561,30 @@
       ],
       "type": "object"
     },
+    "ColdStartStats": {
+      "description": "The cold start of a run: the connections dialed at the start of warmup and the operations\nthat waited for them.",
+      "properties": {
+        "connect": {
+          "$ref": "#/$defs/Quantiles",
+          "description": "DNS + TCP + proxy + TLS of a fresh connection."
+        },
+        "connections_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "first_ops": {
+          "$ref": "#/$defs/Quantiles",
+          "description": "Latency of the operations whose requests dialed."
+        }
+      },
+      "required": [
+        "connections_count",
+        "connect",
+        "first_ops"
+      ],
+      "type": "object"
+    },
     "Confidence": {
       "description": "How far to trust the estimate.",
       "enum": [
@@ -525,6 +601,17 @@
         },
         "cipher": {
           "type": "string"
+        },
+        "cold_start": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ColdStartStats"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Connection setup before warmup absorbed it (design v5 §3, M15): the dials and first\noperations of the warmup's cold start."
         },
         "dial_failures_count": {
           "format": "uint64",
@@ -706,6 +793,11 @@
           "format": "double",
           "type": "number"
         },
+        "inter_region_fraction": {
+          "description": "Fraction of downloaded bytes that cross regions (inter-region transfer).",
+          "format": "double",
+          "type": "number"
+        },
         "monthly_ops": {
           "default": 100000000.0,
           "description": "Logical operations per month at this workload mix.",
@@ -725,6 +817,13 @@
         },
         "provider": {
           "description": "Pricing preset: aws-s3, gcs, azure-blob, cloudflare-r2, backblaze-b2, aliyun-oss.\nDefaults to the target's provider.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "storage_class": {
+          "description": "Storage class the data is kept in: `standard` (default), `infrequent` or `archive`\n(the provider's equivalents: S3 Standard-IA / Glacier IR, GCS Nearline / Archive, …).",
           "type": [
             "string",
             "null"
@@ -811,6 +910,17 @@
           "default": false,
           "description": "Keep the generated dataset between runs (`oprobe-dataset/<fingerprint>/`) to avoid\nre-uploading it every time. Remove with `oprobe cleanup --datasets`.",
           "type": "boolean"
+        },
+        "size_dist": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SizeDist"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Object sizes drawn from a distribution (`object_size` is then its median)."
         }
       },
       "required": [
@@ -866,6 +976,117 @@
         "delta_ratio",
         "baseline_feasible",
         "baseline_trial"
+      ],
+      "type": "object"
+    },
+    "DimensionSlice": {
+      "description": "One slice of a dimension (a prefix, a size bucket, cold or warm, a tenant).",
+      "properties": {
+        "error_ratio": {
+          "format": "double",
+          "type": "number"
+        },
+        "key": {
+          "type": "string"
+        },
+        "ops_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "p99_ms": {
+          "format": "double",
+          "type": "number"
+        },
+        "requests_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "share_ratio": {
+          "description": "Share of all requests.",
+          "format": "double",
+          "type": "number"
+        },
+        "throttled_ratio": {
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "key",
+        "ops_count",
+        "requests_count",
+        "share_ratio",
+        "throttled_ratio",
+        "error_ratio",
+        "p99_ms"
+      ],
+      "type": "object"
+    },
+    "Dimensions": {
+      "description": "Where the traffic and the trouble are (`report.dimensions`, design v5 §3).",
+      "properties": {
+        "cold_warm": {
+          "default": [],
+          "description": "`cold` (first read of a key) and `warm` (repeat reads).",
+          "items": {
+            "$ref": "#/$defs/DimensionSlice"
+          },
+          "type": "array"
+        },
+        "hot_keys": {
+          "default": [],
+          "description": "Top keys by requests (at most 20).",
+          "items": {
+            "$ref": "#/$defs/HotKey"
+          },
+          "type": "array"
+        },
+        "prefix_depth_count": {
+          "description": "Prefix depth of `prefixes` (path segments).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "prefixes": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/DimensionSlice"
+          },
+          "type": "array"
+        },
+        "size_buckets": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/DimensionSlice"
+          },
+          "type": "array"
+        },
+        "tenants": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/DimensionSlice"
+          },
+          "type": "array"
+        },
+        "workers": {
+          "default": [],
+          "description": "Per-worker slices of a distributed run.",
+          "items": {
+            "$ref": "#/$defs/DimensionSlice"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "prefix_depth_count",
+        "prefixes",
+        "hot_keys",
+        "size_buckets",
+        "cold_warm",
+        "tenants",
+        "workers"
       ],
       "type": "object"
     },
@@ -1003,6 +1224,24 @@
       ],
       "type": "object"
     },
+    "EgressTier": {
+      "description": "One egress price tier: the monthly GB up to `up_to_gb` (counted from 0, the free allowance\nincluded) cost `per_gb` (the last tier may use a huge bound).",
+      "properties": {
+        "per_gb": {
+          "format": "double",
+          "type": "number"
+        },
+        "up_to_gb": {
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "up_to_gb",
+        "per_gb"
+      ],
+      "type": "object"
+    },
     "EnvInfo": {
       "description": "Cloud context of the target, when known.",
       "properties": {
@@ -1021,36 +1260,6 @@
         }
       },
       "type": "object"
-    },
-    "ErrorCode": {
-      "description": "Stable error code. Serialized as its dotted string (e.g. `net.timeout`).",
-      "enum": [
-        "usage.invalid_argument",
-        "usage.unknown_target",
-        "usage.unknown_run",
-        "usage.unknown_baseline",
-        "config.invalid",
-        "config.unknown_option",
-        "auth.no_credentials",
-        "auth.denied",
-        "net.unreachable",
-        "net.dns",
-        "net.tls",
-        "net.timeout",
-        "net.rate_limited",
-        "net.http",
-        "storage.not_found",
-        "storage.throttled",
-        "storage.unsupported",
-        "safety.budget_exceeded",
-        "safety.read_only",
-        "safety.refused",
-        "run.sla_failed",
-        "run.regression",
-        "run.interrupted",
-        "internal"
-      ],
-      "type": "string"
     },
     "Evidence": {
       "description": "The numbers and trace references behind a finding.",
@@ -1239,6 +1448,34 @@
       ],
       "type": "object"
     },
+    "HotKey": {
+      "description": "A hot key: its share of the traffic and of the throttling.",
+      "properties": {
+        "key": {
+          "type": "string"
+        },
+        "requests_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "share_ratio": {
+          "format": "double",
+          "type": "number"
+        },
+        "throttle_share_ratio": {
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "key",
+        "requests_count",
+        "share_ratio",
+        "throttle_share_ratio"
+      ],
+      "type": "object"
+    },
     "HttpVersion": {
       "description": "HTTP protocol preference.",
       "oneOf": [
@@ -1262,6 +1499,189 @@
     "HumanDuration": {
       "description": "A duration: `10s`, `500ms`, `2m` (plain seconds are accepted on input).",
       "type": "string"
+    },
+    "Hypothesis": {
+      "description": "One fitted limit model.",
+      "properties": {
+        "bic": {
+          "description": "Bayesian information criterion `−2·LL + k·ln n` (lower is better; selection score).",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "confidence": {
+          "$ref": "#/$defs/Confidence"
+        },
+        "evidence": {
+          "default": [],
+          "description": "Why the model fits, in words.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "explains_ratio": {
+          "description": "Share of the throttled (or slowed) requests the model explains.",
+          "format": "double",
+          "type": "number"
+        },
+        "kind": {
+          "$ref": "#/$defs/HypothesisKind"
+        },
+        "log_likelihood": {
+          "description": "Log-likelihood of the data under the model (absent until fitted).",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "params": {
+          "$ref": "#/$defs/HypothesisParams"
+        },
+        "selected": {
+          "description": "The chosen hypothesis (at most one).",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "kind",
+        "params",
+        "evidence",
+        "confidence",
+        "explains_ratio",
+        "selected"
+      ],
+      "type": "object"
+    },
+    "HypothesisKind": {
+      "description": "The kind of limit a hypothesis asserts.",
+      "oneOf": [
+        {
+          "const": "inflight_limit",
+          "description": "The service accepts a number of requests in flight (`ceiling`).",
+          "type": "string"
+        },
+        {
+          "const": "rate_limit",
+          "description": "A token bucket: requests per second (`rps`, `burst`).",
+          "type": "string"
+        },
+        {
+          "const": "key_limit",
+          "description": "A per-key or per-prefix rate (`key`, `rps`).",
+          "type": "string"
+        },
+        {
+          "const": "queueing",
+          "description": "Latency grows with in-flight requests (`service_ms`, `servers`).",
+          "type": "string"
+        },
+        {
+          "const": "bandwidth_cap",
+          "description": "Aggregate bytes per second flat across streams (`bytes_per_s`).",
+          "type": "string"
+        },
+        {
+          "const": "client_bound",
+          "description": "The client itself is saturated (CPU, scheduling lag).",
+          "type": "string"
+        },
+        {
+          "const": "time_varying",
+          "description": "The limit changes over the run (change points).",
+          "type": "string"
+        },
+        {
+          "const": "none",
+          "description": "No limit was reached.",
+          "type": "string"
+        }
+      ]
+    },
+    "HypothesisParams": {
+      "description": "The parameters of a limit model (the ones its kind uses are set).",
+      "properties": {
+        "burst_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "bytes_per_s": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "ceiling_inflight_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "change_points_s": {
+          "description": "Seconds into the window where a [`HypothesisKind::TimeVarying`] limit changed.",
+          "items": {
+            "format": "double",
+            "type": "number"
+          },
+          "type": "array"
+        },
+        "key": {
+          "description": "The key or prefix of a [`HypothesisKind::KeyLimit`] (the hottest one).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "key_share_ratio": {
+          "description": "Share of the requests that went to `key`.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "requests_per_s": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "segment_requests_per_s": {
+          "description": "The rate of each segment between change points (requests per second).",
+          "items": {
+            "format": "double",
+            "type": "number"
+          },
+          "type": "array"
+        },
+        "servers_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "service_ms": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
     },
     "InflightLevel": {
       "description": "Arrivals at one in-flight level.",
@@ -1306,6 +1726,116 @@
       "required": [
         "verified_count",
         "corrupted_count"
+      ],
+      "type": "object"
+    },
+    "IntervalBlock": {
+      "description": "One slice of the run's timeline: 1 s for the first ten minutes, then 10 s (design v5 §3).",
+      "properties": {
+        "cpu_pct": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "errors_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "inflight_count": {
+          "description": "Peak requests in flight in the slice (when measured).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "latency_rows_count": {
+          "description": "Operations per heatmap latency row (the interval's latency sketch).",
+          "items": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        "len_s": {
+          "format": "double",
+          "type": "number"
+        },
+        "max_ms": {
+          "default": 0.0,
+          "format": "double",
+          "type": "number"
+        },
+        "missed_arrivals_count": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "new_connections_count": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "ops_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "p50_ms": {
+          "format": "double",
+          "type": "number"
+        },
+        "p90_ms": {
+          "default": 0.0,
+          "format": "double",
+          "type": "number"
+        },
+        "p999_ms": {
+          "default": 0.0,
+          "format": "double",
+          "type": "number"
+        },
+        "p99_ms": {
+          "format": "double",
+          "type": "number"
+        },
+        "t_s": {
+          "description": "Start of the slice, seconds from the window start.",
+          "format": "double",
+          "type": "number"
+        },
+        "throttled_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "transferred_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "t_s",
+        "len_s",
+        "ops_count",
+        "errors_count",
+        "throttled_count",
+        "transferred_bytes",
+        "p50_ms",
+        "p99_ms",
+        "p90_ms",
+        "p999_ms",
+        "max_ms",
+        "missed_arrivals_count",
+        "new_connections_count"
       ],
       "type": "object"
     },
@@ -1660,6 +2190,12 @@
           "format": "double",
           "type": "number"
         },
+        "ops_service_inflight_mean": {
+          "default": 0.0,
+          "description": "Operations in flight on average, retry backoff left out: the time operations were\nserved, which throughput scales with (backoff is waiting, not work; A3).",
+          "format": "double",
+          "type": "number"
+        },
         "peak_inflight_count": {
           "format": "uint64",
           "minimum": 0,
@@ -1688,6 +2224,7 @@
         "peak_inflight_count",
         "inflight_mean",
         "ops_inflight_mean",
+        "ops_service_inflight_mean",
         "ops_per_s"
       ],
       "type": "object"
@@ -1731,140 +2268,15 @@
       ],
       "type": "object"
     },
-    "OpBreakdownUs": {
-      "description": "Where the wall time of one operation went (µs; the parts sum to `latency_us`).",
-      "properties": {
-        "backend_us": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "cache_us": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "client_us": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "queue_us": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "retry_us": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        }
-      },
-      "required": [
-        "queue_us",
-        "cache_us",
-        "backend_us",
-        "retry_us",
-        "client_us"
-      ],
-      "type": "object"
-    },
-    "OpRow": {
-      "description": "One measured logical operation.",
-      "properties": {
-        "attempts": {
-          "description": "1 + retries.",
-          "format": "uint32",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "await_tree": {
-          "description": "Await-tree call stack captured while the operation was slow.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "breakdown": {
-          "$ref": "#/$defs/OpBreakdownUs"
-        },
-        "bytes": {
-          "description": "Logical bytes read + written.",
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "error": {
-          "description": "Error class / detail of a failed operation.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "error_code": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ErrorCode"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "key": {
-          "description": "Object key (or listed prefix).",
-          "type": "string"
-        },
-        "latency_us": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "ok": {
-          "type": "boolean"
-        },
-        "op_id": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "requests": {
-          "description": "Backend requests issued (exact, even when request rows were capped).",
-          "format": "uint32",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "t_us": {
-          "description": "Start (the intended start in open-loop runs), µs from the window start.",
-          "format": "int64",
-          "type": "integer"
-        },
-        "throttled": {
-          "description": "At least one request of the operation was throttled (429/503).",
-          "type": "boolean"
-        },
-        "verb": {
-          "description": "Workload verb, e.g. `read.range`, `write.multipart`.",
-          "type": "string"
-        }
-      },
-      "required": [
-        "op_id",
-        "verb",
-        "key",
-        "t_us",
-        "latency_us",
-        "bytes",
-        "ok",
-        "attempts",
-        "breakdown",
-        "requests"
-      ],
-      "type": "object"
-    },
     "OpShape": {
       "description": "Request concurrency of one operation.",
       "properties": {
+        "bytes_per_op_mean": {
+          "default": 0.0,
+          "description": "Logical bytes per operation (mean).",
+          "format": "double",
+          "type": "number"
+        },
         "inflight_per_op_mean": {
           "description": "Requests one operation keeps in flight on average over its lifetime.",
           "format": "double",
@@ -1898,7 +2310,8 @@
         "peak_inflight_per_op_count",
         "inflight_per_op_mean",
         "sequential_ratio",
-        "ops_count"
+        "ops_count",
+        "bytes_per_op_mean"
       ],
       "type": "object"
     },
@@ -2149,6 +2562,24 @@
           "format": "double",
           "type": "number"
         },
+        "arrivals": {
+          "description": "Arrival process: `constant`, `poisson`, `ramp`, `step`, `diurnal` (`+poisson`), `replay`.",
+          "type": "string"
+        },
+        "censored_count": {
+          "default": 0,
+          "description": "Missed arrivals counted in the latency distribution as censored values (a lower bound:\nwindow end − intended start): `summary.latency` percentiles are then \"≥\" values.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "intended_count": {
+          "default": 0,
+          "description": "Arrivals due inside the window: started plus missed.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "max_schedule_lag_ms": {
           "format": "double",
           "type": "number"
@@ -2159,6 +2590,17 @@
           "minimum": 0,
           "type": "integer"
         },
+        "schedule": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Quantiles"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The `schedule` stage: intended → actual start of the operations that started."
+        },
         "target_per_s": {
           "format": "double",
           "type": "number"
@@ -2168,7 +2610,9 @@
         "target_per_s",
         "achieved_per_s",
         "missed_count",
-        "max_schedule_lag_ms"
+        "max_schedule_lag_ms",
+        "intended_count",
+        "censored_count"
       ],
       "type": "object"
     },
@@ -2290,6 +2734,12 @@
           "format": "double",
           "type": "number"
         },
+        "server_error_requests_mean": {
+          "default": 0.0,
+          "description": "Of `failed_requests`, those answered 5xx (incl. 503 SlowDown): not billed by most\nproviders.",
+          "format": "double",
+          "type": "number"
+        },
         "upload_bytes": {
           "format": "double",
           "type": "number"
@@ -2305,6 +2755,7 @@
         "read_requests_mean",
         "delete_requests_mean",
         "failed_requests_mean",
+        "server_error_requests_mean",
         "download_bytes",
         "upload_bytes",
         "overread_bytes",
@@ -2381,13 +2832,48 @@
       "additionalProperties": false,
       "description": "Provider list prices in USD (request prices per million, data per GB = 1e9 bytes).",
       "properties": {
+        "bills_client_errors": {
+          "default": true,
+          "description": "Requests answered 4xx are billed (most providers).",
+          "type": "boolean"
+        },
+        "bills_server_errors": {
+          "default": true,
+          "description": "Requests answered 5xx (incl. 503 SlowDown) are billed (the presets assume so; check\nyour provider's terms and set `false` in `[cost.pricing]` where they are free).",
+          "type": "boolean"
+        },
         "delete_per_million": {
           "default": 0.0,
           "format": "double",
           "type": "number"
         },
+        "egress_free_gb": {
+          "default": 0.0,
+          "description": "Internet egress free per month (GB).",
+          "format": "double",
+          "type": "number"
+        },
+        "egress_free_stored_multiple": {
+          "default": 0.0,
+          "description": "Free egress as a multiple of the stored data (Backblaze B2: 3×).",
+          "format": "double",
+          "type": "number"
+        },
         "egress_per_gb": {
-          "description": "Internet egress per GB.",
+          "description": "Internet egress per GB (the first paid tier when `egress_tiers` is given).",
+          "format": "double",
+          "type": "number"
+        },
+        "egress_tiers": {
+          "description": "Internet egress price tiers by monthly volume (absolute bounds, the free allowance\nincluded in the first); empty: the flat `egress_per_gb`.",
+          "items": {
+            "$ref": "#/$defs/EgressTier"
+          },
+          "type": "array"
+        },
+        "inter_region_per_gb": {
+          "default": 0.0,
+          "description": "Inter-region transfer per GB.",
           "format": "double",
           "type": "number"
         },
@@ -2406,6 +2892,13 @@
           "format": "double",
           "type": "number"
         },
+        "storage_classes": {
+          "description": "Storage classes besides standard (`infrequent`, `archive`).",
+          "items": {
+            "$ref": "#/$defs/StorageClassPrice"
+          },
+          "type": "array"
+        },
         "storage_gb_month": {
           "format": "double",
           "type": "number"
@@ -2423,7 +2916,12 @@
         "list_per_million",
         "read_per_million",
         "delete_per_million",
-        "egress_per_gb"
+        "egress_per_gb",
+        "egress_free_gb",
+        "egress_free_stored_multiple",
+        "inter_region_per_gb",
+        "bills_client_errors",
+        "bills_server_errors"
       ],
       "type": "object"
     },
@@ -2502,12 +3000,24 @@
           "format": "double",
           "type": "number"
         },
+        "early_delete_usd": {
+          "default": 0.0,
+          "description": "Monthly charges for objects deleted before the class's minimum duration.",
+          "format": "double",
+          "type": "number"
+        },
         "egress_usd": {
           "format": "double",
           "type": "number"
         },
         "failed_requests_usd": {
           "description": "Monthly spend on failed/throttled requests.",
+          "format": "double",
+          "type": "number"
+        },
+        "inter_region_usd": {
+          "default": 0.0,
+          "description": "Monthly inter-region transfer.",
           "format": "double",
           "type": "number"
         },
@@ -2531,6 +3041,17 @@
           "format": "double",
           "type": "number"
         },
+        "retrieval_usd": {
+          "default": 0.0,
+          "description": "Monthly data-retrieval fees of the storage class.",
+          "format": "double",
+          "type": "number"
+        },
+        "storage_class": {
+          "default": "",
+          "description": "The storage class priced (`standard`, or the provider's name of the class).",
+          "type": "string"
+        },
         "storage_usd": {
           "format": "double",
           "type": "number"
@@ -2550,7 +3071,11 @@
         "per_million_ops_usd",
         "failed_requests_usd",
         "overread_usd",
-        "cache_savings_usd"
+        "cache_savings_usd",
+        "storage_class",
+        "retrieval_usd",
+        "inter_region_usd",
+        "early_delete_usd"
       ],
       "type": "object"
     },
@@ -2626,6 +3151,10 @@
         "max_ms"
       ],
       "type": "object"
+    },
+    "RateShape": {
+      "description": "Time-varying open-loop rate: ramp:FROM..TO/DURATION, step:R1,R2,…/DURATION or diurnal[:MIN..MAX/PERIOD]",
+      "type": "string"
     },
     "Recommendation": {
       "description": "What `oprobe tune` / `oprobe fix` / MCP `recommend_config` recommend.",
@@ -2725,6 +3254,44 @@
       ],
       "type": "object"
     },
+    "ReplaySpec": {
+      "additionalProperties": false,
+      "description": "What to replay (`workload.replay`).",
+      "properties": {
+        "file": {
+          "description": "The log: an S3 server access log, CloudTrail JSON (S3 data events) or an oprobe run file.",
+          "type": "string"
+        },
+        "map_prefix": {
+          "description": "Key rewrites, the first matching prefix wins (`$RUN/` targets the run prefix).",
+          "items": {
+            "maxItems": 2,
+            "minItems": 2,
+            "prefixItems": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "string"
+              }
+            ],
+            "type": "array"
+          },
+          "type": "array"
+        },
+        "speed": {
+          "default": 1.0,
+          "description": "Speed factor: 2 replays twice as fast as recorded.",
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "file",
+        "speed"
+      ],
+      "type": "object"
+    },
     "Report": {
       "description": "The full report of one run.",
       "properties": {
@@ -2745,16 +3312,19 @@
           "default": {
             "confidence": "low",
             "confidence_reason": "",
+            "hypotheses": [],
             "observed": {
               "inflight_mean": 0.0,
               "ops_inflight_mean": 0.0,
               "ops_per_s": 0.0,
+              "ops_service_inflight_mean": 0.0,
               "peak_inflight_count": 0,
               "requests_count": 0,
               "throttled_requests_count": 0,
               "window_s": 0.0
             },
             "per_op": {
+              "bytes_per_op_mean": 0.0,
               "inflight_per_op_mean": 0.0,
               "ops_count": 0,
               "peak_inflight_per_op_count": 0,
@@ -2769,13 +3339,40 @@
           "$ref": "#/$defs/CleanupSummary"
         },
         "client": {
-          "$ref": "#/$defs/ClientStats"
+          "$ref": "#/$defs/ClientInfo",
+          "default": {
+            "kind": "opendal",
+            "phases_available": [
+              "queue",
+              "connect",
+              "send",
+              "ttfb",
+              "body",
+              "stall",
+              "backoff"
+            ],
+            "version": "0.59"
+          },
+          "description": "What generated the load (design v5 §7)."
         },
         "connections": {
           "$ref": "#/$defs/ConnStats"
         },
         "cost": {
           "$ref": "#/$defs/CostReport"
+        },
+        "dimensions": {
+          "$ref": "#/$defs/Dimensions",
+          "default": {
+            "cold_warm": [],
+            "hot_keys": [],
+            "prefix_depth_count": 0,
+            "prefixes": [],
+            "size_buckets": [],
+            "tenants": [],
+            "workers": []
+          },
+          "description": "Where the traffic and the trouble are: prefixes, hot keys, sizes, cold/warm, tenants."
         },
         "findings": {
           "items": {
@@ -2811,9 +3408,46 @@
         "run": {
           "$ref": "#/$defs/RunInfo"
         },
+        "sampling": {
+          "$ref": "#/$defs/Sampling",
+          "default": {
+            "always_kept_ops_count": 0,
+            "kept_ops_count": 0,
+            "kept_ratio": 0.0,
+            "kept_requests_count": 0,
+            "method": "",
+            "seen_ops_count": 0,
+            "seen_requests_count": 0
+          },
+          "description": "How the trace rows were sampled (findings use aggregate counts, never these)."
+        },
+        "schedule": {
+          "$ref": "#/$defs/ScheduleStats",
+          "default": {
+            "intended_ops_count": 0,
+            "max_schedule_lag_ms": 0.0,
+            "missed_arrivals_count": 0,
+            "missed_arrivals_ratio": 0.0,
+            "open_loop": false
+          },
+          "description": "Arrival schedule: missed arrivals and the schedule stage (design v5 §3)."
+        },
         "schema": {
           "description": "Always [`REPORT_SCHEMA`].",
           "type": "string"
+        },
+        "self": {
+          "$ref": "#/$defs/SelfStats",
+          "default": {
+            "client_saturated": false,
+            "process": {
+              "cpu_cores_count": 0,
+              "cpu_pct": 0.0,
+              "peak_cpu_pct": 0.0,
+              "rss_mib": 0.0
+            }
+          },
+          "description": "The observer's own cost and the client's health (design v5 §3; `report.self`)."
         },
         "sla": {
           "$ref": "#/$defs/SlaInfo"
@@ -2872,6 +3506,14 @@
           },
           "type": "array"
         },
+        "workers": {
+          "default": [],
+          "description": "Workers of a distributed run (empty: this process; design v5 §8).",
+          "items": {
+            "$ref": "#/$defs/WorkerInfo"
+          },
+          "type": "array"
+        },
         "workload": {
           "$ref": "#/$defs/WorkloadInfo"
         }
@@ -2896,6 +3538,11 @@
         "cache",
         "integrity",
         "client",
+        "self",
+        "schedule",
+        "workers",
+        "dimensions",
+        "sampling",
         "timeline",
         "heatmap",
         "findings",
@@ -2904,191 +3551,6 @@
         "slowest",
         "cleanup",
         "warnings"
-      ],
-      "type": "object"
-    },
-    "ReqRow": {
-      "description": "One backend request (an HTTP exchange, or an in-process backend call).",
-      "properties": {
-        "api": {
-          "description": "Storage API, e.g. `GetObject` (OpenDAL `ServiceOperation`; URL heuristic fallback).",
-          "type": "string"
-        },
-        "attempt": {
-          "description": "1 for the first attempt of this API call within the operation, 2+ for retries.",
-          "format": "uint32",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "body_us": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "bytes_down": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "bytes_up": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "conn_id": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "dns_us": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "error": {
-          "description": "Error detail (transport or backend message).",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "error_code": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ErrorCode"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "method": {
-          "type": "string"
-        },
-        "op_id": {
-          "description": "The logical operation that issued it (0: issued outside any operation).",
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "protocol": {
-          "$ref": "#/$defs/WireProtocol"
-        },
-        "proxy_us": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "queue_us": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "remote": {
-          "description": "Remote `ip:port` (the proxy's when tunnelling).",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "request_id": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "retry_after_ms": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "reused": {
-          "description": "The request reused a pooled connection.",
-          "type": "boolean"
-        },
-        "send_us": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "stall_us": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "status": {
-          "description": "HTTP status; 0 when no response arrived.",
-          "format": "uint16",
-          "maximum": 65535,
-          "minimum": 0,
-          "type": "integer"
-        },
-        "t_us": {
-          "description": "Start, µs from the measurement window start (negative: before the window).",
-          "format": "int64",
-          "type": "integer"
-        },
-        "tcp": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/TcpRow"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "tcp_us": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "tls": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/TlsRow"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "tls_us": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "total_us": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "ttfb_us": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        }
-      },
-      "required": [
-        "t_us",
-        "op_id",
-        "attempt",
-        "api",
-        "method",
-        "status",
-        "protocol",
-        "reused",
-        "conn_id",
-        "queue_us",
-        "send_us",
-        "ttfb_us",
-        "body_us",
-        "total_us",
-        "bytes_up",
-        "bytes_down"
       ],
       "type": "object"
     },
@@ -3210,15 +3672,17 @@
       ],
       "type": "object"
     },
-    "RunFileHeader": {
-      "description": "First line of a run file.",
+    "RunHeader": {
+      "description": "The first block: what the run is.",
       "properties": {
+        "client": {
+          "$ref": "#/$defs/ClientInfo"
+        },
         "created_at": {
-          "description": "RFC 3339.",
           "type": "string"
         },
         "format": {
-          "description": "Always `oprobe.run/4`.",
+          "description": "Always [`RUN_FORMAT`].",
           "type": "string"
         },
         "oprobe_version": {
@@ -3226,13 +3690,18 @@
         },
         "run_id": {
           "type": "string"
+        },
+        "spec": {
+          "$ref": "#/$defs/RunSpec"
         }
       },
       "required": [
         "format",
         "run_id",
         "oprobe_version",
-        "created_at"
+        "created_at",
+        "spec",
+        "client"
       ],
       "type": "object"
     },
@@ -3346,12 +3815,194 @@
       ],
       "type": "object"
     },
+    "Sampling": {
+      "description": "How the trace rows were sampled (`report.sampling`, design v5 §2): whole operations are\nkept with all their requests; findings use aggregate counts, never these.",
+      "properties": {
+        "always_kept_ops_count": {
+          "description": "Operations kept regardless of the reservoir: the slowest 1 % and every failed or\nthrottled operation.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "kept_ops_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "kept_ratio": {
+          "description": "Kept / seen operations (1 when nothing was sampled away).",
+          "format": "double",
+          "type": "number"
+        },
+        "kept_requests_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "method": {
+          "description": "`whole_op` (v5) — the sampler.",
+          "type": "string"
+        },
+        "seen_ops_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "seen_requests_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "kept_ops_count",
+        "seen_ops_count",
+        "kept_ratio",
+        "kept_requests_count",
+        "seen_requests_count",
+        "always_kept_ops_count",
+        "method"
+      ],
+      "type": "object"
+    },
+    "ScheduleStats": {
+      "description": "The arrival schedule (`report.schedule`, design v5 §3): open-loop arrivals that started\nlate or never, and the `schedule` stage (intended → actual start).",
+      "properties": {
+        "arrivals": {
+          "description": "`constant`, `poisson`, `ramp`, `step`, `diurnal`, `replay` (open loop only).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "intended_ops_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_schedule_lag_ms": {
+          "format": "double",
+          "type": "number"
+        },
+        "missed_arrivals_count": {
+          "description": "Arrivals that never started (censored latencies, counted in the tail as \"≥\").",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "missed_arrivals_ratio": {
+          "format": "double",
+          "type": "number"
+        },
+        "open_loop": {
+          "description": "Arrivals follow a rate (`--rate`, `--shape`, `--replay`); false: closed loop, subject to\ncoordinated omission.",
+          "type": "boolean"
+        },
+        "schedule_stage": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Quantiles"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Time from an operation's intended start to its actual start."
+        }
+      },
+      "required": [
+        "open_loop",
+        "intended_ops_count",
+        "missed_arrivals_count",
+        "missed_arrivals_ratio",
+        "max_schedule_lag_ms"
+      ],
+      "type": "object"
+    },
+    "SelfStats": {
+      "description": "The observer's own cost and the client's health (`report.self`, design v5 §3).",
+      "properties": {
+        "client_saturated": {
+          "description": "Lag p99 > 5 ms or CPU ≥ 90 % of the cores in use: the server/TTFB stage is unreliable.",
+          "type": "boolean"
+        },
+        "cpu_ratio": {
+          "description": "Client CPU after warmup, as a share of the cores in use.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "global_queue_depth_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "observer_per_op_us": {
+          "description": "Measured observer cost per operation.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "process": {
+          "$ref": "#/$defs/ClientStats",
+          "description": "Process CPU and memory of the client (4.x `report.client`)."
+        },
+        "rss_current_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "rss_peak_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "runtime_busy_ratio": {
+          "description": "Tokio runtime busy share.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "sched_lag_p99_ms": {
+          "description": "p99 of the 1 ms scheduling-lag probe.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "process",
+        "client_saturated"
+      ],
+      "type": "object"
+    },
     "Severity": {
       "enum": [
         "info",
         "warning",
         "critical"
       ],
+      "type": "string"
+    },
+    "SizeDist": {
+      "description": "Object size distribution: dist:lognormal(MEDIAN,SIGMA) or file:PATH",
       "type": "string"
     },
     "Sla": {
@@ -3560,6 +4211,58 @@
         "shares",
         "per_verb",
         "request_p99"
+      ],
+      "type": "object"
+    },
+    "StorageClassPrice": {
+      "description": "A storage class: its storage, request and retrieval prices, minimum billable object size\nand minimum storage duration.",
+      "properties": {
+        "class": {
+          "description": "`infrequent` or `archive`.",
+          "type": "string"
+        },
+        "min_billable_bytes": {
+          "description": "Smaller objects are billed as this size (bytes).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "min_duration_days": {
+          "description": "Objects deleted earlier are billed for the rest of this duration (days).",
+          "format": "double",
+          "type": "number"
+        },
+        "name": {
+          "description": "The provider's name for it.",
+          "type": "string"
+        },
+        "read_per_million": {
+          "format": "double",
+          "type": "number"
+        },
+        "retrieval_per_gb": {
+          "description": "Data retrieval per GB read.",
+          "format": "double",
+          "type": "number"
+        },
+        "storage_gb_month": {
+          "format": "double",
+          "type": "number"
+        },
+        "write_per_million": {
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "class",
+        "name",
+        "storage_gb_month",
+        "write_per_million",
+        "read_per_million",
+        "retrieval_per_gb",
+        "min_billable_bytes",
+        "min_duration_days"
       ],
       "type": "object"
     },
@@ -3840,66 +4543,6 @@
       ],
       "type": "object"
     },
-    "TcpRow": {
-      "description": "Kernel TCP statistics of the connection at request end (Linux `TCP_INFO`, macOS\n`TCP_CONNECTION_INFO`). Counters are totals over the connection's life so far.",
-      "properties": {
-        "busy_us": {
-          "description": "Time busy sending data (Linux ≥ 4.10).",
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "cwnd": {
-          "description": "Congestion window, segments.",
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "delivery_rate_bps": {
-          "description": "Most recent delivery rate estimate, bits per second (Linux).",
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "retrans": {
-          "description": "Retransmitted segments (whole connection).",
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "rtt_us": {
-          "description": "Smoothed round-trip time.",
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "rttvar_us": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "rwnd_limited_us": {
-          "description": "Time sending was limited by the receiver's window (Linux ≥ 4.10).",
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "sndbuf_limited_us": {
-          "description": "Time sending was limited by the send buffer (Linux ≥ 4.10).",
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        }
-      },
-      "required": [
-        "rtt_us",
-        "rttvar_us",
-        "retrans",
-        "cwnd",
-        "delivery_rate_bps"
-      ],
-      "type": "object"
-    },
     "TimeWindow": {
       "properties": {
         "from_s": {
@@ -3919,20 +4562,78 @@
     },
     "TimelinePoint": {
       "properties": {
+        "cpu_pct": {
+          "description": "Client CPU in percent of one core (350 = 3.5 cores busy), when sampled in the interval.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
         "errors_count": {
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
+        "inflight_peak_count": {
+          "default": 0,
+          "description": "Peak requests in flight during the interval.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "latency_rows_count": {
+          "description": "Operations started in the interval per latency row of the heatmap\n(`heatmap.latency_buckets_ms`): the heatmap is built from these, not from sampled rows.",
+          "items": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        "len_s": {
+          "default": 1.0,
+          "description": "Length of the interval: 1 s for the first ten minutes, 10 s afterwards.",
+          "format": "double",
+          "type": "number"
+        },
+        "max_ms": {
+          "default": 0.0,
+          "format": "double",
+          "type": "number"
+        },
         "mib_per_s": {
           "format": "double",
           "type": "number"
+        },
+        "missed_arrivals_count": {
+          "description": "Open-loop arrivals due in this interval that never started.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "new_connections_count": {
+          "default": 0,
+          "description": "Connections dialed during the interval.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
         },
         "ops_per_s": {
           "format": "double",
           "type": "number"
         },
         "p50_ms": {
+          "format": "double",
+          "type": "number"
+        },
+        "p90_ms": {
+          "default": 0.0,
+          "format": "double",
+          "type": "number"
+        },
+        "p999_ms": {
+          "default": 0.0,
           "format": "double",
           "type": "number"
         },
@@ -3958,7 +4659,13 @@
         "p50_ms",
         "p99_ms",
         "errors_count",
-        "throttled_count"
+        "throttled_count",
+        "len_s",
+        "p90_ms",
+        "p999_ms",
+        "max_ms",
+        "inflight_peak_count",
+        "new_connections_count"
       ],
       "type": "object"
     },
@@ -4063,40 +4770,6 @@
       "required": [
         "handshake",
         "handshakes"
-      ],
-      "type": "object"
-    },
-    "TlsRow": {
-      "description": "TLS details of the connection a request used (when the transport reports them).",
-      "properties": {
-        "cipher": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "group": {
-          "description": "Negotiated key-exchange group, e.g. `X25519MLKEM768`.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "hrr": {
-          "description": "The handshake needed a HelloRetryRequest.",
-          "type": "boolean"
-        },
-        "resumed": {
-          "type": "boolean"
-        },
-        "version": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "resumed",
-        "version",
-        "hrr"
       ],
       "type": "object"
     },
@@ -4211,6 +4884,14 @@
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
+        },
+        "rate_per_s": {
+          "description": "The pace of an open-loop trial (operations per second).",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
         },
         "requests_count": {
           "format": "uint64",
@@ -4602,22 +5283,53 @@
         }
       ]
     },
-    "WireProtocol": {
-      "description": "Wire protocol of one request.",
-      "oneOf": [
-        {
-          "enum": [
-            "h1",
-            "h2"
-          ],
+    "WorkerInfo": {
+      "description": "One worker of a distributed run (`report.workers[]`, design v5 §8).",
+      "properties": {
+        "addr": {
+          "description": "`host:port`, or `local` for a local worker process.",
           "type": "string"
         },
-        {
-          "const": "inproc",
-          "description": "In-process backends (memory, fs): no network.",
+        "clock_offset_ms": {
+          "description": "The worker's clock minus the coordinator's (NTP-style exchange).",
+          "format": "double",
+          "type": "number"
+        },
+        "id": {
           "type": "string"
+        },
+        "ops_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "ops_per_s": {
+          "format": "double",
+          "type": "number"
+        },
+        "requests_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "warnings": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
         }
-      ]
+      },
+      "required": [
+        "id",
+        "addr",
+        "clock_offset_ms",
+        "ops_count",
+        "requests_count",
+        "ops_per_s",
+        "warnings"
+      ],
+      "type": "object"
     },
     "WorkloadInfo": {
       "description": "The workload, resolved (preset defaults applied).",
@@ -4694,6 +5406,10 @@
           "$ref": "#/$defs/Access",
           "default": "uniform"
         },
+        "arrivals": {
+          "$ref": "#/$defs/Arrivals",
+          "description": "Open-loop arrival process: `constant` (evenly spaced) or `poisson` (design v5 §3)."
+        },
         "cleanup": {
           "default": true,
           "description": "Delete everything written under the run prefix when the run ends.",
@@ -4742,11 +5458,33 @@
             "null"
           ]
         },
+        "replay": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ReplaySpec"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Replay a traffic log instead of the mix (open loop on the log's timing)."
+        },
         "seed": {
           "default": 42,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
+        },
+        "shape": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RateShape"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Time-varying open-loop rate: `ramp:FROM..TO/D`, `step:R1,R2,…/D` or\n`diurnal[:MIN..MAX/PERIOD]` (makes the run open-loop; `rate` is then the diurnal peak)."
         },
         "verify": {
           "default": true,
@@ -4770,15 +5508,42 @@
       "type": "object"
     }
   },
-  "$id": "https://github.com/hxddh/oprobe/schemas/4/run-file.json",
+  "$id": "https://github.com/hxddh/oprobe/schemas/5/run-file.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "description": "One line of a .oprobe run file (oprobe.run/4)",
+  "description": "One block of a .oprobe run file (oprobe.run/5)",
   "oneOf": [
     {
-      "$ref": "#/$defs/RunFileHeader",
+      "$ref": "#/$defs/RunHeader",
       "properties": {
         "kind": {
           "const": "header",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "type": "object"
+    },
+    {
+      "additionalProperties": true,
+      "description": "Columnar operation and request rows of one time slice (interned strings, `u32`\nmicroseconds after `base_us`; see `oprobe_core::store::runfile::Segment`).",
+      "properties": {
+        "kind": {
+          "const": "segment",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "type": "object"
+    },
+    {
+      "$ref": "#/$defs/IntervalBlock",
+      "properties": {
+        "kind": {
+          "const": "interval",
           "type": "string"
         }
       },
@@ -4799,34 +5564,8 @@
         "kind"
       ],
       "type": "object"
-    },
-    {
-      "$ref": "#/$defs/OpRow",
-      "properties": {
-        "kind": {
-          "const": "op",
-          "type": "string"
-        }
-      },
-      "required": [
-        "kind"
-      ],
-      "type": "object"
-    },
-    {
-      "$ref": "#/$defs/ReqRow",
-      "properties": {
-        "kind": {
-          "const": "req",
-          "type": "string"
-        }
-      },
-      "required": [
-        "kind"
-      ],
-      "type": "object"
     }
   ],
   "title": "oprobe run-file",
-  "x-rust-type": "RunFileLine"
+  "x-rust-type": "RunFileBlock"
 }

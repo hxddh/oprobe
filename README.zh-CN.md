@@ -36,7 +36,7 @@ oprobe run prod
 演示、本机发现的 AWS profile、Google 凭据、Azure 环境变量（`oprobe target discover`），或者一个 URL，并把选择保存为
 命名目标。
 
-默认输出最多 20 行、不超过 80 列：结论、最重要的发现（原因 · 证据 · 建议 · 下一条命令）、关键数字，以及完整报告的位置。
+默认输出包括结论、最重要的发现（原因 · 证据 · 建议 · 下一条命令）、关键数字，以及完整报告的位置。它按终端宽度换行（管道输出时为 100 列），从不截断命令。`--lang zh-CN`（或 `zh_CN` 语言环境）会用简体中文输出；JSON 输出始终为英文。
 
 ## 深入查看
 
@@ -86,21 +86,34 @@ oprobe run prod
 ## 在 CI 中
 
 ```yaml
-- uses: hxddh/oprobe@v4
+- uses: hxddh/oprobe@v5
   with:
     target: s3://ci-bucket/oprobe
     preset: small-files
     baseline: main
+    repeat: 3
 ```
 
-该 Action 安装最新的 oprobe 4.x（或你固定的 `version`）、运行、与基线对比、上传 `.oprobe` 文件和 HTML 报告、
-维护一条置顶的 PR 评论，并在回归时失败。[CI 指南 →](docs/ci.md)
+该 Action 安装最新的 oprobe 5.x（或你固定的 `version`）、运行、与基线对比（`--strict`：目标或负载不同即失败）、
+首次学习目标的噪声基线并与容量历史一起保存在 Actions 缓存中、上传 `.oprobe` 文件和 HTML 报告、维护一条置顶的
+PR 评论，并在回归时失败。`oprobe watch` 持续探测生产环境，并导出 Prometheus（`/metrics`、`/healthz`）和 OTLP
+指标。[CI 指南 →](docs/ci.md)
 
 ## 面向智能体
 
 所有命令都支持 `-o json` 输出单个 JSON 文档、`-o ndjson` 输出事件流；错误带稳定的错误码和退出码；`oprobe schema`
 输出 JSON Schema；`oprobe mcp` 是一个 MCP 服务器（默认只读，`--allow-write` 才允许写入）。参见
 [docs/agents.md](docs/agents.md) 和 [llms.txt](llms.txt)。
+
+## 嵌入
+
+oprobe 5.0 是同一工作区中的三个 crate：[`oprobe-trace`](crates/oprobe-trace)（在生产环境中为你自己的 OpenDAL
+operator 加上的追踪层，可选 OpenTelemetry 指标）、[`oprobe-core`](crates/oprobe-core)（引擎、诊断、成本模型、
+调优器、运行存储，以及所有前端调用的服务层 `oprobe_core::app::App`）和 [`oprobe`](crates/oprobe)（命令行、MCP
+服务器和应用）。
+
+`oprobe completions bash|zsh|fish|powershell|elvish` 生成的补全脚本可以在输入时补全目标名、运行 ID、标签和发现
+代码。`--help` 只列出常用参数，`--help-all` 列出全部参数。
 
 ## 安装
 
@@ -115,7 +128,9 @@ oprobe run prod
 
 macOS 和 Windows 安装包**没有代码签名**（没有证书）：首次打开需要确认一次 —
 [方法](docs/install.md#first-open-of-unsigned-packages)。每个文件都在 `SHA256SUMS` 中有 SHA-256，并带有签名的
-SLSA 构建来源证明（`gh attestation verify`）。用 `oprobe self-update`（或你的包管理器）更新。
+SLSA 构建来源证明；`install.sh`、`install.ps1` 和 `oprobe self-update` 在 GitHub CLI 已登录时用
+`gh attestation verify` 校验它，否则校验 `SHA256SUMS` 的 minisign 签名（[校验方法](docs/install.md#verifying-a-download)）。
+用 `oprobe self-update`（或你的包管理器）更新。
 
 oprobe 不发送任何遥测数据。它只连接你指定的存储，以及在运行 `oprobe self-update` 时连接 GitHub。
 [隐私 →](docs/privacy.md)

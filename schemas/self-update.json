@@ -99,9 +99,29 @@
           "type": "string"
         }
       ]
+    },
+    "VerifiedBy": {
+      "description": "How a download was verified beyond its SHA-256 (`SHA256SUMS` comes from the same release).",
+      "oneOf": [
+        {
+          "const": "github_attestation",
+          "description": "The GitHub build provenance attestation of the release workflow (`gh attestation verify`).",
+          "type": "string"
+        },
+        {
+          "const": "minisign",
+          "description": "The minisign signature over `SHA256SUMS` with the embedded public key.",
+          "type": "string"
+        },
+        {
+          "const": "checksum_only",
+          "description": "Only the SHA-256 checksum (neither check could run here).",
+          "type": "string"
+        }
+      ]
     }
   },
-  "$id": "https://github.com/hxddh/oprobe/schemas/4/self-update.json",
+  "$id": "https://github.com/hxddh/oprobe/schemas/5/self-update.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "Result of `oprobe self-update`",
   "properties": {
@@ -153,6 +173,17 @@
     "update_command": {
       "description": "How to update this install.",
       "type": "string"
+    },
+    "verified_by": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/VerifiedBy"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "How the installed download was verified beyond its SHA-256 (set when installed)."
     },
     "warnings": {
       "description": "Warnings of the command (also printed on stderr in text mode).",
