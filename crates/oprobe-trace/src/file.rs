@@ -1,0 +1,150 @@
+//! The `.oprobe` file a traced operator writes ([`crate::Handle::save`],
+//! [`crate::Snapshot::save`]): format `oprobe.trace/6`, which `oprobe show FILE` and the
+//! workbench open like any other profile.
+//!
+//! It is one JSON document, so it can be read without oprobe:
+//!
+//! ```text
+//! {
+//!   "format": "oprobe.trace/6",
+//!   "oprobe_trace_version": "6.0.0",
+//!   "created_at": "2026-11-22T10:00:00Z",
+//!   "snapshot": { … the aggregates: per API and stage, connections, bytes, timeline … },
+//!   "rows": { "ops": [ … ], "reqs": [ … ], "info": { … }, "sampling": { … } }   // optional
+//! }
+//! ```
+//!
+//! The format is stable across 6.x: fields are only ever added.
+
+use std::io::{self, BufWriter, Write};
+use std::path::Path;
+
+use serde::{Deserialize, Serialize};
+
+use crate::Snapshot;
+use crate::log::TraceRows;
+use crate::rows::{OpRow, ReqRow, TraceInfo};
+use crate::sample::SamplingStats;
+
+/// The `format` of a file written by `oprobe-trace`.
+pub const TRACE_FORMAT: &str = "oprobe.trace/6";
+
+#[derive(Serialize)]
+struct FileRef<'a> {
+    format: &'static str,
+    oprobe_trace_version: &'static str,
+    created_at: String,
+    snapshot: &'a Snapshot,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rows: Option<RowsRef<'a>>,
+}
+
+#[derive(Serialize)]
+struct RowsRef<'a> {
+    ops: &'a [OpRow],
+    reqs: &'a [ReqRow],
+    info: &'a TraceInfo,
+    sampling: &'a SamplingStats,
+}
+
+/// Write `snapshot` (and, when given, the sampled rows) to `path`, atomically: the file is
+/// written next to `path` and renamed into place.
+pub(crate) fn write(path: &Path, snapshot: &Snapshot, rows: Option<&TraceRows>) -> io::Result<()> {
+    let doc = FileRef {
+        format: TRACE_FORMAT,
+        oprobe_trace_version: env!("CARGO_PKG_VERSION"),
+        created_at: crate::util::now_rfc3339(),
+        snapshot,
+        rows: rows.map(|r| RowsRef {
+            ops: &r.ops,
+            reqs: &r.reqs,
+            info: &r.info,
+            sampling: &r.sampling,
+        }),
+    };
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = std::path::PathBuf::from(tmp);
+    let result = (|| {
+        let mut w = BufWriter::new(std::fs::File::create(&tmp)?);
+        serde_json::to_writer(&mut w, &doc).map_err(io::Error::other)?;
+        w.write_all(b"\n")?;
+        w.into_inner().map_err(|e| e.into_error())?.sync_all()
+    })();
+    match result {
+        Ok(()) => std::fs::rename(&tmp, path),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
+/// A file written by `oprobe-trace`, read back.
+#[derive(Clone, Debug, Deserialize)]
+#[cfg_attr(not(feature = "__internal"), allow(dead_code))]
+pub struct TraceFile {
+    /// Always [`TRACE_FORMAT`].
+    pub format: String,
+    pub oprobe_trace_version: String,
+    pub created_at: String,
+    pub snapshot: Snapshot,
+    #[serde(default)]
+    rows: Option<OwnedRows>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct OwnedRows {
+    ops: Vec<OpRow>,
+    reqs: Vec<ReqRow>,
+    info: TraceInfo,
+    sampling: SamplingStats,
+}
+
+#[cfg_attr(not(feature = "__internal"), allow(dead_code))]
+impl TraceFile {
+    /// Whether `bytes` (the start of a file) look like a trace file: a JSON object rather than
+    /// the zstd stream of an `oprobe.run` file.
+    pub fn sniff(bytes: &[u8]) -> bool {
+        bytes
+            .iter()
+            .find(|b| !b.is_ascii_whitespace())
+            .is_some_and(|b| *b == b'{')
+    }
+
+    /// Read a trace file. Fails on another format (an `oprobe.run` file, or a later major).
+    pub fn read(path: &Path) -> io::Result<TraceFile> {
+        let f = std::fs::File::open(path)?;
+        let file: TraceFile = serde_json::from_reader(io::BufReader::new(f))
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        if file.format != TRACE_FORMAT {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "`{}` is format `{}`, not `{TRACE_FORMAT}`",
+                    path.display(),
+                    file.format
+                ),
+            ));
+        }
+        Ok(file)
+    }
+
+    /// The sampled rows the file holds (empty when it was written from a bare snapshot).
+    pub fn rows(&self) -> TraceRows {
+        match &self.rows {
+            Some(r) => TraceRows {
+                ops: r.ops.clone(),
+                reqs: r.reqs.clone(),
+                info: r.info.clone(),
+                sampling: r.sampling,
+            },
+            None => TraceRows::default(),
+        }
+    }
+
+    /// Whether the file holds rows (written by [`crate::Handle::save`]).
+    pub fn has_rows(&self) -> bool {
+        self.rows.is_some()
+    }
+}

@@ -7,9 +7,8 @@ use serde::{Deserialize, Serialize};
 use super::tls::TlsClientOptions;
 
 /// HTTP protocol preference.
-#[derive(
-    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
-)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum HttpVersion {
     /// Negotiate via ALPN (h2 preferred for https), HTTP/1.1 for plain http.

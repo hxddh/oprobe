@@ -44,7 +44,7 @@ impl Default for SampleConfig {
 }
 
 /// What the sampler kept (summed over shards; `report.sampling`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SamplingStats {
     pub seen_ops: u64,
     pub kept_ops: u64,

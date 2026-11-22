@@ -5,7 +5,6 @@
 use std::collections::{HashMap, HashSet};
 
 use hdrhistogram::Histogram;
-use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// Prefixes tracked at most (the rest count as `(other)`).
@@ -20,7 +19,9 @@ pub const HOT_KEYS: usize = 20;
 pub const DEFAULT_PREFIX_DEPTH: u32 = 1;
 
 /// One slice: operations, requests, failures, throttling and the tail.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[cfg_attr(not(feature = "__internal"), non_exhaustive)]
 pub struct SliceStats {
     pub key: String,
     pub ops_count: u64,
@@ -31,7 +32,9 @@ pub struct SliceStats {
 }
 
 /// A hot key's traffic and throttling.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[cfg_attr(not(feature = "__internal"), non_exhaustive)]
 pub struct HotKeyStats {
     pub key: String,
     pub requests_count: u64,
@@ -39,7 +42,9 @@ pub struct HotKeyStats {
 }
 
 /// The dimensions of a measurement window.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[cfg_attr(not(feature = "__internal"), non_exhaustive)]
 pub struct DimensionStats {
     pub prefix_depth_count: u32,
     pub prefixes: Vec<SliceStats>,

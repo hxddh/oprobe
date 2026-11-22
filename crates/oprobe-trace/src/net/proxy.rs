@@ -1,11 +1,6 @@
 //! HTTP CONNECT egress proxy support (`HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` / `NO_PROXY`).
 
-use std::io;
 use std::net::IpAddr;
-
-use tokio::io::{AsyncRead, AsyncWrite};
-
-use super::dial::{read_response_head, write_all};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProxyConfig {
@@ -23,10 +18,9 @@ impl ProxyConfig {
         } else {
             format!("http://{raw}")
         };
-        use crate::error::{ErrorCode, OprobeError};
         let usage = |m: String| {
-            OprobeError::new(ErrorCode::UsageInvalidArgument, m).with_hint(
-                "pass --proxy http://HOST:PORT, or `none` to ignore HTTPS_PROXY/HTTP_PROXY",
+            super::ConfigError::new(m).with_hint(
+                "use an http://HOST:PORT proxy, or unset HTTPS_PROXY/HTTP_PROXY",
             )
         };
         let u = url::Url::parse(&with_scheme)
@@ -101,41 +95,6 @@ impl ProxyConfig {
         })
     }
 
-    pub(crate) async fn connect_tunnel<S: AsyncRead + AsyncWrite + Unpin>(
-        &self,
-        s: &mut S,
-        host: &str,
-        port: u16,
-    ) -> io::Result<()> {
-        let authority = if host.contains(':') && !host.starts_with('[') {
-            format!("[{host}]:{port}")
-        } else {
-            format!("{host}:{port}")
-        };
-        let mut req = format!(
-            "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nUser-Agent: oprobe/{}\r\n",
-            env!("CARGO_PKG_VERSION")
-        );
-        if let Some(a) = &self.auth {
-            req.push_str(&format!("Proxy-Authorization: Basic {a}\r\n"));
-        }
-        req.push_str("\r\n");
-        write_all(s, req.as_bytes()).await?;
-        let head = read_response_head(s).await?;
-        let status_line = head.lines().next().unwrap_or_default();
-        let code: u16 = status_line
-            .split_whitespace()
-            .nth(1)
-            .and_then(|c| c.parse().ok())
-            .unwrap_or(0);
-        if code / 100 != 2 {
-            return Err(io::Error::new(
-                io::ErrorKind::ConnectionRefused,
-                format!("proxy refused CONNECT {authority}: {status_line}"),
-            ));
-        }
-        Ok(())
-    }
 }
 
 fn cidr_contains(net: &str, bits: &str, ip: IpAddr) -> bool {

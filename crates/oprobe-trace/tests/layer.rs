@@ -1,7 +1,19 @@
-//! The public API on a `memory://` operator: layer it, use it, read a snapshot.
+//! The public API on a `memory://` operator: layer it, use it, read a snapshot, save a profile.
 
 use opendal_core::Operator;
 use opendal_core::services::Memory;
+
+fn temp_file(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("oprobe-trace-test-{}-{name}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir.join("profile.oprobe")
+}
+
+fn read_json(path: &std::path::Path) -> serde_json::Value {
+    let text = std::fs::read_to_string(path).unwrap();
+    std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    serde_json::from_str(&text).unwrap()
+}
 
 #[tokio::test]
 async fn a_memory_operator_reports_its_requests() {
@@ -30,19 +42,33 @@ async fn a_memory_operator_reports_its_requests() {
     let down: u64 = snap.apis.iter().map(|a| a.bytes_down).sum();
     assert_eq!(down, 10 * 1024);
 
-    // Requests outside any operation scope are kept as rows too (op id 0), in every shard.
-    let rows = handle.take_rows();
-    assert_eq!(rows.reqs.len(), 21);
-    assert!(rows.reqs.iter().all(|r| r.op_id == 0));
-    assert_eq!(rows.sampling.seen_requests, 21);
+    // The profile holds the aggregates and every request (outside any operation: op id 0).
+    let path = temp_file("requests");
+    handle.save(&path).unwrap();
+    let doc = read_json(&path);
+    assert_eq!(doc["format"], "oprobe.trace/6");
+    assert_eq!(doc["oprobe_trace_version"], env!("CARGO_PKG_VERSION"));
+    let reqs = doc["rows"]["reqs"].as_array().unwrap();
+    assert_eq!(reqs.len(), 21);
+    assert!(reqs.iter().all(|r| r["op_id"] == 0));
+    assert_eq!(doc["rows"]["sampling"]["seen_requests"], 21);
+    let apis = doc["snapshot"]["apis"].as_array().unwrap();
+    let total: u64 = apis
+        .iter()
+        .map(|a| a["requests_count"].as_u64().unwrap())
+        .sum();
+    assert_eq!(total, 21);
+
+    // Saving moved the rows out of memory: the next profile starts afresh.
+    let path = temp_file("again");
+    handle.save(&path).unwrap();
+    let doc = read_json(&path);
+    assert!(doc["rows"]["reqs"].as_array().unwrap().is_empty());
 }
 
 #[tokio::test]
 async fn memory_stays_bounded() {
-    let (layer, handle) = oprobe_trace::layer(oprobe_trace::Config {
-        max_rows: 64,
-        ..Default::default()
-    });
+    let (layer, handle) = oprobe_trace::layer(oprobe_trace::Config::default().max_rows(64));
     let op = Operator::new(Memory::default()).unwrap().layer(layer);
     op.write("k", vec![1u8; 16]).await.unwrap();
     for _ in 0..2_000 {
@@ -57,9 +83,25 @@ async fn memory_stays_bounded() {
         .sum();
     // Aggregates are exact; rows are capped.
     assert_eq!(heads, 2_000);
-    let rows = handle.take_rows();
-    assert!(rows.reqs.len() <= 64, "{}", rows.reqs.len());
-    assert_eq!(rows.sampling.seen_requests, 2_001);
+    let path = temp_file("bounded");
+    handle.save(&path).unwrap();
+    let doc = read_json(&path);
+    let kept = doc["rows"]["reqs"].as_array().unwrap().len();
+    assert!(kept <= 64, "{kept}");
+    assert_eq!(doc["rows"]["sampling"]["seen_requests"], 2_001);
+}
+
+#[tokio::test]
+async fn a_snapshot_saves_without_rows() {
+    let (layer, handle) = oprobe_trace::layer(oprobe_trace::Config::default());
+    let op = Operator::new(Memory::default()).unwrap().layer(layer);
+    op.write("a", "x").await.unwrap();
+    let path = temp_file("snapshot");
+    handle.snapshot().save(&path).unwrap();
+    let doc = read_json(&path);
+    assert_eq!(doc["format"], "oprobe.trace/6");
+    assert!(doc.get("rows").is_none());
+    assert_eq!(doc["snapshot"]["apis"][0]["api"], "PutObject");
 }
 
 struct Count(std::sync::atomic::AtomicU64);
@@ -74,9 +116,19 @@ impl oprobe_trace::Exporter for Count {
 async fn the_exporter_hook_sees_every_request() {
     let count = std::sync::Arc::new(Count(Default::default()));
     let (layer, _handle) =
-        oprobe_trace::layer(oprobe_trace::Config::default().with_exporter(count.clone()));
+        oprobe_trace::layer(oprobe_trace::Config::default().exporter(count.clone()));
     let op = Operator::new(Memory::default()).unwrap().layer(layer);
     op.write("a", "x").await.unwrap();
     op.read("a").await.unwrap();
     assert_eq!(count.0.load(std::sync::atomic::Ordering::Relaxed), 2);
+}
+
+#[test]
+fn an_invalid_proxy_is_reported_not_fatal() {
+    let (_layer, handle) =
+        oprobe_trace::layer(oprobe_trace::Config::default().proxy(Some("socks5://x:1")));
+    let err = handle
+        .transport_error()
+        .expect("the transport must refuse the proxy");
+    assert!(err.contains("http://"), "{err}");
 }

@@ -3,28 +3,24 @@
 
 use std::sync::{Arc, OnceLock};
 
+#[cfg(feature = "__internal")]
 use anyhow::{Context, Result};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::CryptoProvider;
-use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, ServerConfig, SignatureScheme};
+use rustls::{DigitallySignedStruct, SignatureScheme};
+#[cfg(feature = "__internal")]
 use rustls_pki_types::pem::PemObject;
-use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
-use tokio_rustls::{TlsAcceptor, TlsConnector};
+use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
+#[cfg(feature = "__internal")]
+use tokio_rustls::TlsAcceptor;
 
 static CRYPTO_PROVIDER: OnceLock<Arc<CryptoProvider>> = OnceLock::new();
-static SYSTEM_ROOT_CERTS: OnceLock<Vec<CertificateDer<'static>>> = OnceLock::new();
 
 /// Return the shared `rustls::crypto::CryptoProvider` (aws-lc-rs).
 pub fn crypto_provider() -> Arc<CryptoProvider> {
     CRYPTO_PROVIDER
         .get_or_init(|| Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
         .clone()
-}
-
-fn cached_system_certs() -> &'static [CertificateDer<'static>] {
-    SYSTEM_ROOT_CERTS
-        .get_or_init(|| rustls_native_certs::load_native_certs().certs)
-        .as_slice()
 }
 
 /// TLS client negotiation & trust options.
@@ -46,24 +42,6 @@ impl Default for TlsClientOptions {
             insecure_skip_verify: false,
         }
     }
-}
-
-/// Build a `RootCertStore` combining Mozilla WebPKI roots, OS native roots, and optional custom PEMs.
-pub fn build_root_store(extra_ca_pem: Option<&str>) -> Result<RootCertStore> {
-    let mut store = RootCertStore::empty();
-    store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    for cert in cached_system_certs() {
-        let _ = store.add(cert.clone());
-    }
-    if let Some(pem) = extra_ca_pem {
-        for item in CertificateDer::pem_slice_iter(pem.as_bytes()) {
-            let cert = item.context("failed to parse custom CA PEM certificate")?;
-            store
-                .add(cert)
-                .context("failed to add custom CA certificate to RootCertStore")?;
-        }
-    }
-    Ok(store)
 }
 
 #[derive(Debug)]
@@ -118,28 +96,8 @@ impl ServerCertVerifier for InsecureCertVerifier {
     }
 }
 
-/// Build a `tokio_rustls::TlsConnector` from [`TlsClientOptions`].
-pub fn build_tls_connector(opts: &TlsClientOptions) -> Result<TlsConnector> {
-    let provider = crypto_provider();
-    let builder = ClientConfig::builder_with_provider(provider.clone())
-        .with_safe_default_protocol_versions()
-        .context("failed to configure TLS 1.2/1.3 protocol versions")?;
-
-    let mut cfg = if opts.insecure_skip_verify {
-        builder
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(InsecureCertVerifier { provider }))
-            .with_no_client_auth()
-    } else {
-        let roots = build_root_store(opts.extra_ca_pem.as_deref())?;
-        builder.with_root_certificates(roots).with_no_client_auth()
-    };
-
-    cfg.alpn_protocols.clone_from(&opts.alpn_protocols);
-    Ok(TlsConnector::from(Arc::new(cfg)))
-}
-
-/// Build a `tokio_rustls::TlsAcceptor` from PEM-encoded certificate chain and PKCS#8 private key.
+/// Build a `tokio_rustls::TlsAcceptor` (the lab server) from PEM-encoded certificate chain and PKCS#8 private key.
+#[cfg(feature = "__internal")]
 pub fn build_tls_acceptor(cert_pem: &str, key_pem: &str, enable_h2: bool) -> Result<TlsAcceptor> {
     let alpn: &[&[u8]] = if enable_h2 {
         &[b"h2", b"http/1.1"]
@@ -150,6 +108,7 @@ pub fn build_tls_acceptor(cert_pem: &str, key_pem: &str, enable_h2: bool) -> Res
 }
 
 /// A TLS acceptor offering exactly the `alpn` protocols (`[b"h2"]`: HTTP/2 only).
+#[cfg(feature = "__internal")]
 pub fn build_tls_acceptor_alpn(
     cert_pem: &str,
     key_pem: &str,
@@ -159,10 +118,10 @@ pub fn build_tls_acceptor_alpn(
     let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
         .collect::<std::result::Result<Vec<_>, _>>()
         .context("failed to parse server certificate PEM")?;
-    let key = PrivateKeyDer::from_pem_slice(key_pem.as_bytes())
+    let key = rustls_pki_types::PrivateKeyDer::from_pem_slice(key_pem.as_bytes())
         .context("failed to parse server private key PEM")?;
 
-    let mut cfg = ServerConfig::builder_with_provider(provider)
+    let mut cfg = rustls::ServerConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .context("failed to configure server TLS versions")?
         .with_no_client_auth()

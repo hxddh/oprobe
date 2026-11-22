@@ -12,8 +12,11 @@ homepage = "https://github.com/hxddh/oprobe"
 documentation = "https://github.com/hxddh/oprobe/tree/main/docs"
 
 [workspace.dependencies]
-oprobe-trace = { version = "6.0.0-dev", path = "crates/oprobe-trace" }
-oprobe-core = { version = "6.0.0-dev", path = "crates/oprobe-core", default-features = false }
+# The workspace crates pin each other exactly: oprobe-core uses oprobe-trace's internals
+# (`__internal`, no semver promise) and oprobe uses oprobe-core, which is internal itself.
+# Release: bump these two versions together with `workspace.package.version` (docs/releasing.md).
+oprobe-trace = { version = "=6.0.0-dev", path = "crates/oprobe-trace", features = ["__internal"] }
+oprobe-core = { version = "=6.0.0-dev", path = "crates/oprobe-core", default-features = false }
 
 opendal = { version = "0.59", default-features = false }
 opendal-core = { version = "0.59", default-features = false }

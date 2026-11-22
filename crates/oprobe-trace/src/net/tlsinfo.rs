@@ -22,7 +22,6 @@ use rustls::{
     SignatureScheme, SupportedCipherSuite, Tls12CipherSuite, Tls13CipherSuite,
 };
 use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
-use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::rows::TlsRow;
@@ -312,7 +311,8 @@ impl<V: ServerCertVerifier> ServerCertVerifier for ObservedVerifier<V> {
 // Certificate chain (doctor)
 
 /// One certificate the server presented.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct CertInfo {
     pub subject: String,
     pub issuer: String,
@@ -324,7 +324,8 @@ pub struct CertInfo {
 }
 
 /// The chain as presented (leaf first).
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct CertChain {
     pub certs: Vec<CertInfo>,
     /// Total DER size the server sends in every full handshake.
