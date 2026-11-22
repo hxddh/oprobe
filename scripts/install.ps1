@@ -109,7 +109,7 @@ try {
     $gh = Get-Command gh -ErrorAction SilentlyContinue
     $minisign = Get-Command minisign -ErrorAction SilentlyContinue
     $ghReady = $false
-    if ($gh) { & $gh.Source auth status *> $null; $ghReady = ($LASTEXITCODE -eq 0) }
+    if ($gh) { & $gh.Source auth status *> $null; $ghReady = ($LASTEXITCODE -eq 0); $global:LASTEXITCODE = 0 }
     if ($ghReady) {
       & $gh.Source attestation verify "$tmp\$name.zip" --repo $repo --signer-workflow "$repo/.github/workflows/release.yml"
       if ($LASTEXITCODE -ne 0) { throw "oprobe-install: the build provenance of $name.zip does not verify; nothing was installed" }

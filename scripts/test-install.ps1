@@ -86,6 +86,8 @@ try {
   if (-not $refused) { throw 'OPROBE_VERIFY=require installed an unverified download' }
   Write-Host 'ok: OPROBE_VERIFY=require refuses an unverifiable download'
   Write-Host 'install.ps1: all cases passed'
+  # The refused case leaves gh's non-zero exit code behind; the runner would exit with it.
+  $global:LASTEXITCODE = 0
 } finally {
   [Environment]::SetEnvironmentVariable('Path', $savedUserPath, 'User')
   if ($server) { Stop-Process -Id $server.Id -Force -ErrorAction SilentlyContinue }
