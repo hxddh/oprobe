@@ -478,8 +478,12 @@ impl Body for TracedBody {
 pub const UPLOAD_ACK_MIN_BYTES: u64 = 64 * 1024;
 
 /// When the kernel reports every byte of the request sent and acknowledged (polled every
-/// millisecond once the body was handed over). Never resolves without `TCP_INFO`.
+/// millisecond once the body was handed over). Never resolves without `TCP_INFO`, nor where it
+/// lacks the unsent and unacknowledged counts (only Linux reports them).
 async fn wait_acked(clock: Arc<ConnClock>, end_us: Arc<AtomicU64>) -> Instant {
+    if !cfg!(target_os = "linux") {
+        return std::future::pending().await;
+    }
     let mut tick = tokio::time::interval(Duration::from_millis(1));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
