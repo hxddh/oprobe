@@ -1094,7 +1094,13 @@ mod tests {
             (ol.intended_count as f64 - 400.0).abs() < 400.0 * 0.15,
             "{ol:?}"
         );
-        assert_eq!(ol.missed, 0, "{ol:?}");
+        // 8 slots keep up with 400/s against memory://: no backlog (the `schedule_backlog`
+        // threshold is 1 %). An arrival due in the last timer tick before the window closes may
+        // still be censored on a coarse-timer platform (Windows: ~15 ms ticks).
+        assert!(
+            ol.missed as f64 <= ol.intended_count as f64 * 0.01,
+            "{ol:?}"
+        );
 
         let mut p = profile("memory://");
         p.workload.shape = Some("ramp:0..400/1s".parse().unwrap());
