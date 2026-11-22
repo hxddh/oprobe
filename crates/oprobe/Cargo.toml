@@ -27,10 +27,17 @@ path = "src/main.rs"
 
 [features]
 default = ["app", "default-services"]
-# The app (bare `oprobe`): the nsh workbench in a terminal; `gui` adds native windows. Phase B of
-# oprobe 6 wires the nsh crates below into these features; today the app is a stub.
-app = []
-gui = ["app"]
+# The app (bare `oprobe`): the nsh workbench in any terminal (no GUI toolkit needed).
+app = [
+  "dep:nsh-core",
+  "dep:nsh-base",
+  "dep:nsh-platform-tui",
+  "dep:ratatui-core",
+  "dep:ratatui-crossterm",
+  "dep:crossterm",
+]
+# Native windows for the app (AppKit / Win32 / GTK 4; Linux builds need libgtk-4-dev).
+gui = ["app", "dep:nsh-platform-linux", "dep:nsh-platform-macos", "dep:nsh-platform-windows"]
 # OpenDAL services: the common clouds by default; `all-services` adds the rest.
 default-services = ["oprobe-core/default-services"]
 all-services = ["oprobe-core/all-services"]
@@ -78,6 +85,8 @@ nsh-platform-windows = { version = "0.6", default-features = false, features = [
 windows-sys.workspace = true
 
 [dev-dependencies]
+nsh-engine = { version = "0.6", default-features = false }
+nsh-testing = { version = "0.6", default-features = false }
 opendal-http-transport-reqwest = "0.59"
 tempfile.workspace = true
 jsonschema = { version = "0.61", default-features = false }
