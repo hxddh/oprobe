@@ -118,12 +118,13 @@ jobs:
       # docs/cli.md must name every flag of `--help`, llms-full.txt must match the docs
       # (`OPROBE_BLESS=1 cargo test --test docs`), and relative links must resolve.
       - run: cargo test --locked --test docs
-      - name: rustdoc of oprobe-trace (as docs.rs builds it) and oprobe-core
+      # The published API's docs must be clean (as docs.rs builds them); oprobe-core is internal.
+      - name: rustdoc of oprobe-trace
         env:
           RUSTDOCFLAGS: -D warnings
-        run: |
-          cargo doc --locked --no-deps -p oprobe-trace --features otel,schemars
-          cargo doc --locked --no-deps -p oprobe-core
+        run: cargo doc --locked --no-deps -p oprobe-trace --features otel,schemars
+      - name: rustdoc of oprobe-core
+        run: cargo doc --locked --no-deps -p oprobe-core
       - name: Links (external included)
         uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2.9.0
         with:
