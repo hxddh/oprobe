@@ -141,6 +141,20 @@ pub fn build_tls_connector(opts: &TlsClientOptions) -> Result<TlsConnector> {
 
 /// Build a `tokio_rustls::TlsAcceptor` from PEM-encoded certificate chain and PKCS#8 private key.
 pub fn build_tls_acceptor(cert_pem: &str, key_pem: &str, enable_h2: bool) -> Result<TlsAcceptor> {
+    let alpn: &[&[u8]] = if enable_h2 {
+        &[b"h2", b"http/1.1"]
+    } else {
+        &[b"http/1.1"]
+    };
+    build_tls_acceptor_alpn(cert_pem, key_pem, alpn)
+}
+
+/// A TLS acceptor offering exactly the `alpn` protocols (`[b"h2"]`: HTTP/2 only).
+pub fn build_tls_acceptor_alpn(
+    cert_pem: &str,
+    key_pem: &str,
+    alpn: &[&[u8]],
+) -> Result<TlsAcceptor> {
     let provider = crypto_provider();
     let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
         .collect::<std::result::Result<Vec<_>, _>>()
@@ -155,11 +169,7 @@ pub fn build_tls_acceptor(cert_pem: &str, key_pem: &str, enable_h2: bool) -> Res
         .with_single_cert(certs, key)
         .context("invalid server TLS certificate or private key")?;
 
-    cfg.alpn_protocols = if enable_h2 {
-        vec![b"h2".to_vec(), b"http/1.1".to_vec()]
-    } else {
-        vec![b"http/1.1".to_vec()]
-    };
+    cfg.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
 
     Ok(TlsAcceptor::from(Arc::new(cfg)))
 }

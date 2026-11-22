@@ -233,7 +233,8 @@ impl Session {
             }
         );
         if profile.target.is_network() {
-            super::operator::check_reachable(&base, &profile.target).await?;
+            super::operator::check_reachable_with(&base, &profile.target, &profile.knobs).await?;
+            super::operator::check_protocol(&base, &profile.target, &profile.knobs).await?;
         }
         let replay = match &profile.workload.replay {
             Some(spec) => {
@@ -1107,5 +1108,53 @@ mod tests {
         );
         // The next window continues with the rest of the log.
         assert_eq!(*s.replay_cursor.lock().unwrap(), 4);
+    }
+
+    #[tokio::test]
+    async fn lab_protocols_and_the_http2_preflight() {
+        use crate::net::HttpVersion;
+        let mut ok = Vec::new();
+        for (url, http, microscope) in [
+            ("lab://clean", HttpVersion::H2, false),
+            ("lab://clean", HttpVersion::H2, true),
+            ("lab://clean?proto=https", HttpVersion::Auto, false),
+            ("lab://clean?proto=h2", HttpVersion::H2, false),
+            ("lab://clean?proto=h2", HttpVersion::H2, true),
+        ] {
+            let mut p = profile(url);
+            p.knobs.http_version = http;
+            if microscope {
+                p.knobs.transport = crate::config::TransportMode::Microscope;
+            }
+            p.knobs.concurrency = 4;
+            let s = Session::open(p, Cancel::new(), quiet())
+                .await
+                .unwrap_or_else(|e| panic!("{url} {http:?} {microscope}: {e:#}"));
+            let knobs = s.profile.knobs.clone();
+            let snap = s.run(&knobs, &opts(300, None), None).await.unwrap();
+            assert_eq!(snap.summary.failed_ops, 0, "{url} {http:?}");
+            // (OpenDAL's own client negotiates HTTP/1.1 unless HTTP/2 is asked for.)
+            if http == HttpVersion::H2 || microscope {
+                assert!(
+                    snap.connections.http2_requests > 0,
+                    "{url} {http:?} {microscope}"
+                );
+            }
+            if url.contains("https") || url.contains("proto=h2") {
+                assert!(!snap.connections.tls_version.is_empty(), "{url}");
+            }
+            ok.push(url);
+        }
+        // A server without HTTP/2 is refused up front with a hint, not failed request by request.
+        let mut p = profile("lab://clean?proto=h1");
+        p.knobs.http_version = HttpVersion::H2;
+        let e = Session::open(p, Cancel::new(), quiet())
+            .await
+            .err()
+            .expect("refused");
+        let c = crate::errors::classify(&e, "s3");
+        assert_eq!(c.code, crate::errors::ErrorCode::NetHttp, "{e:#}");
+        assert!(c.hint.unwrap_or_default().contains("proto=h2c"));
+        assert!(crate::lab::LabProto::parse("h3").is_err());
     }
 }

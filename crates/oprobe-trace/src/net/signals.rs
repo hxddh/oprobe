@@ -85,7 +85,8 @@ fn cache_status(h: &http::HeaderMap) -> Option<String> {
 pub fn error_code_of(body: &[u8]) -> Option<String> {
     let body = &body[..body.len().min(ERROR_BODY_CAP)];
     let text = String::from_utf8_lossy(body);
-    let t = text.trim_start();
+    // Azure prefixes its XML with a byte-order mark.
+    let t = text.trim_start_matches('\u{feff}').trim_start();
     if t.starts_with('<') {
         let start = t.find("<Code>")? + "<Code>".len();
         let end = start + t[start..].find("</Code>")?;

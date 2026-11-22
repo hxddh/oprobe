@@ -1202,7 +1202,14 @@ impl TargetSpec {
             }
             "lab" => {
                 let scenario = crate::input::lab_scenario(host.as_deref().unwrap_or_default())?;
-                let lab = crate::lab::shared(scenario)?;
+                let proto = match options.remove("proto") {
+                    Some(p) => crate::lab::LabProto::parse(&p)?,
+                    None => crate::lab::LabProto::default(),
+                };
+                let lab = crate::lab::shared_with(scenario, proto)?;
+                if proto.tls() {
+                    options.insert("ca_cert_pem".into(), crate::lab::lab_ca_pem().into());
+                }
                 options.insert("bucket".into(), crate::lab::LAB_BUCKET.into());
                 options.insert("region".into(), "us-east-1".into());
                 options.insert("endpoint".into(), lab.endpoint_url.clone());
