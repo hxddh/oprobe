@@ -430,19 +430,19 @@
       "description": "The in-flight level the service accepts before it throttles.",
       "properties": {
         "hi_inflight_count": {
-          "description": "Lowest in-flight level whose arrivals were throttled (the limit is in `[lo, hi)`).",
+          "description": "First level clearly throttled above every plausible split, plus one level of\nmeasurement error (the limit is in `[lo, hi)`).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "inflight_count": {
-          "description": "In-flight requests the service accepted cleanly (the estimate; equals `lo`).",
+          "description": "In-flight requests the service accepts: the estimate (the likeliest split), which the\nmargins (safe concurrency, caps) apply their headroom to; `lo ≤ inflight_count < hi`.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "lo_inflight_count": {
-          "description": "Highest in-flight level whose arrivals were served without throttling.",
+          "description": "Lowest level the limit may lie at: the lowest split about as likely as the best, less\none level of client-side measurement error.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"

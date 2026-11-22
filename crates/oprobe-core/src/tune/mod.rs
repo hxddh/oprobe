@@ -384,7 +384,7 @@ impl Tuner<'_> {
     fn safe_for(&self, peak_per_op: f64) -> Option<usize> {
         let ce = self.ceiling?;
         let h = self.opts.headroom_ratio.clamp(0.0, 0.95);
-        Some(((ce.lo * (1.0 - h) / peak_per_op.max(1.0)).floor() as usize).max(1))
+        Some(((ce.requests * (1.0 - h) / peak_per_op.max(1.0)).floor() as usize).max(1))
     }
 
     /// Within the safety margin: its peak in-flight (concurrency × its per-op peak) stays

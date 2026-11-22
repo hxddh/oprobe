@@ -295,7 +295,7 @@ impl Ctx<'_> {
         match (self.cap.inflight_ceiling, self.safe) {
             (Some(c), Some(s)) => format!(
                 "the service throttles above ~{:.0} requests in flight ({} per operation at the peak): at most {s} workers{}",
-                c.lo,
+                c.requests,
                 self.cap.per_op.peak_inflight_per_op,
                 if self.cap.source == super::capacity::CapacitySource::History {
                     " (remembered from an earlier run)"
@@ -652,10 +652,10 @@ fn throttling(c: &Ctx) -> Option<Finding> {
             let p = cap.predict(to as u32);
             advice = format!(
                 "The service throttles above ~{:.0} requests in flight: run at concurrency ≤ {to} ({peak:.0} requests in flight per operation at the peak, {:.0}% headroom; predicted {:.0} ops/s), or cap `max_inflight_requests` at {:.0}; keep retries with jitter.",
-                ce.lo,
+                ce.requests,
                 headroom * 100.0,
                 p.ops_per_s,
-                (ce.lo * (1.0 - headroom)).floor().max(1.0)
+                (ce.requests * (1.0 - headroom)).floor().max(1.0)
             );
             verification = c.verify_concurrency(
                 format!(
@@ -1151,7 +1151,7 @@ fn client_queue(c: &Ctx) -> Option<Finding> {
         .then(|| match c.cap.inflight_ceiling {
             Some(ce) => {
                 let allowed =
-                    (ce.lo * (1.0 - super::capacity::DEFAULT_HEADROOM_RATIO)).floor() as u64;
+                    (ce.requests * (1.0 - super::capacity::DEFAULT_HEADROOM_RATIO)).floor() as u64;
                 let uncapped =
                     c.concurrency() as f64 * c.r.knobs.requested.io_concurrency_count.max(1) as f64;
                 if uncapped <= allowed as f64 {

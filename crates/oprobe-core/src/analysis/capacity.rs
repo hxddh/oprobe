@@ -72,15 +72,18 @@ impl Window {
 /// The in-flight level the service accepts before it throttles.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Ceiling {
-    /// In-flight requests the service accepted cleanly (the estimate; equals `lo`).
+    /// In-flight requests the service accepts: the estimate (the likeliest split), which the
+    /// margins (safe concurrency, caps) apply their headroom to; `lo ≤ inflight_count < hi`.
     #[serde(rename = "inflight_count", serialize_with = "ser_whole")]
     #[schemars(with = "u64")]
     pub requests: f64,
-    /// Highest in-flight level whose arrivals were served without throttling.
+    /// Lowest level the limit may lie at: the lowest split about as likely as the best, less
+    /// one level of client-side measurement error.
     #[serde(rename = "lo_inflight_count", serialize_with = "ser_whole")]
     #[schemars(with = "u64")]
     pub lo: f64,
-    /// Lowest in-flight level whose arrivals were throttled (the limit is in `[lo, hi)`).
+    /// First level clearly throttled above every plausible split, plus one level of
+    /// measurement error (the limit is in `[lo, hi)`).
     #[serde(rename = "hi_inflight_count", serialize_with = "ser_whole")]
     #[schemars(with = "u64")]
     pub hi: f64,
@@ -504,9 +507,10 @@ fn estimate_ceiling(reqs: &[ReqRow], ops: &[OpRow], window: Window) -> Capacity 
         .sum();
     let misclass = errors as f64 / reqs.len() as f64;
     let width = ceiling.hi - ceiling.lo;
-    cap.confidence = if near_thr >= 20 && near_clean >= 20 && misclass <= 0.05 && width <= 2.0 {
+    // The bracket carries one level of measurement error on each side (`find_ceiling`).
+    cap.confidence = if near_thr >= 20 && near_clean >= 20 && misclass <= 0.05 && width <= 4.0 {
         Confidence::High
-    } else if throttled >= 5 && misclass <= 0.15 && width <= (0.2 * ceiling.lo).max(4.0) {
+    } else if throttled >= 5 && misclass <= 0.15 && width <= (0.2 * ceiling.lo).max(4.0) + 2.0 {
         Confidence::Medium
     } else {
         Confidence::Low
@@ -530,10 +534,14 @@ fn estimate_ceiling(reqs: &[ReqRow], ops: &[OpRow], window: Window) -> Capacity 
 /// The highest class-balanced error a ceiling split may have (1.0 = no better than no split).
 const MAX_SPLIT_COST: f64 = 0.75;
 
+/// Log-likelihood within which a split is as plausible as the best (≈ a 95 % interval).
+const PLAUSIBLE_SPLIT_LL: f64 = 2.0;
+
 /// The level at or below which throttling is rarest and above which it is most common: the
 /// split of `lv` (`(level, clean, throttled)`, in level order) that maximises the likelihood of
-/// one throttled share below it and another above.
-fn likelihood_split(lv: &[(u64, u64, u64)]) -> u64 {
+/// one throttled share below it and another above — `(best, lowest, highest)` of the splits
+/// within [`PLAUSIBLE_SPLIT_LL`] of it.
+fn likelihood_split(lv: &[(u64, u64, u64)]) -> (u64, u64, u64) {
     let bern = |k: u64, n: u64| {
         if k == 0 || k == n {
             return 0.0;
@@ -544,16 +552,30 @@ fn likelihood_split(lv: &[(u64, u64, u64)]) -> u64 {
     let tot_c: u64 = lv.iter().map(|x| x.1).sum();
     let tot_t: u64 = lv.iter().map(|x| x.2).sum();
     let (mut c0, mut t0) = (0u64, 0u64);
+    let lls: Vec<(u64, f64)> = lv
+        .iter()
+        .map(|(l, c, t)| {
+            c0 += c;
+            t0 += t;
+            (
+                *l,
+                bern(t0, c0 + t0) + bern(tot_t - t0, tot_c - c0 + tot_t - t0),
+            )
+        })
+        .collect();
     let mut best = (f64::NEG_INFINITY, 0u64);
-    for (l, c, t) in lv {
-        c0 += c;
-        t0 += t;
-        let ll = bern(t0, c0 + t0) + bern(tot_t - t0, tot_c - c0 + tot_t - t0);
-        if ll > best.0 + 1e-9 {
-            best = (ll, *l);
+    for (l, ll) in &lls {
+        if *ll > best.0 + 1e-9 {
+            best = (*ll, *l);
         }
     }
-    best.1
+    let plausible = lls
+        .iter()
+        .filter(|(_, ll)| *ll >= best.0 - PLAUSIBLE_SPLIT_LL)
+        .map(|(l, _)| *l);
+    let low = plausible.clone().min().unwrap_or(best.1);
+    let high = plausible.max().unwrap_or(best.1);
+    (best.1, low, high)
 }
 
 /// Move the split `k` up past the levels right above it that were served (almost) cleanly:
@@ -609,32 +631,36 @@ fn find_ceiling(levels: &BTreeMap<u64, (u64, u64)>) -> Option<(Ceiling, u64)> {
     // in-flight count also reads a level or more low now and then — five stray throttles at
     // 18–23 (≈ 0.7 % of those levels, against 25–60 % from 24 on) pulled the split down to
     // 17 on a lab limited at 24.
-    let k = likelihood_split(&lv);
-    // ±1 measurement error: the client's in-flight count is a level off the server's now and
-    // then (coarse scheduling on Windows), so a lone throttled arrival can land one level low —
-    // or a clean one a level high. A level just above the split that still served ≥ 90 % of
-    // its (≥ 3) arrivals cleanly may be below the limit: the bracket widens to cover it. `lo`
-    // stays at or below the split, `hi` lies above the levels that may still be clean.
-    let k_hi = nudge_past_clean_levels(&lv, k);
+    let (k, k_low, k_high) = likelihood_split(&lv);
+    // The client's in-flight count is a level or so off the server's now and then (coarse
+    // scheduling on Windows and macOS, a loaded machine), both ways: a few throttles land below
+    // the limit, a few clean arrivals above it. Near the limit, levels have few arrivals, so
+    // the best split can err either way by a level or two (17–22 and 25 on a lab limited at 24).
+    // The bracket therefore spans every split about as likely as the best (profile likelihood
+    // within 2: ≈ 95 %): `lo` is the lowest of them, `hi` the first clearly throttled level
+    // above the highest — and above the levels just past the best split that still served
+    // ≥ 90 % of their (≥ 3) arrivals cleanly.
+    let k_hi = nudge_past_clean_levels(&lv, k).max(k_high);
     // A throttled arrival must exist above the split, or throttling does not follow load.
     lv.iter().find(|(l, _, t)| *l > k && *t > 0)?;
     let share = |c: u64, t: u64| t as f64 / (c + t).max(1) as f64;
-    let lo = lv
-        .iter()
-        .rev()
-        .find(|(l, c, t)| *l <= k && c + t >= 3 && share(*c, *t) <= 0.1)
-        .or_else(|| lv.iter().rev().find(|(l, c, _)| *l <= k && *c > 0))
-        .map_or(0, |x| x.0);
-    let above = k_hi.max(lo);
+    let above = k_hi.max(k_low);
     let hi = lv
         .iter()
         .find(|(l, c, t)| *l > above && c + t >= 2 && share(*c, *t) >= 0.5)
         .or_else(|| lv.iter().find(|(l, _, t)| *l > above && *t > 0))
-        .or_else(|| lv.iter().find(|(l, _, t)| *l > lo && *t > 0))?
+        .or_else(|| lv.iter().find(|(l, _, t)| *l > k_low && *t > 0))?
         .0;
+    // The client's count is a level off the server's now and then, either way, and near the
+    // limit the levels hold a handful of arrivals each: whether 24 or 25 was the last clean
+    // level is within that error (CI: a clean 23, 24 and 25 on a lab limited at 24, a loaded
+    // machine's lone throttles at 21–23). The bracket includes one level of it on each side;
+    // the estimate stays the likeliest split.
+    let lo = k_low.saturating_sub(1);
+    let hi = hi + 1;
     Some((
         Ceiling {
-            requests: lo as f64,
+            requests: (k as f64).clamp(lo as f64, (hi - 1) as f64),
             lo: lo as f64,
             hi: hi as f64,
         },
@@ -783,13 +809,14 @@ impl Capacity {
     }
 
     /// Workers that keep peak in-flight under the ceiling with `headroom_ratio` spare:
-    /// `floor(ceiling.lo × (1 − headroom) / peak_inflight_per_op)`, at least 1. `None` when no
+    /// `floor(ceiling.inflight_count × (1 − headroom) / peak_inflight_per_op)`, at least 1 (the
+    /// headroom applies to the estimate; the bracket only says how sure it is). `None` when no
     /// ceiling is known.
     pub fn safe_concurrency(&self, headroom_ratio: f64) -> Option<u32> {
         let c = self.inflight_ceiling?;
         let per_op = self.per_op.peak_inflight_per_op.max(1.0);
         let h = headroom_ratio.clamp(0.0, 0.95);
-        Some(((c.lo * (1.0 - h) / per_op).floor() as u32).max(1))
+        Some(((c.requests * (1.0 - h) / per_op).floor() as u32).max(1))
     }
 
     /// Expected throughput, throttling and peak in-flight at `concurrency` workers.
@@ -1018,13 +1045,13 @@ pub fn calibrate_capacity(cap: &mut Capacity, cal: &mut Calibration, obs: &Obser
         match cap.inflight_ceiling.as_mut() {
             Some(ce) if clean && peak > ce.lo => {
                 ce.lo = peak;
-                ce.requests = peak;
-                ce.hi = ce.hi.max(peak + 1.0);
+                ce.requests = ce.requests.max(peak);
+                ce.hi = ce.hi.max(ce.requests + 1.0);
             }
             Some(ce) if !clean && peak < ce.hi => {
                 ce.hi = peak.max(1.0);
                 ce.lo = ce.lo.min((peak - 1.0).max(0.0));
-                ce.requests = ce.lo;
+                ce.requests = ce.requests.min(ce.hi - 1.0).max(ce.lo);
             }
             None if !clean && peak > 1.0 => {
                 cap.inflight_ceiling = Some(Ceiling {
@@ -1292,7 +1319,9 @@ mod tests {
             "{ce:?} {}",
             c.confidence_reason
         );
-        assert_eq!(ce.requests, ce.lo);
+        // The estimate is the likeliest split (24 here), inside the bracket.
+        assert!(ce.lo <= ce.requests && ce.requests < ce.hi, "{ce:?}");
+        assert_eq!(ce.requests, 24.0, "{ce:?}");
         assert!(
             (c.per_op.peak_inflight_per_op - 1.0).abs() < 1e-9,
             "{:?}",
@@ -1301,7 +1330,7 @@ mod tests {
         assert!(c.per_op.sequential_fraction > 0.99, "{:?}", c.per_op);
         assert_eq!(
             c.safe_concurrency(0.15),
-            Some((ce.lo * 0.85).floor() as u32)
+            Some((ce.requests * 0.85).floor() as u32)
         );
         assert!(c.observed.throttled_requests_count > 0);
         assert!(c.observed.min_throttled_inflight_count.unwrap() > 24);
@@ -1446,6 +1475,28 @@ mod tests {
         assert!(c.lo <= 24.0 && 24.0 < c.hi, "{c:?}");
         // 24 × 0.85 / 4 parquet requests per op → 4 or 5 workers, not 3.
         assert!(c.lo >= 22.0, "{c:?}");
+    }
+
+    /// macOS CI, parquet lab (limit 24): throttles at 23 and 24 and a clean 25 (0 of 5). The
+    /// best split is 25; the bracket must still reach down to the limit.
+    #[test]
+    fn a_small_clean_level_above_the_limit_does_not_lift_the_bracket() {
+        let mut levels: BTreeMap<u64, (u64, u64)> = (1..=21u64).map(|l| (l, (100, 0))).collect();
+        for (l, n, t) in [
+            (22u64, 28u64, 0u64),
+            (23, 27, 1),
+            (24, 8, 1),
+            (25, 5, 0),
+            (26, 5, 2),
+            (27, 3, 2),
+            (28, 2, 2),
+            (29, 2, 2),
+        ] {
+            levels.insert(l, (n, t));
+        }
+        let (c, _) = find_ceiling(&levels).expect("a ceiling");
+        assert!(c.lo <= 24.0 && 24.0 < c.hi, "{c:?}");
+        assert!(c.lo >= 19.0, "{c:?}");
     }
 
     #[test]
