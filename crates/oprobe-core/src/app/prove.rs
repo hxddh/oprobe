@@ -1066,6 +1066,15 @@ async fn size(
     Ok(knee(&evals, obj))
 }
 
+/// The `kind` trials of the first `pairs` completed A/B pairs: a trailing baseline whose
+/// candidate did not run (the budget ended between them) is left out of every metric.
+fn paired(trials: &[ProveTrial], kind: TrialKind, pairs: u64) -> Vec<&ProveTrial> {
+    trials
+        .iter()
+        .filter(|x| x.kind == kind && x.pair.is_some_and(|p| p < pairs))
+        .collect()
+}
+
 /// Mean of a trial metric.
 fn mean(ts: &[&ProveTrial], f: impl Fn(&ProveTrial) -> f64) -> f64 {
     if ts.is_empty() {
@@ -1427,16 +1436,8 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
             "the sequential test did not decide within {pairs} pairs: the verdict reads the interval"
         ));
     }
-    let a_trials: Vec<&ProveTrial> = t
-        .out
-        .iter()
-        .filter(|x| x.kind == TrialKind::Baseline)
-        .collect();
-    let b_trials: Vec<&ProveTrial> = t
-        .out
-        .iter()
-        .filter(|x| x.kind == TrialKind::Candidate)
-        .collect();
+    let a_trials = paired(&t.out, TrialKind::Baseline, pairs);
+    let b_trials = paired(&t.out, TrialKind::Candidate, pairs);
     let secondary = secondary(obj, &a_trials, &b_trials, floor);
     let base_spec: &OperatorSpec = &run.report.spec.profile.operator;
     let mut changed = base_spec.clone();
@@ -1570,5 +1571,34 @@ mod tests {
         // One pair: the widest quantile, whatever the floor.
         let one = objective_interval(ProveObjective::Goodput, &[100.0], &[110.0], 0.02);
         assert!(one.high - one.low > 0.4, "{one:?}");
+    }
+
+    #[test]
+    fn an_unpaired_baseline_is_left_out_of_the_secondary_metrics() {
+        let ab = |kind, pair, throttled: u64| ProveTrial {
+            kind,
+            pair: Some(pair),
+            throttled_count: throttled,
+            throttled_request_ratio: throttled as f64 / 100.0,
+            ..trial(100.0, 10.0, true)
+        };
+        let trials = vec![
+            trial(50.0, 10.0, true), // sizing
+            ab(TrialKind::Baseline, 0, 0),
+            ab(TrialKind::Candidate, 0, 0),
+            ab(TrialKind::Baseline, 1, 0),
+            ab(TrialKind::Candidate, 1, 0),
+            // The budget ended before this baseline's candidate ran.
+            ab(TrialKind::Baseline, 2, 90),
+        ];
+        let a = paired(&trials, TrialKind::Baseline, 2);
+        let b = paired(&trials, TrialKind::Candidate, 2);
+        assert_eq!((a.len(), b.len()), (2, 2));
+        let sec = secondary(ProveObjective::Goodput, &a, &b, 0.02);
+        let thr = sec
+            .iter()
+            .find(|m| m.metric == "throttled_request_ratio")
+            .unwrap();
+        assert_eq!(thr.baseline, 0.0, "{thr:?}");
     }
 }
