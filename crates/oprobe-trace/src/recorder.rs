@@ -507,6 +507,8 @@ pub struct Recorder {
     observer_ns: AtomicU64,
     observer_samples: AtomicU64,
     completions: AtomicU64,
+    /// Cold start sampled during warmup: connect times and first-operation latencies.
+    cold: Mutex<(Histogram<u64>, Histogram<u64>)>,
 }
 
 impl Recorder {
@@ -547,6 +549,7 @@ impl Recorder {
             observer_ns: AtomicU64::new(0),
             observer_samples: AtomicU64::new(0),
             completions: AtomicU64::new(0),
+            cold: Mutex::new((hist(), hist())),
         })
     }
 
@@ -855,6 +858,26 @@ impl Recorder {
             .insert(op_id, at);
     }
 
+    /// Warmup operations that dialed: the cold start (connection setup is otherwise absorbed
+    /// by warmup and missing from short runs).
+    fn record_cold_start(&self, c: &OpCompletion) {
+        let cold: Vec<u64> = c
+            .data
+            .requests
+            .iter()
+            .filter(|r| !r.reused && r.protocol != Protocol::InProcess && r.timing.connect_us() > 0)
+            .map(|r| r.timing.connect_us())
+            .collect();
+        if cold.is_empty() {
+            return;
+        }
+        let mut g = self.cold.lock().unwrap_or_else(|e| e.into_inner());
+        for us in cold {
+            rec(&mut g.0, us);
+        }
+        rec(&mut g.1, c.latency_us);
+    }
+
     /// Measured observer cost per operation (µs): the recorder's bookkeeping of one completed
     /// operation, timed on one operation in [`OBSERVER_SAMPLE_EVERY`].
     pub fn observer_per_op_us(&self) -> Option<f64> {
@@ -909,6 +932,9 @@ impl Recorder {
             .remove(&c.op_id);
         if !measured || !self.is_measuring() {
             forget_live();
+            if self.phase() == Phase::Warmup {
+                self.record_cold_start(&c);
+            }
             return;
         }
         let window_start = self.window_start();
@@ -1255,6 +1281,14 @@ impl Recorder {
             proxy_connect: quantiles(&a.proxy),
             tls: quantiles(&a.tls),
             peak_inflight_requests: self.peak_inflight_requests.load(Ordering::Relaxed),
+            cold_start: {
+                let g = self.cold.lock().unwrap_or_else(|e| e.into_inner());
+                (!g.0.is_empty()).then(|| ColdStartStats {
+                    connections_count: g.0.len(),
+                    connect: quantiles(&g.0),
+                    first_ops: quantiles(&g.1),
+                })
+            },
         };
 
         let mut resilience = a.res.clone();

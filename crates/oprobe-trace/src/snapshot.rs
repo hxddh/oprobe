@@ -152,6 +152,21 @@ pub struct ConnStats {
     pub tls: Quantiles,
     #[serde(rename = "peak_inflight_requests_count")]
     pub peak_inflight_requests: u64,
+    /// Connection setup before warmup absorbed it (design v5 §3, M15): the dials and first
+    /// operations of the warmup's cold start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cold_start: Option<ColdStartStats>,
+}
+
+/// The cold start of a run: the connections dialed at the start of warmup and the operations
+/// that waited for them.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ColdStartStats {
+    pub connections_count: u64,
+    /// DNS + TCP + proxy + TLS of a fresh connection.
+    pub connect: Quantiles,
+    /// Latency of the operations whose requests dialed.
+    pub first_ops: Quantiles,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]

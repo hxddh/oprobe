@@ -966,7 +966,7 @@ mod tests {
     fn opts(ms: u64, rate: Option<f64>) -> RunOptions {
         RunOptions {
             duration: Duration::from_millis(ms),
-            warmup: Duration::ZERO,
+            warmup: Duration::from_millis(if rate.is_none() { 100 } else { 0 }),
             max_ops: None,
             rate,
             trace_slow_ops: false,
@@ -1100,7 +1100,12 @@ mod tests {
             s.warnings
         );
         let knobs = s.profile.knobs.clone();
-        let snap = s.run(&knobs, &opts(800, None), None).await.unwrap();
+        // (A warmup would replay the start of the log.)
+        let o = RunOptions {
+            warmup: Duration::ZERO,
+            ..opts(800, None)
+        };
+        let snap = s.run(&knobs, &o, None).await.unwrap();
         let ol = snap.open_loop.clone().unwrap();
         assert_eq!(ol.arrivals, "replay");
         // The 9 s event is outside the 0.8 s window.
@@ -1145,6 +1150,12 @@ mod tests {
                     "{url} {http:?} {microscope}"
                 );
             }
+            // Warmup took the dials; the cold start keeps their cost.
+            let cold = snap.connections.cold_start.as_ref().expect("cold start");
+            assert!(
+                cold.connections_count > 0 && cold.connect.p50 > 0.0,
+                "{cold:?}"
+            );
             if url.contains("https") || url.contains("proto=h2") {
                 assert!(!snap.connections.tls_version.is_empty(), "{url}");
             }
