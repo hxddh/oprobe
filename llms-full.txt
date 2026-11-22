@@ -46,20 +46,20 @@ URL — and saves your choice as a named target.
 
 ```text
 $ oprobe run prod
-[CRITICAL] Throttling-bound: the service rejected 3.6% of requests with 429/503;
+[CRITICAL] Throttling-bound: the service rejected 3.6% of requests with 429/503
   ✖ 626 throttled responses (429/503)
-    3.57% of requests throttled; 609 retries, 63.02s total backoff (25% of operat…
-    → The service is rate-limiting this request rate. Lower `concurrency` / `max…
-  ▲ `read.full` p99 is 50.9× its median
-    p50 5.04ms · p99 257ms · max 663ms
-    → See the slowest-operation timelines for the responsible stage. Server stra…
+    3.57% of requests throttled; 609 retries, 63.02s total backoff (25% of operation time)
+    → The service is rate-limiting this request rate. Lower `concurrency` / `max_inflight`
+      below the ceiling, or spread keys over more prefixes.
+    next: oprobe run --from 20261120-084637-d873 --set concurrency=20
   2114.0 ops/s · 119.2 MiB/s · p50 5.04ms · p99 257ms · errors 0.10%
-  626 throttled · SLA met
+  626 throttled (3.57% of requests) · SLA met (throttling not checked: --max-throttle-ratio)
 full report: oprobe runs show 20261120-084637-d873
 ```
 
-The default output is at most 20 lines that fit 80 columns: the verdict, the top findings (cause · evidence ·
-advice · next command), the key numbers, and where the full report is.
+The default output is the verdict, the top findings (cause · evidence · advice · next command), the key
+numbers, and where the full report is. It wraps to your terminal (100 columns when piped) and never cuts a
+command. `--lang zh-CN` (or a `zh_CN` locale) prints it in 简体中文; JSON output stays English.
 
 ## Look closer
 
@@ -114,22 +114,41 @@ Findings and Cost; the selected request or operation on the right. [More →](do
 ## In CI
 
 ```yaml
-- uses: hxddh/oprobe@v4
+- uses: hxddh/oprobe@v5
   with:
     target: s3://ci-bucket/oprobe
     preset: small-files
     baseline: main
+    repeat: 3
 ```
 
-The action installs the newest oprobe 4.x (or the `version` you pin), runs, compares against the baseline,
-uploads the `.oprobe` file and the HTML report, keeps one sticky PR comment up to date and fails on
-regression. [CI guide →](docs/ci.md)
+The action installs the newest oprobe 5.x (or the `version` you pin), runs, compares against the baseline
+(`--strict`: different targets or workloads fail), learns the target's noise floor once and keeps it with
+the capacity history in the Actions cache, uploads the `.oprobe` file and the HTML report, keeps one sticky
+PR comment up to date and fails on regression. `oprobe watch` probes production continuously and exports
+Prometheus (`/metrics`, `/healthz`) and OTLP metrics. [CI guide →](docs/ci.md)
 
 ## For agents
 
 Every command prints one JSON document with `-o json` and an event stream with `-o ndjson`; errors carry stable
 codes and exit codes; `oprobe schema` prints the JSON Schemas; `oprobe mcp` is an MCP server (read-only unless
 `--allow-write`). See [docs/agents.md](docs/agents.md) and [llms.txt](llms.txt).
+
+## Embed it
+
+oprobe 5.0 is three crates in one workspace:
+
+| Crate | For |
+|---|---|
+| [`oprobe-trace`](crates/oprobe-trace) | The instrumentation as an OpenDAL layer for your own operator in production: per-stage timing of every request, bounded memory, optional OpenTelemetry metrics (`otel`). `let (layer, handle) = oprobe_trace::layer(Config::default());` |
+| [`oprobe-core`](crates/oprobe-core) | The engine, diagnosis, cost model, tuner, run store and the service layer (`oprobe_core::app::App`) that every front end calls. |
+| [`oprobe`](crates/oprobe) | The binary: the CLI, the MCP server and the app. |
+
+## Shell
+
+`oprobe completions bash|zsh|fish|powershell|elvish` prints a completion script that completes target
+names, run ids, labels and finding codes as you type. `--help` shows the common flags of a command;
+`--help-all` shows all of them.
 
 ## Install
 
@@ -144,7 +163,9 @@ codes and exit codes; `oprobe schema` prints the JSON Schemas; `oprobe mcp` is a
 
 The macOS and Windows packages are **not code-signed** (no certificates): the first open needs one
 confirmation — [how](docs/install.md#first-open-of-unsigned-packages). Every asset has a SHA-256 in
-`SHA256SUMS` and a signed SLSA build provenance attestation (`gh attestation verify`). Update with
+`SHA256SUMS` and a signed SLSA build provenance attestation; `install.sh`, `install.ps1` and
+`oprobe self-update` verify it with `gh attestation verify` when the GitHub CLI is logged in, and otherwise
+a minisign signature over `SHA256SUMS` ([verifying](docs/install.md#verifying-a-download)). Update with
 `oprobe self-update` (or your package manager).
 
 oprobe sends no telemetry. It talks only to the storage you point it at, and to GitHub when you run
@@ -881,7 +902,7 @@ max_throttle_rate = 0.0     # throttled-operation share (unset: `run` ignores th
 ```
 
 Corrupted data (a CRC32C mismatch on read-back) always breaches the SLA. Every SLA field can also
-be set from the command line: `--max-error-rate 1%`, `--max-throttle-rate 0%`, `--p99-ms 250`,
+be set from the command line: `--max-error-ratio 1%`, `--max-throttle-ratio 0%`, `--p99-ms 250`,
 `--sla none`.
 
 ```toml
@@ -927,29 +948,36 @@ jobs:
         with:
           role-to-assume: arn:aws:iam::123456789012:role/oprobe-ci
           aws-region: eu-west-1
-      - uses: hxddh/oprobe@v4
+      - uses: hxddh/oprobe@v5       # pin a commit SHA for supply-chain hygiene: hxddh/oprobe@<sha> # v5.0.0
         with:
           target: s3://ci-bucket/oprobe
           preset: small-files
           duration: 20s
+          repeat: 3                 # three measurements: a surer verdict
           args: -c 16 --max-cost-usd 0.25 --option "user_agent=oprobe ci"
           baseline: main            # a name: kept in the Actions cache, refreshed by pushes to main
 ```
 
 What it does:
 
-1. installs oprobe (`version`: by default the newest release of the action's major version, so `@v4`
-   installs the newest 4.x) after checking its SHA-256 against the release's `SHA256SUMS`;
-2. `oprobe run TARGET` with the preset, duration and extra `args`, labelled with the commit SHA. `args`
-   and `compare-args` are split like a shell would split them — quotes keep a value with spaces together —
-   but never evaluated (no `$VAR`, no `$(…)`);
-3. compares the run with the baseline (`oprobe compare`), writing Markdown and JUnit;
-4. writes the comparison and the report to the job summary;
-5. uploads an artifact with the `.oprobe` run file, `oprobe-report.html`, `oprobe-report.md` and the gate
+1. installs oprobe (`version`: by default the newest release of the action's major version, so `@v5`
+   installs the newest 5.x) after checking its SHA-256 against the release's `SHA256SUMS`;
+2. restores oprobe's data directory for this target from the Actions cache (`cache-data`): the noise floor
+   and the capacity history survive from job to job (the runs themselves are not cached);
+3. `oprobe run TARGET --repeat N` with the preset, duration and extra `args`, labelled with the commit SHA.
+   `args` and `compare-args` are split like a shell would split them — quotes keep a value with spaces
+   together — but never evaluated (no `$VAR`, no `$(…)`);
+4. learns the target's noise floor (`oprobe baseline calibrate --from <run>`) when the data directory has
+   none yet (`calibrate: auto`), so compare tells noise from regressions;
+5. compares the run with the baseline (`oprobe compare --strict`: runs of different targets or workloads
+   fail with exit 2 instead of passing with a warning), writing Markdown and JUnit;
+6. saves the data directory back to the cache;
+7. writes the comparison and the report to the job summary;
+8. uploads an artifact with the `.oprobe` run file, `oprobe-report.html`, `oprobe-report.md` and the gate
    files — open the run later with `oprobe runs show oprobe-report/<id>.oprobe` or `oprobe runs open …`;
-6. posts one pull-request comment and updates it on every push (it finds its own comment by a marker). The
+9. posts one pull-request comment and updates it on every push (it finds its own comment by a marker). The
    comment step may fail without failing the job: pull requests from forks get a read-only token;
-7. fails the step on a regression (exit 3) or when the run breaches its SLA (`fail-on-regression: false`
+10. fails the step on a regression (exit 3) or when the run breaches its SLA (`fail-on-regression: false`
    only reports).
 
 ### Inputs
@@ -957,12 +985,17 @@ What it does:
 | Input | Default | |
 |---|---|---|
 | `target` | — | URL or configured name; `memory://` and `lab://demo` need no credentials |
-| `version` | `latest-major` | the newest release of the action's major (`@v4` → newest 4.x; resolved from `latest.json`, then the release list); `latest` = the newest release of any major; or an exact version such as `4.0.0` |
+| `version` | `latest-major` | the newest release of the action's major (`@v5` → newest 5.x; resolved from `latest.json`, then the release list); `latest` = the newest release of any major; or an exact version such as `5.0.0` |
 | `preset`, `duration` | preset's default, `20s` | |
 | `args` | | extra `oprobe run` flags (`-c 32`, `--region`, budgets, `--existing PREFIX`, …) |
+| `repeat` | `1` | measure N times (`oprobe run --repeat N`) and report the spread |
+| `calibrate` | `auto` | learn the noise floor: `auto` (while the cached data directory has none), `true` (every job), `false` |
+| `calibrate-repeat` | `4` | identical runs of the calibration (N − 1 A/A pairs) |
+| `cache-data` | `true` | keep the data directory (noise floor, capacity history) in the Actions cache, per target and runner OS |
+| `strict` | `true` | `oprobe compare --strict`: a different target or workload fails (exit 2) |
 | `baseline` | | a `.oprobe` / report `.json` path in the workspace, or a **name** stored in the Actions cache |
 | `update-baseline` | `auto` | replace a named baseline with this run: `auto` = pushes to the default branch that passed; `true` / `false` |
-| `compare-args` | | e.g. `--max-p99-increase 30 --allow-throttling` |
+| `compare-args` | | e.g. `--max-p99-increase-pct 30 --allow-throttling` |
 | `fail-on-regression` | `true` | |
 | `comment` | `true` | sticky PR comment (needs `pull-requests: write`) |
 | `artifact-name` | `oprobe-report` | also distinguishes comments when the action runs more than once |
@@ -1002,7 +1035,7 @@ jobs). In scripts, prefer `-o json` (one document) or `-o ndjson` (events, then 
 | 130 | interrupted |
 
 The default SLA of `oprobe run`: at most 1% failed operations and no corrupted data. Tighten it with
-`--max-error-rate 0.1%`, `--max-throttle-rate 0%`, `--p99-ms 250`; `--sla none` reports without failing;
+`--max-error-ratio 0.1%`, `--max-throttle-ratio 0%`, `--p99-ms 250`; `--sla none` reports without failing;
 `--fail-on warning|critical` also fails on findings of that severity.
 
 ## What the gate checks
@@ -1011,17 +1044,19 @@ The default SLA of `oprobe run`: at most 1% failed operations and no corrupted d
 |---|---|---|
 | same workload (`workload_hash`: dataset, mix, access, rate, warmup, duration) | must be identical | `--allow-workload-change` |
 | same target (normalised target identity: scheme, bucket, prefix) | must be identical | `--allow-target-change` |
-| throughput (ops/s, MiB/s) | −10 % | `--max-throughput-drop` |
-| p50 per operation | +20 % and > 1 ms | `--max-p50-increase`, `--min-latency-delta-ms` |
-| p99 per operation | +20 % and > 1 ms | `--max-p99-increase` |
-| failed operations | +0.5 percentage points | `--max-error-increase` |
+| throughput (ops/s, MiB/s) | −10 % | `--max-throughput-drop-pct` |
+| p50 per operation | +20 % and > 1 ms | `--max-p50-increase-pct`, `--min-latency-delta-ms` |
+| p99 per operation | +20 % and > 1 ms | `--max-p99-increase-pct` |
+| failed operations | +0.5 percentage points | `--max-error-increase-pp` |
 | new 429/503 throttling | not allowed | `--allow-throttling` |
 | CRC32C corruption | must be 0 | always |
-| requests per operation | +10 % | `--max-request-amp-increase` |
-| read amplification | +10 % | `--max-read-amp-increase` |
-| cost per 1M operations (when a price table applies to both) | +10 % | `--max-cost-increase` |
+| requests per operation | +10 % | `--max-request-amp-increase-pct` |
+| read amplification | +10 % | `--max-read-amp-increase-pct` |
+| cost per 1M operations (when a price table applies to both) | +10 % | `--max-cost-increase-pct` |
 
-Operations with fewer than `--min-samples` (30) samples are skipped for latency checks. Every setting that
+Units are in the flag names (`_pct`: percent, `_pp`: percentage points, `_ms`); the 4.x names
+(`--max-p99-increase`, …) still work as aliases. Operations with fewer than `--min-samples` (30) samples are
+skipped for latency checks. Every setting that
 differs is listed first. A different workload or target gives no regression verdict: the result is
 `comparable: false` with the differing spec keys (exit 0 with a warning, exit 2 under `--strict`).
 Different client knobs are an A/B comparison; a different host, proxy or oprobe version is a warning. Runs
@@ -1036,6 +1071,20 @@ replayed from one spec (`oprobe run --from RUN`) are always comparable.
 * `memory://` and `fs://` gate client-side regressions (OpenDAL usage, request amplification); gate network
   behaviour against a dedicated bucket or `lab://`.
 * Budgets keep a misconfigured job cheap: `--max-cost-usd`, `--max-requests`, `--max-duration`.
+
+## Watching production
+
+`oprobe watch TARGET --slo 'p99<200ms' --slo 'errors<1%'` probes at a low open-loop rate every `--interval`
+and checks the SLOs over a rolling `--window` (exit 3 when one is breached at the end).
+
+* `--listen 127.0.0.1:9464` serves Prometheus text on `/metrics` — every series labelled `target`, HELP text
+  on every metric, `oprobe_build_info{version}` and `oprobe_last_success_timestamp_seconds` (the end of the
+  last window without failed operations) — and `/healthz` (200, or 503 when no window succeeded within three
+  intervals).
+* `--otlp-endpoint http://collector:4318` pushes OTLP metrics after every window as one cumulative stream per
+  session: a stable `service.instance.id` (from the host and the target) and `oprobe.target` on the resource,
+  never a run id. The body is protobuf (`OTEL_EXPORTER_OTLP_PROTOCOL=http/json` for JSON) and
+  `OTEL_EXPORTER_OTLP_HEADERS` (e.g. `api-key=…`) adds headers, as for any OTel SDK.
 
 
 <!-- source: docs/agents.md -->
@@ -1729,8 +1778,8 @@ Then try it with no account: `oprobe demo` ([getting started](getting-started.md
 
 ### The install scripts
 
-`install.sh` and `install.ps1` download the archive for your platform, verify it against `SHA256SUMS` and
-install `oprobe` (Linux and macOS: `~/.local/bin`; Windows: `%LOCALAPPDATA%\Programs\oprobe`). Update later
+`install.sh` and `install.ps1` download the archive for your platform, verify it against `SHA256SUMS`, check
+its build provenance or signature ([verifying](#verifying-a-download)) and install `oprobe` (Linux and macOS: `~/.local/bin`; Windows: `%LOCALAPPDATA%\Programs\oprobe`). Update later
 with `oprobe self-update`.
 
 They find the latest version without the rate-limited GitHub API when they can, trying in order and falling
@@ -1738,10 +1787,12 @@ back on any failure: the release's `latest.json`, the `releases/latest` redirect
 
 | Variable | Effect |
 |---|---|
-| `OPROBE_VERSION=4.0.0` | install this version instead of the latest |
+| `OPROBE_VERSION=5.0.0` | install this version instead of the latest |
 | `OPROBE_INSTALL_DIR=DIR` | install somewhere else |
 | `OPROBE_MODIFY_PATH=1` / `0` | add the directory to `PATH` without asking / never touch `PATH` |
 | `OPROBE_RELEASE_BASE=URL` | release download base (mirrors, tests; default `https://github.com/hxddh/oprobe/releases`) |
+| `OPROBE_VERIFY=auto` / `require` / `checksum` | after the checksum: verify the provenance or signature when this machine can (default), insist on it, or skip it |
+| `OPROBE_MINISIGN_PUBKEY=KEY` | the minisign public key to verify `SHA256SUMS.minisig` with (overrides the embedded one) |
 
 **PATH.** When the install directory is not on `PATH`, `install.sh` offers to append it to your shell's rc
 file: `~/.zshrc` (zsh), `~/.bashrc` (bash; `~/.bash_profile` on macOS), `~/.config/fish/config.fish` (fish),
@@ -1824,37 +1875,55 @@ cargo install --locked --git https://github.com/hxddh/oprobe --tag v4.0.0 oprobe
 ## Updating
 
 `oprobe self-update` finds the release (the release's `latest.json` first, then the GitHub API), downloads
-the archive for this platform, verifies its SHA-256 (from `latest.json`, or the release's `SHA256SUMS`),
-checks that the new binary starts, and replaces the running one in place (`oprobe self-update --check` only
-reports; `--to v4.0.1` picks a release; `-o json` for scripts). A GitHub refusal (403, rate limit) is a
+the archive for this platform, verifies its SHA-256 (from `latest.json`, or the release's `SHA256SUMS`), then
+its build provenance or signature like the install scripts (`--verify auto|require|checksum`, or
+`OPROBE_VERIFY`; the result's `verified_by` says which check passed), checks that the new binary starts, and
+replaces the running one in place (`oprobe self-update --check` only reports; `--to v5.0.1` picks a release;
+`-o json` for scripts). A GitHub refusal (403, rate limit) is a
 network error (`net.unreachable`, retryable): set `GITHUB_TOKEN` or retry later. When
 oprobe was installed by a package manager (Homebrew, apt/dnf, the `.pkg` or `.app`, Scoop, winget, the MSI,
 cargo), it refuses and prints that manager's update command instead.
 
-`SHA256SUMS` comes from the same GitHub release as the archive, so the check proves the download is
-intact, not who built it: oprobe releases are not code-signed (no signing certificates), and the
-checksums are as trustworthy as the GitHub release itself. `OPROBE_RELEASE_BASE` replaces the release
+`SHA256SUMS` comes from the same GitHub release as the archive, so the checksum alone proves the download
+is intact, not who built it; the provenance attestation and the minisign signature below prove that. `OPROBE_RELEASE_BASE` replaces the release
 download base (default `https://github.com/hxddh/oprobe/releases`) and `OPROBE_UPDATE_API` the GitHub API base
 (default `https://api.github.com`; set alone, `latest.json` is not fetched from github.com). They exist for
 internal mirrors and tests — point them only at a server you trust, since they decide which binary is
 installed.
 
-## Verifying downloads
+## Verifying a download
 
-The checksums detect corrupted or truncated downloads; they are not a signature (see above).
+Three checks, from weakest to strongest. The install scripts and `oprobe self-update` run them
+automatically (design v5 §5): always the checksum, then the provenance when the GitHub CLI is installed and
+logged in, otherwise the minisign signature when `minisign` (or, for self-update, the embedded verifier) and
+the release's signature are available. A check that runs and fails always stops the install; a check that
+cannot run is a warning, or an error with `OPROBE_VERIFY=require` / `--verify require`.
+
+**Checksum.** Detects corrupted or truncated downloads; `SHA256SUMS` comes from the same release.
 
 ```bash
 sha256sum --ignore-missing -c SHA256SUMS                    # Linux
 shasum -a 256 --ignore-missing -c SHA256SUMS                # macOS
-Get-FileHash oprobe-4.0.0-x64.msi -Algorithm SHA256          # Windows
+Get-FileHash oprobe-5.0.0-x64.msi -Algorithm SHA256          # Windows
 ```
 
-Every asset also has a [SLSA build provenance](https://slsa.dev/) attestation signed by GitHub Actions, which
-proves it was built by this repository's release workflow from a given commit:
+**Build provenance.** Every asset has a [SLSA build provenance](https://slsa.dev/) attestation signed by
+GitHub Actions, which proves it was built by this repository's release workflow from a given commit:
 
 ```bash
-gh attestation verify oprobe-4.0.0-x86_64-unknown-linux-musl.tar.gz --repo hxddh/oprobe
+gh attestation verify oprobe-5.0.0-x86_64-unknown-linux-musl.tar.gz --repo hxddh/oprobe \
+  --signer-workflow hxddh/oprobe/.github/workflows/release.yml
 ```
+
+**minisign.** When the release is signed, `SHA256SUMS.minisig` is a [minisign](https://jedisct1.github.io/minisign/)
+signature over `SHA256SUMS`, made with a key held only by the release workflow. The public key is embedded in
+`install.sh`, `install.ps1` and the `oprobe` binary of the release (and printed in the release notes):
+
+```bash
+minisign -Vm SHA256SUMS -P <public key>     # then check the archive against SHA256SUMS as above
+```
+
+These signatures say who built a file; they are not operating-system code signing (below).
 
 ## First open of unsigned packages
 
@@ -1869,7 +1938,7 @@ signed or notarized**. The operating system asks for one confirmation the first 
 - **Windows**: SmartScreen says "Windows protected your PC": click **More info** → **Run anyway**.
 
 Homebrew, Scoop, winget, the install scripts, `cargo install` and the plain archives used from a terminal are
-not affected. Verify the download (above) before you confirm.
+not affected. Verify the download ([above](#verifying-a-download)) before you confirm.
 
 ## Shell completions (archives)
 
@@ -1881,7 +1950,9 @@ cp completions/oprobe.fish ~/.config/fish/completions/                         #
 ```
 
 Packages (deb, rpm, pkg, Homebrew) install completions and man pages themselves. `oprobe completions SHELL`
-and `oprobe man` generate them on any install.
+and `oprobe man` generate them on any install. The scripts are dynamic: they ask `oprobe` for candidates as
+you type, so target names, run ids, labels and finding codes complete (`oprobe` must be on `PATH`);
+`oprobe completions SHELL --static` prints the fixed script of earlier versions.
 
 
 <!-- source: docs/troubleshooting.md -->
@@ -2158,6 +2229,8 @@ Every command accepts the global options below. Exit codes: `0` ok · `1` runtim
 | `-q, --quiet` | No progress or informational messages on stderr |
 | `--non-interactive` | Never prompt or redraw (implied when stdin/stdout is not a terminal) |
 | `--config <PATH>` | Config file (default: $OPROBE_CONFIG or <config dir>/oprobe/config.toml) |
+| `--lang <LANG>` | Language of text output: en, zh-CN (default: LC_ALL / LC_MESSAGES / LANG); JSON stays English · env `OPROBE_LANG` |
+| `--help-all` | Print help with every flag (`--help` shows the common ones of large commands) |
 
 ## Commands
 
@@ -2188,7 +2261,7 @@ Every command accepts the global options below. Exit codes: `0` ok · `1` runtim
 | [`oprobe self-update`](#oprobe-self-update) | Check, download, verify and install the latest release |
 | [`oprobe top`](#oprobe-top) | Interactive workbench in this terminal: run, tune and probe with live charts |
 | [`oprobe gui`](#oprobe-gui) | The same workbench in a native window (macOS, Windows, Linux with GTK 4) |
-| [`oprobe completions`](#oprobe-completions) | Generate shell completions |
+| [`oprobe completions`](#oprobe-completions) | Generate shell completions (dynamic: target names and run ids complete live) |
 | [`oprobe man`](#oprobe-man) | Generate the man page |
 
 ## `oprobe run`
@@ -2265,8 +2338,8 @@ Output formats (`-o`): text, json, ndjson, md, html
 | argument | description |
 |---|---|
 | `--sla <MODE>` | `none` reports the SLA verdict without failing the command · one of `enforce`, `none` |
-| `--max-error-rate <RATE>` | Max share of failed operations, e.g. 1% or 0.01 (default 1%) |
-| `--max-throttle-rate <RATE>` | Max share of throttled (429/503) operations, e.g. 0% (default: not checked by `run`; `tune` rejects any throttling) |
+| `--max-error-ratio <RATIO>` | Max share of failed operations, e.g. 1% or 0.01 (default 1%) |
+| `--max-throttle-ratio <RATIO>` | Max share of throttled (429/503) requests, e.g. 0% or 0.001: an SLA of `run` (default: not checked) and the throttle budget of `tune` and `fix` (default 0.1%) |
 | `--p99-ms <MS>` | Max p99 latency per operation in ms (tune rejects trials above it) |
 
 *Output*
@@ -2384,8 +2457,8 @@ Output formats (`-o`): text, json, ndjson, md
 | argument | description |
 |---|---|
 | `--sla <MODE>` | `none` reports the SLA verdict without failing the command · one of `enforce`, `none` |
-| `--max-error-rate <RATE>` | Max share of failed operations, e.g. 1% or 0.01 (default 1%) |
-| `--max-throttle-rate <RATE>` | Max share of throttled (429/503) operations, e.g. 0% (default: not checked by `run`; `tune` rejects any throttling) |
+| `--max-error-ratio <RATIO>` | Max share of failed operations, e.g. 1% or 0.01 (default 1%) |
+| `--max-throttle-ratio <RATIO>` | Max share of throttled (429/503) requests, e.g. 0% or 0.001: an SLA of `run` (default: not checked) and the throttle budget of `tune` and `fix` (default 0.1%) |
 | `--p99-ms <MS>` | Max p99 latency per operation in ms (tune rejects trials above it) |
 
 *Output*
@@ -2420,7 +2493,6 @@ Output formats (`-o`): text, json, ndjson, md
 | `--max-trials <MAX_TRIALS>` | Maximum number of trials · default `24` |
 | `--max-concurrency <MAX_CONCURRENCY>` | Highest concurrency to try · default `256` |
 | `--cooldown <COOLDOWN>` | Pause after a throttled trial · default `5s` |
-| `--max-throttle-ratio <RATIO>` | Share of throttled requests a configuration may cause and still be feasible (default 0.001, or the profile's `sla.max_throttle_rate`) |
 | `--boundary-repeats <BOUNDARY_REPEATS>` | Runs of each bisection trial near the throttle boundary · default `2` |
 | `--headroom-ratio <RATIO>` | In-flight headroom kept below the throttling ceiling (default 0.15) |
 | `--budget <DURATION>` | Total wall-time budget of the tuner, e.g. 5m: caps the trials so the estimate fits (add --max-duration for a hard stop) |
@@ -2443,15 +2515,15 @@ Output formats (`-o`): text, json, ndjson, md, html
 | `<A>` | Baseline: RUNREF (id, prefix, last~N, label) or a .oprobe / report .json file |
 | `<B>` | Candidate: RUNREF or file (default: `last`) |
 | `--baseline <NAME>` | Compare against a named baseline instead of A |
-| `--max-p99-increase <MAX_P99_INCREASE>` | Max p99 increase per operation (%) · default `20` |
-| `--max-p50-increase <MAX_P50_INCREASE>` | Max p50 increase per operation (%) · default `20` |
-| `--min-latency-delta-ms <MIN_LATENCY_DELTA_MS>` | Ignore latency changes smaller than this (ms) · default `1` |
-| `--max-throughput-drop <MAX_THROUGHPUT_DROP>` | Max throughput drop (%) · default `10` |
-| `--max-error-increase <MAX_ERROR_INCREASE>` | Max increase of failed operations (percentage points) · default `0.5` |
-| `--max-request-amp-increase <MAX_REQUEST_AMP_INCREASE>` | Max increase of requests per operation (%) · default `10` |
-| `--max-read-amp-increase <MAX_READ_AMP_INCREASE>` | Max increase of read amplification (%) · default `10` |
-| `--max-cost-increase <MAX_COST_INCREASE>` | Max increase of cost per operation (%) · default `10` |
-| `--min-samples <MIN_SAMPLES>` | Minimum samples per operation for latency checks · default `30` |
+| `--max-p99-increase-pct <PCT>` | Max p99 increase per operation (%) · default `20` |
+| `--max-p50-increase-pct <PCT>` | Max p50 increase per operation (%) · default `20` |
+| `--min-latency-delta-ms <MS>` | Ignore latency changes smaller than this (ms) · default `1` |
+| `--max-throughput-drop-pct <PCT>` | Max throughput drop (%) · default `10` |
+| `--max-error-increase-pp <PP>` | Max increase of failed operations (percentage points) · default `0.5` |
+| `--max-request-amp-increase-pct <PCT>` | Max increase of requests per operation (%) · default `10` |
+| `--max-read-amp-increase-pct <PCT>` | Max increase of read amplification (%) · default `10` |
+| `--max-cost-increase-pct <PCT>` | Max increase of cost per operation (%) · default `10` |
+| `--min-samples <N>` | Minimum samples per operation for latency checks · default `30` |
 | `--allow-throttling` | Do not fail when the candidate starts getting throttled |
 | `--allow-workload-change` | Do not fail when the workload differs (preset, mix, dataset, access, rate) |
 | `--allow-target-change` | Do not fail when the target differs (scheme, bucket/prefix, endpoint, options) |
@@ -2565,8 +2637,8 @@ Output formats (`-o`): text, json, ndjson, md
 | argument | description |
 |---|---|
 | `--sla <MODE>` | `none` reports the SLA verdict without failing the command · one of `enforce`, `none` |
-| `--max-error-rate <RATE>` | Max share of failed operations, e.g. 1% or 0.01 (default 1%) |
-| `--max-throttle-rate <RATE>` | Max share of throttled (429/503) operations, e.g. 0% (default: not checked by `run`; `tune` rejects any throttling) |
+| `--max-error-ratio <RATIO>` | Max share of failed operations, e.g. 1% or 0.01 (default 1%) |
+| `--max-throttle-ratio <RATIO>` | Max share of throttled (429/503) requests, e.g. 0% or 0.001: an SLA of `run` (default: not checked) and the throttle budget of `tune` and `fix` (default 0.1%) |
 | `--p99-ms <MS>` | Max p99 latency per operation in ms (tune rejects trials above it) |
 
 *Output*
@@ -2601,7 +2673,6 @@ Output formats (`-o`): text, json, ndjson, md
 | `--max-trials <MAX_TRIALS>` | Maximum number of trials · default `24` |
 | `--max-concurrency <MAX_CONCURRENCY>` | Highest concurrency to try · default `256` |
 | `--cooldown <COOLDOWN>` | Pause after a throttled trial · default `5s` |
-| `--max-throttle-ratio <RATIO>` | Share of throttled requests a configuration may cause and still be feasible (default 0.001, or the profile's `sla.max_throttle_rate`) |
 | `--boundary-repeats <BOUNDARY_REPEATS>` | Runs of each bisection trial near the throttle boundary · default `2` |
 | `--headroom-ratio <RATIO>` | In-flight headroom kept below the throttling ceiling (default 0.15) |
 | `--budget <DURATION>` | Total wall-time budget of the tuning step, e.g. 5m (caps the trials so the estimate fits) |
@@ -3088,8 +3159,8 @@ Output formats (`-o`): text, json, ndjson, md
 | argument | description |
 |---|---|
 | `--sla <MODE>` | `none` reports the SLA verdict without failing the command · one of `enforce`, `none` |
-| `--max-error-rate <RATE>` | Max share of failed operations, e.g. 1% or 0.01 (default 1%) |
-| `--max-throttle-rate <RATE>` | Max share of throttled (429/503) operations, e.g. 0% (default: not checked by `run`; `tune` rejects any throttling) |
+| `--max-error-ratio <RATIO>` | Max share of failed operations, e.g. 1% or 0.01 (default 1%) |
+| `--max-throttle-ratio <RATIO>` | Max share of throttled (429/503) requests, e.g. 0% or 0.001: an SLA of `run` (default: not checked) and the throttle budget of `tune` and `fix` (default 0.1%) |
 | `--p99-ms <MS>` | Max p99 latency per operation in ms (tune rejects trials above it) |
 
 *Safety*
@@ -3148,7 +3219,7 @@ Output formats (`-o`): text, json, ndjson
 | `--max-bytes <SIZE>` | Stop after transferring this many bytes, e.g. 10GiB (exit 4) |
 | `--max-duration <DURATION>` | Stop after this much wall time, e.g. 5m (exit 4) |
 | `--idempotency-key <KEY>` | Name the run prefix after KEY: a retried command reuses and cleans it up |
-| `--min-score <PCT>` | Exit 3 when the score (percent of the checks that ran) is below this |
+| `--min-score-pct <PCT>` | Exit 3 when the score (percent of the checks that ran) is below this |
 
 ## `oprobe baseline`
 
@@ -3448,6 +3519,7 @@ Output formats (`-o`): text, json, ndjson
 | `--check` | Only check whether a newer release exists (exit 0 either way) |
 | `--to <TAG>` | Install this release tag instead of the latest (e.g. v3.0.1) |
 | `--force` | Reinstall even when already on that version |
+| `--verify <VERIFY>` | After the SHA-256 check: verify the build provenance (gh) or the minisign signature when possible (auto), insist on one of them (require), or skip both (checksum) · one of `auto`, `require`, `checksum` · default `auto` · env `OPROBE_VERIFY` |
 
 ## `oprobe top`
 
@@ -3503,7 +3575,7 @@ Output formats (`-o`): text
 
 ## `oprobe completions`
 
-Generate shell completions
+Generate shell completions (dynamic: target names and run ids complete live)
 
 ```text
 oprobe completions [OPTIONS] <SHELL>
@@ -3514,6 +3586,7 @@ Output formats (`-o`): text
 | argument | description |
 |---|---|
 | `<SHELL>` | · one of `bash`, `elvish`, `fish`, `powershell`, `zsh` |
+| `--static` | Print a static script (no target or run completion; for shells that cannot call back into oprobe) |
 
 ## `oprobe man`
 

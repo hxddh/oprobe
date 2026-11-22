@@ -45,6 +45,44 @@ The foundation of 5.0 (design [v5](docs/design/v5.md) §12 F). Everything below 
   (`all-services`); the default build covers s3, gcs, azblob, oss, cos, obs, b2, webdav, fs and
   memory.
 
+### CLI, automation and distribution
+
+- **Brief output wraps** to the terminal width (100 columns off a terminal, `COLUMNS` when set)
+  and never truncates; `next` commands are printed whole. Throttled requests show their share,
+  and an SLA without a throttle objective says so instead of "SLA met" alone.
+- **Help tiers.** `--help` lists the common flags of large commands and names the headings of
+  the rest; `--help-all` lists every flag.
+- **Flags with units.** One throttle flag, `--max-throttle-ratio` (the SLA of `run`, the budget of
+  `tune` and `fix`; `tune --max-throttle-ratio` and `--max-throttle-rate` are merged into it);
+  `--max-error-ratio`; compare `--max-p99-increase-pct`, `--max-p50-increase-pct`,
+  `--max-throughput-drop-pct`, `--max-error-increase-pp`, `--max-request-amp-increase-pct`,
+  `--max-read-amp-increase-pct`, `--max-cost-increase-pct`; `compat --min-score-pct`. The 4.x
+  names remain as hidden aliases.
+- **Dynamic completions.** `oprobe completions SHELL` completes target names, run ids, labels and
+  finding codes live; `--static` prints the 4.x script.
+- **简体中文.** `--lang zh-CN` (or `OPROBE_LANG`, `LC_ALL`, `LC_MESSAGES`, `LANG`) localizes the
+  brief, the findings' cause and advice, and error labels and codes; the catalog
+  (`oprobe_core::i18n`) is shared with the app. JSON output stays English.
+- **watch exports.** OTLP metrics are one cumulative stream per session with a stable
+  `service.instance.id` and the target (no run id per window), honour
+  `OTEL_EXPORTER_OTLP_HEADERS` and are protobuf by default (`OTEL_EXPORTER_OTLP_PROTOCOL=http/json`
+  for JSON). Prometheus series carry a `target` label, with `oprobe_build_info`,
+  `oprobe_last_success_timestamp_seconds`, HELP text and `/healthz`.
+- **GitHub Action.** `compare --strict` by default (`strict`), the data directory (noise floor,
+  capacity history) cached per target across jobs (`cache-data`), and `repeat`, `calibrate`,
+  `calibrate-repeat` inputs.
+- **Verified updates.** `install.sh`, `install.ps1` and `oprobe self-update` check the GitHub
+  build provenance (`gh attestation verify`) when the GitHub CLI is logged in, else a minisign
+  signature over `SHA256SUMS` (`SHA256SUMS.minisig`, signed by the release when `MINISIGN_KEY`
+  is set); `OPROBE_VERIFY` / `--verify auto|require|checksum`. The self-update result gains
+  `verified_by`.
+- **Supply chain and CI.** Every action is pinned by commit SHA with Dependabot updates, release
+  jobs use no caches, `cargo deny` checks advisories, licenses, bans and sources (`deny.toml`;
+  RUSTSEC-2023-0071 documented), pull requests test on Linux, macOS and Windows in debug with
+  cargo-nextest with cancel-in-progress, and release builds and installers run on main and
+  nightly only. crates.io publishes `oprobe-trace`, `oprobe-core`, `oprobe` in order.
+- Text: "1 request" (not "1 requests"); watch prints SLO values in their unit.
+
 ## v4.0.2 — 2026-11-21
 
 ### Fixed

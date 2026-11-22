@@ -15,6 +15,8 @@ Every command accepts the global options below. Exit codes: `0` ok · `1` runtim
 | `-q, --quiet` | No progress or informational messages on stderr |
 | `--non-interactive` | Never prompt or redraw (implied when stdin/stdout is not a terminal) |
 | `--config <PATH>` | Config file (default: $OPROBE_CONFIG or <config dir>/oprobe/config.toml) |
+| `--lang <LANG>` | Language of text output: en, zh-CN (default: LC_ALL / LC_MESSAGES / LANG); JSON stays English · env `OPROBE_LANG` |
+| `--help-all` | Print help with every flag (`--help` shows the common ones of large commands) |
 
 ## Commands
 
@@ -45,7 +47,7 @@ Every command accepts the global options below. Exit codes: `0` ok · `1` runtim
 | [`oprobe self-update`](#oprobe-self-update) | Check, download, verify and install the latest release |
 | [`oprobe top`](#oprobe-top) | Interactive workbench in this terminal: run, tune and probe with live charts |
 | [`oprobe gui`](#oprobe-gui) | The same workbench in a native window (macOS, Windows, Linux with GTK 4) |
-| [`oprobe completions`](#oprobe-completions) | Generate shell completions |
+| [`oprobe completions`](#oprobe-completions) | Generate shell completions (dynamic: target names and run ids complete live) |
 | [`oprobe man`](#oprobe-man) | Generate the man page |
 
 ## `oprobe run`
@@ -122,8 +124,8 @@ Output formats (`-o`): text, json, ndjson, md, html
 | argument | description |
 |---|---|
 | `--sla <MODE>` | `none` reports the SLA verdict without failing the command · one of `enforce`, `none` |
-| `--max-error-rate <RATE>` | Max share of failed operations, e.g. 1% or 0.01 (default 1%) |
-| `--max-throttle-rate <RATE>` | Max share of throttled (429/503) operations, e.g. 0% (default: not checked by `run`; `tune` rejects any throttling) |
+| `--max-error-ratio <RATIO>` | Max share of failed operations, e.g. 1% or 0.01 (default 1%) |
+| `--max-throttle-ratio <RATIO>` | Max share of throttled (429/503) requests, e.g. 0% or 0.001: an SLA of `run` (default: not checked) and the throttle budget of `tune` and `fix` (default 0.1%) |
 | `--p99-ms <MS>` | Max p99 latency per operation in ms (tune rejects trials above it) |
 
 *Output*
@@ -241,8 +243,8 @@ Output formats (`-o`): text, json, ndjson, md
 | argument | description |
 |---|---|
 | `--sla <MODE>` | `none` reports the SLA verdict without failing the command · one of `enforce`, `none` |
-| `--max-error-rate <RATE>` | Max share of failed operations, e.g. 1% or 0.01 (default 1%) |
-| `--max-throttle-rate <RATE>` | Max share of throttled (429/503) operations, e.g. 0% (default: not checked by `run`; `tune` rejects any throttling) |
+| `--max-error-ratio <RATIO>` | Max share of failed operations, e.g. 1% or 0.01 (default 1%) |
+| `--max-throttle-ratio <RATIO>` | Max share of throttled (429/503) requests, e.g. 0% or 0.001: an SLA of `run` (default: not checked) and the throttle budget of `tune` and `fix` (default 0.1%) |
 | `--p99-ms <MS>` | Max p99 latency per operation in ms (tune rejects trials above it) |
 
 *Output*
@@ -277,7 +279,6 @@ Output formats (`-o`): text, json, ndjson, md
 | `--max-trials <MAX_TRIALS>` | Maximum number of trials · default `24` |
 | `--max-concurrency <MAX_CONCURRENCY>` | Highest concurrency to try · default `256` |
 | `--cooldown <COOLDOWN>` | Pause after a throttled trial · default `5s` |
-| `--max-throttle-ratio <RATIO>` | Share of throttled requests a configuration may cause and still be feasible (default 0.001, or the profile's `sla.max_throttle_rate`) |
 | `--boundary-repeats <BOUNDARY_REPEATS>` | Runs of each bisection trial near the throttle boundary · default `2` |
 | `--headroom-ratio <RATIO>` | In-flight headroom kept below the throttling ceiling (default 0.15) |
 | `--budget <DURATION>` | Total wall-time budget of the tuner, e.g. 5m: caps the trials so the estimate fits (add --max-duration for a hard stop) |
@@ -300,15 +301,15 @@ Output formats (`-o`): text, json, ndjson, md, html
 | `<A>` | Baseline: RUNREF (id, prefix, last~N, label) or a .oprobe / report .json file |
 | `<B>` | Candidate: RUNREF or file (default: `last`) |
 | `--baseline <NAME>` | Compare against a named baseline instead of A |
-| `--max-p99-increase <MAX_P99_INCREASE>` | Max p99 increase per operation (%) · default `20` |
-| `--max-p50-increase <MAX_P50_INCREASE>` | Max p50 increase per operation (%) · default `20` |
-| `--min-latency-delta-ms <MIN_LATENCY_DELTA_MS>` | Ignore latency changes smaller than this (ms) · default `1` |
-| `--max-throughput-drop <MAX_THROUGHPUT_DROP>` | Max throughput drop (%) · default `10` |
-| `--max-error-increase <MAX_ERROR_INCREASE>` | Max increase of failed operations (percentage points) · default `0.5` |
-| `--max-request-amp-increase <MAX_REQUEST_AMP_INCREASE>` | Max increase of requests per operation (%) · default `10` |
-| `--max-read-amp-increase <MAX_READ_AMP_INCREASE>` | Max increase of read amplification (%) · default `10` |
-| `--max-cost-increase <MAX_COST_INCREASE>` | Max increase of cost per operation (%) · default `10` |
-| `--min-samples <MIN_SAMPLES>` | Minimum samples per operation for latency checks · default `30` |
+| `--max-p99-increase-pct <PCT>` | Max p99 increase per operation (%) · default `20` |
+| `--max-p50-increase-pct <PCT>` | Max p50 increase per operation (%) · default `20` |
+| `--min-latency-delta-ms <MS>` | Ignore latency changes smaller than this (ms) · default `1` |
+| `--max-throughput-drop-pct <PCT>` | Max throughput drop (%) · default `10` |
+| `--max-error-increase-pp <PP>` | Max increase of failed operations (percentage points) · default `0.5` |
+| `--max-request-amp-increase-pct <PCT>` | Max increase of requests per operation (%) · default `10` |
+| `--max-read-amp-increase-pct <PCT>` | Max increase of read amplification (%) · default `10` |
+| `--max-cost-increase-pct <PCT>` | Max increase of cost per operation (%) · default `10` |
+| `--min-samples <N>` | Minimum samples per operation for latency checks · default `30` |
 | `--allow-throttling` | Do not fail when the candidate starts getting throttled |
 | `--allow-workload-change` | Do not fail when the workload differs (preset, mix, dataset, access, rate) |
 | `--allow-target-change` | Do not fail when the target differs (scheme, bucket/prefix, endpoint, options) |
@@ -422,8 +423,8 @@ Output formats (`-o`): text, json, ndjson, md
 | argument | description |
 |---|---|
 | `--sla <MODE>` | `none` reports the SLA verdict without failing the command · one of `enforce`, `none` |
-| `--max-error-rate <RATE>` | Max share of failed operations, e.g. 1% or 0.01 (default 1%) |
-| `--max-throttle-rate <RATE>` | Max share of throttled (429/503) operations, e.g. 0% (default: not checked by `run`; `tune` rejects any throttling) |
+| `--max-error-ratio <RATIO>` | Max share of failed operations, e.g. 1% or 0.01 (default 1%) |
+| `--max-throttle-ratio <RATIO>` | Max share of throttled (429/503) requests, e.g. 0% or 0.001: an SLA of `run` (default: not checked) and the throttle budget of `tune` and `fix` (default 0.1%) |
 | `--p99-ms <MS>` | Max p99 latency per operation in ms (tune rejects trials above it) |
 
 *Output*
@@ -458,7 +459,6 @@ Output formats (`-o`): text, json, ndjson, md
 | `--max-trials <MAX_TRIALS>` | Maximum number of trials · default `24` |
 | `--max-concurrency <MAX_CONCURRENCY>` | Highest concurrency to try · default `256` |
 | `--cooldown <COOLDOWN>` | Pause after a throttled trial · default `5s` |
-| `--max-throttle-ratio <RATIO>` | Share of throttled requests a configuration may cause and still be feasible (default 0.001, or the profile's `sla.max_throttle_rate`) |
 | `--boundary-repeats <BOUNDARY_REPEATS>` | Runs of each bisection trial near the throttle boundary · default `2` |
 | `--headroom-ratio <RATIO>` | In-flight headroom kept below the throttling ceiling (default 0.15) |
 | `--budget <DURATION>` | Total wall-time budget of the tuning step, e.g. 5m (caps the trials so the estimate fits) |
@@ -945,8 +945,8 @@ Output formats (`-o`): text, json, ndjson, md
 | argument | description |
 |---|---|
 | `--sla <MODE>` | `none` reports the SLA verdict without failing the command · one of `enforce`, `none` |
-| `--max-error-rate <RATE>` | Max share of failed operations, e.g. 1% or 0.01 (default 1%) |
-| `--max-throttle-rate <RATE>` | Max share of throttled (429/503) operations, e.g. 0% (default: not checked by `run`; `tune` rejects any throttling) |
+| `--max-error-ratio <RATIO>` | Max share of failed operations, e.g. 1% or 0.01 (default 1%) |
+| `--max-throttle-ratio <RATIO>` | Max share of throttled (429/503) requests, e.g. 0% or 0.001: an SLA of `run` (default: not checked) and the throttle budget of `tune` and `fix` (default 0.1%) |
 | `--p99-ms <MS>` | Max p99 latency per operation in ms (tune rejects trials above it) |
 
 *Safety*
@@ -1005,7 +1005,7 @@ Output formats (`-o`): text, json, ndjson
 | `--max-bytes <SIZE>` | Stop after transferring this many bytes, e.g. 10GiB (exit 4) |
 | `--max-duration <DURATION>` | Stop after this much wall time, e.g. 5m (exit 4) |
 | `--idempotency-key <KEY>` | Name the run prefix after KEY: a retried command reuses and cleans it up |
-| `--min-score <PCT>` | Exit 3 when the score (percent of the checks that ran) is below this |
+| `--min-score-pct <PCT>` | Exit 3 when the score (percent of the checks that ran) is below this |
 
 ## `oprobe baseline`
 
@@ -1305,6 +1305,7 @@ Output formats (`-o`): text, json, ndjson
 | `--check` | Only check whether a newer release exists (exit 0 either way) |
 | `--to <TAG>` | Install this release tag instead of the latest (e.g. v3.0.1) |
 | `--force` | Reinstall even when already on that version |
+| `--verify <VERIFY>` | After the SHA-256 check: verify the build provenance (gh) or the minisign signature when possible (auto), insist on one of them (require), or skip both (checksum) · one of `auto`, `require`, `checksum` · default `auto` · env `OPROBE_VERIFY` |
 
 ## `oprobe top`
 
@@ -1360,7 +1361,7 @@ Output formats (`-o`): text
 
 ## `oprobe completions`
 
-Generate shell completions
+Generate shell completions (dynamic: target names and run ids complete live)
 
 ```text
 oprobe completions [OPTIONS] <SHELL>
@@ -1371,6 +1372,7 @@ Output formats (`-o`): text
 | argument | description |
 |---|---|
 | `<SHELL>` | · one of `bash`, `elvish`, `fish`, `powershell`, `zsh` |
+| `--static` | Print a static script (no target or run completion; for shells that cannot call back into oprobe) |
 
 ## `oprobe man`
 

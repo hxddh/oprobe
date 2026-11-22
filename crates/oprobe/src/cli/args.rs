@@ -1383,3 +1383,107 @@ pub struct MatrixArgs {
     #[arg(long, help_heading = "Matrix")]
     pub label: Option<String>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::{CommandFactory, Parser};
+
+    fn parse(args: &[&str]) -> Cli {
+        Cli::try_parse_from(std::iter::once("oprobe").chain(args.iter().copied()))
+            .unwrap_or_else(|e| panic!("{args:?}: {e}"))
+    }
+
+    #[test]
+    fn the_command_tree_is_valid() {
+        // clap's own consistency checks: ids, conflicts, requirements, value names.
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn one_throttle_flag_and_unit_suffixed_names() {
+        let Some(Command::Tune(t)) =
+            parse(&["tune", "memory://", "--max-throttle-ratio", "0.5%"]).command
+        else {
+            panic!()
+        };
+        assert_eq!(t.sla.max_throttle_rate.as_deref(), Some("0.5%"));
+        // The 4.x spellings still parse (hidden aliases).
+        let Some(Command::Run(r)) = parse(&[
+            "run",
+            "memory://",
+            "--max-throttle-rate",
+            "1%",
+            "--max-error-rate",
+            "2%",
+        ])
+        .command
+        else {
+            panic!()
+        };
+        assert_eq!(r.sla.max_throttle_rate.as_deref(), Some("1%"));
+        assert_eq!(r.sla.max_error_rate.as_deref(), Some("2%"));
+        let Some(Command::Compare(c)) = parse(&[
+            "compare",
+            "a",
+            "b",
+            "--max-p99-increase-pct",
+            "30",
+            "--max-error-increase",
+            "1",
+        ])
+        .command
+        else {
+            panic!()
+        };
+        assert_eq!((c.max_p99_increase, c.max_error_increase), (30.0, 1.0));
+        // No flag spells a unit-bearing quantity without its unit.
+        let help = Cli::command()
+            .find_subcommand("compare")
+            .unwrap()
+            .clone()
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("--max-p99-increase-pct") && !help.contains("--max-p99-increase "));
+    }
+
+    #[test]
+    fn global_flags_parse_anywhere() {
+        let cli = parse(&["runs", "list", "--lang", "zh-CN", "-o", "json"]);
+        assert_eq!(cli.lang.as_deref(), Some("zh-CN"));
+        assert!(Cli::try_parse_from(["oprobe", "--lang", "klingon", "runs", "list"]).is_err());
+        assert_eq!(
+            parse(&["--lang", "auto", "runs", "list"]).lang.as_deref(),
+            Some("auto")
+        );
+    }
+
+    #[test]
+    fn self_update_verification_policy() {
+        let Some(Command::SelfUpdate(a)) = parse(&["self-update", "--check"]).command else {
+            panic!()
+        };
+        assert_eq!(a.verify, VerifyPolicy::Auto);
+        let Some(Command::SelfUpdate(a)) = parse(&["self-update", "--verify", "require"]).command
+        else {
+            panic!()
+        };
+        assert_eq!(a.verify, VerifyPolicy::Require);
+    }
+
+    #[test]
+    fn completions_default_to_dynamic() {
+        let Some(Command::Completions { static_script, .. }) =
+            parse(&["completions", "zsh"]).command
+        else {
+            panic!()
+        };
+        assert!(!static_script);
+        let Some(Command::Completions { static_script, .. }) =
+            parse(&["completions", "bash", "--static"]).command
+        else {
+            panic!()
+        };
+        assert!(static_script);
+    }
+}
