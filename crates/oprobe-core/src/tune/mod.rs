@@ -203,6 +203,31 @@ struct Tuner<'a> {
     saturated: bool,
 }
 
+/// Of the successful operations that started in the measurement window `[0, window_s)`, the
+/// share that also finished inside it — by count and by bytes (1 without rows).
+///
+/// A trial counts every operation started in its window, including those still draining at
+/// the deadline, but divides by the window alone; each window also starts with every worker
+/// issuing at once. A closed loop of `c` workers thus over-counts by ≈ `c` operations: +60 %
+/// at 256 workers against a 400 ops/s queue in a 1 s trial, so goodput seemed to grow with the
+/// workers forever and the ladder never found the plateau. Goodput is scaled to the
+/// operations that completed by the deadline.
+fn completed_in_window(ops: &[crate::model::OpRow], window_s: f64) -> (f64, f64) {
+    let end = (window_s.max(0.0) * 1e6) as i64;
+    let (mut n, mut done, mut b, mut done_b) = (0u64, 0u64, 0u64, 0u64);
+    for o in ops.iter().filter(|o| o.ok && o.t_us >= 0 && o.t_us < end) {
+        let fin = o.t_us + o.latency_us as i64 <= end;
+        n += 1;
+        b += o.bytes;
+        if fin {
+            done += 1;
+            done_b += o.bytes;
+        }
+    }
+    let share = |d: u64, t: u64| if t == 0 { 1.0 } else { d as f64 / t as f64 };
+    (share(done, n), share(done_b, b))
+}
+
 impl Tuner<'_> {
     fn metric(&self, t: &Trial) -> f64 {
         if self.use_bytes {
@@ -269,13 +294,15 @@ impl Tuner<'_> {
         );
         let requests = snap.connections.requests;
         let throttled = snap.resilience.throttled_responses;
+        let (done_ops, done_bytes) = completed_in_window(&rows.ops, snap.elapsed_s);
         let mut t = Trial {
             id,
             stage: stage.into(),
             knobs: knobs.clone(),
             ops_per_s: snap.summary.ops.saturating_sub(snap.summary.failed_ops) as f64
-                / snap.elapsed_s.max(1e-3),
-            mib_per_s: snap.summary.mib_per_s,
+                / snap.elapsed_s.max(1e-3)
+                * done_ops,
+            mib_per_s: snap.summary.mib_per_s * done_bytes,
             p50_ms: snap.summary.latency.p50,
             p99_ms: worst_p99,
             error_rate: snap.summary.error_rate,
@@ -1331,6 +1358,28 @@ pub async fn tune(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn goodput_counts_operations_finished_by_the_deadline() {
+        let op = |t_ms: i64, lat_ms: u64, bytes: u64| {
+            let mut o = crate::analysis::simulate::tests::op(1, t_ms * 1000, lat_ms * 1000);
+            o.bytes = bytes;
+            o.ok = true;
+            o
+        };
+        // 1 s window: 3 finish inside, 1 drains past the deadline, 1 started in the warmup.
+        let ops = vec![
+            op(0, 100, 10),
+            op(400, 100, 10),
+            op(800, 150, 10),
+            op(950, 300, 30),
+            op(-100, 50, 10),
+        ];
+        let (n, b) = completed_in_window(&ops, 1.0);
+        assert!((n - 0.75).abs() < 1e-9, "{n}");
+        assert!((b - 0.5).abs() < 1e-9, "{b}");
+        assert_eq!(completed_in_window(&[], 1.0), (1.0, 1.0));
+    }
 
     #[test]
     fn write_chunk_candidates_respect_the_minimum_part_size() {
