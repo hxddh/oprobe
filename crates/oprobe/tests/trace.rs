@@ -244,3 +244,124 @@ async fn a_trace_shows_stragglers_and_cold_connections() {
     assert!(codes.contains(&"cold_connections"), "{codes:?}");
     assert!(!codes.contains(&"throttling"), "{codes:?}");
 }
+
+/// A hostile or corrupt trace file never panics `show FILE`: values out of range (a huge,
+/// negative or absurd elapsed time, counters at `u64::MAX`, latencies that overflow) are refused
+/// as `usage.invalid_argument` with a hint, or read with saturating arithmetic.
+#[tokio::test(flavor = "multi_thread")]
+async fn hostile_trace_values_never_panic_show() {
+    let dir = tempfile::tempdir().unwrap();
+    let good = dir.path().join("good.oprobe");
+    traced_workload(
+        &good,
+        LabConfig::default(),
+        oprobe::trace::Config::default(),
+        1,
+    )
+    .await;
+    let doc: Value = serde_json::from_str(&std::fs::read_to_string(&good).unwrap()).unwrap();
+    let max = Value::from(u64::MAX);
+    type Mutation = (&'static str, bool, Box<dyn Fn(&mut Value)>);
+    let set_reqs = |field: &'static str, v: Value| -> Box<dyn Fn(&mut Value)> {
+        Box::new(move |d: &mut Value| {
+            for r in d["rows"]["reqs"].as_array_mut().unwrap() {
+                r[field] = v.clone();
+            }
+        })
+    };
+    let set_apis = |field: &'static str, v: Value| -> Box<dyn Fn(&mut Value)> {
+        Box::new(move |d: &mut Value| {
+            for a in d["snapshot"]["apis"].as_array_mut().unwrap() {
+                a[field] = v.clone();
+            }
+        })
+    };
+    // (what, must be refused, mutation)
+    let cases: Vec<Mutation> = vec![
+        (
+            "huge elapsed",
+            true,
+            Box::new(|d| d["snapshot"]["elapsed_s"] = Value::from(1e300)),
+        ),
+        (
+            "negative elapsed",
+            true,
+            Box::new(|d| d["snapshot"]["elapsed_s"] = Value::from(-5.0)),
+        ),
+        (
+            "elapsed past u64 seconds",
+            true,
+            Box::new(|d| d["snapshot"]["elapsed_s"] = Value::from(1.9e19)),
+        ),
+        (
+            "absurd latency",
+            true,
+            Box::new(|d| d["snapshot"]["summary"]["latency"]["p99_ms"] = Value::from(1e300)),
+        ),
+        (
+            "negative latency",
+            true,
+            Box::new(|d| d["snapshot"]["apis"][0]["stages"]["total"]["p50_ms"] = Value::from(-3.0)),
+        ),
+        (
+            "api counts at u64::MAX",
+            false,
+            set_apis("count", max.clone()),
+        ),
+        ("api bytes at u64::MAX", false, {
+            let up = set_apis("bytes_up", max.clone());
+            let down = set_apis("bytes_down", max.clone());
+            Box::new(move |d| {
+                up(d);
+                down(d);
+            })
+        }),
+        ("request bytes at u64::MAX", false, {
+            let up = set_reqs("bytes_up", max.clone());
+            let down = set_reqs("bytes_down", max.clone());
+            Box::new(move |d| {
+                up(d);
+                down(d);
+            })
+        }),
+        ("request times at u64::MAX", false, {
+            let t = set_reqs("t_us", max.clone());
+            let total = set_reqs("total_us", max.clone());
+            Box::new(move |d| {
+                t(d);
+                total(d);
+            })
+        }),
+        (
+            "garbage created_at",
+            false,
+            Box::new(|d| d["created_at"] = Value::from("9999-99-99T99:99:99Z")),
+        ),
+    ];
+    for (what, refused, mutate) in cases {
+        let mut d = doc.clone();
+        mutate(&mut d);
+        let file = dir.path().join("hostile.oprobe");
+        std::fs::write(&file, serde_json::to_vec(&d).unwrap()).unwrap();
+        let o = oprobe(dir.path(), &["show", file.to_str().unwrap(), "-o", "json"]);
+        let stderr = String::from_utf8_lossy(&o.stderr);
+        assert!(
+            !stderr.contains("panicked"),
+            "{what}: show panicked: {stderr}"
+        );
+        match o.status.code() {
+            Some(0) if !refused => {
+                json(&o);
+            }
+            Some(2) => {
+                let e = json(&o);
+                assert_eq!(e["error"]["code"], "usage.invalid_argument", "{what}: {e}");
+                assert!(e["error"]["hint"].is_string(), "{what}: {e}");
+            }
+            other => panic!("{what}: exit {other:?}\n{stderr}"),
+        }
+        if refused {
+            assert_eq!(o.status.code(), Some(2), "{what}: {stderr}");
+        }
+    }
+}

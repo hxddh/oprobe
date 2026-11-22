@@ -74,13 +74,12 @@ fn parse_rfc3339(s: &str) -> Option<SystemTime> {
 /// The summary of a trace with no operations: every request stands in for one operation (a
 /// throttled request is counted as throttled, not failed: a retry layer may have recovered it).
 fn per_request_summary(s: &mut Snapshot, reqs: &[ReqRow], complete: bool) {
-    let requests: u64 = s.apis.iter().map(|a| a.count).sum();
-    let throttled: u64 = s.apis.iter().map(|a| a.throttled).sum();
-    let failed = s
-        .apis
-        .iter()
-        .map(|a| a.errors.saturating_sub(a.throttled))
-        .sum::<u64>();
+    let sum = |f: &dyn Fn(&crate::trace::ApiStats) -> u64| {
+        s.apis.iter().fold(0u64, |n, a| n.saturating_add(f(a)))
+    };
+    let requests = sum(&|a| a.count);
+    let throttled = sum(&|a| a.throttled);
+    let failed = sum(&|a| a.errors.saturating_sub(a.throttled));
     let elapsed = s.elapsed_s.max(1e-3);
     let ratio = |n: u64| n as f64 / requests.max(1) as f64;
     let latency = if complete {
@@ -146,7 +145,7 @@ fn per_request_summary(s: &mut Snapshot, reqs: &[ReqRow], complete: bool) {
                 })
                 .flatten()
                 .unwrap_or(*t);
-            let bytes = a.bytes_up + a.bytes_down;
+            let bytes = a.bytes_up.saturating_add(a.bytes_down);
             let n = a.count as f64;
             crate::trace::VerbStats {
                 verb: label.to_owned(),
@@ -187,7 +186,7 @@ fn per_request_view(run: &Run) -> Run {
                 String::new(),
                 q.t_us,
                 q.total_us,
-                q.bytes_up + q.bytes_down,
+                q.bytes_up.saturating_add(q.bytes_down),
                 failed.then(|| {
                     q.error
                         .clone()
@@ -209,24 +208,139 @@ fn per_request_view(run: &Run) -> Run {
     }
 }
 
-/// Build the run of a trace file `path` (already read).
-pub fn trace_run(file: TraceFile, path: &Path) -> Run {
-    let rows = file.rows();
-    let has_ops = !rows.ops.is_empty();
+/// The longest recording a trace may span (ten years): beyond it the file is corrupt.
+const MAX_ELAPSED_S: f64 = 10.0 * 365.25 * 86_400.0;
+
+/// The largest integer a trace aggregate may hold (2^53: exact as a float, and far beyond any
+/// real count or byte total), so sums and conversions cannot overflow.
+const MAX_COUNT: u64 = 1 << 53;
+
+/// The largest float a trace aggregate may hold (rates, means, quantiles in ms).
+const MAX_FLOAT: f64 = 1e15;
+
+/// The largest time offset or duration of one row (µs): the longest recording.
+const MAX_ROW_US: u64 = (MAX_ELAPSED_S * 1e6) as u64;
+
+/// The most bytes one request or operation may move (1 PiB).
+const MAX_ROW_BYTES: u64 = 1 << 50;
+
+/// Check that every value of a trace file is in range: finite, non-negative where it must be,
+/// and within sane bounds, so building the report cannot overflow or panic. The error names
+/// the first value out of range.
+pub fn validate(s: &Snapshot, rows: &crate::trace::TraceRows) -> Result<(), String> {
+    if !(s.elapsed_s.is_finite() && (0.0..=MAX_ELAPSED_S).contains(&s.elapsed_s)) {
+        return Err(format!(
+            "snapshot.elapsed_s = {} is not a duration between 0 and {MAX_ELAPSED_S} s",
+            s.elapsed_s
+        ));
+    }
+    let doc = serde_json::to_value(s).map_err(|e| e.to_string())?;
+    check_value("snapshot", &doc)?;
+    for (i, r) in rows.reqs.iter().enumerate() {
+        let us = [
+            r.queue_us, r.dns_us, r.tcp_us, r.proxy_us, r.tls_us, r.send_us,
+        ]
+        .into_iter()
+        .chain([r.ttfb_us, r.body_us, r.stall_us, r.total_us]);
+        if r.t_us.unsigned_abs() > MAX_ROW_US || us.into_iter().any(|v| v > MAX_ROW_US) {
+            return Err(format!("rows.reqs[{i}]: a time is out of range"));
+        }
+        if r.bytes_up > MAX_ROW_BYTES || r.bytes_down > MAX_ROW_BYTES {
+            return Err(format!("rows.reqs[{i}]: a byte count is out of range"));
+        }
+        if r.retry_after_ms.is_some_and(|v| v > MAX_ROW_US / 1000) {
+            return Err(format!("rows.reqs[{i}].retry_after_ms is out of range"));
+        }
+    }
+    for (i, o) in rows.ops.iter().enumerate() {
+        let b = &o.breakdown;
+        let us = [
+            b.queue_us,
+            b.cache_us,
+            b.backend_us,
+            b.retry_us,
+            b.client_us,
+        ];
+        if o.t_us.unsigned_abs() > MAX_ROW_US
+            || o.latency_us > MAX_ROW_US
+            || us.into_iter().any(|v| v > MAX_ROW_US)
+        {
+            return Err(format!("rows.ops[{i}]: a time is out of range"));
+        }
+        if o.bytes > MAX_ROW_BYTES {
+            return Err(format!("rows.ops[{i}].bytes is out of range"));
+        }
+    }
+    Ok(())
+}
+
+/// Every number of an aggregate in range; the quantiles of a latency non-negative.
+fn check_value(at: &str, v: &serde_json::Value) -> Result<(), String> {
+    use serde_json::Value;
+    match v {
+        Value::Number(n) => {
+            let ok = if let Some(u) = n.as_u64() {
+                u <= MAX_COUNT
+            } else if let Some(i) = n.as_i64() {
+                i.unsigned_abs() <= MAX_COUNT
+            } else {
+                n.as_f64()
+                    .is_some_and(|f| f.is_finite() && f.abs() <= MAX_FLOAT)
+            };
+            if !ok {
+                return Err(format!("{at} = {n} is out of range"));
+            }
+        }
+        Value::Array(a) => {
+            for (i, x) in a.iter().enumerate() {
+                check_value(&format!("{at}[{i}]"), x)?;
+            }
+        }
+        Value::Object(o) => {
+            let quantiles = o.contains_key("p50_ms") && o.contains_key("p99_ms");
+            for (k, x) in o {
+                let at = format!("{at}.{k}");
+                if quantiles && x.as_f64().is_some_and(|f| f < 0.0) {
+                    return Err(format!("{at} = {x} is negative"));
+                }
+                check_value(&at, x)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Build the run of a trace file `path` (already read). Fails, as a usage error, on a file
+/// whose values are out of range ([`validate`]).
+pub fn trace_run(mut file: TraceFile, path: &Path) -> Result<Run, crate::errors::OprobeError> {
     let has_rows = file.has_rows();
+    let rows = file.take_rows();
+    validate(&file.snapshot, &rows).map_err(|why| {
+        crate::errors::OprobeError::new(
+            crate::errors::ErrorCode::UsageInvalidArgument,
+            format!("trace file `{}` is corrupt: {why}", path.display()),
+        )
+        .with_hint("save the profile again with oprobe-trace's `Handle::save`")
+    })?;
+    let has_ops = !rows.ops.is_empty();
     let url = operator_url(file.service.as_ref());
     let mut profile = crate::config::Profile::from_url(&url);
     profile.name = None;
     let knobs = crate::config::Knobs::of(&profile);
     let ended_at = parse_rfc3339(&file.created_at).unwrap_or_else(SystemTime::now);
-    let mut snapshot = file.snapshot.clone();
-    let started_at = ended_at
-        .checked_sub(Duration::from_secs_f64(snapshot.elapsed_s.max(0.0)))
+    let mut snapshot = std::mem::take(&mut file.snapshot);
+    let started_at = Duration::try_from_secs_f64(snapshot.elapsed_s.max(0.0))
+        .ok()
+        .and_then(|d| ended_at.checked_sub(d))
         .unwrap_or(ended_at);
     let run_id = RunId::at(started_at, 0);
     let mut warnings = Vec::new();
     if !has_ops {
-        let requests: u64 = snapshot.apis.iter().map(|a| a.count).sum();
+        let requests = snapshot
+            .apis
+            .iter()
+            .fold(0u64, |n, a| n.saturating_add(a.count));
         let complete = !rows.sampled() && rows.reqs.len() as u64 == requests;
         per_request_summary(&mut snapshot, &rows.reqs, complete);
         warnings.push(PER_REQUEST_WARNING.to_owned());
@@ -294,7 +408,7 @@ pub fn trace_run(file: TraceFile, path: &Path) -> Run {
             f.remedy.next = Some(format!("oprobe show {file_ref} --detail"));
         }
     }
-    run
+    Ok(run)
 }
 
 /// The next command of a finding of a trace: a remedy is proven on a run oprobe drives

@@ -426,29 +426,51 @@ impl RunStore {
     }
 }
 
-/// The `format` of a JSON document, when `path` starts like one (a run file is a zstd stream).
-fn json_format(path: &Path) -> Option<String> {
+/// The value of the first `"format": "…"` member in `head` (the start of a JSON document;
+/// oprobe and oprobe-trace write it first).
+fn format_in_prefix(head: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(head).ok().or_else(|| {
+        // A prefix cut inside a multi-byte character: read up to it.
+        let e = std::str::from_utf8(head).err()?;
+        std::str::from_utf8(&head[..e.valid_up_to()]).ok()
+    })?;
+    let rest = &text[text.find("\"format\"")? + 8..];
+    let rest = rest.trim_start().strip_prefix(':')?.trim_start();
+    let rest = rest.strip_prefix('"')?;
+    let end = rest.find('"')?;
+    let v = &rest[..end];
+    (!v.contains('\\')).then(|| v.to_owned())
+}
+
+/// The whole file and its `format`, when `path` starts like a JSON document (a run file is a
+/// zstd stream: only its first bytes are read).
+fn json_document(path: &Path) -> Option<(Vec<u8>, String)> {
     use std::io::Read;
     let mut head = [0u8; 512];
     let n = std::fs::File::open(path).ok()?.read(&mut head).ok()?;
     if !crate::trace::TraceFile::sniff(&head[..n]) {
         return None;
     }
-    #[derive(serde::Deserialize)]
-    struct Format {
-        #[serde(default)]
-        format: Option<String>,
-    }
-    let f: Format =
-        serde_json::from_reader(std::io::BufReader::new(std::fs::File::open(path).ok()?)).ok()?;
-    Some(f.format.unwrap_or_default())
+    let bytes = std::fs::read(path).ok()?;
+    let format = format_in_prefix(&bytes[..bytes.len().min(4096)]).or_else(|| {
+        #[derive(serde::Deserialize)]
+        struct Format {
+            #[serde(default)]
+            format: Option<String>,
+        }
+        serde_json::from_slice::<Format>(&bytes)
+            .ok()
+            .map(|f| f.format.unwrap_or_default())
+    });
+    Some((bytes, format.unwrap_or_default()))
 }
 
 /// Load a run file, a production trace written by `oprobe-trace` (`oprobe.trace/6`, whatever
 /// its extension: recognised by its content), or a report `.json` (without trace rows).
 pub fn load_path(path: &Path) -> Result<Run> {
-    let format = json_format(path);
-    if let Some(f) = format.as_deref().filter(|f| f.starts_with("oprobe.trace/")) {
+    let doc = json_document(path);
+    let format = doc.as_ref().map(|(_, f)| f.clone());
+    if let Some((bytes, f)) = doc.filter(|(_, f)| f.starts_with("oprobe.trace/")) {
         if f != crate::trace::TRACE_FORMAT {
             return Err(OprobeError::new(
                 ErrorCode::UsageInvalidArgument,
@@ -461,16 +483,18 @@ pub fn load_path(path: &Path) -> Result<Run> {
             .with_hint("open it with the oprobe release that matches the oprobe-trace version that wrote it")
             .into());
         }
-        let file = crate::trace::TraceFile::read(path).map_err(|e| {
-            anyhow::Error::new(
-                OprobeError::new(
-                    ErrorCode::UsageInvalidArgument,
-                    format!("cannot read trace file `{}`: {e}", path.display()),
+        let file = crate::trace::TraceFile::from_slice(&bytes, &path.display().to_string())
+            .map_err(|e| {
+                anyhow::Error::new(
+                    OprobeError::new(
+                        ErrorCode::UsageInvalidArgument,
+                        format!("cannot read trace file `{}`: {e}", path.display()),
+                    )
+                    .with_hint("save the profile again with oprobe-trace's `Handle::save`"),
                 )
-                .with_hint("save the profile again with oprobe-trace's `Handle::save`"),
-            )
-        })?;
-        return Ok(crate::model::trace_file::trace_run(file, path));
+            })?;
+        drop(bytes);
+        return Ok(crate::model::trace_file::trace_run(file, path)?);
     }
     let is_json = path
         .extension()
@@ -489,6 +513,25 @@ pub fn load_path(path: &Path) -> Result<Run> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_format_is_read_from_the_start_of_a_document() {
+        let f = |s: &str| format_in_prefix(s.as_bytes());
+        assert_eq!(
+            f(r#"{"format":"oprobe.trace/6","x":1}"#).as_deref(),
+            Some("oprobe.trace/6")
+        );
+        assert_eq!(
+            f("{ \"format\" : \"oprobe.report/6\" }").as_deref(),
+            Some("oprobe.report/6")
+        );
+        assert_eq!(f(r#"{"x":1}"#), None);
+        assert_eq!(f(r#"{"format":"oprobe.tr"#), None);
+        // Cut inside a multi-byte character.
+        let mut b = r#"{"format":"a","k":"é"#.as_bytes().to_vec();
+        b.pop();
+        assert_eq!(format_in_prefix(&b).as_deref(), Some("a"));
+    }
     use crate::model::*;
 
     pub(crate) fn sample_run(id: &str, label: Option<&str>) -> Run {

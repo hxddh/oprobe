@@ -145,17 +145,24 @@ impl TraceFile {
         let f = std::fs::File::open(path)?;
         let file: TraceFile = serde_json::from_reader(io::BufReader::new(f))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        if file.format != TRACE_FORMAT {
+        file.check_format(&path.display().to_string())
+    }
+
+    /// Parse a trace file already in memory (`what` names it in errors).
+    pub fn from_slice(bytes: &[u8], what: &str) -> io::Result<TraceFile> {
+        let file: TraceFile = serde_json::from_slice(bytes)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        file.check_format(what)
+    }
+
+    fn check_format(self, what: &str) -> io::Result<TraceFile> {
+        if self.format != TRACE_FORMAT {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!(
-                    "`{}` is format `{}`, not `{TRACE_FORMAT}`",
-                    path.display(),
-                    file.format
-                ),
+                format!("`{what}` is format `{}`, not `{TRACE_FORMAT}`", self.format),
             ));
         }
-        Ok(file)
+        Ok(self)
     }
 
     /// The sampled rows the file holds (empty when it was written from a bare snapshot).
@@ -165,6 +172,19 @@ impl TraceFile {
                 ops: r.ops.clone(),
                 reqs: r.reqs.clone(),
                 info: r.info.clone(),
+                sampling: r.sampling,
+            },
+            None => TraceRows::default(),
+        }
+    }
+
+    /// Move the sampled rows out of the file (empty when it holds none, or they were taken).
+    pub fn take_rows(&mut self) -> TraceRows {
+        match self.rows.take() {
+            Some(r) => TraceRows {
+                ops: r.ops,
+                reqs: r.reqs,
+                info: r.info,
                 sampling: r.sampling,
             },
             None => TraceRows::default(),
