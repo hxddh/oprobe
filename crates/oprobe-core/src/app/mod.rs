@@ -26,10 +26,8 @@
 //! to the [`EventSink`] (`sink.bus()` carries the `oprobe.events/1` events the app draws from).
 //!
 //! The other modules hold the commands' work: [`run`] and [`runs`] (measuring and the run
-//! history), [`prove`], [`lab`], [`profile`] (profile assembly). [`verify`], [`fix`] and
-//! [`tune`] are the 5.x machinery `prove` is built from; no front end calls them.
+//! history), [`prove`], [`lab`], [`profile`] (profile assembly).
 
-pub mod fix;
 pub mod input;
 pub mod lab;
 pub mod live;
@@ -39,8 +37,6 @@ pub mod profile;
 pub mod prove;
 pub mod run;
 pub mod runs;
-pub mod tune;
-pub mod verify;
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
@@ -56,7 +52,6 @@ use crate::model::RunSpec;
 use crate::store::{ConfigFile, Paths};
 pub use input::*;
 pub use lab::LabOutput;
-pub use profile::{TuneSettings, tune_options};
 pub use prove::{ProveObjective, ProveOutcome, ProveOutput, ProveRequest, ProveVerdict};
 pub use run::{RunOutput, RunPlan, RunSet};
 pub use runs::{Profile, RemovedRuns, RunList};
@@ -316,7 +311,7 @@ impl App {
                 run::Measured::Plan(_) => unreachable!("not a dry run"),
             }
         }
-        Ok(RunOutcome::Run(Box::new(RunSet { runs })))
+        Ok(RunOutcome::Run(Box::new(RunSet::new(runs))))
     }
 
     /// `oprobe prove`: A/B-test a change of a run's operator.
@@ -334,9 +329,14 @@ impl App {
         runs::show(self, &r)
     }
 
-    /// The stored runs, newest first.
+    /// The stored runs you made, newest first, and the proves (trials hidden).
     pub fn list(&self) -> Result<RunList> {
-        runs::list(self)
+        runs::list(self, false)
+    }
+
+    /// [`App::list`] with prove trial runs included (`show --list --all`).
+    pub fn list_all(&self) -> Result<RunList> {
+        runs::list(self, true)
     }
 
     /// Delete stored runs (a file outside the store is refused).
