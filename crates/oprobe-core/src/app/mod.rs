@@ -33,6 +33,7 @@ pub mod measure;
 pub mod lab;
 pub mod next;
 pub mod profile;
+pub mod prove;
 pub mod run;
 pub mod runs;
 pub mod tune;
@@ -327,6 +328,16 @@ impl App {
         cancel: Cancel,
     ) -> Result<fix::FixOutcome> {
         fix::fix(&self.ctx(sink), req, cancel).await
+    }
+
+    /// `oprobe prove`: A/B-test a change of a run's operator.
+    pub async fn prove(
+        &self,
+        req: prove::ProveRequest,
+        sink: &EventSink,
+        cancel: Cancel,
+    ) -> Result<prove::ProveOutcome> {
+        prove::prove(&self.ctx(sink), req, cancel).await
     }
 
     /// `oprobe lab`: start the server (it serves until the returned handle is dropped).

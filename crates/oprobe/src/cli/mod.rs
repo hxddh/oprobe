@@ -190,6 +190,7 @@ async fn dispatch(cmd: Command, ctx: &Ctx) -> Result<u8> {
     match cmd {
         Command::Run(a) => c::run(a.operators, a.flags, ctx).await,
         Command::Demo(a) => c::run(vec!["lab://demo".to_owned()], a.flags, ctx).await,
+        Command::Prove(a) => c::prove(a, ctx).await,
         Command::Show(a) => c::show(a, ctx),
         Command::Lab(a) => c::lab(a, ctx).await,
     }

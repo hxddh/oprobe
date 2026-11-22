@@ -149,6 +149,94 @@ pub struct RunShow {
     #[serde(skip)]
     #[schemars(skip)]
     pub detail: bool,
+    /// `--by`: the request rows grouped.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub by: Option<ByTable>,
+}
+
+/// `show --by`: the request rows grouped (and, by stage, the per-stage latency per API).
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct ByTable {
+    pub by: crate::analysis::slice::By,
+    pub groups: Vec<crate::analysis::slice::GroupRow>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub stages: Vec<crate::analysis::slice::StageRow>,
+}
+
+impl ByTable {
+    fn of(run: &Run, by: crate::analysis::slice::By) -> Self {
+        use crate::analysis::slice;
+        let reqs: Vec<&crate::model::ReqRow> = run.reqs.iter().collect();
+        Self {
+            by,
+            groups: slice::group(&reqs, by),
+            stages: if by == slice::By::Stage {
+                slice::stage_table(&reqs)
+            } else {
+                Vec::new()
+            },
+        }
+    }
+
+    fn text(&self) -> String {
+        let rows: Vec<Vec<String>> = self
+            .groups
+            .iter()
+            .map(|g| {
+                vec![
+                    g.key.clone(),
+                    g.requests_count.to_string(),
+                    format!("{:.1}%", g.time_pct),
+                    fmt_ms(g.p50_ms),
+                    fmt_ms(g.p99_ms),
+                    g.errors_count.to_string(),
+                    g.throttled_count.to_string(),
+                    g.cold_count.to_string(),
+                ]
+            })
+            .collect();
+        let mut o = crate::report::style::table(
+            &[
+                self.by.label(),
+                "requests",
+                "time",
+                "p50",
+                "p99",
+                "errors",
+                "throttled",
+                "cold",
+            ],
+            &rows,
+            0,
+        );
+        if !self.stages.is_empty() {
+            let q = |s: &crate::analysis::slice::StageQ| format!("{}/{}", fmt_ms(s.p50_ms), fmt_ms(s.p99_ms));
+            let rows: Vec<Vec<String>> = self
+                .stages
+                .iter()
+                .map(|s| {
+                    vec![
+                        s.api.clone(),
+                        s.requests_count.to_string(),
+                        q(&s.queue),
+                        q(&s.connect),
+                        q(&s.send),
+                        q(&s.ttfb),
+                        q(&s.body),
+                        q(&s.total),
+                    ]
+                })
+                .collect();
+            o += "\n";
+            o += &crate::report::style::table(
+                &["api", "requests", "queue", "connect", "send", "ttfb", "body", "total"],
+                &rows,
+                0,
+            );
+            o += &dim("stage columns: p50/p99\n");
+        }
+        o
+    }
 }
 
 /// The report of a shown run.
@@ -165,6 +253,9 @@ impl CommandOutput for RunShow {
     }
 
     fn text(&self) -> String {
+        if let Some(b) = &self.by {
+            return b.text();
+        }
         match &self.full {
             Some(run) => terminal::render_run_with(run, self.detail),
             None => terminal::render(&self.run.report),
@@ -183,6 +274,7 @@ pub fn show(ctx: &Ctx, a: RunsShowRequest) -> Result<RunShow> {
             ops_count: run.ops.len() as u64,
             requests_count: run.reqs.len() as u64,
         },
+        by: a.by.map(|b| ByTable::of(&run, b)),
         full: Some(Box::new(run)),
         detail: a.detail,
     })

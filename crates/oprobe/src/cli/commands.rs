@@ -85,7 +85,37 @@ pub fn show(a: ShowArgs, ctx: &Ctx) -> Result<u8> {
     ctx.out.finish(&app.runs_show(i::RunsShowRequest {
         run: a.run.unwrap_or_else(|| "last".into()),
         detail: a.detail,
+        by: a.by.map(|b| match b {
+            ByArg::Stage => crate::analysis::slice::By::Stage,
+            ByArg::Api => crate::analysis::slice::By::Api,
+            ByArg::Conn => crate::analysis::slice::By::Conn,
+        }),
     })?)
+}
+
+/// `oprobe prove`.
+pub async fn prove(a: ProveArgs, ctx: &Ctx) -> Result<u8> {
+    use crate::app::prove::{ProveObjective, ProveOutcome, ProveRequest};
+    let req = ProveRequest {
+        run: a.run,
+        finding: a.finding,
+        with: a.with,
+        objective: match a.objective {
+            ObjectiveArg::Goodput => ProveObjective::Goodput,
+            ObjectiveArg::P99 => ProveObjective::P99,
+        },
+        max_throttle_ratio: a
+            .max_throttle
+            .as_deref()
+            .map(|v| crate::input::share("--max-throttle", v))
+            .transpose()?,
+        budget: a.budget,
+        ..Default::default()
+    };
+    match ctx.app().prove(req, &ctx.out, ctrl_c()).await? {
+        ProveOutcome::Plan(p) => ctx.out.finish(p.as_ref()),
+        ProveOutcome::Proved(p) => ctx.out.finish(p.as_ref()),
+    }
 }
 
 /// `oprobe lab`: serve until Ctrl-C.

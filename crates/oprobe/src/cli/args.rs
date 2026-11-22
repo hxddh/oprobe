@@ -110,6 +110,8 @@ pub enum Command {
     Run(RunArgs),
     /// Profile the local lab (`oprobe run lab://demo`)
     Demo(DemoArgs),
+    /// A/B-test a change of a run's operator: the proven layer diff
+    Prove(ProveArgs),
     /// Show a stored run (or a run file); `--list` for the history
     Show(ShowArgs),
     /// Serve a local S3-compatible lab with faults

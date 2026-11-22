@@ -309,6 +309,8 @@ pub struct RunsShowRequest {
     pub run: String,
     /// Every column, per-stage and per-verb breakdowns, the timeline and the 5 slowest operations
     pub detail: bool,
+    /// Group the requests: by dominant stage, API or connection
+    pub by: Option<crate::analysis::slice::By>,
 }
 
 impl Default for RunsShowRequest {
@@ -316,6 +318,7 @@ impl Default for RunsShowRequest {
         Self {
             run: "last".into(),
             detail: Default::default(),
+            by: None,
         }
     }
 }

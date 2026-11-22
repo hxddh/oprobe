@@ -358,6 +358,7 @@ pub fn build_run_with(
     let endpoint = t.endpoint();
     let diagnosis = diagnose(&snapshot, knobs, &profile.sla, t.is_network());
     let sla_verdict = check_sla(&snapshot, &profile.sla);
+    let breached = !sla_verdict.passed;
     let mut options = crate::util::redact_options(&t.options);
     options.remove("ca_cert_pem");
     let interrupted = snapshot.interrupted;
@@ -386,11 +387,9 @@ pub fn build_run_with(
             ));
         }
     }
-    let breached = !sla_verdict.passed;
+    // A breached SLA is reported, not an exit code (design v6 §8: 3 is Prove's "refuted").
     let exit_code = if interrupted {
         exit::INTERRUPTED
-    } else if breached && sla_verdict.enforced {
-        exit::GATE
     } else {
         exit::OK
     };
