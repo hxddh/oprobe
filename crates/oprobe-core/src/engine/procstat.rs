@@ -119,19 +119,26 @@ mod tests {
         let Some(before) = usage() else { return };
         assert!(before.rss_bytes > 0);
         let mut m = CpuMeter::new();
+        // Spin until this process has spent 150 ms of CPU (not of wall time: on a loaded runner the
+        // scheduler may give this thread only a sliver of a core), bounded by 10 s of wall time.
         let t = Instant::now();
+        let target = before.cpu + Duration::from_millis(150);
         let mut x = 0u64;
-        while t.elapsed() < Duration::from_millis(200) {
-            x = x.wrapping_mul(31).wrapping_add(7);
+        while usage().is_some_and(|u| u.cpu < target) && t.elapsed() < Duration::from_secs(10) {
+            for _ in 0..100_000 {
+                x = x.wrapping_mul(31).wrapping_add(7);
+            }
         }
         std::hint::black_box(x);
+        let wall = t.elapsed().as_secs_f64();
         let (pct, rss) = m.sample().expect("sample");
-        // Process-wide CPU: this thread spins (≥ ~30 % of one core), and other tests running in
-        // the same process may add to it — but never beyond every core busy.
+        // The meter reports at least the CPU this thread spent over the wall time it took (other
+        // tests in the process may add to it), and never beyond every core busy.
         let cores = std::thread::available_parallelism().map_or(1, |n| n.get()) as f64;
+        let spent_pct = 0.15 / wall * 100.0;
         assert!(
-            pct > 30.0 && pct <= 100.0 * cores * 1.05,
-            "cpu {pct} on {cores} cores"
+            pct >= spent_pct * 0.9 && pct <= 100.0 * cores * 1.05,
+            "cpu {pct} (spent ≥ {spent_pct}) on {cores} cores over {wall} s"
         );
         assert!(rss > 1.0);
         assert!(usage().unwrap().cpu > before.cpu);
