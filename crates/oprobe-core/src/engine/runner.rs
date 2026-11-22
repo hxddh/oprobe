@@ -961,7 +961,7 @@ mod tests {
 
     fn profile(url: &str) -> Profile {
         let mut p = Profile::from_url(url);
-        p.workload.preset = crate::config::Preset::Metadata;
+        p.workload.preset = crate::config::Preset::ListStat;
         p.workload.dataset = Some(crate::config::DatasetSpec {
             objects: 4,
             object_size: crate::util::ByteSize::kib(4),

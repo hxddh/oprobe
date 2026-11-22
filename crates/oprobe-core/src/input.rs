@@ -303,17 +303,18 @@ pub fn boolean(what: &str, raw: &str) -> Result<bool, OprobeError> {
 /// A workload preset (aliases: `lakehouse`, `small`, `meta`, `ckpt`, …).
 pub fn preset(raw: &str) -> Result<Preset, OprobeError> {
     let mut table: Vec<(&str, Preset)> = Preset::ALL.iter().map(|p| (p.slug(), *p)).collect();
+    // The 5.x names map to the preset that keeps their access pattern.
     table.extend([
-        ("lakehouse", Preset::Parquet),
-        ("ckpt", Preset::Checkpoint),
         ("small", Preset::SmallFiles),
-        ("meta", Preset::Metadata),
-        ("suffix", Preset::ParquetSuffix),
-        ("deleter", Preset::Delete),
-        ("churn", Preset::Delete),
-        ("paged-list", Preset::ListPaged),
-        ("presigned", Preset::Presign),
-        ("conditional-writes", Preset::Conditional),
+        ("large", Preset::LargeObjects),
+        ("checkpoint", Preset::LargeObjects),
+        ("parquet", Preset::RangeReads),
+        ("parquet-suffix", Preset::RangeReads),
+        ("ranges", Preset::RangeReads),
+        ("metadata", Preset::ListStat),
+        ("metadata-heavy", Preset::ListStat),
+        ("list-paged", Preset::ListStat),
+        ("mixed", Preset::SmallFiles),
     ]);
     let s = raw.trim().to_ascii_lowercase().replace('_', "-");
     if let Some((_, p)) = table.iter().find(|(n, _)| *n == s) {
@@ -698,10 +699,11 @@ mod tests {
     #[test]
     fn presets_access_and_providers() {
         assert_eq!(preset("small_files").unwrap(), Preset::SmallFiles);
-        assert_eq!(preset("lakehouse").unwrap(), Preset::Parquet);
-        let (c, h) = code(preset("parqet"));
+        assert_eq!(preset("parquet").unwrap(), Preset::RangeReads);
+        assert_eq!(preset("large-objects").unwrap(), Preset::LargeObjects);
+        let (c, h) = code(preset("range-raeds"));
         assert_eq!(c, ErrorCode::UsageInvalidArgument);
-        assert!(h.contains("did you mean `parquet`"), "{h}");
+        assert!(h.contains("did you mean `range-reads`"), "{h}");
         let (_, h) = code(preset("zzzzzz"));
         assert!(h.starts_with("choose:"), "{h}");
         assert_eq!(access("zipf:1.2").unwrap(), Access::Zipf(1.2));

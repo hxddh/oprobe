@@ -466,7 +466,7 @@ impl Scenario {
                 ..Default::default()
             },
             Scenario::Parquet => ScenarioDefaults {
-                preset: Some(Preset::Parquet),
+                preset: Some(Preset::RangeReads),
                 concurrency: Some(PARQUET_CONCURRENCY),
                 ..Default::default()
             },

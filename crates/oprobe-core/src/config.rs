@@ -127,87 +127,46 @@ pub struct TargetSpec {
     pub proxy: Option<String>,
 }
 
+/// The workload presets: OpenDAL access patterns (design v6 §8).
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
 )]
 #[serde(rename_all = "kebab-case")]
 pub enum Preset {
-    /// Lakehouse scan: stat + footer read + vectored column-chunk range reads.
+    /// Many small objects: whole-object reads and writes, some stats.
     #[default]
-    Parquet,
-    /// AI/ML checkpoint: large multipart writes plus occasional full restores.
-    Checkpoint,
-    /// Many small objects: whole-object GETs and PUTs.
     SmallFiles,
-    /// Metadata-heavy: LIST and HEAD storms over a partitioned prefix.
-    Metadata,
-    /// General purpose 70/20/10 read/write/stat mix.
-    Mixed,
-    /// Lakehouse scan reading the footer with a suffix range (no HEAD per file).
-    ParquetSuffix,
-    /// Churn: small writes removed again by batched deletes (OpenDAL `Deleter`).
-    Delete,
-    /// Server-side copies of dataset objects.
-    Copy,
-    /// LIST with a page size (`limit`): every page is a billed request.
-    ListPaged,
-    /// GETs through presigned URLs.
-    Presign,
-    /// Optimistic concurrency: conditional create (`If-None-Match: *`) and overwrite (`If-Match`).
-    Conditional,
-    /// HEAD storm plus small writes carrying user metadata.
-    MetadataHeavy,
+    /// Large objects: multipart writes and full reads.
+    LargeObjects,
+    /// Range reads (parquet-like): a stat, the footer, then vectored column-chunk ranges.
+    RangeReads,
+    /// Metadata: list and stat over a partitioned prefix.
+    ListStat,
 }
 
 impl Preset {
-    pub const ALL: [Preset; 12] = [
-        Preset::Parquet,
-        Preset::Checkpoint,
+    pub const ALL: [Preset; 4] = [
         Preset::SmallFiles,
-        Preset::Metadata,
-        Preset::Mixed,
-        Preset::ParquetSuffix,
-        Preset::Delete,
-        Preset::Copy,
-        Preset::ListPaged,
-        Preset::Presign,
-        Preset::Conditional,
-        Preset::MetadataHeavy,
+        Preset::LargeObjects,
+        Preset::RangeReads,
+        Preset::ListStat,
     ];
 
     pub fn slug(&self) -> &'static str {
         match self {
-            Preset::Parquet => "parquet",
-            Preset::Checkpoint => "checkpoint",
             Preset::SmallFiles => "small-files",
-            Preset::Metadata => "metadata",
-            Preset::Mixed => "mixed",
-            Preset::ParquetSuffix => "parquet-suffix",
-            Preset::Delete => "delete",
-            Preset::Copy => "copy",
-            Preset::ListPaged => "list-paged",
-            Preset::Presign => "presign",
-            Preset::Conditional => "conditional",
-            Preset::MetadataHeavy => "metadata-heavy",
+            Preset::LargeObjects => "large-objects",
+            Preset::RangeReads => "range-reads",
+            Preset::ListStat => "list-stat",
         }
     }
 
     pub fn describe(&self) -> &'static str {
         match self {
-            Preset::Parquet => "lakehouse scan: footer + vectored column-chunk range reads",
-            Preset::Checkpoint => "ML checkpoint: large multipart writes + full restores",
-            Preset::SmallFiles => "small objects: whole-object GET/PUT",
-            Preset::Metadata => "metadata storm: LIST + HEAD over partitions",
-            Preset::Mixed => "general purpose: 70% reads / 20% writes / 10% stat",
-            Preset::ParquetSuffix => {
-                "lakehouse scan without HEAD: suffix footer read + vectored column chunks"
-            }
-            Preset::Delete => "churn: 4 KiB writes removed by batched deletes (20 keys/batch)",
-            Preset::Copy => "server-side copies of 1 MiB objects",
-            Preset::ListPaged => "paged LIST: 32 keys per page over 128-object partitions",
-            Preset::Presign => "GETs through presigned URLs",
-            Preset::Conditional => "optimistic concurrency: If-None-Match / If-Match writes",
-            Preset::MetadataHeavy => "60% HEAD / 40% small writes with user metadata",
+            Preset::SmallFiles => "small objects: whole-object reads and writes, some stats",
+            Preset::LargeObjects => "large objects: multipart writes and full reads",
+            Preset::RangeReads => "range reads: footer + vectored column-chunk ranges (parquet-like)",
+            Preset::ListStat => "metadata: list + stat over partitions",
         }
     }
 
@@ -224,7 +183,7 @@ impl Preset {
             ..DatasetSpec::default()
         };
         match self {
-            Preset::Parquet => (
+            Preset::RangeReads => (
                 ds(8, ByteSize::mib(16)),
                 vec![OpSpec {
                     weight: 100,
@@ -236,90 +195,7 @@ impl Preset {
                     },
                 }],
             ),
-            Preset::ParquetSuffix => (
-                ds(8, ByteSize::mib(16)),
-                vec![OpSpec {
-                    weight: 100,
-                    op: OpKind::ParquetScan {
-                        columns: 4,
-                        column_size: ByteSize::kib(512),
-                        footer_size: ByteSize::kib(64),
-                        suffix: true,
-                    },
-                }],
-            ),
-            Preset::Delete => (
-                ds(1, ByteSize::kib(4)),
-                vec![
-                    OpSpec {
-                        weight: 95,
-                        op: OpKind::Write {
-                            size: ByteSize::kib(4),
-                        },
-                    },
-                    OpSpec {
-                        weight: 5,
-                        op: OpKind::Delete { batch: 20 },
-                    },
-                ],
-            ),
-            Preset::Copy => (
-                ds(16, ByteSize::mib(1)),
-                vec![OpSpec {
-                    weight: 100,
-                    op: OpKind::Copy,
-                }],
-            ),
-            Preset::ListPaged => (
-                DatasetSpec {
-                    objects: 512,
-                    object_size: ByteSize::kib(1),
-                    partitions: 4,
-                    ..DatasetSpec::default()
-                },
-                vec![OpSpec {
-                    weight: 100,
-                    op: OpKind::ListPaged { limit: 32 },
-                }],
-            ),
-            Preset::Presign => (
-                ds(32, ByteSize::kib(256)),
-                vec![OpSpec {
-                    weight: 100,
-                    op: OpKind::PresignedRead,
-                }],
-            ),
-            Preset::Conditional => (
-                ds(1, ByteSize::kib(16)),
-                vec![OpSpec {
-                    weight: 100,
-                    op: OpKind::ConditionalWrite {
-                        size: ByteSize::kib(16),
-                    },
-                }],
-            ),
-            Preset::MetadataHeavy => (
-                DatasetSpec {
-                    objects: 256,
-                    object_size: ByteSize::kib(4),
-                    partitions: 8,
-                    ..DatasetSpec::default()
-                },
-                vec![
-                    OpSpec {
-                        weight: 60,
-                        op: OpKind::Stat,
-                    },
-                    OpSpec {
-                        weight: 40,
-                        op: OpKind::MetadataWrite {
-                            size: ByteSize::kib(4),
-                            entries: 8,
-                        },
-                    },
-                ],
-            ),
-            Preset::Checkpoint => (
+            Preset::LargeObjects => (
                 ds(2, ByteSize::mib(32)),
                 vec![
                     OpSpec {
@@ -353,7 +229,7 @@ impl Preset {
                     },
                 ],
             ),
-            Preset::Metadata => (
+            Preset::ListStat => (
                 DatasetSpec {
                     objects: 512,
                     object_size: ByteSize::kib(4),
@@ -367,31 +243,6 @@ impl Preset {
                     },
                     OpSpec {
                         weight: 60,
-                        op: OpKind::Stat,
-                    },
-                ],
-            ),
-            Preset::Mixed => (
-                ds(32, ByteSize::mib(4)),
-                vec![
-                    OpSpec {
-                        weight: 60,
-                        op: OpKind::Read {
-                            size: Some(ByteSize::mib(1)),
-                        },
-                    },
-                    OpSpec {
-                        weight: 10,
-                        op: OpKind::Read { size: None },
-                    },
-                    OpSpec {
-                        weight: 20,
-                        op: OpKind::Write {
-                            size: ByteSize::mib(1),
-                        },
-                    },
-                    OpSpec {
-                        weight: 10,
                         op: OpKind::Stat,
                     },
                 ],
@@ -1673,7 +1524,7 @@ mod tests {
             read = { chunk = "4MiB" }
 
             [workload]
-            preset = "mixed"
+            preset = "small-files"
             concurrency = 8
             duration = "5s"
             access = "zipf:1.2"

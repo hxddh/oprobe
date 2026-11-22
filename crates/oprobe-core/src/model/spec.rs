@@ -878,7 +878,7 @@ mod tests {
         let d = RunSpec::new(&Profile::from_url("memory://"), "memory://");
         assert_eq!(
             d.command(),
-            "oprobe run memory:// --preset parquet -c 16 -d 10s"
+            "oprobe run memory:// --preset small-files -c 16 -d 10s"
         );
         let s = RunSpec::new(&profile(), "s3://bkt/x");
         let c = s.command();
