@@ -2253,6 +2253,7 @@ Every command accepts the global options below. Exit codes: `0` ok · `1` runtim
 | [`oprobe compat`](#oprobe-compat) | Correctness & compatibility suite for a target |
 | [`oprobe baseline`](#oprobe-baseline) | Named baselines: set, list, rm, show |
 | [`oprobe lab`](#oprobe-lab) | Start a local S3-compatible server with programmable faults |
+| [`oprobe worker`](#oprobe-worker) | Serve load for distributed runs (`oprobe run --workers`) |
 | [`oprobe mcp`](#oprobe-mcp) | MCP server for agents (stdio, or --http ADDR) |
 | [`oprobe schema`](#oprobe-schema) | Print the JSON Schema of a machine output (report, events, …) |
 | [`oprobe capabilities`](#oprobe-capabilities) | Describe what this oprobe can do (machine-readable) |
@@ -2372,6 +2373,14 @@ Output formats (`-o`): text, json, ndjson, md, html
 |---|---|
 | `--from <RUNREF>` | Replay a stored run (RUNREF): its spec, with credentials resolved again from the target; other flags and --set override it |
 | `--set <KEY=VALUE>` | Override one setting, repeatable (e.g. --set concurrency=8 --set warmup=1s); keys: the profile's knob, workload, SLA and cost names, `endpoint`, `region`, `label` |
+
+*Load generation*
+
+| argument | description |
+|---|---|
+| `--client <CLIENT>` | What drives the workload: opendal (default), aws-sdk, or exec:COMMAND (an adapter speaking the oprobe client protocol, see docs/clients.md). Not stored in the run's spec |
+| `--workers <WORKERS>` | Distribute the run over workers: host:port[*WEIGHT],… of `oprobe worker`, local:N to start N worker processes here, or config for the config file's [workers] |
+| `--worker-token-file <FILE>` | The token file the remote workers were started with (default: [workers].token_file, then $OPROBE_WORKER_TOKEN) |
 
 ## `oprobe demo`
 
@@ -3390,6 +3399,24 @@ Output formats (`-o`): text, json, ndjson
 | `--throttle-early-close` | Answer throttled requests without reading the upload and close the connection (as real gateways do), so clients see resets mid-upload |
 | `--complete-delay <COMPLETE_DELAY>` | Delay for CompleteMultipartUpload · default `0ms` |
 | `--write-ca <FILE>` | Write the lab CA certificate (for --ca-cert) to this file |
+
+## `oprobe worker`
+
+Serve load for distributed runs (`oprobe run --workers`)
+
+```text
+oprobe worker [OPTIONS] --listen <ADDR> --token-file <FILE>
+```
+
+Output formats (`-o`): text, json, ndjson
+
+| argument | description |
+|---|---|
+| `--listen <ADDR>` | Address to listen on (host:port; port 0 picks a free one) |
+| `--token-file <FILE>` | File holding the shared secret every coordinator request must carry |
+| `--tls-cert <FILE>` | Serve TLS with this PEM certificate (needs --tls-key) |
+| `--tls-key <FILE>` | PEM private key of --tls-cert |
+| `--allow-exec` | Let coordinators run `--client exec:COMMAND` on this machine |
 
 ## `oprobe mcp`
 
