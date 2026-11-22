@@ -177,7 +177,7 @@ Design [v5](docs/design/v5.md). The changes under **Changed** are breaking.
 - **`--client aws-sdk | exec:COMMAND`.** Drive any workload with aws-sdk-s3 (cargo feature
   `aws-sdk`, over oprobe's instrumented transport) or with an external adapter speaking the
   versioned oprobe client protocol `oprobe.client/1` (NDJSON over stdin/stdout, documented in
-  [docs/clients.md](docs/clients.md); schemas `client-hello`, `client-hello-reply`,
+  [docs/clients.md](https://github.com/hxddh/oprobe/blob/v5.0.0/docs/clients.md); schemas `client-hello`, `client-hello-reply`,
   `client-op`, `client-result`). `report.client` names the client, its version and the stages
   it observes; findings that need other stages are suppressed with a warning. The client is
   never stored in a run's spec. Reference adapters in `adapters/`: `minimal` (Python standard
