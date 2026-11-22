@@ -47,7 +47,7 @@
       "type": "object"
     }
   },
-  "$id": "https://github.com/hxddh/oprobe/schemas/4/runs-rm.json",
+  "$id": "https://github.com/hxddh/oprobe/schemas/5/runs-rm.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "Result of `oprobe runs rm` / `runs gc`",
   "properties": {

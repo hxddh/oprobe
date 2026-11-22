@@ -27,7 +27,7 @@
       ]
     }
   },
-  "$id": "https://github.com/hxddh/oprobe/schemas/4/run-summary.json",
+  "$id": "https://github.com/hxddh/oprobe/schemas/5/run-summary.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "Sidecar summary of a stored run (runs/<id>.json)",
   "properties": {

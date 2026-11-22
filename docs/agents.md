@@ -14,13 +14,13 @@ repository should read [`AGENTS.md`](../AGENTS.md).
 | Command results | `-o json` (one document on stdout) | `oprobe schema <command>` |
 | Live events | `-o ndjson` (one event per line, ends with `result` or `error`) | `oprobe schema events` |
 | Errors | `{"type":"error","error":{code,message,hint?,retryable,docs?}}` on stdout in json/ndjson modes | `oprobe schema error` |
-| Report v4 | `report` of `run`, `runs show`, MCP `get_run` | `oprobe schema report` |
-| Run files | `runs/<id>.oprobe` (zstd NDJSON: header, report, op rows, req rows) | `oprobe schema run-file` |
+| Report v5 | `report` of `run`, `runs show`, MCP `get_run` | `oprobe schema report` |
+| Run files | `runs/<id>.oprobe` (`oprobe.run/5`: zstd stream of framed blocks — header, columnar op/request segments, per-second intervals, report last) | `oprobe schema run-file` |
 | Config | `config.toml` (`[defaults]`, `[targets.NAME]`) | `oprobe schema config` |
 | Self-description | `oprobe capabilities -o json` | `oprobe schema capabilities` |
 
 Schemas are JSON Schema 2020-12 with `$id`
-`https://github.com/hxddh/oprobe/schemas/4/<name>.json`; the checked-in copies live in
+`https://github.com/hxddh/oprobe/schemas/5/<name>.json`; the checked-in copies live in
 [`schemas/`](../schemas). `oprobe schema` lists every name.
 
 Rules that hold everywhere:

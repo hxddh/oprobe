@@ -610,7 +610,7 @@
       ]
     }
   },
-  "$id": "https://github.com/hxddh/oprobe/schemas/4/capacity-history.json",
+  "$id": "https://github.com/hxddh/oprobe/schemas/5/capacity-history.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "Ceilings remembered per target and workload (<data>/capacity.toml)",
   "properties": {

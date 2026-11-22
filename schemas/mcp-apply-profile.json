@@ -47,7 +47,7 @@
       "type": "object"
     }
   },
-  "$id": "https://github.com/hxddh/oprobe/schemas/4/mcp-apply-profile.json",
+  "$id": "https://github.com/hxddh/oprobe/schemas/5/mcp-apply-profile.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "MCP apply_profile: the profile file written and its diff",
   "properties": {

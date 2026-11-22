@@ -1402,7 +1402,7 @@
       "type": "object"
     }
   },
-  "$id": "https://github.com/hxddh/oprobe/schemas/4/fix.json",
+  "$id": "https://github.com/hxddh/oprobe/schemas/5/fix.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "Result of `oprobe fix`: diagnose, tune, verify; a recommendation and a profile patch",
   "properties": {

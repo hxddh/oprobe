@@ -216,7 +216,7 @@
       ]
     }
   },
-  "$id": "https://github.com/hxddh/oprobe/schemas/4/mcp-runs.json",
+  "$id": "https://github.com/hxddh/oprobe/schemas/5/mcp-runs.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "MCP list_runs: one page of stored runs and the jobs this server started",
   "properties": {

@@ -163,7 +163,7 @@
       "type": "object"
     }
   },
-  "$id": "https://github.com/hxddh/oprobe/schemas/4/target-sample.json",
+  "$id": "https://github.com/hxddh/oprobe/schemas/5/target-sample.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "Result of `oprobe target sample` (MCP sample_objects): prefixes, counts and sizes",
   "properties": {

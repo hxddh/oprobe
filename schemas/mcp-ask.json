@@ -86,7 +86,7 @@
       "type": "object"
     }
   },
-  "$id": "https://github.com/hxddh/oprobe/schemas/4/mcp-ask.json",
+  "$id": "https://github.com/hxddh/oprobe/schemas/5/mcp-ask.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "MCP ask_run: answers citing report fields",
   "properties": {

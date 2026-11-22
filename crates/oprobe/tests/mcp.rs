@@ -452,7 +452,7 @@ fn agent_workflow_over_stdio() {
     let schema: Value = serde_json::from_str(&schema).unwrap();
     assert_eq!(
         schema["$id"],
-        "https://github.com/hxddh/oprobe/schemas/4/report.json"
+        "https://github.com/hxddh/oprobe/schemas/5/report.json"
     );
     let (findings, _) = m.read("oprobe://docs/findings");
     assert!(findings.contains("throttling"));

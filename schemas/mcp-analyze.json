@@ -108,7 +108,7 @@
       "type": "object"
     }
   },
-  "$id": "https://github.com/hxddh/oprobe/schemas/4/mcp-analyze.json",
+  "$id": "https://github.com/hxddh/oprobe/schemas/5/mcp-analyze.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "MCP analyze_run: outlier attribution of selected requests",
   "properties": {

@@ -106,7 +106,7 @@ sudo dnf install ./oprobe-<ver>-1.x86_64.rpm
 ```bash
 cargo install oprobe --locked
 cargo install oprobe --locked --features gui
-cargo install --locked --git https://github.com/hxddh/oprobe --tag v4.0.0 oprobe
+cargo install --locked --git https://github.com/hxddh/oprobe --tag v5.0.0 oprobe
 ```
 
 ## Updating

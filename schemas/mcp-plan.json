@@ -219,7 +219,7 @@
       "type": "object"
     }
   },
-  "$id": "https://github.com/hxddh/oprobe/schemas/4/mcp-plan.json",
+  "$id": "https://github.com/hxddh/oprobe/schemas/5/mcp-plan.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "MCP plan_run: the dry-run plan, budgets and whether the server accepts it",
   "properties": {

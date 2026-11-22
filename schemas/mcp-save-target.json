@@ -93,7 +93,7 @@
       "type": "object"
     }
   },
-  "$id": "https://github.com/hxddh/oprobe/schemas/4/mcp-save-target.json",
+  "$id": "https://github.com/hxddh/oprobe/schemas/5/mcp-save-target.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "MCP save_target: the target saved",
   "properties": {

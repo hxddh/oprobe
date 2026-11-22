@@ -4,9 +4,9 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
-## v5.0.0 — unreleased
+## v5.0.0 — 2026-11-22
 
-The foundation of 5.0 (design [v5](docs/design/v5.md) §12 F). Everything below is breaking.
+Design [v5](docs/design/v5.md). The changes under **Changed** are breaking.
 
 ### Changed
 
@@ -98,6 +98,173 @@ The foundation of 5.0 (design [v5](docs/design/v5.md) §12 F). Everything below 
   splits concurrency, rate, dataset and budgets, starts every worker at one instant, enforces
   the global budgets, fans out cancellation and merges the workers' snapshots and trace rows
   into one run with `report.workers[]` and `report.dimensions.workers[]`.
+
+### Added (stream MEAS: measurement, design v5 §3)
+
+- **Open-loop schedule stage.** Open-loop runs time every operation from its intended start: the
+  `schedule` stage (intended → actual start) is part of its latency, and arrivals that never
+  started before the window ended are counted as censored latencies in the tail ("≥" values)
+  instead of being dropped. `report.schedule` gives `open_loop`, `arrivals`,
+  `intended_ops_count`, `missed_arrivals_count`/`_ratio`, `schedule_stage` and
+  `max_schedule_lag_ms`; a closed-loop run says `open_loop: false`.
+- **Arrival shapes.** `--arrivals constant|poisson` and a time-varying rate with
+  `--shape ramp:FROM..TO/D | step:R1,R2,…/D | diurnal[:MIN..MAX/PERIOD]`. Over `--workers` the
+  shape is scaled by each worker's weight and every worker draws its own Poisson seed.
+- **Log replay.** `--replay FILE` replays an S3 server access log, CloudTrail S3 data events or
+  an oprobe run file, with `--speed N` and `--map-prefix FROM=TO` (repeatable); writes outside
+  the run prefix are refused. Replays are split by key over local workers and refused for
+  remote ones.
+- **Self probe.** `report.self` measures the load generator: scheduling lag, Tokio runtime busy
+  share, CPU after warmup, RSS, the observer's cost per operation and `client_saturated`.
+- **Streamed run file.** Rows go to a writer thread that appends columnar segments while the
+  run measures; past `trace.max_requests` every failed or throttled operation is kept and the
+  rest thinned. A run keeps only a 100k-row sample in memory, so memory stays flat on long runs.
+  The interval series adds p90, p99.9, max, in-flight, new connections, CPU, missed arrivals and
+  heatmap columns, at 1 s for the first ten minutes and 10 s after.
+- **Server signals.** Requests record the provider's error code (from the body, first 4 KiB),
+  S3 `x-amz-id-2`, the bucket region, `Server-Timing` and the CDN cache status.
+- **HTTP/2 stream waits.** The time a request waits for a stream slot (`stream_wait`, part of
+  `queue`), flow-control stalls and the streams open on the connection; the microscope transport
+  opens several HTTP/2 connections per host by stream budget.
+- **Lab protocols and HTTP/2 preflight.** `lab://NAME?proto=h1|h2c|https|h2`; lab servers speak
+  h2c by default, so `--http h2` works on `lab://` targets, and TLS variants trust the lab CA.
+  With `--http h2` a target without HTTP/2 is refused up front (`net.http`, with a hint) instead
+  of failing every request.
+- **Kernel upload acknowledgement, min RTT, retransmits.** TCP samples keep the minimum RTT,
+  unsent and unacknowledged bytes, lost segments, bytes acknowledged and pacing; every request
+  samples its connection and carries the retransmits since the previous sample. On Linux,
+  HTTP/1 uploads through the microscope transport poll `TCP_INFO` until the last byte is
+  acknowledged: `upload` ends at the acknowledgement and `server` (TTFB) starts from it.
+- **`report.dimensions`.** Where the traffic and the trouble are, from aggregates: prefixes,
+  hot keys (at most 20, with their share of the throttling), size buckets and cold vs warm reads,
+  each with its share, throttled and error ratios and p99.
+- **Object size distributions.** `--object-size dist:lognormal(MEDIAN,SIGMA)` or
+  `--object-size file:PATH` (one size per line) next to a fixed size.
+- **Cold-start sample.** Warmup used to absorb every dial; `connections.cold_start` now reports
+  the connections dialed at the start of warmup, their connect time and the latency of the
+  operations that waited for them.
+- **`schedule_backlog` finding.** More than 1 % of the open-loop arrivals never started: the
+  tail holds censored values and throughput is what the client managed; capacity advice is
+  suppressed.
+- Distributed runs merge all of the above across workers (self, dimensions, the open-loop
+  fields, timelines and cold starts).
+
+### Added (stream ANA: analysis, design v5 §4)
+
+- **Competing limit models.** Capacity fits in-flight, token-bucket rate, per-key,
+  time-varying, queueing, bandwidth-cap and client-bound hypotheses and selects one by BIC
+  (`capacity.hypotheses`); the 4.x ceiling and rate fields follow the selected hypothesis. The
+  lab gains limit faults with one scenario each: `ratelimit`, `hotkey`, `bandwidth`, `queueing`
+  (an M/M/4 queue), `timevarying` and `noisy` (random 5xx unrelated to the load).
+- **Advice per limit model.** The throttling finding's advice depends on the selected
+  hypothesis (rate, per-key, time-varying, random, inconclusive); a queue, a bandwidth cap or a
+  busy client no longer gets "add workers". Retried 5xx are reported even under throttling, and
+  `cache_opportunity` needs real data or a stated skew.
+- **Two-sided verify with an SPRT.** `verify` runs 2 to 8 interleaved pairs (`--repeat`) and
+  stops a finding early once its sequential test decides, with bounded log-ratio and
+  Wilson/Newcombe intervals; each finding gets a net verdict (`improved`, `regressed`,
+  `traded`, `no_change`, `inconclusive`).
+- **Three-tier gate.** Each compare check is `fail` (significantly worse and over the limit),
+  `warn` (significantly worse within the limit) or `inconclusive` (not significant, but the
+  interval reaches past the limit), next to `pass`/`improved`; the gate verdict gains `warned`
+  and `inconclusive`. Intervals are log-ratio and pooled block bootstraps instead of
+  t-intervals on two runs (run-level once either side has 3+ runs), `compare` reports a net
+  verdict, and `compare --fail-on-warn` makes a warn fail the gate (exit 3).
+- **Fix menu.** `fix` offers 2 to 4 Pareto options, each with goodput, p99, throttling, monthly
+  cost and whether it was verified.
+- **Tune 5.** A rate-limit hypothesis adds paced rate trials; Gaussian-process surrogates of
+  goodput and the throttle ratio pick the next concurrency by constrained expected improvement;
+  a measured configuration beyond the fixed headroom is accepted when the posterior risk of
+  exceeding the throttle budget is at most `--risk` (default 0.05), and is then reported as
+  `safe_concurrency`. Under a queue or a bandwidth cap the tuner prefers the lowest-latency
+  configuration on the plateau. Trial goodput counts only the in-window operations that
+  finished by the deadline, so a large closed loop no longer looks faster than it is.
+- **Bill-grade cost.** Price tables gain storage classes (minimum billable size and duration,
+  retrieval fees), egress tiers with free allowances, inter-region transfer and per-provider
+  error billing; the cost spec takes `storage_class` (`standard`, `infrequent`, `archive`) and
+  `inter_region_fraction`. The AWS egress note is corrected.
+- **Deterministic lab queue.** The lab's queue runs on virtual time, so its capacity is exactly
+  servers ÷ service time whatever the timer resolution; on Windows the lab asks for 1 ms timers.
+  In-flight ceilings tolerate a client that counts in-flight requests one level off.
+
+### Security and MCP (stream SEC, design v5 §5–§6)
+
+- **Private store files.** On unix, store files are created `0600` and new directories `0700`.
+- **Lab exposure.** `oprobe lab` refuses a non-loopback `--bind` unless `--allow-remote`, caps
+  object bodies, the in-memory store and open connections (`--max-object-size`,
+  `--max-store-size`, `--max-connections`) and times out slow request headers.
+- **MCP default budgets.** Every run the MCP server starts is limited to 50 000 requests,
+  2 minutes, $1 and 5 GiB unless the server's own flags say otherwise; a tool call can only
+  lower them.
+- **Credential-safe overrides.** A tool call may not point a configured or credentialed target
+  elsewhere (endpoint, proxy, insecure, options, `set`): overrides are accepted only for
+  unsigned requests and `memory://` / `lab://`, never towards link-local addresses.
+  `probe_endpoint` refuses loopback, private, link-local and reserved addresses unless
+  `--allow-private-endpoints`.
+- **HTTP bearer token.** `oprobe mcp --http` requires a bearer token (a new one written to
+  `<data>/mcp-token`, mode 0600, at every start, or `--token-file`), compared in constant time.
+  A non-loopback bind needs `--http-allow-remote` and TLS (`--tls-cert`/`--tls-key`) or
+  `--insecure-remote`; connections (`--max-connections`), bodies and header time are limited.
+- **Untrusted text.** Object keys and service messages are escaped, bounded and kept in
+  untrusted fields, out of the tools' text content.
+- **No client or workers via MCP.** Tool arguments and `set` keys that name a load client or
+  workers are refused (`safety.refused`), and so are replays of runs that used them.
+- **Jobs.** `verify_finding` and `recommend_config` are jobs; `doctor`, probes, `sample` and
+  `cleanup` continue as jobs after 5 s; `start_run` waits at most 5 s; `get_run` and
+  `cancel_run` handle every job.
+- **Compact responses.** `tools/list` shrinks from 442 KB to 51 KB (compact input schemas,
+  output schemas that name their `oprobe://schema` resource); results are summaries by default
+  (`detail=summary|full`; `include_report` is accepted as an alias of `full`), `list_runs`
+  pages with a cursor and `oprobe://runs/{id}/slowest` pages five operations at a time.
+- **New tools.** `ask_run` (questions about a stored run, answered from its report with cited
+  fields, no model), `save_target` and `apply_profile` (both need `--allow-write`).
+- **Next steps as MCP calls.** Every next step carries an MCP call, derived from its CLI command
+  when it has none (`target add` → `save_target`, `fix` → `recommend_config`, `run --from` →
+  `start_run`, …); capabilities report the default budgets and the bearer auth.
+
+### App (terminal and native workbench, design v5 §9)
+
+- **Target Health main screen.** The app opens on live tiles with sparklines of the last runs
+  and the baseline band, the selected limit hypothesis, a primary Fix action with its
+  prediction (opening the fix menu) and an annotated run history.
+- **Per-operation waterfall.** Drill into one operation's requests (stages, retry backoff,
+  critical path, compared with a typical operation) from the timeline, the heatmap brush or the
+  waterfall command. The timeline opens on the p99 operations, slowest first.
+- **One verdict source.** Compare and Verify show one net verdict through `App::compare`, with
+  one vocabulary and colour scale for verdicts, severities and gate checks; a warn check reads
+  "worse (within limit)", and a large change without significance is inconclusive, never
+  "same". Test Connection runs a read-only doctor through `App`.
+- **Honest terminal charts.** Gutters as wide as their labels, no grid in a terminal, x labels
+  never overlapping, text swatches in legends.
+- **Toasts** take the terminal's status row instead of drawing over content; terminal
+  notifications use OSC 9 or the bell.
+- **Provisional live findings** with a confidence while a run measures, an early-numbers flag
+  and the tuner's ETA. Findings use the shared presentation with readable evidence labels, and
+  CLI commands in advice become buttons.
+- **`oprobe://` view links.** `oprobe://run/ID?view=…` (and `oprobe gui LINK`) opens the run and
+  restores its view; the scheme and `.oprobe` files are registered by the Linux desktop entry,
+  the macOS `Info.plist` and the Windows installer.
+- **Markdown exports carry links** to the shown view.
+- Also: keyboard heatmap brush and sort keys, a fuzzy command palette with shortcuts and the
+  reason a command is disabled, per-platform shortcut labels and icons, app text size, and the
+  language taken from the OS. `RunSummary` gains `preset` and `throttled_request_ratio`.
+- **Live snapshots on the event bus.** `EventBus` gains an in-process live stream (engine
+  snapshots, cleanup, the finished run, budget stops); it is never serialized, so CLI and MCP
+  output are unchanged. The app's run job goes through `App::run`.
+
+### Known limitations
+
+- There are no `oprobe probe limits` or `oprobe probe semantics` commands.
+- TCP info (RTT, retransmits, upload acknowledgement) is not collected on Windows; the upload
+  acknowledgement is Linux only.
+- `--workers` refuses `--repeat` and `--baseline`.
+- `compare` does not flag runs made with different load clients (`report.client`).
+- The app's tuner job still calls `engine::measure` directly instead of going through `App`.
+- Plain `oprobe run` reports still count operations that started in the window and finish
+  while draining after the deadline (the tuner's trials do not).
+- The release binary (about 60 MB with the default features) misses the 45 MB target of design
+  v5.
+- Installers are still not signed with a developer certificate (see 4.0's notes).
 
 ## v4.0.2 — 2026-11-21
 

@@ -755,7 +755,7 @@
       ]
     }
   },
-  "$id": "https://github.com/hxddh/oprobe/schemas/4/capabilities.json",
+  "$id": "https://github.com/hxddh/oprobe/schemas/5/capabilities.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "Result of `oprobe capabilities`",
   "properties": {

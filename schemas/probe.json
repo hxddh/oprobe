@@ -237,7 +237,7 @@
       "type": "object"
     }
   },
-  "$id": "https://github.com/hxddh/oprobe/schemas/4/probe.json",
+  "$id": "https://github.com/hxddh/oprobe/schemas/5/probe.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "Result of `oprobe probe`",
   "properties": {

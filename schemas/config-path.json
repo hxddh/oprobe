@@ -47,7 +47,7 @@
       "type": "object"
     }
   },
-  "$id": "https://github.com/hxddh/oprobe/schemas/4/config-path.json",
+  "$id": "https://github.com/hxddh/oprobe/schemas/5/config-path.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "Result of `oprobe config path`",
   "properties": {

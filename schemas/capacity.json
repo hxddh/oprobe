@@ -398,7 +398,7 @@
       "type": "object"
     }
   },
-  "$id": "https://github.com/hxddh/oprobe/schemas/4/capacity.json",
+  "$id": "https://github.com/hxddh/oprobe/schemas/5/capacity.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "The capacity model (report.capacity): in-flight ceiling and per-op request shape",
   "properties": {

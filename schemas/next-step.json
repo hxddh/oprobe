@@ -18,7 +18,7 @@
       "type": "object"
     }
   },
-  "$id": "https://github.com/hxddh/oprobe/schemas/4/next-step.json",
+  "$id": "https://github.com/hxddh/oprobe/schemas/5/next-step.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "One suggested next step of a command result (CLI command and MCP call)",
   "properties": {

@@ -5430,7 +5430,7 @@
       "type": "object"
     }
   },
-  "$id": "https://github.com/hxddh/oprobe/schemas/4/demo.json",
+  "$id": "https://github.com/hxddh/oprobe/schemas/5/demo.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "Result of `oprobe demo`",
   "properties": {

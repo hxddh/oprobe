@@ -11,7 +11,7 @@ use serde_json::Value;
 use crate::errors::ErrorBody;
 
 /// Base of every schema `$id`.
-pub const ID_BASE: &str = "https://github.com/hxddh/oprobe/schemas/4/";
+pub const ID_BASE: &str = "https://github.com/hxddh/oprobe/schemas/5/";
 
 /// Whether a schema describes something oprobe writes (outputs) or reads (inputs).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

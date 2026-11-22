@@ -353,7 +353,7 @@ fn json_only_agent_workflow_validates_against_the_schemas() {
     let rs: Value = serde_json::from_slice(&report_schema.stdout).unwrap();
     assert_eq!(
         rs["$id"],
-        "https://github.com/hxddh/oprobe/schemas/4/report.json"
+        "https://github.com/hxddh/oprobe/schemas/5/report.json"
     );
 
     // 2. Preflight and plan.

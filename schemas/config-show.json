@@ -78,7 +78,7 @@
       "type": "string"
     }
   },
-  "$id": "https://github.com/hxddh/oprobe/schemas/4/config-show.json",
+  "$id": "https://github.com/hxddh/oprobe/schemas/5/config-show.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "Result of `oprobe config show`",
   "properties": {

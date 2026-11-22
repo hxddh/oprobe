@@ -83,7 +83,7 @@
       "type": "object"
     }
   },
-  "$id": "https://github.com/hxddh/oprobe/schemas/4/mcp-targets.json",
+  "$id": "https://github.com/hxddh/oprobe/schemas/5/mcp-targets.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "MCP list_targets: configured targets and the server's rails",
   "properties": {

@@ -1097,7 +1097,7 @@
       "type": "object"
     }
   },
-  "$id": "https://github.com/hxddh/oprobe/schemas/4/run-spec.json",
+  "$id": "https://github.com/hxddh/oprobe/schemas/5/run-spec.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "The replayable definition of a run (report.spec; `oprobe run --from RUN`)",
   "properties": {

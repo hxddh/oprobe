@@ -1,5 +1,5 @@
 {
-  "$id": "https://github.com/hxddh/oprobe/schemas/4/selection.json",
+  "$id": "https://github.com/hxddh/oprobe/schemas/5/selection.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "Which requests to attribute (MCP analyze_run)",
   "properties": {

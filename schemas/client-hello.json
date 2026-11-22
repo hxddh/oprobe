@@ -52,7 +52,7 @@
       "type": "object"
     }
   },
-  "$id": "https://github.com/hxddh/oprobe/schemas/4/client-hello.json",
+  "$id": "https://github.com/hxddh/oprobe/schemas/5/client-hello.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "oprobe client protocol (`--client exec:CMD`): the first line oprobe sends",
   "properties": {

@@ -5449,7 +5449,7 @@
       "type": "object"
     }
   },
-  "$id": "https://github.com/hxddh/oprobe/schemas/4/events.json",
+  "$id": "https://github.com/hxddh/oprobe/schemas/5/events.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "One line of the event stream (oprobe.events/1, -o ndjson)",
   "oneOf": [

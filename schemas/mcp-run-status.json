@@ -5861,7 +5861,7 @@
       "type": "object"
     }
   },
-  "$id": "https://github.com/hxddh/oprobe/schemas/4/mcp-run-status.json",
+  "$id": "https://github.com/hxddh/oprobe/schemas/5/mcp-run-status.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "MCP start_run, start_tune, verify_finding, recommend_config, get_run, cancel_run: a run or job",
   "properties": {

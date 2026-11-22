@@ -139,7 +139,7 @@
       "type": "object"
     }
   },
-  "$id": "https://github.com/hxddh/oprobe/schemas/4/client-result.json",
+  "$id": "https://github.com/hxddh/oprobe/schemas/5/client-result.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "oprobe client protocol: the adapter's result of one operation",
   "properties": {

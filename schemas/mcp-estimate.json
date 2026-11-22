@@ -1,5 +1,5 @@
 {
-  "$id": "https://github.com/hxddh/oprobe/schemas/4/mcp-estimate.json",
+  "$id": "https://github.com/hxddh/oprobe/schemas/5/mcp-estimate.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "MCP estimate_cost: request cost at list prices",
   "properties": {

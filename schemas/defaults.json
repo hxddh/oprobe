@@ -1032,7 +1032,7 @@
       "type": "object"
     }
   },
-  "$id": "https://github.com/hxddh/oprobe/schemas/4/defaults.json",
+  "$id": "https://github.com/hxddh/oprobe/schemas/5/defaults.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "Every built-in default (config::defaults)",
   "properties": {

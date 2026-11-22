@@ -121,7 +121,7 @@
       ]
     }
   },
-  "$id": "https://github.com/hxddh/oprobe/schemas/4/self-update.json",
+  "$id": "https://github.com/hxddh/oprobe/schemas/5/self-update.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "Result of `oprobe self-update`",
   "properties": {
