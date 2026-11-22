@@ -1014,8 +1014,8 @@ pub struct ProbeArgs {
 pub struct LabArgs {
     #[arg(long, default_value = "127.0.0.1:9000")]
     pub bind: String,
-    /// Start from a fault preset: clean, demo, throttle, stragglers, lossy, flaky, parquet (the
-    /// flags below override it)
+    /// Start from a fault preset: clean, demo, throttle, stragglers, lossy, flaky, parquet,
+    /// ratelimit, hotkey, bandwidth, queueing, timevarying, noisy (the flags below override it)
     #[arg(long, value_parser = parse::lab_scenario)]
     pub scenario: Option<String>,
     /// Answer every Nth request with 500 InternalError

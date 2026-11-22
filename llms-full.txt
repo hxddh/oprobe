@@ -2423,6 +2423,7 @@ Output formats (`-o`): text, json, ndjson, md
 | `--max-throttle-ratio <RATIO>` | Share of throttled requests a configuration may cause and still be feasible (default 0.001, or the profile's `sla.max_throttle_rate`) |
 | `--boundary-repeats <BOUNDARY_REPEATS>` | Runs of each bisection trial near the throttle boundary · default `2` |
 | `--headroom-ratio <RATIO>` | In-flight headroom kept below the throttling ceiling (default 0.15) |
+| `--risk <RATIO>` | Posterior chance of exceeding the throttle budget the recommendation may carry (default 0.05): measured-clean configurations beyond the fixed headroom are accepted when the surrogate is this sure |
 | `--budget <DURATION>` | Total wall-time budget of the tuner, e.g. 5m: caps the trials so the estimate fits (add --max-duration for a hard stop) |
 | `--emit-profile <FILE>` | Write the tuned profile (TOML) |
 | `--emit-rust <FILE>` | Write a Rust/OpenDAL snippet with the tuned settings |
@@ -2456,6 +2457,7 @@ Output formats (`-o`): text, json, ndjson, md, html
 | `--allow-workload-change` | Do not fail when the workload differs (preset, mix, dataset, access, rate) |
 | `--allow-target-change` | Do not fail when the target differs (scheme, bucket/prefix, endpoint, options) |
 | `--strict` | Runs of different targets or workloads are an error (exit 2) instead of a warning |
+| `--fail-on-warn` | A significant regression within the limits (`warn`) fails the gate too (exit 3) |
 | `--markdown <FILE>` | Write a Markdown summary (PR comment / job summary) |
 | `--junit <FILE>` | Write JUnit XML |
 | `--json <FILE>` | Write the comparison as JSON |
@@ -2604,6 +2606,7 @@ Output formats (`-o`): text, json, ndjson, md
 | `--max-throttle-ratio <RATIO>` | Share of throttled requests a configuration may cause and still be feasible (default 0.001, or the profile's `sla.max_throttle_rate`) |
 | `--boundary-repeats <BOUNDARY_REPEATS>` | Runs of each bisection trial near the throttle boundary · default `2` |
 | `--headroom-ratio <RATIO>` | In-flight headroom kept below the throttling ceiling (default 0.15) |
+| `--risk <RATIO>` | Posterior chance of exceeding the throttle budget the recommendation may carry (default 0.05): measured-clean configurations beyond the fixed headroom are accepted when the surrogate is this sure |
 | `--budget <DURATION>` | Total wall-time budget of the tuning step, e.g. 5m (caps the trials so the estimate fits) |
 
 *Verification*
@@ -3304,7 +3307,7 @@ Output formats (`-o`): text, json, ndjson
 | argument | description |
 |---|---|
 | `--bind <BIND>` | · default `127.0.0.1:9000` |
-| `--scenario <SCENARIO>` | Start from a fault preset: clean, demo, throttle, stragglers, lossy, flaky, parquet (the flags below override it) |
+| `--scenario <SCENARIO>` | Start from a fault preset: clean, demo, throttle, stragglers, lossy, flaky, parquet, ratelimit, hotkey, bandwidth, queueing, timevarying, noisy (the flags below override it) |
 | `--error-every <ERROR_EVERY>` | Answer every Nth request with 500 InternalError |
 | `--reset-every <RESET_EVERY>` | Drop the connection on every Nth request |
 | `--tls` | Serve HTTPS (certificate for localhost / 127.0.0.1) |

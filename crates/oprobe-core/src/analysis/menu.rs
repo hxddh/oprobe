@@ -49,6 +49,7 @@ pub struct FixOption {
     /// The tuner trial it was measured in.
     pub trial_id: u64,
     /// Goodput in `goodput_unit` (`ops_per_s` or `mib_per_s`).
+    #[serde(rename = "goodput_per_s")]
     pub goodput: f64,
     pub goodput_unit: String,
     /// Goodput change against the diagnosis (ratio).

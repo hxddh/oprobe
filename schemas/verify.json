@@ -390,7 +390,7 @@
               "type": "null"
             }
           ],
-          "description": "The two-sided net verdict (design v5 §4; filled by stream ANA)."
+          "description": "The two-sided net verdict (design v5 §4): improved, regressed, traded, no change or\ninconclusive, with what got better and what got worse."
         },
         "outcome": {
           "$ref": "#/$defs/VerifyOutcome"
@@ -399,12 +399,24 @@
           "$ref": "#/$defs/Overrides",
           "description": "The change that was tested."
         },
+        "pairs_count": {
+          "default": 0,
+          "description": "Interleaved baseline / candidate pairs measured for this finding.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "reason": {
           "description": "Why, in one sentence with numbers.",
           "type": "string"
         },
         "resolved": {
           "description": "The finding no longer shows in most candidate runs.",
+          "type": "boolean"
+        },
+        "stopped_early": {
+          "default": false,
+          "description": "The sequential test decided before `--repeat` pairs ran.",
           "type": "boolean"
         }
       },
@@ -417,7 +429,9 @@
         "expectations",
         "resolved",
         "candidate_run_ids",
-        "comparison"
+        "comparison",
+        "pairs_count",
+        "stopped_early"
       ],
       "type": "object"
     },
@@ -460,6 +474,16 @@
         {
           "const": "regression",
           "description": "Comparable and at least one check failed (exit 3).",
+          "type": "string"
+        },
+        {
+          "const": "warned",
+          "description": "Comparable, nothing failed, but a check is significantly worse within its limit (exit 0,\nor 3 with `fail_on_warn`).",
+          "type": "string"
+        },
+        {
+          "const": "inconclusive",
+          "description": "Comparable, nothing failed or warned, but a check could not rule out a regression\n(exit 0).",
           "type": "string"
         },
         {
@@ -805,13 +829,31 @@
     },
     "Status": {
       "description": "The verdict of one check.",
-      "enum": [
-        "pass",
-        "improved",
-        "fail",
-        "skipped"
-      ],
-      "type": "string"
+      "oneOf": [
+        {
+          "enum": [
+            "pass",
+            "improved",
+            "skipped"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "fail",
+          "description": "Significantly worse and over the limit (design v5 §4: the `fail` tier).",
+          "type": "string"
+        },
+        {
+          "const": "warn",
+          "description": "Significantly worse, but within the limit (the `warn` tier: a real, smaller\nregression; A13).",
+          "type": "string"
+        },
+        {
+          "const": "inconclusive",
+          "description": "Not significant, yet the interval reaches past the limit: neither a pass nor a\nregression (never shown as \"same\").",
+          "type": "string"
+        }
+      ]
     },
     "Thresholds": {
       "description": "Regression limits. Relative limits are ratios of the baseline in the \"bad\" direction\n(0.2 = 20 % worse).",
@@ -837,6 +879,11 @@
         },
         "fail_on_new_throttling": {
           "description": "Gate throttling: fail when the candidate's throttled-request ratio grows past\n[`Thresholds::throttle_increase_ratio`] (relative), [`THROTTLE_RATIO_FLOOR`] (absolute)\nand [`Thresholds::min_throttled_count`] (count floor).",
+          "type": "boolean"
+        },
+        "fail_on_warn": {
+          "default": false,
+          "description": "A `warn` (significantly worse within the limit) fails the gate too (exit 3).",
           "type": "boolean"
         },
         "min_failed_ops_count": {
@@ -909,7 +956,8 @@
         "min_samples_count",
         "allow_workload_change",
         "allow_target_change",
-        "strict"
+        "strict",
+        "fail_on_warn"
       ],
       "type": "object"
     },
@@ -969,7 +1017,7 @@
       "type": "integer"
     },
     "repeat_count": {
-      "description": "Baseline / candidate pairs per finding.",
+      "description": "Baseline / candidate pairs per finding (the most any finding needed: the sequential test\nstops a finding once the evidence is in, between 2 and 8 pairs).",
       "format": "uint64",
       "minimum": 0,
       "type": "integer"

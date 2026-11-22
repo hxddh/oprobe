@@ -72,6 +72,8 @@ pub const UNITLESS_FIELDS: &[&str] = &[
     "low",
     "high",
     "log_likelihood",
+    // Bayesian information criterion of a limit model (a score; lower is better).
+    "bic",
 ];
 
 /// Whether a numeric report field name follows the unit rule.

@@ -346,7 +346,7 @@
         },
         "hypotheses": {
           "default": [],
-          "description": "Competing limit models, the selected one first (design v5 §4; filled from the\nin-flight ceiling until stream ANA fits them).",
+          "description": "Competing limit models, the selected one first (design v5 §4).",
           "items": {
             "$ref": "#/$defs/Hypothesis"
           },
@@ -370,7 +370,7 @@
           "$ref": "#/$defs/OpShape"
         },
         "rate_ceiling_requests_per_s": {
-          "description": "Requests per second the service accepted while it throttled.",
+          "description": "The fitted rate limit (requests per second) when the selected hypothesis is a rate\nlimit (the lowest rate of a time-varying one); never the observed throughput.",
           "format": "double",
           "type": [
             "number",
@@ -743,6 +743,11 @@
           "format": "double",
           "type": "number"
         },
+        "inter_region_fraction": {
+          "description": "Fraction of downloaded bytes that cross regions (inter-region transfer).",
+          "format": "double",
+          "type": "number"
+        },
         "monthly_ops": {
           "default": 100000000.0,
           "description": "Logical operations per month at this workload mix.",
@@ -762,6 +767,13 @@
         },
         "provider": {
           "description": "Pricing preset: aws-s3, gcs, azure-blob, cloudflare-r2, backblaze-b2, aliyun-oss.\nDefaults to the target's provider.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "storage_class": {
+          "description": "Storage class the data is kept in: `standard` (default), `infrequent` or `archive`\n(the provider's equivalents: S3 Standard-IA / Glacier IR, GCS Nearline / Archive, …).",
           "type": [
             "string",
             "null"
@@ -1151,6 +1163,24 @@
       ],
       "type": "object"
     },
+    "EgressTier": {
+      "description": "One egress price tier: the monthly GB up to `up_to_gb` (counted from 0, the free allowance\nincluded) cost `per_gb` (the last tier may use a huge bound).",
+      "properties": {
+        "per_gb": {
+          "format": "double",
+          "type": "number"
+        },
+        "up_to_gb": {
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "up_to_gb",
+        "per_gb"
+      ],
+      "type": "object"
+    },
     "EnvInfo": {
       "description": "Cloud context of the target, when known.",
       "properties": {
@@ -1412,6 +1442,14 @@
     "Hypothesis": {
       "description": "One fitted limit model.",
       "properties": {
+        "bic": {
+          "description": "Bayesian information criterion `−2·LL + k·ln n` (lower is better; selection score).",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
         "confidence": {
           "$ref": "#/$defs/Confidence"
         },
@@ -1528,10 +1566,26 @@
             "null"
           ]
         },
+        "change_points_s": {
+          "description": "Seconds into the window where a [`HypothesisKind::TimeVarying`] limit changed.",
+          "items": {
+            "format": "double",
+            "type": "number"
+          },
+          "type": "array"
+        },
         "key": {
-          "description": "The key or prefix of a [`HypothesisKind::KeyLimit`].",
+          "description": "The key or prefix of a [`HypothesisKind::KeyLimit`] (the hottest one).",
           "type": [
             "string",
+            "null"
+          ]
+        },
+        "key_share_ratio": {
+          "description": "Share of the requests that went to `key`.",
+          "format": "double",
+          "type": [
+            "number",
             "null"
           ]
         },
@@ -1541,6 +1595,14 @@
             "number",
             "null"
           ]
+        },
+        "segment_requests_per_s": {
+          "description": "The rate of each segment between change points (requests per second).",
+          "items": {
+            "format": "double",
+            "type": "number"
+          },
+          "type": "array"
         },
         "servers_count": {
           "format": "uint64",
@@ -1957,6 +2019,12 @@
           "format": "double",
           "type": "number"
         },
+        "ops_service_inflight_mean": {
+          "default": 0.0,
+          "description": "Operations in flight on average, retry backoff left out: the time operations were\nserved, which throughput scales with (backoff is waiting, not work; A3).",
+          "format": "double",
+          "type": "number"
+        },
         "peak_inflight_count": {
           "format": "uint64",
           "minimum": 0,
@@ -1985,6 +2053,7 @@
         "peak_inflight_count",
         "inflight_mean",
         "ops_inflight_mean",
+        "ops_service_inflight_mean",
         "ops_per_s"
       ],
       "type": "object"
@@ -2031,6 +2100,12 @@
     "OpShape": {
       "description": "Request concurrency of one operation.",
       "properties": {
+        "bytes_per_op_mean": {
+          "default": 0.0,
+          "description": "Logical bytes per operation (mean).",
+          "format": "double",
+          "type": "number"
+        },
         "inflight_per_op_mean": {
           "description": "Requests one operation keeps in flight on average over its lifetime.",
           "format": "double",
@@ -2064,7 +2139,8 @@
         "peak_inflight_per_op_count",
         "inflight_per_op_mean",
         "sequential_ratio",
-        "ops_count"
+        "ops_count",
+        "bytes_per_op_mean"
       ],
       "type": "object"
     },
@@ -2456,6 +2532,12 @@
           "format": "double",
           "type": "number"
         },
+        "server_error_requests_mean": {
+          "default": 0.0,
+          "description": "Of `failed_requests`, those answered 5xx (incl. 503 SlowDown): not billed by most\nproviders.",
+          "format": "double",
+          "type": "number"
+        },
         "upload_bytes": {
           "format": "double",
           "type": "number"
@@ -2471,6 +2553,7 @@
         "read_requests_mean",
         "delete_requests_mean",
         "failed_requests_mean",
+        "server_error_requests_mean",
         "download_bytes",
         "upload_bytes",
         "overread_bytes",
@@ -2547,13 +2630,48 @@
       "additionalProperties": false,
       "description": "Provider list prices in USD (request prices per million, data per GB = 1e9 bytes).",
       "properties": {
+        "bills_client_errors": {
+          "default": true,
+          "description": "Requests answered 4xx are billed (most providers).",
+          "type": "boolean"
+        },
+        "bills_server_errors": {
+          "default": true,
+          "description": "Requests answered 5xx (incl. 503 SlowDown) are billed (the presets assume so; check\nyour provider's terms and set `false` in `[cost.pricing]` where they are free).",
+          "type": "boolean"
+        },
         "delete_per_million": {
           "default": 0.0,
           "format": "double",
           "type": "number"
         },
+        "egress_free_gb": {
+          "default": 0.0,
+          "description": "Internet egress free per month (GB).",
+          "format": "double",
+          "type": "number"
+        },
+        "egress_free_stored_multiple": {
+          "default": 0.0,
+          "description": "Free egress as a multiple of the stored data (Backblaze B2: 3×).",
+          "format": "double",
+          "type": "number"
+        },
         "egress_per_gb": {
-          "description": "Internet egress per GB.",
+          "description": "Internet egress per GB (the first paid tier when `egress_tiers` is given).",
+          "format": "double",
+          "type": "number"
+        },
+        "egress_tiers": {
+          "description": "Internet egress price tiers by monthly volume (absolute bounds, the free allowance\nincluded in the first); empty: the flat `egress_per_gb`.",
+          "items": {
+            "$ref": "#/$defs/EgressTier"
+          },
+          "type": "array"
+        },
+        "inter_region_per_gb": {
+          "default": 0.0,
+          "description": "Inter-region transfer per GB.",
           "format": "double",
           "type": "number"
         },
@@ -2572,6 +2690,13 @@
           "format": "double",
           "type": "number"
         },
+        "storage_classes": {
+          "description": "Storage classes besides standard (`infrequent`, `archive`).",
+          "items": {
+            "$ref": "#/$defs/StorageClassPrice"
+          },
+          "type": "array"
+        },
         "storage_gb_month": {
           "format": "double",
           "type": "number"
@@ -2589,7 +2714,12 @@
         "list_per_million",
         "read_per_million",
         "delete_per_million",
-        "egress_per_gb"
+        "egress_per_gb",
+        "egress_free_gb",
+        "egress_free_stored_multiple",
+        "inter_region_per_gb",
+        "bills_client_errors",
+        "bills_server_errors"
       ],
       "type": "object"
     },
@@ -2668,12 +2798,24 @@
           "format": "double",
           "type": "number"
         },
+        "early_delete_usd": {
+          "default": 0.0,
+          "description": "Monthly charges for objects deleted before the class's minimum duration.",
+          "format": "double",
+          "type": "number"
+        },
         "egress_usd": {
           "format": "double",
           "type": "number"
         },
         "failed_requests_usd": {
           "description": "Monthly spend on failed/throttled requests.",
+          "format": "double",
+          "type": "number"
+        },
+        "inter_region_usd": {
+          "default": 0.0,
+          "description": "Monthly inter-region transfer.",
           "format": "double",
           "type": "number"
         },
@@ -2697,6 +2839,17 @@
           "format": "double",
           "type": "number"
         },
+        "retrieval_usd": {
+          "default": 0.0,
+          "description": "Monthly data-retrieval fees of the storage class.",
+          "format": "double",
+          "type": "number"
+        },
+        "storage_class": {
+          "default": "",
+          "description": "The storage class priced (`standard`, or the provider's name of the class).",
+          "type": "string"
+        },
         "storage_usd": {
           "format": "double",
           "type": "number"
@@ -2716,7 +2869,11 @@
         "per_million_ops_usd",
         "failed_requests_usd",
         "overread_usd",
-        "cache_savings_usd"
+        "cache_savings_usd",
+        "storage_class",
+        "retrieval_usd",
+        "inter_region_usd",
+        "early_delete_usd"
       ],
       "type": "object"
     },
@@ -3514,6 +3671,58 @@
       ],
       "type": "object"
     },
+    "StorageClassPrice": {
+      "description": "A storage class: its storage, request and retrieval prices, minimum billable object size\nand minimum storage duration.",
+      "properties": {
+        "class": {
+          "description": "`infrequent` or `archive`.",
+          "type": "string"
+        },
+        "min_billable_bytes": {
+          "description": "Smaller objects are billed as this size (bytes).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "min_duration_days": {
+          "description": "Objects deleted earlier are billed for the rest of this duration (days).",
+          "format": "double",
+          "type": "number"
+        },
+        "name": {
+          "description": "The provider's name for it.",
+          "type": "string"
+        },
+        "read_per_million": {
+          "format": "double",
+          "type": "number"
+        },
+        "retrieval_per_gb": {
+          "description": "Data retrieval per GB read.",
+          "format": "double",
+          "type": "number"
+        },
+        "storage_gb_month": {
+          "format": "double",
+          "type": "number"
+        },
+        "write_per_million": {
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "class",
+        "name",
+        "storage_gb_month",
+        "write_per_million",
+        "read_per_million",
+        "retrieval_per_gb",
+        "min_billable_bytes",
+        "min_duration_days"
+      ],
+      "type": "object"
+    },
     "Summary": {
       "properties": {
         "attempted_ops_per_s": {
@@ -4068,6 +4277,14 @@
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
+        },
+        "rate_per_s": {
+          "description": "The pace of an open-loop trial (operations per second).",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
         },
         "requests_count": {
           "format": "uint64",
@@ -4684,12 +4901,14 @@
           "inflight_mean": 0.0,
           "ops_inflight_mean": 0.0,
           "ops_per_s": 0.0,
+          "ops_service_inflight_mean": 0.0,
           "peak_inflight_count": 0,
           "requests_count": 0,
           "throttled_requests_count": 0,
           "window_s": 0.0
         },
         "per_op": {
+          "bytes_per_op_mean": 0.0,
           "inflight_per_op_mean": 0.0,
           "ops_count": 0,
           "peak_inflight_per_op_count": 0,
