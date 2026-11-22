@@ -213,16 +213,56 @@ impl Default for Timeout {
     }
 }
 
-/// `TailCutLayer` (cancel and re-issue requests slower than the percentile × 1.5).
+/// `TailCutLayer`: cancel (and, through `RetryLayer`, re-issue) a request slower than the
+/// `percentile` of the recent latencies × `safety_factor`, the deadline clamped to
+/// `[min_deadline, max_deadline]`.
+///
+/// The defaults are what oprobe measures with, not OpenDAL's (1.3, 200 samples, 500 ms, 30 s):
+/// a shorter warm-up and floor so that short runs can see the layer work, and a ceiling at the
+/// operation timeout. Generated Rust spells out every value that differs from OpenDAL's default.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct TailCut {
+    /// The latency percentile the deadline follows (50..99).
     pub percentile: u8,
+    /// The deadline = percentile × this factor (1..5).
+    pub safety_factor: f64,
+    /// Latencies recorded before the layer cuts anything.
+    pub min_samples: usize,
+    /// The shortest deadline.
+    pub min_deadline: HumanDuration,
+    /// The longest deadline (unset: the operation timeout, `layers.timeout.op`, or 60 s without
+    /// the timeout layer).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_deadline: Option<HumanDuration>,
+    /// The sliding window of latencies (at most 120 s).
+    pub window: HumanDuration,
 }
 
 impl Default for TailCut {
     fn default() -> Self {
-        Self { percentile: 95 }
+        Self {
+            percentile: 95,
+            safety_factor: 1.5,
+            min_samples: 32,
+            min_deadline: HumanDuration(Duration::from_millis(50)),
+            max_deadline: None,
+            window: HumanDuration::secs(60),
+        }
+    }
+}
+
+impl TailCut {
+    /// The parameters applied with an operation timeout of `op_timeout`.
+    pub fn params(&self, op_timeout: Duration) -> crate::engine::stack::TailCutParams {
+        crate::engine::stack::TailCutParams {
+            percentile: self.percentile,
+            safety_factor: self.safety_factor,
+            min_samples: self.min_samples,
+            min_deadline: self.min_deadline.get(),
+            max_deadline: self.max_deadline.map_or(op_timeout, HumanDuration::get),
+            window: self.window.get(),
+        }
     }
 }
 
@@ -410,6 +450,11 @@ pub const SET_PATHS: &[&str] = &[
     "layers.timeout.io",
     "layers.tail_cut",
     "layers.tail_cut.percentile",
+    "layers.tail_cut.safety_factor",
+    "layers.tail_cut.min_samples",
+    "layers.tail_cut.min_deadline",
+    "layers.tail_cut.max_deadline",
+    "layers.tail_cut.window",
     "layers.throttle",
     "layers.throttle.bandwidth",
     "layers.throttle.burst",
@@ -500,10 +545,24 @@ impl OperatorSpec {
         {
             return Err(invalid("layers.timeout durations must be > 0"));
         }
-        if let Some(t) = &l.tail_cut
-            && !(1..=99).contains(&t.percentile)
-        {
-            return Err(invalid("layers.tail_cut.percentile must be within 1..99"));
+        if let Some(t) = &l.tail_cut {
+            // OpenDAL's builder panics outside these ranges.
+            if !(50..=99).contains(&t.percentile) {
+                return Err(invalid("layers.tail_cut.percentile must be within 50..99"));
+            }
+            if !(t.safety_factor.is_finite() && (1.0..=5.0).contains(&t.safety_factor)) {
+                return Err(invalid("layers.tail_cut.safety_factor must be within 1..5"));
+            }
+            if t.window.get().is_zero() || t.window.get() > Duration::from_secs(120) {
+                return Err(invalid("layers.tail_cut.window must be within 1ms..120s"));
+            }
+            if t.max_deadline
+                .is_some_and(|m| m.get().is_zero() || m.get() < t.min_deadline.get())
+            {
+                return Err(invalid(
+                    "layers.tail_cut.max_deadline must be > 0 and not below min_deadline",
+                ));
+            }
         }
         if let Some(t) = &l.throttle {
             let ok = |b: ByteSize| b.0 > 0 && b.0 <= u64::from(u32::MAX);

@@ -66,6 +66,11 @@ Everything under **Changed** and **Removed** is breaking; 5.x run files are not 
 - **Releases:** every platform gets the app build and a CLI-only build
   (`oprobe-cli-<ver>-<target>` archives; `--no-default-features --features cli`). `install.sh
   --cli` / `install.ps1 -Cli` install it; `install.sh --help` prints help instead of installing.
+- **`layers.tail_cut` carries every parameter oprobe applies:** `percentile` (50..99),
+  `safety_factor` (1.5), `min_samples` (32), `min_deadline` ("50ms"), `max_deadline` (the
+  operation timeout) and `window` ("60s"). The measured layer and the generated Rust are built
+  from one parameter list, and the Rust spells out every value that differs from OpenDAL's
+  defaults, so pasted code behaves as measured.
 - **Docs** are rewritten around the loop: getting started, concepts, `op.toml`, the CLI,
   reading the profile, embedding, the app, install, troubleshooting, privacy and releasing.
 

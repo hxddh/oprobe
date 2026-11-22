@@ -391,6 +391,8 @@ pub enum FieldKind {
     /// A layer in or out of the stack (`layers.NAME`).
     Layer,
     Count,
+    /// A decimal number (`layers.tail_cut.safety_factor`).
+    Number,
     Size,
     Duration,
     Switch,
@@ -434,6 +436,11 @@ pub const SECTIONS: &[(&str, &[Field])] = &[
             f("layers.timeout.io", Duration, "with_io_timeout"),
             f("layers.tail_cut", Layer, "TailCutLayer"),
             f("layers.tail_cut.percentile", Count, "percentile"),
+            f("layers.tail_cut.safety_factor", Number, "safety_factor"),
+            f("layers.tail_cut.min_samples", Count, "min_samples"),
+            f("layers.tail_cut.min_deadline", Duration, "min_deadline"),
+            f("layers.tail_cut.max_deadline", Duration, "max_deadline"),
+            f("layers.tail_cut.window", Duration, "window"),
             f("layers.throttle", Layer, "ThrottleLayer"),
             f("layers.throttle.bandwidth", Size, "bandwidth"),
             f("layers.throttle.burst", Size, "burst"),
@@ -497,6 +504,21 @@ pub fn value_of(s: &OperatorSpec, path: &str) -> String {
         "layers.timeout.io" => opt(l.timeout.as_ref().map(|t| t.io.to_string())),
         "layers.tail_cut" => on(l.tail_cut.is_some()),
         "layers.tail_cut.percentile" => opt(l.tail_cut.as_ref().map(|t| t.percentile.to_string())),
+        "layers.tail_cut.safety_factor" => {
+            opt(l.tail_cut.as_ref().map(|t| t.safety_factor.to_string()))
+        }
+        "layers.tail_cut.min_samples" => {
+            opt(l.tail_cut.as_ref().map(|t| t.min_samples.to_string()))
+        }
+        "layers.tail_cut.min_deadline" => {
+            opt(l.tail_cut.as_ref().map(|t| t.min_deadline.to_string()))
+        }
+        "layers.tail_cut.max_deadline" => opt(l
+            .tail_cut
+            .as_ref()
+            .and_then(|t| t.max_deadline)
+            .map(|d| d.to_string())),
+        "layers.tail_cut.window" => opt(l.tail_cut.as_ref().map(|t| t.window.to_string())),
         "layers.throttle" => on(l.throttle.is_some()),
         "layers.throttle.bandwidth" => opt(l.throttle.as_ref().map(|t| t.bandwidth.to_string())),
         "layers.throttle.burst" => opt(l.throttle.as_ref().map(|t| t.burst.to_string())),

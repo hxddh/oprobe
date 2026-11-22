@@ -611,10 +611,12 @@ fn bandwidth_cap(c: &Ctx) -> Option<Finding> {
 /// detection does not depend on the current retry backoff (OpenDAL's default waits 1 s).
 fn remedy_setup(r: &Report) -> TailCutSetup {
     let op = &r.spec.profile.operator;
-    let mut params = crate::engine::stack::TailCutParams::for_timeout(op.op_timeout());
-    if let Some(t) = &op.layers.tail_cut {
-        params.percentile = t.percentile;
-    }
+    let params = op
+        .layers
+        .tail_cut
+        .clone()
+        .unwrap_or_default()
+        .params(op.op_timeout());
     TailCutSetup {
         params,
         backoff_us: TAIL_CUT_REISSUE_US,

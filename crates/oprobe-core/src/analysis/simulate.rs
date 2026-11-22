@@ -90,10 +90,12 @@ impl TailCutSetup {
     pub fn of(r: &crate::model::Report) -> Option<Self> {
         let op = &r.spec.profile.operator;
         let retry = RetryParams::of(op.layers.retry.as_ref()?);
-        let mut params = TailCutParams::for_timeout(op.op_timeout());
-        if let Some(t) = &op.layers.tail_cut {
-            params.percentile = t.percentile;
-        }
+        let params = op
+            .layers
+            .tail_cut
+            .clone()
+            .unwrap_or_default()
+            .params(op.op_timeout());
         Some(Self {
             params,
             backoff_us: retry.first_backoff_mean().as_micros() as u64,

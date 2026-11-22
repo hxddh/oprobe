@@ -162,7 +162,7 @@ fn field_row(
             move |o| s.edit(path, o),
         )
         .into_element(),
-        FieldKind::Count | FieldKind::Size | FieldKind::Duration => field(
+        FieldKind::Count | FieldKind::Number | FieldKind::Size | FieldKind::Duration => field(
             path,
             path,
             if base.is_empty() {

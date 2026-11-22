@@ -7,6 +7,7 @@ use std::time::Duration;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use super::build::{Arg, OpendalDefault, layer_params};
 use super::*;
 
 /// Operations a concurrent-limit layer allows when only the HTTP limit is set (unlimited in
@@ -158,7 +159,9 @@ fn layer_of(path: &str) -> Option<&str> {
 
 fn rust_duration(d: Duration) -> String {
     let ms = d.as_millis();
-    if ms.is_multiple_of(1000) {
+    if d.subsec_nanos() % 1_000_000 != 0 {
+        format!("Duration::from_nanos({})", d.as_nanos())
+    } else if ms.is_multiple_of(1000) {
         format!("Duration::from_secs({})", ms / 1000)
     } else {
         format!("Duration::from_millis({ms})")
@@ -183,81 +186,55 @@ fn rust_size(b: ByteSize) -> String {
     v.to_string()
 }
 
-/// The builder expression of one layer of `s` (`None`: not in the stack).
+/// One builder argument as Rust.
+fn rust_arg(a: Arg) -> String {
+    match a {
+        Arg::Count(n) if n == UNLIMITED_OPERATIONS => "1 << 20".to_owned(),
+        Arg::Count(n) => n.to_string(),
+        Arg::F32(f) => format!("{f:?}"),
+        Arg::F64(f) => format!("{f:?}"),
+        Arg::Switch(b) => b.to_string(),
+        Arg::Time(d) => rust_duration(d),
+        Arg::Bytes(b) => rust_size(ByteSize(b)),
+    }
+}
+
+/// The builder expression of one layer of `s` (`None`: not in the stack): the constructor and
+/// every applied parameter that differs from OpenDAL's default ([`layer_params`]), so the code
+/// builds the layer that was measured.
 pub fn layer_rust(s: &OperatorSpec, name: &str) -> Option<String> {
-    let l = &s.layers;
+    let params = layer_params(s, name)?;
+    let ctor: Vec<String> = params
+        .iter()
+        .filter(|p| p.opendal_default == OpendalDefault::Ctor)
+        .map(|p| rust_arg(p.value))
+        .collect();
+    let mut calls = String::new();
+    for p in params
+        .iter()
+        .filter(|p| p.opendal_default != OpendalDefault::Ctor && p.spelled())
+    {
+        match p.value {
+            Arg::Switch(true) => {
+                let _ = write!(calls, ".{}()", p.method);
+            }
+            Arg::Switch(false) => {}
+            v => {
+                let _ = write!(calls, ".{}({})", p.method, rust_arg(v));
+            }
+        }
+    }
+    let ctor = ctor.join(", ");
     Some(match name {
-        "concurrent_limit" => {
-            let c = l.concurrent_limit.as_ref()?;
-            // No operation cap: OpenDAL needs a permit count, so a large one reads as such.
-            let mut e = match c.operations {
-                Some(n) => format!("ConcurrentLimitLayer::new({n})"),
-                None => "ConcurrentLimitLayer::new(1 << 20)".to_owned(),
-            };
-            if let Some(h) = c.http {
-                let _ = write!(e, ".with_http_concurrent_limit({h})");
-            }
-            e
-        }
-        "retry" => {
-            let r = l.retry.as_ref()?;
-            let d = Retry::default();
-            let mut e = "RetryLayer::new()".to_owned();
-            if r.jitter {
-                e += ".with_jitter()";
-            }
-            if r.max_times != d.max_times {
-                let _ = write!(e, ".with_max_times({})", r.max_times);
-            }
-            if r.min_delay != d.min_delay {
-                let _ = write!(e, ".with_min_delay({})", rust_duration(r.min_delay.get()));
-            }
-            if r.max_delay != d.max_delay {
-                let _ = write!(e, ".with_max_delay({})", rust_duration(r.max_delay.get()));
-            }
-            if r.factor != d.factor {
-                let _ = write!(e, ".with_factor({:?})", r.factor);
-            }
-            e
-        }
-        "timeout" => {
-            let t = l.timeout.as_ref()?;
-            let d = Timeout::default();
-            let mut e = "TimeoutLayer::new()".to_owned();
-            if t.op != d.op {
-                let _ = write!(e, ".with_timeout({})", rust_duration(t.op.get()));
-            }
-            if t.io != d.io {
-                let _ = write!(e, ".with_io_timeout({})", rust_duration(t.io.get()));
-            }
-            e
-        }
-        "tail_cut" => {
-            let t = l.tail_cut.as_ref()?;
-            if *t == TailCut::default() {
-                "TailCutLayer::new()".to_owned()
-            } else {
-                format!(
-                    "TailCutLayer::builder().percentile({}).build()",
-                    t.percentile
-                )
-            }
-        }
-        "throttle" => {
-            let t = l.throttle.as_ref()?;
-            format!(
-                "ThrottleLayer::new({}, {})",
-                rust_size(t.bandwidth),
-                rust_size(t.burst)
-            )
-        }
-        "cache" => {
-            let c = l.cache.as_ref()?;
-            format!(
-                "FoyerLayer::new(HybridCacheBuilder::new().memory({}).storage().build().await?)",
-                rust_size(c.memory)
-            )
-        }
+        "concurrent_limit" => format!("ConcurrentLimitLayer::new({ctor}){calls}"),
+        "retry" => format!("RetryLayer::new(){calls}"),
+        "timeout" => format!("TimeoutLayer::new(){calls}"),
+        "tail_cut" if calls.is_empty() => "TailCutLayer::new()".to_owned(),
+        "tail_cut" => format!("TailCutLayer::builder(){calls}.build()"),
+        "throttle" => format!("ThrottleLayer::new({ctor})"),
+        "cache" => format!(
+            "FoyerLayer::new(HybridCacheBuilder::new().memory({ctor}).storage().build().await?)"
+        ),
         _ => return None,
     })
 }
@@ -478,6 +455,7 @@ pub fn to_rust(s: &OperatorSpec) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::operator::build::Param;
 
     #[test]
     fn a_diff_renders_rust_and_toml() {
@@ -555,7 +533,11 @@ mod tests {
             r.contains(".layer(ThrottleLayer::new(100 * 1024 * 1024, 16 * 1024 * 1024))"),
             "{r}"
         );
-        assert!(r.contains(".layer(TailCutLayer::new())"), "{r}");
+        // oprobe's tail-cut parameters differ from OpenDAL's: they are spelled out.
+        assert!(
+            r.contains(".layer(TailCutLayer::builder().safety_factor(1.5).min_samples(32).min_deadline(Duration::from_millis(50)).max_deadline(Duration::from_secs(60)).build())"),
+            "{r}"
+        );
         assert!(r.contains(".layer(RetryLayer::new())"), "{r}");
         assert!(
             r.contains("FoyerLayer::new(HybridCacheBuilder::new().memory(256 * 1024 * 1024)"),
@@ -565,5 +547,164 @@ mod tests {
         // Innermost first: throttle before retry, cache last.
         assert!(r.find("ThrottleLayer").unwrap() < r.find("RetryLayer").unwrap());
         assert!(r.find("RetryLayer").unwrap() < r.find("FoyerLayer").unwrap());
+    }
+
+    /// Evaluate one argument of generated Rust.
+    fn eval_arg(src: &str) -> Arg {
+        let src = src.trim();
+        if src == "1 << 20" {
+            return Arg::Count(UNLIMITED_OPERATIONS);
+        }
+        for (f, scale) in [
+            ("Duration::from_secs(", 1_000_000_000u128),
+            ("Duration::from_millis(", 1_000_000),
+            ("Duration::from_nanos(", 1),
+        ] {
+            if let Some(n) = src.strip_prefix(f).and_then(|r| r.strip_suffix(')')) {
+                let n: u128 = n.parse().unwrap();
+                return Arg::Time(Duration::from_nanos((n * scale) as u64));
+            }
+        }
+        if src.contains('*') {
+            let b: u64 = src
+                .split('*')
+                .map(|x| x.trim().parse::<u64>().unwrap())
+                .product();
+            return Arg::Bytes(b);
+        }
+        if src.contains('.') {
+            return Arg::F64(src.parse().unwrap());
+        }
+        Arg::Count(src.parse().unwrap())
+    }
+
+    /// The parameters a layer expression of generated Rust applies: OpenDAL's defaults, then the
+    /// constructor arguments and the called methods.
+    fn emitted_params(expr: &str, applied: &[Param]) -> Vec<Param> {
+        let mut out: Vec<Param> = applied
+            .iter()
+            .filter_map(|p| match p.opendal_default {
+                OpendalDefault::Value(d) => Some(Param { value: d, ..*p }),
+                _ => None,
+            })
+            .collect();
+        // Constructor arguments: inside the first `(...)` of `X::new(...)` (or `.memory(...)`).
+        let ctors: Vec<&Param> = applied
+            .iter()
+            .filter(|p| p.opendal_default == OpendalDefault::Ctor)
+            .collect();
+        let (head, rest) = if let Some(i) = expr.find(".memory(") {
+            (&expr[i + 8..], "")
+        } else {
+            let i = expr.find("::new(").map_or(0, |i| i + 6);
+            let j = expr[i..].find(')').map_or(i, |j| i + j);
+            (&expr[i..j], &expr[j..])
+        };
+        if !ctors.is_empty() {
+            let head = head.split(')').next().unwrap();
+            let args: Vec<&str> = head.split(", ").collect();
+            assert_eq!(args.len(), ctors.len(), "{expr}");
+            for (p, a) in ctors.iter().zip(args) {
+                out.push(Param {
+                    value: eval_arg(a),
+                    ..**p
+                });
+            }
+        }
+        // Method calls `.name(arg)` at the top level of the expression.
+        let mut calls = Vec::new();
+        let (bytes, mut i, mut depth) = (rest.as_bytes(), 0, 0i32);
+        while i < bytes.len() {
+            match bytes[i] {
+                b'(' => depth += 1,
+                b')' => depth -= 1,
+                b'.' if depth <= 0 => {
+                    let open = rest[i..].find('(').map(|o| i + o);
+                    if let Some(open) = open {
+                        let (mut d, mut j) = (0, open);
+                        while j < bytes.len() {
+                            match bytes[j] {
+                                b'(' => d += 1,
+                                b')' => {
+                                    d -= 1;
+                                    if d == 0 {
+                                        break;
+                                    }
+                                }
+                                _ => {}
+                            }
+                            j += 1;
+                        }
+                        calls.push((&rest[i + 1..open], &rest[open + 1..j]));
+                        i = j;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        for (m, arg) in calls {
+            let Some(p) = applied.iter().find(|p| p.method == m) else {
+                continue;
+            };
+            let v = match p.value {
+                Arg::Switch(_) => Arg::Switch(true),
+                Arg::F32(_) => Arg::F32(arg.parse().unwrap()),
+                Arg::F64(_) => Arg::F64(arg.parse().unwrap()),
+                Arg::Bytes(_) => match eval_arg(arg) {
+                    Arg::Count(n) => Arg::Bytes(n as u64),
+                    a => a,
+                },
+                _ => eval_arg(arg),
+            };
+            out.retain(|q| q.method != m);
+            out.push(Param { value: v, ..*p });
+        }
+        out.sort_by_key(|p| p.method);
+        out
+    }
+
+    #[test]
+    fn emitted_rust_applies_what_is_measured_for_every_layer() {
+        let specs = [
+            // Every layer with its defaults (tail-cut and timeout defaults differ from
+            // OpenDAL's).
+            "url = \"s3://b\"\n[layers]\nconcurrent_limit = { http = 8 }\ntail_cut = true\nthrottle = true\ncache = true\n",
+            // Every parameter changed.
+            "url = \"s3://b\"\n[layers]\nconcurrent_limit = { http = 24, operations = 64 }\nretry = { max_times = 5, jitter = true, min_delay = \"50ms\", max_delay = \"5s\", factor = 1.5 }\ntimeout = { op = \"30s\", io = \"2500ms\" }\ntail_cut = { percentile = 99, safety_factor = 2.0, min_samples = 10, min_deadline = \"20ms\", max_deadline = \"3s\", window = \"90s\" }\nthrottle = { bandwidth = \"64MiB\", burst = \"3KiB\" }\ncache = { memory = \"1GiB\" }\n",
+            // OpenDAL's own values everywhere they can be expressed.
+            "url = \"s3://b\"\n[layers]\nconcurrent_limit = { operations = 4 }\ntimeout = { op = \"60s\", io = \"10s\" }\ntail_cut = { percentile = 95, safety_factor = 1.3, min_samples = 200, min_deadline = \"500ms\", max_deadline = \"30s\", window = \"60s\" }\n",
+            // Without the timeout layer, the tail-cut ceiling is OpenDAL's 60 s.
+            "url = \"s3://b\"\n[layers]\ntimeout = false\ntail_cut = { min_samples = 7 }\n",
+        ];
+        for text in specs {
+            let s = OperatorSpec::parse(text).unwrap();
+            for name in LAYER_ORDER {
+                let Some(applied) = layer_params(&s, name) else {
+                    continue;
+                };
+                let expr = layer_rust(&s, name).unwrap();
+                let mut want: Vec<Param> = applied.clone();
+                want.retain(|p| !(p.value == Arg::Switch(false)));
+                want.sort_by_key(|p| p.method);
+                let mut got = emitted_params(&expr, &applied);
+                got.retain(|p| !(p.value == Arg::Switch(false)));
+                assert_eq!(got, want, "{name}: measured != emitted: {expr}\n{text}");
+            }
+        }
+        // The tail-cut ceiling follows the operation timeout.
+        let s = OperatorSpec::parse(specs[1]).unwrap();
+        assert!(
+            layer_rust(&s, "tail_cut")
+                .unwrap()
+                .contains(".max_deadline(Duration::from_secs(3))")
+        );
+        let mut s = OperatorSpec::parse(specs[0]).unwrap();
+        s.set("layers.timeout.op", "12s").unwrap();
+        assert!(
+            layer_rust(&s, "tail_cut")
+                .unwrap()
+                .contains(".max_deadline(Duration::from_secs(12))")
+        );
     }
 }
