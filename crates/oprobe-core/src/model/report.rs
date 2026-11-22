@@ -754,7 +754,7 @@ impl Heatmap {
         window_s: f64,
         max_columns: usize,
     ) -> Option<Self> {
-        if timeline.iter().all(|p| p.latency_counts.is_empty()) {
+        if timeline.iter().all(|p| p.latency_rows_count.is_empty()) {
             return None;
         }
         let window = window_s.max(0.0);
@@ -764,7 +764,7 @@ impl Heatmap {
         let mut counts = vec![vec![0u64; bounds.len()]; n_t];
         for p in timeline {
             let t = (p.t_s.max(0.0) / width) as usize;
-            for (row, n) in counts[t.min(n_t - 1)].iter_mut().zip(&p.latency_counts) {
+            for (row, n) in counts[t.min(n_t - 1)].iter_mut().zip(&p.latency_rows_count) {
                 *row += n;
             }
         }

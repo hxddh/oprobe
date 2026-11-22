@@ -485,6 +485,15 @@ With an open-loop `--rate`, arrivals queued behind busy workers; their wait is p
 - **Verify:** report.open_loop (target vs achieved rate, missed arrivals)
 - **Knobs:** --rate; --concurrency
 
+<a id="finding-schedule_backlog"></a>
+### `schedule_backlog` — The open-loop schedule fell behind
+
+More than 1% of the open-loop arrivals never started before the window ended: their latency is unknown and counted in the tail as a lower bound (censored), so percentiles are "≥" values and throughput is what the client managed, not the target (no coordinated omission). *(validity, usually warning)*
+
+- **Causes:** too few in-flight slots (`--concurrency`) for the rate or shape; a rate above what the target serves; a saturated load generator (report.self.client_saturated)
+- **Verify:** report.schedule (intended, missed_arrivals_ratio, schedule_stage)
+- **Knobs:** --rate; --shape; --concurrency
+
 <a id="finding-run_invalid"></a>
 ### `run_invalid` — The run cannot be judged on performance
 

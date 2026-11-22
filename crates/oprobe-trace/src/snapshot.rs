@@ -282,17 +282,17 @@ pub struct TimelinePoint {
     /// Connections dialed during the interval.
     #[serde(rename = "new_connections_count", default)]
     pub new_connections: u64,
-    /// Client CPU in cores (1.0 = one core busy), when sampled in the interval.
+    /// Client CPU in percent of one core (350 = 3.5 cores busy), when sampled in the interval.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cpu_cores: Option<f64>,
+    pub cpu_pct: Option<f64>,
     /// Operations started in the interval per latency row of the heatmap
     /// (`heatmap.latency_buckets_ms`): the heatmap is built from these, not from sampled rows.
     #[serde(
-        rename = "latency_counts",
+        rename = "latency_rows_count",
         default,
         skip_serializing_if = "Vec::is_empty"
     )]
-    pub latency_counts: Vec<u64>,
+    pub latency_rows_count: Vec<u64>,
 }
 
 fn one_s() -> f64 {

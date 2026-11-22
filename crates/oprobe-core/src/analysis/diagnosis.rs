@@ -489,6 +489,29 @@ pub fn diagnose(s: &Snapshot, knobs: &Knobs, sla: &Sla, network: bool) -> Diagno
                 "Raise `concurrency` (in-flight cap) or lower the target rate. Queued arrivals still ran: their wait is included in the latency percentiles (measured from the intended start time).",
             ));
     }
+    // Design v5 §3 (M1): more than 1 % of the arrivals never started; the tail holds censored
+    // values and the throughput is the client's, not the target's.
+    if let Some(ol) = &s.open_loop
+        && ol.intended_count > 0
+        && ol.missed as f64 / ol.intended_count as f64 > crate::model::SCHEDULE_BACKLOG_RATIO
+    {
+        f.push(finding(
+                Severity::Warning,
+                "schedule_backlog",
+                format!(
+                    "{:.1}% of the scheduled arrivals never started",
+                    ol.missed as f64 / ol.intended_count as f64 * 100.0
+                ),
+                format!(
+                    "{} of {} arrivals ({}) missed; they count in the latency tail as lower bounds (window end − intended start); max schedule lag {}",
+                    ol.missed,
+                    ol.intended_count,
+                    if ol.arrivals.is_empty() { "constant" } else { ol.arrivals.as_str() },
+                    fmt_ms(ol.max_schedule_lag_ms)
+                ),
+                "The load generator fell behind its schedule: throughput and capacity advice describe the backlog, not the target. Raise `concurrency` or lower the rate, then re-run.",
+            ));
+    }
     if cpu_busy > 0.8 * cores && bottleneck != Bottleneck::Client {
         f.push(finding(
             Severity::Warning,

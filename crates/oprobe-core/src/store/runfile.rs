@@ -95,10 +95,10 @@ pub struct IntervalBlock {
     #[serde(default)]
     pub new_connections_count: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cpu_cores: Option<f64>,
+    pub cpu_pct: Option<f64>,
     /// Operations per heatmap latency row (the interval's latency sketch).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub latency_counts: Vec<u64>,
+    pub latency_rows_count: Vec<u64>,
 }
 
 impl IntervalBlock {
@@ -120,8 +120,8 @@ impl IntervalBlock {
             max_ms: p.max_ms,
             missed_arrivals_count: p.missed_arrivals,
             new_connections_count: p.new_connections,
-            cpu_cores: p.cpu_cores,
-            latency_counts: p.latency_counts.clone(),
+            cpu_pct: p.cpu_pct,
+            latency_rows_count: p.latency_rows_count.clone(),
         }
     }
 }

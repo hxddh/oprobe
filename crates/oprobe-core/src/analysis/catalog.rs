@@ -517,6 +517,20 @@ const ENTRIES: &[Entry] = &[
         knobs: &["--rate", "--concurrency"],
     },
     Entry {
+        code: "schedule_backlog",
+        title: "The open-loop schedule fell behind",
+        severity: Severity::Warning,
+        category: "validity",
+        meaning: "More than 1% of the open-loop arrivals never started before the window ended: their latency is unknown and counted in the tail as a lower bound (censored), so percentiles are \"≥\" values and throughput is what the client managed, not the target (no coordinated omission).",
+        causes: &[
+            "too few in-flight slots (`--concurrency`) for the rate or shape",
+            "a rate above what the target serves",
+            "a saturated load generator (report.self.client_saturated)",
+        ],
+        verify: &["report.schedule (intended, missed_arrivals_ratio, schedule_stage)"],
+        knobs: &["--rate", "--shape", "--concurrency"],
+    },
+    Entry {
         code: "run_invalid",
         title: "The run cannot be judged on performance",
         severity: Severity::Warning,

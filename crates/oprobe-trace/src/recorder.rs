@@ -1346,8 +1346,8 @@ impl Recorder {
                     max_ms: ms(q[4]),
                     inflight_peak: b.inflight_peak,
                     new_connections: b.dials,
-                    cpu_cores: b.cpu_pct.map(|p| p / 100.0),
-                    latency_counts: if b.ops > 0 {
+                    cpu_pct: b.cpu_pct,
+                    latency_rows_count: if b.ops > 0 {
                         b.heat.iter().map(|c| u64::from(*c)).collect()
                     } else {
                         Vec::new()

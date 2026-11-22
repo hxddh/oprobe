@@ -124,6 +124,21 @@
       ],
       "type": "object"
     },
+    "Arrivals": {
+      "description": "How open-loop arrivals are spaced.",
+      "oneOf": [
+        {
+          "const": "constant",
+          "description": "Evenly spaced: one arrival every `1 / rate` seconds.",
+          "type": "string"
+        },
+        {
+          "const": "poisson",
+          "description": "A Poisson process: exponentially distributed gaps with mean `1 / rate` (bursty, like\nindependent clients).",
+          "type": "string"
+        }
+      ]
+    },
     "BillingClass": {
       "description": "Billing bucket used by the cost model.",
       "oneOf": [
@@ -546,6 +561,30 @@
       ],
       "type": "object"
     },
+    "ColdStartStats": {
+      "description": "The cold start of a run: the connections dialed at the start of warmup and the operations\nthat waited for them.",
+      "properties": {
+        "connect": {
+          "$ref": "#/$defs/Quantiles",
+          "description": "DNS + TCP + proxy + TLS of a fresh connection."
+        },
+        "connections_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "first_ops": {
+          "$ref": "#/$defs/Quantiles",
+          "description": "Latency of the operations whose requests dialed."
+        }
+      },
+      "required": [
+        "connections_count",
+        "connect",
+        "first_ops"
+      ],
+      "type": "object"
+    },
     "Confidence": {
       "description": "How far to trust the estimate.",
       "enum": [
@@ -562,6 +601,17 @@
         },
         "cipher": {
           "type": "string"
+        },
+        "cold_start": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ColdStartStats"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Connection setup before warmup absorbed it (design v5 §3, M15): the dials and first\noperations of the warmup's cold start."
         },
         "dial_failures_count": {
           "format": "uint64",
@@ -848,6 +898,17 @@
           "default": false,
           "description": "Keep the generated dataset between runs (`oprobe-dataset/<fingerprint>/`) to avoid\nre-uploading it every time. Remove with `oprobe cleanup --datasets`.",
           "type": "boolean"
+        },
+        "size_dist": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SizeDist"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Object sizes drawn from a distribution (`object_size` is then its median)."
         }
       },
       "required": [
@@ -1607,15 +1668,22 @@
       "type": "object"
     },
     "IntervalBlock": {
-      "description": "One slice of the run's timeline (per-second; stream MEAS adds sketches).",
+      "description": "One slice of the run's timeline: 1 s for the first ten minutes, then 10 s (design v5 §3).",
       "properties": {
+        "cpu_pct": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
         "errors_count": {
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "inflight_count": {
-          "description": "Requests in flight at the end of the slice (when measured).",
+          "description": "Peak requests in flight in the slice (when measured).",
           "format": "uint64",
           "minimum": 0,
           "type": [
@@ -1623,9 +1691,35 @@
             "null"
           ]
         },
+        "latency_rows_count": {
+          "description": "Operations per heatmap latency row (the interval's latency sketch).",
+          "items": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "array"
+        },
         "len_s": {
           "format": "double",
           "type": "number"
+        },
+        "max_ms": {
+          "default": 0.0,
+          "format": "double",
+          "type": "number"
+        },
+        "missed_arrivals_count": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "new_connections_count": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
         },
         "ops_count": {
           "format": "uint64",
@@ -1633,6 +1727,16 @@
           "type": "integer"
         },
         "p50_ms": {
+          "format": "double",
+          "type": "number"
+        },
+        "p90_ms": {
+          "default": 0.0,
+          "format": "double",
+          "type": "number"
+        },
+        "p999_ms": {
+          "default": 0.0,
           "format": "double",
           "type": "number"
         },
@@ -1664,7 +1768,12 @@
         "throttled_count",
         "transferred_bytes",
         "p50_ms",
-        "p99_ms"
+        "p99_ms",
+        "p90_ms",
+        "p999_ms",
+        "max_ms",
+        "missed_arrivals_count",
+        "new_connections_count"
       ],
       "type": "object"
     },
@@ -2377,6 +2486,24 @@
           "format": "double",
           "type": "number"
         },
+        "arrivals": {
+          "description": "Arrival process: `constant`, `poisson`, `ramp`, `step`, `diurnal` (`+poisson`), `replay`.",
+          "type": "string"
+        },
+        "censored_count": {
+          "default": 0,
+          "description": "Missed arrivals counted in the latency distribution as censored values (a lower bound:\nwindow end − intended start): `summary.latency` percentiles are then \"≥\" values.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "intended_count": {
+          "default": 0,
+          "description": "Arrivals due inside the window: started plus missed.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "max_schedule_lag_ms": {
           "format": "double",
           "type": "number"
@@ -2387,6 +2514,17 @@
           "minimum": 0,
           "type": "integer"
         },
+        "schedule": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Quantiles"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The `schedule` stage: intended → actual start of the operations that started."
+        },
         "target_per_s": {
           "format": "double",
           "type": "number"
@@ -2396,7 +2534,9 @@
         "target_per_s",
         "achieved_per_s",
         "missed_count",
-        "max_schedule_lag_ms"
+        "max_schedule_lag_ms",
+        "intended_count",
+        "censored_count"
       ],
       "type": "object"
     },
@@ -2855,6 +2995,10 @@
       ],
       "type": "object"
     },
+    "RateShape": {
+      "description": "Time-varying open-loop rate: ramp:FROM..TO/DURATION, step:R1,R2,…/DURATION or diurnal[:MIN..MAX/PERIOD]",
+      "type": "string"
+    },
     "Recommendation": {
       "description": "What `oprobe tune` / `oprobe fix` / MCP `recommend_config` recommend.",
       "properties": {
@@ -2950,6 +3094,44 @@
         "down_bytes",
         "p50_ms",
         "p99_ms"
+      ],
+      "type": "object"
+    },
+    "ReplaySpec": {
+      "additionalProperties": false,
+      "description": "What to replay (`workload.replay`).",
+      "properties": {
+        "file": {
+          "description": "The log: an S3 server access log, CloudTrail JSON (S3 data events) or an oprobe run file.",
+          "type": "string"
+        },
+        "map_prefix": {
+          "description": "Key rewrites, the first matching prefix wins (`$RUN/` targets the run prefix).",
+          "items": {
+            "maxItems": 2,
+            "minItems": 2,
+            "prefixItems": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "string"
+              }
+            ],
+            "type": "array"
+          },
+          "type": "array"
+        },
+        "speed": {
+          "default": 1.0,
+          "description": "Speed factor: 2 replays twice as fast as recorded.",
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "file",
+        "speed"
       ],
       "type": "object"
     },
@@ -3660,6 +3842,10 @@
       ],
       "type": "string"
     },
+    "SizeDist": {
+      "description": "Object size distribution: dist:lognormal(MEDIAN,SIGMA) or file:PATH",
+      "type": "string"
+    },
     "Sla": {
       "additionalProperties": false,
       "description": "Service level objectives. `oprobe run` / `oprobe tune` exit with code 3 when the measured\nresult breaches them (unless `enforce = false` / `--sla none`); the tuner rejects trials that\nbreach them and the diagnosis grades findings against them.",
@@ -4165,20 +4351,78 @@
     },
     "TimelinePoint": {
       "properties": {
+        "cpu_pct": {
+          "description": "Client CPU in percent of one core (350 = 3.5 cores busy), when sampled in the interval.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
         "errors_count": {
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
+        "inflight_peak_count": {
+          "default": 0,
+          "description": "Peak requests in flight during the interval.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "latency_rows_count": {
+          "description": "Operations started in the interval per latency row of the heatmap\n(`heatmap.latency_buckets_ms`): the heatmap is built from these, not from sampled rows.",
+          "items": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        "len_s": {
+          "default": 1.0,
+          "description": "Length of the interval: 1 s for the first ten minutes, 10 s afterwards.",
+          "format": "double",
+          "type": "number"
+        },
+        "max_ms": {
+          "default": 0.0,
+          "format": "double",
+          "type": "number"
+        },
         "mib_per_s": {
           "format": "double",
           "type": "number"
+        },
+        "missed_arrivals_count": {
+          "description": "Open-loop arrivals due in this interval that never started.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "new_connections_count": {
+          "default": 0,
+          "description": "Connections dialed during the interval.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
         },
         "ops_per_s": {
           "format": "double",
           "type": "number"
         },
         "p50_ms": {
+          "format": "double",
+          "type": "number"
+        },
+        "p90_ms": {
+          "default": 0.0,
+          "format": "double",
+          "type": "number"
+        },
+        "p999_ms": {
+          "default": 0.0,
           "format": "double",
           "type": "number"
         },
@@ -4204,7 +4448,13 @@
         "p50_ms",
         "p99_ms",
         "errors_count",
-        "throttled_count"
+        "throttled_count",
+        "len_s",
+        "p90_ms",
+        "p999_ms",
+        "max_ms",
+        "inflight_peak_count",
+        "new_connections_count"
       ],
       "type": "object"
     },
@@ -4937,6 +5187,10 @@
           "$ref": "#/$defs/Access",
           "default": "uniform"
         },
+        "arrivals": {
+          "$ref": "#/$defs/Arrivals",
+          "description": "Open-loop arrival process: `constant` (evenly spaced) or `poisson` (design v5 §3)."
+        },
         "cleanup": {
           "default": true,
           "description": "Delete everything written under the run prefix when the run ends.",
@@ -4985,11 +5239,33 @@
             "null"
           ]
         },
+        "replay": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ReplaySpec"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Replay a traffic log instead of the mix (open loop on the log's timing)."
+        },
         "seed": {
           "default": 42,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
+        },
+        "shape": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RateShape"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Time-varying open-loop rate: `ramp:FROM..TO/D`, `step:R1,R2,…/D` or\n`diurnal[:MIN..MAX/PERIOD]` (makes the run open-loop; `rate` is then the diurnal peak)."
         },
         "verify": {
           "default": true,
