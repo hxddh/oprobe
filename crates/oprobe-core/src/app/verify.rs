@@ -14,7 +14,7 @@ use super::input::*;
 use crate::analysis::capacity::{self, Observation};
 use crate::analysis::compare::{Comparison, compare_with_noise, runs_t, significant};
 use crate::analysis::stats::Interval;
-use crate::analysis::verdict::{NetAssessment, NetVerdict, Sprt, SprtDecision};
+use crate::analysis::verdict::{NetVerdict, Sprt, SprtDecision};
 use crate::analysis::verification::{Direction, Expectation, VerifyOutcome};
 use crate::engine::Cancel;
 use crate::errors::{ErrorCode, OprobeError};
@@ -702,7 +702,6 @@ pub async fn verify_hypotheses(
         // The baselines this finding was paired with.
         let a_mine: Vec<Run> = b_pairs[k].iter().map(|(i, _)| a_runs[*i].clone()).collect();
         let a_runs = &a_mine;
-        let net = net_assessment(a_runs, bs, noise.as_ref());
         let comparison = compare_with_noise(
             a_runs,
             bs,
@@ -737,6 +736,15 @@ pub async fn verify_hypotheses(
                 _ => missing.push(e.metric.clone()),
             }
         }
+        // One net verdict for verify and compare (design v5 §4): the comparison's, over the same
+        // runs — then without the losses the finding predicted and its checks confirmed.
+        let (net, tolerated) = tolerate_predicted(
+            comparison
+                .net
+                .clone()
+                .expect("a comparison carries its net verdict"),
+            &checks,
+        );
         let refuted: Vec<&ExpectationCheck> = checks
             .iter()
             .filter(|c| c.outcome == VerifyOutcome::Refuted)
@@ -847,10 +855,22 @@ pub async fn verify_hypotheses(
             comparison,
             pairs_count: bs.len() as u64,
             stopped_early: bs.len() < max_pairs,
-            reason: if net.verdict == NetVerdict::Traded && outcome != VerifyOutcome::Refuted {
-                format!("{reason} — net {}", net.summary())
-            } else {
-                reason
+            reason: {
+                let reason =
+                    if net.verdict == NetVerdict::Traded && outcome != VerifyOutcome::Refuted {
+                        format!("{reason} — net {}", net.summary())
+                    } else {
+                        reason
+                    };
+                if tolerated.is_empty() {
+                    reason
+                } else {
+                    let t: Vec<String> = tolerated
+                        .iter()
+                        .map(|m| format!("{} {:+.1} %", m.metric, m.delta_ratio * 100.0))
+                        .collect();
+                    format!("{reason} (within the prediction: {})", t.join(", "))
+                }
             },
             net: Some(net),
         });
@@ -866,64 +886,53 @@ pub async fn verify_hypotheses(
     })
 }
 
-/// The two-sided net verdict of `bs` against the paired baselines `a` (same length, pair by
-/// pair): goodput and p99 as paired log ratios, throttling and errors as differences of pooled
-/// ratios (Newcombe intervals).
-pub fn net_assessment(
-    a: &[Run],
-    b: &[Run],
-    noise: Option<&crate::store::baselines::NoiseEntry>,
-) -> NetAssessment {
-    use crate::analysis::verdict::{MetricChange, log_ratio, ratio_difference};
-    let vals = |rs: &[Run], f: &dyn Fn(&Report) -> f64| {
-        rs.iter().map(|r| f(&r.report)).collect::<Vec<f64>>()
-    };
-    let paired = a.len() == b.len();
-    let mut changes = vec![
-        MetricChange {
-            metric: "ops_per_s".into(),
-            change: log_ratio(&vals(a, &good_ops_per_s), &vals(b, &good_ops_per_s), paired),
-            lower_is_better: false,
-            floor: noise_ratio(noise, "ops_per_s").max(0.02),
-        },
-        MetricChange {
-            metric: "p99_ms".into(),
-            change: log_ratio(
-                &vals(a, &|r| r.summary.latency.p99),
-                &vals(b, &|r| r.summary.latency.p99),
-                paired,
-            ),
-            lower_is_better: true,
-            floor: noise_ratio(noise, "p99_ms").max(0.05),
-        },
-    ];
-    let pooled = |rs: &[Run], k: &dyn Fn(&Report) -> (u64, u64)| {
-        rs.iter().fold((0.0, 0.0), |(x, y), r| {
-            let (a, b) = k(&r.report);
-            (x + a as f64, y + b as f64)
+/// The metric family of a report metric or net-verdict metric: goodput (`ops_per_s` and
+/// `mib_per_s` move together in a replay of the same workload), p99, or the name itself.
+fn metric_family(m: &str) -> &str {
+    let m = m.strip_prefix("summary.").unwrap_or(m);
+    match m {
+        "ops_per_s" | "mib_per_s" => "goodput",
+        "p99_ms" | "latency.p99" => "p99",
+        other => other,
+    }
+}
+
+/// `net` without the losses a confirmed expectation predicted: a finding that expects goodput
+/// ≥ 90 % of the baseline accepts a 3 % loss, which must not make the change "worse" (CI: a
+/// confirmed `mib_per_s ≥ 0.9×` and a −2.9 % `ops_per_s` refuted `download_bound`). A loss
+/// beyond the predicted tolerance still counts. Returns the net and the tolerated moves.
+fn tolerate_predicted(
+    mut net: crate::analysis::verdict::NetAssessment,
+    checks: &[ExpectationCheck],
+) -> (
+    crate::analysis::verdict::NetAssessment,
+    Vec<crate::analysis::verdict::MetricMove>,
+) {
+    use crate::analysis::verdict::NetVerdict;
+    let covers = |w: &crate::analysis::verdict::MetricMove| {
+        checks.iter().any(|c| {
+            c.outcome == VerifyOutcome::Confirmed
+                && c.unit == "baseline_ratio"
+                && metric_family(&c.metric) == metric_family(&w.metric)
+                && match c.direction {
+                    Direction::AtLeast => w.delta_ratio >= c.predicted.min(c.lo) - 1.0 - 1e-12,
+                    Direction::AtMost => w.delta_ratio <= c.predicted.max(c.hi) - 1.0 + 1e-12,
+                    _ => false,
+                }
         })
     };
-    let thr = |r: &Report| (r.resilience.throttled_responses, r.connections.requests);
-    let err = |r: &Report| (r.summary.failed_ops, r.summary.ops);
-    for (metric, f) in [
-        (
-            "throttled_request_ratio",
-            &thr as &dyn Fn(&Report) -> (u64, u64),
-        ),
-        ("error_ratio", &err),
-    ] {
-        let ((ka, na), (kb, nb)) = (pooled(a, f), pooled(b, f));
-        if na > 0.0 && nb > 0.0 && (ka > 0.0 || kb > 0.0) {
-            changes.push(MetricChange {
-                metric: metric.into(),
-                change: ratio_difference(ka, na, kb, nb),
-                lower_is_better: true,
-                // 0.1 percentage points.
-                floor: 0.001,
-            });
-        }
+    let (tolerated, worse): (Vec<_>, Vec<_>) = net.worse.drain(..).partition(|w| covers(w));
+    net.worse = worse;
+    if !tolerated.is_empty() {
+        net.verdict = match (net.better.is_empty(), net.worse.is_empty()) {
+            (false, true) => NetVerdict::Improved,
+            (true, false) => NetVerdict::Regressed,
+            (false, false) => NetVerdict::Traded,
+            // Only predicted losses: neither better nor worse than the finding said.
+            (true, true) => NetVerdict::Inconclusive,
+        };
     }
-    crate::analysis::verdict::assess(&changes)
+    (net, tolerated)
 }
 
 /// What [`verify`] produced.
@@ -997,6 +1006,91 @@ pub async fn verify(ctx: &Ctx, a: VerifyRequest, cancel: Cancel) -> Result<Verif
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn check(metric: &str, dir: Direction, min: f64, outcome: VerifyOutcome) -> ExpectationCheck {
+        ExpectationCheck {
+            metric: metric.into(),
+            direction: dir,
+            unit: "baseline_ratio".into(),
+            predicted: min,
+            lo: min,
+            hi: 1.0,
+            baseline: Interval::default(),
+            candidate: Interval::default(),
+            change: Interval::default(),
+            outcome,
+            note: String::new(),
+        }
+    }
+
+    fn moved(metric: &str, d: f64) -> crate::analysis::verdict::MetricMove {
+        crate::analysis::verdict::MetricMove {
+            metric: metric.into(),
+            delta_ratio: d,
+        }
+    }
+
+    /// CI (Linux, download_bound under a shared bandwidth cap, concurrency 4, 2 pairs):
+    /// `mib_per_s ≥ 0.9×` confirmed (17.1 → 16.6 MiB/s, −2.9 %) while ops/s −2.9 % was the only
+    /// "worse" move: refuted for a loss inside its own prediction.
+    #[test]
+    fn a_loss_the_finding_predicted_does_not_refute_it() {
+        use crate::analysis::verdict::{NetAssessment, NetVerdict};
+        let keep = check(
+            "summary.mib_per_s",
+            Direction::AtLeast,
+            0.9,
+            VerifyOutcome::Confirmed,
+        );
+        let net = NetAssessment {
+            verdict: NetVerdict::Regressed,
+            better: vec![],
+            worse: vec![moved("ops_per_s", -0.029)],
+        };
+        let (n, t) = tolerate_predicted(net, std::slice::from_ref(&keep));
+        assert_ne!(n.verdict, NetVerdict::Regressed, "{n:?}");
+        assert!(n.worse.is_empty() && t.len() == 1, "{n:?}");
+        // With the p99 gain the comparison saw: improved.
+        let net = NetAssessment {
+            verdict: NetVerdict::Traded,
+            better: vec![moved("p99_ms", -0.48)],
+            worse: vec![moved("ops_per_s", -0.029)],
+        };
+        let (n, _) = tolerate_predicted(net, std::slice::from_ref(&keep));
+        assert_eq!(n.verdict, NetVerdict::Improved, "{n:?}");
+        // A genuine regression beyond the predicted tolerance still refutes.
+        let net = NetAssessment {
+            verdict: NetVerdict::Regressed,
+            better: vec![],
+            worse: vec![moved("ops_per_s", -0.15)],
+        };
+        let (n, t) = tolerate_predicted(net, std::slice::from_ref(&keep));
+        assert_eq!(n.verdict, NetVerdict::Regressed, "{n:?}");
+        assert!(t.is_empty());
+        // An expectation that was not confirmed tolerates nothing, nor one on another metric.
+        for c in [
+            check(
+                "summary.mib_per_s",
+                Direction::AtLeast,
+                0.9,
+                VerifyOutcome::Inconclusive,
+            ),
+            check(
+                "throttled_request_ratio",
+                Direction::AtLeast,
+                0.9,
+                VerifyOutcome::Confirmed,
+            ),
+        ] {
+            let net = NetAssessment {
+                verdict: NetVerdict::Regressed,
+                better: vec![],
+                worse: vec![moved("ops_per_s", -0.029)],
+            };
+            let (n, _) = tolerate_predicted(net, std::slice::from_ref(&c));
+            assert_eq!(n.verdict, NetVerdict::Regressed, "{c:?}");
+        }
+    }
 
     fn exp(metric: &str, direction: Direction, predicted: f64, unit: &str) -> Expectation {
         Expectation {
