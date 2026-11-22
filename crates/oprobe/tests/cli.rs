@@ -517,6 +517,68 @@ fn prove_judges_a_change_and_hides_its_trials() {
     assert_eq!(env.runs().len(), 1);
 }
 
+/// A budget breach in the middle of a prove (`--max-requests`) stops the trials, keeps exit 4
+/// and prints and saves the partial result, so the trials stay attached to the prove.
+#[test]
+fn a_budget_breach_keeps_the_partial_prove() {
+    let env = Env::new();
+    let o = env.run(&run_args(&["lab://clean"], &["-q", "-o", "json"]));
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let prove = |max_requests: &str| {
+        env.run(&[
+            "prove",
+            "last",
+            "--with",
+            "read.gap=1MiB",
+            "--trial",
+            "300ms",
+            "--pairs",
+            "3",
+            "--max-requests",
+            max_requests,
+            "-o",
+            "json",
+        ])
+    };
+    // How many requests a trial makes, then a budget that breaks in the third trial.
+    let o = prove("100000000");
+    assert!(matches!(code(&o), 0 | 3), "{}", stderr(&o));
+    let full = json(&o);
+    let per_trial = full["trials"][0]["requests_count"].as_u64().unwrap();
+    let o = env.run(&["show", "--rm", full["prove_id"].as_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    for max in [per_trial * 5 / 2, 10] {
+        let o = prove(&max.to_string());
+        assert_eq!(code(&o), 4, "{}\n{}", stdout(&o), stderr(&o));
+        let v = json(&o);
+        validate("prove", &v);
+        assert_eq!(v["budget_exceeded"], true, "{v}");
+        assert!(v["pairs_count"].as_u64().unwrap() <= 1, "{v}");
+        assert_eq!(v["verdict"], "inconclusive", "{v}");
+        assert!(
+            v["notes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|n| n.as_str().unwrap().contains("a budget stopped the prove")),
+            "{v}"
+        );
+        let id = v["prove_id"].as_str().unwrap();
+        assert!(
+            env.data()
+                .join("runs")
+                .join(format!("{id}.prove.json"))
+                .is_file(),
+            "the partial prove is saved"
+        );
+        assert!(env.runs().len() > 1, "the trial runs are saved");
+        // No trial is orphaned: removing the prove removes them all.
+        let o = env.run(&["show", "--rm", id]);
+        assert_eq!(code(&o), 0, "{}", stderr(&o));
+        assert_eq!(env.runs().len(), 1, "max {max}");
+    }
+}
+
 /// A budget that allows fewer than three A/B pairs cannot decide: the verdict is
 /// `inconclusive` (exit 0), with a note, however large the measured difference.
 #[test]

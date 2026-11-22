@@ -69,6 +69,8 @@ Everything under **Changed** and **Removed** is breaking; 5.x run files are not 
 - **`prove` needs at least 3 A/B pairs to decide:** with fewer (a small `--budget`), the verdict
   is `inconclusive` with a note; `--pairs` is at least 3. The objective's interval uses Student's
   t for the number of pairs, and a noise floor from a single A/A difference is doubled.
+- **A budget breach mid-prove keeps the partial result:** the prove stops, prints and saves what
+  it measured (`budget_exceeded: true`) and exits 4; its trials stay removable with `show --rm`.
 - **`layers.tail_cut` carries every parameter oprobe applies:** `percentile` (50..99),
   `safety_factor` (1.5), `min_samples` (32), `min_deadline` ("50ms"), `max_deadline` (the
   operation timeout) and `window` ("60s"). The measured layer and the generated Rust are built

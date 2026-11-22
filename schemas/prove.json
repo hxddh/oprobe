@@ -294,6 +294,10 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "The result of `oprobe prove -o json`: the verdict on the objective and the operator diff",
   "properties": {
+    "budget_exceeded": {
+      "description": "A budget (`--budget`, `--max-requests`, `--max-bytes`, `--max-duration`) stopped the\nprove before it could finish: the result reads what was measured (exit 4).",
+      "type": "boolean"
+    },
     "change": {
       "description": "The change, as `PATH=VALUE` pairs (the sized value included).",
       "items": {

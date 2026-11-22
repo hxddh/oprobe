@@ -85,6 +85,10 @@ A verdict other than `inconclusive` needs at least **3 A/B pairs**: when the bud
 the verdict is `inconclusive` (exit 0) with a note. The objective's interval uses Student's t for
 the number of pairs, and a noise floor learned from a single A/A difference is doubled.
 
+When a budget (`--max-requests`, `--max-bytes`, `--max-duration`) stops the prove part-way, it
+still prints and saves the partial result (`budget_exceeded: true`, usually `inconclusive`) and
+exits 4; its trials stay attached, so `oprobe show --rm PROVE` removes them.
+
 `RUN` is a run id, an id prefix, `last`, `last~N` or a label. `FINDING` is a finding code
 (`throttling`, `tail_stragglers`, …).
 

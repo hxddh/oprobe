@@ -247,6 +247,10 @@ pub struct ProveOutput {
     pub trials: Vec<ProveTrial>,
     /// The operator change as Rust and TOML.
     pub diff: OperatorDiff,
+    /// A budget (`--budget`, `--max-requests`, `--max-bytes`, `--max-duration`) stopped the
+    /// prove before it could finish: the result reads what was measured (exit 4).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub budget_exceeded: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<String>,
 }
@@ -354,7 +358,9 @@ impl CommandOutput for ProveOutput {
     }
 
     fn exit_code(&self) -> u8 {
-        if self.verdict == ProveVerdict::Worse {
+        if self.budget_exceeded {
+            exit::BUDGET
+        } else if self.verdict == ProveVerdict::Worse {
             exit::GATE
         } else {
             exit::OK
@@ -790,15 +796,43 @@ struct Trials<'a> {
     max_error: f64,
     out: Vec<ProveTrial>,
     target_name: Option<String>,
+    /// The budget breach that stopped the trials (the partial trial run is saved).
+    breach: Option<anyhow::Error>,
 }
 
 impl Trials<'_> {
     /// There is time for one more trial.
     fn time_left(&self) -> bool {
-        !self.cancel.is_cancelled()
+        self.breach.is_none()
+            && !self.cancel.is_cancelled()
             && self
                 .deadline
                 .is_none_or(|d| Instant::now() + self.per_trial <= d)
+    }
+
+    /// [`Self::trial`], with a budget breach recorded instead of returned: `None` once a
+    /// budget has stopped the trials (no more run).
+    async fn try_trial(
+        &mut self,
+        sets: &[(String, String)],
+        kind: TrialKind,
+        pair: Option<u64>,
+        value: Option<String>,
+    ) -> Result<Option<ProveTrial>> {
+        if self.breach.is_some() {
+            return Ok(None);
+        }
+        match self.trial(sets, kind, pair, value).await {
+            Ok(t) => Ok(Some(t)),
+            Err(e) if is_budget_breach(&e) => {
+                self.ctx
+                    .out
+                    .warn(format!("{e:#}: the prove stops with what it measured"));
+                self.breach = Some(e);
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     async fn trial(
@@ -870,6 +904,14 @@ impl Trials<'_> {
     }
 }
 
+/// A guard's budget stopped a trial (`safety.budget_exceeded`).
+fn is_budget_breach(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        c.downcast_ref::<OprobeError>()
+            .is_some_and(|o| o.code == ErrorCode::SafetyBudgetExceeded)
+    })
+}
+
 fn kind_label(k: TrialKind) -> &'static str {
     match k {
         TrialKind::Sizing => "sizing",
@@ -935,9 +977,12 @@ async fn eval_at(
         return Ok(None);
     }
     let sets = sets_at(c, Some(v), t.run);
-    let r = t
-        .trial(&sets, TrialKind::Sizing, None, Some(d.fmt(v)))
-        .await?;
+    let Some(r) = t
+        .try_trial(&sets, TrialKind::Sizing, None, Some(d.fmt(v)))
+        .await?
+    else {
+        return Ok(None);
+    };
     evals.insert(v, r.clone());
     Ok(Some(r))
 }
@@ -1234,6 +1279,7 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
         max_error: run.report.sla.max_error_ratio,
         out: Vec::new(),
         target_name,
+        breach: None,
     };
     let obj = req.objective;
     ctx.out.info(format!(
@@ -1285,18 +1331,26 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
     let mut decision = SprtDecision::Continue;
     let candidate_value = sizing.as_ref().map(|s| s.value.clone());
     while (pairs as usize) < max_pairs && t.time_left() {
-        let a = t.trial(&[], TrialKind::Baseline, Some(pairs), None).await?;
+        let Some(a) = t
+            .try_trial(&[], TrialKind::Baseline, Some(pairs), None)
+            .await?
+        else {
+            break;
+        };
         if !t.time_left() && pairs as usize >= min_pairs {
             break;
         }
-        let b = t
-            .trial(
+        let Some(b) = t
+            .try_trial(
                 &sets,
                 TrialKind::Candidate,
                 Some(pairs),
                 candidate_value.clone(),
             )
-            .await?;
+            .await?
+        else {
+            break;
+        };
         a_vals.push(obj.value(&a));
         b_vals.push(obj.value(&b));
         pairs += 1;
@@ -1318,13 +1372,28 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
             break;
         }
     }
-    if pairs == 0 {
-        return Err(OprobeError::new(
-            ErrorCode::SafetyBudgetExceeded,
-            "the budget ran out before one A/B pair could run",
-        )
-        .with_hint("raise --budget")
-        .into());
+    // No trial ran at all (the wall-time budget): nothing to show. A breach saved its trial,
+    // so the prove is saved too.
+    if pairs == 0 && t.out.is_empty() && t.breach.is_none() {
+        return Err(t.breach.take().unwrap_or_else(|| {
+            OprobeError::new(
+                ErrorCode::SafetyBudgetExceeded,
+                "the budget ran out before one A/B pair could run",
+            )
+            .with_hint("raise --budget")
+            .into()
+        }));
+    }
+    // Trials ran but a budget stopped the prove early: the result reads what was measured,
+    // and is saved, so its trials stay attached (`show --rm PROVE` removes them).
+    let budget_exceeded = t.breach.is_some() || pairs == 0;
+    if let Some(e) = &t.breach {
+        notes.push(format!(
+            "a budget stopped the prove after {pairs} A/B pair{} ({e:#}): the verdict reads what was measured",
+            if pairs == 1 { "" } else { "s" }
+        ));
+    } else if pairs == 0 {
+        notes.push("the budget ran out before one A/B pair could run".to_owned());
     }
     // Step 4: decide.
     let floor = noise_floor(&a_vals);
@@ -1405,6 +1474,7 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
         secondary,
         trials: t.out.clone(),
         diff,
+        budget_exceeded,
         notes,
     };
     if let Err(e) = ctx
