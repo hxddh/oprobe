@@ -47,10 +47,64 @@ pub struct Proved {
     pub delta: (f64, f64, f64),
     pub significant: bool,
     pub pairs: u64,
-    /// The other metrics: `(metric, relative change)`.
-    pub secondary: Vec<(String, f64)>,
+    /// The other metrics (shown, never decisive).
+    pub secondary: Vec<Secondary>,
     pub rust: String,
     pub toml: String,
+}
+
+/// A secondary metric of a Prove: a relative change, or for a share (`throttled`, `errors`) a
+/// difference in percentage points.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Secondary {
+    /// `p99_ms`, `goodput_ops_per_s`, `throttled_request_ratio`, `error_ratio`.
+    pub metric: String,
+    /// Relative change (`0.1` = +10 %), or the difference of two shares (`0.005` = +0.5 pp).
+    pub change: f64,
+    /// `change` is a difference of shares, shown in percentage points.
+    pub points: bool,
+}
+
+impl Secondary {
+    fn of(s: &crate::app::prove::SecondaryMetric) -> Self {
+        Self {
+            metric: s.metric.clone(),
+            change: s.change.estimate,
+            points: s.metric.ends_with("_ratio"),
+        }
+    }
+
+    /// The metric's name in the app's language.
+    pub fn label(&self) -> String {
+        let key = match self.metric.as_str() {
+            "p99_ms" => "metric.p99",
+            "goodput_ops_per_s" => "metric.goodput",
+            "throttled_request_ratio" => "metric.throttled",
+            "error_ratio" => "metric.errors",
+            other => return other.to_owned(),
+        };
+        super::i18n::tr(key).to_owned()
+    }
+
+    /// `p99 −12.0 %`, `Throttled +0.500 pp`.
+    pub fn text(&self) -> String {
+        let v = if self.points {
+            super::fmt::points(self.change)
+        } else {
+            super::fmt::delta(self.change)
+        };
+        format!("{} {v}", self.label())
+    }
+}
+
+/// The secondary metrics on one line, captioned as not decisive (shares in percentage
+/// points), in the app's language.
+pub fn secondary_line(s: &[Secondary]) -> String {
+    if s.is_empty() {
+        return String::new();
+    }
+    let items: Vec<String> = s.iter().map(Secondary::text).collect();
+    super::i18n::trf("operator.secondary", &[&items.join(" · ")])
 }
 
 /// How a job ended.
@@ -225,11 +279,7 @@ impl Job {
                     ),
                     significant: p.objective_delta.low > 0.0 || p.objective_delta.high < 0.0,
                     pairs: p.pairs_count,
-                    secondary: p
-                        .secondary
-                        .iter()
-                        .map(|s| (s.metric.clone(), s.change.estimate))
-                        .collect(),
+                    secondary: p.secondary.iter().map(Secondary::of).collect(),
                     rust: p.diff.rust,
                     toml: p.diff.toml,
                 })),
@@ -295,6 +345,39 @@ pub fn shutdown(timeout: Duration) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secondary_shares_read_as_percentage_points_in_both_languages() {
+        let s = vec![
+            Secondary {
+                metric: "p99_ms".into(),
+                change: -0.12,
+                points: false,
+            },
+            Secondary {
+                metric: "throttled_request_ratio".into(),
+                change: 0.005,
+                points: true,
+            },
+            Secondary {
+                metric: "error_ratio".into(),
+                change: -0.0002,
+                points: true,
+            },
+        ];
+        // Each test runs on its own thread: the language is per thread.
+        super::super::i18n::set(super::super::i18n::Lang::En);
+        let en = secondary_line(&s);
+        assert!(en.contains("p99 −12.0 %"), "{en}");
+        assert!(en.contains("Throttled +0.500 pp"), "{en}");
+        assert!(en.contains("Errors −0.0200 pp"), "{en}");
+        assert!(en.contains("percentage points"), "{en}");
+        super::super::i18n::set(super::super::i18n::Lang::Zh);
+        let zh = secondary_line(&s);
+        assert!(zh.contains("被限流 +0.500 pp"), "{zh}");
+        assert!(zh.contains("百分点"), "{zh}");
+        super::super::i18n::set(super::super::i18n::Lang::En);
+    }
 
     #[test]
     fn pairs_take_the_baseline_before_each_candidate() {

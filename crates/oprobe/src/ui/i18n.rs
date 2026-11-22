@@ -275,6 +275,10 @@ static EN: &[(&str, &str)] = &[
     ("operator.replays", "{} replays finished"),
     ("operator.pair", "Pair {}"),
     ("operator.pairs_count", "{} A/B pairs"),
+    (
+        "operator.secondary",
+        "Secondary, not decisive (shares as percentage points, pp): {}",
+    ),
     ("operator.proven_diff", "The proven diff"),
     ("operator.stopped", "Stopped."),
     ("prove.improved", "proved"),
@@ -467,6 +471,10 @@ static ZH: &[(&str, &str)] = &[
     ("operator.replays", "已完成 {} 次回放"),
     ("operator.pair", "第 {} 对"),
     ("operator.pairs_count", "{} 对 A/B"),
+    (
+        "operator.secondary",
+        "次要指标，不决定结论（占比为百分点差，pp）：{}",
+    ),
     ("operator.proven_diff", "已证明的改动"),
     ("operator.stopped", "已停止。"),
     ("prove.improved", "已证实"),

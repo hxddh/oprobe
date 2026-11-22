@@ -20,6 +20,23 @@ pub fn compact(v: f64) -> String {
     format!("{}{suffix}", sig3(x))
 }
 
+/// A difference of two shares in percentage points: `0.005` → `+0.5 pp`.
+pub fn points(d: f64) -> String {
+    let p = d * 100.0;
+    if !p.is_finite() {
+        return "—".into();
+    }
+    if p.abs() < 0.0001 {
+        return "±0 pp".into();
+    }
+    let s = sig3(p.abs());
+    if p > 0.0 {
+        format!("+{s} pp")
+    } else {
+        format!("−{s} pp")
+    }
+}
+
 /// Three significant digits.
 pub fn sig3(x: f64) -> String {
     let a = x.abs();

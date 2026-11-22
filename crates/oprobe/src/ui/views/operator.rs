@@ -399,13 +399,7 @@ fn prove_state(st: crate::ui::jobs::State, p99: bool) -> View {
                         )))
                         .child(small(fill("operator.pairs_count", &[&p.pairs]))),
                 )
-                .child(small(
-                    p.secondary
-                        .iter()
-                        .map(|(m, d)| format!("{m} {}", fmt::delta(*d)))
-                        .collect::<Vec<_>>()
-                        .join(" · "),
-                ))
+                .child(small(crate::ui::jobs::secondary_line(&p.secondary)))
                 .child(caption(tr("operator.proven_diff")))
                 .child(code(p.rust.clone()))
                 .child((!p.toml.is_empty()).then(|| code(p.toml.clone())))
