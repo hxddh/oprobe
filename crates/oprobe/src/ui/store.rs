@@ -403,12 +403,7 @@ impl Store {
         let Some(cur) = self.current.get_untracked() else {
             return;
         };
-        let with: Vec<String> = self
-            .edits
-            .get_untracked()
-            .into_iter()
-            .map(|(k, v)| format!("{k}={v}"))
-            .collect();
+        let with = data::prove_with(&self.edits.get_untracked());
         let budget =
             Some(self.prove_budget.get_untracked().trim().to_owned()).filter(|b| !b.is_empty());
         let req = ProveRequest {

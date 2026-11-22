@@ -540,29 +540,61 @@ pub fn value_of(s: &OperatorSpec, path: &str) -> String {
     }
 }
 
-/// `base` with `edits` applied in order; the first edit that does not apply and why.
+/// The edits as `PATH=VALUE` pairs in the order they apply (core's
+/// [`crate::operator::normalize_edits`]): the preview ([`apply`]) and `prove --with`
+/// ([`prove_with`]) read the same list.
+pub fn normalized(edits: &BTreeMap<String, String>) -> Vec<(String, String)> {
+    let pairs: Vec<(String, String)> = edits.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    crate::operator::normalize_edits(&pairs)
+}
+
+/// The edits as `prove --with` arguments.
+pub fn prove_with(edits: &BTreeMap<String, String>) -> Vec<String> {
+    normalized(edits)
+        .into_iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect()
+}
+
+/// `base` with `edits` applied; the first edit that does not apply and why.
 pub fn apply(
     base: &OperatorSpec,
     edits: &BTreeMap<String, String>,
 ) -> (OperatorSpec, Option<(String, String)>) {
+    let pairs = normalized(edits);
+    let mut whole = base.clone();
+    if whole.apply_edits(&pairs).is_ok() {
+        return (whole, None);
+    }
+    // Find the edit at fault: apply them one by one.
     let mut s = base.clone();
-    let mut failed = Vec::new();
-    // Layers first, so a field of a layer just switched on lands in it; the fields of a layer
-    // switched off are left out.
-    let mut ordered: Vec<(&String, &String)> = edits
-        .iter()
-        .filter(|(k, _)| layer_of(k).is_none_or(|l| edits.get(l).is_none_or(|v| v != "off")))
-        .collect();
-    ordered.sort_by_key(|(k, _)| layer_of(k).is_some());
-    for (k, v) in ordered {
-        if let Err(e) = s.set(k, v) {
-            failed.push((k.clone(), e.message));
+    let mut bad = None;
+    let mut pending_toggle = None;
+    for (k, v) in &pairs {
+        let mut next = s.clone();
+        match next.apply_edits(&[(k.clone(), v.clone())]) {
+            Ok(()) => s = next,
+            // A layer switched on that needs a field (`concurrent_limit` needs `http`) is
+            // complete once its field applies.
+            Err(e) if k.matches('.').count() == 1 && OperatorSpec::check_edit(k, v).is_ok() => {
+                pending_toggle.get_or_insert((k.clone(), e.message));
+            }
+            Err(e) => {
+                bad.get_or_insert((k.clone(), e.message));
+            }
         }
     }
-    // A layer that needs a parameter to be on (`concurrent_limit`) is on once one is set.
-    let bad = failed
-        .into_iter()
-        .find(|(k, _)| layer_of(k).is_some() || value_of(&s, k) != "on");
+    let toggle_still_off = pending_toggle
+        .as_ref()
+        .is_some_and(|(k, _)| value_of(&s, k) != "on");
+    let bad = bad.or(pending_toggle.filter(|_| toggle_still_off));
+    let bad = bad.or_else(|| {
+        whole
+            .clone()
+            .apply_edits(&pairs)
+            .err()
+            .map(|e| (String::new(), e.message))
+    });
     (s, bad)
 }
 
@@ -629,8 +661,54 @@ mod tests {
         assert!(rust.contains("ConcurrentLimitLayer"), "{rust}");
         assert!(toml.contains("concurrent_limit"), "{toml}");
         edits.insert("read.chunk".to_owned(), "1".to_owned());
-        assert!(apply(&base, &edits).1.is_some());
+        assert_eq!(apply(&base, &edits).1.unwrap().0, "read.chunk");
+        edits.remove("read.chunk");
+        edits.remove("layers.concurrent_limit.http");
+        assert_eq!(
+            apply(&base, &edits).1.unwrap().0,
+            "layers.concurrent_limit",
+            "a limit layer without a limit"
+        );
         assert_eq!(layer_of("layers.retry.jitter"), Some("layers.retry"));
         assert_eq!(layer_of("layers.retry"), None);
+    }
+
+    /// What the app passes to `prove --with` is what its preview shows: core applies the
+    /// same edits, whatever their order, to the same operator.
+    #[test]
+    fn prove_with_applies_what_the_preview_shows() {
+        let base = OperatorSpec::from_url("s3://b/x");
+        let mut edits = BTreeMap::new();
+        for (k, v) in [
+            ("layers.concurrent_limit", "on"),
+            ("layers.concurrent_limit.http", "24"),
+            ("layers.retry", "off"),
+            ("layers.retry.max_times", "5"),
+            ("layers.tail_cut.percentile", "99"),
+            ("read.gap", "1MiB"),
+        ] {
+            edits.insert(k.to_owned(), v.to_owned());
+        }
+        let (preview, bad) = apply(&base, &edits);
+        assert_eq!(bad, None);
+        assert!(preview.layers.retry.is_none());
+        let with = prove_with(&edits);
+        // Core's `--with` parsing and application (prove's own path).
+        let pairs: Vec<(String, String)> = with
+            .iter()
+            .map(|kv| {
+                let (k, v) = kv.split_once('=').unwrap();
+                (k.to_owned(), v.to_owned())
+            })
+            .collect();
+        let mut proved = base.clone();
+        proved.apply_edits(&pairs).unwrap();
+        assert_eq!(proved, preview);
+        // And the raw map, in any order.
+        let mut raw: Vec<(String, String)> = edits.clone().into_iter().collect();
+        raw.reverse();
+        let mut proved = base.clone();
+        proved.apply_edits(&raw).unwrap();
+        assert_eq!(proved, preview);
     }
 }

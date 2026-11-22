@@ -599,6 +599,51 @@ impl OperatorSpec {
     /// Change one value: `layers.retry.max_times=5`, `read.gap=1MiB`, `layers.cache=off`,
     /// `options.region=eu-west-1`; `none` removes an optional value. Validated.
     pub fn set(&mut self, path: &str, value: &str) -> Result<(), OprobeError> {
+        self.apply_edits(&[(path.to_owned(), value.to_owned())])
+    }
+
+    /// Apply a set of `PATH=VALUE` edits (`--set`, `prove --with`, the app's edits) as one
+    /// change, validated once at the end: the order they are given in does not matter
+    /// ([`normalize_edits`]), so `layers.concurrent_limit=on` with
+    /// `layers.concurrent_limit.http=24` works either way round.
+    pub fn apply_edits(&mut self, edits: &[(String, String)]) -> Result<(), OprobeError> {
+        let edits = normalize_edits(edits);
+        let mut next = self.clone();
+        for (k, v) in &edits {
+            next.set_unchecked(k, v)?;
+        }
+        next.validate().map_err(|e| {
+            let given: Vec<String> = edits.iter().map(|(k, v)| redacted_edit(k, v)).collect();
+            let mut o = OprobeError::new(
+                e.code,
+                format!("--set {}: {}", given.join(" --set "), e.message),
+            );
+            o.hint = e.hint;
+            o
+        })?;
+        *self = next;
+        Ok(())
+    }
+
+    /// Check one edit on its own (its path, its value's type and range), before it is applied
+    /// with others: a layer switched on is not required to be complete yet, since the field it
+    /// needs (`layers.concurrent_limit` needs `http`) may come in the same set.
+    pub fn check_edit(path: &str, value: &str) -> Result<(), OprobeError> {
+        let mut scratch = Self::from_url("memory://");
+        let toggle_on = path
+            .trim()
+            .strip_prefix("layers.")
+            .is_some_and(|n| !n.contains('.'))
+            && !is_layer_off(value);
+        if toggle_on {
+            scratch.set_unchecked(path, value)
+        } else {
+            scratch.set(path, value)
+        }
+    }
+
+    /// One edit without validating the result (a step of [`Self::apply_edits`]).
+    fn set_unchecked(&mut self, path: &str, value: &str) -> Result<(), OprobeError> {
         let path = path.trim();
         let value = value.trim();
         let mut doc = toml::Value::try_from(&*self)
@@ -647,7 +692,12 @@ impl OperatorSpec {
             table = entry.as_table_mut().expect("table");
         }
         let last = parts[parts.len() - 1].to_owned();
+        // A layer switched on that is already on keeps its parameters.
+        let keep = layer_toggle
+            && parsed == Some(toml::Value::Boolean(true))
+            && table.get(&last).is_some_and(toml::Value::is_table);
         match parsed {
+            _ if keep => {}
             Some(v) => {
                 table.insert(last, v);
             }
@@ -666,9 +716,6 @@ impl OperatorSpec {
                 "counts and percentiles are numbers, sizes like 8MiB, durations like 50ms, \
                  switches on/off; a layer itself is on or off",
             )
-        })?;
-        next.validate().map_err(|e| {
-            OprobeError::new(e.code, format!("--set {path}={value}: {}", e.message))
         })?;
         *self = next;
         Ok(())
@@ -722,6 +769,56 @@ impl OperatorSpec {
     /// The HTTP in-flight cap (`layers.concurrent_limit.http`).
     pub fn http_limit(&self) -> Option<usize> {
         self.layers.concurrent_limit.as_ref().and_then(|c| c.http)
+    }
+}
+
+/// Whether a layer switch value takes the layer out (`off`, `false`, `no`, `none`).
+pub fn is_layer_off(v: &str) -> bool {
+    matches!(
+        v.trim().to_ascii_lowercase().as_str(),
+        "off" | "false" | "no" | "none"
+    )
+}
+
+/// The layer switch of a layer field (`layers.retry.jitter` → `layers.retry`).
+pub fn layer_switch(path: &str) -> Option<&str> {
+    let rest = path.strip_prefix("layers.")?;
+    let (name, field) = rest.split_once('.')?;
+    (!field.is_empty()).then(|| &path[..7 + name.len()])
+}
+
+/// A set of `PATH=VALUE` edits in the order they apply, the same for every front end:
+/// - the last value given for a path wins;
+/// - the fields of a layer switched off in the same set are dropped (the layer is out);
+/// - layer switches (`layers.NAME=on|off`) and every other path apply before layer fields, so
+///   a field lands in a layer switched on in the same set; otherwise the given order is kept.
+pub fn normalize_edits(edits: &[(String, String)]) -> Vec<(String, String)> {
+    let mut last: Vec<(String, String)> = Vec::new();
+    for (k, v) in edits {
+        let (k, v) = (k.trim(), v.trim());
+        last.retain(|(x, _)| x != k);
+        last.push((k.to_owned(), v.to_owned()));
+    }
+    let off = |layer: &str| last.iter().any(|(k, v)| k == layer && is_layer_off(v));
+    let mut out: Vec<(String, String)> = last
+        .iter()
+        .filter(|(k, _)| layer_switch(k).is_none_or(|l| !off(l)))
+        .cloned()
+        .collect();
+    out.sort_by_key(|(k, _)| layer_switch(k).is_some());
+    out
+}
+
+/// `PATH=VALUE` for display: the value of a secret option (`options.secret_access_key`)
+/// redacted, a URL without credentials.
+pub fn redacted_edit(path: &str, value: &str) -> String {
+    match path.strip_prefix("options.") {
+        Some(k) if crate::util::is_secret_key(k) => format!("{path}=<redacted>"),
+        Some(_) => format!("{path}={}", crate::util::strip_url_credentials(value)),
+        None if path == "url" || path == "http.proxy" => {
+            format!("{path}={}", crate::util::redact_url(value))
+        }
+        None => format!("{path}={value}"),
     }
 }
 
@@ -873,6 +970,63 @@ keep_alive = true
         }
         let e = s.set("layers.retry.max_tims", "5").unwrap_err();
         assert!(e.hint.unwrap().contains("layers.retry.max_times"));
+    }
+
+    #[test]
+    fn edits_apply_in_any_order() {
+        let e = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect()
+        };
+        let want = {
+            let mut s = OperatorSpec::from_url("s3://b/x");
+            s.set("layers.concurrent_limit.http", "24").unwrap();
+            s
+        };
+        for edits in [
+            e(&[
+                ("layers.concurrent_limit", "on"),
+                ("layers.concurrent_limit.http", "24"),
+            ]),
+            e(&[
+                ("layers.concurrent_limit.http", "24"),
+                ("layers.concurrent_limit", "on"),
+            ]),
+        ] {
+            let mut s = OperatorSpec::from_url("s3://b/x");
+            s.apply_edits(&edits).unwrap();
+            assert_eq!(s, want, "{edits:?}");
+        }
+        // Switching on a layer that is already on keeps its parameters.
+        let mut s = want.clone();
+        s.set("layers.concurrent_limit", "on").unwrap();
+        assert_eq!(s, want);
+        // The fields of a layer switched off are dropped; the last value wins.
+        let mut s = OperatorSpec::from_url("s3://b/x");
+        s.apply_edits(&e(&[
+            ("layers.retry.max_times", "9"),
+            ("layers.retry", "off"),
+            ("read.gap", "1MiB"),
+            ("read.gap", "2MiB"),
+        ]))
+        .unwrap();
+        assert!(s.layers.retry.is_none());
+        assert_eq!(s.read.gap, Some(ByteSize::mib(2)));
+        // A layer switched on without a needed parameter still fails, once, at the end.
+        let err = OperatorSpec::from_url("s3://b/x")
+            .apply_edits(&e(&[("layers.concurrent_limit", "on")]))
+            .unwrap_err();
+        assert!(err.message.contains("needs `http`"), "{err:?}");
+        // Secrets never show in the error.
+        let err = OperatorSpec::from_url("s3://b/x")
+            .apply_edits(&e(&[
+                ("options.secret_access_key", "SEKRIT"),
+                ("layers.concurrent_limit", "on"),
+            ]))
+            .unwrap_err();
+        assert!(!err.message.contains("SEKRIT"), "{err:?}");
     }
 
     #[test]

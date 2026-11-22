@@ -712,6 +712,9 @@ fn choose_change(run: &Run, req: &ProveRequest) -> Result<Change> {
             })?;
             fixed.push((k.trim().to_owned(), v.trim().to_owned()));
         }
+        // The order the pairs are given in does not matter (the app passes its edits as a
+        // map): switches first, the fields of a layer switched off dropped.
+        let fixed = crate::operator::normalize_edits(&fixed);
         let long_warmup = fixed.iter().any(|(k, v)| {
             k == "layers.tail_cut" && !matches!(v.as_str(), "off" | "false")
                 || k.starts_with("layers.tail_cut.")
@@ -793,9 +796,7 @@ impl Trials<'_> {
         value: Option<String>,
     ) -> Result<ProveTrial> {
         let mut p = self.base.clone();
-        for (k, v) in sets {
-            p.operator.set(k, v)?;
-        }
+        p.operator.apply_edits(sets)?;
         p.name = Some(format!("prove {} {}", self.prove_id, kind_label(kind)));
         p.validate()?;
         let rails = super::run::rails(self.ctx, &p, &self.safety)?;
@@ -1165,9 +1166,7 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
         &run,
     );
     let mut changed = base.operator.clone();
-    for (k, v) in &probe_sets {
-        changed.set(k, v)?;
-    }
+    changed.apply_edits(&probe_sets)?;
     if req.safety.dry_run {
         let rails = super::run::rails(ctx, &base, &req.safety)?;
         let mut plan = rails.plan(&base);
@@ -1351,9 +1350,9 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
     let secondary = secondary(obj, &a_trials, &b_trials, floor);
     let base_spec: &OperatorSpec = &run.report.spec.profile.operator;
     let mut changed = base_spec.clone();
-    for (k, v) in &sets {
-        changed.set(k, v).context("apply the proven change")?;
-    }
+    changed
+        .apply_edits(&sets)
+        .context("apply the proven change")?;
     let diff = crate::operator::diff::diff(base_spec, &changed);
     let r = &run.report;
     let environment = if r.spec.operator_ref.starts_with("lab://") {

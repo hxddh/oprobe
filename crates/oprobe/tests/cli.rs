@@ -517,6 +517,63 @@ fn prove_judges_a_change_and_hides_its_trials() {
     assert_eq!(env.runs().len(), 1);
 }
 
+/// `--with` (and `--set`) pairs apply as one change, in any order: a layer switched on with its
+/// field, as the app sends its edits.
+#[test]
+fn with_and_set_pairs_apply_in_any_order() {
+    let env = Env::new();
+    let o = env.run(&run_args(&["memory://"], &["-q", "-o", "json"]));
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    for with in [
+        [
+            "layers.concurrent_limit=on",
+            "layers.concurrent_limit.http=24",
+        ],
+        [
+            "layers.concurrent_limit.http=24",
+            "layers.concurrent_limit=on",
+        ],
+    ] {
+        let o = env.run(&[
+            "prove",
+            "last",
+            "--with",
+            with[0],
+            "--with",
+            with[1],
+            "--dry-run",
+            "-o",
+            "json",
+        ]);
+        assert_eq!(code(&o), 0, "{with:?}: {}\n{}", stdout(&o), stderr(&o));
+        let o = env.run(&run_args(
+            &["memory://"],
+            &[
+                "--set",
+                with[0],
+                "--set",
+                with[1],
+                "--dry-run",
+                "-o",
+                "json",
+            ],
+        ));
+        assert_eq!(code(&o), 0, "{with:?}: {}\n{}", stdout(&o), stderr(&o));
+    }
+    // A limit layer without a limit is still refused.
+    let o = env.run(&[
+        "prove",
+        "last",
+        "--with",
+        "layers.concurrent_limit=on",
+        "--dry-run",
+        "-o",
+        "json",
+    ]);
+    assert_eq!(code(&o), 2, "{}", stdout(&o));
+    assert!(stdout(&o).contains("needs `http`"), "{}", stdout(&o));
+}
+
 #[test]
 fn bare_oprobe_is_the_app() {
     let env = Env::new();

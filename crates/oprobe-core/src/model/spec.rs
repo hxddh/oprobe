@@ -767,11 +767,13 @@ impl Overrides {
     }
 
     fn set_operator(&mut self, path: &str, v: &str) -> Result<(), OprobeError> {
-        let mut scratch = OperatorSpec::from_url("memory://");
-        // A field of a layer that a previous pair took out is checked on its own.
-        scratch.set(path, v)?;
-        // A layer turned on or off replaces the pairs of its fields given before.
-        if path.matches('.').count() == 1 && path.starts_with("layers.") {
+        OperatorSpec::check_edit(path, v)?;
+        // A layer turned off drops the pairs of its fields given before (the fields given
+        // after are dropped when the pairs apply: `normalize_edits`).
+        if path.matches('.').count() == 1
+            && path.starts_with("layers.")
+            && crate::operator::is_layer_off(v)
+        {
             let prefix = format!("{path}.");
             self.operator.retain(|k, _| !k.starts_with(&prefix));
         }
@@ -842,14 +844,16 @@ impl Overrides {
 
     /// Apply to a profile (and the run label).
     pub fn apply(&self, p: &mut Profile, label: &mut Option<String>) -> Result<(), OprobeError> {
+        let mut operator = Vec::new();
         for (k, v) in self.entries() {
             if is_operator_path(&k) {
-                p.operator.set(&k, &v)?;
+                operator.push((k, v));
             } else {
                 apply_one(p, label, set_key(&k)?, &v)?;
             }
         }
-        Ok(())
+        // The operator pairs as one change (order-independent, validated once).
+        p.operator.apply_edits(&operator)
     }
 
     /// A one-line summary: `concurrency=8 layers.tail_cut=on`.
