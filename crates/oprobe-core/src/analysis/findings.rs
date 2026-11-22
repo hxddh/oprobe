@@ -1122,6 +1122,21 @@ fn client_bound(c: &Ctx) -> Option<Finding> {
     })
 }
 
+/// How many times the client's scheduling lag (p99) a latency finding's excess delay must be
+/// to survive a saturated client.
+const LAG_DWARF_FACTOR: f64 = 10.0;
+
+/// The delay a latency finding attributes to the server, over its typical request: what a
+/// saturated client's scheduling lag would have to explain. `None` for other findings.
+fn excess_latency_ms(f: &Finding) -> Option<f64> {
+    let v = |k: &str| f.evidence.values.get(k).copied();
+    match f.code.as_str() {
+        "tail_stragglers" => Some(v("straggler_ttfb_ms")? - v("typical_ttfb_ms")?),
+        "hung_requests" => Some(v("slowest_request_ms")? - v("median_request_ms")?),
+        _ => None,
+    }
+}
+
 /// All findings of a run, one per code, most severe first, with each remedy's next command.
 pub fn derive(run: &Run) -> Vec<Finding> {
     let r = &run.report;
@@ -1144,14 +1159,16 @@ pub fn derive(run: &Run) -> Vec<Finding> {
     out.extend(slow_multipart(&c));
     out.extend(cold_connections(&c));
     out.extend(repeated_reads(&c));
-    // A saturated client makes every latency finding unreliable (T7): it leads, and the
-    // findings that read the server's timing are dropped.
+    // A saturated client makes latency findings unreliable (T7): it leads, and the findings
+    // that read the server's timing are dropped — unless the delay they report dwarfs what the
+    // client's own scheduling lag can add (a 300 ms straggler is not a 7 ms poll delay).
     if let Some(cb) = client {
+        let lag_ms = r.self_stats.sched_lag_p99_ms.unwrap_or(0.0);
         out.retain(|f| {
             matches!(
                 f.code.as_str(),
                 "errors" | "throttling" | "rate_limit" | "key_limit"
-            )
+            ) || excess_latency_ms(f).is_some_and(|ms| ms > LAG_DWARF_FACTOR * lag_ms.max(1.0))
         });
         out.insert(0, cb);
     }
@@ -1444,11 +1461,31 @@ pub(crate) mod tests {
     fn a_saturated_client_leads_and_drops_latency_findings() {
         let mut run = base();
         run.report.self_stats.client_saturated = true;
-        run.report.self_stats.sched_lag_p99_ms = Some(30.0);
+        // A lag as long as the stragglers themselves: it could explain them.
+        run.report.self_stats.sched_lag_p99_ms = Some(1000.0);
         let f = derive(&run);
         assert_eq!(f[0].code, "client_bound", "{f:#?}");
         assert!(f[0].remedy.path.is_none());
         assert!(!f.iter().any(|x| x.code == "tail_stragglers"));
+    }
+
+    #[test]
+    fn stragglers_that_dwarf_the_clients_lag_survive_a_saturated_client() {
+        let mut run = base();
+        let straggler = derive(&run)
+            .into_iter()
+            .find(|x| x.code == "tail_stragglers")
+            .expect("the base run has stragglers");
+        let excess = excess_latency_ms(&straggler).unwrap();
+        // A small scheduling lag (a busy CI machine) cannot explain them: they stay.
+        run.report.self_stats.client_saturated = true;
+        run.report.self_stats.sched_lag_p99_ms = Some(excess / (LAG_DWARF_FACTOR * 2.0));
+        let f = derive(&run);
+        assert_eq!(f[0].code, "client_bound", "{f:#?}");
+        assert!(f.iter().any(|x| x.code == "tail_stragglers"), "{f:#?}");
+        // A lag of the same order could: they go.
+        run.report.self_stats.sched_lag_p99_ms = Some(excess);
+        assert!(!derive(&run).iter().any(|x| x.code == "tail_stragglers"));
     }
 
     #[test]

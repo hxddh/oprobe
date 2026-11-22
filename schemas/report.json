@@ -366,7 +366,7 @@
           "type": "integer"
         },
         "inflight_count": {
-          "description": "In-flight requests the service accepts: the estimate (the likeliest split), which the\nmargins (safe concurrency, caps) apply their headroom to; `lo ≤ inflight_count < hi`.",
+          "description": "In-flight requests the service accepts: the estimate (the likeliest split);\n`lo ≤ inflight_count < hi`.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"

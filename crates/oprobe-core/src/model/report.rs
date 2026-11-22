@@ -798,7 +798,6 @@ pub fn evidence_label(key: &str, v: f64) -> (String, String) {
         "ceiling_lo_inflight_count" => Some("Clean up to (in flight)"),
         "ceiling_hi_inflight_count" => Some("Throttled from (in flight)"),
         "peak_inflight_per_op_count" => Some("In flight per operation (peak)"),
-        "safe_concurrency_count" => Some("Safe concurrency"),
         "extra_requests_per_1k_ops_mean" => Some("Extra requests per 1 000 ops"),
         "mean_request_bytes" => Some("Mean request size"),
         "tail_cut_deadline_ms" => Some("Tail-cut deadline"),
@@ -908,7 +907,7 @@ mod tests {
                 ("throttled_request_ratio", 0.0468),
                 ("p99_ms", 262.918),
                 ("retry_pct", 12.0),
-                ("safe_concurrency_count", 20.0),
+                ("ceiling_lo_inflight_count", 20.0),
                 ("mean_request_bytes", 65536.0),
                 ("p99_to_p50_ratio", 30.0),
                 ("ceiling_requests_per_s", 2410.4),
@@ -922,7 +921,7 @@ mod tests {
         let l: BTreeMap<String, String> = e.labelled().into_iter().collect();
         assert_eq!(l["Throttled requests"], "4.7%");
         assert_eq!(l["Time in retry backoff"], "12%");
-        assert_eq!(l["Safe concurrency"], "20");
+        assert_eq!(l["Clean up to (in flight)"], "20");
         assert_eq!(l["p99 / p50"], "30.00×");
         assert_eq!(l["Ceiling requests"], "2\u{202f}410 requests/s");
         assert_eq!(l["Extra requests per 1 000 ops"], "−1\u{202f}031.00");

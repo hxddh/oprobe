@@ -53,8 +53,6 @@ pub struct BuiltinDefaults {
     pub workload: WorkloadSpec,
     pub sla: Sla,
     pub prove: ProveDefaults,
-    /// Spare in-flight capacity kept below a measured ceiling (`analysis::capacity`).
-    pub headroom_ratio: f64,
     /// The demo target (`oprobe demo`, the App's Demo button).
     pub demo_target: String,
     /// The demo's measurement window.
@@ -75,7 +73,6 @@ pub fn defaults() -> BuiltinDefaults {
             min_pairs: prove_defaults::MIN_PAIRS,
             max_sizing_trials: prove_defaults::MAX_SIZING_TRIALS,
         },
-        headroom_ratio: crate::analysis::capacity::DEFAULT_HEADROOM_RATIO,
         demo_target: "lab://demo".into(),
         demo_duration: HumanDuration::secs(8),
     }

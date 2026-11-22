@@ -6,7 +6,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use oprobe::analysis::capacity::{self, DEFAULT_HEADROOM_RATIO, Window};
+use oprobe::analysis::capacity::{self, Window};
 use oprobe::config::{Preset, Profile};
 use oprobe::engine::Cancel;
 use oprobe::engine::measure::{Rails, Request, measure};
@@ -53,8 +53,6 @@ async fn demo_lab_ceiling_brackets_its_limit_and_small_files_fit_twenty_workers(
         "{:?}",
         c.per_op
     );
-    let safe = c.safe_concurrency(DEFAULT_HEADROOM_RATIO).unwrap();
-    assert!((19..=21).contains(&safe), "safe concurrency {safe}: {ce:?}");
     // The report's estimate is the estimate of its rows.
     let again = capacity::estimate(&run.reqs, &run.ops, Window::measured(r.run.window_s));
     assert_eq!(again.inflight_ceiling, c.inflight_ceiling);
@@ -79,7 +77,4 @@ async fn parquet_lab_ops_peak_at_four_requests_in_flight() {
         "{ce:?}: {:?}",
         c.observed.levels
     );
-    // 24 × 0.85 / 4 → 5 workers (not 24 / 6.3 = 3, nor 24).
-    let safe = c.safe_concurrency(DEFAULT_HEADROOM_RATIO).unwrap();
-    assert!((4..=5).contains(&safe), "{safe}: {ce:?} {s:?}");
 }

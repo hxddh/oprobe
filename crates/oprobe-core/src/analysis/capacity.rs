@@ -1,4 +1,4 @@
-//! Capacity model (design v4 §3): the only source of "how much can I push".
+//! Capacity model: where the service starts to throttle.
 //!
 //! [`estimate`] reconstructs the requests in flight over time from the request rows (start and
 //! end times), then finds the in-flight level at which the service starts throttling: the
@@ -7,11 +7,6 @@
 //! flight ([`OpShape`]: a parquet scan issues a HEAD, a footer read, then 4 parallel column
 //! reads, so it peaks at 4, not at its 6.3 requests per op). The ceiling is never derived from
 //! mean latency × rate.
-//!
-//! [`Capacity::safe_concurrency`] turns both into a worker count that keeps peak in-flight
-//! under the ceiling with spare headroom; [`Capacity::predict`] estimates throughput and the
-//! chance of throttling at a concurrency. Every finding, simulator, tuner margin and App
-//! action that talks about concurrency uses these; nothing else computes a safe concurrency.
 //!
 //! Findings report the fitted model as evidence only; sizing a change is `oprobe prove`'s job
 //! (a single run varies no load).
@@ -24,9 +19,6 @@ use serde::{Deserialize, Serialize};
 use super::hypothesis::{Hypothesis, HypothesisKind};
 pub use super::limits::FitInputs;
 use crate::model::{OpRow, ReqRow};
-
-/// Spare in-flight capacity kept below the ceiling by default (15 %).
-pub const DEFAULT_HEADROOM_RATIO: f64 = 0.15;
 
 /// Serialize a whole-number `f64` (an in-flight level) as an integer.
 fn ser_whole<S: serde::Serializer>(v: &f64, s: S) -> Result<S::Ok, S::Error> {
@@ -70,8 +62,8 @@ impl Window {
 /// The in-flight level the service accepts before it throttles.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Ceiling {
-    /// In-flight requests the service accepts: the estimate (the likeliest split), which the
-    /// margins (safe concurrency, caps) apply their headroom to; `lo ≤ inflight_count < hi`.
+    /// In-flight requests the service accepts: the estimate (the likeliest split);
+    /// `lo ≤ inflight_count < hi`.
     #[serde(rename = "inflight_count", serialize_with = "ser_whole")]
     #[schemars(with = "u64")]
     pub requests: f64,
@@ -756,161 +748,6 @@ impl Capacity {
             }
         }
     }
-
-    /// The most workers any advice may suggest: [`Capacity::safe_concurrency`] with the
-    /// default headroom. `None` when no ceiling is known.
-    pub fn max_advisable_concurrency(&self) -> Option<u32> {
-        self.safe_concurrency(DEFAULT_HEADROOM_RATIO)
-    }
-
-    /// Workers that keep peak in-flight under the ceiling with `headroom_ratio` spare:
-    /// `floor(ceiling.inflight_count × (1 − headroom) / peak_inflight_per_op)`, at least 1 (the
-    /// headroom applies to the estimate; the bracket only says how sure it is). `None` when no
-    /// ceiling is known.
-    pub fn safe_concurrency(&self, headroom_ratio: f64) -> Option<u32> {
-        let c = self.inflight_ceiling?;
-        let per_op = self.per_op.peak_inflight_per_op.max(1.0);
-        let h = headroom_ratio.clamp(0.0, 0.95);
-        Some(((c.requests * (1.0 - h) / per_op).floor() as u32).max(1))
-    }
-
-    /// Expected throughput, throttling and peak in-flight at `concurrency` workers.
-    ///
-    /// Throughput scales from the observed rate per worker (operations per second divided by
-    /// operations in flight) and saturates where mean in-flight reaches the ceiling; the
-    /// interval widens with the distance from the observed concurrency. The throttle
-    /// probability rises from 0 to 1 across the ceiling's bracket.
-    pub fn predict(&self, concurrency: u32) -> Prediction {
-        let c = f64::from(concurrency.max(1));
-        let per_op_peak = self.per_op.peak_inflight_per_op.max(1.0);
-        let per_op_mean = self.per_op.mean_inflight_per_op.max(1e-6);
-        let peak = c * per_op_peak;
-        let o = &self.observed;
-        // Throughput per worker from the time operations were served: retry backoff is
-        // waiting, not work (A3).
-        let busy = if o.ops_service_inflight_mean > 0.0 {
-            o.ops_service_inflight_mean
-        } else {
-            o.ops_inflight_mean
-        };
-        let per_worker = (busy > 0.0).then(|| o.ops_per_s / busy);
-        let workers = match self.inflight_ceiling {
-            Some(ce) => c.min((ce.hi.max(1.0) / per_op_mean).max(1.0)),
-            None => c,
-        };
-        let bias = self
-            .calibration_bias_ratio
-            .filter(|b| b.is_finite() && *b > 0.0)
-            .unwrap_or(1.0);
-        let mut ops = per_worker.map_or(0.0, |r| r * workers) * bias;
-        let rel = if busy > 0.0 {
-            (0.1 + 0.2 * (c / busy).ln().abs()).min(0.6)
-        } else {
-            0.6
-        };
-        let (mut throttle, mut within) = match self.inflight_ceiling {
-            Some(ce) => {
-                let mid = (ce.lo + ce.hi) / 2.0;
-                let width = (ce.hi - ce.lo).max(1.0);
-                let p = 1.0 / (1.0 + (-(peak - mid) * 3.0 / width).exp());
-                (p, peak <= ce.lo)
-            }
-            None => {
-                let seen = o.peak_inflight_count as f64;
-                if peak <= seen || seen == 0.0 {
-                    (0.0, true)
-                } else {
-                    (((peak - seen) / peak).min(0.5), true)
-                }
-            }
-        };
-        // The other limit models cap the demand (design v5 §4, prediction).
-        if let Some(h) = self.asserted() {
-            let rpo = self.clean_requests_per_op();
-            let demand_ops = ops;
-            let cap_ops = match h.kind {
-                HypothesisKind::RateLimit | HypothesisKind::TimeVarying => {
-                    h.params.requests_per_s.map(|r| r / rpo)
-                }
-                HypothesisKind::KeyLimit => h
-                    .params
-                    .requests_per_s
-                    .map(|r| r / rpo / h.params.key_share_ratio.unwrap_or(1.0).clamp(1e-3, 1.0)),
-                HypothesisKind::Queueing => match (h.params.servers_count, h.params.service_ms) {
-                    (Some(n), Some(ms)) if ms > 0.0 => Some(n as f64 * 1000.0 / ms / rpo),
-                    _ => None,
-                },
-                HypothesisKind::BandwidthCap => h
-                    .params
-                    .bytes_per_s
-                    .filter(|_| self.per_op.bytes_per_op_mean > 0.0)
-                    .map(|b| b / self.per_op.bytes_per_op_mean),
-                HypothesisKind::ClientBound => Some(o.ops_per_s * 1.05),
-                _ => None,
-            };
-            if let Some(cap_ops) = cap_ops.filter(|x| x.is_finite() && *x > 0.0) {
-                if demand_ops > cap_ops {
-                    ops = cap_ops * bias;
-                    // A rate limit throttles the excess; the others only slow down.
-                    if matches!(
-                        h.kind,
-                        HypothesisKind::RateLimit
-                            | HypothesisKind::TimeVarying
-                            | HypothesisKind::KeyLimit
-                    ) {
-                        throttle = throttle.max(1.0 - cap_ops / demand_ops);
-                        within = false;
-                    }
-                } else if matches!(
-                    h.kind,
-                    HypothesisKind::RateLimit
-                        | HypothesisKind::TimeVarying
-                        | HypothesisKind::KeyLimit
-                ) {
-                    throttle = 0.0;
-                    within = true;
-                }
-            }
-        }
-        let mut confidence = self.confidence;
-        if per_worker.is_none() || (busy > 0.0 && rel >= 0.4) {
-            confidence = Confidence::Low;
-        }
-        Prediction {
-            concurrency_count: u64::from(concurrency.max(1)),
-            peak_inflight_count: peak.ceil() as u64,
-            ops_per_s: ops,
-            ops_lo_per_s: ops * (1.0 - rel),
-            ops_hi_per_s: ops * (1.0 + rel),
-            throttle_probability_ratio: throttle.clamp(0.0, 1.0),
-            within_ceiling: within,
-            confidence,
-        }
-    }
-
-    /// Requests per operation without the retries throttling caused (what a paced client
-    /// sends).
-    pub fn clean_requests_per_op(&self) -> f64 {
-        let o = &self.observed;
-        let thr = crate::util::ratio(o.throttled_requests_count as f64, o.requests_count as f64);
-        (self.per_op.requests_per_op * (1.0 - thr)).max(1.0)
-    }
-
-    /// Operations per second a client may be paced at so the selected rate limit (or per-key
-    /// limit) is not exceeded, with `headroom_ratio` spare. `None` without an asserted rate
-    /// hypothesis.
-    pub fn safe_rate(&self, headroom_ratio: f64) -> Option<f64> {
-        let h = self.asserted()?;
-        let rps = h.params.requests_per_s?;
-        let rpo = self.clean_requests_per_op();
-        let share = match h.kind {
-            HypothesisKind::RateLimit | HypothesisKind::TimeVarying => 1.0,
-            HypothesisKind::KeyLimit => h.params.key_share_ratio.unwrap_or(1.0).clamp(1e-3, 1.0),
-            _ => return None,
-        };
-        let h = headroom_ratio.clamp(0.0, 0.95);
-        Some((rps / rpo / share * (1.0 - h)).max(1.0))
-    }
 }
 
 #[cfg(test)]
@@ -1023,10 +860,6 @@ mod tests {
             c.per_op
         );
         assert!(c.per_op.sequential_fraction > 0.99, "{:?}", c.per_op);
-        assert_eq!(
-            c.safe_concurrency(0.15),
-            Some((ce.requests * 0.85).floor() as u32)
-        );
         assert!(c.observed.throttled_requests_count > 0);
         assert!(c.observed.min_throttled_inflight_count.unwrap() > 24);
         assert!(c.confidence >= Confidence::Medium, "{c:#?}");
@@ -1052,19 +885,6 @@ mod tests {
             .inflight_ceiling
             .expect("8 workers × 4 = 32 > 24 throttles");
         assert!(ce.lo <= 24.0 && 24.0 < ce.hi, "{ce:?}");
-        // 24 × 0.85 / 4 = 5.1 → 5 workers, not 24 / 6.
-        assert_eq!(c.safe_concurrency(DEFAULT_HEADROOM_RATIO), Some(5));
-        let p = c.predict(5);
-        assert_eq!(p.peak_inflight_count, 20);
-        assert!(
-            p.within_ceiling && p.throttle_probability_ratio < 0.05,
-            "{p:?}"
-        );
-        let p = c.predict(8);
-        assert!(
-            !p.within_ceiling && p.throttle_probability_ratio > 0.9,
-            "{p:?}"
-        );
     }
 
     #[test]
@@ -1072,21 +892,12 @@ mod tests {
         let (reqs, ops) = synthetic(8, 1000, &[1], 5, 20);
         let c = estimate(&reqs, &ops, Window::all());
         assert!(c.inflight_ceiling.is_none());
-        assert!(c.safe_concurrency(0.15).is_none());
         assert_eq!(c.observed.peak_inflight_count, 8);
         assert!(
             c.confidence_reason.contains("no throttling"),
             "{}",
             c.confidence_reason
         );
-        let p = c.predict(4);
-        assert_eq!(p.throttle_probability_ratio, 0.0);
-        assert!(p.ops_per_s > 0.0);
-        // Twice the workers: twice the throughput (wide interval), unknown throttling.
-        let p2 = c.predict(16);
-        assert!(p2.ops_per_s > p.ops_per_s * 3.5, "{p:?} {p2:?}");
-        assert!(p2.ops_lo_per_s < p2.ops_per_s && p2.ops_hi_per_s > p2.ops_per_s);
-        assert!(p2.throttle_probability_ratio > 0.0);
         assert!(estimate(&[], &[], Window::all()).inflight_ceiling.is_none());
     }
 
@@ -1248,7 +1059,6 @@ mod tests {
         let s = c.selected().unwrap();
         assert_eq!(s.kind, HypothesisKind::None, "{:#?}", c.hypotheses);
         assert!(c.rate_ceiling_requests_per_s.is_none());
-        assert!(c.safe_rate(0.15).is_none());
     }
 
     #[test]
