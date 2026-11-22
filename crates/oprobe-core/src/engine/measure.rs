@@ -357,6 +357,12 @@ pub async fn measure(req: Request) -> Result<Measured> {
             (run, Some(tuned))
         }
     };
+    // The load generator (design v5 §7): its name, version and stages, and no finding that
+    // needs a stage it cannot observe.
+    if let Some(c) = session.client() {
+        run.report.client = c.info();
+        crate::clients::suppress_unsupported(&mut run.report);
+    }
     let breach = session.guard().and_then(|g| g.breach());
     if breach.is_some() {
         run.report.verdict.exit_code = exit::BUDGET;

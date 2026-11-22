@@ -181,6 +181,9 @@ pub struct Session {
     guard: Option<Arc<Guard>>,
     trace_max_requests: usize,
     last_trace: Mutex<Option<TraceRows>>,
+    /// The non-default load generator (`profile.client`, design v5 §7), started for this
+    /// session; `None`: OpenDAL's own HTTP stack.
+    client: Option<Arc<crate::clients::Driver>>,
 }
 
 impl Session {
@@ -200,6 +203,12 @@ impl Session {
         profile.target = profile.target.normalized()?;
         profile.validate()?;
         super::operator::prepare_target(&mut profile.target, &profile.knobs).await?;
+        let client =
+            crate::clients::Driver::start(&profile.client, &profile.target, &profile.knobs).await?;
+        let client_warnings = match &client {
+            Some(c) => c.adjust(&mut profile),
+            None => Vec::new(),
+        };
         let base = base_operator(&profile.target)?;
         let admin = admin_operator(&base, &profile.target)?;
         let run_prefix = opts.run_prefix.clone().unwrap_or_else(new_run_prefix);
@@ -208,11 +217,13 @@ impl Session {
         }
         let spec = profile.workload.effective_dataset();
         let mut mix = profile.workload.effective_mix();
-        let mut warnings = super::workloads::adapt_mix(
-            &mut mix,
-            &base.info().capability(),
-            &profile.target.scheme,
-        );
+        // The mix runs on what the measured client can do.
+        let measured_cap = client
+            .as_ref()
+            .map_or_else(|| base.info().capability(), |c| c.capability());
+        let mut warnings =
+            super::workloads::adapt_mix(&mut mix, &measured_cap, &profile.target.scheme);
+        warnings.extend(client_warnings);
         if spec.existing_prefix.is_some() && mix.iter().any(|m| m.op.is_write()) {
             mix.retain(|m| !m.op.is_write());
             warnings.push("existing_prefix datasets are read-only: write operations were removed from the mix".into());
@@ -265,7 +276,7 @@ impl Session {
             })
             .max()
             .unwrap_or(0);
-        let capability = base.info().capability();
+        let capability = measured_cap;
         Ok(Self {
             profile,
             base,
@@ -282,6 +293,7 @@ impl Session {
             guard: opts.guard,
             trace_max_requests: opts.trace_max_requests,
             last_trace: Mutex::new(None),
+            client,
         })
     }
 
@@ -291,6 +303,11 @@ impl Session {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take()
+    }
+
+    /// The non-default load generator of this session (design v5 §7).
+    pub fn client(&self) -> Option<&Arc<crate::clients::Driver>> {
+        self.client.as_ref()
     }
 
     /// The budget guard, when the session has one.
@@ -317,13 +334,16 @@ impl Session {
         if let Some(t) = &tree {
             recorder.set_tree_registry(t.clone());
         }
-        let op = measured_operator(
-            &self.base,
-            &self.profile.target,
-            knobs,
-            &recorder,
-            tree.clone(),
-        )?;
+        let op = match &self.client {
+            Some(c) => c.operator(&self.profile.target, knobs, &recorder)?,
+            None => measured_operator(
+                &self.base,
+                &self.profile.target,
+                knobs,
+                &recorder,
+                tree.clone(),
+            )?,
+        };
         let ctx = Arc::new(OpCtx {
             op,
             picker: Picker::new(self.dataset.objects.len(), self.profile.workload.access),
@@ -670,6 +690,9 @@ impl Session {
 
     /// Delete everything this session wrote (unless disabled) and verify.
     pub async fn close(&self) -> CleanupSummary {
+        if let Some(c) = &self.client {
+            c.shutdown().await;
+        }
         if !self.profile.workload.cleanup {
             return CleanupSummary {
                 enabled: false,
