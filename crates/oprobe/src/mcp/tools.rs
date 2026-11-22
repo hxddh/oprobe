@@ -240,6 +240,9 @@ pub struct GetRunIn {
     /// task result).
     #[serde(default)]
     pub detail: Option<Detail>,
+    /// Deprecated: `true` is `detail: full`.
+    #[serde(default)]
+    pub include_report: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
@@ -2150,7 +2153,11 @@ async fn start_tune(st: &Arc<State>, a: StartTuneIn, cx: CallCx) -> anyhow::Resu
 }
 
 fn get_run(st: &Arc<State>, a: GetRunIn) -> anyhow::Result<Reply> {
-    let detail = a.detail.unwrap_or_default();
+    let detail = a.detail.unwrap_or(if a.include_report == Some(true) {
+        Detail::Full
+    } else {
+        Detail::Summary
+    });
     if let Some(job) = st.jobs.get(&a.run) {
         let out = status_of(st, &job, detail);
         let text = status_text(&out);
