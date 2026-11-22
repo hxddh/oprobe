@@ -715,54 +715,6 @@
       ],
       "type": "object"
     },
-    "Delta": {
-      "description": "One objective metric, recommended vs a reference trial.",
-      "properties": {
-        "baseline": {
-          "description": "The reference trial's value.",
-          "format": "double",
-          "type": "number"
-        },
-        "baseline_feasible": {
-          "description": "The reference met the SLA and the throttle budget; deltas against an infeasible\nreference are not improvements.",
-          "type": "boolean"
-        },
-        "baseline_trial": {
-          "description": "Trial id of the reference.",
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "candidate": {
-          "description": "The recommended configuration's value.",
-          "format": "double",
-          "type": "number"
-        },
-        "delta_ratio": {
-          "description": "`(candidate − baseline) / baseline` (0 when the baseline is 0).",
-          "format": "double",
-          "type": "number"
-        },
-        "metric": {
-          "description": "`ops_per_s` / `mib_per_s` (goodput), `p99_ms` (latency) or\n`cost_per_million_ops_usd`.",
-          "type": "string"
-        },
-        "unit": {
-          "description": "Unit of `baseline` and `candidate`.",
-          "type": "string"
-        }
-      },
-      "required": [
-        "metric",
-        "unit",
-        "baseline",
-        "candidate",
-        "delta_ratio",
-        "baseline_feasible",
-        "baseline_trial"
-      ],
-      "type": "object"
-    },
     "DimensionSlice": {
       "description": "One slice of a dimension (a prefix, a size bucket, cold or warm, a tenant).",
       "properties": {
@@ -874,80 +826,11 @@
       ],
       "type": "object"
     },
-    "Direction": {
-      "description": "Which way a metric should move.",
-      "oneOf": [
-        {
-          "const": "increase",
-          "description": "Higher than the baseline.",
-          "type": "string"
-        },
-        {
-          "const": "decrease",
-          "description": "Lower than the baseline.",
-          "type": "string"
-        },
-        {
-          "const": "at_most",
-          "description": "At most the predicted value (e.g. a throttle budget).",
-          "type": "string"
-        },
-        {
-          "const": "at_least",
-          "description": "At least the predicted value.",
-          "type": "string"
-        },
-        {
-          "const": "unchanged",
-          "description": "Within the interval of the baseline (a change that must not cost anything).",
-          "type": "string"
-        }
-      ]
-    },
-    "EffectiveKnobValues": {
-      "description": "The effective configuration: the requested values with the service's limits applied.",
+    "EffectiveKnobs": {
+      "description": "Knob values as OpenDAL applies them, which can differ from what was requested.",
       "properties": {
-        "cache": {
-          "type": "boolean"
-        },
-        "cache_bytes": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "chunk_bytes": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "concurrency_count": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "http_version": {
-          "$ref": "#/$defs/HttpVersion"
-        },
-        "io_concurrency_count": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "keep_alive": {
-          "type": "boolean"
-        },
-        "max_inflight_requests_count": {
-          "description": "0 = unlimited.",
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "range_gap_bytes": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "retries_count": {
+        "requested_chunk_bytes": {
+          "description": "`knobs.chunk_size` as requested (bytes).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -968,34 +851,15 @@
             "null"
           ]
         },
-        "tail_cut": {
-          "type": "boolean"
-        },
-        "timeout_ms": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
         "write_chunk_bytes": {
-          "description": "Multipart part size OpenDAL writes with (the chunk clamped to the service's limits).",
+          "description": "Chunk (multipart part size) OpenDAL writes with: the requested chunk clamped to the\nservice's `write_multi_min_size ..= write_multi_max_size` (reads use it unchanged).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         }
       },
       "required": [
-        "concurrency_count",
-        "io_concurrency_count",
-        "chunk_bytes",
-        "range_gap_bytes",
-        "max_inflight_requests_count",
-        "http_version",
-        "keep_alive",
-        "cache",
-        "cache_bytes",
-        "retries_count",
-        "tail_cut",
-        "timeout_ms",
+        "requested_chunk_bytes",
         "write_chunk_bytes"
       ],
       "type": "object"
@@ -1118,84 +982,39 @@
       ],
       "type": "object"
     },
-    "Expectation": {
-      "description": "What a change should do to one metric: a predicted value with an interval.",
-      "properties": {
-        "direction": {
-          "$ref": "#/$defs/Direction"
-        },
-        "hi": {
-          "description": "Upper end of the prediction interval, in `unit`.",
-          "format": "double",
-          "type": "number"
-        },
-        "lo": {
-          "description": "Lower end of the prediction interval, in `unit`.",
-          "format": "double",
-          "type": "number"
-        },
-        "metric": {
-          "description": "A report metric path, e.g. `summary.ops_per_s`, `throttled_request_ratio`, `p99_ms`.",
-          "type": "string"
-        },
-        "predicted": {
-          "description": "Predicted value, in `unit`.",
-          "format": "double",
-          "type": "number"
-        },
-        "unit": {
-          "description": "Unit of `predicted`, `lo` and `hi` (`ops_per_s`, `ms`, `ratio`, …).",
-          "type": "string"
-        }
-      },
-      "required": [
-        "metric",
-        "direction",
-        "predicted",
-        "lo",
-        "hi",
-        "unit"
-      ],
-      "type": "object"
-    },
     "Finding": {
-      "description": "A diagnosis item (design §1).",
+      "description": "A finding (design v6 §3 \"Explain\"): a cause, the evidence (the requests themselves) and\n**one** OpenDAL remedy. No sizing numbers: a single run varies no load (T1, T2); `oprobe\nprove` sizes the remedy.",
       "properties": {
-        "advice": {
-          "description": "What to change.",
-          "type": "string"
-        },
         "cause": {
           "description": "One sentence: what is wrong.",
           "type": "string"
         },
         "code": {
-          "description": "Stable code, e.g. `throttling`, `cold_connections`.",
+          "description": "Stable code ([`crate::analysis::catalog`]), e.g. `throttling`, `tail_stragglers`.",
           "type": "string"
+        },
+        "confidence": {
+          "$ref": "#/$defs/Confidence",
+          "default": "low",
+          "description": "How sure the cause is: `high` only when the limit model explains most of the effect\nand agrees across the run's halves (T8)."
         },
         "evidence": {
           "$ref": "#/$defs/Evidence"
         },
+        "remedy": {
+          "$ref": "#/$defs/Remedy"
+        },
         "severity": {
           "$ref": "#/$defs/Severity"
-        },
-        "verification": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Verification"
-            },
-            {
-              "type": "null"
-            }
-          ]
         }
       },
       "required": [
         "code",
         "severity",
+        "confidence",
         "cause",
         "evidence",
-        "advice"
+        "remedy"
       ],
       "type": "object"
     },
@@ -1585,95 +1404,6 @@
       "required": [
         "verified_count",
         "corrupted_count"
-      ],
-      "type": "object"
-    },
-    "KnobValues": {
-      "description": "Client knob values in machine units.",
-      "properties": {
-        "cache": {
-          "type": "boolean"
-        },
-        "cache_bytes": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "chunk_bytes": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "concurrency_count": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "http_version": {
-          "$ref": "#/$defs/HttpVersion"
-        },
-        "io_concurrency_count": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "keep_alive": {
-          "type": "boolean"
-        },
-        "max_inflight_requests_count": {
-          "description": "0 = unlimited.",
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "range_gap_bytes": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "retries_count": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "tail_cut": {
-          "type": "boolean"
-        },
-        "timeout_ms": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        }
-      },
-      "required": [
-        "concurrency_count",
-        "io_concurrency_count",
-        "chunk_bytes",
-        "range_gap_bytes",
-        "max_inflight_requests_count",
-        "http_version",
-        "keep_alive",
-        "cache",
-        "cache_bytes",
-        "retries_count",
-        "tail_cut",
-        "timeout_ms"
-      ],
-      "type": "object"
-    },
-    "KnobsInfo": {
-      "description": "Knobs as requested and as OpenDAL applied them.",
-      "properties": {
-        "effective": {
-          "$ref": "#/$defs/EffectiveKnobValues"
-        },
-        "requested": {
-          "$ref": "#/$defs/KnobValues"
-        }
-      },
-      "required": [
-        "requested",
-        "effective"
       ],
       "type": "object"
     },
@@ -2381,37 +2111,6 @@
       ],
       "type": "object"
     },
-    "Overrides": {
-      "description": "A change to a run: operator paths, workload and SLA keys, and the label. Built with\n[`Overrides::set`], which validates.",
-      "properties": {
-        "label": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "operator": {
-          "additionalProperties": {
-            "type": "string"
-          },
-          "description": "Operator paths (`layers.retry.max_times`, `read.gap`, `options.region`, …).",
-          "type": "object"
-        },
-        "sla": {
-          "additionalProperties": {
-            "type": "string"
-          },
-          "type": "object"
-        },
-        "workload": {
-          "additionalProperties": {
-            "type": "string"
-          },
-          "type": "object"
-        }
-      },
-      "type": "object"
-    },
     "PartialInfo": {
       "description": "A run that stopped early (`report.run.partial`).",
       "properties": {
@@ -2612,61 +2311,46 @@
       },
       "type": "object"
     },
-    "Recommendation": {
-      "description": "What `oprobe tune` / `oprobe fix` / MCP `recommend_config` recommend.",
+    "Remedy": {
+      "description": "The one remedy of a finding: an `OperatorSpec` path (design v6 §8 \"Findings → remedies\").",
       "properties": {
-        "confirmed": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/VerifyOutcome"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "What `oprobe verify` concluded about the recommendation (set by `oprobe fix`)."
+        "next": {
+          "description": "The next command (`oprobe prove RUN CODE`, or `oprobe show RUN --by …` when there is\nnothing to prove).",
+          "type": [
+            "string",
+            "null"
+          ]
         },
-        "knobs": {
-          "$ref": "#/$defs/KnobValues",
-          "description": "The recommended knob values."
+        "opendal": {
+          "description": "The OpenDAL API, e.g. `ConcurrentLimitLayer::with_http_concurrent_limit`.",
+          "type": "string"
         },
-        "no_feasible_trial": {
-          "description": "No trial met the SLA: this is the least-bad configuration, not a recommendation.",
+        "path": {
+          "description": "The operator path the remedy changes (`layers.concurrent_limit.http`, `read.gap`);\nabsent when the remedy is not a layer (`key_limit`, `client_bound`, `errors`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sized": {
+          "description": "`oprobe prove` sizes the value with a bracket search (otherwise it switches it on).",
           "type": "boolean"
         },
-        "objective": {
+        "text": {
+          "description": "The remedy in one sentence (no numbers).",
           "type": "string"
         },
-        "overrides": {
-          "$ref": "#/$defs/Overrides",
-          "description": "The change from the baseline's knobs (`--set` vocabulary): apply with\n`oprobe run --from RUN …` or `RunSpec::with`."
-        },
-        "profile_toml": {
-          "description": "A profile with the recommended knobs (environment defaults such as `proxy` and\nredacted secrets omitted).",
-          "type": "string"
-        },
-        "rust_snippet": {
-          "description": "Rust/OpenDAL code configuring the same client.",
-          "type": "string"
-        },
-        "vs_baseline": {
-          "$ref": "#/$defs/Delta",
-          "description": "Against the baseline trial (`baseline_feasible: false` when it violated the SLA or\nthe throttle budget)."
-        },
-        "vs_best": {
-          "$ref": "#/$defs/Delta",
-          "description": "Against the best feasible trial: the cost of the safety margin."
+        "with": {
+          "description": "Paths changed together with it (`layers.retry.jitter`).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
         }
       },
       "required": [
-        "objective",
-        "knobs",
-        "overrides",
-        "profile_toml",
-        "rust_snippet",
-        "vs_baseline",
-        "vs_best",
-        "no_feasible_trial"
+        "sized",
+        "text"
       ],
       "type": "object"
     },
@@ -2772,6 +2456,14 @@
           },
           "description": "Where the traffic and the trouble are: prefixes, hot keys, sizes, cold/warm, tenants."
         },
+        "effective_write": {
+          "$ref": "#/$defs/EffectiveKnobs",
+          "default": {
+            "requested_chunk_bytes": 0,
+            "write_chunk_bytes": 0
+          },
+          "description": "The multipart part size OpenDAL wrote with (the requested `write.chunk` clamped to the\nservice's part-size limits)."
+        },
         "findings": {
           "items": {
             "$ref": "#/$defs/Finding"
@@ -2783,9 +2475,6 @@
         },
         "integrity": {
           "$ref": "#/$defs/IntegrityStats"
-        },
-        "knobs": {
-          "$ref": "#/$defs/KnobsInfo"
         },
         "network": {
           "$ref": "#/$defs/Network"
@@ -2878,16 +2567,6 @@
           },
           "type": "array"
         },
-        "tune": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/TuneReport"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
         "verbs": {
           "items": {
             "$ref": "#/$defs/VerbStats"
@@ -2914,7 +2593,7 @@
         "spec",
         "target",
         "workload",
-        "knobs",
+        "effective_write",
         "sla",
         "verdict",
         "summary",
@@ -3125,6 +2804,13 @@
         },
         "oprobe_version": {
           "type": "string"
+        },
+        "parent_id": {
+          "description": "The `oprobe prove` this run is a trial of (trials are hidden from `show --list`).",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "partial": {
           "anyOf": [
@@ -4167,256 +3853,25 @@
       ],
       "type": "object"
     },
-    "TrialRow": {
-      "description": "One tuner trial.",
-      "properties": {
-        "error_ratio": {
-          "format": "double",
-          "type": "number"
-        },
-        "feasible": {
-          "type": "boolean"
-        },
-        "id": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "knobs": {
-          "$ref": "#/$defs/KnobValues"
-        },
-        "mib_per_s": {
-          "format": "double",
-          "type": "number"
-        },
-        "note": {
+    "TrialKind": {
+      "description": "What a trial was for.",
+      "oneOf": [
+        {
+          "const": "sizing",
+          "description": "A sizing trial of the bracket search (the change at `value`).",
           "type": "string"
         },
-        "ops_per_s": {
-          "description": "Successful operations per second.",
-          "format": "double",
-          "type": "number"
-        },
-        "p50_ms": {
-          "format": "double",
-          "type": "number"
-        },
-        "p99_ms": {
-          "format": "double",
-          "type": "number"
-        },
-        "peak_inflight_count": {
-          "description": "Requests in flight at the trial's peak.",
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "peak_inflight_per_op_count": {
-          "description": "The most requests one operation had in flight at once (maximum over operations).",
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "rate_per_s": {
-          "description": "The pace of an open-loop trial (operations per second).",
-          "format": "double",
-          "type": [
-            "number",
-            "null"
-          ]
-        },
-        "requests_count": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "stage": {
+        {
+          "const": "baseline",
+          "description": "The current operator (A).",
           "type": "string"
         },
-        "throttled_op_ratio": {
-          "description": "Operations with ≥ 1 throttled response / operations.",
-          "format": "double",
-          "type": "number"
-        },
-        "throttled_request_ratio": {
-          "description": "Throttled responses / requests (the throttle budget applies to this).",
-          "format": "double",
-          "type": "number"
-        },
-        "throttled_responses_count": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
+        {
+          "const": "candidate",
+          "description": "The changed operator (B).",
+          "type": "string"
         }
-      },
-      "required": [
-        "id",
-        "stage",
-        "knobs",
-        "ops_per_s",
-        "mib_per_s",
-        "p50_ms",
-        "p99_ms",
-        "error_ratio",
-        "throttled_request_ratio",
-        "throttled_op_ratio",
-        "throttled_responses_count",
-        "requests_count",
-        "peak_inflight_count",
-        "peak_inflight_per_op_count",
-        "feasible",
-        "note"
-      ],
-      "type": "object"
-    },
-    "TuneReport": {
-      "description": "The tuner's search, embedded in the winner's report (design v4 §6).",
-      "properties": {
-        "baseline_feasible": {
-          "description": "The baseline met the SLA and the throttle budget. When it did not, deltas are taken\nagainst the best feasible trial.",
-          "type": "boolean"
-        },
-        "baseline_trial": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "best_feasible_trial_id": {
-          "description": "The best trial within the SLA and the throttle budget, ignoring the safety margin.",
-          "format": "uint64",
-          "minimum": 0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "capacity": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Capacity"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "The capacity model over every trial (`source: tune`)."
-        },
-        "headline": {
-          "description": "One line: what is recommended and why.",
-          "type": "string"
-        },
-        "improvement_ratio": {
-          "description": "Objective improvement of the recommendation vs the baseline (positive = better);\nabsent when the baseline was infeasible or above the safety margin. Never negative.",
-          "format": "double",
-          "type": [
-            "number",
-            "null"
-          ]
-        },
-        "margin_cost_ratio": {
-          "description": "How much better the best feasible trial measured than the recommendation: what the\nsafety margin costs.",
-          "format": "double",
-          "type": [
-            "number",
-            "null"
-          ]
-        },
-        "max_throttle_ratio": {
-          "description": "The throttle budget (share of throttled requests a feasible trial may cause).",
-          "format": "double",
-          "type": "number"
-        },
-        "metric_unit": {
-          "description": "What goodput was measured in: `ops_per_s` or `mib_per_s`.",
-          "type": "string"
-        },
-        "no_feasible_trial": {
-          "description": "No trial met the SLA: the winner is the least-bad configuration.",
-          "type": "boolean"
-        },
-        "notes": {
-          "items": {
-            "type": "string"
-          },
-          "type": "array"
-        },
-        "objective": {
-          "description": "`goodput`, `p99`, `cost` or `balanced`.",
-          "type": "string"
-        },
-        "pareto_trial_ids": {
-          "default": [],
-          "description": "Trials not dominated on (goodput, p99, cost, throttling).",
-          "items": {
-            "format": "uint64",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "type": "array"
-        },
-        "recommendation": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Recommendation"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "The recommended configuration: knobs, profile, code, deltas."
-        },
-        "recommended_trial_id": {
-          "description": "The trial whose knobs are recommended.",
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "safe_concurrency_count": {
-          "description": "The capacity model's concurrency within the safety margin.",
-          "format": "uint64",
-          "minimum": 0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "throttle_ceiling_count": {
-          "description": "Lowest concurrency that exceeded the throttle budget.",
-          "format": "uint64",
-          "minimum": 0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "trials": {
-          "items": {
-            "$ref": "#/$defs/TrialRow"
-          },
-          "type": "array"
-        },
-        "winner_trial": {
-          "description": "The recommendation's confirmation run.",
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        }
-      },
-      "required": [
-        "objective",
-        "metric_unit",
-        "trials",
-        "baseline_trial",
-        "recommended_trial_id",
-        "winner_trial",
-        "baseline_feasible",
-        "headline",
-        "max_throttle_ratio",
-        "pareto_trial_ids",
-        "no_feasible_trial",
-        "notes"
-      ],
-      "type": "object"
+      ]
     },
     "VerbBreakdown": {
       "properties": {
@@ -4550,66 +4005,6 @@
         {
           "const": "critical",
           "description": "Critical findings or a breached SLA.",
-          "type": "string"
-        }
-      ]
-    },
-    "Verification": {
-      "description": "How to test a finding's advice (design v4 §5).",
-      "properties": {
-        "command": {
-          "description": "`oprobe verify RUN CODE`: replays the run with and without the change and judges it.",
-          "type": "string"
-        },
-        "description": {
-          "description": "The hypothesis in words.",
-          "type": "string"
-        },
-        "expect": {
-          "description": "What the change should do (filled by the findings that can predict it).",
-          "items": {
-            "$ref": "#/$defs/Expectation"
-          },
-          "type": "array"
-        },
-        "overrides": {
-          "$ref": "#/$defs/Overrides",
-          "description": "The change to the run's spec."
-        },
-        "replay": {
-          "description": "The changed run as a self-contained `oprobe run TARGET …` command (no stored run\nneeded).",
-          "type": "string"
-        },
-        "rerun": {
-          "description": "`oprobe run --from RUN --set …`: the changed run alone.",
-          "type": "string"
-        }
-      },
-      "required": [
-        "description",
-        "overrides",
-        "command",
-        "rerun",
-        "replay"
-      ],
-      "type": "object"
-    },
-    "VerifyOutcome": {
-      "description": "What `verify` concluded about one hypothesis.",
-      "oneOf": [
-        {
-          "const": "confirmed",
-          "description": "The change moved the metrics as expected.",
-          "type": "string"
-        },
-        {
-          "const": "refuted",
-          "description": "The change did not help (or made things worse).",
-          "type": "string"
-        },
-        {
-          "const": "inconclusive",
-          "description": "Noise or too few samples to tell.",
           "type": "string"
         }
       ]
@@ -4942,22 +4337,26 @@
       "type": "object"
     },
     {
-      "description": "A diagnosis item (design §1).",
+      "description": "A finding (design v6 §3 \"Explain\"): a cause, the evidence (the requests themselves) and\n**one** OpenDAL remedy. No sizing numbers: a single run varies no load (T1, T2); `oprobe\nprove` sizes the remedy.",
       "properties": {
-        "advice": {
-          "description": "What to change.",
-          "type": "string"
-        },
         "cause": {
           "description": "One sentence: what is wrong.",
           "type": "string"
         },
         "code": {
-          "description": "Stable code, e.g. `throttling`, `cold_connections`.",
+          "description": "Stable code ([`crate::analysis::catalog`]), e.g. `throttling`, `tail_stragglers`.",
           "type": "string"
+        },
+        "confidence": {
+          "$ref": "#/$defs/Confidence",
+          "default": "low",
+          "description": "How sure the cause is: `high` only when the limit model explains most of the effect\nand agrees across the run's halves (T8)."
         },
         "evidence": {
           "$ref": "#/$defs/Evidence"
+        },
+        "remedy": {
+          "$ref": "#/$defs/Remedy"
         },
         "severity": {
           "$ref": "#/$defs/Severity"
@@ -4965,83 +4364,53 @@
         "type": {
           "const": "finding",
           "type": "string"
-        },
-        "verification": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Verification"
-            },
-            {
-              "type": "null"
-            }
-          ]
         }
       },
       "required": [
         "type",
         "code",
         "severity",
+        "confidence",
         "cause",
         "evidence",
-        "advice"
+        "remedy"
       ],
       "type": "object"
     },
     {
-      "description": "One tuner trial.",
+      "description": "One trial run of a prove (an event as it finishes, and a row of the result).",
       "properties": {
         "error_ratio": {
+          "description": "Operations that failed for reasons other than throttling, per operation.",
           "format": "double",
           "type": "number"
         },
         "feasible": {
+          "description": "Within `--max-throttle` and the SLA's error ratio.",
           "type": "boolean"
         },
-        "id": {
+        "goodput_ops_per_s": {
+          "format": "double",
+          "type": "number"
+        },
+        "kind": {
+          "$ref": "#/$defs/TrialKind"
+        },
+        "ops_count": {
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
-        },
-        "knobs": {
-          "$ref": "#/$defs/KnobValues"
-        },
-        "mib_per_s": {
-          "format": "double",
-          "type": "number"
-        },
-        "note": {
-          "type": "string"
-        },
-        "ops_per_s": {
-          "description": "Successful operations per second.",
-          "format": "double",
-          "type": "number"
-        },
-        "p50_ms": {
-          "format": "double",
-          "type": "number"
         },
         "p99_ms": {
           "format": "double",
           "type": "number"
         },
-        "peak_inflight_count": {
-          "description": "Requests in flight at the trial's peak.",
+        "pair": {
+          "description": "The A/B pair (0-based) of a baseline or candidate trial.",
           "format": "uint64",
           "minimum": 0,
-          "type": "integer"
-        },
-        "peak_inflight_per_op_count": {
-          "description": "The most requests one operation had in flight at once (maximum over operations).",
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "rate_per_s": {
-          "description": "The pace of an open-loop trial (operations per second).",
-          "format": "double",
           "type": [
-            "number",
+            "integer",
             "null"
           ]
         },
@@ -5050,47 +4419,43 @@
           "minimum": 0,
           "type": "integer"
         },
-        "stage": {
+        "run_id": {
+          "description": "The stored trial run (a child of the prove).",
           "type": "string"
         },
-        "throttled_op_ratio": {
-          "description": "Operations with ≥ 1 throttled response / operations.",
-          "format": "double",
-          "type": "number"
-        },
-        "throttled_request_ratio": {
-          "description": "Throttled responses / requests (the throttle budget applies to this).",
-          "format": "double",
-          "type": "number"
-        },
-        "throttled_responses_count": {
+        "throttled_count": {
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
+        "throttled_request_ratio": {
+          "format": "double",
+          "type": "number"
+        },
         "type": {
           "const": "trial",
           "type": "string"
+        },
+        "value": {
+          "description": "The sized value of a sizing trial (or the candidate's), as `--set` writes it.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
         "type",
-        "id",
-        "stage",
-        "knobs",
-        "ops_per_s",
-        "mib_per_s",
-        "p50_ms",
+        "kind",
+        "run_id",
+        "goodput_ops_per_s",
         "p99_ms",
-        "error_ratio",
-        "throttled_request_ratio",
-        "throttled_op_ratio",
-        "throttled_responses_count",
+        "ops_count",
         "requests_count",
-        "peak_inflight_count",
-        "peak_inflight_per_op_count",
-        "feasible",
-        "note"
+        "throttled_count",
+        "throttled_request_ratio",
+        "error_ratio",
+        "feasible"
       ],
       "type": "object"
     },

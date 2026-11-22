@@ -37,15 +37,6 @@
       ],
       "type": "string"
     },
-    "Confidence": {
-      "description": "How far to trust the estimate.",
-      "enum": [
-        "low",
-        "medium",
-        "high"
-      ],
-      "type": "string"
-    },
     "Interval": {
       "description": "An estimate with a confidence interval.",
       "properties": {
@@ -66,76 +57,6 @@
         "estimate",
         "low",
         "high"
-      ],
-      "type": "object"
-    },
-    "Method": {
-      "description": "How a [`MetricStat`] interval was computed.",
-      "oneOf": [
-        {
-          "const": "block_bootstrap",
-          "description": "One run per side: block bootstrap over per-second windows.",
-          "type": "string"
-        },
-        {
-          "const": "runs_t",
-          "description": "Several runs per side: a t-interval over the per-run values.",
-          "type": "string"
-        },
-        {
-          "const": "unavailable",
-          "description": "Too few samples: point estimates only, never significant.",
-          "type": "string"
-        }
-      ]
-    },
-    "MetricStat": {
-      "description": "A headline metric with confidence intervals.",
-      "properties": {
-        "baseline": {
-          "$ref": "#/$defs/Interval"
-        },
-        "candidate": {
-          "$ref": "#/$defs/Interval"
-        },
-        "change": {
-          "$ref": "#/$defs/Interval",
-          "description": "Relative change of the candidate (ratio; +0.1 = 10 % higher), with its 95 % interval."
-        },
-        "confidence": {
-          "$ref": "#/$defs/Confidence"
-        },
-        "method": {
-          "$ref": "#/$defs/Method"
-        },
-        "metric": {
-          "description": "`p50_ms`, `p99_ms`, `ops_per_s`.",
-          "type": "string"
-        },
-        "noise_floor_ratio": {
-          "description": "Changes smaller than this are noise for this target and workload.",
-          "format": "double",
-          "type": "number"
-        },
-        "significant": {
-          "description": "The 95 % interval excludes zero and the change exceeds the noise floor.",
-          "type": "boolean"
-        },
-        "unit": {
-          "description": "Unit of `baseline` and `candidate`.",
-          "type": "string"
-        }
-      },
-      "required": [
-        "metric",
-        "unit",
-        "baseline",
-        "candidate",
-        "change",
-        "noise_floor_ratio",
-        "significant",
-        "method",
-        "confidence"
       ],
       "type": "object"
     },
@@ -182,37 +103,6 @@
       ],
       "type": "object"
     },
-    "Overrides": {
-      "description": "A change to a run: operator paths, workload and SLA keys, and the label. Built with\n[`Overrides::set`], which validates.",
-      "properties": {
-        "label": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "operator": {
-          "additionalProperties": {
-            "type": "string"
-          },
-          "description": "Operator paths (`layers.retry.max_times`, `read.gap`, `options.region`, …).",
-          "type": "object"
-        },
-        "sla": {
-          "additionalProperties": {
-            "type": "string"
-          },
-          "type": "object"
-        },
-        "workload": {
-          "additionalProperties": {
-            "type": "string"
-          },
-          "type": "object"
-        }
-      },
-      "type": "object"
-    },
     "ProveObjective": {
       "description": "What prove judges a change on.",
       "oneOf": [
@@ -223,10 +113,87 @@
         },
         {
           "const": "p99",
-          "description": "The worst per-operation p99 latency.",
+          "description": "The p99 operation latency.",
           "type": "string"
         }
       ]
+    },
+    "ProveTrial": {
+      "description": "One trial run of a prove (an event as it finishes, and a row of the result).",
+      "properties": {
+        "error_ratio": {
+          "description": "Operations that failed for reasons other than throttling, per operation.",
+          "format": "double",
+          "type": "number"
+        },
+        "feasible": {
+          "description": "Within `--max-throttle` and the SLA's error ratio.",
+          "type": "boolean"
+        },
+        "goodput_ops_per_s": {
+          "format": "double",
+          "type": "number"
+        },
+        "kind": {
+          "$ref": "#/$defs/TrialKind"
+        },
+        "ops_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "p99_ms": {
+          "format": "double",
+          "type": "number"
+        },
+        "pair": {
+          "description": "The A/B pair (0-based) of a baseline or candidate trial.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "requests_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "run_id": {
+          "description": "The stored trial run (a child of the prove).",
+          "type": "string"
+        },
+        "throttled_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "throttled_request_ratio": {
+          "format": "double",
+          "type": "number"
+        },
+        "value": {
+          "description": "The sized value of a sizing trial (or the candidate's), as `--set` writes it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "kind",
+        "run_id",
+        "goodput_ops_per_s",
+        "p99_ms",
+        "ops_count",
+        "requests_count",
+        "throttled_count",
+        "throttled_request_ratio",
+        "error_ratio",
+        "feasible"
+      ],
+      "type": "object"
     },
     "ProveVerdict": {
       "description": "The verdict on the objective.",
@@ -236,31 +203,111 @@
         "inconclusive"
       ],
       "type": "string"
+    },
+    "SecondaryMetric": {
+      "description": "A secondary metric: shown, never decisive.",
+      "properties": {
+        "baseline": {
+          "description": "Mean over the baseline trials (in the metric's unit).",
+          "format": "double",
+          "type": "number"
+        },
+        "candidate": {
+          "description": "Mean over the candidate trials.",
+          "format": "double",
+          "type": "number"
+        },
+        "change": {
+          "$ref": "#/$defs/Interval",
+          "description": "Relative change (log ratio) for positive metrics, absolute difference (Newcombe) for\nshares; always within range."
+        },
+        "metric": {
+          "description": "`p99_ms`, `goodput_ops_per_s`, `throttled_request_ratio`, `error_ratio`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "metric",
+        "baseline",
+        "candidate",
+        "change"
+      ],
+      "type": "object"
+    },
+    "Sizing": {
+      "description": "The sizing step: the path, the values tried and the knee.",
+      "properties": {
+        "feasible": {
+          "description": "Some value met `--max-throttle` (otherwise the least throttled one was chosen).",
+          "type": "boolean"
+        },
+        "path": {
+          "description": "The sized operator path.",
+          "type": "string"
+        },
+        "start": {
+          "description": "Where the search started and why.",
+          "type": "string"
+        },
+        "unmeasured": {
+          "description": "Why no trial ran (the value was taken from the evidence instead).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "value": {
+          "description": "The chosen value (the knee), as `--set` writes it.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "value",
+        "start",
+        "feasible"
+      ],
+      "type": "object"
+    },
+    "TrialKind": {
+      "description": "What a trial was for.",
+      "oneOf": [
+        {
+          "const": "sizing",
+          "description": "A sizing trial of the bracket search (the change at `value`).",
+          "type": "string"
+        },
+        {
+          "const": "baseline",
+          "description": "The current operator (A).",
+          "type": "string"
+        },
+        {
+          "const": "candidate",
+          "description": "The changed operator (B).",
+          "type": "string"
+        }
+      ]
     }
   },
   "$id": "https://github.com/hxddh/oprobe/schemas/6/prove.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "The result of `oprobe prove -o json`: the verdict on the objective and the operator diff",
   "properties": {
-    "baseline_run_ids": {
-      "items": {
-        "type": "string"
-      },
-      "type": "array"
-    },
-    "candidate_run_ids": {
-      "items": {
-        "type": "string"
-      },
-      "type": "array"
-    },
     "change": {
-      "$ref": "#/$defs/Overrides",
-      "description": "The change, as `--set` pairs."
+      "description": "The change, as `PATH=VALUE` pairs (the sized value included).",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
     },
     "diff": {
       "$ref": "#/$defs/OperatorDiff",
       "description": "The operator change as Rust and TOML."
+    },
+    "environment": {
+      "description": "Where it was validated (design v6 D3): the scheme and target.",
+      "type": "string"
     },
     "finding": {
       "description": "The finding whose remedy was proven (absent for `--with` alone).",
@@ -269,10 +316,25 @@
         "null"
       ]
     },
+    "max_throttle_ratio": {
+      "format": "double",
+      "type": "number"
+    },
     "next": {
       "description": "Suggested next steps.",
       "items": {
         "$ref": "#/$defs/NextStep"
+      },
+      "type": "array"
+    },
+    "noise_floor_ratio": {
+      "description": "The A/A noise floor: the per-pair spread of the objective's log ratio.",
+      "format": "double",
+      "type": "number"
+    },
+    "notes": {
+      "items": {
+        "type": "string"
       },
       "type": "array"
     },
@@ -281,17 +343,21 @@
     },
     "objective_delta": {
       "$ref": "#/$defs/Interval",
-      "description": "Relative change of the objective (candidate vs baseline), with its 95 % interval."
+      "description": "Relative change of the objective (candidate vs baseline) with its 95 % interval,\nsigned in the metric's own direction (goodput +: more; p99 −: faster)."
     },
     "operator_ref": {
       "description": "The run's operator as given.",
       "type": "string"
     },
     "pairs_count": {
-      "description": "Interleaved baseline / candidate pairs that ran.",
+      "description": "Interleaved A/B pairs that ran.",
       "format": "uint64",
       "minimum": 0,
       "type": "integer"
+    },
+    "prove_id": {
+      "description": "This prove (its trials are runs with this `parent_id`).",
+      "type": "string"
     },
     "run_id": {
       "description": "The run whose operator was changed.",
@@ -300,13 +366,26 @@
     "secondary": {
       "description": "The other metrics (shown, never decisive).",
       "items": {
-        "$ref": "#/$defs/MetricStat"
+        "$ref": "#/$defs/SecondaryMetric"
       },
       "type": "array"
     },
-    "significant": {
-      "description": "The change exceeded the noise floor and its interval excludes zero.",
-      "type": "boolean"
+    "sizing": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Sizing"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "trials": {
+      "description": "Every trial: sizing, then the A/B pairs.",
+      "items": {
+        "$ref": "#/$defs/ProveTrial"
+      },
+      "type": "array"
     },
     "verdict": {
       "$ref": "#/$defs/ProveVerdict"
@@ -320,17 +399,19 @@
     }
   },
   "required": [
+    "prove_id",
     "run_id",
     "operator_ref",
+    "environment",
     "change",
     "objective",
     "verdict",
     "objective_delta",
-    "significant",
+    "noise_floor_ratio",
     "pairs_count",
-    "baseline_run_ids",
-    "candidate_run_ids",
+    "max_throttle_ratio",
     "secondary",
+    "trials",
     "diff",
     "next",
     "warnings"

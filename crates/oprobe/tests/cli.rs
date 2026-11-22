@@ -184,11 +184,28 @@ fn run_saves_the_run_and_prints_one_json_document() {
     validate("report", &s["report"]);
     assert_eq!(s["report"]["run"]["id"], id);
     assert!(s["requests_count"].as_u64().unwrap() > 0);
-    // Text output is the brief.
+    // Every finding names a 6.0 code and its next command is a real 6.0 command.
+    for f in report["findings"].as_array().unwrap() {
+        let code = f["code"].as_str().unwrap();
+        assert!(oprobe::analysis::findings::CODES.contains(&code), "{code}");
+        if let Some(n) = f["remedy"]["next"].as_str() {
+            assert!(
+                n.starts_with("oprobe prove ") || n.starts_with("oprobe show "),
+                "{n}"
+            );
+        }
+    }
+    for n in v["next"].as_array().unwrap() {
+        let cli = n["cli"].as_str().unwrap();
+        let cmd = cli.split_whitespace().nth(1).unwrap();
+        assert!(["run", "prove", "show", "lab"].contains(&cmd), "{cli}");
+    }
+    // Text output is the brief (not JSON), naming the run.
     let o = env.run(&run_args(&["memory://"], &[]));
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     let t = stdout(&o);
-    assert!(t.contains("ops/s") && t.contains("oprobe show"), "{t}");
+    assert!(serde_json::from_str::<Value>(&t).is_err());
+    assert!(t.lines().count() <= 30, "the brief is one screen: {t}");
 }
 
 #[test]
@@ -206,8 +223,42 @@ fn several_operators_run_one_after_another_on_the_same_workload() {
         runs[1]["report"]["spec"]["seed"]
     );
     assert_eq!(env.runs().len(), 2);
-    let t = stdout(&env.run(&run_args(&["memory://", "memory://"], &[])));
-    assert!(t.contains("operator") && t.contains("throttled"), "{t}");
+    // One comparison: a row per operator, and how each differs from the first.
+    let cmp = &v["comparison"];
+    let rows = cmp["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[1]["operator"], "lab://clean");
+    for k in [
+        "goodput_ops_per_s",
+        "p50_ms",
+        "p99_ms",
+        "throttled_request_ratio",
+        "failed_ops_count",
+    ] {
+        assert!(rows[0][k].is_number(), "{k}: {cmp}");
+    }
+    let d = cmp["differences"][0].as_str().unwrap();
+    assert!(d.contains("service"), "{d}");
+    // The same service with a layer changed differs in layers.
+    let op = env.path("cap.toml");
+    std::fs::write(
+        &op,
+        "url = \"memory://\"\n[layers]\nconcurrent_limit = { http = 2 }\n",
+    )
+    .unwrap();
+    let o = env.run(&run_args(
+        &["memory://", op.to_str().unwrap()],
+        &["-o", "json"],
+    ));
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let d = json(&o)["comparison"]["differences"][0]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(d.contains("layers") && !d.contains("service"), "{d}");
+    // One run alone has no comparison.
+    let o = env.run(&run_args(&["memory://"], &["-o", "json"]));
+    assert!(json(&o)["comparison"].is_null());
 }
 
 #[test]
@@ -282,8 +333,6 @@ fn show_lists_groups_and_removes_runs() {
         assert_eq!(b["by"], by);
         assert!(!b["groups"].as_array().unwrap().is_empty(), "{b}");
     }
-    let t = stdout(&env.run(&["show", "last", "--by", "stage"]));
-    assert!(t.contains("ttfb") && t.contains("p99"), "{t}");
     let detail = stdout(&env.run(&["show", "last", "--detail"]));
     assert!(detail.len() > stdout(&env.run(&["show", "last"])).len());
     let o = env.run(&["show", "--rm", &first, "-o", "json"]);
@@ -378,7 +427,7 @@ fn demo_is_run_lab_demo() {
 }
 
 #[test]
-fn prove_judges_a_change_and_renders_the_diff() {
+fn prove_judges_a_change_and_hides_its_trials() {
     let env = Env::new();
     let o = env.run(&[
         "run",
@@ -390,13 +439,20 @@ fn prove_judges_a_change_and_renders_the_diff() {
         "--preset",
         "small-files",
         "-q",
+        "-o",
+        "json",
     ]);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let run_id = json(&o)["runs"][0]["run_id"].as_str().unwrap().to_owned();
     let o = env.run(&[
         "prove",
         "last",
         "--with",
-        "layers.tail_cut=on",
+        "read.gap=1MiB",
+        "--trial",
+        "300ms",
+        "--pairs",
+        "2",
         "-o",
         "json",
         "-q",
@@ -405,20 +461,43 @@ fn prove_judges_a_change_and_renders_the_diff() {
     let v = json(&o);
     validate("prove", &v);
     assert!(["improved", "worse", "inconclusive"].contains(&v["verdict"].as_str().unwrap()));
-    assert_eq!(v["change"]["operator"]["layers.tail_cut"], "on");
-    assert!(
-        v["diff"]["rust"]
-            .as_str()
-            .unwrap()
-            .contains("+ TailCutLayer::new()"),
-        "{v}"
-    );
-    assert!(
-        v["diff"]["toml"].as_str().unwrap().contains("tail_cut"),
-        "{v}"
-    );
-    assert!(v["pairs_count"].as_u64().unwrap() >= 2);
-    // A dry run plans the replays and sends nothing.
+    assert_eq!(v["run_id"], run_id.as_str());
+    assert_eq!(v["change"][0], "read.gap=1MiB");
+    assert!(v["diff"]["toml"].as_str().unwrap().contains("gap"), "{v}");
+    assert_eq!(v["pairs_count"], 2);
+    let d = &v["objective_delta"];
+    assert!(d["low"].as_f64().unwrap() > -1.0, "never below -100 %: {d}");
+    assert!(d["low"].as_f64().unwrap() <= d["high"].as_f64().unwrap());
+    let trials = v["trials"].as_array().unwrap();
+    assert_eq!(trials.len(), 4);
+    // The trials are children of the prove: hidden from the list, and `last` is still the
+    // run the user made (U4).
+    let o = env.run(&["show", "--list", "-o", "json"]);
+    let list = json(&o);
+    validate("run-list", &list);
+    assert_eq!(list["total_count"], 1);
+    assert_eq!(list["hidden_trials_count"], 4);
+    assert_eq!(list["proves"][0]["prove_id"], v["prove_id"]);
+    let all = json(&env.run(&["show", "--list", "--all", "-o", "json"]));
+    assert_eq!(all["total_count"], 5);
+    let trial = json(&env.run(&["show", trials[0]["run_id"].as_str().unwrap(), "-o", "json"]));
+    assert_eq!(trial["report"]["run"]["parent_id"], v["prove_id"]);
+    let last = json(&env.run(&["show", "last", "-o", "json"]));
+    assert_eq!(last["report"]["run"]["id"], run_id.as_str());
+    // Removing the prove removes its trials.
+    let o = env.run(&[
+        "show",
+        "--rm",
+        v["prove_id"].as_str().unwrap(),
+        "-o",
+        "json",
+    ]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(env.runs().len(), 1);
+    // A finding the run does not have; a dry run plans and sends nothing.
+    let o = env.run(&["prove", "last", "hung_requests", "-o", "json"]);
+    assert_eq!(code(&o), 2, "{}", stdout(&o));
+    assert_eq!(error_code(&o), "usage.invalid_argument");
     let o = env.run(&[
         "prove",
         "last",
@@ -428,7 +507,14 @@ fn prove_judges_a_change_and_renders_the_diff() {
         "-o",
         "json",
     ]);
-    assert_eq!(code(&o), 2, "prove has no --dry-run flag: {}", stdout(&o));
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(
+        json(&o)["plan"]["estimated_requests_count"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert_eq!(env.runs().len(), 1);
 }
 
 #[test]
