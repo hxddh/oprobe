@@ -58,10 +58,28 @@ pub fn entries() -> Vec<Entry> {
             build: gen_for::<crate::model::Report>,
         },
         Entry {
+            name: "run",
+            description: "The result of `oprobe run -o json` (and `demo`): one run per operator, each with its report, and the comparison when there are several",
+            input: false,
+            build: gen_cmd::<crate::app::RunSet>,
+        },
+        Entry {
+            name: "plan",
+            description: "The result of `oprobe run --dry-run -o json`: the plan of every operator, nothing sent",
+            input: false,
+            build: gen_cmd::<crate::app::RunPlan>,
+        },
+        Entry {
             name: "prove",
             description: "The result of `oprobe prove -o json`: the verdict on the objective and the operator diff",
             input: false,
             build: gen_cmd::<crate::app::ProveOutput>,
+        },
+        Entry {
+            name: "prove-plan",
+            description: "The result of `oprobe prove --dry-run -o json`: the estimate of the whole proof and the plan of one trial, nothing sent",
+            input: false,
+            build: gen_cmd::<crate::app::PlanOutput>,
         },
         Entry {
             name: "show",
