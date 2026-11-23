@@ -440,6 +440,24 @@ fn settings_body(s: Store) -> View {
             mono(config).selectable(true).number_of_lines(2),
         ))
         .child(small(tr("settings.config_hint")))
+        .child(form_row(
+            "settings.storage",
+            view()
+                .flex_1()
+                .min_w(px(0.0))
+                .gap_1()
+                .child(small(tr("settings.storage_hint")))
+                .child(
+                    btn(
+                        tr("settings.storage_docs"),
+                        || Kind::Plain,
+                        || {
+                            let _ = open_url(crate::util::docs_url("docs/operator.md"));
+                        },
+                    )
+                    .test_id("settings-storage-docs"),
+                ),
+        ))
 }
 
 /// Settings as a preferences dialog (GNOME, Windows; Done on a terminal): a title bar with
@@ -505,7 +523,7 @@ fn about(s: Store) -> View {
                     tr("menu.docs"),
                     || Kind::Plain,
                     || {
-                        let _ = open_url(menus::DOCS);
+                        let _ = open_url(menus::docs());
                     },
                 )),
         )

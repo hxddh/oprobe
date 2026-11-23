@@ -378,6 +378,11 @@ impl Store {
         self.app.with(|a| a.clone())
     }
 
+    /// The `.oprobe` file of stored run `id`.
+    pub fn run_file(&self, id: &str) -> std::path::PathBuf {
+        self.app().store().run_path(id)
+    }
+
     /// Reload the run history.
     pub fn refresh(&self) {
         match data::list(&self.app()) {
