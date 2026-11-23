@@ -26,7 +26,7 @@ a `hint:` line. `--dry-run` shows the plan without sending a request.
 
 | Situation | What to do |
 |---|---|
-| leftover `oprobe-run-*` prefixes | a run was killed hard (a second Ctrl-C, OOM, power loss); delete the prefix with your usual tools |
+| leftover `oprobe-run-*` prefixes | a run was killed hard (a second Ctrl-C, OOM, power loss): the next run against the same target deletes them (it says so), except under `--read-only`; or delete the prefix with your usual tools |
 | `client_bound` on a remote store | the profiling process is the bottleneck (CPU, tiny objects); the profile's `self` section says why. Larger objects or fewer workers |
 | `oprobe` asks nothing in a script | it never prompts: pass an operator, and use `--non-interactive` to rule out redraws |
 | `cannot open a window` | no display (SSH, a server): the app opens in the terminal; Linux packages built with `--features gui` need GTK 4 |

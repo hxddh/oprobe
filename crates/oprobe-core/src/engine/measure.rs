@@ -116,6 +116,10 @@ pub struct Request {
     /// The run's spec. `None`: `RunSpec::new(&profile, target)` with the target name, else the
     /// profile's URL (the pipeline fills it before the session normalises the profile).
     pub spec: Option<RunSpec>,
+    /// Where pending-cleanup markers live (`<data>/pending`, [`crate::store::pending`]): the
+    /// run marks its prefix before its first write and sweeps what killed runs against the same
+    /// target left. `None`: no markers.
+    pub pending_dir: Option<PathBuf>,
 }
 
 impl Request {
@@ -134,8 +138,46 @@ impl Request {
             on_stage: None,
             finalize: None,
             spec: None,
+            pending_dir: None,
         }
     }
+}
+
+/// Delete what runs against this target that were killed hard left behind (their markers are
+/// unlocked), within the guard: only `oprobe-run-*` prefixes, never under `--read-only`. A
+/// prefix verified gone loses its marker; the others are tried again by the next run.
+async fn sweep_pending(
+    dir: &std::path::Path,
+    target: &str,
+    rails: &Rails,
+    admin: &opendal::Operator,
+    progress: &ProgressFn,
+) -> Vec<String> {
+    use crate::store::pending;
+    let mut notes = Vec::new();
+    if rails.read_only {
+        return notes;
+    }
+    for s in pending::stale(dir, target, &rails.run_id.to_string()) {
+        if !s.marker.sweepable() {
+            continue;
+        }
+        let prefix = s.marker.run_prefix.clone();
+        progress(crate::engine::Progress::Message(format!(
+            "deleting the test data a stopped run left under {prefix}"
+        )));
+        let c = super::cleanup::delete_prefix(admin, &prefix).await;
+        if c.verified {
+            if c.deleted > 0 {
+                notes.push(format!(
+                    "deleted {} test objects a stopped run left under {prefix}",
+                    c.deleted
+                ));
+            }
+            s.finish();
+        }
+    }
+    notes
 }
 
 /// The spec of measuring `profile` at `target_name` (or the profile's own URL).
@@ -204,8 +246,34 @@ pub async fn measure(req: Request) -> Result<Measured> {
         on_stage,
         finalize,
         spec,
+        pending_dir,
     } = req;
     let spec = spec.unwrap_or_else(|| spec_of(&profile, target_name.as_deref()));
+    // The pending-cleanup marker, before anything is written (the preflight writes).
+    let marker = match (&pending_dir, rails.read_only) {
+        (Some(_), false) => profile
+            .operator
+            .target()
+            .ok()
+            .and_then(|t| crate::store::pending::Marker::of(&t, &rails.run_prefix)),
+        _ => None,
+    };
+    let pending = match (&pending_dir, &marker) {
+        (Some(dir), Some(m)) => {
+            match crate::store::pending::Pending::create(dir, &rails.run_id.to_string(), m) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    progress(crate::engine::Progress::Message(format!(
+                        "no pending-cleanup marker ({e:#}): if this run is killed, its test data \
+                         stays under {}",
+                        rails.run_prefix
+                    )));
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
     let stage = |s: Stage| {
         if let Some(f) = &on_stage {
             f(s)
@@ -236,6 +304,12 @@ pub async fn measure(req: Request) -> Result<Measured> {
             return Err(e);
         }
     };
+    let swept = match (&pending_dir, &marker) {
+        (Some(dir), Some(m)) => {
+            sweep_pending(dir, &m.target, &rails, &session.admin, &progress).await
+        }
+        _ => Vec::new(),
+    };
     let knobs = crate::config::Knobs::of(&session.profile);
     // The run file is written while the run is in progress (design v5 §2).
     if let Some(s) = &store {
@@ -263,6 +337,13 @@ pub async fn measure(req: Request) -> Result<Measured> {
     };
     stage(Stage::CleaningUp);
     let cleanup = session.close().await;
+    // Nothing is left behind (or the user keeps it on purpose): the marker goes. Otherwise it
+    // stays, and the next run against this target deletes the prefix.
+    if let Some(p) = pending
+        && (cleanup.verified || !cleanup.enabled)
+    {
+        p.finish();
+    }
     let mut snap = res?;
     snap.integrity.verified += ok;
     snap.integrity.corrupted += bad;
@@ -312,7 +393,7 @@ pub async fn measure(req: Request) -> Result<Measured> {
         path,
         breach,
         cancelled: cancel.is_cancelled(),
-        warnings: session.warnings.clone(),
+        warnings: session.warnings.iter().cloned().chain(swept).collect(),
     })
 }
 
@@ -383,6 +464,64 @@ mod tests {
         assert_eq!(m.breach.unwrap().budget, "requests");
         assert!(m.run.report.run.interrupted);
         assert_eq!(m.run.report.verdict.exit_code, exit::BUDGET);
+    }
+
+    /// A run killed hard leaves its marker; the next run against the same target deletes its
+    /// prefix and the marker, and a run that cleans up leaves no marker (P3).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_next_run_sweeps_what_a_killed_run_left() {
+        use crate::store::pending::{Marker, Pending};
+        let data = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let pending = data.path().join("pending");
+        let url = format!("fs://{}", root.path().display());
+        let p = quick(&url);
+        let target = p.operator.target().unwrap();
+        // The killed run: objects under its prefix and an unlocked marker. A live run's
+        // prefix (its marker locked) and a prefix outside `oprobe-run-*` stay.
+        let killed = "oprobe-run-20200101-000000-dead/";
+        std::fs::create_dir_all(root.path().join(killed).join("data")).unwrap();
+        std::fs::write(root.path().join(killed).join("data/x"), b"left").unwrap();
+        let m = Marker::of(&target, killed).unwrap();
+        drop(Pending::create(&pending, "20200101-000000-dead", &m).unwrap());
+        let live_prefix = "oprobe-run-20200101-000000-0001/";
+        std::fs::create_dir_all(root.path().join(live_prefix)).unwrap();
+        std::fs::write(root.path().join(live_prefix).join("y"), b"live").unwrap();
+        let live = Pending::create(
+            &pending,
+            "20200101-000000-0001",
+            &Marker::of(&target, live_prefix).unwrap(),
+        )
+        .unwrap();
+        let mut odd = m.clone();
+        odd.run_prefix = "data/".into();
+        std::fs::create_dir_all(root.path().join("data")).unwrap();
+        std::fs::write(root.path().join("data/keep"), b"mine").unwrap();
+        drop(Pending::create(&pending, "20200101-000000-0002", &odd).unwrap());
+
+        let rails = Rails::new(&p, false, None, Budgets::default()).unwrap();
+        let own = rails.run_id.to_string();
+        let mut req = Request::new(p, rails, Cancel::new(), silent());
+        req.pending_dir = Some(pending.clone());
+        let m = measure(req).await.unwrap();
+        assert!(m.run.report.cleanup.verified, "{:?}", m.run.report.cleanup);
+        assert!(
+            !root.path().join(killed).join("data/x").exists(),
+            "the killed run's data is deleted"
+        );
+        assert!(!pending.join("20200101-000000-dead").exists());
+        assert!(
+            m.warnings.iter().any(|w| w.contains(killed)),
+            "{:?}",
+            m.warnings
+        );
+        // The run cleaned up after itself: no marker of its own.
+        assert!(!pending.join(&own).exists());
+        // A live run's data and anything outside a run prefix are never touched.
+        assert!(root.path().join(live_prefix).join("y").exists());
+        assert!(pending.join("20200101-000000-0001").exists());
+        assert!(root.path().join("data/keep").exists());
+        live.finish();
     }
 
     #[test]
