@@ -128,7 +128,7 @@ oprobe binary and has no semver promise; do not enable it.
 `oprobe.trace/6` is one JSON document, readable without oprobe:
 
 ```text
-{ "format": "oprobe.trace/6", "oprobe_trace_version": "6.0.0", "created_at": "…",
+{ "format": "oprobe.trace/6", "oprobe_trace_version": "6.1.0", "created_at": "…",
   "service": { "scheme": "s3", "name": "my-bucket", "root": "/data/" },
   "snapshot": { … }, "rows": { "ops": [], "reqs": [ … ], "info": { … }, "sampling": { … } } }
 ```
