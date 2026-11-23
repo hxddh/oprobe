@@ -12,8 +12,10 @@ pub mod data;
 mod fmt;
 mod heatmap;
 pub mod i18n;
+mod icons;
 pub mod jobs;
 mod kit;
+mod menus;
 pub mod plots;
 pub mod store;
 mod term;
@@ -114,19 +116,6 @@ pub fn log_fatal(msg: &str) {
     }
 }
 
-/// The main window: a minimum size, and on macOS the toolbar as the title bar.
-fn setup_window() {
-    use nsh_core::desktop::WindowAttributes;
-    use nsh_core::element::desktop::main_window;
-    if kit::in_terminal() {
-        return;
-    }
-    let mut attrs = WindowAttributes::default();
-    attrs.title = Some("oprobe".into());
-    attrs.min_size = Some(Some(size(px(760.0), px(480.0))));
-    main_window().set(attrs);
-}
-
 /// The root: the theme, the store, and the views in the chosen language (they are drawn
 /// again when it changes).
 #[component]
@@ -137,7 +126,7 @@ pub fn App() -> impl IntoElement {
     }
     let s = store::Store::new();
     provide_context(s);
-    setup_window();
+    views::shell::setup_window();
     nsh_core::element::desktop::on_app_quit(move || {
         store::finish_jobs();
         async {}

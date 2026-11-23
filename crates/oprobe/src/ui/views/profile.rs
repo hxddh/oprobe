@@ -16,10 +16,10 @@ use crate::ui::heatmap::heatmap;
 use crate::ui::i18n::{finding_title, tr, tr_dyn};
 use crate::ui::kit::{
     Kind, Tone, badge, body, btn, caption, empty, meter, mono, prop, section, small, stage_token,
-    strong, swatch, tile, tile_row, title, token,
+    strong, swatch, tile, tile_row, token,
 };
 use crate::ui::plots;
-use crate::ui::store::{Page, Store, store};
+use crate::ui::store::{Store, store};
 
 pub fn profile() -> impl IntoElement {
     let s = store();
@@ -65,44 +65,20 @@ fn content(s: Store, m: Rc<ProfileModel>) -> View {
         }))
 }
 
-fn head(s: Store, m: &ProfileModel) -> View {
+/// The verdict and its one-line headline (the run's id and operator are the toolbar's title).
+fn head(_s: Store, m: &ProfileModel) -> View {
     view()
-        .gap_1()
+        .flex_row()
+        .flex_wrap()
+        .items_center()
+        .gap_3()
+        .child(verdict_badge(m.verdict))
         .child(
-            view()
-                .flex_row()
-                .flex_wrap()
-                .items_center()
-                .gap_2()
-                .child(title(m.id.clone()))
-                .child(verdict_badge(m.verdict))
-                .child(view().flex_1())
-                .child(btn(
-                    tr("profile.to_operator"),
-                    || Kind::Primary,
-                    move || s.page.set(Page::Operator),
-                ))
-                .child({
-                    let id = m.id.clone();
-                    btn(
-                        tr("profile.pick"),
-                        || Kind::Plain,
-                        move || {
-                            if !s.picked.with_untracked(|p| p.contains(&id)) {
-                                s.toggle_pick(&id);
-                            }
-                            s.page.set(Page::Compare);
-                        },
-                    )
-                }),
+            body(m.headline.clone())
+                .selectable(true)
+                .flex_1()
+                .min_w(px(0.0)),
         )
-        .child(small(format!(
-            "{} · {} · {}",
-            m.operator_ref,
-            m.preset,
-            fmt::clock_s(m.window_s)
-        )))
-        .child(body(m.headline.clone()).selectable(true))
 }
 
 fn tiles(m: &ProfileModel) -> View {

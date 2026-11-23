@@ -10,72 +10,29 @@ use nsh_core::prelude::*;
 
 use super::profile::{stage_bar, verdict_badge};
 use super::shell::{fill, page};
+
 use crate::ui::chart::chart;
 use crate::ui::data::{self, ProfileModel};
 use crate::ui::fmt;
 use crate::ui::i18n::{finding_title, tr};
-use crate::ui::kit::{Kind, Tone, btn, caption, empty, mono, row_button, section, small, strong};
+use crate::ui::kit::{Tone, caption, empty, mono, section, small, strong};
 use crate::ui::plots;
-use crate::ui::store::{Store, store};
+use crate::ui::store::store;
 
 pub fn compare() -> impl IntoElement {
     let s = store();
-    page(view().child(picker(s)).child(dynamic(move || {
+    dynamic(move || {
         let (ms, loading) = (s.compared.get(), s.loading.get());
         untracked(|| {
-            if loading {
+            if loading && ms.len() < 2 {
                 empty(tr("app.loading"), "").into_element()
             } else if ms.len() < 2 {
                 empty(tr("compare.none"), tr("compare.none_hint")).into_element()
             } else {
-                view().child(table(&ms)).child(overlays(&ms)).into_element()
+                page(view().child(table(&ms)).child(overlays(&ms))).into_element()
             }
         })
-    })))
-}
-
-fn picker(s: Store) -> View {
-    section(tr("compare.pick"))
-        .child(dynamic(move || {
-            let runs = s.runs.get();
-            untracked(|| {
-                view()
-                    .flex_row()
-                    .flex_wrap()
-                    .gap_1()
-                    .children(runs.into_iter().take(24).map(|r| {
-                        let (id, id2) = (r.id.clone(), r.id.clone());
-                        let on = computed(move || s.picked.with(|p| p.contains(&id2)));
-                        let on = move || on.get();
-                        row_button(fill("runs.pick", &[&r.id]), on, move || s.toggle_pick(&id))
-                            .border_1()
-                            .border_color(move || theme().border)
-                            .child(mono(r.id.clone()))
-                            .child(
-                                small(r.operator.clone())
-                                    .number_of_lines(1)
-                                    .max_w(px(180.0)),
-                            )
-                    }))
-                    .into_element()
-            })
-        }))
-        .child(
-            btn(
-                move || {
-                    SharedString::from(fill("runs.compare_picked", &[&s.picked.with(|p| p.len())]))
-                },
-                || Kind::Primary,
-                move || {
-                    let ids = s.picked.get_untracked();
-                    if ids.len() >= 2 {
-                        s.compare(ids)
-                    }
-                },
-            )
-            .disabled(move || s.picked.with(|p| p.len() < 2))
-            .test_id("compare-go"),
-        )
+    })
 }
 
 /// Their goodput over time and latency distributions, one line per run.
