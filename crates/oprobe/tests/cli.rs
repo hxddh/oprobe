@@ -340,6 +340,15 @@ fn show_lists_groups_and_removes_runs() {
     }
     let detail = stdout(&env.run(&["show", "last", "--detail"]));
     assert!(detail.len() > stdout(&env.run(&["show", "last"])).len());
+    // The text names the run's file, to hand a teammate.
+    let file = detail
+        .lines()
+        .find_map(|l| l.strip_prefix("file: "))
+        .expect("a file: line");
+    assert!(
+        file.ends_with(".oprobe") && std::path::Path::new(file).is_file(),
+        "{file}"
+    );
     let o = env.run(&["show", "--rm", &first, "-o", "json"]);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     assert_eq!(json(&o)["removed"][0], first.as_str());

@@ -334,10 +334,18 @@ impl CommandOutput for Profile {
         if let (Some(v), Some(run)) = (&self.range, &self.full) {
             return terminal::range_section(run, v);
         }
-        match &self.full {
+        let mut o = match &self.full {
             Some(run) => terminal::render_run_with(run, self.detail),
             None => terminal::render(&self.run.report),
+        };
+        // Where the run is: the file to hand a teammate.
+        if !self.path.is_empty() {
+            if !o.ends_with('\n') {
+                o.push('\n');
+            }
+            o += &dim(&format!("file: {}\n", self.path));
         }
+        o
     }
 }
 

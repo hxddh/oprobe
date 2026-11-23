@@ -428,17 +428,22 @@ pub fn target_ref(profile: &Profile) -> String {
 /// Warnings about a workload that would run but probably not as meant (AG-9): a warmup at
 /// least as long as the measurement window spends most of the run unmeasured.
 pub fn workload_warnings(profile: &Profile) -> Vec<String> {
+    warmup_warning(profile).into_iter().collect()
+}
+
+/// The warning of a warmup at least as long as the measurement window, with the setting that
+/// shortens it (`--set warmup=…`).
+pub fn warmup_warning(profile: &Profile) -> Option<String> {
     let w = &profile.workload;
     let (warmup, window) = (w.warmup.get(), w.duration.get());
-    let mut out = Vec::new();
-    if !warmup.is_zero() && warmup >= window && w.max_ops.is_none() {
-        out.push(format!(
+    (!warmup.is_zero() && warmup >= window && w.max_ops.is_none()).then(|| {
+        format!(
             "the warmup ({}) is as long as the measurement window ({}) or longer: most of the \
-             run is not measured",
+             run is not measured; shorten it with `--set warmup=DURATION` or lengthen the window \
+             with `-d`",
             w.warmup, w.duration
-        ));
-    }
-    out
+        )
+    })
 }
 
 /// Outcome of [`preflight`].
@@ -561,6 +566,20 @@ mod sec_tests {
         ds.existing_prefix = Some("data/".into());
         p.workload.dataset = Some(ds);
         check_read_only(&p).unwrap();
+    }
+
+    /// The warmup warning names the setting that fixes it (U6).
+    #[test]
+    fn the_warmup_warning_names_its_setting() {
+        let mut p = Profile::from_url("memory://");
+        p.workload.warmup = crate::util::HumanDuration(Duration::from_secs(5));
+        p.workload.duration = crate::util::HumanDuration(Duration::from_secs(2));
+        let w = workload_warnings(&p);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("--set warmup="), "{w:?}");
+        assert_eq!(plan(&p, "x/", false, &Budgets::default()).warnings, w);
+        p.workload.warmup = crate::util::HumanDuration(Duration::from_secs(1));
+        assert!(workload_warnings(&p).is_empty());
     }
 
     #[test]

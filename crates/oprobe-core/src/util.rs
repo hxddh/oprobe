@@ -162,6 +162,20 @@ impl<'de> Deserialize<'de> for HumanDuration {
     }
 }
 
+/// A page of the documentation as this version shipped it (`docs/concepts.md#glossary` →
+/// `https://github.com/hxddh/oprobe/blob/v6.3.0/docs/concepts.md#glossary`).
+pub fn docs_url(path: &str) -> String {
+    format!(
+        "https://github.com/hxddh/oprobe/blob/v{}/{path}",
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
+/// The glossary of the terms a profile prints (goodput, TTFB, 95 % interval, …).
+pub fn glossary_url() -> String {
+    docs_url("docs/concepts.md#glossary")
+}
+
 /// Parse `"10s"`, `"500ms"`, `"1.5m"`, `"1h"`, `"250us"` or plain seconds (`"5"`); typed errors
 /// from [`crate::input::duration`].
 pub fn parse_duration(raw: &str) -> Result<Duration> {

@@ -143,8 +143,9 @@ pub fn render_width(r: &Report, width: usize) -> String {
         );
     }
     lines.push(dim(&format!(
-        "  full profile: oprobe show {} --detail",
-        v.run_id
+        "  full profile: oprobe show {} --detail · terms: {}",
+        v.run_id,
+        crate::util::glossary_url()
     )));
     let mut out = lines.join("\n");
     out.push('\n');
@@ -196,6 +197,14 @@ mod tests {
         let out = render_width(&r, 100);
         assert!(out.contains("next: oprobe prove 20261120-143005-a1b2 throttling"));
         assert!(out.contains("oprobe show 20261120-143005-a1b2 --detail"));
+        // The terms link to the glossary of this version (U5).
+        assert!(
+            out.contains(&format!(
+                "terms: https://github.com/hxddh/oprobe/blob/v{}/docs/concepts.md#glossary",
+                env!("CARGO_PKG_VERSION")
+            )),
+            "{out}"
+        );
         // At most three findings.
         assert_eq!(out.matches("remedy:").count(), 3, "{out}");
     }
