@@ -541,13 +541,14 @@ fn demo_is_run_lab_demo() {
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     let r = &json(&o)["runs"][0]["report"];
     assert_eq!(r["spec"]["operator_ref"], "lab://demo");
-    assert!(
-        r["resilience"]["throttled_responses_count"]
-            .as_u64()
-            .unwrap()
-            > 0,
-        "{r}"
-    );
+    // The demo lab's stragglers wait 250 ms for their first byte.
+    let slowest_ttfb = r["apis"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|a| a["stages"]["ttfb"]["max_ms"].as_f64())
+        .fold(0.0, f64::max);
+    assert!(slowest_ttfb >= 250.0, "{r}");
 }
 
 #[test]
