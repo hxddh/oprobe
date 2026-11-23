@@ -103,9 +103,26 @@ fn desktop_launch() -> bool {
         return unsafe { GetConsoleProcessList(ids.as_mut_ptr(), ids.len() as u32) } <= 1;
     }
     #[allow(unreachable_code)]
-    ["DESKTOP_STARTUP_ID", "XDG_ACTIVATION_TOKEN"]
-        .iter()
-        .any(|k| std::env::var_os(k).is_some_and(|v| !v.is_empty()))
+    {
+        const KEYS: [&str; 2] = ["DESKTOP_STARTUP_ID", "XDG_ACTIVATION_TOKEN"];
+        // GTK 4 stashes and unsets both before `main` (a library constructor, so that child
+        // processes do not inherit them): read the environment the process started with too.
+        KEYS.iter()
+            .any(|k| std::env::var_os(k).is_some_and(|v| !v.is_empty()))
+            || std::fs::read("/proc/self/environ").is_ok_and(|env| started_with(&env, &KEYS))
+    }
+}
+
+/// Whether a `/proc/PID/environ` block (`KEY=VALUE` entries, NUL-separated) sets any of
+/// `keys` to a non-empty value.
+fn started_with(environ: &[u8], keys: &[&str]) -> bool {
+    environ.split(|b| *b == 0).any(|e| {
+        keys.iter().any(|k| {
+            e.strip_prefix(k.as_bytes())
+                .and_then(|rest| rest.strip_prefix(b"="))
+                .is_some_and(|v| !v.is_empty())
+        })
+    })
 }
 
 /// Started from Explorer, Windows gives a console program its own console window: hide it for
@@ -144,4 +161,21 @@ fn refuse(cli: &Cli, message: &str, hint: &str) -> ExitCode {
         "s3",
     );
     ExitCode::from(crate::output::Output::new(format, true, true).error(&body))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::started_with;
+
+    #[test]
+    fn a_desktop_launch_is_read_from_the_starting_environment() {
+        let keys = ["DESKTOP_STARTUP_ID", "XDG_ACTIVATION_TOKEN"];
+        assert!(started_with(
+            b"HOME=/root\0XDG_ACTIVATION_TOKEN=abc\0",
+            &keys
+        ));
+        assert!(!started_with(b"XDG_ACTIVATION_TOKEN=\0PATH=/bin\0", &keys));
+        assert!(!started_with(b"DESKTOP_STARTUP_ID_X=1\0", &keys));
+        assert!(!started_with(b"", &keys));
+    }
 }
