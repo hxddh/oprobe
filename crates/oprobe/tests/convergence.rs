@@ -439,8 +439,8 @@ fn a_clean_lab_gets_no_invented_limit() {
 
 /// The first impression (6.3): `oprobe demo`, then `oprobe prove last` with every default — the
 /// top finding's remedy, the default objective (goodput) and no budget flag — proves
-/// `improved`. The demo's throttling costs latency, not goodput, so it ranks below the
-/// stragglers whose wait holds the lab's slots.
+/// `improved`, within `--max-throttle` (7.0: the lab's in-flight limit leaves room for the
+/// stragglers' re-issues).
 #[test]
 fn the_demo_proves_its_top_finding() {
     let env = Env::new();
@@ -463,8 +463,8 @@ fn the_demo_proves_its_top_finding() {
     let p = env.json(&["prove", "last"]);
     assert_eq!(p["finding"], "tail_stragglers", "{p:#}");
     assert_eq!(p["objective"], "goodput");
-    // A candidate that throttles over --max-throttle, and more than the baseline, is not a
-    // proof (design 7 A2): the demo's re-issued requests meet its throttle.
+    // Proven, and within --max-throttle (design 7 A2): the lab leaves room for the re-issues.
+    improved(&p);
     let ratio = |kind: &str| {
         let ts: Vec<&Value> = p["trials"]
             .as_array()
@@ -475,16 +475,10 @@ fn the_demo_proves_its_top_finding() {
         let n = |k: &str| ts.iter().map(|t| t[k].as_u64().unwrap()).sum::<u64>();
         n("throttled_count") as f64 / n("requests_count").max(1) as f64
     };
-    let (a, b) = (ratio("baseline"), ratio("candidate"));
-    if b > p["max_throttle_ratio"].as_f64().unwrap() && b > a {
-        assert_eq!(p["verdict"], "inconclusive", "{p:#}");
-        assert!(
-            p["notes"].to_string().contains("over --max-throttle"),
-            "{p:#}"
-        );
-    } else {
-        improved(&p);
-    }
+    assert!(
+        ratio("candidate") <= p["max_throttle_ratio"].as_f64().unwrap(),
+        "{p:#}"
+    );
     eprintln!(
         "demo → prove last: {} in {:.0} s ({} pairs)",
         p["objective_delta"]["estimate"],

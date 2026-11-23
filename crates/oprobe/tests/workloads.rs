@@ -434,7 +434,7 @@ async fn lab_scenarios_inject_their_faults() {
     assert!(s.resilience.server_errors > 0, "{:?}", s.resilience);
     assert!(s.resilience.network_errors > 0, "{:?}", s.resilience);
     assert!(s.resilience.retries > 0);
-    // demo: throttling above 24 concurrent requests, ~2.5% stragglers of 250 ms.
+    // demo: throttling above 40 concurrent requests (48 workers here), ~2.5% stragglers of 250 ms.
     let s = snap("lab://demo/t", 48).await;
     assert!(s.resilience.throttled_responses > 0, "{:?}", s.resilience);
     assert!(s.summary.latency.max >= 250.0, "{:?}", s.summary.latency);

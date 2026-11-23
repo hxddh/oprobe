@@ -72,8 +72,8 @@ oprobe run prod --existing data/2026/ --max-requests 50000
 
 ## `oprobe demo`
 
-`oprobe run lab://demo`, with the same workload and safety flags as `run`. The lab throttles
-above 24 requests in flight, and every 40th request is a straggler that waits 250 ms. Its default
+`oprobe run lab://demo`, with the same workload and safety flags as `run`. Every 40th request
+of the lab is a straggler that waits 250 ms, and it throttles above 40 requests in flight. Its default
 workload is small files (64 × 64 KiB) with 28 workers for 8 s; `oprobe prove last` then proves
 the top finding's remedy in about a minute.
 

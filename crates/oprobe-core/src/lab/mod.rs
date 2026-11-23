@@ -299,7 +299,7 @@ impl Scenario {
         match self {
             Scenario::Clean => "no faults: S3 semantics only",
             Scenario::Demo => {
-                "8 ms latency, 503 SlowDown above 24 concurrent requests, 2.5% stragglers (+250 ms); \
+                "8 ms latency, 2.5% stragglers (+250 ms), 503 SlowDown above 40 concurrent requests; \
                  default workload: small-files, 64 × 64 KiB, 28 workers, 0.5 s warmup, 8 s"
             }
             Scenario::Throttle => "5 ms latency, 503 SlowDown above 8 concurrent requests",
@@ -435,11 +435,13 @@ impl Scenario {
     }
 }
 
-/// Requests in flight above which `lab://demo` answers `503 SlowDown`.
-pub const DEMO_THROTTLE_ABOVE: usize = 24;
-/// Workers of the `lab://demo` default workload: more than the lab accepts at once, so it
-/// throttles, but few enough that the throttled workers' retry backoff costs less than the
-/// stragglers' wait (the demo's top finding proves on goodput, 6.3).
+/// Requests in flight above which `lab://demo` answers `503 SlowDown`. Above its workers with
+/// room for the stragglers' re-issues: the server still counts a request the client cut until it
+/// answers, so the top finding's remedy (TailCutLayer) proves without throttling (design 7 A2:
+/// a candidate over `--max-throttle` is not a proof).
+pub const DEMO_THROTTLE_ABOVE: usize = 40;
+/// Workers of the `lab://demo` default workload: below the lab's in-flight limit, so the profile
+/// is about its stragglers, and the top finding proves on goodput.
 pub const DEMO_CONCURRENCY: usize = 28;
 /// Every Nth request of `lab://demo` is a straggler.
 pub const DEMO_STRAGGLER_EVERY: usize = 40;

@@ -281,7 +281,7 @@ static EN: &[(&str, &str)] = &[
     ),
     (
         "lab.demo",
-        "Throttling above 24 requests in flight and 2.5 % slow stragglers.",
+        "2.5 % slow stragglers; throttling above 40 requests in flight.",
     ),
     ("lab.throttle", "503 SlowDown above 8 requests in flight."),
     (
@@ -825,7 +825,7 @@ static ZH: &[(&str, &str)] = &[
         "请先输入 operator：URL、op.toml 文件或 lab://demo",
     ),
     ("runs.bad_concurrency", "并发须为不小于 1 的整数"),
-    ("lab.demo", "在途请求超过 24 个时限流，2.5 % 的慢请求。"),
+    ("lab.demo", "2.5 % 的慢请求；在途请求超过 40 个时限流。"),
     ("lab.throttle", "在途请求超过 8 个时返回 503 SlowDown。"),
     ("lab.stragglers", "3 % 的请求要等 400 ms 才响应。"),
     ("lab.bandwidth", "所有响应共享 16 MiB/s。"),
