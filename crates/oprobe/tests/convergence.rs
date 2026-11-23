@@ -463,7 +463,28 @@ fn the_demo_proves_its_top_finding() {
     let p = env.json(&["prove", "last"]);
     assert_eq!(p["finding"], "tail_stragglers", "{p:#}");
     assert_eq!(p["objective"], "goodput");
-    improved(&p);
+    // A candidate that throttles over --max-throttle, and more than the baseline, is not a
+    // proof (design 7 A2): the demo's re-issued requests meet its throttle.
+    let ratio = |kind: &str| {
+        let ts: Vec<&Value> = p["trials"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|t| t["kind"] == kind)
+            .collect();
+        let n = |k: &str| ts.iter().map(|t| t[k].as_u64().unwrap()).sum::<u64>();
+        n("throttled_count") as f64 / n("requests_count").max(1) as f64
+    };
+    let (a, b) = (ratio("baseline"), ratio("candidate"));
+    if b > p["max_throttle_ratio"].as_f64().unwrap() && b > a {
+        assert_eq!(p["verdict"], "inconclusive", "{p:#}");
+        assert!(
+            p["notes"].to_string().contains("over --max-throttle"),
+            "{p:#}"
+        );
+    } else {
+        improved(&p);
+    }
     eprintln!(
         "demo → prove last: {} in {:.0} s ({} pairs)",
         p["objective_delta"]["estimate"],

@@ -8,13 +8,15 @@
 //! from Explorer (its own console) open the window.
 
 use std::io::IsTerminal;
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use crate::cli::Cli;
 use crate::output::OutputFormat;
 
-/// Start the app for a bare `oprobe`; returns the process exit code.
-pub fn bare(cli: &Cli) -> ExitCode {
+/// Start the app for a bare `oprobe` (with `file`: a run file to open, see
+/// [`crate::cli::launch_file`]); returns the process exit code.
+pub fn bare(cli: &Cli, file: Option<PathBuf>) -> ExitCode {
     if cli.output_format() == Some(OutputFormat::Json) {
         return refuse(
             cli,
@@ -22,20 +24,40 @@ pub fn bare(cli: &Cli) -> ExitCode {
             "use the commands with -o json (`oprobe --help`)",
         );
     }
+    // Where the app cannot open, the file can still be read here.
+    let show = file
+        .as_ref()
+        .map(|f| {
+            format!(
+                "\nto read the run file here: oprobe show {}",
+                crate::model::spec::shell_quote(&f.to_string_lossy())
+            )
+        })
+        .unwrap_or_default();
     if cli.non_interactive {
-        return help("the app needs an interactive terminal or a desktop");
+        return help(&format!(
+            "the app needs an interactive terminal or a desktop{show}"
+        ));
     }
     let terminal = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
-    open(cli, terminal)
+    open(cli, terminal, file, &show)
 }
 
 #[cfg(not(feature = "app"))]
-fn open(_: &Cli, _: bool) -> ExitCode {
-    help("this oprobe was built without its app; use the commands")
+fn open(_: &Cli, _: bool, _: Option<PathBuf>, show: &str) -> ExitCode {
+    help(&format!(
+        "this oprobe was built without its app; use the commands{show}"
+    ))
 }
 
 #[cfg(feature = "app")]
-fn open(cli: &Cli, terminal: bool) -> ExitCode {
+fn open(cli: &Cli, terminal: bool, file: Option<PathBuf>, show: &str) -> ExitCode {
+    if let Some(f) = file {
+        crate::ui::set_launch(crate::ui::Launch {
+            paths: None,
+            open: Some(f.to_string_lossy().into_owned()),
+        });
+    }
     let window = desktop(terminal);
     #[cfg(feature = "gui")]
     if window.is_ok() {
@@ -45,7 +67,7 @@ fn open(cli: &Cli, terminal: bool) -> ExitCode {
     if !terminal {
         let why = window.err().unwrap_or_default();
         return help(&format!(
-            "the app opens when `oprobe` runs in a terminal or on a desktop (no window: {why})"
+            "the app opens when `oprobe` runs in a terminal or on a desktop (no window: {why}){show}"
         ));
     }
     let monochrome = match cli.color {

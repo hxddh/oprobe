@@ -794,11 +794,12 @@ impl<S: Stream<Item = reqwest::Result<Bytes>>> Stream for TimedResponseBody<S> {
                     return Poll::Ready(Some(Ok(Buffer::from(b))));
                 }
                 Poll::Ready(Some(Err(err))) => {
+                    let temporary = is_temporary_error(&err);
+                    let err = err.without_url();
                     let msg = format!("response body: {err}");
                     if let Some(f) = this.fin.take() {
                         f.finish(Some(msg));
                     }
-                    let temporary = is_temporary_error(&err);
                     return Poll::Ready(Some(Err(Error::new(
                         ErrorKind::Unexpected,
                         "read data from http response",
@@ -806,7 +807,7 @@ impl<S: Stream<Item = reqwest::Result<Bytes>>> Stream for TimedResponseBody<S> {
                     .with_operation("reqwest::fetch")
                     .with_context("url", this.uri.clone())
                     .with_temporary(temporary)
-                    .set_source(err.without_url()))));
+                    .set_source(err))));
                 }
             }
         }
@@ -950,6 +951,9 @@ impl HttpTransport for FidelityTransport {
         let mut resp = match sent {
             Ok(r) => r,
             Err(err) => {
+                let temporary = is_temporary_error(&err);
+                // Never the URL: a presigned or SAS query (`?sig=`) would land in the trace.
+                let err = err.without_url();
                 let msg = format!("send http request: {err}");
                 record.error = Some(msg);
                 // Whether a pooled connection was involved is unknown; a failed connect is
@@ -963,8 +967,8 @@ impl HttpTransport for FidelityTransport {
                 return Err(Error::new(ErrorKind::Unexpected, "send http request")
                     .with_operation("reqwest::send")
                     .with_context("url", uri.to_string())
-                    .with_temporary(is_temporary_error(&err))
-                    .set_source(err.without_url()));
+                    .with_temporary(temporary)
+                    .set_source(err));
             }
         };
 
@@ -1134,5 +1138,40 @@ mod tests {
         // Everything reqwest reports about its configuration matches OpenDAL's HTTP/1.1 client.
         let strip_tls = |s: &str| s.split(", tls").next().unwrap_or(s).to_owned();
         assert_eq!(strip_tls(&ours), strip_tls(&opendal));
+    }
+
+    struct Errors(Mutex<Vec<String>>);
+
+    impl crate::Exporter for Errors {
+        fn on_request(&self, r: &RequestRecord) {
+            self.0.lock().unwrap().extend(r.error.clone());
+        }
+    }
+
+    /// A failed request records why, never the URL: an Azure SAS or presigned query carries a
+    /// signature (`?sig=`), and the trace is a file people share.
+    #[tokio::test]
+    async fn a_failed_request_never_records_its_url() {
+        let recorder = Recorder::always_on(64);
+        let errors = Arc::new(Errors(Mutex::new(Vec::new())));
+        recorder.set_exporter(errors.clone());
+        let cfg = TransportConfig {
+            proxy: Some(None),
+            ..TransportConfig::default()
+        };
+        let t = FidelityTransport::new(cfg, false, Some(recorder.clone())).unwrap();
+        // Nothing listens on port 1: the connect fails.
+        let req = Request::get("http://127.0.0.1:1/c/k?sv=2024&sig=SECRET")
+            .body(Buffer::new())
+            .unwrap();
+        assert!(t.fetch(req).await.is_err());
+        let errors = errors.0.lock().unwrap().clone();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].starts_with("send http request"), "{errors:?}");
+        let rows = format!("{:?}", recorder.take_trace());
+        for text in errors.iter().chain([&rows]) {
+            assert!(!text.contains("SECRET"), "{text}");
+            assert!(!text.contains("127.0.0.1:1/"), "{text}");
+        }
     }
 }

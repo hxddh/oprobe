@@ -57,11 +57,11 @@ impl BudgetBreach {
     pub fn message(&self) -> String {
         match self.budget.as_str() {
             "requests" => format!(
-                "request budget exceeded: {} requests (limit {})",
+                "request budget spent: {} requests (limit {})",
                 self.observed, self.limit
             ),
             "bytes" => format!(
-                "byte budget exceeded: {} transferred (limit {})",
+                "byte budget spent: {} transferred (limit {})",
                 crate::util::fmt_bytes(self.observed as u64),
                 crate::util::fmt_bytes(self.limit as u64)
             ),
@@ -127,18 +127,19 @@ impl Guard {
         *self.cancel.lock().unwrap_or_else(|e| e.into_inner()) = Some(cancel);
     }
 
-    /// Account requests and bytes (hot path: two atomic adds and a few compares).
+    /// Account requests and bytes (hot path: two atomic adds and a few compares). A budget
+    /// stops the run when it is spent: `--max-requests 500` allows 500 requests, not 501.
     #[inline]
     pub fn add(&self, requests: u64, bytes: u64) {
         let r = self.requests.fetch_add(requests, Ordering::Relaxed) + requests;
         let b = self.bytes.fetch_add(bytes, Ordering::Relaxed) + bytes;
         if let Some(max) = self.budgets.max_requests_count
-            && r > max
+            && r >= max
         {
             self.trip("requests", max as f64, r as f64);
         }
         if let Some(max) = self.budgets.max_bytes
-            && b > max
+            && b >= max
         {
             self.trip("bytes", max as f64, b as f64);
         }
@@ -410,7 +411,62 @@ pub fn plan(profile: &Profile, run_prefix: &str, read_only: bool, budgets: &Budg
         assumptions,
         target_ref: target_ref(profile),
         command: crate::model::RunSpec::new(profile, target_ref(profile)).command(),
-        warnings: workload_warnings(profile),
+        warnings: {
+            let mut w = workload_warnings(profile);
+            w.extend(budget_warnings(
+                budgets,
+                requests,
+                bytes,
+                prepare_s + window + cleanup_s,
+            ));
+            w
+        },
+    }
+}
+
+/// The budgets a plan would spend before it finishes (the run would stop there, exit 4).
+fn budget_warnings(b: &Budgets, requests: u64, bytes: u64, eta_s: f64) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(max) = b.max_requests_count
+        && requests >= max
+    {
+        out.push(format!(
+            "~{requests} requests reach the request budget ({max}): the run would stop early (raise --max-requests or shorten the run)"
+        ));
+    }
+    if let Some(max) = b.max_bytes
+        && bytes >= max
+    {
+        out.push(format!(
+            "~{} transferred reach the byte budget ({}): the run would stop early (raise --max-bytes or shorten the run)",
+            crate::util::fmt_bytes(bytes),
+            crate::util::fmt_bytes(max)
+        ));
+    }
+    if let Some(max) = b.max_duration_s
+        && eta_s > max
+    {
+        out.push(format!(
+            "an ETA of {eta_s:.0}s exceeds the duration budget ({max:.0}s): the run would stop early (raise --max-duration or shorten the run)"
+        ));
+    }
+    out
+}
+
+impl Budgets {
+    /// `≤ 500 requests · ≤ 1.0 GiB · ≤ 60s`, or `None` without a budget.
+    pub fn line(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        if let Some(n) = self.max_requests_count {
+            parts.push(format!("≤ {n} requests"));
+        }
+        if let Some(n) = self.max_bytes {
+            parts.push(format!("≤ {}", crate::util::fmt_bytes(n)));
+        }
+        if let Some(s) = self.max_duration_s {
+            parts.push(format!("≤ {s:.0}s"));
+        }
+        (!parts.is_empty()).then(|| parts.join(" · "))
     }
 }
 
@@ -515,15 +571,17 @@ mod sec_tests {
         });
         let c = Cancel::new();
         g.arm(c.clone());
-        g.add(10, 0);
+        g.add(9, 0);
         assert!(!g.tripped());
+        // The tenth request spends the budget: the run stops at the limit, not one past it.
         g.add(1, 0);
         assert!(g.tripped());
         assert!(c.is_cancelled());
         let b = g.breach().unwrap();
         assert_eq!(b.budget, "requests");
         g.add(100, 0);
-        assert_eq!(g.breach().unwrap().observed, 11.0);
+        assert_eq!(g.breach().unwrap().observed, 10.0);
+        assert_eq!(b.message(), "request budget spent: 10 requests (limit 10)");
         let e = b.to_error();
         assert_eq!(
             crate::errors::classify(&e, "s3").code,
@@ -594,5 +652,34 @@ mod sec_tests {
         assert!(pl.estimated_ops_count <= 100);
         assert!(pl.estimated_requests_count >= ds.objects as u64);
         assert!(pl.eta_s > 0.0);
+        assert!(pl.warnings.iter().all(|w| !w.contains("budget")), "{pl:?}");
+    }
+
+    /// 6.3.0 planned 6 541 requests under `--max-requests 500` without a word.
+    #[test]
+    fn a_plan_warns_when_it_would_spend_a_budget() {
+        let mut p = Profile::from_url("memory://");
+        p.workload.max_ops = Some(100);
+        let free = plan(&p, "oprobe-run-x/", false, &Budgets::default());
+        let budgets = Budgets {
+            max_requests_count: Some(free.estimated_requests_count / 2),
+            max_bytes: Some(free.estimated_bytes / 2),
+            max_duration_s: Some(free.eta_s / 2.0),
+        };
+        let pl = plan(&p, "oprobe-run-x/", false, &budgets);
+        assert_eq!(pl.budgets, budgets);
+        for flag in ["--max-requests", "--max-bytes", "--max-duration"] {
+            assert!(
+                pl.warnings.iter().any(|w| w.contains(flag)),
+                "{flag}: {pl:?}"
+            );
+        }
+        let roomy = Budgets {
+            max_requests_count: Some(free.estimated_requests_count * 2),
+            max_bytes: Some(free.estimated_bytes * 2 + 1),
+            max_duration_s: Some(free.eta_s * 2.0),
+        };
+        let pl = plan(&p, "oprobe-run-x/", false, &roomy);
+        assert!(pl.warnings.iter().all(|w| !w.contains("budget")), "{pl:?}");
     }
 }

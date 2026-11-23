@@ -279,6 +279,8 @@ impl Store {
         s.refresh();
         // A run to open, else the newest run is selected.
         match l.open {
+            // A run file the app was opened with (`oprobe RUN.oprobe`).
+            Some(p) if std::path::Path::new(&p).is_file() => s.open_file(&p),
             Some(id) => s.open_run(&id),
             None => {
                 if let Some(id) = s.runs.with_untracked(|r| r.first().map(|r| r.id.clone())) {

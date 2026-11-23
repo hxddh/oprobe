@@ -9,7 +9,8 @@ oprobe is a profiler for OpenDAL operators. Four commands: `run` (profile an ope
 workload), `prove` (A/B-test a change and print the proven layer diff), `show` (a stored run or a
 `.oprobe` file; `--list` for history) and `lab` (a local S3 with faults). `demo` is
 `run lab://demo`. Every command prints one JSON document with `-o json`; schemas are in the
-repository's `schemas/` (`report`, `prove`, `run-list`, `operator`, `error`, `events`).
+repository's `schemas/` (`run`, `plan`, `report`, `prove`, `prove-plan`, `show`, `run-list`,
+`operator`, `error`, `events`).
 
 ## Rules
 

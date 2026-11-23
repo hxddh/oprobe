@@ -1220,6 +1220,38 @@ fn paired(trials: &[ProveTrial], kind: TrialKind, pairs: u64) -> Vec<&ProveTrial
         .collect()
 }
 
+/// A candidate that throttles beyond `--max-throttle`, and more than the current operator,
+/// proves nothing: what it gained on the objective it took from a limit the service enforces
+/// (sized or not). The verdict becomes `inconclusive`, with a note saying why. A candidate
+/// that throttles less than the baseline (a cap on a hot key that the service still limits)
+/// is judged on its objective.
+fn throttle_gate(
+    verdict: ProveVerdict,
+    a_trials: &[&ProveTrial],
+    b_trials: &[&ProveTrial],
+    max_throttle: f64,
+) -> (ProveVerdict, Option<String>) {
+    let ratio = |ts: &[&ProveTrial]| {
+        let requests: u64 = ts.iter().map(|t| t.requests_count).sum();
+        let throttled: u64 = ts.iter().map(|t| t.throttled_count).sum();
+        (requests > 0).then(|| throttled as f64 / requests as f64)
+    };
+    let Some(b) = ratio(b_trials) else {
+        return (verdict, None);
+    };
+    let a = ratio(a_trials).unwrap_or(0.0);
+    if b <= max_throttle || b <= a {
+        return (verdict, None);
+    }
+    let note = format!(
+        "the changed operator throttled {:.2} % of its requests (the current one {:.2} %), over --max-throttle {:.2} %: the verdict is inconclusive",
+        b * 100.0,
+        a * 100.0,
+        max_throttle * 100.0
+    );
+    (ProveVerdict::Inconclusive, Some(note))
+}
+
 /// Mean of a trial metric.
 fn mean(ts: &[&ProveTrial], f: impl Fn(&ProveTrial) -> f64) -> f64 {
     if ts.is_empty() {
@@ -1446,6 +1478,36 @@ fn trace_hint(r: &crate::model::Report) -> String {
 }
 
 /// `oprobe prove`.
+/// A run that cannot be judged on performance (invalid, or partial and too short: its
+/// `invalid_run` finding) is no baseline: its findings are leads, not remedies to size.
+fn refuse_unjudged(run: &Run) -> Result<()> {
+    let r = &run.report;
+    let v = crate::analysis::findings::run_validity(r);
+    let why = v.unjudged(r).or_else(|| {
+        r.findings
+            .iter()
+            .find(|f| f.code == "invalid_run")
+            .map(|f| f.cause.clone())
+    });
+    let Some(why) = why else {
+        return Ok(());
+    };
+    Err(OprobeError::new(
+        ErrorCode::UsageInvalidArgument,
+        format!(
+            "run {} cannot be judged on performance: {}",
+            run.id(),
+            why.trim_start_matches("The run cannot be judged on performance: ")
+                .trim_end_matches('.')
+        ),
+    )
+    .with_hint(format!(
+        "profile the operator again until the run completes: oprobe run {}",
+        crate::model::spec::shell_quote(&r.spec.operator_ref)
+    ))
+    .into())
+}
+
 pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<ProveOutcome> {
     let run = ctx.store().load(&req.run)?;
     if run.report.is_trace() {
@@ -1467,6 +1529,7 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
         .with_hint("prove a run you made: oprobe show --list")
         .into());
     }
+    refuse_unjudged(&run)?;
     let defaults = crate::config::defaults().prove;
     let max_throttle = req
         .max_throttle_ratio
@@ -1719,6 +1782,8 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
     }
     let a_trials = paired(&t.out, TrialKind::Baseline, pairs);
     let b_trials = paired(&t.out, TrialKind::Candidate, pairs);
+    let (verdict, throttle_note) = throttle_gate(verdict, &a_trials, &b_trials, max_throttle);
+    notes.extend(throttle_note);
     let secondary = secondary(obj, &a_trials, &b_trials, floor);
     let base_spec: &OperatorSpec = &run.report.spec.profile.operator;
     let mut changed = base_spec.clone();
@@ -1817,6 +1882,74 @@ mod tests {
             budget_exceeded: pairs == 0,
             notes: vec!["the budget ran out before one pair of trials could run".into()],
         }
+    }
+
+    /// 6.3.0 proved a run interrupted after 4 s. A run that cannot be judged is refused.
+    #[test]
+    fn prove_refuses_a_run_that_cannot_be_judged() {
+        let mut run = crate::analysis::simulate::tests::straggler_run();
+        run.report.run.window_s = 5.0;
+        run.report.spec.operator_ref = "lab://demo".into();
+        refuse_unjudged(&run).unwrap();
+        crate::model::build::mark_partial(&mut run, crate::model::PartialReason::Interrupted);
+        let e = refuse_unjudged(&run).unwrap_err();
+        let b = crate::errors::classify(&e, "s3");
+        assert_eq!(b.code, ErrorCode::UsageInvalidArgument);
+        assert!(
+            b.message.contains("cannot be judged") && b.message.contains("interrupted"),
+            "{}",
+            b.message
+        );
+        assert!(!b.message.ends_with('.'), "{}", b.message);
+        assert_eq!(
+            b.hint.as_deref(),
+            Some("profile the operator again until the run completes: oprobe run lab://demo")
+        );
+    }
+
+    /// 6.3.0 said "improved" while the candidate throttled 4.36 % against a 0.10 % limit.
+    #[test]
+    fn a_candidate_over_max_throttle_is_inconclusive() {
+        let b = |requests: u64, throttled: u64| ProveTrial {
+            kind: TrialKind::Candidate,
+            pair: Some(0),
+            requests_count: requests,
+            throttled_count: throttled,
+            throttled_request_ratio: throttled as f64 / requests as f64,
+            ..trial(10.0, 5.0, true)
+        };
+        let a = [b(1000, 3), b(1000, 3)];
+        let a: Vec<&ProveTrial> = a.iter().collect();
+        let over = [b(1000, 40), b(1000, 47)];
+        let over: Vec<&ProveTrial> = over.iter().collect();
+        for v in [ProveVerdict::Improved, ProveVerdict::Worse] {
+            let (verdict, note) = throttle_gate(v, &a, &over, 0.001);
+            assert_eq!(verdict, ProveVerdict::Inconclusive);
+            let note = note.unwrap();
+            assert!(
+                note.contains("4.35 %") && note.contains("0.30 %") && note.contains("0.10 %"),
+                "{note}"
+            );
+        }
+        let within = [b(1000, 1), b(1000, 0)];
+        let within: Vec<&ProveTrial> = within.iter().collect();
+        assert_eq!(
+            throttle_gate(ProveVerdict::Improved, &a, &within, 0.001),
+            (ProveVerdict::Improved, None)
+        );
+        // Less throttled than the baseline (a hot key the service still limits): judged on
+        // the objective.
+        let hot = [b(1000, 280), b(1000, 290)];
+        let hot: Vec<&ProveTrial> = hot.iter().collect();
+        assert_eq!(
+            throttle_gate(ProveVerdict::Improved, &hot, &over, 0.001),
+            (ProveVerdict::Improved, None)
+        );
+        // No candidate ran: nothing to gate.
+        assert_eq!(
+            throttle_gate(ProveVerdict::Inconclusive, &a, &[], 0.001),
+            (ProveVerdict::Inconclusive, None)
+        );
     }
 
     #[test]
