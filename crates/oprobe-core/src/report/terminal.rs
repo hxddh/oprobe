@@ -57,8 +57,11 @@ pub fn time_share_lines(r: &Report) -> String {
     share_bars(&super::view::TimeView::of(r, None).stages)
 }
 
-/// One request of an operation that started at `op_t_us`.
-pub fn request_line(i: usize, r: &ReqRow, op_t_us: i64) -> String {
+/// One request of an operation that started at `op_t_us`, with what it recorded beyond its
+/// stages: the signals that explain a slow request on their own (error code, `Retry-After`,
+/// the HTTP/2 stream wait and flow-control stall, the CDN cache), and with `detail` every
+/// other one (round trip, retransmits, `Server-Timing`, the kernel's upload timing, region).
+pub fn request_line(i: usize, r: &ReqRow, op_t_us: i64, detail: bool) -> String {
     let t = r;
     let ms = |us: u64| fmt_ms(us as f64 / 1000.0);
     let status = if r.status == 0 {
@@ -121,14 +124,23 @@ pub fn request_line(i: usize, r: &ReqRow, op_t_us: i64) -> String {
     if let Some(e) = &r.error {
         let _ = write!(s, "  {}", red(e));
     }
+    let signals: Vec<String> = super::view::request_signals(r)
+        .iter()
+        .filter(|x| detail || x.explains())
+        .map(|x| x.text())
+        .collect();
+    if !signals.is_empty() {
+        let _ = write!(s, "  {}", yellow(&signals.join(" · ")));
+    }
     if let Some(id) = &r.request_id {
         let _ = write!(s, "  {}", dim(&format!("req-id {id}")));
     }
     s
 }
 
-/// An operation with its request timeline.
-pub fn slow_op_block(op: &OpRow, requests: &[&ReqRow], show_tree: bool) -> String {
+/// An operation with its request timeline; `detail` adds every request signal and the async
+/// call stack.
+pub fn slow_op_block(op: &OpRow, requests: &[&ReqRow], detail: bool) -> String {
     let mut out = String::new();
     let b = &op.breakdown;
     let ms = |us: u64| fmt_ms(us as f64 / 1000.0);
@@ -155,7 +167,7 @@ pub fn slow_op_block(op: &OpRow, requests: &[&ReqRow], show_tree: bool) -> Strin
         let _ = writeln!(out, "    {}", red(&format!("failed: {e}")));
     }
     for (i, r) in requests.iter().take(12).enumerate() {
-        let _ = writeln!(out, "{}", request_line(i, r, op.t_us));
+        let _ = writeln!(out, "{}", request_line(i, r, op.t_us, detail));
     }
     if requests.len() > 12 {
         let _ = writeln!(
@@ -164,7 +176,7 @@ pub fn slow_op_block(op: &OpRow, requests: &[&ReqRow], show_tree: bool) -> Strin
             dim(&format!("… {} more requests", requests.len() - 12))
         );
     }
-    if show_tree && let Some(t) = &op.await_tree {
+    if detail && let Some(t) = &op.await_tree {
         let _ = writeln!(
             out,
             "    {}",
@@ -235,6 +247,10 @@ pub fn verbs_table(verbs: &[VerbStats], detail: bool) -> String {
                     fmt_ms(v.latency.max),
                     format!("{:.2}", v.requests_per_op),
                     v.retries.to_string(),
+                    format!(
+                        "{:.1}%",
+                        crate::util::ratio(v.throttled as f64, v.count as f64) * 100.0
+                    ),
                     errors,
                 ]
             } else {
@@ -265,6 +281,7 @@ pub fn verbs_table(verbs: &[VerbStats], detail: bool) -> String {
                 "max",
                 "req/op",
                 "retries",
+                "throttled",
                 "errors",
             ],
             &rows,
@@ -288,8 +305,8 @@ pub fn verbs_table(verbs: &[VerbStats], detail: bool) -> String {
     }
 }
 
-fn status_summary(a: &ApiStats) -> String {
-    a.status
+fn status_summary(status: &[(u16, u64)]) -> String {
+    status
         .iter()
         .map(|(c, n)| {
             let label = if *c == 0 {
@@ -304,62 +321,75 @@ fn status_summary(a: &ApiStats) -> String {
         .join(" ")
 }
 
-/// Backend requests: compact columns by default (mean ttfb, p99, statuses), every stage with
-/// `detail`.
-pub fn apis_table(apis: &[ApiStats], detail: bool) -> String {
-    let rows: Vec<Vec<String>> = apis
-        .iter()
-        .map(|a| {
-            let st = &a.stages;
-            if detail {
+/// `p50/p99` of two values in ms.
+fn p50_p99(p50: f64, p99: f64) -> String {
+    format!("{}/{}", fmt_ms(p50), fmt_ms(p99))
+}
+
+/// Backend requests: compact columns by default (the app's: ttfb and total p50/p99, bytes
+/// down/up, statuses), every stage's p50/p99 with `detail`.
+pub fn apis_table(r: &Report, detail: bool) -> String {
+    if detail {
+        // Busiest first, as the compact table (`view::apis`).
+        let mut apis: Vec<&ApiStats> = r.apis.iter().filter(|a| a.count > 0).collect();
+        apis.sort_by_key(|a| std::cmp::Reverse(a.count));
+        let rows: Vec<Vec<String>> = apis
+            .into_iter()
+            .map(|a| {
+                let st = &a.stages;
+                let q = |q: &crate::trace::Quantiles| p50_p99(q.p50, q.p99);
+                let mut status: Vec<(u16, u64)> = a.status.iter().map(|(k, v)| (*k, *v)).collect();
+                status.sort_by_key(|s| std::cmp::Reverse(s.1));
                 vec![
                     a.api.label().to_owned(),
                     a.count.to_string(),
                     format!("{:.0}%", a.reused_pct),
-                    fmt_ms(st.queue.mean),
+                    q(&st.queue),
                     if st.connect.count > 0 {
-                        fmt_ms(st.connect.mean)
+                        q(&st.connect)
                     } else {
                         "-".into()
                     },
-                    fmt_ms(st.send.mean),
-                    fmt_ms(st.ttfb.mean),
-                    fmt_ms(st.body.mean),
-                    fmt_ms(st.stall.mean),
-                    fmt_ms(st.total.p99),
-                    status_summary(a),
+                    q(&st.send),
+                    q(&st.ttfb),
+                    q(&st.body),
+                    q(&st.stall),
+                    q(&st.total),
+                    format!("{}/{}", fmt_bytes(a.bytes_down), fmt_bytes(a.bytes_up)),
+                    status_summary(&status),
                 ]
-            } else {
-                vec![
-                    a.api.label().to_owned(),
-                    a.count.to_string(),
-                    format!("{:.0}%", a.reused_pct),
-                    fmt_ms(st.ttfb.mean),
-                    fmt_ms(st.body.mean),
-                    fmt_ms(st.total.p99),
-                    status_summary(a),
-                ]
-            }
-        })
-        .collect();
-    if detail {
-        table(
+            })
+            .collect();
+        return table(
             &[
                 "request", "count", "warm", "queue", "connect", "send", "ttfb", "transfer",
-                "stall", "p99", "status",
+                "stall", "total", "down/up", "status",
             ],
             &rows,
             2,
-        )
-    } else {
-        table(
-            &[
-                "request", "count", "warm", "ttfb", "transfer", "p99", "status",
-            ],
-            &rows,
-            2,
-        )
+        );
     }
+    let rows: Vec<Vec<String>> = super::view::apis(r)
+        .iter()
+        .map(|a| {
+            vec![
+                a.api.clone(),
+                a.requests_count.to_string(),
+                format!("{:.0}%", a.reused_ratio * 100.0),
+                p50_p99(a.ttfb_p50_ms, a.ttfb_p99_ms),
+                p50_p99(a.total_p50_ms, a.total_p99_ms),
+                format!("{}/{}", fmt_bytes(a.down_bytes), fmt_bytes(a.up_bytes)),
+                status_summary(&a.status),
+            ]
+        })
+        .collect();
+    table(
+        &[
+            "request", "count", "warm", "ttfb", "total", "down/up", "status",
+        ],
+        &rows,
+        2,
+    )
 }
 
 /// The full report of a report without trace rows.
@@ -515,6 +545,12 @@ fn render_with(r: &Report, run: Option<&Run>, detail: bool) -> String {
             }
         ),
     );
+    let view = super::view::ProfileView::of(r, run);
+    // Resilience: the app's Retries section in one line.
+    kv(&mut out, "resilience", &{
+        let line = view.retry.line();
+        if view.retry.quiet() { dim(&line) } else { line }
+    });
     // A corrupted object or too many failed operations (the run's checks).
     if !r.verdict.sla.breaches.is_empty() {
         kv(
@@ -537,7 +573,6 @@ fn render_with(r: &Report, run: Option<&Run>, detail: bool) -> String {
         );
     }
 
-    let view = super::view::ProfileView::of(r, run);
     if !view.findings.is_empty() {
         section(&mut out, "FINDINGS");
         for f in &view.findings {
@@ -634,29 +669,29 @@ fn render_with(r: &Report, run: Option<&Run>, detail: bool) -> String {
     out.push_str(&verbs_table(&r.verbs, detail));
 
     if !r.apis.is_empty() {
-        section(
-            &mut out,
-            "BACKEND REQUESTS  (mean per request; p99 of the total)",
-        );
-        out.push_str(&apis_table(&r.apis, detail));
+        section(&mut out, "BACKEND REQUESTS  (p50/p99 per request)");
+        out.push_str(&apis_table(r, detail));
+        if let Some(w) = &view.write_path {
+            let _ = writeln!(out, "  {} {}", dim("writes"), w.line());
+        }
         if detail && r.connections.http2_requests > 0 {
             let _ = writeln!(
                 out,
                 "  {}",
                 dim(
-                    "h2: `send` ends when the body is handed to the stream; flow control shows up in ttfb"
+                    "h2: `send` ends when the body is handed to the stream; a flow-control stall is inside ttfb (`h2 flow stall` on a request, `show --by stage`)"
                 )
             );
         }
     }
 
-    let c = &r.connections;
-    if c.requests > 0 && (c.http1_requests + c.http2_requests) > 0 {
+    let c = &view.connections;
+    if c.networked() {
         section(&mut out, "CONNECTIONS");
         let _ = writeln!(
             out,
             "  {}{}",
-            super::connection_protocol(c),
+            c.protocol,
             c.proxy
                 .as_ref()
                 .map(|p| format!(" · via {p}"))
@@ -665,19 +700,31 @@ fn render_with(r: &Report, run: Option<&Run>, detail: bool) -> String {
         let _ = writeln!(
             out,
             "  {} new · {:.1}% of requests warm · peak {} in flight{}",
-            c.dialed,
-            c.reuse_pct,
-            c.peak_inflight_requests,
-            if c.dial_failures > 0 {
-                red(&format!(" · {} failed dials", c.dial_failures))
+            c.dialed_count,
+            c.reuse_ratio * 100.0,
+            c.peak_inflight_count,
+            if c.dial_failures_count > 0 {
+                red(&format!(" · {} failed dials", c.dial_failures_count))
             } else {
                 String::new()
             }
         );
-        let phases = super::dial_phases(c);
-        if !phases.is_empty() {
-            let _ = writeln!(out, "  dial p50/p99 {phases}");
+        if !c.phases.is_empty() {
+            let _ = writeln!(out, "  dial p50/p99 {}", c.phases);
         }
+        // The kernel's view: whether the network or the server is the limit.
+        if let Some(t) = &c.tcp {
+            let _ = writeln!(out, "  {} {}", dim("tcp"), t.line());
+        }
+        if detail {
+            if let Some(t) = &c.tls_handshakes {
+                let _ = writeln!(out, "  {} {}", dim("tls"), t.line());
+            }
+            if let Some(s) = &c.cold_start {
+                let _ = writeln!(out, "  {} {}", dim("cold start"), s.line());
+            }
+        }
+        let remote_addrs = &c.remote_addrs;
         if detail && !r.network.remotes.is_empty() {
             let rows: Vec<Vec<String>> = r
                 .network
@@ -699,11 +746,11 @@ fn render_with(r: &Report, run: Option<&Run>, detail: bool) -> String {
                 &rows,
                 2,
             ));
-        } else if !c.remote_addrs.is_empty() {
+        } else if !remote_addrs.is_empty() {
             let _ = writeln!(
                 out,
                 "  {}",
-                dim(&format!("remote {}", c.remote_addrs.join(", ")))
+                dim(&format!("remote {}", remote_addrs.join(", ")))
             );
         }
     }
@@ -853,6 +900,9 @@ fn render_with(r: &Report, run: Option<&Run>, detail: bool) -> String {
                 w.seed
             );
         }
+        if let Some(w) = &view.write_path {
+            let _ = writeln!(out, "  writes     {}", w.line());
+        }
         for (k, v) in &r.target.options {
             let _ = writeln!(out, "  option     {k}={v}");
         }
@@ -916,6 +966,11 @@ fn interval_label(s: f64) -> String {
     }
 }
 
+/// A count of a series the timeline may not carry (`-` when it does not).
+fn cell_u64(v: &[u64], i: usize) -> String {
+    v.get(i).map_or("-".to_owned(), u64::to_string)
+}
+
 /// The TIMELINE section of `show --detail`: one row per interval (its real length), at most
 /// [`TIMELINE_ROWS`] rows.
 pub fn timeline_section(t: &super::view::TimelineView) -> String {
@@ -954,6 +1009,14 @@ pub fn timeline_section(t: &super::view::TimelineView) -> String {
                 fmt_ms(rows_v.max_ms[i]),
                 rows_v.errors_count[i].to_string(),
                 rows_v.throttled_count[i].to_string(),
+                cell_u64(&rows_v.retries_count, i),
+                cell_u64(&rows_v.new_connections_count, i),
+                rows_v
+                    .cpu_pct
+                    .get(i)
+                    .copied()
+                    .flatten()
+                    .map_or("-".to_owned(), |c| format!("{:.0}%", c)),
             ]
         })
         .collect();
@@ -968,6 +1031,9 @@ pub fn timeline_section(t: &super::view::TimelineView) -> String {
             "max",
             "errors",
             "throttled",
+            "retries",
+            "new conns",
+            "cpu",
         ],
         &rows,
         2,
@@ -975,7 +1041,9 @@ pub fn timeline_section(t: &super::view::TimelineView) -> String {
     let _ = writeln!(
         out,
         "  {}",
-        dim("errors, throttled: counts in each row, not rates")
+        dim(
+            "errors, throttled, retries, new conns: counts in each row, not rates · cpu: % of one core"
+        )
     );
     out
 }
@@ -990,10 +1058,11 @@ pub fn spread_section(s: &super::view::SpreadView) -> String {
     section(&mut out, "SPREAD  (where the requests went)");
     let pct = |x: Option<f64>| x.map_or("-".to_owned(), |v| format!("{:.1}%", v * 100.0));
     let ms = |x: Option<f64>| x.map_or("-".to_owned(), fmt_ms);
-    let groups: [(&str, &str, &[super::view::Slice]); 4] = [
+    let groups: [(&str, &str, &[super::view::Slice]); 5] = [
         ("hot key", "of throttling", &s.hot_keys),
         ("object size", "throttled", &s.sizes),
         ("prefix", "throttled", &s.prefixes),
+        ("cold/warm", "throttled", &s.cold_warm),
         ("remote", "throttled", &s.remotes),
     ];
     for (title, thr, slices) in groups {
@@ -1313,6 +1382,78 @@ mod tests {
         }
         // No SLA line, no label.
         assert!(!text.contains("sla") && !detail.contains("sla "), "{text}");
+    }
+
+    #[test]
+    fn the_report_shows_resilience_connections_writes_and_request_signals() {
+        set(false);
+        let mut run = super::super::fixture::run();
+        let r = &mut run.report;
+        r.resilience.retries = 3;
+        r.resilience.status_503 = 12;
+        r.connections.requests = 1100;
+        r.connections.http1_requests = 1100;
+        r.network.tcp.kernel = Some(crate::net::stats::TcpKernelStats {
+            samples_count: 10,
+            connections_count: 4,
+            rtt_p50_us: 1_000,
+            rtt_p99_us: 2_000,
+            ..Default::default()
+        });
+        r.network.tls.handshakes.handshakes_count = 4;
+        r.bytes.logical_write = 1 << 20;
+        r.effective_write.write_chunk_size = 8 << 20;
+        r.apis = vec![crate::trace::ApiStats {
+            api: crate::trace::Api::GetObject,
+            count: 1100,
+            reused_pct: 99.0,
+            bytes_down: 64 << 20,
+            status: [(200, 1088), (503, 12)].into_iter().collect(),
+            stages: crate::trace::StageStats {
+                ttfb: crate::trace::Quantiles {
+                    count: 1100,
+                    p50: 3.0,
+                    p99: 12.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        }];
+        run.reqs[2].detail = Some(Box::new(crate::model::ReqDetail {
+            flow_stall_us: Some(7_000),
+            region: Some("eu-west-1".into()),
+            ..Default::default()
+        }));
+        run.report.slowest = vec![2];
+        let text = render_run(&run);
+        // Lines wrap at 80 columns: compare words.
+        let words = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        for s in [
+            "resilience 3 retries",
+            "503 ×12",
+            "BACKEND REQUESTS (p50/p99 per request)",
+            "3.00ms/12.0ms",
+            "64.0 MiB/0 B",
+            "writes part size 8.0 MiB",
+            "tcp rtt p50/p99 1.00ms/2.00ms",
+            "h2 flow stall 7.00ms",
+        ] {
+            assert!(words.contains(s), "{s}\n{text}");
+        }
+        // The long tail waits for --detail: the region of a request, the TLS handshakes.
+        assert!(!text.contains("region eu-west-1"), "{text}");
+        assert!(!text.contains("handshakes"), "{text}");
+        let detail = render_run_with(&run, true);
+        for s in [
+            "region eu-west-1",
+            "tls 4 handshakes",
+            "writes     part size 8.0 MiB",
+            "new conns",
+            "throttled",
+        ] {
+            assert!(detail.contains(s), "{s}\n{detail}");
+        }
     }
 
     #[test]

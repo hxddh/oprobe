@@ -309,6 +309,59 @@ impl ByTable {
                 0,
             );
             o += &dim("stage columns: p50/p99\n");
+            // What the requests recorded beyond their stages: the HTTP/2 stream wait (part of
+            // queue) and flow-control stall (hidden in ttfb), the kernel's upload timing, the
+            // CDN cache and the region.
+            if self.stages.iter().any(|s| s.has_signals()) {
+                let opt = |s: &Option<crate::analysis::slice::StageQ>| {
+                    s.as_ref().map_or("-".to_owned(), &q)
+                };
+                let counts = |m: &std::collections::BTreeMap<String, u64>| {
+                    if m.is_empty() {
+                        "-".to_owned()
+                    } else {
+                        m.iter()
+                            .map(|(k, n)| format!("{k}×{n}"))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    }
+                };
+                let rows: Vec<Vec<String>> = self
+                    .stages
+                    .iter()
+                    .map(|s| {
+                        vec![
+                            s.api.clone(),
+                            opt(&s.stream_wait),
+                            opt(&s.flow_stall),
+                            s.streams_max_count
+                                .map_or("-".to_owned(), |n| n.to_string()),
+                            opt(&s.send_buffered),
+                            opt(&s.upload_acked),
+                            counts(&s.cache_status_count),
+                            counts(&s.region_count),
+                        ]
+                    })
+                    .collect();
+                o += "\n";
+                o += &crate::report::style::table(
+                    &[
+                        "api",
+                        "h2 stream wait",
+                        "h2 flow stall",
+                        "streams",
+                        "send buffered",
+                        "upload acked",
+                        "cache",
+                        "region",
+                    ],
+                    &rows,
+                    0,
+                );
+                o += &dim(
+                    "request signals: p50/p99 over the requests that had them · stream wait is part of queue, flow stall is inside ttfb\n",
+                );
+            }
         }
         o
     }

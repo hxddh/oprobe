@@ -3601,12 +3601,41 @@
         "body": {
           "$ref": "#/$defs/StageQ"
         },
+        "cache_status_count": {
+          "additionalProperties": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "description": "CDN cache status (`hit`, `miss`, …) → requests.",
+          "type": "object"
+        },
         "connect": {
           "$ref": "#/$defs/StageQ",
           "description": "Requests that dialed only."
         },
+        "flow_stall": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/StageQ"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "HTTP/2: the request body waiting for flow-control window (hidden in `ttfb`), over the\nrequests that stalled."
+        },
         "queue": {
           "$ref": "#/$defs/StageQ"
+        },
+        "region_count": {
+          "additionalProperties": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "description": "The bucket's region (`x-amz-bucket-region`) → requests.",
+          "type": "object"
         },
         "requests_count": {
           "format": "uint64",
@@ -3616,14 +3645,56 @@
         "send": {
           "$ref": "#/$defs/StageQ"
         },
+        "send_buffered": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/StageQ"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Until the request body reached the kernel's send buffer."
+        },
         "stall": {
           "$ref": "#/$defs/StageQ"
+        },
+        "stream_wait": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/StageQ"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "HTTP/2: waiting for a stream slot on a connection (part of `queue`), over the requests\nthat waited."
+        },
+        "streams_max_count": {
+          "description": "The most HTTP/2 streams open on a connection when one of these requests started.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "total": {
           "$ref": "#/$defs/StageQ"
         },
         "ttfb": {
           "$ref": "#/$defs/StageQ"
+        },
+        "upload_acked": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/StageQ"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "From the request start until the server acknowledged the last request byte (kernel)."
         }
       },
       "required": [
@@ -4585,6 +4656,11 @@
           "format": "double",
           "type": "number"
         },
+        "mib_per_s": {
+          "description": "Logical bytes read and written per second.",
+          "format": "double",
+          "type": "number"
+        },
         "ops_count": {
           "format": "uint64",
           "minimum": 0,
@@ -4614,6 +4690,7 @@
           "type": "array"
         },
         "throttled_ratio": {
+          "description": "Share of the verb's operations that saw a throttled response.",
           "format": "double",
           "type": "number"
         },
@@ -4625,6 +4702,7 @@
         "verb",
         "ops_count",
         "ops_per_s",
+        "mib_per_s",
         "p50_ms",
         "p99_ms",
         "error_ratio",
