@@ -13,10 +13,14 @@
 //! layers above wrap), so OpenDAL's `RetryLayer` calls it again for every attempt. With a
 //! [`RetryNotify`] installed (`RetryLayer::with_notify(handle.retry_notify())`), the attempts of
 //! one call are one operation: a call that failed with a temporary error is parked on its task;
-//! the retry notification marks it retrying and records the backoff; the next attempt on the same
-//! task (or, for a future driven by `block_on`, the same thread) resumes it. A parked call that is not retried completes as failed (at the next call on
-//! its task, or when the handle takes a snapshot). Without the notifier every attempt is an
-//! operation of its own.
+//! the retry notification (which the retry layer sends right after the failure, before another
+//! future of the task runs) marks it retrying and records the backoff; the next attempt of the
+//! same call (verb and key) on the same task (or, for a future driven by `block_on`, the same
+//! thread) resumes it. Calls running concurrently in one task (`join_all`, `FuturesUnordered`)
+//! each keep their own parked attempt. A parked call that is not retried completes as failed
+//! (at the next call on its task, or when the handle takes a snapshot); one marked retrying whose
+//! retry never comes completes as failed once it is stale. Without the notifier every attempt is
+//! an operation of its own.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -139,7 +143,8 @@ struct Parked {
 pub struct Linker {
     /// A [`RetryNotify`] exists: temporary failures are parked.
     enabled: AtomicBool,
-    parked: Mutex<HashMap<Key, Parked>>,
+    /// Per task, its parked calls in the order they failed.
+    parked: Mutex<HashMap<Key, Vec<Parked>>>,
     /// Multi-call operations (writers, listers, …) whose last call failed temporarily: the
     /// scope a retry notification on that task belongs to.
     scopes: Mutex<HashMap<Key, Arc<OpScope>>>,
@@ -152,7 +157,7 @@ impl std::fmt::Debug for Linker {
 }
 
 impl Linker {
-    fn parked(&self) -> std::sync::MutexGuard<'_, HashMap<Key, Parked>> {
+    fn parked(&self) -> std::sync::MutexGuard<'_, HashMap<Key, Vec<Parked>>> {
         self.parked.lock().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -172,17 +177,40 @@ impl Linker {
         }
         let done: Vec<Parked> = {
             let mut p = self.parked();
-            let ids: Vec<_> = p
-                .iter()
-                .filter(|(_, x)| !x.retrying || x.ended.elapsed() > STALE_RETRY)
-                .map(|(id, _)| *id)
-                .collect();
-            ids.into_iter().filter_map(|id| p.remove(&id)).collect()
+            let mut done = Vec::new();
+            for calls in p.values_mut() {
+                done.extend(take_where(calls, |x| {
+                    !x.retrying || x.ended.elapsed() > STALE_RETRY
+                }));
+            }
+            p.retain(|_, calls| !calls.is_empty());
+            done
         };
         for x in done {
             complete(rec, x.op, x.ended, Some(x.error));
         }
     }
+
+    /// Take the parked calls of task `id` that were not retried: the retry notification
+    /// follows a failure at once, so a call still not marked retrying never will be.
+    fn take_not_retried(&self, id: Key) -> Vec<Parked> {
+        let mut p = self.parked();
+        let Some(calls) = p.get_mut(&id) else {
+            return Vec::new();
+        };
+        let done = take_where(calls, |x| !x.retrying);
+        if calls.is_empty() {
+            p.remove(&id);
+        }
+        done
+    }
+}
+
+/// Remove and return the elements of `v` matching `f`, keeping the order of the others.
+fn take_where(v: &mut Vec<Parked>, f: impl Fn(&Parked) -> bool) -> Vec<Parked> {
+    let (out, keep) = std::mem::take(v).into_iter().partition(|x| f(x));
+    *v = keep;
+    out
 }
 
 /// The retry notifier of [`crate::Handle::retry_notify`]: pass it to OpenDAL's
@@ -215,7 +243,13 @@ impl RetryNotify {
             return;
         }
         let id = key();
-        if let Some(p) = self.linker.parked().get_mut(&id) {
+        // The call that just failed on this task: the last one parked and not yet retrying.
+        if let Some(p) = self
+            .linker
+            .parked()
+            .get_mut(&id)
+            .and_then(|calls| calls.iter_mut().rev().find(|p| !p.retrying))
+        {
             p.retrying = true;
             p.op.scope.record_retry(backoff, throttled);
             return;
@@ -274,14 +308,24 @@ impl Observer {
         }
         let key_of_path = private_key(path);
         if self.linker.enabled() {
-            let parked = self.linker.parked().remove(&key());
-            if let Some(p) = parked {
-                // The retry of the same call (the retry layer calls again with the same verb
-                // and path); anything else means the parked call was not retried.
-                if p.retrying && p.op.verb == verb && p.op.key == key_of_path {
-                    return Some(p.op);
-                }
+            let id = key();
+            for p in self.linker.take_not_retried(id) {
                 complete(&self.recorder, p.op, p.ended, Some(p.error));
+            }
+            // The retry of a parked call: the retry layer calls again with the same verb and
+            // path. Other calls of the task marked retrying may be waiting out their backoff
+            // concurrently (`join_all`): they stay parked.
+            let mut parked = self.linker.parked();
+            if let Some(calls) = parked.get_mut(&id)
+                && let Some(i) = calls
+                    .iter()
+                    .position(|p| p.op.verb == verb && p.op.key == key_of_path)
+            {
+                let p = calls.remove(i);
+                if calls.is_empty() {
+                    parked.remove(&id);
+                }
+                return Some(p.op);
             }
         }
         let started = Instant::now();
@@ -307,30 +351,35 @@ impl Observer {
         let class = class_of(&st.scope, e);
         if e.is_temporary() && self.linker.enabled() {
             let id = key();
-            let evicted = {
+            // An earlier failure of a multi-call operation on this task was not retried.
+            self.linker.scopes().remove(&id);
+            let mut done = self.linker.take_not_retried(id);
+            {
                 let mut p = self.linker.parked();
-                let evicted = if p.len() >= MAX_PARKED {
+                if p.values().map(Vec::len).sum::<usize>() >= MAX_PARKED {
+                    // Full: the oldest parked call completes as failed.
                     let oldest = p
                         .iter()
-                        .filter(|(_, x)| !x.retrying)
-                        .min_by_key(|(_, x)| x.ended)
-                        .map(|(id, _)| *id);
-                    oldest.and_then(|id| p.remove(&id))
-                } else {
-                    None
-                };
-                let prev = p.insert(
-                    id,
-                    Parked {
-                        op: st,
-                        ended: end,
-                        error: class,
-                        retrying: false,
-                    },
-                );
-                (evicted, prev)
-            };
-            for x in [evicted.0, evicted.1].into_iter().flatten() {
+                        .flat_map(|(k, calls)| calls.iter().enumerate().map(move |(i, x)| (*k, i, x.ended)))
+                        .min_by_key(|(_, _, ended)| *ended)
+                        .map(|(k, i, _)| (k, i));
+                    if let Some((k, i)) = oldest
+                        && let Some(calls) = p.get_mut(&k)
+                    {
+                        done.push(calls.remove(i));
+                        if calls.is_empty() {
+                            p.remove(&k);
+                        }
+                    }
+                }
+                p.entry(id).or_default().push(Parked {
+                    op: st,
+                    ended: end,
+                    error: class,
+                    retrying: false,
+                });
+            }
+            for x in done {
                 complete(&self.recorder, x.op, x.ended, Some(x.error));
             }
             return;
@@ -351,6 +400,11 @@ impl Observer {
     /// its scope.
     fn failed_call(&self, st: &OpState, e: &Error) {
         if e.is_temporary() && self.linker.enabled() {
+            // Parked calls of this task not retried by now never will be: the notification
+            // that follows is this call's.
+            for p in self.linker.take_not_retried(key()) {
+                complete(&self.recorder, p.op, p.ended, Some(p.error));
+            }
             let mut s = self.linker.scopes();
             if s.len() < MAX_PARKED {
                 s.insert(key(), st.scope.clone());
@@ -984,15 +1038,66 @@ mod tests {
         obs.finish(st, Some(&Error::new(ErrorKind::NotFound, "no")));
         assert_eq!(rec.snapshot().summary.ops, 2);
         // A call marked retrying is resumed only by the same call: another call on the task
-        // completes it as failed and starts afresh.
+        // starts afresh (the first may be waiting out its backoff concurrently), and the
+        // abandoned call completes as failed once stale.
         let st = obs.start("stat", "a/b").unwrap();
         obs.finish(st, Some(&slow_down()));
         notify.retrying(&slow_down(), std::time::Duration::from_millis(1));
         let st = obs.start("stat", "a/other").unwrap();
         obs.finish(st, None);
         let s = rec.snapshot();
+        assert_eq!(s.summary.ops, 3);
+        assert_eq!(s.summary.failed_ops, 2, "the exhausted retry and the not-found");
+        for calls in obs.linker.parked().values_mut() {
+            for p in calls {
+                p.ended -= STALE_RETRY + std::time::Duration::from_secs(1);
+            }
+        }
+        obs.linker.flush(&rec);
+        let s = rec.snapshot();
         assert_eq!(s.summary.ops, 4);
         assert_eq!(s.summary.failed_ops, 3, "the exhausted retry, the not-found and the abandoned call");
+    }
+
+    /// Calls running concurrently in one task (`join_all`) under throttling: each call's
+    /// attempts are one operation, whatever order the attempts and retries interleave in.
+    #[tokio::test]
+    async fn concurrent_calls_in_one_task_keep_their_own_retries() {
+        let (rec, obs, notify) = linked();
+        let backoff = |ms| std::time::Duration::from_millis(ms);
+        tokio::spawn(async move {
+            // Three calls in flight; each fails, and the retry layer notifies right away.
+            let a = obs.start("stat", "a/1").unwrap();
+            let b = obs.start("read.full", "a/2").unwrap();
+            let c = obs.start("stat", "a/3").unwrap();
+            obs.finish(a, Some(&slow_down()));
+            notify.retrying(&slow_down(), backoff(1));
+            obs.finish(b, Some(&slow_down()));
+            notify.retrying(&slow_down(), backoff(2));
+            obs.finish(c, Some(&slow_down()));
+            notify.retrying(&slow_down(), backoff(4));
+            // Their retries in another order; `c` fails again and is retried once more.
+            let c = obs.start("stat", "a/3").unwrap();
+            let a = obs.start("stat", "a/1").unwrap();
+            obs.finish(c, Some(&slow_down()));
+            notify.retrying(&slow_down(), backoff(8));
+            obs.finish(a, None);
+            let b = obs.start("read.full", "a/2").unwrap();
+            let c = obs.start("stat", "a/3").unwrap();
+            obs.finish(b, None);
+            obs.finish(c, None);
+            obs.linker.flush(&rec);
+            let s = rec.snapshot();
+            assert_eq!(s.summary.ops, 3, "three calls");
+            assert_eq!(s.summary.failed_ops, 0, "every call succeeded on a retry");
+            assert_eq!(s.resilience.retries, 4);
+            assert!((s.resilience.retry_backoff_ms - 15.0).abs() < 1e-9);
+            let retries = |verb: &str| s.verbs.iter().find(|v| v.verb == verb).unwrap().retries;
+            assert_eq!(retries("stat"), 3);
+            assert_eq!(retries("read.full"), 1);
+        })
+        .await
+        .unwrap();
     }
 
     #[test]

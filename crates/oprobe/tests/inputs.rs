@@ -153,3 +153,42 @@ fn only_text_and_json_outputs_exist() {
         assert_eq!(o.status.code(), Some(2), "-o {f}");
     }
 }
+
+/// A pasted web address that is not a storage URL is refused without echoing its signature
+/// (a pre-signed URL, a SAS token) or credentials, on stdout or stderr.
+#[cfg(not(feature = "all-services"))]
+#[test]
+fn a_refused_web_address_never_echoes_its_secrets() {
+    let dir = tempfile::tempdir().unwrap();
+    for url in [
+        "https://user:hunter2@minio.local:9000/b/x?X-Amz-Signature=deadbeef1234&X-Amz-Credential=AKIAEXAMPLE",
+        "https://example.com/c/blob?sv=2024-01-01&sig=sastoken1234",
+        "https://b.s3-website-us-east-1.amazonaws.com/k?X-Amz-Signature=deadbeef1234",
+    ] {
+        let o = cmd(dir.path())
+            .args(["run", url, "-o", "json"])
+            .output()
+            .unwrap();
+        let out = String::from_utf8_lossy(&o.stdout);
+        let err = String::from_utf8_lossy(&o.stderr);
+        let v: Value = serde_json::from_str(&out).unwrap_or_else(|e| panic!("{url}: {e}: {out}"));
+        assert_eq!(v["error"]["code"], "usage.invalid_argument", "{v}");
+        assert_eq!(o.status.code(), Some(2));
+        for secret in ["hunter2", "deadbeef1234", "AKIAEXAMPLE", "sastoken1234"] {
+            assert!(!out.contains(secret), "{secret} on stdout: {out}");
+            assert!(!err.contains(secret), "{secret} on stderr: {err}");
+        }
+    }
+    // An S3 website address is not an API endpoint: no region is made of it.
+    let (_, _, e) = cli_error(
+        dir.path(),
+        &["run", "https://b.s3-website-us-east-1.amazonaws.com/k"],
+    );
+    assert!(!e.to_string().contains("region=website"), "{e}");
+    assert!(
+        e["hint"]
+            .as_str()
+            .is_some_and(|h| h.contains("s3://bucket/prefix")),
+        "{e}"
+    );
+}

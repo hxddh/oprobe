@@ -506,6 +506,22 @@ impl Session {
                 }
             }
         };
+        // The cancellation stopped work the window still had to do (before its deadline and
+        // its last operation): a budget spent then is breached, not just spent.
+        let cut_short = {
+            let started = started.clone();
+            let cancel = self.cancel.clone();
+            let guard = self.guard.clone();
+            move || {
+                if cancel.is_cancelled()
+                    && Instant::now() < deadline
+                    && !max_ops.is_some_and(|m| started.load(Ordering::Relaxed) >= m)
+                    && let Some(g) = &guard
+                {
+                    g.note_cut_short();
+                }
+            }
+        };
         let seed = self.profile.workload.seed ^ (trial << 32) ^ if measured { 0x5eed } else { 0 };
 
         let rate = opts.rate.or_else(|| {
@@ -523,6 +539,7 @@ impl Session {
                     let cum = cum.clone();
                     let stop = should_stop.clone();
                     let close = close_window.clone();
+                    let cut = cut_short.clone();
                     let started = started.clone();
                     let rec = recorder.clone();
                     let tree = tree.cloned();
@@ -560,6 +577,7 @@ impl Session {
                             // the runtime run the sampler and cancellation between operations.
                             tokio::task::yield_now().await;
                         }
+                        cut();
                         // The first worker to stop ends the window; the rest drain.
                         close();
                     });
@@ -723,6 +741,9 @@ impl Session {
                         drop(permit);
                     });
                     pending = src.next(horizon).map(|d| t0 + d);
+                }
+                if pending.is_some() {
+                    cut_short();
                 }
                 let window_end = Instant::now().min(deadline);
                 close_window();
