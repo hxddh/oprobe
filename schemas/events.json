@@ -745,6 +745,7 @@
           "type": "number"
         },
         "throttled_ratio": {
+          "description": "Share of this slice's own requests that were throttled.",
           "format": "double",
           "type": "number"
         }
@@ -1099,10 +1100,12 @@
           "type": "integer"
         },
         "share_ratio": {
+          "description": "Share of all requests.",
           "format": "double",
           "type": "number"
         },
         "throttle_share_ratio": {
+          "description": "Share of **all** throttled responses that went to this key (not the share of the key's\nown requests: compare `DimensionSlice::throttled_ratio`).",
           "format": "double",
           "type": "number"
         }
@@ -1404,6 +1407,55 @@
       "required": [
         "verified_count",
         "corrupted_count"
+      ],
+      "type": "object"
+    },
+    "LatencyHistogram": {
+      "description": "The run's whole operation latency distribution as a log-scale histogram with\n[`LatencyHistogram::BINS_PER_DECADE`] bins per decade (each bin ≈ 12 % wide): every\noperation of the window, never sampled. Only non-empty bins are listed, ascending.",
+      "properties": {
+        "bins_per_decade_count": {
+          "description": "Bins per decade of the log scale.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "counts": {
+          "description": "Operations per bin.",
+          "items": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        "lower_ms": {
+          "description": "Lower bound of each non-empty bin (ms).",
+          "items": {
+            "format": "double",
+            "type": "number"
+          },
+          "type": "array"
+        },
+        "max_ms": {
+          "description": "The slowest operation (ms).",
+          "format": "double",
+          "type": "number"
+        },
+        "upper_ms": {
+          "description": "Upper bound of each non-empty bin (ms, exclusive).",
+          "items": {
+            "format": "double",
+            "type": "number"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "bins_per_decade_count",
+        "lower_ms",
+        "upper_ms",
+        "counts",
+        "max_ms"
       ],
       "type": "object"
     },
@@ -2476,6 +2528,10 @@
         "integrity": {
           "$ref": "#/$defs/IntegrityStats"
         },
+        "latency_histogram": {
+          "$ref": "#/$defs/LatencyHistogram",
+          "description": "Every operation's latency as a fine log-scale histogram (20 bins per decade, never\nsampled): what the latency CDF is drawn from. Absent in reports before 6.3."
+        },
         "network": {
           "$ref": "#/$defs/Network"
         },
@@ -2562,6 +2618,7 @@
           "$ref": "#/$defs/TargetInfo"
         },
         "timeline": {
+          "description": "Per interval: 1 s for the first ten minutes, then 10 s. Operation counts and quantiles\nby operation start; requests, throttled responses, retries and failures by when they\nhappened (see [`TimelinePoint`]).",
           "items": {
             "$ref": "#/$defs/TimelinePoint"
           },
@@ -3636,6 +3693,7 @@
       "type": "object"
     },
     "TimelinePoint": {
+      "description": "One interval of the measurement window.\n\n**When things count.** Operation counts (`ops_*`, `ok_ops_count`, `throttled_ops_count`),\nbytes, the latency quantiles and `latency_rows_count` belong to the interval the operation\n**started** in (they describe the same operations). Events count in the interval they\n**happened** in: a request when it was sent (`requests_count`), a throttled response when\nit arrived (`throttled_count`), a retry when it was issued (`retries_count`) and a failure\nwhen the operation ended (`errors_count`) — a 503 at +7 s is drawn at +7 s, not at the\nsecond its operation began.",
       "properties": {
         "cpu_pct": {
           "description": "Client CPU in percent of one core (350 = 3.5 cores busy), when sampled in the interval.",
@@ -3646,9 +3704,16 @@
           ]
         },
         "errors_count": {
+          "description": "Operations that failed in the interval (counted when they ended).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
+        },
+        "goodput_ops_per_s": {
+          "default": 0.0,
+          "description": "Goodput: successful operations started in the interval per second (failed operations\nnever count; `ops_per_s` is the attempted rate).",
+          "format": "double",
+          "type": "number"
         },
         "inflight_peak_count": {
           "default": 0,
@@ -3694,7 +3759,22 @@
           "minimum": 0,
           "type": "integer"
         },
+        "ok_ops_count": {
+          "default": 0,
+          "description": "Operations started in the interval that succeeded.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "ops_count": {
+          "default": 0,
+          "description": "Operations started in the interval (the sample count behind its quantiles).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "ops_per_s": {
+          "description": "Operations started in the interval per second, failed ones included (the attempted\nrate; `goodput_ops_per_s` counts successes only).",
           "format": "double",
           "type": "number"
         },
@@ -3716,15 +3796,50 @@
           "format": "double",
           "type": "number"
         },
+        "requests_count": {
+          "default": 0,
+          "description": "Backend requests sent in the interval: every attempt, retries included.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "requests_per_s": {
+          "default": 0.0,
+          "description": "`requests_count` per second of the interval.",
+          "format": "double",
+          "type": "number"
+        },
+        "retries_count": {
+          "default": 0,
+          "description": "Retries issued in the interval (when the retry layer sent the next attempt).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "t_s": {
-          "description": "Start of this one-second interval, seconds from the measurement window start (the same\nconvention as `heatmap.t_buckets_s` and `oprobe analyze --by second`).",
+          "description": "Start of the interval, seconds from the measurement window start (the same convention\nas `heatmap.t_buckets_s`).",
           "format": "double",
           "type": "number"
         },
         "throttled_count": {
+          "description": "Throttled responses (429/503) received in the interval, retries included (counted when\neach response arrived). Before 6.3 this counted throttled operations by their start.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
+        },
+        "throttled_ops_count": {
+          "default": 0,
+          "description": "Operations started in the interval that saw at least one throttled response.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "verbs": {
+          "description": "The interval's counters per verb (`read`, `stat`, …), so a view can filter by verb.",
+          "items": {
+            "$ref": "#/$defs/VerbInterval"
+          },
+          "type": "array"
         }
       },
       "required": [
@@ -3740,7 +3855,14 @@
         "p999_ms",
         "max_ms",
         "inflight_peak_count",
-        "new_connections_count"
+        "new_connections_count",
+        "ops_count",
+        "ok_ops_count",
+        "goodput_ops_per_s",
+        "throttled_ops_count",
+        "requests_count",
+        "requests_per_s",
+        "retries_count"
       ],
       "type": "object"
     },
@@ -3945,6 +4067,63 @@
       "required": [
         "verb",
         "breakdown"
+      ],
+      "type": "object"
+    },
+    "VerbInterval": {
+      "description": "One verb's part of a [`TimelinePoint`], with the same time conventions: operations,\nsuccesses, latency rows and the latency sum by operation start; failures when they ended;\nthrottled responses when they arrived.",
+      "properties": {
+        "errors_count": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "latency_rows_count": {
+          "description": "Operations started in the interval per heatmap latency row (as\n`TimelinePoint::latency_rows_count`): quantiles at row resolution.",
+          "items": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        "latency_sum_ms": {
+          "default": 0.0,
+          "description": "Sum of the latencies of the operations started in the interval (mean = sum ÷ ops).",
+          "format": "double",
+          "type": "number"
+        },
+        "ok_ops_count": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "ops_count": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "throttled_count": {
+          "default": 0,
+          "description": "Throttled responses received in the interval by this verb's operations.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "verb": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "verb",
+        "ops_count",
+        "ok_ops_count",
+        "errors_count",
+        "throttled_count",
+        "latency_sum_ms"
       ],
       "type": "object"
     },
@@ -4346,18 +4525,26 @@
       "type": "object"
     },
     {
-      "description": "One second of the measurement window.",
+      "description": "One interval of the measurement window (as `report.timeline`: operations by their\nstart; failures, throttled responses, requests and retries when they happened).",
       "properties": {
         "errors_count": {
+          "description": "Operations that failed in the interval.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
+        },
+        "goodput_ops_per_s": {
+          "default": 0.0,
+          "description": "Successful operations started per second.",
+          "format": "double",
+          "type": "number"
         },
         "mib_per_s": {
           "format": "double",
           "type": "number"
         },
         "ops_per_s": {
+          "description": "Operations started per second, failed ones included.",
           "format": "double",
           "type": "number"
         },
@@ -4369,12 +4556,27 @@
           "format": "double",
           "type": "number"
         },
+        "requests_count": {
+          "default": 0,
+          "description": "Requests sent in the interval, retries included.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "retries_count": {
+          "default": 0,
+          "description": "Retries issued in the interval.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "t_s": {
           "description": "Start of the second, seconds from the window start.",
           "format": "double",
           "type": "number"
         },
         "throttled_count": {
+          "description": "Throttled responses received in the interval.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -4392,7 +4594,10 @@
         "p50_ms",
         "p99_ms",
         "errors_count",
-        "throttled_count"
+        "throttled_count",
+        "goodput_ops_per_s",
+        "requests_count",
+        "retries_count"
       ],
       "type": "object"
     },

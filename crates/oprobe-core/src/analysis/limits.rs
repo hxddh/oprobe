@@ -378,6 +378,36 @@ fn best_rate(
     best
 }
 
+/// A cap of `c` in flight serves at most about `c` requests per service time `S`: over any
+/// [`CAP_WINDOW_SERVICES`] service times, the requests a cap served stay below this multiple
+/// of what it carries (the labs' caps peak at ≈ 1.3× with service-time noise); a token
+/// bucket's burst after a lull runs well past it (≈ 2× and more).
+const CAP_RATE_RATIO: f64 = 1.5;
+/// The window of [`peak_served_ratio`], in mean service times.
+const CAP_WINDOW_SERVICES: f64 = 8.0;
+
+/// Request-rate evidence against an in-flight cap of `c` (design 6.3 A1): the most requests
+/// the service served (arrivals of served requests) within any window of
+/// [`CAP_WINDOW_SERVICES`] mean service times, as a multiple of what `c` requests in flight
+/// carry in it (`c / S` per second, Little's law), and the window (µs). A cap never serves
+/// much more than that, however blurred its client-side in-flight counts are (arrival times
+/// stay exact); a token bucket that refilled during a lull serves its whole burst at once.
+fn peak_served_ratio(obs: &[Obs], c: f64, service_s: f64) -> (f64, i64) {
+    if c <= 0.0 || service_s <= 0.0 {
+        return (0.0, 0);
+    }
+    let window_us = ((service_s * CAP_WINDOW_SERVICES * 1e6) as i64).max(1);
+    let served: Vec<i64> = obs.iter().filter(|o| !o.thr).map(|o| o.t).collect();
+    let (mut j, mut peak) = (0usize, 0usize);
+    for i in 0..served.len() {
+        while served[i] - served[j] >= window_us {
+            j += 1;
+        }
+        peak = peak.max(i + 1 - j);
+    }
+    (peak as f64 / (c * CAP_WINDOW_SERVICES), window_us)
+}
+
 /// A clean in-flight step: `(ceiling, log-likelihood, share throttled at or below, above)`.
 type Step = (u32, f64, f64, f64);
 
@@ -409,8 +439,11 @@ fn little_matches(rate: f64, service_s: f64, c: f64) -> bool {
 /// `TimeVarying` whose every segment obeys Little's law with its own service time) is evidence
 /// for the in-flight limit: the in-flight hypothesis takes its likelihood and, with fewer
 /// parameters, is selected. Returns the best such fit's log-likelihood and recall. A genuine
-/// bucket keeps its lead: its burst is not the in-flight ceiling, or throttling happens well
-/// below the step.
+/// bucket keeps its lead: its burst is not the in-flight ceiling, throttling happens well
+/// below the step, or the service served bursts at a request rate no cap of `c` carries
+/// ([`peak_served_ratio`]: with OpenDAL's default retry the workers sleep 1 s after a 503 and
+/// wake in step, so a bucket of rate `r` throttles only above ≈ r·S in flight and its fitted
+/// burst sits on the grid's floor — the request rate is what tells it from a cap).
 fn rate_restatement(obs: &[Obs], fits: &mut [Fit], step: Step) -> Option<(f64, f64)> {
     let (c, step_ll, lo_share, hi_share) = step;
     let cf = f64::from(c);
@@ -675,7 +708,39 @@ fn throttle_family(
             }
         }
     }
-    let restated = step.and_then(|st| rate_restatement(obs, &mut fits, st));
+    // Request-rate evidence (design 6.3 A1): bursts of served requests no cap of `c` carries
+    // refute the in-flight limit, whatever its step fits: it explains no more than constant
+    // throttling, and no bucket restates it.
+    let refuted = step.and_then(|(c, ..)| {
+        let s = served_service_s(obs);
+        let (peak, window_us) = peak_served_ratio(obs, f64::from(c), s);
+        (peak >= CAP_RATE_RATIO).then_some((c, peak, window_us, s))
+    });
+    if let Some((c, peak, window_us, s)) = refuted {
+        let why = format!(
+            "within {:.0} ms the service served {peak:.1}× the requests {c} in flight carry at ≈{:.1} ms each",
+            window_us as f64 / 1e3,
+            s * 1e3
+        );
+        for f in fits.iter_mut() {
+            match f.kind {
+                HypothesisKind::InflightLimit => {
+                    f.ll = bern_ll(k, n);
+                    f.explains = 0.0;
+                    f.evidence.push(format!(
+                        "refuted by the request rate: {why}; a cap never does"
+                    ));
+                }
+                HypothesisKind::RateLimit | HypothesisKind::TimeVarying => f.evidence.push(
+                    format!("not an in-flight limit of {c}: {why} (a bucket's burst)"),
+                ),
+                _ => {}
+            }
+        }
+    }
+    let restated = step
+        .filter(|_| refuted.is_none())
+        .and_then(|st| rate_restatement(obs, &mut fits, st));
     if let Some((ll, explains)) = restated
         && let Some(f) = fits
             .iter_mut()
@@ -1297,6 +1362,85 @@ mod tests {
         assert_eq!(s.kind, HypothesisKind::RateLimit, "{hs:#?}");
         let rps = s.params.requests_per_s.unwrap();
         assert!((rps - 300.0).abs() < 45.0, "{rps}");
+    }
+
+    /// Request-rate evidence: a cap never serves much more than `c / S`, however blurred the
+    /// client's in-flight counts; a bucket that refilled during a lull serves its burst at once.
+    #[test]
+    fn served_bursts_tell_a_bucket_from_a_cap() {
+        let peak = |reqs: &[ReqRow], ops: &[OpRow], c: f64| {
+            let r: Vec<&ReqRow> = reqs.iter().collect();
+            let o: Vec<&OpRow> = ops.iter().collect();
+            let (obs, _, _) = observations(&r, &o);
+            peak_served_ratio(&obs, c, served_service_s(&obs)).0
+        };
+        for (c, late) in [(24usize, 3.0), (24, 0.3), (8, 1.0), (2, 0.3)] {
+            let (reqs, ops) = closed_loop(32, 5.0, late, 100.0, 3000.0, |_, n| n < c);
+            let p = peak(&reqs, &ops, c as f64);
+            assert!(p < CAP_RATE_RATIO, "cap {c}, late {late}: {p}");
+        }
+        // Two requests in flight for 1 s (5 ms each), then a refilled burst of 20 at once.
+        let (mut reqs, mut ops) = (Vec::new(), Vec::new());
+        let mut id = 0u64;
+        let mut push = |t: f64| {
+            id += 1;
+            reqs.push(req(t, 5.0, 200, id));
+            ops.push(op(id, "k", t));
+        };
+        for i in 0..400 {
+            push(f64::from(i) * 2.5);
+        }
+        for i in 0..20 {
+            push(1000.0 + f64::from(i) * 0.05);
+        }
+        let p = peak(&reqs, &ops, 2.0);
+        assert!(p >= 2.0, "{p}");
+    }
+
+    /// `lab://ratelimit` with OpenDAL's default retry (1 s backoff, no jitter): 16 workers
+    /// against a bucket of 300/s (burst 20) spend most of their time asleep, wake in step and
+    /// throttle only above a couple of requests in flight, where a cap of ≈ r·S (Little's
+    /// law) would also throttle; the bursts the bucket serves after a lull rule the cap out.
+    #[test]
+    fn a_bucket_under_default_retry_is_a_rate_limit() {
+        for (late, seed_shift) in [(0.3, 0.0), (1.0, 0.01), (3.0, 0.02)] {
+            let (mut tokens, mut last) = (20.0f64, 0.0f64);
+            let (reqs, ops) = closed_loop(16, 5.0 + seed_shift, late, 1000.0, 3000.0, |t, _| {
+                tokens = (tokens + (t - last) / 1000.0 * 300.0).min(20.0);
+                last = t;
+                if tokens >= 1.0 {
+                    tokens -= 1.0;
+                    true
+                } else {
+                    false
+                }
+            });
+            let hs = fit(&reqs, &ops, (i64::MIN, i64::MAX), &FitInputs::default());
+            let s = selected(&hs);
+            assert!(
+                matches!(
+                    s.kind,
+                    HypothesisKind::RateLimit | HypothesisKind::TimeVarying
+                ),
+                "late {late}: {hs:#?}"
+            );
+        }
+    }
+
+    /// The default-retry client against a genuine cap of 2 in flight stays an in-flight
+    /// limit: a cap serves no bursts.
+    #[test]
+    fn a_small_cap_under_default_retry_is_an_inflight_limit() {
+        for late in [0.3, 3.0] {
+            let (reqs, ops) = closed_loop(16, 5.0, late, 1000.0, 3000.0, |_, n| n < 2);
+            let hs = fit(&reqs, &ops, (i64::MIN, i64::MAX), &FitInputs::default());
+            let s = selected(&hs);
+            assert_eq!(
+                s.kind,
+                HypothesisKind::InflightLimit,
+                "late {late}: {hs:#?}"
+            );
+        }
     }
 
     #[test]

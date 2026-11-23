@@ -151,6 +151,18 @@ fn bucket_index(secs: u64) -> usize {
     }
 }
 
+/// The interval of an event `us` after the window start. Once the window closed (`frozen` is
+/// its length), events of draining operations land in its last interval: the timeline never
+/// grows past the window.
+fn event_bucket(us: u64, frozen: u64) -> usize {
+    let us = if frozen == WINDOW_OPEN {
+        us
+    } else {
+        us.min(frozen.saturating_sub(1))
+    };
+    bucket_index(us / 1_000_000)
+}
+
 /// Start and length (s) of interval `idx`.
 fn bucket_span(idx: usize) -> (f64, f64) {
     if idx < FINE_INTERVALS {
@@ -163,11 +175,34 @@ fn bucket_span(idx: usize) -> (f64, f64) {
     }
 }
 
-struct Bucket {
+/// One verb's counters in one interval (the conventions of [`Bucket`]).
+struct VerbBucket {
+    verb: &'static str,
     ops: u64,
-    bytes: u64,
+    ok: u64,
     errors: u64,
     throttled: u64,
+    latency_us: u64,
+    heat: [u32; 20],
+}
+
+/// One interval of the timeline. Operation counts, bytes, latencies and heat rows belong to
+/// the interval the operation started in; `errors` (when the operation ended), `throttled`
+/// (when the response arrived), `requests` (when sent) and `retries` (when issued) to the
+/// interval they happened in.
+struct Bucket {
+    ops: u64,
+    ok_ops: u64,
+    bytes: u64,
+    errors: u64,
+    /// Throttled responses.
+    throttled: u64,
+    /// Operations that saw a throttled response.
+    throttled_ops: u64,
+    requests: u64,
+    retries: u64,
+    /// Per verb, in first-seen order (a handful: a linear scan beats a map).
+    verbs: Vec<VerbBucket>,
     /// Open-loop arrivals due in this interval that never started.
     missed: u64,
     /// Latencies of the interval while it is open; dropped (and its quantiles kept) once every
@@ -190,9 +225,14 @@ impl Bucket {
     fn new() -> Self {
         Self {
             ops: 0,
+            ok_ops: 0,
             bytes: 0,
             errors: 0,
             throttled: 0,
+            throttled_ops: 0,
+            requests: 0,
+            retries: 0,
+            verbs: Vec::new(),
             missed: 0,
             latency: Some(hist()),
             q_us: [0; 5],
@@ -227,6 +267,25 @@ impl Bucket {
             Some(h) => Self::qs(h),
             None => self.q_us,
         }
+    }
+
+    fn verb(&mut self, verb: &'static str) -> &mut VerbBucket {
+        let i = match self.verbs.iter().position(|v| v.verb == verb) {
+            Some(i) => i,
+            None => {
+                self.verbs.push(VerbBucket {
+                    verb,
+                    ops: 0,
+                    ok: 0,
+                    errors: 0,
+                    throttled: 0,
+                    latency_us: 0,
+                    heat: [0; 20],
+                });
+                self.verbs.len() - 1
+            }
+        };
+        &mut self.verbs[i]
     }
 }
 
@@ -798,9 +857,24 @@ impl Recorder {
             e.on_request(r);
         }
         if self.is_measuring() {
-            self.agg().record_request(r);
+            let window_start = self.window_start();
             // Unscoped: its offset is not relative to an operation; it ended just now.
-            let now_us = self.window_start().elapsed().as_micros() as i64;
+            let now_us = window_start.elapsed().as_micros() as i64;
+            {
+                let frozen = self.frozen_elapsed_us.load(Ordering::Acquire);
+                let ended = event_bucket(now_us as u64, frozen);
+                let sent = event_bucket(
+                    (now_us as u64).saturating_sub(r.timing.total_us),
+                    frozen,
+                );
+                let mut a = self.agg();
+                a.record_request(r);
+                self.ensure_bucket(&mut a, ended.max(sent), window_start);
+                a.buckets[sent].requests += 1;
+                if r.is_throttle() {
+                    a.buckets[ended].throttled += 1;
+                }
+            }
             let mut row = req_row(r.clone(), 0, 0, 1);
             row.t_us = now_us - r.timing.total_us as i64;
             if let Some(sink) = self.row_sink.get() {
@@ -1008,21 +1082,72 @@ impl Recorder {
             v.retry_us += bd[3];
             v.client_us += bd[4];
         }
-        let idx = bucket_index(at_s.max(0.0) as u64);
+        // The interval of each event: the operation's start for its latency, its end for a
+        // failure, each request's send and response for requests and throttling, each
+        // retry's issue (design 6.3 A1: events land in the interval they happened in).
+        let start_us = c.started.saturating_duration_since(window_start).as_micros() as u64;
+        let end_us = start_us + c.latency_us;
+        let frozen = self.frozen_elapsed_us.load(Ordering::Acquire);
+        let at = |us: u64| event_bucket(us, frozen);
+        let idx = at(start_us);
+        let end_idx = at(end_us);
+        // The start interval first: a later one may close it, and its quantiles must hold
+        // this operation.
         self.ensure_bucket(&mut a, idx, window_start);
-        let b = &mut a.buckets[idx];
-        b.ops += 1;
-        b.bytes += bytes;
+        let heat = heat_index(c.latency_us);
+        {
+            let b = &mut a.buckets[idx];
+            b.ops += 1;
+            b.bytes += bytes;
+            if ok {
+                b.ok_ops += 1;
+            }
+            if throttled {
+                b.throttled_ops += 1;
+            }
+            // Requests whose rows were dropped (more than the scope keeps) count at the start.
+            b.requests += c.data.dropped_requests;
+            if let Some(h) = b.latency.as_mut() {
+                rec(h, c.latency_us);
+            }
+            b.heat[heat] += 1;
+            let v = b.verb(c.verb);
+            v.ops += 1;
+            v.ok += u64::from(ok);
+            v.latency_us += c.latency_us;
+            v.heat[heat] += 1;
+        }
+        self.ensure_bucket(&mut a, end_idx, window_start);
         if !ok {
+            let b = &mut a.buckets[end_idx];
             b.errors += 1;
+            b.verb(c.verb).errors += 1;
         }
-        if throttled {
-            b.throttled += 1;
+        for r in &c.data.requests {
+            let sent = start_us + r.start_offset_us;
+            let i = at(sent);
+            self.ensure_bucket(&mut a, i, window_start);
+            a.buckets[i].requests += 1;
+            if r.is_throttle() {
+                let i = at(sent + r.timing.total_us);
+                self.ensure_bucket(&mut a, i, window_start);
+                let b = &mut a.buckets[i];
+                b.throttled += 1;
+                b.verb(c.verb).throttled += 1;
+            }
         }
-        if let Some(h) = b.latency.as_mut() {
-            rec(h, c.latency_us);
+        // Retries: when the next attempt was issued (the end of its backoff); retries beyond
+        // the kept backoff intervals count when the operation ended.
+        for &(_, issued) in &c.data.retry_waits {
+            let i = at(start_us + issued);
+            self.ensure_bucket(&mut a, i, window_start);
+            a.buckets[i].retries += 1;
         }
-        b.heat[heat_index(c.latency_us)] += 1;
+        let rest = c
+            .data
+            .retries
+            .saturating_sub(c.data.retry_waits.len() as u64);
+        a.buckets[end_idx].retries += rest;
 
         // Keep the slowest operations with their full request timelines.
         let lat_ms = c.latency_us as f64 / 1000.0;
@@ -1352,6 +1477,30 @@ impl Recorder {
                     } else {
                         Vec::new()
                     },
+                    ops_count: b.ops,
+                    ok_ops_count: b.ok_ops,
+                    goodput_ops_per_s: b.ok_ops as f64 / width,
+                    throttled_ops: b.throttled_ops,
+                    requests_count: b.requests,
+                    requests_per_s: b.requests as f64 / width,
+                    retries_count: b.retries,
+                    verbs: b
+                        .verbs
+                        .iter()
+                        .map(|v| VerbInterval {
+                            verb: v.verb.to_owned(),
+                            ops_count: v.ops,
+                            ok_ops_count: v.ok,
+                            errors_count: v.errors,
+                            throttled_count: v.throttled,
+                            latency_sum_ms: ms(v.latency_us),
+                            latency_rows_count: if v.ops > 0 {
+                                v.heat.iter().map(|c| u64::from(*c)).collect()
+                            } else {
+                                Vec::new()
+                            },
+                        })
+                        .collect(),
                 }
             })
             .collect();
@@ -1404,6 +1553,11 @@ impl Recorder {
             slow_ops: a.slow.clone(),
             self_obs: None,
             dimensions: Some(a.dims.stats()).filter(|d| !d.prefixes.is_empty()),
+            latency_histogram: LatencyHistogram::from_counts(
+                a.all_latency
+                    .iter_recorded()
+                    .map(|v| (v.value_iterated_to(), v.count_at_value())),
+            ),
         }
     }
 }
@@ -1557,6 +1711,158 @@ mod tests {
         assert_eq!(s.summary.ops, 1);
         assert!((s.elapsed_s - 0.5).abs() < 1e-6);
         assert!((s.summary.ops_per_s - 2.0).abs() < 1e-6);
+    }
+
+    fn completion(
+        r: &Recorder,
+        id: u64,
+        started: Instant,
+        latency_us: u64,
+        error: Option<&str>,
+        data: OpScopeData,
+    ) {
+        r.op_started_at(id, started);
+        r.complete_op(
+            true,
+            OpCompletion {
+                verb: if id.is_multiple_of(2) { "read" } else { "stat" },
+                op_id: id,
+                started,
+                latency_us,
+                logical_read: 0,
+                logical_write: 0,
+                error: error.map(str::to_owned),
+                key: String::new(),
+                data,
+                schedule_us: None,
+            },
+        );
+    }
+
+    #[test]
+    fn events_land_in_the_interval_they_happened_in() {
+        let r = Recorder::new();
+        r.set_phase(Phase::Measure);
+        let t0 = r.window_start();
+        // Started at 0 s: a throttled attempt answered at +2.5 s, a retry issued at +3.2 s,
+        // the second attempt sent then and the operation failing at +7.4 s.
+        let mut thr = req(2_000_000, 0, 500_000);
+        thr.status = 503;
+        let mut last = req(3_200_000, 0, 4_200_000);
+        last.status = 500;
+        let data = OpScopeData {
+            requests: vec![req(0, 0, 1000), thr, last],
+            retries: 1,
+            retry_waits: vec![(2_500_000, 3_200_000)],
+            throttled: true,
+            ..Default::default()
+        };
+        completion(&r, 1, t0, 7_400_000, Some("server_error"), data);
+        let s = r.snapshot();
+        let tl = &s.timeline;
+        assert_eq!(tl.len(), 8, "{tl:#?}");
+        // The operation and its latency belong to its start.
+        assert_eq!(tl[0].ops_count, 1);
+        assert_eq!(tl[0].throttled_ops, 1);
+        assert!((tl[0].p99_ms - 7400.0).abs() < 10.0);
+        // Requests when sent, the throttled response when it arrived, the retry when issued,
+        // the failure when the operation ended.
+        let per = |f: fn(&TimelinePoint) -> u64| tl.iter().map(f).collect::<Vec<_>>();
+        assert_eq!(per(|p| p.requests_count), [1, 0, 1, 1, 0, 0, 0, 0]);
+        assert_eq!(per(|p| p.throttled), [0, 0, 1, 0, 0, 0, 0, 0]);
+        assert_eq!(per(|p| p.retries_count), [0, 0, 0, 1, 0, 0, 0, 0]);
+        assert_eq!(per(|p| p.errors), [0, 0, 0, 0, 0, 0, 0, 1]);
+        // The verb's own counters follow the same rules.
+        let verb = |i: usize| tl[i].verbs.iter().find(|v| v.verb == "stat").cloned();
+        assert_eq!(verb(0).unwrap().ops_count, 1);
+        assert_eq!(verb(2).unwrap().throttled_count, 1);
+        assert_eq!(verb(7).unwrap().errors_count, 1);
+    }
+
+    #[test]
+    fn goodput_excludes_failures_and_throttled_counts_responses() {
+        let r = Recorder::new();
+        r.set_phase(Phase::Measure);
+        let t0 = r.window_start();
+        for id in 0..10u64 {
+            // Three failures; every operation's first attempt is throttled twice over.
+            let mut a = req(0, 0, 100);
+            a.status = 429;
+            let mut b = req(200, 0, 100);
+            b.status = 503;
+            let data = OpScopeData {
+                requests: vec![a, b, req(400, 0, 100)],
+                retries: 2,
+                throttled: true,
+                ..Default::default()
+            };
+            let err = (id < 3).then_some("rate_limited");
+            completion(&r, id + 1, t0, 600, err, data);
+        }
+        r.close_window(t0 + std::time::Duration::from_secs(1));
+        let s = r.snapshot();
+        let p = &s.timeline[0];
+        assert_eq!(p.ops_count, 10);
+        assert_eq!(p.ok_ops_count, 7);
+        assert!((p.ops_per_s - 10.0).abs() < 1e-9, "{}", p.ops_per_s);
+        assert!((p.goodput_ops_per_s - 7.0).abs() < 1e-9);
+        assert_eq!(p.errors, 3);
+        // 20 throttled responses from 10 throttled operations.
+        assert_eq!(p.throttled, 20);
+        assert_eq!(p.throttled_ops, 10);
+        assert_eq!(p.requests_count, 30);
+        assert!((p.requests_per_s - 30.0).abs() < 1e-9);
+        // Retries without backoff intervals count when the operation ended.
+        assert_eq!(p.retries_count, 20);
+        assert_eq!(s.resilience.throttled_responses, 20);
+        // The verbs add up to the interval.
+        let ops: u64 = p.verbs.iter().map(|v| v.ops_count).sum();
+        let ok: u64 = p.verbs.iter().map(|v| v.ok_ops_count).sum();
+        assert_eq!((ops, ok), (10, 7));
+    }
+
+    #[test]
+    fn draining_operations_stay_in_the_window() {
+        let r = Recorder::new();
+        r.set_phase(Phase::Measure);
+        let t0 = r.window_start();
+        r.close_window(t0 + std::time::Duration::from_millis(2500));
+        // Started at 2.4 s, failing at 5.4 s, after the window closed.
+        completion(
+            &r,
+            3,
+            t0 + std::time::Duration::from_millis(2400),
+            3_000_000,
+            Some("timeout"),
+            OpScopeData::default(),
+        );
+        let s = r.snapshot();
+        assert_eq!(s.timeline.len(), 3);
+        assert_eq!(s.timeline[2].errors, 1);
+        assert_eq!(s.timeline[2].ops_count, 1);
+    }
+
+    #[test]
+    fn the_latency_histogram_holds_every_operation() {
+        let r = Recorder::new();
+        r.set_phase(Phase::Measure);
+        let t0 = r.window_start();
+        // 900 operations at 1 ms, 100 at 10 ms.
+        for id in 0..1000u64 {
+            let us = if id < 900 { 1000 } else { 10_000 };
+            completion(&r, id + 1, t0, us, None, OpScopeData::default());
+        }
+        let s = r.snapshot();
+        let h = &s.latency_histogram;
+        assert_eq!(h.total(), 1000);
+        assert_eq!(h.counts, vec![900, 100]);
+        assert!(h.lower_ms[0] <= 1.0 && 1.0 < h.upper_ms[0], "{h:?}");
+        assert!(h.lower_ms[1] <= 10.0 && 10.0 < h.upper_ms[1], "{h:?}");
+        assert_eq!(h.quantile_ms(0.5), Some(h.upper_ms[0]));
+        assert!((h.quantile_ms(0.99).unwrap() - 10.0).abs() < 0.1);
+        assert!((h.max_ms - 10.0).abs() < 0.05);
+        let back: Snapshot = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back.latency_histogram, s.latency_histogram);
     }
 
     #[test]

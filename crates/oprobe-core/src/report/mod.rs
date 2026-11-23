@@ -154,6 +154,7 @@ pub mod fixture {
                 })
                 .collect(),
             heatmap: Default::default(),
+            latency_histogram: Default::default(),
             findings: vec![Finding {
                 code: "throttling".into(),
                 severity: Severity::Warning,

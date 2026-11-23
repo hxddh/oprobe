@@ -167,7 +167,8 @@ pub fn segments(ops: &[OpRow], window_s: f64) -> Segments {
 }
 
 /// A latency heatmap with buckets fitted to the data: 1-1.5-2-3-5-7 steps per decade from the
-/// fastest to the slowest operation (finer than the report's fixed buckets).
+/// fastest to the slowest operation (finer than the report's fixed buckets). Operations of
+/// the warmup (`t_us < 0`) are left out.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct FineHeatmap {
     pub t_buckets_s: Vec<f64>,
@@ -179,31 +180,43 @@ pub struct FineHeatmap {
 }
 
 pub fn fine_heatmap(ops: &[OpRow], window_s: f64, max_columns: usize) -> FineHeatmap {
-    if ops.is_empty() {
+    let measured = || ops.iter().filter(|o| o.t_us >= 0);
+    if measured().next().is_none() {
         return FineHeatmap::default();
     }
-    let min_ms = ops.iter().map(|o| o.latency_us).min().unwrap_or(0) as f64 / 1000.0;
-    let max_ms = ops.iter().map(|o| o.latency_us).max().unwrap_or(0) as f64 / 1000.0;
+    let min_ms = measured().map(|o| o.latency_us).min().unwrap_or(0) as f64 / 1000.0;
+    let max_ms = measured().map(|o| o.latency_us).max().unwrap_or(0) as f64 / 1000.0;
+    // The first row starts at the largest step at or below the fastest operation (rows below
+    // it would be empty), then every step up to the slowest.
     let mut bounds = vec![0.0];
     let mut decade = 10f64.powf(min_ms.max(0.001).log10().floor());
+    let mut first = decade;
     'outer: loop {
         for m in [1.0, 1.5, 2.0, 3.0, 5.0, 7.0] {
             let b = m * decade;
             if b > max_ms {
                 break 'outer;
             }
-            if b > min_ms * 0.999 || bounds.len() == 1 {
+            if b <= min_ms * 1.000_001 {
+                first = b;
+            } else {
+                if bounds.len() == 1 {
+                    bounds.push(first);
+                }
                 bounds.push(b);
             }
         }
         decade *= 10.0;
     }
+    if bounds.len() == 1 {
+        bounds.push(first);
+    }
     let window = window_s.max(1e-3);
     let width = (window / max_columns.max(1) as f64).max(0.1);
     let n_t = ((window / width).ceil() as usize).max(1);
     let mut counts = vec![vec![0u64; bounds.len()]; n_t];
-    for o in ops {
-        let t = ((o.t_us.max(0) as f64 / 1e6) / width) as usize;
+    for o in measured() {
+        let t = ((o.t_us as f64 / 1e6) / width) as usize;
         let ms = o.latency_us as f64 / 1000.0;
         let l = bounds.partition_point(|b| *b <= ms).saturating_sub(1);
         counts[t.min(n_t - 1)][l] += 1;
