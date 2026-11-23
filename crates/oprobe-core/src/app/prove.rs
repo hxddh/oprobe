@@ -1217,6 +1217,29 @@ fn paired(trials: &[ProveTrial], kind: TrialKind, pairs: u64) -> Vec<&ProveTrial
         .collect()
 }
 
+/// A candidate that throttles beyond `--max-throttle` proves nothing: its goodput or p99 is
+/// measured against a limit the service enforces, not against the change (sized or not). The
+/// verdict becomes `inconclusive`, with a note saying why.
+fn throttle_gate(
+    verdict: ProveVerdict,
+    b_trials: &[&ProveTrial],
+    max_throttle: f64,
+) -> (ProveVerdict, Option<String>) {
+    let requests: u64 = b_trials.iter().map(|t| t.requests_count).sum();
+    let throttled: u64 = b_trials.iter().map(|t| t.throttled_count).sum();
+    let ratio = throttled as f64 / requests.max(1) as f64;
+    if requests == 0 || ratio <= max_throttle {
+        return (verdict, None);
+    }
+    let note = format!(
+        "the changed operator throttled {:.2} % of its requests, over --max-throttle {:.2} %: \
+         the verdict is inconclusive",
+        ratio * 100.0,
+        max_throttle * 100.0
+    );
+    (ProveVerdict::Inconclusive, Some(note))
+}
+
 /// Mean of a trial metric.
 fn mean(ts: &[&ProveTrial], f: impl Fn(&ProveTrial) -> f64) -> f64 {
     if ts.is_empty() {
@@ -1696,6 +1719,8 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
     }
     let a_trials = paired(&t.out, TrialKind::Baseline, pairs);
     let b_trials = paired(&t.out, TrialKind::Candidate, pairs);
+    let (verdict, throttle_note) = throttle_gate(verdict, &b_trials, max_throttle);
+    notes.extend(throttle_note);
     let secondary = secondary(obj, &a_trials, &b_trials, floor);
     let base_spec: &OperatorSpec = &run.report.spec.profile.operator;
     let mut changed = base_spec.clone();
@@ -1794,6 +1819,38 @@ mod tests {
             budget_exceeded: pairs == 0,
             notes: vec!["the budget ran out before one pair of trials could run".into()],
         }
+    }
+
+    /// 6.3.0 said "improved" while the candidate throttled 4.36 % against a 0.10 % limit.
+    #[test]
+    fn a_candidate_over_max_throttle_is_inconclusive() {
+        let b = |requests: u64, throttled: u64| ProveTrial {
+            kind: TrialKind::Candidate,
+            pair: Some(0),
+            requests_count: requests,
+            throttled_count: throttled,
+            throttled_request_ratio: throttled as f64 / requests as f64,
+            ..trial(10.0, 5.0, true)
+        };
+        let over = [b(1000, 40), b(1000, 47)];
+        let over: Vec<&ProveTrial> = over.iter().collect();
+        for v in [ProveVerdict::Improved, ProveVerdict::Worse] {
+            let (verdict, note) = throttle_gate(v, &over, 0.001);
+            assert_eq!(verdict, ProveVerdict::Inconclusive);
+            let note = note.unwrap();
+            assert!(note.contains("4.35 %") && note.contains("0.10 %"), "{note}");
+        }
+        let within = [b(1000, 1), b(1000, 0)];
+        let within: Vec<&ProveTrial> = within.iter().collect();
+        assert_eq!(
+            throttle_gate(ProveVerdict::Improved, &within, 0.001),
+            (ProveVerdict::Improved, None)
+        );
+        // No candidate ran: nothing to gate.
+        assert_eq!(
+            throttle_gate(ProveVerdict::Inconclusive, &[], 0.001),
+            (ProveVerdict::Inconclusive, None)
+        );
     }
 
     #[test]
