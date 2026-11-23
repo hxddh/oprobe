@@ -27,11 +27,12 @@ oprobe prove last                # 对首要发现的补救措施做 A/B 测试�
 oprobe                           # 应用：运行记录、Profile、Operator、对比
 ```
 
-`oprobe demo` 即 `oprobe run lab://demo`：一个本地 S3，在超过 24 个并发请求时限流，并让每第 40 个请求变成等待 250 ms 的拖尾。简报最多列出三条发现，每条附上以 `op.toml` 路径表示的补救措施和下一条命令。`prove last` 交替运行当前 operator（A）与补救后的 operator（B）的试验，最后给出 diff（这次用时 60 秒）：
+`oprobe demo` 即 `oprobe run lab://demo`：一个本地 S3，让每第 40 个请求变成等待 250 ms 的拖尾（并在超过 40 个并发请求时限流）。简报最多列出三条发现，每条附上以 `op.toml` 路径表示的补救措施和下一条命令。`prove last` 交替运行当前 operator（A）与补救后的 operator（B）的试验，最后给出 diff（这次用时 54 秒）：
 
 ```text
-improved on goodput: +34.4 %, 95 % interval [+19.5, +51.1] (3 pairs of trials, noise ±2.0 %) · lab://demo (local lab)
-secondary (not decisive; 95 % intervals): p99 -67.8 % [-69.4, -66.2] · throttled 0.27 % → 4.54 % · errors 0.00 % → 0.02 %
+improved on goodput: +33.3 %, 95 % interval [+26.9, +40.1] (3 pairs of trials, noise ±2.0 %) · lab://demo (local lab)
+secondary (not decisive; 95 % intervals): p99 -68.5 % [-70.0, -66.9] · throttled 0.00 % → 0.00 % · errors 0.00 % → 0.00 %
+note: TailCutLayer re-issues through RetryLayer: its first backoff is shortened so a cut request is retried at once; trials warm up 11.5 s because the layer ignores its first 10 s
 + TailCutLayer::builder().safety_factor(1.5).min_samples(32).min_deadline(Duration::from_millis(50)).max_deadline(Duration::from_secs(60)).build()
 ~ RetryLayer::new().with_min_delay(Duration::from_millis(20))
 op.toml:

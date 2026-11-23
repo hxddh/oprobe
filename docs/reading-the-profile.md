@@ -13,27 +13,20 @@ The app's Profile view shows the same sections with charts ([app](app.md)).
 ## The brief
 
 ```text
-[Attention] 2.4% of GetObject requests wait far longer for the server's first byte than their peers
-  (stragglers).
-  lab://demo · small-files · 8.0 s · run 20261123-063611-3d82
-  ▲ 1 tail_stragglers (high confidence) — 2.4% of GetObject requests wait far longer for the
-      server's first byte than their peers (stragglers).
-      162 stragglers wait ~261ms for the first byte against ~9.78ms for a typical GetObject;
-      operation p50 10.0ms · p99 261ms
+[Attention] 2.4% of HeadObject, 2.4% of PutObject and 2.6% of GetObject requests wait far longer for
+  the server's first byte than their peers (stragglers).
+  lab://demo · small-files · 8.0 s · run 20261123-135409-4b57
+  ▲ 1 tail_stragglers (high confidence) — 2.4% of HeadObject, 2.4% of PutObject and 2.6% of
+      GetObject requests wait far longer for the server's first byte than their peers (stragglers).
+      33 HeadObject stragglers wait ~260ms for the first byte against ~9.48ms for a typical
+      HeadObject; 100 PutObject stragglers wait ~260ms for the first byte against ~9.55ms for a
+      typical PutObject; 214 GetObject stragglers wait ~260ms for the first byte against ~9.54ms for
+      a typical GetObject; operation p50 9.65ms · p99 261ms
       remedy: layers.tail_cut + layers.retry.min_delay — re-issue requests far slower than their
         peers, after a short retry backoff (TailCutLayer + RetryLayer::with_min_delay)
-      next: oprobe prove 20261123-063611-3d82 tail_stragglers
-  ▲ 2 throttling (medium confidence) — 15% of operation time is spent in retry backoff after
-      429/503: the service throttled 0.1% of requests.
-      16 throttled responses (429/503) in 11416 requests (0.14%); 15% of operation time in retry
-      backoff; the rejections start above a number of requests in flight (the in-flight limit
-      explains 81% of the throttled requests)
-      remedy: layers.concurrent_limit.http + layers.retry.jitter — cap the HTTP requests in flight
-        below the service's limit and retry with jitter
-        (ConcurrentLimitLayer::with_http_concurrent_limit + RetryLayer::with_jitter)
-      next: oprobe prove 20261123-063611-3d82 throttling
-  1425.0 ops/s · 80.1 MiB/s · p50 10.0ms · p99 261ms · errors 0.00% · 0.14% of requests throttled
-  full profile: oprobe show 20261123-063611-3d82 --detail · terms: https://github.com/hxddh/oprobe/blob/v6.3.0/docs/concepts.md#glossary
+      next: oprobe prove 20261123-135409-4b57 tail_stragglers
+  1733.6 ops/s · 97.6 MiB/s · p50 9.65ms · p99 261ms · errors 0.00%
+  full profile: oprobe show 20261123-135409-4b57 --detail · terms: https://github.com/hxddh/oprobe/blob/v7.0.0/docs/concepts.md#glossary
 ```
 
 (`oprobe demo`; your numbers differ from run to run.)

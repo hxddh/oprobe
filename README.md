@@ -35,30 +35,34 @@ oprobe prove last                # A/B-test the remedy of the top finding (about
 oprobe                           # the app: runs, profile, operator, compare
 ```
 
-`oprobe demo` is `oprobe run lab://demo`: a local S3 that throttles above 24 requests in flight and
-makes every 40th request a straggler that waits 250 ms. The brief names at most three findings,
+`oprobe demo` is `oprobe run lab://demo`: a local S3 that makes every 40th request a straggler
+that waits 250 ms (and throttles above 40 requests in flight). The brief names at most three findings,
 each with its remedy as an `op.toml` path, and the next command:
 
 ```text
-[Attention] 2.4% of GetObject requests wait far longer for the server's first byte than their peers
-  (stragglers).
-  lab://demo · small-files · 8.0 s · run 20261123-063611-3d82
-  ▲ 1 tail_stragglers (high confidence) — 2.4% of GetObject requests wait far longer for the
-      server's first byte than their peers (stragglers).
-      …
-      next: oprobe prove 20261123-063611-3d82 tail_stragglers
-  ▲ 2 throttling (medium confidence) — 15% of operation time is spent in retry backoff after
-      429/503: the service throttled 0.1% of requests.
-      …
-  1425.0 ops/s · 80.1 MiB/s · p50 10.0ms · p99 261ms · errors 0.00% · 0.14% of requests throttled
+[Attention] 2.4% of HeadObject, 2.4% of PutObject and 2.6% of GetObject requests wait far longer for
+  the server's first byte than their peers (stragglers).
+  lab://demo · small-files · 8.0 s · run 20261123-135409-4b57
+  ▲ 1 tail_stragglers (high confidence) — 2.4% of HeadObject, 2.4% of PutObject and 2.6% of
+      GetObject requests wait far longer for the server's first byte than their peers (stragglers).
+      33 HeadObject stragglers wait ~260ms for the first byte against ~9.48ms for a typical
+      HeadObject; 100 PutObject stragglers wait ~260ms for the first byte against ~9.55ms for a
+      typical PutObject; 214 GetObject stragglers wait ~260ms for the first byte against ~9.54ms for
+      a typical GetObject; operation p50 9.65ms · p99 261ms
+      remedy: layers.tail_cut + layers.retry.min_delay — re-issue requests far slower than their
+        peers, after a short retry backoff (TailCutLayer + RetryLayer::with_min_delay)
+      next: oprobe prove 20261123-135409-4b57 tail_stragglers
+  1733.6 ops/s · 97.6 MiB/s · p50 9.65ms · p99 261ms · errors 0.00%
+  full profile: oprobe show 20261123-135409-4b57 --detail · terms: https://github.com/hxddh/oprobe/blob/v7.0.0/docs/concepts.md#glossary
 ```
 
 `prove last` runs trials of the current operator (A) and of the remedy (B), interleaved, and ends
-with the diff (this run took 60 s):
+with the diff (this run took 54 s):
 
 ```text
-improved on goodput: +34.4 %, 95 % interval [+19.5, +51.1] (3 pairs of trials, noise ±2.0 %) · lab://demo (local lab)
-secondary (not decisive; 95 % intervals): p99 -67.8 % [-69.4, -66.2] · throttled 0.27 % → 4.54 % · errors 0.00 % → 0.02 %
+improved on goodput: +33.3 %, 95 % interval [+26.9, +40.1] (3 pairs of trials, noise ±2.0 %) · lab://demo (local lab)
+secondary (not decisive; 95 % intervals): p99 -68.5 % [-70.0, -66.9] · throttled 0.00 % → 0.00 % · errors 0.00 % → 0.00 %
+note: TailCutLayer re-issues through RetryLayer: its first backoff is shortened so a cut request is retried at once; trials warm up 11.5 s because the layer ignores its first 10 s
 + TailCutLayer::builder().safety_factor(1.5).min_samples(32).min_deadline(Duration::from_millis(50)).max_deadline(Duration::from_secs(60)).build()
 ~ RetryLayer::new().with_min_delay(Duration::from_millis(20))
 op.toml:
