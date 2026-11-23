@@ -52,8 +52,9 @@ oprobe is a document-style professional tool (Instruments, Xcode, Console). The 
     job runs (with its progress);
   - the whole bar is a drag region: a double press zooms or maximizes as the platform does (the
     title is not selectable, so it does not take the press).
-- **State**: the window's placement, the sidebar's visibility and width, and the page are
-  restored at the next start.
+- **State**: the sidebar's visibility and width, the page and (macOS, Windows) the window's
+  placement are restored at the next start. Linux does not restore the placement: with GTK's
+  client-side frame a restored window would shrink by its frame at every start.
 
 ## Menus and keys
 

@@ -31,8 +31,8 @@ All notable changes to this project are documented here. The format follows
     language; menu shortcuts that a text field uses no longer fire while you type, and menu
     actions wait while a dialog is open;
   - quitting or closing the window during a run or a prove asks first (Stop and Quit / Cancel);
-  - the window's placement, the sidebar and the page are restored; control heights grow with
-    the system's text size; the toolbar has each platform's height;
+  - the sidebar, the page and (macOS, Windows) the window's placement are restored; control
+    heights grow with the system's text size; the toolbar has each platform's height;
   - New Run focuses the operator field, takes Return anywhere, offers the workload as a pop-up
     and the lab's scenarios, configured operators (`[operators.NAME]`) and recent `op.toml`
     files in a Choose pop-up, and **plans a real target first** (`App::plan`: what it writes,

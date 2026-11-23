@@ -43,7 +43,8 @@ The window works like other professional tools on your platform (design:
   - Secondary-click a run for its menu: Open, Compare With Selected, Prove…, Copy Run ID,
     Copy Command and Delete…. The row the menu acts on is outlined while it is open.
   - Drag the sidebar's edge to resize it. Its width, whether it shows, the page (Profile or
-    Operator) and the window's size and position are restored at the next start.
+    Operator) and, on macOS and Windows, the window's size and position are restored at the
+    next start.
   - On macOS it is drawn on the window's sidebar material, on Windows 11 on Mica; elsewhere it
     has its own colour.
 - **Toolbar**: it sits in the title bar, at the platform's height. It holds the run's id and
