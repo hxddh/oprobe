@@ -144,9 +144,16 @@ errors, throttling, hung requests, stragglers and cold connections. `prove` refu
 | `--rm RUN…` | delete stored runs |
 | `--detail` | every section of the profile: the timeline (one row per interval of 1 s, or 10 s after ten minutes; long runs merge rows), the spread of the requests over keys, sizes, prefixes and remotes, the operator and the five slowest operations |
 | `--by stage\|api\|conn` | group the requests by stage, storage API or connection |
+| `--since DURATION` | only the time range from this far into the window: its goodput, latency quantiles, failures, requests, retries and throttling, where the time went, the verbs, the requests by API and the slowest operations, recomputed from the trace rows (`-o json`: the `range` object). With `--by`, only the range's requests are grouped |
+| `--until DURATION` | only the time range up to this far into the window (default: its end) |
+
+An operation counts in the range it started in, a request in the range it was sent in. When the
+run kept only a share of its rows, the range says so: its counts are estimates and its quantiles
+weighted by the operations each row stands for.
 
 ```bash
 oprobe show --list
+oprobe show last --since 3s --until 8s
 oprobe show last --by stage
 oprobe show prod.oprobe --detail
 oprobe show --rm last~3 last~4

@@ -38,6 +38,7 @@ oprobe run s3://bucket/prefix --existing data/ -c 16 -d 15s \
 oprobe run s3://bucket/prefix --existing data/ -c 16 -d 15s \
   --max-requests 20000 --max-duration 1m -o json            # profile (saves the run)
 oprobe show last --by stage -o json                   # where the time went, per stage
+oprobe show last --since 3s --until 8s -o json        # one time range (`range`), from the rows
 oprobe prove last throttling --max-duration 5m -o json   # A/B-test the finding's remedy
 oprobe prove last --with layers.tail_cut=on --objective p99 -o json   # a change of your own
 oprobe show --list -o json                            # history (prove trials hidden)

@@ -2,6 +2,7 @@
 //! brief result of `run` ([`brief`]) and the full profile of `show` ([`terminal`]).
 
 pub mod brief;
+pub mod range;
 
 pub mod style;
 pub mod terminal;

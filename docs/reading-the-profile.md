@@ -58,6 +58,11 @@ the configuration and the five slowest operations):
 `--by stage` sums the requests' time per stage, `--by api` per storage API, `--by conn` per
 connection (cold and warm, per remote address).
 
+`--since 3s --until 8s` shows one time range of the window (a burst, the seconds a rate limit
+bit): its numbers, where the time went, the verbs, the requests by API and its slowest
+operations, recomputed from the trace rows. When the rows were sampled it says so, and each row
+counts for the operations it stands for. In the app, drag across the timeline or the heatmap.
+
 ### Where the time goes
 
 Each operation's wall time is split exactly; an instant counts once even when requests overlap:

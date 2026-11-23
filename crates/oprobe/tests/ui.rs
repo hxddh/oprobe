@@ -628,4 +628,94 @@ fn quitting_during_a_run_asks_first() {
     assert!(has(&app, "id:stop"));
     app.press("id:stop").unwrap();
     app.wait_for_gone("id:stop", LONG).unwrap();
+/// A run long enough to brush: three seconds of a lab scenario (several verbs).
+fn seed_long(cx: &Ctx, operator: &str) -> String {
+    let app = App::new(cx.paths());
+    let req = RunRequest {
+        operators: vec![operator.to_owned()],
+        workload: WorkloadInput {
+            duration: Some("3s".into()),
+            // Past the throttling lab's limit, so it throttles.
+            concurrency: Some(32),
+            ..small()
+        },
+        ..Default::default()
+    };
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    match rt
+        .block_on(app.run(req, EventSink::silent(), Cancel::new()))
+        .unwrap()
+    {
+        RunOutcome::Run(set) => set.runs[0].run_id.clone(),
+        RunOutcome::Plan(_) => unreachable!(),
+    }
+}
+
+fn right(by: f32) -> nsh_core::Point<Points> {
+    nsh_core::geometry::point(Points(by), Points(0.0))
+}
+
+#[test]
+fn a_drag_selects_a_range_and_the_profile_recomputes_it() {
+    let cx = Ctx::new();
+    let id = seed_long(&cx, "lab://throttle");
+    cx.launch(Some(id.clone()));
+    let mut app = cx.start();
+    choose(&mut app, "English");
+    wait_long(&mut app, "id:chart-goodput");
+    wait_long(&mut app, "id:range-hint");
+    // Every chart says what it shows to a screen reader.
+    wait_long(&mut app, "label:/^Goodput over /");
+    wait_long(&mut app, "label:/^Requests per second over /");
+    wait_long(&mut app, "label:/operations per cell$/");
+    // A drag across the goodput chart selects a range: the numbers are the range's.
+    app.drag("id:chart-goodput", right(160.0)).unwrap();
+    wait_long(&mut app, "id:range-bar");
+    wait_long(&mut app, "text:/^Selected /");
+    wait_long(
+        &mut app,
+        "text:/operations · .* requests in the .* selected/",
+    );
+    // Clear drops it.
+    app.press("id:range-clear").unwrap();
+    app.wait_for_gone("id:range-bar", LONG).unwrap();
+    wait_long(&mut app, "text:/operations · .* requests · .* measured/");
+    // A drag across the heatmap selects one too, and Escape drops it.
+    app.drag("id:heatmap", right(-120.0)).unwrap();
+    wait_long(&mut app, "id:range-bar");
+    app.press_key("Escape").unwrap();
+    app.wait_for_gone("id:range-bar", LONG).unwrap();
+}
+
+#[test]
+fn findings_apis_and_the_verb_filter_drill_down() {
+    let cx = Ctx::new();
+    let id = seed_long(&cx, "lab://throttle");
+    cx.launch(Some(id.clone()));
+    let mut app = cx.start();
+    choose(&mut app, "English");
+    wait_long(&mut app, "id:finding-throttling");
+    // A finding's examples open on demand, request by request.
+    assert!(!app.shows("id:examples"));
+    wait_long(&mut app, "text:/^Show \\d+ examples$/");
+    app.press("id:examples-throttling").unwrap();
+    wait_long(&mut app, "id:examples");
+    wait_long(&mut app, "text:Hide examples");
+    // An API lists its slowest requests; one of them opens its operation's waterfall.
+    app.press("id:api-row-0").unwrap();
+    wait_long(&mut app, "id:api-drill");
+    wait_long(&mut app, "text:/^Slowest .* requests$/");
+    app.press("id:api-req-0").unwrap();
+    wait_long(&mut app, "id:drill-waterfall");
+    // The timeline follows the verb filter; what it does not split by verb says so.
+    wait_long(&mut app, "id:verb-filter");
+    app.press("id:verb-filter >> text:stat").unwrap();
+    wait_long(&mut app, "text:Goodput · stat");
+    wait_long(&mut app, "text:Requests per second · all verbs");
+    app.press("id:verb-filter >> text:All verbs").unwrap();
+    app.wait_for_gone("text:Goodput · stat", LONG).unwrap();
+    // A click on a heatmap cell (a press that barely moves) lists the operations behind it.
+    app.drag("id:heatmap", right(1.0)).unwrap();
+    wait_long(&mut app, "id:cell-drill");
+    wait_long(&mut app, "text:/^Slowest operations at /");
 }
