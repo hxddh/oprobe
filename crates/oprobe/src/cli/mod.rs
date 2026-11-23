@@ -31,7 +31,7 @@ pub async fn main(cli: Cli) -> ExitCode {
         ColorChoice::Auto => {}
     }
     let Some(command) = cli.command else {
-        return crate::launch::bare(&cli);
+        return crate::launch::bare(&cli, None);
     };
     let paths = Paths::resolve(cli.config.as_deref());
     let format = cli.output.map(OutputFormat::from).unwrap_or_else(|| {
@@ -109,6 +109,21 @@ where
         .filter(|(i, a)| *i == 0 || !a.to_string_lossy().starts_with("-psn_"))
         .map(|(_, a)| a)
         .collect()
+}
+
+/// A desktop opening a run file: `oprobe PATH`, where `PATH` is the only argument and an
+/// existing `.oprobe` or `.json` file (a double click, Open With, a file dropped on the
+/// program). The bare app opens it; nothing else is a file argument.
+pub fn launch_file(args: &[std::ffi::OsString]) -> Option<std::path::PathBuf> {
+    let [_, arg] = args else {
+        return None;
+    };
+    let path = std::path::Path::new(arg);
+    let ext = path.extension()?.to_string_lossy().to_ascii_lowercase();
+    if !matches!(ext.as_str(), "oprobe" | "json") || !path.is_file() {
+        return None;
+    }
+    Some(std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf()))
 }
 
 /// Parse the command line. Help and `--version` behave as clap's (exit 0); an argument error

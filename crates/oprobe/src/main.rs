@@ -2,14 +2,20 @@ use std::process::ExitCode;
 
 fn main() -> ExitCode {
     oprobe::output::quiet_broken_pipes();
-    let cli = match oprobe::cli::parse_cli(oprobe::cli::launch_args(std::env::args_os())) {
+    let mut args = oprobe::cli::launch_args(std::env::args_os());
+    // `oprobe RUN.oprobe` (a double click on a run file) is the bare app, opening it.
+    let file = oprobe::cli::launch_file(&args);
+    if file.is_some() {
+        args.truncate(1);
+    }
+    let cli = match oprobe::cli::parse_cli(args) {
         Ok(cli) => cli,
         Err(code) => return code,
     };
     // A bare `oprobe` is the app: it owns the main thread (native windows need it) and runs
     // its work on a runtime of its own.
     if cli.command.is_none() {
-        return oprobe::launch::bare(&cli);
+        return oprobe::launch::bare(&cli, file);
     }
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
