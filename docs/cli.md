@@ -93,8 +93,8 @@ A verdict other than `inconclusive` needs at least **3 pairs** of trials (A then
 budget allows fewer, the verdict is `inconclusive` (exit 0) with a note. When no pair ran at all,
 the text says `not measured` and prints no diff; `-o json` still prints a valid result
 (`verdict: "inconclusive"`, `pairs_count: 0`, a note). When the changed operator's trials
-throttle more than `--max-throttle` allows, the verdict is `inconclusive` too, with a note: the
-service's limit, not the change, set what was measured.
+throttle more than `--max-throttle` allows, and more than the current operator's, the verdict is
+`inconclusive` too, with a note: the service's limit, not the change, set what was measured.
 
 `prove` refuses a run that cannot be judged on performance (its first finding is `invalid_run`:
 it failed, or it is partial and too short); profile the operator again first.

@@ -1217,24 +1217,33 @@ fn paired(trials: &[ProveTrial], kind: TrialKind, pairs: u64) -> Vec<&ProveTrial
         .collect()
 }
 
-/// A candidate that throttles beyond `--max-throttle` proves nothing: its goodput or p99 is
-/// measured against a limit the service enforces, not against the change (sized or not). The
-/// verdict becomes `inconclusive`, with a note saying why.
+/// A candidate that throttles beyond `--max-throttle`, and more than the current operator,
+/// proves nothing: what it gained on the objective it took from a limit the service enforces
+/// (sized or not). The verdict becomes `inconclusive`, with a note saying why. A candidate
+/// that throttles less than the baseline (a cap on a hot key that the service still limits)
+/// is judged on its objective.
 fn throttle_gate(
     verdict: ProveVerdict,
+    a_trials: &[&ProveTrial],
     b_trials: &[&ProveTrial],
     max_throttle: f64,
 ) -> (ProveVerdict, Option<String>) {
-    let requests: u64 = b_trials.iter().map(|t| t.requests_count).sum();
-    let throttled: u64 = b_trials.iter().map(|t| t.throttled_count).sum();
-    let ratio = throttled as f64 / requests.max(1) as f64;
-    if requests == 0 || ratio <= max_throttle {
+    let ratio = |ts: &[&ProveTrial]| {
+        let requests: u64 = ts.iter().map(|t| t.requests_count).sum();
+        let throttled: u64 = ts.iter().map(|t| t.throttled_count).sum();
+        (requests > 0).then(|| throttled as f64 / requests as f64)
+    };
+    let Some(b) = ratio(b_trials) else {
+        return (verdict, None);
+    };
+    let a = ratio(a_trials).unwrap_or(0.0);
+    if b <= max_throttle || b <= a {
         return (verdict, None);
     }
     let note = format!(
-        "the changed operator throttled {:.2} % of its requests, over --max-throttle {:.2} %: \
-         the verdict is inconclusive",
-        ratio * 100.0,
+        "the changed operator throttled {:.2} % of its requests (the current one {:.2} %), over --max-throttle {:.2} %: the verdict is inconclusive",
+        b * 100.0,
+        a * 100.0,
         max_throttle * 100.0
     );
     (ProveVerdict::Inconclusive, Some(note))
@@ -1750,7 +1759,7 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
     }
     let a_trials = paired(&t.out, TrialKind::Baseline, pairs);
     let b_trials = paired(&t.out, TrialKind::Candidate, pairs);
-    let (verdict, throttle_note) = throttle_gate(verdict, &b_trials, max_throttle);
+    let (verdict, throttle_note) = throttle_gate(verdict, &a_trials, &b_trials, max_throttle);
     notes.extend(throttle_note);
     let secondary = secondary(obj, &a_trials, &b_trials, floor);
     let base_spec: &OperatorSpec = &run.report.spec.profile.operator;
@@ -1886,23 +1895,36 @@ mod tests {
             throttled_request_ratio: throttled as f64 / requests as f64,
             ..trial(10.0, 5.0, true)
         };
+        let a = [b(1000, 3), b(1000, 3)];
+        let a: Vec<&ProveTrial> = a.iter().collect();
         let over = [b(1000, 40), b(1000, 47)];
         let over: Vec<&ProveTrial> = over.iter().collect();
         for v in [ProveVerdict::Improved, ProveVerdict::Worse] {
-            let (verdict, note) = throttle_gate(v, &over, 0.001);
+            let (verdict, note) = throttle_gate(v, &a, &over, 0.001);
             assert_eq!(verdict, ProveVerdict::Inconclusive);
             let note = note.unwrap();
-            assert!(note.contains("4.35 %") && note.contains("0.10 %"), "{note}");
+            assert!(
+                note.contains("4.35 %") && note.contains("0.30 %") && note.contains("0.10 %"),
+                "{note}"
+            );
         }
         let within = [b(1000, 1), b(1000, 0)];
         let within: Vec<&ProveTrial> = within.iter().collect();
         assert_eq!(
-            throttle_gate(ProveVerdict::Improved, &within, 0.001),
+            throttle_gate(ProveVerdict::Improved, &a, &within, 0.001),
+            (ProveVerdict::Improved, None)
+        );
+        // Less throttled than the baseline (a hot key the service still limits): judged on
+        // the objective.
+        let hot = [b(1000, 280), b(1000, 290)];
+        let hot: Vec<&ProveTrial> = hot.iter().collect();
+        assert_eq!(
+            throttle_gate(ProveVerdict::Improved, &hot, &over, 0.001),
             (ProveVerdict::Improved, None)
         );
         // No candidate ran: nothing to gate.
         assert_eq!(
-            throttle_gate(ProveVerdict::Inconclusive, &[], 0.001),
+            throttle_gate(ProveVerdict::Inconclusive, &a, &[], 0.001),
             (ProveVerdict::Inconclusive, None)
         );
     }
