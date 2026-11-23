@@ -11,8 +11,10 @@ use serde::{Deserialize, Serialize};
 
 
 /// Why a request or an operation failed: the stable dotted codes a trace row carries
-/// (`storage.throttled`, `net.timeout`, …). They are a subset of the oprobe CLI's error codes and
-/// serialize to the same strings, so files stay readable when the CLI adds codes.
+/// (`storage.throttled`, `net.timeout`, …). Most are the oprobe CLI's error codes and serialize
+/// to the same strings, so files stay readable when the CLI adds codes; the conditional-request
+/// outcomes (`storage.condition_not_match`, `storage.already_exists`, `storage.conflict`,
+/// `storage.range_not_satisfied`: OpenDAL's error kinds, design v7 B6) are the trace's own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[non_exhaustive]
@@ -35,6 +37,19 @@ pub enum FailureCode {
     /// The service does not support the operation.
     #[serde(rename = "storage.unsupported")]
     StorageUnsupported,
+    /// A conditional request's condition did not hold: 412 (`If-Match`, `If-None-Match`;
+    /// OpenDAL `ConditionNotMatch`).
+    #[serde(rename = "storage.condition_not_match")]
+    StorageConditionNotMatch,
+    /// The object already exists (a create-only write; OpenDAL `AlreadyExists`).
+    #[serde(rename = "storage.already_exists")]
+    StorageAlreadyExists,
+    /// 409: a conflicting concurrent change (OpenDAL `Conflict`).
+    #[serde(rename = "storage.conflict")]
+    StorageConflict,
+    /// 416: the requested range is outside the object (OpenDAL `RangeNotSatisfied`).
+    #[serde(rename = "storage.range_not_satisfied")]
+    StorageRangeNotSatisfied,
     /// The operator is misconfigured.
     #[serde(rename = "config.invalid")]
     ConfigInvalid,
@@ -53,6 +68,10 @@ impl FailureCode {
             Self::StorageNotFound => "storage.not_found",
             Self::StorageThrottled => "storage.throttled",
             Self::StorageUnsupported => "storage.unsupported",
+            Self::StorageConditionNotMatch => "storage.condition_not_match",
+            Self::StorageAlreadyExists => "storage.already_exists",
+            Self::StorageConflict => "storage.conflict",
+            Self::StorageRangeNotSatisfied => "storage.range_not_satisfied",
             Self::ConfigInvalid => "config.invalid",
             Self::Internal => "internal",
         }
@@ -67,6 +86,10 @@ impl FailureCode {
             "not_found" => Self::StorageNotFound,
             "config_invalid" => Self::ConfigInvalid,
             "unsupported" => Self::StorageUnsupported,
+            "condition_not_match" => Self::StorageConditionNotMatch,
+            "already_exists" => Self::StorageAlreadyExists,
+            "conflict" => Self::StorageConflict,
+            "range_not_satisfied" => Self::StorageRangeNotSatisfied,
             "timeout" | "tail_cut" => Self::NetTimeout,
             "connect" | "network" => Self::NetUnreachable,
             _ => Self::Internal,
@@ -81,9 +104,33 @@ impl FailureCode {
             429 | 503 => Some(Self::StorageThrottled),
             401 | 403 => Some(Self::AuthDenied),
             404 => Some(Self::StorageNotFound),
+            409 => Some(Self::StorageConflict),
+            412 => Some(Self::StorageConditionNotMatch),
+            416 => Some(Self::StorageRangeNotSatisfied),
             400..=599 => Some(Self::Internal),
             _ => None,
         }
+    }
+
+    /// [`FailureCode::from_status`], refined by the provider's error code when it names the
+    /// failure more precisely (Azure `BlobAlreadyExists` on a 409, an in-process backend's
+    /// OpenDAL kind).
+    pub fn of_request(status: u16, provider_code: Option<&str>) -> Option<Self> {
+        let code = Self::from_status(status)?;
+        Some(match provider_code {
+            Some(c) if c.ends_with("AlreadyExists") => Self::StorageAlreadyExists,
+            Some("ConditionNotMatch" | "ConditionNotMet" | "PreconditionFailed") => {
+                Self::StorageConditionNotMatch
+            }
+            Some("InvalidRange" | "RangeNotSatisfied") => Self::StorageRangeNotSatisfied,
+            _ => code,
+        })
+    }
+
+    /// Whether OpenDAL retries a request that failed with HTTP `status` (0: no response): no
+    /// response, 408, 429, 499 and 5xx except 501 are temporary; any other failure persists.
+    pub fn temporary_status(status: u16) -> bool {
+        matches!(status, 0 | 408 | 429 | 499 | 500 | 502 | 503 | 504)
     }
 }
 
@@ -241,6 +288,11 @@ pub struct ReqDetail {
     /// whole object or an open-ended range. Against `bytes_down` it shows over-read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub range_bytes: Option<u64>,
+    /// A failed request: whether the failure is temporary (OpenDAL retries it: no response,
+    /// 408, 429, 5xx) or persistent (any other 4xx; a precondition or conflict). Absent for a
+    /// success.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temporary: Option<bool>,
 }
 
 impl ReqDetail {

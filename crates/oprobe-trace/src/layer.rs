@@ -63,9 +63,14 @@ fn push(
         }),
         api,
         method: api.label().to_owned(),
-        status: match err {
+        status: match err.map(Error::kind) {
             None => 200,
-            Some(e) if e.kind() == ErrorKind::NotFound => 404,
+            Some(ErrorKind::NotFound) => 404,
+            Some(ErrorKind::PermissionDenied) => 403,
+            Some(ErrorKind::RateLimited) => 429,
+            Some(ErrorKind::ConditionNotMatch) => 412,
+            Some(ErrorKind::AlreadyExists | ErrorKind::Conflict) => 409,
+            Some(ErrorKind::RangeNotSatisfied) => 416,
             Some(_) => 500,
         },
         protocol: Protocol::InProcess,
@@ -89,7 +94,14 @@ fn push(
         service_op: None,
         tls: None,
         tcp: None,
-        detail: None,
+        // The backend's own error kind and temporary bit (design v7 B6).
+        detail: err.map(|e| {
+            Box::new(crate::rows::ReqDetail {
+                error_code: Some(e.kind().into_static().to_owned()),
+                temporary: Some(e.is_temporary()),
+                ..Default::default()
+            })
+        }),
     };
     match scope {
         Some(s) => s.push_request(rec),
@@ -348,5 +360,38 @@ impl oio::Delete for ObserveDeleter {
 
     async fn close(&mut self) -> Result<()> {
         self.inner.close().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rows::FailureCode;
+
+    /// An in-process backend's failure keeps OpenDAL's kind and temporary bit (design v7 B6).
+    #[test]
+    fn in_process_failures_keep_their_kind() {
+        let rec = Recorder::always_on(100);
+        let t = Instant::now();
+        let exists = Error::new(ErrorKind::AlreadyExists, "exists");
+        push(&rec, Api::PutObject, t, 1, 0, Some(&exists));
+        let busy = Error::new(ErrorKind::RateLimited, "busy").set_temporary();
+        push(&rec, Api::GetObject, t, 0, 0, Some(&busy));
+        let range = Error::new(ErrorKind::RangeNotSatisfied, "range");
+        push(&rec, Api::GetObject, t, 0, 0, Some(&range));
+        let rows = rec.take_trace();
+        let got: Vec<(Option<FailureCode>, Option<bool>)> = rows
+            .reqs
+            .iter()
+            .map(|r| (r.error_code, r.detail.as_ref().and_then(|d| d.temporary)))
+            .collect();
+        assert_eq!(got.len(), 3);
+        for want in [
+            (Some(FailureCode::StorageAlreadyExists), Some(false)),
+            (Some(FailureCode::StorageThrottled), Some(true)),
+            (Some(FailureCode::StorageRangeNotSatisfied), Some(false)),
+        ] {
+            assert!(got.contains(&want), "{want:?} in {got:?}");
+        }
     }
 }

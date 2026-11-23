@@ -166,10 +166,15 @@ fn method_name(m: String) -> Cow<'static, str> {
 
 /// Build a request row from a transport record. `op_t_us` is the start of the owning
 /// operation relative to the window start.
-pub fn req_row(r: RequestRecord, op_id: u64, op_t_us: i64, attempt: u32) -> ReqRow {
+pub fn req_row(mut r: RequestRecord, op_id: u64, op_t_us: i64, attempt: u32) -> ReqRow {
     let t = r.timing;
     let error_code = if r.is_error() && r.status != 404 || r.error.is_some() {
-        FailureCode::from_status(r.status).or(Some(FailureCode::Internal))
+        // Temporary or persistent (design v7 B6), unless the backend said (in-process).
+        let status = r.status;
+        let d = r.detail.get_or_insert_with(Default::default);
+        d.temporary
+            .get_or_insert(FailureCode::temporary_status(status));
+        FailureCode::of_request(status, d.error_code.as_deref()).or(Some(FailureCode::Internal))
     } else {
         None
     };
@@ -268,6 +273,49 @@ pub fn op_row(
 
 #[cfg(test)]
 mod tests {
+    use crate::rows::FailureCode;
+
+    fn failed(status: u16, provider: Option<&str>) -> ReqRow {
+        let mut r = rec(Api::PutObject, 0, status);
+        if let Some(p) = provider {
+            r.detail = Some(Box::new(crate::rows::ReqDetail {
+                error_code: Some(p.into()),
+                ..Default::default()
+            }));
+        }
+        req_row(r, 1, 0, 1)
+    }
+
+    /// 409, 412 and 416 keep their meaning (design v7 B6), with a temporary/persistent bit.
+    #[test]
+    fn failed_requests_keep_their_class() {
+        let code = |s, p| failed(s, p).error_code.unwrap();
+        let temporary = |s| failed(s, None).detail.unwrap().temporary;
+        assert_eq!(code(412, None), FailureCode::StorageConditionNotMatch);
+        assert_eq!(code(409, None), FailureCode::StorageConflict);
+        assert_eq!(
+            code(409, Some("BlobAlreadyExists")),
+            FailureCode::StorageAlreadyExists
+        );
+        assert_eq!(code(416, None), FailureCode::StorageRangeNotSatisfied);
+        assert_eq!(code(400, None), FailureCode::Internal);
+        assert_eq!(code(503, None), FailureCode::StorageThrottled);
+        assert_eq!(temporary(503), Some(true));
+        assert_eq!(temporary(500), Some(true));
+        assert_eq!(temporary(0), Some(true));
+        assert_eq!(temporary(412), Some(false));
+        assert_eq!(temporary(400), Some(false));
+        // A success carries neither.
+        let ok = req_row(rec(Api::GetObject, 0, 200), 1, 0, 1);
+        assert!(ok.error_code.is_none() && ok.detail.is_none());
+        // The codes serialize to stable strings.
+        assert_eq!(
+            serde_json::to_value(FailureCode::StorageConditionNotMatch).unwrap(),
+            "storage.condition_not_match"
+        );
+        assert_eq!(FailureCode::from_class("already_exists"), FailureCode::StorageAlreadyExists);
+    }
+
     use super::*;
     use crate::{Api, Protocol, RequestTiming};
 
