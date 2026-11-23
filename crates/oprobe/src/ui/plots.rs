@@ -192,41 +192,84 @@ fn per_interval(
 }
 
 /// The most requests in flight at once, interval by interval (where a concurrency limit
-/// shows).
+/// shows), the connections dialed in each interval (churn behind a latency spike) and, faint,
+/// the client's CPU in cores busy (its saturation over time) — all counts on one axis.
 pub fn inflight(t: &TimelineView) -> Option<Plot> {
-    if t.inflight_peak_count.iter().all(|n| *n == 0) {
+    if t.inflight_peak_count.len() != t.len() || t.inflight_peak_count.iter().all(|n| *n == 0) {
         return None;
     }
-    per_interval(
-        t,
-        tr("plot.peak"),
-        "series-a",
-        Unit::Count,
-        t.inflight_peak_count.iter().map(|n| *n as f64).collect(),
-    )
+    let peak: Vec<f64> = t.inflight_peak_count.iter().map(|n| *n as f64).collect();
+    let conns: Vec<f64> = t.new_connections_count.iter().map(|n| *n as f64).collect();
+    let cpu = t.cpu_cores().filter(|c| c.len() == t.len());
+    let top = peak
+        .iter()
+        .chain(&conns)
+        .chain(cpu.iter().flatten())
+        .copied()
+        .fold(0.0, f64::max);
+    let mut lines = vec![Line::step(tr("plot.peak"), "series-a", series(t, &peak))];
+    if conns.len() == t.len() && conns.iter().any(|v| *v > 0.0) {
+        lines.push(Line::step(
+            tr("plot.new_connections"),
+            "stage-connect",
+            series(t, &conns),
+        ));
+    }
+    if let Some(cpu) = cpu {
+        lines.push(Line::step(tr("plot.cpu_cores"), "axis", series(t, &cpu)).faint());
+    }
+    Some(time_plot(t, Scale::zero_based(top), Unit::Count, lines))
 }
 
-/// Requests sent per second (retries included) and the retries per second: where a request
-/// rate limit shows.
+/// Requests sent per second (retries included), and beside them the retries, the throttled
+/// responses and the failed operations per second as step lines: where a request rate limit
+/// shows, and how much — one 429 is not a thousand.
 pub fn requests(t: &TimelineView) -> Option<Plot> {
     if t.requests_per_s.len() != t.len() || t.requests_per_s.iter().all(|v| *v <= 0.0) {
         return None;
     }
-    let retries = per_s(t, &t.retries_count);
     let y = Scale::zero_based(t.requests_per_s.iter().copied().fold(0.0, f64::max));
     let mut lines = vec![Line::step(
         tr("plot.requests"),
         "series-a",
         series(t, &t.requests_per_s),
     )];
-    if retries.iter().any(|v| *v > 0.0) {
-        lines.push(Line::step(
-            tr("plot.retries"),
-            "stage-retry",
-            series(t, &retries),
-        ));
+    for (label, token, counts) in [
+        (tr("plot.retries"), "stage-retry", &t.retries_count),
+        (tr("plot.throttled_responses"), "warn", &t.throttled_count),
+        (tr("plot.failed_ops"), "crit", &t.errors_count),
+    ] {
+        let v = per_s(t, counts);
+        if v.len() == t.len() && v.iter().any(|v| *v > 0.0) {
+            lines.push(Line::step(label, token, series(t, &v)));
+        }
     }
     Some(time_plot(t, y, Unit::Rate, lines))
+}
+
+/// The hottest keys as horizontal bars, at most five, largest first: `(key, share)` of all
+/// throttling when any key drew some (`true`), else of all requests (`false`: a key read
+/// over and over).
+pub fn hot_key_bars(m: &ProfileModel) -> (bool, Vec<(String, f64)>) {
+    let keys = &m.spread.hot_keys;
+    let throttle = keys
+        .iter()
+        .any(|k| k.throttle_share_ratio.is_some_and(|r| r > 0.0));
+    let mut v: Vec<(String, f64)> = keys
+        .iter()
+        .map(|k| {
+            let r = if throttle {
+                k.throttle_share_ratio.unwrap_or(0.0)
+            } else {
+                k.share_ratio
+            };
+            (k.key.clone(), r)
+        })
+        .filter(|(_, r)| *r > 0.0)
+        .collect();
+    v.sort_by(|a, b| b.1.total_cmp(&a.1));
+    v.truncate(5);
+    (throttle, v)
 }
 
 /// Throttled responses per second (each in the interval it arrived).
@@ -407,7 +450,7 @@ pub fn evidence(m: &ProfileModel, kind: EvidenceChart) -> Option<(&'static str, 
         EvidenceChart::ErrorsOverTime => {
             errors_rate(&m.timeline).map(|p| (tr("plot.errors_rate"), p))
         }
-        // Tables, not charts: the view draws them.
+        // Bars ([`hot_key_bars`]) and numbers, not a plot: the view draws them.
         EvidenceChart::HotKeys | EvidenceChart::Amplification => None,
     }
 }
@@ -566,8 +609,78 @@ mod tests {
             retries_count: rows.iter().map(|r| r.2).collect(),
             inflight_peak_count: vec![4; n],
             new_connections_count: vec![0; n],
+            cpu_pct: Vec::new(),
             verb: None,
         }
+    }
+
+    #[test]
+    fn the_requests_chart_draws_how_much_was_throttled_and_failed() {
+        let t = tl(&[
+            (100.0, 100.0, 0, 0, 100),
+            (100.0, 60.0, 1, 0, 100),
+            (100.0, 60.0, 900, 40, 100),
+        ]);
+        let rq = requests(&t).unwrap();
+        let by = |l: &str| rq.lines.iter().find(|x| x.label == l).unwrap();
+        // One 429 and nine hundred are not the same line.
+        let th = by(tr("plot.throttled_responses"));
+        assert_eq!(th.mark, crate::ui::chart::Mark::Step);
+        assert_eq!(th.token, "warn");
+        assert_eq!(th.pts[1], (1.0, 1.0));
+        assert_eq!(th.pts[2], (2.0, 900.0));
+        let failed = by(tr("plot.failed_ops"));
+        assert_eq!(failed.token, "crit");
+        assert_eq!(failed.pts[2], (2.0, 40.0));
+        // A quiet run draws the requests alone.
+        let quiet = tl(&[(10.0, 10.0, 0, 0, 10), (10.0, 10.0, 0, 0, 10)]);
+        assert_eq!(requests(&quiet).unwrap().lines.len(), 1);
+    }
+
+    #[test]
+    fn hot_keys_are_bars_of_their_share_of_the_throttling() {
+        let mut run = crate::report::fixture::run();
+        let hk = |key: &str, share: f64, throttle: f64| crate::model::HotKey {
+            key: key.into(),
+            requests_count: 10,
+            share_ratio: share,
+            throttle_share_ratio: throttle,
+        };
+        run.report.dimensions.hot_keys = vec![hk("a", 0.5, 0.1), hk("b", 0.2, 0.8)];
+        let m = crate::ui::data::of_run(&run);
+        let (throttle, bars) = hot_key_bars(&m);
+        assert!(throttle);
+        assert_eq!(bars, vec![("b".to_owned(), 0.8), ("a".to_owned(), 0.1)]);
+        // Nothing throttled (repeated reads): the share of the requests instead.
+        run.report.dimensions.hot_keys = vec![hk("a", 0.5, 0.0), hk("b", 0.2, 0.0)];
+        let (throttle, bars) = hot_key_bars(&crate::ui::data::of_run(&run));
+        assert!(!throttle);
+        assert_eq!(bars[0], ("a".to_owned(), 0.5));
+    }
+
+    #[test]
+    fn the_inflight_chart_draws_new_connections_and_a_faint_cpu() {
+        let mut t = tl(&[(10.0, 10.0, 0, 0, 10), (10.0, 10.0, 0, 0, 10)]);
+        assert_eq!(
+            inflight(&t).unwrap().lines.len(),
+            1,
+            "nothing dialed, no CPU"
+        );
+        t.new_connections_count = vec![16, 0];
+        t.cpu_pct = vec![Some(250.0), None];
+        let p = inflight(&t).unwrap();
+        assert_eq!(p.lines.len(), 3);
+        let conns = &p.lines[1];
+        assert_eq!(conns.label, tr("plot.new_connections"));
+        assert_eq!(conns.mark, crate::ui::chart::Mark::Step);
+        assert_eq!(conns.pts[0], (0.0, 16.0));
+        let cpu = &p.lines[2];
+        assert_eq!(cpu.label, tr("plot.cpu_cores"));
+        assert!(cpu.faint);
+        assert_eq!(cpu.pts[0], (0.0, 2.5));
+        assert!(p.y.max >= 16.0);
+        // The screen reader hears the in-flight peak, not the faint CPU.
+        assert!(p.summary("In flight").contains('4'), "{}", p.summary("x"));
     }
 
     #[test]
@@ -590,11 +703,12 @@ mod tests {
         // Throttled responses, per second.
         let th = throttled_rate(&t).unwrap();
         assert_eq!(th.lines[0].pts[1], (1.0, 4.0));
-        // Requests per second with the retries beside them.
+        // Requests per second with the retries and the throttled responses beside them.
         let rq = requests(&t).unwrap();
-        assert_eq!(rq.lines.len(), 2);
+        assert_eq!(rq.lines.len(), 3);
         assert!((rq.lines[0].pts[0].1 - 110.0).abs() < 1e-9);
         assert_eq!(rq.lines[1].pts[1], (1.0, 4.0));
+        assert_eq!(rq.lines[2].label, tr("plot.throttled_responses"));
         assert!(rq.summary("Requests").contains("Requests"));
     }
 

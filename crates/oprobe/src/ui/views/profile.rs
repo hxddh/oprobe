@@ -13,7 +13,7 @@
 
 use std::rc::Rc;
 
-use nsh_base::theme;
+use nsh_base::{button, theme};
 use nsh_core::prelude::*;
 
 use super::shell::{fill, page};
@@ -350,8 +350,8 @@ const API_COLS: [Col; 7] = [
         numeric: true,
     },
     Col {
-        heading: "col.total_p99",
-        width: 72.0,
+        heading: "col.total_p50_p99",
+        width: 132.0,
         numeric: true,
     },
     Col {
@@ -382,6 +382,31 @@ fn status_line(status: &[(u16, u64)]) -> String {
         .join(" · ")
 }
 
+/// How OpenDAL wrote: the part size it used (and why, when it is not what was asked) and the
+/// parts it uploaded.
+fn write_line(w: &crate::report::view::WritePathView) -> String {
+    let mut parts = Vec::new();
+    if w.write_chunk_bytes > 0 {
+        let mut s = fill("write.part_size", &[&fmt::bytes(w.write_chunk_bytes)]);
+        let mut why = Vec::new();
+        if w.clamped {
+            why.push(fill("write.asked", &[&fmt::bytes(w.requested_chunk_bytes)]));
+        }
+        if let (Some(a), Some(b)) = (w.service_min_part_bytes, w.service_max_part_bytes) {
+            why.push(fill("write.service", &[&fmt::bytes(a), &fmt::bytes(b)]));
+        }
+        if !why.is_empty() {
+            s += &format!(" ({})", why.join("; "));
+        }
+        parts.push(s);
+    }
+    parts.push(match w.part_mean_bytes {
+        Some(m) => fill("write.parts", &[&fmt::count(w.parts_count), &fmt::bytes(m)]),
+        None => tr("write.no_parts").to_owned(),
+    });
+    parts.join(" · ")
+}
+
 /// The backend's requests by API (of the range when one is selected); clicking an API lists
 /// its slowest requests, and clicking one of those shows its operation's waterfall.
 fn requests(m: &Rc<ProfileModel>, cx: Ctx) -> Option<View> {
@@ -391,9 +416,14 @@ fn requests(m: &Rc<ProfileModel>, cx: Ctx) -> Option<View> {
     let m = m.clone();
     let picked = signal(None::<usize>);
     let opened = signal(None::<u64>);
+    let writes = m
+        .write_path
+        .as_ref()
+        .map(|w| prop(tr("write.path"), write_line(w)).test_id("write-path"));
     Some(
         section(tr("profile.requests"))
             .test_id("requests")
+            .child(writes)
             .child(m.has_rows().then(|| small(tr("drill.api_hint"))))
             .child(dynamic(move || {
                 let r = cx.range.get();
@@ -416,7 +446,11 @@ fn requests(m: &Rc<ProfileModel>, cx: Ctx) -> Option<View> {
                                     fmt::dur_ms(a.ttfb_p50_ms),
                                     fmt::dur_ms(a.ttfb_p99_ms)
                                 ),
-                                fmt::dur_ms(a.total_p99_ms),
+                                format!(
+                                    "{} / {}",
+                                    fmt::dur_ms(a.total_p50_ms),
+                                    fmt::dur_ms(a.total_p99_ms)
+                                ),
                                 format!(
                                     "{} / {}",
                                     fmt::bytes(a.down_bytes),
@@ -709,6 +743,11 @@ fn details(m: &ProfileModel) -> View {
                 numeric: true,
             },
             Col {
+                heading: "col.errors",
+                width: 72.0,
+                numeric: true,
+            },
+            Col {
                 heading: "col.p99",
                 width: 72.0,
                 numeric: true,
@@ -725,6 +764,7 @@ fn details(m: &ProfileModel) -> View {
                         .or(x.throttle_share_ratio)
                         .map(fmt::ratio)
                         .unwrap_or_else(|| "—".into()),
+                    x.error_ratio.map(fmt::ratio).unwrap_or_else(|| "—".into()),
                     x.p99_ms.map(fmt::dur_ms).unwrap_or_else(|| "—".into()),
                 ]
             })
@@ -740,6 +780,7 @@ fn details(m: &ProfileModel) -> View {
         ("details.hot_keys", "hot-keys", &sp.hot_keys),
         ("details.sizes", "sizes", &sp.sizes),
         ("details.prefixes", "prefixes", &sp.prefixes),
+        ("details.cold_warm", "cold-warm", &sp.cold_warm),
         ("details.remotes", "remotes", &sp.remotes),
     ] {
         if !xs.is_empty() {
@@ -794,6 +835,11 @@ fn setup(m: &ProfileModel) -> View {
                     .join(" · "),
             )
         }))
+        .child(
+            m.write_path
+                .as_ref()
+                .map(|w| prop(tr("write.path"), write_line(w))),
+        )
         .child(prop(tr("setup.seed"), st.seed.to_string()))
         .child(prop(tr("setup.started"), st.started_at.clone()))
         .child(prop(
@@ -915,7 +961,23 @@ fn verbs(vs: &[VerbRow]) -> View {
                     }))
                     .tabular_nums(),
                 )
+                // Its rates: operations and bytes per second, requests per operation.
+                .child(
+                    small(fill(
+                        "verb.rates",
+                        &[
+                            &fmt::compact(v.ops_per_s),
+                            &fmt::sig3(v.mib_per_s),
+                            &fmt::sig3(v.requests_per_op),
+                        ],
+                    ))
+                    .tabular_nums(),
+                )
                 .child(view().flex_1().min_w(px(120.0)).child(stage_bar(&v.stages)))
+                .child((v.throttled_ratio > 0.0).then(|| {
+                    small(fill("verb.throttled", &[&fmt::ratio(v.throttled_ratio)]))
+                        .text_color(move || Tone::Warn.color())
+                }))
                 .child(
                     small(if v.error_ratio > 0.0 {
                         format!("{} {}", tr("metric.errors"), fmt::ratio(v.error_ratio))
@@ -931,50 +993,32 @@ fn verbs(vs: &[VerbRow]) -> View {
 fn evidence(m: &ProfileModel, f: &FindingRow) -> Option<View> {
     use crate::report::view::EvidenceChart;
     match f.chart? {
-        EvidenceChart::HotKeys if !m.spread.hot_keys.is_empty() => {
-            let cols = [
-                Col {
-                    heading: "col.key",
-                    width: 0.0,
-                    numeric: false,
-                },
-                Col {
-                    heading: "col.requests",
-                    width: 72.0,
-                    numeric: true,
-                },
-                Col {
-                    heading: "col.share",
-                    width: 64.0,
-                    numeric: true,
-                },
-                Col {
-                    heading: "col.throttle_share",
-                    width: 120.0,
-                    numeric: true,
-                },
-            ];
-            let rows = m
-                .spread
-                .hot_keys
-                .iter()
-                .take(5)
-                .map(|k| {
-                    vec![
-                        k.key.clone(),
-                        fmt::count(k.requests_count),
-                        fmt::ratio(k.share_ratio),
-                        k.throttle_share_ratio.map(fmt::ratio).unwrap_or_default(),
-                    ]
-                })
-                .collect();
+        EvidenceChart::HotKeys if !plots::hot_key_bars(m).1.is_empty() => {
+            // Each hot key as a horizontal bar of its share of all throttling (of all requests
+            // when nothing was throttled).
+            let (throttle, bars) = plots::hot_key_bars(m);
+            let label_w = if kit::in_terminal() { 168.0 } else { 190.0 };
+            let tok = if throttle { "warn" } else { "series-a" };
             return Some(
                 view()
                     .gap_1()
                     .pt_1()
                     .test_id(&format!("evidence-{}", f.code))
-                    .child(caption(tr("details.hot_keys")))
-                    .child(kit::table(&cols, rows)),
+                    .child(caption(if throttle {
+                        tr("plot.hot_keys_throttling")
+                    } else {
+                        tr("plot.hot_keys_requests")
+                    }))
+                    .children(bars.into_iter().enumerate().map(move |(i, (key, share))| {
+                        view()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .test_id(&format!("hot-key-bar-{i}"))
+                            .child(mono(key).w(px(label_w)).number_of_lines(1))
+                            .child(meter(share, tok))
+                            .child(small(fmt::ratio(share)).w(px(64.0)).tabular_nums())
+                    })),
             );
         }
         EvidenceChart::Amplification => {
@@ -1435,7 +1479,7 @@ fn waterfalls(ws: &[Waterfall], id: &'static str) -> View {
         .child(
             view().flex_row().flex_wrap().gap_3().children(
                 [
-                    "queue", "connect", "send", "ttfb", "body", "client", "retry",
+                    "queue", "connect", "send", "ttfb", "body", "stall", "client", "retry",
                 ]
                 .map(|k| {
                     view()
@@ -1567,28 +1611,147 @@ fn waterfall(w: &Waterfall, span: f64, hover: Signal<Option<String>>) -> View {
                         .tabular_nums(),
                 )
         }))
+        .child(w.await_tree.clone().map(await_tree))
 }
 
+/// The async call stack captured while a slow operation was in flight, under its waterfall;
+/// closed until asked.
+fn await_tree(tree: String) -> View {
+    let open = signal(false);
+    view()
+        .gap_1()
+        .test_id("await-tree")
+        .child(
+            button()
+                .on_press(move || open.update(|o| *o = !*o))
+                .accessibility_label(move || Some(SharedString::from(tr("profile.await_tree"))))
+                .test_id("await-tree-toggle")
+                .flex_row()
+                .items_center()
+                .gap_1()
+                .self_start()
+                .rounded(px(4.0))
+                .child(small(move || {
+                    SharedString::from(format!(
+                        "{} {}",
+                        if open.get() { "▾" } else { "▸" },
+                        tr("profile.await_tree")
+                    ))
+                })),
+        )
+        .child(dynamic(move || {
+            let o = open.get();
+            let tree = tree.clone();
+            untracked(move || {
+                o.then(|| {
+                    kit::panel()
+                        .px_2()
+                        .py_1()
+                        .test_id("await-tree-body")
+                        .child(mono(tree).selectable(true))
+                })
+            })
+        }))
+}
+
+/// The connections (core's [`crate::report::view::ConnectionView`]): reuse, dials and their
+/// phases (proxy CONNECT included), and whether the network or the server is the limit — the
+/// kernel's round trip, retransmits and window limits, the TLS handshakes, the cold start.
 fn conns(m: &ProfileModel) -> View {
     let c = &m.conns;
+    let p50_p99 = |a: f64, b: f64| format!("p50 {} · p99 {}", fmt::dur_ms(a), fmt::dur_ms(b));
     section(tr("profile.connections"))
-        .child(prop(tr("conn.dialed"), c.dialed.to_string()))
+        .test_id("connections")
+        .child(prop(tr("conn.dialed"), fmt::count(c.dialed_count)))
+        .child(
+            (c.dial_failures_count > 0)
+                .then(|| prop(tr("conn.dial_failures"), fmt::count(c.dial_failures_count))),
+        )
         .child(prop(tr("conn.reuse"), fmt::ratio(c.reuse_ratio)))
         .child(prop(
             tr("conn.protocols"),
-            format!("HTTP/1.1 {} · HTTP/2 {}", c.http1, c.http2),
+            format!(
+                "HTTP/1.1 {} · HTTP/2 {}",
+                c.http1_requests_count, c.http2_requests_count
+            ),
         ))
         .child((!c.tls.is_empty()).then(|| prop("TLS", c.tls.clone())))
-        .child(prop(tr("conn.peak"), c.peak_inflight.to_string()))
-        .children(
-            c.setup
-                .iter()
-                .filter(|(_, p50, _)| *p50 > 0.0)
-                .map(|(k, p50, p99)| {
+        .child(c.proxy.clone().map(|p| prop(tr("conn.proxy"), p)))
+        .child(prop(tr("conn.peak"), c.peak_inflight_count.to_string()))
+        .children(c.dial.iter().map(|d| {
+            prop(
+                if d.key == "proxy" {
+                    tr("conn.proxy_connect").to_owned()
+                } else {
+                    d.key.to_uppercase()
+                },
+                p50_p99(d.p50_ms, d.p99_ms),
+            )
+        }))
+        .child(c.tcp.as_ref().map(|t| {
+            view()
+                .gap_1()
+                .test_id("conn-tcp")
+                .child(prop(
+                    tr("conn.rtt"),
+                    format!(
+                        "p50 {} · p99 {}",
+                        fmt::dur_us(t.rtt_p50_us as f64),
+                        fmt::dur_us(t.rtt_p99_us as f64)
+                    ),
+                ))
+                .child(prop(
+                    tr("conn.retransmitting"),
+                    fill(
+                        "conn.retransmitting_of",
+                        &[
+                            &fmt::count(t.retransmitting_connections_count),
+                            &fmt::count(t.connections_count),
+                            &fmt::count(t.retransmits_count),
+                        ],
+                    ),
+                ))
+                .child(prop(
+                    tr("conn.limited"),
+                    fill(
+                        "conn.limited_of",
+                        &[
+                            &fmt::ratio(t.rwnd_limited_ratio),
+                            &fmt::ratio(t.sndbuf_limited_ratio),
+                        ],
+                    ),
+                ))
+                .child((t.delivery_rate_p50_bits_per_s > 0).then(|| {
                     prop(
-                        k.to_uppercase(),
-                        format!("p50 {} · p99 {}", fmt::dur_ms(*p50), fmt::dur_ms(*p99)),
+                        tr("conn.delivery"),
+                        crate::report::view::fmt_bits(t.delivery_rate_p50_bits_per_s),
                     )
-                }),
-        )
+                }))
+        }))
+        .child(c.tls_handshakes.as_ref().map(|t| {
+            prop(
+                tr("conn.tls_handshakes"),
+                fill(
+                    "conn.tls_handshakes_of",
+                    &[
+                        &fmt::count(t.handshakes_count),
+                        &fmt::ratio(t.resumption_ratio),
+                        &fmt::count(t.hrr_count),
+                    ],
+                ),
+            )
+        }))
+        .child(c.cold_start.as_ref().map(|s| {
+            prop(
+                tr("conn.cold_start"),
+                fill(
+                    "conn.cold_start_of",
+                    &[
+                        &fmt::count(s.connections_count),
+                        &p50_p99(s.connect_p50_ms, s.connect_p99_ms),
+                        &p50_p99(s.first_ops_p50_ms, s.first_ops_p99_ms),
+                    ],
+                ),
+            )
+        }))
 }
