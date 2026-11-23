@@ -4532,7 +4532,7 @@
       "type": "object"
     },
     {
-      "description": "One interval of the measurement window (as `report.timeline`: operations by their\nstart; failures, throttled responses, requests and retries when they happened).",
+      "description": "One interval of the measurement window (as `report.timeline`: operations by their\nstart; failures, throttled responses, requests and retries when they happened). It is\nsent once the interval after it has also closed; an operation still running then (a\nretry chain longer than an interval) adds its requests, retries and failure to the\ninterval they happened in only when it ends, so `report.timeline` is the final count.",
       "properties": {
         "errors_count": {
           "description": "Operations that failed in the interval.",

@@ -64,6 +64,12 @@ pub fn entries() -> Vec<Entry> {
             build: gen_cmd::<crate::app::ProveOutput>,
         },
         Entry {
+            name: "show",
+            description: "The result of `oprobe show RUN -o json`: the report, where the run is stored, and `--by` / `--since --until` when given",
+            input: false,
+            build: gen_cmd::<crate::app::Profile>,
+        },
+        Entry {
             name: "run-list",
             description: "The result of `oprobe show --list -o json`: the stored runs",
             input: false,

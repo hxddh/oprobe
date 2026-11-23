@@ -49,7 +49,10 @@ pub enum EventKind {
         requests: u64,
     },
     /// One interval of the measurement window (as `report.timeline`: operations by their
-    /// start; failures, throttled responses, requests and retries when they happened).
+    /// start; failures, throttled responses, requests and retries when they happened). It is
+    /// sent once the interval after it has also closed; an operation still running then (a
+    /// retry chain longer than an interval) adds its requests, retries and failure to the
+    /// interval they happened in only when it ends, so `report.timeline` is the final count.
     Interval {
         /// Start of the second, seconds from the window start.
         t_s: f64,
@@ -257,12 +260,13 @@ impl EventBus {
                     }
                     bus.emit(EventKind::Phase { phase: s.phase });
                 }
-                // Every second but the last (still filling) is final.
-                // The window is over (`cleanup` follows it): every second is final.
+                // An interval is sent once the one after it closed too: requests and retries
+                // count when an operation ends, and most end within an interval. The window
+                // is over (`cleanup` follows it): every interval is sent.
                 let done = if matches!(s.phase, Phase::Done | Phase::Cleanup) {
                     s.timeline.len()
                 } else {
-                    s.timeline.len().saturating_sub(1)
+                    s.timeline.len().saturating_sub(2)
                 };
                 for t in s.timeline.iter().take(done).skip(st.1) {
                     bus.emit(EventKind::Interval {
@@ -339,10 +343,12 @@ mod tests {
             assert!(l["ts"].as_str().unwrap().ends_with('Z'));
         }
         let types: Vec<&str> = lines.iter().map(|l| l["type"].as_str().unwrap()).collect();
+        // Three intervals while measuring: only the first is sent; the second waits for the
+        // third to close (requests and retries count when operations end).
         assert_eq!(
             types,
             [
-                "version", "log", "phase", "interval", "interval", "progress", "progress", "error"
+                "version", "log", "phase", "interval", "progress", "progress", "error"
             ]
         );
         assert_eq!(lines[2]["phase"], "measure");

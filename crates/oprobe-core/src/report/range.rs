@@ -39,7 +39,10 @@ pub struct RangeView {
     pub rows_count: u64,
     /// Operations started in the range (weighted when sampled).
     pub ops_count: u64,
+    /// Operations that failed in the range: by when they ended, as the timeline counts
+    /// failures (an operation started earlier that times out inside the range counts here).
     pub failed_ops_count: u64,
+    /// Failed / every operation that ended in the range.
     pub error_ratio: f64,
     /// Operations started per second, failed ones included.
     pub ops_per_s: f64,
@@ -95,7 +98,19 @@ impl RangeView {
         let ops: Vec<&OpRow> = run.ops.iter().filter(|o| inside(o.t_us)).collect();
         let reqs: Vec<&ReqRow> = run.reqs.iter().filter(|q| inside(q.t_us)).collect();
         let total_w: f64 = ops.iter().map(|o| weight(o.op_id)).sum();
-        let failed_w: f64 = ops.iter().filter(|o| !o.ok).map(|o| weight(o.op_id)).sum();
+        // Goodput as the timeline counts it: operations started in the range that succeeded.
+        let failed_started_w: f64 = ops.iter().filter(|o| !o.ok).map(|o| weight(o.op_id)).sum();
+        // Failures as the timeline counts them: when the operation ended, whenever it started,
+        // against every operation that ended in the range.
+        let ended = |o: &&OpRow| inside(o.t_us.saturating_add(o.latency_us as i64));
+        let ended_w: f64 = run.ops.iter().filter(ended).map(|o| weight(o.op_id)).sum();
+        let failed_w: f64 = run
+            .ops
+            .iter()
+            .filter(ended)
+            .filter(|o| !o.ok)
+            .map(|o| weight(o.op_id))
+            .sum();
         let bytes_w: f64 = ops.iter().map(|o| o.bytes as f64 * weight(o.op_id)).sum();
         let mut lat: Vec<(u64, f64)> = ops
             .iter()
@@ -135,9 +150,9 @@ impl RangeView {
             rows_count: ops.len() as u64,
             ops_count: total_w.round() as u64,
             failed_ops_count: failed_w.round() as u64,
-            error_ratio: ratio(failed_w, total_w),
+            error_ratio: ratio(failed_w, ended_w),
             ops_per_s: total_w / span,
-            goodput_ops_per_s: (total_w - failed_w).max(0.0) / span,
+            goodput_ops_per_s: (total_w - failed_started_w).max(0.0) / span,
             mib_per_s: bytes_w / span / (1024.0 * 1024.0),
             p50_ms: p50,
             p90_ms: p90,
@@ -498,6 +513,32 @@ mod tests {
         // The whole window, and an empty range.
         assert_eq!(RangeView::of(&run, 0.0, 10.0).ops_count, 100);
         assert!(RangeView::of(&run, 20.0, 30.0).is_empty());
+    }
+
+    #[test]
+    fn a_range_counts_failures_when_they_happened_as_the_timeline_does() {
+        let mut run = run();
+        // Op 3 started at 0.2 s; it now retries until it fails at 7.4 s.
+        let o = run.ops.iter_mut().find(|o| o.op_id == 3).unwrap();
+        o.latency_us = 7_200_000;
+        o.ok = false;
+        let late = RangeView::of(&run, 7.0, 8.0);
+        assert_eq!(
+            late.failed_ops_count, 1,
+            "the failure lands where it happened"
+        );
+        // Eleven others ended in [7, 8): the 110 ms op started at 6.9 s and the ten started
+        // at 7.0..7.9 s. 1 failure of 12.
+        assert!(
+            (late.error_ratio - 1.0 / 12.0).abs() < 1e-9,
+            "{}",
+            late.error_ratio
+        );
+        // Goodput stays the operations that started in the range and succeeded.
+        assert!((late.goodput_ops_per_s - 10.0).abs() < 1e-9);
+        let early = RangeView::of(&run, 0.0, 1.0);
+        assert_eq!(early.failed_ops_count, 0);
+        assert!((early.goodput_ops_per_s - 9.0).abs() < 1e-9);
     }
 
     #[test]

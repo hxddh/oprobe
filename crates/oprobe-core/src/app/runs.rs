@@ -510,7 +510,19 @@ pub fn trash(app: &App, refs: &[RunRef]) -> Result<TrashedRuns> {
 /// Put runs [`trash`] moved back into the store.
 pub fn restore(app: &App, t: &TrashedRuns) -> Result<()> {
     let root = app.paths.data_dir.join("trash");
-    if t.folder.parent() != Some(root.as_path()) {
+    // A folder `trash` made: directly under `<data>/trash/`, named by a run id, no `..`.
+    let named = t
+        .folder
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| crate::model::RunId::parse(n).is_some());
+    let plain = t.folder.components().all(|c| {
+        !matches!(
+            c,
+            std::path::Component::ParentDir | std::path::Component::CurDir
+        )
+    });
+    if !named || !plain || t.folder.parent() != Some(root.as_path()) {
         return Err(OprobeError::new(
             ErrorCode::SafetyRefused,
             format!("`{}` is not a trash folder of oprobe", t.folder.display()),
@@ -583,6 +595,27 @@ mod tests {
             folder: d.path().join("elsewhere"),
         };
         assert!(app.restore(&bad).is_err());
+        // `<data>/trash/..` is the data dir: never restored from (it would be removed).
+        for folder in [
+            d.path().join("data/trash/.."),
+            d.path().join("data/trash/notarun"),
+        ] {
+            let sneaky = TrashedRuns {
+                ids: vec![],
+                folder,
+            };
+            assert!(app.restore(&sneaky).is_err(), "{:?}", sneaky.folder);
+        }
+        assert!(d.path().join("data").exists());
         assert!(app.trash(&[RunRef::from("20261120-000000-ffff")]).is_err());
+        // A trash of several runs that fails part-way moves nothing.
+        assert!(
+            app.trash(&[
+                RunRef::from("20261120-143005-a1b2"),
+                RunRef::from("20261120-000000-ffff"),
+            ])
+            .is_err()
+        );
+        assert_eq!(app.list().unwrap().runs.len(), 2);
     }
 }

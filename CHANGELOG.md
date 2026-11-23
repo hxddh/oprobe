@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
-## Unreleased
+## v6.3.0 — 2026-11-23
 
 ### Added
 
@@ -60,6 +60,9 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- `interval` events are sent once the next interval has also closed, so their requests and
+  retries are final for operations shorter than an interval; `report.timeline` stays the final
+  count. `show -o json` has a schema (`schemas/show.json`).
 - **The demo proves.** `oprobe demo` then `oprobe prove last` (every default) proves its top
   finding `improved` on goodput; a convergence test runs exactly that.
   - Throttling's severity follows its cost, not its presence: critical when more operations
@@ -157,6 +160,13 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- `show --detail`'s Spread prints a hot key's share of all throttling (it printed `-`).
+- A brushed time range (app, `show --since --until`) counts failures when they happened, as the
+  timeline does; goodput stays the operations that started in it and succeeded.
+- Restoring trashed runs refuses any folder but one `App::trash` made (no `..`); a trash that
+  fails part-way puts back what it moved.
+- `prove --budget` with `--max-duration` (both, as a 6.2 script might pass) takes the shorter
+  instead of failing.
 - `throttled_count` in the timeline (and `interval` events, `IntervalBlock`) counts throttled
   **responses**, as documented and charted; it counted throttled operations, so a run with 41
   throttled responses summed to 22.

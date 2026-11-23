@@ -1007,7 +1007,8 @@ pub fn spread_section(s: &super::view::SpreadView) -> String {
                     x.key.clone(),
                     x.requests_count.to_string(),
                     format!("{:.1}%", x.share_ratio * 100.0),
-                    pct(x.throttled_ratio),
+                    // Hot keys carry their share of all throttling, the others their own.
+                    pct(x.throttled_ratio.or(x.throttle_share_ratio)),
                     pct(x.error_ratio),
                     ms(x.p99_ms),
                 ]
@@ -1238,6 +1239,25 @@ pub fn range_section(run: &Run, v: &super::range::RangeView) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_spread_shows_a_hot_keys_share_of_throttling() {
+        use super::super::view::{Slice, SpreadView};
+        let s = SpreadView {
+            hot_keys: vec![Slice {
+                key: "hot/a".into(),
+                requests_count: 120,
+                share_ratio: 0.4,
+                throttled_ratio: None,
+                throttle_share_ratio: Some(0.75),
+                error_ratio: None,
+                p99_ms: None,
+            }],
+            ..Default::default()
+        };
+        let out = spread_section(&s);
+        assert!(out.contains("75.0%"), "{out}");
+    }
+
     use super::*;
 
     #[test]

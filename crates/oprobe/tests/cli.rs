@@ -123,7 +123,9 @@ fn checked_in_schemas_match_the_code() {
     let names = oprobe::cli::schema::names();
     assert_eq!(
         names,
-        ["report", "prove", "run-list", "operator", "error", "events"]
+        [
+            "report", "prove", "show", "run-list", "operator", "error", "events"
+        ]
     );
     for name in &names {
         let v = oprobe::cli::schema::schema(name).unwrap();
@@ -181,6 +183,7 @@ fn run_saves_the_run_and_prints_one_json_document() {
     let o = env.run(&["show", id, "-o", "json"]);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     let s = json(&o);
+    validate("show", &s);
     validate("report", &s["report"]);
     assert_eq!(s["report"]["run"]["id"], id);
     assert!(s["requests_count"].as_u64().unwrap() > 0);
@@ -329,7 +332,9 @@ fn show_lists_groups_and_removes_runs() {
     for by in ["stage", "api", "conn"] {
         let o = env.run(&["show", "last", "--by", by, "-o", "json"]);
         assert_eq!(code(&o), 0, "{}", stderr(&o));
-        let b = &json(&o)["by"];
+        let shown = json(&o);
+        validate("show", &shown);
+        let b = &shown["by"];
         assert_eq!(b["by"], by);
         assert!(!b["groups"].as_array().unwrap().is_empty(), "{b}");
     }
@@ -365,6 +370,7 @@ fn show_recomputes_a_time_range_from_the_rows() {
     assert!(r["p99_ms"].as_f64().unwrap() > 0.0);
     assert!(!r["apis"].as_array().unwrap().is_empty());
     // The whole report is still there; without the flags there is no range.
+    validate("show", &v);
     validate("report", &v["report"]);
     assert!(
         json(&env.run(&["show", "last", "-o", "json"]))

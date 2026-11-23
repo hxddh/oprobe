@@ -389,7 +389,7 @@ static EN: &[(&str, &str)] = &[
     ("operator.prove_run", "Prove"),
     ("operator.trials", "{} trials finished"),
     ("operator.pair", "Pair {}"),
-    ("operator.pairs_count", "{} A/B pairs"),
+    ("operator.pairs_count", "{} pairs of trials"),
     (
         "operator.secondary",
         "Secondary, not decisive (shares as percentage points, pp): {}",
@@ -861,7 +861,7 @@ static ZH: &[(&str, &str)] = &[
     ("operator.prove_run", "证明"),
     ("operator.trials", "已完成 {} 次试验"),
     ("operator.pair", "第 {} 对"),
-    ("operator.pairs_count", "{} 对 A/B"),
+    ("operator.pairs_count", "{} 对试验"),
     (
         "operator.secondary",
         "次要指标，不决定结论（占比为百分点差，pp）：{}",

@@ -449,18 +449,39 @@ impl RunStore {
     pub fn move_to(&self, ids: &[String], trash: &Path) -> Result<()> {
         super::create_private_dir_all(trash)
             .with_context(|| format!("cannot create `{}`", trash.display()))?;
+        // All or nothing: a move that fails puts the files already moved back.
+        let mut moved: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
+        let undo = |moved: &[(std::path::PathBuf, std::path::PathBuf)]| {
+            for (from, to) in moved.iter().rev() {
+                let _ = std::fs::rename(to, from);
+            }
+            let _ = std::fs::remove_dir(trash);
+        };
         for id in ids {
-            let files = self.files_of(id)?;
+            let files = match self.files_of(id) {
+                Ok(f) => f,
+                Err(e) => {
+                    undo(&moved);
+                    return Err(e);
+                }
+            };
             if files.is_empty() {
+                undo(&moved);
                 return Err(
                     OprobeError::new(ErrorCode::UsageUnknownRun, format!("no run `{id}`")).into(),
                 );
             }
             for f in files {
                 let to = trash.join(f.file_name().expect("a stored file has a name"));
-                std::fs::rename(&f, &to).with_context(|| {
-                    format!("cannot move `{}` to `{}`", f.display(), to.display())
-                })?;
+                if let Err(e) = std::fs::rename(&f, &to) {
+                    undo(&moved);
+                    return Err(anyhow::Error::new(e).context(format!(
+                        "cannot move `{}` to `{}`",
+                        f.display(),
+                        to.display()
+                    )));
+                }
+                moved.push((f, to));
             }
         }
         Ok(())

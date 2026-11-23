@@ -109,7 +109,7 @@ pub async fn prove(a: ProveArgs, ctx: &Ctx) -> Result<u8> {
             .map(|v| crate::input::share("--max-throttle", v))
             .transpose()?,
         // One wall-time budget: `--max-duration` (alias `--budget`) bounds the whole proof.
-        budget: a.safety.max_duration.clone(),
+        budget: a.safety.wall_budget(),
         trial_duration: a.trial,
         pairs: a.pairs.unwrap_or(crate::config::prove_defaults::MAX_PAIRS),
         safety: i::Safety {

@@ -255,15 +255,38 @@ pub struct ProveSafetyArgs {
     #[arg(long, value_name = "SIZE", value_parser = parse::size, allow_hyphen_values = true)]
     pub max_bytes: Option<String>,
     /// Wall-time budget of the whole proof, e.g. 5m: no trial starts that would not end in it
-    // `--budget` is the 6.0–6.2 spelling, kept as a hidden alias.
     #[arg(
         long,
-        alias = "budget",
         value_name = "DURATION",
         value_parser = parse::duration,
         allow_hyphen_values = true
     )]
     pub max_duration: Option<String>,
+    /// `--budget`: the 6.0–6.2 spelling of `--max-duration`, hidden; with both, the shorter
+    /// bounds the proof.
+    #[arg(
+        long,
+        hide = true,
+        value_name = "DURATION",
+        value_parser = parse::duration,
+        allow_hyphen_values = true
+    )]
+    pub budget: Option<String>,
+}
+
+impl ProveSafetyArgs {
+    /// The one wall-time budget: `--max-duration`, `--budget`, or the shorter of the two.
+    pub fn wall_budget(&self) -> Option<String> {
+        let secs = |d: &String| {
+            crate::util::parse_duration(d)
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(f64::INFINITY)
+        };
+        match (&self.max_duration, &self.budget) {
+            (Some(a), Some(b)) => Some(if secs(b) < secs(a) { b } else { a }.clone()),
+            (a, b) => a.clone().or_else(|| b.clone()),
+        }
+    }
 }
 
 /// `--by`.
@@ -314,4 +337,26 @@ pub struct LabArgs {
     /// Address to listen on
     #[arg(long, default_value = "127.0.0.1:9000", value_name = "ADDR")]
     pub bind: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ProveSafetyArgs;
+
+    #[test]
+    fn the_old_budget_spelling_still_bounds_the_proof() {
+        let s = |max: Option<&str>, budget: Option<&str>| ProveSafetyArgs {
+            max_duration: max.map(str::to_owned),
+            budget: budget.map(str::to_owned),
+            ..Default::default()
+        };
+        assert_eq!(s(Some("5m"), None).wall_budget().as_deref(), Some("5m"));
+        assert_eq!(s(None, Some("2m")).wall_budget().as_deref(), Some("2m"));
+        // Both (a 6.2 script that passed both): the shorter bounds it, no error.
+        assert_eq!(
+            s(Some("5m"), Some("90s")).wall_budget().as_deref(),
+            Some("90s")
+        );
+        assert_eq!(s(None, None).wall_budget(), None);
+    }
 }
