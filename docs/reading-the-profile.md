@@ -87,7 +87,16 @@ Each operation's wall time is split exactly; an instant counts once even when re
   started count in every percentile as censored values, so a slow server cannot hide behind fewer
   requests.
 - **Percentiles** are exact when every operation was kept, otherwise from histograms with three
-  significant digits. Counts always agree with the totals.
+  significant digits. Counts always agree with the totals. The report keeps the run's whole
+  latency distribution (`latency_histogram`, 20 bins per decade), and the latency CDF is drawn
+  from it whenever the trace rows are sampled.
+- **The timeline** has one row per interval (1 s for the first ten minutes, then 10 s).
+  Operations, goodput (`goodput_ops_per_s`: successes only; `ops_per_s` counts every attempt)
+  and the latency quantiles belong to the interval an operation *started* in; requests
+  (`requests_count`, retries included), throttled responses (`throttled_count`), retries and
+  failures (`errors_count`) to the interval they *happened* in, so a 503 at +7 s is drawn at
+  +7 s. `ops_count` says how many operations stand behind an interval's quantiles: a p99 needs
+  about 1 000. Each interval also carries the same counters per verb (`verbs`).
 - **The profiler's cost** is measured: `cargo bench -p oprobe-trace --bench overhead` compares
   the same operations with and without the layer (budget 2 µs per operation), and the profile's
   `self` section reports scheduling lag and CPU during the run. A run where the client was

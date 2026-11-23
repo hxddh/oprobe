@@ -4,6 +4,60 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Added
+
+- **The timeline counts what it says** (`oprobe.report/6`, `oprobe.run/6`, `oprobe-trace`
+  `TimelinePoint`; additive fields):
+  - `goodput_ops_per_s` and `ok_ops_count`: successful operations per interval (`ops_per_s`
+    stays the attempted rate, failures included);
+  - `requests_count` / `requests_per_s` (every attempt, retries included) and `retries_count`,
+    so rate limits show as requests per second;
+  - `ops_count` (the operations behind an interval's quantiles) and `throttled_ops_count`;
+  - `verbs`: per-verb counters per interval (operations, successes, failures, throttled
+    responses, a latency sum and the heatmap rows), so a view can filter the timeline by verb.
+  - The `interval` event carries `goodput_ops_per_s`, `requests_count` and `retries_count`.
+- **The run's whole latency distribution** (`latency_histogram`: 20 bins per decade, every
+  operation, never sampled) in the report, the run file and `oprobe-trace`'s `Snapshot`. The
+  latency CDF is drawn from it when the trace rows are sampled.
+- Core view model: `HeatmapView` (rows in 1-1.5-2-3-5-7 steps per decade when every row was kept,
+  otherwise the report's 20 fixed rows), `TimelineView::for_verb` / `verbs`, goodput, requests,
+  retries, p90 / p99.9 / max and per-interval operation counts on `TimelineView`, and
+  `TimelineView::reliable(q)` / `min_ops_for(q)` (n ≥ 10 / (1 − q)) so renderers can mute
+  quantiles of intervals with too few operations; `FindingView::remedy_line`;
+  `Slice::throttle_share_ratio` for hot keys.
+
+### Changed
+
+- The timeline buckets events by **when they happened**: requests when sent, throttled responses
+  when they arrived, retries when issued and failures when the operation ended (operations and
+  their latency quantiles stay with the interval they started in). A 503 at +7 s is drawn at
+  +7 s, not at the second its operation began. Events of operations draining after the window
+  closed land in its last interval.
+- `tail_stragglers` names every API with stragglers (its cause lists each API's share), not only
+  the one with the largest gain; evidence gains `affected_apis_count`.
+- Hot keys in the view model carry `throttle_share_ratio` (share of all throttling); the slices'
+  `throttled_ratio` is the share of the slice's own requests, and is `None` for hot keys.
+
+### Fixed
+
+- `throttled_count` in the timeline (and `interval` events, `IntervalBlock`) counts throttled
+  **responses**, as documented and charted; it counted throttled operations, so a run with 41
+  throttled responses summed to 22.
+- A rate limit under OpenDAL's default retry (`lab://ratelimit`) is diagnosed as `rate_limit`, not
+  an in-flight limit: the service serving bursts of requests no cap of that size carries (request
+  rate within 8 service times above 1.5× `c / S`) refutes the in-flight model.
+- Findings weight sampled rows by the operations they stand for (`tail_stragglers`,
+  `hung_requests`, `cold_connections`): the samplers always keep the slowest, failed and throttled
+  operations, which over-weighed the tail. `tail_stragglers` takes the operation p50 / p99 from
+  the exact summary.
+- `repeated_reads` says its unit (requests saved per 1 000 successful read operations) and prints
+  the same number as its evidence value; per-1 000 values print as whole numbers.
+- `key_limit` (and any remedy that is not a layer) no longer prints its remedy twice in `show`.
+- The fine heatmap leaves warmup operations out and starts at the step just below the fastest
+  operation.
+
 ## v6.2.0 — 2026-11-23
 
 ### Changed
