@@ -139,3 +139,20 @@ Four streams, in this order of risk.
 - the schemas are re-blessed;
 - `docs/cli.md`, `troubleshooting.md` and `llms-full.txt` are updated;
 - the CHANGELOG has a `v7.0.0` section with a short migration note for trace consumers (`oprobe.trace/7`, request counts no longer labelled as operations).
+
+## 6. Dependencies: what is new and what 7.0 uses
+
+Checked on 2026-11-23 against crates.io.
+
+| Dependency | From → to | Decision |
+|---|---|---|
+| nsh-* | 0.6.0 → 0.6.1 | **Upgrade.** Fixes: placement and full screen requested while the window is hidden now apply when it shows (our `keep_placement`); a list row can no longer read new data at an old index. File association already works in 0.6.0 (`AppOptions.file_types`, `next_open_files`). A6 is a bug in our argument parsing and packaging, not in nsh |
+| OpenDAL | 0.59.5 (latest) | **Use `opendal-layer-observe-metrics-common` as the design reference for B1.** Its `MetricsLayer` wraps every service in `apply_service`, wraps the HTTP transport in `apply_context`, and records on cancellation. **Don't depend on it.** Its labels have no path, no operation-to-request link, and no range or retry data |
+| opentelemetry | 0.31 → **0.32** (not 0.33) | OpenDAL 0.59's `opendal-layer-otelmetrics` pins 0.32. Embedders who use both need one opentelemetry version, so both write to the same global `Meter`. Keep the semconv name `http.client.request.duration`; OpenDAL's metric of a similar name measures a different interval. Add OpenDAL's label names (`scheme`, `namespace`, `root`, `operation`) as attributes, so dashboards can join on them. This is a public dependency of `oprobe-trace`, so it belongs in 7.0 |
+| reqsign | aws-v4 3.3 → 3.5 (transitive) | **Upgrade.** Profiles with `role_arn` / `source_profile` now resolve (role chains). No API reports which provider supplied the credentials, so U3 derives the source from what oprobe can see itself: `AWS_*` variables, `AWS_PROFILE`, `options.*` |
+| rustls-platform-verifier | 0.6 → 0.7 | **Upgrade.** reqwest 0.13 already uses 0.7, so today two copies are compiled, and the claim "the same TLS stack as OpenDAL's client" is false |
+| sha2 0.11, zstd 0.14, dirs 7, rcgen 0.14, clap 4.6.9 | – | **Upgrade.** This removes duplicates; rcgen needs a one-line change in the lab |
+| webpki-roots, rustls-native-certs | – | **Remove.** Nothing uses them |
+| rand | 0.8 → 0.10 | **Skip.** The `SmallRng` seeding changed, so the same `--seed` would produce a different workload (docs/cli.md promises reproducibility). The only gain is removing duplicates |
+| toml | 0.8 → 1.x | **Skip.** It brings nothing new, and the formatting of `op.toml` and of the TOML diff would change |
+| Rust | MSRV 1.97; latest is 1.100 | **Keep MSRV 1.97.** Embedders depend on it (P4), and nothing new would delete real code |
