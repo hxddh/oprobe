@@ -351,8 +351,8 @@ impl Handle {
     /// ```
     pub fn save_and_reset(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
         self.linker.flush(&self.recorder);
-        let snapshot = self.recorder.snapshot_and_reset();
-        let rows = self.recorder.take_trace();
+        // The rows of the same window as the aggregates (one critical section).
+        let (snapshot, rows) = self.recorder.snapshot_and_reset_with_rows();
         file::write(path.as_ref(), self.service.get(), &snapshot, Some(&rows))
     }
 

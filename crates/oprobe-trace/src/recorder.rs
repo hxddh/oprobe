@@ -214,6 +214,10 @@ fn fold_end_sliver(mut t: Vec<TimelinePoint>, elapsed_s: f64) -> Vec<TimelinePoi
 /// 10-second intervals would be 259 200) and its file opens quickly.
 const MAX_INTERVALS: usize = 2000;
 
+/// Intervals an operation still running can hold open (with their latency histograms): an
+/// interval older than this closes even if one of its operations has not finished.
+const MAX_OPEN_INTERVALS: usize = MAX_INTERVALS / 4;
+
 /// Start and length (s) of interval `idx`.
 fn bucket_span(idx: usize) -> (f64, f64) {
     if idx < FINE_INTERVALS {
@@ -1297,8 +1301,10 @@ impl Recorder {
             }
             // Requests whose rows were dropped (more than the scope keeps) count at the start.
             b.requests += c.data.dropped_requests;
-            if let Some(h) = b.latency.as_mut() {
-                rec(h, c.latency_us);
+            match b.latency.as_mut() {
+                Some(h) => rec(h, c.latency_us),
+                // A late completion in an interval closed while it ran: its maximum stays exact.
+                None => b.q_us[4] = b.q_us[4].max(c.latency_us.min(HIST_MAX_US)),
             }
             b.heat[heat] += 1;
             let v = b.verb(c.verb);
@@ -1366,6 +1372,10 @@ impl Recorder {
             a.slow.sort_by(|x, y| y.latency_ms.total_cmp(&x.latency_ms));
             a.slow.truncate(SLOW_OPS_KEPT);
         }
+        // The row's trace shard, taken before the aggregate lock is released: a snapshot that
+        // resets the window (under the aggregate lock) takes the rows after this one is in, so
+        // an operation's row is in the same window as its aggregates.
+        let mut shard = self.trace(c.op_id);
         drop(a);
 
         // Trace rows (moved out of the scope data: no per-request allocation).
@@ -1400,7 +1410,7 @@ impl Recorder {
             sink.on_op(&row, &reqs);
         }
         // Whole operations: kept with all their requests, or not at all.
-        self.trace(c.op_id).push_whole_op(row, reqs);
+        shard.push_whole_op(row, reqs);
     }
 
     /// Make interval `idx` exist. A new interval closes the earlier ones that are complete:
@@ -1418,9 +1428,14 @@ impl Recorder {
             .values()
             .min()
             .copied();
+        // A long-lived operation (a writer or lister open for hours, a stream never drained)
+        // holds at most `MAX_OPEN_INTERVALS` open: older intervals close anyway, so the
+        // timeline can still be archived and stays bounded. Its completion then lands in the
+        // closed (or archived) interval's counters, without its latency histogram.
         let first_open = oldest_live
             .map(|t| bucket_index(t.saturating_duration_since(window_start).as_secs()))
             .unwrap_or(idx)
+            .max(idx.saturating_sub(MAX_OPEN_INTERVALS))
             .min(idx);
         for b in a.buckets.iter_mut().take(first_open.saturating_sub(a.base)) {
             b.close();
@@ -1525,17 +1540,27 @@ impl Recorder {
     }
 
     pub fn snapshot(&self) -> Snapshot {
-        self.snapshot_with(false)
+        self.snapshot_with(false, None)
     }
 
     /// The aggregates so far, and a fresh window from now on (design v7 P2): every aggregate
     /// starts again from zero, atomically with the snapshot, so successive snapshots cover
     /// disjoint windows. Operations in flight are counted in the window they complete in.
     pub fn snapshot_and_reset(&self) -> Snapshot {
-        self.snapshot_with(true)
+        self.snapshot_with(true, None)
     }
 
-    fn snapshot_with(&self, reset: bool) -> Snapshot {
+    /// [`Recorder::snapshot_and_reset`] with the trace rows of the same window
+    /// ([`Recorder::take_trace`]): taken in the same critical section, so every row's operation
+    /// is in the snapshot's aggregates, and every operation in the aggregates whose row was
+    /// kept has its row here.
+    pub fn snapshot_and_reset_with_rows(&self) -> (Snapshot, TraceRows) {
+        let mut rows = TraceRows::default();
+        let snap = self.snapshot_with(true, Some(&mut rows));
+        (snap, rows)
+    }
+
+    fn snapshot_with(&self, reset: bool, rows: Option<&mut TraceRows>) -> Snapshot {
         let elapsed = self.elapsed_s().max(1e-3);
         let mut a = self.agg();
         let mib = |b: u64| b as f64 / (1024.0 * 1024.0);
@@ -1774,6 +1799,11 @@ impl Recorder {
                     .map(|v| (v.value_iterated_to(), v.count_at_value())),
             ),
         };
+        if let Some(rows) = rows {
+            // Under the aggregate lock: a completion counted above holds its trace shard until
+            // its row is in (see `complete_op_inner`), so taking every shard waits for it.
+            *rows = self.take_trace();
+        }
         if reset {
             // Under the aggregate lock: nothing recorded between the snapshot and the reset is
             // lost. The connection details (ALPN, TLS, remotes) describe the pool, which lives on.
@@ -1924,6 +1954,106 @@ mod tests {
                 .all(|p| p.p50_ms >= 1.0 && p.max_ms <= 1.7)
         );
         assert_eq!(t[t.len() - 1].len_s, COARSE_S as f64);
+    }
+
+    /// One operation left running (a writer open for days, a stream never drained) does not
+    /// keep every later interval open: the timeline stays bounded, and the operation lands in
+    /// the timeline when it finally completes.
+    #[test]
+    fn a_long_lived_operation_does_not_hold_the_timeline_open() {
+        let rec = Recorder::always_on(0);
+        let start = rec.window_start();
+        let op = |id: u64, s: u64, latency_us: u64| OpCompletion {
+            verb: "stat",
+            op_id: id,
+            started: start + std::time::Duration::from_secs(s),
+            latency_us,
+            logical_read: 0,
+            logical_write: 0,
+            error: None,
+            key: String::new(),
+            data: Default::default(),
+            schedule_us: None,
+        };
+        // The long-lived operation starts at second 5 and stays open.
+        rec.op_started_at(u64::MAX, start + std::time::Duration::from_secs(5));
+        let span_s: u64 = 10 * 86_400;
+        let mut n = 0u64;
+        for s in (0..span_s).step_by(10) {
+            n += 1;
+            rec.op_started_at(n, start + std::time::Duration::from_secs(s));
+            rec.complete_op(true, op(n, s, 1_000));
+            let a = rec.agg();
+            assert!(
+                a.archive.len() + a.buckets.len() <= MAX_INTERVALS,
+                "at {s} s: {} archived + {} live",
+                a.archive.len(),
+                a.buckets.len()
+            );
+        }
+        // It completes at last: counted once, in the oldest interval the timeline still holds.
+        rec.complete_op(true, op(u64::MAX, 5, (span_s - 5) * 1_000_000));
+        let snap = rec.snapshot();
+        let t = &snap.timeline;
+        assert!(t.len() <= MAX_INTERVALS, "{}", t.len());
+        assert_eq!(t.iter().map(|p| p.ops_count).sum::<u64>(), n + 1);
+        assert_eq!(snap.summary.ops, n + 1);
+        assert!(t.iter().any(|p| p.max_ms > 1_000.0));
+    }
+
+    /// Windows saved while operations complete on other threads: each window's rows are the
+    /// rows of the operations in its aggregates, never one window's aggregates with the next
+    /// window's rows.
+    #[test]
+    fn a_reset_window_keeps_its_rows_with_its_aggregates() {
+        let rec = Recorder::always_on(10_000_000);
+        let stop = Arc::new(AtomicBool::new(false));
+        let next = Arc::new(AtomicU64::new(1));
+        let workers: Vec<_> = (0..4)
+            .map(|_| {
+                let (rec, stop, next) = (rec.clone(), stop.clone(), next.clone());
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let id = next.fetch_add(1, Ordering::Relaxed);
+                        rec.op_started(id);
+                        rec.complete_op(
+                            true,
+                            OpCompletion {
+                                verb: "stat",
+                                op_id: id,
+                                started: Instant::now(),
+                                latency_us: 10,
+                                logical_read: 0,
+                                logical_write: 0,
+                                error: None,
+                                key: String::new(),
+                                data: Default::default(),
+                                schedule_us: None,
+                            },
+                        );
+                    }
+                })
+            })
+            .collect();
+        let (mut ops, mut rows) = (0u64, 0u64);
+        for _ in 0..5000 {
+            let (snap, r) = rec.snapshot_and_reset_with_rows();
+            assert_eq!(
+                r.ops.len() as u64,
+                snap.summary.ops,
+                "a window's rows and aggregates disagree"
+            );
+            ops += snap.summary.ops;
+            rows += r.ops.len() as u64;
+        }
+        stop.store(true, Ordering::Relaxed);
+        for w in workers {
+            w.join().unwrap();
+        }
+        let (snap, r) = rec.snapshot_and_reset_with_rows();
+        assert_eq!(r.ops.len() as u64, snap.summary.ops);
+        assert!(ops > 0);
+        assert_eq!(ops + snap.summary.ops, rows + r.ops.len() as u64);
     }
 
     fn req(start: u64, queue: u64, total: u64) -> RequestRecord {
