@@ -42,7 +42,15 @@ async fn a_memory_operator_reports_its_requests() {
     let down: u64 = snap.apis.iter().map(|a| a.bytes_down).sum();
     assert_eq!(down, 10 * 1024);
 
-    // The profile holds the aggregates and every request (outside any operation: op id 0).
+    // Every call is an operation with its request (design v7 B1).
+    assert_eq!(snap.summary.ops, 21);
+    let verbs: Vec<&str> = snap.verbs.iter().map(|v| v.verb.as_str()).collect();
+    assert_eq!(verbs, ["read.full", "stat", "write"]);
+    assert!(snap.verbs.iter().all(|v| v.requests_per_op == 1.0));
+    assert_eq!(snap.bytes.logical_read, 10 * 1024);
+    assert_eq!(snap.bytes.logical_write, 10 * 1024);
+
+    // The profile holds the aggregates, every operation and every request, linked.
     let path = temp_file("requests");
     handle.save(&path).unwrap();
     let doc = read_json(&path);
@@ -52,7 +60,20 @@ async fn a_memory_operator_reports_its_requests() {
     assert_eq!(doc["service"]["scheme"], "memory");
     let reqs = doc["rows"]["reqs"].as_array().unwrap();
     assert_eq!(reqs.len(), 21);
-    assert!(reqs.iter().all(|r| r["op_id"] == 0));
+    let ops = doc["rows"]["ops"].as_array().unwrap();
+    assert_eq!(ops.len(), 21);
+    let ids: std::collections::BTreeSet<u64> =
+        ops.iter().map(|o| o["op_id"].as_u64().unwrap()).collect();
+    assert!(
+        reqs.iter()
+            .all(|r| ids.contains(&r["op_id"].as_u64().unwrap()))
+    );
+    // Keys are hashed, never recorded (docs/privacy.md).
+    assert!(
+        ops.iter()
+            .all(|o| o["key"].as_str().unwrap().starts_with('#')),
+        "{ops:#?}"
+    );
     assert_eq!(doc["rows"]["sampling"]["seen_requests"], 21);
     let apis = doc["snapshot"]["apis"].as_array().unwrap();
     let total: u64 = apis

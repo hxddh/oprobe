@@ -20,6 +20,7 @@ oprobe-core = { version = "=6.3.0", path = "crates/oprobe-core", default-feature
 
 opendal = { version = "0.59", default-features = false }
 opendal-core = { version = "0.59", default-features = false }
+opendal-layer-retry = "0.59"
 await-tree = "0.3"
 hyper = { version = "1", features = ["client", "server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "server", "server-auto", "http1", "http2", "tokio"] }

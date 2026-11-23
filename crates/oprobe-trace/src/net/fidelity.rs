@@ -664,6 +664,7 @@ impl Drop for CancelGuard {
             return;
         }
         let record = RequestRecord {
+            operation: None,
             api: self.api,
             method: std::mem::take(&mut self.method),
             status: 0,
@@ -876,6 +877,17 @@ impl HttpTransport for FidelityTransport {
             url.query(),
         );
         let bytes_up = body.len() as u64;
+        // What the service asked for: the byte range's length (over-read, range sizes) and the
+        // OpenDAL operation (`read`, `write`, …: the `operation` label of exported metrics).
+        let range_bytes = parts
+            .headers
+            .get(http::header::RANGE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(super::range_len);
+        let operation = parts
+            .extensions
+            .get::<opendal_core::raw::Operation>()
+            .map(|o| o.into_static());
         let inflight = InflightGuard::start(recorder.clone());
         let start_offset_us = scope
             .as_ref()
@@ -892,6 +904,7 @@ impl HttpTransport for FidelityTransport {
             recorder.clone(),
         );
         let mut record = RequestRecord {
+            operation,
             api,
             method: method.to_string(),
             status: 0,
@@ -1040,10 +1053,9 @@ impl HttpTransport for FidelityTransport {
                 .map(str::to_owned)
         };
         record.request_id = REQUEST_ID_HEADERS.iter().find_map(|h| header(h));
-        record.detail = Some(Box::new(super::signals::from_headers(
-            resp.headers(),
-            record.status,
-        )));
+        let mut detail = super::signals::from_headers(resp.headers(), record.status);
+        detail.range_bytes = range_bytes;
+        record.detail = Some(Box::new(detail));
         let sniff = (record.status >= 400).then(super::signals::ErrorSniffer::default);
         if record.is_throttle() {
             record.retry_after_ms = header("retry-after")

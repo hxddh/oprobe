@@ -237,6 +237,10 @@ pub struct ReqDetail {
     /// Retransmitted segments on the connection during this request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retrans_count: Option<u64>,
+    /// The length of the byte range the request asked for (`Range: bytes=a-b`); absent for a
+    /// whole object or an open-ended range. Against `bytes_down` it shows over-read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range_bytes: Option<u64>,
 }
 
 impl ReqDetail {

@@ -54,6 +54,13 @@ fn push(
     let scope = OpScope::current();
     let total = started.elapsed().as_micros() as u64;
     let rec = RequestRecord {
+        operation: Some(match api {
+            Api::GetObject => "read",
+            Api::HeadObject => "stat",
+            Api::ListObjects => "list",
+            Api::DeleteObject => "delete",
+            _ => "write",
+        }),
         api,
         method: api.label().to_owned(),
         status: match err {

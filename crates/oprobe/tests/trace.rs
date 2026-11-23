@@ -39,7 +39,8 @@ fn validate(name: &str, v: &Value) {
 }
 
 /// The application: an S3 operator on the lab with `faults`, the trace layer applied first and
-/// a retry layer above it, as `docs/embedding.md` says; `reads` passes over 30 objects.
+/// a retry layer above it reporting to the trace, as `docs/embedding.md` says; `reads` passes
+/// over 30 objects.
 async fn traced_workload(
     path: &Path,
     faults: LabConfig,
@@ -68,18 +69,21 @@ async fn traced_workload(
             RetryLayer::default()
                 .with_min_delay(Duration::from_millis(5))
                 .with_max_delay(Duration::from_millis(20))
-                .with_max_times(6),
+                .with_max_times(6)
+                .with_notify(handle.retry_notify()),
         );
     for i in 0..30 {
-        op.write(&format!("k{i}"), vec![7u8; 4096]).await.unwrap();
+        op.write(&format!("logs/k{i}"), vec![7u8; 4096])
+            .await
+            .unwrap();
     }
     for _ in 0..reads {
         for i in 0..30 {
-            assert_eq!(op.read(&format!("k{i}")).await.unwrap().len(), 4096);
+            assert_eq!(op.read(&format!("logs/k{i}")).await.unwrap().len(), 4096);
         }
     }
     for i in 0..10 {
-        op.stat(&format!("k{i}")).await.unwrap();
+        op.stat(&format!("logs/k{i}")).await.unwrap();
     }
     handle.save(path).unwrap();
     lab.requests_served()
@@ -96,7 +100,10 @@ async fn show_opens_a_production_trace_and_prove_refuses_it() {
         ..Default::default()
     };
     let served = traced_workload(&file, throttle, oprobe::trace::Config::default(), 2).await;
-    let doc: Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    let text = std::fs::read_to_string(&file).unwrap();
+    // Keys are hashed (docs/privacy.md): the first path segment, never the key.
+    assert!(!text.contains("logs/k1"), "a key is in the file");
+    let doc: Value = serde_json::from_str(&text).unwrap();
     assert_eq!(doc["format"], "oprobe.trace/6");
     assert_eq!(doc["service"]["scheme"], "s3");
     assert_eq!(doc["service"]["name"], "app-bucket");
@@ -121,10 +128,35 @@ async fn show_opens_a_production_trace_and_prove_refuses_it() {
     assert!(r["workload"]["mix"].as_array().unwrap().is_empty());
     assert_eq!(r["target"]["scheme"], "s3");
     assert_eq!(r["spec"]["operator_ref"], "s3://app-bucket/prod");
-    // Every request the application made is counted, and each stands in for an operation.
+    // Every request the application made is counted, under the operation that issued it: 30
+    // writes, 60 reads and 10 stats, each with its retries (design v7 B1).
     let requests = r["connections"]["requests_count"].as_u64().unwrap();
     assert_eq!(requests, served, "the lab served every traced request");
-    assert_eq!(r["summary"]["ops_count"].as_u64().unwrap(), requests);
+    assert_eq!(r["summary"]["ops_count"].as_u64().unwrap(), 100);
+    assert!(requests > 100, "retried requests: {requests}");
+    assert_eq!(r["summary"]["failed_ops_count"].as_u64().unwrap(), 0);
+    let verbs: Vec<&str> = r["verbs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v["verb"].as_str().unwrap())
+        .collect();
+    for v in ["read.full", "write", "stat"] {
+        assert!(verbs.contains(&v), "{v}: {verbs:?}");
+    }
+    // The retry layer reported its retries, attributed to their operations.
+    let retries = r["resilience"]["retries_count"].as_u64().unwrap();
+    assert_eq!(retries, requests - 100, "every extra request is a retry");
+    assert!(r["resilience"]["retry_backoff_ms"].as_f64().unwrap() > 0.0);
+    // Hot keys and prefixes from the operations, with hashed keys.
+    let hot = r["dimensions"]["hot_keys"].as_array().unwrap();
+    assert!(!hot.is_empty());
+    assert!(
+        hot.iter()
+            .all(|k| k["key"].as_str().unwrap().starts_with("logs/#")),
+        "{hot:#?}"
+    );
+    assert_eq!(r["dimensions"]["prefixes"][0]["key"], "logs/");
     let api_total: u64 = r["apis"]
         .as_array()
         .unwrap()
@@ -135,12 +167,13 @@ async fn show_opens_a_production_trace_and_prove_refuses_it() {
     assert_eq!(v["requests_count"].as_u64().unwrap(), reqs_in_file);
     assert_eq!(reqs_in_file, requests, "nothing was sampled away");
     assert_eq!(
-        v["ops_count"], 0,
-        "an embedder's trace has no operation rows"
+        v["ops_count"], 100,
+        "an embedder's trace has operation rows"
     );
     assert!(r["summary"]["latency"]["p50_ms"].as_f64().unwrap() > 0.0);
+    // Requests are no longer counted as operations.
     assert!(
-        r["warnings"]
+        !r["warnings"]
             .as_array()
             .unwrap()
             .iter()
@@ -162,14 +195,9 @@ async fn show_opens_a_production_trace_and_prove_refuses_it() {
     for f in findings {
         let code = f["code"].as_str().unwrap();
         assert!(
-            oprobe::model::trace_file::TRACE_FINDINGS.contains(&code),
-            "{code} needs operations or a varied load"
-        );
-        assert!(
-            f["evidence"]["op_ids"]
-                .as_array()
-                .unwrap_or(&vec![])
-                .is_empty()
+            oprobe::model::trace_file::TRACE_FINDINGS.contains(&code)
+                || oprobe::model::trace_file::OP_TRACE_FINDINGS.contains(&code),
+            "{code} needs a varied load"
         );
     }
 

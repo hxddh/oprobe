@@ -1,12 +1,13 @@
 //! Thread-safe aggregation of trace records into histograms, timelines and slow-op samples.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use hdrhistogram::Histogram;
 
+use crate::util::FxHashMap as HashMap;
 use crate::log::{TraceLog, TraceRows, attempts, op_row, req_row};
 use crate::record::{Api, Protocol, RequestRecord};
 use crate::scope::OpScopeData;
@@ -552,6 +553,11 @@ pub trait Exporter: Send + Sync {
     fn on_op(&self, verb: &'static str, latency_us: u64, failed: bool) {
         let _ = (verb, latency_us, failed);
     }
+    /// The OpenDAL service the layer was applied to (once, before its first request): its
+    /// scheme, name (the bucket: OpenDAL's `namespace` label) and root.
+    fn on_service(&self, scheme: &str, name: &str, root: &str) {
+        let _ = (scheme, name, root);
+    }
 }
 
 /// Receives every trace row of the measurement window as operations complete (design v5 §2):
@@ -593,6 +599,8 @@ pub struct Recorder {
     proxy: Mutex<Option<String>>,
     // await-tree slow-path capture
     tree_registry: Mutex<Option<await_tree::Registry>>,
+    /// A tree registry is set: completions look for captured trees.
+    trees_on: AtomicBool,
     live_ops: Mutex<HashMap<u64, Instant>>,
     trees: Mutex<HashMap<u64, String>>,
     client: Mutex<ClientStats>,
@@ -631,8 +639,9 @@ impl Recorder {
             cache_enabled: AtomicBool::new(false),
             proxy: Mutex::new(None),
             tree_registry: Mutex::new(None),
-            live_ops: Mutex::new(HashMap::new()),
-            trees: Mutex::new(HashMap::new()),
+            trees_on: AtomicBool::new(false),
+            live_ops: Mutex::new(HashMap::default()),
+            trees: Mutex::new(HashMap::default()),
             client: Mutex::new(ClientStats {
                 cpu_cores: std::thread::available_parallelism()
                     .map(|n| n.get())
@@ -670,6 +679,11 @@ impl Recorder {
     /// Install the exporter hook (the first call wins; returns whether it was installed).
     pub fn set_exporter(&self, e: Arc<dyn Exporter>) -> bool {
         self.exporter.set(e).is_ok()
+    }
+
+    /// The exporter hook, when one is installed.
+    pub fn exporter(&self) -> Option<&Arc<dyn Exporter>> {
+        self.exporter.get()
     }
 
     fn trace(&self, op_id: u64) -> std::sync::MutexGuard<'_, TraceLog> {
@@ -723,6 +737,7 @@ impl Recorder {
 
     pub fn set_tree_registry(&self, reg: await_tree::Registry) {
         *self.tree_registry.lock().unwrap_or_else(|e| e.into_inner()) = Some(reg);
+        self.trees_on.store(true, Ordering::Release);
     }
 
     pub fn phase(&self) -> Phase {
@@ -934,6 +949,23 @@ impl Recorder {
         }
     }
 
+    /// A retry outside any operation scope (an embedder's retry layer with no operation to
+    /// attribute it to): counted in the resilience totals and the interval it was issued in.
+    pub fn record_unscoped_retry(&self, backoff: std::time::Duration) {
+        if !self.is_measuring() {
+            return;
+        }
+        let window_start = self.window_start();
+        let frozen = self.frozen_elapsed_us.load(Ordering::Acquire);
+        let issued = window_start.elapsed() + backoff;
+        let idx = event_bucket(issued.as_micros() as u64, frozen);
+        let mut a = self.agg();
+        a.res.retries += 1;
+        a.res.retry_backoff_ms += backoff.as_secs_f64() * 1000.0;
+        self.ensure_bucket(&mut a, idx, window_start);
+        a.buckets[idx].retries += 1;
+    }
+
     pub fn record_integrity(&self, ok: bool) {
         let mut a = self.agg();
         if ok {
@@ -1044,11 +1076,14 @@ impl Recorder {
                 .unwrap_or_else(|e| e.into_inner())
                 .remove(&c.op_id);
         };
-        let tree = self
-            .trees
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&c.op_id);
+        let tree = if self.trees_on.load(Ordering::Acquire) {
+            self.trees
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&c.op_id)
+        } else {
+            None
+        };
         if !measured || !self.is_measuring() {
             forget_live();
             if self.phase() == Phase::Warmup {
@@ -1691,6 +1726,7 @@ mod tests {
 
     fn req(start: u64, queue: u64, total: u64) -> RequestRecord {
         RequestRecord {
+            operation: None,
             api: Api::GetObject,
             method: "GET".into(),
             status: 200,

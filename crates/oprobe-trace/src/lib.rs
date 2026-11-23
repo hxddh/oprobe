@@ -79,7 +79,7 @@ macro_rules! internal_use {
 }
 
 internal_mods!(
-    dims, file, layer, log, net, record, recorder, rows, sample, scope, snapshot, util
+    dims, file, layer, log, net, observe, record, recorder, rows, sample, scope, snapshot, util
 );
 
 #[cfg(feature = "otel")]
@@ -90,6 +90,7 @@ use std::sync::Arc;
 
 pub use dims::{DimensionStats, HotKeyStats, SliceStats};
 pub use net::HttpVersion;
+pub use observe::RetryNotify;
 pub use record::{Api, Protocol, RequestRecord, RequestTiming};
 pub use recorder::Exporter;
 pub use rows::{FailureCode, ReqDetail, TcpRow, TlsRow};
@@ -102,6 +103,7 @@ pub use snapshot::{
 
 internal_use!(file::{ServiceRecord, TRACE_FORMAT, TraceFile});
 internal_use!(layer::{InProcessObserveLayer, TraceContextLayer});
+internal_use!(observe::{Linker, OperationObserveLayer, error_class, private_key});
 internal_use!(log::{DEFAULT_MAX_REQUESTS, TraceLog, TraceRows});
 internal_use!(record::classify_http);
 internal_use!(recorder::{Budget, DialRecord, InflightGuard, OpCompletion, Recorder, RowSink});
@@ -227,13 +229,15 @@ impl Config {
     }
 }
 
-/// The OpenDAL layer of [`layer`]: the instrumented HTTP transport and scope propagation for
-/// HTTP services, one record per backend call for in-process services.
+/// The OpenDAL layer of [`layer`]: every OpenDAL call as one operation, with the backend
+/// requests it issued (the instrumented HTTP transport and scope propagation for HTTP services,
+/// one record per backend call for in-process services).
 #[derive(Clone)]
 pub struct TraceLayer {
     recorder: Arc<Recorder>,
     context: Option<TraceContextLayer>,
     service: Arc<std::sync::OnceLock<file::ServiceRecord>>,
+    linker: Arc<observe::Linker>,
 }
 
 impl std::fmt::Debug for TraceLayer {
@@ -251,16 +255,25 @@ impl opendal_core::raw::Layer for TraceLayer {
     fn apply_service(&self, srv: opendal_core::raw::Servicer) -> opendal_core::raw::Servicer {
         use opendal_core::raw::*;
         let info = srv.info();
-        self.service.get_or_init(|| file::ServiceRecord {
-            scheme: info.scheme().to_owned(),
-            name: info.name().to_string(),
-            root: info.root().to_string(),
+        self.service.get_or_init(|| {
+            let s = file::ServiceRecord {
+                scheme: info.scheme().to_owned(),
+                name: info.name().to_string(),
+                root: info.root().to_string(),
+            };
+            if let Some(e) = self.recorder.exporter() {
+                e.on_service(&s.scheme, &s.name, &s.root);
+            }
+            s
         });
-        if in_process(info.scheme()) {
+        // In-process services: one request per backend call, beneath the operation.
+        let srv = if in_process(info.scheme()) {
             InProcessObserveLayer::new(self.recorder.clone()).apply_service(srv)
         } else {
             srv
-        }
+        };
+        observe::OperationObserveLayer::new(self.recorder.clone(), self.linker.clone())
+            .apply_service(srv)
     }
 
     fn apply_context(
@@ -281,6 +294,7 @@ pub struct Handle {
     recorder: Arc<Recorder>,
     transport_error: Option<Arc<str>>,
     service: Arc<std::sync::OnceLock<file::ServiceRecord>>,
+    linker: Arc<observe::Linker>,
 }
 
 impl std::fmt::Debug for Handle {
@@ -294,7 +308,25 @@ impl std::fmt::Debug for Handle {
 impl Handle {
     /// The aggregates so far: per API and stage, per verb, connections, bytes, timeline.
     pub fn snapshot(&self) -> Snapshot {
+        self.linker.flush(&self.recorder);
         self.recorder.snapshot()
+    }
+
+    /// The retry notifier for OpenDAL's `RetryLayer`, so retries are part of the profile (the
+    /// Retries section: count, backoff, throttling) and the attempts of one call are one
+    /// operation:
+    ///
+    /// ```
+    /// # use opendal_core::{Operator, services::Memory};
+    /// # fn demo(op: Operator) {
+    /// let (trace, handle) = oprobe_trace::layer(oprobe_trace::Config::default());
+    /// let op = op
+    ///     .layer(trace)
+    ///     .layer(opendal_layer_retry::RetryLayer::new().with_notify(handle.retry_notify()));
+    /// # }
+    /// ```
+    pub fn retry_notify(&self) -> RetryNotify {
+        RetryNotify::new(self.recorder.clone(), self.linker.clone())
     }
 
     /// Write a `.oprobe` profile to `path`: the aggregates so far plus the sampled operations
@@ -348,16 +380,19 @@ pub fn layer(cfg: Config) -> (TraceLayer, Handle) {
             Err(e) => (None, Some(Arc::from(format!("{e:#}")))),
         };
     let service = Arc::new(std::sync::OnceLock::new());
+    let linker = Arc::new(observe::Linker::default());
     (
         TraceLayer {
             recorder: recorder.clone(),
             context,
             service: service.clone(),
+            linker: linker.clone(),
         },
         Handle {
             recorder,
             transport_error,
             service,
+            linker,
         },
     )
 }

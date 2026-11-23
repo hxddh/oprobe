@@ -328,6 +328,7 @@ mod tests {
 
     fn rec(api: Api, start: u64, status: u16) -> RequestRecord {
         RequestRecord {
+            operation: None,
             api,
             method: "GET".into(),
             status,

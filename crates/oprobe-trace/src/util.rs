@@ -92,3 +92,62 @@ pub fn pct(num: f64, den: f64) -> f64 {
 pub fn ratio(num: f64, den: f64) -> f64 {
     if den > 0.0 { num / den } else { 0.0 }
 }
+
+
+/// A fast, non-cryptographic hasher for the recorder's maps (operation ids, keys, prefixes):
+/// the `FxHash` of rustc. The keys are the application's own (or hashed) names and ids, and
+/// the maps are bounded.
+#[derive(Clone, Copy, Default)]
+pub struct FxHasher(u64);
+
+const FX_SEED: u64 = 0x517c_c1b7_2722_0a95;
+
+impl FxHasher {
+    #[inline]
+    fn add(&mut self, w: u64) {
+        self.0 = (self.0.rotate_left(5) ^ w).wrapping_mul(FX_SEED);
+    }
+}
+
+impl std::hash::Hasher for FxHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut chunks = bytes.chunks_exact(8);
+        for c in &mut chunks {
+            self.add(u64::from_le_bytes(c.try_into().expect("8 bytes")));
+        }
+        let rest = chunks.remainder();
+        if !rest.is_empty() {
+            let mut b = [0u8; 8];
+            b[..rest.len()].copy_from_slice(rest);
+            self.add(u64::from_le_bytes(b));
+        }
+    }
+
+    #[inline]
+    fn write_u8(&mut self, i: u8) {
+        self.add(u64::from(i));
+    }
+
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        self.add(i);
+    }
+
+    #[inline]
+    fn write_usize(&mut self, i: usize) {
+        self.add(i as u64);
+    }
+
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+/// A `HashMap` with [`FxHasher`].
+pub type FxHashMap<K, V> =
+    std::collections::HashMap<K, V, std::hash::BuildHasherDefault<FxHasher>>;
+
+/// A `HashSet` with [`FxHasher`].
+pub type FxHashSet<K> = std::collections::HashSet<K, std::hash::BuildHasherDefault<FxHasher>>;
