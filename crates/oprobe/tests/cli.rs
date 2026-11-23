@@ -1027,8 +1027,11 @@ fn a_run_file_alone_opens_the_app() {
         assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
         let t = stdout(&o);
         assert!(t.contains("the app"), "{t}");
+        // The path is quoted for the shell where it needs it (Windows paths always do).
+        let name = file.file_name().unwrap().to_string_lossy();
         assert!(
-            t.contains(&format!("oprobe show {}", file.display())),
+            t.lines()
+                .any(|l| l.contains("oprobe show ") && l.contains(name.as_ref())),
             "{t}"
         );
     }

@@ -800,7 +800,8 @@ async fn connection_refused_fails_fast() {
     );
     let body = oprobe::errors::classify(&err, "s3");
     let detail = body.detail.expect("the storage library's report");
-    assert!(detail.contains("Connection refused"), "{detail}");
+    // "Connection refused" on Unix, "actively refused" on Windows.
+    assert!(detail.to_lowercase().contains("refused"), "{detail}");
     assert!(
         !detail.contains("error sending request: error sending request"),
         "no text twice: {detail}"
