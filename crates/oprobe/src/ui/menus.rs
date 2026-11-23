@@ -68,13 +68,43 @@ const ALL: &[&str] = &[
     QUIT,
 ];
 
-/// The documentation's and the project's addresses.
-pub const DOCS: &str = "https://github.com/hxddh/oprobe/tree/main/docs";
+/// The documentation of the installed version (its release tag, not `main`).
+pub fn docs() -> String {
+    format!(
+        "https://github.com/hxddh/oprobe/tree/v{}/docs",
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
+/// The project's address.
 pub const HOME: &str = "https://github.com/hxddh/oprobe";
+
+/// Help ▸ Documentation, and Help ▸ Glossary (the terms a profile prints).
+fn help_items() -> [MenuItem; 2] {
+    [
+        MenuItem::new(tr("menu.docs")).on_select(|| {
+            let _ = open_url(docs());
+        }),
+        MenuItem::new(tr("menu.glossary")).on_select(|| {
+            let _ = open_url(crate::util::glossary_url());
+        }),
+    ]
+}
 
 /// A role item of the platform, labelled in the app's language.
 fn role(r: MenuRole, key: &'static str) -> MenuItem {
     MenuItem::role(r).label(tr(key))
+}
+
+/// "Show in Finder" (macOS), "Show in Explorer" (Windows), "Show in Files" (elsewhere).
+fn reveal_key() -> &'static str {
+    if mac() {
+        "menu.reveal_mac"
+    } else if windows() {
+        "menu.reveal_windows"
+    } else {
+        "menu.reveal"
+    }
 }
 
 /// Settings is "Preferences" on GNOME, "Settings" on macOS and Windows.
@@ -262,9 +292,7 @@ pub fn application(s: Store) -> Vec<MenuItem> {
             ],
         ));
     }
-    let mut help = vec![MenuItem::new(tr("menu.docs")).on_select(|| {
-        let _ = open_url(DOCS);
-    })];
+    let mut help: Vec<MenuItem> = help_items().into();
     if !mac() {
         help.push(MenuItem::separator());
         help.push(about_item(s, modal));
@@ -306,11 +334,9 @@ pub fn primary(s: Store) -> Vec<MenuItem> {
         MenuItem::new(tr(settings_key()))
             .disabled(modal)
             .on_select(move || s.open_settings()),
-        MenuItem::new(tr("menu.docs")).on_select(|| {
-            let _ = open_url(DOCS);
-        }),
-        about_item(s, modal),
     ];
+    items.extend(help_items());
+    items.push(about_item(s, modal));
     // A terminal quits with Ctrl+C.
     if !crate::ui::kit::in_terminal() {
         items.push(MenuItem::separator());
@@ -343,6 +369,7 @@ pub fn run_context(s: Store, id: &str) {
         vec![id.to_owned()]
     };
     let one = ids.len() == 1;
+    let reveal = ids[0].clone();
     let (open, cmp, prove, copy, cmd, del) = (
         ids.clone(),
         ids.clone(),
@@ -376,6 +403,15 @@ pub fn run_context(s: Store, id: &str) {
         MenuItem::separator(),
         MenuItem::new(tr("menu.copy_id")).on_select(move || s.copy(copy.clone())),
         MenuItem::new(tr("menu.copy_command")).on_select(move || s.copy(cmd.clone())),
+        // The run's file, to hand a teammate (a run id means nothing to them).
+        MenuItem::new(tr(reveal_key()))
+            .disabled(!one || crate::ui::kit::in_terminal())
+            .on_select(move || {
+                let file = s.run_file(&reveal);
+                s.task(async move {
+                    let _ = reveal_path(file).await;
+                });
+            }),
         MenuItem::separator(),
         MenuItem::new(tr("menu.delete")).on_select(move || s.ask_delete(del.clone())),
     ];

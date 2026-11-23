@@ -238,7 +238,9 @@ impl Session {
                 && (needs_objects || mix.iter().any(|m| m.weight > 0 && m.op.is_write()));
             // Fail fast: few retries, short timeouts (the admin operator retries for minutes).
             let quick = super::operator::preflight_operator(&base, &target)?;
-            crate::guard::preflight(&quick, &run_prefix, writes).await?;
+            crate::guard::preflight(&quick, &run_prefix, writes)
+                .await
+                .map_err(|e| super::operator::explain_preflight(e, &target))?;
         }
         let p2 = progress.clone();
         let dataset = Dataset::prepare(

@@ -1,5 +1,5 @@
-<!-- WiX Toolset v4 source for the oprobe MSI (per-machine): adds oprobe to PATH and a Start menu
-     shortcut that opens the app (a bare `oprobe`).
+<!-- WiX Toolset v4 source for the oprobe MSI (per-machine): adds oprobe to PATH, a Start menu
+     shortcut that opens the app (a bare `oprobe`) and the `.oprobe` file association.
      Built by .github/workflows/release.yml:
        wix build packaging/windows/oprobe.wxs -arch x64 -d Version=2.0.0 -d BinDir=... \
          -d IconFile=packaging/desktop/oprobe.ico -o oprobe-2.0.0-x64.msi -->
@@ -30,6 +30,12 @@
         </File>
         <Environment Id="PathEntry" Name="PATH" Value="[INSTALLFOLDER]" Permanent="no"
                      Part="last" Action="set" System="yes" />
+        <!-- Double-clicking a `.oprobe` run file opens it in the app (`oprobe FILE`). -->
+        <ProgId Id="oprobe.run" Description="oprobe run">
+          <Extension Id="oprobe" ContentType="application/x-oprobe-run">
+            <Verb Id="open" TargetFile="oprobe.exe" Argument="&quot;%1&quot;" />
+          </Extension>
+        </ProgId>
       </Component>
       <Component Id="Docs" Guid="8A4D2E61-5B3C-4E7F-A1D9-0C6B2F8E4A73">
         <File Source="$(var.BinDir)\README.md" KeyPath="yes" />

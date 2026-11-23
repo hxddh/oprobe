@@ -200,12 +200,12 @@ async fn show_opens_a_production_trace_and_prove_refuses_it() {
         e["error"]["hint"]
             .as_str()
             .unwrap()
-            .contains("prove needs a run oprobe drove: `oprobe run OPERATOR`"),
+            .contains("`oprobe run s3://app-bucket/prod`"),
         "{e:#}"
     );
     let o = oprobe(dir.path(), &["prove", f]);
     assert_eq!(o.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&o.stderr).contains("oprobe run OPERATOR"));
+    assert!(String::from_utf8_lossy(&o.stderr).contains("oprobe run s3://app-bucket/prod"));
 
     // Nothing was stored: a trace is opened, not imported.
     assert!(!dir.path().join("data").join("runs").exists());

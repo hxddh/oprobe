@@ -21,6 +21,12 @@ let op = op.layer(layer);
 handle.save("prod.oprobe")?;          // then: oprobe show prod.oprobe
 ```
 
+**Compatibility.** This release of `oprobe-trace` needs **OpenDAL 0.59** (`opendal` or
+`opendal-core` 0.59: with another minor version the layer's traits do not match, and the
+compiler reports opaque trait errors such as an unsatisfied `Layer` bound), the **Tokio** runtime
+(1.52 or later; the instrumented HTTP client and its timers run on it) and **Rust 1.97** or later
+(the MSRV, `rust-version` in `Cargo.toml`).
+
 Apply it first, before your other layers (`Operator::new(builder)?.layer(trace).layer(RetryLayer::new())`):
 it installs the instrumented `HttpFetch`, and the layers above it then wrap it, so every retry
 is recorded as its own request.

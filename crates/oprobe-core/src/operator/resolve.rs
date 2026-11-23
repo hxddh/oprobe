@@ -29,6 +29,9 @@ pub fn resolve(arg: &str, cfg: &ConfigFile) -> Result<(OperatorSpec, OperatorSou
     let arg = arg.trim();
     if arg.contains("://") {
         crate::input::storage_url(arg)?;
+        // A pasted cloud address becomes the bucket's URL (`s3://…`), which the run shows.
+        let mapped = crate::input::cloud_url(arg);
+        let arg = mapped.as_deref().unwrap_or(arg);
         return Ok((
             OperatorSpec::from_url(arg),
             OperatorSource::Url(crate::util::redact_url(arg)),
@@ -77,6 +80,10 @@ mod tests {
         let (s, src) = resolve("memory://", &cfg).unwrap();
         assert_eq!(s, OperatorSpec::from_url("memory://"));
         assert_eq!(src, OperatorSource::Url("memory://".into()));
+        // A pasted cloud address is the bucket's URL.
+        let (s, src) = resolve("https://b.s3.amazonaws.com/x", &cfg).unwrap();
+        assert_eq!(s, OperatorSpec::from_url("s3://b/x"));
+        assert_eq!(src, OperatorSource::Url("s3://b/x".into()));
         let (s, src) = resolve("prod", &cfg).unwrap();
         assert_eq!(s, prod);
         assert_eq!(src, OperatorSource::Config("prod".into()));

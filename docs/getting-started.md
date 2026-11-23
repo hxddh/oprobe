@@ -32,7 +32,8 @@ with 28 workers for 8 seconds:
       remedy: layers.tail_cut + layers.retry.min_delay — re-issue requests far slower than their
         peers, after a short retry backoff (TailCutLayer + RetryLayer::with_min_delay)
       next: oprobe prove 20261123-063611-3d82 tail_stragglers
-  ▲ 2 throttling (medium confidence) — The service throttled 0.1% of requests (429/503).
+  ▲ 2 throttling (medium confidence) — 15% of operation time is spent in retry backoff after
+      429/503: the service throttled 0.1% of requests.
       16 throttled responses (429/503) in 11416 requests (0.14%); 15% of operation time in retry
       backoff; the rejections start above a number of requests in flight (the in-flight limit
       explains 81% of the throttled requests)
@@ -41,7 +42,7 @@ with 28 workers for 8 seconds:
         (ConcurrentLimitLayer::with_http_concurrent_limit + RetryLayer::with_jitter)
       next: oprobe prove 20261123-063611-3d82 throttling
   1425.0 ops/s · 80.1 MiB/s · p50 10.0ms · p99 261ms · errors 0.00% · 0.14% of requests throttled
-  full profile: oprobe show 20261123-063611-3d82 --detail
+  full profile: oprobe show 20261123-063611-3d82 --detail · terms: https://github.com/hxddh/oprobe/blob/v6.3.0/docs/concepts.md#glossary
 ```
 
 The brief that `run` prints has three parts:
@@ -86,8 +87,8 @@ The verdict is `improved`, `worse` (exit 3) or `inconclusive`, on goodput unless
 `--objective p99`, and the result ends with the diff:
 
 ```text
-improved on goodput: +34.4 % [+19.5, +51.1] (3 pairs of trials, noise ±2.0 %) · lab://demo (local lab)
-secondary (not decisive): p99 -67.8 % [-69.4, -66.2] · throttled 0.27 % → 4.54 % · errors 0.00 % → 0.02 %
+improved on goodput: +34.4 %, 95 % interval [+19.5, +51.1] (3 pairs of trials, noise ±2.0 %) · lab://demo (local lab)
+secondary (not decisive; 95 % intervals): p99 -67.8 % [-69.4, -66.2] · throttled 0.27 % → 4.54 % · errors 0.00 % → 0.02 %
 note: TailCutLayer re-issues through RetryLayer: its first backoff is shortened so a cut request is retried at once; trials warm up 11.5 s because the layer ignores its first 10 s
 + TailCutLayer::builder().safety_factor(1.5).min_samples(32).min_deadline(Duration::from_millis(50)).max_deadline(Duration::from_secs(60)).build()
 ~ RetryLayer::new().with_min_delay(Duration::from_millis(20))

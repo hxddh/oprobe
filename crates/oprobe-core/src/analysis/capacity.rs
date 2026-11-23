@@ -259,7 +259,8 @@ fn quantile(v: &mut [f64], q: f64) -> f64 {
 
 /// The per-operation request concurrency of the rows.
 fn op_shape(reqs: &[&ReqRow], ops: &[&OpRow]) -> OpShape {
-    let mut by_op: HashMap<u64, Vec<(i64, i64)>> = HashMap::new();
+    // Ordered: the float sums below come out the same on every run (U9).
+    let mut by_op: BTreeMap<u64, Vec<(i64, i64)>> = BTreeMap::new();
     for q in reqs.iter().filter(|q| q.op_id != 0) {
         by_op.entry(q.op_id).or_default().push(interval(q));
     }

@@ -78,8 +78,11 @@ The window works like other professional tools on your platform (design:
   asks first: **Stop and Quit** stops it, removes its test data and quits; Cancel keeps it
   running.
 - **Run files**: open a `.oprobe` or report/trace `.json` file with File ▸ Open Run File… (the
-  system's open dialog, filtered to those types), open it from Finder or Explorer, or drop it
-  on the window (the window is outlined while a file is dragged over it).
+  system's open dialog, filtered to those types), drop it on the window (the window is outlined
+  while a file is dragged over it), or double-click it: `oprobe.app` (macOS), the `.msi`
+  (Windows) and the Linux desktop archive's `.desktop` entry and MIME type
+  (`application/x-oprobe-run`) register `.oprobe` files, and run `oprobe FILE`, which opens the
+  file in the app. The archives and the `.deb` / `.rpm` register nothing.
 - **Progress**: a running job shows its progress on the Dock or taskbar icon. When it ends while
   the window is in the background, a notification says so and the Dock icon or taskbar button
   asks for attention.

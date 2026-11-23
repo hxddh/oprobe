@@ -295,7 +295,7 @@ impl CommandOutput for ProveOutput {
         };
         let mut o = if measured {
             format!(
-                "{} on {}: {} % [{}, {}] ({} pair{} of trials, noise ±{:.1} %) · {}\n",
+                "{} on {}: {} %, 95 % interval [{}, {}] ({} pair{} of trials, noise ±{:.1} %) · {}\n",
                 bold(&verdict),
                 self.objective.label(),
                 pct(d.estimate),
@@ -366,7 +366,10 @@ impl CommandOutput for ProveOutput {
             })
             .collect();
         if !sec.is_empty() {
-            o += &dim(&format!("secondary (not decisive): {}\n", sec.join(" · ")));
+            o += &dim(&format!(
+                "secondary (not decisive; 95 % intervals): {}\n",
+                sec.join(" · ")
+            ));
         }
         for n in &self.notes {
             o += &dim(&format!("note: {n}\n"));
@@ -1426,6 +1429,22 @@ fn proof_budget(req: &ProveRequest) -> Result<Option<Duration>> {
         .transpose()?)
 }
 
+/// The hint of a refusal to prove a production trace: the run to make instead, on the service
+/// the trace recorded (`oprobe run s3://bucket/root`), when the file names it.
+fn trace_hint(r: &crate::model::Report) -> String {
+    let url = &r.spec.operator_ref;
+    if url.is_empty() || url.starts_with("unknown://") {
+        return "prove needs a run oprobe drove: profile the operator with `oprobe run URL`, \
+                then prove that run"
+            .to_owned();
+    }
+    format!(
+        "prove needs a run oprobe drove: profile the same service with `oprobe run {}`, then \
+         prove that run",
+        crate::model::spec::shell_quote(url)
+    )
+}
+
 /// `oprobe prove`.
 pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<ProveOutcome> {
     let run = ctx.store().load(&req.run)?;
@@ -1437,7 +1456,7 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
                 req.run
             ),
         )
-        .with_hint("prove needs a run oprobe drove: `oprobe run OPERATOR`")
+        .with_hint(trace_hint(&run.report))
         .into());
     }
     if run.report.run.parent_id.is_some() {
@@ -1482,7 +1501,11 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
     let budget = proof_budget(&req)?;
     let estimate = {
         let rails = super::run::rails(ctx, &base, &req.safety)?;
-        let plan = rails.plan(&base);
+        let mut plan = rails.plan(&base);
+        // The trials' warmup is prove's choice (tail-cut's blind start), not the user's (U6).
+        if let Some(w) = crate::guard::warmup_warning(&base) {
+            plan.warnings.retain(|x| *x != w);
+        }
         let sizing = match &change.sized {
             Some(s) if s.unmeasured.is_none() => (defaults.max_sizing_trials as u64, 2),
             _ => (0, 0),
@@ -1807,6 +1830,8 @@ mod tests {
         let done = output(4, ProveVerdict::Improved).text();
         assert!(done.starts_with("improved on goodput: +30.0 %"), "{done}");
         assert!(done.contains("4 pairs of trials"), "{done}");
+        // The interval says what it is (U5).
+        assert!(done.contains("+30.0 %, 95 % interval ["), "{done}");
         assert!(done.contains("ConcurrentLimitLayer"), "{done}");
         assert!(
             output(4, ProveVerdict::Worse)

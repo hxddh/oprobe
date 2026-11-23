@@ -793,7 +793,18 @@ async fn connection_refused_fails_fast() {
         .expect("must fail");
     assert!(t.elapsed() < Duration::from_secs(15), "{:?}", t.elapsed());
     let msg = format!("{err:#}");
-    assert!(msg.contains("cannot reach"), "{msg}");
+    // One plain cause; OpenDAL's report is the detail (U2).
+    assert_eq!(
+        msg,
+        format!("connection refused by 127.0.0.1:{port} (s3://bkt/bench)")
+    );
+    let body = oprobe::errors::classify(&err, "s3");
+    let detail = body.detail.expect("the storage library's report");
+    assert!(detail.contains("Connection refused"), "{detail}");
+    assert!(
+        !detail.contains("error sending request: error sending request"),
+        "no text twice: {detail}"
+    );
     let hint = oprobe::analysis::hints::hint_for(&msg, "s3").expect("hint");
     assert!(hint.title.contains("refused"), "{}", hint.title);
 }

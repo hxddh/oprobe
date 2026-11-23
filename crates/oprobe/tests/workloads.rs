@@ -359,10 +359,37 @@ fn every_compiled_service_resolves_from_its_url() {
         .unwrap_err();
     let e = format!("{e:#}");
     assert!(e.contains("endpoint"), "{e}");
+    // An unknown scheme lists the schemes of this build, and only those.
     let e = full(TargetSpec::from_url("ftp://x").unwrap_err());
     assert!(
-        e.contains("unsupported storage scheme") && e.contains("azdls"),
+        e.contains("unsupported storage scheme") && e.contains("s3"),
         "{e}"
+    );
+    let compiled = oprobe::engine::operator::missing_service_feature("azdls").is_none();
+    assert_eq!(e.contains("azdls"), compiled, "{e}");
+    // A pasted cloud address is the bucket's URL.
+    let t = TargetSpec::from_url("https://bkt.s3.eu-west-1.amazonaws.com/data")
+        .unwrap()
+        .normalized()
+        .unwrap();
+    assert_eq!(t.scheme, "s3");
+    assert_eq!(t.options["bucket"], "bkt");
+    assert_eq!(t.options["root"], "/data");
+    assert_eq!(t.options["region"], "eu-west-1");
+    let t = TargetSpec::from_url("https://acct.blob.core.windows.net/cont/p")
+        .unwrap()
+        .normalized()
+        .unwrap();
+    assert_eq!(t.scheme, "azblob");
+    assert_eq!(t.options["container"], "cont");
+    assert_eq!(t.options["endpoint"], "https://acct.blob.core.windows.net");
+    let t = TargetSpec::from_url("https://storage.googleapis.com/gb/x")
+        .unwrap()
+        .normalized()
+        .unwrap();
+    assert_eq!(
+        (t.scheme.as_str(), t.options["bucket"].as_str()),
+        ("gcs", "gb")
     );
 }
 

@@ -23,6 +23,9 @@ you run them.
   saved, and URLs lose embedded credentials and query strings.
 - **The host** is recorded as OS, architecture, CPU count and a hash of the host name, never the
   name itself.
+- **Pending-cleanup markers** in `<data dir>/oprobe/pending/`: while a run that writes is going,
+  one small file names its target and its `oprobe-run-*` prefix. It is removed once the test data
+  is deleted; one left by a killed run tells the next run against that target what to delete.
 - **The config file** holds what you put there.
 
 Delete runs with `oprobe show --rm RUN…`, or remove the data directory.

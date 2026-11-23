@@ -389,9 +389,14 @@ jobs:
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
         with:
           subject-path: out/*
+      # A channel is advertised only when this release publishes to it: its secret is set (the
+      # crates-io, homebrew-tap and scoop-bucket jobs skip without one).
       - name: Release notes from CHANGELOG
         env:
           MINISIGN_PUBKEY: ${{ vars.MINISIGN_PUBKEY }}
+          HAS_CARGO_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN != '' }}
+          HAS_TAP_TOKEN: ${{ secrets.TAP_TOKEN != '' }}
+          HAS_SCOOP_TOKEN: ${{ secrets.SCOOP_TOKEN != '' }}
         run: |
           awk -v v="$VERSION" '$0 ~ "^## \\[?v?"v {f=1; next} f && /^## / {exit} f' CHANGELOG.md > notes.md
           [ -s notes.md ] || echo "oprobe $VERSION" > notes.md
@@ -399,9 +404,19 @@ jobs:
             echo
             echo "---"
             echo "**Install:** \`curl -fsSL https://github.com/${{ github.repository }}/releases/download/v$VERSION/install.sh | sh\` (CLI only: \`| sh -s -- --cli\`) ·"
-            echo "Homebrew: \`brew install hxddh/tap/oprobe\` (the app bundle: \`brew install --cask hxddh/tap/oprobe-app\`) ·"
-            echo "Windows: the \`.msi\`, Scoop (\`scoop bucket add hxddh https://github.com/hxddh/scoop-bucket\` then \`scoop install oprobe\`), or \`winget install hxddh.oprobe\` once its winget-pkgs pull request is merged ·"
-            echo "Rust: \`cargo install oprobe --locked\` · the CLI-only build: the \`oprobe-cli-$VERSION-*\` archives."
+            if [ "$HAS_TAP_TOKEN" = true ]; then
+              echo "Homebrew: \`brew install hxddh/tap/oprobe\` (the app bundle: \`brew install --cask hxddh/tap/oprobe-app\`) ·"
+            fi
+            if [ "$HAS_SCOOP_TOKEN" = true ]; then
+              echo "Windows: the \`.msi\`, Scoop (\`scoop bucket add hxddh https://github.com/hxddh/scoop-bucket\` then \`scoop install oprobe\`), or \`winget install hxddh.oprobe\` once its winget-pkgs pull request is merged ·"
+            else
+              echo "Windows: the \`.msi\` or \`install.ps1\`, or \`winget install hxddh.oprobe\` once its winget-pkgs pull request is merged ·"
+            fi
+            if [ "$HAS_CARGO_TOKEN" = true ]; then
+              echo "Rust: \`cargo install oprobe --locked\` · the CLI-only build: the \`oprobe-cli-$VERSION-*\` archives."
+            else
+              echo "The CLI-only build: the \`oprobe-cli-$VERSION-*\` archives."
+            fi
             echo "The macOS and Windows packages are not code-signed; first open: [docs/install.md](https://github.com/${{ github.repository }}/blob/v$VERSION/docs/install.md#first-open-of-unsigned-packages)."
             if [ -f out/SHA256SUMS.minisig ] && [ -n "$MINISIGN_PUBKEY" ]; then
               echo "Verify: \`sha256sum -c SHA256SUMS --ignore-missing\`, then \`gh attestation verify <file> --repo ${{ github.repository }}\` or \`minisign -Vm SHA256SUMS -P $MINISIGN_PUBKEY\`."

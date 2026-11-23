@@ -30,8 +30,8 @@ oprobe                           # 应用：运行记录、Profile、Operator、
 `oprobe demo` 即 `oprobe run lab://demo`：一个本地 S3，在超过 24 个并发请求时限流，并让每第 40 个请求变成等待 250 ms 的拖尾。简报最多列出三条发现，每条附上以 `op.toml` 路径表示的补救措施和下一条命令。`prove last` 交替运行当前 operator（A）与补救后的 operator（B）的试验，最后给出 diff（这次用时 60 秒）：
 
 ```text
-improved on goodput: +34.4 % [+19.5, +51.1] (3 pairs of trials, noise ±2.0 %) · lab://demo (local lab)
-secondary (not decisive): p99 -67.8 % [-69.4, -66.2] · throttled 0.27 % → 4.54 % · errors 0.00 % → 0.02 %
+improved on goodput: +34.4 %, 95 % interval [+19.5, +51.1] (3 pairs of trials, noise ±2.0 %) · lab://demo (local lab)
+secondary (not decisive; 95 % intervals): p99 -67.8 % [-69.4, -66.2] · throttled 0.27 % → 4.54 % · errors 0.00 % → 0.02 %
 + TailCutLayer::builder().safety_factor(1.5).min_samples(32).min_deadline(Duration::from_millis(50)).max_deadline(Duration::from_secs(60)).build()
 ~ RetryLayer::new().with_min_delay(Duration::from_millis(20))
 op.toml:
@@ -109,15 +109,25 @@ handle.save("prod.oprobe")?;          // 之后：oprobe show prod.oprobe
 
 每个命令都可以用 `-o json` 输出一个 JSON 文档（stdout 只有结果，进度写到 stderr）；错误带有稳定的错误码和退出码（0 成功 · 1 运行时 · 2 用法 · 3 prove 结果为 worse · 4 预算 · 5 安全 · 130 中断）；JSON Schema 在 [`schemas/`](schemas)。命令行与 JSON 输出只有英文。智能体请看 [`skills/oprobe/SKILL.md`](skills/oprobe/SKILL.md) 和 [llms.txt](llms.txt)。
 
+CI 中支持两种用法：
+
+```sh
+# Profile 为 critical 时让任务失败。
+oprobe run s3://bucket/bench --existing data/ --max-requests 20000 -o json \
+  | jq -e '.runs[0].report.verdict.level != "critical"'
+# 改动让 operator 变差时让任务失败：prove 以 3 退出。
+oprobe prove last --with layers.retry.max_times=5 --max-duration 5m -o json > prove.json
+```
+
 ## 安装
 
 | 平台 | |
 |---|---|
 | macOS / Linux | `curl -fsSL https://github.com/hxddh/oprobe/releases/latest/download/install.sh \| sh`（`-s -- --cli` 只装命令行，不含应用） |
-| Homebrew | `brew install hxddh/tap/oprobe`（应用包：`brew install --cask hxddh/tap/oprobe-app`） |
-| Windows | `irm https://github.com/hxddh/oprobe/releases/latest/download/install.ps1 \| iex`、`.msi`、Scoop（`scoop bucket add hxddh https://github.com/hxddh/scoop-bucket`，`scoop install oprobe`）或 `winget install hxddh.oprobe` |
+| Homebrew（发布后） | `brew install hxddh/tap/oprobe`（应用包：`brew install --cask hxddh/tap/oprobe-app`） |
+| Windows | `irm https://github.com/hxddh/oprobe/releases/latest/download/install.ps1 \| iex`、`.msi`、Scoop（发布后；`scoop bucket add hxddh https://github.com/hxddh/scoop-bucket`，`scoop install oprobe`）或 `winget install hxddh.oprobe` |
 | Debian / Ubuntu、Fedora / RHEL | 发布页上的 `.deb` / `.rpm` |
-| Rust | `cargo install oprobe --locked`（`--no-default-features --features cli` 只装命令行；Linux 上 `--features gui` 启用原生窗口） |
+| Rust（crates.io，发布后） | `cargo install oprobe --locked`（`--no-default-features --features cli` 只装命令行；Linux 上 `--features gui` 启用原生窗口） |
 
 macOS 和 Windows 安装包**没有代码签名**：首次打开需要确认一次（[方法](docs/install.md#first-open-of-unsigned-packages)）。每个文件在 `SHA256SUMS` 中都有 SHA-256，并带有 SLSA 构建来源证明；安装脚本会校验 SHA-256，并在 GitHub CLI 已登录时校验来源证明（[校验方法](docs/install.md#verifying-a-download)）。
 
