@@ -109,6 +109,10 @@ impl OpScope {
                 d.throttled = true;
             }
             if d.requests.len() < MAX_REQUESTS_PER_OP {
+                // Most operations issue one request: no room for four records up front.
+                if d.requests.capacity() == 0 {
+                    d.requests.reserve_exact(1);
+                }
                 d.requests.push(rec);
             } else {
                 d.dropped_requests += 1;

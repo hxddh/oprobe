@@ -4,7 +4,10 @@
 //! (seconds), once per stage: `oprobe.stage` is `total` (the whole request, what the semantic
 //! convention means) or one of `queue`, `connect`, `send`, `ttfb`, `body`, `stall` (stages
 //! that took no time are skipped). Attributes: `oprobe.stage`, `oprobe.api` (`GetObject`, …),
-//! `http.request.method` and `http.response.status_code` (absent when no response arrived).
+//! `http.request.method` and `http.response.status_code` (absent when no response arrived),
+//! and OpenDAL's own metric labels (`opendal-layer-otelmetrics`), so both layers' series join:
+//! `scheme`, `namespace` (the bucket or container) and `root` of the service, and `operation`
+//! (`read`, `write`, `stat`, …) when the service attached it.
 //!
 //! ```no_run
 //! let meter = opentelemetry::global::meter("my-app");
@@ -12,7 +15,7 @@
 //! # let _ = (layer, handle);
 //! ```
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use opentelemetry::KeyValue;
 use opentelemetry::metrics::{Histogram, Meter};
@@ -26,6 +29,8 @@ pub const REQUEST_DURATION: &str = "http.client.request.duration";
 /// Emits [`REQUEST_DURATION`] per request and stage.
 pub struct OtelExporter {
     duration: Histogram<f64>,
+    /// `scheme`, `namespace`, `root` of the service (once the layer is applied).
+    service: OnceLock<[KeyValue; 3]>,
 }
 
 impl std::fmt::Debug for OtelExporter {
@@ -42,6 +47,7 @@ impl OtelExporter {
                 .with_unit("s")
                 .with_description("Duration of HTTP client requests, by oprobe stage.")
                 .build(),
+            service: OnceLock::new(),
         }
     }
 }
@@ -67,11 +73,18 @@ impl Exporter for OtelExporter {
             if us == 0 && stage != "total" {
                 continue;
             }
-            let mut attrs = vec![
+            let mut attrs = Vec::with_capacity(9);
+            attrs.extend([
                 KeyValue::new("oprobe.stage", stage),
                 KeyValue::new("oprobe.api", api),
                 KeyValue::new("http.request.method", r.method.clone()),
-            ];
+            ]);
+            if let Some(s) = self.service.get() {
+                attrs.extend(s.iter().cloned());
+            }
+            if let Some(op) = r.operation {
+                attrs.push(KeyValue::new("operation", op));
+            }
             if r.status > 0 {
                 attrs.push(KeyValue::new(
                     "http.response.status_code",
@@ -80,6 +93,14 @@ impl Exporter for OtelExporter {
             }
             self.duration.record(us as f64 / 1e6, &attrs);
         }
+    }
+
+    fn on_service(&self, scheme: &str, name: &str, root: &str) {
+        let _ = self.service.set([
+            KeyValue::new("scheme", scheme.to_owned()),
+            KeyValue::new("namespace", name.to_owned()),
+            KeyValue::new("root", root.to_owned()),
+        ]);
     }
 }
 
@@ -112,6 +133,7 @@ mod tests {
         let metrics = exporter.get_finished_metrics().unwrap();
         let mut points = 0;
         let mut stages = std::collections::BTreeSet::new();
+        let mut labels = std::collections::BTreeMap::new();
         for rm in &metrics {
             for sm in rm.scope_metrics() {
                 for m in sm.metrics() {
@@ -126,6 +148,7 @@ mod tests {
                                 if kv.key.as_str() == "oprobe.stage" {
                                     stages.insert(kv.value.to_string());
                                 }
+                                labels.insert(kv.key.to_string(), kv.value.to_string());
                             }
                         }
                     }
@@ -134,5 +157,14 @@ mod tests {
         }
         assert!(points >= 2, "{points} data points");
         assert!(stages.contains("total"), "{stages:?}");
+        // OpenDAL's own metric labels, so oprobe's series join opendal-layer-otelmetrics'.
+        assert_eq!(
+            labels.get("scheme").map(String::as_str),
+            Some("memory"),
+            "{labels:?}"
+        );
+        for l in ["namespace", "root", "operation"] {
+            assert!(labels.contains_key(l), "{l}: {labels:?}");
+        }
     }
 }

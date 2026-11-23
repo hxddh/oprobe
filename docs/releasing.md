@@ -30,7 +30,7 @@
 
 | Crate | Published | Promise |
 |---|---|---|
-| `oprobe-trace` | yes | semver: the documented API and the `oprobe.trace/6` format are stable across 6.x |
+| `oprobe-trace` | yes | semver: the documented API and the `oprobe.trace/7` format are stable across 7.x |
 | `oprobe-core` | yes, so that `cargo install oprobe` works | none: internal, documented as such; `oprobe` pins it with `=` |
 | `oprobe` | yes | the CLI, the JSON output and the `.oprobe` files are stable across 6.x |
 

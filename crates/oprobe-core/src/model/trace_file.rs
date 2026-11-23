@@ -1,4 +1,4 @@
-//! A production trace as a [`Run`]: the `oprobe.trace/6` file an application writes with the
+//! A production trace as a [`Run`]: the `oprobe.trace/7` file an application writes with the
 //! embedded `oprobe-trace` layer (`Handle::save`, `Snapshot::save`), built into a report by the
 //! same builder as a run ([`super::build_run`]), and marked for what it is (design v6 §2: the
 //! workbench opens it like any other profile).
@@ -7,13 +7,16 @@
 //! - `run.source` is `trace`; there is no workload (no preset, mix or dataset) and nothing to
 //!   replay, so `oprobe prove` refuses it;
 //! - the operator is what the layer saw: the service's scheme, name (bucket) and root;
-//! - an application's requests are not grouped into operations, so each request stands in for
-//!   one operation in the summary (count, failures, latency), and the request rows have no
-//!   operation rows (unless the trace has them);
-//! - only the findings that request rows can support are kept: errors, throttling and its
-//!   limit models, hung requests, stragglers and cold connections. The ones that need oprobe's
-//!   operations or a load it varied (small ranges, slow multipart, repeated reads, bandwidth
-//!   cap, client bound) are not derived.
+//! - an `oprobe.trace/7` file has the application's operations (each OpenDAL call, linked to
+//!   the requests it issued; keys hashed, design v7 B1), so the summary, verbs, hot keys,
+//!   prefixes and over-read read them as a run's do. An `oprobe.trace/6` file has requests
+//!   only: each request stands in for one operation in the summary (count, failures, latency),
+//!   and the report says so;
+//! - only the findings the trace can support are kept ([`TRACE_FINDINGS`], plus
+//!   [`OP_TRACE_FINDINGS`] when it has operations). The ones that need a load oprobe varied or
+//!   its own client (bandwidth cap, client bound) are not derived; the ones that judge the
+//!   operator's `read.concurrent` / `write.concurrent` read what its requests did instead of
+//!   oprobe's defaults.
 
 use std::path::Path;
 use std::time::{Duration, SystemTime};
@@ -33,6 +36,10 @@ pub const TRACE_FINDINGS: &[&str] = &[
     "cold_connections",
     "invalid_run",
 ];
+
+/// The findings a trace with operations keeps besides [`TRACE_FINDINGS`]: they read operations
+/// (ranges per read, parts per write, repeated keys).
+pub const OP_TRACE_FINDINGS: &[&str] = &["small_ranges", "slow_multipart", "repeated_reads"];
 
 /// The warning every report of a trace without operation rows carries.
 pub const PER_REQUEST_WARNING: &str = "production trace: oprobe did not drive this traffic and the application's requests are not grouped into operations, so each request counts as one operation";
@@ -206,6 +213,56 @@ fn per_request_view(run: &Run) -> Run {
         ops,
         reqs,
     }
+}
+
+/// The run as the findings read a trace with operations: the operations it observed stand in
+/// for the workload mix (by verb, weighted by count), so the findings that apply to reads or
+/// writes know there were some. A view, never stored: the report's workload stays empty.
+fn observed_view(run: &Run) -> Run {
+    let mut counts: std::collections::BTreeMap<&str, u64> = Default::default();
+    for o in run.ops.iter().filter(|o| o.t_us >= 0) {
+        let op = if o.verb.starts_with("read") {
+            "read"
+        } else if o.verb.starts_with("write.multipart") {
+            "multipart_write"
+        } else if o.verb.starts_with("write") {
+            "write"
+        } else {
+            continue;
+        };
+        *counts.entry(op).or_default() += 1;
+    }
+    let mut view = Run {
+        report: run.report.clone(),
+        ops: run.ops.clone(),
+        reqs: run.reqs.clone(),
+    };
+    view.report.workload.mix = counts
+        .into_iter()
+        .map(|(op, n)| MixEntry {
+            weight: n.min(u64::from(u32::MAX)) as u32,
+            op: op.to_owned(),
+            ..Default::default()
+        })
+        .collect();
+    view
+}
+
+/// Whether every operation issued its `api` requests one after another (no two overlapping in
+/// time): what an operator with `concurrent = 1` does.
+fn sequential(run: &Run, api: &str) -> bool {
+    let mut by_op: std::collections::HashMap<u64, Vec<(i64, i64)>> = Default::default();
+    for q in run.reqs.iter().filter(|q| q.op_id != 0 && q.api == api) {
+        let start = q.t_us;
+        by_op
+            .entry(q.op_id)
+            .or_default()
+            .push((start, start.saturating_add(q.total_us as i64)));
+    }
+    by_op.into_values().all(|mut v| {
+        v.sort_unstable();
+        v.windows(2).all(|w| w[1].0 >= w[0].1)
+    })
 }
 
 /// The longest recording a trace may span (ten years): beyond it the file is corrupt.
@@ -383,10 +440,19 @@ pub fn trace_run(mut file: TraceFile, path: &Path) -> Result<Run, crate::errors:
         r.target.display = "unknown service".into();
         r.target.scheme = "unknown".into();
     }
-    // Findings from the requests alone; a trace without operations reads them one request
-    // per operation.
+    // Findings from the operations; a trace without operations reads them one request per
+    // operation.
     let mut findings = if has_ops {
-        crate::analysis::findings::derive(&run)
+        let view = observed_view(&run);
+        let mut f = crate::analysis::findings::derive(&view);
+        f.retain(|x| match x.code.as_str() {
+            // These judge `read.concurrent` / `write.concurrent`, which the trace does not
+            // know: keep them only when the requests really were sequential.
+            "small_ranges" => sequential(&run, "GetObject"),
+            "slow_multipart" => sequential(&run, "UploadPart"),
+            _ => true,
+        });
+        f
     } else {
         let view = per_request_view(&run);
         let mut f = crate::analysis::findings::derive(&view);
@@ -395,7 +461,10 @@ pub fn trace_run(mut file: TraceFile, path: &Path) -> Result<Run, crate::errors:
         }
         f
     };
-    findings.retain(|f| TRACE_FINDINGS.contains(&f.code.as_str()));
+    findings.retain(|f| {
+        TRACE_FINDINGS.contains(&f.code.as_str())
+            || (has_ops && OP_TRACE_FINDINGS.contains(&f.code.as_str()))
+    });
     let file_ref = super::spec::shell_quote(&path.display().to_string());
     for f in &mut findings {
         f.remedy.next = Some(next_command(&file_ref, f));

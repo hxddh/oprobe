@@ -136,6 +136,7 @@ mod tests {
     fn row(conn: u64, t: i64) -> ReqRow {
         crate::log::req_row(
             crate::RequestRecord {
+                operation: None,
                 api: crate::Api::GetObject,
                 method: "GET".into(),
                 status: 200,

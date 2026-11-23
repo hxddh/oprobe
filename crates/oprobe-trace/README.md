@@ -11,20 +11,27 @@ let op = op.layer(layer);
 handle.save("prod.oprobe")?; // then: oprobe show prod.oprobe
 ```
 
+- **Operations:** every OpenDAL call is an operation linked to the requests it issued (verbs,
+  latency and where it went, slow operations, hot keys and prefixes with keys hashed);
+  `Handle::retry_notify()` for OpenDAL's `RetryLayer::with_notify` counts retries.
 - **The API:** `layer(Config) -> (TraceLayer, Handle)`, `Handle::snapshot()` for the aggregates
   (per API and stage, per verb, connections, bytes, timeline), `Handle::save(path)` /
-  `Snapshot::save(path)` for a `.oprobe` file (format `oprobe.trace/6`, one JSON document).
+  `Handle::save_and_reset(path)` / `Snapshot::save(path)` for a `.oprobe` file (format
+  `oprobe.trace/7`, one JSON document; 6.x files still open).
 - **Your own sink:** implement `Exporter` and pass it with `Config::exporter`. With the `otel`
-  feature, `otel::OtelExporter` records `http.client.request.duration` with `oprobe.stage` and
-  `oprobe.api` attributes.
+  feature (opentelemetry 0.32), `otel::OtelExporter` records `http.client.request.duration` with
+  `oprobe.stage` and `oprobe.api` attributes and OpenDAL's `scheme`, `namespace`, `root` and
+  `operation` labels.
 - **Faithful:** for HTTP services the layer installs an instrumented `HttpFetch` built like
   OpenDAL's default reqwest client (rustls with aws-lc-rs, the same pool defaults); the HTTP
   version, keep-alive, extra CA, proxy and in-flight cap are `Config` settings.
-- **Bounded:** aggregates are exact; trace rows are sampled whole within `Config::max_rows`.
+- **Bounded:** aggregates are exact; trace rows are sampled whole within `Config::max_rows`; a
+  month-long timeline keeps under 2 000 intervals.
 - **Cheap:** `cargo bench -p oprobe-trace --bench overhead` compares the same operations with
   and without the layer; the budget is 2 µs per operation.
 - **Stable:** the documented API, the file format and the meaning of every field are stable
-  across 6.x; public structs and enums are `#[non_exhaustive]`.
+  across 7.x; public structs and enums are `#[non_exhaustive]`.
+- **Requires:** OpenDAL 0.59, Tokio, Rust 1.97.
 
 Features: `otel` (OpenTelemetry metrics), `schemars` (`JsonSchema` for the snapshot types).
 The `__internal` feature is for the oprobe binary only and has no semver promise.

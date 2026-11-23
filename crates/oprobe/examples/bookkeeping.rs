@@ -21,6 +21,7 @@ fn main() {
                     let api = classify_http(&http::Method::GET, "/bench/overhead/16384/7", None);
                     rec.request_started();
                     let r = RequestRecord {
+                        operation: None,
                         api,
                         method: "GET".to_string(),
                         status: 200,

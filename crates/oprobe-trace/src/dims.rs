@@ -2,7 +2,7 @@
 //! is counted by key prefix, hot key, object size bucket and cold vs warm read. Aggregates
 //! (not sampled rows), with bounded memory.
 
-use std::collections::{HashMap, HashSet};
+use crate::util::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use hdrhistogram::Histogram;
 use serde::{Deserialize, Serialize};
@@ -154,7 +154,7 @@ fn prefix_of(key: &str, depth: u32) -> &str {
 
 fn hash(s: &str) -> u64 {
     use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let mut h = crate::util::FxHasher::default();
     s.hash(&mut h);
     h.finish()
 }
@@ -163,14 +163,14 @@ impl DimAgg {
     pub fn new(depth: u32) -> Self {
         Self {
             depth: depth.max(1),
-            prefixes: HashMap::new(),
+            prefixes: HashMap::default(),
             other: Slice::new(),
-            keys: HashMap::new(),
+            keys: HashMap::default(),
             untracked: 0,
             sizes: SIZE_BUCKETS.iter().map(|_| Slice::new()).collect(),
             cold: Slice::new(),
             warm: Slice::new(),
-            seen: HashSet::new(),
+            seen: HashSet::default(),
             total_requests: 0,
             total_throttled: 0,
         }
