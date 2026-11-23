@@ -70,9 +70,40 @@ pub(crate) fn parse_retry_after(v: &str) -> Option<u64> {
     Some(ms.min(DAY_MS))
 }
 
+/// The length of the range a `Range: bytes=…` request header asks for: `bytes=0-99` is 100,
+/// `bytes=-500` (a suffix) is 500. `None` for an open-ended range (`bytes=100-`), several
+/// ranges or anything unparsable.
+pub(crate) fn range_len(v: &str) -> Option<u64> {
+    let spec = v.trim().strip_prefix("bytes=")?;
+    if spec.contains(',') {
+        return None;
+    }
+    let (a, b) = spec.split_once('-')?;
+    let (a, b) = (a.trim(), b.trim());
+    match (a.is_empty(), b.is_empty()) {
+        (true, false) => b.parse().ok(),
+        (false, false) => {
+            let (a, b): (u64, u64) = (a.parse().ok()?, b.parse().ok()?);
+            b.checked_sub(a).map(|d| d + 1)
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::parse_retry_after;
+    use super::{parse_retry_after, range_len};
+
+    #[test]
+    fn range_lengths() {
+        assert_eq!(range_len("bytes=0-99"), Some(100));
+        assert_eq!(range_len("bytes=4096-8191"), Some(4096));
+        assert_eq!(range_len("bytes=-500"), Some(500));
+        assert_eq!(range_len("bytes=100-"), None);
+        assert_eq!(range_len("bytes=0-1,5-9"), None);
+        assert_eq!(range_len("bytes=9-0"), None);
+        assert_eq!(range_len("items=0-9"), None);
+    }
 
     #[test]
     fn retry_after_forms() {

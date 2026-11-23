@@ -260,6 +260,42 @@ pub struct StageRow {
     pub body: StageQ,
     pub stall: StageQ,
     pub total: StageQ,
+    /// HTTP/2: waiting for a stream slot on a connection (part of `queue`), over the requests
+    /// that waited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_wait: Option<StageQ>,
+    /// HTTP/2: the request body waiting for flow-control window (hidden in `ttfb`), over the
+    /// requests that stalled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flow_stall: Option<StageQ>,
+    /// The most HTTP/2 streams open on a connection when one of these requests started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub streams_max_count: Option<u64>,
+    /// From the request start until the server acknowledged the last request byte (kernel).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upload_acked: Option<StageQ>,
+    /// Until the request body reached the kernel's send buffer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub send_buffered: Option<StageQ>,
+    /// CDN cache status (`hit`, `miss`, …) → requests.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub cache_status_count: BTreeMap<String, u64>,
+    /// The bucket's region (`x-amz-bucket-region`) → requests.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub region_count: BTreeMap<String, u64>,
+}
+
+impl StageRow {
+    /// Any request carried a signal beyond the stage timings.
+    pub fn has_signals(&self) -> bool {
+        self.stream_wait.is_some()
+            || self.flow_stall.is_some()
+            || self.streams_max_count.is_some()
+            || self.upload_acked.is_some()
+            || self.send_buffered.is_some()
+            || !self.cache_status_count.is_empty()
+            || !self.region_count.is_empty()
+    }
 }
 
 fn stage_row(api: String, reqs: &[&ReqRow]) -> StageRow {
@@ -270,7 +306,33 @@ fn stage_row(api: String, reqs: &[&ReqRow]) -> StageRow {
             p99_ms: quantile_us_ms(&mut v, 0.99),
         }
     };
+    // Over the requests that carry the signal only (`None` when none does).
+    let some =
+        |f: &dyn Fn(&ReqRow) -> Option<u64>| reqs.iter().any(|r| f(r).is_some()).then(|| q(f));
+    let count = |f: &dyn Fn(&ReqRow) -> Option<String>| {
+        let mut m: BTreeMap<String, u64> = BTreeMap::new();
+        for r in reqs {
+            if let Some(k) = f(r) {
+                *m.entry(k).or_default() += 1;
+            }
+        }
+        m
+    };
+    fn d(r: &ReqRow) -> Option<&crate::model::ReqDetail> {
+        r.detail.as_deref()
+    }
     StageRow {
+        stream_wait: some(&|r| d(r).and_then(|d| d.stream_wait_us).filter(|v| *v > 0)),
+        flow_stall: some(&|r| d(r).and_then(|d| d.flow_stall_us).filter(|v| *v > 0)),
+        streams_max_count: reqs
+            .iter()
+            .filter_map(|r| d(r).and_then(|d| d.streams_count))
+            .max()
+            .map(u64::from),
+        upload_acked: some(&|r| d(r).and_then(|d| d.upload_acked_us)),
+        send_buffered: some(&|r| d(r).and_then(|d| d.send_buffered_us)),
+        cache_status_count: count(&|r| d(r).and_then(|d| d.cache_status.clone())),
+        region_count: count(&|r| d(r).and_then(|d| d.region.clone())),
         api,
         requests_count: reqs.len() as u64,
         queue: q(&|r| Some(r.queue_us)),
@@ -304,6 +366,33 @@ pub fn stage_table(reqs: &[&ReqRow]) -> Vec<StageRow> {
 mod tests {
     use super::*;
     use crate::analysis::outliers::test_req;
+
+    #[test]
+    fn the_stage_table_summarises_the_request_signals() {
+        let mut reqs: Vec<ReqRow> = (0..10).map(|i| test_req(i * 1_000, 1_000)).collect();
+        assert!(!stage_table(&reqs.iter().collect::<Vec<_>>())[0].has_signals());
+        for (i, r) in reqs.iter_mut().enumerate().take(4) {
+            r.detail = Some(Box::new(crate::model::ReqDetail {
+                stream_wait_us: Some(2_000),
+                flow_stall_us: Some(if i == 0 { 9_000 } else { 1_000 }),
+                streams_count: Some(i as u32 + 1),
+                cache_status: Some(if i == 0 { "miss" } else { "hit" }.into()),
+                region: Some("eu-west-1".into()),
+                ..Default::default()
+            }));
+        }
+        let t = stage_table(&reqs.iter().collect::<Vec<_>>());
+        let s = &t[0];
+        assert!(s.has_signals());
+        // Over the four requests that stalled, not the ten.
+        assert_eq!(s.flow_stall.unwrap().p50_ms, 1.0);
+        assert_eq!(s.flow_stall.unwrap().p99_ms, 9.0);
+        assert_eq!(s.stream_wait.unwrap().p50_ms, 2.0);
+        assert_eq!(s.streams_max_count, Some(4));
+        assert_eq!(s.cache_status_count["hit"], 3);
+        assert_eq!(s.region_count["eu-west-1"], 4);
+        assert_eq!(s.upload_acked, None);
+    }
 
     #[test]
     fn filters_and_groups() {

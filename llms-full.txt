@@ -42,29 +42,34 @@ oprobe prove last                # A/B-test the remedy of the top finding (about
 oprobe                           # the app: runs, profile, operator, compare
 ```
 
-`oprobe demo` is `oprobe run lab://demo`: a local S3 that throttles above 24 requests in flight and
-makes every 40th request a straggler that waits 250 ms. The brief names at most three findings,
+`oprobe demo` is `oprobe run lab://demo`: a local S3 that makes every 40th request a straggler
+that waits 250 ms (and throttles above 40 requests in flight). The brief names at most three findings,
 each with its remedy as an `op.toml` path, and the next command:
 
 ```text
-[Attention] 2.4% of GetObject requests wait far longer for the server's first byte than their peers
-  (stragglers).
-  lab://demo · small-files · 8.0 s · run 20261123-063611-3d82
-  ▲ 1 tail_stragglers (high confidence) — 2.4% of GetObject requests wait far longer for the
-      server's first byte than their peers (stragglers).
-      …
-      next: oprobe prove 20261123-063611-3d82 tail_stragglers
-  ▲ 2 throttling (medium confidence) — The service throttled 0.1% of requests (429/503).
-      …
-  1425.0 ops/s · 80.1 MiB/s · p50 10.0ms · p99 261ms · errors 0.00% · 0.14% of requests throttled
+[Attention] 2.4% of HeadObject, 2.4% of PutObject and 2.6% of GetObject requests wait far longer for
+  the server's first byte than their peers (stragglers).
+  lab://demo · small-files · 8.0 s · run 20261123-135409-4b57
+  ▲ 1 tail_stragglers (high confidence) — 2.4% of HeadObject, 2.4% of PutObject and 2.6% of
+      GetObject requests wait far longer for the server's first byte than their peers (stragglers).
+      33 HeadObject stragglers wait ~260ms for the first byte against ~9.48ms for a typical
+      HeadObject; 100 PutObject stragglers wait ~260ms for the first byte against ~9.55ms for a
+      typical PutObject; 214 GetObject stragglers wait ~260ms for the first byte against ~9.54ms for
+      a typical GetObject; operation p50 9.65ms · p99 261ms
+      remedy: layers.tail_cut + layers.retry.min_delay — re-issue requests far slower than their
+        peers, after a short retry backoff (TailCutLayer + RetryLayer::with_min_delay)
+      next: oprobe prove 20261123-135409-4b57 tail_stragglers
+  1733.6 ops/s · 97.6 MiB/s · p50 9.65ms · p99 261ms · errors 0.00%
+  full profile: oprobe show 20261123-135409-4b57 --detail · terms: https://github.com/hxddh/oprobe/blob/v7.0.0/docs/concepts.md#glossary
 ```
 
 `prove last` runs trials of the current operator (A) and of the remedy (B), interleaved, and ends
-with the diff (this run took 60 s):
+with the diff (this run took 54 s):
 
 ```text
-improved on goodput: +34.4 % [+19.5, +51.1] (3 pairs of trials, noise ±2.0 %) · lab://demo (local lab)
-secondary (not decisive): p99 -67.8 % [-69.4, -66.2] · throttled 0.27 % → 4.54 % · errors 0.00 % → 0.02 %
+improved on goodput: +33.3 %, 95 % interval [+26.9, +40.1] (3 pairs of trials, noise ±2.0 %) · lab://demo (local lab)
+secondary (not decisive; 95 % intervals): p99 -68.5 % [-70.0, -66.9] · throttled 0.00 % → 0.00 % · errors 0.00 % → 0.00 %
+note: TailCutLayer re-issues through RetryLayer: its first backoff is shortened so a cut request is retried at once; trials warm up 11.5 s because the layer ignores its first 10 s
 + TailCutLayer::builder().safety_factor(1.5).min_samples(32).min_deadline(Duration::from_millis(50)).max_deadline(Duration::from_secs(60)).build()
 ~ RetryLayer::new().with_min_delay(Duration::from_millis(20))
 op.toml:
@@ -156,15 +161,25 @@ goes to stderr), errors carry stable codes and exit codes (0 ok · 1 runtime · 
 · 4 budget · 5 safety · 130 interrupted), and the JSON Schemas are in [`schemas/`](schemas).
 Agents: [`skills/oprobe/SKILL.md`](skills/oprobe/SKILL.md) and [llms.txt](llms.txt).
 
+Two patterns cover CI:
+
+```sh
+# Fail the job when a profile is critical.
+oprobe run s3://bucket/bench --existing data/ --max-requests 20000 -o json \
+  | jq -e '.runs[0].report.verdict.level != "critical"'
+# Fail the job when a change makes the operator worse: prove exits 3.
+oprobe prove last --with layers.retry.max_times=5 --max-duration 5m -o json > prove.json
+```
+
 ## Install
 
 | Platform | |
 |---|---|
 | macOS / Linux | `curl -fsSL https://github.com/hxddh/oprobe/releases/latest/download/install.sh \| sh` (`-s -- --cli` for the CLI without the app) |
-| Homebrew | `brew install hxddh/tap/oprobe` (the app bundle: `brew install --cask hxddh/tap/oprobe-app`) |
-| Windows | `irm https://github.com/hxddh/oprobe/releases/latest/download/install.ps1 \| iex`, the `.msi`, Scoop (`scoop bucket add hxddh https://github.com/hxddh/scoop-bucket`, `scoop install oprobe`) or `winget install hxddh.oprobe` |
+| Homebrew (when published) | `brew install hxddh/tap/oprobe` (the app bundle: `brew install --cask hxddh/tap/oprobe-app`) |
+| Windows | `irm https://github.com/hxddh/oprobe/releases/latest/download/install.ps1 \| iex`, the `.msi`, Scoop when published (`scoop bucket add hxddh https://github.com/hxddh/scoop-bucket`, `scoop install oprobe`) or `winget install hxddh.oprobe` |
 | Debian / Ubuntu, Fedora / RHEL | `.deb` / `.rpm` from the release page |
-| Rust | `cargo install oprobe --locked` (`--no-default-features --features cli` for the CLI only, `--features gui` for native windows on Linux) |
+| Rust (crates.io, when published) | `cargo install oprobe --locked` (`--no-default-features --features cli` for the CLI only, `--features gui` for native windows on Linux) |
 
 The macOS and Windows packages are **not code-signed**: the first open needs one confirmation
 ([how](docs/install.md#first-open-of-unsigned-packages)). Every asset has a SHA-256 in `SHA256SUMS`
@@ -199,31 +214,25 @@ oprobe demo
 ```
 
 `demo` is `oprobe run lab://demo`. The lab is an S3-compatible server inside oprobe on 127.0.0.1:
-it throttles (503 SlowDown) above 24 requests in flight, and every 40th request is a straggler
-that waits 250 ms for its first byte. The default workload writes, reads and stats small objects
+every 40th request is a straggler that waits 250 ms for its first byte, and it throttles
+(503 SlowDown) above 40 requests in flight. The default workload writes, reads and stats small objects
 with 28 workers for 8 seconds:
 
 ```text
-[Attention] 2.4% of GetObject requests wait far longer for the server's first byte than their peers
-  (stragglers).
-  lab://demo · small-files · 8.0 s · run 20261123-063611-3d82
-  ▲ 1 tail_stragglers (high confidence) — 2.4% of GetObject requests wait far longer for the
-      server's first byte than their peers (stragglers).
-      162 stragglers wait ~261ms for the first byte against ~9.78ms for a typical GetObject;
-      operation p50 10.0ms · p99 261ms
+[Attention] 2.4% of HeadObject, 2.4% of PutObject and 2.6% of GetObject requests wait far longer for
+  the server's first byte than their peers (stragglers).
+  lab://demo · small-files · 8.0 s · run 20261123-135409-4b57
+  ▲ 1 tail_stragglers (high confidence) — 2.4% of HeadObject, 2.4% of PutObject and 2.6% of
+      GetObject requests wait far longer for the server's first byte than their peers (stragglers).
+      33 HeadObject stragglers wait ~260ms for the first byte against ~9.48ms for a typical
+      HeadObject; 100 PutObject stragglers wait ~260ms for the first byte against ~9.55ms for a
+      typical PutObject; 214 GetObject stragglers wait ~260ms for the first byte against ~9.54ms for
+      a typical GetObject; operation p50 9.65ms · p99 261ms
       remedy: layers.tail_cut + layers.retry.min_delay — re-issue requests far slower than their
         peers, after a short retry backoff (TailCutLayer + RetryLayer::with_min_delay)
-      next: oprobe prove 20261123-063611-3d82 tail_stragglers
-  ▲ 2 throttling (medium confidence) — The service throttled 0.1% of requests (429/503).
-      16 throttled responses (429/503) in 11416 requests (0.14%); 15% of operation time in retry
-      backoff; the rejections start above a number of requests in flight (the in-flight limit
-      explains 81% of the throttled requests)
-      remedy: layers.concurrent_limit.http + layers.retry.jitter — cap the HTTP requests in flight
-        below the service's limit and retry with jitter
-        (ConcurrentLimitLayer::with_http_concurrent_limit + RetryLayer::with_jitter)
-      next: oprobe prove 20261123-063611-3d82 throttling
-  1425.0 ops/s · 80.1 MiB/s · p50 10.0ms · p99 261ms · errors 0.00% · 0.14% of requests throttled
-  full profile: oprobe show 20261123-063611-3d82 --detail
+      next: oprobe prove 20261123-135409-4b57 tail_stragglers
+  1733.6 ops/s · 97.6 MiB/s · p50 9.65ms · p99 261ms · errors 0.00%
+  full profile: oprobe show 20261123-135409-4b57 --detail · terms: https://github.com/hxddh/oprobe/blob/v7.0.0/docs/concepts.md#glossary
 ```
 
 The brief that `run` prints has three parts:
@@ -233,9 +242,8 @@ The brief that `run` prints has three parts:
   requests themselves) and its remedy as an `op.toml` path, such as `layers.tail_cut`;
 - **the next command**, `oprobe prove RUN FINDING`.
 
-Here the stragglers come first: they hold the lab's request slots for a quarter of a second each.
-The throttling costs latency (the throttled operations wait out OpenDAL's one-second retry
-backoff) but no goodput, because the other workers keep the lab busy.
+Here every API has stragglers: each holds a worker for a quarter of a second, so the slowest 2.5 %
+of requests cost the run a third of its throughput.
 
 The run is saved. `oprobe show last` prints the whole profile, `oprobe show last --by stage`
 groups the requests by stage, and `oprobe show --list` lists the history.
@@ -247,29 +255,29 @@ oprobe prove last
 ```
 
 `prove` takes the run's operator (A) and the same operator with the top finding's remedy (B);
-`oprobe prove last throttling` proves another finding's. For a remedy with a size, such as a
+`oprobe prove last FINDING` proves another finding's. For a remedy with a size, such as a
 concurrency limit, it first runs short sizing trials over that one value and picks the knee of
 the objective. Then it runs trials of A and B interleaved (A B A B …) until a sequential test
 against the noise floor decides, or the budget (`--max-duration`) runs out. It starts with the
 number of trials and the ETA of the whole proof, and prints each trial as it ends (on stderr):
 
 ```text
-prove tail_stragglers · goodput · run 20261123-063611-3d82 · prove 20261123-063621-f7e6
+prove tail_stragglers · goodput · run 20261123-135409-4b57 · prove 20261123-135419-219a
 6–12 trials (3–6 pairs of A and B) · ETA 57s – 1m 53s
-· A #1 : 1485.5 ops/s · p99 261ms · 0.27 % throttled
-· B #1 : 2078.0 ops/s · p99 82.5ms · 4.40 % throttled
-· A #2 : 1503.0 ops/s · p99 261ms · 0.27 % throttled
-· B #2 : 2043.0 ops/s · p99 84.3ms · 4.29 % throttled
-· A #3 : 1468.5 ops/s · p99 262ms · 0.27 % throttled
-· B #3 : 1873.0 ops/s · p99 85.3ms · 4.98 % throttled
+· A #1 : 1757.9 ops/s · p99 261ms · 0.00 % throttled
+· B #1 : 2354.5 ops/s · p99 82.2ms · 0.00 % throttled
+· A #2 : 1747.9 ops/s · p99 261ms · 0.00 % throttled
+· B #2 : 2330.5 ops/s · p99 82.2ms · 0.00 % throttled
+· A #3 : 1765.4 ops/s · p99 261ms · 0.00 % throttled
+· B #3 : 2343.0 ops/s · p99 82.1ms · 0.00 % throttled
 ```
 
 The verdict is `improved`, `worse` (exit 3) or `inconclusive`, on goodput unless you pass
 `--objective p99`, and the result ends with the diff:
 
 ```text
-improved on goodput: +34.4 % [+19.5, +51.1] (3 pairs of trials, noise ±2.0 %) · lab://demo (local lab)
-secondary (not decisive): p99 -67.8 % [-69.4, -66.2] · throttled 0.27 % → 4.54 % · errors 0.00 % → 0.02 %
+improved on goodput: +33.3 %, 95 % interval [+26.9, +40.1] (3 pairs of trials, noise ±2.0 %) · lab://demo (local lab)
+secondary (not decisive; 95 % intervals): p99 -68.5 % [-70.0, -66.9] · throttled 0.00 % → 0.00 % · errors 0.00 % → 0.00 %
 note: TailCutLayer re-issues through RetryLayer: its first backoff is shortened so a cut request is retried at once; trials warm up 11.5 s because the layer ignores its first 10 s
 + TailCutLayer::builder().safety_factor(1.5).min_samples(32).min_deadline(Duration::from_millis(50)).max_deadline(Duration::from_secs(60)).build()
 ~ RetryLayer::new().with_min_delay(Duration::from_millis(20))
@@ -384,7 +392,8 @@ server cannot hide behind fewer requests), `--seed` and `--existing PREFIX` (rea
 that are already there, write nothing).
 
 oprobe writes its dataset under a fresh `oprobe-run-<id>/` prefix, warms up, measures, and
-deletes the prefix. The guard enforces budgets (`--max-requests`, `--max-bytes`,
+deletes the prefix. A run killed before it could clean up leaves its prefix behind; the next run
+against the same target deletes it. The guard enforces budgets (`--max-requests`, `--max-bytes`,
 `--max-duration`), `--read-only` and `--dry-run`.
 
 ## Profile
@@ -405,7 +414,10 @@ server or my code?" has a measured answer. Long runs keep every aggregate exact 
 operations (failed, throttled and slowest ones are always kept), so memory stays bounded.
 
 `.oprobe` files come from `oprobe run` and from [`oprobe-trace`](embedding.md) in production;
-`oprobe show FILE` and the app open both. [Reading the profile →](reading-the-profile.md)
+`oprobe show FILE` and the app open both. A production trace has the same shape: every OpenDAL
+call your application makes is an operation with its requests, its keys hashed. What it lacks is
+a workload oprobe chose, so nothing to replay: `prove` needs a run. [Reading the profile
+→](reading-the-profile.md)
 
 ## Finding
 
@@ -450,6 +462,32 @@ large a limit should be or how much it would help; claiming so would be a guess.
 The result is a **proven layer diff**: the objective's change with its interval, the evidence,
 and the change as Rust and as TOML. Every result states where it was validated (the lab, MinIO,
 your bucket).
+
+## Glossary
+
+The terms a profile and a proof print, in one line each.
+
+| Term | Meaning |
+|---|---|
+| **operation** | one OpenDAL call (`read`, `write`, `stat`, `list`, …); it may send several requests |
+| **request** | one HTTP request to the service; retries and range parts are requests of one operation |
+| **throughput** | operations (or MiB) per second, failed ones included |
+| **goodput** | *successful* operations per second: the work that got done; `prove`'s default objective |
+| **p50 / p99** | the latency half / 99 % of operations stay under; p99 is the slowest 1 % |
+| **TTFB** | time to first byte: from the request sent to the first byte of the answer (the server's time, plus one network round trip) |
+| **queue · connect · send · body · stall** | the stages of a request: waiting for a connection or a permit, opening one (DNS, TCP, TLS), sending, receiving the body, and the body waiting for your code |
+| **retry backoff** | time an operation sleeps between attempts after a 429, 503 or another retryable failure |
+| **throttled** | answered 429 (Too Many Requests) or 503 (Slow Down): the service refuses load; `throttled %` is the share of requests |
+| **in flight** | requests sent and not yet answered at one moment; a limit "starts above N in flight" |
+| **stragglers** | the few requests far slower than a typical one, usually waiting on the server (TTFB) |
+| **amplification** | bytes or requests per operation above what the operation needed (over-read ranges, retries) |
+| **cold connection** | a request that had to open a new connection instead of reusing one |
+| **open loop** | operations start on a schedule (`--rate`), so a slow service cannot hide behind fewer requests |
+| **confidence** | how well a finding's model explains the evidence: high, medium or low |
+| **95 % interval** | the range `[low, high]` that holds the true change in 95 of 100 repeats of the proof; a change whose interval includes 0 is not proven |
+| **noise floor (`±`)** | how much two runs of the *same* operator differ (the A/A spread); a change smaller than it cannot be told from noise |
+| **pair of trials** | one short run of A (the operator as it is) and one of B (with the change), back to back |
+| **verdict** | `ok`, `review` (look before trusting the numbers), `attention` (a finding costs time) or `critical` (failures or a large cost) |
 
 ## Where oprobe stops
 
@@ -562,8 +600,15 @@ takes the same paths. The paths: `url`, `options.KEY`, `layers.NAME` (`on`/`off`
 `http.insecure`. `none` removes an optional value, except for `http.proxy`, where it means no proxy
 (`unset` goes back to the environment's).
 
+`--set` also takes the workload's keys, the ones without a flag of their own included:
+`concurrency`, `preset`, `duration`, `warmup` (e.g. `--set warmup=2s`), `max_ops`, `rate`,
+`arrivals`, `shape`, `access`, `objects`, `object_size`, `partitions`, `existing`, `persist`,
+`verify`, `cleanup`, `seed` and `mix`; the SLA's `max_error_rate`, `max_throttle_rate`, `p99_ms`
+and `sla`; and the run's `label`.
+
 ```bash
 oprobe run op.toml --set layers.concurrent_limit.http=32 --set read.gap=1MiB
+oprobe run s3://bucket/bench -d 10s --set warmup=1s
 oprobe prove last --with layers.retry.jitter=true
 ```
 
@@ -650,8 +695,9 @@ oprobe lab   [SCENARIO]    # a local S3 with faults
 
 Profile one or more operators on the same workload. Several operators run one after another on
 the same workload and form one comparison. Prints the brief: the verdict, at most three findings
-with their remedy, and the next command. The run is saved; `-o json` prints the report
-(`schemas/report.json`).
+with their remedy, and the next command. The run is saved; `-o json` prints the runs, each
+with its report, and the comparison when there are several (`schemas/run.json`; the report alone
+is `schemas/report.json`).
 
 `OPERATOR` is a URL (`s3://bucket/prefix`, `lab://demo`, `fs:///tmp/x`, `memory://`) or an
 operator file ([`op.toml`](operator.md), the recommended way to describe your operator). A name
@@ -675,7 +721,7 @@ from the config file's `[operators.NAME]` also works.
 
 | Flag | Meaning |
 |---|---|
-| `--dry-run` | print the plan (requests, bytes, objects written and deleted, ETA) and exit |
+| `--dry-run` | print the plan (requests, bytes, objects written and deleted, ETA, budgets; a warning when it would spend one) and exit (`-o json`: `schemas/plan.json`) |
 | `--read-only` | refuse every write and delete (exit 5) |
 | `--max-requests N` | stop after this many backend requests (exit 4) |
 | `--max-bytes SIZE` | stop after transferring this many bytes, e.g. `10GiB` (exit 4) |
@@ -693,8 +739,8 @@ oprobe run prod --existing data/2026/ --max-requests 50000
 
 ## `oprobe demo`
 
-`oprobe run lab://demo`, with the same workload and safety flags as `run`. The lab throttles
-above 24 requests in flight, and every 40th request is a straggler that waits 250 ms. Its default
+`oprobe run lab://demo`, with the same workload and safety flags as `run`. Every 40th request
+of the lab is a straggler that waits 250 ms, and it throttles above 40 requests in flight. Its default
 workload is small files (64 × 64 KiB) with 28 workers for 8 s; `oprobe prove last` then proves
 the top finding's remedy in about a minute.
 
@@ -713,7 +759,12 @@ whole proof; `--dry-run` prints the same estimate (and the plan of one trial) an
 A verdict other than `inconclusive` needs at least **3 pairs** of trials (A then B): when the
 budget allows fewer, the verdict is `inconclusive` (exit 0) with a note. When no pair ran at all,
 the text says `not measured` and prints no diff; `-o json` still prints a valid result
-(`verdict: "inconclusive"`, `pairs_count: 0`, a note).
+(`verdict: "inconclusive"`, `pairs_count: 0`, a note). When the changed operator's trials
+throttle more than `--max-throttle` allows, and more than the current operator's, the verdict is
+`inconclusive` too, with a note: the service's limit, not the change, set what was measured.
+
+`prove` refuses a run that cannot be judged on performance (its first finding is `invalid_run`:
+it failed, or it is partial and too short); profile the operator again first.
 
 The objective's interval is Student's t on the paired log ratios of the objective (B over A, pair
 by pair), with a spread no smaller than the A/A noise floor learned from consecutive A trials (a
@@ -725,8 +776,10 @@ end within it. When a budget (`--max-duration`, `--max-requests`, `--max-bytes`)
 part-way, it still prints and saves the partial result (`budget_exceeded: true`, usually
 `inconclusive`) and exits 4; its trials stay attached, so `oprobe show --rm PROVE` removes them.
 
-`RUN` is a run id, an id prefix, `last` or `last~N`. `FINDING` is a finding code
-(`throttling`, `tail_stragglers`, …).
+`RUN` is a run id, an id prefix, `last`, `last~N` or a run's `.oprobe` file. A production trace
+has no workload to replay: `prove` refuses it and prints the `oprobe run` command for the service
+it recorded. `FINDING` is a finding code (`throttling`, `tail_stragglers`, …). The objective's
+change prints with its 95 % interval ([glossary](concepts.md#glossary)).
 
 | Flag | Meaning |
 |---|---|
@@ -734,7 +787,7 @@ part-way, it still prints and saves the partial result (`budget_exceeded: true`,
 | `--objective goodput\|p99` | what the change is judged on: successful operations (or bytes) per second (default), or the worst per-operation p99 latency |
 | `--max-throttle RATIO` | share of throttled requests a change may cause, e.g. `0.1%` or `0.001` |
 | `--max-duration DURATION` | wall-time budget of the whole proof, e.g. `5m` |
-| `--dry-run` | print the number of trials and the ETA of the whole proof, and exit |
+| `--dry-run` | print the number of trials and the ETA of the whole proof, and exit (`-o json`: `schemas/prove-plan.json`) |
 | `--read-only` | refuse every write and delete (exit 5) |
 | `--max-requests N`, `--max-bytes SIZE` | stop after this many backend requests or bytes, over every trial (exit 4) |
 
@@ -754,9 +807,11 @@ Print a profile: a stored run, or a file (`.oprobe` from `run` or from
 (`schemas/run-list.json`).
 
 A trace from `oprobe-trace` is recognised by its content, whatever its name. Its report has
-`run.source = "trace"` and shows `production trace` where a run shows its workload. Each
-request counts as one operation, and only the findings that requests support are derived:
-errors, throttling, hung requests, stragglers and cold connections. `prove` refuses a trace
+`run.source = "trace"` and shows `production trace` where a run shows its workload. Its
+operations are the application's OpenDAL calls (keys hashed), and the findings a trace supports
+are derived: errors, throttling, hung requests, stragglers, cold connections, small ranges, slow
+multipart and repeated reads (not bandwidth cap or client bound). A 6.x trace
+(`oprobe.trace/6`) has no operations: each request counts as one there. `prove` refuses a trace
 (exit 2): it needs a run oprobe drove.
 
 | Flag | Meaning |
@@ -841,16 +896,23 @@ The app's Profile view shows the same sections with charts ([app](app.md)).
 ## The brief
 
 ```text
-ATTENTION  throttling-bound: 3.6 % of requests were answered 429/503
-  throttling       626 throttled responses above 24 requests in flight (high confidence)
-                   remedy: layers.concurrent_limit.http, plus layers.retry.jitter
-  tail_stragglers  1 in 40 GetObject responses waits > 200 ms for its first byte
-                   remedy: layers.tail_cut
-  2114 ops/s · 119 MiB/s · p50 5.0 ms · p99 257 ms
-next: oprobe prove last throttling
+[Attention] 2.4% of HeadObject, 2.4% of PutObject and 2.6% of GetObject requests wait far longer for
+  the server's first byte than their peers (stragglers).
+  lab://demo · small-files · 8.0 s · run 20261123-135409-4b57
+  ▲ 1 tail_stragglers (high confidence) — 2.4% of HeadObject, 2.4% of PutObject and 2.6% of
+      GetObject requests wait far longer for the server's first byte than their peers (stragglers).
+      33 HeadObject stragglers wait ~260ms for the first byte against ~9.48ms for a typical
+      HeadObject; 100 PutObject stragglers wait ~260ms for the first byte against ~9.55ms for a
+      typical PutObject; 214 GetObject stragglers wait ~260ms for the first byte against ~9.54ms for
+      a typical GetObject; operation p50 9.65ms · p99 261ms
+      remedy: layers.tail_cut + layers.retry.min_delay — re-issue requests far slower than their
+        peers, after a short retry backoff (TailCutLayer + RetryLayer::with_min_delay)
+      next: oprobe prove 20261123-135409-4b57 tail_stragglers
+  1733.6 ops/s · 97.6 MiB/s · p50 9.65ms · p99 261ms · errors 0.00%
+  full profile: oprobe show 20261123-135409-4b57 --detail · terms: https://github.com/hxddh/oprobe/blob/v7.0.0/docs/concepts.md#glossary
 ```
 
-(Illustrative: the exact wording follows the version you run.)
+(`oprobe demo`; your numbers differ from run to run.)
 
 - **The badge** is the verdict level: **OK**, **Review** (worth a look: informational
   findings, a partial run), **Attention** (warning findings), **Critical** (critical findings).
@@ -872,19 +934,44 @@ the configuration and the five slowest operations):
 |---|---|
 | header | run id, operator, workload, window, concurrency, start time |
 | verdict | the badge and where the time went, in one sentence |
-| key numbers | goodput and throughput, latency p50/p99/p99.9/max, failed operations, throttled responses |
+| key numbers | goodput and throughput, latency p50/p99/p99.9/max, failed operations, throttled responses, and one **resilience** line: retries, time spent waiting between attempts, 429/503, the 5xx/4xx/network split and the top failure classes (the app's Retries section) |
 | findings | every finding: code, cause, evidence, confidence, remedy |
 | where the time goes | each operation's wall time split into stages (below) |
-| operations | per workload verb: count, ops/s, p50, p99, max, requests per operation, errors |
-| backend requests | per storage API (`GetObject`, `PutObject`, …): count, share on warm connections, mean TTFB and transfer, p99, status codes |
-| connections | HTTP version, TLS, new connections, reuse, peak in-flight requests, dial time per phase |
+| operations | per workload verb: count, ops/s, p50, p99, max, requests per operation, errors (`--detail`: MiB/s, retries, throttled share) |
+| backend requests | per storage API (`GetObject`, `PutObject`, …): count, share on warm connections, TTFB and total p50/p99, bytes down/up, status codes (`--detail`: every stage's p50/p99); and, for a run that wrote, a **writes** line: the multipart part size OpenDAL used (and the requested `write.chunk` and the service's part-size limits when it was clamped) and the parts uploaded with their mean size — the knobs `prove` sizes for `slow_multipart` |
+| connections | HTTP version, TLS, new connections, reuse, peak in-flight requests, dial time per phase (proxy CONNECT included), and a **tcp** line from the kernel: rtt p50/p99, connections that retransmitted, the share of sending time limited by the peer's receive window or the local send buffer, the delivery rate. High rtt or retransmits point at the network; a clean network with a high TTFB points at the server. `--detail` adds the TLS handshakes (resumed share, HelloRetryRequests) and the cold start (dials and first operations before the warm-up absorbed them) |
 | bytes | logical vs backend bytes, read amplification, over-read, requests per operation, cache hits |
-| slowest operation | the worst operation request by request (a waterfall), with its async call stack |
+| slowest operation | the worst operation request by request (a waterfall), with what each request recorded beyond its stages (below) and, with `--detail`, its async call stack |
 | self | the profiler's own health: scheduling lag, CPU, whether the client was saturated |
 | cleanup | test data removed (verified), or what is left |
 
+`--detail` also adds, per interval of the timeline, retries, new connections and the client's
+CPU (percent of one core), and the cold and warm reads (first read of a key, repeat reads) to
+SPREAD.
+
 `--by stage` sums the requests' time per stage, `--by api` per storage API, `--by conn` per
-connection (cold and warm, per remote address).
+connection (cold and warm, per remote address). `--by stage` also gives each stage's p50/p99
+per API and, when the requests recorded them, the request signals below.
+
+### Request signals
+
+Besides its stage timings a request row can carry what the response and the connection said.
+The waterfall of the slowest operation (terminal and app) lists them per request, and
+`show --by stage` summarises them per API:
+
+| Signal | What it says |
+|---|---|
+| error code, Retry-After | the provider's own error (`SlowDown`, `ServerBusy`) and how long it asked to wait |
+| h2 stream wait | HTTP/2: the request waited for a stream slot (`max_concurrent_streams`); part of queue |
+| h2 flow stall | HTTP/2: the request body waited for flow-control window; it is hidden inside TTFB |
+| h2 streams | HTTP/2 streams open on the connection when the request started |
+| upload acked, send buffered | when the kernel saw the last request byte acknowledged, and when the body reached the send buffer: the end of the upload |
+| cache | a CDN's cache status (`hit`, `miss`) |
+| region | the bucket's region (`x-amz-bucket-region`) |
+| rtt, retransmits, Server-Timing | the connection's round trip and retransmitted segments, the server's own timing header |
+
+The compact profile shows the error code, Retry-After, the HTTP/2 waits and the cache status;
+`--detail` shows every signal.
 
 `--since 3s --until 8s` shows one time range of the window (a burst, the seconds a rate limit
 bit): its numbers, where the time went, the verbs, the requests by API and its slowest
@@ -902,7 +989,7 @@ Each operation's wall time is split exactly; an instant counts once even when re
 | send | the request body goes out | upload bandwidth; `write.chunk`, `write.concurrent` |
 | TTFB | waiting for the first byte (the server's work plus one round trip) | the store or the distance to it; stragglers show as a long tail (`layers.tail_cut`) |
 | body | the response body arrives | download bandwidth per stream × streams; `read.chunk`, `read.concurrent` |
-| stall | the body waits for your code to read it | the consumer, not storage |
+| stall | the body waits for your code to read it (client time: its own segment in a waterfall, never part of body) | the consumer, not storage |
 | retry | the retry layer sleeps before the next attempt | throttling or errors; see the findings |
 | client | everything else: OpenDAL, signing, checksums | CPU (`client_bound`), tiny objects |
 
@@ -948,7 +1035,7 @@ fields carry their unit in the name (`_ms`, `_bytes`, `_ratio`, `_count`), enums
 
 A stored run lives in `<data dir>/oprobe/runs/` as one `.oprobe` file (format `oprobe.run/6`: a
 zstd stream of the header with the operator spec and workload, columnar segments of operation and
-request rows, the per-second timeline, and the report). `oprobe-trace` writes `oprobe.trace/6`
+request rows, the per-second timeline, and the report). `oprobe-trace` writes `oprobe.trace/7`
 files (one JSON document: the aggregates and the sampled rows). `oprobe show FILE` and the app
 open both. 5.x run files are not read.
 
@@ -965,11 +1052,16 @@ timed by stage and aggregated in bounded memory. Save a `.oprobe` file and open 
 It is the only crate oprobe publishes with a semver promise. (`oprobe-core` is on crates.io only
 so that `cargo install oprobe` works; it is internal.)
 
+**Requirements.** OpenDAL 0.59 (`opendal` or `opendal-core`; another minor shows up as trait
+errors about `Layer` or `Servicer`), the Tokio runtime, Rust 1.97 or later, and, for the `otel`
+feature, `opentelemetry` 0.32 (the version OpenDAL's `opendal-layer-otelmetrics` uses, so both
+layers share one global meter).
+
 ## Three lines
 
 ```toml
 [dependencies]
-oprobe-trace = "6"
+oprobe-trace = "7"
 ```
 
 ```rust
@@ -978,20 +1070,41 @@ let op = op.layer(layer);
 handle.save("prod.oprobe")?;          // then: oprobe show prod.oprobe
 ```
 
-Apply it first, before your other layers (`Operator::new(builder)?.layer(trace).layer(RetryLayer::new())`):
-it installs the instrumented `HttpFetch`, and the layers above it then wrap it, so every retry
-is recorded as its own request.
+Apply it first, before your other layers: it installs the instrumented `HttpFetch`, and the
+layers above it then wrap it, so every retry is recorded as its own request. Give OpenDAL's retry
+layer the handle's notifier, so retries land in the profile's Retries section (count, backoff,
+throttling) and the attempts of one call count as one operation:
+
+```rust
+let (trace, handle) = oprobe_trace::layer(oprobe_trace::Config::default());
+let op = Operator::new(builder)?
+    .layer(trace)
+    .layer(RetryLayer::new().with_notify(handle.retry_notify()));
+```
+
+Without the notifier every attempt is an operation of its own, and retries are not counted.
 
 ## What you get
 
+Every OpenDAL call is one **operation**, linked to the backend requests it issued, as in a run
+oprobe drives: `stat`, `read.full` / `read.range` (one `open` until its stream ends, or one ranged
+read), `write` / `write.multipart` (the writer's life), `list`, `delete` (a batch), `copy`,
+`rename`, `create_dir`. So a trace has verbs, operation latency and where its time went (queue,
+backend, retry, client), the slowest operations with their requests, hot keys and prefixes, size
+buckets, cold and warm reads, and over-read. A call your code drops (a timeout, a cancelled
+future) is recorded as `cancelled`. Keys are recorded hashed: see [The file](#the-file).
+
 - **`handle.snapshot()`**: a `Snapshot` with the aggregates so far: per storage API and stage
   (queue, connect, send, TTFB, body, stall; count, mean, p50/p90/p99/p99.9/max), per verb,
-  connection reuse and dial times, retries and status codes, bytes, a per-second timeline.
-  Aggregates are exact.
-- **`handle.save(path)`**: a `.oprobe` profile: the snapshot plus a sample of whole requests
-  (failed, throttled and slowest requests are always kept, within `Config::max_rows`). The rows
-  saved are moved out of memory, so periodic saves hold the requests of each period; the
-  aggregates are cumulative. `snapshot.save(path)` writes the aggregates alone.
+  connection reuse and dial times, retries and status codes, bytes, a timeline. Aggregates are
+  exact.
+- **`handle.save(path)`**: a `.oprobe` profile: the snapshot plus a sample of whole operations
+  with their requests (failed, throttled and slowest ones are always kept, within
+  `Config::max_rows`). The rows saved are moved out of memory, so periodic saves hold the
+  operations of each period; the aggregates are cumulative. `snapshot.save(path)` writes the
+  aggregates alone.
+- **`handle.save_and_reset(path)`**: the same, then a fresh window: the aggregates start again
+  from zero (atomically with the snapshot), so hourly files are hourly profiles.
 - **`Exporter`**: called for every request as it completes, on the request path (keep it cheap).
 
 ```rust
@@ -1006,10 +1119,11 @@ impl oprobe_trace::Exporter for Slow {
 let cfg = oprobe_trace::Config::default().exporter(std::sync::Arc::new(Slow));
 ```
 
-- **OpenTelemetry** (feature `otel`): `oprobe_trace::otel::config(&meter)` records
-  `http.client.request.duration` (seconds) once per stage, with the attributes `oprobe.stage`
-  (`total`, `queue`, `connect`, `send`, `ttfb`, `body`, `stall`), `oprobe.api`,
-  `http.request.method` and `http.response.status_code`.
+- **OpenTelemetry** (feature `otel`, `opentelemetry` 0.32): `oprobe_trace::otel::config(&meter)`
+  records `http.client.request.duration` (seconds) once per stage, with the attributes
+  `oprobe.stage` (`total`, `queue`, `connect`, `send`, `ttfb`, `body`, `stall`), `oprobe.api`,
+  `http.request.method` and `http.response.status_code`, and OpenDAL's own metric labels
+  (`scheme`, `namespace`, `root`, `operation`), so its series join `opendal-layer-otelmetrics`'.
 
 ## Configuration
 
@@ -1041,15 +1155,19 @@ a connector layer that times each dial, a TLS session store that timestamps the 
 body wrapper that times the transfer and your code's consumption. Nothing is decrypted or
 proxied. For `memory` and `fs` it records one request per backend call.
 
-Without oprobe's workload driving it, requests are not grouped into operations: a profile from
-`oprobe-trace` has requests and their aggregates. `oprobe show FILE` marks its report
-`run.source = "trace"` and shows `production trace` instead of a workload. Each request counts
-as one operation there. The findings that requests support are derived: `errors`, `throttling`
-(and `rate_limit`, `key_limit`), `hung_requests`, `tail_stragglers` and `cold_connections`.
-The ones that need operations or a load oprobe varied are not: `small_ranges`,
-`slow_multipart`, `repeated_reads`, `bandwidth_cap` and `client_bound`. A trace has no workload
-to replay, so `oprobe prove` refuses it. Reproduce the traffic with `oprobe run OPERATOR` and
-prove that run.
+Above the transport, the layer wraps the service: each call runs in an operation scope that the
+transport (and OpenDAL's background tasks, through a scope-propagating executor) reports its
+requests to. The memory stays bounded however long the process lives: rows are sampled within
+`Config::max_rows`, and past about 2 000 intervals the oldest timeline intervals are merged in
+pairs (a month-long trace keeps under 2 000 intervals, the recent ones at full resolution).
+
+`oprobe show FILE` marks the report `run.source = "trace"` and shows `production trace` instead
+of a workload. Its findings are `errors`, `throttling` (and `rate_limit`, `key_limit`),
+`hung_requests`, `tail_stragglers`, `cold_connections`, and, from the operations,
+`small_ranges`, `slow_multipart` (when the operations issued their requests one after another)
+and `repeated_reads`. The ones that need a load oprobe varied or its own client are not:
+`bandwidth_cap` and `client_bound`. A trace has no workload to replay, so `oprobe prove` refuses
+it. Reproduce the traffic with `oprobe run OPERATOR` and prove that run.
 
 ## Overhead
 
@@ -1058,43 +1176,63 @@ cargo bench -p oprobe-trace --bench overhead              # ~10 s
 cargo bench -p oprobe-trace --bench overhead -- --quick   # ~1 s, runs in CI
 ```
 
-The bench runs the same operations on a plain `memory://` operator and on a traced one,
-interleaved, and reports the median difference per operation. The budget is **2 µs per
-operation**; the bench fails above it. On a 4-core Linux VM:
+The bench runs the same operations on a plain operator and on a traced one, interleaved, and
+reports the median difference per operation: on `memory://`, and over HTTP against a local server
+(OpenDAL's `http` service: OpenDAL's own reqwest client against the layer's instrumented one).
+The budget is **2 µs per operation** for the layer's bookkeeping, measured on `memory://`; the
+bench fails above it. On a 4-core Linux VM (busy with other builds):
 
 ```text
 oprobe-trace overhead on memory:// (31 rounds × 50000 ops)
-  plain OpenDAL         0.798 µs/op
-  with oprobe-trace     1.190 µs/op
-  overhead              0.379 µs/op  (p10 0.295, p90 0.578; budget 2 µs)
+  plain OpenDAL         1.032 µs/op
+  with oprobe-trace     2.363 µs/op
+  overhead              1.322 µs/op  (p10 1.119, p90 1.547; budget 2 µs)
+oprobe-trace overhead over HTTP on loopback (31 rounds × 4000 ops)
+  plain OpenDAL        19.874 µs/op
+  with oprobe-trace    25.222 µs/op
+  overhead              5.167 µs/op  (p10 0.979, p90 8.327)
 ```
 
 `memory://` is the worst case: its backend call costs well under a microsecond, so the difference
-is all bookkeeping. Against object storage, where a request takes milliseconds, the layer is lost
-in the noise.
+is all bookkeeping (an operation and its request). Over HTTP the transport's hooks add a few
+microseconds to a request; against object storage, where a request takes milliseconds, the layer
+is lost in the noise.
 
 ## Stability
 
-Within 6.x the API documented on docs.rs, the `oprobe.trace/6` file format and the meaning of
+Within 7.x the API documented on docs.rs, the `oprobe.trace/7` file format and the meaning of
 every field are stable: changes are additive. Public structs and enums are `#[non_exhaustive]`,
 so read fields freely but build `Config` with its methods. The `__internal` feature exists for the
 oprobe binary and has no semver promise; do not enable it.
 
 ## The file
 
-`oprobe.trace/6` is one JSON document, readable without oprobe:
+`oprobe.trace/7` is one JSON document, readable without oprobe:
 
 ```text
-{ "format": "oprobe.trace/6", "oprobe_trace_version": "6.3.0", "created_at": "…",
+{ "format": "oprobe.trace/7", "oprobe_trace_version": "7.0.0", "created_at": "…",
   "service": { "scheme": "s3", "name": "my-bucket", "root": "/data/" },
-  "snapshot": { … }, "rows": { "ops": [], "reqs": [ … ], "info": { … }, "sampling": { … } } }
+  "snapshot": { … }, "rows": { "ops": [ … ], "reqs": [ … ], "info": { … }, "sampling": { … } } }
 ```
 
 `service` is the OpenDAL service the layer was applied to: its scheme, name (the bucket or
 container) and root, with no options. A bare `snapshot.save` has neither `service` nor `rows`.
+`rows.ops` are the operations; each request row names its operation (`op_id`), the length of the
+byte range it asked for (`detail.range_bytes`) and, when it failed, its class
+(`storage.condition_not_match`, `storage.already_exists`, `storage.conflict`,
+`storage.range_not_satisfied`, `storage.throttled`, …) and whether the failure is temporary
+(`detail.temporary`).
 
-Object keys, request IDs and remote addresses can be in it; credentials never are. Treat a
+**Keys are hashed.** An operation's `key` is its first path segment (at most 32 bytes) and a
+48-bit hash of the whole key: `logs/2026/11/a.parquet` is recorded as `logs/#3f2a…`. Prefixes and
+hot keys still slice the traffic, and repeated reads are still told apart, but the file never
+holds a key. Request IDs and remote addresses can be in it; credentials never are. Treat a
 profile like a log file before you paste it into an issue.
+
+**Migrating from 6.x.** `oprobe.trace/6` files still open: they hold requests only, so each
+request counts as one operation there, and the report says so. A 7.x file counts operations;
+request counts are no longer labelled as operations. `TraceLayer` wraps every service now, not
+only `memory` and `fs`.
 
 
 <!-- source: docs/app.md -->
@@ -1179,8 +1317,11 @@ The window works like other professional tools on your platform (design:
   asks first: **Stop and Quit** stops it, removes its test data and quits; Cancel keeps it
   running.
 - **Run files**: open a `.oprobe` or report/trace `.json` file with File ▸ Open Run File… (the
-  system's open dialog, filtered to those types), open it from Finder or Explorer, or drop it
-  on the window (the window is outlined while a file is dragged over it).
+  system's open dialog, filtered to those types), drop it on the window (the window is outlined
+  while a file is dragged over it), or double-click it: `oprobe.app` (macOS), the `.msi`
+  (Windows) and the Linux desktop archive's `.desktop` entry and MIME type
+  (`application/x-oprobe-run`) register `.oprobe` files, and run `oprobe FILE`, which opens the
+  file in the app. The archives and the `.deb` / `.rpm` register nothing.
 - **Progress**: a running job shows its progress on the Dock or taskbar icon. When it ends while
   the window is in the background, a notification says so and the Dock icon or taskbar button
   asks for attention.
@@ -1195,24 +1336,37 @@ The window works like other professional tools on your platform (design:
   partial, open-loop arrivals started late, or too few operations were measured.
 - **Findings**, each with its remedy and the evidence it rests on (below). **Show N examples**
   expands the waterfalls of the operations that show the problem.
-- **Where the time went**: the stage split of every operation, and of each verb.
+- **Where the time went**: the stage split of every operation, and of each verb with its
+  operations per second, MiB/s, requests per operation and, when any, its throttled share.
 - **Requests by API**: for each S3 API, the request count, the status codes, TTFB p50 / p99,
-  p99, bytes down / up and connection reuse. Click an API to list its slowest requests, and one
-  of those to see its operation's waterfall.
+  total p50 / p99 (the same statistics as `oprobe show`), bytes down / up and connection reuse.
+  For a run that wrote, a **Writes** line gives the multipart part size OpenDAL used (with the
+  requested chunk and the service's limits when it was clamped) and the parts uploaded with
+  their mean size. Click an API to list its slowest requests, and one of those to see its
+  operation's waterfall.
 - **Retries and failures**: retries, time spent waiting between attempts, 429 / 503 responses,
   the longest `Retry-After`, other errors and failure classes.
 - **The slowest operations** as a request waterfall. Each request is on a shared time axis and
-  coloured by stage; the wait before a retry is drawn as a line in the retry colour. Hovering a
-  request reads out its stages and, when recorded, the provider's error code (`SlowDown`),
-  `Retry-After`, the connection's rtt, min rtt and retransmits, and `Server-Timing`.
+  coloured by stage, the body's wait for the consumer (stall) its own segment; the wait before a
+  retry is drawn as a line in the retry colour. Hovering a request reads out its stages and,
+  when recorded, the provider's error code (`SlowDown`), `Retry-After`, the connection's rtt,
+  min rtt and retransmits, `Server-Timing`, the HTTP/2 stream wait, flow-control stall and open
+  streams, when the upload reached the kernel and was acknowledged, the CDN cache status and
+  the region ([request signals](reading-the-profile.md#request-signals)). An operation whose
+  async call stack was captured has **Async call stack while in flight** under it, closed until
+  clicked.
 - **Timeline**, with a verb filter above it (All verbs, or one verb):
   - goodput (successful operations) with the attempted rate, failures included, as a faint line
     behind it, and the intervals with throttled responses or failed operations shaded;
   - p50 / p99 / p99.9; an interval with too few operations for a quantile (fewer than
     10 / (1 − q): 1 000 for p99) draws it faint and dashed, and the readout says so
     (`n=12, too few for p99`);
-  - requests per second (retries included) with the retries per second;
-  - the number of requests in flight.
+  - requests per second (retries included) with, as step lines beside it, the retries, the
+    throttled responses and the failed operations per second (so one 429 does not look like a
+    thousand);
+  - the number of requests in flight, with the connections dialed in each interval (churn
+    behind a latency spike) and, faint, the client's CPU in cores busy (its saturation over
+    time).
 
   Requests and in-flight are not split by verb: with a verb chosen they say "all verbs".
 - **Latency distribution**: a CDF with p50 and p99 marked. It is drawn from every row when no row
@@ -1221,11 +1375,18 @@ The window works like other professional tools on your platform (design:
 - **Heatmap**: operations by start time and latency, in fine rows when every row was kept, with a
   colour key from the fewest to the most operations in a cell. Click a cell to list its slowest
   operations (verb, key, latency, status, attempts), and one of those to see its waterfall.
-- **Connections**.
+- **Connections**: new connections (and failed dials), reuse, protocols, TLS, the proxy, peak
+  requests in flight, each dial phase's p50 / p99 (DNS, TCP, proxy CONNECT, TLS), and whether
+  the network or the server is the limit: the kernel's round trip p50 / p99, the connections
+  that retransmitted, the share of sending time limited by the receive window or the send
+  buffer, the delivery rate, the TLS handshakes (resumed share, HelloRetryRequests) and the
+  cold start (connections dialed at the start, their connect time and the first operations'
+  latency).
 - **Details** (open on demand):
   - bytes asked for against bytes moved: read, write and request amplification, and cache hits;
-  - the hottest keys, object sizes, prefixes and server addresses.
-- **Run setup** (open on demand): target, workload, load, dataset, mix, seed, the client (CPU and
+  - the hottest keys, object sizes, prefixes, first and repeat reads (cold / warm) and server
+    addresses, each with its throttled share, error share and p99.
+- **Run setup** (open on demand): target, workload, load, dataset, mix, the write path, seed, the client (CPU and
   scheduling lag), the share of trace rows kept, and the `oprobe run …` command that runs it
   again.
 
@@ -1244,7 +1405,7 @@ Each finding carries the evidence it rests on:
 | Finding | Evidence |
 |---|---|
 | `throttling` | the share throttled at each number of requests in flight, with the fitted limit's interval shaded |
-| `key_limit`, `repeated_reads` | the hottest keys, with their share of the traffic and their share of all throttling |
+| `key_limit`, `repeated_reads` | the hottest keys as horizontal bars of their share of all throttling (of all requests when nothing was throttled) |
 | `small_ranges` | bytes asked for against bytes downloaded, and requests per operation |
 | `rate_limit` | throttled responses per second |
 | `bandwidth_cap` | bandwidth (MiB/s) over the run |
@@ -1311,14 +1472,19 @@ JSON.
 |---|---|
 | macOS, Linux | `curl -fsSL https://github.com/hxddh/oprobe/releases/latest/download/install.sh \| sh` |
 | macOS, Linux (CLI only) | `curl -fsSL https://github.com/hxddh/oprobe/releases/latest/download/install.sh \| sh -s -- --cli` |
-| Homebrew | `brew install hxddh/tap/oprobe` (the app bundle: `brew install --cask hxddh/tap/oprobe-app`) |
+| Homebrew (when published) | `brew install hxddh/tap/oprobe` (the app bundle: `brew install --cask hxddh/tap/oprobe-app`) |
 | Windows | `irm https://github.com/hxddh/oprobe/releases/latest/download/install.ps1 \| iex`, or the `.msi` |
-| Windows, Scoop | `scoop bucket add hxddh https://github.com/hxddh/scoop-bucket` then `scoop install oprobe` |
+| Windows, Scoop (when published) | `scoop bucket add hxddh https://github.com/hxddh/scoop-bucket` then `scoop install oprobe` |
 | Windows, winget | `winget install hxddh.oprobe`, once the package is accepted into winget-pkgs ([below](#windows)) |
 | Debian, Ubuntu, Fedora, RHEL | the `.deb` / `.rpm` from the release page |
-| Rust ≥ 1.97 | `cargo install oprobe --locked` |
+| Rust ≥ 1.97 (crates.io, when published) | `cargo install oprobe --locked`; until then `cargo install --locked --git https://github.com/hxddh/oprobe oprobe` |
 
 Then try it with no account: `oprobe demo` ([getting started](getting-started.md)).
+
+Rows marked **when published** depend on the project's package channels (the Homebrew tap, the
+Scoop bucket, crates.io). A release publishes to a channel only when its publishing credentials
+are set, and its release notes list only the channels it published to; until then, use the
+install scripts, the release assets or `cargo install --git`.
 
 ## The app and the CLI-only build
 
@@ -1427,7 +1593,7 @@ sudo dnf install ./oprobe-<ver>-1.x86_64.rpm
 cargo install oprobe --locked                                         # the app in the terminal
 cargo install oprobe --locked --features gui                          # plus native windows (Linux: libgtk-4-dev)
 cargo install oprobe --locked --no-default-features --features cli    # the CLI only
-cargo install --locked --git https://github.com/hxddh/oprobe --tag v6.3.0 oprobe
+cargo install --locked --git https://github.com/hxddh/oprobe --tag v7.0.0 oprobe
 ```
 
 `cargo install oprobe` also downloads `oprobe-core`, oprobe's internal engine crate, at exactly
@@ -1446,7 +1612,7 @@ as the archive, so it proves the download is intact, not who built it.
 ```bash
 sha256sum --ignore-missing -c SHA256SUMS                    # Linux
 shasum -a 256 --ignore-missing -c SHA256SUMS                # macOS
-Get-FileHash oprobe-6.3.0-x64.msi -Algorithm SHA256          # Windows
+Get-FileHash oprobe-7.0.0-x64.msi -Algorithm SHA256          # Windows
 ```
 
 **Build provenance.** Every asset has a [SLSA build provenance](https://slsa.dev/) attestation
@@ -1454,7 +1620,7 @@ signed by GitHub Actions, which proves it was built by this repository's release
 given commit:
 
 ```bash
-gh attestation verify oprobe-6.3.0-x86_64-unknown-linux-musl.tar.gz --repo hxddh/oprobe \
+gh attestation verify oprobe-7.0.0-x86_64-unknown-linux-musl.tar.gz --repo hxddh/oprobe \
   --signer-workflow hxddh/oprobe/.github/workflows/release.yml
 ```
 
@@ -1478,8 +1644,11 @@ are **not signed or notarized**. The operating system asks for one confirmation 
 - **Either, from a terminal**: `xattr -dr com.apple.quarantine /Applications/oprobe.app`.
 - **Windows**: SmartScreen says "Windows protected your PC": click **More info** → **Run anyway**.
 
-Homebrew, Scoop, winget, the install scripts, `cargo install` and the plain archives used from a
-terminal are not affected. Verify the download ([above](#verifying-a-download)) before you
+The Homebrew formula, Scoop, winget, the install scripts, `cargo install` and the plain archives
+used from a terminal are not affected. The Homebrew **cask** (`oprobe-app`) is: Homebrew keeps the
+quarantine attribute on the apps it installs, so the first open of `oprobe.app` asks as above.
+The app is signed ad hoc, so macOS may refuse to verify its developer, but never reports it as
+damaged. Verify the download ([above](#verifying-a-download)) before you
 confirm.
 
 
@@ -1513,7 +1682,7 @@ a `hint:` line. `--dry-run` shows the plan without sending a request.
 
 | Situation | What to do |
 |---|---|
-| leftover `oprobe-run-*` prefixes | a run was killed hard (a second Ctrl-C, OOM, power loss); delete the prefix with your usual tools |
+| leftover `oprobe-run-*` prefixes | a run was killed hard (a second Ctrl-C, OOM, power loss): the next run against the same target deletes them (it says so), except under `--read-only`; or delete the prefix with your usual tools |
 | `client_bound` on a remote store | the profiling process is the bottleneck (CPU, tiny objects); the profile's `self` section says why. Larger objects or fewer workers |
 | `oprobe` asks nothing in a script | it never prompts: pass an operator, and use `--non-interactive` to rule out redraws |
 | `cannot open a window` | no display (SSH, a server): the app opens in the terminal; Linux packages built with `--features gui` need GTK 4 |
@@ -1708,16 +1877,21 @@ you run them.
   saved, and URLs lose embedded credentials and query strings.
 - **The host** is recorded as OS, architecture, CPU count and a hash of the host name, never the
   name itself.
+- **Pending-cleanup markers** in `<data dir>/oprobe/pending/`: while a run that writes is going,
+  one small file names its target and its `oprobe-run-*` prefix. It is removed once the test data
+  is deleted; one left by a killed run tells the next run against that target what to delete.
 - **The config file** holds what you put there.
 
 Delete runs with `oprobe show --rm RUN…`, or remove the data directory.
 
 ## `.oprobe` files from `oprobe-trace`
 
-`Handle::save` writes what the layer saw in your process: the aggregates and a sample of requests
-with their API, method, status, timing, bytes, connection and request ID. Object keys are not part
-of request rows, but request IDs and remote addresses are. Credentials never are. Review a file
-before you attach it to an issue.
+`Handle::save` writes what the layer saw in your process: the aggregates and a sample of
+operations and their requests, with their API, method, status, timing, bytes, connection and
+request ID. Object keys are never stored: an operation's key is its first path segment (at most
+32 bytes) and a hash of the whole key (`logs/#3f2a…`), so a top-level directory name can be in
+the file, but not a key. Request IDs and remote addresses are. Credentials never are. Review a
+file before you attach it to an issue.
 
 ## Test data in your bucket
 

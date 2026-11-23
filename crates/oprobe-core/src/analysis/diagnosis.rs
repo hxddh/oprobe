@@ -191,9 +191,9 @@ pub fn diagnose(s: &Snapshot, network: bool) -> Diagnosis {
     let headline = match bottleneck {
         Bottleneck::None => "No operations completed in the measurement window.".to_owned(),
         Bottleneck::Throttling => format!(
-            "Throttling-bound: the service rejected {:.1}% of requests with 429/503; {:.0}% of operation time is retry backoff.",
-            thr as f64 / requests * 100.0,
-            shares.retry * 100.0
+            "Throttling-bound: {:.0}% of operation time is retry backoff after 429/503 ({:.1}% of requests rejected).",
+            shares.retry * 100.0,
+            thr as f64 / requests * 100.0
         ),
         b => format!(
             "{}-bound: {:.0}% of operation time is spent in {} (p50 {} / p99 {}).",

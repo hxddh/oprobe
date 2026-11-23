@@ -85,6 +85,7 @@ pub async fn measure(ctx: &Ctx, profile: Profile, o: Opts<'_>) -> Result<Measure
     req.trace_max_requests = super::profile::trace_max_requests(ctx);
     req.store = (!o.output.no_save).then(|| ctx.store());
     req.parent_id = o.parent_id;
+    req.pending_dir = Some(crate::store::pending::dir(&ctx.paths.data_dir));
     req.on_stage = Some(on_stage);
     req.finalize = Some(Box::new(move |run| {
         if let Some(level) = fail_on

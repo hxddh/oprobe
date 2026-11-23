@@ -126,10 +126,11 @@ jobs:
       - name: rustdoc of oprobe-core
         run: cargo doc --locked --no-deps -p oprobe-core
       - name: Links (external included)
+        # 429 and 503 are GitHub rate-limiting the runner, not a dead link (that is a 404).
         uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2.9.0
         with:
           args: >-
-            --no-progress --max-retries 3 --accept 200,206,429
+            --no-progress --max-retries 3 --accept 200,206,429,503
             --exclude-path docs/design
             --exclude 'releases/(latest/)?download'
             --exclude-loopback

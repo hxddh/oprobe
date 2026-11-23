@@ -158,7 +158,7 @@ pub struct ErrorBody {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub docs: Option<String>,
     /// The whole error chain as the storage library reported it, when `message` leads with
-    /// the provider's error code instead (machine output only).
+    /// the provider's error code or states the cause plainly instead (machine output only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
 }
@@ -197,6 +197,9 @@ pub struct OprobeError {
     pub code: ErrorCode,
     pub message: String,
     pub hint: Option<String>,
+    /// The storage library's own report, when `message` states the cause plainly (machine
+    /// output only: [`ErrorBody::detail`]).
+    pub detail: Option<String>,
 }
 
 impl OprobeError {
@@ -205,11 +208,17 @@ impl OprobeError {
             code,
             message: message.into(),
             hint: None,
+            detail: None,
         }
     }
 
     pub fn with_hint(mut self, hint: impl Into<String>) -> Self {
         self.hint = Some(hint.into());
+        self
+    }
+
+    pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = Some(detail.into());
         self
     }
 }
@@ -275,6 +284,13 @@ fn debug_field<'a>(s: &'a str, name: &str) -> Option<&'a str> {
 /// debug-printed service errors), as a short lead: what happened, then the code and message.
 /// `None` when the chain carries no provider code.
 pub fn provider_lead(chain: &str, code: ErrorCode) -> Option<String> {
+    let (what, rest) = provider_parts(chain, code)?;
+    Some(format!("{what}: {rest}"))
+}
+
+/// [`provider_lead`] in two parts: what happened (`credentials rejected`) and the provider's
+/// code and message (`InvalidAccessKeyId: The AWS Access Key Id …`).
+pub fn provider_parts(chain: &str, code: ErrorCode) -> Option<(&'static str, String)> {
     let (pcode, pmsg) = match (xml_value(chain, "Code"), debug_field(chain, "code")) {
         (Some(c), _) => (c, xml_value(chain, "Message")),
         (None, Some(c)) => (c, debug_field(chain, "message")),
@@ -304,10 +320,13 @@ pub fn provider_lead(chain: &str, code: ErrorCode) -> Option<String> {
             _ => "the service refused the request",
         },
     };
-    Some(match pmsg {
-        Some(m) => format!("{what}: {pcode}: {m}"),
-        None => format!("{what}: {pcode}"),
-    })
+    Some((
+        what,
+        match pmsg {
+            Some(m) => format!("{pcode}: {m}"),
+            None => pcode.to_owned(),
+        },
+    ))
 }
 
 /// Classify an error chain: an [`OprobeError`] anywhere in the chain wins, then typed sources
@@ -327,6 +346,9 @@ pub fn classify(err: &anyhow::Error, scheme: &str) -> ErrorBody {
     for cause in err.chain() {
         if let Some(e) = cause.downcast_ref::<OprobeError>() {
             let mut body = ErrorBody::new(e.code, chain_message(err)).lead_with_provider();
+            if body.detail.is_none() {
+                body.detail = e.detail.as_deref().map(crate::util::strip_url_credentials);
+            }
             body.hint = e
                 .hint
                 .as_deref()

@@ -10,6 +10,7 @@
 //! may hold inline secrets, and run files name buckets, endpoints and object keys.
 
 pub mod config;
+pub mod pending;
 pub mod runfile;
 pub mod runs;
 pub mod target_id;

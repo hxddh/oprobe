@@ -459,7 +459,7 @@ fn empty_state(s: Store) -> View {
         )
         .child(small(tr("runs.empty_hint")).text_center())
         .child(btn(
-            tr("menu.new_run"),
+            tr("runs.profile_lab"),
             || Kind::Primary,
             move || s.dialog.set(Some(Dialog::NewRun)),
         ))

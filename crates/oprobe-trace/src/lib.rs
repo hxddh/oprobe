@@ -27,7 +27,7 @@
 //! - [`layer`] returns the [`TraceLayer`] to add to an operator and a [`Handle`] to read it.
 //! - [`Handle::snapshot`] returns the aggregates so far ([`Snapshot`]): per API and stage, per
 //!   verb, connections, bytes and a timeline.
-//! - [`Handle::save`] and [`Snapshot::save`] write a `.oprobe` file (format `oprobe.trace/6`).
+//! - [`Handle::save`] and [`Snapshot::save`] write a `.oprobe` file (format `oprobe.trace/7`).
 //! - [`Exporter`] receives every request as it completes; with the `otel` feature,
 //!   [`otel::OtelExporter`] turns them into OpenTelemetry metrics
 //!   (`http.client.request.duration` with `oprobe.stage` and `oprobe.api`).
@@ -46,7 +46,7 @@
 //! # Stability
 //!
 //! The items documented here, the `.oprobe` format and the meaning of every field are stable
-//! across 6.x: changes are additive, and public structs and enums are `#[non_exhaustive]`. The
+//! across 7.x: changes are additive, and public structs and enums are `#[non_exhaustive]`. The
 //! `__internal` feature exists for the oprobe binary only and carries no semver promise.
 
 // Half of the recorder (operation scopes, the whole-operation sampler, key dimensions, the
@@ -79,7 +79,7 @@ macro_rules! internal_use {
 }
 
 internal_mods!(
-    dims, file, layer, log, net, record, recorder, rows, sample, scope, snapshot, util
+    dims, file, layer, log, net, observe, record, recorder, rows, sample, scope, snapshot, util
 );
 
 #[cfg(feature = "otel")]
@@ -90,6 +90,7 @@ use std::sync::Arc;
 
 pub use dims::{DimensionStats, HotKeyStats, SliceStats};
 pub use net::HttpVersion;
+pub use observe::RetryNotify;
 pub use record::{Api, Protocol, RequestRecord, RequestTiming};
 pub use recorder::Exporter;
 pub use rows::{FailureCode, ReqDetail, TcpRow, TlsRow};
@@ -100,8 +101,9 @@ pub use snapshot::{
     TimelinePoint, VerbInterval, VerbStats,
 };
 
-internal_use!(file::{ServiceRecord, TRACE_FORMAT, TraceFile});
+internal_use!(file::{ServiceRecord, TRACE_FORMAT, TRACE_FORMATS_READ, TraceFile});
 internal_use!(layer::{InProcessObserveLayer, TraceContextLayer});
+internal_use!(observe::{Linker, OperationObserveLayer, error_class, private_key});
 internal_use!(log::{DEFAULT_MAX_REQUESTS, TraceLog, TraceRows});
 internal_use!(record::classify_http);
 internal_use!(recorder::{Budget, DialRecord, InflightGuard, OpCompletion, Recorder, RowSink});
@@ -227,13 +229,15 @@ impl Config {
     }
 }
 
-/// The OpenDAL layer of [`layer`]: the instrumented HTTP transport and scope propagation for
-/// HTTP services, one record per backend call for in-process services.
+/// The OpenDAL layer of [`layer`]: every OpenDAL call as one operation, with the backend
+/// requests it issued (the instrumented HTTP transport and scope propagation for HTTP services,
+/// one record per backend call for in-process services).
 #[derive(Clone)]
 pub struct TraceLayer {
     recorder: Arc<Recorder>,
     context: Option<TraceContextLayer>,
     service: Arc<std::sync::OnceLock<file::ServiceRecord>>,
+    linker: Arc<observe::Linker>,
 }
 
 impl std::fmt::Debug for TraceLayer {
@@ -251,16 +255,25 @@ impl opendal_core::raw::Layer for TraceLayer {
     fn apply_service(&self, srv: opendal_core::raw::Servicer) -> opendal_core::raw::Servicer {
         use opendal_core::raw::*;
         let info = srv.info();
-        self.service.get_or_init(|| file::ServiceRecord {
-            scheme: info.scheme().to_owned(),
-            name: info.name().to_string(),
-            root: info.root().to_string(),
+        self.service.get_or_init(|| {
+            let s = file::ServiceRecord {
+                scheme: info.scheme().to_owned(),
+                name: info.name().to_string(),
+                root: info.root().to_string(),
+            };
+            if let Some(e) = self.recorder.exporter() {
+                e.on_service(&s.scheme, &s.name, &s.root);
+            }
+            s
         });
-        if in_process(info.scheme()) {
+        // In-process services: one request per backend call, beneath the operation.
+        let srv = if in_process(info.scheme()) {
             InProcessObserveLayer::new(self.recorder.clone()).apply_service(srv)
         } else {
             srv
-        }
+        };
+        observe::OperationObserveLayer::new(self.recorder.clone(), self.linker.clone())
+            .apply_service(srv)
     }
 
     fn apply_context(
@@ -281,6 +294,7 @@ pub struct Handle {
     recorder: Arc<Recorder>,
     transport_error: Option<Arc<str>>,
     service: Arc<std::sync::OnceLock<file::ServiceRecord>>,
+    linker: Arc<observe::Linker>,
 }
 
 impl std::fmt::Debug for Handle {
@@ -294,7 +308,25 @@ impl std::fmt::Debug for Handle {
 impl Handle {
     /// The aggregates so far: per API and stage, per verb, connections, bytes, timeline.
     pub fn snapshot(&self) -> Snapshot {
+        self.linker.flush(&self.recorder);
         self.recorder.snapshot()
+    }
+
+    /// The retry notifier for OpenDAL's `RetryLayer`, so retries are part of the profile (the
+    /// Retries section: count, backoff, throttling) and the attempts of one call are one
+    /// operation:
+    ///
+    /// ```
+    /// # use opendal_core::{Operator, services::Memory};
+    /// # fn demo(op: Operator) {
+    /// let (trace, handle) = oprobe_trace::layer(oprobe_trace::Config::default());
+    /// let op = op
+    ///     .layer(trace)
+    ///     .layer(opendal_layer_retry::RetryLayer::new().with_notify(handle.retry_notify()));
+    /// # }
+    /// ```
+    pub fn retry_notify(&self) -> RetryNotify {
+        RetryNotify::new(self.recorder.clone(), self.linker.clone())
     }
 
     /// Write a `.oprobe` profile to `path`: the aggregates so far plus the sampled operations
@@ -304,6 +336,23 @@ impl Handle {
     pub fn save(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
         let snapshot = self.snapshot();
         let rows = self.recorder.take_trace();
+        file::write(path.as_ref(), self.service.get(), &snapshot, Some(&rows))
+    }
+
+    /// [`Handle::save`], then start a fresh window: the aggregates start again from zero, so
+    /// each file profiles only its own period (hourly files are hourly profiles). The reset is
+    /// atomic with the snapshot: nothing recorded in between is lost.
+    ///
+    /// ```no_run
+    /// # fn demo(handle: oprobe_trace::Handle) -> std::io::Result<()> {
+    /// // Once an hour:
+    /// handle.save_and_reset("prod-1400.oprobe")?;
+    /// # Ok(()) }
+    /// ```
+    pub fn save_and_reset(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
+        self.linker.flush(&self.recorder);
+        // The rows of the same window as the aggregates (one critical section).
+        let (snapshot, rows) = self.recorder.snapshot_and_reset_with_rows();
         file::write(path.as_ref(), self.service.get(), &snapshot, Some(&rows))
     }
 
@@ -348,16 +397,19 @@ pub fn layer(cfg: Config) -> (TraceLayer, Handle) {
             Err(e) => (None, Some(Arc::from(format!("{e:#}")))),
         };
     let service = Arc::new(std::sync::OnceLock::new());
+    let linker = Arc::new(observe::Linker::default());
     (
         TraceLayer {
             recorder: recorder.clone(),
             context,
             service: service.clone(),
+            linker: linker.clone(),
         },
         Handle {
             recorder,
             transport_error,
             service,
+            linker,
         },
     )
 }

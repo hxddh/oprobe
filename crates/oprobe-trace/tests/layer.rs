@@ -42,17 +42,38 @@ async fn a_memory_operator_reports_its_requests() {
     let down: u64 = snap.apis.iter().map(|a| a.bytes_down).sum();
     assert_eq!(down, 10 * 1024);
 
-    // The profile holds the aggregates and every request (outside any operation: op id 0).
+    // Every call is an operation with its request (design v7 B1).
+    assert_eq!(snap.summary.ops, 21);
+    let verbs: Vec<&str> = snap.verbs.iter().map(|v| v.verb.as_str()).collect();
+    assert_eq!(verbs, ["read.full", "stat", "write"]);
+    assert!(snap.verbs.iter().all(|v| v.requests_per_op == 1.0));
+    assert_eq!(snap.bytes.logical_read, 10 * 1024);
+    assert_eq!(snap.bytes.logical_write, 10 * 1024);
+
+    // The profile holds the aggregates, every operation and every request, linked.
     let path = temp_file("requests");
     handle.save(&path).unwrap();
     let doc = read_json(&path);
-    assert_eq!(doc["format"], "oprobe.trace/6");
+    assert_eq!(doc["format"], "oprobe.trace/7");
     assert_eq!(doc["oprobe_trace_version"], env!("CARGO_PKG_VERSION"));
     // The service the layer was applied to (no options, no credentials).
     assert_eq!(doc["service"]["scheme"], "memory");
     let reqs = doc["rows"]["reqs"].as_array().unwrap();
     assert_eq!(reqs.len(), 21);
-    assert!(reqs.iter().all(|r| r["op_id"] == 0));
+    let ops = doc["rows"]["ops"].as_array().unwrap();
+    assert_eq!(ops.len(), 21);
+    let ids: std::collections::BTreeSet<u64> =
+        ops.iter().map(|o| o["op_id"].as_u64().unwrap()).collect();
+    assert!(
+        reqs.iter()
+            .all(|r| ids.contains(&r["op_id"].as_u64().unwrap()))
+    );
+    // Keys are hashed, never recorded (docs/privacy.md).
+    assert!(
+        ops.iter()
+            .all(|o| o["key"].as_str().unwrap().starts_with('#')),
+        "{ops:#?}"
+    );
     assert_eq!(doc["rows"]["sampling"]["seen_requests"], 21);
     let apis = doc["snapshot"]["apis"].as_array().unwrap();
     let total: u64 = apis
@@ -101,9 +122,35 @@ async fn a_snapshot_saves_without_rows() {
     let path = temp_file("snapshot");
     handle.snapshot().save(&path).unwrap();
     let doc = read_json(&path);
-    assert_eq!(doc["format"], "oprobe.trace/6");
+    assert_eq!(doc["format"], "oprobe.trace/7");
     assert!(doc.get("rows").is_none());
     assert_eq!(doc["snapshot"]["apis"][0]["api"], "PutObject");
+}
+
+/// Hourly files are hourly profiles: `save_and_reset` starts a fresh window.
+#[tokio::test]
+async fn save_and_reset_starts_a_fresh_window() {
+    let (layer, handle) = oprobe_trace::layer(oprobe_trace::Config::default());
+    let op = Operator::new(Memory::default()).unwrap().layer(layer);
+    op.write("a", "x").await.unwrap();
+    for _ in 0..3 {
+        op.stat("a").await.unwrap();
+    }
+    let path = temp_file("hour1");
+    handle.save_and_reset(&path).unwrap();
+    let doc = read_json(&path);
+    assert_eq!(doc["snapshot"]["summary"]["ops_count"], 4);
+    // The next window holds only what happened since.
+    op.stat("a").await.unwrap();
+    let snap = handle.snapshot();
+    assert_eq!(snap.summary.ops, 1);
+    let requests: u64 = snap.apis.iter().map(|a| a.count).sum();
+    assert_eq!(requests, 1);
+    let path = temp_file("hour2");
+    handle.save_and_reset(&path).unwrap();
+    let doc = read_json(&path);
+    assert_eq!(doc["snapshot"]["summary"]["ops_count"], 1);
+    assert_eq!(doc["rows"]["ops"].as_array().unwrap().len(), 1);
 }
 
 struct Count(std::sync::atomic::AtomicU64);

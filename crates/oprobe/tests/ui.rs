@@ -179,7 +179,25 @@ fn the_app_follows_the_system_language() {
     let cx = Ctx::new();
     let mut app = cx.start_in(Locale::parse("zh-CN").unwrap());
     wait_long(&mut app, "text:还没有运行");
-    wait_long(&mut app, "text:新建运行…");
+    // The empty state's one action says what it does (U7).
+    wait_long(&mut app, "text:剖析实验室…");
+}
+
+/// Settings says where your own storage goes: an op.toml file and credentials from the
+/// environment, with the docs one press away (U7).
+#[test]
+fn settings_points_to_your_storage() {
+    let cx = Ctx::new();
+    let mut app = cx.start();
+    choose(&mut app, "English");
+    wait_long(&mut app, "text:Profile the lab…");
+    app.press_key("ctrl+,").unwrap();
+    wait_long(&mut app, "id:settings-dialog");
+    wait_long(&mut app, "text:Your storage");
+    wait_long(&mut app, "text:/op\\.toml file.*AWS_\\*/");
+    assert!(has(&app, "id:settings-storage-docs"));
+    app.press("id:dialog-done").unwrap();
+    app.wait_for_gone("id:dialog", LONG).unwrap();
 }
 
 #[test]
@@ -498,6 +516,11 @@ fn the_windows_window_follows_windows() {
         .map(|e| format!("{e:?}"))
         .collect();
     assert!(labels.iter().any(|l| l.contains("Exit")), "{labels:?}");
+    // Help has the glossary of the terms a profile prints (U5).
+    assert!(
+        labels.iter().any(|l| l.contains("Glossary of Terms")),
+        "{labels:?}"
+    );
     app.choose_menu_item("About oprobe").unwrap();
     wait_long(&mut app, "id:about-dialog");
     assert!(has(
@@ -506,6 +529,19 @@ fn the_windows_window_follows_windows() {
     ));
     app.press("id:dialog-done").unwrap();
     app.wait_for_gone("id:dialog", LONG).unwrap();
+    // A run's context menu shows its file in Explorer, in Windows' words.
+    app.right_click(&format!("id:run-{id}")).unwrap();
+    let labels: Vec<String> = app
+        .menu()
+        .expect("the context menu")
+        .iter()
+        .map(|e| format!("{e:?}"))
+        .collect();
+    assert!(
+        labels.iter().any(|l| l.contains("Show in Explorer")),
+        "{labels:?}"
+    );
+    app.choose_menu_item("Copy Run ID").unwrap();
     // Delete asks with Cancel the default.
     app.answer_dialogs_myself();
     app.press(&format!("id:run-{id}")).unwrap();
@@ -720,4 +756,46 @@ fn findings_apis_and_the_verb_filter_drill_down() {
     app.drag("id:heatmap", right(1.0)).unwrap();
     wait_long(&mut app, "id:cell-drill");
     wait_long(&mut app, "text:/^Slowest operations at /");
+}
+
+#[test]
+fn the_profile_shows_every_captured_signal_where_it_explains_something() {
+    let cx = Ctx::new();
+    let id = seed_long(&cx, "lab://stragglers");
+    // The slowest operation as it reads when its async call stack was captured in flight.
+    let shown = App::new(cx.paths())
+        .show(oprobe::app::RunRef::from(id.as_str()))
+        .unwrap();
+    let mut run = *shown.full.unwrap();
+    let slowest = run.report.slowest[0];
+    run.ops
+        .iter_mut()
+        .find(|o| o.op_id == slowest)
+        .unwrap()
+        .await_tree = Some("read.full [400ms]\n  GetObject [400ms]".into());
+    oprobe::store::runs::write_run_file(std::path::Path::new(&shown.path), &run).unwrap();
+    cx.launch(Some(id.clone()));
+    let mut app = cx.start();
+    choose(&mut app, "English");
+    wait_long(&mut app, "id:chart-inflight");
+    // In flight with the connections dialed per interval and, faint, the client's CPU.
+    wait_long(&mut app, "id:timeline >> text:new connections");
+    wait_long(&mut app, "id:timeline >> text:client CPU (cores)");
+    // The same statistics as `oprobe show` in the API table.
+    wait_long(&mut app, "id:requests >> text:Total p50 / p99");
+    // Each verb with its rates.
+    wait_long(&mut app, "id:verbs >> text:/MiB\\/s · .* req\\/op$/");
+    // The consumer's stall is its own segment of the waterfall.
+    wait_long(&mut app, "id:slowest >> text:stall");
+    // Connections: one model with the CLI's, the kernel's view where the kernel gives it.
+    wait_long(&mut app, "id:connections");
+    #[cfg(target_os = "linux")]
+    wait_long(&mut app, "id:conn-tcp");
+    // A slow operation's async call stack opens under its waterfall on demand (every slow
+    // operation of a live run has one; the slowest is first).
+    let toggle = "id:slowest >> id:await-tree-toggle >> nth=0";
+    wait_long(&mut app, toggle);
+    assert!(!has(&app, "id:await-tree-body"));
+    app.press(toggle).unwrap();
+    wait_long(&mut app, "id:await-tree-body");
 }

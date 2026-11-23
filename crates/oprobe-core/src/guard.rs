@@ -57,11 +57,11 @@ impl BudgetBreach {
     pub fn message(&self) -> String {
         match self.budget.as_str() {
             "requests" => format!(
-                "request budget exceeded: {} requests (limit {})",
+                "request budget spent: {} requests (limit {})",
                 self.observed, self.limit
             ),
             "bytes" => format!(
-                "byte budget exceeded: {} transferred (limit {})",
+                "byte budget spent: {} transferred (limit {})",
                 crate::util::fmt_bytes(self.observed as u64),
                 crate::util::fmt_bytes(self.limit as u64)
             ),
@@ -89,7 +89,12 @@ pub struct Guard {
     requests: AtomicU64,
     bytes: AtomicU64,
     breach: Mutex<Option<BudgetBreach>>,
+    /// A budget is spent: the armed measurement was cancelled (no further work starts).
     tripped: std::sync::atomic::AtomicBool,
+    /// A budget was exceeded (more than its limit was used).
+    exceeded: std::sync::atomic::AtomicBool,
+    /// A spent budget stopped work that was still to be done ([`Guard::note_cut_short`]).
+    cut_short: std::sync::atomic::AtomicBool,
     /// The measurement currently enforced (re-armed by each session sharing this guard).
     cancel: Mutex<Option<Cancel>>,
 }
@@ -109,6 +114,8 @@ impl Guard {
             bytes: AtomicU64::new(0),
             breach: Mutex::new(None),
             tripped: std::sync::atomic::AtomicBool::new(false),
+            exceeded: std::sync::atomic::AtomicBool::new(false),
+            cut_short: std::sync::atomic::AtomicBool::new(false),
             cancel: Mutex::new(None),
         })
     }
@@ -127,20 +134,23 @@ impl Guard {
         *self.cancel.lock().unwrap_or_else(|e| e.into_inner()) = Some(cancel);
     }
 
-    /// Account requests and bytes (hot path: two atomic adds and a few compares).
+    /// Account requests and bytes (hot path: two atomic adds and a few compares). A budget
+    /// stops the run when it is spent: `--max-requests 500` allows 500 requests, not 501.
+    /// Spending it exactly is not a breach by itself: only exceeding it, or work it stopped
+    /// ([`Guard::note_cut_short`]), is.
     #[inline]
     pub fn add(&self, requests: u64, bytes: u64) {
         let r = self.requests.fetch_add(requests, Ordering::Relaxed) + requests;
         let b = self.bytes.fetch_add(bytes, Ordering::Relaxed) + bytes;
         if let Some(max) = self.budgets.max_requests_count
-            && r > max
+            && r >= max
         {
-            self.trip("requests", max as f64, r as f64);
+            self.trip("requests", max as f64, r as f64, r > max);
         }
         if let Some(max) = self.budgets.max_bytes
-            && b > max
+            && b >= max
         {
-            self.trip("bytes", max as f64, b as f64);
+            self.trip("bytes", max as f64, b as f64, b > max);
         }
         self.tick();
     }
@@ -151,12 +161,15 @@ impl Guard {
         if let Some(max) = self.budgets.max_duration_s {
             let s = self.started.elapsed().as_secs_f64();
             if s > max {
-                self.trip("duration", max, s);
+                self.trip("duration", max, s, true);
             }
         }
     }
 
-    fn trip(&self, budget: &str, limit: f64, observed: f64) {
+    fn trip(&self, budget: &str, limit: f64, observed: f64, exceeded: bool) {
+        if exceeded {
+            self.exceeded.store(true, Ordering::Release);
+        }
         if self.tripped.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -175,15 +188,36 @@ impl Guard {
         }
     }
 
+    /// A budget is spent: the armed measurement was cancelled.
     pub fn tripped(&self) -> bool {
         self.tripped.load(Ordering::Acquire)
     }
 
+    /// Work that was still to be done was stopped (the cancellation cut a measurement short,
+    /// or another measurement wants to start): a spent budget is then breached.
+    pub fn note_cut_short(&self) {
+        self.cut_short.store(true, Ordering::Release);
+    }
+
+    /// The breach of a spent budget that was exceeded or stopped work; `None` while no budget
+    /// is spent, and for a budget spent exactly by work that was done anyway.
     pub fn breach(&self) -> Option<BudgetBreach> {
+        if !self.exceeded.load(Ordering::Acquire) && !self.cut_short.load(Ordering::Acquire) {
+            return None;
+        }
         self.breach
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+
+    /// A measurement wants to start: the breach that refuses it when a budget is spent.
+    pub fn demand(&self) -> Option<BudgetBreach> {
+        self.tick();
+        if self.tripped() {
+            self.note_cut_short();
+        }
+        self.breach()
     }
 
     /// Requests and bytes accounted so far.
@@ -410,7 +444,62 @@ pub fn plan(profile: &Profile, run_prefix: &str, read_only: bool, budgets: &Budg
         assumptions,
         target_ref: target_ref(profile),
         command: crate::model::RunSpec::new(profile, target_ref(profile)).command(),
-        warnings: workload_warnings(profile),
+        warnings: {
+            let mut w = workload_warnings(profile);
+            w.extend(budget_warnings(
+                budgets,
+                requests,
+                bytes,
+                prepare_s + window + cleanup_s,
+            ));
+            w
+        },
+    }
+}
+
+/// The budgets a plan would spend before it finishes (the run would stop there, exit 4).
+fn budget_warnings(b: &Budgets, requests: u64, bytes: u64, eta_s: f64) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(max) = b.max_requests_count
+        && requests >= max
+    {
+        out.push(format!(
+            "~{requests} requests reach the request budget ({max}): the run would stop early (raise --max-requests or shorten the run)"
+        ));
+    }
+    if let Some(max) = b.max_bytes
+        && bytes >= max
+    {
+        out.push(format!(
+            "~{} transferred reach the byte budget ({}): the run would stop early (raise --max-bytes or shorten the run)",
+            crate::util::fmt_bytes(bytes),
+            crate::util::fmt_bytes(max)
+        ));
+    }
+    if let Some(max) = b.max_duration_s
+        && eta_s > max
+    {
+        out.push(format!(
+            "an ETA of {eta_s:.0}s exceeds the duration budget ({max:.0}s): the run would stop early (raise --max-duration or shorten the run)"
+        ));
+    }
+    out
+}
+
+impl Budgets {
+    /// `≤ 500 requests · ≤ 1.0 GiB · ≤ 60s`, or `None` without a budget.
+    pub fn line(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        if let Some(n) = self.max_requests_count {
+            parts.push(format!("≤ {n} requests"));
+        }
+        if let Some(n) = self.max_bytes {
+            parts.push(format!("≤ {}", crate::util::fmt_bytes(n)));
+        }
+        if let Some(s) = self.max_duration_s {
+            parts.push(format!("≤ {s:.0}s"));
+        }
+        (!parts.is_empty()).then(|| parts.join(" · "))
     }
 }
 
@@ -428,17 +517,22 @@ pub fn target_ref(profile: &Profile) -> String {
 /// Warnings about a workload that would run but probably not as meant (AG-9): a warmup at
 /// least as long as the measurement window spends most of the run unmeasured.
 pub fn workload_warnings(profile: &Profile) -> Vec<String> {
+    warmup_warning(profile).into_iter().collect()
+}
+
+/// The warning of a warmup at least as long as the measurement window, with the setting that
+/// shortens it (`--set warmup=…`).
+pub fn warmup_warning(profile: &Profile) -> Option<String> {
     let w = &profile.workload;
     let (warmup, window) = (w.warmup.get(), w.duration.get());
-    let mut out = Vec::new();
-    if !warmup.is_zero() && warmup >= window && w.max_ops.is_none() {
-        out.push(format!(
+    (!warmup.is_zero() && warmup >= window && w.max_ops.is_none()).then(|| {
+        format!(
             "the warmup ({}) is as long as the measurement window ({}) or longer: most of the \
-             run is not measured",
+             run is not measured; shorten it with `--set warmup=DURATION` or lengthen the window \
+             with `-d`",
             w.warmup, w.duration
-        ));
-    }
-    out
+        )
+    })
 }
 
 /// Outcome of [`preflight`].
@@ -510,15 +604,37 @@ mod sec_tests {
         });
         let c = Cancel::new();
         g.arm(c.clone());
-        g.add(10, 0);
+        g.add(9, 0);
         assert!(!g.tripped());
+        // The tenth request spends the budget: the run stops at the limit, not one past it.
         g.add(1, 0);
         assert!(g.tripped());
         assert!(c.is_cancelled());
+        // Spent exactly, by work that was done anyway: not a breach (yet).
+        assert!(g.breach().is_none());
+        // A request past the limit (one in flight when it tripped) is.
+        g.add(1, 0);
         let b = g.breach().unwrap();
         assert_eq!(b.budget, "requests");
         g.add(100, 0);
-        assert_eq!(g.breach().unwrap().observed, 11.0);
+        assert_eq!(g.breach().unwrap().observed, 10.0);
+        // Work stopped by a spent budget is a breach even at the limit.
+        let g = Guard::new(Budgets {
+            max_requests_count: Some(10),
+            ..Default::default()
+        });
+        g.add(10, 0);
+        assert!(g.tripped() && g.breach().is_none());
+        g.note_cut_short();
+        assert_eq!(g.breach().unwrap().observed, 10.0);
+        // As is a measurement that wants to start once it is spent.
+        let g = Guard::new(Budgets {
+            max_requests_count: Some(10),
+            ..Default::default()
+        });
+        g.add(10, 0);
+        assert!(g.demand().is_some());
+        assert_eq!(b.message(), "request budget spent: 10 requests (limit 10)");
         let e = b.to_error();
         assert_eq!(
             crate::errors::classify(&e, "s3").code,
@@ -563,6 +679,20 @@ mod sec_tests {
         check_read_only(&p).unwrap();
     }
 
+    /// The warmup warning names the setting that fixes it (U6).
+    #[test]
+    fn the_warmup_warning_names_its_setting() {
+        let mut p = Profile::from_url("memory://");
+        p.workload.warmup = crate::util::HumanDuration(Duration::from_secs(5));
+        p.workload.duration = crate::util::HumanDuration(Duration::from_secs(2));
+        let w = workload_warnings(&p);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("--set warmup="), "{w:?}");
+        assert_eq!(plan(&p, "x/", false, &Budgets::default()).warnings, w);
+        p.workload.warmup = crate::util::HumanDuration(Duration::from_secs(1));
+        assert!(workload_warnings(&p).is_empty());
+    }
+
     #[test]
     fn plan_counts_dataset_writes_and_cleanup() {
         let mut p = Profile::from_url("memory://");
@@ -575,5 +705,34 @@ mod sec_tests {
         assert!(pl.estimated_ops_count <= 100);
         assert!(pl.estimated_requests_count >= ds.objects as u64);
         assert!(pl.eta_s > 0.0);
+        assert!(pl.warnings.iter().all(|w| !w.contains("budget")), "{pl:?}");
+    }
+
+    /// 6.3.0 planned 6 541 requests under `--max-requests 500` without a word.
+    #[test]
+    fn a_plan_warns_when_it_would_spend_a_budget() {
+        let mut p = Profile::from_url("memory://");
+        p.workload.max_ops = Some(100);
+        let free = plan(&p, "oprobe-run-x/", false, &Budgets::default());
+        let budgets = Budgets {
+            max_requests_count: Some(free.estimated_requests_count / 2),
+            max_bytes: Some(free.estimated_bytes / 2),
+            max_duration_s: Some(free.eta_s / 2.0),
+        };
+        let pl = plan(&p, "oprobe-run-x/", false, &budgets);
+        assert_eq!(pl.budgets, budgets);
+        for flag in ["--max-requests", "--max-bytes", "--max-duration"] {
+            assert!(
+                pl.warnings.iter().any(|w| w.contains(flag)),
+                "{flag}: {pl:?}"
+            );
+        }
+        let roomy = Budgets {
+            max_requests_count: Some(free.estimated_requests_count * 2),
+            max_bytes: Some(free.estimated_bytes * 2 + 1),
+            max_duration_s: Some(free.eta_s * 2.0),
+        };
+        let pl = plan(&p, "oprobe-run-x/", false, &roomy);
+        assert!(pl.warnings.iter().all(|w| !w.contains("budget")), "{pl:?}");
     }
 }

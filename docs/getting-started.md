@@ -17,31 +17,25 @@ oprobe demo
 ```
 
 `demo` is `oprobe run lab://demo`. The lab is an S3-compatible server inside oprobe on 127.0.0.1:
-it throttles (503 SlowDown) above 24 requests in flight, and every 40th request is a straggler
-that waits 250 ms for its first byte. The default workload writes, reads and stats small objects
+every 40th request is a straggler that waits 250 ms for its first byte, and it throttles
+(503 SlowDown) above 40 requests in flight. The default workload writes, reads and stats small objects
 with 28 workers for 8 seconds:
 
 ```text
-[Attention] 2.4% of GetObject requests wait far longer for the server's first byte than their peers
-  (stragglers).
-  lab://demo · small-files · 8.0 s · run 20261123-063611-3d82
-  ▲ 1 tail_stragglers (high confidence) — 2.4% of GetObject requests wait far longer for the
-      server's first byte than their peers (stragglers).
-      162 stragglers wait ~261ms for the first byte against ~9.78ms for a typical GetObject;
-      operation p50 10.0ms · p99 261ms
+[Attention] 2.4% of HeadObject, 2.4% of PutObject and 2.6% of GetObject requests wait far longer for
+  the server's first byte than their peers (stragglers).
+  lab://demo · small-files · 8.0 s · run 20261123-135409-4b57
+  ▲ 1 tail_stragglers (high confidence) — 2.4% of HeadObject, 2.4% of PutObject and 2.6% of
+      GetObject requests wait far longer for the server's first byte than their peers (stragglers).
+      33 HeadObject stragglers wait ~260ms for the first byte against ~9.48ms for a typical
+      HeadObject; 100 PutObject stragglers wait ~260ms for the first byte against ~9.55ms for a
+      typical PutObject; 214 GetObject stragglers wait ~260ms for the first byte against ~9.54ms for
+      a typical GetObject; operation p50 9.65ms · p99 261ms
       remedy: layers.tail_cut + layers.retry.min_delay — re-issue requests far slower than their
         peers, after a short retry backoff (TailCutLayer + RetryLayer::with_min_delay)
-      next: oprobe prove 20261123-063611-3d82 tail_stragglers
-  ▲ 2 throttling (medium confidence) — The service throttled 0.1% of requests (429/503).
-      16 throttled responses (429/503) in 11416 requests (0.14%); 15% of operation time in retry
-      backoff; the rejections start above a number of requests in flight (the in-flight limit
-      explains 81% of the throttled requests)
-      remedy: layers.concurrent_limit.http + layers.retry.jitter — cap the HTTP requests in flight
-        below the service's limit and retry with jitter
-        (ConcurrentLimitLayer::with_http_concurrent_limit + RetryLayer::with_jitter)
-      next: oprobe prove 20261123-063611-3d82 throttling
-  1425.0 ops/s · 80.1 MiB/s · p50 10.0ms · p99 261ms · errors 0.00% · 0.14% of requests throttled
-  full profile: oprobe show 20261123-063611-3d82 --detail
+      next: oprobe prove 20261123-135409-4b57 tail_stragglers
+  1733.6 ops/s · 97.6 MiB/s · p50 9.65ms · p99 261ms · errors 0.00%
+  full profile: oprobe show 20261123-135409-4b57 --detail · terms: https://github.com/hxddh/oprobe/blob/v7.0.0/docs/concepts.md#glossary
 ```
 
 The brief that `run` prints has three parts:
@@ -51,9 +45,8 @@ The brief that `run` prints has three parts:
   requests themselves) and its remedy as an `op.toml` path, such as `layers.tail_cut`;
 - **the next command**, `oprobe prove RUN FINDING`.
 
-Here the stragglers come first: they hold the lab's request slots for a quarter of a second each.
-The throttling costs latency (the throttled operations wait out OpenDAL's one-second retry
-backoff) but no goodput, because the other workers keep the lab busy.
+Here every API has stragglers: each holds a worker for a quarter of a second, so the slowest 2.5 %
+of requests cost the run a third of its throughput.
 
 The run is saved. `oprobe show last` prints the whole profile, `oprobe show last --by stage`
 groups the requests by stage, and `oprobe show --list` lists the history.
@@ -65,29 +58,29 @@ oprobe prove last
 ```
 
 `prove` takes the run's operator (A) and the same operator with the top finding's remedy (B);
-`oprobe prove last throttling` proves another finding's. For a remedy with a size, such as a
+`oprobe prove last FINDING` proves another finding's. For a remedy with a size, such as a
 concurrency limit, it first runs short sizing trials over that one value and picks the knee of
 the objective. Then it runs trials of A and B interleaved (A B A B …) until a sequential test
 against the noise floor decides, or the budget (`--max-duration`) runs out. It starts with the
 number of trials and the ETA of the whole proof, and prints each trial as it ends (on stderr):
 
 ```text
-prove tail_stragglers · goodput · run 20261123-063611-3d82 · prove 20261123-063621-f7e6
+prove tail_stragglers · goodput · run 20261123-135409-4b57 · prove 20261123-135419-219a
 6–12 trials (3–6 pairs of A and B) · ETA 57s – 1m 53s
-· A #1 : 1485.5 ops/s · p99 261ms · 0.27 % throttled
-· B #1 : 2078.0 ops/s · p99 82.5ms · 4.40 % throttled
-· A #2 : 1503.0 ops/s · p99 261ms · 0.27 % throttled
-· B #2 : 2043.0 ops/s · p99 84.3ms · 4.29 % throttled
-· A #3 : 1468.5 ops/s · p99 262ms · 0.27 % throttled
-· B #3 : 1873.0 ops/s · p99 85.3ms · 4.98 % throttled
+· A #1 : 1757.9 ops/s · p99 261ms · 0.00 % throttled
+· B #1 : 2354.5 ops/s · p99 82.2ms · 0.00 % throttled
+· A #2 : 1747.9 ops/s · p99 261ms · 0.00 % throttled
+· B #2 : 2330.5 ops/s · p99 82.2ms · 0.00 % throttled
+· A #3 : 1765.4 ops/s · p99 261ms · 0.00 % throttled
+· B #3 : 2343.0 ops/s · p99 82.1ms · 0.00 % throttled
 ```
 
 The verdict is `improved`, `worse` (exit 3) or `inconclusive`, on goodput unless you pass
 `--objective p99`, and the result ends with the diff:
 
 ```text
-improved on goodput: +34.4 % [+19.5, +51.1] (3 pairs of trials, noise ±2.0 %) · lab://demo (local lab)
-secondary (not decisive): p99 -67.8 % [-69.4, -66.2] · throttled 0.27 % → 4.54 % · errors 0.00 % → 0.02 %
+improved on goodput: +33.3 %, 95 % interval [+26.9, +40.1] (3 pairs of trials, noise ±2.0 %) · lab://demo (local lab)
+secondary (not decisive; 95 % intervals): p99 -68.5 % [-70.0, -66.9] · throttled 0.00 % → 0.00 % · errors 0.00 % → 0.00 %
 note: TailCutLayer re-issues through RetryLayer: its first backoff is shortened so a cut request is retried at once; trials warm up 11.5 s because the layer ignores its first 10 s
 + TailCutLayer::builder().safety_factor(1.5).min_samples(32).min_deadline(Duration::from_millis(50)).max_deadline(Duration::from_secs(60)).build()
 ~ RetryLayer::new().with_min_delay(Duration::from_millis(20))

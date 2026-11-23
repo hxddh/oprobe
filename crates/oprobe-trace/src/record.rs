@@ -229,6 +229,10 @@ impl RequestTiming {
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[cfg_attr(not(feature = "__internal"), non_exhaustive)]
 pub struct RequestRecord {
+    /// The OpenDAL operation that issued the request (`read`, `write`, `stat`, …), when the
+    /// service attached it.
+    #[serde(skip)]
+    pub operation: Option<&'static str>,
     pub api: Api,
     pub method: String,
     /// HTTP status; 0 when the request failed before a response (network error).

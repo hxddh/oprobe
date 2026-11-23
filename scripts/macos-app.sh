@@ -22,6 +22,23 @@ iconutil -c icns "$iconset" -o "$app/Contents/Resources/oprobe.icns"
 codesign --force --deep --sign - "$app"
 codesign --verify --deep --strict "$app"
 
+# A downloaded copy carries the quarantine attribute. Gatekeeper may reject an app that is not
+# notarized ("rejected"), and the user then confirms the first open (docs/install.md); but a
+# broken seal makes macOS call the app "damaged" with no way to open it, so the copy's seal must
+# verify and Gatekeeper must not report a damaged or invalid signature.
+qdir=$(mktemp -d)
+ditto "$app" "$qdir/oprobe.app"
+xattr -w com.apple.quarantine "0081;$(printf %x "$(date +%s)");Safari;" "$qdir/oprobe.app"
+codesign --verify --deep --strict "$qdir/oprobe.app"
+assess=$(spctl --assess --type execute -vv "$qdir/oprobe.app" 2>&1 || true)
+echo "Gatekeeper on a quarantined copy: $assess"
+case "$assess" in
+  *damaged*|*"invalid signature"*|*"a sealed resource is missing or invalid"*|*"code object is not signed at all"*)
+    echo "oprobe.app's seal does not survive a download" >&2
+    exit 1;;
+esac
+rm -rf "$qdir"
+
 # Smoke launch: a bare launch must open the workbench window and keep running. A usage error,
 # a crash or an early exit fails the build (v2.0.0 shipped an app that exited with a usage
 # error when opened from Finder).

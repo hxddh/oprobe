@@ -195,3 +195,60 @@ fn the_readme_does_not_promise_a_signature_check() {
         );
     }
 }
+
+/// Double-clicking a `.oprobe` file opens it (A6): the Linux `.desktop` entry passes the files
+/// and claims the MIME type its shared-mime-info file defines, and the MSI registers the
+/// extension with the binary.
+#[test]
+fn the_packages_register_run_files() {
+    let read = |f: &str| std::fs::read_to_string(root().join(f)).unwrap();
+    let desktop = read("packaging/desktop/io.github.hxddh.oprobe.desktop");
+    let lines: Vec<&str> = desktop.lines().collect();
+    assert!(lines.contains(&"Exec=oprobe %F"), "{desktop}");
+    assert!(
+        lines.contains(&"MimeType=application/x-oprobe-run;"),
+        "{desktop}"
+    );
+    let mime = read("packaging/desktop/io.github.hxddh.oprobe.xml");
+    assert!(
+        mime.contains("<mime-type type=\"application/x-oprobe-run\">")
+            && mime.contains("<glob pattern=\"*.oprobe\"/>"),
+        "{mime}"
+    );
+    let wxs = read("packaging/windows/oprobe.wxs");
+    assert!(
+        wxs.contains("<Extension Id=\"oprobe\" ContentType=\"application/x-oprobe-run\">")
+            && wxs.contains(
+                "<Verb Id=\"open\" TargetFile=\"oprobe.exe\" Argument=\"&quot;%1&quot;\" />"
+            ),
+        "{wxs}"
+    );
+}
+
+/// The release notes advertise a package channel only when the release publishes to it: its
+/// secret is set (P1).
+#[test]
+fn release_notes_name_only_published_channels() {
+    let yml = std::fs::read_to_string(root().join(".github/workflows/release.yml")).unwrap();
+    let notes = yml
+        .split("- name: Release notes from CHANGELOG")
+        .nth(1)
+        .and_then(|s| s.split("- uses:").next())
+        .unwrap();
+    for (secret, flag, channel) in [
+        ("TAP_TOKEN", "HAS_TAP_TOKEN", "brew install"),
+        ("SCOOP_TOKEN", "HAS_SCOOP_TOKEN", "scoop install"),
+        ("CARGO_REGISTRY_TOKEN", "HAS_CARGO_TOKEN", "cargo install"),
+    ] {
+        assert!(
+            notes.contains(&format!("{flag}: ${{{{ secrets.{secret} != '' }}}}")),
+            "{secret}"
+        );
+        let before = notes.split(channel).next().unwrap();
+        let guard = before.rsplit("if [").next().unwrap();
+        assert!(
+            guard.starts_with(&format!(" \"${flag}\" = true ]")),
+            "`{channel}` is printed without a check of {secret}: {guard}"
+        );
+    }
+}

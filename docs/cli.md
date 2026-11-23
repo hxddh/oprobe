@@ -28,8 +28,9 @@ oprobe lab   [SCENARIO]    # a local S3 with faults
 
 Profile one or more operators on the same workload. Several operators run one after another on
 the same workload and form one comparison. Prints the brief: the verdict, at most three findings
-with their remedy, and the next command. The run is saved; `-o json` prints the report
-(`schemas/report.json`).
+with their remedy, and the next command. The run is saved; `-o json` prints the runs, each
+with its report, and the comparison when there are several (`schemas/run.json`; the report alone
+is `schemas/report.json`).
 
 `OPERATOR` is a URL (`s3://bucket/prefix`, `lab://demo`, `fs:///tmp/x`, `memory://`) or an
 operator file ([`op.toml`](operator.md), the recommended way to describe your operator). A name
@@ -53,7 +54,7 @@ from the config file's `[operators.NAME]` also works.
 
 | Flag | Meaning |
 |---|---|
-| `--dry-run` | print the plan (requests, bytes, objects written and deleted, ETA) and exit |
+| `--dry-run` | print the plan (requests, bytes, objects written and deleted, ETA, budgets; a warning when it would spend one) and exit (`-o json`: `schemas/plan.json`) |
 | `--read-only` | refuse every write and delete (exit 5) |
 | `--max-requests N` | stop after this many backend requests (exit 4) |
 | `--max-bytes SIZE` | stop after transferring this many bytes, e.g. `10GiB` (exit 4) |
@@ -71,8 +72,8 @@ oprobe run prod --existing data/2026/ --max-requests 50000
 
 ## `oprobe demo`
 
-`oprobe run lab://demo`, with the same workload and safety flags as `run`. The lab throttles
-above 24 requests in flight, and every 40th request is a straggler that waits 250 ms. Its default
+`oprobe run lab://demo`, with the same workload and safety flags as `run`. Every 40th request
+of the lab is a straggler that waits 250 ms, and it throttles above 40 requests in flight. Its default
 workload is small files (64 × 64 KiB) with 28 workers for 8 s; `oprobe prove last` then proves
 the top finding's remedy in about a minute.
 
@@ -91,7 +92,12 @@ whole proof; `--dry-run` prints the same estimate (and the plan of one trial) an
 A verdict other than `inconclusive` needs at least **3 pairs** of trials (A then B): when the
 budget allows fewer, the verdict is `inconclusive` (exit 0) with a note. When no pair ran at all,
 the text says `not measured` and prints no diff; `-o json` still prints a valid result
-(`verdict: "inconclusive"`, `pairs_count: 0`, a note).
+(`verdict: "inconclusive"`, `pairs_count: 0`, a note). When the changed operator's trials
+throttle more than `--max-throttle` allows, and more than the current operator's, the verdict is
+`inconclusive` too, with a note: the service's limit, not the change, set what was measured.
+
+`prove` refuses a run that cannot be judged on performance (its first finding is `invalid_run`:
+it failed, or it is partial and too short); profile the operator again first.
 
 The objective's interval is Student's t on the paired log ratios of the objective (B over A, pair
 by pair), with a spread no smaller than the A/A noise floor learned from consecutive A trials (a
@@ -103,8 +109,10 @@ end within it. When a budget (`--max-duration`, `--max-requests`, `--max-bytes`)
 part-way, it still prints and saves the partial result (`budget_exceeded: true`, usually
 `inconclusive`) and exits 4; its trials stay attached, so `oprobe show --rm PROVE` removes them.
 
-`RUN` is a run id, an id prefix, `last` or `last~N`. `FINDING` is a finding code
-(`throttling`, `tail_stragglers`, …).
+`RUN` is a run id, an id prefix, `last`, `last~N` or a run's `.oprobe` file. A production trace
+has no workload to replay: `prove` refuses it and prints the `oprobe run` command for the service
+it recorded. `FINDING` is a finding code (`throttling`, `tail_stragglers`, …). The objective's
+change prints with its 95 % interval ([glossary](concepts.md#glossary)).
 
 | Flag | Meaning |
 |---|---|
@@ -112,7 +120,7 @@ part-way, it still prints and saves the partial result (`budget_exceeded: true`,
 | `--objective goodput\|p99` | what the change is judged on: successful operations (or bytes) per second (default), or the worst per-operation p99 latency |
 | `--max-throttle RATIO` | share of throttled requests a change may cause, e.g. `0.1%` or `0.001` |
 | `--max-duration DURATION` | wall-time budget of the whole proof, e.g. `5m` |
-| `--dry-run` | print the number of trials and the ETA of the whole proof, and exit |
+| `--dry-run` | print the number of trials and the ETA of the whole proof, and exit (`-o json`: `schemas/prove-plan.json`) |
 | `--read-only` | refuse every write and delete (exit 5) |
 | `--max-requests N`, `--max-bytes SIZE` | stop after this many backend requests or bytes, over every trial (exit 4) |
 
@@ -132,9 +140,11 @@ Print a profile: a stored run, or a file (`.oprobe` from `run` or from
 (`schemas/run-list.json`).
 
 A trace from `oprobe-trace` is recognised by its content, whatever its name. Its report has
-`run.source = "trace"` and shows `production trace` where a run shows its workload. Each
-request counts as one operation, and only the findings that requests support are derived:
-errors, throttling, hung requests, stragglers and cold connections. `prove` refuses a trace
+`run.source = "trace"` and shows `production trace` where a run shows its workload. Its
+operations are the application's OpenDAL calls (keys hashed), and the findings a trace supports
+are derived: errors, throttling, hung requests, stragglers, cold connections, small ranges, slow
+multipart and repeated reads (not bandwidth cap or client bound). A 6.x trace
+(`oprobe.trace/6`) has no operations: each request counts as one there. `prove` refuses a trace
 (exit 2): it needs a run oprobe drove.
 
 | Flag | Meaning |

@@ -220,6 +220,9 @@ impl CommandOutput for PlanOutput {
             p.objects_written_count, p.run_prefix, p.objects_deleted_count
         );
         o += &format!("  ETA {:.0}s\n", p.eta_s);
+        if let Some(b) = p.budgets.line() {
+            o += &format!("  budgets {b}\n");
+        }
         for a in &p.assumptions {
             o += &format!("  {}\n", dim(&format!("assumes {a}")));
         }

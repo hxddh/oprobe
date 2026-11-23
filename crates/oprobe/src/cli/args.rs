@@ -7,8 +7,10 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use crate::input::clap as parse;
 pub use crate::output::OutputFormat;
 
-const EXAMPLES: &str = "\
+const EXAMPLES: &str = concat!(
+    "\
 Examples:
+  oprobe                                       # open the app (no command)
   oprobe demo                                  # profile the local lab (no credentials)
   oprobe run s3://my-bucket/bench              # profile an operator
   oprobe run op.toml --set layers.retry.max_times=5
@@ -18,7 +20,10 @@ Examples:
   oprobe prove last                            # A/B-test the remedy of the top finding
   oprobe lab throttle                          # local S3 with faults
 
-Docs: https://github.com/hxddh/oprobe/tree/main/docs";
+Docs: https://github.com/hxddh/oprobe/tree/v",
+    env!("CARGO_PKG_VERSION"),
+    "/docs"
+);
 
 /// A whole number that must be at least `MIN` (rejected with a clear error, never clamped).
 fn at_least<const MIN: usize>(v: &str) -> Result<usize, String> {
@@ -213,7 +218,7 @@ pub enum ObjectiveArg {
 
 #[derive(Args, Debug)]
 pub struct ProveArgs {
-    /// The run whose operator to change (id, id prefix, `last`, `last~N`)
+    /// The run whose operator to change (id, id prefix, `last`, `last~N`, or a .oprobe file)
     #[arg(value_name = "RUN")]
     pub run: String,
     /// The finding whose remedy to prove (default: the top finding)

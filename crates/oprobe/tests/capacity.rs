@@ -32,18 +32,20 @@ async fn lab_run(scenario: &str, preset: Preset, workers: usize) -> oprobe::mode
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn demo_lab_ceiling_brackets_its_limit_and_small_files_fit_twenty_workers() {
-    let run = lab_run("demo", Preset::SmallFiles, 32).await;
+    // More workers than the demo lab's in-flight limit (40), so it throttles.
+    let limit = oprobe::lab::DEMO_THROTTLE_ABOVE as f64;
+    let run = lab_run("demo", Preset::SmallFiles, 52).await;
     let r = &run.report;
     assert!(
         r.resilience.throttled_responses > 0,
-        "32 workers > 24 throttle"
+        "52 workers > {limit} throttle"
     );
     let c = &r.capacity;
     let ce = c
         .inflight_ceiling
         .unwrap_or_else(|| panic!("no ceiling: {}", c.confidence_reason));
     assert!(
-        ce.lo <= 24.0 && 24.0 < ce.hi,
+        ce.lo <= limit && limit < ce.hi,
         "{ce:?}: {} {:?}",
         c.confidence_reason,
         c.observed.levels

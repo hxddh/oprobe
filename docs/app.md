@@ -78,8 +78,11 @@ The window works like other professional tools on your platform (design:
   asks first: **Stop and Quit** stops it, removes its test data and quits; Cancel keeps it
   running.
 - **Run files**: open a `.oprobe` or report/trace `.json` file with File ▸ Open Run File… (the
-  system's open dialog, filtered to those types), open it from Finder or Explorer, or drop it
-  on the window (the window is outlined while a file is dragged over it).
+  system's open dialog, filtered to those types), drop it on the window (the window is outlined
+  while a file is dragged over it), or double-click it: `oprobe.app` (macOS), the `.msi`
+  (Windows) and the Linux desktop archive's `.desktop` entry and MIME type
+  (`application/x-oprobe-run`) register `.oprobe` files, and run `oprobe FILE`, which opens the
+  file in the app. The archives and the `.deb` / `.rpm` register nothing.
 - **Progress**: a running job shows its progress on the Dock or taskbar icon. When it ends while
   the window is in the background, a notification says so and the Dock icon or taskbar button
   asks for attention.
@@ -94,24 +97,37 @@ The window works like other professional tools on your platform (design:
   partial, open-loop arrivals started late, or too few operations were measured.
 - **Findings**, each with its remedy and the evidence it rests on (below). **Show N examples**
   expands the waterfalls of the operations that show the problem.
-- **Where the time went**: the stage split of every operation, and of each verb.
+- **Where the time went**: the stage split of every operation, and of each verb with its
+  operations per second, MiB/s, requests per operation and, when any, its throttled share.
 - **Requests by API**: for each S3 API, the request count, the status codes, TTFB p50 / p99,
-  p99, bytes down / up and connection reuse. Click an API to list its slowest requests, and one
-  of those to see its operation's waterfall.
+  total p50 / p99 (the same statistics as `oprobe show`), bytes down / up and connection reuse.
+  For a run that wrote, a **Writes** line gives the multipart part size OpenDAL used (with the
+  requested chunk and the service's limits when it was clamped) and the parts uploaded with
+  their mean size. Click an API to list its slowest requests, and one of those to see its
+  operation's waterfall.
 - **Retries and failures**: retries, time spent waiting between attempts, 429 / 503 responses,
   the longest `Retry-After`, other errors and failure classes.
 - **The slowest operations** as a request waterfall. Each request is on a shared time axis and
-  coloured by stage; the wait before a retry is drawn as a line in the retry colour. Hovering a
-  request reads out its stages and, when recorded, the provider's error code (`SlowDown`),
-  `Retry-After`, the connection's rtt, min rtt and retransmits, and `Server-Timing`.
+  coloured by stage, the body's wait for the consumer (stall) its own segment; the wait before a
+  retry is drawn as a line in the retry colour. Hovering a request reads out its stages and,
+  when recorded, the provider's error code (`SlowDown`), `Retry-After`, the connection's rtt,
+  min rtt and retransmits, `Server-Timing`, the HTTP/2 stream wait, flow-control stall and open
+  streams, when the upload reached the kernel and was acknowledged, the CDN cache status and
+  the region ([request signals](reading-the-profile.md#request-signals)). An operation whose
+  async call stack was captured has **Async call stack while in flight** under it, closed until
+  clicked.
 - **Timeline**, with a verb filter above it (All verbs, or one verb):
   - goodput (successful operations) with the attempted rate, failures included, as a faint line
     behind it, and the intervals with throttled responses or failed operations shaded;
   - p50 / p99 / p99.9; an interval with too few operations for a quantile (fewer than
     10 / (1 − q): 1 000 for p99) draws it faint and dashed, and the readout says so
     (`n=12, too few for p99`);
-  - requests per second (retries included) with the retries per second;
-  - the number of requests in flight.
+  - requests per second (retries included) with, as step lines beside it, the retries, the
+    throttled responses and the failed operations per second (so one 429 does not look like a
+    thousand);
+  - the number of requests in flight, with the connections dialed in each interval (churn
+    behind a latency spike) and, faint, the client's CPU in cores busy (its saturation over
+    time).
 
   Requests and in-flight are not split by verb: with a verb chosen they say "all verbs".
 - **Latency distribution**: a CDF with p50 and p99 marked. It is drawn from every row when no row
@@ -120,11 +136,18 @@ The window works like other professional tools on your platform (design:
 - **Heatmap**: operations by start time and latency, in fine rows when every row was kept, with a
   colour key from the fewest to the most operations in a cell. Click a cell to list its slowest
   operations (verb, key, latency, status, attempts), and one of those to see its waterfall.
-- **Connections**.
+- **Connections**: new connections (and failed dials), reuse, protocols, TLS, the proxy, peak
+  requests in flight, each dial phase's p50 / p99 (DNS, TCP, proxy CONNECT, TLS), and whether
+  the network or the server is the limit: the kernel's round trip p50 / p99, the connections
+  that retransmitted, the share of sending time limited by the receive window or the send
+  buffer, the delivery rate, the TLS handshakes (resumed share, HelloRetryRequests) and the
+  cold start (connections dialed at the start, their connect time and the first operations'
+  latency).
 - **Details** (open on demand):
   - bytes asked for against bytes moved: read, write and request amplification, and cache hits;
-  - the hottest keys, object sizes, prefixes and server addresses.
-- **Run setup** (open on demand): target, workload, load, dataset, mix, seed, the client (CPU and
+  - the hottest keys, object sizes, prefixes, first and repeat reads (cold / warm) and server
+    addresses, each with its throttled share, error share and p99.
+- **Run setup** (open on demand): target, workload, load, dataset, mix, the write path, seed, the client (CPU and
   scheduling lag), the share of trace rows kept, and the `oprobe run …` command that runs it
   again.
 
@@ -143,7 +166,7 @@ Each finding carries the evidence it rests on:
 | Finding | Evidence |
 |---|---|
 | `throttling` | the share throttled at each number of requests in flight, with the fitted limit's interval shaded |
-| `key_limit`, `repeated_reads` | the hottest keys, with their share of the traffic and their share of all throttling |
+| `key_limit`, `repeated_reads` | the hottest keys as horizontal bars of their share of all throttling (of all requests when nothing was throttled) |
 | `small_ranges` | bytes asked for against bytes downloaded, and requests per operation |
 | `rate_limit` | throttled responses per second |
 | `bandwidth_cap` | bandwidth (MiB/s) over the run |

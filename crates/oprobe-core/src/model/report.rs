@@ -259,8 +259,8 @@ pub enum RunSource {
     /// A workload `oprobe run` drove (replayable: `oprobe prove` can A/B it).
     #[default]
     Run,
-    /// A production trace written by the `oprobe-trace` layer (`oprobe.trace/6`): the
-    /// application's own traffic, with no workload to replay.
+    /// A production trace written by the `oprobe-trace` layer (`oprobe.trace/7`, or a 6.x
+    /// `oprobe.trace/6`): the application's own traffic, with no workload to replay.
     Trace,
 }
 

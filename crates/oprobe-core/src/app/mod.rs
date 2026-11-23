@@ -55,7 +55,7 @@ use crate::store::{ConfigFile, Paths};
 pub use input::*;
 pub use lab::LabOutput;
 pub use prove::{ProveObjective, ProveOutcome, ProveOutput, ProveRequest, ProveVerdict};
-pub use run::{RunOutput, RunPlan, RunSet};
+pub use run::{PlanOutput, RunOutput, RunPlan, RunSet};
 pub use runs::{Profile, RemovedRuns, RunList, TrashedRuns};
 
 /// Where a command's log lines, warnings, progress and events go: [`crate::output::Output`].

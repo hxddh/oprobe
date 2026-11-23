@@ -6,14 +6,19 @@
 |---|---|
 | macOS, Linux | `curl -fsSL https://github.com/hxddh/oprobe/releases/latest/download/install.sh \| sh` |
 | macOS, Linux (CLI only) | `curl -fsSL https://github.com/hxddh/oprobe/releases/latest/download/install.sh \| sh -s -- --cli` |
-| Homebrew | `brew install hxddh/tap/oprobe` (the app bundle: `brew install --cask hxddh/tap/oprobe-app`) |
+| Homebrew (when published) | `brew install hxddh/tap/oprobe` (the app bundle: `brew install --cask hxddh/tap/oprobe-app`) |
 | Windows | `irm https://github.com/hxddh/oprobe/releases/latest/download/install.ps1 \| iex`, or the `.msi` |
-| Windows, Scoop | `scoop bucket add hxddh https://github.com/hxddh/scoop-bucket` then `scoop install oprobe` |
+| Windows, Scoop (when published) | `scoop bucket add hxddh https://github.com/hxddh/scoop-bucket` then `scoop install oprobe` |
 | Windows, winget | `winget install hxddh.oprobe`, once the package is accepted into winget-pkgs ([below](#windows)) |
 | Debian, Ubuntu, Fedora, RHEL | the `.deb` / `.rpm` from the release page |
-| Rust ≥ 1.97 | `cargo install oprobe --locked` |
+| Rust ≥ 1.97 (crates.io, when published) | `cargo install oprobe --locked`; until then `cargo install --locked --git https://github.com/hxddh/oprobe oprobe` |
 
 Then try it with no account: `oprobe demo` ([getting started](getting-started.md)).
+
+Rows marked **when published** depend on the project's package channels (the Homebrew tap, the
+Scoop bucket, crates.io). A release publishes to a channel only when its publishing credentials
+are set, and its release notes list only the channels it published to; until then, use the
+install scripts, the release assets or `cargo install --git`.
 
 ## The app and the CLI-only build
 
@@ -122,7 +127,7 @@ sudo dnf install ./oprobe-<ver>-1.x86_64.rpm
 cargo install oprobe --locked                                         # the app in the terminal
 cargo install oprobe --locked --features gui                          # plus native windows (Linux: libgtk-4-dev)
 cargo install oprobe --locked --no-default-features --features cli    # the CLI only
-cargo install --locked --git https://github.com/hxddh/oprobe --tag v6.3.0 oprobe
+cargo install --locked --git https://github.com/hxddh/oprobe --tag v7.0.0 oprobe
 ```
 
 `cargo install oprobe` also downloads `oprobe-core`, oprobe's internal engine crate, at exactly
@@ -141,7 +146,7 @@ as the archive, so it proves the download is intact, not who built it.
 ```bash
 sha256sum --ignore-missing -c SHA256SUMS                    # Linux
 shasum -a 256 --ignore-missing -c SHA256SUMS                # macOS
-Get-FileHash oprobe-6.3.0-x64.msi -Algorithm SHA256          # Windows
+Get-FileHash oprobe-7.0.0-x64.msi -Algorithm SHA256          # Windows
 ```
 
 **Build provenance.** Every asset has a [SLSA build provenance](https://slsa.dev/) attestation
@@ -149,7 +154,7 @@ signed by GitHub Actions, which proves it was built by this repository's release
 given commit:
 
 ```bash
-gh attestation verify oprobe-6.3.0-x86_64-unknown-linux-musl.tar.gz --repo hxddh/oprobe \
+gh attestation verify oprobe-7.0.0-x86_64-unknown-linux-musl.tar.gz --repo hxddh/oprobe \
   --signer-workflow hxddh/oprobe/.github/workflows/release.yml
 ```
 
@@ -173,6 +178,9 @@ are **not signed or notarized**. The operating system asks for one confirmation 
 - **Either, from a terminal**: `xattr -dr com.apple.quarantine /Applications/oprobe.app`.
 - **Windows**: SmartScreen says "Windows protected your PC": click **More info** → **Run anyway**.
 
-Homebrew, Scoop, winget, the install scripts, `cargo install` and the plain archives used from a
-terminal are not affected. Verify the download ([above](#verifying-a-download)) before you
+The Homebrew formula, Scoop, winget, the install scripts, `cargo install` and the plain archives
+used from a terminal are not affected. The Homebrew **cask** (`oprobe-app`) is: Homebrew keeps the
+quarantine attribute on the apps it installs, so the first open of `oprobe.app` asks as above.
+The app is signed ad hoc, so macOS may refuse to verify its developer, but never reports it as
+damaged. Verify the download ([above](#verifying-a-download)) before you
 confirm.

@@ -279,6 +279,8 @@ impl Store {
         s.refresh();
         // A run to open, else the newest run is selected.
         match l.open {
+            // A run file the app was opened with (`oprobe RUN.oprobe`).
+            Some(p) if std::path::Path::new(&p).is_file() => s.open_file(&p),
             Some(id) => s.open_run(&id),
             None => {
                 if let Some(id) = s.runs.with_untracked(|r| r.first().map(|r| r.id.clone())) {
@@ -376,6 +378,11 @@ impl Store {
 
     fn app(&self) -> App {
         self.app.with(|a| a.clone())
+    }
+
+    /// The `.oprobe` file of stored run `id`.
+    pub fn run_file(&self, id: &str) -> std::path::PathBuf {
+        self.app().store().run_path(id)
     }
 
     /// Reload the run history.

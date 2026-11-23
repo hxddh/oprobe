@@ -322,6 +322,7 @@ mod tests {
 
     fn req(op: u64, status: u16) -> ReqRow {
         let r = RequestRecord {
+            operation: None,
             api: Api::GetObject,
             method: "GET".into(),
             status,

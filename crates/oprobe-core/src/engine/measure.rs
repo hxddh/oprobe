@@ -116,6 +116,10 @@ pub struct Request {
     /// The run's spec. `None`: `RunSpec::new(&profile, target)` with the target name, else the
     /// profile's URL (the pipeline fills it before the session normalises the profile).
     pub spec: Option<RunSpec>,
+    /// Where pending-cleanup markers live (`<data>/pending`, [`crate::store::pending`]): the
+    /// run marks its prefix before its first write and sweeps what killed runs against the same
+    /// target left. `None`: no markers.
+    pub pending_dir: Option<PathBuf>,
 }
 
 impl Request {
@@ -134,8 +138,53 @@ impl Request {
             on_stage: None,
             finalize: None,
             spec: None,
+            pending_dir: None,
         }
     }
+}
+
+/// Delete what runs against this target that were killed hard left behind (their markers are
+/// unlocked), within the guard: only `oprobe-run-*` prefixes, never under `--read-only`. A
+/// prefix verified gone loses its marker; the others are tried again by the next run.
+///
+/// A stale marker of this run's own prefix (an `--idempotency-key` retry of a killed run) is
+/// only removed: this run's test data is already there, and its own cleanup deletes the prefix.
+async fn sweep_pending(
+    dir: &std::path::Path,
+    target: &str,
+    rails: &Rails,
+    admin: &opendal::Operator,
+    progress: &ProgressFn,
+) -> Vec<String> {
+    use crate::store::pending;
+    let mut notes = Vec::new();
+    if rails.read_only {
+        return notes;
+    }
+    for s in pending::stale(dir, target, &rails.run_id.to_string()) {
+        if s.marker.run_prefix == rails.run_prefix {
+            s.finish();
+            continue;
+        }
+        if !s.marker.sweepable() {
+            continue;
+        }
+        let prefix = s.marker.run_prefix.clone();
+        progress(crate::engine::Progress::Message(format!(
+            "deleting the test data a stopped run left under {prefix}"
+        )));
+        let c = super::cleanup::delete_prefix(admin, &prefix).await;
+        if c.verified {
+            if c.deleted > 0 {
+                notes.push(format!(
+                    "deleted {} test objects a stopped run left under {prefix}",
+                    c.deleted
+                ));
+            }
+            s.finish();
+        }
+    }
+    notes
 }
 
 /// The spec of measuring `profile` at `target_name` (or the profile's own URL).
@@ -168,10 +217,7 @@ pub async fn open(
     cancel: Cancel,
     progress: ProgressFn,
 ) -> Result<Session> {
-    if let Some(b) = guard.as_ref().and_then(|g| {
-        g.tick();
-        g.breach()
-    }) {
+    if let Some(b) = guard.as_ref().and_then(|g| g.demand()) {
         return Err(b.to_error());
     }
     Session::open_with(
@@ -204,8 +250,34 @@ pub async fn measure(req: Request) -> Result<Measured> {
         on_stage,
         finalize,
         spec,
+        pending_dir,
     } = req;
     let spec = spec.unwrap_or_else(|| spec_of(&profile, target_name.as_deref()));
+    // The pending-cleanup marker, before anything is written (the preflight writes).
+    let marker = match (&pending_dir, rails.read_only) {
+        (Some(_), false) => profile
+            .operator
+            .target()
+            .ok()
+            .and_then(|t| crate::store::pending::Marker::of(&t, &rails.run_prefix)),
+        _ => None,
+    };
+    let pending = match (&pending_dir, &marker) {
+        (Some(dir), Some(m)) => {
+            match crate::store::pending::Pending::create(dir, &rails.run_id.to_string(), m) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    progress(crate::engine::Progress::Message(format!(
+                        "no pending-cleanup marker ({e:#}): if this run is killed, its test data \
+                         stays under {}",
+                        rails.run_prefix
+                    )));
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
     let stage = |s: Stage| {
         if let Some(f) = &on_stage {
             f(s)
@@ -236,6 +308,12 @@ pub async fn measure(req: Request) -> Result<Measured> {
             return Err(e);
         }
     };
+    let swept = match (&pending_dir, &marker) {
+        (Some(dir), Some(m)) => {
+            sweep_pending(dir, &m.target, &rails, &session.admin, &progress).await
+        }
+        _ => Vec::new(),
+    };
     let knobs = crate::config::Knobs::of(&session.profile);
     // The run file is written while the run is in progress (design v5 §2).
     if let Some(s) = &store {
@@ -263,12 +341,25 @@ pub async fn measure(req: Request) -> Result<Measured> {
     };
     stage(Stage::CleaningUp);
     let cleanup = session.close().await;
+    // Nothing is left behind (or the user keeps it on purpose): the marker goes. Otherwise it
+    // stays, and the next run against this target deletes the prefix.
+    if let Some(p) = pending
+        && (cleanup.verified || !cleanup.enabled)
+    {
+        p.finish();
+    }
     let mut snap = res?;
     snap.integrity.verified += ok;
     snap.integrity.corrupted += bad;
-    if session.guard().is_some_and(|g| g.tripped()) {
+    // A budget spent exactly by the work the run had to do stops nothing: the run is whole.
+    let breach = session.guard().and_then(|g| g.breach());
+    let spent_whole = breach.is_none() && session.guard().is_some_and(|g| g.tripped());
+    if breach.is_some() {
         snap.interrupted = true;
+    } else if spent_whole {
+        snap.interrupted = false;
     }
+    let cancelled = cancel.is_cancelled() && !spent_whole;
     let mut run = crate::model::build::build_run(crate::model::ReportInput {
         run_id: &rails.run_id,
         target_name,
@@ -283,11 +374,10 @@ pub async fn measure(req: Request) -> Result<Measured> {
         spec: Some(spec),
     });
     run.report.run.parent_id = parent_id;
-    let breach = session.guard().and_then(|g| g.breach());
     if breach.is_some() {
         run.report.verdict.exit_code = exit::BUDGET;
         crate::model::build::mark_partial(&mut run, crate::model::PartialReason::Budget);
-    } else if cancel.is_cancelled() && run.report.run.partial.is_none() {
+    } else if cancelled && run.report.run.partial.is_none() {
         crate::model::build::mark_partial(&mut run, crate::model::PartialReason::Interrupted);
     }
     if let Some(f) = finalize {
@@ -311,8 +401,8 @@ pub async fn measure(req: Request) -> Result<Measured> {
         run,
         path,
         breach,
-        cancelled: cancel.is_cancelled(),
-        warnings: session.warnings.clone(),
+        cancelled,
+        warnings: session.warnings.iter().cloned().chain(swept).collect(),
     })
 }
 
@@ -383,6 +473,148 @@ mod tests {
         assert_eq!(m.breach.unwrap().budget, "requests");
         assert!(m.run.report.run.interrupted);
         assert_eq!(m.run.report.verdict.exit_code, exit::BUDGET);
+    }
+
+    /// A run that uses exactly its request budget is whole (no breach, not partial, not
+    /// exit 4); one more request of work would be cut: the budget one short stops the run at
+    /// the limit, without a request past it, and is a breach.
+    #[tokio::test]
+    async fn a_run_that_spends_exactly_its_budget_is_whole() {
+        let mut p = quick("memory://");
+        p.workload.concurrency = 1;
+        p.workload.max_ops = Some(40);
+        p.workload.duration = crate::util::HumanDuration(std::time::Duration::from_secs(30));
+        let run = |max: u64| {
+            let p = p.clone();
+            async move {
+                let budgets = Budgets {
+                    max_requests_count: Some(max),
+                    ..Default::default()
+                };
+                let guard = guard_for(&budgets, &p).unwrap();
+                let rails = Rails::new(&p, false, None, budgets).unwrap();
+                let mut req = Request::new(p, rails, Cancel::new(), silent());
+                req.guard = Some(guard.clone());
+                let m = measure(req).await.unwrap();
+                (m, guard.usage().0)
+            }
+        };
+        let (m, used) = run(u64::MAX).await;
+        assert!(m.breach.is_none());
+        assert!(used > 0);
+        // Exactly the budget: the run did all its work.
+        let (m, at) = run(used).await;
+        assert_eq!(at, used);
+        assert!(m.breach.is_none(), "{:?}", m.breach);
+        assert!(!m.cancelled);
+        assert!(!m.run.report.run.interrupted);
+        assert!(
+            m.run.report.run.partial.is_none(),
+            "{:?}",
+            m.run.report.run.partial
+        );
+        assert_ne!(m.run.report.verdict.exit_code, exit::BUDGET);
+        assert_eq!(m.run.report.summary.ops, 40);
+        // One request short: stopped at the limit, never past it.
+        let (m, at) = run(used - 1).await;
+        assert_eq!(at, used - 1, "no request past the limit");
+        assert_eq!(m.breach.as_ref().unwrap().budget, "requests");
+        assert!(m.run.report.run.interrupted);
+        assert_eq!(m.run.report.verdict.exit_code, exit::BUDGET);
+    }
+
+    /// A run killed hard leaves its marker; the next run against the same target deletes its
+    /// prefix and the marker, and a run that cleans up leaves no marker (P3).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_next_run_sweeps_what_a_killed_run_left() {
+        use crate::store::pending::{Marker, Pending};
+        let data = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let pending = data.path().join("pending");
+        let url = format!("fs://{}", root.path().display());
+        let p = quick(&url);
+        let target = p.operator.target().unwrap();
+        // The killed run: objects under its prefix and an unlocked marker. A live run's
+        // prefix (its marker locked) and a prefix outside `oprobe-run-*` stay.
+        let killed = "oprobe-run-20200101-000000-dead/";
+        std::fs::create_dir_all(root.path().join(killed).join("data")).unwrap();
+        std::fs::write(root.path().join(killed).join("data/x"), b"left").unwrap();
+        let m = Marker::of(&target, killed).unwrap();
+        drop(Pending::create(&pending, "20200101-000000-dead", &m).unwrap());
+        let live_prefix = "oprobe-run-20200101-000000-0001/";
+        std::fs::create_dir_all(root.path().join(live_prefix)).unwrap();
+        std::fs::write(root.path().join(live_prefix).join("y"), b"live").unwrap();
+        let live = Pending::create(
+            &pending,
+            "20200101-000000-0001",
+            &Marker::of(&target, live_prefix).unwrap(),
+        )
+        .unwrap();
+        let mut odd = m.clone();
+        odd.run_prefix = "data/".into();
+        std::fs::create_dir_all(root.path().join("data")).unwrap();
+        std::fs::write(root.path().join("data/keep"), b"mine").unwrap();
+        drop(Pending::create(&pending, "20200101-000000-0002", &odd).unwrap());
+
+        let rails = Rails::new(&p, false, None, Budgets::default()).unwrap();
+        let own = rails.run_id.to_string();
+        let mut req = Request::new(p, rails, Cancel::new(), silent());
+        req.pending_dir = Some(pending.clone());
+        let m = measure(req).await.unwrap();
+        assert!(m.run.report.cleanup.verified, "{:?}", m.run.report.cleanup);
+        assert!(
+            !root.path().join(killed).join("data/x").exists(),
+            "the killed run's data is deleted"
+        );
+        assert!(!pending.join("20200101-000000-dead").exists());
+        assert!(
+            m.warnings.iter().any(|w| w.contains(killed)),
+            "{:?}",
+            m.warnings
+        );
+        // The run cleaned up after itself: no marker of its own.
+        assert!(!pending.join(&own).exists());
+        // A live run's data and anything outside a run prefix are never touched.
+        assert!(root.path().join(live_prefix).join("y").exists());
+        assert!(pending.join("20200101-000000-0001").exists());
+        assert!(root.path().join("data/keep").exists());
+        live.finish();
+    }
+
+    /// An `--idempotency-key` retry of a run that was killed hard shares its prefix: the
+    /// killed run's marker is removed, but the sweep never deletes the retry's own dataset.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_retry_with_the_same_prefix_keeps_its_own_dataset() {
+        use crate::store::pending::{Marker, Pending};
+        let data = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let pending = data.path().join("pending");
+        let url = format!("fs://{}", root.path().display());
+        let p = quick(&url);
+        let target = p.operator.target().unwrap();
+        let rails = Rails::new(&p, false, Some("nightly"), Budgets::default()).unwrap();
+        let prefix = rails.run_prefix.clone();
+        // The killed attempt: same prefix, an unlocked marker.
+        std::fs::create_dir_all(root.path().join(&prefix)).unwrap();
+        std::fs::write(root.path().join(&prefix).join("old"), b"left").unwrap();
+        let m = Marker::of(&target, &prefix).unwrap();
+        drop(Pending::create(&pending, "20200101-000000-dead", &m).unwrap());
+
+        let mut req = Request::new(p, rails, Cancel::new(), silent());
+        req.pending_dir = Some(pending.clone());
+        let m = measure(req).await.unwrap();
+        let s = &m.run.report.summary;
+        assert!(s.ops > 0);
+        assert_eq!(s.failed_ops, 0, "the retry's dataset was deleted under it");
+        assert!(
+            !m.warnings.iter().any(|w| w.contains("a stopped run left")),
+            "{:?}",
+            m.warnings
+        );
+        assert!(!pending.join("20200101-000000-dead").exists());
+        // The retry's own cleanup removed the prefix, the killed attempt's leftovers with it.
+        assert!(m.run.report.cleanup.verified, "{:?}", m.run.report.cleanup);
+        assert!(!root.path().join(&prefix).join("old").exists());
     }
 
     #[test]

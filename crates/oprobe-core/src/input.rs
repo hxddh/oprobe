@@ -468,7 +468,12 @@ pub fn scheme(raw: &str) -> Result<&'static str, OprobeError> {
     if let Some((_, svc)) = SCHEMES.iter().find(|(n, _)| *n == s) {
         return Ok(svc);
     }
-    let names: Vec<&str> = SCHEMES.iter().map(|(n, _)| *n).collect();
+    // Only what this build can open.
+    let names: Vec<&str> = SCHEMES
+        .iter()
+        .filter(|(_, svc)| crate::engine::operator::missing_service_feature(svc).is_none())
+        .map(|(n, _)| *n)
+        .collect();
     Err(
         invalid(format!("unsupported storage scheme `{}`", raw.trim())).with_hint(format!(
             "{} (examples: s3://bucket/prefix, gcs://bucket, fs:///tmp/bench, memory://, lab://demo)",
@@ -491,6 +496,14 @@ pub fn storage_url(raw: &str) -> Result<&'static str, OprobeError> {
         );
     };
     let svc = scheme(sch)?;
+    if svc == "http" {
+        if let Some(url) = cloud_url(s) {
+            return storage_url(&url);
+        }
+        if crate::engine::operator::missing_service_feature("http").is_some() {
+            return Err(web_address(s));
+        }
+    }
     let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
     if let Some(what) = bucket_kind(svc)
         && host.is_empty()
@@ -498,6 +511,130 @@ pub fn storage_url(raw: &str) -> Result<&'static str, OprobeError> {
         return Err(missing_bucket(&sch.to_ascii_lowercase(), what));
     }
     Ok(svc)
+}
+
+/// The storage URL of a pasted `https://` address of a cloud bucket, `None` for any other
+/// address:
+/// - S3, virtual-hosted (`https://BUCKET.s3[.REGION].amazonaws.com/KEY`) or path-style
+///   (`https://s3[.REGION].amazonaws.com/BUCKET/KEY`) → `s3://BUCKET/KEY[?region=REGION]`;
+/// - GCS (`https://storage.googleapis.com/BUCKET/KEY`, `https://BUCKET.storage.googleapis.com/KEY`)
+///   → `gs://BUCKET/KEY`;
+/// - Azure Blob (`https://ACCOUNT.blob.core.windows.net/CONTAINER/KEY`) →
+///   `azblob://CONTAINER/KEY?endpoint=https://ACCOUNT.blob.core.windows.net`.
+///
+/// The address's query (a pre-signed URL's signature) is never kept.
+pub fn cloud_url(raw: &str) -> Option<String> {
+    let u = url::Url::parse(raw.trim()).ok()?;
+    if !matches!(u.scheme(), "http" | "https") || u.port().is_some() {
+        return None;
+    }
+    let host = u.host_str()?.to_ascii_lowercase();
+    let segments: Vec<&str> = u.path().split('/').filter(|p| !p.is_empty()).collect();
+    // `SCHEME://BUCKET/KEY…` (the key may be empty).
+    let join = |scheme: &str, bucket: &str, rest: &[&str]| -> Option<String> {
+        if bucket.is_empty() {
+            return None;
+        }
+        let mut out = format!("{scheme}://{bucket}");
+        for p in rest {
+            out.push('/');
+            out.push_str(p);
+        }
+        Some(out)
+    };
+    if let Some(stem) = host
+        .strip_suffix(".amazonaws.com")
+        .or_else(|| host.strip_suffix(".amazonaws.com.cn"))
+    {
+        let labels: Vec<&str> = stem.split('.').collect();
+        let i = labels
+            .iter()
+            .position(|l| *l == "s3" || l.strip_prefix("s3-").is_some_and(aws_region))?;
+        let region = match labels[i].strip_prefix("s3-") {
+            Some(r) => Some(r),
+            None => labels[i + 1..]
+                .iter()
+                .copied()
+                .find(|l| *l != "dualstack")
+                .filter(|r| aws_region(r)),
+        };
+        // Anything else after `s3` (`s3-accesspoint`, `s3-control`, …) is not a bucket's address.
+        if !labels[i + 1..]
+            .iter()
+            .all(|l| *l == "dualstack" || Some(*l) == region)
+        {
+            return None;
+        }
+        let mut out = if i == 0 {
+            let (bucket, rest) = segments.split_first()?;
+            join("s3", bucket, rest)?
+        } else {
+            join("s3", &labels[..i].join("."), &segments)?
+        };
+        if let Some(r) = region {
+            out += &format!("?region={r}");
+        }
+        return Some(out);
+    }
+    if host == "storage.googleapis.com" || host == "storage.cloud.google.com" {
+        let (bucket, rest) = segments.split_first()?;
+        return join("gs", bucket, rest);
+    }
+    if let Some(bucket) = host.strip_suffix(".storage.googleapis.com") {
+        return join("gs", bucket, &segments);
+    }
+    if let Some(account) = host.strip_suffix(".blob.core.windows.net")
+        && !account.is_empty()
+        && !account.contains('.')
+    {
+        let (container, rest) = segments.split_first()?;
+        let out = join("azblob", container, rest)?;
+        return Some(format!("{out}?endpoint=https://{host}"));
+    }
+    None
+}
+
+/// `eu-west-1`, `us-gov-west-1`, `cn-north-1`: the shape of an AWS region's name (a
+/// two-letter area first, so `website-us-east-1` or `fips-us-east-1`, the labels of hosts that
+/// are not a bucket's API endpoint, are not one).
+fn aws_region(s: &str) -> bool {
+    let parts: Vec<&str> = s.split('-').collect();
+    parts.len() >= 3
+        && parts[0].len() == 2
+        && parts[0].chars().all(|c| c.is_ascii_lowercase())
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_alphanumeric()))
+        && parts
+            .last()
+            .is_some_and(|p| p.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// The error of an `http(s)://` address that is not a cloud bucket's, in a build without
+/// OpenDAL's `http` service: such an address is usually an S3-compatible server, which takes
+/// it as its endpoint. An AWS address that is not a bucket's API endpoint (an S3 website, an
+/// access point) gets the generic examples. The message never repeats the address's query (a
+/// pre-signed signature, a SAS token) or credentials.
+fn web_address(raw: &str) -> OprobeError {
+    let aws = |h: &str| h.ends_with(".amazonaws.com") || h.ends_with(".amazonaws.com.cn");
+    let hint = match url::Url::parse(raw) {
+        Ok(u) if u.host_str().is_some_and(|h| !h.is_empty() && !aws(h)) => {
+            let mut endpoint = format!("{}://{}", u.scheme(), u.host_str().unwrap_or_default());
+            if let Some(p) = u.port() {
+                endpoint += &format!(":{p}");
+            }
+            let path = u.path().trim_matches('/');
+            let target = if path.is_empty() {
+                "s3://BUCKET".to_owned()
+            } else {
+                format!("s3://{path}")
+            };
+            format!("for an S3-compatible server, use `{target} --set options.endpoint={endpoint}`")
+        }
+        _ => URL_EXAMPLES.to_owned(),
+    };
+    let shown = crate::util::display_url(raw);
+    invalid(format!("`{shown}` is a web address, not a storage URL")).with_hint(hint)
 }
 
 /// `bucket` / `container` for services addressed by one, `None` otherwise.
@@ -735,6 +872,116 @@ mod tests {
         assert!(access("hotset:2/0.5").is_err());
     }
 
+    /// A pasted address of a cloud bucket is the bucket's storage URL.
+    #[test]
+    fn cloud_addresses_map_to_storage_urls() {
+        let m = |s: &str| cloud_url(s);
+        // S3: virtual-hosted and path-style, with and without a region.
+        assert_eq!(
+            m("https://my-bucket.s3.amazonaws.com/data/x").as_deref(),
+            Some("s3://my-bucket/data/x")
+        );
+        assert_eq!(
+            m("https://my.bucket.s3.eu-west-1.amazonaws.com/").as_deref(),
+            Some("s3://my.bucket?region=eu-west-1")
+        );
+        assert_eq!(
+            m("https://b.s3-us-west-2.amazonaws.com/k").as_deref(),
+            Some("s3://b/k?region=us-west-2")
+        );
+        assert_eq!(
+            m("https://b.s3.dualstack.ap-south-1.amazonaws.com/k").as_deref(),
+            Some("s3://b/k?region=ap-south-1")
+        );
+        assert_eq!(
+            m("https://s3.amazonaws.com/b/p/q").as_deref(),
+            Some("s3://b/p/q")
+        );
+        assert_eq!(
+            m("http://s3.eu-central-1.amazonaws.com/b").as_deref(),
+            Some("s3://b?region=eu-central-1")
+        );
+        // A pre-signed URL's signature is dropped.
+        assert_eq!(
+            m("https://b.s3.amazonaws.com/k?X-Amz-Signature=abc").as_deref(),
+            Some("s3://b/k")
+        );
+        // GCS, both forms.
+        assert_eq!(
+            m("https://storage.googleapis.com/b/p").as_deref(),
+            Some("gs://b/p")
+        );
+        assert_eq!(
+            m("https://b.storage.googleapis.com/p").as_deref(),
+            Some("gs://b/p")
+        );
+        // Azure Blob: the container, at the account's endpoint.
+        assert_eq!(
+            m("https://acct.blob.core.windows.net/c/p").as_deref(),
+            Some("azblob://c/p?endpoint=https://acct.blob.core.windows.net")
+        );
+        // Not a bucket's address.
+        for s in [
+            "https://b.s3-website-us-east-1.amazonaws.com/k",
+            "https://b.s3-website.eu-west-1.amazonaws.com/k",
+            "https://b.s3-fips-us-gov-west-1.amazonaws.com/k",
+            "https://s3.amazonaws.com/",
+            "https://ap-123.s3-accesspoint.eu-west-1.amazonaws.com/k",
+            "https://ec2.amazonaws.com/",
+            "https://acct.blob.core.windows.net/",
+            "https://minio.local:9000/b/x",
+            "https://example.com/b",
+            "s3://b/x",
+        ] {
+            assert_eq!(m(s), None, "{s}");
+        }
+        // The URL check accepts them as the service they map to.
+        assert_eq!(storage_url("https://b.s3.amazonaws.com/x").unwrap(), "s3");
+        assert_eq!(
+            storage_url("https://acct.blob.core.windows.net/c").unwrap(),
+            "azblob"
+        );
+        // Any other web address, without OpenDAL's http service: the endpoint to set.
+        if crate::engine::operator::missing_service_feature("http").is_some() {
+            let e = storage_url("https://minio.local:9000/b/x").unwrap_err();
+            assert_eq!(e.code, ErrorCode::UsageInvalidArgument);
+            assert_eq!(
+                e.hint.as_deref(),
+                Some(
+                    "for an S3-compatible server, use `s3://b/x --set options.endpoint=https://minio.local:9000`"
+                )
+            );
+            // An S3 website address is not an endpoint to set.
+            let e = storage_url("https://b.s3-website-us-east-1.amazonaws.com/k").unwrap_err();
+            assert_eq!(e.hint.as_deref(), Some(URL_EXAMPLES));
+        }
+    }
+
+    /// A pasted address's signature (a pre-signed URL, a SAS token) and credentials never
+    /// appear in the error.
+    #[test]
+    fn a_web_address_error_never_repeats_its_secrets() {
+        let e = web_address(
+            "https://user:hunter2@minio.local:9000/b/x?X-Amz-Signature=deadbeef&sig=sastoken#frag",
+        );
+        let text = format!("{} {}", e.message, e.hint.as_deref().unwrap_or_default());
+        for secret in [
+            "hunter2",
+            "user:",
+            "deadbeef",
+            "sastoken",
+            "X-Amz-Signature",
+            "sig=",
+        ] {
+            assert!(!text.contains(secret), "{secret} in {text}");
+        }
+        assert!(
+            e.message.contains("https://minio.local:9000/b/x"),
+            "{}",
+            e.message
+        );
+    }
+
     #[test]
     fn urls_schemes_buckets_endpoints() {
         assert_eq!(scheme("S3A").unwrap(), "s3");
@@ -754,6 +1001,14 @@ mod tests {
         );
         assert!(storage_url("memory://").is_ok());
         assert!(storage_url("bucket/x").is_err());
+        // Only the schemes of this build are offered.
+        let (_, h) = code(storage_url("ftp://x"));
+        assert!(h.contains("s3"), "{h}");
+        assert_eq!(
+            h.contains("azdls"),
+            crate::engine::operator::missing_service_feature("azdls").is_none(),
+            "{h}"
+        );
         assert_eq!(bucket("my-bucket").unwrap(), "my-bucket");
         let (_, h) = code(bucket("MyBucket"));
         assert!(h.contains("mybucket"), "{h}");

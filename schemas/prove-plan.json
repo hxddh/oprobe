@@ -1,0 +1,283 @@
+{
+  "$defs": {
+    "Budgets": {
+      "description": "Limits for one command.",
+      "properties": {
+        "max_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_duration_s": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "max_requests_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "NextStep": {
+      "description": "A suggested next step: what it does and the CLI command.",
+      "properties": {
+        "cli": {
+          "description": "The command line (`oprobe …`).",
+          "type": "string"
+        },
+        "title": {
+          "description": "What the step does, in a few words.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "title",
+        "cli"
+      ],
+      "type": "object"
+    },
+    "Plan": {
+      "description": "What a run would do (`--dry-run`).",
+      "properties": {
+        "assumptions": {
+          "description": "How the estimates were made.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "budgets": {
+          "$ref": "#/$defs/Budgets"
+        },
+        "command": {
+          "default": "",
+          "description": "The command that runs this plan (`oprobe run …`, every non-default setting).",
+          "type": "string"
+        },
+        "concurrency_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "duration_s": {
+          "format": "double",
+          "type": "number"
+        },
+        "estimated_bytes": {
+          "description": "Estimated bytes transferred (up + down).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "estimated_ops_count": {
+          "description": "Estimated logical operations (warmup + window).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "estimated_requests_count": {
+          "description": "Estimated backend requests (dataset upload + workload + cleanup).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "eta_s": {
+          "description": "Estimated wall time, dataset upload and cleanup included.",
+          "format": "double",
+          "type": "number"
+        },
+        "objects_deleted_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "objects_written_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "preset": {
+          "type": "string"
+        },
+        "read_only": {
+          "type": "boolean"
+        },
+        "run_prefix": {
+          "type": "string"
+        },
+        "target": {
+          "type": "string"
+        },
+        "target_ref": {
+          "default": "",
+          "description": "The target as given (URL or `lab://` scenario), for the run command.",
+          "type": "string"
+        },
+        "warmup_s": {
+          "format": "double",
+          "type": "number"
+        },
+        "warnings": {
+          "default": [],
+          "description": "Things that would run, but probably not as meant (e.g. warmup ≥ window).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "target",
+        "preset",
+        "run_prefix",
+        "read_only",
+        "concurrency_count",
+        "warmup_s",
+        "duration_s",
+        "estimated_ops_count",
+        "estimated_requests_count",
+        "estimated_bytes",
+        "objects_written_count",
+        "objects_deleted_count",
+        "eta_s",
+        "budgets",
+        "assumptions",
+        "target_ref",
+        "command",
+        "warnings"
+      ],
+      "type": "object"
+    },
+    "ProofEstimate": {
+      "description": "How long a whole proof takes: its sizing trials and its interleaved A/B pairs, each trial\na short run (`prove --dry-run`, and the first lines of every prove).",
+      "properties": {
+        "budget_s": {
+          "description": "The wall-time budget, when one is set (`--max-duration`).",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "change": {
+          "description": "The change, as `PATH=VALUE` pairs (a sized value at its starting point).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "command": {
+          "description": "The command that runs this proof.",
+          "type": "string"
+        },
+        "eta_max_s": {
+          "format": "double",
+          "type": "number"
+        },
+        "eta_min_s": {
+          "description": "Wall time of the whole proof: at least (the fewest trials) and at most (every trial,\nwithin the budget).",
+          "format": "double",
+          "type": "number"
+        },
+        "pairs_max_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "pairs_min_count": {
+          "description": "The fewest and the most A/B pairs (a pair is two trials: A, then B).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "sizing_trials_max_count": {
+          "description": "Sizing trials at most (0 when the change has no size to search).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "trial_eta_s": {
+          "description": "Wall time of one baseline trial (warmup, window, dataset and cleanup).",
+          "format": "double",
+          "type": "number"
+        },
+        "trials_max_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "trials_min_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "command",
+        "change",
+        "sizing_trials_max_count",
+        "pairs_min_count",
+        "pairs_max_count",
+        "trials_min_count",
+        "trials_max_count",
+        "trial_eta_s",
+        "eta_min_s",
+        "eta_max_s"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://github.com/hxddh/oprobe/schemas/6/prove-plan.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "The result of `oprobe prove --dry-run -o json`: the estimate of the whole proof and the plan of one trial, nothing sent",
+  "properties": {
+    "next": {
+      "description": "Suggested next steps.",
+      "items": {
+        "$ref": "#/$defs/NextStep"
+      },
+      "type": "array"
+    },
+    "plan": {
+      "$ref": "#/$defs/Plan",
+      "description": "The plan of one run (of one trial, for `prove --dry-run`)."
+    },
+    "proof": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ProofEstimate"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "`prove --dry-run`: the whole proof, every trial of it."
+    },
+    "warnings": {
+      "description": "Warnings of the command (also printed on stderr in text mode).",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "plan",
+    "next",
+    "warnings"
+  ],
+  "title": "oprobe prove-plan",
+  "type": "object",
+  "x-rust-type": "PlanOutput"
+}

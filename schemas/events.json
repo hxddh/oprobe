@@ -891,7 +891,7 @@
           "$ref": "#/$defs/ErrorCode"
         },
         "detail": {
-          "description": "The whole error chain as the storage library reported it, when `message` leads with\nthe provider's error code instead (machine output only).",
+          "description": "The whole error chain as the storage library reported it, when `message` leads with\nthe provider's error code or states the cause plainly instead (machine output only).",
           "type": [
             "string",
             "null"
@@ -2934,7 +2934,7 @@
         },
         {
           "const": "trace",
-          "description": "A production trace written by the `oprobe-trace` layer (`oprobe.trace/6`): the\napplication's own traffic, with no workload to replay.",
+          "description": "A production trace written by the `oprobe-trace` layer (`oprobe.trace/7`, or a 6.x\n`oprobe.trace/6`): the application's own traffic, with no workload to replay.",
           "type": "string"
         }
       ]

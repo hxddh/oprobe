@@ -23,16 +23,21 @@ you run them.
   saved, and URLs lose embedded credentials and query strings.
 - **The host** is recorded as OS, architecture, CPU count and a hash of the host name, never the
   name itself.
+- **Pending-cleanup markers** in `<data dir>/oprobe/pending/`: while a run that writes is going,
+  one small file names its target and its `oprobe-run-*` prefix. It is removed once the test data
+  is deleted; one left by a killed run tells the next run against that target what to delete.
 - **The config file** holds what you put there.
 
 Delete runs with `oprobe show --rm RUN…`, or remove the data directory.
 
 ## `.oprobe` files from `oprobe-trace`
 
-`Handle::save` writes what the layer saw in your process: the aggregates and a sample of requests
-with their API, method, status, timing, bytes, connection and request ID. Object keys are not part
-of request rows, but request IDs and remote addresses are. Credentials never are. Review a file
-before you attach it to an issue.
+`Handle::save` writes what the layer saw in your process: the aggregates and a sample of
+operations and their requests, with their API, method, status, timing, bytes, connection and
+request ID. Object keys are never stored: an operation's key is its first path segment (at most
+32 bytes) and a hash of the whole key (`logs/#3f2a…`), so a top-level directory name can be in
+the file, but not a key. Request IDs and remote addresses are. Credentials never are. Review a
+file before you attach it to an issue.
 
 ## Test data in your bucket
 

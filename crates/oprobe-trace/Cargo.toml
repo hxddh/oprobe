@@ -28,6 +28,8 @@ __internal = ["schemars", "dep:tokio-rustls"]
 
 [dependencies]
 opendal-core = { workspace = true, features = ["executors-tokio"] }
+# `RetryInterceptor`, for `Handle::retry_notify` (the crate OpenDAL's `RetryLayer` comes from).
+opendal-layer-retry.workspace = true
 await-tree.workspace = true
 hyper-util = { version = "0.1", default-features = false, features = ["client-legacy"] }
 http.workspace = true
@@ -52,12 +54,15 @@ anyhow.workspace = true
 libc.workspace = true
 schemars = { workspace = true, optional = true }
 tokio-rustls = { workspace = true, optional = true }
-opentelemetry = { version = "0.31", default-features = false, features = ["metrics"], optional = true }
+opentelemetry = { version = "0.32", default-features = false, features = ["metrics"], optional = true }
 
 [dev-dependencies]
 opendal-core = { workspace = true, features = ["executors-tokio", "services-memory"] }
-opentelemetry_sdk = { version = "0.31", default-features = false, features = ["metrics", "testing"] }
-tokio = { version = "1.52", features = ["rt-multi-thread", "macros"] }
+opentelemetry_sdk = { version = "0.32", default-features = false, features = ["metrics", "testing"] }
+tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "net", "io-util"] }
+# The overhead bench's HTTP line: OpenDAL's `http` service and its default reqwest client.
+opendal-service-http = "0.59"
+opendal-http-transport-reqwest = "0.59"
 
 [[bench]]
 name = "overhead"

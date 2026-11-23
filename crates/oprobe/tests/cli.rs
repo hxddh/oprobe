@@ -124,7 +124,16 @@ fn checked_in_schemas_match_the_code() {
     assert_eq!(
         names,
         [
-            "report", "prove", "show", "run-list", "operator", "error", "events"
+            "report",
+            "run",
+            "plan",
+            "prove",
+            "prove-plan",
+            "show",
+            "run-list",
+            "operator",
+            "error",
+            "events"
         ]
     );
     for name in &names {
@@ -169,6 +178,7 @@ fn run_saves_the_run_and_prints_one_json_document() {
     let o = env.run(&run_args(&["memory://"], &["-o", "json"]));
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     let v = json(&o);
+    validate("run", &v);
     let run = &v["runs"][0];
     let report = &run["report"];
     validate("report", report);
@@ -340,6 +350,15 @@ fn show_lists_groups_and_removes_runs() {
     }
     let detail = stdout(&env.run(&["show", "last", "--detail"]));
     assert!(detail.len() > stdout(&env.run(&["show", "last"])).len());
+    // The text names the run's file, to hand a teammate.
+    let file = detail
+        .lines()
+        .find_map(|l| l.strip_prefix("file: "))
+        .expect("a file: line");
+    assert!(
+        file.ends_with(".oprobe") && std::path::Path::new(file).is_file(),
+        "{file}"
+    );
     let o = env.run(&["show", "--rm", &first, "-o", "json"]);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     assert_eq!(json(&o)["removed"][0], first.as_str());
@@ -454,6 +473,31 @@ fn safety_rails_refuse_or_stop_runs() {
     ]);
     assert_eq!(code(&o), 4, "{}", stdout(&o));
     assert_eq!(error_code(&o), "safety.budget_exceeded");
+    // It stops at the limit, not one past it.
+    let msg = json(&o)["error"]["message"].as_str().unwrap().to_owned();
+    assert!(
+        msg.contains("(limit 50)") && !msg.contains("51 requests"),
+        "{msg}"
+    );
+    // The partial run is Review (not Critical), leads with why it cannot be judged, and
+    // prove refuses it.
+    let o = env.run(&["show", "last", "-o", "json"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let r = &json(&o)["report"];
+    assert_eq!(r["verdict"]["level"], "review", "{}", r["verdict"]);
+    assert_eq!(r["findings"][0]["code"], "invalid_run", "{}", r["findings"]);
+    let o = env.run(&["prove", "last", "-o", "json"]);
+    assert_eq!(code(&o), 2, "{}", stdout(&o));
+    assert_eq!(error_code(&o), "usage.invalid_argument");
+    let e = json(&o);
+    validate("error", &e);
+    assert!(
+        e["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("cannot be judged"),
+        "{e}"
+    );
     // --dry-run: the plan of every operator; nothing is written.
     let env = Env::new();
     let o = env.run(&run_args(
@@ -462,8 +506,31 @@ fn safety_rails_refuse_or_stop_runs() {
     ));
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     let v = json(&o);
+    validate("plan", &v);
     assert_eq!(v["plans"].as_array().unwrap().len(), 2);
     assert!(v["plans"][0]["estimated_requests_count"].as_u64().unwrap() > 0);
+    assert!(env.runs().is_empty());
+    // The plan states its budgets and warns when it would spend one (6.3.0 planned 6 541
+    // requests under --max-requests 500 without a word).
+    let o = env.run(&run_args(
+        &["memory://"],
+        &["--dry-run", "--max-requests", "5", "-o", "json"],
+    ));
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let v = json(&o);
+    validate("plan", &v);
+    assert_eq!(v["plans"][0]["budgets"]["max_requests_count"], 5);
+    let warnings = v["warnings"].to_string();
+    assert!(warnings.contains("--max-requests"), "{v}");
+    let t = stdout(&env.run(&run_args(
+        &["memory://"],
+        &["--dry-run", "--max-requests", "5"],
+    )));
+    assert!(t.contains("budgets ≤ 5 requests"), "{t}");
+    assert!(
+        t.contains("warning:") && t.contains("request budget"),
+        "{t}"
+    );
     assert!(env.runs().is_empty());
 }
 
@@ -474,13 +541,14 @@ fn demo_is_run_lab_demo() {
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     let r = &json(&o)["runs"][0]["report"];
     assert_eq!(r["spec"]["operator_ref"], "lab://demo");
-    assert!(
-        r["resilience"]["throttled_responses_count"]
-            .as_u64()
-            .unwrap()
-            > 0,
-        "{r}"
-    );
+    // The demo lab's stragglers wait 250 ms for their first byte.
+    let slowest_ttfb = r["apis"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|a| a["stages"]["ttfb"]["max_ms"].as_f64())
+        .fold(0.0, f64::max);
+    assert!(slowest_ttfb >= 250.0, "{r}");
 }
 
 #[test]
@@ -857,6 +925,7 @@ fn prove_has_one_budget_and_estimates_the_whole_proof() {
             "json",
         ]);
         assert_eq!(code(&o), 0, "{flag}: {}", stderr(&o));
+        validate("prove-plan", &json(&o));
         let p = &json(&o)["proof"];
         assert_eq!(p["budget_s"], 90.0, "{flag}: {p}");
         assert_eq!(p["pairs_min_count"], 3, "{p}");
@@ -931,6 +1000,51 @@ fn bare_oprobe_is_the_app() {
     let o = env.run(&["-o", "json"]);
     assert_eq!(code(&o), 2);
     validate("error", &json(&o));
+}
+
+/// A double click on a run file runs `oprobe PATH` (6.3.0: `unrecognized subcommand`). When the
+/// only argument is an existing `.oprobe` or `.json` file, it is the bare app opening it; off a
+/// desktop and a terminal, the help says how to read it here.
+#[test]
+fn a_run_file_alone_opens_the_app() {
+    let env = Env::new();
+    let o = env.run(&run_args(&["memory://"], &["-q"]));
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let oprobe = env.runs().pop().unwrap();
+    let report = env.path("report.JSON");
+    std::fs::write(&report, stdout(&env.run(&["show", "last", "-o", "json"]))).unwrap();
+    // Exactly as a file manager starts it: the path alone.
+    let alone = |path: &std::path::Path| {
+        Command::new(env!("CARGO_BIN_EXE_oprobe"))
+            .env("OPROBE_DATA_DIR", env.data())
+            .env("OPROBE_CONFIG", env.path("config.toml"))
+            .env_remove("OPROBE_OUTPUT")
+            .arg(path)
+            .output()
+            .unwrap()
+    };
+    for file in [&oprobe, &report] {
+        let o = alone(file);
+        assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+        let t = stdout(&o);
+        assert!(t.contains("the app"), "{t}");
+        // The path is quoted for the shell where it needs it (Windows paths always do).
+        let name = file.file_name().unwrap().to_string_lossy();
+        assert!(
+            t.lines()
+                .any(|l| l.contains("oprobe show ") && l.contains(name.as_ref())),
+            "{t}"
+        );
+    }
+    // Anything else is still a command line: a missing file, another extension, more arguments.
+    let toml = env.path("op.toml");
+    std::fs::write(&toml, "url = \"memory://\"\n").unwrap();
+    for path in [env.path("missing.oprobe"), toml] {
+        let o = alone(&path);
+        assert_eq!(code(&o), 2, "{}", stdout(&o));
+    }
+    let o = env.run(&[oprobe.to_str().unwrap()]);
+    assert_eq!(code(&o), 2, "{}", stdout(&o));
 }
 
 #[test]
