@@ -100,10 +100,18 @@ pub async fn prove(a: ProveArgs, ctx: &Ctx) -> Result<u8> {
             .as_deref()
             .map(|v| crate::input::share("--max-throttle", v))
             .transpose()?,
-        budget: a.budget,
+        // One wall-time budget: `--max-duration` (alias `--budget`) bounds the whole proof.
+        budget: a.safety.max_duration.clone(),
         trial_duration: a.trial,
         pairs: a.pairs.unwrap_or(crate::config::prove_defaults::MAX_PAIRS),
-        safety: safety(&a.safety),
+        safety: i::Safety {
+            dry_run: a.safety.dry_run,
+            read_only: a.safety.read_only,
+            max_requests: a.safety.max_requests,
+            max_bytes: a.safety.max_bytes.clone(),
+            max_duration: None,
+            idempotency_key: None,
+        },
     };
     match ctx.app().prove(req, ctx.out.clone(), ctrl_c()).await? {
         ProveOutcome::Plan(p) => ctx.out.finish(p.as_ref()),

@@ -4,6 +4,57 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Changed
+
+- **The demo proves.** `oprobe demo` then `oprobe prove last` (every default) proves its top
+  finding `improved` on goodput; a convergence test runs exactly that.
+  - Throttling's severity follows its cost, not its presence: critical when more operations
+    fail out of retries than a run allows or when half the operation time is retry backoff, a
+    warning when some fail or the backoff is a noticeable share, otherwise informational.
+  - Within one severity, the costliest finding comes first (`time_cost_ratio`, a new evidence
+    value of the throttle family and `tail_stragglers`).
+- **One prove budget.** `--max-duration` is the wall-time budget of the whole proof; no trial
+  starts that would not end within it. `--budget` still works as a hidden alias.
+- **The ETA covers the whole proof.** `prove --dry-run` and the start of every prove print the
+  number of trials (sizing, then the fewest to the most pairs) and the ETA of the whole proof.
+  `prove --dry-run -o json` adds `proof` (trial counts, `eta_min_s`, `eta_max_s`).
+- A tail-cut proof warms up only its candidate trials for 11.5 s; the baseline trials keep the
+  short warmup.
+- With no pair of trials, `prove` prints `not measured` and no diff (JSON: `inconclusive`,
+  `pairs_count: 0`, a note).
+- **One vocabulary**: verdict levels read OK, Review, Attention, Critical (JSON keeps `ok`,
+  `review`, `attention`, `critical`); prove results read improved, worse, inconclusive; the runs
+  of a proof are trials.
+- **Output is never clipped.** `show` wraps long lines instead of cutting them, `show --list`
+  prints whole targets and changes, and a word longer than the line stays whole.
+- **Diffs show only what differs from the defaults**: the TOML of a changed layer no longer
+  repeats its default fields (`retry = { jitter = true }`, not the whole table).
+- **Errors lead with the provider's code**: `credentials rejected: InvalidAccessKeyId: …`. The
+  raw error chain moves to the new `detail` field of the JSON error.
+- `show --detail`: the timeline names its real interval (1 s, or 10 s after ten minutes), adds
+  p99.9 and max, merges long runs into at most 60 rows, and labels errors and throttled as counts
+  per row. A new **Spread** section shows the hottest keys, object sizes, prefixes and remotes.
+- `oprobe lab` lists the app's six scenarios (`demo`, `throttle`, `stragglers`, `bandwidth`,
+  `flaky`, `ratelimit`); an unknown name lists them. The other scenarios still run by name.
+- The docs describe the prove interval as it is computed: Student's t on the paired log ratios,
+  no narrower than the A/A noise floor, and Newcombe for shares.
+- `docs/operator.md` recommends an `op.toml` path for your operator; `[operators.NAME]` in the
+  config file still works.
+- Core: `App::prove_finding` and `ProveRequest::for_finding` prove a finding's remedy, sized as
+  the CLI sizes it.
+
+### Removed
+
+- The SLA surface of 5.x: `show` prints no SLA line, and `--set sla`, `max_error_rate`,
+  `max_throttle_rate` and `p99_ms` are refused with an error. The report keeps its `sla` fields
+  (always the defaults).
+- Run labels from the help, the docs and `show --list` (the JSON field stays).
+- Hints and warnings that named flags oprobe does not take (`--option`, `--anonymous`,
+  `--ca-cert`, `--insecure`, `--proxy`, `oprobe init`, `--warmup`, `--microscope`); they name
+  `--set` paths instead.
+
 ## v6.2.0 — 2026-11-23
 
 ### Changed

@@ -17,7 +17,8 @@ oprobe reads an operator from:
   `timeout`;
 - an operator file, `op.toml` (format `oprobe.operator/6`): the URL, service options, layers,
   read/write options and HTTP client settings ([reference](operator.md));
-- a name, `[operators.NAME]` in the config file.
+- a name, `[operators.NAME]` in the config file (an `op.toml` path is the recommended way;
+  [the config file](operator.md#the-config-file)).
 
 `--set PATH=VALUE` changes one value (`--set layers.retry.max_times=5`, `--set read.gap=1MiB`).
 The difference between two operators is itself a value: it renders as Rust builder code and as
@@ -51,7 +52,7 @@ deletes the prefix. The guard enforces budgets (`--max-requests`, `--max-bytes`,
 
 A profile is what one operator did on one workload, saved as one `.oprobe` file:
 
-- the operator spec and the workload, so the run replays exactly;
+- the operator spec and the workload, so the run can be reproduced exactly;
 - every operation and every backend request under it, stage by stage: **queue** (waiting for a
   connection or a permit), **connect** (DNS, TCP, proxy, TLS on a fresh connection), **send**,
   **TTFB** (the server's time to the first byte), **body** (the transfer), **stall** (the body
@@ -96,13 +97,16 @@ large a limit should be or how much it would help; claiming so would be a guess.
 1. **Choose the change**: the finding's remedy (the top finding by default), or `--with PATH=VALUE`.
 2. **Size it**: when the remedy has a size (a limit, a chunk), short trials over that one value
    find the knee of the objective, within `--max-throttle`.
-3. **A/B test**: A and B alternate (A B A B …); a sequential test on the objective, against a
-   noise floor learned from A/A pairs, stops as soon as it can decide, or at `--budget`.
+3. **A/B test**: trials of A and B alternate (A B A B …); a sequential test on the objective,
+   against a noise floor learned from consecutive A trials (the A/A spread), stops as soon as it
+   can decide, or when the wall-time budget (`--max-duration`) would be exceeded.
 4. **Decide**: `improved`, `worse` (exit 3) or `inconclusive` on the objective: **goodput**
-   (successful operations per second; the default) or **p99**. Intervals are Wilson/beta and stay
-   in range; secondary metrics are shown and never decide. Deciding takes at least 3 A/B pairs;
-   with fewer, the verdict is `inconclusive`.
-5. **Save**: every trial run is saved as a child of the prove run, hidden from `show --list`.
+   (successful operations per second; the default) or **p99**. The objective's interval is
+   Student's t on the paired log ratios (B over A, pair by pair), with a spread no smaller than
+   the A/A noise floor, so it never goes below −100 %. Shares (throttled requests, errors) are
+   compared with Newcombe's interval. Secondary metrics are shown and never decide. Deciding
+   takes at least 3 pairs of trials; with fewer, the verdict is `inconclusive`.
+5. **Save**: every trial is saved as a run, a child of the prove, hidden from `show --list`.
 
 The result is a **proven layer diff**: the objective's change with its interval, the evidence,
 and the change as Rust and as TOML. Every result states where it was validated (the lab, MinIO,

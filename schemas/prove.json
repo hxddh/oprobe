@@ -127,7 +127,7 @@
           "type": "number"
         },
         "feasible": {
-          "description": "Within `--max-throttle` and the SLA's error ratio.",
+          "description": "Within `--max-throttle` and the error ratio a run allows (1 %).",
           "type": "boolean"
         },
         "goodput_ops_per_s": {
@@ -295,7 +295,7 @@
   "description": "The result of `oprobe prove -o json`: the verdict on the objective and the operator diff",
   "properties": {
     "budget_exceeded": {
-      "description": "A budget (`--budget`, `--max-requests`, `--max-bytes`, `--max-duration`) stopped the\nprove before it could finish: the result reads what was measured (exit 4).",
+      "description": "A budget (`--max-duration`, `--max-requests`, `--max-bytes`) stopped the\nprove before it could finish: the result reads what was measured (exit 4).",
       "type": "boolean"
     },
     "change": {

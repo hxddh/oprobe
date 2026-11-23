@@ -905,8 +905,9 @@ fn run_cli_against(endpoint: &str, extra: &[&str]) -> std::process::Output {
         .unwrap()
 }
 
-/// Failed operations breach the default SLA (≤ 1% failed, no corruption): the brief says so
-/// (a breach is reported, not an exit code), unless the SLA is disabled or relaxed.
+/// Failed operations breach the run's default checks (≤ 1% failed, no corruption): the report
+/// says so (a breach is reported, not an exit code). The 5.x keys that relaxed them
+/// (`--set sla=none`, `max_error_rate`) are refused since 6.3: oprobe 6 has no SLA.
 #[test]
 fn failed_operations_breach_the_default_sla() {
     let (_rt, lab) = background_lab(LabConfig {
@@ -927,10 +928,11 @@ fn failed_operations_breach_the_default_sla() {
     ] {
         let args: Vec<&str> = no_retry.iter().chain(relaxed).copied().collect();
         let out = run_cli_against(&lab.endpoint_url, &args);
+        assert_eq!(out.status.code(), Some(2), "{relaxed:?}: a usage error");
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
         assert!(
-            out.status.success(),
-            "{relaxed:?}: {}",
-            String::from_utf8_lossy(&out.stderr)
+            v["error"]["message"].as_str().unwrap().contains("no SLA"),
+            "{relaxed:?}: {v}"
         );
     }
     let bad = run_cli_against(&lab.endpoint_url, &["--set", "max_error_rate=150%"]);

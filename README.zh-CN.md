@@ -23,16 +23,21 @@
 curl -fsSL https://github.com/hxddh/oprobe/releases/latest/download/install.sh | sh
 
 oprobe demo                      # 剖析本机上一个“行为不良”的 S3 实验室，无需任何账号
-oprobe prove last throttling     # 对 throttling 发现的补救措施做 A/B 测试
+oprobe prove last                # 对首要发现的补救措施做 A/B 测试（约一分钟）
 oprobe                           # 应用：运行记录、Profile、Operator、对比
 ```
 
-`oprobe demo` 即 `oprobe run lab://demo`：一个本地 S3，在超过 24 个并发请求时限流，并让部分请求变成拖尾。简报最多列出三条发现，每条附上以 `op.toml` 路径表示的补救措施和下一条命令。`prove` 的结果形如：
+`oprobe demo` 即 `oprobe run lab://demo`：一个本地 S3，在超过 24 个并发请求时限流，并让每第 40 个请求变成等待 250 ms 的拖尾。简报最多列出三条发现，每条附上以 `op.toml` 路径表示的补救措施和下一条命令。`prove last` 交替运行当前 operator（A）与补救后的 operator（B）的试验，最后给出 diff（这次用时 60 秒）：
 
 ```text
-proved on goodput: +31 % [+27, +35], p99 −42 %, 0 throttled (4 A/B pairs)
-+ ConcurrentLimitLayer::new(24)
-~ RetryLayer::new().with_jitter().with_max_times(4)
+improved on goodput: +34.4 % [+19.5, +51.1] (3 pairs of trials, noise ±2.0 %) · lab://demo (local lab)
+secondary (not decisive): p99 -67.8 % [-69.4, -66.2] · throttled 0.27 % → 4.54 % · errors 0.00 % → 0.02 %
++ TailCutLayer::builder().safety_factor(1.5).min_samples(32).min_deadline(Duration::from_millis(50)).max_deadline(Duration::from_secs(60)).build()
+~ RetryLayer::new().with_min_delay(Duration::from_millis(20))
+op.toml:
+[layers]
+retry = { min_delay = "20ms" }
+tail_cut = true
 ```
 
 然后换成你自己的存储：
@@ -47,7 +52,7 @@ oprobe run s3://a/x r2://b/x fs:///nvme/x         # 多个 operator 跑同一负
 
 ## 你的 operator：`op.toml`
 
-一切的单位都是 OpenDAL 的 `Operator`：一个服务、一组 layer、以及读写选项。oprobe 可以从 URL、文件或配置文件中的 `[operators.NAME]` 读取它。
+一切的单位都是 OpenDAL 的 `Operator`：一个服务、一组 layer、以及读写选项。oprobe 从 URL 或文件 `op.toml`（推荐的描述方式）读取它。
 
 ```toml
 url = "s3://bucket/prefix"
@@ -102,7 +107,7 @@ handle.save("prod.oprobe")?;          // 之后：oprobe show prod.oprobe
 
 ## 脚本与智能体
 
-每个命令都可以用 `-o json` 输出一个 JSON 文档（stdout 只有结果，进度写到 stderr）；错误带有稳定的错误码和退出码（0 成功 · 1 运行时 · 2 用法 · 3 prove 被否定 · 4 预算 · 5 安全 · 130 中断）；JSON Schema 在 [`schemas/`](schemas)。命令行与 JSON 输出只有英文。智能体请看 [`skills/oprobe/SKILL.md`](skills/oprobe/SKILL.md) 和 [llms.txt](llms.txt)。
+每个命令都可以用 `-o json` 输出一个 JSON 文档（stdout 只有结果，进度写到 stderr）；错误带有稳定的错误码和退出码（0 成功 · 1 运行时 · 2 用法 · 3 prove 结果为 worse · 4 预算 · 5 安全 · 130 中断）；JSON Schema 在 [`schemas/`](schemas)。命令行与 JSON 输出只有英文。智能体请看 [`skills/oprobe/SKILL.md`](skills/oprobe/SKILL.md) 和 [llms.txt](llms.txt)。
 
 ## 安装
 

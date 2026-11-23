@@ -889,6 +889,13 @@
         "code": {
           "$ref": "#/$defs/ErrorCode"
         },
+        "detail": {
+          "description": "The whole error chain as the storage library reported it, when `message` leads with\nthe provider's error code instead (machine output only).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "docs": {
           "type": [
             "string",
@@ -4446,7 +4453,7 @@
           "type": "number"
         },
         "feasible": {
-          "description": "Within `--max-throttle` and the SLA's error ratio.",
+          "description": "Within `--max-throttle` and the error ratio a run allows (1 %).",
           "type": "boolean"
         },
         "goodput_ops_per_s": {

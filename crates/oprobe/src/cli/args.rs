@@ -213,7 +213,7 @@ pub enum ObjectiveArg {
 
 #[derive(Args, Debug)]
 pub struct ProveArgs {
-    /// The run whose operator to change (id, id prefix, `last`, `last~N`, label)
+    /// The run whose operator to change (id, id prefix, `last`, `last~N`)
     #[arg(value_name = "RUN")]
     pub run: String,
     /// The finding whose remedy to prove (default: the top finding)
@@ -228,9 +228,6 @@ pub struct ProveArgs {
     /// Share of throttled requests a sized value may cause, e.g. 0.1% or 0.001 (default 0.1%)
     #[arg(long, value_name = "RATIO", value_parser = parse::share, allow_hyphen_values = true)]
     pub max_throttle: Option<String>,
-    /// Wall-time budget of the whole proof, e.g. 5m
-    #[arg(long, value_name = "DURATION", value_parser = parse::duration, allow_hyphen_values = true)]
-    pub budget: Option<String>,
     /// Measurement window of one trial (default 2s)
     #[arg(long, value_name = "DURATION", value_parser = parse::duration, hide = true)]
     pub trial: Option<String>,
@@ -238,7 +235,35 @@ pub struct ProveArgs {
     #[arg(long, value_name = "N", value_parser = at_least::<3>, hide = true)]
     pub pairs: Option<usize>,
     #[command(flatten)]
-    pub safety: SafetyArgs,
+    pub safety: ProveSafetyArgs,
+}
+
+/// Safety rails of a prove: one wall-time budget for the whole proof.
+#[derive(Args, Debug, Clone, Default)]
+#[command(next_help_heading = "Safety")]
+pub struct ProveSafetyArgs {
+    /// Print the plan of the whole proof (trials, requests, ETA) and exit
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Refuse every write and delete (exit 5)
+    #[arg(long)]
+    pub read_only: bool,
+    /// Stop after this many backend requests (exit 4)
+    #[arg(long, value_name = "N")]
+    pub max_requests: Option<u64>,
+    /// Stop after transferring this many bytes, e.g. 10GiB (exit 4)
+    #[arg(long, value_name = "SIZE", value_parser = parse::size, allow_hyphen_values = true)]
+    pub max_bytes: Option<String>,
+    /// Wall-time budget of the whole proof, e.g. 5m: no trial starts that would not end in it
+    // `--budget` is the 6.0–6.2 spelling, kept as a hidden alias.
+    #[arg(
+        long,
+        alias = "budget",
+        value_name = "DURATION",
+        value_parser = parse::duration,
+        allow_hyphen_values = true
+    )]
+    pub max_duration: Option<String>,
 }
 
 /// `--by`.
@@ -251,7 +276,7 @@ pub enum ByArg {
 
 #[derive(Args, Debug)]
 pub struct ShowArgs {
-    /// The run: id, id prefix, `last`, `last~N`, label, or a .oprobe / report .json file
+    /// The run: id, id prefix, `last`, `last~N`, or a .oprobe / report .json file
     #[arg(value_name = "RUN|FILE")]
     pub run: Option<String>,
     /// List the stored runs (prove trials are hidden; --all lists them)
@@ -276,8 +301,7 @@ pub struct ShowArgs {
 
 #[derive(Args, Debug)]
 pub struct LabArgs {
-    /// The faults: clean, demo, throttle, stragglers, lossy, flaky, parquet, ratelimit,
-    /// hotkey, bandwidth, queueing, timevarying, noisy
+    /// The faults: demo, throttle, stragglers, bandwidth, flaky or ratelimit (default: none)
     #[arg(value_name = "SCENARIO", value_parser = parse::lab_scenario)]
     pub scenario: Option<String>,
     /// Address to listen on

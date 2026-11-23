@@ -136,7 +136,7 @@ pub fn render_width(r: &Report, width: usize) -> String {
     if !v.sla_breaches.is_empty() {
         prose(
             &mut lines,
-            &format!("SLA breached: {}", v.sla_breaches.join("; ")),
+            &format!("✖ {}", v.sla_breaches.join("; ")),
             "  ",
             "    ",
             red,

@@ -24,8 +24,9 @@ next: oprobe prove last throttling
 
 (Illustrative: the exact wording follows the version you run.)
 
-- **The badge** is the verdict level: **HEALTHY**, **REVIEW** (worth a look: informational
-  findings, a partial run), **ATTENTION** (warning findings), **CRITICAL** (critical findings).
+- **The badge** is the verdict level: **OK**, **Review** (worth a look: informational
+  findings, a partial run), **Attention** (warning findings), **Critical** (critical findings).
+  JSON carries the same levels as `ok`, `review`, `attention`, `critical`.
 - **The headline** says what bounds the operator on this workload: throttling, the server's
   latency, the network (connect, upload, download), queueing in the client, or the client itself.
 - **Findings**: at most three, most severe first. Each has its code, the evidence in one line,
@@ -41,7 +42,7 @@ the configuration and the five slowest operations):
 
 | Section | What it tells you |
 |---|---|
-| header | run id and label, operator, workload, window, concurrency, start time |
+| header | run id, operator, workload, window, concurrency, start time |
 | verdict | the badge and where the time went, in one sentence |
 | key numbers | goodput and throughput, latency p50/p99/p99.9/max, failed operations, throttled responses |
 | findings | every finding: code, cause, evidence, confidence, remedy |

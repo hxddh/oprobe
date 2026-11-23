@@ -66,21 +66,18 @@ impl CommandOutput for RunList {
             .runs
             .iter()
             .map(|r| {
+                let level = r.verdict_level.label();
                 let verdict = match r.verdict_level {
-                    VerdictLevel::Ok => green("ok"),
-                    VerdictLevel::Review => "review".to_owned(),
-                    VerdictLevel::Attention => yellow("attention"),
-                    VerdictLevel::Critical => red("critical"),
+                    VerdictLevel::Ok => green(level),
+                    VerdictLevel::Review => level.to_owned(),
+                    VerdictLevel::Attention => yellow(level),
+                    VerdictLevel::Critical => red(level),
                 };
                 vec![
                     r.id.clone(),
-                    cut(r.label.as_deref().unwrap_or(""), 12),
-                    cut(
-                        &r.target_name
-                            .clone()
-                            .unwrap_or_else(|| crate::util::display_url(&r.target_display)),
-                        22,
-                    ),
+                    r.target_name
+                        .clone()
+                        .unwrap_or_else(|| crate::util::display_url(&r.target_display)),
                     when(&r.id, now),
                     format!("{:.0}s", r.window_s),
                     if r.interrupted {
@@ -94,9 +91,7 @@ impl CommandOutput for RunList {
             })
             .collect();
         let mut o = crate::report::style::table(
-            &[
-                "run", "label", "target", "when", "window", "verdict", "ops/s", "p99",
-            ],
+            &["run", "target", "when", "window", "verdict", "ops/s", "p99"],
             &rows,
             0,
         );
@@ -120,7 +115,7 @@ impl CommandOutput for RunList {
                             p.objective.label(),
                             p.objective_delta_ratio * 100.0
                         ),
-                        cut(&p.change.join(" "), 40),
+                        p.change.join(" "),
                     ]
                 })
                 .collect();
@@ -132,7 +127,7 @@ impl CommandOutput for RunList {
         }
         if self.hidden_trials_count > 0 {
             o += &dim(&format!(
-                "{} prove trial runs hidden (--all lists them)\n",
+                "{} trials of proves hidden (--all lists them)\n",
                 self.hidden_trials_count
             ));
         }
@@ -143,17 +138,7 @@ impl CommandOutput for RunList {
                 self.total_count
             ));
         }
-        o += &dim("show one: oprobe show RUN  (id, prefix, last, last~1, label)\n");
-        o
-    }
-}
-
-fn cut(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_owned()
-    } else {
-        let mut o: String = s.chars().take(max - 1).collect();
-        o.push('…');
+        o += &dim("show one: oprobe show RUN  (id, prefix, last, last~1)\n");
         o
     }
 }
