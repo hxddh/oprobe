@@ -791,9 +791,11 @@ fn the_profile_shows_every_captured_signal_where_it_explains_something() {
     wait_long(&mut app, "id:connections");
     #[cfg(target_os = "linux")]
     wait_long(&mut app, "id:conn-tcp");
-    // A slow operation's async call stack opens under its waterfall on demand.
-    wait_long(&mut app, "id:slowest >> id:await-tree-toggle");
+    // A slow operation's async call stack opens under its waterfall on demand (every slow
+    // operation of a live run has one; the slowest is first).
+    let toggle = "id:slowest >> id:await-tree-toggle >> nth=0";
+    wait_long(&mut app, toggle);
     assert!(!has(&app, "id:await-tree-body"));
-    app.press("id:slowest >> id:await-tree-toggle").unwrap();
+    app.press(toggle).unwrap();
     wait_long(&mut app, "id:await-tree-body");
 }
