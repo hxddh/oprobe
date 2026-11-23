@@ -52,11 +52,11 @@ anyhow.workspace = true
 libc.workspace = true
 schemars = { workspace = true, optional = true }
 tokio-rustls = { workspace = true, optional = true }
-opentelemetry = { version = "0.31", default-features = false, features = ["metrics"], optional = true }
+opentelemetry = { version = "0.32", default-features = false, features = ["metrics"], optional = true }
 
 [dev-dependencies]
 opendal-core = { workspace = true, features = ["executors-tokio", "services-memory"] }
-opentelemetry_sdk = { version = "0.31", default-features = false, features = ["metrics", "testing"] }
+opentelemetry_sdk = { version = "0.32", default-features = false, features = ["metrics", "testing"] }
 tokio = { version = "1.52", features = ["rt-multi-thread", "macros"] }
 
 [[bench]]
