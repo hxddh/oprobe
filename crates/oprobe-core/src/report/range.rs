@@ -281,6 +281,12 @@ fn verbs(ops: &[&OpRow], weight: &dyn Fn(u64) -> f64, span: f64) -> Vec<VerbView
                 verb: verb.to_owned(),
                 ops_count: n.round() as u64,
                 ops_per_s: n / span,
+                mib_per_s: os
+                    .iter()
+                    .map(|o| o.bytes as f64 * weight(o.op_id))
+                    .sum::<f64>()
+                    / span
+                    / (1024.0 * 1024.0),
                 p50_ms: wq(&mut lat, 0.5),
                 p99_ms: wq(&mut lat, 0.99),
                 error_ratio: share(&|o| !o.ok),

@@ -92,9 +92,11 @@ pub struct Bar {
     pub total_us: u64,
     pub segs: Vec<Seg>,
     pub failed: bool,
-    /// What the response and the connection said, as `(what, value)`: the provider's error
-    /// code, `Retry-After`, rtt / min rtt / retransmits, `Server-Timing`, the request id (only
-    /// those the request row has).
+    /// What the response and the connection said, as `(what, value)`, in core's order
+    /// ([`view::request_signals`]): the provider's error code, `Retry-After`, rtt / min rtt /
+    /// retransmits, `Server-Timing`, the HTTP/2 stream wait, flow-control stall and open
+    /// streams, the kernel's upload timing, the CDN cache status and the region (only those
+    /// the request row has).
     pub signals: Vec<(&'static str, String)>,
 }
 
@@ -106,6 +108,8 @@ pub struct Waterfall {
     pub key: String,
     pub latency_us: u64,
     pub bars: Vec<Bar>,
+    /// The async call stack captured while it was in flight (slow operations).
+    pub await_tree: Option<String>,
 }
 
 /// The request heatmap: time buckets × log latency rows.
@@ -128,23 +132,13 @@ pub struct VerbRow {
     pub verb: String,
     pub ops_count: u64,
     pub ops_per_s: f64,
+    pub mib_per_s: f64,
     pub p50_ms: f64,
     pub p99_ms: f64,
     pub error_ratio: f64,
+    pub throttled_ratio: f64,
+    pub requests_per_op: f64,
     pub stages: Vec<StageBar>,
-}
-
-/// The connections of a run.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Conns {
-    pub dialed: u64,
-    pub reuse_ratio: f64,
-    pub http1: u64,
-    pub http2: u64,
-    pub tls: String,
-    pub peak_inflight: u64,
-    /// `(stage, p50 ms, p99 ms)` of DNS, TCP and TLS.
-    pub setup: Vec<(&'static str, f64, f64)>,
 }
 
 /// The run with its trace rows, shared by the views (equal when it is the same run, so a
@@ -198,7 +192,11 @@ pub struct ProfileModel {
     pub retry: view::RetryView,
     pub bytes: view::BytesView,
     pub spread: view::SpreadView,
-    pub conns: Conns,
+    /// Core's connection view: reuse, dials and their phases, the kernel's TCP statistics,
+    /// the TLS handshakes and the cold start.
+    pub conns: view::ConnectionView,
+    /// The multipart part size OpenDAL wrote with and the parts it uploaded (runs that wrote).
+    pub write_path: Option<view::WritePathView>,
     pub warnings: Vec<String>,
     /// The run and its rows: what a range, a filter or a drill-down is recomputed from.
     pub rows: Rows,
@@ -299,9 +297,12 @@ fn verb_row(v: view::VerbView) -> VerbRow {
         verb: v.verb,
         ops_count: v.ops_count,
         ops_per_s: v.ops_per_s,
+        mib_per_s: v.mib_per_s,
         p50_ms: v.p50_ms,
         p99_ms: v.p99_ms,
         error_ratio: v.error_ratio,
+        throttled_ratio: v.throttled_ratio,
+        requests_per_op: v.requests_per_op,
         stages: v
             .stages
             .into_iter()
@@ -323,7 +324,6 @@ fn of_rows(rows: Arc<Run>) -> ProfileModel {
     let r = &run.report;
     let n = view::NumbersView::of(r);
     let time = view::TimeView::of(r, Some(run));
-    let c = &r.connections;
     let timeline = view::TimelineView::of(r);
     let heat = heat(r, run, &timeline);
     ProfileModel {
@@ -365,24 +365,8 @@ fn of_rows(rows: Arc<Run>) -> ProfileModel {
         retry: view::RetryView::of(r),
         bytes: view::BytesView::of(r),
         spread: view::SpreadView::of(r),
-        conns: Conns {
-            dialed: c.dialed,
-            reuse_ratio: c.reuse_pct / 100.0,
-            http1: c.http1_requests,
-            http2: c.http2_requests,
-            tls: [c.tls_version.as_str(), c.alpn.as_str()]
-                .iter()
-                .filter(|s| !s.is_empty())
-                .copied()
-                .collect::<Vec<_>>()
-                .join(" · "),
-            peak_inflight: c.peak_inflight_requests,
-            setup: vec![
-                ("dns", c.dns.p50, c.dns.p99),
-                ("tcp", c.tcp.p50, c.tcp.p99),
-                ("tls", c.tls.p50, c.tls.p99),
-            ],
-        },
+        conns: view::ConnectionView::of(r, Some(run)),
+        write_path: view::WritePathView::of(r),
         warnings: r.warnings.clone(),
         rows: Rows(rows.clone()),
     }
@@ -460,6 +444,8 @@ fn waterfall_of(w: &view::WaterfallOp) -> Waterfall {
                     ("send", r.send_us),
                     ("ttfb", r.ttfb_us),
                     ("body", r.body_us),
+                    // The body waiting for the consumer: client time, not the network's.
+                    ("stall", r.stall_us),
                 ];
                 let mut segs: Vec<Seg> = parts
                     .into_iter()
@@ -478,25 +464,19 @@ fn waterfall_of(w: &view::WaterfallOp) -> Waterfall {
                 } else {
                     r.status.to_string()
                 };
-                let mut signals: Vec<(&'static str, String)> = Vec::new();
-                if let Some(c) = &r.provider_code {
-                    signals.push(("code", c.clone()));
-                }
-                if let Some(ms) = r.retry_after_ms {
-                    signals.push(("retry_after", crate::ui::fmt::dur_ms(ms as f64)));
-                }
-                if let Some(us) = r.rtt_us {
-                    signals.push(("rtt", crate::ui::fmt::dur_us(us as f64)));
-                }
-                if let Some(us) = r.min_rtt_us {
-                    signals.push(("min_rtt", crate::ui::fmt::dur_us(us as f64)));
-                }
-                if let Some(n) = r.retransmits_count.filter(|n| *n > 0) {
-                    signals.push(("retransmits", n.to_string()));
-                }
-                if let Some(t) = &r.server_timing {
-                    signals.push(("server_timing", t.clone()));
-                }
+                let signals: Vec<(&'static str, String)> = r
+                    .signals
+                    .iter()
+                    .map(|s| {
+                        let v = match &s.value {
+                            view::SignalValue::Us(us) => crate::ui::fmt::dur_us(*us as f64),
+                            view::SignalValue::Ms(ms) => crate::ui::fmt::dur_ms(*ms as f64),
+                            view::SignalValue::Count(n) => crate::ui::fmt::count(*n),
+                            view::SignalValue::Text(t) => t.clone(),
+                        };
+                        (s.key, v)
+                    })
+                    .collect();
                 Bar {
                     backoff_us: r.wait_before_us,
                     label: if r.attempt > 1 {
@@ -512,6 +492,7 @@ fn waterfall_of(w: &view::WaterfallOp) -> Waterfall {
                 }
             })
             .collect(),
+        await_tree: w.await_tree.clone(),
     }
 }
 
@@ -916,6 +897,33 @@ mod tests {
         );
         assert_eq!(layer_of("layers.retry.jitter"), Some("layers.retry"));
         assert_eq!(layer_of("layers.retry"), None);
+    }
+
+    #[test]
+    fn a_waterfall_bar_has_a_stall_segment_core_signals_and_the_call_stack() {
+        let mut run = crate::report::fixture::run();
+        run.reqs[2].stall_us = 1_500;
+        run.reqs[2].detail = Some(Box::new(crate::model::ReqDetail {
+            flow_stall_us: Some(7_000),
+            cache_status: Some("miss".into()),
+            ..Default::default()
+        }));
+        run.ops[1].await_tree = Some("read\n  http".into());
+        let m = of_run(&run);
+        let w = m.waterfall(2).unwrap();
+        let b = &w.bars[1];
+        assert!(b.segs.iter().any(|s| s.stage == "stall" && s.us == 1_500));
+        assert!(b.segs.iter().any(|s| s.stage == "body" && s.us == 4_000));
+        assert_eq!(
+            b.signals,
+            vec![
+                ("flow_stall", crate::ui::fmt::dur_us(7_000.0)),
+                ("cache_status", "miss".to_owned())
+            ]
+        );
+        assert_eq!(w.await_tree.as_deref(), Some("read\n  http"));
+        // The connections are core's one model.
+        assert_eq!(m.conns, view::ConnectionView::of(&run.report, Some(&run)));
     }
 
     /// What the app passes to `prove --with` is what its preview shows: core applies the

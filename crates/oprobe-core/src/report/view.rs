@@ -12,9 +12,10 @@
 //! | findings with their remedy | [`FindingView`] |
 //! | key numbers | [`NumbersView`] |
 //! | where the time went (all operations, and the slowest — T4) | [`TimeView`] |
-//! | slowest operations, request by request | [`WaterfallOp`] / [`WaterfallRow`] |
+//! | slowest operations, request by request (with what each request recorded) | [`WaterfallOp`] / [`WaterfallRow`] / [`RequestSignal`] |
 //! | timeline series | [`TimelineView`] |
-//! | connections | [`ConnectionView`] |
+//! | connections: dials, the kernel's TCP view, TLS handshakes, the cold start | [`ConnectionView`] |
+//! | the write path: the part size OpenDAL used, the parts uploaded | [`WritePathView`] |
 //! | operator stack beside each finding's remedy | [`OperatorView`] |
 //! | prove: sizing and A/B pairs | [`ProveView`] |
 //! | several operators side by side | [`CompareView`] |
@@ -292,7 +293,10 @@ pub struct WaterfallRow {
     pub connect_us: u64,
     pub send_us: u64,
     pub ttfb_us: u64,
+    /// The response body transfer, without the consumer's stall (`stall_us`).
     pub body_us: u64,
+    /// The response body waited for the consumer to read it (client time, its own segment).
+    pub stall_us: u64,
     pub total_us: u64,
     pub reused: bool,
     pub bytes_down: u64,
@@ -313,6 +317,130 @@ pub struct WaterfallRow {
     /// The `Server-Timing` header.
     pub server_timing: Option<String>,
     pub request_id: Option<String>,
+    /// What the response and the connection said, in the order a front end lists them
+    /// ([`request_signals`]).
+    pub signals: Vec<RequestSignal>,
+}
+
+/// The value of a [`RequestSignal`]: a front end formats it.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SignalValue {
+    /// A duration in µs.
+    Us(u64),
+    /// A duration in ms.
+    Ms(u64),
+    Count(u64),
+    Text(String),
+}
+
+/// One thing a request row recorded beyond its stage timings: the provider's error code,
+/// `Retry-After`, the connection's round trip and retransmits, `Server-Timing`, the HTTP/2
+/// stream wait, flow-control stall and open streams, the kernel's upload acknowledgement and
+/// buffered send, the CDN cache status and the bucket's region.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RequestSignal {
+    /// Stable key: `code`, `retry_after`, `rtt`, `min_rtt`, `retransmits`, `server_timing`,
+    /// `stream_wait`, `flow_stall`, `streams`, `upload_acked`, `send_buffered`,
+    /// `cache_status`, `region`.
+    pub key: &'static str,
+    pub value: SignalValue,
+}
+
+impl RequestSignal {
+    /// Signals that explain a slow request on their own (shown in the compact terminal
+    /// report); the others (round trip, kernel timings, `Server-Timing`, region) only with
+    /// `--detail`.
+    pub fn explains(&self) -> bool {
+        matches!(
+            self.key,
+            "code" | "retry_after" | "stream_wait" | "flow_stall" | "cache_status"
+        )
+    }
+
+    /// `h2 stream wait 3.1ms`: the signal in the terminal's words.
+    pub fn text(&self) -> String {
+        let label = match self.key {
+            "retry_after" => "retry-after",
+            "min_rtt" => "min rtt",
+            "server_timing" => "server-timing",
+            "stream_wait" => "h2 stream wait",
+            "flow_stall" => "h2 flow stall",
+            "streams" => "h2 streams",
+            "upload_acked" => "upload acked",
+            "send_buffered" => "send buffered",
+            "cache_status" => "cache",
+            k => k,
+        };
+        let value = match &self.value {
+            SignalValue::Us(us) => crate::util::fmt_ms(*us as f64 / 1000.0),
+            SignalValue::Ms(ms) => crate::util::fmt_ms(*ms as f64),
+            SignalValue::Count(n) => n.to_string(),
+            SignalValue::Text(t) => t.clone(),
+        };
+        format!("{label} {value}")
+    }
+}
+
+/// What one request row recorded beyond its stage timings, in a fixed order (only those the
+/// row has; the request id is not one: front ends show it on its own).
+pub fn request_signals(q: &crate::model::ReqRow) -> Vec<RequestSignal> {
+    let d = q.detail.as_deref();
+    let tcp = q.tcp.as_deref();
+    let nonzero = |v: Option<u64>| v.filter(|v| *v > 0);
+    let all: [(&'static str, Option<SignalValue>); 13] = [
+        (
+            "code",
+            d.and_then(|d| d.error_code.clone()).map(SignalValue::Text),
+        ),
+        ("retry_after", q.retry_after_ms.map(SignalValue::Ms)),
+        ("rtt", nonzero(tcp.map(|t| t.rtt_us)).map(SignalValue::Us)),
+        (
+            "min_rtt",
+            nonzero(tcp.map(|t| t.min_rtt_us)).map(SignalValue::Us),
+        ),
+        (
+            "retransmits",
+            nonzero(tcp.map(|t| t.retrans)).map(SignalValue::Count),
+        ),
+        (
+            "server_timing",
+            d.and_then(|d| d.server_timing.clone())
+                .map(SignalValue::Text),
+        ),
+        (
+            "stream_wait",
+            nonzero(d.and_then(|d| d.stream_wait_us)).map(SignalValue::Us),
+        ),
+        (
+            "flow_stall",
+            nonzero(d.and_then(|d| d.flow_stall_us)).map(SignalValue::Us),
+        ),
+        (
+            "streams",
+            d.and_then(|d| d.streams_count)
+                .map(|n| SignalValue::Count(u64::from(n))),
+        ),
+        (
+            "upload_acked",
+            d.and_then(|d| d.upload_acked_us).map(SignalValue::Us),
+        ),
+        (
+            "send_buffered",
+            d.and_then(|d| d.send_buffered_us).map(SignalValue::Us),
+        ),
+        (
+            "cache_status",
+            d.and_then(|d| d.cache_status.clone())
+                .map(SignalValue::Text),
+        ),
+        (
+            "region",
+            d.and_then(|d| d.region.clone()).map(SignalValue::Text),
+        ),
+    ];
+    all.into_iter()
+        .filter_map(|(key, value)| value.map(|value| RequestSignal { key, value }))
+        .collect()
 }
 
 /// One of the slowest operations with its requests.
@@ -328,6 +456,8 @@ pub struct WaterfallOp {
     /// Time sleeping between retries.
     pub backoff_us: u64,
     pub rows: Vec<WaterfallRow>,
+    /// The async call stack captured while the operation was in flight (slow operations).
+    pub await_tree: Option<String>,
 }
 
 /// The slowest operations (at most `n`), request by request.
@@ -375,7 +505,8 @@ pub fn waterfall(run: &Run, op_id: u64) -> Option<WaterfallOp> {
                 connect_us: q.connect_us(),
                 send_us: q.send_us,
                 ttfb_us: q.ttfb_us,
-                body_us: q.body_us + q.stall_us,
+                body_us: q.body_us,
+                stall_us: q.stall_us,
                 total_us: q.total_us,
                 reused: q.reused,
                 bytes_down: q.bytes_down,
@@ -389,6 +520,7 @@ pub fn waterfall(run: &Run, op_id: u64) -> Option<WaterfallOp> {
                 retransmits_count: q.tcp.as_ref().map(|t| t.retrans),
                 server_timing: detail.and_then(|d| d.server_timing.clone()),
                 request_id: q.request_id.clone(),
+                signals: request_signals(q),
             }
         })
         .collect();
@@ -401,6 +533,7 @@ pub fn waterfall(run: &Run, op_id: u64) -> Option<WaterfallOp> {
         ok: o.ok,
         backoff_us: o.breakdown.retry_us,
         rows,
+        await_tree: o.await_tree.clone(),
     })
 }
 
@@ -438,7 +571,10 @@ pub struct TimelineView {
     /// Retries issued in each interval.
     pub retries_count: Vec<u64>,
     pub inflight_peak_count: Vec<u64>,
+    /// Connections dialed in each interval (connection churn behind a latency spike).
     pub new_connections_count: Vec<u64>,
+    /// The client's CPU in percent of one core (350: 3.5 cores busy), where it was sampled.
+    pub cpu_pct: Vec<Option<f64>>,
     /// The verb the series are filtered to ([`TimelineView::for_verb`]); `None`: every verb.
     pub verb: Option<String>,
 }
@@ -478,8 +614,20 @@ impl TimelineView {
             v.retries_count.push(p.retries_count);
             v.inflight_peak_count.push(p.inflight_peak);
             v.new_connections_count.push(p.new_connections);
+            v.cpu_pct.push(p.cpu_pct);
         }
         v
+    }
+
+    /// The client's CPU in cores busy per interval (0 where it was not sampled); `None` when
+    /// no interval sampled it.
+    pub fn cpu_cores(&self) -> Option<Vec<f64>> {
+        self.cpu_pct.iter().any(Option::is_some).then(|| {
+            self.cpu_pct
+                .iter()
+                .map(|c| c.unwrap_or(0.0) / 100.0)
+                .collect()
+        })
     }
 
     pub fn len(&self) -> usize {
@@ -557,6 +705,15 @@ impl TimelineView {
                 );
             }
             sum(&self.new_connections_count, &mut v.new_connections_count);
+            if self.cpu_pct.len() == n {
+                // Averaged over the sampled intervals' time.
+                let (busy, t) = self.cpu_pct[r.clone()]
+                    .iter()
+                    .zip(&self.len_s[r.clone()])
+                    .filter_map(|(c, l)| c.map(|c| (c * l, *l)))
+                    .fold((0.0, 0.0), |a, b| (a.0 + b.0, a.1 + b.1));
+                v.cpu_pct.push((t > 0.0).then(|| busy / t));
+            }
             i = j;
         }
         (v, k)
@@ -670,30 +827,167 @@ fn row_quantile_ms(rows: &[u64], bounds: &[f64], q: f64) -> f64 {
     0.0
 }
 
-/// The connections: protocol, reuse, dials (warmup included, T11) and their phases.
+/// One phase of dialing a connection (`dns`, `tcp`, `proxy` — the proxy's CONNECT —, `tls`),
+/// p50 and p99 over the dials that had it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DialPhase {
+    pub key: &'static str,
+    pub p50_ms: f64,
+    pub p99_ms: f64,
+}
+
+/// The kernel's view of the connections (`TCP_INFO`): whether the network or the server is
+/// the limit.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TcpView {
+    pub rtt_p50_us: u64,
+    pub rtt_p99_us: u64,
+    pub connections_count: u64,
+    /// Connections that retransmitted at least once.
+    pub retransmitting_connections_count: u64,
+    pub retransmits_count: u64,
+    /// Share of the sending time limited by the peer's receive window / the local send buffer.
+    pub rwnd_limited_ratio: f64,
+    pub sndbuf_limited_ratio: f64,
+    /// The kernel's delivery rate estimate, p50 (0: not reported).
+    pub delivery_rate_p50_bits_per_s: u64,
+}
+
+impl TcpView {
+    /// `rtt p50/p99 1.2ms/3.4ms · 2 of 16 connections retransmitted · rwnd-limited 3.0% ·
+    /// sndbuf-limited 0.0% · delivery p50 812 Mbit/s`.
+    pub fn line(&self) -> String {
+        use crate::util::fmt_ms;
+        let mut s = format!(
+            "rtt p50/p99 {}/{} · {} of {} connections retransmitted · rwnd-limited {:.1}% · sndbuf-limited {:.1}%",
+            fmt_ms(self.rtt_p50_us as f64 / 1000.0),
+            fmt_ms(self.rtt_p99_us as f64 / 1000.0),
+            self.retransmitting_connections_count,
+            self.connections_count,
+            self.rwnd_limited_ratio * 100.0,
+            self.sndbuf_limited_ratio * 100.0,
+        );
+        if self.delivery_rate_p50_bits_per_s > 0 {
+            s += &format!(
+                " · delivery p50 {}",
+                fmt_bits(self.delivery_rate_p50_bits_per_s)
+            );
+        }
+        s
+    }
+}
+
+/// `812 Mbit/s`.
+pub fn fmt_bits(bps: u64) -> String {
+    let b = bps as f64;
+    if b >= 1e9 {
+        format!("{:.1} Gbit/s", b / 1e9)
+    } else if b >= 1e6 {
+        format!("{:.0} Mbit/s", b / 1e6)
+    } else if b >= 1e3 {
+        format!("{:.0} kbit/s", b / 1e3)
+    } else {
+        format!("{b:.0} bit/s")
+    }
+}
+
+/// The TLS handshakes of the window.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TlsView {
+    pub handshakes_count: u64,
+    pub resumption_ratio: f64,
+    /// Handshakes that needed a HelloRetryRequest (an extra round trip).
+    pub hrr_count: u64,
+}
+
+impl TlsView {
+    /// `16 handshakes · 0.0% resumed · 0 HelloRetryRequest`.
+    pub fn line(&self) -> String {
+        format!(
+            "{} handshakes · {:.1}% resumed · {} HelloRetryRequest",
+            self.handshakes_count,
+            self.resumption_ratio * 100.0,
+            self.hrr_count
+        )
+    }
+}
+
+/// The run's cold start: the connections dialed at the start of the warmup and the operations
+/// that waited for them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ColdStartView {
+    pub connections_count: u64,
+    pub connect_p50_ms: f64,
+    pub connect_p99_ms: f64,
+    pub first_ops_p50_ms: f64,
+    pub first_ops_p99_ms: f64,
+}
+
+impl ColdStartView {
+    /// `16 connections · connect p50/p99 2.1ms/9.0ms · first operations p50/p99 …`.
+    pub fn line(&self) -> String {
+        use crate::util::fmt_ms;
+        format!(
+            "{} connections · connect p50/p99 {}/{} · first operations p50/p99 {}/{}",
+            self.connections_count,
+            fmt_ms(self.connect_p50_ms),
+            fmt_ms(self.connect_p99_ms),
+            fmt_ms(self.first_ops_p50_ms),
+            fmt_ms(self.first_ops_p99_ms),
+        )
+    }
+}
+
+/// The connections: protocol, reuse, dials (warmup included, T11) and their phases, and what
+/// tells the network from the server as the limit — the kernel's TCP statistics, the TLS
+/// handshakes and the cold start. The one model of the Connections section of every front end.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ConnectionView {
     /// `http/1.1 · plain`, `h2 · TLSv1.3 · …`.
     pub protocol: String,
+    /// `TLSv1.3 · h2` (empty for plain connections).
+    pub tls: String,
     pub requests_count: u64,
+    pub http1_requests_count: u64,
+    pub http2_requests_count: u64,
     /// New connections in the window.
     pub dialed_count: u64,
+    pub dial_failures_count: u64,
     /// New connections during the warmup (from the kept rows).
     pub warmup_dialed_count: u64,
     pub reuse_ratio: f64,
     pub peak_inflight_count: u64,
+    /// The proxy the connections went through.
+    pub proxy: Option<String>,
     /// `dns 1.2ms/3.4ms · tcp …` (p50/p99).
     pub phases: String,
+    /// The dial phases that took time, proxy CONNECT included.
+    pub dial: Vec<DialPhase>,
+    pub tcp: Option<TcpView>,
+    pub tls_handshakes: Option<TlsView>,
+    pub cold_start: Option<ColdStartView>,
     pub remotes_count: u64,
+    /// `ip:port` the requests went to.
+    pub remote_addrs: Vec<String>,
 }
 
 impl ConnectionView {
     pub fn of(r: &Report, run: Option<&Run>) -> Self {
         let c = &r.connections;
+        let n = &r.network;
         Self {
             protocol: super::connection_protocol(c),
+            tls: [c.tls_version.as_str(), c.alpn.as_str()]
+                .iter()
+                .filter(|s| !s.is_empty())
+                .copied()
+                .collect::<Vec<_>>()
+                .join(" · "),
             requests_count: c.requests,
+            http1_requests_count: c.http1_requests,
+            http2_requests_count: c.http2_requests,
             dialed_count: c.dialed,
+            dial_failures_count: c.dial_failures,
             warmup_dialed_count: run.map_or(0, |run| {
                 run.reqs
                     .iter()
@@ -702,9 +996,150 @@ impl ConnectionView {
             }),
             reuse_ratio: c.reuse_pct / 100.0,
             peak_inflight_count: c.peak_inflight_requests,
+            proxy: c.proxy.clone(),
             phases: super::dial_phases(c),
-            remotes_count: r.network.remotes.len() as u64,
+            dial: [
+                ("dns", &c.dns),
+                ("tcp", &c.tcp),
+                ("proxy", &c.proxy_connect),
+                ("tls", &c.tls),
+            ]
+            .into_iter()
+            .filter(|(_, q)| q.count > 0 && q.p99 > 0.0)
+            .map(|(key, q)| DialPhase {
+                key,
+                p50_ms: q.p50,
+                p99_ms: q.p99,
+            })
+            .collect(),
+            tcp: n
+                .tcp
+                .kernel
+                .as_ref()
+                .filter(|k| k.samples_count > 0)
+                .map(|k| TcpView {
+                    rtt_p50_us: k.rtt_p50_us,
+                    rtt_p99_us: k.rtt_p99_us,
+                    connections_count: k.connections_count,
+                    retransmitting_connections_count: k.retransmitting_connections_count,
+                    retransmits_count: k.retrans_count,
+                    rwnd_limited_ratio: k.rwnd_limited_ratio,
+                    sndbuf_limited_ratio: k.sndbuf_limited_ratio,
+                    delivery_rate_p50_bits_per_s: k.delivery_rate_p50_bits_per_s,
+                }),
+            tls_handshakes: (n.tls.handshakes.handshakes_count > 0).then_some(TlsView {
+                handshakes_count: n.tls.handshakes.handshakes_count,
+                resumption_ratio: n.tls.handshakes.resumption_ratio,
+                hrr_count: n.tls.handshakes.hrr_count,
+            }),
+            cold_start: c
+                .cold_start
+                .as_ref()
+                .filter(|s| s.connections_count > 0)
+                .map(|s| ColdStartView {
+                    connections_count: s.connections_count,
+                    connect_p50_ms: s.connect.p50,
+                    connect_p99_ms: s.connect.p99,
+                    first_ops_p50_ms: s.first_ops.p50,
+                    first_ops_p99_ms: s.first_ops.p99,
+                }),
+            remotes_count: n.remotes.len() as u64,
+            remote_addrs: c.remote_addrs.clone(),
         }
+    }
+
+    /// The run went over the network (not an in-process backend).
+    pub fn networked(&self) -> bool {
+        self.requests_count > 0 && self.http1_requests_count + self.http2_requests_count > 0
+    }
+}
+
+/// How OpenDAL wrote: the multipart part size it used (the requested `write.chunk` clamped to
+/// the service's part-size limits) and the parts it uploaded — the knobs `prove` sizes for
+/// `slow_multipart`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WritePathView {
+    /// `write.chunk` as requested (0: not set).
+    pub requested_chunk_bytes: u64,
+    /// The part size OpenDAL wrote with.
+    pub write_chunk_bytes: u64,
+    pub service_min_part_bytes: Option<u64>,
+    pub service_max_part_bytes: Option<u64>,
+    /// OpenDAL changed the requested chunk to fit the service's limits.
+    pub clamped: bool,
+    /// Multipart parts uploaded, and their mean size.
+    pub parts_count: u64,
+    pub part_mean_bytes: Option<u64>,
+}
+
+impl WritePathView {
+    /// `None` when the run wrote nothing and recorded no write knobs.
+    pub fn of(r: &Report) -> Option<Self> {
+        let e = &r.effective_write;
+        let parts: Vec<&crate::trace::ApiStats> = r
+            .apis
+            .iter()
+            .filter(|a| a.api.label() == "UploadPart" && a.count > 0)
+            .collect();
+        let parts_count: u64 = parts.iter().map(|a| a.count).sum();
+        let up: u64 = parts.iter().map(|a| a.bytes_up).sum();
+        if r.bytes.logical_write == 0 && parts_count == 0 {
+            return None;
+        }
+        if e.write_chunk_size == 0 && e.requested_chunk_size == 0 && parts_count == 0 {
+            return None;
+        }
+        Some(Self {
+            requested_chunk_bytes: e.requested_chunk_size,
+            write_chunk_bytes: e.write_chunk_size,
+            service_min_part_bytes: e.service_min_part_size,
+            service_max_part_bytes: e.service_max_part_size,
+            clamped: e.write_chunk_clamped(),
+            parts_count,
+            part_mean_bytes: (parts_count > 0).then(|| up / parts_count),
+        })
+    }
+
+    /// `part size 8 MiB (asked 4 MiB; the service takes 5 MiB–5 GiB) · 12 parts of 8 MiB on
+    /// average`.
+    pub fn line(&self) -> String {
+        use crate::util::fmt_bytes;
+        let mut s = String::new();
+        if self.write_chunk_bytes > 0 {
+            s += &format!("part size {}", fmt_bytes(self.write_chunk_bytes));
+            let mut why = Vec::new();
+            if self.clamped {
+                why.push(format!("asked {}", fmt_bytes(self.requested_chunk_bytes)));
+            }
+            match (self.service_min_part_bytes, self.service_max_part_bytes) {
+                (Some(a), Some(b)) => why.push(format!(
+                    "the service takes {}–{}",
+                    fmt_bytes(a),
+                    fmt_bytes(b)
+                )),
+                (Some(a), None) => why.push(format!("the service takes ≥ {}", fmt_bytes(a))),
+                (None, Some(b)) => why.push(format!("the service takes ≤ {}", fmt_bytes(b))),
+                (None, None) => {}
+            }
+            if !why.is_empty() {
+                s += &format!(" ({})", why.join("; "));
+            }
+        }
+        match self.part_mean_bytes {
+            Some(m) => {
+                if !s.is_empty() {
+                    s += " · ";
+                }
+                s += &format!("{} parts of {} on average", self.parts_count, fmt_bytes(m));
+            }
+            None => {
+                if !s.is_empty() {
+                    s += " · ";
+                }
+                s += "no multipart parts";
+            }
+        }
+        s
     }
 }
 
@@ -814,6 +1249,8 @@ pub struct ProfileView {
     pub timeline: TimelineView,
     pub connections: ConnectionView,
     pub operator: OperatorView,
+    pub retry: RetryView,
+    pub write_path: Option<WritePathView>,
 }
 
 impl ProfileView {
@@ -829,6 +1266,8 @@ impl ProfileView {
             timeline: TimelineView::of(r),
             connections: ConnectionView::of(r, run),
             operator: OperatorView::of(r),
+            retry: RetryView::of(r),
+            write_path: WritePathView::of(r),
         }
     }
 }
@@ -1242,9 +1681,12 @@ pub struct VerbView {
     pub verb: String,
     pub ops_count: u64,
     pub ops_per_s: f64,
+    /// Logical bytes read and written per second.
+    pub mib_per_s: f64,
     pub p50_ms: f64,
     pub p99_ms: f64,
     pub error_ratio: f64,
+    /// Share of the verb's operations that saw a throttled response.
     pub throttled_ratio: f64,
     pub requests_per_op: f64,
     /// Shares of the verb's operation time: `queue`, `cache`, `server` (the backend),
@@ -1285,6 +1727,7 @@ pub fn verbs(r: &Report) -> Vec<VerbView> {
                 verb: v.verb.clone(),
                 ops_count: v.count,
                 ops_per_s: v.ops_per_s,
+                mib_per_s: v.mib_per_s,
                 p50_ms: v.latency.p50,
                 p99_ms: v.latency.p99,
                 error_ratio: v.errors as f64 / n,
@@ -1576,6 +2019,59 @@ impl RetryView {
         }
     }
 
+    /// The resilience in one line, as the app's Retries section reads it: `12 retries ·
+    /// 1.4s waiting · 429 ×10 · 503 ×2 · errors 5xx 2 / 4xx 0 / network 0 · 1 failed op ·
+    /// classes: throttled ×10, timeout ×2`.
+    pub fn line(&self) -> String {
+        if self.quiet()
+            && self.server_errors_count + self.client_errors_count + self.network_errors_count == 0
+        {
+            return "no retries, no failed operations".to_owned();
+        }
+        let mut s = format!(
+            "{} {} · {} waiting · 429 ×{} · 503 ×{}",
+            self.retries_count,
+            if self.retries_count == 1 {
+                "retry"
+            } else {
+                "retries"
+            },
+            crate::util::fmt_ms(self.backoff_ms),
+            self.status_429_count,
+            self.status_503_count,
+        );
+        if self.max_retry_after_ms > 0 {
+            s += &format!(
+                " (Retry-After up to {})",
+                crate::util::fmt_ms(self.max_retry_after_ms as f64)
+            );
+        }
+        s += &format!(
+            " · errors 5xx {} / 4xx {} / network {} · {} failed {}",
+            self.server_errors_count,
+            self.client_errors_count,
+            self.network_errors_count,
+            self.failed_ops_count,
+            if self.failed_ops_count == 1 {
+                "op"
+            } else {
+                "ops"
+            },
+        );
+        if !self.classes.is_empty() {
+            s += &format!(
+                " · classes: {}",
+                self.classes
+                    .iter()
+                    .take(3)
+                    .map(|(c, n)| format!("{c} ×{n}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        s
+    }
+
     /// Nothing was retried and nothing failed.
     pub fn quiet(&self) -> bool {
         self.retries_count == 0
@@ -1646,6 +2142,8 @@ pub struct SpreadView {
     pub hot_keys: Vec<Slice>,
     pub sizes: Vec<Slice>,
     pub prefixes: Vec<Slice>,
+    /// `cold` (first read of a key) and `warm` (repeat reads).
+    pub cold_warm: Vec<Slice>,
     pub remotes: Vec<Slice>,
 }
 
@@ -1681,6 +2179,7 @@ impl SpreadView {
                 .collect(),
             sizes: d.size_buckets.iter().take(Self::TOP).map(slice).collect(),
             prefixes: d.prefixes.iter().take(Self::TOP).map(slice).collect(),
+            cold_warm: d.cold_warm.iter().take(Self::TOP).map(slice).collect(),
             remotes: r
                 .network
                 .remotes
@@ -1706,6 +2205,7 @@ impl SpreadView {
         self.hot_keys.is_empty()
             && self.sizes.is_empty()
             && self.prefixes.is_empty()
+            && self.cold_warm.is_empty()
             && self.remotes.is_empty()
     }
 }
@@ -2005,6 +2505,204 @@ mod tests {
             assert!(crate::analysis::catalog::get(code).is_some(), "{code}");
         }
         assert_eq!(EvidenceChart::of("cold_connections"), None);
+    }
+
+    #[test]
+    fn a_waterfall_gives_the_stall_its_own_segment_and_lists_the_request_signals() {
+        let mut run = crate::report::fixture::run();
+        let q = &mut run.reqs[2];
+        q.stall_us = 1_500;
+        q.detail = Some(Box::new(crate::model::ReqDetail {
+            stream_wait_us: Some(2_000),
+            flow_stall_us: Some(7_000),
+            streams_count: Some(100),
+            upload_acked_us: Some(900),
+            send_buffered_us: Some(40),
+            cache_status: Some("miss".into()),
+            region: Some("eu-west-1".into()),
+            error_code: Some("SlowDown".into()),
+            ..Default::default()
+        }));
+        run.ops[1].await_tree = Some("read\n  http".into());
+        let w = waterfall(&run, 2).unwrap();
+        let r = &w.rows[1];
+        // The stall is not in the body any more.
+        assert_eq!((r.body_us, r.stall_us), (4_000, 1_500));
+        let keys: Vec<&str> = r.signals.iter().map(|s| s.key).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "code",
+                "stream_wait",
+                "flow_stall",
+                "streams",
+                "upload_acked",
+                "send_buffered",
+                "cache_status",
+                "region"
+            ]
+        );
+        assert_eq!(r.signals[2].value, SignalValue::Us(7_000));
+        assert_eq!(r.signals[2].text(), "h2 flow stall 7.00ms");
+        assert!(r.signals[2].explains());
+        assert!(!r.signals[7].explains(), "the region is a detail");
+        assert_eq!(w.await_tree.as_deref(), Some("read\n  http"));
+        // A plain request says nothing beyond its stages.
+        assert!(w.rows[0].signals.is_empty());
+    }
+
+    #[test]
+    fn the_connection_view_tells_the_network_from_the_server() {
+        let mut r = crate::report::fixture::report();
+        let c = &mut r.connections;
+        c.requests = 100;
+        c.http1_requests = 100;
+        c.dialed = 16;
+        c.proxy_connect = crate::trace::Quantiles {
+            count: 16,
+            p50: 1.0,
+            p99: 4.0,
+            ..Default::default()
+        };
+        c.cold_start = Some(crate::trace::ColdStartStats {
+            connections_count: 16,
+            connect: crate::trace::Quantiles {
+                count: 16,
+                p50: 2.0,
+                p99: 9.0,
+                ..Default::default()
+            },
+            first_ops: crate::trace::Quantiles {
+                count: 16,
+                p50: 20.0,
+                p99: 40.0,
+                ..Default::default()
+            },
+        });
+        r.network.tcp.kernel = Some(crate::net::stats::TcpKernelStats {
+            samples_count: 100,
+            connections_count: 16,
+            rtt_p50_us: 1_200,
+            rtt_p99_us: 3_400,
+            retransmitting_connections_count: 2,
+            retrans_count: 5,
+            rwnd_limited_ratio: 0.03,
+            delivery_rate_p50_bits_per_s: 812_000_000,
+            ..Default::default()
+        });
+        r.network.tls.handshakes.handshakes_count = 16;
+        r.network.tls.handshakes.resumption_ratio = 0.25;
+        r.network.tls.handshakes.hrr_count = 1;
+        let v = ConnectionView::of(&r, None);
+        assert!(v.networked());
+        assert_eq!(v.dial.len(), 1);
+        assert_eq!(v.dial[0].key, "proxy");
+        let tcp = v.tcp.as_ref().unwrap();
+        assert_eq!(
+            tcp.line(),
+            "rtt p50/p99 1.20ms/3.40ms · 2 of 16 connections retransmitted · rwnd-limited 3.0% · sndbuf-limited 0.0% · delivery p50 812 Mbit/s"
+        );
+        assert_eq!(
+            v.tls_handshakes.as_ref().unwrap().line(),
+            "16 handshakes · 25.0% resumed · 1 HelloRetryRequest"
+        );
+        let cold = v.cold_start.as_ref().unwrap();
+        assert_eq!((cold.connections_count, cold.first_ops_p99_ms), (16, 40.0));
+        // Nothing recorded: nothing to say.
+        let quiet = ConnectionView::of(&crate::report::fixture::report(), None);
+        assert!(
+            quiet.tcp.is_none() && quiet.tls_handshakes.is_none() && quiet.cold_start.is_none()
+        );
+        assert!(!quiet.networked());
+    }
+
+    #[test]
+    fn the_write_path_says_the_part_size_and_why() {
+        let mut r = crate::report::fixture::report();
+        assert_eq!(WritePathView::of(&r), None, "a run that wrote nothing");
+        r.bytes.logical_write = 96 << 20;
+        r.effective_write = crate::trace::EffectiveKnobs {
+            requested_chunk_size: 4 << 20,
+            write_chunk_size: 5 << 20,
+            service_min_part_size: Some(5 << 20),
+            service_max_part_size: Some(5 << 30),
+        };
+        r.apis = vec![crate::trace::ApiStats {
+            api: crate::trace::Api::UploadPart,
+            count: 12,
+            bytes_up: 12 * (5 << 20),
+            ..Default::default()
+        }];
+        let w = WritePathView::of(&r).unwrap();
+        assert!(w.clamped);
+        assert_eq!((w.parts_count, w.part_mean_bytes), (12, Some(5 << 20)));
+        let l = w.line();
+        assert!(
+            l.starts_with("part size 5.0 MiB (asked 4.0 MiB; the service takes 5.0 MiB–5.00 GiB)"),
+            "{l}"
+        );
+        assert!(l.ends_with("12 parts of 5.0 MiB on average"), "{l}");
+    }
+
+    #[test]
+    fn the_resilience_line_reads_like_the_retries_section() {
+        let mut r = crate::report::fixture::report();
+        r.resilience = Default::default();
+        assert_eq!(RetryView::of(&r).line(), "no retries, no failed operations");
+        r.resilience.retries = 12;
+        r.resilience.retry_backoff_ms = 1400.0;
+        r.resilience.status_429 = 10;
+        r.resilience.status_503 = 2;
+        r.resilience.server_errors = 2;
+        r.resilience.failed_ops = 1;
+        r.resilience.error_classes = [("throttled".to_owned(), 10), ("timeout".to_owned(), 2)]
+            .into_iter()
+            .collect();
+        let l = RetryView::of(&r).line();
+        for s in [
+            "12 retries",
+            "429 ×10",
+            "503 ×2",
+            "errors 5xx 2 / 4xx 0 / network 0",
+            "1 failed op",
+            "classes: throttled ×10, timeout ×2",
+        ] {
+            assert!(l.contains(s), "{s}: {l}");
+        }
+    }
+
+    #[test]
+    fn cpu_is_averaged_over_the_sampled_time_when_downsampled() {
+        let t = TimelineView {
+            t_s: vec![0.0, 1.0, 2.0, 3.0],
+            len_s: vec![1.0; 4],
+            cpu_pct: vec![Some(100.0), Some(300.0), None, Some(50.0)],
+            ..Default::default()
+        };
+        assert_eq!(t.cpu_cores(), Some(vec![1.0, 3.0, 0.0, 0.5]));
+        let (d, k) = t.downsample(2);
+        assert_eq!(k, 2);
+        assert_eq!(d.cpu_pct, vec![Some(200.0), Some(50.0)]);
+        assert_eq!(TimelineView::default().cpu_cores(), None);
+        let r = crate::report::fixture::report();
+        let mut r2 = r.clone();
+        r2.timeline[0].cpu_pct = Some(120.0);
+        assert_eq!(TimelineView::of(&r2).cpu_pct[0], Some(120.0));
+    }
+
+    #[test]
+    fn the_spread_has_cold_and_warm_reads() {
+        let mut r = crate::report::fixture::report();
+        r.dimensions.cold_warm = vec![crate::model::DimensionSlice {
+            key: "cold".into(),
+            requests_count: 10,
+            error_ratio: 0.1,
+            ..Default::default()
+        }];
+        let s = SpreadView::of(&r);
+        assert_eq!(s.cold_warm[0].key, "cold");
+        assert_eq!(s.cold_warm[0].error_ratio, Some(0.1));
+        assert!(!s.is_empty());
     }
 
     #[test]

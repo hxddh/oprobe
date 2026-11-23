@@ -757,3 +757,43 @@ fn findings_apis_and_the_verb_filter_drill_down() {
     wait_long(&mut app, "id:cell-drill");
     wait_long(&mut app, "text:/^Slowest operations at /");
 }
+
+#[test]
+fn the_profile_shows_every_captured_signal_where_it_explains_something() {
+    let cx = Ctx::new();
+    let id = seed_long(&cx, "lab://stragglers");
+    // The slowest operation as it reads when its async call stack was captured in flight.
+    let shown = App::new(cx.paths())
+        .show(oprobe::app::RunRef::from(id.as_str()))
+        .unwrap();
+    let mut run = *shown.full.unwrap();
+    let slowest = run.report.slowest[0];
+    run.ops
+        .iter_mut()
+        .find(|o| o.op_id == slowest)
+        .unwrap()
+        .await_tree = Some("read.full [400ms]\n  GetObject [400ms]".into());
+    oprobe::store::runs::write_run_file(std::path::Path::new(&shown.path), &run).unwrap();
+    cx.launch(Some(id.clone()));
+    let mut app = cx.start();
+    choose(&mut app, "English");
+    wait_long(&mut app, "id:chart-inflight");
+    // In flight with the connections dialed per interval and, faint, the client's CPU.
+    wait_long(&mut app, "id:timeline >> text:new connections");
+    wait_long(&mut app, "id:timeline >> text:client CPU (cores)");
+    // The same statistics as `oprobe show` in the API table.
+    wait_long(&mut app, "id:requests >> text:Total p50 / p99");
+    // Each verb with its rates.
+    wait_long(&mut app, "id:verbs >> text:/MiB\\/s · .* req\\/op$/");
+    // The consumer's stall is its own segment of the waterfall.
+    wait_long(&mut app, "id:slowest >> text:stall");
+    // Connections: one model with the CLI's, the kernel's view where the kernel gives it.
+    wait_long(&mut app, "id:connections");
+    #[cfg(target_os = "linux")]
+    wait_long(&mut app, "id:conn-tcp");
+    // A slow operation's async call stack opens under its waterfall on demand.
+    wait_long(&mut app, "id:slowest >> id:await-tree-toggle");
+    assert!(!has(&app, "id:await-tree-body"));
+    app.press("id:slowest >> id:await-tree-toggle").unwrap();
+    wait_long(&mut app, "id:await-tree-body");
+}
