@@ -89,7 +89,12 @@ pub struct Guard {
     requests: AtomicU64,
     bytes: AtomicU64,
     breach: Mutex<Option<BudgetBreach>>,
+    /// A budget is spent: the armed measurement was cancelled (no further work starts).
     tripped: std::sync::atomic::AtomicBool,
+    /// A budget was exceeded (more than its limit was used).
+    exceeded: std::sync::atomic::AtomicBool,
+    /// A spent budget stopped work that was still to be done ([`Guard::note_cut_short`]).
+    cut_short: std::sync::atomic::AtomicBool,
     /// The measurement currently enforced (re-armed by each session sharing this guard).
     cancel: Mutex<Option<Cancel>>,
 }
@@ -109,6 +114,8 @@ impl Guard {
             bytes: AtomicU64::new(0),
             breach: Mutex::new(None),
             tripped: std::sync::atomic::AtomicBool::new(false),
+            exceeded: std::sync::atomic::AtomicBool::new(false),
+            cut_short: std::sync::atomic::AtomicBool::new(false),
             cancel: Mutex::new(None),
         })
     }
@@ -129,6 +136,8 @@ impl Guard {
 
     /// Account requests and bytes (hot path: two atomic adds and a few compares). A budget
     /// stops the run when it is spent: `--max-requests 500` allows 500 requests, not 501.
+    /// Spending it exactly is not a breach by itself: only exceeding it, or work it stopped
+    /// ([`Guard::note_cut_short`]), is.
     #[inline]
     pub fn add(&self, requests: u64, bytes: u64) {
         let r = self.requests.fetch_add(requests, Ordering::Relaxed) + requests;
@@ -136,12 +145,12 @@ impl Guard {
         if let Some(max) = self.budgets.max_requests_count
             && r >= max
         {
-            self.trip("requests", max as f64, r as f64);
+            self.trip("requests", max as f64, r as f64, r > max);
         }
         if let Some(max) = self.budgets.max_bytes
             && b >= max
         {
-            self.trip("bytes", max as f64, b as f64);
+            self.trip("bytes", max as f64, b as f64, b > max);
         }
         self.tick();
     }
@@ -152,12 +161,15 @@ impl Guard {
         if let Some(max) = self.budgets.max_duration_s {
             let s = self.started.elapsed().as_secs_f64();
             if s > max {
-                self.trip("duration", max, s);
+                self.trip("duration", max, s, true);
             }
         }
     }
 
-    fn trip(&self, budget: &str, limit: f64, observed: f64) {
+    fn trip(&self, budget: &str, limit: f64, observed: f64, exceeded: bool) {
+        if exceeded {
+            self.exceeded.store(true, Ordering::Release);
+        }
         if self.tripped.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -176,15 +188,36 @@ impl Guard {
         }
     }
 
+    /// A budget is spent: the armed measurement was cancelled.
     pub fn tripped(&self) -> bool {
         self.tripped.load(Ordering::Acquire)
     }
 
+    /// Work that was still to be done was stopped (the cancellation cut a measurement short,
+    /// or another measurement wants to start): a spent budget is then breached.
+    pub fn note_cut_short(&self) {
+        self.cut_short.store(true, Ordering::Release);
+    }
+
+    /// The breach of a spent budget that was exceeded or stopped work; `None` while no budget
+    /// is spent, and for a budget spent exactly by work that was done anyway.
     pub fn breach(&self) -> Option<BudgetBreach> {
+        if !self.exceeded.load(Ordering::Acquire) && !self.cut_short.load(Ordering::Acquire) {
+            return None;
+        }
         self.breach
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+
+    /// A measurement wants to start: the breach that refuses it when a budget is spent.
+    pub fn demand(&self) -> Option<BudgetBreach> {
+        self.tick();
+        if self.tripped() {
+            self.note_cut_short();
+        }
+        self.breach()
     }
 
     /// Requests and bytes accounted so far.
@@ -577,10 +610,30 @@ mod sec_tests {
         g.add(1, 0);
         assert!(g.tripped());
         assert!(c.is_cancelled());
+        // Spent exactly, by work that was done anyway: not a breach (yet).
+        assert!(g.breach().is_none());
+        // A request past the limit (one in flight when it tripped) is.
+        g.add(1, 0);
         let b = g.breach().unwrap();
         assert_eq!(b.budget, "requests");
         g.add(100, 0);
         assert_eq!(g.breach().unwrap().observed, 10.0);
+        // Work stopped by a spent budget is a breach even at the limit.
+        let g = Guard::new(Budgets {
+            max_requests_count: Some(10),
+            ..Default::default()
+        });
+        g.add(10, 0);
+        assert!(g.tripped() && g.breach().is_none());
+        g.note_cut_short();
+        assert_eq!(g.breach().unwrap().observed, 10.0);
+        // As is a measurement that wants to start once it is spent.
+        let g = Guard::new(Budgets {
+            max_requests_count: Some(10),
+            ..Default::default()
+        });
+        g.add(10, 0);
+        assert!(g.demand().is_some());
         assert_eq!(b.message(), "request budget spent: 10 requests (limit 10)");
         let e = b.to_error();
         assert_eq!(
