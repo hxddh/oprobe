@@ -127,6 +127,32 @@ async fn a_snapshot_saves_without_rows() {
     assert_eq!(doc["snapshot"]["apis"][0]["api"], "PutObject");
 }
 
+/// Hourly files are hourly profiles: `save_and_reset` starts a fresh window.
+#[tokio::test]
+async fn save_and_reset_starts_a_fresh_window() {
+    let (layer, handle) = oprobe_trace::layer(oprobe_trace::Config::default());
+    let op = Operator::new(Memory::default()).unwrap().layer(layer);
+    op.write("a", "x").await.unwrap();
+    for _ in 0..3 {
+        op.stat("a").await.unwrap();
+    }
+    let path = temp_file("hour1");
+    handle.save_and_reset(&path).unwrap();
+    let doc = read_json(&path);
+    assert_eq!(doc["snapshot"]["summary"]["ops_count"], 4);
+    // The next window holds only what happened since.
+    op.stat("a").await.unwrap();
+    let snap = handle.snapshot();
+    assert_eq!(snap.summary.ops, 1);
+    let requests: u64 = snap.apis.iter().map(|a| a.count).sum();
+    assert_eq!(requests, 1);
+    let path = temp_file("hour2");
+    handle.save_and_reset(&path).unwrap();
+    let doc = read_json(&path);
+    assert_eq!(doc["snapshot"]["summary"]["ops_count"], 1);
+    assert_eq!(doc["rows"]["ops"].as_array().unwrap().len(), 1);
+}
+
 struct Count(std::sync::atomic::AtomicU64);
 
 impl oprobe_trace::Exporter for Count {

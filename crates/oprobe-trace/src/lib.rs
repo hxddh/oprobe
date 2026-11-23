@@ -339,6 +339,23 @@ impl Handle {
         file::write(path.as_ref(), self.service.get(), &snapshot, Some(&rows))
     }
 
+    /// [`Handle::save`], then start a fresh window: the aggregates start again from zero, so
+    /// each file profiles only its own period (hourly files are hourly profiles). The reset is
+    /// atomic with the snapshot: nothing recorded in between is lost.
+    ///
+    /// ```no_run
+    /// # fn demo(handle: oprobe_trace::Handle) -> std::io::Result<()> {
+    /// // Once an hour:
+    /// handle.save_and_reset("prod-1400.oprobe")?;
+    /// # Ok(()) }
+    /// ```
+    pub fn save_and_reset(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
+        self.linker.flush(&self.recorder);
+        let snapshot = self.recorder.snapshot_and_reset();
+        let rows = self.recorder.take_trace();
+        file::write(path.as_ref(), self.service.get(), &snapshot, Some(&rows))
+    }
+
     /// Why HTTP requests are not instrumented (the transport could not be built, for example
     /// an invalid proxy URL); only in-process services are observed then.
     pub fn transport_error(&self) -> Option<&str> {

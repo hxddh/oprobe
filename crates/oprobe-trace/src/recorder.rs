@@ -7,11 +7,11 @@ use std::time::Instant;
 
 use hdrhistogram::Histogram;
 
-use crate::util::FxHashMap as HashMap;
 use crate::log::{TraceLog, TraceRows, attempts, op_row, req_row};
 use crate::record::{Api, Protocol, RequestRecord};
 use crate::scope::OpScopeData;
 use crate::snapshot::*;
+use crate::util::FxHashMap as HashMap;
 
 const HIST_MAX_US: u64 = 3_600_000_000;
 const SLOW_OPS_KEPT: usize = 8;
@@ -209,6 +209,11 @@ fn fold_end_sliver(mut t: Vec<TimelinePoint>, elapsed_s: f64) -> Vec<TimelinePoi
     t
 }
 
+/// Intervals a timeline keeps at most (design v7 P2): beyond it the oldest closed intervals
+/// are merged in pairs, so a recorder embedded in a long-lived process stays bounded (a month of
+/// 10-second intervals would be 259 200) and its file opens quickly.
+const MAX_INTERVALS: usize = 2000;
+
 /// Start and length (s) of interval `idx`.
 fn bucket_span(idx: usize) -> (f64, f64) {
     if idx < FINE_INTERVALS {
@@ -218,6 +223,65 @@ fn bucket_span(idx: usize) -> (f64, f64) {
             (FINE_INTERVALS + (idx - FINE_INTERVALS) * COARSE_S) as f64,
             COARSE_S as f64,
         )
+    }
+}
+
+/// A closed interval moved out of the live timeline (it may span several intervals once merged).
+struct Archived {
+    t_s: f64,
+    len_s: f64,
+    b: Bucket,
+}
+
+impl Archived {
+    /// Two adjacent closed intervals as one. Counts add up; the quantiles of the merged
+    /// interval are the operation-weighted means of the two (the maximum is exact): an
+    /// approximation, for intervals old enough to be merged.
+    fn merge(self, next: Archived) -> Archived {
+        let (mut x, y) = (self.b, next.b);
+        let (wx, wy) = (x.ops as f64, y.ops as f64);
+        for i in 0..4 {
+            x.q_us[i] = if wx + wy > 0.0 {
+                ((x.q_us[i] as f64 * wx + y.q_us[i] as f64 * wy) / (wx + wy)) as u64
+            } else {
+                x.q_us[i].max(y.q_us[i])
+            };
+        }
+        x.q_us[4] = x.q_us[4].max(y.q_us[4]);
+        x.ops += y.ops;
+        x.ok_ops += y.ok_ops;
+        x.bytes += y.bytes;
+        x.errors += y.errors;
+        x.throttled += y.throttled;
+        x.throttled_ops += y.throttled_ops;
+        x.requests += y.requests;
+        x.retries += y.retries;
+        x.missed += y.missed;
+        x.dials += y.dials;
+        x.inflight_peak = x.inflight_peak.max(y.inflight_peak);
+        x.cpu_pct = match (x.cpu_pct, y.cpu_pct) {
+            (Some(a), Some(b)) => Some((a + b) / 2.0),
+            (a, b) => a.or(b),
+        };
+        for (h, k) in x.heat.iter_mut().zip(y.heat) {
+            *h += k;
+        }
+        for v in y.verbs {
+            let w = x.verb(v.verb);
+            w.ops += v.ops;
+            w.ok += v.ok;
+            w.errors += v.errors;
+            w.throttled += v.throttled;
+            w.latency_us += v.latency_us;
+            for (h, k) in w.heat.iter_mut().zip(v.heat) {
+                *h += k;
+            }
+        }
+        Archived {
+            t_s: self.t_s,
+            len_s: next.t_s + next.len_s - self.t_s,
+            b: x,
+        }
     }
 }
 
@@ -350,7 +414,13 @@ struct Agg {
     /// Keyed by the static verb name: no allocation per operation (X6).
     verbs: BTreeMap<&'static str, VerbAgg>,
     apis: BTreeMap<Api, ApiAgg>,
+    /// The live intervals: `buckets[i]` is interval `base + i`.
     buckets: Vec<Bucket>,
+    /// The interval index of `buckets[0]`.
+    base: usize,
+    /// Closed intervals moved out of `buckets`, oldest first, merged in pairs as the timeline
+    /// grows ([`MAX_INTERVALS`]).
+    archive: Vec<Archived>,
     slow: Vec<SlowOp>,
     dns: Histogram<u64>,
     tcp: Histogram<u64>,
@@ -389,6 +459,8 @@ impl Agg {
             verbs: BTreeMap::new(),
             apis: BTreeMap::new(),
             buckets: Vec::new(),
+            base: 0,
+            archive: Vec::new(),
             slow: Vec::new(),
             dns: hist(),
             tcp: hist(),
@@ -414,6 +486,44 @@ impl Agg {
             censored: 0,
             dials_seen: 0,
             dims: crate::dims::DimAgg::default(),
+        }
+    }
+
+    /// Live interval `idx` (an event in an interval already archived lands in the oldest live
+    /// one). [`Recorder::ensure_bucket`] made it exist.
+    fn bucket(&mut self, idx: usize) -> &mut Bucket {
+        let i = idx.saturating_sub(self.base).min(self.buckets.len() - 1);
+        &mut self.buckets[i]
+    }
+
+    /// Keep the timeline within [`MAX_INTERVALS`]: archive the closed intervals at the front,
+    /// then merge the oldest half of the archive in pairs until it fits.
+    fn compact(&mut self) {
+        if self.archive.len() + self.buckets.len() <= MAX_INTERVALS {
+            return;
+        }
+        let closed = self
+            .buckets
+            .iter()
+            .take_while(|b| b.latency.is_none())
+            .count()
+            .min(self.buckets.len().saturating_sub(1));
+        let base = self.base;
+        self.archive
+            .extend(self.buckets.drain(..closed).enumerate().map(|(i, b)| {
+                let (t_s, len_s) = bucket_span(base + i);
+                Archived { t_s, len_s, b }
+            }));
+        self.base += closed;
+        while self.archive.len() + self.buckets.len() > MAX_INTERVALS && self.archive.len() >= 2 {
+            let n = (self.archive.len() / 2).max(2) & !1;
+            let mut old = self.archive.drain(..n);
+            let mut merged = Vec::with_capacity(n / 2);
+            while let (Some(x), Some(y)) = (old.next(), old.next()) {
+                merged.push(x.merge(y));
+            }
+            drop(old);
+            self.archive.splice(0..0, merged);
         }
     }
 
@@ -923,16 +1033,13 @@ impl Recorder {
             {
                 let frozen = self.frozen_elapsed_us.load(Ordering::Acquire);
                 let ended = event_bucket(now_us as u64, frozen);
-                let sent = event_bucket(
-                    (now_us as u64).saturating_sub(r.timing.total_us),
-                    frozen,
-                );
+                let sent = event_bucket((now_us as u64).saturating_sub(r.timing.total_us), frozen);
                 let mut a = self.agg();
                 a.record_request(r);
                 self.ensure_bucket(&mut a, ended.max(sent), window_start);
-                a.buckets[sent].requests += 1;
+                a.bucket(sent).requests += 1;
                 if r.is_throttle() {
-                    a.buckets[ended].throttled += 1;
+                    a.bucket(ended).throttled += 1;
                 }
             }
             let mut row = req_row(r.clone(), 0, 0, 1);
@@ -963,7 +1070,7 @@ impl Recorder {
         a.res.retries += 1;
         a.res.retry_backoff_ms += backoff.as_secs_f64() * 1000.0;
         self.ensure_bucket(&mut a, idx, window_start);
-        a.buckets[idx].retries += 1;
+        a.bucket(idx).retries += 1;
     }
 
     pub fn record_integrity(&self, ok: bool) {
@@ -993,7 +1100,7 @@ impl Recorder {
         a.censored += 1;
         rec(&mut a.all_latency, lower_bound_us.max(1));
         self.ensure_bucket(&mut a, idx, window_start);
-        a.buckets[idx].missed += 1;
+        a.bucket(idx).missed += 1;
     }
 
     pub fn op_started(&self, op_id: u64) {
@@ -1165,7 +1272,10 @@ impl Recorder {
         // The interval of each event: the operation's start for its latency, its end for a
         // failure, each request's send and response for requests and throttling, each
         // retry's issue (design 6.3 A1: events land in the interval they happened in).
-        let start_us = c.started.saturating_duration_since(window_start).as_micros() as u64;
+        let start_us = c
+            .started
+            .saturating_duration_since(window_start)
+            .as_micros() as u64;
         let end_us = start_us + c.latency_us;
         let frozen = self.frozen_elapsed_us.load(Ordering::Acquire);
         let at = |us: u64| event_bucket(us, frozen);
@@ -1176,7 +1286,7 @@ impl Recorder {
         self.ensure_bucket(&mut a, idx, window_start);
         let heat = heat_index(c.latency_us);
         {
-            let b = &mut a.buckets[idx];
+            let b = a.bucket(idx);
             b.ops += 1;
             b.bytes += bytes;
             if ok {
@@ -1199,7 +1309,7 @@ impl Recorder {
         }
         self.ensure_bucket(&mut a, end_idx, window_start);
         if !ok {
-            let b = &mut a.buckets[end_idx];
+            let b = a.bucket(end_idx);
             b.errors += 1;
             b.verb(c.verb).errors += 1;
         }
@@ -1207,11 +1317,11 @@ impl Recorder {
             let sent = start_us + r.start_offset_us;
             let i = at(sent);
             self.ensure_bucket(&mut a, i, window_start);
-            a.buckets[i].requests += 1;
+            a.bucket(i).requests += 1;
             if r.is_throttle() {
                 let i = at(sent + r.timing.total_us);
                 self.ensure_bucket(&mut a, i, window_start);
-                let b = &mut a.buckets[i];
+                let b = a.bucket(i);
                 b.throttled += 1;
                 b.verb(c.verb).throttled += 1;
             }
@@ -1221,13 +1331,13 @@ impl Recorder {
         for &(_, issued) in &c.data.retry_waits {
             let i = at(start_us + issued);
             self.ensure_bucket(&mut a, i, window_start);
-            a.buckets[i].retries += 1;
+            a.bucket(i).retries += 1;
         }
         let rest = c
             .data
             .retries
             .saturating_sub(c.data.retry_waits.len() as u64);
-        a.buckets[end_idx].retries += rest;
+        a.bucket(end_idx).retries += rest;
 
         // Keep the slowest operations with their full request timelines.
         let lat_ms = c.latency_us as f64 / 1000.0;
@@ -1294,7 +1404,7 @@ impl Recorder {
     /// intervals before the oldest operation still running). `live_ops` is never held while
     /// taking `agg`, so taking it here (under `agg`) cannot deadlock.
     fn ensure_bucket(&self, a: &mut Agg, idx: usize, window_start: Instant) {
-        if a.buckets.len() > idx {
+        if a.base + a.buckets.len() > idx {
             return;
         }
         let oldest_live = self
@@ -1308,12 +1418,13 @@ impl Recorder {
             .map(|t| bucket_index(t.saturating_duration_since(window_start).as_secs()))
             .unwrap_or(idx)
             .min(idx);
-        for b in a.buckets.iter_mut().take(first_open) {
+        for b in a.buckets.iter_mut().take(first_open.saturating_sub(a.base)) {
             b.close();
         }
-        while a.buckets.len() <= idx {
+        while a.base + a.buckets.len() <= idx {
             a.buckets.push(Bucket::new());
         }
+        a.compact();
     }
 
     /// The per-interval series probe (call it every few ms while measuring): requests in
@@ -1330,7 +1441,7 @@ impl Recorder {
         let dialed = a.conn.dialed;
         let new = dialed.saturating_sub(a.dials_seen);
         a.dials_seen = dialed;
-        let b = &mut a.buckets[idx];
+        let b = a.bucket(idx);
         b.inflight_peak = b.inflight_peak.max(inflight);
         b.dials += new;
     }
@@ -1405,13 +1516,24 @@ impl Recorder {
             let idx = bucket_index(window_start.elapsed().as_secs());
             let mut a = self.agg();
             self.ensure_bucket(&mut a, idx, window_start);
-            a.buckets[idx].cpu_pct = Some(cpu_pct);
+            a.bucket(idx).cpu_pct = Some(cpu_pct);
         }
     }
 
     pub fn snapshot(&self) -> Snapshot {
+        self.snapshot_with(false)
+    }
+
+    /// The aggregates so far, and a fresh window from now on (design v7 P2): every aggregate
+    /// starts again from zero, atomically with the snapshot, so successive snapshots cover
+    /// disjoint windows. Operations in flight are counted in the window they complete in.
+    pub fn snapshot_and_reset(&self) -> Snapshot {
+        self.snapshot_with(true)
+    }
+
+    fn snapshot_with(&self, reset: bool) -> Snapshot {
         let elapsed = self.elapsed_s().max(1e-3);
-        let a = self.agg();
+        let mut a = self.agg();
         let mib = |b: u64| b as f64 / (1024.0 * 1024.0);
 
         let verbs: Vec<VerbStats> = a
@@ -1524,13 +1646,15 @@ impl Recorder {
         // The last interval is usually partial; scale its rates by its covered fraction.
         let nb = a.buckets.len();
         let ms = |v: u64| v as f64 / 1000.0;
-        let timeline = a
-            .buckets
-            .iter()
-            .enumerate()
-            .map(|(i, b)| {
-                let (t_s, len_s) = bucket_span(i);
-                let width = if i + 1 == nb {
+        let archived = a.archive.iter().map(|x| (x.t_s, x.len_s, false, &x.b));
+        let live = a.buckets.iter().enumerate().map(|(i, b)| {
+            let (t_s, len_s) = bucket_span(a.base + i);
+            (t_s, len_s, i + 1 == nb, b)
+        });
+        let timeline = archived
+            .chain(live)
+            .map(|(t_s, len_s, last, b)| {
+                let width = if last {
                     (elapsed - t_s).clamp(0.05, len_s)
                 } else {
                     len_s
@@ -1611,7 +1735,7 @@ impl Recorder {
             inflight_ops: self.inflight_ops.load(Ordering::Relaxed),
         };
 
-        Snapshot {
+        let snap = Snapshot {
             phase: self.phase(),
             elapsed_s: elapsed,
             summary,
@@ -1645,7 +1769,26 @@ impl Recorder {
                     .iter_recorded()
                     .map(|v| (v.value_iterated_to(), v.count_at_value())),
             ),
+        };
+        if reset {
+            // Under the aggregate lock: nothing recorded between the snapshot and the reset is
+            // lost. The connection details (ALPN, TLS, remotes) describe the pool, which lives on.
+            let conn = std::mem::take(&mut a.conn);
+            *a = Agg::new();
+            a.conn = ConnInfo {
+                dialed: 0,
+                failures: 0,
+                ..conn
+            };
+            *self.window_start.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
+            self.wire_rx.store(0, Ordering::Relaxed);
+            self.wire_tx.store(0, Ordering::Relaxed);
+            self.peak_inflight_requests.store(
+                self.inflight_requests.load(Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
         }
+        snap
     }
 }
 
@@ -1723,6 +1866,61 @@ impl std::fmt::Debug for Recorder {
 mod tests {
     use super::*;
     use crate::record::*;
+
+    /// A month of traffic in an always-on recorder (one operation every 30 s): the timeline
+    /// stays bounded and keeps every operation, in contiguous intervals (design v7 P2).
+    #[test]
+    fn a_month_long_timeline_stays_bounded() {
+        let rec = Recorder::always_on(0);
+        let start = rec.window_start();
+        let month_s: u64 = 30 * 86_400;
+        let mut n = 0u64;
+        for s in (0..month_s).step_by(30) {
+            rec.complete_op(
+                true,
+                OpCompletion {
+                    verb: "stat",
+                    op_id: n + 1,
+                    started: start + std::time::Duration::from_secs(s),
+                    latency_us: 1_000 + (s % 7) * 100,
+                    logical_read: 0,
+                    logical_write: 0,
+                    error: None,
+                    key: String::new(),
+                    data: Default::default(),
+                    schedule_us: None,
+                },
+            );
+            n += 1;
+            let a = rec.agg();
+            assert!(
+                a.archive.len() + a.buckets.len() <= MAX_INTERVALS,
+                "at {s} s"
+            );
+        }
+        let t = rec.snapshot().timeline;
+        assert!(t.len() <= MAX_INTERVALS, "{}", t.len());
+        assert!(t.len() > MAX_INTERVALS / 2, "{}", t.len());
+        assert_eq!(t.iter().map(|p| p.ops_count).sum::<u64>(), n);
+        for w in t.windows(2) {
+            assert!(
+                (w[0].t_s + w[0].len_s - w[1].t_s).abs() < 1e-6,
+                "{} + {} vs {}",
+                w[0].t_s,
+                w[0].len_s,
+                w[1].t_s
+            );
+        }
+        // The oldest intervals are the coarsest; the recent ones keep their resolution.
+        assert!(t[0].len_s > t[t.len() - 1].len_s);
+        // Merged quantiles stay within the operations' latencies (1.0 to 1.6 ms).
+        assert!(
+            t.iter()
+                .filter(|p| p.ops_count > 0)
+                .all(|p| p.p50_ms >= 1.0 && p.max_ms <= 1.7)
+        );
+        assert_eq!(t[t.len() - 1].len_s, COARSE_S as f64);
+    }
 
     fn req(start: u64, queue: u64, total: u64) -> RequestRecord {
         RequestRecord {
@@ -1921,13 +2119,22 @@ mod tests {
             ..Default::default()
         };
         // `-d 2s` closed at 2.00008 s: the third interval holds draining requests only.
-        let t = fold_end_sliver(vec![pt(0.0, 10, 10, 0), pt(1.0, 10, 10, 1), pt(2.0, 0, 3, 2)], 2.00008);
+        let t = fold_end_sliver(
+            vec![pt(0.0, 10, 10, 0), pt(1.0, 10, 10, 1), pt(2.0, 0, 3, 2)],
+            2.00008,
+        );
         assert_eq!(t.len(), 2);
         assert_eq!((t[1].requests_count, t[1].throttled), (13, 3));
         assert_eq!(t[1].requests_per_s, 13.0);
         // A real last interval (operations started in it, or most of it inside the window) stays.
-        assert_eq!(fold_end_sliver(vec![pt(0.0, 10, 10, 0), pt(1.0, 2, 3, 0)], 1.00008).len(), 2);
-        assert_eq!(fold_end_sliver(vec![pt(0.0, 10, 10, 0), pt(1.0, 0, 3, 0)], 1.5).len(), 2);
+        assert_eq!(
+            fold_end_sliver(vec![pt(0.0, 10, 10, 0), pt(1.0, 2, 3, 0)], 1.00008).len(),
+            2
+        );
+        assert_eq!(
+            fold_end_sliver(vec![pt(0.0, 10, 10, 0), pt(1.0, 0, 3, 0)], 1.5).len(),
+            2
+        );
     }
 
     #[test]
