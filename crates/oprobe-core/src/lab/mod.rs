@@ -60,8 +60,8 @@ fn lab_tls() -> &'static LabTls {
 
 fn generate_lab_tls() -> std::result::Result<LabTls, rcgen::Error> {
     use rcgen::{
-        BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair,
-        KeyUsagePurpose, date_time_ymd,
+        BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer,
+        KeyPair, KeyUsagePurpose, date_time_ymd,
     };
     let today = crate::util::utc_today();
     let (y0, m0, d0) = crate::util::civil_from_days(today - 1);
@@ -91,7 +91,8 @@ fn generate_lab_tls() -> std::result::Result<LabTls, rcgen::Error> {
     leaf.key_usages = vec![KeyUsagePurpose::DigitalSignature];
     leaf.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
     validity(&mut leaf);
-    let cert = leaf.signed_by(&key, &ca_cert, &ca_key)?;
+    let issuer = Issuer::from_params(&ca, &ca_key);
+    let cert = leaf.signed_by(&key, &issuer)?;
     Ok(LabTls {
         ca_pem: ca_cert.pem(),
         cert_pem: cert.pem(),
