@@ -357,9 +357,9 @@ fn prove_state(st: crate::ui::jobs::State, p99: bool) -> View {
         v = v.child(small(fill("operator.replays", &[&st.trials.len()])));
     }
     // The pairs as the prove recorded them once it ends, else as they stream in.
-    let ab: Vec<(f64, f64)> = match &st.outcome {
+    let ab: Vec<(f64, f64, u64)> = match &st.outcome {
         Some(Outcome::Proved(p)) if !p.ab.is_empty() => p.ab.clone(),
-        _ => ps.iter().map(|(a, b, _)| (*a, *b)).collect(),
+        _ => crate::ui::jobs::ab_live(&st.trials),
     };
     if let Some(plot) = plots::prove(&ab, p99) {
         v = v.child(view().test_id("prove-chart").child(chart(

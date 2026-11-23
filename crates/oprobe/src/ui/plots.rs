@@ -295,8 +295,9 @@ fn noise_band(floor: f64) -> (f64, f64) {
 
 /// Prove's convergence: each pair's change (candidate / baseline − 1) as a dot, the running
 /// estimate with its 95 % interval narrowing as pairs come in, the A/A noise floor around no
-/// change, and no change ruled. `ab` holds the objective of each pair.
-pub fn prove(ab: &[(f64, f64)], p99: bool) -> Option<Plot> {
+/// change, and no change ruled. `ab` holds the objective of each pair and the fewest operations
+/// its trials counted (the noise floor is never below that resolution, as in the verdict).
+pub fn prove(ab: &[(f64, f64, u64)], p99: bool) -> Option<Plot> {
     if ab.is_empty() {
         return None;
     }
@@ -305,13 +306,20 @@ pub fn prove(ab: &[(f64, f64)], p99: bool) -> Option<Plot> {
     } else {
         ProveObjective::Goodput
     };
-    let (a, b): (Vec<f64>, Vec<f64>) = ab.iter().copied().unzip();
-    let conv: Vec<Converged> = convergence(obj, &a, &b);
+    let (a, b): (Vec<f64>, Vec<f64>) = ab.iter().map(|p| (p.0, p.1)).unzip();
+    let ops: Vec<u64> = ab
+        .iter()
+        .scan(u64::MAX, |m, p| {
+            *m = (*m).min(p.2);
+            Some(*m)
+        })
+        .collect();
+    let conv: Vec<Converged> = convergence(obj, &a, &b, &ops);
     let n = ab.len() as f64;
     let d: Vec<(f64, f64)> = ab
         .iter()
         .enumerate()
-        .map(|(i, (a, b))| ((i + 1) as f64, if *a > 0.0 { b / a - 1.0 } else { 0.0 }))
+        .map(|(i, (a, b, _))| ((i + 1) as f64, if *a > 0.0 { b / a - 1.0 } else { 0.0 }))
         .collect();
     let floor = conv.last().map(|c| c.noise_floor_ratio).unwrap_or(0.0);
     let (nlo, nhi) = noise_band(floor);
@@ -482,8 +490,8 @@ mod tests {
 
     #[test]
     fn the_prove_chart_narrows_around_the_estimate() {
-        let ab: Vec<(f64, f64)> = (0..6)
-            .map(|i| (100.0 + i as f64, 120.0 + (i % 3) as f64))
+        let ab: Vec<(f64, f64, u64)> = (0..6)
+            .map(|i| (100.0 + i as f64, 120.0 + (i % 3) as f64, 10_000))
             .collect();
         let p = prove(&ab, false).unwrap();
         let est = &p.lines[0].pts;
@@ -497,8 +505,22 @@ mod tests {
         assert_eq!(p.rules[0].y, Some(0.0));
         assert!(p.y.min <= 0.0 && p.y.max >= 0.2);
         // p99: lower is better; each dot is still candidate / baseline − 1.
-        let q = prove(&[(50.0, 40.0)], true).unwrap();
+        let q = prove(&[(50.0, 40.0, 10_000)], true).unwrap();
         assert!((q.lines[1].pts[0].1 + 0.2).abs() < 1e-9);
         assert!(prove(&[], false).is_none());
+        // Few operations per trial: the noise floor is their resolution, as in the verdict.
+        let few: Vec<(f64, f64, u64)> = [
+            (37.0, 36.0),
+            (37.0, 35.0),
+            (37.0, 37.0),
+            (38.0, 37.0),
+            (37.0, 35.0),
+        ]
+        .iter()
+        .map(|(a, b)| (*a, *b, 35))
+        .collect();
+        let f = prove(&few, false).unwrap();
+        let last = f.bands[1].pts.last().unwrap();
+        assert!(last.1 < 0.0 && last.2 > 0.0, "{last:?}");
     }
 }

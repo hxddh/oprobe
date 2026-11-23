@@ -4,6 +4,14 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Fixed
+
+- `prove`: the noise floor is never below what a trial can resolve, `ln(1 + 1/ops)` for its
+  fewest operations. A/A trials of a few dozen operations that happened to agree exactly let a
+  one-operation difference read as a significant change (a `worse` verdict from rounding).
+
 ## v6.1.0 — 2026-11-23
 
 ### Added
