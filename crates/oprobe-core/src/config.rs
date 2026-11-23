@@ -880,6 +880,10 @@ impl TargetSpec {
             return Ok(t);
         }
         crate::input::storage_url(raw)?;
+        // A pasted `https://` address of a cloud bucket is that bucket's storage URL.
+        if let Some(url) = crate::input::cloud_url(raw) {
+            return Self::from_url(&url);
+        }
         let u = url::Url::parse(raw).map_err(|e| {
             crate::input::invalid(format!("invalid storage URL `{raw}`: {e}"))
                 .with_hint(crate::input::URL_EXAMPLES)
@@ -999,17 +1003,21 @@ impl TargetSpec {
                     for (k, v) in o {
                         options.entry(k).or_insert(v);
                     }
-                    other
+                    // OpenDAL's service is `http`, for both schemes.
+                    if other == "https" { "http" } else { other }
                 }
                 None => {
                     return Err(crate::input::scheme(other)
                         .err()
                         .unwrap_or_else(|| {
-                            crate::input::invalid(format!("unsupported storage scheme `{other}`"))
-                                .with_hint(format!(
-                                    "supported: {}, lab, memory",
-                                    supported_schemes().join(", ")
-                                ))
+                            crate::input::invalid(format!(
+                                "this oprobe was built without the `{other}` service"
+                            ))
+                            .with_hint(format!(
+                                "use one of {}, lab, memory; or install a build with every \
+                                 service: `cargo install oprobe --features all-services`",
+                                supported_schemes().join(", ")
+                            ))
                         })
                         .into());
                 }
@@ -1216,12 +1224,32 @@ impl TargetSpec {
     }
 }
 
-/// URL schemes oprobe resolves (aliases included), for messages.
+/// URL schemes this build resolves (aliases included), for messages.
 pub fn supported_schemes() -> Vec<&'static str> {
-    vec![
-        "s3", "r2", "minio", "gcs", "azblob", "azdls", "azfile", "oss", "cos", "obs", "tos", "b2",
-        "swift", "webdav", "webhdfs", "upyun", "http", "fs",
+    [
+        ("s3", "s3"),
+        ("r2", "s3"),
+        ("minio", "s3"),
+        ("gcs", "gcs"),
+        ("azblob", "azblob"),
+        ("azdls", "azdls"),
+        ("azfile", "azfile"),
+        ("oss", "oss"),
+        ("cos", "cos"),
+        ("obs", "obs"),
+        ("tos", "tos"),
+        ("b2", "b2"),
+        ("swift", "swift"),
+        ("webdav", "webdav"),
+        ("webhdfs", "webhdfs"),
+        ("upyun", "upyun"),
+        ("http", "http"),
+        ("fs", "fs"),
     ]
+    .into_iter()
+    .filter(|(_, svc)| crate::engine::operator::missing_service_feature(svc).is_none())
+    .map(|(s, _)| s)
+    .collect()
 }
 
 /// Service options of `raw` from the OpenDAL service's own `Config::from_uri` (bucket /

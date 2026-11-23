@@ -7,7 +7,7 @@
           "$ref": "#/$defs/ErrorCode"
         },
         "detail": {
-          "description": "The whole error chain as the storage library reported it, when `message` leads with\nthe provider's error code instead (machine output only).",
+          "description": "The whole error chain as the storage library reported it, when `message` leads with\nthe provider's error code or states the cause plainly instead (machine output only).",
           "type": [
             "string",
             "null"

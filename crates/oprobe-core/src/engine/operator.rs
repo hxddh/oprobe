@@ -48,7 +48,7 @@ pub fn missing_service_feature(scheme: &str) -> Option<&'static str> {
 
 pub fn base_operator(target: &TargetSpec) -> Result<Operator> {
     ensure_registry();
-    if let Some(feature) = missing_service_feature(&target.scheme) {
+    if missing_service_feature(&target.scheme).is_some() {
         return Err(OprobeError::new(
             ErrorCode::StorageUnsupported,
             format!(
@@ -56,9 +56,9 @@ pub fn base_operator(target: &TargetSpec) -> Result<Operator> {
                 target.scheme
             ),
         )
-        .with_hint(format!(
-            "install a build with it: `cargo install oprobe --features {feature}` (or `all-services`)"
-        ))
+        .with_hint(
+            "install a build with every service: `cargo install oprobe --features all-services`",
+        )
         .into());
     }
     let mut opts = target.resolved_options()?;
@@ -313,13 +313,7 @@ pub async fn check_reachable_with(
     let Err(e) = probe.stat(".oprobe-reachability-check").await else {
         return Ok(());
     };
-    let mut chain = e.to_string();
-    let mut src = std::error::Error::source(&e);
-    while let Some(s) = src {
-        chain.push_str(": ");
-        chain.push_str(&s.to_string());
-        src = s.source();
-    }
+    let chain = error_chain(&e);
     let l = chain.to_ascii_lowercase();
     // Wording differs by OS: "Connection refused (os error 111)" on Linux, "(os error 61)" on
     // macOS, "No connection could be made because the target machine actively refused it.
@@ -339,18 +333,233 @@ pub async fn check_reachable_with(
         .iter()
         .any(|n| l.contains(n));
     if unreachable {
-        return Err(OprobeError::new(
-            ErrorCode::NetUnreachable,
-            format!(
-                "cannot reach {} ({}): {chain}",
-                target.endpoint().unwrap_or_else(|| target.display()),
-                target.display()
-            ),
-        )
-        .with_hint("check the endpoint, the network path and the proxy ")
-        .into());
+        return Err(unreachable_error(target, &chain).into());
     }
     Ok(())
+}
+
+/// An OpenDAL error and its sources on one line, each text once (OpenDAL's own message already
+/// names its first source).
+fn error_chain(e: &opendal::Error) -> String {
+    let mut chain = e.to_string();
+    let mut src = std::error::Error::source(e);
+    while let Some(s) = src {
+        let t = s.to_string();
+        if !chain.contains(&t) {
+            chain.push_str(": ");
+            chain.push_str(&t);
+        }
+        src = s.source();
+    }
+    chain
+}
+
+/// `host:port` of an endpoint URL (the scheme's default port when it names none).
+fn host_port(endpoint: &str) -> Option<String> {
+    let u = url::Url::parse(endpoint).ok()?;
+    let host = u.host_str().filter(|h| !h.is_empty())?;
+    Some(match u.port_or_known_default() {
+        Some(p) => format!("{host}:{p}"),
+        None => host.to_owned(),
+    })
+}
+
+/// The error of a target that cannot be reached: one plain cause (`connection refused by
+/// 127.0.0.1:9999`), the operator, and the storage library's report (`chain`) as the detail.
+pub fn unreachable_error(target: &TargetSpec, chain: &str) -> OprobeError {
+    let endpoint = target.endpoint();
+    let at = endpoint
+        .as_deref()
+        .and_then(host_port)
+        .or(endpoint)
+        .unwrap_or_else(|| target.display());
+    let l = chain.to_ascii_lowercase();
+    let dns = [
+        "dns error",
+        "failed to lookup address",
+        "name or service not known",
+        "nodename nor servname",
+        "no such host",
+    ]
+    .iter()
+    .any(|n| l.contains(n));
+    let refused = ["connection refused", "actively refused", "os error 10061"]
+        .iter()
+        .any(|n| l.contains(n));
+    let (code, cause, hint) = if dns {
+        let host = at.rsplit_once(':').map_or(at.as_str(), |(h, _)| h);
+        (
+            ErrorCode::NetDns,
+            format!("cannot resolve {host}"),
+            "check the endpoint's host name (`--set options.endpoint=URL`), DNS and the proxy",
+        )
+    } else if refused {
+        (
+            ErrorCode::NetUnreachable,
+            format!("connection refused by {at}"),
+            "check that the service is running at that address and the endpoint is right \
+             (`--set options.endpoint=URL`)",
+        )
+    } else {
+        (
+            ErrorCode::NetUnreachable,
+            format!("cannot connect to {at}"),
+            "check the endpoint (`--set options.endpoint=URL`), the network path and the proxy",
+        )
+    };
+    OprobeError::new(code, format!("{cause} ({})", target.display()))
+        .with_hint(hint)
+        .with_detail(chain.trim())
+}
+
+/// What [`credential_source`] says of a target that sends unsigned requests.
+pub const UNSIGNED: &str = "unsigned requests";
+
+/// Where the credentials of `target` come from, as far as the configuration and the
+/// environment tell (`AWS_ACCESS_KEY_ID`, `~/.aws/credentials`, an operator option); `None`
+/// when nothing names them (the service's metadata endpoint, or no credentials at all).
+pub fn credential_source(target: &TargetSpec) -> Option<String> {
+    let opt = |k: &str| target.options.get(k).is_some_and(|v| !v.trim().is_empty());
+    let env = |k: &str| std::env::var(k).is_ok_and(|v| !v.trim().is_empty());
+    let on = |k: &str| target.options.get(k).is_some_and(|v| v.trim() == "true");
+    if on("skip_signature") || on("allow_anonymous") {
+        return Some(UNSIGNED.into());
+    }
+    let option = |k: &str| format!("the operator's `{k}` option");
+    let home = || {
+        std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(std::path::PathBuf::from)
+    };
+    let config_load = !on("disable_config_load");
+    match target.scheme.as_str() {
+        "s3" => {
+            if opt("access_key_id") {
+                return Some(option("access_key_id"));
+            }
+            if env("AWS_ACCESS_KEY_ID") {
+                return Some("AWS_ACCESS_KEY_ID".into());
+            }
+            if !config_load {
+                return None;
+            }
+            if env("AWS_WEB_IDENTITY_TOKEN_FILE") {
+                return Some("AWS_WEB_IDENTITY_TOKEN_FILE".into());
+            }
+            let profile = std::env::var("AWS_PROFILE").unwrap_or_else(|_| "default".into());
+            if let Ok(f) = std::env::var("AWS_SHARED_CREDENTIALS_FILE") {
+                return Some(format!("{f} (profile {profile})"));
+            }
+            if home().is_some_and(|h| h.join(".aws/credentials").is_file()) {
+                return Some(format!("~/.aws/credentials (profile {profile})"));
+            }
+            None
+        }
+        "gcs" => {
+            for k in ["credential", "credential_path", "token"] {
+                if opt(k) {
+                    return Some(option(k));
+                }
+            }
+            if env("GOOGLE_APPLICATION_CREDENTIALS") {
+                return Some("GOOGLE_APPLICATION_CREDENTIALS".into());
+            }
+            if config_load
+                && home().is_some_and(|h| {
+                    h.join(".config/gcloud/application_default_credentials.json")
+                        .is_file()
+                })
+            {
+                return Some("gcloud's application default credentials".into());
+            }
+            None
+        }
+        "azblob" => {
+            for k in ["account_key", "sas_token"] {
+                if opt(k) {
+                    return Some(option(k));
+                }
+            }
+            [
+                "AZURE_STORAGE_CONNECTION_STRING",
+                "AZURE_STORAGE_ACCOUNT_KEY",
+                "AZURE_STORAGE_SAS_TOKEN",
+            ]
+            .into_iter()
+            .find(|k| env(k))
+            .map(str::to_owned)
+        }
+        _ => [
+            "access_key_id",
+            "account_key",
+            "sas_token",
+            "credential",
+            "password",
+            "token",
+        ]
+        .into_iter()
+        .find(|k| opt(k))
+        .map(option),
+    }
+}
+
+/// Where to put credentials for `scheme` (the hint of `auth.no_credentials`).
+fn credentials_hint(scheme: &str) -> &'static str {
+    match scheme {
+        "s3" => {
+            "set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY (or AWS_PROFILE), or send unsigned \
+             requests to a public bucket with --set options.skip_signature=true"
+        }
+        "gcs" => {
+            "set GOOGLE_APPLICATION_CREDENTIALS to a service account key file, or send unsigned \
+             requests to a public bucket with --set options.skip_signature=true"
+        }
+        "azblob" => {
+            "set AZURE_STORAGE_ACCOUNT_KEY (or AZURE_STORAGE_SAS_TOKEN), or send unsigned \
+             requests to a public container with --set options.skip_signature=true"
+        }
+        _ => {
+            "set credentials for the operator (OpenDAL's credential chain for the service), or \
+             send unsigned requests to a public bucket with --set options.skip_signature=true"
+        }
+    }
+}
+
+/// A preflight failure of `target`, stated plainly: what happened, at which endpoint, with
+/// which credentials (`credentials rejected by s3.eu-west-1.amazonaws.com:443 (credentials from
+/// AWS_ACCESS_KEY_ID): InvalidAccessKeyId: …`); the storage library's report becomes the
+/// detail. Other errors pass through unchanged.
+pub fn explain_preflight(err: anyhow::Error, target: &TargetSpec) -> anyhow::Error {
+    let Some(e) = err.downcast_ref::<OprobeError>() else {
+        return err;
+    };
+    let at = target
+        .endpoint()
+        .map(|ep| host_port(&ep).unwrap_or(ep))
+        .unwrap_or_else(|| target.display());
+    let creds = match credential_source(target) {
+        Some(s) if s == UNSIGNED => format!(" ({s})"),
+        Some(s) => format!(" (credentials from {s})"),
+        None => " (credentials from OpenDAL's default chain)".to_owned(),
+    };
+    let parts = crate::errors::provider_parts(&e.message, e.code);
+    let message = match (e.code, parts) {
+        (ErrorCode::AuthDenied | ErrorCode::AuthNoCredentials, Some((what, rest))) => {
+            format!("{what} by {at}{creds}: {rest}")
+        }
+        (ErrorCode::AuthDenied, None) => format!("access denied by {at}{creds}"),
+        (ErrorCode::AuthNoCredentials, None) => format!("no credentials found for {at}"),
+        (_, Some((what, rest))) => format!("{what} at {at}: {rest}"),
+        (_, None) => return err,
+    };
+    let hint = match e.code {
+        ErrorCode::AuthNoCredentials => credentials_hint(&target.scheme).to_owned(),
+        _ => e.hint.clone().unwrap_or_default(),
+    };
+    OprobeError::new(e.code, message)
+        .with_hint(hint)
+        .with_detail(e.message.clone())
+        .into()
 }
 
 /// With `--http h2`, check the target speaks HTTP/2 before anything else (design v5 §3, M6):
@@ -376,13 +585,7 @@ pub async fn check_protocol(
         // The server answered over HTTP/2.
         return Ok(());
     }
-    let mut chain = e.to_string();
-    let mut src = std::error::Error::source(&e);
-    while let Some(s) = src {
-        chain.push_str(": ");
-        chain.push_str(&s.to_string());
-        src = s.source();
-    }
+    let chain = error_chain(&e);
     let l = chain.to_ascii_lowercase();
     let protocol = [
         "http2",
@@ -495,5 +698,77 @@ mod tests {
         let hint = b.hint.unwrap_or_default();
         assert!(!hint.contains("`container`"), "{hint}");
         assert!(hint.contains("--set options."), "{hint}");
+    }
+
+    /// An unreachable endpoint: the plain cause first, OpenDAL's report only in the detail.
+    #[test]
+    fn unreachable_targets_state_one_plain_cause() {
+        let mut t = TargetSpec::from_url("s3://b/x").unwrap();
+        t.options
+            .insert("endpoint".into(), "http://127.0.0.1:9999".into());
+        let dump = "Unexpected (temporary) at stat, context: { uri: http://127.0.0.1:9999/b/x, \
+                    service: s3 } => send http request, source: error sending request: client \
+                    error (Connect): tcp connect error: Connection refused (os error 111) ";
+        let e: anyhow::Error = unreachable_error(&t, dump).into();
+        let b = crate::errors::classify(&e, "s3");
+        assert_eq!(b.code, ErrorCode::NetUnreachable);
+        assert_eq!(b.message, "connection refused by 127.0.0.1:9999 (s3://b/x)");
+        assert_eq!(b.detail.as_deref(), Some(dump.trim()));
+        let hint = b.hint.unwrap();
+        assert_eq!(hint, hint.trim_end(), "no trailing space: {hint:?}");
+        assert!(hint.contains("--set options.endpoint="), "{hint}");
+        let b = crate::errors::classify(
+            &unreachable_error(&t, "dns error: failed to lookup address information").into(),
+            "s3",
+        );
+        assert_eq!(b.code, ErrorCode::NetDns);
+        assert_eq!(b.message, "cannot resolve 127.0.0.1 (s3://b/x)");
+    }
+
+    /// A rejected key names the endpoint and where the key came from; the dump is the detail.
+    #[test]
+    fn auth_errors_name_the_endpoint_and_the_credential_source() {
+        let mut t = TargetSpec::from_url("s3://b").unwrap();
+        t.options.insert(
+            "endpoint".into(),
+            "https://s3.eu-west-1.amazonaws.com".into(),
+        );
+        t.options.insert("access_key_id".into(), "AKIA".into());
+        let dump = "preflight: cannot list the target: PermissionDenied (persistent) at list => \
+                    S3Error { code: \"InvalidAccessKeyId\", message: \"The AWS Access Key Id you \
+                    provided does not exist in our records.\" }";
+        let e = anyhow::Error::new(
+            OprobeError::new(ErrorCode::AuthDenied, dump).with_hint("check the credentials"),
+        );
+        let b = crate::errors::classify(&explain_preflight(e, &t), "s3");
+        assert_eq!(b.code, ErrorCode::AuthDenied);
+        assert_eq!(
+            b.message,
+            "credentials rejected by s3.eu-west-1.amazonaws.com:443 (credentials from the \
+             operator's `access_key_id` option): InvalidAccessKeyId: The AWS Access Key Id you \
+             provided does not exist in our records."
+        );
+        assert_eq!(b.detail.as_deref(), Some(dump));
+        // No credentials at all: where to put them, per service.
+        let mut g = TargetSpec::from_url("gs://b").unwrap();
+        g.options
+            .insert("disable_config_load".into(), "true".into());
+        let e = anyhow::Error::new(OprobeError::new(
+            ErrorCode::AuthNoCredentials,
+            "preflight: cannot list the target: ConfigInvalid => no valid credential found",
+        ));
+        let b = crate::errors::classify(&explain_preflight(e, &g), "gcs");
+        assert_eq!(
+            b.message,
+            "no credentials found for storage.googleapis.com:443"
+        );
+        assert!(
+            b.hint.unwrap().contains("GOOGLE_APPLICATION_CREDENTIALS"),
+            "{:?}",
+            b.detail
+        );
+        // Unsigned requests say so.
+        g.options.insert("skip_signature".into(), "true".into());
+        assert_eq!(credential_source(&g).as_deref(), Some(UNSIGNED));
     }
 }
