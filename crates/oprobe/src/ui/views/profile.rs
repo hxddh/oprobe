@@ -700,6 +700,7 @@ fn evidence(m: &ProfileModel, f: &FindingRow) -> Option<View> {
 
 fn finding(s: Store, m: &ProfileModel, f: FindingRow) -> View {
     let remedy = f.remedy.clone();
+    let code = f.code.clone();
     let paths = remedy
         .iter()
         .map(|(p, v)| {
@@ -752,7 +753,7 @@ fn finding(s: Store, m: &ProfileModel, f: FindingRow) -> View {
                     btn(
                         tr("profile.try_remedy"),
                         || Kind::Plain,
-                        move || s.apply_remedy(&remedy),
+                        move || s.prove_remedy(&code),
                     )
                     .accessibility_label(fill("profile.try_remedy_of", &[&f.code])),
                 )

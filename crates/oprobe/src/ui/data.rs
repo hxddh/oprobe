@@ -729,6 +729,100 @@ pub fn compare_rows(ps: &[ProfileModel]) -> Vec<MetricRow> {
     ]
 }
 
+/// The runs as the sidebar lists them: grouped under their operator, the group of the newest
+/// run first, newest first within a group (the keyboard walks this order).
+pub fn sidebar_order(runs: &[RunRow]) -> Vec<RunRow> {
+    let mut groups: Vec<(&str, Vec<RunRow>)> = Vec::new();
+    for r in runs {
+        match groups.iter_mut().find(|g| g.0 == r.operator) {
+            Some(g) => g.1.push(r.clone()),
+            None => groups.push((r.operator.as_str(), vec![r.clone()])),
+        }
+    }
+    groups.into_iter().flat_map(|(_, v)| v).collect()
+}
+
+/// What a run of a real target will do (`App::plan`), for New Run to show before Run.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PlanView {
+    /// One line per operator: `target · preset · N workers · warm-up + window`.
+    pub targets: Vec<String>,
+    /// Estimated operations and requests, bytes moved, in total.
+    pub ops: String,
+    pub requests: String,
+    pub bytes: String,
+    /// Objects written and deleted again, and the prefix they are under.
+    pub written: u64,
+    pub deleted: u64,
+    pub prefixes: Vec<String>,
+    pub read_only: bool,
+    pub eta_s: f64,
+    /// The budgets that stop the run (`None`: none is set).
+    pub budgets: Option<String>,
+    pub warnings: Vec<String>,
+    pub command: String,
+}
+
+/// The plan of a run in the app's terms.
+pub fn plan_view(p: &crate::app::RunPlan) -> PlanView {
+    let b = p
+        .plans
+        .first()
+        .map(|x| x.budgets.clone())
+        .unwrap_or_default();
+    let mut budgets = Vec::new();
+    if let Some(n) = b.max_requests_count {
+        budgets.push(crate::ui::i18n::trf("plan.max_requests", &[&n]));
+    }
+    if let Some(n) = b.max_bytes {
+        budgets.push(crate::util::fmt_bytes(n));
+    }
+    if let Some(s) = b.max_duration_s {
+        budgets.push(crate::ui::fmt::clock_s(s));
+    }
+    PlanView {
+        targets: p
+            .plans
+            .iter()
+            .map(|x| {
+                crate::ui::i18n::trf(
+                    "plan.target",
+                    &[
+                        &x.target,
+                        &x.preset,
+                        &x.concurrency_count,
+                        &crate::ui::fmt::clock_s(x.warmup_s),
+                        &crate::ui::fmt::clock_s(x.duration_s),
+                    ],
+                )
+            })
+            .collect(),
+        ops: crate::ui::fmt::compact(
+            p.plans.iter().map(|x| x.estimated_ops_count).sum::<u64>() as f64
+        ),
+        requests: crate::ui::fmt::compact(
+            p.plans
+                .iter()
+                .map(|x| x.estimated_requests_count)
+                .sum::<u64>() as f64,
+        ),
+        bytes: crate::util::fmt_bytes(p.plans.iter().map(|x| x.estimated_bytes).sum()),
+        written: p.plans.iter().map(|x| x.objects_written_count).sum(),
+        deleted: p.plans.iter().map(|x| x.objects_deleted_count).sum(),
+        prefixes: p.plans.iter().map(|x| x.run_prefix.clone()).collect(),
+        read_only: p.plans.iter().all(|x| x.read_only),
+        eta_s: p.plans.iter().map(|x| x.eta_s).sum(),
+        budgets: (!budgets.is_empty()).then(|| budgets.join(" · ")),
+        warnings: p.plans.iter().flat_map(|x| x.warnings.clone()).collect(),
+        command: p
+            .plans
+            .iter()
+            .map(|x| x.command.clone())
+            .collect::<Vec<_>>()
+            .join("\n"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

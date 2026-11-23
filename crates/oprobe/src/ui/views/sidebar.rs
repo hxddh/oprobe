@@ -1,32 +1,52 @@
 //! The sidebar (design app-native "Structure"): the runs, newest first, grouped under their
-//! operator, on the window's sidebar material. A press selects a run; with the platform's
-//! modifier it adds or removes one, with Shift it extends the selection; a secondary press
-//! opens the run's context menu. A running job is the first row, with its progress.
+//! operator, on the window's sidebar material where the platform has one. The runs are one
+//! list for the keyboard and for screen readers (a listbox of options, one stop of Tab): ↑/↓
+//! move the selection, Shift extends it, Home/End go to the ends, typing a run's id, operator
+//! or workload finds it, Delete (⌘⌫ on macOS) asks to delete, Return opens. A press selects a
+//! run; with the platform's modifier it adds or removes one, with Shift it extends the
+//! selection; a secondary press opens the run's context menu and marks the row it acts on.
+//! Its width follows a drag of its edge and is remembered. A running job is the first row,
+//! with its progress.
 
-use nsh_base::theme;
+use nsh_base::{HandleEdge, resize_handle, theme};
+use nsh_core::element::desktop::main_window;
 use nsh_core::element::os;
+use nsh_core::keymap::When;
 use nsh_core::platform::Os;
 use nsh_core::prelude::*;
 
-use super::shell::{SIDEBAR_W, bar_h, fill};
+use super::shell::{bar_h, fill};
 use crate::ui::data::RunRow;
 use crate::ui::fmt;
 use crate::ui::i18n::{tr, tr_dyn};
 use crate::ui::icons::Icon;
 use crate::ui::kit::{self, Kind, Tone, btn, caption, dot, small, tool_btn};
 use crate::ui::menus;
-use crate::ui::store::{Dialog, Select, Store};
+use crate::ui::store::{Dialog, Move, SIDEBAR_MAX, SIDEBAR_MIN, Select, Store};
+
+/// Whether the sidebar is drawn on the window's material (macOS's vibrancy, Windows 11's
+/// Mica); elsewhere it paints the theme's sidebar colour.
+pub fn on_material() -> bool {
+    !kit::in_terminal()
+        && match os() {
+            Os::MacOs => true,
+            Os::Windows => kit::mica(),
+            _ => false,
+        }
+}
 
 pub fn sidebar(s: Store) -> View {
     let term = kit::in_terminal();
-    let material = !term && matches!(os(), Os::MacOs | Os::Windows);
+    let material = on_material();
+    let list_ref = element_ref();
+    let focused = signal(false);
+    keys(s, focused);
     view()
-        .w(px(if term { 30.0 * 8.0 } else { SIDEBAR_W }))
+        .w(move || px(if term { 30.0 * 8.0 } else { s.sidebar_w.get() }))
         .flex_shrink_0()
         .min_h(px(0.0))
         .border_r_1()
         .border_color(move || theme().border)
-        // On the material where the platform has one, else the theme's sidebar colour.
         .bg(move || {
             if material {
                 transparent_black().into()
@@ -42,9 +62,100 @@ pub fn sidebar(s: Store) -> View {
                     .px(px(if term { 0.0 } else { 8.0 }))
                     .pb_3()
                     .child(live(s))
-                    .child(list(s)),
+                    .child(
+                        view()
+                            .role(AccessibilityRole::Listbox)
+                            .label(tr("side.runs"))
+                            .focusable(true)
+                            .element_ref(&list_ref)
+                            .test_id("sidebar-list")
+                            .on_focus(move || focused.set(true))
+                            .on_blur(move || focused.set(false))
+                            .child(list(s, list_ref, focused)),
+                    ),
             ),
         )
+        .child((!term).then(|| edge(s)))
+}
+
+/// The keys of the list while it has the keyboard focus (never while a field edits).
+fn keys(s: Store, focused: Signal<bool>) {
+    effect(move || {
+        if !focused.get() {
+            return;
+        }
+        let bind = |k: &str, f: Box<dyn Fn()>| {
+            on_key_with(
+                k,
+                KeyOptions {
+                    when: When::NotEditing,
+                    repeat: true,
+                    for_focus: true,
+                    ..Default::default()
+                },
+                move |_| f(),
+            );
+        };
+        bind("up", Box::new(move || s.move_cursor(Move::Prev, false)));
+        bind("down", Box::new(move || s.move_cursor(Move::Next, false)));
+        bind(
+            "shift+up",
+            Box::new(move || s.move_cursor(Move::Prev, true)),
+        );
+        bind(
+            "shift+down",
+            Box::new(move || s.move_cursor(Move::Next, true)),
+        );
+        bind("home", Box::new(move || s.move_cursor(Move::First, false)));
+        bind("end", Box::new(move || s.move_cursor(Move::Last, false)));
+        bind(
+            "shift+home",
+            Box::new(move || s.move_cursor(Move::First, true)),
+        );
+        bind(
+            "shift+end",
+            Box::new(move || s.move_cursor(Move::Last, true)),
+        );
+        for k in ["enter", "space"] {
+            bind(
+                k,
+                Box::new(move || s.show_selection(s.selection.get_untracked())),
+            );
+        }
+        bind(
+            if menus::mac() {
+                "mod+backspace"
+            } else {
+                "delete"
+            },
+            Box::new(move || s.ask_delete(s.selection.get_untracked())),
+        );
+        for c in ('a'..='z').chain('0'..='9') {
+            bind(&c.to_string(), Box::new(move || s.type_select(c)));
+        }
+    });
+}
+
+/// The sidebar's trailing edge: dragged, it resizes the sidebar (the width is saved when the
+/// drag ends).
+fn edge(s: Store) -> impl IntoElement {
+    let from = stored(0.0_f32);
+    resize_handle()
+        .edge(HandleEdge::Trailing)
+        .accessibility_label(tr("side.resize"))
+        .on_drag_start(move || {
+            from.replace(s.sidebar_w.get_untracked());
+        })
+        .on_drag_move(move |o: &Points| {
+            let w = (from.with(|f| *f) + o.0).clamp(SIDEBAR_MIN, SIDEBAR_MAX);
+            s.sidebar_w.set(w);
+        })
+        .on_drag_end(move |o: &Points| {
+            let w = (from.with(|f| *f) + o.0).clamp(SIDEBAR_MIN, SIDEBAR_MAX);
+            s.sidebar_w.set(w);
+            s.persist();
+        })
+        .child(view().w(px(1.0)).h_full())
 }
 
 /// The sidebar's top: room for the window's controls, the sidebar toggle at its end.
@@ -135,7 +246,7 @@ fn live(s: Store) -> impl IntoElement {
 }
 
 /// The runs grouped under their operator, newest group first.
-fn list(s: Store) -> impl IntoElement {
+fn list(s: Store, list_ref: ElementRef, focused: Signal<bool>) -> impl IntoElement {
     dynamic(move || {
         let runs = s.runs.get();
         untracked(|| {
@@ -143,17 +254,24 @@ fn list(s: Store) -> impl IntoElement {
                 return empty_state(s).into_element();
             }
             let mut groups: Vec<(String, Vec<RunRow>)> = Vec::new();
-            for r in runs {
+            for r in crate::ui::data::sidebar_order(&runs) {
                 match groups.iter_mut().find(|g| g.0 == r.operator) {
                     Some(g) => g.1.push(r),
                     None => groups.push((r.operator.clone(), vec![r])),
                 }
             }
+            let total = runs.len();
+            let mut n = 0;
             view()
                 .children(groups.into_iter().map(|(op, rows)| {
-                    view()
-                        .child(group_header(op))
-                        .children(rows.into_iter().map(|r| row(s, r)))
+                    view().child(group_header(op)).children(
+                        rows.into_iter()
+                            .map(|r| {
+                                n += 1;
+                                row(s, r, n, total, list_ref, focused)
+                            })
+                            .collect::<Vec<_>>(),
+                    )
                 }))
                 .into_element()
         })
@@ -168,21 +286,59 @@ fn group_header(label: impl Into<SharedString>) -> View {
         .child(caption(label.into()).number_of_lines(1))
 }
 
+/// How a selected row looks on this platform: macOS fills it with the accent while the list
+/// has the focus in the key window, and with grey otherwise; Windows and GNOME use a subtle
+/// fill and an accent pill at the leading edge; a terminal reverses it.
+#[derive(Clone, Copy, PartialEq)]
+enum Look {
+    Plain,
+    Accent,
+    Inactive,
+    Subtle,
+}
+
 /// One run: its verdict, short id and preset, when it ran, its goodput and p99.
-fn row(s: Store, r: RunRow) -> View {
+fn row(
+    s: Store,
+    r: RunRow,
+    n: usize,
+    total: usize,
+    list_ref: ElementRef,
+    focused: Signal<bool>,
+) -> View {
     let id = r.id.clone();
-    let (sel_id, ctx_id, a11y) = (id.clone(), id.clone(), fill("runs.open", &[&id]));
+    let (sel_id, ctx_id, menu_id) = (id.clone(), id.clone(), id.clone());
+    let a11y = format!("{} ({n}/{total})", fill("runs.open", &[&id]));
     let selected = computed(move || s.selection.with(|v| v.contains(&sel_id)));
-    let selected = move || selected.get();
+    let marked = computed(move || {
+        s.context_row
+            .with(|c| c.as_deref() == Some(ctx_id.as_str()))
+    });
+    let term = kit::in_terminal();
+    let mac = menus::mac();
+    let look = move || {
+        if !selected.get() {
+            Look::Plain
+        } else if term {
+            Look::Accent
+        } else if mac {
+            let key = main_window().state().is_none_or(|w| w.focused);
+            if key && focused.get() {
+                Look::Accent
+            } else {
+                Look::Inactive
+            }
+        } else {
+            Look::Subtle
+        }
+    };
     let tone = Tone::of_verdict(r.verdict);
     let short = r.id.rsplit('-').next().unwrap_or(&r.id).to_owned();
-    let term = kit::in_terminal();
     view()
-        .role(AccessibilityRole::Button)
+        .role(AccessibilityRole::Option)
         .label(a11y)
-        .focusable(true)
         .accessibility_state(move || AccessibilityState {
-            selected: selected(),
+            selected: selected.get(),
             ..Default::default()
         })
         .test_id(&format!("run-{}", r.id))
@@ -192,30 +348,32 @@ fn row(s: Store, r: RunRow) -> View {
         .px(px(8.0))
         .py(px(if term { 0.0 } else { 5.0 }))
         .rounded(px(6.0))
-        .bg(move || {
-            if selected() {
+        .bg(move || match look() {
+            Look::Accent => theme().primary,
+            Look::Inactive => kit::token("selection-inactive")(),
+            Look::Subtle => kit::token("selection")(),
+            Look::Plain => transparent_black().into(),
+        })
+        .text_color(move || match look() {
+            Look::Accent => theme().primary_foreground,
+            _ => theme().foreground,
+        })
+        .outline(px(if term { 0.0 } else { 2.0 }))
+        .outline_color(move || {
+            if marked.get() {
                 theme().primary
             } else {
                 transparent_black().into()
             }
         })
-        .text_color(move || {
-            if selected() {
-                theme().primary_foreground
-            } else {
-                theme().foreground
-            }
-        })
         .hover(move |st| {
-            st.bg(move || {
-                if selected() {
-                    theme().primary
-                } else {
-                    theme().secondary
-                }
+            st.bg(move || match look() {
+                Look::Accent => theme().primary,
+                Look::Inactive => kit::token("selection-inactive")(),
+                Look::Subtle => kit::token("selection")(),
+                Look::Plain => theme().secondary,
             })
         })
-        .focus_visible(kit::ring)
         .on_press(move |e: &PressEvent| {
             let m = e.modifiers;
             let toggle = if menus::mac() { m.cmd } else { m.ctrl };
@@ -226,9 +384,25 @@ fn row(s: Store, r: RunRow) -> View {
             } else {
                 Select::Only
             };
+            list_ref.focus();
             s.select(&id, how);
         })
-        .on_context_menu(move |_: &ContextMenuEvent| menus::run_context(s, &ctx_id))
+        .on_context_menu(move |_: &ContextMenuEvent| menus::run_context(s, &menu_id))
+        // Windows' and GNOME's selection: an accent pill at the leading edge.
+        .child((!term && !mac).then(|| {
+            view()
+                .w(px(3.0))
+                .h(px(16.0))
+                .ml(px(-5.0))
+                .rounded_full()
+                .bg(move || {
+                    if look() == Look::Subtle {
+                        theme().primary
+                    } else {
+                        transparent_black().into()
+                    }
+                })
+        }))
         .child(dot(move || tone))
         .child(
             view()
