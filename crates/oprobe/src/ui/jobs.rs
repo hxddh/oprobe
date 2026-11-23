@@ -38,6 +38,8 @@ pub async fn off_thread<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'stati
 pub struct Trial {
     pub candidate: bool,
     pub value: f64,
+    /// Operations it counted (the objective's resolution).
+    pub ops: u64,
 }
 
 /// The verdict of a Prove with its evidence and the proven diff.
@@ -47,8 +49,8 @@ pub struct Proved {
     pub delta: (f64, f64, f64),
     pub significant: bool,
     pub pairs: u64,
-    /// The objective of each A/B pair, `(baseline, candidate)`, in order.
-    pub ab: Vec<(f64, f64)>,
+    /// The objective of each A/B pair, `(baseline, candidate, fewest operations)`, in order.
+    pub ab: Vec<(f64, f64, u64)>,
     /// The other metrics (shown, never decisive).
     pub secondary: Vec<Secondary>,
     pub rust: String,
@@ -210,6 +212,7 @@ impl Job {
                         s.trials.push(Trial {
                             candidate: r.spec.profile.operator != *base,
                             value,
+                            ops: r.summary.ops,
                         });
                     }
                     s.spark.clear();
@@ -295,22 +298,42 @@ impl Job {
 }
 
 /// The objective of each complete A/B pair of a prove's trials, by pair number.
-pub fn ab_pairs(trials: &[crate::app::prove::ProveTrial], p99: bool) -> Vec<(f64, f64)> {
+pub fn ab_pairs(trials: &[crate::app::prove::ProveTrial], p99: bool) -> Vec<(f64, f64, u64)> {
     use crate::app::prove::TrialKind;
     let v = |t: &crate::app::prove::ProveTrial| if p99 { t.p99_ms } else { t.goodput_ops_per_s };
-    let mut by: std::collections::BTreeMap<u64, (Option<f64>, Option<f64>)> = Default::default();
+    type Side = Option<(f64, u64)>;
+    let mut by: std::collections::BTreeMap<u64, (Side, Side)> = Default::default();
     for t in trials {
         let Some(pair) = t.pair else { continue };
         let e = by.entry(pair).or_default();
         match t.kind {
-            TrialKind::Baseline => e.0 = Some(v(t)),
-            TrialKind::Candidate => e.1 = Some(v(t)),
+            TrialKind::Baseline => e.0 = Some((v(t), t.ops_count)),
+            TrialKind::Candidate => e.1 = Some((v(t), t.ops_count)),
             TrialKind::Sizing => {}
         }
     }
     by.into_values()
-        .filter_map(|(a, b)| Some((a?, b?)))
+        .filter_map(|(a, b)| {
+            let ((a, na), (b, nb)) = (a?, b?);
+            Some((a, b, na.min(nb)))
+        })
         .collect()
+}
+
+/// Prove's pairs so far as `(baseline, candidate, fewest operations)`.
+pub fn ab_live(trials: &[Trial]) -> Vec<(f64, f64, u64)> {
+    let mut out = Vec::new();
+    let mut last_a = None;
+    for t in trials {
+        if t.candidate {
+            if let Some((a, na)) = last_a.take() {
+                out.push((a, t.value, t.ops.min(na)));
+            }
+        } else {
+            last_a = Some((t.value, t.ops));
+        }
+    }
+    out
 }
 
 /// Prove's pairs so far: each candidate with the baseline just before it, and the change of
@@ -403,7 +426,11 @@ mod tests {
 
     #[test]
     fn pairs_take_the_baseline_before_each_candidate() {
-        let t = |candidate, value| Trial { candidate, value };
+        let t = |candidate, value| Trial {
+            candidate,
+            value,
+            ops: 100,
+        };
         let p = pairs(&[
             t(false, 100.0),
             t(false, 100.0),

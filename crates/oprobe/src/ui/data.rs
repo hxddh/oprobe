@@ -83,6 +83,8 @@ pub struct Seg {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Bar {
     pub label: String,
+    /// Waiting before this attempt since the previous one ended (retry backoff), µs.
+    pub backoff_us: u64,
     pub start_us: u64,
     pub total_us: u64,
     pub segs: Vec<Seg>,
@@ -109,6 +111,10 @@ pub struct Point {
     pub mib_per_s: f64,
     pub p50_ms: f64,
     pub p99_ms: f64,
+    pub p999_ms: f64,
+    pub max_ms: f64,
+    /// The most requests in flight at once in the slice.
+    pub inflight_peak: u64,
     pub errors: u64,
     pub throttled: u64,
 }
@@ -173,6 +179,9 @@ pub struct ProfileModel {
     pub mib_per_s: f64,
     pub p50_ms: f64,
     pub p99_ms: f64,
+    pub p999_ms: f64,
+    pub ops_count: u64,
+    pub requests_count: u64,
     pub error_ratio: f64,
     pub throttled_ratio: f64,
     pub stages: Vec<StageBar>,
@@ -186,6 +195,13 @@ pub struct ProfileModel {
     pub verbs: Vec<VerbRow>,
     /// The in-flight levels behind a concurrency ceiling (when anything was throttled).
     pub concurrency: Option<view::ConcurrencyView>,
+    pub setup: view::SetupView,
+    pub trust: view::TrustView,
+    /// The backend's requests by API, busiest first.
+    pub apis: Vec<view::ApiRow>,
+    pub retry: view::RetryView,
+    pub bytes: view::BytesView,
+    pub spread: view::SpreadView,
     pub conns: Conns,
     pub warnings: Vec<String>,
 }
@@ -233,6 +249,9 @@ pub fn of_run(run: &Run) -> ProfileModel {
         mib_per_s: n.mib_per_s,
         p50_ms: n.p50_ms,
         p99_ms: n.p99_ms,
+        p999_ms: n.p999_ms,
+        ops_count: n.ops_count,
+        requests_count: n.requests_count,
         error_ratio: n.error_ratio,
         throttled_ratio: n.throttled_request_ratio,
         stages: time
@@ -244,7 +263,7 @@ pub fn of_run(run: &Run) -> ProfileModel {
             })
             .collect(),
         findings: findings(r),
-        slowest: slowest(run, 6),
+        slowest: slowest(run, 3),
         timeline: r
             .timeline
             .iter()
@@ -255,6 +274,9 @@ pub fn of_run(run: &Run) -> ProfileModel {
                 mib_per_s: p.mib_per_s,
                 p50_ms: p.p50_ms,
                 p99_ms: p.p99_ms,
+                p999_ms: p.p999_ms,
+                max_ms: p.max_ms,
+                inflight_peak: p.inflight_peak,
                 errors: p.errors,
                 throttled: p.throttled,
             })
@@ -281,6 +303,12 @@ pub fn of_run(run: &Run) -> ProfileModel {
             })
             .collect(),
         concurrency: view::ConcurrencyView::of(r),
+        setup: view::SetupView::of(r),
+        trust: view::TrustView::of(r),
+        apis: view::apis(r),
+        retry: view::RetryView::of(r),
+        bytes: view::BytesView::of(r),
+        spread: view::SpreadView::of(r),
         conns: Conns {
             dialed: c.dialed,
             reuse_ratio: c.reuse_pct / 100.0,
@@ -374,6 +402,7 @@ fn slowest(run: &Run, n: usize) -> Vec<Waterfall> {
                 .min()
                 .unwrap_or(op.t_us)
                 .min(op.t_us);
+            let mut prev_end: Option<i64> = None;
             Waterfall {
                 op_id: op.op_id,
                 verb: op.verb.to_string(),
@@ -382,6 +411,13 @@ fn slowest(run: &Run, n: usize) -> Vec<Waterfall> {
                 bars: reqs
                     .into_iter()
                     .map(|r| {
+                        // A retry waited from the previous attempt's end to its own start.
+                        let backoff_us = match prev_end {
+                            Some(end) if r.attempt > 1 && r.t_us > end => (r.t_us - end) as u64,
+                            _ => 0,
+                        };
+                        prev_end =
+                            Some(prev_end.unwrap_or(i64::MIN).max(r.t_us + r.total_us as i64));
                         let parts = [
                             ("queue", r.queue_us),
                             ("connect", r.connect_us()),
@@ -408,6 +444,7 @@ fn slowest(run: &Run, n: usize) -> Vec<Waterfall> {
                             r.status.to_string()
                         };
                         Bar {
+                            backoff_us,
                             label: if r.attempt > 1 {
                                 format!("{} #{} {status}", r.api, r.attempt)
                             } else {

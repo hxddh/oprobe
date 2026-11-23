@@ -58,7 +58,7 @@ change of your own: `oprobe prove last --with layers.tail_cut=on`.
 oprobe
 ```
 
-The app shows the same runs in four views: Runs, Profile, Operator and Compare. In the Operator
+The app shows the same runs in a sidebar. A run opens in Profile or Operator, and two or more selected runs open in Compare. In the Operator
 view you can toggle a layer, press *Prove* and watch the A/B pairs arrive. See [the app](app.md).
 
 ## 5. Your storage

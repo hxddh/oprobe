@@ -1083,10 +1083,22 @@ fn mean(ts: &[&ProveTrial], f: impl Fn(&ProveTrial) -> f64) -> f64 {
     ts.iter().map(|t| f(t)).sum::<f64>() / ts.len() as f64
 }
 
+/// The smallest change a trial of `ops` operations can resolve, as a log ratio: one operation
+/// more or less is `ln(1 + 1/ops)` (2.7 % at 37 operations). Below it, a run of A/A trials that
+/// happen to agree exactly says nothing about the noise (0 when nothing was counted).
+pub fn count_resolution(ops: u64) -> f64 {
+    if ops == 0 {
+        0.0
+    } else {
+        (1.0 + 1.0 / ops as f64).ln()
+    }
+}
+
 /// The A/A noise floor: the RMS log ratio of consecutive baseline trials (a per-pair spread),
-/// at least [`MIN_NOISE_SD`]. Fewer than two A/A differences cannot say how precise the floor
-/// is, so it is doubled (and with none, it is twice the minimum).
-fn noise_floor(a: &[f64]) -> f64 {
+/// at least [`MIN_NOISE_SD`] and at least the trials' count `resolution`
+/// ([`count_resolution`]). Fewer than two A/A differences cannot say how precise the floor is,
+/// so it is doubled (and with none, it is twice the minimum).
+fn noise_floor(a: &[f64], resolution: f64) -> f64 {
     let d: Vec<f64> = a
         .windows(2)
         .filter(|w| w[0] > 0.0 && w[1] > 0.0)
@@ -1097,7 +1109,7 @@ fn noise_floor(a: &[f64]) -> f64 {
     } else {
         (d.iter().map(|x| x * x).sum::<f64>() / d.len() as f64).sqrt()
     };
-    let floor = rms.max(MIN_NOISE_SD);
+    let floor = rms.max(MIN_NOISE_SD).max(resolution);
     if d.len() < 2 { 2.0 * floor } else { floor }
 }
 
@@ -1136,12 +1148,15 @@ fn objective_interval(obj: ProveObjective, a: &[f64], b: &[f64], floor: f64) -> 
 
 /// The objective's interval after each A/B pair, as the prove saw it grow (the convergence
 /// chart): the same estimate and interval as the verdict's, over the first 1, 2, … n pairs,
-/// with the A/A noise floor known at that point. `a` and `b` are the paired objective values.
-pub fn convergence(obj: ProveObjective, a: &[f64], b: &[f64]) -> Vec<Converged> {
+/// with the A/A noise floor known at that point. `a` and `b` are the paired objective values;
+/// `ops[k]` is the fewest operations a trial of the first `k + 1` pairs counted (missing: no
+/// resolution floor).
+pub fn convergence(obj: ProveObjective, a: &[f64], b: &[f64], ops: &[u64]) -> Vec<Converged> {
     let n = a.len().min(b.len());
     (1..=n)
         .map(|k| {
-            let floor = noise_floor(&a[..k]);
+            let res = ops.get(k - 1).map(|o| count_resolution(*o)).unwrap_or(0.0);
+            let floor = noise_floor(&a[..k], res);
             Converged {
                 interval: objective_interval(obj, &a[..k], &b[..k], floor),
                 noise_floor_ratio: floor,
@@ -1363,6 +1378,8 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
     let mut b_vals: Vec<f64> = Vec::new();
     let mut pairs = 0u64;
     let mut decision = SprtDecision::Continue;
+    // The fewest operations a paired trial counted: the objective's resolution.
+    let mut min_ops = u64::MAX;
     let candidate_value = sizing.as_ref().map(|s| s.value.clone());
     while (pairs as usize) < max_pairs && t.time_left() {
         let Some(a) = t
@@ -1387,8 +1404,9 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
         };
         a_vals.push(obj.value(&a));
         b_vals.push(obj.value(&b));
+        min_ops = min_ops.min(a.ops_count).min(b.ops_count);
         pairs += 1;
-        let floor = noise_floor(&a_vals);
+        let floor = noise_floor(&a_vals, count_resolution(min_ops));
         let mut sprt = Sprt::new((2.0 * floor).max(MIN_EFFECT), floor, 0.05, 0.10);
         for (x, y) in a_vals.iter().zip(&b_vals) {
             sprt.push(obj.signed_log_ratio(*x, *y));
@@ -1430,7 +1448,14 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
         notes.push("the budget ran out before one A/B pair could run".to_owned());
     }
     // Step 4: decide.
-    let floor = noise_floor(&a_vals);
+    let floor = noise_floor(
+        &a_vals,
+        if pairs == 0 {
+            0.0
+        } else {
+            count_resolution(min_ops)
+        },
+    );
     let delta = objective_interval(obj, &a_vals, &b_vals, floor);
     let better = |x: f64| match obj {
         ProveObjective::Goodput => x > 0.0,
@@ -1568,13 +1593,33 @@ mod tests {
     }
 
     #[test]
+    fn a_one_operation_difference_is_not_a_change() {
+        // The macOS CI trials: ~37 operations each, the A/A trials agreeing exactly and the
+        // candidates one or two operations short. Without the count resolution the interval
+        // excluded no change (−6.0 %, −0.4 %): "worse" from rounding.
+        let a = [37.0, 37.0, 37.0, 38.0, 37.0];
+        let b = [36.0, 35.0, 37.0, 37.0, 35.0];
+        let loose = objective_interval(ProveObjective::Goodput, &a, &b, noise_floor(&a, 0.0));
+        assert!(loose.high < 0.0, "{loose:?}");
+        let floor = noise_floor(&a, count_resolution(35));
+        assert!(floor > MIN_NOISE_SD);
+        let i = objective_interval(ProveObjective::Goodput, &a, &b, floor);
+        assert!(i.low < 0.0 && i.high > 0.0, "{i:?}");
+        // Thousands of operations resolve far below the minimum floor: nothing changes.
+        assert_eq!(
+            noise_floor(&a, count_resolution(10_000)),
+            noise_floor(&a, 0.0)
+        );
+    }
+
+    #[test]
     fn convergence_ends_on_the_verdicts_interval() {
         let a = [100.0, 102.0, 99.0, 101.0, 100.0];
         let b = [120.0, 121.0, 118.0, 122.0, 119.0];
-        let c = convergence(ProveObjective::Goodput, &a, &b);
+        let c = convergence(ProveObjective::Goodput, &a, &b, &[]);
         assert_eq!(c.len(), 5);
         let last = c.last().unwrap();
-        let floor = noise_floor(&a);
+        let floor = noise_floor(&a, 0.0);
         assert_eq!(last.noise_floor_ratio, floor);
         assert_eq!(
             last.interval,
@@ -1589,14 +1634,14 @@ mod tests {
     #[test]
     fn the_noise_floor_has_a_minimum() {
         // No A/A difference yet: the minimum, widened.
-        assert_eq!(noise_floor(&[100.0]), 2.0 * MIN_NOISE_SD);
-        let f = noise_floor(&[100.0, 120.0, 100.0]);
+        assert_eq!(noise_floor(&[100.0], 0.0), 2.0 * MIN_NOISE_SD);
+        let f = noise_floor(&[100.0, 120.0, 100.0], 0.0);
         assert!(f > 0.15 && f < 0.2, "{f}");
     }
 
     #[test]
     fn one_aa_difference_is_not_a_precise_floor() {
-        let one = noise_floor(&[100.0, 110.0]);
+        let one = noise_floor(&[100.0, 110.0], 0.0);
         let d = (110.0f64 / 100.0).ln();
         assert!((one - 2.0 * d).abs() < 1e-12, "{one}");
     }

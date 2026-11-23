@@ -68,7 +68,7 @@ dirs.workspace = true
 tokio-util.workspace = true
 
 # The app (Native Shell): the terminal workbench (`app`, default) and native windows (`gui`).
-nsh-core = { version = "0.6", optional = true }
+nsh-core = { version = "0.6", features = ["svg"], optional = true }
 nsh-base = { version = "0.6", default-features = false, features = ["plot"], optional = true }
 nsh-platform-tui = { version = "0.6", default-features = false, features = ["run-app"], optional = true }
 ratatui-core = { version = "0.1", optional = true }

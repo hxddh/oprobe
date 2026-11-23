@@ -18,8 +18,8 @@ use crate::ui::fmt;
 use crate::ui::i18n::{finding_title, tr, tr_dyn};
 use crate::ui::jobs::{Outcome, pairs};
 use crate::ui::kit::{
-    Kind, Tone, badge, body, btn, caption, empty, field, mono, section, segmented, small, strong,
-    switch_on, title,
+    self, Kind, Tone, badge, body, btn, caption, empty, field, mono, section, segmented, small,
+    strong, switch_on,
 };
 use crate::ui::plots;
 use crate::ui::store::{Store, store};
@@ -48,15 +48,7 @@ fn content(s: Store, m: Rc<ProfileModel>) -> View {
         .collect();
     let base = m.operator.clone();
     let edited = computed(move || data::apply(&base, &s.edits.get()));
-    let mut v = view()
-        .test_id("operator")
-        .child(
-            view()
-                .gap_1()
-                .child(title(m.operator_ref.clone()))
-                .child(small(fill("operator.of_run", &[&m.id]))),
-        )
-        .child(remedy_list(s, &m));
+    let mut v = view().test_id("operator").child(remedy_list(s, &m));
     for (name, fields) in SECTIONS {
         v = v.child(section_of(s, name, fields, &m, &remedies, edited));
     }
@@ -71,9 +63,10 @@ fn remedy_list(s: Store, m: &ProfileModel) -> View {
         .cloned()
         .collect();
     if with.is_empty() {
-        return section(tr("operator.remedies")).child(small(tr("operator.no_remedies")));
+        return kit::section_first(tr("operator.remedies"))
+            .child(small(tr("operator.no_remedies")));
     }
-    section(tr("operator.remedies")).children(with.into_iter().map(move |f| {
+    kit::section_first(tr("operator.remedies")).children(with.into_iter().map(move |f| {
         let r = f.remedy.clone();
         view()
             .flex_row()
@@ -117,16 +110,46 @@ fn section_of(
     remedies: &[(String, String)],
     edited: Edited,
 ) -> View {
-    section(tr_dyn(&format!("operator.section.{name}")).unwrap_or(name)).children(
-        fields.iter().map(|f| {
-            let rem: BTreeSet<String> = remedies
-                .iter()
-                .filter(|(p, _)| p == f.path || data::layer_of(p) == Some(f.path))
-                .map(|(_, c)| c.clone())
-                .collect();
-            field_row(s, *f, data::value_of(&m.operator, f.path), rem, edited)
-        }),
+    let rem = |f: &Field| -> BTreeSet<String> {
+        remedies
+            .iter()
+            .filter(|(p, _)| p == f.path || data::layer_of(p) == Some(f.path))
+            .map(|(_, c)| c.clone())
+            .collect()
+    };
+    let row = |f: &Field, first: bool| {
+        field_row(
+            s,
+            *f,
+            data::value_of(&m.operator, f.path),
+            rem(f),
+            edited,
+            first,
+        )
+    };
+    let sec = section(tr_dyn(&format!("operator.section.{name}")).unwrap_or(name));
+    if name != "layers" {
+        return sec.child(group().children(fields.iter().enumerate().map(|(i, f)| row(f, i == 0))));
+    }
+    // Each layer is a group: the layer with its switch, then its parameters.
+    let mut groups: Vec<Vec<&Field>> = Vec::new();
+    for f in fields.iter() {
+        if data::layer_of(f.path).is_none() {
+            groups.push(vec![f]);
+        } else if let Some(g) = groups.last_mut() {
+            g.push(f);
+        }
+    }
+    sec.children(
+        groups
+            .into_iter()
+            .map(|g| group().children(g.into_iter().enumerate().map(|(i, f)| row(f, i == 0)))),
     )
+}
+
+/// A grouped inset surface for rows of settings.
+fn group() -> View {
+    kit::panel().px(px(if kit::in_terminal() { 1.0 } else { 12.0 }))
 }
 
 fn field_row(
@@ -135,6 +158,7 @@ fn field_row(
     base: String,
     remedy_of: BTreeSet<String>,
     edited: Edited,
+    first: bool,
 ) -> View {
     let path = f.path;
     let now = move || edited.with(|(e, _)| data::value_of(e, path));
@@ -142,8 +166,7 @@ fn field_row(
     let layer_on = move || {
         data::layer_of(path).is_none_or(|l| edited.with(|(e, _)| data::value_of(e, l) == "on"))
     };
-    let highlight = !remedy_of.is_empty();
-    let indent = data::layer_of(path).is_some();
+    let is_layer = f.kind == FieldKind::Layer;
     let control: AnyElement = match f.kind {
         FieldKind::Layer | FieldKind::Switch => switch_on(
             path,
@@ -177,47 +200,54 @@ fn field_row(
             move || s.edits.with(|e| e.get(path).cloned()).unwrap_or_else(now),
             move |v| s.edit(path, &v),
         )
-        .w(px(110.0))
+        .w(px(120.0))
         .into_element(),
     };
+    // The row's name: the layer's or the parameter's own (the full path is the accessible
+    // name and shows in the diff).
+    let name = path.rsplit('.').next().unwrap_or(path).to_owned();
     view()
         .flex_row()
-        .flex_wrap()
         .items_center()
-        .gap_2()
-        .py(px(2.0))
-        .pl(px(if indent { 18.0 } else { 0.0 }))
-        .rounded(px(4.0))
-        .opacity(move || if layer_on() { 1.0_f32 } else { 0.5 })
-        .bg(move || {
-            if highlight {
-                theme().color("selection").unwrap_or(theme().accent)
-            } else {
-                transparent_black().into()
-            }
-        })
-        .child(control)
+        .gap_3()
+        .min_h(px(if kit::in_terminal() { 16.0 } else { 40.0 }))
+        .py(px(if kit::in_terminal() { 0.0 } else { 6.0 }))
+        .border_t(px(if first { 0.0 } else { 1.0 }))
+        .border_color(move || theme().border)
+        .opacity(move || if layer_on() { 1.0_f32 } else { 0.45 })
         .child(
-            text(path)
-                .text_size(px(12.0))
-                .font_weight(if indent {
-                    FontWeight::NORMAL
-                } else {
-                    FontWeight::SEMIBOLD
-                })
-                .w(px(220.0))
-                .number_of_lines(1),
+            view()
+                .flex_1()
+                .min_w(px(0.0))
+                .child(
+                    view()
+                        .flex_row()
+                        .flex_wrap()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            text(name)
+                                .text_size(px(kit::metrics().body))
+                                .font_weight(if is_layer {
+                                    FontWeight::SEMIBOLD
+                                } else {
+                                    FontWeight::NORMAL
+                                })
+                                .number_of_lines(1),
+                        )
+                        .child(dynamic(move || {
+                            let c = changed();
+                            untracked(|| c.then(|| badge(tr("operator.changed"), || Tone::Info)))
+                        }))
+                        .children(remedy_of.into_iter().map(|code| {
+                            badge(fill("operator.remedy_of", &[&finding_title(&code)]), || {
+                                Tone::Warn
+                            })
+                        })),
+                )
+                .child(small(f.api).number_of_lines(1)),
         )
-        .child(small(f.api).flex_1().min_w(px(0.0)).number_of_lines(1))
-        .child(dynamic(move || {
-            let c = changed();
-            untracked(|| c.then(|| badge(tr("operator.changed"), || Tone::Info)))
-        }))
-        .children(remedy_of.into_iter().map(|code| {
-            badge(fill("operator.remedy_of", &[&finding_title(&code)]), || {
-                Tone::Warn
-            })
-        }))
+        .child(control)
 }
 
 fn copy_row(rust: String, toml: String) -> View {
@@ -357,9 +387,9 @@ fn prove_state(st: crate::ui::jobs::State, p99: bool) -> View {
         v = v.child(small(fill("operator.replays", &[&st.trials.len()])));
     }
     // The pairs as the prove recorded them once it ends, else as they stream in.
-    let ab: Vec<(f64, f64)> = match &st.outcome {
+    let ab: Vec<(f64, f64, u64)> = match &st.outcome {
         Some(Outcome::Proved(p)) if !p.ab.is_empty() => p.ab.clone(),
-        _ => ps.iter().map(|(a, b, _)| (*a, *b)).collect(),
+        _ => crate::ui::jobs::ab_live(&st.trials),
     };
     if let Some(plot) = plots::prove(&ab, p99) {
         v = v.child(view().test_id("prove-chart").child(chart(

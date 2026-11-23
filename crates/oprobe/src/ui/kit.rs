@@ -1,7 +1,11 @@
-//! The app's own controls on `nsh_base` (which has behaviour and no look): compact,
-//! native-density, in the theme's tokens. The views compose only these.
+//! The app's own controls on `nsh_base` (which has behaviour and no look), at the platform's
+//! density (design app-native "Look"): macOS's compact 13 pt controls, Windows' and GNOME's
+//! taller ones, one cell on a terminal. Sections are spaced, not boxed; headings are sentence
+//! case. The views compose only these.
 
 use nsh_base::{button, input, switch, theme, toggle, toggle_group};
+use nsh_core::element::os;
+use nsh_core::platform::Os;
 use nsh_core::prelude::*;
 
 use crate::analysis::diagnosis::Severity;
@@ -82,35 +86,80 @@ fn radius() -> AbsoluteLength {
     px(theme().radius.0).into()
 }
 
-// Typography: the system font at native desktop sizes (13 pt body), tabular numerals.
+/// The platform's sizes: a control's height, the body text and the secondary text.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Metrics {
+    pub control_h: f32,
+    pub body: f32,
+    pub small: f32,
+}
+
+/// The sizes of this platform (macOS's 13 pt, Windows' Segoe 14 px, GNOME's 11 pt Cantarell,
+/// a terminal's cells).
+pub fn metrics() -> Metrics {
+    if in_terminal() {
+        return Metrics {
+            control_h: 16.0,
+            body: 13.0,
+            small: 12.0,
+        };
+    }
+    match os() {
+        Os::MacOs => Metrics {
+            control_h: 24.0,
+            body: 13.0,
+            small: 11.0,
+        },
+        Os::Windows => Metrics {
+            control_h: 30.0,
+            body: 14.0,
+            small: 12.0,
+        },
+        _ => Metrics {
+            control_h: 32.0,
+            body: 14.0,
+            small: 12.0,
+        },
+    }
+}
+
+// Typography: the system font at the platform's sizes, tabular numerals.
 
 pub fn body(t: impl IntoReactive<SharedString>) -> Text {
-    text(t).text_size(px(13.0))
+    text(t).text_size(px(metrics().body))
 }
 
 pub fn strong(t: impl IntoReactive<SharedString>) -> Text {
     text(t)
-        .text_size(px(13.0))
+        .text_size(px(metrics().body))
         .font_weight(FontWeight::SEMIBOLD)
 }
 
+/// The title of what the window shows (a run's id).
 pub fn title(t: impl IntoReactive<SharedString>) -> Text {
     text(t)
-        .text_size(px(17.0))
+        .text_size(px(metrics().body + 2.0))
+        .font_weight(FontWeight::SEMIBOLD)
+}
+
+/// A section's heading: body size, semibold, sentence case.
+pub fn heading(t: impl IntoReactive<SharedString>) -> Text {
+    text(t)
+        .text_size(px(metrics().body))
         .font_weight(FontWeight::SEMIBOLD)
 }
 
 pub fn small(t: impl IntoReactive<SharedString>) -> Text {
     text(t)
-        .text_size(px(11.0))
+        .text_size(px(metrics().small))
         .text_color(move || theme().muted_foreground)
 }
 
-/// A section heading.
+/// A label beside a value or above a group (secondary text, medium weight).
 pub fn caption(t: impl IntoReactive<SharedString>) -> Text {
     text(t)
-        .text_size(px(11.0))
-        .font_weight(FontWeight::SEMIBOLD)
+        .text_size(px(metrics().small))
+        .font_weight(FontWeight::MEDIUM)
         .text_color(move || theme().muted_foreground)
 }
 
@@ -171,8 +220,8 @@ pub fn btn(
     button()
         .on_press(on_press)
         .accessibility_label(move || Some(a11y.get()))
-        .h(px(26.0))
-        .px(px(10.0))
+        .h(px(metrics().control_h))
+        .px(px(if in_terminal() { 8.0 } else { 12.0 }))
         .flex_shrink_0()
         .flex_row()
         .items_center()
@@ -191,36 +240,43 @@ pub fn btn(
         .disabled_style(|s| s.opacity(0.4))
         .child(
             text(label)
-                .text_size(px(13.0))
-                .font_weight(FontWeight::MEDIUM)
+                .text_size(px(metrics().body))
                 .number_of_lines(1)
                 .text_color(fg),
         )
 }
 
-/// A pressable list row (history, findings, navigation): keyboard focusable.
-pub fn row_button(
+/// A borderless icon button of the toolbar, its label the tooltip and the accessible name.
+pub fn tool_btn(
+    icon: crate::ui::icons::Icon,
     label: impl IntoReactive<SharedString>,
-    selected: impl Fn() -> bool + Copy + 'static,
     on_press: impl Fn() + 'static,
 ) -> nsh_base::ButtonElement {
     let label = label.into_reactive();
+    let (a11y, tip) = (label.clone(), label);
+    let size = if in_terminal() { 16.0 } else { 28.0 };
     button()
-        .selected(selected)
         .on_press(on_press)
-        .accessibility_label(move || Some(label.get()))
-        .px(px(8.0))
-        .py(px(4.0))
-        .rounded(radius)
+        .accessibility_label(move || Some(a11y.get()))
+        .w(px(size))
+        .h(px(size))
+        .flex_shrink_0()
+        .items_center()
+        .justify_center()
+        .rounded(px(6.0))
+        .text_color(move || theme().muted_foreground)
         .hover(|s| s.bg(move || theme().secondary))
-        .bg(move || {
-            if selected() {
-                theme().accent
-            } else {
-                transparent_black().into()
-            }
-        })
+        .active(|s| s.opacity(0.7))
         .focus_visible(ring)
+        .disabled_style(|s| s.opacity(0.35))
+        .child(
+            view()
+                .size_full()
+                .items_center()
+                .justify_center()
+                .tooltip(text(tip).text_size(px(12.0)))
+                .child(crate::ui::icons::icon(icon, 16.0, None)),
+        )
 }
 
 /// A text field bound to a signal; `id` is its test id, `label` its accessible name.
@@ -240,9 +296,9 @@ pub fn field(
         .placeholder(placeholder.into())
         .placeholder_color(|| color(theme().muted_foreground))
         .caret_color(|| color(theme().primary))
-        .h(px(26.0))
+        .h(px(metrics().control_h))
         .px(px(8.0))
-        .text_size(px(13.0))
+        .text_size(px(metrics().body))
         .rounded(radius)
         .border_1()
         .border_color(move || theme().input)
@@ -299,7 +355,7 @@ pub fn segmented<T: Copy + PartialEq + 'static>(
                 .accessibility_label(label.clone())
                 .on_change(move |_: &bool| set(key))
                 .px(px(10.0))
-                .h(px(22.0))
+                .h(px((metrics().control_h - 4.0).max(16.0)))
                 .justify_center()
                 .rounded(radius)
                 .bg(move || {
@@ -310,45 +366,81 @@ pub fn segmented<T: Copy + PartialEq + 'static>(
                     }
                 })
                 .focus_visible(ring)
-                .child(text(label).text_size(px(12.0)).number_of_lines(1))
+                .child(
+                    text(label)
+                        .text_size(px(metrics().body - 1.0))
+                        .number_of_lines(1),
+                )
         }))
 }
 
-/// A bordered surface.
+/// A grouped surface (a form's fields, a set of numbers): a quiet fill, no border.
 pub fn panel() -> View {
     view()
         .rounded(move || px(theme().number("radius-card").unwrap_or(8.0)))
-        .border_1()
-        .border_color(move || theme().border)
-        .bg(move || theme().card)
+        .bg(move || theme().muted)
         .min_w(px(0.0))
 }
 
-/// A section: a heading over its content, in a panel.
-pub fn section(heading: impl IntoReactive<SharedString>) -> View {
-    panel().p_3().gap_2().child(caption(heading))
+/// A section: its heading over its content, set apart by space (and a hairline above), not
+/// by a box.
+pub fn section(heading_text: impl IntoReactive<SharedString>) -> View {
+    let h = heading_text.into_reactive();
+    let shown = h.clone();
+    view()
+        .gap_2()
+        .pt(px(if in_terminal() { 0.0 } else { 16.0 }))
+        .border_t_1()
+        .border_color(move || theme().border)
+        .min_w(px(0.0))
+        .child(dynamic(move || {
+            let t = shown.get();
+            untracked(|| (!t.is_empty()).then(|| heading(t.clone())))
+        }))
 }
 
-/// A coloured pill.
+/// The first section of a view: no hairline above it.
+pub fn section_first(heading_text: impl IntoReactive<SharedString>) -> View {
+    section(heading_text).border_t(px(0.0)).pt(px(0.0))
+}
+
+/// A verdict or severity: a filled dot and its word, in the tone's colour.
 pub fn badge(
     label: impl IntoReactive<SharedString>,
     tone: impl Fn() -> Tone + Copy + 'static,
 ) -> View {
     view()
-        .px(px(6.0))
-        .py(px(1.0))
-        .rounded(radius)
-        .border_1()
-        .border_color(move || tone().color())
+        .flex_row()
+        .items_center()
+        .gap(px(5.0))
         .self_start()
         .flex_shrink_0()
+        .child(dot(tone))
         .child(
             text(label)
-                .text_size(px(11.0))
-                .font_weight(FontWeight::SEMIBOLD)
+                .text_size(px(metrics().small))
+                .font_weight(FontWeight::MEDIUM)
                 .number_of_lines(1)
                 .text_color(move || tone().color()),
         )
+}
+
+/// A small filled dot in a tone's colour (a `●` in a terminal).
+pub fn dot(tone: impl Fn() -> Tone + Copy + 'static) -> View {
+    if in_terminal() {
+        view().child(
+            text("●")
+                .text_size(px(11.0))
+                .text_color(move || tone().color()),
+        )
+    } else {
+        view()
+            .w(px(8.0))
+            .h(px(8.0))
+            .rounded_full()
+            .flex_shrink_0()
+            .bg(move || tone().color())
+    }
 }
 
 /// A swatch of a token's colour: a square in a window, a coloured `■` in a terminal.
@@ -377,7 +469,7 @@ pub fn tile(
         .child(caption(label).number_of_lines(1))
         .child(
             text(value)
-                .text_size(px(17.0))
+                .text_size(px(metrics().body + 6.0))
                 .font_weight(FontWeight::SEMIBOLD)
                 .tabular_nums()
                 .number_of_lines(1)
@@ -388,15 +480,12 @@ pub fn tile(
         )
 }
 
-/// The row of tiles: one row when it fits, more when it does not.
+/// The row of tiles: one row when it fits, more when it does not, on a grouped surface.
 pub fn tile_row() -> View {
-    view()
+    panel()
         .flex_row()
         .flex_wrap()
-        .rounded(px(6.0))
-        .border_1()
-        .border_color(move || theme().border)
-        .overflow_hidden()
+        .py(px(if in_terminal() { 0.0 } else { 6.0 }))
 }
 
 /// A centred message for an empty pane.
@@ -408,10 +497,15 @@ pub fn empty(
         .flex_1()
         .items_center()
         .justify_center()
-        .gap_1()
+        .gap_2()
         .p_6()
-        .child(strong(heading))
-        .child(small(detail).text_center().max_w(px(460.0)))
+        .child(
+            text(heading)
+                .text_size(px(metrics().body + 4.0))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(move || theme().muted_foreground),
+        )
+        .child(small(detail).text_center().max_w(px(420.0)))
 }
 
 /// A two-column property row.
@@ -422,13 +516,13 @@ pub fn prop(name: impl IntoReactive<SharedString>, value: impl IntoReactive<Shar
         .min_w(px(0.0))
         .child(
             view()
-                .w(px(200.0))
+                .w(px(180.0))
                 .flex_shrink_0()
                 .child(small(name).number_of_lines(1)),
         )
         .child(
             text(value)
-                .text_size(px(12.0))
+                .text_size(px(metrics().small + 1.0))
                 .tabular_nums()
                 .number_of_lines(1)
                 .flex_1()
@@ -448,4 +542,96 @@ pub fn meter(ratio: f64, tok: &'static str) -> View {
         .bg(move || theme().muted)
         .overflow_hidden()
         .child(view().h_full().w(relative(r)).bg(token(tok)))
+}
+
+/// A column of a [`table`]: its heading, width and whether its cells are numbers (right-aligned,
+/// tabular).
+#[derive(Clone, Copy, Debug)]
+pub struct Col {
+    pub heading: &'static str,
+    pub width: f32,
+    pub numeric: bool,
+}
+
+/// A compact table: a heading row, then one hairline-separated row per item. The first column
+/// takes the room left; the others have their widths. It scrolls sideways when the window is
+/// narrower than its columns.
+pub fn table(cols: &[Col], rows: Vec<Vec<String>>) -> impl IntoElement {
+    let cols: Vec<Col> = cols.to_vec();
+    let total: f32 = cols.iter().skip(1).map(|c| c.width).sum::<f32>() + 160.0;
+    let cell = |c: Col, first: bool, t: String, head: bool| {
+        let t = if head {
+            caption(t)
+        } else if c.numeric {
+            text(t).text_size(px(metrics().small + 1.0)).tabular_nums()
+        } else {
+            text(t).text_size(px(metrics().small + 1.0))
+        };
+        let v = view().min_w(px(0.0)).child(t.number_of_lines(1));
+        let v = if first {
+            v.flex_1().min_w(px(120.0))
+        } else {
+            v.w(px(c.width)).flex_shrink_0()
+        };
+        if c.numeric { v.items_end() } else { v }
+    };
+    let row = |cells: Vec<String>, head: bool, cols: &[Col]| {
+        view()
+            .flex_row()
+            .items_center()
+            .gap_3()
+            .py(px(if in_terminal() { 0.0 } else { 5.0 }))
+            .border_t(px(if head { 0.0 } else { 1.0 }))
+            .border_color(move || theme().border)
+            .children(
+                cols.iter()
+                    .zip(cells)
+                    .enumerate()
+                    .map(|(i, (c, t))| cell(*c, i == 0, t, head)),
+            )
+    };
+    let heads: Vec<String> = cols
+        .iter()
+        .map(|c| crate::ui::i18n::tr(c.heading).to_owned())
+        .collect();
+    scroll().horizontal().min_w(px(0.0)).child(
+        view()
+            .min_w(px(total))
+            .child(row(heads, true, &cols))
+            .children(rows.into_iter().map(|r| row(r, false, &cols))),
+    )
+}
+
+/// A disclosure: a heading that shows or hides its content (hidden at first).
+pub fn disclosure(
+    heading_text: impl IntoReactive<SharedString>,
+    id: &'static str,
+    content: impl Fn() -> View + 'static,
+) -> View {
+    let open = signal(false);
+    let h = heading_text.into_reactive();
+    let a11y = h.clone();
+    section("")
+        .child(
+            button()
+                .on_press(move || open.update(|o| *o = !*o))
+                .accessibility_label(move || Some(a11y.get()))
+                .test_id(id)
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .self_start()
+                .rounded(px(4.0))
+                .focus_visible(ring)
+                .child(
+                    text(move || SharedString::from(if open.get() { "▾" } else { "▸" }))
+                        .text_size(px(metrics().body))
+                        .text_color(move || theme().muted_foreground),
+                )
+                .child(heading(h)),
+        )
+        .child(dynamic(move || {
+            let o = open.get();
+            untracked(|| o.then(|| content().gap_3()))
+        }))
 }

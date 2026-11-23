@@ -9,73 +9,30 @@ use nsh_base::theme;
 use nsh_core::prelude::*;
 
 use super::profile::{stage_bar, verdict_badge};
-use super::shell::{fill, page};
+use super::shell::page;
+
 use crate::ui::chart::chart;
 use crate::ui::data::{self, ProfileModel};
 use crate::ui::fmt;
 use crate::ui::i18n::{finding_title, tr};
-use crate::ui::kit::{Kind, Tone, btn, caption, empty, mono, row_button, section, small, strong};
+use crate::ui::kit::{Tone, caption, empty, mono, section, small, strong};
 use crate::ui::plots;
-use crate::ui::store::{Store, store};
+use crate::ui::store::store;
 
 pub fn compare() -> impl IntoElement {
     let s = store();
-    page(view().child(picker(s)).child(dynamic(move || {
+    dynamic(move || {
         let (ms, loading) = (s.compared.get(), s.loading.get());
         untracked(|| {
-            if loading {
+            if loading && ms.len() < 2 {
                 empty(tr("app.loading"), "").into_element()
             } else if ms.len() < 2 {
                 empty(tr("compare.none"), tr("compare.none_hint")).into_element()
             } else {
-                view().child(table(&ms)).child(overlays(&ms)).into_element()
+                page(view().child(table(&ms)).child(overlays(&ms))).into_element()
             }
         })
-    })))
-}
-
-fn picker(s: Store) -> View {
-    section(tr("compare.pick"))
-        .child(dynamic(move || {
-            let runs = s.runs.get();
-            untracked(|| {
-                view()
-                    .flex_row()
-                    .flex_wrap()
-                    .gap_1()
-                    .children(runs.into_iter().take(24).map(|r| {
-                        let (id, id2) = (r.id.clone(), r.id.clone());
-                        let on = computed(move || s.picked.with(|p| p.contains(&id2)));
-                        let on = move || on.get();
-                        row_button(fill("runs.pick", &[&r.id]), on, move || s.toggle_pick(&id))
-                            .border_1()
-                            .border_color(move || theme().border)
-                            .child(mono(r.id.clone()))
-                            .child(
-                                small(r.operator.clone())
-                                    .number_of_lines(1)
-                                    .max_w(px(180.0)),
-                            )
-                    }))
-                    .into_element()
-            })
-        }))
-        .child(
-            btn(
-                move || {
-                    SharedString::from(fill("runs.compare_picked", &[&s.picked.with(|p| p.len())]))
-                },
-                || Kind::Primary,
-                move || {
-                    let ids = s.picked.get_untracked();
-                    if ids.len() >= 2 {
-                        s.compare(ids)
-                    }
-                },
-            )
-            .disabled(move || s.picked.with(|p| p.len() < 2))
-            .test_id("compare-go"),
-        )
+    })
 }
 
 /// Their goodput over time and latency distributions, one line per run.
@@ -84,6 +41,7 @@ fn overlays(ms: &[Rc<ProfileModel>]) -> View {
     let (ops, cdf) = (plots::goodput_overlay(&refs), plots::cdf_overlay(&refs));
     section("")
         .test_id("compare-charts")
+        .child(small(tr("compare.note")).test_id("compare-note"))
         .child(ops.map(|p| chart(tr("compare.goodput"), 120.0, move || Some(p.clone()))))
         .child(cdf.map(|p| chart(tr("compare.cdf"), 130.0, move || Some(p.clone()))))
 }
@@ -127,7 +85,7 @@ fn value(key: &str, v: f64) -> String {
 fn table(ms: &[Rc<ProfileModel>]) -> View {
     let plain: Vec<ProfileModel> = ms.iter().map(|m| (**m).clone()).collect();
     let first = plain[0].operator.clone();
-    let mut t = section(fill("compare.of", &[&ms.len()]))
+    let mut t = crate::ui::kit::section_first("")
         .test_id("compare-table")
         .child(row("").children(ms.iter().map(|m| {
             cell(
@@ -150,22 +108,36 @@ fn table(ms: &[Rc<ProfileModel>]) -> View {
                 _ => "metric.throttled",
             }))
             .children(r.values.iter().enumerate().map(|(i, v)| {
-                let d = if base > 0.0 { v / base - 1.0 } else { 0.0 };
+                // Shares (errors, throttled) change by percentage points; the others by ratio.
+                let share = matches!(r.key, "errors" | "throttled");
+                let d = if share {
+                    v - base
+                } else if base > 0.0 {
+                    v / base - 1.0
+                } else {
+                    0.0
+                };
                 let better = if r.higher_is_better { d > 0.0 } else { d < 0.0 };
-                let tone = if i == 0 || d.abs() < 0.02 {
+                let small_change = if share {
+                    d.abs() < 0.0005
+                } else {
+                    d.abs() < 0.02
+                };
+                let tone = if i == 0 || small_change {
                     Tone::Neutral
                 } else if better {
                     Tone::Ok
                 } else {
                     Tone::Crit
                 };
+                let shown = if share { fmt::points(d) } else { fmt::delta(d) };
                 cell(
                     view()
                         .flex_row()
                         .gap_2()
                         .child(text(value(r.key, *v)).text_size(px(13.0)).tabular_nums())
                         .child((i > 0).then(|| {
-                            text(fmt::delta(d))
+                            text(shown.clone())
                                 .text_size(px(11.0))
                                 .tabular_nums()
                                 .text_color(move || tone.color())

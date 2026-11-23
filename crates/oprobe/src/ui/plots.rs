@@ -66,7 +66,7 @@ pub fn goodput(pts: &[Point]) -> Option<Plot> {
     Some(plot)
 }
 
-/// p50 and p99 over the run on a log axis.
+/// p50, p99 and p99.9 over the run on a log axis.
 pub fn latency(pts: &[Point]) -> Option<Plot> {
     if pts.is_empty() {
         return None;
@@ -80,7 +80,9 @@ pub fn latency(pts: &[Point]) -> Option<Plot> {
         window(pts),
         Scale::log(
             if lo.is_finite() { lo } else { 0.1 },
-            pts.iter().map(|p| p.p99_ms).fold(0.1, f64::max),
+            pts.iter()
+                .map(|p| p.p999_ms.max(p.p99_ms))
+                .fold(0.1, f64::max),
         ),
         Unit::Ms,
         vec![
@@ -93,6 +95,14 @@ pub fn latency(pts: &[Point]) -> Option<Plot> {
                 "p99",
                 "stage-server",
                 pts.iter().map(|p| (p.t_s, p.p99_ms)).collect(),
+            ),
+            Line::step(
+                "p99.9",
+                "stage-stall",
+                pts.iter()
+                    .filter(|p| p.p999_ms > 0.0)
+                    .map(|p| (p.t_s, p.p999_ms))
+                    .collect(),
             ),
         ],
     ))
@@ -120,6 +130,16 @@ fn per_second(
             pts.iter().map(|p| (p.t_s, f(p))).collect(),
         )],
     ))
+}
+
+/// The most requests in flight at once, second by second (where a concurrency limit shows).
+pub fn inflight(pts: &[Point]) -> Option<Plot> {
+    if pts.iter().all(|p| p.inflight_peak == 0) {
+        return None;
+    }
+    per_second(pts, tr("plot.peak"), "series-a", Unit::Count, |p| {
+        p.inflight_peak as f64
+    })
 }
 
 /// Throttled responses per second.
@@ -285,6 +305,8 @@ pub fn evidence(m: &ProfileModel, kind: EvidenceChart) -> Option<(&'static str, 
         EvidenceChart::ErrorsOverTime => {
             errors_rate(&m.timeline).map(|p| (tr("plot.errors_rate"), p))
         }
+        // Tables, not charts: the view draws them.
+        EvidenceChart::HotKeys | EvidenceChart::Amplification => None,
     }
 }
 
@@ -295,8 +317,9 @@ fn noise_band(floor: f64) -> (f64, f64) {
 
 /// Prove's convergence: each pair's change (candidate / baseline − 1) as a dot, the running
 /// estimate with its 95 % interval narrowing as pairs come in, the A/A noise floor around no
-/// change, and no change ruled. `ab` holds the objective of each pair.
-pub fn prove(ab: &[(f64, f64)], p99: bool) -> Option<Plot> {
+/// change, and no change ruled. `ab` holds the objective of each pair and the fewest operations
+/// its trials counted (the noise floor is never below that resolution, as in the verdict).
+pub fn prove(ab: &[(f64, f64, u64)], p99: bool) -> Option<Plot> {
     if ab.is_empty() {
         return None;
     }
@@ -305,13 +328,20 @@ pub fn prove(ab: &[(f64, f64)], p99: bool) -> Option<Plot> {
     } else {
         ProveObjective::Goodput
     };
-    let (a, b): (Vec<f64>, Vec<f64>) = ab.iter().copied().unzip();
-    let conv: Vec<Converged> = convergence(obj, &a, &b);
+    let (a, b): (Vec<f64>, Vec<f64>) = ab.iter().map(|p| (p.0, p.1)).unzip();
+    let ops: Vec<u64> = ab
+        .iter()
+        .scan(u64::MAX, |m, p| {
+            *m = (*m).min(p.2);
+            Some(*m)
+        })
+        .collect();
+    let conv: Vec<Converged> = convergence(obj, &a, &b, &ops);
     let n = ab.len() as f64;
     let d: Vec<(f64, f64)> = ab
         .iter()
         .enumerate()
-        .map(|(i, (a, b))| ((i + 1) as f64, if *a > 0.0 { b / a - 1.0 } else { 0.0 }))
+        .map(|(i, (a, b, _))| ((i + 1) as f64, if *a > 0.0 { b / a - 1.0 } else { 0.0 }))
         .collect();
     let floor = conv.last().map(|c| c.noise_floor_ratio).unwrap_or(0.0);
     let (nlo, nhi) = noise_band(floor);
@@ -420,6 +450,9 @@ mod tests {
             mib_per_s: ops / 10.0,
             p50_ms: 5.0,
             p99_ms: 50.0,
+            p999_ms: 80.0,
+            max_ms: 120.0,
+            inflight_peak: 4,
             errors,
             throttled,
         }
@@ -439,6 +472,7 @@ mod tests {
         assert_eq!(b.pts[0].1, b.pts[0].2, "a clean second draws nothing");
         assert_eq!((b.pts[1].1, b.pts[1].2), (p.y.min, p.y.max));
         assert!(goodput(&[]).is_none());
+        assert_eq!(inflight(&pts).unwrap().lines[0].pts[0], (0.0, 4.0));
         let t = throttled_rate(&pts).unwrap();
         assert_eq!(t.lines[0].pts[1], (1.0, 4.0));
     }
@@ -482,8 +516,8 @@ mod tests {
 
     #[test]
     fn the_prove_chart_narrows_around_the_estimate() {
-        let ab: Vec<(f64, f64)> = (0..6)
-            .map(|i| (100.0 + i as f64, 120.0 + (i % 3) as f64))
+        let ab: Vec<(f64, f64, u64)> = (0..6)
+            .map(|i| (100.0 + i as f64, 120.0 + (i % 3) as f64, 10_000))
             .collect();
         let p = prove(&ab, false).unwrap();
         let est = &p.lines[0].pts;
@@ -497,8 +531,22 @@ mod tests {
         assert_eq!(p.rules[0].y, Some(0.0));
         assert!(p.y.min <= 0.0 && p.y.max >= 0.2);
         // p99: lower is better; each dot is still candidate / baseline − 1.
-        let q = prove(&[(50.0, 40.0)], true).unwrap();
+        let q = prove(&[(50.0, 40.0, 10_000)], true).unwrap();
         assert!((q.lines[1].pts[0].1 + 0.2).abs() < 1e-9);
         assert!(prove(&[], false).is_none());
+        // Few operations per trial: the noise floor is their resolution, as in the verdict.
+        let few: Vec<(f64, f64, u64)> = [
+            (37.0, 36.0),
+            (37.0, 35.0),
+            (37.0, 37.0),
+            (38.0, 37.0),
+            (37.0, 35.0),
+        ]
+        .iter()
+        .map(|(a, b)| (*a, *b, 35))
+        .collect();
+        let f = prove(&few, false).unwrap();
+        let last = f.bands[1].pts.last().unwrap();
+        assert!(last.1 < 0.0 && last.2 > 0.0, "{last:?}");
     }
 }

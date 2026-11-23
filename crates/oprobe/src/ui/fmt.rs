@@ -73,6 +73,31 @@ pub fn dur_us(us: f64) -> String {
     }
 }
 
+/// A whole count: `7`, `935`, `8.86k`.
+pub fn count(n: u64) -> String {
+    if n < 1000 {
+        n.to_string()
+    } else {
+        compact(n as f64)
+    }
+}
+
+/// A byte count in binary units: `512 B`, `1.50 KiB`, `62.0 MiB`, `3.20 GiB`.
+pub fn bytes(b: u64) -> String {
+    const U: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut v = b as f64;
+    let mut i = 0;
+    while v >= 1024.0 && i < U.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{b} B")
+    } else {
+        format!("{} {}", sig3(v), U[i])
+    }
+}
+
 /// A duration given in ms.
 pub fn dur_ms(ms: f64) -> String {
     dur_us(ms * 1000.0)
@@ -264,6 +289,11 @@ mod tests {
         assert_eq!(delta(-0.042), "−4.20 %");
         assert_eq!(ratio(0.0), "0 %");
         assert_eq!(short_time("2026-11-20T14:30:05Z"), "11-20 14:30");
+        assert_eq!(count(7), "7");
+        assert_eq!(count(8863), "8.86k");
+        assert_eq!(bytes(512), "512 B");
+        assert_eq!(bytes(1536), "1.50 KiB");
+        assert_eq!(bytes(65 * 1024 * 1024), "65.0 MiB");
     }
 
     #[test]
