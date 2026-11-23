@@ -1113,8 +1113,8 @@ impl TargetSpec {
                         )
                         .with_hint(
                             "add `--set options.account_id=<ACCOUNT_ID>` (or `account_id = \"${R2_ACCOUNT_ID}\"` \
-                             under [targets.NAME.options]), or pass \
-                             `--endpoint https://<ACCOUNT_ID>.r2.cloudflarestorage.com`",
+                             under [operators.NAME.options]), or pass \
+                             `--set options.endpoint=https://<ACCOUNT_ID>.r2.cloudflarestorage.com`",
                         )
                         .into());
                     };
@@ -1132,8 +1132,8 @@ impl TargetSpec {
                     return Err(
                         crate::input::invalid("minio:// needs the server's endpoint")
                             .with_hint(
-                                "pass `--endpoint http://<host>:9000` (or `endpoint = ...` under \
-                             [targets.NAME.options])",
+                                "pass `--set options.endpoint=http://<host>:9000` (or `endpoint = ...` \
+                             under [operators.NAME.options])",
                             )
                             .into(),
                     );
@@ -1491,10 +1491,17 @@ mod tests {
             assert_eq!(b.code, crate::errors::ErrorCode::UsageInvalidArgument);
             format!("{} {}", b.message, b.hint.unwrap_or_default())
         };
+        // Hints name only the flag and the config table that exist.
+        for url in ["r2://bkt", "minio://bkt"] {
+            let e = TargetSpec::from_url(url).unwrap().normalized();
+            let text = full(e.unwrap_err());
+            assert!(text.contains("--set options.endpoint="), "{text}");
+            assert!(text.contains("[operators.NAME.options]"), "{text}");
+            assert!(!text.contains("`--endpoint"), "{text}");
+            assert!(!text.contains("[targets."), "{text}");
+        }
         let e = TargetSpec::from_url("r2://bkt").unwrap().normalized();
         assert!(full(e.unwrap_err()).contains("account_id"));
-        let e = TargetSpec::from_url("minio://bkt").unwrap().normalized();
-        assert!(full(e.unwrap_err()).contains("--endpoint"));
 
         let mut r2 = TargetSpec::from_url("r2://bkt/p").unwrap();
         r2.options.insert("account_id".into(), "abc123".into());
