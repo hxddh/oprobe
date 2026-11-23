@@ -163,6 +163,51 @@ fn event_bucket(us: u64, frozen: u64) -> usize {
     bucket_index(us / 1_000_000)
 }
 
+/// The window closes a hair after a whole interval (`-d 5s` closes at 5.00008 s): the last
+/// interval then holds only the events of operations draining after the close, and no
+/// operation, and would draw as a drop to zero. Such a sliver (under 5 % of its length inside
+/// the window, with no operation started in it) is folded into the interval before it; its
+/// rates are over the previous interval's length.
+fn fold_end_sliver(mut t: Vec<TimelinePoint>, elapsed_s: f64) -> Vec<TimelinePoint> {
+    let n = t.len();
+    if n < 2 {
+        return t;
+    }
+    let last = &t[n - 1];
+    let covered = elapsed_s - last.t_s;
+    if last.ops_count > 0 || !(0.0..0.05 * last.len_s.max(1e-9)).contains(&covered) {
+        return t;
+    }
+    let s = t.pop().expect("two intervals");
+    let p = t.last_mut().expect("one interval");
+    let width = p.len_s.max(1e-9);
+    p.errors += s.errors;
+    p.throttled += s.throttled;
+    p.throttled_ops += s.throttled_ops;
+    p.requests_count += s.requests_count;
+    p.requests_per_s = p.requests_count as f64 / width;
+    p.retries_count += s.retries_count;
+    p.missed_arrivals += s.missed_arrivals;
+    p.new_connections += s.new_connections;
+    p.inflight_peak = p.inflight_peak.max(s.inflight_peak);
+    for v in s.verbs {
+        match p.verbs.iter_mut().find(|x| x.verb == v.verb) {
+            Some(x) => {
+                x.errors_count += v.errors_count;
+                x.throttled_count += v.throttled_count;
+            }
+            None => p.verbs.push(VerbInterval {
+                ops_count: 0,
+                ok_ops_count: 0,
+                latency_sum_ms: 0.0,
+                latency_rows_count: Vec::new(),
+                ..v
+            }),
+        }
+    }
+    t
+}
+
 /// Start and length (s) of interval `idx`.
 fn bucket_span(idx: usize) -> (f64, f64) {
     if idx < FINE_INTERVALS {
@@ -1504,6 +1549,13 @@ impl Recorder {
                 }
             })
             .collect();
+        // Only a closed window has an end to fold a sliver into.
+        let closed = self.frozen_elapsed_us.load(Ordering::Acquire) != WINDOW_OPEN;
+        let timeline = if closed {
+            fold_end_sliver(timeline, elapsed)
+        } else {
+            timeline
+        };
 
         let throttled_ops: u64 = verbs.iter().map(|v| v.throttled).sum();
         let summary = Summary {
@@ -1819,6 +1871,27 @@ mod tests {
         let ops: u64 = p.verbs.iter().map(|v| v.ops_count).sum();
         let ok: u64 = p.verbs.iter().map(|v| v.ok_ops_count).sum();
         assert_eq!((ops, ok), (10, 7));
+    }
+
+    #[test]
+    fn a_sliver_after_the_window_folds_into_the_last_interval() {
+        let pt = |t_s: f64, ops: u64, requests: u64, throttled: u64| TimelinePoint {
+            t_s,
+            len_s: 1.0,
+            ops_count: ops,
+            requests_count: requests,
+            requests_per_s: requests as f64,
+            throttled,
+            ..Default::default()
+        };
+        // `-d 2s` closed at 2.00008 s: the third interval holds draining requests only.
+        let t = fold_end_sliver(vec![pt(0.0, 10, 10, 0), pt(1.0, 10, 10, 1), pt(2.0, 0, 3, 2)], 2.00008);
+        assert_eq!(t.len(), 2);
+        assert_eq!((t[1].requests_count, t[1].throttled), (13, 3));
+        assert_eq!(t[1].requests_per_s, 13.0);
+        // A real last interval (operations started in it, or most of it inside the window) stays.
+        assert_eq!(fold_end_sliver(vec![pt(0.0, 10, 10, 0), pt(1.0, 2, 3, 0)], 1.00008).len(), 2);
+        assert_eq!(fold_end_sliver(vec![pt(0.0, 10, 10, 0), pt(1.0, 0, 3, 0)], 1.5).len(), 2);
     }
 
     #[test]
