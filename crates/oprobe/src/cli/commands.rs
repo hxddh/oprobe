@@ -77,8 +77,16 @@ pub fn show(a: ShowArgs, ctx: &Ctx) -> Result<u8> {
         ByArg::Api => crate::analysis::slice::By::Api,
         ByArg::Conn => crate::analysis::slice::By::Conn,
     });
+    let secs = |v: &Option<String>| -> Result<Option<f64>> {
+        Ok(match v {
+            Some(s) => Some(crate::input::duration(s)?.as_secs_f64()),
+            None => None,
+        })
+    };
+    let (since, until) = (secs(&a.since)?, secs(&a.until)?);
     let p = app
         .show(RunRef(a.run.unwrap_or_else(|| "last".into())))?
+        .with_range(since, until)?
         .with_detail(a.detail)
         .with_by(by);
     ctx.out.finish(&p)
@@ -100,10 +108,18 @@ pub async fn prove(a: ProveArgs, ctx: &Ctx) -> Result<u8> {
             .as_deref()
             .map(|v| crate::input::share("--max-throttle", v))
             .transpose()?,
-        budget: a.budget,
+        // One wall-time budget: `--max-duration` (alias `--budget`) bounds the whole proof.
+        budget: a.safety.wall_budget(),
         trial_duration: a.trial,
         pairs: a.pairs.unwrap_or(crate::config::prove_defaults::MAX_PAIRS),
-        safety: safety(&a.safety),
+        safety: i::Safety {
+            dry_run: a.safety.dry_run,
+            read_only: a.safety.read_only,
+            max_requests: a.safety.max_requests,
+            max_bytes: a.safety.max_bytes.clone(),
+            max_duration: None,
+            idempotency_key: None,
+        },
     };
     match ctx.app().prove(req, ctx.out.clone(), ctrl_c()).await? {
         ProveOutcome::Plan(p) => ctx.out.finish(p.as_ref()),

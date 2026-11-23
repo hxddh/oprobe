@@ -403,13 +403,33 @@ fn toml_diff(b: &OperatorSpec, changes: &[Change]) -> String {
             "layers" => {
                 let name = parts[1];
                 let l = &b.layers;
+                // Only the fields that differ from the layer's defaults (`true`: the layer
+                // with its defaults): the TOML applied to `a` still gives `b`.
                 let v = match name {
-                    "concurrent_limit" => l.concurrent_limit.as_ref().map(|x| x.toml()),
-                    "retry" => l.retry.as_ref().map(|x| x.toml()),
-                    "timeout" => l.timeout.as_ref().map(|x| x.toml()),
-                    "tail_cut" => l.tail_cut.as_ref().map(|x| x.toml()),
-                    "throttle" => l.throttle.as_ref().map(|x| x.toml()),
-                    "cache" => l.cache.as_ref().map(|x| x.toml()),
+                    "concurrent_limit" => l
+                        .concurrent_limit
+                        .as_ref()
+                        .map(|x| changed_fields(x.toml(), ConcurrentLimit::default().toml())),
+                    "retry" => l
+                        .retry
+                        .as_ref()
+                        .map(|x| changed_fields(x.toml(), Retry::default().toml())),
+                    "timeout" => l
+                        .timeout
+                        .as_ref()
+                        .map(|x| changed_fields(x.toml(), Timeout::default().toml())),
+                    "tail_cut" => l
+                        .tail_cut
+                        .as_ref()
+                        .map(|x| changed_fields(x.toml(), TailCut::default().toml())),
+                    "throttle" => l
+                        .throttle
+                        .as_ref()
+                        .map(|x| changed_fields(x.toml(), Throttle::default().toml())),
+                    "cache" => l
+                        .cache
+                        .as_ref()
+                        .map(|x| changed_fields(x.toml(), Cache::default().toml())),
                     _ => None,
                 }
                 .unwrap_or(toml::Value::Boolean(false));
@@ -433,6 +453,20 @@ fn toml_diff(b: &OperatorSpec, changes: &[Change]) -> String {
         let _ = writeln!(out, "# remove {r}");
     }
     out
+}
+
+/// The fields of a layer table `v` that differ from its defaults `d`; `true` when none do.
+fn changed_fields(v: toml::Value, d: toml::Value) -> toml::Value {
+    let (toml::Value::Table(t), toml::Value::Table(d)) = (v, d) else {
+        return toml::Value::Boolean(true);
+    };
+    let kept: toml::map::Map<String, toml::Value> =
+        t.into_iter().filter(|(k, v)| d.get(k) != Some(v)).collect();
+    if kept.is_empty() {
+        toml::Value::Boolean(true)
+    } else {
+        toml::Value::Table(kept)
+    }
 }
 
 /// A TOML value on one line (tables inline).
@@ -521,6 +555,13 @@ mod tests {
             d.toml
         );
         assert!(d.toml.contains("timeout = false"), "{}", d.toml);
+        // Only what differs from the defaults: not the whole retry table.
+        assert!(
+            d.toml.contains("retry = { jitter = true, max_times = 4 }"),
+            "{}",
+            d.toml
+        );
+        assert!(!d.toml.contains("min_delay"), "{}", d.toml);
         assert!(d.toml.contains("[read]\ngap = \"1MiB\""), "{}", d.toml);
         // The TOML applied to `a` gives `b`.
         let mut merged = toml::Value::try_from(&a).unwrap();

@@ -1,64 +1,100 @@
-//! The plots the views draw, built from the app's models: the timeline (with the seconds that
-//! were throttled or failed shaded), the latency distribution, the in-flight levels behind a
-//! concurrency ceiling, each finding's evidence, Prove's convergence and the overlays of
-//! Compare. Plain functions of plain values, so each is tested without a window.
+//! The plots the views draw, built from the app's models: the timeline (goodput with the
+//! attempted rate behind it and the intervals with throttled responses or failures shaded, the
+//! latency quantiles muted where an interval has too few operations, requests and retries),
+//! the latency distribution, the in-flight levels behind a concurrency ceiling, each finding's
+//! evidence, Prove's convergence and the overlays of Compare. Plain functions of plain values,
+//! so each is tested without a window.
 
 use crate::analysis::capacity::Confidence;
 use crate::app::ProveObjective;
 use crate::app::prove::{Converged, convergence};
-use crate::report::view::{ConcurrencyView, EvidenceChart, LatencyCdf};
+use crate::report::view::{ConcurrencyView, EvidenceChart, LatencyCdf, TimelineView};
 use crate::ui::chart::{Band, Line, Plot, Rule, Unit};
-use crate::ui::data::{Point, ProfileModel};
+use crate::ui::data::{Heat, ProfileModel};
 use crate::ui::fmt::Scale;
 use crate::ui::i18n::{tr, trf};
 
 /// Series colours in order, for one line per run.
 pub const SERIES: [&str; 5] = ["series-a", "series-b", "chart-3", "chart-2", "chart-5"];
 
-fn window(pts: &[Point]) -> f64 {
-    pts.last().map(|p| p.t_s + p.len_s).unwrap_or(1.0)
+/// The end of the timeline's last interval.
+fn window(t: &TimelineView) -> f64 {
+    match (t.t_s.last(), t.len_s.last()) {
+        (Some(s), Some(l)) => s + l,
+        _ => 1.0,
+    }
 }
 
-/// A step band over the full height of `y` for the slices where `on` holds.
-fn shade(pts: &[Point], y: &Scale, on: impl Fn(&Point) -> bool) -> Vec<(f64, f64, f64)> {
-    pts.iter()
-        .map(|p| {
-            let hi = if on(p) { y.max } else { y.min };
-            (p.t_s, y.min, hi)
-        })
+/// `(t, v)` of a series the view carries (empty when it does not).
+fn series(t: &TimelineView, v: &[f64]) -> Vec<(f64, f64)> {
+    t.t_s.iter().copied().zip(v.iter().copied()).collect()
+}
+
+/// A per-interval count as a rate.
+fn per_s(t: &TimelineView, c: &[u64]) -> Vec<f64> {
+    c.iter()
+        .zip(&t.len_s)
+        .map(|(n, l)| *n as f64 / l.max(1e-3))
         .collect()
 }
 
-/// Goodput over the run, the throttled and failed seconds shaded under it.
-pub fn goodput(pts: &[Point]) -> Option<Plot> {
-    if pts.is_empty() {
+/// A step band over the full height of `y` for the intervals where `on` holds.
+fn shade(t: &TimelineView, y: &Scale, on: impl Fn(usize) -> bool) -> Vec<(f64, f64, f64)> {
+    t.t_s
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (*s, y.min, if on(i) { y.max } else { y.min }))
+        .collect()
+}
+
+fn time_plot(t: &TimelineView, y: Scale, unit: Unit, lines: Vec<Line>) -> Plot {
+    let mut p = Plot::over_time(window(t), y, unit, lines);
+    p.step_w = t.len_s.last().copied().unwrap_or(1.0);
+    p
+}
+
+/// Goodput over the run (successful operations), the attempted rate (failures included) as a
+/// faint line behind it, and the intervals with throttled responses or failed operations
+/// shaded.
+pub fn goodput(t: &TimelineView) -> Option<Plot> {
+    if t.is_empty() {
         return None;
     }
-    let y = Scale::zero_based(pts.iter().map(|p| p.ops_per_s).fold(0.0, f64::max));
-    let mut plot = Plot::over_time(
-        window(pts),
-        y,
-        Unit::Rate,
-        vec![Line::step(
-            tr("metric.goodput"),
-            "series-a",
-            pts.iter().map(|p| (p.t_s, p.ops_per_s)).collect(),
-        )],
-    );
-    if pts.iter().any(|p| p.throttled > 0) {
+    let top = t
+        .ops_per_s
+        .iter()
+        .chain(&t.goodput_ops_per_s)
+        .copied()
+        .fold(0.0, f64::max);
+    let y = Scale::zero_based(top);
+    let mut lines = vec![Line::step(
+        tr("metric.goodput"),
+        "series-a",
+        series(t, &t.goodput_ops_per_s),
+    )];
+    // The attempted rate only when it differs (failures happened).
+    if t.ops_per_s
+        .iter()
+        .zip(&t.goodput_ops_per_s)
+        .any(|(a, g)| (a - g).abs() > 1e-9)
+    {
+        lines.push(Line::step(tr("plot.attempted"), "axis", series(t, &t.ops_per_s)).faint());
+    }
+    let mut plot = time_plot(t, y, Unit::Rate, lines);
+    if t.throttled_count.iter().any(|n| *n > 0) {
         plot.bands.push(Band {
-            label: tr("plot.throttled_secs").to_owned(),
+            label: tr("plot.throttled_responses").to_owned(),
             token: "warn",
-            pts: shade(pts, &y, |p| p.throttled > 0),
+            pts: shade(t, &y, |i| t.throttled_count[i] > 0),
             step: true,
             alpha: 0.14,
         });
     }
-    if pts.iter().any(|p| p.errors > 0) {
+    if t.errors_count.iter().any(|n| *n > 0) {
         plot.bands.push(Band {
             label: tr("plot.error_secs").to_owned(),
             token: "crit",
-            pts: shade(pts, &y, |p| p.errors > 0),
+            pts: shade(t, &y, |i| t.errors_count[i] > 0),
             step: true,
             alpha: 0.14,
         });
@@ -66,113 +102,177 @@ pub fn goodput(pts: &[Point]) -> Option<Plot> {
     Some(plot)
 }
 
-/// p50, p99 and p99.9 over the run on a log axis.
-pub fn latency(pts: &[Point]) -> Option<Plot> {
-    if pts.is_empty() {
+/// p50, p99 and p99.9 over the run on a log axis. An interval with too few operations for a
+/// quantile ([`TimelineView::reliable`]) has that quantile drawn faint and dashed, and the
+/// readout says so.
+pub fn latency(t: &TimelineView) -> Option<Plot> {
+    if t.is_empty() {
         return None;
     }
-    let lo = pts
+    let lo = t
+        .p50_ms
         .iter()
-        .map(|p| p.p50_ms)
+        .copied()
         .filter(|v| *v > 0.0)
         .fold(f64::INFINITY, f64::min);
-    Some(Plot::over_time(
-        window(pts),
-        Scale::log(
-            if lo.is_finite() { lo } else { 0.1 },
-            pts.iter()
-                .map(|p| p.p999_ms.max(p.p99_ms))
-                .fold(0.1, f64::max),
-        ),
-        Unit::Ms,
-        vec![
+    let hi = t
+        .p999_ms
+        .iter()
+        .chain(&t.p99_ms)
+        .copied()
+        .fold(0.1, f64::max);
+    let qs = [
+        ("p50", 0.5, "series-a", &t.p50_ms),
+        ("p99", 0.99, "stage-server", &t.p99_ms),
+        ("p99.9", 0.999, "stage-stall", &t.p999_ms),
+    ];
+    let lines = qs
+        .iter()
+        .map(|(label, q, tok, v)| {
+            let keep: Vec<usize> = (0..v.len()).filter(|i| v[*i] > 0.0).collect();
+            let reliable = t.reliable(*q);
             Line::step(
-                "p50",
-                "series-a",
-                pts.iter().map(|p| (p.t_s, p.p50_ms)).collect(),
-            ),
-            Line::step(
-                "p99",
-                "stage-server",
-                pts.iter().map(|p| (p.t_s, p.p99_ms)).collect(),
-            ),
-            Line::step(
-                "p99.9",
-                "stage-stall",
-                pts.iter()
-                    .filter(|p| p.p999_ms > 0.0)
-                    .map(|p| (p.t_s, p.p999_ms))
+                *label,
+                tok,
+                keep.iter().map(|i| (t.t_s[*i], v[*i])).collect(),
+            )
+            .weak(
+                keep.iter()
+                    .map(|i| !reliable.get(*i).copied().unwrap_or(true))
                     .collect(),
-            ),
-        ],
-    ))
+            )
+        })
+        .collect();
+    let mut plot = time_plot(
+        t,
+        Scale::log(if lo.is_finite() { lo } else { 0.1 }, hi),
+        Unit::Ms,
+        lines,
+    );
+    plot.notes = too_few(t);
+    Some(plot)
 }
 
-/// One per-second series over the run.
-fn per_second(
-    pts: &[Point],
+/// Per interval with too few operations for a quantile: `n=12, too few for p99`.
+pub fn too_few(t: &TimelineView) -> Vec<(f64, f64, String)> {
+    let names = [(0.5, "p50"), (0.99, "p99"), (0.999, "p99.9")];
+    (0..t.len())
+        .filter_map(|i| {
+            let n = t.ops_count.get(i).copied()?;
+            let first = names
+                .iter()
+                .find(|(q, _)| n < TimelineView::min_ops_for(*q))?;
+            Some((
+                t.t_s[i],
+                t.t_s[i] + t.len_s[i],
+                trf("plot.too_few", &[&n, &first.1]),
+            ))
+        })
+        .collect()
+}
+
+/// One per-interval series over the run.
+fn per_interval(
+    t: &TimelineView,
     label: &str,
     token: &'static str,
     unit: Unit,
-    f: fn(&Point) -> f64,
+    v: Vec<f64>,
 ) -> Option<Plot> {
-    if pts.is_empty() {
+    if t.is_empty() || v.len() != t.len() {
         return None;
     }
-    let y = Scale::zero_based(pts.iter().map(f).fold(0.0, f64::max));
-    Some(Plot::over_time(
-        window(pts),
+    let y = Scale::zero_based(v.iter().copied().fold(0.0, f64::max));
+    Some(time_plot(
+        t,
         y,
         unit,
-        vec![Line::step(
-            label,
-            token,
-            pts.iter().map(|p| (p.t_s, f(p))).collect(),
-        )],
+        vec![Line::step(label, token, series(t, &v))],
     ))
 }
 
-/// The most requests in flight at once, second by second (where a concurrency limit shows).
-pub fn inflight(pts: &[Point]) -> Option<Plot> {
-    if pts.iter().all(|p| p.inflight_peak == 0) {
+/// The most requests in flight at once, interval by interval (where a concurrency limit
+/// shows).
+pub fn inflight(t: &TimelineView) -> Option<Plot> {
+    if t.inflight_peak_count.iter().all(|n| *n == 0) {
         return None;
     }
-    per_second(pts, tr("plot.peak"), "series-a", Unit::Count, |p| {
-        p.inflight_peak as f64
-    })
+    per_interval(
+        t,
+        tr("plot.peak"),
+        "series-a",
+        Unit::Count,
+        t.inflight_peak_count.iter().map(|n| *n as f64).collect(),
+    )
 }
 
-/// Throttled responses per second.
-pub fn throttled_rate(pts: &[Point]) -> Option<Plot> {
-    per_second(
-        pts,
-        tr("plot.throttled_share"),
+/// Requests sent per second (retries included) and the retries per second: where a request
+/// rate limit shows.
+pub fn requests(t: &TimelineView) -> Option<Plot> {
+    if t.requests_per_s.len() != t.len() || t.requests_per_s.iter().all(|v| *v <= 0.0) {
+        return None;
+    }
+    let retries = per_s(t, &t.retries_count);
+    let y = Scale::zero_based(t.requests_per_s.iter().copied().fold(0.0, f64::max));
+    let mut lines = vec![Line::step(
+        tr("plot.requests"),
+        "series-a",
+        series(t, &t.requests_per_s),
+    )];
+    if retries.iter().any(|v| *v > 0.0) {
+        lines.push(Line::step(
+            tr("plot.retries"),
+            "stage-retry",
+            series(t, &retries),
+        ));
+    }
+    Some(time_plot(t, y, Unit::Rate, lines))
+}
+
+/// Throttled responses per second (each in the interval it arrived).
+pub fn throttled_rate(t: &TimelineView) -> Option<Plot> {
+    per_interval(
+        t,
+        tr("plot.throttled_responses"),
         "warn",
         Unit::Rate,
-        Point::throttled_per_s,
+        per_s(t, &t.throttled_count),
     )
 }
 
 /// Failed operations per second.
-pub fn errors_rate(pts: &[Point]) -> Option<Plot> {
-    per_second(
-        pts,
+pub fn errors_rate(t: &TimelineView) -> Option<Plot> {
+    per_interval(
+        t,
         tr("metric.errors"),
         "crit",
         Unit::Rate,
-        Point::errors_per_s,
+        per_s(t, &t.errors_count),
     )
 }
 
 /// Bandwidth over the run.
-pub fn bandwidth(pts: &[Point]) -> Option<Plot> {
-    per_second(
-        pts,
+pub fn bandwidth(t: &TimelineView) -> Option<Plot> {
+    per_interval(
+        t,
         tr("metric.bandwidth"),
         "series-a",
         Unit::MibRate,
-        |p| p.mib_per_s,
+        t.mib_per_s.clone(),
     )
+}
+
+/// The heatmap's colour key: the fewest operations in a non-empty cell and the most.
+pub fn heat_legend(h: &Heat) -> (u64, u64) {
+    let lo = h
+        .counts
+        .iter()
+        .flatten()
+        .copied()
+        .filter(|n| *n > 0)
+        .min()
+        .unwrap_or(0);
+    (lo, h.max.max(lo))
 }
 
 /// Latency distributions on one log axis: one line per `(label, cdf)`; `marks` puts the p50
@@ -209,6 +309,7 @@ pub fn cdf(series: &[(String, &LatencyCdf)], marks: Option<(f64, f64)>) -> Optio
             .collect(),
         bands: Vec::new(),
         rules: Vec::new(),
+        notes: Vec::new(),
     };
     if let Some((p50, p99)) = marks {
         if p50 > 0.0 {
@@ -258,6 +359,7 @@ pub fn concurrency(c: &ConcurrencyView) -> Option<Plot> {
         )],
         bands: Vec::new(),
         rules: Vec::new(),
+        notes: Vec::new(),
     };
     if let Some((est, lo, hi)) = c.ceiling {
         plot.bands.push(Band {
@@ -401,6 +503,7 @@ pub fn prove(ab: &[(f64, f64, u64)], p99: bool) -> Option<Plot> {
             },
         ],
         rules: vec![Rule::at_y(0.0, "axis", "")],
+        notes: Vec::new(),
     })
 }
 
@@ -409,7 +512,7 @@ pub fn goodput_overlay(ms: &[&ProfileModel]) -> Option<Plot> {
     let w = ms.iter().map(|m| window(&m.timeline)).fold(0.0, f64::max);
     let top = ms
         .iter()
-        .flat_map(|m| m.timeline.iter().map(|p| p.ops_per_s))
+        .flat_map(|m| m.timeline.goodput_ops_per_s.iter().copied())
         .fold(0.0, f64::max);
     if w <= 0.0 || ms.iter().all(|m| m.timeline.is_empty()) {
         return None;
@@ -424,7 +527,7 @@ pub fn goodput_overlay(ms: &[&ProfileModel]) -> Option<Plot> {
                 Line::step(
                     m.id.clone(),
                     tok,
-                    m.timeline.iter().map(|p| (p.t_s, p.ops_per_s)).collect(),
+                    series(&m.timeline, &m.timeline.goodput_ops_per_s),
                 )
             })
             .collect(),
@@ -442,39 +545,111 @@ mod tests {
     use super::*;
     use crate::ui::chart::Mark;
 
-    fn pt(t: f64, ops: f64, throttled: u64, errors: u64) -> Point {
-        Point {
-            t_s: t,
-            len_s: 1.0,
-            ops_per_s: ops,
-            mib_per_s: ops / 10.0,
-            p50_ms: 5.0,
-            p99_ms: 50.0,
-            p999_ms: 80.0,
-            max_ms: 120.0,
-            inflight_peak: 4,
-            errors,
-            throttled,
+    /// Three 1 s intervals: `(attempted, goodput, throttled responses, failures, operations)`.
+    fn tl(rows: &[(f64, f64, u64, u64, u64)]) -> TimelineView {
+        let n = rows.len();
+        TimelineView {
+            t_s: (0..n).map(|i| i as f64).collect(),
+            len_s: vec![1.0; n],
+            ops_per_s: rows.iter().map(|r| r.0).collect(),
+            goodput_ops_per_s: rows.iter().map(|r| r.1).collect(),
+            mib_per_s: rows.iter().map(|r| r.0 / 10.0).collect(),
+            p50_ms: vec![5.0; n],
+            p90_ms: vec![30.0; n],
+            p99_ms: vec![50.0; n],
+            p999_ms: vec![80.0; n],
+            max_ms: vec![120.0; n],
+            ops_count: rows.iter().map(|r| r.4).collect(),
+            throttled_count: rows.iter().map(|r| r.2).collect(),
+            errors_count: rows.iter().map(|r| r.3).collect(),
+            requests_per_s: rows.iter().map(|r| r.0 * 1.1).collect(),
+            retries_count: rows.iter().map(|r| r.2).collect(),
+            inflight_peak_count: vec![4; n],
+            new_connections_count: vec![0; n],
+            verb: None,
         }
     }
 
     #[test]
-    fn the_timeline_shades_only_the_seconds_that_were_throttled() {
-        let pts = [
-            pt(0.0, 100.0, 0, 0),
-            pt(1.0, 80.0, 4, 0),
-            pt(2.0, 90.0, 0, 0),
-        ];
-        let p = goodput(&pts).unwrap();
+    fn the_timeline_shades_only_the_intervals_with_throttled_responses() {
+        let t = tl(&[
+            (100.0, 100.0, 0, 0, 100),
+            (80.0, 80.0, 4, 0, 80),
+            (90.0, 90.0, 0, 0, 90),
+        ]);
+        let p = goodput(&t).unwrap();
+        assert_eq!(p.lines.len(), 1, "no failures: no attempted line");
         assert_eq!(p.bands.len(), 1, "no errors, no error band");
         let b = &p.bands[0];
+        assert_eq!(b.label, tr("plot.throttled_responses"));
         assert!(b.step);
-        assert_eq!(b.pts[0].1, b.pts[0].2, "a clean second draws nothing");
+        assert_eq!(b.pts[0].1, b.pts[0].2, "a clean interval draws nothing");
         assert_eq!((b.pts[1].1, b.pts[1].2), (p.y.min, p.y.max));
-        assert!(goodput(&[]).is_none());
-        assert_eq!(inflight(&pts).unwrap().lines[0].pts[0], (0.0, 4.0));
-        let t = throttled_rate(&pts).unwrap();
-        assert_eq!(t.lines[0].pts[1], (1.0, 4.0));
+        assert!(goodput(&TimelineView::default()).is_none());
+        assert_eq!(inflight(&t).unwrap().lines[0].pts[0], (0.0, 4.0));
+        // Throttled responses, per second.
+        let th = throttled_rate(&t).unwrap();
+        assert_eq!(th.lines[0].pts[1], (1.0, 4.0));
+        // Requests per second with the retries beside them.
+        let rq = requests(&t).unwrap();
+        assert_eq!(rq.lines.len(), 2);
+        assert!((rq.lines[0].pts[0].1 - 110.0).abs() < 1e-9);
+        assert_eq!(rq.lines[1].pts[1], (1.0, 4.0));
+        assert!(rq.summary("Requests").contains("Requests"));
+    }
+
+    #[test]
+    fn goodput_is_drawn_over_the_faint_attempted_rate() {
+        let t = tl(&[(100.0, 100.0, 0, 0, 100), (100.0, 60.0, 0, 40, 100)]);
+        let p = goodput(&t).unwrap();
+        assert_eq!(p.lines.len(), 2);
+        assert_eq!(p.lines[0].label, tr("metric.goodput"));
+        assert!(!p.lines[0].faint);
+        assert_eq!(p.lines[0].pts[1], (1.0, 60.0));
+        assert_eq!(p.lines[1].label, tr("plot.attempted"));
+        assert!(p.lines[1].faint);
+        assert_eq!(p.lines[1].pts[1], (1.0, 100.0));
+        assert_eq!(p.bands.len(), 1, "the failures are shaded");
+        // The screen reader hears the goodput's range, not the attempted rate's.
+        let s = p.summary("Goodput");
+        assert!(s.starts_with("Goodput"), "{s}");
+        assert!(s.contains("60") && s.contains("100/s"), "{s}");
+    }
+
+    #[test]
+    fn quantiles_of_intervals_with_too_few_operations_are_muted() {
+        // 2 000 operations: p99 holds (≥ 1 000), p99.9 does not (< 10 000); 25: only p50
+        // (≥ 20).
+        let t = tl(&[(2000.0, 2000.0, 0, 0, 2000), (25.0, 25.0, 0, 0, 25)]);
+        let p = latency(&t).unwrap();
+        let by = |l: &str| p.lines.iter().find(|x| x.label == l).unwrap();
+        assert_eq!(by("p50").weak, vec![false, false]);
+        assert_eq!(by("p99").weak, vec![false, true]);
+        assert_eq!(by("p99.9").weak, vec![true, true]);
+        assert_eq!(
+            p.note_at(1.5),
+            Some(trf("plot.too_few", &[&25, &"p99"]).as_str())
+        );
+        assert_eq!(
+            p.note_at(0.5),
+            Some(trf("plot.too_few", &[&2000, &"p99.9"]).as_str())
+        );
+        let r = crate::ui::chart::readout_at(&p, 1.5);
+        assert!(r.contains("n=25, too few for p99"), "{r}");
+    }
+
+    #[test]
+    fn the_heatmap_key_spans_the_fewest_to_the_most_in_a_cell() {
+        let h = Heat {
+            bucket_s: 1.0,
+            bounds_ms: vec![0.0, 1.0, 10.0],
+            counts: vec![vec![0, 3, 0], vec![0, 7, 40]],
+            max: 40,
+            span_s: 2.0,
+            fine: true,
+        };
+        assert_eq!(heat_legend(&h), (3, 40));
+        assert_eq!(heat_legend(&Heat::default()), (0, 0));
     }
 
     #[test]

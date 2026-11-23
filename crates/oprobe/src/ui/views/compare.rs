@@ -15,7 +15,7 @@ use crate::ui::chart::chart;
 use crate::ui::data::{self, ProfileModel};
 use crate::ui::fmt;
 use crate::ui::i18n::{finding_title, tr};
-use crate::ui::kit::{Tone, caption, empty, mono, section, small, strong};
+use crate::ui::kit::{caption, empty, mono, section, small, strong};
 use crate::ui::plots;
 use crate::ui::store::store;
 
@@ -117,19 +117,8 @@ fn table(ms: &[Rc<ProfileModel>]) -> View {
                 } else {
                     0.0
                 };
-                let better = if r.higher_is_better { d > 0.0 } else { d < 0.0 };
-                let small_change = if share {
-                    d.abs() < 0.0005
-                } else {
-                    d.abs() < 0.02
-                };
-                let tone = if i == 0 || small_change {
-                    Tone::Neutral
-                } else if better {
-                    Tone::Ok
-                } else {
-                    Tone::Crit
-                };
+                // Neutral: one run each side, so a change is not yet better or worse (run-to-run
+                // noise is in it); the note under the table points to prove.
                 let shown = if share { fmt::points(d) } else { fmt::delta(d) };
                 cell(
                     view()
@@ -140,7 +129,7 @@ fn table(ms: &[Rc<ProfileModel>]) -> View {
                             text(shown.clone())
                                 .text_size(px(11.0))
                                 .tabular_nums()
-                                .text_color(move || tone.color())
+                                .text_color(move || theme().muted_foreground)
                         })),
                 )
             })),

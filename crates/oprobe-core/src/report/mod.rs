@@ -2,6 +2,7 @@
 //! brief result of `run` ([`brief`]) and the full profile of `show` ([`terminal`]).
 
 pub mod brief;
+pub mod range;
 
 pub mod style;
 pub mod terminal;
@@ -154,6 +155,7 @@ pub mod fixture {
                 })
                 .collect(),
             heatmap: Default::default(),
+            latency_histogram: Default::default(),
             findings: vec![Finding {
                 code: "throttling".into(),
                 severity: Severity::Warning,

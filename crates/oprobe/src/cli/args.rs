@@ -213,7 +213,7 @@ pub enum ObjectiveArg {
 
 #[derive(Args, Debug)]
 pub struct ProveArgs {
-    /// The run whose operator to change (id, id prefix, `last`, `last~N`, label)
+    /// The run whose operator to change (id, id prefix, `last`, `last~N`)
     #[arg(value_name = "RUN")]
     pub run: String,
     /// The finding whose remedy to prove (default: the top finding)
@@ -228,9 +228,6 @@ pub struct ProveArgs {
     /// Share of throttled requests a sized value may cause, e.g. 0.1% or 0.001 (default 0.1%)
     #[arg(long, value_name = "RATIO", value_parser = parse::share, allow_hyphen_values = true)]
     pub max_throttle: Option<String>,
-    /// Wall-time budget of the whole proof, e.g. 5m
-    #[arg(long, value_name = "DURATION", value_parser = parse::duration, allow_hyphen_values = true)]
-    pub budget: Option<String>,
     /// Measurement window of one trial (default 2s)
     #[arg(long, value_name = "DURATION", value_parser = parse::duration, hide = true)]
     pub trial: Option<String>,
@@ -238,7 +235,58 @@ pub struct ProveArgs {
     #[arg(long, value_name = "N", value_parser = at_least::<3>, hide = true)]
     pub pairs: Option<usize>,
     #[command(flatten)]
-    pub safety: SafetyArgs,
+    pub safety: ProveSafetyArgs,
+}
+
+/// Safety rails of a prove: one wall-time budget for the whole proof.
+#[derive(Args, Debug, Clone, Default)]
+#[command(next_help_heading = "Safety")]
+pub struct ProveSafetyArgs {
+    /// Print the plan of the whole proof (trials, requests, ETA) and exit
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Refuse every write and delete (exit 5)
+    #[arg(long)]
+    pub read_only: bool,
+    /// Stop after this many backend requests (exit 4)
+    #[arg(long, value_name = "N")]
+    pub max_requests: Option<u64>,
+    /// Stop after transferring this many bytes, e.g. 10GiB (exit 4)
+    #[arg(long, value_name = "SIZE", value_parser = parse::size, allow_hyphen_values = true)]
+    pub max_bytes: Option<String>,
+    /// Wall-time budget of the whole proof, e.g. 5m: no trial starts that would not end in it
+    #[arg(
+        long,
+        value_name = "DURATION",
+        value_parser = parse::duration,
+        allow_hyphen_values = true
+    )]
+    pub max_duration: Option<String>,
+    /// `--budget`: the 6.0–6.2 spelling of `--max-duration`, hidden; with both, the shorter
+    /// bounds the proof.
+    #[arg(
+        long,
+        hide = true,
+        value_name = "DURATION",
+        value_parser = parse::duration,
+        allow_hyphen_values = true
+    )]
+    pub budget: Option<String>,
+}
+
+impl ProveSafetyArgs {
+    /// The one wall-time budget: `--max-duration`, `--budget`, or the shorter of the two.
+    pub fn wall_budget(&self) -> Option<String> {
+        let secs = |d: &String| {
+            crate::util::parse_duration(d)
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(f64::INFINITY)
+        };
+        match (&self.max_duration, &self.budget) {
+            (Some(a), Some(b)) => Some(if secs(b) < secs(a) { b } else { a }.clone()),
+            (a, b) => a.clone().or_else(|| b.clone()),
+        }
+    }
 }
 
 /// `--by`.
@@ -251,7 +299,7 @@ pub enum ByArg {
 
 #[derive(Args, Debug)]
 pub struct ShowArgs {
-    /// The run: id, id prefix, `last`, `last~N`, label, or a .oprobe / report .json file
+    /// The run: id, id prefix, `last`, `last~N`, or a .oprobe / report .json file
     #[arg(value_name = "RUN|FILE")]
     pub run: Option<String>,
     /// List the stored runs (prove trials are hidden; --all lists them)
@@ -269,6 +317,13 @@ pub struct ShowArgs {
     /// Group the requests: by stage, API or connection
     #[arg(long, value_enum)]
     pub by: Option<ByArg>,
+    /// Only the time range from this far into the window (e.g. 3s): its numbers, requests by
+    /// API, verbs and slowest operations, recomputed from the trace rows
+    #[arg(long, value_name = "DURATION", value_parser = parse::duration, conflicts_with_all = ["list", "rm"])]
+    pub since: Option<String>,
+    /// Only the time range up to this far into the window (e.g. 8s; default: the window's end)
+    #[arg(long, value_name = "DURATION", value_parser = parse::duration, conflicts_with_all = ["list", "rm"])]
+    pub until: Option<String>,
     /// Show at most N runs (`--list`)
     #[arg(short = 'n', long, default_value_t = 20, hide = true)]
     pub limit: usize,
@@ -276,11 +331,32 @@ pub struct ShowArgs {
 
 #[derive(Args, Debug)]
 pub struct LabArgs {
-    /// The faults: clean, demo, throttle, stragglers, lossy, flaky, parquet, ratelimit,
-    /// hotkey, bandwidth, queueing, timevarying, noisy
+    /// The faults: demo, throttle, stragglers, bandwidth, flaky or ratelimit (default: none)
     #[arg(value_name = "SCENARIO", value_parser = parse::lab_scenario)]
     pub scenario: Option<String>,
     /// Address to listen on
     #[arg(long, default_value = "127.0.0.1:9000", value_name = "ADDR")]
     pub bind: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ProveSafetyArgs;
+
+    #[test]
+    fn the_old_budget_spelling_still_bounds_the_proof() {
+        let s = |max: Option<&str>, budget: Option<&str>| ProveSafetyArgs {
+            max_duration: max.map(str::to_owned),
+            budget: budget.map(str::to_owned),
+            ..Default::default()
+        };
+        assert_eq!(s(Some("5m"), None).wall_budget().as_deref(), Some("5m"));
+        assert_eq!(s(None, Some("2m")).wall_budget().as_deref(), Some("2m"));
+        // Both (a 6.2 script that passed both): the shorter bounds it, no error.
+        assert_eq!(
+            s(Some("5m"), Some("90s")).wall_budget().as_deref(),
+            Some("90s")
+        );
+        assert_eq!(s(None, None).wall_budget(), None);
+    }
 }

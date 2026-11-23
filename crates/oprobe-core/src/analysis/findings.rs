@@ -27,7 +27,7 @@ use super::diagnosis::Severity;
 use super::hypothesis::{Hypothesis, HypothesisKind};
 use super::outliers::dominant_stage;
 use super::simulate::{self, TailCutSetup};
-use super::stats::quantile_us_ms;
+use super::stats::weighted_quantile_us_ms;
 use crate::model::{Evidence, Finding, Remedy, Report, ReqRow, Run, TimeWindow};
 use crate::util::fmt_ms;
 
@@ -520,11 +520,14 @@ fn throttle_family(c: &Ctx) -> (Option<Finding>, bool) {
             h.explains_ratio * 100.0
         );
     }
+    let backoff_share = r.stages.shares.retry_pct / 100.0;
+    let failed_ratio = out_of_retries as f64 / r.summary.ops.max(1) as f64;
     let mut vals = vec![
         ("throttled_responses_count", thr as f64),
         ("throttled_request_ratio", req_ratio),
         ("retry_pct", r.stages.shares.retry_pct),
         ("rate_limited_failures_count", out_of_retries as f64),
+        (COST_KEY, backoff_share),
     ];
     // The fitted limit is evidence (JSON), not advice: prove sizes the remedy.
     if let Some(h) = &sel {
@@ -557,11 +560,7 @@ fn throttle_family(c: &Ctx) -> (Option<Finding>, bool) {
     (
         Some(Finding {
             code: code.into(),
-            severity: if req_ratio >= 0.01 || out_of_retries > 0 {
-                Severity::Critical
-            } else {
-                Severity::Warning
-            },
+            severity: throttle_severity(failed_ratio, backoff_share, r.sla.max_error_ratio),
             confidence,
             cause,
             evidence: Evidence {
@@ -574,6 +573,53 @@ fn throttle_family(c: &Ctx) -> (Option<Finding>, bool) {
         }),
         false,
     )
+}
+
+/// Evidence value of the share of operation time a finding costs (retry backoff for the
+/// throttle family, the stragglers' wait beyond a typical request for `tail_stragglers`): it
+/// orders findings of one severity.
+pub const COST_KEY: &str = "time_cost_ratio";
+
+/// Backoff share of operation time from which throttling is critical.
+const CRITICAL_BACKOFF_RATIO: f64 = 0.5;
+/// Backoff share of operation time from which throttling is worth a warning.
+const WARNING_BACKOFF_RATIO: f64 = 0.05;
+
+/// The severity of throttling by its cost, not its presence (6.3): critical when more
+/// operations failed out of retries than the run allows, or when half the operation time is
+/// retry backoff; a warning when some operations failed or the backoff is a noticeable share;
+/// otherwise informational (a few 429/503 that retries absorbed at no cost).
+pub fn throttle_severity(failed_ratio: f64, backoff_share: f64, max_error_ratio: f64) -> Severity {
+    if failed_ratio > max_error_ratio || backoff_share >= CRITICAL_BACKOFF_RATIO {
+        Severity::Critical
+    } else if failed_ratio > 0.0 || backoff_share >= WARNING_BACKOFF_RATIO {
+        Severity::Warning
+    } else {
+        Severity::Info
+    }
+}
+
+/// The share of operation time `f` costs ([`COST_KEY`]; 0 when not estimated).
+fn cost_ratio(f: &Finding) -> f64 {
+    f.evidence
+        .values
+        .get(COST_KEY)
+        .copied()
+        .filter(|v| v.is_finite())
+        .unwrap_or(0.0)
+}
+
+/// Most severe first; within one severity, a saturated client first (it makes the others'
+/// timing unreliable), then the costliest (a stable sort: findings that estimate no cost keep
+/// their order).
+pub fn rank(findings: &mut [Finding]) {
+    let client = |f: &Finding| f.code == "client_bound";
+    findings.sort_by(|a, b| {
+        b.severity
+            .cmp(&a.severity)
+            .then(client(b).cmp(&client(a)))
+            .then(cost_ratio(b).total_cmp(&cost_ratio(a)))
+    });
 }
 
 fn bandwidth_cap(c: &Ctx) -> Option<Finding> {
@@ -633,11 +679,26 @@ fn tail_stragglers(c: &Ctx) -> Option<Finding> {
     if c.spec().layers.tail_cut.is_some() || run.reqs.len() < 50 {
         return None;
     }
-    let mut lat: Vec<u64> = run.ops.iter().map(|o| o.latency_us).collect();
-    let (p50, p99) = (
-        quantile_us_ms(&mut lat, 0.5),
-        quantile_us_ms(&mut lat, 0.99),
-    );
+    // Sampled rows over-weigh the tail (the slowest, failed and throttled operations are
+    // always kept): the run's exact distribution, else the rows weighted by what they stand
+    // for.
+    let w = run.op_weights();
+    let weight = |id: u64| w.get(&id).copied().unwrap_or(1.0);
+    let s = &c.r.summary.latency;
+    let (p50, p99) = if s.count > 0 && s.p50 > 0.0 {
+        (s.p50, s.p99)
+    } else {
+        let mut lat: Vec<(u64, f64)> = run
+            .ops
+            .iter()
+            .filter(|o| o.t_us >= 0)
+            .map(|o| (o.latency_us, weight(o.op_id)))
+            .collect();
+        (
+            weighted_quantile_us_ms(&mut lat, 0.5),
+            weighted_quantile_us_ms(&mut lat, 0.99),
+        )
+    };
     if p50 <= 0.0 || p99 < 3.0 * p50 {
         return None;
     }
@@ -647,7 +708,8 @@ fn tail_stragglers(c: &Ctx) -> Option<Finding> {
     let mut apis: Vec<&str> = run.reqs.iter().map(|q| q.api.as_ref()).collect();
     apis.sort_unstable();
     apis.dedup();
-    let mut best: Option<(f64, String, Vec<&ReqRow>, simulate::TailCutReplay)> = None;
+    // Every API with stragglers the tail cut would remove (largest gain first).
+    let mut affected: Vec<(f64, String, Vec<&ReqRow>, simulate::TailCutReplay)> = Vec::new();
     for api in apis {
         let Some(replay) = simulate::tail_cut(run, api, &setup) else {
             continue;
@@ -669,70 +731,135 @@ fn tail_stragglers(c: &Ctx) -> Option<Finding> {
         if p.current <= 0.0 || gain < p.current / 3.0 {
             continue;
         }
-        if best.as_ref().is_none_or(|b| gain > b.0) {
-            best = Some((gain, api.to_owned(), over, replay));
-        }
+        affected.push((gain, api.to_owned(), over, replay));
     }
-    let (_, api, over, replay) = best?;
-    let all = run
-        .reqs
+    if affected.is_empty() {
+        return None;
+    }
+    affected.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+    // Per API: (api, stragglers, share %, straggler TTFB p50, typical TTFB p50), weighted.
+    let per_api: Vec<(&str, usize, f64, f64, f64)> = affected
         .iter()
-        .filter(|q| q.api == api && !q.is_error())
-        .count();
-    let share = over.len() as f64 * 100.0 / all.max(1) as f64;
-    let mut ttfb: Vec<u64> = over.iter().map(|q| q.ttfb_us).collect();
-    let wait = quantile_us_ms(&mut ttfb, 0.5);
-    let mut typical: Vec<u64> = run
-        .reqs
-        .iter()
-        .filter(|q| q.api == api && !q.is_error())
-        .map(|q| q.ttfb_us)
+        .map(|(_, api, over, _)| {
+            let ok: Vec<&ReqRow> = run
+                .reqs
+                .iter()
+                .filter(|q| q.api == *api && !q.is_error())
+                .collect();
+            let all_w: f64 = ok.iter().map(|q| weight(q.op_id)).sum();
+            let over_w: f64 = over.iter().map(|q| weight(q.op_id)).sum();
+            let mut ttfb: Vec<(u64, f64)> =
+                over.iter().map(|q| (q.ttfb_us, weight(q.op_id))).collect();
+            let mut typical: Vec<(u64, f64)> =
+                ok.iter().map(|q| (q.ttfb_us, weight(q.op_id))).collect();
+            (
+                api.as_str(),
+                over.len(),
+                over_w * 100.0 / all_w.max(1.0),
+                weighted_quantile_us_ms(&mut ttfb, 0.5),
+                weighted_quantile_us_ms(&mut typical, 0.5),
+            )
+        })
         .collect();
-    let typ = quantile_us_ms(&mut typical, 0.5);
+    let (_, _, share, wait, typ) = per_api[0];
+    let stragglers: usize = per_api.iter().map(|a| a.1).sum();
+    let shares: Vec<String> = per_api
+        .iter()
+        .map(|(api, _, share, _, _)| format!("{share:.1}% of {api}"))
+        .collect();
+    let mut text = per_api
+        .iter()
+        .map(|(api, n, _, wait, typ)| {
+            format!(
+                "{n} {api} stragglers wait ~{} for the first byte against ~{} for a typical {api}",
+                fmt_ms(*wait),
+                fmt_ms(*typ)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    text += &format!("; operation p50 {} · p99 {}", fmt_ms(p50), fmt_ms(p99));
+    // What the stragglers cost: the wait beyond a typical request of every request that waits
+    // for its first byte past its API's deadline, as a share of all request time.
+    let mut ttfb_all: Vec<(u64, f64)> = run
+        .reqs
+        .iter()
+        .filter(|q| !q.is_error())
+        .map(|q| (q.ttfb_us, weight(q.op_id)))
+        .collect();
+    let typ_all_us = weighted_quantile_us_ms(&mut ttfb_all, 0.5) * 1000.0;
+    let excess: f64 = affected
+        .iter()
+        .flat_map(|a| a.2.iter())
+        .filter(|q| dominant_stage(q) == "ttfb")
+        .map(|q| (q.total_us as f64 - typ_all_us).max(0.0))
+        .sum();
+    let total: f64 = run
+        .reqs
+        .iter()
+        .map(|q| q.total_us as f64)
+        .sum::<f64>()
+        .max(1.0);
     Some(Finding {
         code: "tail_stragglers".into(),
         severity: Severity::Warning,
-        confidence: if over.len() >= 20 {
+        confidence: if stragglers >= 20 {
             Confidence::High
         } else {
             Confidence::Medium
         },
         cause: format!(
-            "{share:.1}% of {api} requests wait far longer for the server's first byte than their peers (stragglers)."
+            "{} requests wait far longer for the server's first byte than their peers (stragglers).",
+            join_and(&shares)
         ),
         evidence: Evidence {
-            text: format!(
-                "{} stragglers wait ~{} for the first byte against ~{} for a typical {api}; operation p50 {} · p99 {}",
-                over.len(),
-                fmt_ms(wait),
-                fmt_ms(typ),
-                fmt_ms(p50),
-                fmt_ms(p99)
-            ),
+            text,
             values: values(&[
                 ("straggler_pct", share),
                 ("straggler_ttfb_ms", wait),
                 ("typical_ttfb_ms", typ),
                 ("p50_ms", p50),
                 ("p99_ms", p99),
-                ("replayed_p99_ms", replay.prediction.predicted),
+                ("replayed_p99_ms", affected[0].3.prediction.predicted),
+                ("affected_apis_count", per_api.len() as f64),
+                (COST_KEY, excess / total),
             ]),
-            op_ids: slowest_ops(run, over.iter().map(|q| q.op_id)),
+            op_ids: slowest_ops(
+                run,
+                affected
+                    .iter()
+                    .flat_map(|a| a.2.iter().map(|q| q.op_id))
+                    .collect::<Vec<_>>(),
+            ),
             windows: Vec::new(),
         },
         remedy: remedy("tail_stragglers", None),
     })
 }
 
+/// `a`, `a and b`, `a, b and c`.
+fn join_and(items: &[String]) -> String {
+    match items {
+        [] => String::new(),
+        [one] => one.clone(),
+        [init @ .., last] => format!("{} and {last}", init.join(", ")),
+    }
+}
+
 /// A request is hung when it takes this long and ≥ 20× the median request.
 const HUNG_MIN_US: u64 = 2_000_000;
 
 fn hung_requests(c: &Ctx) -> Option<Finding> {
-    let mut totals: Vec<u64> = c.reqs().map(|q| q.total_us).collect();
+    // Weighted: sampled rows over-weigh the slow requests.
+    let w = c.run.op_weights();
+    let mut totals: Vec<(u64, f64)> = c
+        .reqs()
+        .map(|q| (q.total_us, w.get(&q.op_id).copied().unwrap_or(1.0)))
+        .collect();
     if totals.len() < 20 {
         return None;
     }
-    let median_ms = quantile_us_ms(&mut totals, 0.5);
+    let median_ms = weighted_quantile_us_ms(&mut totals, 0.5);
     let bound = HUNG_MIN_US.max((median_ms * 1000.0 * 20.0) as u64);
     let timeouts =
         c.r.resilience
@@ -986,8 +1113,9 @@ fn repeated_reads(c: &Ctx) -> Option<Finding> {
         cause: "The same bytes are read again and again.".into(),
         evidence: Evidence {
             text: format!(
-                "replaying the reads through an in-memory cache would save {:.0} of every 1 000 read requests",
-                -p.requests_per_1k_ops_delta
+                "replaying the reads through an in-memory cache would save {} requests per {} successful read operations",
+                crate::model::group_thousands(-p.requests_per_1k_ops_delta, 0),
+                crate::model::group_thousands(1000.0, 0)
             ),
             values: values(&[(
                 "saved_requests_per_1k_ops_mean",
@@ -1012,9 +1140,18 @@ fn cold_connections(c: &Ctx) -> Option<Finding> {
     if reqs.len() < 20 || cold.is_empty() {
         return None;
     }
-    let total: u64 = reqs.iter().map(|q| q.total_us).sum();
-    let connect: u64 = cold.iter().map(|q| q.connect_us()).sum();
-    let share = connect as f64 * 100.0 / total.max(1) as f64;
+    // Weighted by what each sampled row stands for (warmup rows are never sampled).
+    let w = c.run.op_weights();
+    let weight = |q: &ReqRow| {
+        if q.t_us < 0 {
+            1.0
+        } else {
+            w.get(&q.op_id).copied().unwrap_or(1.0)
+        }
+    };
+    let total: f64 = reqs.iter().map(|q| q.total_us as f64 * weight(q)).sum();
+    let connect: f64 = cold.iter().map(|q| q.connect_us() as f64 * weight(q)).sum();
+    let share = connect * 100.0 / total.max(1.0);
     let reuse = (reqs.len() - cold.len()) as f64 * 100.0 / reqs.len() as f64;
     if share < 10.0 && !(reuse < 80.0 && reqs.len() > 50) {
         return None;
@@ -1028,8 +1165,12 @@ fn cold_connections(c: &Ctx) -> Option<Finding> {
         "version"
     };
     let p50 = |f: &dyn Fn(&ReqRow) -> u64| {
-        let mut v: Vec<u64> = cold.iter().map(|q| f(q)).filter(|x| *x > 0).collect();
-        quantile_us_ms(&mut v, 0.5)
+        let mut v: Vec<(u64, f64)> = cold
+            .iter()
+            .map(|q| (f(q), weight(q)))
+            .filter(|x| x.0 > 0)
+            .collect();
+        weighted_quantile_us_ms(&mut v, 0.5)
     };
     let (dns, tcp, tls) = (p50(&|q| q.dns_us), p50(&|q| q.tcp_us), p50(&|q| q.tls_us));
     Some(Finding {
@@ -1174,7 +1315,7 @@ pub fn derive(run: &Run) -> Vec<Finding> {
         });
         out.insert(0, cb);
     }
-    out.sort_by_key(|f| std::cmp::Reverse(f.severity));
+    rank(&mut out);
     for f in &mut out {
         f.remedy.next = Some(next_command(&r.run.id, f));
     }
@@ -1268,7 +1409,7 @@ pub fn validity(r: &Report, findings: Vec<Finding>) -> (Vec<Finding>, Validity) 
             remedy: rem,
         });
     }
-    out.sort_by_key(|f| std::cmp::Reverse(f.severity));
+    rank(&mut out);
     (out, v)
 }
 
@@ -1276,6 +1417,48 @@ pub fn validity(r: &Report, findings: Vec<Finding>) -> (Vec<Finding>, Validity) 
 pub(crate) mod tests {
     use super::*;
     use crate::analysis::simulate::tests::straggler_run;
+
+    /// Throttling is judged by what it costs: failed operations and retry backoff, not the
+    /// mere presence of 429/503 (the demo's 0.3 % throttled requests absorbed by retries).
+    #[test]
+    fn throttling_severity_follows_its_cost() {
+        let max = 0.01;
+        assert_eq!(throttle_severity(0.0, 0.01, max), Severity::Info);
+        assert_eq!(throttle_severity(0.0, 0.2, max), Severity::Warning);
+        assert_eq!(throttle_severity(0.001, 0.0, max), Severity::Warning);
+        assert_eq!(throttle_severity(0.02, 0.0, max), Severity::Critical);
+        assert_eq!(throttle_severity(0.0, 0.7, max), Severity::Critical);
+    }
+
+    #[test]
+    fn findings_of_one_severity_rank_by_cost() {
+        let f = |code: &str, sev, cost: Option<f64>| Finding {
+            code: code.into(),
+            severity: sev,
+            evidence: Evidence {
+                values: cost.map(|c| values(&[(COST_KEY, c)])).unwrap_or_default(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut v = vec![
+            f("errors", Severity::Warning, None),
+            f("throttling", Severity::Warning, Some(0.15)),
+            f("tail_stragglers", Severity::Warning, Some(0.4)),
+            f("cold_connections", Severity::Critical, None),
+        ];
+        rank(&mut v);
+        let codes: Vec<&str> = v.iter().map(|f| f.code.as_str()).collect();
+        assert_eq!(
+            codes,
+            [
+                "cold_connections",
+                "tail_stragglers",
+                "throttling",
+                "errors"
+            ]
+        );
+    }
 
     /// A complete, empty report as JSON (every field present).
     pub(crate) fn empty_report_json() -> serde_json::Value {
@@ -1314,6 +1497,7 @@ pub(crate) mod tests {
             open_loop: None,
             timeline: vec![],
             heatmap: Default::default(),
+            latency_histogram: Default::default(),
             findings: vec![],
             slowest: vec![],
             cleanup: Default::default(),
@@ -1349,6 +1533,98 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn stragglers_name_every_affected_api() {
+        let mut run = base();
+        // Alternate blocks of 40 requests between two APIs: both get their stragglers.
+        for (i, q) in run.reqs.iter_mut().enumerate() {
+            if (i / 40) % 2 == 1 {
+                q.api = "HeadObject".into();
+            }
+        }
+        let f = derive(&run);
+        let t = f
+            .iter()
+            .find(|x| x.code == "tail_stragglers")
+            .unwrap_or_else(|| panic!("{f:#?}"));
+        assert!(
+            t.cause.contains("GetObject") && t.cause.contains("HeadObject"),
+            "{}",
+            t.cause
+        );
+        assert!(t.cause.contains(" and "), "{}", t.cause);
+        assert!(
+            t.evidence.text.contains("GetObject stragglers")
+                && t.evidence.text.contains("HeadObject stragglers"),
+            "{}",
+            t.evidence.text
+        );
+        assert_eq!(t.evidence.values["affected_apis_count"], 2.0);
+    }
+
+    #[test]
+    fn sampled_rows_are_weighted_by_what_they_stand_for() {
+        // 1 000 kept rows of 10 000 operations: the 25 slowest kept always, the rest a sample.
+        let mut run = base();
+        run.report.sampling = crate::model::Sampling {
+            seen_ops_count: 10_000,
+            kept_ops_count: 1000,
+            kept_ratio: 0.1,
+            always_kept_ops_count: 25,
+            ..Default::default()
+        };
+        let w = run.op_weights();
+        // op 8 is a straggler (row 7): it stands for itself.
+        assert!(!w.contains_key(&8));
+        assert!((w[&1] - 9975.0 / 975.0).abs() < 1e-9, "{}", w[&1]);
+        // With the timeline's exact counts: per interval (2 000 operations, 200 rows, 5 of
+        // them stragglers).
+        run.report.timeline = (0..5)
+            .map(|i| crate::trace::TimelinePoint {
+                t_s: f64::from(i),
+                len_s: 1.0,
+                ops_count: 2000,
+                ..Default::default()
+            })
+            .collect();
+        let w = run.op_weights();
+        assert!((w[&1] - 1995.0 / 195.0).abs() < 1e-9, "{}", w[&1]);
+        // Weighted, the stragglers are 0.25 % of the operations, not 2.5 % of the rows: the
+        // p99 is a typical operation, and there is no tail to cut.
+        assert!(!derive(&run).iter().any(|x| x.code == "tail_stragglers"));
+    }
+
+    #[test]
+    fn repeated_reads_count_requests_per_thousand_reads() {
+        let mut run = base();
+        run.report.workload.access = "zipf(1.2)".into();
+        run.report.workload.mix = vec![crate::model::MixEntry {
+            weight: 1,
+            op: "read".into(),
+            ..Default::default()
+        }];
+        let f = derive(&run);
+        let rr = f
+            .iter()
+            .find(|x| x.code == "repeated_reads")
+            .unwrap_or_else(|| panic!("{f:#?}"));
+        let saved = rr.evidence.values["saved_requests_per_1k_ops_mean"];
+        // The text and the labelled value name the same unit and print the same number.
+        let n = crate::model::group_thousands(saved, 0);
+        assert!(
+            rr.evidence.text.contains(&format!(
+                "{n} requests per 1\u{202f}000 successful read operations"
+            )),
+            "{}",
+            rr.evidence.text
+        );
+        let l = rr.evidence.labelled();
+        assert_eq!(
+            l[0],
+            ("Requests saved per 1\u{202f}000 reads".to_owned(), n)
+        );
+    }
+
+    #[test]
     fn stragglers_are_found_with_opendal_default_retry() {
         // OpenDAL's default backoff (1 s, no jitter) would make a cut request slower: the
         // detection uses the remedy's own short backoff.
@@ -1375,6 +1651,8 @@ pub(crate) mod tests {
     fn throttled(kind: HypothesisKind, explains: f64, conf: Confidence) -> Run {
         let mut run = base();
         run.report.resilience.throttled_responses = 100;
+        // Throttling that costs: most of the operation time is retry backoff (critical).
+        run.report.stages.shares.retry_pct = 60.0;
         run.report.capacity.hypotheses = vec![Hypothesis {
             kind,
             explains_ratio: explains,

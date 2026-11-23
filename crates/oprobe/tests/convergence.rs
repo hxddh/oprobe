@@ -205,6 +205,56 @@ fn a_rate_limit_is_capped_under_the_rate() {
     }
 }
 
+/// The default `lab://ratelimit` (OpenDAL's default retry: 1 s backoff, no jitter) is a rate
+/// limit, not an in-flight limit: the workers wake in step and throttle only above a couple of
+/// requests in flight, but the bursts the bucket serves after each lull are more than any cap
+/// of that size carries (design 6.3 A1). A run that saw no throttling is repeated; no run may
+/// name an in-flight limit.
+#[test]
+fn the_default_rate_limit_lab_is_a_rate_limit() {
+    let env = Env::new();
+    let mut found = None;
+    for _ in 0..3 {
+        let v = env.json(&["run", "lab://ratelimit"]);
+        let r = v["runs"][0]["report"].clone();
+        assert!(
+            finding(&r, "throttling").is_none(),
+            "the rate limit read as an in-flight limit: {:#}",
+            r["capacity"]["hypotheses"]
+        );
+        if finding(&r, "rate_limit").is_some() {
+            found = Some(r);
+            break;
+        }
+    }
+    let r = found.expect("a rate_limit finding in 3 runs");
+    check_finding(&r, "rate_limit", Some("layers.concurrent_limit.http"));
+    assert!(
+        r["capacity"]["inflight_ceiling"].is_null(),
+        "not an in-flight limit (A1)"
+    );
+    // The timeline shows the request rate and the throttled responses where they happened.
+    let tl = r["timeline"].as_array().unwrap();
+    let requests: u64 = tl
+        .iter()
+        .map(|p| p["requests_count"].as_u64().unwrap())
+        .sum();
+    let throttled: u64 = tl
+        .iter()
+        .map(|p| p["throttled_count"].as_u64().unwrap())
+        .sum();
+    assert_eq!(
+        requests,
+        r["connections"]["requests_count"].as_u64().unwrap()
+    );
+    assert_eq!(
+        throttled,
+        r["resilience"]["throttled_responses_count"]
+            .as_u64()
+            .unwrap()
+    );
+}
+
 /// Zipf reads over per-key buckets of 40 requests/s: a key limit. Its remedy is the key
 /// layout (not a layer); prove tests the client-side cap as the stopgap.
 #[test]
@@ -385,4 +435,39 @@ fn a_clean_lab_gets_no_invented_limit() {
             }
         }
     }
+}
+
+/// The first impression (6.3): `oprobe demo`, then `oprobe prove last` with every default — the
+/// top finding's remedy, the default objective (goodput) and no budget flag — proves
+/// `improved`. The demo's throttling costs latency, not goodput, so it ranks below the
+/// stragglers whose wait holds the lab's slots.
+#[test]
+fn the_demo_proves_its_top_finding() {
+    let env = Env::new();
+    let mut r = Value::Null;
+    for _ in 0..3 {
+        r = env.json(&["demo"])["runs"][0]["report"].clone();
+        if r["findings"][0]["code"] == "tail_stragglers" {
+            break;
+        }
+    }
+    let top = &r["findings"][0];
+    assert_eq!(top["code"], "tail_stragglers", "{:#}", r["findings"]);
+    if let Some(t) = finding(&r, "throttling") {
+        assert_ne!(
+            t["severity"], "critical",
+            "throttling that costs no goodput: {t:#}"
+        );
+    }
+    let started = std::time::Instant::now();
+    let p = env.json(&["prove", "last"]);
+    assert_eq!(p["finding"], "tail_stragglers", "{p:#}");
+    assert_eq!(p["objective"], "goodput");
+    improved(&p);
+    eprintln!(
+        "demo → prove last: {} in {:.0} s ({} pairs)",
+        p["objective_delta"]["estimate"],
+        started.elapsed().as_secs_f64(),
+        p["pairs_count"]
+    );
 }

@@ -30,6 +30,8 @@ use crate::analysis::capacity::Confidence;
 use crate::analysis::diagnosis::Severity;
 use crate::model::{Finding, Report, Run, VerdictLevel};
 
+pub use super::range::{OpLine, RangeView, ReqLine, ops_in, slowest_requests};
+
 /// The verdict line.
 #[derive(Clone, Debug, PartialEq)]
 pub struct VerdictView {
@@ -150,6 +152,15 @@ impl FindingView {
             None => self.remedy.clone(),
         }
     }
+
+    /// The remedy in one line, each part once: `path + with — words`, or only the words when
+    /// the remedy is not a layer (`key_limit`, `client_bound`: the label already is the words).
+    pub fn remedy_line(&self) -> String {
+        match &self.remedy_path {
+            Some(_) => format!("{} — {}", self.remedy_label(), self.remedy),
+            None => self.remedy.clone(),
+        }
+    }
 }
 
 /// The findings, most severe first (stable within a severity).
@@ -201,7 +212,7 @@ impl NumbersView {
 }
 
 /// One stage's share of time.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, schemars::JsonSchema)]
 pub struct StageShare {
     /// Stable key: `queue`, `connect`, `upload`, `server`, `download`, `retry`, `cache`,
     /// `client` (all operations); `queue`, `connect`, `send`, `ttfb`, `body`, `backoff`,
@@ -287,6 +298,21 @@ pub struct WaterfallRow {
     pub bytes_down: u64,
     pub throttled: bool,
     pub error: Option<String>,
+    /// Time waited before this attempt since the previous request of the operation ended
+    /// (retry backoff), µs; 0 for a first attempt.
+    pub wait_before_us: u64,
+    /// The provider's error code (`SlowDown`, `InternalError`), when the response had one.
+    pub provider_code: Option<String>,
+    /// The `Retry-After` the service asked for.
+    pub retry_after_ms: Option<u64>,
+    /// The connection's smoothed and minimum round-trip time and retransmitted segments
+    /// (kernel `TCP_INFO`), when recorded.
+    pub rtt_us: Option<u64>,
+    pub min_rtt_us: Option<u64>,
+    pub retransmits_count: Option<u64>,
+    /// The `Server-Timing` header.
+    pub server_timing: Option<String>,
+    pub request_id: Option<String>,
 }
 
 /// One of the slowest operations with its requests.
@@ -313,71 +339,335 @@ pub fn slowest(run: &Run, n: usize) -> Vec<WaterfallOp> {
     } else {
         run.report.slowest.clone()
     };
-    ids.into_iter()
-        .filter_map(|id| run.op(id))
+    examples(run, &ids, n)
+}
+
+/// The operations `ids` (a finding's examples, in its order) that have rows, at most `n`,
+/// request by request.
+pub fn examples(run: &Run, ids: &[u64], n: usize) -> Vec<WaterfallOp> {
+    ids.iter()
+        .filter_map(|id| waterfall(run, *id))
         .take(n)
-        .map(|o| WaterfallOp {
-            op_id: o.op_id,
-            verb: o.verb.to_string(),
-            key: o.key.clone(),
-            t_us: o.t_us,
-            latency_us: o.latency_us,
-            ok: o.ok,
-            backoff_us: o.breakdown.retry_us,
-            rows: run
-                .requests_of(o.op_id)
-                .into_iter()
-                .map(|q| WaterfallRow {
-                    api: q.api.to_string(),
-                    status: q.status,
-                    attempt: q.attempt,
-                    start_us: q.t_us - o.t_us,
-                    queue_us: q.queue_us,
-                    connect_us: q.connect_us(),
-                    send_us: q.send_us,
-                    ttfb_us: q.ttfb_us,
-                    body_us: q.body_us + q.stall_us,
-                    total_us: q.total_us,
-                    reused: q.reused,
-                    bytes_down: q.bytes_down,
-                    throttled: q.is_throttle(),
-                    error: q.error.clone(),
-                })
-                .collect(),
-        })
         .collect()
 }
 
-/// The per-second series of the window.
+/// One operation, request by request (`None` when the rows do not hold it).
+pub fn waterfall(run: &Run, op_id: u64) -> Option<WaterfallOp> {
+    let o = run.op(op_id)?;
+    let mut prev_end: Option<i64> = None;
+    let rows = run
+        .requests_of(o.op_id)
+        .into_iter()
+        .map(|q| {
+            // A retry waited from the previous attempt's end to its own start.
+            let wait_before_us = match prev_end {
+                Some(end) if q.attempt > 1 && q.t_us > end => (q.t_us - end) as u64,
+                _ => 0,
+            };
+            prev_end = Some(prev_end.unwrap_or(i64::MIN).max(q.t_us + q.total_us as i64));
+            let detail = q.detail.as_deref();
+            WaterfallRow {
+                api: q.api.to_string(),
+                status: q.status,
+                attempt: q.attempt,
+                start_us: q.t_us - o.t_us,
+                queue_us: q.queue_us,
+                connect_us: q.connect_us(),
+                send_us: q.send_us,
+                ttfb_us: q.ttfb_us,
+                body_us: q.body_us + q.stall_us,
+                total_us: q.total_us,
+                reused: q.reused,
+                bytes_down: q.bytes_down,
+                throttled: q.is_throttle(),
+                error: q.error.clone(),
+                wait_before_us,
+                provider_code: detail.and_then(|d| d.error_code.clone()),
+                retry_after_ms: q.retry_after_ms,
+                rtt_us: q.tcp.as_ref().map(|t| t.rtt_us).filter(|v| *v > 0),
+                min_rtt_us: q.tcp.as_ref().map(|t| t.min_rtt_us).filter(|v| *v > 0),
+                retransmits_count: q.tcp.as_ref().map(|t| t.retrans),
+                server_timing: detail.and_then(|d| d.server_timing.clone()),
+                request_id: q.request_id.clone(),
+            }
+        })
+        .collect();
+    Some(WaterfallOp {
+        op_id: o.op_id,
+        verb: o.verb.to_string(),
+        key: o.key.clone(),
+        t_us: o.t_us,
+        latency_us: o.latency_us,
+        ok: o.ok,
+        backoff_us: o.breakdown.retry_us,
+        rows,
+    })
+}
+
+/// The series of the window, one value per interval (1 s for the first ten minutes, then
+/// 10 s: `len_s`).
+///
+/// **When things count** (as `report.timeline`): operations, goodput, bytes and the latency
+/// quantiles by the interval the operation started in; `throttled_count` (throttled
+/// responses), `requests_per_s`, `retries_count` and `errors_count` (failed operations) by the
+/// interval they happened in.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct TimelineView {
     pub t_s: Vec<f64>,
+    /// Length of each interval.
+    pub len_s: Vec<f64>,
+    /// Operations started per second, failed ones included (the attempted rate).
     pub ops_per_s: Vec<f64>,
+    /// Successful operations started per second (failed ones never count).
+    pub goodput_ops_per_s: Vec<f64>,
     pub mib_per_s: Vec<f64>,
     pub p50_ms: Vec<f64>,
+    pub p90_ms: Vec<f64>,
     pub p99_ms: Vec<f64>,
+    pub p999_ms: Vec<f64>,
+    pub max_ms: Vec<f64>,
+    /// Operations started in each interval: the samples behind its quantiles
+    /// ([`TimelineView::reliable`]).
+    pub ops_count: Vec<u64>,
+    /// Throttled responses received in each interval.
     pub throttled_count: Vec<u64>,
+    /// Operations that failed in each interval.
     pub errors_count: Vec<u64>,
+    /// Requests sent per second, retries included.
+    pub requests_per_s: Vec<f64>,
+    /// Retries issued in each interval.
+    pub retries_count: Vec<u64>,
     pub inflight_peak_count: Vec<u64>,
     pub new_connections_count: Vec<u64>,
+    /// The verb the series are filtered to ([`TimelineView::for_verb`]); `None`: every verb.
+    pub verb: Option<String>,
 }
 
 impl TimelineView {
     pub fn of(r: &Report) -> Self {
         let mut v = Self::default();
-        for p in &r.timeline {
+        let n = r.timeline.len();
+        for (i, p) in r.timeline.iter().enumerate() {
+            let len = interval_len(p);
+            let width = interval_width(r, p, i + 1 == n);
+            // Reports before 6.3 carry no exact counts: derive them from the rates.
+            let ops = if p.ops_count > 0 {
+                p.ops_count
+            } else {
+                (p.ops_per_s * width).round().max(0.0) as u64
+            };
             v.t_s.push(p.t_s);
+            v.len_s.push(len);
             v.ops_per_s.push(p.ops_per_s);
+            v.goodput_ops_per_s.push(if p.ops_count > 0 {
+                p.goodput_ops_per_s
+            } else {
+                // Before 6.3 failures counted by operation start, like the operations.
+                (p.ops_per_s - p.errors as f64 / width).max(0.0)
+            });
             v.mib_per_s.push(p.mib_per_s);
             v.p50_ms.push(p.p50_ms);
+            v.p90_ms.push(p.p90_ms);
             v.p99_ms.push(p.p99_ms);
+            v.p999_ms.push(p.p999_ms);
+            v.max_ms.push(p.max_ms);
+            v.ops_count.push(ops);
             v.throttled_count.push(p.throttled);
             v.errors_count.push(p.errors);
+            v.requests_per_s.push(p.requests_per_s);
+            v.retries_count.push(p.retries_count);
             v.inflight_peak_count.push(p.inflight_peak);
             v.new_connections_count.push(p.new_connections);
         }
         v
     }
+
+    pub fn len(&self) -> usize {
+        self.t_s.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.t_s.is_empty()
+    }
+
+    /// At most `max_rows` rows: consecutive intervals merged into rows of equal count. Rates are
+    /// averaged over time, counts summed, p50 averaged, and p90, p99, p99.9 and max are the
+    /// worst interval's (a merged row never hides a spike). A series this view does not carry
+    /// (a verb's requests) stays empty. Returns the series and how many intervals each row
+    /// merges.
+    pub fn downsample(&self, max_rows: usize) -> (Self, usize) {
+        let n = self.len();
+        let k = n.div_ceil(max_rows.max(1)).max(1);
+        if k == 1 {
+            return (self.clone(), 1);
+        }
+        let mut v = Self {
+            verb: self.verb.clone(),
+            ..Self::default()
+        };
+        let mut i = 0;
+        while i < n {
+            let j = (i + k).min(n);
+            let r = i..j;
+            let len: f64 = self.len_s[r.clone()].iter().sum();
+            let tw = |x: &[f64], out: &mut Vec<f64>| {
+                if x.len() == n {
+                    out.push(
+                        x[r.clone()]
+                            .iter()
+                            .zip(&self.len_s[r.clone()])
+                            .map(|(a, l)| a * l)
+                            .sum::<f64>()
+                            / len.max(1e-9),
+                    );
+                }
+            };
+            let worst = |x: &[f64], out: &mut Vec<f64>| {
+                if x.len() == n {
+                    out.push(x[r.clone()].iter().copied().fold(0.0, f64::max));
+                }
+            };
+            let sum = |x: &[u64], out: &mut Vec<u64>| {
+                if x.len() == n {
+                    out.push(x[r.clone()].iter().sum::<u64>());
+                }
+            };
+            v.t_s.push(self.t_s[i]);
+            v.len_s.push(len);
+            tw(&self.ops_per_s, &mut v.ops_per_s);
+            tw(&self.goodput_ops_per_s, &mut v.goodput_ops_per_s);
+            tw(&self.mib_per_s, &mut v.mib_per_s);
+            tw(&self.p50_ms, &mut v.p50_ms);
+            worst(&self.p90_ms, &mut v.p90_ms);
+            worst(&self.p99_ms, &mut v.p99_ms);
+            worst(&self.p999_ms, &mut v.p999_ms);
+            worst(&self.max_ms, &mut v.max_ms);
+            sum(&self.ops_count, &mut v.ops_count);
+            sum(&self.throttled_count, &mut v.throttled_count);
+            sum(&self.errors_count, &mut v.errors_count);
+            tw(&self.requests_per_s, &mut v.requests_per_s);
+            sum(&self.retries_count, &mut v.retries_count);
+            if self.inflight_peak_count.len() == n {
+                v.inflight_peak_count.push(
+                    self.inflight_peak_count[r.clone()]
+                        .iter()
+                        .copied()
+                        .max()
+                        .unwrap_or(0),
+                );
+            }
+            sum(&self.new_connections_count, &mut v.new_connections_count);
+            i = j;
+        }
+        (v, k)
+    }
+
+    /// The verbs the timeline has per-interval counters for, busiest first (empty for reports
+    /// before 6.3).
+    pub fn verbs(r: &Report) -> Vec<String> {
+        let mut n: std::collections::BTreeMap<&str, u64> = Default::default();
+        for p in &r.timeline {
+            for v in &p.verbs {
+                *n.entry(v.verb.as_str()).or_default() += v.ops_count;
+            }
+        }
+        let mut v: Vec<(&str, u64)> = n.into_iter().collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+        v.into_iter().map(|(k, _)| k.to_owned()).collect()
+    }
+
+    /// The series of one verb: its operations, goodput, failures and throttled responses per
+    /// interval, its p50 / p90 / p99 / p99.9 / max at the heatmap's row resolution (the upper
+    /// bound of the row reaching the quantile). Requests, retries, bytes, in-flight and new
+    /// connections are not split by verb: they stay empty. `None` when the timeline has no
+    /// counters for `verb`.
+    pub fn for_verb(r: &Report, verb: &str) -> Option<Self> {
+        if !r
+            .timeline
+            .iter()
+            .any(|p| p.verbs.iter().any(|v| v.verb == verb))
+        {
+            return None;
+        }
+        let bounds = crate::model::HEATMAP_LATENCY_BOUNDS_MS;
+        let mut v = Self {
+            verb: Some(verb.to_owned()),
+            ..Self::default()
+        };
+        let n = r.timeline.len();
+        for (i, p) in r.timeline.iter().enumerate() {
+            let width = interval_width(r, p, i + 1 == n);
+            let x = p.verbs.iter().find(|x| x.verb == verb);
+            let ops = x.map_or(0, |x| x.ops_count);
+            let rows = x.map(|x| x.latency_rows_count.as_slice()).unwrap_or(&[]);
+            let q = |q: f64| row_quantile_ms(rows, &bounds, q);
+            v.t_s.push(p.t_s);
+            v.len_s.push(interval_len(p));
+            v.ops_per_s.push(ops as f64 / width);
+            v.goodput_ops_per_s
+                .push(x.map_or(0, |x| x.ok_ops_count) as f64 / width);
+            v.p50_ms.push(q(0.5));
+            v.p90_ms.push(q(0.9));
+            v.p99_ms.push(q(0.99));
+            v.p999_ms.push(q(0.999));
+            v.max_ms.push(q(1.0));
+            v.ops_count.push(ops);
+            v.throttled_count.push(x.map_or(0, |x| x.throttled_count));
+            v.errors_count.push(x.map_or(0, |x| x.errors_count));
+        }
+        Some(v)
+    }
+
+    /// The fewest operations an interval needs for its quantile `q` (0–1) to be an estimate
+    /// rather than its slowest few operations: `n ≥ 10 / (1 − q)` (10 for p50, 100 for p90,
+    /// 1 000 for p99, 10 000 for p99.9), so at least ten operations lie above it.
+    pub fn min_ops_for(q: f64) -> u64 {
+        (10.0 / (1.0 - q.clamp(0.0, 0.9999))).ceil() as u64
+    }
+
+    /// Per interval: whether it has enough operations for quantile `q`
+    /// ([`TimelineView::min_ops_for`]). A renderer mutes (or omits) the others.
+    pub fn reliable(&self, q: f64) -> Vec<bool> {
+        let min = Self::min_ops_for(q);
+        self.ops_count.iter().map(|n| *n >= min).collect()
+    }
+}
+
+/// The nominal length of a timeline interval (1 s for reports without one).
+fn interval_len(p: &crate::trace::TimelinePoint) -> f64 {
+    if p.len_s > 0.0 { p.len_s } else { 1.0 }
+}
+
+/// The time a timeline interval's rates are over: the last interval ends with the window.
+fn interval_width(r: &Report, p: &crate::trace::TimelinePoint, last: bool) -> f64 {
+    let len = interval_len(p);
+    if last && r.run.window_s > p.t_s {
+        (r.run.window_s - p.t_s).clamp(0.05, len)
+    } else {
+        len
+    }
+}
+
+/// The latency at quantile `q` of counts per latency row (`bounds` the rows' lower bounds):
+/// the upper bound of the row that reaches it (twice the lower bound for the open last row);
+/// 0 without counts.
+fn row_quantile_ms(rows: &[u64], bounds: &[f64], q: f64) -> f64 {
+    let total: u64 = rows.iter().sum();
+    if total == 0 {
+        return 0.0;
+    }
+    let rank = ((total as f64 * q.clamp(0.0, 1.0)).ceil() as u64).max(1);
+    let mut acc = 0u64;
+    for (i, c) in rows.iter().enumerate() {
+        acc += c;
+        if acc >= rank {
+            return bounds
+                .get(i + 1)
+                .copied()
+                .unwrap_or_else(|| bounds.get(i).map_or(0.0, |b| b * 2.0));
+        }
+    }
+    0.0
 }
 
 /// The connections: protocol, reuse, dials (warmup included, T11) and their phases.
@@ -737,15 +1027,22 @@ impl CompareView {
     }
 }
 
-/// The latency distribution: the share of operations at or below each latency (a CDF), from
-/// the trace rows (exact) when every operation was kept, else from the heatmap's fixed log
-/// buckets, which count every operation (the sampler keeps the slowest and the failed ones
-/// always, so sampled rows over-weigh the tail). At most [`LatencyCdf::MAX_POINTS`] points.
+/// The latency distribution: the share of operations at or below each latency (a CDF).
+///
+/// Drawn from, in order:
+/// 1. the trace rows (exact) when they hold every operation the run measured — nothing
+///    sampled away and no censored open-loop arrival the rows cannot show;
+/// 2. the run's latency histogram (`report.latency_histogram`: every operation, 20 bins per
+///    decade, each point at its bin's upper bound) — never biased by row sampling, which
+///    keeps the slowest and failed operations always and so over-weighs the tail;
+/// 3. the heatmap's 20 coarse rows (reports before 6.3).
+///
+/// At most [`LatencyCdf::MAX_POINTS`] points.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct LatencyCdf {
     /// `(latency ms, share 0–1)`, latency ascending, the share reaching 1.
     pub pts: Vec<(f64, f64)>,
-    /// From the trace rows (otherwise from the heatmap buckets).
+    /// From the exact trace rows (otherwise from the histogram or the heatmap's rows).
     pub exact: bool,
 }
 
@@ -765,6 +1062,12 @@ impl LatencyCdf {
                     .collect()
             })
             .unwrap_or_default();
+        // The rows win only when they are every operation of the histogram (a censored
+        // arrival or a row the stream thinned is in the histogram, not in the rows).
+        let hist = &r.latency_histogram;
+        if !hist.is_empty() && lat.len() as u64 != hist.total() {
+            lat.clear();
+        }
         if !lat.is_empty() {
             lat.sort_unstable();
             let n = lat.len();
@@ -777,6 +1080,36 @@ impl LatencyCdf {
                 pts.push((lat[n - 1] as f64 / 1000.0, 1.0));
             }
             return Self { pts, exact: true };
+        }
+        if !hist.is_empty() {
+            let total = hist.total() as f64;
+            let mut acc = 0u64;
+            let mut pts: Vec<(f64, f64)> = hist
+                .upper_ms
+                .iter()
+                .zip(&hist.counts)
+                .map(|(upper, c)| {
+                    acc += c;
+                    (*upper, acc as f64 / total)
+                })
+                .collect();
+            // The last bin ends at the slowest operation.
+            if let Some(last) = pts.last_mut() {
+                last.0 = last
+                    .0
+                    .min(hist.max_ms.max(0.0))
+                    .max(hist.lower_ms.last().copied().unwrap_or(0.0));
+                last.1 = 1.0;
+            }
+            if pts.len() > Self::MAX_POINTS {
+                let step = pts.len().div_ceil(Self::MAX_POINTS);
+                let last = *pts.last().expect("non-empty");
+                pts = pts.into_iter().skip(step - 1).step_by(step).collect();
+                if pts.last() != Some(&last) {
+                    pts.push(last);
+                }
+            }
+            return Self { pts, exact: false };
         }
         let h = &r.heatmap;
         let rows = h.latency_buckets_ms.len();
@@ -813,10 +1146,98 @@ impl LatencyCdf {
     pub fn quantile(&self, q: f64) -> Option<f64> {
         self.pts.iter().find(|p| p.1 >= q).map(|p| p.0)
     }
+
+    /// The distribution of one verb, from the timeline's per-verb latency rows (every
+    /// operation of the verb, at the heatmap's row resolution: each point at its row's upper
+    /// bound). `None` when the timeline has no rows for `verb`.
+    pub fn for_verb(r: &Report, verb: &str) -> Option<Self> {
+        let bounds = crate::model::HEATMAP_LATENCY_BOUNDS_MS;
+        let mut rows = vec![0u64; bounds.len()];
+        for p in &r.timeline {
+            for v in p.verbs.iter().filter(|v| v.verb == verb) {
+                for (i, c) in v.latency_rows_count.iter().enumerate().take(rows.len()) {
+                    rows[i] += c;
+                }
+            }
+        }
+        let total: u64 = rows.iter().sum();
+        if total == 0 {
+            return None;
+        }
+        let mut acc = 0u64;
+        let pts = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| **c > 0)
+            .map(|(i, c)| {
+                acc += c;
+                let upper = bounds.get(i + 1).copied().unwrap_or(bounds[i] * 2.0);
+                (upper, acc as f64 / total as f64)
+            })
+            .collect();
+        Some(Self { pts, exact: false })
+    }
+}
+
+/// Operation latency over time for drawing: `counts[t][l]` operations started in time column
+/// `t` with a latency in row `l`.
+///
+/// When the trace rows hold every operation of the window, the rows are fitted to the data in
+/// 1-1.5-2-3-5-7 steps per decade ([`crate::analysis::segments::fine_heatmap`]: 6.6 ms and
+/// 9.9 ms fall in different rows); otherwise (sampled rows over-weigh the tail) it is the
+/// report's heatmap, 20 fixed rows in 1-2-5 steps that count every operation.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct HeatmapView {
+    /// Start of each time column, seconds from the window start.
+    pub t_buckets_s: Vec<f64>,
+    pub bucket_width_s: f64,
+    /// Lower bound of each latency row (ms); the last row is open-ended.
+    pub latency_buckets_ms: Vec<f64>,
+    pub counts: Vec<Vec<u64>>,
+    /// The fine rows fitted to the data (otherwise the report's fixed rows).
+    pub fine: bool,
+}
+
+impl HeatmapView {
+    /// Time columns of the fine heatmap at most.
+    pub const MAX_COLUMNS: usize = 120;
+
+    pub fn of(r: &Report, run: Option<&Run>) -> Self {
+        let complete = r.sampling.kept_ratio >= 1.0 || r.sampling.seen_ops_count == 0;
+        if let Some(run) = run.filter(|_| complete)
+            && run.ops.iter().any(|o| o.t_us >= 0)
+        {
+            let h = crate::analysis::segments::fine_heatmap(
+                &run.ops,
+                r.run.window_s,
+                Self::MAX_COLUMNS,
+            );
+            return Self {
+                t_buckets_s: h.t_buckets_s,
+                bucket_width_s: h.bucket_width_s,
+                latency_buckets_ms: h.latency_buckets_ms,
+                counts: h.counts,
+                fine: true,
+            };
+        }
+        let h = &r.heatmap;
+        Self {
+            t_buckets_s: h.t_buckets_s.clone(),
+            bucket_width_s: h.bucket_width_s,
+            latency_buckets_ms: h.latency_buckets_ms.clone(),
+            counts: h.counts.clone(),
+            fine: false,
+        }
+    }
+
+    /// The largest cell (the colour scale's top; 0 when empty).
+    pub fn max_count(&self) -> u64 {
+        self.counts.iter().flatten().copied().max().unwrap_or(0)
+    }
 }
 
 /// One verb (`read.range`, `write.multipart`) with its numbers and where its time went.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, schemars::JsonSchema)]
 pub struct VerbView {
     pub verb: String,
     pub ops_count: u64,
@@ -928,13 +1349,16 @@ impl ConcurrencyView {
 pub enum EvidenceChart {
     /// Share throttled per in-flight level, with the fitted ceiling ([`ConcurrencyView`]).
     Concurrency,
-    /// Throttled responses per second over the run.
+    /// Throttled responses per second over the run: each 429/503 in the interval its
+    /// response arrived (`TimelineView::throttled_count` over `len_s`), retries included —
+    /// a rate limit shows as a plateau where it bit, not smeared back to the operations'
+    /// starts.
     ThrottledOverTime,
     /// Bandwidth (MiB/s) over the run.
     Bandwidth,
     /// The latency distribution with its median and tail marked ([`LatencyCdf`]).
     Latency,
-    /// Failed operations per second over the run.
+    /// Failed operations per second over the run (each in the interval it failed).
     ErrorsOverTime,
     /// The hottest keys with their share of the traffic and of the throttling
     /// ([`SpreadView::hot_keys`]).
@@ -1065,7 +1489,7 @@ impl TrustView {
 }
 
 /// The backend's requests of one API (`GetObject`, `PutObject`, …).
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, schemars::JsonSchema)]
 pub struct ApiRow {
     pub api: String,
     pub requests_count: u64,
@@ -1206,8 +1630,12 @@ pub struct Slice {
     pub requests_count: u64,
     /// Share of all requests.
     pub share_ratio: f64,
-    /// Share of the throttling (hot keys) or of the slice's requests (the others).
+    /// Share of the slice's own requests that were throttled (prefixes, sizes); `None` for
+    /// hot keys, which carry `throttle_share_ratio` instead.
     pub throttled_ratio: Option<f64>,
+    /// Share of **all** throttled responses that went to this slice (hot keys: how much of
+    /// the throttling one key draws); `None` for the other slices.
+    pub throttle_share_ratio: Option<f64>,
     pub error_ratio: Option<f64>,
     pub p99_ms: Option<f64>,
 }
@@ -1231,6 +1659,7 @@ impl SpreadView {
             requests_count: x.requests_count,
             share_ratio: x.share_ratio,
             throttled_ratio: Some(x.throttled_ratio),
+            throttle_share_ratio: None,
             error_ratio: Some(x.error_ratio),
             p99_ms: Some(x.p99_ms),
         };
@@ -1244,7 +1673,8 @@ impl SpreadView {
                     key: k.key.clone(),
                     requests_count: k.requests_count,
                     share_ratio: k.share_ratio,
-                    throttled_ratio: Some(k.throttle_share_ratio),
+                    throttled_ratio: None,
+                    throttle_share_ratio: Some(k.throttle_share_ratio),
                     error_ratio: None,
                     p99_ms: None,
                 })
@@ -1261,6 +1691,7 @@ impl SpreadView {
                     requests_count: x.requests_count,
                     share_ratio: crate::util::ratio(x.requests_count as f64, total as f64),
                     throttled_ratio: None,
+                    throttle_share_ratio: None,
                     error_ratio: Some(crate::util::ratio(
                         x.errors_count as f64,
                         x.requests_count as f64,
@@ -1282,6 +1713,37 @@ impl SpreadView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_long_timeline_is_downsampled_without_hiding_spikes() {
+        let n = 900;
+        let t = TimelineView {
+            t_s: (0..n).map(|i| i as f64).collect(),
+            len_s: vec![1.0; n],
+            ops_per_s: vec![100.0; n],
+            mib_per_s: vec![1.0; n],
+            p50_ms: vec![5.0; n],
+            p99_ms: (0..n).map(|i| if i == 451 { 900.0 } else { 9.0 }).collect(),
+            p999_ms: vec![10.0; n],
+            max_ms: vec![12.0; n],
+            throttled_count: vec![1; n],
+            errors_count: vec![0; n],
+            inflight_peak_count: vec![4; n],
+            new_connections_count: vec![0; n],
+            ..Default::default()
+        };
+        let (d, k) = t.downsample(60);
+        assert_eq!(k, 15);
+        assert_eq!(d.len(), 60);
+        assert_eq!(d.len_s[0], 15.0);
+        assert_eq!(d.t_s[1], 15.0);
+        assert!((d.ops_per_s[0] - 100.0).abs() < 1e-9);
+        assert_eq!(d.throttled_count[0], 15);
+        // The 900 ms second survives the merge.
+        assert_eq!(d.p99_ms[30], 900.0);
+        let (same, k) = t.downsample(1000);
+        assert_eq!((same.len(), k), (n, 1));
+    }
 
     #[test]
     fn the_profile_view_covers_every_section_of_the_fixture() {
@@ -1355,6 +1817,175 @@ mod tests {
         assert_eq!(LatencyCdf::of(&sampled.report, Some(&sampled)), b);
         assert_eq!(b.pts, vec![(10.0, 3.0 / 8.0), (20.0, 1.0)]);
         assert_eq!(b.quantile(0.5), Some(20.0));
+    }
+
+    /// A log-normal-ish known distribution: 1 000 operations, 1 % at 100 ms.
+    fn with_histogram(mut r: Report) -> Report {
+        let lat = |i: u64| -> u64 {
+            match i {
+                0..500 => 2_000,
+                500..900 => 5_000,
+                900..990 => 20_000,
+                _ => 100_000,
+            }
+        };
+        r.latency_histogram =
+            crate::trace::LatencyHistogram::from_counts((0..1000).map(|i| (lat(i), 1)));
+        r
+    }
+
+    #[test]
+    fn the_latency_cdf_comes_from_the_histogram_when_rows_are_sampled() {
+        let run = crate::report::fixture::run();
+        let mut sampled = run.clone();
+        sampled.report = with_histogram(run.report.clone());
+        sampled.report.sampling.kept_ratio = 0.1;
+        sampled.report.sampling.seen_ops_count = 1000;
+        let cdf = LatencyCdf::of(&sampled.report, Some(&sampled));
+        assert!(!cdf.exact);
+        assert_eq!(cdf.pts.len(), 4, "{:?}", cdf.pts);
+        // Each point is its bin's upper bound with the exact share at or below it.
+        let at = |ms: f64| cdf.pts.iter().find(|p| p.0 >= ms).unwrap().1;
+        assert_eq!(at(2.0), 0.5);
+        assert_eq!(at(5.0), 0.9);
+        assert_eq!(at(20.0), 0.99);
+        assert_eq!(cdf.pts.last().unwrap(), &(100.0, 1.0));
+        // Bins are 12 % wide: the quantiles are within a bin of the truth.
+        let p50 = cdf.quantile(0.5).unwrap();
+        assert!((2.0..2.0 * 1.13).contains(&p50), "{p50}");
+        assert_eq!(cdf.quantile(0.995), Some(100.0));
+        // Rows that are every operation of the histogram stay exact; fewer rows do not.
+        let mut complete = run.clone();
+        complete.report = with_histogram(run.report.clone());
+        assert!(!LatencyCdf::of(&complete.report, Some(&complete)).exact);
+        let n = run.ops.iter().filter(|o| o.t_us >= 0).count() as u64;
+        complete.report.latency_histogram =
+            crate::trace::LatencyHistogram::from_counts([(3_000, n)]);
+        assert!(LatencyCdf::of(&complete.report, Some(&complete)).exact);
+    }
+
+    #[test]
+    fn the_timeline_view_counts_goodput_requests_and_reliable_quantiles() {
+        let mut r = crate::report::fixture::report();
+        r.run.window_s = 3.0;
+        let p = |ops: u64, ok: u64| crate::trace::TimelinePoint {
+            len_s: 1.0,
+            ops_per_s: ops as f64,
+            ops_count: ops,
+            ok_ops_count: ok,
+            goodput_ops_per_s: ok as f64,
+            requests_per_s: 2.0 * ops as f64,
+            requests_count: 2 * ops,
+            retries_count: ops - ok,
+            ..Default::default()
+        };
+        r.timeline = vec![p(5, 5), p(200, 150), p(2000, 2000)];
+        for (i, t) in r.timeline.iter_mut().enumerate() {
+            t.t_s = i as f64;
+            t.verbs = vec![crate::trace::VerbInterval {
+                verb: "read".into(),
+                ops_count: t.ops_count,
+                ok_ops_count: t.ok_ops_count,
+                errors_count: t.ops_count - t.ok_ops_count,
+                latency_rows_count: {
+                    // Every read in the 10–20 ms row.
+                    let mut rows = vec![0u64; 20];
+                    rows[7] = t.ops_count;
+                    rows
+                },
+                ..Default::default()
+            }];
+        }
+        let v = TimelineView::of(&r);
+        assert_eq!(v.goodput_ops_per_s, vec![5.0, 150.0, 2000.0]);
+        assert_eq!(v.ops_per_s, vec![5.0, 200.0, 2000.0]);
+        assert_eq!(v.requests_per_s, vec![10.0, 400.0, 4000.0]);
+        assert_eq!(v.retries_count, vec![0, 50, 0]);
+        assert_eq!(TimelineView::min_ops_for(0.5), 20);
+        assert_eq!(TimelineView::min_ops_for(0.99), 1000);
+        assert_eq!(v.reliable(0.5), vec![false, true, true]);
+        assert_eq!(v.reliable(0.99), vec![false, false, true]);
+        // One verb's series, quantiles at row resolution.
+        assert_eq!(TimelineView::verbs(&r), vec!["read".to_owned()]);
+        let read = TimelineView::for_verb(&r, "read").unwrap();
+        assert_eq!(read.verb.as_deref(), Some("read"));
+        assert_eq!(read.goodput_ops_per_s, vec![5.0, 150.0, 2000.0]);
+        assert_eq!(read.errors_count, vec![0, 50, 0]);
+        assert_eq!(read.p99_ms, vec![20.0, 20.0, 20.0]);
+        assert!(TimelineView::for_verb(&r, "stat").is_none());
+        // Reports before 6.3: goodput from the rate less the failures (both by start).
+        let mut old = r.clone();
+        old.timeline = vec![crate::trace::TimelinePoint {
+            len_s: 1.0,
+            ops_per_s: 10.0,
+            errors: 4,
+            ..Default::default()
+        }];
+        let v = TimelineView::of(&old);
+        assert_eq!(v.ops_count, vec![10]);
+        assert_eq!(v.goodput_ops_per_s, vec![6.0]);
+    }
+
+    #[test]
+    fn the_heatmap_view_uses_fine_rows_only_for_complete_rows() {
+        let run = crate::report::fixture::run();
+        let fine = HeatmapView::of(&run.report, Some(&run));
+        assert!(fine.fine);
+        let kept: u64 = fine.counts.iter().flatten().sum();
+        assert_eq!(kept, run.ops.iter().filter(|o| o.t_us >= 0).count() as u64);
+        // Rows in 1-1.5-2-3-5-7 steps.
+        let steps: Vec<f64> = fine.latency_buckets_ms[1..]
+            .windows(2)
+            .map(|w| w[1] / w[0])
+            .collect();
+        assert!(
+            steps.iter().all(|s| *s <= 1.7),
+            "{:?}",
+            fine.latency_buckets_ms
+        );
+        let mut sampled = run.clone();
+        sampled.report.sampling.kept_ratio = 0.5;
+        sampled.report.sampling.seen_ops_count = 100;
+        let coarse = HeatmapView::of(&sampled.report, Some(&sampled));
+        assert!(!coarse.fine);
+        assert_eq!(coarse.counts, run.report.heatmap.counts);
+    }
+
+    #[test]
+    fn a_remedy_that_is_not_a_layer_is_said_once() {
+        let f = crate::model::Finding {
+            code: "key_limit".into(),
+            remedy: crate::analysis::findings::remedy("key_limit", None),
+            ..Default::default()
+        };
+        let v = FindingView::of(&f);
+        assert_eq!(v.remedy_line(), v.remedy);
+        let f = crate::model::Finding {
+            code: "throttling".into(),
+            remedy: crate::analysis::findings::remedy("throttling", None),
+            ..Default::default()
+        };
+        let v = FindingView::of(&f);
+        assert!(
+            v.remedy_line()
+                .starts_with("layers.concurrent_limit.http + layers.retry.jitter — cap"),
+            "{}",
+            v.remedy_line()
+        );
+    }
+
+    #[test]
+    fn hot_keys_carry_their_share_of_the_throttling_not_a_throttled_ratio() {
+        let mut r = crate::report::fixture::report();
+        r.dimensions.hot_keys = vec![crate::model::HotKey {
+            key: "k".into(),
+            requests_count: 10,
+            share_ratio: 0.5,
+            throttle_share_ratio: 0.8,
+        }];
+        let sp = SpreadView::of(&r);
+        assert_eq!(sp.hot_keys[0].throttle_share_ratio, Some(0.8));
+        assert_eq!(sp.hot_keys[0].throttled_ratio, None);
     }
 
     #[test]

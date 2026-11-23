@@ -434,7 +434,7 @@ pub fn workload_warnings(profile: &Profile) -> Vec<String> {
     if !warmup.is_zero() && warmup >= window && w.max_ops.is_none() {
         out.push(format!(
             "the warmup ({}) is as long as the measurement window ({}) or longer: most of the \
-             run is not measured (shorten --warmup or lengthen -d)",
+             run is not measured",
             w.warmup, w.duration
         ));
     }
@@ -468,7 +468,7 @@ pub async fn preflight(
             ErrorCode::Internal
         });
         let hint = if code == ErrorCode::AuthNoCredentials {
-            "no credentials were found: set them for the target (see OpenDAL's credential chain for the service), or pass --anonymous for a public bucket"
+            "set credentials for the operator (OpenDAL's credential chain for the service), or send unsigned requests to a public bucket with --set options.skip_signature=true"
         } else {
             "check the credentials and permissions of the operator"
         };

@@ -4,6 +4,7 @@
 //! view model changes, this file is the one to follow it.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use anyhow::Result;
 
@@ -70,6 +71,8 @@ pub struct FindingRow {
     pub chart: Option<view::EvidenceChart>,
     /// The remedy as operator paths with the value to try (empty value: the path alone).
     pub remedy: Vec<(String, String)>,
+    /// Operations that show the problem ("Show N examples").
+    pub op_ids: Vec<u64>,
 }
 
 /// One stage segment of a request bar (µs).
@@ -89,9 +92,13 @@ pub struct Bar {
     pub total_us: u64,
     pub segs: Vec<Seg>,
     pub failed: bool,
+    /// What the response and the connection said, as `(what, value)`: the provider's error
+    /// code, `Retry-After`, rtt / min rtt / retransmits, `Server-Timing`, the request id (only
+    /// those the request row has).
+    pub signals: Vec<(&'static str, String)>,
 }
 
-/// One of the slowest operations with its requests.
+/// One operation with its requests.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Waterfall {
     pub op_id: u64,
@@ -101,33 +108,18 @@ pub struct Waterfall {
     pub bars: Vec<Bar>,
 }
 
-/// One second of the measurement window.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Point {
-    pub t_s: f64,
-    /// Length of the slice (1 s for the first ten minutes, then 10 s).
-    pub len_s: f64,
-    pub ops_per_s: f64,
-    pub mib_per_s: f64,
-    pub p50_ms: f64,
-    pub p99_ms: f64,
-    pub p999_ms: f64,
-    pub max_ms: f64,
-    /// The most requests in flight at once in the slice.
-    pub inflight_peak: u64,
-    pub errors: u64,
-    pub throttled: u64,
-}
-
-impl Point {
-    /// Failed operations per second in this slice.
-    pub fn errors_per_s(&self) -> f64 {
-        self.errors as f64 / self.len_s.max(1e-3)
-    }
-    /// Throttled responses per second in this slice.
-    pub fn throttled_per_s(&self) -> f64 {
-        self.throttled as f64 / self.len_s.max(1e-3)
-    }
+/// The request heatmap: time buckets × log latency rows.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Heat {
+    pub bucket_s: f64,
+    pub bounds_ms: Vec<f64>,
+    /// `counts[t][row]`.
+    pub counts: Vec<Vec<u64>>,
+    pub max: u64,
+    /// The time axis's end: the timeline's, so a time reads at the same place on both.
+    pub span_s: f64,
+    /// The fine rows fitted to the data (every row kept), else the report's 20 fixed rows.
+    pub fine: bool,
 }
 
 /// One verb with its numbers and where its time went.
@@ -142,16 +134,6 @@ pub struct VerbRow {
     pub stages: Vec<StageBar>,
 }
 
-/// The request heatmap: time buckets × log latency rows.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct Heat {
-    pub bucket_s: f64,
-    pub bounds_ms: Vec<f64>,
-    /// `counts[t][row]`.
-    pub counts: Vec<Vec<u64>>,
-    pub max: u64,
-}
-
 /// The connections of a run.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Conns {
@@ -163,6 +145,17 @@ pub struct Conns {
     pub peak_inflight: u64,
     /// `(stage, p50 ms, p99 ms)` of DNS, TCP and TLS.
     pub setup: Vec<(&'static str, f64, f64)>,
+}
+
+/// The run with its trace rows, shared by the views (equal when it is the same run, so a
+/// model compares without walking its rows).
+#[derive(Clone, Debug)]
+pub struct Rows(pub Arc<Run>);
+
+impl PartialEq for Rows {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
 }
 
 /// Everything the Profile view shows of one run.
@@ -187,7 +180,10 @@ pub struct ProfileModel {
     pub stages: Vec<StageBar>,
     pub findings: Vec<FindingRow>,
     pub slowest: Vec<Waterfall>,
-    pub timeline: Vec<Point>,
+    /// The series of the window (every verb).
+    pub timeline: view::TimelineView,
+    /// The verbs the timeline can be filtered to, busiest first.
+    pub timeline_verbs: Vec<String>,
     pub heat: Option<Heat>,
     /// The latency distribution.
     pub cdf: view::LatencyCdf,
@@ -204,6 +200,8 @@ pub struct ProfileModel {
     pub spread: view::SpreadView,
     pub conns: Conns,
     pub warnings: Vec<String>,
+    /// The run and its rows: what a range, a filter or a drill-down is recomputed from.
+    pub rows: Rows,
 }
 
 impl ProfileModel {
@@ -215,6 +213,71 @@ impl ProfileModel {
             self.good_ops_per_s
         }
     }
+
+    /// The run has trace rows (ranges and drill-downs need them).
+    pub fn has_rows(&self) -> bool {
+        !self.rows.0.ops.is_empty()
+    }
+
+    /// The timeline of one verb (`None`: every verb).
+    pub fn timeline_for(&self, verb: Option<&str>) -> view::TimelineView {
+        verb.and_then(|v| view::TimelineView::for_verb(&self.rows.0.report, v))
+            .unwrap_or_else(|| self.timeline.clone())
+    }
+
+    /// The latency distribution of one verb (`None`, or a verb without rows: every verb).
+    pub fn cdf_for(&self, verb: Option<&str>) -> view::LatencyCdf {
+        verb.and_then(|v| view::LatencyCdf::for_verb(&self.rows.0.report, v))
+            .unwrap_or_else(|| self.cdf.clone())
+    }
+
+    /// The time range `[t0, t1)` (seconds into the window), recomputed from the rows.
+    pub fn range(&self, t0: f64, t1: f64) -> RangeModel {
+        let v = view::RangeView::of(&self.rows.0, t0, t1);
+        let slowest = view::examples(&self.rows.0, &v.slowest_op_ids, 3)
+            .iter()
+            .map(waterfall_of)
+            .collect();
+        RangeModel {
+            verbs: v.verbs.iter().cloned().map(verb_row).collect(),
+            slowest,
+            view: v,
+        }
+    }
+
+    /// Operations `ids` (a finding's examples) request by request, at most `n`.
+    pub fn examples(&self, ids: &[u64], n: usize) -> Vec<Waterfall> {
+        view::examples(&self.rows.0, ids, n)
+            .iter()
+            .map(waterfall_of)
+            .collect()
+    }
+
+    /// One operation request by request.
+    pub fn waterfall(&self, op_id: u64) -> Option<Waterfall> {
+        view::waterfall(&self.rows.0, op_id)
+            .as_ref()
+            .map(waterfall_of)
+    }
+
+    /// The slowest operations behind a heatmap cell: started in `[t0, t1)` with a latency in
+    /// `[lo_ms, hi_ms)`.
+    pub fn cell_ops(&self, t0: f64, t1: f64, lo_ms: f64, hi_ms: f64) -> Vec<view::OpLine> {
+        view::ops_in(&self.rows.0, t0, t1, lo_ms, hi_ms, 8)
+    }
+
+    /// The slowest requests of `api`, in the window or in `range`.
+    pub fn api_requests(&self, api: &str, range: Option<(f64, f64)>) -> Vec<view::ReqLine> {
+        view::slowest_requests(&self.rows.0, api, range, 8)
+    }
+}
+
+/// A time range of a run as the Profile shows it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RangeModel {
+    pub view: view::RangeView,
+    pub verbs: Vec<VerbRow>,
+    pub slowest: Vec<Waterfall>,
 }
 
 /// A stored run, ready to show (`App::show`).
@@ -228,15 +291,41 @@ pub fn profile(app: &App, id: &str) -> Result<ProfileModel> {
             reqs: Vec::new(),
         },
     };
-    Ok(of_run(&run))
+    Ok(of_rows(Arc::new(run)))
+}
+
+fn verb_row(v: view::VerbView) -> VerbRow {
+    VerbRow {
+        verb: v.verb,
+        ops_count: v.ops_count,
+        ops_per_s: v.ops_per_s,
+        p50_ms: v.p50_ms,
+        p99_ms: v.p99_ms,
+        error_ratio: v.error_ratio,
+        stages: v
+            .stages
+            .into_iter()
+            .map(|s| StageBar {
+                key: s.key,
+                ratio: s.ratio,
+            })
+            .collect(),
+    }
 }
 
 /// The model of a run with its trace rows.
 pub fn of_run(run: &Run) -> ProfileModel {
+    of_rows(Arc::new(run.clone()))
+}
+
+fn of_rows(rows: Arc<Run>) -> ProfileModel {
+    let run: &Run = &rows;
     let r = &run.report;
     let n = view::NumbersView::of(r);
     let time = view::TimeView::of(r, Some(run));
     let c = &r.connections;
+    let timeline = view::TimelineView::of(r);
+    let heat = heat(r, run, &timeline);
     ProfileModel {
         id: r.run.id.clone(),
         operator_ref: r.spec.operator_ref.clone(),
@@ -263,45 +352,12 @@ pub fn of_run(run: &Run) -> ProfileModel {
             })
             .collect(),
         findings: findings(r),
-        slowest: slowest(run, 3),
-        timeline: r
-            .timeline
-            .iter()
-            .map(|p| Point {
-                t_s: p.t_s,
-                len_s: if p.len_s > 0.0 { p.len_s } else { 1.0 },
-                ops_per_s: p.ops_per_s,
-                mib_per_s: p.mib_per_s,
-                p50_ms: p.p50_ms,
-                p99_ms: p.p99_ms,
-                p999_ms: p.p999_ms,
-                max_ms: p.max_ms,
-                inflight_peak: p.inflight_peak,
-                errors: p.errors,
-                throttled: p.throttled,
-            })
-            .collect(),
-        heat: heat(r),
+        slowest: view::slowest(run, 3).iter().map(waterfall_of).collect(),
+        timeline,
+        timeline_verbs: view::TimelineView::verbs(r),
+        heat,
         cdf: view::LatencyCdf::of(r, Some(run)),
-        verbs: view::verbs(r)
-            .into_iter()
-            .map(|v| VerbRow {
-                verb: v.verb,
-                ops_count: v.ops_count,
-                ops_per_s: v.ops_per_s,
-                p50_ms: v.p50_ms,
-                p99_ms: v.p99_ms,
-                error_ratio: v.error_ratio,
-                stages: v
-                    .stages
-                    .into_iter()
-                    .map(|s| StageBar {
-                        key: s.key,
-                        ratio: s.ratio,
-                    })
-                    .collect(),
-            })
-            .collect(),
+        verbs: view::verbs(r).into_iter().map(verb_row).collect(),
         concurrency: view::ConcurrencyView::of(r),
         setup: view::SetupView::of(r),
         trust: view::TrustView::of(r),
@@ -328,6 +384,7 @@ pub fn of_run(run: &Run) -> ProfileModel {
             ],
         },
         warnings: r.warnings.clone(),
+        rows: Rows(rows.clone()),
     }
 }
 
@@ -345,6 +402,7 @@ fn findings(r: &Report) -> Vec<FindingRow> {
                 items: f.items.into_iter().map(|i| (i.label, i.value)).collect(),
                 chart: view::EvidenceChart::of(&f.code),
                 remedy: src.map(remedy).unwrap_or_default(),
+                op_ids: f.op_ids,
             }
         })
         .collect()
@@ -383,96 +441,94 @@ pub fn remedy_paths(code: &str) -> &'static [&'static str] {
     }
 }
 
-fn slowest(run: &Run, n: usize) -> Vec<Waterfall> {
-    let mut ids: Vec<u64> = run.report.slowest.clone();
-    if ids.is_empty() {
-        let mut ops: Vec<_> = run.ops.iter().collect();
-        ops.sort_by_key(|o| std::cmp::Reverse(o.latency_us));
-        ids = ops.iter().map(|o| o.op_id).collect();
-    }
-    ids.into_iter()
-        .filter_map(|id| run.op(id))
-        .take(n)
-        .map(|op| {
-            let mut reqs: Vec<_> = run.reqs.iter().filter(|r| r.op_id == op.op_id).collect();
-            reqs.sort_by_key(|r| (r.t_us, r.attempt));
-            let t0 = reqs
-                .iter()
-                .map(|r| r.t_us)
-                .min()
-                .unwrap_or(op.t_us)
-                .min(op.t_us);
-            let mut prev_end: Option<i64> = None;
-            Waterfall {
-                op_id: op.op_id,
-                verb: op.verb.to_string(),
-                key: op.key.clone(),
-                latency_us: op.latency_us,
-                bars: reqs
+/// An operation's waterfall (core's [`view::WaterfallOp`]) as bars: each request from the
+/// operation's first event, its stages, the wait before it and what it said.
+fn waterfall_of(w: &view::WaterfallOp) -> Waterfall {
+    let t0 = w.rows.iter().map(|r| r.start_us).min().unwrap_or(0).min(0);
+    Waterfall {
+        op_id: w.op_id,
+        verb: w.verb.clone(),
+        key: w.key.clone(),
+        latency_us: w.latency_us,
+        bars: w
+            .rows
+            .iter()
+            .map(|r| {
+                let parts = [
+                    ("queue", r.queue_us),
+                    ("connect", r.connect_us),
+                    ("send", r.send_us),
+                    ("ttfb", r.ttfb_us),
+                    ("body", r.body_us),
+                ];
+                let mut segs: Vec<Seg> = parts
                     .into_iter()
-                    .map(|r| {
-                        // A retry waited from the previous attempt's end to its own start.
-                        let backoff_us = match prev_end {
-                            Some(end) if r.attempt > 1 && r.t_us > end => (r.t_us - end) as u64,
-                            _ => 0,
-                        };
-                        prev_end =
-                            Some(prev_end.unwrap_or(i64::MIN).max(r.t_us + r.total_us as i64));
-                        let parts = [
-                            ("queue", r.queue_us),
-                            ("connect", r.connect_us()),
-                            ("send", r.send_us),
-                            ("ttfb", r.ttfb_us),
-                            ("body", r.body_us),
-                            ("stall", r.stall_us),
-                        ];
-                        let mut segs: Vec<Seg> = parts
-                            .into_iter()
-                            .filter(|(_, us)| *us > 0)
-                            .map(|(stage, us)| Seg { stage, us })
-                            .collect();
-                        let sum: u64 = segs.iter().map(|s| s.us).sum();
-                        if r.total_us > sum {
-                            segs.push(Seg {
-                                stage: "client",
-                                us: r.total_us - sum,
-                            });
-                        }
-                        let status = if r.status == 0 {
-                            "—".to_owned()
-                        } else {
-                            r.status.to_string()
-                        };
-                        Bar {
-                            backoff_us,
-                            label: if r.attempt > 1 {
-                                format!("{} #{} {status}", r.api, r.attempt)
-                            } else {
-                                format!("{} {status}", r.api)
-                            },
-                            start_us: (r.t_us - t0).max(0) as u64,
-                            total_us: r.total_us,
-                            segs,
-                            failed: r.status == 0 || r.status >= 400,
-                        }
-                    })
-                    .collect(),
-            }
-        })
-        .collect()
+                    .filter(|(_, us)| *us > 0)
+                    .map(|(stage, us)| Seg { stage, us })
+                    .collect();
+                let sum: u64 = segs.iter().map(|s| s.us).sum();
+                if r.total_us > sum {
+                    segs.push(Seg {
+                        stage: "client",
+                        us: r.total_us - sum,
+                    });
+                }
+                let status = if r.status == 0 {
+                    "—".to_owned()
+                } else {
+                    r.status.to_string()
+                };
+                let mut signals: Vec<(&'static str, String)> = Vec::new();
+                if let Some(c) = &r.provider_code {
+                    signals.push(("code", c.clone()));
+                }
+                if let Some(ms) = r.retry_after_ms {
+                    signals.push(("retry_after", crate::ui::fmt::dur_ms(ms as f64)));
+                }
+                if let Some(us) = r.rtt_us {
+                    signals.push(("rtt", crate::ui::fmt::dur_us(us as f64)));
+                }
+                if let Some(us) = r.min_rtt_us {
+                    signals.push(("min_rtt", crate::ui::fmt::dur_us(us as f64)));
+                }
+                if let Some(n) = r.retransmits_count.filter(|n| *n > 0) {
+                    signals.push(("retransmits", n.to_string()));
+                }
+                if let Some(t) = &r.server_timing {
+                    signals.push(("server_timing", t.clone()));
+                }
+                Bar {
+                    backoff_us: r.wait_before_us,
+                    label: if r.attempt > 1 {
+                        format!("{} #{} {status}", r.api, r.attempt)
+                    } else {
+                        format!("{} {status}", r.api)
+                    },
+                    start_us: (r.start_us - t0).max(0) as u64,
+                    total_us: r.total_us,
+                    segs,
+                    failed: r.status == 0 || r.status >= 400,
+                    signals,
+                }
+            })
+            .collect(),
+    }
 }
 
-fn heat(r: &Report) -> Option<Heat> {
-    let h = &r.heatmap;
+fn heat(r: &Report, run: &Run, t: &view::TimelineView) -> Option<Heat> {
+    let h = view::HeatmapView::of(r, Some(run));
     if h.counts.is_empty() {
         return None;
     }
-    let max = h.counts.iter().flatten().copied().max().unwrap_or(0);
+    let cols = h.counts.len() as f64;
     Some(Heat {
         bucket_s: h.bucket_width_s.max(1e-3),
-        bounds_ms: h.latency_buckets_ms.clone(),
-        counts: h.counts.clone(),
-        max,
+        max: h.max_count(),
+        bounds_ms: h.latency_buckets_ms,
+        counts: h.counts,
+        span_s: (h.bucket_width_s * cols)
+            .max(t.t_s.last().zip(t.len_s.last()).map_or(0.0, |(a, b)| a + b)),
+        fine: h.fine,
     })
 }
 
@@ -727,6 +783,100 @@ pub fn compare_rows(ps: &[ProfileModel]) -> Vec<MetricRow> {
         row("errors", false, |p| p.error_ratio),
         row("throttled", false, |p| p.throttled_ratio),
     ]
+}
+
+/// The runs as the sidebar lists them: grouped under their operator, the group of the newest
+/// run first, newest first within a group (the keyboard walks this order).
+pub fn sidebar_order(runs: &[RunRow]) -> Vec<RunRow> {
+    let mut groups: Vec<(&str, Vec<RunRow>)> = Vec::new();
+    for r in runs {
+        match groups.iter_mut().find(|g| g.0 == r.operator) {
+            Some(g) => g.1.push(r.clone()),
+            None => groups.push((r.operator.as_str(), vec![r.clone()])),
+        }
+    }
+    groups.into_iter().flat_map(|(_, v)| v).collect()
+}
+
+/// What a run of a real target will do (`App::plan`), for New Run to show before Run.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PlanView {
+    /// One line per operator: `target · preset · N workers · warm-up + window`.
+    pub targets: Vec<String>,
+    /// Estimated operations and requests, bytes moved, in total.
+    pub ops: String,
+    pub requests: String,
+    pub bytes: String,
+    /// Objects written and deleted again, and the prefix they are under.
+    pub written: u64,
+    pub deleted: u64,
+    pub prefixes: Vec<String>,
+    pub read_only: bool,
+    pub eta_s: f64,
+    /// The budgets that stop the run (`None`: none is set).
+    pub budgets: Option<String>,
+    pub warnings: Vec<String>,
+    pub command: String,
+}
+
+/// The plan of a run in the app's terms.
+pub fn plan_view(p: &crate::app::RunPlan) -> PlanView {
+    let b = p
+        .plans
+        .first()
+        .map(|x| x.budgets.clone())
+        .unwrap_or_default();
+    let mut budgets = Vec::new();
+    if let Some(n) = b.max_requests_count {
+        budgets.push(crate::ui::i18n::trf("plan.max_requests", &[&n]));
+    }
+    if let Some(n) = b.max_bytes {
+        budgets.push(crate::util::fmt_bytes(n));
+    }
+    if let Some(s) = b.max_duration_s {
+        budgets.push(crate::ui::fmt::clock_s(s));
+    }
+    PlanView {
+        targets: p
+            .plans
+            .iter()
+            .map(|x| {
+                crate::ui::i18n::trf(
+                    "plan.target",
+                    &[
+                        &x.target,
+                        &x.preset,
+                        &x.concurrency_count,
+                        &crate::ui::fmt::clock_s(x.warmup_s),
+                        &crate::ui::fmt::clock_s(x.duration_s),
+                    ],
+                )
+            })
+            .collect(),
+        ops: crate::ui::fmt::compact(
+            p.plans.iter().map(|x| x.estimated_ops_count).sum::<u64>() as f64
+        ),
+        requests: crate::ui::fmt::compact(
+            p.plans
+                .iter()
+                .map(|x| x.estimated_requests_count)
+                .sum::<u64>() as f64,
+        ),
+        bytes: crate::util::fmt_bytes(p.plans.iter().map(|x| x.estimated_bytes).sum()),
+        written: p.plans.iter().map(|x| x.objects_written_count).sum(),
+        deleted: p.plans.iter().map(|x| x.objects_deleted_count).sum(),
+        prefixes: p.plans.iter().map(|x| x.run_prefix.clone()).collect(),
+        read_only: p.plans.iter().all(|x| x.read_only),
+        eta_s: p.plans.iter().map(|x| x.eta_s).sum(),
+        budgets: (!budgets.is_empty()).then(|| budgets.join(" · ")),
+        warnings: p.plans.iter().flat_map(|x| x.warnings.clone()).collect(),
+        command: p
+            .plans
+            .iter()
+            .map(|x| x.command.clone())
+            .collect::<Vec<_>>()
+            .join("\n"),
+    }
 }
 
 #[cfg(test)]

@@ -48,18 +48,34 @@ pub enum EventKind {
         #[serde(rename = "requests_count", alias = "requests")]
         requests: u64,
     },
-    /// One second of the measurement window.
+    /// One interval of the measurement window (as `report.timeline`: operations by their
+    /// start; failures, throttled responses, requests and retries when they happened). It is
+    /// sent once the interval after it has also closed; an operation still running then (a
+    /// retry chain longer than an interval) adds its requests, retries and failure to the
+    /// interval they happened in only when it ends, so `report.timeline` is the final count.
     Interval {
         /// Start of the second, seconds from the window start.
         t_s: f64,
+        /// Operations started per second, failed ones included.
         ops_per_s: f64,
         mib_per_s: f64,
         p50_ms: f64,
         p99_ms: f64,
+        /// Operations that failed in the interval.
         #[serde(rename = "errors_count", alias = "errors")]
         errors: u64,
+        /// Throttled responses received in the interval.
         #[serde(rename = "throttled_count", alias = "throttled")]
         throttled: u64,
+        /// Successful operations started per second.
+        #[serde(default)]
+        goodput_ops_per_s: f64,
+        /// Requests sent in the interval, retries included.
+        #[serde(default)]
+        requests_count: u64,
+        /// Retries issued in the interval.
+        #[serde(default)]
+        retries_count: u64,
     },
     Finding {
         #[serde(flatten)]
@@ -244,12 +260,13 @@ impl EventBus {
                     }
                     bus.emit(EventKind::Phase { phase: s.phase });
                 }
-                // Every second but the last (still filling) is final.
-                // The window is over (`cleanup` follows it): every second is final.
+                // An interval is sent once the one after it closed too: requests and retries
+                // count when an operation ends, and most end within an interval. The window
+                // is over (`cleanup` follows it): every interval is sent.
                 let done = if matches!(s.phase, Phase::Done | Phase::Cleanup) {
                     s.timeline.len()
                 } else {
-                    s.timeline.len().saturating_sub(1)
+                    s.timeline.len().saturating_sub(2)
                 };
                 for t in s.timeline.iter().take(done).skip(st.1) {
                     bus.emit(EventKind::Interval {
@@ -260,6 +277,9 @@ impl EventBus {
                         p99_ms: t.p99_ms,
                         errors: t.errors,
                         throttled: t.throttled,
+                        goodput_ops_per_s: t.goodput_ops_per_s,
+                        requests_count: t.requests_count,
+                        retries_count: t.retries_count,
                     });
                 }
                 st.1 = st.1.max(done);
@@ -323,10 +343,12 @@ mod tests {
             assert!(l["ts"].as_str().unwrap().ends_with('Z'));
         }
         let types: Vec<&str> = lines.iter().map(|l| l["type"].as_str().unwrap()).collect();
+        // Three intervals while measuring: only the first is sent; the second waits for the
+        // third to close (requests and retries count when operations end).
         assert_eq!(
             types,
             [
-                "version", "log", "phase", "interval", "interval", "progress", "progress", "error"
+                "version", "log", "phase", "interval", "progress", "progress", "error"
             ]
         );
         assert_eq!(lines[2]["phase"], "measure");

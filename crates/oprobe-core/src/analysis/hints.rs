@@ -67,29 +67,29 @@ pub fn hint_for(error_chain: &str, scheme: &str) -> Option<Hint> {
     let has = |n: &str| e.contains(n);
     let creds = match scheme {
         "gcs" => {
-            "Set GOOGLE_APPLICATION_CREDENTIALS or `credential_path` in the target's options (`--option KEY=VALUE`, or `[targets.NAME.options]` in the config)."
+            "Set GOOGLE_APPLICATION_CREDENTIALS, or `credential_path` in the operator's options (`--set options.credential_path=PATH`, or `[options]` in op.toml)."
         }
         "azblob" => {
-            "Set `account_name` and `account_key` (or a SAS token) in the target's options (`--option KEY=VALUE`, or `[targets.NAME.options]` in the config)."
+            "Set `account_name` and `account_key` (or a SAS token) in the operator's options (`--set options.account_key=…`, or `[options]` in op.toml; ${ENV} references work)."
         }
         "oss" => {
-            "Set `access_key_id` / `access_key_secret` in the target's options (`--option KEY=VALUE`, or `[targets.NAME.options]` in the config) (use ${ENV} references)."
+            "Set `access_key_id` / `access_key_secret` in the operator's options (`--set options.access_key_id=…`, or `[options]` in op.toml; ${ENV} references work)."
         }
         _ => {
-            "Export AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY (or AWS_PROFILE), or reference them as ${ENV} in the target's options (`--option KEY=VALUE`, or `[targets.NAME.options]` in the config)."
+            "Export AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY (or AWS_PROFILE), or set them in the operator's options (`--set options.access_key_id=…`, or `[options]` in op.toml; ${ENV} references work)."
         }
     };
 
     if has("environment variable") && has("not set") {
         return Some(h(
-            "A profile references an unset environment variable",
-            &["Export the variable named above, or replace the ${NAME} reference in the profile."],
+            "An option references an unset environment variable",
+            &["Export the variable named above, or replace the ${NAME} reference in the operator."],
         ));
     }
     if has("invalid profile") || has("unknown field") || has("toml parse") {
         return Some(h(
-            "The profile is not valid",
-            &["Fix the field named above; `oprobe init` prints a fully commented profile."],
+            "The operator file is not valid",
+            &["Fix the field named above; docs/operator.md lists every field of op.toml."],
         ));
     }
     if has("region is missing")
@@ -101,7 +101,7 @@ pub fn hint_for(error_chain: &str, scheme: &str) -> Option<Hint> {
         return Some(h(
             "Wrong or missing region",
             &[
-                "Set `region` in the target's options (`--option KEY=VALUE`, or `[targets.NAME.options]` in the config) or export AWS_REGION to the bucket's region.",
+                "Set the bucket's region in the operator's options (`--set options.region=…`, or `[options]` in op.toml), or export AWS_REGION.",
                 "S3-compatible stores (MinIO, R2, Ceph) also need `endpoint`; R2 uses region `auto`.",
             ],
         ));
@@ -129,7 +129,7 @@ pub fn hint_for(error_chain: &str, scheme: &str) -> Option<Hint> {
             &[
                 creds,
                 "Using a named profile? Export AWS_PROFILE (or set `credential_path` / `config_path` for other services).",
-                "Public bucket? Pass `--anonymous` to send unsigned requests.",
+                "Public bucket? Send unsigned requests with `--set options.skip_signature=true`.",
             ],
         ));
     }
@@ -149,7 +149,7 @@ pub fn hint_for(error_chain: &str, scheme: &str) -> Option<Hint> {
             &[
                 creds,
                 "The credentials need list, read, write and delete permission on the target prefix (oprobe writes under `oprobe-run-*/`).",
-                "For read-only access to existing data use `--existing <prefix>`.",
+                "For read-only access to existing data, use `--existing PREFIX`.",
             ],
         ));
     }
@@ -183,8 +183,8 @@ pub fn hint_for(error_chain: &str, scheme: &str) -> Option<Hint> {
         return Some(h(
             "TLS certificate verification failed",
             &[
-                "Corporate TLS-inspecting proxy or private CA? Pass `--ca-cert <bundle.pem>` (or set SSL_CERT_FILE).",
-                "Self-signed development endpoint: `--insecure` skips verification (never in production).",
+                "Corporate TLS-inspecting proxy or private CA? Trust its bundle with `--set http.ca_cert=bundle.pem` (or set SSL_CERT_FILE).",
+                "Self-signed development endpoint: `--set http.insecure=true` skips verification (never in production).",
                 "Hostname mismatch: make sure `endpoint` uses the certificate's DNS name, not an IP.",
             ],
         ));
@@ -194,7 +194,7 @@ pub fn hint_for(error_chain: &str, scheme: &str) -> Option<Hint> {
             "The egress proxy refused the tunnel",
             &[
                 "Check HTTPS_PROXY / HTTP_PROXY and proxy credentials, or add the endpoint to NO_PROXY.",
-                "Use `--proxy none` to bypass environment proxies.",
+                "Bypass the environment's proxies with `--set http.proxy=none`.",
             ],
         ));
     }
@@ -317,6 +317,36 @@ mod tests {
         );
     }
 
+    /// Every flag a hint names is one oprobe takes (`--set`, `--existing`); 5.x flags
+    /// (`--option`, `--anonymous`, `--ca-cert`, `--insecure`, `--proxy`) and commands
+    /// (`oprobe init`) are gone.
+    #[test]
+    fn hints_name_only_flags_that_exist() {
+        let src = include_str!("hints.rs");
+        let src = &src[..src.find("#[cfg(test)]").unwrap()];
+        for gone in [
+            "--option",
+            "--anonymous",
+            "--ca-cert",
+            "--insecure",
+            "--proxy",
+            "oprobe init",
+            "[targets.",
+        ] {
+            assert!(!src.contains(gone), "a hint names `{gone}`");
+        }
+        for (i, _) in src.match_indices("`--") {
+            let flag: String = src[i + 1..]
+                .chars()
+                .take_while(|c| c.is_ascii_lowercase() || *c == '-')
+                .collect();
+            assert!(
+                ["--set", "--existing"].contains(&flag.as_str()),
+                "a hint names `{flag}`"
+            );
+        }
+    }
+
     #[test]
     fn missing_credentials_get_their_own_hint() {
         let h = hint_for(
@@ -325,7 +355,7 @@ mod tests {
         )
         .unwrap();
         assert!(h.title.contains("No credentials"), "{}", h.title);
-        assert!(h.steps.iter().any(|s| s.contains("--anonymous")));
+        assert!(h.steps.iter().any(|s| s.contains("skip_signature")));
         assert!(h.steps.iter().any(|s| s.contains("AWS_PROFILE")));
         assert!(
             hint_for("no valid credential found", "gcs")

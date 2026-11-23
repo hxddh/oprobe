@@ -7,7 +7,7 @@
 //! ```text
 //! {
 //!   "format": "oprobe.trace/6",
-//!   "oprobe_trace_version": "6.2.0",
+//!   "oprobe_trace_version": "6.3.0",
 //!   "created_at": "2026-11-22T10:00:00Z",
 //!   "service": { "scheme": "s3", "name": "my-bucket", "root": "/data/" },   // optional
 //!   "snapshot": { … the aggregates: per API and stage, connections, bytes, timeline … },

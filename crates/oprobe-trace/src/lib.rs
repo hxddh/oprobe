@@ -95,9 +95,9 @@ pub use recorder::Exporter;
 pub use rows::{FailureCode, ReqDetail, TcpRow, TlsRow};
 pub use snapshot::{
     ApiStats, ByteStats, CacheStats, ClientStats, ColdStartStats, ConnStats, EffectiveKnobs,
-    IntegrityStats, OpBreakdown, OpenLoopStats, Phase, Quantiles, RequestStageMeans,
-    ResilienceStats, SelfObservation, SlowOp, Snapshot, StageStats, Summary, TimelinePoint,
-    VerbStats,
+    IntegrityStats, LatencyHistogram, OpBreakdown, OpenLoopStats, Phase, Quantiles,
+    RequestStageMeans, ResilienceStats, SelfObservation, SlowOp, Snapshot, StageStats, Summary,
+    TimelinePoint, VerbInterval, VerbStats,
 };
 
 internal_use!(file::{ServiceRecord, TRACE_FORMAT, TraceFile});

@@ -66,21 +66,18 @@ impl CommandOutput for RunList {
             .runs
             .iter()
             .map(|r| {
+                let level = r.verdict_level.label();
                 let verdict = match r.verdict_level {
-                    VerdictLevel::Ok => green("ok"),
-                    VerdictLevel::Review => "review".to_owned(),
-                    VerdictLevel::Attention => yellow("attention"),
-                    VerdictLevel::Critical => red("critical"),
+                    VerdictLevel::Ok => green(level),
+                    VerdictLevel::Review => level.to_owned(),
+                    VerdictLevel::Attention => yellow(level),
+                    VerdictLevel::Critical => red(level),
                 };
                 vec![
                     r.id.clone(),
-                    cut(r.label.as_deref().unwrap_or(""), 12),
-                    cut(
-                        &r.target_name
-                            .clone()
-                            .unwrap_or_else(|| crate::util::display_url(&r.target_display)),
-                        22,
-                    ),
+                    r.target_name
+                        .clone()
+                        .unwrap_or_else(|| crate::util::display_url(&r.target_display)),
                     when(&r.id, now),
                     format!("{:.0}s", r.window_s),
                     if r.interrupted {
@@ -94,9 +91,7 @@ impl CommandOutput for RunList {
             })
             .collect();
         let mut o = crate::report::style::table(
-            &[
-                "run", "label", "target", "when", "window", "verdict", "ops/s", "p99",
-            ],
+            &["run", "target", "when", "window", "verdict", "ops/s", "p99"],
             &rows,
             0,
         );
@@ -120,7 +115,7 @@ impl CommandOutput for RunList {
                             p.objective.label(),
                             p.objective_delta_ratio * 100.0
                         ),
-                        cut(&p.change.join(" "), 40),
+                        p.change.join(" "),
                     ]
                 })
                 .collect();
@@ -132,7 +127,7 @@ impl CommandOutput for RunList {
         }
         if self.hidden_trials_count > 0 {
             o += &dim(&format!(
-                "{} prove trial runs hidden (--all lists them)\n",
+                "{} trials of proves hidden (--all lists them)\n",
                 self.hidden_trials_count
             ));
         }
@@ -143,17 +138,7 @@ impl CommandOutput for RunList {
                 self.total_count
             ));
         }
-        o += &dim("show one: oprobe show RUN  (id, prefix, last, last~1, label)\n");
-        o
-    }
-}
-
-fn cut(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_owned()
-    } else {
-        let mut o: String = s.chars().take(max - 1).collect();
-        o.push('…');
+        o += &dim("show one: oprobe show RUN  (id, prefix, last, last~1)\n");
         o
     }
 }
@@ -231,6 +216,9 @@ pub struct Profile {
     /// `--by`: the request rows grouped.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub by: Option<ByTable>,
+    /// `--since/--until`: the numbers of that time range, recomputed from the trace rows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub range: Option<crate::report::range::RangeView>,
 }
 
 /// `show --by`: the request rows grouped (and, by stage, the per-stage latency per API).
@@ -243,9 +231,13 @@ pub struct ByTable {
 }
 
 impl ByTable {
-    fn of(run: &Run, by: crate::analysis::slice::By) -> Self {
+    fn of(run: &Run, by: crate::analysis::slice::By, range: Option<(f64, f64)>) -> Self {
         use crate::analysis::slice;
-        let reqs: Vec<&crate::model::ReqRow> = run.reqs.iter().collect();
+        let inside = |t: i64| match range {
+            Some((a, b)) => t >= (a * 1e6) as i64 && t < (b * 1e6) as i64,
+            None => true,
+        };
+        let reqs: Vec<&crate::model::ReqRow> = run.reqs.iter().filter(|q| inside(q.t_us)).collect();
         Self {
             by,
             groups: slice::group(&reqs, by),
@@ -339,6 +331,9 @@ impl CommandOutput for Profile {
         if let Some(b) = &self.by {
             return b.text();
         }
+        if let (Some(v), Some(run)) = (&self.range, &self.full) {
+            return terminal::range_section(run, v);
+        }
         match &self.full {
             Some(run) => terminal::render_run_with(run, self.detail),
             None => terminal::render(&self.run.report),
@@ -355,11 +350,49 @@ impl Profile {
 
     /// Group the request rows (`--by`).
     pub fn with_by(mut self, by: Option<crate::analysis::slice::By>) -> Self {
+        let range = self.range.as_ref().map(|v| (v.since_s, v.until_s));
         self.by = match (by, &self.full) {
-            (Some(b), Some(run)) => Some(ByTable::of(run, b)),
+            (Some(b), Some(run)) => Some(ByTable::of(run, b, range)),
             _ => None,
         };
         self
+    }
+
+    /// Only the time range `[since, until)` (seconds into the window; `until` defaults to the
+    /// window's end): its numbers, requests by API, verbs and slowest operations from the
+    /// trace rows (`--since/--until`). Nothing changes when neither is given.
+    pub fn with_range(mut self, since: Option<f64>, until: Option<f64>) -> Result<Self> {
+        if since.is_none() && until.is_none() {
+            return Ok(self);
+        }
+        let window = self.run.report.run.window_s;
+        let (a, b) = (since.unwrap_or(0.0), until.unwrap_or(window));
+        if b <= a {
+            return Err(OprobeError::new(
+                ErrorCode::UsageInvalidArgument,
+                format!("--until ({b} s) is not after --since ({a} s)"),
+            )
+            .with_hint("pass a range inside the window, e.g. --since 2s --until 6s")
+            .into());
+        }
+        if a >= window {
+            return Err(OprobeError::new(
+                ErrorCode::UsageInvalidArgument,
+                format!("--since ({a} s) is past the end of the {window:.1} s window"),
+            )
+            .with_hint(format!("pass a time under {window:.1}s"))
+            .into());
+        }
+        let Some(run) = self.full.as_deref().filter(|r| !r.ops.is_empty()) else {
+            return Err(OprobeError::new(
+                ErrorCode::UsageInvalidArgument,
+                "this run has no trace rows to recompute a time range from",
+            )
+            .with_hint("show the whole run without --since/--until")
+            .into());
+        };
+        self.range = Some(crate::report::range::RangeView::of(run, a, b));
+        Ok(self)
     }
 }
 
@@ -377,6 +410,7 @@ pub fn show(app: &App, r: &RunRef) -> Result<Profile> {
         by: None,
         full: Some(Box::new(run)),
         detail: false,
+        range: None,
     })
 }
 
@@ -450,6 +484,72 @@ pub fn rm(app: &App, refs: &[RunRef]) -> Result<RemovedRuns> {
     })
 }
 
+/// How long runs stay in the trash (`<data>/trash/`) before [`trash`] removes them for good.
+pub const TRASH_KEEP: std::time::Duration = std::time::Duration::from_secs(7 * 86_400);
+
+/// Runs moved to the trash by [`App::trash`]: their ids and the trash folder that holds their
+/// files, which [`App::restore`] puts back.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct TrashedRuns {
+    pub ids: Vec<String>,
+    /// The folder under `<data>/trash/` that holds their files.
+    pub folder: std::path::PathBuf,
+}
+
+/// Move the stored runs `refs` name (a prove with its trial runs) into a new folder of
+/// `<data>/trash/`; folders older than [`TRASH_KEEP`] go for good.
+pub fn trash(app: &App, refs: &[RunRef]) -> Result<TrashedRuns> {
+    let ids = stored_ids(app, refs)?;
+    let root = app.paths.data_dir.join("trash");
+    empty_trash(&root, TRASH_KEEP);
+    let folder = root.join(crate::model::RunId::new().to_string());
+    app.store().move_to(&ids, &folder)?;
+    Ok(TrashedRuns { ids, folder })
+}
+
+/// Put runs [`trash`] moved back into the store.
+pub fn restore(app: &App, t: &TrashedRuns) -> Result<()> {
+    let root = app.paths.data_dir.join("trash");
+    // A folder `trash` made: directly under `<data>/trash/`, named by a run id, no `..`.
+    let named = t
+        .folder
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| crate::model::RunId::parse(n).is_some());
+    let plain = t.folder.components().all(|c| {
+        !matches!(
+            c,
+            std::path::Component::ParentDir | std::path::Component::CurDir
+        )
+    });
+    if !named || !plain || t.folder.parent() != Some(root.as_path()) {
+        return Err(OprobeError::new(
+            ErrorCode::SafetyRefused,
+            format!("`{}` is not a trash folder of oprobe", t.folder.display()),
+        )
+        .into());
+    }
+    app.store().restore_from(&t.folder)
+}
+
+/// Remove the trash folders under `root` older than `keep` (best effort).
+fn empty_trash(root: &std::path::Path, keep: std::time::Duration) {
+    let Ok(rd) = std::fs::read_dir(root) else {
+        return;
+    };
+    for e in rd.flatten() {
+        let old = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > keep);
+        if old {
+            let _ = std::fs::remove_dir_all(e.path());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -465,5 +565,57 @@ mod tests {
         assert_eq!(when(id, t + s(5)), "just now");
         assert_eq!(when(id, t + s(600)), "10m ago");
         assert_eq!(when(id, t + s(3 * 86_400)), "3d ago");
+    }
+
+    #[test]
+    fn trashed_runs_come_back() {
+        let d = tempfile::tempdir().unwrap();
+        let app = App::new(crate::store::Paths {
+            config_file: d.path().join("config.toml"),
+            data_dir: d.path().join("data"),
+        });
+        let store = app.store();
+        for id in ["20261120-143005-a1b2", "20261120-143006-c3d4"] {
+            store
+                .save(&crate::store::runs::tests::sample_run(id, None))
+                .unwrap();
+        }
+        let t = app.trash(&[RunRef::from("20261120-143005-a1b2")]).unwrap();
+        assert_eq!(t.ids, ["20261120-143005-a1b2"]);
+        assert!(t.folder.starts_with(d.path().join("data/trash")));
+        let left: Vec<String> = app.list().unwrap().runs.into_iter().map(|r| r.id).collect();
+        assert_eq!(left, ["20261120-143006-c3d4"]);
+        // Undo: back in the list, the trash folder gone.
+        app.restore(&t).unwrap();
+        assert_eq!(app.list().unwrap().runs.len(), 2);
+        assert!(!t.folder.exists());
+        // A folder outside the trash is refused; an unknown run is an error.
+        let bad = TrashedRuns {
+            ids: vec![],
+            folder: d.path().join("elsewhere"),
+        };
+        assert!(app.restore(&bad).is_err());
+        // `<data>/trash/..` is the data dir: never restored from (it would be removed).
+        for folder in [
+            d.path().join("data/trash/.."),
+            d.path().join("data/trash/notarun"),
+        ] {
+            let sneaky = TrashedRuns {
+                ids: vec![],
+                folder,
+            };
+            assert!(app.restore(&sneaky).is_err(), "{:?}", sneaky.folder);
+        }
+        assert!(d.path().join("data").exists());
+        assert!(app.trash(&[RunRef::from("20261120-000000-ffff")]).is_err());
+        // A trash of several runs that fails part-way moves nothing.
+        assert!(
+            app.trash(&[
+                RunRef::from("20261120-143005-a1b2"),
+                RunRef::from("20261120-000000-ffff"),
+            ])
+            .is_err()
+        );
+        assert_eq!(app.list().unwrap().runs.len(), 2);
     }
 }

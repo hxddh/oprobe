@@ -273,16 +273,30 @@ pub struct IntegrityStats {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[cfg_attr(not(feature = "__internal"), non_exhaustive)]
+/// One interval of the measurement window.
+///
+/// **When things count.** Operation counts (`ops_*`, `ok_ops_count`, `throttled_ops_count`),
+/// bytes, the latency quantiles and `latency_rows_count` belong to the interval the operation
+/// **started** in (they describe the same operations). Events count in the interval they
+/// **happened** in: a request when it was sent (`requests_count`), a throttled response when
+/// it arrived (`throttled_count`), a retry when it was issued (`retries_count`) and a failure
+/// when the operation ended (`errors_count`) — a 503 at +7 s is drawn at +7 s, not at the
+/// second its operation began.
 pub struct TimelinePoint {
-    /// Start of this one-second interval, seconds from the measurement window start (the same
-    /// convention as `heatmap.t_buckets_s` and `oprobe analyze --by second`).
+    /// Start of the interval, seconds from the measurement window start (the same convention
+    /// as `heatmap.t_buckets_s`).
     pub t_s: f64,
+    /// Operations started in the interval per second, failed ones included (the attempted
+    /// rate; `goodput_ops_per_s` counts successes only).
     pub ops_per_s: f64,
     pub mib_per_s: f64,
     pub p50_ms: f64,
     pub p99_ms: f64,
+    /// Operations that failed in the interval (counted when they ended).
     #[serde(rename = "errors_count")]
     pub errors: u64,
+    /// Throttled responses (429/503) received in the interval, retries included (counted when
+    /// each response arrived). Before 6.3 this counted throttled operations by their start.
     #[serde(rename = "throttled_count")]
     pub throttled: u64,
     /// Open-loop arrivals due in this interval that never started.
@@ -318,6 +332,149 @@ pub struct TimelinePoint {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub latency_rows_count: Vec<u64>,
+    /// Operations started in the interval (the sample count behind its quantiles).
+    #[serde(default)]
+    pub ops_count: u64,
+    /// Operations started in the interval that succeeded.
+    #[serde(default)]
+    pub ok_ops_count: u64,
+    /// Goodput: successful operations started in the interval per second (failed operations
+    /// never count; `ops_per_s` is the attempted rate).
+    #[serde(default)]
+    pub goodput_ops_per_s: f64,
+    /// Operations started in the interval that saw at least one throttled response.
+    #[serde(rename = "throttled_ops_count", default)]
+    pub throttled_ops: u64,
+    /// Backend requests sent in the interval: every attempt, retries included.
+    #[serde(default)]
+    pub requests_count: u64,
+    /// `requests_count` per second of the interval.
+    #[serde(default)]
+    pub requests_per_s: f64,
+    /// Retries issued in the interval (when the retry layer sent the next attempt).
+    #[serde(default)]
+    pub retries_count: u64,
+    /// The interval's counters per verb (`read`, `stat`, …), so a view can filter by verb.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub verbs: Vec<VerbInterval>,
+}
+
+/// One verb's part of a [`TimelinePoint`], with the same time conventions: operations,
+/// successes, latency rows and the latency sum by operation start; failures when they ended;
+/// throttled responses when they arrived.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[cfg_attr(not(feature = "__internal"), non_exhaustive)]
+pub struct VerbInterval {
+    pub verb: String,
+    #[serde(default)]
+    pub ops_count: u64,
+    #[serde(default)]
+    pub ok_ops_count: u64,
+    #[serde(default)]
+    pub errors_count: u64,
+    /// Throttled responses received in the interval by this verb's operations.
+    #[serde(default)]
+    pub throttled_count: u64,
+    /// Sum of the latencies of the operations started in the interval (mean = sum ÷ ops).
+    #[serde(default)]
+    pub latency_sum_ms: f64,
+    /// Operations started in the interval per heatmap latency row (as
+    /// `TimelinePoint::latency_rows_count`): quantiles at row resolution.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub latency_rows_count: Vec<u64>,
+}
+
+/// The run's whole operation latency distribution as a log-scale histogram with
+/// [`LatencyHistogram::BINS_PER_DECADE`] bins per decade (each bin ≈ 12 % wide): every
+/// operation of the window, never sampled. Only non-empty bins are listed, ascending.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[cfg_attr(not(feature = "__internal"), non_exhaustive)]
+pub struct LatencyHistogram {
+    /// Bins per decade of the log scale.
+    #[serde(rename = "bins_per_decade_count")]
+    pub bins_per_decade: u32,
+    /// Lower bound of each non-empty bin (ms).
+    pub lower_ms: Vec<f64>,
+    /// Upper bound of each non-empty bin (ms, exclusive).
+    pub upper_ms: Vec<f64>,
+    /// Operations per bin.
+    pub counts: Vec<u64>,
+    /// The slowest operation (ms).
+    pub max_ms: f64,
+}
+
+impl LatencyHistogram {
+    /// Bins per decade: bins 1.122× wide (6.6 ms and 9.9 ms fall three bins apart).
+    pub const BINS_PER_DECADE: u32 = 20;
+
+    /// Nothing recorded.
+    pub fn is_empty(&self) -> bool {
+        self.counts.iter().all(|c| *c == 0)
+    }
+
+    /// Operations in the histogram.
+    pub fn total(&self) -> u64 {
+        self.counts.iter().sum()
+    }
+
+    /// The bin of a latency in µs (bin 0 starts at 1 µs).
+    pub fn bin_of(us: u64) -> i32 {
+        ((us.max(1) as f64).log10() * f64::from(Self::BINS_PER_DECADE) + 1e-9).floor() as i32
+    }
+
+    /// `[lower, upper)` of bin `i` in ms.
+    pub fn bounds_ms(i: i32) -> (f64, f64) {
+        let b = f64::from(Self::BINS_PER_DECADE);
+        (
+            10f64.powf(f64::from(i) / b) / 1000.0,
+            10f64.powf(f64::from(i + 1) / b) / 1000.0,
+        )
+    }
+
+    /// The histogram of `(latency µs, count)` pairs.
+    pub fn from_counts(values: impl IntoIterator<Item = (u64, u64)>) -> Self {
+        let mut bins: BTreeMap<i32, u64> = BTreeMap::new();
+        let mut max_us = 0u64;
+        for (us, n) in values {
+            if n == 0 {
+                continue;
+            }
+            *bins.entry(Self::bin_of(us)).or_default() += n;
+            max_us = max_us.max(us);
+        }
+        let mut h = Self {
+            bins_per_decade: Self::BINS_PER_DECADE,
+            max_ms: max_us as f64 / 1000.0,
+            ..Default::default()
+        };
+        for (i, n) in bins {
+            let (lo, hi) = Self::bounds_ms(i);
+            h.lower_ms.push(lo);
+            h.upper_ms.push(hi);
+            h.counts.push(n);
+        }
+        h
+    }
+
+    /// The latency (ms) at quantile `q` (0–1): the upper bound of the bin that reaches it,
+    /// never above the slowest operation. `None` when empty.
+    pub fn quantile_ms(&self, q: f64) -> Option<f64> {
+        let total = self.total();
+        if total == 0 {
+            return None;
+        }
+        let rank = ((total as f64 * q.clamp(0.0, 1.0)).ceil() as u64).max(1);
+        let mut acc = 0u64;
+        for (i, n) in self.counts.iter().enumerate() {
+            acc += n;
+            if acc >= rank {
+                return Some(self.upper_ms[i].min(self.max_ms).max(self.lower_ms[i]));
+            }
+        }
+        Some(self.max_ms)
+    }
 }
 
 fn one_s() -> f64 {
@@ -488,6 +645,10 @@ pub struct Snapshot {
     /// Prefixes, hot keys, size buckets, cold vs warm reads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dimensions: Option<crate::dims::DimensionStats>,
+    /// Every operation's latency (censored open-loop arrivals included, as in
+    /// `summary.latency`) as a fine log-scale histogram.
+    #[serde(default, skip_serializing_if = "LatencyHistogram::is_empty")]
+    pub latency_histogram: LatencyHistogram,
 }
 
 /// Knob values as OpenDAL applies them, which can differ from what was requested.

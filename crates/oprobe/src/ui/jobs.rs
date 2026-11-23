@@ -33,7 +33,7 @@ pub async fn off_thread<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'stati
     rx.await.ok()
 }
 
-/// One replay of a Prove: baseline (A) or candidate (B), and its objective value.
+/// One trial of a Prove: baseline (A) or candidate (B), and its objective value.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Trial {
     pub candidate: bool,
@@ -137,7 +137,7 @@ pub struct State {
     pub errors: u64,
     pub throttled: u64,
     pub cleaning: bool,
-    /// Prove's replays as they finish.
+    /// Prove's trials as they finish.
     pub trials: Vec<Trial>,
     /// Operators measured so far (a run of several operators).
     pub done_count: usize,

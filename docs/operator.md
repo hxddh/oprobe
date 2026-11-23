@@ -109,7 +109,7 @@ oprobe prove last --with layers.retry.jitter=true
 
 `$OPROBE_CONFIG`, or `<config dir>/oprobe/config.toml` (`~/.config/oprobe/config.toml` on Linux,
 `~/Library/Application Support/oprobe/config.toml` on macOS, `%APPDATA%\oprobe\config.toml` on
-Windows). It names operators and sets defaults:
+Windows). It sets defaults:
 
 ```toml
 [defaults]
@@ -119,7 +119,16 @@ duration = "30s"
 [defaults.budgets]
 max_requests = 200000
 max_bytes = "20GiB"
+```
 
+Precedence of every setting: flags, then `OPROBE_*` environment variables, then `[defaults]`,
+then the built-in default.
+
+**Your operator belongs in an `op.toml` file**, passed by its path: `oprobe run prod.toml`. It
+can live next to your code, be reviewed and versioned, and is what `prove`'s TOML diff patches.
+The config file can also name an operator, as a shortcut for the same table:
+
+```toml
 [operators.prod]
 url = "s3://prod-bucket/oprobe"
 [operators.prod.options]
@@ -128,8 +137,7 @@ region = "eu-west-1"
 concurrent_limit = { http = 64 }
 ```
 
-`oprobe run prod` then profiles that operator. Precedence of every setting: flags, then
-`OPROBE_*` environment variables, then `[defaults]`, then the built-in default.
+`oprobe run prod` then profiles that operator.
 
 ## The diff
 

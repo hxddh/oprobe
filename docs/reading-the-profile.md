@@ -24,8 +24,9 @@ next: oprobe prove last throttling
 
 (Illustrative: the exact wording follows the version you run.)
 
-- **The badge** is the verdict level: **HEALTHY**, **REVIEW** (worth a look: informational
-  findings, a partial run), **ATTENTION** (warning findings), **CRITICAL** (critical findings).
+- **The badge** is the verdict level: **OK**, **Review** (worth a look: informational
+  findings, a partial run), **Attention** (warning findings), **Critical** (critical findings).
+  JSON carries the same levels as `ok`, `review`, `attention`, `critical`.
 - **The headline** says what bounds the operator on this workload: throttling, the server's
   latency, the network (connect, upload, download), queueing in the client, or the client itself.
 - **Findings**: at most three, most severe first. Each has its code, the evidence in one line,
@@ -41,7 +42,7 @@ the configuration and the five slowest operations):
 
 | Section | What it tells you |
 |---|---|
-| header | run id and label, operator, workload, window, concurrency, start time |
+| header | run id, operator, workload, window, concurrency, start time |
 | verdict | the badge and where the time went, in one sentence |
 | key numbers | goodput and throughput, latency p50/p99/p99.9/max, failed operations, throttled responses |
 | findings | every finding: code, cause, evidence, confidence, remedy |
@@ -56,6 +57,11 @@ the configuration and the five slowest operations):
 
 `--by stage` sums the requests' time per stage, `--by api` per storage API, `--by conn` per
 connection (cold and warm, per remote address).
+
+`--since 3s --until 8s` shows one time range of the window (a burst, the seconds a rate limit
+bit): its numbers, where the time went, the verbs, the requests by API and its slowest
+operations, recomputed from the trace rows. When the rows were sampled it says so, and each row
+counts for the operations it stands for. In the app, drag across the timeline or the heatmap.
 
 ### Where the time goes
 
@@ -87,7 +93,16 @@ Each operation's wall time is split exactly; an instant counts once even when re
   started count in every percentile as censored values, so a slow server cannot hide behind fewer
   requests.
 - **Percentiles** are exact when every operation was kept, otherwise from histograms with three
-  significant digits. Counts always agree with the totals.
+  significant digits. Counts always agree with the totals. The report keeps the run's whole
+  latency distribution (`latency_histogram`, 20 bins per decade), and the latency CDF is drawn
+  from it whenever the trace rows are sampled.
+- **The timeline** has one row per interval (1 s for the first ten minutes, then 10 s).
+  Operations, goodput (`goodput_ops_per_s`: successes only; `ops_per_s` counts every attempt)
+  and the latency quantiles belong to the interval an operation *started* in; requests
+  (`requests_count`, retries included), throttled responses (`throttled_count`), retries and
+  failures (`errors_count`) to the interval they *happened* in, so a 503 at +7 s is drawn at
+  +7 s. `ops_count` says how many operations stand behind an interval's quantiles: a p99 needs
+  about 1 000. Each interval also carries the same counters per verb (`verbs`).
 - **The profiler's cost** is measured: `cargo bench -p oprobe-trace --bench overhead` compares
   the same operations with and without the layer (budget 2 µs per operation), and the profile's
   `self` section reports scheduling lag and CPU during the run. A run where the client was

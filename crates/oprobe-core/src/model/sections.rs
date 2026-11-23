@@ -78,6 +78,7 @@ pub struct DimensionSlice {
     pub requests_count: u64,
     /// Share of all requests.
     pub share_ratio: f64,
+    /// Share of this slice's own requests that were throttled.
     pub throttled_ratio: f64,
     pub error_ratio: f64,
     pub p99_ms: f64,
@@ -88,7 +89,10 @@ pub struct DimensionSlice {
 pub struct HotKey {
     pub key: String,
     pub requests_count: u64,
+    /// Share of all requests.
     pub share_ratio: f64,
+    /// Share of **all** throttled responses that went to this key (not the share of the key's
+    /// own requests: compare `DimensionSlice::throttled_ratio`).
     pub throttle_share_ratio: f64,
 }
 

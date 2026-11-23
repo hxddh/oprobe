@@ -424,6 +424,91 @@ impl RunStore {
         std::fs::remove_file(&p)?;
         Ok(true)
     }
+
+    /// The files of stored run (or prove) `id` that exist: its run file and sidecar, or a
+    /// prove's result and its trial runs' files.
+    fn files_of(&self, id: &str) -> Result<Vec<PathBuf>> {
+        let mut v = Vec::new();
+        let prove = self.prove_path(id);
+        if prove.is_file() {
+            for c in self.children(id)? {
+                v.extend(self.files_of(&c)?);
+            }
+            v.push(prove);
+        }
+        for p in [self.run_path(id), self.sidecar_path(id)] {
+            if p.is_file() {
+                v.push(p);
+            }
+        }
+        Ok(v)
+    }
+
+    /// Move the files of runs `ids` into `trash` (a new directory), where
+    /// [`Self::restore_from`] finds them again. Nothing is deleted.
+    pub fn move_to(&self, ids: &[String], trash: &Path) -> Result<()> {
+        super::create_private_dir_all(trash)
+            .with_context(|| format!("cannot create `{}`", trash.display()))?;
+        // All or nothing: a move that fails puts the files already moved back.
+        let mut moved: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
+        let undo = |moved: &[(std::path::PathBuf, std::path::PathBuf)]| {
+            for (from, to) in moved.iter().rev() {
+                let _ = std::fs::rename(to, from);
+            }
+            let _ = std::fs::remove_dir(trash);
+        };
+        for id in ids {
+            let files = match self.files_of(id) {
+                Ok(f) => f,
+                Err(e) => {
+                    undo(&moved);
+                    return Err(e);
+                }
+            };
+            if files.is_empty() {
+                undo(&moved);
+                return Err(
+                    OprobeError::new(ErrorCode::UsageUnknownRun, format!("no run `{id}`")).into(),
+                );
+            }
+            for f in files {
+                let to = trash.join(f.file_name().expect("a stored file has a name"));
+                if let Err(e) = std::fs::rename(&f, &to) {
+                    undo(&moved);
+                    return Err(anyhow::Error::new(e).context(format!(
+                        "cannot move `{}` to `{}`",
+                        f.display(),
+                        to.display()
+                    )));
+                }
+                moved.push((f, to));
+            }
+        }
+        Ok(())
+    }
+
+    /// Move every file of `trash` (made by [`Self::move_to`]) back into the store, then remove
+    /// `trash`. A file the store has again meanwhile is kept and the trashed one dropped.
+    pub fn restore_from(&self, trash: &Path) -> Result<()> {
+        super::create_private_dir_all(&self.dir)?;
+        let rd = std::fs::read_dir(trash)
+            .with_context(|| format!("cannot read `{}`", trash.display()))?;
+        for e in rd {
+            let from = e?.path();
+            let Some(name) = from.file_name() else {
+                continue;
+            };
+            let to = self.dir.join(name);
+            if !to.exists() {
+                std::fs::rename(&from, &to).with_context(|| {
+                    format!("cannot move `{}` to `{}`", from.display(), to.display())
+                })?;
+            }
+        }
+        std::fs::remove_dir_all(trash)
+            .with_context(|| format!("cannot remove `{}`", trash.display()))?;
+        Ok(())
+    }
 }
 
 /// The value of the first `"format": "…"` member in `head` (the start of a JSON document;
@@ -511,7 +596,7 @@ pub fn load_path(path: &Path) -> Result<Run> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]

@@ -4,6 +4,199 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## v6.3.0 — 2026-11-23
+
+### Added
+
+- **The timeline counts what it says** (`oprobe.report/6`, `oprobe.run/6`, `oprobe-trace`
+  `TimelinePoint`; additive fields):
+  - `goodput_ops_per_s` and `ok_ops_count`: successful operations per interval (`ops_per_s`
+    stays the attempted rate, failures included);
+  - `requests_count` / `requests_per_s` (every attempt, retries included) and `retries_count`,
+    so rate limits show as requests per second;
+  - `ops_count` (the operations behind an interval's quantiles) and `throttled_ops_count`;
+  - `verbs`: per-verb counters per interval (operations, successes, failures, throttled
+    responses, a latency sum and the heatmap rows), so a view can filter the timeline by verb.
+  - The `interval` event carries `goodput_ops_per_s`, `requests_count` and `retries_count`.
+- **The run's whole latency distribution** (`latency_histogram`: 20 bins per decade, every
+  operation, never sampled) in the report, the run file and `oprobe-trace`'s `Snapshot`. The
+  latency CDF is drawn from it when the trace rows are sampled.
+- Core view model: `HeatmapView` (rows in 1-1.5-2-3-5-7 steps per decade when every row was kept,
+  otherwise the report's 20 fixed rows), `TimelineView::for_verb` / `verbs`, goodput, requests,
+  retries, p90 / p99.9 / max and per-interval operation counts on `TimelineView`, and
+  `TimelineView::reliable(q)` / `min_ops_for(q)` (n ≥ 10 / (1 − q)) so renderers can mute
+  quantiles of intervals with too few operations; `FindingView::remedy_line`;
+  `Slice::throttle_share_ratio` for hot keys.
+- `App::trash`, `App::restore` (`TrashedRuns`) and `App::configured_operators` in the service
+  layer.
+- Headless UI tests that run as macOS and as Windows: menus, shortcuts, Settings, alerts and
+  their default button, dialog button order, the sidebar's keys, New Run's plan, and quitting
+  during a run.
+
+- **Brush and link in the app.** The timeline charts and the heatmap share one time cursor; a
+  drag across any of them selects a time range, shaded on every time chart. With a range
+  selected, the key numbers, the requests by API, the verbs, the latency distribution and the
+  slowest operations are recomputed for it from the trace rows (sampled rows say so and are
+  weighted). Escape, a double-click or **Clear** drops it.
+- **`oprobe show RUN --since 3s --until 8s`**: the same range from the CLI (its goodput, latency
+  quantiles, failures, requests, retries and throttling, where the time went, the verbs, the
+  requests by API and the slowest operations; `-o json` adds a `range` object). With `--by`,
+  only the range's requests are grouped.
+- **Drill down in the app**, each on demand: a finding's **Show N examples** expands the
+  waterfalls of its example operations; a click on a heatmap cell lists the slowest operations
+  of that time bucket and latency row; a click on an API lists its slowest requests; a click on
+  one of those opens its waterfall. Hovering a request in a waterfall also shows the provider's
+  error code, `Retry-After`, rtt / min rtt / retransmits and `Server-Timing` when recorded.
+- **A verb filter above the app's timeline** (All verbs, or one): goodput and latency follow it,
+  and the distribution when no range is selected; requests and in-flight say "all verbs".
+- The app's timeline gains a **Requests per second** chart with retries per second beside it.
+- Every chart in the app has the Image role and a label that summarises it ("Goodput over 8 s,
+  1.0k/s–1.1k/s").
+- Core: `report::range` — `RangeView::of(run, since, until)` (also `view::RangeView`), the
+  drill-down queries `ops_in` (a heatmap cell) and `slowest_requests` (an API), `view::examples`
+  and `view::waterfall`, `LatencyCdf::for_verb`; `WaterfallRow` carries the wait before a retry,
+  the provider's error code, `Retry-After`, rtt, min rtt, retransmits, `Server-Timing` and the
+  request id.
+
+### Changed
+
+- `interval` events are sent once the next interval has also closed, so their requests and
+  retries are final for operations shorter than an interval; `report.timeline` stays the final
+  count. `show -o json` has a schema (`schemas/show.json`).
+- **The demo proves.** `oprobe demo` then `oprobe prove last` (every default) proves its top
+  finding `improved` on goodput; a convergence test runs exactly that.
+  - Throttling's severity follows its cost, not its presence: critical when more operations
+    fail out of retries than a run allows or when half the operation time is retry backoff, a
+    warning when some fail or the backoff is a noticeable share, otherwise informational.
+  - Within one severity, the costliest finding comes first (`time_cost_ratio`, a new evidence
+    value of the throttle family and `tail_stragglers`).
+- **One prove budget.** `--max-duration` is the wall-time budget of the whole proof; no trial
+  starts that would not end within it. `--budget` still works as a hidden alias.
+- **The ETA covers the whole proof.** `prove --dry-run` and the start of every prove print the
+  number of trials (sizing, then the fewest to the most pairs) and the ETA of the whole proof.
+  `prove --dry-run -o json` adds `proof` (trial counts, `eta_min_s`, `eta_max_s`).
+- A tail-cut proof warms up only its candidate trials for 11.5 s; the baseline trials keep the
+  short warmup.
+- With no pair of trials, `prove` prints `not measured` and no diff (JSON: `inconclusive`,
+  `pairs_count: 0`, a note).
+- **One vocabulary**: verdict levels read OK, Review, Attention, Critical (JSON keeps `ok`,
+  `review`, `attention`, `critical`); prove results read improved, worse, inconclusive; the runs
+  of a proof are trials.
+- **Output is never clipped.** `show` wraps long lines instead of cutting them, `show --list`
+  prints whole targets and changes, and a word longer than the line stays whole.
+- **Diffs show only what differs from the defaults**: the TOML of a changed layer no longer
+  repeats its default fields (`retry = { jitter = true }`, not the whole table).
+- **Errors lead with the provider's code**: `credentials rejected: InvalidAccessKeyId: …`. The
+  raw error chain moves to the new `detail` field of the JSON error.
+- `show --detail`: the timeline names its real interval (1 s, or 10 s after ten minutes), adds
+  p99.9 and max, merges long runs into at most 60 rows, and labels errors and throttled as counts
+  per row. A new **Spread** section shows the hottest keys, object sizes, prefixes and remotes.
+- `oprobe lab` lists the app's six scenarios (`demo`, `throttle`, `stragglers`, `bandwidth`,
+  `flaky`, `ratelimit`); an unknown name lists them. The other scenarios still run by name.
+- The docs describe the prove interval as it is computed: Student's t on the paired log ratios,
+  no narrower than the A/A noise floor, and Newcombe for shares.
+- `docs/operator.md` recommends an `op.toml` path for your operator; `[operators.NAME]` in the
+  config file still works.
+- Core: `App::prove_finding` and `ProveRequest::for_finding` prove a finding's remedy, sized as
+  the CLI sizes it.
+- The timeline buckets events by **when they happened**: requests when sent, throttled responses
+  when they arrived, retries when issued and failures when the operation ended (operations and
+  their latency quantiles stay with the interval they started in). A 503 at +7 s is drawn at
+  +7 s, not at the second its operation began. Events of operations draining after the window
+  closed land in its last interval.
+- `tail_stragglers` names every API with stragglers (its cause lists each API's share), not only
+  the one with the largest gain; evidence gains `affected_apis_count`.
+- Hot keys in the view model carry `throttle_share_ratio` (share of all throttling); the slices'
+  `throttled_ratio` is the share of the slice's own requests, and is `None` for hot keys.
+- **The app's Prove proves the finding, as the CLI does.** A finding's Prove (Operator) and
+  **Prove this remedy** (Profile) pass the finding to `App::prove`, which sizes its remedy from
+  the run like `oprobe prove RUN CODE`; the app no longer invents values (`concurrent_limit =
+  16`, `timeout = 5s`, …). A value you change by hand is still proved as you set it.
+- **One vocabulary in the app**: verdicts OK / Review / Attention / Critical (正常 / 值得一看 /
+  需关注 / 严重), prove results improved / worse / inconclusive (有改善 / 变差 / 无定论), and
+  trials (试验) instead of replays. Finding titles of 5.x codes are gone.
+- **Delete moves runs to the trash, with Undo.** The app asks with the system's alert (Cancel is
+  the default) and moves the runs to `<data>/trash/` (`App::trash`); **Undo** in the notice bar
+  brings them back (`App::restore`). `oprobe show --rm` is unchanged.
+- **Native platform behaviour**:
+  - the sidebar shows the window's material (vibrancy on macOS, Mica on Windows 11; only the
+    detail paints the background), is a keyboard listbox (↑/↓, Shift to extend, Home/End,
+    type-select, Delete or ⌘⌫, Return) with listbox/option roles, selects the platform's way
+    (accent or inactive grey on macOS, subtle fill with an accent pill on Windows and GNOME),
+    outlines the row a context menu acts on, and can be resized;
+  - Settings is a window of its own on macOS (changes apply at once) and a preferences dialog
+    elsewhere, and shows the config file and the data directory;
+  - Windows and Linux get a flat primary menu under its button, About oprobe, Quit (Ctrl+Q) or
+    Exit, and full screen (F11); menu items with a system role are labelled in the app's
+    language; menu shortcuts that a text field uses no longer fire while you type, and menu
+    actions wait while a dialog is open;
+  - quitting or closing the window during a run or a prove asks first (Stop and Quit / Cancel);
+  - the sidebar, the page and (macOS, Windows) the window's placement are restored; control
+    heights grow with the system's text size; the toolbar has each platform's height;
+  - New Run focuses the operator field, takes Return anywhere, offers the workload as a pop-up
+    and the lab's scenarios, configured operators (`[operators.NAME]`) and recent `op.toml`
+    files in a Choose pop-up, and **plans a real target first** (`App::plan`: what it writes,
+    reads and deletes, its ETA and budgets) before it offers Run;
+  - Open Run File uses the system's open dialog filtered to `.oprobe` / `.json` and opens the
+    file in place; files opened from Finder or Explorer open; a file dragged over the window
+    outlines it;
+  - a run or prove that ends in the background shows a notification and asks for attention;
+    the notice bar is read out by screen readers; dialogs do not fade with reduced motion; the
+    title in the toolbar no longer takes the title bar's double click; the detail is centred on
+    wide windows.
+
+- **Honest charts in the app.** Goodput is drawn from successful operations, with the attempted
+  rate (failures included) as a faint labelled line behind it; the shading and the throttling
+  evidence count throttled **responses** and say so; p50 / p99 / p99.9 of intervals with too few
+  operations are drawn faint and dashed, and the readout says why (`n=12, too few for p99`); the
+  heatmap uses the fine rows when every row was kept and has a colour key from the fewest to the
+  most operations in a cell; the distribution comes from the run's histogram.
+- **Compare stays neutral**: single-run deltas are no longer green or red; the note points to
+  prove.
+- The hottest keys' column reads **Share of throttling**; the other slices keep **Throttled**
+  (the share of their own requests).
+- (Tests) The app's plot tests now build `TimelineView`s; `the_timeline_shades_only_the_seconds_
+  that_were_throttled` became `…_intervals_with_throttled_responses` (the band's label changed).
+
+### Fixed
+
+- `show --detail`'s Spread prints a hot key's share of all throttling (it printed `-`).
+- A brushed time range (app, `show --since --until`) counts failures when they happened, as the
+  timeline does; goodput stays the operations that started in it and succeeded.
+- Restoring trashed runs refuses any folder but one `App::trash` made (no `..`); a trash that
+  fails part-way puts back what it moved.
+- `prove --budget` with `--max-duration` (both, as a 6.2 script might pass) takes the shorter
+  instead of failing.
+- `throttled_count` in the timeline (and `interval` events, `IntervalBlock`) counts throttled
+  **responses**, as documented and charted; it counted throttled operations, so a run with 41
+  throttled responses summed to 22.
+- A rate limit under OpenDAL's default retry (`lab://ratelimit`) is diagnosed as `rate_limit`, not
+  an in-flight limit: the service serving bursts of requests no cap of that size carries (request
+  rate within 8 service times above 1.5× `c / S`) refutes the in-flight model.
+- Findings weight sampled rows by the operations they stand for (`tail_stragglers`,
+  `hung_requests`, `cold_connections`): the samplers always keep the slowest, failed and throttled
+  operations, which over-weighed the tail. `tail_stragglers` takes the operation p50 / p99 from
+  the exact summary.
+- `repeated_reads` says its unit (requests saved per 1 000 successful read operations) and prints
+  the same number as its evidence value; per-1 000 values print as whole numbers.
+- `key_limit` (and any remedy that is not a layer) no longer prints its remedy twice in `show`.
+- The fine heatmap leaves warmup operations out and starts at the step just below the fastest
+  operation.
+- The macOS menu bar is built again (Settings, New Run and the app's shortcuts): the sidebar's
+  shortcut no longer panics there (`ctrl+cmd+s`).
+- Contrast: white on the dark accent (now `#2a73d6`, 4.6:1), field and switch borders (3.3:1),
+  and the warning and OK colours as small text (`#9a5c00`, `#16843f`).
+
+### Removed
+
+- The SLA surface of 5.x: `show` prints no SLA line, and `--set sla`, `max_error_rate`,
+  `max_throttle_rate` and `p99_ms` are refused with an error. The report keeps its `sla` fields
+  (always the defaults).
+- Run labels from the help, the docs and `show --list` (the JSON field stays).
+- Hints and warnings that named flags oprobe does not take (`--option`, `--anonymous`,
+  `--ca-cert`, `--insecure`, `--proxy`, `oprobe init`, `--warmup`, `--microscope`); they name
+  `--set` paths instead.
+
 ## v6.2.0 — 2026-11-23
 
 ### Changed

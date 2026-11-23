@@ -122,7 +122,7 @@ sudo dnf install ./oprobe-<ver>-1.x86_64.rpm
 cargo install oprobe --locked                                         # the app in the terminal
 cargo install oprobe --locked --features gui                          # plus native windows (Linux: libgtk-4-dev)
 cargo install oprobe --locked --no-default-features --features cli    # the CLI only
-cargo install --locked --git https://github.com/hxddh/oprobe --tag v6.2.0 oprobe
+cargo install --locked --git https://github.com/hxddh/oprobe --tag v6.3.0 oprobe
 ```
 
 `cargo install oprobe` also downloads `oprobe-core`, oprobe's internal engine crate, at exactly
@@ -141,7 +141,7 @@ as the archive, so it proves the download is intact, not who built it.
 ```bash
 sha256sum --ignore-missing -c SHA256SUMS                    # Linux
 shasum -a 256 --ignore-missing -c SHA256SUMS                # macOS
-Get-FileHash oprobe-6.2.0-x64.msi -Algorithm SHA256          # Windows
+Get-FileHash oprobe-6.3.0-x64.msi -Algorithm SHA256          # Windows
 ```
 
 **Build provenance.** Every asset has a [SLSA build provenance](https://slsa.dev/) attestation
@@ -149,7 +149,7 @@ signed by GitHub Actions, which proves it was built by this repository's release
 given commit:
 
 ```bash
-gh attestation verify oprobe-6.2.0-x86_64-unknown-linux-musl.tar.gz --repo hxddh/oprobe \
+gh attestation verify oprobe-6.3.0-x86_64-unknown-linux-musl.tar.gz --repo hxddh/oprobe \
   --signer-workflow hxddh/oprobe/.github/workflows/release.yml
 ```
 

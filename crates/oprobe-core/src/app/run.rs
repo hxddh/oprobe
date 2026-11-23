@@ -152,7 +152,13 @@ impl CommandOutput for RunPlan {
     fn text(&self) -> String {
         self.plans
             .iter()
-            .map(|p| PlanOutput { plan: p.clone() }.text())
+            .map(|p| {
+                PlanOutput {
+                    plan: p.clone(),
+                    proof: None,
+                }
+                .text()
+            })
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -161,7 +167,11 @@ impl CommandOutput for RunPlan {
 /// Result of `--dry-run`.
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 pub struct PlanOutput {
+    /// The plan of one run (of one trial, for `prove --dry-run`).
     pub plan: Plan,
+    /// `prove --dry-run`: the whole proof, every trial of it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proof: Option<super::prove::ProofEstimate>,
 }
 
 impl CommandOutput for PlanOutput {
@@ -169,6 +179,9 @@ impl CommandOutput for PlanOutput {
         self.plan.warnings.clone()
     }
     fn next(&self) -> Vec<crate::output::NextStep> {
+        if let Some(pr) = &self.proof {
+            return vec![crate::output::NextStep::new("prove it", pr.command.clone())];
+        }
         let p = &self.plan;
         if p.command.is_empty() {
             return Vec::new();
@@ -177,9 +190,18 @@ impl CommandOutput for PlanOutput {
     }
     fn text(&self) -> String {
         let p = &self.plan;
-        let mut o = format!(
+        let mut o = String::new();
+        if let Some(pr) = &self.proof {
+            o += &pr.text();
+            o += &dim("each trial:\n");
+        }
+        o += &format!(
             "{} {} · {} · {} workers · {:.0}s warmup + {:.0}s window{}\n",
-            bold("plan"),
+            bold(if self.proof.is_some() {
+                "trial"
+            } else {
+                "plan"
+            }),
             p.target,
             p.preset,
             p.concurrency_count,
@@ -375,7 +397,7 @@ pub async fn measure_guarded(
     let rails = rails(ctx, &profile, safety)?;
     if safety.dry_run {
         let plan = rails.plan(&profile);
-        return Ok(Measured::Plan(Box::new(PlanOutput { plan })));
+        return Ok(Measured::Plan(Box::new(PlanOutput { plan, proof: None })));
     }
     for w in crate::guard::workload_warnings(&profile) {
         ctx.out.warn(w);

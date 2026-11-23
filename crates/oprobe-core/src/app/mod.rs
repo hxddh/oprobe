@@ -8,6 +8,8 @@
 //!     fn show(&self, r: RunRef) -> Result<Profile>;
 //!     fn list(&self) -> Result<RunList>;
 //!     fn rm(&self, r: &[RunRef]) -> Result<()>;
+//!     fn trash(&self, r: &[RunRef]) -> Result<TrashedRuns>;   // the app's Delete, with Undo
+//!     fn restore(&self, t: &TrashedRuns) -> Result<()>;
 //!     async fn lab(&self, req: LabRequest) -> Result<LabHandle>;
 //! }
 //! ```
@@ -54,7 +56,7 @@ pub use input::*;
 pub use lab::LabOutput;
 pub use prove::{ProveObjective, ProveOutcome, ProveOutput, ProveRequest, ProveVerdict};
 pub use run::{RunOutput, RunPlan, RunSet};
-pub use runs::{Profile, RemovedRuns, RunList};
+pub use runs::{Profile, RemovedRuns, RunList, TrashedRuns};
 
 /// Where a command's log lines, warnings, progress and events go: [`crate::output::Output`].
 /// Front ends that consume events in-process use `EventSink::silent()` and `sink.bus()`.
@@ -324,6 +326,28 @@ impl App {
         prove::prove(&self.ctx(&sink), req, cancel).await
     }
 
+    /// Prove the remedy of finding `code` of run `run` exactly as `oprobe prove RUN CODE` does:
+    /// the remedy's size is searched with short trials, then A and B are interleaved, within
+    /// `budget` (a wall-time budget such as `2m`; `None`: none). The one path for a front end's
+    /// "prove this finding".
+    pub async fn prove_finding(
+        &self,
+        run: RunRef,
+        code: &str,
+        budget: Option<String>,
+        sink: EventSink,
+        cancel: Cancel,
+    ) -> Result<ProveOutput> {
+        let req = ProveRequest {
+            budget,
+            ..ProveRequest::for_finding(run.0, code)
+        };
+        match self.prove(req, sink, cancel).await? {
+            ProveOutcome::Proved(p) => Ok(*p),
+            ProveOutcome::Plan(_) => unreachable!("not a dry run"),
+        }
+    }
+
     /// A stored run (or a run file) with its rows.
     pub fn show(&self, r: RunRef) -> Result<Profile> {
         runs::show(self, &r)
@@ -342,6 +366,22 @@ impl App {
     /// Delete stored runs (a file outside the store is refused).
     pub fn rm(&self, r: &[RunRef]) -> Result<()> {
         runs::rm(self, r).map(|_| ())
+    }
+
+    /// Move stored runs to oprobe's trash (`<data>/trash/`, kept a week) instead of deleting
+    /// them: [`App::restore`] puts them back (the app's Undo).
+    pub fn trash(&self, r: &[RunRef]) -> Result<TrashedRuns> {
+        runs::trash(self, r)
+    }
+
+    /// Put runs [`App::trash`] moved back into the store.
+    pub fn restore(&self, t: &TrashedRuns) -> Result<()> {
+        runs::restore(self, t)
+    }
+
+    /// The names of the operators the config file declares (`[operators.NAME]`), sorted.
+    pub fn configured_operators(&self) -> Result<Vec<String>> {
+        Ok(self.config()?.operators.keys().cloned().collect())
     }
 
     /// The run ids `r` names (to report what [`App::rm`] removes).

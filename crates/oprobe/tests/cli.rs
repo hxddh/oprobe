@@ -123,7 +123,9 @@ fn checked_in_schemas_match_the_code() {
     let names = oprobe::cli::schema::names();
     assert_eq!(
         names,
-        ["report", "prove", "run-list", "operator", "error", "events"]
+        [
+            "report", "prove", "show", "run-list", "operator", "error", "events"
+        ]
     );
     for name in &names {
         let v = oprobe::cli::schema::schema(name).unwrap();
@@ -181,6 +183,7 @@ fn run_saves_the_run_and_prints_one_json_document() {
     let o = env.run(&["show", id, "-o", "json"]);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     let s = json(&o);
+    validate("show", &s);
     validate("report", &s["report"]);
     assert_eq!(s["report"]["run"]["id"], id);
     assert!(s["requests_count"].as_u64().unwrap() > 0);
@@ -329,7 +332,9 @@ fn show_lists_groups_and_removes_runs() {
     for by in ["stage", "api", "conn"] {
         let o = env.run(&["show", "last", "--by", by, "-o", "json"]);
         assert_eq!(code(&o), 0, "{}", stderr(&o));
-        let b = &json(&o)["by"];
+        let shown = json(&o);
+        validate("show", &shown);
+        let b = &shown["by"];
         assert_eq!(b["by"], by);
         assert!(!b["groups"].as_array().unwrap().is_empty(), "{b}");
     }
@@ -342,6 +347,58 @@ fn show_lists_groups_and_removes_runs() {
     let o = env.run(&["show", "no-such-run", "-o", "json"]);
     assert_eq!(code(&o), 2);
     assert_eq!(error_code(&o), "usage.unknown_run");
+}
+
+#[test]
+fn show_recomputes_a_time_range_from_the_rows() {
+    let env = Env::new();
+    let o = env.run(&run_args(&["memory://"], &["-q"]));
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let whole = json(&env.run(&["show", "last", "--since", "0s", "-o", "json"]));
+    let all = whole["range"]["ops_count"].as_u64().unwrap();
+    assert!(all > 0, "{}", whole["range"]);
+    let o = env.run(&[
+        "show", "last", "--since", "100ms", "--until", "200ms", "-o", "json",
+    ]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let v = json(&o);
+    let r = &v["range"];
+    assert_eq!(r["since_s"], 0.1);
+    assert_eq!(r["until_s"], 0.2);
+    let part = r["ops_count"].as_u64().unwrap();
+    assert!(part > 0 && part < all, "{part} of {all}");
+    assert!(r["p99_ms"].as_f64().unwrap() > 0.0);
+    assert!(!r["apis"].as_array().unwrap().is_empty());
+    // The whole report is still there; without the flags there is no range.
+    validate("show", &v);
+    validate("report", &v["report"]);
+    assert!(
+        json(&env.run(&["show", "last", "-o", "json"]))
+            .get("range")
+            .is_none()
+    );
+    let text = stdout(&env.run(&[
+        "show", "last", "--since", "100ms", "--until", "200ms", "--color", "never",
+    ]));
+    assert!(text.contains("0.1–0.2 s of the"), "{text}");
+    assert!(text.contains("Requests by API"), "{text}");
+    // `--by` groups only the range's requests.
+    let by = json(&env.run(&[
+        "show", "last", "--since", "100ms", "--until", "200ms", "--by", "api", "-o", "json",
+    ]));
+    let n: u64 = by["by"]["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|g| g["requests_count"].as_u64().unwrap())
+        .sum();
+    assert_eq!(n, r["requests_count"].as_u64().unwrap());
+    // A backwards range is a usage error.
+    let o = env.run(&[
+        "show", "last", "--since", "2s", "--until", "1s", "-o", "json",
+    ]);
+    assert_eq!(code(&o), 2);
+    assert_eq!(error_code(&o), "usage.invalid_argument");
 }
 
 #[test]
@@ -594,7 +651,7 @@ fn prove_needs_three_pairs_to_decide() {
         "layers.retry.min_delay=10ms",
         "--trial",
         "300ms",
-        "--budget",
+        "--max-duration",
         "1s",
         "-o",
         "json",
@@ -609,7 +666,7 @@ fn prove_needs_three_pairs_to_decide() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|n| n.as_str().unwrap().contains("allowed only 1 A/B pair")),
+            .any(|n| n.as_str().unwrap().contains("allowed only 1 pair")),
         "{v}"
     );
     // `--pairs` below three is refused.
@@ -775,6 +832,94 @@ fn prove_never_prints_or_stores_secrets() {
             assert!(!text.contains(secret), "{secret} in {}", p.display());
         }
     }
+}
+
+/// One prove budget (6.3): `--max-duration` bounds the whole proof, `--budget` is a hidden
+/// alias, and the dry run estimates the whole proof.
+#[test]
+fn prove_has_one_budget_and_estimates_the_whole_proof() {
+    let env = Env::new();
+    let h = stdout(&env.run(&["prove", "--help"]));
+    assert!(h.contains("--max-duration"), "{h}");
+    assert!(!h.contains("--budget"), "{h}");
+    let o = env.run(&run_args(&["lab://clean"], &["-q", "-o", "json"]));
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    for flag in ["--max-duration", "--budget"] {
+        let o = env.run(&[
+            "prove",
+            "last",
+            "--with",
+            "read.gap=1MiB",
+            flag,
+            "90s",
+            "--dry-run",
+            "-o",
+            "json",
+        ]);
+        assert_eq!(code(&o), 0, "{flag}: {}", stderr(&o));
+        let p = &json(&o)["proof"];
+        assert_eq!(p["budget_s"], 90.0, "{flag}: {p}");
+        assert_eq!(p["pairs_min_count"], 3, "{p}");
+        assert_eq!(p["trials_max_count"], 12, "{p}");
+        let (lo, hi) = (
+            p["eta_min_s"].as_f64().unwrap(),
+            p["eta_max_s"].as_f64().unwrap(),
+        );
+        assert!(lo > 0.0 && lo <= hi && hi <= 90.0, "{p}");
+        // Six trials at least: the estimate is the proof's, not one trial's.
+        assert!(lo >= 6.0 * p["trial_eta_s"].as_f64().unwrap() - 1e-6, "{p}");
+        assert!(
+            p["command"]
+                .as_str()
+                .unwrap()
+                .ends_with("--with read.gap=1MiB --max-duration 90s"),
+            "{p}"
+        );
+    }
+    let o = env.run(&["prove", "last", "--with", "read.gap=1MiB", "--dry-run"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let t = stdout(&o);
+    assert!(t.contains("6–12 trials") && t.contains("ETA"), "{t}");
+    assert!(!t.contains("--warmup"), "{t}");
+    assert_eq!(env.runs().len(), 1, "a dry run runs nothing");
+}
+
+/// 5.x vestiges are gone from the surface (6.3): `--set sla…` is refused, the run list has no
+/// label column and names verdicts OK / Review / Attention / Critical, and `lab` lists the
+/// app's six scenarios.
+#[test]
+fn five_x_vestiges_are_gone() {
+    let env = Env::new();
+    for bad in ["sla=none", "p99_ms=50"] {
+        let o = env.run(&["run", "memory://", "--set", bad, "-o", "json"]);
+        assert_eq!(code(&o), 2, "{bad}: {}", stdout(&o));
+        let v = json(&o);
+        assert!(
+            v["error"]["message"].as_str().unwrap().contains("no SLA"),
+            "{v}"
+        );
+    }
+    let o = env.run(&run_args(&["memory://"], &["-q"]));
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let list = stdout(&env.run(&["show", "--list", "--color", "never"]));
+    assert!(!list.contains("label"), "{list}");
+    assert!(
+        ["OK", "Review", "Attention", "Critical"]
+            .iter()
+            .any(|l| list.contains(l)),
+        "{list}"
+    );
+    let show = stdout(&env.run(&["show", "last", "--color", "never"]));
+    assert!(!show.contains("sla"), "{show}");
+    let o = env.run(&["lab", "bogus"]);
+    assert_eq!(code(&o), 2);
+    assert!(
+        stderr(&o).contains("demo, throttle, stragglers, bandwidth, flaky, ratelimit"),
+        "{}",
+        stderr(&o)
+    );
+    let h = stdout(&env.run(&["lab", "--help"]));
+    assert!(!h.contains("hotkey") && h.contains("ratelimit"), "{h}");
 }
 
 #[test]
