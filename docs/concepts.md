@@ -66,7 +66,10 @@ server or my code?" has a measured answer. Long runs keep every aggregate exact 
 operations (failed, throttled and slowest ones are always kept), so memory stays bounded.
 
 `.oprobe` files come from `oprobe run` and from [`oprobe-trace`](embedding.md) in production;
-`oprobe show FILE` and the app open both. [Reading the profile →](reading-the-profile.md)
+`oprobe show FILE` and the app open both. A production trace has the same shape: every OpenDAL
+call your application makes is an operation with its requests, its keys hashed. What it lacks is
+a workload oprobe chose, so nothing to replay: `prove` needs a run. [Reading the profile
+→](reading-the-profile.md)
 
 ## Finding
 

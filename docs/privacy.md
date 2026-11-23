@@ -29,10 +29,12 @@ Delete runs with `oprobe show --rm RUN…`, or remove the data directory.
 
 ## `.oprobe` files from `oprobe-trace`
 
-`Handle::save` writes what the layer saw in your process: the aggregates and a sample of requests
-with their API, method, status, timing, bytes, connection and request ID. Object keys are not part
-of request rows, but request IDs and remote addresses are. Credentials never are. Review a file
-before you attach it to an issue.
+`Handle::save` writes what the layer saw in your process: the aggregates and a sample of
+operations and their requests, with their API, method, status, timing, bytes, connection and
+request ID. Object keys are never stored: an operation's key is its first path segment (at most
+32 bytes) and a hash of the whole key (`logs/#3f2a…`), so a top-level directory name can be in
+the file, but not a key. Request IDs and remote addresses are. Credentials never are. Review a
+file before you attach it to an issue.
 
 ## Test data in your bucket
 

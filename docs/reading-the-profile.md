@@ -120,6 +120,6 @@ fields carry their unit in the name (`_ms`, `_bytes`, `_ratio`, `_count`), enums
 
 A stored run lives in `<data dir>/oprobe/runs/` as one `.oprobe` file (format `oprobe.run/6`: a
 zstd stream of the header with the operator spec and workload, columnar segments of operation and
-request rows, the per-second timeline, and the report). `oprobe-trace` writes `oprobe.trace/6`
+request rows, the per-second timeline, and the report). `oprobe-trace` writes `oprobe.trace/7`
 files (one JSON document: the aggregates and the sampled rows). `oprobe show FILE` and the app
 open both. 5.x run files are not read.
