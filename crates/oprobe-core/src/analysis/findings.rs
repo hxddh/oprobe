@@ -300,9 +300,12 @@ impl Ctx<'_> {
 /// otherwise at most `medium` (or `low` when it explains less than half).
 fn limit_confidence(c: &Ctx, h: &Hypothesis) -> Confidence {
     let mut conf = h.confidence;
-    if h.explains_ratio < 0.5 {
+    // Compared as printed (whole percent): a ratio a rounding error away from a threshold
+    // never flips the confidence between runs of the same rows (U9).
+    let explains = (h.explains_ratio * 100.0).round() / 100.0;
+    if explains < 0.5 {
         conf = conf.min(Confidence::Low);
-    } else if h.explains_ratio < HIGH_EXPLAINS_RATIO {
+    } else if explains < HIGH_EXPLAINS_RATIO {
         conf = conf.min(Confidence::Medium);
     }
     if conf == Confidence::High && !halves_agree(c, h.kind) {
@@ -542,19 +545,42 @@ fn throttle_family(c: &Ctx) -> (Option<Finding>, bool) {
             vals.push(("hot_key_share_ratio", s));
         }
     }
-    let cause = match code {
+    // The cause leads with what the throttling costs (U4): time in retry backoff, then
+    // operations that failed; the share of throttled requests alone understates it.
+    let what = match code {
         "rate_limit" => format!(
-            "The service limits the request rate and throttled {:.1}% of requests.",
+            "the service limits the request rate and throttled {:.1}% of requests",
             req_ratio * 100.0
         ),
         "key_limit" => format!(
-            "Hot keys exceed a per-key limit: {:.1}% of requests were throttled.",
+            "hot keys exceed a per-key limit ({:.1}% of requests throttled)",
             req_ratio * 100.0
         ),
         _ => format!(
-            "The service throttled {:.1}% of requests (429/503).",
+            "the service throttled {:.1}% of requests",
             req_ratio * 100.0
         ),
+    };
+    let failed = match out_of_retries {
+        0 => String::new(),
+        1 => "; 1 operation failed when its retries ran out".to_owned(),
+        n => format!("; {n} operations failed when their retries ran out"),
+    };
+    let cause = if r.stages.shares.retry_pct >= 0.5 {
+        format!(
+            "{:.0}% of operation time is spent in retry backoff after 429/503: {what}{failed}.",
+            r.stages.shares.retry_pct
+        )
+    } else {
+        let mut s = what;
+        if let Some(c) = s.get_mut(..1) {
+            c.make_ascii_uppercase();
+        }
+        if failed.is_empty() {
+            format!("{s} (429/503); retries absorbed them at under 1% of operation time.")
+        } else {
+            format!("{s} (429/503){failed}.")
+        }
     };
     let ids = c.run.ops.iter().filter(|o| o.throttled).map(|o| o.op_id);
     (
@@ -1682,11 +1708,41 @@ pub(crate) mod tests {
         assert!(!f[0].cause.contains("24"));
     }
 
+    /// The cause (the headline) leads with what throttling costs, not the share of requests.
+    #[test]
+    fn the_throttling_cause_leads_with_its_cost() {
+        let mut run = throttled(HypothesisKind::InflightLimit, 0.95, Confidence::High);
+        run.report.connections.requests = 10_000;
+        let f = derive(&run);
+        assert!(
+            f[0].cause
+                .starts_with("60% of operation time is spent in retry backoff after 429/503: "),
+            "{}",
+            f[0].cause
+        );
+        assert!(
+            f[0].cause.contains("throttled 1.0% of requests"),
+            "{}",
+            f[0].cause
+        );
+        // Absorbed at no cost: said so.
+        run.report.stages.shares.retry_pct = 0.1;
+        let f = derive(&run);
+        let t = f.iter().find(|x| x.code == "throttling").unwrap();
+        assert_eq!(
+            t.cause,
+            "The service throttled 1.0% of requests (429/503); retries absorbed them at under 1% of operation time."
+        );
+    }
+
     #[test]
     fn high_confidence_needs_the_model_to_explain_most_of_it() {
         let run = throttled(HypothesisKind::InflightLimit, 0.45, Confidence::High);
         assert_eq!(derive(&run)[0].confidence, Confidence::Low);
         let run = throttled(HypothesisKind::InflightLimit, 0.6, Confidence::High);
+        assert_eq!(derive(&run)[0].confidence, Confidence::Medium);
+        // A rounding error below a threshold is the threshold (no flips between runs).
+        let run = throttled(HypothesisKind::InflightLimit, 0.5 - 1e-12, Confidence::High);
         assert_eq!(derive(&run)[0].confidence, Confidence::Medium);
     }
 

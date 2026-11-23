@@ -310,7 +310,9 @@ fn served_rate(obs: &[Obs], by: Option<&dyn Fn(&Obs) -> u32>, nkeys: usize) -> f
     let rates: Vec<f64> = per
         .iter()
         .filter_map(|bins| {
-            let hot: Vec<(&i64, &(u64, u64))> = bins.iter().filter(|b| b.1.1 > 0).collect();
+            let mut hot: Vec<(&i64, &(u64, u64))> = bins.iter().filter(|b| b.1.1 > 0).collect();
+            // In time order: the sum is the same on every run (U9).
+            hot.sort_unstable_by_key(|b| *b.0);
             (!hot.is_empty()).then(|| {
                 hot.iter().map(|b| b.1.0).sum::<u64>() as f64
                     / hot.iter().map(|b| cover(*b.0)).sum::<f64>()
