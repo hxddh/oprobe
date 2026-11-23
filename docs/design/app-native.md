@@ -68,8 +68,8 @@ The shortcuts use the platform's modifier (`mod`: ⌘ on macOS, Ctrl elsewhere).
 
 - **New Run** is a dialog: the operator (with the lab scenarios as quick picks), the preset, and the
   duration and concurrency (advanced, collapsed). Return starts the run and Escape cancels.
-- **Settings** (mod+,) is a dialog window of its own: the language (System, English, 简体中文) and
-  where runs are stored. Nothing about settings stays in the main window.
+- **Settings** (mod+,) is a dialog: the language (System, English, 简体中文) and where runs are
+  stored. Nothing about settings stays in the main window.
 - **Open Run File…** uses the system's file dialog (`.oprobe`, `.json` traces). Dropping such a file
   on the window opens it.
 - A running job shows its progress on the Dock icon or taskbar button.

@@ -6,6 +6,20 @@ All notable changes to this project are documented here. The format follows
 
 ## Unreleased
 
+### Changed
+
+- **The app is a native window** ([design](docs/design/app-native.md)). The row of tabs and the
+  bordered cards are gone:
+  - a sidebar of runs grouped by operator, on the platform's sidebar material; select runs with a
+    click, mod-click and shift-click, and two or more show Compare;
+  - the title bar holds the toolbar: Profile/Operator, New Run, Run Again/Stop, and the main menu
+    on Windows and Linux;
+  - menus with the platform's shortcuts (the menu bar on macOS), and a context menu on runs;
+  - New Run, Settings (the language) and Delete are dialogs;
+  - progress shows on the Dock or taskbar; open a run file or drop it on the window;
+  - control sizes follow each platform, headings are in sentence case, and Operator's settings
+    are grouped.
+
 ### Fixed
 
 - `prove`: the noise floor is never below what a trial can resolve, `ln(1 + 1/ops)` for its

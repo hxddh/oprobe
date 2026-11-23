@@ -9,7 +9,7 @@ use nsh_base::theme;
 use nsh_core::prelude::*;
 
 use super::profile::{stage_bar, verdict_badge};
-use super::shell::{fill, page};
+use super::shell::page;
 
 use crate::ui::chart::chart;
 use crate::ui::data::{self, ProfileModel};
@@ -84,7 +84,7 @@ fn value(key: &str, v: f64) -> String {
 fn table(ms: &[Rc<ProfileModel>]) -> View {
     let plain: Vec<ProfileModel> = ms.iter().map(|m| (**m).clone()).collect();
     let first = plain[0].operator.clone();
-    let mut t = section(fill("compare.of", &[&ms.len()]))
+    let mut t = crate::ui::kit::section_first("")
         .test_id("compare-table")
         .child(row("").children(ms.iter().map(|m| {
             cell(

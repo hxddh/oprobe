@@ -218,7 +218,7 @@ change of your own: `oprobe prove last --with layers.tail_cut=on`.
 oprobe
 ```
 
-The app shows the same runs in four views: Runs, Profile, Operator and Compare. In the Operator
+The app shows the same runs in a sidebar. A run opens in Profile or Operator, and two or more selected runs open in Compare. In the Operator
 view you can toggle a layer, press *Prove* and watch the A/B pairs arrive. See [the app](app.md).
 
 ## 5. Your storage
@@ -1000,12 +1000,30 @@ at all.
 The app has no logic of its own: it calls the same service layer as the CLI (`run`, `prove`,
 `show`), so a run started in the app is a run in `oprobe show --list`, and the reverse.
 
-## Four views
+## The window
 
-**Runs.** The history, newest first, with live runs streaming in (from the app, the CLI or
-another window). Each row shows the operator, workload, verdict, goodput and p99. Prove trials are
-folded under their prove run. Start a run from here: an operator (URL, file or configured name)
-and a preset.
+The window works like other professional tools on your platform (design:
+[app-native](design/app-native.md)):
+
+- **Sidebar**:
+  - Lists the runs, newest first, grouped under their operator. Each row shows the verdict, the
+    run's short id, the preset, when it ran, and its goodput and p99.
+  - Runs started from the app, the CLI or another window show up here.
+  - A running job is the first row, with its progress.
+  - Click a run to show it. With ⌘ (macOS) or Ctrl held, a click adds or removes a run; with
+    Shift held, it extends the selection.
+  - Two or more selected runs show **Compare**.
+  - Secondary-click a run for its menu: Open, Compare With Selected, Prove…, Copy Run ID,
+    Copy Command and Delete…. Delete always asks first.
+- **Toolbar**: it sits in the title bar. It holds the run's id and operator, the
+  **Profile / Operator** switch, **New Run** (＋), and **Run Again** ▶, which becomes **Stop** ■
+  while a job runs. On Windows and Linux it also holds the main menu (⋯ or ☰).
+- **Menus**: on macOS the menu bar holds File, Edit, Run, View, Window and Help. On Windows and
+  Linux the same menus are in the main menu.
+- **Dialogs**: New Run (mod+N) and Settings (mod+,) open as dialogs. Settings is where you choose
+  the language.
+- **Run files**: open a `.oprobe` file with File ▸ Open Run File…, or drop it on the window.
+- **Progress**: a running job shows its progress on the Dock or taskbar icon.
 
 **Profile.** One run: the verdict, where the time went (the stage split of every operation, and
 of each verb when there are several), the request waterfall of the slowest operations (each
@@ -1040,8 +1058,21 @@ English only.
 
 ## Keys
 
-Everything works from the keyboard, in the terminal and in a window; the app's help lists the
-keys. In a window the mouse and the platform's usual shortcuts work too.
+`mod` is ⌘ on macOS and Ctrl elsewhere (and in a terminal).
+
+| Keys | Does |
+|---|---|
+| mod+N | New Run… |
+| mod+O | Open Run File… |
+| mod+R | Run the selected run again |
+| mod+. | Stop the running job |
+| mod+shift+P | Prove the current change |
+| mod+1, mod+2 | Profile, Operator |
+| ctrl+mod+S (macOS), mod+shift+S | Show or hide the sidebar |
+| mod+shift+C | Copy the selected run IDs |
+| mod+Backspace | Delete the selected runs (asks first) |
+| mod+, | Settings |
+| F10 (terminal) | The main menu |
 
 ## Without a display
 

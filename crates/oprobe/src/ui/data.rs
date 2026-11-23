@@ -244,7 +244,7 @@ pub fn of_run(run: &Run) -> ProfileModel {
             })
             .collect(),
         findings: findings(r),
-        slowest: slowest(run, 6),
+        slowest: slowest(run, 3),
         timeline: r
             .timeline
             .iter()

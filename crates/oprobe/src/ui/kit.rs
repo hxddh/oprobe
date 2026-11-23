@@ -399,6 +399,11 @@ pub fn section(heading_text: impl IntoReactive<SharedString>) -> View {
         }))
 }
 
+/// The first section of a view: no hairline above it.
+pub fn section_first(heading_text: impl IntoReactive<SharedString>) -> View {
+    section(heading_text).border_t(px(0.0)).pt(px(0.0))
+}
+
 /// A verdict or severity: a filled dot and its word, in the tone's colour.
 pub fn badge(
     label: impl IntoReactive<SharedString>,

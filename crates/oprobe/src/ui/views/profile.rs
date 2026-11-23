@@ -195,7 +195,11 @@ fn verbs(vs: &[VerbRow]) -> View {
                         fmt::dur_ms(v.p50_ms),
                         fmt::dur_ms(v.p99_ms)
                     ))
-                    .w(px(170.0))
+                    .w(px(if crate::ui::kit::in_terminal() {
+                        27.0 * 8.0
+                    } else {
+                        170.0
+                    }))
                     .tabular_nums(),
                 )
                 .child(view().flex_1().min_w(px(120.0)).child(stage_bar(&v.stages)))

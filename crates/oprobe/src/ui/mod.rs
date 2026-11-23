@@ -15,6 +15,8 @@ pub mod i18n;
 mod icons;
 pub mod jobs;
 mod kit;
+// A menu or URL opened answers once closed; nothing waits for it.
+#[allow(clippy::let_underscore_future)]
 mod menus;
 pub mod plots;
 pub mod store;

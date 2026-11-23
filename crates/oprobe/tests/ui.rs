@@ -145,7 +145,8 @@ fn the_window_reads_in_both_languages() {
     wait_long(&mut app, "text:时间花在哪里");
     assert!(app.shows(&id), "ids stay as they are");
     app.press("id:new-run").unwrap();
-    wait_long(&mut app, "text:新建运行…");
+    wait_long(&mut app, "id:new-run-dialog");
+    wait_long(&mut app, "text:新建运行");
     app.press("id:dialog-cancel").unwrap();
     choose(&mut app, "English");
     wait_long(&mut app, "text:Where the time went");

@@ -207,11 +207,13 @@ fn row(s: Store, r: RunRow) -> View {
             }
         })
         .hover(move |st| {
-            if selected() {
-                st
-            } else {
-                st.bg(move || theme().secondary)
-            }
+            st.bg(move || {
+                if selected() {
+                    theme().primary
+                } else {
+                    theme().secondary
+                }
+            })
         })
         .focus_visible(kit::ring)
         .on_press(move |e: &PressEvent| {

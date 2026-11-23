@@ -384,7 +384,7 @@ impl Store {
 
     /// Put `text` on the clipboard.
     pub fn copy(&self, text: String) {
-        let _ = set_clipboard(text);
+        set_clipboard(text);
     }
 
     /// Run the selected run's operator and workload again.

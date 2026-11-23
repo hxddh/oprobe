@@ -106,7 +106,7 @@ fn new_run(s: Store) -> View {
     view()
         .gap(px(14.0))
         .test_id("new-run-dialog")
-        .child(title(tr("menu.new_run")))
+        .child(title(tr("dialog.new_run")))
         .child(form_row(
             "runs.operator",
             field(
@@ -128,7 +128,7 @@ fn new_run(s: Store) -> View {
                     let on = move || scenario().as_deref() == Some(name);
                     btn(
                         name,
-                        move || if on() { Kind::Plain } else { Kind::Ghost },
+                        move || if on() { Kind::Primary } else { Kind::Plain },
                         move || f.operator.set(format!("lab://{name}")),
                     )
                     .accessibility_label(format!("lab://{name}"))

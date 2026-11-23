@@ -55,7 +55,7 @@ The workspace has three crates. Front ends call only `oprobe_core::app::App`.
 | `crates/oprobe-core/src/{guard,errors,events,output}.rs` | Safety rails; error classification (`ErrorCode`, exit codes); the event bus; output formats (`text`, `json`). |
 | `crates/oprobe-core/src/lab/` | The in-process S3-compatible fault-injection server. |
 | `crates/oprobe/src/cli/` | The clap tree (`args.rs`), presentation (`commands.rs`) and the schema registry (`schema.rs`). |
-| `crates/oprobe/src/launch.rs`, `src/ui/` | Bare `oprobe` opens the nsh app: Runs, Profile, Operator, Compare. Its zh/en catalog is `ui/i18n.rs`, and `ui/data.rs` is its one adapter onto core. |
+| `crates/oprobe/src/launch.rs`, `src/ui/` | Bare `oprobe` opens the nsh app: a sidebar of runs, a toolbar in the title bar, menus (`ui/menus.rs`), and Profile, Operator or Compare for the selection (design: `docs/design/app-native.md`). Its zh/en catalog is `ui/i18n.rs`, and `ui/data.rs` is its one adapter onto core. |
 | `crates/oprobe/tests/` | Integration tests (they spawn the binary); `ui.rs` runs nsh headless. |
 | `schemas/` | Generated JSON Schemas: `report`, `prove`, `run-list`, `operator`, `error`, `events`. Do not edit them by hand. |
 
