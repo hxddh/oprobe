@@ -216,6 +216,9 @@ pub struct Profile {
     /// `--by`: the request rows grouped.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub by: Option<ByTable>,
+    /// `--since/--until`: the numbers of that time range, recomputed from the trace rows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub range: Option<crate::report::range::RangeView>,
 }
 
 /// `show --by`: the request rows grouped (and, by stage, the per-stage latency per API).
@@ -228,9 +231,13 @@ pub struct ByTable {
 }
 
 impl ByTable {
-    fn of(run: &Run, by: crate::analysis::slice::By) -> Self {
+    fn of(run: &Run, by: crate::analysis::slice::By, range: Option<(f64, f64)>) -> Self {
         use crate::analysis::slice;
-        let reqs: Vec<&crate::model::ReqRow> = run.reqs.iter().collect();
+        let inside = |t: i64| match range {
+            Some((a, b)) => t >= (a * 1e6) as i64 && t < (b * 1e6) as i64,
+            None => true,
+        };
+        let reqs: Vec<&crate::model::ReqRow> = run.reqs.iter().filter(|q| inside(q.t_us)).collect();
         Self {
             by,
             groups: slice::group(&reqs, by),
@@ -324,6 +331,9 @@ impl CommandOutput for Profile {
         if let Some(b) = &self.by {
             return b.text();
         }
+        if let (Some(v), Some(run)) = (&self.range, &self.full) {
+            return terminal::range_section(run, v);
+        }
         match &self.full {
             Some(run) => terminal::render_run_with(run, self.detail),
             None => terminal::render(&self.run.report),
@@ -340,11 +350,49 @@ impl Profile {
 
     /// Group the request rows (`--by`).
     pub fn with_by(mut self, by: Option<crate::analysis::slice::By>) -> Self {
+        let range = self.range.as_ref().map(|v| (v.since_s, v.until_s));
         self.by = match (by, &self.full) {
-            (Some(b), Some(run)) => Some(ByTable::of(run, b)),
+            (Some(b), Some(run)) => Some(ByTable::of(run, b, range)),
             _ => None,
         };
         self
+    }
+
+    /// Only the time range `[since, until)` (seconds into the window; `until` defaults to the
+    /// window's end): its numbers, requests by API, verbs and slowest operations from the
+    /// trace rows (`--since/--until`). Nothing changes when neither is given.
+    pub fn with_range(mut self, since: Option<f64>, until: Option<f64>) -> Result<Self> {
+        if since.is_none() && until.is_none() {
+            return Ok(self);
+        }
+        let window = self.run.report.run.window_s;
+        let (a, b) = (since.unwrap_or(0.0), until.unwrap_or(window));
+        if b <= a {
+            return Err(OprobeError::new(
+                ErrorCode::UsageInvalidArgument,
+                format!("--until ({b} s) is not after --since ({a} s)"),
+            )
+            .with_hint("pass a range inside the window, e.g. --since 2s --until 6s")
+            .into());
+        }
+        if a >= window {
+            return Err(OprobeError::new(
+                ErrorCode::UsageInvalidArgument,
+                format!("--since ({a} s) is past the end of the {window:.1} s window"),
+            )
+            .with_hint(format!("pass a time under {window:.1}s"))
+            .into());
+        }
+        let Some(run) = self.full.as_deref().filter(|r| !r.ops.is_empty()) else {
+            return Err(OprobeError::new(
+                ErrorCode::UsageInvalidArgument,
+                "this run has no trace rows to recompute a time range from",
+            )
+            .with_hint("show the whole run without --since/--until")
+            .into());
+        };
+        self.range = Some(crate::report::range::RangeView::of(run, a, b));
+        Ok(self)
     }
 }
 
@@ -362,6 +410,7 @@ pub fn show(app: &App, r: &RunRef) -> Result<Profile> {
         by: None,
         full: Some(Box::new(run)),
         detail: false,
+        range: None,
     })
 }
 

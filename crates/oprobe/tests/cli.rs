@@ -345,6 +345,57 @@ fn show_lists_groups_and_removes_runs() {
 }
 
 #[test]
+fn show_recomputes_a_time_range_from_the_rows() {
+    let env = Env::new();
+    let o = env.run(&run_args(&["memory://"], &["-q"]));
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let whole = json(&env.run(&["show", "last", "--since", "0s", "-o", "json"]));
+    let all = whole["range"]["ops_count"].as_u64().unwrap();
+    assert!(all > 0, "{}", whole["range"]);
+    let o = env.run(&[
+        "show", "last", "--since", "100ms", "--until", "200ms", "-o", "json",
+    ]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let v = json(&o);
+    let r = &v["range"];
+    assert_eq!(r["since_s"], 0.1);
+    assert_eq!(r["until_s"], 0.2);
+    let part = r["ops_count"].as_u64().unwrap();
+    assert!(part > 0 && part < all, "{part} of {all}");
+    assert!(r["p99_ms"].as_f64().unwrap() > 0.0);
+    assert!(!r["apis"].as_array().unwrap().is_empty());
+    // The whole report is still there; without the flags there is no range.
+    validate("report", &v["report"]);
+    assert!(
+        json(&env.run(&["show", "last", "-o", "json"]))
+            .get("range")
+            .is_none()
+    );
+    let text = stdout(&env.run(&[
+        "show", "last", "--since", "100ms", "--until", "200ms", "--color", "never",
+    ]));
+    assert!(text.contains("0.1–0.2 s of the"), "{text}");
+    assert!(text.contains("Requests by API"), "{text}");
+    // `--by` groups only the range's requests.
+    let by = json(&env.run(&[
+        "show", "last", "--since", "100ms", "--until", "200ms", "--by", "api", "-o", "json",
+    ]));
+    let n: u64 = by["by"]["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|g| g["requests_count"].as_u64().unwrap())
+        .sum();
+    assert_eq!(n, r["requests_count"].as_u64().unwrap());
+    // A backwards range is a usage error.
+    let o = env.run(&[
+        "show", "last", "--since", "2s", "--until", "1s", "-o", "json",
+    ]);
+    assert_eq!(code(&o), 2);
+    assert_eq!(error_code(&o), "usage.invalid_argument");
+}
+
+#[test]
 fn errors_are_classified_with_exit_codes() {
     let env = Env::new();
     let o = env.run(&["run", "ftp://x", "-o", "json"]);

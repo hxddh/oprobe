@@ -77,8 +77,16 @@ pub fn show(a: ShowArgs, ctx: &Ctx) -> Result<u8> {
         ByArg::Api => crate::analysis::slice::By::Api,
         ByArg::Conn => crate::analysis::slice::By::Conn,
     });
+    let secs = |v: &Option<String>| -> Result<Option<f64>> {
+        Ok(match v {
+            Some(s) => Some(crate::input::duration(s)?.as_secs_f64()),
+            None => None,
+        })
+    };
+    let (since, until) = (secs(&a.since)?, secs(&a.until)?);
     let p = app
         .show(RunRef(a.run.unwrap_or_else(|| "last".into())))?
+        .with_range(since, until)?
         .with_detail(a.detail)
         .with_by(by);
     ctx.out.finish(&p)

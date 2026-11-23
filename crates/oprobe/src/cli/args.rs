@@ -294,6 +294,13 @@ pub struct ShowArgs {
     /// Group the requests: by stage, API or connection
     #[arg(long, value_enum)]
     pub by: Option<ByArg>,
+    /// Only the time range from this far into the window (e.g. 3s): its numbers, requests by
+    /// API, verbs and slowest operations, recomputed from the trace rows
+    #[arg(long, value_name = "DURATION", value_parser = parse::duration, conflicts_with_all = ["list", "rm"])]
+    pub since: Option<String>,
+    /// Only the time range up to this far into the window (e.g. 8s; default: the window's end)
+    #[arg(long, value_name = "DURATION", value_parser = parse::duration, conflicts_with_all = ["list", "rm"])]
+    pub until: Option<String>,
     /// Show at most N runs (`--list`)
     #[arg(short = 'n', long, default_value_t = 20, hide = true)]
     pub limit: usize,

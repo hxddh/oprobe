@@ -30,6 +30,8 @@ use crate::analysis::capacity::Confidence;
 use crate::analysis::diagnosis::Severity;
 use crate::model::{Finding, Report, Run, VerdictLevel};
 
+pub use super::range::{OpLine, RangeView, ReqLine, ops_in, slowest_requests};
+
 /// The verdict line.
 #[derive(Clone, Debug, PartialEq)]
 pub struct VerdictView {
@@ -210,7 +212,7 @@ impl NumbersView {
 }
 
 /// One stage's share of time.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, schemars::JsonSchema)]
 pub struct StageShare {
     /// Stable key: `queue`, `connect`, `upload`, `server`, `download`, `retry`, `cache`,
     /// `client` (all operations); `queue`, `connect`, `send`, `ttfb`, `body`, `backoff`,
@@ -296,6 +298,21 @@ pub struct WaterfallRow {
     pub bytes_down: u64,
     pub throttled: bool,
     pub error: Option<String>,
+    /// Time waited before this attempt since the previous request of the operation ended
+    /// (retry backoff), µs; 0 for a first attempt.
+    pub wait_before_us: u64,
+    /// The provider's error code (`SlowDown`, `InternalError`), when the response had one.
+    pub provider_code: Option<String>,
+    /// The `Retry-After` the service asked for.
+    pub retry_after_ms: Option<u64>,
+    /// The connection's smoothed and minimum round-trip time and retransmitted segments
+    /// (kernel `TCP_INFO`), when recorded.
+    pub rtt_us: Option<u64>,
+    pub min_rtt_us: Option<u64>,
+    pub retransmits_count: Option<u64>,
+    /// The `Server-Timing` header.
+    pub server_timing: Option<String>,
+    pub request_id: Option<String>,
 }
 
 /// One of the slowest operations with its requests.
@@ -322,39 +339,69 @@ pub fn slowest(run: &Run, n: usize) -> Vec<WaterfallOp> {
     } else {
         run.report.slowest.clone()
     };
-    ids.into_iter()
-        .filter_map(|id| run.op(id))
+    examples(run, &ids, n)
+}
+
+/// The operations `ids` (a finding's examples, in its order) that have rows, at most `n`,
+/// request by request.
+pub fn examples(run: &Run, ids: &[u64], n: usize) -> Vec<WaterfallOp> {
+    ids.iter()
+        .filter_map(|id| waterfall(run, *id))
         .take(n)
-        .map(|o| WaterfallOp {
-            op_id: o.op_id,
-            verb: o.verb.to_string(),
-            key: o.key.clone(),
-            t_us: o.t_us,
-            latency_us: o.latency_us,
-            ok: o.ok,
-            backoff_us: o.breakdown.retry_us,
-            rows: run
-                .requests_of(o.op_id)
-                .into_iter()
-                .map(|q| WaterfallRow {
-                    api: q.api.to_string(),
-                    status: q.status,
-                    attempt: q.attempt,
-                    start_us: q.t_us - o.t_us,
-                    queue_us: q.queue_us,
-                    connect_us: q.connect_us(),
-                    send_us: q.send_us,
-                    ttfb_us: q.ttfb_us,
-                    body_us: q.body_us + q.stall_us,
-                    total_us: q.total_us,
-                    reused: q.reused,
-                    bytes_down: q.bytes_down,
-                    throttled: q.is_throttle(),
-                    error: q.error.clone(),
-                })
-                .collect(),
-        })
         .collect()
+}
+
+/// One operation, request by request (`None` when the rows do not hold it).
+pub fn waterfall(run: &Run, op_id: u64) -> Option<WaterfallOp> {
+    let o = run.op(op_id)?;
+    let mut prev_end: Option<i64> = None;
+    let rows = run
+        .requests_of(o.op_id)
+        .into_iter()
+        .map(|q| {
+            // A retry waited from the previous attempt's end to its own start.
+            let wait_before_us = match prev_end {
+                Some(end) if q.attempt > 1 && q.t_us > end => (q.t_us - end) as u64,
+                _ => 0,
+            };
+            prev_end = Some(prev_end.unwrap_or(i64::MIN).max(q.t_us + q.total_us as i64));
+            let detail = q.detail.as_deref();
+            WaterfallRow {
+                api: q.api.to_string(),
+                status: q.status,
+                attempt: q.attempt,
+                start_us: q.t_us - o.t_us,
+                queue_us: q.queue_us,
+                connect_us: q.connect_us(),
+                send_us: q.send_us,
+                ttfb_us: q.ttfb_us,
+                body_us: q.body_us + q.stall_us,
+                total_us: q.total_us,
+                reused: q.reused,
+                bytes_down: q.bytes_down,
+                throttled: q.is_throttle(),
+                error: q.error.clone(),
+                wait_before_us,
+                provider_code: detail.and_then(|d| d.error_code.clone()),
+                retry_after_ms: q.retry_after_ms,
+                rtt_us: q.tcp.as_ref().map(|t| t.rtt_us).filter(|v| *v > 0),
+                min_rtt_us: q.tcp.as_ref().map(|t| t.min_rtt_us).filter(|v| *v > 0),
+                retransmits_count: q.tcp.as_ref().map(|t| t.retrans),
+                server_timing: detail.and_then(|d| d.server_timing.clone()),
+                request_id: q.request_id.clone(),
+            }
+        })
+        .collect();
+    Some(WaterfallOp {
+        op_id: o.op_id,
+        verb: o.verb.to_string(),
+        key: o.key.clone(),
+        t_us: o.t_us,
+        latency_us: o.latency_us,
+        ok: o.ok,
+        backoff_us: o.breakdown.retry_us,
+        rows,
+    })
 }
 
 /// The series of the window, one value per interval (1 s for the first ten minutes, then
@@ -1099,6 +1146,37 @@ impl LatencyCdf {
     pub fn quantile(&self, q: f64) -> Option<f64> {
         self.pts.iter().find(|p| p.1 >= q).map(|p| p.0)
     }
+
+    /// The distribution of one verb, from the timeline's per-verb latency rows (every
+    /// operation of the verb, at the heatmap's row resolution: each point at its row's upper
+    /// bound). `None` when the timeline has no rows for `verb`.
+    pub fn for_verb(r: &Report, verb: &str) -> Option<Self> {
+        let bounds = crate::model::HEATMAP_LATENCY_BOUNDS_MS;
+        let mut rows = vec![0u64; bounds.len()];
+        for p in &r.timeline {
+            for v in p.verbs.iter().filter(|v| v.verb == verb) {
+                for (i, c) in v.latency_rows_count.iter().enumerate().take(rows.len()) {
+                    rows[i] += c;
+                }
+            }
+        }
+        let total: u64 = rows.iter().sum();
+        if total == 0 {
+            return None;
+        }
+        let mut acc = 0u64;
+        let pts = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| **c > 0)
+            .map(|(i, c)| {
+                acc += c;
+                let upper = bounds.get(i + 1).copied().unwrap_or(bounds[i] * 2.0);
+                (upper, acc as f64 / total as f64)
+            })
+            .collect();
+        Some(Self { pts, exact: false })
+    }
 }
 
 /// Operation latency over time for drawing: `counts[t][l]` operations started in time column
@@ -1159,7 +1237,7 @@ impl HeatmapView {
 }
 
 /// One verb (`read.range`, `write.multipart`) with its numbers and where its time went.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, schemars::JsonSchema)]
 pub struct VerbView {
     pub verb: String,
     pub ops_count: u64,
@@ -1411,7 +1489,7 @@ impl TrustView {
 }
 
 /// The backend's requests of one API (`GetObject`, `PutObject`, …).
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, schemars::JsonSchema)]
 pub struct ApiRow {
     pub api: String,
     pub requests_count: u64,
@@ -1652,6 +1730,7 @@ mod tests {
             errors_count: vec![0; n],
             inflight_peak_count: vec![4; n],
             new_connections_count: vec![0; n],
+            ..Default::default()
         };
         let (d, k) = t.downsample(60);
         assert_eq!(k, 15);

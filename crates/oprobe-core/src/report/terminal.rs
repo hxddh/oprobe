@@ -1088,6 +1088,154 @@ pub fn wrap_text(s: &str, width: usize) -> Vec<String> {
     lines
 }
 
+/// `show --since/--until`: one time range of a run, recomputed from its trace rows
+/// ([`super::range::RangeView`]): the numbers, where the time went, the verbs, the requests by
+/// API and the slowest operations of the range.
+pub fn range_section(run: &Run, v: &super::range::RangeView) -> String {
+    let r = &run.report;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "{} {} {}",
+        bold("oprobe"),
+        dim(&r.run.oprobe_version),
+        dim(&format!("· run {}", r.run.id))
+    );
+    let _ = writeln!(
+        out,
+        "{} {}",
+        bold(&r.target.display),
+        dim(&format!(
+            "· {:.1}–{:.1} s of the {:.1} s window",
+            v.since_s, v.until_s, r.run.window_s
+        ))
+    );
+    if v.sampled {
+        let _ = writeln!(
+            out,
+            "{}",
+            yellow(&format!(
+                "rows were sampled ({:.0}% kept): counts are estimates, each row weighted by the operations it stands for",
+                v.kept_ratio * 100.0
+            ))
+        );
+    }
+    if v.is_empty() {
+        let _ = writeln!(out, "\n  no operation started in this range");
+        return out;
+    }
+    section(&mut out, "Range");
+    kv(
+        &mut out,
+        "goodput",
+        &format!(
+            "{:.1} ops/s · {:.1} attempted · {:.2} MiB/s",
+            v.goodput_ops_per_s, v.ops_per_s, v.mib_per_s
+        ),
+    );
+    kv(
+        &mut out,
+        "latency",
+        &format!(
+            "p50 {} · p90 {} · p99 {} · p99.9 {} · max {}",
+            fmt_ms(v.p50_ms),
+            fmt_ms(v.p90_ms),
+            fmt_ms(v.p99_ms),
+            fmt_ms(v.p999_ms),
+            fmt_ms(v.max_ms)
+        ),
+    );
+    kv(
+        &mut out,
+        "operations",
+        &format!(
+            "{} · {} failed ({:.2}%)",
+            v.ops_count,
+            v.failed_ops_count,
+            v.error_ratio * 100.0
+        ),
+    );
+    kv(
+        &mut out,
+        "requests",
+        &format!(
+            "{} · {} retries · {} throttled ({:.2}%)",
+            v.requests_count,
+            v.retries_count,
+            v.throttled_requests_count,
+            v.throttled_request_ratio * 100.0
+        ),
+    );
+    if !v.stages.is_empty() {
+        section(&mut out, "Where the time went");
+        out += &share_bars(&v.stages);
+    }
+    if v.verbs.len() > 1 {
+        section(&mut out, "Verbs");
+        let rows: Vec<Vec<String>> = v
+            .verbs
+            .iter()
+            .map(|x| {
+                vec![
+                    x.verb.clone(),
+                    x.ops_count.to_string(),
+                    format!("{:.1}", x.ops_per_s),
+                    fmt_ms(x.p50_ms),
+                    fmt_ms(x.p99_ms),
+                    format!("{:.2}%", x.error_ratio * 100.0),
+                ]
+            })
+            .collect();
+        out += &table(&["verb", "ops", "ops/s", "p50", "p99", "errors"], &rows, 2);
+    }
+    if !v.apis.is_empty() {
+        section(&mut out, "Requests by API");
+        let rows: Vec<Vec<String>> = v
+            .apis
+            .iter()
+            .map(|a| {
+                vec![
+                    a.api.clone(),
+                    a.requests_count.to_string(),
+                    a.status
+                        .iter()
+                        .take(3)
+                        .map(|(c, n)| format!("{c}×{n}"))
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    format!("{}/{}", fmt_ms(a.ttfb_p50_ms), fmt_ms(a.ttfb_p99_ms)),
+                    fmt_ms(a.total_p99_ms),
+                    a.throttled_count.to_string(),
+                ]
+            })
+            .collect();
+        out += &table(
+            &[
+                "api",
+                "requests",
+                "status",
+                "ttfb p50/p99",
+                "p99",
+                "throttled",
+            ],
+            &rows,
+            2,
+        );
+    }
+    let slow: Vec<&OpRow> = v
+        .slowest_op_ids
+        .iter()
+        .filter_map(|id| run.op(*id))
+        .collect();
+    if !slow.is_empty() {
+        section(&mut out, "Slowest operations in the range");
+        for op in slow.iter().take(3) {
+            out += &slow_op_block(op, &run.requests_of(op.op_id), false);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
