@@ -103,8 +103,10 @@ end within it. When a budget (`--max-duration`, `--max-requests`, `--max-bytes`)
 part-way, it still prints and saves the partial result (`budget_exceeded: true`, usually
 `inconclusive`) and exits 4; its trials stay attached, so `oprobe show --rm PROVE` removes them.
 
-`RUN` is a run id, an id prefix, `last` or `last~N`. `FINDING` is a finding code
-(`throttling`, `tail_stragglers`, …).
+`RUN` is a run id, an id prefix, `last`, `last~N` or a run's `.oprobe` file. A production trace
+has no workload to replay: `prove` refuses it and prints the `oprobe run` command for the service
+it recorded. `FINDING` is a finding code (`throttling`, `tail_stragglers`, …). The objective's
+change prints with its 95 % interval ([glossary](concepts.md#glossary)).
 
 | Flag | Meaning |
 |---|---|

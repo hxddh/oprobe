@@ -45,7 +45,8 @@ server cannot hide behind fewer requests), `--seed` and `--existing PREFIX` (rea
 that are already there, write nothing).
 
 oprobe writes its dataset under a fresh `oprobe-run-<id>/` prefix, warms up, measures, and
-deletes the prefix. The guard enforces budgets (`--max-requests`, `--max-bytes`,
+deletes the prefix. A run killed before it could clean up leaves its prefix behind; the next run
+against the same target deletes it. The guard enforces budgets (`--max-requests`, `--max-bytes`,
 `--max-duration`), `--read-only` and `--dry-run`.
 
 ## Profile
@@ -111,6 +112,32 @@ large a limit should be or how much it would help; claiming so would be a guess.
 The result is a **proven layer diff**: the objective's change with its interval, the evidence,
 and the change as Rust and as TOML. Every result states where it was validated (the lab, MinIO,
 your bucket).
+
+## Glossary
+
+The terms a profile and a proof print, in one line each.
+
+| Term | Meaning |
+|---|---|
+| **operation** | one OpenDAL call (`read`, `write`, `stat`, `list`, …); it may send several requests |
+| **request** | one HTTP request to the service; retries and range parts are requests of one operation |
+| **throughput** | operations (or MiB) per second, failed ones included |
+| **goodput** | *successful* operations per second: the work that got done; `prove`'s default objective |
+| **p50 / p99** | the latency half / 99 % of operations stay under; p99 is the slowest 1 % |
+| **TTFB** | time to first byte: from the request sent to the first byte of the answer (the server's time, plus one network round trip) |
+| **queue · connect · send · body · stall** | the stages of a request: waiting for a connection or a permit, opening one (DNS, TCP, TLS), sending, receiving the body, and the body waiting for your code |
+| **retry backoff** | time an operation sleeps between attempts after a 429, 503 or another retryable failure |
+| **throttled** | answered 429 (Too Many Requests) or 503 (Slow Down): the service refuses load; `throttled %` is the share of requests |
+| **in flight** | requests sent and not yet answered at one moment; a limit "starts above N in flight" |
+| **stragglers** | the few requests far slower than a typical one, usually waiting on the server (TTFB) |
+| **amplification** | bytes or requests per operation above what the operation needed (over-read ranges, retries) |
+| **cold connection** | a request that had to open a new connection instead of reusing one |
+| **open loop** | operations start on a schedule (`--rate`), so a slow service cannot hide behind fewer requests |
+| **confidence** | how well a finding's model explains the evidence: high, medium or low |
+| **95 % interval** | the range `[low, high]` that holds the true change in 95 of 100 repeats of the proof; a change whose interval includes 0 is not proven |
+| **noise floor (`±`)** | how much two runs of the *same* operator differ (the A/A spread); a change smaller than it cannot be told from noise |
+| **pair of trials** | one short run of A (the operator as it is) and one of B (with the change), back to back |
+| **verdict** | `ok`, `review` (look before trusting the numbers), `attention` (a finding costs time) or `critical` (failures or a large cost) |
 
 ## Where oprobe stops
 

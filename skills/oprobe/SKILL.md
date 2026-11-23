@@ -51,7 +51,7 @@ oprobe show prod.oprobe -o json                       # a profile written by opr
 race on the same workload. Workload: `--preset small-files|large-objects|range-reads|list-stat`,
 `-c`, `-d`, `--objects`, `--object-size`, `--rate`, `--seed`, `--existing PREFIX`.
 
-`RUN` is a run id, an id prefix, `last` or `last~N`.
+`RUN` is a run id, an id prefix, `last`, `last~N` or a run's `.oprobe` file.
 
 ## Reading results
 
@@ -71,7 +71,17 @@ race on the same workload. Workload: `--preset small-files|large-objects|range-r
 
 Exit codes: 0 ok · 1 runtime · 2 usage · 3 prove: the change is worse on the objective · 4 budget ·
 5 safety refusal · 130 interrupted. Errors: `{"type":"error","error":{"code","message","hint",
-"retryable","docs"}}`.
+"retryable","docs"}}` (`detail`, when present, is the storage library's own report).
+
+In CI, two patterns are supported:
+
+```sh
+# Fail when the profile is critical.
+oprobe run s3://bucket/bench --existing data/ --max-requests 20000 -o json \
+  | jq -e '.runs[0].report.verdict.level != "critical"'
+# Fail when the change is worse: prove exits 3 (inconclusive and improved exit 0).
+oprobe prove last --with layers.retry.max_times=5 --max-duration 5m -o json > prove.json
+```
 
 ## Profiling production
 

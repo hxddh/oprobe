@@ -13,16 +13,30 @@ The app's Profile view shows the same sections with charts ([app](app.md)).
 ## The brief
 
 ```text
-ATTENTION  throttling-bound: 3.6 % of requests were answered 429/503
-  throttling       626 throttled responses above 24 requests in flight (high confidence)
-                   remedy: layers.concurrent_limit.http, plus layers.retry.jitter
-  tail_stragglers  1 in 40 GetObject responses waits > 200 ms for its first byte
-                   remedy: layers.tail_cut
-  2114 ops/s · 119 MiB/s · p50 5.0 ms · p99 257 ms
-next: oprobe prove last throttling
+[Attention] 2.4% of GetObject requests wait far longer for the server's first byte than their peers
+  (stragglers).
+  lab://demo · small-files · 8.0 s · run 20261123-063611-3d82
+  ▲ 1 tail_stragglers (high confidence) — 2.4% of GetObject requests wait far longer for the
+      server's first byte than their peers (stragglers).
+      162 stragglers wait ~261ms for the first byte against ~9.78ms for a typical GetObject;
+      operation p50 10.0ms · p99 261ms
+      remedy: layers.tail_cut + layers.retry.min_delay — re-issue requests far slower than their
+        peers, after a short retry backoff (TailCutLayer + RetryLayer::with_min_delay)
+      next: oprobe prove 20261123-063611-3d82 tail_stragglers
+  ▲ 2 throttling (medium confidence) — 15% of operation time is spent in retry backoff after
+      429/503: the service throttled 0.1% of requests.
+      16 throttled responses (429/503) in 11416 requests (0.14%); 15% of operation time in retry
+      backoff; the rejections start above a number of requests in flight (the in-flight limit
+      explains 81% of the throttled requests)
+      remedy: layers.concurrent_limit.http + layers.retry.jitter — cap the HTTP requests in flight
+        below the service's limit and retry with jitter
+        (ConcurrentLimitLayer::with_http_concurrent_limit + RetryLayer::with_jitter)
+      next: oprobe prove 20261123-063611-3d82 throttling
+  1425.0 ops/s · 80.1 MiB/s · p50 10.0ms · p99 261ms · errors 0.00% · 0.14% of requests throttled
+  full profile: oprobe show 20261123-063611-3d82 --detail · terms: https://github.com/hxddh/oprobe/blob/v6.3.0/docs/concepts.md#glossary
 ```
 
-(Illustrative: the exact wording follows the version you run.)
+(`oprobe demo`; your numbers differ from run to run.)
 
 - **The badge** is the verdict level: **OK**, **Review** (worth a look: informational
   findings, a partial run), **Attention** (warning findings), **Critical** (critical findings).
