@@ -162,3 +162,20 @@ fn stragglers_are_found_explained_and_attributed() {
     );
     assert_eq!(bv["by"]["groups"][0]["key"], "ttfb", "{bv}");
 }
+
+/// Slow operations keep the async call stack captured while they were in flight, in the stored
+/// run: rows are streamed to the run file as operations complete, so the stack must be on the
+/// row then (a stack patched in from the slow-op samples afterwards never reached the file).
+#[test]
+fn slow_operations_keep_their_await_tree() {
+    let env = Env::new();
+    let o = env.run(&["run", "lab://stragglers", "-d", "3s", "-o", "json"]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    let o = env.run(&["show", "last", "--detail"]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    let text = String::from_utf8_lossy(&o.stdout);
+    assert!(
+        text.contains("async call stack captured while in flight:"),
+        "{text}"
+    );
+}

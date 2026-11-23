@@ -1360,7 +1360,7 @@ impl Recorder {
                 },
                 retries: c.data.retries,
                 requests: c.data.requests.clone(),
-                await_tree: tree,
+                await_tree: tree.clone(),
                 error: c.error.clone(),
             });
             a.slow.sort_by(|x, y| y.latency_ms.total_cmp(&x.latency_ms));
@@ -1372,7 +1372,7 @@ impl Recorder {
         let op_t_us = signed_offset_us(window_start, c.started);
         let att = attempts(&c.data.requests);
         let att = |i: usize| att.as_ref().map_or(1, |a| a[i]);
-        let row = op_row(
+        let mut row = op_row(
             c.op_id,
             c.verb,
             c.key,
@@ -1385,6 +1385,10 @@ impl Recorder {
             bd,
             req_count,
         );
+        // The call stack captured while the operation was slow, on its own row: a run file
+        // streams rows as operations complete (`RowSink`), so a stack patched in afterwards
+        // from the slow-op samples never reached the file.
+        row.await_tree = tree;
         let reqs: Vec<_> = c
             .data
             .requests
