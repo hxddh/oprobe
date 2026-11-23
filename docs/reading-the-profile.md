@@ -44,19 +44,44 @@ the configuration and the five slowest operations):
 |---|---|
 | header | run id, operator, workload, window, concurrency, start time |
 | verdict | the badge and where the time went, in one sentence |
-| key numbers | goodput and throughput, latency p50/p99/p99.9/max, failed operations, throttled responses |
+| key numbers | goodput and throughput, latency p50/p99/p99.9/max, failed operations, throttled responses, and one **resilience** line: retries, time spent waiting between attempts, 429/503, the 5xx/4xx/network split and the top failure classes (the app's Retries section) |
 | findings | every finding: code, cause, evidence, confidence, remedy |
 | where the time goes | each operation's wall time split into stages (below) |
-| operations | per workload verb: count, ops/s, p50, p99, max, requests per operation, errors |
-| backend requests | per storage API (`GetObject`, `PutObject`, …): count, share on warm connections, mean TTFB and transfer, p99, status codes |
-| connections | HTTP version, TLS, new connections, reuse, peak in-flight requests, dial time per phase |
+| operations | per workload verb: count, ops/s, p50, p99, max, requests per operation, errors (`--detail`: MiB/s, retries, throttled share) |
+| backend requests | per storage API (`GetObject`, `PutObject`, …): count, share on warm connections, TTFB and total p50/p99, bytes down/up, status codes (`--detail`: every stage's p50/p99); and, for a run that wrote, a **writes** line: the multipart part size OpenDAL used (and the requested `write.chunk` and the service's part-size limits when it was clamped) and the parts uploaded with their mean size — the knobs `prove` sizes for `slow_multipart` |
+| connections | HTTP version, TLS, new connections, reuse, peak in-flight requests, dial time per phase (proxy CONNECT included), and a **tcp** line from the kernel: rtt p50/p99, connections that retransmitted, the share of sending time limited by the peer's receive window or the local send buffer, the delivery rate. High rtt or retransmits point at the network; a clean network with a high TTFB points at the server. `--detail` adds the TLS handshakes (resumed share, HelloRetryRequests) and the cold start (dials and first operations before the warm-up absorbed them) |
 | bytes | logical vs backend bytes, read amplification, over-read, requests per operation, cache hits |
-| slowest operation | the worst operation request by request (a waterfall), with its async call stack |
+| slowest operation | the worst operation request by request (a waterfall), with what each request recorded beyond its stages (below) and, with `--detail`, its async call stack |
 | self | the profiler's own health: scheduling lag, CPU, whether the client was saturated |
 | cleanup | test data removed (verified), or what is left |
 
+`--detail` also adds, per interval of the timeline, retries, new connections and the client's
+CPU (percent of one core), and the cold and warm reads (first read of a key, repeat reads) to
+SPREAD.
+
 `--by stage` sums the requests' time per stage, `--by api` per storage API, `--by conn` per
-connection (cold and warm, per remote address).
+connection (cold and warm, per remote address). `--by stage` also gives each stage's p50/p99
+per API and, when the requests recorded them, the request signals below.
+
+### Request signals
+
+Besides its stage timings a request row can carry what the response and the connection said.
+The waterfall of the slowest operation (terminal and app) lists them per request, and
+`show --by stage` summarises them per API:
+
+| Signal | What it says |
+|---|---|
+| error code, Retry-After | the provider's own error (`SlowDown`, `ServerBusy`) and how long it asked to wait |
+| h2 stream wait | HTTP/2: the request waited for a stream slot (`max_concurrent_streams`); part of queue |
+| h2 flow stall | HTTP/2: the request body waited for flow-control window; it is hidden inside TTFB |
+| h2 streams | HTTP/2 streams open on the connection when the request started |
+| upload acked, send buffered | when the kernel saw the last request byte acknowledged, and when the body reached the send buffer: the end of the upload |
+| cache | a CDN's cache status (`hit`, `miss`) |
+| region | the bucket's region (`x-amz-bucket-region`) |
+| rtt, retransmits, Server-Timing | the connection's round trip and retransmitted segments, the server's own timing header |
+
+The compact profile shows the error code, Retry-After, the HTTP/2 waits and the cache status;
+`--detail` shows every signal.
 
 `--since 3s --until 8s` shows one time range of the window (a burst, the seconds a rate limit
 bit): its numbers, where the time went, the verbs, the requests by API and its slowest
@@ -74,7 +99,7 @@ Each operation's wall time is split exactly; an instant counts once even when re
 | send | the request body goes out | upload bandwidth; `write.chunk`, `write.concurrent` |
 | TTFB | waiting for the first byte (the server's work plus one round trip) | the store or the distance to it; stragglers show as a long tail (`layers.tail_cut`) |
 | body | the response body arrives | download bandwidth per stream × streams; `read.chunk`, `read.concurrent` |
-| stall | the body waits for your code to read it | the consumer, not storage |
+| stall | the body waits for your code to read it (client time: its own segment in a waterfall, never part of body) | the consumer, not storage |
 | retry | the retry layer sleeps before the next attempt | throttling or errors; see the findings |
 | client | everything else: OpenDAL, signing, checksums | CPU (`client_bound`), tiny objects |
 
