@@ -594,10 +594,14 @@ pub fn cloud_url(raw: &str) -> Option<String> {
     None
 }
 
-/// `eu-west-1`, `us-gov-west-1`, `cn-north-1`: the shape of an AWS region's name.
+/// `eu-west-1`, `us-gov-west-1`, `cn-north-1`: the shape of an AWS region's name (a
+/// two-letter area first, so `website-us-east-1` or `fips-us-east-1`, the labels of hosts that
+/// are not a bucket's API endpoint, are not one).
 fn aws_region(s: &str) -> bool {
     let parts: Vec<&str> = s.split('-').collect();
     parts.len() >= 3
+        && parts[0].len() == 2
+        && parts[0].chars().all(|c| c.is_ascii_lowercase())
         && parts
             .iter()
             .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_alphanumeric()))
@@ -608,10 +612,13 @@ fn aws_region(s: &str) -> bool {
 
 /// The error of an `http(s)://` address that is not a cloud bucket's, in a build without
 /// OpenDAL's `http` service: such an address is usually an S3-compatible server, which takes
-/// it as its endpoint.
+/// it as its endpoint. An AWS address that is not a bucket's API endpoint (an S3 website, an
+/// access point) gets the generic examples. The message never repeats the address's query (a
+/// pre-signed signature, a SAS token) or credentials.
 fn web_address(raw: &str) -> OprobeError {
+    let aws = |h: &str| h.ends_with(".amazonaws.com") || h.ends_with(".amazonaws.com.cn");
     let hint = match url::Url::parse(raw) {
-        Ok(u) if u.host_str().is_some_and(|h| !h.is_empty()) => {
+        Ok(u) if u.host_str().is_some_and(|h| !h.is_empty() && !aws(h)) => {
             let mut endpoint = format!("{}://{}", u.scheme(), u.host_str().unwrap_or_default());
             if let Some(p) = u.port() {
                 endpoint += &format!(":{p}");
@@ -626,7 +633,8 @@ fn web_address(raw: &str) -> OprobeError {
         }
         _ => URL_EXAMPLES.to_owned(),
     };
-    invalid(format!("`{raw}` is a web address, not a storage URL")).with_hint(hint)
+    let shown = crate::util::display_url(raw);
+    invalid(format!("`{shown}` is a web address, not a storage URL")).with_hint(hint)
 }
 
 /// `bucket` / `container` for services addressed by one, `None` otherwise.
@@ -914,6 +922,9 @@ mod tests {
         );
         // Not a bucket's address.
         for s in [
+            "https://b.s3-website-us-east-1.amazonaws.com/k",
+            "https://b.s3-website.eu-west-1.amazonaws.com/k",
+            "https://b.s3-fips-us-gov-west-1.amazonaws.com/k",
             "https://s3.amazonaws.com/",
             "https://ap-123.s3-accesspoint.eu-west-1.amazonaws.com/k",
             "https://ec2.amazonaws.com/",
@@ -940,7 +951,35 @@ mod tests {
                     "for an S3-compatible server, use `s3://b/x --set options.endpoint=https://minio.local:9000`"
                 )
             );
+            // An S3 website address is not an endpoint to set.
+            let e = storage_url("https://b.s3-website-us-east-1.amazonaws.com/k").unwrap_err();
+            assert_eq!(e.hint.as_deref(), Some(URL_EXAMPLES));
         }
+    }
+
+    /// A pasted address's signature (a pre-signed URL, a SAS token) and credentials never
+    /// appear in the error.
+    #[test]
+    fn a_web_address_error_never_repeats_its_secrets() {
+        let e = web_address(
+            "https://user:hunter2@minio.local:9000/b/x?X-Amz-Signature=deadbeef&sig=sastoken#frag",
+        );
+        let text = format!("{} {}", e.message, e.hint.as_deref().unwrap_or_default());
+        for secret in [
+            "hunter2",
+            "user:",
+            "deadbeef",
+            "sastoken",
+            "X-Amz-Signature",
+            "sig=",
+        ] {
+            assert!(!text.contains(secret), "{secret} in {text}");
+        }
+        assert!(
+            e.message.contains("https://minio.local:9000/b/x"),
+            "{}",
+            e.message
+        );
     }
 
     #[test]
