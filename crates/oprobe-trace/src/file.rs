@@ -1,13 +1,13 @@
 //! The `.oprobe` file a traced operator writes ([`crate::Handle::save`],
-//! [`crate::Snapshot::save`]): format `oprobe.trace/6`, which `oprobe show FILE` and the
+//! [`crate::Snapshot::save`]): format `oprobe.trace/7`, which `oprobe show FILE` and the
 //! workbench open like any other profile.
 //!
 //! It is one JSON document, so it can be read without oprobe:
 //!
 //! ```text
 //! {
-//!   "format": "oprobe.trace/6",
-//!   "oprobe_trace_version": "6.3.0",
+//!   "format": "oprobe.trace/7",
+//!   "oprobe_trace_version": "7.0.0",
 //!   "created_at": "2026-11-22T10:00:00Z",
 //!   "service": { "scheme": "s3", "name": "my-bucket", "root": "/data/" },   // optional
 //!   "snapshot": { … the aggregates: per API and stage, connections, bytes, timeline … },
@@ -15,7 +15,9 @@
 //! }
 //! ```
 //!
-//! The format is stable across 6.x: fields are only ever added.
+//! The format is stable across 7.x: fields are only ever added. `oprobe.trace/7` holds the
+//! application's operations (`rows.ops`), each request linked to the operation that issued it;
+//! an `oprobe.trace/6` file (requests only) still reads ([`TRACE_FORMATS_READ`]).
 
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
@@ -28,7 +30,10 @@ use crate::rows::{OpRow, ReqRow, TraceInfo};
 use crate::sample::SamplingStats;
 
 /// The `format` of a file written by `oprobe-trace`.
-pub const TRACE_FORMAT: &str = "oprobe.trace/6";
+pub const TRACE_FORMAT: &str = "oprobe.trace/7";
+
+/// The formats [`TraceFile`] reads: this one and 6.x files (requests without operations).
+pub const TRACE_FORMATS_READ: &[&str] = &[TRACE_FORMAT, "oprobe.trace/6"];
 
 /// The OpenDAL service the traced operator talks to, as the layer saw it (the first operator
 /// the layer was applied to). No options or credentials: the scheme, the service's name (the
@@ -109,7 +114,7 @@ pub(crate) fn write(
 #[derive(Clone, Debug, Deserialize)]
 #[cfg_attr(not(feature = "__internal"), allow(dead_code))]
 pub struct TraceFile {
-    /// Always [`TRACE_FORMAT`].
+    /// One of [`TRACE_FORMATS_READ`].
     pub format: String,
     pub oprobe_trace_version: String,
     pub created_at: String,
@@ -141,6 +146,7 @@ impl TraceFile {
     }
 
     /// Read a trace file. Fails on another format (an `oprobe.run` file, or a later major).
+    /// A 6.x file reads as it was written: requests, no operation rows.
     pub fn read(path: &Path) -> io::Result<TraceFile> {
         let f = std::fs::File::open(path)?;
         let file: TraceFile = serde_json::from_reader(io::BufReader::new(f))
@@ -156,13 +162,21 @@ impl TraceFile {
     }
 
     fn check_format(self, what: &str) -> io::Result<TraceFile> {
-        if self.format != TRACE_FORMAT {
+        if !Self::reads(&self.format) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("`{what}` is format `{}`, not `{TRACE_FORMAT}`", self.format),
+                format!(
+                    "`{what}` is format `{}`, not `{TRACE_FORMAT}` or `oprobe.trace/6`",
+                    self.format
+                ),
             ));
         }
         Ok(self)
+    }
+
+    /// Whether this version reads trace files of `format` ([`TRACE_FORMATS_READ`]).
+    pub fn reads(format: &str) -> bool {
+        TRACE_FORMATS_READ.contains(&format)
     }
 
     /// The sampled rows the file holds (empty when it was written from a bare snapshot).
@@ -194,5 +208,35 @@ impl TraceFile {
     /// Whether the file holds rows (written by [`crate::Handle::save`]).
     pub fn has_rows(&self) -> bool {
         self.rows.is_some()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn doc(format: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "format": format,
+            "oprobe_trace_version": "6.3.0",
+            "created_at": "2026-11-22T10:00:00Z",
+            "snapshot": Snapshot::default(),
+            "rows": { "ops": [], "reqs": [], "info": TraceInfo::default(),
+                      "sampling": SamplingStats::default() },
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn this_major_and_6x_files_read() {
+        assert_eq!(TRACE_FORMAT, "oprobe.trace/7");
+        for f in ["oprobe.trace/7", "oprobe.trace/6"] {
+            let t = TraceFile::from_slice(&doc(f), "x").unwrap();
+            assert_eq!(t.format, f);
+            assert!(t.has_rows());
+        }
+        let e = TraceFile::from_slice(&doc("oprobe.trace/8"), "x").unwrap_err();
+        assert!(e.to_string().contains("oprobe.trace/8"), "{e}");
+        assert!(TraceFile::from_slice(&doc("oprobe.run/6"), "x").is_err());
     }
 }

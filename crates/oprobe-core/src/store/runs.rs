@@ -550,19 +550,20 @@ fn json_document(path: &Path) -> Option<(Vec<u8>, String)> {
     Some((bytes, format.unwrap_or_default()))
 }
 
-/// Load a run file, a production trace written by `oprobe-trace` (`oprobe.trace/6`, whatever
-/// its extension: recognised by its content), or a report `.json` (without trace rows).
+/// Load a run file, a production trace written by `oprobe-trace` (`oprobe.trace/7`, or a 6.x
+/// `oprobe.trace/6`; whatever its extension: recognised by its content), or a report `.json`
+/// (without trace rows).
 pub fn load_path(path: &Path) -> Result<Run> {
     let doc = json_document(path);
     let format = doc.as_ref().map(|(_, f)| f.clone());
     if let Some((bytes, f)) = doc.filter(|(_, f)| f.starts_with("oprobe.trace/")) {
-        if f != crate::trace::TRACE_FORMAT {
+        if !crate::trace::TraceFile::reads(&f) {
             return Err(OprobeError::new(
                 ErrorCode::UsageInvalidArgument,
                 format!(
                     "`{}` is a trace of format `{f}`; this oprobe reads `{}`",
                     path.display(),
-                    crate::trace::TRACE_FORMAT
+                    crate::trace::TRACE_FORMATS_READ.join("` and `")
                 ),
             )
             .with_hint("open it with the oprobe release that matches the oprobe-trace version that wrote it")

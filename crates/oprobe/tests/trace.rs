@@ -104,7 +104,7 @@ async fn show_opens_a_production_trace_and_prove_refuses_it() {
     // Keys are hashed (docs/privacy.md): the first path segment, never the key.
     assert!(!text.contains("logs/k1"), "a key is in the file");
     let doc: Value = serde_json::from_str(&text).unwrap();
-    assert_eq!(doc["format"], "oprobe.trace/6");
+    assert_eq!(doc["format"], "oprobe.trace/7");
     assert_eq!(doc["service"]["scheme"], "s3");
     assert_eq!(doc["service"]["name"], "app-bucket");
     let reqs_in_file = doc["rows"]["reqs"].as_array().unwrap().len() as u64;
@@ -237,6 +237,106 @@ async fn show_opens_a_production_trace_and_prove_refuses_it() {
 
     // Nothing was stored: a trace is opened, not imported.
     assert!(!dir.path().join("data").join("runs").exists());
+}
+
+/// The `oprobe.trace/6` file `doc` (an `oprobe.trace/7` one) would have been: the same requests,
+/// with no operation rows (each request outside any operation) and no operation aggregates.
+fn as_trace_6(doc: &Value) -> Value {
+    let mut d = doc.clone();
+    d["format"] = "oprobe.trace/6".into();
+    d["oprobe_trace_version"] = "6.3.0".into();
+    d["rows"]["ops"] = Value::Array(Vec::new());
+    for r in d["rows"]["reqs"].as_array_mut().unwrap() {
+        r["op_id"] = 0.into();
+        r["attempt"] = 1.into();
+        if let Some(x) = r.get_mut("detail").and_then(Value::as_object_mut) {
+            x.remove("range_bytes");
+            x.remove("temporary");
+        }
+    }
+    let s = &mut d["snapshot"];
+    s["verbs"] = Value::Array(Vec::new());
+    s["slow_ops"] = Value::Array(Vec::new());
+    s["dimensions"] = Value::Null;
+    s["summary"]["ops_count"] = 0.into();
+    s["summary"]["failed_ops_count"] = 0.into();
+    s["resilience"]["retries_count"] = 0.into();
+    s["resilience"]["retry_backoff_ms"] = 0.0.into();
+    d
+}
+
+/// 6.x trace files still open (design v7 §5): requests only, each one standing in for an
+/// operation, as 6.x showed them, and said so.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_6x_trace_still_opens() {
+    let dir = tempfile::tempdir().unwrap();
+    let v7 = dir.path().join("v7.oprobe");
+    let throttle = LabConfig {
+        throttle_every_n_requests: Some(5),
+        throttle_status_code: 503,
+        ..Default::default()
+    };
+    let served = traced_workload(&v7, throttle, oprobe::trace::Config::default(), 2).await;
+    let doc: Value = serde_json::from_str(&std::fs::read_to_string(&v7).unwrap()).unwrap();
+    let file = dir.path().join("v6.oprobe");
+    std::fs::write(&file, serde_json::to_vec(&as_trace_6(&doc)).unwrap()).unwrap();
+    let f = file.to_str().unwrap();
+    let o = oprobe(dir.path(), &["show", f, "-o", "json"]);
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let v = json(&o);
+    let r = &v["report"];
+    validate("report", r);
+    assert_eq!(r["run"]["source"], "trace");
+    assert_eq!(r["run"]["oprobe_version"], "6.3.0");
+    // Every request stands in for an operation, and the report says so.
+    let requests = r["connections"]["requests_count"].as_u64().unwrap();
+    assert_eq!(requests, served);
+    assert_eq!(r["summary"]["ops_count"].as_u64().unwrap(), requests);
+    assert_eq!(v["ops_count"], 0);
+    assert!(
+        r["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w.as_str().unwrap().starts_with("production trace:")),
+        "{:#}",
+        r["warnings"]
+    );
+    let findings = r["findings"].as_array().unwrap();
+    assert!(
+        findings
+            .iter()
+            .any(|f| ["throttling", "rate_limit", "key_limit"]
+                .contains(&f["code"].as_str().unwrap())),
+        "{findings:#?}"
+    );
+    for f in findings {
+        let code = f["code"].as_str().unwrap();
+        assert!(
+            oprobe::model::trace_file::TRACE_FINDINGS.contains(&code),
+            "{code} needs operations or a varied load"
+        );
+        assert!(
+            f["evidence"]["op_ids"]
+                .as_array()
+                .unwrap_or(&vec![])
+                .is_empty()
+        );
+    }
+    // A later major is refused, with a hint.
+    let mut d = doc.clone();
+    d["format"] = "oprobe.trace/8".into();
+    let file = dir.path().join("v8.oprobe");
+    std::fs::write(&file, serde_json::to_vec(&d).unwrap()).unwrap();
+    let o = oprobe(dir.path(), &["show", file.to_str().unwrap(), "-o", "json"]);
+    assert_eq!(o.status.code(), Some(2));
+    let e = json(&o);
+    assert_eq!(e["error"]["code"], "usage.invalid_argument");
 }
 
 /// Stragglers and connections dialled for every request show in a trace's findings too:

@@ -27,7 +27,7 @@
 //! - [`layer`] returns the [`TraceLayer`] to add to an operator and a [`Handle`] to read it.
 //! - [`Handle::snapshot`] returns the aggregates so far ([`Snapshot`]): per API and stage, per
 //!   verb, connections, bytes and a timeline.
-//! - [`Handle::save`] and [`Snapshot::save`] write a `.oprobe` file (format `oprobe.trace/6`).
+//! - [`Handle::save`] and [`Snapshot::save`] write a `.oprobe` file (format `oprobe.trace/7`).
 //! - [`Exporter`] receives every request as it completes; with the `otel` feature,
 //!   [`otel::OtelExporter`] turns them into OpenTelemetry metrics
 //!   (`http.client.request.duration` with `oprobe.stage` and `oprobe.api`).
@@ -46,7 +46,7 @@
 //! # Stability
 //!
 //! The items documented here, the `.oprobe` format and the meaning of every field are stable
-//! across 6.x: changes are additive, and public structs and enums are `#[non_exhaustive]`. The
+//! across 7.x: changes are additive, and public structs and enums are `#[non_exhaustive]`. The
 //! `__internal` feature exists for the oprobe binary only and carries no semver promise.
 
 // Half of the recorder (operation scopes, the whole-operation sampler, key dimensions, the
@@ -101,7 +101,7 @@ pub use snapshot::{
     TimelinePoint, VerbInterval, VerbStats,
 };
 
-internal_use!(file::{ServiceRecord, TRACE_FORMAT, TraceFile});
+internal_use!(file::{ServiceRecord, TRACE_FORMAT, TRACE_FORMATS_READ, TraceFile});
 internal_use!(layer::{InProcessObserveLayer, TraceContextLayer});
 internal_use!(observe::{Linker, OperationObserveLayer, error_class, private_key});
 internal_use!(log::{DEFAULT_MAX_REQUESTS, TraceLog, TraceRows});

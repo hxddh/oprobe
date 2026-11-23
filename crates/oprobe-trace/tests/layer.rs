@@ -54,7 +54,7 @@ async fn a_memory_operator_reports_its_requests() {
     let path = temp_file("requests");
     handle.save(&path).unwrap();
     let doc = read_json(&path);
-    assert_eq!(doc["format"], "oprobe.trace/6");
+    assert_eq!(doc["format"], "oprobe.trace/7");
     assert_eq!(doc["oprobe_trace_version"], env!("CARGO_PKG_VERSION"));
     // The service the layer was applied to (no options, no credentials).
     assert_eq!(doc["service"]["scheme"], "memory");
@@ -122,7 +122,7 @@ async fn a_snapshot_saves_without_rows() {
     let path = temp_file("snapshot");
     handle.snapshot().save(&path).unwrap();
     let doc = read_json(&path);
-    assert_eq!(doc["format"], "oprobe.trace/6");
+    assert_eq!(doc["format"], "oprobe.trace/7");
     assert!(doc.get("rows").is_none());
     assert_eq!(doc["snapshot"]["apis"][0]["api"], "PutObject");
 }

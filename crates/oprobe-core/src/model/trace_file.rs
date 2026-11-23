@@ -1,4 +1,4 @@
-//! A production trace as a [`Run`]: the `oprobe.trace/6` file an application writes with the
+//! A production trace as a [`Run`]: the `oprobe.trace/7` file an application writes with the
 //! embedded `oprobe-trace` layer (`Handle::save`, `Snapshot::save`), built into a report by the
 //! same builder as a run ([`super::build_run`]), and marked for what it is (design v6 §2: the
 //! workbench opens it like any other profile).
