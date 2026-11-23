@@ -1101,9 +1101,9 @@ fn examples(m: &ProfileModel, f: &FindingRow) -> Option<View> {
                 btn(
                     move || -> SharedString {
                         if open.get() {
-                            tr("finding.hide_examples").into()
+                            tr("profile.hide_examples").into()
                         } else {
-                            fill("finding.examples", &[&n]).into()
+                            fill("profile.examples", &[&n]).into()
                         }
                     },
                     || Kind::Plain,

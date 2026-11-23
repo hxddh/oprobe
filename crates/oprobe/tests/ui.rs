@@ -628,6 +628,8 @@ fn quitting_during_a_run_asks_first() {
     assert!(has(&app, "id:stop"));
     app.press("id:stop").unwrap();
     app.wait_for_gone("id:stop", LONG).unwrap();
+}
+
 /// A run long enough to brush: three seconds of a lab scenario (several verbs).
 fn seed_long(cx: &Ctx, operator: &str) -> String {
     let app = App::new(cx.paths());
