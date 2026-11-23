@@ -36,7 +36,7 @@ a `hint:` line. `--dry-run` shows the plan without sending a request.
 ## Error codes
 
 Every error carries one of these codes. The exit code follows the class: `2` usage/config, `1`
-runtime, `3` prove refuted, `4` budget, `5` safety refusal, `130` interrupted.
+runtime, `3` the proven change is worse, `4` budget, `5` safety refusal, `130` interrupted.
 
 <a id="usage-invalid_argument"></a>
 ### `usage.invalid_argument` (exit 2)
@@ -55,7 +55,7 @@ in the config file, or no operator was given. The hint lists the configured name
 ### `usage.unknown_run` (exit 2)
 
 No stored run matches the reference. `oprobe show --list`; use more characters of the id,
-`last`, `last~N`, a label, or a path to a `.oprobe` file.
+`last`, `last~N`, or a path to a `.oprobe` file.
 
 <a id="usage-unknown_baseline"></a>
 ### `usage.unknown_baseline` (exit 2)
@@ -170,14 +170,14 @@ lab limit.
 <a id="run-sla_failed"></a>
 ### `run.sla_failed` (exit 3)
 
-A 5.x SLA check failed. oprobe 6 reports failures as findings; exit 3 now means that `prove`
-refuted the change.
+A 5.x SLA check failed. oprobe 6 has no SLA: it reports failures as findings, and `--set sla…`
+is refused. Exit 3 now means that `prove` found the change worse on the objective.
 
 <a id="run-regression"></a>
 ### `run.regression` (exit 3)
 
-The change made things worse on the objective: `prove` refuted it. Read the evidence (the A/B
-pairs and the secondary metrics); try another value with `--with`.
+The change made things worse on the objective: `prove`'s verdict is `worse`. Read the evidence
+(the trials and the secondary metrics); try another value with `--with`.
 
 <a id="run-interrupted"></a>
 ### `run.interrupted` (exit 130, retryable)

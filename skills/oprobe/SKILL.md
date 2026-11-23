@@ -19,7 +19,8 @@ repository's `schemas/` (`report`, `prove`, `run-list`, `operator`, `error`, `ev
 2. **Plan first**: `oprobe run OPERATOR --dry-run -o json` shows requests, bytes, objects written
    and deleted, and the ETA. Tell the user before anything non-trivial.
 3. **Always set budgets** on real storage: `--max-requests`, `--max-bytes`, `--max-duration`
-   (exit 4, `safety.budget_exceeded`; the partial run is saved). `prove` takes `--budget`.
+   (exit 4, `safety.budget_exceeded`; the partial run is saved). For `prove`, `--max-duration`
+   is the wall-time budget of the whole proof.
 4. **Parse JSON, not text**: `-o json`. Branch on exit codes and `error.code`, never on prose.
 5. Never pass credentials in arguments: they come from the environment (`AWS_*`,
    `GOOGLE_APPLICATION_CREDENTIALS`, `AZURE_STORAGE_*`) or from `[options]` in an operator file
@@ -37,7 +38,7 @@ oprobe run s3://bucket/prefix --existing data/ -c 16 -d 15s \
 oprobe run s3://bucket/prefix --existing data/ -c 16 -d 15s \
   --max-requests 20000 --max-duration 1m -o json            # profile (saves the run)
 oprobe show last --by stage -o json                   # where the time went, per stage
-oprobe prove last throttling --budget 5m -o json      # A/B-test the finding's remedy
+oprobe prove last throttling --max-duration 5m -o json   # A/B-test the finding's remedy
 oprobe prove last --with layers.tail_cut=on --objective p99 -o json   # a change of your own
 oprobe show --list -o json                            # history (prove trials hidden)
 oprobe show prod.oprobe -o json                       # a profile written by oprobe-trace
@@ -49,7 +50,7 @@ oprobe show prod.oprobe -o json                       # a profile written by opr
 race on the same workload. Workload: `--preset small-files|large-objects|range-reads|list-stat`,
 `-c`, `-d`, `--objects`, `--object-size`, `--rate`, `--seed`, `--existing PREFIX`.
 
-`RUN` is a run id, an id prefix, `last`, `last~N` or a label.
+`RUN` is a run id, an id prefix, `last` or `last~N`.
 
 ## Reading results
 
@@ -67,7 +68,7 @@ race on the same workload. Workload: `--preset small-files|large-objects|range-r
   `objective_delta` (estimate with interval), `pairs_count`, `secondary[]` (shown, never
   decisive) and `diff` with the change as `rust` and `toml`. Hand the user the diff.
 
-Exit codes: 0 ok · 1 runtime · 2 usage · 3 prove refuted (worse on the objective) · 4 budget ·
+Exit codes: 0 ok · 1 runtime · 2 usage · 3 prove: the change is worse on the objective · 4 budget ·
 5 safety refusal · 130 interrupted. Errors: `{"type":"error","error":{"code","message","hint",
 "retryable","docs"}}`.
 

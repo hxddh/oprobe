@@ -85,7 +85,7 @@ Each finding carries the evidence it rests on:
 | `errors` | failed operations per second |
 
 **Operator.** The run's layer stack beside each finding's remedy. Toggle a layer or change a value
-(a limit, a chunk size), then press **Prove**: the A/B pairs stream in live and are drawn as they
+(a limit, a chunk size), then press **Prove**: the trials stream in live and are drawn as they
 converge: each pair's change as a dot, the running estimate with its 95 % interval narrowing, and
 the A/A noise floor around no change, until the sequential test decides. **Copy** puts the winning diff (Rust
 or TOML) on the clipboard.

@@ -31,18 +31,39 @@ and proves that change with an interleaved A/B test on the objective you care ab
 curl -fsSL https://github.com/hxddh/oprobe/releases/latest/download/install.sh | sh
 
 oprobe demo                      # profile a misbehaving S3 lab on your laptop: no account needed
-oprobe prove last throttling     # A/B-test the remedy of the throttling finding
+oprobe prove last                # A/B-test the remedy of the top finding (about a minute)
 oprobe                           # the app: runs, profile, operator, compare
 ```
 
 `oprobe demo` is `oprobe run lab://demo`: a local S3 that throttles above 24 requests in flight and
-turns some requests into stragglers. The brief names at most three findings, each with its remedy
-as an `op.toml` path, and the next command. `prove` ends with the diff, for example:
+makes every 40th request a straggler that waits 250 ms. The brief names at most three findings,
+each with its remedy as an `op.toml` path, and the next command:
 
 ```text
-proved on goodput: +31 % [+27, +35], p99 −42 %, 0 throttled (4 A/B pairs)
-+ ConcurrentLimitLayer::new(24)
-~ RetryLayer::new().with_jitter().with_max_times(4)
+[Attention] 2.4% of GetObject requests wait far longer for the server's first byte than their peers
+  (stragglers).
+  lab://demo · small-files · 8.0 s · run 20261123-063611-3d82
+  ▲ 1 tail_stragglers (high confidence) — 2.4% of GetObject requests wait far longer for the
+      server's first byte than their peers (stragglers).
+      …
+      next: oprobe prove 20261123-063611-3d82 tail_stragglers
+  ▲ 2 throttling (medium confidence) — The service throttled 0.1% of requests (429/503).
+      …
+  1425.0 ops/s · 80.1 MiB/s · p50 10.0ms · p99 261ms · errors 0.00% · 0.14% of requests throttled
+```
+
+`prove last` runs trials of the current operator (A) and of the remedy (B), interleaved, and ends
+with the diff (this run took 60 s):
+
+```text
+improved on goodput: +34.4 % [+19.5, +51.1] (3 pairs of trials, noise ±2.0 %) · lab://demo (local lab)
+secondary (not decisive): p99 -67.8 % [-69.4, -66.2] · throttled 0.27 % → 4.54 % · errors 0.00 % → 0.02 %
++ TailCutLayer::builder().safety_factor(1.5).min_samples(32).min_deadline(Duration::from_millis(50)).max_deadline(Duration::from_secs(60)).build()
+~ RetryLayer::new().with_min_delay(Duration::from_millis(20))
+op.toml:
+[layers]
+retry = { min_delay = "20ms" }
+tail_cut = true
 ```
 
 Then point it at your own storage:
@@ -54,12 +75,13 @@ oprobe run s3://a/x r2://b/x fs:///nvme/x         # several operators, one workl
 ```
 
 Writes go under a fresh `oprobe-run-<id>/` prefix and are cleaned up; `--dry-run` prints the plan,
-`--read-only` refuses every write, and `--max-requests/--max-bytes/--max-duration` are hard budgets.
+`--read-only` refuses every write, and `--max-requests/--max-bytes/--max-duration` are hard budgets
+(for `prove`, `--max-duration` is the wall-time budget of the whole proof).
 
 ## Your operator: `op.toml`
 
 The unit of everything is the OpenDAL `Operator`: a service, a layer stack, and read/write options.
-oprobe reads it from a URL, from a file, or from `[operators.NAME]` in its config file.
+oprobe reads it from a URL or from a file, `op.toml` (the recommended way to describe yours).
 
 ```toml
 url = "s3://bucket/prefix"
@@ -117,14 +139,14 @@ observed). Memory stays bounded, the overhead is benchmarked (budget ≤ 2 µs p
 Run `oprobe` with no arguments: a native window when there is a display, the same app in your
 terminal otherwise (also over SSH). Four views: **Runs**, **Profile** (verdict, where the time
 went, the request waterfall of the slowest operations, timeline, heatmap), **Operator** (your layer
-stack beside each remedy: toggle a layer, press *Prove*, watch the A/B pairs stream in, copy the
+stack beside each remedy: toggle a layer, press *Prove*, watch the trials stream in, copy the
 diff) and **Compare**. It speaks 简体中文 and English. [More →](docs/app.md)
 
 ## For scripts and agents
 
 Every command prints one JSON document with `-o json` (stdout carries only the result; progress
-goes to stderr), errors carry stable codes and exit codes (0 ok · 1 runtime · 2 usage · 3 prove
-refuted · 4 budget · 5 safety · 130 interrupted), and the JSON Schemas are in [`schemas/`](schemas).
+goes to stderr), errors carry stable codes and exit codes (0 ok · 1 runtime · 2 usage · 3 prove: worse
+· 4 budget · 5 safety · 130 interrupted), and the JSON Schemas are in [`schemas/`](schemas).
 Agents: [`skills/oprobe/SKILL.md`](skills/oprobe/SKILL.md) and [llms.txt](llms.txt).
 
 ## Install
