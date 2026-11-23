@@ -2962,7 +2962,7 @@
         },
         {
           "const": "trace",
-          "description": "A production trace written by the `oprobe-trace` layer (`oprobe.trace/6`): the\napplication's own traffic, with no workload to replay.",
+          "description": "A production trace written by the `oprobe-trace` layer (`oprobe.trace/7`, or a 6.x\n`oprobe.trace/6`): the application's own traffic, with no workload to replay.",
           "type": "string"
         }
       ]
