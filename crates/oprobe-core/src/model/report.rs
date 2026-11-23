@@ -487,6 +487,17 @@ impl VerdictLevel {
             Self::Critical => "critical",
         }
     }
+
+    /// How text output names the level: `OK`, `Review`, `Attention`, `Critical` (JSON keeps
+    /// [`Self::as_str`]).
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Ok => "OK",
+            Self::Review => "Review",
+            Self::Attention => "Attention",
+            Self::Critical => "Critical",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -790,6 +801,7 @@ pub fn evidence_label(key: &str, v: f64) -> (String, String) {
         "overread_ratio" => Some("Over-read"),
         "ttfb_pct" => Some("Time waiting for the first byte"),
         "retry_pct" => Some("Time in retry backoff"),
+        "time_cost_ratio" => Some("Share of the time it costs"),
         "queue_pct" => Some("Time queued"),
         "connect_pct" => Some("Time connecting"),
         "reuse_pct" => Some("Connection reuse"),

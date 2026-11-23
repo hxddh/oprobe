@@ -520,11 +520,14 @@ fn throttle_family(c: &Ctx) -> (Option<Finding>, bool) {
             h.explains_ratio * 100.0
         );
     }
+    let backoff_share = r.stages.shares.retry_pct / 100.0;
+    let failed_ratio = out_of_retries as f64 / r.summary.ops.max(1) as f64;
     let mut vals = vec![
         ("throttled_responses_count", thr as f64),
         ("throttled_request_ratio", req_ratio),
         ("retry_pct", r.stages.shares.retry_pct),
         ("rate_limited_failures_count", out_of_retries as f64),
+        (COST_KEY, backoff_share),
     ];
     // The fitted limit is evidence (JSON), not advice: prove sizes the remedy.
     if let Some(h) = &sel {
@@ -557,11 +560,7 @@ fn throttle_family(c: &Ctx) -> (Option<Finding>, bool) {
     (
         Some(Finding {
             code: code.into(),
-            severity: if req_ratio >= 0.01 || out_of_retries > 0 {
-                Severity::Critical
-            } else {
-                Severity::Warning
-            },
+            severity: throttle_severity(failed_ratio, backoff_share, r.sla.max_error_ratio),
             confidence,
             cause,
             evidence: Evidence {
@@ -574,6 +573,53 @@ fn throttle_family(c: &Ctx) -> (Option<Finding>, bool) {
         }),
         false,
     )
+}
+
+/// Evidence value of the share of operation time a finding costs (retry backoff for the
+/// throttle family, the stragglers' wait beyond a typical request for `tail_stragglers`): it
+/// orders findings of one severity.
+pub const COST_KEY: &str = "time_cost_ratio";
+
+/// Backoff share of operation time from which throttling is critical.
+const CRITICAL_BACKOFF_RATIO: f64 = 0.5;
+/// Backoff share of operation time from which throttling is worth a warning.
+const WARNING_BACKOFF_RATIO: f64 = 0.05;
+
+/// The severity of throttling by its cost, not its presence (6.3): critical when more
+/// operations failed out of retries than the run allows, or when half the operation time is
+/// retry backoff; a warning when some operations failed or the backoff is a noticeable share;
+/// otherwise informational (a few 429/503 that retries absorbed at no cost).
+pub fn throttle_severity(failed_ratio: f64, backoff_share: f64, max_error_ratio: f64) -> Severity {
+    if failed_ratio > max_error_ratio || backoff_share >= CRITICAL_BACKOFF_RATIO {
+        Severity::Critical
+    } else if failed_ratio > 0.0 || backoff_share >= WARNING_BACKOFF_RATIO {
+        Severity::Warning
+    } else {
+        Severity::Info
+    }
+}
+
+/// The share of operation time `f` costs ([`COST_KEY`]; 0 when not estimated).
+fn cost_ratio(f: &Finding) -> f64 {
+    f.evidence
+        .values
+        .get(COST_KEY)
+        .copied()
+        .filter(|v| v.is_finite())
+        .unwrap_or(0.0)
+}
+
+/// Most severe first; within one severity, a saturated client first (it makes the others'
+/// timing unreliable), then the costliest (a stable sort: findings that estimate no cost keep
+/// their order).
+pub fn rank(findings: &mut [Finding]) {
+    let client = |f: &Finding| f.code == "client_bound";
+    findings.sort_by(|a, b| {
+        b.severity
+            .cmp(&a.severity)
+            .then(client(b).cmp(&client(a)))
+            .then(cost_ratio(b).total_cmp(&cost_ratio(a)))
+    });
 }
 
 fn bandwidth_cap(c: &Ctx) -> Option<Finding> {
@@ -689,6 +735,28 @@ fn tail_stragglers(c: &Ctx) -> Option<Finding> {
         .map(|q| q.ttfb_us)
         .collect();
     let typ = quantile_us_ms(&mut typical, 0.5);
+    // What the stragglers cost: the wait beyond a typical request of every request that waits
+    // for its first byte past the deadline (whatever its API), as a share of all request time.
+    let deadline = replay.deadline_us.unwrap_or(u64::MAX);
+    let mut ttfb_all: Vec<u64> = run
+        .reqs
+        .iter()
+        .filter(|q| !q.is_error())
+        .map(|q| q.ttfb_us)
+        .collect();
+    let typ_all_us = quantile_us_ms(&mut ttfb_all, 0.5) * 1000.0;
+    let excess: f64 = run
+        .reqs
+        .iter()
+        .filter(|q| !q.is_error() && q.total_us > deadline && dominant_stage(q) == "ttfb")
+        .map(|q| (q.total_us as f64 - typ_all_us).max(0.0))
+        .sum();
+    let total: f64 = run
+        .reqs
+        .iter()
+        .map(|q| q.total_us as f64)
+        .sum::<f64>()
+        .max(1.0);
     Some(Finding {
         code: "tail_stragglers".into(),
         severity: Severity::Warning,
@@ -716,6 +784,7 @@ fn tail_stragglers(c: &Ctx) -> Option<Finding> {
                 ("p50_ms", p50),
                 ("p99_ms", p99),
                 ("replayed_p99_ms", replay.prediction.predicted),
+                (COST_KEY, excess / total),
             ]),
             op_ids: slowest_ops(run, over.iter().map(|q| q.op_id)),
             windows: Vec::new(),
@@ -1174,7 +1243,7 @@ pub fn derive(run: &Run) -> Vec<Finding> {
         });
         out.insert(0, cb);
     }
-    out.sort_by_key(|f| std::cmp::Reverse(f.severity));
+    rank(&mut out);
     for f in &mut out {
         f.remedy.next = Some(next_command(&r.run.id, f));
     }
@@ -1268,7 +1337,7 @@ pub fn validity(r: &Report, findings: Vec<Finding>) -> (Vec<Finding>, Validity) 
             remedy: rem,
         });
     }
-    out.sort_by_key(|f| std::cmp::Reverse(f.severity));
+    rank(&mut out);
     (out, v)
 }
 
@@ -1276,6 +1345,48 @@ pub fn validity(r: &Report, findings: Vec<Finding>) -> (Vec<Finding>, Validity) 
 pub(crate) mod tests {
     use super::*;
     use crate::analysis::simulate::tests::straggler_run;
+
+    /// Throttling is judged by what it costs: failed operations and retry backoff, not the
+    /// mere presence of 429/503 (the demo's 0.3 % throttled requests absorbed by retries).
+    #[test]
+    fn throttling_severity_follows_its_cost() {
+        let max = 0.01;
+        assert_eq!(throttle_severity(0.0, 0.01, max), Severity::Info);
+        assert_eq!(throttle_severity(0.0, 0.2, max), Severity::Warning);
+        assert_eq!(throttle_severity(0.001, 0.0, max), Severity::Warning);
+        assert_eq!(throttle_severity(0.02, 0.0, max), Severity::Critical);
+        assert_eq!(throttle_severity(0.0, 0.7, max), Severity::Critical);
+    }
+
+    #[test]
+    fn findings_of_one_severity_rank_by_cost() {
+        let f = |code: &str, sev, cost: Option<f64>| Finding {
+            code: code.into(),
+            severity: sev,
+            evidence: Evidence {
+                values: cost.map(|c| values(&[(COST_KEY, c)])).unwrap_or_default(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut v = vec![
+            f("errors", Severity::Warning, None),
+            f("throttling", Severity::Warning, Some(0.15)),
+            f("tail_stragglers", Severity::Warning, Some(0.4)),
+            f("cold_connections", Severity::Critical, None),
+        ];
+        rank(&mut v);
+        let codes: Vec<&str> = v.iter().map(|f| f.code.as_str()).collect();
+        assert_eq!(
+            codes,
+            [
+                "cold_connections",
+                "tail_stragglers",
+                "throttling",
+                "errors"
+            ]
+        );
+    }
 
     /// A complete, empty report as JSON (every field present).
     pub(crate) fn empty_report_json() -> serde_json::Value {
@@ -1375,6 +1486,8 @@ pub(crate) mod tests {
     fn throttled(kind: HypothesisKind, explains: f64, conf: Confidence) -> Run {
         let mut run = base();
         run.report.resilience.throttled_responses = 100;
+        // Throttling that costs: most of the operation time is retry backoff (critical).
+        run.report.stages.shares.retry_pct = 60.0;
         run.report.capacity.hypotheses = vec![Hypothesis {
             kind,
             explains_ratio: explains,

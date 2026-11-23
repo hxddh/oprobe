@@ -348,15 +348,22 @@ pub fn slowest(run: &Run, n: usize) -> Vec<WaterfallOp> {
         .collect()
 }
 
-/// The per-second series of the window.
+/// The series of the window, one entry per interval (1 s for the first ten minutes, 10 s
+/// afterwards: `len_s`).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct TimelineView {
     pub t_s: Vec<f64>,
+    /// Length of each interval (seconds).
+    pub len_s: Vec<f64>,
     pub ops_per_s: Vec<f64>,
     pub mib_per_s: Vec<f64>,
     pub p50_ms: Vec<f64>,
     pub p99_ms: Vec<f64>,
+    pub p999_ms: Vec<f64>,
+    pub max_ms: Vec<f64>,
+    /// Throttled requests (or operations, as the recorder counts them) in each interval.
     pub throttled_count: Vec<u64>,
+    /// Failed operations in each interval.
     pub errors_count: Vec<u64>,
     pub inflight_peak_count: Vec<u64>,
     pub new_connections_count: Vec<u64>,
@@ -367,16 +374,77 @@ impl TimelineView {
         let mut v = Self::default();
         for p in &r.timeline {
             v.t_s.push(p.t_s);
+            v.len_s.push(if p.len_s > 0.0 { p.len_s } else { 1.0 });
             v.ops_per_s.push(p.ops_per_s);
             v.mib_per_s.push(p.mib_per_s);
             v.p50_ms.push(p.p50_ms);
             v.p99_ms.push(p.p99_ms);
+            v.p999_ms.push(p.p999_ms);
+            v.max_ms.push(p.max_ms);
             v.throttled_count.push(p.throttled);
             v.errors_count.push(p.errors);
             v.inflight_peak_count.push(p.inflight_peak);
             v.new_connections_count.push(p.new_connections);
         }
         v
+    }
+
+    pub fn len(&self) -> usize {
+        self.t_s.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.t_s.is_empty()
+    }
+
+    /// At most `max_rows` rows: consecutive intervals merged into rows of equal count. Rates are
+    /// averaged over time, counts summed, p50 averaged, and p99, p99.9 and max are the worst
+    /// interval's (a merged row never hides a spike). Returns the series and how many intervals
+    /// each row merges.
+    pub fn downsample(&self, max_rows: usize) -> (Self, usize) {
+        let n = self.len();
+        let k = n.div_ceil(max_rows.max(1)).max(1);
+        if k == 1 {
+            return (self.clone(), 1);
+        }
+        let mut v = Self::default();
+        let mut i = 0;
+        while i < n {
+            let j = (i + k).min(n);
+            let r = i..j;
+            let len: f64 = self.len_s[r.clone()].iter().sum();
+            let tw = |x: &[f64]| -> f64 {
+                x[r.clone()]
+                    .iter()
+                    .zip(&self.len_s[r.clone()])
+                    .map(|(a, l)| a * l)
+                    .sum::<f64>()
+                    / len.max(1e-9)
+            };
+            let worst = |x: &[f64]| x[r.clone()].iter().copied().fold(0.0, f64::max);
+            let sum = |x: &[u64]| x[r.clone()].iter().sum::<u64>();
+            v.t_s.push(self.t_s[i]);
+            v.len_s.push(len);
+            v.ops_per_s.push(tw(&self.ops_per_s));
+            v.mib_per_s.push(tw(&self.mib_per_s));
+            v.p50_ms.push(tw(&self.p50_ms));
+            v.p99_ms.push(worst(&self.p99_ms));
+            v.p999_ms.push(worst(&self.p999_ms));
+            v.max_ms.push(worst(&self.max_ms));
+            v.throttled_count.push(sum(&self.throttled_count));
+            v.errors_count.push(sum(&self.errors_count));
+            v.inflight_peak_count.push(
+                self.inflight_peak_count[r.clone()]
+                    .iter()
+                    .copied()
+                    .max()
+                    .unwrap_or(0),
+            );
+            v.new_connections_count
+                .push(sum(&self.new_connections_count));
+            i = j;
+        }
+        (v, k)
     }
 }
 
@@ -1282,6 +1350,36 @@ impl SpreadView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_long_timeline_is_downsampled_without_hiding_spikes() {
+        let n = 900;
+        let t = TimelineView {
+            t_s: (0..n).map(|i| i as f64).collect(),
+            len_s: vec![1.0; n],
+            ops_per_s: vec![100.0; n],
+            mib_per_s: vec![1.0; n],
+            p50_ms: vec![5.0; n],
+            p99_ms: (0..n).map(|i| if i == 451 { 900.0 } else { 9.0 }).collect(),
+            p999_ms: vec![10.0; n],
+            max_ms: vec![12.0; n],
+            throttled_count: vec![1; n],
+            errors_count: vec![0; n],
+            inflight_peak_count: vec![4; n],
+            new_connections_count: vec![0; n],
+        };
+        let (d, k) = t.downsample(60);
+        assert_eq!(k, 15);
+        assert_eq!(d.len(), 60);
+        assert_eq!(d.len_s[0], 15.0);
+        assert_eq!(d.t_s[1], 15.0);
+        assert!((d.ops_per_s[0] - 100.0).abs() < 1e-9);
+        assert_eq!(d.throttled_count[0], 15);
+        // The 900 ms second survives the merge.
+        assert_eq!(d.p99_ms[30], 900.0);
+        let (same, k) = t.downsample(1000);
+        assert_eq!((same.len(), k), (n, 1));
+    }
 
     #[test]
     fn the_profile_view_covers_every_section_of_the_fixture() {

@@ -262,23 +262,8 @@ impl RunSpec {
             }
             sets.push((c.path, v));
         }
-        let s = &p.sla;
-        let ds_ = &def.sla;
-        if !s.enforce {
-            sets.push(("sla".into(), "none".into()));
-        }
-        if s.max_error_rate != ds_.max_error_rate {
-            sets.push(("max_error_rate".into(), s.max_error_rate.to_string()));
-        }
-        if let Some(t) = s.max_throttle_rate {
-            sets.push(("max_throttle_rate".into(), t.to_string()));
-        }
-        if let Some(ms) = s.p99_ms {
-            sets.push(("p99_ms".into(), ms.to_string()));
-        }
-        if let Some(l) = &self.label {
-            sets.push(("label".into(), l.clone()));
-        }
+        // The 5.x SLA keys and the run label are no longer flags (6.3): a command never
+        // names them, whatever an older run stored.
         for (k, v) in sets {
             flag("--set", Some(format!("{k}={v}")));
         }
@@ -752,6 +737,15 @@ impl Overrides {
             return Ok(self);
         }
         let sk = set_key(&k)?;
+        if sk.section == Section::Sla {
+            return Err(input::invalid(format!(
+                "`--set {}` was removed: oprobe 6 has no SLA",
+                sk.name
+            ))
+            .with_hint(
+                "drop it; findings judge a run, and prove's --max-throttle bounds the throttling a sized change may cause",
+            ));
+        }
         let mut p = Profile::from_url("memory://");
         apply_one(&mut p, &mut None, sk, &v)?;
         match sk.section {
@@ -1011,5 +1005,26 @@ mod tests {
             let e = Overrides::parse(&[bad]).unwrap_err();
             assert_eq!(e.code, ErrorCode::UsageInvalidArgument, "{bad}");
         }
+    }
+
+    /// The 5.x SLA keys are refused with a clear error, and a command never names them.
+    #[test]
+    fn sla_keys_are_refused() {
+        for bad in [
+            "sla=none",
+            "max_error_rate=0.1",
+            "max_throttle_rate=0.01",
+            "p99_ms=50",
+        ] {
+            let e = Overrides::parse(&[bad]).unwrap_err();
+            assert_eq!(e.code, ErrorCode::UsageInvalidArgument, "{bad}");
+            assert!(e.message.contains("no SLA"), "{bad}: {}", e.message);
+            assert!(e.hint.is_some());
+        }
+        let mut p = Profile::from_url("memory://");
+        p.sla.enforce = false;
+        p.sla.p99_ms = Some(50.0);
+        let cmd = RunSpec::new(&p, "memory://").command();
+        assert!(!cmd.contains("sla") && !cmd.contains("p99_ms"), "{cmd}");
     }
 }

@@ -7,7 +7,7 @@
 //!    within [`KNEE_RATIO`] of the best — subject to `--max-throttle`.
 //! 3. **A/B test**: interleaved A B A B trials with a sequential test ([`Sprt`]) on the
 //!    objective against a noise floor learned from the A/A spread, until a decision, the
-//!    pair limit or `--budget`.
+//!    pair limit or the wall-time budget (`--max-duration`).
 //! 4. **Decide**: `improved | worse | inconclusive` on the objective (goodput = successful
 //!    operations per second, or p99). Intervals are log-ratio (never below −100 %) and
 //!    Wilson/Newcombe for shares; secondary metrics are shown, never decisive.
@@ -113,7 +113,8 @@ pub struct ProveRequest {
     pub objective: ProveObjective,
     /// Share of throttled requests a sized value may cause (default 0.001)
     pub max_throttle_ratio: Option<f64>,
-    /// Wall-time budget of the whole proof, e.g. 5m
+    /// Wall-time budget of the whole proof, e.g. 5m (`safety.max_duration` when unset): no
+    /// trial starts that would not end within it
     pub budget: Option<String>,
     /// A/B pairs at most (3–12; at least 3 are needed to decide)
     pub pairs: usize,
@@ -134,6 +135,17 @@ impl Default for ProveRequest {
             pairs: crate::config::prove_defaults::MAX_PAIRS,
             trial_duration: None,
             safety: Safety::default(),
+        }
+    }
+}
+
+impl ProveRequest {
+    /// Prove the remedy of finding `code` of run `run` (sized, on goodput, default budget).
+    pub fn for_finding(run: impl Into<String>, code: impl Into<String>) -> Self {
+        Self {
+            run: run.into(),
+            finding: Some(code.into()),
+            ..Self::default()
         }
     }
 }
@@ -179,7 +191,7 @@ pub struct ProveTrial {
     pub throttled_request_ratio: f64,
     /// Operations that failed for reasons other than throttling, per operation.
     pub error_ratio: f64,
-    /// Within `--max-throttle` and the SLA's error ratio.
+    /// Within `--max-throttle` and the error ratio a run allows (1 %).
     pub feasible: bool,
 }
 
@@ -247,7 +259,7 @@ pub struct ProveOutput {
     pub trials: Vec<ProveTrial>,
     /// The operator change as Rust and TOML.
     pub diff: OperatorDiff,
-    /// A budget (`--budget`, `--max-requests`, `--max-bytes`, `--max-duration`) stopped the
+    /// A budget (`--max-duration`, `--max-requests`, `--max-bytes`) stopped the
     /// prove before it could finish: the result reads what was measured (exit 4).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub budget_exceeded: bool,
@@ -274,22 +286,34 @@ fn pct(x: f64) -> String {
 impl CommandOutput for ProveOutput {
     fn text(&self) -> String {
         let d = &self.objective_delta;
+        let measured = self.pairs_count > 0;
         let verdict = match self.verdict {
-            ProveVerdict::Improved => green("proved"),
-            ProveVerdict::Worse => red("refuted"),
+            ProveVerdict::Improved => green("improved"),
+            ProveVerdict::Worse => red("worse"),
+            ProveVerdict::Inconclusive if !measured => yellow("not measured"),
             ProveVerdict::Inconclusive => yellow("inconclusive"),
         };
-        let mut o = format!(
-            "{} on {}: {} % [{}, {}] ({} A/B pairs, noise ±{:.1} %) · {}\n",
-            bold(&verdict),
-            self.objective.label(),
-            pct(d.estimate),
-            pct(d.low),
-            pct(d.high),
-            self.pairs_count,
-            self.noise_floor_ratio * 100.0,
-            self.environment
-        );
+        let mut o = if measured {
+            format!(
+                "{} on {}: {} % [{}, {}] ({} pair{} of trials, noise ±{:.1} %) · {}\n",
+                bold(&verdict),
+                self.objective.label(),
+                pct(d.estimate),
+                pct(d.low),
+                pct(d.high),
+                self.pairs_count,
+                if self.pairs_count == 1 { "" } else { "s" },
+                self.noise_floor_ratio * 100.0,
+                self.environment
+            )
+        } else {
+            format!(
+                "{} on {}: no pair of trials ran · {}\n",
+                bold(&verdict),
+                self.objective.label(),
+                self.environment
+            )
+        };
         if let Some(s) = &self.sizing {
             let tried: Vec<String> = self
                 .trials
@@ -347,6 +371,11 @@ impl CommandOutput for ProveOutput {
         for n in &self.notes {
             o += &dim(&format!("note: {n}\n"));
         }
+        if !measured {
+            // Nothing was compared: a diff here would read as a finished proof.
+            o += &dim(&format!("change not tested: {}\n", self.change.join(" ")));
+            return o;
+        }
         o += &self.diff.rust;
         if !self.diff.rust.ends_with('\n') {
             o.push('\n');
@@ -370,16 +399,7 @@ impl CommandOutput for ProveOutput {
     fn next(&self) -> Vec<NextStep> {
         let mut sets = String::new();
         for c in &self.change {
-            // A redacted secret is read from the environment when the command runs
-            // (`options.secret_access_key=${SECRET_ACCESS_KEY}`).
-            let c = match c.split_once('=') {
-                Some((k, "<redacted>")) => {
-                    let var = k.rsplit('.').next().unwrap_or(k).to_ascii_uppercase();
-                    format!("{k}=${{{var}}}")
-                }
-                _ => c.clone(),
-            };
-            sets += &format!(" --set {}", crate::model::spec::shell_quote(&c));
+            sets += &format!(" --set {}", shell_edit(c));
         }
         vec![
             NextStep::new(
@@ -389,8 +409,125 @@ impl CommandOutput for ProveOutput {
                     crate::model::spec::shell_quote(&self.operator_ref)
                 ),
             ),
-            NextStep::new("the trial runs", "oprobe show --list --all"),
+            NextStep::new("its trials", "oprobe show --list --all"),
         ]
+    }
+}
+
+/// How long a whole proof takes: its sizing trials and its interleaved A/B pairs, each trial
+/// a short run (`prove --dry-run`, and the first lines of every prove).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ProofEstimate {
+    /// The command that runs this proof.
+    pub command: String,
+    /// The change, as `PATH=VALUE` pairs (a sized value at its starting point).
+    pub change: Vec<String>,
+    /// Sizing trials at most (0 when the change has no size to search).
+    pub sizing_trials_max_count: u64,
+    /// The fewest and the most A/B pairs (a pair is two trials: A, then B).
+    pub pairs_min_count: u64,
+    pub pairs_max_count: u64,
+    pub trials_min_count: u64,
+    pub trials_max_count: u64,
+    /// Wall time of one baseline trial (warmup, window, dataset and cleanup).
+    pub trial_eta_s: f64,
+    /// Wall time of the whole proof: at least (the fewest trials) and at most (every trial,
+    /// within the budget).
+    pub eta_min_s: f64,
+    pub eta_max_s: f64,
+    /// The wall-time budget, when one is set (`--max-duration`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_s: Option<f64>,
+}
+
+/// `42s`, `1m 30s`.
+fn fmt_secs(s: f64) -> String {
+    let s = s.max(0.0).round() as u64;
+    if s < 60 {
+        format!("{s}s")
+    } else if s.is_multiple_of(60) {
+        format!("{}m", s / 60)
+    } else {
+        format!("{}m {}s", s / 60, s % 60)
+    }
+}
+
+impl ProofEstimate {
+    /// The estimate of a proof of `sizing` (most, fewest) sizing trials and `pairs` (fewest,
+    /// most) A/B pairs, whose baseline trials take `a_eta_s` and whose sizing and candidate
+    /// trials take `b_eta_s`, within `budget`.
+    fn new(
+        command: String,
+        change: Vec<String>,
+        sizing: (u64, u64),
+        pairs: (u64, u64),
+        a_eta_s: f64,
+        b_eta_s: f64,
+        budget: Option<Duration>,
+    ) -> Self {
+        let pair_s = a_eta_s + b_eta_s;
+        let min = sizing.1 as f64 * b_eta_s + pairs.0 as f64 * pair_s;
+        let mut max = sizing.0 as f64 * b_eta_s + pairs.1 as f64 * pair_s;
+        let budget_s = budget.map(|b| b.as_secs_f64());
+        if let Some(b) = budget_s {
+            max = max.min(b);
+        }
+        Self {
+            command,
+            change,
+            sizing_trials_max_count: sizing.0,
+            pairs_min_count: pairs.0,
+            pairs_max_count: pairs.1,
+            trials_min_count: sizing.1 + 2 * pairs.0,
+            trials_max_count: sizing.0 + 2 * pairs.1,
+            trial_eta_s: a_eta_s,
+            eta_min_s: min.min(max),
+            eta_max_s: max,
+            budget_s,
+        }
+    }
+
+    /// `6–20 trials (up to 8 sizing, 3–6 pairs of A and B) · ETA 25s – 1m 10s`.
+    pub fn line(&self) -> String {
+        let sizing = if self.sizing_trials_max_count > 0 {
+            format!("up to {} sizing, ", self.sizing_trials_max_count)
+        } else {
+            String::new()
+        };
+        let pairs = if self.pairs_min_count == self.pairs_max_count {
+            format!("{} pairs", self.pairs_min_count)
+        } else {
+            format!("{}–{} pairs", self.pairs_min_count, self.pairs_max_count)
+        };
+        let trials = if self.trials_min_count == self.trials_max_count {
+            format!("{} trials", self.trials_max_count)
+        } else {
+            format!("{}–{} trials", self.trials_min_count, self.trials_max_count)
+        };
+        let eta = if (self.eta_max_s - self.eta_min_s).abs() < 1.0 {
+            fmt_secs(self.eta_max_s)
+        } else {
+            format!(
+                "{} – {}",
+                fmt_secs(self.eta_min_s),
+                fmt_secs(self.eta_max_s)
+            )
+        };
+        let budget = match self.budget_s {
+            Some(b) => format!(" (budget {})", fmt_secs(b)),
+            None => String::new(),
+        };
+        format!("{trials} ({sizing}{pairs} of A and B) · ETA {eta}{budget}")
+    }
+
+    /// The proof's plan as text (`prove --dry-run`).
+    pub fn text(&self) -> String {
+        format!(
+            "{} {}\n  {}\n",
+            bold("proof"),
+            self.change.join(" "),
+            self.line()
+        )
     }
 }
 
@@ -792,6 +929,8 @@ struct Trials<'a> {
     deadline: Option<Instant>,
     /// Wall time of one trial (measured on the first one).
     per_trial: Duration,
+    /// Warmup of the baseline trials (shorter than the candidate's for a tail-cut change).
+    baseline_warmup: Duration,
     max_throttle: f64,
     max_error: f64,
     out: Vec<ProveTrial>,
@@ -844,6 +983,9 @@ impl Trials<'_> {
     ) -> Result<ProveTrial> {
         let mut p = self.base.clone();
         p.operator.apply_edits(sets)?;
+        if kind == TrialKind::Baseline {
+            p.workload.warmup = crate::util::HumanDuration(self.baseline_warmup);
+        }
         p.name = Some(format!("prove {} {}", self.prove_id, kind_label(kind)));
         p.validate()?;
         let rails = super::run::rails(self.ctx, &p, &self.safety)?;
@@ -1223,6 +1365,67 @@ fn secondary(
     v
 }
 
+/// Wall time a trial adds to its plan's ETA: opening the session, saving the trial run.
+const TRIAL_OVERHEAD_S: f64 = 0.5;
+
+/// The warmup of the baseline trials (A): the trial warmup, without the candidate's long one
+/// (a tail-cut change warms its own layer; the baseline has none to warm).
+fn baseline_warmup(base: &Profile, change: &Change) -> Duration {
+    let w = base.workload.warmup.get();
+    if change.long_warmup {
+        crate::config::defaults().prove.trial_warmup.get().min(w)
+    } else {
+        w
+    }
+}
+
+/// A redacted `PATH=VALUE` for a command line: a secret is read from the environment when the
+/// command runs (`options.secret_access_key=${SECRET_ACCESS_KEY}`), and the pair is quoted.
+fn shell_edit(redacted: &str) -> String {
+    let c = match redacted.split_once('=') {
+        Some((k, "<redacted>")) => {
+            let var = k.rsplit('.').next().unwrap_or(k).to_ascii_uppercase();
+            format!("{k}=${{{var}}}")
+        }
+        _ => redacted.to_owned(),
+    };
+    crate::model::spec::shell_quote(&c)
+}
+
+/// `oprobe prove RUN [FINDING] [--with …] [--objective p99]`: the command of a request.
+fn prove_command(req: &ProveRequest, run: &Run) -> String {
+    let q = crate::model::spec::shell_quote;
+    let mut c = format!("oprobe prove {}", q(run.id()));
+    if let Some(f) = &req.finding {
+        c += &format!(" {}", q(f));
+    }
+    for w in &req.with {
+        let shown = match w.split_once('=') {
+            Some((k, v)) => crate::operator::redacted_edit(k.trim(), v.trim()),
+            None => w.clone(),
+        };
+        c += &format!(" --with {}", shell_edit(&shown));
+    }
+    if req.objective != ProveObjective::Goodput {
+        c += &format!(" --objective {}", req.objective.label());
+    }
+    if let Some(b) = req.budget.as_deref().or(req.safety.max_duration.as_deref()) {
+        c += &format!(" --max-duration {}", q(b));
+    }
+    c
+}
+
+/// The one wall-time budget of a proof: `budget`, else `safety.max_duration` (the CLI's
+/// `--max-duration`, whose older spelling is `--budget`).
+fn proof_budget(req: &ProveRequest) -> Result<Option<Duration>> {
+    Ok(req
+        .budget
+        .as_deref()
+        .or(req.safety.max_duration.as_deref())
+        .map(crate::input::duration)
+        .transpose()?)
+}
+
 /// `oprobe prove`.
 pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<ProveOutcome> {
     let run = ctx.store().load(&req.run)?;
@@ -1276,39 +1479,42 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
     );
     let mut changed = base.operator.clone();
     changed.apply_edits(&probe_sets)?;
-    if req.safety.dry_run {
+    let budget = proof_budget(&req)?;
+    let estimate = {
         let rails = super::run::rails(ctx, &base, &req.safety)?;
-        let mut plan = rails.plan(&base);
-        let sizing = if change.sized.is_some() {
-            defaults.max_sizing_trials
-        } else {
-            0
+        let plan = rails.plan(&base);
+        let sizing = match &change.sized {
+            Some(s) if s.unmeasured.is_none() => (defaults.max_sizing_trials as u64, 2),
+            _ => (0, 0),
         };
-        plan.assumptions.push(format!(
-            "up to {} trials of this plan: {sizing} sizing trials, then up to {} interleaved A/B pairs of {}",
-            sizing + 2 * req.pairs.clamp(MIN_DECISIVE_PAIRS, 12),
-            req.pairs.clamp(MIN_DECISIVE_PAIRS, 12),
+        let max_pairs = req.pairs.clamp(MIN_DECISIVE_PAIRS, 12) as u64;
+        let min_pairs = (defaults.min_pairs.max(MIN_DECISIVE_PAIRS) as u64).min(max_pairs);
+        // A candidate that needs a long warmup takes longer than its baseline.
+        let a_eta = plan.eta_s - plan.warmup_s + baseline_warmup(&base, &change).as_secs_f64();
+        let estimate = ProofEstimate::new(
+            prove_command(&req, &run),
             probe_sets
                 .iter()
                 .map(|(k, v)| crate::operator::redacted_edit(k, v))
-                .collect::<Vec<_>>()
-                .join(" ")
-        ));
-        return Ok(ProveOutcome::Plan(Box::new(super::run::PlanOutput {
-            plan,
-        })));
-    }
+                .collect(),
+            sizing,
+            (min_pairs, max_pairs),
+            a_eta + TRIAL_OVERHEAD_S,
+            plan.eta_s + TRIAL_OVERHEAD_S,
+            budget,
+        );
+        if req.safety.dry_run {
+            return Ok(ProveOutcome::Plan(Box::new(super::run::PlanOutput {
+                plan,
+                proof: Some(estimate),
+            })));
+        }
+        estimate
+    };
     let prove_id = RunId::new().to_string();
-    let budget = req
-        .budget
-        .as_deref()
-        .map(crate::input::duration)
-        .transpose()?;
     let mut safety = req.safety.clone();
-    if safety.max_duration.is_none() {
-        // The budget also bounds the trials themselves (with room for the last one's cleanup).
-        safety.max_duration = budget.map(|b| format!("{}ms", (b.as_millis() as u64) * 2));
-    }
+    // The budget also bounds the trials themselves (with room for the last one's cleanup).
+    safety.max_duration = budget.map(|b| format!("{}ms", (b.as_millis() as u64) * 2));
     let guard = super::run::guard_for(ctx, &base, &super::run::budgets(ctx, &safety)?);
     let target_name =
         crate::operator::resolve::resolve(&run.report.spec.operator_ref, ctx.config()?)
@@ -1324,6 +1530,7 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
         cancel: cancel.clone(),
         deadline: budget.map(|b| Instant::now() + b),
         per_trial: trial_window + warmup,
+        baseline_warmup: baseline_warmup(&base, &change),
         max_throttle,
         max_error: run.report.sla.max_error_ratio,
         out: Vec::new(),
@@ -1339,6 +1546,7 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
         run.id(),
         prove_id
     ));
+    ctx.out.info(dim(&estimate.line()));
     // Step 2: size.
     let mut notes = change.notes.clone();
     let mut sizing: Option<Sizing> = None;
@@ -1430,9 +1638,9 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
         return Err(t.breach.take().unwrap_or_else(|| {
             OprobeError::new(
                 ErrorCode::SafetyBudgetExceeded,
-                "the budget ran out before one A/B pair could run",
+                "the budget ran out before one pair of trials could run",
             )
-            .with_hint("raise --budget")
+            .with_hint("raise --max-duration")
             .into()
         }));
     }
@@ -1441,11 +1649,11 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
     let budget_exceeded = t.breach.is_some() || pairs == 0;
     if let Some(e) = &t.breach {
         notes.push(format!(
-            "a budget stopped the prove after {pairs} A/B pair{} ({e:#}): the verdict reads what was measured",
+            "a budget stopped the prove after {pairs} pair{} of trials ({e:#}): the verdict reads what was measured",
             if pairs == 1 { "" } else { "s" }
         ));
     } else if pairs == 0 {
-        notes.push("the budget ran out before one A/B pair could run".to_owned());
+        notes.push("the budget ran out before one pair of trials could run".to_owned());
     }
     // Step 4: decide.
     let floor = noise_floor(
@@ -1478,7 +1686,7 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
     };
     if too_few {
         notes.push(format!(
-            "the budget allowed only {pairs} A/B pair{}: at least {MIN_DECISIVE_PAIRS} are needed to decide",
+            "the budget allowed only {pairs} pair{} of trials: at least {MIN_DECISIVE_PAIRS} are needed to decide",
             if pairs == 1 { "" } else { "s" }
         ));
     } else if decision == SprtDecision::Continue {
@@ -1556,6 +1764,92 @@ mod tests {
             error_ratio: 0.0,
             feasible,
         }
+    }
+
+    fn output(pairs: u64, verdict: ProveVerdict) -> ProveOutput {
+        let a = OperatorSpec::from_url("s3://b/x");
+        let mut b = a.clone();
+        b.set("layers.concurrent_limit.http", "24").unwrap();
+        ProveOutput {
+            prove_id: "p".into(),
+            run_id: "r".into(),
+            operator_ref: "lab://demo".into(),
+            environment: "lab://demo (local lab)".into(),
+            finding: Some("throttling".into()),
+            change: vec!["layers.concurrent_limit.http=24".into()],
+            sizing: None,
+            objective: ProveObjective::Goodput,
+            verdict,
+            objective_delta: Interval {
+                estimate: 0.3,
+                low: 0.2,
+                high: 0.4,
+            },
+            noise_floor_ratio: 0.02,
+            pairs_count: pairs,
+            max_throttle_ratio: 0.001,
+            secondary: Vec::new(),
+            trials: Vec::new(),
+            diff: crate::operator::diff::diff(&a, &b),
+            budget_exceeded: pairs == 0,
+            notes: vec!["the budget ran out before one pair of trials could run".into()],
+        }
+    }
+
+    #[test]
+    fn a_proof_with_no_pair_says_not_measured_and_prints_no_diff() {
+        crate::report::style::set(false);
+        let none = output(0, ProveVerdict::Inconclusive).text();
+        assert!(none.starts_with("not measured on goodput"), "{none}");
+        assert!(!none.contains("ConcurrentLimitLayer"), "{none}");
+        assert!(!none.contains("op.toml"), "{none}");
+        assert!(none.contains("change not tested: layers.concurrent_limit.http=24"));
+        let done = output(4, ProveVerdict::Improved).text();
+        assert!(done.starts_with("improved on goodput: +30.0 %"), "{done}");
+        assert!(done.contains("4 pairs of trials"), "{done}");
+        assert!(done.contains("ConcurrentLimitLayer"), "{done}");
+        assert!(
+            output(4, ProveVerdict::Worse)
+                .text()
+                .starts_with("worse on goodput")
+        );
+    }
+
+    #[test]
+    fn the_estimate_covers_the_whole_proof() {
+        // 8 sizing trials at most (2 at least), 3–6 pairs, trials of 3 s.
+        let e = ProofEstimate::new(
+            "oprobe prove r".into(),
+            vec!["layers.concurrent_limit.http=24".into()],
+            (8, 2),
+            (3, 6),
+            3.0,
+            3.0,
+            None,
+        );
+        assert_eq!((e.trials_min_count, e.trials_max_count), (8, 20));
+        assert_eq!((e.eta_min_s, e.eta_max_s), (24.0, 60.0));
+        assert_eq!(
+            e.line(),
+            "8–20 trials (up to 8 sizing, 3–6 pairs of A and B) · ETA 24s – 1m"
+        );
+        // A long candidate warmup, no sizing, within a budget.
+        let e = ProofEstimate::new(
+            "oprobe prove r".into(),
+            vec!["layers.tail_cut=on".into()],
+            (0, 0),
+            (3, 6),
+            3.0,
+            14.0,
+            Some(Duration::from_secs(90)),
+        );
+        assert_eq!(e.eta_min_s, 51.0);
+        assert_eq!(e.eta_max_s, 90.0);
+        assert!(
+            e.line().ends_with("ETA 51s – 1m 30s (budget 1m 30s)"),
+            "{}",
+            e.line()
+        );
     }
 
     #[test]

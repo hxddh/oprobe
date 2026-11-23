@@ -594,7 +594,7 @@ fn prove_needs_three_pairs_to_decide() {
         "layers.retry.min_delay=10ms",
         "--trial",
         "300ms",
-        "--budget",
+        "--max-duration",
         "1s",
         "-o",
         "json",
@@ -609,7 +609,7 @@ fn prove_needs_three_pairs_to_decide() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|n| n.as_str().unwrap().contains("allowed only 1 A/B pair")),
+            .any(|n| n.as_str().unwrap().contains("allowed only 1 pair")),
         "{v}"
     );
     // `--pairs` below three is refused.
@@ -775,6 +775,94 @@ fn prove_never_prints_or_stores_secrets() {
             assert!(!text.contains(secret), "{secret} in {}", p.display());
         }
     }
+}
+
+/// One prove budget (6.3): `--max-duration` bounds the whole proof, `--budget` is a hidden
+/// alias, and the dry run estimates the whole proof.
+#[test]
+fn prove_has_one_budget_and_estimates_the_whole_proof() {
+    let env = Env::new();
+    let h = stdout(&env.run(&["prove", "--help"]));
+    assert!(h.contains("--max-duration"), "{h}");
+    assert!(!h.contains("--budget"), "{h}");
+    let o = env.run(&run_args(&["lab://clean"], &["-q", "-o", "json"]));
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    for flag in ["--max-duration", "--budget"] {
+        let o = env.run(&[
+            "prove",
+            "last",
+            "--with",
+            "read.gap=1MiB",
+            flag,
+            "90s",
+            "--dry-run",
+            "-o",
+            "json",
+        ]);
+        assert_eq!(code(&o), 0, "{flag}: {}", stderr(&o));
+        let p = &json(&o)["proof"];
+        assert_eq!(p["budget_s"], 90.0, "{flag}: {p}");
+        assert_eq!(p["pairs_min_count"], 3, "{p}");
+        assert_eq!(p["trials_max_count"], 12, "{p}");
+        let (lo, hi) = (
+            p["eta_min_s"].as_f64().unwrap(),
+            p["eta_max_s"].as_f64().unwrap(),
+        );
+        assert!(lo > 0.0 && lo <= hi && hi <= 90.0, "{p}");
+        // Six trials at least: the estimate is the proof's, not one trial's.
+        assert!(lo >= 6.0 * p["trial_eta_s"].as_f64().unwrap() - 1e-6, "{p}");
+        assert!(
+            p["command"]
+                .as_str()
+                .unwrap()
+                .ends_with("--with read.gap=1MiB --max-duration 90s"),
+            "{p}"
+        );
+    }
+    let o = env.run(&["prove", "last", "--with", "read.gap=1MiB", "--dry-run"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let t = stdout(&o);
+    assert!(t.contains("6–12 trials") && t.contains("ETA"), "{t}");
+    assert!(!t.contains("--warmup"), "{t}");
+    assert_eq!(env.runs().len(), 1, "a dry run runs nothing");
+}
+
+/// 5.x vestiges are gone from the surface (6.3): `--set sla…` is refused, the run list has no
+/// label column and names verdicts OK / Review / Attention / Critical, and `lab` lists the
+/// app's six scenarios.
+#[test]
+fn five_x_vestiges_are_gone() {
+    let env = Env::new();
+    for bad in ["sla=none", "p99_ms=50"] {
+        let o = env.run(&["run", "memory://", "--set", bad, "-o", "json"]);
+        assert_eq!(code(&o), 2, "{bad}: {}", stdout(&o));
+        let v = json(&o);
+        assert!(
+            v["error"]["message"].as_str().unwrap().contains("no SLA"),
+            "{v}"
+        );
+    }
+    let o = env.run(&run_args(&["memory://"], &["-q"]));
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let list = stdout(&env.run(&["show", "--list", "--color", "never"]));
+    assert!(!list.contains("label"), "{list}");
+    assert!(
+        ["OK", "Review", "Attention", "Critical"]
+            .iter()
+            .any(|l| list.contains(l)),
+        "{list}"
+    );
+    let show = stdout(&env.run(&["show", "last", "--color", "never"]));
+    assert!(!show.contains("sla"), "{show}");
+    let o = env.run(&["lab", "bogus"]);
+    assert_eq!(code(&o), 2);
+    assert!(
+        stderr(&o).contains("demo, throttle, stragglers, bandwidth, flaky, ratelimit"),
+        "{}",
+        stderr(&o)
+    );
+    let h = stdout(&env.run(&["lab", "--help"]));
+    assert!(!h.contains("hotkey") && h.contains("ratelimit"), "{h}");
 }
 
 #[test]

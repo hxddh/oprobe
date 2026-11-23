@@ -157,6 +157,10 @@ pub struct ErrorBody {
     pub retryable: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub docs: Option<String>,
+    /// The whole error chain as the storage library reported it, when `message` leads with
+    /// the provider's error code instead (machine output only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 impl ErrorBody {
@@ -167,7 +171,18 @@ impl ErrorBody {
             hint: None,
             retryable: code.retryable(),
             docs: Some(code.docs()),
+            detail: None,
         }
+    }
+
+    /// Lead with the provider's error code and message when the chain carries one
+    /// (`credentials rejected: InvalidAccessKeyId: The AWS Access Key Id …`); the raw chain
+    /// moves to `detail`.
+    fn lead_with_provider(mut self) -> Self {
+        if let Some(lead) = provider_lead(&self.message, self.code) {
+            self.detail = Some(std::mem::replace(&mut self.message, lead));
+        }
+        self
     }
 
     pub fn exit_code(&self) -> u8 {
@@ -240,6 +255,61 @@ impl<T, E: Into<anyhow::Error>> Classify<T> for Result<T, E> {
     }
 }
 
+/// The value of XML element `tag` in `s` (`<Code>SlowDown</Code>`).
+fn xml_value<'a>(s: &'a str, tag: &str) -> Option<&'a str> {
+    let open = format!("<{tag}>");
+    let i = s.find(&open)? + open.len();
+    let j = s[i..].find("</")? + i;
+    Some(s[i..j].trim()).filter(|v| !v.is_empty())
+}
+
+/// The value of a debug-printed field `name: "…"` in `s` (OpenDAL's `S3Error { code: "…" }`).
+fn debug_field<'a>(s: &'a str, name: &str) -> Option<&'a str> {
+    let key = format!("{name}: \"");
+    let i = s.find(&key)? + key.len();
+    let j = s[i..].find('"')? + i;
+    Some(s[i..j].trim()).filter(|v| !v.is_empty())
+}
+
+/// The provider's error code and message in an error chain (S3 and Azure XML bodies, OpenDAL's
+/// debug-printed service errors), as a short lead: what happened, then the code and message.
+/// `None` when the chain carries no provider code.
+pub fn provider_lead(chain: &str, code: ErrorCode) -> Option<String> {
+    let (pcode, pmsg) = match (xml_value(chain, "Code"), debug_field(chain, "code")) {
+        (Some(c), _) => (c, xml_value(chain, "Message")),
+        (None, Some(c)) => (c, debug_field(chain, "message")),
+        _ => return None,
+    };
+    if !pcode.chars().all(|c| c.is_ascii_alphanumeric() || c == '.') {
+        return None;
+    }
+    let what = match pcode {
+        "InvalidAccessKeyId"
+        | "SignatureDoesNotMatch"
+        | "InvalidToken"
+        | "ExpiredToken"
+        | "InvalidClientTokenId"
+        | "AuthenticationFailed"
+        | "InvalidSecurity" => "credentials rejected",
+        "AccessDenied" | "AuthorizationPermissionMismatch" | "AuthorizationFailure" => {
+            "access denied"
+        }
+        "NoSuchBucket" | "ContainerNotFound" => "bucket not found",
+        "SlowDown" | "ServerBusy" | "TooManyRequests" | "RequestLimitExceeded" => "throttled",
+        _ => match code {
+            ErrorCode::AuthDenied => "access denied",
+            ErrorCode::AuthNoCredentials => "no credentials",
+            ErrorCode::StorageNotFound => "not found",
+            ErrorCode::StorageThrottled => "throttled",
+            _ => "the service refused the request",
+        },
+    };
+    Some(match pmsg {
+        Some(m) => format!("{what}: {pcode}: {m}"),
+        None => format!("{what}: {pcode}"),
+    })
+}
+
 /// Classify an error chain: an [`OprobeError`] anywhere in the chain wins, then typed sources
 /// (OpenDAL error kinds, dial/TLS/timeout errors), else `internal`. `scheme` selects
 /// provider-specific hints.
@@ -256,7 +326,7 @@ pub fn classify(err: &anyhow::Error, scheme: &str) -> ErrorBody {
     };
     for cause in err.chain() {
         if let Some(e) = cause.downcast_ref::<OprobeError>() {
-            let mut body = ErrorBody::new(e.code, chain_message(err));
+            let mut body = ErrorBody::new(e.code, chain_message(err)).lead_with_provider();
             body.hint = e
                 .hint
                 .as_deref()
@@ -271,7 +341,7 @@ pub fn classify(err: &anyhow::Error, scheme: &str) -> ErrorBody {
         }
     }
     let code = typed_code(err).unwrap_or(ErrorCode::Internal);
-    let mut body = ErrorBody::new(code, chain_message(err));
+    let mut body = ErrorBody::new(code, chain_message(err)).lead_with_provider();
     body.hint = hint_text();
     body
 }
@@ -460,6 +530,35 @@ mod tests {
         assert_eq!(classify(&e, "s3").code, ErrorCode::AuthNoCredentials);
         let e = anyhow::anyhow!("something odd");
         assert_eq!(classify(&e, "s3").code, ErrorCode::Internal);
+    }
+
+    /// A wrong S3 key: the provider's code and message lead, the raw chain stays in `detail`.
+    #[test]
+    fn errors_lead_with_the_provider_code() {
+        let dump = "preflight: cannot list the target root: PermissionDenied (persistent) at list, context: { uri: http://127.0.0.1:9000/b?list-type=2, response: Parts { status: 403, version: HTTP/1.1, headers: {\"x-amz-request-id\": \"17A\"} }, service: s3, path: / } => S3Error { code: \"InvalidAccessKeyId\", message: \"The AWS Access Key Id you provided does not exist in our records.\", resource: \"\", request_id: \"17A\" }";
+        let e = anyhow::Error::new(OprobeError::new(ErrorCode::AuthDenied, dump));
+        let b = classify(&e, "s3");
+        assert_eq!(
+            b.message,
+            "credentials rejected: InvalidAccessKeyId: The AWS Access Key Id you provided does not exist in our records."
+        );
+        assert_eq!(b.detail.as_deref(), Some(dump));
+        let v = serde_json::to_value(&b).unwrap();
+        assert_eq!(v["detail"], dump);
+        // An XML body (Azure, S3-compatible gateways).
+        let xml = "unexpected: <?xml version=\"1.0\"?><Error><Code>SlowDown</Code><Message>Please reduce your request rate.</Message></Error>";
+        assert_eq!(
+            provider_lead(xml, ErrorCode::StorageThrottled).as_deref(),
+            Some("throttled: SlowDown: Please reduce your request rate.")
+        );
+        // No provider code: the message is the chain, and there is no detail.
+        let e = anyhow::Error::new(OprobeError::new(
+            ErrorCode::NetUnreachable,
+            "cannot reach x",
+        ));
+        let b = classify(&e, "s3");
+        assert_eq!(b.message, "cannot reach x");
+        assert!(b.detail.is_none());
     }
 
     #[test]

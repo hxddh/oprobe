@@ -10,14 +10,15 @@ use crate::model::{OpRow, ReqRow, Run, VerdictLevel, WireProtocol};
 use crate::trace::{ApiStats, VerbStats};
 use crate::util::{fmt_bytes, fmt_ms};
 
-/// `HEALTHY` / `REVIEW` / `ATTENTION` / `CRITICAL` badge of a verdict level.
+/// `OK` / `Review` / `Attention` / `Critical` badge of a verdict level.
 pub fn verdict_badge(level: VerdictLevel) -> String {
-    match level {
-        VerdictLevel::Ok => badge("HEALTHY", "42;30"),
-        VerdictLevel::Review => badge("REVIEW", "46;30"),
-        VerdictLevel::Attention => badge("ATTENTION", "43;30"),
-        VerdictLevel::Critical => badge("CRITICAL", "41"),
-    }
+    let color = match level {
+        VerdictLevel::Ok => "42;30",
+        VerdictLevel::Review => "46;30",
+        VerdictLevel::Attention => "43;30",
+        VerdictLevel::Critical => "41",
+    };
+    badge(level.label(), color)
 }
 
 fn section(out: &mut String, title: &str) {
@@ -54,37 +55,6 @@ fn share_bars(rows: &[super::view::StageShare]) -> String {
 /// The time-share bars of every operation.
 pub fn time_share_lines(r: &Report) -> String {
     share_bars(&super::view::TimeView::of(r, None).stages)
-}
-
-/// `✓ met (failed ops ≤ 1%, no corrupted data)` or `✖ BREACHED: …`.
-pub fn sla_line(r: &Report) -> String {
-    let sla = &r.sla;
-    let mut terms = vec![
-        format!("failed ops ≤ {}%", sla.max_error_ratio * 100.0),
-        "no corrupted data".to_owned(),
-    ];
-    if let Some(t) = sla.max_throttle_ratio {
-        terms.push(format!("throttled requests ≤ {}%", t * 100.0));
-    }
-    if let Some(p) = sla.p99_ms {
-        terms.push(format!("p99 ≤ {}", fmt_ms(p)));
-    }
-    let v = &r.verdict.sla;
-    let enforced = if v.enforced {
-        ""
-    } else {
-        " · not enforced (--sla none)"
-    };
-    if v.passed {
-        format!("{} met ({}){}", green("✓"), terms.join(", "), dim(enforced))
-    } else {
-        format!(
-            "{} {}{}",
-            red(&bold("✖ BREACHED:")),
-            red(&v.breaches.join("; ")),
-            dim(enforced)
-        )
-    }
 }
 
 /// One request of an operation that started at `op_t_us`.
@@ -210,34 +180,35 @@ pub fn slow_op_block(op: &OpRow, requests: &[&ReqRow], show_tree: bool) -> Strin
 /// Width the default full report fits in.
 pub const WIDTH: usize = 80;
 
-/// Cut a line to `max` visible columns (ANSI escapes are kept; an ellipsis marks the cut).
-pub fn fit(line: &str, max: usize) -> String {
+/// Wrap a line to `max` visible columns at spaces (ANSI escapes are kept). Nothing is ever
+/// cut: a continuation is indented two columns past the line's own indent, and a word longer
+/// than the width (a URL, a command's argument) stays whole on its own line.
+pub fn wrap_line(line: &str, max: usize) -> Vec<String> {
     if visible_width(line) <= max {
-        return line.to_owned();
+        return vec![line.to_owned()];
     }
-    let mut out = String::new();
-    let mut w = 0;
-    let mut in_esc = false;
-    for c in line.chars() {
-        if in_esc {
-            out.push(c);
-            if c == 'm' {
-                in_esc = false;
-            }
-        } else if c == '\x1b' {
-            in_esc = true;
-            out.push(c);
-        } else if w + 1 < max {
-            out.push(c);
-            w += 1;
-        } else {
-            break;
+    let indent = line.chars().take_while(|c| *c == ' ').count();
+    let cont = " ".repeat(indent + 2);
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = " ".repeat(indent);
+    let mut cur_w = indent;
+    let mut fresh = true;
+    for word in line[indent..].split(' ') {
+        let w = visible_width(word);
+        if !fresh && cur_w + 1 + w > max {
+            out.push(std::mem::replace(&mut cur, cont.clone()));
+            cur_w = cont.len();
+            fresh = true;
         }
+        if !fresh {
+            cur.push(' ');
+            cur_w += 1;
+        }
+        cur.push_str(word);
+        cur_w += w;
+        fresh = false;
     }
-    out.push('…');
-    if enabled() {
-        out.push_str("\x1b[0m");
-    }
+    out.push(cur);
     out
 }
 
@@ -421,15 +392,7 @@ fn render_with(r: &Report, run: Option<&Run>, detail: bool) -> String {
         "{} {} {}",
         bold("oprobe"),
         dim(&r.run.oprobe_version),
-        dim(&format!(
-            "· run {}{}",
-            r.run.id,
-            r.run
-                .label
-                .as_ref()
-                .map(|l| format!(" · {l}"))
-                .unwrap_or_default()
-        ))
+        dim(&format!("· run {}", r.run.id))
     );
     let _ = writeln!(
         out,
@@ -552,7 +515,14 @@ fn render_with(r: &Report, run: Option<&Run>, detail: bool) -> String {
             }
         ),
     );
-    kv(&mut out, "sla", &sla_line(r));
+    // A corrupted object or too many failed operations (the run's checks).
+    if !r.verdict.sla.breaches.is_empty() {
+        kv(
+            &mut out,
+            "checks",
+            &red(&format!("✖ {}", r.verdict.sla.breaches.join("; "))),
+        );
+    }
     if let Some(ol) = &r.open_loop {
         kv(
             &mut out,
@@ -759,10 +729,9 @@ fn render_with(r: &Report, run: Option<&Run>, detail: bool) -> String {
     if b.wire_rx + b.wire_tx > 0 {
         let _ = writeln!(
             out,
-            "  wire rx {} · tx {} {}",
+            "  wire rx {} · tx {}",
             fmt_bytes(b.wire_rx),
             fmt_bytes(b.wire_tx),
-            dim("(--microscope)")
         );
     }
     if r.cache.enabled {
@@ -794,27 +763,10 @@ fn render_with(r: &Report, run: Option<&Run>, detail: bool) -> String {
     }
 
     if detail && !r.timeline.is_empty() {
-        section(&mut out, "TIMELINE  (per second)");
-        let rows: Vec<Vec<String>> = r
-            .timeline
-            .iter()
-            .map(|p| {
-                vec![
-                    format!("{:.0}s", p.t_s),
-                    format!("{:.1}", p.ops_per_s),
-                    format!("{:.1}", p.mib_per_s),
-                    fmt_ms(p.p50_ms),
-                    fmt_ms(p.p99_ms),
-                    p.errors.to_string(),
-                    p.throttled.to_string(),
-                ]
-            })
-            .collect();
-        out.push_str(&table(
-            &["t", "ops/s", "MiB/s", "p50", "p99", "errors", "throttled"],
-            &rows,
-            2,
-        ));
+        out.push_str(&timeline_section(&super::view::TimelineView::of(r)));
+    }
+    if detail {
+        out.push_str(&spread_section(&super::view::SpreadView::of(r)));
     }
 
     if let Some(run) = run {
@@ -946,11 +898,138 @@ fn render_with(r: &Report, run: Option<&Run>, detail: bool) -> String {
         out
     } else {
         out.lines()
-            .map(|l| fit(l, WIDTH))
+            .flat_map(|l| wrap_line(l, WIDTH))
             .collect::<Vec<_>>()
             .join("\n")
             + "\n"
     }
+}
+
+/// Rows the detailed timeline shows at most: a long run is merged into fewer, longer rows.
+pub const TIMELINE_ROWS: usize = 60;
+
+/// `1 s`, `10 s`, `2 min`.
+fn interval_label(s: f64) -> String {
+    if s >= 60.0 && (s / 60.0).fract().abs() < 1e-6 {
+        format!("{:.0} min", s / 60.0)
+    } else if s.fract().abs() < 1e-6 {
+        format!("{s:.0} s")
+    } else {
+        format!("{s:.1} s")
+    }
+}
+
+/// The TIMELINE section of `show --detail`: one row per interval (its real length), at most
+/// [`TIMELINE_ROWS`] rows.
+pub fn timeline_section(t: &super::view::TimelineView) -> String {
+    let mut out = String::new();
+    if t.is_empty() {
+        return out;
+    }
+    let (rows_v, merged) = t.downsample(TIMELINE_ROWS);
+    // The interval length of the rows (the last one may be shorter: the window's end).
+    let mut lens: Vec<f64> = t.len_s.clone();
+    lens.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
+    let base = interval_label(lens.first().copied().unwrap_or(1.0));
+    let title = if merged > 1 {
+        format!(
+            "TIMELINE  ({} rows of {merged} intervals of {base}; p99, p99.9 and max: the worst interval)",
+            rows_v.len()
+        )
+    } else if lens.len() > 1 {
+        format!(
+            "TIMELINE  (intervals of {base}, then {})",
+            interval_label(lens[1])
+        )
+    } else {
+        format!("TIMELINE  (intervals of {base})")
+    };
+    section(&mut out, &title);
+    let rows: Vec<Vec<String>> = (0..rows_v.len())
+        .map(|i| {
+            vec![
+                format!("{:.0}s", rows_v.t_s[i]),
+                format!("{:.1}", rows_v.ops_per_s[i]),
+                format!("{:.1}", rows_v.mib_per_s[i]),
+                fmt_ms(rows_v.p50_ms[i]),
+                fmt_ms(rows_v.p99_ms[i]),
+                fmt_ms(rows_v.p999_ms[i]),
+                fmt_ms(rows_v.max_ms[i]),
+                rows_v.errors_count[i].to_string(),
+                rows_v.throttled_count[i].to_string(),
+            ]
+        })
+        .collect();
+    out.push_str(&table(
+        &[
+            "t",
+            "ops/s",
+            "MiB/s",
+            "p50",
+            "p99",
+            "p99.9",
+            "max",
+            "errors",
+            "throttled",
+        ],
+        &rows,
+        2,
+    ));
+    let _ = writeln!(
+        out,
+        "  {}",
+        dim("errors, throttled: counts in each row, not rates")
+    );
+    out
+}
+
+/// The SPREAD section of `show --detail`: where the traffic went (hot keys, object sizes,
+/// prefixes, remotes).
+pub fn spread_section(s: &super::view::SpreadView) -> String {
+    let mut out = String::new();
+    if s.is_empty() {
+        return out;
+    }
+    section(&mut out, "SPREAD  (where the requests went)");
+    let pct = |x: Option<f64>| x.map_or("-".to_owned(), |v| format!("{:.1}%", v * 100.0));
+    let ms = |x: Option<f64>| x.map_or("-".to_owned(), fmt_ms);
+    let groups: [(&str, &str, &[super::view::Slice]); 4] = [
+        ("hot key", "of throttling", &s.hot_keys),
+        ("object size", "throttled", &s.sizes),
+        ("prefix", "throttled", &s.prefixes),
+        ("remote", "throttled", &s.remotes),
+    ];
+    for (title, thr, slices) in groups {
+        if slices.is_empty() {
+            continue;
+        }
+        let rows: Vec<Vec<String>> = slices
+            .iter()
+            .map(|x| {
+                vec![
+                    x.key.clone(),
+                    x.requests_count.to_string(),
+                    format!("{:.1}%", x.share_ratio * 100.0),
+                    pct(x.throttled_ratio),
+                    pct(x.error_ratio),
+                    ms(x.p99_ms),
+                ]
+            })
+            .collect();
+        out.push_str(&table(
+            &[title, "requests", "share", thr, "errors", "p99"],
+            &rows,
+            2,
+        ));
+    }
+    let _ = writeln!(
+        out,
+        "  {}",
+        dim(
+            "share: of all requests · hot keys: share of all throttling · others: share of the slice's own requests"
+        )
+    );
+    out
 }
 
 fn cleanup_section(out: &mut String, cl: &crate::engine::CleanupSummary) {
@@ -1023,8 +1102,15 @@ mod tests {
         run.report.findings[0].remedy.text = "word ".repeat(60);
         run.report.target.display = format!("s3://{}", "b".repeat(120));
         let text = render_run(&run);
+        // Lines wrap at 80 columns; nothing is cut, and a word longer than that stays whole.
+        assert!(!text.lines().any(|l| l.ends_with('…')), "{text}");
+        assert!(text.contains(&run.report.target.display), "{text}");
         for l in text.lines() {
-            assert!(visible_width(l) <= WIDTH, "{} > 80: {l}", visible_width(l));
+            assert!(
+                visible_width(l) <= WIDTH || !l.trim().contains(' '),
+                "{} > 80: {l}",
+                visible_width(l)
+            );
         }
         for s in [
             "KEY NUMBERS",
@@ -1039,24 +1125,46 @@ mod tests {
         ] {
             assert!(text.contains(s), "{s}\n{text}");
         }
+        run.report.dimensions.size_buckets = vec![crate::model::DimensionSlice {
+            key: "64KiB–1MiB".into(),
+            requests_count: 1100,
+            share_ratio: 1.0,
+            throttled_ratio: 0.01,
+            p99_ms: 110.0,
+            ..Default::default()
+        }];
         let detail = render_run_with(&run, true);
         for s in [
-            "TIMELINE",
+            "TIMELINE  (intervals of 1 s)",
+            "p99.9",
+            "counts in each row",
+            "SPREAD",
+            "64KiB–1MiB",
             "CONFIGURATION",
             "OPERATOR",
             "SLOWEST OPERATIONS",
-            "p99.9",
         ] {
-            assert!(detail.contains(s), "{s}");
+            assert!(detail.contains(s), "{s}\n{detail}");
         }
+        // No SLA line, no label.
+        assert!(!text.contains("sla") && !detail.contains("sla "), "{text}");
     }
 
     #[test]
-    fn fit_keeps_escapes_and_cuts_visible_text() {
-        let s = format!("\x1b[31m{}\x1b[0m tail", "x".repeat(100));
-        let f = fit(&s, 10);
-        assert_eq!(visible_width(&f), 10);
-        assert!(f.starts_with("\x1b[31m"));
+    fn long_lines_wrap_and_are_never_cut() {
+        let s = format!("  \x1b[31m{}\x1b[0m tail", "x".repeat(100));
+        let w = wrap_line(&s, 10);
+        assert_eq!(w.len(), 2, "{w:?}");
+        assert!(w[0].starts_with("  \x1b[31m"));
+        assert_eq!(visible_width(&w[0]), 102);
+        assert_eq!(w[1], "    tail");
+        let cmd = "  more: oprobe show 20261120-143005-a1b2 --detail · oprobe show 20261120-143005-a1b2 --by stage|api|conn";
+        let w = wrap_line(cmd, 40);
+        assert!(w.iter().all(|l| visible_width(l) <= 40), "{w:?}");
+        assert_eq!(
+            w.iter().map(|l| l.trim()).collect::<Vec<_>>().join(" "),
+            cmd.trim()
+        );
         assert_eq!(wrap_text("a bb ccc dddd", 6), vec!["a bb", "ccc", "dddd"]);
     }
 }

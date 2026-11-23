@@ -407,13 +407,26 @@ pub fn lab_scenario(raw: &str) -> Result<crate::lab::Scenario, OprobeError> {
     if s.is_empty() {
         return Ok(crate::lab::Scenario::Clean);
     }
-    let names: Vec<&str> = crate::lab::Scenario::ALL.iter().map(|x| x.name()).collect();
     crate::lab::Scenario::ALL
         .into_iter()
         .find(|x| x.name() == s)
         .ok_or_else(|| {
-            invalid(format!("unknown lab scenario `{}`", raw.trim()))
-                .with_hint(choices_hint(&s, &names))
+            // The listed scenarios (the app's six); a typo of an unlisted one still finds it.
+            let listed: Vec<&str> = crate::lab::Scenario::LISTED
+                .iter()
+                .map(|x| x.name())
+                .collect();
+            let all: Vec<&str> = crate::lab::Scenario::ALL.iter().map(|x| x.name()).collect();
+            let hint = match suggest(&s, all.iter().copied()) {
+                Some(m) => format!("did you mean `{m}`? (scenarios: {})", listed.join(", ")),
+                None => format!("scenarios: {}", listed.join(", ")),
+            };
+            invalid(format!(
+                "unknown lab scenario `{}` (scenarios: {})",
+                raw.trim(),
+                listed.join(", ")
+            ))
+            .with_hint(hint)
         })
 }
 
@@ -751,6 +764,13 @@ mod tests {
         assert_eq!(http_version("HTTP2").unwrap(), HttpVersion::H2);
         assert!(http_version("h3").is_err());
         assert!(lab_scenario("demo").is_ok());
+        // Unlisted scenarios still run; an unknown one lists the six.
+        assert!(lab_scenario("hotkey").is_ok());
+        let h = lab_scenario("bogus").unwrap_err().hint.unwrap();
+        assert_eq!(
+            h,
+            "scenarios: demo, throttle, stragglers, bandwidth, flaky, ratelimit"
+        );
         assert!(
             lab_scenario("dmeo")
                 .unwrap_err()

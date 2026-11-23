@@ -386,3 +386,38 @@ fn a_clean_lab_gets_no_invented_limit() {
         }
     }
 }
+
+/// The first impression (6.3): `oprobe demo`, then `oprobe prove last` with every default — the
+/// top finding's remedy, the default objective (goodput) and no budget flag — proves
+/// `improved`. The demo's throttling costs latency, not goodput, so it ranks below the
+/// stragglers whose wait holds the lab's slots.
+#[test]
+fn the_demo_proves_its_top_finding() {
+    let env = Env::new();
+    let mut r = Value::Null;
+    for _ in 0..3 {
+        r = env.json(&["demo"])["runs"][0]["report"].clone();
+        if r["findings"][0]["code"] == "tail_stragglers" {
+            break;
+        }
+    }
+    let top = &r["findings"][0];
+    assert_eq!(top["code"], "tail_stragglers", "{:#}", r["findings"]);
+    if let Some(t) = finding(&r, "throttling") {
+        assert_ne!(
+            t["severity"], "critical",
+            "throttling that costs no goodput: {t:#}"
+        );
+    }
+    let started = std::time::Instant::now();
+    let p = env.json(&["prove", "last"]);
+    assert_eq!(p["finding"], "tail_stragglers", "{p:#}");
+    assert_eq!(p["objective"], "goodput");
+    improved(&p);
+    eprintln!(
+        "demo → prove last: {} in {:.0} s ({} pairs)",
+        p["objective_delta"]["estimate"],
+        started.elapsed().as_secs_f64(),
+        p["pairs_count"]
+    );
+}

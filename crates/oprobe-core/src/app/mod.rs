@@ -324,6 +324,28 @@ impl App {
         prove::prove(&self.ctx(&sink), req, cancel).await
     }
 
+    /// Prove the remedy of finding `code` of run `run` exactly as `oprobe prove RUN CODE` does:
+    /// the remedy's size is searched with short trials, then A and B are interleaved, within
+    /// `budget` (a wall-time budget such as `2m`; `None`: none). The one path for a front end's
+    /// "prove this finding".
+    pub async fn prove_finding(
+        &self,
+        run: RunRef,
+        code: &str,
+        budget: Option<String>,
+        sink: EventSink,
+        cancel: Cancel,
+    ) -> Result<ProveOutput> {
+        let req = ProveRequest {
+            budget,
+            ..ProveRequest::for_finding(run.0, code)
+        };
+        match self.prove(req, sink, cancel).await? {
+            ProveOutcome::Proved(p) => Ok(*p),
+            ProveOutcome::Plan(_) => unreachable!("not a dry run"),
+        }
+    }
+
     /// A stored run (or a run file) with its rows.
     pub fn show(&self, r: RunRef) -> Result<Profile> {
         runs::show(self, &r)

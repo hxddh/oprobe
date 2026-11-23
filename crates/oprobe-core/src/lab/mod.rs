@@ -265,6 +265,17 @@ impl Scenario {
         Scenario::Noisy,
     ];
 
+    /// The scenarios `oprobe lab` and the app offer; the others stay runnable by name (the
+    /// tests use them) but are not listed.
+    pub const LISTED: [Scenario; 6] = [
+        Scenario::Demo,
+        Scenario::Throttle,
+        Scenario::Stragglers,
+        Scenario::Bandwidth,
+        Scenario::Flaky,
+        Scenario::RateLimit,
+    ];
+
     pub fn name(self) -> &'static str {
         match self {
             Scenario::Clean => "clean",
@@ -288,7 +299,7 @@ impl Scenario {
             Scenario::Clean => "no faults: S3 semantics only",
             Scenario::Demo => {
                 "8 ms latency, 503 SlowDown above 24 concurrent requests, 2.5% stragglers (+250 ms); \
-                 default workload: small-files, 64 × 64 KiB, 32 workers, 0.5 s warmup, 8 s"
+                 default workload: small-files, 64 × 64 KiB, 28 workers, 0.5 s warmup, 8 s"
             }
             Scenario::Throttle => "5 ms latency, 503 SlowDown above 8 concurrent requests",
             Scenario::Stragglers => "5 ms latency, 3% of requests wait 400 ms",
@@ -425,8 +436,10 @@ impl Scenario {
 
 /// Requests in flight above which `lab://demo` answers `503 SlowDown`.
 pub const DEMO_THROTTLE_ABOVE: usize = 24;
-/// Workers of the `lab://demo` default workload (more than the lab accepts at once).
-pub const DEMO_CONCURRENCY: usize = 32;
+/// Workers of the `lab://demo` default workload: more than the lab accepts at once, so it
+/// throttles, but few enough that the throttled workers' retry backoff costs less than the
+/// stragglers' wait (the demo's top finding proves on goodput, 6.3).
+pub const DEMO_CONCURRENCY: usize = 28;
 /// Every Nth request of `lab://demo` is a straggler.
 pub const DEMO_STRAGGLER_EVERY: usize = 40;
 /// Extra delay of a `lab://demo` straggler.
