@@ -18,6 +18,29 @@ pub fn mac() -> bool {
     matches!(os(), Os::MacOs)
 }
 
+/// Show or hide the sidebar: ⌃⌘S on macOS (as Finder and Xcode), Ctrl+Shift+S elsewhere.
+/// `MenuItem::shortcut` checks a keystroke as off macOS (`mod` is Ctrl there), so the macOS
+/// one names Command itself: `ctrl+mod` would be Ctrl twice and panic.
+const SIDEBAR_MAC: &str = "ctrl+cmd+s";
+const SIDEBAR: &str = "mod+shift+s";
+
+/// Every shortcut of the menus, checked in tests as `MenuItem::shortcut` checks them.
+#[cfg(test)]
+const ALL: &[&str] = &[
+    "mod+,",
+    "mod+n",
+    "mod+o",
+    "mod+shift+c",
+    "mod+r",
+    "mod+.",
+    "mod+shift+p",
+    "mod+backspace",
+    "mod+1",
+    "mod+2",
+    SIDEBAR_MAC,
+    SIDEBAR,
+];
+
 /// The documentation's address.
 const DOCS: &str = "https://github.com/hxddh/oprobe/tree/main/docs";
 
@@ -135,7 +158,7 @@ pub fn application(s: Store) -> Vec<MenuItem> {
         } else {
             tr("menu.show_sidebar")
         })
-        .shortcut(if mac() { "ctrl+mod+s" } else { "mod+shift+s" })
+        .shortcut(if mac() { SIDEBAR_MAC } else { SIDEBAR })
         .on_select(move || s.sidebar.update(|v| *v = !*v)),
     ];
     if mac() {
@@ -222,4 +245,21 @@ pub fn run_context(s: Store, id: &str) {
         MenuItem::new(tr("menu.delete")).on_select(move || s.ask_delete(del.clone())),
     ];
     let _ = popup_menu(items);
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn every_shortcut_is_one_on_every_platform() {
+        for k in super::ALL {
+            for mac in [false, true] {
+                assert!(
+                    nsh_core::desktop::Shortcut::parse(k, mac).is_ok(),
+                    "{k} (mac: {mac})"
+                );
+            }
+            // `MenuItem::shortcut` panics on a keystroke that is not one.
+            let _ = nsh_core::element::desktop::MenuItem::new("x").shortcut(k);
+        }
+    }
 }

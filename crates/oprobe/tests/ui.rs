@@ -72,13 +72,17 @@ impl Ctx {
     }
 
     fn start_in(&self, locale: Locale) -> Headless {
+        self.start_on(Os::Linux, locale)
+    }
+
+    fn start_on(&self, os: Os, locale: Locale) -> Headless {
         let viewport = Size::new(Points(1360.0), Points(900.0));
         let config = EngineConfig {
             viewport,
             data_dir: Some(self.dir.path().join("app")),
             environment: Environment {
                 window: viewport,
-                os: Os::Linux,
+                os,
                 idiom: Idiom::Desktop,
                 locale,
                 locale_settings: LocaleSettings::of(locale),
@@ -329,4 +333,25 @@ fn the_menu_shortcuts_drive_the_window() {
     wait_long(&mut app, "id:delete-dialog");
     app.press("id:dialog-cancel").unwrap();
     app.wait_for_gone("id:dialog", LONG).unwrap();
+}
+
+#[test]
+fn the_macos_menu_bar_opens_settings_and_new_run() {
+    // On macOS the menus are the system's menu bar, built from the app's items with ⌘
+    // shortcuts: a keystroke that does not parse there left the app with the default menu (no
+    // Settings, no shortcuts).
+    let cx = Ctx::new();
+    let mut app = cx.start_on(Os::MacOs, Locale::EN_US);
+    wait_long(&mut app, "text:No runs yet");
+    app.press_key("cmd+,").unwrap();
+    wait_long(&mut app, "id:settings-dialog");
+    app.press("id:dialog-done").unwrap();
+    app.wait_for_gone("id:dialog", LONG).unwrap();
+    app.press_key("cmd+n").unwrap();
+    wait_long(&mut app, "id:new-run-dialog");
+    app.press_key("Escape").unwrap();
+    app.wait_for_gone("id:dialog", LONG).unwrap();
+    // ⌃⌘S hides the sidebar.
+    app.press_key("ctrl+cmd+s").unwrap();
+    app.wait_for_gone("id:sidebar", LONG).unwrap();
 }
