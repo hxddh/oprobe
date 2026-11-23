@@ -52,19 +52,35 @@ The window works like other professional tools on your platform (design:
   throttled requests (per request), with how many operations and requests were measured.
   A **Read these numbers with care** note comes first when the client was saturated, the run is
   partial, open-loop arrivals started late, or too few operations were measured.
-- **Findings**, each with its remedy and the evidence it rests on (below).
+- **Findings**, each with its remedy and the evidence it rests on (below). **Show N examples**
+  expands the waterfalls of the operations that show the problem.
 - **Where the time went**: the stage split of every operation, and of each verb.
 - **Requests by API**: for each S3 API, the request count, the status codes, TTFB p50 / p99,
-  p99, bytes down / up and connection reuse.
+  p99, bytes down / up and connection reuse. Click an API to list its slowest requests, and one
+  of those to see its operation's waterfall.
 - **Retries and failures**: retries, time spent waiting between attempts, 429 / 503 responses,
   the longest `Retry-After`, other errors and failure classes.
 - **The slowest operations** as a request waterfall. Each request is on a shared time axis and
-  coloured by stage; the wait before a retry is drawn as a line in the retry colour.
-- **Timeline**: goodput with the throttled and failed seconds shaded; p50 / p99 / p99.9; and the
-  number of requests in flight.
+  coloured by stage; the wait before a retry is drawn as a line in the retry colour. Hovering a
+  request reads out its stages and, when recorded, the provider's error code (`SlowDown`),
+  `Retry-After`, the connection's rtt, min rtt and retransmits, and `Server-Timing`.
+- **Timeline**, with a verb filter above it (All verbs, or one verb):
+  - goodput (successful operations) with the attempted rate, failures included, as a faint line
+    behind it, and the intervals with throttled responses or failed operations shaded;
+  - p50 / p99 / p99.9; an interval with too few operations for a quantile (fewer than
+    10 / (1 − q): 1 000 for p99) draws it faint and dashed, and the readout says so
+    (`n=12, too few for p99`);
+  - requests per second (retries included) with the retries per second;
+  - the number of requests in flight.
+
+  Requests and in-flight are not split by verb: with a verb chosen they say "all verbs".
 - **Latency distribution**: a CDF with p50 and p99 marked. It is drawn from every row when no row
-  was sampled away, else from the heatmap's counts, which include every operation.
-- **Heatmap and connections**.
+  was sampled away, else from the run's latency histogram, which counts every operation. With a
+  verb chosen (and no range), it is that verb's.
+- **Heatmap**: operations by start time and latency, in fine rows when every row was kept, with a
+  colour key from the fewest to the most operations in a cell. Click a cell to list its slowest
+  operations (verb, key, latency, status, attempts), and one of those to see its waterfall.
+- **Connections**.
 - **Details** (open on demand):
   - bytes asked for against bytes moved: read, write and request amplification, and cache hits;
   - the hottest keys, object sizes, prefixes and server addresses.
@@ -72,12 +88,22 @@ The window works like other professional tools on your platform (design:
   scheduling lag), the share of trace rows kept, and the `oprobe run …` command that runs it
   again.
 
+**A time range.** The timeline charts and the heatmap share one time cursor: hovering one shows
+the time on all. Drag across any of them to select a range, shaded on every time chart. The key
+numbers, the requests by API, the verbs, the distribution and the slowest operations then show
+that range, recomputed from the trace rows (an operation counts in the range it started in, a
+request in the range it was sent in); when the run kept only a share of its rows, the range says
+so and weights each row by the operations it stands for. Escape, a double-click on a chart or
+**Clear** drops the range. `oprobe show RUN --since 3s --until 8s` prints the same range.
+
+Every chart has the Image role and a label that summarises it for screen readers.
+
 Each finding carries the evidence it rests on:
 
 | Finding | Evidence |
 |---|---|
 | `throttling` | the share throttled at each number of requests in flight, with the fitted limit's interval shaded |
-| `key_limit`, `repeated_reads` | the hottest keys, with their share of the traffic and of the throttling |
+| `key_limit`, `repeated_reads` | the hottest keys, with their share of the traffic and their share of all throttling |
 | `small_ranges` | bytes asked for against bytes downloaded, and requests per operation |
 | `rate_limit` | throttled responses per second |
 | `bandwidth_cap` | bandwidth (MiB/s) over the run |
@@ -93,7 +119,8 @@ or TOML) on the clipboard.
 **Compare.** Two runs, or the operators of one multi-operator run, side by side: goodput, latency
 percentiles, the stage split and the findings of each, with their goodput over time and their
 latency distributions drawn on one chart each. Shares (errors, throttled) change by percentage
-points. Each column is a single run: to measure a change, prove it.
+points. The changes are shown in a neutral colour, never as better or worse: each column is a
+single run, and its difference includes run-to-run noise. To measure a change, prove it.
 
 ## Language
 

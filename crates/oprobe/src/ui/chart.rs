@@ -6,7 +6,9 @@
 
 use nsh_base::theme;
 use nsh_core::canvas::{CanvasTextAlign, CanvasTextBaseline};
+use nsh_core::element::TouchClaim;
 use nsh_core::prelude::*;
+use nsh_core::{TouchEvent, TouchPhase};
 
 use crate::ui::fmt::{self, Scale};
 use crate::ui::kit::{self, caption, paint, small, swatch};
@@ -31,6 +33,11 @@ pub struct Line {
     /// `(x, y)` sorted by x.
     pub pts: Vec<(f64, f64)>,
     pub mark: Mark,
+    /// Drawn faint: context behind the main series (the attempted rate behind goodput).
+    pub faint: bool,
+    /// Per point: too few samples to be an estimate (drawn faint and dashed). Empty: every
+    /// point holds.
+    pub weak: Vec<bool>,
 }
 
 impl Line {
@@ -40,7 +47,22 @@ impl Line {
             token,
             pts,
             mark: Mark::Step,
+            faint: false,
+            weak: Vec::new(),
         }
+    }
+    /// The same line drawn faint.
+    pub fn faint(mut self) -> Self {
+        self.faint = true;
+        self
+    }
+    /// The same line with the points where `weak` holds muted.
+    pub fn weak(mut self, weak: Vec<bool>) -> Self {
+        self.weak = weak;
+        self
+    }
+    fn is_weak(&self, i: usize) -> bool {
+        self.weak.get(i).copied().unwrap_or(false)
     }
     pub fn joined(label: impl Into<String>, token: &'static str, pts: Vec<(f64, f64)>) -> Self {
         Self {
@@ -159,6 +181,8 @@ pub struct Plot {
     pub lines: Vec<Line>,
     pub bands: Vec<Band>,
     pub rules: Vec<Rule>,
+    /// What the readout adds over `[from, to)` of x (`n=12, too few for p99`).
+    pub notes: Vec<(f64, f64, String)>,
 }
 
 impl Plot {
@@ -177,6 +201,50 @@ impl Plot {
             lines,
             bands: Vec::new(),
             rules: Vec::new(),
+            notes: Vec::new(),
+        }
+    }
+
+    /// The readout's note at `x`, if any.
+    pub fn note_at(&self, x: f64) -> Option<&str> {
+        self.notes
+            .iter()
+            .find(|(a, b, _)| *a <= x && x < *b)
+            .map(|n| n.2.as_str())
+    }
+
+    /// What a screen reader says of the chart: `Goodput over 8 s, 1.0k/s–1.1k/s` (a time
+    /// series), else the heading and the range of x.
+    pub fn summary(&self, heading: &str) -> String {
+        let ys: Vec<f64> = self
+            .lines
+            .iter()
+            .find(|l| !l.faint && !l.pts.is_empty())
+            .map(|l| l.pts.iter().map(|p| p.1).collect())
+            .unwrap_or_default();
+        let (lo, hi) = ys
+            .iter()
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), v| {
+                (a.min(*v), b.max(*v))
+            });
+        if self.x_fmt == Unit::Clock {
+            if !lo.is_finite() {
+                return crate::ui::i18n::trf(
+                    "chart.a11y_empty",
+                    &[&heading, &self.x_fmt.f()(self.x.max)],
+                );
+            }
+            let f = self.y_fmt.f();
+            crate::ui::i18n::trf(
+                "chart.a11y_time",
+                &[&heading, &self.x_fmt.f()(self.x.max), &f(lo), &f(hi)],
+            )
+        } else {
+            let f = self.x_fmt.f();
+            crate::ui::i18n::trf(
+                "chart.a11y_range",
+                &[&heading, &f(self.x.min), &f(self.x.max)],
+            )
         }
     }
 
@@ -191,9 +259,17 @@ impl Plot {
                     Mark::Step => l
                         .pts
                         .iter()
+                        .enumerate()
                         .rev()
-                        .find(|(px, _)| *px <= x && x < *px + self.step_w.max(1e-12))
-                        .map(|p| p.1),
+                        .find(|(i, (px, _))| {
+                            let end = l
+                                .pts
+                                .get(i + 1)
+                                .map(|n| n.0)
+                                .unwrap_or(*px + self.step_w.max(1e-12));
+                            *px <= x && x < end
+                        })
+                        .map(|(_, p)| p.1),
                     Mark::Line | Mark::Dots => l
                         .pts
                         .iter()
@@ -386,8 +462,39 @@ pub fn paint_plot(plot: &Plot, w: f32, h: f32) -> Painter {
                         .fill();
                 }
             }
+            Mark::Step | Mark::Line if l.weak.iter().any(|w| *w) => {
+                // Segment by segment: a weak point's step (or the segment into it) is faint
+                // and dashed, so a quantile from too few operations does not read as one.
+                let dash = [px(3.0), px(3.0)];
+                for (i, (x, y)) in l.pts.iter().enumerate() {
+                    let weak = l.is_weak(i);
+                    p = p
+                        .global_alpha(if weak { 0.35 } else { 1.0 })
+                        .line_dash(if weak && !kit::in_terminal() {
+                            &dash[..]
+                        } else {
+                            &[]
+                        })
+                        .line_width(if weak { 1.0 } else { 1.5 })
+                        .begin_path();
+                    if l.mark == Mark::Step {
+                        let next = l.pts.get(i + 1).map(|n| n.0).unwrap_or(x + plot.step_w);
+                        p = p.move_to(sx(*x), sy(*y)).line_to(sx(next), sy(*y));
+                        if let Some(n) = l.pts.get(i + 1) {
+                            p = p.line_to(sx(n.0), sy(n.1));
+                        }
+                    } else if let Some(n) = l.pts.get(i + 1) {
+                        p = p.move_to(sx(*x), sy(*y)).line_to(sx(n.0), sy(n.1));
+                    }
+                    p = p.stroke();
+                }
+                p = p.global_alpha(1.0).line_dash(&[]);
+            }
             Mark::Step | Mark::Line => {
-                p = p.line_width(1.5).begin_path();
+                p = p
+                    .global_alpha(if l.faint { 0.4 } else { 1.0 })
+                    .line_width(if l.faint { 1.0 } else { 1.5 })
+                    .begin_path();
                 for (i, (x, y)) in l.pts.iter().enumerate() {
                     p = if i == 0 {
                         p.move_to(sx(*x), sy(*y))
@@ -399,7 +506,7 @@ pub fn paint_plot(plot: &Plot, w: f32, h: f32) -> Painter {
                         p = p.line_to(sx(next), sy(*y));
                     }
                 }
-                p = p.stroke();
+                p = p.stroke().global_alpha(1.0);
             }
         }
     }
@@ -457,32 +564,218 @@ pub fn paint_plot(plot: &Plot, w: f32, h: f32) -> Painter {
     p.line_dash(&[])
 }
 
-/// The hover crosshair at canvas x `hx` (its own layer: a mouse move repaints only this).
-fn paint_crosshair(plot: &Plot, w: f32, h: f32, hx: f32) -> Painter {
+/// The time the charts of one view share (design v6.3 B5): the crosshair, the range selected by
+/// a drag, and the drag in progress. Every time chart and the heatmap given the same link show
+/// the same time cursor and shade the same range.
+#[derive(Clone, Copy)]
+pub struct TimeLink {
+    /// The time under the pointer, seconds into the window.
+    pub cursor: Signal<Option<f64>>,
+    /// The selected range `[from, to)`.
+    pub range: Signal<Option<(f64, f64)>>,
+    /// The range a drag is selecting (from where it began to where it is).
+    pub drag: Signal<Option<(f64, f64)>>,
+}
+
+impl TimeLink {
+    pub fn new() -> Self {
+        Self {
+            cursor: signal(None),
+            range: signal(None),
+            drag: signal(None),
+        }
+    }
+
+    /// The range shaded now: the drag in progress, else the selection.
+    pub fn shaded(&self) -> Option<(f64, f64)> {
+        self.drag
+            .get()
+            .map(|(a, b)| (a.min(b), a.max(b)))
+            .or_else(|| self.range.get())
+    }
+
+    pub fn clear(&self) {
+        self.range.set(None);
+        self.drag.set(None);
+    }
+}
+
+impl Default for TimeLink {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A pointer's gesture over a linked canvas: where it went down (canvas points) and when the
+/// last tap ended (for a double tap).
+#[derive(Clone, Copy)]
+pub struct Gesture {
+    start: Signal<Option<(f32, f32)>>,
+    last_tap: Signal<f64>,
+}
+
+impl Gesture {
+    pub fn new() -> Self {
+        Self {
+            start: signal(None),
+            last_tap: signal(f64::NEG_INFINITY),
+        }
+    }
+}
+
+impl Default for Gesture {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The pointer moves this far (points) before a press becomes a drag.
+const DRAG_SLOP: f32 = 3.0;
+/// Two taps this close (ms) are a double tap.
+const DOUBLE_TAP_MS: f64 = 400.0;
+
+/// Brushing on a linked canvas: a drag selects a time range (`to_t` maps a canvas x to a time,
+/// `None` off the plot), a double tap clears it, a tap calls `tap` with where it landed.
+pub fn on_brush(
+    e: &TouchEvent,
+    link: TimeLink,
+    g: Gesture,
+    to_t: &dyn Fn(f32) -> Option<f64>,
+    tap: &dyn Fn(f32, f32),
+) {
+    let Some(p) = e.points.iter().find(|p| p.changed) else {
+        return;
+    };
+    let (x, y) = (p.location.x.0, p.location.y.0);
+    match e.phase {
+        TouchPhase::Start => {
+            g.start.set(Some((x, y)));
+            link.drag.set(None);
+        }
+        TouchPhase::Move => {
+            let Some((x0, _)) = g.start.get_untracked() else {
+                return;
+            };
+            if (x - x0).abs() >= DRAG_SLOP
+                && let (Some(a), Some(b)) = (to_t(x0), to_t(x))
+            {
+                link.drag.set(Some((a, b)));
+                link.cursor.set(Some(b));
+            }
+        }
+        TouchPhase::End => {
+            let start = g.start.get_untracked();
+            g.start.set(None);
+            let drag = link.drag.get_untracked();
+            link.drag.set(None);
+            match (start, drag) {
+                (Some((x0, _)), Some((a, b))) if (x - x0).abs() >= DRAG_SLOP => {
+                    let b = to_t(x).unwrap_or(b);
+                    let (lo, hi) = (a.min(b), a.max(b));
+                    if hi > lo {
+                        link.range.set(Some((lo, hi)));
+                    }
+                }
+                _ => {
+                    if e.timestamp - g.last_tap.get_untracked() < DOUBLE_TAP_MS {
+                        link.range.set(None);
+                        g.last_tap.set(f64::NEG_INFINITY);
+                    } else {
+                        g.last_tap.set(e.timestamp);
+                        tap(x, y);
+                    }
+                }
+            }
+        }
+        TouchPhase::Cancel => {
+            g.start.set(None);
+            link.drag.set(None);
+        }
+    }
+}
+
+/// The time cursor and the shaded range over a plot area `[x0, x1] × [y1, y0]` of x scale
+/// `x` (its own layer: a pointer move repaints only this).
+pub fn paint_time_overlay(
+    mut p: Painter,
+    x: &Scale,
+    area: (f32, f32, f32, f32),
+    cursor: Option<f64>,
+    band: Option<(f64, f64)>,
+) -> Painter {
+    let (x0, x1, y0, y1) = area;
+    let sx = |v: f64| x0 + (x.norm(v).clamp(0.0, 1.0) as f32) * (x1 - x0);
+    if let Some((a, b)) = band {
+        let (l, r) = (sx(a), sx(b));
+        p = p
+            .global_alpha(0.16)
+            .fill_color(paint("series-a"))
+            .fill_rect(l, y1, (r - l).max(1.0), y0 - y1)
+            .global_alpha(0.7)
+            .stroke_color(paint("series-a"))
+            .line_width(1.0)
+            .begin_path()
+            .move_to(l.round() + 0.5, y1)
+            .line_to(l.round() + 0.5, y0)
+            .move_to(r.round() - 0.5, y1)
+            .line_to(r.round() - 0.5, y0)
+            .stroke()
+            .global_alpha(1.0);
+    }
+    if let Some(t) = cursor.filter(|t| *t >= x.min && *t <= x.max) {
+        let px_ = sx(t).round() + 0.5;
+        p = p
+            .stroke_color(paint("axis"))
+            .line_width(1.0)
+            .begin_path()
+            .move_to(px_, y1)
+            .line_to(px_, y0)
+            .stroke();
+    }
+    p
+}
+
+/// The value of each line at `xv` as dots on the cursor.
+fn paint_dots(mut p: Painter, plot: &Plot, w: f32, h: f32, xv: f64) -> Painter {
     let f = frame_for(&plot.y, plot.y_fmt.f(), h);
     let (x0, x1, y0, y1) = (f.left, f.x1(w), f.y0(h), f.top);
-    if hx < x0 || hx > x1 {
-        return Painter::new();
+    if xv < plot.x.min || xv > plot.x.max {
+        return p;
     }
-    let xv = plot.x.value(((hx - x0) / (x1 - x0)) as f64);
-    let mut p = Painter::new()
-        .stroke_color(paint("axis"))
-        .line_width(1.0)
-        .begin_path()
-        .move_to(hx.round() + 0.5, y1)
-        .line_to(hx.round() + 0.5, y0)
-        .stroke();
+    let hx = x0 + (plot.x.norm(xv) as f32) * (x1 - x0);
     for ((_, v), l) in plot.values_at(xv).into_iter().zip(&plot.lines) {
         if let Some(v) = v {
             let py = y0 - (plot.y.norm(v) as f32) * (y0 - y1);
             p = p
+                .global_alpha(if l.faint { 0.5 } else { 1.0 })
                 .fill_color(paint(l.token))
                 .begin_path()
                 .arc(hx, py, 3.0, 0.0, std::f32::consts::TAU)
                 .fill();
         }
     }
-    p
+    p.global_alpha(1.0)
+}
+
+/// The x value under canvas x `hx` (`None` off the plot area).
+fn x_at(plot: &Plot, w: f32, h: f32, hx: f32) -> Option<f64> {
+    let f = frame_for(&plot.y, plot.y_fmt.f(), h);
+    let (x0, x1) = (f.left, f.x1(w));
+    (hx >= x0 - 1.0 && hx <= x1 + 1.0)
+        .then(|| plot.x.value(((hx - x0) / (x1 - x0)).clamp(0.0, 1.0) as f64))
+}
+
+/// The readout at x value `xv`: x, each line's value and the note there.
+pub fn readout_at(p: &Plot, xv: f64) -> String {
+    let mut s = p.x_fmt.f()(xv);
+    for (label, v) in p.values_at(xv) {
+        let v = v.map(p.y_fmt.f()).unwrap_or_else(|| "—".into());
+        s += &format!(" · {label} {v}");
+    }
+    if let Some(n) = p.note_at(xv) {
+        s += &format!(" · {n}");
+    }
+    s
 }
 
 /// A chart: its heading, legend and hover readout above the canvas.
@@ -491,27 +784,44 @@ pub fn chart(
     height: f32,
     data: impl Fn() -> Option<Plot> + 'static,
 ) -> View {
+    chart_with(heading, height, data, None, "chart")
+}
+
+/// A chart on a time axis that shares its crosshair and range with the others of `link`; a
+/// drag on it selects a range (`id`: its canvas's test id).
+pub fn linked_chart(
+    heading: impl IntoReactive<SharedString>,
+    height: f32,
+    data: impl Fn() -> Option<Plot> + 'static,
+    link: TimeLink,
+    id: &'static str,
+) -> View {
+    chart_with(heading, height, data, Some(link), id)
+}
+
+fn chart_with(
+    heading: impl IntoReactive<SharedString>,
+    height: f32,
+    data: impl Fn() -> Option<Plot> + 'static,
+    link: Option<TimeLink>,
+    id: &'static str,
+) -> View {
     let plot = computed(data);
     let size = signal((0.0_f32, 0.0_f32));
-    let hover = signal(None::<f32>);
+    // The x value under the pointer: the link's time, or this chart's own.
+    let cursor = link
+        .map(|l| l.cursor)
+        .unwrap_or_else(|| signal(None::<f64>));
+    let heading = heading.into_reactive();
+    let a11y_heading = heading.clone();
     let readout = move || -> SharedString {
-        let Some(hx) = hover.get() else {
+        let Some(xv) = cursor.get() else {
             return "".into();
         };
-        let (w, h) = size.get_untracked();
         plot.with_untracked(|p| {
-            let Some(p) = p else {
-                return SharedString::default();
-            };
-            let f = frame_for(&p.y, p.y_fmt.f(), h);
-            let t = ((hx - f.left) / (f.x1(w) - f.left)).clamp(0.0, 1.0) as f64;
-            let xv = p.x.value(t);
-            let mut s = p.x_fmt.f()(xv);
-            for (label, v) in p.values_at(xv) {
-                let v = v.map(p.y_fmt.f()).unwrap_or_else(|| "—".into());
-                s += &format!(" · {label} {v}");
-            }
-            s.into()
+            p.as_ref()
+                .map(|p| SharedString::from(readout_at(p, xv)))
+                .unwrap_or_default()
         })
     };
     let legend = move || {
@@ -531,6 +841,60 @@ pub fn chart(
                 })
                 .unwrap_or_default()
         })
+    };
+    let a11y = move || -> SharedString {
+        let h = a11y_heading.get();
+        plot.with(|p| {
+            p.as_ref()
+                .map(|p| SharedString::from(p.summary(&h)))
+                .unwrap_or_else(|| h.clone())
+        })
+    };
+    let gesture = Gesture::new();
+    let overlay = canvas(move || {
+        let (w, h) = size.get();
+        let c = cursor.get();
+        let band = link.and_then(|l| l.shaded());
+        plot.with(|p| match p {
+            Some(p) if w > 0.0 => {
+                let f = frame_for(&p.y, p.y_fmt.f(), h);
+                let area = (f.left, f.x1(w), f.y0(h), f.top);
+                let layer = paint_time_overlay(Painter::new(), &p.x, area, c, band);
+                match c {
+                    Some(xv) => paint_dots(layer, p, w, h, xv),
+                    None => layer,
+                }
+            }
+            _ => Painter::new(),
+        })
+    })
+    .absolute()
+    .top(px(0.0))
+    .left(px(0.0))
+    .right(px(0.0))
+    .bottom(px(0.0))
+    .test_id(id)
+    .role(AccessibilityRole::Image)
+    .label(a11y)
+    .on_mouse_move(move |e: &MouseEvent| {
+        let (w, h) = size.get_untracked();
+        let xv = plot.with_untracked(|p| p.as_ref().and_then(|p| x_at(p, w, h, e.position.x.0)));
+        cursor.set(xv);
+    })
+    .on_mouse_leave(move |_: &MouseEvent| cursor.set(None));
+    let overlay = match link {
+        Some(link) => {
+            overlay
+                .claim_touches(TouchClaim::on_start())
+                .on_touch(move |e: &TouchEvent| {
+                    let (w, h) = size.get_untracked();
+                    let to_t = |hx: f32| {
+                        plot.with_untracked(|p| p.as_ref().and_then(|p| x_at(p, w, h, hx)))
+                    };
+                    on_brush(e, link, gesture, &to_t, &|_, _| {});
+                })
+        }
+        None => overlay,
     };
     view()
         .gap_1()
@@ -590,25 +954,7 @@ pub fn chart(
                         size.set((frame.size.width.0, frame.size.height.0))
                     }),
                 )
-                .child(
-                    canvas(move || {
-                        let (w, h) = size.get();
-                        let Some(hx) = hover.get() else {
-                            return Painter::new();
-                        };
-                        plot.with(|p| match p {
-                            Some(p) if w > 0.0 => paint_crosshair(p, w, h, hx),
-                            _ => Painter::new(),
-                        })
-                    })
-                    .absolute()
-                    .top(px(0.0))
-                    .left(px(0.0))
-                    .right(px(0.0))
-                    .bottom(px(0.0))
-                    .on_mouse_move(move |e: &MouseEvent| hover.set(Some(e.position.x.0)))
-                    .on_mouse_leave(move |_: &MouseEvent| hover.set(None)),
-                ),
+                .child(overlay),
         )
 }
 

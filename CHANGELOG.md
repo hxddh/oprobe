@@ -28,6 +28,31 @@ All notable changes to this project are documented here. The format follows
   quantiles of intervals with too few operations; `FindingView::remedy_line`;
   `Slice::throttle_share_ratio` for hot keys.
 
+- **Brush and link in the app.** The timeline charts and the heatmap share one time cursor; a
+  drag across any of them selects a time range, shaded on every time chart. With a range
+  selected, the key numbers, the requests by API, the verbs, the latency distribution and the
+  slowest operations are recomputed for it from the trace rows (sampled rows say so and are
+  weighted). Escape, a double-click or **Clear** drops it.
+- **`oprobe show RUN --since 3s --until 8s`**: the same range from the CLI (its goodput, latency
+  quantiles, failures, requests, retries and throttling, where the time went, the verbs, the
+  requests by API and the slowest operations; `-o json` adds a `range` object). With `--by`,
+  only the range's requests are grouped.
+- **Drill down in the app**, each on demand: a finding's **Show N examples** expands the
+  waterfalls of its example operations; a click on a heatmap cell lists the slowest operations
+  of that time bucket and latency row; a click on an API lists its slowest requests; a click on
+  one of those opens its waterfall. Hovering a request in a waterfall also shows the provider's
+  error code, `Retry-After`, rtt / min rtt / retransmits and `Server-Timing` when recorded.
+- **A verb filter above the app's timeline** (All verbs, or one): goodput and latency follow it,
+  and the distribution when no range is selected; requests and in-flight say "all verbs".
+- The app's timeline gains a **Requests per second** chart with retries per second beside it.
+- Every chart in the app has the Image role and a label that summarises it ("Goodput over 8 s,
+  1.0k/s–1.1k/s").
+- Core: `report::range` — `RangeView::of(run, since, until)` (also `view::RangeView`), the
+  drill-down queries `ops_in` (a heatmap cell) and `slowest_requests` (an API), `view::examples`
+  and `view::waterfall`, `LatencyCdf::for_verb`; `WaterfallRow` carries the wait before a retry,
+  the provider's error code, `Retry-After`, rtt, min rtt, retransmits, `Server-Timing` and the
+  request id.
+
 ### Changed
 
 - **The demo proves.** `oprobe demo` then `oprobe prove last` (every default) proves its top
@@ -75,6 +100,19 @@ All notable changes to this project are documented here. The format follows
   the one with the largest gain; evidence gains `affected_apis_count`.
 - Hot keys in the view model carry `throttle_share_ratio` (share of all throttling); the slices'
   `throttled_ratio` is the share of the slice's own requests, and is `None` for hot keys.
+
+- **Honest charts in the app.** Goodput is drawn from successful operations, with the attempted
+  rate (failures included) as a faint labelled line behind it; the shading and the throttling
+  evidence count throttled **responses** and say so; p50 / p99 / p99.9 of intervals with too few
+  operations are drawn faint and dashed, and the readout says why (`n=12, too few for p99`); the
+  heatmap uses the fine rows when every row was kept and has a colour key from the fewest to the
+  most operations in a cell; the distribution comes from the run's histogram.
+- **Compare stays neutral**: single-run deltas are no longer green or red; the note points to
+  prove.
+- The hottest keys' column reads **Share of throttling**; the other slices keep **Throttled**
+  (the share of their own requests).
+- (Tests) The app's plot tests now build `TimelineView`s; `the_timeline_shades_only_the_seconds_
+  that_were_throttled` became `…_intervals_with_throttled_responses` (the band's label changed).
 
 ### Fixed
 

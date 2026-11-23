@@ -635,3 +635,86 @@ pub fn disclosure(
             untracked(|| o.then(|| content().gap_3()))
         }))
 }
+
+/// A [`table`] whose rows can be pressed: each row is a button (`{id}-{i}`, labelled with its
+/// cells) that calls `on_row` with its index, and the row `selected` says is highlighted.
+pub fn pressable_table(
+    cols: &[Col],
+    rows: Vec<Vec<String>>,
+    id: &'static str,
+    selected: impl Fn() -> Option<usize> + Clone + 'static,
+    on_row: impl Fn(usize) + Clone + 'static,
+) -> impl IntoElement {
+    let cols: Vec<Col> = cols.to_vec();
+    let total: f32 = cols.iter().skip(1).map(|c| c.width).sum::<f32>() + 160.0;
+    let cell = |c: Col, first: bool, t: String, head: bool| {
+        let t = if head {
+            caption(t)
+        } else if c.numeric {
+            text(t).text_size(px(metrics().small + 1.0)).tabular_nums()
+        } else {
+            text(t).text_size(px(metrics().small + 1.0))
+        };
+        let v = view().min_w(px(0.0)).child(t.number_of_lines(1));
+        let v = if first {
+            v.flex_1().min_w(px(120.0))
+        } else {
+            v.w(px(c.width)).flex_shrink_0()
+        };
+        if c.numeric { v.items_end() } else { v }
+    };
+    let heads: Vec<String> = cols
+        .iter()
+        .map(|c| crate::ui::i18n::tr(c.heading).to_owned())
+        .collect();
+    let head = view()
+        .flex_row()
+        .items_center()
+        .gap_3()
+        .py(px(if in_terminal() { 0.0 } else { 5.0 }))
+        .children(
+            cols.iter()
+                .zip(heads)
+                .enumerate()
+                .map(|(i, (c, t))| cell(*c, i == 0, t, true)),
+        );
+    scroll()
+        .horizontal()
+        .min_w(px(0.0))
+        .child(
+            view()
+                .min_w(px(total))
+                .child(head)
+                .children(rows.into_iter().enumerate().map(|(i, r)| {
+                    let on_row = on_row.clone();
+                    let selected = selected.clone();
+                    let label = r.join(", ");
+                    button()
+                        .on_press(move || on_row(i))
+                        .accessibility_label(label)
+                        .test_id(&format!("{id}-{i}"))
+                        .flex_row()
+                        .items_center()
+                        .gap_3()
+                        .py(px(if in_terminal() { 0.0 } else { 5.0 }))
+                        .border_t(px(1.0))
+                        .border_color(move || theme().border)
+                        .rounded(px(3.0))
+                        .bg(move || {
+                            if selected() == Some(i) {
+                                theme().muted
+                            } else {
+                                transparent_black().into()
+                            }
+                        })
+                        .hover(|s| s.bg(move || theme().muted))
+                        .focus_visible(ring)
+                        .children(
+                            cols.iter()
+                                .zip(r)
+                                .enumerate()
+                                .map(|(k, (c, t))| cell(*c, k == 0, t, false)),
+                        )
+                })),
+        )
+}
