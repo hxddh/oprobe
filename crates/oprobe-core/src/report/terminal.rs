@@ -561,12 +561,9 @@ fn render_with(r: &Report, run: Option<&Run>, detail: bool) -> String {
                     let _ = writeln!(out, "    {}", dim(&l));
                 }
             }
-            for (i, l) in wrap_text(
-                &format!("remedy: {} — {}", f.remedy_label(), f.remedy),
-                WIDTH - 6,
-            )
-            .iter()
-            .enumerate()
+            for (i, l) in wrap_text(&format!("remedy: {}", f.remedy_line()), WIDTH - 6)
+                .iter()
+                .enumerate()
             {
                 let _ = writeln!(out, "    {} {l}", if i == 0 { "→" } else { " " });
             }

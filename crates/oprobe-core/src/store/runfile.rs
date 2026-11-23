@@ -73,8 +73,11 @@ pub struct IntervalBlock {
     /// Start of the slice, seconds from the window start.
     pub t_s: f64,
     pub len_s: f64,
+    /// Operations started in the slice.
     pub ops_count: u64,
+    /// Operations that failed in the slice (when they ended).
     pub errors_count: u64,
+    /// Throttled responses received in the slice (before 6.3: throttled operations).
     pub throttled_count: u64,
     pub transferred_bytes: u64,
     pub p50_ms: f64,
@@ -97,6 +100,18 @@ pub struct IntervalBlock {
     /// Operations per heatmap latency row (the interval's latency sketch).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub latency_rows_count: Vec<u64>,
+    /// Operations started in the slice that succeeded.
+    #[serde(default)]
+    pub ok_ops_count: u64,
+    /// Operations started in the slice that saw a throttled response.
+    #[serde(default)]
+    pub throttled_ops_count: u64,
+    /// Requests sent in the slice, retries included.
+    #[serde(default)]
+    pub requests_count: u64,
+    /// Retries issued in the slice.
+    #[serde(default)]
+    pub retries_count: u64,
 }
 
 impl IntervalBlock {
@@ -106,7 +121,12 @@ impl IntervalBlock {
         Self {
             t_s: p.t_s,
             len_s: len,
-            ops_count: (p.ops_per_s * len).round().max(0.0) as u64,
+            // Exact since 6.3; earlier timelines only carry the rate.
+            ops_count: if p.ops_count > 0 {
+                p.ops_count
+            } else {
+                (p.ops_per_s * len).round().max(0.0) as u64
+            },
             errors_count: p.errors,
             throttled_count: p.throttled,
             transferred_bytes: (p.mib_per_s * len * 1024.0 * 1024.0).round().max(0.0) as u64,
@@ -120,6 +140,10 @@ impl IntervalBlock {
             new_connections_count: p.new_connections,
             cpu_pct: p.cpu_pct,
             latency_rows_count: p.latency_rows_count.clone(),
+            ok_ops_count: p.ok_ops_count,
+            throttled_ops_count: p.throttled_ops,
+            requests_count: p.requests_count,
+            retries_count: p.retries_count,
         }
     }
 }

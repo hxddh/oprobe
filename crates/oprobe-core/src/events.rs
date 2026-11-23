@@ -48,18 +48,31 @@ pub enum EventKind {
         #[serde(rename = "requests_count", alias = "requests")]
         requests: u64,
     },
-    /// One second of the measurement window.
+    /// One interval of the measurement window (as `report.timeline`: operations by their
+    /// start; failures, throttled responses, requests and retries when they happened).
     Interval {
         /// Start of the second, seconds from the window start.
         t_s: f64,
+        /// Operations started per second, failed ones included.
         ops_per_s: f64,
         mib_per_s: f64,
         p50_ms: f64,
         p99_ms: f64,
+        /// Operations that failed in the interval.
         #[serde(rename = "errors_count", alias = "errors")]
         errors: u64,
+        /// Throttled responses received in the interval.
         #[serde(rename = "throttled_count", alias = "throttled")]
         throttled: u64,
+        /// Successful operations started per second.
+        #[serde(default)]
+        goodput_ops_per_s: f64,
+        /// Requests sent in the interval, retries included.
+        #[serde(default)]
+        requests_count: u64,
+        /// Retries issued in the interval.
+        #[serde(default)]
+        retries_count: u64,
     },
     Finding {
         #[serde(flatten)]
@@ -260,6 +273,9 @@ impl EventBus {
                         p99_ms: t.p99_ms,
                         errors: t.errors,
                         throttled: t.throttled,
+                        goodput_ops_per_s: t.goodput_ops_per_s,
+                        requests_count: t.requests_count,
+                        retries_count: t.retries_count,
                     });
                 }
                 st.1 = st.1.max(done);

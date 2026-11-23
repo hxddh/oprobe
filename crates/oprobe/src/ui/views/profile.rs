@@ -402,6 +402,7 @@ fn details(m: &ProfileModel) -> View {
                     fmt::count(x.requests_count),
                     fmt::ratio(x.share_ratio),
                     x.throttled_ratio
+                        .or(x.throttle_share_ratio)
                         .map(fmt::ratio)
                         .unwrap_or_else(|| "—".into()),
                     x.p99_ms.map(fmt::dur_ms).unwrap_or_else(|| "—".into()),
@@ -644,7 +645,7 @@ fn evidence(m: &ProfileModel, f: &FindingRow) -> Option<View> {
                         k.key.clone(),
                         fmt::count(k.requests_count),
                         fmt::ratio(k.share_ratio),
-                        k.throttled_ratio.map(fmt::ratio).unwrap_or_default(),
+                        k.throttle_share_ratio.map(fmt::ratio).unwrap_or_default(),
                     ]
                 })
                 .collect();

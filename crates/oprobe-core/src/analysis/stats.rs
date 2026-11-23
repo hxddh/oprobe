@@ -34,6 +34,27 @@ pub fn quantile_us_ms(v: &mut [u64], q: f64) -> f64 {
     *x as f64 / 1000.0
 }
 
+/// Nearest-rank quantile of weighted integer samples `(µs, weight)` in ms: the smallest value
+/// whose cumulative weight reaches `q` of the total (with every weight 1, the same as
+/// [`quantile_us_ms`]). Sampled rows carry the number of operations they stand for
+/// ([`crate::model::Run::op_weights`]). 0 for no weight. Reorders `v`.
+pub fn weighted_quantile_us_ms(v: &mut [(u64, f64)], q: f64) -> f64 {
+    let total: f64 = v.iter().map(|x| x.1.max(0.0)).sum();
+    if v.is_empty() || total <= 0.0 {
+        return 0.0;
+    }
+    v.sort_unstable_by_key(|x| x.0);
+    let target = total * q.clamp(0.0, 1.0);
+    let mut acc = 0.0;
+    for (us, w) in v.iter() {
+        acc += w.max(0.0);
+        if acc + 1e-9 * total >= target && acc > 0.0 {
+            return *us as f64 / 1000.0;
+        }
+    }
+    v.last().map_or(0.0, |x| x.0 as f64 / 1000.0)
+}
+
 /// The latency distribution of `us` (µs samples) with the one percentile estimator of
 /// reports, findings and compare (design v4 §4): nearest rank over the exact samples. `None`
 /// for no samples. Reorders `us`.
@@ -271,6 +292,26 @@ pub fn sparkline(values: &[f64], width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn weighted_quantiles_match_nearest_rank_and_follow_the_weights() {
+        let mut us: Vec<u64> = (1..=100).map(|i| i * 1000).collect();
+        let mut w: Vec<(u64, f64)> = us.iter().map(|v| (*v, 1.0)).collect();
+        for q in [0.0, 0.1, 0.5, 0.9, 0.99, 1.0] {
+            assert_eq!(
+                weighted_quantile_us_ms(&mut w, q),
+                quantile_us_ms(&mut us, q),
+                "q {q}"
+            );
+        }
+        // 99 fast rows that each stand for 10 operations and one slow row for itself: the
+        // slow row is 0.1 % of the operations, not 1 % of the rows.
+        let mut w: Vec<(u64, f64)> = (0..99).map(|_| (10_000, 10.0)).collect();
+        w.push((900_000, 1.0));
+        assert_eq!(weighted_quantile_us_ms(&mut w, 0.99), 10.0);
+        assert_eq!(weighted_quantile_us_ms(&mut w, 0.9995), 900.0);
+        assert_eq!(weighted_quantile_us_ms(&mut [], 0.5), 0.0);
+    }
 
     #[test]
     fn quantiles_and_summaries() {

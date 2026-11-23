@@ -548,6 +548,7 @@ pub fn build_run(i: ReportInput<'_>) -> Run {
         open_loop: snapshot.open_loop.clone(),
         timeline: snapshot.timeline.clone(),
         heatmap,
+        latency_histogram: snapshot.latency_histogram.clone(),
         findings: Vec::new(),
         slowest: snapshot.slow_ops.iter().map(|s| s.op_id).collect(),
         cleanup,

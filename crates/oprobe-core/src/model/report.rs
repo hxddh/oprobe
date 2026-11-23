@@ -16,8 +16,8 @@ use crate::analysis::diagnosis::{Bottleneck, Severity, SlaVerdict};
 use crate::engine::CleanupSummary;
 use crate::model::TraceInfo;
 use crate::trace::{
-    ApiStats, ByteStats, CacheStats, ConnStats, EffectiveKnobs, IntegrityStats, OpBreakdown,
-    OpenLoopStats, Quantiles, ResilienceStats, Summary, TimelinePoint, VerbStats,
+    ApiStats, ByteStats, CacheStats, ConnStats, EffectiveKnobs, IntegrityStats, LatencyHistogram,
+    OpBreakdown, OpenLoopStats, Quantiles, ResilienceStats, Summary, TimelinePoint, VerbStats,
 };
 
 /// Schema id of [`Report`].
@@ -121,8 +121,15 @@ pub struct Report {
     /// How the trace rows were sampled (findings use aggregate counts, never these).
     #[serde(default)]
     pub sampling: super::Sampling,
+    /// Per interval: 1 s for the first ten minutes, then 10 s. Operation counts and quantiles
+    /// by operation start; requests, throttled responses, retries and failures by when they
+    /// happened (see [`TimelinePoint`]).
     pub timeline: Vec<TimelinePoint>,
     pub heatmap: Heatmap,
+    /// Every operation's latency as a fine log-scale histogram (20 bins per decade, never
+    /// sampled): what the latency CDF is drawn from. Absent in reports before 6.3.
+    #[serde(default, skip_serializing_if = "LatencyHistogram::is_empty")]
+    pub latency_histogram: LatencyHistogram,
     pub findings: Vec<Finding>,
     /// How much load the target takes: the in-flight ceiling and the per-op request shape.
     #[serde(default)]
@@ -810,7 +817,8 @@ pub fn evidence_label(key: &str, v: f64) -> (String, String) {
         "ceiling_lo_inflight_count" => Some("Clean up to (in flight)"),
         "ceiling_hi_inflight_count" => Some("Throttled from (in flight)"),
         "peak_inflight_per_op_count" => Some("In flight per operation (peak)"),
-        "extra_requests_per_1k_ops_mean" => Some("Extra requests per 1 000 ops"),
+        "extra_requests_per_1k_ops_mean" => Some("Extra requests per 1\u{202f}000 ops"),
+        "saved_requests_per_1k_ops_mean" => Some("Requests saved per 1\u{202f}000 reads"),
         "mean_request_bytes" => Some("Mean request size"),
         "tail_cut_deadline_ms" => Some("Tail-cut deadline"),
         "tail_cut_blind_s" => Some("Tail-cut blind for"),
@@ -860,7 +868,8 @@ pub fn evidence_label(key: &str, v: f64) -> (String, String) {
             "{} {unit}",
             group_thousands(v, if v.abs() < 10.0 { 1 } else { 0 })
         )
-    } else if key.ends_with("_count") {
+    } else if key.ends_with("_count") || key.contains("_per_1k_") {
+        // Counts, and counts per 1 000 operations, are whole numbers.
         group_thousands(v, 0)
     } else {
         group_thousands(v, 2)
@@ -879,8 +888,9 @@ fn pct(p: f64) -> String {
     }
 }
 
-/// `12345.6` → `12 346` (thin groups of three, `decimals` after the point).
-fn group_thousands(v: f64, decimals: usize) -> String {
+/// `12345.6` → `12 346` (narrow no-break spaces between groups of three, `decimals` after the
+/// point): the number format of evidence values, also used in evidence texts.
+pub fn group_thousands(v: f64, decimals: usize) -> String {
     let s = format!("{:.*}", decimals, v.abs());
     let (int, frac) = s.split_once('.').map_or((s.as_str(), ""), |(a, b)| (a, b));
     let mut out = String::new();
@@ -936,7 +946,7 @@ mod tests {
         assert_eq!(l["Clean up to (in flight)"], "20");
         assert_eq!(l["p99 / p50"], "30.00×");
         assert_eq!(l["Ceiling requests"], "2\u{202f}410 requests/s");
-        assert_eq!(l["Extra requests per 1 000 ops"], "−1\u{202f}031.00");
+        assert_eq!(l["Extra requests per 1\u{202f}000 ops"], "−1\u{202f}031");
         assert!(l["Mean request size"].contains("KiB"), "{l:?}");
         assert!(l["P99"].ends_with("ms"), "{l:?}");
         assert!(!l.keys().any(|k| k.contains('_')), "{l:?}");

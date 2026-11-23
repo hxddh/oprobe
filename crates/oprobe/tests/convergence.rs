@@ -205,6 +205,56 @@ fn a_rate_limit_is_capped_under_the_rate() {
     }
 }
 
+/// The default `lab://ratelimit` (OpenDAL's default retry: 1 s backoff, no jitter) is a rate
+/// limit, not an in-flight limit: the workers wake in step and throttle only above a couple of
+/// requests in flight, but the bursts the bucket serves after each lull are more than any cap
+/// of that size carries (design 6.3 A1). A run that saw no throttling is repeated; no run may
+/// name an in-flight limit.
+#[test]
+fn the_default_rate_limit_lab_is_a_rate_limit() {
+    let env = Env::new();
+    let mut found = None;
+    for _ in 0..3 {
+        let v = env.json(&["run", "lab://ratelimit"]);
+        let r = v["runs"][0]["report"].clone();
+        assert!(
+            finding(&r, "throttling").is_none(),
+            "the rate limit read as an in-flight limit: {:#}",
+            r["capacity"]["hypotheses"]
+        );
+        if finding(&r, "rate_limit").is_some() {
+            found = Some(r);
+            break;
+        }
+    }
+    let r = found.expect("a rate_limit finding in 3 runs");
+    check_finding(&r, "rate_limit", Some("layers.concurrent_limit.http"));
+    assert!(
+        r["capacity"]["inflight_ceiling"].is_null(),
+        "not an in-flight limit (A1)"
+    );
+    // The timeline shows the request rate and the throttled responses where they happened.
+    let tl = r["timeline"].as_array().unwrap();
+    let requests: u64 = tl
+        .iter()
+        .map(|p| p["requests_count"].as_u64().unwrap())
+        .sum();
+    let throttled: u64 = tl
+        .iter()
+        .map(|p| p["throttled_count"].as_u64().unwrap())
+        .sum();
+    assert_eq!(
+        requests,
+        r["connections"]["requests_count"].as_u64().unwrap()
+    );
+    assert_eq!(
+        throttled,
+        r["resilience"]["throttled_responses_count"]
+            .as_u64()
+            .unwrap()
+    );
+}
+
 /// Zipf reads over per-key buckets of 40 requests/s: a key limit. Its remedy is the key
 /// layout (not a layer); prove tests the client-side cap as the stopgap.
 #[test]
