@@ -1343,6 +1343,23 @@ pub struct Validity {
     pub suppress: bool,
 }
 
+impl Validity {
+    /// Why the run cannot be judged on performance (invalid, or partial and too short), or
+    /// `None` for a run that can: `prove` refuses such a run, and no finding suggests it.
+    pub fn unjudged(&self, r: &Report) -> Option<String> {
+        if let Some(why) = &self.invalid {
+            return Some(why.clone());
+        }
+        let p = r.run.partial.as_ref().filter(|_| self.suppress)?;
+        Some(format!(
+            "it is partial ({} after {:.1} s of the {:.1} s window)",
+            p.reason.describe(),
+            p.measured_s,
+            r.workload.duration_s
+        ))
+    }
+}
+
 /// The run's [`Validity`].
 pub fn run_validity(r: &Report) -> Validity {
     let s = &r.summary;
@@ -1375,7 +1392,9 @@ pub fn run_validity(r: &Report) -> Validity {
 }
 
 /// Apply the run's [`Validity`] to `findings`: performance findings are dropped when the run
-/// cannot be judged, and `invalid_run` says why. Idempotent.
+/// cannot be judged, and `invalid_run` says why. It leads, and no finding suggests `prove`
+/// (which refuses such a run): a limit seen in a broken run is a lead, not a remedy to size.
+/// Idempotent.
 pub fn validity(r: &Report, findings: Vec<Finding>) -> (Vec<Finding>, Validity) {
     let v = run_validity(r);
     let mut out: Vec<Finding> = findings
@@ -1383,10 +1402,25 @@ pub fn validity(r: &Report, findings: Vec<Finding>) -> (Vec<Finding>, Validity) 
         .filter(|f| f.code != "invalid_run")
         .filter(|f| !v.suppress || VALID_ON_BROKEN_RUNS.contains(&f.code.as_str()))
         .collect();
-    if let Some(why) = &v.invalid {
-        let mut rem = remedy("invalid_run", None);
-        rem.next = Some(format!("oprobe show {} --detail", r.run.id));
-        out.push(Finding {
+    rank(&mut out);
+    let Some(why) = v.unjudged(r) else {
+        return (out, v);
+    };
+    // The reason the run cannot be judged comes first; nothing points at `prove`.
+    for f in &mut out {
+        if f.remedy
+            .next
+            .as_deref()
+            .is_some_and(|n| n.starts_with("oprobe prove"))
+        {
+            f.remedy.next = None;
+        }
+    }
+    let mut rem = remedy("invalid_run", None);
+    rem.next = Some(format!("oprobe show {} --detail", r.run.id));
+    out.insert(
+        0,
+        Finding {
             code: "invalid_run".into(),
             severity: Severity::Warning,
             confidence: Confidence::High,
@@ -1407,9 +1441,8 @@ pub fn validity(r: &Report, findings: Vec<Finding>) -> (Vec<Finding>, Validity) 
                 ..Default::default()
             },
             remedy: rem,
-        });
-    }
-    rank(&mut out);
+        },
+    );
     (out, v)
 }
 
@@ -1735,6 +1768,70 @@ pub(crate) mod tests {
         assert!(f.iter().any(|x| x.code == "invalid_run"));
         assert!(f.iter().any(|x| x.code == "throttling"));
         assert!(!f.iter().any(|x| x.code == "tail_stragglers"));
+    }
+
+    /// 6.3.0: Ctrl-C after 4 s ranked a throttling finding first with `next: oprobe prove`.
+    /// A run that cannot be judged leads with `invalid_run` and suggests no prove.
+    #[test]
+    fn an_unjudged_run_leads_with_invalid_run_and_suggests_no_prove() {
+        use crate::model::PartialReason;
+        for reason in [PartialReason::Interrupted, PartialReason::Error] {
+            let mut run = throttled(HypothesisKind::InflightLimit, 0.9, Confidence::High);
+            run.report.findings = derive(&run);
+            assert!(
+                run.report.findings[0]
+                    .remedy
+                    .next
+                    .as_deref()
+                    .unwrap()
+                    .starts_with("oprobe prove")
+            );
+            crate::model::build::mark_partial(&mut run, reason);
+            let f = &run.report.findings;
+            assert_eq!(f[0].code, "invalid_run", "{f:#?}");
+            assert!(f[0].cause.contains("partial"), "{}", f[0].cause);
+            assert!(f.iter().any(|x| x.code == "throttling"), "{f:#?}");
+            for x in f {
+                let next = x.remedy.next.as_deref().unwrap_or_default();
+                assert!(!next.starts_with("oprobe prove"), "{}: {next}", x.code);
+            }
+            assert!(
+                crate::app::next::after_run(&run.report)
+                    .iter()
+                    .all(|n| !n.cli.starts_with("oprobe prove"))
+            );
+        }
+        // An invalid run (failures that are not throttling) leads with invalid_run too.
+        let mut run = throttled(HypothesisKind::InflightLimit, 0.9, Confidence::High);
+        run.report.summary.failed_ops = 50;
+        run.report.summary.error_rate = 0.05;
+        run.report
+            .resilience
+            .error_classes
+            .insert("permission".into(), 50);
+        let f = derive(&run);
+        assert_eq!(f[0].code, "invalid_run", "{f:#?}");
+        assert!(f.iter().all(|x| {
+            !x.remedy
+                .next
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with("oprobe prove")
+        }));
+    }
+
+    /// 6.3.0: `--max-requests 500` gave `[Critical] Run invalid`; the docs say a partial run is
+    /// Review.
+    #[test]
+    fn a_partial_run_is_review() {
+        use crate::model::{PartialReason, VerdictLevel};
+        for reason in [PartialReason::Budget, PartialReason::Interrupted] {
+            let mut run = throttled(HypothesisKind::InflightLimit, 0.9, Confidence::High);
+            run.report.findings = derive(&run);
+            assert_eq!(run.report.worst_severity(), Severity::Critical);
+            crate::model::build::mark_partial(&mut run, reason);
+            assert_eq!(run.report.verdict.level, VerdictLevel::Review, "{reason:?}");
+        }
     }
 
     #[test]

@@ -116,7 +116,11 @@ pub(super) fn finish(run: &mut Run, breached: bool) {
         );
     }
     let worst = r.worst_severity();
-    r.verdict.level = if (breached && r.verdict.sla.enforced) || worst == Severity::Critical {
+    // A partial run (a budget stop, an interruption) is worth a look, never a judgement: its
+    // numbers cover part of the window (docs/reading-the-profile.md).
+    r.verdict.level = if r.is_partial() {
+        VerdictLevel::Review
+    } else if (breached && r.verdict.sla.enforced) || worst == Severity::Critical {
         VerdictLevel::Critical
     } else if worst == Severity::Warning || breached {
         VerdictLevel::Attention

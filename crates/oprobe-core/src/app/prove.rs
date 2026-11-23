@@ -1450,6 +1450,36 @@ fn proof_budget(req: &ProveRequest) -> Result<Option<Duration>> {
 }
 
 /// `oprobe prove`.
+/// A run that cannot be judged on performance (invalid, or partial and too short: its
+/// `invalid_run` finding) is no baseline: its findings are leads, not remedies to size.
+fn refuse_unjudged(run: &Run) -> Result<()> {
+    let r = &run.report;
+    let v = crate::analysis::findings::run_validity(r);
+    let why = v.unjudged(r).or_else(|| {
+        r.findings
+            .iter()
+            .find(|f| f.code == "invalid_run")
+            .map(|f| f.cause.clone())
+    });
+    let Some(why) = why else {
+        return Ok(());
+    };
+    Err(OprobeError::new(
+        ErrorCode::UsageInvalidArgument,
+        format!(
+            "run {} cannot be judged on performance: {}",
+            run.id(),
+            why.trim_start_matches("The run cannot be judged on performance: ")
+                .trim_end_matches('.')
+        ),
+    )
+    .with_hint(format!(
+        "profile the operator again until the run completes: oprobe run {}",
+        crate::model::spec::shell_quote(&r.spec.operator_ref)
+    ))
+    .into())
+}
+
 pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<ProveOutcome> {
     let run = ctx.store().load(&req.run)?;
     if run.report.is_trace() {
@@ -1471,6 +1501,7 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
         .with_hint("prove a run you made: oprobe show --list")
         .into());
     }
+    refuse_unjudged(&run)?;
     let defaults = crate::config::defaults().prove;
     let max_throttle = req
         .max_throttle_ratio
@@ -1819,6 +1850,29 @@ mod tests {
             budget_exceeded: pairs == 0,
             notes: vec!["the budget ran out before one pair of trials could run".into()],
         }
+    }
+
+    /// 6.3.0 proved a run interrupted after 4 s. A run that cannot be judged is refused.
+    #[test]
+    fn prove_refuses_a_run_that_cannot_be_judged() {
+        let mut run = crate::analysis::simulate::tests::straggler_run();
+        run.report.run.window_s = 5.0;
+        run.report.spec.operator_ref = "lab://demo".into();
+        refuse_unjudged(&run).unwrap();
+        crate::model::build::mark_partial(&mut run, crate::model::PartialReason::Interrupted);
+        let e = refuse_unjudged(&run).unwrap_err();
+        let b = crate::errors::classify(&e, "s3");
+        assert_eq!(b.code, ErrorCode::UsageInvalidArgument);
+        assert!(
+            b.message.contains("cannot be judged") && b.message.contains("interrupted"),
+            "{}",
+            b.message
+        );
+        assert!(!b.message.ends_with('.'), "{}", b.message);
+        assert_eq!(
+            b.hint.as_deref(),
+            Some("profile the operator again until the run completes: oprobe run lab://demo")
+        );
     }
 
     /// 6.3.0 said "improved" while the candidate throttled 4.36 % against a 0.10 % limit.
