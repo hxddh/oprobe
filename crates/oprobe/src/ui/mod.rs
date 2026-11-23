@@ -19,6 +19,8 @@ mod kit;
 #[allow(clippy::let_underscore_future)]
 mod menus;
 pub mod plots;
+// A notification or a trash request answers once done; nothing waits for it.
+#[allow(clippy::let_underscore_future)]
 pub mod store;
 mod term;
 // A clipboard write answers once done; nothing waits for it.
@@ -50,12 +52,23 @@ pub fn run_gui() -> std::process::ExitCode {
     #[cfg(target_os = "windows")]
     use nsh_platform_windows as platform;
     platform::set_ui_sets(ui_sets());
-    let options = platform::AppOptions {
+    #[cfg_attr(target_os = "macos", allow(unused_mut))]
+    let mut options = platform::AppOptions {
         title: "oprobe".to_owned(),
         app_id: "io.github.hxddh.oprobe".to_owned(),
         size: (1280, 860),
         ..Default::default()
     };
+    // Run files opened from the file manager come to the running app (`next_open_files`);
+    // macOS declares them in the bundle's Info.plist.
+    #[cfg(not(target_os = "macos"))]
+    {
+        options.file_types = nsh_core::file_type::file_types_from_json(&serde_json::json!([{
+            "name": "oprobe run",
+            "extensions": ["oprobe"],
+            "mimeTypes": ["application/x-oprobe-run"],
+        }]));
+    }
     // `run_app` returns `ExitCode` on macOS / Windows and `glib::ExitCode` on Linux.
     #[cfg_attr(not(target_os = "linux"), allow(clippy::useless_conversion))]
     let code: std::process::ExitCode = platform::run_app(
@@ -133,9 +146,18 @@ pub fn App() -> impl IntoElement {
         store::finish_jobs();
         async {}
     });
+    // Only the detail column paints the window's background: the sidebar lets the platform's
+    // material through where there is one (it paints its own colour elsewhere).
+    let material = views::sidebar::on_material();
     view()
         .flex_1()
-        .bg(move || theme().background)
+        .bg(move || {
+            if material {
+                transparent_black().into()
+            } else {
+                theme().background
+            }
+        })
         .text_color(move || theme().foreground)
         .child(dynamic(move || {
             i18n::set(s.lang.get());

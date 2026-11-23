@@ -38,39 +38,18 @@ and proves that change with an interleaved A/B test on the objective you care ab
 curl -fsSL https://github.com/hxddh/oprobe/releases/latest/download/install.sh | sh
 
 oprobe demo                      # profile a misbehaving S3 lab on your laptop: no account needed
-oprobe prove last                # A/B-test the remedy of the top finding (about a minute)
+oprobe prove last throttling     # A/B-test the remedy of the throttling finding
 oprobe                           # the app: runs, profile, operator, compare
 ```
 
 `oprobe demo` is `oprobe run lab://demo`: a local S3 that throttles above 24 requests in flight and
-makes every 40th request a straggler that waits 250 ms. The brief names at most three findings,
-each with its remedy as an `op.toml` path, and the next command:
+turns some requests into stragglers. The brief names at most three findings, each with its remedy
+as an `op.toml` path, and the next command. `prove` ends with the diff, for example:
 
 ```text
-[Attention] 2.4% of GetObject requests wait far longer for the server's first byte than their peers
-  (stragglers).
-  lab://demo · small-files · 8.0 s · run 20261123-063611-3d82
-  ▲ 1 tail_stragglers (high confidence) — 2.4% of GetObject requests wait far longer for the
-      server's first byte than their peers (stragglers).
-      …
-      next: oprobe prove 20261123-063611-3d82 tail_stragglers
-  ▲ 2 throttling (medium confidence) — The service throttled 0.1% of requests (429/503).
-      …
-  1425.0 ops/s · 80.1 MiB/s · p50 10.0ms · p99 261ms · errors 0.00% · 0.14% of requests throttled
-```
-
-`prove last` runs trials of the current operator (A) and of the remedy (B), interleaved, and ends
-with the diff (this run took 60 s):
-
-```text
-improved on goodput: +34.4 % [+19.5, +51.1] (3 pairs of trials, noise ±2.0 %) · lab://demo (local lab)
-secondary (not decisive): p99 -67.8 % [-69.4, -66.2] · throttled 0.27 % → 4.54 % · errors 0.00 % → 0.02 %
-+ TailCutLayer::builder().safety_factor(1.5).min_samples(32).min_deadline(Duration::from_millis(50)).max_deadline(Duration::from_secs(60)).build()
-~ RetryLayer::new().with_min_delay(Duration::from_millis(20))
-op.toml:
-[layers]
-retry = { min_delay = "20ms" }
-tail_cut = true
+proved on goodput: +31 % [+27, +35], p99 −42 %, 0 throttled (4 A/B pairs)
++ ConcurrentLimitLayer::new(24)
+~ RetryLayer::new().with_jitter().with_max_times(4)
 ```
 
 Then point it at your own storage:
@@ -82,13 +61,12 @@ oprobe run s3://a/x r2://b/x fs:///nvme/x         # several operators, one workl
 ```
 
 Writes go under a fresh `oprobe-run-<id>/` prefix and are cleaned up; `--dry-run` prints the plan,
-`--read-only` refuses every write, and `--max-requests/--max-bytes/--max-duration` are hard budgets
-(for `prove`, `--max-duration` is the wall-time budget of the whole proof).
+`--read-only` refuses every write, and `--max-requests/--max-bytes/--max-duration` are hard budgets.
 
 ## Your operator: `op.toml`
 
 The unit of everything is the OpenDAL `Operator`: a service, a layer stack, and read/write options.
-oprobe reads it from a URL or from a file, `op.toml` (the recommended way to describe yours).
+oprobe reads it from a URL, from a file, or from `[operators.NAME]` in its config file.
 
 ```toml
 url = "s3://bucket/prefix"
@@ -146,14 +124,14 @@ observed). Memory stays bounded, the overhead is benchmarked (budget ≤ 2 µs p
 Run `oprobe` with no arguments: a native window when there is a display, the same app in your
 terminal otherwise (also over SSH). Four views: **Runs**, **Profile** (verdict, where the time
 went, the request waterfall of the slowest operations, timeline, heatmap), **Operator** (your layer
-stack beside each remedy: toggle a layer, press *Prove*, watch the trials stream in, copy the
+stack beside each remedy: toggle a layer, press *Prove*, watch the A/B pairs stream in, copy the
 diff) and **Compare**. It speaks 简体中文 and English. [More →](docs/app.md)
 
 ## For scripts and agents
 
 Every command prints one JSON document with `-o json` (stdout carries only the result; progress
-goes to stderr), errors carry stable codes and exit codes (0 ok · 1 runtime · 2 usage · 3 prove: worse
-· 4 budget · 5 safety · 130 interrupted), and the JSON Schemas are in [`schemas/`](schemas).
+goes to stderr), errors carry stable codes and exit codes (0 ok · 1 runtime · 2 usage · 3 prove
+refuted · 4 budget · 5 safety · 130 interrupted), and the JSON Schemas are in [`schemas/`](schemas).
 Agents: [`skills/oprobe/SKILL.md`](skills/oprobe/SKILL.md) and [llms.txt](llms.txt).
 
 ## Install
@@ -199,43 +177,16 @@ oprobe demo
 ```
 
 `demo` is `oprobe run lab://demo`. The lab is an S3-compatible server inside oprobe on 127.0.0.1:
-it throttles (503 SlowDown) above 24 requests in flight, and every 40th request is a straggler
-that waits 250 ms for its first byte. The default workload writes, reads and stats small objects
-with 28 workers for 8 seconds:
-
-```text
-[Attention] 2.4% of GetObject requests wait far longer for the server's first byte than their peers
-  (stragglers).
-  lab://demo · small-files · 8.0 s · run 20261123-063611-3d82
-  ▲ 1 tail_stragglers (high confidence) — 2.4% of GetObject requests wait far longer for the
-      server's first byte than their peers (stragglers).
-      162 stragglers wait ~261ms for the first byte against ~9.78ms for a typical GetObject;
-      operation p50 10.0ms · p99 261ms
-      remedy: layers.tail_cut + layers.retry.min_delay — re-issue requests far slower than their
-        peers, after a short retry backoff (TailCutLayer + RetryLayer::with_min_delay)
-      next: oprobe prove 20261123-063611-3d82 tail_stragglers
-  ▲ 2 throttling (medium confidence) — The service throttled 0.1% of requests (429/503).
-      16 throttled responses (429/503) in 11416 requests (0.14%); 15% of operation time in retry
-      backoff; the rejections start above a number of requests in flight (the in-flight limit
-      explains 81% of the throttled requests)
-      remedy: layers.concurrent_limit.http + layers.retry.jitter — cap the HTTP requests in flight
-        below the service's limit and retry with jitter
-        (ConcurrentLimitLayer::with_http_concurrent_limit + RetryLayer::with_jitter)
-      next: oprobe prove 20261123-063611-3d82 throttling
-  1425.0 ops/s · 80.1 MiB/s · p50 10.0ms · p99 261ms · errors 0.00% · 0.14% of requests throttled
-  full profile: oprobe show 20261123-063611-3d82 --detail
-```
+it throttles (503 SlowDown) above 24 requests in flight and turns some requests into stragglers.
+The default workload writes small objects, then reads them back with 32 workers for a few seconds.
 
 The brief that `run` prints has three parts:
 
-- **the verdict**: its level (OK, Review, Attention, Critical) and the top finding's cause;
-- **at most three findings**, costliest first, each with its cause, its evidence (counts and the
-  requests themselves) and its remedy as an `op.toml` path, such as `layers.tail_cut`;
-- **the next command**, `oprobe prove RUN FINDING`.
-
-Here the stragglers come first: they hold the lab's request slots for a quarter of a second each.
-The throttling costs latency (the throttled operations wait out OpenDAL's one-second retry
-backoff) but no goodput, because the other workers keep the lab busy.
+- **the verdict**: what bounds this operator on this workload (throttling, the server, the
+  network, your client);
+- **at most three findings**, each with its cause, its evidence (counts and the requests
+  themselves) and its remedy as an `op.toml` path, such as `layers.concurrent_limit.http`;
+- **the next command**, usually `oprobe prove last FINDING`.
 
 The run is saved. `oprobe show last` prints the whole profile, `oprobe show last --by stage`
 groups the requests by stage, and `oprobe show --list` lists the history.
@@ -243,45 +194,23 @@ groups the requests by stage, and `oprobe show --list` lists the history.
 ## 3. Prove the remedy
 
 ```bash
-oprobe prove last
+oprobe prove last throttling
 ```
 
-`prove` takes the run's operator (A) and the same operator with the top finding's remedy (B);
-`oprobe prove last throttling` proves another finding's. For a remedy with a size, such as a
-concurrency limit, it first runs short sizing trials over that one value and picks the knee of
-the objective. Then it runs trials of A and B interleaved (A B A B …) until a sequential test
-against the noise floor decides, or the budget (`--max-duration`) runs out. It starts with the
-number of trials and the ETA of the whole proof, and prints each trial as it ends (on stderr):
+`prove` takes the run's operator (A) and the same operator with the finding's remedy (B). For a
+remedy with a size, such as a concurrency limit, it first runs short trials over that one value
+and picks the knee of the objective. Then it runs A and B interleaved (A B A B …) until a
+sequential test against the noise floor decides, or the budget runs out. The verdict is
+`improved`, `worse` (exit 3) or `inconclusive`, on goodput unless you pass `--objective p99`:
 
 ```text
-prove tail_stragglers · goodput · run 20261123-063611-3d82 · prove 20261123-063621-f7e6
-6–12 trials (3–6 pairs of A and B) · ETA 57s – 1m 53s
-· A #1 : 1485.5 ops/s · p99 261ms · 0.27 % throttled
-· B #1 : 2078.0 ops/s · p99 82.5ms · 4.40 % throttled
-· A #2 : 1503.0 ops/s · p99 261ms · 0.27 % throttled
-· B #2 : 2043.0 ops/s · p99 84.3ms · 4.29 % throttled
-· A #3 : 1468.5 ops/s · p99 262ms · 0.27 % throttled
-· B #3 : 1873.0 ops/s · p99 85.3ms · 4.98 % throttled
+proved on goodput: +31 % [+27, +35], p99 −42 %, 0 throttled (4 A/B pairs)
++ ConcurrentLimitLayer::new(24)
+~ RetryLayer::new().with_jitter().with_max_times(4)
 ```
 
-The verdict is `improved`, `worse` (exit 3) or `inconclusive`, on goodput unless you pass
-`--objective p99`, and the result ends with the diff:
-
-```text
-improved on goodput: +34.4 % [+19.5, +51.1] (3 pairs of trials, noise ±2.0 %) · lab://demo (local lab)
-secondary (not decisive): p99 -67.8 % [-69.4, -66.2] · throttled 0.27 % → 4.54 % · errors 0.00 % → 0.02 %
-note: TailCutLayer re-issues through RetryLayer: its first backoff is shortened so a cut request is retried at once; trials warm up 11.5 s because the layer ignores its first 10 s
-+ TailCutLayer::builder().safety_factor(1.5).min_samples(32).min_deadline(Duration::from_millis(50)).max_deadline(Duration::from_secs(60)).build()
-~ RetryLayer::new().with_min_delay(Duration::from_millis(20))
-op.toml:
-[layers]
-retry = { min_delay = "20ms" }
-tail_cut = true
-```
-
-The diff is Rust you can paste into your operator, and the same change as `op.toml`. TailCutLayer
-ignores its first 10 seconds, so its candidate trials warm up for 11.5 s: this proof took a
-minute. To prove a change of your own: `oprobe prove last --with layers.retry.jitter=on`.
+The diff is Rust you can paste into your operator, and the same change as `op.toml`. To prove a
+change of your own: `oprobe prove last --with layers.tail_cut=on`.
 
 ## 4. Open the app
 
@@ -290,7 +219,7 @@ oprobe
 ```
 
 The app shows the same runs in a sidebar. A run opens in Profile or Operator, and two or more selected runs open in Compare. In the Operator
-view you can toggle a layer, press *Prove* and watch the trials arrive. See [the app](app.md).
+view you can toggle a layer, press *Prove* and watch the A/B pairs arrive. See [the app](app.md).
 
 ## 5. Your storage
 
@@ -356,8 +285,7 @@ oprobe reads an operator from:
   `timeout`;
 - an operator file, `op.toml` (format `oprobe.operator/6`): the URL, service options, layers,
   read/write options and HTTP client settings ([reference](operator.md));
-- a name, `[operators.NAME]` in the config file (an `op.toml` path is the recommended way;
-  [the config file](operator.md#the-config-file)).
+- a name, `[operators.NAME]` in the config file.
 
 `--set PATH=VALUE` changes one value (`--set layers.retry.max_times=5`, `--set read.gap=1MiB`).
 The difference between two operators is itself a value: it renders as Rust builder code and as
@@ -391,7 +319,7 @@ deletes the prefix. The guard enforces budgets (`--max-requests`, `--max-bytes`,
 
 A profile is what one operator did on one workload, saved as one `.oprobe` file:
 
-- the operator spec and the workload, so the run can be reproduced exactly;
+- the operator spec and the workload, so the run replays exactly;
 - every operation and every backend request under it, stage by stage: **queue** (waiting for a
   connection or a permit), **connect** (DNS, TCP, proxy, TLS on a fresh connection), **send**,
   **TTFB** (the server's time to the first byte), **body** (the transfer), **stall** (the body
@@ -436,16 +364,13 @@ large a limit should be or how much it would help; claiming so would be a guess.
 1. **Choose the change**: the finding's remedy (the top finding by default), or `--with PATH=VALUE`.
 2. **Size it**: when the remedy has a size (a limit, a chunk), short trials over that one value
    find the knee of the objective, within `--max-throttle`.
-3. **A/B test**: trials of A and B alternate (A B A B …); a sequential test on the objective,
-   against a noise floor learned from consecutive A trials (the A/A spread), stops as soon as it
-   can decide, or when the wall-time budget (`--max-duration`) would be exceeded.
+3. **A/B test**: A and B alternate (A B A B …); a sequential test on the objective, against a
+   noise floor learned from A/A pairs, stops as soon as it can decide, or at `--budget`.
 4. **Decide**: `improved`, `worse` (exit 3) or `inconclusive` on the objective: **goodput**
-   (successful operations per second; the default) or **p99**. The objective's interval is
-   Student's t on the paired log ratios (B over A, pair by pair), with a spread no smaller than
-   the A/A noise floor, so it never goes below −100 %. Shares (throttled requests, errors) are
-   compared with Newcombe's interval. Secondary metrics are shown and never decide. Deciding
-   takes at least 3 pairs of trials; with fewer, the verdict is `inconclusive`.
-5. **Save**: every trial is saved as a run, a child of the prove, hidden from `show --list`.
+   (successful operations per second; the default) or **p99**. Intervals are Wilson/beta and stay
+   in range; secondary metrics are shown and never decide. Deciding takes at least 3 A/B pairs;
+   with fewer, the verdict is `inconclusive`.
+5. **Save**: every trial run is saved as a child of the prove run, hidden from `show --list`.
 
 The result is a **proven layer diff**: the objective's change with its interval, the evidence,
 and the change as Rust and as TOML. Every result states where it was validated (the lab, MinIO,
@@ -571,7 +496,7 @@ oprobe prove last --with layers.retry.jitter=true
 
 `$OPROBE_CONFIG`, or `<config dir>/oprobe/config.toml` (`~/.config/oprobe/config.toml` on Linux,
 `~/Library/Application Support/oprobe/config.toml` on macOS, `%APPDATA%\oprobe\config.toml` on
-Windows). It sets defaults:
+Windows). It names operators and sets defaults:
 
 ```toml
 [defaults]
@@ -581,16 +506,7 @@ duration = "30s"
 [defaults.budgets]
 max_requests = 200000
 max_bytes = "20GiB"
-```
 
-Precedence of every setting: flags, then `OPROBE_*` environment variables, then `[defaults]`,
-then the built-in default.
-
-**Your operator belongs in an `op.toml` file**, passed by its path: `oprobe run prod.toml`. It
-can live next to your code, be reviewed and versioned, and is what `prove`'s TOML diff patches.
-The config file can also name an operator, as a shortcut for the same table:
-
-```toml
 [operators.prod]
 url = "s3://prod-bucket/oprobe"
 [operators.prod.options]
@@ -599,7 +515,8 @@ region = "eu-west-1"
 concurrent_limit = { http = 64 }
 ```
 
-`oprobe run prod` then profiles that operator.
+`oprobe run prod` then profiles that operator. Precedence of every setting: flags, then
+`OPROBE_*` environment variables, then `[defaults]`, then the built-in default.
 
 ## The diff
 
@@ -653,9 +570,8 @@ the same workload and form one comparison. Prints the brief: the verdict, at mos
 with their remedy, and the next command. The run is saved; `-o json` prints the report
 (`schemas/report.json`).
 
-`OPERATOR` is a URL (`s3://bucket/prefix`, `lab://demo`, `fs:///tmp/x`, `memory://`) or an
-operator file ([`op.toml`](operator.md), the recommended way to describe your operator). A name
-from the config file's `[operators.NAME]` also works.
+`OPERATOR` is a URL (`s3://bucket/prefix`, `lab://demo`, `fs:///tmp/x`, `memory://`), an
+operator file ([`op.toml`](operator.md)) or a name from the config file's `[operators.NAME]`.
 
 **Workload** ([concepts](concepts.md#workload))
 
@@ -694,9 +610,7 @@ oprobe run prod --existing data/2026/ --max-requests 50000
 ## `oprobe demo`
 
 `oprobe run lab://demo`, with the same workload and safety flags as `run`. The lab throttles
-above 24 requests in flight, and every 40th request is a straggler that waits 250 ms. Its default
-workload is small files (64 × 64 KiB) with 28 workers for 8 s; `oprobe prove last` then proves
-the top finding's remedy in about a minute.
+above 24 requests in flight and turns some requests into stragglers.
 
 ## `oprobe prove RUN [FINDING]`
 
@@ -706,26 +620,15 @@ operator and the changed one run interleaved until a sequential test decides on 
 the budget ends. Prints the proven layer diff (Rust and TOML) with its evidence; `-o json` prints
 the prove result (`schemas/prove.json`). Exit 3 when the change is worse on the objective.
 
-The proof is made of **trials**: short runs of the current operator (A) and the changed one (B),
-plus the sizing trials. It starts by printing how many trials it may take and the ETA of the
-whole proof; `--dry-run` prints the same estimate (and the plan of one trial) and sends nothing.
+A verdict other than `inconclusive` needs at least **3 A/B pairs**: when the budget allows fewer,
+the verdict is `inconclusive` (exit 0) with a note. The objective's interval uses Student's t for
+the number of pairs, and a noise floor learned from a single A/A difference is doubled.
 
-A verdict other than `inconclusive` needs at least **3 pairs** of trials (A then B): when the
-budget allows fewer, the verdict is `inconclusive` (exit 0) with a note. When no pair ran at all,
-the text says `not measured` and prints no diff; `-o json` still prints a valid result
-(`verdict: "inconclusive"`, `pairs_count: 0`, a note).
+When a budget (`--max-requests`, `--max-bytes`, `--max-duration`) stops the prove part-way, it
+still prints and saves the partial result (`budget_exceeded: true`, usually `inconclusive`) and
+exits 4; its trials stay attached, so `oprobe show --rm PROVE` removes them.
 
-The objective's interval is Student's t on the paired log ratios of the objective (B over A, pair
-by pair), with a spread no smaller than the A/A noise floor learned from consecutive A trials (a
-floor learned from a single A/A difference is doubled). Shares, such as throttled requests, are
-compared with Newcombe's interval.
-
-`--max-duration` is the one wall-time budget of the whole proof: no trial starts that would not
-end within it. When a budget (`--max-duration`, `--max-requests`, `--max-bytes`) stops the prove
-part-way, it still prints and saves the partial result (`budget_exceeded: true`, usually
-`inconclusive`) and exits 4; its trials stay attached, so `oprobe show --rm PROVE` removes them.
-
-`RUN` is a run id, an id prefix, `last` or `last~N`. `FINDING` is a finding code
+`RUN` is a run id, an id prefix, `last`, `last~N` or a label. `FINDING` is a finding code
 (`throttling`, `tail_stragglers`, …).
 
 | Flag | Meaning |
@@ -733,17 +636,14 @@ part-way, it still prints and saves the partial result (`budget_exceeded: true`,
 | `--with PATH=VALUE` | the change to prove instead of the finding's remedy, repeatable |
 | `--objective goodput\|p99` | what the change is judged on: successful operations (or bytes) per second (default), or the worst per-operation p99 latency |
 | `--max-throttle RATIO` | share of throttled requests a change may cause, e.g. `0.1%` or `0.001` |
-| `--max-duration DURATION` | wall-time budget of the whole proof, e.g. `5m` |
-| `--dry-run` | print the number of trials and the ETA of the whole proof, and exit |
-| `--read-only` | refuse every write and delete (exit 5) |
-| `--max-requests N`, `--max-bytes SIZE` | stop after this many backend requests or bytes, over every trial (exit 4) |
+| `--budget DURATION` | wall-time budget of the whole proof, e.g. `5m` |
 
-Every trial is saved as a run, a child of the prove, and hidden from `show --list`.
+Every trial run is saved as a child of the prove run and hidden from `show --list`.
 
 ```bash
 oprobe prove last throttling
 oprobe prove last --with layers.tail_cut=on --objective p99
-oprobe prove 20261122-0915 small_ranges --max-duration 10m
+oprobe prove 20261122-0915 small_ranges --budget 10m
 ```
 
 ## `oprobe show [RUN|FILE]`
@@ -764,7 +664,7 @@ errors, throttling, hung requests, stragglers and cold connections. `prove` refu
 | `--list` | list the stored runs (prove trials hidden) |
 | `--all` | with `--list`: include the prove trials |
 | `--rm RUN…` | delete stored runs |
-| `--detail` | every section of the profile: the timeline (one row per interval of 1 s, or 10 s after ten minutes; long runs merge rows), the spread of the requests over keys, sizes, prefixes and remotes, the operator and the five slowest operations |
+| `--detail` | every section of the profile |
 | `--by stage\|api\|conn` | group the requests by stage, storage API or connection |
 
 ```bash
@@ -779,8 +679,8 @@ oprobe show --rm last~3 last~4
 Serve a local S3-compatible lab with faults until Ctrl-C and print its endpoint. Point any S3
 client at it, or use `lab://SCENARIO` as an operator to start one inside a run.
 
-Scenarios (the same six as the app's): `demo`, `throttle`, `stragglers`, `bandwidth`, `flaky`,
-`ratelimit`. Without one, the lab has no faults.
+Scenarios: `clean`, `demo`, `throttle`, `stragglers`, `lossy`, `flaky`, `parquet`, `ratelimit`,
+`hotkey`, `bandwidth`, `queueing`, `timevarying`, `noisy`.
 
 | Flag | Meaning |
 |---|---|
@@ -788,8 +688,8 @@ Scenarios (the same six as the app's): `demo`, `throttle`, `stragglers`, `bandwi
 
 ## Run references
 
-`last` (the newest run), `last~N` (N runs before it), a full id (`20261122-091512-ab12`) or an
-unambiguous id prefix. `show` also takes a path to a file.
+`last` (the newest run), `last~N` (N runs before it), a full id (`20261122-091512-ab12`), an
+unambiguous id prefix, or a label. `show` also takes a path to a file.
 
 ## Exit codes
 
@@ -798,7 +698,7 @@ unambiguous id prefix. `show` also takes a path to a file.
 | 0 | ok |
 | 1 | runtime failure (auth, network, storage, internal) |
 | 2 | usage or configuration error |
-| 3 | `prove`: the change is worse on the objective |
+| 3 | `prove` refuted the change (worse on the objective) |
 | 4 | a budget stopped the command |
 | 5 | a safety rail refused the command |
 | 130 | interrupted (Ctrl-C) |
@@ -845,9 +745,8 @@ next: oprobe prove last throttling
 
 (Illustrative: the exact wording follows the version you run.)
 
-- **The badge** is the verdict level: **OK**, **Review** (worth a look: informational
-  findings, a partial run), **Attention** (warning findings), **Critical** (critical findings).
-  JSON carries the same levels as `ok`, `review`, `attention`, `critical`.
+- **The badge** is the verdict level: **HEALTHY**, **REVIEW** (worth a look: informational
+  findings, a partial run), **ATTENTION** (warning findings), **CRITICAL** (critical findings).
 - **The headline** says what bounds the operator on this workload: throttling, the server's
   latency, the network (connect, upload, download), queueing in the client, or the client itself.
 - **Findings**: at most three, most severe first. Each has its code, the evidence in one line,
@@ -863,7 +762,7 @@ the configuration and the five slowest operations):
 
 | Section | What it tells you |
 |---|---|
-| header | run id, operator, workload, window, concurrency, start time |
+| header | run id and label, operator, workload, window, concurrency, start time |
 | verdict | the badge and where the time went, in one sentence |
 | key numbers | goodput and throughput, latency p50/p99/p99.9/max, failed operations, throttled responses |
 | findings | every finding: code, cause, evidence, confidence, remedy |
@@ -909,16 +808,7 @@ Each operation's wall time is split exactly; an instant counts once even when re
   started count in every percentile as censored values, so a slow server cannot hide behind fewer
   requests.
 - **Percentiles** are exact when every operation was kept, otherwise from histograms with three
-  significant digits. Counts always agree with the totals. The report keeps the run's whole
-  latency distribution (`latency_histogram`, 20 bins per decade), and the latency CDF is drawn
-  from it whenever the trace rows are sampled.
-- **The timeline** has one row per interval (1 s for the first ten minutes, then 10 s).
-  Operations, goodput (`goodput_ops_per_s`: successes only; `ops_per_s` counts every attempt)
-  and the latency quantiles belong to the interval an operation *started* in; requests
-  (`requests_count`, retries included), throttled responses (`throttled_count`), retries and
-  failures (`errors_count`) to the interval they *happened* in, so a 503 at +7 s is drawn at
-  +7 s. `ops_count` says how many operations stand behind an interval's quantiles: a p99 needs
-  about 1 000. Each interval also carries the same counters per verb (`verbs`).
+  significant digits. Counts always agree with the totals.
 - **The profiler's cost** is measured: `cargo bench -p oprobe-trace --bench overhead` compares
   the same operations with and without the layer (budget 2 µs per operation), and the profile's
   `self` section reports scheduling lag and CPU during the run. A run where the client was
@@ -1122,18 +1012,58 @@ The window works like other professional tools on your platform (design:
   - A running job is the first row, with its progress.
   - Click a run to show it. With ⌘ (macOS) or Ctrl held, a click adds or removes a run; with
     Shift held, it extends the selection.
+  - The runs are one list for the keyboard (one Tab stop) and for screen readers (a list of
+    options, the selected ones said so): ↑ / ↓ move the selection, Shift+↑ / ↓ extend it,
+    Home / End go to the ends, typing a run's short id, operator or preset finds it, Return
+    opens it, and Delete (⌘⌫ on macOS) asks to delete the selection.
+  - The selection looks like the platform's: filled with the accent on macOS (grey while the
+    list or the window is not active), a subtle fill with an accent mark on Windows and Linux.
   - Two or more selected runs show **Compare**.
   - Secondary-click a run for its menu: Open, Compare With Selected, Prove…, Copy Run ID,
-    Copy Command and Delete…. Delete always asks first.
-- **Toolbar**: it sits in the title bar. It holds the run's id and operator, the
-  **Profile / Operator** switch, **New Run** (＋), and **Run Again** ▶, which becomes **Stop** ■
-  while a job runs. On Windows and Linux it also holds the main menu (⋯ or ☰).
-- **Menus**: on macOS the menu bar holds File, Edit, Run, View, Window and Help. On Windows and
-  Linux the same menus are in the main menu.
-- **Dialogs**: New Run (mod+N) and Settings (mod+,) open as dialogs. Settings is where you choose
-  the language.
-- **Run files**: open a `.oprobe` file with File ▸ Open Run File…, or drop it on the window.
-- **Progress**: a running job shows its progress on the Dock or taskbar icon.
+    Copy Command and Delete…. The row the menu acts on is outlined while it is open.
+  - Drag the sidebar's edge to resize it. Its width, whether it shows, the page (Profile or
+    Operator) and, on macOS and Windows, the window's size and position are restored at the
+    next start.
+  - On macOS it is drawn on the window's sidebar material, on Windows 11 on Mica; elsewhere it
+    has its own colour.
+- **Toolbar**: it sits in the title bar, at the platform's height. It holds the run's id and
+  operator, the **Profile / Operator** switch, **New Run** (＋), and **Run Again** ▶, which
+  becomes **Stop** ■ while a job runs. On Windows and Linux it also holds the main menu (⋯ or ☰),
+  which opens under its button: New Run…, Open Run File…, Show/Hide Sidebar, Full Screen,
+  Preferences (Settings on Windows), the documentation, About oprobe, and Quit (Exit on
+  Windows).
+- **Menus**: on macOS the menu bar holds oprobe, File, Edit, Run, View, Window and Help. Every
+  item, the system's own (Undo, Quit, …) included, is in the app's language. On Windows and
+  Linux the same menus' shortcuts work under the hidden title bar. Shortcuts that a text field
+  also uses (Delete, ⌘⌫) are left to the field while you type, and the menus' actions wait while
+  a dialog is open.
+- **New Run** (mod+N) is a dialog: the operator (a URL, an `op.toml`, a configured name) with a
+  **Choose** pop-up that lists the lab's scenarios, the operators of your config file
+  (`[operators.NAME]`), the `op.toml` files you ran before and **Choose op.toml…**; the workload
+  (a pop-up); the duration and concurrency. The operator field has the focus when it opens,
+  Return anywhere presses the default button and Escape cancels. A `lab://` run starts at once;
+  a real target is **planned first**: **Review Plan** shows what the run will write, read and
+  delete (and under which prefix), how long it takes and the budgets that stop it, and only then
+  does the button become **Run**. Changing the form drops the plan.
+- **Settings** (mod+,): the language, where runs are stored and the config file. Each change
+  applies at once. On macOS it is a window of its own; on Windows and Linux a preferences dialog
+  with a close button; in a terminal a dialog.
+- **About oprobe**: the version and links (the system's About panel on macOS).
+- **Delete** asks first with the system's alert (Cancel is the default button). The runs go to
+  oprobe's trash (`<data>/trash/`), not away: **Undo** in the notice bar brings them back. Once
+  the notice goes, the folder goes on to the system's trash where there is one; oprobe's trash
+  is emptied after a week. `oprobe show --rm` in the CLI still deletes for good.
+- **Quitting** (⌘Q, Ctrl+Q, Exit, or the window's close button) while a run or a prove goes on
+  asks first: **Stop and Quit** stops it, removes its test data and quits; Cancel keeps it
+  running.
+- **Run files**: open a `.oprobe` or report/trace `.json` file with File ▸ Open Run File… (the
+  system's open dialog, filtered to those types), open it from Finder or Explorer, or drop it
+  on the window (the window is outlined while a file is dragged over it).
+- **Progress**: a running job shows its progress on the Dock or taskbar icon. When it ends while
+  the window is in the background, a notification says so and the Dock icon or taskbar button
+  asks for attention.
+- **Accessibility**: messages in the notice bar are read out by screen readers; control heights
+  grow with the system's text size; the dialogs appear without a fade when reduced motion is on.
 
 **Profile.** One run, from the verdict down to the raw numbers:
 
@@ -1173,11 +1103,14 @@ Each finding carries the evidence it rests on:
 | `tail_stragglers`, `hung_requests` | the latency distribution, with p50 and p99 marked |
 | `errors` | failed operations per second |
 
-**Operator.** The run's layer stack beside each finding's remedy. Toggle a layer or change a value
-(a limit, a chunk size), then press **Prove**: the trials stream in live and are drawn as they
-converge: each pair's change as a dot, the running estimate with its 95 % interval narrowing, and
-the A/A noise floor around no change, until the sequential test decides. **Copy** puts the winning diff (Rust
-or TOML) on the clipboard.
+**Operator.** The run's layer stack beside each finding's remedy. A finding's **Prove** (and
+**Prove this remedy** in Profile) proves that finding as `oprobe prove RUN CODE` does: prove
+sizes the remedy from the run (a limit from the fitted throttling limit, say) and then proves
+it. Toggle a layer or change a value (a limit, a chunk size) yourself and **Prove** proves your
+change with the values you set. The trials stream in live and their A/B pairs are drawn as they
+converge: each pair's change as a dot, the running estimate with its 95 % interval narrowing,
+and the A/A noise floor around no change, until the sequential test decides: **improved**,
+**worse** or **inconclusive**. **Copy** puts the winning diff (Rust or TOML) on the clipboard.
 
 **Compare.** Two runs, or the operators of one multi-operator run, side by side: goodput, latency
 percentiles, the stage split and the findings of each, with their goodput over time and their
@@ -1200,13 +1133,17 @@ English only.
 | mod+O | Open Run File… |
 | mod+R | Run the selected run again |
 | mod+. | Stop the running job |
-| mod+shift+P | Prove the current change |
+| mod+shift+P | Prove (your change, else the chosen or top finding's remedy) |
 | mod+1, mod+2 | Profile, Operator |
-| ctrl+mod+S (macOS), mod+shift+S | Show or hide the sidebar |
+| ctrl+⌘+S (macOS), mod+shift+S | Show or hide the sidebar |
 | mod+shift+C | Copy the selected run IDs |
-| mod+Backspace | Delete the selected runs (asks first) |
+| ⌘⌫ (macOS), Delete | Delete the selected runs (asks first; Undo brings them back) |
+| ↑ ↓, Shift+↑ ↓, Home, End, letters | Move, extend and find in the sidebar's list |
 | mod+, | Settings |
+| F11 (Windows, Linux), ctrl+⌘+F (macOS) | Full screen |
+| Ctrl+Q (Linux), ⌘Q (macOS) | Quit (asks first while a job runs) |
 | F10 (terminal) | The main menu |
+| Ctrl+C (terminal) | Quit (stops a job and cleans up first) |
 
 ## Without a display
 
@@ -1437,7 +1374,7 @@ a `hint:` line. `--dry-run` shows the plan without sending a request.
 ## Error codes
 
 Every error carries one of these codes. The exit code follows the class: `2` usage/config, `1`
-runtime, `3` the proven change is worse, `4` budget, `5` safety refusal, `130` interrupted.
+runtime, `3` prove refuted, `4` budget, `5` safety refusal, `130` interrupted.
 
 <a id="usage-invalid_argument"></a>
 ### `usage.invalid_argument` (exit 2)
@@ -1456,7 +1393,7 @@ in the config file, or no operator was given. The hint lists the configured name
 ### `usage.unknown_run` (exit 2)
 
 No stored run matches the reference. `oprobe show --list`; use more characters of the id,
-`last`, `last~N`, or a path to a `.oprobe` file.
+`last`, `last~N`, a label, or a path to a `.oprobe` file.
 
 <a id="usage-unknown_baseline"></a>
 ### `usage.unknown_baseline` (exit 2)
@@ -1571,14 +1508,14 @@ lab limit.
 <a id="run-sla_failed"></a>
 ### `run.sla_failed` (exit 3)
 
-A 5.x SLA check failed. oprobe 6 has no SLA: it reports failures as findings, and `--set sla…`
-is refused. Exit 3 now means that `prove` found the change worse on the objective.
+A 5.x SLA check failed. oprobe 6 reports failures as findings; exit 3 now means that `prove`
+refuted the change.
 
 <a id="run-regression"></a>
 ### `run.regression` (exit 3)
 
-The change made things worse on the objective: `prove`'s verdict is `worse`. Read the evidence
-(the trials and the secondary metrics); try another value with `--with`.
+The change made things worse on the objective: `prove` refuted it. Read the evidence (the A/B
+pairs and the secondary metrics); try another value with `--with`.
 
 <a id="run-interrupted"></a>
 ### `run.interrupted` (exit 130, retryable)

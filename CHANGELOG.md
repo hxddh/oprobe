@@ -27,6 +27,11 @@ All notable changes to this project are documented here. The format follows
   `TimelineView::reliable(q)` / `min_ops_for(q)` (n ≥ 10 / (1 − q)) so renderers can mute
   quantiles of intervals with too few operations; `FindingView::remedy_line`;
   `Slice::throttle_share_ratio` for hot keys.
+- `App::trash`, `App::restore` (`TrashedRuns`) and `App::configured_operators` in the service
+  layer.
+- Headless UI tests that run as macOS and as Windows: menus, shortcuts, Settings, alerts and
+  their default button, dialog button order, the sidebar's keys, New Run's plan, and quitting
+  during a run.
 
 ### Changed
 
@@ -75,6 +80,42 @@ All notable changes to this project are documented here. The format follows
   the one with the largest gain; evidence gains `affected_apis_count`.
 - Hot keys in the view model carry `throttle_share_ratio` (share of all throttling); the slices'
   `throttled_ratio` is the share of the slice's own requests, and is `None` for hot keys.
+- **The app's Prove proves the finding, as the CLI does.** A finding's Prove (Operator) and
+  **Prove this remedy** (Profile) pass the finding to `App::prove`, which sizes its remedy from
+  the run like `oprobe prove RUN CODE`; the app no longer invents values (`concurrent_limit =
+  16`, `timeout = 5s`, …). A value you change by hand is still proved as you set it.
+- **One vocabulary in the app**: verdicts OK / Review / Attention / Critical (正常 / 值得一看 /
+  需关注 / 严重), prove results improved / worse / inconclusive (有改善 / 变差 / 无定论), and
+  trials (试验) instead of replays. Finding titles of 5.x codes are gone.
+- **Delete moves runs to the trash, with Undo.** The app asks with the system's alert (Cancel is
+  the default) and moves the runs to `<data>/trash/` (`App::trash`); **Undo** in the notice bar
+  brings them back (`App::restore`). `oprobe show --rm` is unchanged.
+- **Native platform behaviour**:
+  - the sidebar shows the window's material (vibrancy on macOS, Mica on Windows 11; only the
+    detail paints the background), is a keyboard listbox (↑/↓, Shift to extend, Home/End,
+    type-select, Delete or ⌘⌫, Return) with listbox/option roles, selects the platform's way
+    (accent or inactive grey on macOS, subtle fill with an accent pill on Windows and GNOME),
+    outlines the row a context menu acts on, and can be resized;
+  - Settings is a window of its own on macOS (changes apply at once) and a preferences dialog
+    elsewhere, and shows the config file and the data directory;
+  - Windows and Linux get a flat primary menu under its button, About oprobe, Quit (Ctrl+Q) or
+    Exit, and full screen (F11); menu items with a system role are labelled in the app's
+    language; menu shortcuts that a text field uses no longer fire while you type, and menu
+    actions wait while a dialog is open;
+  - quitting or closing the window during a run or a prove asks first (Stop and Quit / Cancel);
+  - the sidebar, the page and (macOS, Windows) the window's placement are restored; control
+    heights grow with the system's text size; the toolbar has each platform's height;
+  - New Run focuses the operator field, takes Return anywhere, offers the workload as a pop-up
+    and the lab's scenarios, configured operators (`[operators.NAME]`) and recent `op.toml`
+    files in a Choose pop-up, and **plans a real target first** (`App::plan`: what it writes,
+    reads and deletes, its ETA and budgets) before it offers Run;
+  - Open Run File uses the system's open dialog filtered to `.oprobe` / `.json` and opens the
+    file in place; files opened from Finder or Explorer open; a file dragged over the window
+    outlines it;
+  - a run or prove that ends in the background shows a notification and asks for attention;
+    the notice bar is read out by screen readers; dialogs do not fade with reduced motion; the
+    title in the toolbar no longer takes the title bar's double click; the detail is centred on
+    wide windows.
 
 ### Fixed
 
@@ -93,6 +134,10 @@ All notable changes to this project are documented here. The format follows
 - `key_limit` (and any remedy that is not a layer) no longer prints its remedy twice in `show`.
 - The fine heatmap leaves warmup operations out and starts at the step just below the fastest
   operation.
+- The macOS menu bar is built again (Settings, New Run and the app's shortcuts): the sidebar's
+  shortcut no longer panics there (`ctrl+cmd+s`).
+- Contrast: white on the dark accent (now `#2a73d6`, 4.6:1), field and switch borders (3.3:1),
+  and the warning and OK colours as small text (`#9a5c00`, `#16843f`).
 
 ### Removed
 

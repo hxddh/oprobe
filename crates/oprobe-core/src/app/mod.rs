@@ -8,6 +8,8 @@
 //!     fn show(&self, r: RunRef) -> Result<Profile>;
 //!     fn list(&self) -> Result<RunList>;
 //!     fn rm(&self, r: &[RunRef]) -> Result<()>;
+//!     fn trash(&self, r: &[RunRef]) -> Result<TrashedRuns>;   // the app's Delete, with Undo
+//!     fn restore(&self, t: &TrashedRuns) -> Result<()>;
 //!     async fn lab(&self, req: LabRequest) -> Result<LabHandle>;
 //! }
 //! ```
@@ -54,7 +56,7 @@ pub use input::*;
 pub use lab::LabOutput;
 pub use prove::{ProveObjective, ProveOutcome, ProveOutput, ProveRequest, ProveVerdict};
 pub use run::{RunOutput, RunPlan, RunSet};
-pub use runs::{Profile, RemovedRuns, RunList};
+pub use runs::{Profile, RemovedRuns, RunList, TrashedRuns};
 
 /// Where a command's log lines, warnings, progress and events go: [`crate::output::Output`].
 /// Front ends that consume events in-process use `EventSink::silent()` and `sink.bus()`.
@@ -364,6 +366,22 @@ impl App {
     /// Delete stored runs (a file outside the store is refused).
     pub fn rm(&self, r: &[RunRef]) -> Result<()> {
         runs::rm(self, r).map(|_| ())
+    }
+
+    /// Move stored runs to oprobe's trash (`<data>/trash/`, kept a week) instead of deleting
+    /// them: [`App::restore`] puts them back (the app's Undo).
+    pub fn trash(&self, r: &[RunRef]) -> Result<TrashedRuns> {
+        runs::trash(self, r)
+    }
+
+    /// Put runs [`App::trash`] moved back into the store.
+    pub fn restore(&self, t: &TrashedRuns) -> Result<()> {
+        runs::restore(self, t)
+    }
+
+    /// The names of the operators the config file declares (`[operators.NAME]`), sorted.
+    pub fn configured_operators(&self) -> Result<Vec<String>> {
+        Ok(self.config()?.operators.keys().cloned().collect())
     }
 
     /// The run ids `r` names (to report what [`App::rm`] removes).

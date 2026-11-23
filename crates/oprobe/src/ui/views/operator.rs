@@ -1,8 +1,9 @@
 //! Operator: the run's layer stack and read/write/HTTP settings as switches and fields, each
-//! finding's remedy highlighted beside them. Change a value, then Prove: `App::prove` replays
-//! the run A/B and its pairs stream in, drawn as they converge (each pair's change, the
-//! estimate and its interval against the A/A noise floor); the proven diff copies as Rust or
-//! TOML.
+//! finding's remedy highlighted beside them. A finding's Prove sizes its remedy from the run and
+//! proves it, as `oprobe prove RUN CODE` does; a value changed by hand is proved as it is
+//! (`--with`). `App::prove` runs the trials A/B and its pairs stream in, drawn as they converge
+//! (each pair's change, the estimate and its interval against the A/A noise floor); the proven
+//! diff copies as Rust or TOML.
 
 use std::collections::BTreeSet;
 use std::rc::Rc;
@@ -67,7 +68,7 @@ fn remedy_list(s: Store, m: &ProfileModel) -> View {
             .child(small(tr("operator.no_remedies")));
     }
     kit::section_first(tr("operator.remedies")).children(with.into_iter().map(move |f| {
-        let r = f.remedy.clone();
+        let code = f.code.clone();
         view()
             .flex_row()
             .flex_wrap()
@@ -93,7 +94,7 @@ fn remedy_list(s: Store, m: &ProfileModel) -> View {
                 btn(
                     tr("operator.apply"),
                     || Kind::Plain,
-                    move || s.apply_remedy(&r),
+                    move || s.prove_remedy(&code),
                 )
                 .accessibility_label(fill("profile.try_remedy_of", &[&f.code])),
             )
@@ -309,6 +310,20 @@ fn prove(s: Store) -> View {
     section(tr("operator.prove"))
         .test_id("prove")
         .child(small(tr("operator.prove_hint")))
+        .child(dynamic(move || {
+            let edited = s.edits.with(|e| !e.is_empty());
+            let finding = s.prove_finding.get();
+            untracked(|| {
+                let what = if edited {
+                    tr("operator.proves_edits").to_owned()
+                } else if let Some(code) = finding {
+                    fill("operator.proves_finding", &[&finding_title(&code)])
+                } else {
+                    tr("operator.proves_top").to_owned()
+                };
+                body(what).test_id("prove-target")
+            })
+        }))
         .child(
             view()
                 .flex_row()
@@ -384,7 +399,7 @@ fn prove_state(st: crate::ui::jobs::State, p99: bool) -> View {
     };
     let mut v = view().gap_1();
     if st.outcome.is_none() {
-        v = v.child(small(fill("operator.replays", &[&st.trials.len()])));
+        v = v.child(small(fill("operator.trials", &[&st.trials.len()])));
     }
     // The pairs as the prove recorded them once it ends, else as they stream in.
     let ab: Vec<(f64, f64, u64)> = match &st.outcome {

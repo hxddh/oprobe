@@ -2,25 +2,33 @@
 //! selection, under one bar that is both the title bar and the toolbar (the system's title bar
 //! is hidden; its controls stay where the platform puts them, and the bar is a drag region).
 //! The detail is Profile or Operator for one run, Compare for several. Dialogs (New Run,
-//! Settings, Delete) are modal over it. On a terminal the same structure, one cell high.
+//! Settings, About) are modal over it; Delete and Quit ask with the system's alert. The window
+//! opens where it was left, and files opened from the file manager or dropped on it open. On a
+//! terminal the same structure, one cell high.
 
 use nsh_base::theme;
-use nsh_core::desktop::{Backdrop, ProgressState, WindowProgress};
-use nsh_core::element::desktop::{main_window, title_bar};
+use nsh_core::desktop::{Backdrop, ProgressState, WindowPlacement, WindowProgress};
+use nsh_core::element::desktop::{main_window, on_quit_request, title_bar};
 use nsh_core::element::os;
 use nsh_core::platform::Os;
 use nsh_core::prelude::*;
+use nsh_core::storage::Storage;
 
 use crate::ui::i18n::{tr, trf};
 use crate::ui::icons::Icon;
 use crate::ui::kit::{self, Kind, btn, segmented, small, title, tool_btn};
 use crate::ui::menus;
-use crate::ui::store::{Dialog, Page, Store, store};
+use crate::ui::store::{Dialog, PLACEMENT_KEY, Page, Store, store};
 
-/// The toolbar's height where the platform leaves it to the app (macOS's unified toolbar).
-const BAR_H: f32 = 52.0;
-/// The sidebar's width.
-pub const SIDEBAR_W: f32 = 248.0;
+/// The toolbar's height where the platform leaves it to the app: macOS's unified toolbar
+/// (52 pt), Windows' title bar with a toolbar (48 px), GNOME's header bar (46 px).
+fn platform_bar_h() -> f32 {
+    match os() {
+        Os::MacOs => 52.0,
+        Os::Windows => 48.0,
+        _ => 46.0,
+    }
+}
 
 pub fn shell() -> impl IntoElement {
     let s = store();
@@ -28,6 +36,9 @@ pub fn shell() -> impl IntoElement {
     if !term {
         menus::install(s);
         dock_progress(s);
+        guard_quit(s);
+        keep_placement();
+        s.follow_open_files();
     } else {
         install_terminal_keys(s);
     }
@@ -36,6 +47,8 @@ pub fn shell() -> impl IntoElement {
         .min_h(px(0.0))
         .flex_row()
         .on_file_drop(move |e: &FileDropEvent| s.open_dropped(&e.uris))
+        .on_file_drag_enter(move || s.drag_over.set(true))
+        .on_file_drag_leave(move || s.drag_over.set(false))
         .child(dynamic(move || {
             let on = s.sidebar.get();
             untracked(|| on.then(|| super::sidebar::sidebar(s)))
@@ -50,22 +63,44 @@ pub fn shell() -> impl IntoElement {
                 .child(notice(s))
                 .child(detail(s)),
         )
+        // A file dragged over the window: the window says it takes it.
+        .child(dynamic(move || {
+            let over = s.drag_over.get();
+            untracked(|| {
+                over.then(|| {
+                    view()
+                        .absolute()
+                        .inset_0()
+                        .border(px(3.0))
+                        .border_color(move || theme().primary)
+                        .rounded(px(6.0))
+                        .test_id("drop-target")
+                })
+            })
+        }))
+        .child(super::dialogs::settings_window(s))
         .child(super::dialogs::dialogs(s))
 }
 
-/// The height of the bar: the platform's title bar (a hidden one keeps its height), else ours.
+/// The height of the bar: the platform's title bar (a hidden one keeps its height), else the
+/// platform's toolbar height.
 pub fn bar_h() -> f32 {
     if kit::in_terminal() {
         return 16.0;
     }
     let t = title_bar().top.0;
-    if t > 0.0 { t.max(38.0) } else { BAR_H }
+    if t > 0.0 {
+        t.max(38.0)
+    } else {
+        platform_bar_h()
+    }
 }
 
 /// The toolbar over the detail: the sidebar toggle (when the sidebar is hidden), the title and
 /// subtitle; Profile/Operator, New Run, Run/Stop and, off macOS, the primary menu.
 fn toolbar(s: Store) -> View {
     let term = kit::in_terminal();
+    let menu_ref = element_ref();
     view()
         .flex_row()
         .items_center()
@@ -140,14 +175,24 @@ fn toolbar(s: Store) -> View {
         }))
         .child((term || !menus::mac()).then(|| {
             tool_btn(
-                if matches!(os(), Os::Windows) {
+                if menus::windows() {
                     Icon::More
                 } else {
                     Icon::Menu
                 },
                 tr("menu.primary"),
-                move || menus::show_primary(s),
+                move || {
+                    // Under the button, its leading edge (GNOME's and Windows' menu buttons).
+                    let at = menu_ref.measure();
+                    s.task(async move {
+                        let at = at.await.map(|m| {
+                            nsh_core::geometry::point(m.page.x, m.page.y + m.frame.size.height)
+                        });
+                        menus::show_primary(s, at);
+                    });
+                },
             )
+            .element_ref(&menu_ref)
             .test_id("primary-menu")
         }))
         // The window's own controls at the trailing end (Windows, GNOME's layout).
@@ -157,7 +202,8 @@ fn toolbar(s: Store) -> View {
         }))
 }
 
-/// The title and subtitle: the run (or how many are compared) and its operator.
+/// The title and subtitle: the run (or how many are compared) and its operator. Not
+/// selectable: the bar is the window's drag region (a double press zooms).
 fn heading_of(s: Store) -> impl IntoElement {
     dynamic(move || {
         let n = s.selection.with(|v| v.len());
@@ -181,7 +227,7 @@ fn heading_of(s: Store) -> impl IntoElement {
             view()
                 .min_w(px(0.0))
                 .flex_shrink(1.0)
-                .child(title(t).number_of_lines(1).selectable(true))
+                .child(title(t).number_of_lines(1))
                 .child(
                     (!sub.is_empty() && !kit::in_terminal()).then(|| small(sub).number_of_lines(1)),
                 )
@@ -209,7 +255,7 @@ fn job_status(s: Store) -> impl IntoElement {
                     },
                     (st.total_s > 0.0).then(|| (st.elapsed_s / st.total_s).clamp(0.0, 1.0)),
                 ),
-                (None, Some(st)) => (trf("operator.replays", &[&st.trials.len()]), None),
+                (None, Some(st)) => (trf("operator.trials", &[&st.trials.len()]), None),
                 _ => return None,
             };
             Some(
@@ -242,12 +288,16 @@ fn detail(s: Store) -> impl IntoElement {
     })
 }
 
+/// The notice bar: an alert screen readers read (`Store::say` announces it), with Undo after a
+/// Delete.
 fn notice(s: Store) -> impl IntoElement {
     dynamic(move || {
         let n = s.notice.get();
+        let undo = s.trashed.with(|t| t.is_some());
         untracked(|| {
             n.map(|(msg, tone)| {
                 view()
+                    .role(AccessibilityRole::Alert)
                     .flex_row()
                     .items_center()
                     .gap_2()
@@ -265,11 +315,11 @@ fn notice(s: Store) -> impl IntoElement {
                             .min_w(px(0.0))
                             .selectable(true),
                     )
-                    .child(btn(
-                        tr("app.dismiss"),
-                        || Kind::Ghost,
-                        move || s.notice.set(None),
-                    ))
+                    .child(undo.then(|| {
+                        btn(tr("app.undo"), || Kind::Plain, move || s.undo_delete())
+                            .test_id("notice-undo")
+                    }))
+                    .child(btn(tr("app.dismiss"), || Kind::Ghost, move || s.dismiss()))
             })
         })
     })
@@ -301,8 +351,56 @@ fn dock_progress(s: Store) {
     });
 }
 
+/// Quitting or closing the window while a run or a prove goes on asks first: the app's Quit
+/// (⌘Q, Ctrl+Q, Exit) is a quit request, and the main window's close button does not close it
+/// while a job runs.
+fn guard_quit(s: Store) {
+    on_quit_request(move || s.request_quit());
+    let busy = computed(move || s.running() || s.proving());
+    effect(move || {
+        let mut attrs = nsh_core::desktop::WindowAttributes::default();
+        attrs.close_on_press = Some(!busy.get());
+        main_window().set(attrs);
+    });
+    main_window().on_close_press(move |_| {
+        if busy.get_untracked() {
+            s.request_quit();
+        }
+    });
+}
+
+/// The window opens where the user left it: its placement is saved as it changes and given
+/// back at the next start (fitted on the displays there are then). macOS and Windows only: on
+/// GTK the bounds nsh 0.6 reports exclude the client-side frame that `set_placement` then
+/// includes, so a restored window shrinks by its frame at every start (and Wayland places
+/// windows itself).
+fn keep_placement() {
+    if !matches!(os(), Os::MacOs | Os::Windows) {
+        return;
+    }
+    let main = main_window();
+    if let Some(p) = Storage::get_item(PLACEMENT_KEY)
+        .and_then(|j| serde_json::from_str::<WindowPlacement>(&j).ok())
+    {
+        main.set_placement(p);
+    }
+    let last = stored(None::<WindowPlacement>);
+    effect(move || {
+        let Some(st) = main.state() else {
+            return;
+        };
+        if last.with(|l| *l == Some(st.placement)) {
+            return;
+        }
+        last.replace(Some(st.placement));
+        if let Ok(j) = serde_json::to_string(&st.placement) {
+            let _ = Storage::set_item(PLACEMENT_KEY, j);
+        }
+    });
+}
+
 /// The window's chrome: the title bar hidden (the toolbar takes its place), the sidebar's
-/// material behind the window on macOS and Windows.
+/// material behind the window on macOS (vibrancy) and Windows 11 (Mica).
 pub fn setup_window() {
     use nsh_core::desktop::{TitleBarOptions, TitleBarStyle, WindowAttributes};
     if kit::in_terminal() {
@@ -313,10 +411,14 @@ pub fn setup_window() {
     attrs.min_size = Some(Some(size(px(820.0), px(520.0))));
     let mut bar = TitleBarOptions::default();
     bar.style = TitleBarStyle::Hidden;
-    bar.height = Some(px(BAR_H));
+    bar.height = Some(px(platform_bar_h()));
     attrs.title_bar = Some(bar);
-    if matches!(os(), Os::MacOs | Os::Windows) {
-        attrs.backdrop = Some(Backdrop::Sidebar);
+    if super::sidebar::on_material() {
+        attrs.backdrop = Some(if menus::mac() {
+            Backdrop::Sidebar
+        } else {
+            Backdrop::Window
+        });
     }
     main_window().set(attrs);
 }
@@ -324,25 +426,40 @@ pub fn setup_window() {
 /// On a terminal there is no menu bar: the shortcuts are the app's own keys.
 fn install_terminal_keys(s: Store) {
     let opts = KeyOptions::default();
-    on_key_with("ctrl+n", opts, move |_| s.dialog.set(Some(Dialog::NewRun)));
-    on_key_with("ctrl+r", opts, move |_| s.run_again());
+    let free = move || !s.modal();
+    on_key_with("ctrl+n", opts, move |_| {
+        if free() {
+            s.dialog.set(Some(Dialog::NewRun))
+        }
+    });
+    on_key_with("ctrl+r", opts, move |_| {
+        if free() {
+            s.run_again()
+        }
+    });
     on_key_with("ctrl+1", opts, move |_| s.page.set(Page::Profile));
     on_key_with("ctrl+2", opts, move |_| s.page.set(Page::Operator));
     on_key_with("ctrl+,", opts, move |_| {
-        s.dialog.set(Some(Dialog::Settings))
+        if free() {
+            s.open_settings()
+        }
     });
-    on_key_with("f10", opts, move |_| menus::show_primary(s));
+    on_key_with("f10", opts, move |_| menus::show_primary(s, None));
 }
 
-/// The frame of the detail's content: scrolling and inset.
+/// The frame of the detail's content: scrolling and inset, its width capped and centred on
+/// wide windows.
 pub fn page(body: View) -> impl IntoElement {
     let term = kit::in_terminal();
     scroll().flex_1().min_h(px(0.0)).child(
-        body.px(px(if term { 1.0 } else { 24.0 }))
-            .py(px(if term { 0.0 } else { 20.0 }))
-            .gap(px(if term { 16.0 } else { 20.0 }))
-            .min_w(px(0.0))
-            .max_w(px(1100.0)),
+        view().w_full().items_center().child(
+            body.w_full()
+                .px(px(if term { 1.0 } else { 24.0 }))
+                .py(px(if term { 0.0 } else { 20.0 }))
+                .gap(px(if term { 16.0 } else { 20.0 }))
+                .min_w(px(0.0))
+                .max_w(px(1100.0)),
+        ),
     )
 }
 
