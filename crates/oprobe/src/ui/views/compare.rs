@@ -41,6 +41,7 @@ fn overlays(ms: &[Rc<ProfileModel>]) -> View {
     let (ops, cdf) = (plots::goodput_overlay(&refs), plots::cdf_overlay(&refs));
     section("")
         .test_id("compare-charts")
+        .child(small(tr("compare.note")).test_id("compare-note"))
         .child(ops.map(|p| chart(tr("compare.goodput"), 120.0, move || Some(p.clone()))))
         .child(cdf.map(|p| chart(tr("compare.cdf"), 130.0, move || Some(p.clone()))))
 }
@@ -107,22 +108,36 @@ fn table(ms: &[Rc<ProfileModel>]) -> View {
                 _ => "metric.throttled",
             }))
             .children(r.values.iter().enumerate().map(|(i, v)| {
-                let d = if base > 0.0 { v / base - 1.0 } else { 0.0 };
+                // Shares (errors, throttled) change by percentage points; the others by ratio.
+                let share = matches!(r.key, "errors" | "throttled");
+                let d = if share {
+                    v - base
+                } else if base > 0.0 {
+                    v / base - 1.0
+                } else {
+                    0.0
+                };
                 let better = if r.higher_is_better { d > 0.0 } else { d < 0.0 };
-                let tone = if i == 0 || d.abs() < 0.02 {
+                let small_change = if share {
+                    d.abs() < 0.0005
+                } else {
+                    d.abs() < 0.02
+                };
+                let tone = if i == 0 || small_change {
                     Tone::Neutral
                 } else if better {
                     Tone::Ok
                 } else {
                     Tone::Crit
                 };
+                let shown = if share { fmt::points(d) } else { fmt::delta(d) };
                 cell(
                     view()
                         .flex_row()
                         .gap_2()
                         .child(text(value(r.key, *v)).text_size(px(13.0)).tabular_nums())
                         .child((i > 0).then(|| {
-                            text(fmt::delta(d))
+                            text(shown.clone())
                                 .text_size(px(11.0))
                                 .tabular_nums()
                                 .text_color(move || tone.color())

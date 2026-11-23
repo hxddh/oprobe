@@ -187,6 +187,18 @@ fn a_lab_run_streams_into_the_sidebar_and_opens_in_profile() {
     wait_long(&mut app, "text:Latency distribution");
     wait_long(&mut app, "id:evidence-throttling");
     wait_long(&mut app, "text:Share throttled by requests in flight");
+    // The backend's requests by API, the retries, and the counts behind the numbers.
+    wait_long(&mut app, "id:requests");
+    assert!(app.shows("GetObject"), "{:?}", app.screen().texts());
+    wait_long(&mut app, "id:retries");
+    wait_long(&mut app, "text:/operations · .* requests/");
+    // Details and the run's setup open on demand.
+    app.press("id:details").unwrap();
+    wait_long(&mut app, "id:details-body");
+    wait_long(&mut app, "text:/Bytes asked for/");
+    app.press("id:setup").unwrap();
+    wait_long(&mut app, "id:setup-body");
+    wait_long(&mut app, "text:/^oprobe run lab/");
     let runs = App::new(cx.paths()).list().unwrap().runs;
     assert_eq!(runs.len(), 1);
     wait_long(&mut app, &format!("id:run-{}", runs[0].id));
@@ -271,6 +283,7 @@ fn a_context_menu_compares_and_deletes_runs() {
     wait_long(&mut app, "text:2 runs compared");
     assert!(app.shows("Operator vs first"));
     wait_long(&mut app, "id:compare-charts");
+    wait_long(&mut app, "id:compare-note");
     assert!(app.shows("Goodput over time") && app.shows("Latency distribution"));
     // Delete asks first; Cancel keeps the runs.
     app.right_click(&format!("id:run-{a}")).unwrap();

@@ -543,3 +543,95 @@ pub fn meter(ratio: f64, tok: &'static str) -> View {
         .overflow_hidden()
         .child(view().h_full().w(relative(r)).bg(token(tok)))
 }
+
+/// A column of a [`table`]: its heading, width and whether its cells are numbers (right-aligned,
+/// tabular).
+#[derive(Clone, Copy, Debug)]
+pub struct Col {
+    pub heading: &'static str,
+    pub width: f32,
+    pub numeric: bool,
+}
+
+/// A compact table: a heading row, then one hairline-separated row per item. The first column
+/// takes the room left; the others have their widths. It scrolls sideways when the window is
+/// narrower than its columns.
+pub fn table(cols: &[Col], rows: Vec<Vec<String>>) -> impl IntoElement {
+    let cols: Vec<Col> = cols.to_vec();
+    let total: f32 = cols.iter().skip(1).map(|c| c.width).sum::<f32>() + 160.0;
+    let cell = |c: Col, first: bool, t: String, head: bool| {
+        let t = if head {
+            caption(t)
+        } else if c.numeric {
+            text(t).text_size(px(metrics().small + 1.0)).tabular_nums()
+        } else {
+            text(t).text_size(px(metrics().small + 1.0))
+        };
+        let v = view().min_w(px(0.0)).child(t.number_of_lines(1));
+        let v = if first {
+            v.flex_1().min_w(px(120.0))
+        } else {
+            v.w(px(c.width)).flex_shrink_0()
+        };
+        if c.numeric { v.items_end() } else { v }
+    };
+    let row = |cells: Vec<String>, head: bool, cols: &[Col]| {
+        view()
+            .flex_row()
+            .items_center()
+            .gap_3()
+            .py(px(if in_terminal() { 0.0 } else { 5.0 }))
+            .border_t(px(if head { 0.0 } else { 1.0 }))
+            .border_color(move || theme().border)
+            .children(
+                cols.iter()
+                    .zip(cells)
+                    .enumerate()
+                    .map(|(i, (c, t))| cell(*c, i == 0, t, head)),
+            )
+    };
+    let heads: Vec<String> = cols
+        .iter()
+        .map(|c| crate::ui::i18n::tr(c.heading).to_owned())
+        .collect();
+    scroll().horizontal().min_w(px(0.0)).child(
+        view()
+            .min_w(px(total))
+            .child(row(heads, true, &cols))
+            .children(rows.into_iter().map(|r| row(r, false, &cols))),
+    )
+}
+
+/// A disclosure: a heading that shows or hides its content (hidden at first).
+pub fn disclosure(
+    heading_text: impl IntoReactive<SharedString>,
+    id: &'static str,
+    content: impl Fn() -> View + 'static,
+) -> View {
+    let open = signal(false);
+    let h = heading_text.into_reactive();
+    let a11y = h.clone();
+    section("")
+        .child(
+            button()
+                .on_press(move || open.update(|o| *o = !*o))
+                .accessibility_label(move || Some(a11y.get()))
+                .test_id(id)
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .self_start()
+                .rounded(px(4.0))
+                .focus_visible(ring)
+                .child(
+                    text(move || SharedString::from(if open.get() { "▾" } else { "▸" }))
+                        .text_size(px(metrics().body))
+                        .text_color(move || theme().muted_foreground),
+                )
+                .child(heading(h)),
+        )
+        .child(dynamic(move || {
+            let o = open.get();
+            untracked(|| o.then(|| content().gap_3()))
+        }))
+}

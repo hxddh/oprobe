@@ -66,7 +66,7 @@ pub fn goodput(pts: &[Point]) -> Option<Plot> {
     Some(plot)
 }
 
-/// p50 and p99 over the run on a log axis.
+/// p50, p99 and p99.9 over the run on a log axis.
 pub fn latency(pts: &[Point]) -> Option<Plot> {
     if pts.is_empty() {
         return None;
@@ -80,7 +80,9 @@ pub fn latency(pts: &[Point]) -> Option<Plot> {
         window(pts),
         Scale::log(
             if lo.is_finite() { lo } else { 0.1 },
-            pts.iter().map(|p| p.p99_ms).fold(0.1, f64::max),
+            pts.iter()
+                .map(|p| p.p999_ms.max(p.p99_ms))
+                .fold(0.1, f64::max),
         ),
         Unit::Ms,
         vec![
@@ -93,6 +95,14 @@ pub fn latency(pts: &[Point]) -> Option<Plot> {
                 "p99",
                 "stage-server",
                 pts.iter().map(|p| (p.t_s, p.p99_ms)).collect(),
+            ),
+            Line::step(
+                "p99.9",
+                "stage-stall",
+                pts.iter()
+                    .filter(|p| p.p999_ms > 0.0)
+                    .map(|p| (p.t_s, p.p999_ms))
+                    .collect(),
             ),
         ],
     ))
@@ -120,6 +130,16 @@ fn per_second(
             pts.iter().map(|p| (p.t_s, f(p))).collect(),
         )],
     ))
+}
+
+/// The most requests in flight at once, second by second (where a concurrency limit shows).
+pub fn inflight(pts: &[Point]) -> Option<Plot> {
+    if pts.iter().all(|p| p.inflight_peak == 0) {
+        return None;
+    }
+    per_second(pts, tr("plot.peak"), "series-a", Unit::Count, |p| {
+        p.inflight_peak as f64
+    })
 }
 
 /// Throttled responses per second.
@@ -285,6 +305,8 @@ pub fn evidence(m: &ProfileModel, kind: EvidenceChart) -> Option<(&'static str, 
         EvidenceChart::ErrorsOverTime => {
             errors_rate(&m.timeline).map(|p| (tr("plot.errors_rate"), p))
         }
+        // Tables, not charts: the view draws them.
+        EvidenceChart::HotKeys | EvidenceChart::Amplification => None,
     }
 }
 
@@ -428,6 +450,9 @@ mod tests {
             mib_per_s: ops / 10.0,
             p50_ms: 5.0,
             p99_ms: 50.0,
+            p999_ms: 80.0,
+            max_ms: 120.0,
+            inflight_peak: 4,
             errors,
             throttled,
         }
@@ -447,6 +472,7 @@ mod tests {
         assert_eq!(b.pts[0].1, b.pts[0].2, "a clean second draws nothing");
         assert_eq!((b.pts[1].1, b.pts[1].2), (p.y.min, p.y.max));
         assert!(goodput(&[]).is_none());
+        assert_eq!(inflight(&pts).unwrap().lines[0].pts[0], (0.0, 4.0));
         let t = throttled_rate(&pts).unwrap();
         assert_eq!(t.lines[0].pts[1], (1.0, 4.0));
     }

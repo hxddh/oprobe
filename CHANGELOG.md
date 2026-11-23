@@ -20,7 +20,31 @@ All notable changes to this project are documented here. The format follows
   - control sizes follow each platform, headings are in sentence case, and Operator's settings
     are grouped.
 
+### Added
+
+- **Profile shows what the run measured, not only its verdict**:
+  - requests by S3 API: count, status codes, TTFB p50 / p99, p99, bytes, reuse;
+  - retries and failures: retries, backoff time, 429 / 503, the longest `Retry-After`, failure
+    classes;
+  - requests in flight and p99.9 on the timeline, and p99.9 among the key numbers;
+  - **Details**: byte amplification, the hottest keys, object sizes, prefixes and server
+    addresses;
+  - **Run setup**: workload, load, dataset, mix, seed, client health, rows kept, and the command
+    that runs it again;
+  - a note up front when the numbers are less certain (a saturated client, a partial run, late
+    arrivals, few operations).
+- Evidence for more findings: hot keys (`key_limit`, `repeated_reads`) and byte amplification
+  (`small_ranges`). Core view model: `SetupView`, `TrustView`, `ApiRow`, `RetryView`,
+  `BytesView`, `SpreadView`.
+
 ### Fixed
+
+- The request waterfall draws the wait before each retry. In a throttled run it was blank,
+  though it was most of the time.
+- Compare shows a change of a share (errors, throttled) in percentage points: from 0.08 % to
+  0 % is −0.08 pp, not −100 %. It also notes that each column is a single run.
+- Findings come before the stage split. The key numbers say what they are a share of (failed per
+  operation, throttled per request) and how many operations were measured.
 
 - `prove`: the noise floor is never below what a trial can resolve, `ln(1 + 1/ops)` for its
   fewest operations. A/A trials of a few dozen operations that happened to agree exactly let a

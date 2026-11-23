@@ -22,6 +22,9 @@
 //! | each verb with its own stage split | [`VerbView`] |
 //! | the in-flight levels behind a concurrency ceiling | [`ConcurrencyView`] |
 //! | which chart is a finding's evidence | [`EvidenceChart`] |
+//! | how the run was set up, and how far to trust it | [`SetupView`], [`TrustView`] |
+//! | the backend's requests by API, retries, bytes | [`ApiRow`], [`RetryView`], [`BytesView`] |
+//! | where the traffic went (keys, sizes, prefixes, remotes) | [`SpreadView`] |
 
 use crate::analysis::capacity::Confidence;
 use crate::analysis::diagnosis::Severity;
@@ -933,19 +936,346 @@ pub enum EvidenceChart {
     Latency,
     /// Failed operations per second over the run.
     ErrorsOverTime,
+    /// The hottest keys with their share of the traffic and of the throttling
+    /// ([`SpreadView::hot_keys`]).
+    HotKeys,
+    /// Bytes asked for against bytes moved, and requests per operation ([`BytesView`]).
+    Amplification,
 }
 
 impl EvidenceChart {
     /// The evidence chart of a finding code (`None`: the evidence is in its numbers).
     pub fn of(code: &str) -> Option<Self> {
         Some(match code {
-            "throttling" | "key_limit" => Self::Concurrency,
+            "throttling" => Self::Concurrency,
+            "key_limit" | "repeated_reads" => Self::HotKeys,
+            "small_ranges" => Self::Amplification,
             "rate_limit" => Self::ThrottledOverTime,
             "bandwidth_cap" => Self::Bandwidth,
             "tail_stragglers" | "hung_requests" => Self::Latency,
             "errors" => Self::ErrorsOverTime,
             _ => return None,
         })
+    }
+}
+
+/// How the run was set up: enough to read its numbers and to run it again.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SetupView {
+    /// The target as shown (`lab://throttle`, `s3://bucket/prefix`), and its endpoint.
+    pub target: String,
+    pub endpoint: Option<String>,
+    pub preset: String,
+    pub concurrency_count: u64,
+    pub duration_s: f64,
+    pub warmup_s: f64,
+    /// Operations per second asked for (open loop), else closed loop.
+    pub rate_per_s: Option<f64>,
+    pub objects_count: u64,
+    pub object_size_bytes: u64,
+    /// The workload's mix: `(weight, operation)`.
+    pub mix: Vec<(u32, String)>,
+    pub seed: u64,
+    pub started_at: String,
+    pub host: String,
+    pub oprobe_version: String,
+    /// An equivalent `oprobe run …` command.
+    pub command: String,
+}
+
+impl SetupView {
+    pub fn of(r: &Report) -> Self {
+        let w = &r.workload;
+        let h = &r.run.host;
+        Self {
+            target: r.target.display.clone(),
+            endpoint: r.target.endpoint.clone(),
+            preset: w.preset.clone(),
+            concurrency_count: r.spec.profile.workload.concurrency as u64,
+            duration_s: w.duration_s,
+            warmup_s: w.warmup_s,
+            rate_per_s: w.rate_per_s,
+            objects_count: w.dataset.objects_count,
+            object_size_bytes: w.dataset.object_size_bytes,
+            mix: w.mix.iter().map(|m| (m.weight, m.op.clone())).collect(),
+            seed: w.seed,
+            started_at: r.run.started_at.clone(),
+            host: format!("{} {} · {} CPUs", h.os, h.arch, h.cpus_count),
+            oprobe_version: r.run.oprobe_version.clone(),
+            command: r.spec.command(),
+        }
+    }
+}
+
+/// How far to trust the run's numbers: how much was measured, whether every operation was
+/// kept, and whether the client itself kept up.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TrustView {
+    pub ops_count: u64,
+    pub requests_count: u64,
+    pub window_s: f64,
+    /// Kept / seen operations in the trace rows (1: none sampled away).
+    pub kept_ratio: f64,
+    /// The client's CPU over the cores in use, and its scheduling lag p99.
+    pub cpu_ratio: Option<f64>,
+    pub sched_lag_p99_ms: Option<f64>,
+    /// The client could not keep up: the server/TTFB split is unreliable.
+    pub client_saturated: bool,
+    /// Arrivals of an open-loop run that could not start on time.
+    pub missed_arrivals_ratio: Option<f64>,
+    /// Why the run is partial (interrupted, a budget), if it is.
+    pub partial: Option<String>,
+}
+
+impl TrustView {
+    pub fn of(r: &Report) -> Self {
+        let sf = &r.self_stats;
+        Self {
+            ops_count: r.summary.ops,
+            requests_count: r.connections.requests,
+            window_s: r.run.window_s,
+            kept_ratio: if r.sampling.seen_ops_count == 0 {
+                1.0
+            } else {
+                r.sampling.kept_ratio
+            },
+            cpu_ratio: sf.cpu_ratio,
+            sched_lag_p99_ms: sf.sched_lag_p99_ms,
+            client_saturated: sf.client_saturated,
+            missed_arrivals_ratio: r
+                .schedule
+                .open_loop
+                .then_some(r.schedule.missed_arrivals_ratio),
+            partial: r
+                .run
+                .partial
+                .as_ref()
+                .map(|p| format!("{:?}", p.reason).to_lowercase())
+                .or_else(|| r.run.interrupted.then(|| "interrupted".to_owned())),
+        }
+    }
+
+    /// Something makes the numbers less certain (shown up front, not only in the details).
+    pub fn concerns(&self) -> bool {
+        self.client_saturated
+            || self.partial.is_some()
+            || self.missed_arrivals_ratio.is_some_and(|m| m > 0.01)
+            || self.ops_count < 100
+    }
+}
+
+/// The backend's requests of one API (`GetObject`, `PutObject`, …).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ApiRow {
+    pub api: String,
+    pub requests_count: u64,
+    pub errors_count: u64,
+    pub throttled_count: u64,
+    /// The status codes answered, most frequent first (`0`: no response).
+    pub status: Vec<(u16, u64)>,
+    pub reused_ratio: f64,
+    pub up_bytes: u64,
+    pub down_bytes: u64,
+    pub ttfb_p50_ms: f64,
+    pub ttfb_p99_ms: f64,
+    pub total_p50_ms: f64,
+    pub total_p99_ms: f64,
+}
+
+/// Every API the run called, busiest first.
+pub fn apis(r: &Report) -> Vec<ApiRow> {
+    let mut v: Vec<ApiRow> = r
+        .apis
+        .iter()
+        .filter(|a| a.count > 0)
+        .map(|a| {
+            let mut status: Vec<(u16, u64)> = a.status.iter().map(|(k, v)| (*k, *v)).collect();
+            status.sort_by_key(|s| std::cmp::Reverse(s.1));
+            ApiRow {
+                api: a.api.label().to_owned(),
+                requests_count: a.count,
+                errors_count: a.errors,
+                throttled_count: a.throttled,
+                status,
+                reused_ratio: a.reused_pct / 100.0,
+                up_bytes: a.bytes_up,
+                down_bytes: a.bytes_down,
+                ttfb_p50_ms: a.stages.ttfb.p50,
+                ttfb_p99_ms: a.stages.ttfb.p99,
+                total_p50_ms: a.stages.total.p50,
+                total_p99_ms: a.stages.total.p99,
+            }
+        })
+        .collect();
+    v.sort_by_key(|a| std::cmp::Reverse(a.requests_count));
+    v
+}
+
+/// Retries and failures.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RetryView {
+    pub retries_count: u64,
+    /// Time operations spent waiting between attempts, in total.
+    pub backoff_ms: f64,
+    pub status_429_count: u64,
+    pub status_503_count: u64,
+    /// The longest `Retry-After` the service asked for.
+    pub max_retry_after_ms: u64,
+    pub server_errors_count: u64,
+    pub client_errors_count: u64,
+    pub network_errors_count: u64,
+    pub failed_ops_count: u64,
+    /// Failure classes, most frequent first.
+    pub classes: Vec<(String, u64)>,
+}
+
+impl RetryView {
+    pub fn of(r: &Report) -> Self {
+        let x = &r.resilience;
+        let mut classes: Vec<(String, u64)> = x
+            .error_classes
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+        classes.sort_by_key(|c| std::cmp::Reverse(c.1));
+        Self {
+            retries_count: x.retries,
+            backoff_ms: x.retry_backoff_ms,
+            status_429_count: x.status_429,
+            status_503_count: x.status_503,
+            max_retry_after_ms: x.max_retry_after_ms,
+            server_errors_count: x.server_errors,
+            client_errors_count: x.client_errors,
+            network_errors_count: x.network_errors,
+            failed_ops_count: x.failed_ops,
+            classes,
+        }
+    }
+
+    /// Nothing was retried and nothing failed.
+    pub fn quiet(&self) -> bool {
+        self.retries_count == 0
+            && self.failed_ops_count == 0
+            && self.status_429_count == 0
+            && self.status_503_count == 0
+    }
+}
+
+/// Bytes asked for against bytes moved.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BytesView {
+    pub logical_read_bytes: u64,
+    pub logical_write_bytes: u64,
+    pub cache_hit_bytes: u64,
+    pub backend_down_bytes: u64,
+    pub backend_up_bytes: u64,
+    pub wire_rx_bytes: u64,
+    pub wire_tx_bytes: u64,
+    /// Downloaded / asked for (over-fetching raises it, cache hits lower it).
+    pub read_amplification_ratio: f64,
+    /// Downloaded / asked for past the cache.
+    pub overread_ratio: f64,
+    /// Uploaded / written (retried uploads raise it).
+    pub write_amplification_ratio: f64,
+    pub requests_per_op: f64,
+}
+
+impl BytesView {
+    pub fn of(r: &Report) -> Self {
+        let b = &r.bytes;
+        Self {
+            logical_read_bytes: b.logical_read,
+            logical_write_bytes: b.logical_write,
+            cache_hit_bytes: b.cache_hit_bytes,
+            backend_down_bytes: b.backend_down,
+            backend_up_bytes: b.backend_up,
+            wire_rx_bytes: b.wire_rx,
+            wire_tx_bytes: b.wire_tx,
+            read_amplification_ratio: b.read_amplification,
+            overread_ratio: b.overread_ratio,
+            write_amplification_ratio: b.write_amplification,
+            requests_per_op: b.request_amplification,
+        }
+    }
+}
+
+/// One slice of the traffic (a key, a size bucket, a prefix, a remote).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Slice {
+    pub key: String,
+    pub requests_count: u64,
+    /// Share of all requests.
+    pub share_ratio: f64,
+    /// Share of the throttling (hot keys) or of the slice's requests (the others).
+    pub throttled_ratio: Option<f64>,
+    pub error_ratio: Option<f64>,
+    pub p99_ms: Option<f64>,
+}
+
+/// Where the traffic went: the hottest keys, object sizes, prefixes and the server addresses.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct SpreadView {
+    pub hot_keys: Vec<Slice>,
+    pub sizes: Vec<Slice>,
+    pub prefixes: Vec<Slice>,
+    pub remotes: Vec<Slice>,
+}
+
+impl SpreadView {
+    pub const TOP: usize = 8;
+
+    pub fn of(r: &Report) -> Self {
+        let d = &r.dimensions;
+        let slice = |x: &crate::model::DimensionSlice| Slice {
+            key: x.key.clone(),
+            requests_count: x.requests_count,
+            share_ratio: x.share_ratio,
+            throttled_ratio: Some(x.throttled_ratio),
+            error_ratio: Some(x.error_ratio),
+            p99_ms: Some(x.p99_ms),
+        };
+        let total: u64 = r.network.remotes.iter().map(|x| x.requests_count).sum();
+        Self {
+            hot_keys: d
+                .hot_keys
+                .iter()
+                .take(Self::TOP)
+                .map(|k| Slice {
+                    key: k.key.clone(),
+                    requests_count: k.requests_count,
+                    share_ratio: k.share_ratio,
+                    throttled_ratio: Some(k.throttle_share_ratio),
+                    error_ratio: None,
+                    p99_ms: None,
+                })
+                .collect(),
+            sizes: d.size_buckets.iter().take(Self::TOP).map(slice).collect(),
+            prefixes: d.prefixes.iter().take(Self::TOP).map(slice).collect(),
+            remotes: r
+                .network
+                .remotes
+                .iter()
+                .take(Self::TOP)
+                .map(|x| Slice {
+                    key: x.remote.clone(),
+                    requests_count: x.requests_count,
+                    share_ratio: crate::util::ratio(x.requests_count as f64, total as f64),
+                    throttled_ratio: None,
+                    error_ratio: Some(crate::util::ratio(
+                        x.errors_count as f64,
+                        x.requests_count as f64,
+                    )),
+                    p99_ms: Some(x.p99_ms),
+                })
+                .collect(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.hot_keys.is_empty()
+            && self.sizes.is_empty()
+            && self.prefixes.is_empty()
+            && self.remotes.is_empty()
     }
 }
 
@@ -1032,6 +1362,8 @@ mod tests {
         for code in [
             "throttling",
             "key_limit",
+            "repeated_reads",
+            "small_ranges",
             "rate_limit",
             "bandwidth_cap",
             "tail_stragglers",
@@ -1041,6 +1373,32 @@ mod tests {
             assert!(EvidenceChart::of(code).is_some(), "{code}");
             assert!(crate::analysis::catalog::get(code).is_some(), "{code}");
         }
-        assert_eq!(EvidenceChart::of("small_ranges"), None);
+        assert_eq!(EvidenceChart::of("cold_connections"), None);
+    }
+
+    #[test]
+    fn the_details_read_the_fixture() {
+        let run = crate::report::fixture::run();
+        let r = &run.report;
+        let setup = SetupView::of(r);
+        assert!(setup.command.starts_with("oprobe run"), "{}", setup.command);
+        assert_eq!(setup.preset, r.workload.preset);
+        let trust = TrustView::of(r);
+        assert_eq!(trust.ops_count, r.summary.ops);
+        assert!(trust.kept_ratio > 0.0 && trust.kept_ratio <= 1.0);
+        let a = apis(r);
+        assert!(
+            a.windows(2)
+                .all(|w| w[0].requests_count >= w[1].requests_count)
+        );
+        assert_eq!(
+            a.iter().map(|x| x.requests_count).sum::<u64>(),
+            r.apis.iter().map(|x| x.count).sum::<u64>()
+        );
+        let retry = RetryView::of(r);
+        assert_eq!(retry.retries_count, r.resilience.retries);
+        let _ = BytesView::of(r);
+        let sp = SpreadView::of(r);
+        assert!(sp.hot_keys.len() <= SpreadView::TOP);
     }
 }
