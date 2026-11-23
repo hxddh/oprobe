@@ -735,8 +735,9 @@ impl CompareView {
 }
 
 /// The latency distribution: the share of operations at or below each latency (a CDF), from
-/// the trace rows (exact) or, without rows, from the heatmap's fixed log buckets (so runs stay
-/// comparable). At most [`LatencyCdf::MAX_POINTS`] points.
+/// the trace rows (exact) when every operation was kept, else from the heatmap's fixed log
+/// buckets, which count every operation (the sampler keeps the slowest and the failed ones
+/// always, so sampled rows over-weigh the tail). At most [`LatencyCdf::MAX_POINTS`] points.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct LatencyCdf {
     /// `(latency ms, share 0–1)`, latency ascending, the share reaching 1.
@@ -749,7 +750,10 @@ impl LatencyCdf {
     pub const MAX_POINTS: usize = 240;
 
     pub fn of(r: &Report, run: Option<&Run>) -> Self {
+        // Sampled rows are not a fair sample of the latencies.
+        let complete = r.sampling.kept_ratio >= 1.0 || r.sampling.seen_ops_count == 0;
         let mut lat: Vec<u64> = run
+            .filter(|_| complete)
             .map(|run| {
                 run.ops
                     .iter()
@@ -1013,6 +1017,12 @@ mod tests {
         r.heatmap.counts = vec![vec![0, 3, 1], vec![0, 0, 4]];
         let b = LatencyCdf::of(&r, None);
         assert!(!b.exact);
+        // Sampled rows over-weigh the tail: the buckets, which count every operation, are used.
+        let mut sampled = run.clone();
+        sampled.report = r.clone();
+        sampled.report.sampling.kept_ratio = 0.5;
+        sampled.report.sampling.seen_ops_count = 100;
+        assert_eq!(LatencyCdf::of(&sampled.report, Some(&sampled)), b);
         assert_eq!(b.pts, vec![(10.0, 3.0 / 8.0), (20.0, 1.0)]);
         assert_eq!(b.quantile(0.5), Some(20.0));
     }
