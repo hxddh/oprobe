@@ -33,6 +33,10 @@ use crate::{Api, OpCompletion, OpScope, Recorder};
 /// complete as failed.
 const MAX_PARKED: usize = 4096;
 
+/// A call marked retrying whose retry never came (its future was dropped during the backoff)
+/// completes as failed after this long.
+const STALE_RETRY: std::time::Duration = std::time::Duration::from_secs(600);
+
 /// The key an embedded operation records (design v7 B1, docs/privacy.md): the first path
 /// segment (at most 32 bytes, so prefixes still slice the traffic) and a 48-bit hash of the
 /// whole key (so hot keys and repeated reads are still told apart), never the key itself:
@@ -160,7 +164,8 @@ impl Linker {
         self.enabled.load(Ordering::Relaxed)
     }
 
-    /// Complete every parked call that is not being retried (before a snapshot).
+    /// Complete every parked call that is not being retried, or whose retry never came
+    /// (before a snapshot).
     pub fn flush(&self, rec: &Recorder) {
         if !self.enabled() {
             return;
@@ -169,7 +174,7 @@ impl Linker {
             let mut p = self.parked();
             let ids: Vec<_> = p
                 .iter()
-                .filter(|(_, x)| !x.retrying)
+                .filter(|(_, x)| !x.retrying || x.ended.elapsed() > STALE_RETRY)
                 .map(|(id, _)| *id)
                 .collect();
             ids.into_iter().filter_map(|id| p.remove(&id)).collect()
@@ -267,13 +272,15 @@ impl Observer {
         if OpScope::current().is_some() {
             return None;
         }
+        let key_of_path = private_key(path);
         if self.linker.enabled() {
             let parked = self.linker.parked().remove(&key());
             if let Some(p) = parked {
-                if p.retrying {
+                // The retry of the same call (the retry layer calls again with the same verb
+                // and path); anything else means the parked call was not retried.
+                if p.retrying && p.op.verb == verb && p.op.key == key_of_path {
                     return Some(p.op);
                 }
-                // Not retried: the earlier call failed for good.
                 complete(&self.recorder, p.op, p.ended, Some(p.error));
             }
         }
@@ -283,7 +290,7 @@ impl Observer {
         Some(OpState {
             scope,
             verb,
-            key: private_key(path),
+            key: key_of_path,
             started,
             read: 0,
             written: 0,
@@ -976,6 +983,16 @@ mod tests {
         let st = obs.start("stat", "a/b").unwrap();
         obs.finish(st, Some(&Error::new(ErrorKind::NotFound, "no")));
         assert_eq!(rec.snapshot().summary.ops, 2);
+        // A call marked retrying is resumed only by the same call: another call on the task
+        // completes it as failed and starts afresh.
+        let st = obs.start("stat", "a/b").unwrap();
+        obs.finish(st, Some(&slow_down()));
+        notify.retrying(&slow_down(), std::time::Duration::from_millis(1));
+        let st = obs.start("stat", "a/other").unwrap();
+        obs.finish(st, None);
+        let s = rec.snapshot();
+        assert_eq!(s.summary.ops, 4);
+        assert_eq!(s.summary.failed_ops, 3, "the exhausted retry, the not-found and the abandoned call");
     }
 
     #[test]
