@@ -781,13 +781,13 @@ fn tail_stragglers(c: &Ctx) -> Option<Finding> {
     text += &format!("; operation p50 {} · p99 {}", fmt_ms(p50), fmt_ms(p99));
     // What the stragglers cost: the wait beyond a typical request of every request that waits
     // for its first byte past its API's deadline, as a share of all request time.
-    let mut ttfb_all: Vec<u64> = run
+    let mut ttfb_all: Vec<(u64, f64)> = run
         .reqs
         .iter()
         .filter(|q| !q.is_error())
-        .map(|q| q.ttfb_us)
+        .map(|q| (q.ttfb_us, weight(q.op_id)))
         .collect();
-    let typ_all_us = quantile_us_ms(&mut ttfb_all, 0.5) * 1000.0;
+    let typ_all_us = weighted_quantile_us_ms(&mut ttfb_all, 0.5) * 1000.0;
     let excess: f64 = affected
         .iter()
         .flat_map(|a| a.2.iter())
