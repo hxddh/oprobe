@@ -4,6 +4,95 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## v7.0.0 — 2026-11-23
+
+7.0 is the release planned in `docs/design/v7-review.md`. Embedded traces now count operations,
+not only HTTP requests; that is the one breaking change, and `oprobe.trace/6` files still open.
+Everything else is additive: the report and run formats stay `oprobe.report/6` and
+`oprobe.run/6`.
+
+### Breaking
+
+- **`oprobe-trace` records operations for every service** (it used to record only the requests
+  of HTTP services). Each OpenDAL call is one operation linked to its requests (`stat`,
+  `read.full` / `read.range`, `write` / `write.multipart`, `list`, `delete`, `copy`, …), so
+  production traces have verbs, operation latency, the time breakdown, slow operations, hot keys
+  and prefixes (hashed: the first path segment and a 48-bit hash, never the key), range sizes and
+  over-read. Request counts are no longer labelled as operations.
+- The trace format is `oprobe.trace/7`; `oprobe.trace/6` files still open (each request counts
+  as one operation there, as before).
+- `opentelemetry` 0.32 for the `otel` feature (the version OpenDAL 0.59's
+  `opendal-layer-otelmetrics` uses, so both share one global meter). Metrics gain the attributes
+  `scheme`, `namespace`, `root` and `operation`.
+
+### Added
+
+- `Handle::retry_notify()`: give it to OpenDAL's `RetryLayer::with_notify` and an embedded
+  trace counts retries, their backoff and throttling, with every attempt of one call in one
+  operation.
+- `Handle::save_and_reset(path)`: save a window and start the next one, so hourly files are
+  hourly profiles.
+- **The profile shows every captured signal** (terminal, JSON and app):
+  - a `resilience` line in KEY NUMBERS (retries, backoff, 429/503 and the longest Retry-After,
+    the 5xx/4xx/network split, the top failure classes);
+  - connections: TCP kernel stats (RTT, retransmits, window- and buffer-limited time), TLS
+    resumption and HelloRetryRequests, cold start, and proxy CONNECT in the dial phases;
+  - the write path: requested and effective part size, the service's limits, the parts uploaded;
+  - request signals (HTTP/2 stream and flow-control waits, upload acknowledgement, cache status,
+    region) in the waterfall and in `show --by stage`;
+  - charts: throttled responses and failed operations per second next to retries; new
+    connections and client CPU on the in-flight chart; the consumer's stall as its own waterfall
+    segment; hot keys as bars of their share of throttling;
+  - the same p50 / p99 in the terminal's and the app's API tables, per-verb MiB/s and throttled
+    share, cold/warm slices, and slow operations' async call stacks in the app.
+- Finer failure classes: `storage.condition_not_match` (412), `storage.conflict` (409),
+  `storage.already_exists` and `storage.range_not_satisfied` (416), with OpenDAL's temporary /
+  persistent bit on every failed request.
+- Schemas for `run -o json` (`schemas/run.json`) and the `--dry-run` plans (`plan.json`,
+  `prove-plan.json`).
+- A pasted cloud address runs as is: `https://bucket.s3.region.amazonaws.com/x`, path-style S3,
+  `storage.googleapis.com` and `*.blob.core.windows.net` become `s3://`, `gs://` and
+  `azblob://` (a presigned query is dropped).
+- `oprobe FILE.oprobe` (and a double click on a run file on Windows and Linux) opens the app on
+  it; the `.desktop` entry and the MSI register the file type.
+- Runs killed hard leave a pending marker; the next run against the same target removes what
+  they left (only `oprobe-run-*` prefixes, never under `--read-only`).
+- The app: Settings ▸ Your storage, Help ▸ Glossary of Terms, Help ▸ Docs for the installed
+  version, and Show in Finder / Explorer / Files for a run. `show` ends with the run file's path.
+- A glossary in `docs/concepts.md`, linked from every brief.
+
+### Changed
+
+- `prove`: a candidate that throttles over `--max-throttle`, and more than the current operator,
+  is `inconclusive`, with a note.
+- A run that cannot be judged (stopped early, too short) leads with `invalid_run`, suggests no
+  `prove`, and `prove` refuses it. A partial run is **Review**, as documented.
+- Budgets stop at the limit (`--max-requests 500` never sends 501); a run that spends exactly its
+  budget is whole. `--dry-run` shows the budgets and warns when the plan would spend one.
+- Errors state one plain cause first ("connection refused by 127.0.0.1:9999", "cannot resolve
+  HOST", "credentials rejected by HOST (credentials from AWS_ACCESS_KEY_ID)"); the storage
+  library's report is the JSON `detail`. A DNS failure is `net.dns`.
+- Hints list only the services in this build; a known service that is not compiled in says so.
+- The throttling headline leads with its cost (time in retry backoff); `prove` says "95 %
+  interval"; the warmup warning names `--set warmup=…`.
+- `lab://demo` throttles above 40 requests in flight (24 before), so the demo is about its
+  stragglers and its remedy proves without throttling.
+- Release notes list a package channel only when it was published.
+- Dependencies: nsh 0.6.1, rustls-platform-verifier 0.7 (one copy, as reqwest uses), sha2 0.11,
+  zstd 0.14, dirs 7, rcgen 0.14, reqsign (AWS role chains in profiles); unused webpki-roots and
+  rustls-native-certs removed.
+
+### Fixed
+
+- A failed request's URL (with a presigned or SAS signature) is never recorded in a trace, and a
+  refused web address is never echoed with its query.
+- An embedded trace's memory stays bounded in a long-lived process, even with an operation left
+  open; old intervals are merged.
+- Slow operations' async call stacks are kept in stored runs.
+- Hints no longer name `--endpoint` or `[targets.*]`.
+- Output order is deterministic (the headline's APIs, confidence at a threshold).
+- `s3-website-*` and FIPS hosts are not taken as regions.
+
 ## v6.3.0 — 2026-11-23
 
 ### Added
