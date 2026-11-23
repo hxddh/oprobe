@@ -70,7 +70,16 @@ fn paint_heat(h: &Heat, w: f32, hh: f32) -> Painter {
             );
         }
     }
-    axes(p.global_alpha(1.0), f, w, hh, &x, &y, Unit::Ms.f())
+    axes(
+        p.global_alpha(1.0),
+        f,
+        w,
+        hh,
+        &x,
+        &y,
+        Unit::Clock.f(),
+        Unit::Ms.f(),
+    )
 }
 
 /// What the cell under canvas point `at` holds.

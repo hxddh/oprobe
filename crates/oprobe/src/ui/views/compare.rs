@@ -1,6 +1,7 @@
 //! Compare: two runs, or several operators run on one workload, side by side: the key numbers
-//! with the change against the first, where the time went, the findings and how each operator
-//! differs from the first.
+//! with the change against the first, their goodput over time and latency distributions drawn
+//! on one chart each, where the time went, the findings and how each operator differs from the
+//! first.
 
 use std::rc::Rc;
 
@@ -9,10 +10,12 @@ use nsh_core::prelude::*;
 
 use super::profile::{stage_bar, verdict_badge};
 use super::shell::{fill, page};
+use crate::ui::chart::chart;
 use crate::ui::data::{self, ProfileModel};
 use crate::ui::fmt;
 use crate::ui::i18n::{finding_title, tr};
 use crate::ui::kit::{Kind, Tone, btn, caption, empty, mono, row_button, section, small, strong};
+use crate::ui::plots;
 use crate::ui::store::{Store, store};
 
 pub fn compare() -> impl IntoElement {
@@ -25,7 +28,7 @@ pub fn compare() -> impl IntoElement {
             } else if ms.len() < 2 {
                 empty(tr("compare.none"), tr("compare.none_hint")).into_element()
             } else {
-                table(&ms).into_element()
+                view().child(table(&ms)).child(overlays(&ms)).into_element()
             }
         })
     })))
@@ -73,6 +76,16 @@ fn picker(s: Store) -> View {
             .disabled(move || s.picked.with(|p| p.len() < 2))
             .test_id("compare-go"),
         )
+}
+
+/// Their goodput over time and latency distributions, one line per run.
+fn overlays(ms: &[Rc<ProfileModel>]) -> View {
+    let refs: Vec<&ProfileModel> = ms.iter().map(|m| &**m).collect();
+    let (ops, cdf) = (plots::goodput_overlay(&refs), plots::cdf_overlay(&refs));
+    section("")
+        .test_id("compare-charts")
+        .child(ops.map(|p| chart(tr("compare.goodput"), 120.0, move || Some(p.clone()))))
+        .child(cdf.map(|p| chart(tr("compare.cdf"), 130.0, move || Some(p.clone()))))
 }
 
 const COL: f32 = 170.0;

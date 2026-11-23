@@ -177,6 +177,13 @@ fn a_lab_run_streams_into_runs_and_opens_in_profile() {
     // It finishes, is saved and opens in Profile.
     wait_long(&mut app, "id:profile");
     wait_long(&mut app, "text:WHERE THE TIME WENT");
+    // Every chart of the profile: the timeline, the latency distribution, and the throttling
+    // finding's evidence (the share throttled per in-flight level).
+    wait_long(&mut app, "id:timeline");
+    wait_long(&mut app, "id:distribution");
+    wait_long(&mut app, "text:LATENCY DISTRIBUTION");
+    wait_long(&mut app, "id:evidence-throttling");
+    wait_long(&mut app, "text:Share throttled by requests in flight");
     let runs = App::new(cx.paths()).list().unwrap().runs;
     assert_eq!(runs.len(), 1);
     assert!(app.shows(&runs[0].id));
@@ -216,6 +223,9 @@ fn operator_toggles_a_layer_and_proves_it_against_the_lab() {
     );
     assert!(app.shows("The proven diff"));
     app.wait_for("text:/Pair 1/").unwrap();
+    // The pairs are drawn as they converge.
+    wait_long(&mut app, "id:prove-chart");
+    assert!(app.shows("Change of the objective, pair by pair"));
     // Prove saved its trial runs as children of the prove run: stored, hidden from the list.
     let app_ = App::new(cx.paths());
     let all = app_.list_all().unwrap().runs.len();
@@ -260,4 +270,7 @@ fn compare_shows_two_runs_side_by_side() {
     wait_long(&mut app, "text:2 RUNS SIDE BY SIDE");
     assert!(app.shows("Operator vs first"));
     assert!(app.shows(&a) && app.shows(&b));
+    // Their goodput and latency distributions on one chart each.
+    wait_long(&mut app, "id:compare-charts");
+    assert!(app.shows("Goodput over time") && app.shows("Latency distribution"));
 }

@@ -66,6 +66,8 @@ pub struct FindingRow {
     pub evidence: String,
     pub advice: String,
     pub items: Vec<(String, String)>,
+    /// The chart that shows its evidence.
+    pub chart: Option<view::EvidenceChart>,
     /// The remedy as operator paths with the value to try (empty value: the path alone).
     pub remedy: Vec<(String, String)>,
 }
@@ -101,11 +103,37 @@ pub struct Waterfall {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Point {
     pub t_s: f64,
+    /// Length of the slice (1 s for the first ten minutes, then 10 s).
+    pub len_s: f64,
     pub ops_per_s: f64,
+    pub mib_per_s: f64,
     pub p50_ms: f64,
     pub p99_ms: f64,
     pub errors: u64,
     pub throttled: u64,
+}
+
+impl Point {
+    /// Failed operations per second in this slice.
+    pub fn errors_per_s(&self) -> f64 {
+        self.errors as f64 / self.len_s.max(1e-3)
+    }
+    /// Throttled responses per second in this slice.
+    pub fn throttled_per_s(&self) -> f64 {
+        self.throttled as f64 / self.len_s.max(1e-3)
+    }
+}
+
+/// One verb with its numbers and where its time went.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VerbRow {
+    pub verb: String,
+    pub ops_count: u64,
+    pub ops_per_s: f64,
+    pub p50_ms: f64,
+    pub p99_ms: f64,
+    pub error_ratio: f64,
+    pub stages: Vec<StageBar>,
 }
 
 /// The request heatmap: time buckets × log latency rows.
@@ -152,6 +180,12 @@ pub struct ProfileModel {
     pub slowest: Vec<Waterfall>,
     pub timeline: Vec<Point>,
     pub heat: Option<Heat>,
+    /// The latency distribution.
+    pub cdf: view::LatencyCdf,
+    /// Every verb, busiest first.
+    pub verbs: Vec<VerbRow>,
+    /// The in-flight levels behind a concurrency ceiling (when anything was throttled).
+    pub concurrency: Option<view::ConcurrencyView>,
     pub conns: Conns,
     pub warnings: Vec<String>,
 }
@@ -216,7 +250,9 @@ pub fn of_run(run: &Run) -> ProfileModel {
             .iter()
             .map(|p| Point {
                 t_s: p.t_s,
+                len_s: if p.len_s > 0.0 { p.len_s } else { 1.0 },
                 ops_per_s: p.ops_per_s,
+                mib_per_s: p.mib_per_s,
                 p50_ms: p.p50_ms,
                 p99_ms: p.p99_ms,
                 errors: p.errors,
@@ -224,6 +260,27 @@ pub fn of_run(run: &Run) -> ProfileModel {
             })
             .collect(),
         heat: heat(r),
+        cdf: view::LatencyCdf::of(r, Some(run)),
+        verbs: view::verbs(r)
+            .into_iter()
+            .map(|v| VerbRow {
+                verb: v.verb,
+                ops_count: v.ops_count,
+                ops_per_s: v.ops_per_s,
+                p50_ms: v.p50_ms,
+                p99_ms: v.p99_ms,
+                error_ratio: v.error_ratio,
+                stages: v
+                    .stages
+                    .into_iter()
+                    .map(|s| StageBar {
+                        key: s.key,
+                        ratio: s.ratio,
+                    })
+                    .collect(),
+            })
+            .collect(),
+        concurrency: view::ConcurrencyView::of(r),
         conns: Conns {
             dialed: c.dialed,
             reuse_ratio: c.reuse_pct / 100.0,
@@ -258,6 +315,7 @@ fn findings(r: &Report) -> Vec<FindingRow> {
                 evidence: f.evidence,
                 advice: f.remedy,
                 items: f.items.into_iter().map(|i| (i.label, i.value)).collect(),
+                chart: view::EvidenceChart::of(&f.code),
                 remedy: src.map(remedy).unwrap_or_default(),
             }
         })

@@ -4,6 +4,28 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## v6.1.0 — 2026-11-23
+
+### Added
+
+- **The app draws its evidence.** Each finding carries the chart that shows it: the share throttled
+  at each number of requests in flight with the fitted limit's interval (`throttling`,
+  `key_limit`), throttled or failed operations per second (`rate_limit`, `errors`), bandwidth over
+  time (`bandwidth_cap`), the latency distribution (`tail_stragglers`, `hung_requests`).
+- **Prove is drawn as it converges**: each A/B pair's change, the running estimate with its 95 %
+  interval, and the A/A noise floor around no change.
+- Profile: the latency distribution (CDF) with p50 and p99 marked, the stage split of each verb,
+  and the throttled and failed seconds shaded under the goodput timeline.
+- Compare: goodput over time and the latency distributions of every run on one chart each.
+- Core view model: `LatencyCdf`, `VerbView`, `ConcurrencyView`, `EvidenceChart`, and
+  `prove::convergence` (the interval after each pair, the same computation as the verdict's).
+
+### Fixed
+
+- Linux: the window opens when the app starts from its desktop entry. GTK 4 unsets
+  `DESKTOP_STARTUP_ID` and `XDG_ACTIVATION_TOKEN` before `main`, so the launch was taken for a
+  script and the help was printed instead.
+
 ## v6.0.0 — 2026-11-22
 
 Design [v6](docs/design/v6.md), from the review in [v6-review.md](docs/design/v6-review.md).

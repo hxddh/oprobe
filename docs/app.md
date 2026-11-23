@@ -28,19 +28,30 @@ another window). Each row shows the operator, workload, verdict, goodput and p99
 folded under their prove run. Start a run from here: an operator (URL, file or configured name)
 and a preset.
 
-**Profile.** One run: the verdict, where the time went (the stage split of every operation), the
-request waterfall of the slowest operations (each request on a shared time axis, coloured by
-stage, with its connection, status and request ID), the per-second timeline and the latency
-heatmap (horizontal bands above the bulk are stragglers, vertical stripes are stalls). The
-findings sit beside the charts with their evidence; selecting one highlights its requests.
+**Profile.** One run: the verdict, where the time went (the stage split of every operation, and
+of each verb when there are several), the request waterfall of the slowest operations (each
+request on a shared time axis, coloured by stage, with its connection, status and request ID), the
+per-second timeline (the seconds that were throttled or failed shaded under goodput), the latency
+distribution with its p50 and p99 marked, and the latency heatmap (horizontal bands above the bulk
+are stragglers, vertical stripes are stalls). Each finding carries the chart of its evidence:
+
+| Finding | Evidence chart |
+|---|---|
+| `throttling`, `key_limit` | the share throttled at each number of requests in flight, the fitted limit's interval shaded |
+| `rate_limit` | throttled responses per second |
+| `bandwidth_cap` | bandwidth (MiB/s) over the run |
+| `tail_stragglers`, `hung_requests` | the latency distribution, p50 and p99 marked |
+| `errors` | failed operations per second |
 
 **Operator.** The run's layer stack beside each finding's remedy. Toggle a layer or change a value
-(a limit, a chunk size), then press **Prove**: the A/B pairs stream in live with the running
-estimate and its interval until the sequential test decides. **Copy** puts the winning diff (Rust
+(a limit, a chunk size), then press **Prove**: the A/B pairs stream in live and are drawn as they
+converge: each pair's change as a dot, the running estimate with its 95 % interval narrowing, and
+the A/A noise floor around no change, until the sequential test decides. **Copy** puts the winning diff (Rust
 or TOML) on the clipboard.
 
 **Compare.** Two runs, or the operators of one multi-operator run, side by side: goodput, latency
-percentiles, the stage split and the findings of each.
+percentiles, the stage split and the findings of each, with their goodput over time and their
+latency distributions drawn on one chart each.
 
 ## Language
 

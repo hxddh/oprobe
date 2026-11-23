@@ -963,7 +963,7 @@ oprobe binary and has no semver promise; do not enable it.
 `oprobe.trace/6` is one JSON document, readable without oprobe:
 
 ```text
-{ "format": "oprobe.trace/6", "oprobe_trace_version": "6.0.0", "created_at": "…",
+{ "format": "oprobe.trace/6", "oprobe_trace_version": "6.1.0", "created_at": "…",
   "service": { "scheme": "s3", "name": "my-bucket", "root": "/data/" },
   "snapshot": { … }, "rows": { "ops": [], "reqs": [ … ], "info": { … }, "sampling": { … } } }
 ```
@@ -1007,19 +1007,30 @@ another window). Each row shows the operator, workload, verdict, goodput and p99
 folded under their prove run. Start a run from here: an operator (URL, file or configured name)
 and a preset.
 
-**Profile.** One run: the verdict, where the time went (the stage split of every operation), the
-request waterfall of the slowest operations (each request on a shared time axis, coloured by
-stage, with its connection, status and request ID), the per-second timeline and the latency
-heatmap (horizontal bands above the bulk are stragglers, vertical stripes are stalls). The
-findings sit beside the charts with their evidence; selecting one highlights its requests.
+**Profile.** One run: the verdict, where the time went (the stage split of every operation, and
+of each verb when there are several), the request waterfall of the slowest operations (each
+request on a shared time axis, coloured by stage, with its connection, status and request ID), the
+per-second timeline (the seconds that were throttled or failed shaded under goodput), the latency
+distribution with its p50 and p99 marked, and the latency heatmap (horizontal bands above the bulk
+are stragglers, vertical stripes are stalls). Each finding carries the chart of its evidence:
+
+| Finding | Evidence chart |
+|---|---|
+| `throttling`, `key_limit` | the share throttled at each number of requests in flight, the fitted limit's interval shaded |
+| `rate_limit` | throttled responses per second |
+| `bandwidth_cap` | bandwidth (MiB/s) over the run |
+| `tail_stragglers`, `hung_requests` | the latency distribution, p50 and p99 marked |
+| `errors` | failed operations per second |
 
 **Operator.** The run's layer stack beside each finding's remedy. Toggle a layer or change a value
-(a limit, a chunk size), then press **Prove**: the A/B pairs stream in live with the running
-estimate and its interval until the sequential test decides. **Copy** puts the winning diff (Rust
+(a limit, a chunk size), then press **Prove**: the A/B pairs stream in live and are drawn as they
+converge: each pair's change as a dot, the running estimate with its 95 % interval narrowing, and
+the A/A noise floor around no change, until the sequential test decides. **Copy** puts the winning diff (Rust
 or TOML) on the clipboard.
 
 **Compare.** Two runs, or the operators of one multi-operator run, side by side: goodput, latency
-percentiles, the stage split and the findings of each.
+percentiles, the stage split and the findings of each, with their goodput over time and their
+latency distributions drawn on one chart each.
 
 ## Language
 
@@ -1165,7 +1176,7 @@ sudo dnf install ./oprobe-<ver>-1.x86_64.rpm
 cargo install oprobe --locked                                         # the app in the terminal
 cargo install oprobe --locked --features gui                          # plus native windows (Linux: libgtk-4-dev)
 cargo install oprobe --locked --no-default-features --features cli    # the CLI only
-cargo install --locked --git https://github.com/hxddh/oprobe --tag v6.0.0 oprobe
+cargo install --locked --git https://github.com/hxddh/oprobe --tag v6.1.0 oprobe
 ```
 
 `cargo install oprobe` also downloads `oprobe-core`, oprobe's internal engine crate, at exactly
@@ -1184,7 +1195,7 @@ as the archive, so it proves the download is intact, not who built it.
 ```bash
 sha256sum --ignore-missing -c SHA256SUMS                    # Linux
 shasum -a 256 --ignore-missing -c SHA256SUMS                # macOS
-Get-FileHash oprobe-6.0.0-x64.msi -Algorithm SHA256          # Windows
+Get-FileHash oprobe-6.1.0-x64.msi -Algorithm SHA256          # Windows
 ```
 
 **Build provenance.** Every asset has a [SLSA build provenance](https://slsa.dev/) attestation
@@ -1192,7 +1203,7 @@ signed by GitHub Actions, which proves it was built by this repository's release
 given commit:
 
 ```bash
-gh attestation verify oprobe-6.0.0-x86_64-unknown-linux-musl.tar.gz --repo hxddh/oprobe \
+gh attestation verify oprobe-6.1.0-x86_64-unknown-linux-musl.tar.gz --repo hxddh/oprobe \
   --signer-workflow hxddh/oprobe/.github/workflows/release.yml
 ```
 
