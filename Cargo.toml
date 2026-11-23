@@ -52,7 +52,7 @@ libc = "0.2"
 toml = "0.8"
 crc32c = "0.6"
 zstd = "0.13"
-dirs = "6"
+dirs = "7"
 sha2 = "0.10"
 rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "aws_lc_rs"] }
 tokio-util = "0.7"
