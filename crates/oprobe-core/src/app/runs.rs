@@ -450,6 +450,60 @@ pub fn rm(app: &App, refs: &[RunRef]) -> Result<RemovedRuns> {
     })
 }
 
+/// How long runs stay in the trash (`<data>/trash/`) before [`trash`] removes them for good.
+pub const TRASH_KEEP: std::time::Duration = std::time::Duration::from_secs(7 * 86_400);
+
+/// Runs moved to the trash by [`App::trash`]: their ids and the trash folder that holds their
+/// files, which [`App::restore`] puts back.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct TrashedRuns {
+    pub ids: Vec<String>,
+    /// The folder under `<data>/trash/` that holds their files.
+    pub folder: std::path::PathBuf,
+}
+
+/// Move the stored runs `refs` name (a prove with its trial runs) into a new folder of
+/// `<data>/trash/`; folders older than [`TRASH_KEEP`] go for good.
+pub fn trash(app: &App, refs: &[RunRef]) -> Result<TrashedRuns> {
+    let ids = stored_ids(app, refs)?;
+    let root = app.paths.data_dir.join("trash");
+    empty_trash(&root, TRASH_KEEP);
+    let folder = root.join(crate::model::RunId::new().to_string());
+    app.store().move_to(&ids, &folder)?;
+    Ok(TrashedRuns { ids, folder })
+}
+
+/// Put runs [`trash`] moved back into the store.
+pub fn restore(app: &App, t: &TrashedRuns) -> Result<()> {
+    let root = app.paths.data_dir.join("trash");
+    if t.folder.parent() != Some(root.as_path()) {
+        return Err(OprobeError::new(
+            ErrorCode::SafetyRefused,
+            format!("`{}` is not a trash folder of oprobe", t.folder.display()),
+        )
+        .into());
+    }
+    app.store().restore_from(&t.folder)
+}
+
+/// Remove the trash folders under `root` older than `keep` (best effort).
+fn empty_trash(root: &std::path::Path, keep: std::time::Duration) {
+    let Ok(rd) = std::fs::read_dir(root) else {
+        return;
+    };
+    for e in rd.flatten() {
+        let old = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > keep);
+        if old {
+            let _ = std::fs::remove_dir_all(e.path());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -465,5 +519,36 @@ mod tests {
         assert_eq!(when(id, t + s(5)), "just now");
         assert_eq!(when(id, t + s(600)), "10m ago");
         assert_eq!(when(id, t + s(3 * 86_400)), "3d ago");
+    }
+
+    #[test]
+    fn trashed_runs_come_back() {
+        let d = tempfile::tempdir().unwrap();
+        let app = App::new(crate::store::Paths {
+            config_file: d.path().join("config.toml"),
+            data_dir: d.path().join("data"),
+        });
+        let store = app.store();
+        for id in ["20261120-143005-a1b2", "20261120-143006-c3d4"] {
+            store
+                .save(&crate::store::runs::tests::sample_run(id, None))
+                .unwrap();
+        }
+        let t = app.trash(&[RunRef::from("20261120-143005-a1b2")]).unwrap();
+        assert_eq!(t.ids, ["20261120-143005-a1b2"]);
+        assert!(t.folder.starts_with(d.path().join("data/trash")));
+        let left: Vec<String> = app.list().unwrap().runs.into_iter().map(|r| r.id).collect();
+        assert_eq!(left, ["20261120-143006-c3d4"]);
+        // Undo: back in the list, the trash folder gone.
+        app.restore(&t).unwrap();
+        assert_eq!(app.list().unwrap().runs.len(), 2);
+        assert!(!t.folder.exists());
+        // A folder outside the trash is refused; an unknown run is an error.
+        let bad = TrashedRuns {
+            ids: vec![],
+            folder: d.path().join("elsewhere"),
+        };
+        assert!(app.restore(&bad).is_err());
+        assert!(app.trash(&[RunRef::from("20261120-000000-ffff")]).is_err());
     }
 }
