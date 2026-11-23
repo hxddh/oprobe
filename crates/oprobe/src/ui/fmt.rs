@@ -153,6 +153,21 @@ impl Scale {
         }
     }
 
+    /// A linear scale covering `[min, max]` (either may be negative), widened to nice bounds.
+    pub fn span(min: f64, max: f64) -> Self {
+        let (min, max) = if min.is_finite() && max.is_finite() && max > min {
+            (min, max)
+        } else {
+            (min.min(0.0) - 1.0, max.max(0.0) + 1.0)
+        };
+        let step = nice_step((max - min) / 5.0);
+        Self {
+            min: (min / step).floor() * step,
+            max: (max / step).ceil() * step,
+            log: false,
+        }
+    }
+
     /// A log scale covering `[min, max]` (positive), widened to whole decades.
     pub fn log(min: f64, max: f64) -> Self {
         let min = if min > 0.0 { min } else { max.max(1e-3) / 1e3 };
@@ -260,5 +275,10 @@ mod tests {
         assert_eq!((l.min, l.max), (0.1, 1000.0));
         assert_eq!(l.ticks(5), vec![0.1, 1.0, 10.0, 100.0, 1000.0]);
         assert!((s.value(s.norm(25.0)) - 25.0).abs() < 1e-9);
+        let c = Scale::span(-0.07, 0.23);
+        assert!(
+            c.min <= -0.07 && c.min > -0.2 && c.max >= 0.23 && c.max <= 0.3 + 1e-9,
+            "{c:?}"
+        );
     }
 }

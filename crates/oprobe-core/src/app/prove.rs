@@ -1134,6 +1134,31 @@ fn objective_interval(obj: ProveObjective, a: &[f64], b: &[f64], floor: f64) -> 
     }
 }
 
+/// The objective's interval after each A/B pair, as the prove saw it grow (the convergence
+/// chart): the same estimate and interval as the verdict's, over the first 1, 2, … n pairs,
+/// with the A/A noise floor known at that point. `a` and `b` are the paired objective values.
+pub fn convergence(obj: ProveObjective, a: &[f64], b: &[f64]) -> Vec<Converged> {
+    let n = a.len().min(b.len());
+    (1..=n)
+        .map(|k| {
+            let floor = noise_floor(&a[..k]);
+            Converged {
+                interval: objective_interval(obj, &a[..k], &b[..k], floor),
+                noise_floor_ratio: floor,
+            }
+        })
+        .collect()
+}
+
+/// The objective after some pairs (see [`convergence`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Converged {
+    /// Relative change of the objective (candidate vs baseline) with its 95 % interval.
+    pub interval: Interval,
+    /// The A/A noise floor (a per-pair log-ratio spread).
+    pub noise_floor_ratio: f64,
+}
+
 /// The secondary metrics of the A/B trials.
 fn secondary(
     obj: ProveObjective,
@@ -1540,6 +1565,25 @@ mod tests {
         assert_eq!(b.fmt(16 << 20), "16MiB");
         assert!(b.mid(1 << 20, 1 << 21).is_some());
         assert!(b.mid(1 << 20, (1 << 20) + 1000).is_none());
+    }
+
+    #[test]
+    fn convergence_ends_on_the_verdicts_interval() {
+        let a = [100.0, 102.0, 99.0, 101.0, 100.0];
+        let b = [120.0, 121.0, 118.0, 122.0, 119.0];
+        let c = convergence(ProveObjective::Goodput, &a, &b);
+        assert_eq!(c.len(), 5);
+        let last = c.last().unwrap();
+        let floor = noise_floor(&a);
+        assert_eq!(last.noise_floor_ratio, floor);
+        assert_eq!(
+            last.interval,
+            objective_interval(ProveObjective::Goodput, &a, &b, floor)
+        );
+        // More pairs, a narrower interval.
+        let w = |i: &Interval| i.high - i.low;
+        assert!(w(&c[4].interval) < w(&c[1].interval));
+        assert!(last.interval.low > 0.0);
     }
 
     #[test]

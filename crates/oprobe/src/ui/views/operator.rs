@@ -1,6 +1,8 @@
 //! Operator: the run's layer stack and read/write/HTTP settings as switches and fields, each
 //! finding's remedy highlighted beside them. Change a value, then Prove: `App::prove` replays
-//! the run A/B and its pairs stream in; the proven diff copies as Rust or TOML.
+//! the run A/B and its pairs stream in, drawn as they converge (each pair's change, the
+//! estimate and its interval against the A/A noise floor); the proven diff copies as Rust or
+//! TOML.
 
 use std::collections::BTreeSet;
 use std::rc::Rc;
@@ -10,6 +12,7 @@ use nsh_core::prelude::*;
 
 use super::shell::{fill, page};
 use crate::app::{ProveObjective, ProveVerdict};
+use crate::ui::chart::chart;
 use crate::ui::data::{self, Field, FieldKind, ProfileModel, SECTIONS};
 use crate::ui::fmt;
 use crate::ui::i18n::{finding_title, tr, tr_dyn};
@@ -18,6 +21,7 @@ use crate::ui::kit::{
     Kind, Tone, badge, body, btn, caption, empty, field, mono, section, segmented, small, strong,
     switch_on, title,
 };
+use crate::ui::plots;
 use crate::ui::store::{Store, store};
 
 pub fn operator() -> impl IntoElement {
@@ -351,6 +355,18 @@ fn prove_state(st: crate::ui::jobs::State, p99: bool) -> View {
     let mut v = view().gap_1();
     if st.outcome.is_none() {
         v = v.child(small(fill("operator.replays", &[&st.trials.len()])));
+    }
+    // The pairs as the prove recorded them once it ends, else as they stream in.
+    let ab: Vec<(f64, f64)> = match &st.outcome {
+        Some(Outcome::Proved(p)) if !p.ab.is_empty() => p.ab.clone(),
+        _ => ps.iter().map(|(a, b, _)| (*a, *b)).collect(),
+    };
+    if let Some(plot) = plots::prove(&ab, p99) {
+        v = v.child(view().test_id("prove-chart").child(chart(
+            tr("plot.convergence"),
+            150.0,
+            move || Some(plot.clone()),
+        )));
     }
     v = v.children(ps.iter().enumerate().map(|(i, (a, b, d))| {
         let good = if p99 { *d < 0.0 } else { *d > 0.0 };

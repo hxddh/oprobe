@@ -47,6 +47,8 @@ pub struct Proved {
     pub delta: (f64, f64, f64),
     pub significant: bool,
     pub pairs: u64,
+    /// The objective of each A/B pair, `(baseline, candidate)`, in order.
+    pub ab: Vec<(f64, f64)>,
     /// The other metrics (shown, never decisive).
     pub secondary: Vec<Secondary>,
     pub rust: String,
@@ -279,6 +281,7 @@ impl Job {
                     ),
                     significant: p.objective_delta.low > 0.0 || p.objective_delta.high < 0.0,
                     pairs: p.pairs_count,
+                    ab: ab_pairs(&p.trials, p99),
                     secondary: p.secondary.iter().map(Secondary::of).collect(),
                     rust: p.diff.rust,
                     toml: p.diff.toml,
@@ -289,6 +292,25 @@ impl Job {
         });
         job
     }
+}
+
+/// The objective of each complete A/B pair of a prove's trials, by pair number.
+pub fn ab_pairs(trials: &[crate::app::prove::ProveTrial], p99: bool) -> Vec<(f64, f64)> {
+    use crate::app::prove::TrialKind;
+    let v = |t: &crate::app::prove::ProveTrial| if p99 { t.p99_ms } else { t.goodput_ops_per_s };
+    let mut by: std::collections::BTreeMap<u64, (Option<f64>, Option<f64>)> = Default::default();
+    for t in trials {
+        let Some(pair) = t.pair else { continue };
+        let e = by.entry(pair).or_default();
+        match t.kind {
+            TrialKind::Baseline => e.0 = Some(v(t)),
+            TrialKind::Candidate => e.1 = Some(v(t)),
+            TrialKind::Sizing => {}
+        }
+    }
+    by.into_values()
+        .filter_map(|(a, b)| Some((a?, b?)))
+        .collect()
 }
 
 /// Prove's pairs so far: each candidate with the baseline just before it, and the change of

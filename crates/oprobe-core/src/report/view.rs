@@ -18,6 +18,10 @@
 //! | operator stack beside each finding's remedy | [`OperatorView`] |
 //! | prove: sizing and A/B pairs | [`ProveView`] |
 //! | several operators side by side | [`CompareView`] |
+//! | latency distribution | [`LatencyCdf`] |
+//! | each verb with its own stage split | [`VerbView`] |
+//! | the in-flight levels behind a concurrency ceiling | [`ConcurrencyView`] |
+//! | which chart is a finding's evidence | [`EvidenceChart`] |
 
 use crate::analysis::capacity::Confidence;
 use crate::analysis::diagnosis::Severity;
@@ -730,6 +734,217 @@ impl CompareView {
     }
 }
 
+/// The latency distribution: the share of operations at or below each latency (a CDF), from
+/// the trace rows (exact) or, without rows, from the heatmap's fixed log buckets (so runs stay
+/// comparable). At most [`LatencyCdf::MAX_POINTS`] points.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LatencyCdf {
+    /// `(latency ms, share 0–1)`, latency ascending, the share reaching 1.
+    pub pts: Vec<(f64, f64)>,
+    /// From the trace rows (otherwise from the heatmap buckets).
+    pub exact: bool,
+}
+
+impl LatencyCdf {
+    pub const MAX_POINTS: usize = 240;
+
+    pub fn of(r: &Report, run: Option<&Run>) -> Self {
+        let mut lat: Vec<u64> = run
+            .map(|run| {
+                run.ops
+                    .iter()
+                    .filter(|o| o.t_us >= 0)
+                    .map(|o| o.latency_us)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !lat.is_empty() {
+            lat.sort_unstable();
+            let n = lat.len();
+            let step = n.div_ceil(Self::MAX_POINTS).max(1);
+            let mut pts: Vec<(f64, f64)> = (step - 1..n)
+                .step_by(step)
+                .map(|i| (lat[i] as f64 / 1000.0, (i + 1) as f64 / n as f64))
+                .collect();
+            if pts.last().map(|p| p.1) != Some(1.0) {
+                pts.push((lat[n - 1] as f64 / 1000.0, 1.0));
+            }
+            return Self { pts, exact: true };
+        }
+        let h = &r.heatmap;
+        let rows = h.latency_buckets_ms.len();
+        let mut per_row = vec![0u64; rows];
+        for col in &h.counts {
+            for (i, c) in col.iter().enumerate().take(rows) {
+                per_row[i] += c;
+            }
+        }
+        let total: u64 = per_row.iter().sum();
+        if total == 0 {
+            return Self::default();
+        }
+        let mut acc = 0u64;
+        let mut pts = Vec::new();
+        for (i, c) in per_row.iter().enumerate() {
+            if *c == 0 {
+                continue;
+            }
+            acc += c;
+            // A bucket's operations are at or below its upper bound (the open last bucket: twice
+            // its lower bound).
+            let upper = h
+                .latency_buckets_ms
+                .get(i + 1)
+                .copied()
+                .unwrap_or(h.latency_buckets_ms[i] * 2.0);
+            pts.push((upper, acc as f64 / total as f64));
+        }
+        Self { pts, exact: false }
+    }
+
+    /// The latency at quantile `q` (0–1): the first point whose share reaches it.
+    pub fn quantile(&self, q: f64) -> Option<f64> {
+        self.pts.iter().find(|p| p.1 >= q).map(|p| p.0)
+    }
+}
+
+/// One verb (`read.range`, `write.multipart`) with its numbers and where its time went.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VerbView {
+    pub verb: String,
+    pub ops_count: u64,
+    pub ops_per_s: f64,
+    pub p50_ms: f64,
+    pub p99_ms: f64,
+    pub error_ratio: f64,
+    pub throttled_ratio: f64,
+    pub requests_per_op: f64,
+    /// Shares of the verb's operation time: `queue`, `cache`, `server` (the backend),
+    /// `retry`, `client`; they sum to 1 (empty when nothing was timed).
+    pub stages: Vec<StageShare>,
+}
+
+/// Every verb of the run, busiest first.
+pub fn verbs(r: &Report) -> Vec<VerbView> {
+    let mut v: Vec<VerbView> = r
+        .verbs
+        .iter()
+        .filter(|v| v.count > 0)
+        .map(|v| {
+            let b = &v.breakdown;
+            let parts = [
+                ("queue", "queue", b.queue_ms),
+                ("cache", "cache", b.cache_ms),
+                ("server", "backend", b.backend_ms),
+                ("retry", "retry backoff", b.retry_ms),
+                ("client", "client", b.client_ms),
+            ];
+            let total: f64 = parts.iter().map(|p| p.2.max(0.0)).sum();
+            let stages = if total > 0.0 {
+                parts
+                    .iter()
+                    .map(|(k, t, ms)| StageShare {
+                        key: (*k).to_owned(),
+                        title: (*t).to_owned(),
+                        ratio: ms.max(0.0) / total,
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let n = v.count as f64;
+            VerbView {
+                verb: v.verb.clone(),
+                ops_count: v.count,
+                ops_per_s: v.ops_per_s,
+                p50_ms: v.latency.p50,
+                p99_ms: v.latency.p99,
+                error_ratio: v.errors as f64 / n,
+                throttled_ratio: v.throttled as f64 / n,
+                requests_per_op: v.requests_per_op,
+                stages,
+            }
+        })
+        .collect();
+    v.sort_by_key(|v| std::cmp::Reverse(v.ops_count));
+    v
+}
+
+/// One in-flight level: requests that arrived with this many in flight, and the share of them
+/// throttled.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LevelPoint {
+    pub inflight_count: u64,
+    pub requests_count: u64,
+    pub throttled_ratio: f64,
+}
+
+/// The evidence of a concurrency ceiling: the share throttled at each in-flight level, and the
+/// fitted ceiling with its interval (`lo ≤ limit < hi`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConcurrencyView {
+    pub levels: Vec<LevelPoint>,
+    /// `(estimate, lo, hi)` in-flight requests, when a ceiling was fitted.
+    pub ceiling: Option<(f64, f64, f64)>,
+    pub confidence: Confidence,
+}
+
+impl ConcurrencyView {
+    /// `None` when the run recorded no in-flight levels or nothing was throttled.
+    pub fn of(r: &Report) -> Option<Self> {
+        let o = &r.capacity.observed;
+        if o.levels.is_empty() || o.throttled_requests_count == 0 {
+            return None;
+        }
+        Some(Self {
+            levels: o
+                .levels
+                .iter()
+                .filter(|l| l.requests_count > 0)
+                .map(|l| LevelPoint {
+                    inflight_count: l.inflight_count,
+                    requests_count: l.requests_count,
+                    throttled_ratio: l.throttled_count as f64 / l.requests_count as f64,
+                })
+                .collect(),
+            ceiling: r
+                .capacity
+                .inflight_ceiling
+                .map(|c| (c.requests, c.lo, c.hi)),
+            confidence: r.capacity.confidence,
+        })
+    }
+}
+
+/// The chart that shows a finding's evidence (the renderer draws it beside the finding).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EvidenceChart {
+    /// Share throttled per in-flight level, with the fitted ceiling ([`ConcurrencyView`]).
+    Concurrency,
+    /// Throttled responses per second over the run.
+    ThrottledOverTime,
+    /// Bandwidth (MiB/s) over the run.
+    Bandwidth,
+    /// The latency distribution with its median and tail marked ([`LatencyCdf`]).
+    Latency,
+    /// Failed operations per second over the run.
+    ErrorsOverTime,
+}
+
+impl EvidenceChart {
+    /// The evidence chart of a finding code (`None`: the evidence is in its numbers).
+    pub fn of(code: &str) -> Option<Self> {
+        Some(match code {
+            "throttling" | "key_limit" => Self::Concurrency,
+            "rate_limit" => Self::ThrottledOverTime,
+            "bandwidth_cap" => Self::Bandwidth,
+            "tail_stragglers" | "hung_requests" => Self::Latency,
+            "errors" => Self::ErrorsOverTime,
+            _ => return None,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -779,5 +994,43 @@ mod tests {
         assert_eq!(v.rows.len(), 3);
         assert!(v.differences[0].contains("service"), "{:?}", v.differences);
         assert!(v.differences[1].contains("layers"), "{:?}", v.differences);
+    }
+
+    #[test]
+    fn the_latency_cdf_rises_to_one_from_rows_or_buckets() {
+        let run = crate::report::fixture::run();
+        let exact = LatencyCdf::of(&run.report, Some(&run));
+        assert!(exact.exact);
+        assert_eq!(exact.pts.last().unwrap().1, 1.0);
+        assert!(
+            exact
+                .pts
+                .windows(2)
+                .all(|w| w[0].0 <= w[1].0 && w[0].1 <= w[1].1)
+        );
+        let mut r = run.report.clone();
+        r.heatmap.latency_buckets_ms = vec![0.0, 1.0, 10.0];
+        r.heatmap.counts = vec![vec![0, 3, 1], vec![0, 0, 4]];
+        let b = LatencyCdf::of(&r, None);
+        assert!(!b.exact);
+        assert_eq!(b.pts, vec![(10.0, 3.0 / 8.0), (20.0, 1.0)]);
+        assert_eq!(b.quantile(0.5), Some(20.0));
+    }
+
+    #[test]
+    fn every_finding_code_with_a_chart_is_in_the_catalog() {
+        for code in [
+            "throttling",
+            "key_limit",
+            "rate_limit",
+            "bandwidth_cap",
+            "tail_stragglers",
+            "hung_requests",
+            "errors",
+        ] {
+            assert!(EvidenceChart::of(code).is_some(), "{code}");
+            assert!(crate::analysis::catalog::get(code).is_some(), "{code}");
+        }
+        assert_eq!(EvidenceChart::of("small_ranges"), None);
     }
 }

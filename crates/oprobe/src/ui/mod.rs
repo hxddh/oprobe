@@ -4,7 +4,8 @@
 //!
 //! Layers: [`data`] (the one adapter onto the service layer's result types), [`jobs`] (`run`
 //! and `prove` off the UI thread), [`store`] (state and its writers), [`i18n`] (English and
-//! 简体中文), `kit`/`chart`/`heatmap` (controls and charts), `views`.
+//! 简体中文), `kit`/`chart`/`heatmap` (controls and charts), [`plots`] (what each chart
+//! shows, built from the models), `views`.
 
 mod chart;
 pub mod data;
@@ -13,6 +14,7 @@ mod heatmap;
 pub mod i18n;
 pub mod jobs;
 mod kit;
+pub mod plots;
 pub mod store;
 mod term;
 // A clipboard write answers once done; nothing waits for it.

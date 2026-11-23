@@ -1,6 +1,7 @@
-//! Profile: one run (`App::show`): the verdict, the key numbers, where the time went, the
-//! findings with their remedy path, the request waterfall of the slowest operations, the
-//! timeline, the heatmap and the connections.
+//! Profile: one run (`App::show`): the verdict, the key numbers, where the time went (and per
+//! verb), the findings with their remedy path and the chart of their evidence, the request
+//! waterfall of the slowest operations, the timeline (throttled and failed seconds shaded),
+//! the latency distribution, the heatmap and the connections.
 
 use std::rc::Rc;
 
@@ -8,15 +9,16 @@ use nsh_base::theme;
 use nsh_core::prelude::*;
 
 use super::shell::{fill, page};
-use crate::ui::chart::{Line, Plot, Unit, chart};
-use crate::ui::data::{FindingRow, ProfileModel, Waterfall};
-use crate::ui::fmt::{self, Scale};
+use crate::ui::chart::chart;
+use crate::ui::data::{FindingRow, ProfileModel, VerbRow, Waterfall};
+use crate::ui::fmt;
 use crate::ui::heatmap::heatmap;
 use crate::ui::i18n::{finding_title, tr, tr_dyn};
 use crate::ui::kit::{
     Kind, Tone, badge, body, btn, caption, empty, meter, mono, prop, section, small, stage_token,
     strong, swatch, tile, tile_row, title, token,
 };
+use crate::ui::plots;
 use crate::ui::store::{Page, Store, store};
 
 pub fn profile() -> impl IntoElement {
@@ -44,11 +46,13 @@ fn content(s: Store, m: Rc<ProfileModel>) -> View {
         .child(head(s, &m))
         .child(tiles(&m))
         .child(time_went(&m))
+        .child((m.verbs.len() > 1).then(|| verbs(&m.verbs)))
         .child(findings(s, &m));
     if !m.slowest.is_empty() {
         v = v.child(slowest(&m.slowest));
     }
     v.child(timeline(&m))
+        .child(distribution(&m))
         .child(
             m.heat
                 .clone()
@@ -189,10 +193,59 @@ fn findings(s: Store, m: &ProfileModel) -> View {
     if m.findings.is_empty() {
         return sec.child(small(tr("profile.no_findings")));
     }
-    sec.children(m.findings.iter().map(|f| finding(s, f.clone())))
+    sec.children(m.findings.iter().map(|f| finding(s, m, f.clone())))
 }
 
-fn finding(s: Store, f: FindingRow) -> View {
+/// Each verb: its numbers and its own stage split.
+fn verbs(vs: &[VerbRow]) -> View {
+    section(tr("profile.verbs"))
+        .test_id("verbs")
+        .children(vs.iter().map(|v| {
+            view()
+                .flex_row()
+                .flex_wrap()
+                .items_center()
+                .gap_3()
+                .py_1()
+                .child(mono(v.verb.clone()).w(px(150.0)).number_of_lines(1))
+                .child(
+                    small(fill("verb.ops", &[&fmt::compact(v.ops_count as f64)]))
+                        .w(px(72.0))
+                        .tabular_nums(),
+                )
+                .child(
+                    small(format!(
+                        "p50 {} · p99 {}",
+                        fmt::dur_ms(v.p50_ms),
+                        fmt::dur_ms(v.p99_ms)
+                    ))
+                    .w(px(170.0))
+                    .tabular_nums(),
+                )
+                .child(view().flex_1().min_w(px(120.0)).child(stage_bar(&v.stages)))
+                .child(
+                    small(if v.error_ratio > 0.0 {
+                        format!("{} {}", tr("metric.errors"), fmt::ratio(v.error_ratio))
+                    } else {
+                        String::new()
+                    })
+                    .text_color(move || Tone::Crit.color()),
+                )
+        }))
+}
+
+/// The evidence chart of a finding (nothing when the run lacks its data).
+fn evidence(m: &ProfileModel, f: &FindingRow) -> Option<View> {
+    let (heading, plot) = plots::evidence(m, f.chart?)?;
+    Some(
+        view()
+            .pt_1()
+            .test_id(&format!("evidence-{}", f.code))
+            .child(chart(heading, 96.0, move || Some(plot.clone()))),
+    )
+}
+
+fn finding(s: Store, m: &ProfileModel, f: FindingRow) -> View {
     let remedy = f.remedy.clone();
     let paths = remedy
         .iter()
@@ -227,6 +280,7 @@ fn finding(s: Store, f: FindingRow) -> View {
         .child(body(f.cause.clone()).selectable(true))
         .child(small(f.evidence.clone()).selectable(true))
         .children(f.items.iter().map(|(k, v)| prop(k.clone(), v.clone())))
+        .child(evidence(m, &f))
         .child(if remedy.is_empty() {
             view()
                 .flex_row()
@@ -376,52 +430,8 @@ fn waterfall(w: &Waterfall, span: f64, hover: Signal<Option<String>>) -> View {
 }
 
 fn timeline(m: &ProfileModel) -> View {
-    let pts = m.timeline.clone();
-    if pts.is_empty() {
+    let (Some(ops), Some(lat)) = (plots::goodput(&m.timeline), plots::latency(&m.timeline)) else {
         return view();
-    }
-    let window = pts.last().map(|p| p.t_s + 1.0).unwrap_or(1.0);
-    let x = Scale {
-        min: 0.0,
-        max: window,
-        log: false,
-    };
-    let ops = Plot {
-        x,
-        y: Scale::zero_based(pts.iter().map(|p| p.ops_per_s).fold(0.0, f64::max)),
-        step_w: 1.0,
-        y_fmt: Unit::Rate,
-        lines: vec![Line {
-            label: tr("metric.goodput"),
-            token: "series-a",
-            pts: pts.iter().map(|p| (p.t_s, p.ops_per_s)).collect(),
-        }],
-    };
-    let lo = pts
-        .iter()
-        .map(|p| p.p50_ms)
-        .filter(|v| *v > 0.0)
-        .fold(f64::INFINITY, f64::min);
-    let lat = Plot {
-        x,
-        y: Scale::log(
-            if lo.is_finite() { lo } else { 0.1 },
-            pts.iter().map(|p| p.p99_ms).fold(0.1, f64::max),
-        ),
-        step_w: 1.0,
-        y_fmt: Unit::Ms,
-        lines: vec![
-            Line {
-                label: "p50",
-                token: "series-a",
-                pts: pts.iter().map(|p| (p.t_s, p.p50_ms)).collect(),
-            },
-            Line {
-                label: "p99",
-                token: "stage-server",
-                pts: pts.iter().map(|p| (p.t_s, p.p99_ms)).collect(),
-            },
-        ],
     };
     section(tr("profile.timeline"))
         .test_id("timeline")
@@ -431,6 +441,21 @@ fn timeline(m: &ProfileModel) -> View {
         .child(chart(tr("profile.latency"), 110.0, move || {
             Some(lat.clone())
         }))
+}
+
+/// The latency distribution with its median and tail marked.
+fn distribution(m: &ProfileModel) -> View {
+    let Some(p) = plots::own_cdf(m) else {
+        return view();
+    };
+    let heading = if m.cdf.exact {
+        tr("plot.cdf")
+    } else {
+        tr("plot.cdf_buckets")
+    };
+    section(tr("profile.distribution"))
+        .test_id("distribution")
+        .child(chart(heading, 130.0, move || Some(p.clone())))
 }
 
 fn conns(m: &ProfileModel) -> View {
