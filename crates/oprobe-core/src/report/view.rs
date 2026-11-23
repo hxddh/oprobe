@@ -1652,6 +1652,7 @@ mod tests {
             errors_count: vec![0; n],
             inflight_peak_count: vec![4; n],
             new_connections_count: vec![0; n],
+            ..Default::default()
         };
         let (d, k) = t.downsample(60);
         assert_eq!(k, 15);
