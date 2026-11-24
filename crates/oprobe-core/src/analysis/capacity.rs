@@ -647,7 +647,16 @@ fn find_ceiling(levels: &BTreeMap<u64, (u64, u64)>) -> Option<(Ceiling, u64)> {
     // level is within that error (CI: a clean 23, 24 and 25 on a lab limited at 24, a loaded
     // machine's lone throttles at 21–23). The bracket includes one level of it on each side;
     // the estimate stays the likeliest split.
-    let lo = k_low.saturating_sub(1);
+    // A level with fewer than 3 arrivals is no evidence that it was clean (the same rule as
+    // above): the bracket starts from the highest level at or below `k_low` that has 3 (macOS
+    // CI: 2 clean arrivals each at 25 and 26 put `lo` at 25 on a lab limited at 24).
+    let supported = lv
+        .iter()
+        .filter(|(l, c, t)| *l <= k_low && c + t >= 3)
+        .map(|(l, _, _)| *l)
+        .max()
+        .unwrap_or(k_low);
+    let lo = supported.saturating_sub(1);
     let hi = hi + 1;
     Some((
         Ceiling {
@@ -916,6 +925,38 @@ mod tests {
             levels.insert(l, (20 + 3, 3));
         }
         levels.insert(29, (2, 2));
+        let (c, _) = find_ceiling(&levels).expect("a ceiling");
+        assert!(c.lo <= 24.0 && 24.0 < c.hi, "{c:?}");
+    }
+
+    /// macOS CI, parquet lab (limit 24): 2 clean arrivals each at 25 and 26 (the client's count
+    /// reading high) are no evidence that those levels were clean, so the bracket still
+    /// holds 24.
+    #[test]
+    fn a_couple_of_clean_arrivals_above_the_limit_do_not_lift_the_bracket() {
+        let mut levels = BTreeMap::new();
+        let clean = [
+            7u64, 17, 48, 91, 194, 220, 174, 229, 241, 194, 225, 179, 190, 148, 109, 133, 76, 73,
+            56, 34, 40, 14, 13, 14,
+        ];
+        for (i, c) in clean.iter().enumerate() {
+            levels.insert(i as u64 + 1, (*c, 0));
+        }
+        levels.insert(25, (2, 0));
+        levels.insert(26, (2, 0));
+        for (l, n) in [
+            (27u64, 4u64),
+            (28, 2),
+            (29, 2),
+            (30, 2),
+            (33, 5),
+            (34, 6),
+            (35, 7),
+        ] {
+            // (arrivals, throttled): all but two of level 27 were throttled.
+            let thr = if l == 27 { 2 } else { n };
+            levels.insert(l, (n, thr));
+        }
         let (c, _) = find_ceiling(&levels).expect("a ceiling");
         assert!(c.lo <= 24.0 && 24.0 < c.hi, "{c:?}");
     }

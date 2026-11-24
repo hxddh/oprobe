@@ -335,7 +335,9 @@ fn retried_transient_failures_prove_a_shorter_backoff() {
         let r = env.run_until(&[scenario, "-d", "2s"], "errors");
         let f = check_finding(&r, "errors", Some("layers.retry.min_delay"));
         assert_eq!(f["remedy"]["with"][0], "layers.retry.jitter", "{f:#}");
-        let p = env.json(&["prove", r["run"]["id"].as_str().unwrap()]);
+        // The errors finding by name: on a slow machine the random 503s can also rank a
+        // throttling finding first.
+        let p = env.json(&["prove", r["run"]["id"].as_str().unwrap(), "errors"]);
         assert_eq!(p["finding"], "errors", "{scenario}: {p:#}");
         assert_eq!(p["objective"], "goodput");
         let v = sized(&p);
