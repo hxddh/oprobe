@@ -232,6 +232,10 @@ pub struct TcpRow {
     /// Pacing rate, bits per second (Linux).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub pacing_rate_bps: u64,
+    /// Bytes received over the connection's life (Linux `tcpi_bytes_received`, macOS
+    /// `rxbytes`): with `bytes_acked`, the bytes on the wire.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub bytes_received: u64,
 }
 
 /// Details of one request beyond the stage timings (design v5 §3): what the server said
