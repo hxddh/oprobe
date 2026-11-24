@@ -608,7 +608,7 @@ fn prove_judges_a_change_and_hides_its_trials() {
     let trial = json(&env.run(&["show", trials[0]["run_id"].as_str().unwrap(), "-o", "json"]));
     assert_eq!(trial["report"]["run"]["parent_id"], v["prove_id"]);
     let last = json(&env.run(&["show", "last", "-o", "json"]));
-    assert_eq!(last["report"]["run"]["id"], run_id.as_str());
+    assert_eq!(last["report"]["run"]["id"], run_id.as_str(), "{last:#}");
     // Removing the prove removes its trials.
     let o = env.run(&[
         "show",

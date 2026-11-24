@@ -124,6 +124,12 @@ pub fn decode_run(r: impl Read) -> Result<Run> {
             .with_hint(hint.to_owned())
             .into()
         };
+        // An I/O error (a sharing violation, a permission) is what it says, not a damaged file;
+        // a file that ends early is.
+        let io = e.chain().find_map(|c| c.downcast_ref::<std::io::Error>());
+        if io.is_some_and(|io| io.kind() != std::io::ErrorKind::UnexpectedEof) {
+            return e;
+        }
         if msg.contains("is not supported") {
             invalid(
                 "run files of other oprobe versions are not read: re-run the workload with this oprobe",
