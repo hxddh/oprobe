@@ -1288,16 +1288,33 @@ fn throttle_gate(
     b_trials: &[&ProveTrial],
     max_throttle: f64,
 ) -> (ProveVerdict, Option<String>) {
-    let ratio = |ts: &[&ProveTrial]| {
+    let counts = |ts: &[&ProveTrial]| {
         let requests: u64 = ts.iter().map(|t| t.requests_count).sum();
         let throttled: u64 = ts.iter().map(|t| t.throttled_count).sum();
-        (requests > 0).then(|| throttled as f64 / requests as f64)
+        (requests as f64, throttled as f64)
     };
-    let Some(b) = ratio(b_trials) else {
+    let (nb, tb) = counts(b_trials);
+    if nb == 0.0 {
         return (verdict, None);
+    }
+    let (na, ta) = counts(a_trials);
+    let b = tb / nb;
+    let a = if na > 0.0 { ta / na } else { 0.0 };
+    // The change is what throttles: over the limit, more than the current operator by more
+    // than the limit allows, and beyond chance (a one-sided two-proportion test, z > 2).
+    // Service errors that follow no load (`lab://noisy`) throttle both alike and pass.
+    let z = if na > 0.0 {
+        let p = (ta + tb) / (na + nb);
+        let se = (p * (1.0 - p) * (1.0 / na + 1.0 / nb)).sqrt();
+        if se > 0.0 {
+            (b - a) / se
+        } else {
+            f64::INFINITY
+        }
+    } else {
+        f64::INFINITY
     };
-    let a = ratio(a_trials).unwrap_or(0.0);
-    if b <= max_throttle || b <= a {
+    if b <= max_throttle || b - a <= max_throttle || z <= 2.0 {
         return (verdict, None);
     }
     let note = format!(
@@ -1307,6 +1324,18 @@ fn throttle_gate(
         max_throttle * 100.0
     );
     (ProveVerdict::Inconclusive, Some(note))
+}
+
+/// The throttled share a sizing trial may reach. A remedy for throttling must bring it under
+/// `--max-throttle`; any other remedy must only not add more than `--max-throttle` to what the
+/// run already had (503s that follow no load, `lab://noisy`, are not the change's doing).
+fn sizing_throttle_limit(run: &crate::model::Run, finding: Option<&str>, max_throttle: f64) -> f64 {
+    if matches!(finding, Some("throttling" | "rate_limit" | "key_limit")) {
+        return max_throttle;
+    }
+    let r = &run.report;
+    let had = r.resilience.throttled_responses as f64 / r.connections.requests.max(1) as f64;
+    max_throttle.max(had + max_throttle)
 }
 
 /// Mean of a trial metric.
@@ -1587,28 +1616,11 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
     }
     refuse_unjudged(&run)?;
     let defaults = crate::config::defaults().prove;
-    let explicit_throttle =
-        req.max_throttle_ratio
-            .or(run.report.spec.profile.sla.max_throttle_rate);
-    let mut max_throttle = explicit_throttle.unwrap_or(defaults.max_throttle_ratio);
-    let mut change = choose_change(&run, &req)?;
-    // The `errors` remedy is for 503s that follow no load pattern (A5): they are service
-    // errors, not a limit to stay under, and a shorter backoff cannot remove them. Unless
-    // asked for, `--max-throttle` does not judge this change (`lab://noisy`).
-    if explicit_throttle.is_none()
-        && change.finding.as_deref() == Some("errors")
-        && change
-            .sized
-            .as_ref()
-            .is_some_and(|s| s.path == "layers.retry.min_delay")
-        && run.report.resilience.throttled_responses > 0
-    {
-        max_throttle = 1.0;
-        change.notes.push(
-            "the 503s follow neither the load, the rate nor the keys: they are service errors, so --max-throttle does not judge this change"
-                .into(),
-        );
-    }
+    let max_throttle = req
+        .max_throttle_ratio
+        .or(run.report.spec.profile.sla.max_throttle_rate)
+        .unwrap_or(defaults.max_throttle_ratio);
+    let change = choose_change(&run, &req)?;
     // The base profile, with credentials resolved again, on a short trial window.
     let mut base = super::profile::spec_profile(ctx, run.report.spec.clone())?;
     let trial_window = match &req.trial_duration {
@@ -1690,7 +1702,7 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
         deadline: budget.map(|b| Instant::now() + b),
         per_trial: trial_window + warmup,
         baseline_warmup: baseline_warmup(&base, &change),
-        max_throttle,
+        max_throttle: sizing_throttle_limit(&run, change.finding.as_deref(), max_throttle),
         max_error: run.report.sla.max_error_ratio,
         out: Vec::new(),
         target_name,
@@ -2016,6 +2028,16 @@ mod tests {
         let hot: Vec<&ProveTrial> = hot.iter().collect();
         assert_eq!(
             throttle_gate(ProveVerdict::Improved, &hot, &over, 0.001),
+            (ProveVerdict::Improved, None)
+        );
+        // Service errors that follow no load throttle both alike: a difference within chance,
+        // or within the limit, is not the change's doing.
+        let noisy_a = [b(1000, 10), b(1000, 9)];
+        let noisy_a: Vec<&ProveTrial> = noisy_a.iter().collect();
+        let noisy_b = [b(1000, 13), b(1000, 12)];
+        let noisy_b: Vec<&ProveTrial> = noisy_b.iter().collect();
+        assert_eq!(
+            throttle_gate(ProveVerdict::Improved, &noisy_a, &noisy_b, 0.001),
             (ProveVerdict::Improved, None)
         );
         // No candidate ran: nothing to gate.
