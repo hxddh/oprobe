@@ -592,7 +592,101 @@ pub fn meter(ratio: f64, tok: &'static str) -> View {
         .child(view().h_full().w(relative(r)).bg(token(tok)))
 }
 
-/// A column of a [`table`]: its heading, width and whether its cells are numbers (right-aligned,
+/// An inline bar beside a table cell's number: `outer` (0–1 of the track) drawn faint and
+/// `inner` (0–1) in full over it — a share alone (`inner == outer`), or a p50 inside a p99.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CellBar {
+    pub inner: f64,
+    pub outer: f64,
+    pub tok: &'static str,
+}
+
+impl CellBar {
+    /// One share, 0–1.
+    pub fn share(r: f64, tok: &'static str) -> Self {
+        Self {
+            inner: r,
+            outer: r,
+            tok,
+        }
+    }
+}
+
+/// The track of an inline bar (points wide).
+pub const CELL_BAR_W: f32 = 56.0;
+
+fn cell_bar(b: CellBar) -> View {
+    let (inner, outer) = (
+        b.inner.clamp(0.0, 1.0) as f32,
+        b.outer.clamp(0.0, 1.0) as f32,
+    );
+    let tok = b.tok;
+    view()
+        .w(px(CELL_BAR_W))
+        .flex_shrink_0()
+        .h(px(8.0))
+        .rounded(px(2.0))
+        .bg(move || theme().muted)
+        .overflow_hidden()
+        .child(
+            view()
+                .absolute()
+                .top(px(0.0))
+                .left(px(0.0))
+                .h_full()
+                .w(relative(outer))
+                .bg(token(tok))
+                .opacity(0.35),
+        )
+        .child(
+            view()
+                .absolute()
+                .top(px(0.0))
+                .left(px(0.0))
+                .h_full()
+                .w(relative(inner))
+                .bg(token(tok)),
+        )
+}
+
+/// A table cell: its text, after an inline bar when it has one.
+fn table_cell(c: Col, first: bool, t: String, head: bool, bar: Option<CellBar>) -> View {
+    let t = if head {
+        caption(t)
+    } else if c.numeric {
+        text(t).text_size(px(metrics().small + 1.0)).tabular_nums()
+    } else {
+        text(t).text_size(px(metrics().small + 1.0))
+    };
+    let v = match bar {
+        Some(b) => view()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .min_w(px(0.0))
+            .child(cell_bar(b))
+            .child(
+                view()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .items_end()
+                    .child(t.number_of_lines(1)),
+            ),
+        None => view().min_w(px(0.0)).child(t.number_of_lines(1)),
+    };
+    let v = if first {
+        v.flex_1().min_w(px(120.0))
+    } else {
+        v.w(px(c.width)).flex_shrink_0()
+    };
+    if c.numeric && bar.is_none() {
+        v.items_end()
+    } else {
+        v
+    }
+}
+
+/// A column of a [`table_bars`]: its heading, width and whether its cells are numbers (right-aligned,
 /// tabular).
 #[derive(Clone, Copy, Debug)]
 pub struct Col {
@@ -603,50 +697,42 @@ pub struct Col {
 
 /// A compact table: a heading row, then one hairline-separated row per item. The first column
 /// takes the room left; the others have their widths. It scrolls sideways when the window is
-/// narrower than its columns.
-pub fn table(cols: &[Col], rows: Vec<Vec<String>>) -> impl IntoElement {
+/// narrower than its columns. `bars[row][col]` draws an inline bar beside that cell's number (a
+/// row or column without an entry has none); a column with bars needs room for one
+/// ([`CELL_BAR_W`]).
+pub fn table_bars(
+    cols: &[Col],
+    rows: Vec<Vec<String>>,
+    bars: Vec<Vec<Option<CellBar>>>,
+) -> impl IntoElement {
     let cols: Vec<Col> = cols.to_vec();
     let total: f32 = cols.iter().skip(1).map(|c| c.width).sum::<f32>() + 160.0;
-    let cell = |c: Col, first: bool, t: String, head: bool| {
-        let t = if head {
-            caption(t)
-        } else if c.numeric {
-            text(t).text_size(px(metrics().small + 1.0)).tabular_nums()
-        } else {
-            text(t).text_size(px(metrics().small + 1.0))
+    let row =
+        |cells: Vec<String>, bars: Vec<Option<CellBar>>, head: bool, cols: &[Col]| {
+            view()
+                .flex_row()
+                .items_center()
+                .gap_3()
+                .py(px(if in_terminal() { 0.0 } else { 5.0 }))
+                .border_t(px(if head { 0.0 } else { 1.0 }))
+                .border_color(move || theme().border)
+                .children(cols.iter().zip(cells).enumerate().map(|(i, (c, t))| {
+                    table_cell(*c, i == 0, t, head, bars.get(i).copied().flatten())
+                }))
         };
-        let v = view().min_w(px(0.0)).child(t.number_of_lines(1));
-        let v = if first {
-            v.flex_1().min_w(px(120.0))
-        } else {
-            v.w(px(c.width)).flex_shrink_0()
-        };
-        if c.numeric { v.items_end() } else { v }
-    };
-    let row = |cells: Vec<String>, head: bool, cols: &[Col]| {
-        view()
-            .flex_row()
-            .items_center()
-            .gap_3()
-            .py(px(if in_terminal() { 0.0 } else { 5.0 }))
-            .border_t(px(if head { 0.0 } else { 1.0 }))
-            .border_color(move || theme().border)
-            .children(
-                cols.iter()
-                    .zip(cells)
-                    .enumerate()
-                    .map(|(i, (c, t))| cell(*c, i == 0, t, head)),
-            )
-    };
     let heads: Vec<String> = cols
         .iter()
         .map(|c| crate::ui::i18n::tr(c.heading).to_owned())
         .collect();
+    let mut bars = bars.into_iter();
     scroll().horizontal().min_w(px(0.0)).child(
         view()
             .min_w(px(total))
-            .child(row(heads, true, &cols))
-            .children(rows.into_iter().map(|r| row(r, false, &cols))),
+            .child(row(heads, Vec::new(), true, &cols))
+            .children(
+                rows.into_iter()
+                    .map(|r| row(r, bars.next().unwrap_or_default(), false, &cols)),
+            ),
     )
 }
 
@@ -684,7 +770,7 @@ pub fn disclosure(
         }))
 }
 
-/// A [`table`] whose rows can be pressed: each row is a button (`{id}-{i}`, labelled with its
+/// A [`table_bars`] whose rows can be pressed: each row is a button (`{id}-{i}`, labelled with its
 /// cells) that calls `on_row` with its index, and the row `selected` says is highlighted.
 pub fn pressable_table(
     cols: &[Col],
@@ -693,24 +779,20 @@ pub fn pressable_table(
     selected: impl Fn() -> Option<usize> + Clone + 'static,
     on_row: impl Fn(usize) + Clone + 'static,
 ) -> impl IntoElement {
+    pressable_table_bars(cols, rows, Vec::new(), id, selected, on_row)
+}
+
+/// A [`pressable_table`] with inline bars, as in [`table_bars`].
+pub fn pressable_table_bars(
+    cols: &[Col],
+    rows: Vec<Vec<String>>,
+    bars: Vec<Vec<Option<CellBar>>>,
+    id: &'static str,
+    selected: impl Fn() -> Option<usize> + Clone + 'static,
+    on_row: impl Fn(usize) + Clone + 'static,
+) -> impl IntoElement {
     let cols: Vec<Col> = cols.to_vec();
     let total: f32 = cols.iter().skip(1).map(|c| c.width).sum::<f32>() + 160.0;
-    let cell = |c: Col, first: bool, t: String, head: bool| {
-        let t = if head {
-            caption(t)
-        } else if c.numeric {
-            text(t).text_size(px(metrics().small + 1.0)).tabular_nums()
-        } else {
-            text(t).text_size(px(metrics().small + 1.0))
-        };
-        let v = view().min_w(px(0.0)).child(t.number_of_lines(1));
-        let v = if first {
-            v.flex_1().min_w(px(120.0))
-        } else {
-            v.w(px(c.width)).flex_shrink_0()
-        };
-        if c.numeric { v.items_end() } else { v }
-    };
     let heads: Vec<String> = cols
         .iter()
         .map(|c| crate::ui::i18n::tr(c.heading).to_owned())
@@ -724,8 +806,9 @@ pub fn pressable_table(
             cols.iter()
                 .zip(heads)
                 .enumerate()
-                .map(|(i, (c, t))| cell(*c, i == 0, t, true)),
+                .map(|(i, (c, t))| table_cell(*c, i == 0, t, true, None)),
         );
+    let mut bars = bars.into_iter();
     scroll()
         .horizontal()
         .min_w(px(0.0))
@@ -737,6 +820,7 @@ pub fn pressable_table(
                     let on_row = on_row.clone();
                     let selected = selected.clone();
                     let label = r.join(", ");
+                    let rb = bars.next().unwrap_or_default();
                     button()
                         .on_press(move || on_row(i))
                         .accessibility_label(label)
@@ -757,12 +841,9 @@ pub fn pressable_table(
                         })
                         .hover(|s| s.bg(move || theme().muted))
                         .focus_visible(ring)
-                        .children(
-                            cols.iter()
-                                .zip(r)
-                                .enumerate()
-                                .map(|(k, (c, t))| cell(*c, k == 0, t, false)),
-                        )
+                        .children(cols.iter().zip(r).enumerate().map(|(k, (c, t))| {
+                            table_cell(*c, k == 0, t, false, rb.get(k).copied().flatten())
+                        }))
                 })),
         )
 }

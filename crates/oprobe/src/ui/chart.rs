@@ -140,6 +140,24 @@ pub enum Unit {
     Change,
     /// A whole count (in-flight requests, a pair number).
     Count,
+    /// A small share on a log axis (a tail plot): `100 %`, `1 %`, `0.01 %`, `3.47 %`.
+    Tail,
+}
+
+/// A share as a percentage with its significant digits and no trailing zeros: `0.0001` →
+/// `0.01 %`, `0.0347` → `3.47 %`, `1` → `100 %`.
+pub fn tail_share(v: f64) -> String {
+    let p = v * 100.0;
+    if !p.is_finite() || p <= 0.0 {
+        return "0 %".into();
+    }
+    let s = fmt::sig3(p);
+    let s = if s.contains('.') {
+        s.trim_end_matches('0').trim_end_matches('.').to_owned()
+    } else {
+        s
+    };
+    format!("{s} %")
 }
 
 impl Unit {
@@ -157,6 +175,7 @@ impl Unit {
                 }
             },
             Unit::Change => fmt::delta,
+            Unit::Tail => tail_share,
             Unit::Count => |v| {
                 let v = v.round();
                 if v.abs() < 1000.0 {
@@ -828,8 +847,10 @@ fn chart_with(
         plot.with(|p| {
             p.as_ref()
                 .map(|p| {
+                    // A series that is zero throughout draws on the axis: no legend entry.
                     p.lines
                         .iter()
+                        .filter(|l| l.pts.iter().any(|p| p.1 != 0.0))
                         .map(|l| (l.label.clone(), l.token))
                         .chain(
                             p.bands
