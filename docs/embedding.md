@@ -102,7 +102,7 @@ let cfg = oprobe_trace::Config::default().exporter(std::sync::Arc::new(Slow));
 | `insecure_skip_verify(on)` | false | skip certificate verification (development only) |
 | `proxy(Some(url) \| None)` | the environment | an explicit `http://` proxy, or none |
 | `https(on)` | true | selects `HTTPS_PROXY` over `HTTP_PROXY` |
-| `tcp_info(on)` | true | read kernel TCP statistics at the end of each request (Linux, macOS, Windows) |
+| `tcp_info(on)` | true | read kernel TCP statistics at the end of each request (Linux, macOS) |
 | `exporter(e)` | none | your `Exporter` |
 
 `handle.transport_error()` says why HTTP requests are not instrumented, if the transport could not

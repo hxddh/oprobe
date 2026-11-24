@@ -948,9 +948,8 @@ mod tests {
             "{full}"
         );
         assert!(
-            full.contains("use opendal::raw::HttpTransporter;")
-                && full.contains("use opendal::OperationContext;")
-                && full.contains("ReqwestTransport"),
+            full.contains("use opendal::{HttpTransporter, OperationContext};")
+                && full.contains("use opendal_http_transport_reqwest::ReqwestTransport;"),
             "{full}"
         );
     }
@@ -962,20 +961,23 @@ mod tests {
         )
         .unwrap();
         let r = to_rust(&gcs);
-        assert!(r.contains("Operator::via_iter(\"gcs\","), "{r}");
+        assert!(r.contains("Operator::via_iter(\n    \"gcs\","), "{r}");
         assert!(r.contains("(\"bucket\", \"my-bucket\")"), "{r}");
         assert!(r.contains("(\"root\", \"/data\")"), "{r}");
         assert!(r.contains("(\"service_account\", \"sa@proj.iam\")"), "{r}");
 
         let r2 = OperatorSpec::from_url("r2://assets/img");
         let r2_code = to_rust(&r2);
-        assert!(r2_code.contains("Operator::via_iter(\"s3\","), "{r2_code}");
+        assert!(
+            r2_code.contains("Operator::via_iter(\n    \"s3\","),
+            "{r2_code}"
+        );
         assert!(r2_code.contains("(\"bucket\", \"assets\")"), "{r2_code}");
 
         let lab = OperatorSpec::from_url("lab://demo");
         let lab_code = to_rust(&lab);
         assert!(
-            lab_code.contains("Operator::via_iter(\"s3\","),
+            lab_code.contains("Operator::via_iter(\n    \"s3\","),
             "{lab_code}"
         );
         assert!(

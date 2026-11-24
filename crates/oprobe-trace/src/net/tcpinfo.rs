@@ -124,15 +124,17 @@ pub fn find(local: SocketAddr, remote: SocketAddr) -> Option<SockId> {
     imp::find(local, remote)
 }
 
-/// Whether this platform reports TCP statistics.
-pub const SUPPORTED: bool = cfg!(any(
+/// Whether the OpenDAL reqwest transport can locate and sample kernel TCP statistics at request
+/// end (requires safe descriptor-table lookup by `(local, remote)` address).
+pub const SUPPORTED: bool = cfg!(any(target_os = "linux", target_os = "macos"));
+
+/// Whether owned `tokio::net::TcpStream` connections report kernel TCP statistics (`TCP_INFO`,
+/// `TCP_CONNECTION_INFO`, `SIO_TCP_INFO`).
+pub const OWNED_SUPPORTED: bool = cfg!(any(
     target_os = "linux",
     target_os = "macos",
     target_os = "windows"
 ));
-
-/// Whether this platform can locate an unowned socket by `(local, remote)` address.
-pub const FIND_SUPPORTED: bool = cfg!(any(target_os = "linux", target_os = "macos"));
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod imp {
@@ -602,12 +604,12 @@ mod tests {
         let s = tokio::net::TcpStream::connect(addr).await.unwrap();
         let server = accept.await.unwrap();
         let id = sock_id_of(&s);
-        if !SUPPORTED {
+        if !OWNED_SUPPORTED {
             assert!(id.is_none());
             return;
         }
         let id = id.unwrap();
-        if FIND_SUPPORTED {
+        if SUPPORTED {
             // Found by identity like the OpenDAL-mode lookup does.
             let found = find(id.local, id.remote).expect("socket found by its addresses");
             assert_eq!(found.fd, id.fd);

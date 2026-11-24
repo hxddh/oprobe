@@ -33,8 +33,9 @@ single new CLI command or configuration concept.
     `x-ms-retry-after-ms`), `503 SlowDown` vs `503 ServiceUnavailable`/`InternalError`
     classification, `WritePathView` multipart straggler skew & `CompleteMultipartUpload` p99, and
     `ListView` pagination depth (`pages/list`).
-  - Race-free per-connection kernel TCP statistics (`TcpProbe` owned per hyper connection, plus
-    Windows `WSAIoctl(SIO_TCP_INFO)` alongside Linux and macOS).
+  - Race-free per-connection kernel TCP statistics (`TcpProbe` owned per connection across
+    concurrent HTTP/2 streams on Linux and macOS, plus `WSAIoctl(SIO_TCP_INFO)` support for owned
+    sockets on Windows).
 - **Concise CLI workflows.**
   - `oprobe show <A> <B> […]` compares stored runs, `.oprobe` files or production traces side by
     side (`-o text`, `-o json` matching `schemas/run.json`, `--detail` for per-API comparison).

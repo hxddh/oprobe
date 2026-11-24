@@ -213,8 +213,8 @@ impl Config {
         self
     }
 
-    /// Read the kernel's TCP statistics of the connection at the end of every request (Linux,
-    /// macOS and Windows; default true).
+    /// Read the kernel's TCP statistics of the connection at the end of every request (Linux
+    /// and macOS; default true).
     pub fn tcp_info(mut self, on: bool) -> Self {
         self.transport.tcp_info = on;
         self
