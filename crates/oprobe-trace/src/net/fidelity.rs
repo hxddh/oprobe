@@ -194,19 +194,21 @@ impl Shared {
         Some(id)
     }
 
-    /// Snapshot of currently known socket probes (used to detect kernel upload buffer drain).
-    fn active_probes(&self) -> Vec<Arc<TcpProbe>> {
-        let Ok(c) = self.conns.lock() else {
-            return Vec::new();
-        };
-        c.by_addr
-            .values()
-            .filter_map(|e| match &e.sock {
-                Sock::Found(p) => Some(p.clone()),
-                _ => None,
-            })
-            .take(16)
-            .collect()
+    /// Unambiguous kernel probe when the pool holds a single idle connection (avoids attributing
+    /// other connections' in-flight segments under multi-worker concurrency).
+    fn single_probe(&self) -> Option<Arc<TcpProbe>> {
+        let c = self.conns.lock().ok()?;
+        if c.by_addr.len() != 1 {
+            return None;
+        }
+        let e = c.by_addr.values().next()?;
+        if e.active_streams.load(Ordering::Acquire) > 0 {
+            return None;
+        }
+        match &e.sock {
+            Sock::Found(p) => Some(p.clone()),
+            _ => None,
+        }
     }
 }
 
@@ -1057,24 +1059,25 @@ impl HttpTransport for FidelityTransport {
             let ack_ref = acked_us.clone();
             let watch = async move {
                 notify.notified().await;
-                let probes = shared.active_probes();
-                if probes.is_empty() {
+                let Some(probe) = shared.single_probe() else {
+                    return;
+                };
+                // Only track kernel send-queue drain (`notsent_bytes > 0`); checking `unacked`
+                // would include the peer's 40 ms TCP Delayed-ACK timer inside `send_us` when a
+                // straggler server delays its HTTP response headers.
+                if !probe.peek().is_some_and(|r| r.notsent_bytes > 0) {
                     return;
                 }
                 let mut wait = Duration::from_micros(250);
                 loop {
-                    let busy = probes.iter().any(|p| {
-                        p.peek()
-                            .is_some_and(|r| r.notsent_bytes > 0 || r.unacked_count > 0)
-                    });
-                    if !busy {
+                    tokio::time::sleep(wait).await;
+                    if !probe.peek().is_some_and(|r| r.notsent_bytes > 0) {
                         let us = t_start.elapsed().as_micros() as u64;
-                        if us >= end_ref.load(Ordering::Acquire) {
+                        if us > end_ref.load(Ordering::Acquire) {
                             ack_ref.store(us.max(1), Ordering::Release);
                         }
                         return;
                     }
-                    tokio::time::sleep(wait).await;
                     wait = (wait * 2).min(Duration::from_millis(2));
                 }
             };
