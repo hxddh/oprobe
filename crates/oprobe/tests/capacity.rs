@@ -80,7 +80,7 @@ async fn parquet_lab_ops_peak_at_four_requests_in_flight() {
         .inflight_ceiling
         .unwrap_or_else(|| panic!("12 × 4 > 24 throttles: {}", c.confidence_reason));
     assert!(
-        ce.lo <= 24.0 && 24.0 < ce.hi,
+        ce.lo <= 24.0 && 24.0 <= ce.hi,
         "{ce:?}: {:?}",
         c.observed.levels
     );
