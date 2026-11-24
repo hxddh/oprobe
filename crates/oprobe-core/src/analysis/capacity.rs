@@ -638,7 +638,11 @@ fn find_ceiling(levels: &BTreeMap<u64, (u64, u64)>) -> Option<(Ceiling, u64)> {
     let above = k_hi.max(k_low);
     let hi = lv
         .iter()
-        .find(|(l, c, t)| *l > above && c + t >= 2 && share(*c, *t) >= 0.5)
+        .find(|(l, c, t)| *l > above && c + t >= 3 && share(*c, *t) >= 0.5)
+        .or_else(|| {
+            lv.iter()
+                .find(|(l, c, t)| *l > above && share(*c, *t) >= 0.5)
+        })
         .or_else(|| lv.iter().find(|(l, _, t)| *l > above && *t > 0))
         .or_else(|| lv.iter().find(|(l, _, t)| *l > k_low && *t > 0))?
         .0;
@@ -1084,6 +1088,62 @@ mod tests {
             win.iter().map(|(l, n, t)| (*l, (*n, *t))).collect();
         let (c, _) = find_ceiling(&levels).expect("a ceiling");
         assert!(c.lo <= 24.0 && 24.0 < c.hi, "{c:?}");
+    }
+
+    #[test]
+    fn sparse_two_arrival_throttles_below_the_limit_do_not_clamp_hi() {
+        // Real CI traces on a loaded 2-core runner against a lab limited at 24: 1 of 2 arrivals
+        // throttled at levels 21–23, followed by clean 24–26 and ≥ 50 % throttled at 28+.
+        let ubu: &[(u64, u64, u64)] = &[
+            (4, 147, 0),
+            (8, 248, 0),
+            (12, 111, 0),
+            (16, 45, 0),
+            (17, 53, 0),
+            (18, 17, 1),
+            (19, 16, 1),
+            (20, 17, 1),
+            (21, 2, 1),
+            (22, 2, 1),
+            (23, 2, 1),
+            (24, 2, 0),
+            (25, 2, 0),
+            (26, 2, 0),
+            (27, 3, 1),
+            (28, 3, 2),
+            (29, 3, 2),
+        ];
+        let mac: &[(u64, u64, u64)] = &[
+            (4, 151, 0),
+            (8, 173, 0),
+            (12, 96, 0),
+            (13, 83, 1),
+            (14, 76, 0),
+            (15, 73, 1),
+            (16, 47, 0),
+            (17, 42, 2),
+            (18, 38, 2),
+            (19, 31, 2),
+            (20, 31, 1),
+            (21, 33, 1),
+            (22, 26, 1),
+            (23, 17, 2),
+            (24, 18, 3),
+            (25, 8, 2),
+            (26, 5, 2),
+            (27, 5, 1),
+            (28, 5, 2),
+            (29, 6, 1),
+            (30, 3, 1),
+            (36, 1, 1),
+            (37, 1, 1),
+        ];
+        for sample in [ubu, mac] {
+            let levels: BTreeMap<u64, (u64, u64)> =
+                sample.iter().map(|(l, n, t)| (*l, (*n, *t))).collect();
+            let (c, _) = find_ceiling(&levels).expect("a ceiling");
+            assert!(c.lo <= 24.0 && 24.0 < c.hi, "{c:?}");
+        }
     }
 
     #[test]
