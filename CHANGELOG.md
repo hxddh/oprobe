@@ -4,6 +4,57 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## v7.1.0 — 2026-11-24
+
+7.1 is the release planned in `docs/design/v7.1-review.md`: the bugs a bug hunt across every lab
+scenario found, remedies that prove, and an app that shows every signal honestly. Everything is
+additive (JSON fields, schemas).
+
+### Fixed
+
+- **The `errors` remedy proved worse.** For transient failures that retries recover, it is now
+  `layers.retry.min_delay`, sized by `prove` (from 20 ms), with jitter: `lab://flaky` proves
+  improved (several-fold goodput) instead of worse (−13 %). Network failures (connection resets)
+  count in the finding; the flaky lab injects the rates it describes.
+- **`run A B` ran a different workload per lab operator** while saying "the same workload": every
+  operator now runs the first one's workload, and `differences` lists any that remains. The budget
+  plan covers all of them.
+- **`prove` judges throttling by what the change adds:** inconclusive only when the candidate is
+  over `--max-throttle`, above the current operator by more than the limit, and beyond chance; a
+  remedy that is not for throttling may keep the throttling the run already had.
+- The text brief kept a partial run's `invalid_run` first, as the JSON does.
+- `show PROVE_ID` shows a stored prove (as `prove` printed it); `show --list` lists proves within
+  `-n` and says how many there are.
+- A budget stop prints the runs that finished (text) or carries them with the error (JSON).
+- Trace findings and prove hints name a concrete `oprobe run URL` (with its endpoint).
+- `show FILE --by` on a file without request rows, and `--since` past the window, are refused
+  with errors that name what is wrong; zero durations are refused.
+- Dry-run plans count transfer time for in-process targets and print durations exactly; the prove
+  ETA plans only the trials the budget fits.
+- One failed request in a production trace is not an `errors` finding; open-loop runs whose
+  arrivals queue name the workers, not the CPU; `bandwidth_cap` on reads is not a layer.
+- Bytes on the wire are measured (they read 0); connections say how many were dialed and when;
+  the kernel's smoothed RTT is shown next to the minimum RTT.
+- The in-flight ceiling's bracket no longer rests on levels with fewer than 3 arrivals.
+- Error docs links point at the installed version; a damaged run file is called damaged;
+  requests whose connection was reset show under "no connection".
+
+### Changed (the app and the profile)
+
+- The timeline ends at the measured window (a drain interval no longer drops every chart to zero
+  at the end).
+- New charts: **problems per second** (retries, throttled responses, failed operations, on their
+  own axis) and **throughput** over time.
+- The latency distribution is a **tail plot** (share slower than, log–log, p50 / p99 / p99.9
+  marked), also in the stragglers evidence and in Compare.
+- The heatmap's slowest row is closed at the next step (stragglers at 260 ms no longer paint a
+  band up to 1 s).
+- Finding evidence has labels and units (zh and en); detail tables show share bars, size ranges,
+  "first read / re-read", and drop empty columns; noise lines and all-zero legend entries are gone.
+- Requests by API draws each API's p50 inside its p99.
+- **Compare** adds p99.9, requests/s, failed operations, retries and throttled responses, p99 and
+  requests over time, and a per-API table.
+
 ## v7.0.0 — 2026-11-23
 
 7.0 is the release planned in `docs/design/v7-review.md`. Embedded traces now count operations,
