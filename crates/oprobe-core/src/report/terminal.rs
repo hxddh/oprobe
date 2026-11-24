@@ -671,7 +671,7 @@ fn render_with(r: &Report, run: Option<&Run>, detail: bool) -> String {
     if !r.apis.is_empty() {
         section(&mut out, "BACKEND REQUESTS  (p50/p99 per request)");
         out.push_str(&apis_table(r, detail));
-        if let Some(w) = &view.write_path {
+        if let Some(w) = view.write_path.as_ref().filter(|w| w.shown()) {
             let _ = writeln!(out, "  {} {}", dim("writes"), w.line());
         }
         if detail && r.connections.http2_requests > 0 {
@@ -699,8 +699,8 @@ fn render_with(r: &Report, run: Option<&Run>, detail: bool) -> String {
         );
         let _ = writeln!(
             out,
-            "  {} new · {:.1}% of requests warm · peak {} in flight{}",
-            c.dialed_count,
+            "  {} · {:.1}% of requests warm · peak {} in flight{}",
+            c.dials_line(),
             c.reuse_ratio * 100.0,
             c.peak_inflight_count,
             if c.dial_failures_count > 0 {
@@ -1062,32 +1062,47 @@ pub fn spread_section(s: &super::view::SpreadView) -> String {
         ("hot key", "of throttling", &s.hot_keys),
         ("object size", "throttled", &s.sizes),
         ("prefix", "throttled", &s.prefixes),
-        ("cold/warm", "throttled", &s.cold_warm),
+        ("first read / re-read", "throttled", &s.cold_warm),
         ("remote", "throttled", &s.remotes),
     ];
     for (title, thr, slices) in groups {
         if slices.is_empty() {
             continue;
         }
+        // Columns no slice fills (a hot key's errors and p99) are left out.
+        let (has_thr, has_err, has_p99) = super::view::SpreadView::columns(slices);
         let rows: Vec<Vec<String>> = slices
             .iter()
             .map(|x| {
-                vec![
-                    x.key.clone(),
+                let mut row = vec![
+                    x.label.clone(),
                     x.requests_count.to_string(),
                     format!("{:.1}%", x.share_ratio * 100.0),
+                ];
+                if has_thr {
                     // Hot keys carry their share of all throttling, the others their own.
-                    pct(x.throttled_ratio.or(x.throttle_share_ratio)),
-                    pct(x.error_ratio),
-                    ms(x.p99_ms),
-                ]
+                    row.push(pct(x.throttled_ratio.or(x.throttle_share_ratio)));
+                }
+                if has_err {
+                    row.push(pct(x.error_ratio));
+                }
+                if has_p99 {
+                    row.push(ms(x.p99_ms));
+                }
+                row
             })
             .collect();
-        out.push_str(&table(
-            &[title, "requests", "share", thr, "errors", "p99"],
-            &rows,
-            2,
-        ));
+        let mut head = vec![title, "requests", "share"];
+        if has_thr {
+            head.push(thr);
+        }
+        if has_err {
+            head.push("errors");
+        }
+        if has_p99 {
+            head.push("p99");
+        }
+        out.push_str(&table(&head, &rows, 2));
     }
     let _ = writeln!(
         out,
@@ -1314,6 +1329,7 @@ mod tests {
         let s = SpreadView {
             hot_keys: vec![Slice {
                 key: "hot/a".into(),
+                label: "hot/a".into(),
                 requests_count: 120,
                 share_ratio: 0.4,
                 throttled_ratio: None,
@@ -1325,6 +1341,8 @@ mod tests {
         };
         let out = spread_section(&s);
         assert!(out.contains("75.0%"), "{out}");
+        // A hot key has no errors and no p99: those columns are left out.
+        assert!(!out.contains("errors") && !out.contains("p99"), "{out}");
     }
 
     use super::*;
@@ -1420,6 +1438,18 @@ mod tests {
             },
             ..Default::default()
         }];
+        // Written in parts: the writes line says the part size and the parts.
+        r.apis.push(crate::trace::ApiStats {
+            api: crate::trace::Api::UploadPart,
+            count: 2,
+            bytes_up: 16 << 20,
+            ..Default::default()
+        });
+        r.connections.dialed = 1;
+        r.connections.cold_start = Some(crate::trace::ColdStartStats {
+            connections_count: 28,
+            ..Default::default()
+        });
         run.reqs[2].detail = Some(Box::new(crate::model::ReqDetail {
             flow_stall_us: Some(7_000),
             region: Some("eu-west-1".into()),
@@ -1436,7 +1466,10 @@ mod tests {
             "3.00ms/12.0ms",
             "64.0 MiB/0 B",
             "writes part size 8.0 MiB",
-            "tcp rtt p50/p99 1.00ms/2.00ms",
+            "tcp smoothed rtt p50/p99 1.00ms/2.00ms",
+            "2 parts of 8.0 MiB on average",
+            // One count of dials, with its window (K18).
+            "28 dialed during warm-up · 1 in the window",
             "h2 flow stall 7.00ms",
         ] {
             assert!(words.contains(s), "{s}\n{text}");

@@ -824,6 +824,38 @@ pub fn evidence_label(key: &str, v: f64) -> (String, String) {
         "tail_cut_blind_s" => Some("Tail-cut blind for"),
         "accepted_requests_per_s" => Some("Accepted while throttled"),
         "monthly_usd" => Some("Projected monthly bill"),
+        "affected_apis_count" => Some("APIs affected"),
+        "p50_ms" => Some("Operation p50"),
+        "p99_ms" => Some("Operation p99"),
+        "replayed_p99_ms" => Some("p99 with the remedy (replayed)"),
+        "typical_ttfb_ms" => Some("Typical time to first byte"),
+        "median_request_ms" => Some("Median request"),
+        "slowest_request_ms" => Some("Slowest request"),
+        "body_pct" => Some("Time receiving the body"),
+        "upload_pct" => Some("Time uploading"),
+        "dns_p50_ms" => Some("DNS p50"),
+        "tcp_p50_ms" => Some("TCP connect p50"),
+        "tls_p50_ms" => Some("TLS handshake p50"),
+        "cold_requests_count" => Some("Requests on new connections"),
+        "client_cpu_ratio" => Some("Client CPU"),
+        "sched_lag_p99_ms" => Some("Scheduler lag p99"),
+        "hot_key_share_ratio" => Some("Hottest key's share"),
+        "explains_ratio" => Some("Share it explains"),
+        "stream_bytes_per_s" => Some("Per-stream throughput"),
+        "fitted_bytes_per_s" => Some("Fitted bandwidth"),
+        "fitted_requests_per_s" => Some("Fitted request rate"),
+        "fitted_inflight_count" => Some("Fitted limit (in flight)"),
+        "requests_per_op_mean" => Some("Requests per operation"),
+        "parts_per_op_mean" => Some("Parts per operation"),
+        "inflight_per_op_mean" => Some("In flight per operation"),
+        "server_errors_count" => Some("Server errors"),
+        "failed_ops_count" => Some("Failed operations"),
+        "hung_requests_count" => Some("Hung requests"),
+        "timeouts_count" => Some("Timeouts"),
+        "throttled_responses_count" => Some("Throttled responses"),
+        "rate_limited_failures_count" => Some("Failures from the rate limit"),
+        "missed_arrivals_count" => Some("Missed arrivals"),
+        "window_s" => Some("Window"),
         _ => None,
     };
     let label = known.map(str::to_owned).unwrap_or_else(|| {
@@ -856,6 +888,8 @@ pub fn evidence_label(key: &str, v: f64) -> (String, String) {
         fmt_bytes(v.max(0.0) as u64)
     } else if key.ends_with("_usd") {
         fmt_usd(v)
+    } else if key.ends_with("_per_s") && key.contains("bytes") {
+        format!("{}/s", fmt_bytes(v.max(0.0) as u64))
     } else if key.ends_with("_per_s") {
         let unit = if key.contains("requests") {
             "requests/s"
@@ -948,7 +982,7 @@ mod tests {
         assert_eq!(l["Ceiling requests"], "2\u{202f}410 requests/s");
         assert_eq!(l["Extra requests per 1\u{202f}000 ops"], "−1\u{202f}031");
         assert!(l["Mean request size"].contains("KiB"), "{l:?}");
-        assert!(l["P99"].ends_with("ms"), "{l:?}");
+        assert!(l["Operation p99"].ends_with("ms"), "{l:?}");
         assert!(!l.keys().any(|k| k.contains('_')), "{l:?}");
     }
 }
