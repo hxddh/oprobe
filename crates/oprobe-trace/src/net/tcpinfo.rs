@@ -56,11 +56,27 @@ pub struct TcpProbe {
 
 impl TcpProbe {
     pub fn new(id: SockId) -> Self {
+        Self::new_seeded(id, false)
+    }
+
+    /// Create a probe for `id`. When `warm` is false (a freshly dialed connection), `last_rx`
+    /// and `last_tx` start at 0 so handshake bytes count once, and `last_retrans` is seeded
+    /// from the socket's post-handshake counter so retransmits on the first request are seen.
+    /// When `warm` is true (an already-pooled connection re-discovered after table eviction),
+    /// `last_rx` and `last_tx` are seeded from the socket's current totals so prior bytes are
+    /// never double-counted.
+    pub fn new_seeded(id: SockId, warm: bool) -> Self {
+        let initial = id.query();
+        let (last_retrans, last_rx, last_tx) = match (initial, warm) {
+            (Some(r), false) => (r.retrans, 0, 0),
+            (Some(r), true) => (r.retrans, r.bytes_received, r.bytes_acked),
+            (None, _) => (u64::MAX, 0, 0),
+        };
         Self {
             id,
-            last_retrans: AtomicU64::new(u64::MAX),
-            last_rx: AtomicU64::new(0),
-            last_tx: AtomicU64::new(0),
+            last_retrans: AtomicU64::new(last_retrans),
+            last_rx: AtomicU64::new(last_rx),
+            last_tx: AtomicU64::new(last_tx),
         }
     }
 
@@ -109,7 +125,14 @@ pub fn find(local: SocketAddr, remote: SocketAddr) -> Option<SockId> {
 }
 
 /// Whether this platform reports TCP statistics.
-pub const SUPPORTED: bool = cfg!(any(target_os = "linux", target_os = "macos"));
+pub const SUPPORTED: bool = cfg!(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "windows"
+));
+
+/// Whether this platform can locate an unowned socket by `(local, remote)` address.
+pub const FIND_SUPPORTED: bool = cfg!(any(target_os = "linux", target_os = "macos"));
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod imp {
@@ -382,7 +405,166 @@ mod imp {
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(target_os = "windows")]
+mod imp {
+    use std::mem::{MaybeUninit, size_of};
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+    use std::os::windows::io::AsRawSocket;
+
+    use windows_sys::Win32::Networking::WinSock::{
+        AF_INET, AF_INET6, SIO_TCP_INFO, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_STORAGE,
+        SOCKET, TCP_INFO_v0, TCP_INFO_v1, WSAIoctl, getpeername, getsockname,
+    };
+
+    use super::SockId;
+    use crate::rows::TcpRow;
+
+    fn to_addr(ss: &SOCKADDR_STORAGE) -> Option<SocketAddr> {
+        match ss.ss_family {
+            AF_INET => {
+                // SAFETY: family checked as AF_INET.
+                let a = unsafe { &*(ss as *const _ as *const SOCKADDR_IN) };
+                let ip = Ipv4Addr::from(u32::from_be(unsafe { a.sin_addr.S_un.S_addr }));
+                Some(SocketAddr::V4(SocketAddrV4::new(
+                    ip,
+                    u16::from_be(a.sin_port),
+                )))
+            }
+            AF_INET6 => {
+                // SAFETY: family checked as AF_INET6.
+                let a = unsafe { &*(ss as *const _ as *const SOCKADDR_IN6) };
+                let ip = Ipv6Addr::from(unsafe { a.sin6_addr.u.Byte });
+                Some(SocketAddr::V6(SocketAddrV6::new(
+                    ip,
+                    u16::from_be(a.sin6_port),
+                    a.sin6_flowinfo,
+                    unsafe { a.Anonymous.sin6_scope_id },
+                )))
+            }
+            _ => None,
+        }
+    }
+
+    type NameFn = unsafe extern "system" fn(SOCKET, *mut SOCKADDR, *mut i32) -> i32;
+
+    fn name_of(sock: SOCKET, f: NameFn) -> Option<SocketAddr> {
+        let mut ss = MaybeUninit::<SOCKADDR_STORAGE>::zeroed();
+        let mut len = size_of::<SOCKADDR_STORAGE>() as i32;
+        // SAFETY: read-only socket address query into an initialized buffer.
+        let rc = unsafe { f(sock, ss.as_mut_ptr() as *mut SOCKADDR, &mut len) };
+        if rc != 0 {
+            return None;
+        }
+        to_addr(unsafe { ss.assume_init_ref() })
+    }
+
+    fn same(a: SocketAddr, b: SocketAddr) -> bool {
+        a.ip() == b.ip() && a.port() == b.port()
+    }
+
+    pub fn sock_id_of(s: &tokio::net::TcpStream) -> Option<SockId> {
+        Some(SockId {
+            fd: s.as_raw_socket() as i64,
+            local: s.local_addr().ok()?,
+            remote: s.peer_addr().ok()?,
+        })
+    }
+
+    pub fn find(_: SocketAddr, _: SocketAddr) -> Option<SockId> {
+        // Probing arbitrary Win32 HANDLE values with getsockname can block on synchronous
+        // named pipes; Windows queries owned sockets (`sock_id_of`) only.
+        None
+    }
+
+    pub fn query(id: &SockId) -> Option<TcpRow> {
+        let sock = SOCKET::try_from(id.fd).ok()?;
+        let row = raw_v1(sock).or_else(|| raw_v0(sock))?;
+        let l = name_of(sock, getsockname)?;
+        let r = name_of(sock, getpeername)?;
+        (same(l, id.local) && same(r, id.remote)).then_some(row)
+    }
+
+    fn raw_v1(sock: SOCKET) -> Option<TcpRow> {
+        let ver: u32 = 1;
+        let mut info = MaybeUninit::<TCP_INFO_v1>::zeroed();
+        let mut returned: u32 = 0;
+        // SAFETY: unprivileged read-only WSAIoctl(SIO_TCP_INFO, version=1) on Windows 10 1709+.
+        let rc = unsafe {
+            WSAIoctl(
+                sock,
+                SIO_TCP_INFO,
+                &ver as *const u32 as *const _,
+                size_of::<u32>() as u32,
+                info.as_mut_ptr() as *mut _,
+                size_of::<TCP_INFO_v1>() as u32,
+                &mut returned,
+                std::ptr::null_mut(),
+                None,
+            )
+        };
+        if rc != 0 || (returned as usize) < size_of::<TCP_INFO_v0>() {
+            return None;
+        }
+        let i = unsafe { info.assume_init() };
+        let mss = u64::from(i.Mss.max(1));
+        Some(TcpRow {
+            rtt_us: u64::from(i.RttUs),
+            rttvar_us: 0,
+            retrans: u64::from(i.BytesRetrans).div_ceil(mss) + u64::from(i.SynRetrans),
+            cwnd: (u64::from(i.Cwnd) / mss).max(1),
+            delivery_rate_bps: 0,
+            busy_us: 0,
+            rwnd_limited_us: u64::from(i.SndLimTimeRwin) * 1000,
+            sndbuf_limited_us: u64::from(i.SndLimTimeSnd) * 1000,
+            min_rtt_us: u64::from(i.MinRttUs),
+            notsent_bytes: 0,
+            unacked_count: u64::from(i.BytesInFlight).div_ceil(mss),
+            lost_count: u64::from(i.FastRetrans),
+            bytes_acked: i.BytesOut,
+            pacing_rate_bps: 0,
+            bytes_received: i.BytesIn,
+        })
+    }
+
+    fn raw_v0(sock: SOCKET) -> Option<TcpRow> {
+        let ver: u32 = 0;
+        let mut info = MaybeUninit::<TCP_INFO_v0>::zeroed();
+        let mut returned: u32 = 0;
+        // SAFETY: unprivileged read-only WSAIoctl(SIO_TCP_INFO, version=0).
+        let rc = unsafe {
+            WSAIoctl(
+                sock,
+                SIO_TCP_INFO,
+                &ver as *const u32 as *const _,
+                size_of::<u32>() as u32,
+                info.as_mut_ptr() as *mut _,
+                size_of::<TCP_INFO_v0>() as u32,
+                &mut returned,
+                std::ptr::null_mut(),
+                None,
+            )
+        };
+        if rc != 0 || (returned as usize) < size_of::<TCP_INFO_v0>() {
+            return None;
+        }
+        let i = unsafe { info.assume_init() };
+        let mss = u64::from(i.Mss.max(1));
+        Some(TcpRow {
+            rtt_us: u64::from(i.RttUs),
+            rttvar_us: 0,
+            retrans: u64::from(i.BytesRetrans).div_ceil(mss) + u64::from(i.SynRetrans),
+            cwnd: (u64::from(i.Cwnd) / mss).max(1),
+            min_rtt_us: u64::from(i.MinRttUs),
+            unacked_count: u64::from(i.BytesInFlight).div_ceil(mss),
+            lost_count: u64::from(i.FastRetrans),
+            bytes_acked: i.BytesOut,
+            bytes_received: i.BytesIn,
+            ..Default::default()
+        })
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 mod imp {
     use std::net::SocketAddr;
 
@@ -425,9 +607,11 @@ mod tests {
             return;
         }
         let id = id.unwrap();
-        // Found by identity like the OpenDAL-mode lookup does.
-        let found = find(id.local, id.remote).expect("socket found by its addresses");
-        assert_eq!(found.fd, id.fd);
+        if FIND_SUPPORTED {
+            // Found by identity like the OpenDAL-mode lookup does.
+            let found = find(id.local, id.remote).expect("socket found by its addresses");
+            assert_eq!(found.fd, id.fd);
+        }
         let row = id.query().expect("tcp info of a live connection");
         assert!(row.cwnd > 0, "{row:?}");
         // A wrong identity on the same descriptor is rejected.

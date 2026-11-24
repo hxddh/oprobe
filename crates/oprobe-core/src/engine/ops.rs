@@ -193,7 +193,25 @@ pub async fn execute(
             let data = ctx.pool.slice(rng, size.as_usize());
             let len = data.len() as u64;
             let crc = (ctx.verify && slot.is_multiple_of(16)).then(|| crate::util::crc32c(&data));
-            ctx.op.write(&path, data).await?;
+            if spec.write.is_default() {
+                ctx.op.write(&path, data).await?;
+            } else {
+                let mut w = ctx.op.writer_with(&path);
+                if let Some(c) = spec.write.chunk {
+                    w = w.chunk(c.as_usize());
+                }
+                if let Some(c) = spec.write.concurrent {
+                    w = w.concurrent(c);
+                }
+                let mut w = w.await?;
+                let mut off = 0;
+                while off < data.len() {
+                    let end = (off + piece).min(data.len());
+                    w.write(data.slice(off..end)).await?;
+                    off = end;
+                }
+                w.close().await?;
+            }
             if ctx.state.unique_writes {
                 ctx.state.push_deletable(path.clone());
             } else if let Some(crc) = crc {

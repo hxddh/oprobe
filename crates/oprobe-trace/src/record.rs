@@ -273,10 +273,15 @@ pub struct RequestRecord {
 
 impl RequestRecord {
     pub fn is_throttle(&self) -> bool {
-        matches!(self.status, 429 | 503)
+        self.status == 429
+            || (self.status == 503
+                && !matches!(
+                    self.detail.as_deref().and_then(|d| d.error_code.as_deref()),
+                    Some("InternalError" | "ServiceUnavailable")
+                ))
     }
     pub fn is_error(&self) -> bool {
-        self.status == 0 || self.status >= 400
+        self.status == 0 || self.status >= 400 || self.error.is_some()
     }
 }
 

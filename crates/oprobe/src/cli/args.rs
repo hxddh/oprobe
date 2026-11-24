@@ -239,6 +239,9 @@ pub struct ProveArgs {
     /// A/B pairs at most (default 6; at least 3, the fewest that can decide)
     #[arg(long, value_name = "N", value_parser = at_least::<3>, hide = true)]
     pub pairs: Option<usize>,
+    /// Save the proven operator to an op.toml file or [operators.NAME] when improved
+    #[arg(long, value_name = "FILE|OPERATOR")]
+    pub save: Option<String>,
     #[command(flatten)]
     pub safety: ProveSafetyArgs,
 }
@@ -304,19 +307,19 @@ pub enum ByArg {
 
 #[derive(Args, Debug)]
 pub struct ShowArgs {
-    /// The run: id, id prefix, `last`, `last~N`, or a .oprobe / report .json file (or a prove id)
+    /// Stored run(s), file(s) or a prove id; pass two or more runs to compare side by side
     #[arg(value_name = "RUN|FILE")]
-    pub run: Option<String>,
+    pub runs: Vec<String>,
     /// List the stored runs (prove trials are hidden; --all lists them)
-    #[arg(long, conflicts_with_all = ["rm", "detail", "by"])]
+    #[arg(long, conflicts_with_all = ["rm", "detail", "by", "runs"])]
     pub list: bool,
     /// With --list: also the trial runs of every prove
     #[arg(long, requires = "list")]
     pub all: bool,
     /// Delete stored runs
-    #[arg(long, value_name = "RUN", num_args = 1.., conflicts_with_all = ["detail", "by"])]
+    #[arg(long, value_name = "RUN", num_args = 1.., conflicts_with_all = ["detail", "by", "runs"])]
     pub rm: Vec<String>,
-    /// Every section of the profile
+    /// Every section of the profile (or per-API breakdown when comparing runs)
     #[arg(long)]
     pub detail: bool,
     /// Group the requests: by stage, API or connection
@@ -342,6 +345,12 @@ pub struct LabArgs {
     /// Address to listen on
     #[arg(long, default_value = "127.0.0.1:9000", value_name = "ADDR")]
     pub bind: String,
+    /// Allow binding to a non-loopback address (unsafe on untrusted networks)
+    #[arg(long)]
+    pub allow_remote: bool,
+    /// Cap total in-memory object bytes stored by the lab (default 512MiB)
+    #[arg(long, value_name = "SIZE", value_parser = parse::nonzero_size)]
+    pub max_store_size: Option<String>,
 }
 
 #[cfg(test)]

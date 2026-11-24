@@ -6,6 +6,7 @@
 
 use std::cell::Cell;
 use std::fmt::Display;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 /// A language of the app.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -36,17 +37,38 @@ impl Lang {
     }
 }
 
+static GLOBAL: AtomicU8 = AtomicU8::new(0);
+
 thread_local! {
-    static CURRENT: Cell<Lang> = const { Cell::new(Lang::En) };
+    static OVERRIDE: Cell<Option<Lang>> = const { Cell::new(None) };
 }
 
-/// Make `l` the language [`tr`] answers in (the root re-draws the app after it).
+/// Set the process-wide UI language so off-thread workers (`jobs::off_thread`, `plan_view`)
+/// format strings in the user's selected language.
+pub fn set_global(l: Lang) {
+    GLOBAL.store(
+        match l {
+            Lang::En => 0,
+            Lang::Zh => 1,
+        },
+        Ordering::Relaxed,
+    );
+    OVERRIDE.with(|c| c.set(None));
+}
+
+/// Override [`tr`] on the calling thread (used by parallel unit tests and local scopes).
 pub fn set(l: Lang) {
-    CURRENT.with(|c| c.set(l));
+    OVERRIDE.with(|c| c.set(Some(l)));
 }
 
 pub fn current() -> Lang {
-    CURRENT.with(|c| c.get())
+    OVERRIDE.with(|c| {
+        c.get()
+            .unwrap_or_else(|| match GLOBAL.load(Ordering::Relaxed) {
+                1 => Lang::Zh,
+                _ => Lang::En,
+            })
+    })
 }
 
 /// The system's language: the platform's preferred languages and locale, else the locale
@@ -756,6 +778,25 @@ static EN: &[(&str, &str)] = &[
     ("sig.min_rtt", "min rtt"),
     ("sig.retransmits", "retransmits"),
     ("sig.server_timing", "Server-Timing"),
+    ("sig.tail_cut", "tail-cut"),
+    ("sig.aborted", "body"),
+    ("sig.cdn_pop", "edge PoP"),
+    ("sig.age", "cache age"),
+    ("sig.storage_class", "storage class"),
+    ("sig.encryption", "encryption"),
+    ("retry.tail_cuts", "Tail-cut hedged attempts"),
+    ("write.skew", "part straggler {}×"),
+    ("write.complete", "complete p99 {}"),
+    ("list.path", "Lists"),
+    (
+        "list.summary",
+        "{} pages across {} list ops ({} pages/op) · p50/p99 {} / {}",
+    ),
+    ("cache.title", "Client cache"),
+    ("cache.summary", "{} hit ({} of {} lookups, mean {})"),
+    ("operator.save_as_toml", "Save as op.toml…"),
+    ("operator.compare_trials", "Compare A/B trials"),
+    ("operator.stored_proves", "Stored proves · {}"),
 ];
 
 static ZH: &[(&str, &str)] = &[
@@ -1335,6 +1376,25 @@ static ZH: &[(&str, &str)] = &[
     ("sig.min_rtt", "最小 rtt"),
     ("sig.retransmits", "重传"),
     ("sig.server_timing", "Server-Timing"),
+    ("sig.tail_cut", "尾部裁剪"),
+    ("sig.aborted", "响应体"),
+    ("sig.cdn_pop", "边缘节点"),
+    ("sig.age", "缓存年龄"),
+    ("sig.storage_class", "存储类型"),
+    ("sig.encryption", "服务端加密"),
+    ("retry.tail_cuts", "Tail-cut 对冲尝试"),
+    ("write.skew", "分片长尾 {}×"),
+    ("write.complete", "合并完成 p99 {}"),
+    ("list.path", "列举"),
+    (
+        "list.summary",
+        "{} 页 / {} 次列举（{} 页/操作）· p50/p99 {} / {}",
+    ),
+    ("cache.title", "客户端缓存"),
+    ("cache.summary", "命中 {}（{}/{} 次查找，均值 {}）"),
+    ("operator.save_as_toml", "另存为 op.toml…"),
+    ("operator.compare_trials", "对比 A/B 试验"),
+    ("operator.stored_proves", "已保存的证明 · {}"),
 ];
 
 #[cfg(test)]

@@ -206,6 +206,9 @@ pub struct ResilienceStats {
     pub network_errors: u64,
     #[serde(rename = "failed_ops_count")]
     pub failed_ops: u64,
+    /// Requests actively cut by `TailCutLayer` to re-issue a faster attempt.
+    #[serde(rename = "tail_cuts_count", default, skip_serializing_if = "is_zero")]
+    pub tail_cuts: u64,
     #[serde(rename = "error_classes_count")]
     pub error_classes: BTreeMap<String, u64>,
 }

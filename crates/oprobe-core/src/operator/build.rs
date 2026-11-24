@@ -238,10 +238,22 @@ pub async fn apply_layers(op: Operator, spec: &OperatorSpec, observe: bool) -> R
 
 /// [`apply_layers`], reusing an already-warmed [`TailCutLayer`] when given.
 pub async fn apply_layers_with_tail_cut(
+    op: Operator,
+    spec: &OperatorSpec,
+    observe: bool,
+    shared_tail_cut: Option<TailCutLayer>,
+) -> Result<Operator> {
+    apply_layers_with_recorder(op, spec, observe, shared_tail_cut, None).await
+}
+
+/// [`apply_layers_with_tail_cut`], also observing in-memory cache lookups into `recorder`
+/// when `layers.cache` is enabled.
+pub async fn apply_layers_with_recorder(
     mut op: Operator,
     spec: &OperatorSpec,
     observe: bool,
     shared_tail_cut: Option<TailCutLayer>,
+    recorder: Option<std::sync::Arc<crate::trace::Recorder>>,
 ) -> Result<Operator> {
     let params = |name| layer_params(spec, name);
     if let Some(p) = params("throttle") {
@@ -268,11 +280,15 @@ pub async fn apply_layers_with_tail_cut(
         op = if observe {
             op.layer(layer.with_notify(|ev: opendal::layers::RetryEvent<'_>| {
                 if let Some(s) = OpScope::current() {
+                    let msg = ev.err.message();
+                    let cut = matches!(msg, "cancelled by tail cut" | "io cancelled by tail cut")
+                        || msg.contains("tail cut");
                     // 429/503 responses mark the scope throttled when they are recorded
                     // (`OpScope::push_request`); OpenDAL's kind covers the rest.
-                    s.record_retry(
+                    s.record_retry_with_cut(
                         ev.retry_after,
                         ev.err.kind() == opendal::ErrorKind::RateLimited,
+                        cut,
                     );
                 }
             }))
@@ -288,6 +304,9 @@ pub async fn apply_layers_with_tail_cut(
             .await
             .context("cannot build the in-memory foyer cache")?;
         op = op.layer(FoyerLayer::new(cache));
+        if observe && let Some(rec) = recorder {
+            op = op.layer(crate::trace::CacheObserveLayer::new(rec));
+        }
     }
     Ok(op)
 }

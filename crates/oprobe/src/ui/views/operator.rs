@@ -54,8 +54,9 @@ fn content(s: Store, m: Rc<ProfileModel>) -> View {
         v = v.child(section_of(s, name, fields, &m, &remedies, edited));
     }
     let has_file = m.operator_file.is_some();
+    let stored_proves = m.proves.clone();
     v.child(changes(s, m.clone(), edited))
-        .child(prove(s, has_file))
+        .child(prove(s, has_file, stored_proves))
 }
 
 fn remedy_list(s: Store, m: &ProfileModel) -> View {
@@ -308,10 +309,39 @@ fn changes(s: Store, m: Rc<ProfileModel>, edited: Edited) -> View {
     }))
 }
 
-fn prove(s: Store, has_file: bool) -> View {
+fn prove(s: Store, has_file: bool, stored_proves: Vec<crate::ui::jobs::Proved>) -> View {
+    let history =
+        (stored_proves.len() > 1).then(|| {
+            let count = stored_proves.len();
+            view()
+                .gap_1()
+                .test_id("stored-proves")
+                .child(caption(fill("operator.stored_proves", &[&count])))
+                .child(view().flex_row().flex_wrap().gap_2().children(
+                    stored_proves.into_iter().map(move |p| {
+                        let label = format!(
+                            "{} · {}",
+                            p.prove_id.rsplit('-').next().unwrap_or(&p.prove_id),
+                            p.change.first().map(String::as_str).unwrap_or("prove")
+                        );
+                        let p_clone = p.clone();
+                        btn(
+                            label,
+                            || Kind::Plain,
+                            move || {
+                                s.prove_state.set(Some(crate::ui::jobs::State {
+                                    outcome: Some(Outcome::Proved(Box::new(p_clone.clone()))),
+                                    ..Default::default()
+                                }));
+                            },
+                        )
+                    }),
+                ))
+        });
     section(tr("operator.prove"))
         .test_id("prove")
         .child(small(tr("operator.prove_hint")))
+        .child(history)
         .child(dynamic(move || {
             let edited = s.edits.with(|e| !e.is_empty());
             let finding = s.prove_finding.get();
@@ -385,8 +415,16 @@ fn prove(s: Store, has_file: bool) -> View {
         )
         .child(dynamic(move || {
             let st = s.prove_state.get();
-            let p99 = s.objective.get() == ProveObjective::P99;
-            untracked(|| st.map(|st| prove_state(s, st, p99, has_file)))
+            let live_p99 = s.objective.get() == ProveObjective::P99;
+            untracked(|| {
+                st.map(|st| {
+                    let p99 = match &st.outcome {
+                        Some(Outcome::Proved(p)) => p.objective == ProveObjective::P99,
+                        _ => live_p99,
+                    };
+                    prove_state(s, st, p99, has_file)
+                })
+            })
         }))
 }
 
@@ -467,16 +505,43 @@ fn prove_state(s: Store, st: crate::ui::jobs::State, p99: bool, has_file: bool) 
                 .child(code(p.rust.clone()))
                 .child((!p.toml.is_empty()).then(|| code(p.toml.clone())))
                 .child({
-                    let mut actions = copy_row(p.rust.clone(), p.toml.clone());
+                    let mut actions = copy_row(p.rust.clone(), p.toml.clone())
+                        .flex_wrap()
+                        .items_center();
                     if has_file && !p.change.is_empty() {
                         let change = p.change.clone();
+                        let run_id = p.run_id.clone();
                         actions = actions.child(
                             btn(
                                 tr("operator.save_toml"),
                                 || Kind::Plain,
-                                move || s.save_proven_to_file(&change),
+                                move || s.save_proven_to_file(&run_id, &change),
                             )
                             .test_id("save-operator"),
+                        );
+                    } else if !has_file && !p.change.is_empty() && !kit::in_terminal() {
+                        let change = p.change.clone();
+                        let run_id = p.run_id.clone();
+                        actions = actions.child(
+                            btn(
+                                tr("operator.save_as_toml"),
+                                || Kind::Plain,
+                                move || s.save_operator_as(&run_id, change.clone()),
+                            )
+                            .test_id("save-operator-as"),
+                        );
+                    }
+                    if let Some((a, b)) = p.trial_ids.clone()
+                        && s.run_file(&a).is_file()
+                        && s.run_file(&b).is_file()
+                    {
+                        actions = actions.child(
+                            btn(
+                                tr("operator.compare_trials"),
+                                || Kind::Plain,
+                                move || s.show_selection(vec![a.clone(), b.clone()]),
+                            )
+                            .test_id("compare-prove-trials"),
                         );
                     }
                     actions

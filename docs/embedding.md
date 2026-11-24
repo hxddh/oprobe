@@ -17,7 +17,7 @@ layers share one global meter).
 
 ```toml
 [dependencies]
-oprobe-trace = "7"
+oprobe-trace = "8"
 ```
 
 ```rust
@@ -40,6 +40,12 @@ let op = Operator::new(builder)?
 ```
 
 Without the notifier every attempt is an operation of its own, and retries are not counted.
+When you use a local cache layer (`FoyerLayer`, `MokaLayer`), wrap it with `handle.cache_layer()`
+so cache hits, hit bytes and lookup latency are recorded in `snapshot.cache` and `snapshot.bytes`:
+
+```rust
+let op = op.layer(foyer_layer).layer(handle.cache_layer());
+```
 
 ## What you get
 
@@ -96,7 +102,7 @@ let cfg = oprobe_trace::Config::default().exporter(std::sync::Arc::new(Slow));
 | `insecure_skip_verify(on)` | false | skip certificate verification (development only) |
 | `proxy(Some(url) \| None)` | the environment | an explicit `http://` proxy, or none |
 | `https(on)` | true | selects `HTTPS_PROXY` over `HTTP_PROXY` |
-| `tcp_info(on)` | true | read kernel TCP statistics at the end of each request (Linux, macOS) |
+| `tcp_info(on)` | true | read kernel TCP statistics at the end of each request (Linux, macOS, Windows) |
 | `exporter(e)` | none | your `Exporter` |
 
 `handle.transport_error()` says why HTTP requests are not instrumented, if the transport could not
@@ -157,17 +163,17 @@ is lost in the noise.
 
 ## Stability
 
-Within 7.x the API documented on docs.rs, the `oprobe.trace/7` file format and the meaning of
+Within 8.x the API documented on docs.rs, the `oprobe.trace/8` file format and the meaning of
 every field are stable: changes are additive. Public structs and enums are `#[non_exhaustive]`,
 so read fields freely but build `Config` with its methods. The `__internal` feature exists for the
 oprobe binary and has no semver promise; do not enable it.
 
 ## The file
 
-`oprobe.trace/7` is one JSON document, readable without oprobe:
+`oprobe.trace/8` is one JSON document, readable without oprobe:
 
 ```text
-{ "format": "oprobe.trace/7", "oprobe_trace_version": "7.0.0", "created_at": "…",
+{ "format": "oprobe.trace/8", "oprobe_trace_version": "8.0.0", "created_at": "…",
   "service": { "scheme": "s3", "name": "my-bucket", "root": "/data/" },
   "snapshot": { … }, "rows": { "ops": [ … ], "reqs": [ … ], "info": { … }, "sampling": { … } } }
 ```
@@ -186,7 +192,7 @@ hot keys still slice the traffic, and repeated reads are still told apart, but t
 holds a key. Request IDs and remote addresses can be in it; credentials never are. Treat a
 profile like a log file before you paste it into an issue.
 
-**Migrating from 6.x.** `oprobe.trace/6` files still open: they hold requests only, so each
-request counts as one operation there, and the report says so. A 7.x file counts operations;
-request counts are no longer labelled as operations. `TraceLayer` wraps every service now, not
+**Migrating from 7.x and 6.x.** `oprobe.trace/7` and `oprobe.trace/6` files still open (`oprobe.trace/7`
+with full operation fidelity; `oprobe.trace/6` holds requests only, so each
+request counts as one operation there, and the report says so). `TraceLayer` wraps every service now, not
 only `memory` and `fs`.

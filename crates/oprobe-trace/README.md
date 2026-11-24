@@ -17,7 +17,8 @@ handle.save("prod.oprobe")?; // then: oprobe show prod.oprobe
 - **The API:** `layer(Config) -> (TraceLayer, Handle)`, `Handle::snapshot()` for the aggregates
   (per API and stage, per verb, connections, bytes, timeline), `Handle::save(path)` /
   `Handle::save_and_reset(path)` / `Snapshot::save(path)` for a `.oprobe` file (format
-  `oprobe.trace/7`, one JSON document; 6.x files still open).
+  `oprobe.trace/8`, one JSON document; 7.x and 6.x files still open); `Handle::cache_layer()`
+  records local cache hits (`FoyerLayer`, `MokaLayer`).
 - **Your own sink:** implement `Exporter` and pass it with `Config::exporter`. With the `otel`
   feature (opentelemetry 0.32), `otel::OtelExporter` records `http.client.request.duration` with
   `oprobe.stage` and `oprobe.api` attributes and OpenDAL's `scheme`, `namespace`, `root` and
@@ -30,7 +31,7 @@ handle.save("prod.oprobe")?; // then: oprobe show prod.oprobe
 - **Cheap:** `cargo bench -p oprobe-trace --bench overhead` compares the same operations with
   and without the layer; the budget is 2 µs per operation.
 - **Stable:** the documented API, the file format and the meaning of every field are stable
-  across 7.x; public structs and enums are `#[non_exhaustive]`.
+  across 8.x; public structs and enums are `#[non_exhaustive]`.
 - **Requires:** OpenDAL 0.59, Tokio, Rust 1.97.
 
 Features: `otel` (OpenTelemetry metrics), `schemars` (`JsonSchema` for the snapshot types).

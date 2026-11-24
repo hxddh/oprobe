@@ -1,23 +1,23 @@
 //! The `.oprobe` file a traced operator writes ([`crate::Handle::save`],
-//! [`crate::Snapshot::save`]): format `oprobe.trace/7`, which `oprobe show FILE` and the
+//! [`crate::Snapshot::save`]): format `oprobe.trace/8`, which `oprobe show FILE` and the
 //! workbench open like any other profile.
 //!
 //! It is one JSON document, so it can be read without oprobe:
 //!
 //! ```text
 //! {
-//!   "format": "oprobe.trace/7",
-//!   "oprobe_trace_version": "7.0.0",
-//!   "created_at": "2026-11-22T10:00:00Z",
+//!   "format": "oprobe.trace/8",
+//!   "oprobe_trace_version": "8.0.0",
+//!   "created_at": "2026-11-24T10:00:00Z",
 //!   "service": { "scheme": "s3", "name": "my-bucket", "root": "/data/" },   // optional
 //!   "snapshot": { … the aggregates: per API and stage, connections, bytes, timeline … },
 //!   "rows": { "ops": [ … ], "reqs": [ … ], "info": { … }, "sampling": { … } }   // optional
 //! }
 //! ```
 //!
-//! The format is stable across 7.x: fields are only ever added. `oprobe.trace/7` holds the
+//! The format is stable across 8.x: fields are only ever added. `oprobe.trace/8` holds the
 //! application's operations (`rows.ops`), each request linked to the operation that issued it;
-//! an `oprobe.trace/6` file (requests only) still reads ([`TRACE_FORMATS_READ`]).
+//! `oprobe.trace/7` and `oprobe.trace/6` files still read ([`TRACE_FORMATS_READ`]).
 
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
@@ -30,10 +30,10 @@ use crate::rows::{OpRow, ReqRow, TraceInfo};
 use crate::sample::SamplingStats;
 
 /// The `format` of a file written by `oprobe-trace`.
-pub const TRACE_FORMAT: &str = "oprobe.trace/7";
+pub const TRACE_FORMAT: &str = "oprobe.trace/8";
 
-/// The formats [`TraceFile`] reads: this one and 6.x files (requests without operations).
-pub const TRACE_FORMATS_READ: &[&str] = &[TRACE_FORMAT, "oprobe.trace/6"];
+/// The formats [`TraceFile`] reads: this one plus 7.x and 6.x files.
+pub const TRACE_FORMATS_READ: &[&str] = &[TRACE_FORMAT, "oprobe.trace/7", "oprobe.trace/6"];
 
 /// The OpenDAL service the traced operator talks to, as the layer saw it (the first operator
 /// the layer was applied to). No options or credentials: the scheme, the service's name (the
@@ -166,7 +166,7 @@ impl TraceFile {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "`{what}` is format `{}`, not `{TRACE_FORMAT}` or `oprobe.trace/6`",
+                    "`{what}` is format `{}`, not `{TRACE_FORMAT}`, `oprobe.trace/7` or `oprobe.trace/6`",
                     self.format
                 ),
             ));
@@ -229,14 +229,14 @@ mod tests {
 
     #[test]
     fn this_major_and_6x_files_read() {
-        assert_eq!(TRACE_FORMAT, "oprobe.trace/7");
-        for f in ["oprobe.trace/7", "oprobe.trace/6"] {
+        assert_eq!(TRACE_FORMAT, "oprobe.trace/8");
+        for f in ["oprobe.trace/8", "oprobe.trace/7", "oprobe.trace/6"] {
             let t = TraceFile::from_slice(&doc(f), "x").unwrap();
             assert_eq!(t.format, f);
             assert!(t.has_rows());
         }
-        let e = TraceFile::from_slice(&doc("oprobe.trace/8"), "x").unwrap_err();
-        assert!(e.to_string().contains("oprobe.trace/8"), "{e}");
+        let e = TraceFile::from_slice(&doc("oprobe.trace/9"), "x").unwrap_err();
+        assert!(e.to_string().contains("oprobe.trace/9"), "{e}");
         assert!(TraceFile::from_slice(&doc("oprobe.run/6"), "x").is_err());
     }
 }

@@ -56,7 +56,7 @@ pub use input::*;
 pub use lab::LabOutput;
 pub use prove::{ProveObjective, ProveOutcome, ProveOutput, ProveRequest, ProveVerdict};
 pub use run::{PlanOutput, RunOutput, RunPlan, RunSet};
-pub use runs::{Profile, RemovedRuns, RunList, TrashedRuns};
+pub use runs::{Comparison, Profile, RemovedRuns, RunList, TrashedRuns};
 
 /// Where a command's log lines, warnings, progress and events go: [`crate::output::Output`].
 /// Front ends that consume events in-process use `EventSink::silent()` and `sink.bus()`.
@@ -386,6 +386,11 @@ impl App {
         runs::show(self, &r)
     }
 
+    /// Compare two or more stored runs or `.oprobe` files side by side (`oprobe show A B`).
+    pub fn compare(&self, r: &[RunRef], detail: bool) -> Result<Comparison> {
+        runs::compare(self, r, detail)
+    }
+
     /// The stored prove `r` names (`oprobe show PROVE_ID`), or `None` when it names no prove.
     pub fn show_prove(&self, r: &RunRef) -> Result<Option<runs::ShownProve>> {
         runs::show_prove(self, r)
@@ -451,6 +456,67 @@ impl App {
         spec.validate()?;
         crate::store::atomic_write(path, spec.to_toml().as_bytes())?;
         Ok(spec)
+    }
+
+    /// Save an operator `base` with `edits` applied either to an `op.toml` file (creating or
+    /// updating it in place) or to `[operators.NAME]` in `config.toml` when `dest` is a bare
+    /// operator name. Returns a short human description of where it was written.
+    pub fn save_operator_target(
+        &self,
+        dest: &str,
+        base: &crate::operator::OperatorSpec,
+        edits: &[String],
+    ) -> Result<String> {
+        let dest = dest.trim();
+        if dest.is_empty() {
+            return Err(
+                OprobeError::new(ErrorCode::UsageInvalidArgument, "empty --save target")
+                    .with_hint("pass an op.toml path or an operator name for config.toml")
+                    .into(),
+            );
+        }
+        let path = std::path::Path::new(dest);
+        let is_file_target = dest.ends_with(".toml")
+            || dest.contains('/')
+            || dest.contains(std::path::MAIN_SEPARATOR)
+            || path.is_file();
+        let mut pairs = Vec::with_capacity(edits.len());
+        for e in edits {
+            let (k, v) = crate::input::key_value("edit", e)?;
+            if v.trim() != crate::model::spec::REDACTED {
+                pairs.push((k, v));
+            }
+        }
+        if is_file_target {
+            if path.is_file() {
+                self.save_operator_edits(path, edits)?;
+            } else {
+                let mut spec = base.clone();
+                // Strip redacted placeholders when writing a brand-new op.toml so it parses
+                // cleanly with ambient credentials.
+                spec.options
+                    .retain(|_, v| v.trim() != crate::model::spec::REDACTED);
+                spec.apply_edits(&pairs)?;
+                spec.validate()?;
+                crate::store::atomic_write(path, spec.to_toml().as_bytes())?;
+            }
+            return Ok(dest.to_owned());
+        }
+        let mut cfg = ConfigFile::load(&self.paths.config_file)?;
+        let mut spec = cfg.operators.get(dest).cloned().unwrap_or_else(|| {
+            let mut b = base.clone();
+            b.options
+                .retain(|_, v| v.trim() != crate::model::spec::REDACTED);
+            b
+        });
+        spec.apply_edits(&pairs)?;
+        spec.validate()?;
+        cfg.operators.insert(dest.to_owned(), spec);
+        cfg.save(&self.paths.config_file)?;
+        Ok(format!(
+            "[operators.{dest}] in {}",
+            self.paths.config_file.display()
+        ))
     }
 
     /// The run ids `r` names (to report what [`App::rm`] removes).

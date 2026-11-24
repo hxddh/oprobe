@@ -1036,7 +1036,41 @@ fn small_ranges(c: &Ctx, have_cap: bool) -> Option<Finding> {
     let ttfb: f64 = reads.iter().map(|q| (q.send_us + q.ttfb_us) as f64).sum();
     let body: f64 = reads.iter().map(|q| q.body_us as f64).sum();
     let gap_set = c.spec().read.gap.is_some();
+    let small_gap = c.spec().read.gap.is_some_and(|g| g.0 < 256 * 1024);
     let concurrent = c.spec().read_concurrent();
+    // Many tiny uncoalesced ranges per operation (or already concurrent small ranges without
+    // coalescing), waiting for the first byte: coalesce adjacent ranges first so `read.gap`
+    // is not shadowed by `read.concurrent = 1`.
+    let coalesce_first =
+        mean < 64.0 * 1024.0 || small_gap || (concurrent > 1 && mean < 256.0 * 1024.0);
+    if reads.len() >= 50
+        && per_op >= 3.0
+        && mean < 256.0 * 1024.0
+        && ttfb / total >= 0.5
+        && coalesce_first
+        && (!gap_set || small_gap)
+    {
+        return Some(Finding {
+            code: "small_ranges".into(),
+            severity: Severity::Warning,
+            confidence: Confidence::Medium,
+            cause: "Each read is many small range requests, each paying a full round trip.".into(),
+            evidence: Evidence {
+                text: format!(
+                    "{per_op:.1} range requests per read operation, {} on average; {:.0}% of their time waits for the first byte",
+                    crate::util::fmt_bytes(mean as u64),
+                    ttfb * 100.0 / total
+                ),
+                values: values(&[
+                    ("requests_per_op_mean", per_op),
+                    ("mean_request_bytes", mean),
+                    ("ttfb_pct", ttfb * 100.0 / total),
+                ]),
+                ..Default::default()
+            },
+            remedy: remedy("small_ranges", Some("gap")),
+        });
+    }
     // Several ranges per operation fetched one after another, each waiting for its first
     // byte: fetch them concurrently.
     if reads.len() >= 50 && per_op >= 3.0 && ttfb / total >= 0.5 && concurrent <= 1 {
@@ -1135,11 +1169,20 @@ fn slow_multipart(c: &Ctx) -> Option<Finding> {
     if parts.len() < 10 || c.spec().write_concurrent() > 1 {
         return None;
     }
+    let part_ops: std::collections::HashSet<u64> = parts
+        .iter()
+        .filter(|q| q.op_id != 0)
+        .map(|q| q.op_id)
+        .collect();
     let writes: Vec<&crate::model::OpRow> = c
         .run
         .ops
         .iter()
-        .filter(|o| o.t_us >= 0 && o.verb.contains("multipart"))
+        .filter(|o| {
+            o.t_us >= 0
+                && (o.verb.contains("multipart")
+                    || (o.verb.starts_with("write") && part_ops.contains(&o.op_id)))
+        })
         .collect();
     if writes.is_empty() {
         return None;

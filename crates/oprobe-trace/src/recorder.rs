@@ -538,22 +538,31 @@ impl Agg {
 
     fn record_request(&mut self, r: &RequestRecord) {
         self.requests += 1;
-        if r.reused {
-            self.reused_requests += 1;
+        let is_cut = r.detail.as_deref().is_some_and(|d| d.cut);
+        if is_cut {
+            self.res.tail_cuts += 1;
         }
-        match r.protocol {
-            Protocol::Http1 => self.h1_requests += 1,
-            Protocol::Http2 => self.h2_requests += 1,
-            Protocol::InProcess => {}
+        let connected = r.conn_id > 0 || r.status != 0 || r.protocol == Protocol::InProcess;
+        if connected {
+            if r.reused {
+                self.reused_requests += 1;
+            }
+            match r.protocol {
+                Protocol::Http1 => self.h1_requests += 1,
+                Protocol::Http2 => self.h2_requests += 1,
+                Protocol::InProcess => {}
+            }
         }
         self.bytes.backend_down += r.bytes_down;
         self.bytes.backend_up += r.bytes_up;
         match r.status {
-            0 => self.res.network_errors += 1,
+            0 if !is_cut => self.res.network_errors += 1,
+            0 => {}
             429 => self.res.status_429 += 1,
-            503 => self.res.status_503 += 1,
+            503 if r.is_throttle() => self.res.status_503 += 1,
             s if s >= 500 => self.res.server_errors += 1,
             s if s >= 400 && s != 404 => self.res.client_errors += 1,
+            _ if r.error.is_some() && !is_cut => self.res.network_errors += 1,
             _ => {}
         }
         if r.is_throttle() {

@@ -407,6 +407,12 @@ fn write_line(w: &crate::report::view::WritePathView) -> String {
             &[&fmt::count(w.parts_count), &fmt::bytes(m)],
         ));
     }
+    if let Some(sk) = w.part_skew_ratio.filter(|x| *x >= 1.25) {
+        parts.push(fill("write.skew", &[&fmt::sig3(sk)]));
+    }
+    if let Some(ms) = w.complete_p99_ms {
+        parts.push(fill("write.complete", &[&fmt::dur_ms(ms)]));
+    }
     parts.join(" · ")
 }
 
@@ -424,10 +430,27 @@ fn requests(m: &Rc<ProfileModel>, cx: Ctx) -> Option<View> {
         .as_ref()
         .filter(|w| w.shown())
         .map(|w| prop(tr("write.path"), write_line(w)).test_id("write-path"));
+    let lists = m.list_path.as_ref().map(|lp| {
+        prop(
+            tr("list.path"),
+            fill(
+                "list.summary",
+                &[
+                    &fmt::count(lp.pages_count),
+                    &fmt::count(lp.list_ops_count),
+                    &fmt::sig3(lp.pages_per_op),
+                    &fmt::dur_ms(lp.page_p50_ms),
+                    &fmt::dur_ms(lp.page_p99_ms),
+                ],
+            ),
+        )
+        .test_id("list-path")
+    });
     Some(
         section(tr("profile.requests"))
             .test_id("requests")
             .child(writes)
+            .child(lists)
             .child(m.has_rows().then(|| small(tr("drill.api_hint"))))
             .child(dynamic(move || {
                 let r = cx.range.get();
@@ -653,6 +676,7 @@ fn retries(m: &ProfileModel) -> View {
     section(tr("profile.retries"))
         .test_id("retries")
         .child(prop(tr("retry.retries"), n(r.retries_count)))
+        .child((r.tail_cuts_count > 0).then(|| prop(tr("retry.tail_cuts"), n(r.tail_cuts_count))))
         .child(prop(tr("retry.backoff"), fmt::dur_ms(r.backoff_ms)))
         .child(prop(
             tr("retry.throttled"),
@@ -729,6 +753,21 @@ fn details(m: &ProfileModel) -> View {
                 (b.cache_hit_bytes > 0)
                     .then(|| prop(tr("bytes.cache"), fmt::bytes(b.cache_hit_bytes))),
             )
+            .child(m.cache.as_ref().map(|cv| {
+                prop(
+                    tr("cache.title"),
+                    fill(
+                        "cache.summary",
+                        &[
+                            &fmt::ratio(cv.hit_ratio),
+                            &fmt::count(cv.hits_count),
+                            &fmt::count(cv.lookups_count),
+                            &fmt::dur_ms(cv.lookup_mean_ms),
+                        ],
+                    ),
+                )
+                .test_id("details-cache")
+            }))
             .child(prop(
                 tr("bytes.amplification"),
                 fill(

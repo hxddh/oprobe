@@ -903,18 +903,66 @@ fn chart_with(
         cursor.set(xv);
     })
     .on_mouse_leave(move |_: &MouseEvent| cursor.set(None));
+    let focused = signal(false);
+    if let Some(link) = link {
+        let plot_k = plot;
+        effect(move || {
+            if !focused.get() {
+                return;
+            }
+            let opts = KeyOptions {
+                when: nsh_core::keymap::When::NotEditing,
+                repeat: true,
+                for_focus: true,
+                ..Default::default()
+            };
+            let step_by = move |dir: f64, extend: bool| {
+                plot_k.with_untracked(|p| {
+                    let Some(p) = p else { return };
+                    let step = p.step_w.max(0.1);
+                    let cur = link.cursor.get_untracked().unwrap_or(p.x.min);
+                    let next = (cur + dir * step).clamp(p.x.min, (p.x.max - step).max(p.x.min));
+                    link.cursor.set(Some(next));
+                    if extend {
+                        let (a, b) = link.range.get_untracked().unwrap_or((cur, cur + step));
+                        let lo = a.min(next).max(p.x.min);
+                        let hi = b.max(next + step).min(p.x.max);
+                        if hi > lo {
+                            link.range.set(Some((lo, hi)));
+                        }
+                    }
+                });
+            };
+            on_key_with("left", opts, move |_| step_by(-1.0, false));
+            on_key_with("right", opts, move |_| step_by(1.0, false));
+            on_key_with("shift+left", opts, move |_| step_by(-1.0, true));
+            on_key_with("shift+right", opts, move |_| step_by(1.0, true));
+            on_key_with("enter", opts, move |_| {
+                plot_k.with_untracked(|p| {
+                    let Some(p) = p else { return };
+                    let step = p.step_w.max(0.1);
+                    let cur = link.cursor.get_untracked().unwrap_or(p.x.min);
+                    let hi = (cur + step).min(p.x.max);
+                    if hi > cur {
+                        link.range.set(Some((cur, hi)));
+                    }
+                });
+            });
+        });
+    }
     let overlay = match link {
-        Some(link) => {
-            overlay
-                .claim_touches(TouchClaim::on_start())
-                .on_touch(move |e: &TouchEvent| {
-                    let (w, h) = size.get_untracked();
-                    let to_t = |hx: f32| {
-                        plot.with_untracked(|p| p.as_ref().and_then(|p| x_at(p, w, h, hx)))
-                    };
-                    on_brush(e, link, gesture, &to_t, &|_, _| {});
-                })
-        }
+        Some(link) => overlay
+            .focusable(true)
+            .focus_visible(kit::ring)
+            .on_focus(move || focused.set(true))
+            .on_blur(move || focused.set(false))
+            .claim_touches(TouchClaim::on_start())
+            .on_touch(move |e: &TouchEvent| {
+                let (w, h) = size.get_untracked();
+                let to_t =
+                    |hx: f32| plot.with_untracked(|p| p.as_ref().and_then(|p| x_at(p, w, h, hx)));
+                on_brush(e, link, gesture, &to_t, &|_, _| {});
+            }),
         None => overlay,
     };
     view()

@@ -113,6 +113,48 @@ struct OpState {
     started: Instant,
     read: u64,
     written: u64,
+    in_process: bool,
+}
+
+/// Coalesces chunked or multi-range `oio::Read::read` calls issued on one `OpReader` (OpenDAL's
+/// `Reader::fetch` and concurrent chunked reads) into a single logical read operation.
+const READ_COALESCE_IDLE: std::time::Duration = std::time::Duration::from_millis(5);
+
+struct ReadGroup {
+    st: OpState,
+    active: usize,
+    calls: usize,
+    last_end: Option<Instant>,
+    error: Option<Error>,
+}
+
+/// Shared slot registered with [`Linker`] while an [`OpReader`] holds a coalesced [`ReadGroup`],
+/// so [`Linker::flush`] (`Handle::snapshot`) completes finished bursts even before the caller
+/// drops its `Reader`.
+struct ReadSlot {
+    group: Mutex<Option<ReadGroup>>,
+    obs: Observer,
+}
+
+impl ReadSlot {
+    fn flush_idle(&self) {
+        let done = {
+            let mut g = self.group.lock().unwrap_or_else(|e| e.into_inner());
+            if g.as_ref().is_some_and(|x| x.active == 0) {
+                g.take()
+            } else {
+                None
+            }
+        };
+        if let Some(g) = done {
+            let end = g.last_end.unwrap_or_else(Instant::now);
+            self.obs.finish_at(g.st, end, g.error.as_ref(), g.calls == 1);
+        }
+    }
+}
+
+fn same_op_family(a: &str, b: &str) -> bool {
+    a == b || (a.starts_with("read.") && b.starts_with("read."))
 }
 
 /// Where a call runs: its Tokio task, or (a future driven by `block_on`, which never moves) its
@@ -148,6 +190,8 @@ pub struct Linker {
     /// Multi-call operations (writers, listers, …) whose last call failed temporarily: the
     /// scope a retry notification on that task belongs to.
     scopes: Mutex<HashMap<Key, Arc<OpScope>>>,
+    /// Active [`OpReader`] slots holding coalesced chunked/range reads.
+    readers: Mutex<Vec< std::sync::Weak<ReadSlot> >>,
 }
 
 impl std::fmt::Debug for Linker {
@@ -170,8 +214,23 @@ impl Linker {
     }
 
     /// Complete every parked call that is not being retried, or whose retry never came
-    /// (before a snapshot).
+    /// (before a snapshot), plus any idle coalesced [`OpReader`] bursts.
     pub fn flush(&self, rec: &Recorder) {
+        let slots: Vec<Arc<ReadSlot>> = {
+            let mut r = self.readers.lock().unwrap_or_else(|e| e.into_inner());
+            let mut live = Vec::with_capacity(r.len());
+            r.retain(|w| match w.upgrade() {
+                Some(s) => {
+                    live.push(s);
+                    true
+                }
+                None => false,
+            });
+            live
+        };
+        for s in slots {
+            s.flush_idle();
+        }
         if !self.enabled() {
             return;
         }
@@ -237,9 +296,10 @@ impl RetryNotify {
     /// The retry layer is about to wait `backoff` before retrying after `err`.
     pub fn retrying(&self, err: &Error, backoff: std::time::Duration) {
         let throttled = err.kind() == ErrorKind::RateLimited;
+        let tail_cut = err.message().contains("tail cut");
         // The trace layer above the retry layer: the operation is the current scope.
         if let Some(s) = OpScope::current() {
-            s.record_retry(backoff, throttled);
+            s.record_retry_with_cut(backoff, throttled, tail_cut);
             return;
         }
         let id = key();
@@ -251,11 +311,12 @@ impl RetryNotify {
             .and_then(|calls| calls.iter_mut().rev().find(|p| !p.retrying))
         {
             p.retrying = true;
-            p.op.scope.record_retry(backoff, throttled);
+            p.op.scope
+                .record_retry_with_cut(backoff, throttled, tail_cut);
             return;
         }
         if let Some(s) = self.linker.scopes().remove(&id) {
-            s.record_retry(backoff, throttled);
+            s.record_retry_with_cut(backoff, throttled, tail_cut);
             return;
         }
         self.recorder.record_unscoped_retry(backoff);
@@ -270,9 +331,32 @@ impl opendal_layer_retry::RetryInterceptor for RetryNotify {
 
 /// Hand a completed operation to the recorder.
 fn complete(rec: &Recorder, st: OpState, end: Instant, error: Option<String>) {
-    let data = st.scope.take();
+    let mut data = st.scope.take();
+    let latency_us = end.saturating_duration_since(st.started).as_micros() as u64;
+    if !st.in_process
+        && error.is_none()
+        && st.verb.starts_with("read")
+        && data.requests.is_empty()
+        && data.dropped_requests == 0
+        && data.cache_lookups == 0
+    {
+        rec.set_cache_enabled(true);
+        data.cache_lookups = 1;
+        data.cache_hits = 1;
+        data.cache_hit_bytes = st.read;
+        data.cache_lookup_us = latency_us;
+    }
     let verb = match st.verb {
-        "write" if data.requests.iter().any(|r| r.api == Api::UploadPart) => "write.multipart",
+        "write"
+            if data.requests.iter().any(|r| {
+                matches!(
+                    r.api,
+                    Api::UploadPart | Api::CreateMultipart | Api::CompleteMultipart
+                )
+            }) =>
+        {
+            "write.multipart"
+        }
         v => v,
     };
     rec.complete_op(
@@ -281,7 +365,7 @@ fn complete(rec: &Recorder, st: OpState, end: Instant, error: Option<String>) {
             verb,
             op_id: st.scope.id,
             started: st.started,
-            latency_us: end.saturating_duration_since(st.started).as_micros() as u64,
+            latency_us,
             logical_read: st.read,
             logical_write: st.written,
             error,
@@ -296,6 +380,7 @@ fn complete(rec: &Recorder, st: OpState, end: Instant, error: Option<String>) {
 struct Observer {
     recorder: Arc<Recorder>,
     linker: Arc<Linker>,
+    in_process: bool,
 }
 
 impl Observer {
@@ -312,14 +397,13 @@ impl Observer {
             for p in self.linker.take_not_retried(id) {
                 complete(&self.recorder, p.op, p.ended, Some(p.error));
             }
-            // The retry of a parked call: the retry layer calls again with the same verb and
-            // path. Other calls of the task marked retrying may be waiting out their backoff
-            // concurrently (`join_all`): they stay parked.
+            // The retry of a parked call: the retry layer calls again with the same verb family
+            // (a mid-stream `read.full` retry resumes with `read.range`) and path.
             let mut parked = self.linker.parked();
             if let Some(calls) = parked.get_mut(&id)
                 && let Some(i) = calls
                     .iter()
-                    .position(|p| p.op.verb == verb && p.op.key == key_of_path)
+                    .position(|p| same_op_family(p.op.verb, verb) && p.op.key == key_of_path)
             {
                 let p = calls.remove(i);
                 if calls.is_empty() {
@@ -338,18 +422,22 @@ impl Observer {
             started,
             read: 0,
             written: 0,
+            in_process: self.in_process,
         })
     }
 
     /// End a single-call operation: a temporary failure is parked while a retry may follow.
     fn finish(&self, st: OpState, err: Option<&Error>) {
-        let end = Instant::now();
+        self.finish_at(st, Instant::now(), err, true);
+    }
+
+    fn finish_at(&self, st: OpState, end: Instant, err: Option<&Error>, may_park: bool) {
         let Some(e) = err else {
             complete(&self.recorder, st, end, None);
             return;
         };
         let class = class_of(&st.scope, e);
-        if e.is_temporary() && self.linker.enabled() {
+        if may_park && e.is_temporary() && self.linker.enabled() {
             let id = key();
             // An earlier failure of a multi-call operation on this task was not retried.
             self.linker.scopes().remove(&id);
@@ -360,7 +448,9 @@ impl Observer {
                     // Full: the oldest parked call completes as failed.
                     let oldest = p
                         .iter()
-                        .flat_map(|(k, calls)| calls.iter().enumerate().map(move |(i, x)| (*k, i, x.ended)))
+                        .flat_map(|(k, calls)| {
+                            calls.iter().enumerate().map(move |(i, x)| (*k, i, x.ended))
+                        })
                         .min_by_key(|(_, _, ended)| *ended)
                         .map(|(k, i, _)| (k, i));
                     if let Some((k, i)) = oldest
@@ -418,10 +508,40 @@ fn class_of(scope: &OpScope, e: &Error) -> String {
     error_class(e, last)
 }
 
+/// Wraps `fut` so that if it parks (`Poll::Pending`) before reaching the HTTP transport (e.g.
+/// waiting on `ConcurrentLimitLayer`'s HTTP semaphore), the park time is noted on `scope`.
+struct PreFetchPoll<'a, F> {
+    scope: &'a Arc<OpScope>,
+    fut: F,
+}
+
+impl<F: std::future::Future> std::future::Future for PreFetchPoll<'_, F> {
+    type Output = F::Output;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        // SAFETY: `fut` is structurally pinned; `scope` is an unpinned reference.
+        let (scope, fut) = unsafe {
+            let this = self.get_unchecked_mut();
+            (this.scope, std::pin::Pin::new_unchecked(&mut this.fut))
+        };
+        match fut.poll(cx) {
+            std::task::Poll::Pending => {
+                scope.note_pre_fetch_park(Instant::now());
+                std::task::Poll::Pending
+            }
+            ready => ready,
+        }
+    }
+}
+
 /// Run `fut` in the operation's scope (as is when there is none).
 async fn in_scope<F: std::future::Future>(st: &Option<OpState>, fut: F) -> F::Output {
     match st {
-        Some(s) => s.scope.run(fut).await,
+        Some(s) if s.in_process => s.scope.run(fut).await,
+        Some(s) => s.scope.run(PreFetchPoll { scope: &s.scope, fut }).await,
         None => fut.await,
     }
 }
@@ -476,17 +596,20 @@ impl std::fmt::Debug for OperationObserveLayer {
 impl OperationObserveLayer {
     pub fn new(recorder: Arc<Recorder>, linker: Arc<Linker>) -> Self {
         Self {
-            obs: Observer { recorder, linker },
+            obs: Observer {
+                recorder,
+                linker,
+                in_process: false,
+            },
         }
     }
 }
 
 impl Layer for OperationObserveLayer {
     fn apply_service(&self, inner: Servicer) -> Servicer {
-        Arc::new(OpService {
-            inner,
-            obs: self.obs.clone(),
-        })
+        let mut obs = self.obs.clone();
+        obs.in_process = matches!(inner.info().scheme(), "memory" | "fs");
+        Arc::new(OpService { inner, obs })
     }
 }
 
@@ -546,6 +669,7 @@ impl Service for OpService {
             inner: self.inner.read(ctx, path, args)?,
             obs: self.obs.clone(),
             path: path.to_owned(),
+            slot: std::sync::OnceLock::new(),
         })
     }
 
@@ -660,6 +784,7 @@ pub struct OpReader {
     inner: oio::Reader,
     obs: Observer,
     path: String,
+    slot: std::sync::OnceLock<Arc<ReadSlot>>,
 }
 
 fn read_verb(range: &BytesRange) -> &'static str {
@@ -693,13 +818,104 @@ impl oio::Read for OpReader {
     }
 
     async fn read(&self, range: BytesRange) -> Result<(RpRead, Buffer)> {
-        let mut g = OpGuard::new(&self.obs, read_verb(&range), &self.path);
-        let r = in_scope(&g.st, self.inner.read(range)).await;
-        if let (Ok((_, b)), Some(st)) = (&r, g.st.as_mut()) {
-            st.read += b.len() as u64;
+        if OpScope::current().is_some() {
+            return self.inner.read(range).await;
         }
-        g.finish(r.as_ref().err());
+        let verb = read_verb(&range);
+        let slot = self.slot.get_or_init(|| {
+            let s = Arc::new(ReadSlot {
+                group: Mutex::new(None),
+                obs: self.obs.clone(),
+            });
+            let mut r = self
+                .obs
+                .linker
+                .readers
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if r.len() >= MAX_PARKED {
+                r.retain(|w| w.strong_count() > 0);
+            }
+            r.push(Arc::downgrade(&s));
+            s
+        });
+        let (flushed, scope, in_process) = {
+            let mut g = slot.group.lock().unwrap_or_else(|e| e.into_inner());
+            let mut flushed = None;
+            let reuse = g.as_ref().is_some_and(|x| {
+                x.active > 0
+                    || x.last_end
+                        .is_some_and(|t| t.elapsed() <= READ_COALESCE_IDLE)
+            });
+            if !reuse {
+                flushed = g.take();
+            }
+            if let Some(x) = g.as_mut() {
+                x.active += 1;
+                x.calls += 1;
+                if verb == "read.range" || x.calls > 1 {
+                    x.st.verb = "read.range";
+                }
+                (flushed, Some(x.st.scope.clone()), x.st.in_process)
+            } else if let Some(st) = self.obs.start(verb, &self.path) {
+                let sc = st.scope.clone();
+                let ip = st.in_process;
+                *g = Some(ReadGroup {
+                    st,
+                    active: 1,
+                    calls: 1,
+                    last_end: None,
+                    error: None,
+                });
+                (flushed, Some(sc), ip)
+            } else {
+                (flushed, None, self.obs.in_process)
+            }
+        };
+        if let Some(prev) = flushed {
+            let end = prev.last_end.unwrap_or_else(Instant::now);
+            self.obs
+                .finish_at(prev.st, end, prev.error.as_ref(), prev.calls == 1);
+        }
+        let r = match &scope {
+            Some(s) if in_process => s.run(self.inner.read(range)).await,
+            Some(s) => s.run(PreFetchPoll { scope: s, fut: self.inner.read(range) }).await,
+            None => self.inner.read(range).await,
+        };
+        let end = Instant::now();
+        {
+            let mut g = slot.group.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(x) = g.as_mut() {
+                x.active = x.active.saturating_sub(1);
+                x.last_end = Some(end);
+                match &r {
+                    Ok((_, b)) => {
+                        x.st.read += b.len() as u64;
+                        x.error = None;
+                    }
+                    Err(e) => {
+                        if x.calls > 1 {
+                            self.obs.failed_call(&x.st, e);
+                        }
+                        x.error = Some(Error::new(e.kind(), e.message().to_owned()));
+                        if e.is_temporary()
+                            && let Some(err) = x.error.take()
+                        {
+                            x.error = Some(err.set_temporary());
+                        }
+                    }
+                }
+            }
+        }
         r
+    }
+}
+
+impl Drop for OpReader {
+    fn drop(&mut self) {
+        if let Some(slot) = self.slot.get() {
+            slot.flush_idle();
+        }
     }
 }
 
@@ -978,6 +1194,7 @@ mod tests {
         let obs = Observer {
             recorder: rec.clone(),
             linker,
+            in_process: true,
         };
         (rec, obs, notify)
     }

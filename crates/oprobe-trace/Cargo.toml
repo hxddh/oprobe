@@ -55,6 +55,9 @@ schemars = { workspace = true, optional = true }
 tokio-rustls = { workspace = true, optional = true }
 opentelemetry = { version = "0.32", default-features = false, features = ["metrics"], optional = true }
 
+[target."cfg(windows)".dependencies]
+windows-sys.workspace = true
+
 [dev-dependencies]
 opendal-core = { workspace = true, features = ["executors-tokio", "services-memory"] }
 opentelemetry_sdk = { version = "0.32", default-features = false, features = ["metrics", "testing"] }

@@ -27,7 +27,7 @@
 //! - [`layer`] returns the [`TraceLayer`] to add to an operator and a [`Handle`] to read it.
 //! - [`Handle::snapshot`] returns the aggregates so far ([`Snapshot`]): per API and stage, per
 //!   verb, connections, bytes and a timeline.
-//! - [`Handle::save`] and [`Snapshot::save`] write a `.oprobe` file (format `oprobe.trace/7`).
+//! - [`Handle::save`] and [`Snapshot::save`] write a `.oprobe` file (format `oprobe.trace/8`).
 //! - [`Exporter`] receives every request as it completes; with the `otel` feature,
 //!   [`otel::OtelExporter`] turns them into OpenTelemetry metrics
 //!   (`http.client.request.duration` with `oprobe.stage` and `oprobe.api`).
@@ -46,7 +46,7 @@
 //! # Stability
 //!
 //! The items documented here, the `.oprobe` format and the meaning of every field are stable
-//! across 7.x: changes are additive, and public structs and enums are `#[non_exhaustive]`. The
+//! across 8.x: changes are additive, and public structs and enums are `#[non_exhaustive]`. The
 //! `__internal` feature exists for the oprobe binary only and carries no semver promise.
 
 // Half of the recorder (operation scopes, the whole-operation sampler, key dimensions, the
@@ -89,6 +89,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 pub use dims::{DimensionStats, HotKeyStats, SliceStats};
+pub use layer::CacheObserveLayer;
 pub use net::HttpVersion;
 pub use observe::RetryNotify;
 pub use record::{Api, Protocol, RequestRecord, RequestTiming};
@@ -212,8 +213,8 @@ impl Config {
         self
     }
 
-    /// Read the kernel's TCP statistics of the connection at the end of every request (Linux
-    /// and macOS; default true).
+    /// Read the kernel's TCP statistics of the connection at the end of every request (Linux,
+    /// macOS and Windows; default true).
     pub fn tcp_info(mut self, on: bool) -> Self {
         self.transport.tcp_info = on;
         self
@@ -343,6 +344,21 @@ impl Handle {
     /// ```
     pub fn retry_notify(&self) -> RetryNotify {
         RetryNotify::new(self.recorder.clone(), self.linker.clone())
+    }
+
+    /// A layer to place directly outside a local cache layer (`FoyerLayer`, `MokaLayer`) so
+    /// cache hits, hit bytes and lookup latency are recorded in [`Snapshot::cache`]:
+    ///
+    /// ```no_run
+    /// # use opendal_core::{Operator, services::Memory};
+    /// # fn demo<L: opendal_core::raw::Layer>(op: Operator, foyer_layer: L) {
+    /// let (trace, handle) = oprobe_trace::layer(oprobe_trace::Config::default());
+    /// let op = op.layer(trace).layer(foyer_layer).layer(handle.cache_layer());
+    /// # let _ = op;
+    /// # }
+    /// ```
+    pub fn cache_layer(&self) -> CacheObserveLayer {
+        CacheObserveLayer::new(self.recorder.clone())
     }
 
     /// Write a `.oprobe` profile to `path`: the aggregates so far plus the sampled operations

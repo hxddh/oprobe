@@ -871,3 +871,46 @@ fn the_profile_shows_every_captured_signal_where_it_explains_something() {
     app.press(toggle).unwrap();
     wait_long(&mut app, "id:await-tree-body");
 }
+
+#[test]
+fn concurrent_limit_toggle_seeds_default_and_stored_proves_reload_and_compare_trials() {
+    let cx = Ctx::new();
+    let id_a = cx.seed("lab://clean");
+    let id_b = cx.seed("lab://throttle");
+    // Run a short prove on id_a via the service layer so `<prove_id>.prove.json` and trial runs exist.
+    {
+        let svc = App::new(cx.paths());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let req = oprobe::app::ProveRequest {
+            run: id_a.clone(),
+            with: vec!["layers.retry.jitter=on".into()],
+            trial_duration: Some("300ms".into()),
+            budget: Some("1s".into()),
+            ..Default::default()
+        };
+        let _ = rt
+            .block_on(svc.prove(req, EventSink::silent(), Cancel::new()))
+            .unwrap();
+    }
+    cx.launch(Some(id_a.clone()));
+    let mut app = cx.start();
+    choose(&mut app, "English");
+    wait_long(&mut app, "id:profile");
+    app.press_key("ctrl+2").unwrap();
+    wait_long(&mut app, "id:operator");
+    // Stored prove is loaded automatically for id_a!
+    wait_long(&mut app, "id:prove-result");
+    wait_long(&mut app, "id:compare-prove-trials");
+    // Toggling `layers.concurrent_limit` seeds `http = 32` instead of snapping back off.
+    app.press("role:switch[layers.concurrent_limit]").unwrap();
+    wait_long(&mut app, "text:layers.concurrent_limit.http = 32");
+    // Switching to id_b hides id_a's prove; switching back restores id_a's stored prove.
+    app.press(&format!("id:run-{id_b}")).unwrap();
+    app.wait_for_gone("id:prove-result", LONG).unwrap();
+    app.press(&format!("id:run-{id_a}")).unwrap();
+    wait_long(&mut app, "id:prove-result");
+    // Comparing the stored prove's A/B trials opens Compare on those trial runs.
+    app.press("id:compare-prove-trials").unwrap();
+    wait_long(&mut app, "id:compare-table");
+    wait_long(&mut app, "text:2 runs compared");
+}

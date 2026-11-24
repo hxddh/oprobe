@@ -448,6 +448,356 @@ impl oio::Copy for ObserveCopier {
     }
 }
 
+/// Observes a local cache layer (`FoyerLayer`, `MokaLayer`, …) placed beneath it:
+/// `op.layer(trace).layer(FoyerLayer::new(cache)).layer(handle.cache_layer())`.
+///
+/// A read answered without issuing any backend request counts as a cache hit (`cache_hits`,
+/// `cache_hit_bytes`, `cache_lookup_us`); a read that issues backend requests counts as a cache
+/// miss (`cache_lookups` only) and groups the cache layer's internal `stat` + full-object fetch
+/// into a single logical read operation so `overread_ratio` stays exact.
+#[derive(Clone)]
+pub struct CacheObserveLayer {
+    recorder: Arc<Recorder>,
+}
+
+impl std::fmt::Debug for CacheObserveLayer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CacheObserveLayer")
+    }
+}
+
+impl CacheObserveLayer {
+    pub fn new(recorder: Arc<Recorder>) -> Self {
+        Self { recorder }
+    }
+}
+
+impl Layer for CacheObserveLayer {
+    fn apply_service(&self, inner: Servicer) -> Servicer {
+        self.recorder.set_cache_enabled(true);
+        Arc::new(CacheObserveService {
+            inner,
+            recorder: self.recorder.clone(),
+        })
+    }
+}
+
+#[derive(Clone)]
+struct CacheObserveService {
+    inner: Servicer,
+    recorder: Arc<Recorder>,
+}
+
+impl std::fmt::Debug for CacheObserveService {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CacheObserveService")
+    }
+}
+
+impl Service for CacheObserveService {
+    type Reader = CacheObserveReader;
+    type Writer = oio::Writer;
+    type Lister = oio::Lister;
+    type Deleter = oio::Deleter;
+    type Copier = oio::Copier;
+    type Composer = oio::Composer;
+
+    fn info(&self) -> ServiceInfo {
+        self.inner.info()
+    }
+
+    fn capability(&self) -> Capability {
+        self.inner.capability()
+    }
+
+    async fn create_dir(
+        &self,
+        ctx: &OperationContext,
+        path: &str,
+        args: OpCreateDir,
+    ) -> Result<RpCreateDir> {
+        self.inner.create_dir(ctx, path, args).await
+    }
+
+    fn read(&self, ctx: &OperationContext, path: &str, args: OpRead) -> Result<Self::Reader> {
+        Ok(CacheObserveReader {
+            inner: self.inner.read(ctx, path, args)?,
+            recorder: self.recorder.clone(),
+            path: path.to_owned(),
+        })
+    }
+
+    fn write(&self, ctx: &OperationContext, path: &str, args: OpWrite) -> Result<Self::Writer> {
+        self.inner.write(ctx, path, args)
+    }
+
+    fn copy(
+        &self,
+        ctx: &OperationContext,
+        from: &str,
+        to: &str,
+        args: OpCopy,
+    ) -> Result<Self::Copier> {
+        self.inner.copy(ctx, from, to, args)
+    }
+
+    fn compose(&self, ctx: &OperationContext, to: &str, args: OpCompose) -> Result<Self::Composer> {
+        self.inner.compose(ctx, to, args)
+    }
+
+    async fn rename(
+        &self,
+        ctx: &OperationContext,
+        from: &str,
+        to: &str,
+        args: OpRename,
+    ) -> Result<RpRename> {
+        self.inner.rename(ctx, from, to, args).await
+    }
+
+    async fn restore(
+        &self,
+        ctx: &OperationContext,
+        path: &str,
+        args: OpRestore,
+    ) -> Result<RpRestore> {
+        self.inner.restore(ctx, path, args).await
+    }
+
+    async fn stat(&self, ctx: &OperationContext, path: &str, args: OpStat) -> Result<RpStat> {
+        self.inner.stat(ctx, path, args).await
+    }
+
+    fn delete(&self, ctx: &OperationContext) -> Result<Self::Deleter> {
+        self.inner.delete(ctx)
+    }
+
+    fn list(&self, ctx: &OperationContext, path: &str, args: OpList) -> Result<Self::Lister> {
+        self.inner.list(ctx, path, args)
+    }
+
+    async fn presign(
+        &self,
+        ctx: &OperationContext,
+        path: &str,
+        args: OpPresign,
+    ) -> Result<RpPresign> {
+        self.inner.presign(ctx, path, args).await
+    }
+}
+
+pub struct CacheObserveReader {
+    inner: oio::Reader,
+    recorder: Arc<Recorder>,
+    path: String,
+}
+
+impl oio::Read for CacheObserveReader {
+    async fn open(&self, range: BytesRange) -> Result<(RpRead, Box<dyn oio::ReadStreamDyn>)> {
+        let verb = if range.is_full() {
+            "read.full"
+        } else {
+            "read.range"
+        };
+        let t0 = Instant::now();
+        if let Some(scope) = OpScope::current() {
+            let before = scope.requests_recorded();
+            let (rp, stream) = self.inner.open(range).await?;
+            return Ok((
+                rp,
+                Box::new(CacheObserveStream {
+                    inner: stream,
+                    outer_scope: Some(scope),
+                    owned_scope: None,
+                    recorder: self.recorder.clone(),
+                    verb,
+                    key: String::new(),
+                    t0,
+                    before,
+                    bytes: 0,
+                    finished: false,
+                }) as Box<dyn oio::ReadStreamDyn>,
+            ));
+        }
+        let scope = OpScope::new_at(true, t0, Some(self.recorder.clone()));
+        self.recorder.op_started_at(scope.id, t0);
+        let key = crate::observe::private_key(&self.path);
+        match scope.run(self.inner.open(range)).await {
+            Ok((rp, stream)) => Ok((
+                rp,
+                Box::new(CacheObserveStream {
+                    inner: stream,
+                    outer_scope: None,
+                    owned_scope: Some(scope),
+                    recorder: self.recorder.clone(),
+                    verb,
+                    key,
+                    t0,
+                    before: 0,
+                    bytes: 0,
+                    finished: false,
+                }) as Box<dyn oio::ReadStreamDyn>,
+            )),
+            Err(e) => {
+                let data = scope.take();
+                let last = data.requests.last().map(|r| r.status);
+                let class = crate::observe::error_class(&e, last);
+                self.recorder.complete_op(
+                    true,
+                    crate::OpCompletion {
+                        verb,
+                        op_id: scope.id,
+                        started: t0,
+                        latency_us: t0.elapsed().as_micros() as u64,
+                        logical_read: 0,
+                        logical_write: 0,
+                        error: Some(class),
+                        key,
+                        data,
+                        schedule_us: None,
+                    },
+                );
+                Err(e)
+            }
+        }
+    }
+
+    async fn read(&self, range: BytesRange) -> Result<(RpRead, Buffer)> {
+        let verb = if range.is_full() {
+            "read.full"
+        } else {
+            "read.range"
+        };
+        let t0 = Instant::now();
+        if let Some(scope) = OpScope::current() {
+            let before = scope.requests_recorded();
+            let r = self.inner.read(range).await;
+            if let Ok((_, ref b)) = r {
+                let hit = scope.requests_recorded() == before;
+                let us = if hit {
+                    t0.elapsed().as_micros() as u64
+                } else {
+                    0
+                };
+                scope.record_cache_lookup(hit, b.len() as u64, us);
+            }
+            return r;
+        }
+        let scope = OpScope::new_at(true, t0, Some(self.recorder.clone()));
+        self.recorder.op_started_at(scope.id, t0);
+        let r = scope.run(self.inner.read(range)).await;
+        let latency_us = t0.elapsed().as_micros() as u64;
+        let (n, err) = match &r {
+            Ok((_, b)) => {
+                let n = b.len() as u64;
+                let hit = scope.requests_recorded() == 0;
+                scope.record_cache_lookup(hit, n, if hit { latency_us } else { 0 });
+                (n, None)
+            }
+            Err(e) => {
+                let last = scope.with(|d| d.requests.last().map(|req| req.status));
+                (0, Some(crate::observe::error_class(e, last)))
+            }
+        };
+        let data = scope.take();
+        self.recorder.complete_op(
+            true,
+            crate::OpCompletion {
+                verb,
+                op_id: scope.id,
+                started: t0,
+                latency_us,
+                logical_read: n,
+                logical_write: 0,
+                error: err,
+                key: crate::observe::private_key(&self.path),
+                data,
+                schedule_us: None,
+            },
+        );
+        r
+    }
+}
+
+pub struct CacheObserveStream {
+    inner: Box<dyn oio::ReadStreamDyn>,
+    outer_scope: Option<Arc<OpScope>>,
+    owned_scope: Option<Arc<OpScope>>,
+    recorder: Arc<Recorder>,
+    verb: &'static str,
+    key: String,
+    t0: Instant,
+    before: u64,
+    bytes: u64,
+    finished: bool,
+}
+
+impl CacheObserveStream {
+    fn finish(&mut self, err: Option<String>) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        let latency_us = self.t0.elapsed().as_micros() as u64;
+        if let Some(scope) = self.outer_scope.take() {
+            if err.is_none() {
+                let hit = scope.requests_recorded() == self.before;
+                scope.record_cache_lookup(hit, self.bytes, if hit { latency_us } else { 0 });
+            }
+            return;
+        }
+        if let Some(scope) = self.owned_scope.take() {
+            if err.is_none() {
+                let hit = scope.requests_recorded() == 0;
+                scope.record_cache_lookup(hit, self.bytes, if hit { latency_us } else { 0 });
+            }
+            let data = scope.take();
+            self.recorder.complete_op(
+                true,
+                crate::OpCompletion {
+                    verb: self.verb,
+                    op_id: scope.id,
+                    started: self.t0,
+                    latency_us,
+                    logical_read: self.bytes,
+                    logical_write: 0,
+                    error: err,
+                    key: std::mem::take(&mut self.key),
+                    data,
+                    schedule_us: None,
+                },
+            );
+        }
+    }
+}
+
+impl oio::ReadStream for CacheObserveStream {
+    async fn read(&mut self) -> Result<Buffer> {
+        let r = match &self.owned_scope {
+            Some(s) => s.run(self.inner.read_dyn()).await,
+            None => self.inner.read_dyn().await,
+        };
+        match &r {
+            Ok(b) if b.is_empty() => self.finish(None),
+            Ok(b) => self.bytes += b.len() as u64,
+            Err(e) => {
+                let last = self
+                    .owned_scope
+                    .as_ref()
+                    .and_then(|s| s.with(|d| d.requests.last().map(|req| req.status)));
+                self.finish(Some(crate::observe::error_class(e, last)));
+            }
+        }
+        r
+    }
+}
+
+impl Drop for CacheObserveStream {
+    fn drop(&mut self) {
+        self.finish(None);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

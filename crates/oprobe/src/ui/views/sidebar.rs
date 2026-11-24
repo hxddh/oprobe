@@ -42,7 +42,13 @@ pub fn sidebar(s: Store) -> View {
     let focused = signal(false);
     keys(s, focused);
     view()
-        .w(move || px(if term { 30.0 * 8.0 } else { s.sidebar_w.get() }))
+        .w(move || {
+            px(if term {
+                (s.sidebar_w.get() / 8.0).round().clamp(22.0, 48.0) * 8.0
+            } else {
+                s.sidebar_w.get()
+            })
+        })
         .flex_shrink_0()
         .min_h(px(0.0))
         .border_r_1()
@@ -75,7 +81,7 @@ pub fn sidebar(s: Store) -> View {
                     ),
             ),
         )
-        .child((!term).then(|| edge(s)))
+        .child(edge(s))
 }
 
 /// The keys of the list while it has the keyboard focus (never while a field edits).
@@ -181,7 +187,7 @@ fn top(s: Store) -> View {
 fn live(s: Store) -> impl IntoElement {
     dynamic(move || {
         let st = s.run_state.get().filter(|st| st.outcome.is_none());
-        let operator = s.form.operator.get();
+        let operator = s.running_label.get();
         untracked(|| {
             st.map(|st| {
                 let frac = if st.total_s > 0.0 {

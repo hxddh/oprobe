@@ -3092,6 +3092,12 @@
           "minimum": 0,
           "type": "integer"
         },
+        "tail_cuts_count": {
+          "description": "Requests actively cut by `TailCutLayer` to re-issue a faster attempt.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "throttled_responses_count": {
           "format": "uint64",
           "minimum": 0,

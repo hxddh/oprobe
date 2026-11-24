@@ -181,6 +181,8 @@ pub struct Store {
     /// Operator files used before (newest first), and the operators the config file names.
     pub recent: Signal<Vec<String>>,
     pub configured: Signal<Vec<String>>,
+    /// The operator label of the active `run_job`, frozen when the run starts.
+    pub running_label: Signal<String>,
     app: Stored<App>,
     data_dir: Stored<String>,
     config_file: Stored<String>,
@@ -189,6 +191,7 @@ pub struct Store {
     root: Owner,
     run_job: Stored<Option<Job>>,
     prove_job: Stored<Option<Job>>,
+    prove_run_id: Stored<Option<String>>,
 }
 
 /// The store of the running app.
@@ -260,7 +263,7 @@ impl Store {
             edits: signal(BTreeMap::new()),
             objective: signal(ProveObjective::Goodput),
             prove_budget: signal("2m".to_owned()),
-            prove_pairs: signal(4),
+            prove_pairs: signal(crate::config::prove_defaults::MAX_PAIRS),
             compared: signal(Vec::new()),
             notice: signal(None),
             trashed: signal(None),
@@ -268,6 +271,7 @@ impl Store {
             plan: signal(None),
             recent: signal(settings.recent),
             configured: signal(configured),
+            running_label: signal(String::new()),
             data_dir: stored(paths.data_dir.display().to_string()),
             config_file: stored(paths.config_file.display().to_string()),
             app: stored(app),
@@ -275,6 +279,7 @@ impl Store {
             root: Owner::current(),
             run_job: stored(None),
             prove_job: stored(None),
+            prove_run_id: stored(None),
         };
         s.refresh();
         // A run to open, else the newest run is selected.
@@ -366,9 +371,8 @@ impl Store {
     /// The operators of the form are all `lab://` scenarios (nothing to plan: the lab is
     /// local and its data goes with it).
     pub fn form_is_lab(&self) -> bool {
-        let ops = self.form.operator.get();
-        let mut it = ops.split_whitespace().peekable();
-        it.peek().is_some() && it.all(|o| o.starts_with("lab://"))
+        let ops = split_operators(&self.form.operator.get());
+        !ops.is_empty() && ops.iter().all(|o| o.starts_with("lab://"))
     }
 
     /// Where runs are stored.
@@ -438,12 +442,7 @@ impl Store {
     /// one).
     fn form_request(&self) -> Result<RunRequest, &'static str> {
         let f = self.form;
-        let operators: Vec<String> = f
-            .operator
-            .get_untracked()
-            .split_whitespace()
-            .map(str::to_owned)
-            .collect();
+        let operators = split_operators(&f.operator.get_untracked());
         if operators.is_empty() {
             return Err("runs.need_operator");
         }
@@ -538,11 +537,13 @@ impl Store {
                 r.truncate(RECENT_MAX);
             });
         }
+        let label = req.operators.join(" ");
         let job = Job::run(self.app(), req);
         jobs::track(&job);
         self.dismiss();
         self.dialog.set(None);
         self.plan.set(None);
+        self.running_label.set(label);
         self.run_state.set(Some(job.peek()));
         self.run_job.replace(Some(job));
     }
@@ -563,10 +564,75 @@ impl Store {
         self.load_run(id);
     }
 
-    /// Open a run file (`.oprobe`, a trace) that may not be in the history.
+    /// Open a file (`.oprobe` run/trace, `.prove.json` prove result, or `op.toml` operator).
     pub fn open_file(&self, path: &str) {
+        let p = std::path::Path::new(path);
+        let ext = p
+            .extension()
+            .map(|e| e.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default();
+        if ext == "toml" {
+            self.form.operator.set(quote_operator_arg(path));
+            self.dialog.set(Some(Dialog::NewRun));
+            if !untracked(|| self.form_is_lab()) {
+                self.plan_run();
+            }
+            return;
+        }
+        if path.ends_with(".prove.json")
+            || (ext == "json"
+                && std::fs::read(p)
+                    .ok()
+                    .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+                    .is_some_and(|v| v.get("prove_id").is_some() && v.get("verdict").is_some()))
+        {
+            match std::fs::read(p).map_err(anyhow::Error::from).and_then(|b| {
+                serde_json::from_slice::<crate::app::ProveOutput>(&b).map_err(Into::into)
+            }) {
+                Ok(out) => {
+                    let run_id = out.run_id.clone();
+                    let proved = jobs::Proved::from_output(out);
+                    self.page.set(Page::Operator);
+                    if self.app().store().run_path(&run_id).is_file() {
+                        self.open_run(&run_id);
+                    } else {
+                        self.prove_state.set(Some(State {
+                            outcome: Some(Outcome::Proved(Box::new(proved))),
+                            ..Default::default()
+                        }));
+                    }
+                }
+                Err(e) => self.say(format!("{e:#}"), Tone::Crit),
+            }
+            return;
+        }
         self.selection.set(Vec::new());
         self.load_run(path);
+    }
+
+    /// Open one or more files: several `.oprobe` / report `.json` files open side by side in
+    /// Compare.
+    pub fn open_files(&self, paths: &[std::path::PathBuf]) {
+        if paths.is_empty() {
+            return;
+        }
+        if paths.len() == 1 {
+            self.open_file(&paths[0].to_string_lossy());
+            return;
+        }
+        let run_files: Vec<String> = paths
+            .iter()
+            .filter(|p| {
+                let s = p.to_string_lossy();
+                !s.ends_with(".toml") && !s.ends_with(".prove.json")
+            })
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        if run_files.len() >= 2 {
+            self.show_selection(run_files);
+        } else if let Some(first) = paths.first() {
+            self.open_file(&first.to_string_lossy());
+        }
     }
 
     /// The runs in the sidebar's order: grouped under their operator, the group of the newest
@@ -704,10 +770,22 @@ impl Store {
                 s.loading.set(false);
                 match res {
                     Some(Ok(m)) => batch(|| {
+                        let active_prove = s
+                            .prove_job
+                            .with(|j| j.clone())
+                            .filter(|_| {
+                                s.prove_run_id
+                                    .with(|rid| rid.as_deref() == Some(m.id.as_str()))
+                            })
+                            .map(|j| j.peek());
+                        let stored_prove = m.proves.first().cloned().map(|p| State {
+                            outcome: Some(Outcome::Proved(Box::new(p))),
+                            ..Default::default()
+                        });
                         s.current.set(Some(Rc::new(m)));
                         s.edits.set(BTreeMap::new());
                         s.prove_finding.set(None);
-                        s.prove_state.set(None);
+                        s.prove_state.set(active_prove.or(stored_prove));
                     }),
                     Some(Err(e)) => s.say(e, Tone::Crit),
                     None => s.say(i18n::tr("app.failed"), Tone::Crit),
@@ -721,35 +799,57 @@ impl Store {
         set_clipboard(text);
     }
 
-    /// Run the selected run's operator and workload again.
+    /// Run the selected run's operator and workload again: local `lab://` targets start at
+    /// once; real storage targets open New Run with their plan so writes are reviewed first.
     pub fn run_again(&self) {
         let Some(cur) = self.current.get_untracked() else {
             return;
         };
         let f = self.form;
-        f.operator.set(cur.operator_ref.clone());
+        let report = &cur.rows.0.report;
+        let op_str = if report.is_trace() {
+            cur.operator_ref.clone()
+        } else if cur.operator_file.is_some() {
+            quote_operator_arg(&cur.operator_ref)
+        } else {
+            cur.operator_ref.clone()
+        };
+        f.operator.set(op_str);
         if let Some(p) = PRESETS.iter().find(|p| **p == cur.preset) {
             f.preset.set(p);
         }
-        self.start_run();
+        if !report.is_trace() {
+            let secs = cur.window_s.round().max(1.0) as u64;
+            f.duration.set(format!("{secs}s"));
+            if cur.setup.rate_per_s.is_none() && cur.setup.concurrency_count > 0 {
+                f.concurrency.set(cur.setup.concurrency_count.to_string());
+            }
+        }
+        if !report.is_trace() && untracked(|| self.form_is_lab()) {
+            self.start_run();
+        } else {
+            self.dialog.set(Some(Dialog::NewRun));
+            if !untracked(|| self.form_is_lab()) {
+                self.plan_run();
+            }
+        }
     }
 
-    /// Ask for a run file (`.oprobe`, a report or trace `.json`) with the system's open dialog
-    /// and open it where it is.
+    /// Ask for run, prove or operator files with the system's open dialog and open them.
     pub fn pick_run_file(&self) {
         use nsh_core::file_dialog::{FileFilter, OpenDialog};
         let s = *self;
         let dialog = OpenDialog::files()
-            .filter(FileFilter::new(i18n::tr("open.filter"), ["oprobe", "json"]))
+            .multiple(true)
+            .filter(FileFilter::new(
+                i18n::tr("open.filter"),
+                ["oprobe", "json", "toml"],
+            ))
             .button_label(i18n::tr("open.button"));
         self.root.run(|| {
             spawn(async move {
                 match pick_paths(dialog).await {
-                    Ok(Some(paths)) => {
-                        if let Some(p) = paths.first() {
-                            s.open_file(&p.to_string_lossy());
-                        }
-                    }
+                    Ok(Some(paths)) => s.open_files(&paths),
                     Ok(None) => {}
                     Err(e) => s.say(e, Tone::Crit),
                 }
@@ -768,22 +868,24 @@ impl Store {
                 if let Ok(Some(paths)) = pick_paths(dialog).await
                     && let Some(p) = paths.first()
                 {
-                    s.form.operator.set(p.to_string_lossy().into_owned());
+                    s.form
+                        .operator
+                        .set(quote_operator_arg(&p.to_string_lossy()));
                 }
             })
         });
     }
 
-    /// Open the run files the system opens the app with (Open With, a double click), for as
-    /// long as the app runs.
+    /// Open the files the system opens the app with (Open With, a double click), for as long
+    /// as the app runs.
     pub fn follow_open_files(&self) {
         let s = *self;
         self.root.run(|| {
             spawn(async move {
                 loop {
                     let files = next_open_files().await;
-                    if let Some(p) = files.first() {
-                        s.open_file(&p.to_string_lossy());
+                    if !files.is_empty() {
+                        s.open_files(&files);
                         main_window().focus();
                     }
                 }
@@ -791,16 +893,51 @@ impl Store {
         });
     }
 
-    /// Open the first run file dropped on the window (`file:` URLs).
+    /// Activate the main window and open any file arguments passed to a second launch of the
+    /// desktop app (`next_second_instance`).
+    pub fn follow_second_instance(&self) {
+        let s = *self;
+        self.root.run(|| {
+            spawn(async move {
+                loop {
+                    let inst = next_second_instance().await;
+                    let base = std::path::Path::new(&inst.cwd);
+                    let files: Vec<std::path::PathBuf> = inst
+                        .args
+                        .iter()
+                        .filter_map(|a| {
+                            let p = std::path::Path::new(a);
+                            let full = if p.is_absolute() || inst.cwd.is_empty() {
+                                p.to_path_buf()
+                            } else {
+                                base.join(p)
+                            };
+                            let ext = full.extension()?.to_string_lossy().to_ascii_lowercase();
+                            (matches!(ext.as_str(), "oprobe" | "json" | "toml") && full.is_file())
+                                .then_some(full)
+                        })
+                        .collect();
+                    if !files.is_empty() {
+                        s.open_files(&files);
+                    }
+                    main_window().focus();
+                }
+            })
+        });
+    }
+
+    /// Open files dropped on the window (`file:` URLs): multiple `.oprobe` files open in
+    /// Compare; an `op.toml` opens New Run; a `.prove.json` opens its prove verdict.
     pub fn open_dropped(&self, uris: &[String]) {
         self.drag_over.set(false);
-        let Some(path) = uris.iter().find_map(|u| {
-            let p = u.strip_prefix("file://")?;
-            Some(percent_decode(p))
-        }) else {
-            return;
-        };
-        self.open_file(&path);
+        let paths: Vec<std::path::PathBuf> = uris
+            .iter()
+            .filter_map(|u| {
+                let p = u.strip_prefix("file://")?;
+                Some(std::path::PathBuf::from(percent_decode(p)))
+            })
+            .collect();
+        self.open_files(&paths);
     }
 
     /// Ask before deleting runs `ids`: the system's alert in a window (Cancel the default,
@@ -934,9 +1071,16 @@ impl Store {
 
     /// Change one operator value (`""`: back to the run's value).
     pub fn edit(&self, path: &str, value: &str) {
-        let base = self
+        let (base, base_http) = self
             .current
-            .with_untracked(|c| c.as_ref().map(|c| data::value_of(&c.operator, path)))
+            .with_untracked(|c| {
+                c.as_ref().map(|c| {
+                    (
+                        data::value_of(&c.operator, path),
+                        data::value_of(&c.operator, "layers.concurrent_limit.http"),
+                    )
+                })
+            })
             .unwrap_or_default();
         self.edits.update(|e| {
             let v = value.trim();
@@ -944,6 +1088,15 @@ impl Store {
                 e.remove(path);
             } else {
                 e.insert(path.to_owned(), v.to_owned());
+            }
+            // `ConcurrentLimitLayer` requires `http` to be set: seed a sensible default when
+            // toggled on so the switch stays ON cleanly instead of snapping back off.
+            if path == "layers.concurrent_limit"
+                && v == "on"
+                && base_http.is_empty()
+                && !e.contains_key("layers.concurrent_limit.http")
+            {
+                e.insert("layers.concurrent_limit.http".to_owned(), "32".to_owned());
             }
             // Switching a layer off drops the changes to its parameters.
             if v == "off" && data::layer_of(path).is_none() {
@@ -982,8 +1135,9 @@ impl Store {
         };
         let budget =
             Some(self.prove_budget.get_untracked().trim().to_owned()).filter(|b| !b.is_empty());
+        let run_id = cur.id.clone();
         let req = ProveRequest {
-            run: cur.id.clone(),
+            run: run_id.clone(),
             finding,
             with,
             objective: self.objective.get_untracked(),
@@ -994,6 +1148,7 @@ impl Store {
         let job = Job::prove(self.app(), req, cur.operator.clone());
         jobs::track(&job);
         self.dismiss();
+        self.prove_run_id.replace(Some(run_id));
         self.prove_state.set(Some(job.peek()));
         self.prove_job.replace(Some(job));
     }
@@ -1005,10 +1160,13 @@ impl Store {
     }
 
     /// Write a proven change back into the run's `op.toml` file (`App::save_operator_edits`).
-    pub fn save_proven_to_file(&self, edits: &[String]) {
+    pub fn save_proven_to_file(&self, origin_run_id: &str, edits: &[String]) {
         let Some(cur) = self.current.get_untracked() else {
             return;
         };
+        if !origin_run_id.is_empty() && cur.id != origin_run_id {
+            return;
+        }
         let Some(path) = cur.operator_file.clone() else {
             return;
         };
@@ -1028,6 +1186,54 @@ impl Store {
             }
             Err(e) => self.say(format!("{e:#}"), Tone::Crit),
         }
+    }
+
+    /// Save the current run's operator with `edits` to a newly chosen `op.toml` file.
+    pub fn save_operator_as(&self, origin_run_id: &str, edits: Vec<String>) {
+        use nsh_core::file_dialog::{FileFilter, SaveDialog};
+        let Some(cur) = self.current.get_untracked() else {
+            return;
+        };
+        if !origin_run_id.is_empty() && cur.id != origin_run_id {
+            return;
+        }
+        let s = *self;
+        let dialog = SaveDialog::new()
+            .file_name("op.toml")
+            .filter(FileFilter::new(i18n::tr("runs.operator_file"), ["toml"]));
+        self.root.run(|| {
+            spawn(async move {
+                match pick_save_path(dialog).await {
+                    Ok(Some(path)) => {
+                        let dest = path.to_string_lossy().into_owned();
+                        match s.app().save_operator_target(&dest, &cur.operator, &edits) {
+                            Ok(_) => {
+                                let name = path
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| dest.clone());
+                                if s.current
+                                    .with_untracked(|c| c.as_ref().map(|m| &m.id) == Some(&cur.id))
+                                {
+                                    let mut updated = (*cur).clone();
+                                    updated.operator_file = Some(path);
+                                    if let Ok(raw) = std::fs::read_to_string(&dest)
+                                        && let Ok(spec) = crate::operator::OperatorSpec::parse(&raw)
+                                    {
+                                        updated.operator = spec.redacted();
+                                    }
+                                    s.current.set(Some(Rc::new(updated)));
+                                }
+                                s.say(i18n::trf("operator.saved_toml", &[&name]), Tone::Ok);
+                            }
+                            Err(e) => s.say(format!("{e:#}"), Tone::Crit),
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => s.say(e, Tone::Crit),
+                }
+            })
+        });
     }
 
     // ---------------------------------------------------------------------------------
@@ -1117,7 +1323,7 @@ impl Store {
                         _ => "notify.run_done",
                     })
                     .to_owned(),
-                    self.form.operator.get_untracked(),
+                    self.running_label.get_untracked(),
                 );
                 match o {
                     Outcome::Ran(ids) if ids.len() == 1 => self.open_run(&ids[0]),
@@ -1136,12 +1342,28 @@ impl Store {
         if let Some(job) = self.prove_job.with(|j| j.clone()) {
             let st = job.peek();
             let ended = st.outcome.clone();
-            if self.prove_state.with_untracked(|s| s.as_ref() != Some(&st)) {
+            let origin = self.prove_run_id.with(|r| r.clone());
+            let on_origin = self
+                .current
+                .with_untracked(|c| c.as_ref().map(|m| m.id.clone()))
+                == origin;
+            if on_origin && self.prove_state.with_untracked(|s| s.as_ref() != Some(&st)) {
                 self.prove_state.set(Some(st));
             }
             if let Some(o) = ended {
                 self.prove_job.replace(None);
+                self.prove_run_id.replace(None);
                 self.refresh();
+                if on_origin && let Outcome::Proved(ref p) = o {
+                    self.current.update(|cur| {
+                        if let Some(m) = cur {
+                            let mut next = (**m).clone();
+                            next.proves.retain(|x| x.prove_id != p.prove_id);
+                            next.proves.insert(0, (**p).clone());
+                            *cur = Some(Rc::new(next));
+                        }
+                    });
+                }
                 let body = match &o {
                     Outcome::Proved(p) => i18n::tr(match p.verdict {
                         crate::app::ProveVerdict::Improved => "prove.improved",
@@ -1180,6 +1402,46 @@ pub fn finish_jobs() {
         if !jobs::shutdown(Duration::from_secs(30)) {
             eprintln!("oprobe: the running job did not finish cleaning up in time");
         }
+    }
+}
+
+/// Tokenise space-separated operator entries while respecting `"..."` and `'...'` quotes (so
+/// `op.toml` paths chosen from folders with spaces stay whole).
+pub fn split_operators(raw: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(q) if c == '\\' && q == '"' => {
+                if let Some(next) = chars.next() {
+                    cur.push(next);
+                }
+            }
+            Some(_) => cur.push(c),
+            None if c == '"' || c == '\'' => quote = Some(c),
+            None if c.is_whitespace() => {
+                if !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+            }
+            None => cur.push(c),
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// Quote an operator path for the New Run field when it contains whitespace.
+pub fn quote_operator_arg(s: &str) -> String {
+    if s.chars().any(char::is_whitespace) && !s.starts_with('"') {
+        format!("\"{}\"", s.replace('"', "\\\""))
+    } else {
+        s.to_owned()
     }
 }
 
@@ -1222,5 +1484,21 @@ mod tests {
             assert_eq!(super::percent_decode("/x/%E4%B8%AD.oprobe"), "/x/中.oprobe");
             assert_eq!(super::percent_decode("/bad%2"), "/bad%2");
         }
+    }
+
+    #[test]
+    fn split_operators_preserves_quoted_paths_with_spaces() {
+        let raw = format!(
+            "{} lab://demo '/another dir/b.toml'",
+            super::quote_operator_arg("/Users/me/My Runs/op.toml")
+        );
+        assert_eq!(
+            super::split_operators(&raw),
+            vec![
+                "/Users/me/My Runs/op.toml",
+                "lab://demo",
+                "/another dir/b.toml"
+            ]
+        );
     }
 }

@@ -367,6 +367,13 @@
       "description": "The run whose operator was changed.",
       "type": "string"
     },
+    "saved_to": {
+      "description": "Where the proven operator was written (`--save`, when `verdict == improved`).",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "secondary": {
       "description": "The other metrics (shown, never decisive).",
       "items": {

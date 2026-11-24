@@ -1306,3 +1306,77 @@ fn reset_requests_show_under_no_connection() {
         .unwrap_or_else(|| panic!("{groups:#?}"));
     assert_eq!(g["requests_count"], resets);
 }
+
+#[test]
+fn show_compares_multiple_runs_and_prove_saves_when_improved() {
+    let env = Env::new();
+    let o1 = env.run(&run_args(&["lab://clean"], &["-q", "-o", "json"]));
+    assert_eq!(code(&o1), 0, "{}", stderr(&o1));
+    let id1 = json(&o1)["runs"][0]["run_id"].as_str().unwrap().to_owned();
+
+    let o2 = env.run(&run_args(
+        &["lab://clean"],
+        &["--set", "layers.retry.jitter=on", "-q", "-o", "json"],
+    ));
+    assert_eq!(code(&o2), 0, "{}", stderr(&o2));
+    let id2 = json(&o2)["runs"][0]["run_id"].as_str().unwrap().to_owned();
+
+    // `show A B -o json` matches `schemas/run.json` with a side-by-side comparison.
+    let cmp = env.run(&["show", &id1, &id2, "-o", "json"]);
+    assert_eq!(code(&cmp), 0, "{}", stderr(&cmp));
+    let v = json(&cmp);
+    validate("run", &v);
+    assert_eq!(v["runs"].as_array().unwrap().len(), 2);
+    assert!(v["comparison"].is_object(), "{v:#}");
+
+    // `show A B --detail` renders both runs and the per-API comparison table in text.
+    let text = stdout(&env.run(&["show", &id1, &id2, "--detail"]));
+    assert!(text.contains(&id1) && text.contains(&id2), "{text}");
+    assert!(text.contains("GetObject"), "{text}");
+
+    // `prove --save` on an improved remedy writes `op.toml`, and `show last-prove` opens it.
+    let o_strag = env.run(&[
+        "run",
+        "lab://stragglers",
+        "-c",
+        "16",
+        "-d",
+        "1500ms",
+        "--warmup",
+        "0s",
+        "-q",
+        "-o",
+        "json",
+    ]);
+    assert_eq!(code(&o_strag), 0, "{}", stderr(&o_strag));
+    let save_path = env.path("proven-op.toml");
+    let p = env.run(&[
+        "prove",
+        "last",
+        "--with",
+        "layers.tail_cut=on",
+        "--with",
+        "layers.retry.min_delay=10ms",
+        "--trial",
+        "600ms",
+        "--save",
+        save_path.to_str().unwrap(),
+        "-q",
+        "-o",
+        "json",
+    ]);
+    assert!(matches!(code(&p), 0 | 3), "{}", stderr(&p));
+    let pv = json(&p);
+    validate("prove", &pv);
+    if pv["verdict"] == "improved" {
+        let saved = std::fs::read_to_string(&save_path).unwrap();
+        assert!(
+            saved.contains("[layers.tail_cut]") && saved.contains("min_delay = \"10ms\""),
+            "{saved}"
+        );
+        assert_eq!(pv["saved_to"].as_str(), save_path.to_str());
+    }
+    let last_p = env.run(&["show", "last-prove", "-o", "json"]);
+    assert_eq!(code(&last_p), 0, "{}", stderr(&last_p));
+    assert_eq!(json(&last_p)["prove_id"], pv["prove_id"]);
+}

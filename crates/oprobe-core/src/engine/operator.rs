@@ -140,10 +140,66 @@ pub async fn s3_region(target: &TargetSpec) -> Option<(String, RegionSource)> {
             return Some((r, RegionSource::Environment));
         }
     }
+    if !target
+        .options
+        .get("disable_config_load")
+        .is_some_and(|v| v.trim() == "true")
+        && let Some(r) = aws_config_region()
+    {
+        return Some((r, RegionSource::Environment));
+    }
     match detect_s3_region(target).await {
         Some(r) => Some((r, RegionSource::Detected)),
         None => Some(("us-east-1".into(), RegionSource::Default)),
     }
+}
+
+/// Read `region` for the active `AWS_PROFILE` (`default` when unset) from `AWS_CONFIG_FILE` or
+/// `~/.aws/config`.
+pub(crate) fn aws_config_region() -> Option<String> {
+    let path = std::env::var_os("AWS_CONFIG_FILE")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .or_else(|| std::env::var_os("USERPROFILE"))
+                .map(|h| std::path::PathBuf::from(h).join(".aws/config"))
+        })?;
+    let text = std::fs::read_to_string(path).ok()?;
+    parse_aws_config_region(
+        &text,
+        &std::env::var("AWS_PROFILE").unwrap_or_else(|_| "default".into()),
+    )
+}
+
+pub(crate) fn parse_aws_config_region(text: &str, profile: &str) -> Option<String> {
+    let profile = profile.trim();
+    if profile.is_empty() {
+        return None;
+    }
+    let mut in_section = false;
+    for raw in text.lines() {
+        let line = raw.split(['#', ';']).next().unwrap_or_default().trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(sec) = line.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            let sec = sec.trim();
+            let name = sec.strip_prefix("profile").map(str::trim).unwrap_or(sec);
+            in_section = name == profile;
+            continue;
+        }
+        if in_section
+            && let Some((k, v)) = line.split_once('=')
+            && k.trim().eq_ignore_ascii_case("region")
+        {
+            let v = v.trim().trim_matches(['"', '\'']).trim();
+            if !v.is_empty() {
+                return Some(v.to_owned());
+            }
+        }
+    }
+    None
 }
 
 /// The region the service reports for an S3 bucket (`None`: not determinable).
@@ -337,7 +393,14 @@ pub async fn measured_operator_with(
             layers.layers.concurrent_limit = None;
         }
     }
-    crate::operator::build::apply_layers_with_tail_cut(op, &layers, true, shared_tail_cut).await
+    crate::operator::build::apply_layers_with_recorder(
+        op,
+        &layers,
+        true,
+        shared_tail_cut,
+        Some(recorder.clone()),
+    )
+    .await
 }
 
 /// Fail fast when the endpoint cannot be reached at all (connection refused, unknown host):

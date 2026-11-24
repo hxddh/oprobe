@@ -4,6 +4,75 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## v8.0.0 — 2026-11-24
+
+8.0 advances embedded and live wire observability (`oprobe.trace/8`), closes OpenDAL 0.59 Rust
+code generation and engine measurement gaps, streamlines side-by-side CLI comparisons and
+`prove --save`, and polishes the native desktop and terminal TUI experience without adding a
+single new CLI command or configuration concept.
+
+### Breaking
+
+- **`oprobe-trace` writes `oprobe.trace/8`.** `oprobe show` and the app continue to open
+  `oprobe.trace/7`, `oprobe.trace/6` and `oprobe.run/6` files seamlessly.
+
+### Added
+
+- **End-to-end wire & layer observability (`oprobe.trace/8`).**
+  - `Handle::cache_layer` (`CacheObserveLayer`) wraps `FoyerLayer` to record exact cache hits,
+    misses and bytes served from memory (`bytes.cache_hits_count`, `bytes.cache_misses_count`,
+    `CacheView`).
+  - Composable `ConcurrentLimitLayer` HTTP semaphore wait attribution (`timing.queue_us`) when
+    layered above `TraceLayer` / `TraceContextLayer`.
+  - HTTP/2 concurrent stream tracking (`h2_streams` peak & open streams) and coalesced connection
+    dial wait (`dial_wait_us`).
+  - Upload kernel-buffer drain vs server acknowledgement timing (`send_buffered_us`,
+    `upload_acked_us`), explicit `TailCutLayer` cut attribution (`tail_cut`, `tail_cuts_count`)
+    and cancelled-request tracking (`aborted`).
+  - Multi-cloud response headers (`cdn_pop`, `age_s`, `storage_class`, `encryption`, Azure
+    `x-ms-retry-after-ms`), `503 SlowDown` vs `503 ServiceUnavailable`/`InternalError`
+    classification, `WritePathView` multipart straggler skew & `CompleteMultipartUpload` p99, and
+    `ListView` pagination depth (`pages/list`).
+  - Race-free per-connection kernel TCP statistics (`TcpProbe` owned per hyper connection, plus
+    Windows `WSAIoctl(SIO_TCP_INFO)` alongside Linux and macOS).
+- **Concise CLI workflows.**
+  - `oprobe show <A> <B> […]` compares stored runs, `.oprobe` files or production traces side by
+    side (`-o text`, `-o json` matching `schemas/run.json`, `--detail` for per-API comparison).
+  - `oprobe prove --save <FILE|OPERATOR>` atomically writes proven improvements back to an
+    `op.toml` file or `[operators.NAME]` in `config.toml`; `show` resolves `last-prove`,
+    `.prove.json` files and unambiguous prove ID prefixes.
+  - Multi-cloud paste-and-run URL recognition for Alibaba Cloud OSS, Tencent COS, Huawei OBS,
+    Volcengine TOS, Cloudflare R2 and Backblaze B2, plus `~/.aws/config` profile `region` and
+    `AZURE_STORAGE_ACCOUNT_NAME` discovery.
+  - Workload-aware `oprobe run` reproduction hints (`--preset list-stat|range-reads|large-objects`)
+    on production traces, and `oprobe lab --allow-remote` / `--max-store-size`.
+- **Native app & terminal TUI polish (`nsh 0.6.1`).**
+  - Stored proves (`<id>.prove.json`) reload in the Operator view across run switches and app
+    restarts, with **Compare A/B trials** and **Save as `op.toml`…**.
+  - Full terminal clipboard support (`TermClipboard`: OSC-52 with `tmux` passthrough, OS clipboard
+    tools and in-memory fallback), resizable sidebar and full keyboard shortcut parity in TUI.
+  - Overlay scrollbars (`ScrollbarTheme`), horizontal scrolling on wide Compare tables, keyboard
+    range selection (`←` / `→` / `Shift+←/→` / `Enter`) on timeline charts, single-instance
+    file wakeup (`next_second_instance`), and smart multi-file drag-and-drop / open (`op.toml`,
+    `.prove.json`, multiple `.oprobe` files → Compare).
+
+### Fixed
+
+- **Compilable OpenDAL 0.59 `to_rust` codegen.** Alias schemes (`gs://`, `r2://`, `lab://`) and
+  `[options]` now emit `Operator::via_iter` with canonical OpenDAL schemes and required
+  `HttpTransporter` / `OperationContext` / `ReqwestTransport` imports.
+- **`OpKind::Write` chunk & concurrency.** Direct `write` operations now apply `write.chunk` and
+  `write.concurrent` via `writer_with`, and record `"write.multipart"` when multipart uploads occur.
+- **Finding & `prove` accuracy.** Unshadowed `small_ranges` `read.gap` sizing (`4 KiB .. 32 MiB`),
+  refused `bandwidth_cap` layer proofs cleanly on read-only workloads, and preserved `.oprobe`
+  filenames with dots when writing `.tmp` files.
+- **Built-in lab fidelity.** Omitted illegal `connection: close` headers on HTTP/2 responses and
+  deduplicated `CommonPrefixes` across paginated `ListObjectsV2` delimiter responses.
+- **UI responsiveness & state safety.** Prevented 100 ms menu rebuilds during live jobs, isolated
+  reactive effects outside language-switch rebuilds, synced worker-thread `i18n` atomically, seeded
+  `http = 32` when toggling `layers.concurrent_limit` on, and routed non-lab **Run Again** through
+  plan review.
+
 ## v7.2.0 — 2026-11-24
 
 7.2 sharpens measurement accuracy, OpenDAL 0.59 code generation, `oprobe-trace` embedding safety,

@@ -929,17 +929,21 @@ async fn serve_s3_request(
     let _inflight_guard = ServerInflightGuard {
         store: store.clone(),
     };
+    let req_version = req.version();
     if let Some((status, code, msg)) = caps::admit(&store, req.method(), req.headers()) {
         let req_id = format!(
             "oprobe-s3-req-{:06}",
             store.req_seq.fetch_add(1, Ordering::Relaxed) + 1
         );
         let mut resp = s3_error(status, code, &msg, &req_id);
-        // The body is not read: ask the client to close the connection.
-        resp.headers_mut().insert(
-            http::header::CONNECTION,
-            http::HeaderValue::from_static("close"),
-        );
+        // The body is not read: ask an HTTP/1.x client to close the connection (RFC 9113 §8.2.2
+        // forbids connection-specific headers on HTTP/2+).
+        if req_version < http::Version::HTTP_2 {
+            resp.headers_mut().insert(
+                http::header::CONNECTION,
+                http::HeaderValue::from_static("close"),
+            );
+        }
         return Ok(resp);
     }
     let mut straggle = Duration::ZERO;
@@ -960,6 +964,7 @@ async fn handle_s3_request(
     let req_id = format!("oprobe-s3-req-{seq:06}");
     let faults = store.faults.read().expect("faults lock").clone();
 
+    let req_version = req.version();
     let method = req.method().clone();
     let uri = req.uri().clone();
     let qmap = parse_query_map(uri.query());
@@ -1026,7 +1031,7 @@ async fn handle_s3_request(
                  <RequestId>{req_id}</RequestId></Error>"
             );
             let mut resp = Response::builder();
-            if faults.throttle_early_close {
+            if faults.throttle_early_close && req_version < http::Version::HTTP_2 {
                 resp = resp.header("connection", "close");
             }
             return Ok(resp
@@ -1206,21 +1211,27 @@ async fn handle_s3_request(
                     if !start_after.is_empty() && rel_key <= start_after.as_str() {
                         continue;
                     }
-                    if count >= max_keys {
-                        truncated = true;
-                        break;
-                    }
                     if let Some(d) = &delimiter {
                         let rest = &rel_key[prefix.len()..];
                         if let Some(pos) = rest.find(d.as_str()) {
                             let cp = format!("{prefix}{}", &rest[..pos + d.len()]);
-                            if common.last() != Some(&cp) {
-                                common.push(cp.clone());
-                                count += 1;
+                            if common.last() == Some(&cp) {
+                                last_key = rel_key.to_owned();
+                                continue;
                             }
+                            if count >= max_keys {
+                                truncated = true;
+                                break;
+                            }
+                            common.push(cp);
+                            count += 1;
                             last_key = rel_key.to_owned();
                             continue;
                         }
+                    }
+                    if count >= max_keys {
+                        truncated = true;
+                        break;
                     }
                     count += 1;
                     last_key = rel_key.to_owned();

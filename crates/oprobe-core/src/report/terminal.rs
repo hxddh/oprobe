@@ -674,6 +674,9 @@ fn render_with(r: &Report, run: Option<&Run>, detail: bool) -> String {
         if let Some(w) = view.write_path.as_ref().filter(|w| w.shown()) {
             let _ = writeln!(out, "  {} {}", dim("writes"), w.line());
         }
+        if let Some(lp) = &view.list_path {
+            let _ = writeln!(out, "  {} {}", dim("lists"), lp.line());
+        }
         if detail && r.connections.http2_requests > 0 {
             let _ = writeln!(
                 out,
@@ -778,15 +781,8 @@ fn render_with(r: &Report, run: Option<&Run>, detail: bool) -> String {
             fmt_bytes(b.wire_tx),
         );
     }
-    if r.cache.enabled {
-        let _ = writeln!(
-            out,
-            "  cache {:.1}% hit ({} of {} lookups, mean {})",
-            r.cache.hit_ratio * 100.0,
-            r.cache.hits,
-            r.cache.lookups,
-            fmt_ms(r.cache.lookup_ms_mean)
-        );
+    if let Some(cv) = &view.cache {
+        let _ = writeln!(out, "  cache {}", cv.line());
     }
     if r.integrity.verified + r.integrity.corrupted > 0 {
         let _ = writeln!(

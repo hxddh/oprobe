@@ -1,17 +1,17 @@
-//! A production trace as a [`Run`]: the `oprobe.trace/7` file an application writes with the
-//! embedded `oprobe-trace` layer (`Handle::save`, `Snapshot::save`), built into a report by the
-//! same builder as a run ([`super::build_run`]), and marked for what it is (design v6 §2: the
-//! workbench opens it like any other profile).
+//! A production trace as a [`Run`]: the `oprobe.trace/8` (or `7` / `6`) file an application
+//! writes with the embedded `oprobe-trace` layer (`Handle::save`, `Snapshot::save`), built into
+//! a report by the same builder as a run ([`super::build_run`]), and marked for what it is
+//! (design v6 §2: the workbench opens it like any other profile).
 //!
 //! What differs from a run oprobe drove:
 //! - `run.source` is `trace`; there is no workload (no preset, mix or dataset) and nothing to
 //!   replay, so `oprobe prove` refuses it;
 //! - the operator is what the layer saw: the service's scheme, name (bucket) and root;
-//! - an `oprobe.trace/7` file has the application's operations (each OpenDAL call, linked to
-//!   the requests it issued; keys hashed, design v7 B1), so the summary, verbs, hot keys,
-//!   prefixes and over-read read them as a run's do. An `oprobe.trace/6` file has requests
-//!   only: each request stands in for one operation in the summary (count, failures, latency),
-//!   and the report says so;
+//! - an `oprobe.trace/8` (or `oprobe.trace/7`) file has the application's operations (each
+//!   OpenDAL call, linked to the requests it issued; keys hashed, design v7 B1), so the
+//!   summary, verbs, hot keys, prefixes and over-read read them as a run's do. An
+//!   `oprobe.trace/6` file has requests only: each request stands in for one operation in the
+//!   summary (count, failures, latency), and the report says so;
 //! - only the findings the trace can support are kept ([`TRACE_FINDINGS`], plus
 //!   [`OP_TRACE_FINDINGS`] when it has operations). The ones that need a load oprobe varied or
 //!   its own client (bandwidth cap, client bound) are not derived; the ones that judge the
@@ -107,7 +107,8 @@ pub fn custom_endpoint(r: &Report) -> Option<String> {
 
 /// The run that profiles the service a trace recorded, to prove a remedy on (`oprobe run
 /// s3://bucket/root`, with `--set options.endpoint=…` when the requests went to a custom
-/// endpoint); `None` when the file does not name the service.
+/// endpoint, and `--preset …` when the recorded operations match a non-default preset);
+/// `None` when the file does not name the service.
 pub fn run_command(r: &Report) -> Option<String> {
     let url = &r.spec.operator_ref;
     if url.is_empty() || url.starts_with("unknown://") {
@@ -120,7 +121,67 @@ pub fn run_command(r: &Report) -> Option<String> {
             super::spec::shell_quote(&format!("options.endpoint={e}"))
         );
     }
+    if let Some(preset) = inferred_preset(r) {
+        c += &format!(" --preset {preset}");
+    }
     Some(c)
+}
+
+fn inferred_preset(r: &Report) -> Option<&'static str> {
+    let total: u64 = r.verbs.iter().map(|v| v.count).sum();
+    if total == 0 {
+        return None;
+    }
+    let writes: u64 = r
+        .verbs
+        .iter()
+        .filter(|v| {
+            v.verb.starts_with("write")
+                || matches!(
+                    v.verb.as_str(),
+                    "PutObject" | "UploadPart" | "CreateMultipart"
+                )
+        })
+        .map(|v| v.count)
+        .sum();
+    let meta: u64 = r
+        .verbs
+        .iter()
+        .filter(|v| {
+            matches!(
+                v.verb.as_str(),
+                "list" | "stat" | "ListObjectsV2" | "HeadObject"
+            )
+        })
+        .map(|v| v.count)
+        .sum();
+    let ranges: u64 = r
+        .verbs
+        .iter()
+        .filter(|v| v.verb == "read.range" || v.verb.contains("parquet"))
+        .map(|v| v.count)
+        .sum();
+    let multipart = r
+        .verbs
+        .iter()
+        .any(|v| v.verb.contains("multipart") || v.verb == "UploadPart")
+        || r.apis
+            .iter()
+            .any(|a| a.api.label() == "UploadPart" && a.count > 0);
+    let max_bpo = r
+        .verbs
+        .iter()
+        .map(|v| v.bytes_per_op)
+        .fold(0.0_f64, f64::max);
+    if writes == 0 && meta.saturating_mul(10) >= total.saturating_mul(7) {
+        Some("list-stat")
+    } else if writes == 0 && ranges.saturating_mul(2) >= total {
+        Some("range-reads")
+    } else if multipart || max_bpo >= (4 << 20) as f64 {
+        Some("large-objects")
+    } else {
+        None
+    }
 }
 
 /// `2026-11-22T10:00:00Z` as a time.

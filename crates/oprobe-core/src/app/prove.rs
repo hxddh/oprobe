@@ -123,6 +123,9 @@ pub struct ProveRequest {
     pub pairs: usize,
     /// Measurement window of one trial (default 2s, at most the run's own window)
     pub trial_duration: Option<String>,
+    /// Write the proven operator to an `op.toml` file or `[operators.NAME]` when `improved`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub save: Option<String>,
     pub safety: Safety,
 }
 
@@ -137,6 +140,7 @@ impl Default for ProveRequest {
             budget: None,
             pairs: crate::config::prove_defaults::MAX_PAIRS,
             trial_duration: None,
+            save: None,
             safety: Safety::default(),
         }
     }
@@ -266,6 +270,9 @@ pub struct ProveOutput {
     /// prove before it could finish: the result reads what was measured (exit 4).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub budget_exceeded: bool,
+    /// Where the proven operator was written (`--save`, when `verdict == improved`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saved_to: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<String>,
 }
@@ -388,6 +395,9 @@ impl CommandOutput for ProveOutput {
         }
         if !self.diff.toml.is_empty() {
             o += &format!("{}\n{}", dim("op.toml:"), self.diff.toml);
+        }
+        if let Some(dest) = &self.saved_to {
+            o += &format!("{} {dest}\n", green("saved"));
         }
         o
     }
@@ -797,15 +807,23 @@ fn remedy_change(run: &Run, f: &Finding) -> Result<Change> {
             }
         }
         "bandwidth_cap" => {
-            let bps = evidence(f, "fitted_bytes_per_s")
-                .unwrap_or(r.summary.mib_per_s * 1024.0 * 1024.0)
-                .max(1024.0 * 1024.0);
-            let mib = ((bps / (1024.0 * 1024.0)).floor() as u64).max(1) << 20;
             let writes = r
                 .workload
                 .mix
                 .iter()
                 .any(|m| m.weight > 0 && m.op.contains("write"));
+            if !writes {
+                return Err(OprobeError::new(
+                    ErrorCode::UsageInvalidArgument,
+                    "finding `bandwidth_cap` on a read workload has no operator remedy to prove (OpenDAL's ThrottleLayer shapes writes only)",
+                )
+                .with_hint("pass the change to test with --with PATH=VALUE")
+                .into());
+            }
+            let bps = evidence(f, "fitted_bytes_per_s")
+                .unwrap_or(r.summary.mib_per_s * 1024.0 * 1024.0)
+                .max(1024.0 * 1024.0);
+            let mib = ((bps / (1024.0 * 1024.0)).floor() as u64).max(1) << 20;
             c.sized = Some(SizedPath {
                 path: "layers.throttle.bandwidth".into(),
                 domain: Domain::Bytes {
@@ -815,16 +833,8 @@ fn remedy_change(run: &Run, f: &Finding) -> Result<Change> {
                 start: mib,
                 start_why: "the fitted aggregate cap".into(),
                 follow: throttle_burst_follow,
-                unmeasured: (!writes).then(|| {
-                    "taken from the fitted cap: OpenDAL's ThrottleLayer shapes writes only, and this workload reads".to_owned()
-                }),
+                unmeasured: None,
             });
-            if !writes {
-                c.notes.push(
-                    "OpenDAL's ThrottleLayer limits write bandwidth only: on a read workload it changes nothing, so the A/B test can only show no loss; the reads' gain is not adding streams beyond the cap"
-                        .into(),
-                );
-            }
         }
         "tail_stragglers" => {
             c.fixed.push(("layers.tail_cut".into(), "on".into()));
@@ -878,10 +888,10 @@ fn remedy_change(run: &Run, f: &Finding) -> Result<Change> {
                 path: "read.gap".into(),
                 domain: Domain::Bytes {
                     min: 4 << 10,
-                    max: 16 << 20,
+                    max: 32 << 20,
                 },
-                start: 256 << 10,
-                start_why: "OpenDAL's usual coalescing gap".into(),
+                start: 2 << 20,
+                start_why: "twice OpenDAL's 1 MiB default coalescing gap".into(),
                 follow: no_follow,
                 unmeasured: None,
             });
@@ -1988,6 +1998,25 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
             None => r.target.display.clone(),
         }
     };
+    let raw_edits: Vec<String> = sets.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    let mut saved_to = None;
+    if let Some(dest) = &req.save {
+        if verdict == ProveVerdict::Improved {
+            saved_to = Some(
+                ctx.app()
+                    .save_operator_target(dest, base_spec, &raw_edits)?,
+            );
+        } else {
+            let v_label = match verdict {
+                ProveVerdict::Improved => "improved",
+                ProveVerdict::Worse => "worse",
+                ProveVerdict::Inconclusive => "inconclusive",
+            };
+            notes.push(format!(
+                "--save `{dest}` skipped: verdict is {v_label}, not improved"
+            ));
+        }
+    }
     let out = ProveOutput {
         prove_id: prove_id.clone(),
         run_id: run.id().to_owned(),
@@ -2010,6 +2039,7 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
         trials: t.out.clone(),
         diff,
         budget_exceeded,
+        saved_to,
         notes,
     };
     if let Err(e) = ctx
@@ -2068,6 +2098,7 @@ mod tests {
             trials: Vec::new(),
             diff: crate::operator::diff::diff(&a, &b),
             budget_exceeded: pairs == 0,
+            saved_to: None,
             notes: vec!["the budget ran out before one pair of trials could run".into()],
         }
     }

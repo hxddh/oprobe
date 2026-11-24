@@ -499,11 +499,88 @@ fn inline(v: &toml::Value) -> String {
     }
 }
 
-/// The whole operator as Rust: the service from its URL and every layer of the stack.
+const CANONICAL_URI_SCHEMES: &[&str] = &[
+    "s3", "gcs", "azblob", "azdls", "azfile", "oss", "cos", "obs", "tos", "b2", "swift", "webdav",
+    "webhdfs", "upyun", "http", "fs", "memory",
+];
+
+fn resolved_rust_target(s: &OperatorSpec) -> (String, BTreeMap<String, String>) {
+    let red = s.redacted();
+    let url = red.display_url();
+    let raw_scheme = url
+        .split_once("://")
+        .map(|(k, _)| k.to_ascii_lowercase())
+        .unwrap_or_default();
+    if raw_scheme == "lab" {
+        let mut opts = red.options.clone();
+        let rest = url.strip_prefix("lab://").unwrap_or_default();
+        let path = rest.split_once('/').map_or("", |(_, p)| p);
+        let root = path.split('?').next().unwrap_or_default().trim_matches('/');
+        opts.entry("bucket".into())
+            .or_insert_with(|| crate::lab::LAB_BUCKET.into());
+        opts.entry("region".into())
+            .or_insert_with(|| "us-east-1".into());
+        opts.entry("endpoint".into())
+            .or_insert_with(|| "http://127.0.0.1:9000".into());
+        opts.entry("disable_config_load".into())
+            .or_insert_with(|| "true".into());
+        if !root.is_empty() {
+            opts.entry("root".into())
+                .or_insert_with(|| format!("/{root}"));
+        }
+        return ("s3".into(), opts);
+    }
+    if let Ok(mut t) = red.target() {
+        t.options.remove("ca_cert_pem");
+        return (t.scheme, t.options);
+    }
+    if let Ok(mut t) = crate::config::TargetSpec::from_url(&url) {
+        for (k, v) in red.options {
+            t.options.insert(k, v);
+        }
+        t.options.remove("ca_cert_pem");
+        return (t.scheme, t.options);
+    }
+    let svc = crate::input::scheme(&raw_scheme).unwrap_or("s3").to_owned();
+    (svc, red.options)
+}
+
+/// The whole operator as Rust: the service from its URL (or canonical scheme and options) and
+/// every layer of the stack.
 pub fn to_rust(s: &OperatorSpec) -> String {
-    let mut out = format!("let op = Operator::from_uri({:?})?\n", s.display_url());
-    for (k, v) in &s.redacted().options {
-        let _ = writeln!(out, "    // option {k} = {v:?}");
+    let mut out = String::new();
+    let need_http = s.http.version != HttpVersion::Auto || !s.http.keep_alive;
+    if need_http {
+        let _ = writeln!(out, "use opendal::{{HttpTransporter, OperationContext}};");
+        let _ = writeln!(
+            out,
+            "use opendal_http_transport_reqwest::ReqwestTransport;\n"
+        );
+    }
+    let disp_url = s.display_url();
+    let url_scheme = disp_url
+        .split_once("://")
+        .map(|(k, _)| k.to_ascii_lowercase())
+        .unwrap_or_default();
+    let plain_uri = s.options.is_empty()
+        && CANONICAL_URI_SCHEMES.contains(&url_scheme.as_str())
+        && !disp_url.contains('?');
+    if plain_uri {
+        let _ = writeln!(out, "let op = Operator::from_uri({disp_url:?})?");
+    } else {
+        let (scheme, opts) = resolved_rust_target(s);
+        if opts.is_empty() {
+            let _ = writeln!(
+                out,
+                "let op = Operator::via_iter({scheme:?}, std::iter::empty::<(&str, &str)>())?"
+            );
+        } else {
+            let _ = writeln!(out, "let op = Operator::via_iter(\n    {scheme:?},\n    [");
+            for (k, v) in &opts {
+                let _ = writeln!(out, "        ({k:?}, {v:?}),");
+            }
+            let _ = writeln!(out, "    ],\n)?");
+        }
     }
     for name in LAYER_ORDER {
         if let Some(e) = layer_rust(s, name) {
@@ -517,7 +594,7 @@ pub fn to_rust(s: &OperatorSpec) -> String {
     if !s.write.is_default() {
         let _ = writeln!(out, "let writer = {}.await?;", write_rust(s));
     }
-    if s.http.version != HttpVersion::Auto || !s.http.keep_alive {
+    if need_http {
         let (client, alpn_h2) = http_client_expr(s);
         if alpn_h2 {
             let _ = writeln!(out, "// reqwest `http2` feature negotiates ALPN h2");
@@ -869,6 +946,41 @@ mod tests {
         assert!(
             full.contains("let op = op.with_context(OperationContext::new().with_http_transport(HttpTransporter::new(ReqwestTransport::new(client))));"),
             "{full}"
+        );
+        assert!(
+            full.contains("use opendal::raw::HttpTransporter;")
+                && full.contains("use opendal::OperationContext;")
+                && full.contains("ReqwestTransport"),
+            "{full}"
+        );
+    }
+
+    #[test]
+    fn to_rust_uses_canonical_schemes_and_via_iter_when_options_or_aliases_exist() {
+        let gcs = OperatorSpec::parse(
+            "url = \"gs://my-bucket/data\"\n[options]\nservice_account = \"sa@proj.iam\"\n",
+        )
+        .unwrap();
+        let r = to_rust(&gcs);
+        assert!(r.contains("Operator::via_iter(\"gcs\","), "{r}");
+        assert!(r.contains("(\"bucket\", \"my-bucket\")"), "{r}");
+        assert!(r.contains("(\"root\", \"/data\")"), "{r}");
+        assert!(r.contains("(\"service_account\", \"sa@proj.iam\")"), "{r}");
+
+        let r2 = OperatorSpec::from_url("r2://assets/img");
+        let r2_code = to_rust(&r2);
+        assert!(r2_code.contains("Operator::via_iter(\"s3\","), "{r2_code}");
+        assert!(r2_code.contains("(\"bucket\", \"assets\")"), "{r2_code}");
+
+        let lab = OperatorSpec::from_url("lab://demo");
+        let lab_code = to_rust(&lab);
+        assert!(
+            lab_code.contains("Operator::via_iter(\"s3\","),
+            "{lab_code}"
+        );
+        assert!(
+            lab_code.contains("(\"endpoint\", \"http://127.0.0.1:9000\")"),
+            "{lab_code}"
         );
     }
 }

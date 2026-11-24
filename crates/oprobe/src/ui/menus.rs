@@ -301,11 +301,24 @@ pub fn application(s: Store) -> Vec<MenuItem> {
     menus
 }
 
-/// Keep the menu bar in step with the language and the app's state.
+/// Keep the menu bar in step with the language and the app's discrete state transitions
+/// (never rebuilding OS menus on 100 ms progress ticks).
 pub fn install(s: Store) {
+    let key = computed(move || {
+        (
+            s.lang.get(),
+            s.modal(),
+            s.running(),
+            s.proving(),
+            s.selection.get(),
+            s.current.with(|c| c.is_some()),
+            s.page.get(),
+            s.sidebar.get(),
+        )
+    });
     effect(move || {
-        let _ = s.lang.get();
-        set_application_menu(application(s));
+        let _ = key.get();
+        set_application_menu(untracked(|| application(s)));
     });
 }
 
@@ -314,14 +327,21 @@ pub fn install(s: Store) {
 /// shortcuts belong to, and in the toolbar.
 pub fn primary(s: Store) -> Vec<MenuItem> {
     let modal = s.modal();
+    let term = crate::ui::kit::in_terminal();
     let mut items = vec![
         MenuItem::new(tr("menu.new_run"))
             .disabled(modal)
             .on_select(move || s.dialog.set(Some(Dialog::NewRun))),
-        MenuItem::new(tr("menu.open_file"))
-            .disabled(modal)
-            .on_select(move || s.pick_run_file()),
-        MenuItem::separator(),
+    ];
+    if !term {
+        items.push(
+            MenuItem::new(tr("menu.open_file"))
+                .disabled(modal)
+                .on_select(move || s.pick_run_file()),
+        );
+    }
+    items.push(MenuItem::separator());
+    items.push(
         MenuItem::new(if s.sidebar.get() {
             tr("menu.hide_sidebar")
         } else {
@@ -329,16 +349,20 @@ pub fn primary(s: Store) -> Vec<MenuItem> {
         })
         .disabled(modal)
         .on_select(move || s.sidebar.update(|v| *v = !*v)),
-        MenuItem::new(tr("menu.full_screen")).on_select(toggle_full_screen),
-        MenuItem::separator(),
+    );
+    if !term {
+        items.push(MenuItem::new(tr("menu.full_screen")).on_select(toggle_full_screen));
+    }
+    items.push(MenuItem::separator());
+    items.push(
         MenuItem::new(tr(settings_key()))
             .disabled(modal)
             .on_select(move || s.open_settings()),
-    ];
+    );
     items.extend(help_items());
     items.push(about_item(s, modal));
     // A terminal quits with Ctrl+C.
-    if !crate::ui::kit::in_terminal() {
+    if !term {
         items.push(MenuItem::separator());
         items.push(if windows() {
             MenuItem::new(tr("menu.exit")).on_select(move || s.request_quit())

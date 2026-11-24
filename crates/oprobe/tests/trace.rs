@@ -119,7 +119,7 @@ async fn show_opens_a_production_trace_and_prove_refuses_it() {
     // Keys are hashed (docs/privacy.md): the first path segment, never the key.
     assert!(!text.contains("logs/k1"), "a key is in the file");
     let doc: Value = serde_json::from_str(&text).unwrap();
-    assert_eq!(doc["format"], "oprobe.trace/7");
+    assert_eq!(doc["format"], "oprobe.trace/8");
     assert_eq!(doc["service"]["scheme"], "s3");
     assert_eq!(doc["service"]["name"], "app-bucket");
     let reqs_in_file = doc["rows"]["reqs"].as_array().unwrap().len() as u64;
@@ -349,10 +349,28 @@ async fn a_6x_trace_still_opens() {
                 .is_empty()
         );
     }
+    // 7.x trace files still open with full operation fidelity.
+    let mut d7 = doc.clone();
+    d7["format"] = "oprobe.trace/7".into();
+    d7["oprobe_trace_version"] = "7.2.0".into();
+    let file7 = dir.path().join("v7-compat.oprobe");
+    std::fs::write(&file7, serde_json::to_vec(&d7).unwrap()).unwrap();
+    let o7 = oprobe(dir.path(), &["show", file7.to_str().unwrap(), "-o", "json"]);
+    assert_eq!(
+        o7.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&o7.stderr)
+    );
+    let r7 = &json(&o7)["report"];
+    validate("report", r7);
+    assert_eq!(r7["run"]["oprobe_version"], "7.2.0");
+    assert_eq!(r7["summary"]["ops_count"].as_u64().unwrap(), 100);
+
     // A later major is refused, with a hint.
     let mut d = doc.clone();
-    d["format"] = "oprobe.trace/8".into();
-    let file = dir.path().join("v8.oprobe");
+    d["format"] = "oprobe.trace/9".into();
+    let file = dir.path().join("v9.oprobe");
     std::fs::write(&file, serde_json::to_vec(&d).unwrap()).unwrap();
     let o = oprobe(dir.path(), &["show", file.to_str().unwrap(), "-o", "json"]);
     assert_eq!(o.status.code(), Some(2));

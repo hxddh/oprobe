@@ -358,7 +358,7 @@ impl RunStore {
         load_path(&path)
     }
 
-    /// Delete a stored run (file and sidecar).
+    /// Delete a stored run (file and sidecar; stored proves keep standing on their own).
     pub fn delete(&self, id: &str) -> Result<()> {
         let p = self.run_path(id);
         std::fs::remove_file(&p).map_err(|e| {
@@ -429,6 +429,115 @@ impl RunStore {
         Ok(v.into_iter().map(|x| x.1).collect())
     }
 
+    /// Ids of stored proves, oldest first.
+    pub fn prove_ids(&self) -> Result<Vec<String>> {
+        let rd = match std::fs::read_dir(&self.dir) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let mut ids: Vec<String> = rd
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                let id = name.strip_suffix(".prove.json")?;
+                RunId::parse(id).map(|_| id.to_owned())
+            })
+            .collect();
+        ids.sort();
+        Ok(ids)
+    }
+
+    /// Stored prove ids whose baseline `run_id` is `run_id`, newest first.
+    pub fn proves_of_run(&self, run_id: &str) -> Result<Vec<String>> {
+        Ok(self
+            .proves()?
+            .into_iter()
+            .filter_map(|v| {
+                (v.get("run_id").and_then(|x| x.as_str()) == Some(run_id))
+                    .then(|| {
+                        v.get("prove_id")
+                            .and_then(|x| x.as_str())
+                            .map(str::to_owned)
+                    })
+                    .flatten()
+            })
+            .collect())
+    }
+
+    /// Resolve a prove reference: a `.prove.json` path, `last-prove`, an exact `prove_id`, or
+    /// an unambiguous `prove_id` prefix (when no stored run matches `r`).
+    pub fn resolve_prove(&self, r: &str) -> Result<Option<PathBuf>> {
+        let r = r.trim();
+        if r.is_empty() {
+            return Ok(None);
+        }
+        let p = Path::new(r);
+        if r.ends_with(".prove.json") {
+            return if p.is_file() {
+                Ok(Some(p.to_path_buf()))
+            } else {
+                Err(
+                    OprobeError::new(ErrorCode::UsageUnknownRun, format!("no prove file `{r}`"))
+                        .with_hint("list proves with `oprobe show --list`")
+                        .into(),
+                )
+            };
+        }
+        if (r.contains('/') || r.contains(std::path::MAIN_SEPARATOR) || r.ends_with(".json"))
+            && p.is_file()
+            && let Ok(raw) = std::fs::read(p)
+            && let Ok(v) = serde_json::from_slice::<serde_json::Value>(&raw)
+            && v.get("prove_id").is_some()
+            && v.get("verdict").is_some()
+        {
+            return Ok(Some(p.to_path_buf()));
+        }
+        let pids = self.prove_ids()?;
+        if r == "last-prove" {
+            return pids
+                .last()
+                .map(|id| Ok(Some(self.prove_path(id))))
+                .unwrap_or_else(|| {
+                    Err(
+                        OprobeError::new(ErrorCode::UsageUnknownRun, "no proves yet")
+                            .with_hint("run `oprobe prove RUN` first")
+                            .into(),
+                    )
+                });
+        }
+        if pids.iter().any(|id| id == r) {
+            return Ok(Some(self.prove_path(r)));
+        }
+        if r == "last" || r.starts_with("last~") {
+            return Ok(None);
+        }
+        // Only treat `r` as a prove prefix when no stored run starts with `r`.
+        if self.ids()?.iter().any(|id| id.starts_with(r)) {
+            return Ok(None);
+        }
+        let matches: Vec<&String> = pids.iter().filter(|id| id.starts_with(r)).collect();
+        match matches.len() {
+            0 => Ok(None),
+            1 => Ok(Some(self.prove_path(matches[0]))),
+            n => Err(OprobeError::new(
+                ErrorCode::UsageUnknownRun,
+                format!("prove reference `{r}` is ambiguous ({n} proves match)"),
+            )
+            .with_hint(format!(
+                "use more characters: {}",
+                matches
+                    .iter()
+                    .rev()
+                    .take(5)
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+            .into()),
+        }
+    }
+
     /// Delete a stored prove and its trial runs. `false` when `id` is not a prove.
     pub fn delete_prove(&self, id: &str) -> Result<bool> {
         let p = self.prove_path(id);
@@ -446,17 +555,27 @@ impl RunStore {
     /// prove's result and its trial runs' files.
     fn files_of(&self, id: &str) -> Result<Vec<PathBuf>> {
         let mut v = Vec::new();
+        let mut push = |p: PathBuf| {
+            if !v.contains(&p) {
+                v.push(p);
+            }
+        };
         let prove = self.prove_path(id);
         if prove.is_file() {
             for c in self.children(id)? {
-                v.extend(self.files_of(&c)?);
+                for f in self.files_of(&c)? {
+                    push(f);
+                }
             }
-            v.push(prove);
+            push(prove);
         }
-        for p in [self.run_path(id), self.sidecar_path(id)] {
-            if p.is_file() {
-                v.push(p);
-            }
+        let run_file = self.run_path(id);
+        if run_file.is_file() {
+            push(run_file);
+        }
+        let sidecar = self.sidecar_path(id);
+        if sidecar.is_file() {
+            push(sidecar);
         }
         Ok(v)
     }

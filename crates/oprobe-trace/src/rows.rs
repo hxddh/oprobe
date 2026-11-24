@@ -113,9 +113,13 @@ impl FailureCode {
     }
 
     /// [`FailureCode::from_status`], refined by the provider's error code when it names the
-    /// failure more precisely (Azure `BlobAlreadyExists` on a 409, an in-process backend's
-    /// OpenDAL kind).
+    /// failure more precisely (Azure `BlobAlreadyExists` on a 409, `InternalError` /
+    /// `ServiceUnavailable` on a 503, `tail_cut` on a cancelled hedge, or an in-process
+    /// backend's OpenDAL kind).
     pub fn of_request(status: u16, provider_code: Option<&str>) -> Option<Self> {
+        if provider_code == Some("tail_cut") {
+            return Some(Self::NetTimeout);
+        }
         let code = Self::from_status(status)?;
         Some(match provider_code {
             Some(c) if c.ends_with("AlreadyExists") => Self::StorageAlreadyExists,
@@ -123,6 +127,7 @@ impl FailureCode {
                 Self::StorageConditionNotMatch
             }
             Some("InvalidRange" | "RangeNotSatisfied") => Self::StorageRangeNotSatisfied,
+            Some("InternalError" | "ServiceUnavailable") if status == 503 => Self::Internal,
             _ => code,
         })
     }
@@ -297,6 +302,24 @@ pub struct ReqDetail {
     /// success.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temporary: Option<bool>,
+    /// Actively cancelled by `TailCutLayer` to re-issue a faster attempt.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub cut: bool,
+    /// Cancelled or dropped before the response completed (timeout, tail-cut or caller drop).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub aborted: bool,
+    /// Edge / CDN point of presence (`x-amz-cf-pop`, `cf-ray` airport code, `x-served-by`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cdn_pop: Option<String>,
+    /// Cached object age in seconds (`Age` header).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub age_s: Option<u64>,
+    /// Object storage class or access tier (`x-amz-storage-class`, `x-ms-access-tier`, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_class: Option<String>,
+    /// Server-side encryption algorithm (`x-amz-server-side-encryption`, e.g. `aws:kms`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encryption: Option<String>,
 }
 
 impl ReqDetail {
@@ -369,10 +392,15 @@ impl ReqRow {
         self.dns_us + self.tcp_us + self.proxy_us + self.tls_us
     }
     pub fn is_throttle(&self) -> bool {
-        matches!(self.status, 429 | 503)
+        self.status == 429
+            || (self.status == 503
+                && !matches!(
+                    self.detail.as_deref().and_then(|d| d.error_code.as_deref()),
+                    Some("InternalError" | "ServiceUnavailable")
+                ))
     }
     pub fn is_error(&self) -> bool {
-        self.status == 0 || self.status >= 400
+        self.status == 0 || self.status >= 400 || self.error.is_some()
     }
 }
 

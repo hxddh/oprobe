@@ -882,6 +882,20 @@ async fn run_one(
             (0, 0, Some(error_class(&e, status)))
         }
     };
+    let data = scope.take();
+    let name = if name == "write"
+        && data.requests.iter().any(|r| {
+            matches!(
+                r.api,
+                crate::trace::Api::UploadPart
+                    | crate::trace::Api::CreateMultipart
+                    | crate::trace::Api::CompleteMultipart
+            )
+        }) {
+        "write.multipart"
+    } else {
+        name
+    };
     rec.complete_op(
         measured,
         OpCompletion {
@@ -893,7 +907,7 @@ async fn run_one(
             logical_write: lw,
             error,
             key,
-            data: scope.take(),
+            data,
             schedule_us,
         },
     );

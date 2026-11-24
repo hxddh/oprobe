@@ -203,6 +203,10 @@ pub struct ProfileModel {
     pub conns: view::ConnectionView,
     /// The multipart part size OpenDAL wrote with and the parts it uploaded (runs that wrote).
     pub write_path: Option<view::WritePathView>,
+    pub cache: Option<view::CacheView>,
+    pub list_path: Option<view::ListView>,
+    /// Stored proves for this run (`<id>.prove.json`), newest first.
+    pub proves: Vec<super::jobs::Proved>,
     pub warnings: Vec<String>,
     /// The run and its rows: what a range, a filter or a drill-down is recomputed from.
     pub rows: Rows,
@@ -295,7 +299,16 @@ pub fn profile(app: &App, id: &str) -> Result<ProfileModel> {
             reqs: Vec::new(),
         },
     };
-    Ok(of_rows(Arc::new(run)))
+    let mut m = of_rows(Arc::new(run));
+    if let Ok(proves) = app.store().proves() {
+        m.proves = proves
+            .into_iter()
+            .filter(|v| v.get("run_id").and_then(|x| x.as_str()) == Some(m.id.as_str()))
+            .filter_map(|v| serde_json::from_value::<crate::app::ProveOutput>(v).ok())
+            .map(super::jobs::Proved::from_output)
+            .collect();
+    }
+    Ok(m)
 }
 
 fn verb_row(v: view::VerbView) -> VerbRow {
@@ -374,7 +387,10 @@ fn of_rows(rows: Arc<Run>) -> ProfileModel {
         bytes: view::BytesView::of(r),
         spread: view::SpreadView::of(r),
         conns: view::ConnectionView::of(r, Some(run)),
-        write_path: view::WritePathView::of(r),
+        write_path: view::WritePathView::of_with(r, Some(run)),
+        cache: view::CacheView::of(r),
+        list_path: view::ListView::of(r, Some(run)),
+        proves: Vec::new(),
         warnings: r.warnings.clone(),
         rows: Rows(rows.clone()),
     }

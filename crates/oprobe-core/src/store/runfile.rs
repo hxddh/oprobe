@@ -552,7 +552,9 @@ impl RunFileWriter {
             super::create_private_dir_all(dir)
                 .with_context(|| format!("cannot create {}", dir.display()))?;
         }
-        let tmp = path.with_extension("oprobe.tmp");
+        let mut tmp_os = path.as_os_str().to_os_string();
+        tmp_os.push(".tmp");
+        let tmp = PathBuf::from(tmp_os);
         let file =
             super::private_file(&tmp).with_context(|| format!("cannot write {}", tmp.display()))?;
         let enc = zstd::stream::Encoder::new(BufWriter::new(file), ZSTD_LEVEL)?;

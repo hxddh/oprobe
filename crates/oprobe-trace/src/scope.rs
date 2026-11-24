@@ -40,6 +40,9 @@ pub struct OpScopeData {
     pub throttled: bool,
     /// Set by [`OpScope::take`]: the operation is complete and its data handed over.
     pub closed: bool,
+    /// When the operation's inner future first parked (`Poll::Pending`) before reaching the
+    /// HTTP transport (e.g. waiting on `ConcurrentLimitLayer`'s HTTP semaphore).
+    pub pre_fetch_park: Option<Instant>,
 }
 
 /// Collects everything that happened underneath one logical operation.
@@ -105,6 +108,7 @@ impl OpScope {
             if d.closed {
                 return Some(rec);
             }
+            d.pre_fetch_park = None;
             if rec.is_throttle() {
                 d.throttled = true;
             }
@@ -124,15 +128,63 @@ impl OpScope {
         }
     }
 
+    /// Number of backend requests recorded on this scope so far.
+    pub fn requests_recorded(&self) -> u64 {
+        self.with(|d| d.requests.len() as u64 + d.dropped_requests)
+    }
+
+    /// Record a local cache lookup (hit or miss) performed for this operation.
+    pub fn record_cache_lookup(&self, hit: bool, hit_bytes: u64, lookup_us: u64) {
+        self.with(|d| {
+            if d.closed {
+                return;
+            }
+            d.cache_lookups += 1;
+            d.cache_lookup_us += lookup_us;
+            if hit {
+                d.cache_hits += 1;
+                d.cache_hit_bytes += hit_bytes;
+            }
+        });
+    }
+
+    /// Note that an inner call yielded (`Poll::Pending`) before entering the HTTP transport,
+    /// when no request of this call has entered the transport yet.
+    pub fn note_pre_fetch_park(&self, at: Instant) {
+        self.with(|d| {
+            if !d.closed && d.requests.is_empty() && d.pre_fetch_park.is_none() {
+                d.pre_fetch_park = Some(at);
+            }
+        });
+    }
+
+    /// Take the timestamp at which this operation parked on an outer gate before entering the
+    /// HTTP transport.
+    pub fn take_pre_fetch_park(&self) -> Option<Instant> {
+        self.with(|d| d.pre_fetch_park.take())
+    }
+
     /// The retry layer is about to sleep `backoff` before the next attempt: account the
     /// attempt and the wait interval (attributed to *retry* in the time breakdown).
     pub fn record_retry(&self, backoff: std::time::Duration, throttled: bool) {
+        self.record_retry_with_cut(backoff, throttled, false);
+    }
+
+    /// [`Self::record_retry`], marking the preceding cancelled attempt as a `TailCutLayer` cut
+    /// when `tail_cut` is set.
+    pub fn record_retry_with_cut(
+        &self,
+        backoff: std::time::Duration,
+        throttled: bool,
+        tail_cut: bool,
+    ) {
         let start = self.started.elapsed().as_micros() as u64;
         let us = backoff.as_micros() as u64;
         self.with(|d| {
             if d.closed {
                 return;
             }
+            d.pre_fetch_park = None;
             d.retries += 1;
             d.retry_backoff_us += us;
             if d.retry_waits.len() < MAX_RETRY_WAITS_PER_OP {
@@ -140,6 +192,18 @@ impl OpScope {
             }
             if throttled {
                 d.throttled = true;
+            }
+            if tail_cut
+                && let Some(last) = d.requests.last_mut()
+                && (last.status == 0 || last.error.is_some())
+            {
+                let det = last.detail.get_or_insert_with(Default::default);
+                det.cut = true;
+                det.aborted = true;
+                det.temporary = Some(true);
+                if det.error_code.is_none() {
+                    det.error_code = Some("tail_cut".into());
+                }
             }
         });
     }
