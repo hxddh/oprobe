@@ -53,7 +53,9 @@ fn content(s: Store, m: Rc<ProfileModel>) -> View {
     for (name, fields) in SECTIONS {
         v = v.child(section_of(s, name, fields, &m, &remedies, edited));
     }
-    v.child(changes(s, m.clone(), edited)).child(prove(s))
+    let has_file = m.operator_file.is_some();
+    v.child(changes(s, m.clone(), edited))
+        .child(prove(s, has_file))
 }
 
 fn remedy_list(s: Store, m: &ProfileModel) -> View {
@@ -306,7 +308,7 @@ fn changes(s: Store, m: Rc<ProfileModel>, edited: Edited) -> View {
     }))
 }
 
-fn prove(s: Store) -> View {
+fn prove(s: Store, has_file: bool) -> View {
     section(tr("operator.prove"))
         .test_id("prove")
         .child(small(tr("operator.prove_hint")))
@@ -384,11 +386,11 @@ fn prove(s: Store) -> View {
         .child(dynamic(move || {
             let st = s.prove_state.get();
             let p99 = s.objective.get() == ProveObjective::P99;
-            untracked(|| st.map(|st| prove_state(st, p99)))
+            untracked(|| st.map(|st| prove_state(s, st, p99, has_file)))
         }))
 }
 
-fn prove_state(st: crate::ui::jobs::State, p99: bool) -> View {
+fn prove_state(s: Store, st: crate::ui::jobs::State, p99: bool, has_file: bool) -> View {
     let ps = pairs(&st.trials);
     let unit = |v: f64| {
         if p99 {
@@ -464,7 +466,21 @@ fn prove_state(st: crate::ui::jobs::State, p99: bool) -> View {
                 .child(caption(tr("operator.proven_diff")))
                 .child(code(p.rust.clone()))
                 .child((!p.toml.is_empty()).then(|| code(p.toml.clone())))
-                .child(copy_row(p.rust.clone(), p.toml.clone()))
+                .child({
+                    let mut actions = copy_row(p.rust.clone(), p.toml.clone());
+                    if has_file && !p.change.is_empty() {
+                        let change = p.change.clone();
+                        actions = actions.child(
+                            btn(
+                                tr("operator.save_toml"),
+                                || Kind::Plain,
+                                move || s.save_proven_to_file(&change),
+                            )
+                            .test_id("save-operator"),
+                        );
+                    }
+                    actions
+                })
         }
         Some(Outcome::Stopped) => v.child(small(tr("operator.stopped"))),
         Some(Outcome::Failed { message, .. }) => {

@@ -1004,6 +1004,32 @@ impl Store {
         }
     }
 
+    /// Write a proven change back into the run's `op.toml` file (`App::save_operator_edits`).
+    pub fn save_proven_to_file(&self, edits: &[String]) {
+        let Some(cur) = self.current.get_untracked() else {
+            return;
+        };
+        let Some(path) = cur.operator_file.clone() else {
+            return;
+        };
+        match self.app().save_operator_edits(&path, edits) {
+            Ok(spec) => {
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string());
+                let mut updated = (*cur).clone();
+                updated.operator = spec.redacted();
+                batch(|| {
+                    self.current.set(Some(Rc::new(updated)));
+                    self.edits.set(BTreeMap::new());
+                });
+                self.say(i18n::trf("operator.saved_toml", &[&name]), Tone::Ok);
+            }
+            Err(e) => self.say(format!("{e:#}"), Tone::Crit),
+        }
+    }
+
     // ---------------------------------------------------------------------------------
     // Quitting and closing
     // ---------------------------------------------------------------------------------

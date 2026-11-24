@@ -5,7 +5,6 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
 documentation.workspace = true
 description = "A profiler for Apache OpenDAL operators: what your Operator does on the wire, the layer that fixes it, and an A/B test that proves the fix"
 readme = "../../README.md"

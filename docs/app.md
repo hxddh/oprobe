@@ -195,7 +195,9 @@ it. Toggle a layer or change a value (a limit, a chunk size) yourself and **Prov
 change with the values you set. The trials stream in live and their A/B pairs are drawn as they
 converge: each pair's change as a dot, the running estimate with its 95 % interval narrowing,
 and the A/A noise floor around no change, until the sequential test decides: **improved**,
-**worse** or **inconclusive**. **Copy** puts the winning diff (Rust or TOML) on the clipboard.
+**worse** or **inconclusive**. **Copy** puts the winning diff (Rust or TOML) on the clipboard; when
+the run came from an `op.toml` file, **Save to op.toml** writes the proven change back to it in
+place (preserving credentials and `${ENV}` references).
 
 **Compare.** Two runs, or the operators of one multi-operator run, side by side: goodput,
 bandwidth, requests per second, latency p50 / p99 / p99.9, failed operations, retries, throttled

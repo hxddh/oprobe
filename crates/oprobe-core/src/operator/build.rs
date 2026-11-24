@@ -184,7 +184,7 @@ fn bytes(p: &[Param], method: &str) -> u64 {
 }
 
 /// `TailCutLayer` from its applied parameters.
-fn tail_cut_layer(params: &[Param]) -> TailCutLayer {
+pub fn tail_cut_layer(params: &[Param]) -> TailCutLayer {
     let mut b = TailCutLayer::builder();
     for p in params {
         b = match (p.method, p.value) {
@@ -232,10 +232,16 @@ fn timeout_layer(params: &[Param]) -> TimeoutLayer {
 
 /// Wrap `op` (the service, already traced) in the spec's layers. Retries are reported to the
 /// operation's [`OpScope`] (backoff, throttling) when `observe` is set.
-pub async fn apply_layers(
+pub async fn apply_layers(op: Operator, spec: &OperatorSpec, observe: bool) -> Result<Operator> {
+    apply_layers_with_tail_cut(op, spec, observe, None).await
+}
+
+/// [`apply_layers`], reusing an already-warmed [`TailCutLayer`] when given.
+pub async fn apply_layers_with_tail_cut(
     mut op: Operator,
     spec: &OperatorSpec,
     observe: bool,
+    shared_tail_cut: Option<TailCutLayer>,
 ) -> Result<Operator> {
     let params = |name| layer_params(spec, name);
     if let Some(p) = params("throttle") {
@@ -255,7 +261,7 @@ pub async fn apply_layers(
         op = op.layer(timeout_layer(&p));
     }
     if let Some(p) = params("tail_cut") {
-        op = op.layer(tail_cut_layer(&p));
+        op = op.layer(shared_tail_cut.unwrap_or_else(|| tail_cut_layer(&p)));
     }
     if let Some(p) = params("retry") {
         let layer = retry_layer(&p);

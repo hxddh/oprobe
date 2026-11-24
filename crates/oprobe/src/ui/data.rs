@@ -159,6 +159,8 @@ impl PartialEq for Rows {
 pub struct ProfileModel {
     pub id: String,
     pub operator_ref: String,
+    /// The `op.toml` file this run's operator came from, when it exists on disk.
+    pub operator_file: Option<std::path::PathBuf>,
     pub operator: OperatorSpec,
     pub preset: String,
     pub window_s: f64,
@@ -333,6 +335,7 @@ fn of_rows(rows: Arc<Run>) -> ProfileModel {
     ProfileModel {
         id: r.run.id.clone(),
         operator_ref: r.spec.operator_ref.clone(),
+        operator_file: crate::operator::resolve::operator_file_path(&r.spec.operator_ref),
         operator: r.spec.profile.operator.clone(),
         preset: r.workload_label().to_owned(),
         window_s: r.run.window_s,
@@ -603,8 +606,12 @@ pub const SECTIONS: &[(&str, &[Field])] = &[
     (
         "http",
         &[
-            f("http.version", Choice(&["auto", "h1", "h2"]), "HttpFetch"),
-            f("http.keep_alive", Switch, "HttpFetch"),
+            f(
+                "http.version",
+                Choice(&["auto", "h1", "h2"]),
+                "ReqwestTransport",
+            ),
+            f("http.keep_alive", Switch, "ReqwestTransport"),
         ],
     ),
 ];

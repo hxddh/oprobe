@@ -466,6 +466,7 @@ impl ProofEstimate {
     /// The estimate of a proof of `sizing` (most, fewest) sizing trials and `pairs` (fewest,
     /// most) A/B pairs, whose baseline trials take `a_eta_s` and whose sizing and candidate
     /// trials take `b_eta_s`, within `budget`.
+    #[cfg(test)]
     fn new(
         command: String,
         change: Vec<String>,
@@ -475,7 +476,33 @@ impl ProofEstimate {
         b_eta_s: f64,
         budget: Option<Duration>,
     ) -> Self {
-        let pair_s = a_eta_s + b_eta_s;
+        Self::new_reused(
+            command, change, sizing, pairs, a_eta_s, b_eta_s, b_eta_s, budget,
+        )
+    }
+
+    /// [`ProofEstimate::new`] where the first candidate trial warms a shared layer
+    /// (`b_first_eta_s`) and subsequent candidate trials reuse it (`b_warm_eta_s`).
+    #[allow(clippy::too_many_arguments)]
+    fn new_reused(
+        command: String,
+        change: Vec<String>,
+        sizing: (u64, u64),
+        pairs: (u64, u64),
+        a_eta_s: f64,
+        b_first_eta_s: f64,
+        b_warm_eta_s: f64,
+        budget: Option<Duration>,
+    ) -> Self {
+        let pair_cold_s = a_eta_s + b_first_eta_s;
+        let pair_warm_s = a_eta_s + b_warm_eta_s;
+        let pairs_cost = |p: u64| -> f64 {
+            if p == 0 {
+                0.0
+            } else {
+                pair_cold_s + (p - 1) as f64 * pair_warm_s
+            }
+        };
         let budget_s = budget.map(|b| b.as_secs_f64());
         let unbudgeted = sizing.0 + 2 * pairs.1;
         // Plan only the trials that fit in the budget (K19): the sizing trials run first, the
@@ -484,14 +511,19 @@ impl ProofEstimate {
             let Some(b) = budget_s else {
                 return (s, p);
             };
-            let s = s.min((b / b_eta_s.max(1e-3)).floor() as u64);
-            let left = (b - s as f64 * b_eta_s).max(0.0);
-            (s, p.min((left / pair_s.max(1e-3)).floor() as u64))
+            let s = s.min((b / b_first_eta_s.max(1e-3)).floor() as u64);
+            let left = (b - s as f64 * b_first_eta_s).max(0.0);
+            let fit_p = if left < pair_cold_s {
+                0
+            } else {
+                1 + ((left - pair_cold_s) / pair_warm_s.max(1e-3)).floor() as u64
+            };
+            (s, p.min(fit_p))
         };
         let (s_min, p_min) = fit(sizing.1, pairs.0);
         let (s_max, p_max) = fit(sizing.0, pairs.1);
-        let min = s_min as f64 * b_eta_s + p_min as f64 * pair_s;
-        let mut max = sizing.0 as f64 * b_eta_s + pairs.1 as f64 * pair_s;
+        let min = s_min as f64 * b_first_eta_s + pairs_cost(p_min);
+        let mut max = sizing.0 as f64 * b_first_eta_s + pairs_cost(pairs.1);
         if let Some(b) = budget_s {
             max = max.min(b);
         }
@@ -987,10 +1019,18 @@ struct Trials<'a> {
     guard: Option<std::sync::Arc<crate::guard::Guard>>,
     cancel: Cancel,
     deadline: Option<Instant>,
-    /// Wall time of one trial (measured on the first one).
+    /// Wall time of one cold candidate trial (measured on the first one).
     per_trial: Duration,
-    /// Warmup of the baseline trials (shorter than the candidate's for a tail-cut change).
+    /// Wall time of one baseline or warmed candidate trial.
+    per_warm_trial: Duration,
+    /// Warmup of the baseline trials (shorter than an un-warmed tail-cut candidate's).
     baseline_warmup: Duration,
+    /// Warmed `TailCutLayer` shared across candidate trials that apply the same parameters.
+    warmed_tail_cut: Option<(
+        Vec<crate::operator::build::Param>,
+        opendal::layers::TailCutLayer,
+        Instant,
+    )>,
     max_throttle: f64,
     max_error: f64,
     out: Vec<ProveTrial>,
@@ -1000,13 +1040,20 @@ struct Trials<'a> {
 }
 
 impl Trials<'_> {
-    /// There is time for one more trial.
+    /// There is time for one more trial (`warm`: baseline or an already-warmed candidate).
     fn time_left(&self) -> bool {
+        self.time_left_for(self.warmed_tail_cut.is_some())
+    }
+
+    fn time_left_for(&self, warm: bool) -> bool {
+        let need = if warm {
+            self.per_warm_trial
+        } else {
+            self.per_trial
+        };
         self.breach.is_none()
             && !self.cancel.is_cancelled()
-            && self
-                .deadline
-                .is_none_or(|d| Instant::now() + self.per_trial <= d)
+            && self.deadline.is_none_or(|d| Instant::now() + need <= d)
     }
 
     /// [`Self::trial`], with a budget breach recorded instead of returned: `None` once a
@@ -1043,8 +1090,37 @@ impl Trials<'_> {
     ) -> Result<ProveTrial> {
         let mut p = self.base.clone();
         p.operator.apply_edits(sets)?;
+        let mut shared_tail_cut: Option<(
+            Vec<crate::operator::build::Param>,
+            opendal::layers::TailCutLayer,
+        )> = None;
+        let mut used_warm = false;
         if kind == TrialKind::Baseline {
             p.workload.warmup = crate::util::HumanDuration(self.baseline_warmup);
+            used_warm = true;
+        } else if let Some(params) = crate::operator::build::layer_params(&p.operator, "tail_cut") {
+            let window = p
+                .operator
+                .layers
+                .tail_cut
+                .as_ref()
+                .map(|t| t.window.get())
+                .unwrap_or(Duration::from_secs(60));
+            let reusable = window >= Duration::from_secs(20);
+            if reusable
+                && let Some((prev_p, layer, used_at)) = &self.warmed_tail_cut
+                && *prev_p == params
+                && used_at.elapsed() < window / 2
+            {
+                p.workload.warmup = crate::util::HumanDuration(self.baseline_warmup);
+                shared_tail_cut = Some((params, layer.clone()));
+                used_warm = true;
+            } else if reusable {
+                let layer = crate::operator::build::tail_cut_layer(&params);
+                shared_tail_cut = Some((params, layer));
+            }
+        } else {
+            used_warm = self.per_trial == self.per_warm_trial;
         }
         p.name = Some(format!("prove {} {}", self.prove_id, kind_label(kind)));
         p.validate()?;
@@ -1061,10 +1137,23 @@ impl Trials<'_> {
                 output: &OutputOptions::default(),
                 cancel: &self.cancel,
                 parent_id: Some(self.prove_id.clone()),
+                tail_cut: shared_tail_cut.as_ref().map(|(_, l)| l.clone()),
             },
         )
         .await?;
-        self.per_trial = self.per_trial.max(started.elapsed());
+        let elapsed = started.elapsed();
+        if used_warm {
+            self.per_warm_trial = self.per_warm_trial.max(elapsed);
+        } else {
+            self.per_trial = self.per_trial.max(elapsed);
+        }
+        if !m.cancelled
+            && m.breach.is_none()
+            && m.run.report.summary.ops > 0
+            && let Some((params, layer)) = shared_tail_cut
+        {
+            self.warmed_tail_cut = Some((params, layer, Instant::now()));
+        }
         let r = &m.run.report;
         let failed = crate::analysis::findings::non_throttle_failures(r);
         let ops = r.summary.ops;
@@ -1660,9 +1749,19 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
         };
         let max_pairs = req.pairs.clamp(MIN_DECISIVE_PAIRS, 12) as u64;
         let min_pairs = (defaults.min_pairs.max(MIN_DECISIVE_PAIRS) as u64).min(max_pairs);
-        // A candidate that needs a long warmup takes longer than its baseline.
+        // A candidate that needs a long warmup takes longer on its first trial, then reuses
+        // its warmed TailCutLayer across the remaining pairs.
         let a_eta = plan.eta_s - plan.warmup_s + baseline_warmup(&base, &change).as_secs_f64();
-        let estimate = ProofEstimate::new(
+        let tc_reusable = change.long_warmup
+            && changed
+                .layers
+                .tail_cut
+                .as_ref()
+                .map(|t| t.window.get())
+                .unwrap_or(Duration::from_secs(60))
+                >= Duration::from_secs(20);
+        let b_warm_eta = if tc_reusable { a_eta } else { plan.eta_s };
+        let estimate = ProofEstimate::new_reused(
             prove_command(&req, &run),
             probe_sets
                 .iter()
@@ -1672,6 +1771,7 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
             (min_pairs, max_pairs),
             a_eta + TRIAL_OVERHEAD_S,
             plan.eta_s + TRIAL_OVERHEAD_S,
+            b_warm_eta + TRIAL_OVERHEAD_S,
             budget,
         );
         if req.safety.dry_run {
@@ -1691,6 +1791,7 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
         crate::operator::resolve::resolve(&run.report.spec.operator_ref, ctx.config()?)
             .ok()
             .and_then(|(_, s)| s.name());
+    let base_warmup = baseline_warmup(&base, &change);
     let mut t = Trials {
         ctx,
         run: &run,
@@ -1701,7 +1802,9 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
         cancel: cancel.clone(),
         deadline: budget.map(|b| Instant::now() + b),
         per_trial: trial_window + warmup,
-        baseline_warmup: baseline_warmup(&base, &change),
+        per_warm_trial: trial_window + base_warmup,
+        baseline_warmup: base_warmup,
+        warmed_tail_cut: None,
         max_throttle: sizing_throttle_limit(&run, change.finding.as_deref(), max_throttle),
         max_error: run.report.sla.max_error_ratio,
         out: Vec::new(),
@@ -1760,14 +1863,14 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
     // The fewest operations a paired trial counted: the objective's resolution.
     let mut min_ops = u64::MAX;
     let candidate_value = sizing.as_ref().map(|s| s.value.clone());
-    while (pairs as usize) < max_pairs && t.time_left() {
+    while (pairs as usize) < max_pairs && t.time_left_for(true) {
         let Some(a) = t
             .try_trial(&[], TrialKind::Baseline, Some(pairs), None)
             .await?
         else {
             break;
         };
-        if !t.time_left() && pairs as usize >= min_pairs {
+        if !t.time_left() {
             break;
         }
         let Some(b) = t
@@ -2111,6 +2214,18 @@ mod tests {
             "{}",
             e.line()
         );
+        // Reusing a warmed TailCutLayer warms only on the first pair: 17 s + 5 × 6 s = 47 s.
+        let reused = ProofEstimate::new_reused(
+            "oprobe prove r".into(),
+            vec!["layers.tail_cut=on".into()],
+            (0, 0),
+            (3, 6),
+            3.0,
+            14.0,
+            3.0,
+            None,
+        );
+        assert_eq!((reused.eta_min_s, reused.eta_max_s), (29.0, 47.0));
     }
 
     /// 7.0.0 planned 6–20 trials under a budget that fits one pair (K19).

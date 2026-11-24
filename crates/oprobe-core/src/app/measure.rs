@@ -29,6 +29,8 @@ pub struct Opts<'a> {
     pub cancel: &'a Cancel,
     /// The prove this measurement is a trial of (its progress stays quiet).
     pub parent_id: Option<String>,
+    /// Warmed [`opendal::layers::TailCutLayer`] reused across candidate trials of one prove.
+    pub tail_cut: Option<opendal::layers::TailCutLayer>,
 }
 
 /// Measure `profile` once through the pipeline and save the run (unless `--no-save`). A budget
@@ -96,6 +98,7 @@ pub async fn measure_to_breach(ctx: &Ctx, profile: Profile, o: Opts<'_>) -> Resu
     req.trace_max_requests = super::profile::trace_max_requests(ctx);
     req.store = (!o.output.no_save).then(|| ctx.store());
     req.parent_id = o.parent_id;
+    req.tail_cut = o.tail_cut;
     req.pending_dir = Some(crate::store::pending::dir(&ctx.paths.data_dir));
     req.on_stage = Some(on_stage);
     req.finalize = Some(Box::new(move |run| {

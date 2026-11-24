@@ -4,6 +4,48 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## v7.2.0 — 2026-11-24
+
+7.2 sharpens measurement accuracy, OpenDAL 0.59 code generation, `oprobe-trace` embedding safety,
+and the `prove` → `op.toml` loop without adding commands or configuration concepts.
+
+### Added
+
+- **Save to `op.toml` in the app.** When a run came from an `op.toml` file, **Save to op.toml** in
+  the Operator view writes a proven change back to that file atomically, preserving unedited
+  options, `${ENV}` placeholders and relative paths.
+
+### Changed
+
+- **Faster `prove` on `tail_cut` remedies.** Candidate trials of one proof now share a warmed
+  `TailCutLayer` once its initial 10 s blind window has rolled over, cutting `prove` wall time on
+  `tail_stragglers` by more than half while keeping baseline and candidate warm-ups matched.
+
+### Fixed
+
+- **OpenDAL 0.59 HTTP Rust diffs.** `http.*` changes now emit `ReqwestTransport` installed via
+  `OperationContext::with_http_transport` instead of the removed `HttpClient::with` / `HttpFetch`
+  APIs, and `http.version = "h2"` uses `.http2_prior_knowledge()` only on plain `http://` (`h2c`)
+  endpoints so HTTPS endpoints keep TLS ALPN negotiation.
+- **Peak in-flight count under `layers.concurrent_limit.http`.** `FidelityTransport` now counts a
+  request as in flight only after acquiring its concurrency permit (and decrements before releasing
+  it), so `peak_inflight_requests_count` and the timeline reflect wire concurrency rather than
+  workers waiting in the client queue.
+- **In-process `copy` and `rename` requests.** `InProcessObserveLayer` (`fs://`, `memory://`) now
+  records `CopyObject` requests for `copy` and `rename`, fixing stage attribution (`client_pct` was
+  100 %) and enforcing `--max-requests` / `--max-bytes` budgets on copy workloads.
+- **`oprobe-trace` composition and multi-operator metrics.** `OpStream::read` keeps the operation
+  scope active so mid-stream retries link to their operation when `RetryLayer` sits inside
+  `TraceLayer`; cloning `oprobe_trace::otel::config(&meter)` across several operators gives each
+  its own `scheme`, `namespace` and `root` attributes.
+- **Relative `http.ca_cert` paths and S3 region detection.** `OperatorSpec::load` resolves relative
+  `http.ca_cert` paths against the `op.toml` file's directory, unreadable or malformed CA bundles
+  fail as `config.invalid` (exit 2) instead of `internal`, and `detect_s3_region` honours explicit
+  `http.proxy`, `http.ca_cert` and `http.insecure` settings.
+- **Custom endpoint hints in production traces.** `custom_endpoint` now recognises dual-stack,
+  multi-node private clusters and CGNAT/Tailscale (`100.64.0.0/10`) addresses.
+- Removed redundant `package.homepage` manifest keys that warned under Cargo 1.97+.
+
 ## v7.1.0 — 2026-11-24
 
 7.1 is the release planned in `docs/design/v7.1-review.md`: the bugs a bug hunt across every lab

@@ -53,6 +53,8 @@ pub struct Proved {
     pub ab: Vec<(f64, f64, u64)>,
     /// The other metrics (shown, never decisive).
     pub secondary: Vec<Secondary>,
+    /// The proven change as `PATH=VALUE` pairs (sized values included).
+    pub change: Vec<String>,
     pub rust: String,
     pub toml: String,
 }
@@ -294,6 +296,7 @@ impl Job {
                     pairs: p.pairs_count,
                     ab: ab_pairs(&p.trials, p99),
                     secondary: p.secondary.iter().map(Secondary::of).collect(),
+                    change: p.change,
                     rust: p.diff.rust,
                     toml: p.diff.toml,
                 })),

@@ -289,6 +289,34 @@ fn operator_toggles_a_layer_and_proves_it_against_the_lab() {
 }
 
 #[test]
+fn proven_change_saves_back_to_op_toml() {
+    let cx = Ctx::new();
+    let op_file = cx.dir.path().join("op.toml");
+    std::fs::write(
+        &op_file,
+        "url = \"memory://\"\n[options]\nroot = \"/keep\"\n",
+    )
+    .unwrap();
+    let id = cx.seed(op_file.to_str().unwrap());
+    cx.launch(Some(id));
+    let mut app = cx.start();
+    choose(&mut app, "English");
+    wait_long(&mut app, "id:profile");
+    app.press_key("ctrl+2").unwrap();
+    wait_long(&mut app, "id:operator");
+    app.press("role:switch[layers.retry.jitter]").unwrap();
+    wait_long(&mut app, "text:layers.retry.jitter = on");
+    app.press("id:prove-start").unwrap();
+    wait_long(&mut app, "id:prove-result");
+    wait_long(&mut app, "id:save-operator");
+    app.press("id:save-operator").unwrap();
+    wait_long(&mut app, "text:Saved to op.toml.");
+    let saved = std::fs::read_to_string(&op_file).unwrap();
+    assert!(saved.contains("jitter = true"), "{saved}");
+    assert!(saved.contains("root = \"/keep\""), "{saved}");
+}
+
+#[test]
 fn the_language_choice_persists() {
     let cx = Ctx::new();
     {

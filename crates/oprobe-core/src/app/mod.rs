@@ -422,6 +422,37 @@ impl App {
         Ok(self.config()?.operators.keys().cloned().collect())
     }
 
+    /// Apply `PATH=VALUE` `edits` (such as a proven change) to an existing `op.toml` file in
+    /// place, preserving unedited options, `${ENV}` placeholders and relative paths.
+    pub fn save_operator_edits(
+        &self,
+        path: &std::path::Path,
+        edits: &[String],
+    ) -> Result<crate::operator::OperatorSpec> {
+        let raw = std::fs::read_to_string(path).map_err(|e| {
+            OprobeError::new(
+                ErrorCode::ConfigInvalid,
+                format!("cannot read operator file `{}`: {e}", path.display()),
+            )
+        })?;
+        let mut spec = crate::operator::OperatorSpec::parse(&raw).map_err(|e| {
+            let mut o = OprobeError::new(e.code, format!("`{}`: {}", path.display(), e.message));
+            o.hint = e.hint;
+            o
+        })?;
+        let mut pairs = Vec::with_capacity(edits.len());
+        for e in edits {
+            let (k, v) = crate::input::key_value("edit", e)?;
+            if v.trim() != crate::model::spec::REDACTED {
+                pairs.push((k, v));
+            }
+        }
+        spec.apply_edits(&pairs)?;
+        spec.validate()?;
+        crate::store::atomic_write(path, spec.to_toml().as_bytes())?;
+        Ok(spec)
+    }
+
     /// The run ids `r` names (to report what [`App::rm`] removes).
     pub fn run_ids(&self, r: &[RunRef]) -> Result<Vec<String>> {
         runs::stored_ids(self, r)
@@ -430,5 +461,44 @@ impl App {
     /// `oprobe lab`: start the server (it serves until the returned handle is dropped).
     pub async fn lab(&self, req: LabRequest) -> Result<LabHandle> {
         lab::lab(req).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn save_operator_edits_preserves_secrets_env_and_relative_ca_cert() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("op.toml");
+        std::fs::write(
+            &p,
+            "url = \"s3://b/x\"\n[options]\nregion = \"us-east-1\"\nsecret_access_key = \"${AWS_SECRET_ACCESS_KEY}\"\n[http]\nca_cert = \"ca.pem\"\n",
+        )
+        .unwrap();
+        let app = App::new(crate::store::Paths {
+            config_file: dir.path().join("config.toml"),
+            data_dir: dir.path().join("data"),
+        });
+        let updated = app
+            .save_operator_edits(
+                &p,
+                &[
+                    "layers.concurrent_limit.http=24".to_owned(),
+                    "layers.retry.jitter=on".to_owned(),
+                    "options.secret_access_key=<redacted>".to_owned(),
+                ],
+            )
+            .unwrap();
+        assert_eq!(updated.http_limit(), Some(24));
+        let disk = std::fs::read_to_string(&p).unwrap();
+        assert!(
+            disk.contains("secret_access_key = \"${AWS_SECRET_ACCESS_KEY}\""),
+            "{disk}"
+        );
+        assert!(disk.contains("ca_cert = \"ca.pem\""), "{disk}");
+        assert!(disk.contains("http = 24"), "{disk}");
+        assert!(disk.contains("jitter = true"), "{disk}");
     }
 }

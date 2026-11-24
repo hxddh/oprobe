@@ -120,6 +120,8 @@ pub struct Request {
     /// run marks its prefix before its first write and sweeps what killed runs against the same
     /// target left. `None`: no markers.
     pub pending_dir: Option<PathBuf>,
+    /// Warmed [`opendal::layers::TailCutLayer`] reused across candidate trials of one prove.
+    pub tail_cut: Option<opendal::layers::TailCutLayer>,
 }
 
 impl Request {
@@ -139,6 +141,7 @@ impl Request {
             finalize: None,
             spec: None,
             pending_dir: None,
+            tail_cut: None,
         }
     }
 }
@@ -217,6 +220,27 @@ pub async fn open(
     cancel: Cancel,
     progress: ProgressFn,
 ) -> Result<Session> {
+    open_with_tail_cut(
+        profile,
+        rails,
+        guard,
+        trace_max_requests,
+        cancel,
+        progress,
+        None,
+    )
+    .await
+}
+
+async fn open_with_tail_cut(
+    profile: Profile,
+    rails: &Rails,
+    guard: Option<Arc<Guard>>,
+    trace_max_requests: usize,
+    cancel: Cancel,
+    progress: ProgressFn,
+    tail_cut: Option<opendal::layers::TailCutLayer>,
+) -> Result<Session> {
     if let Some(b) = guard.as_ref().and_then(|g| g.demand()) {
         return Err(b.to_error());
     }
@@ -229,6 +253,7 @@ pub async fn open(
             guard,
             trace_max_requests,
             preflight: true,
+            tail_cut,
         },
     )
     .await
@@ -251,6 +276,7 @@ pub async fn measure(req: Request) -> Result<Measured> {
         finalize,
         spec,
         pending_dir,
+        tail_cut,
     } = req;
     let spec = spec.unwrap_or_else(|| spec_of(&profile, target_name.as_deref()));
     // The pending-cleanup marker, before anything is written (the preflight writes).
@@ -292,13 +318,14 @@ pub async fn measure(req: Request) -> Result<Measured> {
     } else {
         trace_max_requests
     };
-    let session = match open(
+    let session = match open_with_tail_cut(
         profile,
         &rails,
         guard,
         trace_max_requests,
         cancel.clone(),
         progress.clone(),
+        tail_cut,
     )
     .await
     {

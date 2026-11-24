@@ -584,14 +584,15 @@ The options of `read_with` / `reader_with` and `writer_with`; unset means OpenDA
 
 ## `[http]`
 
-The `HttpFetch` client (OpenDAL's reqwest client).
+OpenDAL's HTTP transport (`ReqwestTransport`, installed with
+`OperationContext::new().with_http_transport(HttpTransporter::new(ReqwestTransport::new(client)))`).
 
 | Key | Meaning |
 |---|---|
 | `version` | `auto` (OpenDAL's default: HTTP/1.1), `h1` or `h2` |
 | `keep_alive` | reuse connections (default true) |
 | `proxy` | egress proxy URL; `"none"` (also `--set http.proxy=none`) means no proxy, whatever `HTTPS_PROXY`/`HTTP_PROXY` say; unset (`--set http.proxy=unset`): the environment |
-| `ca_cert` | an extra PEM CA bundle to trust |
+| `ca_cert` | an extra PEM CA bundle to trust (relative paths in `op.toml` resolve against the file's directory) |
 | `insecure` | skip certificate verification (self-signed development endpoints only) |
 
 ## `--set`
@@ -1073,14 +1074,15 @@ oprobe-trace = "7"
 
 ```rust
 let (layer, handle) = oprobe_trace::layer(oprobe_trace::Config::default());
-let op = op.layer(layer);
+let op = Operator::new(builder)?.layer(layer);
 handle.save("prod.oprobe")?;          // then: oprobe show prod.oprobe
 ```
 
-Apply it first, before your other layers: it installs the instrumented `HttpFetch`, and the
-layers above it then wrap it, so every retry is recorded as its own request. Give OpenDAL's retry
-layer the handle's notifier, so retries land in the profile's Retries section (count, backoff,
-throttling) and the attempts of one call count as one operation:
+Apply it first, before your other layers (`ConcurrentLimitLayer`, `TailCutLayer`, `RetryLayer`): it
+installs the instrumented `HttpTransport` on `OperationContext`, and the layers above it then wrap
+it, so HTTP concurrency caps stay in force and every retry is recorded as its own request. Give
+OpenDAL's retry layer the handle's notifier, so retries land in the profile's Retries section
+(count, backoff, throttling) and the attempts of one call count as one operation:
 
 ```rust
 let (trace, handle) = oprobe_trace::layer(oprobe_trace::Config::default());
@@ -1155,7 +1157,7 @@ in-process services (`memory`, `fs`) are observed then.
 
 ## How it works
 
-For HTTP services the layer replaces the operator's `HttpFetch` with OpenDAL's own reqwest client
+For HTTP services the layer replaces the operator's `HttpTransport` with OpenDAL's own reqwest client
 (rustls with aws-lc-rs, the same pool defaults: no connect timeout, unlimited idle connections per
 host, 90 s idle timeout), observed through reqwest's public extension points: a timed DNS resolver,
 a connector layer that times each dial, a TLS session store that timestamps the ClientHello, and a
@@ -1441,7 +1443,9 @@ it. Toggle a layer or change a value (a limit, a chunk size) yourself and **Prov
 change with the values you set. The trials stream in live and their A/B pairs are drawn as they
 converge: each pair's change as a dot, the running estimate with its 95 % interval narrowing,
 and the A/A noise floor around no change, until the sequential test decides: **improved**,
-**worse** or **inconclusive**. **Copy** puts the winning diff (Rust or TOML) on the clipboard.
+**worse** or **inconclusive**. **Copy** puts the winning diff (Rust or TOML) on the clipboard; when
+the run came from an `op.toml` file, **Save to op.toml** writes the proven change back to it in
+place (preserving credentials and `${ENV}` references).
 
 **Compare.** Two runs, or the operators of one multi-operator run, side by side: goodput,
 bandwidth, requests per second, latency p50 / p99 / p99.9, failed operations, retries, throttled

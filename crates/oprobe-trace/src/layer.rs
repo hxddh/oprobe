@@ -51,16 +51,30 @@ fn push(
     bytes_down: u64,
     err: Option<&Error>,
 ) {
+    let op = match api {
+        Api::GetObject => "read",
+        Api::HeadObject => "stat",
+        Api::ListObjects => "list",
+        Api::DeleteObject => "delete",
+        Api::CopyObject => "copy",
+        _ => "write",
+    };
+    push_op(recorder, op, api, started, bytes_up, bytes_down, err);
+}
+
+fn push_op(
+    recorder: &Arc<Recorder>,
+    operation: &'static str,
+    api: Api,
+    started: Instant,
+    bytes_up: u64,
+    bytes_down: u64,
+    err: Option<&Error>,
+) {
     let scope = OpScope::current();
     let total = started.elapsed().as_micros() as u64;
     let rec = RequestRecord {
-        operation: Some(match api {
-            Api::GetObject => "read",
-            Api::HeadObject => "stat",
-            Api::ListObjects => "list",
-            Api::DeleteObject => "delete",
-            _ => "write",
-        }),
+        operation: Some(operation),
         api,
         method: api.label().to_owned(),
         status: match err.map(Error::kind) {
@@ -153,7 +167,7 @@ impl Service for ObserveService {
     type Writer = ObserveWriter;
     type Lister = ObserveLister;
     type Deleter = ObserveDeleter;
-    type Copier = oio::Copier;
+    type Copier = ObserveCopier;
     type Composer = oio::Composer;
 
     fn info(&self) -> ServiceInfo {
@@ -172,7 +186,15 @@ impl Service for ObserveService {
     ) -> Result<RpCreateDir> {
         let t = Instant::now();
         let r = self.inner.create_dir(ctx, path, args).await;
-        push(&self.recorder, Api::PutObject, t, 0, 0, r.as_ref().err());
+        push_op(
+            &self.recorder,
+            "create_dir",
+            Api::PutObject,
+            t,
+            0,
+            0,
+            r.as_ref().err(),
+        );
         r
     }
 
@@ -199,7 +221,13 @@ impl Service for ObserveService {
         to: &str,
         args: OpCopy,
     ) -> Result<Self::Copier> {
-        self.inner.copy(ctx, from, to, args)
+        Ok(ObserveCopier {
+            inner: self.inner.copy(ctx, from, to, args)?,
+            recorder: self.recorder.clone(),
+            started: None,
+            bytes: 0,
+            done: false,
+        })
     }
 
     fn compose(&self, ctx: &OperationContext, to: &str, args: OpCompose) -> Result<Self::Composer> {
@@ -213,7 +241,18 @@ impl Service for ObserveService {
         to: &str,
         args: OpRename,
     ) -> Result<RpRename> {
-        self.inner.rename(ctx, from, to, args).await
+        let t = Instant::now();
+        let r = self.inner.rename(ctx, from, to, args).await;
+        push_op(
+            &self.recorder,
+            "rename",
+            Api::CopyObject,
+            t,
+            0,
+            0,
+            r.as_ref().err(),
+        );
+        r
     }
 
     async fn restore(
@@ -360,6 +399,52 @@ impl oio::Delete for ObserveDeleter {
 
     async fn close(&mut self) -> Result<()> {
         self.inner.close().await
+    }
+}
+
+pub struct ObserveCopier {
+    inner: oio::Copier,
+    recorder: Arc<Recorder>,
+    started: Option<Instant>,
+    bytes: u64,
+    done: bool,
+}
+
+impl oio::Copy for ObserveCopier {
+    async fn next(&mut self) -> Result<Option<usize>> {
+        let t = *self.started.get_or_insert_with(Instant::now);
+        let r = self.inner.next().await;
+        match &r {
+            Ok(Some(n)) => self.bytes += *n as u64,
+            Ok(None) => {}
+            Err(e) if !self.done => {
+                self.done = true;
+                push(&self.recorder, Api::CopyObject, t, self.bytes, 0, Some(e));
+            }
+            Err(_) => {}
+        }
+        r
+    }
+
+    async fn close(&mut self) -> Result<Metadata> {
+        let t = *self.started.get_or_insert_with(Instant::now);
+        let r = self.inner.close().await;
+        if !self.done {
+            self.done = true;
+            push(
+                &self.recorder,
+                Api::CopyObject,
+                t,
+                self.bytes,
+                0,
+                r.as_ref().err(),
+            );
+        }
+        r
+    }
+
+    async fn abort(&mut self) -> Result<()> {
+        self.inner.abort().await
     }
 }
 

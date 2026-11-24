@@ -717,8 +717,8 @@ struct Finisher {
     last_yield: Option<Instant>,
     scope: Option<Arc<OpScope>>,
     recorder: Option<Arc<Recorder>>,
-    _permit: Option<OwnedSemaphorePermit>,
     _inflight: InflightGuard,
+    _permit: Option<OwnedSemaphorePermit>,
     /// The first bytes of an error response (its provider error code).
     sniff: Option<super::signals::ErrorSniffer>,
 }
@@ -902,7 +902,6 @@ impl HttpTransport for FidelityTransport {
             .extensions
             .get::<opendal_core::raw::Operation>()
             .map(|o| o.into_static());
-        let inflight = InflightGuard::start(recorder.clone());
         let start_offset_us = scope
             .as_ref()
             .map(|s| t_start.saturating_duration_since(s.started).as_micros() as u64)
@@ -949,6 +948,7 @@ impl HttpTransport for FidelityTransport {
             ),
             None => None,
         };
+        let inflight = InflightGuard::start(recorder.clone());
         let t_ready = Instant::now();
         record.timing.queue_us = t_ready.saturating_duration_since(t_start).as_micros() as u64;
 

@@ -44,7 +44,7 @@ The workspace has three crates. Front ends call only `oprobe_core::app::App`.
 
 | Path | What |
 |---|---|
-| `crates/oprobe-trace/` | The published library: `layer(Config) -> (TraceLayer, Handle)`, `Handle::snapshot/save/save_and_reset` (`oprobe.trace/7` files; 6.x still read), `Handle::retry_notify`, the instrumented `HttpFetch`, the `Exporter` hook, OpenTelemetry metrics (feature `otel`). Internals are public only under the hidden `__internal` feature that oprobe-core enables. |
+| `crates/oprobe-trace/` | The published library: `layer(Config) -> (TraceLayer, Handle)`, `Handle::snapshot/save/save_and_reset` (`oprobe.trace/7` files; 6.x still read), `Handle::retry_notify`, the instrumented `HttpTransport`, the `Exporter` hook, OpenTelemetry metrics (feature `otel`). Internals are public only under the hidden `__internal` feature that oprobe-core enables. |
 | `crates/oprobe-core/src/operator/` | `OperatorSpec` (`op.toml`, `oprobe.operator/6`). `build.rs` builds the layer stack; `diff.rs` renders a diff as Rust and TOML; `resolve.rs` resolves the OPERATOR argument. |
 | `crates/oprobe-core/src/app/` | The service layer: `plan`, `run` (1..n operators), `prove`, `show`, `list`, `rm`, `lab`. |
 | `crates/oprobe-core/src/engine/` | Sessions, datasets, the runner and its schedule, the four workload presets, cleanup. |

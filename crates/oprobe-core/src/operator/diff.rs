@@ -294,17 +294,33 @@ fn write_rust(s: &OperatorSpec) -> String {
     e
 }
 
-fn http_rust(s: &OperatorSpec) -> String {
+fn http_client_expr(s: &OperatorSpec) -> (String, bool) {
     let mut e = "reqwest::Client::builder()".to_owned();
+    let h2c = s.url.starts_with("http://")
+        || s.options
+            .get("endpoint")
+            .is_some_and(|u| u.trim().starts_with("http://"));
     match s.http.version {
-        HttpVersion::H2 => e += ".http2_prior_knowledge()",
+        HttpVersion::H2 if h2c => e += ".http2_prior_knowledge()",
+        HttpVersion::H2 => {}
         HttpVersion::H1 => e += ".http1_only()",
         HttpVersion::Auto => {}
     }
     if !s.http.keep_alive {
         e += ".pool_max_idle_per_host(0)";
     }
-    e + " // install with HttpClient::with(...)"
+    e += ".build()?";
+    (e, s.http.version == HttpVersion::H2 && !h2c)
+}
+
+fn http_rust(s: &OperatorSpec) -> String {
+    let (e, alpn_h2) = http_client_expr(s);
+    let note = if alpn_h2 {
+        "reqwest `http2` feature negotiates ALPN h2; install with OperationContext::new().with_http_transport(HttpTransporter::new(ReqwestTransport::new(client)))"
+    } else {
+        "install with OperationContext::new().with_http_transport(HttpTransporter::new(ReqwestTransport::new(client)))"
+    };
+    format!("{e} // {note}")
 }
 
 fn rust_diff(a: &OperatorSpec, b: &OperatorSpec, changes: &[Change]) -> String {
@@ -502,7 +518,15 @@ pub fn to_rust(s: &OperatorSpec) -> String {
         let _ = writeln!(out, "let writer = {}.await?;", write_rust(s));
     }
     if s.http.version != HttpVersion::Auto || !s.http.keep_alive {
-        let _ = writeln!(out, "let client = {};", http_rust(s));
+        let (client, alpn_h2) = http_client_expr(s);
+        if alpn_h2 {
+            let _ = writeln!(out, "// reqwest `http2` feature negotiates ALPN h2");
+        }
+        let _ = writeln!(out, "let client = {client};");
+        let _ = writeln!(
+            out,
+            "let op = op.with_context(OperationContext::new().with_http_transport(HttpTransporter::new(ReqwestTransport::new(client))));"
+        );
     }
     out
 }
@@ -804,6 +828,47 @@ mod tests {
             d.toml.contains("secret_access_key = \"<redacted>\""),
             "{}",
             d.toml
+        );
+    }
+
+    #[test]
+    fn http_rust_matches_opendal_059_and_alpn_semantics() {
+        let a = OperatorSpec::from_url("s3://b/x");
+        let mut https_h2 = a.clone();
+        https_h2.set("http.version", "h2").unwrap();
+        let d = diff(&a, &https_h2);
+        assert!(
+            !d.rust.contains("http2_prior_knowledge"),
+            "HTTPS H2 negotiates via ALPN, not h2c prior knowledge: {}",
+            d.rust
+        );
+        assert!(
+            d.rust
+                .contains("OperationContext::new().with_http_transport(HttpTransporter::new(ReqwestTransport::new(client)))"),
+            "{}",
+            d.rust
+        );
+        assert!(!d.rust.contains("HttpClient"), "{}", d.rust);
+
+        let mut h2c = a.clone();
+        h2c.set("options.endpoint", "http://127.0.0.1:9000")
+            .unwrap();
+        h2c.set("http.version", "h2").unwrap();
+        let d_h2c = diff(&a, &h2c);
+        assert!(
+            d_h2c.rust.contains(".http2_prior_knowledge()"),
+            "{}",
+            d_h2c.rust
+        );
+
+        let full = to_rust(&https_h2);
+        assert!(
+            full.contains("let client = reqwest::Client::builder().build()?;"),
+            "{full}"
+        );
+        assert!(
+            full.contains("let op = op.with_context(OperationContext::new().with_http_transport(HttpTransporter::new(ReqwestTransport::new(client))));"),
+            "{full}"
         );
     }
 }

@@ -65,8 +65,25 @@ pub fn operator_url(s: Option<&ServiceRecord>) -> String {
     }
 }
 
-/// The endpoint a trace's requests went to when it is not the service's default (K8): one
-/// remote on a loopback, private or link-local address (a lab, MinIO, a gateway), as
+fn is_non_public_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(ip) => {
+            let o = ip.octets();
+            ip.is_loopback()
+                || ip.is_private()
+                || ip.is_link_local()
+                || (o[0] == 100 && (o[1] & 0xc0) == 64)
+        }
+        std::net::IpAddr::V6(ip) => {
+            ip.is_loopback()
+                || (ip.segments()[0] & 0xfe00) == 0xfc00
+                || (ip.segments()[0] & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+/// The endpoint a trace's requests went to when it is not the service's default (K8): remotes
+/// on loopback, private, link-local or CGNAT/Tailscale addresses (a lab, MinIO, a gateway), as
 /// `http://ip:port` (`https` when the requests used TLS). `None` otherwise: a public address is
 /// taken for the service's own endpoint, which `oprobe run URL` finds by itself.
 pub fn custom_endpoint(r: &Report) -> Option<String> {
@@ -76,20 +93,14 @@ pub fn custom_endpoint(r: &Report) -> Option<String> {
         .iter()
         .filter_map(|x| x.remote.parse().ok())
         .collect();
-    let [a] = addrs.as_slice() else {
-        return None;
-    };
-    let local = match a.ip() {
-        std::net::IpAddr::V4(ip) => ip.is_loopback() || ip.is_private() || ip.is_link_local(),
-        std::net::IpAddr::V6(ip) => {
-            ip.is_loopback()
-                || (ip.segments()[0] & 0xfe00) == 0xfc00
-                || (ip.segments()[0] & 0xffc0) == 0xfe80
-        }
-    };
-    if !local {
+    if addrs.is_empty() || !addrs.iter().all(|a| is_non_public_ip(a.ip())) {
         return None;
     }
+    let a = addrs
+        .iter()
+        .copied()
+        .find(|a| a.is_ipv4())
+        .unwrap_or(addrs[0]);
     let tls = !r.network.tls.version.is_empty() || a.port() == 443;
     Some(format!("{}://{a}", if tls { "https" } else { "http" }))
 }
@@ -562,5 +573,55 @@ mod tests {
         let t = parse_rfc3339("2026-11-22T10:00:05Z").unwrap();
         assert_eq!(crate::util::fmt_rfc3339(t), "2026-11-22T10:00:05Z");
         assert!(parse_rfc3339("garbage").is_none());
+    }
+
+    #[test]
+    fn custom_endpoint_handles_multi_addr_private_and_cgnat() {
+        let report_with = |addrs: &[&str], tls: &str| {
+            let p = crate::config::Profile::from_url("s3://bkt");
+            let k = crate::config::Knobs::of(&p);
+            let mut run = crate::model::build_run(crate::model::ReportInput {
+                run_id: &RunId::new(),
+                target_name: None,
+                profile: &p,
+                knobs: &k,
+                snapshot: Default::default(),
+                trace: Default::default(),
+                cleanup: Default::default(),
+                warnings: Vec::new(),
+                started_at: SystemTime::now(),
+                ended_at: SystemTime::now(),
+                spec: None,
+            });
+            run.report.network.tls.version = tls.to_owned();
+            run.report.network.remotes = addrs
+                .iter()
+                .map(|a| RemoteStats {
+                    remote: (*a).to_owned(),
+                    requests_count: 1,
+                    ..Default::default()
+                })
+                .collect();
+            run.report
+        };
+        assert_eq!(
+            custom_endpoint(&report_with(&["[::1]:9000", "127.0.0.1:9000"], "")),
+            Some("http://127.0.0.1:9000".into())
+        );
+        assert_eq!(
+            custom_endpoint(&report_with(&["10.0.1.2:9000", "10.0.1.3:9000"], "TLSv1.3")),
+            Some("https://10.0.1.2:9000".into())
+        );
+        assert_eq!(
+            custom_endpoint(&report_with(&["100.80.1.2:9000"], "")),
+            Some("http://100.80.1.2:9000".into())
+        );
+        assert_eq!(
+            custom_endpoint(&report_with(
+                &["52.216.1.2:443", "52.216.1.3:443"],
+                "TLSv1.3"
+            )),
+            None
+        );
     }
 }

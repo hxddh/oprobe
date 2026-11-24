@@ -3,20 +3,19 @@ members = ["crates/*"]
 resolver = "3"
 
 [workspace.package]
-version = "7.1.0"
+version = "7.2.0"
 edition = "2024"
 rust-version = "1.97"
 license = "Apache-2.0"
 repository = "https://github.com/hxddh/oprobe"
-homepage = "https://github.com/hxddh/oprobe"
 documentation = "https://github.com/hxddh/oprobe/tree/main/docs"
 
 [workspace.dependencies]
-# The workspace crates pin each other exactly: oprobe-core uses oprobe-trace's internals
+# The workspace crates pin each other exactly: oprobe-trace uses oprobe-trace's internals
 # (`__internal`, no semver promise) and oprobe uses oprobe-core, which is internal itself.
 # Release: bump these two versions together with `workspace.package.version` (docs/releasing.md).
-oprobe-trace = { version = "=7.1.0", path = "crates/oprobe-trace", features = ["__internal"] }
-oprobe-core = { version = "=7.1.0", path = "crates/oprobe-core", default-features = false }
+oprobe-trace = { version = "=7.2.0", path = "crates/oprobe-trace", features = ["__internal"] }
+oprobe-core = { version = "=7.2.0", path = "crates/oprobe-core", default-features = false }
 
 opendal = { version = "0.59", default-features = false }
 opendal-core = { version = "0.59", default-features = false }

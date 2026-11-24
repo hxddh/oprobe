@@ -81,14 +81,15 @@ The options of `read_with` / `reader_with` and `writer_with`; unset means OpenDA
 
 ## `[http]`
 
-The `HttpFetch` client (OpenDAL's reqwest client).
+OpenDAL's HTTP transport (`ReqwestTransport`, installed with
+`OperationContext::new().with_http_transport(HttpTransporter::new(ReqwestTransport::new(client)))`).
 
 | Key | Meaning |
 |---|---|
 | `version` | `auto` (OpenDAL's default: HTTP/1.1), `h1` or `h2` |
 | `keep_alive` | reuse connections (default true) |
 | `proxy` | egress proxy URL; `"none"` (also `--set http.proxy=none`) means no proxy, whatever `HTTPS_PROXY`/`HTTP_PROXY` say; unset (`--set http.proxy=unset`): the environment |
-| `ca_cert` | an extra PEM CA bundle to trust |
+| `ca_cert` | an extra PEM CA bundle to trust (relative paths in `op.toml` resolve against the file's directory) |
 | `insecure` | skip certificate verification (self-signed development endpoints only) |
 
 ## `--set`

@@ -22,14 +22,15 @@ oprobe-trace = "7"
 
 ```rust
 let (layer, handle) = oprobe_trace::layer(oprobe_trace::Config::default());
-let op = op.layer(layer);
+let op = Operator::new(builder)?.layer(layer);
 handle.save("prod.oprobe")?;          // then: oprobe show prod.oprobe
 ```
 
-Apply it first, before your other layers: it installs the instrumented `HttpFetch`, and the
-layers above it then wrap it, so every retry is recorded as its own request. Give OpenDAL's retry
-layer the handle's notifier, so retries land in the profile's Retries section (count, backoff,
-throttling) and the attempts of one call count as one operation:
+Apply it first, before your other layers (`ConcurrentLimitLayer`, `TailCutLayer`, `RetryLayer`): it
+installs the instrumented `HttpTransport` on `OperationContext`, and the layers above it then wrap
+it, so HTTP concurrency caps stay in force and every retry is recorded as its own request. Give
+OpenDAL's retry layer the handle's notifier, so retries land in the profile's Retries section
+(count, backoff, throttling) and the attempts of one call count as one operation:
 
 ```rust
 let (trace, handle) = oprobe_trace::layer(oprobe_trace::Config::default());
@@ -104,7 +105,7 @@ in-process services (`memory`, `fs`) are observed then.
 
 ## How it works
 
-For HTTP services the layer replaces the operator's `HttpFetch` with OpenDAL's own reqwest client
+For HTTP services the layer replaces the operator's `HttpTransport` with OpenDAL's own reqwest client
 (rustls with aws-lc-rs, the same pool defaults: no connect timeout, unlimited idle connections per
 host, 90 s idle timeout), observed through reqwest's public extension points: a timed DNS resolver,
 a connector layer that times each dial, a TLS session store that timestamps the ClientHello, and a

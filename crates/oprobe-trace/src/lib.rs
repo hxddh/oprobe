@@ -35,7 +35,7 @@
 //!
 //! # How it works
 //!
-//! For HTTP services the layer installs an instrumented `HttpFetch`: OpenDAL's own reqwest
+//! For HTTP services the layer installs an instrumented `HttpTransport`: OpenDAL's own reqwest
 //! client (same TLS stack, same pool defaults), observed request by request: phase timing,
 //! connection reuse, TLS and kernel TCP statistics. For in-process services (`memory`, `fs`)
 //! it records one request per backend call. The recorder is always on: there is no measurement
@@ -127,6 +127,7 @@ pub struct Config {
     transport: net::TransportConfig,
     https: bool,
     exporter: Option<Arc<dyn Exporter>>,
+    exporter_factory: Option<Arc<dyn Fn() -> Arc<dyn Exporter> + Send + Sync>>,
 }
 
 impl Default for Config {
@@ -136,6 +137,7 @@ impl Default for Config {
             transport: net::TransportConfig::default(),
             https: true,
             exporter: None,
+            exporter_factory: None,
         }
     }
 }
@@ -147,7 +149,10 @@ impl std::fmt::Debug for Config {
             .field("http_version", &self.transport.http)
             .field("keep_alive", &self.transport.keep_alive)
             .field("https", &self.https)
-            .field("exporter", &self.exporter.is_some())
+            .field(
+                "exporter",
+                &(self.exporter.is_some() || self.exporter_factory.is_some()),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -217,6 +222,17 @@ impl Config {
     /// Call `e` for every recorded request and operation (metrics, logs, your own sink).
     pub fn exporter(mut self, e: Arc<dyn Exporter>) -> Self {
         self.exporter = Some(e);
+        self.exporter_factory = None;
+        self
+    }
+
+    #[cfg(feature = "otel")]
+    pub(crate) fn exporter_factory(
+        mut self,
+        f: impl Fn() -> Arc<dyn Exporter> + Send + Sync + 'static,
+    ) -> Self {
+        self.exporter = None;
+        self.exporter_factory = Some(Arc::new(f));
         self
     }
 
@@ -388,7 +404,7 @@ impl Snapshot {
 /// Instrument an operator: `op.layer(layer)`, then `handle.snapshot()` or `handle.save(path)`.
 pub fn layer(cfg: Config) -> (TraceLayer, Handle) {
     let recorder = Recorder::always_on(cfg.max_rows);
-    if let Some(e) = cfg.exporter {
+    if let Some(e) = cfg.exporter.or_else(|| cfg.exporter_factory.map(|f| f())) {
         recorder.set_exporter(e);
     }
     let (context, transport_error) =

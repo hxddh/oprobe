@@ -24,6 +24,16 @@ impl OperatorSource {
     }
 }
 
+/// The operator file `arg` names when it exists on disk (`None` for a URL or a configured name).
+pub fn operator_file_path(arg: &str) -> Option<PathBuf> {
+    let arg = arg.trim();
+    if arg.is_empty() || arg.contains("://") {
+        return None;
+    }
+    let path = Path::new(arg);
+    ((arg.ends_with(".toml") || path.is_file()) && path.is_file()).then(|| path.to_path_buf())
+}
+
 /// Resolve `arg` to an operator spec.
 pub fn resolve(arg: &str, cfg: &ConfigFile) -> Result<(OperatorSpec, OperatorSource), OprobeError> {
     let arg = arg.trim();
@@ -92,6 +102,25 @@ mod tests {
         std::fs::write(&f, prod.to_toml()).unwrap();
         let (s, _) = resolve(f.to_str().unwrap(), &cfg).unwrap();
         assert_eq!(s, prod);
+        assert_eq!(operator_file_path(f.to_str().unwrap()), Some(f.clone()));
+        assert_eq!(operator_file_path("s3://b/x"), None);
+        assert_eq!(operator_file_path("prod"), None);
+        // Relative `http.ca_cert` resolves against the operator file's directory.
+        let sub = d.path().join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let ca = sub.join("ca.pem");
+        std::fs::write(&ca, "pem").unwrap();
+        let sub_op = sub.join("op.toml");
+        std::fs::write(
+            &sub_op,
+            "url = \"s3://b/x\"\n[http]\nca_cert = \"ca.pem\"\n",
+        )
+        .unwrap();
+        let loaded = OperatorSpec::load(&sub_op).unwrap();
+        assert_eq!(
+            loaded.http.ca_cert,
+            Some(std::fs::canonicalize(&sub).unwrap().join("ca.pem"))
+        );
         let e = resolve("prdo", &cfg).unwrap_err();
         assert_eq!(e.code, ErrorCode::UsageUnknownTarget);
         assert!(e.hint.unwrap().contains("prod"));

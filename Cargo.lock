@@ -4416,7 +4416,7 @@ dependencies = [
 
 [[package]]
 name = "oprobe"
-version = "7.1.0"
+version = "7.2.0"
 dependencies = [
  "anyhow",
  "await-tree",
@@ -4461,7 +4461,7 @@ dependencies = [
 
 [[package]]
 name = "oprobe-core"
-version = "7.1.0"
+version = "7.2.0"
 dependencies = [
  "anyhow",
  "await-tree",
@@ -4501,7 +4501,7 @@ dependencies = [
 
 [[package]]
 name = "oprobe-trace"
-version = "7.1.0"
+version = "7.2.0"
 dependencies = [
  "anyhow",
  "await-tree",
@@ -4516,6 +4516,7 @@ dependencies = [
  "opendal-core",
  "opendal-http-transport-reqwest",
  "opendal-layer-retry",
+ "opendal-service-fs",
  "opendal-service-http",
  "opentelemetry",
  "opentelemetry_sdk",

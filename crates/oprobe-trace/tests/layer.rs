@@ -181,3 +181,30 @@ fn an_invalid_proxy_is_reported_not_fatal() {
         .expect("the transport must refuse the proxy");
     assert!(err.contains("http://"), "{err}");
 }
+
+#[tokio::test]
+async fn in_process_copy_and_rename_record_requests() {
+    let dir = std::env::temp_dir().join(format!("oprobe-trace-fs-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let (layer, handle) = oprobe_trace::layer(oprobe_trace::Config::default());
+    let op = Operator::new(opendal_service_fs::Fs::default().root(dir.to_str().unwrap()))
+        .unwrap()
+        .layer(layer);
+    op.write("src", vec![9u8; 512]).await.unwrap();
+    op.copy("src", "dst").await.unwrap();
+    op.rename("dst", "moved").await.unwrap();
+    let snap = handle.snapshot();
+    let copies: u64 = snap
+        .apis
+        .iter()
+        .filter(|a| a.api.label() == "CopyObject")
+        .map(|a| a.count)
+        .sum();
+    assert_eq!(copies, 2, "{:?}", snap.apis);
+    let copy_verb = snap.verbs.iter().find(|v| v.verb == "copy").unwrap();
+    assert_eq!(copy_verb.requests_per_op, 1.0);
+    let rename_verb = snap.verbs.iter().find(|v| v.verb == "rename").unwrap();
+    assert_eq!(rename_verb.requests_per_op, 1.0);
+    let _ = std::fs::remove_dir_all(&dir);
+}

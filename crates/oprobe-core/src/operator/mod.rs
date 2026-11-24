@@ -502,11 +502,22 @@ impl OperatorSpec {
                 path.display()
             ))
         })?;
-        Self::parse(&raw).map_err(|e| {
+        let mut s = Self::parse(&raw).map_err(|e| {
             let mut o = OprobeError::new(e.code, format!("`{}`: {}", path.display(), e.message));
             o.hint = e.hint;
             o
-        })
+        })?;
+        if let Some(ca) = &s.http.ca_cert
+            && ca.is_relative()
+        {
+            let dir = path
+                .parent()
+                .filter(|d| !d.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            let base = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+            s.http.ca_cert = Some(base.join(ca));
+        }
+        Ok(s)
     }
 
     /// The `op.toml` form (defaults left out).

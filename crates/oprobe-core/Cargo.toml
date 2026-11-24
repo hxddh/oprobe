@@ -5,7 +5,6 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
 documentation = "https://docs.rs/oprobe-core"
 description = "Internal engine of the oprobe binary (no semver promise; to profile your own OpenDAL operator use oprobe-trace)"
 readme = "README.md"

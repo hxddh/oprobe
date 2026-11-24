@@ -521,6 +521,8 @@ static EN: &[(&str, &str)] = &[
     ("operator.diff", "The change as Rust and as op.toml"),
     ("operator.copy_rust", "Copy Rust"),
     ("operator.copy_toml", "Copy TOML"),
+    ("operator.save_toml", "Save to op.toml"),
+    ("operator.saved_toml", "Saved to {}."),
     ("operator.reset", "Reset"),
     ("operator.prove", "Prove"),
     (
@@ -1127,6 +1129,8 @@ static ZH: &[(&str, &str)] = &[
     ("operator.diff", "改动的 Rust 与 op.toml 形式"),
     ("operator.copy_rust", "复制 Rust"),
     ("operator.copy_toml", "复制 TOML"),
+    ("operator.save_toml", "写入 op.toml"),
+    ("operator.saved_toml", "已写入 {}。"),
     ("operator.reset", "重置"),
     ("operator.prove", "证明"),
     (

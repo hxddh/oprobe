@@ -713,8 +713,8 @@ pub struct OpStream {
 
 impl oio::ReadStream for OpStream {
     async fn read(&mut self) -> Result<Buffer> {
-        // The body of a request already linked to the operation: no scope needed.
-        let r = self.inner.read_dyn().await;
+        // Keep the operation scope active while reading so mid-stream retries link here.
+        let r = in_scope(&self.st, self.inner.read_dyn()).await;
         match &r {
             Ok(b) if b.is_empty() => {
                 if let Some(st) = self.st.take() {

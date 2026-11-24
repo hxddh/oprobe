@@ -104,9 +104,11 @@ impl Exporter for OtelExporter {
     }
 }
 
-/// A [`crate::Config`] that exports to `meter`.
+/// A [`crate::Config`] that exports to `meter` (cloning it gives each traced operator its own
+/// `scheme`, `namespace` and `root` attributes).
 pub fn config(meter: &Meter) -> crate::Config {
-    crate::Config::default().exporter(Arc::new(OtelExporter::new(meter)))
+    let meter = meter.clone();
+    crate::Config::default().exporter_factory(move || Arc::new(OtelExporter::new(&meter)))
 }
 
 #[cfg(test)]
@@ -166,5 +168,47 @@ mod tests {
         for l in ["namespace", "root", "operation"] {
             assert!(labels.contains_key(l), "{l}: {labels:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn cloned_otel_config_keeps_each_operators_service_labels() {
+        let exporter = InMemoryMetricExporter::default();
+        let provider = SdkMeterProvider::builder()
+            .with_reader(PeriodicReader::builder(exporter.clone()).build())
+            .build();
+        let meter = provider.meter("oprobe-trace-multi");
+        let cfg = config(&meter);
+        let (l1, _h1) = crate::layer(cfg.clone());
+        let (l2, _h2) = crate::layer(cfg);
+        let op1 =
+            opendal_core::Operator::new(opendal_core::services::Memory::default().root("/alpha"))
+                .unwrap()
+                .layer(l1);
+        let op2 =
+            opendal_core::Operator::new(opendal_core::services::Memory::default().root("/beta"))
+                .unwrap()
+                .layer(l2);
+        op1.write("k", "1").await.unwrap();
+        op2.write("k", "2").await.unwrap();
+        provider.force_flush().unwrap();
+        let metrics = exporter.get_finished_metrics().unwrap();
+        let mut roots = std::collections::BTreeSet::new();
+        for rm in &metrics {
+            for sm in rm.scope_metrics() {
+                for m in sm.metrics() {
+                    if let AggregatedMetrics::F64(MetricData::Histogram(h)) = m.data() {
+                        for p in h.data_points() {
+                            for kv in p.attributes() {
+                                if kv.key.as_str() == "root" {
+                                    roots.insert(kv.value.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(roots.contains("/alpha/"), "{roots:?}");
+        assert!(roots.contains("/beta/"), "{roots:?}");
     }
 }
