@@ -120,7 +120,7 @@ operators renders as Rust and as TOML. [The reference →](docs/operator.md)
 | `throttling` | 429/503 above an in-flight level | `layers.concurrent_limit.http`, plus `layers.retry.jitter` |
 | `rate_limit` | a request-rate ceiling | `layers.concurrent_limit.http` |
 | `key_limit` | a hot prefix or key | the key layout (advice, not a layer) |
-| `bandwidth_cap` | a bytes-per-second ceiling | `layers.throttle.bandwidth` |
+| `bandwidth_cap` | a bytes-per-second ceiling | `layers.throttle.bandwidth` on writes; on reads not a layer |
 | `tail_stragglers` | a few very slow server responses | `layers.tail_cut` |
 | `hung_requests` | requests that never finish | `layers.timeout.io` |
 | `small_ranges` | many small range reads | `read.gap` / `read.concurrent` |
@@ -128,6 +128,8 @@ operators renders as Rust and as TOML. [The reference →](docs/operator.md)
 | `repeated_reads` | the same bytes read again and again | `layers.cache` (`FoyerLayer`) |
 | `cold_connections` | handshakes on the critical path, HTTP version | `http.keep_alive` / `http.version` |
 | `client_bound` | your process is the bottleneck | none in storage; reported as such |
+| `errors` | 5xx or lost connections that retries recovered | `layers.retry.min_delay`, plus `layers.retry.jitter` |
+| `errors` | failures that reached the application | none: fix their cause (`show RUN --by api`) |
 
 `run` names the remedy; only `prove` puts a number on it.
 
@@ -429,8 +431,9 @@ hung I/O, cold connections, small ranges, slow multipart, repeated reads, a busy
 Every finding has a confidence: **high** only when the model explains most of the effect and
 agrees across repeats. Throttling that made operations fail is reported as throttling, never as
 an invalid run. The codes and their remedies are in the [README](../README.md#findings-and-their-remedy);
-besides those, `errors` reports failures that are not throttling and `invalid_run` a run whose
-numbers cannot be trusted (too short, nothing measured).
+besides those, `errors` reports failures that are not throttling (when retries recovered every
+operation, its remedy is a shorter first retry backoff with jitter, `layers.retry.min_delay`) and
+`invalid_run` a run whose numbers cannot be trusted (too short, nothing measured).
 
 ## Remedy
 
@@ -804,7 +807,9 @@ oprobe prove 20261122-0915 small_ranges --max-duration 10m
 Print a profile: a stored run, or a file (`.oprobe` from `run` or from
 [`oprobe-trace`](embedding.md), or a report `.json`). Without an argument, the last run.
 `-o json` prints the shown run (`schemas/show.json`: the report of `schemas/report.json`, where it is stored, and the `by` and `range` sections when asked for); `--list -o json` the run list
-(`schemas/run-list.json`).
+(`schemas/run-list.json`; `-n` limits the runs and the proves alike). A prove id (`show --list`
+lists them) prints that prove's stored result as `prove` printed it (`schemas/prove.json`), also
+after its run was removed.
 
 A trace from `oprobe-trace` is recognised by its content, whatever its name. Its report has
 `run.source = "trace"` and shows `production trace` where a run shows its workload. Its
@@ -939,15 +944,16 @@ the configuration and the five slowest operations):
 | where the time goes | each operation's wall time split into stages (below) |
 | operations | per workload verb: count, ops/s, p50, p99, max, requests per operation, errors (`--detail`: MiB/s, retries, throttled share) |
 | backend requests | per storage API (`GetObject`, `PutObject`, …): count, share on warm connections, TTFB and total p50/p99, bytes down/up, status codes (`--detail`: every stage's p50/p99); and, for a run that wrote, a **writes** line: the multipart part size OpenDAL used (and the requested `write.chunk` and the service's part-size limits when it was clamped) and the parts uploaded with their mean size — the knobs `prove` sizes for `slow_multipart` |
-| connections | HTTP version, TLS, new connections, reuse, peak in-flight requests, dial time per phase (proxy CONNECT included), and a **tcp** line from the kernel: rtt p50/p99, connections that retransmitted, the share of sending time limited by the peer's receive window or the local send buffer, the delivery rate. High rtt or retransmits point at the network; a clean network with a high TTFB points at the server. `--detail` adds the TLS handshakes (resumed share, HelloRetryRequests) and the cold start (dials and first operations before the warm-up absorbed them) |
-| bytes | logical vs backend bytes, read amplification, over-read, requests per operation, cache hits |
+| connections | HTTP version, TLS, the connections dialed during the warm-up and in the window, reuse, peak in-flight requests, dial time per phase (proxy CONNECT included), and a **tcp** line from the kernel: the minimum rtt (the network's own round trip) and the smoothed rtt p50/p99 (which on a fast network includes the server's delay and delayed acknowledgements), connections that retransmitted, the share of sending time limited by the peer's receive window or the local send buffer, the delivery rate. High rtt or retransmits point at the network; a clean network with a high TTFB points at the server. `--detail` adds the TLS handshakes (resumed share, HelloRetryRequests) and the cold start (dials and first operations before the warm-up absorbed them) |
+| bytes | logical vs backend bytes, read amplification, over-read, requests per operation, cache hits, and the bytes on the wire (from the kernel's per-connection counters, when they were read) |
 | slowest operation | the worst operation request by request (a waterfall), with what each request recorded beyond its stages (below) and, with `--detail`, its async call stack |
 | self | the profiler's own health: scheduling lag, CPU, whether the client was saturated |
 | cleanup | test data removed (verified), or what is left |
 
 `--detail` also adds, per interval of the timeline, retries, new connections and the client's
-CPU (percent of one core), and the cold and warm reads (first read of a key, repeat reads) to
-SPREAD.
+CPU (percent of one core), and the first read and re-reads of a key to SPREAD (object sizes as
+ranges; a column no row has, such as a hot key's errors, is left out). The timeline ends with
+the measured window: what draining operations did after it counts in its last interval.
 
 `--by stage` sums the requests' time per stage, `--by api` per storage API, `--by conn` per
 connection (cold and warm, per remote address). `--by stage` also gives each stage's p50/p99
@@ -990,7 +996,7 @@ Each operation's wall time is split exactly; an instant counts once even when re
 | TTFB | waiting for the first byte (the server's work plus one round trip) | the store or the distance to it; stragglers show as a long tail (`layers.tail_cut`) |
 | body | the response body arrives | download bandwidth per stream × streams; `read.chunk`, `read.concurrent` |
 | stall | the body waits for your code to read it (client time: its own segment in a waterfall, never part of body) | the consumer, not storage |
-| retry | the retry layer sleeps before the next attempt | throttling or errors; see the findings |
+| retry | the retry layer sleeps before the next attempt | throttling or errors; see the findings (`errors` on retried 5xx or lost connections: `layers.retry.min_delay`) |
 | client | everything else: OpenDAL, signing, checksums | CPU (`client_bound`), tiny objects |
 
 ### How it is measured
@@ -1009,8 +1015,9 @@ Each operation's wall time is split exactly; an instant counts once even when re
   requests.
 - **Percentiles** are exact when every operation was kept, otherwise from histograms with three
   significant digits. Counts always agree with the totals. The report keeps the run's whole
-  latency distribution (`latency_histogram`, 20 bins per decade), and the latency CDF is drawn
-  from it whenever the trace rows are sampled.
+  latency distribution (`latency_histogram`, 20 bins per decade), and the latency distribution
+  (in the app a tail plot: the share of operations slower than each latency, on log axes) is
+  drawn from it whenever the trace rows are sampled.
 - **The timeline** has one row per interval (1 s for the first ten minutes, then 10 s).
   Operations, goodput (`goodput_ops_per_s`: successes only; `ops_per_s` counts every attempt)
   and the latency quantiles belong to the interval an operation *started* in; requests
@@ -1334,16 +1341,18 @@ The window works like other professional tools on your platform (design:
   throttled requests (per request), with how many operations and requests were measured.
   A **Read these numbers with care** note comes first when the client was saturated, the run is
   partial, open-loop arrivals started late, or too few operations were measured.
-- **Findings**, each with its remedy and the evidence it rests on (below). **Show N examples**
-  expands the waterfalls of the operations that show the problem.
+- **Findings**, each with its remedy and the evidence it rests on (below). Its named values are
+  labelled in the app's language and formatted like the tiles (`9.87 ms`, `2.60 %`). **Show N
+  examples** expands the waterfalls of the operations that show the problem.
 - **Where the time went**: the stage split of every operation, and of each verb with its
   operations per second, MiB/s, requests per operation and, when any, its throttled share.
 - **Requests by API**: for each S3 API, the request count, the status codes, TTFB p50 / p99,
-  total p50 / p99 (the same statistics as `oprobe show`), bytes down / up and connection reuse.
-  For a run that wrote, a **Writes** line gives the multipart part size OpenDAL used (with the
-  requested chunk and the service's limits when it was clamped) and the parts uploaded with
-  their mean size. Click an API to list its slowest requests, and one of those to see its
-  operation's waterfall.
+  total p50 / p99 (the same statistics as `oprobe show`) with a bar of the p50 inside the p99,
+  scaled to the slowest API, bytes down / up and connection reuse. For a run that wrote in
+  parts, a **Writes** line gives the multipart part size OpenDAL used (with the requested chunk
+  and the service's limits when it was clamped) and the parts uploaded with their mean size.
+  Click an API to list its slowest requests, and one of those to see its operation's
+  waterfall.
 - **Retries and failures**: retries, time spent waiting between attempts, 429 / 503 responses,
   the longest `Retry-After`, other errors and failure classes.
 - **The slowest operations** as a request waterfall. Each request is on a shared time axis and
@@ -1361,31 +1370,44 @@ The window works like other professional tools on your platform (design:
   - p50 / p99 / p99.9; an interval with too few operations for a quantile (fewer than
     10 / (1 − q): 1 000 for p99) draws it faint and dashed, and the readout says so
     (`n=12, too few for p99`);
-  - requests per second (retries included) with, as step lines beside it, the retries, the
-    throttled responses and the failed operations per second (so one 429 does not look like a
-    thousand);
+  - throughput: MiB per second read and written, interval by interval (the bandwidth tile over
+    time);
+  - requests per second (retries included);
+  - **Problems per second**, on its own axis and only when any happened: the retries, the
+    throttled responses and the failed operations per second (on the requests' axis a few
+    retries would be flat at zero; here one 429 does not look like a thousand either);
   - the number of requests in flight, with the connections dialed in each interval (churn
     behind a latency spike) and, faint, the client's CPU in cores busy (its saturation over
     time).
 
-  Requests and in-flight are not split by verb: with a verb chosen they say "all verbs".
-- **Latency distribution**: a CDF with p50 and p99 marked. It is drawn from every row when no row
-  was sampled away, else from the run's latency histogram, which counts every operation. With a
-  verb chosen (and no range), it is that verb's.
-- **Heatmap**: operations by start time and latency, in fine rows when every row was kept, with a
-  colour key from the fewest to the most operations in a cell. Click a cell to list its slowest
+  Throughput, requests, problems and in-flight are not split by verb: with a verb chosen they
+  say "all verbs". Every chart ends where the measured window ends, as the tiles do: what
+  operations did while draining after the window counts in its last interval. A legend lists
+  only the series that are not zero throughout.
+- **Latency distribution**: a tail plot, the share of operations slower than each latency on
+  log axes (latency across, 100 % down to 0.01 % up the side), with p50, p99 and p99.9 marked,
+  so the tail gets as much room as the body. It is drawn from every row when no row was sampled
+  away, else from the run's latency histogram, which counts every operation. With a verb chosen
+  (and no range), it is that verb's.
+- **Heatmap**: operations by start time and latency, in fine rows (1-1.5-2-3-5-7 per decade, the
+  slowest row closed at the next step) when every row was kept, with a colour key from the fewest to the most operations in a cell. Click a cell to list its slowest
   operations (verb, key, latency, status, attempts), and one of those to see its waterfall.
-- **Connections**: new connections (and failed dials), reuse, protocols, TLS, the proxy, peak
-  requests in flight, each dial phase's p50 / p99 (DNS, TCP, proxy CONNECT, TLS), and whether
-  the network or the server is the limit: the kernel's round trip p50 / p99, the connections
-  that retransmitted, the share of sending time limited by the receive window or the send
-  buffer, the delivery rate, the TLS handshakes (resumed share, HelloRetryRequests) and the
-  cold start (connections dialed at the start, their connect time and the first operations'
-  latency).
+- **Connections**: the connections dialed, each count with its window (`28 during warm-up · 1
+  in the window`), failed dials, reuse, the protocols used, TLS, the proxy, peak requests in
+  flight, each dial phase's p50 / p99 (DNS, TCP, proxy CONNECT, TLS), and whether the network or
+  the server is the limit: the kernel's minimum round trip (the network's) and its smoothed
+  round trip p50 / p99 — on a fast network the smoothed one includes the server's delay and
+  delayed acknowledgements, and the app says so when it is far above the minimum —, the
+  connections that retransmitted, the share of sending time limited by the receive window or
+  the send buffer, the delivery rate, the TLS handshakes (resumed share, HelloRetryRequests)
+  and the cold start (the warm-up dials' connect time and the first operations' latency).
 - **Details** (open on demand):
-  - bytes asked for against bytes moved: read, write and request amplification, and cache hits;
-  - the hottest keys, object sizes, prefixes, first and repeat reads (cold / warm) and server
-    addresses, each with its throttled share, error share and p99.
+  - bytes asked for against bytes moved: read, write and request amplification, cache hits,
+    and the bytes on the wire (in / out, from the kernel's counters) when they were measured;
+  - the hottest keys, object sizes (as ranges: `0 B`, `4 KiB – 64 KiB`, …), prefixes, the first
+    read and re-reads of a key, and server addresses, each with its share of the requests (with
+    a bar), its throttled share, error share and p99 (a column no row has is left out: hot keys
+    carry their share of the throttling only).
 - **Run setup** (open on demand): target, workload, load, dataset, mix, the write path, seed, the client (CPU and
   scheduling lag), the share of trace rows kept, and the `oprobe run …` command that runs it
   again.
@@ -1409,7 +1431,7 @@ Each finding carries the evidence it rests on:
 | `small_ranges` | bytes asked for against bytes downloaded, and requests per operation |
 | `rate_limit` | throttled responses per second |
 | `bandwidth_cap` | bandwidth (MiB/s) over the run |
-| `tail_stragglers`, `hung_requests` | the latency distribution, with p50 and p99 marked |
+| `tail_stragglers`, `hung_requests` | the latency tail plot, with p50, p99 and p99.9 marked |
 | `errors` | failed operations per second |
 
 **Operator.** The run's layer stack beside each finding's remedy. A finding's **Prove** (and
@@ -1421,9 +1443,11 @@ converge: each pair's change as a dot, the running estimate with its 95 % interv
 and the A/A noise floor around no change, until the sequential test decides: **improved**,
 **worse** or **inconclusive**. **Copy** puts the winning diff (Rust or TOML) on the clipboard.
 
-**Compare.** Two runs, or the operators of one multi-operator run, side by side: goodput, latency
-percentiles, the stage split and the findings of each, with their goodput over time and their
-latency distributions drawn on one chart each. Shares (errors, throttled) change by percentage
+**Compare.** Two runs, or the operators of one multi-operator run, side by side: goodput,
+bandwidth, requests per second, latency p50 / p99 / p99.9, failed operations, retries, throttled
+responses, the stage split and the findings of each, with their goodput, p99 and requests per
+second over time and their latency tails drawn on one chart each, and each backend API's
+requests and TTFB p99 in every run. Shares (errors, throttled) change by percentage
 points. The changes are shown in a neutral colour, never as better or worse: each column is a
 single run, and its difference includes run-to-run noise. To measure a change, prove it.
 
@@ -1593,7 +1617,7 @@ sudo dnf install ./oprobe-<ver>-1.x86_64.rpm
 cargo install oprobe --locked                                         # the app in the terminal
 cargo install oprobe --locked --features gui                          # plus native windows (Linux: libgtk-4-dev)
 cargo install oprobe --locked --no-default-features --features cli    # the CLI only
-cargo install --locked --git https://github.com/hxddh/oprobe --tag v7.0.0 oprobe
+cargo install --locked --git https://github.com/hxddh/oprobe --tag v7.1.0 oprobe
 ```
 
 `cargo install oprobe` also downloads `oprobe-core`, oprobe's internal engine crate, at exactly
@@ -1612,7 +1636,7 @@ as the archive, so it proves the download is intact, not who built it.
 ```bash
 sha256sum --ignore-missing -c SHA256SUMS                    # Linux
 shasum -a 256 --ignore-missing -c SHA256SUMS                # macOS
-Get-FileHash oprobe-7.0.0-x64.msi -Algorithm SHA256          # Windows
+Get-FileHash oprobe-7.1.0-x64.msi -Algorithm SHA256          # Windows
 ```
 
 **Build provenance.** Every asset has a [SLSA build provenance](https://slsa.dev/) attestation
@@ -1620,7 +1644,7 @@ signed by GitHub Actions, which proves it was built by this repository's release
 given commit:
 
 ```bash
-gh attestation verify oprobe-7.0.0-x86_64-unknown-linux-musl.tar.gz --repo hxddh/oprobe \
+gh attestation verify oprobe-7.1.0-x86_64-unknown-linux-musl.tar.gz --repo hxddh/oprobe \
   --signer-workflow hxddh/oprobe/.github/workflows/release.yml
 ```
 

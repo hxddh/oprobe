@@ -297,23 +297,62 @@ fn stragglers_are_cut() {
     improved(&p);
 }
 
-/// Every response stream shares 16 MiB/s: a bandwidth cap, named as such and sized at the
-/// cap. OpenDAL's ThrottleLayer shapes writes only, so on this read workload the A/B test can
-/// show no loss but no gain: never `worse`.
+/// Every response stream shares 16 MiB/s: a bandwidth cap, named as such, with the fitted cap
+/// in its evidence. OpenDAL's ThrottleLayer shapes writes only, so on this read workload the
+/// cap is not a layer (K16: 7.0 named `layers.throttle.bandwidth`, which cannot help reads)
+/// and there is nothing to prove.
 #[test]
-fn a_shared_bandwidth_cap_is_sized_at_the_cap() {
+fn a_shared_bandwidth_cap_on_reads_is_not_a_layer() {
     let env = Env::new();
     let r = env.run_until(&["lab://bandwidth", "-d", "2s"], "bandwidth_cap");
-    check_finding(&r, "bandwidth_cap", Some("layers.throttle.bandwidth"));
-    let p = env.prove(r["run"]["id"].as_str().unwrap(), "bandwidth_cap", &[]);
-    let v = sized(&p);
-    let mib: f64 = v.trim_end_matches("MiB").parse().unwrap();
+    let f = finding(&r, "bandwidth_cap").unwrap();
+    assert!(f["remedy"]["path"].is_null(), "{f:#}");
+    let text = f["remedy"]["text"].as_str().unwrap();
+    assert!(text.contains("not a layer"), "{text}");
+    let id = r["run"]["id"].as_str().unwrap();
+    assert_eq!(
+        f["remedy"]["next"].as_str().unwrap(),
+        format!("oprobe show {id} --detail")
+    );
+    let bps = f["evidence"]["values"]["fitted_bytes_per_s"]
+        .as_f64()
+        .unwrap();
+    let mib = bps / (1024.0 * 1024.0);
     assert!(
         (12.0..=20.0).contains(&mib),
-        "sized {v}, the lab caps at 16MiB"
+        "fitted {mib} MiB/s, the lab caps at 16"
     );
-    assert_ne!(p["verdict"], "worse", "{p:#}");
-    assert!(!p["notes"].as_array().unwrap().is_empty());
+}
+
+/// Transient failures that retries recover (`lab://flaky`: 4 % 500s and 2 % connection resets;
+/// `lab://noisy`: 5 % random 5xx): an `errors` finding whose remedy is the first retry backoff,
+/// with jitter. With every default, `prove` sizes it short and proves `improved` (K1: 7.0
+/// named jitter alone at OpenDAL's 1 s backoff, and the prove came out worse).
+#[test]
+fn retried_transient_failures_prove_a_shorter_backoff() {
+    let env = Env::new();
+    for scenario in ["lab://flaky", "lab://noisy"] {
+        let r = env.run_until(&[scenario, "-d", "2s"], "errors");
+        let f = check_finding(&r, "errors", Some("layers.retry.min_delay"));
+        assert_eq!(f["remedy"]["with"][0], "layers.retry.jitter", "{f:#}");
+        // The errors finding by name: on a slow machine the random 503s can also rank a
+        // throttling finding first.
+        let p = env.json(&["prove", r["run"]["id"].as_str().unwrap(), "errors"]);
+        assert_eq!(p["finding"], "errors", "{scenario}: {p:#}");
+        assert_eq!(p["objective"], "goodput");
+        let v = sized(&p);
+        let ms: u64 = v.trim_end_matches("ms").parse().unwrap();
+        assert!((20..=500).contains(&ms), "{scenario}: sized {v}");
+        assert!(
+            p["change"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c == "layers.retry.jitter=on"),
+            "{p:#}"
+        );
+        improved(&p);
+    }
 }
 
 /// 4 MiB/s per response stream: large reads streamed through one request each are split

@@ -83,8 +83,78 @@ pub struct EvidenceItem {
     pub key: String,
     /// Human label (`Throttled requests`).
     pub label: String,
-    /// Formatted value with its unit (`4.7%`).
+    /// Formatted value with its unit (`4.7%`), in the terminal's format.
     pub value: String,
+    /// The number, in [`EvidenceItem::unit`] (a share is 0–1, also for `_pct` keys), for a
+    /// front end that formats numbers its own way.
+    pub amount: f64,
+    pub unit: EvidenceUnit,
+}
+
+/// The unit of an evidence value, from its key's suffix.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EvidenceUnit {
+    /// Milliseconds (`_ms`, and `_us` converted).
+    Ms,
+    /// Seconds (`_s`).
+    Seconds,
+    /// A share, 0–1 (`_ratio`, and `_pct` divided by 100).
+    Share,
+    /// A multiple (`p99_to_p50_ratio`, `overread_ratio`): `3.20×`.
+    Times,
+    Bytes,
+    BytesPerS,
+    MibPerS,
+    RequestsPerS,
+    OpsPerS,
+    /// A whole count (`_count`, and counts per 1 000 operations).
+    Count,
+    Usd,
+    /// A plain number (`_mean`).
+    Number,
+}
+
+impl EvidenceUnit {
+    /// The unit of `key` and its value converted to that unit.
+    pub fn of(key: &str, v: f64) -> (Self, f64) {
+        let multiple = key.contains("_to_") || key == "overread_ratio";
+        if key.ends_with("_ratio") {
+            if multiple {
+                (Self::Times, v)
+            } else {
+                (Self::Share, v)
+            }
+        } else if key.ends_with("_pct") {
+            (Self::Share, v / 100.0)
+        } else if key.ends_with("_ms") {
+            (Self::Ms, v)
+        } else if key.ends_with("_us") {
+            (Self::Ms, v / 1000.0)
+        } else if key.ends_with("_per_s") {
+            (
+                if key.contains("bytes") {
+                    Self::BytesPerS
+                } else if key.contains("mib") {
+                    Self::MibPerS
+                } else if key.contains("requests") {
+                    Self::RequestsPerS
+                } else {
+                    Self::OpsPerS
+                },
+                v,
+            )
+        } else if key.ends_with("_s") {
+            (Self::Seconds, v)
+        } else if key.ends_with("_bytes") {
+            (Self::Bytes, v)
+        } else if key.ends_with("_usd") {
+            (Self::Usd, v)
+        } else if key.ends_with("_count") || key.contains("_per_1k_") {
+            (Self::Count, v)
+        } else {
+            (Self::Number, v)
+        }
+    }
 }
 
 /// One finding: cause · evidence · remedy path · next command.
@@ -127,10 +197,16 @@ impl FindingView {
                 .labelled()
                 .into_iter()
                 .zip(f.evidence.values.keys())
-                .map(|((label, value), key)| EvidenceItem {
-                    key: key.clone(),
-                    label,
-                    value,
+                .zip(f.evidence.values.values())
+                .map(|(((label, value), key), v)| {
+                    let (unit, amount) = EvidenceUnit::of(key, *v);
+                    EvidenceItem {
+                        key: key.clone(),
+                        label,
+                        value,
+                        amount,
+                        unit,
+                    }
                 })
                 .collect(),
             remedy_path: f.remedy.path.clone(),
@@ -164,11 +240,10 @@ impl FindingView {
     }
 }
 
-/// The findings, most severe first (stable within a severity).
+/// The findings in the report's order (already ranked: `invalid_run` leads a run that cannot
+/// be judged, then the most severe), so the text and JSON agree.
 pub fn findings(r: &Report) -> Vec<FindingView> {
-    let mut v: Vec<FindingView> = r.findings.iter().map(FindingView::of).collect();
-    v.sort_by_key(|f| std::cmp::Reverse(f.severity));
-    v
+    r.findings.iter().map(FindingView::of).collect()
 }
 
 /// The key numbers.
@@ -582,10 +657,12 @@ pub struct TimelineView {
 impl TimelineView {
     pub fn of(r: &Report) -> Self {
         let mut v = Self::default();
-        let n = r.timeline.len();
-        for (i, p) in r.timeline.iter().enumerate() {
-            let len = interval_len(p);
+        let timeline = window_points(r);
+        let n = timeline.len();
+        for (i, p) in timeline.iter().enumerate() {
             let width = interval_width(r, p, i + 1 == n);
+            // The last interval ends with the window (the charts end where the tiles do).
+            let len = if i + 1 == n { width } else { interval_len(p) };
             // Reports before 6.3 carry no exact counts: derive them from the rates.
             let ops = if p.ops_count > 0 {
                 p.ops_count
@@ -751,15 +828,17 @@ impl TimelineView {
             verb: Some(verb.to_owned()),
             ..Self::default()
         };
-        let n = r.timeline.len();
-        for (i, p) in r.timeline.iter().enumerate() {
+        let timeline = window_points(r);
+        let n = timeline.len();
+        for (i, p) in timeline.iter().enumerate() {
             let width = interval_width(r, p, i + 1 == n);
             let x = p.verbs.iter().find(|x| x.verb == verb);
             let ops = x.map_or(0, |x| x.ops_count);
             let rows = x.map(|x| x.latency_rows_count.as_slice()).unwrap_or(&[]);
             let q = |q: f64| row_quantile_ms(rows, &bounds, q);
             v.t_s.push(p.t_s);
-            v.len_s.push(interval_len(p));
+            v.len_s
+                .push(if i + 1 == n { width } else { interval_len(p) });
             v.ops_per_s.push(ops as f64 / width);
             v.goodput_ops_per_s
                 .push(x.map_or(0, |x| x.ok_ops_count) as f64 / width);
@@ -788,6 +867,58 @@ impl TimelineView {
         let min = Self::min_ops_for(q);
         self.ops_count.iter().map(|n| *n >= min).collect()
     }
+}
+
+/// The timeline clipped to the measurement window: an interval that starts at or after the
+/// window's end (the drain, where operations started in the window finish) holds no started
+/// operation, only events — its requests, retries, throttled responses and failures are folded
+/// into the window's last interval, so no chart runs past the window or drops to zero there.
+fn window_points(r: &Report) -> std::borrow::Cow<'_, [crate::trace::TimelinePoint]> {
+    let w = r.run.window_s;
+    let inside = r.timeline.iter().take_while(|p| p.t_s < w - 1e-6).count();
+    if w <= 0.0 || inside == 0 || inside == r.timeline.len() {
+        return std::borrow::Cow::Borrowed(&r.timeline);
+    }
+    let mut pts: Vec<crate::trace::TimelinePoint> = r.timeline[..inside].to_vec();
+    let last_i = pts.len() - 1;
+    let width = interval_width(r, &pts[last_i], true);
+    let p = &mut pts[last_i];
+    // Requests as a count (reports before 6.3 carry only the rate).
+    let mut requests = if p.requests_count > 0 {
+        p.requests_count as f64
+    } else {
+        p.requests_per_s * width
+    };
+    for s in &r.timeline[inside..] {
+        p.errors += s.errors;
+        p.throttled += s.throttled;
+        p.throttled_ops += s.throttled_ops;
+        p.retries_count += s.retries_count;
+        p.missed_arrivals += s.missed_arrivals;
+        p.new_connections += s.new_connections;
+        p.inflight_peak = p.inflight_peak.max(s.inflight_peak);
+        p.requests_count += s.requests_count;
+        requests += if s.requests_count > 0 {
+            s.requests_count as f64
+        } else {
+            s.requests_per_s * interval_len(s)
+        };
+        for v in &s.verbs {
+            if let Some(x) = p.verbs.iter_mut().find(|x| x.verb == v.verb) {
+                x.errors_count += v.errors_count;
+                x.throttled_count += v.throttled_count;
+            } else {
+                p.verbs.push(crate::trace::VerbInterval {
+                    verb: v.verb.clone(),
+                    errors_count: v.errors_count,
+                    throttled_count: v.throttled_count,
+                    ..Default::default()
+                });
+            }
+        }
+    }
+    p.requests_per_s = requests / width.max(1e-9);
+    std::borrow::Cow::Owned(pts)
 }
 
 /// The nominal length of a timeline interval (1 s for reports without one).
@@ -840,8 +971,13 @@ pub struct DialPhase {
 /// the limit.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TcpView {
+    /// The kernel's smoothed round trip: on a fast network it includes the server's delay and
+    /// delayed acknowledgements, so it reads well above the network's (`min_rtt_p50_us`).
     pub rtt_p50_us: u64,
     pub rtt_p99_us: u64,
+    /// The kernel's minimum round trip of the connections (p50 over the requests that
+    /// recorded it): the network's own round trip, which server delay does not inflate.
+    pub min_rtt_p50_us: Option<u64>,
     pub connections_count: u64,
     /// Connections that retransmitted at least once.
     pub retransmitting_connections_count: u64,
@@ -858,8 +994,18 @@ impl TcpView {
     /// sndbuf-limited 0.0% · delivery p50 812 Mbit/s`.
     pub fn line(&self) -> String {
         use crate::util::fmt_ms;
+        let min = self
+            .min_rtt_p50_us
+            .map(|m| {
+                if m < 1000 {
+                    format!("min rtt {m}µs · ")
+                } else {
+                    format!("min rtt {} · ", fmt_ms(m as f64 / 1000.0))
+                }
+            })
+            .unwrap_or_default();
         let mut s = format!(
-            "rtt p50/p99 {}/{} · {} of {} connections retransmitted · rwnd-limited {:.1}% · sndbuf-limited {:.1}%",
+            "{min}smoothed rtt p50/p99 {}/{} · {} of {} connections retransmitted · rwnd-limited {:.1}% · sndbuf-limited {:.1}%",
             fmt_ms(self.rtt_p50_us as f64 / 1000.0),
             fmt_ms(self.rtt_p99_us as f64 / 1000.0),
             self.retransmitting_connections_count,
@@ -875,6 +1021,21 @@ impl TcpView {
         }
         s
     }
+}
+
+/// The p50 of the kernel's minimum round trip over the request rows that recorded one.
+fn min_rtt_p50_us(run: &Run) -> Option<u64> {
+    let mut v: Vec<u64> = run
+        .reqs
+        .iter()
+        .filter_map(|q| q.tcp.as_ref().map(|t| t.min_rtt_us))
+        .filter(|us| *us > 0)
+        .collect();
+    if v.is_empty() {
+        return None;
+    }
+    v.sort_unstable();
+    Some(v[(v.len() - 1) / 2])
 }
 
 /// `812 Mbit/s`.
@@ -924,12 +1085,12 @@ pub struct ColdStartView {
 }
 
 impl ColdStartView {
-    /// `16 connections · connect p50/p99 2.1ms/9.0ms · first operations p50/p99 …`.
+    /// `connect p50/p99 2.1ms/9.0ms · first operations p50/p99 …` (how many were dialed is
+    /// [`ConnectionView::dials_line`]'s).
     pub fn line(&self) -> String {
         use crate::util::fmt_ms;
         format!(
-            "{} connections · connect p50/p99 {}/{} · first operations p50/p99 {}/{}",
-            self.connections_count,
+            "connect p50/p99 {}/{} · first operations p50/p99 {}/{}",
             fmt_ms(self.connect_p50_ms),
             fmt_ms(self.connect_p99_ms),
             fmt_ms(self.first_ops_p50_ms),
@@ -953,7 +1114,7 @@ pub struct ConnectionView {
     /// New connections in the window.
     pub dialed_count: u64,
     pub dial_failures_count: u64,
-    /// New connections during the warmup (from the kept rows).
+    /// New connections during the warmup (the cold start's, or from the kept rows).
     pub warmup_dialed_count: u64,
     pub reuse_ratio: f64,
     pub peak_inflight_count: u64,
@@ -988,12 +1149,14 @@ impl ConnectionView {
             http2_requests_count: c.http2_requests,
             dialed_count: c.dialed,
             dial_failures_count: c.dial_failures,
-            warmup_dialed_count: run.map_or(0, |run| {
-                run.reqs
-                    .iter()
-                    .filter(|q| q.t_us < 0 && !q.reused && q.connect_us() > 0)
-                    .count() as u64
-            }),
+            warmup_dialed_count: run
+                .map_or(0, |run| {
+                    run.reqs
+                        .iter()
+                        .filter(|q| q.t_us < 0 && !q.reused && q.connect_us() > 0)
+                        .count() as u64
+                })
+                .max(c.cold_start.as_ref().map_or(0, |s| s.connections_count)),
             reuse_ratio: c.reuse_pct / 100.0,
             peak_inflight_count: c.peak_inflight_requests,
             proxy: c.proxy.clone(),
@@ -1018,6 +1181,7 @@ impl ConnectionView {
                 .as_ref()
                 .filter(|k| k.samples_count > 0)
                 .map(|k| TcpView {
+                    min_rtt_p50_us: run.and_then(min_rtt_p50_us),
                     rtt_p50_us: k.rtt_p50_us,
                     rtt_p99_us: k.rtt_p99_us,
                     connections_count: k.connections_count,
@@ -1043,8 +1207,25 @@ impl ConnectionView {
                     first_ops_p50_ms: s.first_ops.p50,
                     first_ops_p99_ms: s.first_ops.p99,
                 }),
-            remotes_count: n.remotes.len() as u64,
+            remotes_count: n
+                .remotes
+                .iter()
+                .filter(|x| x.remote != crate::analysis::slice::NO_CONNECTION)
+                .count() as u64,
             remote_addrs: c.remote_addrs.clone(),
+        }
+    }
+
+    /// The connections dialed, each count with its window: `28 dialed during warm-up · 1 in
+    /// the window` (the window alone when nothing was dialed during a warm-up).
+    pub fn dials_line(&self) -> String {
+        if self.warmup_dialed_count > 0 {
+            format!(
+                "{} dialed during warm-up · {} in the window",
+                self.warmup_dialed_count, self.dialed_count
+            )
+        } else {
+            format!("{} dialed in the window", self.dialed_count)
         }
     }
 
@@ -1100,6 +1281,12 @@ impl WritePathView {
         })
     }
 
+    /// Worth a line: OpenDAL wrote in parts, or changed the part size that was asked for.
+    /// Without either (small writes in one request) the part size says nothing.
+    pub fn shown(&self) -> bool {
+        self.parts_count > 0 || self.clamped
+    }
+
     /// `part size 8 MiB (asked 4 MiB; the service takes 5 MiB–5 GiB) · 12 parts of 8 MiB on
     /// average`.
     pub fn line(&self) -> String {
@@ -1125,19 +1312,11 @@ impl WritePathView {
                 s += &format!(" ({})", why.join("; "));
             }
         }
-        match self.part_mean_bytes {
-            Some(m) => {
-                if !s.is_empty() {
-                    s += " · ";
-                }
-                s += &format!("{} parts of {} on average", self.parts_count, fmt_bytes(m));
+        if let Some(m) = self.part_mean_bytes {
+            if !s.is_empty() {
+                s += " · ";
             }
-            None => {
-                if !s.is_empty() {
-                    s += " · ";
-                }
-                s += "no multipart parts";
-            }
+            s += &format!("{} parts of {} on average", self.parts_count, fmt_bytes(m));
         }
         s
     }
@@ -1395,6 +1574,15 @@ pub struct CompareRow {
     pub goodput_ops_per_s: f64,
     pub p50_ms: f64,
     pub p99_ms: f64,
+    #[serde(default)]
+    pub p999_ms: f64,
+    /// Backend requests per second, retries included.
+    #[serde(default)]
+    pub requests_per_s: f64,
+    #[serde(default)]
+    pub retries_count: u64,
+    #[serde(default)]
+    pub throttled_responses_count: u64,
     pub throttled_request_ratio: f64,
     pub failed_ops_count: u64,
     pub error_ratio: f64,
@@ -1403,10 +1591,22 @@ pub struct CompareRow {
     pub top_finding: Option<String>,
 }
 
+/// One backend API across the compared runs (one value per run, in the order of
+/// [`CompareView::rows`]; 0 where a run did not call it).
+#[derive(Clone, Debug, PartialEq, serde::Serialize, schemars::JsonSchema)]
+pub struct CompareApi {
+    pub api: String,
+    pub requests_count: Vec<u64>,
+    pub ttfb_p99_ms: Vec<f64>,
+}
+
 /// Several operators on the same workload, side by side, and how they differ.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, schemars::JsonSchema)]
 pub struct CompareView {
     pub rows: Vec<CompareRow>,
+    /// The backend APIs any of them called, busiest (over all runs) first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub apis: Vec<CompareApi>,
     /// One line per operator after the first: `service` (scheme, endpoint, bucket) and/or the
     /// layer and option paths that differ from the first operator.
     pub differences: Vec<String>,
@@ -1424,6 +1624,10 @@ impl CompareView {
                     goodput_ops_per_s: n.goodput_ops_per_s,
                     p50_ms: n.p50_ms,
                     p99_ms: n.p99_ms,
+                    p999_ms: n.p999_ms,
+                    requests_per_s: crate::util::ratio(n.requests_count as f64, r.run.window_s),
+                    retries_count: r.resilience.retries,
+                    throttled_responses_count: n.throttled_requests_count,
                     throttled_request_ratio: n.throttled_request_ratio,
                     failed_ops_count: n.failed_ops_count,
                     error_ratio: n.error_ratio,
@@ -1450,6 +1654,14 @@ impl CompareView {
                     .map(|c| c.path.as_str())
                     .collect();
                 let name = VerdictView::of(r).operator;
+                let workload =
+                    workload_differences(&first.spec.profile.workload, &r.spec.profile.workload);
+                if !workload.is_empty() {
+                    differences.push(format!(
+                        "{name}: ran a different workload ({})",
+                        workload.join(", ")
+                    ));
+                }
                 differences.push(match (service.is_empty(), layers.is_empty()) {
                     (true, true) => format!("{name}: the same operator"),
                     (false, true) => format!("{name}: differs in service ({})", service.join(", ")),
@@ -1462,8 +1674,65 @@ impl CompareView {
                 });
             }
         }
-        Self { rows, differences }
+        Self {
+            rows,
+            apis: compare_apis(reports),
+            differences,
+        }
     }
+}
+
+/// The workload fields that differ between `a` and `b` (`concurrency 28 vs 16`); empty when
+/// they ran the same workload.
+fn workload_differences(
+    a: &crate::config::WorkloadSpec,
+    b: &crate::config::WorkloadSpec,
+) -> Vec<String> {
+    let (Ok(serde_json::Value::Object(a)), Ok(serde_json::Value::Object(b))) =
+        (serde_json::to_value(a), serde_json::to_value(b))
+    else {
+        return Vec::new();
+    };
+    let keys: std::collections::BTreeSet<&String> = a.keys().chain(b.keys()).collect();
+    let show = |v: Option<&serde_json::Value>| match v {
+        None | Some(serde_json::Value::Null) => "unset".to_owned(),
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(v) => v.to_string(),
+    };
+    keys.into_iter()
+        .filter(|k| a.get(*k) != b.get(*k))
+        .map(|k| format!("{k} {} vs {}", show(a.get(k)), show(b.get(k))))
+        .collect()
+}
+
+/// Each API any of `reports` called, with its requests and TTFB p99 per report.
+fn compare_apis(reports: &[&Report]) -> Vec<CompareApi> {
+    let per: Vec<Vec<ApiRow>> = reports.iter().map(|r| apis(r)).collect();
+    let mut names: Vec<(String, u64)> = Vec::new();
+    for a in per.iter().flatten() {
+        match names.iter_mut().find(|n| n.0 == a.api) {
+            Some(n) => n.1 += a.requests_count,
+            None => names.push((a.api.clone(), a.requests_count)),
+        }
+    }
+    names.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    names
+        .into_iter()
+        .map(|(api, _)| {
+            let of = |r: &Vec<ApiRow>| r.iter().find(|a| a.api == api).cloned();
+            CompareApi {
+                requests_count: per
+                    .iter()
+                    .map(|r| of(r).map_or(0, |a| a.requests_count))
+                    .collect(),
+                ttfb_p99_ms: per
+                    .iter()
+                    .map(|r| of(r).map_or(0.0, |a| a.ttfb_p99_ms))
+                    .collect(),
+                api,
+            }
+        })
+        .collect()
 }
 
 /// The latency distribution: the share of operations at or below each latency (a CDF).
@@ -1581,6 +1850,22 @@ impl LatencyCdf {
         Self { pts, exact: false }
     }
 
+    /// The tail of the distribution: `(latency ms, share of operations at or slower than
+    /// it)`, from 1 at the fastest down to the slowest few — on log axes this is where every
+    /// finding about the tail shows, which a linear CDF flattens above p90.
+    pub fn tail(&self) -> Vec<(f64, f64)> {
+        let mut prev = 0.0_f64;
+        let mut out = Vec::with_capacity(self.pts.len());
+        for (ms, f) in &self.pts {
+            let slower = (1.0 - prev).max(0.0);
+            if slower > 0.0 && *ms > 0.0 {
+                out.push((*ms, slower));
+            }
+            prev = *f;
+        }
+        out
+    }
+
     /// The latency at quantile `q` (0–1): the first point whose share reaches it.
     pub fn quantile(&self, q: f64) -> Option<f64> {
         self.pts.iter().find(|p| p.1 >= q).map(|p| p.0)
@@ -1646,11 +1931,22 @@ impl HeatmapView {
         if let Some(run) = run.filter(|_| complete)
             && run.ops.iter().any(|o| o.t_us >= 0)
         {
-            let h = crate::analysis::segments::fine_heatmap(
+            let mut h = crate::analysis::segments::fine_heatmap(
                 &run.ops,
                 r.run.window_s,
                 Self::MAX_COLUMNS,
             );
+            // The fitted rows end at the step at or below the slowest operation, so the last
+            // row is open: close it at the next step, or a 260 ms straggler paints up to the
+            // axis's next decade.
+            if let Some(last) = h.latency_buckets_ms.last().copied()
+                && last > 0.0
+            {
+                h.latency_buckets_ms.push(next_fine_step(last));
+                for col in &mut h.counts {
+                    col.push(0);
+                }
+            }
             return Self {
                 t_buckets_s: h.t_buckets_s,
                 bucket_width_s: h.bucket_width_s,
@@ -1673,6 +1969,16 @@ impl HeatmapView {
     pub fn max_count(&self) -> u64 {
         self.counts.iter().flatten().copied().max().unwrap_or(0)
     }
+}
+
+/// The fine heatmap's next row bound above `b` (1-1.5-2-3-5-7 steps per decade).
+fn next_fine_step(b: f64) -> f64 {
+    let decade = 10f64.powf(b.log10().floor());
+    [1.0, 1.5, 2.0, 3.0, 5.0, 7.0, 10.0]
+        .iter()
+        .map(|m| m * decade)
+        .find(|x| *x > b * 1.000_001)
+        .unwrap_or(decade * 10.0)
 }
 
 /// One verb (`read.range`, `write.multipart`) with its numbers and where its time went.
@@ -2123,6 +2429,9 @@ impl BytesView {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Slice {
     pub key: String,
+    /// The key for people: a size bucket as its range (`64 KiB – 1 MiB`), `first read` and
+    /// `re-read` for the cold and warm reads; other keys as they are.
+    pub label: String,
     pub requests_count: u64,
     /// Share of all requests.
     pub share_ratio: f64,
@@ -2136,13 +2445,30 @@ pub struct Slice {
     pub p99_ms: Option<f64>,
 }
 
+/// A slice key for people: the object-size buckets (`0`, `<4KiB`, … `>=16MiB`) as ranges,
+/// `cold` / `warm` as first read / re-read of a key.
+pub fn slice_label(key: &str) -> String {
+    let range = |a: &str, b: &str| format!("{a} – {b}");
+    match key {
+        "0" => "0 B".to_owned(),
+        "<4KiB" => range("1 B", "4 KiB"),
+        "<64KiB" => range("4 KiB", "64 KiB"),
+        "<1MiB" => range("64 KiB", "1 MiB"),
+        "<16MiB" => range("1 MiB", "16 MiB"),
+        ">=16MiB" => "≥ 16 MiB".to_owned(),
+        "cold" => "first read".to_owned(),
+        "warm" => "re-read".to_owned(),
+        k => k.to_owned(),
+    }
+}
+
 /// Where the traffic went: the hottest keys, object sizes, prefixes and the server addresses.
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct SpreadView {
     pub hot_keys: Vec<Slice>,
     pub sizes: Vec<Slice>,
     pub prefixes: Vec<Slice>,
-    /// `cold` (first read of a key) and `warm` (repeat reads).
+    /// `cold` (first read of a key) and `warm` (repeat reads of a key: not the connection).
     pub cold_warm: Vec<Slice>,
     pub remotes: Vec<Slice>,
 }
@@ -2154,6 +2480,7 @@ impl SpreadView {
         let d = &r.dimensions;
         let slice = |x: &crate::model::DimensionSlice| Slice {
             key: x.key.clone(),
+            label: slice_label(&x.key),
             requests_count: x.requests_count,
             share_ratio: x.share_ratio,
             throttled_ratio: Some(x.throttled_ratio),
@@ -2169,6 +2496,7 @@ impl SpreadView {
                 .take(Self::TOP)
                 .map(|k| Slice {
                     key: k.key.clone(),
+                    label: k.key.clone(),
                     requests_count: k.requests_count,
                     share_ratio: k.share_ratio,
                     throttled_ratio: None,
@@ -2187,6 +2515,7 @@ impl SpreadView {
                 .take(Self::TOP)
                 .map(|x| Slice {
                     key: x.remote.clone(),
+                    label: x.remote.clone(),
                     requests_count: x.requests_count,
                     share_ratio: crate::util::ratio(x.requests_count as f64, total as f64),
                     throttled_ratio: None,
@@ -2199,6 +2528,17 @@ impl SpreadView {
                 })
                 .collect(),
         }
+    }
+
+    /// Which of the columns `throttled`, `errors`, `p99` any of `xs` has (a column no slice
+    /// fills is not drawn: hot keys carry neither errors nor a p99).
+    pub fn columns(xs: &[Slice]) -> (bool, bool, bool) {
+        (
+            xs.iter()
+                .any(|x| x.throttled_ratio.or(x.throttle_share_ratio).is_some()),
+            xs.iter().any(|x| x.error_ratio.is_some()),
+            xs.iter().any(|x| x.p99_ms.is_some()),
+        )
     }
 
     pub fn is_empty(&self) -> bool {
@@ -2263,7 +2603,12 @@ mod tests {
         assert_eq!(v.slowest[0].op_id, 2);
         assert_eq!(v.slowest[0].rows.len(), 2);
         assert!(v.slowest[0].rows[0].throttled);
-        assert_eq!(v.timeline.t_s.len(), r.timeline.len());
+        // The fixture's last interval starts at the window's end: it is folded into the one
+        // before.
+        assert_eq!(
+            v.timeline.t_s.len(),
+            r.timeline.iter().filter(|p| p.t_s < r.run.window_s).count()
+        );
         assert_eq!(v.operator.layers.len(), 6);
         let cl = v
             .operator
@@ -2273,6 +2618,30 @@ mod tests {
             .unwrap();
         assert_eq!(cl.remedy_of, vec!["throttling"]);
         assert_eq!(v.connections.warmup_dialed_count, 0);
+    }
+
+    #[test]
+    fn a_comparison_has_the_tail_the_problems_and_each_api() {
+        let a = crate::report::fixture::report();
+        let mut b = a.clone();
+        b.resilience.retries = 12;
+        b.apis = vec![crate::trace::ApiStats {
+            api: crate::trace::Api::HeadObject,
+            count: 5,
+            ..Default::default()
+        }];
+        let mut a = a;
+        a.apis = vec![crate::trace::ApiStats {
+            api: crate::trace::Api::GetObject,
+            count: 7,
+            ..Default::default()
+        }];
+        let v = CompareView::of(&[&a, &b]);
+        assert_eq!(v.rows[1].retries_count, 12);
+        let names: Vec<&str> = v.apis.iter().map(|x| x.api.as_str()).collect();
+        assert_eq!(names, ["GetObject", "HeadObject"]);
+        assert_eq!(v.apis[0].requests_count, vec![7, 0]);
+        assert_eq!(v.apis[1].requests_count, vec![0, 5]);
     }
 
     #[test]
@@ -2290,6 +2659,42 @@ mod tests {
         assert_eq!(v.rows.len(), 3);
         assert!(v.differences[0].contains("service"), "{:?}", v.differences);
         assert!(v.differences[1].contains("layers"), "{:?}", v.differences);
+    }
+
+    #[test]
+    fn a_comparison_lists_a_workload_difference() {
+        let a = crate::report::fixture::report();
+        let mut b = a.clone();
+        b.spec.profile.workload.concurrency = a.spec.profile.workload.concurrency + 12;
+        let v = CompareView::of(&[&a, &b]);
+        assert!(
+            v.differences[0].contains("different workload")
+                && v.differences[0].contains("concurrency"),
+            "{:?}",
+            v.differences
+        );
+        let same = CompareView::of(&[&a, &a]);
+        assert!(
+            same.differences.iter().all(|d| !d.contains("workload")),
+            "{:?}",
+            same.differences
+        );
+    }
+
+    #[test]
+    fn findings_keep_the_reports_order() {
+        // A partial run: `invalid_run` (a warning) leads a critical finding; the text must
+        // not re-sort what the JSON keeps (K3).
+        let mut r = crate::report::fixture::report();
+        let mut first = r.findings[0].clone();
+        first.code = "invalid_run".into();
+        first.severity = Severity::Warning;
+        let mut second = r.findings[0].clone();
+        second.severity = Severity::Critical;
+        r.findings = vec![first, second];
+        let v = findings(&r);
+        assert_eq!(v[0].code, "invalid_run");
+        assert_eq!(v[1].severity, Severity::Critical);
     }
 
     #[test]
@@ -2600,8 +3005,28 @@ mod tests {
         let tcp = v.tcp.as_ref().unwrap();
         assert_eq!(
             tcp.line(),
-            "rtt p50/p99 1.20ms/3.40ms · 2 of 16 connections retransmitted · rwnd-limited 3.0% · sndbuf-limited 0.0% · delivery p50 812 Mbit/s"
+            "smoothed rtt p50/p99 1.20ms/3.40ms · 2 of 16 connections retransmitted · rwnd-limited 3.0% · sndbuf-limited 0.0% · delivery p50 812 Mbit/s"
         );
+        // One count of dials, each with its window (K18): 16 in the warm-up's cold start.
+        assert_eq!(v.warmup_dialed_count, 16);
+        assert_eq!(
+            v.dials_line(),
+            "16 dialed during warm-up · 16 in the window"
+        );
+        // With rows: the minimum round trip (the network's) beside the smoothed one.
+        let mut run = crate::report::fixture::run();
+        run.report = r.clone();
+        for (i, q) in run.reqs.iter_mut().enumerate() {
+            q.tcp = Some(Box::new(crate::model::TcpRow {
+                rtt_us: 7_000,
+                min_rtt_us: 40 + i as u64,
+                ..Default::default()
+            }));
+        }
+        let with = ConnectionView::of(&run.report, Some(&run));
+        let t = with.tcp.unwrap();
+        assert!(t.min_rtt_p50_us.is_some_and(|m| m < 100), "{t:?}");
+        assert!(t.line().starts_with("min rtt 4"), "{}", t.line());
         assert_eq!(
             v.tls_handshakes.as_ref().unwrap().line(),
             "16 handshakes · 25.0% resumed · 1 HelloRetryRequest"
@@ -2614,6 +3039,7 @@ mod tests {
             quiet.tcp.is_none() && quiet.tls_handshakes.is_none() && quiet.cold_start.is_none()
         );
         assert!(!quiet.networked());
+        assert_eq!(quiet.dials_line(), "0 dialed in the window");
     }
 
     #[test]
@@ -2642,6 +3068,13 @@ mod tests {
             "{l}"
         );
         assert!(l.ends_with("12 parts of 5.0 MiB on average"), "{l}");
+        assert!(w.shown());
+        // Small writes in one request each: the part size says nothing, no line.
+        r.apis.clear();
+        r.effective_write.requested_chunk_size = 0;
+        let w = WritePathView::of(&r).unwrap();
+        assert!(!w.shown());
+        assert!(!w.line().contains("no multipart"), "{}", w.line());
     }
 
     #[test]
@@ -2701,8 +3134,145 @@ mod tests {
         }];
         let s = SpreadView::of(&r);
         assert_eq!(s.cold_warm[0].key, "cold");
+        // Cold and warm are reads of a key, not connections.
+        assert_eq!(s.cold_warm[0].label, "first read");
         assert_eq!(s.cold_warm[0].error_ratio, Some(0.1));
         assert!(!s.is_empty());
+    }
+
+    #[test]
+    fn size_buckets_read_as_ranges_and_empty_columns_are_dropped() {
+        assert_eq!(slice_label("0"), "0 B");
+        assert_eq!(slice_label("<1MiB"), "64 KiB – 1 MiB");
+        assert_eq!(slice_label(">=16MiB"), "≥ 16 MiB");
+        assert_eq!(slice_label("warm"), "re-read");
+        assert_eq!(slice_label("data/part=00"), "data/part=00");
+        let mut r = crate::report::fixture::report();
+        r.dimensions.hot_keys = vec![crate::model::HotKey {
+            key: "k".into(),
+            requests_count: 10,
+            share_ratio: 0.5,
+            throttle_share_ratio: 0.2,
+        }];
+        let s = SpreadView::of(&r);
+        // A hot key has its share of the throttling, but no errors and no p99.
+        assert_eq!(SpreadView::columns(&s.hot_keys), (true, false, false));
+    }
+
+    #[test]
+    fn the_timeline_ends_with_the_window_and_folds_the_drain_into_it() {
+        let mut r = crate::report::fixture::report();
+        // A window closed at 2.98 s; retries and failures drained for two more seconds.
+        r.run.window_s = 2.98;
+        let p = |t: f64, ops: u64, requests: u64, retries: u64, errors: u64| {
+            crate::trace::TimelinePoint {
+                t_s: t,
+                len_s: 1.0,
+                ops_count: ops,
+                ok_ops_count: ops,
+                ops_per_s: ops as f64,
+                goodput_ops_per_s: ops as f64,
+                requests_count: requests,
+                requests_per_s: requests as f64,
+                retries_count: retries,
+                errors,
+                mib_per_s: ops as f64 / 10.0,
+                ..Default::default()
+            }
+        };
+        r.timeline = vec![
+            p(0.0, 100, 100, 0, 0),
+            p(1.0, 100, 100, 0, 0),
+            p(2.0, 98, 98, 0, 0),
+            p(3.0, 0, 6, 6, 2),
+            p(4.0, 0, 4, 4, 1),
+        ];
+        // The recorder's rates of the last interval are over its 0.98 s inside the window.
+        r.timeline[2].goodput_ops_per_s = 100.0;
+        let v = TimelineView::of(&r);
+        assert_eq!(v.len(), 3, "no interval past the window");
+        assert!((v.t_s[2] + v.len_s[2] - 2.98).abs() < 1e-9, "{:?}", v.len_s);
+        // No drop to zero at the end: the last interval's goodput is over its 0.98 s.
+        assert!((v.goodput_ops_per_s[2] - 100.0).abs() < 1e-6);
+        // The drain's events are in the last interval.
+        assert_eq!(v.retries_count[2], 10);
+        assert_eq!(v.errors_count[2], 3);
+        assert!((v.requests_per_s[2] - 108.0 / 0.98).abs() < 1e-6);
+        let read = TimelineView::for_verb(&r, "x");
+        assert!(read.is_none());
+    }
+
+    #[test]
+    fn the_fine_heatmap_closes_its_slowest_row() {
+        let run = crate::report::fixture::run();
+        let h = HeatmapView::of(&run.report, Some(&run));
+        let max_ms = run
+            .ops
+            .iter()
+            .filter(|o| o.t_us >= 0)
+            .map(|o| o.latency_us)
+            .max()
+            .unwrap() as f64
+            / 1000.0;
+        // The slowest operation is in a closed row whose upper bound is the next step.
+        let n = h.latency_buckets_ms.len();
+        let top = h.latency_buckets_ms[n - 1];
+        assert!(top > max_ms, "{:?} vs {max_ms}", h.latency_buckets_ms);
+        assert!(top <= max_ms * 1.5 + 1e-9, "{:?}", h.latency_buckets_ms);
+        assert!(h.counts.iter().all(|c| c.len() == n && c[n - 1] == 0));
+        assert_eq!(next_fine_step(200.0), 300.0);
+        assert_eq!(next_fine_step(7.0), 10.0);
+        assert_eq!(next_fine_step(150.0), 200.0);
+    }
+
+    #[test]
+    fn evidence_values_carry_their_unit() {
+        assert_eq!(EvidenceUnit::of("p50_ms", 9.9), (EvidenceUnit::Ms, 9.9));
+        let (u, a) = EvidenceUnit::of("straggler_pct", 2.6);
+        assert_eq!(u, EvidenceUnit::Share);
+        assert!((a - 0.026).abs() < 1e-12);
+        assert_eq!(
+            EvidenceUnit::of("p99_to_p50_ratio", 3.0),
+            (EvidenceUnit::Times, 3.0)
+        );
+        assert_eq!(EvidenceUnit::of("error_ratio", 0.1).0, EvidenceUnit::Share);
+        assert_eq!(
+            EvidenceUnit::of("fitted_bytes_per_s", 1.0).0,
+            EvidenceUnit::BytesPerS
+        );
+        assert_eq!(
+            EvidenceUnit::of("accepted_requests_per_s", 1.0).0,
+            EvidenceUnit::RequestsPerS
+        );
+        assert_eq!(EvidenceUnit::of("window_s", 8.0).0, EvidenceUnit::Seconds);
+        assert_eq!(
+            EvidenceUnit::of("affected_apis_count", 3.0).0,
+            EvidenceUnit::Count
+        );
+        let mut f = crate::report::fixture::report().findings[0].clone();
+        f.evidence.values.insert("affected_apis_count".into(), 3.0);
+        f.evidence.values.insert("typical_ttfb_ms".into(), 9.87);
+        let v = FindingView::of(&f);
+        let item = |k: &str| v.items.iter().find(|i| i.key == k).unwrap().clone();
+        assert_eq!(item("affected_apis_count").label, "APIs affected");
+        let t = item("typical_ttfb_ms");
+        assert_eq!(t.label, "Typical time to first byte");
+        assert_eq!((t.unit, t.amount), (EvidenceUnit::Ms, 9.87));
+    }
+
+    #[test]
+    fn a_tail_falls_from_every_operation_to_the_slowest() {
+        let c = LatencyCdf {
+            pts: vec![(1.0, 0.9), (10.0, 0.99), (100.0, 1.0)],
+            exact: true,
+        };
+        let t = c.tail();
+        assert_eq!(t[0], (1.0, 1.0));
+        assert!(
+            (t[1].1 - 0.1).abs() < 1e-9 && (t[2].1 - 0.01).abs() < 1e-9,
+            "{t:?}"
+        );
+        assert!(LatencyCdf::default().tail().is_empty());
     }
 
     #[test]

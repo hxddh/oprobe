@@ -61,11 +61,13 @@ race on the same workload. Workload: `--preset small-files|large-objects|range-r
   (numbers, operation ids, time windows) and the remedy, an `op.toml` path.
 - Finding codes and their remedy: `throttling` → `layers.concurrent_limit.http` (+
   `layers.retry.jitter`), `rate_limit` → `layers.concurrent_limit.http`, `key_limit` → key layout
-  (advice), `bandwidth_cap` → `layers.throttle.bandwidth`, `tail_stragglers` → `layers.tail_cut`,
+  (advice), `bandwidth_cap` → `layers.throttle.bandwidth` (writes; on reads not a layer),
+  `tail_stragglers` → `layers.tail_cut`,
   `hung_requests` → `layers.timeout.io`, `small_ranges` → `read.gap` / `read.concurrent`,
   `slow_multipart` → `write.chunk` / `write.concurrent`, `repeated_reads` → `layers.cache`,
   `cold_connections` → `http.keep_alive` / `http.version`, `client_bound` → none (the client is
-  the bottleneck); also `errors` and `invalid_run`.
+  the bottleneck); also `errors` (→ `layers.retry.min_delay` + `layers.retry.jitter` when retries
+  recovered every operation, else none) and `invalid_run`.
 - `prove` (`oprobe.prove`): `verdict` (`improved`, `worse`, `inconclusive`), `objective`,
   `objective_delta` (estimate with interval), `pairs_count`, `secondary[]` (shown, never
   decisive) and `diff` with the change as `rust` and `toml`. Hand the user the diff.

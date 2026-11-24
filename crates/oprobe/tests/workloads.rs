@@ -447,6 +447,39 @@ async fn lab_scenarios_inject_their_faults() {
     assert_eq!(s.summary.failed_ops, 0);
 }
 
+/// `lab://flaky` injects what its description says (K4: 7.0 answered 2 % 500s, not 4 %: every
+/// second error request was a reset instead). Plain HTTP requests, one connection each.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_flaky_lab_injects_its_described_rates() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let sc = oprobe::lab::Scenario::Flaky;
+    assert!(sc.describe().contains("4% 500") && sc.describe().contains("2% connection resets"));
+    let lab = oprobe::lab::LabServer::spawn("127.0.0.1:0", sc.config())
+        .await
+        .unwrap();
+    let addr = lab.endpoint_url.trim_start_matches("http://").to_owned();
+    let (mut errors, mut resets) = (0, 0);
+    let n = 400;
+    for i in 0..n {
+        let mut s = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        let req = format!("GET /b/k{i} HTTP/1.1\r\nhost: lab\r\nconnection: close\r\n\r\n");
+        s.write_all(req.as_bytes()).await.unwrap();
+        let mut buf = Vec::new();
+        let _ = s.read_to_end(&mut buf).await;
+        let head = String::from_utf8_lossy(&buf);
+        if head.starts_with("HTTP/1.1 500") {
+            errors += 1;
+        } else if !head.starts_with("HTTP/") {
+            resets += 1;
+        }
+    }
+    assert!((14..=18).contains(&errors), "{errors} 500s in {n} requests");
+    assert!(
+        (6..=10).contains(&resets),
+        "{resets} resets in {n} requests"
+    );
+}
+
 /// An error's message and hint (typed errors carry the choices in the hint).
 fn full(e: anyhow::Error) -> String {
     let b = oprobe::errors::classify(&e, "s3");

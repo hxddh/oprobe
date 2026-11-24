@@ -123,7 +123,7 @@ upgrade code, en-US locale) in the layout of
 
 ```powershell
 Expand-Archive winget-manifests.zip -DestinationPath winget
-winget validate --manifest winget\manifests\h\hxddh\oprobe\7.0.0
+winget validate --manifest winget\manifests\h\hxddh\oprobe\7.1.0
 ```
 
 The `winget` job runs `vedantmgoyal9/winget-releaser`, which updates the existing `hxddh.oprobe`

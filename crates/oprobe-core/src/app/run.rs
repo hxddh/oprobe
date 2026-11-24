@@ -18,7 +18,7 @@ use crate::model::{Report, Run};
 use crate::output::{CommandOutput, OutputFormat};
 use crate::report::style::{bold, dim};
 use crate::report::{brief, write_file};
-use crate::util::{ByteSize, parse_duration};
+use crate::util::ByteSize;
 
 /// Result of `oprobe run`.
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -32,6 +32,11 @@ pub struct RunOutput {
     #[serde(skip)]
     #[schemars(skip)]
     pub full: Option<Box<Run>>,
+    /// The budget that stopped this run (the run is partial; not serialized: the set's
+    /// `error` says it).
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub breach: Option<crate::guard::BudgetBreach>,
 }
 
 impl CommandOutput for RunOutput {
@@ -55,6 +60,10 @@ pub struct RunSet {
     /// Several operators: the side-by-side table and how each differs from the first.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub comparison: Option<crate::report::view::CompareView>,
+    /// A spent budget stopped the command (`safety.budget_exceeded`, exit 4): `runs` holds
+    /// what finished and the partial run it cut short, all saved.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<crate::errors::ErrorBody>,
 }
 
 impl RunSet {
@@ -64,7 +73,15 @@ impl RunSet {
             let reports: Vec<&Report> = runs.iter().map(|r| &r.report).collect();
             crate::report::view::CompareView::of(&reports)
         });
-        Self { runs, comparison }
+        let error = runs
+            .iter()
+            .find_map(|r| r.breach.as_ref())
+            .map(|b| crate::errors::classify(&b.to_error(), ""));
+        Self {
+            runs,
+            comparison,
+            error,
+        }
     }
 }
 
@@ -134,6 +151,9 @@ impl CommandOutput for RunSet {
     }
 
     fn exit_code(&self) -> u8 {
+        if let Some(e) = &self.error {
+            return e.exit_code();
+        }
         self.runs.iter().map(|r| r.exit_code()).max().unwrap_or(0)
     }
 }
@@ -195,8 +215,11 @@ impl CommandOutput for PlanOutput {
             o += &pr.text();
             o += &dim("each trial:\n");
         }
+        let dur = |s: f64| {
+            crate::util::HumanDuration(std::time::Duration::from_secs_f64(s.max(0.0))).to_string()
+        };
         o += &format!(
-            "{} {} · {} · {} workers · {:.0}s warmup + {:.0}s window{}\n",
+            "{} {} · {} · {} workers · {} warmup + {} window{}\n",
             bold(if self.proof.is_some() {
                 "trial"
             } else {
@@ -205,8 +228,8 @@ impl CommandOutput for PlanOutput {
             p.target,
             p.preset,
             p.concurrency_count,
-            p.warmup_s,
-            p.duration_s,
+            dur(p.warmup_s),
+            dur(p.duration_s),
             if p.read_only { " · read-only" } else { "" }
         );
         o += &format!(
@@ -276,7 +299,11 @@ pub fn budgets(ctx: &Ctx, s: &Safety) -> Result<Budgets> {
         max_duration_s: s
             .max_duration
             .as_deref()
-            .map(|v| parse_duration(v).map(|d| d.as_secs_f64()))
+            .map(|v| {
+                crate::input::positive_duration(v)
+                    .map(|d| d.as_secs_f64())
+                    .map_err(anyhow::Error::from)
+            })
             .transpose()
             .map_err(|e| bad("--max-duration", e))?,
     };
@@ -418,7 +445,7 @@ pub async fn measure_guarded(
             ))
         ));
     }
-    let m = super::measure::measure(
+    let m = super::measure::measure_to_breach(
         ctx,
         profile,
         super::measure::Opts {
@@ -438,5 +465,27 @@ pub async fn measure_guarded(
         path: m.path.map(|p| p.display().to_string()),
         report: run.report.clone(),
         full: Some(Box::new(run)),
+        breach: m.breach,
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 7.0.0 printed a 0.5 s warmup as `0s warmup` (K6).
+    #[test]
+    fn the_plan_prints_durations_like_everywhere_else() {
+        let p = Plan {
+            warmup_s: 0.5,
+            duration_s: 2.5,
+            ..Default::default()
+        };
+        let text = PlanOutput {
+            plan: p,
+            proof: None,
+        }
+        .text();
+        assert!(text.contains("500ms warmup + 2500ms window"), "{text}");
+    }
 }

@@ -1423,6 +1423,11 @@ impl Profile {
         if w.concurrency < 1 {
             return Err(invalid("workload.concurrency must be >= 1"));
         }
+        if w.duration.get().is_zero() {
+            return Err(invalid(
+                "workload.duration must be greater than zero (a run measures nothing in 0s)",
+            ));
+        }
         if let Some(r) = w.rate
             && !(r.is_finite() && r > 0.0)
         {

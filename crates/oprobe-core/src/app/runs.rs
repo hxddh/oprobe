@@ -40,6 +40,8 @@ pub struct RunList {
     /// Prove trial runs not listed (`--all` lists them).
     pub hidden_trials_count: u64,
     pub proves: Vec<ProveSummary>,
+    /// Proves stored in total before `-n` (the list may be limited).
+    pub proves_total_count: u64,
 }
 
 impl CommandOutput for RunList {
@@ -103,7 +105,6 @@ impl CommandOutput for RunList {
             let rows: Vec<Vec<String>> = self
                 .proves
                 .iter()
-                .take(5)
                 .map(|p| {
                     vec![
                         p.prove_id.clone(),
@@ -138,6 +139,13 @@ impl CommandOutput for RunList {
                 self.total_count
             ));
         }
+        if self.proves_total_count as usize > self.proves.len() {
+            o += &dim(&format!(
+                "{} of {} proves (-n/--limit)\n",
+                self.proves.len(),
+                self.proves_total_count
+            ));
+        }
         o += &dim("show one: oprobe show RUN  (id, prefix, last, last~1)\n");
         o
     }
@@ -158,9 +166,11 @@ fn when(id: &str, now: std::time::SystemTime) -> String {
 }
 
 impl RunList {
-    /// Keep the newest `n` runs (`total_count` stays the number stored).
+    /// Keep the newest `n` runs and the newest `n` proves (`total_count` and
+    /// `proves_total_count` stay the numbers stored).
     pub fn truncate(mut self, n: usize) -> Self {
         self.runs.truncate(n);
+        self.proves.truncate(n);
         self
     }
 }
@@ -175,7 +185,7 @@ pub fn list(app: &App, all: bool) -> Result<RunList> {
         .into_iter()
         .filter(|r| all || r.parent_id.is_none())
         .collect();
-    let proves = store
+    let proves: Vec<ProveSummary> = store
         .proves()?
         .into_iter()
         .filter_map(|v| {
@@ -194,6 +204,7 @@ pub fn list(app: &App, all: bool) -> Result<RunList> {
         total_count: runs.len() as u64,
         hidden_trials_count: if all { 0 } else { trials },
         runs,
+        proves_total_count: proves.len() as u64,
         proves,
     })
 }
@@ -409,14 +420,24 @@ impl Profile {
         self
     }
 
-    /// Group the request rows (`--by`).
-    pub fn with_by(mut self, by: Option<crate::analysis::slice::By>) -> Self {
-        let range = self.range.as_ref().map(|v| (v.since_s, v.until_s));
-        self.by = match (by, &self.full) {
-            (Some(b), Some(run)) => Some(ByTable::of(run, b, range)),
-            _ => None,
+    /// Group the request rows (`--by`). Refused, like `--since`, on a run without request
+    /// rows (a report `.json`, a trace saved without its rows): there is nothing to group.
+    pub fn with_by(mut self, by: Option<crate::analysis::slice::By>) -> Result<Self> {
+        let Some(b) = by else {
+            self.by = None;
+            return Ok(self);
         };
-        self
+        let Some(run) = self.full.as_deref().filter(|r| !r.reqs.is_empty()) else {
+            return Err(OprobeError::new(
+                ErrorCode::UsageInvalidArgument,
+                format!("this run has no request rows to group by {}", b.label()),
+            )
+            .with_hint("show the whole run without --by")
+            .into());
+        };
+        let range = self.range.as_ref().map(|v| (v.since_s, v.until_s));
+        self.by = Some(ByTable::of(run, b, range));
+        Ok(self)
     }
 
     /// Only the time range `[since, until)` (seconds into the window; `until` defaults to the
@@ -428,20 +449,24 @@ impl Profile {
         }
         let window = self.run.report.run.window_s;
         let (a, b) = (since.unwrap_or(0.0), until.unwrap_or(window));
+        // `--since` past the window first: with no `--until` given, the end defaults to the
+        // window's, and blaming an `--until` nobody passed confuses (K12).
+        if a >= window {
+            return Err(OprobeError::new(
+                ErrorCode::UsageInvalidArgument,
+                format!("--since ({a} s) is past the end of the {window:.1} s measurement window"),
+            )
+            .with_hint(format!(
+                "pass a --since under {window:.1}s (seconds into the window)"
+            ))
+            .into());
+        }
         if b <= a {
             return Err(OprobeError::new(
                 ErrorCode::UsageInvalidArgument,
                 format!("--until ({b} s) is not after --since ({a} s)"),
             )
             .with_hint("pass a range inside the window, e.g. --since 2s --until 6s")
-            .into());
-        }
-        if a >= window {
-            return Err(OprobeError::new(
-                ErrorCode::UsageInvalidArgument,
-                format!("--since ({a} s) is past the end of the {window:.1} s window"),
-            )
-            .with_hint(format!("pass a time under {window:.1}s"))
             .into());
         }
         let Some(run) = self.full.as_deref().filter(|r| !r.ops.is_empty()) else {
@@ -455,6 +480,43 @@ impl Profile {
         self.range = Some(crate::report::range::RangeView::of(run, a, b));
         Ok(self)
     }
+}
+
+/// A prove result as `oprobe show PROVE_ID` prints it: the stored result, rendered as `prove`
+/// rendered it (JSON: the prove schema). Showing it is not a gate: exit 0.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(transparent)]
+pub struct ShownProve(pub super::prove::ProveOutput);
+
+impl CommandOutput for ShownProve {
+    fn text(&self) -> String {
+        self.0.text()
+    }
+    fn next(&self) -> Vec<crate::output::NextStep> {
+        self.0.next()
+    }
+}
+
+/// The stored prove `r` names (its id), or `None` when `r` names no prove. A prove whose run
+/// or trials were removed still shows: its result is stored whole.
+pub fn show_prove(app: &App, r: &RunRef) -> Result<Option<ShownProve>> {
+    let id = r.0.trim();
+    if crate::model::RunId::parse(id).is_none() {
+        return Ok(None);
+    }
+    let path = app.store().dir().join(format!("{id}.prove.json"));
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let raw = std::fs::read(&path)?;
+    let out: super::prove::ProveOutput = serde_json::from_slice(&raw).map_err(|e| {
+        OprobeError::new(
+            ErrorCode::UsageInvalidArgument,
+            format!("prove result `{}` is corrupt: {e}", path.display()),
+        )
+        .with_hint(format!("remove it with `oprobe show --rm {id}`"))
+    })?;
+    Ok(Some(ShownProve(out)))
 }
 
 /// The run `r` names, with its rows.

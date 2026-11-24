@@ -221,6 +221,15 @@
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
+        },
+        "unbudgeted_trials_max_count": {
+          "description": "Trials the proof would run without the budget, when the budget leaves some out (the\ncounts above are those that fit in it).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
         }
       },
       "required": [

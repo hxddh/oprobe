@@ -65,15 +65,20 @@ async fn demo_lab_ceiling_brackets_its_limit_and_small_files_fit_twenty_workers(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn parquet_lab_ops_peak_at_four_requests_in_flight() {
+    // The shape of an operation, at a load the lab mostly accepts (8 × 4 around its 24).
     let run = lab_run("parquet", Preset::RangeReads, 8).await;
-    let c = &run.report.capacity;
-    let s = c.per_op;
+    let s = run.report.capacity.per_op;
     assert_eq!(s.peak_inflight_per_op, 4.0, "{s:?}");
     assert!(s.requests_per_op >= 6.0, "{s:?}");
     assert!(s.sequential_fraction > 0.2, "{s:?}");
+    // The ceiling, at a load well above it (12 × 4), so the lab throttles even on a slow
+    // runner where the scans overlap less (8 workers stayed under 24 on macOS CI).
+    let run = lab_run("parquet", Preset::RangeReads, 12).await;
+    let c = &run.report.capacity;
+    assert_eq!(c.per_op.peak_inflight_per_op, 4.0, "{:?}", c.per_op);
     let ce = c
         .inflight_ceiling
-        .unwrap_or_else(|| panic!("8 × 4 > 24 throttles: {}", c.confidence_reason));
+        .unwrap_or_else(|| panic!("12 × 4 > 24 throttles: {}", c.confidence_reason));
     assert!(
         ce.lo <= 24.0 && 24.0 < ce.hi,
         "{ce:?}: {:?}",

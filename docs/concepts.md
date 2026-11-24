@@ -82,8 +82,9 @@ hung I/O, cold connections, small ranges, slow multipart, repeated reads, a busy
 Every finding has a confidence: **high** only when the model explains most of the effect and
 agrees across repeats. Throttling that made operations fail is reported as throttling, never as
 an invalid run. The codes and their remedies are in the [README](../README.md#findings-and-their-remedy);
-besides those, `errors` reports failures that are not throttling and `invalid_run` a run whose
-numbers cannot be trusted (too short, nothing measured).
+besides those, `errors` reports failures that are not throttling (when retries recovered every
+operation, its remedy is a shorter first retry backoff with jitter, `layers.retry.min_delay`) and
+`invalid_run` a run whose numbers cannot be trusted (too short, nothing measured).
 
 ## Remedy
 

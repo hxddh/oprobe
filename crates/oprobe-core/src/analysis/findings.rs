@@ -8,7 +8,7 @@
 //! | `throttling` | `layers.concurrent_limit.http` (sized) + `layers.retry.jitter` |
 //! | `rate_limit` | `layers.concurrent_limit.http` (sized from rate × latency) |
 //! | `key_limit` | the workload's key layout (advice, not a layer) |
-//! | `bandwidth_cap` | `layers.throttle.bandwidth` |
+//! | `bandwidth_cap` | `layers.throttle.bandwidth` on writes; on reads not a layer |
 //! | `tail_stragglers` | `layers.tail_cut` |
 //! | `hung_requests` | `layers.timeout.io` |
 //! | `small_ranges` | `read.gap` / `read.concurrent` |
@@ -17,8 +17,9 @@
 //! | `cold_connections` | `http.keep_alive` / `http.version` |
 //! | `client_bound` | none (reported) |
 //!
-//! Plus `errors` (failures that are not throttling) and `invalid_run` (the run cannot be
-//! judged). One finding per code, most severe first.
+//! Plus `errors` (failures that are not throttling: `layers.retry.min_delay` (sized) +
+//! `layers.retry.jitter` when retries recovered every operation, else not a layer) and
+//! `invalid_run` (the run cannot be judged). One finding per code, most severe first.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -95,6 +96,13 @@ pub fn remedy(code: &str, variant: Option<&str>) -> Remedy {
             false,
             "spread the hot keys over more keys or prefixes (salting, replicas); this is the workload's key layout, not a layer",
         ),
+        ("bandwidth_cap", Some("reads")) => r(
+            None,
+            &[],
+            "",
+            false,
+            "the cap is not a layer: OpenDAL's ThrottleLayer shapes writes only, so on reads keep the streams to what the cap carries, or raise the cap itself (a wider link, another endpoint)",
+        ),
         ("bandwidth_cap", _) => r(
             Some("layers.throttle.bandwidth"),
             &[],
@@ -158,12 +166,26 @@ pub fn remedy(code: &str, variant: Option<&str>) -> Remedy {
             false,
             "multiplex requests over fewer connections with HTTP/2",
         ),
+        ("client_bound", Some("workers")) => r(
+            None,
+            &[],
+            "",
+            false,
+            "none in storage: the workers, not the client's CPU, are the bound; raise the workers (`-c`) or lower `--rate`",
+        ),
         ("client_bound", _) => r(
             None,
             &[],
             "",
             false,
             "none in storage: the client process is the limit (more cores, less per-operation work)",
+        ),
+        ("errors", Some("retried")) => r(
+            Some("layers.retry.min_delay"),
+            &["layers.retry.jitter"],
+            "RetryLayer::with_min_delay + RetryLayer::with_jitter",
+            true,
+            "retry transient failures after a short first backoff, with jitter: they do not follow the load, so a long backoff only adds latency",
         ),
         ("errors", _) => r(
             None,
@@ -372,15 +394,34 @@ pub fn non_throttle_failures(r: &Report) -> u64 {
     r.summary.failed_ops.saturating_sub(rate_limited)
 }
 
+/// Fewer than this many failures (or under [`MIN_ERROR_SHARE`] of their population) raise no
+/// `errors` finding: one 404 is not a finding.
+const MIN_ERRORS: u64 = 3;
+/// The smallest share of requests (or, in a production trace, of operations) whose failures
+/// raise an `errors` finding.
+const MIN_ERROR_SHARE: f64 = 0.001;
+
+/// `n` failures of `of` are too few to report.
+fn too_few_errors(n: u64, of: u64) -> bool {
+    n < MIN_ERRORS || (n as f64) < of.max(1) as f64 * MIN_ERROR_SHARE
+}
+
 fn errors(c: &Ctx, random_throttle: bool) -> Option<Finding> {
     let r = c.r;
     let failed = non_throttle_failures(r);
     let server = r.resilience.server_errors;
+    // Requests that got no response (connection resets, refused or dropped connections).
+    let network = r.resilience.network_errors;
     let requests = r.connections.requests.max(1);
     let thr = r.resilience.throttled_responses;
     // Random 503s count as service errors (A5): no limit to cap.
-    let retried = server + if random_throttle { thr } else { 0 };
-    if failed == 0 && (retried < 3 || (retried as f64) < requests as f64 * 0.001) {
+    let random = if random_throttle { thr } else { 0 };
+    let retried = server + network + random;
+    // A production trace's failed operations meet the same minimum share as a run's retried
+    // requests (K14): an application that stats a missing key fails one operation.
+    let trace = r.run.source == crate::model::RunSource::Trace;
+    let failed_counts = failed > 0 && !(trace && too_few_errors(failed, r.summary.ops));
+    if !failed_counts && too_few_errors(retried, requests) {
         return None;
     }
     let classes = failure_classes(r);
@@ -393,9 +434,10 @@ fn errors(c: &Ctx, random_throttle: bool) -> Option<Finding> {
     if !by_class.is_empty() {
         text += &format!(" ({})", by_class.join(", "));
     }
-    if retried > 0 {
+    if server + random > 0 {
         text += &format!(
-            "; {retried} of {requests} requests answered 5xx{}",
+            "; {} of {requests} requests answered 5xx{}",
+            server + random,
             if random_throttle {
                 " — 503s that follow neither the load, the rate nor the keys"
             } else {
@@ -403,14 +445,21 @@ fn errors(c: &Ctx, random_throttle: bool) -> Option<Finding> {
             }
         );
     }
-    let error_ratio = failed as f64 / r.summary.ops.max(1) as f64;
-    let mut rem = remedy("errors", None);
-    if failed == 0 {
-        // Retried 5xx: keep retries with jitter.
-        rem.path = Some("layers.retry.jitter".into());
-        rem.opendal = "RetryLayer::with_jitter".into();
-        rem.text = "keep retrying with jitter and exponential backoff; slowing down would not remove errors that do not follow the load".into();
+    if network > 0 {
+        text +=
+            &format!("; {network} of {requests} requests lost their connection before a response");
     }
+    if failed == 0 && retried > 0 {
+        text += &format!(
+            "; {:.0}% of operation time in retry backoff",
+            r.stages.shares.retry_pct
+        );
+    }
+    let error_ratio = failed as f64 / r.summary.ops.max(1) as f64;
+    // Every operation succeeded after retries: the failures are transient, and what they cost
+    // is the retry backoff (OpenDAL waits 1 s first). The remedy is a shorter first backoff,
+    // with jitter, sized by prove (K1).
+    let rem = remedy("errors", (failed == 0).then_some("retried"));
     Some(Finding {
         code: "errors".into(),
         severity: if error_ratio > r.sla.max_error_ratio {
@@ -426,7 +475,7 @@ fn errors(c: &Ctx, random_throttle: bool) -> Option<Finding> {
             )
         } else {
             format!(
-                "{:.2}% of requests failed with a server error and were retried.",
+                "{:.2}% of requests failed with a server error or a lost connection and were retried: the time goes to the retry backoff.",
                 retried as f64 * 100.0 / requests as f64
             )
         },
@@ -435,7 +484,8 @@ fn errors(c: &Ctx, random_throttle: bool) -> Option<Finding> {
             values: values(&[
                 ("failed_ops_count", failed as f64),
                 ("error_ratio", error_ratio),
-                ("server_errors_count", retried as f64),
+                ("server_errors_count", (server + random) as f64),
+                ("network_errors_count", network as f64),
             ]),
             op_ids: slowest_ops(c.run, c.run.ops.iter().filter(|o| !o.ok).map(|o| o.op_id)),
             windows: windows_where(&c.run.reqs, |q| {
@@ -654,6 +704,13 @@ fn bandwidth_cap(c: &Ctx) -> Option<Finding> {
         return None;
     }
     let bps = h.params.bytes_per_s.unwrap_or(0.0);
+    // ThrottleLayer shapes writes only (K16): on a workload that writes nothing it cannot
+    // help, and the finding says the cap is not a layer.
+    let writes =
+        c.r.workload
+            .mix
+            .iter()
+            .any(|m| m.weight > 0 && m.op.contains("write"));
     let body: f64 = c.reqs().map(|q| q.body_us as f64).sum();
     let total: f64 = c.reqs().map(|q| q.total_us as f64).sum::<f64>().max(1.0);
     Some(Finding {
@@ -675,7 +732,7 @@ fn bandwidth_cap(c: &Ctx) -> Option<Finding> {
             op_ids: slowest_ops(c.run, c.reqs().map(|q| q.op_id)),
             windows: Vec::new(),
         },
-        remedy: remedy("bandwidth_cap", None),
+        remedy: remedy("bandwidth_cap", (!writes).then_some("reads")),
     })
 }
 
@@ -1261,6 +1318,16 @@ fn client_bound(c: &Ctx) -> Option<Finding> {
             ol.missed, ol.intended_count
         );
     }
+    // The arrivals queued behind the workers while the CPU had room (K15): `--rate` asks for
+    // more than `-c` workers carry at the operations' latency.
+    let workers = backlog.is_some() && !cpu_bound && !saturated;
+    let conc = r.spec.profile.workload.concurrency.max(1);
+    if let (true, Some(ol)) = (workers, backlog) {
+        text += &format!(
+            "; the arrivals queued behind the {conc} workers: {:.0}/s scheduled, {:.0}/s carried",
+            ol.target_rate, ol.achieved_rate
+        );
+    }
     Some(Finding {
         code: "client_bound".into(),
         severity: Severity::Warning,
@@ -1269,8 +1336,10 @@ fn client_bound(c: &Ctx) -> Option<Finding> {
         } else {
             Confidence::Medium
         },
-        cause: if backlog.is_some() && !cpu_bound && !saturated {
-            "The client fell behind its arrival schedule: throughput is the client's, not the service's.".into()
+        cause: if workers {
+            format!(
+                "The {conc} workers set the pace, not the service: the arrivals queued behind them, and the client's CPU had room."
+            )
         } else {
             "The client process, not the service, set the pace: its numbers understate the service."
                 .into()
@@ -1287,7 +1356,7 @@ fn client_bound(c: &Ctx) -> Option<Finding> {
             ]),
             ..Default::default()
         },
-        remedy: remedy("client_bound", None),
+        remedy: remedy("client_bound", workers.then_some("workers")),
     })
 }
 
@@ -1355,6 +1424,10 @@ pub fn next_command(run_id: &str, f: &Finding) -> String {
     match f.code.as_str() {
         "errors" if f.remedy.path.is_none() => format!("oprobe show {run_id} --by api"),
         "client_bound" | "invalid_run" => format!("oprobe show {run_id} --detail"),
+        // Not a layer (a bandwidth cap on reads): nothing to prove.
+        code if f.remedy.path.is_none() && code != "key_limit" => {
+            format!("oprobe show {run_id} --detail")
+        }
         code => format!("oprobe prove {run_id} {code}"),
     }
 }
@@ -1796,7 +1869,8 @@ pub(crate) mod tests {
         let f = derive(&run);
         assert!(!f.iter().any(|x| x.code == "throttling"), "{f:#?}");
         let e = f.iter().find(|x| x.code == "errors").unwrap();
-        assert_eq!(e.remedy.path.as_deref(), Some("layers.retry.jitter"));
+        assert_eq!(e.remedy.path.as_deref(), Some("layers.retry.min_delay"));
+        assert_eq!(e.remedy.with, ["layers.retry.jitter"]);
     }
 
     #[test]
@@ -1919,6 +1993,101 @@ pub(crate) mod tests {
         // A lag of the same order could: they go.
         run.report.self_stats.sched_lag_p99_ms = Some(excess);
         assert!(!derive(&run).iter().any(|x| x.code == "tail_stragglers"));
+    }
+
+    /// Retried resets alone are an `errors` finding (K4), and failures retries recovered name
+    /// the retry backoff, sized by prove, with jitter (K1: 7.0 named jitter alone, and prove
+    /// came out worse).
+    #[test]
+    fn retried_transient_failures_name_the_retry_backoff() {
+        let mut run = base();
+        run.report.resilience.network_errors = 20;
+        let f = derive(&run);
+        let e = f
+            .iter()
+            .find(|x| x.code == "errors")
+            .unwrap_or_else(|| panic!("{f:#?}"));
+        assert_eq!(e.remedy.path.as_deref(), Some("layers.retry.min_delay"));
+        assert_eq!(e.remedy.with, ["layers.retry.jitter"]);
+        assert!(e.remedy.sized);
+        assert_eq!(e.evidence.values["network_errors_count"], 20.0);
+        assert!(
+            e.evidence.text.contains("lost their connection"),
+            "{}",
+            e.evidence.text
+        );
+        assert_eq!(e.remedy.next.as_deref(), Some("oprobe prove r1 errors"));
+        // Too few to matter: nothing.
+        run.report.resilience.network_errors = 2;
+        assert!(!derive(&run).iter().any(|x| x.code == "errors"));
+        // Failures that reached the application: not a layer.
+        run.report.summary.failed_ops = 1;
+        run.report.summary.ops = 1000;
+        let f = derive(&run);
+        let e = f.iter().find(|x| x.code == "errors").unwrap();
+        assert!(e.remedy.path.is_none());
+    }
+
+    /// In a production trace, one failed operation (a stat of a missing key) is not a finding:
+    /// the same minimum share as a run's retried requests (K14).
+    #[test]
+    fn one_failure_in_a_trace_is_not_an_errors_finding() {
+        let mut run = base();
+        run.report.run.source = crate::model::RunSource::Trace;
+        run.report.summary.ops = 1000;
+        run.report.summary.failed_ops = 1;
+        assert!(!derive(&run).iter().any(|x| x.code == "errors"));
+        run.report.summary.failed_ops = 5;
+        assert!(derive(&run).iter().any(|x| x.code == "errors"));
+    }
+
+    /// An open-loop run whose arrivals queue behind the workers names the workers, not the
+    /// CPU (K15).
+    #[test]
+    fn a_rate_above_the_workers_names_the_workers() {
+        let mut run = base();
+        run.report.self_stats.cpu_ratio = Some(0.1);
+        run.report.spec.profile.workload.concurrency = 2;
+        run.report.summary.latency.mean = 10.0;
+        run.report.open_loop = Some(crate::trace::OpenLoopStats {
+            target_rate: 1000.0,
+            achieved_rate: 200.0,
+            missed: 4000,
+            intended_count: 5000,
+            ..Default::default()
+        });
+        let f = derive(&run);
+        let c = f
+            .iter()
+            .find(|x| x.code == "client_bound")
+            .unwrap_or_else(|| panic!("{f:#?}"));
+        assert!(c.cause.contains("2 workers"), "{}", c.cause);
+        assert!(
+            !c.cause.contains("CPU, not") && !c.remedy.text.contains("more cores"),
+            "{c:#?}"
+        );
+        assert!(c.remedy.text.contains("`-c`"), "{}", c.remedy.text);
+        assert!(
+            c.evidence.text.contains("1000/s scheduled, 200/s carried"),
+            "{}",
+            c.evidence.text
+        );
+    }
+
+    /// A bandwidth cap names ThrottleLayer only where it applies: on writes (K16).
+    #[test]
+    fn a_bandwidth_cap_on_reads_is_not_a_layer() {
+        let reads = remedy("bandwidth_cap", Some("reads"));
+        assert!(reads.path.is_none());
+        assert!(reads.text.contains("not a layer"), "{}", reads.text);
+        let writes = remedy("bandwidth_cap", None);
+        assert_eq!(writes.path.as_deref(), Some("layers.throttle.bandwidth"));
+        let f = Finding {
+            code: "bandwidth_cap".into(),
+            remedy: reads,
+            ..Default::default()
+        };
+        assert_eq!(next_command("r1", &f), "oprobe show r1 --detail");
     }
 
     #[test]

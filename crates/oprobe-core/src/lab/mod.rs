@@ -1041,18 +1041,20 @@ async fn handle_s3_request(
 
     // 1b. Injected server errors and connection resets (never on cleanup DELETEs).
     if !is_delete_cleanup {
-        let every = |n: Option<usize>| {
+        let every = |n: Option<usize>, offset: u64| {
             n.filter(|&n| n > 0)
-                .is_some_and(|n| seq.is_multiple_of(n as u64))
+                .is_some_and(|n| (seq + offset).is_multiple_of(n as u64))
         };
-        if every(faults.reset_every_n) {
+        // Resets fall one request before the errors' multiples, so the two never land on the
+        // same request: `error_every_n: 25` is 4 % errors whatever the resets (K4).
+        if every(faults.reset_every_n, 1) {
             // An error from the service makes hyper drop the connection without a response.
             return Err(std::io::Error::new(
                 std::io::ErrorKind::ConnectionReset,
                 "lab: injected connection reset",
             ));
         }
-        if every(faults.error_every_n) {
+        if every(faults.error_every_n, 0) {
             let _ = req.into_body().collect().await;
             return Ok(s3_error(
                 StatusCode::INTERNAL_SERVER_ERROR,

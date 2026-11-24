@@ -249,7 +249,8 @@ impl App {
                 .into());
         }
         let ctx = self.ctx(&EventSink::silent());
-        req.operators
+        let mut resolved = req
+            .operators
             .iter()
             .map(|op| {
                 let (profile, source) = profile::run_profile(&ctx, &req.profile_request(op))?;
@@ -259,18 +260,42 @@ impl App {
                     operator_ref: op.clone(),
                 })
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        // One workload for every operator (K2): the first operator's (its `lab://` scenario's
+        // defaults, then `[defaults]`, the flags and `--set`), never each lab's own defaults.
+        if let Some((first, rest)) = resolved.split_first_mut() {
+            for r in rest {
+                r.profile.workload = first.profile.workload.clone();
+                r.profile.validate()?;
+            }
+        }
+        Ok(resolved)
     }
 
     /// The plan of a run (`--dry-run`): per operator the requests, bytes, objects written and
     /// deleted and the ETA. Nothing is sent.
     pub fn plan(&self, req: &RunRequest) -> Result<RunPlan> {
         let ctx = self.ctx(&EventSink::silent());
-        let plans = self
+        let mut plans = self
             .resolve(req)?
             .iter()
             .map(|r| Ok(run::rails(&ctx, &r.profile, &req.safety)?.plan(&r.profile)))
             .collect::<Result<Vec<_>>>()?;
+        // The budgets cover the whole command: what all the operators spend together.
+        if plans.len() > 1 {
+            let requests = plans.iter().map(|p| p.estimated_requests_count).sum();
+            let bytes = plans.iter().map(|p| p.estimated_bytes).sum();
+            let eta_s = plans.iter().map(|p| p.eta_s).sum();
+            let n = plans.len();
+            if let Some(last) = plans.last_mut() {
+                let together = crate::guard::budget_warnings(&last.budgets, requests, bytes, eta_s);
+                last.warnings.extend(
+                    together
+                        .into_iter()
+                        .map(|w| format!("the {n} operators together: {w}")),
+                );
+            }
+        }
         Ok(RunPlan { plans })
     }
 
@@ -309,7 +334,15 @@ impl App {
             )
             .await?
             {
-                run::Measured::Run(o) => runs.push(*o),
+                run::Measured::Run(o) => {
+                    // A spent budget covers the whole command: the operators after it do
+                    // not run (K10: what ran is printed, then the error, exit 4).
+                    let stop = o.breach.is_some();
+                    runs.push(*o);
+                    if stop {
+                        break;
+                    }
+                }
                 run::Measured::Plan(_) => unreachable!("not a dry run"),
             }
         }
@@ -351,6 +384,11 @@ impl App {
     /// A stored run (or a run file) with its rows.
     pub fn show(&self, r: RunRef) -> Result<Profile> {
         runs::show(self, &r)
+    }
+
+    /// The stored prove `r` names (`oprobe show PROVE_ID`), or `None` when it names no prove.
+    pub fn show_prove(&self, r: &RunRef) -> Result<Option<runs::ShownProve>> {
+        runs::show_prove(self, r)
     }
 
     /// The stored runs you made, newest first, and the proves (trials hidden).

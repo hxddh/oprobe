@@ -34,6 +34,17 @@ pub struct Opts<'a> {
 /// Measure `profile` once through the pipeline and save the run (unless `--no-save`). A budget
 /// breach saves the partial run and returns its error (exit 4).
 pub async fn measure(ctx: &Ctx, profile: Profile, o: Opts<'_>) -> Result<Measured> {
+    let m = measure_to_breach(ctx, profile, o).await?;
+    match &m.breach {
+        Some(b) => Err(b.to_error()),
+        None => Ok(m),
+    }
+}
+
+/// [`measure`], with a budget breach returned in [`Measured::breach`] next to the partial run
+/// (saved) instead of as an error: `oprobe run` prints what was measured before the budget ran
+/// out, as it does after Ctrl-C.
+pub async fn measure_to_breach(ctx: &Ctx, profile: Profile, o: Opts<'_>) -> Result<Measured> {
     let total_s = profile.workload.duration.get().as_secs_f64();
     let trial = o.parent_id.is_some();
     let (progress, line) = if trial {
@@ -116,14 +127,14 @@ pub async fn measure(ctx: &Ctx, profile: Profile, o: Opts<'_>) -> Result<Measure
         ));
     }
     save_outputs(&m.run.report, o.output)?;
-    if let Some(b) = &m.breach {
+    if m.breach.is_some() {
         if m.path.is_some() {
             ctx.out.warn(format!(
                 "the partial run was saved: oprobe show {}",
                 m.run.id()
             ));
         }
-        return Err(b.to_error());
+        return Ok(m);
     }
     if m.cancelled {
         ctx.out

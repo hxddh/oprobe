@@ -52,7 +52,17 @@ pub async fn run(operators: Vec<String>, f: RunFlags, ctx: &Ctx) -> Result<u8> {
     };
     match ctx.app().run(req, ctx.out.clone(), ctrl_c()).await? {
         RunOutcome::Plan(p) => ctx.out.finish(p.as_ref()),
-        RunOutcome::Run(r) => ctx.out.finish(r.as_ref()),
+        RunOutcome::Run(r) => {
+            let code = ctx.out.finish(r.as_ref())?;
+            // A spent budget: the runs it let finish are on stdout, the error on stderr (in
+            // JSON, the document's `error`).
+            if let Some(e) = &r.error
+                && !ctx.out.format.is_machine()
+            {
+                ctx.out.error(e);
+            }
+            Ok(code)
+        }
     }
 }
 
@@ -84,11 +94,16 @@ pub fn show(a: ShowArgs, ctx: &Ctx) -> Result<u8> {
         })
     };
     let (since, until) = (secs(&a.since)?, secs(&a.until)?);
+    let r = RunRef(a.run.unwrap_or_else(|| "last".into()));
+    // A prove id (`show --list` lists them): its stored result, as `prove` printed it.
+    if let Some(p) = app.show_prove(&r)? {
+        return ctx.out.finish(&p);
+    }
     let p = app
-        .show(RunRef(a.run.unwrap_or_else(|| "last".into())))?
+        .show(r)?
         .with_range(since, until)?
         .with_detail(a.detail)
-        .with_by(by);
+        .with_by(by)?;
     ctx.out.finish(&p)
 }
 

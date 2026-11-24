@@ -325,6 +325,21 @@ fn a_context_menu_compares_and_deletes_runs() {
     wait_long(&mut app, "id:compare-charts");
     wait_long(&mut app, "id:compare-note");
     assert!(app.shows("Goodput over time") && app.shows("Latency distribution"));
+    // The tail of the latency, requests, retries, failures and throttling side by side; p99 and
+    // requests over time; each API's requests and TTFB p99.
+    for row in [
+        "p999",
+        "requests_per_s",
+        "retries",
+        "failed",
+        "throttled_count",
+    ] {
+        wait_long(&mut app, &format!("id:compare-row-{row}"));
+    }
+    wait_long(&mut app, "id:compare-p99");
+    wait_long(&mut app, "id:compare-requests");
+    wait_long(&mut app, "id:compare-apis");
+    wait_long(&mut app, "id:compare-apis >> text:GetObject");
     // Delete asks first with the system's alert, Cancel its default; Cancel keeps the runs.
     app.answer_dialogs_myself();
     app.right_click(&format!("id:run-{a}")).unwrap();
@@ -752,6 +767,16 @@ fn findings_apis_and_the_verb_filter_drill_down() {
     wait_long(&mut app, "text:Requests per second · all verbs");
     app.press("id:verb-filter >> text:All verbs").unwrap();
     app.wait_for_gone("text:Goodput · stat", LONG).unwrap();
+    // Throughput over time; the throttled responses (and the retries) on their own axis.
+    wait_long(&mut app, "id:chart-throughput");
+    wait_long(&mut app, "id:chart-problems");
+    wait_long(&mut app, "label:/^Problems per second over /");
+    wait_long(&mut app, "id:timeline >> text:throttled responses");
+    // The latency distribution is a tail plot with p99.9 marked.
+    wait_long(
+        &mut app,
+        "id:distribution >> text:/^Share of operations slower than a latency/",
+    );
     // A click on a heatmap cell (a press that barely moves) lists the operations behind it.
     app.drag("id:heatmap", right(1.0)).unwrap();
     wait_long(&mut app, "id:cell-drill");
@@ -787,10 +812,29 @@ fn the_profile_shows_every_captured_signal_where_it_explains_something() {
     wait_long(&mut app, "id:verbs >> text:/MiB\\/s · .* req\\/op$/");
     // The consumer's stall is its own segment of the waterfall.
     wait_long(&mut app, "id:slowest >> text:stall");
-    // Connections: one model with the CLI's, the kernel's view where the kernel gives it.
+    // Connections: one model with the CLI's, the kernel's view where the kernel gives it; the
+    // dials counted once, with their window.
     wait_long(&mut app, "id:connections");
+    wait_long(&mut app, "id:conn-dialed >> text:/in the window$/");
+    assert!(!app.shows("HTTP/2 0"), "no protocol that carried nothing");
     #[cfg(target_os = "linux")]
-    wait_long(&mut app, "id:conn-tcp");
+    {
+        wait_long(&mut app, "id:conn-tcp");
+        wait_long(&mut app, "id:conn-min-rtt");
+    }
+    // A finding's evidence is labelled, its values in the tiles' format.
+    wait_long(
+        &mut app,
+        "id:finding-tail_stragglers >> text:Typical time to first byte",
+    );
+    wait_long(&mut app, "id:finding-tail_stragglers >> text:APIs affected");
+    wait_long(&mut app, "id:finding-tail_stragglers >> text:/^\\d.* ms$/");
+    // Details: the bytes on the wire, from the kernel's counters.
+    app.press("id:details").unwrap();
+    wait_long(&mut app, "id:details-body");
+    #[cfg(target_os = "linux")]
+    wait_long(&mut app, "id:bytes-wire");
+    wait_long(&mut app, "id:details-body >> text:/ – /");
     // A slow operation's async call stack opens under its waterfall on demand (every slow
     // operation of a live run has one; the slowest is first).
     let toggle = "id:slowest >> id:await-tree-toggle >> nth=0";

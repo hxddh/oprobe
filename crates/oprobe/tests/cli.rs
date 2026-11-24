@@ -608,7 +608,7 @@ fn prove_judges_a_change_and_hides_its_trials() {
     let trial = json(&env.run(&["show", trials[0]["run_id"].as_str().unwrap(), "-o", "json"]));
     assert_eq!(trial["report"]["run"]["parent_id"], v["prove_id"]);
     let last = json(&env.run(&["show", "last", "-o", "json"]));
-    assert_eq!(last["report"]["run"]["id"], run_id.as_str());
+    assert_eq!(last["report"]["run"]["id"], run_id.as_str(), "{last:#}");
     // Removing the prove removes its trials.
     let o = env.run(&[
         "show",
@@ -1073,4 +1073,236 @@ fn a_closed_stdout_ends_quietly() {
     drop(child.stdout.take());
     let out = child.wait_with_output().unwrap();
     assert!(!stderr(&out).contains("panicked"), "{}", stderr(&out));
+}
+
+/// `run A B` runs one workload for every operator (K2): the first operator's, not each lab's
+/// own defaults (7.0: 28 workers on `lab://demo`, 16 on `lab://ratelimit`). The budgets cover
+/// what all the operators spend together.
+#[test]
+fn several_operators_share_one_workload_and_one_budget() {
+    let env = Env::new();
+    let o = env.run(&[
+        "run",
+        "lab://demo",
+        "lab://ratelimit",
+        "--dry-run",
+        "-o",
+        "json",
+    ]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let v = json(&o);
+    validate("plan", &v);
+    let p = v["plans"].as_array().unwrap();
+    assert_eq!(
+        p[0]["concurrency_count"], p[1]["concurrency_count"],
+        "{v:#}"
+    );
+    assert_eq!(p[0]["preset"], p[1]["preset"]);
+    assert_eq!(p[0]["duration_s"], p[1]["duration_s"]);
+    // One operator's plan fits the budget; the two together do not.
+    let one = json(&env.run(&run_args(&["memory://"], &["--dry-run", "-o", "json"])));
+    let n = one["plans"][0]["estimated_requests_count"]
+        .as_u64()
+        .unwrap();
+    let budget = (n * 3 / 2).to_string();
+    let o = env.run(&run_args(
+        &["memory://", "memory://"],
+        &["--dry-run", "--max-requests", &budget, "-o", "json"],
+    ));
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let v = json(&o);
+    let w = v["warnings"].to_string();
+    assert!(
+        w.contains("2 operators together") && w.contains("--max-requests"),
+        "{v:#}"
+    );
+}
+
+/// A spent budget prints what it let finish, like Ctrl-C does (K10): the brief on stdout and
+/// the error on stderr; under `-o json`, the runs with the error. Still exit 4, and the
+/// operators after it do not run.
+#[test]
+fn a_budget_stop_prints_the_runs_it_let_finish() {
+    let env = Env::new();
+    let args = [
+        "run",
+        "memory://",
+        "memory://",
+        "-d",
+        "5s",
+        "--warmup",
+        "0s",
+        "--max-requests",
+        "50",
+    ];
+    let o = env.run(&args);
+    assert_eq!(code(&o), 4, "{}", stderr(&o));
+    assert!(stdout(&o).contains("ops/s"), "the brief: {}", stdout(&o));
+    assert!(
+        stderr(&o).contains("error:") && stderr(&o).contains("request budget"),
+        "{}",
+        stderr(&o)
+    );
+    let mut a = args.to_vec();
+    a.extend(["-o", "json"]);
+    let o = env.run(&a);
+    assert_eq!(code(&o), 4, "{}", stderr(&o));
+    let v = json(&o);
+    validate("run", &v);
+    assert_eq!(error_code(&o), "safety.budget_exceeded");
+    let runs = v["runs"].as_array().unwrap();
+    assert_eq!(runs.len(), 1, "the second operator does not run: {v:#}");
+    assert!(runs[0]["report"]["run"]["partial"].is_object(), "{v:#}");
+}
+
+/// `show PROVE_ID` shows the stored result as `prove` printed it (K11), also once its run is
+/// removed; `show --list` limits the proves with `-n` and says so (K7).
+#[test]
+fn show_opens_a_prove_and_lists_proves_within_the_limit() {
+    let env = Env::new();
+    let o = env.run(&run_args(&["lab://clean"], &["-q", "-o", "json"]));
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let run_id = json(&o)["runs"][0]["run_id"].as_str().unwrap().to_owned();
+    let prove = || {
+        let o = env.run(&[
+            "prove",
+            "last",
+            "--with",
+            "read.gap=1MiB",
+            "--trial",
+            "300ms",
+            "--max-duration",
+            "1s",
+            "-o",
+            "json",
+        ]);
+        assert!(matches!(code(&o), 0 | 3), "{}", stderr(&o));
+        json(&o)
+    };
+    let first = prove();
+    let second = prove();
+    let id = first["prove_id"].as_str().unwrap();
+    // The list: one of each with -n 1, and it says how many proves there are.
+    let o = env.run(&["show", "--list", "-n", "1", "-o", "json"]);
+    let list = json(&o);
+    validate("run-list", &list);
+    assert_eq!(list["proves"].as_array().unwrap().len(), 1, "{list:#}");
+    assert_eq!(list["proves_total_count"], 2);
+    assert_eq!(list["proves"][0]["prove_id"], second["prove_id"]);
+    let t = stdout(&env.run(&["show", "--list", "-n", "1"]));
+    assert!(t.contains("1 of 2 proves"), "{t}");
+    // The prove itself: the prove schema, the same text as `prove`, exit 0.
+    let o = env.run(&["show", id, "-o", "json"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let v = json(&o);
+    validate("prove", &v);
+    assert_eq!(v["prove_id"], first["prove_id"]);
+    assert_eq!(v["change"], first["change"]);
+    let t = stdout(&env.run(&["show", id]));
+    assert!(t.contains(" on goodput"), "{t}");
+    // Its run removed: the prove still shows.
+    let o = env.run(&["show", "--rm", &run_id]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let o = env.run(&["show", id, "-o", "json"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    validate("prove", &json(&o));
+}
+
+/// `show` refuses what it cannot show, naming the right flag: `--by` on a file without
+/// request rows (K9), `--since` past the window (K12: 7.0 blamed an `--until` nobody passed).
+#[test]
+fn show_refuses_a_range_or_grouping_it_cannot_show() {
+    let env = Env::new();
+    let o = env.run(&run_args(&["memory://"], &["-q"]));
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let o = env.run(&["show", "last", "--since", "100s", "-o", "json"]);
+    assert_eq!(code(&o), 2, "{}", stdout(&o));
+    let e = json(&o);
+    let msg = e["error"]["message"].as_str().unwrap();
+    assert!(msg.contains("--since") && msg.contains("window"), "{e:#}");
+    assert!(!msg.contains("--until"), "{e:#}");
+    // A report `.json` has no request rows: --by is refused like --since.
+    let report = json(&env.run(&["show", "last", "-o", "json"]))["report"].clone();
+    let file = env.path("report.json");
+    std::fs::write(&file, serde_json::to_vec(&report).unwrap()).unwrap();
+    let f = file.to_str().unwrap();
+    for by in ["api", "conn", "stage"] {
+        let o = env.run(&["show", f, "--by", by, "-o", "json"]);
+        assert_eq!(code(&o), 2, "{by}: {}", stdout(&o));
+        assert_eq!(error_code(&o), "usage.invalid_argument");
+        let e = json(&o);
+        assert!(
+            e["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("request rows"),
+            "{e:#}"
+        );
+    }
+}
+
+/// A zero duration is refused with a classified usage error (K13): a 0 s window measures
+/// nothing, a 0 s budget stops at once, a 0 s trial proves nothing.
+#[test]
+fn zero_durations_are_refused() {
+    let env = Env::new();
+    for args in [
+        vec!["run", "memory://", "-d", "0s"],
+        vec!["run", "memory://", "-d", "0"],
+        vec!["run", "memory://", "--max-duration", "0s"],
+        vec!["run", "memory://", "--set", "duration=0s"],
+        vec!["prove", "last", "--trial", "0s"],
+        vec!["prove", "last", "--max-duration", "0s"],
+        vec!["run", "memory://", "-d", "-1s"],
+    ] {
+        let mut a = args.clone();
+        a.extend(["-o", "json"]);
+        let o = env.run(&a);
+        assert_eq!(code(&o), 2, "{args:?}: {}", stdout(&o));
+        assert_eq!(error_code(&o), "usage.invalid_argument", "{args:?}");
+        validate("error", &json(&o));
+    }
+    assert!(env.runs().is_empty());
+}
+
+/// Requests that lost their connection (`lab://flaky` resets) are counted in the remotes and
+/// `--by conn` tables under a `no connection` row, not dropped or filed under connection 0.
+#[test]
+fn reset_requests_show_under_no_connection() {
+    let env = Env::new();
+    let o = env.run(&[
+        "run",
+        "lab://flaky",
+        "-d",
+        "1s",
+        "--warmup",
+        "0s",
+        "-q",
+        "-o",
+        "json",
+    ]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let r = json(&o)["runs"][0]["report"].clone();
+    let resets = r["resilience"]["network_errors_count"].as_u64().unwrap();
+    assert!(resets > 0, "{}", r["resilience"]);
+    let remotes = r["network"]["remotes"].as_array().unwrap();
+    let none = remotes
+        .iter()
+        .find(|x| x["remote"] == "no connection")
+        .unwrap_or_else(|| panic!("{remotes:#?}"));
+    assert_eq!(none["requests_count"], resets);
+    let total: u64 = remotes
+        .iter()
+        .map(|x| x["requests_count"].as_u64().unwrap())
+        .sum();
+    assert_eq!(total, r["connections"]["requests_count"].as_u64().unwrap());
+    let by = json(&env.run(&["show", "last", "--by", "conn", "-o", "json"]));
+    validate("show", &by);
+    let groups = by["by"]["groups"].as_array().unwrap();
+    assert!(!groups.iter().any(|g| g["key"] == "0"), "{groups:#?}");
+    let g = groups
+        .iter()
+        .find(|g| g["key"] == "no connection")
+        .unwrap_or_else(|| panic!("{groups:#?}"));
+    assert_eq!(g["requests_count"], resets);
 }
