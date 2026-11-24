@@ -141,6 +141,19 @@ impl Shared {
         if !self.tcp_info {
             return None;
         }
+        let probe = self.probe(addr, known)?;
+        let (row, retrans) = probe.sample_with_retrans()?;
+        // The bytes on the wire since the connection's previous sample: every request is
+        // sampled, so the deltas add up to the connection's traffic.
+        if let Some(r) = &self.recorder {
+            let (rx, tx) = probe.wire_since_last(&row);
+            r.add_wire(rx, tx);
+        }
+        Some((row, retrans))
+    }
+
+    /// The kernel probe of connection `addr` (looked up once per connection).
+    fn probe(&self, addr: (SocketAddr, SocketAddr), known: Sock) -> Option<Arc<TcpProbe>> {
         let id = match known {
             Sock::Found(p) => p,
             Sock::Missing => return None,
@@ -155,7 +168,7 @@ impl Shared {
                 found?
             }
         };
-        id.sample_with_retrans()
+        Some(id)
     }
 }
 

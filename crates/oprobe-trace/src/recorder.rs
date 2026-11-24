@@ -168,17 +168,22 @@ fn event_bucket(us: u64, frozen: u64) -> usize {
 /// interval then holds only the events of operations draining after the close, and no
 /// operation, and would draw as a drop to zero. Such a sliver (under 5 % of its length inside
 /// the window, with no operation started in it) is folded into the interval before it; its
-/// rates are over the previous interval's length.
+/// rates are over the previous interval's length. So is every interval that starts after the
+/// close (operations still draining a second or more later).
 fn fold_end_sliver(mut t: Vec<TimelinePoint>, elapsed_s: f64) -> Vec<TimelinePoint> {
-    let n = t.len();
-    if n < 2 {
-        return t;
+    while t.len() >= 2 {
+        let last = &t[t.len() - 1];
+        let covered = elapsed_s - last.t_s;
+        if last.ops_count > 0 || covered >= 0.05 * last.len_s.max(1e-9) {
+            break;
+        }
+        t = fold_last(t);
     }
-    let last = &t[n - 1];
-    let covered = elapsed_s - last.t_s;
-    if last.ops_count > 0 || !(0.0..0.05 * last.len_s.max(1e-9)).contains(&covered) {
-        return t;
-    }
+    t
+}
+
+/// The last interval folded into the one before it.
+fn fold_last(mut t: Vec<TimelinePoint>) -> Vec<TimelinePoint> {
     let s = t.pop().expect("two intervals");
     let p = t.last_mut().expect("one interval");
     let width = p.len_s.max(1e-9);
@@ -2260,6 +2265,19 @@ mod tests {
         assert_eq!(t.len(), 2);
         assert_eq!((t[1].requests_count, t[1].throttled), (13, 3));
         assert_eq!(t[1].requests_per_s, 13.0);
+        // A window closed at 1.98 s with retries draining for two more seconds: both drain
+        // intervals fold into the window's last one.
+        let t = fold_end_sliver(
+            vec![
+                pt(0.0, 10, 10, 0),
+                pt(1.0, 10, 10, 0),
+                pt(2.0, 0, 4, 1),
+                pt(3.0, 0, 2, 1),
+            ],
+            1.98,
+        );
+        assert_eq!(t.len(), 2);
+        assert_eq!((t[1].requests_count, t[1].throttled), (16, 2));
         // A real last interval (operations started in it, or most of it inside the window) stays.
         assert_eq!(
             fold_end_sliver(vec![pt(0.0, 10, 10, 0), pt(1.0, 2, 3, 0)], 1.00008).len(),

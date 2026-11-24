@@ -1,7 +1,8 @@
 //! The plots the views draw, built from the app's models: the timeline (goodput with the
 //! attempted rate behind it and the intervals with throttled responses or failures shaded, the
-//! latency quantiles muted where an interval has too few operations, requests and retries),
-//! the latency distribution, the in-flight levels behind a concurrency ceiling, each finding's
+//! latency quantiles muted where an interval has too few operations, throughput, requests, and
+//! the problems per second on their own axis), the latency distribution as a tail plot, the
+//! in-flight levels behind a concurrency ceiling, each finding's
 //! evidence, Prove's convergence and the overlays of Compare. Plain functions of plain values,
 //! so each is tested without a window.
 
@@ -221,30 +222,63 @@ pub fn inflight(t: &TimelineView) -> Option<Plot> {
     Some(time_plot(t, Scale::zero_based(top), Unit::Count, lines))
 }
 
-/// Requests sent per second (retries included), and beside them the retries, the throttled
-/// responses and the failed operations per second as step lines: where a request rate limit
-/// shows, and how much — one 429 is not a thousand.
+/// Requests sent per second, retries included (the problems have their own chart: on this
+/// axis a few retries are flat at zero).
 pub fn requests(t: &TimelineView) -> Option<Plot> {
     if t.requests_per_s.len() != t.len() || t.requests_per_s.iter().all(|v| *v <= 0.0) {
         return None;
     }
     let y = Scale::zero_based(t.requests_per_s.iter().copied().fold(0.0, f64::max));
-    let mut lines = vec![Line::step(
-        tr("plot.requests"),
-        "series-a",
-        series(t, &t.requests_per_s),
-    )];
-    for (label, token, counts) in [
+    Some(time_plot(
+        t,
+        y,
+        Unit::Rate,
+        vec![Line::step(
+            tr("plot.requests"),
+            "series-a",
+            series(t, &t.requests_per_s),
+        )],
+    ))
+}
+
+/// Problems per second on their own axis: retries, throttled responses and failed operations
+/// (each in the interval it happened) — only those that happened; `None` when none did.
+pub fn problems(t: &TimelineView) -> Option<Plot> {
+    if t.is_empty() {
+        return None;
+    }
+    let lines: Vec<Line> = [
         (tr("plot.retries"), "stage-retry", &t.retries_count),
         (tr("plot.throttled_responses"), "warn", &t.throttled_count),
         (tr("plot.failed_ops"), "crit", &t.errors_count),
-    ] {
-        let v = per_s(t, counts);
-        if v.len() == t.len() && v.iter().any(|v| *v > 0.0) {
-            lines.push(Line::step(label, token, series(t, &v)));
-        }
+    ]
+    .into_iter()
+    .filter(|(_, _, c)| c.len() == t.len() && c.iter().any(|n| *n > 0))
+    .map(|(label, token, c)| Line::step(label, token, series(t, &per_s(t, c))))
+    .collect();
+    if lines.is_empty() {
+        return None;
     }
-    Some(time_plot(t, y, Unit::Rate, lines))
+    let top = lines
+        .iter()
+        .flat_map(|l| l.pts.iter().map(|p| p.1))
+        .fold(0.0, f64::max);
+    Some(time_plot(t, Scale::zero_based(top), Unit::Rate, lines))
+}
+
+/// Bytes moved per second (read and written, as the operations asked for them), interval by
+/// interval: the bandwidth tile over time. `None` when nothing moved.
+pub fn throughput(t: &TimelineView) -> Option<Plot> {
+    if t.mib_per_s.len() != t.len() || t.mib_per_s.iter().all(|v| *v <= 0.0) {
+        return None;
+    }
+    per_interval(
+        t,
+        tr("plot.read_written"),
+        "series-a",
+        Unit::MibRate,
+        t.mib_per_s.clone(),
+    )
 }
 
 /// The hottest keys as horizontal bars, at most five, largest first: `(key, share)` of all
@@ -318,58 +352,85 @@ pub fn heat_legend(h: &Heat) -> (u64, u64) {
     (lo, h.max.max(lo))
 }
 
-/// Latency distributions on one log axis: one line per `(label, cdf)`; `marks` puts the p50
-/// and p99 of a single distribution on it as rules.
-pub fn cdf(series: &[(String, &LatencyCdf)], marks: Option<(f64, f64)>) -> Option<Plot> {
-    let all = series.iter().flat_map(|(_, c)| c.pts.iter());
+/// The quantiles a tail plot marks: p50, p99 and p99.9 (0: not marked).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Marks {
+    pub p50_ms: f64,
+    pub p99_ms: f64,
+    pub p999_ms: f64,
+}
+
+impl Marks {
+    /// The marks of a distribution, read off it.
+    pub fn of(c: &LatencyCdf) -> Self {
+        Self {
+            p50_ms: c.quantile(0.5).unwrap_or(0.0),
+            p99_ms: c.quantile(0.99).unwrap_or(0.0),
+            p999_ms: c.quantile(0.999).unwrap_or(0.0),
+        }
+    }
+}
+
+/// The lowest share a tail plot shows: one operation in 10 000.
+pub const TAIL_FLOOR: f64 = 1e-4;
+
+/// Latency distributions as tail plots: the share of operations at or slower than each latency,
+/// on log axes (latency across, 100 % down to 0.01 % up the side), one line per `(label, cdf)`;
+/// `marks` rules a single distribution's p50, p99 and p99.9. The tail, where every finding
+/// lives, gets as much room as the body.
+pub fn tail(series: &[(String, &LatencyCdf)], marks: Option<Marks>) -> Option<Plot> {
+    let tails: Vec<(String, Vec<(f64, f64)>)> =
+        series.iter().map(|(l, c)| (l.clone(), c.tail())).collect();
+    let all = tails.iter().flat_map(|(_, t)| t.iter());
     let (lo, hi) = all.fold((f64::INFINITY, 0.0_f64), |(lo, hi), p| {
-        (if p.0 > 0.0 { lo.min(p.0) } else { lo }, hi.max(p.0))
+        (lo.min(p.0), hi.max(p.0))
     });
     if hi <= 0.0 {
         return None;
     }
-    let x = Scale::log(if lo.is_finite() { lo } else { hi / 1e3 }, hi);
     let mut plot = Plot {
-        x,
+        x: Scale::log(if lo.is_finite() { lo } else { hi / 1e3 }, hi),
         y: Scale {
-            min: 0.0,
+            min: TAIL_FLOOR,
             max: 1.0,
-            log: false,
+            log: true,
         },
         step_w: 0.0,
         x_fmt: Unit::Ms,
-        y_fmt: Unit::Share,
-        lines: series
-            .iter()
+        y_fmt: Unit::Tail,
+        lines: tails
+            .into_iter()
             .zip(SERIES.iter().cycle())
-            .filter(|((_, c), _)| !c.pts.is_empty())
-            .map(|((label, c), tok)| {
-                // Start on the floor at the first latency, so the curve rises from zero.
-                let mut pts = vec![(c.pts[0].0, 0.0)];
-                pts.extend(c.pts.iter().copied());
-                Line::joined(label.clone(), tok, pts)
-            })
+            .filter(|((_, t), _)| !t.is_empty())
+            .map(|((label, t), tok)| Line::joined(label, tok, t))
             .collect(),
         bands: Vec::new(),
         rules: Vec::new(),
         notes: Vec::new(),
     };
-    if let Some((p50, p99)) = marks {
-        if p50 > 0.0 {
-            plot.rules.push(Rule::at_x(p50, "axis", "p50"));
-        }
-        if p99 > 0.0 {
-            plot.rules.push(Rule::at_x(p99, "stage-server", "p99"));
+    if let Some(m) = marks {
+        for (v, tok, label) in [
+            (m.p50_ms, "axis", "p50"),
+            (m.p99_ms, "stage-server", "p99"),
+            (m.p999_ms, "stage-stall", "p99.9"),
+        ] {
+            if v > 0.0 {
+                plot.rules.push(Rule::at_x(v, tok, label));
+            }
         }
     }
     Some(plot)
 }
 
-/// The run's own latency distribution with its p50 and p99 marked.
-pub fn own_cdf(m: &ProfileModel) -> Option<Plot> {
-    cdf(
+/// The run's own tail plot with its p50, p99 and p99.9 marked.
+pub fn own_tail(m: &ProfileModel) -> Option<Plot> {
+    tail(
         &[(tr("plot.ops").to_owned(), &m.cdf)],
-        Some((m.p50_ms, m.p99_ms)),
+        Some(Marks {
+            p50_ms: m.p50_ms,
+            p99_ms: m.p99_ms,
+            p999_ms: m.p999_ms,
+        }),
     )
 }
 
@@ -437,12 +498,12 @@ pub fn evidence(m: &ProfileModel, kind: EvidenceChart) -> Option<(&'static str, 
             throttled_rate(&m.timeline).map(|p| (tr("plot.throttled_rate"), p))
         }
         EvidenceChart::Bandwidth => bandwidth(&m.timeline).map(|p| (tr("metric.bandwidth"), p)),
-        EvidenceChart::Latency => own_cdf(m).map(|p| {
+        EvidenceChart::Latency => own_tail(m).map(|p| {
             (
                 if m.cdf.exact {
-                    tr("plot.cdf")
+                    tr("plot.tail")
                 } else {
-                    tr("plot.cdf_buckets")
+                    tr("plot.tail_buckets")
                 },
                 p,
             )
@@ -550,37 +611,70 @@ pub fn prove(ab: &[(f64, f64, u64)], p99: bool) -> Option<Plot> {
     })
 }
 
-/// Several runs' goodput over time from their own start, one line each.
-pub fn goodput_overlay(ms: &[&ProfileModel]) -> Option<Plot> {
-    let w = ms.iter().map(|m| window(&m.timeline)).fold(0.0, f64::max);
-    let top = ms
+/// Several runs' series over time from their own start, one line each (`f` picks the
+/// series; runs without it are left out).
+fn overlay(
+    ms: &[&ProfileModel],
+    y_fmt: Unit,
+    log: bool,
+    f: impl Fn(&TimelineView) -> &[f64],
+) -> Option<Plot> {
+    let with: Vec<(&ProfileModel, Vec<(f64, f64)>)> = ms
         .iter()
-        .flat_map(|m| m.timeline.goodput_ops_per_s.iter().copied())
-        .fold(0.0, f64::max);
-    if w <= 0.0 || ms.iter().all(|m| m.timeline.is_empty()) {
+        .map(|m| {
+            let v = f(&m.timeline);
+            let pts: Vec<(f64, f64)> = if v.len() == m.timeline.len() {
+                series(&m.timeline, v)
+                    .into_iter()
+                    .filter(|p| !log || p.1 > 0.0)
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            (*m, pts)
+        })
+        .collect();
+    if with.iter().all(|(_, p)| p.is_empty()) {
         return None;
     }
+    let w = ms.iter().map(|m| window(&m.timeline)).fold(0.0, f64::max);
+    let ys = || with.iter().flat_map(|(_, p)| p.iter().map(|p| p.1));
+    let top = ys().fold(0.0, f64::max);
+    let y = if log {
+        Scale::log(ys().fold(f64::INFINITY, f64::min), top)
+    } else {
+        Scale::zero_based(top)
+    };
     Some(Plot::over_time(
         w,
-        Scale::zero_based(top),
-        Unit::Rate,
-        ms.iter()
+        y,
+        y_fmt,
+        with.into_iter()
             .zip(SERIES.iter().cycle())
-            .map(|(m, tok)| {
-                Line::step(
-                    m.id.clone(),
-                    tok,
-                    series(&m.timeline, &m.timeline.goodput_ops_per_s),
-                )
-            })
+            .map(|((m, pts), tok)| Line::step(m.id.clone(), tok, pts))
             .collect(),
     ))
 }
 
-/// Several runs' latency distributions, one line each.
-pub fn cdf_overlay(ms: &[&ProfileModel]) -> Option<Plot> {
+/// Several runs' goodput over time from their own start, one line each.
+pub fn goodput_overlay(ms: &[&ProfileModel]) -> Option<Plot> {
+    overlay(ms, Unit::Rate, false, |t| &t.goodput_ops_per_s)
+}
+
+/// Several runs' p99 over time on a log axis, one line each.
+pub fn p99_overlay(ms: &[&ProfileModel]) -> Option<Plot> {
+    overlay(ms, Unit::Ms, true, |t| &t.p99_ms)
+}
+
+/// Several runs' requests per second over time, one line each.
+pub fn requests_overlay(ms: &[&ProfileModel]) -> Option<Plot> {
+    overlay(ms, Unit::Rate, false, |t| &t.requests_per_s)
+}
+
+/// Several runs' latency distributions as tail plots, one line each.
+pub fn tail_overlay(ms: &[&ProfileModel]) -> Option<Plot> {
     let series: Vec<(String, &LatencyCdf)> = ms.iter().map(|m| (m.id.clone(), &m.cdf)).collect();
-    cdf(&series, None)
+    tail(&series, None)
 }
 
 #[cfg(test)]
@@ -615,14 +709,20 @@ mod tests {
     }
 
     #[test]
-    fn the_requests_chart_draws_how_much_was_throttled_and_failed() {
+    fn problems_have_their_own_axis_and_the_requests_chart_draws_requests_alone() {
         let t = tl(&[
             (100.0, 100.0, 0, 0, 100),
             (100.0, 60.0, 1, 0, 100),
             (100.0, 60.0, 900, 40, 100),
         ]);
         let rq = requests(&t).unwrap();
-        let by = |l: &str| rq.lines.iter().find(|x| x.label == l).unwrap();
+        assert_eq!(
+            rq.lines.len(),
+            1,
+            "requests alone: problems are flat on its axis"
+        );
+        let pr = problems(&t).unwrap();
+        let by = |l: &str| pr.lines.iter().find(|x| x.label == l).unwrap();
         // One 429 and nine hundred are not the same line.
         let th = by(tr("plot.throttled_responses"));
         assert_eq!(th.mark, crate::ui::chart::Mark::Step);
@@ -632,9 +732,28 @@ mod tests {
         let failed = by(tr("plot.failed_ops"));
         assert_eq!(failed.token, "crit");
         assert_eq!(failed.pts[2], (2.0, 40.0));
-        // A quiet run draws the requests alone.
+        assert_eq!(by(tr("plot.retries")).token, "stage-retry");
+        // Its own axis: the most problems per second, not the requests.
+        assert!(pr.y.max >= 900.0 && pr.y.max < 1100.0, "{:?}", pr.y);
+        // A quiet run draws no problems chart, and only what happened otherwise.
         let quiet = tl(&[(10.0, 10.0, 0, 0, 10), (10.0, 10.0, 0, 0, 10)]);
-        assert_eq!(requests(&quiet).unwrap().lines.len(), 1);
+        assert!(problems(&quiet).is_none());
+        let mut failing = quiet.clone();
+        failing.errors_count = vec![0, 3];
+        let p = problems(&failing).unwrap();
+        assert_eq!(p.lines.len(), 1);
+        assert_eq!(p.lines[0].label, tr("plot.failed_ops"));
+    }
+
+    #[test]
+    fn throughput_is_mib_per_second_per_interval() {
+        let t = tl(&[(100.0, 100.0, 0, 0, 100), (50.0, 50.0, 0, 0, 50)]);
+        let p = throughput(&t).unwrap();
+        assert_eq!(p.y_fmt, Unit::MibRate);
+        assert_eq!(p.lines[0].pts, vec![(0.0, 10.0), (1.0, 5.0)]);
+        let mut none = t.clone();
+        none.mib_per_s = vec![0.0, 0.0];
+        assert!(throughput(&none).is_none());
     }
 
     #[test]
@@ -703,13 +822,15 @@ mod tests {
         // Throttled responses, per second.
         let th = throttled_rate(&t).unwrap();
         assert_eq!(th.lines[0].pts[1], (1.0, 4.0));
-        // Requests per second with the retries and the throttled responses beside them.
+        // Requests per second; the retries and the throttled responses on their own axis.
         let rq = requests(&t).unwrap();
-        assert_eq!(rq.lines.len(), 3);
+        assert_eq!(rq.lines.len(), 1);
         assert!((rq.lines[0].pts[0].1 - 110.0).abs() < 1e-9);
-        assert_eq!(rq.lines[1].pts[1], (1.0, 4.0));
-        assert_eq!(rq.lines[2].label, tr("plot.throttled_responses"));
         assert!(rq.summary("Requests").contains("Requests"));
+        let pr = problems(&t).unwrap();
+        assert_eq!(pr.lines.len(), 2);
+        assert_eq!(pr.lines[0].pts[1], (1.0, 4.0));
+        assert_eq!(pr.lines[1].label, tr("plot.throttled_responses"));
     }
 
     #[test]
@@ -767,17 +888,39 @@ mod tests {
     }
 
     #[test]
-    fn a_distribution_rises_from_zero_with_its_quantiles_ruled() {
+    fn a_distribution_is_a_tail_plot_on_log_axes_with_its_quantiles_ruled() {
         let c = LatencyCdf {
-            pts: vec![(1.0, 0.5), (10.0, 0.99), (40.0, 1.0)],
+            pts: vec![(1.0, 0.5), (10.0, 0.99), (40.0, 0.999), (260.0, 1.0)],
             exact: true,
         };
-        let p = cdf(&[("a".into(), &c)], Some((1.0, 10.0))).unwrap();
-        assert!(p.x.log);
-        assert_eq!(p.lines[0].pts[0], (1.0, 0.0));
+        let p = tail(
+            &[("a".into(), &c)],
+            Some(Marks {
+                p50_ms: 1.0,
+                p99_ms: 10.0,
+                p999_ms: 40.0,
+            }),
+        )
+        .unwrap();
+        assert!(p.x.log && p.y.log);
+        assert_eq!((p.y.min, p.y.max), (TAIL_FLOOR, 1.0));
+        assert_eq!(p.y_fmt, Unit::Tail);
+        // Every operation is at least as slow as the fastest; the slowest 0.1 % reach 260 ms.
+        let pts = &p.lines[0].pts;
+        assert_eq!(pts[0], (1.0, 1.0));
+        assert!((pts[1].1 - 0.5).abs() < 1e-9);
+        let last = pts.last().unwrap();
+        assert_eq!(last.0, 260.0);
+        assert!((last.1 - 0.001).abs() < 1e-9);
         assert_eq!(p.lines[0].mark, Mark::Line);
-        assert_eq!(p.rules.len(), 2);
-        assert!(cdf(&[("a".into(), &LatencyCdf::default())], None).is_none());
+        let labels: Vec<&str> = p.rules.iter().map(|r| r.label.as_str()).collect();
+        assert_eq!(labels, ["p50", "p99", "p99.9"]);
+        assert!(tail(&[("a".into(), &LatencyCdf::default())], None).is_none());
+        assert_eq!(Marks::of(&c).p999_ms, 40.0);
+        // The axis reads in plain percentages.
+        assert_eq!(crate::ui::chart::tail_share(1e-4), "0.01 %");
+        assert_eq!(crate::ui::chart::tail_share(1.0), "100 %");
+        assert_eq!(crate::ui::chart::tail_share(0.0347), "3.47 %");
     }
 
     #[test]

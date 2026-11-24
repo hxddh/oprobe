@@ -2,8 +2,9 @@
 //! verb), the findings with their remedy path, the chart of their evidence and their example
 //! operations, the request waterfall of the slowest operations, the timeline (goodput over the
 //! attempted rate, the intervals with throttled responses or failures shaded, quantiles muted
-//! where too few operations back them, requests and retries), the latency distribution, the
-//! heatmap and the connections.
+//! where too few operations back them, throughput, requests, the problems per second on their
+//! own axis, in flight), the latency distribution as a tail plot, the heatmap and the
+//! connections.
 //!
 //! The timeline charts and the heatmap share one time cursor and one selected range
 //! ([`TimeLink`]): a drag selects a range, and the key numbers, the requests by API, the verbs,
@@ -351,7 +352,7 @@ const API_COLS: [Col; 7] = [
     },
     Col {
         heading: "col.total_p50_p99",
-        width: 132.0,
+        width: 132.0 + kit::CELL_BAR_W,
         numeric: true,
     },
     Col {
@@ -400,10 +401,12 @@ fn write_line(w: &crate::report::view::WritePathView) -> String {
         }
         parts.push(s);
     }
-    parts.push(match w.part_mean_bytes {
-        Some(m) => fill("write.parts", &[&fmt::count(w.parts_count), &fmt::bytes(m)]),
-        None => tr("write.no_parts").to_owned(),
-    });
+    if let Some(m) = w.part_mean_bytes {
+        parts.push(fill(
+            "write.parts",
+            &[&fmt::count(w.parts_count), &fmt::bytes(m)],
+        ));
+    }
     parts.join(" · ")
 }
 
@@ -419,6 +422,7 @@ fn requests(m: &Rc<ProfileModel>, cx: Ctx) -> Option<View> {
     let writes = m
         .write_path
         .as_ref()
+        .filter(|w| w.shown())
         .map(|w| prop(tr("write.path"), write_line(w)).test_id("write-path"));
     Some(
         section(tr("profile.requests"))
@@ -461,10 +465,12 @@ fn requests(m: &Rc<ProfileModel>, cx: Ctx) -> Option<View> {
                         })
                         .collect();
                     let names: Vec<String> = apis.iter().map(|a| a.api.clone()).collect();
+                    let bars = api_bars(&apis);
                     let table = if m.has_rows() {
-                        kit::pressable_table(
+                        kit::pressable_table_bars(
                             &API_COLS,
                             rows,
+                            bars,
                             "api-row",
                             move || picked.get(),
                             move |i| {
@@ -474,7 +480,7 @@ fn requests(m: &Rc<ProfileModel>, cx: Ctx) -> Option<View> {
                         )
                         .into_element()
                     } else {
-                        kit::table(&API_COLS, rows).into_element()
+                        kit::table_bars(&API_COLS, rows, bars).into_element()
                     };
                     view()
                         .child(table)
@@ -493,6 +499,25 @@ fn requests(m: &Rc<ProfileModel>, cx: Ctx) -> Option<View> {
                 })
             })),
     )
+}
+
+/// Each API's total p50 inside its p99, as a bar scaled to the slowest API's p99: the slow API
+/// stands out without reading numbers.
+fn api_bars(apis: &[crate::report::view::ApiRow]) -> Vec<Vec<Option<kit::CellBar>>> {
+    let top = apis.iter().map(|a| a.total_p99_ms).fold(0.0, f64::max);
+    apis.iter()
+        .map(|a| {
+            let mut row = vec![None; API_COLS.len()];
+            if top > 0.0 {
+                row[4] = Some(kit::CellBar {
+                    inner: a.total_p50_ms / top,
+                    outer: a.total_p99_ms / top,
+                    tok: "stage-server",
+                });
+            }
+            row
+        })
+        .collect()
 }
 
 /// An API's slowest requests; clicking one shows its operation's waterfall.
@@ -689,14 +714,17 @@ fn details(m: &ProfileModel) -> View {
                     fmt::bytes(b.backend_up_bytes)
                 ),
             ))
-            .child(prop(
-                tr("bytes.wire"),
-                format!(
-                    "{} / {}",
-                    fmt::bytes(b.wire_rx_bytes),
-                    fmt::bytes(b.wire_tx_bytes)
-                ),
-            ))
+            .child((b.wire_rx_bytes + b.wire_tx_bytes > 0).then(|| {
+                prop(
+                    tr("bytes.wire"),
+                    format!(
+                        "{} / {}",
+                        fmt::bytes(b.wire_rx_bytes),
+                        fmt::bytes(b.wire_tx_bytes)
+                    ),
+                )
+                .test_id("bytes-wire")
+            }))
             .child(
                 (b.cache_hit_bytes > 0)
                     .then(|| prop(tr("bytes.cache"), fmt::bytes(b.cache_hit_bytes))),
@@ -715,7 +743,10 @@ fn details(m: &ProfileModel) -> View {
             )),
     );
     let slices = |title: &'static str, id: &'static str, xs: &[crate::report::view::Slice]| {
-        let cols = [
+        // Columns no slice fills (a hot key's errors and p99) are left out.
+        let (has_thr, has_err, has_p99) = crate::report::view::SpreadView::columns(xs);
+        let throttle_share = xs.iter().any(|x| x.throttle_share_ratio.is_some());
+        let mut cols = vec![
             Col {
                 heading: "col.key",
                 width: 0.0,
@@ -728,52 +759,86 @@ fn details(m: &ProfileModel) -> View {
             },
             Col {
                 heading: "col.share",
-                width: 64.0,
+                width: 64.0 + kit::CELL_BAR_W,
                 numeric: true,
             },
-            Col {
+        ];
+        if has_thr {
+            cols.push(Col {
                 // Hot keys carry their share of all throttling; the other slices the share of
                 // their own requests throttled.
-                heading: if xs.iter().any(|x| x.throttle_share_ratio.is_some()) {
+                heading: if throttle_share {
                     "col.throttle_share"
                 } else {
                     "col.throttled"
                 },
-                width: 120.0,
+                width: 120.0 + kit::CELL_BAR_W,
                 numeric: true,
-            },
-            Col {
+            });
+        }
+        if has_err {
+            cols.push(Col {
                 heading: "col.errors",
                 width: 72.0,
                 numeric: true,
-            },
-            Col {
+            });
+        }
+        if has_p99 {
+            cols.push(Col {
                 heading: "col.p99",
                 width: 72.0,
                 numeric: true,
-            },
-        ];
+            });
+        }
+        let dash = || "—".to_owned();
         let rows = xs
             .iter()
             .map(|x| {
-                vec![
-                    x.key.clone(),
+                let mut r = vec![
+                    slice_label(x),
                     fmt::count(x.requests_count),
                     fmt::ratio(x.share_ratio),
-                    x.throttled_ratio
-                        .or(x.throttle_share_ratio)
-                        .map(fmt::ratio)
-                        .unwrap_or_else(|| "—".into()),
-                    x.error_ratio.map(fmt::ratio).unwrap_or_else(|| "—".into()),
-                    x.p99_ms.map(fmt::dur_ms).unwrap_or_else(|| "—".into()),
-                ]
+                ];
+                if has_thr {
+                    r.push(
+                        x.throttled_ratio
+                            .or(x.throttle_share_ratio)
+                            .map(fmt::ratio)
+                            .unwrap_or_else(dash),
+                    );
+                }
+                if has_err {
+                    r.push(x.error_ratio.map(fmt::ratio).unwrap_or_else(dash));
+                }
+                if has_p99 {
+                    r.push(x.p99_ms.map(fmt::dur_ms).unwrap_or_else(dash));
+                }
+                r
+            })
+            .collect();
+        let bars = xs
+            .iter()
+            .map(|x| {
+                let mut b = vec![
+                    None,
+                    None,
+                    Some(kit::CellBar::share(x.share_ratio, "series-a")),
+                ];
+                if has_thr {
+                    b.push(
+                        x.throttled_ratio
+                            .or(x.throttle_share_ratio)
+                            .map(|r| kit::CellBar::share(r, "warn")),
+                    );
+                }
+                b
             })
             .collect();
         view()
             .gap_1()
             .test_id(id)
             .child(caption(tr(title)))
-            .child(kit::table(&cols, rows))
+            .child(kit::table_bars(&cols, rows, bars))
     };
     let sp = &m.spread;
     for (title, id, xs) in [
@@ -788,6 +853,15 @@ fn details(m: &ProfileModel) -> View {
         }
     }
     v
+}
+
+/// A traffic slice's key for people: the view model's label (size buckets as ranges), first
+/// read / re-read in the app's language.
+fn slice_label(x: &crate::report::view::Slice) -> String {
+    tr_dyn(&format!("slice.{}", x.key))
+        .filter(|_| matches!(x.key.as_str(), "cold" | "warm"))
+        .map(str::to_owned)
+        .unwrap_or_else(|| x.label.clone())
 }
 
 /// How the run was set up, and the command that runs it again.
@@ -838,6 +912,7 @@ fn setup(m: &ProfileModel) -> View {
         .child(
             m.write_path
                 .as_ref()
+                .filter(|w| w.shown())
                 .map(|w| prop(tr("write.path"), write_line(w))),
         )
         .child(prop(tr("setup.seed"), st.seed.to_string()))
@@ -1097,7 +1172,11 @@ fn finding(s: Store, m: &ProfileModel, f: FindingRow) -> View {
         )
         .child(body(f.cause.clone()).selectable(true))
         .child(small(f.evidence.clone()).selectable(true))
-        .children(f.items.iter().map(|(k, v)| prop(k.clone(), v.clone())))
+        .children(
+            f.items
+                .iter()
+                .map(|i| prop(evidence_label(i), evidence_value(i))),
+        )
         .child(evidence(m, &f))
         .child(examples(m, &f))
         .child(if remedy.is_empty() {
@@ -1123,6 +1202,32 @@ fn finding(s: Store, m: &ProfileModel, f: FindingRow) -> View {
                     .accessibility_label(fill("profile.try_remedy_of", &[&f.code])),
                 )
         })
+}
+
+/// An evidence value's label in the app's language (core's label when the catalog has none).
+pub fn evidence_label(i: &crate::report::view::EvidenceItem) -> String {
+    tr_dyn(&format!("ev.{}", i.key))
+        .map(str::to_owned)
+        .unwrap_or_else(|| i.label.clone())
+}
+
+/// An evidence value in the tiles' format (`9.67 ms`, `2.60 %`, `3.20×`).
+pub fn evidence_value(i: &crate::report::view::EvidenceItem) -> String {
+    use crate::report::view::EvidenceUnit as U;
+    let a = i.amount;
+    match i.unit {
+        U::Ms => fmt::dur_ms(a),
+        U::Seconds => fmt::dur_ms(a * 1000.0),
+        U::Share => fmt::ratio(a),
+        U::Times => format!("{}×", fmt::sig3(a)),
+        U::Bytes => fmt::bytes(a.max(0.0) as u64),
+        U::BytesPerS => format!("{}/s", fmt::bytes(a.max(0.0) as u64)),
+        U::MibPerS => format!("{} MiB/s", fmt::sig3(a)),
+        U::RequestsPerS | U::OpsPerS => format!("{}/s", fmt::compact(a)),
+        U::Count if a.fract() == 0.0 && a >= 0.0 => fmt::count(a as u64),
+        U::Usd => format!("${a:.2}"),
+        U::Count | U::Number => fmt::sig3(a),
+    }
 }
 
 /// "Show N examples": the waterfalls of the operations behind a finding, on demand.
@@ -1191,8 +1296,9 @@ fn slowest_section(m: &ProfileModel, cx: Ctx) -> View {
     }))
 }
 
-/// The timeline: a verb filter, then goodput, latency, requests and in-flight on one time
-/// axis, sharing the crosshair and the selected range.
+/// The timeline: a verb filter, then goodput, latency, throughput, requests, the problems per
+/// second (when any) and in-flight on one time axis, sharing the crosshair and the selected
+/// range.
 fn timeline(m: &Rc<ProfileModel>, cx: Ctx) -> View {
     if m.timeline.is_empty() {
         return view();
@@ -1271,6 +1377,15 @@ fn timeline_charts(m: &ProfileModel, i: usize, cx: Ctx) -> View {
                 "chart-latency",
             )
         }))
+        .child(plots::throughput(all).map(|p| {
+            linked_chart(
+                every("timeline.throughput"),
+                90.0,
+                move || Some(p.clone()),
+                link,
+                "chart-throughput",
+            )
+        }))
         .child(plots::requests(all).map(|p| {
             linked_chart(
                 every("timeline.requests"),
@@ -1278,6 +1393,15 @@ fn timeline_charts(m: &ProfileModel, i: usize, cx: Ctx) -> View {
                 move || Some(p.clone()),
                 link,
                 "chart-requests",
+            )
+        }))
+        .child(plots::problems(all).map(|p| {
+            linked_chart(
+                every("timeline.problems"),
+                70.0,
+                move || Some(p.clone()),
+                link,
+                "chart-problems",
             )
         }))
         .child(plots::inflight(all).map(|p| {
@@ -1305,31 +1429,42 @@ fn distribution(m: &Rc<ProfileModel>, cx: Ctx) -> View {
                 .and_then(|i| m.timeline_verbs.get(i))
                 .cloned();
             let (cdf, marks) = match (&r, &verb) {
-                (Some(r), _) => (r.view.cdf.clone(), (r.view.p50_ms, r.view.p99_ms)),
+                (Some(r), _) => (
+                    r.view.cdf.clone(),
+                    plots::Marks {
+                        p50_ms: r.view.p50_ms,
+                        p99_ms: r.view.p99_ms,
+                        p999_ms: r.view.p999_ms,
+                    },
+                ),
                 (None, Some(v)) => {
                     let c = m.cdf_for(Some(v));
-                    let marks = (
-                        c.quantile(0.5).unwrap_or(0.0),
-                        c.quantile(0.99).unwrap_or(0.0),
-                    );
+                    let marks = plots::Marks::of(&c);
                     (c, marks)
                 }
-                (None, None) => (m.cdf.clone(), (m.p50_ms, m.p99_ms)),
+                (None, None) => (
+                    m.cdf.clone(),
+                    plots::Marks {
+                        p50_ms: m.p50_ms,
+                        p99_ms: m.p99_ms,
+                        p999_ms: m.p999_ms,
+                    },
+                ),
             };
-            let Some(p) = plots::cdf(&[(tr("plot.ops").to_owned(), &cdf)], Some(marks)) else {
+            let Some(p) = plots::tail(&[(tr("plot.ops").to_owned(), &cdf)], Some(marks)) else {
                 return view().into_element();
             };
             let mut heading = if cdf.exact {
-                tr("plot.cdf").to_owned()
+                tr("plot.tail").to_owned()
             } else {
-                tr("plot.cdf_buckets").to_owned()
+                tr("plot.tail_buckets").to_owned()
             };
             if let (None, Some(v)) = (&r, &verb) {
                 heading = format!("{heading} · {v}");
             }
             section(tr("profile.distribution"))
                 .test_id("distribution")
-                .child(chart(heading, 130.0, move || Some(p.clone())))
+                .child(chart(heading, 150.0, move || Some(p.clone())))
                 .into_element()
         })
     }))
@@ -1662,7 +1797,23 @@ fn conns(m: &ProfileModel) -> View {
     let p50_p99 = |a: f64, b: f64| format!("p50 {} · p99 {}", fmt::dur_ms(a), fmt::dur_ms(b));
     section(tr("profile.connections"))
         .test_id("connections")
-        .child(prop(tr("conn.dialed"), fmt::count(c.dialed_count)))
+        .child(
+            prop(
+                tr("conn.dialed"),
+                if c.warmup_dialed_count > 0 {
+                    fill(
+                        "conn.dialed_of",
+                        &[
+                            &fmt::count(c.warmup_dialed_count),
+                            &fmt::count(c.dialed_count),
+                        ],
+                    )
+                } else {
+                    fill("conn.dialed_window", &[&fmt::count(c.dialed_count)])
+                },
+            )
+            .test_id("conn-dialed"),
+        )
         .child(
             (c.dial_failures_count > 0)
                 .then(|| prop(tr("conn.dial_failures"), fmt::count(c.dial_failures_count))),
@@ -1670,10 +1821,15 @@ fn conns(m: &ProfileModel) -> View {
         .child(prop(tr("conn.reuse"), fmt::ratio(c.reuse_ratio)))
         .child(prop(
             tr("conn.protocols"),
-            format!(
-                "HTTP/1.1 {} · HTTP/2 {}",
-                c.http1_requests_count, c.http2_requests_count
-            ),
+            [
+                ("HTTP/1.1", c.http1_requests_count),
+                ("HTTP/2", c.http2_requests_count),
+            ]
+            .iter()
+            .filter(|(_, n)| *n > 0)
+            .map(|(p, n)| format!("{p} {}", fmt::count(*n)))
+            .collect::<Vec<_>>()
+            .join(" · "),
         ))
         .child((!c.tls.is_empty()).then(|| prop("TLS", c.tls.clone())))
         .child(c.proxy.clone().map(|p| prop(tr("conn.proxy"), p)))
@@ -1692,6 +1848,9 @@ fn conns(m: &ProfileModel) -> View {
             view()
                 .gap_1()
                 .test_id("conn-tcp")
+                .child(t.min_rtt_p50_us.map(|us| {
+                    prop(tr("conn.min_rtt"), fmt::dur_us(us as f64)).test_id("conn-min-rtt")
+                }))
                 .child(prop(
                     tr("conn.rtt"),
                     format!(
@@ -1700,6 +1859,13 @@ fn conns(m: &ProfileModel) -> View {
                         fmt::dur_us(t.rtt_p99_us as f64)
                     ),
                 ))
+                // The smoothed round trip of a fast network is mostly the server's delay and
+                // delayed acknowledgements: say so rather than let it read as the network.
+                .child(
+                    t.min_rtt_p50_us
+                        .filter(|m| t.rtt_p50_us > m.saturating_mul(4) && t.rtt_p50_us > 1000)
+                        .map(|_| small(tr("conn.rtt_inflated")).test_id("conn-rtt-note")),
+                )
                 .child(prop(
                     tr("conn.retransmitting"),
                     fill(
@@ -1747,7 +1913,6 @@ fn conns(m: &ProfileModel) -> View {
                 fill(
                     "conn.cold_start_of",
                     &[
-                        &fmt::count(s.connections_count),
                         &p50_p99(s.connect_p50_ms, s.connect_p99_ms),
                         &p50_p99(s.first_ops_p50_ms, s.first_ops_p99_ms),
                     ],

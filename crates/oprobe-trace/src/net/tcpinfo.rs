@@ -49,6 +49,9 @@ pub struct TcpProbe {
     pub id: SockId,
     /// `total_retrans` at the previous sample (`u64::MAX`: none yet).
     last_retrans: AtomicU64,
+    /// Bytes received and acknowledged at the previous sample (wire bytes since then).
+    last_rx: AtomicU64,
+    last_tx: AtomicU64,
 }
 
 impl TcpProbe {
@@ -56,6 +59,8 @@ impl TcpProbe {
         Self {
             id,
             last_retrans: AtomicU64::new(u64::MAX),
+            last_rx: AtomicU64::new(0),
+            last_tx: AtomicU64::new(0),
         }
     }
 
@@ -72,6 +77,18 @@ impl TcpProbe {
         let prev = self.last_retrans.swap(row.retrans, Ordering::AcqRel);
         let delta = (prev != u64::MAX).then(|| row.retrans.saturating_sub(prev));
         Some((row, delta))
+    }
+
+    /// The bytes received and sent (acknowledged) on the wire since the previous call, from
+    /// `row` (the first call counts from the connection's start: its handshakes included).
+    /// Concurrent requests on one connection each get a disjoint share.
+    pub fn wire_since_last(&self, row: &TcpRow) -> (u64, u64) {
+        let rx = self.last_rx.fetch_max(row.bytes_received, Ordering::AcqRel);
+        let tx = self.last_tx.fetch_max(row.bytes_acked, Ordering::AcqRel);
+        (
+            row.bytes_received.saturating_sub(rx),
+            row.bytes_acked.saturating_sub(tx),
+        )
     }
 
     /// Raw statistics without touching the retransmit baseline (upload-acknowledgement polls).
@@ -306,6 +323,7 @@ mod imp {
             lost_count: i.lost as u64,
             bytes_acked: i.bytes_acked,
             pacing_rate_bps: i.pacing_rate.saturating_mul(8),
+            bytes_received: i.bytes_received,
         })
     }
 
@@ -357,6 +375,8 @@ mod imp {
             // Bytes → segments.
             cwnd: (i.snd_cwnd / i.maxseg.max(1)) as u64,
             delivery_rate_bps: 0,
+            bytes_acked: i.txbytes,
+            bytes_received: i.rxbytes,
             ..Default::default()
         })
     }

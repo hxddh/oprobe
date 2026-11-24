@@ -66,7 +66,9 @@ pub struct FindingRow {
     pub cause: String,
     pub evidence: String,
     pub advice: String,
-    pub items: Vec<(String, String)>,
+    /// The named evidence values: key, core's label, the number and its unit (the view
+    /// labels them in its language and formats them like the tiles).
+    pub items: Vec<view::EvidenceItem>,
     /// The chart that shows its evidence.
     pub chart: Option<view::EvidenceChart>,
     /// The remedy as operator paths with the value to try (empty value: the path alone).
@@ -171,6 +173,8 @@ pub struct ProfileModel {
     pub requests_count: u64,
     pub error_ratio: f64,
     pub throttled_ratio: f64,
+    /// Throttled responses (429/503), retries included.
+    pub throttled_count: u64,
     pub stages: Vec<StageBar>,
     pub findings: Vec<FindingRow>,
     pub slowest: Vec<Waterfall>,
@@ -343,6 +347,7 @@ fn of_rows(rows: Arc<Run>) -> ProfileModel {
         requests_count: n.requests_count,
         error_ratio: n.error_ratio,
         throttled_ratio: n.throttled_request_ratio,
+        throttled_count: n.throttled_requests_count,
         stages: time
             .stages
             .into_iter()
@@ -383,7 +388,7 @@ fn findings(r: &Report) -> Vec<FindingRow> {
                 cause: f.cause,
                 evidence: f.evidence,
                 advice: f.remedy,
-                items: f.items.into_iter().map(|i| (i.label, i.value)).collect(),
+                items: f.items,
                 chart: view::EvidenceChart::of(&f.code),
                 remedy: src.map(remedy).unwrap_or_default(),
                 op_ids: f.op_ids,
@@ -759,11 +764,25 @@ pub fn compare_rows(ps: &[ProfileModel]) -> Vec<MetricRow> {
     vec![
         row("goodput", true, |p| p.good_ops_per_s),
         row("bandwidth", true, |p| p.mib_per_s),
+        row("requests_per_s", true, |p| {
+            crate::util::ratio(p.requests_count as f64, p.window_s)
+        }),
         row("p50", false, |p| p.p50_ms),
         row("p99", false, |p| p.p99_ms),
+        row("p999", false, |p| p.p999_ms),
         row("errors", false, |p| p.error_ratio),
+        row("failed", false, |p| p.retry.failed_ops_count as f64),
+        row("retries", false, |p| p.retry.retries_count as f64),
+        row("throttled_count", false, |p| p.throttled_count as f64),
         row("throttled", false, |p| p.throttled_ratio),
     ]
+}
+
+/// Each backend API across the compared runs: requests and TTFB p99 per run (core's
+/// [`view::CompareView`]).
+pub fn compare_apis(ps: &[ProfileModel]) -> Vec<view::CompareApi> {
+    let reports: Vec<&Report> = ps.iter().map(|p| &p.rows.0.report).collect();
+    view::CompareView::of(&reports).apis
 }
 
 /// The runs as the sidebar lists them: grouped under their operator, the group of the newest

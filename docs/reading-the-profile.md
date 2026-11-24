@@ -56,15 +56,16 @@ the configuration and the five slowest operations):
 | where the time goes | each operation's wall time split into stages (below) |
 | operations | per workload verb: count, ops/s, p50, p99, max, requests per operation, errors (`--detail`: MiB/s, retries, throttled share) |
 | backend requests | per storage API (`GetObject`, `PutObject`, …): count, share on warm connections, TTFB and total p50/p99, bytes down/up, status codes (`--detail`: every stage's p50/p99); and, for a run that wrote, a **writes** line: the multipart part size OpenDAL used (and the requested `write.chunk` and the service's part-size limits when it was clamped) and the parts uploaded with their mean size — the knobs `prove` sizes for `slow_multipart` |
-| connections | HTTP version, TLS, new connections, reuse, peak in-flight requests, dial time per phase (proxy CONNECT included), and a **tcp** line from the kernel: rtt p50/p99, connections that retransmitted, the share of sending time limited by the peer's receive window or the local send buffer, the delivery rate. High rtt or retransmits point at the network; a clean network with a high TTFB points at the server. `--detail` adds the TLS handshakes (resumed share, HelloRetryRequests) and the cold start (dials and first operations before the warm-up absorbed them) |
-| bytes | logical vs backend bytes, read amplification, over-read, requests per operation, cache hits |
+| connections | HTTP version, TLS, the connections dialed during the warm-up and in the window, reuse, peak in-flight requests, dial time per phase (proxy CONNECT included), and a **tcp** line from the kernel: the minimum rtt (the network's own round trip) and the smoothed rtt p50/p99 (which on a fast network includes the server's delay and delayed acknowledgements), connections that retransmitted, the share of sending time limited by the peer's receive window or the local send buffer, the delivery rate. High rtt or retransmits point at the network; a clean network with a high TTFB points at the server. `--detail` adds the TLS handshakes (resumed share, HelloRetryRequests) and the cold start (dials and first operations before the warm-up absorbed them) |
+| bytes | logical vs backend bytes, read amplification, over-read, requests per operation, cache hits, and the bytes on the wire (from the kernel's per-connection counters, when they were read) |
 | slowest operation | the worst operation request by request (a waterfall), with what each request recorded beyond its stages (below) and, with `--detail`, its async call stack |
 | self | the profiler's own health: scheduling lag, CPU, whether the client was saturated |
 | cleanup | test data removed (verified), or what is left |
 
 `--detail` also adds, per interval of the timeline, retries, new connections and the client's
-CPU (percent of one core), and the cold and warm reads (first read of a key, repeat reads) to
-SPREAD.
+CPU (percent of one core), and the first read and re-reads of a key to SPREAD (object sizes as
+ranges; a column no row has, such as a hot key's errors, is left out). The timeline ends with
+the measured window: what draining operations did after it counts in its last interval.
 
 `--by stage` sums the requests' time per stage, `--by api` per storage API, `--by conn` per
 connection (cold and warm, per remote address). `--by stage` also gives each stage's p50/p99
@@ -126,8 +127,9 @@ Each operation's wall time is split exactly; an instant counts once even when re
   requests.
 - **Percentiles** are exact when every operation was kept, otherwise from histograms with three
   significant digits. Counts always agree with the totals. The report keeps the run's whole
-  latency distribution (`latency_histogram`, 20 bins per decade), and the latency CDF is drawn
-  from it whenever the trace rows are sampled.
+  latency distribution (`latency_histogram`, 20 bins per decade), and the latency distribution
+  (in the app a tail plot: the share of operations slower than each latency, on log axes) is
+  drawn from it whenever the trace rows are sampled.
 - **The timeline** has one row per interval (1 s for the first ten minutes, then 10 s).
   Operations, goodput (`goodput_ops_per_s`: successes only; `ops_per_s` counts every attempt)
   and the latency quantiles belong to the interval an operation *started* in; requests
