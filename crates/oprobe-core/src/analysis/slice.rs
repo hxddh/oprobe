@@ -52,17 +52,23 @@ impl By {
     fn key(self, r: &ReqRow) -> String {
         match self {
             Self::Api => r.api.to_string(),
+            // A request that never got a connection (reset, refused) has none to group by.
+            Self::Conn if r.conn_id == 0 => NO_CONNECTION.into(),
             Self::Conn => r.conn_id.to_string(),
             Self::Remote => r
                 .remote
                 .map(|a| a.ip().to_string())
-                .unwrap_or_else(|| "-".into()),
+                .unwrap_or_else(|| NO_CONNECTION.into()),
             Self::Stage => dominant_stage(r).to_owned(),
             Self::Second => (r.t_us.div_euclid(1_000_000)).to_string(),
             Self::Status => r.status.to_string(),
         }
     }
 }
+
+/// The group of the requests that had no connection (reset or refused before one was
+/// reported): `--by conn` and the remotes table count them under this row.
+pub const NO_CONNECTION: &str = "no connection";
 
 /// Request filters: `--window A..B` and `--where k=v,…`.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]

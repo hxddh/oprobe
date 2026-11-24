@@ -113,7 +113,7 @@ operators renders as Rust and as TOML. [The reference →](docs/operator.md)
 | `throttling` | 429/503 above an in-flight level | `layers.concurrent_limit.http`, plus `layers.retry.jitter` |
 | `rate_limit` | a request-rate ceiling | `layers.concurrent_limit.http` |
 | `key_limit` | a hot prefix or key | the key layout (advice, not a layer) |
-| `bandwidth_cap` | a bytes-per-second ceiling | `layers.throttle.bandwidth` |
+| `bandwidth_cap` | a bytes-per-second ceiling | `layers.throttle.bandwidth` on writes; on reads not a layer |
 | `tail_stragglers` | a few very slow server responses | `layers.tail_cut` |
 | `hung_requests` | requests that never finish | `layers.timeout.io` |
 | `small_ranges` | many small range reads | `read.gap` / `read.concurrent` |
@@ -121,6 +121,8 @@ operators renders as Rust and as TOML. [The reference →](docs/operator.md)
 | `repeated_reads` | the same bytes read again and again | `layers.cache` (`FoyerLayer`) |
 | `cold_connections` | handshakes on the critical path, HTTP version | `http.keep_alive` / `http.version` |
 | `client_bound` | your process is the bottleneck | none in storage; reported as such |
+| `errors` | 5xx or lost connections that retries recovered | `layers.retry.min_delay`, plus `layers.retry.jitter` |
+| `errors` | failures that reached the application | none: fix their cause (`show RUN --by api`) |
 
 `run` names the remedy; only `prove` puts a number on it.
 

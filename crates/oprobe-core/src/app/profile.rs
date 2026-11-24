@@ -56,7 +56,7 @@ pub fn apply_workload(p: &mut Profile, w: &WorkloadInput) -> Result<()> {
         wl.dataset = None;
     }
     if let Some(d) = &w.duration {
-        wl.duration = HumanDuration(crate::input::duration(d)?);
+        wl.duration = HumanDuration(crate::input::positive_duration(d)?);
     }
     if let Some(d) = &w.warmup {
         wl.warmup = HumanDuration(crate::input::duration(d)?);

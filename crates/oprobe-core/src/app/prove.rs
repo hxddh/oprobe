@@ -44,6 +44,9 @@ const MIN_EFFECT: f64 = 0.03;
 /// the pairs cannot be estimated (`--pairs` is raised to this, and a budget that allows
 /// fewer gives `inconclusive`).
 pub const MIN_DECISIVE_PAIRS: usize = 3;
+/// The first retry backoffs prove searches for transient failures (ms): from a short 20 ms up
+/// to half a second.
+const RETRY_MIN_DELAY_MS: (u64, u64) = (20, 500);
 /// OpenDAL's TailCutLayer ignores its first 10 s: trials of a tail-cut change warm up longer.
 const TAIL_CUT_WARMUP: Duration = Duration::from_millis(11_500);
 
@@ -441,6 +444,10 @@ pub struct ProofEstimate {
     /// The wall-time budget, when one is set (`--max-duration`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget_s: Option<f64>,
+    /// Trials the proof would run without the budget, when the budget leaves some out (the
+    /// counts above are those that fit in it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unbudgeted_trials_max_count: Option<u64>,
 }
 
 /// `42s`, `1m 30s`.
@@ -469,24 +476,40 @@ impl ProofEstimate {
         budget: Option<Duration>,
     ) -> Self {
         let pair_s = a_eta_s + b_eta_s;
-        let min = sizing.1 as f64 * b_eta_s + pairs.0 as f64 * pair_s;
-        let mut max = sizing.0 as f64 * b_eta_s + pairs.1 as f64 * pair_s;
         let budget_s = budget.map(|b| b.as_secs_f64());
+        let unbudgeted = sizing.0 + 2 * pairs.1;
+        // Plan only the trials that fit in the budget (K19): the sizing trials run first, the
+        // A/B pairs in what is left; no trial starts that would not end in it.
+        let fit = |s: u64, p: u64| -> (u64, u64) {
+            let Some(b) = budget_s else {
+                return (s, p);
+            };
+            let s = s.min((b / b_eta_s.max(1e-3)).floor() as u64);
+            let left = (b - s as f64 * b_eta_s).max(0.0);
+            (s, p.min((left / pair_s.max(1e-3)).floor() as u64))
+        };
+        let (s_min, p_min) = fit(sizing.1, pairs.0);
+        let (s_max, p_max) = fit(sizing.0, pairs.1);
+        let min = s_min as f64 * b_eta_s + p_min as f64 * pair_s;
+        let mut max = sizing.0 as f64 * b_eta_s + pairs.1 as f64 * pair_s;
         if let Some(b) = budget_s {
             max = max.min(b);
         }
+        let trials_min = s_min + 2 * p_min;
+        let trials_max = (s_max + 2 * p_max).max(trials_min);
         Self {
             command,
             change,
-            sizing_trials_max_count: sizing.0,
-            pairs_min_count: pairs.0,
-            pairs_max_count: pairs.1,
-            trials_min_count: sizing.1 + 2 * pairs.0,
-            trials_max_count: sizing.0 + 2 * pairs.1,
+            sizing_trials_max_count: s_max,
+            pairs_min_count: p_min.min(p_max),
+            pairs_max_count: p_max.max(p_min),
+            trials_min_count: trials_min,
+            trials_max_count: trials_max,
             trial_eta_s: a_eta_s,
             eta_min_s: min.min(max),
             eta_max_s: max,
             budget_s,
+            unbudgeted_trials_max_count: (trials_max < unbudgeted).then_some(unbudgeted),
         }
     }
 
@@ -520,7 +543,19 @@ impl ProofEstimate {
             Some(b) => format!(" (budget {})", fmt_secs(b)),
             None => String::new(),
         };
-        format!("{trials} ({sizing}{pairs} of A and B) · ETA {eta}{budget}")
+        let cut = match self.unbudgeted_trials_max_count {
+            Some(all) => {
+                let mut c = format!("; the budget fits {} of {all}", self.trials_max_count);
+                if (self.pairs_max_count as usize) < MIN_DECISIVE_PAIRS {
+                    c += &format!(
+                        ", too few pairs to decide (at least {MIN_DECISIVE_PAIRS}): raise --max-duration"
+                    );
+                }
+                c
+            }
+            None => String::new(),
+        };
+        format!("{trials} ({sizing}{pairs} of A and B{cut}) · ETA {eta}{budget}")
     }
 
     /// The proof's plan as text (`prove --dry-run`).
@@ -843,6 +878,28 @@ fn remedy_change(run: &Run, f: &Finding) -> Result<Change> {
             Some("http.keep_alive") => c.fixed.push(("http.keep_alive".into(), "on".into())),
             _ => c.fixed.push(("http.version".into(), "h2".into())),
         },
+        // Transient failures that retries recovered (K1): their cost is the retry backoff
+        // (OpenDAL waits 1 s first). Size the first backoff from short to long, with jitter:
+        // the search climbs only while a longer backoff does better (a service that needs
+        // room to recover), and the knee is the shortest as good as the best.
+        "errors" if f.remedy.path.as_deref() == Some("layers.retry.min_delay") => {
+            if !retry_on {
+                c.fixed.push(("layers.retry".into(), "on".into()));
+            }
+            c.fixed.push(("layers.retry.jitter".into(), "on".into()));
+            c.sized = Some(SizedPath {
+                path: "layers.retry.min_delay".into(),
+                domain: Domain::Millis {
+                    min: RETRY_MIN_DELAY_MS.0,
+                    max: RETRY_MIN_DELAY_MS.1,
+                },
+                start: RETRY_MIN_DELAY_MS.0,
+                start_why: "a short first backoff: the failures do not follow the load".into(),
+                follow: no_follow,
+                unmeasured: None,
+            });
+        }
+        // A 7.0 run's remedy for retried 5xx.
         "errors" if f.remedy.path.as_deref() == Some("layers.retry.jitter") => {
             c.fixed.push(("layers.retry.jitter".into(), "on".into()));
         }
@@ -1464,17 +1521,16 @@ fn proof_budget(req: &ProveRequest) -> Result<Option<Duration>> {
 /// The hint of a refusal to prove a production trace: the run to make instead, on the service
 /// the trace recorded (`oprobe run s3://bucket/root`), when the file names it.
 fn trace_hint(r: &crate::model::Report) -> String {
-    let url = &r.spec.operator_ref;
-    if url.is_empty() || url.starts_with("unknown://") {
-        return "prove needs a run oprobe drove: profile the operator with `oprobe run URL`, \
-                then prove that run"
-            .to_owned();
+    match crate::model::trace_file::run_command(r) {
+        // With its endpoint when the trace's requests went to a custom one (K8).
+        Some(cmd) => format!(
+            "prove needs a run oprobe drove: profile the same service with `{cmd}`, then \
+             prove that run"
+        ),
+        None => "prove needs a run oprobe drove: profile the operator with `oprobe run URL`, \
+                 then prove that run"
+            .to_owned(),
     }
-    format!(
-        "prove needs a run oprobe drove: profile the same service with `oprobe run {}`, then \
-         prove that run",
-        crate::model::spec::shell_quote(url)
-    )
 }
 
 /// `oprobe prove`.
@@ -1531,15 +1587,32 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
     }
     refuse_unjudged(&run)?;
     let defaults = crate::config::defaults().prove;
-    let max_throttle = req
-        .max_throttle_ratio
-        .or(run.report.spec.profile.sla.max_throttle_rate)
-        .unwrap_or(defaults.max_throttle_ratio);
-    let change = choose_change(&run, &req)?;
+    let explicit_throttle =
+        req.max_throttle_ratio
+            .or(run.report.spec.profile.sla.max_throttle_rate);
+    let mut max_throttle = explicit_throttle.unwrap_or(defaults.max_throttle_ratio);
+    let mut change = choose_change(&run, &req)?;
+    // The `errors` remedy is for 503s that follow no load pattern (A5): they are service
+    // errors, not a limit to stay under, and a shorter backoff cannot remove them. Unless
+    // asked for, `--max-throttle` does not judge this change (`lab://noisy`).
+    if explicit_throttle.is_none()
+        && change.finding.as_deref() == Some("errors")
+        && change
+            .sized
+            .as_ref()
+            .is_some_and(|s| s.path == "layers.retry.min_delay")
+        && run.report.resilience.throttled_responses > 0
+    {
+        max_throttle = 1.0;
+        change.notes.push(
+            "the 503s follow neither the load, the rate nor the keys: they are service errors, so --max-throttle does not judge this change"
+                .into(),
+        );
+    }
     // The base profile, with credentials resolved again, on a short trial window.
     let mut base = super::profile::spec_profile(ctx, run.report.spec.clone())?;
     let trial_window = match &req.trial_duration {
-        Some(d) => crate::input::duration(d)?,
+        Some(d) => crate::input::positive_duration(d)?,
         None => defaults.trial_duration.get(),
     }
     .min(base.workload.duration.get().max(Duration::from_millis(500)));
@@ -2008,6 +2081,46 @@ mod tests {
             "{}",
             e.line()
         );
+        // Only the pairs that fit: 5 of 17 s in 90 s (K19: 7.0 planned 6).
+        assert_eq!((e.pairs_min_count, e.pairs_max_count), (3, 5));
+        assert_eq!(e.trials_max_count, 10);
+        assert!(
+            e.line().contains("the budget fits 10 of 12"),
+            "{}",
+            e.line()
+        );
+    }
+
+    /// 7.0.0 planned 6–20 trials under a budget that fits one pair (K19).
+    #[test]
+    fn the_estimate_plans_only_what_fits_in_the_budget() {
+        let e = ProofEstimate::new(
+            "oprobe prove r".into(),
+            vec!["layers.concurrent_limit.http=24".into()],
+            (8, 2),
+            (3, 6),
+            3.0,
+            3.0,
+            Some(Duration::from_secs(12)),
+        );
+        // 2 sizing trials (6 s), then one pair (6 s): 4 trials at most.
+        assert_eq!(e.trials_max_count, 4, "{e:?}");
+        assert_eq!(e.pairs_max_count, 1);
+        assert!(e.eta_max_s <= 12.0);
+        let line = e.line();
+        assert!(line.contains("the budget fits 4 of 20"), "{line}");
+        assert!(line.contains("raise --max-duration"), "{line}");
+        // Without a budget, nothing is cut.
+        let free = ProofEstimate::new(
+            "oprobe prove r".into(),
+            vec![],
+            (8, 2),
+            (3, 6),
+            3.0,
+            3.0,
+            None,
+        );
+        assert_eq!(free.unbudgeted_trials_max_count, None);
     }
 
     #[test]

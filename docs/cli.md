@@ -137,7 +137,9 @@ oprobe prove 20261122-0915 small_ranges --max-duration 10m
 Print a profile: a stored run, or a file (`.oprobe` from `run` or from
 [`oprobe-trace`](embedding.md), or a report `.json`). Without an argument, the last run.
 `-o json` prints the shown run (`schemas/show.json`: the report of `schemas/report.json`, where it is stored, and the `by` and `range` sections when asked for); `--list -o json` the run list
-(`schemas/run-list.json`).
+(`schemas/run-list.json`; `-n` limits the runs and the proves alike). A prove id (`show --list`
+lists them) prints that prove's stored result as `prove` printed it (`schemas/prove.json`), also
+after its run was removed.
 
 A trace from `oprobe-trace` is recognised by its content, whatever its name. Its report has
 `run.source = "trace"` and shows `production trace` where a run shows its workload. Its

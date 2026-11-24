@@ -204,9 +204,16 @@ fn request_p99(reqs: &[ReqRow]) -> RequestStagesP99 {
 }
 
 fn remotes(reqs: &[ReqRow]) -> Vec<RemoteStats> {
-    let mut by: HashMap<std::net::SocketAddr, (u64, u64, u64, Vec<u64>)> = HashMap::new();
+    // `None`: network requests that failed with no connection (a reset, a refused dial), kept
+    // in their own row so the table counts every request.
+    let mut by: HashMap<Option<std::net::SocketAddr>, (u64, u64, u64, Vec<u64>)> = HashMap::new();
     for r in reqs {
-        if let Some(a) = r.remote {
+        let key = match r.remote {
+            Some(a) => Some(Some(a)),
+            None if r.status == 0 && r.protocol != crate::model::WireProtocol::Inproc => Some(None),
+            None => None,
+        };
+        if let Some(a) = key {
             let e = by.entry(a).or_default();
             e.0 += 1;
             if r.is_error() && r.status != 404 {
@@ -219,7 +226,10 @@ fn remotes(reqs: &[ReqRow]) -> Vec<RemoteStats> {
     let mut out: Vec<RemoteStats> = by
         .into_iter()
         .map(|(a, (n, err, down, mut lat))| RemoteStats {
-            remote: a.to_string(),
+            remote: a.map_or_else(
+                || crate::analysis::slice::NO_CONNECTION.to_owned(),
+                |a| a.to_string(),
+            ),
             requests_count: n,
             errors_count: err,
             bytes_down: down,

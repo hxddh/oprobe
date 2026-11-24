@@ -252,6 +252,12 @@
       },
       "type": "array"
     },
+    "proves_total_count": {
+      "description": "Proves stored in total before `-n` (the list may be limited).",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
     "runs": {
       "items": {
         "$ref": "#/$defs/RunSummary"
@@ -277,6 +283,7 @@
     "total_count",
     "hidden_trials_count",
     "proves",
+    "proves_total_count",
     "next",
     "warnings"
   ],

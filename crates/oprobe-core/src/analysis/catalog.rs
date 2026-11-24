@@ -69,7 +69,7 @@ const ENTRIES: &[Entry] = &[
         code: "bandwidth_cap",
         title: "Every stream shares one bandwidth cap",
         severity: Severity::Warning,
-        meaning: "The aggregate throughput is flat while a stream's rate falls as more streams run beside it: a shared cap (a NIC, proxy, endpoint or bucket limit).",
+        meaning: "The aggregate throughput is flat while a stream's rate falls as more streams run beside it: a shared cap (a NIC, proxy, endpoint or bucket limit). OpenDAL's ThrottleLayer shapes writes only: the remedy is `layers.throttle.bandwidth` (sized by prove) where the workload writes; on reads the cap is not a layer.",
         causes: &[
             "a network link, NAT gateway or proxy at its capacity",
             "a provider's per-bucket or per-connection bandwidth limit",
@@ -134,9 +134,10 @@ const ENTRIES: &[Entry] = &[
         code: "client_bound",
         title: "The client, not the service, sets the pace",
         severity: Severity::Warning,
-        meaning: "The load generator's CPU or its scheduler is saturated (scheduling lag), or an open-loop schedule fell behind: its latency and throughput understate the service, and latency findings are dropped.",
+        meaning: "The load generator's CPU or its scheduler is saturated (scheduling lag), or an open-loop schedule fell behind: its latency and throughput understate the service, and latency findings are dropped. When the arrivals queue behind the workers while the CPU has room, the workers (`-c`) are the bound, not the CPU.",
         causes: &[
             "too few cores for the concurrency",
+            "an open-loop `--rate` above what the workers (`-c`) carry",
             "per-operation client work (checksums, decoding)",
         ],
     },
@@ -144,7 +145,7 @@ const ENTRIES: &[Entry] = &[
         code: "errors",
         title: "Requests or operations failed",
         severity: Severity::Warning,
-        meaning: "Operations failed for reasons other than throttling, or the service answered 5xx (including 503s that follow no load pattern) that retries absorbed.",
+        meaning: "Operations failed for reasons other than throttling, or requests failed with a 5xx (including 503s that follow no load pattern) or a lost connection and retries absorbed them. When retries recovered every operation, the time goes to the retry backoff (OpenDAL waits a full second first): the remedy is a shorter first backoff with jitter, `layers.retry.min_delay` sized by prove. Failures that reach the application are not a layer: fix their cause.",
         causes: &[
             "missing permissions or wrong credentials",
             "objects or buckets that do not exist",

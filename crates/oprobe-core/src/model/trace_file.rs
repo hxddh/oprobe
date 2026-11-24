@@ -65,6 +65,53 @@ pub fn operator_url(s: Option<&ServiceRecord>) -> String {
     }
 }
 
+/// The endpoint a trace's requests went to when it is not the service's default (K8): one
+/// remote on a loopback, private or link-local address (a lab, MinIO, a gateway), as
+/// `http://ip:port` (`https` when the requests used TLS). `None` otherwise: a public address is
+/// taken for the service's own endpoint, which `oprobe run URL` finds by itself.
+pub fn custom_endpoint(r: &Report) -> Option<String> {
+    let addrs: Vec<std::net::SocketAddr> = r
+        .network
+        .remotes
+        .iter()
+        .filter_map(|x| x.remote.parse().ok())
+        .collect();
+    let [a] = addrs.as_slice() else {
+        return None;
+    };
+    let local = match a.ip() {
+        std::net::IpAddr::V4(ip) => ip.is_loopback() || ip.is_private() || ip.is_link_local(),
+        std::net::IpAddr::V6(ip) => {
+            ip.is_loopback()
+                || (ip.segments()[0] & 0xfe00) == 0xfc00
+                || (ip.segments()[0] & 0xffc0) == 0xfe80
+        }
+    };
+    if !local {
+        return None;
+    }
+    let tls = !r.network.tls.version.is_empty() || a.port() == 443;
+    Some(format!("{}://{a}", if tls { "https" } else { "http" }))
+}
+
+/// The run that profiles the service a trace recorded, to prove a remedy on (`oprobe run
+/// s3://bucket/root`, with `--set options.endpoint=…` when the requests went to a custom
+/// endpoint); `None` when the file does not name the service.
+pub fn run_command(r: &Report) -> Option<String> {
+    let url = &r.spec.operator_ref;
+    if url.is_empty() || url.starts_with("unknown://") {
+        return None;
+    }
+    let mut c = format!("oprobe run {}", super::spec::shell_quote(url));
+    if let Some(e) = custom_endpoint(r) {
+        c += &format!(
+            " --set {}",
+            super::spec::shell_quote(&format!("options.endpoint={e}"))
+        );
+    }
+    Some(c)
+}
+
 /// `2026-11-22T10:00:00Z` as a time.
 fn parse_rfc3339(s: &str) -> Option<SystemTime> {
     let n = |r: std::ops::Range<usize>| s.get(r)?.parse::<u32>().ok();
@@ -466,8 +513,9 @@ pub fn trace_run(mut file: TraceFile, path: &Path) -> Result<Run, crate::errors:
             || (has_ops && OP_TRACE_FINDINGS.contains(&f.code.as_str()))
     });
     let file_ref = super::spec::shell_quote(&path.display().to_string());
+    let run_cmd = run_command(&run.report);
     for f in &mut findings {
-        f.remedy.next = Some(next_command(&file_ref, f));
+        f.remedy.next = Some(next_command(&file_ref, run_cmd.as_deref(), f));
     }
     run.report.findings = findings;
     let breached = !run.report.verdict.sla.passed;
@@ -481,14 +529,13 @@ pub fn trace_run(mut file: TraceFile, path: &Path) -> Result<Run, crate::errors:
 }
 
 /// The next command of a finding of a trace: a remedy is proven on a run oprobe drives
-/// (`oprobe run OPERATOR`, then `oprobe prove`), never on the trace.
-fn next_command(file: &str, f: &Finding) -> String {
+/// (`run`, the service's concrete [`run_command`], then `oprobe prove`), never on the trace.
+fn next_command(file: &str, run: Option<&str>, f: &Finding) -> String {
     match f.code.as_str() {
         "errors" if f.remedy.path.is_none() => format!("oprobe show {file} --by api"),
         "invalid_run" => format!("oprobe show {file} --detail"),
-        // The service as the layer saw it has no endpoint or credentials: the user names the
-        // operator to drive.
-        _ => "oprobe run OPERATOR".to_owned(),
+        // A file that does not name its service: the user names the operator to drive.
+        _ => run.map_or_else(|| "oprobe run URL".to_owned(), str::to_owned),
     }
 }
 

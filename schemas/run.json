@@ -962,6 +962,75 @@
       },
       "type": "object"
     },
+    "ErrorBody": {
+      "description": "Machine form of an error (`{\"type\":\"error\",\"error\":{…}}` in json/ndjson output).",
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/ErrorCode"
+        },
+        "detail": {
+          "description": "The whole error chain as the storage library reported it, when `message` leads with\nthe provider's error code or states the cause plainly instead (machine output only).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "docs": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "hint": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "message": {
+          "type": "string"
+        },
+        "retryable": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "code",
+        "message",
+        "retryable"
+      ],
+      "type": "object"
+    },
+    "ErrorCode": {
+      "description": "Stable error code. Serialized as its dotted string (e.g. `net.timeout`).",
+      "enum": [
+        "usage.invalid_argument",
+        "usage.unknown_target",
+        "usage.unknown_run",
+        "usage.unknown_baseline",
+        "config.invalid",
+        "config.unknown_option",
+        "auth.no_credentials",
+        "auth.denied",
+        "net.unreachable",
+        "net.dns",
+        "net.tls",
+        "net.timeout",
+        "net.rate_limited",
+        "net.http",
+        "storage.not_found",
+        "storage.throttled",
+        "storage.unsupported",
+        "safety.budget_exceeded",
+        "safety.read_only",
+        "safety.refused",
+        "run.sla_failed",
+        "run.regression",
+        "run.interrupted",
+        "internal"
+      ],
+      "type": "string"
+    },
     "Evidence": {
       "description": "The numbers and trace references behind a finding.",
       "properties": {
@@ -2439,7 +2508,7 @@
           "type": "number"
         },
         "remote": {
-          "description": "`ip:port`.",
+          "description": "`ip:port`, or `no connection` for the requests that failed without one (resets).",
           "type": "string"
         },
         "requests_count": {
@@ -4476,6 +4545,17 @@
         }
       ],
       "description": "Several operators: the side-by-side table and how each differs from the first."
+    },
+    "error": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ErrorBody"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "A spent budget stopped the command (`safety.budget_exceeded`, exit 4): `runs` holds\nwhat finished and the partial run it cut short, all saved."
     },
     "next": {
       "description": "Suggested next steps.",

@@ -2434,7 +2434,7 @@
           "type": "number"
         },
         "remote": {
-          "description": "`ip:port`.",
+          "description": "`ip:port`, or `no connection` for the requests that failed without one (resets).",
           "type": "string"
         },
         "requests_count": {

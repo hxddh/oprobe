@@ -79,7 +79,7 @@ version = "auto"                # auto | h1 | h2
 | `throttling` | 并发超过某个水平后出现 429/503 | `layers.concurrent_limit.http`，并开启 `layers.retry.jitter` |
 | `rate_limit` | 请求速率上限 | `layers.concurrent_limit.http` |
 | `key_limit` | 热点前缀或热点 key | key 的布局（建议，而非 layer） |
-| `bandwidth_cap` | 带宽上限 | `layers.throttle.bandwidth` |
+| `bandwidth_cap` | 带宽上限 | 写入：`layers.throttle.bandwidth`；读取：不是 layer |
 | `tail_stragglers` | 少量极慢的服务端响应 | `layers.tail_cut` |
 | `hung_requests` | 永不结束的请求 | `layers.timeout.io` |
 | `small_ranges` | 大量小范围读取 | `read.gap` / `read.concurrent` |
@@ -87,6 +87,8 @@ version = "auto"                # auto | h1 | h2
 | `repeated_reads` | 同样的字节被反复读取 | `layers.cache`（`FoyerLayer`） |
 | `cold_connections` | 握手落在关键路径上、HTTP 版本 | `http.keep_alive` / `http.version` |
 | `client_bound` | 瓶颈在你的进程 | 存储侧无补救，如实报告 |
+| `errors` | 重试后恢复的 5xx 或断开的连接 | `layers.retry.min_delay`，加 `layers.retry.jitter` |
+| `errors` | 应用侧看到的失败 | 无：修复其原因（`show RUN --by api`） |
 
 `run` 只给出补救措施；只有 `prove` 会给出数字。
 

@@ -627,7 +627,7 @@ pub struct TcpInfo {
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct RemoteStats {
-    /// `ip:port`.
+    /// `ip:port`, or `no connection` for the requests that failed without one (resets).
     pub remote: String,
     pub requests_count: u64,
     pub errors_count: u64,

@@ -111,16 +111,27 @@ fn tempdir_for_encode() -> Result<PathBuf> {
     Ok(d)
 }
 
-/// Decode an `oprobe.run/6` stream (a v4 or older file is refused with a hint).
+/// Decode an `oprobe.run/6` stream (a v4 or older file is refused with a hint; a damaged or
+/// truncated file of this version says so, not that it is of another version).
 pub fn decode_run(r: impl Read) -> Result<Run> {
     super::runfile::read_run(r).map_err(|e| {
         let msg = format!("{e:#}");
-        if msg.contains("format") || msg.contains("not an oprobe run file") || msg.contains("corrupt") {
-            crate::errors::OprobeError::new(crate::errors::ErrorCode::UsageInvalidArgument, msg)
-                .with_hint("run files of other oprobe versions are not read: re-run the workload with this oprobe")
-                .into()
+        let invalid = |hint: &str| -> anyhow::Error {
+            crate::errors::OprobeError::new(
+                crate::errors::ErrorCode::UsageInvalidArgument,
+                msg.clone(),
+            )
+            .with_hint(hint.to_owned())
+            .into()
+        };
+        if msg.contains("is not supported") {
+            invalid(
+                "run files of other oprobe versions are not read: re-run the workload with this oprobe",
+            )
+        } else if msg.contains("not an oprobe run file") {
+            invalid("pass an `.oprobe` run file, a report `.json` or an `oprobe-trace` file")
         } else {
-            e
+            invalid("the run file is damaged or truncated: copy it again, or re-run the workload")
         }
     })
 }
@@ -618,6 +629,24 @@ pub(crate) mod tests {
         b.pop();
         assert_eq!(format_in_prefix(&b).as_deref(), Some("a"));
     }
+    /// A truncated run file of this version is damaged, not "of another version".
+    #[test]
+    fn a_truncated_run_file_is_called_damaged() {
+        let bytes = encode_run(&sample_run("20261120-143005-a1b2", None)).unwrap();
+        for cut in [bytes.len() / 2, bytes.len() - 3] {
+            let e = decode_run(&bytes[..cut]).unwrap_err();
+            let b = crate::errors::classify(&e, "s3");
+            assert_eq!(
+                b.code,
+                crate::errors::ErrorCode::UsageInvalidArgument,
+                "{e:#}"
+            );
+            let hint = b.hint.unwrap_or_default();
+            assert!(hint.contains("damaged or truncated"), "{cut}: {hint}");
+            assert!(!hint.contains("other oprobe versions"), "{hint}");
+        }
+    }
+
     use crate::model::*;
 
     pub(crate) fn sample_run(id: &str, label: Option<&str>) -> Run {

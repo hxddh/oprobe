@@ -107,7 +107,7 @@ Each operation's wall time is split exactly; an instant counts once even when re
 | TTFB | waiting for the first byte (the server's work plus one round trip) | the store or the distance to it; stragglers show as a long tail (`layers.tail_cut`) |
 | body | the response body arrives | download bandwidth per stream × streams; `read.chunk`, `read.concurrent` |
 | stall | the body waits for your code to read it (client time: its own segment in a waterfall, never part of body) | the consumer, not storage |
-| retry | the retry layer sleeps before the next attempt | throttling or errors; see the findings |
+| retry | the retry layer sleeps before the next attempt | throttling or errors; see the findings (`errors` on retried 5xx or lost connections: `layers.retry.min_delay`) |
 | client | everything else: OpenDAL, signing, checksums | CPU (`client_bound`), tiny objects |
 
 ### How it is measured

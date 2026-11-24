@@ -164,11 +164,10 @@ impl FindingView {
     }
 }
 
-/// The findings, most severe first (stable within a severity).
+/// The findings in the report's order (already ranked: `invalid_run` leads a run that cannot
+/// be judged, then the most severe), so the text and JSON agree.
 pub fn findings(r: &Report) -> Vec<FindingView> {
-    let mut v: Vec<FindingView> = r.findings.iter().map(FindingView::of).collect();
-    v.sort_by_key(|f| std::cmp::Reverse(f.severity));
-    v
+    r.findings.iter().map(FindingView::of).collect()
 }
 
 /// The key numbers.
@@ -1043,7 +1042,11 @@ impl ConnectionView {
                     first_ops_p50_ms: s.first_ops.p50,
                     first_ops_p99_ms: s.first_ops.p99,
                 }),
-            remotes_count: n.remotes.len() as u64,
+            remotes_count: n
+                .remotes
+                .iter()
+                .filter(|x| x.remote != crate::analysis::slice::NO_CONNECTION)
+                .count() as u64,
             remote_addrs: c.remote_addrs.clone(),
         }
     }
@@ -1450,6 +1453,14 @@ impl CompareView {
                     .map(|c| c.path.as_str())
                     .collect();
                 let name = VerdictView::of(r).operator;
+                let workload =
+                    workload_differences(&first.spec.profile.workload, &r.spec.profile.workload);
+                if !workload.is_empty() {
+                    differences.push(format!(
+                        "{name}: ran a different workload ({})",
+                        workload.join(", ")
+                    ));
+                }
                 differences.push(match (service.is_empty(), layers.is_empty()) {
                     (true, true) => format!("{name}: the same operator"),
                     (false, true) => format!("{name}: differs in service ({})", service.join(", ")),
@@ -1464,6 +1475,29 @@ impl CompareView {
         }
         Self { rows, differences }
     }
+}
+
+/// The workload fields that differ between `a` and `b` (`concurrency 28 vs 16`); empty when
+/// they ran the same workload.
+fn workload_differences(
+    a: &crate::config::WorkloadSpec,
+    b: &crate::config::WorkloadSpec,
+) -> Vec<String> {
+    let (Ok(serde_json::Value::Object(a)), Ok(serde_json::Value::Object(b))) =
+        (serde_json::to_value(a), serde_json::to_value(b))
+    else {
+        return Vec::new();
+    };
+    let keys: std::collections::BTreeSet<&String> = a.keys().chain(b.keys()).collect();
+    let show = |v: Option<&serde_json::Value>| match v {
+        None | Some(serde_json::Value::Null) => "unset".to_owned(),
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(v) => v.to_string(),
+    };
+    keys.into_iter()
+        .filter(|k| a.get(*k) != b.get(*k))
+        .map(|k| format!("{k} {} vs {}", show(a.get(k)), show(b.get(k))))
+        .collect()
 }
 
 /// The latency distribution: the share of operations at or below each latency (a CDF).
@@ -2290,6 +2324,42 @@ mod tests {
         assert_eq!(v.rows.len(), 3);
         assert!(v.differences[0].contains("service"), "{:?}", v.differences);
         assert!(v.differences[1].contains("layers"), "{:?}", v.differences);
+    }
+
+    #[test]
+    fn a_comparison_lists_a_workload_difference() {
+        let a = crate::report::fixture::report();
+        let mut b = a.clone();
+        b.spec.profile.workload.concurrency = a.spec.profile.workload.concurrency + 12;
+        let v = CompareView::of(&[&a, &b]);
+        assert!(
+            v.differences[0].contains("different workload")
+                && v.differences[0].contains("concurrency"),
+            "{:?}",
+            v.differences
+        );
+        let same = CompareView::of(&[&a, &a]);
+        assert!(
+            same.differences.iter().all(|d| !d.contains("workload")),
+            "{:?}",
+            same.differences
+        );
+    }
+
+    #[test]
+    fn findings_keep_the_reports_order() {
+        // A partial run: `invalid_run` (a warning) leads a critical finding; the text must
+        // not re-sort what the JSON keeps (K3).
+        let mut r = crate::report::fixture::report();
+        let mut first = r.findings[0].clone();
+        first.code = "invalid_run".into();
+        first.severity = Severity::Warning;
+        let mut second = r.findings[0].clone();
+        second.severity = Severity::Critical;
+        r.findings = vec![first, second];
+        let v = findings(&r);
+        assert_eq!(v[0].code, "invalid_run");
+        assert_eq!(v[1].severity, Severity::Critical);
     }
 
     #[test]

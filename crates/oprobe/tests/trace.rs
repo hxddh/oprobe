@@ -47,6 +47,18 @@ async fn traced_workload(
     cfg: oprobe::trace::Config,
     reads: usize,
 ) -> u64 {
+    traced_workload_with(path, faults, cfg, reads, 0).await
+}
+
+/// [`traced_workload`], then `missing` stats of keys that do not exist (each a failed
+/// operation, as an application checking for a key sees it).
+async fn traced_workload_with(
+    path: &Path,
+    faults: LabConfig,
+    cfg: oprobe::trace::Config,
+    reads: usize,
+    missing: usize,
+) -> u64 {
     let lab = LabServer::spawn("127.0.0.1:0", faults)
         .await
         .expect("lab starts");
@@ -84,6 +96,9 @@ async fn traced_workload(
     }
     for i in 0..10 {
         op.stat(&format!("logs/k{i}")).await.unwrap();
+    }
+    for i in 0..missing {
+        assert!(op.stat(&format!("logs/missing{i}")).await.is_err());
     }
     handle.save(path).unwrap();
     lab.requests_served()
@@ -191,7 +206,13 @@ async fn show_opens_a_production_trace_and_prove_refuses_it() {
         .iter()
         .find(|f| ["throttling", "rate_limit", "key_limit"].contains(&f["code"].as_str().unwrap()))
         .unwrap_or_else(|| panic!("a throttling finding: {findings:#?}"));
-    assert_eq!(thr["remedy"]["next"], "oprobe run OPERATOR");
+    // The concrete run of the traced service, with the lab's endpoint (K8: 7.0 printed
+    // `oprobe run OPERATOR` literally).
+    let run_cmd = "oprobe run s3://app-bucket/prod --set options.endpoint=http://127.0.0.1:";
+    assert!(
+        thr["remedy"]["next"].as_str().unwrap().starts_with(run_cmd),
+        "{thr:#}"
+    );
     for f in findings {
         let code = f["code"].as_str().unwrap();
         assert!(
@@ -228,12 +249,12 @@ async fn show_opens_a_production_trace_and_prove_refuses_it() {
         e["error"]["hint"]
             .as_str()
             .unwrap()
-            .contains("`oprobe run s3://app-bucket/prod`"),
+            .contains(&format!("`{run_cmd}")),
         "{e:#}"
     );
     let o = oprobe(dir.path(), &["prove", f]);
     assert_eq!(o.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&o.stderr).contains("oprobe run s3://app-bucket/prod"));
+    assert!(String::from_utf8_lossy(&o.stderr).contains(run_cmd));
 
     // Nothing was stored: a trace is opened, not imported.
     assert!(!dir.path().join("data").join("runs").exists());
@@ -337,6 +358,51 @@ async fn a_6x_trace_still_opens() {
     assert_eq!(o.status.code(), Some(2));
     let e = json(&o);
     assert_eq!(e["error"]["code"], "usage.invalid_argument");
+}
+
+/// One 404 in a production trace (an application checking for a key that is not there) is not
+/// an `errors` finding: a trace's failures meet the same minimum share as a run's (K14). Many
+/// of them are.
+#[tokio::test(flavor = "multi_thread")]
+async fn one_missing_key_in_a_trace_is_not_an_errors_finding() {
+    let dir = tempfile::tempdir().unwrap();
+    let codes = |file: &Path| -> Vec<String> {
+        let o = oprobe(dir.path(), &["show", file.to_str().unwrap(), "-o", "json"]);
+        assert_eq!(
+            o.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+        json(&o)["report"]["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["code"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    let one = dir.path().join("one-404.oprobe");
+    traced_workload_with(
+        &one,
+        LabConfig::default(),
+        oprobe::trace::Config::default(),
+        2,
+        1,
+    )
+    .await;
+    let c = codes(&one);
+    assert!(!c.iter().any(|x| x == "errors"), "{c:?}");
+    let many = dir.path().join("many-404.oprobe");
+    traced_workload_with(
+        &many,
+        LabConfig::default(),
+        oprobe::trace::Config::default(),
+        2,
+        20,
+    )
+    .await;
+    let c = codes(&many);
+    assert!(c.iter().any(|x| x == "errors"), "{c:?}");
 }
 
 /// Stragglers and connections dialled for every request show in a trace's findings too:

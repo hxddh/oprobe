@@ -120,7 +120,7 @@ operators renders as Rust and as TOML. [The reference →](docs/operator.md)
 | `throttling` | 429/503 above an in-flight level | `layers.concurrent_limit.http`, plus `layers.retry.jitter` |
 | `rate_limit` | a request-rate ceiling | `layers.concurrent_limit.http` |
 | `key_limit` | a hot prefix or key | the key layout (advice, not a layer) |
-| `bandwidth_cap` | a bytes-per-second ceiling | `layers.throttle.bandwidth` |
+| `bandwidth_cap` | a bytes-per-second ceiling | `layers.throttle.bandwidth` on writes; on reads not a layer |
 | `tail_stragglers` | a few very slow server responses | `layers.tail_cut` |
 | `hung_requests` | requests that never finish | `layers.timeout.io` |
 | `small_ranges` | many small range reads | `read.gap` / `read.concurrent` |
@@ -128,6 +128,8 @@ operators renders as Rust and as TOML. [The reference →](docs/operator.md)
 | `repeated_reads` | the same bytes read again and again | `layers.cache` (`FoyerLayer`) |
 | `cold_connections` | handshakes on the critical path, HTTP version | `http.keep_alive` / `http.version` |
 | `client_bound` | your process is the bottleneck | none in storage; reported as such |
+| `errors` | 5xx or lost connections that retries recovered | `layers.retry.min_delay`, plus `layers.retry.jitter` |
+| `errors` | failures that reached the application | none: fix their cause (`show RUN --by api`) |
 
 `run` names the remedy; only `prove` puts a number on it.
 
@@ -429,8 +431,9 @@ hung I/O, cold connections, small ranges, slow multipart, repeated reads, a busy
 Every finding has a confidence: **high** only when the model explains most of the effect and
 agrees across repeats. Throttling that made operations fail is reported as throttling, never as
 an invalid run. The codes and their remedies are in the [README](../README.md#findings-and-their-remedy);
-besides those, `errors` reports failures that are not throttling and `invalid_run` a run whose
-numbers cannot be trusted (too short, nothing measured).
+besides those, `errors` reports failures that are not throttling (when retries recovered every
+operation, its remedy is a shorter first retry backoff with jitter, `layers.retry.min_delay`) and
+`invalid_run` a run whose numbers cannot be trusted (too short, nothing measured).
 
 ## Remedy
 
@@ -804,7 +807,9 @@ oprobe prove 20261122-0915 small_ranges --max-duration 10m
 Print a profile: a stored run, or a file (`.oprobe` from `run` or from
 [`oprobe-trace`](embedding.md), or a report `.json`). Without an argument, the last run.
 `-o json` prints the shown run (`schemas/show.json`: the report of `schemas/report.json`, where it is stored, and the `by` and `range` sections when asked for); `--list -o json` the run list
-(`schemas/run-list.json`).
+(`schemas/run-list.json`; `-n` limits the runs and the proves alike). A prove id (`show --list`
+lists them) prints that prove's stored result as `prove` printed it (`schemas/prove.json`), also
+after its run was removed.
 
 A trace from `oprobe-trace` is recognised by its content, whatever its name. Its report has
 `run.source = "trace"` and shows `production trace` where a run shows its workload. Its
@@ -990,7 +995,7 @@ Each operation's wall time is split exactly; an instant counts once even when re
 | TTFB | waiting for the first byte (the server's work plus one round trip) | the store or the distance to it; stragglers show as a long tail (`layers.tail_cut`) |
 | body | the response body arrives | download bandwidth per stream × streams; `read.chunk`, `read.concurrent` |
 | stall | the body waits for your code to read it (client time: its own segment in a waterfall, never part of body) | the consumer, not storage |
-| retry | the retry layer sleeps before the next attempt | throttling or errors; see the findings |
+| retry | the retry layer sleeps before the next attempt | throttling or errors; see the findings (`errors` on retried 5xx or lost connections: `layers.retry.min_delay`) |
 | client | everything else: OpenDAL, signing, checksums | CPU (`client_bound`), tiny objects |
 
 ### How it is measured

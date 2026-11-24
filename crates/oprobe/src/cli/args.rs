@@ -134,7 +134,7 @@ pub struct WorkloadArgs {
     #[arg(short = 'c', long, value_parser = at_least::<1>)]
     pub concurrency: Option<usize>,
     /// Measurement window (e.g. 30s, 2m)
-    #[arg(short, long, value_parser = parse::duration, allow_hyphen_values = true)]
+    #[arg(short, long, value_parser = parse::positive_duration, allow_hyphen_values = true)]
     pub duration: Option<String>,
     /// Number of dataset objects to generate
     #[arg(long)]
@@ -173,7 +173,7 @@ pub struct SafetyArgs {
     #[arg(long, value_name = "SIZE", value_parser = parse::size, allow_hyphen_values = true)]
     pub max_bytes: Option<String>,
     /// Stop after this much wall time, e.g. 5m (exit 4)
-    #[arg(long, value_name = "DURATION", value_parser = parse::duration, allow_hyphen_values = true)]
+    #[arg(long, value_name = "DURATION", value_parser = parse::positive_duration, allow_hyphen_values = true)]
     pub max_duration: Option<String>,
 }
 
@@ -234,7 +234,7 @@ pub struct ProveArgs {
     #[arg(long, value_name = "RATIO", value_parser = parse::share, allow_hyphen_values = true)]
     pub max_throttle: Option<String>,
     /// Measurement window of one trial (default 2s)
-    #[arg(long, value_name = "DURATION", value_parser = parse::duration, hide = true)]
+    #[arg(long, value_name = "DURATION", value_parser = parse::positive_duration, allow_hyphen_values = true, hide = true)]
     pub trial: Option<String>,
     /// A/B pairs at most (default 6; at least 3, the fewest that can decide)
     #[arg(long, value_name = "N", value_parser = at_least::<3>, hide = true)]
@@ -263,7 +263,7 @@ pub struct ProveSafetyArgs {
     #[arg(
         long,
         value_name = "DURATION",
-        value_parser = parse::duration,
+        value_parser = parse::positive_duration,
         allow_hyphen_values = true
     )]
     pub max_duration: Option<String>,
@@ -273,7 +273,7 @@ pub struct ProveSafetyArgs {
         long,
         hide = true,
         value_name = "DURATION",
-        value_parser = parse::duration,
+        value_parser = parse::positive_duration,
         allow_hyphen_values = true
     )]
     pub budget: Option<String>,
@@ -304,7 +304,7 @@ pub enum ByArg {
 
 #[derive(Args, Debug)]
 pub struct ShowArgs {
-    /// The run: id, id prefix, `last`, `last~N`, or a .oprobe / report .json file
+    /// The run: id, id prefix, `last`, `last~N`, or a .oprobe / report .json file (or a prove id)
     #[arg(value_name = "RUN|FILE")]
     pub run: Option<String>,
     /// List the stored runs (prove trials are hidden; --all lists them)

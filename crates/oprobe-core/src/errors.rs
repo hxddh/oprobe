@@ -139,11 +139,13 @@ impl ErrorCode {
     }
 
     /// Documentation anchor for the code.
+    /// The troubleshooting section of this code, as this version shipped it (pinned to the
+    /// version tag, like the glossary).
     pub fn docs(self) -> String {
-        format!(
-            "https://github.com/hxddh/oprobe/blob/main/docs/troubleshooting.md#{}",
+        crate::util::docs_url(&format!(
+            "docs/troubleshooting.md#{}",
             self.as_str().replace('.', "-")
-        )
+        ))
     }
 }
 
@@ -480,6 +482,11 @@ mod tests {
             let url = c.docs();
             let (page, anchor) = url.rsplit_once('#').unwrap();
             assert!(page.ends_with("docs/troubleshooting.md"), "{url}");
+            // Pinned to this version's tag, like the glossary (not `main`, which moves on).
+            assert!(
+                url.contains(&format!("/blob/v{}/", env!("CARGO_PKG_VERSION"))),
+                "{url}"
+            );
             assert!(
                 doc.contains(&format!("<a id=\"{anchor}\"></a>")),
                 "docs/troubleshooting.md has no anchor `{anchor}` for {c}"

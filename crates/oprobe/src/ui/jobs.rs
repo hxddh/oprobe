@@ -257,12 +257,20 @@ impl Job {
         let (job, sink) = Self::start(total, false, None);
         let (state, cancel) = (job.state.clone(), job.cancel.clone());
         runtime().spawn(async move {
-            let res = app.run(req, sink, cancel.clone()).await.map(|o| match o {
-                RunOutcome::Run(set) => {
-                    Outcome::Ran(set.runs.into_iter().map(|r| r.run_id).collect())
-                }
-                RunOutcome::Plan(_) => Outcome::Ran(Vec::new()),
-            });
+            let res = app
+                .run(req, sink, cancel.clone())
+                .await
+                .and_then(|o| match o {
+                    RunOutcome::Run(set) => match set.error {
+                        // A spent budget is the job's error, as before (the partial run is
+                        // saved).
+                        Some(e) => Err(crate::errors::OprobeError::new(e.code, e.message).into()),
+                        None => Ok(Outcome::Ran(
+                            set.runs.into_iter().map(|r| r.run_id).collect(),
+                        )),
+                    },
+                    RunOutcome::Plan(_) => Ok(Outcome::Ran(Vec::new())),
+                });
             Self::finish(&state, &cancel, res);
         });
         job

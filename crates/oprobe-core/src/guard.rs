@@ -377,8 +377,12 @@ pub fn plan(profile: &Profile, run_prefix: &str, read_only: bool, budgets: &Budg
         );
         0.030 + transfer
     } else {
-        assumptions.push("in-process operations take ~0.2 ms".to_owned());
-        0.0002
+        // Bytes still take time in process: a copy at ~1 GiB/s per operation.
+        let transfer = bytes_per_op / (1024.0 * 1024.0 * 1024.0);
+        assumptions.push(
+            "in-process operations take ~0.2 ms plus transfer at 1 GiB/s per operation".to_owned(),
+        );
+        0.0002 + transfer
     };
     let window = w.warmup.get().as_secs_f64() + w.duration.get().as_secs_f64();
     let conc = k.concurrency.max(1) as f64;
@@ -458,7 +462,7 @@ pub fn plan(profile: &Profile, run_prefix: &str, read_only: bool, budgets: &Budg
 }
 
 /// The budgets a plan would spend before it finishes (the run would stop there, exit 4).
-fn budget_warnings(b: &Budgets, requests: u64, bytes: u64, eta_s: f64) -> Vec<String> {
+pub(crate) fn budget_warnings(b: &Budgets, requests: u64, bytes: u64, eta_s: f64) -> Vec<String> {
     let mut out = Vec::new();
     if let Some(max) = b.max_requests_count
         && requests >= max
@@ -706,6 +710,34 @@ mod sec_tests {
         assert!(pl.estimated_requests_count >= ds.objects as u64);
         assert!(pl.eta_s > 0.0);
         assert!(pl.warnings.iter().all(|w| !w.contains("budget")), "{pl:?}");
+    }
+
+    /// 7.0.0 planned 30 000 GiB in 12 s for large in-process objects: bytes take time too.
+    #[test]
+    fn an_in_process_plan_counts_the_transfer_time() {
+        let mut p = Profile::from_url("memory://");
+        p.workload.preset = crate::config::Preset::SmallFiles;
+        p.workload.dataset = Some(crate::config::DatasetSpec {
+            objects: 4,
+            object_size: crate::util::ByteSize(64 << 20),
+            ..Default::default()
+        });
+        p.workload.mix = vec![crate::config::OpSpec {
+            weight: 1,
+            op: OpKind::Read { size: None },
+        }];
+        p.workload.concurrency = 4;
+        p.workload.warmup = crate::util::HumanDuration(Duration::ZERO);
+        p.workload.duration = crate::util::HumanDuration(Duration::from_secs(10));
+        let pl = plan(&p, "oprobe-run-x/", false, &Budgets::default());
+        // 4 workers at ~1 GiB/s each for 10 s: tens of GiB, not tens of thousands.
+        let gib = pl.estimated_bytes as f64 / (1u64 << 30) as f64;
+        assert!(gib < 100.0 && gib > 10.0, "{gib} GiB: {pl:?}");
+        assert!(
+            pl.assumptions.iter().any(|a| a.contains("transfer")),
+            "{:?}",
+            pl.assumptions
+        );
     }
 
     /// 6.3.0 planned 6 541 requests under `--max-requests 500` without a word.
