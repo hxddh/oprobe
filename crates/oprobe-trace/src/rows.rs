@@ -440,7 +440,8 @@ pub struct OpRow {
     pub verb: Cow<'static, str>,
     /// Object key (or listed prefix).
     pub key: String,
-    /// Start (the intended start in open-loop runs), µs from the window start.
+    /// Start, µs from the window start. In open-loop runs `latency_us` also counts how late the
+    /// operation started against its schedule (queue time in `breakdown`).
     pub t_us: i64,
     pub latency_us: u64,
     /// Logical bytes read + written.

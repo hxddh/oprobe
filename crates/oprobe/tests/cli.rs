@@ -131,7 +131,6 @@ fn checked_in_schemas_match_the_code() {
             "prove-plan",
             "show",
             "run-list",
-            "compare",
             "removed",
             "lab",
             "operator",
@@ -1004,6 +1003,21 @@ fn five_x_vestiges_are_gone() {
     assert!(!h.contains("hotkey") && h.contains("ratelimit"), "{h}");
 }
 
+/// `lab --max-store-size` is hidden from the help (design 9.1 §3), and still taken.
+#[test]
+fn lab_max_store_size_is_hidden_but_accepted() {
+    let env = Env::new();
+    let h = stdout(&env.run(&["lab", "--help"]));
+    assert!(!h.contains("--max-store-size"), "{h}");
+    assert!(h.contains("--allow-remote"), "{h}");
+    // A zero size is refused by its parser, not as an unknown flag.
+    let o = env.run(&["lab", "--max-store-size", "0"]);
+    assert_eq!(code(&o), 2);
+    let e = stderr(&o);
+    assert!(!e.contains("unexpected argument"), "{e}");
+    assert!(e.contains("max-store-size"), "{e}");
+}
+
 #[test]
 fn bare_oprobe_is_the_app() {
     let env = Env::new();
@@ -1334,11 +1348,10 @@ fn show_compares_multiple_runs_and_prove_saves_when_improved() {
     assert_eq!(code(&o2), 0, "{}", stderr(&o2));
     let id2 = json(&o2)["runs"][0]["run_id"].as_str().unwrap().to_owned();
 
-    // `show A B -o json` matches `schemas/compare.json` (and `schemas/run.json`) with a side-by-side comparison.
+    // `show A B -o json` is a `schemas/run.json` document with a side-by-side comparison.
     let cmp = env.run(&["show", &id1, &id2, "-o", "json"]);
     assert_eq!(code(&cmp), 0, "{}", stderr(&cmp));
     let v = json(&cmp);
-    validate("compare", &v);
     validate("run", &v);
     assert_eq!(v["runs"].as_array().unwrap().len(), 2);
     assert!(v["comparison"].is_object(), "{v:#}");

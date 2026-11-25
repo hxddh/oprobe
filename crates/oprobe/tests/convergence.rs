@@ -70,6 +70,15 @@ impl Env {
         );
     }
 
+    /// The finding's `next` command exactly as printed (the output flags aside): it must be an
+    /// `oprobe prove`.
+    fn run_next(&self, f: &Value) -> Value {
+        let next = f["remedy"]["next"].as_str().unwrap();
+        let args: Vec<&str> = next.split_whitespace().collect();
+        assert_eq!(&args[..2], ["oprobe", "prove"], "{next}");
+        self.json(&args[1..])
+    }
+
     /// `oprobe prove RUN CODE ARGS` (short trials).
     fn prove(&self, run_id: &str, code: &str, extra: &[&str]) -> Value {
         let mut a = vec!["prove", run_id, code, "--trial", "1s"];
@@ -85,7 +94,8 @@ fn finding<'a>(report: &'a Value, code: &str) -> Option<&'a Value> {
         .find(|f| f["code"] == code)
 }
 
-/// The finding names its remedy path and carries no sizing number (T1, T2).
+/// The finding names its remedy path and carries no sizing number (T1, T2); its `next` proves
+/// the remedy on the objective it is proved on (W8: p99 for the throttle family).
 fn check_finding(report: &Value, code: &str, path: Option<&str>) -> Value {
     let f = finding(report, code).unwrap().clone();
     assert_eq!(f["remedy"]["path"].as_str(), path, "{code}: {f:#}");
@@ -95,9 +105,13 @@ fn check_finding(report: &Value, code: &str, path: Option<&str>) -> Value {
         "no number in the remedy: {text}"
     );
     let id = report["run"]["id"].as_str().unwrap();
+    let objective = match code {
+        "throttling" | "rate_limit" => " --objective p99",
+        _ => "",
+    };
     assert_eq!(
         f["remedy"]["next"].as_str().unwrap(),
-        format!("oprobe prove {id} {code}")
+        format!("oprobe prove {id} {code}{objective}")
     );
     f
 }
@@ -228,7 +242,7 @@ fn the_default_rate_limit_lab_is_a_rate_limit() {
         }
     }
     let r = found.expect("a rate_limit finding in 3 runs");
-    check_finding(&r, "rate_limit", Some("layers.concurrent_limit.http"));
+    let f = check_finding(&r, "rate_limit", Some("layers.concurrent_limit.http"));
     assert!(
         r["capacity"]["inflight_ceiling"].is_null(),
         "not an in-flight limit (A1)"
@@ -253,15 +267,52 @@ fn the_default_rate_limit_lab_is_a_rate_limit() {
             .as_u64()
             .unwrap()
     );
+    // W8: the finding's `next`, exactly as printed (default trials, its objective), decides.
+    let p = env.run_next(&f);
+    assert_eq!(p["objective"], "p99", "{p:#}");
+    improved(&p);
+}
+
+/// The default `lab://throttle` (32 workers over an in-flight limit of 8): the finding's
+/// `next`, run exactly as printed, proves the cap `improved` on p99 (W8: 9.0's `next` named no
+/// objective, and at 16 workers the throttled operations' backoffs sat above the p99).
+#[test]
+fn the_default_throttle_lab_proves_its_next_command() {
+    let env = Env::new();
+    let r = env.run_until(&["lab://throttle"], "throttling");
+    let f = check_finding(&r, "throttling", Some("layers.concurrent_limit.http"));
+    let p = env.run_next(&f);
+    assert_eq!(p["finding"], "throttling");
+    assert_eq!(p["objective"], "p99", "{p:#}");
+    let n: u64 = sized(&p).parse().unwrap();
+    assert!((6..=9).contains(&n), "sized {n}, the lab throttles above 8");
+    improved(&p);
+    // The A/B order of the pairs is drawn from the run's seed, and the result says so (W11).
+    let notes = p["notes"].as_array().unwrap();
+    assert!(
+        notes
+            .iter()
+            .any(|n| n.as_str().unwrap().contains("A/B order")),
+        "{notes:?}"
+    );
 }
 
 /// Zipf reads over per-key buckets of 40 requests/s: a key limit. Its remedy is the key
-/// layout (not a layer); prove tests the client-side cap as the stopgap.
+/// layout, not a layer: `next` shows the hot keys, and `prove` refuses it (W9: 9.0 said "not a
+/// layer" and suggested `prove … key_limit`).
 #[test]
 fn a_hot_key_is_a_key_limit() {
     let env = Env::new();
     let r = env.run_until(&["lab://hotkey", "-d", "2s"], "key_limit");
-    let f = check_finding(&r, "key_limit", None);
+    let f = finding(&r, "key_limit").unwrap();
+    assert!(f["remedy"]["path"].is_null(), "{f:#}");
+    let text = f["remedy"]["text"].as_str().unwrap();
+    assert!(text.contains("not a layer"), "{text}");
+    let id = r["run"]["id"].as_str().unwrap();
+    assert_eq!(
+        f["remedy"]["next"].as_str().unwrap(),
+        format!("oprobe show {id} --detail")
+    );
     let rps = f["evidence"]["values"]["fitted_requests_per_s"]
         .as_f64()
         .unwrap();
@@ -269,13 +320,26 @@ fn a_hot_key_is_a_key_limit() {
         (20.0..=60.0).contains(&rps),
         "fitted {rps}/s per key, the lab allows 40"
     );
-    let p = env.prove(
-        r["run"]["id"].as_str().unwrap(),
-        "key_limit",
-        &["--objective", "p99"],
+    let o = Command::new(env!("CARGO_BIN_EXE_oprobe"))
+        .env("OPROBE_DATA_DIR", env.path("data"))
+        .env("OPROBE_CONFIG", env.path("config.toml"))
+        .args(["prove", id, "key_limit", "-o", "json"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        o.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&o.stdout)
     );
-    assert_eq!(p["sizing"]["path"], "layers.concurrent_limit.http");
-    improved(&p);
+    let e: Value = serde_json::from_slice(&o.stdout).unwrap();
+    let msg = e["error"]["message"].as_str().unwrap();
+    assert!(msg.contains("no operator remedy to prove"), "{e:#}");
+    let hint = e["error"]["hint"].as_str().unwrap();
+    assert!(
+        hint.contains(&format!("oprobe show {id} --detail")),
+        "{hint}"
+    );
 }
 
 /// 3 % of requests wait 400 ms: stragglers, cut by TailCutLayer (with a short re-issue

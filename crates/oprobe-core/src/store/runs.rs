@@ -82,6 +82,14 @@ impl From<&Report> for RunSummary {
     }
 }
 
+impl RunSummary {
+    /// The run's storage scheme (`s3`, `gcs`, `fs`, …; a lab is S3), from its target identity.
+    pub fn scheme(&self) -> Option<&str> {
+        let (scheme, _) = self.target_id.split_once("://")?;
+        Some(if scheme == "lab" { "s3" } else { scheme }).filter(|s| !s.is_empty())
+    }
+}
+
 /// Encode a run as `oprobe.run/7` in memory (tests and small exports; the store streams to
 /// disk with [`super::runfile::write_run`]).
 pub fn encode_run(run: &Run) -> Result<Vec<u8>> {
@@ -347,6 +355,27 @@ impl RunStore {
         Err(unknown(format!("no run matches `{r}`")))
     }
 
+    /// The summary of the run RUNREF `r` names: its sidecar, without decoding the run (the
+    /// run file is read only for a file outside the store or a missing sidecar).
+    pub fn summary(&self, r: &str) -> Result<RunSummary> {
+        let path = self.resolve(r)?;
+        let stored = path.parent() == Some(self.dir.as_path())
+            && path.extension().is_some_and(|e| e == "oprobe")
+            && path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(RunId::parse)
+                .is_some();
+        if stored
+            && let Some(s) = std::fs::read(path.with_extension("json"))
+                .ok()
+                .and_then(|b| serde_json::from_slice::<RunSummary>(&b).ok())
+        {
+            return Ok(s);
+        }
+        Ok(RunSummary::from(&load_path(&path)?.report))
+    }
+
     /// Load a run by RUNREF. A report `.json` file loads without trace rows.
     pub fn load(&self, r: &str) -> Result<Run> {
         let path = self.resolve(r)?;
@@ -441,23 +470,6 @@ impl RunStore {
             .collect();
         ids.sort();
         Ok(ids)
-    }
-
-    /// Stored prove ids whose baseline `run_id` is `run_id`, newest first.
-    pub fn proves_of_run(&self, run_id: &str) -> Result<Vec<String>> {
-        Ok(self
-            .proves()?
-            .into_iter()
-            .filter_map(|v| {
-                (v.get("run_id").and_then(|x| x.as_str()) == Some(run_id))
-                    .then(|| {
-                        v.get("prove_id")
-                            .and_then(|x| x.as_str())
-                            .map(str::to_owned)
-                    })
-                    .flatten()
-            })
-            .collect())
     }
 
     /// Resolve a prove reference: a `.prove.json` path, `last-prove`, an exact `prove_id`, or
@@ -901,6 +913,31 @@ pub(crate) mod tests {
         assert!(kinds.contains(&"segment"));
         // In memory too.
         assert_eq!(decode_run(&encode_run(&run).unwrap()[..]).unwrap(), run);
+    }
+
+    #[test]
+    fn a_summary_reads_the_sidecar_not_the_run() {
+        let d = tempfile::tempdir().unwrap();
+        let store = RunStore::new(d.path().join("runs"));
+        let run = sample_run("20261120-143005-a1b2", None);
+        let path = store.save(&run).unwrap();
+        // The run file is unreadable: the sidecar alone answers.
+        std::fs::write(&path, b"not a run").unwrap();
+        let s = store.summary("last").unwrap();
+        assert_eq!(s.id, "20261120-143005-a1b2");
+        assert_eq!(s.scheme(), RunSummary::from(&run.report).scheme());
+        assert!(store.load("last").is_err());
+        let lab = RunSummary {
+            target_id: "lab://throttle/".into(),
+            ..Default::default()
+        };
+        assert_eq!(lab.scheme(), Some("s3"));
+        let gcs = RunSummary {
+            target_id: "gcs://bucket/".into(),
+            ..Default::default()
+        };
+        assert_eq!(gcs.scheme(), Some("gcs"));
+        assert_eq!(RunSummary::default().scheme(), None);
     }
 
     #[test]

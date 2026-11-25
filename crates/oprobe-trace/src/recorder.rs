@@ -623,6 +623,7 @@ impl Agg {
 pub struct OpCompletion {
     pub verb: &'static str,
     pub op_id: u64,
+    /// When the operation actually started.
     pub started: Instant,
     /// Latency from the *intended* start (open-loop) or actual start (closed-loop).
     pub latency_us: u64,
@@ -1335,7 +1336,9 @@ impl Recorder {
             .started
             .saturating_duration_since(window_start)
             .as_micros() as u64;
-        let end_us = start_us + c.latency_us;
+        // An open-loop operation's latency also counts how late it started (`schedule_us`,
+        // before `started`): it ends that much sooner after its start.
+        let end_us = start_us + c.latency_us.saturating_sub(c.schedule_us.unwrap_or(0));
         let frozen = self.frozen_elapsed_us.load(Ordering::Acquire);
         let at = |us: u64| event_bucket(us, frozen);
         let idx = at(start_us);

@@ -5,9 +5,10 @@
 //! 2. **Size it**: when the remedy is a size (a limit, a gap, a concurrency), a bracket search
 //!    over that one value with short trials picks the objective's knee — the smallest value
 //!    within [`KNEE_RATIO`] of the best — subject to `--max-throttle`.
-//! 3. **A/B test**: interleaved A B A B trials with a sequential test ([`Sprt`]) on the
-//!    objective against a noise floor learned from the A/A spread, until a decision, the
-//!    pair limit or the wall-time budget (`--max-duration`).
+//! 3. **A/B test**: interleaved A/B pairs (each pair's order drawn from the run's seed) with a
+//!    sequential test ([`Sprt`]) on the objective against a noise floor learned from each
+//!    side's trial-to-trial spread, until a decision, the pair limit or the wall-time budget
+//!    (`--max-duration`).
 //! 4. **Decide**: `improved | worse | inconclusive` on the objective (goodput = successful
 //!    operations per second, or p99). Intervals are log-ratio (never below −100 %) and
 //!    Wilson/Newcombe for shares; secondary metrics are shown, never decisive.
@@ -65,6 +66,14 @@ pub enum ProveObjective {
 }
 
 impl ProveObjective {
+    /// The objective the remedy of finding `code` is proved on (the one its `next` names).
+    pub fn of_finding(code: &str) -> Self {
+        match crate::analysis::findings::proof_objective(code) {
+            Some("p99") => Self::P99,
+            _ => Self::Goodput,
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Goodput => "goodput",
@@ -129,9 +138,6 @@ pub struct ProveRequest {
     /// Write the proven operator to an `op.toml` file or `[operators.NAME]` when `improved`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub save: Option<String>,
-    /// Do not save trial runs or `<id>.prove.json` into the run store
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub no_save: bool,
     pub safety: Safety,
 }
 
@@ -147,18 +153,20 @@ impl Default for ProveRequest {
             pairs: crate::config::prove_defaults::MAX_PAIRS,
             trial_duration: None,
             save: None,
-            no_save: false,
             safety: Safety::default(),
         }
     }
 }
 
 impl ProveRequest {
-    /// Prove the remedy of finding `code` of run `run` (sized, on goodput, default budget).
+    /// Prove the remedy of finding `code` of run `run` as its `next` command does: sized, on
+    /// the objective it is proved on ([`ProveObjective::of_finding`]), default budget.
     pub fn for_finding(run: impl Into<String>, code: impl Into<String>) -> Self {
+        let code = code.into();
         Self {
             run: run.into(),
-            finding: Some(code.into()),
+            objective: ProveObjective::of_finding(&code),
+            finding: Some(code),
             ..Self::default()
         }
     }
@@ -473,7 +481,7 @@ pub struct ProofEstimate {
     pub change: Vec<String>,
     /// Sizing trials at most (0 when the change has no size to search).
     pub sizing_trials_max_count: u64,
-    /// The fewest and the most A/B pairs (a pair is two trials: A, then B).
+    /// The fewest and the most A/B pairs (a pair is two trials: A and B, in either order).
     pub pairs_min_count: u64,
     pub pairs_max_count: u64,
     pub trials_min_count: u64,
@@ -508,26 +516,10 @@ fn fmt_secs(s: f64) -> String {
 impl ProofEstimate {
     /// The estimate of a proof of `sizing` (most, fewest) sizing trials and `pairs` (fewest,
     /// most) A/B pairs, whose baseline trials take `a_eta_s` and whose sizing and candidate
-    /// trials take `b_eta_s`, within `budget`.
-    #[cfg(test)]
-    fn new(
-        command: String,
-        change: Vec<String>,
-        sizing: (u64, u64),
-        pairs: (u64, u64),
-        a_eta_s: f64,
-        b_eta_s: f64,
-        budget: Option<Duration>,
-    ) -> Self {
-        Self::new_reused(
-            command, change, sizing, pairs, a_eta_s, b_eta_s, b_eta_s, budget,
-        )
-    }
-
-    /// [`ProofEstimate::new`] where the first candidate trial warms a shared layer
-    /// (`b_first_eta_s`) and subsequent candidate trials reuse it (`b_warm_eta_s`).
+    /// trials take `b_first_eta_s` — or `b_warm_eta_s` once the first candidate trial has
+    /// warmed a shared layer — within `budget`.
     #[allow(clippy::too_many_arguments)]
-    fn new_reused(
+    fn new(
         command: String,
         change: Vec<String>,
         sizing: (u64, u64),
@@ -775,6 +767,23 @@ fn mean_request_s(run: &Run) -> f64 {
 
 /// The change of a finding's remedy.
 fn remedy_change(run: &Run, f: &Finding) -> Result<Change> {
+    // A remedy that is not a layer (the key layout, a cap on reads, the client, a failing
+    // request) has nothing to prove: say where to look instead, as the finding's `next` does.
+    if !f.remedy.provable() {
+        let next =
+            crate::analysis::findings::next_command(&crate::model::spec::shell_quote(run.id()), f);
+        return Err(OprobeError::new(
+            ErrorCode::UsageInvalidArgument,
+            format!(
+                "finding `{}` has no operator remedy to prove: {}",
+                f.code, f.remedy.text
+            ),
+        )
+        .with_hint(format!(
+            "see it with `{next}`, or pass a change to test with --with PATH=VALUE"
+        ))
+        .into());
+    }
     let r = &run.report;
     let peak = r.capacity.observed.peak_inflight_count.max(1);
     let spec = &r.spec.profile.operator;
@@ -809,16 +818,10 @@ fn remedy_change(run: &Run, f: &Finding) -> Result<Change> {
             };
             c.sized = Some(limit(start.max(1), why));
         }
-        "rate_limit" | "key_limit" => {
+        "rate_limit" => {
             c.fixed.push(("layers.retry.jitter".into(), "on".into()));
             let lat = mean_request_s(run);
-            let rate = match f.code.as_str() {
-                "key_limit" => evidence(f, "fitted_requests_per_s")
-                    .zip(evidence(f, "hot_key_share_ratio").filter(|s| *s > 0.0))
-                    .map(|(rps, share)| rps / share),
-                _ => evidence(f, "fitted_requests_per_s"),
-            };
-            let (start, why) = match rate {
+            let (start, why) = match evidence(f, "fitted_requests_per_s") {
                 Some(rps) => (
                     ((rps * lat).floor() as u64).max(1),
                     format!(
@@ -832,12 +835,6 @@ fn remedy_change(run: &Run, f: &Finding) -> Result<Change> {
                 ),
             };
             c.sized = Some(limit(start, why));
-            if f.code == "key_limit" {
-                c.notes.push(
-                    "the remedy for hot keys is the key layout (not a layer); prove tests the client-side cap that keeps the hottest key under its limit until the keys are spread"
-                        .into(),
-                );
-            }
         }
         "bandwidth_cap" => {
             let writes = r
@@ -1056,9 +1053,7 @@ fn choose_change(run: &Run, req: &ProveRequest) -> Result<Change> {
         }
         None => findings
             .iter()
-            .find(|f| {
-                f.remedy.provable() || f.code == "key_limit"
-            })
+            .find(|f| f.remedy.provable())
             .ok_or_else(|| {
                 OprobeError::new(
                     ErrorCode::UsageInvalidArgument,
@@ -1078,7 +1073,6 @@ struct Trials<'a> {
     base: Profile,
     prove_id: String,
     safety: Safety,
-    no_save: bool,
     guard: Option<std::sync::Arc<crate::guard::Guard>>,
     cancel: Cancel,
     deadline: Option<Instant>,
@@ -1218,10 +1212,7 @@ impl Trials<'_> {
         p.name = Some(format!("prove {} {}", self.prove_id, kind_label(kind)));
         p.validate()?;
         let rails = super::run::rails(self.ctx, &p, &self.safety)?;
-        let output = OutputOptions {
-            no_save: self.no_save,
-            ..Default::default()
-        };
+        let output = OutputOptions::default();
         let started = Instant::now();
         let m = super::measure::measure(
             self.ctx,
@@ -1376,12 +1367,46 @@ fn knee(evals: &BTreeMap<u64, ProveTrial>, obj: ProveObjective) -> (u64, bool) {
     (v, false)
 }
 
+/// Measures one value of a sized path ([`search`]): `None` once no more trial can run.
+trait Measure {
+    fn measure(
+        &mut self,
+        v: u64,
+    ) -> impl std::future::Future<Output = Result<Option<ProveTrial>>> + Send;
+}
+
+/// The sizing trials of a change.
+struct SizingTrials<'t, 'a> {
+    t: &'t mut Trials<'a>,
+    c: &'t Change,
+    d: Domain,
+}
+
+impl<M: Measure + Send> Measure for &mut M {
+    fn measure(
+        &mut self,
+        v: u64,
+    ) -> impl std::future::Future<Output = Result<Option<ProveTrial>>> + Send {
+        (**self).measure(v)
+    }
+}
+
+impl Measure for SizingTrials<'_, '_> {
+    async fn measure(&mut self, v: u64) -> Result<Option<ProveTrial>> {
+        let sets = sets_at(self.c, Some(v), self.t.run);
+        if !self.t.time_left_for_sets(&sets, TrialKind::Sizing) {
+            return Ok(None);
+        }
+        self.t
+            .try_trial(&sets, TrialKind::Sizing, None, Some(self.d.fmt(v)))
+            .await
+    }
+}
+
 /// One sizing trial at `v` (cached; `None` when the trial limit or the budget is reached).
 async fn eval_at(
-    t: &mut Trials<'_>,
     evals: &mut BTreeMap<u64, ProveTrial>,
-    c: &Change,
-    d: Domain,
+    m: &mut impl Measure,
     v: u64,
     max_trials: usize,
 ) -> Result<Option<ProveTrial>> {
@@ -1391,23 +1416,14 @@ async fn eval_at(
     if evals.len() >= max_trials {
         return Ok(None);
     }
-    let sets = sets_at(c, Some(v), t.run);
-    if !t.time_left_for_sets(&sets, TrialKind::Sizing) {
-        return Ok(None);
-    }
-    let Some(r) = t
-        .try_trial(&sets, TrialKind::Sizing, None, Some(d.fmt(v)))
-        .await?
-    else {
+    let Some(r) = m.measure(v).await? else {
         return Ok(None);
     };
     evals.insert(v, r.clone());
     Ok(Some(r))
 }
 
-/// The bracket search over one value (step 2): climb (doubling) while feasible and
-/// improving, or descend (halving) while infeasible, then bisect between the bracket's ends;
-/// the answer is the [`knee`] of everything measured.
+/// The bracket search over one value (step 2) with sizing trials of the change.
 async fn size(
     t: &mut Trials<'_>,
     c: &Change,
@@ -1415,10 +1431,26 @@ async fn size(
     obj: ProveObjective,
     max_trials: usize,
 ) -> Result<(u64, bool)> {
-    let mut evals: BTreeMap<u64, ProveTrial> = BTreeMap::new();
     let d = s.domain;
-    let v0 = d.clamp(s.start);
-    let Some(first) = eval_at(t, &mut evals, c, d, v0, max_trials).await? else {
+    search(d, s.start, obj, max_trials, SizingTrials { t, c, d }).await
+}
+
+/// The bracket search over one value of domain `d` from `start`, measuring each value with
+/// `trial`: climb (doubling) while feasible and improving, or descend (halving) while
+/// infeasible, then bisect between the bracket's ends; the answer is the [`knee`] of
+/// everything measured. When the first step up is no better than the start, the best is at or
+/// below the start: the search descends while a smaller value is as good, and bisects nothing
+/// above (S7: 9.0 sized a 20 ms backoff 20 → 40 → 28 → 33 ms, every step worse than 20).
+async fn search(
+    d: Domain,
+    start: u64,
+    obj: ProveObjective,
+    max_trials: usize,
+    mut trial: impl Measure,
+) -> Result<(u64, bool)> {
+    let mut evals: BTreeMap<u64, ProveTrial> = BTreeMap::new();
+    let v0 = d.clamp(start);
+    let Some(first) = eval_at(&mut evals, &mut trial, v0, max_trials).await? else {
         return Ok((v0, false));
     };
     let (mut lo, mut hi);
@@ -1429,17 +1461,40 @@ async fn size(
             if v == prev {
                 return Ok(knee(&evals, obj));
             }
-            let Some(r) = eval_at(t, &mut evals, c, d, v, max_trials).await? else {
+            let Some(r) = eval_at(&mut evals, &mut trial, v, max_trials).await? else {
                 return Ok(knee(&evals, obj));
             };
-            if r.feasible && !obj.within(obj.value(&r), obj.value(&prev_t)) {
-                // Feasible and not within the knee ratio of the previous value: better or
-                // worse. Keep climbing only while it gets better.
-                if obj.better(obj.value(&r), obj.value(&prev_t)) {
+            // Keep climbing only while the value is feasible and better than the previous one
+            // by more than the knee ratio (9.0 compared the wrong way round, so it never
+            // climbed past the first step).
+            if r.feasible
+                && obj.better(obj.value(&r), obj.value(&prev_t))
+                && !obj.within(obj.value(&prev_t), obj.value(&r))
+            {
+                prev = v;
+                prev_t = r;
+                continue;
+            }
+            if prev == v0 && r.feasible {
+                // The first step up did not help: look below the start instead.
+                let mut cur_t = prev_t;
+                loop {
+                    let v = d.down(prev);
+                    if v == prev {
+                        break;
+                    }
+                    let Some(r) = eval_at(&mut evals, &mut trial, v, max_trials).await? else {
+                        break;
+                    };
+                    let as_good = obj.within(obj.value(&r), obj.value(&cur_t))
+                        || obj.better(obj.value(&r), obj.value(&cur_t));
+                    if !r.feasible || !as_good {
+                        break;
+                    }
                     prev = v;
-                    prev_t = r;
-                    continue;
+                    cur_t = r;
                 }
+                return Ok(knee(&evals, obj));
             }
             (lo, hi) = (prev, v);
             break;
@@ -1451,7 +1506,7 @@ async fn size(
             if v == prev {
                 return Ok(knee(&evals, obj));
             }
-            let Some(r) = eval_at(t, &mut evals, c, d, v, max_trials).await? else {
+            let Some(r) = eval_at(&mut evals, &mut trial, v, max_trials).await? else {
                 return Ok(knee(&evals, obj));
             };
             if r.feasible {
@@ -1461,21 +1516,18 @@ async fn size(
             prev = v;
         }
     }
-    // Refine: `lo` is feasible; move it up while the middle is feasible and better than (or
-    // as good as) `hi`, else move `hi` down.
+    // Refine: `lo` is feasible. Under an infeasible `hi`, move `lo` up to a feasible middle;
+    // under a feasible (worse) `hi`, only to a middle better than `lo` (S7: 9.0 also moved it to
+    // a middle merely better than `hi`, walking away from the best). Else move `hi` down.
     while let Some(m) = d.mid(lo, hi) {
-        let Some(r) = eval_at(t, &mut evals, c, d, m, max_trials).await? else {
+        let Some(r) = eval_at(&mut evals, &mut trial, m, max_trials).await? else {
             break;
         };
-        let hi_t = evals.get(&hi).cloned();
-        let lo_t = evals.get(&lo).cloned();
-        let hi_worse = hi_t
-            .as_ref()
-            .is_some_and(|h| !h.feasible || obj.better(obj.value(&r), obj.value(h)));
-        let beats_lo = lo_t
-            .as_ref()
+        let hi_infeasible = evals.get(&hi).is_some_and(|h| !h.feasible);
+        let beats_lo = evals
+            .get(&lo)
             .is_some_and(|l| !obj.within(obj.value(l), obj.value(&r)));
-        if r.feasible && (hi_worse || beats_lo) {
+        if r.feasible && (hi_infeasible || beats_lo) {
             lo = m;
         } else {
             hi = m;
@@ -1484,8 +1536,17 @@ async fn size(
     Ok(knee(&evals, obj))
 }
 
-/// The `kind` trials of the first `pairs` completed A/B pairs: a trailing baseline whose
-/// candidate did not run (the budget ended between them) is left out of every metric.
+/// Whether pair `pair` runs its candidate (B) first: a fair coin drawn from `seed`
+/// (splitmix64), so the order is random across pairs yet the same for the same run.
+fn candidate_first(seed: u64, pair: u64) -> bool {
+    let mut z = seed.wrapping_add((pair + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    (z ^ (z >> 31)) >> 63 == 1
+}
+
+/// The `kind` trials of the first `pairs` completed A/B pairs: a trailing trial whose other
+/// half did not run (the budget ended between them) is left out of every metric.
 fn paired(trials: &[ProveTrial], kind: TrialKind, pairs: u64) -> Vec<&ProveTrial> {
     trials
         .iter()
@@ -1546,7 +1607,7 @@ fn throttle_gate(
 /// `--max-throttle`; any other remedy must only not add more than `--max-throttle` to what the
 /// run already had (503s that follow no load, `lab://noisy`, are not the change's doing).
 fn sizing_throttle_limit(run: &crate::model::Run, finding: Option<&str>, max_throttle: f64) -> f64 {
-    if matches!(finding, Some("throttling" | "rate_limit" | "key_limit")) {
+    if matches!(finding, Some("throttling" | "rate_limit")) {
         return max_throttle;
     }
     let r = &run.report;
@@ -1576,20 +1637,46 @@ pub fn count_resolution(ops: u64) -> f64 {
 /// The A/A noise floor: the RMS log ratio of consecutive baseline trials (a per-pair spread),
 /// at least [`MIN_NOISE_SD`] and at least the trials' count `resolution`
 /// ([`count_resolution`]). Fewer than two A/A differences cannot say how precise the floor is,
-/// so it is doubled (and with none, it is twice the minimum).
+/// so it is doubled (and with none, it is twice the minimum). [`noise_floor_ab`] with no B.
+#[cfg(test)]
 fn noise_floor(a: &[f64], resolution: f64) -> f64 {
-    let d: Vec<f64> = a
+    noise_floor_ab(a, &[], resolution)
+}
+
+/// The mean squared log ratio of consecutive trials of one side, with how many ratios it
+/// averages: twice that side's trial-to-trial variance (von Neumann), robust to a slow drift.
+fn successive_msd(x: &[f64]) -> (f64, usize) {
+    let d: Vec<f64> = x
         .windows(2)
         .filter(|w| w[0] > 0.0 && w[1] > 0.0)
         .map(|w| (w[1] / w[0]).ln())
         .collect();
-    let rms = if d.is_empty() {
+    let msd = if d.is_empty() {
         0.0
     } else {
-        (d.iter().map(|x| x * x).sum::<f64>() / d.len() as f64).sqrt()
+        d.iter().map(|x| x * x).sum::<f64>() / d.len() as f64
     };
-    let floor = rms.max(MIN_NOISE_SD).max(resolution);
-    if d.len() < 2 { 2.0 * floor } else { floor }
+    (msd, d.len())
+}
+
+/// The noise floor of a pair's log ratio `ln(b/a)`: its variance is A's trial-to-trial
+/// variance plus B's, each estimated from that side's consecutive trials
+/// ([`successive_msd`]: `σ² ≈ MSSD / 2`), so `floor² = (MSSD_A + MSSD_B) / 2`. Until B has
+/// two trials it is assumed as noisy as A (an A/A pair: `floor² = MSSD_A`, [`noise_floor`]).
+/// W8: 9.0 took the A/A spread alone, which overstates a pair's spread by up to √2 when the
+/// change steadies B (a cap that ends the throttling of a throttled baseline). At least
+/// [`MIN_NOISE_SD`] and the count `resolution`, and doubled while A has fewer than two
+/// differences.
+fn noise_floor_ab(a: &[f64], b: &[f64], resolution: f64) -> f64 {
+    let (msd_a, na) = successive_msd(a);
+    let (msd_b, nb) = successive_msd(b);
+    let var = if nb == 0 {
+        msd_a
+    } else {
+        (msd_a + msd_b) / 2.0
+    };
+    let floor = var.sqrt().max(MIN_NOISE_SD).max(resolution);
+    if na < 2 { 2.0 * floor } else { floor }
 }
 
 /// The objective's relative change (candidate vs baseline) over the interleaved pairs: the
@@ -1635,7 +1722,7 @@ pub fn convergence(obj: ProveObjective, a: &[f64], b: &[f64], ops: &[u64]) -> Ve
     (1..=n)
         .map(|k| {
             let res = ops.get(k - 1).map(|o| count_resolution(*o)).unwrap_or(0.0);
-            let floor = noise_floor(&a[..k], res);
+            let floor = noise_floor_ab(&a[..k], &b[..k], res);
             Converged {
                 interval: objective_interval(obj, &a[..k], &b[..k], floor),
                 noise_floor_ratio: floor,
@@ -1896,7 +1983,7 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
                 .unwrap_or(Duration::from_secs(60))
                 >= Duration::from_secs(20);
         let b_warm_eta = if tc_reusable { a_eta } else { plan.eta_s };
-        let estimate = ProofEstimate::new_reused(
+        let estimate = ProofEstimate::new(
             prove_command(&req, &run),
             probe_sets
                 .iter()
@@ -1932,7 +2019,7 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
     let mut orphans = OrphanTrials {
         store: ctx.store(),
         prove_id: prove_id.clone(),
-        armed: !req.no_save,
+        armed: true,
     };
     let mut t = Trials {
         ctx,
@@ -1940,7 +2027,6 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
         base: base.clone(),
         prove_id: prove_id.clone(),
         safety,
-        no_save: req.no_save,
         guard,
         cancel: cancel.clone(),
         deadline: budget.map(|b| Instant::now() + b),
@@ -2007,40 +2093,56 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
     // The fewest operations a paired trial counted: the objective's resolution.
     let mut min_ops = u64::MAX;
     let candidate_value = sizing.as_ref().map(|s| s.value.clone());
+    let seed = run.report.spec.seed;
+    notes.push(if change.long_warmup {
+        format!(
+            "the A/B order of each pair is drawn from the run's seed ({seed}); the changed operator's TailCutLayer keeps its warmed state from one of its trials to the next, as a long-lived operator's does"
+        )
+    } else {
+        format!("the A/B order of each pair is drawn from the run's seed ({seed})")
+    });
     while (pairs as usize) < max_pairs {
         let need_pair = t.expected_duration(&[], TrialKind::Baseline)
             + t.expected_duration(&sets, TrialKind::Candidate);
         if !t.has_time_for(need_pair) {
             break;
         }
-        let Some(a) = t
-            .try_trial(&[], TrialKind::Baseline, Some(pairs), None)
-            .await?
-        else {
-            break;
+        // The order within the pair is drawn from the run's seed (W11): a drift that favours
+        // whichever trial runs first or second is spread over both.
+        let order = if candidate_first(seed, pairs) {
+            [TrialKind::Candidate, TrialKind::Baseline]
+        } else {
+            [TrialKind::Baseline, TrialKind::Candidate]
         };
-        // `need_pair` already reserved time for both halves before `a` started; run `b` to
-        // complete the pair unless `a` itself ran past the deadline, breached a guard, or was
-        // cancelled.
-        if !t.has_time_for(Duration::ZERO) {
-            break;
+        let (mut a, mut b) = (None, None);
+        for (i, kind) in order.into_iter().enumerate() {
+            // `need_pair` already reserved time for both halves before the first started; run
+            // the second to complete the pair unless the first ran past the deadline, breached
+            // a guard, or was cancelled.
+            if i == 1 && !t.has_time_for(Duration::ZERO) {
+                break;
+            }
+            let trial = if kind == TrialKind::Baseline {
+                t.try_trial(&[], kind, Some(pairs), None).await?
+            } else {
+                t.try_trial(&sets, kind, Some(pairs), candidate_value.clone())
+                    .await?
+            };
+            let Some(trial) = trial else { break };
+            if kind == TrialKind::Baseline {
+                a = Some(trial);
+            } else {
+                b = Some(trial);
+            }
         }
-        let Some(b) = t
-            .try_trial(
-                &sets,
-                TrialKind::Candidate,
-                Some(pairs),
-                candidate_value.clone(),
-            )
-            .await?
-        else {
+        let (Some(a), Some(b)) = (a, b) else {
             break;
         };
         a_vals.push(obj.value(&a));
         b_vals.push(obj.value(&b));
         min_ops = min_ops.min(a.ops_count).min(b.ops_count);
         pairs += 1;
-        let floor = noise_floor(&a_vals, count_resolution(min_ops));
+        let floor = noise_floor_ab(&a_vals, &b_vals, count_resolution(min_ops));
         let mut sprt = Sprt::new((2.0 * floor).max(MIN_EFFECT), floor, 0.05, 0.10);
         for (x, y) in a_vals.iter().zip(&b_vals) {
             sprt.push(obj.signed_log_ratio(*x, *y));
@@ -2087,8 +2189,9 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
         notes.push("the budget ran out before one pair of trials could run".to_owned());
     }
     // Step 4: decide.
-    let floor = noise_floor(
+    let floor = noise_floor_ab(
         &a_vals,
+        &b_vals,
         if pairs == 0 {
             0.0
         } else {
@@ -2196,9 +2299,6 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
     };
     // The proof first: a `--save` that fails after it must not lose it.
     let store_prove = |out: &ProveOutput| -> Result<bool> {
-        if req.no_save {
-            return Ok(false);
-        }
         match ctx
             .store()
             .save_prove(&prove_id, &serde_json::to_value(out)?)
@@ -2271,6 +2371,61 @@ mod tests {
             error_ratio: 0.0,
             feasible,
         }
+    }
+
+    /// S7: a value best at its start (a 20 ms retry backoff) was sized 20 → 40 → 28 → 33 ms,
+    /// every step after the first worse than 20. The first step up that does no better ends
+    /// the climb, and the search looks below the start instead.
+    #[tokio::test]
+    async fn sizing_stops_when_the_first_step_up_is_worse() {
+        struct F(fn(u64) -> f64, Vec<u64>);
+        impl Measure for F {
+            async fn measure(&mut self, v: u64) -> Result<Option<ProveTrial>> {
+                self.1.push(v);
+                Ok(Some(trial((self.0)(v), 10.0, true)))
+            }
+        }
+        let d = Domain::Millis { min: 20, max: 500 };
+        // Goodput falls as the backoff grows: the best is the smallest value.
+        let goodput = |v: u64| 1000.0 / (1.0 + v as f64 / 100.0);
+        let mut f = F(goodput, Vec::new());
+        let got = search(d, 20, ProveObjective::Goodput, 8, &mut f).await;
+        assert_eq!(got.unwrap(), (20, true));
+        assert_eq!(f.1, [20, 40]);
+        // From a start above the best, it descends while smaller values do better.
+        let mut f = F(goodput, Vec::new());
+        let got = search(d, 80, ProveObjective::Goodput, 8, &mut f).await;
+        assert_eq!(got.unwrap(), (20, true));
+        assert_eq!(f.1, [80, 160, 40, 20]);
+        // A value that keeps improving still climbs, then bisects below the worse step.
+        let mut f = F(|v| 1000.0 - 5.0 * (v as f64 - 100.0).abs(), Vec::new());
+        let (v, _) = search(d, 20, ProveObjective::Goodput, 8, &mut f)
+            .await
+            .unwrap();
+        assert_eq!(&f.1[..4], [20, 40, 80, 160]);
+        assert!((80..=126).contains(&v), "{v}: {:?}", f.1);
+    }
+
+    /// W11: the A/B order of the pairs is a fair coin from the run's seed: both orders occur,
+    /// and the same seed gives the same orders.
+    #[test]
+    fn the_ab_order_is_drawn_from_the_seed() {
+        let orders = |seed: u64| {
+            (0..12)
+                .map(|p| candidate_first(seed, p))
+                .collect::<Vec<_>>()
+        };
+        for seed in [0, 1, 42, u64::MAX] {
+            let o = orders(seed);
+            assert!(
+                o.iter().any(|b| *b) && o.iter().any(|b| !*b),
+                "{seed}: {o:?}"
+            );
+            assert_eq!(o, orders(seed));
+        }
+        assert_ne!(orders(1), orders(2));
+        let firsts = (0..1000u64).filter(|s| candidate_first(*s, 0)).count();
+        assert!((400..=600).contains(&firsts), "{firsts}");
     }
 
     fn output(pairs: u64, verdict: ProveVerdict) -> ProveOutput {
@@ -2416,6 +2571,7 @@ mod tests {
             (3, 6),
             3.0,
             3.0,
+            3.0,
             None,
         );
         assert_eq!((e.trials_min_count, e.trials_max_count), (8, 20));
@@ -2431,6 +2587,7 @@ mod tests {
             (0, 0),
             (3, 6),
             3.0,
+            14.0,
             14.0,
             Some(Duration::from_secs(90)),
         );
@@ -2450,7 +2607,7 @@ mod tests {
             e.line()
         );
         // Reusing a warmed TailCutLayer warms only on the first pair: 17 s + 5 × 6 s = 47 s.
-        let reused = ProofEstimate::new_reused(
+        let reused = ProofEstimate::new(
             "oprobe prove r".into(),
             vec!["layers.tail_cut=on".into()],
             (0, 0),
@@ -2473,6 +2630,7 @@ mod tests {
             (3, 6),
             3.0,
             3.0,
+            3.0,
             Some(Duration::from_secs(12)),
         );
         // 2 sizing trials (6 s), then one pair (6 s): 4 trials at most.
@@ -2488,6 +2646,7 @@ mod tests {
             vec![],
             (8, 2),
             (3, 6),
+            3.0,
             3.0,
             3.0,
             None,
@@ -2556,7 +2715,7 @@ mod tests {
         let c = convergence(ProveObjective::Goodput, &a, &b, &[]);
         assert_eq!(c.len(), 5);
         let last = c.last().unwrap();
-        let floor = noise_floor(&a, 0.0);
+        let floor = noise_floor_ab(&a, &b, 0.0);
         assert_eq!(last.noise_floor_ratio, floor);
         assert_eq!(
             last.interval,
@@ -2574,6 +2733,23 @@ mod tests {
         assert_eq!(noise_floor(&[100.0], 0.0), 2.0 * MIN_NOISE_SD);
         let f = noise_floor(&[100.0, 120.0, 100.0], 0.0);
         assert!(f > 0.15 && f < 0.2, "{f}");
+    }
+
+    /// W8: a steady candidate against a noisy (throttled) baseline: the pair's spread is A's
+    /// alone, not the A/A spread of two noisy trials (√2 more).
+    #[test]
+    fn a_steady_candidate_does_not_double_the_baselines_noise() {
+        let a = [100.0, 150.0, 100.0, 150.0];
+        let steady = [60.0, 60.0, 60.0, 60.0];
+        let aa = noise_floor(&a, 0.0);
+        let ab = noise_floor_ab(&a, &steady, 0.0);
+        assert!((ab - aa / 2f64.sqrt()).abs() < 1e-12, "{ab} vs {aa}");
+        // As noisy as A: the A/A floor.
+        assert!((noise_floor_ab(&a, &a, 0.0) - aa).abs() < 1e-12);
+        // One B trial says nothing about B: A/A.
+        assert_eq!(noise_floor_ab(&a, &[60.0], 0.0), aa);
+        // Minimums hold.
+        assert_eq!(noise_floor_ab(&[100.0; 4], &[100.0; 4], 0.0), MIN_NOISE_SD);
     }
 
     #[test]

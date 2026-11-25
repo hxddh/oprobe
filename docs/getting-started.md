@@ -60,7 +60,7 @@ oprobe prove last
 `prove` takes the run's operator (A) and the same operator with the top finding's remedy (B);
 `oprobe prove last FINDING` proves another finding's. For a remedy with a size, such as a
 concurrency limit, it first runs short sizing trials over that one value and picks the knee of
-the objective. Then it runs trials of A and B interleaved (A B A B …) until a sequential test
+the objective. Then it runs trials of A and B interleaved, pair by pair, until a sequential test
 against the noise floor decides, or the budget (`--max-duration`) runs out. It starts with the
 number of trials and the ETA of the whole proof, and prints each trial as it ends (on stderr):
 

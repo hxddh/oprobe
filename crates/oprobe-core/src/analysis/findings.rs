@@ -1466,17 +1466,26 @@ pub fn derive(run: &Run) -> Vec<Finding> {
     kept
 }
 
-/// The next command of a finding: `oprobe prove RUN CODE` when the remedy is a change of the
-/// operator (key_limit proves the client-side cap as a stopgap), else where to look.
+/// The objective the remedy of finding `code` is proved on, when it is not prove's default
+/// (goodput): `p99` for an in-flight or rate limit. Capping the requests in flight takes the
+/// throttled operations' retry backoffs out of the tail, but cannot raise goodput while spare
+/// workers already keep the service at its limit.
+pub fn proof_objective(code: &str) -> Option<&'static str> {
+    matches!(code, "throttling" | "rate_limit").then_some("p99")
+}
+
+/// The next command of a finding: `oprobe prove RUN CODE` (with the objective it is proved
+/// on) when the remedy is a change of the operator, else where to look. A remedy that is not a
+/// layer (`key_limit`: the key layout; a bandwidth cap on reads) has nothing to prove: the
+/// hot keys and the cap are in `show --detail`.
 pub fn next_command(run_id: &str, f: &Finding) -> String {
     match f.code.as_str() {
         "errors" if f.remedy.path.is_none() => format!("oprobe show {run_id} --by api"),
-        "client_bound" | "invalid_run" => format!("oprobe show {run_id} --detail"),
-        // Not a layer (a bandwidth cap on reads): nothing to prove.
-        code if f.remedy.path.is_none() && code != "key_limit" => {
-            format!("oprobe show {run_id} --detail")
-        }
-        code => format!("oprobe prove {run_id} {code}"),
+        _ if !f.remedy.provable() => format!("oprobe show {run_id} --detail"),
+        code => match proof_objective(code) {
+            Some(obj) => format!("oprobe prove {run_id} {code} --objective {obj}"),
+            None => format!("oprobe prove {run_id} {code}"),
+        },
     }
 }
 
@@ -2136,6 +2145,40 @@ pub(crate) mod tests {
             ..Default::default()
         };
         assert_eq!(next_command("r1", &f), "oprobe show r1 --detail");
+    }
+
+    /// 9.0 suggested `prove … key_limit` for a remedy it calls "not a layer" (W9), and the
+    /// throttle family's `next` omitted the objective it is proved on (W8).
+    #[test]
+    fn next_proves_only_layers_on_their_objective() {
+        let f = |code: &str, variant: Option<&str>| Finding {
+            code: code.into(),
+            remedy: remedy(code, variant),
+            ..Default::default()
+        };
+        assert_eq!(
+            next_command("r1", &f("key_limit", None)),
+            "oprobe show r1 --detail"
+        );
+        for code in ["throttling", "rate_limit"] {
+            assert_eq!(
+                next_command("r1", &f(code, None)),
+                format!("oprobe prove r1 {code} --objective p99")
+            );
+        }
+        assert_eq!(
+            next_command("r1", &f("tail_stragglers", None)),
+            "oprobe prove r1 tail_stragglers"
+        );
+        // Every `prove` a finding suggests is one prove accepts: a layer.
+        for c in CODES {
+            for v in [None, Some("reads"), Some("retried"), Some("workers")] {
+                let x = f(c, v);
+                if next_command("r1", &x).starts_with("oprobe prove") {
+                    assert!(x.remedy.provable(), "{c} {v:?}");
+                }
+            }
+        }
     }
 
     #[test]

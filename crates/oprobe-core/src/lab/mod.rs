@@ -305,7 +305,9 @@ impl Scenario {
                 "8 ms latency, 2.5% stragglers (+250 ms), 503 SlowDown above 40 concurrent requests; \
                  default workload: small-files, 64 × 64 KiB, 28 workers, 0.5 s warmup, 8 s"
             }
-            Scenario::Throttle => "5 ms latency, 503 SlowDown above 8 concurrent requests",
+            Scenario::Throttle => {
+                "5 ms latency, 503 SlowDown above 8 concurrent requests; default workload: small-files, 32 workers"
+            }
             Scenario::Stragglers => "5 ms latency, 3% of requests wait 400 ms",
             Scenario::Lossy => "20 ms latency, responses capped at 4 MiB/s per stream",
             Scenario::Flaky => "5 ms latency, 4% 500 InternalError, 2% connection resets",
@@ -450,6 +452,11 @@ pub const DEMO_CONCURRENCY: usize = 28;
 pub const DEMO_STRAGGLER_EVERY: usize = 40;
 /// Extra delay of a `lab://demo` straggler.
 pub const DEMO_STRAGGLER_MS: u64 = 250;
+/// Workers of the `lab://throttle` default workload: four times its in-flight limit of 8. At
+/// the profile default of 16, a few tenths of a percent of the operations met a 503 and its 1 s
+/// backoff, above the p99: the finding's remedy (a cap at the limit) then only queued the
+/// workers, and its prove on p99 could not decide (W8).
+pub const THROTTLE_CONCURRENCY: usize = 32;
 /// Workers of the `lab://parquet` default workload (4 requests in flight per op: 6 fit, 8 throttle).
 pub const PARQUET_CONCURRENCY: usize = 8;
 
@@ -482,6 +489,10 @@ impl Scenario {
                 warmup: Some(Duration::from_millis(500)),
                 duration: Some(crate::config::defaults().demo_duration.get()),
                 concurrency: Some(DEMO_CONCURRENCY),
+                ..Default::default()
+            },
+            Scenario::Throttle => ScenarioDefaults {
+                concurrency: Some(THROTTLE_CONCURRENCY),
                 ..Default::default()
             },
             Scenario::Parquet => ScenarioDefaults {

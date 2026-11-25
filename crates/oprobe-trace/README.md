@@ -21,9 +21,8 @@ handle.save("prod.oprobe")?; // then: oprobe show prod.oprobe
   (`FoyerLayer`, `MokaLayer`) and `Handle::queue_layer()` measures semaphore wait in outer
   concurrency layers.
 - **Your own sink:** implement `Exporter` and pass it with `Config::exporter`. With the `otel`
-  feature (opentelemetry 0.32), `otel::OtelExporter` records `http.client.request.duration`,
-  `oprobe.operation.duration` and `oprobe.cache.lookups` with OpenDAL's `scheme`, `namespace`,
-  `root` and `operation` labels.
+  feature (opentelemetry 0.32), `otel::OtelExporter` records `http.client.request.duration`
+  stage by stage with OpenDAL's `scheme`, `namespace`, `root` and `operation` labels.
 - **Faithful:** for HTTP services the layer installs an instrumented `HttpFetch` built like
   OpenDAL's default reqwest client (rustls with aws-lc-rs, the same pool defaults); the HTTP
   version, keep-alive, extra CA, proxy and in-flight cap are `Config` settings.

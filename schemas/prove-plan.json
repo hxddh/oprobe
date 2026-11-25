@@ -196,7 +196,7 @@
           "type": "integer"
         },
         "pairs_min_count": {
-          "description": "The fewest and the most A/B pairs (a pair is two trials: A, then B).",
+          "description": "The fewest and the most A/B pairs (a pair is two trials: A and B, in either order).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"

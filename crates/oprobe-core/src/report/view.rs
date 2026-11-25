@@ -442,9 +442,6 @@ impl RequestSignal {
             "upload_acked" => "upload acked",
             "send_buffered" => "send buffered",
             "cache_status" => "cache",
-            "cdn_pop" => "edge",
-            "storage_class" => "class",
-            "encryption" => "sse",
             k => k,
         };
         let value = match &self.value {
@@ -458,12 +455,13 @@ impl RequestSignal {
 }
 
 /// What one request row recorded beyond its stage timings, in a fixed order (only those the
-/// row has; the request id is not one: front ends show it on its own).
+/// row has; the request id is not one: front ends show it on its own). The edge PoP, cache
+/// age, storage class and encryption headers stay in the rows and the JSON, not here.
 pub fn request_signals(q: &crate::model::ReqRow) -> Vec<RequestSignal> {
     let d = q.detail.as_deref();
     let tcp = q.tcp.as_deref();
     let nonzero = |v: Option<u64>| v.filter(|v| *v > 0);
-    let all: [(&'static str, Option<SignalValue>); 17] = [
+    let all: [(&'static str, Option<SignalValue>); 13] = [
         (
             "code",
             d.and_then(|d| d.error_code.clone()).map(SignalValue::Text),
@@ -512,26 +510,8 @@ pub fn request_signals(q: &crate::model::ReqRow) -> Vec<RequestSignal> {
                 .map(SignalValue::Text),
         ),
         (
-            "cdn_pop",
-            d.and_then(|d| d.cdn_pop.clone()).map(SignalValue::Text),
-        ),
-        (
-            "age",
-            d.and_then(|d| d.age_s)
-                .map(|s| SignalValue::Text(format!("{s}s"))),
-        ),
-        (
             "region",
             d.and_then(|d| d.region.clone()).map(SignalValue::Text),
-        ),
-        (
-            "storage_class",
-            d.and_then(|d| d.storage_class.clone())
-                .map(SignalValue::Text),
-        ),
-        (
-            "encryption",
-            d.and_then(|d| d.encryption.clone()).map(SignalValue::Text),
         ),
     ];
     all.into_iter()
@@ -3202,6 +3182,24 @@ mod tests {
         assert_eq!(w.await_tree.as_deref(), Some("read\n  http"));
         // A plain request says nothing beyond its stages.
         assert!(w.rows[0].signals.is_empty());
+    }
+
+    #[test]
+    fn wire_headers_stay_in_the_rows_and_out_of_the_view() {
+        let mut q = crate::report::fixture::run().reqs[0].clone();
+        q.detail = Some(Box::new(crate::model::ReqDetail {
+            cdn_pop: Some("FRA".into()),
+            age_s: Some(12),
+            storage_class: Some("STANDARD_IA".into()),
+            encryption: Some("aws:kms".into()),
+            region: Some("eu-west-1".into()),
+            ..Default::default()
+        }));
+        let keys: Vec<&str> = request_signals(&q).iter().map(|s| s.key).collect();
+        assert_eq!(keys, vec!["region"]);
+        let row = serde_json::to_value(&q).unwrap();
+        assert_eq!(row["detail"]["cdn_pop"], "FRA", "{row}");
+        assert_eq!(row["detail"]["storage_class"], "STANDARD_IA", "{row}");
     }
 
     #[test]

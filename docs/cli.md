@@ -89,7 +89,8 @@ The proof is made of **trials**: short runs of the current operator (A) and the 
 plus the sizing trials. It starts by printing how many trials it may take and the ETA of the
 whole proof; `--dry-run` prints the same estimate (and the plan of one trial) and sends nothing.
 
-A verdict other than `inconclusive` needs at least **3 pairs** of trials (A then B): when the
+A verdict other than `inconclusive` needs at least **3 pairs** of trials (one A and one B, in an
+order drawn per pair from the run's seed, and said so in `notes`): when the
 budget allows fewer, the verdict is `inconclusive` (exit 0) with a note. When no pair ran at all,
 the text says `not measured` and prints no diff; `-o json` still prints a valid result
 (`verdict: "inconclusive"`, `pairs_count: 0`, a note). When the changed operator's trials
@@ -100,8 +101,10 @@ throttle more than `--max-throttle` allows, and more than the current operator's
 it failed, or it is partial and too short); profile the operator again first.
 
 The objective's interval is Student's t on the paired log ratios of the objective (B over A, pair
-by pair), with a spread no smaller than the A/A noise floor learned from consecutive A trials (a
-floor learned from a single A/A difference is doubled). Shares, such as throttled requests, are
+by pair), with a spread no smaller than the noise floor: the spread a pair's ratio would have
+from the trial-to-trial spread of A and of B alone, each learned from that side's consecutive
+trials (until B has two trials, it is assumed as noisy as A: the A/A spread; a floor learned from
+a single A/A difference is doubled). Shares, such as throttled requests, are
 compared with Newcombe's interval.
 
 `--max-duration` is the one wall-time budget of the whole proof: no trial starts that would not
@@ -111,8 +114,13 @@ part-way, it still prints and saves the partial result (`budget_exceeded: true`,
 
 `RUN` is a run id, an id prefix, `last`, `last~N` or a run's `.oprobe` file. A production trace
 has no workload to replay: `prove` refuses it and prints the `oprobe run` command for the service
-it recorded. `FINDING` is a finding code (`throttling`, `tail_stragglers`, …). The objective's
-change prints with its 95 % interval ([glossary](concepts.md#glossary)).
+it recorded. `FINDING` is a finding code (`throttling`, `tail_stragglers`, …); a finding whose
+remedy is not a layer (`key_limit`, `client_bound`, a bandwidth cap on reads) has nothing to prove,
+and `prove` refuses it with where to look instead. A finding's `next` command names the objective
+its remedy is proved on: `--objective p99` for `throttling` and `rate_limit` (a cap takes the
+throttled operations' backoffs out of the tail; it cannot raise goodput while spare workers keep
+the service at its limit). The objective's change prints with its 95 % interval
+([glossary](concepts.md#glossary)).
 
 | Flag | Meaning |
 |---|---|
@@ -140,7 +148,7 @@ oprobe prove 20261122-0915 small_ranges --max-duration 10m
 Print a profile: a stored run, or a file (`.oprobe` from `run` or from
 [`oprobe-trace`](embedding.md), or a report `.json`). Without an argument, the last run.
 Pass two or more runs or files to compare them side by side on goodput, bandwidth, latency,
-retries, throttling and stage split (`-o json`: `schemas/compare.json`, `--detail` adds the per-API
+retries, throttling and stage split (`-o json`: the `run` document, `schemas/run.json`, `--detail` adds the per-API
 comparison table). `-o json` for one run prints the shown run (`schemas/show.json`: the report of `schemas/report.json`, where it is stored, and the `by` and `range` sections when asked for); `--list -o json` the run list
 (`schemas/run-list.json`; `-n` limits the runs and the proves alike), and `--rm -o json` the deleted ids (`schemas/removed.json`). A prove id, unambiguous prove prefix, `last-prove`, or `.prove.json` file (`show --list`
 lists them) prints that prove's stored result as `prove` printed it (`schemas/prove.json`), also
@@ -188,7 +196,7 @@ Scenarios (the same six as the app's): `demo`, `throttle`, `stragglers`, `bandwi
 |---|---|
 | `--bind ADDR` | the address to listen on (default `127.0.0.1:9000`) |
 | `--allow-remote` | allow binding to a non-loopback address (`0.0.0.0`, LAN IP); refused without this flag because the lab accepts static lab credentials without authentication |
-| `--max-store-size SIZE` | cap total in-memory object bytes stored by the lab (default `8GiB`; returns `507 InsufficientStorage` above it) |
+| `--max-store-size SIZE` | (hidden from `--help`) cap total in-memory object bytes stored by the lab (default `8GiB`; returns `507 InsufficientStorage` above it) |
 
 ## Run references
 

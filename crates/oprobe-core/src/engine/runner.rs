@@ -858,16 +858,22 @@ async fn run_one(
     rec: &Arc<Recorder>,
     tree: Option<&await_tree::Registry>,
 ) {
-    // The `schedule` stage: how late the operation starts against its intended start.
-    let schedule_us = open_loop.then(|| intended.elapsed().as_micros() as u64);
+    // The operation starts now: the timeline, the trace row and the request offsets count from
+    // here (W10: 9.0 stamped an open-loop operation at its intended start, so a backlog piled
+    // every operation into the first seconds). Its latency still counts from the intended
+    // start (no coordinated omission), and the `schedule` stage — how late it started — is
+    // queue time.
+    let started = Instant::now();
+    let schedule_us =
+        open_loop.then(|| started.saturating_duration_since(intended).as_micros() as u64);
     // `measured`: the caller decided, when it issued the operation, that it belongs to the
     // measurement window.
-    let scope = OpScope::new_at(measured && rec.is_measuring(), intended, Some(rec.clone()));
+    let scope = OpScope::new_at(measured && rec.is_measuring(), started, Some(rec.clone()));
     let measured = scope.measured;
     let name = match job {
         Job::Mix(kind) => verb(kind),
     };
-    rec.op_started_at(scope.id, intended);
+    rec.op_started_at(scope.id, started);
     let mut key = String::new();
     let fut = scope.run(async {
         match job {
@@ -908,7 +914,7 @@ async fn run_one(
         OpCompletion {
             verb: name,
             op_id: scope.id,
-            started: intended,
+            started,
             latency_us,
             logical_read: lr,
             logical_write: lw,
@@ -1103,6 +1109,50 @@ mod tests {
         let v = &snap.verbs[0];
         assert!(
             v.breakdown.queue_ms > v.breakdown.client_ms,
+            "{:?}",
+            v.breakdown
+        );
+    }
+
+    /// W10: an open loop that falls behind stamps each operation when it actually starts, so
+    /// the timeline spreads them over the window; the lateness stays in the latency as queue.
+    #[tokio::test]
+    async fn a_backlogged_open_loop_stamps_operations_when_they_start() {
+        // One slot against a 20 ms server at 100 arrivals/s: about 45 operations a second
+        // start, ever later behind their schedule.
+        let lab = crate::lab::LabServer::spawn(
+            "127.0.0.1:0",
+            crate::lab::LabConfig {
+                base_ttfb_delay: Duration::from_millis(20),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let mut p = lab.profile("b");
+        p.workload = profile("memory://").workload;
+        p.workload.concurrency = 1;
+        let s = Session::open(p, Cancel::new(), quiet()).await.unwrap();
+        let knobs = Knobs::of(&s.profile);
+        let snap = s
+            .run(&knobs, &opts(2_000, Some(100.0)), None)
+            .await
+            .unwrap();
+        let ops: Vec<u64> = snap.timeline.iter().map(|t| t.ops_count).collect();
+        assert!(ops.len() >= 2, "{ops:?}");
+        // 9.0: every started operation was due in the first half second: [n, 0].
+        assert!(ops[1] * 2 >= ops[0], "{ops:?}");
+        // The lateness is in the latency (from the intended start), as queue time.
+        let stage = snap.open_loop.as_ref().unwrap().schedule.unwrap();
+        assert!(stage.max > 500.0, "{stage:?}");
+        assert!(
+            snap.summary.latency.max >= stage.max,
+            "{:?}",
+            snap.summary.latency
+        );
+        let v = &snap.verbs[0];
+        assert!(
+            v.breakdown.queue_ms > v.breakdown.backend_ms,
             "{:?}",
             v.breakdown
         );
