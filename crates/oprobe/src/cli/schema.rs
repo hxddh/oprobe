@@ -59,7 +59,7 @@ pub fn entries() -> Vec<Entry> {
         },
         Entry {
             name: "run",
-            description: "The result of `oprobe run -o json` (and `demo`): one run per operator, each with its report, and the comparison when there are several",
+            description: "The result of `oprobe run -o json` (and `demo`): one run per operator, each with its report, and the comparison when there are several; `oprobe show A B -o json` prints the same document",
             input: false,
             build: gen_cmd::<crate::app::RunSet>,
         },
@@ -94,12 +94,6 @@ pub fn entries() -> Vec<Entry> {
             build: gen_cmd::<crate::app::RunList>,
         },
         Entry {
-            name: "compare",
-            description: "The result of `oprobe show A B -o json`: two or more runs compared side by side",
-            input: false,
-            build: gen_cmd::<crate::app::Comparison>,
-        },
-        Entry {
             name: "removed",
             description: "The result of `oprobe show --rm RUN -o json`: the deleted run ids",
             input: false,
@@ -125,7 +119,7 @@ pub fn entries() -> Vec<Entry> {
         },
         Entry {
             name: "events",
-            description: "One event of a running command (oprobe.events/1), as the app receives them",
+            description: "One event of a running command (oprobe.events/9), as the app receives them",
             input: false,
             build: gen_for::<crate::events::Event>,
         },

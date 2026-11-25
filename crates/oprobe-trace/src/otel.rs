@@ -18,23 +18,18 @@
 use std::sync::{Arc, OnceLock};
 
 use opentelemetry::KeyValue;
-use opentelemetry::metrics::{Counter, Histogram, Meter};
+use opentelemetry::metrics::{Histogram, Meter};
 
 use crate::record::RequestRecord;
 use crate::recorder::Exporter;
 
 /// The request metric name (HTTP semantic conventions).
 pub const REQUEST_DURATION: &str = "http.client.request.duration";
-/// Logical OpenDAL operation duration (seconds).
-pub const OPERATION_DURATION: &str = "oprobe.operation.duration";
-/// Local cache lookups counter (`oprobe.cache.result` = `hit` | `miss`).
-pub const CACHE_LOOKUPS: &str = "oprobe.cache.lookups";
 
-/// Emits [`REQUEST_DURATION`], [`OPERATION_DURATION`] and [`CACHE_LOOKUPS`].
+/// Emits [`REQUEST_DURATION`]. Operation-level metrics are OpenDAL's own
+/// (`opendal-layer-otelmetrics`): oprobe adds what only it sees, the request's stages.
 pub struct OtelExporter {
     duration: Histogram<f64>,
-    op_duration: Histogram<f64>,
-    cache_lookups: Counter<u64>,
     /// `scheme`, `namespace`, `root` of the service (once the layer is applied).
     service: OnceLock<[KeyValue; 3]>,
 }
@@ -52,15 +47,6 @@ impl OtelExporter {
                 .f64_histogram(REQUEST_DURATION)
                 .with_unit("s")
                 .with_description("Duration of HTTP client requests, by oprobe stage.")
-                .build(),
-            op_duration: meter
-                .f64_histogram(OPERATION_DURATION)
-                .with_unit("s")
-                .with_description("Duration of logical OpenDAL operations.")
-                .build(),
-            cache_lookups: meter
-                .u64_counter(CACHE_LOOKUPS)
-                .with_description("Local client cache lookups observed by oprobe.")
                 .build(),
             service: OnceLock::new(),
         }
@@ -107,34 +93,6 @@ impl Exporter for OtelExporter {
                 ));
             }
             self.duration.record(us as f64 / 1e6, &attrs);
-        }
-    }
-
-    fn on_op(&self, verb: &'static str, latency_us: u64, failed: bool) {
-        let mut attrs = Vec::with_capacity(5);
-        attrs.push(KeyValue::new("operation", verb));
-        attrs.push(KeyValue::new(
-            "oprobe.outcome",
-            if failed { "error" } else { "ok" },
-        ));
-        if let Some(s) = self.service.get() {
-            attrs.extend(s.iter().cloned());
-        }
-        self.op_duration.record(latency_us as f64 / 1e6, &attrs);
-    }
-
-    fn on_cache(&self, lookups: u64, hits: u64) {
-        let misses = lookups.saturating_sub(hits);
-        for (res, count) in [("hit", hits), ("miss", misses)] {
-            if count == 0 {
-                continue;
-            }
-            let mut attrs = Vec::with_capacity(4);
-            attrs.push(KeyValue::new("oprobe.cache.result", res));
-            if let Some(s) = self.service.get() {
-                attrs.extend(s.iter().cloned());
-            }
-            self.cache_lookups.add(count, &attrs);
         }
     }
 

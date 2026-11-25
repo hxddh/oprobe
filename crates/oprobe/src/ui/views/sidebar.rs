@@ -9,7 +9,6 @@
 //! with its progress.
 
 use nsh_base::{HandleEdge, resize_handle, theme};
-use nsh_core::element::desktop::main_window;
 use nsh_core::element::os;
 use nsh_core::keymap::When;
 use nsh_core::platform::Os;
@@ -334,7 +333,7 @@ fn row(
         } else if term {
             Look::Accent
         } else if mac {
-            let key = main_window().state().is_none_or(|w| w.focused);
+            let key = s.window_focused();
             if key && focused.get() {
                 Look::Accent
             } else {

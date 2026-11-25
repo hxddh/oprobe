@@ -1,5 +1,6 @@
 //! Run identifiers: `YYYYMMDD-HHMMSS-xxxx`: the UTC start second, then 16 bits holding the
-//! millisecond (× 64) plus 6 random bits, so ids sort in creation order even within a second.
+//! millisecond (× 64) plus 6 bits that start at random in each millisecond, so ids sort in
+//! creation order even within a second.
 
 use std::fmt;
 use std::time::SystemTime;
@@ -27,7 +28,10 @@ impl RunId {
         let (use_ms, sub) = {
             let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
             if epoch_ms > st.0 {
-                let s = rand::random::<u16>() % 32;
+                // Any of the 64 values: two processes minting an id in the same millisecond
+                // collide 1 time in 64. More ids in this millisecond count up from here, then
+                // move on to the next millisecond (strictly monotonic either way).
+                let s = rand::random::<u16>() % 64;
                 *st = (epoch_ms, s);
                 (epoch_ms, s)
             } else if st.1 < 63 {
@@ -186,6 +190,23 @@ mod tests {
 #[cfg(test)]
 mod order_tests {
     use super::RunId;
+
+    /// The first id of a millisecond starts anywhere in its 64 values (9.0 drew only 32, so
+    /// two processes collided 1 time in 32).
+    #[test]
+    fn the_first_id_of_a_millisecond_uses_all_64_values() {
+        let mut upper = false;
+        for _ in 0..200 {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            let id = RunId::new();
+            let tag = u16::from_str_radix(&id.as_str()[16..], 16).unwrap();
+            if tag % 64 >= 32 {
+                upper = true;
+                break;
+            }
+        }
+        assert!(upper, "no first id of a millisecond in the upper 32 values");
+    }
 
     #[test]
     fn ids_created_in_sequence_sort_in_sequence() {

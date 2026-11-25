@@ -274,12 +274,10 @@ pub struct RequestRecord {
 
 impl RequestRecord {
     pub fn is_throttle(&self) -> bool {
-        self.status == 429
-            || (self.status == 503
-                && !matches!(
-                    self.detail.as_deref().and_then(|d| d.error_code.as_deref()),
-                    Some("InternalError" | "ServiceUnavailable")
-                ))
+        crate::rows::FailureCode::is_throttle_response(
+            self.status,
+            self.detail.as_deref().and_then(|d| d.error_code.as_deref()),
+        )
     }
     pub fn is_error(&self) -> bool {
         self.status == 0 || self.status >= 400 || self.error.is_some()
@@ -429,6 +427,28 @@ pub fn classify_http(method: &http::Method, path: &str, query: Option<&str>) -> 
 mod tests {
     use super::*;
     use http::Method;
+
+    /// S3 answers "reduce your request rate" with `503 SlowDown` or `503 ServiceUnavailable`:
+    /// both are throttling. Only `503 InternalError` is a server error.
+    #[test]
+    fn a_503_service_unavailable_is_throttling() {
+        use crate::rows::FailureCode;
+        for code in [None, Some("SlowDown"), Some("ServiceUnavailable")] {
+            assert!(FailureCode::is_throttle_response(503, code), "{code:?}");
+            assert_eq!(
+                FailureCode::of_request(503, code),
+                Some(FailureCode::StorageThrottled),
+                "{code:?}"
+            );
+        }
+        assert!(!FailureCode::is_throttle_response(503, Some("InternalError")));
+        assert_eq!(
+            FailureCode::of_request(503, Some("InternalError")),
+            Some(FailureCode::Internal)
+        );
+        assert!(FailureCode::is_throttle_response(429, None));
+        assert!(!FailureCode::is_throttle_response(500, None));
+    }
 
     #[test]
     fn classifies_s3_requests() {

@@ -7,7 +7,8 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use opendal::Operator;
 use opendal::layers::{
-    ConcurrentLimitLayer, FoyerLayer, RetryLayer, TailCutLayer, ThrottleLayer, TimeoutLayer,
+    ConcurrentLimitLayer, FoyerKey, FoyerLayer, FoyerValue, RetryLayer, TailCutLayer,
+    ThrottleLayer, TimeoutLayer,
 };
 
 use super::diff::UNLIMITED_OPERATIONS;
@@ -301,12 +302,7 @@ pub async fn apply_layers_with_recorder(
         };
     }
     if let Some(p) = params("cache") {
-        let cache = foyer::HybridCacheBuilder::new()
-            .memory(bytes(&p, "memory") as usize)
-            .storage()
-            .build()
-            .await
-            .context("cannot build the in-memory foyer cache")?;
+        let cache = memory_cache(bytes(&p, "memory") as usize).await?;
         op = op.layer(FoyerLayer::new(cache));
         if observe && let Some(rec) = recorder {
             op = op.layer(crate::trace::CacheObserveLayer::new(rec));
@@ -315,9 +311,63 @@ pub async fn apply_layers_with_recorder(
     Ok(op)
 }
 
+/// Shards of the in-memory cache (foyer's default).
+pub(crate) const CACHE_SHARDS: usize = 8;
+
+/// The in-memory foyer cache of `layers.cache.memory`: at most `capacity_bytes` of cached data.
+/// Each entry weighs its value's length (foyer's default weighs every entry 1, so "1 KiB" held
+/// 1024 objects of any size), and an object larger than a shard's share of the budget is not
+/// admitted (foyer keeps an entry heavier than its shard, one per shard).
+pub(crate) async fn memory_cache(
+    capacity_bytes: usize,
+) -> Result<foyer::HybridCache<FoyerKey, FoyerValue>> {
+    let shards = CACHE_SHARDS.min(capacity_bytes.max(1));
+    let per_shard = capacity_bytes / shards;
+    foyer::HybridCacheBuilder::new()
+        .memory(capacity_bytes.max(1))
+        .with_shards(shards)
+        .with_weighter(|_: &FoyerKey, v: &FoyerValue| v.len())
+        .with_filter(move |_: &FoyerKey, v: &FoyerValue| v.len() <= per_shard)
+        .storage()
+        .build()
+        .await
+        .context("cannot build the in-memory foyer cache")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `cache = { memory = "1KiB" }` holds 1 KiB of data, not 1024 objects: a 1 KiB cache
+    /// cannot keep 64 MiB (9.0 weighed every entry 1, so it "fit" 1024 × 64 KiB).
+    #[tokio::test]
+    async fn the_cache_budget_is_bytes_not_entries() {
+        let cache = memory_cache(1024).await.unwrap();
+        for i in 0..1024 {
+            cache.insert(
+                FoyerKey {
+                    path: format!("k{i}"),
+                    version: None,
+                },
+                FoyerValue(opendal::Buffer::from(vec![0u8; 64 * 1024])),
+            );
+        }
+        assert!(
+            cache.memory().usage() <= 1024,
+            "{} bytes cached",
+            cache.memory().usage()
+        );
+        // A small value fits and is served.
+        let key = FoyerKey {
+            path: "small".into(),
+            version: None,
+        };
+        cache.insert(
+            key.clone(),
+            FoyerValue(opendal::Buffer::from(vec![1u8; 100])),
+        );
+        assert!(cache.memory().contains(&key));
+    }
 
     #[tokio::test]
     async fn every_layer_builds_and_serves() {

@@ -26,11 +26,11 @@ ignore = [
   # drop this entry once OpenDAL moves to rsa >= 0.10.
   { id = "RUSTSEC-2023-0071", reason = "signing only, no RSA decryption; no fix available upstream (reqsign 3.x)" },
   # Unmaintained crates pulled in by the terminal/native UI toolkit (nsh): syntax highlighting
-  # (syntect -> bincode), dates (chrono) and SVG text shaping (resvg -> rustybuzz, ttf-parser).
+  # (syntect -> bincode), dates (chrono) and SVG fonts (resvg -> ttf-parser; nsh 0.7 shapes with
+  # harfrust, so rustybuzz is gone).
   # None of them parses untrusted network input; they are tracked for replacement upstream.
   { id = "RUSTSEC-2025-0141", reason = "bincode via syntect (UI toolkit); only bundled syntax sets are decoded" },
   { id = "RUSTSEC-2026-0543", reason = "chrono via nsh (UI toolkit); no known vulnerability" },
-  { id = "RUSTSEC-2026-0206", reason = "rustybuzz via resvg (UI toolkit); shapes bundled fonts only" },
   { id = "RUSTSEC-2026-0192", reason = "ttf-parser via resvg (UI toolkit); parses bundled fonts only" },
 ]
 

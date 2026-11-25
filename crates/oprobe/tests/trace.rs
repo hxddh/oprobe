@@ -59,6 +59,19 @@ async fn traced_workload_with(
     reads: usize,
     missing: usize,
 ) -> u64 {
+    traced_workload_saved(path, faults, cfg, reads, missing, true).await
+}
+
+/// [`traced_workload_with`], saved with its rows (`Handle::save`) or as aggregates only
+/// (`Snapshot::save`).
+async fn traced_workload_saved(
+    path: &Path,
+    faults: LabConfig,
+    cfg: oprobe::trace::Config,
+    reads: usize,
+    missing: usize,
+    rows: bool,
+) -> u64 {
     let lab = LabServer::spawn("127.0.0.1:0", faults)
         .await
         .expect("lab starts");
@@ -100,7 +113,11 @@ async fn traced_workload_with(
     for i in 0..missing {
         assert!(op.stat(&format!("logs/missing{i}")).await.is_err());
     }
-    handle.save(path).unwrap();
+    if rows {
+        handle.save(path).unwrap();
+    } else {
+        handle.snapshot().save(path).unwrap();
+    }
     lab.requests_served()
 }
 
@@ -493,4 +510,108 @@ async fn hostile_trace_values_never_panic_show() {
             assert_eq!(o.status.code(), Some(2), "{what}: {stderr}");
         }
     }
+}
+
+/// An embedded layer has no sampler: the timeline's new connections and peak requests in
+/// flight are filled where a connection is dialed and a request starts (9.0 showed 0 and 0).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_embedded_trace_fills_connections_and_inflight_per_interval() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("conns.oprobe");
+    // No keep-alive: every request dials.
+    let cfg = oprobe::trace::Config::default().keep_alive(false);
+    traced_workload(&file, LabConfig::default(), cfg, 2).await;
+    let o = oprobe(dir.path(), &["show", file.to_str().unwrap(), "-o", "json"]);
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let r = &json(&o)["report"];
+    let tl = r["timeline"].as_array().unwrap();
+    assert!(!tl.is_empty());
+    let dialed: u64 = tl
+        .iter()
+        .map(|p| p["new_connections_count"].as_u64().unwrap_or(0))
+        .sum();
+    let peak = tl
+        .iter()
+        .map(|p| p["inflight_peak_count"].as_u64().unwrap_or(0))
+        .max()
+        .unwrap();
+    assert_eq!(
+        dialed,
+        r["connections"]["dialed_count"].as_u64().unwrap(),
+        "{tl:#?}"
+    );
+    assert!(dialed > 0, "{tl:#?}");
+    assert!(peak >= 1, "{tl:#?}");
+}
+
+/// A trace saved as aggregates only (`Snapshot::save`) keeps no rows but the slowest
+/// operations rebuilt from its aggregates: a range or a grouping of those would describe a
+/// handful of slow operations, not the traffic, so both are refused (9.0 printed them).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_aggregates_only_trace_refuses_ranges_and_groupings() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("aggregates.oprobe");
+    let faults = LabConfig {
+        straggler_every_n: 10,
+        straggler_delay: Duration::from_millis(30),
+        ..Default::default()
+    };
+    traced_workload_saved(&file, faults, oprobe::trace::Config::default(), 3, 0, false).await;
+    let f = file.to_str().unwrap();
+    let o = oprobe(dir.path(), &["show", f, "-o", "json"]);
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    validate("report", &json(&o)["report"]);
+    for extra in [
+        &["--by", "api"][..],
+        &["--since", "0s"][..],
+        &["--by", "stage"][..],
+    ] {
+        let mut args = vec!["show", f];
+        args.extend_from_slice(extra);
+        args.extend(["-o", "json"]);
+        let o = oprobe(dir.path(), &args);
+        assert_eq!(
+            o.status.code(),
+            Some(2),
+            "{extra:?}: {}",
+            String::from_utf8_lossy(&o.stdout)
+        );
+        let e = &json(&o)["error"];
+        assert_eq!(e["code"], "usage.invalid_argument", "{e}");
+        assert!(
+            e["hint"].as_str().unwrap().contains("aggregates only"),
+            "{e}"
+        );
+    }
+    // The same trace saved with its rows takes both.
+    let file = dir.path().join("rows.oprobe");
+    traced_workload_saved(
+        &file,
+        LabConfig::default(),
+        oprobe::trace::Config::default(),
+        1,
+        0,
+        true,
+    )
+    .await;
+    let o = oprobe(
+        dir.path(),
+        &["show", file.to_str().unwrap(), "--by", "api", "-o", "json"],
+    );
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
 }

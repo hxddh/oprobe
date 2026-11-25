@@ -13,7 +13,13 @@ use oprobe::engine::measure::{Rails, Request, measure};
 use oprobe::guard::Budgets;
 use oprobe::util::HumanDuration;
 
+/// One lab run at a time: the ceiling is read from the client's in-flight counts, and a second
+/// lab run loading the same CPUs (52 demo workers) delays responses in the client, so its
+/// counts read several levels above the server's (a clean 29 on a lab limited at 24).
+static ONE_AT_A_TIME: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 async fn lab_run(scenario: &str, preset: Preset, workers: usize) -> oprobe::model::Run {
+    let _one = ONE_AT_A_TIME.lock().await;
     let mut p = Profile::from_url(&format!("lab://{scenario}"));
     p.workload.preset = preset;
     if preset == Preset::RangeReads {
@@ -80,7 +86,7 @@ async fn parquet_lab_ops_peak_at_four_requests_in_flight() {
         .inflight_ceiling
         .unwrap_or_else(|| panic!("12 × 4 > 24 throttles: {}", c.confidence_reason));
     assert!(
-        ce.lo <= 24.0 && 24.0 <= ce.hi,
+        ce.lo <= 24.0 && 24.0 < ce.hi,
         "{ce:?}: {:?}",
         c.observed.levels
     );

@@ -131,7 +131,6 @@ fn checked_in_schemas_match_the_code() {
             "prove-plan",
             "show",
             "run-list",
-            "compare",
             "removed",
             "lab",
             "operator",
@@ -1004,6 +1003,21 @@ fn five_x_vestiges_are_gone() {
     assert!(!h.contains("hotkey") && h.contains("ratelimit"), "{h}");
 }
 
+/// `lab --max-store-size` is hidden from the help (design 9.1 §3), and still taken.
+#[test]
+fn lab_max_store_size_is_hidden_but_accepted() {
+    let env = Env::new();
+    let h = stdout(&env.run(&["lab", "--help"]));
+    assert!(!h.contains("--max-store-size"), "{h}");
+    assert!(h.contains("--allow-remote"), "{h}");
+    // A zero size is refused by its parser, not as an unknown flag.
+    let o = env.run(&["lab", "--max-store-size", "0"]);
+    assert_eq!(code(&o), 2);
+    let e = stderr(&o);
+    assert!(!e.contains("unexpected argument"), "{e}");
+    assert!(e.contains("max-store-size"), "{e}");
+}
+
 #[test]
 fn bare_oprobe_is_the_app() {
     let env = Env::new();
@@ -1334,11 +1348,10 @@ fn show_compares_multiple_runs_and_prove_saves_when_improved() {
     assert_eq!(code(&o2), 0, "{}", stderr(&o2));
     let id2 = json(&o2)["runs"][0]["run_id"].as_str().unwrap().to_owned();
 
-    // `show A B -o json` matches `schemas/compare.json` (and `schemas/run.json`) with a side-by-side comparison.
+    // `show A B -o json` is a `schemas/run.json` document with a side-by-side comparison.
     let cmp = env.run(&["show", &id1, &id2, "-o", "json"]);
     assert_eq!(code(&cmp), 0, "{}", stderr(&cmp));
     let v = json(&cmp);
-    validate("compare", &v);
     validate("run", &v);
     assert_eq!(v["runs"].as_array().unwrap().len(), 2);
     assert!(v["comparison"].is_object(), "{v:#}");
@@ -1349,28 +1362,30 @@ fn show_compares_multiple_runs_and_prove_saves_when_improved() {
     assert!(text.contains("GetObject"), "{text}");
 
     // `prove --save` on an improved remedy writes `op.toml`, and `show last-prove` opens it.
-    let o_strag = env.run(&[
+    // Deterministic: one operation at a time against 20 ms of latency, then sixteen (about
+    // 16× the goodput, whatever the machine).
+    let o_lim = env.run(&[
         "run",
-        "lab://stragglers",
+        "lab://lossy",
         "-c",
-        "8",
+        "16",
         "-d",
         "800ms",
         "--warmup",
         "0s",
+        "--set",
+        "layers.concurrent_limit.operations=1",
         "-q",
         "-o",
         "json",
     ]);
-    assert_eq!(code(&o_strag), 0, "{}", stderr(&o_strag));
+    assert_eq!(code(&o_lim), 0, "{}", stderr(&o_lim));
     let save_path = env.path("proven-op.toml");
     let p = env.run(&[
         "prove",
         "last",
         "--with",
-        "layers.tail_cut=on",
-        "--with",
-        "layers.retry.min_delay=10ms",
+        "layers.concurrent_limit.operations=64",
         "--trial",
         "400ms",
         "--pairs",
@@ -1381,18 +1396,106 @@ fn show_compares_multiple_runs_and_prove_saves_when_improved() {
         "-o",
         "json",
     ]);
-    assert!(matches!(code(&p), 0 | 3), "{}", stderr(&p));
+    assert_eq!(code(&p), 0, "{}", stderr(&p));
     let pv = json(&p);
     validate("prove", &pv);
-    if pv["verdict"] == "improved" {
-        let saved = std::fs::read_to_string(&save_path).unwrap();
-        assert!(
-            saved.contains("[layers.tail_cut]") && saved.contains("min_delay = \"10ms\""),
-            "{saved}"
-        );
-        assert_eq!(pv["saved_to"].as_str(), save_path.to_str());
-    }
+    assert_eq!(pv["verdict"], "improved", "{pv:#}");
+    let saved = std::fs::read_to_string(&save_path).unwrap();
+    assert!(saved.contains("operations = 64"), "{saved}");
+    assert_eq!(pv["saved_to"].as_str(), save_path.to_str());
+    // W7: the next profile replays the run's workload on the proven operator.
+    let next = pv["run_command"].as_str().unwrap();
+    assert!(
+        next.starts_with("oprobe run lab://lossy")
+            && next.contains("-c 16")
+            && next.contains("-d 800ms")
+            && next.contains("layers.concurrent_limit.operations=64"),
+        "{next}"
+    );
+    let stored: Value = serde_json::from_slice(
+        &std::fs::read(env.data().join(format!(
+            "runs/{}.prove.json",
+            pv["prove_id"].as_str().unwrap()
+        )))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(stored["saved_to"], pv["saved_to"]);
+    // Not improved (sixteen workers down to one operation at a time): nothing is written.
+    let o_free = env.run(&[
+        "run",
+        "lab://lossy",
+        "-c",
+        "16",
+        "-d",
+        "800ms",
+        "--warmup",
+        "0s",
+        "-q",
+        "-o",
+        "json",
+    ]);
+    assert_eq!(code(&o_free), 0, "{}", stderr(&o_free));
+    let not_saved = env.path("not-saved-op.toml");
+    let p_worse = env.run(&[
+        "prove",
+        "last",
+        "--with",
+        "layers.concurrent_limit.operations=1",
+        "--trial",
+        "400ms",
+        "--pairs",
+        "3",
+        "--save",
+        not_saved.to_str().unwrap(),
+        "-q",
+        "-o",
+        "json",
+    ]);
+    let wv = json(&p_worse);
+    validate("prove", &wv);
+    assert_eq!(wv["verdict"], "worse", "{wv:#}");
+    assert_eq!(code(&p_worse), 3, "{}", stderr(&p_worse));
+    assert!(!not_saved.exists(), "a worse change was saved");
+    assert!(wv.get("saved_to").is_none(), "{wv:#}");
+    assert!(
+        wv["notes"]
+            .to_string()
+            .contains("skipped: verdict is worse"),
+        "{wv:#}"
+    );
+    // D1/D2: a `--save` target that is not this service's operator is refused before any
+    // trial runs, and left as it was.
+    let foreign = env.path("Cargo.toml");
+    std::fs::write(&foreign, "[package]\nname = \"app\"\n").unwrap();
+    let proves_before = std::fs::read_dir(env.data().join("runs")).unwrap().count();
+    let bad = env.run(&[
+        "prove",
+        "last",
+        "--with",
+        "layers.concurrent_limit.operations=8",
+        "--trial",
+        "400ms",
+        "--save",
+        foreign.to_str().unwrap(),
+        "-o",
+        "json",
+    ]);
+    assert_eq!(code(&bad), 2, "{}", stdout(&bad));
+    assert_eq!(error_code(&bad), "usage.invalid_argument");
+    assert_eq!(
+        std::fs::read_to_string(&foreign).unwrap(),
+        "[package]\nname = \"app\"\n"
+    );
+    assert_eq!(
+        std::fs::read_dir(env.data().join("runs")).unwrap().count(),
+        proves_before,
+        "no trial ran"
+    );
+    // The last prove is still the worse one.
     let last_p = env.run(&["show", "last-prove", "-o", "json"]);
+    assert_eq!(json(&last_p)["prove_id"], wv["prove_id"]);
+    let pv = wv;
     assert_eq!(code(&last_p), 0, "{}", stderr(&last_p));
     assert_eq!(json(&last_p)["prove_id"], pv["prove_id"]);
     assert_eq!(json(&last_p)["schema"], "oprobe.prove/9");
@@ -1409,4 +1512,97 @@ fn show_compares_multiple_runs_and_prove_saves_when_improved() {
         assert_eq!(code(&bad), 2, "{extra:?}: {}", stdout(&bad));
         assert_eq!(error_code(&bad), "usage.invalid_argument");
     }
+}
+
+/// D3: the hint for an unreadable prove result never suggests a `show --rm` that would match
+/// something else: a file outside the store (whose stem prefix-matches a stored run) is to be
+/// deleted as a file; only a stored prove named by its full id is removed with `--rm`.
+#[test]
+fn an_unreadable_prove_hint_never_removes_an_unrelated_run() {
+    let env = Env::new();
+    let o = env.run(&run_args(&["memory://"], &["-q", "-o", "json"]));
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let run_id = json(&o)["runs"][0]["run_id"].as_str().unwrap().to_owned();
+    // `20261125.prove.json` next to the user's files: its stem prefixes the stored run's id.
+    let outside = env.path(&format!("{}.prove.json", &run_id[..8]));
+    std::fs::write(
+        &outside,
+        r#"{"schema":"oprobe.prove/1","prove_id":"x","verdict":"improved"}"#,
+    )
+    .unwrap();
+    let o = env.run(&["show", outside.to_str().unwrap(), "-o", "json"]);
+    assert_eq!(code(&o), 2, "{}", stdout(&o));
+    let hint = json(&o)["error"]["hint"].as_str().unwrap().to_owned();
+    assert!(!hint.contains("--rm"), "{hint}");
+    assert!(hint.contains("delete the file"), "{hint}");
+    assert_eq!(env.runs().len(), 1);
+    // A stored prove, named by its full id, is removed with `--rm ID`.
+    let id = "20200101-000000-0001";
+    std::fs::write(
+        env.data().join(format!("runs/{id}.prove.json")),
+        r#"{"schema":"oprobe.prove/1"}"#,
+    )
+    .unwrap();
+    let o = env.run(&["show", id, "-o", "json"]);
+    assert_eq!(code(&o), 2, "{}", stdout(&o));
+    let hint = json(&o)["error"]["hint"].as_str().unwrap().to_owned();
+    assert!(hint.contains(&format!("oprobe show --rm {id}")), "{hint}");
+}
+
+/// W5/W6: a file oprobe cannot read says what it is and which command takes it: random bytes
+/// are "not an oprobe run file" (a usage error, not `internal`), a prove result passed to
+/// `prove` is a prove result, a run's sidecar points at its run.
+#[test]
+fn files_that_are_not_runs_say_what_they_are() {
+    let env = Env::new();
+    let junk = env.path("junk.bin");
+    let bytes: Vec<u8> = (0..2048u32).map(|i| (i * 7919 % 251) as u8).collect();
+    std::fs::write(&junk, bytes).unwrap();
+    let o = env.run(&["show", junk.to_str().unwrap(), "-o", "json"]);
+    assert_eq!(code(&o), 2, "{}", stdout(&o));
+    let e = &json(&o)["error"];
+    assert_eq!(e["code"], "usage.invalid_argument", "{e}");
+    assert!(
+        e["message"]
+            .as_str()
+            .unwrap()
+            .contains("not an oprobe run file"),
+        "{e}"
+    );
+    assert!(e["hint"].is_string(), "{e}");
+    // A run's sidecar.
+    let o = env.run(&run_args(&["memory://"], &["-q", "-o", "json"]));
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let run_id = json(&o)["runs"][0]["run_id"].as_str().unwrap().to_owned();
+    let sidecar = env.data().join(format!("runs/{run_id}.json"));
+    assert!(sidecar.is_file());
+    let o = env.run(&["prove", sidecar.to_str().unwrap(), "-o", "json"]);
+    assert_eq!(code(&o), 2, "{}", stdout(&o));
+    let e = &json(&o)["error"];
+    assert!(e["message"].as_str().unwrap().contains("sidecar"), "{e}");
+    assert!(
+        e["hint"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("{run_id}.oprobe")),
+        "{e}"
+    );
+    // A prove result passed to `prove`.
+    let fake = env.path("x.prove.json");
+    std::fs::write(
+        &fake,
+        format!(
+            r#"{{"schema":"oprobe.prove/9","prove_id":"20200101-000000-0001","run_id":"{run_id}","verdict":"improved"}}"#
+        ),
+    )
+    .unwrap();
+    let o = env.run(&["prove", fake.to_str().unwrap(), "-o", "json"]);
+    assert_eq!(code(&o), 2, "{}", stdout(&o));
+    let e = &json(&o)["error"];
+    assert!(
+        e["message"].as_str().unwrap().contains("prove result"),
+        "{e}"
+    );
+    let hint = e["hint"].as_str().unwrap();
+    assert!(hint.contains(&run_id) && !hint.contains("versions"), "{e}");
 }

@@ -179,3 +179,40 @@ fn slow_operations_keep_their_await_tree() {
         "{text}"
     );
 }
+
+/// S3 also throttles with `503 ServiceUnavailable` ("reduce your request rate"): it counts as
+/// throttling, not as server errors (9.0 counted only `SlowDown` and 429).
+#[test]
+fn a_503_service_unavailable_is_counted_as_throttling() {
+    let env = Env::new();
+    let (_rt, lab) = background_lab(LabConfig {
+        base_ttfb_delay: Duration::from_millis(5),
+        max_inflight_before_503: Some(2),
+        throttle_service_unavailable: true,
+        ..Default::default()
+    });
+    let o = env
+        .cmd()
+        .arg("run")
+        .args(lab_args(&lab.endpoint_url))
+        .args(["-c", "8", "-d", "1s", "-o", "json"])
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", err(&o));
+    let r = &json(&o)["runs"][0]["report"];
+    let res = &r["resilience"];
+    assert!(lab.emitted_throttles() > 0, "8 workers > 2 throttle");
+    assert!(
+        res["throttled_responses_count"].as_u64().unwrap() > 0,
+        "{res}"
+    );
+    assert!(res["status_503_count"].as_u64().unwrap() > 0, "{res}");
+    assert_eq!(res["server_errors_count"], 0, "{res}");
+    let codes: Vec<&str> = r["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["code"].as_str().unwrap())
+        .collect();
+    assert!(codes.contains(&"throttling"), "{codes:?}");
+}

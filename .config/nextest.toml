@@ -1,0 +1,10 @@
+# The lab tests measure: each asserts what a run found (the top finding, a capacity bracket, a
+# proved change). nextest runs every test in its own process, so they would share the runner's
+# few cores and measure each other — on a 3-core macOS runner, the demo's client then reads as
+# saturated (`client_bound` first). They run one at a time; everything else stays parallel.
+[test-groups]
+lab-measurements = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'binary(convergence) | binary(capacity)'
+test-group = 'lab-measurements'

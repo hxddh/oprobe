@@ -65,7 +65,7 @@ OpenDAL recommends:
 | `timeout` | `TimeoutLayer` | `op`: one operation ("60s"); `io`: one read or write call ("10s") |
 | `tail_cut` | `TailCutLayer` | cancel and re-issue requests slower than `percentile` (95, within 50..99) of the recent latencies × `safety_factor` (1.5, within 1..5), once `min_samples` (32) latencies are recorded within `window` ("60s", at most 120 s); the deadline is clamped to `min_deadline` ("50ms") .. `max_deadline` (unset: the operation timeout `layers.timeout.op`, 60 s without the timeout layer). These defaults are oprobe's, not OpenDAL's (1.3, 200, "500ms", "30s"); generated Rust spells out every value that differs from OpenDAL's, so pasted code behaves as measured |
 | `throttle` | `ThrottleLayer` | `bandwidth` ("100MiB" per second), `burst` ("16MiB") |
-| `cache` | `FoyerLayer` over an in-memory foyer cache | `memory` ("256MiB") |
+| `cache` | `FoyerLayer` over an in-memory foyer cache, each entry weighed by its size | `memory` ("256MiB" of cached data) |
 
 ## `[read]` and `[write]`
 

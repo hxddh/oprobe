@@ -149,7 +149,6 @@ pub async fn prove(a: ProveArgs, ctx: &Ctx) -> Result<u8> {
         trial_duration: a.trial,
         pairs: a.pairs.unwrap_or(crate::config::prove_defaults::MAX_PAIRS),
         save: a.save,
-        no_save: false,
         safety: i::Safety {
             dry_run: a.safety.dry_run,
             read_only: a.safety.read_only,

@@ -253,7 +253,7 @@ pub fn layer_rust(s: &OperatorSpec, name: &str) -> Option<String> {
         "tail_cut" => format!("TailCutLayer::builder(){calls}.build()"),
         "throttle" => format!("ThrottleLayer::new({ctor})"),
         "cache" => format!(
-            "FoyerLayer::new(HybridCacheBuilder::new().memory({ctor}).storage().build().await?)"
+            "FoyerLayer::new(HybridCacheBuilder::new().memory({ctor}).with_shards(8).with_weighter(|_: &FoyerKey, v: &FoyerValue| v.len()).with_filter(|_: &FoyerKey, v: &FoyerValue| v.len() <= {ctor} / 8).storage().build().await?)"
         ),
         _ => return None,
     })
@@ -598,15 +598,17 @@ pub fn to_rust(s: &OperatorSpec) -> String {
     }
     let layer_types: Vec<&str> = layer_exprs
         .iter()
-        .map(|(name, _)| match *name {
-            "throttle" => "ThrottleLayer",
-            "concurrent_limit" => "ConcurrentLimitLayer",
-            "timeout" => "TimeoutLayer",
-            "tail_cut" => "TailCutLayer",
-            "retry" => "RetryLayer",
-            "cache" => "FoyerLayer",
+        .flat_map(|(name, _)| match *name {
+            "throttle" => &["ThrottleLayer"][..],
+            "concurrent_limit" => &["ConcurrentLimitLayer"],
+            "timeout" => &["TimeoutLayer"],
+            "tail_cut" => &["TailCutLayer"],
+            "retry" => &["RetryLayer"],
+            // The cache's weighter names its key and value types.
+            "cache" => &["FoyerKey", "FoyerLayer", "FoyerValue"],
             _ => unreachable!(),
         })
+        .copied()
         .collect();
     if layer_types.len() == 1 {
         let _ = writeln!(out, "use opendal::layers::{};", layer_types[0]);
@@ -763,8 +765,16 @@ mod tests {
             "{r}"
         );
         assert!(r.contains(".layer(RetryLayer::new())"), "{r}");
+        // The cache's budget is bytes: each entry weighs its value's length, as oprobe builds
+        // it (foyer's default weighs every entry 1).
         assert!(
-            r.contains("FoyerLayer::new(HybridCacheBuilder::new().memory(256 * 1024 * 1024)"),
+            r.contains(
+                "FoyerLayer::new(HybridCacheBuilder::new().memory(256 * 1024 * 1024).with_shards(8).with_weighter(|_: &FoyerKey, v: &FoyerValue| v.len()).with_filter(|_: &FoyerKey, v: &FoyerValue| v.len() <= 256 * 1024 * 1024 / 8).storage().build().await?)"
+            ),
+            "{r}"
+        );
+        assert!(
+            r.contains("use opendal::layers::{") && r.contains("FoyerKey, FoyerLayer, FoyerValue"),
             "{r}"
         );
         assert!(r.contains("op.reader_with(path).concurrent(4)"), "{r}");

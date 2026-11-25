@@ -90,7 +90,8 @@ operation, its remedy is a shorter first retry backoff with jitter, `layers.retr
 
 Each finding names exactly **one** remedy, as an `op.toml` path: `layers.concurrent_limit.http`,
 `layers.tail_cut`, `read.gap`, `http.keep_alive`, … A remedy that is not a layer (spreading keys
-over prefixes for `key_limit`) is reported as advice, and `client_bound` has no storage remedy.
+over prefixes for `key_limit`) is reported as advice, and `client_bound` has no storage remedy:
+their `next` says where to look (`oprobe show RUN --detail`), and `prove` refuses them.
 
 `run` gives the remedy and **no number**. A single run varies no load, so it cannot say how
 large a limit should be or how much it would help; claiming so would be a guess.
@@ -102,8 +103,9 @@ large a limit should be or how much it would help; claiming so would be a guess.
 1. **Choose the change**: the finding's remedy (the top finding by default), or `--with PATH=VALUE`.
 2. **Size it**: when the remedy has a size (a limit, a chunk), short trials over that one value
    find the knee of the objective, within `--max-throttle`.
-3. **A/B test**: trials of A and B alternate (A B A B …); a sequential test on the objective,
-   against a noise floor learned from consecutive A trials (the A/A spread), stops as soon as it
+3. **A/B test**: trials of A and B alternate in pairs (the order within each pair drawn from the
+   run's seed); a sequential test on the objective, against a noise floor learned from each
+   side's consecutive trials (the A/A spread until B has its own), stops as soon as it
    can decide, or when the wall-time budget (`--max-duration`) would be exceeded.
 4. **Decide**: `improved`, `worse` (exit 3) or `inconclusive` on the objective: **goodput**
    (successful operations per second; the default) or **p99**. The objective's interval is

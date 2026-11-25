@@ -29,8 +29,8 @@
 //!   verb, connections, bytes and a timeline.
 //! - [`Handle::save`] and [`Snapshot::save`] write a `.oprobe` file (format `oprobe.trace/9`).
 //! - [`Exporter`] receives every request, operation and cache lookup as it completes; with the
-//!   `otel` feature, [`otel::OtelExporter`] turns them into OpenTelemetry metrics
-//!   (`http.client.request.duration`, `oprobe.operation.duration` and `oprobe.cache.lookups`).
+//!   `otel` feature, [`otel::OtelExporter`] records the requests into the OpenTelemetry
+//!   histogram `http.client.request.duration`, stage by stage.
 //! - [`Config`] sets the row budget, the HTTP client settings and the exporter.
 //!
 //! # How it works

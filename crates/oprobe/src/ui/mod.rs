@@ -32,7 +32,7 @@ pub use store::{Launch, set_launch};
 use nsh_base::theme;
 use nsh_core::prelude::*;
 
-/// The UI sets every host serves: `nsh/base` (plots included) and oprobe's root.
+/// The UI sets every host serves: `nsh/base` and oprobe's root.
 pub(crate) fn ui_sets() -> Vec<nsh_core::element::Registry> {
     vec![nsh_base::registry(), crate::registry()]
 }
@@ -153,7 +153,6 @@ pub fn App() -> impl IntoElement {
     let s = store::Store::new();
     provide_context(s);
     i18n::set_global(s.lang.get_untracked());
-    views::shell::setup_window();
     views::shell::install_app_effects(s);
     nsh_core::element::desktop::on_app_quit(move || {
         store::finish_jobs();
@@ -162,18 +161,20 @@ pub fn App() -> impl IntoElement {
     // Only the detail column paints the window's background: the sidebar lets the platform's
     // material through where there is one (it paints its own colour elsewhere).
     let material = views::sidebar::on_material();
-    view()
-        .flex_1()
-        .bg(move || {
-            if material {
-                transparent_black().into()
-            } else {
-                theme().background
-            }
-        })
-        .text_color(move || theme().foreground)
-        .child(dynamic(move || {
-            i18n::set_global(s.lang.get());
-            untracked(|| views::shell::shell().into_element())
-        }))
+    views::shell::main_window(s, move || {
+        view()
+            .flex_1()
+            .bg(move || {
+                if material {
+                    transparent_black().into()
+                } else {
+                    theme().background
+                }
+            })
+            .text_color(move || theme().foreground)
+            .child(dynamic(move || {
+                i18n::set_global(s.lang.get());
+                untracked(|| views::shell::shell().into_element())
+            }))
+    })
 }

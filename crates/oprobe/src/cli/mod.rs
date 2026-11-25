@@ -67,7 +67,7 @@ pub async fn main(cli: Cli) -> ExitCode {
             if INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst)
                 && body.code.exit_code() == exit::RUNTIME
             {
-                body.code = ErrorCode::RunInterrupted;
+                body = body.with_code(ErrorCode::RunInterrupted);
             }
             ctx.out.error(&body)
         }
@@ -100,12 +100,12 @@ fn scheme_of(cmd: &Command, ctx: &Ctx) -> String {
             })
             .unwrap_or_else(|| "s3".into()),
         Command::Demo(_) => "lab".into(),
+        // The sidecar names the service: the run itself is not decoded for an error's hint.
         Command::Prove(a) => ctx
             .store()
-            .load(&a.run)
+            .summary(&a.run)
             .ok()
-            .map(|r| r.report.target.scheme)
-            .filter(|s| !s.is_empty())
+            .and_then(|s| s.scheme().map(str::to_owned))
             .unwrap_or_else(|| "s3".into()),
         _ => "s3".into(),
     }

@@ -17,7 +17,7 @@ use crate::ui::chart::chart;
 use crate::ui::data::{self, Field, FieldKind, ProfileModel, SECTIONS};
 use crate::ui::fmt;
 use crate::ui::i18n::{finding_title, tr, tr_dyn};
-use crate::ui::jobs::{Outcome, pairs};
+use crate::ui::jobs::Outcome;
 use crate::ui::kit::{
     self, Kind, Tone, badge, body, btn, caption, empty, field, mono, section, segmented, small,
     strong, switch_on,
@@ -262,19 +262,19 @@ fn field_row(
         .child(control)
 }
 
-fn copy_row(rust: String, toml: String) -> View {
+fn copy_row(s: Store, rust: String, toml: String) -> View {
     view()
         .flex_row()
         .gap_2()
         .child(btn(
             tr("operator.copy_rust"),
             || Kind::Plain,
-            move || set_clipboard(rust.clone()),
+            move || s.copy(rust.clone()),
         ))
         .child(btn(
             tr("operator.copy_toml"),
             || Kind::Plain,
-            move || set_clipboard(toml.clone()),
+            move || s.copy(toml.clone()),
         ))
 }
 
@@ -316,7 +316,7 @@ fn changes(s: Store, m: Rc<ProfileModel>, edited: Edited) -> View {
                 .child(caption(tr("operator.diff")))
                 .child(code(rust.clone()))
                 .child(code(toml.clone()))
-                .child(copy_row(rust, toml).child(btn(
+                .child(copy_row(s, rust, toml).child(btn(
                     tr("operator.reset"),
                     || Kind::Ghost,
                     move || s.edits.set(Default::default()),
@@ -440,6 +440,14 @@ fn prove(
                         },
                     )
                     .disabled(move || !s.proving() && !can_prove())
+                    .busy(move || s.proving())
+                    .accessibility_hint(move || {
+                        Some(SharedString::from(if s.proving() {
+                            tr("operator.prove_stop_hint")
+                        } else {
+                            tr("operator.prove_run_hint")
+                        }))
+                    })
                     .test_id("prove-start"),
                 ),
         )
@@ -459,7 +467,6 @@ fn prove(
 }
 
 fn prove_state(s: Store, st: crate::ui::jobs::State, p99: bool, has_file: bool) -> View {
-    let _ = pairs;
     let unit = |v: f64| {
         if p99 {
             fmt::dur_ms(v)
@@ -535,11 +542,30 @@ fn prove_state(s: Store, st: crate::ui::jobs::State, p99: bool, has_file: bool) 
                         .child(small(fill("operator.pairs_count", &[&p.pairs]))),
                 )
                 .child(small(crate::ui::jobs::secondary_line(&p.secondary)))
+                .child(plots::sizing(&p.sizing, p99).map(|plot| {
+                    let heading = match &p.sized_path {
+                        Some(path) => fill("plot.sizing_of", &[path]),
+                        None => tr("plot.sizing").to_owned(),
+                    };
+                    view()
+                        .test_id("prove-sizing")
+                        .child(chart(heading, 120.0, move || Some(plot.clone())))
+                }))
+                .child((!p.notes.is_empty() || !p.environment.is_empty()).then(|| {
+                    view()
+                        .gap_1()
+                        .test_id("prove-notes")
+                        .child(caption(tr("operator.prove_notes")))
+                        .children(p.notes.iter().map(|n| small(n.clone()).selectable(true)))
+                        .child((!p.environment.is_empty()).then(|| {
+                            kit::prop(tr("operator.prove_environment"), p.environment.clone())
+                        }))
+                }))
                 .child(caption(tr("operator.proven_diff")))
                 .child(code(p.rust.clone()))
                 .child((!p.toml.is_empty()).then(|| code(p.toml.clone())))
                 .child({
-                    let mut actions = copy_row(p.rust.clone(), p.toml.clone())
+                    let mut actions = copy_row(s, p.rust.clone(), p.toml.clone())
                         .flex_wrap()
                         .items_center();
                     if has_file && !p.change.is_empty() {
@@ -551,6 +577,9 @@ fn prove_state(s: Store, st: crate::ui::jobs::State, p99: bool, has_file: bool) 
                                 || Kind::Plain,
                                 move || s.save_proven_to_file(&run_id, &change),
                             )
+                            .accessibility_hint(Some(SharedString::from(tr(
+                                "operator.save_toml_hint",
+                            ))))
                             .test_id("save-operator"),
                         );
                     } else if !has_file && !p.change.is_empty() && !kit::in_terminal() {
@@ -562,6 +591,9 @@ fn prove_state(s: Store, st: crate::ui::jobs::State, p99: bool, has_file: bool) 
                                 || Kind::Plain,
                                 move || s.save_operator_as(&run_id, change.clone()),
                             )
+                            .accessibility_hint(Some(SharedString::from(tr(
+                                "operator.save_toml_hint",
+                            ))))
                             .test_id("save-operator-as"),
                         );
                     }

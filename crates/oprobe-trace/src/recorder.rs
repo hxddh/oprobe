@@ -24,6 +24,12 @@ fn rec(h: &mut Histogram<u64>, us: u64) {
     let _ = h.record(us.min(HIST_MAX_US));
 }
 
+/// Whether request `r` dialed its connection: a connection counts as new through the request
+/// that used it first.
+fn dialed(r: &RequestRecord) -> bool {
+    !r.reused && r.protocol != Protocol::InProcess && (r.status != 0 || r.timing.connect_us() > 0)
+}
+
 pub fn quantiles(h: &Histogram<u64>) -> Quantiles {
     if h.is_empty() {
         return Quantiles::default();
@@ -457,8 +463,6 @@ struct Agg {
     schedule: Histogram<u64>,
     /// Missed arrivals recorded as censored latencies.
     censored: u64,
-    /// `conn.dialed` at the last series probe.
-    dials_seen: u64,
     /// Prefixes, hot keys, size buckets, cold vs warm (design v5 §3, M12).
     dims: crate::dims::DimAgg,
 }
@@ -495,7 +499,6 @@ impl Agg {
             open_loop: None,
             schedule: hist(),
             censored: 0,
-            dials_seen: 0,
             dims: crate::dims::DimAgg::default(),
         }
     }
@@ -540,6 +543,7 @@ impl Agg {
 
     fn record_request(&mut self, r: &RequestRecord) {
         self.requests += 1;
+        // `dialed(r)`: counted in `conn.dialed` here, and in its interval by the caller.
         let is_cut = r.detail.as_deref().is_some_and(|d| d.cut);
         if is_cut {
             self.res.tail_cuts += 1;
@@ -595,7 +599,7 @@ impl Agg {
         // A connection counts as dialed in the window through the request that used it first,
         // so "new connections" and "warm %" always describe the same requests (and unconnected
         // cancelled requests with `status == 0` and `connect_us == 0` do not pollute `connect`).
-        if !r.reused && r.protocol != Protocol::InProcess && (r.status != 0 || t.connect_us() > 0) {
+        if dialed(r) {
             rec(&mut a.stages.connect, t.connect_us());
             self.conn.dialed += 1;
             rec(&mut self.dns, t.dns_us);
@@ -619,6 +623,7 @@ impl Agg {
 pub struct OpCompletion {
     pub verb: &'static str,
     pub op_id: u64,
+    /// When the operation actually started.
     pub started: Instant,
     /// Latency from the *intended* start (open-loop) or actual start (closed-loop).
     pub latency_us: u64,
@@ -728,6 +733,10 @@ pub struct Recorder {
     inflight_ops: AtomicU64,
     inflight_requests: AtomicU64,
     peak_inflight_requests: AtomicU64,
+    /// The current interval's in-flight peak, kept off the aggregate lock (every request start
+    /// updates it): `(interval + 1) << 32 | peak`, 0 for none. It is folded into its interval
+    /// when the next interval starts and whenever the timeline is read.
+    interval_peak: AtomicU64,
     wire_rx: AtomicU64,
     wire_tx: AtomicU64,
     cache_enabled: AtomicBool,
@@ -769,6 +778,7 @@ impl Recorder {
             inflight_ops: AtomicU64::new(0),
             inflight_requests: AtomicU64::new(0),
             peak_inflight_requests: AtomicU64::new(0),
+            interval_peak: AtomicU64::new(0),
             wire_rx: AtomicU64::new(0),
             wire_tx: AtomicU64::new(0),
             cache_enabled: AtomicBool::new(false),
@@ -917,6 +927,7 @@ impl Recorder {
                 self.inflight_requests.load(Ordering::Relaxed),
                 Ordering::Relaxed,
             );
+            self.interval_peak.store(0, Ordering::Release);
             *self.window_start.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
             self.frozen_elapsed_us.store(WINDOW_OPEN, Ordering::Release);
             self.measuring.store(true, Ordering::Release);
@@ -924,6 +935,10 @@ impl Recorder {
             // Freeze the window length at the moment measurement ends (unless the runner already
             // closed it at its deadline).
             self.close_window(Instant::now());
+            // The last interval's in-flight peak, before nothing folds it any more.
+            let packed = self.interval_peak.load(Ordering::Acquire);
+            let window_start = self.window_start();
+            self.fold_interval_peak(&mut self.agg(), packed, window_start);
             self.measuring.store(false, Ordering::Release);
         }
         self.phase.store(code, Ordering::Release);
@@ -990,7 +1005,80 @@ impl Recorder {
         if self.is_measuring() {
             self.peak_inflight_requests
                 .fetch_max(cur, Ordering::Relaxed);
+            // The interval's peak, where the request starts: an embedded layer has no series
+            // probe ([`Self::sample_series`]) to sample it. Lock-free: this runs on every
+            // request, from every worker.
+            self.note_interval_peak(cur);
         }
+    }
+
+    /// Raise the current interval's in-flight peak to `cur` without taking the aggregate lock;
+    /// the first request of a new interval folds the last interval's peak into the timeline.
+    fn note_interval_peak(&self, cur: u64) {
+        if !self.window_open() {
+            return;
+        }
+        let window_start = self.window_start();
+        let frozen = self.frozen_elapsed_us.load(Ordering::Acquire);
+        let idx = event_bucket(window_start.elapsed().as_micros() as u64, frozen) as u64 + 1;
+        let new = (idx << 32) | cur.min(u64::from(u32::MAX));
+        let mut old = self.interval_peak.load(Ordering::Acquire);
+        loop {
+            let (old_idx, old_peak) = (old >> 32, old & u64::from(u32::MAX));
+            if old_idx == idx && old_peak >= cur {
+                return;
+            }
+            match self.interval_peak.compare_exchange_weak(
+                old,
+                new,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    // Whichever interval it held (an earlier one, or a later one from a thread
+                    // racing a window reset), the value it replaced is folded, never lost.
+                    if old_idx != idx && old_idx != 0 {
+                        let mut a = self.agg();
+                        self.fold_interval_peak(&mut a, old, window_start);
+                    }
+                    return;
+                }
+                Err(x) => old = x,
+            }
+        }
+    }
+
+    /// Fold a packed [`Self::interval_peak`] into its interval (a max, so folding twice is
+    /// harmless). An interval the timeline no longer holds open (compacted), or one past the
+    /// current window's (stamped against the window before a reset), is dropped rather than
+    /// folded into an unrelated interval.
+    fn fold_interval_peak(&self, a: &mut Agg, packed: u64, window_start: Instant) {
+        let Some(idx) = (packed >> 32).checked_sub(1) else {
+            return;
+        };
+        let peak = packed & u64::from(u32::MAX);
+        let idx = idx as usize;
+        let frozen = self.frozen_elapsed_us.load(Ordering::Acquire);
+        let now = event_bucket(window_start.elapsed().as_micros() as u64, frozen);
+        if idx < a.base || idx > now {
+            return;
+        }
+        self.ensure_bucket(a, idx, window_start);
+        let b = a.bucket(idx);
+        b.inflight_peak = b.inflight_peak.max(peak);
+    }
+
+    /// Run `f` on the interval the window is in now (nothing outside the window).
+    fn with_current_bucket(&self, f: impl FnOnce(&mut Bucket)) {
+        if !self.window_open() {
+            return;
+        }
+        let window_start = self.window_start();
+        let frozen = self.frozen_elapsed_us.load(Ordering::Acquire);
+        let idx = event_bucket(window_start.elapsed().as_micros() as u64, frozen);
+        let mut a = self.agg();
+        self.ensure_bucket(&mut a, idx, window_start);
+        f(a.bucket(idx));
     }
 
     pub fn request_finished(&self) {
@@ -1031,6 +1119,7 @@ impl Recorder {
         if !self.is_measuring() {
             return;
         }
+        self.with_current_bucket(|b| b.dials += 1);
         let mut a = self.agg();
         a.conn.dialed += 1;
         rec(&mut a.dns, dns_us);
@@ -1064,6 +1153,9 @@ impl Recorder {
                 a.record_request(r);
                 self.ensure_bucket(&mut a, ended.max(sent), window_start);
                 a.bucket(sent).requests += 1;
+                if dialed(r) {
+                    a.bucket(sent).dials += 1;
+                }
                 if r.is_throttle() {
                     a.bucket(ended).throttled += 1;
                 }
@@ -1311,7 +1403,9 @@ impl Recorder {
             .started
             .saturating_duration_since(window_start)
             .as_micros() as u64;
-        let end_us = start_us + c.latency_us;
+        // An open-loop operation's latency also counts how late it started (`schedule_us`,
+        // before `started`): it ends that much sooner after its start.
+        let end_us = start_us + c.latency_us.saturating_sub(c.schedule_us.unwrap_or(0));
         let frozen = self.frozen_elapsed_us.load(Ordering::Acquire);
         let at = |us: u64| event_bucket(us, frozen);
         let idx = at(start_us);
@@ -1355,6 +1449,10 @@ impl Recorder {
             let i = at(sent);
             self.ensure_bucket(&mut a, i, window_start);
             a.bucket(i).requests += 1;
+            // A new connection lands where the request that dialed it was sent.
+            if dialed(r) {
+                a.bucket(i).dials += 1;
+            }
             if r.is_throttle() {
                 let i = at(sent + r.timing.total_us);
                 self.ensure_bucket(&mut a, i, window_start);
@@ -1478,23 +1576,13 @@ impl Recorder {
         a.compact();
     }
 
-    /// The per-interval series probe (call it every few ms while measuring): requests in
-    /// flight and connections dialed land in the current interval.
+    /// The per-interval series probe (optional; `oprobe run` calls it every few ms): the
+    /// requests in flight now land in the current interval. Requests and dials also fill their
+    /// interval as they start ([`Self::request_started`], [`Self::complete_op`]), so an
+    /// embedded layer without a probe has the same series.
     pub fn sample_series(&self) {
-        if !self.window_open() {
-            return;
-        }
-        let window_start = self.window_start();
-        let idx = bucket_index(window_start.elapsed().as_secs());
         let inflight = self.inflight_requests.load(Ordering::Relaxed);
-        let mut a = self.agg();
-        self.ensure_bucket(&mut a, idx, window_start);
-        let dialed = a.conn.dialed;
-        let new = dialed.saturating_sub(a.dials_seen);
-        a.dials_seen = dialed;
-        let b = a.bucket(idx);
-        b.inflight_peak = b.inflight_peak.max(inflight);
-        b.dials += new;
+        self.note_interval_peak(inflight);
     }
 
     /// Capture await-tree call stacks of operations running longer than `threshold_us`.
@@ -1595,6 +1683,8 @@ impl Recorder {
     fn snapshot_with(&self, reset: bool, rows: Option<&mut TraceRows>) -> Snapshot {
         let elapsed = self.elapsed_s().max(1e-3);
         let mut a = self.agg();
+        let packed = self.interval_peak.load(Ordering::Acquire);
+        self.fold_interval_peak(&mut a, packed, self.window_start());
         let mib = |b: u64| b as f64 / (1024.0 * 1024.0);
 
         let verbs: Vec<VerbStats> = a
@@ -1846,6 +1936,7 @@ impl Recorder {
                 failures: 0,
                 ..conn
             };
+            self.interval_peak.store(0, Ordering::Release);
             *self.window_start.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
             self.wire_rx.store(0, Ordering::Relaxed);
             self.wire_tx.store(0, Ordering::Relaxed);
@@ -2189,6 +2280,29 @@ mod tests {
                 schedule_us: None,
             },
         );
+    }
+
+    /// The interval's in-flight peak is kept off the lock; the last interval's is folded when
+    /// measurement ends, before the final snapshot (which runs after `Phase::Verify`).
+    #[test]
+    fn the_last_intervals_inflight_peak_survives_the_end_of_measurement() {
+        let r = Recorder::new();
+        r.set_phase(Phase::Measure);
+        let t0 = r.window_start();
+        for _ in 0..3 {
+            r.request_started();
+        }
+        for _ in 0..3 {
+            r.request_finished();
+        }
+        let data = OpScopeData {
+            requests: vec![req(0, 0, 1000)],
+            ..Default::default()
+        };
+        completion(&r, 1, t0, 1_000, None, data);
+        r.set_phase(Phase::Verify);
+        let s = r.snapshot();
+        assert_eq!(s.timeline[0].inflight_peak, 3, "{:#?}", s.timeline);
     }
 
     #[test]

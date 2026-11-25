@@ -433,12 +433,16 @@ impl Profile {
             self.by = None;
             return Ok(self);
         };
-        let Some(run) = self.full.as_deref().filter(|r| !r.reqs.is_empty()) else {
+        let Some(run) = self
+            .full
+            .as_deref()
+            .filter(|r| !r.reqs.is_empty() && kept_rows(r))
+        else {
             return Err(OprobeError::new(
                 ErrorCode::UsageInvalidArgument,
                 format!("this run has no request rows to group by {}", b.label()),
             )
-            .with_hint("show the whole run without --by")
+            .with_hint(no_rows_hint(&self.run.report, "--by"))
             .into());
         };
         let range = self.range.as_ref().map(|v| (v.since_s, v.until_s));
@@ -475,16 +479,39 @@ impl Profile {
             .with_hint("pass a range inside the window, e.g. --since 2s --until 6s")
             .into());
         }
-        let Some(run) = self.full.as_deref().filter(|r| !r.ops.is_empty()) else {
+        let Some(run) = self
+            .full
+            .as_deref()
+            .filter(|r| !r.ops.is_empty() && kept_rows(r))
+        else {
             return Err(OprobeError::new(
                 ErrorCode::UsageInvalidArgument,
                 "this run has no trace rows to recompute a time range from",
             )
-            .with_hint("show the whole run without --since/--until")
+            .with_hint(no_rows_hint(&self.run.report, "--since/--until"))
             .into());
         };
         self.range = Some(crate::report::range::RangeView::of(run, a, b));
         Ok(self)
+    }
+}
+
+/// Whether `run` kept rows a range or a grouping can stand on. A trace saved without its rows
+/// holds only the slowest operations rebuilt from its aggregates: their numbers would be those
+/// of a handful of slow operations, not of the traffic.
+fn kept_rows(run: &Run) -> bool {
+    let s = &run.report.sampling;
+    !(s.kept_ops_count == 0 && (s.seen_ops_count > 0 || run.report.run.sampled))
+}
+
+/// The hint of a refused `flag` on a run without rows.
+fn no_rows_hint(r: &crate::model::Report, flag: &str) -> String {
+    if r.is_trace() {
+        format!(
+            "the trace holds aggregates only: show it without {flag}, or save the next one with `Handle::save` (it keeps the rows)"
+        )
+    } else {
+        format!("show the whole run without {flag}")
     }
 }
 
@@ -511,19 +538,34 @@ pub fn show_prove(app: &App, r: &RunRef) -> Result<Option<ShownProve>> {
         return Ok(None);
     };
     let raw = std::fs::read(&path)?;
-    let stem = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .and_then(|n| n.strip_suffix(".prove.json"))
-        .unwrap_or(&r.0);
     let out = super::prove::ProveOutput::from_json_slice(&raw).map_err(|e| {
         OprobeError::new(
             ErrorCode::UsageInvalidArgument,
             format!("prove result `{}` cannot be read: {e}", path.display()),
         )
-        .with_hint(format!("remove it with `oprobe show --rm {stem}`"))
+        .with_hint(unreadable_prove_hint(app, &path))
     })?;
     Ok(Some(ShownProve(out)))
+}
+
+/// How to get rid of the unreadable prove result at `path`: `show --rm ID` only for a stored
+/// prove named by its full id (a shorter stem or a file outside the store could prefix-match a
+/// stored run, which `--rm` would delete instead); otherwise delete the file.
+fn unreadable_prove_hint(app: &App, path: &std::path::Path) -> String {
+    let id = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.strip_suffix(".prove.json"))
+        .filter(|id| crate::model::RunId::parse(id).is_some());
+    let in_store = path
+        .parent()
+        .and_then(|d| std::fs::canonicalize(d).ok())
+        .zip(std::fs::canonicalize(app.store().dir()).ok())
+        .is_some_and(|(a, b)| a == b);
+    match id {
+        Some(id) if in_store => format!("remove it with `oprobe show --rm {id}`"),
+        _ => format!("delete the file `{}`", path.display()),
+    }
 }
 
 /// Result of `oprobe show A B [...]`: two or more stored runs or `.oprobe` files compared

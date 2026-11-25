@@ -461,6 +461,18 @@ pub fn trace_run(mut file: TraceFile, path: &Path) -> Result<Run, crate::errors:
             f.remedy.next = Some(format!("oprobe show {file_ref} --detail"));
         }
     }
+    if !has_rows {
+        // The file kept no rows: the only ones are the slowest operations rebuilt from the
+        // aggregates, which no range or grouping may stand for (`show --since/--by` refuse).
+        let r = &mut run.report;
+        r.sampling.kept_ops_count = 0;
+        r.sampling.kept_requests_count = 0;
+        r.sampling.kept_ratio = 0.0;
+        r.run.trace.ops_kept_count = 0;
+        r.run.trace.requests_kept_count = 0;
+        r.run.trace.sample_ratio = 0.0;
+        r.run.sampled = true;
+    }
     Ok(run)
 }
 

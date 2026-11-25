@@ -1,5 +1,6 @@
-//! Report v6 (`oprobe.report/6`, design v3 §6, v4 §1/§3 and v5 §2): the machine-clean result of one
-//! run, with the run's replayable spec (`spec`) and the capacity estimate (`capacity`).
+//! Report v7 (`oprobe.report/7`, design v3 §6, v4 §1/§3 and v5 §2; the v9 formats): the
+//! machine-clean result of one run, with the run's replayable spec (`spec`) and the capacity
+//! estimate (`capacity`).
 //!
 //! Rules: every numeric field name carries its unit (`_us`, `_ms`, `_s`, `_bytes`, `_per_s`,
 //! `_pct`, `_ratio` for dimensionless fractions, `_usd`, `_count`); no human-formatted strings
@@ -197,19 +198,55 @@ impl Report {
         {
             v = inner.take();
         }
-        let bad = |m: String| -> anyhow::Error {
+        let bad = |m: String, hint: String| -> anyhow::Error {
             crate::errors::OprobeError::new(crate::errors::ErrorCode::UsageInvalidArgument, m)
-                .with_hint("reports of other oprobe versions are not read: re-run the workload with this oprobe")
+                .with_hint(hint)
                 .into()
         };
-        match v.get("schema").and_then(|s| s.as_str()) {
+        let str_of = |k: &str| v.get(k).and_then(|s| s.as_str());
+        let run_file_hint = || {
+            "pass a run: its id, its `.oprobe` file, a report `.json` or an `oprobe-trace` file"
+                .to_owned()
+        };
+        // Say what the file is and which command takes it, not that it is of another version.
+        match str_of("schema") {
             Some(REPORT_SCHEMA) => {}
-            Some(other) => {
-                return Err(bad(format!(
-                    "report schema `{other}` is not supported; this oprobe reads `{REPORT_SCHEMA}`"
-                )));
+            Some(other) if other.starts_with("oprobe.report/") => {
+                return Err(bad(
+                    format!(
+                        "report schema `{other}` is not supported; this oprobe reads `{REPORT_SCHEMA}`"
+                    ),
+                    "reports of other oprobe versions are not read: re-run the workload with this oprobe".into(),
+                ));
             }
-            None => return Err(bad("not an oprobe report".into())),
+            Some(other) if other.starts_with("oprobe.prove/") => {
+                let run = str_of("run_id").unwrap_or("RUN");
+                return Err(bad(
+                    format!("it is a prove result (`{other}`), not a run"),
+                    format!(
+                        "open it with `oprobe show FILE`; `prove` and `show --by/--since` take the run it proved: {run}"
+                    ),
+                ));
+            }
+            Some(other) => {
+                return Err(bad(
+                    format!("it is `{other}` output, not an oprobe run report"),
+                    run_file_hint(),
+                ));
+            }
+            None if str_of("workload_hash").is_some() && str_of("target_id").is_some() => {
+                let id = str_of("id").unwrap_or("RUN");
+                return Err(bad(
+                    "it is a stored run's summary sidecar, not the run".into(),
+                    format!("pass the run itself: `{id}` or its file `{id}.oprobe`"),
+                ));
+            }
+            None => {
+                return Err(bad(
+                    "not an oprobe report: the JSON has no `schema`".into(),
+                    run_file_hint(),
+                ));
+            }
         }
         if let Some(o) = v.as_object_mut() {
             o.remove("kind");
@@ -951,6 +988,47 @@ pub struct TimeWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A JSON file that is not a run report says what it is and which command takes it, not
+    /// that it is a report "of another version" (9.0 said so of a current prove result and of a
+    /// run's sidecar).
+    #[test]
+    fn a_json_that_is_not_a_report_says_what_it_is() {
+        let err = |v: serde_json::Value| {
+            let e = Report::from_json_value(v).unwrap_err();
+            let b = crate::errors::classify(&e, "s3");
+            assert_eq!(b.code, crate::errors::ErrorCode::UsageInvalidArgument);
+            (b.message, b.hint.unwrap_or_default())
+        };
+        let (m, h) = err(serde_json::json!({
+            "schema": "oprobe.prove/9", "prove_id": "20261120-143005-a1b2",
+            "run_id": "20261120-140000-0001", "verdict": "improved"
+        }));
+        assert!(m.contains("prove result"), "{m}");
+        assert!(
+            h.contains("oprobe show") && h.contains("20261120-140000-0001"),
+            "{h}"
+        );
+        assert!(!h.contains("other oprobe versions"), "{h}");
+        let (m, h) = err(serde_json::json!({
+            "id": "20261120-143005-a1b2", "target_id": "s3://b/", "workload_hash": "sha256:1",
+            "headline": "x"
+        }));
+        assert!(m.contains("sidecar"), "{m}");
+        assert!(h.contains("20261120-143005-a1b2.oprobe"), "{h}");
+        let (m, h) = err(serde_json::json!({"name": "package", "version": "1.0.0"}));
+        assert!(m.contains("not an oprobe report"), "{m}");
+        assert!(
+            h.contains("`.oprobe` file") && !h.contains("versions"),
+            "{h}"
+        );
+        let (m, h) = err(serde_json::json!({"schema": "oprobe.events/9"}));
+        assert!(m.contains("oprobe.events/9"), "{m}");
+        assert!(!h.contains("versions"), "{h}");
+        // A report of another version still says so.
+        let (_, h) = err(serde_json::json!({"schema": "oprobe.report/6"}));
+        assert!(h.contains("other oprobe versions"), "{h}");
+    }
 
     /// Every `*_count` field of every registered schema is an integer (design v4 §4).
 

@@ -2496,12 +2496,12 @@
           "type": "array"
         },
         "error_ratio": {
-          "description": "Failed / every operation that ended in the range.",
+          "description": "Failed / every operation started in the range.",
           "format": "double",
           "type": "number"
         },
         "failed_ops_count": {
-          "description": "Operations that failed in the range: by when they ended, as the timeline counts\nfailures (an operation started earlier that times out inside the range counts here).",
+          "description": "Operations started in the range that failed (an operation started earlier that times\nout inside the range counts in the range it started in).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"

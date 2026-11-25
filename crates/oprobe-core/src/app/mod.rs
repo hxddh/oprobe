@@ -25,7 +25,7 @@
 //! ```
 //!
 //! **Long work.** `run` and `prove` are `async` and take a [`Cancel`]; progress and log lines go
-//! to the [`EventSink`] (`sink.bus()` carries the `oprobe.events/1` events the app draws from).
+//! to the [`EventSink`] (`sink.bus()` carries the `oprobe.events/9` events the app draws from).
 //!
 //! The other modules hold the commands' work: [`run`] and [`runs`] (measuring and the run
 //! history), [`prove`], [`lab`], [`profile`] (profile assembly).
@@ -39,6 +39,7 @@ pub mod profile;
 pub mod prove;
 pub mod run;
 pub mod runs;
+mod save;
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
@@ -57,6 +58,7 @@ pub use lab::LabOutput;
 pub use prove::{ProveObjective, ProveOutcome, ProveOutput, ProveRequest, ProveVerdict};
 pub use run::{PlanOutput, RunOutput, RunPlan, RunSet};
 pub use runs::{Comparison, Profile, RemovedRuns, RunList, TrashedRuns};
+pub use save::SavedOperator;
 
 /// Where a command's log lines, warnings, progress and events go: [`crate::output::Output`].
 /// Front ends that consume events in-process use `EventSink::silent()` and `sink.bus()`.
@@ -446,206 +448,6 @@ impl App {
         Ok(self.config()?.operators.keys().cloned().collect())
     }
 
-    /// Apply `PATH=VALUE` `edits` (such as a proven change) to an existing `op.toml` file in
-    /// place, preserving comments, whitespace, unedited options, `${ENV}` placeholders and
-    /// relative paths.
-    pub fn save_operator_edits(
-        &self,
-        path: &std::path::Path,
-        edits: &[String],
-    ) -> Result<crate::operator::OperatorSpec> {
-        let raw = std::fs::read_to_string(path).map_err(|e| {
-            OprobeError::new(
-                ErrorCode::ConfigInvalid,
-                format!("cannot read operator file `{}`: {e}", path.display()),
-            )
-        })?;
-        // Validate existing file first so syntax/schema errors report against it cleanly.
-        let _ = crate::operator::OperatorSpec::parse(&raw).map_err(|e| {
-            let mut o = OprobeError::new(e.code, format!("`{}`: {}", path.display(), e.message));
-            o.hint = e.hint;
-            o
-        })?;
-        let mut doc: toml_edit::DocumentMut = raw.parse().map_err(|e| {
-            OprobeError::new(
-                ErrorCode::ConfigInvalid,
-                format!("`{}`: {e}", path.display()),
-            )
-        })?;
-        let mut pairs = Vec::with_capacity(edits.len());
-        for e in edits {
-            let (k, v) = crate::input::key_value("edit", e)?;
-            if v.trim() != crate::model::spec::REDACTED {
-                pairs.push((k, v));
-            }
-        }
-        crate::operator::patch_toml_table(doc.as_table_mut(), &pairs)?;
-        let out_text = doc.to_string();
-        let spec = crate::operator::OperatorSpec::parse(&out_text).map_err(|e| {
-            let mut o = OprobeError::new(e.code, format!("`{}`: {}", path.display(), e.message));
-            o.hint = e.hint;
-            o
-        })?;
-        spec.validate()?;
-        crate::store::atomic_write(path, out_text.as_bytes())?;
-        Ok(spec)
-    }
-
-    /// Write an operator `base` + `edits` to an explicit `.toml` file `path` (used by the UI's
-    /// "Save operator as…"). When `source_file` is the same file as `path`, patches in place to
-    /// preserve comments and unredacted secrets; otherwise writes a clean operator file from
-    /// `base` + `edits`.
-    pub fn write_operator_file(
-        &self,
-        source_file: Option<&std::path::Path>,
-        path: &std::path::Path,
-        base: &crate::operator::OperatorSpec,
-        edits: &[String],
-    ) -> Result<crate::operator::OperatorSpec> {
-        let same_file = source_file.is_some_and(|src| {
-            src == path
-                || (src.canonicalize().ok().zip(path.canonicalize().ok()))
-                    .is_some_and(|(a, b)| a == b)
-        });
-        if same_file && path.is_file() {
-            return self.save_operator_edits(path, edits);
-        }
-        let mut pairs = Vec::with_capacity(edits.len());
-        for e in edits {
-            let (k, v) = crate::input::key_value("edit", e)?;
-            if v.trim() != crate::model::spec::REDACTED {
-                pairs.push((k, v));
-            }
-        }
-        let mut spec = base.clone();
-        spec.options
-            .retain(|_, v| v.trim() != crate::model::spec::REDACTED);
-        spec.apply_edits(&pairs)?;
-        spec.validate()?;
-        crate::store::atomic_write(path, spec.to_toml().as_bytes())?;
-        Ok(spec)
-    }
-
-    /// Save an operator `base` with `edits` applied either to an `op.toml` file (creating or
-    /// updating it in place) or to `[operators.NAME]` in `config.toml` when `dest` is a bare
-    /// operator name. Returns a short human description of where it was written.
-    pub fn save_operator_target(
-        &self,
-        dest: &str,
-        base: &crate::operator::OperatorSpec,
-        edits: &[String],
-    ) -> Result<String> {
-        let dest = dest.trim();
-        if dest.is_empty() {
-            return Err(
-                OprobeError::new(ErrorCode::UsageInvalidArgument, "empty --save target")
-                    .with_hint("pass an op.toml path or an operator name for config.toml")
-                    .into(),
-            );
-        }
-        let path = std::path::Path::new(dest);
-        let is_file_target = dest.ends_with(".toml")
-            || dest.contains('/')
-            || dest.contains(std::path::MAIN_SEPARATOR)
-            || path.is_file();
-        let mut pairs = Vec::with_capacity(edits.len());
-        for e in edits {
-            let (k, v) = crate::input::key_value("edit", e)?;
-            if v.trim() != crate::model::spec::REDACTED {
-                pairs.push((k, v));
-            }
-        }
-        if is_file_target {
-            // Patch in place when `path` already describes the same service URL (preserving its
-            // comments and unredacted secrets); otherwise write `base + edits` cleanly.
-            let same_service = path.is_file()
-                && std::fs::read_to_string(path)
-                    .ok()
-                    .and_then(|r| crate::operator::OperatorSpec::parse(&r).ok())
-                    .is_some_and(|existing| existing.display_url() == base.display_url());
-            if same_service {
-                self.save_operator_edits(path, edits)?;
-            } else {
-                self.write_operator_file(None, path, base, edits)?;
-            }
-            return Ok(dest.to_owned());
-        }
-
-        // Bare operator name -> `[operators.NAME]` in `config.toml`, preserving comments and
-        // `[defaults]`.
-        let _ = ConfigFile::load(&self.paths.config_file)?;
-        let raw = match std::fs::read_to_string(&self.paths.config_file) {
-            Ok(r) => r,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-            Err(e) => return Err(e.into()),
-        };
-        let mut doc: toml_edit::DocumentMut = raw.parse().map_err(|e| {
-            OprobeError::new(
-                ErrorCode::ConfigInvalid,
-                format!(
-                    "invalid config file `{}`: {e}",
-                    self.paths.config_file.display()
-                ),
-            )
-        })?;
-        if !doc.contains_key("operators") || !doc["operators"].is_table() {
-            let mut ops = toml_edit::Table::new();
-            ops.set_implicit(true);
-            doc["operators"] = toml_edit::Item::Table(ops);
-        }
-        let ops_tbl = doc["operators"].as_table_mut().expect("operators table");
-        if let Some(toml_edit::Item::Value(toml_edit::Value::InlineTable(it))) = ops_tbl.get(dest) {
-            let tbl = it.clone().into_table();
-            ops_tbl[dest] = toml_edit::Item::Table(tbl);
-        }
-        if let Some(toml_edit::Item::Table(existing_tbl)) = ops_tbl.get_mut(dest) {
-            crate::operator::patch_toml_table(existing_tbl, &pairs)?;
-        } else {
-            let mut spec = base.clone();
-            spec.options
-                .retain(|_, v| v.trim() != crate::model::spec::REDACTED);
-            spec.apply_edits(&pairs)?;
-            spec.validate()?;
-            let sub: toml_edit::DocumentMut = spec
-                .to_toml()
-                .parse()
-                .expect("serialized OperatorSpec is valid TOML");
-            ops_tbl[dest] = toml_edit::Item::Table(sub.as_table().clone());
-        }
-        let out_text = doc.to_string();
-        // Validate the full updated config before writing to disk.
-        let validated: ConfigFile = toml::from_str(&out_text).map_err(|e| {
-            OprobeError::new(
-                ErrorCode::ConfigInvalid,
-                format!(
-                    "invalid config file `{}`: {e}",
-                    self.paths.config_file.display()
-                ),
-            )
-        })?;
-        validated.defaults.validate()?;
-        for (name, op) in &validated.operators {
-            op.validate().map_err(|e| {
-                let mut o = OprobeError::new(
-                    ErrorCode::ConfigInvalid,
-                    format!(
-                        "operator `{name}` in `{}`: {}",
-                        self.paths.config_file.display(),
-                        e.message
-                    ),
-                );
-                o.hint = e.hint;
-                o
-            })?;
-        }
-        crate::store::atomic_write(&self.paths.config_file, out_text.as_bytes())?;
-        self.invalidate_config();
-        Ok(format!(
-            "[operators.{dest}] in {}",
-            self.paths.config_file.display()
-        ))
-    }
-
     /// The run ids `r` names (to report what [`App::rm`] removes).
     pub fn run_ids(&self, r: &[RunRef]) -> Result<Vec<String>> {
         runs::stored_ids(self, r)
@@ -654,85 +456,5 @@ impl App {
     /// `oprobe lab`: start the server (it serves until the returned handle is dropped).
     pub async fn lab(&self, req: LabRequest) -> Result<LabHandle> {
         lab::lab(req).await
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn save_operator_edits_preserves_secrets_env_and_relative_ca_cert() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("op.toml");
-        std::fs::write(
-            &p,
-            "# keep user header comment\nurl = \"s3://b/x\"\n[options]\n# keep secret placeholder\nregion = \"us-east-1\"\nsecret_access_key = \"${AWS_SECRET_ACCESS_KEY}\"\n[http]\nca_cert = \"ca.pem\"\n",
-        )
-        .unwrap();
-        let app = App::new(crate::store::Paths {
-            config_file: dir.path().join("config.toml"),
-            data_dir: dir.path().join("data"),
-        });
-        let updated = app
-            .save_operator_edits(
-                &p,
-                &[
-                    "layers.concurrent_limit.http=24".to_owned(),
-                    "layers.retry.jitter=on".to_owned(),
-                    "options.secret_access_key=<redacted>".to_owned(),
-                ],
-            )
-            .unwrap();
-        assert_eq!(updated.http_limit(), Some(24));
-        let disk = std::fs::read_to_string(&p).unwrap();
-        assert!(disk.contains("# keep user header comment"), "{disk}");
-        assert!(disk.contains("# keep secret placeholder"), "{disk}");
-        assert!(
-            disk.contains("secret_access_key = \"${AWS_SECRET_ACCESS_KEY}\""),
-            "{disk}"
-        );
-        assert!(disk.contains("ca_cert = \"ca.pem\""), "{disk}");
-        assert!(disk.contains("http = 24"), "{disk}");
-        assert!(disk.contains("jitter = true"), "{disk}");
-    }
-
-    #[test]
-    fn save_operator_target_preserves_config_comments_and_invalidates_cache() {
-        let dir = tempfile::tempdir().unwrap();
-        let cfg_path = dir.path().join("config.toml");
-        std::fs::write(
-            &cfg_path,
-            "# global defaults comment\n[defaults]\nduration = \"5s\"\n\n# prod operator comment\n[operators.prod]\nurl = \"s3://b/x\"\n[operators.prod.options]\nregion = \"us-east-1\"\nsecret_access_key = \"${AWS_SECRET}\"\n",
-        )
-        .unwrap();
-        let app = App::new(crate::store::Paths {
-            config_file: cfg_path.clone(),
-            data_dir: dir.path().join("data"),
-        });
-        // Prime cache before saving.
-        assert_eq!(app.config().unwrap().operators["prod"].http_limit(), None);
-
-        let base = crate::operator::OperatorSpec::from_url("s3://b/x");
-        app.save_operator_target(
-            "prod",
-            &base,
-            &["layers.concurrent_limit.http=32".to_owned()],
-        )
-        .unwrap();
-
-        // Cache was invalidated so subsequent `app.config()` reads the new limit immediately.
-        assert_eq!(
-            app.config().unwrap().operators["prod"].http_limit(),
-            Some(32)
-        );
-        let disk = std::fs::read_to_string(&cfg_path).unwrap();
-        assert!(disk.contains("# global defaults comment"), "{disk}");
-        assert!(disk.contains("# prod operator comment"), "{disk}");
-        assert!(
-            disk.contains("secret_access_key = \"${AWS_SECRET}\""),
-            "{disk}"
-        );
-        assert!(disk.contains("http = 32"), "{disk}");
     }
 }

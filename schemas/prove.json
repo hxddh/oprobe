@@ -776,6 +776,13 @@
       "description": "This prove (its trials are runs with this `parent_id`).",
       "type": "string"
     },
+    "run_command": {
+      "description": "`oprobe run` of the run's workload on the proven operator: the next profile.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "run_id": {
       "description": "The run whose operator was changed.",
       "type": "string"

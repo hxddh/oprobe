@@ -44,14 +44,14 @@ The workspace has three crates. Front ends call only `oprobe_core::app::App`.
 
 | Path | What |
 |---|---|
-| `crates/oprobe-trace/` | The published library: `layer(Config) -> (TraceLayer, Handle)`, `Handle::snapshot/save/save_and_reset` (`oprobe.trace/7` files; 6.x still read), `Handle::retry_notify`, the instrumented `HttpTransport`, the `Exporter` hook, OpenTelemetry metrics (feature `otel`). Internals are public only under the hidden `__internal` feature that oprobe-core enables. |
+| `crates/oprobe-trace/` | The published library: `layer(Config) -> (TraceLayer, Handle)`, `Handle::snapshot/save/save_and_reset` (`oprobe.trace/9` files; older traces are refused with a hint), `Handle::retry_notify`, the instrumented `HttpTransport`, the `Exporter` hook, OpenTelemetry metrics (feature `otel`). Internals are public only under the hidden `__internal` feature that oprobe-core enables. |
 | `crates/oprobe-core/src/operator/` | `OperatorSpec` (`op.toml`, `oprobe.operator/6`). `build.rs` builds the layer stack; `diff.rs` renders a diff as Rust and TOML; `resolve.rs` resolves the OPERATOR argument. |
 | `crates/oprobe-core/src/app/` | The service layer: `plan`, `run` (1..n operators), `prove`, `show`, `list`, `rm`, `lab`. |
 | `crates/oprobe-core/src/engine/` | Sessions, datasets, the runner and its schedule, the four workload presets, cleanup. |
 | `crates/oprobe-core/src/analysis/` | Findings, each with a `remedy` (`findings.rs`); limit fitting (`limits.rs`); statistics and intervals (`stats.rs`); the finding catalog (`catalog.rs`). |
-| `crates/oprobe-core/src/model/` | Run ids, the report (`oprobe.report/6`), the run spec, the report builder. |
+| `crates/oprobe-core/src/model/` | Run ids, the report (`oprobe.report/7`), the run spec, the report builder. |
 | `crates/oprobe-core/src/report/` | `view.rs` (the one presentation model used by the CLI and the app) and the terminal renderer. |
-| `crates/oprobe-core/src/store/` | The config file, the run store (`runfile.rs`: `oprobe.run/6`), prove results and their child trials. |
+| `crates/oprobe-core/src/store/` | The config file, the run store (`runfile.rs`: `oprobe.run/7`), prove results (`oprobe.prove/9`) and their child trials. |
 | `crates/oprobe-core/src/{guard,errors,events,output}.rs` | Safety rails; error classification (`ErrorCode`, exit codes); the event bus; output formats (`text`, `json`). |
 | `crates/oprobe-core/src/lab/` | The in-process S3-compatible fault-injection server. |
 | `crates/oprobe/src/cli/` | The clap tree (`args.rs`), presentation (`commands.rs`) and the schema registry (`schema.rs`). |

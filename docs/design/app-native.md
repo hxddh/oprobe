@@ -53,8 +53,15 @@ oprobe is a document-style professional tool (Instruments, Xcode, Console). The 
   - the whole bar is a drag region: a double press zooms or maximizes as the platform does (the
     title is not selectable, so it does not take the press).
 - **State**: the sidebar's visibility and width, the page and (macOS, Windows) the window's
-  placement are restored at the next start. Linux does not restore the placement: with GTK's
-  client-side frame a restored window would shrink by its frame at every start.
+  placement are restored at the next start (nsh's `restore_bounds`, kept under the window's id).
+  Linux does not restore the placement: with GTK's client-side frame a restored window would
+  shrink by its frame at every start.
+- **The window** (nsh 0.7's window model): the app root is an invisible host, and the app
+  declares its one window as `window().id("main")` with its title, default size (1280 × 860),
+  chrome, progress and close guard. Commands go to that window's ref (focus, full screen,
+  attention, the sidebar's key-window state); closing it quits the app on every platform
+  (`QuitMode::LastWindowClosed`), and a Dock reopen or a second launch focuses it
+  (`on_reopen`).
 
 ## Menus and keys
 
@@ -100,7 +107,7 @@ The shortcuts use the platform's modifier (`mod`: ⌘ on macOS, Ctrl elsewhere).
   (`App::plan`): the dialog shows what the run writes, reads and deletes, under which prefix, its
   ETA and its budgets, and only then offers Run.
 - **Settings** (mod+,): the language (System, English, 简体中文), where runs are stored and the
-  config file. On macOS it is a window of its own (`window().id("settings")`, not modal, no
+  config file. On macOS it is a window of its own (`window().id("settings")`, owned by `main`, not modal, no
   Done: every change applies at once); on Windows and GNOME a preferences dialog with a close
   button; on a terminal a dialog.
 - **About oprobe**: the version and links (the system's About panel on macOS).
@@ -110,6 +117,9 @@ The shortcuts use the platform's modifier (`mod`: ⌘ on macOS, Ctrl elsewhere).
   file is dragged over it.
 - A running job shows its progress on the Dock icon or taskbar button; when it ends with the
   window in the background, a notification says so and the Dock or taskbar asks for attention.
+  Run, Prove and Save carry an accessibility hint, and Run and Prove read as busy while they go.
+- Copy buttons say "Copied" only when the system says the clipboard took the text
+  (`ClipboardWrite::Written`); a platform that does not say (Linux, a terminal) shows nothing.
 - Dialogs fade in unless reduced motion is on.
 
 ## Look
@@ -136,7 +146,11 @@ The shortcuts use the platform's modifier (`mod`: ⌘ on macOS, Ctrl elsewhere).
 
 The same structure runs on the terminal grid: the sidebar is the left column, the toolbar is the
 first row, menus are the primary menu (F10), dialogs are `Modal`s, and there is no material. The
-keys are the same, with Ctrl.
+keys are the same, with Ctrl. The detail's content pages with PageUp/PageDown, Space and
+Shift+Space, Home/End, and j/k (three rows), wherever the focus is (Up/Down stay the sidebar's);
+Tab reaches the content too. Bars are at least one row high (a thinner bar rounds to nothing on
+the grid), a quantile from too few operations is dotted, chart labels never share a cell row, and
+property names wrap rather than being cut.
 
 ## Not in scope
 

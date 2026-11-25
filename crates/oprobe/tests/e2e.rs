@@ -870,6 +870,86 @@ fn interrupted_run_exits_130() {
     assert!(err.contains("partial results"), "{err}");
 }
 
+/// D7: Ctrl-C during `oprobe prove` leaves no trial runs behind. The prove result is never
+/// saved, so its trials would be orphans no `show --rm` could reach.
+#[cfg(unix)]
+#[test]
+fn an_interrupted_prove_leaves_no_trial_runs() {
+    let home = tempfile::tempdir().unwrap();
+    let cmd = || {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_oprobe"));
+        c.env("OPROBE_DATA_DIR", home.path().join("data"))
+            .env("OPROBE_CONFIG", home.path().join("config.toml"))
+            .env_remove("OPROBE_OUTPUT");
+        c
+    };
+    let o = cmd()
+        .args(["run", "memory://", "-d", "500ms", "--warmup", "0s", "-q"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let runs_dir = home.path().join("data").join("runs");
+    let run_files = || {
+        std::fs::read_dir(&runs_dir)
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .is_some_and(|x| x == "oprobe")
+            })
+            .count()
+    };
+    assert_eq!(run_files(), 1);
+    let child = cmd()
+        .args([
+            "prove",
+            "last",
+            "--with",
+            "layers.retry.jitter=on",
+            "--trial",
+            "500ms",
+            "--pairs",
+            "12",
+            "-q",
+            "-o",
+            "json",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Interrupt once a trial has been stored.
+    let t0 = std::time::Instant::now();
+    while run_files() < 3 && t0.elapsed() < std::time::Duration::from_secs(60) {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(run_files() >= 3, "no trial was stored");
+    // SAFETY: plain signal to our own child process.
+    unsafe {
+        libc::kill(child.id() as libc::pid_t, libc::SIGINT);
+    }
+    let out = child.wait_with_output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(130), "{err}");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["error"]["code"], "run.interrupted", "{v}");
+    assert_eq!(v["error"]["retryable"], true, "{v}");
+    assert_eq!(run_files(), 1, "trial runs were left behind");
+    let all = cmd()
+        .args(["show", "--list", "--all", "-o", "json"])
+        .output()
+        .unwrap();
+    let all: serde_json::Value = serde_json::from_slice(&all.stdout).unwrap();
+    assert_eq!(all["total_count"], 1, "{all}");
+}
+
 // ---------------------------------------------------------------------------------------
 // Trust fixes (v3): results must never lead to a wrong conclusion.
 // ---------------------------------------------------------------------------------------

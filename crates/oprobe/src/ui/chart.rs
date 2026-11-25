@@ -35,9 +35,11 @@ pub struct Line {
     pub mark: Mark,
     /// Drawn faint: context behind the main series (the attempted rate behind goodput).
     pub faint: bool,
-    /// Per point: too few samples to be an estimate (drawn faint and dashed). Empty: every
-    /// point holds.
+    /// Per point: too few samples to be an estimate (drawn faint and dashed; dotted on a
+    /// terminal). Empty: every point holds.
     pub weak: Vec<bool>,
+    /// Drawn dashed in a window (a series close to another: p99.9 beside p99).
+    pub dashed: bool,
 }
 
 impl Line {
@@ -49,7 +51,13 @@ impl Line {
             mark: Mark::Step,
             faint: false,
             weak: Vec::new(),
+            dashed: false,
         }
+    }
+    /// The same line drawn dashed.
+    pub fn dashed(mut self) -> Self {
+        self.dashed = true;
+        self
     }
     /// The same line drawn faint.
     pub fn faint(mut self) -> Self {
@@ -202,6 +210,10 @@ pub struct Plot {
     pub rules: Vec<Rule>,
     /// What the readout adds over `[from, to)` of x (`n=12, too few for p99`).
     pub notes: Vec<(f64, f64, String)>,
+    /// A right axis that reads the same lines in another unit: `(factor, unit, label)`, a
+    /// value `v` of the left axis reading `v × factor` on the right (throughput on goodput
+    /// when every operation moves the same bytes).
+    pub y2: Option<(f64, Unit, String)>,
 }
 
 impl Plot {
@@ -221,7 +233,24 @@ impl Plot {
             bands: Vec::new(),
             rules: Vec::new(),
             notes: Vec::new(),
+            y2: None,
         }
+    }
+
+    /// The frame this plot draws in on a canvas `h` high: the left gutter fits the y labels,
+    /// the right one a second axis's.
+    pub fn frame(&self, h: f32) -> Frame {
+        let mut f = frame_for(&self.y, self.y_fmt.f(), h);
+        if let Some((k, unit, _)) = &self.y2 {
+            let chars = y_ticks(&self.y, (f.y0(h) - f.top).max(1.0))
+                .into_iter()
+                .map(|t| unit.f()(t * k).chars().count())
+                .max()
+                .unwrap_or(0) as f32;
+            let cw = if kit::in_terminal() { 8.0 } else { 6.6 };
+            f.right = f.right.max(chars * cw + 8.0);
+        }
+        f
     }
 
     /// The readout's note at `x`, if any.
@@ -381,8 +410,15 @@ pub fn axes(
         .line_width(1.0)
         .text_align(CanvasTextAlign::Right)
         .text_baseline(CanvasTextBaseline::Middle);
+    let mut last_row = None;
     for t in y_ticks(y, y0 - y1) {
         let py = y0 - (y.norm(t) as f32) * (y0 - y1);
+        // On a terminal two labels on one row of cells run together ("0.011.00 ms").
+        let row = (py / 16.0).round() as i32;
+        if term && last_row == Some(row) {
+            continue;
+        }
+        last_row = Some(row);
         if !term {
             p = p
                 .stroke_color(grid)
@@ -400,7 +436,10 @@ pub fn axes(
         .text_baseline(CanvasTextBaseline::Top);
     // A tick whose label would read as another value (a count's 1.5 reads "2") is left out.
     let honest = |t: &f64| x_fmt(*t) != x_fmt(t.round()) || (t - t.round()).abs() < 1e-9;
-    for t in x.ticks(target).into_iter().filter(honest) {
+    // On a terminal the bottom y label and the first x label share a row ("0/s0 s"): the x
+    // axis starts unlabelled there.
+    let clear = |t: &f64| !term || (x.norm(*t) as f32) * (x1 - x0) >= 4.0 * cw;
+    for t in x.ticks(target).into_iter().filter(honest).filter(clear) {
         let px = x0 + (x.norm(t) as f32) * (x1 - x0);
         p = p
             .stroke_color(axis)
@@ -421,7 +460,8 @@ pub fn axes(
 
 /// The plot: bands under everything, then the axes, the series and the rules.
 pub fn paint_plot(plot: &Plot, w: f32, h: f32) -> Painter {
-    let f = frame_for(&plot.y, plot.y_fmt.f(), h);
+    let term = kit::in_terminal();
+    let f = plot.frame(h);
     let (x0, x1, y0, y1) = (f.left, f.x1(w), f.y0(h), f.top);
     let sx = |v: f64| x0 + (plot.x.norm(v) as f32) * (x1 - x0);
     let sy = |v: f64| y0 - (plot.y.norm(v) as f32) * (y0 - y1);
@@ -469,6 +509,24 @@ pub fn paint_plot(plot: &Plot, w: f32, h: f32) -> Painter {
     }
     p = p.global_alpha(1.0).restore();
     p = axes(p, f, w, h, &plot.x, &plot.y, plot.x_fmt.f(), plot.y_fmt.f());
+    if let Some((k, unit, _)) = &plot.y2 {
+        // The right axis: the left ticks read in the second unit.
+        p = p
+            .font(FONT)
+            .fill_color(paint("axis"))
+            .text_align(CanvasTextAlign::Left)
+            .text_baseline(CanvasTextBaseline::Middle);
+        let mut last_row = None;
+        for t in y_ticks(&plot.y, y0 - y1) {
+            let py = sy(t);
+            let row = (py / 16.0).round() as i32;
+            if term && last_row == Some(row) {
+                continue;
+            }
+            last_row = Some(row);
+            p = p.fill_text(&unit.f()(t * k), x1 + 5.0, py);
+        }
+    }
     p = clip(p);
     for l in plot.lines.iter().filter(|l| !l.pts.is_empty()) {
         p = p.stroke_color(paint(l.token)).fill_color(paint(l.token));
@@ -487,13 +545,24 @@ pub fn paint_plot(plot: &Plot, w: f32, h: f32) -> Painter {
                 let dash = [px(3.0), px(3.0)];
                 for (i, (x, y)) in l.pts.iter().enumerate() {
                     let weak = l.is_weak(i);
+                    if weak && term {
+                        // A terminal draws no dashes: a dotted run of `·` instead.
+                        let next = l.pts.get(i + 1).map(|n| n.0).unwrap_or(x + plot.step_w);
+                        let (a, b, py) = (sx(*x), sx(next), sy(*y));
+                        p = p
+                            .text_align(CanvasTextAlign::Center)
+                            .text_baseline(CanvasTextBaseline::Middle)
+                            .font(FONT);
+                        let mut cx = a + 4.0;
+                        while cx < b.max(a + 8.0) {
+                            p = p.fill_text("·", cx, py);
+                            cx += 16.0;
+                        }
+                        continue;
+                    }
                     p = p
                         .global_alpha(if weak { 0.35 } else { 1.0 })
-                        .line_dash(if weak && !kit::in_terminal() {
-                            &dash[..]
-                        } else {
-                            &[]
-                        })
+                        .line_dash(if weak && !term { &dash[..] } else { &[] })
                         .line_width(if weak { 1.0 } else { 1.5 })
                         .begin_path();
                     if l.mark == Mark::Step {
@@ -510,9 +579,11 @@ pub fn paint_plot(plot: &Plot, w: f32, h: f32) -> Painter {
                 p = p.global_alpha(1.0).line_dash(&[]);
             }
             Mark::Step | Mark::Line => {
+                let dash = [px(5.0), px(3.0)];
                 p = p
                     .global_alpha(if l.faint { 0.4 } else { 1.0 })
                     .line_width(if l.faint { 1.0 } else { 1.5 })
+                    .line_dash(if l.dashed && !term { &dash[..] } else { &[] })
                     .begin_path();
                 for (i, (x, y)) in l.pts.iter().enumerate() {
                     p = if i == 0 {
@@ -525,12 +596,16 @@ pub fn paint_plot(plot: &Plot, w: f32, h: f32) -> Painter {
                         p = p.line_to(sx(next), sy(*y));
                     }
                 }
-                p = p.stroke().global_alpha(1.0);
+                p = p.stroke().global_alpha(1.0).line_dash(&[]);
             }
         }
     }
     p = p.restore().font(FONT).line_width(1.0);
     let dash = [px(4.0), px(3.0)];
+    // Rule labels side by side would run together ("pp99.9"): each takes the first row (of a
+    // terminal's cells, or of the window's text) where it overlaps no label placed before.
+    let (cw, line) = if term { (8.0, 16.0) } else { (6.6, 12.0) };
+    let mut placed: Vec<(usize, f32, f32)> = Vec::new();
     for r in &plot.rules {
         let c = paint(r.token);
         p = p
@@ -550,7 +625,22 @@ pub fn paint_plot(plot: &Plot, w: f32, h: f32) -> Painter {
                 .stroke()
                 .line_dash(&[]);
             if !r.label.is_empty() {
-                let right = px_ + 4.0 + r.label.chars().count() as f32 * 6.6 < x1;
+                let wl = r.label.chars().count() as f32 * cw;
+                let right = px_ + 4.0 + wl < x1;
+                let (a, b) = if right {
+                    (px_ + 4.0, px_ + 4.0 + wl)
+                } else {
+                    (px_ - 4.0 - wl, px_ - 4.0)
+                };
+                let rows = (((y0 - y1) / line).floor() as usize).max(1);
+                let row = (0..rows)
+                    .find(|k| {
+                        !placed
+                            .iter()
+                            .any(|(pk, pa, pb)| pk == k && a < pb + cw && *pa < b + cw)
+                    })
+                    .unwrap_or(0);
+                placed.push((row, a, b));
                 p = p
                     .text_align(if right {
                         CanvasTextAlign::Left
@@ -561,7 +651,7 @@ pub fn paint_plot(plot: &Plot, w: f32, h: f32) -> Painter {
                     .fill_text(
                         &r.label,
                         if right { px_ + 4.0 } else { px_ - 4.0 },
-                        y1 + 1.0,
+                        y1 + 1.0 + row as f32 * line,
                     );
             }
         } else if let Some(y) = r.y {
@@ -573,10 +663,16 @@ pub fn paint_plot(plot: &Plot, w: f32, h: f32) -> Painter {
                 .stroke()
                 .line_dash(&[]);
             if !r.label.is_empty() {
+                // Above the rule, or below it when it runs along the top of the plot.
+                let below = py - line < y1;
                 p = p
                     .text_align(CanvasTextAlign::Right)
-                    .text_baseline(CanvasTextBaseline::Bottom)
-                    .fill_text(&r.label, x1 - 2.0, py - 1.0);
+                    .text_baseline(if below {
+                        CanvasTextBaseline::Top
+                    } else {
+                        CanvasTextBaseline::Bottom
+                    })
+                    .fill_text(&r.label, x1 - 2.0, if below { py + 1.0 } else { py - 1.0 });
             }
         }
     }
@@ -761,7 +857,7 @@ pub fn paint_time_overlay(
 
 /// The value of each line at `xv` as dots on the cursor.
 fn paint_dots(mut p: Painter, plot: &Plot, w: f32, h: f32, xv: f64) -> Painter {
-    let f = frame_for(&plot.y, plot.y_fmt.f(), h);
+    let f = plot.frame(h);
     let (x0, x1, y0, y1) = (f.left, f.x1(w), f.y0(h), f.top);
     if xv < plot.x.min || xv > plot.x.max {
         return p;
@@ -783,7 +879,7 @@ fn paint_dots(mut p: Painter, plot: &Plot, w: f32, h: f32, xv: f64) -> Painter {
 
 /// The x value under canvas x `hx` (`None` off the plot area).
 fn x_at(plot: &Plot, w: f32, h: f32, hx: f32) -> Option<f64> {
-    let f = frame_for(&plot.y, plot.y_fmt.f(), h);
+    let f = plot.frame(h);
     let (x0, x1) = (f.left, f.x1(w));
     (hx >= x0 - 1.0 && hx <= x1 + 1.0)
         .then(|| plot.x.value(((hx - x0) / (x1 - x0)).clamp(0.0, 1.0) as f64))
@@ -793,8 +889,11 @@ fn x_at(plot: &Plot, w: f32, h: f32, hx: f32) -> Option<f64> {
 pub fn readout_at(p: &Plot, xv: f64) -> String {
     let mut s = p.x_fmt.f()(xv);
     for (label, v) in p.values_at(xv) {
-        let v = v.map(p.y_fmt.f()).unwrap_or_else(|| "—".into());
-        s += &format!(" · {label} {v}");
+        let shown = v.map(p.y_fmt.f()).unwrap_or_else(|| "—".into());
+        s += &format!(" · {label} {shown}");
+        if let (Some(v), Some((k, unit, l2))) = (v, &p.y2) {
+            s += &format!(" · {l2} {}", unit.f()(v * k));
+        }
     }
     if let Some(n) = p.note_at(xv) {
         s += &format!(" · {n}");
@@ -883,7 +982,7 @@ fn chart_with(
         let band = link.and_then(|l| l.shaded());
         plot.with(|p| match p {
             Some(p) if w > 0.0 => {
-                let f = frame_for(&p.y, p.y_fmt.f(), h);
+                let f = p.frame(h);
                 let area = (f.left, f.x1(w), f.y0(h), f.top);
                 let layer = paint_time_overlay(Painter::new(), &p.x, area, c, band);
                 match c {

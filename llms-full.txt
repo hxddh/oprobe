@@ -60,7 +60,7 @@ each with its remedy as an `op.toml` path, and the next command:
         peers, after a short retry backoff (TailCutLayer + RetryLayer::with_min_delay)
       next: oprobe prove 20261123-135409-4b57 tail_stragglers
   1733.6 ops/s · 97.6 MiB/s · p50 9.65ms · p99 261ms · errors 0.00%
-  full profile: oprobe show 20261123-135409-4b57 --detail · terms: https://github.com/hxddh/oprobe/blob/v9.0.0/docs/concepts.md#glossary
+  full profile: oprobe show 20261123-135409-4b57 --detail · terms: https://github.com/hxddh/oprobe/blob/v9.1.0/docs/concepts.md#glossary
 ```
 
 `prove last` runs trials of the current operator (A) and of the remedy (B), interleaved, and ends
@@ -259,7 +259,7 @@ oprobe prove last
 `prove` takes the run's operator (A) and the same operator with the top finding's remedy (B);
 `oprobe prove last FINDING` proves another finding's. For a remedy with a size, such as a
 concurrency limit, it first runs short sizing trials over that one value and picks the knee of
-the objective. Then it runs trials of A and B interleaved (A B A B …) until a sequential test
+the objective. Then it runs trials of A and B interleaved, pair by pair, until a sequential test
 against the noise floor decides, or the budget (`--max-duration`) runs out. It starts with the
 number of trials and the ETA of the whole proof, and prints each trial as it ends (on stderr):
 
@@ -439,7 +439,8 @@ operation, its remedy is a shorter first retry backoff with jitter, `layers.retr
 
 Each finding names exactly **one** remedy, as an `op.toml` path: `layers.concurrent_limit.http`,
 `layers.tail_cut`, `read.gap`, `http.keep_alive`, … A remedy that is not a layer (spreading keys
-over prefixes for `key_limit`) is reported as advice, and `client_bound` has no storage remedy.
+over prefixes for `key_limit`) is reported as advice, and `client_bound` has no storage remedy:
+their `next` says where to look (`oprobe show RUN --detail`), and `prove` refuses them.
 
 `run` gives the remedy and **no number**. A single run varies no load, so it cannot say how
 large a limit should be or how much it would help; claiming so would be a guess.
@@ -451,8 +452,9 @@ large a limit should be or how much it would help; claiming so would be a guess.
 1. **Choose the change**: the finding's remedy (the top finding by default), or `--with PATH=VALUE`.
 2. **Size it**: when the remedy has a size (a limit, a chunk), short trials over that one value
    find the knee of the objective, within `--max-throttle`.
-3. **A/B test**: trials of A and B alternate (A B A B …); a sequential test on the objective,
-   against a noise floor learned from consecutive A trials (the A/A spread), stops as soon as it
+3. **A/B test**: trials of A and B alternate in pairs (the order within each pair drawn from the
+   run's seed); a sequential test on the objective, against a noise floor learned from each
+   side's consecutive trials (the A/A spread until B has its own), stops as soon as it
    can decide, or when the wall-time budget (`--max-duration`) would be exceeded.
 4. **Decide**: `improved`, `worse` (exit 3) or `inconclusive` on the objective: **goodput**
    (successful operations per second; the default) or **p99**. The objective's interval is
@@ -568,7 +570,7 @@ OpenDAL recommends:
 | `timeout` | `TimeoutLayer` | `op`: one operation ("60s"); `io`: one read or write call ("10s") |
 | `tail_cut` | `TailCutLayer` | cancel and re-issue requests slower than `percentile` (95, within 50..99) of the recent latencies × `safety_factor` (1.5, within 1..5), once `min_samples` (32) latencies are recorded within `window` ("60s", at most 120 s); the deadline is clamped to `min_deadline` ("50ms") .. `max_deadline` (unset: the operation timeout `layers.timeout.op`, 60 s without the timeout layer). These defaults are oprobe's, not OpenDAL's (1.3, 200, "500ms", "30s"); generated Rust spells out every value that differs from OpenDAL's, so pasted code behaves as measured |
 | `throttle` | `ThrottleLayer` | `bandwidth` ("100MiB" per second), `burst` ("16MiB") |
-| `cache` | `FoyerLayer` over an in-memory foyer cache | `memory` ("256MiB") |
+| `cache` | `FoyerLayer` over an in-memory foyer cache, each entry weighed by its size | `memory` ("256MiB" of cached data) |
 
 ## `[read]` and `[write]`
 
@@ -760,7 +762,8 @@ The proof is made of **trials**: short runs of the current operator (A) and the 
 plus the sizing trials. It starts by printing how many trials it may take and the ETA of the
 whole proof; `--dry-run` prints the same estimate (and the plan of one trial) and sends nothing.
 
-A verdict other than `inconclusive` needs at least **3 pairs** of trials (A then B): when the
+A verdict other than `inconclusive` needs at least **3 pairs** of trials (one A and one B, in an
+order drawn per pair from the run's seed, and said so in `notes`): when the
 budget allows fewer, the verdict is `inconclusive` (exit 0) with a note. When no pair ran at all,
 the text says `not measured` and prints no diff; `-o json` still prints a valid result
 (`verdict: "inconclusive"`, `pairs_count: 0`, a note). When the changed operator's trials
@@ -771,8 +774,10 @@ throttle more than `--max-throttle` allows, and more than the current operator's
 it failed, or it is partial and too short); profile the operator again first.
 
 The objective's interval is Student's t on the paired log ratios of the objective (B over A, pair
-by pair), with a spread no smaller than the A/A noise floor learned from consecutive A trials (a
-floor learned from a single A/A difference is doubled). Shares, such as throttled requests, are
+by pair), with a spread no smaller than the noise floor: the spread a pair's ratio would have
+from the trial-to-trial spread of A and of B alone, each learned from that side's consecutive
+trials (until B has two trials, it is assumed as noisy as A: the A/A spread; a floor learned from
+a single A/A difference is doubled). Shares, such as throttled requests, are
 compared with Newcombe's interval.
 
 `--max-duration` is the one wall-time budget of the whole proof: no trial starts that would not
@@ -782,8 +787,13 @@ part-way, it still prints and saves the partial result (`budget_exceeded: true`,
 
 `RUN` is a run id, an id prefix, `last`, `last~N` or a run's `.oprobe` file. A production trace
 has no workload to replay: `prove` refuses it and prints the `oprobe run` command for the service
-it recorded. `FINDING` is a finding code (`throttling`, `tail_stragglers`, …). The objective's
-change prints with its 95 % interval ([glossary](concepts.md#glossary)).
+it recorded. `FINDING` is a finding code (`throttling`, `tail_stragglers`, …); a finding whose
+remedy is not a layer (`key_limit`, `client_bound`, a bandwidth cap on reads) has nothing to prove,
+and `prove` refuses it with where to look instead. A finding's `next` command names the objective
+its remedy is proved on: `--objective p99` for `throttling` and `rate_limit` (a cap takes the
+throttled operations' backoffs out of the tail; it cannot raise goodput while spare workers keep
+the service at its limit). The objective's change prints with its 95 % interval
+([glossary](concepts.md#glossary)).
 
 | Flag | Meaning |
 |---|---|
@@ -791,12 +801,13 @@ change prints with its 95 % interval ([glossary](concepts.md#glossary)).
 | `--objective goodput\|p99` | what the change is judged on: successful operations (or bytes) per second (default), or the worst per-operation p99 latency |
 | `--max-throttle RATIO` | share of throttled requests a change may cause, e.g. `0.1%` or `0.001` |
 | `--max-duration DURATION` | wall-time budget of the whole proof, e.g. `5m` |
-| `--save FILE\|OPERATOR` | when the verdict is `improved`, write the proven change to an `op.toml` file or to `[operators.OPERATOR]` in the config file |
+| `--save FILE\|OPERATOR` | when the verdict is `improved`, write the proven change to an `op.toml` file or to `[operators.OPERATOR]` in the config file. A new file gets the operator with its `${ENV}` references and without secret values; the run's own `op.toml` (or another of the same service) is patched in place; the config file's path saves to the run's `[operators.NAME]`. Any other existing file is refused before a trial runs. The proof is saved first: a save that fails is a note |
 | `--dry-run` | print the number of trials and the ETA of the whole proof, and exit (`-o json`: `schemas/prove-plan.json`) |
 | `--read-only` | refuse every write and delete (exit 5) |
 | `--max-requests N`, `--max-bytes SIZE` | stop after this many backend requests or bytes, over every trial (exit 4) |
 
-Every trial is saved as a run, a child of the prove, and hidden from `show --list`.
+Every trial is saved as a run, a child of the prove, and hidden from `show --list`. A prove
+stopped before its result is saved (Ctrl-C) deletes its trials.
 
 ```bash
 oprobe prove last throttling
@@ -810,7 +821,7 @@ oprobe prove 20261122-0915 small_ranges --max-duration 10m
 Print a profile: a stored run, or a file (`.oprobe` from `run` or from
 [`oprobe-trace`](embedding.md), or a report `.json`). Without an argument, the last run.
 Pass two or more runs or files to compare them side by side on goodput, bandwidth, latency,
-retries, throttling and stage split (`-o json`: `schemas/compare.json`, `--detail` adds the per-API
+retries, throttling and stage split (`-o json`: the `run` document, `schemas/run.json`, `--detail` adds the per-API
 comparison table). `-o json` for one run prints the shown run (`schemas/show.json`: the report of `schemas/report.json`, where it is stored, and the `by` and `range` sections when asked for); `--list -o json` the run list
 (`schemas/run-list.json`; `-n` limits the runs and the proves alike), and `--rm -o json` the deleted ids (`schemas/removed.json`). A prove id, unambiguous prove prefix, `last-prove`, or `.prove.json` file (`show --list`
 lists them) prints that prove's stored result as `prove` printed it (`schemas/prove.json`), also
@@ -858,7 +869,7 @@ Scenarios (the same six as the app's): `demo`, `throttle`, `stragglers`, `bandwi
 |---|---|
 | `--bind ADDR` | the address to listen on (default `127.0.0.1:9000`) |
 | `--allow-remote` | allow binding to a non-loopback address (`0.0.0.0`, LAN IP); refused without this flag because the lab accepts static lab credentials without authentication |
-| `--max-store-size SIZE` | cap total in-memory object bytes stored by the lab (default `8GiB`; returns `507 InsufficientStorage` above it) |
+| `--max-store-size SIZE` | (hidden from `--help`) cap total in-memory object bytes stored by the lab (default `8GiB`; returns `507 InsufficientStorage` above it) |
 
 ## Run references
 
@@ -921,7 +932,7 @@ The app's Profile view shows the same sections with charts ([app](app.md)).
         peers, after a short retry backoff (TailCutLayer + RetryLayer::with_min_delay)
       next: oprobe prove 20261123-135409-4b57 tail_stragglers
   1733.6 ops/s · 97.6 MiB/s · p50 9.65ms · p99 261ms · errors 0.00%
-  full profile: oprobe show 20261123-135409-4b57 --detail · terms: https://github.com/hxddh/oprobe/blob/v9.0.0/docs/concepts.md#glossary
+  full profile: oprobe show 20261123-135409-4b57 --detail · terms: https://github.com/hxddh/oprobe/blob/v9.1.0/docs/concepts.md#glossary
 ```
 
 (`oprobe demo`; your numbers differ from run to run.)
@@ -953,7 +964,7 @@ the configuration and the five slowest operations):
 | backend requests | per storage API (`GetObject`, `PutObject`, …): count, share on warm connections, TTFB and total p50/p99, bytes down/up, status codes (`--detail`: every stage's p50/p99); and, for a run that wrote, a **writes** line: the multipart part size OpenDAL used (and the requested `write.chunk` and the service's part-size limits when it was clamped) and the parts uploaded with their mean size — the knobs `prove` sizes for `slow_multipart` |
 | connections | HTTP version, TLS, the connections dialed during the warm-up and in the window, reuse, peak in-flight requests, dial time per phase (proxy CONNECT included), and a **tcp** line from the kernel: the minimum rtt (the network's own round trip) and the smoothed rtt p50/p99 (which on a fast network includes the server's delay and delayed acknowledgements), connections that retransmitted, the share of sending time limited by the peer's receive window or the local send buffer, the delivery rate. High rtt or retransmits point at the network; a clean network with a high TTFB points at the server. `--detail` adds the TLS handshakes (resumed share, HelloRetryRequests) and the cold start (dials and first operations before the warm-up absorbed them) |
 | bytes | logical vs backend bytes, read amplification, over-read, requests per operation, cache hits, and the bytes on the wire (from the kernel's per-connection counters, when they were read) |
-| slowest operation | the worst operation request by request (a waterfall), with what each request recorded beyond its stages (below) and, with `--detail`, its async call stack |
+| slowest operations | the five worst operations request by request (waterfalls), with what each request recorded beyond its stages (below) and, with `--detail`, their async call stacks |
 | self | the profiler's own health: scheduling lag, CPU, whether the client was saturated |
 | cleanup | test data removed (verified), or what is left |
 
@@ -969,7 +980,7 @@ per API and, when the requests recorded them, the request signals below.
 ### Request signals
 
 Besides its stage timings a request row can carry what the response and the connection said.
-The waterfall of the slowest operation (terminal and app) lists them per request, and
+The waterfalls of the slowest operations (terminal and app) list them per request, and
 `show --by stage` summarises them per API:
 
 | Signal | What it says |
@@ -1141,10 +1152,10 @@ let cfg = oprobe_trace::Config::default().exporter(std::sync::Arc::new(Slow));
 
 - **OpenTelemetry** (feature `otel`, `opentelemetry` 0.32): `oprobe_trace::otel::config(&meter)`
   records `http.client.request.duration` (seconds) once per stage (with `oprobe.stage`,
-  `oprobe.api`, `http.request.method`, `http.response.status_code`), `oprobe.operation.duration`
-  per OpenDAL operation, and `oprobe.cache.lookups` per cache lookup, carrying OpenDAL's own
+  `oprobe.api`, `http.request.method`, `http.response.status_code`), carrying OpenDAL's own
   metric labels (`scheme`, `namespace`, `root`, `operation`) so its series join
-  `opendal-layer-otelmetrics`'.
+  `opendal-layer-otelmetrics`'. Operation durations and cache metrics are not repeated: use
+  OpenDAL's own metrics layers for them.
 
 ## Configuration
 
@@ -1231,7 +1242,7 @@ oprobe binary and has no semver promise; do not enable it.
 `oprobe.trace/9` is one JSON document, readable without oprobe:
 
 ```text
-{ "format": "oprobe.trace/9", "oprobe_trace_version": "9.0.0", "created_at": "…",
+{ "format": "oprobe.trace/9", "oprobe_trace_version": "9.1.0", "created_at": "…",
   "service": { "scheme": "s3", "name": "my-bucket", "root": "/data/", "http_version": "auto", "keep_alive": true },
   "snapshot": { … }, "rows": { "ops": [ … ], "reqs": [ … ], "info": { … }, "sampling": { … } } }
 ```
@@ -1446,12 +1457,12 @@ Each finding carries the evidence it rests on:
 | `errors` | failed operations per second |
 
 **Operator.** The run's layer stack beside each finding's remedy. A finding's **Prove** (and
-**Prove this remedy** in Profile) proves that finding as `oprobe prove RUN CODE` does: prove
+**Prove this remedy** in Profile) proves that finding as its `next` command (`oprobe prove RUN CODE`, with its objective) does: prove
 sizes the remedy from the run (a limit from the fitted throttling limit, say) and then proves
 it. Toggle a layer or change a value (a limit, a chunk size) yourself and **Prove** proves your
 change with the values you set. The trials stream in live and their A/B pairs are drawn as they
 converge: each pair's change as a dot, the running estimate with its 95 % interval narrowing,
-and the A/A noise floor around no change, until the sequential test decides: **improved**,
+and the noise floor around no change, until the sequential test decides: **improved**,
 **worse** or **inconclusive**. **Copy** puts the winning diff (Rust or TOML) on the clipboard; when
 the run came from an `op.toml` file, **Save to op.toml** writes the proven change back to it in
 place (preserving credentials and `${ENV}` references).

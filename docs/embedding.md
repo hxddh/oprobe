@@ -84,10 +84,10 @@ let cfg = oprobe_trace::Config::default().exporter(std::sync::Arc::new(Slow));
 
 - **OpenTelemetry** (feature `otel`, `opentelemetry` 0.32): `oprobe_trace::otel::config(&meter)`
   records `http.client.request.duration` (seconds) once per stage (with `oprobe.stage`,
-  `oprobe.api`, `http.request.method`, `http.response.status_code`), `oprobe.operation.duration`
-  per OpenDAL operation, and `oprobe.cache.lookups` per cache lookup, carrying OpenDAL's own
+  `oprobe.api`, `http.request.method`, `http.response.status_code`), carrying OpenDAL's own
   metric labels (`scheme`, `namespace`, `root`, `operation`) so its series join
-  `opendal-layer-otelmetrics`'.
+  `opendal-layer-otelmetrics`'. Operation durations and cache metrics are not repeated: use
+  OpenDAL's own metrics layers for them.
 
 ## Configuration
 
@@ -174,7 +174,7 @@ oprobe binary and has no semver promise; do not enable it.
 `oprobe.trace/9` is one JSON document, readable without oprobe:
 
 ```text
-{ "format": "oprobe.trace/9", "oprobe_trace_version": "9.0.0", "created_at": "…",
+{ "format": "oprobe.trace/9", "oprobe_trace_version": "9.1.0", "created_at": "…",
   "service": { "scheme": "s3", "name": "my-bucket", "root": "/data/", "http_version": "auto", "keep_alive": true },
   "snapshot": { … }, "rows": { "ops": [ … ], "reqs": [ … ], "info": { … }, "sampling": { … } } }
 ```

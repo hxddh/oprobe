@@ -4597,7 +4597,7 @@
   },
   "$id": "https://github.com/hxddh/oprobe/schemas/9/run.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "description": "The result of `oprobe run -o json` (and `demo`): one run per operator, each with its report, and the comparison when there are several",
+  "description": "The result of `oprobe run -o json` (and `demo`): one run per operator, each with its report, and the comparison when there are several; `oprobe show A B -o json` prints the same document",
   "properties": {
     "comparison": {
       "anyOf": [
