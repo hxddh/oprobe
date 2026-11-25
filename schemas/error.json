@@ -77,7 +77,7 @@
       "type": "string"
     }
   },
-  "$id": "https://github.com/hxddh/oprobe/schemas/6/error.json",
+  "$id": "https://github.com/hxddh/oprobe/schemas/9/error.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "The error document printed under `-o json`",
   "properties": {

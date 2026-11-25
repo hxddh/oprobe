@@ -42,7 +42,13 @@ pub fn sidebar(s: Store) -> View {
     let focused = signal(false);
     keys(s, focused);
     view()
-        .w(move || px(if term { 30.0 * 8.0 } else { s.sidebar_w.get() }))
+        .w(move || {
+            px(if term {
+                (s.sidebar_w.get() / 8.0).round().clamp(22.0, 48.0) * 8.0
+            } else {
+                s.sidebar_w.get()
+            })
+        })
         .flex_shrink_0()
         .min_h(px(0.0))
         .border_r_1()
@@ -75,7 +81,7 @@ pub fn sidebar(s: Store) -> View {
                     ),
             ),
         )
-        .child((!term).then(|| edge(s)))
+        .child(edge(s))
 }
 
 /// The keys of the list while it has the keyboard focus (never while a field edits).
@@ -181,7 +187,7 @@ fn top(s: Store) -> View {
 fn live(s: Store) -> impl IntoElement {
     dynamic(move || {
         let st = s.run_state.get().filter(|st| st.outcome.is_none());
-        let operator = s.form.operator.get();
+        let operator = s.running_label.get();
         untracked(|| {
             st.map(|st| {
                 let frac = if st.total_s > 0.0 {
@@ -307,7 +313,13 @@ fn row(
     focused: Signal<bool>,
 ) -> View {
     let id = r.id.clone();
-    let (sel_id, ctx_id, menu_id) = (id.clone(), id.clone(), id.clone());
+    let (sel_id, ctx_id, menu_id, cur_id) = (id.clone(), id.clone(), id.clone(), id.clone());
+    let row_ref = element_ref();
+    effect(move || {
+        if s.cursor.get().as_deref() == Some(cur_id.as_str()) {
+            row_ref.reveal(nsh_core::RevealOptions::default());
+        }
+    });
     let a11y = format!("{} ({n}/{total})", fill("runs.open", &[&id]));
     let selected = computed(move || s.selection.with(|v| v.contains(&sel_id)));
     let marked = computed(move || {
@@ -342,6 +354,7 @@ fn row(
             ..Default::default()
         })
         .test_id(&format!("run-{}", r.id))
+        .element_ref(&row_ref)
         .flex_row()
         .items_center()
         .gap(px(8.0))

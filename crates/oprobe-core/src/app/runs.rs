@@ -82,7 +82,7 @@ impl CommandOutput for RunList {
                         .unwrap_or_else(|| crate::util::display_url(&r.target_display)),
                     when(&r.id, now),
                     format!("{:.0}s", r.window_s),
-                    if r.interrupted {
+                    if r.partial.is_some() {
                         format!("{verdict}*")
                     } else {
                         verdict
@@ -97,7 +97,7 @@ impl CommandOutput for RunList {
             &rows,
             0,
         );
-        if self.runs.iter().any(|r| r.interrupted) {
+        if self.runs.iter().any(|r| r.partial.is_some()) {
             o += &dim("* stopped early (partial run)\n");
         }
         if !self.proves.is_empty() {
@@ -249,11 +249,12 @@ impl ByTable {
             None => true,
         };
         let reqs: Vec<&crate::model::ReqRow> = run.reqs.iter().filter(|q| inside(q.t_us)).collect();
+        let weights = run.op_weights();
         Self {
             by,
-            groups: slice::group(&reqs, by),
+            groups: slice::group_weighted(&reqs, by, &weights),
             stages: if by == slice::By::Stage {
-                slice::stage_table(&reqs)
+                slice::stage_table_weighted(&reqs, &weights)
             } else {
                 Vec::new()
             },
@@ -320,9 +321,8 @@ impl ByTable {
                 0,
             );
             o += &dim("stage columns: p50/p99\n");
-            // What the requests recorded beyond their stages: the HTTP/2 stream wait (part of
-            // queue) and flow-control stall (hidden in ttfb), the kernel's upload timing, the
-            // CDN cache and the region.
+            // What the requests recorded beyond their stages: HTTP/2 open streams, the kernel's
+            // upload timing, the CDN cache and the region.
             if self.stages.iter().any(|s| s.has_signals()) {
                 let opt = |s: &Option<crate::analysis::slice::StageQ>| {
                     s.as_ref().map_or("-".to_owned(), &q)
@@ -343,8 +343,6 @@ impl ByTable {
                     .map(|s| {
                         vec![
                             s.api.clone(),
-                            opt(&s.stream_wait),
-                            opt(&s.flow_stall),
                             s.streams_max_count
                                 .map_or("-".to_owned(), |n| n.to_string()),
                             opt(&s.send_buffered),
@@ -358,8 +356,6 @@ impl ByTable {
                 o += &crate::report::style::table(
                     &[
                         "api",
-                        "h2 stream wait",
-                        "h2 flow stall",
                         "streams",
                         "send buffered",
                         "upload acked",
@@ -369,9 +365,7 @@ impl ByTable {
                     &rows,
                     0,
                 );
-                o += &dim(
-                    "request signals: p50/p99 over the requests that had them · stream wait is part of queue, flow stall is inside ttfb\n",
-                );
+                o += &dim("request signals: p50/p99 over the requests that had them\n");
             }
         }
         o
@@ -393,10 +387,22 @@ impl CommandOutput for Profile {
 
     fn text(&self) -> String {
         if let Some(b) = &self.by {
-            return b.text();
+            let mut o = String::new();
+            if let Some(v) = &self.range {
+                o += &dim(&format!(
+                    "{:.1}–{:.1} s of the {:.1} s window · {} ops · {} requests\n",
+                    v.since_s,
+                    v.until_s,
+                    self.run.report.run.window_s,
+                    v.ops_count,
+                    v.requests_count
+                ));
+            }
+            o += &b.text();
+            return o;
         }
         if let (Some(v), Some(run)) = (&self.range, &self.full) {
-            return terminal::range_section(run, v);
+            return terminal::range_section_with(run, v, self.detail);
         }
         let mut o = match &self.full {
             Some(run) => terminal::render_run_with(run, self.detail),
@@ -497,26 +503,155 @@ impl CommandOutput for ShownProve {
     }
 }
 
-/// The stored prove `r` names (its id), or `None` when `r` names no prove. A prove whose run
-/// or trials were removed still shows: its result is stored whole.
+/// The stored prove `r` names (its id, prefix, `last-prove` or `.prove.json` path), or `None`
+/// when `r` names no prove. A prove whose run or trials were removed still shows: its result
+/// is stored whole.
 pub fn show_prove(app: &App, r: &RunRef) -> Result<Option<ShownProve>> {
-    let id = r.0.trim();
-    if crate::model::RunId::parse(id).is_none() {
+    let Some(path) = app.store().resolve_prove(&r.0)? else {
         return Ok(None);
-    }
-    let path = app.store().dir().join(format!("{id}.prove.json"));
-    if !path.is_file() {
-        return Ok(None);
-    }
+    };
     let raw = std::fs::read(&path)?;
-    let out: super::prove::ProveOutput = serde_json::from_slice(&raw).map_err(|e| {
+    let stem = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.strip_suffix(".prove.json"))
+        .unwrap_or(&r.0);
+    let out = super::prove::ProveOutput::from_json_slice(&raw).map_err(|e| {
         OprobeError::new(
             ErrorCode::UsageInvalidArgument,
-            format!("prove result `{}` is corrupt: {e}", path.display()),
+            format!("prove result `{}` cannot be read: {e}", path.display()),
         )
-        .with_hint(format!("remove it with `oprobe show --rm {id}`"))
+        .with_hint(format!("remove it with `oprobe show --rm {stem}`"))
     })?;
     Ok(Some(ShownProve(out)))
+}
+
+/// Result of `oprobe show A B [...]`: two or more stored runs or `.oprobe` files compared
+/// side by side (JSON: the `run` schema, [`super::run::RunSet`]).
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct Comparison {
+    #[serde(flatten)]
+    pub set: super::run::RunSet,
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub detail: bool,
+}
+
+impl CommandOutput for Comparison {
+    fn next(&self) -> Vec<crate::output::NextStep> {
+        self.set.runs.first().map_or_else(
+            || vec![crate::app::next::list_runs()],
+            |r| vec![crate::app::next::show(r.report.show_ref())],
+        )
+    }
+
+    fn text(&self) -> String {
+        let Some(cmp) = &self.set.comparison else {
+            return self.set.text();
+        };
+        let same_workload = cmp.differences.iter().all(|d| !d.contains("workload"));
+        let mut o = format!(
+            "{} {} runs{}\n",
+            bold("compare"),
+            cmp.rows.len(),
+            if same_workload {
+                " · the same workload"
+            } else {
+                ""
+            }
+        );
+        let rows: Vec<Vec<String>> = cmp
+            .rows
+            .iter()
+            .map(|r| {
+                vec![
+                    r.run_id.clone(),
+                    r.operator.clone(),
+                    format!("{:.1}", r.goodput_ops_per_s),
+                    fmt_ms(r.p50_ms),
+                    fmt_ms(r.p99_ms),
+                    format!("{:.2}%", r.throttled_request_ratio * 100.0),
+                    r.failed_ops_count.to_string(),
+                    r.top_finding.clone().unwrap_or_else(|| "—".into()),
+                ]
+            })
+            .collect();
+        o += &crate::report::style::table(
+            &[
+                "run",
+                "operator",
+                "ops/s",
+                "p50",
+                "p99",
+                "throttled",
+                "errors",
+                "top finding",
+            ],
+            &rows,
+            2,
+        );
+        if self.detail && !cmp.apis.is_empty() {
+            let mut headers = vec!["api".to_owned()];
+            for r in &cmp.rows {
+                headers.push(format!("{} reqs / ttfb p99", r.run_id));
+            }
+            let h_refs: Vec<&str> = headers.iter().map(String::as_str).collect();
+            let api_rows: Vec<Vec<String>> = cmp
+                .apis
+                .iter()
+                .map(|a| {
+                    let mut row = vec![a.api.clone()];
+                    for (c, p99) in a.requests_count.iter().zip(&a.ttfb_p99_ms) {
+                        if *c == 0 {
+                            row.push("—".into());
+                        } else {
+                            row.push(format!("{c} / {}", fmt_ms(*p99)));
+                        }
+                    }
+                    row
+                })
+                .collect();
+            o += "\n";
+            o += &crate::report::style::table(&h_refs, &api_rows, 2);
+        }
+        for d in &cmp.differences {
+            o += &format!("  {}\n", dim(d));
+        }
+        for r in &self.set.runs {
+            if let Some(f) = r.report.findings.first() {
+                let next = f.remedy.next.clone().unwrap_or_default();
+                o += &format!(
+                    "  {} {}: {} {}\n",
+                    dim("·"),
+                    r.report.show_ref(),
+                    f.cause,
+                    dim(&next)
+                );
+            }
+        }
+        o += &dim("  each run: oprobe show RUN --detail\n");
+        o
+    }
+}
+
+/// Side-by-side comparison of two or more stored runs or `.oprobe` files (`oprobe show A B`).
+pub fn compare(app: &App, refs: &[RunRef], detail: bool) -> Result<Comparison> {
+    let mut runs = Vec::with_capacity(refs.len());
+    for r in refs {
+        let path = app.store().resolve(&r.0)?;
+        let run = crate::store::runs::load_path(&path)?;
+        runs.push(super::run::RunOutput {
+            run_id: run.report.run.id.clone(),
+            path: Some(path.display().to_string()),
+            report: run.report.clone(),
+            full: Some(Box::new(run)),
+            breach: None,
+        });
+    }
+    Ok(Comparison {
+        set: super::run::RunSet::new(runs),
+        detail,
+    })
 }
 
 /// The run `r` names, with its rows.
@@ -570,9 +705,22 @@ pub fn stored_ids(app: &App, refs: &[RunRef]) -> Result<Vec<String>> {
     let store = app.store();
     let mut ids = Vec::new();
     for RunRef(r) in refs {
-        if store.dir().join(format!("{r}.prove.json")).is_file() {
-            ids.push(r.clone());
-            continue;
+        if let Some(p) = store.resolve_prove(r)? {
+            if p.parent() != Some(store.dir()) {
+                return Err(OprobeError::new(
+                    ErrorCode::SafetyRefused,
+                    format!("`{r}` is not a stored prove; delete files yourself"),
+                )
+                .into());
+            }
+            if let Some(id) = p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.strip_suffix(".prove.json"))
+            {
+                ids.push(id.to_owned());
+                continue;
+            }
         }
         let p = store.resolve(r)?;
         if p.parent() != Some(store.dir()) {

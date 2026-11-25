@@ -1,4 +1,4 @@
-//! The run file `oprobe.run/6` (design v5 §2): a zstd stream of framed blocks, written while
+//! The run file `oprobe.run/7` (design v5 §2): a zstd stream of framed blocks, written while
 //! the run is in progress and read back block by block. The process never encodes the whole
 //! file in memory.
 //!
@@ -193,6 +193,9 @@ struct OpColumns {
     breakdown: Vec<[u32; 5]>,
     requests: Vec<u32>,
     await_tree: Vec<Option<u32>>,
+    /// Sparse sampling weights `(row index, weight)` when `weight != 1.0`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    weights: Vec<(u32, f64)>,
 }
 
 /// Columnar request rows.
@@ -201,7 +204,9 @@ struct ReqColumns {
     t_us: Vec<u32>,
     op_id: Vec<u64>,
     attempt: Vec<u32>,
-    api: Vec<u32>,
+    api: Vec<crate::trace::Api>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    service_op: Vec<(u32, u32)>,
     method: Vec<u32>,
     status: Vec<u16>,
     protocol: Vec<WireProtocol>,
@@ -248,6 +253,7 @@ impl SegmentBuilder {
     pub fn push_op(&mut self, o: &OpRow) {
         let s = &mut self.strings;
         let oc = &mut self.ops;
+        let idx = oc.op_id.len() as u32;
         oc.op_id.push(o.op_id);
         oc.verb.push(s.id(&o.verb));
         oc.key.push(s.id(&o.key));
@@ -272,6 +278,9 @@ impl SegmentBuilder {
         );
         oc.requests.push(o.requests);
         oc.await_tree.push(s.opt(o.await_tree.as_deref()));
+        if (o.weight - 1.0).abs() > f64::EPSILON {
+            oc.weights.push((idx, o.weight));
+        }
     }
 
     pub fn push_req(&mut self, r: &ReqRow) {
@@ -281,7 +290,10 @@ impl SegmentBuilder {
         self.req_t.push(r.t_us);
         rc.op_id.push(r.op_id);
         rc.attempt.push(r.attempt);
-        rc.api.push(s.id(&r.api));
+        rc.api.push(r.api);
+        if let Some(so) = &r.service_op {
+            rc.service_op.push((i as u32, s.id(so)));
+        }
         rc.method.push(s.id(&r.method));
         rc.status.push(r.status);
         rc.protocol.push(r.protocol);
@@ -410,7 +422,13 @@ impl Segment {
                 },
                 requests: o.requests[i],
                 await_tree: sto(o.await_tree[i])?,
+                weight: 1.0,
             });
+        }
+        for &(i, w) in &o.weights {
+            if let Some(row) = ops.get_mut(i as usize) {
+                row.weight = w;
+            }
         }
         let r = &self.reqs;
         let m = r.t_us.len();
@@ -444,7 +462,8 @@ impl Segment {
                 t_us: t(r.t_us[i]),
                 op_id: r.op_id[i],
                 attempt: r.attempt[i],
-                api: intern_static(st(r.api[i])?),
+                api: r.api[i],
+                service_op: None,
                 method: intern_static(st(r.method[i])?),
                 status: r.status[i],
                 protocol: r.protocol[i],
@@ -478,6 +497,12 @@ impl Segment {
                 tcp: None,
                 detail: None,
             });
+        }
+        for &(i, sid) in &r.service_op {
+            let name = intern_static(st(sid)?);
+            if let Some(q) = reqs.get_mut(i as usize) {
+                q.service_op = Some(name);
+            }
         }
         for (i, v) in &r.tls {
             if let Some(q) = reqs.get_mut(*i as usize) {
@@ -552,7 +577,9 @@ impl RunFileWriter {
             super::create_private_dir_all(dir)
                 .with_context(|| format!("cannot create {}", dir.display()))?;
         }
-        let tmp = path.with_extension("oprobe.tmp");
+        let mut tmp_os = path.as_os_str().to_os_string();
+        tmp_os.push(".tmp");
+        let tmp = PathBuf::from(tmp_os);
         let file =
             super::private_file(&tmp).with_context(|| format!("cannot write {}", tmp.display()))?;
         let enc = zstd::stream::Encoder::new(BufWriter::new(file), ZSTD_LEVEL)?;
@@ -695,7 +722,7 @@ fn read_exact_or_eof(r: &mut impl Read, buf: &mut [u8]) -> Result<bool> {
     Ok(true)
 }
 
-/// Write a finished run as `oprobe.run/6` (rows in segments of [`SEGMENT_ROWS`], by time).
+/// Write a finished run as `oprobe.run/7` (rows in segments of [`SEGMENT_ROWS`], by time).
 pub fn write_run(path: &Path, run: &Run) -> Result<PathBuf> {
     let header = RunHeader::new(run.report.run.id.clone(), run.report.spec.clone());
     let mut w = RunFileWriter::create(path, &header)?;
@@ -868,12 +895,12 @@ impl RunFileStream {
         w.finish(report)
     }
 
-    fn keep(&self, st: &mut StreamState, op: &OpRow, rows: u64) -> bool {
+    fn keep(&self, st: &mut StreamState, op: &OpRow, rows: u64) -> Option<f64> {
         if !op.ok || op.throttled {
-            return true;
+            return Some(1.0);
         }
         if st.rows_kept + rows <= self.max_rows {
-            return true;
+            return Some(1.0);
         }
         // Past the cap: thinning levels, each holding up to an eighth of the cap with twice
         // the previous stride (every 2nd, 4th, 8th … operation), so the file keeps covering
@@ -887,8 +914,10 @@ impl RunFileStream {
         let pick = op.op_id.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40 & (stride - 1) == 0;
         if pick {
             st.level_rows += rows;
+            Some(stride as f64)
+        } else {
+            None
         }
-        pick
     }
 }
 
@@ -902,16 +931,22 @@ impl crate::trace::RowSink for RunFileStream {
             st.stats.seen_ops += 1;
             st.stats.seen_requests += reqs.len() as u64;
             let rows = 1 + reqs.len() as u64;
-            if !self.keep(&mut st, op, rows) {
+            let Some(weight) = self.keep(&mut st, op, rows) else {
                 return;
-            }
+            };
             if !op.ok || op.throttled {
                 st.stats.always_kept_ops += 1;
             }
             st.stats.kept_ops += 1;
             st.stats.kept_requests += reqs.len() as u64;
             st.rows_kept += rows;
-            st.seg.push_op(op);
+            if (weight - 1.0).abs() > f64::EPSILON {
+                let mut weighted = op.clone();
+                weighted.weight = weight;
+                st.seg.push_op(&weighted);
+            } else {
+                st.seg.push_op(op);
+            }
             for r in reqs {
                 st.seg.push_req(r);
             }
@@ -934,7 +969,7 @@ impl crate::trace::RowSink for RunFileStream {
     }
 }
 
-/// Read a whole `oprobe.run/6` file into a [`Run`] (rows sorted by start time).
+/// Read a whole `oprobe.run/7` file into a [`Run`] (rows sorted by start time).
 pub fn read_run(r: impl Read) -> Result<Run> {
     let mut rd = RunFileReader::new(r)?;
     let mut header = None;

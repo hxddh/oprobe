@@ -4,7 +4,7 @@
 use std::sync::{Arc, Once};
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use opendal::Operator;
 use opendal::layers::{RetryLayer, TimeoutLayer};
 
@@ -140,10 +140,66 @@ pub async fn s3_region(target: &TargetSpec) -> Option<(String, RegionSource)> {
             return Some((r, RegionSource::Environment));
         }
     }
+    if !target
+        .options
+        .get("disable_config_load")
+        .is_some_and(|v| v.trim() == "true")
+        && let Some(r) = aws_config_region()
+    {
+        return Some((r, RegionSource::Environment));
+    }
     match detect_s3_region(target).await {
         Some(r) => Some((r, RegionSource::Detected)),
         None => Some(("us-east-1".into(), RegionSource::Default)),
     }
+}
+
+/// Read `region` for the active `AWS_PROFILE` (`default` when unset) from `AWS_CONFIG_FILE` or
+/// `~/.aws/config`.
+pub(crate) fn aws_config_region() -> Option<String> {
+    let path = std::env::var_os("AWS_CONFIG_FILE")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .or_else(|| std::env::var_os("USERPROFILE"))
+                .map(|h| std::path::PathBuf::from(h).join(".aws/config"))
+        })?;
+    let text = std::fs::read_to_string(path).ok()?;
+    parse_aws_config_region(
+        &text,
+        &std::env::var("AWS_PROFILE").unwrap_or_else(|_| "default".into()),
+    )
+}
+
+pub(crate) fn parse_aws_config_region(text: &str, profile: &str) -> Option<String> {
+    let profile = profile.trim();
+    if profile.is_empty() {
+        return None;
+    }
+    let mut in_section = false;
+    for raw in text.lines() {
+        let line = raw.split(['#', ';']).next().unwrap_or_default().trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(sec) = line.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            let sec = sec.trim();
+            let name = sec.strip_prefix("profile").map(str::trim).unwrap_or(sec);
+            in_section = name == profile;
+            continue;
+        }
+        if in_section
+            && let Some((k, v)) = line.split_once('=')
+            && k.trim().eq_ignore_ascii_case("region")
+        {
+            let v = v.trim().trim_matches(['"', '\'']).trim();
+            if !v.is_empty() {
+                return Some(v.to_owned());
+            }
+        }
+    }
+    None
 }
 
 /// The region the service reports for an S3 bucket (`None`: not determinable).
@@ -169,8 +225,25 @@ pub async fn detect_s3_region(target: &TargetSpec) -> Option<String> {
         // whatever the status (301 / 403 included): a PermanentRedirect avoided up front.
         None => {
             let mut b = reqwest::Client::builder().timeout(budget);
-            if proxy_setting(target) == Some(None) {
-                b = b.no_proxy();
+            match proxy_setting(target) {
+                Some(None) => b = b.no_proxy(),
+                Some(Some(p)) => {
+                    if let Ok(px) = reqwest::Proxy::all(&p) {
+                        b = b.proxy(px);
+                    }
+                }
+                None => {}
+            }
+            if target.insecure {
+                b = b.danger_accept_invalid_certs(true);
+            }
+            if let Ok(tls) = tls_options(target)
+                && let Some(pem) = &tls.extra_ca_pem
+                && let Ok(certs) = reqwest::Certificate::from_pem_bundle(pem.as_bytes())
+            {
+                for c in certs {
+                    b = b.add_root_certificate(c);
+                }
             }
             let resp = b
                 .build()
@@ -198,10 +271,33 @@ pub async fn prepare_target(target: &mut TargetSpec) -> Result<()> {
 
 pub fn tls_options(target: &TargetSpec) -> Result<TlsClientOptions> {
     let extra_ca_pem = match &target.ca_cert {
-        Some(p) => Some(
-            std::fs::read_to_string(p)
-                .with_context(|| format!("cannot read CA certificate `{}`", p.display()))?,
-        ),
+        Some(p) => {
+            let pem = std::fs::read_to_string(p).map_err(|e| {
+                OprobeError::new(
+                    ErrorCode::ConfigInvalid,
+                    format!("cannot read CA certificate `{}`: {e}", p.display()),
+                )
+                .with_hint(
+                    "check `http.ca_cert` in the operator or pass a readable PEM bundle with `--set http.ca_cert=PATH`",
+                )
+            })?;
+            let certs = reqwest::Certificate::from_pem_bundle(pem.as_bytes()).map_err(|e| {
+                OprobeError::new(
+                    ErrorCode::ConfigInvalid,
+                    format!("invalid CA certificate `{}`: {e}", p.display()),
+                )
+                .with_hint("pass a PEM-encoded CA bundle (`-----BEGIN CERTIFICATE-----`)")
+            })?;
+            if certs.is_empty() {
+                return Err(OprobeError::new(
+                    ErrorCode::ConfigInvalid,
+                    format!("CA certificate `{}` contains no certificates", p.display()),
+                )
+                .with_hint("pass a PEM-encoded CA bundle (`-----BEGIN CERTIFICATE-----`)")
+                .into());
+            }
+            Some(pem)
+        }
         None => target.options.get("ca_cert_pem").cloned(),
     };
     Ok(TlsClientOptions {
@@ -247,7 +343,7 @@ pub fn trace_layer(
     )?))
 }
 
-/// The measured operator: the service through the instrumented `HttpFetch` (every request is
+/// The measured operator: the service through the instrumented `HttpTransport` (every request is
 /// traced into `recorder`), wrapped in `spec`'s layers.
 pub async fn measured_operator(
     base: &Operator,
@@ -255,6 +351,18 @@ pub async fn measured_operator(
     spec: &OperatorSpec,
     recorder: &Arc<Recorder>,
     tree_registry: Option<await_tree::Registry>,
+) -> Result<Operator> {
+    measured_operator_with(base, target, spec, recorder, tree_registry, None).await
+}
+
+/// [`measured_operator`], reusing an already-warmed [`opendal::layers::TailCutLayer`] when given.
+pub async fn measured_operator_with(
+    base: &Operator,
+    target: &TargetSpec,
+    spec: &OperatorSpec,
+    recorder: &Arc<Recorder>,
+    tree_registry: Option<await_tree::Registry>,
+    shared_tail_cut: Option<opendal::layers::TailCutLayer>,
 ) -> Result<Operator> {
     let mut op = base.clone();
     if !target.is_network() {
@@ -285,7 +393,14 @@ pub async fn measured_operator(
             layers.layers.concurrent_limit = None;
         }
     }
-    crate::operator::build::apply_layers(op, &layers, true).await
+    crate::operator::build::apply_layers_with_recorder(
+        op,
+        &layers,
+        true,
+        shared_tail_cut,
+        Some(recorder.clone()),
+    )
+    .await
 }
 
 /// Fail fast when the endpoint cannot be reached at all (connection refused, unknown host):

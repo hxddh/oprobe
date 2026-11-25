@@ -43,9 +43,9 @@ pub enum EventKind {
         elapsed_s: f64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         total_s: Option<f64>,
-        #[serde(rename = "ops_count", alias = "ops")]
+        #[serde(rename = "ops_count")]
         ops: u64,
-        #[serde(rename = "requests_count", alias = "requests")]
+        #[serde(rename = "requests_count")]
         requests: u64,
     },
     /// One interval of the measurement window (as `report.timeline`: operations by their
@@ -62,10 +62,10 @@ pub enum EventKind {
         p50_ms: f64,
         p99_ms: f64,
         /// Operations that failed in the interval.
-        #[serde(rename = "errors_count", alias = "errors")]
+        #[serde(rename = "errors_count")]
         errors: u64,
         /// Throttled responses received in the interval.
-        #[serde(rename = "throttled_count", alias = "throttled")]
+        #[serde(rename = "throttled_count")]
         throttled: u64,
         /// Successful operations started per second.
         #[serde(default)]

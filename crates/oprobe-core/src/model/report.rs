@@ -21,7 +21,7 @@ use crate::trace::{
 };
 
 /// Schema id of [`Report`].
-pub const REPORT_SCHEMA: &str = "oprobe.report/6";
+pub const REPORT_SCHEMA: &str = "oprobe.report/7";
 
 /// Unit suffixes a numeric report field name ends with (design §6). Each names its unit:
 /// `_us` / `_ms` / `_s` time; `_bytes`, `_mib`, `_gib` sizes (`_mib`/`_gib` only where the
@@ -184,9 +184,9 @@ impl Report {
         }
     }
 
-    /// The run stopped early (`run.partial`, or the legacy `run.interrupted` flag).
+    /// The run stopped early (`run.partial`).
     pub fn is_partial(&self) -> bool {
-        self.run.partial.is_some() || self.run.interrupted
+        self.run.partial.is_some()
     }
 
     /// Parse a report from JSON: a bare report, a `{"report": …}` command result, or a
@@ -238,8 +238,6 @@ pub struct RunInfo {
     pub ended_at: String,
     /// Length of the measurement window.
     pub window_s: f64,
-    /// Stopped early (Ctrl-C, Stop, budget): the window is shorter than configured.
-    pub interrupted: bool,
     /// Why and when the run stopped early (absent for a complete run). A partial run is never
     /// accepted as a baseline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -259,8 +257,8 @@ pub enum RunSource {
     /// A workload `oprobe run` drove (replayable: `oprobe prove` can A/B it).
     #[default]
     Run,
-    /// A production trace written by the `oprobe-trace` layer (`oprobe.trace/7`, or a 6.x
-    /// `oprobe.trace/6`): the application's own traffic, with no workload to replay.
+    /// A production trace written by the `oprobe-trace` layer (`oprobe.trace/9`): the
+    /// application's own traffic, with no workload to replay.
     Trace,
 }
 
@@ -631,7 +629,7 @@ pub struct RemoteStats {
     pub remote: String,
     pub requests_count: u64,
     pub errors_count: u64,
-    #[serde(rename = "down_bytes", alias = "bytes_down")]
+    #[serde(rename = "down_bytes")]
     pub bytes_down: u64,
     pub p50_ms: f64,
     pub p99_ms: f64,

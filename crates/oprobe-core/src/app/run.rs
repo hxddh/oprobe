@@ -456,6 +456,7 @@ pub async fn measure_guarded(
             output,
             cancel,
             parent_id: None,
+            tail_cut: None,
         },
     )
     .await?;

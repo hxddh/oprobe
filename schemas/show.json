@@ -3092,6 +3092,12 @@
           "minimum": 0,
           "type": "integer"
         },
+        "tail_cuts_count": {
+          "description": "Requests actively cut by `TailCutLayer` to re-issue a faster attempt.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "throttled_responses_count": {
           "format": "uint64",
           "minimum": 0,
@@ -3167,10 +3173,6 @@
           "description": "Run id (`YYYYMMDD-HHMMSS-xxxx`).",
           "type": "string"
         },
-        "interrupted": {
-          "description": "Stopped early (Ctrl-C, Stop, budget): the window is shorter than configured.",
-          "type": "boolean"
-        },
         "label": {
           "type": [
             "string",
@@ -3226,7 +3228,6 @@
         "started_at",
         "ended_at",
         "window_s",
-        "interrupted",
         "sampled",
         "trace",
         "oprobe_version",
@@ -3245,7 +3246,7 @@
         },
         {
           "const": "trace",
-          "description": "A production trace written by the `oprobe-trace` layer (`oprobe.trace/7`, or a 6.x\n`oprobe.trace/6`): the application's own traffic, with no workload to replay.",
+          "description": "A production trace written by the `oprobe-trace` layer (`oprobe.trace/9`): the\napplication's own traffic, with no workload to replay.",
           "type": "string"
         }
       ]
@@ -3614,17 +3615,6 @@
           "$ref": "#/$defs/StageQ",
           "description": "Requests that dialed only."
         },
-        "flow_stall": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/StageQ"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "HTTP/2: the request body waiting for flow-control window (hidden in `ttfb`), over the\nrequests that stalled."
-        },
         "queue": {
           "$ref": "#/$defs/StageQ"
         },
@@ -3658,17 +3648,6 @@
         },
         "stall": {
           "$ref": "#/$defs/StageQ"
-        },
-        "stream_wait": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/StageQ"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "HTTP/2: waiting for a stream slot on a connection (part of `queue`), over the requests\nthat waited."
         },
         "streams_max_count": {
           "description": "The most HTTP/2 streams open on a connection when one of these requests started.",
@@ -4969,7 +4948,7 @@
       "type": "object"
     }
   },
-  "$id": "https://github.com/hxddh/oprobe/schemas/6/show.json",
+  "$id": "https://github.com/hxddh/oprobe/schemas/9/show.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "The result of `oprobe show RUN -o json`: the report, where the run is stored, and `--by` / `--since --until` when given",
   "properties": {

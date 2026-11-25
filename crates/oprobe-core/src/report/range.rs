@@ -224,7 +224,7 @@ fn stages(ops: &[&OpRow], weight: &dyn Fn(u64) -> f64) -> Vec<StageShare> {
 fn apis(reqs: &[&ReqRow], weight: &dyn Fn(u64) -> f64) -> Vec<ApiRow> {
     let mut by: BTreeMap<&str, Vec<&ReqRow>> = BTreeMap::new();
     for q in reqs {
-        by.entry(q.api.as_ref()).or_default().push(q);
+        by.entry(q.api.label()).or_default().push(q);
     }
     let mut v: Vec<ApiRow> = by
         .into_iter()
@@ -243,13 +243,17 @@ fn apis(reqs: &[&ReqRow], weight: &dyn Fn(u64) -> f64) -> Vec<ApiRow> {
             let mut ttfb: Vec<(u64, f64)> = qs.iter().map(|q| (q.ttfb_us, w(q))).collect();
             let mut total: Vec<(u64, f64)> = qs.iter().map(|q| (q.total_us, w(q))).collect();
             let sum = |f: &dyn Fn(&ReqRow) -> f64| qs.iter().map(|q| f(q) * w(q)).sum::<f64>();
+            let connected = sum(&|q| f64::from(u8::from(q.status != 0 || q.connect_us() > 0)));
+            let is_err = |q: &ReqRow| {
+                q.is_error() && q.status != 404 && !q.detail.as_ref().is_some_and(|d| d.cut)
+            };
             ApiRow {
                 api: api.to_owned(),
                 requests_count: n.round() as u64,
-                errors_count: sum(&|q| f64::from(u8::from(q.is_error()))).round() as u64,
+                errors_count: sum(&|q| f64::from(u8::from(is_err(q)))).round() as u64,
                 throttled_count: sum(&|q| f64::from(u8::from(q.is_throttle()))).round() as u64,
                 status,
-                reused_ratio: ratio(sum(&|q| f64::from(u8::from(q.reused))), n),
+                reused_ratio: ratio(sum(&|q| f64::from(u8::from(q.reused))), connected),
                 up_bytes: sum(&|q| q.bytes_up as f64).round() as u64,
                 down_bytes: sum(&|q| q.bytes_down as f64).round() as u64,
                 ttfb_p50_ms: wq(&mut ttfb, 0.5),
@@ -411,7 +415,7 @@ pub fn slowest_requests(run: &Run, api: &str, range: Option<(f64, f64)>, n: usiz
     let mut v: Vec<&ReqRow> = run
         .reqs
         .iter()
-        .filter(|q| q.api == api && inside(q.t_us))
+        .filter(|q| (q.api.label() == api || q.api_name() == api) && inside(q.t_us))
         .collect();
     v.sort_by_key(|q| std::cmp::Reverse(q.total_us));
     v.into_iter()
@@ -419,7 +423,7 @@ pub fn slowest_requests(run: &Run, api: &str, range: Option<(f64, f64)>, n: usiz
         .map(|q| ReqLine {
             op_id: q.op_id,
             key: run.op(q.op_id).map(|o| o.key.clone()).unwrap_or_default(),
-            api: q.api.to_string(),
+            api: q.api.label().to_owned(),
             status: q.status,
             attempt: q.attempt,
             t_us: q.t_us,
@@ -466,6 +470,7 @@ mod tests {
                 },
                 requests: if throttled { 2 } else { 1 },
                 await_tree: None,
+                weight: 1.0,
             });
             let mut first = fixture::req(i + 1, t_us, if throttled { 503 } else { 200 }, true);
             first.total_us = latency_us / 2;

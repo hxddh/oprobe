@@ -16,14 +16,32 @@ use serde::{Deserialize, Serialize};
 pub struct RunId(String);
 
 impl RunId {
-    /// A fresh id for a run starting now.
+    /// A fresh id for a run starting now (strictly monotonic within this process, even when
+    /// several ids are minted in the same millisecond, such as a prove and its first trial).
     pub fn new() -> Self {
-        let now = SystemTime::now();
-        let ms = now
+        static STATE: std::sync::Mutex<(u128, u16)> = std::sync::Mutex::new((0, 0));
+        let epoch_ms = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
-            .map(|d| d.subsec_millis() as u16)
+            .map(|d| d.as_millis())
             .unwrap_or(0);
-        Self::at(now, ms * 64 + rand::random::<u16>() % 64)
+        let (use_ms, sub) = {
+            let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
+            if epoch_ms > st.0 {
+                let s = rand::random::<u16>() % 32;
+                *st = (epoch_ms, s);
+                (epoch_ms, s)
+            } else if st.1 < 63 {
+                st.1 += 1;
+                (st.0, st.1)
+            } else {
+                st.0 += 1;
+                st.1 = 0;
+                (st.0, 0)
+            }
+        };
+        let t = SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(use_ms as u64);
+        let ms_in_sec = (use_ms % 1000) as u16;
+        Self::at(t, ms_in_sec * 64 + sub)
     }
 
     /// The id of a run started at `t` with random tag `tag`.
@@ -172,8 +190,7 @@ mod order_tests {
     #[test]
     fn ids_created_in_sequence_sort_in_sequence() {
         let mut prev = RunId::new();
-        for _ in 0..50 {
-            std::thread::sleep(std::time::Duration::from_millis(2));
+        for _ in 0..500 {
             let next = RunId::new();
             assert!(
                 next.as_str() > prev.as_str(),

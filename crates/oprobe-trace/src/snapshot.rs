@@ -12,7 +12,7 @@ use crate::record::{Api, RequestRecord};
 #[cfg_attr(not(feature = "__internal"), non_exhaustive)]
 pub struct Quantiles {
     /// Samples in the distribution.
-    #[serde(rename = "samples_count", alias = "count")]
+    #[serde(rename = "samples_count")]
     pub count: u64,
     #[serde(rename = "mean_ms")]
     pub mean: f64,
@@ -82,7 +82,7 @@ pub struct OpBreakdown {
 #[cfg_attr(not(feature = "__internal"), non_exhaustive)]
 pub struct VerbStats {
     pub verb: String,
-    #[serde(rename = "ops_count", alias = "count")]
+    #[serde(rename = "ops_count")]
     pub count: u64,
     #[serde(rename = "errors_count")]
     pub errors: u64,
@@ -120,7 +120,7 @@ pub struct StageStats {
 #[cfg_attr(not(feature = "__internal"), non_exhaustive)]
 pub struct ApiStats {
     pub api: Api,
-    #[serde(rename = "requests_count", alias = "count")]
+    #[serde(rename = "requests_count")]
     pub count: u64,
     #[serde(rename = "errors_count")]
     pub errors: u64,
@@ -129,9 +129,9 @@ pub struct ApiStats {
     #[serde(rename = "status_count")]
     pub status: BTreeMap<u16, u64>,
     pub reused_pct: f64,
-    #[serde(rename = "up_bytes", alias = "bytes_up")]
+    #[serde(rename = "up_bytes")]
     pub bytes_up: u64,
-    #[serde(rename = "down_bytes", alias = "bytes_down")]
+    #[serde(rename = "down_bytes")]
     pub bytes_down: u64,
     pub stages: StageStats,
 }
@@ -206,6 +206,9 @@ pub struct ResilienceStats {
     pub network_errors: u64,
     #[serde(rename = "failed_ops_count")]
     pub failed_ops: u64,
+    /// Requests actively cut by `TailCutLayer` to re-issue a faster attempt.
+    #[serde(rename = "tail_cuts_count", default, skip_serializing_if = "is_zero")]
+    pub tail_cuts: u64,
     #[serde(rename = "error_classes_count")]
     pub error_classes: BTreeMap<String, u64>,
 }
@@ -496,6 +499,9 @@ pub struct SlowOp {
     pub key: String,
     pub verb: String,
     pub latency_ms: f64,
+    /// Logical bytes read + written by the operation.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub bytes: u64,
     pub at_s: f64,
     pub breakdown: OpBreakdown,
     #[serde(rename = "retries_count")]

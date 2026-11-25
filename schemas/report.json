@@ -2459,6 +2459,12 @@
           "minimum": 0,
           "type": "integer"
         },
+        "tail_cuts_count": {
+          "description": "Requests actively cut by `TailCutLayer` to re-issue a faster attempt.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "throttled_responses_count": {
           "format": "uint64",
           "minimum": 0,
@@ -2534,10 +2540,6 @@
           "description": "Run id (`YYYYMMDD-HHMMSS-xxxx`).",
           "type": "string"
         },
-        "interrupted": {
-          "description": "Stopped early (Ctrl-C, Stop, budget): the window is shorter than configured.",
-          "type": "boolean"
-        },
         "label": {
           "type": [
             "string",
@@ -2593,7 +2595,6 @@
         "started_at",
         "ended_at",
         "window_s",
-        "interrupted",
         "sampled",
         "trace",
         "oprobe_version",
@@ -2612,7 +2613,7 @@
         },
         {
           "const": "trace",
-          "description": "A production trace written by the `oprobe-trace` layer (`oprobe.trace/7`, or a 6.x\n`oprobe.trace/6`): the application's own traffic, with no workload to replay.",
+          "description": "A production trace written by the `oprobe-trace` layer (`oprobe.trace/9`): the\napplication's own traffic, with no workload to replay.",
           "type": "string"
         }
       ]
@@ -4112,9 +4113,9 @@
       "type": "object"
     }
   },
-  "$id": "https://github.com/hxddh/oprobe/schemas/6/report.json",
+  "$id": "https://github.com/hxddh/oprobe/schemas/9/report.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "description": "Report v6 (oprobe.report/6): the profile of one run, as `run -o json` and `show -o json` carry it",
+  "description": "Report v7 (oprobe.report/7): the profile of one run, as `run -o json` and `show -o json` carry it",
   "properties": {
     "apis": {
       "items": {

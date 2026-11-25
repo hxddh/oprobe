@@ -61,7 +61,7 @@ The window works like other professional tools on your platform (design:
 - **New Run** (mod+N) is a dialog: the operator (a URL, an `op.toml`, a configured name) with a
   **Choose** pop-up that lists the lab's scenarios, the operators of your config file
   (`[operators.NAME]`), the `op.toml` files you ran before and **Choose op.toml…**; the workload
-  (a pop-up); the duration and concurrency. The operator field has the focus when it opens,
+  (a pop-up); the duration, concurrency and an optional read-only **Existing prefix**. The operator field has the focus when it opens,
   Return anywhere presses the default button and Escape cancels. A `lab://` run starts at once;
   a real target is **planned first**: **Review Plan** shows what the run will write, read and
   delete (and under which prefix), how long it takes and the budgets that stop it, and only then
@@ -77,9 +77,9 @@ The window works like other professional tools on your platform (design:
 - **Quitting** (⌘Q, Ctrl+Q, Exit, or the window's close button) while a run or a prove goes on
   asks first: **Stop and Quit** stops it, removes its test data and quits; Cancel keeps it
   running.
-- **Run files**: open a `.oprobe` or report/trace `.json` file with File ▸ Open Run File… (the
+- **Run files**: open a `.oprobe`, `.prove.json`, report `.json` or `op.toml` file with File ▸ Open Run File… (the
   system's open dialog, filtered to those types), drop it on the window (the window is outlined
-  while a file is dragged over it), or double-click it: `oprobe.app` (macOS), the `.msi`
+  while a file is dragged over it), or double-click a `.oprobe` / `.json` file: `oprobe.app` (macOS), the `.msi`
   (Windows) and the Linux desktop archive's `.desktop` entry and MIME type
   (`application/x-oprobe-run`) register `.oprobe` files, and run `oprobe FILE`, which opens the
   file in the app. The archives and the `.deb` / `.rpm` register nothing.
@@ -111,11 +111,11 @@ The window works like other professional tools on your platform (design:
   the longest `Retry-After`, other errors and failure classes.
 - **The slowest operations** as a request waterfall. Each request is on a shared time axis and
   coloured by stage, the body's wait for the consumer (stall) its own segment; the wait before a
-  retry is drawn as a line in the retry colour. Hovering a request reads out its stages and,
-  when recorded, the provider's error code (`SlowDown`), `Retry-After`, the connection's rtt,
-  min rtt and retransmits, `Server-Timing`, the HTTP/2 stream wait, flow-control stall and open
-  streams, when the upload reached the kernel and was acknowledged, the CDN cache status and
-  the region ([request signals](reading-the-profile.md#request-signals)). An operation whose
+  retry is drawn as a line in the retry colour. Hovering or focusing a request reads out its stages and,
+  when recorded, the provider's error code (`SlowDown`), `Retry-After`, tail-cut / incomplete body status, the connection's rtt,
+  min rtt and retransmits, `Server-Timing`, HTTP/2 active
+  streams, when the upload reached the kernel and was acknowledged, the CDN cache status, the
+  region and the request ID ([request signals](reading-the-profile.md#request-signals)). An operation whose
   async call stack was captured has **Async call stack while in flight** under it, closed until
   clicked.
 - **Timeline**, with a verb filter above it (All verbs, or one verb):
@@ -195,7 +195,9 @@ it. Toggle a layer or change a value (a limit, a chunk size) yourself and **Prov
 change with the values you set. The trials stream in live and their A/B pairs are drawn as they
 converge: each pair's change as a dot, the running estimate with its 95 % interval narrowing,
 and the A/A noise floor around no change, until the sequential test decides: **improved**,
-**worse** or **inconclusive**. **Copy** puts the winning diff (Rust or TOML) on the clipboard.
+**worse** or **inconclusive**. **Copy** puts the winning diff (Rust or TOML) on the clipboard; when
+the run came from an `op.toml` file, **Save to op.toml** writes the proven change back to it in
+place (preserving credentials and `${ENV}` references).
 
 **Compare.** Two runs, or the operators of one multi-operator run, side by side: goodput,
 bandwidth, requests per second, latency p50 / p99 / p99.9, failed operations, retries, throttled

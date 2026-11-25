@@ -936,7 +936,7 @@ impl TargetSpec {
                 }
                 "gcs"
             }
-            "oss" | "cos" | "b2" => {
+            "oss" | "cos" | "b2" | "obs" | "tos" => {
                 options.insert("bucket".into(), need(host, "bucket")?);
                 if let Some(r) = root {
                     options.insert("root".into(), r);
@@ -944,6 +944,8 @@ impl TargetSpec {
                 match scheme.as_str() {
                     "oss" => "oss",
                     "cos" => "cos",
+                    "obs" => "obs",
+                    "tos" => "tos",
                     _ => "b2",
                 }
             }
@@ -1168,8 +1170,28 @@ impl TargetSpec {
             && !opts.contains_key("region")
             && std::env::var("AWS_REGION").is_err()
         {
-            let region = std::env::var("AWS_DEFAULT_REGION").unwrap_or_else(|_| "us-east-1".into());
+            let disable_cfg = opts
+                .get("disable_config_load")
+                .is_some_and(|v| v.trim() == "true");
+            let region = std::env::var("AWS_DEFAULT_REGION")
+                .ok()
+                .filter(|r| !r.trim().is_empty())
+                .or_else(|| {
+                    (!disable_cfg)
+                        .then(crate::engine::operator::aws_config_region)
+                        .flatten()
+                })
+                .unwrap_or_else(|| "us-east-1".into());
             opts.insert("region".into(), region);
+        }
+        if self.scheme == "azblob"
+            && !opts.contains_key("endpoint")
+            && !opts.contains_key("account_name")
+            && let Some(acct) = ["AZURE_STORAGE_ACCOUNT_NAME", "AZURE_STORAGE_ACCOUNT"]
+                .into_iter()
+                .find_map(|k| std::env::var(k).ok().filter(|v| !v.trim().is_empty()))
+        {
+            opts.insert("account_name".into(), acct);
         }
         Ok(opts)
     }
@@ -1213,6 +1235,12 @@ impl TargetSpec {
             "azblob" => self
                 .options
                 .get("account_name")
+                .cloned()
+                .or_else(|| {
+                    ["AZURE_STORAGE_ACCOUNT_NAME", "AZURE_STORAGE_ACCOUNT"]
+                        .into_iter()
+                        .find_map(|k| std::env::var(k).ok().filter(|v| !v.trim().is_empty()))
+                })
                 .map(|a| format!("https://{a}.blob.core.windows.net")),
             "b2" => Some("https://api.backblazeb2.com".into()),
             _ => None,

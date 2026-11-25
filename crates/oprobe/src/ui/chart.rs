@@ -594,6 +594,8 @@ pub struct TimeLink {
     pub range: Signal<Option<(f64, f64)>>,
     /// The range a drag is selecting (from where it began to where it is).
     pub drag: Signal<Option<(f64, f64)>>,
+    /// Where a keyboard `Shift+←/→` range began (so extending then reversing shrinks it).
+    pub anchor: Signal<Option<f64>>,
 }
 
 impl TimeLink {
@@ -602,6 +604,7 @@ impl TimeLink {
             cursor: signal(None),
             range: signal(None),
             drag: signal(None),
+            anchor: signal(None),
         }
     }
 
@@ -616,6 +619,7 @@ impl TimeLink {
     pub fn clear(&self) {
         self.range.set(None);
         self.drag.set(None);
+        self.anchor.set(None);
     }
 }
 
@@ -692,12 +696,13 @@ pub fn on_brush(
                     let b = to_t(x).unwrap_or(b);
                     let (lo, hi) = (a.min(b), a.max(b));
                     if hi > lo {
+                        link.anchor.set(Some(a));
                         link.range.set(Some((lo, hi)));
                     }
                 }
                 _ => {
                     if e.timestamp - g.last_tap.get_untracked() < DOUBLE_TAP_MS {
-                        link.range.set(None);
+                        link.clear();
                         g.last_tap.set(f64::NEG_INFINITY);
                     } else {
                         g.last_tap.set(e.timestamp);
@@ -903,18 +908,87 @@ fn chart_with(
         cursor.set(xv);
     })
     .on_mouse_leave(move |_: &MouseEvent| cursor.set(None));
+    let focused = signal(false);
+    if let Some(link) = link {
+        let plot_k = plot;
+        effect(move || {
+            if !focused.get() {
+                return;
+            }
+            let opts = KeyOptions {
+                when: nsh_core::keymap::When::NotEditing,
+                repeat: true,
+                for_focus: true,
+                ..Default::default()
+            };
+            let step_by = move |dir: f64, extend: bool| {
+                plot_k.with_untracked(|p| {
+                    let Some(p) = p else { return };
+                    let step = p.step_w.max(0.1);
+                    let cur = link.cursor.get_untracked().unwrap_or(p.x.min);
+                    let next = (cur + dir * step).clamp(p.x.min, (p.x.max - step).max(p.x.min));
+                    link.cursor.set(Some(next));
+                    if extend {
+                        let anc = link.anchor.get_untracked().unwrap_or(cur);
+                        link.anchor.set(Some(anc));
+                        let lo = anc.min(next).max(p.x.min);
+                        let hi = (anc.max(next) + step).min(p.x.max);
+                        if hi > lo {
+                            link.range.set(Some((lo, hi)));
+                        }
+                    } else {
+                        link.anchor.set(Some(next));
+                    }
+                });
+            };
+            on_key_with("left", opts, move |_| step_by(-1.0, false));
+            on_key_with("right", opts, move |_| step_by(1.0, false));
+            on_key_with("shift+left", opts, move |_| step_by(-1.0, true));
+            on_key_with("shift+right", opts, move |_| step_by(1.0, true));
+            on_key_with("enter", opts, move |_| {
+                plot_k.with_untracked(|p| {
+                    let Some(p) = p else { return };
+                    let step = p.step_w.max(0.1);
+                    let cur = link.cursor.get_untracked().unwrap_or(p.x.min);
+                    let hi = (cur + step).min(p.x.max);
+                    if hi > cur {
+                        link.anchor.set(Some(cur));
+                        link.range.set(Some((cur, hi)));
+                    }
+                });
+            });
+        });
+    }
     let overlay = match link {
-        Some(link) => {
-            overlay
-                .claim_touches(TouchClaim::on_start())
-                .on_touch(move |e: &TouchEvent| {
-                    let (w, h) = size.get_untracked();
-                    let to_t = |hx: f32| {
-                        plot.with_untracked(|p| p.as_ref().and_then(|p| x_at(p, w, h, hx)))
-                    };
-                    on_brush(e, link, gesture, &to_t, &|_, _| {});
-                })
-        }
+        Some(link) => overlay
+            .focusable(true)
+            .focus_visible(|s| {
+                // On a terminal `kit::ring` fills the element's background, which would wipe
+                // out the underlying Braille plot canvas; focus is shown on the header instead.
+                if kit::in_terminal() { s } else { kit::ring(s) }
+            })
+            .on_focus(move || {
+                focused.set(true);
+                if link.cursor.get_untracked().is_none() {
+                    plot.with_untracked(|p| {
+                        if let Some(p) = p {
+                            link.cursor.set(Some(p.x.min));
+                            link.anchor.set(Some(p.x.min));
+                        }
+                    });
+                }
+            })
+            .on_blur(move || {
+                focused.set(false);
+                link.cursor.set(None);
+            })
+            .claim_touches(TouchClaim::on_start())
+            .on_touch(move |e: &TouchEvent| {
+                let (w, h) = size.get_untracked();
+                let to_t =
+                    |hx: f32| plot.with_untracked(|p| p.as_ref().and_then(|p| x_at(p, w, h, hx)));
+                on_brush(e, link, gesture, &to_t, &|_, _| {});
+            }),
         None => overlay,
     };
     view()
@@ -923,16 +997,36 @@ fn chart_with(
         .child(
             view()
                 .flex_row()
+                .flex_wrap()
                 .items_center()
                 .gap_3()
-                .h(px(16.0))
+                .min_h(px(16.0))
                 .min_w(px(0.0))
-                .child(caption(heading).number_of_lines(1).flex_shrink_0())
+                .child(
+                    caption(heading)
+                        .number_of_lines(1)
+                        .flex_shrink_0()
+                        .bg(move || {
+                            if focused.get() && kit::in_terminal() {
+                                theme().primary
+                            } else {
+                                transparent_black().into()
+                            }
+                        })
+                        .text_color(move || {
+                            if focused.get() && kit::in_terminal() {
+                                theme().primary_foreground
+                            } else {
+                                theme().muted_foreground
+                            }
+                        }),
+                )
                 .child(dynamic(move || {
                     let items = legend();
                     untracked(|| {
                         view()
                             .flex_row()
+                            .flex_wrap()
                             .gap_3()
                             .children(items.into_iter().map(|(label, tok)| {
                                 view()

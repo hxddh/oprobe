@@ -5,7 +5,6 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
 documentation = "https://docs.rs/oprobe-trace"
 description = "Profile any Apache OpenDAL operator in production: one layer times every backend request by stage, keeps bounded aggregates and writes .oprobe files the oprobe workbench opens"
 readme = "README.md"
@@ -56,12 +55,16 @@ schemars = { workspace = true, optional = true }
 tokio-rustls = { workspace = true, optional = true }
 opentelemetry = { version = "0.32", default-features = false, features = ["metrics"], optional = true }
 
+[target."cfg(windows)".dependencies]
+windows-sys.workspace = true
+
 [dev-dependencies]
 opendal-core = { workspace = true, features = ["executors-tokio", "services-memory"] }
 opentelemetry_sdk = { version = "0.32", default-features = false, features = ["metrics", "testing"] }
 tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "net", "io-util"] }
 # The overhead bench's HTTP line: OpenDAL's `http` service and its default reqwest client.
 opendal-service-http = "0.59"
+opendal-service-fs = "0.59"
 opendal-http-transport-reqwest = "0.59"
 
 [[bench]]

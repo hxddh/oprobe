@@ -113,9 +113,13 @@ impl FailureCode {
     }
 
     /// [`FailureCode::from_status`], refined by the provider's error code when it names the
-    /// failure more precisely (Azure `BlobAlreadyExists` on a 409, an in-process backend's
-    /// OpenDAL kind).
+    /// failure more precisely (Azure `BlobAlreadyExists` on a 409, `InternalError` /
+    /// `ServiceUnavailable` on a 503, `tail_cut` on a cancelled hedge, or an in-process
+    /// backend's OpenDAL kind).
     pub fn of_request(status: u16, provider_code: Option<&str>) -> Option<Self> {
+        if provider_code == Some("tail_cut") {
+            return Some(Self::NetTimeout);
+        }
         let code = Self::from_status(status)?;
         Some(match provider_code {
             Some(c) if c.ends_with("AlreadyExists") => Self::StorageAlreadyExists,
@@ -123,6 +127,7 @@ impl FailureCode {
                 Self::StorageConditionNotMatch
             }
             Some("InvalidRange" | "RangeNotSatisfied") => Self::StorageRangeNotSatisfied,
+            Some("InternalError" | "ServiceUnavailable") if status == 503 => Self::Internal,
             _ => code,
         })
     }
@@ -146,6 +151,14 @@ fn is_zero(v: &u64) -> bool {
 
 fn is_false(v: &bool) -> bool {
     !*v
+}
+
+fn one_weight() -> f64 {
+    1.0
+}
+
+fn is_one_weight(v: &f64) -> bool {
+    (*v - 1.0).abs() < 1e-12
 }
 
 /// Wire protocol of one request.
@@ -262,27 +275,19 @@ pub struct ReqDetail {
     /// CDN cache status (`x-cache`, `cf-cache-status`, `x-cache-status`): `hit`, `miss`, …
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_status: Option<String>,
-    /// From the request start until the kernel saw the server acknowledge the last request
-    /// byte (Linux `TCP_INFO`): the end of the `upload` phase. `send_us` then counts until the
-    /// acknowledgement and `ttfb_us` from it (the `server` phase).
+    /// Time from `wire_from` until the kernel saw the send queue drain (`notsent_bytes == 0`):
+    /// the end of the `upload` phase. `send_us` then counts until the drain and `ttfb_us` from
+    /// it (the `server` phase).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upload_acked_us: Option<u64>,
-    /// Time until the request body reached the kernel's send buffer (what `send_us` measured
-    /// before the acknowledgement was known).
+    /// Time from `wire_from` until the request body reached the kernel's send buffer (what
+    /// `send_us` measured before the drain was known).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub send_buffered_us: Option<u64>,
-    /// HTTP/2: time waiting for a stream slot (`max_concurrent_streams`) on a connection
-    /// (the `stream_wait` stage; part of `queue_us`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub stream_wait_us: Option<u64>,
-    /// HTTP/2: time the request body waited for flow-control window (window at 0).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub flow_stall_us: Option<u64>,
-    /// HTTP/2: streams open on the connection when the request started (itself included).
+    /// HTTP/2: concurrent streams active on the connection during this request (itself included).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub streams_count: Option<u32>,
-    /// The request waited for a connection another request was dialing: it counts as cold and
-    /// the wait is in `connect` (fidelity transport).
+    /// Time waiting for a connection another concurrent stream was dialing (part of `queue_us`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dial_wait_us: Option<u64>,
     /// Retransmitted segments on the connection during this request.
@@ -297,6 +302,24 @@ pub struct ReqDetail {
     /// success.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temporary: Option<bool>,
+    /// Actively cancelled by `TailCutLayer` to re-issue a faster attempt.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub cut: bool,
+    /// Cancelled or dropped before the response completed (timeout, tail-cut or caller drop).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub aborted: bool,
+    /// Edge / CDN point of presence (`x-amz-cf-pop`, `cf-ray` airport code, `x-served-by`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cdn_pop: Option<String>,
+    /// Cached object age in seconds (`Age` header).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub age_s: Option<u64>,
+    /// Object storage class or access tier (`x-amz-storage-class`, `x-ms-access-tier`, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_class: Option<String>,
+    /// Server-side encryption algorithm (`x-amz-server-side-encryption`, e.g. `aws:kms`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encryption: Option<String>,
 }
 
 impl ReqDetail {
@@ -316,8 +339,11 @@ pub struct ReqRow {
     pub op_id: u64,
     /// 1 for the first attempt of this API call within the operation, 2+ for retries.
     pub attempt: u32,
-    /// Storage API, e.g. `GetObject` (OpenDAL `ServiceOperation`; URL heuristic fallback).
-    pub api: Cow<'static, str>,
+    /// Normalized storage API class (`GetObject`, `ListObjects`, `CompleteMultipartUpload`, …).
+    pub api: crate::Api,
+    /// Exact provider operation name when attached by OpenDAL (`ListObjectsV2`, `PutBlock`, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_op: Option<Cow<'static, str>>,
     pub method: Cow<'static, str>,
     /// HTTP status; 0 when no response arrived.
     pub status: u16,
@@ -365,14 +391,26 @@ pub struct ReqRow {
 }
 
 impl ReqRow {
+    /// Exact provider operation name (`ListObjectsV2`, `PutBlock`) when present, else the
+    /// normalized [`crate::Api::label`].
+    pub fn api_name(&self) -> &str {
+        self.service_op
+            .as_deref()
+            .unwrap_or_else(|| self.api.label())
+    }
     pub fn connect_us(&self) -> u64 {
         self.dns_us + self.tcp_us + self.proxy_us + self.tls_us
     }
     pub fn is_throttle(&self) -> bool {
-        matches!(self.status, 429 | 503)
+        self.status == 429
+            || (self.status == 503
+                && !matches!(
+                    self.detail.as_deref().and_then(|d| d.error_code.as_deref()),
+                    Some("InternalError" | "ServiceUnavailable")
+                ))
     }
     pub fn is_error(&self) -> bool {
-        self.status == 0 || self.status >= 400
+        self.status == 0 || self.status >= 400 || self.error.is_some()
     }
 }
 
@@ -420,6 +458,10 @@ pub struct OpRow {
     /// Await-tree call stack captured while the operation was slow.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub await_tree: Option<String>,
+    /// Sampling weight: how many operations of the window this kept row stands for (`1.0` when
+    /// unsampled or always-kept).
+    #[serde(default = "one_weight", skip_serializing_if = "is_one_weight")]
+    pub weight: f64,
 }
 
 /// What the run file's trace rows cover.

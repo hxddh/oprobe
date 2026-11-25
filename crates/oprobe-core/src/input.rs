@@ -591,6 +591,117 @@ pub fn cloud_url(raw: &str) -> Option<String> {
         let out = join("azblob", container, rest)?;
         return Some(format!("{out}?endpoint=https://{host}"));
     }
+    if let Some(stem) = host.strip_suffix(".r2.cloudflarestorage.com") {
+        let labels: Vec<&str> = stem.split('.').filter(|l| !l.is_empty()).collect();
+        return match labels.as_slice() {
+            [account] => {
+                let (bucket, rest) = segments.split_first()?;
+                let out = join("r2", bucket, rest)?;
+                Some(format!("{out}?account_id={account}"))
+            }
+            [bucket_parts @ .., account] if !bucket_parts.is_empty() => {
+                let out = join("r2", &bucket_parts.join("."), &segments)?;
+                Some(format!("{out}?account_id={account}"))
+            }
+            _ => None,
+        };
+    }
+    if let Some(stem) = host.strip_suffix(".aliyuncs.com") {
+        let labels: Vec<&str> = stem.split('.').filter(|l| !l.is_empty()).collect();
+        return match labels.as_slice() {
+            [oss] if oss.starts_with("oss-") => {
+                let (bucket, rest) = segments.split_first()?;
+                let out = join("oss", bucket, rest)?;
+                Some(format!("{out}?endpoint=https://{oss}.aliyuncs.com"))
+            }
+            [bucket_parts @ .., oss] if !bucket_parts.is_empty() && oss.starts_with("oss-") => {
+                let out = join("oss", &bucket_parts.join("."), &segments)?;
+                Some(format!("{out}?endpoint=https://{oss}.aliyuncs.com"))
+            }
+            _ => None,
+        };
+    }
+    if let Some(stem) = host.strip_suffix(".myqcloud.com") {
+        let labels: Vec<&str> = stem.split('.').filter(|l| !l.is_empty()).collect();
+        return match labels.as_slice() {
+            ["cos", region] => {
+                let (bucket, rest) = segments.split_first()?;
+                let out = join("cos", bucket, rest)?;
+                Some(format!("{out}?endpoint=https://cos.{region}.myqcloud.com"))
+            }
+            [bucket_parts @ .., "cos", region] if !bucket_parts.is_empty() => {
+                let out = join("cos", &bucket_parts.join("."), &segments)?;
+                Some(format!("{out}?endpoint=https://cos.{region}.myqcloud.com"))
+            }
+            _ => None,
+        };
+    }
+    if let Some(stem) = host.strip_suffix(".myhuaweicloud.com") {
+        let labels: Vec<&str> = stem.split('.').filter(|l| !l.is_empty()).collect();
+        return match labels.as_slice() {
+            ["obs", region] => {
+                let (bucket, rest) = segments.split_first()?;
+                let out = join("obs", bucket, rest)?;
+                Some(format!(
+                    "{out}?endpoint=https://obs.{region}.myhuaweicloud.com"
+                ))
+            }
+            [bucket_parts @ .., "obs", region] if !bucket_parts.is_empty() => {
+                let out = join("obs", &bucket_parts.join("."), &segments)?;
+                Some(format!(
+                    "{out}?endpoint=https://obs.{region}.myhuaweicloud.com"
+                ))
+            }
+            _ => None,
+        };
+    }
+    if let Some(stem) = host.strip_suffix(".volces.com") {
+        let labels: Vec<&str> = stem.split('.').filter(|l| !l.is_empty()).collect();
+        let map_tos = |tos: &str, bucket: &str, rest: &[&str]| -> Option<String> {
+            if let Some(region) = tos.strip_prefix("tos-s3-").filter(|r| !r.is_empty()) {
+                let out = join("s3", bucket, rest)?;
+                Some(format!(
+                    "{out}?endpoint=https://{tos}.volces.com&region={region}"
+                ))
+            } else if let Some(region) = tos.strip_prefix("tos-").filter(|r| !r.is_empty()) {
+                let out = join("tos", bucket, rest)?;
+                Some(format!(
+                    "{out}?endpoint=https://{tos}.volces.com&region={region}"
+                ))
+            } else {
+                None
+            }
+        };
+        return match labels.as_slice() {
+            [tos] if tos.starts_with("tos-") => {
+                let (bucket, rest) = segments.split_first()?;
+                map_tos(tos, bucket, rest)
+            }
+            [bucket_parts @ .., tos] if !bucket_parts.is_empty() && tos.starts_with("tos-") => {
+                map_tos(tos, &bucket_parts.join("."), &segments)
+            }
+            _ => None,
+        };
+    }
+    if let Some(stem) = host.strip_suffix(".backblazeb2.com") {
+        let labels: Vec<&str> = stem.split('.').filter(|l| !l.is_empty()).collect();
+        return match labels.as_slice() {
+            ["s3", region] => {
+                let (bucket, rest) = segments.split_first()?;
+                let out = join("s3", bucket, rest)?;
+                Some(format!(
+                    "{out}?endpoint=https://s3.{region}.backblazeb2.com&region={region}"
+                ))
+            }
+            [bucket_parts @ .., "s3", region] if !bucket_parts.is_empty() => {
+                let out = join("s3", &bucket_parts.join("."), &segments)?;
+                Some(format!(
+                    "{out}?endpoint=https://s3.{region}.backblazeb2.com&region={region}"
+                ))
+            }
+            _ => None,
+        };
+    }
     None
 }
 
@@ -1056,5 +1167,41 @@ mod tests {
         );
         assert_eq!(suggest("zzzzzz", ["concurrency", "warmup"]), None);
         assert_eq!(suggest("", ["a"]), None);
+    }
+
+    #[test]
+    fn cloud_urls_map_oss_cos_obs_tos_r2_and_b2_and_strip_signatures() {
+        assert_eq!(
+            cloud_url("https://my-bkt.oss-cn-hangzhou.aliyuncs.com/dir/k?OSSAccessKeyId=abc&Signature=secret").as_deref(),
+            Some("oss://my-bkt/dir/k?endpoint=https://oss-cn-hangzhou.aliyuncs.com")
+        );
+        assert_eq!(
+            cloud_url("https://my-bkt-125000.cos.ap-shanghai.myqcloud.com/a/b?q-signature=secret")
+                .as_deref(),
+            Some("cos://my-bkt-125000/a/b?endpoint=https://cos.ap-shanghai.myqcloud.com")
+        );
+        assert_eq!(
+            cloud_url("https://my-bkt.obs.cn-north-4.myhuaweicloud.com/p/q").as_deref(),
+            Some("obs://my-bkt/p/q?endpoint=https://obs.cn-north-4.myhuaweicloud.com")
+        );
+        assert_eq!(
+            cloud_url("https://my-bkt.tos-cn-beijing.volces.com/x").as_deref(),
+            Some("tos://my-bkt/x?endpoint=https://tos-cn-beijing.volces.com&region=cn-beijing")
+        );
+        assert_eq!(
+            cloud_url("https://my-bkt.tos-s3-cn-beijing.volces.com/x").as_deref(),
+            Some("s3://my-bkt/x?endpoint=https://tos-s3-cn-beijing.volces.com&region=cn-beijing")
+        );
+        assert_eq!(
+            cloud_url("https://acct123.r2.cloudflarestorage.com/assets/logo.png?X-Amz-Signature=s")
+                .as_deref(),
+            Some("r2://assets/logo.png?account_id=acct123")
+        );
+        assert_eq!(
+            cloud_url("https://my-bkt.s3.us-west-004.backblazeb2.com/f.parquet").as_deref(),
+            Some(
+                "s3://my-bkt/f.parquet?endpoint=https://s3.us-west-004.backblazeb2.com&region=us-west-004"
+            )
+        );
     }
 }

@@ -77,14 +77,15 @@ fn api_table(ms: &[Rc<ProfileModel>]) -> Option<View> {
     }
     let change =
         |v: f64, base: f64| -> Option<String> { (base > 0.0).then(|| fmt::delta(v / base - 1.0)) };
-    let mut t = section(tr("compare.apis"))
-        .test_id("compare-apis")
+    let min_w = HEAD + ms.len() as f32 * (COL + 8.0);
+    let mut inner = view()
+        .min_w(px(min_w))
         .child(row("").children(ms.iter().map(|m| cell(strong(m.id.clone())))));
     for a in &apis {
         let base_n = a.requests_count[0] as f64;
         let base_t = a.ttfb_p99_ms[0];
-        t =
-            t.child(
+        inner =
+            inner.child(
                 row(a.api.clone()).children(
                     a.requests_count.iter().zip(&a.ttfb_p99_ms).enumerate().map(
                         |(i, (n, ttfb))| {
@@ -103,7 +104,11 @@ fn api_table(ms: &[Rc<ProfileModel>]) -> Option<View> {
                 ),
             );
     }
-    Some(t)
+    Some(
+        section(tr("compare.apis"))
+            .test_id("compare-apis")
+            .child(scroll().horizontal().min_w(px(0.0)).child(inner)),
+    )
 }
 
 fn fill_req(n: u64) -> String {
@@ -180,21 +185,35 @@ fn label(key: &str) -> &'static str {
 
 fn table(ms: &[Rc<ProfileModel>]) -> View {
     let plain: Vec<ProfileModel> = ms.iter().map(|m| (**m).clone()).collect();
+    let diffs = data::compare_differences(&plain);
     let first = plain[0].operator.clone();
-    let mut t = crate::ui::kit::section_first("")
-        .test_id("compare-table")
-        .child(row("").children(ms.iter().map(|m| {
+    let min_w = HEAD + ms.len() as f32 * (COL + 8.0);
+    let mut inner = view()
+        .min_w(px(min_w))
+        .child(row("").children(ms.iter().enumerate().map(|(i, m)| {
+            let tok = plots::SERIES[i % plots::SERIES.len()];
             cell(
                 view()
                     .gap(px(2.0))
-                    .child(strong(m.id.clone()))
+                    .child(
+                        view()
+                            .flex_row()
+                            .items_center()
+                            .gap_1()
+                            .child(crate::ui::kit::swatch(tok))
+                            .child(strong(m.id.clone()).number_of_lines(1)),
+                    )
                     .child(small(m.operator_ref.clone()).number_of_lines(1))
+                    .child(
+                        small(format!("{} · {}", m.preset, fmt::clock_s(m.window_s)))
+                            .number_of_lines(1),
+                    )
                     .child(verdict_badge(m.verdict)),
             )
         })));
     for r in data::compare_rows(&plain) {
         let base = r.values[0];
-        t = t.child(
+        inner = inner.child(
             row(label(r.key))
                 .test_id(&format!("compare-row-{}", r.key))
                 .children(r.values.iter().enumerate().map(|(i, v)| {
@@ -227,7 +246,8 @@ fn table(ms: &[Rc<ProfileModel>]) -> View {
                 })),
         );
     }
-    t.child(row(tr("profile.time")).children(ms.iter().map(|m| cell(stage_bar(&m.stages)))))
+    let inner = inner
+        .child(row(tr("profile.time")).children(ms.iter().map(|m| cell(stage_bar(&m.stages)))))
         .child(row(tr("compare.findings")).children(ms.iter().map(|m| {
             cell(
                 view().gap(px(2.0)).children(
@@ -252,5 +272,20 @@ fn table(ms: &[Rc<ProfileModel>]) -> View {
                 };
                 cell(mono(toml).selectable(true))
             })),
-        )
+        );
+    crate::ui::kit::section_first("")
+        .test_id("compare-table")
+        .child((!diffs.is_empty()).then(|| {
+            crate::ui::kit::panel()
+                .px_3()
+                .py_2()
+                .gap_1()
+                .test_id("compare-differences")
+                .children(diffs.into_iter().map(|d| {
+                    small(d)
+                        .text_color(move || crate::ui::kit::Tone::Warn.color())
+                        .selectable(true)
+                }))
+        }))
+        .child(scroll().horizontal().min_w(px(0.0)).child(inner))
 }

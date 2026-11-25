@@ -68,8 +68,7 @@ impl VerdictView {
                 .run
                 .partial
                 .as_ref()
-                .map(|p| format!("{} after {:.1} s", p.reason.describe(), p.measured_s))
-                .or_else(|| r.run.interrupted.then(|| "stopped early".to_owned())),
+                .map(|p| format!("{} after {:.1} s", p.reason.describe(), p.measured_s)),
             sla_breaches: r.verdict.sla.breaches.clone(),
             warnings: r.warnings.clone(),
         }
@@ -410,13 +409,12 @@ pub enum SignalValue {
 
 /// One thing a request row recorded beyond its stage timings: the provider's error code,
 /// `Retry-After`, the connection's round trip and retransmits, `Server-Timing`, the HTTP/2
-/// stream wait, flow-control stall and open streams, the kernel's upload acknowledgement and
-/// buffered send, the CDN cache status and the bucket's region.
+/// open streams, the kernel's upload acknowledgement and buffered send, the CDN cache status
+/// and the bucket's region.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RequestSignal {
     /// Stable key: `code`, `retry_after`, `rtt`, `min_rtt`, `retransmits`, `server_timing`,
-    /// `stream_wait`, `flow_stall`, `streams`, `upload_acked`, `send_buffered`,
-    /// `cache_status`, `region`.
+    /// `streams`, `upload_acked`, `send_buffered`, `cache_status`, `region`.
     pub key: &'static str,
     pub value: SignalValue,
 }
@@ -428,22 +426,25 @@ impl RequestSignal {
     pub fn explains(&self) -> bool {
         matches!(
             self.key,
-            "code" | "retry_after" | "stream_wait" | "flow_stall" | "cache_status"
+            "code" | "retry_after" | "tail_cut" | "aborted" | "cache_status"
         )
     }
 
-    /// `h2 stream wait 3.1ms`: the signal in the terminal's words.
+    /// `upload acked 3.1ms`: the signal in the terminal's words.
     pub fn text(&self) -> String {
         let label = match self.key {
             "retry_after" => "retry-after",
+            "tail_cut" => "tail-cut",
+            "aborted" => "body",
             "min_rtt" => "min rtt",
             "server_timing" => "server-timing",
-            "stream_wait" => "h2 stream wait",
-            "flow_stall" => "h2 flow stall",
             "streams" => "h2 streams",
             "upload_acked" => "upload acked",
             "send_buffered" => "send buffered",
             "cache_status" => "cache",
+            "cdn_pop" => "edge",
+            "storage_class" => "class",
+            "encryption" => "sse",
             k => k,
         };
         let value = match &self.value {
@@ -462,12 +463,22 @@ pub fn request_signals(q: &crate::model::ReqRow) -> Vec<RequestSignal> {
     let d = q.detail.as_deref();
     let tcp = q.tcp.as_deref();
     let nonzero = |v: Option<u64>| v.filter(|v| *v > 0);
-    let all: [(&'static str, Option<SignalValue>); 13] = [
+    let all: [(&'static str, Option<SignalValue>); 17] = [
         (
             "code",
             d.and_then(|d| d.error_code.clone()).map(SignalValue::Text),
         ),
         ("retry_after", q.retry_after_ms.map(SignalValue::Ms)),
+        (
+            "tail_cut",
+            d.filter(|d| d.cut)
+                .map(|_| SignalValue::Text("hedged".into())),
+        ),
+        (
+            "aborted",
+            d.filter(|d| d.aborted && !d.cut)
+                .map(|_| SignalValue::Text("incomplete".into())),
+        ),
         ("rtt", nonzero(tcp.map(|t| t.rtt_us)).map(SignalValue::Us)),
         (
             "min_rtt",
@@ -481,14 +492,6 @@ pub fn request_signals(q: &crate::model::ReqRow) -> Vec<RequestSignal> {
             "server_timing",
             d.and_then(|d| d.server_timing.clone())
                 .map(SignalValue::Text),
-        ),
-        (
-            "stream_wait",
-            nonzero(d.and_then(|d| d.stream_wait_us)).map(SignalValue::Us),
-        ),
-        (
-            "flow_stall",
-            nonzero(d.and_then(|d| d.flow_stall_us)).map(SignalValue::Us),
         ),
         (
             "streams",
@@ -509,8 +512,26 @@ pub fn request_signals(q: &crate::model::ReqRow) -> Vec<RequestSignal> {
                 .map(SignalValue::Text),
         ),
         (
+            "cdn_pop",
+            d.and_then(|d| d.cdn_pop.clone()).map(SignalValue::Text),
+        ),
+        (
+            "age",
+            d.and_then(|d| d.age_s)
+                .map(|s| SignalValue::Text(format!("{s}s"))),
+        ),
+        (
             "region",
             d.and_then(|d| d.region.clone()).map(SignalValue::Text),
+        ),
+        (
+            "storage_class",
+            d.and_then(|d| d.storage_class.clone())
+                .map(SignalValue::Text),
+        ),
+        (
+            "encryption",
+            d.and_then(|d| d.encryption.clone()).map(SignalValue::Text),
         ),
     ];
     all.into_iter()
@@ -572,7 +593,7 @@ pub fn waterfall(run: &Run, op_id: u64) -> Option<WaterfallOp> {
             prev_end = Some(prev_end.unwrap_or(i64::MIN).max(q.t_us + q.total_us as i64));
             let detail = q.detail.as_deref();
             WaterfallRow {
-                api: q.api.to_string(),
+                api: q.api_name().to_owned(),
                 status: q.status,
                 attempt: q.attempt,
                 start_us: q.t_us - o.t_us,
@@ -1251,16 +1272,26 @@ pub struct WritePathView {
     /// Multipart parts uploaded, and their mean size.
     pub parts_count: u64,
     pub part_mean_bytes: Option<u64>,
+    /// Median `max_part_ms / median_part_ms` across multipart writes with ≥ 2 parts.
+    pub part_skew_ratio: Option<f64>,
+    /// `CompleteMultipartUpload` p99 latency (ms) and share of multipart request time.
+    pub complete_p99_ms: Option<f64>,
+    pub complete_share_ratio: Option<f64>,
 }
 
 impl WritePathView {
     /// `None` when the run wrote nothing and recorded no write knobs.
     pub fn of(r: &Report) -> Option<Self> {
+        Self::of_with(r, None)
+    }
+
+    /// [`Self::of`] enriched with per-operation part straggler skew from `run` rows.
+    pub fn of_with(r: &Report, run: Option<&Run>) -> Option<Self> {
         let e = &r.effective_write;
         let parts: Vec<&crate::trace::ApiStats> = r
             .apis
             .iter()
-            .filter(|a| a.api.label() == "UploadPart" && a.count > 0)
+            .filter(|a| a.api == crate::trace::Api::UploadPart && a.count > 0)
             .collect();
         let parts_count: u64 = parts.iter().map(|a| a.count).sum();
         let up: u64 = parts.iter().map(|a| a.bytes_up).sum();
@@ -1270,6 +1301,53 @@ impl WritePathView {
         if e.write_chunk_size == 0 && e.requested_chunk_size == 0 && parts_count == 0 {
             return None;
         }
+        let complete = r
+            .apis
+            .iter()
+            .find(|a| a.api == crate::trace::Api::CompleteMultipart && a.count > 0);
+        let complete_p99_ms = complete.map(|c| c.stages.total.p99).filter(|v| *v > 0.0);
+        let complete_share_ratio = complete.and_then(|c| {
+            let mp_ms: f64 = r
+                .apis
+                .iter()
+                .filter(|a| {
+                    matches!(
+                        a.api,
+                        crate::trace::Api::CreateMultipart
+                            | crate::trace::Api::UploadPart
+                            | crate::trace::Api::CompleteMultipart
+                    )
+                })
+                .map(|a| a.stages.total.mean * a.count as f64)
+                .sum();
+            let c_ms = c.stages.total.mean * c.count as f64;
+            (mp_ms > 0.0).then_some(c_ms / mp_ms)
+        });
+        let part_skew_ratio =
+            run.and_then(|run| {
+                let mut by_op: std::collections::HashMap<u64, Vec<f64>> = Default::default();
+                for q in run.reqs.iter().filter(|q| {
+                    q.op_id != 0 && q.api == crate::trace::Api::UploadPart && !q.is_error()
+                }) {
+                    by_op.entry(q.op_id).or_default().push(q.total_us as f64);
+                }
+                let mut skews: Vec<f64> = by_op
+                    .into_values()
+                    .filter(|v| v.len() >= 2)
+                    .filter_map(|mut v| {
+                        v.sort_by(f64::total_cmp);
+                        let med = crate::analysis::stats::median(&v);
+                        let max = v.last().copied().unwrap_or(0.0);
+                        (med > 0.0).then_some(max / med)
+                    })
+                    .collect();
+                if skews.is_empty() {
+                    None
+                } else {
+                    skews.sort_by(f64::total_cmp);
+                    Some(crate::analysis::stats::median(&skews))
+                }
+            });
         Some(Self {
             requested_chunk_bytes: e.requested_chunk_size,
             write_chunk_bytes: e.write_chunk_size,
@@ -1278,6 +1356,9 @@ impl WritePathView {
             clamped: e.write_chunk_clamped(),
             parts_count,
             part_mean_bytes: (parts_count > 0).then(|| up / parts_count),
+            part_skew_ratio,
+            complete_p99_ms,
+            complete_share_ratio,
         })
     }
 
@@ -1290,7 +1371,7 @@ impl WritePathView {
     /// `part size 8 MiB (asked 4 MiB; the service takes 5 MiB–5 GiB) · 12 parts of 8 MiB on
     /// average`.
     pub fn line(&self) -> String {
-        use crate::util::fmt_bytes;
+        use crate::util::{fmt_bytes, fmt_ms};
         let mut s = String::new();
         if self.write_chunk_bytes > 0 {
             s += &format!("part size {}", fmt_bytes(self.write_chunk_bytes));
@@ -1317,6 +1398,120 @@ impl WritePathView {
                 s += " · ";
             }
             s += &format!("{} parts of {} on average", self.parts_count, fmt_bytes(m));
+        }
+        if let Some(sk) = self.part_skew_ratio.filter(|x| *x >= 1.25) {
+            s += &format!(" · part straggler {sk:.2}×");
+        }
+        if let Some(ms) = self.complete_p99_ms {
+            s += &format!(" · complete p99 {}", fmt_ms(ms));
+        }
+        s
+    }
+}
+
+/// Client cache (`FoyerLayer` / hybrid cache) lookups, hits, bytes served and lookup latency.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CacheView {
+    pub lookups_count: u64,
+    pub hits_count: u64,
+    pub hit_ratio: f64,
+    pub hit_bytes: u64,
+    pub lookup_mean_ms: f64,
+}
+
+impl CacheView {
+    pub fn of(r: &Report) -> Option<Self> {
+        if !r.cache.enabled && r.cache.lookups == 0 {
+            return None;
+        }
+        Some(Self {
+            lookups_count: r.cache.lookups,
+            hits_count: r.cache.hits,
+            hit_ratio: r.cache.hit_ratio,
+            hit_bytes: r.bytes.cache_hit_bytes,
+            lookup_mean_ms: r.cache.lookup_ms_mean,
+        })
+    }
+
+    pub fn line(&self) -> String {
+        let mut s = format!(
+            "{:.1}% hit ({} of {} lookups, mean {})",
+            self.hit_ratio * 100.0,
+            self.hits_count,
+            self.lookups_count,
+            crate::util::fmt_ms(self.lookup_mean_ms)
+        );
+        if self.hit_bytes > 0 {
+            s += &format!(
+                " · {} served from cache",
+                crate::util::fmt_bytes(self.hit_bytes)
+            );
+        }
+        s
+    }
+}
+
+/// `ListObjects` pagination: pages per list operation, page latency, and multi-page share.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ListView {
+    pub list_ops_count: u64,
+    pub pages_count: u64,
+    pub pages_per_op: f64,
+    pub page_p50_ms: f64,
+    pub page_p99_ms: f64,
+    /// Share of list operations that needed > 1 page (when trace rows are present).
+    pub paginated_ops_ratio: Option<f64>,
+}
+
+impl ListView {
+    pub fn of(r: &Report, run: Option<&Run>) -> Option<Self> {
+        let api = r
+            .apis
+            .iter()
+            .find(|a| a.api == crate::trace::Api::ListObjects && a.count > 0)?;
+        let list_ops: u64 = r
+            .verbs
+            .iter()
+            .filter(|v| v.verb.starts_with("list") || v.verb == "ListObjects")
+            .map(|v| v.count)
+            .sum::<u64>()
+            .max(1);
+        let paginated_ops_ratio = run.and_then(|run| {
+            let mut by_op: std::collections::HashMap<u64, u64> = Default::default();
+            for q in run
+                .reqs
+                .iter()
+                .filter(|q| q.op_id != 0 && q.api == crate::trace::Api::ListObjects)
+            {
+                *by_op.entry(q.op_id).or_default() += 1;
+            }
+            (!by_op.is_empty()).then(|| {
+                let multi = by_op.values().filter(|c| **c > 1).count() as f64;
+                multi / by_op.len() as f64
+            })
+        });
+        Some(Self {
+            list_ops_count: list_ops,
+            pages_count: api.count,
+            pages_per_op: api.count as f64 / list_ops as f64,
+            page_p50_ms: api.stages.total.p50,
+            page_p99_ms: api.stages.total.p99,
+            paginated_ops_ratio,
+        })
+    }
+
+    pub fn line(&self) -> String {
+        use crate::util::fmt_ms;
+        let mut s = format!(
+            "{} pages across {} list ops ({:.2} pages/op) · page p50/p99 {}/{}",
+            self.pages_count,
+            self.list_ops_count,
+            self.pages_per_op,
+            fmt_ms(self.page_p50_ms),
+            fmt_ms(self.page_p99_ms)
+        );
+        if let Some(r) = self.paginated_ops_ratio.filter(|r| *r > 0.0) {
+            s += &format!(" · {:.1}% multi-page", r * 100.0);
         }
         s
     }
@@ -1430,6 +1625,8 @@ pub struct ProfileView {
     pub operator: OperatorView,
     pub retry: RetryView,
     pub write_path: Option<WritePathView>,
+    pub cache: Option<CacheView>,
+    pub list_path: Option<ListView>,
 }
 
 impl ProfileView {
@@ -1446,7 +1643,9 @@ impl ProfileView {
             connections: ConnectionView::of(r, run),
             operator: OperatorView::of(r),
             retry: RetryView::of(r),
-            write_path: WritePathView::of(r),
+            write_path: WritePathView::of_with(r, run),
+            cache: CacheView::of(r),
+            list_path: ListView::of(r, run),
         }
     }
 }
@@ -2223,8 +2422,7 @@ impl TrustView {
                 .run
                 .partial
                 .as_ref()
-                .map(|p| format!("{:?}", p.reason).to_lowercase())
-                .or_else(|| r.run.interrupted.then(|| "interrupted".to_owned())),
+                .map(|p| format!("{:?}", p.reason).to_lowercase()),
         }
     }
 
@@ -2288,6 +2486,8 @@ pub fn apis(r: &Report) -> Vec<ApiRow> {
 #[derive(Clone, Debug, PartialEq)]
 pub struct RetryView {
     pub retries_count: u64,
+    /// Hedged / cancelled straggler attempts (`TailCutLayer`).
+    pub tail_cuts_count: u64,
     /// Time operations spent waiting between attempts, in total.
     pub backoff_ms: f64,
     pub status_429_count: u64,
@@ -2313,6 +2513,7 @@ impl RetryView {
         classes.sort_by_key(|c| std::cmp::Reverse(c.1));
         Self {
             retries_count: x.retries,
+            tail_cuts_count: x.tail_cuts,
             backoff_ms: x.retry_backoff_ms,
             status_429_count: x.status_429,
             status_503_count: x.status_503,
@@ -2346,6 +2547,9 @@ impl RetryView {
             self.status_429_count,
             self.status_503_count,
         );
+        if self.tail_cuts_count > 0 {
+            s += &format!(" · {} tail-cut", self.tail_cuts_count);
+        }
         if self.max_retry_after_ms > 0 {
             s += &format!(
                 " (Retry-After up to {})",
@@ -2381,6 +2585,7 @@ impl RetryView {
     /// Nothing was retried and nothing failed.
     pub fn quiet(&self) -> bool {
         self.retries_count == 0
+            && self.tail_cuts_count == 0
             && self.failed_ops_count == 0
             && self.status_429_count == 0
             && self.status_503_count == 0
@@ -2918,8 +3123,7 @@ mod tests {
         let q = &mut run.reqs[2];
         q.stall_us = 1_500;
         q.detail = Some(Box::new(crate::model::ReqDetail {
-            stream_wait_us: Some(2_000),
-            flow_stall_us: Some(7_000),
+            cut: true,
             streams_count: Some(100),
             upload_acked_us: Some(900),
             send_buffered_us: Some(40),
@@ -2938,8 +3142,7 @@ mod tests {
             keys,
             vec![
                 "code",
-                "stream_wait",
-                "flow_stall",
+                "tail_cut",
                 "streams",
                 "upload_acked",
                 "send_buffered",
@@ -2947,10 +3150,10 @@ mod tests {
                 "region"
             ]
         );
-        assert_eq!(r.signals[2].value, SignalValue::Us(7_000));
-        assert_eq!(r.signals[2].text(), "h2 flow stall 7.00ms");
-        assert!(r.signals[2].explains());
-        assert!(!r.signals[7].explains(), "the region is a detail");
+        assert_eq!(r.signals[1].value, SignalValue::Text("hedged".into()));
+        assert_eq!(r.signals[1].text(), "tail-cut hedged");
+        assert!(r.signals[1].explains());
+        assert!(!r.signals[6].explains(), "the region is a detail");
         assert_eq!(w.await_tree.as_deref(), Some("read\n  http"));
         // A plain request says nothing beyond its stages.
         assert!(w.rows[0].signals.is_empty());

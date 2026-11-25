@@ -79,7 +79,7 @@ impl Slice {
     fn add(&mut self, o: &DimOp) {
         self.ops += 1;
         self.requests += o.requests;
-        self.throttled += u64::from(o.throttled);
+        self.throttled += o.throttled_requests;
         self.errors += u64::from(o.failed);
         let _ = self.lat.record(o.latency_us.clamp(1, 3_600_000_000));
     }
@@ -107,7 +107,7 @@ pub struct DimOp<'a> {
     pub bytes: u64,
     pub latency_us: u64,
     pub requests: u64,
-    pub throttled: bool,
+    pub throttled_requests: u64,
     pub failed: bool,
 }
 
@@ -178,7 +178,7 @@ impl DimAgg {
 
     pub fn record(&mut self, o: &DimOp) {
         self.total_requests += o.requests;
-        self.total_throttled += u64::from(o.throttled);
+        self.total_throttled += o.throttled_requests;
         if o.key.is_empty() {
             return;
         }
@@ -196,10 +196,10 @@ impl DimAgg {
         let n_keys = self.keys.len();
         if let Some(k) = self.keys.get_mut(o.key) {
             k.0 += o.requests;
-            k.1 += u64::from(o.throttled);
+            k.1 += o.throttled_requests;
         } else if n_keys < MAX_KEYS {
             self.keys
-                .insert(o.key.to_owned(), (o.requests, u64::from(o.throttled)));
+                .insert(o.key.to_owned(), (o.requests, o.throttled_requests));
         } else {
             self.untracked += 1;
         }
@@ -279,7 +279,7 @@ mod tests {
             bytes,
             latency_us: 1000,
             requests: 1,
-            throttled,
+            throttled_requests: u64::from(throttled),
             failed: false,
         }
     }

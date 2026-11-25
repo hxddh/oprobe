@@ -502,11 +502,22 @@ impl OperatorSpec {
                 path.display()
             ))
         })?;
-        Self::parse(&raw).map_err(|e| {
+        let mut s = Self::parse(&raw).map_err(|e| {
             let mut o = OprobeError::new(e.code, format!("`{}`: {}", path.display(), e.message));
             o.hint = e.hint;
             o
-        })
+        })?;
+        if let Some(ca) = &s.http.ca_cert
+            && ca.is_relative()
+        {
+            let dir = path
+                .parent()
+                .filter(|d| !d.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            let base = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+            s.http.ca_cert = Some(base.join(ca));
+        }
+        Ok(s)
     }
 
     /// The `op.toml` form (defaults left out).
@@ -734,13 +745,10 @@ impl OperatorSpec {
         crate::util::redact_url(&self.url)
     }
 
-    /// A copy whose secret options are replaced by `${ENV}` references or removed (stored in
-    /// reports and run files).
+    /// A copy whose secret options, URL credentials, proxy credentials and `ca_cert_pem` are
+    /// redacted while preserving `${ENV}` references (stored in reports, proves and run files).
     pub fn redacted(&self) -> Self {
-        let mut s = self.clone();
-        s.url = crate::util::redact_url(&s.url);
-        s.options = crate::util::redact_options(&s.options);
-        s
+        crate::model::spec::redact_operator(self)
     }
 
     /// `read.concurrent` as OpenDAL applies it (1 when unset).
@@ -841,6 +849,147 @@ fn scalar(v: &str, layer_toggle: bool) -> Option<toml::Value> {
         return Some(toml::Value::Float(f));
     }
     Some(toml::Value::String(v.to_owned()))
+}
+
+fn to_edit_value(v: toml::Value) -> toml_edit::Value {
+    match v {
+        toml::Value::Boolean(b) => toml_edit::Value::from(b),
+        toml::Value::Integer(i) => toml_edit::Value::from(i),
+        toml::Value::Float(f) => toml_edit::Value::from(f),
+        toml::Value::String(s) => toml_edit::Value::from(s),
+        other => toml_edit::Value::from(other.to_string()),
+    }
+}
+
+/// Apply `PATH=VALUE` `edits` in place to a [`toml_edit::Table`] representing an operator
+/// (`op.toml` root or `[operators.NAME]` in `config.toml`), preserving comments, whitespace,
+/// key ordering and unedited fields.
+pub fn patch_toml_table(
+    root: &mut toml_edit::Table,
+    edits: &[(String, String)],
+) -> Result<(), OprobeError> {
+    let normalized = normalize_edits(edits);
+    for (path, value) in &normalized {
+        OperatorSpec::check_edit(path, value)?;
+        let parts: Vec<&str> = path.split('.').collect();
+        let layer_toggle = parts.len() == 2 && parts[0] == "layers";
+        let parsed: Option<toml_edit::Value> = if parts[0] == "options" || path == "url" {
+            Some(toml_edit::Value::from(value.as_str()))
+        } else if path == "http.proxy" {
+            match value.to_ascii_lowercase().as_str() {
+                "unset" | "default" | "" => None,
+                "none" | "off" => Some(toml_edit::Value::from("none")),
+                _ => Some(toml_edit::Value::from(value.as_str())),
+            }
+        } else if path == "http.ca_cert" {
+            match value.to_ascii_lowercase().as_str() {
+                "none" | "unset" | "default" | "" => None,
+                _ => Some(toml_edit::Value::from(value.as_str())),
+            }
+        } else {
+            scalar(value, layer_toggle).map(to_edit_value)
+        };
+
+        if parts.len() == 1 {
+            match parsed {
+                Some(v) => {
+                    root["url"] = toml_edit::Item::Value(v);
+                }
+                None => {
+                    root.remove("url");
+                }
+            }
+            continue;
+        }
+
+        let sec_key = parts[0];
+        if !root.contains_key(sec_key)
+            || (!root[sec_key].is_table() && !root[sec_key].is_inline_table())
+        {
+            if parsed.is_none() {
+                continue;
+            }
+            root.insert(sec_key, toml_edit::Item::Table(toml_edit::Table::new()));
+        }
+
+        if parts.len() == 2 {
+            let last = parts[1];
+            let keep = layer_toggle
+                && parsed.as_ref().and_then(|v| v.as_bool()) == Some(true)
+                && match &root[sec_key] {
+                    toml_edit::Item::Table(t) => t
+                        .get(last)
+                        .is_some_and(|i| i.is_table() || i.is_inline_table()),
+                    toml_edit::Item::Value(toml_edit::Value::InlineTable(it)) => {
+                        it.get(last).is_some_and(|v| v.as_inline_table().is_some())
+                    }
+                    _ => false,
+                };
+            if keep {
+                continue;
+            }
+            match (&mut root[sec_key], parsed) {
+                (toml_edit::Item::Table(t), Some(v)) => {
+                    t[last] = toml_edit::Item::Value(v);
+                }
+                (toml_edit::Item::Table(t), None) => {
+                    t.remove(last);
+                }
+                (toml_edit::Item::Value(toml_edit::Value::InlineTable(it)), Some(v)) => {
+                    it.insert(last, v);
+                    it.fmt();
+                }
+                (toml_edit::Item::Value(toml_edit::Value::InlineTable(it)), None) => {
+                    it.remove(last);
+                    it.fmt();
+                }
+                _ => {}
+            }
+            continue;
+        }
+
+        // `parts.len() == 3`: `layers.<layer>.<field>`
+        let (layer_name, field) = (parts[1], parts[2]);
+        if let toml_edit::Item::Value(toml_edit::Value::InlineTable(it)) = &root[sec_key] {
+            // Promote inline `[layers]` if needed so layer sub-entries edit cleanly.
+            let mut tbl = it.clone().into_table();
+            tbl.set_implicit(false);
+            root[sec_key] = toml_edit::Item::Table(tbl);
+        }
+        let Some(layers_tbl) = root[sec_key].as_table_mut() else {
+            continue;
+        };
+        match layers_tbl.get_mut(layer_name) {
+            Some(toml_edit::Item::Table(t)) => match parsed {
+                Some(v) => {
+                    t[field] = toml_edit::Item::Value(v);
+                }
+                None => {
+                    t.remove(field);
+                }
+            },
+            Some(toml_edit::Item::Value(toml_edit::Value::InlineTable(it))) => match parsed {
+                Some(v) => {
+                    it.insert(field, v);
+                    it.fmt();
+                }
+                None => {
+                    it.remove(field);
+                    it.fmt();
+                }
+            },
+            _ => {
+                if let Some(v) = parsed {
+                    let mut it = toml_edit::InlineTable::new();
+                    it.insert(field, v);
+                    it.fmt();
+                    layers_tbl[layer_name] =
+                        toml_edit::Item::Value(toml_edit::Value::InlineTable(it));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

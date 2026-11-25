@@ -182,7 +182,8 @@ pub fn req_row(mut r: RequestRecord, op_id: u64, op_t_us: i64, attempt: u32) -> 
         t_us: op_t_us + r.start_offset_us as i64,
         op_id,
         attempt,
-        api: Cow::Borrowed(r.service_op.unwrap_or_else(|| r.api.label())),
+        api: r.api,
+        service_op: r.service_op.map(Cow::Borrowed),
         method: method_name(r.method),
         status: r.status,
         protocol: r.protocol.into(),
@@ -212,21 +213,42 @@ pub fn req_row(mut r: RequestRecord, op_id: u64, op_t_us: i64, attempt: u32) -> 
 }
 
 /// Attempt number of each request (1 = first try of that API call in the operation):
-/// a request is a retry when an earlier-started request of the same API failed.
+/// a request is a retry when an earlier-ended failed request (or an overlapping `TailCutLayer`
+/// cut attempt) of the same API has not yet been resolved by a succeeding retry. Once a retry
+/// succeeds, later parts/pages/ranges of the same API start fresh at attempt 1.
 /// `None` when nothing failed (the common case, no allocation): every request is attempt 1.
 pub fn attempts(reqs: &[RequestRecord]) -> Option<Vec<u32>> {
-    if !reqs.iter().any(|r| r.is_error() && r.status != 404) {
+    if !reqs.iter().any(|r| {
+        (r.is_error() && r.status != 404) || r.detail.as_deref().is_some_and(|d| d.cut)
+    }) {
         return None;
     }
     let mut out = vec![1u32; reqs.len()];
     let mut order: Vec<usize> = (0..reqs.len()).collect();
     order.sort_by_key(|&i| reqs[i].start_offset_us);
-    let mut failures = [0u32; 16];
+    // Per API slot: `(attempt, available_from_offset_us)` of unresolved failed/cut chains.
+    let mut pending: [Vec<(u32, u64)>; 16] = std::array::from_fn(|_| Vec::new());
     for i in order {
-        let slot = (reqs[i].api as usize).min(15);
-        out[i] = failures[slot] + 1;
-        if reqs[i].is_error() && reqs[i].status != 404 {
-            failures[slot] += 1;
+        let r = &reqs[i];
+        let slot = (r.api as usize).min(15);
+        let start = r.start_offset_us;
+        let att = if let Some(pos) = pending[slot]
+            .iter()
+            .position(|&(_, ready_at)| start >= ready_at)
+        {
+            let (prev_att, _) = pending[slot].remove(pos);
+            prev_att + 1
+        } else {
+            1
+        };
+        out[i] = att;
+        let is_cut = r.detail.as_deref().is_some_and(|d| d.cut);
+        if is_cut {
+            // A TailCutLayer replacement starts while the cut request is still in flight.
+            pending[slot].push((att, start));
+        } else if r.is_error() && r.status != 404 {
+            // A RetryLayer retry starts only after this failed attempt ended.
+            pending[slot].push((att, start.saturating_add(r.timing.total_us)));
         }
     }
     Some(out)
@@ -268,6 +290,7 @@ pub fn op_row(
         },
         requests: requests.min(u32::MAX as u64) as u32,
         await_tree: None,
+        weight: 1.0,
     }
 }
 
@@ -411,9 +434,18 @@ mod tests {
         ];
         assert_eq!(attempts(&reqs), Some(vec![3, 1, 1, 2]));
         assert_eq!(attempts(&reqs[2..3]), None);
+        // Subsequent parts/pages after a recovered retry start fresh at attempt 1.
+        let multipart = vec![
+            rec(Api::UploadPart, 0, 503),
+            rec(Api::UploadPart, 2, 200),   // concurrent part #2 (started before #1 ended at 5)
+            rec(Api::UploadPart, 100, 200), // retry of part #1
+            rec(Api::UploadPart, 200, 200), // part #3 starts fresh at attempt 1
+        ];
+        assert_eq!(attempts(&multipart), Some(vec![1, 1, 2, 1]));
         let row = req_row(reqs[1].clone(), 7, 1000, 1);
         assert_eq!(row.t_us, 1000);
-        assert_eq!(row.api, "GetObject");
+        assert_eq!(row.api, Api::GetObject);
+        assert_eq!(row.api_name(), "GetObject");
         assert_eq!(row.error_code, Some(FailureCode::StorageThrottled));
         assert!(matches!(row.method, Cow::Borrowed("GET")));
     }

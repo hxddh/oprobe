@@ -131,6 +131,9 @@ fn checked_in_schemas_match_the_code() {
             "prove-plan",
             "show",
             "run-list",
+            "compare",
+            "removed",
+            "lab",
             "operator",
             "error",
             "events"
@@ -140,7 +143,7 @@ fn checked_in_schemas_match_the_code() {
         let v = oprobe::cli::schema::schema(name).unwrap();
         assert_eq!(
             v["$id"],
-            format!("https://github.com/hxddh/oprobe/schemas/6/{name}.json")
+            format!("https://github.com/hxddh/oprobe/schemas/9/{name}.json")
         );
         let want = serde_json::to_string_pretty(&v).unwrap() + "\n";
         let path = dir.join(format!("{name}.json"));
@@ -182,13 +185,13 @@ fn run_saves_the_run_and_prints_one_json_document() {
     let run = &v["runs"][0];
     let report = &run["report"];
     validate("report", report);
-    assert_eq!(report["schema"], "oprobe.report/6");
+    assert_eq!(report["schema"], "oprobe.report/7");
     assert_eq!(report["spec"]["operator_ref"], "memory://");
     assert_eq!(report["spec"]["profile"]["operator"]["url"], "memory://");
     assert_eq!(report["workload"]["preset"], "small-files");
     assert!(v["next"].is_array() && v["warnings"].is_array());
     assert_eq!(env.runs().len(), 1);
-    // The run file is oprobe.run/6 and opens with `show`.
+    // The run file is oprobe.run/7 and opens with `show`.
     let id = run["run_id"].as_str().unwrap();
     let o = env.run(&["show", id, "-o", "json"]);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
@@ -361,8 +364,14 @@ fn show_lists_groups_and_removes_runs() {
     );
     let o = env.run(&["show", "--rm", &first, "-o", "json"]);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
-    assert_eq!(json(&o)["removed"][0], first.as_str());
+    let rem = json(&o);
+    validate("removed", &rem);
+    assert_eq!(rem["removed"][0], first.as_str());
     assert_eq!(env.runs().len(), 1);
+    // `-n` without `--list` is refused by clap.
+    let o = env.run(&["show", "-n", "5", "-o", "json"]);
+    assert_eq!(code(&o), 2);
+    assert_eq!(error_code(&o), "usage.invalid_argument");
     let o = env.run(&["show", "no-such-run", "-o", "json"]);
     assert_eq!(code(&o), 2);
     assert_eq!(error_code(&o), "usage.unknown_run");
@@ -412,6 +421,10 @@ fn show_recomputes_a_time_range_from_the_rows() {
         .map(|g| g["requests_count"].as_u64().unwrap())
         .sum();
     assert_eq!(n, r["requests_count"].as_u64().unwrap());
+    let by_text = stdout(&env.run(&[
+        "show", "last", "--since", "100ms", "--until", "200ms", "--by", "api", "--color", "never",
+    ]));
+    assert!(by_text.contains("0.1–0.2 s of the"), "{by_text}");
     // A backwards range is a usage error.
     let o = env.run(&[
         "show", "last", "--since", "2s", "--until", "1s", "-o", "json",
@@ -1172,7 +1185,7 @@ fn show_opens_a_prove_and_lists_proves_within_the_limit() {
             "--trial",
             "300ms",
             "--max-duration",
-            "1s",
+            "2500ms",
             "-o",
             "json",
         ]);
@@ -1305,4 +1318,95 @@ fn reset_requests_show_under_no_connection() {
         .find(|g| g["key"] == "no connection")
         .unwrap_or_else(|| panic!("{groups:#?}"));
     assert_eq!(g["requests_count"], resets);
+}
+
+#[test]
+fn show_compares_multiple_runs_and_prove_saves_when_improved() {
+    let env = Env::new();
+    let o1 = env.run(&run_args(&["lab://clean"], &["-q", "-o", "json"]));
+    assert_eq!(code(&o1), 0, "{}", stderr(&o1));
+    let id1 = json(&o1)["runs"][0]["run_id"].as_str().unwrap().to_owned();
+
+    let o2 = env.run(&run_args(
+        &["lab://clean"],
+        &["--set", "layers.retry.jitter=on", "-q", "-o", "json"],
+    ));
+    assert_eq!(code(&o2), 0, "{}", stderr(&o2));
+    let id2 = json(&o2)["runs"][0]["run_id"].as_str().unwrap().to_owned();
+
+    // `show A B -o json` matches `schemas/compare.json` (and `schemas/run.json`) with a side-by-side comparison.
+    let cmp = env.run(&["show", &id1, &id2, "-o", "json"]);
+    assert_eq!(code(&cmp), 0, "{}", stderr(&cmp));
+    let v = json(&cmp);
+    validate("compare", &v);
+    validate("run", &v);
+    assert_eq!(v["runs"].as_array().unwrap().len(), 2);
+    assert!(v["comparison"].is_object(), "{v:#}");
+
+    // `show A B --detail` renders both runs and the per-API comparison table in text.
+    let text = stdout(&env.run(&["show", &id1, &id2, "--detail"]));
+    assert!(text.contains(&id1) && text.contains(&id2), "{text}");
+    assert!(text.contains("GetObject"), "{text}");
+
+    // `prove --save` on an improved remedy writes `op.toml`, and `show last-prove` opens it.
+    let o_strag = env.run(&[
+        "run",
+        "lab://stragglers",
+        "-c",
+        "8",
+        "-d",
+        "800ms",
+        "--warmup",
+        "0s",
+        "-q",
+        "-o",
+        "json",
+    ]);
+    assert_eq!(code(&o_strag), 0, "{}", stderr(&o_strag));
+    let save_path = env.path("proven-op.toml");
+    let p = env.run(&[
+        "prove",
+        "last",
+        "--with",
+        "layers.tail_cut=on",
+        "--with",
+        "layers.retry.min_delay=10ms",
+        "--trial",
+        "400ms",
+        "--pairs",
+        "3",
+        "--save",
+        save_path.to_str().unwrap(),
+        "-q",
+        "-o",
+        "json",
+    ]);
+    assert!(matches!(code(&p), 0 | 3), "{}", stderr(&p));
+    let pv = json(&p);
+    validate("prove", &pv);
+    if pv["verdict"] == "improved" {
+        let saved = std::fs::read_to_string(&save_path).unwrap();
+        assert!(
+            saved.contains("[layers.tail_cut]") && saved.contains("min_delay = \"10ms\""),
+            "{saved}"
+        );
+        assert_eq!(pv["saved_to"].as_str(), save_path.to_str());
+    }
+    let last_p = env.run(&["show", "last-prove", "-o", "json"]);
+    assert_eq!(code(&last_p), 0, "{}", stderr(&last_p));
+    assert_eq!(json(&last_p)["prove_id"], pv["prove_id"]);
+    assert_eq!(json(&last_p)["schema"], "oprobe.prove/9");
+    // Run-only flags on a prove result are refused cleanly instead of silently ignored.
+    for extra in [
+        &["--by", "stage"][..],
+        &["--detail"][..],
+        &["--since", "100ms"][..],
+    ] {
+        let mut args = vec!["show", "last-prove"];
+        args.extend_from_slice(extra);
+        args.extend(["-o", "json"]);
+        let bad = env.run(&args);
+        assert_eq!(code(&bad), 2, "{extra:?}: {}", stdout(&bad));
+        assert_eq!(error_code(&bad), "usage.invalid_argument");
+    }
 }

@@ -1,11 +1,13 @@
 //! The app on the terminal grid (`nsh-platform-tui`): a bare `oprobe` without a display, over
 //! SSH too. Event conversion follows NSH's own terminal host.
 
-use std::io;
+use std::io::{self, Write as _};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
 use crossterm::{ExecutableCommand, terminal};
+use nsh_core::clipboard::ClipboardBackend;
 use nsh_core::element::Root;
 use nsh_platform_tui::{
     AppOptions, AppView, ColorDepth, Input, Modifiers, MouseButton, MouseInput, MouseKind,
@@ -15,6 +17,143 @@ use ratatui_core::terminal::Terminal;
 use ratatui_crossterm::CrosstermBackend;
 
 use crate::ui::jobs;
+
+/// Terminal clipboard backend: OSC-52 (works over SSH and inside tmux) + OS clipboard tools
+/// (`pbcopy`/`pbpaste`, `wl-copy`/`wl-paste`, `xclip`, `xsel`, `clip.exe`) + an in-memory
+/// fallback so copy/paste inside the TUI always succeeds.
+#[derive(Default)]
+struct TermClipboard {
+    mem: Mutex<Option<String>>,
+}
+
+const MAX_OSC52_BYTES: usize = 100_000;
+
+fn base64_encode(input: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((triple >> 18) & 0x3f) as usize] as char);
+        out.push(TABLE[((triple >> 12) & 0x3f) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[((triple >> 6) & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[(triple & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+fn emit_osc52(text: &str) {
+    if text.len() > MAX_OSC52_BYTES {
+        return;
+    }
+    let b64 = base64_encode(text.as_bytes());
+    let seq = if std::env::var_os("TMUX").is_some() {
+        format!("\x1bPtmux;\x1b\x1b]52;c;{b64}\x07\x1b\\")
+    } else {
+        format!("\x1b]52;c;{b64}\x07")
+    };
+    #[cfg(unix)]
+    if let Ok(mut tty) = std::fs::OpenOptions::new().write(true).open("/dev/tty") {
+        let _ = tty.write_all(seq.as_bytes());
+        let _ = tty.flush();
+        return;
+    }
+    let _ = io::stderr().write_all(seq.as_bytes());
+    let _ = io::stderr().flush();
+}
+
+fn os_clipboard_set(text: &str) {
+    use std::process::{Command, Stdio};
+    let is_ssh =
+        std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some();
+    if is_ssh {
+        return;
+    }
+    let candidates: &[(&str, &[&str])] = if cfg!(target_os = "macos") {
+        &[("pbcopy", &[])]
+    } else if cfg!(windows) {
+        &[("clip", &[])]
+    } else {
+        &[
+            ("wl-copy", &[]),
+            ("xclip", &["-selection", "clipboard"]),
+            ("xsel", &["--clipboard", "--input"]),
+        ]
+    };
+    for (bin, args) in candidates {
+        if let Ok(mut child) = Command::new(bin)
+            .args(*args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(text.as_bytes());
+            }
+            if child.wait().is_ok_and(|s| s.success()) {
+                return;
+            }
+        }
+    }
+}
+
+fn os_clipboard_get() -> Option<String> {
+    use std::process::{Command, Stdio};
+    let is_ssh =
+        std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some();
+    if is_ssh {
+        return None;
+    }
+    let candidates: &[(&str, &[&str])] = if cfg!(target_os = "macos") {
+        &[("pbpaste", &[])]
+    } else if cfg!(windows) {
+        return None;
+    } else {
+        &[
+            ("wl-paste", &["--no-newline"]),
+            ("xclip", &["-selection", "clipboard", "-o"]),
+            ("xsel", &["--clipboard", "--output"]),
+        ]
+    };
+    for (bin, args) in candidates {
+        if let Ok(out) = Command::new(bin)
+            .args(*args)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            && out.status.success()
+            && let Ok(s) = String::from_utf8(out.stdout)
+        {
+            return Some(s);
+        }
+    }
+    None
+}
+
+impl ClipboardBackend for TermClipboard {
+    fn text(&self) -> Option<String> {
+        os_clipboard_get().or_else(|| self.mem.lock().unwrap_or_else(|e| e.into_inner()).clone())
+    }
+
+    fn set_text(&self, text: Option<String>) {
+        if let Some(ref s) = text {
+            emit_osc52(s);
+            os_clipboard_set(s);
+        }
+        *self.mem.lock().unwrap_or_else(|e| e.into_inner()) = text;
+    }
+}
 
 fn modifiers(keys: KeyModifiers) -> Modifiers {
     Modifiers {
@@ -136,6 +275,7 @@ fn is_ctrl_c(ev: &Event) -> bool {
 pub fn run(monochrome: bool) -> io::Result<()> {
     let mut options = AppOptions::default();
     options.ui_sets = crate::ui::ui_sets();
+    options.clipboard = Some(std::sync::Arc::new(TermClipboard::default()));
     if monochrome {
         options.capabilities.colors = ColorDepth::Monochrome;
     }
@@ -148,8 +288,12 @@ pub fn run(monochrome: bool) -> io::Result<()> {
     let hook_prev = prev.clone();
     std::panic::set_hook(Box::new(move |info| {
         if std::thread::current().id() == ui_thread {
+            let mut out = io::stdout();
+            let _ = out.execute(event::DisableFocusChange);
+            let _ = out.execute(event::DisableBracketedPaste);
+            let _ = out.execute(event::DisableMouseCapture);
+            let _ = out.execute(terminal::LeaveAlternateScreen);
             let _ = terminal::disable_raw_mode();
-            let _ = io::stdout().execute(terminal::LeaveAlternateScreen);
             hook_prev(info);
         } else {
             let name = std::thread::current().name().unwrap_or("?").to_owned();

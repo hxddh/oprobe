@@ -40,7 +40,7 @@ pub fn list(app: &App) -> Result<Vec<RunRow>> {
                 .clone()
                 .unwrap_or_else(|| crate::util::display_url(&r.target_display)),
             preset: r.preset.clone().unwrap_or_default(),
-            partial: r.partial.is_some() || r.interrupted,
+            partial: r.partial.is_some(),
             id: r.id,
             started_at: r.started_at,
             verdict: r.verdict_level,
@@ -95,11 +95,12 @@ pub struct Bar {
     pub segs: Vec<Seg>,
     pub failed: bool,
     /// What the response and the connection said, as `(what, value)`, in core's order
-    /// ([`view::request_signals`]): the provider's error code, `Retry-After`, rtt / min rtt /
-    /// retransmits, `Server-Timing`, the HTTP/2 stream wait, flow-control stall and open
-    /// streams, the kernel's upload timing, the CDN cache status and the region (only those
-    /// the request row has).
+    /// ([`view::request_signals`]).
     pub signals: Vec<(&'static str, String)>,
+    /// Backend request identifier (`x-amz-request-id`, `x-ms-request-id`, etc.), when recorded.
+    pub request_id: Option<String>,
+    /// Transport or client error string when no HTTP provider code explained the failure.
+    pub error: Option<String>,
 }
 
 /// One operation with its requests.
@@ -159,6 +160,8 @@ impl PartialEq for Rows {
 pub struct ProfileModel {
     pub id: String,
     pub operator_ref: String,
+    /// The `op.toml` file this run's operator came from, when it exists on disk.
+    pub operator_file: Option<std::path::PathBuf>,
     pub operator: OperatorSpec,
     pub preset: String,
     pub window_s: f64,
@@ -201,6 +204,10 @@ pub struct ProfileModel {
     pub conns: view::ConnectionView,
     /// The multipart part size OpenDAL wrote with and the parts it uploaded (runs that wrote).
     pub write_path: Option<view::WritePathView>,
+    pub cache: Option<view::CacheView>,
+    pub list_path: Option<view::ListView>,
+    /// Stored proves for this run (`<id>.prove.json`), newest first.
+    pub proves: Vec<super::jobs::Proved>,
     pub warnings: Vec<String>,
     /// The run and its rows: what a range, a filter or a drill-down is recomputed from.
     pub rows: Rows,
@@ -293,7 +300,51 @@ pub fn profile(app: &App, id: &str) -> Result<ProfileModel> {
             reqs: Vec::new(),
         },
     };
-    Ok(of_rows(Arc::new(run)))
+    let mut m = of_rows(Arc::new(run));
+    if let Ok(proves) = app.store().proves() {
+        m.proves = proves
+            .into_iter()
+            .filter(|v| v.get("run_id").and_then(|x| x.as_str()) == Some(m.id.as_str()))
+            .filter_map(|v| {
+                serde_json::to_vec(&v)
+                    .ok()
+                    .and_then(|b| crate::app::ProveOutput::from_json_slice(&b).ok())
+            })
+            .map(super::jobs::Proved::from_output)
+            .collect();
+    }
+    Ok(m)
+}
+
+/// Build a standalone [`ProfileModel`] from a `.prove.json` document when its origin `.oprobe`
+/// run is not present in the local store (e.g. a `.prove.json` shared by a teammate).
+pub fn of_standalone_prove(p: &crate::app::ProveOutput) -> ProfileModel {
+    let prof = crate::config::Profile::from_operator(p.operator.redacted());
+    let raw_id = if p.run_id.is_empty() {
+        p.prove_id.clone()
+    } else {
+        p.run_id.clone()
+    };
+    let run_id = crate::model::RunId::parse(&raw_id).unwrap_or_default();
+    let now = std::time::SystemTime::now();
+    let mut run = crate::model::build_run(crate::model::ReportInput {
+        run_id: &run_id,
+        target_name: None,
+        profile: &prof,
+        knobs: &crate::config::Knobs::of(&prof),
+        snapshot: crate::trace::Snapshot::default(),
+        trace: crate::trace::TraceRows::default(),
+        cleanup: crate::engine::CleanupSummary::default(),
+        warnings: Vec::new(),
+        started_at: now,
+        ended_at: now,
+        spec: None,
+    });
+    run.report.run.source = crate::model::RunSource::Trace;
+    let mut m = of_rows(Arc::new(run));
+    m.id = raw_id;
+    m.proves = vec![super::jobs::Proved::from_output(p.clone())];
+    m
 }
 
 fn verb_row(v: view::VerbView) -> VerbRow {
@@ -333,6 +384,7 @@ fn of_rows(rows: Arc<Run>) -> ProfileModel {
     ProfileModel {
         id: r.run.id.clone(),
         operator_ref: r.spec.operator_ref.clone(),
+        operator_file: crate::operator::resolve::operator_file_path(&r.spec.operator_ref),
         operator: r.spec.profile.operator.clone(),
         preset: r.workload_label().to_owned(),
         window_s: r.run.window_s,
@@ -371,7 +423,10 @@ fn of_rows(rows: Arc<Run>) -> ProfileModel {
         bytes: view::BytesView::of(r),
         spread: view::SpreadView::of(r),
         conns: view::ConnectionView::of(r, Some(run)),
-        write_path: view::WritePathView::of(r),
+        write_path: view::WritePathView::of_with(r, Some(run)),
+        cache: view::CacheView::of(r),
+        list_path: view::ListView::of(r, Some(run)),
+        proves: Vec::new(),
         warnings: r.warnings.clone(),
         rows: Rows(rows.clone()),
     }
@@ -494,6 +549,11 @@ fn waterfall_of(w: &view::WaterfallOp) -> Waterfall {
                     segs,
                     failed: r.status == 0 || r.status >= 400,
                     signals,
+                    request_id: r.request_id.clone().filter(|s| !s.is_empty()),
+                    error: r
+                        .error
+                        .clone()
+                        .filter(|s| !s.is_empty() && r.provider_code.is_none()),
                 }
             })
             .collect(),
@@ -603,8 +663,12 @@ pub const SECTIONS: &[(&str, &[Field])] = &[
     (
         "http",
         &[
-            f("http.version", Choice(&["auto", "h1", "h2"]), "HttpFetch"),
-            f("http.keep_alive", Switch, "HttpFetch"),
+            f(
+                "http.version",
+                Choice(&["auto", "h1", "h2"]),
+                "ReqwestTransport",
+            ),
+            f("http.keep_alive", Switch, "ReqwestTransport"),
         ],
     ),
 ];
@@ -785,6 +849,12 @@ pub fn compare_apis(ps: &[ProfileModel]) -> Vec<view::CompareApi> {
     view::CompareView::of(&reports).apis
 }
 
+/// Differences in workload or service across the compared runs (`CompareView::differences`).
+pub fn compare_differences(ps: &[ProfileModel]) -> Vec<String> {
+    let reports: Vec<&Report> = ps.iter().map(|p| &p.rows.0.report).collect();
+    view::CompareView::of(&reports).differences
+}
+
 /// The runs as the sidebar lists them: grouped under their operator, the group of the newest
 /// run first, newest first within a group (the keyboard walks this order).
 pub fn sidebar_order(runs: &[RunRow]) -> Vec<RunRow> {
@@ -923,7 +993,7 @@ mod tests {
         let mut run = crate::report::fixture::run();
         run.reqs[2].stall_us = 1_500;
         run.reqs[2].detail = Some(Box::new(crate::model::ReqDetail {
-            flow_stall_us: Some(7_000),
+            cut: true,
             cache_status: Some("miss".into()),
             ..Default::default()
         }));
@@ -936,10 +1006,11 @@ mod tests {
         assert_eq!(
             b.signals,
             vec![
-                ("flow_stall", crate::ui::fmt::dur_us(7_000.0)),
+                ("tail_cut", "hedged".to_owned()),
                 ("cache_status", "miss".to_owned())
             ]
         );
+        assert_eq!(b.request_id.as_deref(), Some("REQ1"));
         assert_eq!(w.await_tree.as_deref(), Some("read\n  http"));
         // The connections are core's one model.
         assert_eq!(m.conns, view::ConnectionView::of(&run.report, Some(&run)));

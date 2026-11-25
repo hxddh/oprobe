@@ -1,4 +1,4 @@
-//! The run store: `runs/<id>.oprobe` (segmented zstd stream, format `oprobe.run/6`,
+//! The run store: `runs/<id>.oprobe` (segmented zstd stream, format `oprobe.run/7`,
 //! [`super::runfile`]) plus a
 //! `runs/<id>.json` sidecar summary for fast listing, and RUNREF resolution (design §2).
 
@@ -26,7 +26,6 @@ pub struct RunSummary {
     pub target_display: String,
     pub started_at: String,
     pub window_s: f64,
-    pub interrupted: bool,
     pub verdict_level: VerdictLevel,
     pub headline: String,
     pub ops_per_s: f64,
@@ -63,7 +62,6 @@ impl From<&Report> for RunSummary {
             target_display: r.target.display.clone(),
             started_at: r.run.started_at.clone(),
             window_s: r.run.window_s,
-            interrupted: r.run.interrupted,
             verdict_level: r.verdict.level,
             headline: r.verdict.headline.clone(),
             ops_per_s: r.summary.ops_per_s,
@@ -71,13 +69,7 @@ impl From<&Report> for RunSummary {
             p99_ms: r.summary.latency.p99,
             error_ratio: r.summary.error_rate,
             path: None,
-            partial: if r.verdict.exit_code == crate::errors::exit::BUDGET {
-                Some("budget".into())
-            } else if r.run.interrupted {
-                Some("interrupted".into())
-            } else {
-                None
-            },
+            partial: r.run.partial.as_ref().map(|p| p.reason.as_str().to_owned()),
             target_id: r
                 .spec
                 .target_id()
@@ -90,7 +82,7 @@ impl From<&Report> for RunSummary {
     }
 }
 
-/// Encode a run as `oprobe.run/6` in memory (tests and small exports; the store streams to
+/// Encode a run as `oprobe.run/7` in memory (tests and small exports; the store streams to
 /// disk with [`super::runfile::write_run`]).
 pub fn encode_run(run: &Run) -> Result<Vec<u8>> {
     let dir = tempdir_for_encode()?;
@@ -111,7 +103,7 @@ fn tempdir_for_encode() -> Result<PathBuf> {
     Ok(d)
 }
 
-/// Decode an `oprobe.run/6` stream (a v4 or older file is refused with a hint; a damaged or
+/// Decode an `oprobe.run/7` stream (other versions are refused with a hint; a damaged or
 /// truncated file of this version says so, not that it is of another version).
 pub fn decode_run(r: impl Read) -> Result<Run> {
     super::runfile::read_run(r).map_err(|e| {
@@ -358,7 +350,7 @@ impl RunStore {
         load_path(&path)
     }
 
-    /// Delete a stored run (file and sidecar).
+    /// Delete a stored run (file and sidecar; stored proves keep standing on their own).
     pub fn delete(&self, id: &str) -> Result<()> {
         let p = self.run_path(id);
         std::fs::remove_file(&p).map_err(|e| {
@@ -429,6 +421,115 @@ impl RunStore {
         Ok(v.into_iter().map(|x| x.1).collect())
     }
 
+    /// Ids of stored proves, oldest first.
+    pub fn prove_ids(&self) -> Result<Vec<String>> {
+        let rd = match std::fs::read_dir(&self.dir) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let mut ids: Vec<String> = rd
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                let id = name.strip_suffix(".prove.json")?;
+                RunId::parse(id).map(|_| id.to_owned())
+            })
+            .collect();
+        ids.sort();
+        Ok(ids)
+    }
+
+    /// Stored prove ids whose baseline `run_id` is `run_id`, newest first.
+    pub fn proves_of_run(&self, run_id: &str) -> Result<Vec<String>> {
+        Ok(self
+            .proves()?
+            .into_iter()
+            .filter_map(|v| {
+                (v.get("run_id").and_then(|x| x.as_str()) == Some(run_id))
+                    .then(|| {
+                        v.get("prove_id")
+                            .and_then(|x| x.as_str())
+                            .map(str::to_owned)
+                    })
+                    .flatten()
+            })
+            .collect())
+    }
+
+    /// Resolve a prove reference: a `.prove.json` path, `last-prove`, an exact `prove_id`, or
+    /// an unambiguous `prove_id` prefix (when no stored run matches `r`).
+    pub fn resolve_prove(&self, r: &str) -> Result<Option<PathBuf>> {
+        let r = r.trim();
+        if r.is_empty() {
+            return Ok(None);
+        }
+        let p = Path::new(r);
+        if r.ends_with(".prove.json") {
+            return if p.is_file() {
+                Ok(Some(p.to_path_buf()))
+            } else {
+                Err(
+                    OprobeError::new(ErrorCode::UsageUnknownRun, format!("no prove file `{r}`"))
+                        .with_hint("list proves with `oprobe show --list`")
+                        .into(),
+                )
+            };
+        }
+        if (r.contains('/') || r.contains(std::path::MAIN_SEPARATOR) || r.ends_with(".json"))
+            && p.is_file()
+            && let Ok(raw) = std::fs::read(p)
+            && let Ok(v) = serde_json::from_slice::<serde_json::Value>(&raw)
+            && v.get("prove_id").is_some()
+            && v.get("verdict").is_some()
+        {
+            return Ok(Some(p.to_path_buf()));
+        }
+        let pids = self.prove_ids()?;
+        if r == "last-prove" {
+            return pids
+                .last()
+                .map(|id| Ok(Some(self.prove_path(id))))
+                .unwrap_or_else(|| {
+                    Err(
+                        OprobeError::new(ErrorCode::UsageUnknownRun, "no proves yet")
+                            .with_hint("run `oprobe prove RUN` first")
+                            .into(),
+                    )
+                });
+        }
+        if pids.iter().any(|id| id == r) {
+            return Ok(Some(self.prove_path(r)));
+        }
+        if r == "last" || r.starts_with("last~") {
+            return Ok(None);
+        }
+        // Only treat `r` as a prove prefix when no stored run starts with `r`.
+        if self.ids()?.iter().any(|id| id.starts_with(r)) {
+            return Ok(None);
+        }
+        let matches: Vec<&String> = pids.iter().filter(|id| id.starts_with(r)).collect();
+        match matches.len() {
+            0 => Ok(None),
+            1 => Ok(Some(self.prove_path(matches[0]))),
+            n => Err(OprobeError::new(
+                ErrorCode::UsageUnknownRun,
+                format!("prove reference `{r}` is ambiguous ({n} proves match)"),
+            )
+            .with_hint(format!(
+                "use more characters: {}",
+                matches
+                    .iter()
+                    .rev()
+                    .take(5)
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+            .into()),
+        }
+    }
+
     /// Delete a stored prove and its trial runs. `false` when `id` is not a prove.
     pub fn delete_prove(&self, id: &str) -> Result<bool> {
         let p = self.prove_path(id);
@@ -446,17 +547,27 @@ impl RunStore {
     /// prove's result and its trial runs' files.
     fn files_of(&self, id: &str) -> Result<Vec<PathBuf>> {
         let mut v = Vec::new();
+        let mut push = |p: PathBuf| {
+            if !v.contains(&p) {
+                v.push(p);
+            }
+        };
         let prove = self.prove_path(id);
         if prove.is_file() {
             for c in self.children(id)? {
-                v.extend(self.files_of(&c)?);
+                for f in self.files_of(&c)? {
+                    push(f);
+                }
             }
-            v.push(prove);
+            push(prove);
         }
-        for p in [self.run_path(id), self.sidecar_path(id)] {
-            if p.is_file() {
-                v.push(p);
-            }
+        let run_file = self.run_path(id);
+        if run_file.is_file() {
+            push(run_file);
+        }
+        let sidecar = self.sidecar_path(id);
+        if sidecar.is_file() {
+            push(sidecar);
         }
         Ok(v)
     }
@@ -567,9 +678,8 @@ fn json_document(path: &Path) -> Option<(Vec<u8>, String)> {
     Some((bytes, format.unwrap_or_default()))
 }
 
-/// Load a run file, a production trace written by `oprobe-trace` (`oprobe.trace/7`, or a 6.x
-/// `oprobe.trace/6`; whatever its extension: recognised by its content), or a report `.json`
-/// (without trace rows).
+/// Load a run file, a production trace written by `oprobe-trace` (`oprobe.trace/9`; whatever
+/// its extension: recognised by its content), or a report `.json` (without trace rows).
 pub fn load_path(path: &Path) -> Result<Run> {
     let doc = json_document(path);
     let format = doc.as_ref().map(|(_, f)| f.clone());
@@ -621,12 +731,12 @@ pub(crate) mod tests {
     fn the_format_is_read_from_the_start_of_a_document() {
         let f = |s: &str| format_in_prefix(s.as_bytes());
         assert_eq!(
-            f(r#"{"format":"oprobe.trace/6","x":1}"#).as_deref(),
-            Some("oprobe.trace/6")
+            f(r#"{"format":"oprobe.trace/9","x":1}"#).as_deref(),
+            Some("oprobe.trace/9")
         );
         assert_eq!(
-            f("{ \"format\" : \"oprobe.report/6\" }").as_deref(),
-            Some("oprobe.report/6")
+            f("{ \"format\" : \"oprobe.report/7\" }").as_deref(),
+            Some("oprobe.report/7")
         );
         assert_eq!(f(r#"{"x":1}"#), None);
         assert_eq!(f(r#"{"format":"oprobe.tr"#), None);
@@ -701,7 +811,8 @@ pub(crate) mod tests {
                 t_us: o.t_us,
                 op_id: o.op_id,
                 attempt: 1,
-                api: "HeadObject".into(),
+                api: crate::trace::Api::HeadObject,
+                service_op: None,
                 method: "HEAD".into(),
                 status: 200,
                 protocol: WireProtocol::H1,

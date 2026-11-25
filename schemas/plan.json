@@ -160,7 +160,7 @@
       "type": "object"
     }
   },
-  "$id": "https://github.com/hxddh/oprobe/schemas/6/plan.json",
+  "$id": "https://github.com/hxddh/oprobe/schemas/9/plan.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "The result of `oprobe run --dry-run -o json`: the plan of every operator, nothing sent",
   "properties": {

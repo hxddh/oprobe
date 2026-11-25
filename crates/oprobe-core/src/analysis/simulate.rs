@@ -135,7 +135,7 @@ pub struct TailCutReplay {
 /// re-issued after the retry backoff; the re-issue takes a time drawn from the requests that
 /// finished within the deadline. Each operation saves the largest saving of its cut requests
 /// (conservative when an operation's requests overlap).
-pub fn tail_cut(run: &Run, api: &str, setup: &TailCutSetup) -> Option<TailCutReplay> {
+pub fn tail_cut(run: &Run, api: crate::trace::Api, setup: &TailCutSetup) -> Option<TailCutReplay> {
     let rows: Vec<&ReqRow> = run.reqs.iter().filter(|r| r.api == api).collect();
     let mut ok: Vec<u64> = rows
         .iter()
@@ -207,11 +207,12 @@ pub fn tail_cut(run: &Run, api: &str, setup: &TailCutSetup) -> Option<TailCutRep
             .saturating_sub(saving.get(&o.op_id).copied().unwrap_or(0))
     }));
     let d_ms = deadline_us.map_or(0, |d| d / 1000);
+    let api_label = api.label();
     Some(TailCutReplay {
         prediction: Prediction {
             kind: "tail_cut".into(),
             setting: format!("tail_cut (deadline {d_ms} ms)"),
-            metric: format!("p99_ms of operations issuing {api}"),
+            metric: format!("p99_ms of operations issuing {api_label}"),
             current: before,
             predicted: after,
             predicted_lo: after,
@@ -219,7 +220,7 @@ pub fn tail_cut(run: &Run, api: &str, setup: &TailCutSetup) -> Option<TailCutRep
             requests_per_1k_ops_delta: cut as f64 * 1000.0 / affected.len() as f64,
             replayed_ops_count: affected.len() as u64,
             note: format!(
-                "estimate: replayed {} operations through TailCutLayer's rule (p{} of recent {api} latencies × {}, at least {} ms); a cut request is re-issued after the retry backoff and takes a time drawn from the requests that finished in time",
+                "estimate: replayed {} operations through TailCutLayer's rule (p{} of recent {api_label} latencies × {}, at least {} ms); a cut request is re-issued after the retry backoff and takes a time drawn from the requests that finished in time",
                 affected.len(),
                 setup.params.percentile,
                 setup.params.safety_factor,
@@ -322,6 +323,7 @@ pub(crate) mod tests {
             },
             requests: 1,
             await_tree: None,
+            weight: 1.0,
         }
     }
 
@@ -355,7 +357,7 @@ pub(crate) mod tests {
         let run = straggler_run();
         let setup = TailCutSetup::of(&run.report).unwrap();
         // A long-lived client: 2.5 % stragglers, the deadline sits at the 50 ms floor.
-        let t = tail_cut(&run, "GetObject", &setup.steady()).unwrap();
+        let t = tail_cut(&run, crate::trace::Api::GetObject, &setup.steady()).unwrap();
         assert_eq!(t.deadline_us, Some(50_000));
         let p = &t.prediction;
         assert!(p.current > 800.0, "{p:?}");
@@ -365,7 +367,7 @@ pub(crate) mod tests {
         assert!((20.0..30.0).contains(&p.requests_per_1k_ops_delta), "{p:?}");
         assert_eq!(t.blind_count, 0);
         // The first 10 s of a fresh client (this run is 5 s long, no warmup): nothing is cut.
-        let blind = tail_cut(&run, "GetObject", &setup).unwrap();
+        let blind = tail_cut(&run, crate::trace::Api::GetObject, &setup).unwrap();
         assert_eq!(blind.cut_count, 0);
         assert!(blind.blind_count >= 20, "{blind:?}");
         assert_eq!(blind.prediction.predicted, blind.prediction.current);
@@ -386,7 +388,7 @@ pub(crate) mod tests {
             }
         }
         let setup = TailCutSetup::of(&run.report).unwrap().steady();
-        let t = tail_cut(&run, "GetObject", &setup).unwrap();
+        let t = tail_cut(&run, crate::trace::Api::GetObject, &setup).unwrap();
         assert!(t.deadline_us.unwrap() > 840_000, "{t:?}");
         assert!(t.cut_count < 10, "{t:?}");
     }

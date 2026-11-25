@@ -30,18 +30,22 @@ fn platform_bar_h() -> f32 {
     }
 }
 
-pub fn shell() -> impl IntoElement {
-    let s = store();
-    let term = kit::in_terminal();
-    if !term {
+/// Install window- and app-level effects once per session (outside the language `dynamic`).
+pub fn install_app_effects(s: Store) {
+    if !kit::in_terminal() {
         menus::install(s);
         dock_progress(s);
         guard_quit(s);
         keep_placement();
         s.follow_open_files();
+        s.follow_second_instance();
     } else {
         install_terminal_keys(s);
     }
+}
+
+pub fn shell() -> impl IntoElement {
+    let s = store();
     view()
         .flex_1()
         .min_h(px(0.0))
@@ -258,6 +262,16 @@ fn job_status(s: Store) -> impl IntoElement {
                 (None, Some(st)) => (trf("operator.trials", &[&st.trials.len()]), None),
                 _ => return None,
             };
+            if kit::in_terminal() {
+                return Some(
+                    view()
+                        .flex_row()
+                        .items_center()
+                        .w(px(96.0))
+                        .test_id("job-status")
+                        .child(small(what).tabular_nums().number_of_lines(1)),
+                );
+            }
             Some(
                 view()
                     .gap(px(3.0))
@@ -423,9 +437,13 @@ pub fn setup_window() {
     main_window().set(attrs);
 }
 
-/// On a terminal there is no menu bar: the shortcuts are the app's own keys.
+/// On a terminal there is no OS menu bar: bind the full application shortcut set directly.
 fn install_terminal_keys(s: Store) {
     let opts = KeyOptions::default();
+    let not_editing = KeyOptions {
+        when: nsh_core::keymap::When::NotEditing,
+        ..Default::default()
+    };
     let free = move || !s.modal();
     on_key_with("ctrl+n", opts, move |_| {
         if free() {
@@ -435,6 +453,32 @@ fn install_terminal_keys(s: Store) {
     on_key_with("ctrl+r", opts, move |_| {
         if free() {
             s.run_again()
+        }
+    });
+    on_key_with("ctrl+.", opts, move |_| {
+        s.stop_run();
+        s.stop_prove();
+    });
+    on_key_with("ctrl+shift+s", opts, move |_| {
+        if free() {
+            s.sidebar.update(|v| *v = !*v)
+        }
+    });
+    on_key_with("ctrl+shift+p", opts, move |_| {
+        if free()
+            && s.selection.with_untracked(|v| v.len() == 1)
+            && s.current.with_untracked(|c| c.is_some())
+        {
+            s.page.set(Page::Operator);
+            s.start_prove();
+        }
+    });
+    on_key_with("ctrl+shift+c", not_editing, move |_| {
+        if free() {
+            let ids = s.selection.get_untracked();
+            if !ids.is_empty() {
+                s.copy(ids.join(" "));
+            }
         }
     });
     on_key_with("ctrl+1", opts, move |_| s.page.set(Page::Profile));

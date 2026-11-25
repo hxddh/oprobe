@@ -6,6 +6,7 @@
 
 use std::cell::Cell;
 use std::fmt::Display;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 /// A language of the app.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -36,17 +37,38 @@ impl Lang {
     }
 }
 
+static GLOBAL: AtomicU8 = AtomicU8::new(0);
+
 thread_local! {
-    static CURRENT: Cell<Lang> = const { Cell::new(Lang::En) };
+    static OVERRIDE: Cell<Option<Lang>> = const { Cell::new(None) };
 }
 
-/// Make `l` the language [`tr`] answers in (the root re-draws the app after it).
+/// Set the process-wide UI language so off-thread workers (`jobs::off_thread`, `plan_view`)
+/// format strings in the user's selected language.
+pub fn set_global(l: Lang) {
+    GLOBAL.store(
+        match l {
+            Lang::En => 0,
+            Lang::Zh => 1,
+        },
+        Ordering::Relaxed,
+    );
+    OVERRIDE.with(|c| c.set(None));
+}
+
+/// Override [`tr`] on the calling thread (used by parallel unit tests and local scopes).
 pub fn set(l: Lang) {
-    CURRENT.with(|c| c.set(l));
+    OVERRIDE.with(|c| c.set(Some(l)));
 }
 
 pub fn current() -> Lang {
-    CURRENT.with(|c| c.get())
+    OVERRIDE.with(|c| {
+        c.get()
+            .unwrap_or_else(|| match GLOBAL.load(Ordering::Relaxed) {
+                1 => Lang::Zh,
+                _ => Lang::En,
+            })
+    })
 }
 
 /// The system's language: the platform's preferred languages and locale, else the locale
@@ -192,6 +214,7 @@ static EN: &[(&str, &str)] = &[
     ("ev.accepted_requests_per_s", "Accepted while throttled"),
     ("ev.monthly_usd", "Projected monthly bill"),
     ("ev.server_errors_count", "Server errors"),
+    ("ev.network_errors_count", "Network errors"),
     ("ev.failed_ops_count", "Failed operations"),
     ("ev.hung_requests_count", "Hung requests"),
     ("ev.timeouts_count", "Timeouts"),
@@ -342,6 +365,11 @@ static EN: &[(&str, &str)] = &[
     ("runs.preset", "Workload"),
     ("runs.duration", "Duration"),
     ("runs.concurrency", "Concurrency"),
+    ("runs.existing", "Existing prefix"),
+    (
+        "runs.existing_hint",
+        "optional read-only prefix (nothing written or deleted)",
+    ),
     (
         "runs.several",
         "Several operators separated by spaces run one after another on the same workload and open side by side in Compare.",
@@ -486,13 +514,15 @@ static EN: &[(&str, &str)] = &[
     ("plot.cpu_cores", "client CPU (cores)"),
     ("plot.failed_ops", "failed operations"),
     ("profile.await_tree", "Async call stack while in flight"),
-    ("sig.stream_wait", "h2 stream wait"),
-    ("sig.flow_stall", "h2 flow-control stall"),
     ("sig.streams", "h2 streams open"),
     ("sig.upload_acked", "upload acknowledged at"),
     ("sig.send_buffered", "sent to the kernel at"),
     ("sig.cache_status", "CDN cache"),
     ("sig.region", "region"),
+    ("sig.request_id", "request id"),
+    ("sig.error", "error"),
+    ("sig_val.hedged", "hedged"),
+    ("sig_val.incomplete", "incomplete"),
     // Operator
     ("operator.none", "No operator yet"),
     (
@@ -521,6 +551,8 @@ static EN: &[(&str, &str)] = &[
     ("operator.diff", "The change as Rust and as op.toml"),
     ("operator.copy_rust", "Copy Rust"),
     ("operator.copy_toml", "Copy TOML"),
+    ("operator.save_toml", "Save to op.toml"),
+    ("operator.saved_toml", "Saved to {}."),
     ("operator.reset", "Reset"),
     ("operator.prove", "Prove"),
     (
@@ -754,6 +786,25 @@ static EN: &[(&str, &str)] = &[
     ("sig.min_rtt", "min rtt"),
     ("sig.retransmits", "retransmits"),
     ("sig.server_timing", "Server-Timing"),
+    ("sig.tail_cut", "tail-cut"),
+    ("sig.aborted", "body"),
+    ("sig.cdn_pop", "edge PoP"),
+    ("sig.age", "cache age"),
+    ("sig.storage_class", "storage class"),
+    ("sig.encryption", "encryption"),
+    ("retry.tail_cuts", "Tail-cut hedged attempts"),
+    ("write.skew", "part straggler {}×"),
+    ("write.complete", "complete p99 {}"),
+    ("list.path", "Lists"),
+    (
+        "list.summary",
+        "{} pages across {} list ops ({} pages/op) · p50/p99 {} / {}",
+    ),
+    ("cache.title", "Client cache"),
+    ("cache.summary", "{} hit ({} of {} lookups, mean {})"),
+    ("operator.save_as_toml", "Save as op.toml…"),
+    ("operator.compare_trials", "Compare A/B trials"),
+    ("operator.stored_proves", "Stored proves · {}"),
 ];
 
 static ZH: &[(&str, &str)] = &[
@@ -835,6 +886,7 @@ static ZH: &[(&str, &str)] = &[
     ("ev.accepted_requests_per_s", "限流期间被接受的请求"),
     ("ev.monthly_usd", "预计月度账单"),
     ("ev.server_errors_count", "服务端错误"),
+    ("ev.network_errors_count", "网络错误"),
     ("ev.failed_ops_count", "失败操作"),
     ("ev.hung_requests_count", "挂起的请求"),
     ("ev.timeouts_count", "超时"),
@@ -975,6 +1027,11 @@ static ZH: &[(&str, &str)] = &[
     ("runs.preset", "负载"),
     ("runs.duration", "时长"),
     ("runs.concurrency", "并发"),
+    ("runs.existing", "已有前缀"),
+    (
+        "runs.existing_hint",
+        "可选：只读压测已有数据前缀（不写入、不删除）",
+    ),
     (
         "runs.several",
         "以空格分隔多个 operator，它们会在同一负载上依次运行，并在“对比”中并排打开。",
@@ -1096,13 +1153,15 @@ static ZH: &[(&str, &str)] = &[
     ("plot.cpu_cores", "客户端 CPU（核）"),
     ("plot.failed_ops", "失败的操作"),
     ("profile.await_tree", "在途时的异步调用栈"),
-    ("sig.stream_wait", "h2 等待流"),
-    ("sig.flow_stall", "h2 流控停顿"),
     ("sig.streams", "h2 打开的流"),
     ("sig.upload_acked", "上传被确认于"),
     ("sig.send_buffered", "交给内核于"),
     ("sig.cache_status", "CDN 缓存"),
     ("sig.region", "区域"),
+    ("sig.request_id", "请求 ID"),
+    ("sig.error", "错误"),
+    ("sig_val.hedged", "对冲取消"),
+    ("sig_val.incomplete", "未读完"),
     ("operator.none", "还没有 operator"),
     (
         "operator.none_hint",
@@ -1127,6 +1186,8 @@ static ZH: &[(&str, &str)] = &[
     ("operator.diff", "改动的 Rust 与 op.toml 形式"),
     ("operator.copy_rust", "复制 Rust"),
     ("operator.copy_toml", "复制 TOML"),
+    ("operator.save_toml", "写入 op.toml"),
+    ("operator.saved_toml", "已写入 {}。"),
     ("operator.reset", "重置"),
     ("operator.prove", "证明"),
     (
@@ -1331,6 +1392,25 @@ static ZH: &[(&str, &str)] = &[
     ("sig.min_rtt", "最小 rtt"),
     ("sig.retransmits", "重传"),
     ("sig.server_timing", "Server-Timing"),
+    ("sig.tail_cut", "尾部裁剪"),
+    ("sig.aborted", "响应体"),
+    ("sig.cdn_pop", "边缘节点"),
+    ("sig.age", "缓存年龄"),
+    ("sig.storage_class", "存储类型"),
+    ("sig.encryption", "服务端加密"),
+    ("retry.tail_cuts", "Tail-cut 对冲尝试"),
+    ("write.skew", "分片长尾 {}×"),
+    ("write.complete", "合并完成 p99 {}"),
+    ("list.path", "列举"),
+    (
+        "list.summary",
+        "{} 页 / {} 次列举（{} 页/操作）· p50/p99 {} / {}",
+    ),
+    ("cache.title", "客户端缓存"),
+    ("cache.summary", "命中 {}（{}/{} 次查找，均值 {}）"),
+    ("operator.save_as_toml", "另存为 op.toml…"),
+    ("operator.compare_trials", "对比 A/B 试验"),
+    ("operator.stored_proves", "已保存的证明 · {}"),
 ];
 
 #[cfg(test)]

@@ -184,7 +184,7 @@ fn bytes(p: &[Param], method: &str) -> u64 {
 }
 
 /// `TailCutLayer` from its applied parameters.
-fn tail_cut_layer(params: &[Param]) -> TailCutLayer {
+pub fn tail_cut_layer(params: &[Param]) -> TailCutLayer {
     let mut b = TailCutLayer::builder();
     for p in params {
         b = match (p.method, p.value) {
@@ -232,10 +232,28 @@ fn timeout_layer(params: &[Param]) -> TimeoutLayer {
 
 /// Wrap `op` (the service, already traced) in the spec's layers. Retries are reported to the
 /// operation's [`OpScope`] (backoff, throttling) when `observe` is set.
-pub async fn apply_layers(
+pub async fn apply_layers(op: Operator, spec: &OperatorSpec, observe: bool) -> Result<Operator> {
+    apply_layers_with_tail_cut(op, spec, observe, None).await
+}
+
+/// [`apply_layers`], reusing an already-warmed [`TailCutLayer`] when given.
+pub async fn apply_layers_with_tail_cut(
+    op: Operator,
+    spec: &OperatorSpec,
+    observe: bool,
+    shared_tail_cut: Option<TailCutLayer>,
+) -> Result<Operator> {
+    apply_layers_with_recorder(op, spec, observe, shared_tail_cut, None).await
+}
+
+/// [`apply_layers_with_tail_cut`], also observing in-memory cache lookups into `recorder`
+/// when `layers.cache` is enabled.
+pub async fn apply_layers_with_recorder(
     mut op: Operator,
     spec: &OperatorSpec,
     observe: bool,
+    shared_tail_cut: Option<TailCutLayer>,
+    recorder: Option<std::sync::Arc<crate::trace::Recorder>>,
 ) -> Result<Operator> {
     let params = |name| layer_params(spec, name);
     if let Some(p) = params("throttle") {
@@ -246,27 +264,35 @@ pub async fn apply_layers(
     }
     if let Some(p) = params("concurrent_limit") {
         let mut layer = ConcurrentLimitLayer::new(count(&p, "permits").unwrap_or(1));
-        if let Some(h) = count(&p, "with_http_concurrent_limit") {
+        let has_http = count(&p, "with_http_concurrent_limit");
+        if let Some(h) = has_http {
             layer = layer.with_http_concurrent_limit(h);
         }
         op = op.layer(layer);
+        if observe && has_http.is_some() {
+            op = op.layer(oprobe_trace::QueueStampLayer);
+        }
     }
     if let Some(p) = params("timeout") {
         op = op.layer(timeout_layer(&p));
     }
     if let Some(p) = params("tail_cut") {
-        op = op.layer(tail_cut_layer(&p));
+        op = op.layer(shared_tail_cut.unwrap_or_else(|| tail_cut_layer(&p)));
     }
     if let Some(p) = params("retry") {
         let layer = retry_layer(&p);
         op = if observe {
             op.layer(layer.with_notify(|ev: opendal::layers::RetryEvent<'_>| {
                 if let Some(s) = OpScope::current() {
+                    let msg = ev.err.message();
+                    let cut = matches!(msg, "cancelled by tail cut" | "io cancelled by tail cut")
+                        || msg.contains("tail cut");
                     // 429/503 responses mark the scope throttled when they are recorded
                     // (`OpScope::push_request`); OpenDAL's kind covers the rest.
-                    s.record_retry(
+                    s.record_retry_with_cut(
                         ev.retry_after,
                         ev.err.kind() == opendal::ErrorKind::RateLimited,
+                        cut,
                     );
                 }
             }))
@@ -282,6 +308,9 @@ pub async fn apply_layers(
             .await
             .context("cannot build the in-memory foyer cache")?;
         op = op.layer(FoyerLayer::new(cache));
+        if observe && let Some(rec) = recorder {
+            op = op.layer(crate::trace::CacheObserveLayer::new(rec));
+        }
     }
     Ok(op)
 }

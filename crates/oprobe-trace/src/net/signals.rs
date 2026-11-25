@@ -30,6 +30,29 @@ pub fn from_headers(h: &http::HeaderMap, status: u16) -> ReqDetail {
         region: header(h, "x-amz-bucket-region").map(|v| capped(v, 64)),
         server_timing: header(h, "server-timing").map(|v| capped(v, SERVER_TIMING_CAP)),
         cache_status: cache_status(h),
+        cdn_pop: cdn_pop(h),
+        age_s: header(h, "age").and_then(|v| v.parse::<u64>().ok()),
+        storage_class: [
+            "x-amz-storage-class",
+            "x-goog-storage-class",
+            "x-oss-storage-class",
+            "x-cos-storage-class",
+            "x-ms-access-tier",
+        ]
+        .iter()
+        .find_map(|n| header(h, n))
+        .filter(|v| !v.is_empty())
+        .map(|v| capped(v, 48)),
+        encryption: [
+            "x-amz-server-side-encryption",
+            "x-goog-encryption-algorithm",
+            "x-oss-server-side-encryption",
+            "x-cos-server-side-encryption",
+        ]
+        .iter()
+        .find_map(|n| header(h, n))
+        .filter(|v| !v.is_empty())
+        .map(|v| capped(v, 48)),
         ..Default::default()
     };
     if status >= 400 {
@@ -45,6 +68,37 @@ pub fn from_headers(h: &http::HeaderMap, status: u16) -> ReqDetail {
         .map(|v| capped(v, 64));
     }
     d
+}
+
+/// Retry-After in milliseconds from standard `Retry-After` (seconds or HTTP-date) or
+/// millisecond headers (`x-ms-retry-after-ms`, `retry-after-ms`).
+pub fn retry_after_ms(h: &http::HeaderMap) -> Option<u64> {
+    for name in ["x-ms-retry-after-ms", "retry-after-ms"] {
+        if let Some(ms) = header(h, name).and_then(|v| v.parse::<u64>().ok()) {
+            return Some(ms);
+        }
+    }
+    header(h, "retry-after").and_then(super::parse_retry_after)
+}
+
+fn cdn_pop(h: &http::HeaderMap) -> Option<String> {
+    if let Some(v) = header(h, "x-amz-cf-pop").filter(|v| !v.is_empty()) {
+        return Some(capped(v, 32));
+    }
+    if let Some(ray) = header(h, "cf-ray")
+        && let Some((_, pop)) = ray.rsplit_once('-')
+        && !pop.is_empty()
+    {
+        return Some(capped(pop, 16));
+    }
+    if let Some(v) = header(h, "x-served-by").filter(|v| !v.is_empty()) {
+        let last = v.split(',').next_back().unwrap_or(v).trim();
+        let pop = last.strip_prefix("cache-").unwrap_or(last);
+        if !pop.is_empty() {
+            return Some(capped(pop, 32));
+        }
+    }
+    None
 }
 
 /// `hit`, `miss`, `expired`, … from the usual CDN headers.

@@ -63,11 +63,13 @@ pub fn run_gui() -> std::process::ExitCode {
     // macOS declares them in the bundle's Info.plist.
     #[cfg(not(target_os = "macos"))]
     {
-        options.file_types = nsh_core::file_type::file_types_from_json(&serde_json::json!([{
-            "name": "oprobe run",
-            "extensions": ["oprobe"],
-            "mimeTypes": ["application/x-oprobe-run"],
-        }]));
+        options.file_types = nsh_core::file_type::file_types_from_json(&serde_json::json!([
+            {
+                "name": "oprobe run",
+                "extensions": ["oprobe", "json"],
+                "mimeTypes": ["application/x-oprobe-run", "application/json"],
+            }
+        ]));
     }
     // `run_app` returns `ExitCode` on macOS / Windows and `glib::ExitCode` on Linux.
     #[cfg_attr(not(target_os = "linux"), allow(clippy::useless_conversion))]
@@ -139,9 +141,20 @@ pub fn App() -> impl IntoElement {
         Ok(tokens) => set_tokens(tokens),
         Err(e) => eprintln!("oprobe: theme.json: {e}"),
     }
+    if !kit::in_terminal() {
+        let mut look = nsh_base::ScrollbarLook::default();
+        look.thumb_class =
+            Some("rounded-full bg-muted-foreground/35 hover:bg-muted-foreground/55".into());
+        let mut sb = nsh_base::ScrollbarTheme::default();
+        sb.vertical = Some(look.clone());
+        sb.horizontal = Some(look);
+        nsh_base::set_scrollbar_theme(Some(sb));
+    }
     let s = store::Store::new();
     provide_context(s);
+    i18n::set_global(s.lang.get_untracked());
     views::shell::setup_window();
+    views::shell::install_app_effects(s);
     nsh_core::element::desktop::on_app_quit(move || {
         store::finish_jobs();
         async {}
@@ -160,7 +173,7 @@ pub fn App() -> impl IntoElement {
         })
         .text_color(move || theme().foreground)
         .child(dynamic(move || {
-            i18n::set(s.lang.get());
+            i18n::set_global(s.lang.get());
             untracked(|| views::shell::shell().into_element())
         }))
 }

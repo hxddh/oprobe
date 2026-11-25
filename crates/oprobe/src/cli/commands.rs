@@ -94,9 +94,30 @@ pub fn show(a: ShowArgs, ctx: &Ctx) -> Result<u8> {
         })
     };
     let (since, until) = (secs(&a.since)?, secs(&a.until)?);
-    let r = RunRef(a.run.unwrap_or_else(|| "last".into()));
+    if a.runs.len() >= 2 {
+        if by.is_some() || since.is_some() || until.is_some() {
+            return Err(crate::errors::OprobeError::new(
+                crate::errors::ErrorCode::UsageInvalidArgument,
+                "--by and --since/--until apply to a single run, not a comparison",
+            )
+            .with_hint("inspect one run at a time, e.g. `oprobe show RUN --by stage`")
+            .into());
+        }
+        let refs: Vec<RunRef> = a.runs.into_iter().map(RunRef).collect();
+        let cmp = app.compare(&refs, a.detail)?;
+        return ctx.out.finish(&cmp);
+    }
+    let r = RunRef(a.runs.into_iter().next().unwrap_or_else(|| "last".into()));
     // A prove id (`show --list` lists them): its stored result, as `prove` printed it.
     if let Some(p) = app.show_prove(&r)? {
+        if by.is_some() || since.is_some() || until.is_some() || a.detail {
+            return Err(crate::errors::OprobeError::new(
+                crate::errors::ErrorCode::UsageInvalidArgument,
+                "--by, --since/--until and --detail apply to a run, not a prove result",
+            )
+            .with_hint("inspect one of the prove's trial runs with `oprobe show --list --all`")
+            .into());
+        }
         return ctx.out.finish(&p);
     }
     let p = app
@@ -127,6 +148,8 @@ pub async fn prove(a: ProveArgs, ctx: &Ctx) -> Result<u8> {
         budget: a.safety.wall_budget(),
         trial_duration: a.trial,
         pairs: a.pairs.unwrap_or(crate::config::prove_defaults::MAX_PAIRS),
+        save: a.save,
+        no_save: false,
         safety: i::Safety {
             dry_run: a.safety.dry_run,
             read_only: a.safety.read_only,
@@ -149,6 +172,8 @@ pub async fn lab(a: LabArgs, ctx: &Ctx) -> Result<u8> {
         .lab(i::LabRequest {
             bind: a.bind,
             scenario: a.scenario,
+            allow_remote: a.allow_remote,
+            max_store_size: a.max_store_size,
             ..Default::default()
         })
         .await?;

@@ -45,16 +45,63 @@ pub struct Trial {
 /// The verdict of a Prove with its evidence and the proven diff.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Proved {
+    pub prove_id: String,
+    pub run_id: String,
+    pub objective: crate::app::ProveObjective,
     pub verdict: crate::app::ProveVerdict,
     pub delta: (f64, f64, f64),
     pub significant: bool,
     pub pairs: u64,
     /// The objective of each A/B pair, `(baseline, candidate, fewest operations)`, in order.
     pub ab: Vec<(f64, f64, u64)>,
+    /// Last completed A/B pair's stored `(baseline_run_id, candidate_run_id)`, for Compare.
+    pub trial_ids: Option<(String, String)>,
     /// The other metrics (shown, never decisive).
     pub secondary: Vec<Secondary>,
+    /// The proven change as `PATH=VALUE` pairs (sized values included).
+    pub change: Vec<String>,
     pub rust: String,
     pub toml: String,
+}
+
+impl Proved {
+    /// Convert a [`crate::app::ProveOutput`] (live or loaded from `<id>.prove.json`) into the
+    /// UI's [`Proved`] summary.
+    pub fn from_output(p: crate::app::ProveOutput) -> Self {
+        use crate::app::prove::TrialKind;
+        let p99 = p.objective == crate::app::ProveObjective::P99;
+        let trial_ids = (0..p.pairs_count).rev().find_map(|pair| {
+            let a = p
+                .trials
+                .iter()
+                .find(|t| t.kind == TrialKind::Baseline && t.pair == Some(pair))?;
+            let b = p
+                .trials
+                .iter()
+                .find(|t| t.kind == TrialKind::Candidate && t.pair == Some(pair))?;
+            (!a.run_id.is_empty() && !b.run_id.is_empty())
+                .then(|| (a.run_id.clone(), b.run_id.clone()))
+        });
+        Self {
+            prove_id: p.prove_id,
+            run_id: p.run_id,
+            objective: p.objective,
+            verdict: p.verdict,
+            delta: (
+                p.objective_delta.estimate,
+                p.objective_delta.low,
+                p.objective_delta.high,
+            ),
+            significant: p.objective_delta.low > 0.0 || p.objective_delta.high < 0.0,
+            pairs: p.pairs_count,
+            ab: ab_pairs(&p.trials, p99),
+            trial_ids,
+            secondary: p.secondary.iter().map(Secondary::of).collect(),
+            change: p.change,
+            rust: p.diff.rust,
+            toml: p.diff.toml,
+        }
+    }
 }
 
 /// A secondary metric of a Prove: a relative change, or for a share (`throttled`, `errors`) a
@@ -168,7 +215,7 @@ impl Job {
         self.peek().outcome.is_some()
     }
 
-    fn start(total_s: f64, p99_objective: bool, base: Option<OperatorSpec>) -> (Self, EventSink) {
+    fn start(total_s: f64, is_prove: bool) -> (Self, EventSink) {
         let state = Arc::new(Mutex::new(State {
             total_s,
             ..Default::default()
@@ -181,7 +228,10 @@ impl Job {
                 Live::Progress(Progress::Snapshot(snap)) => {
                     s.phase = Some(snap.phase);
                     s.cleaning = false;
-                    if snap.phase == Phase::Measure {
+                    // Prove streams discrete completed A/B trials via `EventKind::Trial`;
+                    // skipping 100 ms snapshot churn avoids re-rendering the convergence plot
+                    // ten times per second while a trial is measuring.
+                    if !is_prove && snap.phase == Phase::Measure {
                         s.elapsed_s = snap.elapsed_s;
                         s.ops_per_s = snap.summary.ops_per_s;
                         s.p99_ms = snap.summary.latency.p99;
@@ -200,21 +250,8 @@ impl Job {
                 }
                 Live::Progress(Progress::Message(_)) => {}
                 Live::CleaningUp => s.cleaning = true,
-                Live::Finished { run, .. } => {
+                Live::Finished { .. } => {
                     s.done_count += 1;
-                    if let Some(base) = &base {
-                        let r = &run.report;
-                        let value = if p99_objective {
-                            r.summary.latency.p99
-                        } else {
-                            r.summary.ops_per_s
-                        };
-                        s.trials.push(Trial {
-                            candidate: r.spec.profile.operator != *base,
-                            value,
-                            ops: r.summary.ops,
-                        });
-                    }
                     s.spark.clear();
                 }
             }
@@ -228,12 +265,17 @@ impl Job {
         )
     }
 
-    fn finish(state: &Arc<Mutex<State>>, cancel: &Cancel, res: anyhow::Result<Outcome>) {
+    fn finish(
+        state: &Arc<Mutex<State>>,
+        cancel: &Cancel,
+        scheme: &str,
+        res: anyhow::Result<Outcome>,
+    ) {
         let outcome = match res {
             Ok(o) => o,
             Err(_) if cancel.is_cancelled() => Outcome::Stopped,
             Err(e) => {
-                let body = crate::errors::classify(&e, "s3");
+                let body = crate::errors::classify(&e, scheme);
                 Outcome::Failed {
                     message: body.message,
                     hint: body.hint,
@@ -247,6 +289,23 @@ impl Job {
 
     /// `App::run`: measure the operators of `req` one after another.
     pub fn run(app: App, req: RunRequest) -> Self {
+        let scheme = req
+            .operators
+            .first()
+            .and_then(|op| {
+                if let Ok(cfg) = app.config()
+                    && let Ok((spec, _)) = crate::operator::resolve::resolve(op, &cfg)
+                {
+                    crate::config::TargetSpec::from_url(&spec.url)
+                        .ok()
+                        .map(|t| t.scheme)
+                } else {
+                    crate::config::TargetSpec::from_url(op)
+                        .ok()
+                        .map(|t| t.scheme)
+                }
+            })
+            .unwrap_or_else(|| "s3".into());
         let total = req
             .workload
             .duration
@@ -254,7 +313,7 @@ impl Job {
             .and_then(|d| crate::util::parse_duration(d).ok())
             .unwrap_or(Duration::from_secs(10))
             .as_secs_f64();
-        let (job, sink) = Self::start(total, false, None);
+        let (job, sink) = Self::start(total, false);
         let (state, cancel) = (job.state.clone(), job.cancel.clone());
         runtime().spawn(async move {
             let res = app
@@ -271,7 +330,7 @@ impl Job {
                     },
                     RunOutcome::Plan(_) => Ok(Outcome::Ran(Vec::new())),
                 });
-            Self::finish(&state, &cancel, res);
+            Self::finish(&state, &cancel, &scheme, res);
         });
         job
     }
@@ -279,27 +338,42 @@ impl Job {
     /// `App::prove`: A/B-test a change of `base` (the run's operator).
     pub fn prove(app: App, req: ProveRequest, base: OperatorSpec) -> Self {
         let p99 = req.objective == crate::app::ProveObjective::P99;
-        let (job, sink) = Self::start(0.0, p99, Some(base));
+        let scheme = crate::config::TargetSpec::from_url(&base.url)
+            .ok()
+            .map(|t| t.scheme)
+            .unwrap_or_else(|| "s3".into());
+        let (job, sink) = Self::start(0.0, true);
+        let st_trials = job.state.clone();
+        sink.bus()
+            .subscribe(Arc::new(move |e: &crate::events::Event| {
+                use crate::app::prove::TrialKind;
+                if let crate::events::EventKind::Trial { trial } = &e.kind {
+                    let candidate = match trial.kind {
+                        TrialKind::Baseline => false,
+                        TrialKind::Candidate => true,
+                        // Sizing sweeps are never A/B pairs.
+                        TrialKind::Sizing => return,
+                    };
+                    let value = if p99 {
+                        trial.p99_ms
+                    } else {
+                        trial.goodput_ops_per_s
+                    };
+                    let mut s = st_trials.lock().unwrap_or_else(|e| e.into_inner());
+                    s.trials.push(Trial {
+                        candidate,
+                        value,
+                        ops: trial.ops_count,
+                    });
+                }
+            }));
         let (state, cancel) = (job.state.clone(), job.cancel.clone());
         runtime().spawn(async move {
             let res = app.prove(req, sink, cancel.clone()).await.map(|o| match o {
-                ProveOutcome::Proved(p) => Outcome::Proved(Box::new(Proved {
-                    verdict: p.verdict,
-                    delta: (
-                        p.objective_delta.estimate,
-                        p.objective_delta.low,
-                        p.objective_delta.high,
-                    ),
-                    significant: p.objective_delta.low > 0.0 || p.objective_delta.high < 0.0,
-                    pairs: p.pairs_count,
-                    ab: ab_pairs(&p.trials, p99),
-                    secondary: p.secondary.iter().map(Secondary::of).collect(),
-                    rust: p.diff.rust,
-                    toml: p.diff.toml,
-                })),
+                ProveOutcome::Proved(p) => Outcome::Proved(Box::new(Proved::from_output(*p))),
                 ProveOutcome::Plan(_) => Outcome::Stopped,
             });
-            Self::finish(&state, &cancel, res);
+            Self::finish(&state, &cancel, &scheme, res);
         });
         job
     }

@@ -480,7 +480,7 @@ async fn report_roundtrips_through_json() {
     assert_eq!(back, r);
     // Another version's schema is refused, never misread.
     let mut v = serde_json::to_value(&r).unwrap();
-    v["schema"] = "oprobe.report/5".into();
+    v["schema"] = "oprobe.report/6".into();
     std::fs::write(&path, v.to_string()).unwrap();
     assert!(oprobe::report::load_json(&path).is_err());
 }
@@ -833,10 +833,10 @@ async fn cancelled_run_is_marked_interrupted() {
     assert!(snap.elapsed_s < 5.0, "{}", snap.elapsed_s);
     let prof = s.profile.clone();
     let r = build(&prof, snap, c);
-    assert!(r.run.interrupted);
+    assert!(r.is_partial());
     assert_eq!(r.verdict.exit_code, 130);
     let json: serde_json::Value = serde_json::to_value(&r).unwrap();
-    assert_eq!(json["run"]["interrupted"], true);
+    assert!(json["run"].get("interrupted").is_none());
     assert_eq!(json["run"]["partial"]["reason"], "interrupted");
     assert_eq!(
         r.run.partial.as_ref().map(|p| p.reason),

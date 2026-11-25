@@ -289,6 +289,34 @@ fn operator_toggles_a_layer_and_proves_it_against_the_lab() {
 }
 
 #[test]
+fn proven_change_saves_back_to_op_toml() {
+    let cx = Ctx::new();
+    let op_file = cx.dir.path().join("op.toml");
+    std::fs::write(
+        &op_file,
+        "url = \"memory://\"\n[options]\nroot = \"/keep\"\n",
+    )
+    .unwrap();
+    let id = cx.seed(op_file.to_str().unwrap());
+    cx.launch(Some(id));
+    let mut app = cx.start();
+    choose(&mut app, "English");
+    wait_long(&mut app, "id:profile");
+    app.press_key("ctrl+2").unwrap();
+    wait_long(&mut app, "id:operator");
+    app.press("role:switch[layers.retry.jitter]").unwrap();
+    wait_long(&mut app, "text:layers.retry.jitter = on");
+    app.press("id:prove-start").unwrap();
+    wait_long(&mut app, "id:prove-result");
+    wait_long(&mut app, "id:save-operator");
+    app.press("id:save-operator").unwrap();
+    wait_long(&mut app, "text:Saved to op.toml.");
+    let saved = std::fs::read_to_string(&op_file).unwrap();
+    assert!(saved.contains("jitter = true"), "{saved}");
+    assert!(saved.contains("root = \"/keep\""), "{saved}");
+}
+
+#[test]
 fn the_language_choice_persists() {
     let cx = Ctx::new();
     {
@@ -842,4 +870,92 @@ fn the_profile_shows_every_captured_signal_where_it_explains_something() {
     assert!(!has(&app, "id:await-tree-body"));
     app.press(toggle).unwrap();
     wait_long(&mut app, "id:await-tree-body");
+}
+
+#[test]
+fn concurrent_limit_toggle_seeds_default_and_stored_proves_reload_and_compare_trials() {
+    let cx = Ctx::new();
+    let id_a = cx.seed("lab://clean");
+    let id_b = cx.seed("lab://throttle");
+    // Run a short prove on id_a via the service layer so `<prove_id>.prove.json` and trial runs exist.
+    {
+        let svc = App::new(cx.paths());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let req = oprobe::app::ProveRequest {
+            run: id_a.clone(),
+            with: vec!["layers.retry.jitter=on".into()],
+            trial_duration: Some("300ms".into()),
+            budget: Some("1s".into()),
+            ..Default::default()
+        };
+        let _ = rt
+            .block_on(svc.prove(req, EventSink::silent(), Cancel::new()))
+            .unwrap();
+    }
+    cx.launch(Some(id_a.clone()));
+    let mut app = cx.start();
+    choose(&mut app, "English");
+    wait_long(&mut app, "id:profile");
+    app.press_key("ctrl+2").unwrap();
+    wait_long(&mut app, "id:operator");
+    // Stored prove is loaded automatically for id_a!
+    wait_long(&mut app, "id:prove-result");
+    wait_long(&mut app, "id:compare-prove-trials");
+    // Toggling `layers.concurrent_limit` seeds `http = 32` instead of snapping back off.
+    app.press("role:switch[layers.concurrent_limit]").unwrap();
+    wait_long(&mut app, "text:layers.concurrent_limit.http = 32");
+    // Switching to id_b hides id_a's prove; switching back restores id_a's stored prove.
+    app.press(&format!("id:run-{id_b}")).unwrap();
+    app.wait_for_gone("id:prove-result", LONG).unwrap();
+    app.press(&format!("id:run-{id_a}")).unwrap();
+    wait_long(&mut app, "id:prove-result");
+    // Comparing the stored prove's A/B trials opens Compare on those trial runs.
+    app.press("id:compare-prove-trials").unwrap();
+    wait_long(&mut app, "id:compare-table");
+    wait_long(&mut app, "text:2 runs compared");
+}
+
+#[test]
+fn standalone_prove_json_opens_without_origin_run_and_fields_clear_without_snapback() {
+    let cx = Ctx::new();
+    let id = cx.seed("lab://clean");
+    let prove_file = {
+        let svc = App::new(cx.paths());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let req = oprobe::app::ProveRequest {
+            run: id.clone(),
+            with: vec!["layers.retry.jitter=on".into()],
+            trial_duration: Some("300ms".into()),
+            budget: Some("1s".into()),
+            ..Default::default()
+        };
+        let out = match rt
+            .block_on(svc.prove(req, EventSink::silent(), Cancel::new()))
+            .unwrap()
+        {
+            oprobe::app::ProveOutcome::Proved(p) => *p,
+            oprobe::app::ProveOutcome::Plan(_) => unreachable!(),
+        };
+        let external = cx.dir.path().join("shared.prove.json");
+        std::fs::write(&external, serde_json::to_vec_pretty(&out).unwrap()).unwrap();
+        // Delete both the origin run and the stored prove so `shared.prove.json` is truly standalone.
+        svc.rm(&[
+            oprobe::app::RunRef::from(out.prove_id.as_str()),
+            oprobe::app::RunRef::from(id.as_str()),
+        ])
+        .unwrap();
+        external
+    };
+    cx.launch(Some(prove_file.to_string_lossy().into_owned()));
+    let mut app = cx.start();
+    choose(&mut app, "English");
+    wait_long(&mut app, "id:operator");
+    wait_long(&mut app, "id:prove-result");
+    wait_long(&mut app, "text:/Pair 1/");
+    // Typing into a parameter field and clearing it never snaps back to the base value.
+    app.type_text("id:layers.retry.max_times", "7").unwrap();
+    wait_long(&mut app, "text:layers.retry.max_times = 7");
+    app.clear("id:layers.retry.max_times").unwrap();
+    app.wait_for_gone("text:layers.retry.max_times = 7", LONG)
+        .unwrap();
 }

@@ -134,7 +134,7 @@ pub fn remedy(code: &str, variant: Option<&str>) -> Remedy {
         ("small_ranges", _) => r(
             Some("read.gap"),
             &[],
-            "read_with().gap()",
+            "reader_with().gap()",
             true,
             "coalesce nearby small ranges into fewer range requests",
         ),
@@ -788,11 +788,16 @@ fn tail_stragglers(c: &Ctx) -> Option<Finding> {
     // T4: the requests themselves must wait for the first byte; a tail of retry backoff or
     // queueing has no stragglers to cut (the replay below only counts TTFB-bound requests).
     let setup = remedy_setup(c.r);
-    let mut apis: Vec<&str> = run.reqs.iter().map(|q| q.api.as_ref()).collect();
-    apis.sort_unstable();
+    let mut apis: Vec<crate::trace::Api> = run.reqs.iter().map(|q| q.api).collect();
+    apis.sort_by_key(|a| a.label());
     apis.dedup();
     // Every API with stragglers the tail cut would remove (largest gain first).
-    let mut affected: Vec<(f64, String, Vec<&ReqRow>, simulate::TailCutReplay)> = Vec::new();
+    let mut affected: Vec<(
+        f64,
+        crate::trace::Api,
+        Vec<&ReqRow>,
+        simulate::TailCutReplay,
+    )> = Vec::new();
     for api in apis {
         let Some(replay) = simulate::tail_cut(run, api, &setup) else {
             continue;
@@ -814,12 +819,12 @@ fn tail_stragglers(c: &Ctx) -> Option<Finding> {
         if p.current <= 0.0 || gain < p.current / 3.0 {
             continue;
         }
-        affected.push((gain, api.to_owned(), over, replay));
+        affected.push((gain, api, over, replay));
     }
     if affected.is_empty() {
         return None;
     }
-    affected.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+    affected.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.label().cmp(b.1.label())));
     // Per API: (api, stragglers, share %, straggler TTFB p50, typical TTFB p50), weighted.
     let per_api: Vec<(&str, usize, f64, f64, f64)> = affected
         .iter()
@@ -836,7 +841,7 @@ fn tail_stragglers(c: &Ctx) -> Option<Finding> {
             let mut typical: Vec<(u64, f64)> =
                 ok.iter().map(|q| (q.ttfb_us, weight(q.op_id))).collect();
             (
-                api.as_str(),
+                api.label(),
                 over.len(),
                 over_w * 100.0 / all_w.max(1.0),
                 weighted_quantile_us_ms(&mut ttfb, 0.5),
@@ -1012,7 +1017,7 @@ fn small_ranges(c: &Ctx, have_cap: bool) -> Option<Finding> {
     }
     let reads: Vec<&ReqRow> = c
         .reqs()
-        .filter(|q| q.api == "GetObject" && !q.is_error())
+        .filter(|q| q.api == crate::trace::Api::GetObject && !q.is_error())
         .collect();
     if reads.len() < 5 {
         return None;
@@ -1036,7 +1041,41 @@ fn small_ranges(c: &Ctx, have_cap: bool) -> Option<Finding> {
     let ttfb: f64 = reads.iter().map(|q| (q.send_us + q.ttfb_us) as f64).sum();
     let body: f64 = reads.iter().map(|q| q.body_us as f64).sum();
     let gap_set = c.spec().read.gap.is_some();
+    let small_gap = c.spec().read.gap.is_some_and(|g| g.0 < 256 * 1024);
     let concurrent = c.spec().read_concurrent();
+    // Many tiny uncoalesced ranges per operation (or already concurrent small ranges without
+    // coalescing), waiting for the first byte: coalesce adjacent ranges first so `read.gap`
+    // is not shadowed by `read.concurrent = 1`.
+    let coalesce_first =
+        mean < 64.0 * 1024.0 || small_gap || (concurrent > 1 && mean < 256.0 * 1024.0);
+    if reads.len() >= 50
+        && per_op >= 3.0
+        && mean < 256.0 * 1024.0
+        && ttfb / total >= 0.5
+        && coalesce_first
+        && (!gap_set || small_gap)
+    {
+        return Some(Finding {
+            code: "small_ranges".into(),
+            severity: Severity::Warning,
+            confidence: Confidence::Medium,
+            cause: "Each read is many small range requests, each paying a full round trip.".into(),
+            evidence: Evidence {
+                text: format!(
+                    "{per_op:.1} range requests per read operation, {} on average; {:.0}% of their time waits for the first byte",
+                    crate::util::fmt_bytes(mean as u64),
+                    ttfb * 100.0 / total
+                ),
+                values: values(&[
+                    ("requests_per_op_mean", per_op),
+                    ("mean_request_bytes", mean),
+                    ("ttfb_pct", ttfb * 100.0 / total),
+                ]),
+                ..Default::default()
+            },
+            remedy: remedy("small_ranges", Some("gap")),
+        });
+    }
     // Several ranges per operation fetched one after another, each waiting for its first
     // byte: fetch them concurrently.
     if reads.len() >= 50 && per_op >= 3.0 && ttfb / total >= 0.5 && concurrent <= 1 {
@@ -1130,16 +1169,25 @@ fn small_ranges(c: &Ctx, have_cap: bool) -> Option<Finding> {
 fn slow_multipart(c: &Ctx) -> Option<Finding> {
     let parts: Vec<&ReqRow> = c
         .reqs()
-        .filter(|q| q.api == "UploadPart" && !q.is_error())
+        .filter(|q| q.api == crate::trace::Api::UploadPart && !q.is_error())
         .collect();
     if parts.len() < 10 || c.spec().write_concurrent() > 1 {
         return None;
     }
+    let part_ops: std::collections::HashSet<u64> = parts
+        .iter()
+        .filter(|q| q.op_id != 0)
+        .map(|q| q.op_id)
+        .collect();
     let writes: Vec<&crate::model::OpRow> = c
         .run
         .ops
         .iter()
-        .filter(|o| o.t_us >= 0 && o.verb.contains("multipart"))
+        .filter(|o| {
+            o.t_us >= 0
+                && (o.verb.contains("multipart")
+                    || (o.verb.starts_with("write") && part_ops.contains(&o.op_id)))
+        })
         .collect();
     if writes.is_empty() {
         return None;
@@ -1467,13 +1515,13 @@ pub fn run_validity(r: &Report) -> Validity {
     let error_ratio = failed as f64 / s.ops.max(1) as f64;
     let invalid = if s.ops == 0 {
         Some("no operation completed in the measurement window".to_owned())
-    } else if error_ratio > r.sla.max_error_ratio {
+    } else if !r.is_trace() && error_ratio > r.sla.max_error_ratio {
         Some(format!(
             "{:.1}% of operations failed for reasons other than throttling (the SLA allows {}%), so latency and throughput describe failures",
             error_ratio * 100.0,
             r.sla.max_error_ratio * 100.0
         ))
-    } else if r.workload.warmup_s > 0.0 && window < r.workload.warmup_s {
+    } else if !r.is_trace() && r.workload.warmup_s > 0.0 && window < r.workload.warmup_s {
         Some(format!(
             "the measurement window ({window:.1} s) is shorter than the warmup ({:.1} s)",
             r.workload.warmup_s
@@ -1670,7 +1718,7 @@ pub(crate) mod tests {
         // Alternate blocks of 40 requests between two APIs: both get their stragglers.
         for (i, q) in run.reqs.iter_mut().enumerate() {
             if (i / 40) % 2 == 1 {
-                q.api = "HeadObject".into();
+                q.api = crate::trace::Api::HeadObject;
             }
         }
         let f = derive(&run);

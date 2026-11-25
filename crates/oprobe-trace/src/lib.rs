@@ -27,15 +27,15 @@
 //! - [`layer`] returns the [`TraceLayer`] to add to an operator and a [`Handle`] to read it.
 //! - [`Handle::snapshot`] returns the aggregates so far ([`Snapshot`]): per API and stage, per
 //!   verb, connections, bytes and a timeline.
-//! - [`Handle::save`] and [`Snapshot::save`] write a `.oprobe` file (format `oprobe.trace/7`).
-//! - [`Exporter`] receives every request as it completes; with the `otel` feature,
-//!   [`otel::OtelExporter`] turns them into OpenTelemetry metrics
-//!   (`http.client.request.duration` with `oprobe.stage` and `oprobe.api`).
+//! - [`Handle::save`] and [`Snapshot::save`] write a `.oprobe` file (format `oprobe.trace/9`).
+//! - [`Exporter`] receives every request, operation and cache lookup as it completes; with the
+//!   `otel` feature, [`otel::OtelExporter`] turns them into OpenTelemetry metrics
+//!   (`http.client.request.duration`, `oprobe.operation.duration` and `oprobe.cache.lookups`).
 //! - [`Config`] sets the row budget, the HTTP client settings and the exporter.
 //!
 //! # How it works
 //!
-//! For HTTP services the layer installs an instrumented `HttpFetch`: OpenDAL's own reqwest
+//! For HTTP services the layer installs an instrumented `HttpTransport`: OpenDAL's own reqwest
 //! client (same TLS stack, same pool defaults), observed request by request: phase timing,
 //! connection reuse, TLS and kernel TCP statistics. For in-process services (`memory`, `fs`)
 //! it records one request per backend call. The recorder is always on: there is no measurement
@@ -46,7 +46,7 @@
 //! # Stability
 //!
 //! The items documented here, the `.oprobe` format and the meaning of every field are stable
-//! across 7.x: changes are additive, and public structs and enums are `#[non_exhaustive]`. The
+//! across 9.x: changes are additive, and public structs and enums are `#[non_exhaustive]`. The
 //! `__internal` feature exists for the oprobe binary only and carries no semver promise.
 
 // Half of the recorder (operation scopes, the whole-operation sampler, key dimensions, the
@@ -89,6 +89,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 pub use dims::{DimensionStats, HotKeyStats, SliceStats};
+pub use layer::{CacheObserveLayer, QueueStampLayer};
 pub use net::HttpVersion;
 pub use observe::RetryNotify;
 pub use record::{Api, Protocol, RequestRecord, RequestTiming};
@@ -102,7 +103,7 @@ pub use snapshot::{
 };
 
 internal_use!(file::{ServiceRecord, TRACE_FORMAT, TRACE_FORMATS_READ, TraceFile});
-internal_use!(layer::{InProcessObserveLayer, TraceContextLayer});
+internal_use!(layer::{EnqueuedAt, InProcessObserveLayer, TraceContextLayer});
 internal_use!(observe::{Linker, OperationObserveLayer, error_class, private_key});
 internal_use!(log::{DEFAULT_MAX_REQUESTS, TraceLog, TraceRows});
 internal_use!(record::classify_http);
@@ -127,6 +128,7 @@ pub struct Config {
     transport: net::TransportConfig,
     https: bool,
     exporter: Option<Arc<dyn Exporter>>,
+    exporter_factory: Option<Arc<dyn Fn() -> Arc<dyn Exporter> + Send + Sync>>,
 }
 
 impl Default for Config {
@@ -136,6 +138,7 @@ impl Default for Config {
             transport: net::TransportConfig::default(),
             https: true,
             exporter: None,
+            exporter_factory: None,
         }
     }
 }
@@ -147,7 +150,10 @@ impl std::fmt::Debug for Config {
             .field("http_version", &self.transport.http)
             .field("keep_alive", &self.transport.keep_alive)
             .field("https", &self.https)
-            .field("exporter", &self.exporter.is_some())
+            .field(
+                "exporter",
+                &(self.exporter.is_some() || self.exporter_factory.is_some()),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -217,6 +223,17 @@ impl Config {
     /// Call `e` for every recorded request and operation (metrics, logs, your own sink).
     pub fn exporter(mut self, e: Arc<dyn Exporter>) -> Self {
         self.exporter = Some(e);
+        self.exporter_factory = None;
+        self
+    }
+
+    #[cfg(feature = "otel")]
+    pub(crate) fn exporter_factory(
+        mut self,
+        f: impl Fn() -> Arc<dyn Exporter> + Send + Sync + 'static,
+    ) -> Self {
+        self.exporter = None;
+        self.exporter_factory = Some(Arc::new(f));
         self
     }
 
@@ -238,6 +255,9 @@ pub struct TraceLayer {
     context: Option<TraceContextLayer>,
     service: Arc<std::sync::OnceLock<file::ServiceRecord>>,
     linker: Arc<observe::Linker>,
+    http_version: HttpVersion,
+    keep_alive: bool,
+    max_inflight_count: Option<usize>,
 }
 
 impl std::fmt::Debug for TraceLayer {
@@ -260,6 +280,9 @@ impl opendal_core::raw::Layer for TraceLayer {
                 scheme: info.scheme().to_owned(),
                 name: info.name().to_string(),
                 root: info.root().to_string(),
+                http_version: self.http_version,
+                keep_alive: self.keep_alive,
+                max_inflight_count: self.max_inflight_count,
             };
             if let Some(e) = self.recorder.exporter() {
                 e.on_service(&s.scheme, &s.name, &s.root);
@@ -329,6 +352,27 @@ impl Handle {
         RetryNotify::new(self.recorder.clone(), self.linker.clone())
     }
 
+    /// A layer to place directly outside a local cache layer (`FoyerLayer`, `MokaLayer`) so
+    /// cache hits, hit bytes and lookup latency are recorded in [`Snapshot::cache`]:
+    ///
+    /// ```no_run
+    /// # use opendal_core::{Operator, services::Memory};
+    /// # fn demo<L: opendal_core::raw::Layer>(op: Operator, foyer_layer: L) {
+    /// let (trace, handle) = oprobe_trace::layer(oprobe_trace::Config::default());
+    /// let op = op.layer(trace).layer(foyer_layer).layer(handle.cache_layer());
+    /// # let _ = op;
+    /// # }
+    /// ```
+    pub fn cache_layer(&self) -> CacheObserveLayer {
+        CacheObserveLayer::with_linker(self.recorder.clone(), self.linker.clone())
+    }
+
+    /// Outermost layer to place outside `ConcurrentLimitLayer` so time spent waiting for an
+    /// HTTP concurrency permit is recorded in the `queue` stage of every request.
+    pub fn queue_layer(&self) -> QueueStampLayer {
+        QueueStampLayer
+    }
+
     /// Write a `.oprobe` profile to `path`: the aggregates so far plus the sampled operations
     /// with their requests (the request waterfall). The rows are moved out of memory, so
     /// successive saves hold the rows recorded since the previous one; the aggregates are
@@ -388,9 +432,12 @@ impl Snapshot {
 /// Instrument an operator: `op.layer(layer)`, then `handle.snapshot()` or `handle.save(path)`.
 pub fn layer(cfg: Config) -> (TraceLayer, Handle) {
     let recorder = Recorder::always_on(cfg.max_rows);
-    if let Some(e) = cfg.exporter {
+    if let Some(e) = cfg.exporter.or_else(|| cfg.exporter_factory.map(|f| f())) {
         recorder.set_exporter(e);
     }
+    let http_version = cfg.transport.http;
+    let keep_alive = cfg.transport.keep_alive;
+    let max_inflight_count = cfg.transport.max_inflight;
     let (context, transport_error) =
         match net::FidelityTransport::new(cfg.transport, cfg.https, Some(recorder.clone())) {
             Ok(t) => (Some(TraceContextLayer::new(t)), None),
@@ -404,6 +451,9 @@ pub fn layer(cfg: Config) -> (TraceLayer, Handle) {
             context,
             service: service.clone(),
             linker: linker.clone(),
+            http_version,
+            keep_alive,
+            max_inflight_count,
         },
         Handle {
             recorder,

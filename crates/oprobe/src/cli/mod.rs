@@ -58,7 +58,7 @@ pub async fn main(cli: Cli) -> ExitCode {
         );
         return ExitCode::from(ctx.out.error(&body));
     }
-    let scheme_hint = scheme_of(&command);
+    let scheme_hint = scheme_of(&command, &ctx);
     let code = match dispatch(command, &ctx).await {
         Ok(code) => code,
         Err(err) if crate::output::is_broken_pipe(&err) => crate::output::EXIT_BROKEN_PIPE,
@@ -78,14 +78,37 @@ pub async fn main(cli: Cli) -> ExitCode {
 /// Set by the first Ctrl-C of a measuring command.
 static INTERRUPTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-fn scheme_of(cmd: &Command) -> String {
-    let t = match cmd {
-        Command::Run(a) => a.operators.first().cloned(),
-        Command::Demo(_) => Some("lab://demo".to_owned()),
-        _ => None,
+fn scheme_of(cmd: &Command, ctx: &Ctx) -> String {
+    let scheme_from_url = |u: &str| {
+        crate::config::TargetSpec::from_url(u)
+            .ok()
+            .map(|t| t.scheme)
+            .or_else(|| u.split_once("://").map(|(s, _)| s.to_owned()))
     };
-    t.and_then(|u| u.split_once("://").map(|(s, _)| s.to_owned()))
-        .unwrap_or_else(|| "s3".into())
+    match cmd {
+        Command::Run(a) => a
+            .operators
+            .first()
+            .and_then(|op| {
+                if let Ok(cfg) = ctx.config()
+                    && let Ok((spec, _)) = crate::operator::resolve::resolve(op, &cfg)
+                {
+                    scheme_from_url(&spec.url)
+                } else {
+                    scheme_from_url(op)
+                }
+            })
+            .unwrap_or_else(|| "s3".into()),
+        Command::Demo(_) => "lab".into(),
+        Command::Prove(a) => ctx
+            .store()
+            .load(&a.run)
+            .ok()
+            .map(|r| r.report.target.scheme)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "s3".into()),
+        _ => "s3".into(),
+    }
 }
 
 /// Print an error chain with a hint on stderr (before the CLI runtime exists).
@@ -111,9 +134,9 @@ where
         .collect()
 }
 
-/// A desktop opening a run file: `oprobe PATH`, where `PATH` is the only argument and an
-/// existing `.oprobe` or `.json` file (a double click, Open With, a file dropped on the
-/// program). The bare app opens it; nothing else is a file argument.
+/// A desktop opening a file: `oprobe PATH`, where `PATH` is the only argument and an existing
+/// `.oprobe` or `.json` file (a double click, Open With, a file dropped on the program). The
+/// bare app opens it; nothing else is a file argument.
 pub fn launch_file(args: &[std::ffi::OsString]) -> Option<std::path::PathBuf> {
     let [_, arg] = args else {
         return None;

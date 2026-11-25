@@ -14,7 +14,7 @@ use tokio::task::{JoinError, JoinSet};
 
 use super::cleanup::{CleanupSummary, delete_prefix, new_run_prefix};
 use super::dataset::{Dataset, PayloadPool, Picker};
-use super::operator::{admin_operator, base_operator, measured_operator};
+use super::operator::{admin_operator, base_operator, measured_operator_with};
 use super::ops::{OpCtx, error_class, execute, verb};
 use crate::config::{Knobs, OpKind, OpSpec, Profile, TargetSpec};
 use crate::guard::Guard;
@@ -151,6 +151,8 @@ pub struct SessionOptions {
     pub trace_max_requests: usize,
     /// List (and, when the run writes, write + delete a tiny object) before anything else.
     pub preflight: bool,
+    /// Warmed [`opendal::layers::TailCutLayer`] reused across candidate trials of one prove.
+    pub tail_cut: Option<opendal::layers::TailCutLayer>,
 }
 
 impl Default for SessionOptions {
@@ -160,6 +162,7 @@ impl Default for SessionOptions {
             guard: None,
             trace_max_requests: crate::trace::DEFAULT_MAX_REQUESTS,
             preflight: true,
+            tail_cut: None,
         }
     }
 }
@@ -185,6 +188,7 @@ pub struct Session {
     last_trace: Mutex<Option<TraceRows>>,
     /// Where the next window streams its rows (the run file), taken by [`Session::run`].
     row_sink: Mutex<Option<Arc<dyn crate::trace::RowSink>>>,
+    tail_cut: Option<opendal::layers::TailCutLayer>,
 }
 
 impl Session {
@@ -201,6 +205,13 @@ impl Session {
         progress: ProgressFn,
         opts: SessionOptions,
     ) -> Result<Self> {
+        if cancel.is_cancelled() {
+            return Err(crate::errors::OprobeError::new(
+                crate::errors::ErrorCode::RunInterrupted,
+                "run interrupted",
+            )
+            .into());
+        }
         profile.validate()?;
         let mut target = profile.operator.target()?;
         super::operator::prepare_target(&mut target).await?;
@@ -289,6 +300,7 @@ impl Session {
             trace_max_requests: opts.trace_max_requests,
             last_trace: Mutex::new(None),
             row_sink: Mutex::new(None),
+            tail_cut: opts.tail_cut,
         })
     }
 
@@ -345,8 +357,15 @@ impl Session {
         }
         let mut spec = self.profile.operator.clone();
         knobs.apply_to(&mut spec);
-        let op =
-            measured_operator(&self.base, &self.target, &spec, &recorder, tree.clone()).await?;
+        let op = measured_operator_with(
+            &self.base,
+            &self.target,
+            &spec,
+            &recorder,
+            tree.clone(),
+            self.tail_cut.clone(),
+        )
+        .await?;
         let ctx = Arc::new(OpCtx {
             op,
             picker: Picker::new(self.dataset.objects.len(), self.profile.workload.access),
@@ -870,6 +889,20 @@ async fn run_one(
             (0, 0, Some(error_class(&e, status)))
         }
     };
+    let data = scope.take();
+    let name = if name == "write"
+        && data.requests.iter().any(|r| {
+            matches!(
+                r.api,
+                crate::trace::Api::UploadPart
+                    | crate::trace::Api::CreateMultipart
+                    | crate::trace::Api::CompleteMultipart
+            )
+        }) {
+        "write.multipart"
+    } else {
+        name
+    };
     rec.complete_op(
         measured,
         OpCompletion {
@@ -881,7 +914,7 @@ async fn run_one(
             logical_write: lw,
             error,
             key,
-            data: scope.take(),
+            data,
             schedule_us,
         },
     );

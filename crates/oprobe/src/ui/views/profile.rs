@@ -80,7 +80,11 @@ fn content(s: Store, m: Rc<ProfileModel>) -> View {
             pass_through: true,
             ..Default::default()
         },
-        move |_| link.range.set(None),
+        move |_| {
+            if link.range.get_untracked().is_some() || link.drag.get_untracked().is_some() {
+                link.clear();
+            }
+        },
     );
     let mut v = view()
         .test_id("profile")
@@ -407,6 +411,12 @@ fn write_line(w: &crate::report::view::WritePathView) -> String {
             &[&fmt::count(w.parts_count), &fmt::bytes(m)],
         ));
     }
+    if let Some(sk) = w.part_skew_ratio.filter(|x| *x >= 1.25) {
+        parts.push(fill("write.skew", &[&fmt::sig3(sk)]));
+    }
+    if let Some(ms) = w.complete_p99_ms {
+        parts.push(fill("write.complete", &[&fmt::dur_ms(ms)]));
+    }
     parts.join(" · ")
 }
 
@@ -417,17 +427,34 @@ fn requests(m: &Rc<ProfileModel>, cx: Ctx) -> Option<View> {
         return None;
     }
     let m = m.clone();
-    let picked = signal(None::<usize>);
+    let picked = signal(None::<String>);
     let opened = signal(None::<u64>);
     let writes = m
         .write_path
         .as_ref()
         .filter(|w| w.shown())
         .map(|w| prop(tr("write.path"), write_line(w)).test_id("write-path"));
+    let lists = m.list_path.as_ref().map(|lp| {
+        prop(
+            tr("list.path"),
+            fill(
+                "list.summary",
+                &[
+                    &fmt::count(lp.pages_count),
+                    &fmt::count(lp.list_ops_count),
+                    &fmt::sig3(lp.pages_per_op),
+                    &fmt::dur_ms(lp.page_p50_ms),
+                    &fmt::dur_ms(lp.page_p99_ms),
+                ],
+            ),
+        )
+        .test_id("list-path")
+    });
     Some(
         section(tr("profile.requests"))
             .test_id("requests")
             .child(writes)
+            .child(lists)
             .child(m.has_rows().then(|| small(tr("drill.api_hint"))))
             .child(dynamic(move || {
                 let r = cx.range.get();
@@ -465,6 +492,8 @@ fn requests(m: &Rc<ProfileModel>, cx: Ctx) -> Option<View> {
                         })
                         .collect();
                     let names: Vec<String> = apis.iter().map(|a| a.api.clone()).collect();
+                    let names_sel = names.clone();
+                    let names_press = names.clone();
                     let bars = api_bars(&apis);
                     let table = if m.has_rows() {
                         kit::pressable_table_bars(
@@ -472,10 +501,14 @@ fn requests(m: &Rc<ProfileModel>, cx: Ctx) -> Option<View> {
                             rows,
                             bars,
                             "api-row",
-                            move || picked.get(),
+                            move || {
+                                let cur = picked.get();
+                                cur.and_then(|name| names_sel.iter().position(|n| n == &name))
+                            },
                             move |i| {
                                 opened.set(None);
-                                picked.update(|p| *p = if *p == Some(i) { None } else { Some(i) })
+                                let clicked = names_press.get(i).cloned();
+                                picked.update(|p| *p = if *p == clicked { None } else { clicked });
                             },
                         )
                         .into_element()
@@ -489,7 +522,7 @@ fn requests(m: &Rc<ProfileModel>, cx: Ctx) -> Option<View> {
                             let m = m.clone();
                             let names = names.clone();
                             untracked(move || {
-                                p.and_then(|i| names.get(i).cloned()).map(|api| {
+                                p.filter(|api| names.contains(api)).map(|api| {
                                     let reqs = m.api_requests(&api, range);
                                     api_drill(&m, &api, reqs, opened, picked)
                                 })
@@ -526,7 +559,7 @@ fn api_drill(
     api: &str,
     reqs: Vec<ReqLine>,
     opened: Signal<Option<u64>>,
-    picked: Signal<Option<usize>>,
+    picked: Signal<Option<String>>,
 ) -> View {
     let cols = [
         Col {
@@ -653,6 +686,7 @@ fn retries(m: &ProfileModel) -> View {
     section(tr("profile.retries"))
         .test_id("retries")
         .child(prop(tr("retry.retries"), n(r.retries_count)))
+        .child((r.tail_cuts_count > 0).then(|| prop(tr("retry.tail_cuts"), n(r.tail_cuts_count))))
         .child(prop(tr("retry.backoff"), fmt::dur_ms(r.backoff_ms)))
         .child(prop(
             tr("retry.throttled"),
@@ -729,6 +763,21 @@ fn details(m: &ProfileModel) -> View {
                 (b.cache_hit_bytes > 0)
                     .then(|| prop(tr("bytes.cache"), fmt::bytes(b.cache_hit_bytes))),
             )
+            .child(m.cache.as_ref().map(|cv| {
+                prop(
+                    tr("cache.title"),
+                    fill(
+                        "cache.summary",
+                        &[
+                            &fmt::ratio(cv.hit_ratio),
+                            &fmt::count(cv.hits_count),
+                            &fmt::count(cv.lookups_count),
+                            &fmt::dur_ms(cv.lookup_mean_ms),
+                        ],
+                    ),
+                )
+                .test_id("details-cache")
+            }))
             .child(prop(
                 tr("bytes.amplification"),
                 fill(
@@ -1653,7 +1702,18 @@ fn bar_readout(b: &crate::ui::data::Bar) -> String {
             .join(" · ")
     );
     for (k, v) in &b.signals {
-        s += &format!(" · {} {v}", tr_dyn(&format!("sig.{k}")).unwrap_or(k));
+        let shown_v = match (*k, v.as_str()) {
+            ("tail_cut", "hedged") => tr("sig_val.hedged"),
+            ("aborted", "incomplete") => tr("sig_val.incomplete"),
+            _ => v.as_str(),
+        };
+        s += &format!(" · {} {shown_v}", tr_dyn(&format!("sig.{k}")).unwrap_or(k));
+    }
+    if let Some(err) = &b.error {
+        s += &format!(" · {} {err}", tr("sig.error"));
+    }
+    if let Some(req_id) = &b.request_id {
+        s += &format!(" · {} {req_id}", tr("sig.request_id"));
     }
     s
 }
@@ -1684,6 +1744,8 @@ fn waterfall(w: &Waterfall, span: f64, hover: Signal<Option<String>>) -> View {
         )
         .children(w.bars.iter().map(|b| {
             let readout = bar_readout(b);
+            let readout_focus = readout.clone();
+            let readout_a11y = readout.clone();
             let total = b.total_us.max(1) as f64;
             let failed = b.failed;
             view()
@@ -1691,6 +1753,13 @@ fn waterfall(w: &Waterfall, span: f64, hover: Signal<Option<String>>) -> View {
                 .items_center()
                 .gap_2()
                 .min_w(px(0.0))
+                .rounded(px(2.0))
+                .focusable(true)
+                .focus_visible(kit::ring)
+                .role(AccessibilityRole::Button)
+                .label(readout_a11y)
+                .on_focus(move || hover.set(Some(readout_focus.clone())))
+                .on_blur(move || hover.set(None))
                 .on_mouse_enter(move |_: &MouseEvent| hover.set(Some(readout.clone())))
                 .on_mouse_leave(move |_: &MouseEvent| hover.set(None))
                 .child(

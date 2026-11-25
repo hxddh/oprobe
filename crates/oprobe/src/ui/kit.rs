@@ -564,7 +564,7 @@ pub fn prop(name: impl IntoReactive<SharedString>, value: impl IntoReactive<Shar
         .min_w(px(0.0))
         .child(
             view()
-                .w(px(180.0))
+                .w(px(if in_terminal() { 144.0 } else { 180.0 }))
                 .flex_shrink_0()
                 .child(small(name).number_of_lines(1)),
         )

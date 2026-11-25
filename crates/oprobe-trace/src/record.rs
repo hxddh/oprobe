@@ -71,13 +71,14 @@ impl Api {
         Api::Other,
     ];
 
-    /// Inverse of [`Api::label`]; unknown names are [`Api::Other`].
+    /// Inverse of [`Api::label`] (also accepts provider `ServiceOperation` names); unknown
+    /// names are [`Api::Other`].
     pub fn from_label(s: &str) -> Api {
         Api::ALL
             .iter()
             .copied()
             .find(|a| a.label() == s)
-            .unwrap_or(Api::Other)
+            .unwrap_or_else(|| Api::from_service_operation(s))
     }
 
     pub fn label(&self) -> &'static str {
@@ -273,10 +274,15 @@ pub struct RequestRecord {
 
 impl RequestRecord {
     pub fn is_throttle(&self) -> bool {
-        matches!(self.status, 429 | 503)
+        self.status == 429
+            || (self.status == 503
+                && !matches!(
+                    self.detail.as_deref().and_then(|d| d.error_code.as_deref()),
+                    Some("InternalError" | "ServiceUnavailable")
+                ))
     }
     pub fn is_error(&self) -> bool {
-        self.status == 0 || self.status >= 400
+        self.status == 0 || self.status >= 400 || self.error.is_some()
     }
 }
 

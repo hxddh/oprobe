@@ -100,9 +100,6 @@
         "id": {
           "type": "string"
         },
-        "interrupted": {
-          "type": "boolean"
-        },
         "label": {
           "type": [
             "string",
@@ -190,7 +187,6 @@
         "target_display",
         "started_at",
         "window_s",
-        "interrupted",
         "verdict_level",
         "headline",
         "ops_per_s",
@@ -229,7 +225,7 @@
       ]
     }
   },
-  "$id": "https://github.com/hxddh/oprobe/schemas/6/run-list.json",
+  "$id": "https://github.com/hxddh/oprobe/schemas/9/run-list.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "The result of `oprobe show --list -o json`: the stored runs",
   "properties": {

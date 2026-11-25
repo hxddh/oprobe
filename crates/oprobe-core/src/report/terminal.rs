@@ -115,7 +115,7 @@ pub fn request_line(i: usize, r: &ReqRow, op_t_us: i64, detail: bool) -> String 
         "    #{:<2} +{:<8} {:<24} {} {}  {}  {}",
         i + 1,
         fmt_ms((r.t_us - op_t_us).max(0) as f64 / 1000.0),
-        r.api,
+        r.api_name(),
         status,
         dim(&conn),
         parts.join(" · "),
@@ -674,12 +674,15 @@ fn render_with(r: &Report, run: Option<&Run>, detail: bool) -> String {
         if let Some(w) = view.write_path.as_ref().filter(|w| w.shown()) {
             let _ = writeln!(out, "  {} {}", dim("writes"), w.line());
         }
+        if let Some(lp) = &view.list_path {
+            let _ = writeln!(out, "  {} {}", dim("lists"), lp.line());
+        }
         if detail && r.connections.http2_requests > 0 {
             let _ = writeln!(
                 out,
                 "  {}",
                 dim(
-                    "h2: `send` ends when the body is handed to the stream; a flow-control stall is inside ttfb (`h2 flow stall` on a request, `show --by stage`)"
+                    "h2: `send` ends when the body is handed to the stream; any flow-control stall sits inside ttfb"
                 )
             );
         }
@@ -778,15 +781,8 @@ fn render_with(r: &Report, run: Option<&Run>, detail: bool) -> String {
             fmt_bytes(b.wire_tx),
         );
     }
-    if r.cache.enabled {
-        let _ = writeln!(
-            out,
-            "  cache {:.1}% hit ({} of {} lookups, mean {})",
-            r.cache.hit_ratio * 100.0,
-            r.cache.hits,
-            r.cache.lookups,
-            fmt_ms(r.cache.lookup_ms_mean)
-        );
+    if let Some(cv) = &view.cache {
+        let _ = writeln!(out, "  cache {}", cv.line());
     }
     if r.integrity.verified + r.integrity.corrupted > 0 {
         let _ = writeln!(
@@ -1177,6 +1173,10 @@ pub fn wrap_text(s: &str, width: usize) -> Vec<String> {
 /// ([`super::range::RangeView`]): the numbers, where the time went, the verbs, the requests by
 /// API and the slowest operations of the range.
 pub fn range_section(run: &Run, v: &super::range::RangeView) -> String {
+    range_section_with(run, v, false)
+}
+
+pub fn range_section_with(run: &Run, v: &super::range::RangeView, detail: bool) -> String {
     let r = &run.report;
     let mut out = String::new();
     let _ = writeln!(
@@ -1314,8 +1314,9 @@ pub fn range_section(run: &Run, v: &super::range::RangeView) -> String {
         .collect();
     if !slow.is_empty() {
         section(&mut out, "Slowest operations in the range");
-        for op in slow.iter().take(3) {
-            out += &slow_op_block(op, &run.requests_of(op.op_id), false);
+        let n = if detail { slow.len() } else { 3 };
+        for op in slow.iter().take(n) {
+            out += &slow_op_block(op, &run.requests_of(op.op_id), detail);
         }
     }
     out
@@ -1451,7 +1452,7 @@ mod tests {
             ..Default::default()
         });
         run.reqs[2].detail = Some(Box::new(crate::model::ReqDetail {
-            flow_stall_us: Some(7_000),
+            aborted: true,
             region: Some("eu-west-1".into()),
             ..Default::default()
         }));
@@ -1470,7 +1471,7 @@ mod tests {
             "2 parts of 8.0 MiB on average",
             // One count of dials, with its window (K18).
             "28 dialed during warm-up · 1 in the window",
-            "h2 flow stall 7.00ms",
+            "body incomplete",
         ] {
             assert!(words.contains(s), "{s}\n{text}");
         }

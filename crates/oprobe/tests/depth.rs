@@ -68,7 +68,7 @@ async fn depth_in() {
     p.operator.http.keep_alive = false;
     let reqs = rows(p, 600).await;
     assert!(!reqs.is_empty());
-    let apis: std::collections::BTreeSet<&str> = reqs.iter().map(|r| r.api.as_ref()).collect();
+    let apis: std::collections::BTreeSet<&str> = reqs.iter().map(|r| r.api_name()).collect();
     // OpenDAL's own names, not the URL heuristic's (S3 lists with ListObjectsV2).
     assert!(apis.contains("ListObjectsV2"), "{mode:?}: {apis:?}");
     assert!(

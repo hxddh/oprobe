@@ -285,19 +285,36 @@ impl OpSampler {
         let mut ops = Vec::new();
         let mut reqs = Vec::new();
         let always_kept = (self.always.len() + self.slow.len()) as u64;
-        let mut push = |w: WholeOp| {
+        let strata = std::mem::take(&mut self.strata);
+        let total_reservoir_seen = self.seen_ops.saturating_sub(always_kept);
+        let surviving_strata_seen: u64 = strata
+            .values()
+            .filter(|s| !s.items.is_empty())
+            .map(|s| s.seen)
+            .sum();
+        let stratum_scale = if surviving_strata_seen > 0 && total_reservoir_seen > surviving_strata_seen {
+            total_reservoir_seen as f64 / surviving_strata_seen as f64
+        } else {
+            1.0
+        };
+        let mut push = |mut w: WholeOp, weight: f64| {
+            w.op.weight = weight.max(1.0);
             ops.push(w.op);
             reqs.extend(w.reqs);
         };
         for w in self.always.drain(..) {
-            push(w);
+            push(w, 1.0);
         }
         for Reverse(Slow(w)) in std::mem::take(&mut self.slow).into_vec() {
-            push(w);
+            push(w, 1.0);
         }
-        for (_, s) in std::mem::take(&mut self.strata) {
+        for (_, s) in strata {
+            if s.items.is_empty() {
+                continue;
+            }
+            let w_stratum = (s.seen as f64 / s.items.len() as f64) * stratum_scale;
             for w in s.items {
-                push(w);
+                push(w, w_stratum);
             }
         }
         let stats = SamplingStats {
@@ -395,6 +412,10 @@ mod tests {
         assert!(ops.iter().any(|o| o.t_us < 1_000_000 && o.ok));
         assert!(ops.iter().any(|o| o.t_us > 9_000_000 && o.ok));
         assert!(st.kept_ratio() < 1.0);
+        // Exact inverse-probability weights sum to seen_ops; forced/slow rows have weight 1.
+        let total_w: f64 = ops.iter().map(|o| o.weight).sum();
+        assert!((total_w - st.seen_ops as f64).abs() < 1e-6, "{total_w}");
+        assert!(ops.iter().filter(|o| !o.ok).all(|o| (o.weight - 1.0).abs() < 1e-9));
     }
 
     #[test]
