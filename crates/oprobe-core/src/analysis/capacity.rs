@@ -636,16 +636,31 @@ fn find_ceiling(levels: &BTreeMap<u64, (u64, u64)>) -> Option<(Ceiling, u64)> {
     lv.iter().find(|(l, _, t)| *l > k && *t > 0)?;
     let share = |c: u64, t: u64| t as f64 / (c + t).max(1) as f64;
     let above = k_hi.max(k_low);
+    // `hi` is where throttling is the rule: a level above the split with ≥ 3 arrivals, at least
+    // half of them throttled. Near the top the levels hold an arrival or two each, so sparse
+    // levels are pooled upward until they hold 3: a single arrival (or a lone stray throttle)
+    // never decides where throttling starts. When no level or pool above the split is mostly
+    // throttled, the run never showed where throttling becomes the rule: the bracket reaches
+    // the highest level observed (wide, so the confidence says so).
+    let pooled = || {
+        let (mut c0, mut t0) = (0u64, 0u64);
+        lv.iter().filter(|x| x.0 > above).find_map(|(l, c, t)| {
+            c0 += c;
+            t0 += t;
+            if c0 + t0 < 3 {
+                return None;
+            }
+            let clear = share(c0, t0) >= 0.5;
+            (c0, t0) = (0, 0);
+            clear.then_some(*l)
+        })
+    };
     let hi = lv
         .iter()
         .find(|(l, c, t)| *l > above && c + t >= 3 && share(*c, *t) >= 0.5)
-        .or_else(|| {
-            lv.iter()
-                .find(|(l, c, t)| *l > above && share(*c, *t) >= 0.5)
-        })
-        .or_else(|| lv.iter().find(|(l, _, t)| *l > above && *t > 0))
-        .or_else(|| lv.iter().find(|(l, _, t)| *l > k_low && *t > 0))?
-        .0;
+        .map(|x| x.0)
+        .or_else(pooled)
+        .unwrap_or_else(|| lv.last().map_or(above, |x| x.0).max(above));
     // The client's count is a level off the server's now and then, either way, and near the
     // limit the levels hold a handful of arrivals each: whether 24 or 25 was the last clean
     // level is within that error (CI: a clean 23, 24 and 25 on a lab limited at 24, a loaded
@@ -1144,6 +1159,36 @@ mod tests {
             let (c, _) = find_ceiling(&levels).expect("a ceiling");
             assert!(c.lo <= 24.0 && 24.0 < c.hi, "{c:?}");
         }
+    }
+
+    /// Above the split, a single throttled arrival does not decide where throttling starts:
+    /// one stray throttle at 25 followed by clean arrivals at 26–28 is no ceiling at 25 (9.0
+    /// accepted any lone level ≥ 50 % throttled, so the bracket ended at 26 on a limit of 28).
+    #[test]
+    fn a_single_throttled_arrival_does_not_end_the_bracket() {
+        let mut sample: Vec<(u64, u64, u64)> = (1..=24).map(|l| (l, 40, 0)).collect();
+        sample.extend([
+            (25, 1, 1),
+            (26, 1, 0),
+            (27, 1, 0),
+            (28, 1, 0),
+            (29, 1, 1),
+            (30, 1, 1),
+            (31, 1, 1),
+        ]);
+        let levels: BTreeMap<u64, (u64, u64)> =
+            sample.iter().map(|(l, n, t)| (*l, (*n, *t))).collect();
+        let (c, _) = find_ceiling(&levels).expect("a ceiling");
+        assert!(c.lo <= 28.0 && 28.0 < c.hi, "{c:?}");
+        // Sparse levels pool until they hold three arrivals: 28–30 (2 of 3 throttled).
+        assert_eq!(c.hi, 31.0, "{c:?}");
+        // A run that never shows throttling as the rule reaches the highest level observed.
+        let mut sample: Vec<(u64, u64, u64)> = (1..=24).map(|l| (l, 40, 0)).collect();
+        sample.extend([(25, 10, 3), (26, 10, 3), (27, 1, 1)]);
+        let levels: BTreeMap<u64, (u64, u64)> =
+            sample.iter().map(|(l, n, t)| (*l, (*n, *t))).collect();
+        let (c, _) = find_ceiling(&levels).expect("a ceiling");
+        assert_eq!(c.hi, 28.0, "{c:?}");
     }
 
     #[test]
