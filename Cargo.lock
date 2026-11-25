@@ -4443,7 +4443,7 @@ dependencies = [
 
 [[package]]
 name = "oprobe"
-version = "9.0.0"
+version = "9.1.0"
 dependencies = [
  "anyhow",
  "await-tree",
@@ -4488,7 +4488,7 @@ dependencies = [
 
 [[package]]
 name = "oprobe-core"
-version = "9.0.0"
+version = "9.1.0"
 dependencies = [
  "anyhow",
  "await-tree",
@@ -4529,7 +4529,7 @@ dependencies = [
 
 [[package]]
 name = "oprobe-trace"
-version = "9.0.0"
+version = "9.1.0"
 dependencies = [
  "anyhow",
  "await-tree",

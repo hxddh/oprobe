@@ -4,6 +4,72 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## v9.1.0 — 2026-11-25
+
+9.1 fixes the bugs found in a deep review of 9.0 (several could lose data or report wrong numbers),
+moves the app to nsh 0.7.0, and makes the GUI and the terminal UI show everything a run measured.
+It adds no command and no flag. The plan is `docs/design/v9.1-review.md`.
+
+### Fixed
+
+- **Saving never overwrites the wrong file.** `prove --save`, the app's Save and Save as… share one
+  entry point. It patches the same service's `op.toml` or `[operators.NAME]` in place, writes a new
+  file clean (`${ENV}` references kept, secret values — including ones given as edits — left
+  out), and refuses any other existing file, a config file entry of another service included.
+  9.0 could overwrite `config.toml` with an operator.
+- **A proof is never lost.** `--save` is checked before the trials, and the prove result is stored
+  before the save; a failing save is a note. A prove that ends early (Ctrl-C, an error, a closed
+  app) deletes its trial runs; Ctrl-C between trials now exits 130 as interrupted.
+- **`layers.cache.memory` is bytes.** Entries are weighed by their size (9.0 counted entries).
+- **503 ServiceUnavailable counts as throttling**, in the trace layer and in findings.
+- **Embedded traces have a full timeline**: new connections and requests in flight per interval
+  (always 0 in 9.0 without the CLI's probe).
+- **Ranges and listings tell the truth.** A trace without rows refuses `--since/--until/--by`
+  instead of inventing ranges from slow-operation rows; a range counts failures when they started;
+  list pages count successful answers only; `show --rm` hints never name an unrelated run.
+- **Clear errors for files that are not runs**, for zstd damage and for JSON that is another
+  oprobe output; `run.interrupted` has its own docs link and retryability.
+- **The capacity bracket** needs three arrivals at a level; one arrival never ends it.
+- **Open-loop runs** stamp operations when they start, so a backlog no longer piles every operation
+  into the first second; the lateness stays in the latency as queue time.
+- **`next` proves what it can.** It carries the objective (`--objective p99` for throttling and
+  rate limits) and the run's own workload; findings whose remedy is not a layer point at
+  `show RUN --detail`, and `prove` refuses them with a hint.
+
+### Changed
+
+- **Prove method.** The noise floor estimates each side's variance from its own trials
+  (σA² + σB²), trial order within a pair is drawn from the run's seed, and the sizing search
+  climbs and bisects correctly. `lab://throttle` defaults to 32 workers so its default prove
+  decides.
+- **The app runs on nsh 0.7.0**: window model v2, quit when the last window closes, reopen,
+  "Copied" only when the clipboard took it, accessibility hints and busy states on Run, Prove
+  and Save. The window position saved by 9.0 is not carried over.
+- **The terminal UI scrolls** with PageUp/PageDown, Space, Home/End and j/k; bars are never
+  blank; axis and rule labels no longer collide; long labels wrap.
+- **The GUI and TUI show what was measured**: integrity and SLA checks, every error status and
+  errors/throttled per API, the slowest 1 % stage split, capacity with ceiling rules, max and
+  p99.9 latency, missed arrivals, the open-loop target and schedule, a traffic line (remotes,
+  bytes, amplification), the prove's sizing sweep, notes and environment, five slowest
+  operations, and a verb filter on the heatmap and the distribution. Charts that repeat another
+  are gone; CPU has its own chart when the client was saturated.
+- Run ids use 64 random start values per millisecond; events are `oprobe.events/9`.
+- The trace layer keeps the per-interval in-flight peak off its aggregate lock.
+
+### Removed
+
+- `schemas/compare.json` (a comparison is part of `run.json`).
+- `oprobe-trace` OpenTelemetry metrics `oprobe.operation.duration` and `oprobe.cache.lookups`.
+- The app's display of the `cdn_pop`, `age`, `storage_class` and `encryption` headers (they stay
+  in the rows and JSON). `lab --max-store-size` is hidden from `--help`.
+
+### Known issues
+
+- Two processes that create a run in the same millisecond can pick the same id (1 in 64).
+- The suggested next `run` command does not carry the run's budget flags.
+- An open-loop operation's waterfall shows its queue time after its requests.
+- With sampled rows, TCP connection counts cover the kept rows only.
+
 ## v9.0.0 — 2026-11-25
 
 9.0 establishes a clean-slate, lossless observability and data contract (`oprobe.trace/9`,
