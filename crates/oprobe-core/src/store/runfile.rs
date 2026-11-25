@@ -976,7 +976,27 @@ pub fn read_run(r: impl Read) -> Result<Run> {
     let mut report = None;
     let mut ops = Vec::new();
     let mut reqs = Vec::new();
-    while let Some(b) = rd.next_block()? {
+    loop {
+        let b = match rd.next_block() {
+            Ok(Some(b)) => b,
+            Ok(None) => break,
+            // Nothing readable before the header: not a run file (another zstd file, random
+            // bytes), unless the system failed the read or the file ends early (a truncated
+            // run file is damaged).
+            Err(e)
+                if header.is_none()
+                    && !e
+                        .chain()
+                        .filter_map(|c| c.downcast_ref::<std::io::Error>())
+                        .any(|io| {
+                            io.raw_os_error().is_some()
+                                || io.kind() == std::io::ErrorKind::UnexpectedEof
+                        }) =>
+            {
+                bail!("not an oprobe run file ({e:#})")
+            }
+            Err(e) => return Err(e),
+        };
         match b {
             Block::Header(h) => {
                 if h.format != RUN_FORMAT {

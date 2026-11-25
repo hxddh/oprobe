@@ -1476,13 +1476,20 @@ impl ListView {
             .map(|v| v.count)
             .sum::<u64>()
             .max(1);
+        // A page is a 2xx answer: a retried or throttled ListObjects request is no page.
+        let pages: u64 = api
+            .status
+            .iter()
+            .filter(|(s, _)| (200..300).contains(*s))
+            .map(|(_, n)| n)
+            .sum();
         let paginated_ops_ratio = run.and_then(|run| {
             let mut by_op: std::collections::HashMap<u64, u64> = Default::default();
-            for q in run
-                .reqs
-                .iter()
-                .filter(|q| q.op_id != 0 && q.api == crate::trace::Api::ListObjects)
-            {
+            for q in run.reqs.iter().filter(|q| {
+                q.op_id != 0
+                    && q.api == crate::trace::Api::ListObjects
+                    && (200..300).contains(&q.status)
+            }) {
                 *by_op.entry(q.op_id).or_default() += 1;
             }
             (!by_op.is_empty()).then(|| {
@@ -1492,8 +1499,8 @@ impl ListView {
         });
         Some(Self {
             list_ops_count: list_ops,
-            pages_count: api.count,
-            pages_per_op: api.count as f64 / list_ops as f64,
+            pages_count: pages,
+            pages_per_op: pages as f64 / list_ops as f64,
             page_p50_ms: api.stages.total.p50,
             page_p99_ms: api.stages.total.p99,
             paginated_ops_ratio,
@@ -2758,6 +2765,44 @@ impl SpreadView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A retried or throttled ListObjects request returned no page: ten single-page lists with
+    /// two 503s retried are 10 pages, 1.00 per list (9.0 said 12 and 1.20).
+    #[test]
+    fn list_pages_count_only_successful_answers() {
+        let mut run = crate::report::fixture::run();
+        let list = |op_id: u64, t_us: i64, status: u16| {
+            let mut q = crate::report::fixture::req(op_id, t_us, status, true);
+            q.api = crate::trace::Api::ListObjects;
+            q
+        };
+        run.reqs.clear();
+        for i in 0..10u64 {
+            if i < 2 {
+                run.reqs.push(list(100 + i, i as i64 * 1000, 503));
+            }
+            run.reqs.push(list(100 + i, i as i64 * 1000 + 500, 200));
+        }
+        let r = &mut run.report;
+        r.apis = vec![crate::trace::ApiStats {
+            api: crate::trace::Api::ListObjects,
+            count: 12,
+            throttled: 2,
+            errors: 2,
+            status: [(200, 10), (503, 2)].into_iter().collect(),
+            ..Default::default()
+        }];
+        r.verbs = vec![crate::trace::VerbStats {
+            verb: "list".into(),
+            count: 10,
+            ..Default::default()
+        }];
+        let v = ListView::of(&run.report, Some(&run)).unwrap();
+        assert_eq!(v.list_ops_count, 10);
+        assert_eq!(v.pages_count, 10);
+        assert!((v.pages_per_op - 1.0).abs() < 1e-9, "{v:?}");
+        assert_eq!(v.paginated_ops_ratio, Some(0.0));
+    }
 
     #[test]
     fn a_long_timeline_is_downsampled_without_hiding_spikes() {

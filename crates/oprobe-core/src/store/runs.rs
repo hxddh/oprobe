@@ -116,10 +116,13 @@ pub fn decode_run(r: impl Read) -> Result<Run> {
             .with_hint(hint.to_owned())
             .into()
         };
-        // An I/O error (a sharing violation, a permission) is what it says, not a damaged file;
-        // a file that ends early is.
+        // An I/O error of the system (a sharing violation, a permission) is what it says, not a
+        // damaged file; a file that ends early is, and so is one the zstd decoder rejects (its
+        // errors are I/O errors without an OS code).
         let io = e.chain().find_map(|c| c.downcast_ref::<std::io::Error>());
-        if io.is_some_and(|io| io.kind() != std::io::ErrorKind::UnexpectedEof) {
+        if io.is_some_and(|io| {
+            io.raw_os_error().is_some() && io.kind() != std::io::ErrorKind::UnexpectedEof
+        }) {
             return e;
         }
         if msg.contains("is not supported") {
@@ -760,6 +763,32 @@ pub(crate) mod tests {
             let hint = b.hint.unwrap_or_default();
             assert!(hint.contains("damaged or truncated"), "{cut}: {hint}");
             assert!(!hint.contains("other oprobe versions"), "{hint}");
+        }
+    }
+
+    /// A file that is not a run file (random bytes, another zstd file) is a usage error that
+    /// says so, with a hint (9.0: `internal`, exit 1, no hint, for the zstd decoder's errors).
+    #[test]
+    fn a_file_that_is_not_a_run_file_says_so() {
+        let random: Vec<u8> = (0..4096u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        let other_zstd = zstd::encode_all(&b"hello, this is not a run file at all"[..], 3).unwrap();
+        for bytes in [&random[..], &other_zstd[..], b"plain text\n"] {
+            let e = decode_run(bytes).unwrap_err();
+            let b = crate::errors::classify(&e, "s3");
+            assert_eq!(
+                b.code,
+                crate::errors::ErrorCode::UsageInvalidArgument,
+                "{e:#}"
+            );
+            assert!(
+                b.message.contains("not an oprobe run file"),
+                "{}",
+                b.message
+            );
+            let hint = b.hint.unwrap_or_default();
+            assert!(hint.contains("`.oprobe` run file"), "{hint}");
         }
     }
 
