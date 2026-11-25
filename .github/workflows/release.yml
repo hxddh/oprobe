@@ -233,7 +233,7 @@ jobs:
             # Write to a file first: `grep -q` stops reading at the first match, which would end
             # the writer with SIGPIPE (exit 141) under `pipefail`.
             "$bin" run memory:// -d 1s -q -o json > smoke.json
-            grep -q '"oprobe.report/6"' smoke.json
+            grep -q '"oprobe.report/7"' smoke.json
             "$bin" show --list -o json > list.json
           done
 
