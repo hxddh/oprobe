@@ -85,9 +85,8 @@ impl OpScope {
         Self::new_at(measured, Instant::now(), None)
     }
 
-    /// A scope whose operation started at `started` (in open-loop runs, the intended start, so
-    /// request offsets and the operation's latency share one origin). Requests recorded after
-    /// the operation completed go to `late`.
+    /// A scope whose operation started at `started` (request offsets count from it). Requests
+    /// recorded after the operation completed go to `late`.
     pub fn new_at(measured: bool, started: Instant, late: Option<Arc<Recorder>>) -> Arc<Self> {
         Arc::new(Self {
             id: NEXT_OP_ID.fetch_add(1, Ordering::Relaxed),
