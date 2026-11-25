@@ -1277,7 +1277,7 @@ impl Store {
         }
     }
 
-    /// Write a proven change back into the run's `op.toml` file (`App::save_operator_edits`).
+    /// Write a proven change back into the run's `op.toml` file (`App::save_operator`).
     pub fn save_proven_to_file(&self, origin_run_id: &str, edits: &[String]) {
         let Some(cur) = self.current.get_untracked() else {
             return;
@@ -1288,8 +1288,14 @@ impl Store {
         let Some(path) = cur.operator_file.clone() else {
             return;
         };
-        match self.app().save_operator_edits(&path, edits) {
-            Ok(spec) => {
+        match self.app().save_operator(
+            &path.to_string_lossy(),
+            &cur.operator,
+            &cur.operator_ref,
+            edits,
+        ) {
+            Ok(saved) => {
+                let spec = saved.operator;
                 let name = path
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
@@ -1337,13 +1343,12 @@ impl Store {
                         base_spec.read = cur.operator.read.clone();
                         base_spec.write = cur.operator.write.clone();
                         base_spec.http = cur.operator.http.clone();
-                        match s.app().write_operator_file(
-                            cur.operator_file.as_deref(),
-                            &path,
-                            &base_spec,
-                            &edits,
-                        ) {
-                            Ok(spec) => {
+                        match s
+                            .app()
+                            .save_operator(&dest, &base_spec, &cur.operator_ref, &edits)
+                        {
+                            Ok(saved) => {
+                                let spec = saved.operator;
                                 let name = path
                                     .file_name()
                                     .map(|n| n.to_string_lossy().into_owned())

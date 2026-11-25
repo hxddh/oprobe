@@ -120,12 +120,13 @@ change prints with its 95 % interval ([glossary](concepts.md#glossary)).
 | `--objective goodput\|p99` | what the change is judged on: successful operations (or bytes) per second (default), or the worst per-operation p99 latency |
 | `--max-throttle RATIO` | share of throttled requests a change may cause, e.g. `0.1%` or `0.001` |
 | `--max-duration DURATION` | wall-time budget of the whole proof, e.g. `5m` |
-| `--save FILE\|OPERATOR` | when the verdict is `improved`, write the proven change to an `op.toml` file or to `[operators.OPERATOR]` in the config file |
+| `--save FILE\|OPERATOR` | when the verdict is `improved`, write the proven change to an `op.toml` file or to `[operators.OPERATOR]` in the config file. A new file gets the operator with its `${ENV}` references and without secret values; the run's own `op.toml` (or another of the same service) is patched in place; the config file's path saves to the run's `[operators.NAME]`. Any other existing file is refused before a trial runs. The proof is saved first: a save that fails is a note |
 | `--dry-run` | print the number of trials and the ETA of the whole proof, and exit (`-o json`: `schemas/prove-plan.json`) |
 | `--read-only` | refuse every write and delete (exit 5) |
 | `--max-requests N`, `--max-bytes SIZE` | stop after this many backend requests or bytes, over every trial (exit 4) |
 
-Every trial is saved as a run, a child of the prove, and hidden from `show --list`.
+Every trial is saved as a run, a child of the prove, and hidden from `show --list`. A prove
+stopped before its result is saved (Ctrl-C) deletes its trials.
 
 ```bash
 oprobe prove last throttling

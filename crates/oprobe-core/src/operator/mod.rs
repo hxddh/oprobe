@@ -520,6 +520,28 @@ impl OperatorSpec {
         Ok(s)
     }
 
+    /// This operator with `http.ca_cert` as the operator file `operator_ref` gives it: a
+    /// relative path stays relative (what a result stores and shows), where [`Self::load`]
+    /// made it absolute for this machine. Unchanged for a URL, a configured name, or a path
+    /// that is not the file's.
+    pub fn as_given(&self, operator_ref: &str) -> Self {
+        let mut s = self.clone();
+        let Some(path) = resolve::operator_file_path(operator_ref) else {
+            return s;
+        };
+        let given = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|raw| toml::from_str::<Self>(&raw).ok())
+            .and_then(|o| o.http.ca_cert);
+        if let (Some(given), Some(abs)) = (given, &self.http.ca_cert)
+            && given.is_relative()
+            && abs.ends_with(&given)
+        {
+            s.http.ca_cert = Some(given);
+        }
+        s
+    }
+
     /// The `op.toml` form (defaults left out).
     pub fn to_toml(&self) -> String {
         toml::to_string(self).unwrap_or_default()

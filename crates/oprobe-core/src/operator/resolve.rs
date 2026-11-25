@@ -121,6 +121,12 @@ mod tests {
             loaded.http.ca_cert,
             Some(std::fs::canonicalize(&sub).unwrap().join("ca.pem"))
         );
+        // What a prove result stores: the path as the file gives it, not this machine's
+        // absolute one (9.0 stored `/home/…/sub/ca.pem` in `.prove.json`).
+        let given = loaded.as_given(sub_op.to_str().unwrap());
+        assert_eq!(given.http.ca_cert, Some(PathBuf::from("ca.pem")));
+        assert_eq!(loaded.as_given("s3://b/x"), loaded);
+        assert_eq!(loaded.as_given("prod"), loaded);
         let e = resolve("prdo", &cfg).unwrap_err();
         assert_eq!(e.code, ErrorCode::UsageUnknownTarget);
         assert!(e.hint.unwrap().contains("prod"));

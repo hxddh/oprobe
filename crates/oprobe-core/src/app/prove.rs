@@ -284,6 +284,9 @@ pub struct ProveOutput {
     /// Where the proven operator was written (`--save`, when `verdict == improved`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub saved_to: Option<String>,
+    /// `oprobe run` of the run's workload on the proven operator: the next profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_command: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<String>,
 }
@@ -441,18 +444,20 @@ impl CommandOutput for ProveOutput {
     }
 
     fn next(&self) -> Vec<NextStep> {
-        let mut sets = String::new();
-        for c in &self.change {
-            sets += &format!(" --set {}", shell_edit(c));
-        }
+        // The run's own workload (preset, `-c`, `-d`, `--existing`, …) on the proven operator;
+        // a result stored without it falls back to the operator and the change alone.
+        let command = self.run_command.clone().unwrap_or_else(|| {
+            let mut sets = String::new();
+            for c in &self.change {
+                sets += &format!(" --set {}", shell_edit(c));
+            }
+            format!(
+                "oprobe run {}{sets}",
+                crate::model::spec::shell_quote(&self.operator_ref)
+            )
+        });
         vec![
-            NextStep::new(
-                "profile the changed operator",
-                format!(
-                    "oprobe run {}{sets}",
-                    crate::model::spec::shell_quote(&self.operator_ref)
-                ),
-            ),
+            NextStep::new("profile the changed operator", command),
             NextStep::new("its trials", "oprobe show --list --all"),
         ]
     }
@@ -1295,6 +1300,25 @@ impl Trials<'_> {
     }
 }
 
+/// Deletes the trial runs of prove `prove_id` when dropped armed: a prove that ends before its
+/// result is saved (Ctrl-C, an error, a front end dropping the job) leaves no orphan trials.
+struct OrphanTrials {
+    store: crate::store::RunStore,
+    prove_id: String,
+    armed: bool,
+}
+
+impl Drop for OrphanTrials {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        for id in self.store.children(&self.prove_id).unwrap_or_default() {
+            let _ = self.store.delete(&id);
+        }
+    }
+}
+
 /// A guard's budget stopped a trial (`safety.budget_exceeded`).
 fn is_budget_breach(e: &anyhow::Error) -> bool {
     e.chain().any(|c| {
@@ -1813,6 +1837,14 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
         .or(run.report.spec.profile.sla.max_throttle_rate)
         .unwrap_or(defaults.max_throttle_ratio);
     let change = choose_change(&run, &req)?;
+    // A `--save` that cannot be written fails now, not after the trials.
+    if let Some(dest) = &req.save {
+        ctx.app().check_save(
+            dest,
+            &run.report.spec.profile.operator,
+            &run.report.spec.operator_ref,
+        )?;
+    }
     // The base profile, with credentials resolved again, on a short trial window.
     let mut base = super::profile::spec_profile(ctx, run.report.spec.clone())?;
     let trial_window = match &req.trial_duration {
@@ -1895,6 +1927,13 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
             .ok()
             .and_then(|(_, s)| s.name());
     let short_warmup = baseline_warmup(&base, &change);
+    // Until the prove result is saved, its trial runs belong to nothing: an interruption, an
+    // error or a dropped future deletes them, or no `show --rm` could ever reach them.
+    let mut orphans = OrphanTrials {
+        store: ctx.store(),
+        prove_id: prove_id.clone(),
+        armed: !req.no_save,
+    };
     let mut t = Trials {
         ctx,
         run: &run,
@@ -2019,6 +2058,11 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
             break;
         }
     }
+    // Ctrl-C between two trials stops the loop like one during a trial: the prove is
+    // interrupted (exit 130, its trials deleted), not a result of the pairs that happened to run.
+    if cancel.is_cancelled() && t.breach.is_none() {
+        return Err(OprobeError::new(ErrorCode::RunInterrupted, "prove interrupted").into());
+    }
     // No trial ran at all (the wall-time budget): nothing to show. A breach saved its trial,
     // so the prove is saved too.
     if pairs == 0 && t.out.is_empty() && t.breach.is_none() {
@@ -2087,11 +2131,14 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
     notes.extend(throttle_note);
     let secondary = secondary(obj, &a_trials, &b_trials, floor);
     let base_spec: &OperatorSpec = &run.report.spec.profile.operator;
-    let mut changed = base_spec.clone();
+    // What the result shows and stores: the operator as its file gives it (a relative
+    // `http.ca_cert` stays relative, not this machine's absolute path).
+    let shown_base = base_spec.as_given(&run.report.spec.operator_ref);
+    let mut changed = shown_base.clone();
     changed
         .apply_edits(&sets)
         .context("apply the proven change")?;
-    let diff = crate::operator::diff::diff(base_spec, &changed);
+    let diff = crate::operator::diff::diff(&shown_base, &changed);
     let r = &run.report;
     let environment = if r.spec.operator_ref.starts_with("lab://") {
         format!("{} (local lab)", r.spec.operator_ref)
@@ -2102,25 +2149,24 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
         }
     };
     let raw_edits: Vec<String> = sets.iter().map(|(k, v)| format!("{k}={v}")).collect();
-    let mut saved_to = None;
-    if let Some(dest) = &req.save {
-        if verdict == ProveVerdict::Improved {
-            saved_to = Some(
-                ctx.app()
-                    .save_operator_target(dest, base_spec, &raw_edits)?,
-            );
-        } else {
-            let v_label = match verdict {
-                ProveVerdict::Improved => "improved",
-                ProveVerdict::Worse => "worse",
-                ProveVerdict::Inconclusive => "inconclusive",
-            };
-            notes.push(format!(
-                "--save `{dest}` skipped: verdict is {v_label}, not improved"
-            ));
-        }
+    let save_now = req
+        .save
+        .as_ref()
+        .filter(|_| verdict == ProveVerdict::Improved);
+    if let Some(dest) = &req.save
+        && save_now.is_none()
+    {
+        let v_label = match verdict {
+            ProveVerdict::Improved => "improved",
+            ProveVerdict::Worse => "worse",
+            ProveVerdict::Inconclusive => "inconclusive",
+        };
+        notes.push(format!(
+            "--save `{dest}` skipped: verdict is {v_label}, not improved"
+        ));
     }
-    let out = ProveOutput {
+    let run_command = profile_command(&r.spec, &sets);
+    let mut out = ProveOutput {
         schema: PROVE_SCHEMA.to_owned(),
         prove_id: prove_id.clone(),
         run_id: run.id().to_owned(),
@@ -2144,17 +2190,66 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
         trials: t.out.clone(),
         diff,
         budget_exceeded,
-        saved_to,
+        saved_to: None,
+        run_command,
         notes,
     };
-    if !req.no_save
-        && let Err(e) = ctx
+    // The proof first: a `--save` that fails after it must not lose it.
+    let store_prove = |out: &ProveOutput| -> Result<bool> {
+        if req.no_save {
+            return Ok(false);
+        }
+        match ctx
             .store()
-            .save_prove(&prove_id, &serde_json::to_value(&out)?)
-    {
-        ctx.out.warn(format!("cannot save the prove result: {e:#}"));
+            .save_prove(&prove_id, &serde_json::to_value(out)?)
+        {
+            Ok(_) => Ok(true),
+            Err(e) => {
+                ctx.out.warn(format!("cannot save the prove result: {e:#}"));
+                Ok(false)
+            }
+        }
+    };
+    // Once stored, its trials belong to the prove (`show --rm PROVE` removes them).
+    if store_prove(&out)? {
+        orphans.armed = false;
+    }
+    if let Some(dest) = save_now {
+        match ctx
+            .app()
+            .save_operator(dest, base_spec, &run.report.spec.operator_ref, &raw_edits)
+        {
+            Ok(saved) => out.saved_to = Some(saved.to),
+            Err(e) => {
+                ctx.out.warn(format!("--save `{dest}` failed: {e:#}"));
+                out.notes
+                    .push(format!("--save `{dest}` failed: {e:#}; the proof is kept"));
+            }
+        }
+        store_prove(&out)?;
     }
     Ok(ProveOutcome::Proved(Box::new(out)))
+}
+
+/// `oprobe run` of the run's workload (its preset, `-c`, `-d`, `--existing`, …) on the operator
+/// with `sets` applied: the command that profiles the proven operator as the run did.
+fn profile_command(spec: &crate::model::RunSpec, sets: &[(String, String)]) -> Option<String> {
+    // The run's own command, then the change as `--set` pairs (the last value of a path wins;
+    // a secret value given as an environment variable of its name, as `next` always did).
+    let mut args = spec.args();
+    for (k, v) in sets {
+        let e = crate::operator::redacted_edit(k, v);
+        let e = match e.split_once('=') {
+            Some((k, crate::model::spec::REDACTED)) => {
+                let var = k.rsplit('.').next().unwrap_or(k).to_ascii_uppercase();
+                format!("{k}=${{{var}}}")
+            }
+            _ => e,
+        };
+        args.push("--set".into());
+        args.push(e);
+    }
+    Some(crate::model::spec::command_line(&args))
 }
 
 #[cfg(test)]
@@ -2207,6 +2302,7 @@ mod tests {
             diff: crate::operator::diff::diff(&a, &b),
             budget_exceeded: pairs == 0,
             saved_to: None,
+            run_command: None,
             notes: vec!["the budget ran out before one pair of trials could run".into()],
         }
     }
