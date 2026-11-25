@@ -189,12 +189,12 @@ Each finding carries the evidence it rests on:
 | `errors` | failed operations per second |
 
 **Operator.** The run's layer stack beside each finding's remedy. A finding's **Prove** (and
-**Prove this remedy** in Profile) proves that finding as `oprobe prove RUN CODE` does: prove
+**Prove this remedy** in Profile) proves that finding as its `next` command (`oprobe prove RUN CODE`, with its objective) does: prove
 sizes the remedy from the run (a limit from the fitted throttling limit, say) and then proves
 it. Toggle a layer or change a value (a limit, a chunk size) yourself and **Prove** proves your
 change with the values you set. The trials stream in live and their A/B pairs are drawn as they
 converge: each pair's change as a dot, the running estimate with its 95 % interval narrowing,
-and the A/A noise floor around no change, until the sequential test decides: **improved**,
+and the noise floor around no change, until the sequential test decides: **improved**,
 **worse** or **inconclusive**. **Copy** puts the winning diff (Rust or TOML) on the clipboard; when
 the run came from an `op.toml` file, **Save to op.toml** writes the proven change back to it in
 place (preserving credentials and `${ENV}` references).

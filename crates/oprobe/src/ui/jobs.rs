@@ -402,17 +402,18 @@ pub fn ab_pairs(trials: &[crate::app::prove::ProveTrial], p99: bool) -> Vec<(f64
         .collect()
 }
 
-/// Prove's pairs so far as `(baseline, candidate, fewest operations)`.
+/// Prove's pairs so far as `(baseline, candidate, fewest operations)`: each two trials of a
+/// pair run back to back, in either order (prove draws the order of each pair).
 pub fn ab_live(trials: &[Trial]) -> Vec<(f64, f64, u64)> {
     let mut out = Vec::new();
-    let mut last_a = None;
+    let mut open: Option<&Trial> = None;
     for t in trials {
-        if t.candidate {
-            if let Some((a, na)) = last_a.take() {
-                out.push((a, t.value, t.ops.min(na)));
+        match open.take() {
+            Some(o) if o.candidate != t.candidate => {
+                let (a, b) = if t.candidate { (o, t) } else { (t, o) };
+                out.push((a.value, b.value, a.ops.min(b.ops)));
             }
-        } else {
-            last_a = Some((t.value, t.ops));
+            _ => open = Some(t),
         }
     }
     out
@@ -504,6 +505,27 @@ mod tests {
         assert!(zh.contains("被限流 +0.500 pp"), "{zh}");
         assert!(zh.contains("百分点"), "{zh}");
         super::super::i18n::set(super::super::i18n::Lang::En);
+    }
+
+    #[test]
+    fn live_pairs_take_either_order() {
+        let t = |candidate, value| Trial {
+            candidate,
+            value,
+            ops: 100,
+        };
+        let p = ab_live(&[
+            t(false, 100.0),
+            t(true, 120.0),
+            t(true, 99.0),
+            t(false, 90.0),
+            t(false, 80.0),
+            t(true, 88.0),
+        ]);
+        assert_eq!(
+            p,
+            [(100.0, 120.0, 100), (90.0, 99.0, 100), (80.0, 88.0, 100)]
+        );
     }
 
     #[test]

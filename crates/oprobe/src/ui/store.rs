@@ -1224,12 +1224,13 @@ impl Store {
         });
     }
 
-    /// Prove finding `code`'s remedy as `oprobe prove RUN CODE` does: `App::prove` sizes the
-    /// remedy from the run and proves it. Changes made by hand are dropped (they would be
-    /// proved instead).
+    /// Prove finding `code`'s remedy as its `next` command does (`oprobe prove RUN CODE`, on the
+    /// objective it is proved on): `App::prove` sizes the remedy from the run and proves it.
+    /// Changes made by hand are dropped (they would be proved instead).
     pub fn prove_remedy(&self, code: &str) {
         batch(|| {
             self.edits.set(BTreeMap::new());
+            self.objective.set(ProveObjective::of_finding(code));
             self.prove_finding.set(Some(code.to_owned()));
             self.page.set(Page::Operator);
         });

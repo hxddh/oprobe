@@ -10,7 +10,7 @@ workload), `prove` (A/B-test a change and print the proven layer diff), `show` (
 `.oprobe` file; `--list` for history) and `lab` (a local S3 with faults). `demo` is
 `run lab://demo`. Every command prints one JSON document with `-o json`; schemas are in the
 repository's `schemas/` (`run`, `plan`, `report`, `prove`, `prove-plan`, `show`, `run-list`,
-`compare`, `removed`, `lab`, `operator`, `error`, `events`).
+`removed`, `lab`, `operator`, `error`, `events`; `show A B` prints a `run` document).
 
 ## Rules
 
@@ -40,7 +40,7 @@ oprobe run s3://bucket/prefix --existing data/ -c 16 -d 15s \
   --max-requests 20000 --max-duration 1m -o json            # profile (saves the run)
 oprobe show last --by stage -o json                   # where the time went, per stage
 oprobe show last --since 3s --until 8s -o json        # one time range (`range`), from the rows
-oprobe prove last throttling --max-duration 5m -o json   # A/B-test the finding's remedy
+oprobe prove last throttling --objective p99 --max-duration 5m -o json   # the finding's `next`
 oprobe prove last --with layers.tail_cut=on --objective p99 -o json   # a change of your own
 oprobe show --list -o json                            # history (prove trials hidden)
 oprobe show prod.oprobe -o json                       # a profile written by oprobe-trace
