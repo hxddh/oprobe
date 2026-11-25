@@ -24,6 +24,12 @@ fn rec(h: &mut Histogram<u64>, us: u64) {
     let _ = h.record(us.min(HIST_MAX_US));
 }
 
+/// Whether request `r` dialed its connection: a connection counts as new through the request
+/// that used it first.
+fn dialed(r: &RequestRecord) -> bool {
+    !r.reused && r.protocol != Protocol::InProcess && (r.status != 0 || r.timing.connect_us() > 0)
+}
+
 pub fn quantiles(h: &Histogram<u64>) -> Quantiles {
     if h.is_empty() {
         return Quantiles::default();
@@ -457,8 +463,6 @@ struct Agg {
     schedule: Histogram<u64>,
     /// Missed arrivals recorded as censored latencies.
     censored: u64,
-    /// `conn.dialed` at the last series probe.
-    dials_seen: u64,
     /// Prefixes, hot keys, size buckets, cold vs warm (design v5 §3, M12).
     dims: crate::dims::DimAgg,
 }
@@ -495,7 +499,6 @@ impl Agg {
             open_loop: None,
             schedule: hist(),
             censored: 0,
-            dials_seen: 0,
             dims: crate::dims::DimAgg::default(),
         }
     }
@@ -540,6 +543,7 @@ impl Agg {
 
     fn record_request(&mut self, r: &RequestRecord) {
         self.requests += 1;
+        // `dialed(r)`: counted in `conn.dialed` here, and in its interval by the caller.
         let is_cut = r.detail.as_deref().is_some_and(|d| d.cut);
         if is_cut {
             self.res.tail_cuts += 1;
@@ -595,7 +599,7 @@ impl Agg {
         // A connection counts as dialed in the window through the request that used it first,
         // so "new connections" and "warm %" always describe the same requests (and unconnected
         // cancelled requests with `status == 0` and `connect_us == 0` do not pollute `connect`).
-        if !r.reused && r.protocol != Protocol::InProcess && (r.status != 0 || t.connect_us() > 0) {
+        if dialed(r) {
             rec(&mut a.stages.connect, t.connect_us());
             self.conn.dialed += 1;
             rec(&mut self.dns, t.dns_us);
@@ -990,7 +994,23 @@ impl Recorder {
         if self.is_measuring() {
             self.peak_inflight_requests
                 .fetch_max(cur, Ordering::Relaxed);
+            // The interval's peak, where the request starts: an embedded layer has no series
+            // probe ([`Self::sample_series`]) to sample it.
+            self.with_current_bucket(|b| b.inflight_peak = b.inflight_peak.max(cur));
         }
+    }
+
+    /// Run `f` on the interval the window is in now (nothing outside the window).
+    fn with_current_bucket(&self, f: impl FnOnce(&mut Bucket)) {
+        if !self.window_open() {
+            return;
+        }
+        let window_start = self.window_start();
+        let frozen = self.frozen_elapsed_us.load(Ordering::Acquire);
+        let idx = event_bucket(window_start.elapsed().as_micros() as u64, frozen);
+        let mut a = self.agg();
+        self.ensure_bucket(&mut a, idx, window_start);
+        f(a.bucket(idx));
     }
 
     pub fn request_finished(&self) {
@@ -1031,6 +1051,7 @@ impl Recorder {
         if !self.is_measuring() {
             return;
         }
+        self.with_current_bucket(|b| b.dials += 1);
         let mut a = self.agg();
         a.conn.dialed += 1;
         rec(&mut a.dns, dns_us);
@@ -1064,6 +1085,9 @@ impl Recorder {
                 a.record_request(r);
                 self.ensure_bucket(&mut a, ended.max(sent), window_start);
                 a.bucket(sent).requests += 1;
+                if dialed(r) {
+                    a.bucket(sent).dials += 1;
+                }
                 if r.is_throttle() {
                     a.bucket(ended).throttled += 1;
                 }
@@ -1355,6 +1379,10 @@ impl Recorder {
             let i = at(sent);
             self.ensure_bucket(&mut a, i, window_start);
             a.bucket(i).requests += 1;
+            // A new connection lands where the request that dialed it was sent.
+            if dialed(r) {
+                a.bucket(i).dials += 1;
+            }
             if r.is_throttle() {
                 let i = at(sent + r.timing.total_us);
                 self.ensure_bucket(&mut a, i, window_start);
@@ -1478,23 +1506,13 @@ impl Recorder {
         a.compact();
     }
 
-    /// The per-interval series probe (call it every few ms while measuring): requests in
-    /// flight and connections dialed land in the current interval.
+    /// The per-interval series probe (optional; `oprobe run` calls it every few ms): the
+    /// requests in flight now land in the current interval. Requests and dials also fill their
+    /// interval as they start ([`Self::request_started`], [`Self::complete_op`]), so an
+    /// embedded layer without a probe has the same series.
     pub fn sample_series(&self) {
-        if !self.window_open() {
-            return;
-        }
-        let window_start = self.window_start();
-        let idx = bucket_index(window_start.elapsed().as_secs());
         let inflight = self.inflight_requests.load(Ordering::Relaxed);
-        let mut a = self.agg();
-        self.ensure_bucket(&mut a, idx, window_start);
-        let dialed = a.conn.dialed;
-        let new = dialed.saturating_sub(a.dials_seen);
-        a.dials_seen = dialed;
-        let b = a.bucket(idx);
-        b.inflight_peak = b.inflight_peak.max(inflight);
-        b.dials += new;
+        self.with_current_bucket(|b| b.inflight_peak = b.inflight_peak.max(inflight));
     }
 
     /// Capture await-tree call stacks of operations running longer than `threshold_us`.

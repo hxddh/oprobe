@@ -170,6 +170,9 @@ pub struct LabConfig {
     pub max_inflight_before_503: Option<usize>,
     pub throttle_every_n_requests: Option<usize>,
     pub throttle_status_code: u16,
+    /// Answer a throttled 503 with `ServiceUnavailable` ("reduce your request rate", as S3
+    /// also does) instead of `SlowDown`.
+    pub throttle_service_unavailable: bool,
     pub stream_bandwidth_kib_s: Option<u64>,
     /// Answer throttled requests immediately and close the connection without reading the
     /// request body, as real gateways do. Clients then often see a reset or abort while still
@@ -1091,6 +1094,8 @@ async fn handle_s3_request<'a>(
             };
             let code_str = if status_u16 == 429 {
                 "TooManyRequests"
+            } else if faults.throttle_service_unavailable {
+                "ServiceUnavailable"
             } else {
                 "SlowDown"
             };

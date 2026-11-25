@@ -113,9 +113,9 @@ impl FailureCode {
     }
 
     /// [`FailureCode::from_status`], refined by the provider's error code when it names the
-    /// failure more precisely (Azure `BlobAlreadyExists` on a 409, `InternalError` /
-    /// `ServiceUnavailable` on a 503, `tail_cut` on a cancelled hedge, or an in-process
-    /// backend's OpenDAL kind).
+    /// failure more precisely (Azure `BlobAlreadyExists` on a 409, `InternalError` on a 503,
+    /// `tail_cut` on a cancelled hedge, or an in-process backend's OpenDAL kind). A 503
+    /// `ServiceUnavailable` stays throttling: S3 answers it with "reduce your request rate".
     pub fn of_request(status: u16, provider_code: Option<&str>) -> Option<Self> {
         if provider_code == Some("tail_cut") {
             return Some(Self::NetTimeout);
@@ -127,9 +127,15 @@ impl FailureCode {
                 Self::StorageConditionNotMatch
             }
             Some("InvalidRange" | "RangeNotSatisfied") => Self::StorageRangeNotSatisfied,
-            Some("InternalError" | "ServiceUnavailable") if status == 503 => Self::Internal,
+            Some("InternalError") if status == 503 => Self::Internal,
             _ => code,
         })
+    }
+
+    /// Whether a response is throttling: a 429, or a 503 other than `InternalError` (S3's
+    /// `SlowDown` and its `ServiceUnavailable` "reduce your request rate" alike).
+    pub fn is_throttle_response(status: u16, provider_code: Option<&str>) -> bool {
+        status == 429 || (status == 503 && provider_code != Some("InternalError"))
     }
 
     /// Whether OpenDAL retries a request that failed with HTTP `status` (0: no response): no
@@ -402,12 +408,10 @@ impl ReqRow {
         self.dns_us + self.tcp_us + self.proxy_us + self.tls_us
     }
     pub fn is_throttle(&self) -> bool {
-        self.status == 429
-            || (self.status == 503
-                && !matches!(
-                    self.detail.as_deref().and_then(|d| d.error_code.as_deref()),
-                    Some("InternalError" | "ServiceUnavailable")
-                ))
+        FailureCode::is_throttle_response(
+            self.status,
+            self.detail.as_deref().and_then(|d| d.error_code.as_deref()),
+        )
     }
     pub fn is_error(&self) -> bool {
         self.status == 0 || self.status >= 400 || self.error.is_some()
