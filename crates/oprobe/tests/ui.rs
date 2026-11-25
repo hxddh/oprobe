@@ -795,10 +795,13 @@ fn findings_apis_and_the_verb_filter_drill_down() {
     app.press("id:verb-filter >> text:stat").unwrap();
     wait_long(&mut app, "text:Goodput · stat");
     wait_long(&mut app, "text:Requests per second · all verbs");
+    // Throughput over time: its own chart, or goodput's right axis when every operation moves
+    // the same bytes (`TimelineView::layout`) — then a verb's goodput is not every
+    // operation's, and it has its chart again.
+    wait_long(&mut app, "id:chart-throughput");
     app.press("id:verb-filter >> text:All verbs").unwrap();
     app.wait_for_gone("text:Goodput · stat", LONG).unwrap();
-    // Throughput over time; the throttled responses (and the retries) on their own axis.
-    wait_long(&mut app, "id:chart-throughput");
+    // The throttled responses (and the retries) on their own axis.
     wait_long(&mut app, "id:chart-problems");
     wait_long(&mut app, "label:/^Problems per second over /");
     wait_long(&mut app, "id:timeline >> text:throttled responses");
