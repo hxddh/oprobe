@@ -161,6 +161,7 @@ fn modifiers(keys: KeyModifiers) -> Modifiers {
         alt: keys.contains(KeyModifiers::ALT),
         shift: keys.contains(KeyModifiers::SHIFT),
         cmd: keys.contains(KeyModifiers::SUPER),
+        alt_graph: false,
     }
 }
 

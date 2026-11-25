@@ -184,7 +184,7 @@ fn legend(h: &Heat) -> View {
 /// The heatmap: `link` shares the time cursor and range with the timeline (a drag selects a
 /// range), `on_cell` hears a click on a cell.
 pub fn heatmap(
-    heading: &'static str,
+    heading: String,
     height: f32,
     data: Heat,
     link: Option<TimeLink>,

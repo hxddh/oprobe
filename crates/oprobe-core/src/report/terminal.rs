@@ -810,7 +810,7 @@ fn render_with(r: &Report, run: Option<&Run>, detail: bool) -> String {
     }
 
     if let Some(run) = run {
-        let n = if detail { 5 } else { 1 };
+        let n = super::view::SLOWEST_COUNT;
         let slow: Vec<&OpRow> = r
             .slowest
             .iter()
@@ -1314,7 +1314,11 @@ pub fn range_section_with(run: &Run, v: &super::range::RangeView, detail: bool) 
         .collect();
     if !slow.is_empty() {
         section(&mut out, "Slowest operations in the range");
-        let n = if detail { slow.len() } else { 3 };
+        let n = if detail {
+            slow.len()
+        } else {
+            super::view::SLOWEST_COUNT
+        };
         for op in slow.iter().take(n) {
             out += &slow_op_block(op, &run.requests_of(op.op_id), detail);
         }
@@ -1336,6 +1340,7 @@ mod tests {
                 throttled_ratio: None,
                 throttle_share_ratio: Some(0.75),
                 error_ratio: None,
+                p50_ms: None,
                 p99_ms: None,
             }],
             ..Default::default()

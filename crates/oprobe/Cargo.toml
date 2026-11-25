@@ -67,28 +67,28 @@ dirs.workspace = true
 tokio-util.workspace = true
 
 # The app (Native Shell): the terminal workbench (`app`, default) and native windows (`gui`).
-nsh-core = { version = "0.6", features = ["svg"], optional = true }
-nsh-base = { version = "0.6", default-features = false, features = ["plot"], optional = true }
-nsh-platform-tui = { version = "0.6", default-features = false, features = ["run-app"], optional = true }
+nsh-core = { version = "0.7", features = ["svg"], optional = true }
+nsh-base = { version = "0.7", default-features = false, optional = true }
+nsh-platform-tui = { version = "0.7", default-features = false, features = ["run-app"], optional = true }
 ratatui-core = { version = "0.1", optional = true }
 ratatui-crossterm = { version = "0.1", optional = true }
 crossterm = { version = "0.29", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-nsh-platform-linux = { version = "0.6", default-features = false, features = ["plot"], optional = true }
+nsh-platform-linux = { version = "0.7", default-features = false, optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-nsh-platform-macos = { version = "0.6", default-features = false, features = ["plot"], optional = true }
+nsh-platform-macos = { version = "0.7", default-features = false, optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-nsh-platform-windows = { version = "0.6", default-features = false, features = ["plot"], optional = true }
+nsh-platform-windows = { version = "0.7", default-features = false, optional = true }
 
 [target."cfg(windows)".dependencies]
 windows-sys.workspace = true
 
 [dev-dependencies]
-nsh-engine = { version = "0.6", default-features = false }
-nsh-testing = { version = "0.6", default-features = false }
+nsh-engine = { version = "0.7", default-features = false }
+nsh-testing = { version = "0.7", default-features = false }
 opendal-http-transport-reqwest = "0.59"
 tempfile.workspace = true
 jsonschema = { version = "0.61", default-features = false }

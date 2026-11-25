@@ -229,6 +229,27 @@ impl FindingView {
         }
     }
 
+    /// What a finding's card says under its title, given the verdict's headline (9.1 review §2
+    /// item 1): the cause, unless the headline already says it; the evidence in words only
+    /// when there are no named values (the values' table holds the numbers).
+    pub fn card(&self, headline: &str) -> FindingCard {
+        let first = |t: &str| {
+            t.split(". ")
+                .next()
+                .unwrap_or(t)
+                .trim()
+                .trim_end_matches('.')
+                .to_owned()
+        };
+        let cause = first(&self.cause);
+        let repeated = !cause.is_empty() && first(headline) == cause;
+        FindingCard {
+            cause: (!repeated && !self.cause.is_empty()).then(|| self.cause.clone()),
+            evidence: (self.items.is_empty() && !self.evidence.is_empty())
+                .then(|| self.evidence.clone()),
+        }
+    }
+
     /// The remedy in one line, each part once: `path + with — words`, or only the words when
     /// the remedy is not a layer (`key_limit`, `client_bound`: the label already is the words).
     pub fn remedy_line(&self) -> String {
@@ -237,6 +258,13 @@ impl FindingView {
             None => self.remedy.clone(),
         }
     }
+}
+
+/// The text of a finding's card ([`FindingView::card`]).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FindingCard {
+    pub cause: Option<String>,
+    pub evidence: Option<String>,
 }
 
 /// The findings in the report's order (already ranked: `invalid_run` leads a run that cannot
@@ -651,6 +679,8 @@ pub struct TimelineView {
     pub new_connections_count: Vec<u64>,
     /// The client's CPU in percent of one core (350: 3.5 cores busy), where it was sampled.
     pub cpu_pct: Vec<Option<f64>>,
+    /// Open-loop arrivals due in each interval that never started.
+    pub missed_arrivals_count: Vec<u64>,
     /// The verb the series are filtered to ([`TimelineView::for_verb`]); `None`: every verb.
     pub verb: Option<String>,
 }
@@ -693,6 +723,7 @@ impl TimelineView {
             v.inflight_peak_count.push(p.inflight_peak);
             v.new_connections_count.push(p.new_connections);
             v.cpu_pct.push(p.cpu_pct);
+            v.missed_arrivals_count.push(p.missed_arrivals);
         }
         v
     }
@@ -783,6 +814,7 @@ impl TimelineView {
                 );
             }
             sum(&self.new_connections_count, &mut v.new_connections_count);
+            sum(&self.missed_arrivals_count, &mut v.missed_arrivals_count);
             if self.cpu_pct.len() == n {
                 // Averaged over the sampled intervals' time.
                 let (busy, t) = self.cpu_pct[r.clone()]
@@ -868,6 +900,74 @@ impl TimelineView {
         let min = Self::min_ops_for(q);
         self.ops_count.iter().map(|n| *n >= min).collect()
     }
+
+    /// Which charts of the timeline say something of their own (9.1 review §2 item 3):
+    /// requests per second only when an operation is not one request; throughput as its own
+    /// chart only when the bytes per operation vary, else as goodput's right axis; the client's
+    /// CPU only when the client was saturated (`client_saturated`, [`TrustView`]).
+    pub fn layout(&self, client_saturated: bool) -> TimelineLayout {
+        let active: Vec<usize> = (0..self.len())
+            .filter(|i| self.ops_per_s.get(*i).is_some_and(|v| *v > 0.0))
+            .collect();
+        let ratio_of = |v: &[f64], i: usize| v.get(i).copied().unwrap_or(0.0) / self.ops_per_s[i];
+        let steady = |v: &[f64], centre: f64, tol: f64| {
+            !active.is_empty()
+                && active.iter().all(|i| {
+                    let r = ratio_of(v, *i);
+                    (r - centre).abs() <= tol * centre.abs().max(1e-12)
+                })
+        };
+        let has_requests =
+            self.requests_per_s.len() == self.len() && self.requests_per_s.iter().any(|v| *v > 0.0);
+        let requests = has_requests && !steady(&self.requests_per_s, 1.0, 0.02);
+        let moved = self.mib_per_s.len() == self.len() && self.mib_per_s.iter().any(|v| *v > 0.0);
+        let throughput = if !moved {
+            ThroughputChart::None
+        } else {
+            let (mib, ops) = active.iter().fold((0.0, 0.0), |(m, o), i| {
+                let l = self.len_s.get(*i).copied().unwrap_or(1.0);
+                (m + self.mib_per_s[*i] * l, o + self.ops_per_s[*i] * l)
+            });
+            let per_op = if ops > 0.0 { mib / ops } else { 0.0 };
+            let no_failures = self
+                .ops_per_s
+                .iter()
+                .zip(&self.goodput_ops_per_s)
+                .all(|(a, g)| (a - g).abs() <= 1e-9 * a.abs().max(1.0));
+            if per_op > 0.0 && no_failures && steady(&self.mib_per_s, per_op, 0.02) {
+                ThroughputChart::OnGoodput { mib_per_op: per_op }
+            } else {
+                ThroughputChart::Own
+            }
+        };
+        TimelineLayout {
+            requests,
+            throughput,
+            cpu: client_saturated && self.cpu_cores().is_some(),
+        }
+    }
+}
+
+/// Which timeline charts a front end draws ([`TimelineView::layout`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TimelineLayout {
+    /// Requests per second differ from operations per second (retries, multipart, pages).
+    pub requests: bool,
+    pub throughput: ThroughputChart,
+    /// The client's CPU over time (only when the client was saturated).
+    pub cpu: bool,
+}
+
+/// Where the timeline draws bytes per second.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ThroughputChart {
+    /// Nothing moved.
+    None,
+    /// Its own chart: the bytes per operation vary.
+    Own,
+    /// The goodput chart's right axis: every operation moved `mib_per_op` MiB, so throughput
+    /// is goodput times it (the same shape).
+    OnGoodput { mib_per_op: f64 },
 }
 
 /// The timeline clipped to the measurement window: an interval that starts at or after the
@@ -1022,6 +1122,27 @@ impl TcpView {
         }
         s
     }
+}
+
+/// The measured operator's connections that the kernel reported on, from its request rows:
+/// `(connections, connections that retransmitted, retransmitted segments)`. `None` when no
+/// row carries the kernel's statistics.
+fn measured_connections(run: &Run) -> Option<(u64, u64, u64)> {
+    let mut by: std::collections::BTreeMap<u64, u64> = Default::default();
+    for q in run.reqs.iter().filter(|q| q.conn_id != 0) {
+        if let Some(t) = &q.tcp {
+            let e = by.entry(q.conn_id).or_default();
+            *e = (*e).max(t.retrans);
+        }
+    }
+    if by.is_empty() {
+        return None;
+    }
+    Some((
+        by.len() as u64,
+        by.values().filter(|r| **r > 0).count() as u64,
+        by.values().sum(),
+    ))
 }
 
 /// The p50 of the kernel's minimum round trip over the request rows that recorded one.
@@ -1181,16 +1302,23 @@ impl ConnectionView {
                 .kernel
                 .as_ref()
                 .filter(|k| k.samples_count > 0)
-                .map(|k| TcpView {
-                    min_rtt_p50_us: run.and_then(min_rtt_p50_us),
-                    rtt_p50_us: k.rtt_p50_us,
-                    rtt_p99_us: k.rtt_p99_us,
-                    connections_count: k.connections_count,
-                    retransmitting_connections_count: k.retransmitting_connections_count,
-                    retransmits_count: k.retrans_count,
-                    rwnd_limited_ratio: k.rwnd_limited_ratio,
-                    sndbuf_limited_ratio: k.sndbuf_limited_ratio,
-                    delivery_rate_p50_bits_per_s: k.delivery_rate_p50_bits_per_s,
+                .map(|k| {
+                    // The measured operator's connections only (its rows), not the ones that
+                    // set the dataset up: every count of this section is of the same
+                    // connections (9.1 review §2 item 5).
+                    let own = run.and_then(measured_connections);
+                    TcpView {
+                        min_rtt_p50_us: run.and_then(min_rtt_p50_us),
+                        rtt_p50_us: k.rtt_p50_us,
+                        rtt_p99_us: k.rtt_p99_us,
+                        connections_count: own.map_or(k.connections_count, |o| o.0),
+                        retransmitting_connections_count: own
+                            .map_or(k.retransmitting_connections_count, |o| o.1),
+                        retransmits_count: own.map_or(k.retrans_count, |o| o.2),
+                        rwnd_limited_ratio: k.rwnd_limited_ratio,
+                        sndbuf_limited_ratio: k.sndbuf_limited_ratio,
+                        delivery_rate_p50_bits_per_s: k.delivery_rate_p50_bits_per_s,
+                    }
                 }),
             tls_handshakes: (n.tls.handshakes.handshakes_count > 0).then_some(TlsView {
                 handshakes_count: n.tls.handshakes.handshakes_count,
@@ -1599,6 +1727,9 @@ impl OperatorView {
     }
 }
 
+/// How many slowest operations every front end shows (the profile, a range, `show`).
+pub const SLOWEST_COUNT: usize = 5;
+
 /// Everything `show` and the app's Profile view draw for one run.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProfileView {
@@ -1625,7 +1756,9 @@ impl ProfileView {
             findings: findings(r),
             numbers: NumbersView::of(r),
             time: TimeView::of(r, run),
-            slowest: run.map(|run| slowest(run, 5)).unwrap_or_default(),
+            slowest: run
+                .map(|run| slowest(run, SLOWEST_COUNT))
+                .unwrap_or_default(),
             timeline: TimelineView::of(r),
             connections: ConnectionView::of(r, run),
             operator: OperatorView::of(r),
@@ -2057,6 +2190,22 @@ impl LatencyCdf {
         self.pts.iter().find(|p| p.1 >= q).map(|p| p.0)
     }
 
+    /// The distribution of one verb's operations that started in `[t0, t1)` seconds, from
+    /// the trace rows (weighted as a range is, [`RangeView`]); `None` when none did.
+    pub fn of_range_verb(run: &Run, t0: f64, t1: f64, verb: &str) -> Option<Self> {
+        let (lo, hi) = ((t0 * 1e6) as i64, (t1 * 1e6) as i64);
+        let w = run.op_weights();
+        let s = &run.report.sampling;
+        let sampled = s.seen_ops_count > 0 && s.kept_ops_count < s.seen_ops_count;
+        let mut lat: Vec<(u64, f64)> = run
+            .ops
+            .iter()
+            .filter(|o| o.verb == verb && o.t_us >= lo && o.t_us < hi)
+            .map(|o| (o.latency_us, w.get(&o.op_id).copied().unwrap_or(1.0)))
+            .collect();
+        (!lat.is_empty()).then(|| super::range::cdf(&mut lat, !sampled))
+    }
+
     /// The distribution of one verb, from the timeline's per-verb latency rows (every
     /// operation of the verb, at the heatmap's row resolution: each point at its row's upper
     /// bound). `None` when the timeline has no rows for `verb`.
@@ -2117,29 +2266,7 @@ impl HeatmapView {
         if let Some(run) = run.filter(|_| complete)
             && run.ops.iter().any(|o| o.t_us >= 0)
         {
-            let mut h = crate::analysis::segments::fine_heatmap(
-                &run.ops,
-                r.run.window_s,
-                Self::MAX_COLUMNS,
-            );
-            // The fitted rows end at the step at or below the slowest operation, so the last
-            // row is open: close it at the next step, or a 260 ms straggler paints up to the
-            // axis's next decade.
-            if let Some(last) = h.latency_buckets_ms.last().copied()
-                && last > 0.0
-            {
-                h.latency_buckets_ms.push(next_fine_step(last));
-                for col in &mut h.counts {
-                    col.push(0);
-                }
-            }
-            return Self {
-                t_buckets_s: h.t_buckets_s,
-                bucket_width_s: h.bucket_width_s,
-                latency_buckets_ms: h.latency_buckets_ms,
-                counts: h.counts,
-                fine: true,
-            };
+            return Self::fitted(&run.ops, r.run.window_s);
         }
         let h = &r.heatmap;
         Self {
@@ -2148,6 +2275,48 @@ impl HeatmapView {
             latency_buckets_ms: h.latency_buckets_ms.clone(),
             counts: h.counts.clone(),
             fine: false,
+        }
+    }
+
+    /// The heatmap of one verb's operations, fitted as [`HeatmapView::of`] fits the rows;
+    /// `None` when the rows are not every operation (sampled) or the verb has none.
+    pub fn for_verb(r: &Report, run: &Run, verb: &str) -> Option<Self> {
+        let complete = r.sampling.kept_ratio >= 1.0 || r.sampling.seen_ops_count == 0;
+        if !complete {
+            return None;
+        }
+        let ops: Vec<crate::model::OpRow> = run
+            .ops
+            .iter()
+            .filter(|o| o.verb == verb && o.t_us >= 0)
+            .cloned()
+            .collect();
+        if ops.is_empty() {
+            return None;
+        }
+        Some(Self::fitted(&ops, r.run.window_s))
+    }
+
+    /// The fine heatmap of `ops`, its rows fitted to their latencies.
+    fn fitted(ops: &[crate::model::OpRow], window_s: f64) -> Self {
+        let mut h = crate::analysis::segments::fine_heatmap(ops, window_s, Self::MAX_COLUMNS);
+        // The fitted rows end at the step at or below the slowest operation, so the last
+        // row is open: close it at the next step, or a 260 ms straggler paints up to the
+        // axis's next decade.
+        if let Some(last) = h.latency_buckets_ms.last().copied()
+            && last > 0.0
+        {
+            h.latency_buckets_ms.push(next_fine_step(last));
+            for col in &mut h.counts {
+                col.push(0);
+            }
+        }
+        Self {
+            t_buckets_s: h.t_buckets_s,
+            bucket_width_s: h.bucket_width_s,
+            latency_buckets_ms: h.latency_buckets_ms,
+            counts: h.counts,
+            fine: true,
         }
     }
 
@@ -2340,6 +2509,38 @@ pub struct SetupView {
     pub oprobe_version: String,
     /// An equivalent `oprobe run …` command.
     pub command: String,
+    /// An open-loop run's schedule: the rate asked for, the rate achieved and the lag.
+    pub open_loop: Option<OpenLoopView>,
+}
+
+/// An open-loop run's arrivals against its schedule.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OpenLoopView {
+    /// `constant`, `poisson`, `ramp`, … (empty when not recorded).
+    pub arrivals: String,
+    pub target_per_s: f64,
+    pub achieved_per_s: f64,
+    pub intended_count: u64,
+    pub missed_count: u64,
+    /// From an operation's intended start to its actual start.
+    pub lag_p99_ms: Option<f64>,
+    pub max_lag_ms: f64,
+}
+
+impl OpenLoopView {
+    pub fn of(r: &Report) -> Option<Self> {
+        let o = r.open_loop.as_ref()?;
+        let sc = &r.schedule;
+        Some(Self {
+            arrivals: o.arrivals.clone(),
+            target_per_s: o.target_rate,
+            achieved_per_s: o.achieved_rate,
+            intended_count: sc.intended_ops_count.max(o.intended_count),
+            missed_count: o.missed.max(sc.missed_arrivals_count),
+            lag_p99_ms: sc.schedule_stage.as_ref().map(|q| q.p99),
+            max_lag_ms: o.max_schedule_lag_ms.max(sc.max_schedule_lag_ms),
+        })
+    }
 }
 
 impl SetupView {
@@ -2362,6 +2563,7 @@ impl SetupView {
             host: format!("{} {} · {} CPUs", h.os, h.arch, h.cpus_count),
             oprobe_version: r.run.oprobe_version.clone(),
             command: r.spec.command(),
+            open_loop: OpenLoopView::of(r),
         }
     }
 }
@@ -2384,6 +2586,11 @@ pub struct TrustView {
     pub missed_arrivals_ratio: Option<f64>,
     /// Why the run is partial (interrupted, a budget), if it is.
     pub partial: Option<String>,
+    /// Objects read back and verified, and those that came back corrupted.
+    pub verified_count: u64,
+    pub corrupted_count: u64,
+    /// The run's checks that failed (a corrupted object, too many failed operations).
+    pub breaches: Vec<String>,
 }
 
 impl TrustView {
@@ -2410,6 +2617,9 @@ impl TrustView {
                 .partial
                 .as_ref()
                 .map(|p| format!("{:?}", p.reason).to_lowercase()),
+            verified_count: r.integrity.verified,
+            corrupted_count: r.integrity.corrupted,
+            breaches: r.verdict.sla.breaches.clone(),
         }
     }
 
@@ -2417,6 +2627,8 @@ impl TrustView {
     pub fn concerns(&self) -> bool {
         self.client_saturated
             || self.partial.is_some()
+            || self.corrupted_count > 0
+            || !self.breaches.is_empty()
             || self.missed_arrivals_ratio.is_some_and(|m| m > 0.01)
             || self.ops_count < 100
     }
@@ -2438,6 +2650,20 @@ pub struct ApiRow {
     pub ttfb_p99_ms: f64,
     pub total_p50_ms: f64,
     pub total_p99_ms: f64,
+}
+
+impl ApiRow {
+    /// The status codes to show: the commonest answers below 400 (at most two), then every
+    /// code of 400 and above and `0` (no response), each with its count.
+    pub fn shown_status(&self) -> Vec<(u16, u64)> {
+        let ok = self
+            .status
+            .iter()
+            .filter(|(c, _)| *c != 0 && *c < 400)
+            .take(2);
+        let bad = self.status.iter().filter(|(c, _)| *c == 0 || *c >= 400);
+        ok.chain(bad).copied().collect()
+    }
 }
 
 /// Every API the run called, busiest first.
@@ -2579,6 +2805,41 @@ impl RetryView {
     }
 }
 
+/// The capacity the run measured (9.1 review §2b gap 4): the selected limit model, and the
+/// rate and in-flight ceilings fitted. Shown in Retries and ruled on the requests and
+/// in-flight charts, not only inside a throttling finding.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CapacityView {
+    /// The selected hypothesis (`rate limit`, `in-flight limit`, …).
+    pub hypothesis: String,
+    pub confidence: Confidence,
+    pub rate_ceiling_requests_per_s: Option<f64>,
+    /// `(estimate, lo, hi)` requests in flight.
+    pub inflight_ceiling: Option<(f64, f64, f64)>,
+}
+
+impl CapacityView {
+    /// `None` when no limit was found (no hypothesis selected, or "no limit", and no ceiling).
+    pub fn of(r: &Report) -> Option<Self> {
+        let c = &r.capacity;
+        let kind = c
+            .selected()
+            .map(|h| h.kind)
+            .filter(|k| *k != crate::analysis::hypothesis::HypothesisKind::None);
+        let inflight = c.inflight_ceiling.map(|x| (x.requests, x.lo, x.hi));
+        let rate = c.rate_ceiling_requests_per_s.filter(|v| *v > 0.0);
+        if kind.is_none() && inflight.is_none() && rate.is_none() {
+            return None;
+        }
+        Some(Self {
+            hypothesis: kind.map(|k| k.label().to_owned()).unwrap_or_default(),
+            confidence: c.confidence,
+            rate_ceiling_requests_per_s: rate,
+            inflight_ceiling: inflight,
+        })
+    }
+}
+
 /// Bytes asked for against bytes moved.
 #[derive(Clone, Debug, PartialEq)]
 pub struct BytesView {
@@ -2634,7 +2895,20 @@ pub struct Slice {
     /// the throttling one key draws); `None` for the other slices.
     pub throttle_share_ratio: Option<f64>,
     pub error_ratio: Option<f64>,
+    /// The median latency (remotes only).
+    pub p50_ms: Option<f64>,
     pub p99_ms: Option<f64>,
+}
+
+/// The remotes in numbers ([`SpreadView::remotes_summary`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RemotesSummary {
+    pub remotes_count: u64,
+    /// Failed requests over all requests to the remotes.
+    pub error_ratio: f64,
+    /// `(lowest, highest)` of the remotes' p50 and p99.
+    pub p50_ms: (f64, f64),
+    pub p99_ms: (f64, f64),
 }
 
 /// A slice key for people: the object-size buckets (`0`, `<4KiB`, … `>=16MiB`) as ranges,
@@ -2678,6 +2952,7 @@ impl SpreadView {
             throttled_ratio: Some(x.throttled_ratio),
             throttle_share_ratio: None,
             error_ratio: Some(x.error_ratio),
+            p50_ms: None,
             p99_ms: Some(x.p99_ms),
         };
         let total: u64 = r.network.remotes.iter().map(|x| x.requests_count).sum();
@@ -2694,6 +2969,7 @@ impl SpreadView {
                     throttled_ratio: None,
                     throttle_share_ratio: Some(k.throttle_share_ratio),
                     error_ratio: None,
+                    p50_ms: None,
                     p99_ms: None,
                 })
                 .collect(),
@@ -2716,10 +2992,44 @@ impl SpreadView {
                         x.errors_count as f64,
                         x.requests_count as f64,
                     )),
+                    p50_ms: Some(x.p50_ms),
                     p99_ms: Some(x.p99_ms),
                 })
                 .collect(),
         }
+    }
+
+    /// The remotes in one line's numbers (9.1 review §2b gap 8): how many answered, the share
+    /// of their requests that failed, and the range of their p50 and p99. `None` without
+    /// remotes.
+    pub fn remotes_summary(&self) -> Option<RemotesSummary> {
+        let xs: Vec<&Slice> = self
+            .remotes
+            .iter()
+            .filter(|x| x.key != crate::analysis::slice::NO_CONNECTION)
+            .collect();
+        if xs.is_empty() {
+            return None;
+        }
+        let reqs: u64 = self.remotes.iter().map(|x| x.requests_count).sum();
+        let errs: f64 = self
+            .remotes
+            .iter()
+            .map(|x| x.error_ratio.unwrap_or(0.0) * x.requests_count as f64)
+            .sum();
+        let range = |f: fn(&Slice) -> Option<f64>| {
+            xs.iter()
+                .filter_map(|x| f(x))
+                .fold((f64::INFINITY, 0.0_f64), |(lo, hi), v| {
+                    (lo.min(v), hi.max(v))
+                })
+        };
+        Some(RemotesSummary {
+            remotes_count: xs.len() as u64,
+            error_ratio: crate::util::ratio(errs, reqs as f64),
+            p50_ms: range(|x| x.p50_ms),
+            p99_ms: range(|x| x.p99_ms),
+        })
     }
 
     /// Which of the columns `throttled`, `errors`, `p99` any of `xs` has (a column no slice
@@ -2740,6 +3050,52 @@ impl SpreadView {
             && self.cold_warm.is_empty()
             && self.remotes.is_empty()
     }
+}
+
+/// The stored proves of run `run_id` among `docs` (`<id>.prove.json` documents, newest
+/// first): those of that run that decode, in their order.
+pub fn proves_of_run(
+    docs: Vec<serde_json::Value>,
+    run_id: &str,
+) -> Vec<crate::app::prove::ProveOutput> {
+    docs.into_iter()
+        .filter(|v| v.get("run_id").and_then(|x| x.as_str()) == Some(run_id))
+        .filter_map(|v| {
+            serde_json::to_vec(&v)
+                .ok()
+                .and_then(|b| crate::app::prove::ProveOutput::from_json_slice(&b).ok())
+        })
+        .collect()
+}
+
+/// The run a `.prove.json` stands for when its own run is not in the store (a prove shared by
+/// a teammate): its operator, no rows, its run id (the prove's when it has none). A front end
+/// shows the prove over it.
+pub fn prove_run(p: &crate::app::prove::ProveOutput) -> Run {
+    let prof = crate::config::Profile::from_operator(p.operator.redacted());
+    let raw_id = if p.run_id.is_empty() {
+        p.prove_id.clone()
+    } else {
+        p.run_id.clone()
+    };
+    let run_id = crate::model::RunId::parse(&raw_id).unwrap_or_default();
+    let now = std::time::SystemTime::now();
+    let mut run = crate::model::build_run(crate::model::ReportInput {
+        run_id: &run_id,
+        target_name: None,
+        profile: &prof,
+        knobs: &crate::config::Knobs::of(&prof),
+        snapshot: crate::trace::Snapshot::default(),
+        trace: crate::trace::TraceRows::default(),
+        cleanup: crate::engine::CleanupSummary::default(),
+        warnings: Vec::new(),
+        started_at: now,
+        ended_at: now,
+        spec: None,
+    });
+    run.report.run.source = crate::model::RunSource::Trace;
+    run.report.run.id = raw_id;
+    run
 }
 
 #[cfg(test)]
@@ -3545,5 +3901,146 @@ mod tests {
         let _ = BytesView::of(r);
         let sp = SpreadView::of(r);
         assert!(sp.hot_keys.len() <= SpreadView::TOP);
+    }
+
+    /// Two 1 s intervals of `(ops/s, requests/s, MiB/s)`, every operation a success.
+    fn tl91(rows: &[(f64, f64, f64)]) -> TimelineView {
+        let n = rows.len();
+        TimelineView {
+            t_s: (0..n).map(|i| i as f64).collect(),
+            len_s: vec![1.0; n],
+            ops_per_s: rows.iter().map(|r| r.0).collect(),
+            goodput_ops_per_s: rows.iter().map(|r| r.0).collect(),
+            requests_per_s: rows.iter().map(|r| r.1).collect(),
+            mib_per_s: rows.iter().map(|r| r.2).collect(),
+            cpu_pct: vec![Some(80.0); n],
+            ..TimelineView::default()
+        }
+    }
+
+    #[test]
+    fn the_timeline_draws_only_the_charts_that_say_something_of_their_own() {
+        // One request per operation of fixed size: requests and throughput are goodput's shape.
+        let t = tl91(&[(100.0, 100.0, 1.0), (50.0, 50.0, 0.5)]);
+        let l = t.layout(false);
+        assert!(!l.requests);
+        assert_eq!(
+            l.throughput,
+            ThroughputChart::OnGoodput { mib_per_op: 0.01 }
+        );
+        assert!(!l.cpu, "CPU only when the client was saturated");
+        assert!(t.layout(true).cpu);
+        // Retries (more requests than operations) and varying sizes: their own charts.
+        let t = tl91(&[(100.0, 130.0, 1.0), (50.0, 50.0, 2.0)]);
+        let l = t.layout(false);
+        assert!(l.requests);
+        assert_eq!(l.throughput, ThroughputChart::Own);
+        // Nothing moved: no throughput at all.
+        assert_eq!(
+            tl91(&[(10.0, 10.0, 0.0)]).layout(false).throughput,
+            ThroughputChart::None
+        );
+        // Failures: goodput is not the operations' rate, so throughput stays apart.
+        let mut t = tl91(&[(100.0, 100.0, 1.0), (50.0, 50.0, 0.5)]);
+        t.goodput_ops_per_s[1] = 40.0;
+        assert_eq!(t.layout(false).throughput, ThroughputChart::Own);
+    }
+
+    #[test]
+    fn a_finding_card_does_not_repeat_the_headline_or_its_values() {
+        let run = crate::report::fixture::run();
+        let r = &run.report;
+        let f = FindingView::of(&r.findings[0]);
+        let card = f.card(&r.verdict.headline);
+        if r.verdict
+            .headline
+            .starts_with(f.cause.split(". ").next().unwrap())
+        {
+            assert_eq!(card.cause, None, "the headline already says it");
+        }
+        let other = f.card("Something else entirely.");
+        assert_eq!(other.cause.as_deref(), Some(f.cause.as_str()));
+        if !f.items.is_empty() {
+            assert_eq!(card.evidence, None, "the values' table holds the numbers");
+        }
+        let mut bare = f.clone();
+        bare.items.clear();
+        bare.evidence = "words".into();
+        assert_eq!(bare.card("x").evidence.as_deref(), Some("words"));
+    }
+
+    #[test]
+    fn an_api_shows_every_error_code_and_its_commonest_answers() {
+        let a = ApiRow {
+            api: "GetObject".into(),
+            requests_count: 100,
+            errors_count: 6,
+            throttled_count: 5,
+            status: vec![(200, 80), (206, 10), (304, 2), (503, 5), (404, 2), (0, 1)],
+            reused_ratio: 1.0,
+            up_bytes: 0,
+            down_bytes: 0,
+            ttfb_p50_ms: 0.0,
+            ttfb_p99_ms: 0.0,
+            total_p50_ms: 0.0,
+            total_p99_ms: 0.0,
+        };
+        assert_eq!(
+            a.shown_status(),
+            vec![(200, 80), (206, 10), (503, 5), (404, 2), (0, 1)]
+        );
+    }
+
+    #[test]
+    fn capacity_remotes_and_the_open_loop_read_the_report() {
+        let mut run = crate::report::fixture::run();
+        let r = &mut run.report;
+        r.capacity.rate_ceiling_requests_per_s = Some(120.0);
+        let c = CapacityView::of(r).expect("a rate ceiling");
+        assert_eq!(c.rate_ceiling_requests_per_s, Some(120.0));
+        r.capacity = Default::default();
+        assert_eq!(CapacityView::of(r), None);
+        r.network.remotes = vec![
+            crate::model::RemoteStats {
+                remote: "10.0.0.1:443".into(),
+                requests_count: 90,
+                errors_count: 9,
+                bytes_down: 0,
+                p50_ms: 2.0,
+                p99_ms: 20.0,
+            },
+            crate::model::RemoteStats {
+                remote: "10.0.0.2:443".into(),
+                requests_count: 10,
+                errors_count: 1,
+                bytes_down: 0,
+                p50_ms: 4.0,
+                p99_ms: 30.0,
+            },
+        ];
+        let s = SpreadView::of(r).remotes_summary().unwrap();
+        assert_eq!(s.remotes_count, 2);
+        assert!((s.error_ratio - 0.1).abs() < 1e-9);
+        assert_eq!((s.p50_ms, s.p99_ms), ((2.0, 4.0), (20.0, 30.0)));
+        r.integrity.corrupted = 1;
+        r.integrity.verified = 9;
+        let t = TrustView::of(r);
+        assert!(t.concerns() && t.corrupted_count == 1);
+        assert_eq!(SetupView::of(r).open_loop.is_some(), r.open_loop.is_some());
+    }
+
+    #[test]
+    fn the_connection_counts_are_the_measured_operators() {
+        let mut run = crate::report::fixture::run();
+        for (i, q) in run.reqs.iter_mut().enumerate() {
+            q.conn_id = 1 + (i as u64 % 2);
+            q.tcp = Some(Box::new(crate::model::TcpRow {
+                retrans: if q.conn_id == 2 { 3 } else { 0 },
+                ..Default::default()
+            }));
+        }
+        assert_eq!(measured_connections(&run), Some((2, 1, 3)));
+        run.reqs.iter_mut().for_each(|q| q.tcp = None);
+        assert_eq!(measured_connections(&run), None);
     }
 }

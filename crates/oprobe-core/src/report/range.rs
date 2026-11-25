@@ -300,7 +300,7 @@ fn verbs(ops: &[&OpRow], weight: &dyn Fn(u64) -> f64, span: f64) -> Vec<VerbView
 }
 
 /// The weighted distribution of `lat` (µs, weight), at most [`LatencyCdf::MAX_POINTS`].
-fn cdf(lat: &mut [(u64, f64)], exact: bool) -> LatencyCdf {
+pub(crate) fn cdf(lat: &mut [(u64, f64)], exact: bool) -> LatencyCdf {
     let total: f64 = lat.iter().map(|x| x.1).sum();
     if lat.is_empty() || total <= 0.0 {
         return LatencyCdf::default();

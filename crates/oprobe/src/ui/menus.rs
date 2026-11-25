@@ -7,9 +7,7 @@
 //! or an alert is open, the app's own actions wait.
 
 use nsh_core::desktop::{MenuRole, WindowMode};
-use nsh_core::element::desktop::{
-    MenuItem, main_window, popup_menu, popup_menu_at, set_application_menu,
-};
+use nsh_core::element::desktop::{MenuItem, popup_menu, popup_menu_at, set_application_menu};
 use nsh_core::element::os;
 use nsh_core::geometry::{Point, Points};
 use nsh_core::keymap::When;
@@ -142,8 +140,10 @@ fn quit_item(s: Store) -> MenuItem {
 }
 
 /// Enter or leave full screen (off macOS).
-fn toggle_full_screen() {
-    let w = main_window();
+fn toggle_full_screen(s: Store) {
+    let Some(w) = s.window.get_untracked() else {
+        return;
+    };
     let full = untracked(|| w.state()).is_some_and(|st| st.mode == WindowMode::FullScreen);
     w.set_mode(if full {
         WindowMode::Normal
@@ -279,7 +279,7 @@ pub fn application(s: Store) -> Vec<MenuItem> {
         view.push(
             MenuItem::new(tr("menu.full_screen"))
                 .shortcut(FULL_SCREEN)
-                .on_select(toggle_full_screen),
+                .on_select(move || toggle_full_screen(s)),
         );
     }
     menus.push(MenuItem::submenu(tr("menu.view"), view));
@@ -396,7 +396,7 @@ pub fn primary(s: Store) -> Vec<MenuItem> {
         .on_select(move || s.sidebar.update(|v| *v = !*v)),
     );
     if !term {
-        items.push(MenuItem::new(tr("menu.full_screen")).on_select(toggle_full_screen));
+        items.push(MenuItem::new(tr("menu.full_screen")).on_select(move || toggle_full_screen(s)));
     }
     items.push(MenuItem::separator());
     items.push(
