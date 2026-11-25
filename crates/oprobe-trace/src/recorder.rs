@@ -733,6 +733,10 @@ pub struct Recorder {
     inflight_ops: AtomicU64,
     inflight_requests: AtomicU64,
     peak_inflight_requests: AtomicU64,
+    /// The current interval's in-flight peak, kept off the aggregate lock (every request start
+    /// updates it): `(interval + 1) << 32 | peak`, 0 for none. It is folded into its interval
+    /// when the next interval starts and whenever the timeline is read.
+    interval_peak: AtomicU64,
     wire_rx: AtomicU64,
     wire_tx: AtomicU64,
     cache_enabled: AtomicBool,
@@ -774,6 +778,7 @@ impl Recorder {
             inflight_ops: AtomicU64::new(0),
             inflight_requests: AtomicU64::new(0),
             peak_inflight_requests: AtomicU64::new(0),
+            interval_peak: AtomicU64::new(0),
             wire_rx: AtomicU64::new(0),
             wire_tx: AtomicU64::new(0),
             cache_enabled: AtomicBool::new(false),
@@ -922,6 +927,7 @@ impl Recorder {
                 self.inflight_requests.load(Ordering::Relaxed),
                 Ordering::Relaxed,
             );
+            self.interval_peak.store(0, Ordering::Release);
             *self.window_start.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
             self.frozen_elapsed_us.store(WINDOW_OPEN, Ordering::Release);
             self.measuring.store(true, Ordering::Release);
@@ -996,9 +1002,57 @@ impl Recorder {
             self.peak_inflight_requests
                 .fetch_max(cur, Ordering::Relaxed);
             // The interval's peak, where the request starts: an embedded layer has no series
-            // probe ([`Self::sample_series`]) to sample it.
-            self.with_current_bucket(|b| b.inflight_peak = b.inflight_peak.max(cur));
+            // probe ([`Self::sample_series`]) to sample it. Lock-free: this runs on every
+            // request, from every worker.
+            self.note_interval_peak(cur);
         }
+    }
+
+    /// Raise the current interval's in-flight peak to `cur` without taking the aggregate lock;
+    /// the first request of a new interval folds the last interval's peak into the timeline.
+    fn note_interval_peak(&self, cur: u64) {
+        if !self.window_open() {
+            return;
+        }
+        let window_start = self.window_start();
+        let frozen = self.frozen_elapsed_us.load(Ordering::Acquire);
+        let idx = event_bucket(window_start.elapsed().as_micros() as u64, frozen) as u64 + 1;
+        let new = (idx << 32) | cur.min(u64::from(u32::MAX));
+        let mut old = self.interval_peak.load(Ordering::Acquire);
+        loop {
+            let (old_idx, old_peak) = (old >> 32, old & u64::from(u32::MAX));
+            if old_idx > idx || (old_idx == idx && old_peak >= cur) {
+                return;
+            }
+            match self.interval_peak.compare_exchange_weak(
+                old,
+                new,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    if old_idx != idx && old_idx != 0 {
+                        let mut a = self.agg();
+                        self.fold_interval_peak(&mut a, old, window_start);
+                    }
+                    return;
+                }
+                Err(x) => old = x,
+            }
+        }
+    }
+
+    /// Fold a packed [`Self::interval_peak`] into its interval (a max, so folding twice is
+    /// harmless).
+    fn fold_interval_peak(&self, a: &mut Agg, packed: u64, window_start: Instant) {
+        let Some(idx) = (packed >> 32).checked_sub(1) else {
+            return;
+        };
+        let peak = packed & u64::from(u32::MAX);
+        let idx = idx as usize;
+        self.ensure_bucket(a, idx, window_start);
+        let b = a.bucket(idx);
+        b.inflight_peak = b.inflight_peak.max(peak);
     }
 
     /// Run `f` on the interval the window is in now (nothing outside the window).
@@ -1515,7 +1569,7 @@ impl Recorder {
     /// embedded layer without a probe has the same series.
     pub fn sample_series(&self) {
         let inflight = self.inflight_requests.load(Ordering::Relaxed);
-        self.with_current_bucket(|b| b.inflight_peak = b.inflight_peak.max(inflight));
+        self.note_interval_peak(inflight);
     }
 
     /// Capture await-tree call stacks of operations running longer than `threshold_us`.
@@ -1616,6 +1670,10 @@ impl Recorder {
     fn snapshot_with(&self, reset: bool, rows: Option<&mut TraceRows>) -> Snapshot {
         let elapsed = self.elapsed_s().max(1e-3);
         let mut a = self.agg();
+        if self.is_measuring() {
+            let packed = self.interval_peak.load(Ordering::Acquire);
+            self.fold_interval_peak(&mut a, packed, self.window_start());
+        }
         let mib = |b: u64| b as f64 / (1024.0 * 1024.0);
 
         let verbs: Vec<VerbStats> = a
@@ -1867,6 +1925,7 @@ impl Recorder {
                 failures: 0,
                 ..conn
             };
+            self.interval_peak.store(0, Ordering::Release);
             *self.window_start.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
             self.wire_rx.store(0, Ordering::Relaxed);
             self.wire_tx.store(0, Ordering::Relaxed);
