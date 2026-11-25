@@ -676,11 +676,13 @@ pub fn sizing(trials: &[crate::report::view::SizingView], p99: bool) -> Option<P
     };
     let top = trials.iter().map(|t| t.objective).fold(0.0, f64::max);
     let n = trials.len() as f64;
-    let mut lines = vec![Line::joined(
-        tr("plot.sizing_feasible"),
-        "series-a",
-        pts(true),
-    )];
+    let feasible = pts(true);
+    // A single point draws no line: a dot then.
+    let mut lines = vec![if feasible.len() == 1 {
+        Line::dots(tr("plot.sizing_feasible"), "series-a", feasible)
+    } else {
+        Line::joined(tr("plot.sizing_feasible"), "series-a", feasible)
+    }];
     let infeasible = pts(false);
     if !infeasible.is_empty() {
         lines.push(Line::dots(tr("plot.sizing_infeasible"), "warn", infeasible));

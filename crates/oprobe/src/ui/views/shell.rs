@@ -537,7 +537,7 @@ pub fn page(body: View) -> impl IntoElement {
                     .py(px(if term { 0.0 } else { 20.0 }))
                     .gap(px(if term { 16.0 } else { 20.0 }))
                     .min_w(px(0.0))
-                    .max_w(px(1100.0)),
+                    .max_w(px(if term { 1600.0 } else { 1100.0 })),
             ),
         )
 }

@@ -663,10 +663,16 @@ pub fn paint_plot(plot: &Plot, w: f32, h: f32) -> Painter {
                 .stroke()
                 .line_dash(&[]);
             if !r.label.is_empty() {
+                // Above the rule, or below it when it runs along the top of the plot.
+                let below = py - line < y1;
                 p = p
                     .text_align(CanvasTextAlign::Right)
-                    .text_baseline(CanvasTextBaseline::Bottom)
-                    .fill_text(&r.label, x1 - 2.0, py - 1.0);
+                    .text_baseline(if below {
+                        CanvasTextBaseline::Top
+                    } else {
+                        CanvasTextBaseline::Bottom
+                    })
+                    .fill_text(&r.label, x1 - 2.0, if below { py + 1.0 } else { py - 1.0 });
             }
         }
     }

@@ -711,6 +711,7 @@ static EN: &[(&str, &str)] = &[
     ("plot.sizing_infeasible", "infeasible"),
     ("plot.sizing_value", "value {}"),
     ("profile.traffic", "Traffic"),
+    ("traffic.remote", "{} remote · errors {} · p50 {} · p99 {}"),
     (
         "traffic.remotes",
         "{} remotes · errors {} · p50 {} · p99 {}",
@@ -1409,6 +1410,7 @@ static ZH: &[(&str, &str)] = &[
     ("plot.sizing_value", "取值 {}"),
     ("profile.traffic", "流量"),
     ("traffic.remotes", "{} 个远端 · 错误 {} · p50 {} · p99 {}"),
+    ("traffic.remote", "{} 个远端 · 错误 {} · p50 {} · p99 {}"),
     ("traffic.read", "读取 {} → 实际传输 {}（{}×）"),
     ("traffic.write", "写入 {} → 实际传输 {}（{}×）"),
     ("traffic.per_op", "每次操作 {} 个请求"),

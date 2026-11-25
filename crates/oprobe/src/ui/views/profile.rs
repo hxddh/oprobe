@@ -356,42 +356,42 @@ fn api_cols() -> [Col; 9] {
         },
         Col {
             heading: "col.requests",
-            width: 72.0,
+            width: if term { 72.0 } else { 60.0 },
             numeric: true,
         },
         Col {
             heading: "col.errors",
-            width: 64.0,
+            width: 52.0,
             numeric: true,
         },
         Col {
             heading: "col.throttled",
-            width: 80.0,
+            width: if term { 80.0 } else { 64.0 },
             numeric: true,
         },
         Col {
             heading: "col.status",
-            width: if term { 200.0 } else { 170.0 },
+            width: if term { 176.0 } else { 140.0 },
             numeric: false,
         },
         Col {
             heading: "col.ttfb",
-            width: if term { 160.0 } else { 132.0 },
+            width: if term { 144.0 } else { 116.0 },
             numeric: true,
         },
         Col {
             heading: "col.total_p50_p99",
-            width: if term { 160.0 } else { 132.0 } + kit::CELL_BAR_W,
+            width: if term { 144.0 } else { 128.0 } + kit::CELL_BAR_W,
             numeric: true,
         },
         Col {
             heading: "col.bytes",
-            width: if term { 160.0 } else { 132.0 },
+            width: if term { 160.0 } else { 128.0 },
             numeric: true,
         },
         Col {
             heading: "col.reused",
-            width: 64.0,
+            width: 60.0,
             numeric: true,
         },
     ]
@@ -405,13 +405,11 @@ const API_TOTAL_COL: usize = 6;
 fn status_line(a: &crate::report::view::ApiRow) -> String {
     a.shown_status()
         .iter()
-        .map(|(c, n)| {
-            let c = if *c == 0 {
-                "—".to_owned()
-            } else {
-                c.to_string()
-            };
-            format!("{c} ×{}", fmt::count(*n))
+        .map(|(c, n)| match *c {
+            // An answer below 400: the code alone (the requests column counts them).
+            1..400 => c.to_string(),
+            0 => format!("— ×{}", fmt::count(*n)),
+            _ => format!("{c} ×{}", fmt::count(*n)),
         })
         .collect::<Vec<_>>()
         .join(" · ")
@@ -814,7 +812,11 @@ fn traffic(m: &ProfileModel, cx: Ctx) -> Option<View> {
             }
         };
         parts.push(fill(
-            "traffic.remotes",
+            if r.remotes_count == 1 {
+                "traffic.remote"
+            } else {
+                "traffic.remotes"
+            },
             &[
                 &fmt::count(r.remotes_count),
                 &fmt::ratio(r.error_ratio),
@@ -1255,15 +1257,17 @@ fn findings(s: Store, m: &ProfileModel) -> View {
 
 /// Each verb: its numbers and its own stage split.
 fn verbs(vs: &[VerbRow]) -> View {
+    // On a terminal every part has its width, so a verb stays one row with its bar.
+    let term = kit::in_terminal();
     section(tr("profile.verbs"))
         .test_id("verbs")
-        .children(vs.iter().map(|v| {
+        .children(vs.iter().map(move |v| {
             view()
                 .flex_row()
                 .flex_wrap()
                 .items_center()
                 .gap_3()
-                .py_1()
+                .py(px(if term { 0.0 } else { 4.0 }))
                 .child(mono(v.verb.clone()).w(px(150.0)).number_of_lines(1))
                 .child(
                     small(fill("verb.ops", &[&fmt::count(v.ops_count)]))
@@ -1284,8 +1288,8 @@ fn verbs(vs: &[VerbRow]) -> View {
                     .tabular_nums(),
                 )
                 // Its rates: operations and bytes per second, requests per operation.
-                .child(
-                    small(fill(
+                .child({
+                    let rates = small(fill(
                         "verb.rates",
                         &[
                             &fmt::compact(v.ops_per_s),
@@ -1293,21 +1297,30 @@ fn verbs(vs: &[VerbRow]) -> View {
                             &fmt::sig3(v.requests_per_op),
                         ],
                     ))
-                    .tabular_nums(),
-                )
-                .child(view().flex_1().min_w(px(120.0)).child(stage_bar(&v.stages)))
+                    .tabular_nums();
+                    if term {
+                        rates.w(px(44.0 * 8.0)).flex_shrink_0()
+                    } else {
+                        rates
+                    }
+                })
+                .child(if term {
+                    view().w(px(20.0 * 8.0)).child(stage_bar(&v.stages))
+                } else {
+                    view().flex_1().min_w(px(120.0)).child(stage_bar(&v.stages))
+                })
                 .child((v.throttled_ratio > 0.0).then(|| {
                     small(fill("verb.throttled", &[&fmt::ratio(v.throttled_ratio)]))
                         .text_color(move || Tone::Warn.color())
                 }))
-                .child(
-                    small(if v.error_ratio > 0.0 {
-                        format!("{} {}", tr("metric.errors"), fmt::ratio(v.error_ratio))
-                    } else {
-                        String::new()
-                    })
-                    .text_color(move || Tone::Crit.color()),
-                )
+                .child((v.error_ratio > 0.0).then(|| {
+                    small(format!(
+                        "{} {}",
+                        tr("metric.errors"),
+                        fmt::ratio(v.error_ratio)
+                    ))
+                    .text_color(move || Tone::Crit.color())
+                }))
         }))
 }
 
