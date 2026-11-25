@@ -16,13 +16,24 @@ use std::process::{Command, Output};
 
 use serde_json::Value;
 
+/// One lab test at a time, also under `cargo test`, which runs a binary's tests as threads of
+/// one process (nextest runs each in its own process; `.config/nextest.toml` groups them).
+/// Every test measures — a prove's noise floor, a top finding, a fitted limit — and two at
+/// once load the same cores and measure each other.
+static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 struct Env {
     dir: tempfile::TempDir,
+    _one: std::sync::MutexGuard<'static, ()>,
 }
 
 impl Env {
     fn new() -> Self {
         Self {
+            // A test that failed while holding it poisons nothing the next one needs.
+            _one: ONE_AT_A_TIME
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
             dir: tempfile::tempdir().unwrap(),
         }
     }
