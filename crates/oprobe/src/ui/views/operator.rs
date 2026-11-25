@@ -17,7 +17,7 @@ use crate::ui::chart::chart;
 use crate::ui::data::{self, Field, FieldKind, ProfileModel, SECTIONS};
 use crate::ui::fmt;
 use crate::ui::i18n::{finding_title, tr, tr_dyn};
-use crate::ui::jobs::{Outcome, pairs};
+use crate::ui::jobs::Outcome;
 use crate::ui::kit::{
     self, Kind, Tone, badge, body, btn, caption, empty, field, mono, section, segmented, small,
     strong, switch_on,
@@ -459,7 +459,6 @@ fn prove(
 }
 
 fn prove_state(s: Store, st: crate::ui::jobs::State, p99: bool, has_file: bool) -> View {
-    let _ = pairs;
     let unit = |v: f64| {
         if p99 {
             fmt::dur_ms(v)

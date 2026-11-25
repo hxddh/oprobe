@@ -591,116 +591,63 @@ pub fn cloud_url(raw: &str) -> Option<String> {
         let out = join("azblob", container, rest)?;
         return Some(format!("{out}?endpoint=https://{host}"));
     }
-    if let Some(stem) = host.strip_suffix(".r2.cloudflarestorage.com") {
-        let labels: Vec<&str> = stem.split('.').filter(|l| !l.is_empty()).collect();
-        return match labels.as_slice() {
-            [account] => {
-                let (bucket, rest) = segments.split_first()?;
-                let out = join("r2", bucket, rest)?;
-                Some(format!("{out}?account_id={account}"))
-            }
-            [bucket_parts @ .., account] if !bucket_parts.is_empty() => {
-                let out = join("r2", &bucket_parts.join("."), &segments)?;
-                Some(format!("{out}?account_id={account}"))
-            }
-            _ => None,
-        };
-    }
-    if let Some(stem) = host.strip_suffix(".aliyuncs.com") {
-        let labels: Vec<&str> = stem.split('.').filter(|l| !l.is_empty()).collect();
-        return match labels.as_slice() {
-            [oss] if oss.starts_with("oss-") => {
-                let (bucket, rest) = segments.split_first()?;
-                let out = join("oss", bucket, rest)?;
-                Some(format!("{out}?endpoint=https://{oss}.aliyuncs.com"))
-            }
-            [bucket_parts @ .., oss] if !bucket_parts.is_empty() && oss.starts_with("oss-") => {
-                let out = join("oss", &bucket_parts.join("."), &segments)?;
-                Some(format!("{out}?endpoint=https://{oss}.aliyuncs.com"))
-            }
-            _ => None,
-        };
-    }
-    if let Some(stem) = host.strip_suffix(".myqcloud.com") {
-        let labels: Vec<&str> = stem.split('.').filter(|l| !l.is_empty()).collect();
-        return match labels.as_slice() {
-            ["cos", region] => {
-                let (bucket, rest) = segments.split_first()?;
-                let out = join("cos", bucket, rest)?;
-                Some(format!("{out}?endpoint=https://cos.{region}.myqcloud.com"))
-            }
-            [bucket_parts @ .., "cos", region] if !bucket_parts.is_empty() => {
-                let out = join("cos", &bucket_parts.join("."), &segments)?;
-                Some(format!("{out}?endpoint=https://cos.{region}.myqcloud.com"))
-            }
-            _ => None,
-        };
-    }
-    if let Some(stem) = host.strip_suffix(".myhuaweicloud.com") {
-        let labels: Vec<&str> = stem.split('.').filter(|l| !l.is_empty()).collect();
-        return match labels.as_slice() {
-            ["obs", region] => {
-                let (bucket, rest) = segments.split_first()?;
-                let out = join("obs", bucket, rest)?;
-                Some(format!(
-                    "{out}?endpoint=https://obs.{region}.myhuaweicloud.com"
-                ))
-            }
-            [bucket_parts @ .., "obs", region] if !bucket_parts.is_empty() => {
-                let out = join("obs", &bucket_parts.join("."), &segments)?;
-                Some(format!(
-                    "{out}?endpoint=https://obs.{region}.myhuaweicloud.com"
-                ))
-            }
-            _ => None,
-        };
-    }
-    if let Some(stem) = host.strip_suffix(".volces.com") {
-        let labels: Vec<&str> = stem.split('.').filter(|l| !l.is_empty()).collect();
-        let map_tos = |tos: &str, bucket: &str, rest: &[&str]| -> Option<String> {
+    // S3-compatible clouds addressed as `https://BUCKET.ENDPOINT/KEY` or
+    // `https://ENDPOINT/BUCKET/KEY`: the host's suffix, how many labels before it name the
+    // endpoint, and the scheme and query those labels map to (`None`: not a bucket's address).
+    type Endpoint = fn(&[&str]) -> Option<(&'static str, String)>;
+    let clouds: [(&str, usize, Endpoint); 6] = [
+        (".r2.cloudflarestorage.com", 1, |l| {
+            Some(("r2", format!("account_id={}", l[0])))
+        }),
+        (".aliyuncs.com", 1, |l| {
+            l[0].starts_with("oss-")
+                .then(|| ("oss", format!("endpoint=https://{}.aliyuncs.com", l[0])))
+        }),
+        (".myqcloud.com", 2, |l| {
+            (l[0] == "cos").then(|| ("cos", format!("endpoint=https://cos.{}.myqcloud.com", l[1])))
+        }),
+        (".myhuaweicloud.com", 2, |l| {
+            (l[0] == "obs").then(|| {
+                (
+                    "obs",
+                    format!("endpoint=https://obs.{}.myhuaweicloud.com", l[1]),
+                )
+            })
+        }),
+        (".volces.com", 1, |l| {
+            let tos = l[0];
+            let endpoint = format!("endpoint=https://{tos}.volces.com");
             if let Some(region) = tos.strip_prefix("tos-s3-").filter(|r| !r.is_empty()) {
-                let out = join("s3", bucket, rest)?;
-                Some(format!(
-                    "{out}?endpoint=https://{tos}.volces.com&region={region}"
-                ))
-            } else if let Some(region) = tos.strip_prefix("tos-").filter(|r| !r.is_empty()) {
-                let out = join("tos", bucket, rest)?;
-                Some(format!(
-                    "{out}?endpoint=https://{tos}.volces.com&region={region}"
-                ))
+                Some(("s3", format!("{endpoint}&region={region}")))
             } else {
-                None
+                let region = tos.strip_prefix("tos-").filter(|r| !r.is_empty())?;
+                Some(("tos", format!("{endpoint}&region={region}")))
             }
+        }),
+        (".backblazeb2.com", 2, |l| {
+            (l[0] == "s3").then(|| {
+                let region = l[1];
+                (
+                    "s3",
+                    format!("endpoint=https://s3.{region}.backblazeb2.com&region={region}"),
+                )
+            })
+        }),
+    ];
+    for (suffix, n, endpoint) in clouds {
+        let Some(stem) = host.strip_suffix(suffix) else {
+            continue;
         };
-        return match labels.as_slice() {
-            [tos] if tos.starts_with("tos-") => {
-                let (bucket, rest) = segments.split_first()?;
-                map_tos(tos, bucket, rest)
-            }
-            [bucket_parts @ .., tos] if !bucket_parts.is_empty() && tos.starts_with("tos-") => {
-                map_tos(tos, &bucket_parts.join("."), &segments)
-            }
-            _ => None,
-        };
-    }
-    if let Some(stem) = host.strip_suffix(".backblazeb2.com") {
         let labels: Vec<&str> = stem.split('.').filter(|l| !l.is_empty()).collect();
-        return match labels.as_slice() {
-            ["s3", region] => {
-                let (bucket, rest) = segments.split_first()?;
-                let out = join("s3", bucket, rest)?;
-                Some(format!(
-                    "{out}?endpoint=https://s3.{region}.backblazeb2.com&region={region}"
-                ))
-            }
-            [bucket_parts @ .., "s3", region] if !bucket_parts.is_empty() => {
-                let out = join("s3", &bucket_parts.join("."), &segments)?;
-                Some(format!(
-                    "{out}?endpoint=https://s3.{region}.backblazeb2.com&region={region}"
-                ))
-            }
-            _ => None,
+        let (bucket, ep) = labels.split_at(labels.len().checked_sub(n)?);
+        let (scheme, query) = endpoint(ep)?;
+        let out = if bucket.is_empty() {
+            let (bucket, rest) = segments.split_first()?;
+            join(scheme, bucket, rest)?
+        } else {
+            join(scheme, &bucket.join("."), &segments)?
         };
+        return Some(format!("{out}?{query}"));
     }
     None
 }

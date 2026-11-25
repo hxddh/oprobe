@@ -1,5 +1,6 @@
-//! Report v6 (`oprobe.report/6`, design v3 §6, v4 §1/§3 and v5 §2): the machine-clean result of one
-//! run, with the run's replayable spec (`spec`) and the capacity estimate (`capacity`).
+//! Report v7 (`oprobe.report/7`, design v3 §6, v4 §1/§3 and v5 §2; the v9 formats): the
+//! machine-clean result of one run, with the run's replayable spec (`spec`) and the capacity
+//! estimate (`capacity`).
 //!
 //! Rules: every numeric field name carries its unit (`_us`, `_ms`, `_s`, `_bytes`, `_per_s`,
 //! `_pct`, `_ratio` for dimensionless fractions, `_usd`, `_count`); no human-formatted strings

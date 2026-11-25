@@ -355,7 +355,7 @@ pub struct LabArgs {
     #[arg(long)]
     pub allow_remote: bool,
     /// Cap total in-memory object bytes stored by the lab (default 8GiB)
-    #[arg(long, value_name = "SIZE", value_parser = parse::nonzero_size)]
+    #[arg(long, value_name = "SIZE", value_parser = parse::nonzero_size, hide = true)]
     pub max_store_size: Option<String>,
 }
 
