@@ -140,7 +140,7 @@ pub fn apply_sla(p: &mut Profile, a: &SlaInput) -> Result<()> {
 /// came from.
 pub fn run_profile(ctx: &Ctx, a: &ProfileRequest) -> Result<(Profile, OperatorSource)> {
     let cfg = ctx.config()?;
-    let (operator, source) = crate::operator::resolve::resolve(&a.operator, cfg)?;
+    let (operator, source) = crate::operator::resolve::resolve(&a.operator, &cfg)?;
     let mut p = Profile::from_operator(operator);
     let mut w = a.workload.clone();
     apply_defaults(&mut w, &cfg.defaults);
@@ -166,7 +166,7 @@ pub fn spec_profile(ctx: &Ctx, spec: crate::model::RunSpec) -> Result<Profile> {
     // Secrets were redacted: take them from where the operator came from when that still
     // resolves (a configured operator, an operator file), else drop them (the environment's
     // credentials apply).
-    let known = crate::operator::resolve::resolve(&spec.operator_ref, ctx.config()?)
+    let known = crate::operator::resolve::resolve(&spec.operator_ref, &*ctx.config()?)
         .ok()
         .map(|(o, _)| o.options);
     p.operator.options = p

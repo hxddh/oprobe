@@ -27,7 +27,7 @@ impl Out {
     fn apis(&self) -> BTreeMap<String, usize> {
         let mut m = BTreeMap::new();
         for r in &self.reqs {
-            *m.entry(r.api.to_string()).or_default() += 1;
+            *m.entry(r.api_name().to_owned()).or_default() += 1;
         }
         m
     }
@@ -251,7 +251,11 @@ async fn copies_paged_listings_and_presigned_reads() {
     .await;
     assert!(o.failed().is_empty(), "{:?}", o.failed());
     // 32 keys per partition, 8 per page: at least 4 billed pages per listing.
-    let lists = o.reqs.iter().filter(|r| r.api == "ListObjectsV2").count();
+    let lists = o
+        .reqs
+        .iter()
+        .filter(|r| r.api_name() == "ListObjectsV2")
+        .count();
     assert!(
         lists >= 4 * o.ops.len(),
         "{lists} pages for {} listings",

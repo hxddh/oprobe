@@ -4,6 +4,75 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## v9.0.0 — 2026-11-25
+
+9.0 establishes a clean-slate, lossless observability and data contract (`oprobe.trace/9`,
+`oprobe.report/7`, `oprobe.run/7`, `oprobe.prove/9`), eliminates concurrency races across cache
+instrumentation, TCP upload probes and lab store quotas, delivers comment-preserving `op.toml` /
+`config.toml` round-trips, and polishes the native desktop and terminal TUI experience without
+adding new commands or configuration concepts.
+
+### Breaking
+
+- **Clean-slate v9 formats and schemas (`https://github.com/hxddh/oprobe/schemas/9/`).**
+  - `oprobe-trace` writes and reads `oprobe.trace/9`; `oprobe` writes and reads `oprobe.report/7`,
+    `oprobe.run/7` and `oprobe.prove/9`. Pre-v9 files and legacy serde field aliases are no longer
+    read.
+  - `ReqRow.api` is strongly typed as `Api` (with `service_op` when custom); `OpRow` carries its
+    exact Horvitz-Thompson stratum `weight`; `SlowOp` records `bytes`; `ServiceRecord` records
+    client posture (`http_version`, `keep_alive`, `max_inflight_count`); `ProveOutput` carries
+    `schema` and `operator` so `.prove.json` documents are self-contained.
+  - Removed unwired `ReqDetail.{stream_wait_us, flow_stall_us}` fields and redundant
+    `RunInfo.interrupted` / `RunSummary.interrupted` flags (`run.partial` is the single source of
+    truth).
+
+### Added
+
+- **Registered JSON Schemas for every command output.** Added `schemas/compare.json`,
+  `schemas/removed.json` and `schemas/lab.json` alongside the updated v9 schema suite.
+- **Complete OpenTelemetry coverage in `oprobe-trace` (`otel` feature).** `OtelExporter` now emits
+  `oprobe.operation.duration` and `oprobe.cache.lookups` in addition to per-stage HTTP request
+  durations.
+- **Read-only prefix support in the app's New Run dialog.** Added an optional **Existing prefix**
+  field (`--existing`, automatically enabling read-only mode) and preserved `--existing` and
+  `--set` overrides across **Run Again**.
+- **Comment-preserving TOML patching (`toml_edit`).** `prove --save` and the app's **Save to
+  `op.toml`** / **Save as `op.toml`…** patch existing `op.toml` and `config.toml` tables in place,
+  preserving comments, whitespace, `${ENV}` placeholders and unredacted credentials.
+
+### Fixed
+
+- **Lossless sampling and stage/slice accuracy.** `OpSampler` records exact per-stratum weights so
+  tail-pinned slow/failed operations never distort sampled range views, `--by` groupings or stage
+  breakdowns; `QueueStampLayer` stamps HTTP concurrency queue wait before `ConcurrentLimitLayer`;
+  `ListView` counts paginated `ListObjects` calls accurately; `WritePathView` attributes multipart
+  uploads across custom chunk sizes; `404` checks and `TailCutLayer` hedges no longer inflate
+  remote/API error counts or invalidate production traces.
+- **Race-free `CacheObserveLayer`, retry attribution and wire fidelity.** Replaced zero-request
+  cache heuristics with per-lookup task-local probes (covering `stat`, concurrent lookups and early
+  reader drops without double-counting), fixed retry state reset after successful attempts,
+  serialized concurrent TCP kernel upload probes per connection, tracked recent HTTP/2 stream ends
+  for accurate `streams_count`, and marked truncated chunked/compressed responses `aborted`.
+- **Instant `prove` cancellation, isolated warm `TailCutLayer` state and `FoyerLayer` sizing.**
+  User cancellation (`Ctrl+C` / UI Stop) exits immediately as `RunInterrupted` instead of saving an
+  inconclusive proof; baseline and candidate `TailCutLayer` instances are isolated by full
+  `OperatorSpec`; `repeated_reads` sizes `FoyerLayer` with an `8 × object_size` shard floor and
+  sampling scale-up.
+- **Compilable OpenDAL 0.59 `to_rust` snippets.** Emits `use` imports in canonical layer order,
+  installs `with_context(ReqwestTransport)` before `reader_with`/`writer_with`, honours
+  `http.{proxy, ca_cert, insecure}`, and routes `webdav://` and relative `fs://` paths through
+  `Operator::via_iter`.
+- **Built-in lab concurrency & S3 fidelity.** `StoreUsage` reserves in-flight upload, multipart
+  merge and `CopyObject` bytes atomically via CAS without leaking quota on throttled or aborted
+  requests; batch-delete XML unescapes entities in a single pass (preserving `+` and `%2B` keys);
+  `CopyObjectResult` formats RFC 3339 `LastModified`; `LabServer` checks loopback bind safety
+  before opening the socket.
+- **Native GUI & `80×24` TUI polish.** Fixed TUI chart focus wiping Braille canvases, added
+  bidirectional `Shift+←/→` range selection and keyboard-focusable waterfall bars, eliminated
+  Operator input backspace snap-back, streamed live `prove` A/B trials without 100 ms snapshot
+  churn, supported standalone `.prove.json` files without local `.oprobe` runs, synced OS menu
+  language switches immediately, and guarded async run/compare loads with monotonic sequence IDs.
+
 ## v8.0.0 — 2026-11-24
 
 8.0 advances embedded and live wire observability (`oprobe.trace/8`), closes OpenDAL 0.59 Rust

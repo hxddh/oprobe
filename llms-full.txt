@@ -60,7 +60,7 @@ each with its remedy as an `op.toml` path, and the next command:
         peers, after a short retry backoff (TailCutLayer + RetryLayer::with_min_delay)
       next: oprobe prove 20261123-135409-4b57 tail_stragglers
   1733.6 ops/s · 97.6 MiB/s · p50 9.65ms · p99 261ms · errors 0.00%
-  full profile: oprobe show 20261123-135409-4b57 --detail · terms: https://github.com/hxddh/oprobe/blob/v7.0.0/docs/concepts.md#glossary
+  full profile: oprobe show 20261123-135409-4b57 --detail · terms: https://github.com/hxddh/oprobe/blob/v9.0.0/docs/concepts.md#glossary
 ```
 
 `prove last` runs trials of the current operator (A) and of the remedy (B), interleaved, and ends
@@ -810,9 +810,9 @@ oprobe prove 20261122-0915 small_ranges --max-duration 10m
 Print a profile: a stored run, or a file (`.oprobe` from `run` or from
 [`oprobe-trace`](embedding.md), or a report `.json`). Without an argument, the last run.
 Pass two or more runs or files to compare them side by side on goodput, bandwidth, latency,
-retries, throttling and stage split (`-o json`: `schemas/run.json`, `--detail` adds the per-API
+retries, throttling and stage split (`-o json`: `schemas/compare.json`, `--detail` adds the per-API
 comparison table). `-o json` for one run prints the shown run (`schemas/show.json`: the report of `schemas/report.json`, where it is stored, and the `by` and `range` sections when asked for); `--list -o json` the run list
-(`schemas/run-list.json`; `-n` limits the runs and the proves alike). A prove id, unambiguous prove prefix, `last-prove`, or `.prove.json` file (`show --list`
+(`schemas/run-list.json`; `-n` limits the runs and the proves alike), and `--rm -o json` the deleted ids (`schemas/removed.json`). A prove id, unambiguous prove prefix, `last-prove`, or `.prove.json` file (`show --list`
 lists them) prints that prove's stored result as `prove` printed it (`schemas/prove.json`), also
 after its run was removed.
 
@@ -820,8 +820,7 @@ A trace from `oprobe-trace` is recognised by its content, whatever its name. Its
 `run.source = "trace"` and shows `production trace` where a run shows its workload. Its
 operations are the application's OpenDAL calls (keys hashed), and the findings a trace supports
 are derived: errors, throttling, hung requests, stragglers, cold connections, small ranges, slow
-multipart and repeated reads (not bandwidth cap or client bound). A 6.x trace
-(`oprobe.trace/6`) has no operations: each request counts as one there. `prove` refuses a trace
+multipart and repeated reads (not bandwidth cap or client bound). `prove` refuses a trace
 (exit 2): it needs a run oprobe drove.
 
 | Flag | Meaning |
@@ -848,8 +847,9 @@ oprobe show --rm last~3 last~4
 
 ## `oprobe lab [SCENARIO]`
 
-Serve a local S3-compatible lab with faults until Ctrl-C and print its endpoint. Point any S3
-client at it, or use `lab://SCENARIO` as an operator to start one inside a run.
+Serve a local S3-compatible lab with faults until Ctrl-C and print its endpoint (`-o json`:
+`schemas/lab.json`). Point any S3 client at it, or use `lab://SCENARIO` as an operator to start one
+inside a run.
 
 Scenarios (the same six as the app's): `demo`, `throttle`, `stragglers`, `bandwidth`, `flaky`,
 `ratelimit`. Without one, the lab has no faults.
@@ -858,7 +858,7 @@ Scenarios (the same six as the app's): `demo`, `throttle`, `stragglers`, `bandwi
 |---|---|
 | `--bind ADDR` | the address to listen on (default `127.0.0.1:9000`) |
 | `--allow-remote` | allow binding to a non-loopback address (`0.0.0.0`, LAN IP); refused without this flag because the lab accepts static lab credentials without authentication |
-| `--max-store-size SIZE` | cap total in-memory object bytes stored by the lab (default `512MiB`; returns `507 InsufficientStorage` above it) |
+| `--max-store-size SIZE` | cap total in-memory object bytes stored by the lab (default `8GiB`; returns `507 InsufficientStorage` above it) |
 
 ## Run references
 
@@ -921,7 +921,7 @@ The app's Profile view shows the same sections with charts ([app](app.md)).
         peers, after a short retry backoff (TailCutLayer + RetryLayer::with_min_delay)
       next: oprobe prove 20261123-135409-4b57 tail_stragglers
   1733.6 ops/s · 97.6 MiB/s · p50 9.65ms · p99 261ms · errors 0.00%
-  full profile: oprobe show 20261123-135409-4b57 --detail · terms: https://github.com/hxddh/oprobe/blob/v7.0.0/docs/concepts.md#glossary
+  full profile: oprobe show 20261123-135409-4b57 --detail · terms: https://github.com/hxddh/oprobe/blob/v9.0.0/docs/concepts.md#glossary
 ```
 
 (`oprobe demo`; your numbers differ from run to run.)
@@ -975,16 +975,15 @@ The waterfall of the slowest operation (terminal and app) lists them per request
 | Signal | What it says |
 |---|---|
 | error code, Retry-After | the provider's own error (`SlowDown`, `ServerBusy`) and how long it asked to wait |
-| h2 stream wait | HTTP/2: the request waited for a stream slot (`max_concurrent_streams`); part of queue |
-| h2 flow stall | HTTP/2: the request body waited for flow-control window; it is hidden inside TTFB |
-| h2 streams | HTTP/2 streams open on the connection when the request started |
+| tail-cut, body incomplete | a request cancelled early by `TailCutLayer` hedging, or a response body dropped before EOF |
+| h2 streams | HTTP/2 streams active on the connection during the request |
 | upload acked, send buffered | when the kernel saw the last request byte acknowledged, and when the body reached the send buffer: the end of the upload |
-| cache | a CDN's cache status (`hit`, `miss`) |
-| region | the bucket's region (`x-amz-bucket-region`) |
-| rtt, retransmits, Server-Timing | the connection's round trip and retransmitted segments, the server's own timing header |
+| cache, edge, age | CDN cache status (`hit`, `miss`), edge PoP and object age |
+| region, class, sse | the bucket's region (`x-amz-bucket-region`), storage class and server-side encryption |
+| rtt, min rtt, retransmits, Server-Timing | the connection's round trip, minimum RTT and retransmitted segments, plus the server's own timing header |
 
-The compact profile shows the error code, Retry-After, the HTTP/2 waits and the cache status;
-`--detail` shows every signal.
+The compact profile shows the error code, Retry-After, tail-cut/incomplete body status and cache
+status; `--detail` shows every signal.
 
 `--since 3s --until 8s` shows one time range of the window (a burst, the seconds a rate limit
 bit): its numbers, where the time went, the verbs, the requests by API and its slowest
@@ -1040,18 +1039,18 @@ Each operation's wall time is split exactly; an instant counts once even when re
 ## JSON
 
 `-o json` prints one document on stdout. `run` and `show` print the report
-(`"schema": "oprobe.report/6"`), `prove` the prove result, `show --list` the run list. Numeric
-fields carry their unit in the name (`_ms`, `_bytes`, `_ratio`, `_count`), enums are
-`snake_case`, and fields are only ever added within 6.x. Errors are
+(`"schema": "oprobe.report/7"`), `prove` the prove result (`"schema": "oprobe.prove/9"`),
+`show --list` the run list. Numeric fields carry their unit in the name (`_ms`, `_bytes`,
+`_ratio`, `_count`), enums are `snake_case`, and fields are only ever added within 9.x. Errors are
 `{"type":"error","error":{"code","message","hint","retryable","docs"}}`.
 
 ## Files
 
-A stored run lives in `<data dir>/oprobe/runs/` as one `.oprobe` file (format `oprobe.run/6`: a
+A stored run lives in `<data dir>/oprobe/runs/` as one `.oprobe` file (format `oprobe.run/7`: a
 zstd stream of the header with the operator spec and workload, columnar segments of operation and
-request rows, the per-second timeline, and the report). `oprobe-trace` writes `oprobe.trace/8`
-files (`oprobe.trace/7` and `oprobe.trace/6` still open; one JSON document: the aggregates and the sampled rows). `oprobe show FILE` and the app
-open both. 5.x run files are not read.
+request rows, the per-second timeline, and the report). `oprobe-trace` writes `oprobe.trace/9`
+files (one JSON document: the aggregates, service posture and sampled rows). `oprobe show FILE`
+and the app open both, as well as standalone `.prove.json` (`oprobe.prove/9`) files.
 
 
 <!-- source: docs/embedding.md -->
@@ -1075,7 +1074,7 @@ layers share one global meter).
 
 ```toml
 [dependencies]
-oprobe-trace = "8"
+oprobe-trace = "9"
 ```
 
 ```rust
@@ -1141,10 +1140,11 @@ let cfg = oprobe_trace::Config::default().exporter(std::sync::Arc::new(Slow));
 ```
 
 - **OpenTelemetry** (feature `otel`, `opentelemetry` 0.32): `oprobe_trace::otel::config(&meter)`
-  records `http.client.request.duration` (seconds) once per stage, with the attributes
-  `oprobe.stage` (`total`, `queue`, `connect`, `send`, `ttfb`, `body`, `stall`), `oprobe.api`,
-  `http.request.method` and `http.response.status_code`, and OpenDAL's own metric labels
-  (`scheme`, `namespace`, `root`, `operation`), so its series join `opendal-layer-otelmetrics`'.
+  records `http.client.request.duration` (seconds) once per stage (with `oprobe.stage`,
+  `oprobe.api`, `http.request.method`, `http.response.status_code`), `oprobe.operation.duration`
+  per OpenDAL operation, and `oprobe.cache.lookups` per cache lookup, carrying OpenDAL's own
+  metric labels (`scheme`, `namespace`, `root`, `operation`) so its series join
+  `opendal-layer-otelmetrics`'.
 
 ## Configuration
 
@@ -1221,24 +1221,26 @@ is lost in the noise.
 
 ## Stability
 
-Within 8.x the API documented on docs.rs, the `oprobe.trace/8` file format and the meaning of
+Within 9.x the API documented on docs.rs, the `oprobe.trace/9` file format and the meaning of
 every field are stable: changes are additive. Public structs and enums are `#[non_exhaustive]`,
 so read fields freely but build `Config` with its methods. The `__internal` feature exists for the
 oprobe binary and has no semver promise; do not enable it.
 
 ## The file
 
-`oprobe.trace/8` is one JSON document, readable without oprobe:
+`oprobe.trace/9` is one JSON document, readable without oprobe:
 
 ```text
-{ "format": "oprobe.trace/8", "oprobe_trace_version": "8.0.0", "created_at": "…",
-  "service": { "scheme": "s3", "name": "my-bucket", "root": "/data/" },
+{ "format": "oprobe.trace/9", "oprobe_trace_version": "9.0.0", "created_at": "…",
+  "service": { "scheme": "s3", "name": "my-bucket", "root": "/data/", "http_version": "auto", "keep_alive": true },
   "snapshot": { … }, "rows": { "ops": [ … ], "reqs": [ … ], "info": { … }, "sampling": { … } } }
 ```
 
 `service` is the OpenDAL service the layer was applied to: its scheme, name (the bucket or
-container) and root, with no options. A bare `snapshot.save` has neither `service` nor `rows`.
-`rows.ops` are the operations; each request row names its operation (`op_id`), the length of the
+container), root and client posture (`http_version`, `keep_alive`, `max_inflight_count`), with no
+credentials or options. A bare `snapshot.save` has neither `service` nor `rows`.
+`rows.ops` are the operations (each carrying its exact sampling `weight` when thinned); each
+request row names its operation (`op_id`), its strongly typed storage `api`, the length of the
 byte range it asked for (`detail.range_bytes`) and, when it failed, its class
 (`storage.condition_not_match`, `storage.already_exists`, `storage.conflict`,
 `storage.range_not_satisfied`, `storage.throttled`, …) and whether the failure is temporary
@@ -1249,11 +1251,6 @@ byte range it asked for (`detail.range_bytes`) and, when it failed, its class
 hot keys still slice the traffic, and repeated reads are still told apart, but the file never
 holds a key. Request IDs and remote addresses can be in it; credentials never are. Treat a
 profile like a log file before you paste it into an issue.
-
-**Migrating from 7.x and 6.x.** `oprobe.trace/7` and `oprobe.trace/6` files still open (`oprobe.trace/7`
-with full operation fidelity; `oprobe.trace/6` holds requests only, so each
-request counts as one operation there, and the report says so). `TraceLayer` wraps every service now, not
-only `memory` and `fs`.
 
 
 <!-- source: docs/app.md -->
@@ -1321,7 +1318,7 @@ The window works like other professional tools on your platform (design:
 - **New Run** (mod+N) is a dialog: the operator (a URL, an `op.toml`, a configured name) with a
   **Choose** pop-up that lists the lab's scenarios, the operators of your config file
   (`[operators.NAME]`), the `op.toml` files you ran before and **Choose op.toml…**; the workload
-  (a pop-up); the duration and concurrency. The operator field has the focus when it opens,
+  (a pop-up); the duration, concurrency and an optional read-only **Existing prefix**. The operator field has the focus when it opens,
   Return anywhere presses the default button and Escape cancels. A `lab://` run starts at once;
   a real target is **planned first**: **Review Plan** shows what the run will write, read and
   delete (and under which prefix), how long it takes and the budgets that stop it, and only then
@@ -1337,9 +1334,9 @@ The window works like other professional tools on your platform (design:
 - **Quitting** (⌘Q, Ctrl+Q, Exit, or the window's close button) while a run or a prove goes on
   asks first: **Stop and Quit** stops it, removes its test data and quits; Cancel keeps it
   running.
-- **Run files**: open a `.oprobe` or report/trace `.json` file with File ▸ Open Run File… (the
+- **Run files**: open a `.oprobe`, `.prove.json`, report `.json` or `op.toml` file with File ▸ Open Run File… (the
   system's open dialog, filtered to those types), drop it on the window (the window is outlined
-  while a file is dragged over it), or double-click it: `oprobe.app` (macOS), the `.msi`
+  while a file is dragged over it), or double-click a `.oprobe` / `.json` file: `oprobe.app` (macOS), the `.msi`
   (Windows) and the Linux desktop archive's `.desktop` entry and MIME type
   (`application/x-oprobe-run`) register `.oprobe` files, and run `oprobe FILE`, which opens the
   file in the app. The archives and the `.deb` / `.rpm` register nothing.
@@ -1371,11 +1368,11 @@ The window works like other professional tools on your platform (design:
   the longest `Retry-After`, other errors and failure classes.
 - **The slowest operations** as a request waterfall. Each request is on a shared time axis and
   coloured by stage, the body's wait for the consumer (stall) its own segment; the wait before a
-  retry is drawn as a line in the retry colour. Hovering a request reads out its stages and,
-  when recorded, the provider's error code (`SlowDown`), `Retry-After`, the connection's rtt,
-  min rtt and retransmits, `Server-Timing`, the HTTP/2 stream wait, flow-control stall and open
-  streams, when the upload reached the kernel and was acknowledged, the CDN cache status and
-  the region ([request signals](reading-the-profile.md#request-signals)). An operation whose
+  retry is drawn as a line in the retry colour. Hovering or focusing a request reads out its stages and,
+  when recorded, the provider's error code (`SlowDown`), `Retry-After`, tail-cut / incomplete body status, the connection's rtt,
+  min rtt and retransmits, `Server-Timing`, HTTP/2 active
+  streams, when the upload reached the kernel and was acknowledged, the CDN cache status, the
+  region and the request ID ([request signals](reading-the-profile.md#request-signals)). An operation whose
   async call stack was captured has **Async call stack while in flight** under it, closed until
   clicked.
 - **Timeline**, with a verb filter above it (All verbs, or one verb):

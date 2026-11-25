@@ -153,6 +153,14 @@ fn is_false(v: &bool) -> bool {
     !*v
 }
 
+fn one_weight() -> f64 {
+    1.0
+}
+
+fn is_one_weight(v: &f64) -> bool {
+    (*v - 1.0).abs() < 1e-12
+}
+
 /// Wire protocol of one request.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
@@ -267,27 +275,19 @@ pub struct ReqDetail {
     /// CDN cache status (`x-cache`, `cf-cache-status`, `x-cache-status`): `hit`, `miss`, …
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_status: Option<String>,
-    /// From the request start until the kernel saw the server acknowledge the last request
-    /// byte (Linux `TCP_INFO`): the end of the `upload` phase. `send_us` then counts until the
-    /// acknowledgement and `ttfb_us` from it (the `server` phase).
+    /// Time from `wire_from` until the kernel saw the send queue drain (`notsent_bytes == 0`):
+    /// the end of the `upload` phase. `send_us` then counts until the drain and `ttfb_us` from
+    /// it (the `server` phase).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upload_acked_us: Option<u64>,
-    /// Time until the request body reached the kernel's send buffer (what `send_us` measured
-    /// before the acknowledgement was known).
+    /// Time from `wire_from` until the request body reached the kernel's send buffer (what
+    /// `send_us` measured before the drain was known).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub send_buffered_us: Option<u64>,
-    /// HTTP/2: time waiting for a stream slot (`max_concurrent_streams`) on a connection
-    /// (the `stream_wait` stage; part of `queue_us`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub stream_wait_us: Option<u64>,
-    /// HTTP/2: time the request body waited for flow-control window (window at 0).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub flow_stall_us: Option<u64>,
-    /// HTTP/2: streams open on the connection when the request started (itself included).
+    /// HTTP/2: concurrent streams active on the connection during this request (itself included).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub streams_count: Option<u32>,
-    /// The request waited for a connection another request was dialing: it counts as cold and
-    /// the wait is in `connect` (fidelity transport).
+    /// Time waiting for a connection another concurrent stream was dialing (part of `queue_us`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dial_wait_us: Option<u64>,
     /// Retransmitted segments on the connection during this request.
@@ -339,8 +339,11 @@ pub struct ReqRow {
     pub op_id: u64,
     /// 1 for the first attempt of this API call within the operation, 2+ for retries.
     pub attempt: u32,
-    /// Storage API, e.g. `GetObject` (OpenDAL `ServiceOperation`; URL heuristic fallback).
-    pub api: Cow<'static, str>,
+    /// Normalized storage API class (`GetObject`, `ListObjects`, `CompleteMultipartUpload`, …).
+    pub api: crate::Api,
+    /// Exact provider operation name when attached by OpenDAL (`ListObjectsV2`, `PutBlock`, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_op: Option<Cow<'static, str>>,
     pub method: Cow<'static, str>,
     /// HTTP status; 0 when no response arrived.
     pub status: u16,
@@ -388,6 +391,13 @@ pub struct ReqRow {
 }
 
 impl ReqRow {
+    /// Exact provider operation name (`ListObjectsV2`, `PutBlock`) when present, else the
+    /// normalized [`crate::Api::label`].
+    pub fn api_name(&self) -> &str {
+        self.service_op
+            .as_deref()
+            .unwrap_or_else(|| self.api.label())
+    }
     pub fn connect_us(&self) -> u64 {
         self.dns_us + self.tcp_us + self.proxy_us + self.tls_us
     }
@@ -448,6 +458,10 @@ pub struct OpRow {
     /// Await-tree call stack captured while the operation was slow.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub await_tree: Option<String>,
+    /// Sampling weight: how many operations of the window this kept row stands for (`1.0` when
+    /// unsampled or always-kept).
+    #[serde(default = "one_weight", skip_serializing_if = "is_one_weight")]
+    pub weight: f64,
 }
 
 /// What the run file's trace rows cover.

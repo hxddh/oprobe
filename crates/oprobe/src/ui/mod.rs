@@ -68,11 +68,6 @@ pub fn run_gui() -> std::process::ExitCode {
                 "name": "oprobe run",
                 "extensions": ["oprobe", "json"],
                 "mimeTypes": ["application/x-oprobe-run", "application/json"],
-            },
-            {
-                "name": "oprobe operator",
-                "extensions": ["toml"],
-                "mimeTypes": ["application/toml"],
             }
         ]));
     }

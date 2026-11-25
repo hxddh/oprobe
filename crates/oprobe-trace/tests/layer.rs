@@ -54,7 +54,7 @@ async fn a_memory_operator_reports_its_requests() {
     let path = temp_file("requests");
     handle.save(&path).unwrap();
     let doc = read_json(&path);
-    assert_eq!(doc["format"], "oprobe.trace/8");
+    assert_eq!(doc["format"], "oprobe.trace/9");
     assert_eq!(doc["oprobe_trace_version"], env!("CARGO_PKG_VERSION"));
     // The service the layer was applied to (no options, no credentials).
     assert_eq!(doc["service"]["scheme"], "memory");
@@ -122,7 +122,7 @@ async fn a_snapshot_saves_without_rows() {
     let path = temp_file("snapshot");
     handle.snapshot().save(&path).unwrap();
     let doc = read_json(&path);
-    assert_eq!(doc["format"], "oprobe.trace/8");
+    assert_eq!(doc["format"], "oprobe.trace/9");
     assert!(doc.get("rows").is_none());
     assert_eq!(doc["snapshot"]["apis"][0]["api"], "PutObject");
 }
@@ -207,4 +207,286 @@ async fn in_process_copy_and_rename_record_requests() {
     let rename_verb = snap.verbs.iter().find(|v| v.verb == "rename").unwrap();
     assert_eq!(rename_verb.requests_per_op, 1.0);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn early_reader_drop_does_not_fabricate_cache_hits() {
+    let (layer, handle) = oprobe_trace::layer(oprobe_trace::Config::default());
+    let op = Operator::new(Memory::default()).unwrap().layer(layer);
+    op.write("k0", vec![1u8; 4096]).await.unwrap();
+
+    // Opening a reader and dropping its stream before reading any bytes issues zero backend
+    // GETs, which is NOT a local cache hit when no cache layer is installed.
+    let reader = op.reader("k0").await.unwrap();
+    let stream = reader.into_bytes_stream(..).await.unwrap();
+    drop(stream);
+
+    let snap = handle.snapshot();
+    assert!(!snap.cache.enabled, "{:?}", snap.cache);
+    assert_eq!(snap.cache.hits, 0);
+    assert_eq!(snap.cache.lookups, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cache_layer_isolates_concurrent_hits_and_misses_and_counts_stat() {
+    use opendal_core::raw::oio::{self, ReadStreamDyn};
+    use opendal_core::raw::*;
+    use opendal_core::*;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Debug, Default)]
+    struct TinyCacheLayer {
+        entries: Arc<Mutex<HashMap<String, Buffer>>>,
+        stats: Arc<Mutex<HashMap<String, Metadata>>>,
+    }
+
+    impl Layer for TinyCacheLayer {
+        fn apply_service(&self, inner: Servicer) -> Servicer {
+            Arc::new(TinyCacheService {
+                inner,
+                entries: self.entries.clone(),
+                stats: self.stats.clone(),
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct TinyCacheService {
+        inner: Servicer,
+        entries: Arc<Mutex<HashMap<String, Buffer>>>,
+        stats: Arc<Mutex<HashMap<String, Metadata>>>,
+    }
+
+    struct MissArgs {
+        inner: Servicer,
+        ctx: OperationContext,
+        path: String,
+        args: OpRead,
+        entries: Arc<Mutex<HashMap<String, Buffer>>>,
+    }
+
+    struct TinyCacheReader {
+        hit: Option<Buffer>,
+        miss: Option<MissArgs>,
+    }
+
+    impl oio::Read for TinyCacheReader {
+        async fn open(&self, range: BytesRange) -> Result<(RpRead, Box<dyn ReadStreamDyn>)> {
+            if let Some(buf) = &self.hit {
+                let bytes = buf.to_bytes();
+                let start = range.offset() as usize;
+                let end = range
+                    .size()
+                    .map_or(bytes.len(), |s| (start + s as usize).min(bytes.len()));
+                let slice = Buffer::from(bytes.slice(start..end));
+                return Ok((RpRead::default(), Box::new(slice) as Box<dyn ReadStreamDyn>));
+            }
+            let m = self.miss.as_ref().unwrap();
+            tokio::task::yield_now().await;
+            let reader = m.inner.read(&m.ctx, &m.path, m.args.clone())?;
+            let (_rp, mut stream) = reader.open(BytesRange::from(..)).await?;
+            let mut chunks = Vec::new();
+            loop {
+                let b = stream.read_dyn().await?;
+                if b.is_empty() {
+                    break;
+                }
+                chunks.push(b.to_bytes());
+            }
+            let full = Buffer::from(chunks);
+            m.entries
+                .lock()
+                .unwrap()
+                .insert(m.path.clone(), full.clone());
+            let bytes = full.to_bytes();
+            let start = range.offset() as usize;
+            let end = range
+                .size()
+                .map_or(bytes.len(), |s| (start + s as usize).min(bytes.len()));
+            let slice = Buffer::from(bytes.slice(start..end));
+            Ok((RpRead::default(), Box::new(slice) as Box<dyn ReadStreamDyn>))
+        }
+
+        async fn read(&self, range: BytesRange) -> Result<(RpRead, Buffer)> {
+            let (rp, mut stream) = self.open(range).await?;
+            let mut chunks = Vec::new();
+            loop {
+                let b = stream.read_dyn().await?;
+                if b.is_empty() {
+                    break;
+                }
+                chunks.push(b.to_bytes());
+            }
+            Ok((rp, Buffer::from(chunks)))
+        }
+    }
+
+    impl Service for TinyCacheService {
+        type Reader = TinyCacheReader;
+        type Writer = oio::Writer;
+        type Lister = oio::Lister;
+        type Deleter = oio::Deleter;
+        type Copier = oio::Copier;
+        type Composer = oio::Composer;
+
+        fn info(&self) -> ServiceInfo {
+            self.inner.info()
+        }
+        fn capability(&self) -> Capability {
+            self.inner.capability()
+        }
+        async fn create_dir(
+            &self,
+            ctx: &OperationContext,
+            path: &str,
+            args: OpCreateDir,
+        ) -> Result<RpCreateDir> {
+            self.inner.create_dir(ctx, path, args).await
+        }
+        async fn stat(&self, ctx: &OperationContext, path: &str, args: OpStat) -> Result<RpStat> {
+            if let Some(meta) = self.stats.lock().unwrap().get(path).cloned() {
+                return Ok(RpStat::new(meta));
+            }
+            let rp = self.inner.stat(ctx, path, args).await?;
+            self.stats
+                .lock()
+                .unwrap()
+                .insert(path.to_owned(), rp.clone().into_metadata());
+            Ok(rp)
+        }
+        fn read(&self, ctx: &OperationContext, path: &str, args: OpRead) -> Result<Self::Reader> {
+            if let Some(buf) = self.entries.lock().unwrap().get(path).cloned() {
+                return Ok(TinyCacheReader {
+                    hit: Some(buf),
+                    miss: None,
+                });
+            }
+            Ok(TinyCacheReader {
+                hit: None,
+                miss: Some(MissArgs {
+                    inner: self.inner.clone(),
+                    ctx: ctx.clone(),
+                    path: path.to_owned(),
+                    args,
+                    entries: self.entries.clone(),
+                }),
+            })
+        }
+        fn write(&self, ctx: &OperationContext, path: &str, args: OpWrite) -> Result<Self::Writer> {
+            self.inner.write(ctx, path, args)
+        }
+        fn copy(
+            &self,
+            ctx: &OperationContext,
+            from: &str,
+            to: &str,
+            args: OpCopy,
+        ) -> Result<Self::Copier> {
+            self.inner.copy(ctx, from, to, args)
+        }
+        fn compose(
+            &self,
+            ctx: &OperationContext,
+            to: &str,
+            args: OpCompose,
+        ) -> Result<Self::Composer> {
+            self.inner.compose(ctx, to, args)
+        }
+        async fn rename(
+            &self,
+            ctx: &OperationContext,
+            from: &str,
+            to: &str,
+            args: OpRename,
+        ) -> Result<RpRename> {
+            self.inner.rename(ctx, from, to, args).await
+        }
+        async fn restore(
+            &self,
+            ctx: &OperationContext,
+            path: &str,
+            args: OpRestore,
+        ) -> Result<RpRestore> {
+            self.inner.restore(ctx, path, args).await
+        }
+        fn delete(&self, ctx: &OperationContext) -> Result<Self::Deleter> {
+            self.inner.delete(ctx)
+        }
+        fn list(&self, ctx: &OperationContext, path: &str, args: OpList) -> Result<Self::Lister> {
+            self.inner.list(ctx, path, args)
+        }
+        async fn presign(
+            &self,
+            ctx: &OperationContext,
+            path: &str,
+            args: OpPresign,
+        ) -> Result<RpPresign> {
+            self.inner.presign(ctx, path, args).await
+        }
+    }
+
+    let (trace_layer, handle) = oprobe_trace::layer(oprobe_trace::Config::default());
+    let cache = TinyCacheLayer::default();
+    let op = Operator::new(Memory::default())
+        .unwrap()
+        .layer(trace_layer)
+        .layer(cache)
+        .layer(handle.cache_layer());
+
+    for i in 0..8 {
+        op.write(&format!("obj-{i}"), vec![42u8; 256])
+            .await
+            .unwrap();
+    }
+    // Prime obj-0 in cache (1 read miss + 1 stat miss).
+    assert_eq!(op.read("obj-0").await.unwrap().len(), 256);
+    assert_eq!(op.stat("obj-0").await.unwrap().content_length(), 256);
+
+    // Concurrently run 16 cached reads on obj-0, 7 uncached reads on obj-1..7, and 4 cached stats on obj-0.
+    let mut tasks = Vec::new();
+    for _ in 0..16 {
+        let op = op.clone();
+        tasks.push(tokio::spawn(async move {
+            assert_eq!(op.read("obj-0").await.unwrap().len(), 256);
+        }));
+    }
+    for i in 1..8 {
+        let op = op.clone();
+        tasks.push(tokio::spawn(async move {
+            assert_eq!(op.read(&format!("obj-{i}")).await.unwrap().len(), 256);
+        }));
+    }
+    for _ in 0..4 {
+        let op = op.clone();
+        tasks.push(tokio::spawn(async move {
+            assert_eq!(op.stat("obj-0").await.unwrap().content_length(), 256);
+        }));
+    }
+    // Plus 1 uncached stat.
+    op.write("stat-only", vec![1u8; 64]).await.unwrap();
+    assert_eq!(op.stat("stat-only").await.unwrap().content_length(), 64);
+
+    for t in tasks {
+        t.await.unwrap();
+    }
+
+    let snap = handle.snapshot();
+    assert!(snap.cache.enabled);
+    // Misses: 1 (prime read obj-0) + 1 (prime stat obj-0) + 7 (obj-1..7) + 1 (stat-only) = 10
+    // Hits: 16 (read obj-0) + 4 (stat obj-0) = 20
+    // Lookups: 10 + 20 = 30
+    assert_eq!(snap.cache.hits, 20, "{:?}", snap.cache);
+    assert_eq!(snap.cache.lookups, 30, "{:?}", snap.cache);
+    // Operations include both cache hits and cache misses + writes (9 writes + 24 reads + 6 stats = 39).
+    assert_eq!(snap.summary.ops, 39, "{:?}", snap.summary);
+
+    let path = temp_file("cache-concurrent");
+    handle.save(&path).unwrap();
+    let doc = read_json(&path);
+    let reqs = doc["rows"]["reqs"].as_array().unwrap();
+    assert!(
+        reqs.iter().all(|r| r["op_id"].as_u64().unwrap() != 0),
+        "{reqs:#?}"
+    );
 }

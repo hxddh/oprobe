@@ -10,7 +10,7 @@ workload), `prove` (A/B-test a change and print the proven layer diff), `show` (
 `.oprobe` file; `--list` for history) and `lab` (a local S3 with faults). `demo` is
 `run lab://demo`. Every command prints one JSON document with `-o json`; schemas are in the
 repository's `schemas/` (`run`, `plan`, `report`, `prove`, `prove-plan`, `show`, `run-list`,
-`operator`, `error`, `events`).
+`compare`, `removed`, `lab`, `operator`, `error`, `events`).
 
 ## Rules
 
@@ -56,7 +56,7 @@ race on the same workload. Workload: `--preset small-files|large-objects|range-r
 
 ## Reading results
 
-- `run` / `show` (`oprobe.report/6`): `verdict.level` (`ok`, `review`, `attention`,
+- `run` / `show` (`oprobe.report/7`): `verdict.level` (`ok`, `review`, `attention`,
   `critical`) and `verdict.headline`; `findings[]` with `code`, `severity`, `cause`, `evidence`
   (numbers, operation ids, time windows) and the remedy, an `op.toml` path.
 - Finding codes and their remedy: `throttling` → `layers.concurrent_limit.http` (+
@@ -68,7 +68,7 @@ race on the same workload. Workload: `--preset small-files|large-objects|range-r
   `cold_connections` → `http.keep_alive` / `http.version`, `client_bound` → none (the client is
   the bottleneck); also `errors` (→ `layers.retry.min_delay` + `layers.retry.jitter` when retries
   recovered every operation, else none) and `invalid_run`.
-- `prove` (`oprobe.prove`): `verdict` (`improved`, `worse`, `inconclusive`), `objective`,
+- `prove` (`oprobe.prove/9`): `verdict` (`improved`, `worse`, `inconclusive`), `objective`,
   `objective_delta` (estimate with interval), `pairs_count`, `secondary[]` (shown, never
   decisive) and `diff` with the change as `rust` and `toml`. Hand the user the diff.
 

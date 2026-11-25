@@ -66,6 +66,7 @@ impl StageHists {
 
 struct ApiAgg {
     count: u64,
+    connected: u64,
     errors: u64,
     throttled: u64,
     reused: u64,
@@ -79,6 +80,7 @@ impl ApiAgg {
     fn new() -> Self {
         Self {
             count: 0,
+            connected: 0,
             errors: 0,
             throttled: 0,
             reused: 0,
@@ -573,27 +575,28 @@ impl Agg {
         }
         let a = self.apis.entry(r.api).or_insert_with(ApiAgg::new);
         a.count += 1;
-        if r.is_error() && r.status != 404 {
+        if r.is_error() && r.status != 404 && !is_cut {
             a.errors += 1;
         }
         if r.is_throttle() {
             a.throttled += 1;
         }
-        if r.reused {
-            a.reused += 1;
+        if connected {
+            a.connected += 1;
+            if r.reused {
+                a.reused += 1;
+            }
         }
         *a.status.entry(r.status).or_default() += 1;
         a.bytes_up += r.bytes_up;
         a.bytes_down += r.bytes_down;
         let t = &r.timing;
         rec(&mut a.stages.queue, t.queue_us);
-        if !r.reused && r.protocol != Protocol::InProcess {
-            rec(&mut a.stages.connect, t.connect_us());
-        }
         // A connection counts as dialed in the window through the request that used it first,
-        // so "new connections" and "warm %" always describe the same requests (a dial finished
-        // just before the window opened would otherwise be missing from one of them).
+        // so "new connections" and "warm %" always describe the same requests (and unconnected
+        // cancelled requests with `status == 0` and `connect_us == 0` do not pollute `connect`).
         if !r.reused && r.protocol != Protocol::InProcess && (r.status != 0 || t.connect_us() > 0) {
+            rec(&mut a.stages.connect, t.connect_us());
             self.conn.dialed += 1;
             rec(&mut self.dns, t.dns_us);
             rec(&mut self.tcp, t.tcp_us);
@@ -680,6 +683,10 @@ pub trait Exporter: Send + Sync {
     /// A completed operation (`verb`, latency, failed).
     fn on_op(&self, verb: &'static str, latency_us: u64, failed: bool) {
         let _ = (verb, latency_us, failed);
+    }
+    /// Local cache lookups performed during an operation (`lookups`, `hits`).
+    fn on_cache(&self, lookups: u64, hits: u64) {
+        let _ = (lookups, hits);
     }
     /// The OpenDAL service the layer was applied to (once, before its first request): its
     /// scheme, name (the bucket: OpenDAL's `namespace` label) and root.
@@ -1038,6 +1045,7 @@ impl Recorder {
 
     /// Request issued outside any operation scope (rare: background OpenDAL work).
     pub fn record_unscoped_request(&self, r: &RequestRecord) {
+        crate::scope::note_backend_request();
         if let Some(g) = self.guard.get() {
             g.add(1, r.bytes_up + r.bytes_down);
         }
@@ -1181,6 +1189,9 @@ impl Recorder {
             for r in &c.data.requests {
                 e.on_request(r);
             }
+            if c.data.cache_lookups > 0 {
+                e.on_cache(c.data.cache_lookups, c.data.cache_hits);
+            }
             e.on_op(c.verb, c.latency_us, c.error.is_some());
         }
         if let Some(g) = self.guard.get() {
@@ -1231,6 +1242,12 @@ impl Recorder {
         }
         let ok = c.error.is_none();
         let throttled = c.data.throttled;
+        let throttled_requests = c
+            .data
+            .requests
+            .iter()
+            .filter(|r| r.is_throttle())
+            .count() as u64;
         let bytes = c.logical_read + c.logical_write;
         let req_count = c.data.requests.len() as u64 + c.data.dropped_requests;
 
@@ -1249,7 +1266,7 @@ impl Recorder {
             bytes,
             latency_us: c.latency_us,
             requests: req_count,
-            throttled,
+            throttled_requests,
             failed: !ok,
         });
         a.logical_read += c.logical_read;
@@ -1370,6 +1387,7 @@ impl Recorder {
                 key: c.key.clone(),
                 verb: c.verb.to_owned(),
                 latency_ms: lat_ms,
+                bytes,
                 at_s,
                 breakdown: OpBreakdown {
                     queue_ms: ms(bd[0]),
@@ -1615,7 +1633,7 @@ impl Recorder {
                 errors: s.errors,
                 throttled: s.throttled,
                 status: s.status.clone(),
-                reused_pct: crate::util::pct(s.reused as f64, s.count as f64),
+                reused_pct: crate::util::pct(s.reused as f64, s.connected as f64),
                 bytes_up: s.bytes_up,
                 bytes_down: s.bytes_down,
                 stages: StageStats {

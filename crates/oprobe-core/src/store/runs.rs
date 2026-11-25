@@ -1,4 +1,4 @@
-//! The run store: `runs/<id>.oprobe` (segmented zstd stream, format `oprobe.run/6`,
+//! The run store: `runs/<id>.oprobe` (segmented zstd stream, format `oprobe.run/7`,
 //! [`super::runfile`]) plus a
 //! `runs/<id>.json` sidecar summary for fast listing, and RUNREF resolution (design §2).
 
@@ -26,7 +26,6 @@ pub struct RunSummary {
     pub target_display: String,
     pub started_at: String,
     pub window_s: f64,
-    pub interrupted: bool,
     pub verdict_level: VerdictLevel,
     pub headline: String,
     pub ops_per_s: f64,
@@ -63,7 +62,6 @@ impl From<&Report> for RunSummary {
             target_display: r.target.display.clone(),
             started_at: r.run.started_at.clone(),
             window_s: r.run.window_s,
-            interrupted: r.run.interrupted,
             verdict_level: r.verdict.level,
             headline: r.verdict.headline.clone(),
             ops_per_s: r.summary.ops_per_s,
@@ -71,13 +69,7 @@ impl From<&Report> for RunSummary {
             p99_ms: r.summary.latency.p99,
             error_ratio: r.summary.error_rate,
             path: None,
-            partial: if r.verdict.exit_code == crate::errors::exit::BUDGET {
-                Some("budget".into())
-            } else if r.run.interrupted {
-                Some("interrupted".into())
-            } else {
-                None
-            },
+            partial: r.run.partial.as_ref().map(|p| p.reason.as_str().to_owned()),
             target_id: r
                 .spec
                 .target_id()
@@ -90,7 +82,7 @@ impl From<&Report> for RunSummary {
     }
 }
 
-/// Encode a run as `oprobe.run/6` in memory (tests and small exports; the store streams to
+/// Encode a run as `oprobe.run/7` in memory (tests and small exports; the store streams to
 /// disk with [`super::runfile::write_run`]).
 pub fn encode_run(run: &Run) -> Result<Vec<u8>> {
     let dir = tempdir_for_encode()?;
@@ -111,7 +103,7 @@ fn tempdir_for_encode() -> Result<PathBuf> {
     Ok(d)
 }
 
-/// Decode an `oprobe.run/6` stream (a v4 or older file is refused with a hint; a damaged or
+/// Decode an `oprobe.run/7` stream (other versions are refused with a hint; a damaged or
 /// truncated file of this version says so, not that it is of another version).
 pub fn decode_run(r: impl Read) -> Result<Run> {
     super::runfile::read_run(r).map_err(|e| {
@@ -686,9 +678,8 @@ fn json_document(path: &Path) -> Option<(Vec<u8>, String)> {
     Some((bytes, format.unwrap_or_default()))
 }
 
-/// Load a run file, a production trace written by `oprobe-trace` (`oprobe.trace/7`, or a 6.x
-/// `oprobe.trace/6`; whatever its extension: recognised by its content), or a report `.json`
-/// (without trace rows).
+/// Load a run file, a production trace written by `oprobe-trace` (`oprobe.trace/9`; whatever
+/// its extension: recognised by its content), or a report `.json` (without trace rows).
 pub fn load_path(path: &Path) -> Result<Run> {
     let doc = json_document(path);
     let format = doc.as_ref().map(|(_, f)| f.clone());
@@ -740,12 +731,12 @@ pub(crate) mod tests {
     fn the_format_is_read_from_the_start_of_a_document() {
         let f = |s: &str| format_in_prefix(s.as_bytes());
         assert_eq!(
-            f(r#"{"format":"oprobe.trace/6","x":1}"#).as_deref(),
-            Some("oprobe.trace/6")
+            f(r#"{"format":"oprobe.trace/9","x":1}"#).as_deref(),
+            Some("oprobe.trace/9")
         );
         assert_eq!(
-            f("{ \"format\" : \"oprobe.report/6\" }").as_deref(),
-            Some("oprobe.report/6")
+            f("{ \"format\" : \"oprobe.report/7\" }").as_deref(),
+            Some("oprobe.report/7")
         );
         assert_eq!(f(r#"{"x":1}"#), None);
         assert_eq!(f(r#"{"format":"oprobe.tr"#), None);
@@ -820,7 +811,8 @@ pub(crate) mod tests {
                 t_us: o.t_us,
                 op_id: o.op_id,
                 attempt: 1,
-                api: "HeadObject".into(),
+                api: crate::trace::Api::HeadObject,
+                service_op: None,
                 method: "HEAD".into(),
                 status: 200,
                 protocol: WireProtocol::H1,

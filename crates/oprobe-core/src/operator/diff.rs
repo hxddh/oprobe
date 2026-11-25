@@ -294,10 +294,22 @@ fn write_rust(s: &OperatorSpec) -> String {
     e
 }
 
+fn need_http_client(s: &OperatorSpec) -> bool {
+    s.http.version != HttpVersion::Auto
+        || !s.http.keep_alive
+        || s.http.insecure
+        || s.http.ca_cert.is_some()
+        || s.http.proxy.is_some()
+}
+
 fn http_client_expr(s: &OperatorSpec) -> (String, bool) {
     let mut e = "reqwest::Client::builder()".to_owned();
+    let (_, resolved_opts) = resolved_rust_target(s);
     let h2c = s.url.starts_with("http://")
         || s.options
+            .get("endpoint")
+            .is_some_and(|u| u.trim().starts_with("http://"))
+        || resolved_opts
             .get("endpoint")
             .is_some_and(|u| u.trim().starts_with("http://"));
     match s.http.version {
@@ -308,6 +320,23 @@ fn http_client_expr(s: &OperatorSpec) -> (String, bool) {
     }
     if !s.http.keep_alive {
         e += ".pool_max_idle_per_host(0)";
+    }
+    if s.http.insecure {
+        e += ".danger_accept_invalid_certs(true)";
+    }
+    if let Some(ca) = &s.http.ca_cert {
+        let _ = write!(
+            e,
+            ".add_root_certificate(reqwest::Certificate::from_pem(&std::fs::read({ca:?})?)?)"
+        );
+    }
+    if let Some(proxy) = &s.http.proxy {
+        if proxy.eq_ignore_ascii_case("none") {
+            e += ".no_proxy()";
+        } else {
+            let red = crate::util::redact_url(proxy);
+            let _ = write!(e, ".proxy(reqwest::Proxy::all({red:?})?)");
+        }
     }
     e += ".build()?";
     (e, s.http.version == HttpVersion::H2 && !h2c)
@@ -500,8 +529,8 @@ fn inline(v: &toml::Value) -> String {
 }
 
 const CANONICAL_URI_SCHEMES: &[&str] = &[
-    "s3", "gcs", "azblob", "azdls", "azfile", "oss", "cos", "obs", "tos", "b2", "swift", "webdav",
-    "webhdfs", "upyun", "http", "fs", "memory",
+    "s3", "gcs", "azblob", "azdls", "azfile", "oss", "cos", "obs", "tos", "b2", "swift", "webhdfs",
+    "upyun", "http", "fs", "memory",
 ];
 
 fn resolved_rust_target(s: &OperatorSpec) -> (String, BTreeMap<String, String>) {
@@ -545,25 +574,59 @@ fn resolved_rust_target(s: &OperatorSpec) -> (String, BTreeMap<String, String>) 
     (svc, red.options)
 }
 
-/// The whole operator as Rust: the service from its URL (or canonical scheme and options) and
-/// every layer of the stack.
+/// The whole operator as Rust: the imports, the service from its URL (or canonical scheme and
+/// options), every layer of the stack, the HTTP transport context, and any reader/writer builders.
 pub fn to_rust(s: &OperatorSpec) -> String {
     let mut out = String::new();
-    let need_http = s.http.version != HttpVersion::Auto || !s.http.keep_alive;
+    let need_http = need_http_client(s);
+    let mut layer_exprs: Vec<(&str, String)> = Vec::new();
+    for name in LAYER_ORDER {
+        if let Some(e) = layer_rust(s, name) {
+            layer_exprs.push((name, e));
+        }
+    }
+    let need_duration = layer_exprs.iter().any(|(_, e)| e.contains("Duration::"));
+    if need_duration {
+        let _ = writeln!(out, "use std::time::Duration;");
+    }
+    if s.layers.cache.is_some() {
+        let _ = writeln!(out, "use foyer::HybridCacheBuilder;");
+    }
+    let _ = writeln!(out, "use opendal::Operator;");
     if need_http {
         let _ = writeln!(out, "use opendal::{{HttpTransporter, OperationContext}};");
-        let _ = writeln!(
-            out,
-            "use opendal_http_transport_reqwest::ReqwestTransport;\n"
-        );
     }
+    let layer_types: Vec<&str> = layer_exprs
+        .iter()
+        .map(|(name, _)| match *name {
+            "throttle" => "ThrottleLayer",
+            "concurrent_limit" => "ConcurrentLimitLayer",
+            "timeout" => "TimeoutLayer",
+            "tail_cut" => "TailCutLayer",
+            "retry" => "RetryLayer",
+            "cache" => "FoyerLayer",
+            _ => unreachable!(),
+        })
+        .collect();
+    if layer_types.len() == 1 {
+        let _ = writeln!(out, "use opendal::layers::{};", layer_types[0]);
+    } else if layer_types.len() > 1 {
+        let _ = writeln!(out, "use opendal::layers::{{{}}};", layer_types.join(", "));
+    }
+    if need_http {
+        let _ = writeln!(out, "use opendal_http_transport_reqwest::ReqwestTransport;");
+    }
+    out.push('\n');
+
     let disp_url = s.display_url();
     let url_scheme = disp_url
         .split_once("://")
         .map(|(k, _)| k.to_ascii_lowercase())
         .unwrap_or_default();
+    let fs_ok = url_scheme != "fs" || (disp_url.starts_with("fs:///") && disp_url.len() > 6);
     let plain_uri = s.options.is_empty()
         && CANONICAL_URI_SCHEMES.contains(&url_scheme.as_str())
+        && fs_ok
         && !disp_url.contains('?');
     if plain_uri {
         let _ = writeln!(out, "let op = Operator::from_uri({disp_url:?})?");
@@ -582,18 +645,10 @@ pub fn to_rust(s: &OperatorSpec) -> String {
             let _ = writeln!(out, "    ],\n)?");
         }
     }
-    for name in LAYER_ORDER {
-        if let Some(e) = layer_rust(s, name) {
-            let _ = writeln!(out, "    .layer({e})");
-        }
+    for (_, e) in &layer_exprs {
+        let _ = writeln!(out, "    .layer({e})");
     }
     out.push_str(";\n");
-    if !s.read.is_default() {
-        let _ = writeln!(out, "let reader = {}.await?;", read_rust(s));
-    }
-    if !s.write.is_default() {
-        let _ = writeln!(out, "let writer = {}.await?;", write_rust(s));
-    }
     if need_http {
         let (client, alpn_h2) = http_client_expr(s);
         if alpn_h2 {
@@ -604,6 +659,12 @@ pub fn to_rust(s: &OperatorSpec) -> String {
             out,
             "let op = op.with_context(OperationContext::new().with_http_transport(HttpTransporter::new(ReqwestTransport::new(client))));"
         );
+    }
+    if !s.read.is_default() {
+        let _ = writeln!(out, "let reader = {}.await?;", read_rust(s));
+    }
+    if !s.write.is_default() {
+        let _ = writeln!(out, "let writer = {}.await?;", write_rust(s));
     }
     out
 }
@@ -983,6 +1044,53 @@ mod tests {
         assert!(
             lab_code.contains("(\"endpoint\", \"http://127.0.0.1:9000\")"),
             "{lab_code}"
+        );
+
+        // WebDAV and relative FS paths emit `Operator::via_iter`, never broken `from_uri`.
+        let dav = OperatorSpec::from_url("webdav://127.0.0.1:8080/files");
+        let dav_code = to_rust(&dav);
+        assert!(
+            dav_code.contains("Operator::via_iter(\n    \"webdav\","),
+            "{dav_code}"
+        );
+
+        let fs_rel = OperatorSpec::from_url("fs://./local-dir");
+        let fs_rel_code = to_rust(&fs_rel);
+        assert!(
+            fs_rel_code.contains("Operator::via_iter(\n    \"fs\","),
+            "{fs_rel_code}"
+        );
+
+        let fs_abs = OperatorSpec::from_url("fs:///var/tmp/bench");
+        let fs_abs_code = to_rust(&fs_abs);
+        assert!(
+            fs_abs_code.contains("Operator::from_uri(\"fs:///var/tmp/bench\")"),
+            "{fs_abs_code}"
+        );
+
+        // Custom HTTP client (`with_context`) is installed BEFORE `reader_with`, and `lab://`
+        // with HTTP/2 uses h2c prior knowledge + proxy/CA/insecure options.
+        let mut custom = OperatorSpec::from_url("lab://demo");
+        custom.set("http.version", "h2").unwrap();
+        custom
+            .set("http.proxy", "http://u:secret@127.0.0.1:8888")
+            .unwrap();
+        custom.set("http.insecure", "true").unwrap();
+        custom.set("read.concurrent", "4").unwrap();
+        let code = to_rust(&custom);
+        assert!(code.contains(".http2_prior_knowledge()"), "{code}");
+        assert!(
+            code.contains(".danger_accept_invalid_certs(true)"),
+            "{code}"
+        );
+        assert!(
+            code.contains("reqwest::Proxy::all(\"http://127.0.0.1:8888\")"),
+            "{code}"
+        );
+        assert!(!code.contains("secret"), "{code}");
+        assert!(
+            code.find("op.with_context(").unwrap() < code.find("op.reader_with(").unwrap(),
+            "{code}"
         );
     }
 }

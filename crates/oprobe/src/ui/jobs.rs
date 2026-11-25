@@ -215,7 +215,7 @@ impl Job {
         self.peek().outcome.is_some()
     }
 
-    fn start(total_s: f64, p99_objective: bool, base: Option<OperatorSpec>) -> (Self, EventSink) {
+    fn start(total_s: f64, is_prove: bool) -> (Self, EventSink) {
         let state = Arc::new(Mutex::new(State {
             total_s,
             ..Default::default()
@@ -228,7 +228,10 @@ impl Job {
                 Live::Progress(Progress::Snapshot(snap)) => {
                     s.phase = Some(snap.phase);
                     s.cleaning = false;
-                    if snap.phase == Phase::Measure {
+                    // Prove streams discrete completed A/B trials via `EventKind::Trial`;
+                    // skipping 100 ms snapshot churn avoids re-rendering the convergence plot
+                    // ten times per second while a trial is measuring.
+                    if !is_prove && snap.phase == Phase::Measure {
                         s.elapsed_s = snap.elapsed_s;
                         s.ops_per_s = snap.summary.ops_per_s;
                         s.p99_ms = snap.summary.latency.p99;
@@ -247,21 +250,8 @@ impl Job {
                 }
                 Live::Progress(Progress::Message(_)) => {}
                 Live::CleaningUp => s.cleaning = true,
-                Live::Finished { run, .. } => {
+                Live::Finished { .. } => {
                     s.done_count += 1;
-                    if let Some(base) = &base {
-                        let r = &run.report;
-                        let value = if p99_objective {
-                            r.summary.latency.p99
-                        } else {
-                            r.summary.ops_per_s
-                        };
-                        s.trials.push(Trial {
-                            candidate: r.spec.profile.operator != *base,
-                            value,
-                            ops: r.summary.ops,
-                        });
-                    }
                     s.spark.clear();
                 }
             }
@@ -304,7 +294,7 @@ impl Job {
             .first()
             .and_then(|op| {
                 if let Ok(cfg) = app.config()
-                    && let Ok((spec, _)) = crate::operator::resolve::resolve(op, cfg)
+                    && let Ok((spec, _)) = crate::operator::resolve::resolve(op, &cfg)
                 {
                     crate::config::TargetSpec::from_url(&spec.url)
                         .ok()
@@ -323,7 +313,7 @@ impl Job {
             .and_then(|d| crate::util::parse_duration(d).ok())
             .unwrap_or(Duration::from_secs(10))
             .as_secs_f64();
-        let (job, sink) = Self::start(total, false, None);
+        let (job, sink) = Self::start(total, false);
         let (state, cancel) = (job.state.clone(), job.cancel.clone());
         runtime().spawn(async move {
             let res = app
@@ -352,7 +342,31 @@ impl Job {
             .ok()
             .map(|t| t.scheme)
             .unwrap_or_else(|| "s3".into());
-        let (job, sink) = Self::start(0.0, p99, Some(base));
+        let (job, sink) = Self::start(0.0, true);
+        let st_trials = job.state.clone();
+        sink.bus()
+            .subscribe(Arc::new(move |e: &crate::events::Event| {
+                use crate::app::prove::TrialKind;
+                if let crate::events::EventKind::Trial { trial } = &e.kind {
+                    let candidate = match trial.kind {
+                        TrialKind::Baseline => false,
+                        TrialKind::Candidate => true,
+                        // Sizing sweeps are never A/B pairs.
+                        TrialKind::Sizing => return,
+                    };
+                    let value = if p99 {
+                        trial.p99_ms
+                    } else {
+                        trial.goodput_ops_per_s
+                    };
+                    let mut s = st_trials.lock().unwrap_or_else(|e| e.into_inner());
+                    s.trials.push(Trial {
+                        candidate,
+                        value,
+                        ops: trial.ops_count,
+                    });
+                }
+            }));
         let (state, cancel) = (job.state.clone(), job.cancel.clone());
         runtime().spawn(async move {
             let res = app.prove(req, sink, cancel.clone()).await.map(|o| match o {

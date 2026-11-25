@@ -26,7 +26,7 @@ The app's Profile view shows the same sections with charts ([app](app.md)).
         peers, after a short retry backoff (TailCutLayer + RetryLayer::with_min_delay)
       next: oprobe prove 20261123-135409-4b57 tail_stragglers
   1733.6 ops/s · 97.6 MiB/s · p50 9.65ms · p99 261ms · errors 0.00%
-  full profile: oprobe show 20261123-135409-4b57 --detail · terms: https://github.com/hxddh/oprobe/blob/v7.0.0/docs/concepts.md#glossary
+  full profile: oprobe show 20261123-135409-4b57 --detail · terms: https://github.com/hxddh/oprobe/blob/v9.0.0/docs/concepts.md#glossary
 ```
 
 (`oprobe demo`; your numbers differ from run to run.)
@@ -80,16 +80,15 @@ The waterfall of the slowest operation (terminal and app) lists them per request
 | Signal | What it says |
 |---|---|
 | error code, Retry-After | the provider's own error (`SlowDown`, `ServerBusy`) and how long it asked to wait |
-| h2 stream wait | HTTP/2: the request waited for a stream slot (`max_concurrent_streams`); part of queue |
-| h2 flow stall | HTTP/2: the request body waited for flow-control window; it is hidden inside TTFB |
-| h2 streams | HTTP/2 streams open on the connection when the request started |
+| tail-cut, body incomplete | a request cancelled early by `TailCutLayer` hedging, or a response body dropped before EOF |
+| h2 streams | HTTP/2 streams active on the connection during the request |
 | upload acked, send buffered | when the kernel saw the last request byte acknowledged, and when the body reached the send buffer: the end of the upload |
-| cache | a CDN's cache status (`hit`, `miss`) |
-| region | the bucket's region (`x-amz-bucket-region`) |
-| rtt, retransmits, Server-Timing | the connection's round trip and retransmitted segments, the server's own timing header |
+| cache, edge, age | CDN cache status (`hit`, `miss`), edge PoP and object age |
+| region, class, sse | the bucket's region (`x-amz-bucket-region`), storage class and server-side encryption |
+| rtt, min rtt, retransmits, Server-Timing | the connection's round trip, minimum RTT and retransmitted segments, plus the server's own timing header |
 
-The compact profile shows the error code, Retry-After, the HTTP/2 waits and the cache status;
-`--detail` shows every signal.
+The compact profile shows the error code, Retry-After, tail-cut/incomplete body status and cache
+status; `--detail` shows every signal.
 
 `--since 3s --until 8s` shows one time range of the window (a burst, the seconds a rate limit
 bit): its numbers, where the time went, the verbs, the requests by API and its slowest
@@ -145,15 +144,15 @@ Each operation's wall time is split exactly; an instant counts once even when re
 ## JSON
 
 `-o json` prints one document on stdout. `run` and `show` print the report
-(`"schema": "oprobe.report/6"`), `prove` the prove result, `show --list` the run list. Numeric
-fields carry their unit in the name (`_ms`, `_bytes`, `_ratio`, `_count`), enums are
-`snake_case`, and fields are only ever added within 6.x. Errors are
+(`"schema": "oprobe.report/7"`), `prove` the prove result (`"schema": "oprobe.prove/9"`),
+`show --list` the run list. Numeric fields carry their unit in the name (`_ms`, `_bytes`,
+`_ratio`, `_count`), enums are `snake_case`, and fields are only ever added within 9.x. Errors are
 `{"type":"error","error":{"code","message","hint","retryable","docs"}}`.
 
 ## Files
 
-A stored run lives in `<data dir>/oprobe/runs/` as one `.oprobe` file (format `oprobe.run/6`: a
+A stored run lives in `<data dir>/oprobe/runs/` as one `.oprobe` file (format `oprobe.run/7`: a
 zstd stream of the header with the operator spec and workload, columnar segments of operation and
-request rows, the per-second timeline, and the report). `oprobe-trace` writes `oprobe.trace/8`
-files (`oprobe.trace/7` and `oprobe.trace/6` still open; one JSON document: the aggregates and the sampled rows). `oprobe show FILE` and the app
-open both. 5.x run files are not read.
+request rows, the per-second timeline, and the report). `oprobe-trace` writes `oprobe.trace/9`
+files (one JSON document: the aggregates, service posture and sampled rows). `oprobe show FILE`
+and the app open both, as well as standalone `.prove.json` (`oprobe.prove/9`) files.

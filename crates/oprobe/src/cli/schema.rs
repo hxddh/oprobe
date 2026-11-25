@@ -10,7 +10,7 @@ use serde_json::Value;
 use crate::errors::ErrorBody;
 
 /// Base of every schema `$id`.
-pub const ID_BASE: &str = "https://github.com/hxddh/oprobe/schemas/6/";
+pub const ID_BASE: &str = "https://github.com/hxddh/oprobe/schemas/9/";
 
 /// The `{"type":"error","error":{…}}` document printed on failures under `-o json`.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
@@ -53,7 +53,7 @@ pub fn entries() -> Vec<Entry> {
     vec![
         Entry {
             name: "report",
-            description: "Report v6 (oprobe.report/6): the profile of one run, as `run -o json` and `show -o json` carry it",
+            description: "Report v7 (oprobe.report/7): the profile of one run, as `run -o json` and `show -o json` carry it",
             input: false,
             build: gen_for::<crate::model::Report>,
         },
@@ -92,6 +92,24 @@ pub fn entries() -> Vec<Entry> {
             description: "The result of `oprobe show --list -o json`: the stored runs",
             input: false,
             build: gen_cmd::<crate::app::RunList>,
+        },
+        Entry {
+            name: "compare",
+            description: "The result of `oprobe show A B -o json`: two or more runs compared side by side",
+            input: false,
+            build: gen_cmd::<crate::app::Comparison>,
+        },
+        Entry {
+            name: "removed",
+            description: "The result of `oprobe show --rm RUN -o json`: the deleted run ids",
+            input: false,
+            build: gen_cmd::<crate::app::RemovedRuns>,
+        },
+        Entry {
+            name: "lab",
+            description: "The startup document of `oprobe lab -o json`: endpoint, scenario and active faults",
+            input: false,
+            build: gen_cmd::<crate::app::LabOutput>,
         },
         Entry {
             name: "operator",

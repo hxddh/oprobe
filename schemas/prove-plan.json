@@ -247,7 +247,7 @@
       "type": "object"
     }
   },
-  "$id": "https://github.com/hxddh/oprobe/schemas/6/prove-plan.json",
+  "$id": "https://github.com/hxddh/oprobe/schemas/9/prove-plan.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "The result of `oprobe prove --dry-run -o json`: the estimate of the whole proof and the plan of one trial, nothing sent",
   "properties": {

@@ -185,16 +185,29 @@ fn label(key: &str) -> &'static str {
 
 fn table(ms: &[Rc<ProfileModel>]) -> View {
     let plain: Vec<ProfileModel> = ms.iter().map(|m| (**m).clone()).collect();
+    let diffs = data::compare_differences(&plain);
     let first = plain[0].operator.clone();
     let min_w = HEAD + ms.len() as f32 * (COL + 8.0);
     let mut inner = view()
         .min_w(px(min_w))
-        .child(row("").children(ms.iter().map(|m| {
+        .child(row("").children(ms.iter().enumerate().map(|(i, m)| {
+            let tok = plots::SERIES[i % plots::SERIES.len()];
             cell(
                 view()
                     .gap(px(2.0))
-                    .child(strong(m.id.clone()))
+                    .child(
+                        view()
+                            .flex_row()
+                            .items_center()
+                            .gap_1()
+                            .child(crate::ui::kit::swatch(tok))
+                            .child(strong(m.id.clone()).number_of_lines(1)),
+                    )
                     .child(small(m.operator_ref.clone()).number_of_lines(1))
+                    .child(
+                        small(format!("{} · {}", m.preset, fmt::clock_s(m.window_s)))
+                            .number_of_lines(1),
+                    )
                     .child(verdict_badge(m.verdict)),
             )
         })));
@@ -262,5 +275,17 @@ fn table(ms: &[Rc<ProfileModel>]) -> View {
         );
     crate::ui::kit::section_first("")
         .test_id("compare-table")
+        .child((!diffs.is_empty()).then(|| {
+            crate::ui::kit::panel()
+                .px_3()
+                .py_2()
+                .gap_1()
+                .test_id("compare-differences")
+                .children(diffs.into_iter().map(|d| {
+                    small(d)
+                        .text_color(move || crate::ui::kit::Tone::Warn.color())
+                        .selectable(true)
+                }))
+        }))
         .child(scroll().horizontal().min_w(px(0.0)).child(inner))
 }

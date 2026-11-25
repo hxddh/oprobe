@@ -288,8 +288,12 @@ pub fn run(monochrome: bool) -> io::Result<()> {
     let hook_prev = prev.clone();
     std::panic::set_hook(Box::new(move |info| {
         if std::thread::current().id() == ui_thread {
+            let mut out = io::stdout();
+            let _ = out.execute(event::DisableFocusChange);
+            let _ = out.execute(event::DisableBracketedPaste);
+            let _ = out.execute(event::DisableMouseCapture);
+            let _ = out.execute(terminal::LeaveAlternateScreen);
             let _ = terminal::disable_raw_mode();
-            let _ = io::stdout().execute(terminal::LeaveAlternateScreen);
             hook_prev(info);
         } else {
             let name = std::thread::current().name().unwrap_or("?").to_owned();

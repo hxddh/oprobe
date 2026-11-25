@@ -45,7 +45,9 @@ impl Selection {
     }
 
     fn in_scope(&self, r: &ReqRow) -> bool {
-        self.api.as_deref().is_none_or(|a| r.api == a)
+        self.api.as_deref().is_none_or(|a| {
+            r.api.label().eq_ignore_ascii_case(a) || r.api_name().eq_ignore_ascii_case(a)
+        })
     }
 
     fn selects(&self, r: &ReqRow) -> bool {
@@ -68,7 +70,7 @@ pub struct Factor {
     /// Share of the other requests with this value (0–1).
     pub rest_ratio: f64,
     /// `selected_ratio / rest_ratio`, smoothed (add-one) and capped.
-    #[serde(rename = "lift_ratio", alias = "lift")]
+    #[serde(rename = "lift_ratio")]
     pub lift: f64,
     /// Selected requests with this value.
     pub selected_count: u64,
@@ -249,7 +251,7 @@ impl TimeBins {
 
 fn attributes(r: &ReqRow, bins: &TimeBins, rtt: bool) -> [(&'static str, String); 12] {
     [
-        ("api", r.api.to_string()),
+        ("api", r.api.label().to_owned()),
         ("status", r.status.to_string()),
         ("protocol", format!("{:?}", r.protocol).to_lowercase()),
         (
@@ -301,45 +303,75 @@ fn attributes(r: &ReqRow, bins: &TimeBins, rtt: bool) -> [(&'static str, String)
 /// ranks `time`). Values are scored by `selected_ratio × ln(lift)` — distinctive *and* common —
 /// damped while the evidence is weak (z < 4).
 pub fn attribute(reqs: &[ReqRow], sel: &Selection) -> Attribution {
+    attribute_weighted(reqs, sel, &HashMap::new())
+}
+
+/// [`attribute`] weighted by per-operation sampling weights (`op_id -> weight`, defaulting to 1).
+pub fn attribute_weighted(
+    reqs: &[ReqRow],
+    sel: &Selection,
+    weights: &HashMap<u64, f64>,
+) -> Attribution {
     let bins = TimeBins::new(reqs);
     // An RTT inflated by the server's own delay would "explain" every slow request.
     let rtt = !rtt_tracks_server(reqs);
     let by_time = sel.from_us.is_some() || sel.to_us.is_some();
-    let mut selected: HashMap<(&'static str, String), u64> = HashMap::new();
-    let mut rest: HashMap<(&'static str, String), u64> = HashMap::new();
-    let (mut n_sel, mut n_rest) = (0u64, 0u64);
+    let mut selected: HashMap<(&'static str, String), (u64, f64)> = HashMap::new();
+    let mut rest: HashMap<(&'static str, String), f64> = HashMap::new();
+    let (mut raw_sel, mut raw_rest) = (0u64, 0u64);
+    let (mut w_sel, mut w_rest) = (0.0f64, 0.0f64);
     for r in reqs.iter().filter(|r| sel.in_scope(r)) {
-        let (map, n) = if sel.selects(r) {
-            (&mut selected, &mut n_sel)
+        let w = weights.get(&r.op_id).copied().unwrap_or(1.0);
+        if sel.selects(r) {
+            raw_sel += 1;
+            w_sel += w;
+            for (k, v) in attributes(r, &bins, rtt) {
+                if !v.is_empty() && !(k == "time" && by_time) {
+                    let e = selected.entry((k, v)).or_default();
+                    e.0 += 1;
+                    e.1 += w;
+                }
+            }
         } else {
-            (&mut rest, &mut n_rest)
-        };
-        *n += 1;
-        for (k, v) in attributes(r, &bins, rtt) {
-            // A time selection trivially "explains" itself by time.
-            if !v.is_empty() && !(k == "time" && by_time) {
-                *map.entry((k, v)).or_default() += 1;
+            raw_rest += 1;
+            w_rest += w;
+            for (k, v) in attributes(r, &bins, rtt) {
+                if !v.is_empty() && !(k == "time" && by_time) {
+                    *rest.entry((k, v)).or_default() += w;
+                }
             }
         }
     }
+    let scale = if w_sel > 0.0 {
+        raw_sel as f64 / w_sel
+    } else {
+        1.0
+    };
+    let rest_scale = if w_rest > 0.0 {
+        raw_rest as f64 / w_rest
+    } else {
+        1.0
+    };
     let mut scored: Vec<(f64, Factor)> = selected
         .into_iter()
-        .filter_map(|((attr, value), count)| {
-            let s = count as f64 / n_sel.max(1) as f64;
+        .filter_map(|((attr, value), (raw_count, w_count))| {
+            let s = w_count / w_sel.max(1.0);
             // Without a comparison set nothing can be over-represented.
-            if count < MIN_SUPPORT || s < MIN_SELECTED_RATIO || n_rest == 0 {
+            if raw_count < MIN_SUPPORT || s < MIN_SELECTED_RATIO || raw_rest == 0 {
                 return None;
             }
-            let rc = rest.get(&(attr, value.clone())).copied().unwrap_or(0);
-            let r = rc as f64 / n_rest as f64;
-            let s_smooth = (count as f64 + 1.0) / (n_sel as f64 + 2.0);
-            let r_smooth = (rc as f64 + 1.0) / (n_rest as f64 + 2.0);
+            let w_rc = rest.get(&(attr, value.clone())).copied().unwrap_or(0.0);
+            let r = w_rc / w_rest.max(1.0);
+            let eff_sel_hit = w_count * scale;
+            let eff_rest_hit = w_rc * rest_scale;
+            let s_smooth = (eff_sel_hit + 1.0) / (raw_sel as f64 + 2.0);
+            let r_smooth = (eff_rest_hit + 1.0) / (raw_rest as f64 + 2.0);
             let lift = (s_smooth / r_smooth).min(MAX_LIFT);
             let z = crate::analysis::stats::two_proportion_z(
-                count as f64,
-                n_sel as f64,
-                rc as f64,
-                n_rest as f64,
+                eff_sel_hit,
+                raw_sel as f64,
+                eff_rest_hit,
+                raw_rest as f64,
             );
             // Many-valued attributes get a stricter bar (many chances for a coincidence).
             let min_z = if matches!(attr, "conn" | "time" | "remote") {
@@ -359,7 +391,7 @@ pub fn attribute(reqs: &[ReqRow], sel: &Selection) -> Attribution {
                     selected_ratio: s,
                     rest_ratio: r,
                     lift,
-                    selected_count: count,
+                    selected_count: w_count.round() as u64,
                 },
             ))
         })
@@ -372,8 +404,8 @@ pub fn attribute(reqs: &[ReqRow], sel: &Selection) -> Attribution {
     let mut factors: Vec<Factor> = scored.into_iter().map(|(_, f)| f).collect();
     factors.truncate(12);
     Attribution {
-        selected_count: n_sel,
-        rest_count: n_rest,
+        selected_count: w_sel.round() as u64,
+        rest_count: w_rest.round() as u64,
         factors,
     }
 }
@@ -386,7 +418,8 @@ pub(crate) fn test_req(t_us: i64, total_us: u64) -> ReqRow {
         t_us,
         op_id: 1,
         attempt: 1,
-        api: Cow::Borrowed("GetObject"),
+        api: crate::trace::Api::GetObject,
+        service_op: None,
         method: Cow::Borrowed("GET"),
         status: 200,
         protocol: crate::model::WireProtocol::H1,

@@ -113,7 +113,6 @@ struct OpState {
     started: Instant,
     read: u64,
     written: u64,
-    in_process: bool,
 }
 
 /// Coalesces chunked or multi-range `oio::Read::read` calls issued on one `OpReader` (OpenDAL's
@@ -331,21 +330,8 @@ impl opendal_layer_retry::RetryInterceptor for RetryNotify {
 
 /// Hand a completed operation to the recorder.
 fn complete(rec: &Recorder, st: OpState, end: Instant, error: Option<String>) {
-    let mut data = st.scope.take();
+    let data = st.scope.take();
     let latency_us = end.saturating_duration_since(st.started).as_micros() as u64;
-    if !st.in_process
-        && error.is_none()
-        && st.verb.starts_with("read")
-        && data.requests.is_empty()
-        && data.dropped_requests == 0
-        && data.cache_lookups == 0
-    {
-        rec.set_cache_enabled(true);
-        data.cache_lookups = 1;
-        data.cache_hits = 1;
-        data.cache_hit_bytes = st.read;
-        data.cache_lookup_us = latency_us;
-    }
     let verb = match st.verb {
         "write"
             if data.requests.iter().any(|r| {
@@ -380,7 +366,6 @@ fn complete(rec: &Recorder, st: OpState, end: Instant, error: Option<String>) {
 struct Observer {
     recorder: Arc<Recorder>,
     linker: Arc<Linker>,
-    in_process: bool,
 }
 
 impl Observer {
@@ -422,7 +407,6 @@ impl Observer {
             started,
             read: 0,
             written: 0,
-            in_process: self.in_process,
         })
     }
 
@@ -508,41 +492,19 @@ fn class_of(scope: &OpScope, e: &Error) -> String {
     error_class(e, last)
 }
 
-/// Wraps `fut` so that if it parks (`Poll::Pending`) before reaching the HTTP transport (e.g.
-/// waiting on `ConcurrentLimitLayer`'s HTTP semaphore), the park time is noted on `scope`.
-struct PreFetchPoll<'a, F> {
-    scope: &'a Arc<OpScope>,
-    fut: F,
-}
-
-impl<F: std::future::Future> std::future::Future for PreFetchPoll<'_, F> {
-    type Output = F::Output;
-
-    fn poll(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Self::Output> {
-        // SAFETY: `fut` is structurally pinned; `scope` is an unpinned reference.
-        let (scope, fut) = unsafe {
-            let this = self.get_unchecked_mut();
-            (this.scope, std::pin::Pin::new_unchecked(&mut this.fut))
-        };
-        match fut.poll(cx) {
-            std::task::Poll::Pending => {
-                scope.note_pre_fetch_park(Instant::now());
-                std::task::Poll::Pending
-            }
-            ready => ready,
-        }
-    }
-}
-
 /// Run `fut` in the operation's scope (as is when there is none).
 async fn in_scope<F: std::future::Future>(st: &Option<OpState>, fut: F) -> F::Output {
     match st {
-        Some(s) if s.in_process => s.scope.run(fut).await,
-        Some(s) => s.scope.run(PreFetchPoll { scope: &s.scope, fut }).await,
+        Some(s) => s.scope.run(fut).await,
         None => fut.await,
+    }
+}
+
+/// Synchronous counterpart of [`in_scope`] (constructor calls and `Drop` cleanup).
+fn in_sync_scope<R>(st: &Option<OpState>, f: impl FnOnce() -> R) -> R {
+    match st {
+        Some(s) => s.scope.sync_run(f),
+        None => f(),
     }
 }
 
@@ -596,20 +558,17 @@ impl std::fmt::Debug for OperationObserveLayer {
 impl OperationObserveLayer {
     pub fn new(recorder: Arc<Recorder>, linker: Arc<Linker>) -> Self {
         Self {
-            obs: Observer {
-                recorder,
-                linker,
-                in_process: false,
-            },
+            obs: Observer { recorder, linker },
         }
     }
 }
 
 impl Layer for OperationObserveLayer {
     fn apply_service(&self, inner: Servicer) -> Servicer {
-        let mut obs = self.obs.clone();
-        obs.in_process = matches!(inner.info().scheme(), "memory" | "fs");
-        Arc::new(OpService { inner, obs })
+        Arc::new(OpService {
+            inner,
+            obs: self.obs.clone(),
+        })
     }
 }
 
@@ -631,6 +590,9 @@ impl OpService {
         path: &str,
         fut: impl std::future::Future<Output = Result<T>>,
     ) -> Result<T> {
+        if OpScope::current().is_some() {
+            return fut.await;
+        }
         let g = OpGuard::new(&self.obs, verb, path);
         let r = in_scope(&g.st, fut).await;
         g.finish(r.as_ref().err());
@@ -674,13 +636,17 @@ impl Service for OpService {
     }
 
     fn write(&self, ctx: &OperationContext, path: &str, args: OpWrite) -> Result<Self::Writer> {
-        let st = self.obs.start("write", path);
-        let inner = match self.inner.write(ctx, path, args) {
+        let st = if OpScope::current().is_some() {
+            None
+        } else {
+            self.obs.start("write", path)
+        };
+        let inner = match in_sync_scope(&st, || self.inner.write(ctx, path, args)) {
             Ok(i) => i,
             Err(e) => return Err(self.obs.failed_start(st, e)),
         };
         Ok(OpWriter {
-            inner,
+            inner: Some(inner),
             obs: self.obs.clone(),
             st,
             error: None,
@@ -695,13 +661,17 @@ impl Service for OpService {
         to: &str,
         args: OpCopy,
     ) -> Result<Self::Copier> {
-        let st = self.obs.start("copy", to);
-        let inner = match self.inner.copy(ctx, from, to, args) {
+        let st = if OpScope::current().is_some() {
+            None
+        } else {
+            self.obs.start("copy", to)
+        };
+        let inner = match in_sync_scope(&st, || self.inner.copy(ctx, from, to, args)) {
             Ok(i) => i,
             Err(e) => return Err(self.obs.failed_start(st, e)),
         };
         Ok(OpCopier {
-            inner,
+            inner: Some(inner),
             obs: self.obs.clone(),
             st,
             error: None,
@@ -740,7 +710,7 @@ impl Service for OpService {
 
     fn delete(&self, ctx: &OperationContext) -> Result<Self::Deleter> {
         Ok(OpDeleter {
-            inner: self.inner.delete(ctx)?,
+            inner: Some(self.inner.delete(ctx)?),
             obs: self.obs.clone(),
             st: None,
             started: false,
@@ -749,13 +719,17 @@ impl Service for OpService {
     }
 
     fn list(&self, ctx: &OperationContext, path: &str, args: OpList) -> Result<Self::Lister> {
-        let st = self.obs.start("list", path);
-        let inner = match self.inner.list(ctx, path, args) {
+        let st = if OpScope::current().is_some() {
+            None
+        } else {
+            self.obs.start("list", path)
+        };
+        let inner = match in_sync_scope(&st, || self.inner.list(ctx, path, args)) {
             Ok(i) => i,
             Err(e) => return Err(self.obs.failed_start(st, e)),
         };
         Ok(OpLister {
-            inner,
+            inner: Some(inner),
             obs: self.obs.clone(),
             st,
             error: None,
@@ -797,6 +771,9 @@ fn read_verb(range: &BytesRange) -> &'static str {
 
 impl oio::Read for OpReader {
     async fn open(&self, range: BytesRange) -> Result<(RpRead, Box<dyn oio::ReadStreamDyn>)> {
+        if OpScope::current().is_some() {
+            return self.inner.open(range).await;
+        }
         let mut g = OpGuard::new(&self.obs, read_verb(&range), &self.path);
         match in_scope(&g.st, self.inner.open(range)).await {
             Ok((rp, stream)) => {
@@ -804,7 +781,7 @@ impl oio::Read for OpReader {
                 Ok((
                     rp,
                     Box::new(OpStream {
-                        inner: stream,
+                        inner: Some(stream),
                         obs: self.obs.clone(),
                         st,
                     }) as Box<dyn oio::ReadStreamDyn>,
@@ -839,7 +816,7 @@ impl oio::Read for OpReader {
             r.push(Arc::downgrade(&s));
             s
         });
-        let (flushed, scope, in_process) = {
+        let (flushed, scope) = {
             let mut g = slot.group.lock().unwrap_or_else(|e| e.into_inner());
             let mut flushed = None;
             let reuse = g.as_ref().is_some_and(|x| {
@@ -856,10 +833,9 @@ impl oio::Read for OpReader {
                 if verb == "read.range" || x.calls > 1 {
                     x.st.verb = "read.range";
                 }
-                (flushed, Some(x.st.scope.clone()), x.st.in_process)
+                (flushed, Some(x.st.scope.clone()))
             } else if let Some(st) = self.obs.start(verb, &self.path) {
                 let sc = st.scope.clone();
-                let ip = st.in_process;
                 *g = Some(ReadGroup {
                     st,
                     active: 1,
@@ -867,9 +843,9 @@ impl oio::Read for OpReader {
                     last_end: None,
                     error: None,
                 });
-                (flushed, Some(sc), ip)
+                (flushed, Some(sc))
             } else {
-                (flushed, None, self.obs.in_process)
+                (flushed, None)
             }
         };
         if let Some(prev) = flushed {
@@ -878,8 +854,7 @@ impl oio::Read for OpReader {
                 .finish_at(prev.st, end, prev.error.as_ref(), prev.calls == 1);
         }
         let r = match &scope {
-            Some(s) if in_process => s.run(self.inner.read(range)).await,
-            Some(s) => s.run(PreFetchPoll { scope: s, fut: self.inner.read(range) }).await,
+            Some(s) => s.run(self.inner.read(range)).await,
             None => self.inner.read(range).await,
         };
         let end = Instant::now();
@@ -922,17 +897,21 @@ impl Drop for OpReader {
 /// The body of an opened read: the operation ends with the stream (its end, an error, or the
 /// stream dropped part-way).
 pub struct OpStream {
-    inner: Box<dyn oio::ReadStreamDyn>,
+    inner: Option<Box<dyn oio::ReadStreamDyn>>,
     obs: Observer,
     st: Option<OpState>,
 }
 
 impl oio::ReadStream for OpStream {
     async fn read(&mut self) -> Result<Buffer> {
+        let Some(inner) = self.inner.as_mut() else {
+            return Ok(Buffer::new());
+        };
         // Keep the operation scope active while reading so mid-stream retries link here.
-        let r = in_scope(&self.st, self.inner.read_dyn()).await;
+        let r = in_scope(&self.st, inner.read_dyn()).await;
         match &r {
             Ok(b) if b.is_empty() => {
+                drop(self.inner.take());
                 if let Some(st) = self.st.take() {
                     self.obs.finish(st, None);
                 }
@@ -943,6 +922,7 @@ impl oio::ReadStream for OpStream {
                 }
             }
             Err(e) => {
+                drop(self.inner.take());
                 if let Some(st) = self.st.take() {
                     self.obs.finish(st, Some(e));
                 }
@@ -954,7 +934,11 @@ impl oio::ReadStream for OpStream {
 
 impl Drop for OpStream {
     fn drop(&mut self) {
-        // Dropped before its end: the application stopped reading; what it read counts.
+        // Drop the inner body stream inside `OpScope` BEFORE closing it so `TimedResponseBody::drop`
+        // records its `aborted` `RequestRecord` onto this operation instead of orphaning it.
+        if let Some(inner) = self.inner.take() {
+            in_sync_scope(&self.st, || drop(inner));
+        }
         if let Some(st) = self.st.take() {
             complete(&self.obs.recorder, st, Instant::now(), None);
         }
@@ -962,7 +946,7 @@ impl Drop for OpStream {
 }
 
 pub struct OpWriter {
-    inner: oio::Writer,
+    inner: Option<oio::Writer>,
     obs: Observer,
     st: Option<OpState>,
     error: Option<String>,
@@ -985,7 +969,8 @@ impl OpWriter {
 impl oio::Write for OpWriter {
     async fn write(&mut self, bs: Buffer) -> Result<()> {
         let n = bs.len() as u64;
-        let r = in_scope(&self.st, self.inner.write(bs)).await;
+        let inner = self.inner.as_mut().expect("writer open");
+        let r = in_scope(&self.st, inner.write(bs)).await;
         if let (Ok(()), Some(st)) = (&r, self.st.as_mut()) {
             st.written += n;
         }
@@ -995,7 +980,8 @@ impl oio::Write for OpWriter {
 
     async fn copy_from(&mut self, path: &str, args: OpRead, range: BytesRange) -> Result<()> {
         let n = range.size().unwrap_or(0);
-        let r = in_scope(&self.st, self.inner.copy_from(path, args, range)).await;
+        let inner = self.inner.as_mut().expect("writer open");
+        let r = in_scope(&self.st, inner.copy_from(path, args, range)).await;
         if let (Ok(()), Some(st)) = (&r, self.st.as_mut()) {
             st.written += n;
         }
@@ -1004,18 +990,22 @@ impl oio::Write for OpWriter {
     }
 
     async fn close(&mut self) -> Result<Metadata> {
-        let r = in_scope(&self.st, self.inner.close()).await;
+        let inner = self.inner.as_mut().expect("writer open");
+        let r = in_scope(&self.st, inner.close()).await;
         self.note(&r);
         if r.is_ok() {
             self.closed = true;
+            drop(self.inner.take());
             end_multi(&self.obs, &mut self.st, None);
         }
         r
     }
 
     async fn abort(&mut self) -> Result<()> {
-        let r = in_scope(&self.st, self.inner.abort()).await;
+        let inner = self.inner.as_mut().expect("writer open");
+        let r = in_scope(&self.st, inner.abort()).await;
         self.closed = true;
+        drop(self.inner.take());
         let error = self.error.take().or_else(|| Some("aborted".into()));
         end_multi(&self.obs, &mut self.st, error);
         r
@@ -1024,13 +1014,16 @@ impl oio::Write for OpWriter {
 
 impl Drop for OpWriter {
     fn drop(&mut self) {
+        if let Some(inner) = self.inner.take() {
+            in_sync_scope(&self.st, || drop(inner));
+        }
         let error = self.error.take().or_else(|| Some("cancelled".into()));
         end_multi(&self.obs, &mut self.st, error.filter(|_| !self.closed));
     }
 }
 
 pub struct OpLister {
-    inner: oio::Lister,
+    inner: Option<oio::Lister>,
     obs: Observer,
     st: Option<OpState>,
     error: Option<String>,
@@ -1038,11 +1031,15 @@ pub struct OpLister {
 
 impl oio::List for OpLister {
     async fn next(&mut self) -> Result<Option<oio::Entry>> {
-        let r = in_scope(&self.st, self.inner.next()).await;
+        let Some(inner) = self.inner.as_mut() else {
+            return Ok(None);
+        };
+        let r = in_scope(&self.st, inner.next()).await;
         match (&r, &self.st) {
             (Ok(Some(_)), _) => self.error = None,
             (Ok(None), _) => {
                 self.error = None;
+                drop(self.inner.take());
                 end_multi(&self.obs, &mut self.st, None);
             }
             (Err(e), Some(st)) => {
@@ -1058,6 +1055,9 @@ impl oio::List for OpLister {
 impl Drop for OpLister {
     fn drop(&mut self) {
         // Dropped part-way: the application stopped listing (not a failure).
+        if let Some(inner) = self.inner.take() {
+            in_sync_scope(&self.st, || drop(inner));
+        }
         let error = self.error.take();
         end_multi(&self.obs, &mut self.st, error);
     }
@@ -1065,7 +1065,7 @@ impl Drop for OpLister {
 
 /// A batch delete: one operation from the first path queued until the deleter is closed.
 pub struct OpDeleter {
-    inner: oio::Deleter,
+    inner: Option<oio::Deleter>,
     obs: Observer,
     st: Option<OpState>,
     started: bool,
@@ -1089,17 +1089,22 @@ impl oio::Delete for OpDeleter {
     async fn delete(&mut self, path: &str, args: OpDelete) -> Result<()> {
         if !self.started {
             self.started = true;
-            self.st = self.obs.start("delete", path);
+            if OpScope::current().is_none() {
+                self.st = self.obs.start("delete", path);
+            }
         }
-        let r = in_scope(&self.st, self.inner.delete(path, args)).await;
+        let inner = self.inner.as_mut().expect("deleter open");
+        let r = in_scope(&self.st, inner.delete(path, args)).await;
         self.note(&r);
         r
     }
 
     async fn close(&mut self) -> Result<()> {
-        let r = in_scope(&self.st, self.inner.close()).await;
+        let inner = self.inner.as_mut().expect("deleter open");
+        let r = in_scope(&self.st, inner.close()).await;
         self.note(&r);
         if r.is_ok() {
+            drop(self.inner.take());
             end_multi(&self.obs, &mut self.st, None);
         }
         r
@@ -1108,13 +1113,16 @@ impl oio::Delete for OpDeleter {
 
 impl Drop for OpDeleter {
     fn drop(&mut self) {
+        if let Some(inner) = self.inner.take() {
+            in_sync_scope(&self.st, || drop(inner));
+        }
         let error = self.error.take();
         end_multi(&self.obs, &mut self.st, error);
     }
 }
 
 pub struct OpCopier {
-    inner: oio::Copier,
+    inner: Option<oio::Copier>,
     obs: Observer,
     st: Option<OpState>,
     error: Option<String>,
@@ -1135,7 +1143,8 @@ impl OpCopier {
 
 impl oio::Copy for OpCopier {
     async fn next(&mut self) -> Result<Option<usize>> {
-        let r = in_scope(&self.st, self.inner.next()).await;
+        let inner = self.inner.as_mut().expect("copier open");
+        let r = in_scope(&self.st, inner.next()).await;
         if let (Ok(Some(n)), Some(st)) = (&r, self.st.as_mut()) {
             st.written += *n as u64;
         }
@@ -1144,16 +1153,20 @@ impl oio::Copy for OpCopier {
     }
 
     async fn close(&mut self) -> Result<Metadata> {
-        let r = in_scope(&self.st, self.inner.close()).await;
+        let inner = self.inner.as_mut().expect("copier open");
+        let r = in_scope(&self.st, inner.close()).await;
         self.note(&r);
         if r.is_ok() {
+            drop(self.inner.take());
             end_multi(&self.obs, &mut self.st, None);
         }
         r
     }
 
     async fn abort(&mut self) -> Result<()> {
-        let r = in_scope(&self.st, self.inner.abort()).await;
+        let inner = self.inner.as_mut().expect("copier open");
+        let r = in_scope(&self.st, inner.abort()).await;
+        drop(self.inner.take());
         let error = self.error.take().or_else(|| Some("aborted".into()));
         end_multi(&self.obs, &mut self.st, error);
         r
@@ -1162,6 +1175,9 @@ impl oio::Copy for OpCopier {
 
 impl Drop for OpCopier {
     fn drop(&mut self) {
+        if let Some(inner) = self.inner.take() {
+            in_sync_scope(&self.st, || drop(inner));
+        }
         let error = self.error.take();
         end_multi(&self.obs, &mut self.st, error);
     }
@@ -1194,7 +1210,6 @@ mod tests {
         let obs = Observer {
             recorder: rec.clone(),
             linker,
-            in_process: true,
         };
         (rec, obs, notify)
     }

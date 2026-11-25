@@ -17,7 +17,7 @@ layers share one global meter).
 
 ```toml
 [dependencies]
-oprobe-trace = "8"
+oprobe-trace = "9"
 ```
 
 ```rust
@@ -83,10 +83,11 @@ let cfg = oprobe_trace::Config::default().exporter(std::sync::Arc::new(Slow));
 ```
 
 - **OpenTelemetry** (feature `otel`, `opentelemetry` 0.32): `oprobe_trace::otel::config(&meter)`
-  records `http.client.request.duration` (seconds) once per stage, with the attributes
-  `oprobe.stage` (`total`, `queue`, `connect`, `send`, `ttfb`, `body`, `stall`), `oprobe.api`,
-  `http.request.method` and `http.response.status_code`, and OpenDAL's own metric labels
-  (`scheme`, `namespace`, `root`, `operation`), so its series join `opendal-layer-otelmetrics`'.
+  records `http.client.request.duration` (seconds) once per stage (with `oprobe.stage`,
+  `oprobe.api`, `http.request.method`, `http.response.status_code`), `oprobe.operation.duration`
+  per OpenDAL operation, and `oprobe.cache.lookups` per cache lookup, carrying OpenDAL's own
+  metric labels (`scheme`, `namespace`, `root`, `operation`) so its series join
+  `opendal-layer-otelmetrics`'.
 
 ## Configuration
 
@@ -163,24 +164,26 @@ is lost in the noise.
 
 ## Stability
 
-Within 8.x the API documented on docs.rs, the `oprobe.trace/8` file format and the meaning of
+Within 9.x the API documented on docs.rs, the `oprobe.trace/9` file format and the meaning of
 every field are stable: changes are additive. Public structs and enums are `#[non_exhaustive]`,
 so read fields freely but build `Config` with its methods. The `__internal` feature exists for the
 oprobe binary and has no semver promise; do not enable it.
 
 ## The file
 
-`oprobe.trace/8` is one JSON document, readable without oprobe:
+`oprobe.trace/9` is one JSON document, readable without oprobe:
 
 ```text
-{ "format": "oprobe.trace/8", "oprobe_trace_version": "8.0.0", "created_at": "…",
-  "service": { "scheme": "s3", "name": "my-bucket", "root": "/data/" },
+{ "format": "oprobe.trace/9", "oprobe_trace_version": "9.0.0", "created_at": "…",
+  "service": { "scheme": "s3", "name": "my-bucket", "root": "/data/", "http_version": "auto", "keep_alive": true },
   "snapshot": { … }, "rows": { "ops": [ … ], "reqs": [ … ], "info": { … }, "sampling": { … } } }
 ```
 
 `service` is the OpenDAL service the layer was applied to: its scheme, name (the bucket or
-container) and root, with no options. A bare `snapshot.save` has neither `service` nor `rows`.
-`rows.ops` are the operations; each request row names its operation (`op_id`), the length of the
+container), root and client posture (`http_version`, `keep_alive`, `max_inflight_count`), with no
+credentials or options. A bare `snapshot.save` has neither `service` nor `rows`.
+`rows.ops` are the operations (each carrying its exact sampling `weight` when thinned); each
+request row names its operation (`op_id`), its strongly typed storage `api`, the length of the
 byte range it asked for (`detail.range_bytes`) and, when it failed, its class
 (`storage.condition_not_match`, `storage.already_exists`, `storage.conflict`,
 `storage.range_not_satisfied`, `storage.throttled`, …) and whether the failure is temporary
@@ -191,8 +194,3 @@ byte range it asked for (`detail.range_bytes`) and, when it failed, its class
 hot keys still slice the traffic, and repeated reads are still told apart, but the file never
 holds a key. Request IDs and remote addresses can be in it; credentials never are. Treat a
 profile like a log file before you paste it into an issue.
-
-**Migrating from 7.x and 6.x.** `oprobe.trace/7` and `oprobe.trace/6` files still open (`oprobe.trace/7`
-with full operation fidelity; `oprobe.trace/6` holds requests only, so each
-request counts as one operation there, and the report says so). `TraceLayer` wraps every service now, not
-only `memory` and `fs`.

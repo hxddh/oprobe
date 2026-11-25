@@ -23,7 +23,7 @@ pub use spec::{Overrides, RunSpec};
 pub use trace::{OpBreakdownUs, OpRow, ReqDetail, ReqRow, TcpRow, TlsRow, TraceInfo, WireProtocol};
 
 /// Format id of a run file (design §4).
-pub const RUN_FORMAT: &str = "oprobe.run/6";
+pub const RUN_FORMAT: &str = "oprobe.run/7";
 
 /// One complete run: its report and trace rows (what a `.oprobe` file holds).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -64,7 +64,12 @@ impl Run {
         use std::collections::HashMap;
         let s = &self.report.sampling;
         let mut out: HashMap<u64, f64> = HashMap::new();
-        if s.seen_ops_count == 0 || s.kept_ops_count >= s.seen_ops_count {
+        for o in &self.ops {
+            if (o.weight - 1.0).abs() > f64::EPSILON {
+                out.insert(o.op_id, o.weight);
+            }
+        }
+        if !out.is_empty() || s.seen_ops_count == 0 || s.kept_ops_count >= s.seen_ops_count {
             return out;
         }
         let measured: Vec<&OpRow> = self.ops.iter().filter(|o| o.t_us >= 0).collect();

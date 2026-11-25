@@ -4416,7 +4416,7 @@ dependencies = [
 
 [[package]]
 name = "oprobe"
-version = "8.0.0"
+version = "9.0.0"
 dependencies = [
  "anyhow",
  "await-tree",
@@ -4461,7 +4461,7 @@ dependencies = [
 
 [[package]]
 name = "oprobe-core"
-version = "8.0.0"
+version = "9.0.0"
 dependencies = [
  "anyhow",
  "await-tree",
@@ -4494,6 +4494,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "toml 0.8.23",
+ "toml_edit 0.22.27",
  "url",
  "windows-sys 0.61.2",
  "zstd 0.14.4",
@@ -4501,7 +4502,7 @@ dependencies = [
 
 [[package]]
 name = "oprobe-trace"
-version = "8.0.0"
+version = "9.0.0"
 dependencies = [
  "anyhow",
  "await-tree",

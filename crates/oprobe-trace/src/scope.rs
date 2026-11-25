@@ -14,6 +14,24 @@ use crate::record::RequestRecord;
 
 tokio::task_local! {
     static CURRENT: Arc<OpScope>;
+    static CACHE_PROBE: Arc<AtomicU64>;
+}
+
+/// Run `fut` with an isolated per-lookup backend request counter (`0` if answered from cache).
+pub async fn with_cache_probe<F: Future>(probe: Arc<AtomicU64>, fut: F) -> F::Output {
+    CACHE_PROBE.scope(probe, fut).await
+}
+
+/// Synchronous counterpart of [`with_cache_probe`] (for `Drop` paths that tear down streams).
+pub fn with_cache_probe_sync<R>(probe: Arc<AtomicU64>, f: impl FnOnce() -> R) -> R {
+    CACHE_PROBE.sync_scope(probe, f)
+}
+
+/// Note that one backend request ran in the current task (increments any active cache probe).
+pub fn note_backend_request() {
+    let _ = CACHE_PROBE.try_with(|p| {
+        p.fetch_add(1, Ordering::AcqRel);
+    });
 }
 
 static NEXT_OP_ID: AtomicU64 = AtomicU64::new(1);
@@ -40,9 +58,6 @@ pub struct OpScopeData {
     pub throttled: bool,
     /// Set by [`OpScope::take`]: the operation is complete and its data handed over.
     pub closed: bool,
-    /// When the operation's inner future first parked (`Poll::Pending`) before reaching the
-    /// HTTP transport (e.g. waiting on `ConcurrentLimitLayer`'s HTTP semaphore).
-    pub pre_fetch_park: Option<Instant>,
 }
 
 /// Collects everything that happened underneath one logical operation.
@@ -90,6 +105,11 @@ impl OpScope {
         CURRENT.scope(self.clone(), fut).await
     }
 
+    /// Run `f` synchronously with this scope installed as the current task-local scope.
+    pub fn sync_run<R>(self: &Arc<Self>, f: impl FnOnce() -> R) -> R {
+        CURRENT.sync_scope(self.clone(), f)
+    }
+
     pub fn set_tree_registry(&self, reg: await_tree::Registry) {
         *self.tree.lock().unwrap_or_else(|e| e.into_inner()) = Some(reg);
     }
@@ -104,11 +124,11 @@ impl OpScope {
     }
 
     pub fn push_request(&self, rec: RequestRecord) {
+        note_backend_request();
         let late = self.with(|d| {
             if d.closed {
                 return Some(rec);
             }
-            d.pre_fetch_park = None;
             if rec.is_throttle() {
                 d.throttled = true;
             }
@@ -148,22 +168,6 @@ impl OpScope {
         });
     }
 
-    /// Note that an inner call yielded (`Poll::Pending`) before entering the HTTP transport,
-    /// when no request of this call has entered the transport yet.
-    pub fn note_pre_fetch_park(&self, at: Instant) {
-        self.with(|d| {
-            if !d.closed && d.requests.is_empty() && d.pre_fetch_park.is_none() {
-                d.pre_fetch_park = Some(at);
-            }
-        });
-    }
-
-    /// Take the timestamp at which this operation parked on an outer gate before entering the
-    /// HTTP transport.
-    pub fn take_pre_fetch_park(&self) -> Option<Instant> {
-        self.with(|d| d.pre_fetch_park.take())
-    }
-
     /// The retry layer is about to sleep `backoff` before the next attempt: account the
     /// attempt and the wait interval (attributed to *retry* in the time breakdown).
     pub fn record_retry(&self, backoff: std::time::Duration, throttled: bool) {
@@ -184,7 +188,6 @@ impl OpScope {
             if d.closed {
                 return;
             }
-            d.pre_fetch_park = None;
             d.retries += 1;
             d.retry_backoff_us += us;
             if d.retry_waits.len() < MAX_RETRY_WAITS_PER_OP {
@@ -194,10 +197,12 @@ impl OpScope {
                 d.throttled = true;
             }
             if tail_cut
-                && let Some(last) = d.requests.last_mut()
-                && (last.status == 0 || last.error.is_some())
+                && let Some(target) = d.requests.iter_mut().rev().find(|r| {
+                    (r.status == 0 || r.error.is_some())
+                        && !r.detail.as_deref().is_some_and(|det| det.cut)
+                })
             {
-                let det = last.detail.get_or_insert_with(Default::default);
+                let det = target.detail.get_or_insert_with(Default::default);
                 det.cut = true;
                 det.aborted = true;
                 det.temporary = Some(true);
@@ -234,6 +239,13 @@ impl ScopePropagatingExecutor {
 
 impl Execute for ScopePropagatingExecutor {
     fn execute(&self, f: BoxedStaticFuture<()>) {
+        let probe = CACHE_PROBE.try_with(|p| p.clone()).ok();
+        let wrap_probe = |fut: BoxedStaticFuture<()>| -> BoxedStaticFuture<()> {
+            match probe {
+                Some(p) => Box::pin(async move { CACHE_PROBE.scope(p, fut).await }),
+                None => fut,
+            }
+        };
         match OpScope::current() {
             Some(scope) => {
                 let reg = scope.tree.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -242,16 +254,19 @@ impl Execute for ScopePropagatingExecutor {
                         let n = scope.subtasks.fetch_add(1, Ordering::Relaxed);
                         let root =
                             reg.register(SubTaskKey(scope.id, n), "opendal::background_task");
+                        let fut = wrap_probe(f);
                         self.inner.execute(Box::pin(async move {
-                            root.instrument(CURRENT.scope(scope, f)).await
+                            root.instrument(CURRENT.scope(scope, fut)).await
                         }))
                     }
-                    None => self
-                        .inner
-                        .execute(Box::pin(async move { CURRENT.scope(scope, f).await })),
+                    None => {
+                        let fut = wrap_probe(f);
+                        self.inner
+                            .execute(Box::pin(async move { CURRENT.scope(scope, fut).await }))
+                    }
                 }
             }
-            None => self.inner.execute(f),
+            None => self.inner.execute(wrap_probe(f)),
         }
     }
 

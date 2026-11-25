@@ -100,14 +100,30 @@ enum Sock {
     Found(Arc<TcpProbe>),
 }
 
-#[derive(Default)]
 struct ConnEntry {
     id: u64,
     dial: Option<Dialed>,
     dial_end: Option<Instant>,
     sock: Sock,
     active_streams: Arc<AtomicU32>,
+    recent_ends: [Option<Instant>; 64],
+    recent_idx: usize,
     last_seq: u64,
+}
+
+impl Default for ConnEntry {
+    fn default() -> Self {
+        Self {
+            id: 0,
+            dial: None,
+            dial_end: None,
+            sock: Sock::Unknown,
+            active_streams: Arc::new(AtomicU32::new(0)),
+            recent_ends: [None; 64],
+            recent_idx: 0,
+            last_seq: 0,
+        }
+    }
 }
 
 /// Decrements a connection's active stream counter when the request finishes.
@@ -136,12 +152,24 @@ struct Conns {
 struct Shared {
     recorder: Option<Arc<Recorder>>,
     conns: Mutex<Conns>,
+    /// Concurrent uploads currently sending body frames (`> 1` disables shared socket send-queue attribution).
+    active_uploads: AtomicU32,
     /// Configured egress proxy (display form) and its addresses: a dial whose peer is one of
     /// them went through the proxy (reqwest applies NO_PROXY itself).
     proxy: Option<String>,
     proxy_addrs: Vec<SocketAddr>,
     /// Query `TCP_INFO` at request end.
     tcp_info: bool,
+}
+
+struct UploadGuard(Option<Arc<Shared>>);
+
+impl Drop for UploadGuard {
+    fn drop(&mut self) {
+        if let Some(s) = &self.0 {
+            s.active_uploads.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
 }
 
 impl Shared {
@@ -194,21 +222,33 @@ impl Shared {
         Some(id)
     }
 
-    /// Unambiguous kernel probe when the pool holds a single idle connection (avoids attributing
-    /// other connections' in-flight segments under multi-worker concurrency).
-    fn single_probe(&self) -> Option<Arc<TcpProbe>> {
+    /// Unambiguous kernel probe for an active upload: either the sole connection in the pool, or
+    /// the unique connection currently carrying unsent kernel send-queue bytes (`notsent_bytes > 0`)
+    /// when idle connections also exist in the pool.
+    fn uploading_probe(&self, active_uploads: u32) -> Option<Arc<TcpProbe>> {
+        if active_uploads > 1 {
+            return None;
+        }
         let c = self.conns.lock().ok()?;
-        if c.by_addr.len() != 1 {
-            return None;
+        let mut with_unsent: Option<Arc<TcpProbe>> = None;
+        let mut only_found: Option<Arc<TcpProbe>> = None;
+        let mut found_count = 0usize;
+        for e in c.by_addr.values() {
+            if let Sock::Found(p) = &e.sock {
+                found_count += 1;
+                only_found = Some(p.clone());
+                if p.peek().is_some_and(|r| r.notsent_bytes > 0) {
+                    if with_unsent.is_some() {
+                        return None;
+                    }
+                    with_unsent = Some(p.clone());
+                }
+            }
         }
-        let e = c.by_addr.values().next()?;
-        if e.active_streams.load(Ordering::Acquire) > 0 {
-            return None;
+        if with_unsent.is_some() {
+            return with_unsent;
         }
-        match &e.sock {
-            Sock::Found(p) => Some(p.clone()),
-            _ => None,
-        }
+        (found_count == 1).then_some(only_found).flatten()
     }
 }
 
@@ -491,6 +531,7 @@ where
                                     sock,
                                     active_streams: Arc::new(AtomicU32::new(0)),
                                     last_seq: id,
+                                    ..Default::default()
                                 },
                             );
                         }
@@ -552,6 +593,7 @@ impl FidelityTransport {
         let shared = Arc::new(Shared {
             recorder,
             conns: Mutex::new(Conns::default()),
+            active_uploads: AtomicU32::new(0),
             proxy: proxy.map(|p| p.display()),
             proxy_addrs,
             tcp_info,
@@ -673,7 +715,7 @@ impl http_body::Body for TimedBody {
             let us = (this.start.elapsed().as_micros() as u64).max(1);
             this.end_us.store(us, Ordering::Release);
             if let Some(n) = &this.notify {
-                n.notify_waiters();
+                n.notify_one();
             }
         }
         Poll::Ready(Some(Ok(http_body::Frame::data(frame))))
@@ -699,6 +741,7 @@ pub(super) struct CancelGuard {
     bytes_up: u64,
     start_offset_us: u64,
     t_start: Instant,
+    t_ready: Option<Instant>,
     scope: Option<Arc<OpScope>>,
     recorder: Option<Arc<Recorder>>,
 }
@@ -723,9 +766,14 @@ impl CancelGuard {
             bytes_up,
             start_offset_us,
             t_start,
+            t_ready: None,
             scope,
             recorder,
         }
+    }
+
+    pub(super) fn set_ready(&mut self, t_ready: Instant) {
+        self.t_ready = Some(t_ready);
     }
 
     /// The request reached a point where it records itself.
@@ -739,6 +787,15 @@ impl Drop for CancelGuard {
         if !self.armed {
             return;
         }
+        let now = Instant::now();
+        let total_us = now.saturating_duration_since(self.t_start).as_micros() as u64;
+        let (queue_us, ttfb_us) = match self.t_ready {
+            Some(ready) => {
+                let q = ready.saturating_duration_since(self.t_start).as_micros() as u64;
+                (q, total_us.saturating_sub(q))
+            }
+            None => (total_us, 0),
+        };
         let record = RequestRecord {
             operation: None,
             api: self.api,
@@ -749,7 +806,9 @@ impl Drop for CancelGuard {
             conn_id: 0,
             start_offset_us: self.start_offset_us,
             timing: RequestTiming {
-                total_us: self.t_start.elapsed().as_micros() as u64,
+                queue_us,
+                ttfb_us,
+                total_us,
                 ..Default::default()
             },
             bytes_up: self.bytes_up,
@@ -820,6 +879,12 @@ impl Finisher {
         self.record.detail = super::signals::finish(self.record.detail.take(), self.sniff.as_ref());
         // After the clock stopped: the query is not part of the request's time.
         if let Some(addr) = self.conn {
+            if let Ok(mut c) = self.shared.conns.lock()
+                && let Some(e) = c.by_addr.get_mut(&addr)
+            {
+                e.recent_ends[e.recent_idx] = Some(now);
+                e.recent_idx = (e.recent_idx + 1) % e.recent_ends.len();
+            }
             let sock = std::mem::take(&mut self.sock);
             if let Some((row, retrans)) = self.shared.tcp_info(addr, sock) {
                 self.record.tcp = Some(Box::new(row));
@@ -900,13 +965,22 @@ impl<S> Drop for TimedResponseBody<S> {
     fn drop(&mut self) {
         if let Some(mut f) = self.fin.take() {
             let got = f.record.bytes_down;
-            let short = self.expected.filter(|&n| got < n);
-            if short.is_some() {
+            let abort_msg = match self.expected {
+                Some(n) if got < n => Some(format!("response body dropped after {got} of {n} bytes")),
+                None if f.record.status < 400
+                    && f.record.method != "HEAD"
+                    && !matches!(f.record.status, 100..=199 | 204 | 304) =>
+                {
+                    Some(format!("response body dropped before EOF after {got} bytes"))
+                }
+                _ => None,
+            };
+            if abort_msg.is_some() {
                 let d = f.record.detail.get_or_insert_with(Default::default);
                 d.aborted = true;
                 d.temporary = Some(true);
             }
-            f.finish(short.map(|n| format!("response body dropped after {got} of {n} bytes")));
+            f.finish(abort_msg);
         }
     }
 }
@@ -915,12 +989,12 @@ impl HttpTransport for FidelityTransport {
     async fn fetch(&self, req: Request<Buffer>) -> Result<Response<HttpBody>> {
         let now = Instant::now();
         let scope = OpScope::current();
-        // Include any time spent parked on an outer concurrency gate (e.g. OpenDAL's
+        // Include any time spent parked on an outer concurrency gate (`QueueStampLayer` around
         // `ConcurrentLimitLayer::with_http_concurrent_limit`) before reaching the transport.
-        let t_start = scope
-            .as_ref()
-            .and_then(|s| s.take_pre_fetch_park())
-            .map_or(now, |p| p.min(now));
+        let t_start = req
+            .extensions()
+            .get::<crate::layer::EnqueuedAt>()
+            .map_or(now, |e| e.0.min(now));
         let recorder = self.shared.recorder.clone();
 
         // --- identical to opendal-http-transport-reqwest ---------------------------------
@@ -1029,6 +1103,7 @@ impl HttpTransport for FidelityTransport {
         };
         let inflight = InflightGuard::start(recorder.clone());
         let t_ready = Instant::now();
+        cancel_guard.set_ready(t_ready);
         record.timing.queue_us = t_ready.saturating_duration_since(t_start).as_micros() as u64;
 
         let end_us = Arc::new(AtomicU64::new(0));
@@ -1051,15 +1126,20 @@ impl HttpTransport for FidelityTransport {
 
         // Static span name: no allocation per request. For uploads on platforms with kernel TCP
         // inspection, watch the socket's send buffer drain once the last frame enters the kernel
-        // so `send_us` / `upload_acked_us` reflect peer ACK rather than socket-buffer copy.
+        // so `send_us` / `upload_acked_us` reflect send-queue drain rather than buffer copy.
         let acked_us = Arc::new(AtomicU64::new(0));
+        let upload_guard = (bytes_up > 0).then(|| {
+            self.shared.active_uploads.fetch_add(1, Ordering::AcqRel);
+            UploadGuard(Some(self.shared.clone()))
+        });
         let sent = if let Some(notify) = body_notify {
             let shared = self.shared.clone();
             let end_ref = end_us.clone();
             let ack_ref = acked_us.clone();
             let watch = async move {
                 notify.notified().await;
-                let Some(probe) = shared.single_probe() else {
+                let active = shared.active_uploads.load(Ordering::Acquire);
+                let Some(probe) = shared.uploading_probe(active) else {
                     return;
                 };
                 // Only track kernel send-queue drain (`notsent_bytes > 0`); checking `unacked`
@@ -1102,6 +1182,7 @@ impl HttpTransport for FidelityTransport {
                 .await
         };
         let t_headers = Instant::now();
+        drop(upload_guard);
         cancel_guard.disarm();
         let mut resp = match sent {
             Ok(r) => r,
@@ -1188,14 +1269,31 @@ impl HttpTransport for FidelityTransport {
                 }
             }
             None => {
-                // Concurrent HTTP/2 stream that waited while another request dialed this conn.
+                // Concurrent HTTP/2 stream that waited in the client pool while another stream
+                // dialed this connection: attribute the wait to `queue_us` and start `wire_from`
+                // once the connection was actually ready.
                 if let Some(d_end) = dial_end
                     && d_end > t_ready
                     && d_end <= t_headers
                 {
-                    waited_dial_us = Some(d_end.saturating_duration_since(t_ready).as_micros() as u64);
+                    let wait = d_end.saturating_duration_since(t_ready).as_micros() as u64;
+                    waited_dial_us = Some(wait);
+                    record.timing.queue_us += wait;
+                    wire_from = d_end;
                 }
             }
+        }
+        if record.protocol == Protocol::Http2
+            && let (Some(addr), Ok(c)) = (addr, self.shared.conns.lock())
+            && let Some(e) = c.by_addr.get(&addr)
+        {
+            let overlapped = e
+                .recent_ends
+                .iter()
+                .flatten()
+                .filter(|&&end| end > wire_from)
+                .count() as u32;
+            open_streams = open_streams.saturating_add(overlapped);
         }
         let buffered_at = {
             let end = end_us.load(Ordering::Acquire);
@@ -1238,7 +1336,7 @@ impl HttpTransport for FidelityTransport {
             detail.send_buffered_us =
                 Some(buffered_at.saturating_duration_since(wire_from).as_micros() as u64);
             detail.upload_acked_us =
-                Some(sent_at.saturating_duration_since(t_start).as_micros() as u64);
+                Some(sent_at.saturating_duration_since(wire_from).as_micros() as u64);
         }
         record.detail = Some(Box::new(detail));
         let sniff = (record.status >= 400).then(super::signals::ErrorSniffer::default);
@@ -1310,6 +1408,7 @@ mod tests {
             proxy: None,
             proxy_addrs: Vec::new(),
             tcp_info: false,
+            active_uploads: AtomicU32::new(0),
         })
     }
 

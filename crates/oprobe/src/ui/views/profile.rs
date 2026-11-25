@@ -80,7 +80,11 @@ fn content(s: Store, m: Rc<ProfileModel>) -> View {
             pass_through: true,
             ..Default::default()
         },
-        move |_| link.range.set(None),
+        move |_| {
+            if link.range.get_untracked().is_some() || link.drag.get_untracked().is_some() {
+                link.clear();
+            }
+        },
     );
     let mut v = view()
         .test_id("profile")
@@ -423,7 +427,7 @@ fn requests(m: &Rc<ProfileModel>, cx: Ctx) -> Option<View> {
         return None;
     }
     let m = m.clone();
-    let picked = signal(None::<usize>);
+    let picked = signal(None::<String>);
     let opened = signal(None::<u64>);
     let writes = m
         .write_path
@@ -488,6 +492,8 @@ fn requests(m: &Rc<ProfileModel>, cx: Ctx) -> Option<View> {
                         })
                         .collect();
                     let names: Vec<String> = apis.iter().map(|a| a.api.clone()).collect();
+                    let names_sel = names.clone();
+                    let names_press = names.clone();
                     let bars = api_bars(&apis);
                     let table = if m.has_rows() {
                         kit::pressable_table_bars(
@@ -495,10 +501,14 @@ fn requests(m: &Rc<ProfileModel>, cx: Ctx) -> Option<View> {
                             rows,
                             bars,
                             "api-row",
-                            move || picked.get(),
+                            move || {
+                                let cur = picked.get();
+                                cur.and_then(|name| names_sel.iter().position(|n| n == &name))
+                            },
                             move |i| {
                                 opened.set(None);
-                                picked.update(|p| *p = if *p == Some(i) { None } else { Some(i) })
+                                let clicked = names_press.get(i).cloned();
+                                picked.update(|p| *p = if *p == clicked { None } else { clicked });
                             },
                         )
                         .into_element()
@@ -512,7 +522,7 @@ fn requests(m: &Rc<ProfileModel>, cx: Ctx) -> Option<View> {
                             let m = m.clone();
                             let names = names.clone();
                             untracked(move || {
-                                p.and_then(|i| names.get(i).cloned()).map(|api| {
+                                p.filter(|api| names.contains(api)).map(|api| {
                                     let reqs = m.api_requests(&api, range);
                                     api_drill(&m, &api, reqs, opened, picked)
                                 })
@@ -549,7 +559,7 @@ fn api_drill(
     api: &str,
     reqs: Vec<ReqLine>,
     opened: Signal<Option<u64>>,
-    picked: Signal<Option<usize>>,
+    picked: Signal<Option<String>>,
 ) -> View {
     let cols = [
         Col {
@@ -1692,7 +1702,18 @@ fn bar_readout(b: &crate::ui::data::Bar) -> String {
             .join(" · ")
     );
     for (k, v) in &b.signals {
-        s += &format!(" · {} {v}", tr_dyn(&format!("sig.{k}")).unwrap_or(k));
+        let shown_v = match (*k, v.as_str()) {
+            ("tail_cut", "hedged") => tr("sig_val.hedged"),
+            ("aborted", "incomplete") => tr("sig_val.incomplete"),
+            _ => v.as_str(),
+        };
+        s += &format!(" · {} {shown_v}", tr_dyn(&format!("sig.{k}")).unwrap_or(k));
+    }
+    if let Some(err) = &b.error {
+        s += &format!(" · {} {err}", tr("sig.error"));
+    }
+    if let Some(req_id) = &b.request_id {
+        s += &format!(" · {} {req_id}", tr("sig.request_id"));
     }
     s
 }
@@ -1723,6 +1744,8 @@ fn waterfall(w: &Waterfall, span: f64, hover: Signal<Option<String>>) -> View {
         )
         .children(w.bars.iter().map(|b| {
             let readout = bar_readout(b);
+            let readout_focus = readout.clone();
+            let readout_a11y = readout.clone();
             let total = b.total_us.max(1) as f64;
             let failed = b.failed;
             view()
@@ -1730,6 +1753,13 @@ fn waterfall(w: &Waterfall, span: f64, hover: Signal<Option<String>>) -> View {
                 .items_center()
                 .gap_2()
                 .min_w(px(0.0))
+                .rounded(px(2.0))
+                .focusable(true)
+                .focus_visible(kit::ring)
+                .role(AccessibilityRole::Button)
+                .label(readout_a11y)
+                .on_focus(move || hover.set(Some(readout_focus.clone())))
+                .on_blur(move || hover.set(None))
                 .on_mouse_enter(move |_: &MouseEvent| hover.set(Some(readout.clone())))
                 .on_mouse_leave(move |_: &MouseEvent| hover.set(None))
                 .child(

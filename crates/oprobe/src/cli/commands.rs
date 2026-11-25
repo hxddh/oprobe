@@ -110,6 +110,14 @@ pub fn show(a: ShowArgs, ctx: &Ctx) -> Result<u8> {
     let r = RunRef(a.runs.into_iter().next().unwrap_or_else(|| "last".into()));
     // A prove id (`show --list` lists them): its stored result, as `prove` printed it.
     if let Some(p) = app.show_prove(&r)? {
+        if by.is_some() || since.is_some() || until.is_some() || a.detail {
+            return Err(crate::errors::OprobeError::new(
+                crate::errors::ErrorCode::UsageInvalidArgument,
+                "--by, --since/--until and --detail apply to a run, not a prove result",
+            )
+            .with_hint("inspect one of the prove's trial runs with `oprobe show --list --all`")
+            .into());
+        }
         return ctx.out.finish(&p);
     }
     let p = app
@@ -141,6 +149,7 @@ pub async fn prove(a: ProveArgs, ctx: &Ctx) -> Result<u8> {
         trial_duration: a.trial,
         pairs: a.pairs.unwrap_or(crate::config::prove_defaults::MAX_PAIRS),
         save: a.save,
+        no_save: false,
         safety: i::Safety {
             dry_run: a.safety.dry_run,
             read_only: a.safety.read_only,

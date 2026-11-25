@@ -82,7 +82,7 @@ impl CommandOutput for RunList {
                         .unwrap_or_else(|| crate::util::display_url(&r.target_display)),
                     when(&r.id, now),
                     format!("{:.0}s", r.window_s),
-                    if r.interrupted {
+                    if r.partial.is_some() {
                         format!("{verdict}*")
                     } else {
                         verdict
@@ -97,7 +97,7 @@ impl CommandOutput for RunList {
             &rows,
             0,
         );
-        if self.runs.iter().any(|r| r.interrupted) {
+        if self.runs.iter().any(|r| r.partial.is_some()) {
             o += &dim("* stopped early (partial run)\n");
         }
         if !self.proves.is_empty() {
@@ -249,11 +249,12 @@ impl ByTable {
             None => true,
         };
         let reqs: Vec<&crate::model::ReqRow> = run.reqs.iter().filter(|q| inside(q.t_us)).collect();
+        let weights = run.op_weights();
         Self {
             by,
-            groups: slice::group(&reqs, by),
+            groups: slice::group_weighted(&reqs, by, &weights),
             stages: if by == slice::By::Stage {
-                slice::stage_table(&reqs)
+                slice::stage_table_weighted(&reqs, &weights)
             } else {
                 Vec::new()
             },
@@ -320,9 +321,8 @@ impl ByTable {
                 0,
             );
             o += &dim("stage columns: p50/p99\n");
-            // What the requests recorded beyond their stages: the HTTP/2 stream wait (part of
-            // queue) and flow-control stall (hidden in ttfb), the kernel's upload timing, the
-            // CDN cache and the region.
+            // What the requests recorded beyond their stages: HTTP/2 open streams, the kernel's
+            // upload timing, the CDN cache and the region.
             if self.stages.iter().any(|s| s.has_signals()) {
                 let opt = |s: &Option<crate::analysis::slice::StageQ>| {
                     s.as_ref().map_or("-".to_owned(), &q)
@@ -343,8 +343,6 @@ impl ByTable {
                     .map(|s| {
                         vec![
                             s.api.clone(),
-                            opt(&s.stream_wait),
-                            opt(&s.flow_stall),
                             s.streams_max_count
                                 .map_or("-".to_owned(), |n| n.to_string()),
                             opt(&s.send_buffered),
@@ -358,8 +356,6 @@ impl ByTable {
                 o += &crate::report::style::table(
                     &[
                         "api",
-                        "h2 stream wait",
-                        "h2 flow stall",
                         "streams",
                         "send buffered",
                         "upload acked",
@@ -369,9 +365,7 @@ impl ByTable {
                     &rows,
                     0,
                 );
-                o += &dim(
-                    "request signals: p50/p99 over the requests that had them · stream wait is part of queue, flow stall is inside ttfb\n",
-                );
+                o += &dim("request signals: p50/p99 over the requests that had them\n");
             }
         }
         o
@@ -393,10 +387,22 @@ impl CommandOutput for Profile {
 
     fn text(&self) -> String {
         if let Some(b) = &self.by {
-            return b.text();
+            let mut o = String::new();
+            if let Some(v) = &self.range {
+                o += &dim(&format!(
+                    "{:.1}–{:.1} s of the {:.1} s window · {} ops · {} requests\n",
+                    v.since_s,
+                    v.until_s,
+                    self.run.report.run.window_s,
+                    v.ops_count,
+                    v.requests_count
+                ));
+            }
+            o += &b.text();
+            return o;
         }
         if let (Some(v), Some(run)) = (&self.range, &self.full) {
-            return terminal::range_section(run, v);
+            return terminal::range_section_with(run, v, self.detail);
         }
         let mut o = match &self.full {
             Some(run) => terminal::render_run_with(run, self.detail),
@@ -510,10 +516,10 @@ pub fn show_prove(app: &App, r: &RunRef) -> Result<Option<ShownProve>> {
         .and_then(|n| n.to_str())
         .and_then(|n| n.strip_suffix(".prove.json"))
         .unwrap_or(&r.0);
-    let out: super::prove::ProveOutput = serde_json::from_slice(&raw).map_err(|e| {
+    let out = super::prove::ProveOutput::from_json_slice(&raw).map_err(|e| {
         OprobeError::new(
             ErrorCode::UsageInvalidArgument,
-            format!("prove result `{}` is corrupt: {e}", path.display()),
+            format!("prove result `{}` cannot be read: {e}", path.display()),
         )
         .with_hint(format!("remove it with `oprobe show --rm {stem}`"))
     })?;

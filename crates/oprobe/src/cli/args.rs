@@ -333,7 +333,13 @@ pub struct ShowArgs {
     #[arg(long, value_name = "DURATION", value_parser = parse::duration, conflicts_with_all = ["list", "rm"])]
     pub until: Option<String>,
     /// Show at most N runs (`--list`)
-    #[arg(short = 'n', long, default_value_t = 20, hide = true)]
+    #[arg(
+        short = 'n',
+        long,
+        default_value_t = 20,
+        requires = "list",
+        hide = true
+    )]
     pub limit: usize,
 }
 
@@ -348,7 +354,7 @@ pub struct LabArgs {
     /// Allow binding to a non-loopback address (unsafe on untrusted networks)
     #[arg(long)]
     pub allow_remote: bool,
-    /// Cap total in-memory object bytes stored by the lab (default 512MiB)
+    /// Cap total in-memory object bytes stored by the lab (default 8GiB)
     #[arg(long, value_name = "SIZE", value_parser = parse::nonzero_size)]
     pub max_store_size: Option<String>,
 }

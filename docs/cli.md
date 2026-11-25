@@ -139,9 +139,9 @@ oprobe prove 20261122-0915 small_ranges --max-duration 10m
 Print a profile: a stored run, or a file (`.oprobe` from `run` or from
 [`oprobe-trace`](embedding.md), or a report `.json`). Without an argument, the last run.
 Pass two or more runs or files to compare them side by side on goodput, bandwidth, latency,
-retries, throttling and stage split (`-o json`: `schemas/run.json`, `--detail` adds the per-API
+retries, throttling and stage split (`-o json`: `schemas/compare.json`, `--detail` adds the per-API
 comparison table). `-o json` for one run prints the shown run (`schemas/show.json`: the report of `schemas/report.json`, where it is stored, and the `by` and `range` sections when asked for); `--list -o json` the run list
-(`schemas/run-list.json`; `-n` limits the runs and the proves alike). A prove id, unambiguous prove prefix, `last-prove`, or `.prove.json` file (`show --list`
+(`schemas/run-list.json`; `-n` limits the runs and the proves alike), and `--rm -o json` the deleted ids (`schemas/removed.json`). A prove id, unambiguous prove prefix, `last-prove`, or `.prove.json` file (`show --list`
 lists them) prints that prove's stored result as `prove` printed it (`schemas/prove.json`), also
 after its run was removed.
 
@@ -149,8 +149,7 @@ A trace from `oprobe-trace` is recognised by its content, whatever its name. Its
 `run.source = "trace"` and shows `production trace` where a run shows its workload. Its
 operations are the application's OpenDAL calls (keys hashed), and the findings a trace supports
 are derived: errors, throttling, hung requests, stragglers, cold connections, small ranges, slow
-multipart and repeated reads (not bandwidth cap or client bound). A 6.x trace
-(`oprobe.trace/6`) has no operations: each request counts as one there. `prove` refuses a trace
+multipart and repeated reads (not bandwidth cap or client bound). `prove` refuses a trace
 (exit 2): it needs a run oprobe drove.
 
 | Flag | Meaning |
@@ -177,8 +176,9 @@ oprobe show --rm last~3 last~4
 
 ## `oprobe lab [SCENARIO]`
 
-Serve a local S3-compatible lab with faults until Ctrl-C and print its endpoint. Point any S3
-client at it, or use `lab://SCENARIO` as an operator to start one inside a run.
+Serve a local S3-compatible lab with faults until Ctrl-C and print its endpoint (`-o json`:
+`schemas/lab.json`). Point any S3 client at it, or use `lab://SCENARIO` as an operator to start one
+inside a run.
 
 Scenarios (the same six as the app's): `demo`, `throttle`, `stragglers`, `bandwidth`, `flaky`,
 `ratelimit`. Without one, the lab has no faults.
@@ -187,7 +187,7 @@ Scenarios (the same six as the app's): `demo`, `throttle`, `stragglers`, `bandwi
 |---|---|
 | `--bind ADDR` | the address to listen on (default `127.0.0.1:9000`) |
 | `--allow-remote` | allow binding to a non-loopback address (`0.0.0.0`, LAN IP); refused without this flag because the lab accepts static lab credentials without authentication |
-| `--max-store-size SIZE` | cap total in-memory object bytes stored by the lab (default `512MiB`; returns `507 InsufficientStorage` above it) |
+| `--max-store-size SIZE` | cap total in-memory object bytes stored by the lab (default `8GiB`; returns `507 InsufficientStorage` above it) |
 
 ## Run references
 

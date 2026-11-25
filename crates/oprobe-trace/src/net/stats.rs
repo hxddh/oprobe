@@ -210,6 +210,7 @@ mod tests {
         assert_eq!(k.rtt_p99_us, 300);
         assert_eq!(k.rwnd_limited_ratio, 0.5);
         assert!(tcp_kernel(&[row(3, 0)]).is_none());
-        assert_eq!(row(3, 0).api, "GetObject");
+        assert_eq!(row(3, 0).api, crate::Api::GetObject);
+        assert_eq!(row(3, 0).api_name(), "GetObject");
     }
 }

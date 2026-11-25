@@ -1,0 +1,59 @@
+{
+  "$defs": {
+    "NextStep": {
+      "description": "A suggested next step: what it does and the CLI command.",
+      "properties": {
+        "cli": {
+          "description": "The command line (`oprobe …`).",
+          "type": "string"
+        },
+        "title": {
+          "description": "What the step does, in a few words.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "title",
+        "cli"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://github.com/hxddh/oprobe/schemas/9/removed.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "The result of `oprobe show --rm RUN -o json`: the deleted run ids",
+  "properties": {
+    "dry_run": {
+      "type": "boolean"
+    },
+    "next": {
+      "description": "Suggested next steps.",
+      "items": {
+        "$ref": "#/$defs/NextStep"
+      },
+      "type": "array"
+    },
+    "removed": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "warnings": {
+      "description": "Warnings of the command (also printed on stderr in text mode).",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "removed",
+    "dry_run",
+    "next",
+    "warnings"
+  ],
+  "title": "oprobe removed",
+  "type": "object",
+  "x-rust-type": "RemovedRuns"
+}

@@ -134,7 +134,7 @@ pub fn remedy(code: &str, variant: Option<&str>) -> Remedy {
         ("small_ranges", _) => r(
             Some("read.gap"),
             &[],
-            "read_with().gap()",
+            "reader_with().gap()",
             true,
             "coalesce nearby small ranges into fewer range requests",
         ),
@@ -788,11 +788,16 @@ fn tail_stragglers(c: &Ctx) -> Option<Finding> {
     // T4: the requests themselves must wait for the first byte; a tail of retry backoff or
     // queueing has no stragglers to cut (the replay below only counts TTFB-bound requests).
     let setup = remedy_setup(c.r);
-    let mut apis: Vec<&str> = run.reqs.iter().map(|q| q.api.as_ref()).collect();
-    apis.sort_unstable();
+    let mut apis: Vec<crate::trace::Api> = run.reqs.iter().map(|q| q.api).collect();
+    apis.sort_by_key(|a| a.label());
     apis.dedup();
     // Every API with stragglers the tail cut would remove (largest gain first).
-    let mut affected: Vec<(f64, String, Vec<&ReqRow>, simulate::TailCutReplay)> = Vec::new();
+    let mut affected: Vec<(
+        f64,
+        crate::trace::Api,
+        Vec<&ReqRow>,
+        simulate::TailCutReplay,
+    )> = Vec::new();
     for api in apis {
         let Some(replay) = simulate::tail_cut(run, api, &setup) else {
             continue;
@@ -814,12 +819,12 @@ fn tail_stragglers(c: &Ctx) -> Option<Finding> {
         if p.current <= 0.0 || gain < p.current / 3.0 {
             continue;
         }
-        affected.push((gain, api.to_owned(), over, replay));
+        affected.push((gain, api, over, replay));
     }
     if affected.is_empty() {
         return None;
     }
-    affected.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+    affected.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.label().cmp(b.1.label())));
     // Per API: (api, stragglers, share %, straggler TTFB p50, typical TTFB p50), weighted.
     let per_api: Vec<(&str, usize, f64, f64, f64)> = affected
         .iter()
@@ -836,7 +841,7 @@ fn tail_stragglers(c: &Ctx) -> Option<Finding> {
             let mut typical: Vec<(u64, f64)> =
                 ok.iter().map(|q| (q.ttfb_us, weight(q.op_id))).collect();
             (
-                api.as_str(),
+                api.label(),
                 over.len(),
                 over_w * 100.0 / all_w.max(1.0),
                 weighted_quantile_us_ms(&mut ttfb, 0.5),
@@ -1012,7 +1017,7 @@ fn small_ranges(c: &Ctx, have_cap: bool) -> Option<Finding> {
     }
     let reads: Vec<&ReqRow> = c
         .reqs()
-        .filter(|q| q.api == "GetObject" && !q.is_error())
+        .filter(|q| q.api == crate::trace::Api::GetObject && !q.is_error())
         .collect();
     if reads.len() < 5 {
         return None;
@@ -1164,7 +1169,7 @@ fn small_ranges(c: &Ctx, have_cap: bool) -> Option<Finding> {
 fn slow_multipart(c: &Ctx) -> Option<Finding> {
     let parts: Vec<&ReqRow> = c
         .reqs()
-        .filter(|q| q.api == "UploadPart" && !q.is_error())
+        .filter(|q| q.api == crate::trace::Api::UploadPart && !q.is_error())
         .collect();
     if parts.len() < 10 || c.spec().write_concurrent() > 1 {
         return None;
@@ -1510,13 +1515,13 @@ pub fn run_validity(r: &Report) -> Validity {
     let error_ratio = failed as f64 / s.ops.max(1) as f64;
     let invalid = if s.ops == 0 {
         Some("no operation completed in the measurement window".to_owned())
-    } else if error_ratio > r.sla.max_error_ratio {
+    } else if !r.is_trace() && error_ratio > r.sla.max_error_ratio {
         Some(format!(
             "{:.1}% of operations failed for reasons other than throttling (the SLA allows {}%), so latency and throughput describe failures",
             error_ratio * 100.0,
             r.sla.max_error_ratio * 100.0
         ))
-    } else if r.workload.warmup_s > 0.0 && window < r.workload.warmup_s {
+    } else if !r.is_trace() && r.workload.warmup_s > 0.0 && window < r.workload.warmup_s {
         Some(format!(
             "the measurement window ({window:.1} s) is shorter than the warmup ({:.1} s)",
             r.workload.warmup_s
@@ -1713,7 +1718,7 @@ pub(crate) mod tests {
         // Alternate blocks of 40 requests between two APIs: both get their stragglers.
         for (i, q) in run.reqs.iter_mut().enumerate() {
             if (i / 40) % 2 == 1 {
-                q.api = "HeadObject".into();
+                q.api = crate::trace::Api::HeadObject;
             }
         }
         let f = derive(&run);

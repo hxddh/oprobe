@@ -1,20 +1,19 @@
-//! A production trace as a [`Run`]: the `oprobe.trace/8` (or `7` / `6`) file an application
-//! writes with the embedded `oprobe-trace` layer (`Handle::save`, `Snapshot::save`), built into
-//! a report by the same builder as a run ([`super::build_run`]), and marked for what it is
-//! (design v6 §2: the workbench opens it like any other profile).
+//! A production trace as a [`Run`]: the `oprobe.trace/9` file an application writes with the
+//! embedded `oprobe-trace` layer (`Handle::save`, `Snapshot::save`), built into a report by the
+//! same builder as a run ([`super::build_run`]), and marked for what it is (design v6 §2: the
+//! workbench opens it like any other profile).
 //!
 //! What differs from a run oprobe drove:
 //! - `run.source` is `trace`; there is no workload (no preset, mix or dataset) and nothing to
 //!   replay, so `oprobe prove` refuses it;
-//! - the operator is what the layer saw: the service's scheme, name (bucket) and root;
-//! - an `oprobe.trace/8` (or `oprobe.trace/7`) file has the application's operations (each
-//!   OpenDAL call, linked to the requests it issued; keys hashed, design v7 B1), so the
-//!   summary, verbs, hot keys, prefixes and over-read read them as a run's do. An
-//!   `oprobe.trace/6` file has requests only: each request stands in for one operation in the
-//!   summary (count, failures, latency), and the report says so;
+//! - the operator is what the layer saw: the service's scheme, name (bucket), root and HTTP
+//!   client posture;
+//! - every OpenDAL call is recorded as an operation linked to the requests it issued (keys
+//!   hashed, design v7 B1), so the summary, verbs, hot keys, prefixes and over-read read them
+//!   as a run's do;
 //! - only the findings the trace can support are kept ([`TRACE_FINDINGS`], plus
-//!   [`OP_TRACE_FINDINGS`] when it has operations). The ones that need a load oprobe varied or
-//!   its own client (bandwidth cap, client bound) are not derived; the ones that judge the
+//!   [`OP_TRACE_FINDINGS`] when it has operation rows). The ones that need a load oprobe varied
+//!   or its own client (bandwidth cap, client bound) are not derived; the ones that judge the
 //!   operator's `read.concurrent` / `write.concurrent` read what its requests did instead of
 //!   oprobe's defaults.
 
@@ -22,7 +21,7 @@ use std::path::Path;
 use std::time::{Duration, SystemTime};
 
 use super::report::*;
-use super::{OpRow, ReqRow, Run, RunId};
+use super::{Run, RunId};
 use crate::trace::{ServiceRecord, Snapshot, TraceFile};
 
 /// The findings a production trace keeps (they read request rows and aggregates only).
@@ -37,12 +36,9 @@ pub const TRACE_FINDINGS: &[&str] = &[
     "invalid_run",
 ];
 
-/// The findings a trace with operations keeps besides [`TRACE_FINDINGS`]: they read operations
-/// (ranges per read, parts per write, repeated keys).
+/// The findings a trace with operation rows keeps besides [`TRACE_FINDINGS`]: they read
+/// operations (ranges per read, parts per write, repeated keys).
 pub const OP_TRACE_FINDINGS: &[&str] = &["small_ranges", "slow_multipart", "repeated_reads"];
-
-/// The warning every report of a trace without operation rows carries.
-pub const PER_REQUEST_WARNING: &str = "production trace: oprobe did not drive this traffic and the application's requests are not grouped into operations, so each request counts as one operation";
 
 /// The operator URL of the service a trace recorded (`s3://bucket/root`); `unknown://` when
 /// the file does not say (a bare `Snapshot::save`).
@@ -167,7 +163,7 @@ fn inferred_preset(r: &Report) -> Option<&'static str> {
         .any(|v| v.verb.contains("multipart") || v.verb == "UploadPart")
         || r.apis
             .iter()
-            .any(|a| a.api.label() == "UploadPart" && a.count > 0);
+            .any(|a| a.api == crate::trace::Api::UploadPart && a.count > 0);
     let max_bpo = r
         .verbs
         .iter()
@@ -195,143 +191,6 @@ fn parse_rfc3339(s: &str) -> Option<SystemTime> {
         n(14..16)?,
         n(17..19)?,
     )
-}
-
-/// The summary of a trace with no operations: every request stands in for one operation (a
-/// throttled request is counted as throttled, not failed: a retry layer may have recovered it).
-fn per_request_summary(s: &mut Snapshot, reqs: &[ReqRow], complete: bool) {
-    let sum = |f: &dyn Fn(&crate::trace::ApiStats) -> u64| {
-        s.apis.iter().fold(0u64, |n, a| n.saturating_add(f(a)))
-    };
-    let requests = sum(&|a| a.count);
-    let throttled = sum(&|a| a.throttled);
-    let failed = sum(&|a| a.errors.saturating_sub(a.throttled));
-    let elapsed = s.elapsed_s.max(1e-3);
-    let ratio = |n: u64| n as f64 / requests.max(1) as f64;
-    let latency = if complete {
-        let mut all: Vec<u64> = reqs.iter().map(|r| r.total_us).collect();
-        crate::analysis::stats::exact_quantiles(&mut all)
-    } else {
-        None
-    };
-    let latency = latency.unwrap_or_else(|| {
-        // Sampled rows over-represent the slow and failed requests: combine the exact
-        // per-API aggregates instead (count-weighted; the maximum is exact).
-        let mut q = crate::trace::Quantiles::default();
-        for a in &s.apis {
-            let t = &a.stages.total;
-            let w = t.count as f64;
-            q.count += t.count;
-            q.mean += t.mean * w;
-            q.p50 += t.p50 * w;
-            q.p90 += t.p90 * w;
-            q.p99 += t.p99 * w;
-            q.p999 += t.p999 * w;
-            q.max = q.max.max(t.max);
-        }
-        let n = q.count.max(1) as f64;
-        q.mean /= n;
-        q.p50 /= n;
-        q.p90 /= n;
-        q.p99 /= n;
-        q.p999 /= n;
-        q
-    });
-    let m = &mut s.summary;
-    m.ops = requests;
-    m.failed_ops = failed;
-    m.ops_per_s = requests.saturating_sub(failed) as f64 / elapsed;
-    m.attempted_ops_per_s = requests as f64 / elapsed;
-    m.error_rate = ratio(failed);
-    m.throttled_request_ratio = ratio(throttled);
-    m.throttled_op_ratio = ratio(throttled);
-    m.latency = latency;
-    s.resilience.failed_ops = failed;
-    if requests > 0 {
-        s.bytes.request_amplification = 1.0;
-    }
-    // One "operation" per storage API, so where the time went and the per-operation table
-    // read the requests (backend time is the request's, less its wait for a slot).
-    let mib = |b: u64| b as f64 / (1024.0 * 1024.0);
-    s.verbs = s
-        .apis
-        .iter()
-        .filter(|a| a.count > 0)
-        .map(|a| {
-            let label = a.api.label();
-            let t = &a.stages.total;
-            let latency = complete
-                .then(|| {
-                    let mut v: Vec<u64> = reqs
-                        .iter()
-                        .filter(|r| r.api == label)
-                        .map(|r| r.total_us)
-                        .collect();
-                    crate::analysis::stats::exact_quantiles(&mut v)
-                })
-                .flatten()
-                .unwrap_or(*t);
-            let bytes = a.bytes_up.saturating_add(a.bytes_down);
-            let n = a.count as f64;
-            crate::trace::VerbStats {
-                verb: label.to_owned(),
-                count: a.count,
-                errors: a.errors.saturating_sub(a.throttled),
-                throttled: a.throttled,
-                ops_per_s: n / elapsed,
-                mib_per_s: mib(bytes) / elapsed,
-                latency,
-                breakdown: crate::trace::OpBreakdown {
-                    queue_ms: a.stages.queue.mean,
-                    backend_ms: (t.mean - a.stages.queue.mean).max(0.0),
-                    ..Default::default()
-                },
-                requests_per_op: 1.0,
-                bytes_per_op: bytes as f64 / n,
-                retries: 0,
-            }
-        })
-        .collect();
-}
-
-/// The request rows as one-request operations, for the findings that read operation latency
-/// (stragglers): a view, never stored.
-fn per_request_view(run: &Run) -> Run {
-    let mut reqs = run.reqs.clone();
-    let ops: Vec<OpRow> = reqs
-        .iter_mut()
-        .enumerate()
-        .map(|(i, q)| {
-            let id = i as u64 + 1;
-            q.op_id = id;
-            q.attempt = 1;
-            let failed = q.is_error() && q.status != 404 && !q.is_throttle();
-            let mut o = crate::trace::log::op_row(
-                id,
-                "",
-                String::new(),
-                q.t_us,
-                q.total_us,
-                q.bytes_up.saturating_add(q.bytes_down),
-                failed.then(|| {
-                    q.error
-                        .clone()
-                        .unwrap_or_else(|| format!("status {}", q.status))
-                }),
-                q.is_throttle(),
-                0,
-                [q.queue_us, 0, q.total_us.saturating_sub(q.queue_us), 0, 0],
-                1,
-            );
-            o.verb = std::borrow::Cow::Owned(q.api.to_string());
-            o
-        })
-        .collect();
-    Run {
-        report: run.report.clone(),
-        ops,
-        reqs,
-    }
 }
 
 /// The run as the findings read a trace with operations: the operations it observed stand in
@@ -369,7 +228,7 @@ fn observed_view(run: &Run) -> Run {
 
 /// Whether every operation issued its `api` requests one after another (no two overlapping in
 /// time): what an operator with `concurrent = 1` does.
-fn sequential(run: &Run, api: &str) -> bool {
+fn sequential(run: &Run, api: crate::trace::Api) -> bool {
     let mut by_op: std::collections::HashMap<u64, Vec<(i64, i64)>> = Default::default();
     for q in run.reqs.iter().filter(|q| q.op_id != 0 && q.api == api) {
         let start = q.t_us;
@@ -503,24 +362,31 @@ pub fn trace_run(mut file: TraceFile, path: &Path) -> Result<Run, crate::errors:
     let url = operator_url(file.service.as_ref());
     let mut profile = crate::config::Profile::from_url(&url);
     profile.name = None;
+    let snapshot = std::mem::take(&mut file.snapshot);
+    if let Some(svc) = file.service.as_ref() {
+        profile.operator.http.version = svc.http_version;
+        profile.operator.http.keep_alive = svc.keep_alive;
+        if let Some(limit) = svc.max_inflight_count {
+            profile.operator.layers.concurrent_limit = Some(crate::operator::ConcurrentLimit {
+                http: Some(limit),
+                operations: None,
+            });
+        }
+    }
+    if profile.operator.http.version == crate::net::HttpVersion::Auto
+        && snapshot.connections.http2_requests > 0
+        && snapshot.connections.http1_requests == 0
+    {
+        profile.operator.http.version = crate::net::HttpVersion::H2;
+    }
     let knobs = crate::config::Knobs::of(&profile);
     let ended_at = parse_rfc3339(&file.created_at).unwrap_or_else(SystemTime::now);
-    let mut snapshot = std::mem::take(&mut file.snapshot);
     let started_at = Duration::try_from_secs_f64(snapshot.elapsed_s.max(0.0))
         .ok()
         .and_then(|d| ended_at.checked_sub(d))
         .unwrap_or(ended_at);
     let run_id = RunId::at(started_at, 0);
     let mut warnings = Vec::new();
-    if !has_ops {
-        let requests = snapshot
-            .apis
-            .iter()
-            .fold(0u64, |n, a| n.saturating_add(a.count));
-        let complete = !rows.sampled() && rows.reqs.len() as u64 == requests;
-        per_request_summary(&mut snapshot, &rows.reqs, complete);
-        warnings.push(PER_REQUEST_WARNING.to_owned());
-    }
     if !has_rows {
         warnings.push(
             "the trace holds aggregates only (a snapshot saved without its requests): findings that read requests are not derived"
@@ -559,22 +425,20 @@ pub fn trace_run(mut file: TraceFile, path: &Path) -> Result<Run, crate::errors:
         r.target.display = "unknown service".into();
         r.target.scheme = "unknown".into();
     }
-    // Findings from the operations; a trace without operations reads them one request per
-    // operation.
+    // Findings from the operations (or from aggregates alone when saved without rows).
     let mut findings = if has_ops {
         let view = observed_view(&run);
         let mut f = crate::analysis::findings::derive(&view);
         f.retain(|x| match x.code.as_str() {
             // These judge `read.concurrent` / `write.concurrent`, which the trace does not
             // know: keep them only when the requests really were sequential.
-            "small_ranges" => sequential(&run, "GetObject"),
-            "slow_multipart" => sequential(&run, "UploadPart"),
+            "small_ranges" => sequential(&run, crate::trace::Api::GetObject),
+            "slow_multipart" => sequential(&run, crate::trace::Api::UploadPart),
             _ => true,
         });
         f
     } else {
-        let view = per_request_view(&run);
-        let mut f = crate::analysis::findings::derive(&view);
+        let mut f = crate::analysis::findings::derive(&run);
         for x in &mut f {
             x.evidence.op_ids.clear();
         }
@@ -621,6 +485,9 @@ mod tests {
             scheme: scheme.into(),
             name: name.into(),
             root: root.into(),
+            http_version: crate::trace::HttpVersion::Auto,
+            keep_alive: true,
+            max_inflight_count: None,
         };
         assert_eq!(operator_url(None), "unknown://");
         assert_eq!(operator_url(Some(&s("s3", "bkt", "/"))), "s3://bkt");

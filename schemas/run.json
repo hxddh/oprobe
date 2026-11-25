@@ -2999,10 +2999,6 @@
           "description": "Run id (`YYYYMMDD-HHMMSS-xxxx`).",
           "type": "string"
         },
-        "interrupted": {
-          "description": "Stopped early (Ctrl-C, Stop, budget): the window is shorter than configured.",
-          "type": "boolean"
-        },
         "label": {
           "type": [
             "string",
@@ -3058,7 +3054,6 @@
         "started_at",
         "ended_at",
         "window_s",
-        "interrupted",
         "sampled",
         "trace",
         "oprobe_version",
@@ -3100,7 +3095,7 @@
         },
         {
           "const": "trace",
-          "description": "A production trace written by the `oprobe-trace` layer (`oprobe.trace/7`, or a 6.x\n`oprobe.trace/6`): the application's own traffic, with no workload to replay.",
+          "description": "A production trace written by the `oprobe-trace` layer (`oprobe.trace/9`): the\napplication's own traffic, with no workload to replay.",
           "type": "string"
         }
       ]
@@ -4600,7 +4595,7 @@
       "type": "object"
     }
   },
-  "$id": "https://github.com/hxddh/oprobe/schemas/6/run.json",
+  "$id": "https://github.com/hxddh/oprobe/schemas/9/run.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "The result of `oprobe run -o json` (and `demo`): one run per operator, each with its report, and the comparison when there are several",
   "properties": {

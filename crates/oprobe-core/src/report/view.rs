@@ -68,8 +68,7 @@ impl VerdictView {
                 .run
                 .partial
                 .as_ref()
-                .map(|p| format!("{} after {:.1} s", p.reason.describe(), p.measured_s))
-                .or_else(|| r.run.interrupted.then(|| "stopped early".to_owned())),
+                .map(|p| format!("{} after {:.1} s", p.reason.describe(), p.measured_s)),
             sla_breaches: r.verdict.sla.breaches.clone(),
             warnings: r.warnings.clone(),
         }
@@ -410,13 +409,12 @@ pub enum SignalValue {
 
 /// One thing a request row recorded beyond its stage timings: the provider's error code,
 /// `Retry-After`, the connection's round trip and retransmits, `Server-Timing`, the HTTP/2
-/// stream wait, flow-control stall and open streams, the kernel's upload acknowledgement and
-/// buffered send, the CDN cache status and the bucket's region.
+/// open streams, the kernel's upload acknowledgement and buffered send, the CDN cache status
+/// and the bucket's region.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RequestSignal {
     /// Stable key: `code`, `retry_after`, `rtt`, `min_rtt`, `retransmits`, `server_timing`,
-    /// `stream_wait`, `flow_stall`, `streams`, `upload_acked`, `send_buffered`,
-    /// `cache_status`, `region`.
+    /// `streams`, `upload_acked`, `send_buffered`, `cache_status`, `region`.
     pub key: &'static str,
     pub value: SignalValue,
 }
@@ -428,17 +426,11 @@ impl RequestSignal {
     pub fn explains(&self) -> bool {
         matches!(
             self.key,
-            "code"
-                | "retry_after"
-                | "tail_cut"
-                | "aborted"
-                | "stream_wait"
-                | "flow_stall"
-                | "cache_status"
+            "code" | "retry_after" | "tail_cut" | "aborted" | "cache_status"
         )
     }
 
-    /// `h2 stream wait 3.1ms`: the signal in the terminal's words.
+    /// `upload acked 3.1ms`: the signal in the terminal's words.
     pub fn text(&self) -> String {
         let label = match self.key {
             "retry_after" => "retry-after",
@@ -446,8 +438,6 @@ impl RequestSignal {
             "aborted" => "body",
             "min_rtt" => "min rtt",
             "server_timing" => "server-timing",
-            "stream_wait" => "h2 stream wait",
-            "flow_stall" => "h2 flow stall",
             "streams" => "h2 streams",
             "upload_acked" => "upload acked",
             "send_buffered" => "send buffered",
@@ -473,7 +463,7 @@ pub fn request_signals(q: &crate::model::ReqRow) -> Vec<RequestSignal> {
     let d = q.detail.as_deref();
     let tcp = q.tcp.as_deref();
     let nonzero = |v: Option<u64>| v.filter(|v| *v > 0);
-    let all: [(&'static str, Option<SignalValue>); 19] = [
+    let all: [(&'static str, Option<SignalValue>); 17] = [
         (
             "code",
             d.and_then(|d| d.error_code.clone()).map(SignalValue::Text),
@@ -502,14 +492,6 @@ pub fn request_signals(q: &crate::model::ReqRow) -> Vec<RequestSignal> {
             "server_timing",
             d.and_then(|d| d.server_timing.clone())
                 .map(SignalValue::Text),
-        ),
-        (
-            "stream_wait",
-            nonzero(d.and_then(|d| d.stream_wait_us)).map(SignalValue::Us),
-        ),
-        (
-            "flow_stall",
-            nonzero(d.and_then(|d| d.flow_stall_us)).map(SignalValue::Us),
         ),
         (
             "streams",
@@ -611,7 +593,7 @@ pub fn waterfall(run: &Run, op_id: u64) -> Option<WaterfallOp> {
             prev_end = Some(prev_end.unwrap_or(i64::MIN).max(q.t_us + q.total_us as i64));
             let detail = q.detail.as_deref();
             WaterfallRow {
-                api: q.api.to_string(),
+                api: q.api_name().to_owned(),
                 status: q.status,
                 attempt: q.attempt,
                 start_us: q.t_us - o.t_us,
@@ -1309,7 +1291,7 @@ impl WritePathView {
         let parts: Vec<&crate::trace::ApiStats> = r
             .apis
             .iter()
-            .filter(|a| a.api.label() == "UploadPart" && a.count > 0)
+            .filter(|a| a.api == crate::trace::Api::UploadPart && a.count > 0)
             .collect();
         let parts_count: u64 = parts.iter().map(|a| a.count).sum();
         let up: u64 = parts.iter().map(|a| a.bytes_up).sum();
@@ -1322,7 +1304,7 @@ impl WritePathView {
         let complete = r
             .apis
             .iter()
-            .find(|a| a.api.label() == "CompleteMultipart" && a.count > 0);
+            .find(|a| a.api == crate::trace::Api::CompleteMultipart && a.count > 0);
         let complete_p99_ms = complete.map(|c| c.stages.total.p99).filter(|v| *v > 0.0);
         let complete_share_ratio = complete.and_then(|c| {
             let mp_ms: f64 = r
@@ -1330,8 +1312,10 @@ impl WritePathView {
                 .iter()
                 .filter(|a| {
                     matches!(
-                        a.api.label(),
-                        "CreateMultipart" | "UploadPart" | "CompleteMultipart"
+                        a.api,
+                        crate::trace::Api::CreateMultipart
+                            | crate::trace::Api::UploadPart
+                            | crate::trace::Api::CompleteMultipart
                     )
                 })
                 .map(|a| a.stages.total.mean * a.count as f64)
@@ -1339,32 +1323,31 @@ impl WritePathView {
             let c_ms = c.stages.total.mean * c.count as f64;
             (mp_ms > 0.0).then_some(c_ms / mp_ms)
         });
-        let part_skew_ratio = run.and_then(|run| {
-            let mut by_op: std::collections::HashMap<u64, Vec<f64>> = Default::default();
-            for q in run
-                .reqs
-                .iter()
-                .filter(|q| q.op_id != 0 && q.api == "UploadPart" && !q.is_error())
-            {
-                by_op.entry(q.op_id).or_default().push(q.total_us as f64);
-            }
-            let mut skews: Vec<f64> = by_op
-                .into_values()
-                .filter(|v| v.len() >= 2)
-                .filter_map(|mut v| {
-                    v.sort_by(f64::total_cmp);
-                    let med = crate::analysis::stats::median(&v);
-                    let max = v.last().copied().unwrap_or(0.0);
-                    (med > 0.0).then_some(max / med)
-                })
-                .collect();
-            if skews.is_empty() {
-                None
-            } else {
-                skews.sort_by(f64::total_cmp);
-                Some(crate::analysis::stats::median(&skews))
-            }
-        });
+        let part_skew_ratio =
+            run.and_then(|run| {
+                let mut by_op: std::collections::HashMap<u64, Vec<f64>> = Default::default();
+                for q in run.reqs.iter().filter(|q| {
+                    q.op_id != 0 && q.api == crate::trace::Api::UploadPart && !q.is_error()
+                }) {
+                    by_op.entry(q.op_id).or_default().push(q.total_us as f64);
+                }
+                let mut skews: Vec<f64> = by_op
+                    .into_values()
+                    .filter(|v| v.len() >= 2)
+                    .filter_map(|mut v| {
+                        v.sort_by(f64::total_cmp);
+                        let med = crate::analysis::stats::median(&v);
+                        let max = v.last().copied().unwrap_or(0.0);
+                        (med > 0.0).then_some(max / med)
+                    })
+                    .collect();
+                if skews.is_empty() {
+                    None
+                } else {
+                    skews.sort_by(f64::total_cmp);
+                    Some(crate::analysis::stats::median(&skews))
+                }
+            });
         Some(Self {
             requested_chunk_bytes: e.requested_chunk_size,
             write_chunk_bytes: e.write_chunk_size,
@@ -1485,11 +1468,11 @@ impl ListView {
         let api = r
             .apis
             .iter()
-            .find(|a| a.api.label() == "ListObjectsV2" && a.count > 0)?;
+            .find(|a| a.api == crate::trace::Api::ListObjects && a.count > 0)?;
         let list_ops: u64 = r
             .verbs
             .iter()
-            .filter(|v| v.verb == "list" || v.verb == "ListObjectsV2")
+            .filter(|v| v.verb.starts_with("list") || v.verb == "ListObjects")
             .map(|v| v.count)
             .sum::<u64>()
             .max(1);
@@ -1498,7 +1481,7 @@ impl ListView {
             for q in run
                 .reqs
                 .iter()
-                .filter(|q| q.op_id != 0 && q.api == "ListObjectsV2")
+                .filter(|q| q.op_id != 0 && q.api == crate::trace::Api::ListObjects)
             {
                 *by_op.entry(q.op_id).or_default() += 1;
             }
@@ -2439,8 +2422,7 @@ impl TrustView {
                 .run
                 .partial
                 .as_ref()
-                .map(|p| format!("{:?}", p.reason).to_lowercase())
-                .or_else(|| r.run.interrupted.then(|| "interrupted".to_owned())),
+                .map(|p| format!("{:?}", p.reason).to_lowercase()),
         }
     }
 
@@ -3141,8 +3123,7 @@ mod tests {
         let q = &mut run.reqs[2];
         q.stall_us = 1_500;
         q.detail = Some(Box::new(crate::model::ReqDetail {
-            stream_wait_us: Some(2_000),
-            flow_stall_us: Some(7_000),
+            cut: true,
             streams_count: Some(100),
             upload_acked_us: Some(900),
             send_buffered_us: Some(40),
@@ -3161,8 +3142,7 @@ mod tests {
             keys,
             vec![
                 "code",
-                "stream_wait",
-                "flow_stall",
+                "tail_cut",
                 "streams",
                 "upload_acked",
                 "send_buffered",
@@ -3170,10 +3150,10 @@ mod tests {
                 "region"
             ]
         );
-        assert_eq!(r.signals[2].value, SignalValue::Us(7_000));
-        assert_eq!(r.signals[2].text(), "h2 flow stall 7.00ms");
-        assert!(r.signals[2].explains());
-        assert!(!r.signals[7].explains(), "the region is a detail");
+        assert_eq!(r.signals[1].value, SignalValue::Text("hedged".into()));
+        assert_eq!(r.signals[1].text(), "tail-cut hedged");
+        assert!(r.signals[1].explains());
+        assert!(!r.signals[6].explains(), "the region is a detail");
         assert_eq!(w.await_tree.as_deref(), Some("read\n  http"));
         // A plain request says nothing beyond its stages.
         assert!(w.rows[0].signals.is_empty());

@@ -1,23 +1,22 @@
 //! The `.oprobe` file a traced operator writes ([`crate::Handle::save`],
-//! [`crate::Snapshot::save`]): format `oprobe.trace/8`, which `oprobe show FILE` and the
+//! [`crate::Snapshot::save`]): format `oprobe.trace/9`, which `oprobe show FILE` and the
 //! workbench open like any other profile.
 //!
 //! It is one JSON document, so it can be read without oprobe:
 //!
 //! ```text
 //! {
-//!   "format": "oprobe.trace/8",
-//!   "oprobe_trace_version": "8.0.0",
-//!   "created_at": "2026-11-24T10:00:00Z",
+//!   "format": "oprobe.trace/9",
+//!   "oprobe_trace_version": "9.0.0",
+//!   "created_at": "2026-11-25T10:00:00Z",
 //!   "service": { "scheme": "s3", "name": "my-bucket", "root": "/data/" },   // optional
 //!   "snapshot": { … the aggregates: per API and stage, connections, bytes, timeline … },
 //!   "rows": { "ops": [ … ], "reqs": [ … ], "info": { … }, "sampling": { … } }   // optional
 //! }
 //! ```
 //!
-//! The format is stable across 8.x: fields are only ever added. `oprobe.trace/8` holds the
-//! application's operations (`rows.ops`), each request linked to the operation that issued it;
-//! `oprobe.trace/7` and `oprobe.trace/6` files still read ([`TRACE_FORMATS_READ`]).
+//! The format is stable across 9.x: fields are only ever added. `oprobe.trace/9` holds the
+//! application's operations (`rows.ops`), each request linked to the operation that issued it.
 
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
@@ -30,15 +29,19 @@ use crate::rows::{OpRow, ReqRow, TraceInfo};
 use crate::sample::SamplingStats;
 
 /// The `format` of a file written by `oprobe-trace`.
-pub const TRACE_FORMAT: &str = "oprobe.trace/8";
+pub const TRACE_FORMAT: &str = "oprobe.trace/9";
 
-/// The formats [`TraceFile`] reads: this one plus 7.x and 6.x files.
-pub const TRACE_FORMATS_READ: &[&str] = &[TRACE_FORMAT, "oprobe.trace/7", "oprobe.trace/6"];
+/// The formats [`TraceFile`] reads.
+pub const TRACE_FORMATS_READ: &[&str] = &[TRACE_FORMAT];
+
+fn default_true() -> bool {
+    true
+}
 
 /// The OpenDAL service the traced operator talks to, as the layer saw it (the first operator
-/// the layer was applied to). No options or credentials: the scheme, the service's name (the
-/// bucket or container) and the root.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// the layer was applied to). No credentials or secret options: the scheme, the service's name
+/// (the bucket or container), the root and the client's transport posture.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(not(feature = "__internal"), non_exhaustive)]
 pub struct ServiceRecord {
     /// The OpenDAL scheme (`s3`, `gcs`, `memory`, ...).
@@ -49,6 +52,28 @@ pub struct ServiceRecord {
     /// The operator's root (`/` by default).
     #[serde(default)]
     pub root: String,
+    /// Configured HTTP version of the traced client (`auto` / `h1` / `h2`).
+    #[serde(default)]
+    pub http_version: crate::HttpVersion,
+    /// Whether connection pooling (`keep_alive`) was enabled on the traced client.
+    #[serde(default = "default_true")]
+    pub keep_alive: bool,
+    /// Configured in-flight HTTP request limit on the traced client, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_inflight_count: Option<usize>,
+}
+
+impl Default for ServiceRecord {
+    fn default() -> Self {
+        Self {
+            scheme: String::new(),
+            name: String::new(),
+            root: String::new(),
+            http_version: crate::HttpVersion::Auto,
+            keep_alive: true,
+            max_inflight_count: None,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -165,10 +190,7 @@ impl TraceFile {
         if !Self::reads(&self.format) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!(
-                    "`{what}` is format `{}`, not `{TRACE_FORMAT}`, `oprobe.trace/7` or `oprobe.trace/6`",
-                    self.format
-                ),
+                format!("`{what}` is format `{}`, not `{TRACE_FORMAT}`", self.format),
             ));
         }
         Ok(self)
@@ -228,15 +250,14 @@ mod tests {
     }
 
     #[test]
-    fn this_major_and_6x_files_read() {
-        assert_eq!(TRACE_FORMAT, "oprobe.trace/8");
-        for f in ["oprobe.trace/8", "oprobe.trace/7", "oprobe.trace/6"] {
-            let t = TraceFile::from_slice(&doc(f), "x").unwrap();
-            assert_eq!(t.format, f);
-            assert!(t.has_rows());
+    fn this_major_reads_and_rejects_others() {
+        assert_eq!(TRACE_FORMAT, "oprobe.trace/9");
+        let t = TraceFile::from_slice(&doc("oprobe.trace/9"), "x").unwrap();
+        assert_eq!(t.format, "oprobe.trace/9");
+        assert!(t.has_rows());
+        for other in ["oprobe.trace/8", "oprobe.trace/7", "oprobe.trace/6", "oprobe.run/7"] {
+            let e = TraceFile::from_slice(&doc(other), "x").unwrap_err();
+            assert!(e.to_string().contains(other), "{e}");
         }
-        let e = TraceFile::from_slice(&doc("oprobe.trace/9"), "x").unwrap_err();
-        assert!(e.to_string().contains("oprobe.trace/9"), "{e}");
-        assert!(TraceFile::from_slice(&doc("oprobe.run/6"), "x").is_err());
     }
 }

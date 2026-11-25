@@ -264,10 +264,14 @@ pub async fn apply_layers_with_recorder(
     }
     if let Some(p) = params("concurrent_limit") {
         let mut layer = ConcurrentLimitLayer::new(count(&p, "permits").unwrap_or(1));
-        if let Some(h) = count(&p, "with_http_concurrent_limit") {
+        let has_http = count(&p, "with_http_concurrent_limit");
+        if let Some(h) = has_http {
             layer = layer.with_http_concurrent_limit(h);
         }
         op = op.layer(layer);
+        if observe && has_http.is_some() {
+            op = op.layer(oprobe_trace::QueueStampLayer);
+        }
     }
     if let Some(p) = params("timeout") {
         op = op.layer(timeout_layer(&p));

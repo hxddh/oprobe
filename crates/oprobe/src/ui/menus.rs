@@ -339,6 +339,51 @@ pub fn primary(s: Store) -> Vec<MenuItem> {
                 .disabled(modal)
                 .on_select(move || s.pick_run_file()),
         );
+    } else {
+        let running = s.running();
+        let proving = s.proving();
+        let sel = s.selection.get_untracked();
+        let one = sel.len() == 1 && s.current.with_untracked(|c| c.is_some());
+        let page = s.page.get_untracked();
+        items.push(
+            MenuItem::new(tr("menu.run_again"))
+                .disabled(modal || running || !one)
+                .on_select(move || s.run_again()),
+        );
+        items.push(
+            MenuItem::new(tr("menu.stop"))
+                .disabled(!running && !proving)
+                .on_select(move || {
+                    s.stop_run();
+                    s.stop_prove();
+                }),
+        );
+        items.push(
+            MenuItem::new(tr("menu.prove"))
+                .disabled(modal || proving || !one)
+                .on_select(move || {
+                    s.page.set(Page::Operator);
+                    s.start_prove();
+                }),
+        );
+        items.push(
+            MenuItem::new(tr("menu.delete"))
+                .disabled(modal || sel.is_empty())
+                .on_select(move || s.ask_delete(sel.clone())),
+        );
+        items.push(MenuItem::separator());
+        items.push(
+            MenuItem::new(tr("nav.profile"))
+                .checked(page == Page::Profile)
+                .disabled(modal)
+                .on_select(move || s.page.set(Page::Profile)),
+        );
+        items.push(
+            MenuItem::new(tr("nav.operator"))
+                .checked(page == Page::Operator)
+                .disabled(modal)
+                .on_select(move || s.page.set(Page::Operator)),
+        );
     }
     items.push(MenuItem::separator());
     items.push(
@@ -399,10 +444,7 @@ pub fn run_context(s: Store, id: &str) {
         ids.clone(),
         ids[0].clone(),
         ids.join(" "),
-        ids.iter()
-            .map(|i| format!("oprobe show {i}"))
-            .collect::<Vec<_>>()
-            .join("\n"),
+        format!("oprobe show {}", ids.join(" ")),
         ids.clone(),
     );
     let items = vec![

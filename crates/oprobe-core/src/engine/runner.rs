@@ -205,6 +205,13 @@ impl Session {
         progress: ProgressFn,
         opts: SessionOptions,
     ) -> Result<Self> {
+        if cancel.is_cancelled() {
+            return Err(crate::errors::OprobeError::new(
+                crate::errors::ErrorCode::RunInterrupted,
+                "run interrupted",
+            )
+            .into());
+        }
         profile.validate()?;
         let mut target = profile.operator.target()?;
         super::operator::prepare_target(&mut target).await?;

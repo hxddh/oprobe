@@ -31,11 +31,6 @@ pub struct ReportInput<'a> {
     pub spec: Option<super::spec::RunSpec>,
 }
 
-/// Percentile of `v` in ms with the one estimator of reports (nearest rank); reorders `v`.
-fn p_ms(v: &mut [u64], q: f64) -> f64 {
-    crate::analysis::stats::quantile_us_ms(v, q)
-}
-
 /// Replace the recorder's histogram percentiles (summary and per verb) with exact ones from
 /// the operation rows, so the report and its findings read the same estimator (design v4
 /// §4). Only when the rows are complete: not sampled, the rows of the window are the
@@ -174,7 +169,6 @@ pub fn headline(r: &Report) -> String {
 /// kept over a plain interruption (the budget is why it was interrupted).
 pub fn mark_partial(run: &mut Run, reason: PartialReason) {
     let r = &mut run.report;
-    r.run.interrupted = true;
     let reason = match &r.run.partial {
         Some(p) if p.reason == PartialReason::Budget => PartialReason::Budget,
         _ => reason,
@@ -187,10 +181,11 @@ pub fn mark_partial(run: &mut Run, reason: PartialReason) {
     finish(run, breached);
 }
 
-fn request_p99(reqs: &[ReqRow]) -> RequestStagesP99 {
+fn request_p99(reqs: &[ReqRow], weights: &HashMap<u64, f64>) -> RequestStagesP99 {
+    let w = |r: &ReqRow| weights.get(&r.op_id).copied().unwrap_or(1.0);
     let col = |f: &dyn Fn(&ReqRow) -> Option<u64>| -> f64 {
-        let mut v: Vec<u64> = reqs.iter().filter_map(f).collect();
-        p_ms(&mut v, 0.99)
+        let mut v: Vec<(u64, f64)> = reqs.iter().filter_map(|r| Some((f(r)?, w(r)))).collect();
+        crate::analysis::stats::weighted_quantile_us_ms(&mut v, 0.99)
     };
     RequestStagesP99 {
         queue_ms: col(&|r| Some(r.queue_us)),
@@ -203,10 +198,18 @@ fn request_p99(reqs: &[ReqRow]) -> RequestStagesP99 {
     }
 }
 
-fn remotes(reqs: &[ReqRow]) -> Vec<RemoteStats> {
+fn remotes(reqs: &[ReqRow], weights: &HashMap<u64, f64>) -> Vec<RemoteStats> {
+    #[derive(Default)]
+    struct RemoteAccum {
+        requests: f64,
+        errors: f64,
+        bytes_down: f64,
+        lat: Vec<(u64, f64)>,
+    }
+
     // `None`: network requests that failed with no connection (a reset, a refused dial), kept
     // in their own row so the table counts every request.
-    let mut by: HashMap<Option<std::net::SocketAddr>, (u64, u64, u64, Vec<u64>)> = HashMap::new();
+    let mut by: HashMap<Option<std::net::SocketAddr>, RemoteAccum> = HashMap::new();
     for r in reqs {
         let key = match r.remote {
             Some(a) => Some(Some(a)),
@@ -214,27 +217,29 @@ fn remotes(reqs: &[ReqRow]) -> Vec<RemoteStats> {
             None => None,
         };
         if let Some(a) = key {
+            let w = weights.get(&r.op_id).copied().unwrap_or(1.0);
             let e = by.entry(a).or_default();
-            e.0 += 1;
-            if r.is_error() && r.status != 404 {
-                e.1 += 1;
+            e.requests += w;
+            let is_cut = r.detail.as_ref().is_some_and(|d| d.cut);
+            if r.is_error() && r.status != 404 && !is_cut {
+                e.errors += w;
             }
-            e.2 += r.bytes_down;
-            e.3.push(r.total_us);
+            e.bytes_down += r.bytes_down as f64 * w;
+            e.lat.push((r.total_us, w));
         }
     }
     let mut out: Vec<RemoteStats> = by
         .into_iter()
-        .map(|(a, (n, err, down, mut lat))| RemoteStats {
+        .map(|(a, mut acc)| RemoteStats {
             remote: a.map_or_else(
                 || crate::analysis::slice::NO_CONNECTION.to_owned(),
                 |a| a.to_string(),
             ),
-            requests_count: n,
-            errors_count: err,
-            bytes_down: down,
-            p50_ms: p_ms(&mut lat, 0.50),
-            p99_ms: p_ms(&mut lat, 0.99),
+            requests_count: acc.requests.round() as u64,
+            errors_count: acc.errors.round() as u64,
+            bytes_down: acc.bytes_down.round() as u64,
+            p50_ms: crate::analysis::stats::weighted_quantile_us_ms(&mut acc.lat, 0.50),
+            p99_ms: crate::analysis::stats::weighted_quantile_us_ms(&mut acc.lat, 0.99),
         })
         .collect();
     out.sort_by(|a, b| {
@@ -350,7 +355,7 @@ fn ensure_slowest(snapshot: &Snapshot, trace: &mut TraceRows) {
             s.key.clone(),
             t_us,
             us(s.latency_ms),
-            0,
+            s.bytes,
             s.error.clone(),
             s.requests.iter().any(|r| r.is_throttle()),
             s.retries,
@@ -445,6 +450,12 @@ pub fn build_run(i: ReportInput<'_>) -> Run {
     } else {
         exit::OK
     };
+    let op_weights: HashMap<u64, f64> = trace
+        .ops
+        .iter()
+        .filter(|o| (o.weight - 1.0).abs() > f64::EPSILON)
+        .map(|o| (o.op_id, o.weight))
+        .collect();
     let c = &snapshot.connections;
     let network = Network {
         tls: TlsInfo {
@@ -461,7 +472,7 @@ pub fn build_run(i: ReportInput<'_>) -> Run {
             dialed_count: c.dialed,
             kernel: crate::net::stats::tcp_kernel(&trace.reqs),
         },
-        remotes: remotes(&trace.reqs),
+        remotes: remotes(&trace.reqs, &op_weights),
     };
     let heatmap = Heatmap::from_timeline(&snapshot.timeline, snapshot.elapsed_s, 120)
         .unwrap_or_else(|| Heatmap::from_ops(&trace.ops, snapshot.elapsed_s, 120));
@@ -476,7 +487,7 @@ pub fn build_run(i: ReportInput<'_>) -> Run {
                 breakdown: v.breakdown,
             })
             .collect(),
-        request_p99: request_p99(&trace.reqs),
+        request_p99: request_p99(&trace.reqs, &op_weights),
     };
     let region = t.options.get("region").cloned();
     let capacity = crate::analysis::capacity::estimate_with(
@@ -510,7 +521,6 @@ pub fn build_run(i: ReportInput<'_>) -> Run {
             started_at: crate::util::fmt_rfc3339(started_at),
             ended_at: crate::util::fmt_rfc3339(ended_at),
             window_s: snapshot.elapsed_s,
-            interrupted,
             partial,
             sampled,
             trace: trace.info.clone(),

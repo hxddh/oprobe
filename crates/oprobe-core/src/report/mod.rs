@@ -195,7 +195,8 @@ pub mod fixture {
             t_us,
             op_id,
             attempt: 1,
-            api: Cow::Borrowed("GetObject"),
+            api: crate::trace::Api::GetObject,
+            service_op: None,
             method: Cow::Borrowed("GET"),
             status,
             protocol: WireProtocol::H1,
@@ -244,6 +245,7 @@ pub mod fixture {
             },
             requests: 1,
             await_tree: None,
+            weight: 1.0,
         };
         let ops = vec![op(1, 1_000, 48_150), op(2, 5_200_000, 900_000)];
         let mut throttled = req(2, 5_200_000, 503, true);

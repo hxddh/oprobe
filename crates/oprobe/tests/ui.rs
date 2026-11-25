@@ -914,3 +914,48 @@ fn concurrent_limit_toggle_seeds_default_and_stored_proves_reload_and_compare_tr
     wait_long(&mut app, "id:compare-table");
     wait_long(&mut app, "text:2 runs compared");
 }
+
+#[test]
+fn standalone_prove_json_opens_without_origin_run_and_fields_clear_without_snapback() {
+    let cx = Ctx::new();
+    let id = cx.seed("lab://clean");
+    let prove_file = {
+        let svc = App::new(cx.paths());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let req = oprobe::app::ProveRequest {
+            run: id.clone(),
+            with: vec!["layers.retry.jitter=on".into()],
+            trial_duration: Some("300ms".into()),
+            budget: Some("1s".into()),
+            ..Default::default()
+        };
+        let out = match rt
+            .block_on(svc.prove(req, EventSink::silent(), Cancel::new()))
+            .unwrap()
+        {
+            oprobe::app::ProveOutcome::Proved(p) => *p,
+            oprobe::app::ProveOutcome::Plan(_) => unreachable!(),
+        };
+        let external = cx.dir.path().join("shared.prove.json");
+        std::fs::write(&external, serde_json::to_vec_pretty(&out).unwrap()).unwrap();
+        // Delete both the origin run and the stored prove so `shared.prove.json` is truly standalone.
+        svc.rm(&[
+            oprobe::app::RunRef::from(out.prove_id.as_str()),
+            oprobe::app::RunRef::from(id.as_str()),
+        ])
+        .unwrap();
+        external
+    };
+    cx.launch(Some(prove_file.to_string_lossy().into_owned()));
+    let mut app = cx.start();
+    choose(&mut app, "English");
+    wait_long(&mut app, "id:operator");
+    wait_long(&mut app, "id:prove-result");
+    wait_long(&mut app, "text:/Pair 1/");
+    // Typing into a parameter field and clearing it never snaps back to the base value.
+    app.type_text("id:layers.retry.max_times", "7").unwrap();
+    wait_long(&mut app, "text:layers.retry.max_times = 7");
+    app.clear("id:layers.retry.max_times").unwrap();
+    app.wait_for_gone("text:layers.retry.max_times = 7", LONG)
+        .unwrap();
+}

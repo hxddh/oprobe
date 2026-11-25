@@ -344,7 +344,7 @@
       "type": "object"
     }
   },
-  "$id": "https://github.com/hxddh/oprobe/schemas/6/operator.json",
+  "$id": "https://github.com/hxddh/oprobe/schemas/9/operator.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "description": "An operator spec (oprobe.operator/6, op.toml): service, layers, read/write and HTTP options",

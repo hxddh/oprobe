@@ -736,10 +736,36 @@ struct MultipartUploadState {
     content_type: Option<String>,
 }
 
+const MAX_COMPLETED_UPLOADS: usize = 1024;
+
+#[derive(Default)]
+struct CompletedUploads {
+    order: std::collections::VecDeque<String>,
+    by_id: HashMap<String, String>,
+}
+
+impl CompletedUploads {
+    fn insert(&mut self, id: String, xml: String) {
+        if !self.by_id.contains_key(&id) {
+            if self.order.len() >= MAX_COMPLETED_UPLOADS
+                && let Some(evicted) = self.order.pop_front()
+            {
+                self.by_id.remove(&evicted);
+            }
+            self.order.push_back(id.clone());
+        }
+        self.by_id.insert(id, xml);
+    }
+
+    fn get(&self, id: &str) -> Option<&String> {
+        self.by_id.get(id)
+    }
+}
+
 struct S3Store {
     objects: RwLock<BTreeMap<String, StoredObject>>,
     uploads: RwLock<HashMap<String, MultipartUploadState>>,
-    completed_uploads: RwLock<HashMap<String, String>>,
+    completed_uploads: RwLock<CompletedUploads>,
     req_seq: AtomicU64,
     upload_seq: AtomicU64,
     active_inflight: AtomicUsize,
@@ -812,6 +838,46 @@ fn parse_query_map(query: Option<&str>) -> HashMap<String, String> {
     map
 }
 
+fn xml_unescape(raw: &str) -> String {
+    if !raw.contains('&') {
+        return raw.to_owned();
+    }
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        let after = &rest[amp + 1..];
+        if let Some(semi) = after.find(';') {
+            let entity = &after[..semi];
+            let decoded = match entity {
+                "lt" => Some('<'),
+                "gt" => Some('>'),
+                "quot" => Some('"'),
+                "apos" => Some('\''),
+                "amp" => Some('&'),
+                _ if entity.starts_with("#x") || entity.starts_with("#X") => {
+                    u32::from_str_radix(&entity[2..], 16)
+                        .ok()
+                        .and_then(char::from_u32)
+                }
+                _ if entity.starts_with('#') => {
+                    entity[1..].parse::<u32>().ok().and_then(char::from_u32)
+                }
+                _ => None,
+            };
+            if let Some(ch) = decoded {
+                out.push(ch);
+                rest = &after[semi + 1..];
+                continue;
+            }
+        }
+        out.push('&');
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
 fn extract_xml_tag_values(xml: &str, tag: &str) -> Vec<String> {
     let open = format!("<{tag}>");
     let close = format!("</{tag}>");
@@ -820,7 +886,7 @@ fn extract_xml_tag_values(xml: &str, tag: &str) -> Vec<String> {
     while let Some(start) = rest.find(&open) {
         let after = &rest[start + open.len()..];
         if let Some(end) = after.find(&close) {
-            out.push(percent_decode(after[..end].trim()));
+            out.push(xml_unescape(after[..end].trim()));
             rest = &after[end + close.len()..];
         } else {
             break;
@@ -930,33 +996,37 @@ async fn serve_s3_request(
         store: store.clone(),
     };
     let req_version = req.version();
-    if let Some((status, code, msg)) = caps::admit(&store, req.method(), req.headers()) {
-        let req_id = format!(
-            "oprobe-s3-req-{:06}",
-            store.req_seq.fetch_add(1, Ordering::Relaxed) + 1
-        );
-        let mut resp = s3_error(status, code, &msg, &req_id);
-        // The body is not read: ask an HTTP/1.x client to close the connection (RFC 9113 §8.2.2
-        // forbids connection-specific headers on HTTP/2+).
-        if req_version < http::Version::HTTP_2 {
-            resp.headers_mut().insert(
-                http::header::CONNECTION,
-                http::HeaderValue::from_static("close"),
+    let upload_guard = match caps::admit(&store, req.method(), req.headers()) {
+        Ok(guard) => guard,
+        Err((status, code, msg)) => {
+            let req_id = format!(
+                "oprobe-s3-req-{:06}",
+                store.req_seq.fetch_add(1, Ordering::Relaxed) + 1
             );
+            let mut resp = s3_error(status, code, &msg, &req_id);
+            // The body is not read: ask an HTTP/1.x client to close the connection (RFC 9113 §8.2.2
+            // forbids connection-specific headers on HTTP/2+).
+            if req_version < http::Version::HTTP_2 {
+                resp.headers_mut().insert(
+                    http::header::CONNECTION,
+                    http::HeaderValue::from_static("close"),
+                );
+            }
+            return Ok(resp);
         }
-        return Ok(resp);
-    }
+    };
     let mut straggle = Duration::ZERO;
-    let resp = handle_s3_request(req, store, cur_inflight, &mut straggle).await;
+    let resp = handle_s3_request(req, &store, upload_guard, cur_inflight, &mut straggle).await;
     if !straggle.is_zero() {
         tokio::time::sleep(straggle).await;
     }
     resp
 }
 
-async fn handle_s3_request(
+async fn handle_s3_request<'a>(
     req: Request<Incoming>,
-    store: Arc<S3Store>,
+    store: &'a Arc<S3Store>,
+    mut upload_guard: Option<caps::InflightGuard<'a>>,
     cur_inflight: usize,
     straggle: &mut Duration,
 ) -> std::result::Result<Response<BoxBody>, std::io::Error> {
@@ -1347,6 +1417,9 @@ async fn handle_s3_request(
                     &req_id,
                 ));
             }
+            if let Some(g) = upload_guard.take() {
+                g.commit();
+            }
             return Ok(Response::builder()
                 .status(StatusCode::OK)
                 .header("etag", etag)
@@ -1360,70 +1433,85 @@ async fn handle_s3_request(
             if !faults.multipart_merge_delay.is_zero() {
                 tokio::time::sleep(faults.multipart_merge_delay).await;
             }
-            let merged_opt = store
-                .uploads
-                .write()
-                .ok()
-                .and_then(|mut ups| ups.remove(upload_id));
-
-            if let Some(st) = &merged_opt
-                && faults.min_part_size > 0
-                && st
-                    .parts
-                    .values()
-                    .rev()
-                    .skip(1)
-                    .any(|p| p.len() < faults.min_part_size)
-            {
-                // Like S3: the upload stays open (the client may abort it).
-                if let (Ok(mut ups), Some(st)) = (store.uploads.write(), merged_opt) {
-                    ups.insert(upload_id.clone(), st);
-                }
-                return Ok(s3_error(
-                    StatusCode::BAD_REQUEST,
-                    "EntityTooSmall",
-                    "Your proposed upload is smaller than the minimum allowed object size.",
-                    &req_id,
-                ));
+            enum MergeStage<'s> {
+                TooSmall,
+                Ready(MultipartUploadState, caps::InflightGuard<'s>),
+                NotFound,
             }
-            if let Some(st) = merged_opt {
-                let total_len: usize = st.parts.values().map(|b| b.len()).sum();
-                let mut merged = BytesMut::with_capacity(total_len);
-                let num_parts = st.parts.len();
-                for (_, p_bytes) in st.parts {
-                    merged.extend_from_slice(&p_bytes);
+            let stage = match store.uploads.write() {
+                Ok(mut ups) => match ups.get(upload_id) {
+                    Some(st)
+                        if faults.min_part_size > 0
+                            && st
+                                .parts
+                                .values()
+                                .rev()
+                                .skip(1)
+                                .any(|p| p.len() < faults.min_part_size) =>
+                    {
+                        MergeStage::TooSmall
+                    }
+                    Some(st) => {
+                        let total_len: usize = st.parts.values().map(|b| b.len()).sum();
+                        let guard = store.usage.hold_inflight(total_len as u64);
+                        let st = ups.remove(upload_id).expect("checked Some");
+                        MergeStage::Ready(st, guard)
+                    }
+                    None => MergeStage::NotFound,
+                },
+                Err(_) => MergeStage::NotFound,
+            };
+            match stage {
+                MergeStage::TooSmall => {
+                    // Like S3: the upload stays open (the client may abort it).
+                    return Ok(s3_error(
+                        StatusCode::BAD_REQUEST,
+                        "EntityTooSmall",
+                        "Your proposed upload is smaller than the minimum allowed object size.",
+                        &req_id,
+                    ));
                 }
-                let frozen = merged.freeze();
-                let crc = crate::util::crc32c(&frozen);
-                let etag = format!("\"{crc:08x}-{num_parts}\"");
+                MergeStage::Ready(st, merge_guard) => {
+                    let total_len: usize = st.parts.values().map(|b| b.len()).sum();
+                    let mut merged = BytesMut::with_capacity(total_len);
+                    let num_parts = st.parts.len();
+                    for (_, p_bytes) in st.parts {
+                        merged.extend_from_slice(&p_bytes);
+                    }
+                    let frozen = merged.freeze();
+                    let crc = crate::util::crc32c(&frozen);
+                    let etag = format!("\"{crc:08x}-{num_parts}\"");
 
-                if let Ok(mut objs) = store.objects.write() {
-                    let mut o = StoredObject::new(frozen, etag.clone());
-                    o.meta = st.meta;
-                    o.content_type = st.content_type;
-                    objs.insert(format!("{}/{}", st.bucket, st.key), o);
+                    if let Ok(mut objs) = store.objects.write() {
+                        let mut o = StoredObject::new(frozen, etag.clone());
+                        o.meta = st.meta;
+                        o.content_type = st.content_type;
+                        objs.insert(format!("{}/{}", st.bucket, st.key), o);
+                    }
+                    merge_guard.commit();
+                    let comp_xml = format!(
+                        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+                         <CompleteMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+                         <Location>http://localhost/{}/{}</Location>\
+                         <Bucket>{}</Bucket><Key>{}</Key><ETag>{}</ETag>\
+                         </CompleteMultipartUploadResult>",
+                        xml_escape(&st.bucket),
+                        xml_escape(&st.key),
+                        xml_escape(&st.bucket),
+                        xml_escape(&st.key),
+                        xml_escape(&etag)
+                    );
+                    if let Ok(mut done) = store.completed_uploads.write() {
+                        done.insert(upload_id.clone(), comp_xml.clone());
+                    }
+                    return Ok(Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "application/xml")
+                        .header("x-amz-request-id", &req_id)
+                        .body(full_body(comp_xml))
+                        .unwrap());
                 }
-                let comp_xml = format!(
-                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
-                     <CompleteMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
-                     <Location>http://localhost/{}/{}</Location>\
-                     <Bucket>{}</Bucket><Key>{}</Key><ETag>{}</ETag>\
-                     </CompleteMultipartUploadResult>",
-                    xml_escape(&st.bucket),
-                    xml_escape(&st.key),
-                    xml_escape(&st.bucket),
-                    xml_escape(&st.key),
-                    xml_escape(&etag)
-                );
-                if let Ok(mut done) = store.completed_uploads.write() {
-                    done.insert(upload_id.clone(), comp_xml.clone());
-                }
-                return Ok(Response::builder()
-                    .status(StatusCode::OK)
-                    .header("content-type", "application/xml")
-                    .header("x-amz-request-id", &req_id)
-                    .body(full_body(comp_xml))
-                    .unwrap());
+                MergeStage::NotFound => {}
             }
             if let Some(prev_xml) = store
                 .completed_uploads
@@ -1459,7 +1547,7 @@ async fn handle_s3_request(
 
     // Standard Single-Object CRUD
     match method {
-        Method::PUT => put_object(req, &store, &bucket, store_key, &req_id).await,
+        Method::PUT => put_object(req, store, upload_guard, &bucket, store_key, &req_id).await,
         Method::HEAD | Method::GET => {
             let is_head = method == Method::HEAD;
             let h = req.headers();
@@ -1585,9 +1673,10 @@ fn user_meta(h: &http::HeaderMap) -> Vec<(String, String)> {
 }
 
 /// PutObject / CopyObject, with conditional writes and checksums.
-async fn put_object(
+async fn put_object<'a>(
     req: Request<Incoming>,
-    store: &S3Store,
+    store: &'a S3Store,
+    upload_guard: Option<caps::InflightGuard<'a>>,
     bucket: &str,
     store_key: String,
     req_id: &str,
@@ -1604,6 +1693,53 @@ async fn put_object(
         .map(|c| c.to_bytes())
         .unwrap_or_default();
     let fail = |status, code: &str, msg: &str| Ok(s3_error(status, code, msg, req_id));
+
+    // Reserve store quota for CopyObject BEFORE taking `objects.write()` so a scan never deadlocks.
+    let copy_reservation = if let Some(raw_src) = &copy_source {
+        let src = percent_decode(raw_src.split('?').next().unwrap_or_default());
+        let src = src.trim_start_matches('/').to_owned();
+        let src_len = store
+            .objects
+            .read()
+            .map_err(|_| std::io::Error::other("lab store poisoned"))?
+            .get(&src)
+            .map(|o| o.data.len() as u64);
+        let Some(src_len) = src_len else {
+            return fail(
+                StatusCode::NOT_FOUND,
+                "NoSuchKey",
+                "The specified key does not exist.",
+            );
+        };
+        if src_len > store.caps.max_object_bytes {
+            return fail(
+                StatusCode::BAD_REQUEST,
+                "EntityTooLarge",
+                &format!(
+                    "Your proposed upload exceeds the maximum allowed size ({} bytes).",
+                    store.caps.max_object_bytes
+                ),
+            );
+        }
+        match store
+            .usage
+            .try_reserve(store, src_len, store.caps.max_store_bytes)
+        {
+            Ok(g) => Some((src, src_len, g)),
+            Err(held) => {
+                return fail(
+                    StatusCode::INSUFFICIENT_STORAGE,
+                    "LabStoreFull",
+                    &format!(
+                        "The lab store is full ({held} bytes held, limit {} bytes): delete objects or restart it with a larger --max-store-size.",
+                        store.caps.max_store_bytes
+                    ),
+                );
+            }
+        }
+    } else {
+        None
+    };
 
     let mut objs = store
         .objects
@@ -1639,9 +1775,7 @@ async fn put_object(
         }
     }
 
-    if let Some(src) = copy_source {
-        let src = percent_decode(src.split('?').next().unwrap_or_default());
-        let src = src.trim_start_matches('/').to_owned();
+    if let Some((src, reserved_len, copy_guard)) = copy_reservation {
         let Some(mut o) = objs.get(&src).cloned() else {
             return fail(
                 StatusCode::NOT_FOUND,
@@ -1649,6 +1783,14 @@ async fn put_object(
                 "The specified key does not exist.",
             );
         };
+        if o.data.len() as u64 > reserved_len {
+            // Source was concurrently replaced by a larger object; enforce cap strictly.
+            return fail(
+                StatusCode::CONFLICT,
+                "OperationAborted",
+                "The source object changed during copy; please retry.",
+            );
+        }
         if header(&h, "x-amz-metadata-directive").is_some_and(|d| d.eq_ignore_ascii_case("REPLACE"))
         {
             o.meta = user_meta(&h);
@@ -1657,10 +1799,12 @@ async fn put_object(
         o.last_modified = std::time::SystemTime::now();
         let etag = o.etag.clone();
         objs.insert(store_key, o);
+        drop(objs);
+        copy_guard.commit();
         let xml = format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
              <CopyObjectResult><LastModified>{}</LastModified><ETag>{}</ETag></CopyObjectResult>",
-            crate::util::compact_utc_now(),
+            crate::util::now_rfc3339(),
             xml_escape(&etag)
         );
         let _ = bucket;
@@ -1688,6 +1832,10 @@ async fn put_object(
     o.content_type = header(&h, "content-type");
     o.checksum_crc32c = checksum.clone();
     objs.insert(store_key, o);
+    drop(objs);
+    if let Some(g) = upload_guard {
+        g.commit();
+    }
     let mut b = Response::builder()
         .status(StatusCode::OK)
         .header("etag", etag)
@@ -1796,6 +1944,13 @@ impl LabServer {
         if faults.throttle_status_code == 0 {
             faults.throttle_status_code = 503;
         }
+        if let Ok(addr) = bind_addr.parse::<SocketAddr>() {
+            caps::check_bind(addr, limits.allow_remote)?;
+        } else {
+            for addr in tokio::net::lookup_host(bind_addr).await? {
+                caps::check_bind(addr, limits.allow_remote)?;
+            }
+        }
         let listener = TcpListener::bind(bind_addr).await?;
         let local_addr = listener.local_addr()?;
         caps::check_bind(local_addr, limits.allow_remote)?;
@@ -1833,7 +1988,7 @@ impl LabServer {
         let store = Arc::new(S3Store {
             objects: RwLock::new(BTreeMap::new()),
             uploads: RwLock::new(HashMap::new()),
-            completed_uploads: RwLock::new(HashMap::new()),
+            completed_uploads: RwLock::new(CompletedUploads::default()),
             req_seq: AtomicU64::new(0),
             upload_seq: AtomicU64::new(0),
             active_inflight: AtomicUsize::new(0),
@@ -1939,5 +2094,63 @@ mod cert_tests {
         assert!(c.not_after.ends_with('Z'));
         assert_eq!(chain.total_bytes, c.der_bytes);
         assert_eq!(chain.min_expiry_days(), Some(c.expires_in_days));
+    }
+
+    #[test]
+    fn batch_delete_xml_preserves_plus_percent_and_entities() {
+        let keys = [
+            "dir/a+b.parquet",
+            "dir/a%2Bb.parquet",
+            "dir/x&y<z>\"'.bin",
+            "dir/nested&amp;lt;.bin",
+        ];
+        let body: String = keys
+            .iter()
+            .map(|k| format!("<Object><Key>{}</Key></Object>", xml_escape(k)))
+            .collect();
+        let xml = format!("<Delete>{body}</Delete>");
+        let parsed = extract_xml_tag_values(&xml, "Key");
+        assert_eq!(parsed, keys);
+    }
+
+    #[test]
+    fn concurrent_store_reservations_never_exceed_cap_or_leak_on_drop() {
+        let store = S3Store {
+            objects: RwLock::new(BTreeMap::new()),
+            uploads: RwLock::new(HashMap::new()),
+            completed_uploads: RwLock::new(CompletedUploads::default()),
+            req_seq: AtomicU64::new(0),
+            upload_seq: AtomicU64::new(0),
+            active_inflight: AtomicUsize::new(0),
+            peak_inflight: AtomicUsize::new(0),
+            emitted_throttles: AtomicU64::new(0),
+            faults: RwLock::new(LabConfig::default()),
+            limits: faults::LimitState::default(),
+            caps: LabLimits {
+                max_store_bytes: 100,
+                ..LabLimits::default()
+            },
+            usage: caps::StoreUsage::default(),
+        };
+        // Two concurrent 60 B uploads against a 100 B cap: only the first is admitted while
+        // in flight, even before anything enters `store.objects`.
+        let g1 = store
+            .usage
+            .try_reserve(&store, 60, 100)
+            .expect("first fits");
+        assert!(store.usage.try_reserve(&store, 60, 100).is_err());
+        // Dropping `g1` (e.g. a throttled or aborted upload) releases the reservation cleanly.
+        drop(g1);
+        let g2 = store
+            .usage
+            .try_reserve(&store, 60, 100)
+            .expect("released after drop");
+        store.objects.write().unwrap().insert(
+            "b/k".into(),
+            StoredObject::new(Bytes::from(vec![0u8; 60]), "\"0\"".into()),
+        );
+        g2.commit();
+        assert!(store.usage.try_reserve(&store, 50, 100).is_err());
+        assert!(store.usage.try_reserve(&store, 40, 100).is_ok());
     }
 }

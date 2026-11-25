@@ -91,7 +91,7 @@ fn scheme_of(cmd: &Command, ctx: &Ctx) -> String {
             .first()
             .and_then(|op| {
                 if let Ok(cfg) = ctx.config()
-                    && let Ok((spec, _)) = crate::operator::resolve::resolve(op, cfg)
+                    && let Ok((spec, _)) = crate::operator::resolve::resolve(op, &cfg)
                 {
                     scheme_from_url(&spec.url)
                 } else {

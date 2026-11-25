@@ -27,10 +27,10 @@
 //! - [`layer`] returns the [`TraceLayer`] to add to an operator and a [`Handle`] to read it.
 //! - [`Handle::snapshot`] returns the aggregates so far ([`Snapshot`]): per API and stage, per
 //!   verb, connections, bytes and a timeline.
-//! - [`Handle::save`] and [`Snapshot::save`] write a `.oprobe` file (format `oprobe.trace/8`).
-//! - [`Exporter`] receives every request as it completes; with the `otel` feature,
-//!   [`otel::OtelExporter`] turns them into OpenTelemetry metrics
-//!   (`http.client.request.duration` with `oprobe.stage` and `oprobe.api`).
+//! - [`Handle::save`] and [`Snapshot::save`] write a `.oprobe` file (format `oprobe.trace/9`).
+//! - [`Exporter`] receives every request, operation and cache lookup as it completes; with the
+//!   `otel` feature, [`otel::OtelExporter`] turns them into OpenTelemetry metrics
+//!   (`http.client.request.duration`, `oprobe.operation.duration` and `oprobe.cache.lookups`).
 //! - [`Config`] sets the row budget, the HTTP client settings and the exporter.
 //!
 //! # How it works
@@ -46,7 +46,7 @@
 //! # Stability
 //!
 //! The items documented here, the `.oprobe` format and the meaning of every field are stable
-//! across 8.x: changes are additive, and public structs and enums are `#[non_exhaustive]`. The
+//! across 9.x: changes are additive, and public structs and enums are `#[non_exhaustive]`. The
 //! `__internal` feature exists for the oprobe binary only and carries no semver promise.
 
 // Half of the recorder (operation scopes, the whole-operation sampler, key dimensions, the
@@ -89,7 +89,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 pub use dims::{DimensionStats, HotKeyStats, SliceStats};
-pub use layer::CacheObserveLayer;
+pub use layer::{CacheObserveLayer, QueueStampLayer};
 pub use net::HttpVersion;
 pub use observe::RetryNotify;
 pub use record::{Api, Protocol, RequestRecord, RequestTiming};
@@ -103,7 +103,7 @@ pub use snapshot::{
 };
 
 internal_use!(file::{ServiceRecord, TRACE_FORMAT, TRACE_FORMATS_READ, TraceFile});
-internal_use!(layer::{InProcessObserveLayer, TraceContextLayer});
+internal_use!(layer::{EnqueuedAt, InProcessObserveLayer, TraceContextLayer});
 internal_use!(observe::{Linker, OperationObserveLayer, error_class, private_key});
 internal_use!(log::{DEFAULT_MAX_REQUESTS, TraceLog, TraceRows});
 internal_use!(record::classify_http);
@@ -255,6 +255,9 @@ pub struct TraceLayer {
     context: Option<TraceContextLayer>,
     service: Arc<std::sync::OnceLock<file::ServiceRecord>>,
     linker: Arc<observe::Linker>,
+    http_version: HttpVersion,
+    keep_alive: bool,
+    max_inflight_count: Option<usize>,
 }
 
 impl std::fmt::Debug for TraceLayer {
@@ -277,6 +280,9 @@ impl opendal_core::raw::Layer for TraceLayer {
                 scheme: info.scheme().to_owned(),
                 name: info.name().to_string(),
                 root: info.root().to_string(),
+                http_version: self.http_version,
+                keep_alive: self.keep_alive,
+                max_inflight_count: self.max_inflight_count,
             };
             if let Some(e) = self.recorder.exporter() {
                 e.on_service(&s.scheme, &s.name, &s.root);
@@ -358,7 +364,13 @@ impl Handle {
     /// # }
     /// ```
     pub fn cache_layer(&self) -> CacheObserveLayer {
-        CacheObserveLayer::new(self.recorder.clone())
+        CacheObserveLayer::with_linker(self.recorder.clone(), self.linker.clone())
+    }
+
+    /// Outermost layer to place outside `ConcurrentLimitLayer` so time spent waiting for an
+    /// HTTP concurrency permit is recorded in the `queue` stage of every request.
+    pub fn queue_layer(&self) -> QueueStampLayer {
+        QueueStampLayer
     }
 
     /// Write a `.oprobe` profile to `path`: the aggregates so far plus the sampled operations
@@ -423,6 +435,9 @@ pub fn layer(cfg: Config) -> (TraceLayer, Handle) {
     if let Some(e) = cfg.exporter.or_else(|| cfg.exporter_factory.map(|f| f())) {
         recorder.set_exporter(e);
     }
+    let http_version = cfg.transport.http;
+    let keep_alive = cfg.transport.keep_alive;
+    let max_inflight_count = cfg.transport.max_inflight;
     let (context, transport_error) =
         match net::FidelityTransport::new(cfg.transport, cfg.https, Some(recorder.clone())) {
             Ok(t) => (Some(TraceContextLayer::new(t)), None),
@@ -436,6 +451,9 @@ pub fn layer(cfg: Config) -> (TraceLayer, Handle) {
             context,
             service: service.clone(),
             linker: linker.clone(),
+            http_version,
+            keep_alive,
+            max_inflight_count,
         },
         Handle {
             recorder,

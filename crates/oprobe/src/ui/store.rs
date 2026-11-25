@@ -133,6 +133,8 @@ pub struct Form {
     pub preset: Signal<&'static str>,
     pub duration: Signal<String>,
     pub concurrency: Signal<String>,
+    /// Existing prefix to read without writing or deleting (`--existing`, read-only).
+    pub existing: Signal<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -192,6 +194,10 @@ pub struct Store {
     run_job: Stored<Option<Job>>,
     prove_job: Stored<Option<Job>>,
     prove_run_id: Stored<Option<String>>,
+    /// Operator `--set` overrides carried over by `Run Again`, cleared when the form is edited.
+    form_set: Stored<Vec<String>>,
+    /// Monotonic generation counter so stale async `load_run` / `compare` completions never overwrite newer selections.
+    load_seq: Stored<u64>,
 }
 
 /// The store of the running app.
@@ -257,6 +263,7 @@ impl Store {
                 preset: signal(PRESETS[0]),
                 duration: signal(String::new()),
                 concurrency: signal(String::new()),
+                existing: signal(String::new()),
             },
             run_state: signal(None),
             prove_state: signal(None),
@@ -280,6 +287,8 @@ impl Store {
             run_job: stored(None),
             prove_job: stored(None),
             prove_run_id: stored(None),
+            form_set: stored(Vec::new()),
+            load_seq: stored(0),
         };
         s.refresh();
         // A run to open, else the newest run is selected.
@@ -312,8 +321,12 @@ impl Store {
                 f.preset.get(),
                 f.duration.get(),
                 f.concurrency.get(),
+                f.existing.get(),
             );
-            untracked(|| s.plan.set(None));
+            untracked(|| {
+                s.plan.set(None);
+                s.form_set.replace(Vec::new());
+            });
         });
         s
     }
@@ -418,9 +431,13 @@ impl Store {
 
     /// Choose the app's language (`None`: follow the system); remembered.
     pub fn set_lang(&self, choice: Option<Lang>) {
+        let resolved = choice.unwrap_or_else(i18n::system);
+        // Set `GLOBAL` before `batch` flushes synchronous effects (such as `menus::install`),
+        // so native menus rebuild immediately in the new language.
+        i18n::set_global(resolved);
         batch(|| {
             self.lang_choice.set(choice);
-            self.lang.set(choice.unwrap_or_else(i18n::system));
+            self.lang.set(resolved);
         });
     }
 
@@ -453,12 +470,20 @@ impl Store {
             Some(_) => return Err("runs.bad_concurrency"),
             None => None,
         };
+        let existing = nonempty(f.existing);
+        let read_only = existing.is_some();
         Ok(RunRequest {
             operators,
+            set: self.form_set.with(|v| v.clone()),
             workload: WorkloadInput {
                 preset: Some(f.preset.get_untracked().to_owned()),
                 duration: nonempty(f.duration),
                 concurrency,
+                existing,
+                ..Default::default()
+            },
+            safety: crate::app::Safety {
+                read_only,
                 ..Default::default()
             },
             ..Default::default()
@@ -583,23 +608,39 @@ impl Store {
             || (ext == "json"
                 && std::fs::read(p)
                     .ok()
-                    .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-                    .is_some_and(|v| v.get("prove_id").is_some() && v.get("verdict").is_some()))
+                    .and_then(|b| crate::app::ProveOutput::from_json_slice(&b).ok())
+                    .is_some())
         {
             match std::fs::read(p).map_err(anyhow::Error::from).and_then(|b| {
-                serde_json::from_slice::<crate::app::ProveOutput>(&b).map_err(Into::into)
+                crate::app::ProveOutput::from_json_slice(&b).map_err(anyhow::Error::msg)
             }) {
                 Ok(out) => {
                     let run_id = out.run_id.clone();
+                    let standalone = data::of_standalone_prove(&out);
                     let proved = jobs::Proved::from_output(out);
                     self.page.set(Page::Operator);
-                    if self.app().store().run_path(&run_id).is_file() {
-                        self.open_run(&run_id);
+                    if !run_id.is_empty() && self.app().store().run_path(&run_id).is_file() {
+                        batch(|| {
+                            self.selection.set(vec![run_id.clone()]);
+                            self.cursor.set(Some(run_id.clone()));
+                            self.anchor.set(Some(run_id.clone()));
+                        });
+                        self.load_run_with(&run_id, Some(proved));
                     } else {
-                        self.prove_state.set(Some(State {
-                            outcome: Some(Outcome::Proved(Box::new(proved))),
-                            ..Default::default()
-                        }));
+                        let seq = self.next_load_seq();
+                        let _ = seq;
+                        batch(|| {
+                            self.loading.set(false);
+                            self.selection.set(Vec::new());
+                            self.compared.set(Vec::new());
+                            self.current.set(Some(Rc::new(standalone)));
+                            self.edits.set(BTreeMap::new());
+                            self.prove_finding.set(None);
+                            self.prove_state.set(Some(State {
+                                outcome: Some(Outcome::Proved(Box::new(proved))),
+                                ..Default::default()
+                            }));
+                        });
                     }
                 }
                 Err(e) => self.say(format!("{e:#}"), Tone::Crit),
@@ -738,8 +779,14 @@ impl Store {
         let n = rows.len();
         let hit = (0..n).map(|k| &rows[(start + k) % n.max(1)]).find(|r| {
             let short = r.id.rsplit('-').next().unwrap_or(&r.id);
-            [short, r.operator.as_str(), r.preset.as_str()]
+            let after_scheme = r
+                .operator
+                .split_once("://")
+                .map(|(_, rest)| rest)
+                .unwrap_or("");
+            [short, r.operator.as_str(), after_scheme, r.preset.as_str()]
                 .iter()
+                .filter(|t| !t.is_empty())
                 .any(|t| t.to_lowercase().starts_with(&typed))
         });
         if let Some(r) = hit {
@@ -747,18 +794,40 @@ impl Store {
         }
     }
 
+    fn next_load_seq(&self) -> u64 {
+        let next = self.load_seq.with(|g| g.wrapping_add(1));
+        self.load_seq.replace(next);
+        next
+    }
+
     /// Select every run of `ids` and show them.
     pub fn show_selection(&self, ids: Vec<String>) {
         self.selection.set(ids.clone());
         match ids.len() {
-            0 => self.current.set(None),
-            1 => self.load_run(&ids[0]),
-            _ => self.compare(ids),
+            0 => {
+                let _ = self.next_load_seq();
+                self.loading.set(false);
+                self.current.set(None);
+                self.compared.set(Vec::new());
+            }
+            1 => {
+                self.compared.set(Vec::new());
+                self.load_run(&ids[0]);
+            }
+            _ => {
+                self.current.set(None);
+                self.compare(ids);
+            }
         }
     }
 
     /// Load stored run `id` (or a run file) as the current run.
     fn load_run(&self, id: &str) {
+        self.load_run_with(id, None);
+    }
+
+    fn load_run_with(&self, id: &str, preferred_prove: Option<jobs::Proved>) {
+        let seq = self.next_load_seq();
         let (app, id, s) = (self.app(), id.to_owned(), *self);
         self.loading.set(true);
         self.root.run(|| {
@@ -767,9 +836,17 @@ impl Store {
                     data::profile(&app, &id).map_err(|e| format!("{e:#}"))
                 })
                 .await;
+                if s.load_seq.with(|g| *g) != seq {
+                    return;
+                }
                 s.loading.set(false);
                 match res {
-                    Some(Ok(m)) => batch(|| {
+                    Some(Ok(mut m)) => batch(|| {
+                        if let Some(ref p) = preferred_prove
+                            && !m.proves.iter().any(|x| x.prove_id == p.prove_id)
+                        {
+                            m.proves.insert(0, p.clone());
+                        }
                         let active_prove = s
                             .prove_job
                             .with(|j| j.clone())
@@ -778,14 +855,16 @@ impl Store {
                                     .with(|rid| rid.as_deref() == Some(m.id.as_str()))
                             })
                             .map(|j| j.peek());
-                        let stored_prove = m.proves.first().cloned().map(|p| State {
-                            outcome: Some(Outcome::Proved(Box::new(p))),
-                            ..Default::default()
-                        });
+                        let chosen_prove = preferred_prove
+                            .or_else(|| m.proves.first().cloned())
+                            .map(|p| State {
+                                outcome: Some(Outcome::Proved(Box::new(p))),
+                                ..Default::default()
+                            });
                         s.current.set(Some(Rc::new(m)));
                         s.edits.set(BTreeMap::new());
                         s.prove_finding.set(None);
-                        s.prove_state.set(active_prove.or(stored_prove));
+                        s.prove_state.set(active_prove.or(chosen_prove));
                     }),
                     Some(Err(e)) => s.say(e, Tone::Crit),
                     None => s.say(i18n::tr("app.failed"), Tone::Crit),
@@ -814,17 +893,52 @@ impl Store {
         } else {
             cur.operator_ref.clone()
         };
-        f.operator.set(op_str);
-        if let Some(p) = PRESETS.iter().find(|p| **p == cur.preset) {
-            f.preset.set(p);
-        }
-        if !report.is_trace() {
-            let secs = cur.window_s.round().max(1.0) as u64;
-            f.duration.set(format!("{secs}s"));
-            if cur.setup.rate_per_s.is_none() && cur.setup.concurrency_count > 0 {
-                f.concurrency.set(cur.setup.concurrency_count.to_string());
+        // Carry over `--set` operator overrides when running a URL or configured operator again.
+        let mut overrides = Vec::new();
+        if !report.is_trace() && cur.operator_file.is_none() {
+            let base = self
+                .app()
+                .config()
+                .ok()
+                .and_then(|cfg| cfg.operators.get(&cur.operator_ref).cloned())
+                .unwrap_or_else(|| crate::operator::OperatorSpec::from_url(&cur.operator.url))
+                .redacted();
+            for (_, fields) in data::SECTIONS {
+                for fd in *fields {
+                    let a = data::value_of(&base, fd.path);
+                    let b = data::value_of(&cur.operator, fd.path);
+                    if a != b && !b.is_empty() {
+                        overrides.push(format!("{}={b}", fd.path));
+                    }
+                }
             }
         }
+        batch(|| {
+            f.operator.set(op_str);
+            if let Some(p) = PRESETS.iter().find(|p| **p == cur.preset) {
+                f.preset.set(p);
+            }
+            f.existing.set(
+                report
+                    .spec
+                    .profile
+                    .workload
+                    .dataset
+                    .as_ref()
+                    .and_then(|d| d.existing_prefix.clone())
+                    .unwrap_or_default(),
+            );
+            if !report.is_trace() {
+                let secs = cur.window_s.round().max(1.0) as u64;
+                f.duration.set(format!("{secs}s"));
+                if cur.setup.rate_per_s.is_none() && cur.setup.concurrency_count > 0 {
+                    f.concurrency.set(cur.setup.concurrency_count.to_string());
+                } else {
+                    f.concurrency.set(String::new());
+                }
+            }
+        });
+        self.form_set.replace(overrides);
         if !report.is_trace() && untracked(|| self.form_is_lab()) {
             self.start_run();
         } else {
@@ -1044,6 +1158,7 @@ impl Store {
 
     /// Compare runs `ids` side by side (each loaded with `App::show`).
     pub fn compare(&self, ids: Vec<String>) {
+        let seq = self.next_load_seq();
         let (app, s) = (self.app(), *self);
         self.loading.set(true);
         self.root.run(|| {
@@ -1055,6 +1170,9 @@ impl Store {
                         .map_err(|e| format!("{e:#}"))
                 })
                 .await;
+                if s.load_seq.with(|g| *g) != seq {
+                    return;
+                }
                 s.loading.set(false);
                 match res {
                     Some(Ok(ms)) => s.compared.set(ms.into_iter().map(Rc::new).collect()),
@@ -1206,8 +1324,26 @@ impl Store {
                 match pick_save_path(dialog).await {
                     Ok(Some(path)) => {
                         let dest = path.to_string_lossy().into_owned();
-                        match s.app().save_operator_target(&dest, &cur.operator, &edits) {
-                            Ok(_) => {
+                        // Resolve unredacted operator from `[operators.NAME]` in config.toml when
+                        // the run came from a named operator, preserving its `${ENV}` placeholders
+                        // and secrets, while keeping the run's layers/read/write/http settings.
+                        let mut base_spec = s
+                            .app()
+                            .config()
+                            .ok()
+                            .and_then(|cfg| cfg.operators.get(&cur.operator_ref).cloned())
+                            .unwrap_or_else(|| cur.operator.clone());
+                        base_spec.layers = cur.operator.layers.clone();
+                        base_spec.read = cur.operator.read.clone();
+                        base_spec.write = cur.operator.write.clone();
+                        base_spec.http = cur.operator.http.clone();
+                        match s.app().write_operator_file(
+                            cur.operator_file.as_deref(),
+                            &path,
+                            &base_spec,
+                            &edits,
+                        ) {
+                            Ok(spec) => {
                                 let name = path
                                     .file_name()
                                     .map(|n| n.to_string_lossy().into_owned())
@@ -1216,13 +1352,16 @@ impl Store {
                                     .with_untracked(|c| c.as_ref().map(|m| &m.id) == Some(&cur.id))
                                 {
                                     let mut updated = (*cur).clone();
+                                    updated.operator_ref = dest.clone();
                                     updated.operator_file = Some(path);
-                                    if let Ok(raw) = std::fs::read_to_string(&dest)
-                                        && let Ok(spec) = crate::operator::OperatorSpec::parse(&raw)
-                                    {
-                                        updated.operator = spec.redacted();
-                                    }
-                                    s.current.set(Some(Rc::new(updated)));
+                                    updated.operator = spec.redacted();
+                                    batch(|| {
+                                        s.current.set(Some(Rc::new(updated)));
+                                        s.edits.set(BTreeMap::new());
+                                    });
+                                }
+                                if let Ok(cfg_ops) = s.app().configured_operators() {
+                                    s.configured.set(cfg_ops);
                                 }
                                 s.say(i18n::trf("operator.saved_toml", &[&name]), Tone::Ok);
                             }

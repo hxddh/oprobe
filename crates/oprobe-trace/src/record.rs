@@ -71,13 +71,14 @@ impl Api {
         Api::Other,
     ];
 
-    /// Inverse of [`Api::label`]; unknown names are [`Api::Other`].
+    /// Inverse of [`Api::label`] (also accepts provider `ServiceOperation` names); unknown
+    /// names are [`Api::Other`].
     pub fn from_label(s: &str) -> Api {
         Api::ALL
             .iter()
             .copied()
             .find(|a| a.label() == s)
-            .unwrap_or(Api::Other)
+            .unwrap_or_else(|| Api::from_service_operation(s))
     }
 
     pub fn label(&self) -> &'static str {

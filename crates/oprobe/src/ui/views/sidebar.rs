@@ -313,7 +313,13 @@ fn row(
     focused: Signal<bool>,
 ) -> View {
     let id = r.id.clone();
-    let (sel_id, ctx_id, menu_id) = (id.clone(), id.clone(), id.clone());
+    let (sel_id, ctx_id, menu_id, cur_id) = (id.clone(), id.clone(), id.clone(), id.clone());
+    let row_ref = element_ref();
+    effect(move || {
+        if s.cursor.get().as_deref() == Some(cur_id.as_str()) {
+            row_ref.reveal(nsh_core::RevealOptions::default());
+        }
+    });
     let a11y = format!("{} ({n}/{total})", fill("runs.open", &[&id]));
     let selected = computed(move || s.selection.with(|v| v.contains(&sel_id)));
     let marked = computed(move || {
@@ -348,6 +354,7 @@ fn row(
             ..Default::default()
         })
         .test_id(&format!("run-{}", r.id))
+        .element_ref(&row_ref)
         .flex_row()
         .items_center()
         .gap(px(8.0))

@@ -54,29 +54,103 @@ pub fn check_bind(addr: SocketAddr, allow_remote: bool) -> anyhow::Result<()> {
     .into())
 }
 
-/// Bytes held by the store, estimated cheaply: the last exact count plus every body accepted
-/// since. The exact count (a scan) is taken only when the estimate nears the cap, so deletes
-/// are accounted for lazily and the common path costs one atomic add.
+/// Bytes held by the store, estimated cheaply and race-freely: the last exact scan plus net
+/// committed bytes since that scan plus every body currently streaming in flight. Failed,
+/// throttled or aborted uploads drop their [`InflightGuard`] without incrementing `committed`,
+/// and concurrent uploads atomically reserve against `max_store_bytes` via CAS on `inflight`.
 #[derive(Debug, Default)]
 pub(super) struct StoreUsage {
-    base: AtomicU64,
-    pending: AtomicU64,
+    base_bytes: AtomicU64,
+    base_committed: AtomicU64,
+    committed: AtomicU64,
+    inflight: AtomicU64,
+    rescan_lock: std::sync::Mutex<()>,
+}
+
+/// Reservation of `len` bytes for an in-flight upload or multipart merge.
+/// Dropping without [`Self::commit`] releases the reservation immediately.
+pub(super) struct InflightGuard<'a> {
+    usage: &'a StoreUsage,
+    len: u64,
+}
+
+impl InflightGuard<'_> {
+    /// Call right after inserting the object or part into the store.
+    pub(super) fn commit(mut self) {
+        if self.len > 0 {
+            self.usage.committed.fetch_add(self.len, Ordering::AcqRel);
+            self.usage.inflight.fetch_sub(self.len, Ordering::AcqRel);
+            self.len = 0;
+        }
+    }
+}
+
+impl Drop for InflightGuard<'_> {
+    fn drop(&mut self) {
+        if self.len > 0 {
+            self.usage.inflight.fetch_sub(self.len, Ordering::AcqRel);
+        }
+    }
 }
 
 impl StoreUsage {
-    fn estimate(&self) -> u64 {
-        self.base
-            .load(Ordering::Relaxed)
-            .saturating_add(self.pending.load(Ordering::Relaxed))
+    fn current_used(&self, cur_inflight: u64) -> u64 {
+        let c = self.committed.load(Ordering::Acquire);
+        let bc = self.base_committed.load(Ordering::Acquire);
+        let bb = self.base_bytes.load(Ordering::Acquire);
+        bb.saturating_add(c.saturating_sub(bc))
+            .saturating_add(cur_inflight)
     }
 
-    fn reset(&self, exact: u64) {
-        self.base.store(exact, Ordering::Relaxed);
-        self.pending.store(0, Ordering::Relaxed);
+    fn rescan(&self, store: &super::S3Store) {
+        let _g = self.rescan_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let c_before = self.committed.load(Ordering::Acquire);
+        let exact = scan(store);
+        self.base_bytes.store(exact, Ordering::Release);
+        self.base_committed.store(c_before, Ordering::Release);
     }
 
-    fn add(&self, n: u64) {
-        self.pending.fetch_add(n, Ordering::Relaxed);
+    pub(super) fn try_reserve<'a>(
+        &'a self,
+        store: &super::S3Store,
+        len: u64,
+        max: u64,
+    ) -> Result<InflightGuard<'a>, u64> {
+        let mut rescanned = false;
+        loop {
+            let cur_inf = self.inflight.load(Ordering::Acquire);
+            let used = self.current_used(cur_inf);
+            if used.saturating_add(len) <= max {
+                if self
+                    .inflight
+                    .compare_exchange_weak(
+                        cur_inf,
+                        cur_inf.saturating_add(len),
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    return Ok(InflightGuard { usage: self, len });
+                }
+                continue;
+            }
+            if rescanned {
+                return Err(used);
+            }
+            self.rescan(store);
+            rescanned = true;
+        }
+    }
+
+    /// Hold already-stored bytes in `inflight` while moving them (e.g. multipart completion
+    /// between removing staged parts from `uploads` and inserting the merged object into
+    /// `objects`) so a concurrent scan never misses them.
+    pub(super) fn hold_inflight(&self, len: u64) -> InflightGuard<'_> {
+        if len > 0 {
+            self.inflight.fetch_add(len, Ordering::AcqRel);
+        }
+        InflightGuard { usage: self, len }
     }
 }
 
@@ -100,19 +174,20 @@ fn scan(store: &super::S3Store) -> u64 {
     objects + staged
 }
 
-/// Why a request is refused before it is read, as `(status, S3 code, message)`.
-pub(super) fn admit(
-    store: &super::S3Store,
+/// Admit a request before its body is read, returning an [`InflightGuard`] when it carries
+/// object bytes, or `(status, S3 code, message)` when refused.
+pub(super) fn admit<'a>(
+    store: &'a super::S3Store,
     method: &Method,
     headers: &http::HeaderMap,
-) -> Option<(StatusCode, &'static str, String)> {
+) -> Result<Option<InflightGuard<'a>>, (StatusCode, &'static str, String)> {
     let limits = &store.caps;
     // PutObject and UploadPart carry object data; POSTs (batch delete, multipart create and
     // complete) only small XML documents.
     let carries_object = *method == Method::PUT && headers.get("x-amz-copy-source").is_none();
     let control = *method == Method::POST;
     if !carries_object && !control {
-        return None;
+        return Ok(None);
     }
     let len = headers
         .get(http::header::CONTENT_LENGTH)
@@ -120,13 +195,14 @@ pub(super) fn admit(
         .and_then(|v| v.trim().parse::<u64>().ok());
     let Some(len) = len else {
         // A PUT of unknown length could stream without bound (S3 answers the same).
-        return carries_object.then(|| {
-            (
+        if carries_object {
+            return Err((
                 StatusCode::LENGTH_REQUIRED,
                 "MissingContentLength",
                 "You must provide the Content-Length HTTP header.".to_owned(),
-            )
-        });
+            ));
+        }
+        return Ok(None);
     };
     let max = if carries_object {
         limits.max_object_bytes
@@ -134,32 +210,26 @@ pub(super) fn admit(
         MAX_CONTROL_BODY_BYTES
     };
     if len > max {
-        return Some((
+        return Err((
             StatusCode::BAD_REQUEST,
             "EntityTooLarge",
             format!("Your proposed upload exceeds the maximum allowed size ({max} bytes)."),
         ));
     }
     if !carries_object {
-        return None;
+        return Ok(None);
     }
-    let usage = &store.usage;
-    if usage.estimate().saturating_add(len) > limits.max_store_bytes {
-        usage.reset(scan(store));
-        if usage.estimate().saturating_add(len) > limits.max_store_bytes {
-            return Some((
-                StatusCode::INSUFFICIENT_STORAGE,
-                "LabStoreFull",
-                format!(
-                    "The lab store is full ({} bytes held, limit {} bytes): delete objects or restart it with a larger --max-store-size.",
-                    usage.estimate(),
-                    limits.max_store_bytes
-                ),
-            ));
-        }
+    match store.usage.try_reserve(store, len, limits.max_store_bytes) {
+        Ok(guard) => Ok(Some(guard)),
+        Err(held) => Err((
+            StatusCode::INSUFFICIENT_STORAGE,
+            "LabStoreFull",
+            format!(
+                "The lab store is full ({held} bytes held, limit {} bytes): delete objects or restart it with a larger --max-store-size.",
+                limits.max_store_bytes
+            ),
+        )),
     }
-    usage.add(len);
-    None
 }
 
 #[cfg(test)]

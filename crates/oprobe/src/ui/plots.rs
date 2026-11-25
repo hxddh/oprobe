@@ -611,6 +611,22 @@ pub fn prove(ab: &[(f64, f64, u64)], p99: bool) -> Option<Plot> {
     })
 }
 
+fn compact_run_labels(ms: &[&ProfileModel]) -> Vec<String> {
+    if ms.len() <= 2 {
+        return ms.iter().map(|m| m.id.clone()).collect();
+    }
+    let shorts: Vec<&str> = ms
+        .iter()
+        .map(|m| m.id.rsplit('-').next().unwrap_or(&m.id))
+        .collect();
+    let unique = (0..shorts.len()).all(|i| shorts[i + 1..].iter().all(|s| *s != shorts[i]));
+    if unique {
+        shorts.into_iter().map(str::to_owned).collect()
+    } else {
+        ms.iter().map(|m| m.id.clone()).collect()
+    }
+}
+
 /// Several runs' series over time from their own start, one line each (`f` picks the
 /// series; runs without it are left out).
 fn overlay(
@@ -619,9 +635,11 @@ fn overlay(
     log: bool,
     f: impl Fn(&TimelineView) -> &[f64],
 ) -> Option<Plot> {
-    let with: Vec<(&ProfileModel, Vec<(f64, f64)>)> = ms
+    let labels = compact_run_labels(ms);
+    let with: Vec<(String, Vec<(f64, f64)>)> = ms
         .iter()
-        .map(|m| {
+        .zip(labels)
+        .map(|(m, label)| {
             let v = f(&m.timeline);
             let pts: Vec<(f64, f64)> = if v.len() == m.timeline.len() {
                 series(&m.timeline, v)
@@ -631,7 +649,7 @@ fn overlay(
             } else {
                 Vec::new()
             };
-            (*m, pts)
+            (label, pts)
         })
         .collect();
     if with.iter().all(|(_, p)| p.is_empty()) {
@@ -651,7 +669,7 @@ fn overlay(
         y_fmt,
         with.into_iter()
             .zip(SERIES.iter().cycle())
-            .map(|((m, pts), tok)| Line::step(m.id.clone(), tok, pts))
+            .map(|((label, pts), tok)| Line::step(label, tok, pts))
             .collect(),
     ))
 }
@@ -673,7 +691,12 @@ pub fn requests_overlay(ms: &[&ProfileModel]) -> Option<Plot> {
 
 /// Several runs' latency distributions as tail plots, one line each.
 pub fn tail_overlay(ms: &[&ProfileModel]) -> Option<Plot> {
-    let series: Vec<(String, &LatencyCdf)> = ms.iter().map(|m| (m.id.clone(), &m.cdf)).collect();
+    let labels = compact_run_labels(ms);
+    let series: Vec<(String, &LatencyCdf)> = labels
+        .into_iter()
+        .zip(ms.iter())
+        .map(|(l, m)| (l, &m.cdf))
+        .collect();
     tail(&series, None)
 }
 

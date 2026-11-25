@@ -54,9 +54,17 @@ fn content(s: Store, m: Rc<ProfileModel>) -> View {
         v = v.child(section_of(s, name, fields, &m, &remedies, edited));
     }
     let has_file = m.operator_file.is_some();
+    let is_trace = m.rows.0.report.is_trace();
+    let has_remedies = !remedies.is_empty();
     let stored_proves = m.proves.clone();
-    v.child(changes(s, m.clone(), edited))
-        .child(prove(s, has_file, stored_proves))
+    v.child(changes(s, m.clone(), edited)).child(prove(
+        s,
+        has_file,
+        is_trace,
+        has_remedies,
+        edited,
+        stored_proves,
+    ))
 }
 
 fn remedy_list(s: Store, m: &ProfileModel) -> View {
@@ -201,7 +209,7 @@ fn field_row(
             } else {
                 base.clone()
             },
-            move || s.edits.with(|e| e.get(path).cloned()).unwrap_or_else(now),
+            move || s.edits.with(|e| e.get(path).cloned()).unwrap_or_default(),
             move |v| s.edit(path, &v),
         )
         .w(px(120.0))
@@ -292,7 +300,16 @@ fn changes(s: Store, m: Rc<ProfileModel>, edited: Edited) -> View {
                 .gap_2()
                 .children(edits.iter().map(|(k, v)| mono(format!("{k} = {v}"))))
                 .child(bad.map(|(p, why)| {
-                    text(format!("{p}: {why}"))
+                    let clean = why
+                        .strip_prefix(&format!("--set {p}="))
+                        .and_then(|r| r.split_once(": ").map(|(_, m)| m))
+                        .unwrap_or(&why);
+                    let msg = if p.is_empty() {
+                        clean.to_owned()
+                    } else {
+                        format!("{p}: {clean}")
+                    };
+                    text(msg)
                         .text_size(px(12.0))
                         .text_color(move || Tone::Crit.color())
                 }))
@@ -309,7 +326,19 @@ fn changes(s: Store, m: Rc<ProfileModel>, edited: Edited) -> View {
     }))
 }
 
-fn prove(s: Store, has_file: bool, stored_proves: Vec<crate::ui::jobs::Proved>) -> View {
+fn prove(
+    s: Store,
+    has_file: bool,
+    is_trace: bool,
+    has_remedies: bool,
+    edited_spec: Edited,
+    stored_proves: Vec<crate::ui::jobs::Proved>,
+) -> View {
+    let can_prove = move || {
+        !is_trace
+            && edited_spec.with(|(_, bad)| bad.is_none())
+            && (has_remedies || s.edits.with(|e| !e.is_empty()))
+    };
     let history =
         (stored_proves.len() > 1).then(|| {
             let count = stored_proves.len();
@@ -410,6 +439,7 @@ fn prove(s: Store, has_file: bool, stored_proves: Vec<crate::ui::jobs::Proved>) 
                             }
                         },
                     )
+                    .disabled(move || !s.proving() && !can_prove())
                     .test_id("prove-start"),
                 ),
         )
@@ -429,7 +459,7 @@ fn prove(s: Store, has_file: bool, stored_proves: Vec<crate::ui::jobs::Proved>) 
 }
 
 fn prove_state(s: Store, st: crate::ui::jobs::State, p99: bool, has_file: bool) -> View {
-    let ps = pairs(&st.trials);
+    let _ = pairs;
     let unit = |v: f64| {
         if p99 {
             fmt::dur_ms(v)
@@ -446,6 +476,10 @@ fn prove_state(s: Store, st: crate::ui::jobs::State, p99: bool, has_file: bool) 
         Some(Outcome::Proved(p)) if !p.ab.is_empty() => p.ab.clone(),
         _ => crate::ui::jobs::ab_live(&st.trials),
     };
+    let ps: Vec<(f64, f64, f64)> = ab
+        .iter()
+        .map(|&(a, b, _)| (a, b, if a > 0.0 { b / a - 1.0 } else { 0.0 }))
+        .collect();
     if let Some(plot) = plots::prove(&ab, p99) {
         v = v.child(view().test_id("prove-chart").child(chart(
             tr("plot.convergence"),

@@ -498,7 +498,7 @@ mod tests {
         req.guard = guard_for(&budgets, &p);
         let m = measure(req).await.unwrap();
         assert_eq!(m.breach.unwrap().budget, "requests");
-        assert!(m.run.report.run.interrupted);
+        assert!(m.run.report.is_partial());
         assert_eq!(m.run.report.verdict.exit_code, exit::BUDGET);
     }
 
@@ -534,7 +534,7 @@ mod tests {
         assert_eq!(at, used);
         assert!(m.breach.is_none(), "{:?}", m.breach);
         assert!(!m.cancelled);
-        assert!(!m.run.report.run.interrupted);
+        assert!(!m.run.report.is_partial());
         assert!(
             m.run.report.run.partial.is_none(),
             "{:?}",
@@ -546,7 +546,7 @@ mod tests {
         let (m, at) = run(used - 1).await;
         assert_eq!(at, used - 1, "no request past the limit");
         assert_eq!(m.breach.as_ref().unwrap().budget, "requests");
-        assert!(m.run.report.run.interrupted);
+        assert!(m.run.report.is_partial());
         assert_eq!(m.run.report.verdict.exit_code, exit::BUDGET);
     }
 

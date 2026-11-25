@@ -262,6 +262,16 @@ fn job_status(s: Store) -> impl IntoElement {
                 (None, Some(st)) => (trf("operator.trials", &[&st.trials.len()]), None),
                 _ => return None,
             };
+            if kit::in_terminal() {
+                return Some(
+                    view()
+                        .flex_row()
+                        .items_center()
+                        .w(px(96.0))
+                        .test_id("job-status")
+                        .child(small(what).tabular_nums().number_of_lines(1)),
+                );
+            }
             Some(
                 view()
                     .gap(px(3.0))

@@ -292,6 +292,17 @@ fn new_run(s: Store) -> View {
                     .w(px(72.0)),
                 ),
         ))
+        .child(form_row(
+            "runs.existing",
+            field(
+                "run-existing",
+                tr("runs.existing"),
+                tr("runs.existing_hint"),
+                move || f.existing.get(),
+                move |v| f.existing.set(v),
+            )
+            .on_submit(move |_: &str| s.submit_new_run()),
+        ))
         .child(plan_part(s))
         .child(small(tr("runs.several")))
         .child(buttons_reactive(
@@ -338,7 +349,11 @@ fn operator_choices(s: Store) -> impl IntoElement {
         .value(move || Some(SharedString::from(s.form.operator.get())))
         .on_change(move |v: &Option<SharedString>| match v.as_deref() {
             Some(PICK) => s.pick_operator_file(),
-            Some(op) => s.form.operator.set(op.to_owned()),
+            Some(op) => s.form.operator.set(if op.ends_with(".toml") {
+                crate::ui::store::quote_operator_arg(op)
+            } else {
+                op.to_owned()
+            }),
             None => {}
         })
         .accessibility_label(tr("runs.choose"))
