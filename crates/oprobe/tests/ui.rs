@@ -15,7 +15,7 @@ use std::time::Duration;
 use nsh_core::element::DialogButtonStyle;
 use nsh_core::platform::{Idiom, Locale, LocaleSettings, Os};
 use nsh_engine::{EngineConfig, Environment, Points, Root, Size};
-use nsh_testing::{DialogAnswer, Headless};
+use nsh_testing::{DialogAnswer, DragOptions, Headless};
 use oprobe::app::{App, Cancel, EventSink, RunOutcome, RunRequest, WorkloadInput};
 use oprobe::store::Paths;
 
@@ -750,7 +750,8 @@ fn a_drag_selects_a_range_and_the_profile_recomputes_it() {
     wait_long(&mut app, "label:/^Requests per second over /");
     wait_long(&mut app, "label:/operations per cell$/");
     // A drag across the goodput chart selects a range: the numbers are the range's.
-    app.drag("id:chart-goodput", right(160.0)).unwrap();
+    app.drag("id:chart-goodput", right(160.0), DragOptions::default())
+        .unwrap();
     wait_long(&mut app, "id:range-bar");
     wait_long(&mut app, "text:/^Selected /");
     wait_long(
@@ -762,7 +763,8 @@ fn a_drag_selects_a_range_and_the_profile_recomputes_it() {
     app.wait_for_gone("id:range-bar", LONG).unwrap();
     wait_long(&mut app, "text:/operations · .* requests · .* measured/");
     // A drag across the heatmap selects one too, and Escape drops it.
-    app.drag("id:heatmap", right(-120.0)).unwrap();
+    app.drag("id:heatmap", right(-120.0), DragOptions::default())
+        .unwrap();
     wait_long(&mut app, "id:range-bar");
     app.press_key("Escape").unwrap();
     app.wait_for_gone("id:range-bar", LONG).unwrap();
@@ -806,7 +808,8 @@ fn findings_apis_and_the_verb_filter_drill_down() {
         "id:distribution >> text:/^Share of operations slower than a latency/",
     );
     // A click on a heatmap cell (a press that barely moves) lists the operations behind it.
-    app.drag("id:heatmap", right(1.0)).unwrap();
+    app.drag("id:heatmap", right(1.0), DragOptions::default())
+        .unwrap();
     wait_long(&mut app, "id:cell-drill");
     wait_long(&mut app, "text:/^Slowest operations at /");
 }
@@ -831,9 +834,9 @@ fn the_profile_shows_every_captured_signal_where_it_explains_something() {
     let mut app = cx.start();
     choose(&mut app, "English");
     wait_long(&mut app, "id:chart-inflight");
-    // In flight with the connections dialed per interval and, faint, the client's CPU.
+    // In flight with the connections dialed per interval (the client's CPU has its own chart,
+    // drawn when the client was saturated).
     wait_long(&mut app, "id:timeline >> text:new connections");
-    wait_long(&mut app, "id:timeline >> text:client CPU (cores)");
     // The same statistics as `oprobe show` in the API table.
     wait_long(&mut app, "id:requests >> text:Total p50 / p99");
     // Each verb with its rates.
@@ -936,6 +939,24 @@ fn standalone_prove_json_opens_without_origin_run_and_fields_clear_without_snapb
             oprobe::app::ProveOutcome::Proved(p) => *p,
             oprobe::app::ProveOutcome::Plan(_) => unreachable!(),
         };
+        // A sized prove: its sweep is plotted with the knee marked.
+        let mut out = out;
+        let mut trial = out.trials[0].clone();
+        trial.kind = oprobe::app::prove::TrialKind::Sizing;
+        trial.pair = None;
+        for (v, feasible) in [("1", true), ("3", true), ("5", false)] {
+            let mut t = trial.clone();
+            t.value = Some(v.into());
+            t.feasible = feasible;
+            out.trials.insert(0, t);
+        }
+        out.sizing = Some(oprobe::app::prove::Sizing {
+            path: "layers.retry.max_times".into(),
+            value: "3".into(),
+            start: "1".into(),
+            feasible: true,
+            unmeasured: None,
+        });
         let external = cx.dir.path().join("shared.prove.json");
         std::fs::write(&external, serde_json::to_vec_pretty(&out).unwrap()).unwrap();
         // Delete both the origin run and the stored prove so `shared.prove.json` is truly standalone.
@@ -952,10 +973,195 @@ fn standalone_prove_json_opens_without_origin_run_and_fields_clear_without_snapb
     wait_long(&mut app, "id:operator");
     wait_long(&mut app, "id:prove-result");
     wait_long(&mut app, "text:/Pair 1/");
+    wait_long(&mut app, "id:prove-sizing");
+    wait_long(&mut app, "text:Sizing sweep · layers.retry.max_times");
+    wait_long(&mut app, "id:prove-notes");
     // Typing into a parameter field and clearing it never snaps back to the base value.
     app.type_text("id:layers.retry.max_times", "7").unwrap();
     wait_long(&mut app, "text:layers.retry.max_times = 7");
     app.clear("id:layers.retry.max_times").unwrap();
     app.wait_for_gone("text:layers.retry.max_times = 7", LONG)
         .unwrap();
+}
+
+/// nsh 0.7's window model: the app root is an invisible host, so an app that declared no
+/// window of its own would show nothing on a desktop. The app opens its one window, `main`,
+/// with its content in it; on macOS Settings is a window of its own beside it.
+#[test]
+fn the_app_opens_its_main_window_with_its_content() {
+    let cx = Ctx::new();
+    let mut app = cx.start();
+    assert_eq!(app.window_ids().unwrap(), vec!["main".to_owned()]);
+    let state = app.window_state("main").unwrap().expect("main is open");
+    assert!(state.visible, "{state:?}");
+    let sidebar = app.screen().layout("id:sidebar").unwrap().expect("drawn");
+    assert!(sidebar.bounds.size.width.0 > 0.0 && sidebar.bounds.size.height.0 > 0.0);
+    drop(app);
+    let mut app = cx.start_on(Os::MacOs, Locale::EN_US);
+    app.press_key("cmd+,").unwrap();
+    wait_long(&mut app, "id:settings-dialog");
+    assert_eq!(
+        app.window_ids().unwrap(),
+        vec!["main".to_owned(), "settings".to_owned()]
+    );
+    // Closing the main window quits (one window: macOS too).
+    app.press_window_close("settings").unwrap();
+    app.wait_for_gone("id:settings-dialog", LONG).unwrap();
+    app.press_window_close("main").unwrap();
+    assert!(app.quit(), "closing the last window quits");
+}
+
+impl Ctx {
+    /// The app on a terminal grid 200 columns wide and 40 rows high.
+    fn start_in_terminal(&self) -> Headless {
+        let viewport = Size::new(Points(200.0 * 8.0), Points(40.0 * 16.0));
+        let config = EngineConfig {
+            viewport,
+            data_dir: Some(self.dir.path().join("app")),
+            environment: Environment {
+                window: viewport,
+                os: Os::Linux,
+                idiom: Idiom::Terminal,
+                locale: Locale::EN_US,
+                locale_settings: LocaleSettings::of(Locale::EN_US),
+                ..Environment::default()
+            },
+            ..EngineConfig::new(Root::of::<oprobe::ui::App>())
+        };
+        let mut app = Headless::start(config).unwrap();
+        app.wait_for("id:sidebar").unwrap();
+        app
+    }
+}
+
+/// Where a view is drawn, top edge (root points).
+fn top(screen: &nsh_testing::Screen, sel: &str) -> f32 {
+    screen
+        .layout(sel)
+        .unwrap()
+        .unwrap_or_else(|| panic!("{sel} is not drawn"))
+        .bounds
+        .origin
+        .y
+        .0
+}
+
+/// On a terminal the content pages from the keyboard (PageDown, Space, Home/End, j/k) wherever
+/// the focus is, and every bar is at least a row high.
+#[test]
+fn the_terminal_pages_the_content_and_draws_its_bars() {
+    let cx = Ctx::new();
+    let id = seed_long(&cx, "lab://throttle");
+    cx.launch(Some(id.clone()));
+    let mut app = cx.start_in_terminal();
+    wait_long(&mut app, "id:tiles");
+    // Bars are a row high: a thinner one rounds to nothing on the grid.
+    let bar = app
+        .screen()
+        .layout("id:time >> id:stage-bar >> nth=0")
+        .unwrap()
+        .expect("the time breakdown's bar");
+    assert!(bar.bounds.size.height.0 >= 16.0, "{:?}", bar.bounds);
+    let y0 = top(app.screen(), "id:tiles");
+    app.press_key("pagedown").unwrap();
+    app.wait_until("PageDown pages the content", LONG, |sc| {
+        top(sc, "id:tiles") < y0 - 160.0
+    })
+    .unwrap();
+    let paged = top(app.screen(), "id:tiles");
+    app.press_key("k").unwrap();
+    app.wait_until("k scrolls back up", LONG, |sc| top(sc, "id:tiles") > paged)
+        .unwrap();
+    app.press_key("home").unwrap();
+    app.wait_until("Home goes to the top", LONG, |sc| {
+        (top(sc, "id:tiles") - y0).abs() < 1.0
+    })
+    .unwrap();
+    app.press_key("space").unwrap();
+    app.wait_until("Space pages too", LONG, |sc| {
+        top(sc, "id:tiles") < y0 - 160.0
+    })
+    .unwrap();
+    // The sections below the first screen are reachable: End shows the last one.
+    app.press_key("end").unwrap();
+    app.wait_until("End reaches the connections", LONG, |sc| {
+        top(sc, "id:connections") < 40.0 * 16.0
+    })
+    .unwrap();
+}
+
+/// The sections 9.1 added: the capacity, the slowest 1 %'s split, the traffic line, every
+/// error code of an API with its errors and throttled columns, and what a range does not
+/// recompute says so.
+#[test]
+fn the_profile_shows_capacity_the_tail_split_traffic_and_whole_run_labels() {
+    let cx = Ctx::new();
+    let id = seed_long(&cx, "lab://throttle");
+    cx.launch(Some(id.clone()));
+    let mut app = cx.start();
+    choose(&mut app, "English");
+    wait_long(&mut app, "id:profile");
+    wait_long(&mut app, "id:time-tail");
+    wait_long(
+        &mut app,
+        "id:time-tail >> text:The slowest 1 % of operations",
+    );
+    wait_long(&mut app, "id:traffic-line");
+    wait_long(&mut app, "id:traffic >> text:/requests per operation$/");
+    wait_long(&mut app, "id:requests >> text:Throttled");
+    wait_long(&mut app, "id:requests >> text:/ · 503 ×/");
+    wait_long(&mut app, "id:retries");
+    wait_long(&mut app, "id:capacity");
+    wait_long(&mut app, "text:Reused connections");
+    // The CPU is drawn only when the client was saturated.
+    assert!(!has(&app, "id:chart-cpu"));
+    // A range: the time breakdown is the range's; retries, connections and traffic say they
+    // are the whole run's.
+    assert!(!has(&app, "id:whole-run"));
+    app.drag("id:chart-goodput", right(160.0), DragOptions::default())
+        .unwrap();
+    wait_long(&mut app, "id:range-bar");
+    wait_long(&mut app, "id:retries >> id:whole-run");
+    wait_long(&mut app, "id:connections >> id:whole-run");
+    wait_long(&mut app, "id:time-tail >> text:/whole run$/");
+    // The verb filter applies to the heatmap too.
+    app.press("id:range-clear").unwrap();
+    app.press("id:verb-filter >> text:stat").unwrap();
+    wait_long(&mut app, "text:/^Request latency over time · stat/");
+}
+
+/// An open-loop run says what it was asked for and what it achieved, and rules its target.
+#[test]
+fn an_open_loop_run_shows_its_schedule() {
+    let cx = Ctx::new();
+    let svc = App::new(cx.paths());
+    let req = RunRequest {
+        operators: vec!["lab://demo".into()],
+        workload: WorkloadInput {
+            rate: Some(200.0),
+            duration: Some("2s".into()),
+            ..small()
+        },
+        ..Default::default()
+    };
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let id = match rt
+        .block_on(svc.run(req, EventSink::silent(), Cancel::new()))
+        .unwrap()
+    {
+        RunOutcome::Run(set) => set.runs[0].run_id.clone(),
+        RunOutcome::Plan(_) => unreachable!(),
+    };
+    cx.launch(Some(id));
+    let mut app = cx.start();
+    choose(&mut app, "English");
+    wait_long(&mut app, "id:chart-goodput");
+    // Missed arrivals are a problem of their own over time.
+    wait_long(&mut app, "id:timeline >> text:missed arrivals");
+    app.press("id:setup").unwrap();
+    wait_long(&mut app, "id:setup-schedule");
+    wait_long(
+        &mut app,
+        "id:setup-body >> text:/^target 200\\/s · achieved /",
+    );
 }

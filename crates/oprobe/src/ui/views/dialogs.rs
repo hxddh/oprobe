@@ -95,6 +95,7 @@ pub fn settings_window(s: Store) -> impl IntoElement {
                 window()
                     .id("settings")
                     .kind(WindowKind::Dialog)
+                    .parent("main")
                     .title(move || tr("settings.title").to_owned())
                     .default_size(size(px(520.0), px(260.0)))
                     .open(move || s.settings_open.get())
@@ -135,6 +136,19 @@ fn buttons_reactive(
     id: &'static str,
 ) -> View {
     let ok = btn(label, move || kind, act).test_id(id);
+    // Run: busy while a run goes on, and what it does for a screen reader.
+    let ok = if id == "run-start" {
+        let s = crate::ui::store::store();
+        ok.busy(move || s.running()).accessibility_hint(move || {
+            Some(SharedString::from(if s.form_is_lab() {
+                tr("runs.start_hint")
+            } else {
+                tr("runs.plan_hint")
+            }))
+        })
+    } else {
+        ok
+    };
     let no = btn(tr("dialog.cancel"), || Kind::Plain, cancel).test_id("dialog-cancel");
     let row = view()
         .flex_row()
@@ -350,7 +364,7 @@ fn operator_choices(s: Store) -> impl IntoElement {
         .on_change(move |v: &Option<SharedString>| match v.as_deref() {
             Some(PICK) => s.pick_operator_file(),
             Some(op) => s.form.operator.set(if op.ends_with(".toml") {
-                crate::ui::store::quote_operator_arg(op)
+                crate::operator::resolve::quote_operator_arg(op)
             } else {
                 op.to_owned()
             }),

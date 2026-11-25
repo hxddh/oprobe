@@ -31,7 +31,7 @@ pub fn stage_token(stage: &str) -> &'static str {
         "server" | "ttfb" => "stage-server",
         "download" | "body" => "stage-download",
         "stall" => "stage-stall",
-        "retry" => "stage-retry",
+        "retry" | "backoff" => "stage-retry",
         _ => "stage-client",
     }
 }
@@ -556,23 +556,31 @@ pub fn empty(
         .child(small(detail).text_center().max_w(px(420.0)))
 }
 
-/// A two-column property row.
+/// The height of a bar (a meter, a stacked share, a waterfall's request): thin in a window,
+/// one whole row on a terminal (a bar thinner than a cell rounds to nothing there).
+pub fn bar_h(window: f32) -> f32 {
+    if in_terminal() { 16.0 } else { window }
+}
+
+/// A two-column property row. On a terminal its name wraps (two lines at most) and its value
+/// wraps rather than being cut.
 pub fn prop(name: impl IntoReactive<SharedString>, value: impl IntoReactive<SharedString>) -> View {
+    let term = in_terminal();
     view()
         .flex_row()
         .gap_2()
         .min_w(px(0.0))
         .child(
             view()
-                .w(px(if in_terminal() { 144.0 } else { 180.0 }))
+                .w(px(if term { 160.0 } else { 180.0 }))
                 .flex_shrink_0()
-                .child(small(name).number_of_lines(1)),
+                .child(small(name).number_of_lines(if term { 2 } else { 1 })),
         )
         .child(
             text(value)
                 .text_size(px(metrics().small + 1.0))
                 .tabular_nums()
-                .number_of_lines(1)
+                .number_of_lines(if term { 3 } else { 1 })
                 .flex_1()
                 .min_w(px(0.0))
                 .selectable(true),
@@ -584,7 +592,7 @@ pub fn meter(ratio: f64, tok: &'static str) -> View {
     let r = ratio.clamp(0.0, 1.0) as f32;
     view()
         .flex_1()
-        .h(px(8.0))
+        .h(px(bar_h(8.0)))
         .min_w(px(40.0))
         .rounded(px(2.0))
         .bg(move || theme().muted)
@@ -624,7 +632,7 @@ fn cell_bar(b: CellBar) -> View {
     view()
         .w(px(CELL_BAR_W))
         .flex_shrink_0()
-        .h(px(8.0))
+        .h(px(bar_h(8.0)))
         .rounded(px(2.0))
         .bg(move || theme().muted)
         .overflow_hidden()

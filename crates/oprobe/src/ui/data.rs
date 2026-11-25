@@ -65,6 +65,9 @@ pub struct FindingRow {
     pub severity: Severity,
     pub cause: String,
     pub evidence: String,
+    /// What its card says under the title (core's [`view::FindingView::card`]: the cause
+    /// unless the headline says it, the evidence in words only without named values).
+    pub card: view::FindingCard,
     pub advice: String,
     /// The named evidence values: key, core's label, the number and its unit (the view
     /// labels them in its language and formats them like the tiles).
@@ -179,10 +182,16 @@ pub struct ProfileModel {
     /// Throttled responses (429/503), retries included.
     pub throttled_count: u64,
     pub stages: Vec<StageBar>,
+    /// The slowest 1 % of operations, by their real stage split (core's `TimeView.tail`).
+    pub tail_stages: Vec<StageBar>,
     pub findings: Vec<FindingRow>,
     pub slowest: Vec<Waterfall>,
     /// The series of the window (every verb).
     pub timeline: view::TimelineView,
+    /// Which timeline charts carry something of their own (core's `TimelineView::layout`).
+    pub layout: view::TimelineLayout,
+    /// The limit the run measured, when it found one.
+    pub capacity: Option<view::CapacityView>,
     /// The verbs the timeline can be filtered to, busiest first.
     pub timeline_verbs: Vec<String>,
     pub heat: Option<Heat>,
@@ -240,10 +249,22 @@ impl ProfileModel {
             .unwrap_or_else(|| self.cdf.clone())
     }
 
+    /// The latency distribution of one verb in the range `[t0, t1)` (`None`: the verb has no
+    /// rows there).
+    pub fn range_cdf_for(&self, t0: f64, t1: f64, verb: &str) -> Option<view::LatencyCdf> {
+        view::LatencyCdf::of_range_verb(&self.rows.0, t0, t1, verb)
+    }
+
+    /// The heatmap of one verb (`None`: every verb, or the rows are sampled).
+    pub fn heat_for(&self, verb: Option<&str>) -> Option<Heat> {
+        let h = view::HeatmapView::for_verb(&self.rows.0.report, &self.rows.0, verb?)?;
+        heat_of(h, &self.timeline)
+    }
+
     /// The time range `[t0, t1)` (seconds into the window), recomputed from the rows.
     pub fn range(&self, t0: f64, t1: f64) -> RangeModel {
         let v = view::RangeView::of(&self.rows.0, t0, t1);
-        let slowest = view::examples(&self.rows.0, &v.slowest_op_ids, 3)
+        let slowest = view::examples(&self.rows.0, &v.slowest_op_ids, view::SLOWEST_COUNT)
             .iter()
             .map(waterfall_of)
             .collect();
@@ -301,48 +322,19 @@ pub fn profile(app: &App, id: &str) -> Result<ProfileModel> {
         },
     };
     let mut m = of_rows(Arc::new(run));
-    if let Ok(proves) = app.store().proves() {
-        m.proves = proves
+    if let Ok(docs) = app.store().proves() {
+        m.proves = view::proves_of_run(docs, &m.id)
             .into_iter()
-            .filter(|v| v.get("run_id").and_then(|x| x.as_str()) == Some(m.id.as_str()))
-            .filter_map(|v| {
-                serde_json::to_vec(&v)
-                    .ok()
-                    .and_then(|b| crate::app::ProveOutput::from_json_slice(&b).ok())
-            })
             .map(super::jobs::Proved::from_output)
             .collect();
     }
     Ok(m)
 }
 
-/// Build a standalone [`ProfileModel`] from a `.prove.json` document when its origin `.oprobe`
-/// run is not present in the local store (e.g. a `.prove.json` shared by a teammate).
+/// A `.prove.json` whose run is not in the local store (a prove shared by a teammate), shown
+/// over the run core makes of it ([`view::prove_run`]).
 pub fn of_standalone_prove(p: &crate::app::ProveOutput) -> ProfileModel {
-    let prof = crate::config::Profile::from_operator(p.operator.redacted());
-    let raw_id = if p.run_id.is_empty() {
-        p.prove_id.clone()
-    } else {
-        p.run_id.clone()
-    };
-    let run_id = crate::model::RunId::parse(&raw_id).unwrap_or_default();
-    let now = std::time::SystemTime::now();
-    let mut run = crate::model::build_run(crate::model::ReportInput {
-        run_id: &run_id,
-        target_name: None,
-        profile: &prof,
-        knobs: &crate::config::Knobs::of(&prof),
-        snapshot: crate::trace::Snapshot::default(),
-        trace: crate::trace::TraceRows::default(),
-        cleanup: crate::engine::CleanupSummary::default(),
-        warnings: Vec::new(),
-        started_at: now,
-        ended_at: now,
-        spec: None,
-    });
-    run.report.run.source = crate::model::RunSource::Trace;
-    let mut m = of_rows(Arc::new(run));
-    m.id = raw_id;
+    let mut m = of_rows(Arc::new(view::prove_run(p)));
     m.proves = vec![super::jobs::Proved::from_output(p.clone())];
     m
 }
@@ -408,8 +400,21 @@ fn of_rows(rows: Arc<Run>) -> ProfileModel {
                 ratio: s.ratio,
             })
             .collect(),
+        tail_stages: time
+            .tail
+            .into_iter()
+            .map(|s| StageBar {
+                key: s.key,
+                ratio: s.ratio,
+            })
+            .collect(),
         findings: findings(r),
-        slowest: view::slowest(run, 3).iter().map(waterfall_of).collect(),
+        slowest: view::slowest(run, view::SLOWEST_COUNT)
+            .iter()
+            .map(waterfall_of)
+            .collect(),
+        layout: timeline.layout(view::TrustView::of(r).client_saturated),
+        capacity: view::CapacityView::of(r),
         timeline,
         timeline_verbs: view::TimelineView::verbs(r),
         heat,
@@ -438,6 +443,7 @@ fn findings(r: &Report) -> Vec<FindingRow> {
         .map(|f| {
             let src = r.findings.iter().find(|x| x.code == f.code);
             FindingRow {
+                card: f.card(&r.verdict.headline),
                 code: f.code.clone(),
                 severity: f.severity,
                 cause: f.cause,
@@ -562,7 +568,10 @@ fn waterfall_of(w: &view::WaterfallOp) -> Waterfall {
 }
 
 fn heat(r: &Report, run: &Run, t: &view::TimelineView) -> Option<Heat> {
-    let h = view::HeatmapView::of(r, Some(run));
+    heat_of(view::HeatmapView::of(r, Some(run)), t)
+}
+
+fn heat_of(h: view::HeatmapView, t: &view::TimelineView) -> Option<Heat> {
     if h.counts.is_empty() {
         return None;
     }

@@ -62,6 +62,12 @@ pub struct Proved {
     pub change: Vec<String>,
     pub rust: String,
     pub toml: String,
+    /// The sizing sweep (core's [`crate::report::view::SizingView`]) and the path it sized.
+    pub sizing: Vec<crate::report::view::SizingView>,
+    pub sized_path: Option<String>,
+    /// What the prove notes about its method, and where it ran.
+    pub notes: Vec<String>,
+    pub environment: String,
 }
 
 impl Proved {
@@ -69,6 +75,7 @@ impl Proved {
     /// UI's [`Proved`] summary.
     pub fn from_output(p: crate::app::ProveOutput) -> Self {
         use crate::app::prove::TrialKind;
+        let v = crate::report::view::ProveView::of(&p);
         let p99 = p.objective == crate::app::ProveObjective::P99;
         let trial_ids = (0..p.pairs_count).rev().find_map(|pair| {
             let a = p
@@ -100,6 +107,10 @@ impl Proved {
             change: p.change,
             rust: p.diff.rust,
             toml: p.diff.toml,
+            sizing: v.sizing,
+            sized_path: v.sized_path,
+            notes: v.notes,
+            environment: v.environment,
         }
     }
 }
@@ -289,23 +300,10 @@ impl Job {
 
     /// `App::run`: measure the operators of `req` one after another.
     pub fn run(app: App, req: RunRequest) -> Self {
-        let scheme = req
-            .operators
-            .first()
-            .and_then(|op| {
-                if let Ok(cfg) = app.config()
-                    && let Ok((spec, _)) = crate::operator::resolve::resolve(op, &cfg)
-                {
-                    crate::config::TargetSpec::from_url(&spec.url)
-                        .ok()
-                        .map(|t| t.scheme)
-                } else {
-                    crate::config::TargetSpec::from_url(op)
-                        .ok()
-                        .map(|t| t.scheme)
-                }
-            })
-            .unwrap_or_else(|| "s3".into());
+        let scheme = req.operators.first().map_or_else(
+            || "s3".to_owned(),
+            |op| crate::operator::resolve::scheme_of(op, app.config().ok().as_deref()),
+        );
         let total = req
             .workload
             .duration
@@ -338,10 +336,7 @@ impl Job {
     /// `App::prove`: A/B-test a change of `base` (the run's operator).
     pub fn prove(app: App, req: ProveRequest, base: OperatorSpec) -> Self {
         let p99 = req.objective == crate::app::ProveObjective::P99;
-        let scheme = crate::config::TargetSpec::from_url(&base.url)
-            .ok()
-            .map(|t| t.scheme)
-            .unwrap_or_else(|| "s3".into());
+        let scheme = crate::operator::resolve::scheme_of(&base.url, None);
         let (job, sink) = Self::start(0.0, true);
         let st_trials = job.state.clone();
         sink.bus()

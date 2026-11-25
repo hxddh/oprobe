@@ -7,13 +7,14 @@ use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::time::Duration;
 
-use nsh_core::element::desktop::{main_window, quit};
+use nsh_core::element::desktop::{WindowRef, quit};
 use nsh_core::prelude::*;
 use nsh_core::storage::Storage;
 
 use crate::app::{
     App, ProveObjective, ProveRequest, RunRef, RunRequest, TrashedRuns, WorkloadInput,
 };
+use crate::operator::resolve::{quote_operator_arg, split_operators};
 use crate::ui::data::{self, PlanView, ProfileModel, RunRow};
 use crate::ui::i18n::{self, Lang};
 use crate::ui::jobs::{self, Job, Outcome, State};
@@ -92,9 +93,6 @@ pub const LAB: [&str; 6] = [
 ];
 
 const SETTINGS_KEY: &str = "oprobe.settings";
-/// The main window's placement (`WindowPlacement`), restored at the next start.
-pub const PLACEMENT_KEY: &str = "oprobe.window";
-
 /// The sidebar's width: its default and the range a drag keeps it in.
 pub const SIDEBAR_W: f32 = 248.0;
 pub const SIDEBAR_MIN: f32 = 200.0;
@@ -185,6 +183,9 @@ pub struct Store {
     pub configured: Signal<Vec<String>>,
     /// The operator label of the active `run_job`, frozen when the run starts.
     pub running_label: Signal<String>,
+    /// The app's window (`window().id("main")`) once it opened (nsh 0.7's window model: the
+    /// app root is an invisible host; its commands go to this window).
+    pub window: Signal<Option<WindowRef>>,
     app: Stored<App>,
     data_dir: Stored<String>,
     config_file: Stored<String>,
@@ -279,6 +280,7 @@ impl Store {
             recent: signal(settings.recent),
             configured: signal(configured),
             running_label: signal(String::new()),
+            window: signal(None),
             data_dir: stored(paths.data_dir.display().to_string()),
             config_file: stored(paths.config_file.display().to_string()),
             app: stored(app),
@@ -873,9 +875,36 @@ impl Store {
         });
     }
 
-    /// Put `text` on the clipboard.
+    /// Bring the app's window to the front and focus it (a reopen, files opened with it).
+    pub fn focus_window(&self) {
+        if let Some(w) = self.window.get_untracked() {
+            w.focus();
+        }
+    }
+
+    /// Whether the app's window has the keyboard focus (true before it reports a state, and
+    /// on a terminal).
+    pub fn window_focused(&self) -> bool {
+        self.window
+            .get()
+            .and_then(|w| w.state())
+            .is_none_or(|st| st.focused)
+    }
+
+    /// Put `text` on the clipboard; "Copied" once the system says it took it, a warning when
+    /// it refused (a platform that does not say leaves the notice as it is).
     pub fn copy(&self, text: String) {
-        set_clipboard(text);
+        let answer = set_clipboard(text);
+        let s = *self;
+        self.root.run(|| {
+            spawn(async move {
+                match answer.await {
+                    ClipboardWrite::Written => s.say(i18n::tr("app.copied"), Tone::Ok),
+                    ClipboardWrite::Failed => s.say(i18n::tr("app.copy_failed"), Tone::Warn),
+                    _ => {}
+                }
+            })
+        });
     }
 
     /// Run the selected run's operator and workload again: local `lab://` targets start at
@@ -1000,7 +1029,7 @@ impl Store {
                     let files = next_open_files().await;
                     if !files.is_empty() {
                         s.open_files(&files);
-                        main_window().focus();
+                        s.focus_window();
                     }
                 }
             })
@@ -1034,7 +1063,7 @@ impl Store {
                     if !files.is_empty() {
                         s.open_files(&files);
                     }
-                    main_window().focus();
+                    s.focus_window();
                 }
             })
         });
@@ -1327,16 +1356,11 @@ impl Store {
                         // Resolve unredacted operator from `[operators.NAME]` in config.toml when
                         // the run came from a named operator, preserving its `${ENV}` placeholders
                         // and secrets, while keeping the run's layers/read/write/http settings.
-                        let mut base_spec = s
-                            .app()
-                            .config()
-                            .ok()
-                            .and_then(|cfg| cfg.operators.get(&cur.operator_ref).cloned())
-                            .unwrap_or_else(|| cur.operator.clone());
-                        base_spec.layers = cur.operator.layers.clone();
-                        base_spec.read = cur.operator.read.clone();
-                        base_spec.write = cur.operator.write.clone();
-                        base_spec.http = cur.operator.http.clone();
+                        let base_spec = crate::operator::resolve::save_base(
+                            &cur.operator,
+                            &cur.operator_ref,
+                            s.app().config().ok().as_deref(),
+                        );
                         match s.app().write_operator_file(
                             cur.operator_file.as_deref(),
                             &path,
@@ -1430,7 +1454,9 @@ impl Store {
         if crate::ui::kit::in_terminal() {
             return;
         }
-        let w = main_window();
+        let Some(w) = self.window.get_untracked() else {
+            return;
+        };
         if untracked(|| w.state()).is_none_or(|st| st.focused) {
             return;
         }
@@ -1544,46 +1570,6 @@ pub fn finish_jobs() {
     }
 }
 
-/// Tokenise space-separated operator entries while respecting `"..."` and `'...'` quotes (so
-/// `op.toml` paths chosen from folders with spaces stay whole).
-pub fn split_operators(raw: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut cur = String::new();
-    let mut quote: Option<char> = None;
-    let mut chars = raw.chars().peekable();
-    while let Some(c) = chars.next() {
-        match quote {
-            Some(q) if c == q => quote = None,
-            Some(q) if c == '\\' && q == '"' => {
-                if let Some(next) = chars.next() {
-                    cur.push(next);
-                }
-            }
-            Some(_) => cur.push(c),
-            None if c == '"' || c == '\'' => quote = Some(c),
-            None if c.is_whitespace() => {
-                if !cur.is_empty() {
-                    out.push(std::mem::take(&mut cur));
-                }
-            }
-            None => cur.push(c),
-        }
-    }
-    if !cur.is_empty() {
-        out.push(cur);
-    }
-    out
-}
-
-/// Quote an operator path for the New Run field when it contains whitespace.
-pub fn quote_operator_arg(s: &str) -> String {
-    if s.chars().any(char::is_whitespace) && !s.starts_with('"') {
-        format!("\"{}\"", s.replace('"', "\\\""))
-    } else {
-        s.to_owned()
-    }
-}
-
 /// `%XX` escapes of a `file:` URL's path decoded.
 fn percent_decode(p: &str) -> String {
     let b = p.as_bytes();
@@ -1623,21 +1609,5 @@ mod tests {
             assert_eq!(super::percent_decode("/x/%E4%B8%AD.oprobe"), "/x/中.oprobe");
             assert_eq!(super::percent_decode("/bad%2"), "/bad%2");
         }
-    }
-
-    #[test]
-    fn split_operators_preserves_quoted_paths_with_spaces() {
-        let raw = format!(
-            "{} lab://demo '/another dir/b.toml'",
-            super::quote_operator_arg("/Users/me/My Runs/op.toml")
-        );
-        assert_eq!(
-            super::split_operators(&raw),
-            vec![
-                "/Users/me/My Runs/op.toml",
-                "lab://demo",
-                "/another dir/b.toml"
-            ]
-        );
     }
 }

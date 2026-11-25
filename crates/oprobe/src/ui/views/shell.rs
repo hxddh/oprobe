@@ -5,20 +5,25 @@
 //! Settings, About) are modal over it; Delete and Quit ask with the system's alert. The window
 //! opens where it was left, and files opened from the file manager or dropped on it open. On a
 //! terminal the same structure, one cell high.
+//!
+//! nsh 0.7's window model: the app root is an invisible host, so the app declares its one
+//! window, `window().id("main")` ([`main_window`]); its attributes, progress, close guard and
+//! placement (macOS and Windows) are the window's, and closing it quits the app.
 
 use nsh_base::theme;
-use nsh_core::desktop::{Backdrop, ProgressState, WindowPlacement, WindowProgress};
-use nsh_core::element::desktop::{main_window, on_quit_request, title_bar};
+use nsh_core::desktop::{Backdrop, ProgressState, QuitMode, WindowAttributes, WindowProgress};
+use nsh_core::element::desktop::{
+    Window, current_window, on_quit_request, on_reopen, set_quit_mode, title_bar, window,
+};
 use nsh_core::element::os;
 use nsh_core::platform::Os;
 use nsh_core::prelude::*;
-use nsh_core::storage::Storage;
 
 use crate::ui::i18n::{tr, trf};
 use crate::ui::icons::Icon;
 use crate::ui::kit::{self, Kind, btn, segmented, small, title, tool_btn};
 use crate::ui::menus;
-use crate::ui::store::{Dialog, PLACEMENT_KEY, Page, Store, store};
+use crate::ui::store::{Dialog, Page, Store, store};
 
 /// The toolbar's height where the platform leaves it to the app: macOS's unified toolbar
 /// (52 pt), Windows' title bar with a toolbar (48 px), GNOME's header bar (46 px).
@@ -34,9 +39,11 @@ fn platform_bar_h() -> f32 {
 pub fn install_app_effects(s: Store) {
     if !kit::in_terminal() {
         menus::install(s);
-        dock_progress(s);
-        guard_quit(s);
-        keep_placement();
+        // Closing the window quits on every platform (macOS too: the app has one window).
+        set_quit_mode(QuitMode::LastWindowClosed);
+        on_quit_request(move || s.request_quit());
+        // The Dock icon pressed, or the app launched again: its window comes to the front.
+        on_reopen(move || s.focus_window());
         s.follow_open_files();
         s.follow_second_instance();
     } else {
@@ -339,89 +346,67 @@ fn notice(s: Store) -> impl IntoElement {
     })
 }
 
-/// The running job's progress on the Dock icon or the taskbar button.
-fn dock_progress(s: Store) {
-    effect(move || {
-        let run = s.run_state.get().filter(|st| st.outcome.is_none());
-        let prove = s.prove_state.get().filter(|st| st.outcome.is_none());
-        let progress = match (run, prove) {
-            (Some(st), _) if st.total_s > 0.0 => {
-                let mut p = WindowProgress::default();
-                p.value = Some(Percentage(
-                    (st.elapsed_s / st.total_s).clamp(0.0, 1.0) as f32
-                ));
-                Some(p)
-            }
-            (Some(_), _) | (None, Some(_)) => {
-                let mut p = WindowProgress::default();
-                p.state = ProgressState::Indeterminate;
-                Some(p)
-            }
-            _ => None,
-        };
-        let mut attrs = nsh_core::desktop::WindowAttributes::default();
-        attrs.progress = Some(progress);
-        main_window().set(attrs);
-    });
-}
-
-/// Quitting or closing the window while a run or a prove goes on asks first: the app's Quit
-/// (⌘Q, Ctrl+Q, Exit) is a quit request, and the main window's close button does not close it
-/// while a job runs.
-fn guard_quit(s: Store) {
-    on_quit_request(move || s.request_quit());
+/// The app's window: its chrome ([`chrome`]), its default size, the running job's progress
+/// on the Dock icon or the taskbar button, and the close guard; it opens where it was left on
+/// macOS and Windows. `content` is drawn in it, and its ref is kept in the store for the
+/// commands that go to it (focus, full screen, attention). On a terminal its content is the
+/// screen.
+pub fn main_window<E: IntoElements>(s: Store, content: impl Fn() -> E + 'static) -> Window {
     let busy = computed(move || s.running() || s.proving());
-    effect(move || {
-        let mut attrs = nsh_core::desktop::WindowAttributes::default();
-        attrs.close_on_press = Some(!busy.get());
-        main_window().set(attrs);
-    });
-    main_window().on_close_press(move |_| {
-        if busy.get_untracked() {
-            s.request_quit();
-        }
-    });
+    window()
+        .id("main")
+        .title("oprobe")
+        .default_size(size(px(1280.0), px(860.0)))
+        // On GTK the bounds reported exclude the client-side frame that a restore then
+        // includes, so a restored window would shrink by its frame at every start (and
+        // Wayland places windows itself).
+        .restore_bounds(matches!(os(), Os::MacOs | Os::Windows))
+        .attributes(chrome())
+        .attributes(move || {
+            let mut attrs = WindowAttributes::default();
+            attrs.progress = Some(progress(s));
+            // The close button does not close the window while a job runs: it asks first.
+            attrs.close_on_press = Some(!busy.get());
+            attrs
+        })
+        .on_close_press(move |_| {
+            if busy.get_untracked() {
+                s.request_quit();
+            }
+        })
+        .content(move || {
+            let w = current_window();
+            untracked(|| s.window.set(Some(w)));
+            content()
+        })
 }
 
-/// The window opens where the user left it: its placement is saved as it changes and given
-/// back at the next start (fitted on the displays there are then). macOS and Windows only: on
-/// GTK the bounds nsh 0.6 reports exclude the client-side frame that `set_placement` then
-/// includes, so a restored window shrinks by its frame at every start (and Wayland places
-/// windows itself).
-fn keep_placement() {
-    if !matches!(os(), Os::MacOs | Os::Windows) {
-        return;
-    }
-    let main = main_window();
-    if let Some(p) = Storage::get_item(PLACEMENT_KEY)
-        .and_then(|j| serde_json::from_str::<WindowPlacement>(&j).ok())
-    {
-        main.set_placement(p);
-    }
-    let last = stored(None::<WindowPlacement>);
-    effect(move || {
-        let Some(st) = main.state() else {
-            return;
-        };
-        if last.with(|l| *l == Some(st.placement)) {
-            return;
+/// The running job's progress for the Dock icon or the taskbar button.
+fn progress(s: Store) -> Option<WindowProgress> {
+    let run = s.run_state.get().filter(|st| st.outcome.is_none());
+    let prove = s.prove_state.get().filter(|st| st.outcome.is_none());
+    match (run, prove) {
+        (Some(st), _) if st.total_s > 0.0 => {
+            let mut p = WindowProgress::default();
+            p.value = Some(Percentage(
+                (st.elapsed_s / st.total_s).clamp(0.0, 1.0) as f32
+            ));
+            Some(p)
         }
-        last.replace(Some(st.placement));
-        if let Ok(j) = serde_json::to_string(&st.placement) {
-            let _ = Storage::set_item(PLACEMENT_KEY, j);
+        (Some(_), _) | (None, Some(_)) => {
+            let mut p = WindowProgress::default();
+            p.state = ProgressState::Indeterminate;
+            Some(p)
         }
-    });
+        _ => None,
+    }
 }
 
 /// The window's chrome: the title bar hidden (the toolbar takes its place), the sidebar's
 /// material behind the window on macOS (vibrancy) and Windows 11 (Mica).
-pub fn setup_window() {
-    use nsh_core::desktop::{TitleBarOptions, TitleBarStyle, WindowAttributes};
-    if kit::in_terminal() {
-        return;
-    }
+fn chrome() -> WindowAttributes {
+    use nsh_core::desktop::{TitleBarOptions, TitleBarStyle};
     let mut attrs = WindowAttributes::default();
-    attrs.title = Some("oprobe".into());
     attrs.min_size = Some(Some(size(px(820.0), px(520.0))));
     let mut bar = TitleBarOptions::default();
     bar.style = TitleBarStyle::Hidden;
@@ -434,7 +419,7 @@ pub fn setup_window() {
             Backdrop::Window
         });
     }
-    main_window().set(attrs);
+    attrs
 }
 
 /// On a terminal there is no OS menu bar: bind the full application shortcut set directly.
@@ -489,22 +474,123 @@ fn install_terminal_keys(s: Store) {
         }
     });
     on_key_with("f10", opts, move |_| menus::show_primary(s, None));
+    // The content pages from the keyboard wherever the focus is (the sidebar's list keeps
+    // Up/Down; Space presses a focused control first).
+    for (key, by) in [
+        ("pagedown", ScrollBy::Page(1.0)),
+        ("pageup", ScrollBy::Page(-1.0)),
+        ("space", ScrollBy::Page(1.0)),
+        ("shift+space", ScrollBy::Page(-1.0)),
+        ("home", ScrollBy::Top),
+        ("end", ScrollBy::End),
+        ("j", ScrollBy::Rows(1.0)),
+        ("k", ScrollBy::Rows(-1.0)),
+    ] {
+        let o = KeyOptions {
+            repeat: true,
+            ..not_editing
+        };
+        on_key_with(key, o, move |_| {
+            if free() {
+                scroll_content(by)
+            }
+        });
+    }
 }
 
 /// The frame of the detail's content: scrolling and inset, its width capped and centred on
 /// wide windows.
 pub fn page(body: View) -> impl IntoElement {
     let term = kit::in_terminal();
-    scroll().flex_1().min_h(px(0.0)).child(
-        view().w_full().items_center().child(
-            body.w_full()
-                .px(px(if term { 1.0 } else { 24.0 }))
-                .py(px(if term { 0.0 } else { 20.0 }))
-                .gap(px(if term { 16.0 } else { 20.0 }))
-                .min_w(px(0.0))
-                .max_w(px(1100.0)),
-        ),
-    )
+    let pos = ContentScroll {
+        to: element_ref(),
+        y: signal(0.0),
+        h: signal(0.0),
+        content_h: signal(0.0),
+    };
+    CONTENT.with(|c| c.set(Some(pos)));
+    cleanup(move || {
+        CONTENT.with(|c| {
+            if c.get().is_some_and(|x| x.to == pos.to) {
+                c.set(None)
+            }
+        })
+    });
+    scroll()
+        .flex_1()
+        .min_h(px(0.0))
+        .element_ref(&pos.to)
+        .test_id("content")
+        // On a terminal the content takes the focus (Tab), and its keys page it (T1).
+        .focusable(term)
+        .focus_visible(|s| s)
+        .on_scroll(move |e: &ScrollEvent| {
+            pos.y.set(e.offset.y.0);
+            pos.h.set(e.size.height.0);
+            pos.content_h.set(e.content_size.height.0);
+        })
+        .on_layout(move |b: &Bounds<Points>| pos.h.set(b.size.height.0))
+        .child(
+            view().w_full().items_center().child(
+                body.w_full()
+                    .px(px(if term { 1.0 } else { 24.0 }))
+                    .py(px(if term { 0.0 } else { 20.0 }))
+                    .gap(px(if term { 16.0 } else { 20.0 }))
+                    .min_w(px(0.0))
+                    .max_w(px(1100.0)),
+            ),
+        )
+}
+
+/// The scroll view of the detail's content: where it is, so the keys can page it.
+#[derive(Clone, Copy)]
+struct ContentScroll {
+    to: ElementRef,
+    y: Signal<f32>,
+    h: Signal<f32>,
+    content_h: Signal<f32>,
+}
+
+thread_local! {
+    static CONTENT: std::cell::Cell<Option<ContentScroll>> = const { std::cell::Cell::new(None) };
+}
+
+/// How far a key moves the content.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ScrollBy {
+    /// A screen less one row, down (+1) or up (-1).
+    Page(f32),
+    /// Three rows down (+1) or up (-1).
+    Rows(f32),
+    Top,
+    End,
+}
+
+/// Scroll the detail's content (the terminal's PageUp/PageDown, Space, Home/End, j/k).
+pub fn scroll_content(by: ScrollBy) {
+    let Some(c) = CONTENT.with(|c| c.get()) else {
+        return;
+    };
+    let row = 16.0;
+    let (y, h) = (c.y.get_untracked(), c.h.get_untracked());
+    let max = (c.content_h.get_untracked() - h).max(0.0);
+    let to = match by {
+        ScrollBy::Page(d) => y + d * (h - row).max(row),
+        ScrollBy::Rows(d) => y + d * 3.0 * row,
+        ScrollBy::Top => 0.0,
+        ScrollBy::End => {
+            c.to.scroll_to_end(false);
+            return;
+        }
+    };
+    // Before the first scroll event the content's height is unknown: let the view clamp.
+    let to = if max > 0.0 {
+        to.clamp(0.0, max)
+    } else {
+        to.max(0.0)
+    };
+    c.y.set(to);
+    c.to.scroll_to(nsh_core::geometry::point(px(0.0), px(to)), false);
 }
 
 /// `{}` filled in a translated string.

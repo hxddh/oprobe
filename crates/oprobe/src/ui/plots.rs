@@ -122,17 +122,18 @@ pub fn latency(t: &TimelineView) -> Option<Plot> {
         .chain(&t.p99_ms)
         .copied()
         .fold(0.1, f64::max);
+    let hi = t.max_ms.iter().copied().fold(hi, f64::max);
     let qs = [
         ("p50", 0.5, "series-a", &t.p50_ms),
         ("p99", 0.99, "stage-server", &t.p99_ms),
         ("p99.9", 0.999, "stage-stall", &t.p999_ms),
     ];
-    let lines = qs
+    let mut lines: Vec<Line> = qs
         .iter()
         .map(|(label, q, tok, v)| {
             let keep: Vec<usize> = (0..v.len()).filter(|i| v[*i] > 0.0).collect();
             let reliable = t.reliable(*q);
-            Line::step(
+            let l = Line::step(
                 *label,
                 tok,
                 keep.iter().map(|i| (t.t_s[*i], v[*i])).collect(),
@@ -141,9 +142,23 @@ pub fn latency(t: &TimelineView) -> Option<Plot> {
                 keep.iter()
                     .map(|i| !reliable.get(*i).copied().unwrap_or(true))
                     .collect(),
-            )
+            );
+            // p99.9 often runs just above p99: dashed, so neither hides the other.
+            if *label == "p99.9" { l.dashed() } else { l }
         })
         .collect();
+    // The slowest operation of each interval, faint behind the quantiles.
+    if t.max_ms.len() == t.len() && t.max_ms.iter().any(|v| *v > 0.0) {
+        let keep: Vec<usize> = (0..t.len()).filter(|i| t.max_ms[*i] > 0.0).collect();
+        lines.push(
+            Line::step(
+                tr("plot.max"),
+                "axis",
+                keep.iter().map(|i| (t.t_s[*i], t.max_ms[*i])).collect(),
+            )
+            .faint(),
+        );
+    }
     let mut plot = time_plot(
         t,
         Scale::log(if lo.is_finite() { lo } else { 0.1 }, hi),
@@ -193,21 +208,15 @@ fn per_interval(
 }
 
 /// The most requests in flight at once, interval by interval (where a concurrency limit
-/// shows), the connections dialed in each interval (churn behind a latency spike) and, faint,
-/// the client's CPU in cores busy (its saturation over time) — all counts on one axis.
+/// shows), and the connections dialed in each interval (churn behind a latency spike), both
+/// counts on one axis. The client's CPU has a chart of its own ([`cpu`]).
 pub fn inflight(t: &TimelineView) -> Option<Plot> {
     if t.inflight_peak_count.len() != t.len() || t.inflight_peak_count.iter().all(|n| *n == 0) {
         return None;
     }
     let peak: Vec<f64> = t.inflight_peak_count.iter().map(|n| *n as f64).collect();
     let conns: Vec<f64> = t.new_connections_count.iter().map(|n| *n as f64).collect();
-    let cpu = t.cpu_cores().filter(|c| c.len() == t.len());
-    let top = peak
-        .iter()
-        .chain(&conns)
-        .chain(cpu.iter().flatten())
-        .copied()
-        .fold(0.0, f64::max);
+    let top = peak.iter().chain(&conns).copied().fold(0.0, f64::max);
     let mut lines = vec![Line::step(tr("plot.peak"), "series-a", series(t, &peak))];
     if conns.len() == t.len() && conns.iter().any(|v| *v > 0.0) {
         lines.push(Line::step(
@@ -216,10 +225,45 @@ pub fn inflight(t: &TimelineView) -> Option<Plot> {
             series(t, &conns),
         ));
     }
-    if let Some(cpu) = cpu {
-        lines.push(Line::step(tr("plot.cpu_cores"), "axis", series(t, &cpu)).faint());
-    }
     Some(time_plot(t, Scale::zero_based(top), Unit::Count, lines))
+}
+
+/// The client's CPU in cores busy, interval by interval (drawn when the client was saturated:
+/// [`crate::report::view::TimelineLayout::cpu`]).
+pub fn cpu(t: &TimelineView) -> Option<Plot> {
+    let cpu = t.cpu_cores().filter(|c| c.len() == t.len())?;
+    let top = cpu.iter().copied().fold(0.0, f64::max);
+    Some(time_plot(
+        t,
+        Scale::zero_based(top.max(1.0)),
+        Unit::Count,
+        vec![Line::step(
+            tr("plot.cpu_cores"),
+            "series-a",
+            series(t, &cpu),
+        )],
+    ))
+}
+
+/// A horizontal rule at `y` (a ceiling, a target), the axis grown to show it.
+pub fn with_rule(mut p: Plot, y: f64, token: &'static str, label: String) -> Plot {
+    if y > p.y.max && !p.y.log {
+        p.y = Scale::zero_based(y);
+    }
+    let mut r = Rule::at_y(y, token, label);
+    r.dashed = true;
+    p.rules.push(r);
+    p
+}
+
+/// Goodput read as throughput on a right axis: every operation moved `mib_per_op` MiB.
+pub fn with_throughput_axis(mut p: Plot, mib_per_op: f64) -> Plot {
+    p.y2 = Some((
+        mib_per_op,
+        Unit::MibRate,
+        tr("plot.read_written").to_owned(),
+    ));
+    p
 }
 
 /// Requests sent per second, retries included (the problems have their own chart: on this
@@ -251,6 +295,7 @@ pub fn problems(t: &TimelineView) -> Option<Plot> {
         (tr("plot.retries"), "stage-retry", &t.retries_count),
         (tr("plot.throttled_responses"), "warn", &t.throttled_count),
         (tr("plot.failed_ops"), "crit", &t.errors_count),
+        (tr("plot.missed"), "inconclusive", &t.missed_arrivals_count),
     ]
     .into_iter()
     .filter(|(_, _, c)| c.len() == t.len() && c.iter().any(|n| *n > 0))
@@ -407,6 +452,7 @@ pub fn tail(series: &[(String, &LatencyCdf)], marks: Option<Marks>) -> Option<Pl
         bands: Vec::new(),
         rules: Vec::new(),
         notes: Vec::new(),
+        y2: None,
     };
     if let Some(m) = marks {
         for (v, tok, label) in [
@@ -464,6 +510,7 @@ pub fn concurrency(c: &ConcurrencyView) -> Option<Plot> {
         bands: Vec::new(),
         rules: Vec::new(),
         notes: Vec::new(),
+        y2: None,
     };
     if let Some((est, lo, hi)) = c.ceiling {
         plot.bands.push(Band {
@@ -608,7 +655,64 @@ pub fn prove(ab: &[(f64, f64, u64)], p99: bool) -> Option<Plot> {
         ],
         rules: vec![Rule::at_y(0.0, "axis", "")],
         notes: Vec::new(),
+        y2: None,
     })
+}
+
+/// Prove's sizing sweep: the objective at each value tried, in the order tried, the values
+/// that kept the run feasible joined and the others marked apart, the chosen knee ruled with
+/// its value. The readout names each trial's value.
+pub fn sizing(trials: &[crate::report::view::SizingView], p99: bool) -> Option<Plot> {
+    if trials.is_empty() {
+        return None;
+    }
+    let pts = |feasible: bool| -> Vec<(f64, f64)> {
+        trials
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.feasible == feasible)
+            .map(|(i, t)| ((i + 1) as f64, t.objective))
+            .collect()
+    };
+    let top = trials.iter().map(|t| t.objective).fold(0.0, f64::max);
+    let n = trials.len() as f64;
+    let mut lines = vec![Line::joined(
+        tr("plot.sizing_feasible"),
+        "series-a",
+        pts(true),
+    )];
+    let infeasible = pts(false);
+    if !infeasible.is_empty() {
+        lines.push(Line::dots(tr("plot.sizing_infeasible"), "warn", infeasible));
+    }
+    let mut plot = Plot {
+        x: Scale {
+            min: 0.5,
+            max: n + 0.5,
+            log: false,
+        },
+        y: Scale::zero_based(top),
+        step_w: 1.0,
+        x_fmt: Unit::Count,
+        y_fmt: if p99 { Unit::Ms } else { Unit::Rate },
+        lines,
+        bands: Vec::new(),
+        rules: Vec::new(),
+        notes: trials
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                let x = (i + 1) as f64;
+                (x - 0.5, x + 0.5, trf("plot.sizing_value", &[&t.value]))
+            })
+            .collect(),
+        y2: None,
+    };
+    if let Some((i, t)) = trials.iter().enumerate().find(|(_, t)| t.chosen) {
+        plot.rules
+            .push(Rule::at_x((i + 1) as f64, "ok", t.value.clone()));
+    }
+    Some(plot)
 }
 
 fn compact_run_labels(ms: &[&ProfileModel]) -> Vec<String> {
@@ -727,6 +831,7 @@ mod tests {
             inflight_peak_count: vec![4; n],
             new_connections_count: vec![0; n],
             cpu_pct: Vec::new(),
+            missed_arrivals_count: vec![0; n],
             verb: None,
         }
     }
@@ -801,28 +906,55 @@ mod tests {
     }
 
     #[test]
-    fn the_inflight_chart_draws_new_connections_and_a_faint_cpu() {
+    fn the_inflight_chart_draws_new_connections_and_the_cpu_has_its_own_axis() {
         let mut t = tl(&[(10.0, 10.0, 0, 0, 10), (10.0, 10.0, 0, 0, 10)]);
-        assert_eq!(
-            inflight(&t).unwrap().lines.len(),
-            1,
-            "nothing dialed, no CPU"
-        );
+        assert_eq!(inflight(&t).unwrap().lines.len(), 1, "nothing dialed");
+        assert!(cpu(&t).is_none());
         t.new_connections_count = vec![16, 0];
         t.cpu_pct = vec![Some(250.0), None];
         let p = inflight(&t).unwrap();
-        assert_eq!(p.lines.len(), 3);
+        assert_eq!(p.lines.len(), 2, "CPU is not drawn on the in-flight axis");
         let conns = &p.lines[1];
         assert_eq!(conns.label, tr("plot.new_connections"));
         assert_eq!(conns.mark, crate::ui::chart::Mark::Step);
         assert_eq!(conns.pts[0], (0.0, 16.0));
-        let cpu = &p.lines[2];
-        assert_eq!(cpu.label, tr("plot.cpu_cores"));
-        assert!(cpu.faint);
-        assert_eq!(cpu.pts[0], (0.0, 2.5));
         assert!(p.y.max >= 16.0);
-        // The screen reader hears the in-flight peak, not the faint CPU.
         assert!(p.summary("In flight").contains('4'), "{}", p.summary("x"));
+        let c = cpu(&t).unwrap();
+        assert_eq!(c.lines[0].pts[0], (0.0, 2.5));
+        assert!(c.y.max < 16.0, "its own axis: {:?}", c.y);
+        // A ceiling ruled on it, the axis grown to show it.
+        let r = with_rule(p, 40.0, "warn", "limit 40".into());
+        assert_eq!(r.rules[0].y, Some(40.0));
+        assert!(r.y.max >= 40.0);
+    }
+
+    #[test]
+    fn p999_is_dashed_and_the_max_drawn_faint() {
+        let t = tl(&[(2000.0, 2000.0, 0, 0, 2000), (2000.0, 2000.0, 0, 0, 2000)]);
+        let p = latency(&t).unwrap();
+        let by = |l: &str| p.lines.iter().find(|x| x.label == l).unwrap();
+        assert!(by("p99.9").dashed && !by("p99").dashed);
+        let max = by(tr("plot.max"));
+        assert!(max.faint);
+        assert_eq!(max.pts[0], (0.0, 120.0));
+        assert!(p.y.max >= 120.0);
+        // Missed arrivals are a problem per second of their own.
+        let mut t = t;
+        t.missed_arrivals_count = vec![0, 7];
+        let pr = problems(&t).unwrap();
+        assert!(
+            pr.lines
+                .iter()
+                .any(|l| l.label == tr("plot.missed") && l.pts[1].1 == 7.0)
+        );
+        // Goodput read as throughput on the right.
+        let g = with_throughput_axis(goodput(&t).unwrap(), 0.5);
+        assert!(
+            crate::ui::chart::readout_at(&g, 0.5).contains("1000"),
+            "{}",
+            crate::ui::chart::readout_at(&g, 0.5)
+        );
     }
 
     #[test]
@@ -1003,5 +1135,32 @@ mod tests {
         let f = prove(&few, false).unwrap();
         let last = f.bands[1].pts.last().unwrap();
         assert!(last.1 < 0.0 && last.2 > 0.0, "{last:?}");
+    }
+
+    #[test]
+    fn the_sizing_sweep_marks_the_knee_and_the_infeasible_values() {
+        use crate::report::view::SizingView;
+        let t = |v: &str, o: f64, feasible: bool, chosen: bool| SizingView {
+            value: v.into(),
+            objective: o,
+            throttled_ratio: 0.0,
+            feasible,
+            chosen,
+        };
+        let p = sizing(
+            &[
+                t("8", 100.0, true, false),
+                t("16", 180.0, true, true),
+                t("32", 90.0, false, false),
+            ],
+            false,
+        )
+        .unwrap();
+        assert_eq!(p.lines[0].pts, vec![(1.0, 100.0), (2.0, 180.0)]);
+        assert_eq!(p.lines[1].pts, vec![(3.0, 90.0)]);
+        assert_eq!(p.rules[0].x, Some(2.0));
+        assert_eq!(p.rules[0].label, "16");
+        assert!(p.note_at(3.0).unwrap().contains("32"));
+        assert!(sizing(&[], false).is_none());
     }
 }
