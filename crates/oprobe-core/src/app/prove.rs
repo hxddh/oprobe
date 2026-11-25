@@ -2326,7 +2326,10 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
                     .push(format!("--save `{dest}` failed: {e:#}; the proof is kept"));
             }
         }
-        store_prove(&out)?;
+        // Stored now, if not before: the trials belong to it.
+        if store_prove(&out)? {
+            orphans.armed = false;
+        }
     }
     Ok(ProveOutcome::Proved(Box::new(out)))
 }

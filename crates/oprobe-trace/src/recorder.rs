@@ -935,6 +935,10 @@ impl Recorder {
             // Freeze the window length at the moment measurement ends (unless the runner already
             // closed it at its deadline).
             self.close_window(Instant::now());
+            // The last interval's in-flight peak, before nothing folds it any more.
+            let packed = self.interval_peak.load(Ordering::Acquire);
+            let window_start = self.window_start();
+            self.fold_interval_peak(&mut self.agg(), packed, window_start);
             self.measuring.store(false, Ordering::Release);
         }
         self.phase.store(code, Ordering::Release);
@@ -1021,7 +1025,7 @@ impl Recorder {
         let mut old = self.interval_peak.load(Ordering::Acquire);
         loop {
             let (old_idx, old_peak) = (old >> 32, old & u64::from(u32::MAX));
-            if old_idx > idx || (old_idx == idx && old_peak >= cur) {
+            if old_idx == idx && old_peak >= cur {
                 return;
             }
             match self.interval_peak.compare_exchange_weak(
@@ -1031,6 +1035,8 @@ impl Recorder {
                 Ordering::Acquire,
             ) {
                 Ok(_) => {
+                    // Whichever interval it held (an earlier one, or a later one from a thread
+                    // racing a window reset), the value it replaced is folded, never lost.
                     if old_idx != idx && old_idx != 0 {
                         let mut a = self.agg();
                         self.fold_interval_peak(&mut a, old, window_start);
@@ -1043,13 +1049,20 @@ impl Recorder {
     }
 
     /// Fold a packed [`Self::interval_peak`] into its interval (a max, so folding twice is
-    /// harmless).
+    /// harmless). An interval the timeline no longer holds open (compacted), or one past the
+    /// current window's (stamped against the window before a reset), is dropped rather than
+    /// folded into an unrelated interval.
     fn fold_interval_peak(&self, a: &mut Agg, packed: u64, window_start: Instant) {
         let Some(idx) = (packed >> 32).checked_sub(1) else {
             return;
         };
         let peak = packed & u64::from(u32::MAX);
         let idx = idx as usize;
+        let frozen = self.frozen_elapsed_us.load(Ordering::Acquire);
+        let now = event_bucket(window_start.elapsed().as_micros() as u64, frozen);
+        if idx < a.base || idx > now {
+            return;
+        }
         self.ensure_bucket(a, idx, window_start);
         let b = a.bucket(idx);
         b.inflight_peak = b.inflight_peak.max(peak);
@@ -1670,10 +1683,8 @@ impl Recorder {
     fn snapshot_with(&self, reset: bool, rows: Option<&mut TraceRows>) -> Snapshot {
         let elapsed = self.elapsed_s().max(1e-3);
         let mut a = self.agg();
-        if self.is_measuring() {
-            let packed = self.interval_peak.load(Ordering::Acquire);
-            self.fold_interval_peak(&mut a, packed, self.window_start());
-        }
+        let packed = self.interval_peak.load(Ordering::Acquire);
+        self.fold_interval_peak(&mut a, packed, self.window_start());
         let mib = |b: u64| b as f64 / (1024.0 * 1024.0);
 
         let verbs: Vec<VerbStats> = a
@@ -2269,6 +2280,29 @@ mod tests {
                 schedule_us: None,
             },
         );
+    }
+
+    /// The interval's in-flight peak is kept off the lock; the last interval's is folded when
+    /// measurement ends, before the final snapshot (which runs after `Phase::Verify`).
+    #[test]
+    fn the_last_intervals_inflight_peak_survives_the_end_of_measurement() {
+        let r = Recorder::new();
+        r.set_phase(Phase::Measure);
+        let t0 = r.window_start();
+        for _ in 0..3 {
+            r.request_started();
+        }
+        for _ in 0..3 {
+            r.request_finished();
+        }
+        let data = OpScopeData {
+            requests: vec![req(0, 0, 1000)],
+            ..Default::default()
+        };
+        completion(&r, 1, t0, 1_000, None, data);
+        r.set_phase(Phase::Verify);
+        let s = r.snapshot();
+        assert_eq!(s.timeline[0].inflight_peak, 3, "{:#?}", s.timeline);
     }
 
     #[test]

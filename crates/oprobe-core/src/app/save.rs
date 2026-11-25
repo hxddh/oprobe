@@ -42,6 +42,10 @@ pub struct SavedOperator {
     pub file: Option<PathBuf>,
     /// The operator as saved.
     pub operator: OperatorSpec,
+    /// The OPERATOR argument that runs the saved operator: the file's path, or NAME for
+    /// `[operators.NAME]` of oprobe's own config file. `None` for an entry of another config
+    /// file, which no OPERATOR argument names: the run keeps its reference.
+    pub operator_ref: Option<String>,
 }
 
 fn refuse(msg: String, hint: &str) -> anyhow::Error {
@@ -91,9 +95,12 @@ fn edit_pairs(edits: &[String]) -> Result<Vec<(String, String)>> {
 /// `base` + `pairs` as a new operator: `${ENV}` references kept, secret values and URL
 /// credentials left out (a new file is not where a secret should land).
 fn clean_operator(base: &OperatorSpec, pairs: &[(String, String)]) -> Result<OperatorSpec> {
-    let mut spec = base.redacted();
-    spec.options.retain(|_, v| v.trim() != REDACTED);
+    let mut spec = base.clone();
     spec.apply_edits(pairs)?;
+    spec.validate()?;
+    // Redacted after the edits: a secret value given as an edit is left out too.
+    let mut spec = spec.redacted();
+    spec.options.retain(|_, v| v.trim() != REDACTED);
     spec.validate()?;
     Ok(spec)
 }
@@ -124,7 +131,20 @@ impl App {
         // there, when it came from it.
         let config_entry = |cfg_path: &Path| -> Result<SaveTo> {
             let cfg = ConfigFile::load(cfg_path)?;
-            if cfg.operators.contains_key(operator_ref.trim()) {
+            let name = operator_ref.trim();
+            if let Some(existing) = cfg.operators.get(name)
+                && existing.display_url() != base.display_url()
+            {
+                return Err(refuse(
+                    format!(
+                        "[operators.{name}] of `{dest}` is the operator of `{}`, not of `{}`",
+                        existing.display_url(),
+                        base.display_url()
+                    ),
+                    "save to a new file or to the op.toml of the same service",
+                ));
+            }
+            if cfg.operators.contains_key(name) {
                 Ok(SaveTo::Config {
                     path: cfg_path.to_path_buf(),
                     name: operator_ref.trim().to_owned(),
@@ -223,6 +243,7 @@ impl App {
                 crate::store::atomic_write(&path, spec.to_toml().as_bytes())?;
                 Ok(SavedOperator {
                     to: path.display().to_string(),
+                    operator_ref: Some(path.display().to_string()),
                     file: Some(path),
                     operator: spec,
                 })
@@ -231,19 +252,22 @@ impl App {
                 let spec = patch_operator_file(&path, &pairs)?;
                 Ok(SavedOperator {
                     to: path.display().to_string(),
+                    operator_ref: Some(path.display().to_string()),
                     file: Some(path),
                     operator: spec,
                 })
             }
             SaveTo::Config { path, name } => {
                 let spec = patch_config_operator(&path, &name, base, &pairs)?;
-                if same_path(&path, &self.paths.config_file) {
+                let own = same_path(&path, &self.paths.config_file);
+                if own {
                     self.invalidate_config();
                 }
                 Ok(SavedOperator {
                     to: format!("[operators.{name}] in {}", path.display()),
                     file: None,
                     operator: spec,
+                    operator_ref: own.then_some(name),
                 })
             }
         }
@@ -476,6 +500,9 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&cfg_path).unwrap(), text);
         let saved = app.save_operator(dest, &base, "prod", &edits).unwrap();
         assert_eq!(saved.operator.http_limit(), Some(8));
+        // The run now refers to the entry by name, not to the config file's path.
+        assert_eq!(saved.file, None);
+        assert_eq!(saved.operator_ref.as_deref(), Some("prod"));
         let cfg = app.config().unwrap();
         assert_eq!(cfg.operators["prod"].http_limit(), Some(8));
         assert_eq!(cfg.operators["dev"].url, "memory://");
@@ -488,14 +515,26 @@ mod tests {
         // Another config file, elsewhere, is recognised by its content.
         let other = dir.path().join("team.toml");
         std::fs::write(&other, "[operators.prod]\nurl = \"s3://b/x\"\n").unwrap();
-        app.save_operator(other.to_str().unwrap(), &base, "prod", &edits)
+        let saved = app
+            .save_operator(other.to_str().unwrap(), &base, "prod", &edits)
             .unwrap();
+        // No OPERATOR argument names another config file's entry: the run keeps its reference.
+        assert_eq!(saved.operator_ref, None);
         let t = std::fs::read_to_string(&other).unwrap();
         assert!(
             t.contains("[operators.prod.layers") || t.contains("http = 8"),
             "{t}"
         );
         assert!(!t.starts_with("url"), "{t}");
+        // A config file whose [operators.prod] is another service is refused, unchanged.
+        let foreign = dir.path().join("foreign.toml");
+        let ftext = "[operators.prod]\nurl = \"s3://other/y\"\n";
+        std::fs::write(&foreign, ftext).unwrap();
+        assert!(
+            app.save_operator(foreign.to_str().unwrap(), &base, "prod", &edits)
+                .is_err()
+        );
+        assert_eq!(std::fs::read_to_string(&foreign).unwrap(), ftext);
     }
 
     /// W14: a new file keeps `${ENV}` references and leaves secret values out (9.0's "Save
@@ -516,11 +555,15 @@ mod tests {
                 p.to_str().unwrap(),
                 &base,
                 "prod",
-                &["layers.retry.jitter=on".to_owned()],
+                &[
+                    "layers.retry.jitter=on".to_owned(),
+                    "options.session_token=EDITED-secret-token".to_owned(),
+                ],
             )
             .unwrap();
         let disk = std::fs::read_to_string(&p).unwrap();
         assert!(!disk.contains("wJalrXUtnFEMI-secret"), "{disk}");
+        assert!(!disk.contains("EDITED-secret-token"), "{disk}");
         assert!(!disk.contains("hunter2"), "{disk}");
         assert!(!disk.contains(REDACTED), "{disk}");
         assert!(disk.contains("access_key_id = \"${MY_KEY_ID}\""), "{disk}");

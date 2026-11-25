@@ -1374,16 +1374,23 @@ impl Store {
                         {
                             Ok(saved) => {
                                 let spec = saved.operator;
-                                let name = path
-                                    .file_name()
-                                    .map(|n| n.to_string_lossy().into_owned())
-                                    .unwrap_or_else(|| dest.clone());
+                                let name = match &saved.file {
+                                    Some(f) => f
+                                        .file_name()
+                                        .map(|n| n.to_string_lossy().into_owned())
+                                        .unwrap_or_else(|| saved.to.clone()),
+                                    None => saved.to.clone(),
+                                };
                                 if s.current
                                     .with_untracked(|c| c.as_ref().map(|m| &m.id) == Some(&cur.id))
                                 {
                                     let mut updated = (*cur).clone();
-                                    updated.operator_ref = dest.clone();
-                                    updated.operator_file = Some(path);
+                                    // A config file's entry is no file to run (`saved.file`
+                                    // is `None` then); core says what the run refers to now.
+                                    if let Some(r) = saved.operator_ref {
+                                        updated.operator_ref = r;
+                                    }
+                                    updated.operator_file = saved.file;
                                     updated.operator = spec.redacted();
                                     batch(|| {
                                         s.current.set(Some(Rc::new(updated)));
