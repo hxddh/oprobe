@@ -125,7 +125,7 @@ pub fn entries() -> Vec<Entry> {
         },
         Entry {
             name: "events",
-            description: "One event of a running command (oprobe.events/1), as the app receives them",
+            description: "One event of a running command (oprobe.events/9), as the app receives them",
             input: false,
             build: gen_for::<crate::events::Event>,
         },

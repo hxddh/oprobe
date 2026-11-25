@@ -177,6 +177,15 @@ impl ErrorBody {
         }
     }
 
+    /// The same error filed under `code`: its `retryable` flag and `docs` link follow the code
+    /// (a failure caused by Ctrl-C becomes `run.interrupted`, not an `internal` one).
+    pub fn with_code(mut self, code: ErrorCode) -> Self {
+        self.code = code;
+        self.retryable = code.retryable();
+        self.docs = Some(code.docs());
+        self
+    }
+
     /// Lead with the provider's error code and message when the chain carries one
     /// (`credentials rejected: InvalidAccessKeyId: The AWS Access Key Id …`); the raw chain
     /// moves to `detail`.
@@ -453,6 +462,20 @@ fn typed_code(err: &anyhow::Error) -> Option<ErrorCode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An internal failure caused by Ctrl-C, filed as `run.interrupted`, links that code's
+    /// docs and says it can be retried (9.0 kept `#internal` and `retryable: false`).
+    #[test]
+    fn a_recoded_error_takes_the_docs_and_retryability_of_its_code() {
+        let b = classify(&anyhow::anyhow!("the runtime stopped"), "s3");
+        assert_eq!(b.code, ErrorCode::Internal);
+        assert!(!b.retryable);
+        let b = b.with_code(ErrorCode::RunInterrupted);
+        assert_eq!(b.code, ErrorCode::RunInterrupted);
+        assert!(b.retryable);
+        assert_eq!(b.docs, Some(ErrorCode::RunInterrupted.docs()));
+        assert_ne!(ErrorCode::Internal.docs(), ErrorCode::RunInterrupted.docs());
+    }
 
     #[test]
     fn credentials_in_urls_never_reach_error_messages() {

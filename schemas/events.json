@@ -4457,7 +4457,7 @@
   },
   "$id": "https://github.com/hxddh/oprobe/schemas/9/events.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "description": "One event of a running command (oprobe.events/1), as the app receives them",
+  "description": "One event of a running command (oprobe.events/9), as the app receives them",
   "oneOf": [
     {
       "description": "First line of every stream.",

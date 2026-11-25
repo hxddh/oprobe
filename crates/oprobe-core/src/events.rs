@@ -1,4 +1,4 @@
-//! Events (`oprobe.events/1`, design §7): what a running command reports while it works.
+//! Events (`oprobe.events/9`, design §7): what a running command reports while it works.
 //!
 //! One [`Event`] enum feeds every in-process consumer (the app, Prove's live pairs). Producers emit
 //! into an [`EventBus`]; [`EventBus::progress_fn`] adapts the engine's progress callback
@@ -15,7 +15,7 @@ use crate::model::{Finding, Report};
 use crate::trace::Phase;
 
 /// Schema id of the event stream.
-pub const EVENTS_SCHEMA: &str = "oprobe.events/1";
+pub const EVENTS_SCHEMA: &str = "oprobe.events/9";
 
 /// Log level of a `log` event.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -337,7 +337,8 @@ mod tests {
             .map(|l| serde_json::from_str(l).unwrap())
             .collect();
         assert_eq!(lines[0]["type"], "version");
-        assert_eq!(lines[0]["schema"], EVENTS_SCHEMA);
+        // The events changed shape in 9.0: their version follows the other v9 formats.
+        assert_eq!(lines[0]["schema"], "oprobe.events/9");
         for l in &lines {
             assert!(l["type"].is_string());
             assert!(l["ts"].as_str().unwrap().ends_with('Z'));

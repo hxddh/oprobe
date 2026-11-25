@@ -67,7 +67,7 @@ pub async fn main(cli: Cli) -> ExitCode {
             if INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst)
                 && body.code.exit_code() == exit::RUNTIME
             {
-                body.code = ErrorCode::RunInterrupted;
+                body = body.with_code(ErrorCode::RunInterrupted);
             }
             ctx.out.error(&body)
         }
