@@ -53,7 +53,7 @@ each with its remedy as an `op.toml` path, and the next command:
         peers, after a short retry backoff (TailCutLayer + RetryLayer::with_min_delay)
       next: oprobe prove 20261123-135409-4b57 tail_stragglers
   1733.6 ops/s · 97.6 MiB/s · p50 9.65ms · p99 261ms · errors 0.00%
-  full profile: oprobe show 20261123-135409-4b57 --detail · terms: https://github.com/hxddh/oprobe/blob/v9.3.1/docs/concepts.md#glossary
+  full profile: oprobe show 20261123-135409-4b57 --detail · terms: https://github.com/hxddh/oprobe/blob/v9.3.2/docs/concepts.md#glossary
 ```
 
 `prove last` runs trials of the current operator (A) and of the remedy (B), interleaved, and ends
@@ -175,7 +175,7 @@ oprobe prove last --with layers.retry.max_times=5 --max-duration 5m -o json > pr
 | macOS / Linux | `curl -fsSL https://github.com/hxddh/oprobe/releases/latest/download/install.sh \| sh` (`-s -- --cli` for the CLI without the app) |
 | Windows | `irm https://github.com/hxddh/oprobe/releases/latest/download/install.ps1 \| iex` or the `.msi` |
 | Debian / Ubuntu, Fedora / RHEL | `.deb` / `.rpm` from the release page |
-| Rust (from source) | `cargo install --locked --git https://github.com/hxddh/oprobe --tag v9.3.1 oprobe` (`--no-default-features --features cli` for the CLI only, `--features gui` for native windows on Linux) |
+| Rust (from source) | `cargo install --locked --git https://github.com/hxddh/oprobe --tag v9.3.2 oprobe` (`--no-default-features --features cli` for the CLI only, `--features gui` for native windows on Linux) |
 
 The macOS and Windows packages are **not code-signed**: the first open needs one confirmation
 ([how](docs/install.md#first-open-of-unsigned-packages)). Every asset has a SHA-256 in `SHA256SUMS`

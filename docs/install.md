@@ -8,7 +8,7 @@
 | macOS, Linux (CLI only) | `curl -fsSL https://github.com/hxddh/oprobe/releases/latest/download/install.sh \| sh -s -- --cli` |
 | Windows | `irm https://github.com/hxddh/oprobe/releases/latest/download/install.ps1 \| iex`, or the `.msi` |
 | Debian, Ubuntu, Fedora, RHEL | the `.deb` / `.rpm` from the release page |
-| Rust ≥ 1.97 (from source) | `cargo install --locked --git https://github.com/hxddh/oprobe --tag v9.3.1 oprobe` |
+| Rust ≥ 1.97 (from source) | `cargo install --locked --git https://github.com/hxddh/oprobe --tag v9.3.2 oprobe` |
 
 Then try it with no account: `oprobe demo` ([getting started](getting-started.md)).
 
@@ -97,9 +97,9 @@ sudo dnf install ./oprobe-<ver>-1.x86_64.rpm
 ## From source
 
 ```bash
-cargo install --locked --git https://github.com/hxddh/oprobe --tag v9.3.1 oprobe                                         # the app in the terminal
-cargo install --locked --git https://github.com/hxddh/oprobe --tag v9.3.1 oprobe --features gui                          # plus native windows (Linux: libgtk-4-dev)
-cargo install --locked --git https://github.com/hxddh/oprobe --tag v9.3.1 oprobe --no-default-features --features cli    # the CLI only
+cargo install --locked --git https://github.com/hxddh/oprobe --tag v9.3.2 oprobe                                         # the app in the terminal
+cargo install --locked --git https://github.com/hxddh/oprobe --tag v9.3.2 oprobe --features gui                          # plus native windows (Linux: libgtk-4-dev)
+cargo install --locked --git https://github.com/hxddh/oprobe --tag v9.3.2 oprobe --no-default-features --features cli    # the CLI only
 ```
 
 oprobe is not on crates.io. To embed oprobe's instrumentation in your own program use
@@ -117,7 +117,7 @@ as the archive, so it proves the download is intact, not who built it.
 ```bash
 sha256sum --ignore-missing -c SHA256SUMS                    # Linux
 shasum -a 256 --ignore-missing -c SHA256SUMS                # macOS
-Get-FileHash oprobe-9.3.1-x64.msi -Algorithm SHA256          # Windows
+Get-FileHash oprobe-9.3.2-x64.msi -Algorithm SHA256          # Windows
 ```
 
 **Build provenance.** Every asset has a [SLSA build provenance](https://slsa.dev/) attestation
@@ -125,7 +125,7 @@ signed by GitHub Actions, which proves it was built by this repository's release
 given commit:
 
 ```bash
-gh attestation verify oprobe-9.3.1-x86_64-unknown-linux-musl.tar.gz --repo hxddh/oprobe \
+gh attestation verify oprobe-9.3.2-x86_64-unknown-linux-musl.tar.gz --repo hxddh/oprobe \
   --signer-workflow hxddh/oprobe/.github/workflows/release.yml
 ```
 

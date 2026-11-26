@@ -60,7 +60,7 @@ each with its remedy as an `op.toml` path, and the next command:
         peers, after a short retry backoff (TailCutLayer + RetryLayer::with_min_delay)
       next: oprobe prove 20261123-135409-4b57 tail_stragglers
   1733.6 ops/s · 97.6 MiB/s · p50 9.65ms · p99 261ms · errors 0.00%
-  full profile: oprobe show 20261123-135409-4b57 --detail · terms: https://github.com/hxddh/oprobe/blob/v9.3.1/docs/concepts.md#glossary
+  full profile: oprobe show 20261123-135409-4b57 --detail · terms: https://github.com/hxddh/oprobe/blob/v9.3.2/docs/concepts.md#glossary
 ```
 
 `prove last` runs trials of the current operator (A) and of the remedy (B), interleaved, and ends
@@ -182,7 +182,7 @@ oprobe prove last --with layers.retry.max_times=5 --max-duration 5m -o json > pr
 | macOS / Linux | `curl -fsSL https://github.com/hxddh/oprobe/releases/latest/download/install.sh \| sh` (`-s -- --cli` for the CLI without the app) |
 | Windows | `irm https://github.com/hxddh/oprobe/releases/latest/download/install.ps1 \| iex` or the `.msi` |
 | Debian / Ubuntu, Fedora / RHEL | `.deb` / `.rpm` from the release page |
-| Rust (from source) | `cargo install --locked --git https://github.com/hxddh/oprobe --tag v9.3.1 oprobe` (`--no-default-features --features cli` for the CLI only, `--features gui` for native windows on Linux) |
+| Rust (from source) | `cargo install --locked --git https://github.com/hxddh/oprobe --tag v9.3.2 oprobe` (`--no-default-features --features cli` for the CLI only, `--features gui` for native windows on Linux) |
 
 The macOS and Windows packages are **not code-signed**: the first open needs one confirmation
 ([how](docs/install.md#first-open-of-unsigned-packages)). Every asset has a SHA-256 in `SHA256SUMS`
@@ -1156,7 +1156,7 @@ The app's Profile view shows the same sections with charts ([app](app.md)).
         peers, after a short retry backoff (TailCutLayer + RetryLayer::with_min_delay)
       next: oprobe prove 20261123-135409-4b57 tail_stragglers
   1733.6 ops/s · 97.6 MiB/s · p50 9.65ms · p99 261ms · errors 0.00%
-  full profile: oprobe show 20261123-135409-4b57 --detail · terms: https://github.com/hxddh/oprobe/blob/v9.3.1/docs/concepts.md#glossary
+  full profile: oprobe show 20261123-135409-4b57 --detail · terms: https://github.com/hxddh/oprobe/blob/v9.3.2/docs/concepts.md#glossary
 ```
 
 (`oprobe demo`; your numbers differ from run to run.)
@@ -1346,7 +1346,7 @@ meter).
 [dependencies]
 oprobe-trace = "9"                      # once it is on crates.io
 # until then:
-# oprobe-trace = { git = "https://github.com/hxddh/oprobe", tag = "v9.3.1" }
+# oprobe-trace = { git = "https://github.com/hxddh/oprobe", tag = "v9.3.2" }
 ```
 
 ```rust
@@ -1615,7 +1615,7 @@ oprobe binary and has no semver promise; do not enable it.
 `oprobe.trace/9` is one JSON document, readable without oprobe:
 
 ```text
-{ "format": "oprobe.trace/9", "oprobe_trace_version": "9.3.1", "created_at": "…",
+{ "format": "oprobe.trace/9", "oprobe_trace_version": "9.3.2", "created_at": "…",
   "service": { "scheme": "s3", "name": "my-bucket", "root": "/data/", "http_version": "auto", "keep_alive": true },
   "snapshot": { … }, "rows": { "ops": [ … ], "reqs": [ … ], "info": { … }, "sampling": { … } } }
 ```
@@ -1920,7 +1920,7 @@ JSON.
 | macOS, Linux (CLI only) | `curl -fsSL https://github.com/hxddh/oprobe/releases/latest/download/install.sh \| sh -s -- --cli` |
 | Windows | `irm https://github.com/hxddh/oprobe/releases/latest/download/install.ps1 \| iex`, or the `.msi` |
 | Debian, Ubuntu, Fedora, RHEL | the `.deb` / `.rpm` from the release page |
-| Rust ≥ 1.97 (from source) | `cargo install --locked --git https://github.com/hxddh/oprobe --tag v9.3.1 oprobe` |
+| Rust ≥ 1.97 (from source) | `cargo install --locked --git https://github.com/hxddh/oprobe --tag v9.3.2 oprobe` |
 
 Then try it with no account: `oprobe demo` ([getting started](getting-started.md)).
 
@@ -2009,9 +2009,9 @@ sudo dnf install ./oprobe-<ver>-1.x86_64.rpm
 ## From source
 
 ```bash
-cargo install --locked --git https://github.com/hxddh/oprobe --tag v9.3.1 oprobe                                         # the app in the terminal
-cargo install --locked --git https://github.com/hxddh/oprobe --tag v9.3.1 oprobe --features gui                          # plus native windows (Linux: libgtk-4-dev)
-cargo install --locked --git https://github.com/hxddh/oprobe --tag v9.3.1 oprobe --no-default-features --features cli    # the CLI only
+cargo install --locked --git https://github.com/hxddh/oprobe --tag v9.3.2 oprobe                                         # the app in the terminal
+cargo install --locked --git https://github.com/hxddh/oprobe --tag v9.3.2 oprobe --features gui                          # plus native windows (Linux: libgtk-4-dev)
+cargo install --locked --git https://github.com/hxddh/oprobe --tag v9.3.2 oprobe --no-default-features --features cli    # the CLI only
 ```
 
 oprobe is not on crates.io. To embed oprobe's instrumentation in your own program use
@@ -2029,7 +2029,7 @@ as the archive, so it proves the download is intact, not who built it.
 ```bash
 sha256sum --ignore-missing -c SHA256SUMS                    # Linux
 shasum -a 256 --ignore-missing -c SHA256SUMS                # macOS
-Get-FileHash oprobe-9.3.1-x64.msi -Algorithm SHA256          # Windows
+Get-FileHash oprobe-9.3.2-x64.msi -Algorithm SHA256          # Windows
 ```
 
 **Build provenance.** Every asset has a [SLSA build provenance](https://slsa.dev/) attestation
@@ -2037,7 +2037,7 @@ signed by GitHub Actions, which proves it was built by this repository's release
 given commit:
 
 ```bash
-gh attestation verify oprobe-9.3.1-x86_64-unknown-linux-musl.tar.gz --repo hxddh/oprobe \
+gh attestation verify oprobe-9.3.2-x86_64-unknown-linux-musl.tar.gz --repo hxddh/oprobe \
   --signer-workflow hxddh/oprobe/.github/workflows/release.yml
 ```
 

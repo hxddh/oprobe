@@ -4,7 +4,11 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
-## v9.3.1 — 2026-11-26
+## v9.3.2 — 2026-11-26
+
+9.3.1 was tagged and never released: the release workflow tags before it runs the tests, and
+the tests failed (see Fixed). The tag `v9.3.1` has no release and no assets; 9.3.2 is what 9.3.1
+was meant to be.
 
 ### Removed
 
@@ -24,7 +28,7 @@ All notable changes to this project are documented here. The format follows
   a fraction of that and the finding could read `rate_limit`, or a limit that "changed" during
   the run. A rate under what the limit carries no longer counts against it; a rate above it
   still marks a bucket, and the fitted burst, which the fit ties to the rate, is no longer
-  consulted. The first build of this release failed its own tests on this.
+  consulted. The build tagged `v9.3.1` failed its own tests on this.
 
 ## v9.3.0 — 2026-11-26
 
