@@ -102,6 +102,16 @@ wherever the layer sits. The layer then sees each request from outside:
 `format!("{trace:?}")` says which one a layer does (`http_transport: "replaced by the
 instrumented client"` or `"the installed transport, observed"`).
 
+What was not observed is not reported as a number. With `keep_http_transport(true)`:
+- `Snapshot::connections` counts the requests by protocol, and nothing else:
+  `connections.observed()` is false, and `dialed`, `reused_requests` and `reuse_pct` say nothing
+  (until 9.2 every answered request counted as reused: "100 %"). `oprobe show FILE` prints
+  `dials not observed · reuse not observed`.
+- The file's `service` says `"http_transport": "installed"` and leaves out `http_version` and
+  `keep_alive`, which describe the instrumented client (the client is yours).
+- A request row has `conn_id` 0, and its time to first byte includes connecting and sending the
+  body: a slow upload shows as a long `ttfb`, not as a slow server.
+
 ## What you get
 
 Every OpenDAL call is one **operation**, linked to the backend requests it issued, as in a run
@@ -149,7 +159,10 @@ let cfg = oprobe_trace::Config::default().exporter(std::sync::Arc::new(Slow));
     (they add up to the request's duration); it also carries `oprobe.api`,
     `http.request.method`, `http.response.status_code` and OpenDAL's own metric labels
     (`scheme`, `namespace`, `root`, `operation`), so its series join
-    `opendal-layer-otelmetrics`'.
+    `opendal-layer-otelmetrics`'. `scheme`, `namespace` and `root` are those of the operator
+    that issued the request: a layer cloned onto several operators labels each one's requests
+    with its own (until 9.2, with the first operator's). Your own `Exporter` reads the same
+    from `RequestRecord::service`.
 
   Backend calls of `memory` and `fs` are not HTTP requests and are in neither. Operation
   durations and cache metrics are not repeated: use OpenDAL's own metrics layers for them.
@@ -191,11 +204,32 @@ A connection's dial belongs to the request that started it: that request is the 
 cold one, whichever request is answered first on a shared HTTP/2 connection; a request that
 waited for another's dial shows the wait as queue time (`detail.dial_wait_us`). A dial whose
 request went elsewhere is a connection nobody waited for: counted, charged to no request.
-Kernel TCP statistics are read at the end of each request; the retransmits of a connection
-shared by concurrent HTTP/2 streams are split among the requests in flight when they are read,
-so `detail.retrans_count` adds up to the connection's count and no retransmit is charged twice.
+Kernel TCP statistics are read at the end of each request, and the connection's retransmits
+since the previous reading are charged to the requests in flight on it, so
+`detail.retrans_count` adds up to the connection's count and no retransmit is charged twice:
+- to the requests that are **sending a body**, when there are any (what a client retransmits
+  is what it sends): an upload is charged its own retransmits, not the small GET that ends
+  beside it on a shared HTTP/2 connection;
+- else evenly to all of them (on HTTP/1.1 that is the one request).
+
+A request counts as sending from the moment the transport can tell which connection carries
+its body: with one upload in flight, the only connection alive, or, once the body is handed
+to the kernel, the only one with unsent bytes in its send queue. With several uploads in
+flight it cannot, and an upload joins at its response headers; a request that ends on the
+same HTTP/2 connection before that is charged the upload's retransmits so far. An upload that
+fails or is cancelled before any response carries the retransmits of its connection when that
+connection was known.
+
 The socket of a new connection is looked up on the runtime's blocking pool (one scan of the
-descriptor table answers every connection dialed meanwhile), never on a worker thread.
+descriptor table answers every connection dialed meanwhile), never on a worker thread, and no
+request waits for it: a request reads the answer when its response headers arrive and again
+when it ends. A request that ends before the lookup answered (the first request of a
+connection, when the blocking pool is busy) has no kernel statistics; what its connection sent
+and retransmitted counts with the connection's next request. Connection ids (`conn_id`) number
+the client's connections in the order they were dialed, from 1.
+
+A response OpenDAL cannot use (a `Content-Encoding` or `Content-Length` that does not parse)
+fails the operation and is recorded as a failed request, not to be retried.
 
 Above the transport, the layer wraps the service: each call runs in an operation scope that the
 transport (and OpenDAL's background tasks, through a scope-propagating executor) reports its

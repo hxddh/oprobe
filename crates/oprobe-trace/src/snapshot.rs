@@ -171,6 +171,22 @@ pub struct ConnStats {
     pub cold_start: Option<ColdStartStats>,
 }
 
+impl ConnStats {
+    /// Whether the connections behind the HTTP requests were observed. They are not when the
+    /// layer keeps the transport installed on the operator
+    /// (`Config::keep_http_transport`): the requests were answered (`http1_requests`,
+    /// `http2_requests`) on connections only the application's client saw. `dialed`,
+    /// `reused_requests`, `reuse_pct` and the dial phases then say nothing, which is not
+    /// "none dialed, 0 % reused", and every request's time to first byte includes its dial and
+    /// the sending of its body (a slow upload is not a slow server).
+    ///
+    /// With the instrumented client every answered request either reused a connection or
+    /// dialed one, so this is true whenever there is a request to speak of.
+    pub fn observed(&self) -> bool {
+        self.http1_requests + self.http2_requests == 0 || self.reused_requests > 0 || self.dialed > 0
+    }
+}
+
 /// The cold start of a run: the connections dialed at the start of warmup and the operations
 /// that waited for them.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

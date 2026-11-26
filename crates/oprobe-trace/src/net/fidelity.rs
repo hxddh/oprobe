@@ -25,7 +25,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -45,7 +45,7 @@ use super::tcpinfo::{self, ConnAddr, SockFinder, TcpProbe};
 use super::tls::{InsecureCertVerifier, crypto_provider};
 use super::tlsinfo::{HandshakeMarks, ObservedVerifier, TlsEvent, observed_provider};
 use super::{HttpVersion, TransportConfig};
-use crate::record::{Protocol, RequestRecord, RequestTiming};
+use crate::record::{Protocol, RequestRecord, RequestTiming, ServiceLabels};
 use crate::recorder::DialRecord;
 use crate::rows::TlsRow;
 use crate::{InflightGuard, OpScope, Recorder};
@@ -146,13 +146,14 @@ enum Sock {
     /// Not found or not supported: never looked up again.
     Missing,
     Found(Arc<TcpProbe>),
-    /// Dialed, its socket being looked up off the runtime's threads: the first request that
-    /// needs the probe shares that one lookup instead of starting its own.
+    /// Its socket is being looked up off the runtime's threads ([`Shared::find_socket`]).
     Finding(Lookup),
 }
 
-/// One lookup of a connection's socket, run once by whoever asks first and shared by the rest.
-type Lookup = Arc<tokio::sync::OnceCell<Option<Arc<TcpProbe>>>>;
+/// The answer of one lookup of a connection's socket: unset while it runs, then the probe
+/// (`None`: not found). Nothing ever waits for it: a request reads it when its response
+/// headers arrive and again when it ends.
+type Lookup = Arc<OnceLock<Option<Arc<TcpProbe>>>>;
 
 struct ConnEntry {
     id: u64,
@@ -206,7 +207,11 @@ const MAX_TRACKED_CONNS: usize = 8192;
 
 #[derive(Default)]
 struct Conns {
+    /// Counts the table's events (dials and answered requests): what was used last.
     seq: u64,
+    /// The connections seen so far: a connection's id is its rank among them, so the ids of
+    /// a client that dialed 25 connections are 1 to 25.
+    ids: u64,
     /// Connection identity (local, remote address) -> (id, dial awaiting its request).
     /// The local address alone is not unique: the kernel reuses a local port for connections
     /// to different peers, and object stores answer from many addresses.
@@ -239,42 +244,39 @@ impl Drop for UploadGuard {
 }
 
 impl Shared {
-    /// The kernel probe of connection `addr` (see `net::tcpinfo` for why querying it is safe):
-    /// fresh from its handshake, or (`warm`) in use before this table knew it, so its bytes so
-    /// far are not counted again. The descriptor lookup runs off the runtime's threads.
-    async fn probe(&self, addr: ConnAddr, warm: bool) -> Sock {
+    /// Start looking up the kernel probe of connection `addr` (see `net::tcpinfo` for why
+    /// querying it is safe): fresh from its handshake, or (`warm`) in use before this table
+    /// knew it, so its bytes so far are not counted again. The lookup runs in a task of its
+    /// own, off the runtime's worker threads, and puts its answer into the returned `Lookup`
+    /// and into the connection table.
+    ///
+    /// Neither a dial nor a request waits for it. A connection goes to hyper as soon as its
+    /// handshake ends, and a request reads the answer if it is there. 9.2 awaited the lookup
+    /// when the response headers arrived: with the runtime's blocking pool busy, that held
+    /// the response back (and read as time the consumer stalled), and with the lookup's task
+    /// lost in a runtime shutdown it never returned.
+    fn find_socket(self: &Arc<Self>, addr: ConnAddr, warm: bool) -> Sock {
         if !self.tcp_info {
             return Sock::Missing;
         }
-        match self.finder.find(addr).await {
-            Some(id) => Sock::Found(Arc::new(TcpProbe::new_seeded(id, warm))),
-            None => Sock::Missing,
-        }
-    }
-
-    /// The probe of the freshly dialed connection `addr`, from its one shared `lookup`; the
-    /// connection table then holds the answer. The dial never waits for this: a connection is
-    /// handed to hyper as soon as its handshake ends, so the lookup costs its first request
-    /// nothing (9.2 development builds awaited it in the dial, after the dial's clock had
-    /// stopped: the wait read as time on the wire).
-    async fn resolve(&self, addr: ConnAddr, lookup: &Lookup) -> Sock {
-        let found = lookup
-            .get_or_init(|| async {
-                match self.probe(addr, false).await {
-                    Sock::Found(p) => Some(p),
-                    _ => None,
-                }
-            })
-            .await
-            .clone();
-        let sock = found.map_or(Sock::Missing, Sock::Found);
-        if let Ok(mut c) = self.conns.lock()
-            && let Some(e) = c.by_addr.get_mut(&addr)
-            && matches!(&e.sock, Sock::Finding(l) if Arc::ptr_eq(l, lookup))
-        {
-            e.sock = sock.clone();
-        }
-        sock
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return Sock::Missing;
+        };
+        let lookup = Lookup::default();
+        let (shared, answer) = (self.clone(), lookup.clone());
+        runtime.spawn(async move {
+            let probe = shared.finder.find(addr).await;
+            let probe = probe.map(|id| Arc::new(TcpProbe::new_seeded(id, warm)));
+            let sock = probe.clone().map_or(Sock::Missing, Sock::Found);
+            let _ = answer.set(probe);
+            if let Ok(mut c) = shared.conns.lock()
+                && let Some(e) = c.by_addr.get_mut(&addr)
+                && matches!(&e.sock, Sock::Finding(l) if Arc::ptr_eq(l, &answer))
+            {
+                e.sock = sock;
+            }
+        });
+        Sock::Finding(lookup)
     }
 
     /// A dial started by the request behind `claim` made connection `addr`. The dial waits in
@@ -315,9 +317,10 @@ impl Shared {
             return;
         };
         c.seq += 1;
-        let id = c.seq;
+        c.ids += 1;
+        let (seq, id) = (c.seq, c.ids);
         if c.by_addr.len() >= MAX_TRACKED_CONNS {
-            let keep_after = id.saturating_sub(MAX_TRACKED_CONNS as u64 / 2);
+            let keep_after = seq.saturating_sub(MAX_TRACKED_CONNS as u64 / 2);
             c.by_addr.retain(|_, e| {
                 e.dial.is_some()
                     || e.active_streams.load(Ordering::Relaxed) > 0
@@ -331,7 +334,7 @@ impl Shared {
                 dial,
                 dial_end: Some(end),
                 sock,
-                last_seq: id,
+                last_seq: seq,
                 ..Default::default()
             },
         );
@@ -376,33 +379,103 @@ impl Shared {
         own
     }
 
-    /// Unambiguous kernel probe for an active upload: either the sole connection in the pool, or
-    /// the unique connection currently carrying unsent kernel send-queue bytes (`notsent_bytes > 0`)
-    /// when idle connections also exist in the pool.
-    fn uploading_probe(&self, active_uploads: u32) -> Option<Arc<TcpProbe>> {
-        if active_uploads > 1 {
+    /// The kernel probe of the connection the one upload in flight is being sent on, when
+    /// that is unambiguous: the only connection alive, or (`queued`: the body's last frame
+    /// was handed over, so what is left of it waits in the kernel) the only one with unsent
+    /// bytes in the kernel's send queue (`notsent_bytes > 0`) when idle connections exist
+    /// beside it. `None` with several uploads in flight. The guess can still be wrong (a
+    /// connection whose socket is not found yet is not among the candidates): the response
+    /// headers say which connection it was ([`SendingStream`]).
+    ///
+    /// The connection table is only locked to list the probes: each one is then read with
+    /// three system calls, which 9.2 made under the lock that every request takes.
+    fn uploading_probe(&self, queued: bool) -> Option<Arc<TcpProbe>> {
+        if self.active_uploads.load(Ordering::Acquire) > 1 {
             return None;
         }
-        let c = self.conns.lock().ok()?;
-        let mut with_unsent: Option<Arc<TcpProbe>> = None;
-        let mut only_found: Option<Arc<TcpProbe>> = None;
-        let mut found_count = 0usize;
-        for e in c.by_addr.values() {
-            if let Sock::Found(p) = &e.sock {
-                found_count += 1;
-                only_found = Some(p.clone());
-                if p.peek().is_some_and(|r| r.notsent_bytes > 0) {
-                    if with_unsent.is_some() {
-                        return None;
-                    }
-                    with_unsent = Some(p.clone());
-                }
+        let probes: Vec<Arc<TcpProbe>> = {
+            let c = self.conns.lock().ok()?;
+            let found = c.by_addr.values().filter_map(|e| match &e.sock {
+                Sock::Found(p) => Some(p.clone()),
+                Sock::Unknown | Sock::Missing | Sock::Finding(_) => None,
+            });
+            found.collect()
+        };
+        let alive: Vec<(&Arc<TcpProbe>, u64)> = probes
+            .iter()
+            .filter_map(|p| Some((p, p.peek()?.notsent_bytes)))
+            .collect();
+        if queued {
+            let mut unsent = alive.iter().filter(|(_, unsent)| *unsent > 0);
+            match (unsent.next(), unsent.next()) {
+                (Some((probe, _)), None) => return Some((*probe).clone()),
+                (Some(_), Some(_)) => return None,
+                (None, _) => {}
             }
         }
-        if with_unsent.is_some() {
-            return with_unsent;
+        match alive.as_slice() {
+            [(probe, _)] => Some((*probe).clone()),
+            _ => None,
         }
-        (found_count == 1).then_some(only_found).flatten()
+    }
+}
+
+/// The retransmit stream of an upload on the connection it is being sent on
+/// ([`Shared::uploading_probe`]), from the moment that connection is known until the request
+/// is answered or gives up: retransmits while the body is on its way are the upload's own
+/// (`net::tcpinfo::RetransLedger`).
+#[derive(Default)]
+struct SendingStream(Mutex<Option<(Arc<TcpProbe>, u64)>>);
+
+impl SendingStream {
+    /// The upload is being sent on the connection of `probe`.
+    fn open(&self, probe: &Arc<TcpProbe>) {
+        if let Ok(mut s) = self.0.lock()
+            && s.is_none()
+        {
+            *s = Some((probe.clone(), probe.open_sending_stream()));
+        }
+    }
+
+    fn take(&self) -> Option<(Arc<TcpProbe>, u64)> {
+        self.0.lock().ok()?.take()
+    }
+
+    /// The response headers arrived on connection `addr` (`None`: unknown): the stream, now
+    /// past its send, when that is the connection it was opened on.
+    fn answered(&self, addr: Option<ConnAddr>) -> Option<(Arc<TcpProbe>, u64)> {
+        let (probe, stream) = self.take()?;
+        if addr.is_some_and(|addr| probe.is_of(addr)) {
+            probe.stream_sent(stream);
+            Some((probe, stream))
+        } else {
+            probe.abandon_stream(stream);
+            None
+        }
+    }
+
+    /// The request ends without an answer (an error, a timeout): what its connection
+    /// retransmitted while it sent is on its record.
+    fn unanswered(&self, record: &mut RequestRecord) {
+        let Some((probe, stream)) = self.take() else {
+            return;
+        };
+        let (row, retrans) = probe.close_stream(stream);
+        record.tcp = row.map(Box::new);
+        if retrans > 0 {
+            record
+                .detail
+                .get_or_insert_with(Default::default)
+                .retrans_count = Some(retrans);
+        }
+    }
+}
+
+impl Drop for SendingStream {
+    fn drop(&mut self) {
+        if let Some((probe, stream)) = self.take() {
+            probe.abandon_stream(stream);
+        }
     }
 }
 
@@ -681,18 +754,8 @@ where
             };
             if let Some((addr, times)) = made {
                 // The socket is looked up off the runtime's threads, starting now; the
-                // connection goes to hyper at once, and its requests share that one lookup.
-                let sock = match tokio::runtime::Handle::try_current() {
-                    Ok(runtime) if shared.tcp_info => {
-                        let lookup = Lookup::default();
-                        let (finding, shared) = (lookup.clone(), shared.clone());
-                        runtime.spawn(async move {
-                            shared.resolve(addr, &finding).await;
-                        });
-                        Sock::Finding(lookup)
-                    }
-                    _ => Sock::Missing,
-                };
+                // connection goes to hyper at once.
+                let sock = shared.find_socket(addr, false);
                 shared.dialed(claim, addr, times, sock);
             }
             res
@@ -827,7 +890,10 @@ struct TimedBody {
     pending: Bytes,
     start: Instant,
     end_us: Arc<AtomicU64>,
+    /// Told when the first frame is handed over (hyper has chosen the connection) and when
+    /// the last one is.
     notify: Option<Arc<tokio::sync::Notify>>,
+    started: bool,
 }
 
 impl TimedBody {
@@ -853,12 +919,14 @@ impl http_body::Body for TimedBody {
         }
         let n = this.pending.len().min(SEND_FRAME);
         let frame = this.pending.split_to(n);
-        if this.remaining() == 0 {
+        let first = !std::mem::replace(&mut this.started, true);
+        let last = this.remaining() == 0;
+        if last {
             let us = (this.start.elapsed().as_micros() as u64).max(1);
             this.end_us.store(us, Ordering::Release);
-            if let Some(n) = &this.notify {
-                n.notify_one();
-            }
+        }
+        if let Some(n) = this.notify.as_ref().filter(|_| first || last) {
+            n.notify_one();
         }
         Poll::Ready(Some(Ok(http_body::Frame::data(frame))))
     }
@@ -882,6 +950,8 @@ pub(super) struct CancelGuard {
     t_ready: Option<Instant>,
     scope: Option<Arc<OpScope>>,
     recorder: Option<Arc<Recorder>>,
+    /// The retransmit stream of the upload being sent, if its connection is known.
+    sending: Option<Arc<SendingStream>>,
 }
 
 impl CancelGuard {
@@ -922,6 +992,9 @@ impl Drop for CancelGuard {
             temporary: Some(true),
             ..Default::default()
         }));
+        if let Some(sending) = &self.sending {
+            sending.unanswered(&mut record);
+        }
         Finisher::emit(record, &self.scope, &self.recorder);
     }
 }
@@ -930,9 +1003,21 @@ impl Drop for CancelGuard {
 pub(super) struct ConnUse {
     addr: ConnAddr,
     shared: Arc<Shared>,
-    /// The connection's kernel probe and this request's stream on it.
-    probe: Option<(Arc<TcpProbe>, u64)>,
+    probe: Probing,
     _stream: StreamGuard,
+}
+
+/// What a request knows of its connection's kernel probe when its response headers arrive.
+enum Probing {
+    /// Not found, or not looked for.
+    Missing,
+    /// The probe, and this request's retransmit stream on it.
+    Stream(Arc<TcpProbe>, u64),
+    /// Still being looked up: the request reads the answer when it ends. If there is one by
+    /// then, the request is sampled like any other, its retransmit stream running from that
+    /// moment; if there is none, the request has no kernel statistics, and what the
+    /// connection sent, received and retransmitted meanwhile counts with its next request.
+    Finding(Lookup),
 }
 
 pub(super) struct Finisher {
@@ -986,7 +1071,15 @@ impl Finisher {
                 e.recent_ends[e.recent_idx] = Some(now);
                 e.recent_idx = (e.recent_idx + 1) % e.recent_ends.len();
             }
-            if let Some((probe, stream)) = conn.probe {
+            let sampled = match conn.probe {
+                Probing::Stream(probe, stream) => Some((probe, stream)),
+                Probing::Finding(lookup) => lookup.get().cloned().flatten().map(|probe| {
+                    let stream = probe.open_stream();
+                    (probe, stream)
+                }),
+                Probing::Missing => None,
+            };
+            if let Some((probe, stream)) = sampled {
                 let (row, retrans) = probe.close_stream(stream);
                 if let Some(row) = row {
                     // The bytes on the wire since the connection's previous sample: every
@@ -1177,6 +1270,7 @@ impl Entered {
             remote: None,
             server,
             service_op,
+            service: parts.extensions.get::<Arc<ServiceLabels>>().cloned(),
             tls: None,
             tcp: None,
             detail: None,
@@ -1187,6 +1281,7 @@ impl Entered {
             t_ready: None,
             scope: scope.clone(),
             recorder: recorder.clone(),
+            sending: None,
         };
         Self {
             t_start,
@@ -1328,6 +1423,7 @@ impl HttpTransport for FidelityTransport {
                 start: t_start,
                 end_us: end_us.clone(),
                 notify: body_notify.clone(),
+                started: false,
             }));
         }
 
@@ -1354,12 +1450,30 @@ impl HttpTransport for FidelityTransport {
             let shared = self.shared.clone();
             let end_ref = end_us.clone();
             let ack_ref = acked_us.clone();
+            let sending = Arc::<SendingStream>::default();
+            cancel_guard.sending = Some(sending.clone());
             let watch = async move {
+                // The first frame is handed over: hyper has chosen the connection. From now
+                // on the connection's retransmits are this upload's, if it can be told.
                 notify.notified().await;
-                let active = shared.active_uploads.load(Ordering::Acquire);
-                let Some(probe) = shared.uploading_probe(active) else {
+                let handed_over = || end_ref.load(Ordering::Acquire) > 0;
+                let mut probe = shared.uploading_probe(handed_over());
+                if !handed_over() {
+                    if let Some(probe) = &probe {
+                        sending.open(probe);
+                    }
+                    // The last frame is handed over.
+                    notify.notified().await;
+                }
+                // With the body's rest waiting in one send queue, the connection can be told
+                // among several.
+                if probe.is_none() {
+                    probe = shared.uploading_probe(true);
+                }
+                let Some(probe) = probe else {
                     return;
                 };
+                sending.open(&probe);
                 // Only track kernel send-queue drain (`notsent_bytes > 0`); checking `unacked`
                 // would include the peer's 40 ms TCP Delayed-ACK timer inside `send_us` when a
                 // straggler server delays its HTTP response headers.
@@ -1397,9 +1511,13 @@ impl HttpTransport for FidelityTransport {
         let t_headers = Instant::now();
         drop(upload_guard);
         cancel_guard.disarm();
+        let sending = cancel_guard.sending.take();
         let mut resp = match sent {
             Ok(r) => r,
             Err(err) => {
+                if let Some(sending) = &sending {
+                    sending.unanswered(&mut record);
+                }
                 let temporary = is_temporary_error(&err);
                 // Never the URL: a presigned or SAS query (`?sig=`) would land in the trace.
                 let err = err.without_url();
@@ -1444,34 +1562,25 @@ impl HttpTransport for FidelityTransport {
             let c = &mut *c;
             c.seq += 1;
             let seq = c.seq;
-            let entry = c.by_addr.entry(addr).or_insert_with(|| ConnEntry {
-                id: seq,
-                last_seq: seq,
-                ..Default::default()
+            let ids = &mut c.ids;
+            let entry = c.by_addr.entry(addr).or_insert_with(|| {
+                *ids += 1;
+                ConnEntry {
+                    id: *ids,
+                    ..Default::default()
+                }
             });
             entry.last_seq = seq;
             record.conn_id = entry.id;
             dial_end = entry.dial_end;
+            if matches!(entry.sock, Sock::Unknown) {
+                // A connection the table did not see dialed (its entry was evicted): its
+                // socket is looked up from now on, for this request's end and the next ones.
+                entry.sock = self.shared.find_socket(addr, true);
+            }
             sock = entry.sock.clone();
             open_streams = entry.active_streams.fetch_add(1, Ordering::AcqRel) + 1;
             stream_guard = StreamGuard(Some(entry.active_streams.clone()));
-        }
-        if let (Some(addr), Sock::Finding(lookup)) = (addr, &sock) {
-            // Dialed a moment ago: its lookup is usually done by the time headers arrive.
-            sock = self.shared.resolve(addr, &lookup.clone()).await;
-        }
-        if let (Some(addr), Sock::Unknown) = (addr, &sock) {
-            // A connection the table did not see dialed (its entry was evicted): find its
-            // socket now; requests racing here converge on the first probe installed.
-            sock = self.shared.probe(addr, true).await;
-            if let Ok(mut c) = self.shared.conns.lock()
-                && let Some(e) = c.by_addr.get_mut(&addr)
-            {
-                match &e.sock {
-                    Sock::Unknown => e.sock = sock.clone(),
-                    known => sock = known.clone(),
-                }
-            }
         }
         // Time on the wire starts when the connection was ready.
         let mut wire_from = t_ready;
@@ -1554,11 +1663,13 @@ impl HttpTransport for FidelityTransport {
         }
 
         // --- identical to opendal-http-transport-reqwest ---------------------------------
-        let content_length = if is_head || parse_content_encoding(resp.headers())?.is_some() {
-            None
-        } else {
-            parse_content_length(resp.headers())?
-        };
+        let content_length = parse_content_encoding(resp.headers()).and_then(|encoding| {
+            if is_head || encoding.is_some() {
+                Ok(None)
+            } else {
+                parse_content_length(resp.headers())
+            }
+        });
         let mut hr = Response::builder()
             .status(resp.status())
             .extension(uri.clone());
@@ -1577,16 +1688,24 @@ impl HttpTransport for FidelityTransport {
         std::mem::swap(hr.headers_mut().expect("fresh builder"), resp.headers_mut());
         // ---------------------------------------------------------------------------------
 
+        // The upload's stream when it was opened on this connection while it sent; else the
+        // request joins the connection's retransmit ledger here, if its probe is there.
+        let sent_stream = sending.and_then(|sending| sending.answered(addr));
         let conn = addr.map(|addr| ConnUse {
             addr,
             shared: self.shared.clone(),
-            // From here to the request's end it shares the connection's retransmits.
-            probe: match sock {
-                Sock::Found(probe) => {
+            probe: match (sent_stream, sock) {
+                (Some((probe, stream)), _) => Probing::Stream(probe, stream),
+                (None, Sock::Found(probe)) => {
                     let stream = probe.open_stream();
-                    Some((probe, stream))
+                    Probing::Stream(probe, stream)
                 }
-                Sock::Unknown | Sock::Missing | Sock::Finding(_) => None,
+                (None, Sock::Finding(lookup)) => match lookup.get() {
+                    Some(Some(probe)) => Probing::Stream(probe.clone(), probe.open_stream()),
+                    Some(None) => Probing::Missing,
+                    None => Probing::Finding(lookup),
+                },
+                (None, Sock::Unknown | Sock::Missing) => Probing::Missing,
             },
             _stream: stream_guard,
         });
@@ -1600,6 +1719,21 @@ impl HttpTransport for FidelityTransport {
             _permit: permit,
             _inflight: inflight,
             sniff,
+        };
+        let content_length = match content_length {
+            Ok(declared) => declared,
+            // A response OpenDAL cannot use is a failed request, not a missing one (until 9.2
+            // this returned before anything was recorded: the operation failed with no request
+            // in the trace). The same response would fail again: not temporary.
+            Err(err) => {
+                let mut fin = fin;
+                fin.record
+                    .detail
+                    .get_or_insert_with(Default::default)
+                    .temporary = Some(false);
+                fin.finish(Duration::ZERO, Some(format!("response headers: {err}")));
+                return Err(err);
+            }
         };
         let chunks = futures::StreamExt::map(resp.bytes_stream(), move |chunk| {
             chunk.map(Buffer::from).map_err(|err| {
@@ -1801,43 +1935,296 @@ mod tests {
         }
     }
 
-    /// A new connection's socket is looked up once, whoever needs it: the lookup started at the
-    /// dial and the first request's share one probe, and the table keeps it. The dial itself
-    /// does not wait (awaiting the lookup there, after the dial's clock had stopped, read as
-    /// time on the wire for the request that dialed).
-    #[tokio::test]
-    async fn the_requests_of_a_new_connection_share_one_socket_lookup() {
-        if !tcpinfo::SUPPORTED {
-            return;
-        }
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let (client, _server) = tokio::join!(
-            tokio::net::TcpStream::connect(l.local_addr().unwrap()),
-            l.accept()
-        );
-        let client = client.unwrap();
-        let addr = (client.local_addr().unwrap(), client.peer_addr().unwrap());
-        let shared = Arc::new(Shared {
-            recorder: None,
+    fn probing(recorder: Option<Arc<Recorder>>) -> Arc<Shared> {
+        Arc::new(Shared {
+            recorder,
             conns: Mutex::new(Conns::default()),
             finder: Arc::default(),
             proxy: None,
             proxy_addrs: Vec::new(),
             active_uploads: AtomicU32::new(0),
             tcp_info: true,
-        });
-        let lookup = Lookup::default();
-        shared.dialed(None, addr, dial_times(), Sock::Finding(lookup.clone()));
-        let (a, b) = tokio::join!(shared.resolve(addr, &lookup), shared.resolve(addr, &lookup));
-        let (Sock::Found(a), Sock::Found(b)) = (a, b) else {
-            panic!("the socket of a live connection is found");
+        })
+    }
+
+    /// A connected loopback socket pair (client, server) and the client's connection identity.
+    async fn socket_pair() -> (tokio::net::TcpStream, tokio::net::TcpStream, ConnAddr) {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (client, server) = tokio::join!(
+            tokio::net::TcpStream::connect(l.local_addr().unwrap()),
+            l.accept()
+        );
+        let client = client.unwrap();
+        let addr = (client.local_addr().unwrap(), client.peer_addr().unwrap());
+        (client, server.unwrap().0, addr)
+    }
+
+    /// The answer of a socket lookup, once it is there.
+    async fn answered(lookup: &Lookup) -> Option<Arc<TcpProbe>> {
+        loop {
+            if let Some(answer) = lookup.get() {
+                return answer.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    /// A new connection's socket is looked up once, in a task of its own: the lookup's answer
+    /// is the probe the connection table keeps, for every request of the connection.
+    #[tokio::test]
+    async fn a_new_connections_socket_lookup_answers_into_the_table() {
+        if !tcpinfo::SUPPORTED {
+            return;
+        }
+        let (_client, _server, addr) = socket_pair().await;
+        let shared = probing(None);
+        let Sock::Finding(lookup) = shared.find_socket(addr, false) else {
+            panic!("the lookup starts");
         };
-        assert!(Arc::ptr_eq(&a, &b), "one probe for the connection");
+        shared.dialed(None, addr, dial_times(), Sock::Finding(lookup.clone()));
+        let found = answered(&lookup).await.expect("the socket of a live connection");
+        // The lookup's task has the table's lock right after it answered.
+        tokio::task::yield_now().await;
         let c = shared.conns.lock().unwrap();
         let Sock::Found(kept) = &c.by_addr[&addr].sock else {
             panic!("the table keeps the probe");
         };
-        assert!(Arc::ptr_eq(kept, &a));
+        assert!(Arc::ptr_eq(kept, &found), "one probe for the connection");
+    }
+
+    /// Holds the only thread of a runtime's blocking pool until dropped: whatever is spawned
+    /// on the pool meanwhile (a socket lookup's descriptor scan) stays queued.
+    struct BusyBlockingPool(Option<std::sync::mpsc::Sender<()>>);
+
+    impl BusyBlockingPool {
+        fn of(runtime: &tokio::runtime::Runtime) -> Self {
+            let (release, held) = std::sync::mpsc::channel::<()>();
+            let (running, started) = std::sync::mpsc::channel::<()>();
+            runtime.spawn_blocking(move || {
+                running.send(()).unwrap();
+                // Returns when the sender is dropped.
+                let _ = held.recv();
+            });
+            started.recv().unwrap();
+            Self(Some(release))
+        }
+    }
+
+    impl Drop for BusyBlockingPool {
+        fn drop(&mut self) {
+            self.0.take();
+        }
+    }
+
+    fn one_blocking_thread() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap()
+    }
+
+    /// A test must fail, not hang, where 9.2 waited for ever. Nothing here depends on how
+    /// long the machine takes: the bound is only reached when the future never completes.
+    async fn never_stuck<T>(what: &str, f: impl Future<Output = T>) -> T {
+        tokio::time::timeout(Duration::from_secs(120), f)
+            .await
+            .unwrap_or_else(|_| panic!("{what} never completed"))
+    }
+
+    async fn get_ok(t: &FidelityTransport, server: &testserver::TestServer) {
+        let req = Request::get(format!("http://{}/k", server.addr))
+            .body(Buffer::new())
+            .unwrap();
+        drain(t.fetch(req).await.unwrap()).await;
+    }
+
+    /// A request never waits for the lookup of its connection's socket. With the runtime's
+    /// blocking pool busy the lookup cannot answer: the request is served all the same,
+    /// without kernel statistics, and the connection's next request has them once the lookup
+    /// did answer (9.2 awaited the lookup when the response headers arrived: the response was
+    /// held back for as long as the pool was busy, and the wait read as consumer stall).
+    #[test]
+    fn a_request_does_not_wait_for_a_slow_socket_lookup() {
+        let runtime = one_blocking_thread();
+        let busy = BusyBlockingPool::of(&runtime);
+        runtime.block_on(async {
+            let server = testserver::serve(|_| async { testserver::respond(200, "ok") }).await;
+            let recorder = Recorder::always_on(64);
+            let t = transport(HttpVersion::H1, &recorder);
+            never_stuck("the request", get_ok(&t, &server)).await;
+            let first = recorder.take_trace().reqs;
+            assert_eq!(first.len(), 1, "{first:?}");
+            assert_eq!((first[0].status, first[0].reused), (200, false), "{first:?}");
+            assert!(first[0].tcp.is_none(), "the lookup cannot have answered: {first:?}");
+            if !tcpinfo::SUPPORTED {
+                return;
+            }
+            let lookup = {
+                let c = t.shared.conns.lock().unwrap();
+                let Some(Sock::Finding(lookup)) = c.by_addr.values().next().map(|e| e.sock.clone())
+                else {
+                    panic!("the connection's socket is still being looked up");
+                };
+                lookup
+            };
+            // The pool is free again: the lookup answers, and the next request reads it.
+            drop(busy);
+            assert!(answered(&lookup).await.is_some());
+            get_ok(&t, &server).await;
+            let second = recorder.take_trace().reqs;
+            assert_eq!(second.len(), 1, "{second:?}");
+            assert_eq!(second[0].conn_id, first[0].conn_id, "{second:?}");
+            assert!(second[0].reused && second[0].tcp.is_some(), "{second:?}");
+        });
+    }
+
+    /// An operator outlives the runtime it was first used on (a shared operator in tests that
+    /// each build a runtime, an application that restarts its runtime). The first runtime is
+    /// shut down with a socket lookup queued on its blocking pool; requests on the second
+    /// runtime are served (9.2: the lookup of the first runtime never answered, the finder
+    /// stayed busy with it, and every request on a new connection waited for ever).
+    #[test]
+    fn an_operator_shared_across_runtimes_outlives_a_lookup_queued_on_the_first() {
+        // The server lives on a runtime of its own.
+        let serving = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let server =
+            serving.block_on(testserver::serve(|_| async { testserver::respond(200, "ok") }));
+        let recorder = Recorder::always_on(64);
+        // No connection is reused: the ones of the first runtime die with it.
+        let cfg = TransportConfig {
+            proxy: Some(None),
+            keep_alive: false,
+            ..TransportConfig::default()
+        };
+        let t = FidelityTransport::new(cfg, false, Some(recorder.clone())).unwrap();
+
+        let first = one_blocking_thread();
+        let busy = BusyBlockingPool::of(&first);
+        first.block_on(never_stuck("the request on the first runtime", get_ok(&t, &server)));
+        first.shutdown_background();
+
+        let second = one_blocking_thread();
+        second.block_on(async {
+            for _ in 0..3 {
+                never_stuck("a request on the second runtime", get_ok(&t, &server)).await;
+            }
+        });
+        drop(busy);
+        let rows = recorder.take_trace().reqs;
+        assert_eq!(rows.len(), 4, "{rows:?}");
+        assert!(rows.iter().all(|r| r.status == 200), "{rows:?}");
+        // Four connections, numbered as they were dialed.
+        let ids: Vec<u64> = rows.iter().map(|r| r.conn_id).collect();
+        assert_eq!(ids, [1, 2, 3, 4]);
+    }
+
+    /// A response OpenDAL cannot use (a `Content-Encoding` that is not text) fails the
+    /// operation, and is in the trace as the failed request it is: with its status, its
+    /// connection, an error, and not to be retried (until 9.2 the transport returned before
+    /// recording anything: the operation failed with no request to show for it).
+    #[tokio::test]
+    async fn a_response_with_unusable_headers_is_recorded_as_a_failed_request() {
+        let server = testserver::serve(|_| async {
+            http::Response::builder()
+                .status(200)
+                .header("content-encoding", http::HeaderValue::from_bytes(b"\xff").unwrap())
+                .body(http_body_util::Full::new(Bytes::from_static(b"hello")))
+                .unwrap()
+        })
+        .await;
+        let recorder = Recorder::always_on(64);
+        let t = transport(HttpVersion::H1, &recorder);
+        let req = Request::get(format!("http://{}/k", server.addr))
+            .body(Buffer::new())
+            .unwrap();
+        let Err(err) = t.fetch(req).await else {
+            panic!("the response cannot be used");
+        };
+        assert!(!err.is_temporary(), "{err}");
+        let snapshot = recorder.snapshot();
+        let rows = recorder.take_trace().reqs;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let row = &rows[0];
+        assert_eq!((row.status, row.conn_id, row.reused), (200, 1, false), "{row:?}");
+        let error = row.error.as_deref().expect("a failed request");
+        assert!(error.starts_with("response headers: "), "{error}");
+        assert_eq!(row.detail.as_ref().and_then(|d| d.temporary), Some(false), "{row:?}");
+        assert!(row.total_us >= row.ttfb_us && row.ttfb_us > 0, "{row:?}");
+        let api = &snapshot.apis[0];
+        assert_eq!((api.count, api.errors), (1, 1), "{api:?}");
+    }
+
+    /// The upload in flight is told its connection while it sends, and its retransmit stream
+    /// opens there: on the only connection alive (a closed one beside it does not make it
+    /// ambiguous), and not at all with two uploads in flight. A request that fails or is
+    /// dropped before any answer still carries what the kernel says of its connection.
+    #[tokio::test]
+    async fn an_uploads_retransmit_stream_opens_while_it_sends() {
+        if !tcpinfo::SUPPORTED {
+            return;
+        }
+        let shared = probing(None);
+        let (client, _server, addr) = socket_pair().await;
+        let (closed, closed_server, closed_addr) = socket_pair().await;
+        for addr in [addr, closed_addr] {
+            let Sock::Finding(lookup) = shared.find_socket(addr, false) else {
+                panic!("the lookup starts");
+            };
+            shared.dialed(None, addr, dial_times(), Sock::Finding(lookup.clone()));
+            assert!(answered(&lookup).await.is_some());
+        }
+        tokio::task::yield_now().await;
+        drop((closed, closed_server));
+
+        shared.active_uploads.store(2, Ordering::Release);
+        assert!(
+            shared.uploading_probe(true).is_none(),
+            "two uploads: whose connection?"
+        );
+        shared.active_uploads.store(1, Ordering::Release);
+        for queued in [false, true] {
+            let probe = shared
+                .uploading_probe(queued)
+                .expect("the only connection alive");
+            assert!(probe.is_of(addr));
+        }
+        let probe = shared.uploading_probe(false).unwrap();
+        // A second connection alive, both idle: no telling.
+        let (_other, _other_server, other_addr) = socket_pair().await;
+        let Sock::Finding(lookup) = shared.find_socket(other_addr, false) else {
+            panic!("the lookup starts");
+        };
+        shared.dialed(None, other_addr, dial_times(), Sock::Finding(lookup.clone()));
+        assert!(answered(&lookup).await.is_some());
+        assert!(shared.uploading_probe(false).is_none());
+        assert!(shared.uploading_probe(true).is_none());
+
+        // Answered on that connection: the stream stays, past its send.
+        let sending = SendingStream::default();
+        sending.open(&probe);
+        let (kept, stream) = sending.answered(Some(addr)).expect("its connection");
+        assert!(Arc::ptr_eq(&kept, &probe));
+        assert_eq!(probe.close_stream(stream).1, 0);
+        // Answered elsewhere: the guess is withdrawn.
+        sending.open(&probe);
+        assert!(sending.answered(Some(closed_addr)).is_none());
+        // Never answered: the record has the connection's kernel statistics.
+        sending.open(&probe);
+        let recorder = Recorder::always_on(8);
+        let parts = Request::put("http://h/k").body(()).unwrap().into_parts().0;
+        let mut entered =
+            Entered::new(Instant::now(), &parts, "/k", None, None, 5, &Some(recorder.clone()));
+        entered.cancel.sending = Some(Arc::new(sending));
+        drop(entered);
+        let rows = recorder.take_trace().reqs;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(rows[0].tcp.is_some() && rows[0].error.is_some(), "{rows:?}");
+        drop(client);
     }
 
     /// A dial belongs to the request that started it. When that request is answered on
@@ -1894,9 +2281,10 @@ mod tests {
         assert_eq!(dialed(), 3);
     }
 
-    /// Eight connections dialed at once: each one's socket is found (its kernel statistics
-    /// are on its first request), and the runtime's worker thread never scans the descriptor
-    /// table for it (9.1 scanned the table once per connection, on the worker).
+    /// Eight connections dialed at once: each one's socket is found (the kernel statistics
+    /// are on every request once its lookup has answered: no request waits for it), and the
+    /// runtime's worker thread never scans the descriptor table for it (9.1 scanned the table
+    /// once per connection, on the worker).
     #[tokio::test]
     async fn new_connections_never_scan_descriptors_on_the_worker_thread() {
         const CONNS: usize = 8;
@@ -1914,22 +2302,38 @@ mod tests {
         let t = transport(HttpVersion::H1, &recorder);
         let scans = || tcpinfo::SCANS.with(|n| n.get());
         let before = scans();
-        futures::future::join_all((0..CONNS).map(|_| async {
-            let req = Request::get(format!("http://{}/k", server.addr))
-                .body(Buffer::new())
-                .unwrap();
-            drain(t.fetch(req).await.unwrap()).await;
-        }))
-        .await;
+        let at_once = || futures::future::join_all((0..CONNS).map(|_| get_ok(&t, &server)));
+        at_once().await;
         // This (current-thread) runtime's only worker is the test thread.
         assert_eq!(scans(), before);
 
         let rows = recorder.take_trace().reqs;
         let conns: std::collections::BTreeSet<u64> = rows.iter().map(|r| r.conn_id).collect();
         assert_eq!((rows.len(), conns.len()), (CONNS, CONNS), "{rows:?}");
+        // Numbered as they were dialed: the highest id is how many there are.
+        assert_eq!(conns.last(), Some(&(CONNS as u64)), "{rows:?}");
         assert!(rows.iter().all(|r| !r.reused), "{rows:?}");
-        if tcpinfo::SUPPORTED {
-            assert!(rows.iter().all(|r| r.tcp.is_some()), "{rows:?}");
+        if !tcpinfo::SUPPORTED {
+            return;
         }
+        // Every lookup answers, and from then on each request has its connection's kernel
+        // statistics.
+        let socks: Vec<Sock> = {
+            let c = t.shared.conns.lock().unwrap();
+            c.by_addr.values().map(|e| e.sock.clone()).collect()
+        };
+        assert_eq!(socks.len(), CONNS);
+        for sock in socks {
+            match sock {
+                Sock::Finding(lookup) => assert!(answered(&lookup).await.is_some()),
+                Sock::Found(_) => {}
+                Sock::Unknown | Sock::Missing => panic!("the socket is looked up"),
+            }
+        }
+        at_once().await;
+        assert_eq!(scans(), before);
+        let rows = recorder.take_trace().reqs;
+        assert_eq!(rows.len(), CONNS, "{rows:?}");
+        assert!(rows.iter().all(|r| r.reused && r.tcp.is_some()), "{rows:?}");
     }
 }

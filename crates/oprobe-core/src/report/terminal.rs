@@ -73,6 +73,14 @@ pub fn request_line(i: usize, r: &ReqRow, op_t_us: i64, detail: bool) -> String 
     };
     let conn = match r.protocol {
         WireProtocol::Inproc => "in-process".to_owned(),
+        // The operator's own HTTP client: which connection, warm or cold, nobody observed.
+        p if r.connection_unobserved() => {
+            let protocol = if p == WireProtocol::H2 { "h2" } else { "h1" };
+            format!(
+                "{protocol} conn {}",
+                super::view::ConnectionView::NOT_OBSERVED
+            )
+        }
         p => format!(
             "{} conn#{} {}",
             if p == WireProtocol::H2 { "h2" } else { "h1" },
@@ -329,6 +337,16 @@ fn p50_p99(p50: f64, p99: f64) -> String {
 /// Backend requests: compact columns by default (the app's: ttfb and total p50/p99, bytes
 /// down/up, statuses), every stage's p50/p99 with `detail`.
 pub fn apis_table(r: &Report, detail: bool) -> String {
+    // No share of warm requests where the connections were not observed (the operator's own
+    // HTTP client): unknown is not 0 %.
+    let observed = r.connections.observed();
+    let warm = |pct: f64| {
+        if observed {
+            format!("{pct:.0}%")
+        } else {
+            "-".to_owned()
+        }
+    };
     if detail {
         // Busiest first, as the compact table (`view::apis`).
         let mut apis: Vec<&ApiStats> = r.apis.iter().filter(|a| a.count > 0).collect();
@@ -343,7 +361,7 @@ pub fn apis_table(r: &Report, detail: bool) -> String {
                 vec![
                     a.api.label().to_owned(),
                     a.count.to_string(),
-                    format!("{:.0}%", a.reused_pct),
+                    warm(a.reused_pct),
                     q(&st.queue),
                     if st.connect.count > 0 {
                         q(&st.connect)
@@ -375,7 +393,7 @@ pub fn apis_table(r: &Report, detail: bool) -> String {
             vec![
                 a.api.clone(),
                 a.requests_count.to_string(),
-                format!("{:.0}%", a.reused_ratio * 100.0),
+                warm(a.reused_ratio * 100.0),
                 p50_p99(a.ttfb_p50_ms, a.ttfb_p99_ms),
                 p50_p99(a.total_p50_ms, a.total_p99_ms),
                 format!("{}/{}", fmt_bytes(a.down_bytes), fmt_bytes(a.up_bytes)),
@@ -702,9 +720,9 @@ fn render_with(r: &Report, run: Option<&Run>, detail: bool) -> String {
         );
         let _ = writeln!(
             out,
-            "  {} · {:.1}% of requests warm · peak {} in flight{}",
+            "  {} · {} · peak {} in flight{}",
             c.dials_line(),
-            c.reuse_ratio * 100.0,
+            c.reuse_line(),
             c.peak_inflight_count,
             if c.dial_failures_count > 0 {
                 red(&format!(" · {} failed dials", c.dial_failures_count))
@@ -712,6 +730,9 @@ fn render_with(r: &Report, run: Option<&Run>, detail: bool) -> String {
                 String::new()
             }
         );
+        if let Some(note) = c.unobserved_note() {
+            let _ = writeln!(out, "  {}", dim(note));
+        }
         if !c.phases.is_empty() {
             let _ = writeln!(out, "  dial p50/p99 {}", c.phases);
         }
@@ -1459,6 +1480,50 @@ mod tests {
         }
         // No SLA line, no label.
         assert!(!text.contains("sla") && !detail.contains("sla "), "{text}");
+    }
+
+    /// The connections of a profile whose operator kept its own HTTP client were not
+    /// observed: no count of dials, no share of warm requests, in the section or the table.
+    #[test]
+    fn unobserved_connections_print_not_observed() {
+        set(false);
+        let mut run = super::super::fixture::run();
+        let r = &mut run.report;
+        r.connections.requests = 1100;
+        r.connections.http1_requests = 1100;
+        r.connections.peak_inflight_requests = 8;
+        r.apis = vec![crate::trace::ApiStats {
+            api: crate::trace::Api::GetObject,
+            count: 1100,
+            status: [(200, 1100)].into_iter().collect(),
+            ..Default::default()
+        }];
+        for detail in [false, true] {
+            let text = render_run_with(&run, detail);
+            let words = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(
+                words.contains("dials not observed · reuse not observed · peak 8 in flight"),
+                "{text}"
+            );
+            assert!(
+                words.contains("connecting and sending are part of ttfb"),
+                "{text}"
+            );
+            // The table's warm column has no number either.
+            assert!(words.contains("GetObject 1100 - "), "{text}");
+            for wrong in ["requests warm", "dialed in the window", "plain"] {
+                assert!(!words.contains(wrong), "{wrong}\n{text}");
+            }
+        }
+        // A request of such a profile: answered, on a connection nobody saw.
+        let mut q = run.reqs[0].clone();
+        (q.status, q.conn_id, q.protocol) = (200, 0, WireProtocol::H1);
+        let line = request_line(0, &q, 0, true);
+        assert!(line.contains("h1 conn not observed"), "{line}");
+        assert!(!line.contains("warm") && !line.contains("conn#"), "{line}");
+        // The instrumented client's request names its connection.
+        q.conn_id = 7;
+        assert!(request_line(0, &q, 0, true).contains("h1 conn#7"), "{line}");
     }
 
     #[test]

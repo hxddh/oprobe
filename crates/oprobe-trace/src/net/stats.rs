@@ -153,6 +153,7 @@ mod tests {
                 remote: None,
                 server: None,
                 service_op: Some("GetObject"),
+                service: None,
                 tls: None,
                 tcp: None,
                 detail: None,

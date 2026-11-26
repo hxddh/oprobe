@@ -54,6 +54,36 @@ impl Layer for QueueStampLayer {
     }
 }
 
+/// Tells the observed transport beneath it which operator a request belongs to
+/// ([`crate::record::ServiceLabels`]), for the layer's exporter.
+#[derive(Clone)]
+pub(crate) struct ServiceLabelTransport {
+    inner: HttpTransporter,
+    service: Arc<crate::record::ServiceLabels>,
+}
+
+impl ServiceLabelTransport {
+    /// Label every request through `inner` with the service of `srv`.
+    pub(crate) fn around(inner: HttpTransporter, srv: &Servicer) -> HttpTransporter {
+        let info = srv.info();
+        HttpTransporter::new(Self {
+            inner,
+            service: Arc::new(crate::record::ServiceLabels {
+                scheme: info.scheme().into(),
+                namespace: Arc::from(&*info.name()),
+                root: Arc::from(&*info.root()),
+            }),
+        })
+    }
+}
+
+impl HttpTransport for ServiceLabelTransport {
+    async fn fetch(&self, mut req: http::Request<Buffer>) -> Result<http::Response<HttpBody>> {
+        req.extensions_mut().insert(self.service.clone());
+        self.inner.fetch(req).await
+    }
+}
+
 /// Makes the operator's HTTP transport an observed one and propagates [`OpScope`] into
 /// OpenDAL's background tasks.
 ///
@@ -191,6 +221,7 @@ fn push_op(
         remote: None,
         server: None,
         service_op: None,
+        service: None,
         tls: None,
         tcp: None,
         // The backend's own error kind and temporary bit (design v7 B6).

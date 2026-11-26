@@ -120,7 +120,7 @@ pub use dims::{DimensionStats, HotKeyStats, SliceStats};
 pub use layer::{CacheObserveLayer, QueueStampLayer};
 pub use net::HttpVersion;
 pub use observe::RetryNotify;
-pub use record::{Api, Protocol, RequestRecord, RequestTiming};
+pub use record::{Api, Protocol, RequestRecord, RequestTiming, ServiceLabels};
 pub use recorder::Exporter;
 pub use rows::{FailureCode, ReqDetail, TcpRow, TlsRow};
 pub use snapshot::{
@@ -157,7 +157,6 @@ pub struct Config {
     https: bool,
     keep_http_transport: bool,
     exporter: Option<Arc<dyn Exporter>>,
-    exporter_factory: Option<Arc<dyn Fn() -> Arc<dyn Exporter> + Send + Sync>>,
 }
 
 impl Default for Config {
@@ -168,7 +167,6 @@ impl Default for Config {
             https: true,
             keep_http_transport: false,
             exporter: None,
-            exporter_factory: None,
         }
     }
 }
@@ -181,10 +179,7 @@ impl std::fmt::Debug for Config {
             .field("keep_alive", &self.transport.keep_alive)
             .field("https", &self.https)
             .field("keep_http_transport", &self.keep_http_transport)
-            .field(
-                "exporter",
-                &(self.exporter.is_some() || self.exporter_factory.is_some()),
-            )
+            .field("exporter", &self.exporter.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -270,9 +265,11 @@ impl Config {
     /// # }
     /// ```
     ///
-    /// The price is what only the client itself can see: DNS, TCP, proxy and TLS time are not
-    /// split out (they are part of the time to first byte), and connections (reuse, dials,
-    /// kernel TCP statistics) are not observed. The client settings of this `Config`
+    /// The price is what only the client itself can see: DNS, TCP, proxy and TLS time and the
+    /// time to send a request body are not split out (they are part of the time to first
+    /// byte), and connections (reuse, dials, kernel TCP statistics) are not observed: the
+    /// profile says so ([`ConnStats::observed`]) instead of reporting none dialed and none
+    /// reused. The client settings of this `Config`
     /// ([`Config::http_version`], [`Config::keep_alive`], [`Config::proxy`],
     /// [`Config::extra_ca_pem`], [`Config::insecure_skip_verify`], [`Config::tcp_info`]) do
     /// not apply: the client is yours. [`Config::max_inflight`] still does.
@@ -282,19 +279,11 @@ impl Config {
     }
 
     /// Call `e` for every recorded request and operation (metrics, logs, your own sink).
+    /// Each HTTP request names the service of the operator that issued it
+    /// ([`RequestRecord::service`]), so one exporter serves a layer applied to several
+    /// operators.
     pub fn exporter(mut self, e: Arc<dyn Exporter>) -> Self {
         self.exporter = Some(e);
-        self.exporter_factory = None;
-        self
-    }
-
-    #[cfg(feature = "otel")]
-    pub(crate) fn exporter_factory(
-        mut self,
-        f: impl Fn() -> Arc<dyn Exporter> + Send + Sync + 'static,
-    ) -> Self {
-        self.exporter = None;
-        self.exporter_factory = Some(Arc::new(f));
         self
     }
 
@@ -349,13 +338,17 @@ impl opendal_core::raw::Layer for TraceLayer {
         use opendal_core::raw::*;
         let info = srv.info();
         self.service.get_or_init(|| {
+            // The client settings describe the instrumented client: with the operator's own
+            // transport kept, that client does not exist.
+            let installed = self.context.as_ref().is_some_and(|c| c.keeps_installed());
             let s = file::ServiceRecord {
                 scheme: info.scheme().to_owned(),
                 name: info.name().to_string(),
                 root: info.root().to_string(),
-                http_version: self.http_version,
-                keep_alive: self.keep_alive,
+                http_version: (!installed).then_some(self.http_version),
+                keep_alive: (!installed).then_some(self.keep_alive),
                 max_inflight_count: self.max_inflight_count,
+                http_transport: installed.then(|| file::HTTP_TRANSPORT_INSTALLED.to_owned()),
             };
             if let Some(e) = self.recorder.exporter() {
                 e.on_service(&s.scheme, &s.name, &s.root);
@@ -377,10 +370,17 @@ impl opendal_core::raw::Layer for TraceLayer {
         srv: opendal_core::raw::Servicer,
         inner: opendal_core::OperationContext,
     ) -> opendal_core::OperationContext {
-        match &self.context {
-            Some(c) => c.apply_context(srv, inner),
-            None => inner,
+        let Some(context) = &self.context else {
+            return inner;
+        };
+        let ctx = context.apply_context(srv.clone(), inner);
+        if self.recorder.exporter().is_none() {
+            return ctx;
         }
+        // A layer may be applied to several operators (it is `Clone`): its exporter learns
+        // from each request which operator's service it went to.
+        let labelled = layer::ServiceLabelTransport::around(ctx.http_transport().clone(), &srv);
+        ctx.with_http_transport(labelled)
     }
 }
 
@@ -518,7 +518,7 @@ impl Snapshot {
 /// Instrument an operator: `op.layer(layer)`, then `handle.snapshot()` or `handle.save(path)`.
 pub fn layer(cfg: Config) -> (TraceLayer, Handle) {
     let recorder = Recorder::always_on(cfg.max_rows);
-    if let Some(e) = cfg.exporter.or_else(|| cfg.exporter_factory.map(|f| f())) {
+    if let Some(e) = cfg.exporter {
         recorder.set_exporter(e);
     }
     let http_version = cfg.transport.http;

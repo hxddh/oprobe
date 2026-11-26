@@ -239,8 +239,14 @@ pub fn fmt_usd(v: f64) -> String {
 /// `sas_token`, `session_token`, `password`, `credential`, `private_key`, ...), customer-supplied
 /// encryption keys (`server_side_encryption_customer_key`, `encryption_key`, ...) and generally
 /// any `*_key`. `access_key_id` stays redacted as before; non-secret encryption settings such as
-/// `server_side_encryption = "aws:kms"` remain visible.
+/// `server_side_encryption = "aws:kms"` remain visible, and so do switches
+/// ([`oprobe_trace::util::is_switch_key`]): `skip_signature = true` is how a public bucket is
+/// read, and a stored operator or a replay command without it signs with whatever credentials
+/// are around (9.2 redacted it as a signature).
 pub fn is_secret_key(key: &str) -> bool {
+    if oprobe_trace::util::is_switch_key(key) {
+        return false;
+    }
     let k = key.to_ascii_lowercase();
     let k = k.as_str();
     const NEEDLES: [&str; 13] = [
@@ -278,7 +284,8 @@ pub fn is_secret_query_key(key: &str) -> bool {
 /// `user:password@`, signatures and tokens) and the query parameters named like a secret option
 /// ([`is_secret_query_key`]) dropped; the other parameters stay, in order
 /// (`s3://b/p?region=x&secret_access_key=y` → `s3://b/p?region=x`). Credentials are resolved
-/// again (environment, profile) when the URL is used. Text without `://` is returned unchanged.
+/// again (environment, profile) when the URL is used. Text without `://` only loses what
+/// [`strip_url_credentials`] removes from any text.
 pub fn redact_url(raw: &str) -> String {
     let s = strip_url_credentials(raw);
     let Some(q) = s.find('?') else {
@@ -489,9 +496,74 @@ mod tests {
             "container",
             "allow_anonymous",
             "enable_virtual_host_style",
+            "skip_signature",
+            "disable_config_load",
         ] {
             assert!(!is_secret_key(k), "{k} is not secret");
         }
+    }
+
+    /// A switch is kept wherever an operator is stored or printed: an unsigned run of a public
+    /// bucket replays unsigned (9.2 dropped `skip_signature` as if it were a signature, and
+    /// the replay command signed with the credentials of whoever ran it).
+    #[test]
+    fn switches_survive_redaction() {
+        let url = "s3://bucket/p?skip_signature=true&region=us-east-1";
+        assert_eq!(redact_url(url), url);
+        assert_eq!(
+            redact_url("s3://bucket/p?skip_signature=true&secret_access_key=hunter2"),
+            "s3://bucket/p?skip_signature=true"
+        );
+        let options: std::collections::BTreeMap<String, String> = [
+            ("skip_signature", "true"),
+            ("disable_config_load", "true"),
+            ("signature", "hunter2"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect();
+        let shown = redact_options(&options);
+        assert_eq!(shown["skip_signature"], "true");
+        assert_eq!(shown["disable_config_load"], "true");
+        assert_eq!(shown["signature"], "<redacted>");
+    }
+
+    /// What 9.2's redaction missed reaches no stored or printed URL: a password with a `/`
+    /// (an AWS secret key), a token in the fragment, a Swift temp URL, a GCS resumable
+    /// session, a percent-encoded URL in a value; and an option value that is a bare SAS
+    /// token or a presigned path loses its signature.
+    #[test]
+    fn credentials_in_every_form_are_removed_from_stored_urls_and_options() {
+        assert_eq!(
+            redact_url("s3://AKIA:wJalr/XUtn+FEMI/K7MDENG@bucket/p?region=x"),
+            "s3://bucket/p?region=x"
+        );
+        assert_eq!(
+            redact_url("https://h/cb?a=1#access_token=hunter2&state=2"),
+            "https://h/cb?a=1#state=2"
+        );
+        assert_eq!(
+            redact_url("swift://c/p?temp_url_sig=hunter2&temp_url_expires=1"),
+            "swift://c/p?temp_url_expires=1"
+        );
+        assert_eq!(
+            display_url("https://storage.googleapis.com/upload/b/o?upload_id=hunter2"),
+            "https://storage.googleapis.com/upload/b/o"
+        );
+        assert_eq!(
+            redact_url("s3://b/p?endpoint=http%3A%2F%2Fak%3Ahunter2%40minio%3A9000"),
+            "s3://b/p?endpoint=http%3A%2F%2Fminio%3A9000"
+        );
+        let options: std::collections::BTreeMap<String, String> = [
+            ("endpoint", "http://ak:hun/ter2@minio:9000"),
+            ("source", "/c/k?sv=2024&sig=hunter2"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect();
+        let shown = redact_options(&options);
+        assert_eq!(shown["endpoint"], "http://minio:9000");
+        assert_eq!(shown["source"], "/c/k?sv=2024");
     }
 
     #[test]
