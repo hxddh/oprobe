@@ -323,6 +323,31 @@ pub enum AbDecision {
     Complete,
 }
 
+/// The 2×2 crossover statistics of the signed log ratios `d` of pairs whose candidate ran
+/// first where `candidate_first` says so: `(estimate, w, s)`, the estimate's variance being
+/// `w` times a pair's. With both orders present the estimate is the mean of the two orders'
+/// means and `w = (1/n_AB + 1/n_BA) / 4`; with one order only, the plain mean and `1/n`. `s`
+/// is the sample SD of all of `d`. [`CRITICAL`] is calibrated on `estimate / (s · √w)`.
+fn crossover(d: &[f64], candidate_first: &[bool]) -> (f64, f64, f64) {
+    let (mean, var) = mean_var(d);
+    let of_order = |first: bool| {
+        let v: Vec<f64> = d
+            .iter()
+            .zip(candidate_first)
+            .filter(|(_, f)| **f == first)
+            .map(|(x, _)| *x)
+            .collect();
+        (mean_var(&v).0, v.len() as f64)
+    };
+    let ((m_ba, n_ba), (m_ab, n_ab)) = (of_order(true), of_order(false));
+    let (est, w) = if n_ba > 0.0 && n_ab > 0.0 {
+        ((m_ab + m_ba) / 2.0, (1.0 / n_ab + 1.0 / n_ba) / 4.0)
+    } else {
+        (mean, 1.0 / d.len().max(1) as f64)
+    };
+    (est, w, var.sqrt())
+}
+
 /// The A/B decision of `oprobe prove`, one pair at a time: pure and synchronous, so the whole
 /// rule can be simulated.
 ///
@@ -405,23 +430,9 @@ impl AbTest {
                 }
             })
             .collect();
-        let (mean, var) = mean_var(&d);
-        let of_order = |first: bool| {
-            let v: Vec<f64> = d
-                .iter()
-                .zip(&self.pairs)
-                .filter(|(_, p)| p.candidate_first == first)
-                .map(|(x, _)| *x)
-                .collect();
-            (mean_var(&v).0, v.len() as f64)
-        };
-        let ((m_ba, n_ba), (m_ab, n_ab)) = (of_order(true), of_order(false));
-        let (est, w) = if n_ba > 0.0 && n_ab > 0.0 {
-            ((m_ab + m_ba) / 2.0, (1.0 / n_ab + 1.0 / n_ba) / 4.0)
-        } else {
-            (mean, 1.0 / n as f64)
-        };
-        let sd = var.sqrt().max(self.noise_floor());
+        let orders: Vec<bool> = self.pairs.iter().map(|p| p.candidate_first).collect();
+        let (est, w, s) = crossover(&d, &orders);
+        let sd = s.max(self.noise_floor());
         Some((est, critical(self.max_pairs, n) * sd * w.sqrt(), sd))
     }
 
@@ -701,6 +712,41 @@ mod tests {
         assert_eq!(critical(2, 3), critical(3, 3));
         assert_eq!(critical(6, 9), critical(9, 9));
         assert_eq!(critical(40, 13), critical(12, 12));
+    }
+
+    /// The checked-in table against the statistic and the schedule as they are coded: over
+    /// 120 000 null proofs of 12 pairs, the boundary of each plan is crossed at some look in
+    /// 4 % of them (within the simulation's error), with no help from the noise floor.
+    #[test]
+    fn the_boundary_is_crossed_in_four_percent_of_null_proofs() {
+        let mut rng = SmallRng::seed_from_u64(20_261_126);
+        let proofs = 120_000;
+        // Proofs that crossed the boundary of each plan, by its planned pairs.
+        let mut crossed: std::collections::BTreeMap<usize, u32> = Default::default();
+        for _ in 0..proofs {
+            let seed = rng.r#gen::<u64>();
+            let d: Vec<f64> = (0..MAX_PAIRS).map(|_| normal(&mut rng)).collect();
+            let orders: Vec<bool> = (0..MAX_PAIRS as u64)
+                .map(|p| candidate_first(seed, p))
+                .collect();
+            let t: Vec<f64> = (MIN_DECISIVE_PAIRS..=MAX_PAIRS)
+                .map(|k| {
+                    let (est, w, s) = crossover(&d[..k], &orders[..k]);
+                    (est / (s * w.sqrt())).abs()
+                })
+                .collect();
+            for planned in MIN_DECISIVE_PAIRS..=MAX_PAIRS {
+                let ever = (MIN_DECISIVE_PAIRS..=planned)
+                    .any(|k| t[k - MIN_DECISIVE_PAIRS] > critical(planned, k));
+                *crossed.entry(planned).or_default() += u32::from(ever);
+            }
+        }
+        assert_eq!(crossed.len(), MAX_PAIRS - MIN_DECISIVE_PAIRS + 1);
+        for (planned, count) in crossed {
+            let rate = f64::from(count) / f64::from(proofs);
+            // 0.04 ± 4 standard errors of 120 000 proofs, and under the 5 % promised.
+            assert!((0.0377..=0.0423).contains(&rate), "{planned} pairs: {rate}");
+        }
     }
 
     #[test]
