@@ -23,12 +23,8 @@ All notable changes to this project are documented here. The format follows
   second, with OpenDAL's default retry) leave the limit mostly empty, so the bucket's rate was
   a fraction of that and the finding could read `rate_limit`, or a limit that "changed" during
   the run. A rate under what the limit carries no longer counts against it; a rate above it
-  still marks a bucket. The first build of this release failed its own tests on this.
-
-### Known issues
-
-- A bucket whose fitted burst is more than twice the in-flight step is still taken for a rate
-  limit, on any run. The remedy path is the same (`layers.concurrent_limit.http`).
+  still marks a bucket, and the fitted burst, which the fit ties to the rate, is no longer
+  consulted. The first build of this release failed its own tests on this.
 
 ## v9.3.0 — 2026-11-26
 

@@ -448,6 +448,10 @@ fn served_service_s(obs: &[Obs]) -> f64 {
 /// the cap) the buckets fitted 550 to 1 700 requests/s, and one with a change point
 /// out-fitted the clean step on a slow CI machine. A rate above `c / S` is still what tells a
 /// bucket from a cap, here and in [`peak_served_ratio`].
+///
+/// The fitted burst is no evidence either way and is not consulted: the grid ties it to the
+/// rate (2 to 30 % of it), so "a burst of at most twice the step" was a test of the rate under
+/// another name (the same lab on macOS CI: 54 against a step of 24, and the cap was refused).
 fn little_matches(rate: f64, service_s: f64, c: f64) -> bool {
     let l = rate * service_s;
     c > 0.0 && l > 0.0 && l / c <= 1.35
@@ -462,8 +466,8 @@ fn little_matches(rate: f64, service_s: f64, c: f64) -> bool {
 /// `TimeVarying` whose every segment obeys Little's law with its own service time) is evidence
 /// for the in-flight limit: the in-flight hypothesis takes its likelihood and, with fewer
 /// parameters, is selected. Returns the best such fit's log-likelihood and recall. A genuine
-/// bucket keeps its lead: its burst is not the in-flight ceiling, throttling happens well
-/// below the step, or the service served bursts at a request rate no cap of `c` carries
+/// bucket keeps its lead: throttling happens well below the step, its rate is more than the
+/// cap carries, or the service served bursts at a request rate no cap of `c` carries
 /// ([`peak_served_ratio`]: with OpenDAL's default retry the workers sleep 1 s after a 503 and
 /// wake in step, so a bucket of rate `r` throttles only above ≈ r·S in flight and its fitted
 /// burst sits on the grid's floor — the request rate is what tells it from a cap).
@@ -478,29 +482,19 @@ fn rate_restatement(obs: &[Obs], fits: &mut [Fit], step: Step) -> Option<(f64, f
     let t0 = obs.first().map_or(0, |o| o.t);
     let mut best: Option<(f64, f64)> = None;
     for f in fits.iter_mut() {
-        // The burst of an in-flight cap is ≈ c; the burst grid starts at a share of the rate,
-        // so a bucket on that floor asked for a burst at most that small.
-        let burst_ok = match (f.params.burst_count, f.params.requests_per_s) {
-            (Some(b), Some(r)) => {
-                let b = b as f64;
-                b <= 2.0 * cf || b <= (r * MIN_BURST_FACTOR).max(1.0).round() + 1.0
-            }
-            _ => false,
-        };
         let equivalent = match f.kind {
             HypothesisKind::RateLimit => {
-                burst_ok
-                    && f.params
-                        .requests_per_s
-                        .is_some_and(|r| little_matches(r, s_all, cf))
+                true && f
+                    .params
+                    .requests_per_s
+                    .is_some_and(|r| little_matches(r, s_all, cf))
             }
             HypothesisKind::TimeVarying => {
                 let cp = f.params.change_points_s.first().copied().unwrap_or(0.0);
                 let cut = t0 + (cp * 1e6) as i64;
                 let (a, b): (Vec<Obs>, Vec<Obs>) = obs.iter().partition(|o| o.t < cut);
                 let segs = &f.params.segment_requests_per_s;
-                burst_ok
-                    && segs.len() == 2
+                true && segs.len() == 2
                     && little_matches(segs[0], served_service_s(&a), cf)
                     && little_matches(segs[1], served_service_s(&b), cf)
             }
@@ -1643,6 +1637,9 @@ pub(crate) mod tests {
         let mut fits = vec![bucket(vec![1131.0, 595.0], 48)];
         assert_eq!(rate_restatement(&obs, &mut fits, step), Some((-53.7, 1.0)));
         assert!(fits[0].evidence[0].contains("indistinguishable"));
+        // macOS CI, the same lab: a burst of 54, more than twice the step.
+        let mut fits = vec![bucket(vec![829.8, 1062.6], 54)];
+        assert!(rate_restatement(&obs, &mut fits, step).is_some());
         // A rate no cap of 24 carries at this service time is a bucket's own.
         let mut fits = vec![bucket(vec![4000.0, 3600.0], 48)];
         assert_eq!(rate_restatement(&obs, &mut fits, step), None);
