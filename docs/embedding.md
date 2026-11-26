@@ -19,7 +19,7 @@ meter).
 [dependencies]
 oprobe-trace = "9"                      # once it is on crates.io
 # until then:
-# oprobe-trace = { git = "https://github.com/hxddh/oprobe", tag = "v9.3.0" }
+# oprobe-trace = { git = "https://github.com/hxddh/oprobe", tag = "v9.3.1" }
 ```
 
 ```rust
@@ -288,7 +288,7 @@ oprobe binary and has no semver promise; do not enable it.
 `oprobe.trace/9` is one JSON document, readable without oprobe:
 
 ```text
-{ "format": "oprobe.trace/9", "oprobe_trace_version": "9.3.0", "created_at": "…",
+{ "format": "oprobe.trace/9", "oprobe_trace_version": "9.3.1", "created_at": "…",
   "service": { "scheme": "s3", "name": "my-bucket", "root": "/data/", "http_version": "auto", "keep_alive": true },
   "snapshot": { … }, "rows": { "ops": [ … ], "reqs": [ … ], "info": { … }, "sampling": { … } } }
 ```
