@@ -7,14 +7,15 @@
 //! - a connector layer (`ClientBuilder::connector_layer`) that times every dial and learns the
 //!   connection's local/remote address,
 //! - a delegating TLS session store that timestamps the ClientHello, splitting TCP from TLS,
-//! - the response's `HttpInfo` (local address = connection identity), which marks the first
-//!   request on every connection as cold and attributes that connection's dial to it.
-//!
+//! - the response's `HttpInfo` (local and remote address = connection identity), which tells
+//!   the request which connection served it: the request that started a connection's dial is
+//!   its cold request and carries the dial ([`DialClaim`]),
 //! - the same rustls crypto provider and certificate verifier with delegating wrappers that
 //!   report the negotiated cipher suite, key-exchange group, HelloRetryRequests and whether the
 //!   handshake was resumed (`net::tlsinfo`),
 //! - the kernel's TCP statistics of the connection at request end (`net::tcpinfo`: the socket
-//!   is found by its addresses and only queried, never owned).
+//!   is found by its addresses when the connection is dialed, off the runtime's threads, and
+//!   only queried, never owned).
 //!
 //! What this transport cannot see: time waiting inside reqwest's pool for an
 //! idle connection or HTTP/2 stream is part of TTFB.
@@ -40,13 +41,13 @@ use rustls::{ClientConfig, NamedGroup};
 use rustls_pki_types::ServerName;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use super::tcpinfo::{self, TcpProbe};
+use super::tcpinfo::{self, ConnAddr, SockFinder, TcpProbe};
 use super::tls::{InsecureCertVerifier, crypto_provider};
 use super::tlsinfo::{HandshakeMarks, ObservedVerifier, TlsEvent, observed_provider};
 use super::{HttpVersion, TransportConfig};
 use crate::record::{Protocol, RequestRecord, RequestTiming};
 use crate::recorder::DialRecord;
-use crate::rows::{TcpRow, TlsRow};
+use crate::rows::TlsRow;
 use crate::{InflightGuard, OpScope, Recorder};
 
 // ---------------------------------------------------------------------------------------------
@@ -78,7 +79,51 @@ fn tls_hook(e: TlsEvent) {
     mark(|m| m.hs.apply(e));
 }
 
-/// A finished dial waiting for the first request that uses its connection.
+/// The dials one request started, until the request is answered. hyper dials while a request
+/// waits for a connection, but the connection does not have to serve that request: on HTTP/2
+/// other requests share it and may be answered first, and on HTTP/1.1 an idle connection may
+/// turn up before the dial ends. The dial belongs to the request that started it:
+///
+/// - answered on the connection it dialed, that request is the connection's cold request and
+///   carries the dial's DNS, TCP, proxy and TLS time;
+/// - answered elsewhere, failed or dropped, its dials are connections nobody waited for
+///   ([`Recorder::record_unclaimed_dial`]): counted, with their handshake phases, and warm for
+///   whoever uses them;
+/// - a request answered on a connection another request dialed never takes that dial, whoever
+///   is answered first: it waited for the connection (`dial_wait_us`) or found it warm.
+#[derive(Debug, Default)]
+struct DialClaim {
+    state: Mutex<ClaimState>,
+}
+
+#[derive(Debug, Default)]
+struct ClaimState {
+    /// The request was answered (or gave up): a dial finishing from now on is unclaimed.
+    settled: bool,
+    /// The connections its dials made, each still holding its [`Dialed`].
+    dialed: Vec<ConnAddr>,
+}
+
+tokio::task_local! {
+    /// The claim of the request being sent (while reqwest's `send` future is polled, which is
+    /// where hyper calls the connector).
+    static CLAIM: Arc<DialClaim>;
+}
+
+/// Settles a request's dials when its `fetch` ends without an answer (an error, or the future
+/// dropped by a timeout); a no-op after [`Shared::settle`].
+struct ClaimGuard {
+    claim: Arc<DialClaim>,
+    shared: Arc<Shared>,
+}
+
+impl Drop for ClaimGuard {
+    fn drop(&mut self) {
+        self.shared.settle(&self.claim, None);
+    }
+}
+
+/// A finished dial waiting for the request that started it.
 #[derive(Clone, Debug)]
 struct Dialed {
     dns_us: u64,
@@ -87,12 +132,15 @@ struct Dialed {
     tls_us: u64,
     end: Instant,
     tls: Option<TlsRow>,
+    /// The request that started it.
+    by: Arc<DialClaim>,
 }
 
 /// Where the kernel statistics of a connection come from.
 #[derive(Clone, Debug, Default)]
 enum Sock {
-    /// Not looked up yet (looked up once, at the end of the connection's first request).
+    /// A connection this table did not see dialed (its entry was evicted): looked up by the
+    /// next request on it.
     #[default]
     Unknown,
     /// Not found or not supported: never looked up again.
@@ -126,6 +174,16 @@ impl Default for ConnEntry {
     }
 }
 
+/// What a dial measured.
+struct DialTimes {
+    dns_us: u64,
+    tcp_us: u64,
+    proxy_us: u64,
+    tls_us: u64,
+    end: Instant,
+    tls: Option<TlsRow>,
+}
+
 /// Decrements a connection's active stream counter when the request finishes.
 struct StreamGuard(Option<Arc<AtomicU32>>);
 
@@ -143,7 +201,7 @@ const MAX_TRACKED_CONNS: usize = 8192;
 #[derive(Default)]
 struct Conns {
     seq: u64,
-    /// Connection identity (local, remote address) -> (id, dial awaiting its first request).
+    /// Connection identity (local, remote address) -> (id, dial awaiting its request).
     /// The local address alone is not unique: the kernel reuses a local port for connections
     /// to different peers, and object stores answer from many addresses.
     by_addr: HashMap<(SocketAddr, SocketAddr), ConnEntry>,
@@ -152,6 +210,8 @@ struct Conns {
 struct Shared {
     recorder: Option<Arc<Recorder>>,
     conns: Mutex<Conns>,
+    /// Finds the sockets of new connections off the runtime's threads.
+    finder: Arc<SockFinder>,
     /// Concurrent uploads currently sending body frames (`> 1` disables shared socket send-queue attribution).
     active_uploads: AtomicU32,
     /// Configured egress proxy (display form) and its addresses: a dial whose peer is one of
@@ -173,53 +233,116 @@ impl Drop for UploadGuard {
 }
 
 impl Shared {
-    /// Kernel TCP statistics of connection `addr` now (see `net::tcpinfo` for why this is safe).
-    /// `known` is what the connection table said when the response arrived.
-    fn tcp_info(
-        &self,
-        addr: (SocketAddr, SocketAddr),
-        known: Sock,
-    ) -> Option<(TcpRow, Option<u64>)> {
+    /// The kernel probe of connection `addr` (see `net::tcpinfo` for why querying it is safe):
+    /// fresh from its handshake, or (`warm`) in use before this table knew it, so its bytes so
+    /// far are not counted again. The descriptor lookup runs off the runtime's threads.
+    async fn probe(&self, addr: ConnAddr, warm: bool) -> Sock {
         if !self.tcp_info {
-            return None;
+            return Sock::Missing;
         }
-        let probe = self.probe(addr, known)?;
-        let (row, retrans) = probe.sample_with_retrans()?;
-        // The bytes on the wire since the connection's previous sample: every request is
-        // sampled, so the deltas add up to the connection's traffic.
-        if let Some(r) = &self.recorder {
-            let (rx, tx) = probe.wire_since_last(&row);
-            r.add_wire(rx, tx);
+        match self.finder.find(addr).await {
+            Some(id) => Sock::Found(Arc::new(TcpProbe::new_seeded(id, warm))),
+            None => Sock::Missing,
         }
-        Some((row, retrans))
     }
 
-    /// The kernel probe of connection `addr` (looked up once per connection; racing streams on
-    /// a newly discovered connection converge on the first installed `TcpProbe`).
-    fn probe(&self, addr: (SocketAddr, SocketAddr), known: Sock) -> Option<Arc<TcpProbe>> {
-        let id = match known {
-            Sock::Found(p) => p,
-            Sock::Missing => return None,
-            Sock::Unknown => {
-                // Scan the descriptor table without holding the lock; warm=true so an already
-                // pooled connection never double-counts lifetime bytes.
-                let found =
-                    tcpinfo::find(addr.0, addr.1).map(|id| Arc::new(TcpProbe::new_seeded(id, true)));
-                if let Ok(mut c) = self.conns.lock()
-                    && let Some(e) = c.by_addr.get_mut(&addr)
-                {
-                    match &e.sock {
-                        Sock::Found(existing) => return Some(existing.clone()),
-                        Sock::Missing => return None,
-                        Sock::Unknown => {
-                            e.sock = found.clone().map_or(Sock::Missing, Sock::Found);
-                        }
-                    }
+    /// A dial started by the request behind `claim` made connection `addr`. The dial waits in
+    /// the connection table for that request's answer; when the request is already settled
+    /// (or the dial was started outside any request), nobody waited for the connection.
+    fn dialed(&self, claim: Option<Arc<DialClaim>>, addr: ConnAddr, times: DialTimes, sock: Sock) {
+        let DialTimes {
+            dns_us,
+            tcp_us,
+            proxy_us,
+            tls_us,
+            end,
+            tls,
+        } = times;
+        // Lock order: a claim, then the connection table.
+        let mut claimed = claim.as_ref().and_then(|c| c.state.lock().ok());
+        let dial = match (&claim, claimed.as_deref_mut()) {
+            (Some(by), Some(state)) if !state.settled => {
+                state.dialed.push(addr);
+                Some(Dialed {
+                    dns_us,
+                    tcp_us,
+                    proxy_us,
+                    tls_us,
+                    end,
+                    tls,
+                    by: by.clone(),
+                })
+            }
+            _ => {
+                if let Some(r) = &self.recorder {
+                    r.record_unclaimed_dial(dns_us, tcp_us, proxy_us, tls_us);
                 }
-                found?
+                None
             }
         };
-        Some(id)
+        let Ok(mut c) = self.conns.lock() else {
+            return;
+        };
+        c.seq += 1;
+        let id = c.seq;
+        if c.by_addr.len() >= MAX_TRACKED_CONNS {
+            let keep_after = id.saturating_sub(MAX_TRACKED_CONNS as u64 / 2);
+            c.by_addr.retain(|_, e| {
+                e.dial.is_some()
+                    || e.active_streams.load(Ordering::Relaxed) > 0
+                    || e.last_seq >= keep_after
+            });
+        }
+        c.by_addr.insert(
+            addr,
+            ConnEntry {
+                id,
+                dial,
+                dial_end: Some(end),
+                sock,
+                last_seq: id,
+                ..Default::default()
+            },
+        );
+    }
+
+    /// The request behind `claim` was answered on connection `used` (`None`: it got no
+    /// answer). Returns the dial of `used` when this request started it; its other dials made
+    /// connections nobody waited for.
+    fn settle(&self, claim: &Arc<DialClaim>, used: Option<ConnAddr>) -> Option<Dialed> {
+        let dialed = {
+            let mut state = claim.state.lock().ok()?;
+            state.settled = true;
+            std::mem::take(&mut state.dialed)
+        };
+        if dialed.is_empty() {
+            return None;
+        }
+        let mut own = None;
+        let mut unclaimed = Vec::new();
+        if let Ok(mut c) = self.conns.lock() {
+            for addr in dialed {
+                // The entry may be another connection by now (the 4-tuple was reused).
+                let Some(dial) = c
+                    .by_addr
+                    .get_mut(&addr)
+                    .and_then(|e| e.dial.take_if(|d| Arc::ptr_eq(&d.by, claim)))
+                else {
+                    continue;
+                };
+                if Some(addr) == used {
+                    own = Some(dial);
+                } else {
+                    unclaimed.push(dial);
+                }
+            }
+        }
+        if let Some(r) = &self.recorder {
+            for d in unclaimed {
+                r.record_unclaimed_dial(d.dns_us, d.tcp_us, d.proxy_us, d.tls_us);
+            }
+        }
+        own
     }
 
     /// Unambiguous kernel probe for an active upload: either the sole connection in the pool, or
@@ -417,7 +540,8 @@ impl<S> tower_layer::Layer<S> for DialLayer {
 impl<S, R> tower_service::Service<R> for DialService<S>
 where
     S: tower_service::Service<R>,
-    S::Response: Connection,
+    S::Response: Connection + Send,
+    S::Error: Send,
     S::Future: Send + 'static,
 {
     type Response = S::Response;
@@ -430,6 +554,8 @@ where
 
     fn call(&mut self, req: R) -> Self::Future {
         let shared = self.shared.clone();
+        // hyper calls the connector while it polls the request that needs a connection.
+        let claim = CLAIM.try_with(Arc::clone).ok();
         let marks = Arc::new(Mutex::new(DialMarks::default()));
         let fut = DIAL
             .scope(marks.clone(), self.inner.call(req))
@@ -450,7 +576,7 @@ where
                 Some(h) => (us(tcp_from, h), us(h, end)),
                 None => (us(tcp_from, end), 0),
             };
-            match &res {
+            let made = match &res {
                 Ok(conn) => {
                     let connected = conn.connected();
                     let mut ext = http::Extensions::new();
@@ -492,50 +618,17 @@ where
                                 .unwrap_or_default(),
                         });
                     }
-                    if let Some(i) = info {
-                        // Look up the socket right after the handshake finishes, before hyper
-                        // multiplexes streams onto it, so concurrent HTTP/2 streams share one
-                        // seeded `TcpProbe` without racing on `/proc/self/fd`.
-                        let sock = if shared.tcp_info {
-                            tcpinfo::find(i.local_addr(), i.remote_addr()).map_or(
-                                Sock::Missing,
-                                |sid| Sock::Found(Arc::new(TcpProbe::new_seeded(sid, false))),
-                            )
-                        } else {
-                            Sock::Missing
+                    info.map(|i| {
+                        let times = DialTimes {
+                            dns_us,
+                            tcp_us,
+                            proxy_us,
+                            tls_us,
+                            end,
+                            tls,
                         };
-                        if let Ok(mut c) = shared.conns.lock() {
-                            c.seq += 1;
-                            let id = c.seq;
-                            if c.by_addr.len() >= MAX_TRACKED_CONNS {
-                                let keep_after = id.saturating_sub(MAX_TRACKED_CONNS as u64 / 2);
-                                c.by_addr.retain(|_, e| {
-                                    e.dial.is_some()
-                                        || e.active_streams.load(Ordering::Relaxed) > 0
-                                        || e.last_seq >= keep_after
-                                });
-                            }
-                            c.by_addr.insert(
-                                (i.local_addr(), i.remote_addr()),
-                                ConnEntry {
-                                    id,
-                                    dial: Some(Dialed {
-                                        dns_us,
-                                        tcp_us,
-                                        proxy_us,
-                                        tls_us,
-                                        end,
-                                        tls,
-                                    }),
-                                    dial_end: Some(end),
-                                    sock,
-                                    active_streams: Arc::new(AtomicU32::new(0)),
-                                    last_seq: id,
-                                    ..Default::default()
-                                },
-                            );
-                        }
-                    }
+                        ((i.local_addr(), i.remote_addr()), times)
+                    })
                 }
                 Err(_) => {
                     if let Some(r) = &shared.recorder {
@@ -552,7 +645,14 @@ where
                             cipher: String::new(),
                         });
                     }
+                    None
                 }
+            };
+            if let Some((addr, times)) = made {
+                // Find the socket right after the handshake, before hyper puts requests on
+                // the connection, so that all of them share one probe.
+                let sock = shared.probe(addr, false).await;
+                shared.dialed(claim, addr, times, sock);
             }
             res
         })
@@ -593,6 +693,7 @@ impl FidelityTransport {
         let shared = Arc::new(Shared {
             recorder,
             conns: Mutex::new(Conns::default()),
+            finder: Arc::default(),
             active_uploads: AtomicU32::new(0),
             proxy: proxy.map(|p| p.display()),
             proxy_addrs,
@@ -734,12 +835,8 @@ impl http_body::Body for TimedBody {
 /// (OpenDAL's timeout layer, a tail-cut, a cancelled operation): otherwise the slowest
 /// requests would vanish from every statistic.
 pub(super) struct CancelGuard {
-    armed: bool,
-    api: crate::Api,
-    service_op: Option<&'static str>,
-    method: String,
-    bytes_up: u64,
-    start_offset_us: u64,
+    /// The request as it entered the transport; `None` once it records itself.
+    record: Option<RequestRecord>,
     t_start: Instant,
     t_ready: Option<Instant>,
     scope: Option<Arc<OpScope>>,
@@ -747,46 +844,21 @@ pub(super) struct CancelGuard {
 }
 
 impl CancelGuard {
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn new(
-        api: crate::Api,
-        service_op: Option<&'static str>,
-        method: String,
-        bytes_up: u64,
-        start_offset_us: u64,
-        t_start: Instant,
-        scope: Option<Arc<OpScope>>,
-        recorder: Option<Arc<Recorder>>,
-    ) -> Self {
-        Self {
-            armed: true,
-            api,
-            service_op,
-            method,
-            bytes_up,
-            start_offset_us,
-            t_start,
-            t_ready: None,
-            scope,
-            recorder,
-        }
-    }
-
     pub(super) fn set_ready(&mut self, t_ready: Instant) {
         self.t_ready = Some(t_ready);
     }
 
     /// The request reached a point where it records itself.
     pub(super) fn disarm(&mut self) {
-        self.armed = false;
+        self.record = None;
     }
 }
 
 impl Drop for CancelGuard {
     fn drop(&mut self) {
-        if !self.armed {
+        let Some(mut record) = self.record.take() else {
             return;
-        }
+        };
         let now = Instant::now();
         let total_us = now.saturating_duration_since(self.t_start).as_micros() as u64;
         let (queue_us, ttfb_us) = match self.t_ready {
@@ -796,62 +868,52 @@ impl Drop for CancelGuard {
             }
             None => (total_us, 0),
         };
-        let record = RequestRecord {
-            operation: None,
-            api: self.api,
-            method: std::mem::take(&mut self.method),
-            status: 0,
-            protocol: Protocol::Http1,
-            reused: false,
-            conn_id: 0,
-            start_offset_us: self.start_offset_us,
-            timing: RequestTiming {
-                queue_us,
-                ttfb_us,
-                total_us,
-                ..Default::default()
-            },
-            bytes_up: self.bytes_up,
-            bytes_down: 0,
-            request_id: None,
-            retry_after_ms: None,
-            error: Some("cancelled before a response (timeout or abandoned)".into()),
-            remote: None,
-            service_op: self.service_op,
-            tls: None,
-            tcp: None,
-            detail: Some(Box::new(crate::rows::ReqDetail {
-                aborted: true,
-                temporary: Some(true),
-                ..Default::default()
-            })),
+        record.reused = false;
+        record.timing = RequestTiming {
+            queue_us,
+            ttfb_us,
+            total_us,
+            ..Default::default()
         };
+        record.error = Some("cancelled before a response (timeout or abandoned)".into());
+        record.detail = Some(Box::new(crate::rows::ReqDetail {
+            aborted: true,
+            temporary: Some(true),
+            ..Default::default()
+        }));
         Finisher::emit(record, &self.scope, &self.recorder);
     }
 }
 
-struct Finisher {
-    record: RequestRecord,
-    /// The connection (local, remote), for its TCP statistics at request end.
-    conn: Option<(SocketAddr, SocketAddr)>,
-    /// The connection's socket as known when the response arrived (no second table lookup).
-    sock: Sock,
+/// The connection a request was answered on, for what is read when the request ends.
+pub(super) struct ConnUse {
+    addr: ConnAddr,
     shared: Arc<Shared>,
-    t_start: Instant,
-    t_headers: Instant,
-    stall: Duration,
-    last_yield: Option<Instant>,
-    scope: Option<Arc<OpScope>>,
-    recorder: Option<Arc<Recorder>>,
-    _inflight: InflightGuard,
-    _permit: Option<OwnedSemaphorePermit>,
+    /// The connection's kernel probe and this request's stream on it.
+    probe: Option<(Arc<TcpProbe>, u64)>,
     _stream: StreamGuard,
+}
+
+pub(super) struct Finisher {
+    pub(super) record: RequestRecord,
+    /// `None` for a request sent through a transport oprobe does not own (`net::wrapped`).
+    pub(super) conn: Option<ConnUse>,
+    pub(super) t_start: Instant,
+    pub(super) t_headers: Instant,
+    pub(super) scope: Option<Arc<OpScope>>,
+    pub(super) recorder: Option<Arc<Recorder>>,
+    pub(super) _inflight: InflightGuard,
+    pub(super) _permit: Option<OwnedSemaphorePermit>,
     /// The first bytes of an error response (its provider error code).
-    sniff: Option<super::signals::ErrorSniffer>,
+    pub(super) sniff: Option<super::signals::ErrorSniffer>,
 }
 
 impl Finisher {
-    fn emit(record: RequestRecord, scope: &Option<Arc<OpScope>>, rec: &Option<Arc<Recorder>>) {
+    pub(super) fn emit(
+        record: RequestRecord,
+        scope: &Option<Arc<OpScope>>,
+        rec: &Option<Arc<Recorder>>,
+    ) {
         match scope {
             Some(s) => s.push_request(record),
             None => {
@@ -862,13 +924,11 @@ impl Finisher {
         }
     }
 
-    fn finish(mut self, error: Option<String>) {
+    /// `stall`: how long the body waited on its consumer.
+    fn finish(mut self, stall: Duration, error: Option<String>) {
         let now = Instant::now();
-        if let Some(t) = self.last_yield.take() {
-            self.stall += now.saturating_duration_since(t);
-        }
         let body_total = now.saturating_duration_since(self.t_headers);
-        let stall = self.stall.min(body_total);
+        let stall = stall.min(body_total);
         let t = &mut self.record.timing;
         t.stall_us = stall.as_micros() as u64;
         t.body_us = (body_total - stall).as_micros() as u64;
@@ -878,21 +938,29 @@ impl Finisher {
         }
         self.record.detail = super::signals::finish(self.record.detail.take(), self.sniff.as_ref());
         // After the clock stopped: the query is not part of the request's time.
-        if let Some(addr) = self.conn {
-            if let Ok(mut c) = self.shared.conns.lock()
-                && let Some(e) = c.by_addr.get_mut(&addr)
+        if let Some(conn) = self.conn.take() {
+            if let Ok(mut c) = conn.shared.conns.lock()
+                && let Some(e) = c.by_addr.get_mut(&conn.addr)
             {
                 e.recent_ends[e.recent_idx] = Some(now);
                 e.recent_idx = (e.recent_idx + 1) % e.recent_ends.len();
             }
-            let sock = std::mem::take(&mut self.sock);
-            if let Some((row, retrans)) = self.shared.tcp_info(addr, sock) {
-                self.record.tcp = Some(Box::new(row));
-                if let Some(n) = retrans.filter(|n| *n > 0) {
+            if let Some((probe, stream)) = conn.probe {
+                let (row, retrans) = probe.close_stream(stream);
+                if let Some(row) = row {
+                    // The bytes on the wire since the connection's previous sample: every
+                    // request is sampled, so the deltas add up to the connection's traffic.
+                    if let Some(r) = &conn.shared.recorder {
+                        let (rx, tx) = probe.wire_since_last(&row);
+                        r.add_wire(rx, tx);
+                    }
+                    self.record.tcp = Some(Box::new(row));
+                }
+                if retrans > 0 {
                     self.record
                         .detail
                         .get_or_insert_with(Default::default)
-                        .retrans_count = Some(n);
+                        .retrans_count = Some(retrans);
                 }
             }
         }
@@ -900,31 +968,51 @@ impl Finisher {
     }
 }
 
-struct TimedResponseBody<S> {
+/// A response body that times its transfer and its consumer, and records the request when it
+/// ends (read to its end, failed, or dropped part-way).
+pub(super) struct TimedResponseBody<S> {
     inner: Pin<Box<S>>,
     fin: Option<Finisher>,
-    uri: String,
+    /// Time the body waited on its consumer so far.
+    stall: Duration,
+    last_yield: Option<Instant>,
     /// Declared body length, to tell a body read to its end from one dropped part-way.
     expected: Option<u64>,
 }
 
-impl<S: Stream<Item = reqwest::Result<Bytes>>> Stream for TimedResponseBody<S> {
+impl<S> TimedResponseBody<S> {
+    pub(super) fn new(inner: S, fin: Finisher, expected: Option<u64>) -> Self {
+        Self {
+            inner: Box::pin(inner),
+            // Until the consumer first polls the body, the bytes wait on it, not the network.
+            last_yield: Some(fin.t_headers),
+            fin: Some(fin),
+            stall: Duration::ZERO,
+            expected,
+        }
+    }
+
+    fn finish(&mut self, error: Option<String>) {
+        if let Some(f) = self.fin.take() {
+            let waiting = self.last_yield.take().map_or(Duration::ZERO, |t| t.elapsed());
+            f.finish(self.stall + waiting, error);
+        }
+    }
+}
+
+impl<S: Stream<Item = Result<Buffer>>> Stream for TimedResponseBody<S> {
     type Item = Result<Buffer>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
-        if let Some(f) = this.fin.as_mut()
-            && let Some(t) = f.last_yield.take()
-        {
-            f.stall += t.elapsed();
+        if let Some(t) = this.last_yield.take() {
+            this.stall += t.elapsed();
         }
         loop {
             match this.inner.as_mut().poll_next(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(None) => {
-                    if let Some(f) = this.fin.take() {
-                        f.finish(None);
-                    }
+                    this.finish(None);
                     return Poll::Ready(None);
                 }
                 Poll::Ready(Some(Ok(b))) => {
@@ -933,28 +1021,20 @@ impl<S: Stream<Item = reqwest::Result<Bytes>>> Stream for TimedResponseBody<S> {
                     }
                     if let Some(f) = this.fin.as_mut() {
                         f.record.bytes_down += b.len() as u64;
-                        f.last_yield = Some(Instant::now());
+                        this.last_yield = Some(Instant::now());
                         if let Some(s) = f.sniff.as_mut() {
-                            s.push(&b);
+                            s.push(&b.to_bytes());
                         }
                     }
-                    return Poll::Ready(Some(Ok(Buffer::from(b))));
+                    return Poll::Ready(Some(Ok(b)));
                 }
                 Poll::Ready(Some(Err(err))) => {
-                    let temporary = is_temporary_error(&err);
-                    let err = err.without_url();
-                    let msg = format!("response body: {err}");
-                    if let Some(f) = this.fin.take() {
-                        f.finish(Some(msg));
-                    }
-                    return Poll::Ready(Some(Err(Error::new(
-                        ErrorKind::Unexpected,
-                        "read data from http response",
-                    )
-                    .with_operation("reqwest::fetch")
-                    .with_context("url", this.uri.clone())
-                    .with_temporary(temporary)
-                    .set_source(err))));
+                    // The transport's own error (reqwest's, without its URL) when there is
+                    // one; the row never needs OpenDAL's context around it.
+                    let cause = std::error::Error::source(&err)
+                        .map_or_else(|| err.to_string(), |source| source.to_string());
+                    this.finish(Some(format!("response body: {cause}")));
+                    return Poll::Ready(Some(Err(err)));
                 }
             }
         }
@@ -963,38 +1043,160 @@ impl<S: Stream<Item = reqwest::Result<Bytes>>> Stream for TimedResponseBody<S> {
 
 impl<S> Drop for TimedResponseBody<S> {
     fn drop(&mut self) {
-        if let Some(mut f) = self.fin.take() {
-            let got = f.record.bytes_down;
-            let abort_msg = match self.expected {
-                Some(n) if got < n => Some(format!("response body dropped after {got} of {n} bytes")),
-                None if f.record.status < 400
-                    && f.record.method != "HEAD"
-                    && !matches!(f.record.status, 100..=199 | 204 | 304) =>
-                {
-                    Some(format!("response body dropped before EOF after {got} bytes"))
-                }
-                _ => None,
-            };
-            if abort_msg.is_some() {
-                let d = f.record.detail.get_or_insert_with(Default::default);
-                d.aborted = true;
-                d.temporary = Some(true);
+        let Some(f) = self.fin.as_mut() else {
+            return;
+        };
+        let got = f.record.bytes_down;
+        let abort_msg = match self.expected {
+            Some(n) if got < n => Some(format!("response body dropped after {got} of {n} bytes")),
+            None if f.record.status < 400
+                && f.record.method != "HEAD"
+                && !matches!(f.record.status, 100..=199 | 204 | 304) =>
+            {
+                Some(format!("response body dropped before EOF after {got} bytes"))
             }
-            f.finish(abort_msg);
+            _ => None,
+        };
+        if abort_msg.is_some() {
+            let d = f.record.detail.get_or_insert_with(Default::default);
+            d.aborted = true;
+            d.temporary = Some(true);
+        }
+        self.finish(abort_msg);
+    }
+}
+
+/// What a transport notes when a request enters it.
+pub(super) struct Entered {
+    /// When the request was enqueued: at the outer concurrency gate when `QueueStampLayer`
+    /// stamped it (around `ConcurrentLimitLayer::with_http_concurrent_limit`), else now.
+    pub(super) t_start: Instant,
+    pub(super) scope: Option<Arc<OpScope>>,
+    pub(super) record: RequestRecord,
+    pub(super) cancel: CancelGuard,
+    /// The length of the byte range asked for (over-read, range sizes).
+    pub(super) range_bytes: Option<u64>,
+}
+
+impl Entered {
+    /// `now` is when the transport was entered; `path`, `query` and `server` (host, port) are
+    /// where the request goes.
+    pub(super) fn new(
+        now: Instant,
+        parts: &http::request::Parts,
+        path: &str,
+        query: Option<&str>,
+        server: Option<(Arc<str>, u16)>,
+        bytes_up: u64,
+        recorder: &Option<Arc<Recorder>>,
+    ) -> Self {
+        let scope = OpScope::current();
+        let t_start = parts
+            .extensions
+            .get::<crate::layer::EnqueuedAt>()
+            .map_or(now, |e| e.0.min(now));
+        // The exact API the service named (OpenDAL `ServiceOperation`); the URL heuristic only
+        // when the service attached none.
+        let (api, service_op) = crate::Api::resolve(
+            parts.extensions.get::<ServiceOperation>().map(|o| o.0),
+            &parts.method,
+            path,
+            query,
+        );
+        let range_bytes = parts
+            .headers
+            .get(http::header::RANGE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(super::range_len);
+        // The OpenDAL operation (`read`, `write`, …: the `operation` label of exported
+        // metrics).
+        let operation = parts
+            .extensions
+            .get::<opendal_core::raw::Operation>()
+            .map(|o| o.into_static());
+        let start_offset_us = scope
+            .as_ref()
+            .map(|s| t_start.saturating_duration_since(s.started).as_micros() as u64)
+            .unwrap_or(0);
+        let record = RequestRecord {
+            operation,
+            api,
+            method: parts.method.to_string(),
+            status: 0,
+            protocol: Protocol::Http1,
+            reused: true,
+            conn_id: 0,
+            start_offset_us,
+            timing: RequestTiming::default(),
+            bytes_up,
+            bytes_down: 0,
+            request_id: None,
+            retry_after_ms: None,
+            error: None,
+            remote: None,
+            server,
+            service_op,
+            tls: None,
+            tcp: None,
+            detail: None,
+        };
+        let cancel = CancelGuard {
+            record: Some(record.clone()),
+            t_start,
+            t_ready: None,
+            scope: scope.clone(),
+            recorder: recorder.clone(),
+        };
+        Self {
+            t_start,
+            scope,
+            record,
+            cancel,
+            range_bytes,
         }
     }
+}
+
+/// The response headers arrived: note the status, the protocol and what the server said.
+/// Returns the sniffer of an error body.
+pub(super) fn answered(
+    record: &mut RequestRecord,
+    range_bytes: Option<u64>,
+    status: http::StatusCode,
+    version: http::Version,
+    headers: &http::HeaderMap,
+) -> Option<super::signals::ErrorSniffer> {
+    record.protocol = if version == http::Version::HTTP_2 {
+        Protocol::Http2
+    } else {
+        Protocol::Http1
+    };
+    record.status = status.as_u16();
+    record.request_id = REQUEST_ID_HEADERS.iter().find_map(|h| {
+        headers
+            .get(*h)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
+    });
+    let mut detail = super::signals::from_headers(headers, record.status);
+    detail.range_bytes = range_bytes;
+    record.detail = Some(Box::new(detail));
+    if record.status < 400 {
+        return None;
+    }
+    record.retry_after_ms = super::signals::retry_after_ms(headers);
+    Some(super::signals::ErrorSniffer::default())
+}
+
+/// `uri` as an error context may quote it: without the signature or token of a presigned or
+/// SAS URL (OpenDAL's own transport quotes the URL whole).
+fn public_url(uri: &http::Uri) -> String {
+    crate::util::strip_url_credentials(&uri.to_string())
 }
 
 impl HttpTransport for FidelityTransport {
     async fn fetch(&self, req: Request<Buffer>) -> Result<Response<HttpBody>> {
         let now = Instant::now();
-        let scope = OpScope::current();
-        // Include any time spent parked on an outer concurrency gate (`QueueStampLayer` around
-        // `ConcurrentLimitLayer::with_http_concurrent_limit`) before reaching the transport.
-        let t_start = req
-            .extensions()
-            .get::<crate::layer::EnqueuedAt>()
-            .map_or(now, |e| e.0.min(now));
         let recorder = self.shared.recorder.clone();
 
         // --- identical to opendal-http-transport-reqwest ---------------------------------
@@ -1010,7 +1212,7 @@ impl HttpTransport for FidelityTransport {
         let url = reqwest::Url::parse(target).map_err(|err| {
             Error::new(ErrorKind::Unexpected, "request url is invalid")
                 .with_operation("reqwest::fetch")
-                .with_context("url", uri.to_string())
+                .with_context("url", public_url(&uri))
                 .set_source(err)
         })?;
         if parts.extensions.get::<HttpRedirect>().is_some() {
@@ -1034,62 +1236,26 @@ impl HttpTransport for FidelityTransport {
         }
         // ---------------------------------------------------------------------------------
 
-        let method = parts.method.clone();
-        // The exact API the service named (OpenDAL `ServiceOperation`); the URL heuristic only
-        // when the service attached none.
-        let (api, service_op) = crate::Api::resolve(
-            parts.extensions.get::<ServiceOperation>().map(|o| o.0),
-            &method,
+        let bytes_up = body.len() as u64;
+        let server = url
+            .host_str()
+            .map(|host| (Arc::from(host), url.port_or_known_default().unwrap_or(0)));
+        let Entered {
+            t_start,
+            scope,
+            mut record,
+            cancel: mut cancel_guard,
+            range_bytes,
+        } = Entered::new(
+            now,
+            &parts,
             url.path(),
             url.query(),
-        );
-        let bytes_up = body.len() as u64;
-        // What the service asked for: the byte range's length (over-read, range sizes) and the
-        // OpenDAL operation (`read`, `write`, …: the `operation` label of exported metrics).
-        let range_bytes = parts
-            .headers
-            .get(http::header::RANGE)
-            .and_then(|v| v.to_str().ok())
-            .and_then(super::range_len);
-        let operation = parts
-            .extensions
-            .get::<opendal_core::raw::Operation>()
-            .map(|o| o.into_static());
-        let start_offset_us = scope
-            .as_ref()
-            .map(|s| t_start.saturating_duration_since(s.started).as_micros() as u64)
-            .unwrap_or(0);
-        let mut cancel_guard = CancelGuard::new(
-            api,
-            service_op,
-            method.to_string(),
+            server,
             bytes_up,
-            start_offset_us,
-            t_start,
-            scope.clone(),
-            recorder.clone(),
+            &recorder,
         );
-        let mut record = RequestRecord {
-            operation,
-            api,
-            method: method.to_string(),
-            status: 0,
-            protocol: Protocol::Http1,
-            reused: true,
-            conn_id: 0,
-            start_offset_us,
-            timing: RequestTiming::default(),
-            bytes_up,
-            bytes_down: 0,
-            request_id: None,
-            retry_after_ms: None,
-            error: None,
-            remote: None,
-            service_op,
-            tls: None,
-            tcp: None,
-            detail: None,
-        };
+        let (api, service_op) = (record.api, record.service_op);
 
         let permit = match &self.limiter {
             Some(sem) => Some(
@@ -1124,9 +1290,20 @@ impl HttpTransport for FidelityTransport {
             }));
         }
 
-        // Static span name: no allocation per request. For uploads on platforms with kernel TCP
-        // inspection, watch the socket's send buffer drain once the last frame enters the kernel
-        // so `send_us` / `upload_acked_us` reflect send-queue drain rather than buffer copy.
+        // The dials hyper starts while it polls this request are this request's.
+        let claim = Arc::<DialClaim>::default();
+        let _settle_dials = ClaimGuard {
+            claim: claim.clone(),
+            shared: self.shared.clone(),
+        };
+        // Static span name: no allocation per request.
+        let send_fut = CLAIM
+            .scope(claim.clone(), rb.send())
+            .instrument_await(service_op.unwrap_or_else(|| api.label()));
+
+        // For uploads on platforms with kernel TCP inspection, watch the socket's send buffer
+        // drain once the last frame enters the kernel so `send_us` / `upload_acked_us` reflect
+        // send-queue drain rather than buffer copy.
         let acked_us = Arc::new(AtomicU64::new(0));
         let upload_guard = (bytes_up > 0).then(|| {
             self.shared.active_uploads.fetch_add(1, Ordering::AcqRel);
@@ -1161,9 +1338,6 @@ impl HttpTransport for FidelityTransport {
                     wait = (wait * 2).min(Duration::from_millis(2));
                 }
             };
-            let send_fut = rb
-                .send()
-                .instrument_await(service_op.unwrap_or_else(|| api.label()));
             tokio::pin!(watch);
             tokio::pin!(send_fut);
             let mut watch_done = false;
@@ -1177,9 +1351,7 @@ impl HttpTransport for FidelityTransport {
                 }
             }
         } else {
-            rb.send()
-                .instrument_await(service_op.unwrap_or_else(|| api.label()))
-                .await
+            send_fut.await
         };
         let t_headers = Instant::now();
         drop(upload_guard);
@@ -1202,19 +1374,26 @@ impl HttpTransport for FidelityTransport {
                 Finisher::emit(record, &scope, &recorder);
                 return Err(Error::new(ErrorKind::Unexpected, "send http request")
                     .with_operation("reqwest::send")
-                    .with_context("url", uri.to_string())
+                    .with_context("url", public_url(&uri))
                     .with_temporary(temporary)
                     .set_source(err));
             }
         };
 
-        // Connection identity: the first request seen on a local address is the cold one and
-        // carries that connection's dial.
+        // Connection identity: which connection answered, and whether this request is the
+        // one that dialed it.
         let addr = resp
             .extensions()
             .get::<HttpInfo>()
             .map(|i| (i.local_addr(), i.remote_addr()));
-        let mut dial = None;
+        let own_dial = self.shared.settle(&claim, addr);
+        let sniff = answered(
+            &mut record,
+            range_bytes,
+            resp.status(),
+            resp.version(),
+            resp.headers(),
+        );
         let mut dial_end = None;
         let mut sock = Sock::Missing;
         let mut stream_guard = StreamGuard(None);
@@ -1226,30 +1405,36 @@ impl HttpTransport for FidelityTransport {
             let seq = c.seq;
             let entry = c.by_addr.entry(addr).or_insert_with(|| ConnEntry {
                 id: seq,
-                active_streams: Arc::new(AtomicU32::new(0)),
                 last_seq: seq,
                 ..Default::default()
             });
             entry.last_seq = seq;
             record.conn_id = entry.id;
-            dial = entry.dial.take();
             dial_end = entry.dial_end;
             sock = entry.sock.clone();
             open_streams = entry.active_streams.fetch_add(1, Ordering::AcqRel) + 1;
             stream_guard = StreamGuard(Some(entry.active_streams.clone()));
         }
-        record.protocol = if resp.version() == http::Version::HTTP_2 {
-            Protocol::Http2
-        } else {
-            Protocol::Http1
-        };
+        if let (Some(addr), Sock::Unknown) = (addr, &sock) {
+            // A connection the table did not see dialed (its entry was evicted): find its
+            // socket now; requests racing here converge on the first probe installed.
+            sock = self.shared.probe(addr, true).await;
+            if let Ok(mut c) = self.shared.conns.lock()
+                && let Some(e) = c.by_addr.get_mut(&addr)
+            {
+                match &e.sock {
+                    Sock::Unknown => e.sock = sock.clone(),
+                    known => sock = known.clone(),
+                }
+            }
+        }
         // Time on the wire starts when the connection was ready.
         let mut wire_from = t_ready;
         let mut waited_dial_us = None;
-        match dial {
-            // The connection was dialed while this request waited: its phases are this
-            // request's.
-            Some(d) if d.end >= t_ready => {
+        match own_dial {
+            // This request started the connection's dial and waited for it: the dial's
+            // phases are this request's.
+            Some(d) => {
                 record.reused = false;
                 record.timing.dns_us = d.dns_us;
                 record.timing.tcp_us = d.tcp_us;
@@ -1260,18 +1445,11 @@ impl HttpTransport for FidelityTransport {
                     wire_from = d.end;
                 }
             }
-            // Finished before this request was even ready: a dial that lost hyper's race
-            // against an idle connection and went to the pool. Count the connection, but this
-            // request found it ready (warm) and did not wait for it.
-            Some(d) => {
-                if let Some(r) = &recorder {
-                    r.record_unclaimed_dial(d.dns_us, d.tcp_us, d.proxy_us, d.tls_us);
-                }
-            }
             None => {
-                // Concurrent HTTP/2 stream that waited in the client pool while another stream
-                // dialed this connection: attribute the wait to `queue_us` and start `wire_from`
-                // once the connection was actually ready.
+                // Another request dialed this connection while this one waited in the
+                // client's pool (a concurrent HTTP/2 stream, or an HTTP/1.1 request taking
+                // a connection its dialer no longer needed): the wait is `queue_us`, and
+                // the wire time starts once the connection was ready.
                 if let Some(d_end) = dial_end
                     && d_end > t_ready
                     && d_end <= t_headers
@@ -1316,16 +1494,7 @@ impl HttpTransport for FidelityTransport {
         let sent_at = ack_at.unwrap_or(buffered_at);
         record.timing.send_us = sent_at.saturating_duration_since(wire_from).as_micros() as u64;
         record.timing.ttfb_us = t_headers.saturating_duration_since(sent_at).as_micros() as u64;
-        record.status = resp.status().as_u16();
-        let header = |n: &str| {
-            resp.headers()
-                .get(n)
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_owned)
-        };
-        record.request_id = REQUEST_ID_HEADERS.iter().find_map(|h| header(h));
-        let mut detail = super::signals::from_headers(resp.headers(), record.status);
-        detail.range_bytes = range_bytes;
+        let detail = record.detail.get_or_insert_with(Default::default);
         if record.protocol == Protocol::Http2 && open_streams > 0 {
             detail.streams_count = Some(open_streams);
         }
@@ -1337,11 +1506,6 @@ impl HttpTransport for FidelityTransport {
                 Some(buffered_at.saturating_duration_since(wire_from).as_micros() as u64);
             detail.upload_acked_us =
                 Some(sent_at.saturating_duration_since(wire_from).as_micros() as u64);
-        }
-        record.detail = Some(Box::new(detail));
-        let sniff = (record.status >= 400).then(super::signals::ErrorSniffer::default);
-        if record.status >= 400 {
-            record.retry_after_ms = super::signals::retry_after_ms(resp.headers());
         }
 
         // --- identical to opendal-http-transport-reqwest ---------------------------------
@@ -1368,29 +1532,41 @@ impl HttpTransport for FidelityTransport {
         std::mem::swap(hr.headers_mut().expect("fresh builder"), resp.headers_mut());
         // ---------------------------------------------------------------------------------
 
+        let conn = addr.map(|addr| ConnUse {
+            addr,
+            shared: self.shared.clone(),
+            // From here to the request's end it shares the connection's retransmits.
+            probe: match sock {
+                Sock::Found(probe) => {
+                    let stream = probe.open_stream();
+                    Some((probe, stream))
+                }
+                Sock::Unknown | Sock::Missing => None,
+            },
+            _stream: stream_guard,
+        });
         let fin = Finisher {
             record,
-            conn: addr,
-            sock,
-            shared: self.shared.clone(),
+            conn,
             t_start,
             t_headers,
-            stall: Duration::ZERO,
-            // Until the consumer first polls the body, the bytes wait on it, not the network.
-            last_yield: Some(t_headers),
             scope,
             recorder,
             _permit: permit,
             _inflight: inflight,
-            _stream: stream_guard,
             sniff,
         };
-        let stream = TimedResponseBody {
-            inner: Box::pin(resp.bytes_stream()),
-            fin: Some(fin),
-            uri: uri.to_string(),
-            expected: content_length,
-        };
+        let chunks = futures::StreamExt::map(resp.bytes_stream(), move |chunk| {
+            chunk.map(Buffer::from).map_err(|err| {
+                let temporary = is_temporary_error(&err);
+                Error::new(ErrorKind::Unexpected, "read data from http response")
+                    .with_operation("reqwest::fetch")
+                    .with_context("url", public_url(&uri))
+                    .with_temporary(temporary)
+                    .set_source(err.without_url())
+            })
+        });
+        let stream = TimedResponseBody::new(chunks, fin, content_length);
         Ok(hr
             .body(HttpBody::new(stream, content_length))
             .expect("response must build"))
@@ -1400,11 +1576,13 @@ impl HttpTransport for FidelityTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::net::testserver;
 
     fn shared() -> Arc<Shared> {
         Arc::new(Shared {
             recorder: None,
             conns: Mutex::new(Conns::default()),
+            finder: Arc::default(),
             proxy: None,
             proxy_addrs: Vec::new(),
             tcp_info: false,
@@ -1439,10 +1617,12 @@ mod tests {
         }
     }
 
-    /// A failed request records why, never the URL: an Azure SAS or presigned query carries a
-    /// signature (`?sig=`), and the trace is a file people share.
+    /// A failed request records why, never the URL, and the error it returns quotes the URL
+    /// without its credentials: a presigned query or an Azure SAS is a bearer credential, the
+    /// trace is a file people share, and the error is printed and logged (9.1 kept the whole
+    /// URL in the returned error's context).
     #[tokio::test]
-    async fn a_failed_request_never_records_its_url() {
+    async fn a_failed_request_never_leaks_its_presigned_url() {
         let recorder = Recorder::always_on(64);
         let errors = Arc::new(Errors(Mutex::new(Vec::new())));
         recorder.set_exporter(errors.clone());
@@ -1452,17 +1632,220 @@ mod tests {
         };
         let t = FidelityTransport::new(cfg, false, Some(recorder.clone())).unwrap();
         // Nothing listens on port 1: the connect fails.
-        let req = Request::get("http://127.0.0.1:1/c/k?sv=2024&sig=SECRET")
-            .body(Buffer::new())
-            .unwrap();
-        assert!(t.fetch(req).await.is_err());
+        let secrets = ["SIGSECRET", "STSSECRET", "AKIASECRET", "SASSECRET"];
+        let req = Request::get(
+            "http://127.0.0.1:1/c/k?X-Amz-Expires=900&X-Amz-Credential=AKIASECRET%2Fs3\
+             &X-Amz-Security-Token=STSSECRET&X-Amz-Signature=SIGSECRET&sv=2024&sig=SASSECRET",
+        )
+        .body(Buffer::new())
+        .unwrap();
+        let Err(err) = t.fetch(req).await else {
+            panic!("the connect cannot succeed");
+        };
+        // The error the application sees, as it prints and logs it.
+        let shown = [format!("{err}"), format!("{err:?}"), format!("{err:#?}")];
+        assert!(
+            shown[0].contains("http://127.0.0.1:1/c/k?X-Amz-Expires=900&sv=2024"),
+            "{err}"
+        );
+        // What the exporter saw, and the rows.
         let errors = errors.0.lock().unwrap().clone();
         assert_eq!(errors.len(), 1, "{errors:?}");
         assert!(errors[0].starts_with("send http request"), "{errors:?}");
-        let rows = format!("{:?}", recorder.take_trace());
-        for text in errors.iter().chain([&rows]) {
-            assert!(!text.contains("SECRET"), "{text}");
+        // The saved profile, byte for byte.
+        let dir = std::env::temp_dir().join(format!("oprobe-trace-presigned-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("failed.oprobe");
+        let snapshot = recorder.snapshot();
+        let rows = recorder.take_trace();
+        assert_eq!(rows.reqs.len(), 1);
+        crate::file::write(&path, None, &snapshot, Some(&rows)).unwrap();
+        let file = String::from_utf8_lossy(&std::fs::read(&path).unwrap()).into_owned();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(file.contains("send http request"), "{file}");
+        let rows = format!("{rows:?}");
+        for text in shown.iter().chain(&errors).chain([&rows, &file]) {
+            for secret in secrets {
+                assert!(!text.contains(secret), "{secret} in {text}");
+            }
+        }
+        for text in errors.iter().chain([&rows, &file]) {
             assert!(!text.contains("127.0.0.1:1/"), "{text}");
+        }
+    }
+
+    async fn drain(resp: Response<HttpBody>) {
+        let (_, mut body) = resp.into_parts();
+        body.to_buffer().await.unwrap();
+    }
+
+    fn transport(http: HttpVersion, recorder: &Arc<Recorder>) -> FidelityTransport {
+        let cfg = TransportConfig {
+            proxy: Some(None),
+            http,
+            ..TransportConfig::default()
+        };
+        FidelityTransport::new(cfg, false, Some(recorder.clone())).unwrap()
+    }
+
+    /// Two requests share one HTTP/2 connection. The first one dials it; the second waits for
+    /// that dial and is answered first. The dial still is the first request's: it is the cold
+    /// one, and the second one found the connection without dialing (9.1 gave the dial to
+    /// whichever request was answered first).
+    #[tokio::test]
+    async fn the_request_that_dialed_carries_the_dial_whoever_is_answered_first() {
+        // `/first` is answered only when the test says so.
+        let release = Arc::new(tokio::sync::Notify::new());
+        let held = release.clone();
+        let server = testserver::serve(move |req| {
+            let held = held.clone();
+            async move {
+                if req.uri().path() == "/first" {
+                    held.notified().await;
+                }
+                testserver::respond(200, "ok")
+            }
+        })
+        .await;
+        let recorder = Recorder::always_on(64);
+        let t = transport(HttpVersion::H2, &recorder);
+        let get = |path: &str| {
+            Request::get(format!("http://{}/{path}", server.addr))
+                .body(Buffer::new())
+                .unwrap()
+        };
+        // Polled in this order: the first request starts the dial, the second finds the
+        // connection being dialed and waits for it.
+        let first = async { drain(t.fetch(get("first")).await.unwrap()).await };
+        let second = async {
+            drain(t.fetch(get("second")).await.unwrap()).await;
+            release.notify_one();
+        };
+        tokio::join!(first, second);
+
+        let snapshot = recorder.snapshot();
+        assert_eq!(snapshot.connections.dialed, 1, "{:?}", snapshot.connections);
+        let mut rows = recorder.take_trace().reqs;
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        // The first request started first and ended last.
+        rows.sort_by_key(|r| std::cmp::Reverse(r.total_us));
+        let (first, second) = (&rows[0], &rows[1]);
+        assert_eq!(first.conn_id, second.conn_id, "{rows:?}");
+        assert_eq!(first.protocol, crate::rows::WireProtocol::H2, "{rows:?}");
+        assert!(!first.reused, "the dialing request is the cold one: {rows:?}");
+        assert!(first.tcp_us > 0, "{rows:?}");
+        assert!(second.reused, "the request answered first did not dial: {rows:?}");
+        assert_eq!(second.connect_us(), 0, "{rows:?}");
+    }
+
+    fn conn(port: u16) -> ConnAddr {
+        (
+            SocketAddr::from(([127, 0, 0, 1], port)),
+            SocketAddr::from(([127, 0, 0, 1], 443)),
+        )
+    }
+
+    fn dial_times() -> DialTimes {
+        DialTimes {
+            dns_us: 10,
+            tcp_us: 20,
+            proxy_us: 0,
+            tls_us: 30,
+            end: Instant::now(),
+            tls: None,
+        }
+    }
+
+    /// A dial belongs to the request that started it. When that request is answered on
+    /// another connection, fails or is dropped, the connection is one nobody waited for: it
+    /// is counted once, and no request is charged its handshake.
+    #[test]
+    fn a_dial_its_request_did_not_use_is_counted_and_charged_to_nobody() {
+        let recorder = Recorder::always_on(64);
+        let shared = Arc::new(Shared {
+            recorder: Some(recorder.clone()),
+            conns: Mutex::new(Conns::default()),
+            finder: Arc::default(),
+            proxy: None,
+            proxy_addrs: Vec::new(),
+            tcp_info: false,
+            active_uploads: AtomicU32::new(0),
+        });
+        let dialed = || recorder.snapshot().connections.dialed;
+        let claim = Arc::<DialClaim>::default;
+
+        // Another request is answered on the new connection first: the dial is not its own.
+        let (dialer, other) = (claim(), claim());
+        shared.dialed(Some(dialer.clone()), conn(1), dial_times(), Sock::Missing);
+        assert!(shared.settle(&other, Some(conn(1))).is_none());
+        assert_eq!(dialed(), 0);
+        // The dialer is answered on a connection that turned up meanwhile: unclaimed.
+        assert!(shared.settle(&dialer, Some(conn(2))).is_none());
+        assert_eq!(dialed(), 1);
+        // A dial that ends after its request was answered is unclaimed at once.
+        shared.dialed(Some(dialer), conn(3), dial_times(), Sock::Missing);
+        assert_eq!(dialed(), 2);
+        let c = shared.conns.lock().unwrap();
+        assert!(c.by_addr.values().all(|e| e.dial.is_none()));
+        assert_eq!(c.by_addr.len(), 2);
+        drop(c);
+
+        // Answered on the connection it dialed: the dial is this request's (and is counted
+        // with the request, not here).
+        let dialer = claim();
+        shared.dialed(Some(dialer.clone()), conn(4), dial_times(), Sock::Missing);
+        let own = shared.settle(&dialer, Some(conn(4))).expect("its own dial");
+        assert_eq!((own.dns_us, own.tcp_us, own.tls_us), (10, 20, 30));
+        assert_eq!(dialed(), 2);
+
+        // A request dropped before any answer (a timeout): its dial is unclaimed.
+        let dialer = claim();
+        let guard = ClaimGuard {
+            claim: dialer.clone(),
+            shared: shared.clone(),
+        };
+        shared.dialed(Some(dialer), conn(5), dial_times(), Sock::Missing);
+        assert_eq!(dialed(), 2);
+        drop(guard);
+        assert_eq!(dialed(), 3);
+    }
+
+    /// Eight connections dialed at once: each one's socket is found (its kernel statistics
+    /// are on its first request), and the runtime's worker thread never scans the descriptor
+    /// table for it (9.1 scanned the table once per connection, on the worker).
+    #[tokio::test]
+    async fn new_connections_never_scan_descriptors_on_the_worker_thread() {
+        const CONNS: usize = 8;
+        // Every request is held until all have arrived, so none can reuse a connection.
+        let all_arrived = Arc::new(tokio::sync::Barrier::new(CONNS));
+        let server = testserver::serve(move |_| {
+            let all_arrived = all_arrived.clone();
+            async move {
+                all_arrived.wait().await;
+                testserver::respond(200, "ok")
+            }
+        })
+        .await;
+        let recorder = Recorder::always_on(64);
+        let t = transport(HttpVersion::H1, &recorder);
+        let scans = || tcpinfo::SCANS.with(|n| n.get());
+        let before = scans();
+        futures::future::join_all((0..CONNS).map(|_| async {
+            let req = Request::get(format!("http://{}/k", server.addr))
+                .body(Buffer::new())
+                .unwrap();
+            drain(t.fetch(req).await.unwrap()).await;
+        }))
+        .await;
+        // This (current-thread) runtime's only worker is the test thread.
+        assert_eq!(scans(), before);
+
+        let rows = recorder.take_trace().reqs;
+        let conns: std::collections::BTreeSet<u64> = rows.iter().map(|r| r.conn_id).collect();
+        assert_eq!((rows.len(), conns.len()), (CONNS, CONNS), "{rows:?}");
+        assert!(rows.iter().all(|r| !r.reused), "{rows:?}");
+        if tcpinfo::SUPPORTED {
+            assert!(rows.iter().all(|r| r.tcp.is_some()), "{rows:?}");
         }
     }
 }

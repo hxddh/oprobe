@@ -19,11 +19,13 @@
 //! No descriptor is ever duplicated, so no connection is kept open by oprobe.
 //!
 //! Cost: three syscalls per sample (≈1–3 µs), once per request (retransmits are attributed
-//! per request). In OpenDAL mode the descriptor table is scanned once per connection, at the
-//! end of its first request.
+//! per request). The descriptor of a connection inside reqwest is found by scanning the
+//! process's descriptor table: [`SockFinder`] does that on the runtime's blocking pool, never
+//! on a worker thread, and one scan answers every connection dialed meanwhile.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::rows::TcpRow;
 
@@ -42,57 +44,112 @@ impl SockId {
     }
 }
 
-/// Sampling of one connection's statistics, with the retransmits since the previous sample
-/// (attributed to the request that took it).
+/// Who a connection's retransmits are charged to. The kernel counts retransmitted segments
+/// per connection, and an HTTP/2 connection carries many requests at once, so the count is
+/// read when a request ends and what it grew by since the previous reading is split evenly
+/// among the requests in flight on the connection at that moment (the indivisible rest goes to
+/// the one ending). Every retransmit is charged exactly once: the charges of a connection's
+/// requests add up to the growth of its counter. On HTTP/1.1 one request is in flight at a
+/// time and is charged everything since the previous request ended.
+#[derive(Debug, Default)]
+pub struct RetransLedger {
+    /// The connection's counter at the previous reading (`None`: never read).
+    seen: Option<u64>,
+    /// The requests in flight: (stream, retransmits charged to it so far).
+    open: Vec<(u64, u64)>,
+    next_stream: u64,
+}
+
+impl RetransLedger {
+    /// A ledger for a connection whose counter reads `total` now (`None`: unreadable; the
+    /// first reading then only sets the baseline).
+    pub fn seeded(total: Option<u64>) -> Self {
+        Self {
+            seen: total,
+            ..Self::default()
+        }
+    }
+
+    /// A request starts using the connection: its stream.
+    pub fn open(&mut self) -> u64 {
+        self.next_stream += 1;
+        self.open.push((self.next_stream, 0));
+        self.next_stream
+    }
+
+    /// `stream` ends while the connection's counter reads `total` (`None`: unreadable now):
+    /// settle the growth among the streams in flight and return what `stream` was charged.
+    /// Readings may arrive out of order (two requests ending at once): the counter never
+    /// goes back, so a stale reading settles nothing.
+    pub fn close(&mut self, stream: u64, total: Option<u64>) -> u64 {
+        let Some(at) = self.open.iter().position(|(id, _)| *id == stream) else {
+            return 0;
+        };
+        if let Some(total) = total {
+            let grown = self.seen.map_or(0, |seen| total.saturating_sub(seen));
+            self.seen = Some(self.seen.map_or(total, |seen| seen.max(total)));
+            let n = self.open.len() as u64;
+            for (_, charged) in &mut self.open {
+                *charged += grown / n;
+            }
+            self.open[at].1 += grown % n;
+        }
+        self.open.swap_remove(at).1
+    }
+}
+
+/// Sampling of one connection's statistics, with its retransmits charged to the requests in
+/// flight ([`RetransLedger`]).
 #[derive(Debug)]
 pub struct TcpProbe {
     pub id: SockId,
-    /// `total_retrans` at the previous sample (`u64::MAX`: none yet).
-    last_retrans: AtomicU64,
+    retrans: Mutex<RetransLedger>,
     /// Bytes received and acknowledged at the previous sample (wire bytes since then).
     last_rx: AtomicU64,
     last_tx: AtomicU64,
 }
 
 impl TcpProbe {
-    pub fn new(id: SockId) -> Self {
-        Self::new_seeded(id, false)
-    }
-
     /// Create a probe for `id`. When `warm` is false (a freshly dialed connection), `last_rx`
-    /// and `last_tx` start at 0 so handshake bytes count once, and `last_retrans` is seeded
-    /// from the socket's post-handshake counter so retransmits on the first request are seen.
+    /// and `last_tx` start at 0 so handshake bytes count once, and the retransmit ledger is
+    /// seeded from the socket's post-handshake counter so retransmits on the first request
+    /// are seen.
     /// When `warm` is true (an already-pooled connection re-discovered after table eviction),
     /// `last_rx` and `last_tx` are seeded from the socket's current totals so prior bytes are
     /// never double-counted.
     pub fn new_seeded(id: SockId, warm: bool) -> Self {
         let initial = id.query();
-        let (last_retrans, last_rx, last_tx) = match (initial, warm) {
-            (Some(r), false) => (r.retrans, 0, 0),
-            (Some(r), true) => (r.retrans, r.bytes_received, r.bytes_acked),
-            (None, _) => (u64::MAX, 0, 0),
+        let (last_rx, last_tx) = match (&initial, warm) {
+            (Some(r), true) => (r.bytes_received, r.bytes_acked),
+            _ => (0, 0),
         };
         Self {
             id,
-            last_retrans: AtomicU64::new(last_retrans),
+            retrans: Mutex::new(RetransLedger::seeded(initial.map(|r| r.retrans))),
             last_rx: AtomicU64::new(last_rx),
             last_tx: AtomicU64::new(last_tx),
         }
     }
 
-    /// The connection's statistics now (every request is sampled: per-request retransmits
-    /// need every sample, design v5 §3 M9).
-    pub fn sample(&self) -> Option<TcpRow> {
-        self.sample_with_retrans().map(|(r, _)| r)
+    /// A request starts using the connection (its response headers arrived): the stream to
+    /// hand back to [`Self::close_stream`].
+    pub fn open_stream(&self) -> u64 {
+        self.ledger().open()
     }
 
-    /// [`Self::sample`] plus the retransmitted segments since the previous sample of this
-    /// connection (`None` for the first).
-    pub fn sample_with_retrans(&self) -> Option<(TcpRow, Option<u64>)> {
-        let row = self.id.query()?;
-        let prev = self.last_retrans.swap(row.retrans, Ordering::AcqRel);
-        let delta = (prev != u64::MAX).then(|| row.retrans.saturating_sub(prev));
-        Some((row, delta))
+    /// The request of `stream` ended: the connection's statistics now (`None` when it is
+    /// already closed) and the retransmitted segments charged to the request (every request
+    /// is sampled: the charges need every reading, design v5 §3 M9).
+    pub fn close_stream(&self, stream: u64) -> (Option<TcpRow>, u64) {
+        let row = self.id.query();
+        let charged = self
+            .ledger()
+            .close(stream, row.as_ref().map(|r| r.retrans));
+        (row, charged)
+    }
+
+    fn ledger(&self) -> std::sync::MutexGuard<'_, RetransLedger> {
+        self.retrans.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// The bytes received and sent (acknowledged) on the wire since the previous call, from
@@ -118,10 +175,82 @@ pub fn sock_id_of(s: &tokio::net::TcpStream) -> Option<SockId> {
     imp::sock_id_of(s)
 }
 
-/// Find the descriptor of the connection `local → remote` in this process (OpenDAL mode: the
-/// socket lives inside reqwest). `None` when not found or not supported.
-pub fn find(local: SocketAddr, remote: SocketAddr) -> Option<SockId> {
-    imp::find(local, remote)
+/// A connection's identity: its (local, remote) address.
+pub type ConnAddr = (SocketAddr, SocketAddr);
+
+#[cfg(test)]
+thread_local! {
+    /// Descriptor-table scans this thread made.
+    pub static SCANS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Find the descriptors of the connections `wanted` in this process, in one pass over its
+/// descriptor table (the sockets live inside reqwest). `None` for one that is not found, and
+/// for all where the platform has no safe lookup. It reads a directory and makes a syscall
+/// per descriptor: call it through [`SockFinder`], off the runtime's worker threads.
+pub fn find_all(wanted: &[ConnAddr]) -> Vec<Option<SockId>> {
+    #[cfg(test)]
+    SCANS.with(|n| n.set(n.get() + 1));
+    imp::find_all(wanted)
+}
+
+/// Finds the sockets of new connections off the runtime's worker threads. A lookup is queued
+/// and answered by a task on the blocking pool; while that task scans the descriptor table,
+/// the lookups of other connections queue up and share its next scan, so a burst of new
+/// connections costs a few scans, not one each, and never a blocked worker.
+#[derive(Debug, Default)]
+pub struct SockFinder {
+    queue: Mutex<FinderQueue>,
+}
+
+#[derive(Debug, Default)]
+struct FinderQueue {
+    pending: Vec<(ConnAddr, tokio::sync::oneshot::Sender<Option<SockId>>)>,
+    /// A blocking task is draining `pending`.
+    scanning: bool,
+}
+
+impl SockFinder {
+    /// The descriptor of connection `addr`; `None` when it is not found, the platform has no
+    /// lookup, or the runtime is shutting down.
+    pub async fn find(self: &Arc<Self>, addr: ConnAddr) -> Option<SockId> {
+        if !SUPPORTED {
+            return None;
+        }
+        let runtime = tokio::runtime::Handle::try_current().ok()?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let start = {
+            let mut q = self.queue.lock().ok()?;
+            q.pending.push((addr, tx));
+            !std::mem::replace(&mut q.scanning, true)
+        };
+        if start {
+            let finder = self.clone();
+            runtime.spawn_blocking(move || finder.drain());
+        }
+        rx.await.ok().flatten()
+    }
+
+    /// Answer every queued lookup, one scan per batch, until the queue is empty.
+    fn drain(&self) {
+        loop {
+            let batch = {
+                let Ok(mut q) = self.queue.lock() else {
+                    return;
+                };
+                if q.pending.is_empty() {
+                    q.scanning = false;
+                    return;
+                }
+                std::mem::take(&mut q.pending)
+            };
+            let (wanted, waiting): (Vec<ConnAddr>, Vec<_>) = batch.into_iter().unzip();
+            for (tx, found) in waiting.into_iter().zip(find_all(&wanted)) {
+                // The dial was dropped meanwhile: nobody waits for the answer.
+                let _ = tx.send(found);
+            }
+        }
+    }
 }
 
 /// Whether the OpenDAL reqwest transport can locate and sample kernel TCP statistics at request
@@ -142,7 +271,7 @@ mod imp {
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
     use std::os::fd::{AsRawFd, RawFd};
 
-    use super::SockId;
+    use super::{ConnAddr, SockId};
     use crate::rows::TcpRow;
 
     fn to_addr(ss: &libc::sockaddr_storage) -> Option<SocketAddr> {
@@ -207,32 +336,49 @@ mod imp {
         })
     }
 
-    pub fn find(local: SocketAddr, remote: SocketAddr) -> Option<SockId> {
+    pub fn find_all(wanted: &[ConnAddr]) -> Vec<Option<SockId>> {
+        let mut found = vec![None; wanted.len()];
         // `/dev/fd` lists this process's descriptors on Linux (→ /proc/self/fd) and macOS.
         let dir = if cfg!(target_os = "linux") {
             "/proc/self/fd"
         } else {
             "/dev/fd"
         };
-        let mut fds: Vec<RawFd> = std::fs::read_dir(dir)
-            .ok()?
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return found;
+        };
+        let mut fds: Vec<RawFd> = entries
             .filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
             .collect();
         // High descriptors first: the low ones are mostly the process's own files and
         // listeners opened at start-up (the order only affects how soon the scan stops).
         fds.sort_unstable_by(|a, b| b.cmp(a));
-        // One syscall per descriptor (the local address is nearly unique); the peer is only
-        // asked of a match.
-        fds.into_iter()
-            .find(|&fd| {
-                name_of(fd, libc::getsockname).is_some_and(|l| same(l, local))
-                    && name_of(fd, libc::getpeername).is_some_and(|r| same(r, remote))
-            })
-            .map(|fd| SockId {
-                fd: fd as i64,
-                local,
-                remote,
-            })
+        let mut missing = wanted.len();
+        for fd in fds {
+            if missing == 0 {
+                break;
+            }
+            // One syscall per descriptor (the local address is nearly unique); the peer is
+            // only asked of a match.
+            let Some(local) = name_of(fd, libc::getsockname) else {
+                continue;
+            };
+            for (i, &(l, r)) in wanted.iter().enumerate() {
+                if found[i].is_none()
+                    && same(l, local)
+                    && name_of(fd, libc::getpeername).is_some_and(|peer| same(peer, r))
+                {
+                    found[i] = Some(SockId {
+                        fd: fd as i64,
+                        local: l,
+                        remote: r,
+                    });
+                    missing -= 1;
+                    break;
+                }
+            }
+        }
+        found
     }
 
     pub fn query(id: &SockId) -> Option<TcpRow> {
@@ -472,10 +618,10 @@ mod imp {
         })
     }
 
-    pub fn find(_: SocketAddr, _: SocketAddr) -> Option<SockId> {
+    pub fn find_all(wanted: &[super::ConnAddr]) -> Vec<Option<SockId>> {
         // Probing arbitrary Win32 HANDLE values with getsockname can block on synchronous
         // named pipes; Windows queries owned sockets (`sock_id_of`) only.
-        None
+        vec![None; wanted.len()]
     }
 
     pub fn query(id: &SockId) -> Option<TcpRow> {
@@ -568,16 +714,14 @@ mod imp {
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 mod imp {
-    use std::net::SocketAddr;
-
     use super::SockId;
     use crate::rows::TcpRow;
 
     pub fn sock_id_of(_: &tokio::net::TcpStream) -> Option<SockId> {
         None
     }
-    pub fn find(_: SocketAddr, _: SocketAddr) -> Option<SockId> {
-        None
+    pub fn find_all(wanted: &[super::ConnAddr]) -> Vec<Option<SockId>> {
+        vec![None; wanted.len()]
     }
     pub fn query(_: &SockId) -> Option<TcpRow> {
         None
@@ -610,9 +754,11 @@ mod tests {
         }
         let id = id.unwrap();
         if SUPPORTED {
-            // Found by identity like the OpenDAL-mode lookup does.
-            let found = find(id.local, id.remote).expect("socket found by its addresses");
-            assert_eq!(found.fd, id.fd);
+            // Found by identity like the OpenDAL-mode lookup does, next to one that is not
+            // there.
+            let nowhere: ConnAddr = (id.local, "127.0.0.1:1".parse().unwrap());
+            let found = find_all(&[nowhere, (id.local, id.remote)]);
+            assert_eq!(found, [None, Some(id)]);
         }
         let row = id.query().expect("tcp info of a live connection");
         assert!(row.cwnd > 0, "{row:?}");
@@ -626,5 +772,99 @@ mod tests {
         drop(server);
         // The descriptor is gone (or reused by something else): nothing is reported.
         assert!(id.query().is_none());
+    }
+
+    /// Connections dialed at once are all found, and every descriptor-table scan runs on the
+    /// blocking pool: the runtime's worker thread makes none (9.1 scanned once per connection,
+    /// on the worker).
+    #[tokio::test]
+    async fn sockets_are_found_off_the_worker_thread() {
+        if !SUPPORTED {
+            return;
+        }
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let mut held = Vec::new();
+        let mut wanted = Vec::new();
+        for _ in 0..16 {
+            let (client, server) = tokio::join!(tokio::net::TcpStream::connect(addr), l.accept());
+            let client = client.unwrap();
+            wanted.push((sock_id_of(&client).unwrap(), client));
+            held.push(server.unwrap().0);
+        }
+        let finder = Arc::new(SockFinder::default());
+        let before = SCANS.with(|n| n.get());
+        let found = futures::future::join_all(
+            wanted
+                .iter()
+                .map(|(id, _)| finder.find((id.local, id.remote))),
+        )
+        .await;
+        for ((id, _), found) in wanted.iter().zip(found) {
+            assert_eq!(found, Some(*id));
+        }
+        // This (current-thread) runtime's only worker is the test thread.
+        assert_eq!(SCANS.with(|n| n.get()), before);
+        // The finder went idle: a later connection starts a new scan and is found too.
+        let (client, _server) = tokio::join!(tokio::net::TcpStream::connect(addr), l.accept());
+        let client = client.unwrap();
+        let id = sock_id_of(&client).unwrap();
+        assert_eq!(finder.find((id.local, id.remote)).await, Some(id));
+        assert_eq!(SCANS.with(|n| n.get()), before);
+    }
+
+    /// Whatever the order in which the requests of a shared connection start and end, and
+    /// however the readings of its counter interleave, the retransmits charged to them add up
+    /// to what the counter grew by: nothing is charged twice, nothing is lost.
+    #[test]
+    fn retransmits_of_a_shared_connection_are_charged_exactly_once() {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::SmallRng::seed_from_u64(0x0b5e_55ed);
+        for _ in 0..200 {
+            let seed = rng.gen_range(0..50u64);
+            let mut ledger = RetransLedger::seeded(Some(seed));
+            let mut kernel = seed;
+            let mut open: Vec<u64> = Vec::new();
+            let mut charged = 0u64;
+            let mut read = seed;
+            for _ in 0..rng.gen_range(1..80) {
+                kernel += rng.gen_range(0..4u64);
+                if open.is_empty() || rng.gen_bool(0.5) {
+                    open.push(ledger.open());
+                } else {
+                    let stream = open.swap_remove(rng.gen_range(0..open.len()));
+                    // Two requests ending at once may hand in their readings out of order.
+                    let reading = if rng.gen_bool(0.2) {
+                        rng.gen_range(seed..=kernel)
+                    } else {
+                        kernel
+                    };
+                    // And a connection that just closed cannot be read at all.
+                    let reading = rng.gen_bool(0.9).then_some(reading);
+                    charged += ledger.close(stream, reading);
+                    read = read.max(reading.unwrap_or(seed));
+                }
+            }
+            for stream in open {
+                charged += ledger.close(stream, Some(kernel));
+                read = kernel;
+            }
+            // Everything the readings showed, and nothing else.
+            assert_eq!(charged, read - seed);
+        }
+
+        // One request at a time (HTTP/1.1): each is charged what happened since the last.
+        let mut h1 = RetransLedger::seeded(Some(10));
+        let a = h1.open();
+        assert_eq!(h1.close(a, Some(13)), 3);
+        let b = h1.open();
+        assert_eq!(h1.close(b, Some(13)), 0);
+        // Three streams share seven retransmits: two each, and the rest to the one ending.
+        let mut h2 = RetransLedger::seeded(Some(0));
+        let (a, b, c) = (h2.open(), h2.open(), h2.open());
+        assert_eq!(h2.close(b, Some(7)), 3);
+        // A stale reading (taken before `b`'s) settles nothing more.
+        assert_eq!(h2.close(a, Some(5)), 2);
+        assert_eq!(h2.close(c, Some(8)), 3);
     }
 }

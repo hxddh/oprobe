@@ -1,5 +1,6 @@
 //! OpenDAL layers that wire oprobe's tracing into an `Operator`:
-//! - [`TraceContextLayer`]: installs the tracing HTTP transport and a scope-propagating executor;
+//! - [`TraceContextLayer`]: installs the tracing HTTP transport (or wraps the installed one) and
+//!   a scope-propagating executor;
 //! - [`InProcessObserveLayer`]: records backend calls for `memory` / `fs` (no HTTP involved).
 
 use std::sync::Arc;
@@ -53,11 +54,30 @@ impl Layer for QueueStampLayer {
     }
 }
 
-/// Installs `transport` as the HTTP transport and propagates [`OpScope`] into OpenDAL's
-/// background tasks. Must be the *first* layer applied so other layers wrap it.
+/// Makes the operator's HTTP transport an observed one and propagates [`OpScope`] into
+/// OpenDAL's background tasks.
+///
+/// - [`TraceContextLayer::new`] installs `transport` (oprobe's instrumented client) **in place
+///   of** whatever transport the context held: it must be the first layer applied that touches
+///   the transport, because a transport installed or wrapped by an earlier layer (a custom
+///   client, `ConcurrentLimitLayer::with_http_concurrent_limit`) is not used any more. Layers
+///   applied after it wrap it.
+/// - [`TraceContextLayer::around_installed`] keeps the transport the context holds and wraps
+///   it ([`crate::net::WrappedTransport`]): nothing beneath is replaced.
 #[derive(Clone)]
 pub struct TraceContextLayer {
-    transport: HttpTransporter,
+    http: Http,
+}
+
+#[derive(Clone)]
+enum Http {
+    /// oprobe's instrumented client replaces the installed transport.
+    Own(HttpTransporter),
+    /// The installed transport is kept and observed from outside.
+    Installed {
+        recorder: Arc<Recorder>,
+        limiter: Option<Arc<tokio::sync::Semaphore>>,
+    },
 }
 
 impl std::fmt::Debug for TraceContextLayer {
@@ -69,17 +89,41 @@ impl std::fmt::Debug for TraceContextLayer {
 impl TraceContextLayer {
     pub fn new(transport: impl HttpTransport) -> Self {
         Self {
-            transport: HttpTransporter::new(transport),
+            http: Http::Own(HttpTransporter::new(transport)),
         }
+    }
+
+    /// Observe the transport already installed on the operator instead of replacing it;
+    /// `max_inflight` caps the requests in flight through it.
+    pub fn around_installed(recorder: Arc<Recorder>, max_inflight: Option<usize>) -> Self {
+        Self {
+            http: Http::Installed {
+                recorder,
+                limiter: max_inflight.map(|n| Arc::new(tokio::sync::Semaphore::new(n.max(1)))),
+            },
+        }
+    }
+
+    /// Whether the installed transport is kept ([`Self::around_installed`]).
+    pub fn keeps_installed(&self) -> bool {
+        matches!(self.http, Http::Installed { .. })
     }
 }
 
 impl Layer for TraceContextLayer {
     fn apply_context(&self, _srv: Servicer, inner: OperationContext) -> OperationContext {
         let exec = ScopePropagatingExecutor::wrap(inner.executor().clone());
-        inner
-            .with_http_transport(self.transport.clone())
-            .with_executor(exec)
+        let transport = match &self.http {
+            Http::Own(transport) => transport.clone(),
+            Http::Installed { recorder, limiter } => {
+                HttpTransporter::new(crate::net::WrappedTransport::new(
+                    inner.http_transport().clone(),
+                    recorder.clone(),
+                    limiter.clone(),
+                ))
+            }
+        };
+        inner.with_http_transport(transport).with_executor(exec)
     }
 }
 
@@ -145,6 +189,7 @@ fn push_op(
         retry_after_ms: None,
         error: err.map(|e| e.to_string()),
         remote: None,
+        server: None,
         service_op: None,
         tls: None,
         tcp: None,
@@ -793,4 +838,44 @@ mod tests {
             assert!(got.contains(&want), "{want:?} in {got:?}");
         }
     }
+
+    /// Whatever writes an error text, the record loses its URL credentials when it is
+    /// captured: in an operation's scope or outside one, before any exporter, row or file
+    /// (9.1 stored a backend's error text as it came).
+    #[test]
+    fn captured_errors_never_keep_a_urls_credentials() {
+        struct Seen(std::sync::Mutex<Vec<String>>);
+        impl crate::Exporter for Seen {
+            fn on_request(&self, r: &RequestRecord) {
+                self.0.lock().unwrap().extend(r.error.clone());
+            }
+        }
+        let rec = Recorder::always_on(100);
+        let seen = Arc::new(Seen(std::sync::Mutex::new(Vec::new())));
+        rec.set_exporter(seen.clone());
+        let leaky = Error::new(
+            ErrorKind::Unexpected,
+            "GET https://user:PASSWORD@b.example/k?X-Amz-Expires=60&X-Amz-Signature=SIGNATURE failed",
+        );
+        // Outside any operation.
+        push(&rec, Api::GetObject, Instant::now(), 0, 0, Some(&leaky));
+        // In an operation's scope.
+        let scope = OpScope::new(true);
+        scope.sync_run(|| push(&rec, Api::GetObject, Instant::now(), 0, 0, Some(&leaky)));
+        let scoped = scope.take().requests;
+
+        let rows = rec.take_trace();
+        let mut texts: Vec<String> = seen.0.lock().unwrap().clone();
+        texts.extend(rows.reqs.iter().filter_map(|r| r.error.clone()));
+        texts.extend(scoped.iter().filter_map(|r| r.error.clone()));
+        assert_eq!(texts.len(), 3, "{texts:?}");
+        for text in &texts {
+            assert!(
+                text.contains("GET https://b.example/k?X-Amz-Expires=60 failed"),
+                "{text}"
+            );
+            assert!(!text.contains("SIGNATURE") && !text.contains("PASSWORD"), "{text}");
+        }
+    }
 }
+

@@ -122,8 +122,9 @@ impl OpScope {
         f(&mut g)
     }
 
-    pub fn push_request(&self, rec: RequestRecord) {
+    pub fn push_request(&self, mut rec: RequestRecord) {
         note_backend_request();
+        rec.redact();
         let late = self.with(|d| {
             if d.closed {
                 return Some(rec);
