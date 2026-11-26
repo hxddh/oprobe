@@ -267,7 +267,7 @@
           "type": "array"
         },
         "operator_rust": {
-          "description": "The whole of `b` as Rust that compiles as written ([`to_rust`]: `build_operator()`,\n`reader()`, `writer()`), secrets left to the credential chain. The `rust` lines above\nshow a change and do not paste. Absent in results of 9.2 and earlier.",
+          "description": "The whole of `b` as Rust that compiles as written ([`to_rust`]: `build_operator()`,\n`reader()`, `writer()`), secrets left to the credential chain. The `rust` lines above\nshow a change and do not paste.",
           "type": "string"
         },
         "rust": {
@@ -782,13 +782,10 @@
       "type": "integer"
     },
     "pairs_max_count": {
-      "description": "The A/B pairs the prove planned at most (`--pairs`): the interval's sequential boundary\nis the one of that plan. Absent in results of 9.1 and earlier, whose interval was the\nfixed-sample one.",
+      "description": "The A/B pairs the prove planned at most (`--pairs`): the interval's sequential boundary\nis the one of that plan.",
       "format": "uint64",
       "minimum": 0,
-      "type": [
-        "integer",
-        "null"
-      ]
+      "type": "integer"
     },
     "prove_id": {
       "description": "This prove (its trials are runs with this `parent_id`).",
@@ -864,6 +861,7 @@
     "objective_delta",
     "noise_floor_ratio",
     "pairs_count",
+    "pairs_max_count",
     "max_throttle_ratio",
     "secondary",
     "trials",

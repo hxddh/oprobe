@@ -1347,7 +1347,7 @@
               "type": "null"
             }
           ],
-          "description": "Which bodies share `bytes_per_s` (a bandwidth cap; absent in reports of 9.2 and\nearlier, which told an upload cap by how its evidence opens)."
+          "description": "Which bodies share `bytes_per_s` (a bandwidth cap)."
         },
         "key": {
           "description": "The key or prefix of a [`HypothesisKind::KeyLimit`] (the hottest one).",
@@ -3216,14 +3216,6 @@
             "number",
             "null"
           ]
-        },
-        "p99_ms": {
-          "description": "Max acceptable p99 per operation verb (ms); unset = no latency constraint.",
-          "format": "double",
-          "type": [
-            "number",
-            "null"
-          ]
         }
       },
       "required": [
@@ -3245,14 +3237,6 @@
         },
         "max_throttled_request_ratio": {
           "description": "Throttled responses / requests the run may have (`sla.max_throttle_rate`).",
-          "format": "double",
-          "type": [
-            "number",
-            "null"
-          ]
-        },
-        "p99_ms": {
-          "description": "A p99 limit of a 9.2 report. Nothing sets or checks one since 9.3 (an open loop that\nstalled fails its checks without a limit); the field stays so that those reports read.",
           "format": "double",
           "type": [
             "number",
