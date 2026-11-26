@@ -20,7 +20,13 @@ you run them.
   the workload and one row per operation and request. Object keys, request IDs and remote IP
   addresses are part of a run. Secrets are not: credential options (`secret_access_key`,
   `account_key`, `sas_token`, `password`, `*_key`, …) are redacted before anything is printed or
-  saved, and URLs lose embedded credentials and query strings.
+  saved. URLs lose their credentials wherever they appear, in an operator, an option, a proxy
+  setting or the text of an error: `user:password@`, and the query parameters that carry a
+  signature or a token (`X-Amz-Signature`, `X-Amz-Credential`, `X-Amz-Security-Token`,
+  `Signature`, `AWSAccessKeyId`, an Azure SAS's `sig`, `X-Goog-Signature`, `x-oss-signature`,
+  `q-signature`, `access_token`, `token`, …, whatever their case). What only describes a
+  request stays readable (`X-Amz-Expires`, an SAS's `se` and `sp`). Errors, warnings and log
+  events are printed the same way.
 - **The host** is recorded as OS, architecture, CPU count and a hash of the host name, never the
   name itself.
 - **Pending-cleanup markers** in `<data dir>/oprobe/pending/`: while a run that writes is going,
@@ -36,8 +42,10 @@ Delete runs with `oprobe show --rm RUN…`, or remove the data directory.
 operations and their requests, with their API, method, status, timing, bytes, connection and
 request ID. Object keys are never stored: an operation's key is its first path segment (at most
 32 bytes) and a hash of the whole key (`logs/#3f2a…`), so a top-level directory name can be in
-the file, but not a key. Request IDs and remote addresses are. Credentials never are. Review a
-file before you attach it to an issue.
+the file, but not a key. Request IDs and remote addresses are. Credentials never are: the
+text of a failed request or operation loses the credentials of every URL in it (the signature
+and token of a presigned or SAS URL included) when it is recorded, so neither an `Exporter`,
+a `Snapshot` nor a file ever holds them. Review a file before you attach it to an issue.
 
 ## Test data in your bucket
 

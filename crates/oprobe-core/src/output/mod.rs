@@ -186,9 +186,11 @@ impl Output {
         &self.bus
     }
 
-    /// A progress/log line on stderr (and a `log` event); nothing on stderr with `-q`.
+    /// A progress/log line on stderr (and a `log` event); nothing on stderr with `-q`. Like
+    /// every line this writes, it never carries a URL's credentials (a message may quote a
+    /// storage error, and storage errors quote URLs).
     pub fn info(&self, msg: impl Into<String>) {
-        let msg = msg.into();
+        let msg = crate::util::strip_url_credentials(&msg.into());
         if !self.quiet {
             eprintln!("{msg}");
         }
@@ -197,7 +199,7 @@ impl Output {
 
     /// A warning: stderr (even with `-q`) and a `log` event.
     pub fn warn(&self, msg: impl Into<String>) {
-        let msg = msg.into();
+        let msg = crate::util::strip_url_credentials(&msg.into());
         if let Ok(mut w) = self.warned.lock() {
             w.push(crate::report::style::strip_ansi(&msg));
         }
@@ -301,6 +303,23 @@ pub fn interactive_terminal() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A warning that quotes a storage error never prints or keeps (the JSON envelope's
+    /// `warnings`, the `log` events) the signature of the URL in it.
+    #[test]
+    fn warnings_never_carry_a_urls_credentials() {
+        let out = Output::silent();
+        let events = out.bus().channel();
+        out.warn("cleanup failed: GET https://b.example/k?X-Amz-Expires=60&X-Amz-Signature=SECRET");
+        let kept = out.warnings();
+        assert_eq!(
+            kept,
+            ["cleanup failed: GET https://b.example/k?X-Amz-Expires=60"]
+        );
+        let logged = format!("{:?}", events.try_recv());
+        assert!(logged.contains("X-Amz-Expires=60"), "{logged}");
+        assert!(!logged.contains("SECRET"), "{logged}");
+    }
 
     #[test]
     fn formats_parse() {
