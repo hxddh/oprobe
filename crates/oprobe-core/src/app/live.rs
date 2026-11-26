@@ -1,6 +1,5 @@
 //! Single-line live progress on stderr for `oprobe run`.
 
-use std::io::Write;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -38,10 +37,11 @@ impl LiveLine {
 
     pub fn update(&self, p: Progress) {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let mut err = std::io::stderr().lock();
+        // Through `stderr_text`: a terminal that went away stops the command, instead of being
+        // drawn to for the rest of the run.
         match p {
             Progress::Message(m) => {
-                let _ = write!(err, "\r\x1b[2K{} {m}\n", dim("·"));
+                crate::output::stderr_text(&format!("\r\x1b[2K{} {m}\n", dim("·")));
             }
             Progress::Snapshot(s) => {
                 if st.1 {
@@ -90,17 +90,14 @@ impl LiveLine {
                 } else {
                     line
                 };
-                let _ = write!(err, "\r\x1b[2K{line}");
+                crate::output::stderr_text(&format!("\r\x1b[2K{line}"));
             }
         }
-        let _ = err.flush();
     }
 
     pub fn finish(&self) {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         st.1 = true;
-        let mut err = std::io::stderr().lock();
-        let _ = write!(err, "\r\x1b[2K");
-        let _ = err.flush();
+        crate::output::stderr_text("\r\x1b[2K");
     }
 }

@@ -18,38 +18,58 @@
 //!   dropped): nobody is left to complete it.
 //!
 //! An `Upload` dropped between two calls aborts on a task as well. The session awaits all of
-//! these tasks ([`Aborts::settle`]) before it cleans up.
+//! these tasks ([`Aborts::settle`]) before it cleans up. Once the run is cancelled that wait is
+//! bounded ([`SETTLE_GRACE`]): the gate has cut every request by then, so a task that still
+//! runs is stuck, and the uploads of such tasks are reported ([`Aborts::failure`]) instead of
+//! being waited for with the cleanup never starting.
 
+use std::collections::BTreeMap;
 use std::future::Future;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use opendal::{Buffer, Execute, Metadata, Operator, Writer};
 use tokio::sync::{Notify, oneshot};
 
+use super::Cancel;
+
 /// How long one abort may take (the service may be unreachable, which is often why the upload
 /// failed in the first place).
 const ABORT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The upload tasks of one session: how many still run, and the aborts that failed.
+/// How long a cancelled run waits for its upload tasks: what the slowest of them may take
+/// once the gate has stopped its requests (an upload being created has its grace period, then
+/// the abort its timeout), and a margin.
+pub const SETTLE_GRACE: Duration =
+    Duration::from_secs(super::gate::CREATE_GRACE.as_secs() + ABORT_TIMEOUT.as_secs() + 5);
+
+/// How many uploads [`Aborts::failure`] names.
+const NAMED_FAILURES: usize = 3;
+
+/// The upload tasks of one session: those still running, and the uploads that could not be
+/// aborted.
 #[derive(Clone, Default)]
 pub struct Aborts(Arc<State>);
 
 #[derive(Default)]
 struct State {
-    running: AtomicUsize,
+    /// The tasks still running: the path each one's upload writes.
+    running: Mutex<BTreeMap<u64, String>>,
+    next_task: AtomicU64,
     idle: Notify,
     failed: Mutex<Vec<String>>,
 }
 
 /// One running task; the last to end wakes [`Aborts::settle`].
-struct Running(Aborts);
+struct Running(Aborts, u64);
 
 impl Drop for Running {
     fn drop(&mut self) {
         let state = &self.0.0;
-        if state.running.fetch_sub(1, Ordering::AcqRel) == 1 {
+        let mut running = state.running.lock().unwrap_or_else(|e| e.into_inner());
+        running.remove(&self.1);
+        if running.is_empty() {
             state.idle.notify_waiters();
         }
     }
@@ -60,7 +80,8 @@ impl Aborts {
         Self::default()
     }
 
-    fn note_failure(&self, path: &str, failure: impl std::fmt::Display) {
+    /// Keep what is wrong with the upload of `path`: it could not be aborted.
+    pub(super) fn note_failure(&self, path: &str, failure: impl std::fmt::Display) {
         self.0
             .failed
             .lock()
@@ -89,43 +110,80 @@ impl Aborts {
         }
     }
 
-    /// Run `work` on a task nothing can drop or cancel. `false`: there is no runtime to run it
-    /// on any more (the process is shutting down).
-    fn run(&self, on: &dyn Execute, work: impl Future<Output = ()> + Send + 'static) -> bool {
-        if tokio::runtime::Handle::try_current().is_err() {
-            return false;
-        }
-        self.0.running.fetch_add(1, Ordering::AcqRel);
-        let running = Running(self.clone());
+    /// Run `work`, the task of the upload of `path`, where nothing can drop or cancel it.
+    fn run(&self, on: &dyn Execute, path: &str, work: impl Future<Output = ()> + Send + 'static) {
+        let task = self.0.next_task.fetch_add(1, Ordering::Relaxed);
+        self.0
+            .running
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(task, path.to_owned());
+        let running = Running(self.clone(), task);
         on.execute(Box::pin(async move {
             work.await;
             drop(running);
         }));
-        true
     }
 
     /// Wait for every upload task still running (those started while waiting included).
-    pub async fn settle(&self) {
-        loop {
-            let idle = self.0.idle.notified();
-            tokio::pin!(idle);
-            // Registered before the count is read: the last task ending in between wakes it.
-            idle.as_mut().enable();
-            if self.0.running.load(Ordering::Acquire) == 0 {
-                break;
+    ///
+    /// Once `cancel` has fired the wait ends after [`SETTLE_GRACE`] at the latest: the uploads
+    /// of the tasks still running then are reported by [`Aborts::failure`] and no longer waited
+    /// for (by this call or a later one). 9.2 waited without a bound: a task stuck after Ctrl-C
+    /// kept the run from ever reaching its cleanup.
+    pub async fn settle(&self, cancel: &Cancel) {
+        let idle = async {
+            loop {
+                let idle = self.0.idle.notified();
+                tokio::pin!(idle);
+                // Registered before the tasks are counted: the last one ending in between
+                // wakes it.
+                idle.as_mut().enable();
+                if self.running().is_empty() {
+                    break;
+                }
+                idle.await;
             }
-            idle.await;
+        };
+        let given_up = async {
+            cancel.cancelled().await;
+            tokio::time::sleep(SETTLE_GRACE).await;
+        };
+        tokio::select! {
+            biased;
+            () = idle => return,
+            () = given_up => {}
+        }
+        let stuck = std::mem::take(&mut *self.running());
+        for path in stuck.values() {
+            self.note_failure(
+                path,
+                format_args!(
+                    "its upload was still in flight {}s after the run was stopped",
+                    SETTLE_GRACE.as_secs()
+                ),
+            );
         }
     }
 
+    fn running(&self) -> std::sync::MutexGuard<'_, BTreeMap<u64, String>> {
+        self.0.running.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// What is wrong with the uploads that could not be aborted so far (`None`: every abort
-    /// went through): their parts stay on the target, billed, until the upload is aborted, and
-    /// deleting objects does not remove them.
+    /// went through), naming them: their parts stay on the target, billed, until the upload is
+    /// aborted, and deleting objects does not remove them.
     pub fn failure(&self) -> Option<String> {
         let failed = self.0.failed.lock().unwrap_or_else(|e| e.into_inner());
-        let first = failed.first()?;
+        if failed.is_empty() {
+            return None;
+        }
+        let mut named = failed[..failed.len().min(NAMED_FAILURES)].join("; ");
+        if failed.len() > NAMED_FAILURES {
+            named.push_str(&format!("; and {} more", failed.len() - NAMED_FAILURES));
+        }
         Some(format!(
-            "{} multipart uploads could not be aborted and may still hold parts ({first})",
+            "{} multipart uploads could not be aborted and may still hold parts ({named})",
             failed.len()
         ))
     }
@@ -172,23 +230,20 @@ impl Upload {
         let mut writer = self.writer.take().ok_or_else(ended)?;
         let (answer, answered) = oneshot::channel::<Answer>();
         let (aborts, path) = (self.aborts.clone(), self.path.clone());
-        let started = self.aborts.run(self.executor.as_ref(), async move {
-            let (res, goes_on) = match call {
-                Call::Write(data) => (writer.write(data).await.map(|()| None), true),
-                Call::Close => (writer.close().await.map(Some), false),
-            };
-            if res.is_err() {
-                aborts.abort(&mut writer, &path).await;
-            }
-            let back = (goes_on && res.is_ok()).then_some(writer);
-            if let Err((Some(mut orphan), _)) = answer.send((back, res)) {
-                aborts.abort(&mut orphan, &path).await;
-            }
-        });
-        if !started {
-            self.aborts.note_failure(&self.path, "the runtime stopped");
-            return Err(ended());
-        }
+        self.aborts
+            .run(self.executor.as_ref(), &self.path, async move {
+                let (res, goes_on) = match call {
+                    Call::Write(data) => (writer.write(data).await.map(|()| None), true),
+                    Call::Close => (writer.close().await.map(Some), false),
+                };
+                if res.is_err() {
+                    aborts.abort(&mut writer, &path).await;
+                }
+                let back = (goes_on && res.is_ok()).then_some(writer);
+                if let Err((Some(mut orphan), _)) = answer.send((back, res)) {
+                    aborts.abort(&mut orphan, &path).await;
+                }
+            });
         let (writer, res) = answered.await.map_err(|_| ended())?;
         self.writer = writer;
         res
@@ -227,13 +282,18 @@ impl Drop for Upload {
         let Some(mut writer) = self.writer.take() else {
             return;
         };
-        let (aborts, path) = (self.aborts.clone(), self.path.clone());
-        let started = self.aborts.run(self.executor.as_ref(), async move {
-            aborts.abort(&mut writer, &path).await;
-        });
-        if !started {
-            self.aborts.note_failure(&self.path, "the runtime stopped");
+        // Dropped where no task can start (off the runtime's threads, by whoever kept the
+        // upload past the runtime): the upload stays, and is reported.
+        if tokio::runtime::Handle::try_current().is_err() {
+            self.aborts
+                .note_failure(&self.path, "it was dropped after the runtime had stopped");
+            return;
         }
+        let (aborts, path) = (self.aborts.clone(), self.path.clone());
+        self.aborts
+            .run(self.executor.as_ref(), &self.path, async move {
+                aborts.abort(&mut writer, &path).await;
+            });
     }
 }
 
@@ -259,7 +319,9 @@ mod tests {
         let op = base_operator(&target)
             .unwrap()
             .layer(trace_layer(&target, &Default::default(), None, None).unwrap())
-            .layer(TimeoutLayer::new().with_io_timeout(Duration::from_millis(300)))
+            // Seconds: a healthy 5 MiB part must never time out, however slow the machine (a
+            // stalled part waits this long, once per attempt).
+            .layer(TimeoutLayer::new().with_io_timeout(Duration::from_secs(3)))
             .layer(
                 RetryLayer::new()
                     .with_max_times(1)
@@ -286,7 +348,7 @@ mod tests {
         let closed = uploads.pop().unwrap();
         drop(uploads);
         closed.close().await.unwrap();
-        aborts.settle().await;
+        aborts.settle(&Cancel::new()).await;
         assert_eq!(aborts.failure(), None);
         assert_eq!(lab.open_uploads(), 0);
         let c = lab.multipart_counts();
@@ -320,10 +382,71 @@ mod tests {
         // then aborts, since nobody is left to finish the upload.
         write.abort();
         assert!(write.await.unwrap_err().is_cancelled());
-        aborts.settle().await;
+        aborts.settle(&Cancel::new()).await;
         assert_eq!(aborts.failure(), None);
         assert_eq!(lab.open_uploads(), 0);
         let c = lab.multipart_counts();
         assert_eq!((c.created, c.completed, c.aborted), (1, 0, 1), "{c:?}");
+    }
+
+    /// K1-5: a task that never ends does not keep a cancelled run from its cleanup: `settle`
+    /// gives up after its grace period and names the upload (9.2 waited for ever). A run that
+    /// was not cancelled still waits: its tasks are doing work that is meant to finish.
+    #[tokio::test(start_paused = true)]
+    async fn a_cancelled_run_stops_waiting_for_a_stuck_task() {
+        let aborts = Aborts::new();
+        let executor = opendal::Executor::new();
+        let stuck = |path: &str| {
+            let executor = executor.clone().into_inner();
+            aborts.run(executor.as_ref(), path, std::future::pending());
+        };
+        for i in 0..5 {
+            stuck(&format!("stuck-{i}"));
+        }
+        let cancel = Cancel::new();
+        let settled = {
+            let (aborts, cancel) = (aborts.clone(), cancel.clone());
+            tokio::spawn(async move { aborts.settle(&cancel).await })
+        };
+        tokio::time::sleep(SETTLE_GRACE * 100).await;
+        assert!(!settled.is_finished(), "not cancelled: it waits");
+        assert_eq!(aborts.failure(), None);
+        cancel.cancel();
+        tokio::time::sleep(SETTLE_GRACE - Duration::from_millis(1)).await;
+        assert!(!settled.is_finished(), "within the grace period");
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        settled.await.unwrap();
+        let failure = aborts.failure().expect("the stuck uploads are reported");
+        assert!(failure.starts_with("5 multipart uploads"), "{failure}");
+        for named in ["`stuck-0`", "`stuck-1`", "`stuck-2`", "and 2 more"] {
+            assert!(failure.contains(named), "{named}: {failure}");
+        }
+        assert!(failure.contains("still in flight 45s after"), "{failure}");
+        // What was given up is not waited for again (`Session::close` settles once more).
+        aborts.settle(&cancel).await;
+        assert!(aborts.failure().unwrap().starts_with("5 "));
+    }
+
+    /// An upload dropped where no task can run (the runtime is gone) cannot be aborted: it is
+    /// reported, and dropping it does not panic.
+    #[test]
+    fn an_upload_dropped_without_a_runtime_is_reported() {
+        let aborts = Aborts::new();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let upload = rt.block_on(async {
+            let target = crate::config::TargetSpec::from_url("memory://").unwrap();
+            let op = base_operator(&target).unwrap();
+            let w = op.writer("kept").await.unwrap();
+            Upload::new(&op, w, "kept", &aborts)
+        });
+        drop(rt);
+        drop(upload);
+        let failure = aborts.failure().expect("reported");
+        assert!(
+            failure.contains("`kept`: it was dropped after the runtime had stopped"),
+            "{failure}"
+        );
     }
 }

@@ -99,6 +99,60 @@ pub async fn lab(a: LabRequest) -> Result<crate::lab::LabHandle> {
     if let Some(n) = a.max_connections {
         limits.max_connections = n.max(1);
     }
-    let lab = LabServer::spawn_with(&a.bind, cfg, limits).await?;
-    Ok(lab)
+    LabServer::spawn_with(&a.bind, cfg, limits)
+        .await
+        .map_err(|e| bind_error(e, &a.bind))
+}
+
+/// The error of a lab that could not listen on `bind`: a usage error that says so (a busy
+/// port was `internal`, with no hint). Other errors pass through unchanged.
+fn bind_error(e: anyhow::Error, bind: &str) -> anyhow::Error {
+    use crate::errors::{ErrorCode, OprobeError};
+    let Some(io) = e.downcast_ref::<std::io::Error>() else {
+        return e;
+    };
+    let (cause, hint) = if io.kind() == std::io::ErrorKind::AddrInUse {
+        (
+            "the address is already in use".to_owned(),
+            "stop the process that listens there, or pick another port with `--bind` \
+             (`--bind 127.0.0.1:0` takes a free one)",
+        )
+    } else {
+        (
+            io.to_string(),
+            "pass an address this machine can listen on, such as `--bind 127.0.0.1:0`",
+        )
+    };
+    OprobeError::new(
+        ErrorCode::UsageInvalidArgument,
+        format!("cannot listen on {bind}: {cause}"),
+    )
+    .with_hint(hint)
+    .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `oprobe lab --bind` on a busy port was `internal` (exit 1) with no hint.
+    #[tokio::test]
+    async fn a_busy_port_is_a_usage_error_with_a_hint() {
+        let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let bind = taken.local_addr().unwrap().to_string();
+        let e = lab(LabRequest {
+            bind: bind.clone(),
+            ..Default::default()
+        })
+        .await
+        .err()
+        .expect("the port is taken");
+        let b = crate::errors::classify(&e, "s3");
+        assert_eq!(b.code, crate::errors::ErrorCode::UsageInvalidArgument);
+        assert_eq!(
+            b.message,
+            format!("cannot listen on {bind}: the address is already in use")
+        );
+        assert!(b.hint.unwrap_or_default().contains("--bind 127.0.0.1:0"));
+    }
 }

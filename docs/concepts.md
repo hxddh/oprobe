@@ -58,18 +58,35 @@ command sends to the target and every body byte, as they are sent and received:
 - a request the budget has no room for is never sent, and a download stops at the chunk that
   crosses the byte budget, so a budget is overshot by at most the response chunks in flight,
   never by a whole operation;
-- cleanup is never counted and never refused: deleting the run prefix and aborting multipart
-  uploads always run.
+- once a budget is spent, nothing more is sent: a request without a body is refused too, since
+  its answer would only be cut. A body that does not fit in what is left of `--max-bytes` is
+  refused and the error says so ("the next request (8.0 MiB) does not fit the byte budget: 1 B
+  of 4.0 MiB used");
+- cleanup is never counted and never refused: deleting the run prefix, deleting the preflight's
+  probe object and aborting multipart uploads always run.
 
 In-process services (`memory://`, `fs://`) send no HTTP request: their calls are counted as they
 complete.
 
 **A stopped run leaves no multipart upload.** When a budget, `--max-duration`, Ctrl-C (or
-SIGTERM, SIGHUP) or Stop ends a run, the requests in flight are cut and the operations they
-belong to end at once; they are neither completed nor failed operations, and are not in the
-profile. Every multipart upload a failed, timed-out or stopped write or dataset upload had
-started is aborted (`AbortMultipartUpload`), so no part stays on the target to be billed where no
-object listing shows it. An upload whose abort fails is named in the cleanup error.
+SIGTERM, SIGHUP), a closed terminal or Stop ends a run, the requests in flight are cut and the
+operations they belong to end at once; they are neither completed nor failed operations, and are
+not in the profile (an open-loop run counts them in neither its arrivals nor its achieved rate).
+Every multipart upload a failed, timed-out or stopped write or dataset upload had started is
+aborted (`AbortMultipartUpload`), so no part stays on the target to be billed where no object
+listing shows it.
+
+Stopping is bounded. An upload that was being created when the run stopped has 10 s to answer
+(its answer carries the id it is aborted with), each abort 30 s, and the run waits at most 45 s
+for all of them before it deletes its test data. An upload whose abort failed, whose creation
+never answered or that was still in flight after that wait is named in the cleanup error: check
+the target for it (`aws s3api list-multipart-uploads`, or a lifecycle rule that aborts
+incomplete uploads).
+
+**A closed stderr stops the run like a signal.** Progress goes to stderr. When its reader is
+gone (the terminal or SSH session closed, `oprobe run … 2>&1 | head`), the first line that cannot
+be written stops the command as Ctrl-C does: it cleans up, saves the partial run and exits 130.
+With `-q` nothing is written while the run measures, so it runs to its end.
 
 ## Profile
 

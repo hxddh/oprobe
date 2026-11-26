@@ -15,27 +15,39 @@
 //! upload behind:
 //!
 //! - *Aborting a multipart upload* is cleanup: never counted, refused or cut.
-//! - *Creating a multipart upload* is counted and can be refused, but once sent it is never
-//!   cut: its response carries the upload id, without which the upload could not be aborted.
+//! - *Creating a multipart upload* is counted and can be refused, but once sent it is not cut
+//!   with the others: its response carries the upload id, without which the upload could not
+//!   be aborted. A cancelled run gives it [`CREATE_GRACE`] to answer. One that has not by then
+//!   (a stalled service) is given up, so that the run can go on to its cleanup, and reported
+//!   with the uploads that could not be aborted ([`Aborts::failure`]): if the service did
+//!   create it, nothing here knows its id.
 
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use futures::Stream;
 use opendal::raw::ServiceOperation;
 use opendal::{Buffer, Error, ErrorKind, HttpBody, HttpTransport};
 
 use super::Cancel;
+use super::upload::Aborts;
 use crate::guard::{BudgetBreach, Guard};
 use crate::trace::Api;
 
+/// How long a `CreateMultipartUpload` in flight may still take to answer once the run is
+/// cancelled.
+pub const CREATE_GRACE: Duration = Duration::from_secs(10);
+
 /// What stops the requests of one measurement: its budgets and its cancellation.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Gate {
     guard: Option<Arc<Guard>>,
     cancel: Cancel,
+    /// Where a created upload that never answered is reported.
+    aborts: Aborts,
 }
 
 /// The error of a request stopped because the run was cancelled. Persistent: no layer retries
@@ -50,8 +62,12 @@ fn over_budget(b: &BudgetBreach) -> Error {
 }
 
 impl Gate {
-    pub fn new(guard: Option<Arc<Guard>>, cancel: Cancel) -> Self {
-        Self { guard, cancel }
+    pub fn new(guard: Option<Arc<Guard>>, cancel: Cancel, aborts: Aborts) -> Self {
+        Self {
+            guard,
+            cancel,
+            aborts,
+        }
     }
 
     /// `transport` behind this gate.
@@ -80,6 +96,31 @@ impl Gate {
             None => Ok(()),
         }
     }
+
+    /// Resolves when a request in flight is to be cut: as soon as the run is cancelled, or,
+    /// for the creation of the upload of `created` (its path), [`CREATE_GRACE`] later.
+    async fn stop(&self, created: Option<&str>) {
+        self.cancel.cancelled().await;
+        if created.is_some() {
+            tokio::time::sleep(CREATE_GRACE).await;
+        }
+    }
+
+    /// The error of a request cut by [`Gate::stop`]. The upload of `created` is reported: it
+    /// may exist, and cannot be aborted.
+    fn cut(&self, created: Option<&str>) -> Error {
+        if let Some(path) = created {
+            self.aborts.note_failure(
+                path,
+                format_args!(
+                    "its creation got no answer within {}s of the stop, so there is no upload \
+                     id to abort",
+                    CREATE_GRACE.as_secs()
+                ),
+            );
+        }
+        cancelled()
+    }
 }
 
 /// A transport behind a [`Gate`].
@@ -103,28 +144,27 @@ impl<T: HttpTransport> HttpTransport for Gated<T> {
             return self.inner.fetch(req).await;
         }
         self.gate.admit(req.body().len() as u64)?;
-        // The response of a created upload must arrive whole: see the module documentation.
-        let cut = api != Api::CreateMultipart;
-        let resp = if cut {
-            tokio::select! {
-                biased;
-                r = self.inner.fetch(req) => r?,
-                () = self.gate.cancel.cancelled() => return Err(cancelled()),
+        // The response of a created upload should arrive whole: see the module documentation.
+        let created = (api == Api::CreateMultipart).then(|| req.uri().path().to_owned());
+        let resp = tokio::select! {
+            biased;
+            r = self.inner.fetch(req) => r?,
+            () = self.gate.stop(created.as_deref()) => {
+                return Err(self.gate.cut(created.as_deref()));
             }
-        } else {
-            self.inner.fetch(req).await?
         };
         let gate = self.gate.clone();
         Ok(resp.map(|body| {
             body.map_inner(|inner| {
-                let stop = cut.then(|| {
-                    let cancel = gate.cancel.clone();
-                    Box::pin(async move { cancel.cancelled().await }) as Stop
-                });
+                let stop = {
+                    let (gate, created) = (gate.clone(), created.clone());
+                    Box::pin(async move { gate.stop(created.as_deref()).await }) as Stop
+                };
                 Box::new(GatedBody {
                     inner,
                     gate,
                     stop,
+                    created,
                     done: false,
                 }) as BodyStream
             })
@@ -132,13 +172,14 @@ impl<T: HttpTransport> HttpTransport for Gated<T> {
     }
 }
 
-/// A response body behind the gate: its chunks are counted as they arrive, and (unless the
-/// body must arrive whole: `stop` is `None`) it ends with an error at the chunk that exceeds
-/// the byte budget, or as soon as the run is cancelled.
+/// A response body behind the gate: its chunks are counted as they arrive, and it ends with
+/// an error when `stop` resolves (the run is cancelled) or, unless it answers a created upload
+/// (`created`: that body should arrive whole), at the chunk that exceeds the byte budget.
 struct GatedBody {
     inner: BodyStream,
     gate: Gate,
-    stop: Option<Stop>,
+    stop: Stop,
+    created: Option<String>,
     done: bool,
 }
 
@@ -150,17 +191,15 @@ impl Stream for GatedBody {
         if this.done {
             return Poll::Ready(None);
         }
-        if let Some(stop) = this.stop.as_mut()
-            && stop.as_mut().poll(cx).is_ready()
-        {
+        if this.stop.as_mut().poll(cx).is_ready() {
             this.done = true;
-            return Poll::Ready(Some(Err(cancelled())));
+            return Poll::Ready(Some(Err(this.gate.cut(this.created.as_deref()))));
         }
         match Pin::new(&mut this.inner).poll_next(cx) {
             Poll::Ready(Some(Ok(chunk))) => {
                 let counted = this.gate.received(chunk.len() as u64);
                 match counted {
-                    Err(e) if this.stop.is_some() => {
+                    Err(e) if this.created.is_none() => {
                         this.done = true;
                         Poll::Ready(Some(Err(e)))
                     }
@@ -241,7 +280,7 @@ mod tests {
         let cancel = Cancel::new();
         guard.arm(cancel.clone());
         (
-            Gate::new(Some(guard.clone()), cancel.clone()),
+            Gate::new(Some(guard.clone()), cancel.clone(), Aborts::new()),
             guard,
             cancel,
         )
@@ -315,10 +354,16 @@ mod tests {
         let t = gate.wrap(fake.clone());
         assert!(send(&t, request("UploadPart", 600)).await.is_ok());
         let e = send(&t, request("UploadPart", 600)).await.err().unwrap();
-        assert!(e.contains("byte budget"), "{e}");
+        // The budget is not spent: the request does not fit in what is left of it (9.2 said
+        // "byte budget spent: 600 B transferred (limit 1000 B)").
+        assert_eq!(
+            e,
+            "the next request (600 B) does not fit the byte budget: 600 B of 1000 B used"
+        );
         assert_eq!(fake.sent(), 1, "the body never left");
         assert_eq!(guard.usage(), (1, 600));
         assert!(cancel.is_cancelled());
+        assert_eq!(guard.breach().unwrap().message(), e);
 
         // A download of 10 × 300 B against 1000 B: cut at the fourth chunk.
         let (gate, guard, cancel) = self::gate(bytes(1000));
@@ -332,13 +377,40 @@ mod tests {
         assert_eq!(guard.breach().unwrap().budget, "bytes");
     }
 
+    /// Once the byte budget is spent exactly, nothing more is sent: 9.2 admitted a request
+    /// without a body (a GET), let the target answer it, and cut the response at its first
+    /// chunk, over the budget.
+    #[tokio::test]
+    async fn a_spent_byte_budget_refuses_a_request_without_a_body() {
+        let (gate, guard, cancel) = self::gate(Budgets {
+            max_bytes: Some(1000),
+            ..Default::default()
+        });
+        let fake = Fake::new(1, 300);
+        let t = gate.wrap(fake.clone());
+        // 400 B up and 300 B down, twice: the second upload spends the budget exactly.
+        let resp = send(&t, request("UploadPart", 400)).await.unwrap();
+        assert_eq!(drain(resp).await.0, 300);
+        assert!(send(&t, request("UploadPart", 300)).await.is_ok());
+        assert_eq!(guard.usage(), (2, 1000));
+        assert!(guard.tripped() && guard.breach().is_none());
+        assert!(!cancel.is_cancelled(), "spent exactly: nothing is stopped");
+        let e = send(&t, request("GetObject", 0)).await.err().unwrap();
+        assert_eq!(e, "byte budget spent: 1000 B transferred (limit 1000 B)");
+        assert_eq!(fake.sent(), 2, "the request never left");
+        assert_eq!(guard.usage(), (2, 1000), "nothing past the budget");
+        assert!(cancel.is_cancelled());
+        assert_eq!(guard.breach().unwrap().observed, 1000.0);
+    }
+
     /// A cancellation cuts the requests in flight and refuses the next ones, but lets a
     /// multipart upload being created finish (its id is needed to abort it) and its abort
     /// through.
     #[tokio::test]
     async fn a_cancellation_cuts_what_is_in_flight() {
         let cancel = Cancel::new();
-        let gate = Gate::new(None, cancel.clone());
+        let aborts = Aborts::new();
+        let gate = Gate::new(None, cancel.clone(), aborts.clone());
         let mut fake = Fake::new(1, 8);
         // No request is answered until the test says so.
         let answers = Arc::new(Semaphore::new(0));
@@ -364,6 +436,63 @@ mod tests {
         assert_eq!(fake.sent(), 2, "nothing new is sent");
         answers.add_permits(1);
         assert!(send(&*t, request("AbortMultipartUpload", 0)).await.is_ok());
+        assert_eq!(aborts.failure(), None);
+    }
+
+    /// K1-5: a created upload that never answers is not waited for beyond its grace period
+    /// once the run is cancelled (9.2 waited for ever: the run hung before its cleanup), and
+    /// is reported, since it cannot be aborted.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_create_is_given_up_after_its_grace_period() {
+        let cancel = Cancel::new();
+        let aborts = Aborts::new();
+        let gate = Gate::new(None, cancel.clone(), aborts.clone());
+        let mut fake = Fake::new(1, 8);
+        fake.answers = Some(Arc::new(Semaphore::new(0)));
+        let t = Arc::new(gate.wrap(fake.clone()));
+        let create = {
+            let t = t.clone();
+            tokio::spawn(async move { send(&*t, request("CreateMultipartUpload", 0)).await })
+        };
+        while fake.sent() < 1 {
+            tokio::task::yield_now().await;
+        }
+        // Not cancelled: it may take as long as it takes.
+        tokio::time::sleep(CREATE_GRACE * 100).await;
+        assert!(!create.is_finished());
+        cancel.cancel();
+        tokio::time::sleep(CREATE_GRACE - Duration::from_millis(1)).await;
+        assert!(!create.is_finished(), "within its grace period");
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        let e = create.await.unwrap().err().expect("given up");
+        assert_eq!(e, "the run was cancelled");
+        let failure = aborts.failure().expect("reported");
+        assert!(
+            failure.contains("`/b/k`") && failure.contains("no upload id to abort"),
+            "{failure}"
+        );
+
+        // The same for the body of its answer: headers that arrived, an id that did not.
+        struct Stalled;
+        impl HttpTransport for Stalled {
+            async fn fetch(
+                &self,
+                _req: http::Request<Buffer>,
+            ) -> opendal::Result<http::Response<HttpBody>> {
+                let body = futures::stream::pending::<opendal::Result<Buffer>>();
+                Ok(http::Response::new(HttpBody::new(body, None)))
+            }
+        }
+        let (cancel, aborts) = (Cancel::new(), Aborts::new());
+        let t = Gate::new(None, cancel.clone(), aborts.clone()).wrap(Stalled);
+        let resp = send(&t, request("CreateMultipartUpload", 0)).await.unwrap();
+        let read = tokio::spawn(drain(resp));
+        cancel.cancel();
+        tokio::time::sleep(CREATE_GRACE - Duration::from_millis(1)).await;
+        assert!(!read.is_finished(), "within its grace period");
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        assert!(read.await.unwrap().1.is_some());
+        assert!(aborts.failure().is_some());
     }
 
     /// A response body in flight ends when the run is cancelled, even while no chunk arrives.
@@ -380,7 +509,7 @@ mod tests {
             }
         }
         let cancel = Cancel::new();
-        let t = Gate::new(None, cancel.clone()).wrap(Stalled);
+        let t = Gate::new(None, cancel.clone(), Aborts::new()).wrap(Stalled);
         let resp = send(&t, request("GetObject", 0)).await.unwrap();
         let read = tokio::spawn(drain(resp));
         for _ in 0..100 {

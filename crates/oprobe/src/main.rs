@@ -25,7 +25,7 @@ fn main() -> ExitCode {
     {
         Ok(rt) => rt,
         Err(e) => {
-            eprintln!("error: cannot start the async runtime: {e}");
+            oprobe::output::stderr_line(format_args!("error: cannot start the async runtime: {e}"));
             return ExitCode::FAILURE;
         }
     };

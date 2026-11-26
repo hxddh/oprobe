@@ -1391,6 +1391,11 @@ pub fn anonymous_options(scheme: &str) -> Result<&'static [(&'static str, &'stat
 
 /// Expand `${NAME}` references from the environment.
 pub fn expand_env(v: &str) -> Result<String> {
+    expand_with(v, |name| std::env::var(name).ok())
+}
+
+/// Expand `${NAME}` references with what `lookup` knows of each name.
+fn expand_with(v: &str, lookup: impl Fn(&str) -> Option<String>) -> Result<String> {
     let mut out = String::with_capacity(v.len());
     let mut rest = v;
     while let Some(start) = rest.find("${") {
@@ -1400,7 +1405,7 @@ pub fn expand_env(v: &str) -> Result<String> {
             .find('}')
             .ok_or_else(|| invalid(format!("unterminated `${{` in `{v}`")))?;
         let name = &after[..end];
-        let val = std::env::var(name).map_err(|_| {
+        let val = lookup(name).ok_or_else(|| {
             crate::errors::OprobeError::new(
                 crate::errors::ErrorCode::ConfigInvalid,
                 format!("environment variable `{name}` referenced by the profile is not set"),
@@ -1622,12 +1627,18 @@ mod tests {
 
     #[test]
     fn env_expansion_and_secret_placeholders() {
-        // FIXME: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::set_var("OPROBE_TEST_SECRET", "s3cr3t") };
+        // A lookup of its own: setting a variable of the process while the other tests'
+        // threads read the environment is undefined behaviour.
+        let env = |name: &str| (name == "OPROBE_TEST_SECRET").then(|| "s3cr3t".to_owned());
         assert_eq!(
-            expand_env("a-${OPROBE_TEST_SECRET}-b").unwrap(),
+            expand_with("a-${OPROBE_TEST_SECRET}-b", env).unwrap(),
             "a-s3cr3t-b"
         );
+        let e = expand_with("${OPROBE_TEST_UNSET}", env).unwrap_err();
+        let b = crate::errors::classify(&e, "s3");
+        assert_eq!(b.code, crate::errors::ErrorCode::ConfigInvalid);
+        assert!(b.message.contains("`OPROBE_TEST_UNSET`"), "{}", b.message);
+        assert!(expand_with("${OPEN", env).is_err());
         let mut p = Profile::from_url("s3://b");
         p.operator
             .options

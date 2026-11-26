@@ -199,6 +199,9 @@ pub struct LabConfig {
     /// Fail the parts of multipart uploads from a part number on (a write that breaks
     /// mid-way).
     pub part_fault: Option<PartFault>,
+    /// Create multipart uploads but never answer `CreateMultipartUpload`: the client does not
+    /// learn the upload id, so it can neither use the upload nor abort it.
+    pub create_never_answers: bool,
 }
 
 /// A fault on `UploadPart` requests: parts numbered `from_part` and above (1-based, as S3
@@ -1443,6 +1446,9 @@ async fn handle_s3_request<'a>(
                     content_type: header(req.headers(), "content-type"),
                 },
             );
+        }
+        if faults.create_never_answers {
+            std::future::pending::<()>().await;
         }
         let init_xml = format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
