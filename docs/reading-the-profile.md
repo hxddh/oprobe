@@ -123,7 +123,12 @@ Each operation's wall time is split exactly; an instant counts once even when re
   OpenDAL's background tasks.
 - **Open loop** (`--rate`): latency counts from the intended start, and arrivals that never
   started count in every percentile as censored values, so a slow server cannot hide behind fewer
-  requests.
+  requests. A censored value is a lower bound (the arrival had waited that long when the window
+  ended; nothing says how much longer it would have taken), so those percentiles are "at least"
+  values. A p99 limit (`p99_ms`) is therefore checked against the worst the censored arrivals
+  allow: it is breached when more than 1 % of the scheduled arrivals never completed (the p99
+  then has no upper bound), and otherwise when the p99 with each of them counted as slower than
+  every completed operation exceeds it.
 - **Percentiles** are exact when every operation was kept, otherwise from histograms with three
   significant digits. Counts always agree with the totals. The report keeps the run's whole
   latency distribution (`latency_histogram`, 20 bins per decade), and the latency distribution

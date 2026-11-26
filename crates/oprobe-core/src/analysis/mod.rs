@@ -4,6 +4,7 @@
 
 pub mod capacity;
 pub mod catalog;
+pub mod censoring;
 pub mod diagnosis;
 pub mod findings;
 pub mod hints;

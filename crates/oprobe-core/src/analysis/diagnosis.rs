@@ -3,6 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::censoring::{CensoredQuantile, censored_quantile};
 use crate::config::Sla;
 use crate::trace::Snapshot;
 use crate::util::fmt_ms;
@@ -241,8 +242,22 @@ pub fn throttled_request_ratio(s: &Snapshot) -> f64 {
     )
 }
 
+/// The p99 over every scheduled arrival of an open-loop run in which some never completed
+/// (and how many of how many): `None` for a closed loop, and when every arrival completed.
+/// See [`crate::analysis::censoring`].
+pub fn censored_p99(s: &Snapshot) -> Option<(CensoredQuantile, u64, u64)> {
+    let censored = s.open_loop.as_ref().map(|o| o.censored_count)?;
+    if censored == 0 {
+        return None;
+    }
+    let p99 = censored_quantile(&s.latency_histogram, censored, 0.99)?;
+    Some((p99, censored, s.latency_histogram.total()))
+}
+
 /// Check the measured result against the SLA: error rate, data integrity (always), per-verb
-/// p99 and throttled requests (when set).
+/// p99 and throttled requests (when set). In an open-loop run the p99 limit also holds for the
+/// arrivals that never completed: they have no verb and no latency, only a time they had
+/// already waited, so the per-verb percentiles (completed operations) cannot show them.
 pub fn check_sla(s: &Snapshot, sla: &Sla) -> SlaVerdict {
     let mut breaches = Vec::new();
     if s.integrity.corrupted > 0 {
@@ -286,6 +301,23 @@ pub fn check_sla(s: &Snapshot, sla: &Sla) -> SlaVerdict {
                 fmt_ms(v.latency.p99),
                 fmt_ms(limit)
             ));
+        }
+        if let Some((p99, censored, arrivals)) = censored_p99(s)
+            && !p99.meets(limit)
+        {
+            let limit = fmt_ms(limit);
+            breaches.push(match p99 {
+                CensoredQuantile::AtLeast(ms) => format!(
+                    "p99 is at least {}: {censored} of {arrivals} scheduled arrivals never \
+                     completed, so the {limit} limit cannot hold",
+                    fmt_ms(ms)
+                ),
+                CensoredQuantile::AtMost(ms) => format!(
+                    "p99 of all scheduled arrivals may be {}: {censored} of {arrivals} never \
+                     completed and count as slower, which exceeds the {limit} limit",
+                    fmt_ms(ms)
+                ),
+            });
         }
     }
     SlaVerdict {
@@ -361,5 +393,67 @@ mod sla_tests {
         };
         let v = check_sla(&snap(10, 10), &off);
         assert!(!v.passed && !v.enforced);
+    }
+
+    /// An open-loop run against a target that stalls: the operations that completed were
+    /// fast, so every per-verb p99 is within the limit, but most arrivals never completed.
+    /// 9.1 passed the SLA; the p99 of the arrivals is unknown and at least their wait.
+    #[test]
+    fn a_stalled_open_loop_cannot_pass_a_p99_limit() {
+        use crate::trace::{LatencyHistogram, OpenLoopStats};
+        let sla = Sla {
+            p99_ms: Some(100.0),
+            ..Sla::default()
+        };
+        // 200 operations of 5 ms, then 800 arrivals censored after 10 ms to 8 s of waiting.
+        let stalled = |censored: u64| {
+            let mut s = snap(200, 0);
+            s.verbs = vec![VerbStats {
+                verb: "read.full".into(),
+                count: 200,
+                latency: Quantiles {
+                    count: 200,
+                    p99: 5.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }];
+            let waits = (1..=censored).map(|i| (i * 10_000, 1));
+            s.latency_histogram =
+                LatencyHistogram::from_counts(std::iter::once((5_000, 200)).chain(waits));
+            s.open_loop = Some(OpenLoopStats {
+                missed: censored,
+                censored_count: censored,
+                intended_count: 200 + censored,
+                ..Default::default()
+            });
+            s
+        };
+        let v = check_sla(&stalled(800), &sla);
+        assert!(!v.passed, "{v:?}");
+        assert_eq!(v.breaches.len(), 1, "{v:?}");
+        let b = &v.breaches[0];
+        assert!(b.starts_with("p99 is at least 7."), "{b}");
+        assert!(
+            b.contains("800 of 1000 scheduled arrivals never completed"),
+            "{b}"
+        );
+        // The bound is never below what the arrivals imply: here the 990th smallest of them.
+        let (p99, ..) = censored_p99(&stalled(800)).unwrap();
+        let naive = stalled(800).latency_histogram.quantile_ms(0.99).unwrap();
+        assert!(p99.bound_ms() >= naive / 1.13, "{p99:?} against {naive}");
+        // One arrival in a thousand cut off at the window's end does not breach a limit the
+        // operations are far below: the p99 is still bounded from above.
+        let mut one = stalled(0);
+        one.latency_histogram = LatencyHistogram::from_counts([(5_000, 999), (2_000, 1)]);
+        one.open_loop.as_mut().unwrap().censored_count = 1;
+        assert!(check_sla(&one, &sla).passed);
+        // Every arrival completed, or a closed loop: the per-verb check alone, as before.
+        assert!(check_sla(&stalled(0), &sla).passed);
+        let mut closed = stalled(800);
+        closed.open_loop = None;
+        assert!(check_sla(&closed, &sla).passed);
+        // The latency limit is the one objective the censored arrivals bear on.
+        assert!(check_sla(&stalled(800), &Sla::default()).passed);
     }
 }
