@@ -82,13 +82,33 @@ impl Ctx {
     fn start_without_sidebar(&self) -> Headless {
         let mut app = Headless::start(self.config(Os::Linux, Locale::EN_US)).unwrap();
         app.wait_for("id:sidebar-show").unwrap();
+        self.opened(&mut app);
         app
     }
 
     fn start_on(&self, os: Os, locale: Locale) -> Headless {
         let mut app = Headless::start(self.config(os, locale)).unwrap();
         app.wait_for("id:sidebar").unwrap();
+        self.opened(&mut app);
         app
+    }
+
+    /// Wait until the run the app opens at start has loaded. It loads off the app's thread,
+    /// and the menu bar is rebuilt when it has (`menus::install`): the items get new ids, so a
+    /// menu shortcut pressed across that rebuild names an item that is gone and does nothing.
+    /// A test that pressed one right after the sidebar showed (Ctrl+, in `choose`) then waited
+    /// its whole timeout for a dialog that never opened, on a loaded machine.
+    fn opened(&self, app: &mut Headless) {
+        if App::new(self.paths())
+            .list()
+            .is_ok_and(|l| l.runs.is_empty())
+        {
+            return;
+        }
+        app.wait_until("the run opened at start loading", LONG, |s| {
+            s.matches("id:profile") == Ok(true) || s.matches("id:operator") == Ok(true)
+        })
+        .unwrap();
     }
 
     fn config(&self, os: Os, locale: Locale) -> EngineConfig {
