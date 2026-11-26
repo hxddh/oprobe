@@ -240,6 +240,22 @@ impl RunRequest {
         self
     }
 
+    /// Run a stored run's `spec` again: its operator as it was given, its whole workload (the
+    /// open-loop rate, the dataset, the seed, …) and every operator value that is not the
+    /// default of its URL ([`RunSpec::replay`]), under the same label. Secrets are not in a
+    /// spec: they come from where the operator does (its file, the config file, the
+    /// environment), as for any run.
+    pub fn replaying(spec: &RunSpec) -> Self {
+        let (workload, set) = spec.replay();
+        Self {
+            operators: vec![spec.operator_ref.clone()],
+            workload,
+            set,
+            label: spec.label.clone(),
+            ..Default::default()
+        }
+    }
+
     /// The profile request of one of the operators.
     fn profile_request(&self, operator: &str) -> ProfileRequest {
         ProfileRequest {
@@ -456,5 +472,95 @@ impl App {
     /// `oprobe lab`: start the server (it serves until the returned handle is dropped).
     pub async fn lab(&self, req: LabRequest) -> Result<LabHandle> {
         lab::lab(req).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Running a run again resolves to the spec it had: the open-loop rate, the dataset, the
+    /// seed, the workload settings without a flag, and the operator's options, layers and
+    /// HTTP client (9.1's app rebuilt the run from five form fields and lost the rest).
+    #[test]
+    fn replaying_a_spec_resolves_to_the_same_spec() {
+        let d = tempfile::tempdir().unwrap();
+        let config_file = d.path().join("config.toml");
+        std::fs::write(
+            &config_file,
+            "[operators.prod]\nurl = \"s3://bkt/data\"\n\n[operators.prod.options]\n\
+             region = \"eu-west-2\"\nsecret_access_key = \"hunter2\"\n\n\
+             [operators.prod.layers]\nretry = { max_times = 9 }\n",
+        )
+        .unwrap();
+        let app = App::new(Paths {
+            config_file,
+            data_dir: d.path().join("data"),
+        });
+        let workload = WorkloadInput {
+            preset: Some("range-reads".into()),
+            concurrency: Some(7),
+            seed: Some(99),
+            duration: Some("3s".into()),
+            warmup: Some("1s".into()),
+            max_ops: Some(5000),
+            rate: Some(250.0),
+            objects: Some(12),
+            object_size: Some("2MiB".into()),
+            access: Some("zipf:1.1".into()),
+            persist_dataset: true,
+            no_verify: true,
+            keep_data: true,
+            arrivals: Some("poisson".into()),
+            ..Default::default()
+        };
+        let set = [
+            "options.endpoint=http://127.0.0.1:9000",
+            "http.version=h1",
+            "http.keep_alive=false",
+            "layers.concurrent_limit.http=12",
+            "layers.timeout=off",
+            "read.gap=1MiB",
+            "write.concurrent=3",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        let requests = [
+            RunRequest {
+                operators: vec!["s3://bkt/prefix".into()],
+                workload: workload.clone(),
+                set: set.clone(),
+                label: Some("nightly".into()),
+                ..Default::default()
+            },
+            // A configured operator: its secret is redacted in the spec and comes from the
+            // config file again.
+            RunRequest {
+                operators: vec!["prod".into()],
+                workload: WorkloadInput {
+                    existing: Some("tables/".into()),
+                    objects: None,
+                    object_size: None,
+                    persist_dataset: false,
+                    keep_data: false,
+                    ..workload
+                },
+                set,
+                ..Default::default()
+            },
+            RunRequest::new(["lab://throttle"]),
+        ];
+        for req in requests {
+            let first = app.resolve(&req).unwrap().remove(0);
+            let spec = first.spec();
+            let again = RunRequest::replaying(&spec);
+            let second = app.resolve(&again).unwrap().remove(0);
+            assert_eq!(second.spec(), spec, "{:?}", spec.command());
+            // The secret itself is back, not its redaction.
+            assert_eq!(
+                second.profile.operator.options.get("secret_access_key"),
+                first.profile.operator.options.get("secret_access_key")
+            );
+        }
     }
 }

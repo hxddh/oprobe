@@ -66,6 +66,18 @@ The window works like other professional tools on your platform (design:
   a real target is **planned first**: **Review Plan** shows what the run will write, read and
   delete (and under which prefix), how long it takes and the budgets that stop it, and only then
   does the button become **Run**. Changing the form drops the plan.
+- **Run Again** (mod+R) repeats the selected run as it ran: its operator, its whole workload
+  (the open-loop rate, the dataset, the seed, the key popularity, …) and every operator value
+  that is not the default of its URL. A `lab://` run starts at once. A real target opens New
+  Run on its plan: the fields show the run's operator, workload, duration, concurrency and
+  existing prefix, and **Runs again as** shows the command whose other settings it keeps.
+  Change a field and only that changes; choose another operator or workload and it is a new
+  run, with nothing carried over. Secrets are never stored in a run: they come from the
+  operator's file, the config file or the environment, as for any run.
+- **Opening a file** (`.oprobe`, a trace, a report): a file is read as untrusted input. A run
+  file may hold blocks of at most 256 MiB, decompress to at most 4 GiB and its rows may take
+  at most 4 GiB of memory (about nine times the default cap of a million rows); a file beyond
+  that, or one that claims more than it holds, is refused with an error, never opened halfway.
 - **Settings** (mod+,): the language, where runs are stored and the config file. Each change
   applies at once. On macOS it is a window of its own; on Windows and Linux a preferences dialog
   with a close button; in a terminal a dialog.
