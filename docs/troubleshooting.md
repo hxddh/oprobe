@@ -151,9 +151,12 @@ preset.
 ### `safety.budget_exceeded` (exit 4)
 
 A budget (`--max-requests`, `--max-bytes`, `--max-duration`, or `[defaults.budgets]`) stopped the
-command. Budgets cover the whole command: every operator of `run`, every trial of `prove`. The
-partial run is saved and test data cleaned up. Raise the budget or shorten the run; `--dry-run`
-shows the estimates.
+command. Budgets cover the whole command: every operator of `run`, every trial of `prove`, and
+every HTTP request sent to the target before cleanup (the preflight, the dataset upload and
+retries included). The request the budget had no room for was not sent, the operations in flight
+were cut, their multipart uploads aborted, the partial run saved and the test data cleaned up.
+When the budget runs out during the preflight or the dataset upload there is no run to save.
+Raise the budget or shorten the run; `--dry-run` shows the estimates.
 
 <a id="safety-read_only"></a>
 ### `safety.read_only` (exit 5)
@@ -182,8 +185,9 @@ The change made things worse on the objective: `prove`'s verdict is `worse`. Rea
 <a id="run-interrupted"></a>
 ### `run.interrupted` (exit 130, retryable)
 
-Ctrl-C or Stop ended the command. Test data was cleaned up unless Ctrl-C was pressed twice. Run it
-again.
+Ctrl-C, SIGTERM, SIGHUP or Stop ended the command. The requests in flight were cut, the multipart
+uploads they belonged to aborted, and the test data cleaned up, unless a second signal ended the
+cleanup too. Run it again.
 
 <a id="internal"></a>
 ### `internal` (exit 1)

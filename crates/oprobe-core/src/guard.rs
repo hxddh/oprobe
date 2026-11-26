@@ -1,9 +1,16 @@
 //! Safety rails (design §10): live budgets, the `--dry-run` plan, `--read-only`, deterministic
 //! run prefixes and the preflight check that runs before anything is written.
 //!
-//! Budgets are enforced by the engine: the recorder feeds every completed operation's requests
-//! and bytes to [`Guard::add`] (all phases), the runner's sampler calls [`Guard::tick`]; the
-//! first breach cancels the run, and the command fails with `safety.budget_exceeded` (exit 4).
+//! Budgets are enforced on the wire. Every operator a run talks to its target with before
+//! cleanup (reachability probes, preflight, dataset preparation, warm-up, the window and
+//! verification) sends its requests through [`crate::engine::gate`]: a request is admitted
+//! by [`Guard::admit`] when it is sent (so retries and re-sent requests count, each with its
+//! body), response bytes are counted by [`Guard::add_bytes`] as they stream, and a request the
+//! budget has no room for is never sent. In-process services (`memory://`, `fs://`) have no
+//! HTTP: the recorder feeds their completed calls to [`Guard::add`]. The runner's sampler
+//! calls [`Guard::tick`]. Cleanup (deleting the run prefix, aborting multipart uploads) is
+//! never counted and never refused. The first breach cancels the run, which cuts what is in
+//! flight, and the command fails with `safety.budget_exceeded` (exit 4).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -89,7 +96,7 @@ pub struct Guard {
     requests: AtomicU64,
     bytes: AtomicU64,
     breach: Mutex<Option<BudgetBreach>>,
-    /// A budget is spent: the armed measurement was cancelled (no further work starts).
+    /// A budget is spent: no further work starts.
     tripped: std::sync::atomic::AtomicBool,
     /// A budget was exceeded (more than its limit was used).
     exceeded: std::sync::atomic::AtomicBool,
@@ -134,10 +141,10 @@ impl Guard {
         *self.cancel.lock().unwrap_or_else(|e| e.into_inner()) = Some(cancel);
     }
 
-    /// Account requests and bytes (hot path: two atomic adds and a few compares). A budget
-    /// stops the run when it is spent: `--max-requests 500` allows 500 requests, not 501.
-    /// Spending it exactly is not a breach by itself: only exceeding it, or work it stopped
-    /// ([`Guard::note_cut_short`]), is.
+    /// Account the requests and bytes of a completed in-process call (hot path: two atomic
+    /// adds and a few compares). A budget stops the run when it is spent: `--max-requests 500`
+    /// allows 500 requests, not 501. Spending it exactly is not a breach by itself: only
+    /// exceeding it, or work it stopped ([`Guard::note_cut_short`]), is.
     #[inline]
     pub fn add(&self, requests: u64, bytes: u64) {
         let r = self.requests.fetch_add(requests, Ordering::Relaxed) + requests;
@@ -145,14 +152,100 @@ impl Guard {
         if let Some(max) = self.budgets.max_requests_count
             && r >= max
         {
-            self.trip("requests", max as f64, r as f64, r > max);
+            self.trip("requests", max as f64, r as f64, r > max, true);
         }
         if let Some(max) = self.budgets.max_bytes
             && b >= max
         {
-            self.trip("bytes", max as f64, b as f64, b > max);
+            self.trip("bytes", max as f64, b as f64, b > max, true);
         }
         self.tick();
+    }
+
+    /// Admit one HTTP request with a body of `body_bytes`, as it is about to be sent: it is
+    /// counted now, whatever becomes of it. A request the budgets have no room for is refused
+    /// (`Err`: it must not be sent), which is work the budget stopped: the run is cancelled
+    /// and the budget breached. The request that spends a budget exactly is admitted and
+    /// cancels nothing: what is in flight is within the budget and may finish.
+    pub fn admit(&self, body_bytes: u64) -> Result<(), BudgetBreach> {
+        self.tick();
+        let mut spent = None;
+        match self.budgets.max_bytes {
+            Some(max) => {
+                let room = |b: u64| b.checked_add(body_bytes).filter(|n| *n <= max);
+                match self
+                    .bytes
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, room)
+                {
+                    Ok(b) if b + body_bytes == max => spent = Some(("bytes", max)),
+                    Ok(_) => {}
+                    Err(b) => return Err(self.refuse("bytes", max as f64, b as f64)),
+                }
+            }
+            None => {
+                self.bytes.fetch_add(body_bytes, Ordering::Relaxed);
+            }
+        }
+        match self.budgets.max_requests_count {
+            Some(max) => {
+                let room = |r: u64| (r < max).then_some(r + 1);
+                match self
+                    .requests
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, room)
+                {
+                    Ok(r) if r + 1 == max => spent = Some(("requests", max)),
+                    Ok(_) => {}
+                    Err(r) => {
+                        // The request is not sent: its body is not transferred either.
+                        self.bytes.fetch_sub(body_bytes, Ordering::AcqRel);
+                        return Err(self.refuse("requests", max as f64, r as f64));
+                    }
+                }
+            }
+            None => {
+                self.requests.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        if let Some((budget, max)) = spent {
+            self.trip(budget, max as f64, max as f64, false, false);
+        }
+        Ok(())
+    }
+
+    /// Count `bytes` of a response body as they arrive. Bytes past the budget were
+    /// transferred all the same (they are counted), but the stream must stop there (`Err`):
+    /// the overshoot is at most the chunks in flight.
+    pub fn add_bytes(&self, bytes: u64) -> Result<(), BudgetBreach> {
+        let b = self.bytes.fetch_add(bytes, Ordering::AcqRel) + bytes;
+        if let Some(max) = self.budgets.max_bytes
+            && b >= max
+        {
+            self.trip("bytes", max as f64, b as f64, b > max, b > max);
+            if b > max {
+                return Err(self.spent_breach("bytes", max as f64, b as f64));
+            }
+        }
+        Ok(())
+    }
+
+    /// A budget with no room left refused work: the run stops and the budget is breached.
+    fn refuse(&self, budget: &str, limit: f64, observed: f64) -> BudgetBreach {
+        self.note_cut_short();
+        self.trip(budget, limit, observed, false, true);
+        self.spent_breach(budget, limit, observed)
+    }
+
+    /// The breach on record (the first budget spent), else the one described.
+    fn spent_breach(&self, budget: &str, limit: f64, observed: f64) -> BudgetBreach {
+        self.breach
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .unwrap_or_else(|| BudgetBreach {
+                budget: budget.to_owned(),
+                limit,
+                observed,
+            })
     }
 
     /// Check the wall-clock budget.
@@ -161,34 +254,36 @@ impl Guard {
         if let Some(max) = self.budgets.max_duration_s {
             let s = self.started.elapsed().as_secs_f64();
             if s > max {
-                self.trip("duration", max, s, true);
+                self.trip("duration", max, s, true, true);
             }
         }
     }
 
-    fn trip(&self, budget: &str, limit: f64, observed: f64, exceeded: bool) {
+    /// A budget is spent (`exceeded`: more than its limit was used). `stop` cancels the armed
+    /// measurement: always, except for the HTTP request that spends a budget exactly.
+    fn trip(&self, budget: &str, limit: f64, observed: f64, exceeded: bool, stop: bool) {
         if exceeded {
             self.exceeded.store(true, Ordering::Release);
         }
-        if self.tripped.swap(true, Ordering::AcqRel) {
-            return;
+        if !self.tripped.swap(true, Ordering::AcqRel) {
+            *self.breach.lock().unwrap_or_else(|e| e.into_inner()) = Some(BudgetBreach {
+                budget: budget.to_owned(),
+                limit,
+                observed,
+            });
         }
-        *self.breach.lock().unwrap_or_else(|e| e.into_inner()) = Some(BudgetBreach {
-            budget: budget.to_owned(),
-            limit,
-            observed,
-        });
-        if let Some(c) = self
-            .cancel
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
+        if stop
+            && let Some(c) = self
+                .cancel
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
         {
             c.cancel();
         }
     }
 
-    /// A budget is spent: the armed measurement was cancelled.
+    /// A budget is spent: nothing more may start (work it stops cancels the measurement).
     pub fn tripped(&self) -> bool {
         self.tripped.load(Ordering::Acquire)
     }

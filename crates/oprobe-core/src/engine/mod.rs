@@ -2,6 +2,7 @@
 
 pub mod cleanup;
 pub mod dataset;
+pub mod gate;
 pub mod measure;
 pub mod operator;
 pub mod ops;
@@ -10,6 +11,7 @@ pub mod runner;
 pub mod schedule;
 pub mod selfobs;
 pub mod stack;
+pub mod upload;
 pub mod workloads;
 
 pub use cleanup::CleanupSummary;

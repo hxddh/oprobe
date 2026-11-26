@@ -14,33 +14,44 @@ use tokio::task::{JoinError, JoinSet};
 
 use super::cleanup::{CleanupSummary, delete_prefix, new_run_prefix};
 use super::dataset::{Dataset, PayloadPool, Picker};
-use super::operator::{admin_operator, base_operator, measured_operator_with};
+use super::gate::Gate;
+use super::operator::{admin_operator, admin_operator_with, base_operator, measured_operator_with};
 use super::ops::{OpCtx, error_class, execute, verb};
+use super::upload::Aborts;
 use crate::config::{Knobs, OpKind, OpSpec, Profile, TargetSpec};
 use crate::guard::Guard;
 use crate::trace::{OpCompletion, OpScope, OpenLoopStats, Phase, Recorder, Snapshot, TraceRows};
 
-/// Cooperative cancellation shared with Ctrl-C handlers and the TUI.
+/// Cooperative cancellation shared with signal handlers, the app and the budget guard.
+/// Cancelling stops new work, and the [`super::gate`] cuts the requests in flight.
 #[derive(Clone, Debug, Default)]
-pub struct Cancel(Arc<AtomicBool>);
+pub struct Cancel(Arc<CancelState>);
+
+#[derive(Debug, Default)]
+struct CancelState {
+    cancelled: AtomicBool,
+    wake: tokio::sync::Notify,
+}
 
 impl Cancel {
     pub fn new() -> Self {
         Self::default()
     }
     pub fn cancel(&self) {
-        self.0.store(true, Ordering::Release);
+        self.0.cancelled.store(true, Ordering::Release);
+        self.0.wake.notify_waiters();
     }
     pub fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::Acquire)
+        self.0.cancelled.load(Ordering::Acquire)
     }
-    pub fn reset(&self) {
-        self.0.store(false, Ordering::Release);
-    }
-    /// Resolves once [`Cancel::cancel`] has been called (polled every 50 ms).
+    /// Resolves once [`Cancel::cancel`] has been called (at once: every waiter is woken).
     pub async fn cancelled(&self) {
-        while !self.is_cancelled() {
-            tokio::time::sleep(Duration::from_millis(50)).await;
+        let woken = self.0.wake.notified();
+        tokio::pin!(woken);
+        // Registered before the flag is read: a cancellation in between still wakes it.
+        woken.as_mut().enable();
+        if !self.is_cancelled() {
+            woken.await;
         }
     }
 }
@@ -172,7 +183,10 @@ pub struct Session {
     /// The operator's service target, normalized (the region of an S3 bucket detected).
     pub target: TargetSpec,
     pub base: Operator,
+    /// Dataset preparation and verification: behind the run's gate (budgets, cancellation).
     pub admin: Operator,
+    /// Cleanup (deleting test data): outside the gate, so nothing stops it.
+    pub cleaner: Operator,
     pub run_prefix: String,
     pub dataset: Arc<Dataset>,
     pub mix: Vec<OpSpec>,
@@ -180,6 +194,10 @@ pub struct Session {
     pool: Arc<PayloadPool>,
     written: Arc<Mutex<Vec<(String, u32)>>>,
     pub cancel: Cancel,
+    /// Budgets and cancellation, enforced on every request before cleanup.
+    gate: Gate,
+    /// The upload tasks of this session (the multipart uploads it has to abort).
+    aborts: Aborts,
     /// The service's full capability (limits OpenDAL applies, e.g. the minimum part size).
     pub capability: opendal::Capability,
     trial: AtomicU64,
@@ -216,11 +234,14 @@ impl Session {
         let mut target = profile.operator.target()?;
         super::operator::prepare_target(&mut target).await?;
         let base = base_operator(&target)?;
-        let admin = admin_operator(&base, &target)?;
         let run_prefix = opts.run_prefix.clone().unwrap_or_else(new_run_prefix);
         if let Some(g) = &opts.guard {
             g.arm(cancel.clone());
         }
+        let gate = Gate::new(opts.guard.clone(), cancel.clone());
+        let admin = admin_operator_with(&base, &target, Some(&gate))?;
+        let cleaner = admin_operator(&base, &target)?;
+        let aborts = Aborts::new();
         let spec = profile.workload.effective_dataset();
         let mut mix = profile.workload.effective_mix();
         // The mix runs on what the service can do.
@@ -240,22 +261,27 @@ impl Session {
             }
         );
         if target.is_network() {
-            super::operator::check_reachable_with(&base, &target, &profile.operator.http).await?;
-            super::operator::check_protocol(&base, &target, &profile.operator.http).await?;
+            let http = &profile.operator.http;
+            super::operator::check_reachable_with(&base, &target, http, Some(&gate)).await?;
+            super::operator::check_protocol(&base, &target, http, Some(&gate)).await?;
         }
         let needs_objects = mix.iter().any(|m| m.op.needs_dataset() && m.weight > 0);
         if opts.preflight {
             let writes = spec.existing_prefix.is_none()
                 && (needs_objects || mix.iter().any(|m| m.weight > 0 && m.op.is_write()));
             // Fail fast: few retries, short timeouts (the admin operator retries for minutes).
-            let quick = super::operator::preflight_operator(&base, &target)?;
+            let quick = super::operator::preflight_operator(&base, &target, Some(&gate))?;
             crate::guard::preflight(&quick, &run_prefix, writes)
                 .await
                 .map_err(|e| super::operator::explain_preflight(e, &target))?;
         }
         let p2 = progress.clone();
         let dataset = Dataset::prepare(
-            &admin,
+            super::dataset::Via {
+                admin: &admin,
+                cleaner: &cleaner,
+                aborts: &aborts,
+            },
             &spec,
             profile.workload.seed,
             &run_prefix,
@@ -273,20 +299,14 @@ impl Session {
         {
             warnings.push(format!("range size {sz} exceeds the smallest object ({min} B); those reads become whole-object reads"));
         }
-        let max_write = mix
-            .iter()
-            .filter_map(|m| match &m.op {
-                OpKind::Write { size } | OpKind::MultipartWrite { size } => Some(size.as_usize()),
-                _ => None,
-            })
-            .max()
-            .unwrap_or(0);
+        let max_write = super::ops::max_payload(mix.iter().map(|m| &m.op));
         let capability = measured_cap;
         Ok(Self {
             profile,
             target,
             base,
             admin,
+            cleaner,
             run_prefix,
             dataset: Arc::new(dataset),
             mix,
@@ -294,6 +314,8 @@ impl Session {
             pool: Arc::new(PayloadPool::new(max_write)),
             written: Arc::new(Mutex::new(Vec::new())),
             cancel,
+            gate,
+            aborts,
             capability,
             trial: AtomicU64::new(0),
             guard: opts.guard,
@@ -346,7 +368,11 @@ impl Session {
                     .min(crate::store::runfile::STREAM_MEMORY_ROWS),
             );
         }
-        if let Some(g) = &self.guard {
+        // HTTP requests are accounted at the gate, as they are sent. An in-process service has
+        // none: its calls are accounted by the recorder, as they complete.
+        if let Some(g) = &self.guard
+            && !self.target.is_network()
+        {
             recorder.set_guard(g.clone());
         }
         let tree = opts
@@ -364,6 +390,7 @@ impl Session {
             &recorder,
             tree.clone(),
             self.tail_cut.clone(),
+            Some(&self.gate),
         )
         .await?;
         let ctx = Arc::new(OpCtx {
@@ -377,6 +404,8 @@ impl Session {
             scratch_prefix: format!("{}writes/t{trial:03}-", self.run_prefix),
             written: self.written.clone(),
             state: super::workloads::WorkloadState::new(self.capability, &self.mix),
+            aborts: self.aborts.clone(),
+            cancel: self.cancel.clone(),
         });
 
         // Background sampler: slow-op call stacks, client CPU/RSS, live snapshots.
@@ -451,6 +480,9 @@ impl Session {
         .await;
         stop.store(true, Ordering::Release);
         let _ = sampler.await;
+        // Operations that were dropped unfinished abort their uploads on their own tasks:
+        // nothing of this window is in flight once they are done.
+        self.aborts.settle().await;
         let obs = result?;
         let mut snap = recorder.snapshot();
         snap.self_obs = Some(obs);
@@ -818,8 +850,22 @@ impl Session {
         (ok, bad)
     }
 
-    /// Delete everything this session wrote (unless disabled) and verify.
+    /// Delete everything this session wrote (unless disabled) and verify. Multipart uploads
+    /// still being aborted are awaited first, whatever the cleanup setting: an upload in
+    /// progress is never test data to keep.
     pub async fn close(&self) -> CleanupSummary {
+        self.aborts.settle().await;
+        let mut s = self.delete_test_data().await;
+        if let Some(e) = self.aborts.failure() {
+            s.error = Some(match s.error.take() {
+                Some(other) => format!("{other}; {e}"),
+                None => e,
+            });
+        }
+        s
+    }
+
+    async fn delete_test_data(&self) -> CleanupSummary {
         if !self.profile.workload.cleanup {
             return CleanupSummary {
                 enabled: false,
@@ -838,7 +884,7 @@ impl Session {
                 ..Default::default()
             };
         }
-        let mut s = delete_prefix(&self.admin, &self.run_prefix).await;
+        let mut s = delete_prefix(&self.cleaner, &self.run_prefix).await;
         if self.dataset.preexisting {
             s.kept_dataset = Some(self.dataset.prefix.clone());
         }
@@ -888,6 +934,10 @@ async fn run_one(
         None => fut.await,
     };
     let latency_us = intended.elapsed().as_micros() as u64;
+    // An operation that ended in an error after the run was cancelled was stopped (the gate
+    // refused or cut its requests): it did not fail, and it did not complete. It is not an
+    // operation of the window.
+    let measured = measured && !(res.is_err() && ctx.cancel.is_cancelled());
     let (lr, lw, error) = match res {
         Ok(o) => (o.logical_read, o.logical_write, None),
         Err(e) => {
@@ -1111,6 +1161,28 @@ mod tests {
             v.breakdown.queue_ms > v.breakdown.client_ms,
             "{:?}",
             v.breakdown
+        );
+        // A p99 limit every completed operation is within is still not met: most arrivals
+        // never ran, and their latency is only known to be at least their wait (9.1 checked
+        // the completed operations alone and passed).
+        let sla = crate::config::Sla {
+            p99_ms: Some(30_000.0),
+            max_error_rate: 1.0,
+            ..Default::default()
+        };
+        assert!(snap.verbs.iter().all(|v| v.latency.max < 30_000.0));
+        let verdict = crate::analysis::diagnosis::check_sla(&snap, &sla);
+        assert_eq!(verdict.breaches.len(), 1, "{verdict:?}");
+        assert!(
+            verdict.breaches[0].contains("scheduled arrivals never completed"),
+            "{verdict:?}"
+        );
+        let (p99, censored, arrivals) =
+            crate::analysis::diagnosis::censored_p99(&snap).expect("censored arrivals");
+        assert_eq!((censored, arrivals), (ol.missed, ol.intended_count));
+        assert!(
+            matches!(p99, crate::analysis::censoring::CensoredQuantile::AtLeast(ms) if ms > 0.0),
+            "{p99:?}"
         );
     }
 

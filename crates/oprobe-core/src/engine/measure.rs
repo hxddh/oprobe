@@ -244,19 +244,25 @@ async fn open_with_tail_cut(
     if let Some(b) = guard.as_ref().and_then(|g| g.demand()) {
         return Err(b.to_error());
     }
-    Session::open_with(
+    let opened = Session::open_with(
         profile,
         cancel,
         progress,
         SessionOptions {
             run_prefix: Some(rails.run_prefix.clone()),
-            guard,
+            guard: guard.clone(),
             trace_max_requests,
             preflight: true,
             tail_cut,
         },
     )
-    .await
+    .await;
+    // The preflight and the dataset upload count too: a budget that stopped them is the
+    // error, not the request it refused.
+    match (opened, guard.and_then(|g| g.breach())) {
+        (Err(_), Some(b)) => Err(b.to_error()),
+        (opened, _) => opened,
+    }
 }
 
 /// Run one measurement end to end. A budget breach is not an error here: the partial run is
@@ -337,7 +343,7 @@ pub async fn measure(req: Request) -> Result<Measured> {
     };
     let swept = match (&pending_dir, &marker) {
         (Some(dir), Some(m)) => {
-            sweep_pending(dir, &m.target, &rails, &session.admin, &progress).await
+            sweep_pending(dir, &m.target, &rails, &session.cleaner, &progress).await
         }
         _ => Vec::new(),
     };

@@ -8,7 +8,9 @@ use futures::TryStreamExt;
 use opendal::{Buffer, Operator};
 use rand::Rng;
 
+use super::Cancel;
 use super::dataset::{Dataset, PayloadPool, Picker};
+use super::upload::{Aborts, Upload};
 use super::workloads::WorkloadState;
 use crate::config::OpKind;
 use crate::operator::OperatorSpec;
@@ -29,6 +31,10 @@ pub struct OpCtx {
     pub written: Arc<std::sync::Mutex<Vec<(String, u32)>>>,
     /// Service capability and the state of delete / conditional-write operations.
     pub state: WorkloadState,
+    /// The session's aborts: every writer an operation opens is an [`Upload`] of these.
+    pub aborts: Aborts,
+    /// The run's cancellation: an operation it stopped did not fail.
+    pub cancel: Cancel,
 }
 
 /// Outcome of one logical operation.
@@ -72,6 +78,59 @@ pub fn verb(kind: &OpKind) -> &'static str {
     }
 }
 
+/// The payload an operation of `kind` writes (`None`: it writes none). Every kind is listed,
+/// so a new one cannot be forgotten: the payload pool is sized from this ([`max_payload`]) and
+/// the operations take their payload through it ([`payload`]).
+pub fn payload_size(kind: &OpKind) -> Option<usize> {
+    match kind {
+        OpKind::Write { size }
+        | OpKind::MultipartWrite { size }
+        | OpKind::ConditionalWrite { size }
+        | OpKind::MetadataWrite { size, .. } => Some(size.as_usize()),
+        OpKind::Read { .. }
+        | OpKind::ParquetScan { .. }
+        | OpKind::Stat
+        | OpKind::List { .. }
+        | OpKind::ListPaged { .. }
+        | OpKind::Delete { .. }
+        | OpKind::Copy
+        | OpKind::PresignedRead => None,
+    }
+}
+
+/// The largest payload any operation of `kinds` writes (0: none writes).
+pub fn max_payload<'a>(kinds: impl IntoIterator<Item = &'a OpKind>) -> usize {
+    kinds
+        .into_iter()
+        .filter_map(payload_size)
+        .max()
+        .unwrap_or(0)
+}
+
+/// The payload of one operation of `kind`, all of it.
+fn payload(ctx: &OpCtx, kind: &OpKind, rng: &mut impl Rng) -> Result<bytes::Bytes> {
+    let len = payload_size(kind).expect("only writing operations take a payload");
+    ctx.pool.slice(rng, len)
+}
+
+/// Write `data` to `path` through a writer with the operator's write options, in the pieces a
+/// streaming application hands it. The upload is aborted unless it completes.
+async fn stream_write(ctx: &OpCtx, path: &str, data: bytes::Bytes) -> opendal::Result<()> {
+    let write = &ctx.spec.write;
+    let mut w = ctx.op.writer_with(path);
+    if let Some(c) = write.chunk {
+        w = w.chunk(c.as_usize());
+    }
+    if let Some(c) = write.concurrent {
+        w = w.concurrent(c);
+    }
+    let mut upload = Upload::new(&ctx.op, w.await?, path, &ctx.aborts);
+    let piece = write.chunk.map_or(8 << 20, |c| c.as_usize());
+    upload.write_in_pieces(data, piece).await?;
+    upload.close().await?;
+    Ok(())
+}
+
 fn crc_of(buf: &Buffer) -> u32 {
     buf.clone()
         .fold(0u32, |acc, chunk| crate::util::crc32c_append(acc, &chunk))
@@ -95,8 +154,6 @@ pub async fn execute(
     key: &mut String,
 ) -> Result<OpOutcome> {
     let spec = &ctx.spec;
-    // The pieces a streaming multipart write hands to the writer.
-    let piece = spec.write.chunk.map_or(8 << 20, |c| c.as_usize());
     let ds = &ctx.dataset;
     let pick = |rng: &mut (dyn rand::RngCore + Send)| -> Result<&super::dataset::DataObject> {
         if ds.objects.is_empty() {
@@ -178,7 +235,7 @@ pub async fn execute(
                 logical_write: 0,
             })
         }
-        OpKind::Write { size } => {
+        OpKind::Write { .. } => {
             let path = if ctx.state.unique_writes {
                 // Deletes consume what writes create: every write makes a new key.
                 format!(
@@ -190,27 +247,14 @@ pub async fn execute(
                 format!("{}w-{slot:05}.bin", ctx.scratch_prefix)
             };
             key.clone_from(&path);
-            let data = ctx.pool.slice(rng, size.as_usize());
+            let data = payload(ctx, kind, rng)?;
             let len = data.len() as u64;
             let crc = (ctx.verify && slot.is_multiple_of(16)).then(|| crate::util::crc32c(&data));
             if spec.write.is_default() {
+                // One request (OpenDAL splits nothing without a chunk size): nothing to abort.
                 ctx.op.write(&path, data).await?;
             } else {
-                let mut w = ctx.op.writer_with(&path);
-                if let Some(c) = spec.write.chunk {
-                    w = w.chunk(c.as_usize());
-                }
-                if let Some(c) = spec.write.concurrent {
-                    w = w.concurrent(c);
-                }
-                let mut w = w.await?;
-                let mut off = 0;
-                while off < data.len() {
-                    let end = (off + piece).min(data.len());
-                    w.write(data.slice(off..end)).await?;
-                    off = end;
-                }
-                w.close().await?;
+                stream_write(ctx, &path, data).await?;
             }
             if ctx.state.unique_writes {
                 ctx.state.push_deletable(path.clone());
@@ -222,27 +266,13 @@ pub async fn execute(
                 logical_write: len,
             })
         }
-        OpKind::MultipartWrite { size } => {
+        OpKind::MultipartWrite { .. } => {
             let path = format!("{}mp-{slot:05}.bin", ctx.scratch_prefix);
             key.clone_from(&path);
-            let data = ctx.pool.slice(rng, size.as_usize());
+            let data = payload(ctx, kind, rng)?;
             let len = data.len() as u64;
             let crc = (ctx.verify && slot.is_multiple_of(8)).then(|| crate::util::crc32c(&data));
-            let mut w = ctx.op.writer_with(&path);
-            if let Some(c) = spec.write.chunk {
-                w = w.chunk(c.as_usize());
-            }
-            if let Some(c) = spec.write.concurrent {
-                w = w.concurrent(c);
-            }
-            let mut w = w.await?;
-            let mut off = 0;
-            while off < data.len() {
-                let end = (off + piece).min(data.len());
-                w.write(data.slice(off..end)).await?;
-                off = end;
-            }
-            w.close().await?;
+            stream_write(ctx, &path, data).await?;
             if let Some(crc) = crc {
                 push_written(ctx, path, crc);
             }
@@ -389,9 +419,9 @@ async fn execute_more(
                 logical_write: 0,
             })
         }
-        OpKind::ConditionalWrite { size } => {
+        OpKind::ConditionalWrite { .. } => {
             let cap = &ctx.state.capability;
-            let data = ctx.pool.slice(rng, size.as_usize());
+            let data = payload(ctx, kind, rng)?;
             let len = data.len() as u64;
             let slot_path = format!("{}cw-{slot:05}.bin", ctx.scratch_prefix);
             let meta = match ctx.state.etag(slot).filter(|e| !e.is_empty()) {
@@ -430,10 +460,10 @@ async fn execute_more(
                 logical_write: len,
             })
         }
-        OpKind::MetadataWrite { size, entries } => {
+        OpKind::MetadataWrite { entries, .. } => {
             let path = format!("{}m-{slot:05}.bin", ctx.scratch_prefix);
             key.clone_from(&path);
-            let data = ctx.pool.slice(rng, size.as_usize());
+            let data = payload(ctx, kind, rng)?;
             let len = data.len() as u64;
             let meta: Vec<(String, String)> = (0..*entries)
                 .map(|i| (format!("oprobe-{i}"), format!("value-{slot}-{i}")))
@@ -562,6 +592,33 @@ pub fn error_class_of(oe: &opendal::Error, last_status: Option<u16>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The payload pool is sized from every operation that writes (9.1 forgot conditional and
+    /// metadata writes, and the pool cut their payloads short without a word).
+    #[test]
+    fn the_payload_pool_holds_the_largest_write_of_any_kind() {
+        use crate::util::ByteSize;
+        let size = ByteSize::mib(3);
+        for kind in [
+            OpKind::Write { size },
+            OpKind::MultipartWrite { size },
+            OpKind::ConditionalWrite { size },
+            OpKind::MetadataWrite { size, entries: 2 },
+        ] {
+            let mix = [OpKind::Stat, kind.clone(), OpKind::Copy];
+            assert_eq!(max_payload(&mix), size.as_usize(), "{kind:?}");
+            let pool = PayloadPool::new(max_payload(&mix));
+            let mut rng = rand::rngs::mock::StepRng::new(1, 7);
+            let data = pool.slice(&mut rng, payload_size(&kind).unwrap()).unwrap();
+            assert_eq!(data.len(), size.as_usize(), "{kind:?}");
+        }
+        assert_eq!(max_payload(&[OpKind::Stat, OpKind::Copy]), 0);
+        // A pool too small for a payload says so instead of handing out less.
+        let pool = PayloadPool::new(0);
+        let mut rng = rand::rngs::mock::StepRng::new(1, 7);
+        let e = pool.slice(&mut rng, 64 << 20).unwrap_err();
+        assert!(e.to_string().contains("payload pool"), "{e}");
+    }
 
     fn err(kind: opendal::ErrorKind, msg: &str) -> anyhow::Error {
         opendal::Error::new(kind, msg).into()

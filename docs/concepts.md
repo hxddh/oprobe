@@ -49,6 +49,28 @@ deletes the prefix. A run killed before it could clean up leaves its prefix behi
 against the same target deletes it. The guard enforces budgets (`--max-requests`, `--max-bytes`,
 `--max-duration`), `--read-only` and `--dry-run`.
 
+**Budgets hold on the wire.** `--max-requests` and `--max-bytes` count every HTTP request the
+command sends to the target and every body byte, as they are sent and received:
+
+- in every phase before cleanup: the reachability check, the preflight, the dataset upload, the
+  warm-up, the measurement and the verification of written objects;
+- retries and re-sent requests included, each with its body;
+- a request the budget has no room for is never sent, and a download stops at the chunk that
+  crosses the byte budget, so a budget is overshot by at most the response chunks in flight,
+  never by a whole operation;
+- cleanup is never counted and never refused: deleting the run prefix and aborting multipart
+  uploads always run.
+
+In-process services (`memory://`, `fs://`) send no HTTP request: their calls are counted as they
+complete.
+
+**A stopped run leaves no multipart upload.** When a budget, `--max-duration`, Ctrl-C (or
+SIGTERM, SIGHUP) or Stop ends a run, the requests in flight are cut and the operations they
+belong to end at once; they are neither completed nor failed operations, and are not in the
+profile. Every multipart upload a failed, timed-out or stopped write or dataset upload had
+started is aborted (`AbortMultipartUpload`), so no part stays on the target to be billed where no
+object listing shows it. An upload whose abort fails is named in the cleanup error.
+
 ## Profile
 
 A profile is what one operator did on one workload, saved as one `.oprobe` file:
