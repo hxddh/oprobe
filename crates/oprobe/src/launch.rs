@@ -56,6 +56,7 @@ fn open(cli: &Cli, terminal: bool, file: Option<PathBuf>, show: &str) -> ExitCod
         crate::ui::set_launch(crate::ui::Launch {
             paths: None,
             open: Some(f.to_string_lossy().into_owned()),
+            stop_grace: None,
         });
     }
     let window = desktop(terminal);

@@ -68,12 +68,16 @@ The window works like other professional tools on your platform (design:
   does the button become **Run**. Changing the form drops the plan.
 - **Run Again** (mod+R) repeats the selected run as it ran: its operator, its whole workload
   (the open-loop rate, the dataset, the seed, the key popularity, …) and every operator value
-  that is not the default of its URL. A `lab://` run starts at once. A real target opens New
-  Run on its plan: the fields show the run's operator, workload, duration, concurrency and
-  existing prefix, and **Runs again as** shows the command whose other settings it keeps.
-  Change a field and only that changes; choose another operator or workload and it is a new
-  run, with nothing carried over. Secrets are never stored in a run: they come from the
-  operator's file, the config file or the environment, as for any run.
+  the run set on top of its operator (the `op.toml` file or the configured operator is read
+  again; for a URL, what is not the default of the URL). A `lab://` run starts at once. A real
+  target opens New Run on its plan: the fields show the run's operator, workload, duration,
+  concurrency and existing prefix, and **Runs again as** shows the command of the run the form
+  will start, as it stands now. Change the duration, the concurrency or the prefix and only
+  that changes. Choose another workload and the operator's values stay (its endpoint, its
+  layers: the run still goes where it went), while the rate, the dataset and the seed of the
+  old workload go. Choose another operator and it is a new run, with nothing carried over.
+  Secrets are never stored in a run: they come from the operator's file, the config file or
+  the environment, as for any run.
 - **Opening a file** (`.oprobe`, a trace, a report): a file is read as untrusted input. A run
   file may hold blocks of at most 256 MiB, decompress to at most 4 GiB and its rows may take
   at most 4 GiB of memory (about nine times the default cap of a million rows); a file beyond
@@ -87,8 +91,14 @@ The window works like other professional tools on your platform (design:
   the notice goes, the folder goes on to the system's trash where there is one; oprobe's trash
   is emptied after a week. `oprobe show --rm` in the CLI still deletes for good.
 - **Quitting** (⌘Q, Ctrl+Q, Exit, or the window's close button) while a run or a prove goes on
-  asks first: **Stop and Quit** stops it, removes its test data and quits; Cancel keeps it
-  running.
+  asks first: **Stop and Quit** stops it, or Cancel keeps it running. The app then waits for
+  the job to remove its test data, showing what it is doing and for how long, and quits by
+  itself when that is done. It waits 60 s at most (an abort of a multipart upload may take
+  30 s to give up on a service that does not answer, and the cleanup gets as long again).
+  Past that it says which job was left and that objects under its `oprobe-run-…/` prefix may
+  remain on the target (the next run against the same target removes them), and offers
+  **Quit Anyway**; the same line goes to the log file. In a terminal, Ctrl+C waits the same
+  way and prints what was left; a second Ctrl+C leaves at once.
 - **Run files**: open a `.oprobe`, `.prove.json`, report `.json` or `op.toml` file with File ▸ Open Run File… (the
   system's open dialog, filtered to those types), drop it on the window (the window is outlined
   while a file is dragged over it), or double-click a `.oprobe` / `.json` file: `oprobe.app` (macOS), the `.msi`
