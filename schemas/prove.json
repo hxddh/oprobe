@@ -756,7 +756,7 @@
     },
     "objective_delta": {
       "$ref": "#/$defs/Interval",
-      "description": "Relative change of the objective (candidate vs baseline) with its 95 % interval,\nsigned in the metric's own direction (goodput +: more; p99 −: faster)."
+      "description": "Relative change of the objective (candidate vs baseline) with its 95 % interval,\nsigned in the metric's own direction (goodput +: more; p99 −: faster). The interval is\nsequential (valid whenever the prove stopped) and adjusted for the order of the trials\nwithin a pair; the verdict is whether it excludes no change."
     },
     "operator": {
       "$ref": "#/$defs/OperatorSpec",
@@ -771,6 +771,15 @@
       "format": "uint64",
       "minimum": 0,
       "type": "integer"
+    },
+    "pairs_max_count": {
+      "description": "The A/B pairs the prove planned at most (`--pairs`): the interval's sequential boundary\nis the one of that plan. Absent in results of 9.1 and earlier, whose interval was the\nfixed-sample one.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
     },
     "prove_id": {
       "description": "This prove (its trials are runs with this `parent_id`).",
