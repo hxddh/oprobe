@@ -1,0 +1,5 @@
+url = "memory://"
+[layers]
+retry = false
+timeout = false
+tail_cut = { percentile = 95, safety_factor = 1.3, min_samples = 200, min_deadline = "500ms", max_deadline = "30s", window = "60s" }

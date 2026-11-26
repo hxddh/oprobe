@@ -95,7 +95,7 @@ impl TailCutSetup {
             .tail_cut
             .clone()
             .unwrap_or_default()
-            .params(op.op_timeout());
+            .params(op.call_timeout());
         Some(Self {
             params,
             backoff_us: retry.first_backoff_mean().as_micros() as u64,

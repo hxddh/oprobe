@@ -1,0 +1,5 @@
+url = "memory://"
+[layers]
+retry = false
+timeout = false
+concurrent_limit = { http = 24 }

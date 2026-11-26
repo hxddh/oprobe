@@ -745,7 +745,7 @@ fn remedy_setup(r: &Report) -> TailCutSetup {
         .tail_cut
         .clone()
         .unwrap_or_default()
-        .params(op.op_timeout());
+        .params(op.call_timeout());
     TailCutSetup {
         params,
         backoff_us: TAIL_CUT_REISSUE_US,

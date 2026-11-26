@@ -1,0 +1,4 @@
+url = "memory://"
+[layers]
+retry = { max_times = 5, jitter = true, min_delay = "50ms", max_delay = "5s", factor = 1.5 }
+timeout = false

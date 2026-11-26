@@ -1,0 +1,3 @@
+url = "gs://my-bucket/data"
+[options]
+service_account = "sa@proj.iam"

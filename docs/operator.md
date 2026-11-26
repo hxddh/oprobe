@@ -63,9 +63,54 @@ OpenDAL recommends:
 | `concurrent_limit` | `ConcurrentLimitLayer` | `http`: HTTP requests in flight (`with_http_concurrent_limit`); `operations`: operations in flight (`ConcurrentLimitLayer::new`; unset: unlimited) |
 | `retry` | `RetryLayer` | `max_times` (3), `jitter` (false), `min_delay` ("1s"), `max_delay` ("60s"), `factor` (2.0) |
 | `timeout` | `TimeoutLayer` | `op`: one operation ("60s"); `io`: one read or write call ("10s") |
-| `tail_cut` | `TailCutLayer` | cancel and re-issue requests slower than `percentile` (95, within 50..99) of the recent latencies × `safety_factor` (1.5, within 1..5), once `min_samples` (32) latencies are recorded within `window` ("60s", at most 120 s); the deadline is clamped to `min_deadline` ("50ms") .. `max_deadline` (unset: the operation timeout `layers.timeout.op`, 60 s without the timeout layer). These defaults are oprobe's, not OpenDAL's (1.3, 200, "500ms", "30s"); generated Rust spells out every value that differs from OpenDAL's, so pasted code behaves as measured |
+| `tail_cut` | `TailCutLayer` | cancel and re-issue requests slower than `percentile` (95, within 50..99) of the recent latencies × `safety_factor` (1.5, within 1..5), once `min_samples` (32) latencies are recorded within `window` ("60s", at most 120 s); the deadline is clamped to `min_deadline` ("50ms") .. `max_deadline` (unset: the shorter of `layers.timeout.op` and `layers.timeout.io`, the timeouts that sever the same calls, so the ceiling is one the layer can reach; 60 s without the timeout layer). These defaults are oprobe's, not OpenDAL's (1.3, 200, "500ms", "30s"); generated Rust spells out every value that differs from OpenDAL's, so pasted code behaves as measured |
 | `throttle` | `ThrottleLayer` | `bandwidth` ("100MiB" per second), `burst` ("16MiB") |
-| `cache` | `FoyerLayer` over an in-memory foyer cache, each entry weighed by its size | `memory` ("256MiB" of cached data) |
+| `cache` | `FoyerLayer` over an in-memory foyer cache, each entry weighed by its size | `memory` ("256MiB" of cached data): any object no larger than `memory` is cached whole; a larger one is read through |
+
+### The order of the stack
+
+The layers are stacked in one fixed order, whatever the order of the keys. A call passes them
+from the outside in:
+
+```text
+cache → retry → throttle → concurrent_limit → tail_cut → timeout → service
+```
+
+The operator oprobe measures and the Rust it generates are both built from this one list, so
+pasted code stacks the layers exactly as they were measured.
+
+- **`timeout` and `tail_cut` time one call to the service and nothing else.** `tail_cut` is the
+  outer of the two; its default ceiling is the shorter of the two timeouts, because OpenDAL's
+  `TimeoutLayer` gives `stat`-like calls `op` and every read, write, list and delete call `io`.
+- **Waiting for an operation permit is not timed.** `concurrent_limit` is outside both timers: a
+  call that queues for `operations` neither runs into a timeout nor counts as a slow call that
+  `tail_cut` would cut and re-issue into the same queue.
+- **A throttled write waits before it takes a permit.** `throttle` is outside the limiter and the
+  timers, so its wait is neither a held permit nor a slow call.
+- **Every attempt starts over.** `retry` is outside all of them: a retried call is throttled,
+  limited and timed again, and a `stat` or a read gives its permit back during the backoff.
+- **A cache hit touches nothing else.**
+
+Two things OpenDAL's design leaves as they are:
+
+- The HTTP permit of `concurrent_limit.http` is taken inside the service, where OpenDAL wraps
+  the HTTP transport. Waiting for it is therefore always inside `timeout` and `tail_cut`: a
+  request that queues behind a small `http` limit can time out, or be tail-cut, while it queues.
+  The profile shows that wait as queue time.
+- A writer, a lister and a deleter keep their operation permit from their first call until
+  they are dropped, a retry's backoff included. So only the first write of an upload waits for
+  the throttle without a permit; its later parts are throttled while the writer holds it.
+
+### The cache
+
+`cache = { memory = "256MiB" }` is one byte budget. The foyer cache behind it has a single
+shard, weighs each entry by its object's size and admits any object no larger than `memory`;
+`FoyerLayer` gets the same size limit, so a larger object is read through with ordinary ranged
+requests and is never fetched or buffered whole. (Foyer's default of 8 shards splits the budget
+by key hash: an object above an eighth of it could not be cached, and a budget that covers the
+objects read still evicted whenever one shard filled first.) The generated Rust builds the
+same cache: `.with_shards(1)`, the weighter, and `.with_size_limit(..=memory)`. `prove` sizes
+`memory` from the distinct objects the run read, and never below its largest object.
 
 ## `[read]` and `[write]`
 
@@ -153,7 +198,7 @@ concurrent_limit = { http = 64 }
 code and as TOML:
 
 ```text
-+ ConcurrentLimitLayer::new(24)
++ ConcurrentLimitLayer::new(1 << 20).with_http_concurrent_limit(24)
 ~ RetryLayer::new().with_jitter().with_max_times(4)
 
 [layers]
@@ -161,4 +206,11 @@ concurrent_limit = { http = 24 }
 retry = { max_times = 4, jitter = true }
 ```
 
-`+` adds a layer, `~` changes one, `-` removes one.
+`+` adds a layer, `~` changes one, `-` removes one. The lines are in the order of the stack,
+innermost first, and each expression is the one oprobe built the measured layer from.
+
+Secrets are never part of the code. A credential option given as a value shows as
+`"<redacted>"` in the TOML and, in the Rust, as a line that names the option without a value:
+nothing to paste over the credential your program loads itself. An option given as an
+environment reference (`secret_access_key = "${MY_SECRET}"`) is kept as the reference in the
+TOML and read with `std::env::var("MY_SECRET")?` in the Rust.

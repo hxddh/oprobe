@@ -1,0 +1,15 @@
+url = "memory://"
+[layers]
+concurrent_limit = { http = 24, operations = 64 }
+retry = { max_times = 5, jitter = true, min_delay = "50ms", max_delay = "5s", factor = 1.5 }
+timeout = { op = "30s", io = "2500ms" }
+tail_cut = { percentile = 99, safety_factor = 2.0, min_samples = 10, min_deadline = "20ms", max_deadline = "3s", window = "90s" }
+throttle = { bandwidth = "64MiB", burst = "8MiB" }
+cache = { memory = 3000000 }
+[read]
+chunk = "8MiB"
+concurrent = 4
+gap = "64KiB"
+[write]
+chunk = "8MiB"
+concurrent = 4

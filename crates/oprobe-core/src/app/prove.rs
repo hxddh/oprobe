@@ -959,11 +959,10 @@ fn remedy_change(run: &Run, f: &Finding) -> Result<Change> {
                     scaled
                 };
             }
-            // Foyer shards memory into 4 pieces: keep at least 2 whole objects per shard (8x).
-            let min_foyer = obj_bytes.saturating_mul(8).max(16 << 20);
-            let mem = ((set as f64 * 1.25) as u64).max(min_foyer).min(1 << 30);
+            let largest = seen.values().copied().max().unwrap_or(obj_bytes);
+            let cache = crate::operator::Cache::sized_for(set, largest);
             c.fixed
-                .push(("layers.cache.memory".into(), ByteSize(mem).to_string()));
+                .push(("layers.cache.memory".into(), cache.memory.to_string()));
         }
         "cold_connections" => match f.remedy.path.as_deref() {
             Some("http.keep_alive") => c.fixed.push(("http.keep_alive".into(), "on".into())),

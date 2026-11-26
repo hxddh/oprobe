@@ -1,0 +1,4 @@
+url = "memory://"
+[layers]
+retry = false
+tail_cut = true
