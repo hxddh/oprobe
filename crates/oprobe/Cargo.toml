@@ -38,8 +38,16 @@ app = [
   "dep:ratatui-crossterm",
   "dep:crossterm",
 ]
-# Native windows for the app (AppKit / Win32 / GTK 4; Linux builds need libgtk-4-dev).
-gui = ["app", "dep:nsh-platform-linux", "dep:nsh-platform-macos", "dep:nsh-platform-windows"]
+# Native windows for the app (AppKit / Win32 / GTK 4; Linux builds need libgtk-4-dev). Only a
+# window draws the icons' SVG (a terminal shows glyphs), so the SVG renderer (resvg and its
+# font stack) is built with this feature alone.
+gui = [
+  "app",
+  "nsh-core/svg",
+  "dep:nsh-platform-linux",
+  "dep:nsh-platform-macos",
+  "dep:nsh-platform-windows",
+]
 # OpenDAL services: the common clouds by default; `all-services` adds the rest.
 default-services = ["oprobe-core/default-services"]
 all-services = ["oprobe-core/all-services"]
@@ -47,27 +55,16 @@ otel = ["oprobe-core/otel"]
 
 [dependencies]
 oprobe-core.workspace = true
-opendal = { workspace = true, features = ["executors-tokio", "services-memory"] }
-hyper.workspace = true
-hyper-util.workspace = true
-http.workspace = true
-http-body-util.workspace = true
-tower-service.workspace = true
-url.workspace = true
-bytes.workspace = true
 futures.workspace = true
 tokio.workspace = true
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
-reqwest.workspace = true
 schemars.workspace = true
-dirs.workspace = true
-tokio-util.workspace = true
 
 # The app (Native Shell): the terminal workbench (`app`, default) and native windows (`gui`).
-nsh-core = { version = "0.7", features = ["svg"], optional = true }
+nsh-core = { version = "0.7", optional = true }
 nsh-base = { version = "0.7", default-features = false, optional = true }
 nsh-platform-tui = { version = "0.7", default-features = false, features = ["run-app"], optional = true }
 ratatui-core = { version = "0.1", optional = true }
@@ -87,7 +84,10 @@ nsh-platform-windows = { version = "0.7", default-features = false, optional = t
 windows-sys.workspace = true
 
 [dev-dependencies]
-nsh-engine = { version = "0.7", default-features = false }
+opendal = { workspace = true, features = ["executors-tokio", "services-memory"] }
+http.workspace = true
+reqwest.workspace = true
+nsh-engine ={ version = "0.7", default-features = false }
 nsh-testing = { version = "0.7", default-features = false }
 opendal-http-transport-reqwest = "0.59"
 tempfile.workspace = true
