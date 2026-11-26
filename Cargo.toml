@@ -46,7 +46,7 @@ serde_json = { version = "1.0", features = ["float_roundtrip"] }
 schemars = "1"
 anyhow = "1.0"
 libc = "0.2"
-toml = "0.8"
+toml = "1.2"
 toml_edit = "0.22"
 crc32c = "0.6"
 zstd = "0.14"

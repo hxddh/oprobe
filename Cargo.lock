@@ -4473,7 +4473,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
- "toml 0.8.23",
+ "toml 1.2.2+spec-1.1.0",
  "windows-sys 0.61.2",
  "zstd 0.14.4",
 ]
@@ -4513,7 +4513,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-rustls",
- "toml 0.8.23",
+ "toml 1.2.2+spec-1.1.0",
  "toml_edit 0.22.27",
  "url",
  "windows-sys 0.61.2",
