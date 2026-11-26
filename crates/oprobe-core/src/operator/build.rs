@@ -341,18 +341,45 @@ pub fn cache_max_entry_bytes(memory_bytes: usize) -> usize {
     memory_bytes / CACHE_SHARDS
 }
 
+/// The largest budget `prove` proposes for `layers.cache`: `FoyerLayer` caches whole objects in
+/// memory, and above this an object is not something to fetch and hold whole.
+pub const CACHE_MAX_SIZED_BYTES: u64 = 1 << 30;
+
 impl Cache {
+    /// Whether a whole-object cache fits reads that touched objects holding `objects_bytes`
+    /// in all and transferred `read_bytes` of them. `FoyerLayer` fetches an object whole at
+    /// its first read, a ranged one too: when the objects hold more than the run read at
+    /// all, the cache would transfer more than it could ever save. `Err` says why.
+    pub fn fit(objects_bytes: u64, read_bytes: u64) -> Result<(), String> {
+        if objects_bytes > read_bytes {
+            return Err(format!(
+                "the reads are ranges of objects that hold {} in all, and the run read {} of them: FoyerLayer fetches an object whole at its first read",
+                ByteSize(objects_bytes),
+                ByteSize(read_bytes)
+            ));
+        }
+        Ok(())
+    }
+
     /// The budget `prove` gives a cache for a run that read `read_set_bytes` of distinct
     /// objects, the largest of `largest_object_bytes`: the read set with a quarter of headroom,
-    /// between 16 MiB and 1 GiB, and never less than the admission rule
-    /// ([`cache_max_entry_bytes`]) needs to keep the largest object, so a sized cache cannot be
-    /// one that admits nothing it was sized for.
-    pub fn sized_for(read_set_bytes: u64, largest_object_bytes: u64) -> Self {
-        let budget = ((read_set_bytes as f64 * 1.25) as u64).clamp(16 << 20, 1 << 30);
-        let admits_largest = largest_object_bytes.saturating_mul(CACHE_SHARDS as u64);
-        Self {
-            memory: ByteSize(budget.max(admits_largest)),
+    /// between 16 MiB and [`CACHE_MAX_SIZED_BYTES`], which the admission rule
+    /// ([`cache_max_entry_bytes`]) makes enough to keep the largest object, so a sized cache
+    /// cannot be one that admits nothing it was sized for. `Err` (with the reason) when the
+    /// largest object is above the ceiling: 9.2 proposed `memory = 5GiB` for reads of a 5 GiB
+    /// object, to be fetched whole on the first of them.
+    pub fn sized_for(read_set_bytes: u64, largest_object_bytes: u64) -> Result<Self, String> {
+        if largest_object_bytes.saturating_mul(CACHE_SHARDS as u64) > CACHE_MAX_SIZED_BYTES {
+            return Err(format!(
+                "the largest object read is {}: FoyerLayer caches whole objects in memory, and oprobe sizes no cache above {}",
+                ByteSize(largest_object_bytes),
+                ByteSize(CACHE_MAX_SIZED_BYTES)
+            ));
         }
+        let budget = ((read_set_bytes as f64 * 1.25) as u64).clamp(16 << 20, CACHE_MAX_SIZED_BYTES);
+        Ok(Self {
+            memory: ByteSize(budget),
+        })
     }
 }
 
@@ -480,16 +507,36 @@ mod tests {
             (900 * MIB, 300 * MIB, 1024 * MIB),
             // A read set above the cap: the cap, which still admits each object.
             (4096 * MIB, 512 * MIB, 1024 * MIB),
-            // One object above the cap: the budget is that object.
-            (3000 * MIB, 3000 * MIB, 3000 * MIB),
         ] {
-            let sized = Cache::sized_for(read_set, largest).memory.0;
+            let sized = Cache::sized_for(read_set, largest).unwrap().memory.0;
             assert_eq!(sized, budget, "{read_set} bytes read, largest {largest}");
             assert!(
                 cache_max_entry_bytes(sized as usize) as u64 >= largest,
                 "a cache of {sized} bytes does not admit its largest object ({largest})"
             );
         }
+    }
+
+    /// K3-7: 9.2 sized `memory = 5GiB` for reads of a 5 GiB object (asserted here until 9.3:
+    /// "one object above the cap: the budget is that object"), and a cache for ranged reads
+    /// that would fetch every object whole. Neither is a cache to propose.
+    #[test]
+    fn a_cache_that_would_fetch_huge_objects_whole_is_not_sized() {
+        const MIB: u64 = 1 << 20;
+        let why = Cache::sized_for(5120 * MIB, 5120 * MIB).unwrap_err();
+        assert!(why.contains("5GiB") && why.contains("1GiB"), "{why}");
+        // Exactly the ceiling still fits.
+        assert_eq!(
+            Cache::sized_for(1024 * MIB, 1024 * MIB).unwrap().memory.0,
+            1024 * MIB
+        );
+        // 1 MiB ranges of four 256 MiB objects, 40 MiB read in all.
+        let why = Cache::fit(1024 * MIB, 40 * MIB).unwrap_err();
+        assert!(why.contains("1GiB") && why.contains("40MiB"), "{why}");
+        assert!(why.contains("whole"), "{why}");
+        // Whole objects read again and again: the cache fits.
+        Cache::fit(64 * MIB, 640 * MIB).unwrap();
+        Cache::fit(64 * MIB, 64 * MIB).unwrap();
     }
 
     /// `ThrottleLayer` is outside `ConcurrentLimitLayer` and the timers: a write that waits

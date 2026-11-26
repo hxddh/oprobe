@@ -814,6 +814,11 @@ pub fn diff(base: &OperatorSpec, edited: &OperatorSpec) -> (String, String) {
     (d.rust, d.toml)
 }
 
+/// The whole operator as Rust that compiles as written (secrets left to the credential chain).
+pub fn rust(spec: &OperatorSpec) -> String {
+    crate::operator::diff::to_rust(&spec.redacted())
+}
+
 // ---------------------------------------------------------------------------------------
 // Compare
 // ---------------------------------------------------------------------------------------

@@ -142,7 +142,10 @@ large a limit should be or how much it would help; claiming so would be a guess.
 
 1. **Choose the change**: the finding's remedy (the top finding by default), or `--with PATH=VALUE`.
 2. **Size it**: when the remedy has a size (a limit, a chunk), short trials over that one value
-   find the knee of the objective, within `--max-throttle`.
+   find the knee of the objective, within `--max-throttle`. For a `rate_limit` finding the
+   value must also stay under the rate the finding fitted: a cap whose own trial sends more
+   requests per second than that is not chosen, even when its two seconds saw no throttle (a
+   token bucket's burst hides the limit from a short trial).
 3. **A/B test**: trials of A and B run in pairs. The order is balanced: the pairs come in blocks
    of two, one `AB` and one `BA`, and which comes first in a block is drawn from the run's seed.
    A sequential test on the objective, against a noise floor learned from each side's
@@ -163,9 +166,29 @@ large a limit should be or how much it would help; claiming so would be a guess.
      are calibrated by simulation for the planned number of pairs, `--pairs`). Whenever the
      proof stops — a decision, the pair limit, the budget — the chance that it calls a change
      that is none stays under 5 %. An order effect widens the interval; it never moves it.
+   - The proof also stops early when more pairs would not help (**futility**): the pairs so
+     far rule out the smallest change the planned pairs could show at the noise measured. A
+     note names that smallest change. A proof is never given up for a change it could have
+     shown.
+   - **After an early stop, read the interval, not the estimate.** A proof that stops early
+     on a decision stopped because its estimate was large, so the estimate overstates the
+     change on average. The interval does not: its coverage holds whenever the proof stops.
    - Shares (throttled requests, errors) are compared with Newcombe's interval. Secondary
-     metrics are shown and never decide (their intervals are plain, not sequential).
+     metrics are shown and never decide; each has a plain interval (not sequential) on its
+     own trial-to-trial spread, not the objective's.
    - Deciding takes at least 3 pairs of trials; with fewer, the verdict is `inconclusive`.
+   - **Two gates come before the objective.** A changed operator that throttles more than
+     `--max-throttle` allows, or fails more operations than the run allows (1 %), and more
+     than the current operator beyond chance, is `inconclusive` with a note: operations that
+     fail fast lower a p99, and that is no improvement. A pair in which a trial has no
+     objective at all (no successful operation, nothing measured) is not judged, and ends
+     the proof.
+   - **A p99 needs enough operations.** The p99 of a trial is one order statistic: its
+     resolution is the spread of the latencies at the ranks 0.99·n ± 2·√(0.0099·n) of the
+     trial's n operations, and the noise floor is never below it. When those latencies
+     differ by more than 2× the p99 sits on a cliff (the edge of the throttled or retried
+     operations, say), which side a trial lands on is chance, and a note says "p99 sits on a
+     cliff: lengthen the trial" (`--trial`).
 5. **Save**: every trial is saved as a run, a child of the prove, hidden from `show --list`.
 
 The result is a **proven layer diff**: the objective's change with its interval, the evidence,

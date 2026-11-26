@@ -293,7 +293,17 @@ fn changes(s: Store, m: Rc<ProfileModel>, edited: Edited) -> View {
         let base = m.operator.clone();
         untracked(|| {
             if edits.is_empty() {
-                return small(tr("operator.no_changes")).into_element();
+                // Nothing pending: "Copy Rust" copies the whole operator, ready to paste.
+                let rust = data::rust(&base);
+                return view()
+                    .gap_2()
+                    .child(small(tr("operator.no_changes")))
+                    .child(view().flex_row().child(btn(
+                        tr("operator.copy_rust"),
+                        || Kind::Plain,
+                        move || s.copy(rust.clone()),
+                    )))
+                    .into_element();
             }
             let (rust, toml) = data::diff(&base, &spec);
             view()
