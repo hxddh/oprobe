@@ -479,15 +479,19 @@ fn prove_state(s: Store, st: crate::ui::jobs::State, p99: bool, has_file: bool) 
         v = v.child(small(fill("operator.trials", &[&st.trials.len()])));
     }
     // The pairs as the prove recorded them once it ends, else as they stream in.
-    let ab: Vec<(f64, f64, u64)> = match &st.outcome {
-        Some(Outcome::Proved(p)) if !p.ab.is_empty() => p.ab.clone(),
-        _ => crate::ui::jobs::ab_live(&st.trials),
+    // The interval is the one of the prove's plan (its sequential boundary).
+    let (ab, max_pairs) = match &st.outcome {
+        Some(Outcome::Proved(p)) if !p.ab.is_empty() => (p.ab.clone(), p.max_pairs),
+        _ => (crate::ui::jobs::ab_live(&st.trials), st.prove_pairs),
     };
     let ps: Vec<(f64, f64, f64)> = ab
         .iter()
-        .map(|&(a, b, _)| (a, b, if a > 0.0 { b / a - 1.0 } else { 0.0 }))
+        .map(|p| {
+            let (a, b) = (p.baseline, p.candidate);
+            (a, b, if a > 0.0 { b / a - 1.0 } else { 0.0 })
+        })
         .collect();
-    if let Some(plot) = plots::prove(&ab, p99) {
+    if let Some(plot) = plots::prove(&ab, p99, max_pairs) {
         v = v.child(view().test_id("prove-chart").child(chart(
             tr("plot.convergence"),
             150.0,
