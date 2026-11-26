@@ -181,39 +181,56 @@ impl RunSpec {
 
     /// The arguments of [`Self::command`] after `oprobe`.
     pub fn args(&self) -> Vec<String> {
+        let (w, sets) = self.replay();
+        let mut a: Vec<String> = vec!["run".into(), self.operator_ref.clone()];
+        let flags = [
+            ("--preset", w.preset),
+            ("-c", w.concurrency.map(|c| c.to_string())),
+            ("-d", w.duration),
+            ("--rate", w.rate.map(|r| r.to_string())),
+            ("--existing", w.existing),
+            ("--objects", w.objects.map(|n| n.to_string())),
+            ("--object-size", w.object_size),
+            ("--seed", w.seed.map(|s| s.to_string())),
+        ];
+        for (flag, value) in flags {
+            if let Some(v) = value {
+                a.extend([flag.to_owned(), v]);
+            }
+        }
+        for set in sets {
+            a.extend(["--set".to_owned(), set]);
+        }
+        a
+    }
+
+    /// What runs this spec again: the workload flags (preset, concurrency and duration
+    /// always; the rate, the existing prefix, the dataset and the seed where they differ from
+    /// the preset's defaults) and the `PATH=VALUE` pairs of every workload setting without a
+    /// flag and every operator value that differs from the default operator of its URL.
+    /// Redacted secrets are left out. [`Self::args`] is these as a command line, and
+    /// [`crate::app::RunRequest::replaying`] as a request.
+    pub fn replay(&self) -> (crate::app::WorkloadInput, Vec<String>) {
         let p = self.resolved_profile();
         let def = crate::config::defaults();
-        let mut a: Vec<String> = vec!["run".into(), self.operator_ref.clone()];
-        let mut flag = |f: &str, v: Option<String>| {
-            a.push(f.to_owned());
-            if let Some(v) = v {
-                a.push(v);
-            }
-        };
         let w = &p.workload;
         let dw = &def.workload;
-        flag("--preset", Some(w.preset.slug().to_owned()));
-        flag("-c", Some(w.concurrency.to_string()));
-        flag("-d", Some(w.duration.to_string()));
-        if let Some(r) = w.rate {
-            flag("--rate", Some(r.to_string()));
-        }
         let (pre_ds, pre_mix) = w.preset.defaults();
         let ds = w.effective_dataset();
-        if let Some(e) = &ds.existing_prefix {
-            flag("--existing", Some(e.clone()));
-        }
-        if ds.objects != pre_ds.objects {
-            flag("--objects", Some(ds.objects.to_string()));
-        }
-        if let Some(d) = &ds.size_dist {
-            flag("--object-size", Some(d.to_string()));
-        } else if ds.object_size != pre_ds.object_size {
-            flag("--object-size", Some(ds.object_size.to_string()));
-        }
-        if w.seed != dw.seed {
-            flag("--seed", Some(w.seed.to_string()));
-        }
+        let flags = crate::app::WorkloadInput {
+            preset: Some(w.preset.slug().to_owned()),
+            concurrency: Some(w.concurrency),
+            duration: Some(w.duration.to_string()),
+            rate: w.rate,
+            existing: ds.existing_prefix.clone(),
+            objects: (ds.objects != pre_ds.objects).then_some(ds.objects),
+            object_size: match &ds.size_dist {
+                Some(d) => Some(d.to_string()),
+                None => (ds.object_size != pre_ds.object_size).then(|| ds.object_size.to_string()),
+            },
+            seed: (w.seed != dw.seed).then_some(w.seed),
+            ..Default::default()
+        };
         let mut sets: Vec<(String, String)> = Vec::new();
         if w.warmup != dw.warmup {
             sets.push(("warmup".into(), w.warmup.to_string()));
@@ -252,6 +269,14 @@ impl RunSpec {
         // The operator: what differs from the default operator of its URL.
         let base = OperatorSpec::from_url(p.operator.url.clone());
         for c in crate::operator::diff::diff(&base, &p.operator).changes {
+            // A layer the default operator lacks is one change (`on`), which says the layer
+            // with its defaults: a layer with other values is named value by value.
+            if c.kind == crate::operator::diff::ChangeKind::Added
+                && let Some(values) = added_layer_values(&base, &p.operator, &c.path)
+            {
+                sets.extend(values);
+                continue;
+            }
             let v = match &c.to {
                 Some(v) => v.trim_matches('"').to_owned(),
                 None if c.path.starts_with("layers.") => "off".into(),
@@ -264,10 +289,8 @@ impl RunSpec {
         }
         // The 5.x SLA keys and the run label are no longer flags (6.3): a command never
         // names them, whatever an older run stored.
-        for (k, v) in sets {
-            flag("--set", Some(format!("{k}={v}")));
-        }
-        a
+        let sets = sets.into_iter().map(|(k, v)| format!("{k}={v}")).collect();
+        (flags, sets)
     }
 
     /// This spec with `o` applied. Overrides are validated when they are built
@@ -308,6 +331,36 @@ impl RunSpec {
         }
         command_line(&args)
     }
+}
+
+/// The values of the layer at `path` (`layers.tail_cut`) of `to` as `PATH=VALUE` pairs, when
+/// switching the layer on in `base` does not give them (`None`: `on` says it all, or `path`
+/// is not a layer).
+fn added_layer_values(
+    base: &OperatorSpec,
+    to: &OperatorSpec,
+    path: &str,
+) -> Option<Vec<(String, String)>> {
+    let name = path.strip_prefix("layers.").filter(|n| !n.contains('.'))?;
+    let layer = |o: &OperatorSpec| {
+        toml::Value::try_from(&o.layers)
+            .ok()
+            .and_then(|l| l.get(name).cloned())
+    };
+    let wanted = layer(to)?;
+    let mut on = base.clone();
+    if on.set(path, "on").is_ok() && layer(&on).as_ref() == Some(&wanted) {
+        return None;
+    }
+    let values: Vec<(String, String)> = wanted
+        .as_table()?
+        .iter()
+        .map(|(k, v)| {
+            let v = v.to_string();
+            (format!("{path}.{k}"), v.trim_matches('"').to_owned())
+        })
+        .collect();
+    (!values.is_empty()).then_some(values)
 }
 
 /// What [`RunSpec::workload_hash`] covers.
@@ -905,6 +958,35 @@ mod tests {
             assert_eq!(s.profile.operator.url, clean);
             assert!(!serde_json::to_string(&s).unwrap().contains("hunter2"));
         }
+    }
+
+    /// A layer added with values of its own is named value by value: `layers.NAME=on` alone
+    /// is the layer's defaults (9.1 printed `--set layers.concurrent_limit=on`, a command
+    /// that fails, and `layers.tail_cut=on` for a tail cut at another percentile).
+    #[test]
+    fn a_command_names_the_values_of_an_added_layer() {
+        let mut p = Profile::from_url("s3://bkt/x");
+        p.operator
+            .set("layers.concurrent_limit.http", "12")
+            .unwrap();
+        p.operator.set("layers.tail_cut.percentile", "90").unwrap();
+        p.operator.set("layers.cache", "on").unwrap();
+        let s = RunSpec::new(&p, "s3://bkt/x");
+        let c = s.command();
+        assert!(c.contains("--set layers.concurrent_limit.http=12"), "{c}");
+        assert!(c.contains("--set layers.tail_cut.percentile=90"), "{c}");
+        assert!(!c.contains("layers.concurrent_limit=on"), "{c}");
+        assert!(!c.contains("layers.tail_cut=on"), "{c}");
+        // The command is the run: its `--set` pairs give the same operator back.
+        let (_, sets) = s.replay();
+        let mut again = OperatorSpec::from_url("s3://bkt/x");
+        let edits: Vec<(String, String)> = sets
+            .iter()
+            .map(|e| e.split_once('=').unwrap())
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .collect();
+        again.apply_edits(&edits).unwrap();
+        assert_eq!(again, s.profile.operator, "{c}");
     }
 
     #[test]

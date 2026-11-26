@@ -41,8 +41,89 @@ const KIND_HEADER: u8 = 1;
 const KIND_SEGMENT: u8 = 2;
 const KIND_INTERVAL: u8 = 3;
 const KIND_REPORT: u8 = 4;
-/// Refuse frames larger than this (a corrupt length).
-const MAX_FRAME: u32 = 1 << 30;
+
+/// The largest segment block a run file may hold, as JSON. Writers cut a segment at
+/// [`SEGMENT_ROWS`] rows of each kind; a row is about 220 bytes in a lab run (a segment: 2 to
+/// 7 MiB), so this leaves 8 KiB a row for long keys, error texts and await trees.
+pub const MAX_SEGMENT_BYTES: u32 = 256 << 20;
+/// The largest header, interval or report block (a lab run's report is some 25 KiB; a long
+/// run's, with its 2 000 intervals, a few MiB).
+pub const MAX_BLOCK_BYTES: u32 = 64 << 20;
+/// The most a run file may decompress to, blocks of unknown kinds included (they are skipped,
+/// never buffered). A run at the default row cap (`max_requests`, 1 000 000 rows) decompresses
+/// to about 220 MiB: this reads runs kept at nineteen times that cap.
+pub const MAX_DECODED_BYTES: u64 = 4 << 30;
+/// The most memory the rows decoded from one run file may take: the row structs and the
+/// strings they own. A segment's interned strings are copied into every row naming them, so
+/// the bytes of the file do not bound it. A lab run's rows take about 440 bytes each: this
+/// holds nine times the default row cap.
+pub const MAX_ROW_BYTES: u64 = 4 << 30;
+
+/// What a reader accepts from one run file: files are untrusted input (they are attached to
+/// issues and opened from anywhere), so no length a file declares is believed before the
+/// bytes are there, and what it decodes to is capped.
+#[derive(Clone, Copy, Debug)]
+struct Limits {
+    segment_bytes: u32,
+    block_bytes: u32,
+    decoded_bytes: u64,
+    row_bytes: u64,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            segment_bytes: MAX_SEGMENT_BYTES,
+            block_bytes: MAX_BLOCK_BYTES,
+            decoded_bytes: MAX_DECODED_BYTES,
+            row_bytes: MAX_ROW_BYTES,
+        }
+    }
+}
+
+impl Limits {
+    /// The largest block of `kind` (a kind this version does not know may be as large as a
+    /// segment: it is skipped, not buffered).
+    fn block(&self, kind: u8) -> u32 {
+        match kind {
+            KIND_HEADER | KIND_INTERVAL | KIND_REPORT => self.block_bytes,
+            _ => self.segment_bytes,
+        }
+    }
+}
+
+/// The message of a run file refused for its size ([`super::runs::decode_run`] gives it its
+/// own hint: the file is not damaged).
+pub(super) const TOO_LARGE: &str = "run file too large to read";
+
+/// The memory the rows of one run file may still take ([`MAX_ROW_BYTES`] at first).
+#[derive(Debug)]
+pub struct RowBudget {
+    left: u64,
+}
+
+impl Default for RowBudget {
+    fn default() -> Self {
+        Self::new(MAX_ROW_BYTES)
+    }
+}
+
+impl RowBudget {
+    fn new(bytes: u64) -> Self {
+        Self { left: bytes }
+    }
+
+    /// Take `bytes` of it, before they are allocated.
+    fn take(&mut self, bytes: usize) -> Result<()> {
+        match self.left.checked_sub(bytes as u64) {
+            Some(left) => {
+                self.left = left;
+                Ok(())
+            }
+            None => bail!("{TOO_LARGE}: its rows take more memory than this oprobe reads"),
+        }
+    }
+}
 
 /// The first block: what the run is.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -364,17 +445,17 @@ impl Segment {
         b.finish()
     }
 
-    /// Operation and request rows of this segment.
-    pub fn decode(&self) -> Result<(Vec<OpRow>, Vec<ReqRow>)> {
+    /// Operation and request rows of this segment, within `budget`: every row is paid for
+    /// before it is built, with the strings it copies out of the segment's table.
+    pub fn decode(&self, budget: &mut RowBudget) -> Result<(Vec<OpRow>, Vec<ReqRow>)> {
         let st = |i: u32| -> Result<&str> {
             self.strings
                 .get(i as usize)
                 .map(String::as_str)
                 .with_context(|| format!("run file segment: no string #{i}"))
         };
-        let sto = |i: Option<u32>| -> Result<Option<String>> {
-            i.map(|i| st(i).map(str::to_owned)).transpose()
-        };
+        let sto = |i: Option<u32>| -> Result<Option<&str>> { i.map(st).transpose() };
+        let len = |s: Option<&str>| s.map_or(0, str::len);
         let t = |v: u32| self.base_us + i64::from(v);
         let o = &self.ops;
         let n = o.op_id.len();
@@ -398,19 +479,24 @@ impl Segment {
         if !cols_ok {
             bail!("run file segment: operation columns differ in length");
         }
+        budget.take(n.saturating_mul(std::mem::size_of::<OpRow>()))?;
         let mut ops = Vec::with_capacity(n);
         for i in 0..n {
             let b = o.breakdown[i].map(u64::from);
+            let (verb, verb_len) = static_name(st(o.verb[i])?);
+            let key = st(o.key[i])?;
+            let (error, await_tree) = (sto(o.error[i])?, sto(o.await_tree[i])?);
+            budget.take(verb_len + key.len() + len(error) + len(await_tree))?;
             ops.push(OpRow {
                 op_id: o.op_id[i],
-                verb: intern_static(st(o.verb[i])?),
-                key: st(o.key[i])?.to_owned(),
+                verb,
+                key: key.to_owned(),
                 t_us: t(o.t_us[i]),
                 latency_us: u64::from(o.latency_us[i]),
                 bytes: o.bytes[i],
                 ok: o.ok[i],
                 error_code: o.error_code[i],
-                error: sto(o.error[i])?,
+                error: error.map(str::to_owned),
                 throttled: o.throttled[i],
                 attempts: o.attempts[i],
                 breakdown: OpBreakdownUs {
@@ -421,7 +507,7 @@ impl Segment {
                     client_us: b[4],
                 },
                 requests: o.requests[i],
-                await_tree: sto(o.await_tree[i])?,
+                await_tree: await_tree.map(str::to_owned),
                 weight: 1.0,
             });
         }
@@ -455,16 +541,30 @@ impl Segment {
         if !cols_ok {
             bail!("run file segment: request columns differ in length");
         }
+        // The sparse columns (TLS, TCP, detail) box one value per entry.
+        budget.take(
+            m.saturating_mul(std::mem::size_of::<ReqRow>())
+                .saturating_add(r.tls.len().saturating_mul(std::mem::size_of::<TlsRow>()))
+                .saturating_add(r.tcp.len().saturating_mul(std::mem::size_of::<TcpRow>()))
+                .saturating_add(
+                    r.detail
+                        .len()
+                        .saturating_mul(std::mem::size_of::<ReqDetail>()),
+                ),
+        )?;
         let mut reqs = Vec::with_capacity(m);
         for i in 0..m {
             let s = r.stages[i].map(u64::from);
+            let (method, method_len) = static_name(st(r.method[i])?);
+            let (request_id, error) = (sto(r.request_id[i])?, sto(r.error[i])?);
+            budget.take(method_len + len(request_id) + len(error))?;
             reqs.push(ReqRow {
                 t_us: t(r.t_us[i]),
                 op_id: r.op_id[i],
                 attempt: r.attempt[i],
                 api: r.api[i],
                 service_op: None,
-                method: intern_static(st(r.method[i])?),
+                method,
                 status: r.status[i],
                 protocol: r.protocol[i],
                 reused: r.reused[i],
@@ -489,17 +589,18 @@ impl Segment {
                 total_us: s[9],
                 bytes_up: r.bytes_up[i],
                 bytes_down: r.bytes_down[i],
-                request_id: sto(r.request_id[i])?,
+                request_id: request_id.map(str::to_owned),
                 retry_after_ms: r.retry_after_ms[i],
                 error_code: r.error_code[i],
-                error: sto(r.error[i])?,
+                error: error.map(str::to_owned),
                 tls: None,
                 tcp: None,
                 detail: None,
             });
         }
         for &(i, sid) in &r.service_op {
-            let name = intern_static(st(sid)?);
+            let (name, name_len) = static_name(st(sid)?);
+            budget.take(name_len)?;
             if let Some(q) = reqs.get_mut(i as usize) {
                 q.service_op = Some(name);
             }
@@ -531,22 +632,43 @@ impl Segment {
     }
 }
 
-/// API, method and verb names are a small static vocabulary: no allocation per row for them.
-fn intern_static(s: &str) -> Cow<'static, str> {
-    use std::sync::{Mutex, OnceLock};
-    static NAMES: OnceLock<Mutex<HashMap<String, &'static str>>> = OnceLock::new();
-    let names = NAMES.get_or_init(Default::default);
-    let mut m = names.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(v) = m.get(s) {
-        return Cow::Borrowed(v);
+/// The names oprobe itself records as static strings (HTTP methods, the workloads' verbs),
+/// sorted: a row naming one of them borrows it instead of owning a copy.
+const STATIC_NAMES: [&str; 21] = [
+    "DELETE",
+    "GET",
+    "HEAD",
+    "OPTIONS",
+    "PATCH",
+    "POST",
+    "PUT",
+    "copy",
+    "delete.batch",
+    "list",
+    "list.paged",
+    "parquet.scan",
+    "parquet.scan.suffix",
+    "read.full",
+    "read.presigned",
+    "read.range",
+    "stat",
+    "write",
+    "write.conditional",
+    "write.metadata",
+    "write.multipart",
+];
+
+/// A method, verb or service operation name as a row holds it, and the heap bytes it takes:
+/// one of the names oprobe knows ([`STATIC_NAMES`], the API labels) is borrowed, any other
+/// name owned. Nothing a file says outlives the rows decoded from it.
+fn static_name(s: &str) -> (Cow<'static, str>, usize) {
+    if let Ok(i) = STATIC_NAMES.binary_search(&s) {
+        return (Cow::Borrowed(STATIC_NAMES[i]), 0);
     }
-    if m.len() >= 4096 {
-        // Not a vocabulary any more: stop leaking.
-        return Cow::Owned(s.to_owned());
+    match crate::trace::Api::ALL.iter().find(|a| a.label() == s) {
+        Some(a) => (Cow::Borrowed(a.label()), 0),
+        None => (Cow::Owned(s.to_owned()), s.len()),
     }
-    let v: &'static str = Box::leak(s.to_owned().into_boxed_str());
-    m.insert(s.to_owned(), v);
-    Cow::Borrowed(v)
 }
 
 /// A block of a run file.
@@ -596,7 +718,11 @@ impl RunFileWriter {
 
     fn frame<T: Serialize>(&mut self, kind: u8, v: &T) -> Result<()> {
         let payload = serde_json::to_vec(v)?;
-        let len = u32::try_from(payload.len()).context("run file block too large")?;
+        // Never write a block the reader refuses.
+        let len = u32::try_from(payload.len())
+            .ok()
+            .filter(|len| *len <= Limits::default().block(kind))
+            .context("run file block too large")?;
         let enc = self.enc.as_mut().context("run file already finished")?;
         enc.write_all(&[kind])?;
         enc.write_all(&len.to_le_bytes())?;
@@ -651,9 +777,16 @@ impl Drop for RunFileWriter {
     }
 }
 
-/// Reads a run file block by block.
+/// Reads a run file block by block. The file is untrusted: a block's declared length is
+/// checked against the limit of its kind and against what the file may still decode to before
+/// anything is read, and its buffer grows only with the bytes that are really there.
 pub struct RunFileReader<R: Read> {
     dec: zstd::stream::Decoder<'static, BufReader<R>>,
+    limits: Limits,
+    /// Bytes decoded so far (block heads and payloads, skipped blocks included).
+    decoded: u64,
+    /// The current block's payload (reused from block to block).
+    payload: Vec<u8>,
 }
 
 impl RunFileReader<std::fs::File> {
@@ -666,9 +799,29 @@ impl RunFileReader<std::fs::File> {
 
 impl<R: Read> RunFileReader<R> {
     pub fn new(r: R) -> Result<Self> {
+        Self::with_limits(r, Limits::default())
+    }
+
+    fn with_limits(r: R, limits: Limits) -> Result<Self> {
         Ok(Self {
             dec: zstd::stream::Decoder::new(r).context("not a zstd stream")?,
+            limits,
+            decoded: 0,
+            payload: Vec::new(),
         })
+    }
+
+    /// Count `bytes` more decoded bytes, unless the file would decode to more than it may.
+    fn account(&mut self, bytes: u64) -> Result<()> {
+        let total = self.decoded.saturating_add(bytes);
+        if total > self.limits.decoded_bytes {
+            bail!(
+                "{TOO_LARGE}: it decompresses to more than {}",
+                crate::util::fmt_bytes(self.limits.decoded_bytes)
+            );
+        }
+        self.decoded = total;
+        Ok(())
     }
 
     /// The next block (`None` at the end of the stream).
@@ -679,30 +832,55 @@ impl<R: Read> RunFileReader<R> {
         }
         let kind = head[0];
         let len = u32::from_le_bytes([head[1], head[2], head[3], head[4]]);
-        if len > MAX_FRAME {
+        let truncated = || {
+            anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::UnexpectedEof))
+                .context("corrupt run file: truncated block")
+        };
+        if len > self.limits.block(kind) {
             bail!("corrupt run file: a block of {len} bytes");
         }
-        let mut payload = vec![0u8; len as usize];
-        self.dec
-            .read_exact(&mut payload)
-            .context("corrupt run file: truncated block")?;
+        self.account(5 + u64::from(len))?;
+        if !matches!(
+            kind,
+            KIND_HEADER | KIND_SEGMENT | KIND_INTERVAL | KIND_REPORT
+        ) {
+            // A kind this version does not know: skipped without buffering it.
+            let skipped = std::io::copy(
+                &mut (&mut self.dec).take(u64::from(len)),
+                &mut std::io::sink(),
+            )
+            .context("corrupt run file")?;
+            if skipped < u64::from(len) {
+                return Err(truncated());
+            }
+            return Ok(Some(Block::Unknown(kind)));
+        }
+        // The length is only what the file says: the buffer grows as the bytes arrive.
+        self.payload.clear();
+        (&mut self.dec)
+            .take(u64::from(len))
+            .read_to_end(&mut self.payload)
+            .context("corrupt run file")?;
+        if self.payload.len() < len as usize {
+            return Err(truncated());
+        }
+        let payload = &self.payload[..];
         let bad = |what: &str, e: serde_json::Error| {
             anyhow::anyhow!("corrupt run file: bad {what} block: {e}")
         };
         Ok(Some(match kind {
             KIND_HEADER => Block::Header(Box::new(
-                serde_json::from_slice(&payload).map_err(|e| bad("header", e))?,
+                serde_json::from_slice(payload).map_err(|e| bad("header", e))?,
             )),
             KIND_SEGMENT => Block::Segment(Box::new(
-                serde_json::from_slice(&payload).map_err(|e| bad("segment", e))?,
+                serde_json::from_slice(payload).map_err(|e| bad("segment", e))?,
             )),
             KIND_INTERVAL => {
-                Block::Interval(serde_json::from_slice(&payload).map_err(|e| bad("interval", e))?)
+                Block::Interval(serde_json::from_slice(payload).map_err(|e| bad("interval", e))?)
             }
-            KIND_REPORT => Block::Report(Box::new(Report::from_json_value(
-                serde_json::from_slice(&payload).map_err(|e| bad("report", e))?,
+            _ => Block::Report(Box::new(Report::from_json_value(
+                serde_json::from_slice(payload).map_err(|e| bad("report", e))?,
             )?)),
-            other => Block::Unknown(other),
         }))
     }
 }
@@ -971,7 +1149,12 @@ impl crate::trace::RowSink for RunFileStream {
 
 /// Read a whole `oprobe.run/7` file into a [`Run`] (rows sorted by start time).
 pub fn read_run(r: impl Read) -> Result<Run> {
-    let mut rd = RunFileReader::new(r)?;
+    read_run_within(r, Limits::default())
+}
+
+fn read_run_within(r: impl Read, limits: Limits) -> Result<Run> {
+    let mut rd = RunFileReader::with_limits(r, limits)?;
+    let mut budget = RowBudget::new(limits.row_bytes);
     let mut header = None;
     let mut report = None;
     let mut ops = Vec::new();
@@ -998,6 +1181,12 @@ pub fn read_run(r: impl Read) -> Result<Run> {
             Err(e) => return Err(e),
         };
         match b {
+            // A run file starts with its header.
+            Block::Segment(_) | Block::Interval(_) | Block::Report(_) | Block::Unknown(_)
+                if header.is_none() =>
+            {
+                bail!("not an oprobe run file (no header)")
+            }
             Block::Header(h) => {
                 if h.format != RUN_FORMAT {
                     bail!(
@@ -1008,7 +1197,7 @@ pub fn read_run(r: impl Read) -> Result<Run> {
                 header = Some(h);
             }
             Block::Segment(s) => {
-                let (o, q) = s.decode()?;
+                let (o, q) = s.decode(&mut budget)?;
                 ops.extend(o);
                 reqs.extend(q);
             }
@@ -1061,7 +1250,7 @@ mod tests {
     fn segments_round_trip_every_field() {
         let run = crate::report::fixture::run();
         let s = Segment::encode(&run.ops, &run.reqs);
-        let (ops, reqs) = s.decode().unwrap();
+        let (ops, reqs) = s.decode(&mut RowBudget::default()).unwrap();
         assert_eq!(ops, run.ops);
         assert_eq!(reqs, run.reqs);
     }
@@ -1163,5 +1352,357 @@ mod tests {
             }
         }
         assert_eq!(intervals, report.timeline.len());
+    }
+
+    /// A run file's bytes: `blocks` as `(kind, declared length, body)`, zstd-compressed.
+    fn stream(blocks: &[(u8, u32, &[u8])]) -> Vec<u8> {
+        let mut raw = Vec::new();
+        for (kind, len, body) in blocks {
+            raw.push(*kind);
+            raw.extend_from_slice(&len.to_le_bytes());
+            raw.extend_from_slice(body);
+        }
+        zstd::encode_all(&raw[..], ZSTD_LEVEL).unwrap()
+    }
+
+    fn header_json() -> Vec<u8> {
+        let run = crate::report::fixture::run();
+        serde_json::to_vec(&RunHeader::new("x", run.report.spec)).unwrap()
+    }
+
+    /// The classified error of a refused file, as `show FILE` and the app report it.
+    fn refused(bytes: &[u8]) -> crate::errors::ErrorBody {
+        let e = crate::store::runs::decode_run(bytes).unwrap_err();
+        let b = crate::errors::classify(&e, "s3");
+        assert_eq!(
+            b.code,
+            crate::errors::ErrorCode::UsageInvalidArgument,
+            "{e:#}"
+        );
+        assert!(b.hint.is_some(), "{e:#}");
+        b
+    }
+
+    /// 9.1.0 allocated a block's declared length (up to 1 GiB, zeroed) before reading it: a
+    /// 60-byte file took a gigabyte. The buffer now grows with the bytes that arrive.
+    #[test]
+    fn a_declared_length_is_not_allocated_before_its_bytes_arrive() {
+        let header = header_json();
+        let h = (KIND_HEADER, header.len() as u32, &header[..]);
+        // The largest lengths the limits allow, with ten bytes behind them.
+        for (kind, declared) in [
+            (KIND_SEGMENT, MAX_SEGMENT_BYTES),
+            (KIND_REPORT, MAX_BLOCK_BYTES),
+            (KIND_INTERVAL, MAX_BLOCK_BYTES),
+            // An unknown kind is skipped: nothing of it is buffered at all.
+            (9, MAX_SEGMENT_BYTES),
+        ] {
+            let bytes = stream(&[h, (kind, declared, b"0123456789")]);
+            let mut rd = RunFileReader::new(&bytes[..]).unwrap();
+            assert!(matches!(rd.next_block(), Ok(Some(Block::Header(_)))));
+            let e = rd.next_block().unwrap_err();
+            assert!(format!("{e:#}").contains("truncated block"), "{e:#}");
+            assert!(
+                rd.payload.capacity() <= 64 << 10,
+                "kind {kind}: {} bytes buffered for a 10-byte block",
+                rd.payload.capacity()
+            );
+            let b = refused(&bytes);
+            assert!(b.hint.unwrap().contains("damaged or truncated"));
+        }
+        // A length over its kind's limit is refused before anything is read.
+        for (kind, declared) in [
+            (KIND_SEGMENT, MAX_SEGMENT_BYTES + 1),
+            (KIND_SEGMENT, u32::MAX),
+            (KIND_HEADER, MAX_BLOCK_BYTES + 1),
+            (KIND_REPORT, u32::MAX),
+            (9, MAX_SEGMENT_BYTES + 1),
+        ] {
+            let bytes = stream(&[h, (kind, declared, b"0123456789")]);
+            let mut rd = RunFileReader::new(&bytes[..]).unwrap();
+            rd.next_block().unwrap();
+            let e = rd.next_block().unwrap_err();
+            assert!(
+                format!("{e:#}").contains(&format!("a block of {declared} bytes")),
+                "{e:#}"
+            );
+            assert_eq!(
+                rd.payload.capacity(),
+                header.len().max(rd.payload.capacity())
+            );
+            assert!(rd.payload.capacity() <= 64 << 10);
+            refused(&bytes);
+        }
+        // The very first block: not a run file, whatever it declares.
+        let b = refused(&stream(&[(KIND_HEADER, u32::MAX, b"{}")]));
+        assert!(
+            b.message.contains("not an oprobe run file"),
+            "{}",
+            b.message
+        );
+    }
+
+    /// A zstd bomb: a few kilobytes that decompress to gigabytes of blocks. 9.1.0 decoded
+    /// them all (and buffered each); the reader stops at what a file may decode to.
+    #[test]
+    fn a_zstd_bomb_is_refused_at_the_decoded_limit() {
+        let header = header_json();
+        let zeros = vec![0u8; 1 << 20];
+        let limits = Limits {
+            decoded_bytes: 8 << 20,
+            ..Default::default()
+        };
+        // 1 GiB of skipped blocks, then as much again of blocks that are buffered.
+        for kind in [9, KIND_INTERVAL] {
+            let mut blocks = vec![(KIND_HEADER, header.len() as u32, &header[..])];
+            blocks.extend((0..1024).map(|_| (kind, zeros.len() as u32, &zeros[..])));
+            let bytes = stream(&blocks);
+            assert!(bytes.len() < 200 << 10, "{} bytes", bytes.len());
+            let mut rd = RunFileReader::with_limits(&bytes[..], limits).unwrap();
+            let e = loop {
+                match rd.next_block() {
+                    Ok(Some(Block::Header(_) | Block::Unknown(_))) => {}
+                    Ok(other) => panic!("{other:?}"),
+                    Err(e) if kind == KIND_INTERVAL && rd.decoded < 2 << 20 => {
+                        // A megabyte of zeros is not an interval: it was buffered within
+                        // its limit, then refused as it is.
+                        assert!(format!("{e:#}").contains("bad interval block"), "{e:#}");
+                        assert!(rd.payload.capacity() <= 4 << 20);
+                        break None;
+                    }
+                    Err(e) => break Some(e),
+                }
+            };
+            assert!(rd.decoded <= limits.decoded_bytes, "{}", rd.decoded);
+            if kind == 9 {
+                let e = e.unwrap();
+                assert!(format!("{e:#}").contains(TOO_LARGE), "{e:#}");
+                assert_eq!(
+                    rd.payload.capacity(),
+                    header.len().max(rd.payload.capacity())
+                );
+                assert!(rd.payload.capacity() <= 64 << 10);
+                let e = read_run_within(&bytes[..], limits).unwrap_err();
+                assert!(format!("{e:#}").contains(TOO_LARGE), "{e:#}");
+            }
+        }
+    }
+
+    /// The format counts nothing: a stream of empty blocks without end must end by itself.
+    #[test]
+    fn a_stream_of_empty_blocks_ends_at_the_decoded_limit() {
+        let header = header_json();
+        let mut blocks = vec![(KIND_HEADER, header.len() as u32, &header[..])];
+        blocks.extend((0..1_000_000).map(|_| (9u8, 0u32, &b""[..])));
+        let bytes = stream(&blocks);
+        let limits = Limits {
+            decoded_bytes: 1 << 20,
+            ..Default::default()
+        };
+        let mut rd = RunFileReader::with_limits(&bytes[..], limits).unwrap();
+        let mut n = 0u64;
+        let e = loop {
+            match rd.next_block() {
+                Ok(Some(_)) => n += 1,
+                Ok(None) => panic!("the stream was read to its end"),
+                Err(e) => break e,
+            }
+        };
+        assert!(format!("{e:#}").contains(TOO_LARGE), "{e:#}");
+        // Five bytes a block: the limit is what stops it.
+        assert!(n <= (1 << 20) / 5 + 1, "{n}");
+        assert!(rd.decoded <= limits.decoded_bytes);
+    }
+
+    /// A segment interns its strings: one long key named by every row is copied into each of
+    /// them, so a megabyte of file decodes to any amount of memory. The rows are paid for out
+    /// of a budget before they are built.
+    #[test]
+    fn rows_that_multiply_an_interned_string_are_refused_within_the_row_budget() {
+        let base = crate::report::fixture::run();
+        let n = 100_000;
+        let ops: Vec<OpRow> = (0..n)
+            .map(|i| OpRow {
+                op_id: i,
+                ..base.ops[0].clone()
+            })
+            .collect();
+        let mut seg = Segment::encode(&ops, &[]);
+        let key = seg.ops.key[0] as usize;
+        seg.strings[key] = "k".repeat(1 << 20);
+        // 100 000 rows of a 1 MiB key: 100 GiB of rows from a segment of a few MiB.
+        let mut budget = RowBudget::default();
+        let e = seg.decode(&mut budget).unwrap_err();
+        assert!(format!("{e:#}").contains(TOO_LARGE), "{e:#}");
+        assert!(budget.left < 1 << 20, "{}", budget.left);
+        // As a file: refused, classified, with what to do.
+        let header = header_json();
+        let body = serde_json::to_vec(&seg).unwrap();
+        let bytes = stream(&[
+            (KIND_HEADER, header.len() as u32, &header[..]),
+            (KIND_SEGMENT, body.len() as u32, &body[..]),
+        ]);
+        assert!(bytes.len() < 1 << 20, "{} bytes", bytes.len());
+        let b = refused(&bytes);
+        assert!(b.message.contains(TOO_LARGE), "{}", b.message);
+        assert!(b.hint.unwrap().contains("max_requests"));
+        // A budget that holds the rows as they really are decodes them.
+        seg.strings[key] = "k".into();
+        let mut budget = RowBudget::new(n * (std::mem::size_of::<OpRow>() as u64 + 1));
+        assert_eq!(seg.decode(&mut budget).unwrap().0.len() as u64, n);
+        assert_eq!(budget.left, 0);
+    }
+
+    /// 9.1.0 leaked every distinct verb, method and service operation name of a file for the
+    /// life of the process (`Box::leak`, the first 4 096 of them): the app opens many files.
+    /// Names oprobe knows are borrowed; any other name is owned by its row and goes with it.
+    #[test]
+    fn names_of_a_file_are_owned_by_its_rows_not_leaked() {
+        assert!(STATIC_NAMES.is_sorted(), "binary search needs them sorted");
+        let base = crate::report::fixture::run();
+        let n = 10_000usize;
+        let ops: Vec<OpRow> = (0..n)
+            .map(|i| OpRow {
+                op_id: i as u64,
+                verb: Cow::Owned(format!("verb-{i}")),
+                ..base.ops[0].clone()
+            })
+            .collect();
+        let reqs: Vec<ReqRow> = (0..n)
+            .map(|i| ReqRow {
+                op_id: i as u64,
+                method: Cow::Owned(format!("METHOD-{i}")),
+                service_op: Some(Cow::Owned(format!("Operation{i}"))),
+                ..base.reqs[0].clone()
+            })
+            .collect();
+        let seg = Segment::encode(&ops, &reqs);
+        let mut budget = RowBudget::default();
+        let (o, r) = seg.decode(&mut budget).unwrap();
+        assert_eq!((o.len(), r.len()), (n, n));
+        assert!(o.iter().all(|o| matches!(o.verb, Cow::Owned(_))));
+        assert!(r.iter().all(|r| matches!(r.method, Cow::Owned(_))));
+        assert!(
+            r.iter()
+                .all(|r| matches!(r.service_op, Some(Cow::Owned(_))))
+        );
+        assert_eq!((o, r), (ops, reqs));
+        // What oprobe itself records is borrowed: no allocation per row for it.
+        let run = crate::report::fixture::run();
+        let (o, r) = Segment::encode(&run.ops, &run.reqs)
+            .decode(&mut RowBudget::default())
+            .unwrap();
+        assert!(o.iter().all(|o| matches!(o.verb, Cow::Borrowed(_))));
+        assert!(r.iter().all(|r| matches!(r.method, Cow::Borrowed(_))));
+        for name in [
+            "read.full",
+            "write.multipart",
+            "GET",
+            "DELETE",
+            "ListObjects",
+        ] {
+            assert!(matches!(static_name(name).0, Cow::Borrowed(_)), "{name}");
+        }
+    }
+
+    /// A run file exactly at every limit reads back whole; one byte less of any of them
+    /// refuses it.
+    #[test]
+    fn a_run_file_at_the_limits_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("r.oprobe");
+        let run = rows();
+        write_run(&path, &run).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        // What this file takes of each limit.
+        let mut rd = RunFileReader::new(&bytes[..]).unwrap();
+        let mut budget = RowBudget::default();
+        let (mut segment, mut block, mut before) = (0u64, 0u64, 0u64);
+        while let Some(b) = rd.next_block().unwrap() {
+            let len = rd.decoded - before - 5;
+            before = rd.decoded;
+            match b {
+                Block::Segment(s) => {
+                    segment = segment.max(len);
+                    s.decode(&mut budget).unwrap();
+                }
+                _ => block = block.max(len),
+            }
+        }
+        let exact = Limits {
+            segment_bytes: segment as u32,
+            block_bytes: block as u32,
+            decoded_bytes: rd.decoded,
+            row_bytes: MAX_ROW_BYTES - budget.left,
+        };
+        assert!(exact.segment_bytes > 0 && exact.block_bytes > 0 && exact.row_bytes > 0);
+        assert_eq!(read_run_within(&bytes[..], exact).unwrap(), run);
+        for (what, limits) in [
+            (
+                "a block of",
+                Limits {
+                    segment_bytes: exact.segment_bytes - 1,
+                    ..exact
+                },
+            ),
+            (
+                "a block of",
+                Limits {
+                    block_bytes: exact.block_bytes - 1,
+                    ..exact
+                },
+            ),
+            (
+                TOO_LARGE,
+                Limits {
+                    decoded_bytes: exact.decoded_bytes - 1,
+                    ..exact
+                },
+            ),
+            (
+                TOO_LARGE,
+                Limits {
+                    row_bytes: exact.row_bytes - 1,
+                    ..exact
+                },
+            ),
+        ] {
+            let e = read_run_within(&bytes[..], limits).unwrap_err();
+            assert!(format!("{e:#}").contains(what), "{limits:?}: {e:#}");
+        }
+        // The writer never writes a block the reader refuses.
+        let header = RunHeader::new("x", run.report.spec.clone());
+        let mut w = RunFileWriter::create(&dir.path().join("big.oprobe"), &header).unwrap();
+        let mut big = Segment::encode(&run.ops[..1], &[]);
+        big.strings.push("x".repeat(MAX_SEGMENT_BYTES as usize));
+        let e = w.write_segment(&big).unwrap_err();
+        assert!(format!("{e:#}").contains("block too large"), "{e:#}");
+    }
+
+    /// The default limits against what rows take (the fixture's: about 100 bytes of JSON and
+    /// 270 of memory each; a lab run's are twice that): they leave room for runs kept at many
+    /// times the default cap of a million rows.
+    #[test]
+    fn the_limits_are_generous_for_real_runs() {
+        let run = rows();
+        let rows_count = (run.ops.len() + run.reqs.len()) as u64;
+        let seg = Segment::encode(&run.ops, &run.reqs);
+        let json = serde_json::to_vec(&seg).unwrap().len() as u64;
+        let mut budget = RowBudget::default();
+        seg.decode(&mut budget).unwrap();
+        let memory = MAX_ROW_BYTES - budget.left;
+        let default_cap = crate::trace::DEFAULT_MAX_REQUESTS as u64;
+        assert!(
+            MAX_DECODED_BYTES / (json / rows_count) >= 10 * default_cap,
+            "{} bytes of JSON a row",
+            json / rows_count
+        );
+        assert!(
+            MAX_ROW_BYTES / (memory / rows_count) >= 10 * default_cap,
+            "{} bytes of memory a row",
+            memory / rows_count
+        );
+        // A segment of SEGMENT_ROWS rows of each kind, 8 KiB a row.
+        assert!(u64::from(MAX_SEGMENT_BYTES) >= 2 * SEGMENT_ROWS as u64 * 8 * 1024);
     }
 }

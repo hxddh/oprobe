@@ -195,10 +195,18 @@ pub struct Store {
     run_job: Stored<Option<Job>>,
     prove_job: Stored<Option<Job>>,
     prove_run_id: Stored<Option<String>>,
-    /// Operator `--set` overrides carried over by `Run Again`, cleared when the form is edited.
-    form_set: Stored<Vec<String>>,
+    /// The run `Run Again` repeats, behind the New Run form while the dialog is open.
+    replay: Stored<Option<Replay>>,
     /// Monotonic generation counter so stale async `load_run` / `compare` completions never overwrite newer selections.
     load_seq: Stored<u64>,
+}
+
+/// A run to repeat (`Run Again`): the request that replays its spec
+/// ([`RunRequest::replaying`]) and its command line, to show what the form has no field for.
+#[derive(Clone)]
+struct Replay {
+    request: RunRequest,
+    command: String,
 }
 
 /// The store of the running app.
@@ -289,7 +297,7 @@ impl Store {
             run_job: stored(None),
             prove_job: stored(None),
             prove_run_id: stored(None),
-            form_set: stored(Vec::new()),
+            replay: stored(None),
             load_seq: stored(0),
         };
         s.refresh();
@@ -325,10 +333,14 @@ impl Store {
                 f.concurrency.get(),
                 f.existing.get(),
             );
-            untracked(|| {
-                s.plan.set(None);
-                s.form_set.replace(Vec::new());
-            });
+            untracked(|| s.plan.set(None));
+        });
+        // A run to repeat belongs to the New Run dialog it opened: closing the dialog (Cancel,
+        // or the run starting) lets it go.
+        effect(move || {
+            if s.dialog.get() != Some(Dialog::NewRun) {
+                s.replay.replace(None);
+            }
         });
         s
     }
@@ -474,22 +486,42 @@ impl Store {
         };
         let existing = nonempty(f.existing);
         let read_only = existing.is_some();
+        // The fields say what they show; a run being repeated keeps everything else of it.
+        let base = untracked(|| self.replayed())
+            .map(|r| r.request)
+            .unwrap_or_default();
         Ok(RunRequest {
             operators,
-            set: self.form_set.with(|v| v.clone()),
             workload: WorkloadInput {
                 preset: Some(f.preset.get_untracked().to_owned()),
                 duration: nonempty(f.duration),
                 concurrency,
                 existing,
-                ..Default::default()
+                ..base.workload
             },
             safety: crate::app::Safety {
                 read_only,
                 ..Default::default()
             },
-            ..Default::default()
+            ..base
         })
+    }
+
+    /// The run the form repeats: the one `Run Again` took, while the form still names its
+    /// operator and preset (another operator or preset is another run).
+    fn replayed(&self) -> Option<Replay> {
+        let f = self.form;
+        let operators = split_operators(&f.operator.get());
+        let preset = f.preset.get();
+        self.replay.with(|r| r.clone()).filter(|r| {
+            r.request.operators == operators && r.request.workload.preset.as_deref() == Some(preset)
+        })
+    }
+
+    /// The command of the run the form repeats (its rate, dataset, seed and operator values
+    /// have no field in the form: they are kept as this command names them).
+    pub fn replayed_command(&self) -> Option<String> {
+        self.replayed().map(|r| r.command)
     }
 
     /// Plan the form's run (`App::plan`): what it writes, reads and deletes, its budgets.
@@ -907,74 +939,53 @@ impl Store {
         });
     }
 
-    /// Run the selected run's operator and workload again: local `lab://` targets start at
-    /// once; real storage targets open New Run with their plan so writes are reviewed first.
+    /// Run the selected run again, as it ran: its operator and its whole workload
+    /// ([`RunRequest::replaying`] of its spec). Local `lab://` targets start at once; real
+    /// storage targets open New Run with their plan so writes are reviewed first. A production
+    /// trace has no workload to repeat: New Run opens on its operator.
     pub fn run_again(&self) {
         let Some(cur) = self.current.get_untracked() else {
             return;
         };
         let f = self.form;
         let report = &cur.rows.0.report;
-        let op_str = if report.is_trace() {
-            cur.operator_ref.clone()
-        } else if cur.operator_file.is_some() {
-            quote_operator_arg(&cur.operator_ref)
-        } else {
-            cur.operator_ref.clone()
-        };
-        // Carry over `--set` operator overrides when running a URL or configured operator again.
-        let mut overrides = Vec::new();
-        if !report.is_trace() && cur.operator_file.is_none() {
-            let base = self
-                .app()
-                .config()
-                .ok()
-                .and_then(|cfg| cfg.operators.get(&cur.operator_ref).cloned())
-                .unwrap_or_else(|| crate::operator::OperatorSpec::from_url(&cur.operator.url))
-                .redacted();
-            for (_, fields) in data::SECTIONS {
-                for fd in *fields {
-                    let a = data::value_of(&base, fd.path);
-                    let b = data::value_of(&cur.operator, fd.path);
-                    if a != b && !b.is_empty() {
-                        overrides.push(format!("{}={b}", fd.path));
-                    }
+        if report.is_trace() {
+            batch(|| {
+                f.operator.set(cur.operator_ref.clone());
+                if let Some(p) = PRESETS.iter().find(|p| **p == cur.preset) {
+                    f.preset.set(p);
                 }
-            }
-        }
-        batch(|| {
-            f.operator.set(op_str);
-            if let Some(p) = PRESETS.iter().find(|p| **p == cur.preset) {
-                f.preset.set(p);
-            }
-            f.existing.set(
-                report
-                    .spec
-                    .profile
-                    .workload
-                    .dataset
-                    .as_ref()
-                    .and_then(|d| d.existing_prefix.clone())
-                    .unwrap_or_default(),
-            );
-            if !report.is_trace() {
-                let secs = cur.window_s.round().max(1.0) as u64;
-                f.duration.set(format!("{secs}s"));
-                if cur.setup.rate_per_s.is_none() && cur.setup.concurrency_count > 0 {
-                    f.concurrency.set(cur.setup.concurrency_count.to_string());
-                } else {
-                    f.concurrency.set(String::new());
-                }
-            }
-        });
-        self.form_set.replace(overrides);
-        if !report.is_trace() && untracked(|| self.form_is_lab()) {
-            self.start_run();
-        } else {
+                f.existing.set(String::new());
+            });
             self.dialog.set(Some(Dialog::NewRun));
             if !untracked(|| self.form_is_lab()) {
                 self.plan_run();
             }
+            return;
+        }
+        let request = RunRequest::replaying(&report.spec);
+        let w = &request.workload;
+        batch(|| {
+            f.operator
+                .set(quote_operator_arg(&report.spec.operator_ref));
+            if let Some(p) = PRESETS.iter().find(|p| Some(**p) == w.preset.as_deref()) {
+                f.preset.set(p);
+            }
+            f.duration.set(w.duration.clone().unwrap_or_default());
+            f.concurrency
+                .set(w.concurrency.map(|c| c.to_string()).unwrap_or_default());
+            f.existing.set(w.existing.clone().unwrap_or_default());
+        });
+        self.replay.replace(Some(Replay {
+            command: report.spec.command(),
+            request,
+        }));
+        if untracked(|| self.form_is_lab()) {
+            self.start_run();
+            self.replay.replace(None);
+        } else {
+            self.dialog.set(Some(Dialog::NewRun));
+            self.plan_run();
         }
     }
 

@@ -2,9 +2,14 @@
 # proved change). nextest runs every test in its own process, so they would share the runner's
 # few cores and measure each other — on a 3-core macOS runner, the demo's client then reads as
 # saturated (`client_bound` first). They run one at a time; everything else stays parallel.
+#
+# The app's tests (`ui`) are lab tests too: each profiles a lab and waits for what the run found
+# to show (the throttling finding and its evidence, the stragglers' finding, the capacity, no
+# CPU chart because the client was not saturated). Under `cargo test` a mutex in the binary runs
+# them one at a time; that mutex is per process, so nextest ran all of them at once.
 [test-groups]
 lab-measurements = { max-threads = 1 }
 
 [[profile.default.overrides]]
-filter = 'binary(convergence) | binary(capacity)'
+filter = 'binary(convergence) | binary(capacity) | binary(ui)'
 test-group = 'lab-measurements'

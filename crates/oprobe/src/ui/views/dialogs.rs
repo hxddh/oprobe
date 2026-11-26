@@ -317,6 +317,17 @@ fn new_run(s: Store) -> View {
             )
             .on_submit(move |_: &str| s.submit_new_run()),
         ))
+        .child(dynamic(move || {
+            let command = s.replayed_command();
+            untracked(|| {
+                command.map(|c| {
+                    form_row(
+                        "runs.again",
+                        small(c).selectable(true).test_id("run-again-command"),
+                    )
+                })
+            })
+        }))
         .child(plan_part(s))
         .child(small(tr("runs.several")))
         .child(buttons_reactive(
