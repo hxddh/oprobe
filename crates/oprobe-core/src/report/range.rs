@@ -835,27 +835,17 @@ mod tests {
         run
     }
 
-    /// The numbers of a range as 9.1.0 computed them: one sort of the rows per quantile
-    /// ([`weighted_quantile_us_ms`] sorts what it is given), one more for the distribution and
-    /// a full sort for the slowest.
+    /// A range sorts its rows once per order it reads, however many quantiles are read from
+    /// each, and its numbers are those of the fixed synthetic trace.
     #[test]
-    fn a_range_sorts_once_and_reads_what_the_repeated_sorts_gave() {
-        use crate::analysis::stats::weighted_quantile_us_ms as old_q;
+    fn a_range_sorts_once_and_reads_the_expected_numbers() {
         let run = synthetic(20_000);
-        let weights = run.op_weights();
-        let w = |id: u64| weights.get(&id).copied().unwrap_or(1.0);
-        for (a, b) in [(0.0, 100.0), (12.5, 60.0), (99.0, 100.0), (40.0, 40.2)] {
-            let (lo, hi) = ((a * 1e6) as i64, (b * 1e6) as i64);
-            let ops: Vec<&OpRow> = run
-                .ops
-                .iter()
-                .filter(|o| o.t_us >= lo && o.t_us < hi)
-                .collect();
-            let reqs: Vec<&ReqRow> = run
-                .reqs
-                .iter()
-                .filter(|q| q.t_us >= lo && q.t_us < hi)
-                .collect();
+        for (a, b, rows, quantiles) in [
+            (0.0, 100.0, 20_000, [51.5, 90.75, 99.25, 100.25]),
+            (12.5, 60.0, 9_500, [51.75, 90.75, 99.5, 100.25]),
+            (99.0, 100.0, 200, [51.5, 95.25, 99.5, 99.75]),
+            (40.0, 40.2, 40, [64.75, 89.5, 98.0, 98.0]),
+        ] {
             SORTS.with(|n| n.set(0));
             let v = RangeView::of(&run, a, b);
             let sorts = SORTS.with(|n| n.get());
@@ -863,114 +853,69 @@ mod tests {
             // many rows and however many quantiles are read from each.
             assert_eq!(sorts, 1 + v.verbs.len() + 2 * v.apis.len(), "[{a}, {b})");
             assert_eq!((v.verbs.len(), v.apis.len()), (4, 3));
-            assert_eq!(v.rows_count, ops.len() as u64);
-
-            let lat = |ops: &[&OpRow]| -> Vec<(u64, f64)> {
-                ops.iter().map(|o| (o.latency_us, w(o.op_id))).collect()
-            };
-            let mut l = lat(&ops);
+            assert_eq!(v.rows_count, rows, "[{a}, {b})");
             assert_eq!(
                 [v.p50_ms, v.p90_ms, v.p99_ms, v.p999_ms],
-                [0.5, 0.9, 0.99, 0.999].map(|q| old_q(&mut l, q)),
+                quantiles,
                 "[{a}, {b})"
             );
-            // The distribution, as the old `cdf` built it from the order the quantiles left.
-            let total: f64 = l.iter().map(|x| x.1).sum();
-            let step = l.len().div_ceil(LatencyCdf::MAX_POINTS).max(1);
-            let mut acc = 0.0;
-            let mut pts = Vec::new();
-            for (i, (us, wt)) in l.iter().enumerate() {
-                acc += wt;
-                if (i + 1) % step == 0 || i + 1 == l.len() {
-                    pts.push((*us as f64 / 1000.0, (acc / total).min(1.0)));
-                }
-            }
-            pts.last_mut().unwrap().1 = 1.0;
-            assert_eq!(v.cdf.pts, pts, "[{a}, {b})");
-            // The slowest: a stable sort of every row, slowest first.
-            let mut slow = ops.clone();
-            slow.sort_by_key(|o| std::cmp::Reverse(o.latency_us));
-            let slow: Vec<u64> = slow
-                .iter()
-                .take(RangeView::SLOWEST)
-                .map(|o| o.op_id)
-                .collect();
-            assert_eq!(v.slowest_op_ids, slow, "[{a}, {b})");
-            for verb in &v.verbs {
-                let os: Vec<&OpRow> = ops
-                    .iter()
-                    .copied()
-                    .filter(|o| o.verb == verb.verb)
-                    .collect();
-                let mut l = lat(&os);
-                assert_eq!(
-                    [verb.p50_ms, verb.p99_ms],
-                    [old_q(&mut l, 0.5), old_q(&mut l, 0.99)],
-                    "{}",
-                    verb.verb
-                );
-            }
-            for api in &v.apis {
-                let qs: Vec<&ReqRow> = reqs
-                    .iter()
-                    .copied()
-                    .filter(|q| q.api.label() == api.api)
-                    .collect();
-                let mut ttfb: Vec<(u64, f64)> =
-                    qs.iter().map(|q| (q.ttfb_us, w(q.op_id))).collect();
-                let mut total: Vec<(u64, f64)> =
-                    qs.iter().map(|q| (q.total_us, w(q.op_id))).collect();
-                assert_eq!(
-                    [
-                        api.ttfb_p50_ms,
-                        api.ttfb_p99_ms,
-                        api.total_p50_ms,
-                        api.total_p99_ms
-                    ],
-                    [
-                        old_q(&mut ttfb, 0.5),
-                        old_q(&mut ttfb, 0.99),
-                        old_q(&mut total, 0.5),
-                        old_q(&mut total, 0.99)
-                    ],
-                    "{}",
-                    api.api
-                );
-            }
         }
+        let v = RangeView::of(&run, 0.0, 100.0);
+        // The distribution: from the fastest to the slowest, the share reaching 1.
+        let n = v.cdf.pts.len();
+        assert_eq!(n, 239);
+        assert_eq!((v.cdf.pts[0].0, v.cdf.pts[n / 2].0), (0.75, 51.25));
+        assert_eq!(v.cdf.pts[n - 1], (100.25, 1.0));
+        // The slowest first, the earlier of equals first.
+        assert_eq!(v.slowest_op_ids, [220, 1057, 1082, 1104, 1658]);
+        let verbs: Vec<(&str, f64, f64)> = v
+            .verbs
+            .iter()
+            .map(|x| (x.verb.as_str(), x.p50_ms, x.p99_ms))
+            .collect();
+        assert_eq!(
+            verbs,
+            [
+                ("read.full", 51.5, 99.5),
+                ("read.range", 52.0, 99.5),
+                ("stat", 51.75, 99.5),
+                ("write", 50.75, 99.25)
+            ]
+        );
+        let apis: Vec<(&str, [f64; 4])> = v
+            .apis
+            .iter()
+            .map(|x| {
+                (
+                    x.api.as_str(),
+                    [x.ttfb_p50_ms, x.ttfb_p99_ms, x.total_p50_ms, x.total_p99_ms],
+                )
+            })
+            .collect();
+        assert_eq!(
+            apis,
+            [
+                ("HeadObject", [7.6, 14.95, 12.6, 23.35]),
+                ("GetObject", [7.75, 14.95, 12.6, 23.1]),
+                ("PutObject", [7.3, 14.9, 12.45, 23.35])
+            ]
+        );
         // A verb's distribution over a range: one sort.
         SORTS.with(|n| n.set(0));
         let cdf = LatencyCdf::of_range_verb(&run, 0.0, 100.0, "stat").unwrap();
         assert_eq!(SORTS.with(|n| n.get()), 1);
         assert_eq!(cdf.pts.last().unwrap().1, 1.0);
-        // The drill-downs select too: what a stable sort of every row listed first.
-        let mut slow: Vec<&OpRow> = run.ops.iter().collect();
-        slow.sort_by_key(|o| std::cmp::Reverse(o.latency_us));
+        // The drill-downs select too: the slowest first, the earlier of equals first.
         let cell: Vec<u64> = ops_in(&run, 0.0, 100.0, 0.0, 1e9, 8)
             .iter()
             .map(|o| o.op_id)
             .collect();
-        assert_eq!(
-            cell,
-            slow.iter().take(8).map(|o| o.op_id).collect::<Vec<_>>()
-        );
-        let mut slow: Vec<&ReqRow> = run
-            .reqs
+        assert_eq!(cell, [220, 1057, 1082, 1104, 1658, 2365, 2388, 2879]);
+        let listed: Vec<u64> = slowest_requests(&run, "GetObject", None, 8)
             .iter()
-            .filter(|q| q.api == crate::trace::Api::GetObject)
+            .map(|q| q.op_id)
             .collect();
-        slow.sort_by_key(|q| std::cmp::Reverse(q.total_us));
-        let listed: Vec<(u64, i64)> = slowest_requests(&run, "GetObject", None, 8)
-            .iter()
-            .map(|q| (q.op_id, q.t_us))
-            .collect();
-        assert_eq!(
-            listed,
-            slow.iter()
-                .take(8)
-                .map(|q| (q.op_id, q.t_us))
-                .collect::<Vec<_>>()
-        );
+        assert_eq!(listed, [7510, 7789, 6688, 9307, 5977, 12589, 13762, 7003]);
         // Few rows, and none.
         assert_eq!(first_n(Vec::<u64>::new(), 5, |x| *x), Vec::<u64>::new());
         assert_eq!(first_n(vec![3, 1, 2], 5, |x| *x), [1, 2, 3]);

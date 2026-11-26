@@ -296,10 +296,8 @@ pub struct ProveOutput {
     /// Interleaved A/B pairs that ran.
     pub pairs_count: u64,
     /// The A/B pairs the prove planned at most (`--pairs`): the interval's sequential boundary
-    /// is the one of that plan. Absent in results of 9.1 and earlier, whose interval was the
-    /// fixed-sample one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pairs_max_count: Option<u64>,
+    /// is the one of that plan.
+    pub pairs_max_count: u64,
     pub max_throttle_ratio: f64,
     /// The other metrics (shown, never decisive).
     pub secondary: Vec<SecondaryMetric>,
@@ -339,25 +337,10 @@ impl ProveOutput {
         }
     }
 
-    /// The plan this result's interval was computed under: the A/B pairs planned at most.
-    /// `None` for a result of 9.1 or earlier, which had no plan: its `objective_delta` is a
-    /// fixed-sample interval, and nothing computed from its trials with a plan
-    /// ([`convergence`]) reproduces it. A view of such a result shows the stored verdict and
-    /// interval as they are; it must not judge the trials again.
-    pub fn plan(&self) -> Option<usize> {
-        self.pairs_max_count
-            .map(|n| (n as usize).clamp(MIN_DECISIVE_PAIRS, MAX_PAIRS))
-    }
-
-    /// The A/B pairs to draw the trials of this result with ([`convergence`]): its plan, or
-    /// for a result without one ([`Self::plan`]) the default plan, or the pairs it ran if
-    /// more. Only [`Self::plan`] says whether the drawing ends on the stored interval.
+    /// The A/B pairs to draw the trials of this result with ([`convergence`]): its plan,
+    /// within the range the sequential test is calibrated for.
     pub fn planned_pairs(&self) -> usize {
-        self.plan().unwrap_or_else(|| {
-            crate::config::prove_defaults::MAX_PAIRS
-                .max(self.pairs_count as usize)
-                .clamp(MIN_DECISIVE_PAIRS, MAX_PAIRS)
-        })
+        (self.pairs_max_count as usize).clamp(MIN_DECISIVE_PAIRS, MAX_PAIRS)
     }
 
     /// Add a note. Every note of a result goes through here: a note may quote an error of the
@@ -2262,7 +2245,7 @@ fn prove_command(req: &ProveRequest, run: &Run) -> String {
 }
 
 /// The one wall-time budget of a proof: `budget`, else `safety.max_duration` (the CLI's
-/// `--max-duration`, whose older spelling is `--budget`).
+/// `--max-duration`).
 fn proof_budget(req: &ProveRequest) -> Result<Option<Duration>> {
     Ok(req
         .budget
@@ -2851,7 +2834,7 @@ async fn prove_run(
         objective_delta: delta,
         noise_floor_ratio: floor,
         pairs_count: pairs,
-        pairs_max_count: Some(max_pairs as u64),
+        pairs_max_count: max_pairs as u64,
         max_throttle_ratio: max_throttle,
         secondary,
         trials: t.out.clone(),
@@ -3081,7 +3064,7 @@ mod tests {
             },
             noise_floor_ratio: 0.02,
             pairs_count: pairs,
-            pairs_max_count: Some(6),
+            pairs_max_count: 6,
             max_throttle_ratio: 0.001,
             secondary: Vec::new(),
             trials: Vec::new(),
@@ -3389,29 +3372,6 @@ mod tests {
             assert!(w(&longer[4].interval) > w(&c[4].interval));
         }
         assert!(convergence(ProveObjective::Goodput, &[], 6).is_empty());
-    }
-
-    /// A result of 9.1 has no `pairs_max_count`: it still reads, as the default plan.
-    #[test]
-    fn a_9_1_result_reads_without_the_planned_pairs() {
-        let mut v = serde_json::to_value(output(4, ProveVerdict::Improved)).unwrap();
-        assert_eq!(v["pairs_max_count"], 6);
-        v.as_object_mut().unwrap().remove("pairs_max_count");
-        let old = ProveOutput::from_json_slice(&serde_json::to_vec(&v).unwrap()).unwrap();
-        assert_eq!(old.pairs_max_count, None);
-        assert_eq!(old.planned_pairs(), 6);
-        // Not written back when absent.
-        assert!(
-            serde_json::to_value(&old)
-                .unwrap()
-                .get("pairs_max_count")
-                .is_none()
-        );
-        let mut long = old.clone();
-        long.pairs_count = 9;
-        assert_eq!(long.planned_pairs(), 9);
-        long.pairs_max_count = Some(12);
-        assert_eq!(long.planned_pairs(), 12);
     }
 
     #[test]
@@ -3935,18 +3895,5 @@ mod tests {
         // Exactly at the limit is within it; a trial that counted nothing never is.
         assert!(limits.admits(10, 0.0, 0.0, 270.0));
         assert!(!limits.admits(0, 0.0, 0.0, 1.0));
-    }
-
-    /// K3-6: a result of 9.1 has no plan. Core says so, and offers no way to read its trials
-    /// as if it had one without asking.
-    #[test]
-    fn a_result_without_a_plan_says_so() {
-        let mut p = output(4, ProveVerdict::Improved);
-        assert_eq!(p.plan(), Some(6));
-        p.pairs_max_count = Some(40);
-        assert_eq!(p.plan(), Some(12), "clamped to the calibrated range");
-        p.pairs_max_count = None;
-        assert_eq!(p.plan(), None);
-        assert_eq!(p.planned_pairs(), 6);
     }
 }

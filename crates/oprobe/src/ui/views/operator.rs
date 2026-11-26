@@ -490,15 +490,6 @@ fn prove_state(s: Store, st: crate::ui::jobs::State, p99: bool, has_file: bool) 
     }
     // The pairs as the prove recorded them once it ends, else as they stream in.
     // The interval is the one of the prove's plan (its sequential boundary).
-    // A result of 9.1 or earlier: the chart ends on the interval it stored with its verdict.
-    let stored = match &st.outcome {
-        Some(Outcome::Proved(p)) if !p.sequential => Some(crate::analysis::stats::Interval {
-            estimate: p.delta.0,
-            low: p.delta.1,
-            high: p.delta.2,
-        }),
-        _ => None,
-    };
     let (ab, max_pairs) = match &st.outcome {
         Some(Outcome::Proved(p)) if !p.ab.is_empty() => (p.ab.clone(), p.max_pairs),
         _ => (
@@ -520,7 +511,7 @@ fn prove_state(s: Store, st: crate::ui::jobs::State, p99: bool, has_file: bool) 
             (a, b, if a > 0.0 { b / a - 1.0 } else { 0.0 })
         })
         .collect();
-    if let Some(plot) = plots::prove(&ab, p99, max_pairs, stored) {
+    if let Some(plot) = plots::prove(&ab, p99, max_pairs) {
         v = v.child(view().test_id("prove-chart").child(chart(
             tr("plot.convergence"),
             150.0,

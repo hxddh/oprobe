@@ -79,8 +79,7 @@ pub struct HypothesisParams {
     pub servers_count: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bytes_per_s: Option<f64>,
-    /// Which bodies share `bytes_per_s` (a bandwidth cap; absent in reports of 9.2 and
-    /// earlier, which told an upload cap by how its evidence opens).
+    /// Which bodies share `bytes_per_s` (a bandwidth cap).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub direction: Option<Direction>,
     /// Seconds into the window where a [`HypothesisKind::TimeVarying`] limit changed.

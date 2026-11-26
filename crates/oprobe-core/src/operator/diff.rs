@@ -48,7 +48,7 @@ pub struct OperatorDiff {
     pub toml: String,
     /// The whole of `b` as Rust that compiles as written ([`to_rust`]: `build_operator()`,
     /// `reader()`, `writer()`), secrets left to the credential chain. The `rust` lines above
-    /// show a change and do not paste. Absent in results of 9.2 and earlier.
+    /// show a change and do not paste.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub operator_rust: String,
 }
@@ -1435,11 +1435,5 @@ mod tests {
         assert!(!d.operator_rust.starts_with('+'));
         // An operator with nothing changed still has its Rust.
         assert!(diff(&a, &a).operator_rust.contains("fn build_operator()"));
-        // A 9.2 result has no such field: it reads, and writes none back.
-        let mut v = serde_json::to_value(&d).unwrap();
-        v.as_object_mut().unwrap().remove("operator_rust");
-        let old: OperatorDiff = serde_json::from_value(v.clone()).unwrap();
-        assert_eq!(old.operator_rust, "");
-        assert_eq!(serde_json::to_value(&old).unwrap(), v);
     }
 }

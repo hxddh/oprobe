@@ -1108,7 +1108,6 @@ mod tests {
         }
         let mut p = Profile::from_url("memory://");
         p.sla.enforce = false;
-        p.sla.p99_ms = Some(50.0);
         let cmd = RunSpec::new(&p, "memory://").command();
         assert!(!cmd.contains("sla") && !cmd.contains("p99_ms"), "{cmd}");
     }

@@ -386,26 +386,17 @@ mod sla_tests {
             });
             s
         };
-        // A stored limit changes nothing: it is no longer read.
-        for sla in [
-            Sla::default(),
-            Sla {
-                p99_ms: Some(60_000.0),
-                ..Sla::default()
-            },
-        ] {
-            let v = check_sla(&stalled(800), &sla);
-            assert!(!v.passed, "{v:?}");
-            assert_eq!(v.breaches.len(), 1, "{v:?}");
-            let b = &v.breaches[0];
-            assert!(
-                b.starts_with("800 of 1000 scheduled arrivals never completed (80.0%)"),
-                "{b}"
-            );
-            // The bound is the run's own p99, not a histogram bin's edge (W2).
-            assert!(b.contains("the p99 is at least 7.90"), "{b}");
-            assert!(b.ends_with("has no upper bound"), "{b}");
-        }
+        let v = check_sla(&stalled(800), &Sla::default());
+        assert!(!v.passed, "{v:?}");
+        assert_eq!(v.breaches.len(), 1, "{v:?}");
+        let b = &v.breaches[0];
+        assert!(
+            b.starts_with("800 of 1000 scheduled arrivals never completed (80.0%)"),
+            "{b}"
+        );
+        // The bound is the run's own p99, not a histogram bin's edge (W2).
+        assert!(b.contains("the p99 is at least 7.90"), "{b}");
+        assert!(b.ends_with("has no upper bound"), "{b}");
         // 1 % of the arrivals cut off at the window's end still bounds the p99: no breach.
         assert!(check_sla(&stalled(2), &Sla::default()).passed);
         // Every arrival completed, or a closed loop: nothing to say.

@@ -694,28 +694,17 @@ impl TimelineView {
             let width = interval_width(r, p, i + 1 == n);
             // The last interval ends with the window (the charts end where the tiles do).
             let len = if i + 1 == n { width } else { interval_len(p) };
-            // Reports before 6.3 carry no exact counts: derive them from the rates.
-            let ops = if p.ops_count > 0 {
-                p.ops_count
-            } else {
-                (p.ops_per_s * width).round().max(0.0) as u64
-            };
             v.t_s.push(p.t_s);
             v.len_s.push(len);
             v.ops_per_s.push(p.ops_per_s);
-            v.goodput_ops_per_s.push(if p.ops_count > 0 {
-                p.goodput_ops_per_s
-            } else {
-                // Before 6.3 failures counted by operation start, like the operations.
-                (p.ops_per_s - p.errors as f64 / width).max(0.0)
-            });
+            v.goodput_ops_per_s.push(p.goodput_ops_per_s);
             v.mib_per_s.push(p.mib_per_s);
             v.p50_ms.push(p.p50_ms);
             v.p90_ms.push(p.p90_ms);
             v.p99_ms.push(p.p99_ms);
             v.p999_ms.push(p.p999_ms);
             v.max_ms.push(p.max_ms);
-            v.ops_count.push(ops);
+            v.ops_count.push(p.ops_count);
             v.throttled_count.push(p.throttled);
             v.errors_count.push(p.errors);
             v.requests_per_s.push(p.requests_per_s);
@@ -984,12 +973,6 @@ fn window_points(r: &Report) -> std::borrow::Cow<'_, [crate::trace::TimelinePoin
     let last_i = pts.len() - 1;
     let width = interval_width(r, &pts[last_i], true);
     let p = &mut pts[last_i];
-    // Requests as a count (reports before 6.3 carry only the rate).
-    let mut requests = if p.requests_count > 0 {
-        p.requests_count as f64
-    } else {
-        p.requests_per_s * width
-    };
     for s in &r.timeline[inside..] {
         p.errors += s.errors;
         p.throttled += s.throttled;
@@ -999,11 +982,6 @@ fn window_points(r: &Report) -> std::borrow::Cow<'_, [crate::trace::TimelinePoin
         p.new_connections += s.new_connections;
         p.inflight_peak = p.inflight_peak.max(s.inflight_peak);
         p.requests_count += s.requests_count;
-        requests += if s.requests_count > 0 {
-            s.requests_count as f64
-        } else {
-            s.requests_per_s * interval_len(s)
-        };
         for v in &s.verbs {
             if let Some(x) = p.verbs.iter_mut().find(|x| x.verb == v.verb) {
                 x.errors_count += v.errors_count;
@@ -1018,7 +996,7 @@ fn window_points(r: &Report) -> std::borrow::Cow<'_, [crate::trace::TimelinePoin
             }
         }
     }
-    p.requests_per_s = requests / width.max(1e-9);
+    p.requests_per_s = p.requests_count as f64 / width.max(1e-9);
     std::borrow::Cow::Owned(pts)
 }
 
@@ -2107,15 +2085,14 @@ fn compare_apis(reports: &[&Report]) -> Vec<CompareApi> {
 ///    sampled away and no censored open-loop arrival the rows cannot show;
 /// 2. the run's latency histogram (`report.latency_histogram`: every operation, 20 bins per
 ///    decade, each point at its bin's upper bound) — never biased by row sampling, which
-///    keeps the slowest and failed operations always and so over-weighs the tail;
-/// 3. the heatmap's 20 coarse rows (reports before 6.3).
+///    keeps the slowest and failed operations always and so over-weighs the tail.
 ///
 /// At most [`LatencyCdf::MAX_POINTS`] points.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct LatencyCdf {
     /// `(latency ms, share 0–1)`, latency ascending, the share reaching 1.
     pub pts: Vec<(f64, f64)>,
-    /// From the exact trace rows (otherwise from the histogram or the heatmap's rows).
+    /// From the exact trace rows (otherwise from the histogram).
     pub exact: bool,
 }
 
@@ -2184,35 +2161,7 @@ impl LatencyCdf {
             }
             return Self { pts, exact: false };
         }
-        let h = &r.heatmap;
-        let rows = h.latency_buckets_ms.len();
-        let mut per_row = vec![0u64; rows];
-        for col in &h.counts {
-            for (i, c) in col.iter().enumerate().take(rows) {
-                per_row[i] += c;
-            }
-        }
-        let total: u64 = per_row.iter().sum();
-        if total == 0 {
-            return Self::default();
-        }
-        let mut acc = 0u64;
-        let mut pts = Vec::new();
-        for (i, c) in per_row.iter().enumerate() {
-            if *c == 0 {
-                continue;
-            }
-            acc += c;
-            // A bucket's operations are at or below its upper bound (the open last bucket: twice
-            // its lower bound).
-            let upper = h
-                .latency_buckets_ms
-                .get(i + 1)
-                .copied()
-                .unwrap_or(h.latency_buckets_ms[i] * 2.0);
-            pts.push((upper, acc as f64 / total as f64));
-        }
-        Self { pts, exact: false }
+        Self::default()
     }
 
     /// The tail of the distribution: `(latency ms, share of operations at or slower than
@@ -3331,7 +3280,7 @@ mod tests {
     }
 
     #[test]
-    fn the_latency_cdf_rises_to_one_from_rows_or_buckets() {
+    fn the_latency_cdf_rises_to_one_from_rows() {
         let run = crate::report::fixture::run();
         let exact = LatencyCdf::of(&run.report, Some(&run));
         assert!(exact.exact);
@@ -3342,19 +3291,8 @@ mod tests {
                 .windows(2)
                 .all(|w| w[0].0 <= w[1].0 && w[0].1 <= w[1].1)
         );
-        let mut r = run.report.clone();
-        r.heatmap.latency_buckets_ms = vec![0.0, 1.0, 10.0];
-        r.heatmap.counts = vec![vec![0, 3, 1], vec![0, 0, 4]];
-        let b = LatencyCdf::of(&r, None);
-        assert!(!b.exact);
-        // Sampled rows over-weigh the tail: the buckets, which count every operation, are used.
-        let mut sampled = run.clone();
-        sampled.report = r.clone();
-        sampled.report.sampling.kept_ratio = 0.5;
-        sampled.report.sampling.seen_ops_count = 100;
-        assert_eq!(LatencyCdf::of(&sampled.report, Some(&sampled)), b);
-        assert_eq!(b.pts, vec![(10.0, 3.0 / 8.0), (20.0, 1.0)]);
-        assert_eq!(b.quantile(0.5), Some(20.0));
+        // No rows and no histogram: no distribution.
+        assert_eq!(LatencyCdf::of(&run.report, None), LatencyCdf::default());
     }
 
     /// A log-normal-ish known distribution: 1 000 operations, 1 % at 100 ms.
@@ -3451,17 +3389,6 @@ mod tests {
         assert_eq!(read.errors_count, vec![0, 50, 0]);
         assert_eq!(read.p99_ms, vec![20.0, 20.0, 20.0]);
         assert!(TimelineView::for_verb(&r, "stat").is_none());
-        // Reports before 6.3: goodput from the rate less the failures (both by start).
-        let mut old = r.clone();
-        old.timeline = vec![crate::trace::TimelinePoint {
-            len_s: 1.0,
-            ops_per_s: 10.0,
-            errors: 4,
-            ..Default::default()
-        }];
-        let v = TimelineView::of(&old);
-        assert_eq!(v.ops_count, vec![10]);
-        assert_eq!(v.goodput_ops_per_s, vec![6.0]);
     }
 
     #[test]

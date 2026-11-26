@@ -300,24 +300,10 @@ pub fn boolean(what: &str, raw: &str) -> Result<bool, OprobeError> {
 // Domain values
 // ---------------------------------------------------------------------------------------
 
-/// A workload preset (aliases: `lakehouse`, `small`, `meta`, `ckpt`, …).
+/// A workload preset.
 pub fn preset(raw: &str) -> Result<Preset, OprobeError> {
-    let mut table: Vec<(&str, Preset)> = Preset::ALL.iter().map(|p| (p.slug(), *p)).collect();
-    // The 5.x names map to the preset that keeps their access pattern.
-    table.extend([
-        ("small", Preset::SmallFiles),
-        ("large", Preset::LargeObjects),
-        ("checkpoint", Preset::LargeObjects),
-        ("parquet", Preset::RangeReads),
-        ("parquet-suffix", Preset::RangeReads),
-        ("ranges", Preset::RangeReads),
-        ("metadata", Preset::ListStat),
-        ("metadata-heavy", Preset::ListStat),
-        ("list-paged", Preset::ListStat),
-        ("mixed", Preset::SmallFiles),
-    ]);
     let s = raw.trim().to_ascii_lowercase().replace('_', "-");
-    if let Some((_, p)) = table.iter().find(|(n, _)| *n == s) {
+    if let Some(p) = Preset::ALL.iter().find(|p| p.slug() == s) {
         return Ok(*p);
     }
     let names: Vec<&str> = Preset::ALL.iter().map(|p| p.slug()).collect();
@@ -907,7 +893,7 @@ mod tests {
     #[test]
     fn presets_access_and_providers() {
         assert_eq!(preset("small_files").unwrap(), Preset::SmallFiles);
-        assert_eq!(preset("parquet").unwrap(), Preset::RangeReads);
+        assert!(preset("parquet").is_err());
         assert_eq!(preset("large-objects").unwrap(), Preset::LargeObjects);
         let (c, h) = code(preset("range-raeds"));
         assert_eq!(c, ErrorCode::UsageInvalidArgument);

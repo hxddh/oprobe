@@ -1010,8 +1010,8 @@ fn prove_never_prints_or_stores_secrets() {
     }
 }
 
-/// One prove budget (6.3): `--max-duration` bounds the whole proof, `--budget` is a hidden
-/// alias, and the dry run estimates the whole proof.
+/// One prove budget: `--max-duration` bounds the whole proof, and the dry run estimates the
+/// whole proof.
 #[test]
 fn prove_has_one_budget_and_estimates_the_whole_proof() {
     let env = Env::new();
@@ -1020,39 +1020,37 @@ fn prove_has_one_budget_and_estimates_the_whole_proof() {
     assert!(!h.contains("--budget"), "{h}");
     let o = env.run(&run_args(&["lab://clean"], &["-q", "-o", "json"]));
     assert_eq!(code(&o), 0, "{}", stderr(&o));
-    for flag in ["--max-duration", "--budget"] {
-        let o = env.run(&[
-            "prove",
-            "last",
-            "--with",
-            "read.gap=1MiB",
-            flag,
-            "90s",
-            "--dry-run",
-            "-o",
-            "json",
-        ]);
-        assert_eq!(code(&o), 0, "{flag}: {}", stderr(&o));
-        validate("prove-plan", &json(&o));
-        let p = &json(&o)["proof"];
-        assert_eq!(p["budget_s"], 90.0, "{flag}: {p}");
-        assert_eq!(p["pairs_min_count"], 3, "{p}");
-        assert_eq!(p["trials_max_count"], 12, "{p}");
-        let (lo, hi) = (
-            p["eta_min_s"].as_f64().unwrap(),
-            p["eta_max_s"].as_f64().unwrap(),
-        );
-        assert!(lo > 0.0 && lo <= hi && hi <= 90.0, "{p}");
-        // Six trials at least: the estimate is the proof's, not one trial's.
-        assert!(lo >= 6.0 * p["trial_eta_s"].as_f64().unwrap() - 1e-6, "{p}");
-        assert!(
-            p["command"]
-                .as_str()
-                .unwrap()
-                .ends_with("--with read.gap=1MiB --max-duration 90s"),
-            "{p}"
-        );
-    }
+    let o = env.run(&[
+        "prove",
+        "last",
+        "--with",
+        "read.gap=1MiB",
+        "--max-duration",
+        "90s",
+        "--dry-run",
+        "-o",
+        "json",
+    ]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    validate("prove-plan", &json(&o));
+    let p = &json(&o)["proof"];
+    assert_eq!(p["budget_s"], 90.0, "{p}");
+    assert_eq!(p["pairs_min_count"], 3, "{p}");
+    assert_eq!(p["trials_max_count"], 12, "{p}");
+    let (lo, hi) = (
+        p["eta_min_s"].as_f64().unwrap(),
+        p["eta_max_s"].as_f64().unwrap(),
+    );
+    assert!(lo > 0.0 && lo <= hi && hi <= 90.0, "{p}");
+    // Six trials at least: the estimate is the proof's, not one trial's.
+    assert!(lo >= 6.0 * p["trial_eta_s"].as_f64().unwrap() - 1e-6, "{p}");
+    assert!(
+        p["command"]
+            .as_str()
+            .unwrap()
+            .ends_with("--with read.gap=1MiB --max-duration 90s"),
+        "{p}"
+    );
     let o = env.run(&["prove", "last", "--with", "read.gap=1MiB", "--dry-run"]);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     let t = stdout(&o);

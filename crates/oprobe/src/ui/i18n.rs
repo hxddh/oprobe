@@ -621,14 +621,6 @@ static EN: &[(&str, &str)] = &[
     ("plot.pair_delta", "each pair"),
     ("plot.estimate", "estimate"),
     ("plot.interval", "95 % interval"),
-    (
-        "plot.interval_stored",
-        "95 % interval, ending on the one oprobe 9.1 stored (not sequential)",
-    ),
-    (
-        "plot.interval_stored_note",
-        "the interval oprobe 9.1 stored with its verdict (fixed-sample, not sequential)",
-    ),
     ("plot.noise", "noise floor (A/A)"),
     ("plot.evidence", "Evidence"),
     ("verb.ops", "{} ops"),
@@ -1386,14 +1378,6 @@ static ZH: &[(&str, &str)] = &[
     ("plot.pair_delta", "每一对"),
     ("plot.estimate", "估计"),
     ("plot.interval", "95 % 区间"),
-    (
-        "plot.interval_stored",
-        "95 % 区间，终点为 oprobe 9.1 存储的区间（非序贯）",
-    ),
-    (
-        "plot.interval_stored_note",
-        "oprobe 9.1 随结论存储的区间（固定样本，非序贯）",
-    ),
     ("plot.noise", "噪声底线（A/A）"),
     ("plot.evidence", "证据"),
     ("verb.ops", "{} 次"),
