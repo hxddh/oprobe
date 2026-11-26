@@ -2197,13 +2197,13 @@ impl LatencyCdf {
         let w = run.op_weights();
         let s = &run.report.sampling;
         let sampled = s.seen_ops_count > 0 && s.kept_ops_count < s.seen_ops_count;
-        let mut lat: Vec<(u64, f64)> = run
+        let lat: Vec<(u64, f64)> = run
             .ops
             .iter()
             .filter(|o| o.verb == verb && o.t_us >= lo && o.t_us < hi)
             .map(|o| (o.latency_us, w.get(&o.op_id).copied().unwrap_or(1.0)))
             .collect();
-        (!lat.is_empty()).then(|| super::range::cdf(&mut lat, !sampled))
+        (!lat.is_empty()).then(|| super::range::Weighted::new(lat).cdf(!sampled))
     }
 
     /// The distribution of one verb, from the timeline's per-verb latency rows (every
