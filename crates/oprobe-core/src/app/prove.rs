@@ -13,9 +13,11 @@
 //!    trial — often the other arm — starts against.
 //! 4. **Decide**: `improved | worse | inconclusive` on the objective (goodput = successful
 //!    operations per second, or p99): whether its sequential, order-adjusted 95 % interval
-//!    excludes no change — the one rule every look and the verdict share. Intervals are
-//!    log-ratio (never below −100 %) and Wilson/Newcombe for shares; secondary metrics are
-//!    shown, never decisive.
+//!    excludes no change — the one rule every look and the verdict share. A changed operator
+//!    that throttles or fails more than the run allows, and more than the current one, is
+//!    `inconclusive` whatever its objective says ([`throttle_gate`], [`error_gate`]).
+//!    Intervals are log-ratio (never below −100 %) and Wilson/Newcombe for shares; secondary
+//!    metrics are shown, never decisive.
 //! 5. **Save**: every trial is a run whose `parent_id` is this prove (hidden from
 //!    `show --list` unless `--all`); the result is stored as `<id>.prove.json`.
 
@@ -30,7 +32,8 @@ use super::Ctx;
 use super::input::{OutputOptions, Safety};
 use crate::analysis::stats::Interval;
 use crate::analysis::verdict::{
-    AbDecision, AbTest, AbVerdict, candidate_first, log_ratio, ratio_difference,
+    AbDecision, AbTest, AbVerdict, P99_CLIFF_RATIO, candidate_first, count_resolution, log_ratio,
+    noise_floor_ab, p99_on_a_cliff, p99_rank_band, p99_spread, ratio_difference,
 };
 pub use crate::analysis::verdict::{AbPair, MAX_PAIRS, MIN_DECISIVE_PAIRS};
 use crate::config::Profile;
@@ -214,8 +217,19 @@ pub struct ProveTrial {
     pub throttled_request_ratio: f64,
     /// Operations that failed for reasons other than throttling, per operation.
     pub error_ratio: f64,
-    /// Within `--max-throttle` and the error ratio a run allows (1 %).
+    /// Within `--max-throttle` and the error ratio a run allows (1 %), and, for the remedy of
+    /// a `rate_limit` finding, sending no more requests per second than the fitted limit.
     pub feasible: bool,
+    /// How far off this trial's p99 can be, as a log ratio: a quarter of the log width of the
+    /// latencies at the ranks 0.99·n ± 2·√(0.0099·n) of its n operations (the p99's
+    /// order-statistic interval). Above 0.17 those latencies differ by more than 2×: the p99
+    /// sits on a cliff. Absent when 0, and in results of 9.2 and earlier.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub p99_spread_ratio: f64,
+}
+
+fn is_zero(v: &f64) -> bool {
+    *v == 0.0
 }
 
 /// The sizing step: the path, the values tried and the knee.
@@ -325,13 +339,34 @@ impl ProveOutput {
         }
     }
 
-    /// The A/B pairs the prove planned at most. A result of 9.1 or earlier does not say: the
-    /// default plan, or the pairs it ran if more.
+    /// The plan this result's interval was computed under: the A/B pairs planned at most.
+    /// `None` for a result of 9.1 or earlier, which had no plan: its `objective_delta` is a
+    /// fixed-sample interval, and nothing computed from its trials with a plan
+    /// ([`convergence`]) reproduces it. A view of such a result shows the stored verdict and
+    /// interval as they are; it must not judge the trials again.
+    pub fn plan(&self) -> Option<usize> {
+        self.pairs_max_count
+            .map(|n| (n as usize).clamp(MIN_DECISIVE_PAIRS, MAX_PAIRS))
+    }
+
+    /// The A/B pairs to draw the trials of this result with ([`convergence`]): its plan, or
+    /// for a result without one ([`Self::plan`]) the default plan, or the pairs it ran if
+    /// more. Only [`Self::plan`] says whether the drawing ends on the stored interval.
     pub fn planned_pairs(&self) -> usize {
-        let planned = self.pairs_max_count.unwrap_or_else(|| {
-            (crate::config::prove_defaults::MAX_PAIRS as u64).max(self.pairs_count)
-        });
-        (planned as usize).clamp(MIN_DECISIVE_PAIRS, MAX_PAIRS)
+        self.plan().unwrap_or_else(|| {
+            crate::config::prove_defaults::MAX_PAIRS
+                .max(self.pairs_count as usize)
+                .clamp(MIN_DECISIVE_PAIRS, MAX_PAIRS)
+        })
+    }
+
+    /// Add a note. Every note of a result goes through here: a note may quote an error of the
+    /// storage library or of a save, and those quote URLs as configured, so credentials in a
+    /// URL (`user:pass@`, a presigned signature) are removed before the note is printed or
+    /// stored.
+    fn add_note(&mut self, note: impl AsRef<str>) {
+        self.notes
+            .push(crate::util::strip_url_credentials(note.as_ref()));
     }
 
     fn metric_label(m: &str) -> &str {
@@ -374,7 +409,7 @@ impl CommandOutput for ProveOutput {
             )
         } else {
             format!(
-                "{} on {}: no pair of trials ran · {}\n",
+                "{} on {}: no pair of trials was judged · {}\n",
                 bold(&verdict),
                 self.objective.label(),
                 self.environment
@@ -469,6 +504,15 @@ impl CommandOutput for ProveOutput {
     }
 
     fn next(&self) -> Vec<NextStep> {
+        // Nothing was compared: there is no changed operator worth a profile yet. The trials
+        // that did run are still stored.
+        if self.pairs_count == 0 {
+            return if self.trials.is_empty() {
+                Vec::new()
+            } else {
+                vec![NextStep::new("its trials", "oprobe show --list --all")]
+            };
+        }
         // The run's own workload (preset, `-c`, `-d`, `--existing`, …) on the proven operator;
         // a result stored without it falls back to the operator and the change alone.
         let command = self.run_command.clone().unwrap_or_else(|| {
@@ -530,52 +574,217 @@ fn fmt_secs(s: f64) -> String {
     }
 }
 
+/// What the trials of a proof are expected to take (seconds of wall time).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TrialTimes {
+    /// A baseline trial (A).
+    a_s: f64,
+    /// The first sizing or candidate trial (B), which may have a shared layer to warm.
+    b_first_s: f64,
+    /// A later one.
+    b_warm_s: f64,
+    /// The cool-down that follows a trial that ends throttled ([`cool_down`]); 0 when the
+    /// base run was not throttled.
+    cool_s: f64,
+}
+
+impl TrialTimes {
+    /// Every trial takes `s`, and none is followed by a cool-down.
+    #[cfg(test)]
+    fn even(s: f64) -> Self {
+        Self {
+            a_s: s,
+            b_first_s: s,
+            b_warm_s: s,
+            cool_s: 0.0,
+        }
+    }
+}
+
+/// What the base run says about the wall time of a trial of its workload, beyond the trial's
+/// own warm-up and window (K3-2). 9.2 estimated a trial from the plan's model alone: too low
+/// when operations sat in retry backoff past the window and by every cool-down (`lab://hotkey`:
+/// "23–45 s" for a proof of 54 s), too high on a fast target (a modelled dataset upload and
+/// cleanup that took no time: "too few pairs to decide", and then it decided).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct BaseTiming {
+    /// The wall time the run spent around its warm-up, window and tail: opening the session,
+    /// the dataset, cleanup, saving. `None` when its timestamps do not say.
+    overhead_s: Option<f64>,
+    /// How long its last operations kept draining after the window closed (an operation in a
+    /// retry backoff finishes its retries).
+    tail_s: f64,
+    /// The cool-down a trial that ends as throttled as the run is followed by.
+    cool_s: f64,
+}
+
+impl BaseTiming {
+    /// From the run's own numbers: its wall time `wall_s` (seconds between its start and end
+    /// stamps), its warm-up and window, the end of its last operation (seconds from the window
+    /// start), and the cool-down `cool` its throttling asks for ([`cool_down`]).
+    fn learn(
+        wall_s: Option<f64>,
+        warmup_s: f64,
+        window_s: f64,
+        last_op_end_s: f64,
+        cool: Duration,
+    ) -> Self {
+        let tail_s = (last_op_end_s - window_s).max(0.0);
+        Self {
+            // The stamps are whole seconds, so their difference is right within a second: the
+            // least the run can have spent. An estimate that is short is corrected by the
+            // first trial; one that is long would keep a pair that fits from ever starting.
+            overhead_s: wall_s
+                .filter(|w| w.is_finite())
+                .map(|w| (w - 1.0 - warmup_s - window_s - tail_s).max(0.0)),
+            tail_s,
+            cool_s: cool.as_secs_f64(),
+        }
+    }
+
+    fn of(run: &Run, trial_warmup: Duration) -> Self {
+        let r = &run.report;
+        // `2026-11-22T10:00:00Z`, as the report writes it.
+        let stamp = |s: &str| crate::util::parse_compact_utc(&s.replace(['-', ':'], ""));
+        let wall_s = match (stamp(&r.run.started_at), stamp(&r.run.ended_at)) {
+            (Some(a), Some(b)) => b.duration_since(a).ok().map(|d| d.as_secs_f64()),
+            _ => None,
+        };
+        let last_op_end_s = run
+            .ops
+            .iter()
+            .map(|o| o.t_us.saturating_add_unsigned(o.latency_us))
+            .max()
+            .unwrap_or(0) as f64
+            / 1e6;
+        Self::learn(
+            wall_s,
+            r.workload.warmup_s,
+            r.run.window_s,
+            last_op_end_s,
+            cool_down(
+                r.resilience.throttled_responses,
+                r.resilience.max_retry_after_ms,
+                trial_warmup,
+            ),
+        )
+    }
+
+    /// The wall time of a trial of `warmup_s` and `window_s`; `model_overhead_s` is the plan's
+    /// own guess of the time around them, used when the run does not say.
+    fn trial_s(&self, warmup_s: f64, window_s: f64, model_overhead_s: f64) -> f64 {
+        warmup_s + window_s + self.tail_s + self.overhead_s.unwrap_or(model_overhead_s)
+    }
+}
+
+/// An expected wall time that what was measured corrects: the estimate until the first
+/// measurement, then the longest one measured (no trial starts that would not end within the
+/// budget, so the plan leans long).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Expected {
+    d: Duration,
+    measured: bool,
+}
+
+impl Expected {
+    fn new(estimate_s: f64) -> Self {
+        Self {
+            d: Duration::from_secs_f64(estimate_s.max(0.0)),
+            measured: false,
+        }
+    }
+
+    fn get(&self) -> Duration {
+        self.d
+    }
+
+    fn observe(&mut self, took: Duration) {
+        self.d = if self.measured {
+            self.d.max(took)
+        } else {
+            took
+        };
+        self.measured = true;
+    }
+}
+
+/// The line that corrects the upfront ETA once the first pair has run: `None` while the pair
+/// took within a quarter of what was estimated. `pairs_left` is what the plan still allows,
+/// `budget_left_s` what the budget does.
+fn corrected_eta(
+    estimated_pair_s: f64,
+    measured_pair_s: f64,
+    pairs_left: u64,
+    budget_left_s: Option<f64>,
+) -> Option<String> {
+    let off = (measured_pair_s - estimated_pair_s).abs();
+    if pairs_left == 0 || off <= 0.25 * estimated_pair_s.max(1e-3) {
+        return None;
+    }
+    let fit = match budget_left_s {
+        Some(b) => pairs_left.min((b.max(0.0) / measured_pair_s.max(1e-3)).floor() as u64),
+        None => pairs_left,
+    };
+    Some(format!(
+        "· a pair of trials takes {}, not the {} estimated: up to {} more for the {} pair{} that can still run",
+        fmt_secs(measured_pair_s),
+        fmt_secs(estimated_pair_s),
+        fmt_secs(fit as f64 * measured_pair_s),
+        fit,
+        if fit == 1 { "" } else { "s" }
+    ))
+}
+
 impl ProofEstimate {
     /// The estimate of a proof of `sizing` (most, fewest) sizing trials and `pairs` (fewest,
-    /// most) A/B pairs, whose baseline trials take `a_eta_s` and whose sizing and candidate
-    /// trials take `b_first_eta_s` — or `b_warm_eta_s` once the first candidate trial has
-    /// warmed a shared layer — within `budget`.
-    #[allow(clippy::too_many_arguments)]
+    /// most) A/B pairs whose trials take `t`, within `budget`. A trial that ends throttled is
+    /// followed by a cool-down: the baseline trials are expected to, as the base run was; the
+    /// changed operator's may (the most the proof takes) or may not (the least).
     fn new(
         command: String,
         change: Vec<String>,
         sizing: (u64, u64),
         pairs: (u64, u64),
-        a_eta_s: f64,
-        b_first_eta_s: f64,
-        b_warm_eta_s: f64,
+        t: TrialTimes,
         budget: Option<Duration>,
     ) -> Self {
-        let pair_cold_s = a_eta_s + b_first_eta_s;
-        let pair_warm_s = a_eta_s + b_warm_eta_s;
-        let pairs_cost = |p: u64| -> f64 {
-            if p == 0 {
+        // (the first pair, a later pair): the cool-down after A, and after B too at worst.
+        let pair_s = |worst: bool| {
+            let cool = t.cool_s * if worst { 2.0 } else { 1.0 };
+            (t.a_s + t.b_first_s + cool, t.a_s + t.b_warm_s + cool)
+        };
+        let sizing_s = |worst: bool| t.b_first_s + if worst { t.cool_s } else { 0.0 };
+        let cost = |s: u64, p: u64, worst: bool| -> f64 {
+            let (cold, warm) = pair_s(worst);
+            let pairs = if p == 0 {
                 0.0
             } else {
-                pair_cold_s + (p - 1) as f64 * pair_warm_s
-            }
+                cold + (p - 1) as f64 * warm
+            };
+            s as f64 * sizing_s(worst) + pairs
         };
         let budget_s = budget.map(|b| b.as_secs_f64());
         let unbudgeted = sizing.0 + 2 * pairs.1;
-        // Plan only the trials that fit in the budget (K19): the sizing trials run first, the
-        // A/B pairs in what is left; no trial starts that would not end in it.
+        // Plan only the trials estimated to fit in the budget (K19): the sizing trials run
+        // first, the A/B pairs in what is left; no trial starts that would not end in it.
         let fit = |s: u64, p: u64| -> (u64, u64) {
             let Some(b) = budget_s else {
                 return (s, p);
             };
-            let s = s.min((b / b_first_eta_s.max(1e-3)).floor() as u64);
-            let left = (b - s as f64 * b_first_eta_s).max(0.0);
-            let fit_p = if left < pair_cold_s {
+            let (cold, warm) = pair_s(false);
+            let s = s.min((b / sizing_s(false).max(1e-3)).floor() as u64);
+            let left = (b - s as f64 * sizing_s(false)).max(0.0);
+            let fit_p = if left < cold {
                 0
             } else {
-                1 + ((left - pair_cold_s) / pair_warm_s.max(1e-3)).floor() as u64
+                1 + ((left - cold) / warm.max(1e-3)).floor() as u64
             };
             (s, p.min(fit_p))
         };
         let (s_min, p_min) = fit(sizing.1, pairs.0);
         let (s_max, p_max) = fit(sizing.0, pairs.1);
-        let min = s_min as f64 * b_first_eta_s + pairs_cost(p_min);
-        let mut max = sizing.0 as f64 * b_first_eta_s + pairs_cost(pairs.1);
+        let min = cost(s_min, p_min, false);
+        let mut max = cost(sizing.0, pairs.1, true);
         if let Some(b) = budget_s {
             max = max.min(b);
         }
@@ -589,7 +798,7 @@ impl ProofEstimate {
             pairs_max_count: p_max.max(p_min),
             trials_min_count: trials_min,
             trials_max_count: trials_max,
-            trial_eta_s: a_eta_s,
+            trial_eta_s: t.a_s,
             eta_min_s: min.min(max),
             eta_max_s: max,
             budget_s,
@@ -628,11 +837,17 @@ impl ProofEstimate {
             None => String::new(),
         };
         let cut = match self.unbudgeted_trials_max_count {
+            // An estimate, said as one: the trials run as long as they really fit, and the
+            // proof may still decide (9.2 printed "too few pairs to decide" as a fact, then
+            // decided).
             Some(all) => {
-                let mut c = format!("; the budget fits {} of {all}", self.trials_max_count);
+                let mut c = format!(
+                    "; the budget is estimated to fit {} of {all}",
+                    self.trials_max_count
+                );
                 if (self.pairs_max_count as usize) < MIN_DECISIVE_PAIRS {
                     c += &format!(
-                        ", too few pairs to decide (at least {MIN_DECISIVE_PAIRS}): raise --max-duration"
+                        ", fewer than the {MIN_DECISIVE_PAIRS} pairs a verdict needs: raise --max-duration if the proof stops short"
                     );
                 }
                 c
@@ -721,6 +936,8 @@ struct Change {
     sized: Option<SizedPath>,
     /// Trials need a long warmup (tail-cut's blind start).
     long_warmup: bool,
+    /// The request rate the finding fitted as the service's limit ([`Feasible`]).
+    max_requests_per_s: Option<f64>,
     notes: Vec<String>,
 }
 
@@ -810,6 +1027,7 @@ fn remedy_change(run: &Run, f: &Finding) -> Result<Change> {
         fixed: Vec::new(),
         sized: None,
         long_warmup: false,
+        max_requests_per_s: None,
         notes: Vec::new(),
     };
     let limit = |start: u64, why: String| SizedPath {
@@ -838,6 +1056,7 @@ fn remedy_change(run: &Run, f: &Finding) -> Result<Change> {
         "rate_limit" => {
             c.fixed.push(("layers.retry.jitter".into(), "on".into()));
             let lat = mean_request_s(run);
+            c.max_requests_per_s = evidence(f, "fitted_requests_per_s").filter(|rps| *rps > 0.0);
             let (start, why) = match evidence(f, "fitted_requests_per_s") {
                 Some(rps) => (
                     ((rps * lat).floor() as u64).max(1),
@@ -956,15 +1175,21 @@ fn remedy_change(run: &Run, f: &Finding) -> Result<Change> {
         "repeated_reads" => {
             let obj_bytes = r.workload.dataset.object_size_bytes;
             let mut seen: std::collections::HashMap<&str, u64> = std::collections::HashMap::new();
+            // What the run read of those objects in all.
+            let mut read = 0u64;
             for o in run.ops.iter().filter(|o| {
                 o.t_us >= 0 && (o.verb.starts_with("read") || o.verb.contains("parquet"))
             }) {
                 let entry = seen.entry(o.key.as_str()).or_insert(0);
                 *entry = (*entry).max(o.bytes).max(obj_bytes);
+                read += o.bytes;
             }
             let mut set: u64 = seen.values().sum();
             if r.run.sampled && r.sampling.kept_ratio > 0.0 && r.sampling.kept_ratio < 1.0 {
-                let scaled = (set as f64 / r.sampling.kept_ratio.max(0.05)).round() as u64;
+                let kept = r.sampling.kept_ratio.max(0.05);
+                // The rows are a sample of the reads; every object may still be among them.
+                read = (read as f64 / kept).round() as u64;
+                let scaled = (set as f64 / kept).round() as u64;
                 let ds_cap = r
                     .workload
                     .dataset
@@ -977,7 +1202,21 @@ fn remedy_change(run: &Run, f: &Finding) -> Result<Change> {
                 };
             }
             let largest = seen.values().copied().max().unwrap_or(obj_bytes);
-            let cache = crate::operator::Cache::sized_for(set, largest);
+            // A whole-object cache that would fetch more than the run read, or hold an
+            // object above the ceiling, is advice against itself (K3-7): nothing is sized.
+            let cache = crate::operator::Cache::fit(seen.values().sum(), read)
+                .and_then(|()| crate::operator::Cache::sized_for(set, largest))
+                .map_err(|why| {
+                    OprobeError::new(
+                        ErrorCode::UsageInvalidArgument,
+                        format!(
+                            "finding `repeated_reads` has no cache to prove: a whole-object cache does not fit these reads ({why})"
+                        ),
+                    )
+                    .with_hint(
+                        "cache the ranges you re-read in the application; to test a cache anyway, pass --with layers.cache.memory=SIZE",
+                    )
+                })?;
             c.fixed
                 .push(("layers.cache.memory".into(), cache.memory.to_string()));
         }
@@ -1047,6 +1286,7 @@ fn choose_change(run: &Run, req: &ProveRequest) -> Result<Change> {
             fixed,
             sized: None,
             long_warmup,
+            max_requests_per_s: None,
             notes: Vec::new(),
         });
     }
@@ -1091,23 +1331,35 @@ struct Trials<'a> {
     safety: Safety,
     guard: Option<std::sync::Arc<crate::guard::Guard>>,
     cancel: Cancel,
-    deadline: Option<Instant>,
-    /// Wall time of one normal (or already-warmed tail-cut) trial.
-    per_trial: Duration,
+    /// The wall-time budget and the cool-downs between the trials.
+    pace: Pacing,
+    /// Wall time of one normal (or already-warmed tail-cut) trial of each arm ([`arm`]):
+    /// learned from the base run, then corrected by the first trial of that arm.
+    per_trial: [Expected; 2],
     /// Wall time of one cold tail-cut trial (`TAIL_CUT_WARMUP`).
-    per_cold_tail_cut: Duration,
+    per_cold_tail_cut: Expected,
     /// Short trial warmup used when no cold `TailCutLayer` needs 11.5 s priming.
     short_warmup: Duration,
     /// Warmed `TailCutLayer` for Baseline A trials (isolated from Candidate/Sizing).
     warmed_baseline_tc: Option<(OperatorSpec, opendal::layers::TailCutLayer, Instant)>,
     /// Warmed `TailCutLayer` for Candidate/Sizing trials matching the exact `OperatorSpec`.
     warmed_candidate_tc: Option<(OperatorSpec, opendal::layers::TailCutLayer, Instant)>,
-    max_throttle: f64,
-    max_error: f64,
+    /// What a trial must stay within to be feasible.
+    limits: Feasible,
     out: Vec<ProveTrial>,
     target_name: Option<String>,
     /// The budget breach that stopped the trials (the partial trial run is saved).
     breach: Option<anyhow::Error>,
+}
+
+/// The wall-time budget of a proof and the cool-downs between its trials (K3-3). A cool-down
+/// is part of the budget like a trial: it is reserved before the trial it precedes, also
+/// before the second half of a pair, and it is never waited past the end of the budget. (9.2
+/// reserved the cool-down a pair's first trial was expected to leave, then waited whatever it
+/// did leave: up to 5 s and a trial past `--max-duration`.)
+#[derive(Debug)]
+struct Pacing {
+    deadline: Option<tokio::time::Instant>,
     /// The cool-down owed before the next trial: the last one ended throttled
     /// ([`cool_down`]).
     cool: Duration,
@@ -1116,6 +1368,93 @@ struct Trials<'a> {
     cool_after: [Duration; 2],
     /// The cool-downs waited: how many, and how long in all.
     cooled: (u64, Duration),
+}
+
+impl Pacing {
+    fn new(budget: Option<Duration>) -> Self {
+        Self {
+            deadline: budget.map(|b| tokio::time::Instant::now() + b),
+            cool: Duration::ZERO,
+            cool_after: [Duration::ZERO; 2],
+            cooled: (0, Duration::ZERO),
+        }
+    }
+
+    /// `need` more wall time ends within the budget.
+    fn fits(&self, need: Duration) -> bool {
+        self.deadline
+            .is_none_or(|d| tokio::time::Instant::now() + need <= d)
+    }
+
+    /// The budget that is left (`None`: no budget).
+    fn left(&self) -> Option<Duration> {
+        self.deadline
+            .map(|d| d.saturating_duration_since(tokio::time::Instant::now()))
+    }
+
+    /// The cool-down owed and a trial of `trial` after it end within the budget.
+    fn fits_trial(&self, trial: Duration) -> bool {
+        self.fits(self.cool + trial)
+    }
+
+    /// A trial of `arm` ended and leaves `cool` to wait before the next trial.
+    fn after_trial(&mut self, arm: usize, cool: Duration) {
+        self.cool = cool;
+        self.cool_after[arm] = cool;
+    }
+
+    /// Wait out the cool-down owed; Ctrl-C interrupts it. `false` when the budget ends before
+    /// the cool-down would: nothing is waited, and no trial can follow.
+    async fn cool_off(&mut self, cancel: &Cancel) -> Result<bool> {
+        let wait = self.cool;
+        if wait.is_zero() {
+            return Ok(true);
+        }
+        if !self.fits(wait) {
+            return Ok(false);
+        }
+        self.cool = Duration::ZERO;
+        if !sleep_unless_cancelled(wait, cancel).await {
+            return Err(OprobeError::new(ErrorCode::RunInterrupted, "prove interrupted").into());
+        }
+        self.cooled.0 += 1;
+        self.cooled.1 += wait;
+        Ok(true)
+    }
+}
+
+/// What a trial must stay within for its value to be one the sizing may choose.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Feasible {
+    /// The throttled share of its requests ([`sizing_throttle_limit`]).
+    max_throttle: f64,
+    /// The share of its operations that fail (the run's allowed error ratio).
+    max_error: f64,
+    /// The request rate the finding fitted as the service's limit (`rate_limit`): a value
+    /// whose trial sends more is over the limit by the proof's own evidence, whether or not
+    /// its two seconds were throttled. A token bucket's burst hides the limit from a short
+    /// trial: on `lab://ratelimit` (fitted 270/s) a cap of 2 ran 311/s with no throttle
+    /// while sizing, was chosen, then throttled 2.7 % in every A/B trial: `worse`.
+    max_requests_per_s: Option<f64>,
+}
+
+impl Feasible {
+    /// A trial of the changed operator that counted `ops` operations, `throttled_ratio` of
+    /// its requests throttled, `error_ratio` of its operations failed, at `requests_per_s`.
+    fn admits(
+        &self,
+        ops: u64,
+        throttled_ratio: f64,
+        error_ratio: f64,
+        requests_per_s: f64,
+    ) -> bool {
+        ops > 0
+            && throttled_ratio <= self.max_throttle
+            && error_ratio <= self.max_error
+            && self
+                .max_requests_per_s
+                .is_none_or(|max| requests_per_s <= max)
+    }
 }
 
 /// How long to wait after a trial before the next one starts. A trial that ended throttled
@@ -1143,9 +1482,27 @@ async fn sleep_unless_cancelled(wait: Duration, cancel: &Cancel) -> bool {
     }
 }
 
-/// The arm of a trial in [`Trials::cool_after`]: the baseline, or the changed operator.
+/// The arm of a trial (in [`Pacing::cool_after`], [`Trials::per_trial`]): the baseline, or the
+/// changed operator.
 fn arm(kind: TrialKind) -> usize {
     usize::from(kind != TrialKind::Baseline)
+}
+
+/// The spread of a trial's p99 ([`p99_spread`]) from its latency histogram: every operation
+/// of the window, never sampled, in bins 12 % wide — the cheapest source that is exact in the
+/// ranks. The latencies at the two ranks of [`p99_rank_band`] are read as the upper edges of
+/// their bins, so a band inside one bin has no spread.
+fn p99_spread_of(h: &crate::trace::LatencyHistogram) -> f64 {
+    let n = h.total();
+    let Some((lo, hi)) = p99_rank_band(n) else {
+        return 0.0;
+    };
+    // The middle of a rank's step, so rounding cannot move the quantile to the next rank.
+    let at = |rank: u64| h.quantile_ms((rank as f64 - 0.5) / n as f64);
+    match (at(lo), at(hi)) {
+        (Some(lo), Some(hi)) => p99_spread(lo, hi),
+        _ => 0.0,
+    }
 }
 
 impl Trials<'_> {
@@ -1155,8 +1512,9 @@ impl Trials<'_> {
         if kind != TrialKind::Baseline {
             let _ = op.apply_edits(sets);
         }
+        let per_trial = self.per_trial[arm(kind)].get();
         let Some(tc) = &op.layers.tail_cut else {
-            return self.per_trial;
+            return per_trial;
         };
         let window = tc.window.get();
         let slot = if kind == TrialKind::Baseline {
@@ -1169,21 +1527,21 @@ impl Trials<'_> {
                 .as_ref()
                 .is_some_and(|(prev, _, used_at)| *prev == op && used_at.elapsed() < window / 2);
         if warm {
-            self.per_trial
+            per_trial
         } else {
-            self.per_cold_tail_cut
+            self.per_cold_tail_cut.get()
         }
     }
 
     fn has_time_for(&self, need: Duration) -> bool {
-        self.breach.is_none()
-            && !self.cancel.is_cancelled()
-            && self.deadline.is_none_or(|d| Instant::now() + need <= d)
+        self.breach.is_none() && !self.cancel.is_cancelled() && self.pace.fits(need)
     }
 
     /// There is time for the cool-down owed and a trial of `(sets, kind)` after it.
     fn time_left_for_sets(&self, sets: &[(String, String)], kind: TrialKind) -> bool {
-        self.has_time_for(self.cool + self.expected_duration(sets, kind))
+        self.breach.is_none()
+            && !self.cancel.is_cancelled()
+            && self.pace.fits_trial(self.expected_duration(sets, kind))
     }
 
     /// Expected wall duration of an A/B pair run in `order` with the candidate's `sets`: the
@@ -1198,26 +1556,13 @@ impl Trials<'_> {
             };
             self.expected_duration(sets, kind)
         };
-        self.cool + trial(order[0]) + self.cool_after[arm(order[0])] + trial(order[1])
+        self.pace.cool + trial(order[0]) + self.pace.cool_after[arm(order[0])] + trial(order[1])
     }
 
-    /// Wait out the cool-down the last trial left ([`cool_down`]); Ctrl-C interrupts it.
-    async fn cool_off(&mut self) -> Result<()> {
-        let wait = std::mem::take(&mut self.cool);
-        if wait.is_zero() {
-            return Ok(());
-        }
-        if !sleep_unless_cancelled(wait, &self.cancel).await {
-            return Err(OprobeError::new(ErrorCode::RunInterrupted, "prove interrupted").into());
-        }
-        self.cooled.0 += 1;
-        self.cooled.1 += wait;
-        Ok(())
-    }
-
-    /// [`Self::trial`], with a budget breach recorded instead of returned: `None` once a
-    /// budget has stopped the trials (no more run). User cancellation (`RunInterrupted`)
-    /// aborts immediately as an error (exit 130).
+    /// [`Self::trial`] after the cool-down owed, with a budget breach recorded instead of
+    /// returned: `None` once a budget has stopped the trials (no more run), or when the
+    /// cool-down does not fit in what is left of the wall-time budget. User cancellation
+    /// (`RunInterrupted`) aborts immediately as an error (exit 130).
     async fn try_trial(
         &mut self,
         sets: &[(String, String)],
@@ -1228,7 +1573,7 @@ impl Trials<'_> {
         if self.cancel.is_cancelled() && self.breach.is_none() {
             return Err(OprobeError::new(ErrorCode::RunInterrupted, "prove interrupted").into());
         }
-        if self.breach.is_some() {
+        if self.breach.is_some() || !self.pace.cool_off(&self.cancel).await? {
             return Ok(None);
         }
         match self.trial(sets, kind, pair, value).await {
@@ -1254,7 +1599,6 @@ impl Trials<'_> {
         if self.cancel.is_cancelled() {
             return Err(OprobeError::new(ErrorCode::RunInterrupted, "prove interrupted").into());
         }
-        self.cool_off().await?;
         let mut p = self.base.clone();
         if kind != TrialKind::Baseline {
             p.operator.apply_edits(sets)?;
@@ -1314,18 +1658,17 @@ impl Trials<'_> {
             },
         )
         .await?;
-        if m.cancelled && m.breach.is_none() {
+        // A budget breach came back as the error above ([`super::measure::measure`]).
+        if m.cancelled {
             return Err(OprobeError::new(ErrorCode::RunInterrupted, "prove interrupted").into());
         }
         let elapsed = started.elapsed();
         if cold_tail_cut {
-            self.per_cold_tail_cut = self.per_cold_tail_cut.max(elapsed);
+            self.per_cold_tail_cut.observe(elapsed);
         } else {
-            self.per_trial = self.per_trial.max(elapsed);
+            self.per_trial[arm(kind)].observe(elapsed);
         }
-        if !m.cancelled
-            && m.breach.is_none()
-            && m.run.report.summary.ops > 0
+        if m.run.report.summary.ops > 0
             && let Some((spec_key, layer)) = shared_tail_cut
         {
             let entry = Some((spec_key, layer, Instant::now()));
@@ -1342,8 +1685,10 @@ impl Trials<'_> {
         let thr = r.resilience.throttled_responses;
         let throttled_request_ratio = thr as f64 / requests.max(1) as f64;
         let error_ratio = failed as f64 / ops.max(1) as f64;
-        self.cool = cool_down(thr, r.resilience.max_retry_after_ms, self.short_warmup);
-        self.cool_after[arm(kind)] = self.cool;
+        self.pace.after_trial(
+            arm(kind),
+            cool_down(thr, r.resilience.max_retry_after_ms, self.short_warmup),
+        );
         let t = ProveTrial {
             kind,
             pair,
@@ -1356,9 +1701,13 @@ impl Trials<'_> {
             throttled_count: thr,
             throttled_request_ratio,
             error_ratio,
-            feasible: ops > 0
-                && throttled_request_ratio <= self.max_throttle
-                && error_ratio <= self.max_error,
+            feasible: self.limits.admits(
+                ops,
+                throttled_request_ratio,
+                error_ratio,
+                requests as f64 / r.run.window_s.max(1e-3),
+            ),
+            p99_spread_ratio: p99_spread_of(&r.latency_histogram),
         };
         self.ctx
             .out
@@ -1643,14 +1992,30 @@ pub fn ab_pairs(objective: ProveObjective, trials: &[ProveTrial]) -> Vec<AbPair>
     by.into_values()
         .filter_map(|(a, b, candidate_first)| {
             let (a, b) = (a?, b?);
-            Some(AbPair {
-                baseline: objective.value(a),
-                candidate: objective.value(b),
-                ops_count: a.ops_count.min(b.ops_count),
-                candidate_first,
-            })
+            Some(ab_pair(objective, a, b, candidate_first))
         })
+        // A pair that could not be compared was not judged ([`AbPair::comparable`]).
+        .filter(AbPair::comparable)
         .collect()
+}
+
+/// The A/B pair of a baseline trial `a` and a candidate trial `b` on `objective`.
+fn ab_pair(
+    objective: ProveObjective,
+    a: &ProveTrial,
+    b: &ProveTrial,
+    candidate_first: bool,
+) -> AbPair {
+    AbPair {
+        baseline: objective.value(a),
+        candidate: objective.value(b),
+        ops_count: a.ops_count.min(b.ops_count),
+        resolution: match objective {
+            ProveObjective::Goodput => 0.0,
+            ProveObjective::P99 => a.p99_spread_ratio.hypot(b.p99_spread_ratio),
+        },
+        candidate_first,
+    }
 }
 
 /// The `kind` trials of the first `pairs` completed A/B pairs: a trailing trial whose other
@@ -1660,6 +2025,31 @@ fn paired(trials: &[ProveTrial], kind: TrialKind, pairs: u64) -> Vec<&ProveTrial
         .iter()
         .filter(|x| x.kind == kind && x.pair.is_some_and(|p| p < pairs))
         .collect()
+}
+
+/// Whether a share of the changed operator's (`kb` events in `nb`) is the change's own doing:
+/// over `limit`, more than the current operator's (`ka` in `na`) by more than `limit` allows,
+/// and beyond chance (a one-sided two-proportion test, z > 2). `(current, changed)` shares
+/// when so. What both operators suffer alike — service errors that follow no load
+/// (`lab://noisy`) — passes. The one test of [`throttle_gate`] and [`error_gate`].
+fn share_gate((ka, na): (f64, f64), (kb, nb): (f64, f64), limit: f64) -> Option<(f64, f64)> {
+    if nb == 0.0 {
+        return None;
+    }
+    let b = kb / nb;
+    let a = if na > 0.0 { ka / na } else { 0.0 };
+    let z = if na > 0.0 {
+        let p = (ka + kb) / (na + nb);
+        let se = (p * (1.0 - p) * (1.0 / na + 1.0 / nb)).sqrt();
+        if se > 0.0 {
+            (b - a) / se
+        } else {
+            f64::INFINITY
+        }
+    } else {
+        f64::INFINITY
+    };
+    (b > limit && b - a > limit && z > 2.0).then_some((a, b))
 }
 
 /// A candidate that throttles beyond `--max-throttle`, and more than the current operator,
@@ -1676,32 +2066,11 @@ fn throttle_gate(
     let counts = |ts: &[&ProveTrial]| {
         let requests: u64 = ts.iter().map(|t| t.requests_count).sum();
         let throttled: u64 = ts.iter().map(|t| t.throttled_count).sum();
-        (requests as f64, throttled as f64)
+        (throttled as f64, requests as f64)
     };
-    let (nb, tb) = counts(b_trials);
-    if nb == 0.0 {
+    let Some((a, b)) = share_gate(counts(a_trials), counts(b_trials), max_throttle) else {
         return (verdict, None);
-    }
-    let (na, ta) = counts(a_trials);
-    let b = tb / nb;
-    let a = if na > 0.0 { ta / na } else { 0.0 };
-    // The change is what throttles: over the limit, more than the current operator by more
-    // than the limit allows, and beyond chance (a one-sided two-proportion test, z > 2).
-    // Service errors that follow no load (`lab://noisy`) throttle both alike and pass.
-    let z = if na > 0.0 {
-        let p = (ta + tb) / (na + nb);
-        let se = (p * (1.0 - p) * (1.0 / na + 1.0 / nb)).sqrt();
-        if se > 0.0 {
-            (b - a) / se
-        } else {
-            f64::INFINITY
-        }
-    } else {
-        f64::INFINITY
     };
-    if b <= max_throttle || b - a <= max_throttle || z <= 2.0 {
-        return (verdict, None);
-    }
     let note = format!(
         "the changed operator throttled {:.2} % of its requests (the current one {:.2} %), over --max-throttle {:.2} %: the verdict is inconclusive",
         b * 100.0,
@@ -1709,6 +2078,55 @@ fn throttle_gate(
         max_throttle * 100.0
     );
     (ProveVerdict::Inconclusive, Some(note))
+}
+
+/// The same gate on failures (K3-1): a candidate whose operations fail (for reasons other than
+/// throttling) beyond the error ratio the run allows, and more than the current operator's,
+/// proves nothing on any objective. Operations that fail fast lower a p99 — 9.2 called
+/// `layers.timeout.io=200ms` "improved" on p99 for cutting the slow operations off — and what
+/// a goodput keeps is not the workload the run measured.
+fn error_gate(
+    verdict: ProveVerdict,
+    a_trials: &[&ProveTrial],
+    b_trials: &[&ProveTrial],
+    max_error: f64,
+) -> (ProveVerdict, Option<String>) {
+    let counts = |ts: &[&ProveTrial]| {
+        let ops: u64 = ts.iter().map(|t| t.ops_count).sum();
+        let failed: f64 = ts
+            .iter()
+            .map(|t| (t.error_ratio * t.ops_count as f64).round())
+            .sum();
+        (failed, ops as f64)
+    };
+    let Some((a, b)) = share_gate(counts(a_trials), counts(b_trials), max_error) else {
+        return (verdict, None);
+    };
+    let note = format!(
+        "the changed operator failed {:.2} % of its operations (the current one {:.2} %), over the {:.2} % of errors the run allows: the verdict is inconclusive",
+        b * 100.0,
+        a * 100.0,
+        max_error * 100.0
+    );
+    (ProveVerdict::Inconclusive, Some(note))
+}
+
+/// The note of a p99 proof whose trials' p99 sits on a cliff (K3-9): the latencies around it
+/// differ by more than [`P99_CLIFF_RATIO`] within one trial, so which side a trial's p99 lands
+/// on is chance and the noise floor is wide. `None` when no trial's does.
+fn cliff_note(trials: &[&ProveTrial]) -> Option<String> {
+    let on: Vec<f64> = trials
+        .iter()
+        .map(|t| t.p99_spread_ratio)
+        .filter(|s| p99_on_a_cliff(*s))
+        .collect();
+    let widest = on.iter().copied().reduce(f64::max)?;
+    Some(format!(
+        "p99 sits on a cliff: lengthen the trial (--trial). In {} of {} trials the latencies around the p99 differ by more than {P99_CLIFF_RATIO:.0}× (up to {:.1}×), so the p99 of a trial is one side or the other by chance",
+        on.len(),
+        trials.len(),
+        (4.0 * widest).exp()
+    ))
 }
 
 /// The throttled share a sizing trial may reach. A remedy for throttling must bring it under
@@ -1763,28 +2181,39 @@ pub struct Converged {
     pub noise_floor_ratio: f64,
 }
 
-/// The secondary metrics of the A/B trials.
-fn secondary(
-    obj: ProveObjective,
-    a: &[&ProveTrial],
-    b: &[&ProveTrial],
-    floor: f64,
-) -> Vec<SecondaryMetric> {
+/// The secondary metrics of the A/B trials. Each interval is on the metric's own spread
+/// (K3-5): its own trial-to-trial noise floor ([`noise_floor_ab`]) over its own resolution
+/// (a count's, or a p99's order-statistic spread). 9.2 gave every metric the objective's
+/// floor: a goodput steady at 300/s printed "[−17 %, +20 %]" beside a noisy p99.
+fn secondary(obj: ProveObjective, a: &[&ProveTrial], b: &[&ProveTrial]) -> Vec<SecondaryMetric> {
     let mut v = Vec::new();
-    let positive = |metric: &str, f: fn(&ProveTrial) -> f64| SecondaryMetric {
-        metric: metric.to_owned(),
-        baseline: mean(a, f),
-        candidate: mean(b, f),
-        change: log_ratio(
-            &a.iter().map(|t| f(t)).collect::<Vec<_>>(),
-            &b.iter().map(|t| f(t)).collect::<Vec<_>>(),
-            true,
-            floor,
-        ),
+    let positive = |metric: &str, f: fn(&ProveTrial) -> f64, resolution: f64| {
+        let values = |ts: &[&ProveTrial]| ts.iter().map(|t| f(t)).collect::<Vec<_>>();
+        let (va, vb) = (values(a), values(b));
+        SecondaryMetric {
+            metric: metric.to_owned(),
+            baseline: mean(a, f),
+            candidate: mean(b, f),
+            change: log_ratio(&va, &vb, true, noise_floor_ab(&va, &vb, resolution)),
+        }
     };
     match obj {
-        ProveObjective::Goodput => v.push(positive("p99_ms", |t| t.p99_ms)),
-        ProveObjective::P99 => v.push(positive("goodput_ops_per_s", |t| t.goodput_ops_per_s)),
+        ProveObjective::Goodput => {
+            let sq = |t: &ProveTrial| t.p99_spread_ratio.powi(2);
+            v.push(positive(
+                "p99_ms",
+                |t| t.p99_ms,
+                (mean(a, sq) + mean(b, sq)).sqrt(),
+            ));
+        }
+        ProveObjective::P99 => {
+            let fewest = a.iter().chain(b).map(|t| t.ops_count).min();
+            v.push(positive(
+                "goodput_ops_per_s",
+                |t| t.goodput_ops_per_s,
+                fewest.map_or(0.0, count_resolution),
+            ));
+        }
     }
     let sum =
         |ts: &[&ProveTrial], f: fn(&ProveTrial) -> u64| ts.iter().map(|t| f(t)).sum::<u64>() as f64;
@@ -1888,7 +2317,6 @@ fn trace_hint(r: &crate::model::Report) -> String {
     }
 }
 
-/// `oprobe prove`.
 /// A run that cannot be judged on performance (invalid, or partial and too short: its
 /// `invalid_run` finding) is no baseline: its findings are leads, not remedies to size.
 fn refuse_unjudged(run: &Run) -> Result<()> {
@@ -1912,15 +2340,75 @@ fn refuse_unjudged(run: &Run) -> Result<()> {
                 .trim_end_matches('.')
         ),
     )
+    // The run's whole command (K1-2): the operator reference alone drops its `--set` values,
+    // and a run against a local endpoint would be repeated against the real service.
     .with_hint(format!(
-        "profile the operator again until the run completes: oprobe run {}",
-        crate::model::spec::shell_quote(&r.spec.operator_ref)
+        "profile the operator again until the run completes: {}",
+        profile_command(&r.spec, &[])
     ))
     .into())
 }
 
+/// The secret options of `spec` that were given by value: oprobe stores no secret, and where
+/// the operator came from (a configured operator, an operator file) does not give them back.
+fn unstored_secrets(ctx: &Ctx, spec: &crate::model::RunSpec) -> Vec<String> {
+    let redacted = |v: &String| v == crate::model::spec::REDACTED;
+    let Ok(replayed) = super::profile::spec_profile(ctx, spec.clone()) else {
+        return Vec::new();
+    };
+    spec.profile
+        .operator
+        .options
+        .iter()
+        .filter(|(k, v)| redacted(v) && !replayed.operator.options.contains_key(*k))
+        .map(|(k, _)| format!("options.{k}"))
+        .collect()
+}
+
+/// A prove that fails for want of credentials, of a run whose secrets were given by value
+/// (`unstored`, [`unstored_secrets`]): the error says they were not stored, and how to give
+/// them again. Any other error is returned as it is.
+fn explain_unstored_secrets(e: anyhow::Error, scheme: &str, unstored: &[String]) -> anyhow::Error {
+    if unstored.is_empty() {
+        return e;
+    }
+    let body = crate::errors::classify(&e, scheme);
+    if !matches!(
+        body.code,
+        ErrorCode::AuthNoCredentials | ErrorCode::AuthDenied
+    ) {
+        return e;
+    }
+    OprobeError::new(
+        body.code,
+        format!(
+            "{}: the run was given {} by value, and oprobe stores no secret value",
+            body.message,
+            unstored.join(", ")
+        ),
+    )
+    .with_hint(
+        "provide the credentials through the environment or a configured operator, then prove again",
+    )
+    .into()
+}
+
+/// `oprobe prove`.
 pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<ProveOutcome> {
     let run = ctx.store().load(&req.run)?;
+    let unstored = unstored_secrets(ctx, &run.report.spec);
+    let scheme = run.report.spec.profile.operator.scheme();
+    prove_run(ctx, &run, req, cancel)
+        .await
+        .map_err(|e| explain_unstored_secrets(e, &scheme, &unstored))
+}
+
+async fn prove_run(
+    ctx: &Ctx,
+    run: &Run,
+    req: ProveRequest,
+    cancel: Cancel,
+) -> Result<ProveOutcome> {
     if run.report.is_trace() {
         return Err(OprobeError::new(
             ErrorCode::UsageInvalidArgument,
@@ -1940,13 +2428,29 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
         .with_hint("prove a run you made: oprobe show --list")
         .into());
     }
-    refuse_unjudged(&run)?;
+    refuse_unjudged(run)?;
+    // The boundary is calibrated for 3 to 12 pairs: a plan outside it is refused, not
+    // silently replaced by another (9.2 ran `--pairs 40` as 12).
+    if !(MIN_DECISIVE_PAIRS..=MAX_PAIRS).contains(&req.pairs) {
+        return Err(OprobeError::new(
+            ErrorCode::UsageInvalidArgument,
+            format!(
+                "--pairs {} is out of range: a proof plans {MIN_DECISIVE_PAIRS} to {MAX_PAIRS} pairs",
+                req.pairs
+            ),
+        )
+        .with_hint(format!(
+            "pass --pairs {MIN_DECISIVE_PAIRS} to {MAX_PAIRS} (at least {MIN_DECISIVE_PAIRS} are needed to decide; the sequential test is calibrated up to {MAX_PAIRS})"
+        ))
+        .into());
+    }
+    let max_pairs = req.pairs;
     let defaults = crate::config::defaults().prove;
     let max_throttle = req
         .max_throttle_ratio
         .or(run.report.spec.profile.sla.max_throttle_rate)
         .unwrap_or(defaults.max_throttle_ratio);
-    let change = choose_change(&run, &req)?;
+    let change = choose_change(run, &req)?;
     // A `--save` that cannot be written fails now, not after the trials.
     if let Some(dest) = &req.save {
         ctx.app().check_save(
@@ -1976,12 +2480,13 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
     let probe_sets = sets_at(
         &change,
         change.sized.as_ref().map(|s| s.domain.clamp(s.start)),
-        &run,
+        run,
     );
     let mut changed = base.operator.clone();
     changed.apply_edits(&probe_sets)?;
     let budget = proof_budget(&req)?;
-    let estimate = {
+    let short_warmup = baseline_warmup(&base, &change);
+    let (estimate, times) = {
         let rails = super::run::rails(ctx, &base, &req.safety)?;
         let mut plan = rails.plan(&base);
         // The trials' warmup is prove's choice (tail-cut's blind start), not the user's (U6).
@@ -1992,11 +2497,20 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
             Some(s) if s.unmeasured.is_none() => (defaults.max_sizing_trials as u64, 2),
             _ => (0, 0),
         };
-        let max_pairs = req.pairs.clamp(MIN_DECISIVE_PAIRS, MAX_PAIRS) as u64;
+        let max_pairs = max_pairs as u64;
         let min_pairs = (defaults.min_pairs.max(MIN_DECISIVE_PAIRS) as u64).min(max_pairs);
+        // What a trial takes around its warm-up and window is learned from the base run
+        // (K3-2); the plan's own model of the dataset and the cleanup stands in when the run
+        // does not say.
+        let timing = BaseTiming::of(run, short_warmup);
+        let model_overhead_s = plan.eta_s - plan.warmup_s - plan.duration_s + TRIAL_OVERHEAD_S;
+        let trial_s = |warmup: Duration| {
+            timing.trial_s(warmup.as_secs_f64(), plan.duration_s, model_overhead_s)
+        };
         // A candidate that needs a long warmup takes longer on its first trial, then reuses
         // its warmed TailCutLayer across the remaining pairs.
-        let a_eta = plan.eta_s - plan.warmup_s + baseline_warmup(&base, &change).as_secs_f64();
+        let a_s = trial_s(short_warmup);
+        let b_first_s = trial_s(warmup);
         let tc_reusable = change.long_warmup
             && changed
                 .layers
@@ -2005,18 +2519,21 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
                 .map(|t| t.window.get())
                 .unwrap_or(Duration::from_secs(60))
                 >= Duration::from_secs(20);
-        let b_warm_eta = if tc_reusable { a_eta } else { plan.eta_s };
+        let times = TrialTimes {
+            a_s,
+            b_first_s,
+            b_warm_s: if tc_reusable { a_s } else { b_first_s },
+            cool_s: timing.cool_s,
+        };
         let estimate = ProofEstimate::new(
-            prove_command(&req, &run),
+            prove_command(&req, run),
             probe_sets
                 .iter()
                 .map(|(k, v)| crate::operator::redacted_edit(k, v))
                 .collect(),
             sizing,
             (min_pairs, max_pairs),
-            a_eta + TRIAL_OVERHEAD_S,
-            plan.eta_s + TRIAL_OVERHEAD_S,
-            b_warm_eta + TRIAL_OVERHEAD_S,
+            times,
             budget,
         );
         if req.safety.dry_run {
@@ -2025,7 +2542,7 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
                 proof: Some(estimate),
             })));
         }
-        estimate
+        (estimate, times)
     };
     let prove_id = RunId::new().to_string();
     let mut safety = req.safety.clone();
@@ -2036,7 +2553,6 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
         crate::operator::resolve::resolve(&run.report.spec.operator_ref, &*ctx.config()?)
             .ok()
             .and_then(|(_, s)| s.name());
-    let short_warmup = baseline_warmup(&base, &change);
     // Until the prove result is saved, its trial runs belong to nothing: an interruption, an
     // error or a dropped future deletes them, or no `show --rm` could ever reach them.
     let mut orphans = OrphanTrials {
@@ -2046,26 +2562,32 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
     };
     let mut t = Trials {
         ctx,
-        run: &run,
+        run,
         base: base.clone(),
         prove_id: prove_id.clone(),
         safety,
         guard,
         cancel: cancel.clone(),
-        deadline: budget.map(|b| Instant::now() + b),
-        per_trial: trial_window + short_warmup,
-        per_cold_tail_cut: trial_window + short_warmup.max(TAIL_CUT_WARMUP),
+        pace: Pacing::new(budget),
+        // The changed operator's trials are expected to take what a warmed one does; a cold
+        // TailCutLayer's (its long warm-up) have their own expectation.
+        per_trial: [Expected::new(times.a_s), Expected::new(times.b_warm_s)],
+        per_cold_tail_cut: Expected::new(
+            times
+                .b_first_s
+                .max(times.a_s - short_warmup.as_secs_f64() + TAIL_CUT_WARMUP.as_secs_f64()),
+        ),
         short_warmup,
         warmed_baseline_tc: None,
         warmed_candidate_tc: None,
-        max_throttle: sizing_throttle_limit(&run, change.finding.as_deref(), max_throttle),
-        max_error: run.report.sla.max_error_ratio,
+        limits: Feasible {
+            max_throttle: sizing_throttle_limit(run, change.finding.as_deref(), max_throttle),
+            max_error: run.report.sla.max_error_ratio,
+            max_requests_per_s: change.max_requests_per_s,
+        },
         out: Vec::new(),
         target_name,
         breach: None,
-        cool: Duration::ZERO,
-        cool_after: [Duration::ZERO; 2],
-        cooled: (0, Duration::ZERO),
     };
     let obj = req.objective;
     ctx.out.info(format!(
@@ -2090,10 +2612,16 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
             }
         };
         if !feasible {
-            notes.push(format!(
-                "no value met --max-throttle {:.2} %: the least throttled one is tested",
-                max_throttle * 100.0
-            ));
+            notes.push(match change.max_requests_per_s {
+                Some(rps) => format!(
+                    "no value met --max-throttle {:.2} % under the fitted rate limit ({rps:.0} requests/s): the least throttled one is tested",
+                    max_throttle * 100.0
+                ),
+                None => format!(
+                    "no value met --max-throttle {:.2} %: the least throttled one is tested",
+                    max_throttle * 100.0
+                ),
+            });
         }
         value = Some(v);
         sizing = Some(Sizing {
@@ -2108,9 +2636,8 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
             unmeasured,
         });
     }
-    let sets = sets_at(&change, value, &run);
+    let sets = sets_at(&change, value, run);
     // Step 3: interleaved A/B with the sequential test.
-    let max_pairs = req.pairs.clamp(MIN_DECISIVE_PAIRS, MAX_PAIRS);
     let min_pairs = defaults.min_pairs.max(MIN_DECISIVE_PAIRS);
     let mut test = AbTest::new(obj.higher_is_better(), min_pairs, max_pairs);
     let mut decision = AbDecision::Continue;
@@ -2123,6 +2650,9 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
         method += "; the changed operator's TailCutLayer keeps its warmed state from one of its trials to the next, as a long-lived operator's does";
     }
     notes.push(method);
+    // A pair that ran but cannot be compared (a trial without the objective): why. It ends
+    // the proof, and is judged by nothing but the gates.
+    let mut unjudged: Option<String> = None;
     while decision == AbDecision::Continue {
         // Balanced in blocks of one AB and one BA (W11, 9.2): a drift or a carryover that
         // favours whichever trial runs first or second falls on both arms alike, and the
@@ -2133,15 +2663,23 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
         } else {
             [TrialKind::Baseline, TrialKind::Candidate]
         };
-        if !t.has_time_for(t.expected_pair(order, &sets)) {
+        let expected_pair = t.expected_pair(order, &sets);
+        if !t.has_time_for(expected_pair) {
             break;
         }
+        let pair_started = Instant::now();
         let (mut a, mut b) = (None, None);
         for (i, kind) in order.into_iter().enumerate() {
-            // The pair's time was reserved for both halves before the first started; run the
-            // second to complete the pair unless the first ran past the deadline, breached a
-            // guard, or was cancelled.
-            if i == 1 && !t.has_time_for(Duration::ZERO) {
+            // The pair's time was reserved for both halves before the first started, with the
+            // cool-down the first was expected to leave. What it did leave is reserved again
+            // now, with the second half after it (K3-3): a pair whose second half would end
+            // past the budget is left incomplete, and its first trial out of every metric.
+            let second_sets: &[(String, String)] = if kind == TrialKind::Baseline {
+                &[]
+            } else {
+                &sets
+            };
+            if i == 1 && !t.time_left_for_sets(second_sets, kind) {
                 break;
             }
             let trial = if kind == TrialKind::Baseline {
@@ -2166,14 +2704,39 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
         let (Some(a), Some(b)) = (a, b) else {
             break;
         };
-        decision = test.push(AbPair {
-            baseline: obj.value(&a),
-            candidate: obj.value(&b),
-            ops_count: a.ops_count.min(b.ops_count),
-            candidate_first: first,
-        });
+        let pair = ab_pair(obj, &a, &b, first);
+        if !pair.comparable() {
+            // Never clamped into a ratio (K3-1: a candidate with no latency at all was
+            // "improved by 100 %" on p99).
+            let (who, value) = if obj.value(&b).is_finite() && obj.value(&b) > 0.0 {
+                ("current", obj.value(&a))
+            } else {
+                ("changed", obj.value(&b))
+            };
+            unjudged = Some(format!(
+                "pair {} was not judged: the {who} operator's trial has no {} to compare (it measured {value}); the proof stops at the pairs before it",
+                test.pairs() + 1,
+                obj.label()
+            ));
+            break;
+        }
+        decision = test.push(pair);
+        // The first pair corrects the upfront ETA when it was off (K3-2).
+        if test.pairs() == 1
+            && decision == AbDecision::Continue
+            && let Some(line) = corrected_eta(
+                expected_pair.as_secs_f64(),
+                pair_started.elapsed().as_secs_f64(),
+                (max_pairs - 1) as u64,
+                t.pace.left().map(|d| d.as_secs_f64()),
+            )
+        {
+            ctx.out.info(dim(&line));
+        }
     }
     let pairs = test.pairs() as u64;
+    // Complete pairs that ran, judged or not: what the gates read.
+    let ran = pairs + u64::from(unjudged.is_some());
     // Ctrl-C between two trials stops the loop like one during a trial: the prove is
     // interrupted (exit 130, its trials deleted), not a result of the pairs that happened to run.
     if cancel.is_cancelled() && t.breach.is_none() {
@@ -2193,21 +2756,22 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
     }
     // Trials ran but a budget stopped the prove early: the result reads what was measured,
     // and is saved, so its trials stay attached (`show --rm PROVE` removes them).
-    let budget_exceeded = t.breach.is_some() || pairs == 0;
+    let budget_exceeded = t.breach.is_some() || ran == 0;
     if let Some(e) = &t.breach {
         notes.push(format!(
             "a budget stopped the prove after {pairs} pair{} of trials ({e:#}): the verdict reads what was measured",
             if pairs == 1 { "" } else { "s" }
         ));
-    } else if pairs == 0 {
+    } else if ran == 0 {
         notes.push("the budget ran out before one pair of trials could run".to_owned());
     }
-    if t.cooled.0 > 0 {
+    let cooled = t.pace.cooled;
+    if cooled.0 > 0 {
         notes.push(format!(
             "{} trial{} ended throttled: the prove cooled down before the next one ({} in all), so no trial started against a limit the one before it had drained",
-            t.cooled.0,
-            if t.cooled.0 == 1 { "" } else { "s" },
-            crate::util::fmt_ms(t.cooled.1.as_secs_f64() * 1000.0)
+            cooled.0,
+            if cooled.0 == 1 { "" } else { "s" },
+            crate::util::fmt_ms(cooled.1.as_secs_f64() * 1000.0)
         ));
     }
     // Step 4: decide. The verdict is the test's own: whether the interval of the look the
@@ -2219,21 +2783,49 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
         AbVerdict::Worse => ProveVerdict::Worse,
         AbVerdict::Inconclusive => ProveVerdict::Inconclusive,
     };
-    if (pairs as usize) < MIN_DECISIVE_PAIRS {
+    let few = (pairs as usize) < MIN_DECISIVE_PAIRS;
+    if let Some(why) = unjudged {
+        notes.push(why);
+        if few {
+            notes.push(format!(
+                "only {pairs} pair{} of trials could be judged: at least {MIN_DECISIVE_PAIRS} are needed to decide",
+                if pairs == 1 { "" } else { "s" }
+            ));
+        }
+    } else if few {
         notes.push(format!(
             "the budget allowed only {pairs} pair{} of trials: at least {MIN_DECISIVE_PAIRS} are needed to decide",
             if pairs == 1 { "" } else { "s" }
         ));
-    } else if verdict == ProveVerdict::Inconclusive && decision != AbDecision::Futile {
+    } else if decision == AbDecision::Futile {
+        // A futility stop says what it gave up on (K3-4).
+        notes.push(format!(
+            "the proof stopped after {pairs} of at most {max_pairs} pairs: at the noise it measured (±{:.1} % a pair), {max_pairs} pairs could not show a change smaller than about {:.0} %, and the pairs so far rule out one that large",
+            floor * 100.0,
+            test.resolvable_change().unwrap_or_default() * 100.0
+        ));
+    } else if verdict == ProveVerdict::Inconclusive {
         notes.push(format!(
             "the sequential test did not decide within {pairs} pairs: the interval still includes no change"
         ));
     }
     let a_trials = paired(&t.out, TrialKind::Baseline, pairs);
     let b_trials = paired(&t.out, TrialKind::Candidate, pairs);
-    let (verdict, throttle_note) = throttle_gate(verdict, &a_trials, &b_trials, max_throttle);
+    if obj == ProveObjective::P99 {
+        let judged: Vec<&ProveTrial> = a_trials.iter().chain(&b_trials).copied().collect();
+        notes.extend(cliff_note(&judged));
+    }
+    // The gates read every complete pair that ran, the unjudged one too: it is the changed
+    // operator failing every operation that leaves a pair with nothing to compare.
+    let (a_ran, b_ran) = (
+        paired(&t.out, TrialKind::Baseline, ran),
+        paired(&t.out, TrialKind::Candidate, ran),
+    );
+    let (verdict, throttle_note) = throttle_gate(verdict, &a_ran, &b_ran, max_throttle);
     notes.extend(throttle_note);
-    let secondary = secondary(obj, &a_trials, &b_trials, floor);
+    let (verdict, error_note) = error_gate(verdict, &a_ran, &b_ran, t.limits.max_error);
+    notes.extend(error_note);
+    let secondary = secondary(obj, &a_trials, &b_trials);
     let base_spec: &OperatorSpec = &run.report.spec.profile.operator;
     // What the result shows and stores: the operator as its file gives it (a relative
     // `http.ca_cert` stays relative, not this machine's absolute path).
@@ -2269,7 +2861,7 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
             "--save `{dest}` skipped: verdict is {v_label}, not improved"
         ));
     }
-    let run_command = profile_command(&r.spec, &sets);
+    let run_command = Some(profile_command(&r.spec, &sets));
     let mut out = ProveOutput {
         schema: PROVE_SCHEMA.to_owned(),
         prove_id: prove_id.clone(),
@@ -2297,8 +2889,11 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
         budget_exceeded,
         saved_to: None,
         run_command,
-        notes,
+        notes: Vec::new(),
     };
+    for note in notes {
+        out.add_note(note);
+    }
     // The proof first: a `--save` that fails after it must not lose it.
     let store_prove = |out: &ProveOutput| -> Result<bool> {
         match ctx
@@ -2324,8 +2919,7 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
             Ok(saved) => out.saved_to = Some(saved.to),
             Err(e) => {
                 ctx.out.warn(format!("--save `{dest}` failed: {e:#}"));
-                out.notes
-                    .push(format!("--save `{dest}` failed: {e:#}; the proof is kept"));
+                out.add_note(format!("--save `{dest}` failed: {e:#}; the proof is kept"));
             }
         }
         // Stored now, if not before: the trials belong to it.
@@ -2338,7 +2932,7 @@ pub async fn prove(ctx: &Ctx, req: ProveRequest, cancel: Cancel) -> Result<Prove
 
 /// `oprobe run` of the run's workload (its preset, `-c`, `-d`, `--existing`, …) on the operator
 /// with `sets` applied: the command that profiles the proven operator as the run did.
-fn profile_command(spec: &crate::model::RunSpec, sets: &[(String, String)]) -> Option<String> {
+fn profile_command(spec: &crate::model::RunSpec, sets: &[(String, String)]) -> String {
     // The run's own command, then the change as `--set` pairs (the last value of a path wins;
     // a secret value given as an environment variable of its name, as `next` always did).
     let mut args = spec.args();
@@ -2354,7 +2948,7 @@ fn profile_command(spec: &crate::model::RunSpec, sets: &[(String, String)]) -> O
         args.push("--set".into());
         args.push(e);
     }
-    Some(crate::model::spec::command_line(&args))
+    crate::model::spec::command_line(&args)
 }
 
 #[cfg(test)]
@@ -2375,6 +2969,7 @@ mod tests {
             throttled_request_ratio: if feasible { 0.0 } else { 0.1 },
             error_ratio: 0.0,
             feasible,
+            p99_spread_ratio: 0.0,
         }
     }
 
@@ -2442,12 +3037,14 @@ mod tests {
                     baseline: 100.0,
                     candidate: 120.0,
                     ops_count: 900,
+                    resolution: 0.0,
                     candidate_first: false
                 },
                 AbPair {
                     baseline: 101.0,
                     candidate: 121.0,
                     ops_count: 800,
+                    resolution: 0.0,
                     candidate_first: true
                 },
             ]
@@ -2543,9 +3140,39 @@ mod tests {
             b.message
         );
         assert!(!b.message.ends_with('.'), "{}", b.message);
+        // The run's whole command (9.2 printed `oprobe run lab://demo`: the operator alone).
+        let hint = b.hint.unwrap();
         assert_eq!(
-            b.hint.as_deref(),
-            Some("profile the operator again until the run completes: oprobe run lab://demo")
+            hint,
+            format!(
+                "profile the operator again until the run completes: {}",
+                run.report.spec.command()
+            )
+        );
+        assert!(hint.contains("oprobe run lab://demo "), "{hint}");
+    }
+
+    /// K1-2: an interrupted run against a local endpoint (`s3://bench/x --set
+    /// options.endpoint=http://127.0.0.1:9000`) was hinted as `oprobe run s3://bench/x`: the
+    /// real service, with ambient credentials. The hint is the run's whole command.
+    #[test]
+    fn the_hint_after_an_unjudged_run_keeps_its_endpoint() {
+        let mut run = crate::analysis::simulate::tests::straggler_run();
+        run.report.run.window_s = 5.0;
+        let mut profile = run.report.spec.resolved_profile();
+        profile.operator = OperatorSpec::from_url("s3://bench/x");
+        profile
+            .operator
+            .set("options.endpoint", "http://127.0.0.1:9000")
+            .unwrap();
+        run.report.spec = crate::model::RunSpec::new(&profile, "s3://bench/x");
+        crate::model::build::mark_partial(&mut run, crate::model::PartialReason::Interrupted);
+        let e = refuse_unjudged(&run).unwrap_err();
+        let hint = crate::errors::classify(&e, "s3").hint.unwrap();
+        assert!(
+            hint.contains("oprobe run s3://bench/x")
+                && hint.contains("--set options.endpoint=http://127.0.0.1:9000"),
+            "{hint}"
         );
     }
 
@@ -2633,9 +3260,7 @@ mod tests {
             vec!["layers.concurrent_limit.http=24".into()],
             (8, 2),
             (3, 6),
-            3.0,
-            3.0,
-            3.0,
+            TrialTimes::even(3.0),
             None,
         );
         assert_eq!((e.trials_min_count, e.trials_max_count), (8, 20));
@@ -2650,9 +3275,11 @@ mod tests {
             vec!["layers.tail_cut=on".into()],
             (0, 0),
             (3, 6),
-            3.0,
-            14.0,
-            14.0,
+            TrialTimes {
+                b_first_s: 14.0,
+                b_warm_s: 14.0,
+                ..TrialTimes::even(3.0)
+            },
             Some(Duration::from_secs(90)),
         );
         assert_eq!(e.eta_min_s, 51.0);
@@ -2666,7 +3293,7 @@ mod tests {
         assert_eq!((e.pairs_min_count, e.pairs_max_count), (3, 5));
         assert_eq!(e.trials_max_count, 10);
         assert!(
-            e.line().contains("the budget fits 10 of 12"),
+            e.line().contains("the budget is estimated to fit 10 of 12"),
             "{}",
             e.line()
         );
@@ -2676,9 +3303,10 @@ mod tests {
             vec!["layers.tail_cut=on".into()],
             (0, 0),
             (3, 6),
-            3.0,
-            14.0,
-            3.0,
+            TrialTimes {
+                b_first_s: 14.0,
+                ..TrialTimes::even(3.0)
+            },
             None,
         );
         assert_eq!((reused.eta_min_s, reused.eta_max_s), (29.0, 47.0));
@@ -2692,9 +3320,7 @@ mod tests {
             vec!["layers.concurrent_limit.http=24".into()],
             (8, 2),
             (3, 6),
-            3.0,
-            3.0,
-            3.0,
+            TrialTimes::even(3.0),
             Some(Duration::from_secs(12)),
         );
         // 2 sizing trials (6 s), then one pair (6 s): 4 trials at most.
@@ -2702,17 +3328,24 @@ mod tests {
         assert_eq!(e.pairs_max_count, 1);
         assert!(e.eta_max_s <= 12.0);
         let line = e.line();
-        assert!(line.contains("the budget fits 4 of 20"), "{line}");
-        assert!(line.contains("raise --max-duration"), "{line}");
+        // An estimate, said as one (9.2: "the budget fits 4 of 20, too few pairs to decide (at
+        // least 3): raise --max-duration", printed as a fact before a proof that then decided).
+        assert!(
+            line.contains("the budget is estimated to fit 4 of 20"),
+            "{line}"
+        );
+        assert!(
+            line.contains("raise --max-duration if the proof stops short"),
+            "{line}"
+        );
+        assert!(!line.contains("too few pairs to decide"), "{line}");
         // Without a budget, nothing is cut.
         let free = ProofEstimate::new(
             "oprobe prove r".into(),
             vec![],
             (8, 2),
             (3, 6),
-            3.0,
-            3.0,
-            3.0,
+            TrialTimes::even(3.0),
             None,
         );
         assert_eq!(free.unbudgeted_trials_max_count, None);
@@ -2762,6 +3395,7 @@ mod tests {
                     baseline: a[i],
                     candidate: b[i],
                     ops_count: 10_000,
+                    resolution: 0.0,
                     candidate_first: candidate_first(7, i as u64),
                 })
                 .collect();
@@ -2831,11 +3465,518 @@ mod tests {
         let a = paired(&trials, TrialKind::Baseline, 2);
         let b = paired(&trials, TrialKind::Candidate, 2);
         assert_eq!((a.len(), b.len()), (2, 2));
-        let sec = secondary(ProveObjective::Goodput, &a, &b, 0.02);
+        let sec = secondary(ProveObjective::Goodput, &a, &b);
         let thr = sec
             .iter()
             .find(|m| m.metric == "throttled_request_ratio")
             .unwrap();
         assert_eq!(thr.baseline, 0.0, "{thr:?}");
+    }
+
+    fn ab_trial(kind: TrialKind, pair: u64, ops: u64, failed: u64, p99: f64) -> ProveTrial {
+        ProveTrial {
+            kind,
+            pair: Some(pair),
+            ops_count: ops,
+            requests_count: ops,
+            error_ratio: failed as f64 / ops.max(1) as f64,
+            goodput_ops_per_s: (ops - failed) as f64 / 2.0,
+            ..trial(0.0, p99, true)
+        }
+    }
+
+    /// K3-1: `--with layers.timeout.io=200ms --objective p99` lowered the p99 by failing the
+    /// slow operations, and 9.2 said `improved`; a candidate with no latency at all was
+    /// "improved by 100 %". The error gate is the throttle gate's twin, on every objective.
+    #[test]
+    fn a_candidate_that_fails_its_operations_is_never_improved() {
+        use TrialKind::{Baseline, Candidate};
+        let a: Vec<ProveTrial> = (0..3)
+            .map(|i| ab_trial(Baseline, i, 1000, 2, 900.0))
+            .collect();
+        let a: Vec<&ProveTrial> = a.iter().collect();
+        // Every operation fails, fast: a p99 of 3 ms against 900 ms.
+        let all_fail: Vec<ProveTrial> = (0..3)
+            .map(|i| ab_trial(Candidate, i, 1000, 1000, 3.0))
+            .collect();
+        let all_fail: Vec<&ProveTrial> = all_fail.iter().collect();
+        // The objective alone calls it improved …
+        let mut test = AbTest::new(false, 3, 6);
+        for (i, (x, y)) in a.iter().zip(&all_fail).enumerate() {
+            test.push(ab_pair(ProveObjective::P99, x, y, i % 2 == 1));
+        }
+        assert_eq!(test.verdict(), AbVerdict::Improved);
+        // … and the gate does not, whatever the verdict was.
+        for v in [ProveVerdict::Improved, ProveVerdict::Worse] {
+            let (verdict, note) = error_gate(v, &a, &all_fail, 0.01);
+            assert_eq!(verdict, ProveVerdict::Inconclusive);
+            let note = note.unwrap();
+            assert!(
+                note.contains("failed 100.00 %")
+                    && note.contains("0.20 %")
+                    && note.contains("1.00 %"),
+                "{note}"
+            );
+        }
+        // A fifth of them fail (the timeout case).
+        let some: Vec<ProveTrial> = (0..3)
+            .map(|i| ab_trial(Candidate, i, 1000, 200, 200.0))
+            .collect();
+        let some: Vec<&ProveTrial> = some.iter().collect();
+        assert_eq!(
+            error_gate(ProveVerdict::Improved, &a, &some, 0.01).0,
+            ProveVerdict::Inconclusive
+        );
+        // Failures both operators suffer alike are not the change's doing; nor is a
+        // difference within what the run allows, or within chance.
+        let noisy_a: Vec<ProveTrial> = (0..3)
+            .map(|i| ab_trial(Baseline, i, 1000, 50, 900.0))
+            .collect();
+        let noisy_a: Vec<&ProveTrial> = noisy_a.iter().collect();
+        let noisy_b: Vec<ProveTrial> = (0..3)
+            .map(|i| ab_trial(Candidate, i, 1000, 55, 400.0))
+            .collect();
+        let noisy_b: Vec<&ProveTrial> = noisy_b.iter().collect();
+        assert_eq!(
+            error_gate(ProveVerdict::Improved, &noisy_a, &noisy_b, 0.01),
+            (ProveVerdict::Improved, None)
+        );
+        let few: Vec<ProveTrial> = (0..3)
+            .map(|i| ab_trial(Candidate, i, 1000, 8, 400.0))
+            .collect();
+        let few: Vec<&ProveTrial> = few.iter().collect();
+        assert_eq!(
+            error_gate(ProveVerdict::Improved, &a, &few, 0.01),
+            (ProveVerdict::Improved, None)
+        );
+        assert_eq!(
+            error_gate(ProveVerdict::Improved, &a, &[], 0.01),
+            (ProveVerdict::Improved, None)
+        );
+        // A trial with nothing to compare makes no pair: stored results give the same pairs.
+        let none = [
+            ab_trial(Baseline, 0, 1000, 0, 900.0),
+            ab_trial(Candidate, 0, 1000, 1000, 0.0),
+        ];
+        assert!(ab_pairs(ProveObjective::P99, &none).is_empty());
+        assert!(ab_pairs(ProveObjective::Goodput, &none).is_empty());
+    }
+
+    /// K3-2, the review's first case (`lab://hotkey`: "23–45 s" for a proof of 54 s): the
+    /// base run's operations kept retrying 2 s past its window and it was throttled, so every
+    /// trial drains as long and is followed by a cool-down. 9.2's model knew neither.
+    #[test]
+    fn the_estimate_learns_the_retry_tail_and_the_cool_downs_from_the_base_run() {
+        let ms = Duration::from_millis;
+        // A 10 s window after 1 s of warm-up; the last operation ended 12 s in; the run took
+        // 15 s in all by its stamps (whole seconds: at least 14); throttled, no Retry-After.
+        let base = BaseTiming::learn(Some(15.0), 1.0, 10.0, 12.0, cool_down(40, 0, ms(300)));
+        assert_eq!(
+            base,
+            BaseTiming {
+                overhead_s: Some(1.0),
+                tail_s: 2.0,
+                cool_s: 0.6
+            }
+        );
+        // A trial: 0.3 s warm-up, 2 s window, the 2 s tail, 1 s around them.
+        let trial_s = base.trial_s(0.3, 2.0, 0.9);
+        assert!((trial_s - 5.3).abs() < 1e-9, "{trial_s}");
+        let times = TrialTimes {
+            cool_s: base.cool_s,
+            ..TrialTimes::even(trial_s)
+        };
+        let e = ProofEstimate::new("oprobe prove r".into(), vec![], (0, 0), (3, 6), times, None);
+        // 9.2: 3–6 pairs of two 3.2 s trials (the model: 2.3 s + 0.9 s), 19–38 s.
+        let old = ProofEstimate::new(
+            "oprobe prove r".into(),
+            vec![],
+            (0, 0),
+            (3, 6),
+            TrialTimes::even(2.3 + 0.9),
+            None,
+        );
+        assert!((old.eta_max_s - 38.4).abs() < 1e-9, "{old:?}");
+        // Now: the least is three pairs with a cool-down after each baseline, the most six
+        // pairs with one after every trial.
+        assert!(
+            (e.eta_min_s - 3.0 * (2.0 * 5.3 + 0.6)).abs() < 1e-9,
+            "{e:?}"
+        );
+        assert!(
+            (e.eta_max_s - 6.0 * (2.0 * 5.3 + 1.2)).abs() < 1e-9,
+            "{e:?}"
+        );
+        assert!(e.eta_min_s > old.eta_min_s * 1.5 && e.eta_max_s > old.eta_max_s * 1.5);
+        // A run that was not throttled owes no cool-down, and one with no tail has none.
+        let calm = BaseTiming::learn(Some(11.0), 1.0, 10.0, 9.99, cool_down(0, 0, ms(300)));
+        assert_eq!(
+            (calm.tail_s, calm.cool_s, calm.overhead_s),
+            (0.0, 0.0, Some(0.0))
+        );
+    }
+
+    /// K3-2, the second case (a fast lab): 9.2's model charged every trial a dataset upload
+    /// and a cleanup that took no time, planned one pair in the budget, printed "too few
+    /// pairs to decide: raise --max-duration" — and the proof decided.
+    #[test]
+    fn the_estimate_does_not_overcharge_a_fast_target() {
+        let budget = Some(Duration::from_secs(16));
+        // The plan's model: 1.6 s around a 2.3 s trial.
+        let model_overhead_s = 1.6;
+        let unlearned = BaseTiming::default().trial_s(0.3, 2.0, model_overhead_s);
+        assert!((unlearned - 3.9).abs() < 1e-9);
+        let old = ProofEstimate::new(
+            "oprobe prove r".into(),
+            vec![],
+            (0, 0),
+            (3, 6),
+            TrialTimes::even(unlearned),
+            budget,
+        );
+        assert_eq!(old.pairs_max_count, 2, "{old:?}");
+        // The base run: 8.3 s of warm-up and window, 9 s between its stamps, nothing draining.
+        let base = BaseTiming::learn(Some(9.0), 0.3, 8.0, 7.9, Duration::ZERO);
+        let trial_s = base.trial_s(0.3, 2.0, model_overhead_s);
+        assert!((trial_s - 2.3).abs() < 1e-9, "{trial_s}");
+        let e = ProofEstimate::new(
+            "oprobe prove r".into(),
+            vec![],
+            (0, 0),
+            (3, 6),
+            TrialTimes::even(trial_s),
+            budget,
+        );
+        assert_eq!((e.pairs_min_count, e.pairs_max_count), (3, 3), "{e:?}");
+        assert!(!e.line().contains("raise --max-duration"), "{}", e.line());
+        // A run that began and ended within one second (stamps 0 s apart) is still read.
+        let short = BaseTiming::learn(Some(0.0), 0.0, 0.3, 0.3005, Duration::ZERO);
+        assert_eq!(short.overhead_s, Some(0.0));
+        assert!((short.trial_s(0.1, 0.3, model_overhead_s) - 0.4005).abs() < 1e-9);
+        // Stamps that do not parse: the model stands in.
+        let blind = BaseTiming::learn(None, 0.3, 8.0, 7.9, Duration::ZERO);
+        assert_eq!(blind.trial_s(0.3, 2.0, model_overhead_s), unlearned);
+    }
+
+    /// K3-2: the first trial of each kind replaces the estimate, in either direction; later
+    /// ones only lengthen it. And the first pair says so when the upfront ETA was off.
+    #[test]
+    fn the_first_trial_corrects_the_estimate() {
+        let ms = Duration::from_millis;
+        let mut fast = Expected::new(3.9);
+        assert_eq!(fast.get(), ms(3900));
+        fast.observe(ms(2400));
+        assert_eq!(fast.get(), ms(2400), "corrected down");
+        fast.observe(ms(2300));
+        assert_eq!(fast.get(), ms(2400));
+        fast.observe(ms(2600));
+        assert_eq!(fast.get(), ms(2600));
+        let mut slow = Expected::new(2.3);
+        slow.observe(ms(4500));
+        assert_eq!(slow.get(), ms(4500), "corrected up");
+        // Within a quarter of the estimate: nothing to say.
+        assert_eq!(corrected_eta(8.0, 9.5, 5, None), None);
+        assert_eq!(corrected_eta(8.0, 3.0, 0, None), None);
+        let line = corrected_eta(6.0, 10.0, 5, None).unwrap();
+        assert!(
+            line.contains("takes 10s, not the 6s estimated") && line.contains("up to 50s"),
+            "{line}"
+        );
+        // The budget bounds what is left.
+        let line = corrected_eta(6.0, 10.0, 5, Some(25.0)).unwrap();
+        assert!(line.contains("up to 20s more for the 2 pairs"), "{line}");
+    }
+
+    /// K3-3: a cool-down is part of the budget. It is reserved with the trial after it, and
+    /// never waited past the end of the budget (9.2 slept the whole cool-down a pair's first
+    /// trial left, up to 5 s, and then ran the second trial: both past `--max-duration`).
+    #[tokio::test(start_paused = true)]
+    async fn a_cool_down_never_runs_past_the_budget() {
+        let s = Duration::from_secs;
+        let cancel = Cancel::new();
+        let started = tokio::time::Instant::now();
+        let mut pace = Pacing::new(Some(s(10)));
+        assert!(pace.fits_trial(s(10)) && !pace.fits_trial(s(11)));
+        // The first half of a pair took 6 s and ended throttled: 5 s to cool down.
+        tokio::time::advance(s(6)).await;
+        pace.after_trial(arm(TrialKind::Baseline), s(5));
+        // The second half (2 s) fits by itself, not after the cool-down: it is not started …
+        assert!(pace.fits(s(2)));
+        assert!(!pace.fits_trial(s(2)));
+        // … and the cool-down, which would end past the budget, is not waited.
+        assert!(!pace.cool_off(&cancel).await.unwrap());
+        assert_eq!(started.elapsed(), s(6), "nothing was waited");
+        assert_eq!(pace.cooled, (0, Duration::ZERO));
+        // A cool-down that fits is waited in full, once.
+        pace.after_trial(arm(TrialKind::Candidate), s(3));
+        assert!(pace.fits_trial(s(1)) && !pace.fits_trial(s(2)));
+        assert!(pace.cool_off(&cancel).await.unwrap());
+        assert_eq!(started.elapsed(), s(9));
+        assert_eq!(pace.cooled, (1, s(3)));
+        assert!(pace.cool_off(&cancel).await.unwrap());
+        assert_eq!(started.elapsed(), s(9));
+        assert_eq!(pace.left(), Some(s(1)));
+        // What the arms last left is what a pair reserves for them.
+        assert_eq!(pace.cool_after, [s(5), s(3)]);
+        // Without a budget everything fits, and Ctrl-C still ends a cool-down.
+        let mut free = Pacing::new(None);
+        assert!(free.fits_trial(s(86_400)) && free.left().is_none());
+        free.after_trial(0, s(5));
+        cancel.cancel();
+        assert!(free.cool_off(&cancel).await.is_err());
+    }
+
+    /// K3-5: on a p99 proof whose p99 moved a lot between trials, a goodput steady at 300/s
+    /// printed "[−17 %, +20 %]": the objective's noise floor on another metric.
+    #[test]
+    fn secondary_metrics_use_their_own_spread() {
+        use TrialKind::{Baseline, Candidate};
+        let mk = |kind, pair: u64, goodput: f64, p99: f64| ProveTrial {
+            kind,
+            pair: Some(pair),
+            ops_count: 600,
+            ..trial(goodput, p99, true)
+        };
+        let a = [
+            mk(Baseline, 0, 300.0, 900.0),
+            mk(Baseline, 1, 301.0, 1400.0),
+            mk(Baseline, 2, 299.0, 800.0),
+            mk(Baseline, 3, 300.0, 1500.0),
+        ];
+        let b = [
+            mk(Candidate, 0, 300.0, 40.0),
+            mk(Candidate, 1, 299.0, 60.0),
+            mk(Candidate, 2, 301.0, 35.0),
+            mk(Candidate, 3, 300.0, 55.0),
+        ];
+        let (a, b): (Vec<&ProveTrial>, Vec<&ProveTrial>) = (a.iter().collect(), b.iter().collect());
+        // The objective's floor is tens of percent.
+        let p99 = |ts: &[&ProveTrial]| ts.iter().map(|t| t.p99_ms).collect::<Vec<_>>();
+        assert!(noise_floor_ab(&p99(&a), &p99(&b), 0.0) > 0.3);
+        let sec = secondary(ProveObjective::P99, &a, &b);
+        let goodput = sec
+            .iter()
+            .find(|m| m.metric == "goodput_ops_per_s")
+            .unwrap();
+        assert!(
+            goodput.change.low > -0.05 && goodput.change.high < 0.05,
+            "{goodput:?}"
+        );
+        assert!(goodput.change.low < 0.0 && goodput.change.high > 0.0);
+        // And the other way round: a p99 keeps its own (wide) spread beside a steady goodput.
+        let sec = secondary(ProveObjective::Goodput, &a, &b);
+        let p99 = sec.iter().find(|m| m.metric == "p99_ms").unwrap();
+        assert!(p99.change.high - p99.change.low > 0.05, "{p99:?}");
+        assert!(p99.change.high < 0.0, "{p99:?}");
+    }
+
+    /// K3-9: a p99 on a cliff. 1000 operations, 985 at 10 ms and 15 retried ones at 1 s: the
+    /// ranks 0.99·n ± 2·√(0.0099·n) (983..997) straddle the edge, so the p99 of a trial is
+    /// 10 ms or 1 s by chance. The trial says so, the note says so, and the pair's resolution
+    /// is the floor's.
+    #[test]
+    fn a_p99_on_a_cliff_is_said_and_widens_the_noise_floor() {
+        use crate::trace::LatencyHistogram;
+        let cliff = LatencyHistogram::from_counts([(10_000, 985), (1_000_000, 15)]);
+        let spread = p99_spread_of(&cliff);
+        assert!(p99_on_a_cliff(spread), "{spread}");
+        // About a quarter of ln(100): the band spans 10 ms to 1 s.
+        assert!((spread - 100f64.ln() / 4.0).abs() < 0.05, "{spread}");
+        // The edge well below the band (5 % retried): the p99 is inside the slow mode.
+        let inside = LatencyHistogram::from_counts([(10_000, 950), (1_000_000, 50)]);
+        assert_eq!(p99_spread_of(&inside), 0.0);
+        // A smooth tail: a few bins wide, no cliff.
+        let smooth = LatencyHistogram::from_counts(
+            (0..1000).map(|i| ((10_000.0 * 1.01f64.powi(i)) as u64, 1)),
+        );
+        let s = p99_spread_of(&smooth);
+        assert!(s > 0.0 && !p99_on_a_cliff(s), "{s}");
+        assert_eq!(p99_spread_of(&LatencyHistogram::default()), 0.0);
+
+        let mk = |kind, pair: u64, p99: f64, spread: f64| ProveTrial {
+            kind,
+            pair: Some(pair),
+            ops_count: 1000,
+            p99_spread_ratio: spread,
+            ..trial(500.0, p99, true)
+        };
+        use TrialKind::{Baseline, Candidate};
+        // The trials happen to agree: without the resolution the floor would be the minimum.
+        let trials: Vec<ProveTrial> = (0..3)
+            .flat_map(|i| [mk(Baseline, i, 10.0, spread), mk(Candidate, i, 10.0, 0.0)])
+            .collect();
+        let pairs = ab_pairs(ProveObjective::P99, &trials);
+        assert_eq!(pairs[0].resolution, spread);
+        let floor = convergence(ProveObjective::P99, &pairs, 6)[2].noise_floor_ratio;
+        assert!((floor - spread).abs() < 1e-12, "{floor} vs {spread}");
+        // Goodput is not a p99: its pairs carry no such resolution.
+        assert_eq!(
+            ab_pairs(ProveObjective::Goodput, &trials)[0].resolution,
+            0.0
+        );
+        let judged: Vec<&ProveTrial> = trials.iter().collect();
+        let note = cliff_note(&judged).unwrap();
+        assert!(
+            note.starts_with("p99 sits on a cliff: lengthen the trial (--trial)"),
+            "{note}"
+        );
+        assert!(note.contains("In 3 of 6 trials"), "{note}");
+        let calm: Vec<ProveTrial> = (0..3).map(|i| mk(Baseline, i, 10.0, s)).collect();
+        assert_eq!(cliff_note(&calm.iter().collect::<Vec<_>>()), None);
+        // The spread is stored only when there is one, and a 9.2 trial reads without it.
+        let v = serde_json::to_value(&trials[1]).unwrap();
+        assert!(v.get("p99_spread_ratio").is_none(), "{v}");
+        let back: ProveTrial = serde_json::from_value(v).unwrap();
+        assert_eq!(back.p99_spread_ratio, 0.0);
+        assert!(serde_json::to_value(&trials[0]).unwrap()["p99_spread_ratio"].is_f64());
+    }
+
+    /// K5-3: every note of a result is redacted where it enters the result.
+    #[test]
+    fn notes_never_carry_url_credentials() {
+        let mut out = output(4, ProveVerdict::Improved);
+        out.notes.clear();
+        out.add_note(
+            "--save `op.toml` failed: cannot reach https://AKIAEXAMPLE:s3cr3t@minio.internal:9000/bucket; the proof is kept",
+        );
+        out.add_note("a budget stopped the prove (GET https://h/b/k?X-Amz-Signature=abcdef0123&X-Amz-Expires=60)");
+        let all = out.notes.join("\n");
+        assert!(
+            !all.contains("s3cr3t") && !all.contains("abcdef0123"),
+            "{all}"
+        );
+        assert!(all.contains("minio.internal:9000/bucket"), "{all}");
+        assert_eq!(out.notes.len(), 2);
+    }
+
+    /// A proof in which nothing was compared offers no profile of a change it did not test
+    /// (9.2: `next: profile the changed operator` after a 0-pair, budget-stopped prove).
+    #[test]
+    fn a_proof_with_no_pair_offers_no_profile_of_the_change() {
+        let mut none = output(0, ProveVerdict::Inconclusive);
+        assert!(none.next().is_empty());
+        // A sizing trial ran before the budget ended: its runs can still be listed.
+        none.trials.push(trial(50.0, 10.0, true));
+        let next = none.next();
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].cli, "oprobe show --list --all");
+        let done = output(4, ProveVerdict::Improved).next();
+        assert_eq!(done.len(), 2);
+        assert!(done[0].cli.starts_with("oprobe run "), "{}", done[0].cli);
+    }
+
+    /// A run whose secret was given by value (`--set options.secret_access_key=…`) cannot be
+    /// replayed with it: oprobe stored no secret. When the prove then fails for want of
+    /// credentials, the error says so (9.2: the plain `auth.no_credentials` of a first run).
+    #[test]
+    fn a_prove_without_the_runs_secret_says_it_was_not_stored() {
+        let no_creds = || -> anyhow::Error {
+            OprobeError::new(
+                ErrorCode::AuthNoCredentials,
+                "no credentials found for s3://b",
+            )
+            .with_hint("set AWS_ACCESS_KEY_ID")
+            .into()
+        };
+        let lost = vec!["options.secret_access_key".to_owned()];
+        let e = explain_unstored_secrets(no_creds(), "s3", &lost);
+        let b = crate::errors::classify(&e, "s3");
+        assert_eq!(b.code, ErrorCode::AuthNoCredentials);
+        assert!(
+            b.message.contains("no credentials found")
+                && b.message.contains("options.secret_access_key by value")
+                && b.message.contains("stores no secret"),
+            "{}",
+            b.message
+        );
+        assert!(b.hint.unwrap().starts_with("provide the credentials"));
+        // Nothing was given by value, or the failure is something else: the error as it is.
+        let e = explain_unstored_secrets(no_creds(), "s3", &[]);
+        assert_eq!(
+            crate::errors::classify(&e, "s3").hint.as_deref(),
+            Some("set AWS_ACCESS_KEY_ID")
+        );
+        let other: anyhow::Error =
+            OprobeError::new(ErrorCode::UsageInvalidArgument, "bad value").into();
+        let e = explain_unstored_secrets(other, "s3", &lost);
+        assert_eq!(crate::errors::classify(&e, "s3").message, "bad value");
+    }
+
+    /// CI on 9.2.0, `lab://ratelimit` (300 requests/s, burst 20; fitted 270/s): the sizing
+    /// trial of `layers.concurrent_limit.http=2` ran 311/s with no throttle in its two
+    /// seconds and was chosen; in the A/B pairs it throttled 2.7 % and the verdict was
+    /// `worse`. A value whose own trial sends more than the fitted limit is not feasible.
+    #[tokio::test]
+    async fn sizing_a_rate_limit_stays_under_the_fitted_rate() {
+        // (requests/s, throttled share, p99 ms) at each cap, as CI measured them.
+        fn at(v: u64) -> (f64, f64, f64) {
+            match v {
+                1 => (155.0, 0.0, 8.0),
+                2 => (311.0, 0.0, 7.0),
+                3 => (300.0, 0.027, 1500.0),
+                _ => (300.0, 0.05, 1700.0),
+            }
+        }
+        struct Lab(Feasible, Vec<u64>);
+        impl Measure for Lab {
+            async fn measure(&mut self, v: u64) -> Result<Option<ProveTrial>> {
+                self.1.push(v);
+                let (rps, throttled, p99) = at(v);
+                let feasible = self.0.admits(1000, throttled, 0.0, rps);
+                Ok(Some(ProveTrial {
+                    throttled_request_ratio: throttled,
+                    ..trial(rps, p99, feasible)
+                }))
+            }
+        }
+        let d = Domain::Count { min: 1, max: 4 };
+        let limits = Feasible {
+            max_throttle: 0.001,
+            max_error: 0.01,
+            max_requests_per_s: Some(270.0),
+        };
+        for obj in [ProveObjective::P99, ProveObjective::Goodput] {
+            let mut lab = Lab(limits, Vec::new());
+            assert_eq!(search(d, 1, obj, 8, &mut lab).await.unwrap(), (1, true));
+            assert_eq!(lab.1, [1, 2], "2 is over the fitted rate: the climb ends");
+        }
+        // 9.2's rule (the throttle of the trial alone) chose 2.
+        let mut lab = Lab(
+            Feasible {
+                max_requests_per_s: None,
+                ..limits
+            },
+            Vec::new(),
+        );
+        let got = search(d, 1, ProveObjective::P99, 8, &mut lab).await;
+        assert_eq!(got.unwrap(), (2, true));
+        // No value under the rate: none is feasible, and the result says so.
+        let mut lab = Lab(
+            Feasible {
+                max_requests_per_s: Some(100.0),
+                ..limits
+            },
+            Vec::new(),
+        );
+        let (_, feasible) = search(d, 1, ProveObjective::P99, 8, &mut lab)
+            .await
+            .unwrap();
+        assert!(!feasible);
+        // Exactly at the limit is within it; a trial that counted nothing never is.
+        assert!(limits.admits(10, 0.0, 0.0, 270.0));
+        assert!(!limits.admits(0, 0.0, 0.0, 1.0));
+    }
+
+    /// K3-6: a result of 9.1 has no plan. Core says so, and offers no way to read its trials
+    /// as if it had one without asking.
+    #[test]
+    fn a_result_without_a_plan_says_so() {
+        let mut p = output(4, ProveVerdict::Improved);
+        assert_eq!(p.plan(), Some(6));
+        p.pairs_max_count = Some(40);
+        assert_eq!(p.plan(), Some(12), "clamped to the calibrated range");
+        p.pairs_max_count = None;
+        assert_eq!(p.plan(), None);
+        assert_eq!(p.planned_pairs(), 6);
     }
 }

@@ -139,7 +139,8 @@ pub async fn measure_to_breach(ctx: &Ctx, profile: Profile, o: Opts<'_>) -> Resu
         }
         return Ok(m);
     }
-    if m.cancelled {
+    // A trial of a prove is not a result: an interrupted prove saves nothing.
+    if m.cancelled && !trial {
         ctx.out
             .warn("interrupted — partial results: they cover only the time before Ctrl-C");
     }

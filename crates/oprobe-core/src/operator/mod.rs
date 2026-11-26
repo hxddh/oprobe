@@ -611,6 +611,21 @@ impl OperatorSpec {
                     "layers.throttle bandwidth and burst must be within 1B..4GiB",
                 ));
             }
+            // OpenDAL's ThrottleLayer refuses a write larger than the burst outright
+            // (`RateLimited`: "burst size is smaller than the request size"); it does not
+            // wait for it. With `write.chunk` every write of that size is known in advance
+            // (K2-1: `burst = 1` failed every write of a run that then read "client_bound").
+            if let Some(chunk) = self.write.chunk
+                && t.burst < chunk
+            {
+                return Err(invalid(format!(
+                    "layers.throttle.burst ({}) is below write.chunk ({chunk}): ThrottleLayer refuses every write larger than the burst",
+                    t.burst
+                ))
+                .with_hint(format!(
+                    "set layers.throttle.burst to at least {chunk}, the largest single write"
+                )));
+            }
         }
         if let Some(c) = &l.cache
             && c.memory.0 == 0
@@ -1230,5 +1245,45 @@ keep_alive = true
         ] {
             assert!(OperatorSpec::parse(bad).is_err(), "{bad}");
         }
+    }
+
+    /// K2-1: `layers.throttle.burst=1` made OpenDAL refuse every write (`rate_limited`), and
+    /// the run read "client_bound". Where the largest write is known (`write.chunk`), a burst
+    /// below it is refused, with what to set.
+    #[test]
+    fn a_throttle_burst_below_the_write_chunk_is_refused() {
+        let mut s = OperatorSpec::from_url("memory://");
+        s.set("write.chunk", "8MiB").unwrap();
+        let e = s
+            .apply_edits(&[
+                ("layers.throttle".to_owned(), "on".to_owned()),
+                ("layers.throttle.burst".to_owned(), "1MiB".to_owned()),
+            ])
+            .unwrap_err();
+        assert_eq!(e.code, ErrorCode::UsageInvalidArgument);
+        assert!(
+            e.message
+                .contains("layers.throttle.burst (1MiB) is below write.chunk (8MiB)"),
+            "{}",
+            e.message
+        );
+        assert_eq!(
+            e.hint.as_deref(),
+            Some("set layers.throttle.burst to at least 8MiB, the largest single write")
+        );
+        // In either order, and from a file.
+        let mut t = OperatorSpec::from_url("memory://");
+        t.set("layers.throttle.burst", "1MiB").unwrap();
+        assert!(t.set("write.chunk", "8MiB").is_err());
+        assert!(
+            OperatorSpec::parse(
+                "url = \"memory://\"\n[layers]\nthrottle = { burst = \"1MiB\" }\n[write]\nchunk = \"8MiB\"\n"
+            )
+            .is_err()
+        );
+        // At least the chunk: fine. Without `write.chunk` the largest write is the
+        // application's to know.
+        s.set("layers.throttle.burst", "8MiB").unwrap();
+        OperatorSpec::check_edit("layers.throttle.burst", "1KiB").unwrap();
     }
 }

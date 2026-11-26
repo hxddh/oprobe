@@ -677,6 +677,10 @@ fn prove_judges_a_change_and_hides_its_trials() {
     assert_eq!(v["run_id"], run_id.as_str());
     assert_eq!(v["change"][0], "read.gap=1MiB");
     assert!(v["diff"]["toml"].as_str().unwrap().contains("gap"), "{v}");
+    // K4-2: the whole changed operator as Rust that pastes, beside the diff lines.
+    let rust = v["diff"]["operator_rust"].as_str().unwrap();
+    assert!(rust.contains("fn build_operator()"), "{rust}");
+    assert!(rust.contains(".gap(") && !rust.starts_with('+'), "{rust}");
     assert_eq!(v["pairs_count"], 3);
     let d = &v["objective_delta"];
     assert!(d["low"].as_f64().unwrap() > -1.0, "never below -100 %: {d}");
@@ -799,35 +803,51 @@ fn prove_needs_three_pairs_to_decide() {
     let env = Env::new();
     let o = env.run(&run_args(&["lab://clean"], &["-q", "-o", "json"]));
     assert_eq!(code(&o), 0, "{}", stderr(&o));
-    // Whatever one pair measures, it cannot decide.
+    // Whatever one or two pairs measure, they cannot decide. A trial is 500 ms of window and
+    // 100 ms of warm-up: three pairs take at least 3.6 s and never fit in 3 s, and one pair
+    // fits while a trial takes up to 1.5 s (9.2's `--trial 300ms --max-duration 1s` left a
+    // slow machine 100 ms a trial; 9.3 no longer starts the second half of a pair past the
+    // budget, so that margin showed).
     let o = env.run(&[
         "prove",
         "last",
         "--with",
         "layers.retry.min_delay=10ms",
         "--trial",
-        "300ms",
+        "500ms",
         "--max-duration",
-        "1s",
+        "3s",
         "-o",
         "json",
     ]);
     assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
     let v = json(&o);
     validate("prove", &v);
-    assert_eq!(v["pairs_count"], 1, "{v}");
+    let pairs = v["pairs_count"].as_u64().unwrap();
+    assert!((1..=2).contains(&pairs), "{v}");
     assert_eq!(v["verdict"], "inconclusive", "{v}");
     assert!(
-        v["notes"]
-            .as_array()
+        v["notes"].as_array().unwrap().iter().any(|n| n
+            .as_str()
             .unwrap()
-            .iter()
-            .any(|n| n.as_str().unwrap().contains("allowed only 1 pair")),
+            .contains(&format!("allowed only {pairs} pair"))),
         "{v}"
     );
     // `--pairs` below three is refused.
     let o = env.run(&["prove", "last", "--with", "read.gap=1MiB", "--pairs", "2"]);
     assert_eq!(code(&o), 2, "{}", stderr(&o));
+    // And above twelve, the most the sequential test is calibrated for (9.2 ran `--pairs 13`
+    // as 12 without a word).
+    let o = env.run(&["prove", "last", "--with", "read.gap=1MiB", "--pairs", "13"]);
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
+    assert!(stderr(&o).contains("at most 12"), "{}", stderr(&o));
+    // The flag the docs cite is in the help, with its range.
+    let help = stdout(&env.run(&["prove", "--help"]));
+    assert!(
+        help.contains("--pairs <N>") && help.contains("3 to 12"),
+        "{help}"
+    );
+    assert!(help.contains("--trial <DURATION>"), "{help}");
 }
 
 /// `--with` (and `--set`) pairs apply as one change, in any order: a layer switched on with its

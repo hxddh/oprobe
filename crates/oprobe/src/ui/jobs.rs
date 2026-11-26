@@ -397,6 +397,8 @@ pub fn ab_live(trials: &[Trial]) -> Vec<AbPair> {
                     baseline: a.value,
                     candidate: b.value,
                     ops_count: a.ops.min(b.ops),
+                    // The live trials carry no p99 spread; the stored result's pairs do.
+                    resolution: 0.0,
                     candidate_first: o.candidate,
                 });
             }

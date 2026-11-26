@@ -136,7 +136,7 @@ oprobe run op.toml --preset range-reads
 
 The four presets are `small-files`, `large-objects`, `range-reads` and `list-stat`
 ([concepts](concepts.md#workload)). Several operators run one after another on the same workload
-and form one comparison: `oprobe run op.toml r2://bucket/x`.
+and form one comparison: `oprobe run op.toml 'r2://bucket/x?account_id=ACCOUNT_ID'` (R2 needs the Cloudflare account id, or an endpoint).
 
 ## 6. Production
 

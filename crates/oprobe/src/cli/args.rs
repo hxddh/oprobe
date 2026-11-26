@@ -37,6 +37,17 @@ fn at_least<const MIN: usize>(v: &str) -> Result<usize, String> {
     Ok(n)
 }
 
+/// `prove --pairs`: the plans the sequential test is calibrated for (rejected outside them,
+/// never clamped).
+fn pairs(v: &str) -> Result<usize, String> {
+    use crate::app::prove::{MAX_PAIRS, MIN_DECISIVE_PAIRS};
+    let n = at_least::<MIN_DECISIVE_PAIRS>(v)?;
+    if n > MAX_PAIRS {
+        return Err(format!("must be at most {MAX_PAIRS}"));
+    }
+    Ok(n)
+}
+
 /// `-o/--output` (the clap side of [`OutputFormat`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum OutputArg {
@@ -233,11 +244,11 @@ pub struct ProveArgs {
     /// Share of throttled requests a sized value may cause, e.g. 0.1% or 0.001 (default 0.1%)
     #[arg(long, value_name = "RATIO", value_parser = parse::share, allow_hyphen_values = true)]
     pub max_throttle: Option<String>,
-    /// Measurement window of one trial (default 2s)
-    #[arg(long, value_name = "DURATION", value_parser = parse::positive_duration, allow_hyphen_values = true, hide = true)]
+    /// Measurement window of one trial (default 2s, at most the run's own window)
+    #[arg(long, value_name = "DURATION", value_parser = parse::positive_duration, allow_hyphen_values = true)]
     pub trial: Option<String>,
-    /// A/B pairs at most (default 6; at least 3, the fewest that can decide)
-    #[arg(long, value_name = "N", value_parser = at_least::<3>, hide = true)]
+    /// A/B pairs at most, 3 to 12 (default 6; 3 are the fewest that can decide)
+    #[arg(long, value_name = "N", value_parser = pairs)]
     pub pairs: Option<usize>,
     /// Save the proven operator to an op.toml file or [operators.NAME] when improved
     #[arg(long, value_name = "FILE|OPERATOR")]
