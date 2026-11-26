@@ -2516,13 +2516,24 @@
           "format": "double",
           "type": "number"
         },
+        "latency_at_least": {
+          "description": "The percentiles are lower bounds (\"at least\"): they count the arrivals that never\nstarted, each at the least it can have taken.",
+          "type": "boolean"
+        },
         "max_ms": {
+          "description": "The slowest operation that started in the range.",
           "format": "double",
           "type": "number"
         },
         "mib_per_s": {
           "format": "double",
           "type": "number"
+        },
+        "missed_arrivals_count": {
+          "description": "Open-loop arrivals due in the range that never started (the timeline's count of each\ninterval, by the share of it the range covers).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
         },
         "ops_count": {
           "description": "Operations started in the range (weighted when sampled).",

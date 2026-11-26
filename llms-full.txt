@@ -453,7 +453,8 @@ A profile is what one operator did on one workload, saved as one `.oprobe` file:
 
 Each operation's wall time splits exactly into queue + backend + retry + client, so "network,
 server or my code?" has a measured answer. Long runs keep every aggregate exact and sample whole
-operations (failed, throttled and slowest ones are always kept), so memory stays bounded.
+operations (failed, throttled and slowest ones first: a run that fails for hours thins those
+too), so memory and the run file stay bounded.
 
 `.oprobe` files come from `oprobe run` and from [`oprobe-trace`](embedding.md) in production;
 `oprobe show FILE` and the app open both. A production trace has the same shape: every OpenDAL
@@ -1036,12 +1037,12 @@ multipart and repeated reads (not bandwidth cap or client bound). `prove` refuse
 
 | Flag | Meaning |
 |---|---|
-| `--list` | list the stored runs (prove trials hidden) |
+| `--list` | list the stored runs (prove trials hidden) and the proves; a long change is cut in the list (`show PROVE` prints it whole) |
 | `--all` | with `--list`: include the prove trials |
-| `--rm RUN…` | delete stored runs |
+| `--rm RUN…` | delete stored runs (a run named twice is deleted once) |
 | `--detail` | every section of the profile: the timeline (one row per interval of 1 s, or 10 s after ten minutes; long runs merge rows), the spread of the requests over keys, sizes, prefixes and remotes, the operator and the five slowest operations |
 | `--by stage\|api\|conn` | group the requests by stage, storage API or connection |
-| `--since DURATION` | only the time range from this far into the window: its goodput, latency quantiles, failures, requests, retries and throttling, where the time went, the verbs, the requests by API and the slowest operations, recomputed from the trace rows (`-o json`: the `range` object). With `--by`, only the range's requests are grouped |
+| `--since DURATION` | only the time range from this far into the window: its goodput, latency quantiles, failures, requests, retries and throttling, where the time went, the verbs, the requests by API and the slowest operations, recomputed from the trace rows (`-o json`: the `range` object). With `--by`, only the range's requests are grouped. In an open-loop run (`--rate`), the arrivals due in the range that never started are counted (`missed_arrivals_count`) and count in its percentiles, each at the least it waited, as in the whole run: the percentiles are then "at least" values, printed with `≥` (`latency_at_least`) |
 | `--until DURATION` | only the time range up to this far into the window (default: its end) |
 
 An operation counts in the range it started in, a request in the range it was sent in. When the
@@ -1268,6 +1269,12 @@ request rows, the per-second timeline, and the report). `oprobe-trace` writes `o
 files (one JSON document: the aggregates, service posture and sampled rows). `oprobe show FILE`
 and the app open both, as well as standalone `.prove.json` (`oprobe.prove/9`) files.
 
+A run file keeps every row up to `max_requests` rows (`[defaults]`, 1 000 000). Past that the
+rows are thinned, each kept row carrying the operations it stands for; failed and throttled
+operations are kept in full for twice as long, then thinned the same way. However long the run
+and whatever it met, the file stays within what `show` and the app read (4 GiB of rows): a run
+that reaches that keeps its aggregates exact and stops keeping rows.
+
 
 <!-- source: docs/embedding.md -->
 
@@ -1375,6 +1382,16 @@ wherever the layer sits. The layer then sees each request from outside:
 `format!("{trace:?}")` says which one a layer does (`http_transport: "replaced by the
 instrumented client"` or `"the installed transport, observed"`).
 
+What was not observed is not reported as a number. With `keep_http_transport(true)`:
+- `Snapshot::connections` counts the requests by protocol, and nothing else:
+  `connections.observed()` is false, and `dialed`, `reused_requests` and `reuse_pct` say nothing
+  (until 9.2 every answered request counted as reused: "100 %"). `oprobe show FILE` prints
+  `dials not observed · reuse not observed`.
+- The file's `service` says `"http_transport": "installed"` and leaves out `http_version` and
+  `keep_alive`, which describe the instrumented client (the client is yours).
+- A request row has `conn_id` 0, and its time to first byte includes connecting and sending the
+  body: a slow upload shows as a long `ttfb`, not as a slow server.
+
 ## What you get
 
 Every OpenDAL call is one **operation**, linked to the backend requests it issued, as in a run
@@ -1422,7 +1439,10 @@ let cfg = oprobe_trace::Config::default().exporter(std::sync::Arc::new(Slow));
     (they add up to the request's duration); it also carries `oprobe.api`,
     `http.request.method`, `http.response.status_code` and OpenDAL's own metric labels
     (`scheme`, `namespace`, `root`, `operation`), so its series join
-    `opendal-layer-otelmetrics`'.
+    `opendal-layer-otelmetrics`'. `scheme`, `namespace` and `root` are those of the operator
+    that issued the request: a layer cloned onto several operators labels each one's requests
+    with its own (until 9.2, with the first operator's). Your own `Exporter` reads the same
+    from `RequestRecord::service`.
 
   Backend calls of `memory` and `fs` are not HTTP requests and are in neither. Operation
   durations and cache metrics are not repeated: use OpenDAL's own metrics layers for them.
@@ -1464,11 +1484,32 @@ A connection's dial belongs to the request that started it: that request is the 
 cold one, whichever request is answered first on a shared HTTP/2 connection; a request that
 waited for another's dial shows the wait as queue time (`detail.dial_wait_us`). A dial whose
 request went elsewhere is a connection nobody waited for: counted, charged to no request.
-Kernel TCP statistics are read at the end of each request; the retransmits of a connection
-shared by concurrent HTTP/2 streams are split among the requests in flight when they are read,
-so `detail.retrans_count` adds up to the connection's count and no retransmit is charged twice.
+Kernel TCP statistics are read at the end of each request, and the connection's retransmits
+since the previous reading are charged to the requests in flight on it, so
+`detail.retrans_count` adds up to the connection's count and no retransmit is charged twice:
+- to the requests that are **sending a body**, when there are any (what a client retransmits
+  is what it sends): an upload is charged its own retransmits, not the small GET that ends
+  beside it on a shared HTTP/2 connection;
+- else evenly to all of them (on HTTP/1.1 that is the one request).
+
+A request counts as sending from the moment the transport can tell which connection carries
+its body: with one upload in flight, the only connection alive, or, once the body is handed
+to the kernel, the only one with unsent bytes in its send queue. With several uploads in
+flight it cannot, and an upload joins at its response headers; a request that ends on the
+same HTTP/2 connection before that is charged the upload's retransmits so far. An upload that
+fails or is cancelled before any response carries the retransmits of its connection when that
+connection was known.
+
 The socket of a new connection is looked up on the runtime's blocking pool (one scan of the
-descriptor table answers every connection dialed meanwhile), never on a worker thread.
+descriptor table answers every connection dialed meanwhile), never on a worker thread, and no
+request waits for it: a request reads the answer when its response headers arrive and again
+when it ends. A request that ends before the lookup answered (the first request of a
+connection, when the blocking pool is busy) has no kernel statistics; what its connection sent
+and retransmitted counts with the connection's next request. Connection ids (`conn_id`) number
+the client's connections in the order they were dialed, from 1.
+
+A response OpenDAL cannot use (a `Content-Encoding` or `Content-Length` that does not parse)
+fails the operation and is recorded as a failed request, not to be retried.
 
 Above the transport, the layer wraps the service: each call runs in an operation scope that the
 transport (and OpenDAL's background tasks, through a scope-propagating executor) reports its
@@ -1622,12 +1663,16 @@ The window works like other professional tools on your platform (design:
   does the button become **Run**. Changing the form drops the plan.
 - **Run Again** (mod+R) repeats the selected run as it ran: its operator, its whole workload
   (the open-loop rate, the dataset, the seed, the key popularity, …) and every operator value
-  that is not the default of its URL. A `lab://` run starts at once. A real target opens New
-  Run on its plan: the fields show the run's operator, workload, duration, concurrency and
-  existing prefix, and **Runs again as** shows the command whose other settings it keeps.
-  Change a field and only that changes; choose another operator or workload and it is a new
-  run, with nothing carried over. Secrets are never stored in a run: they come from the
-  operator's file, the config file or the environment, as for any run.
+  the run set on top of its operator (the `op.toml` file or the configured operator is read
+  again; for a URL, what is not the default of the URL). A `lab://` run starts at once. A real
+  target opens New Run on its plan: the fields show the run's operator, workload, duration,
+  concurrency and existing prefix, and **Runs again as** shows the command of the run the form
+  will start, as it stands now. Change the duration, the concurrency or the prefix and only
+  that changes. Choose another workload and the operator's values stay (its endpoint, its
+  layers: the run still goes where it went), while the rate, the dataset and the seed of the
+  old workload go. Choose another operator and it is a new run, with nothing carried over.
+  Secrets are never stored in a run: they come from the operator's file, the config file or
+  the environment, as for any run.
 - **Opening a file** (`.oprobe`, a trace, a report): a file is read as untrusted input. A run
   file may hold blocks of at most 256 MiB, decompress to at most 4 GiB and its rows may take
   at most 4 GiB of memory (about nine times the default cap of a million rows); a file beyond
@@ -1641,8 +1686,14 @@ The window works like other professional tools on your platform (design:
   the notice goes, the folder goes on to the system's trash where there is one; oprobe's trash
   is emptied after a week. `oprobe show --rm` in the CLI still deletes for good.
 - **Quitting** (⌘Q, Ctrl+Q, Exit, or the window's close button) while a run or a prove goes on
-  asks first: **Stop and Quit** stops it, removes its test data and quits; Cancel keeps it
-  running.
+  asks first: **Stop and Quit** stops it, or Cancel keeps it running. The app then waits for
+  the job to remove its test data, showing what it is doing and for how long, and quits by
+  itself when that is done. It waits 60 s at most (an abort of a multipart upload may take
+  30 s to give up on a service that does not answer, and the cleanup gets as long again).
+  Past that it says which job was left and that objects under its `oprobe-run-…/` prefix may
+  remain on the target (the next run against the same target removes them), and offers
+  **Quit Anyway**; the same line goes to the log file. In a terminal, Ctrl+C waits the same
+  way and prints what was left; a second Ctrl+C leaves at once.
 - **Run files**: open a `.oprobe`, `.prove.json`, report `.json` or `op.toml` file with File ▸ Open Run File… (the
   system's open dialog, filtered to those types), drop it on the window (the window is outlined
   while a file is dragged over it), or double-click a `.oprobe` / `.json` file: `oprobe.app` (macOS), the `.msi`
@@ -2238,13 +2289,9 @@ you run them.
   the workload and one row per operation and request. Object keys, request IDs and remote IP
   addresses are part of a run. Secrets are not: credential options (`secret_access_key`,
   `account_key`, `sas_token`, `password`, `*_key`, …) are redacted before anything is printed or
-  saved. URLs lose their credentials wherever they appear, in an operator, an option, a proxy
-  setting or the text of an error: `user:password@`, and the query parameters that carry a
-  signature or a token (`X-Amz-Signature`, `X-Amz-Credential`, `X-Amz-Security-Token`,
-  `Signature`, `AWSAccessKeyId`, an Azure SAS's `sig`, `X-Goog-Signature`, `x-oss-signature`,
-  `q-signature`, `access_token`, `token`, …, whatever their case). What only describes a
-  request stays readable (`X-Amz-Expires`, an SAS's `se` and `sp`). Errors, warnings and log
-  events are printed the same way.
+  saved. Every text loses the credentials it carries, in an operator, an option, a proxy
+  setting or the text of an error ([what is removed](#what-is-removed-from-a-text)). Errors,
+  warnings and log events are printed the same way.
 - **The host** is recorded as OS, architecture, CPU count and a hash of the host name, never the
   name itself.
 - **Pending-cleanup markers** in `<data dir>/oprobe/pending/`: while a run that writes is going,
@@ -2254,6 +2301,38 @@ you run them.
 
 Delete runs with `oprobe show --rm RUN…`, or remove the data directory.
 
+## What is removed from a text
+
+One function redacts every text before it is recorded, stored or printed
+(`oprobe_trace::util::strip_url_credentials`). It removes:
+
+- **`user:password@`** of every URL, also when the password holds a `/`, `?` or `#` (an AWS
+  secret key typed into a URL unescaped).
+- **Secret parameters**, by name and whatever their case: `*signature*` (`X-Amz-Signature`,
+  `X-Goog-Signature`, `x-oss-signature`, `q-signature`), `sig` and `*_sig` (an Azure SAS, a
+  Swift `temp_url_sig`), `*token*`, `*credential*`, access key ids (`AWSAccessKeyId`, …),
+  `upload_id` (the session of a GCS resumable upload is a bearer credential), `*secret*`,
+  `*password*`, `*session*`, `*authorization*`, `*jwt*`, `*hmac*`, `key`, `*_key`, `apikey`.
+  They are removed from a URL's query, from its fragment (`#access_token=…`), from a query
+  with no URL around it (`GET /b/k?X-Amz-Signature=…`), from a bare parameter list (an SAS
+  token `sv=…&sig=…`) and from a percent-encoded URL passed as a value
+  (`?next=https%3A%2F%2F…%3Fsig%3D…`). The other parameters stay, in order.
+- **The value of a lone `name=value`** with such a name (the `Signature=…` and `Credential=…`
+  of a quoted `Authorization` header, `password=…`): it reads `name=<redacted>`.
+- **The value of an `Authorization` header** quoted in a text (`Authorization: Bearer …`).
+
+What only describes a request stays readable: `X-Amz-Expires`, `X-Amz-Date`, an SAS's `se` and
+`sp`; the cursors and key ranges of a listing (`continuation-token`, `pageToken`, `start_key`,
+`end_key`, `partition-key`, `marker`), which name a position and grant nothing; S3's `uploadId`;
+switches such as `skip_signature=true`; an environment reference (`${AWS_SECRET_ACCESS_KEY}`);
+and a bare `key=…` outside a parameter list, which names an object. A name that only looks
+like a secret's is redacted.
+
+What it cannot know: a credential in none of these forms (a bare token in a path or a
+sentence, a JSON field), and a password before whose first `/` stands only a port number
+(`user:8080/…@host` reads as `host:port/path`). Percent-encode a password you put in a URL, or
+better, give credentials as options or through the environment.
+
 ## `.oprobe` files from `oprobe-trace`
 
 `Handle::save` writes what the layer saw in your process: the aggregates and a sample of
@@ -2261,9 +2340,11 @@ operations and their requests, with their API, method, status, timing, bytes, co
 request ID. Object keys are never stored: an operation's key is its first path segment (at most
 32 bytes) and a hash of the whole key (`logs/#3f2a…`), so a top-level directory name can be in
 the file, but not a key. Request IDs and remote addresses are. Credentials never are: the
-text of a failed request or operation loses the credentials of every URL in it (the signature
-and token of a presigned or SAS URL included) when it is recorded, so neither an `Exporter`,
-a `Snapshot` nor a file ever holds them. Review a file before you attach it to an issue.
+text of a failed request or operation loses the credentials it carries
+([what is removed](#what-is-removed-from-a-text): the signature and token of a presigned or SAS
+URL included, with or without a URL around them) when it is recorded, so neither an
+`Exporter`, a `Snapshot` nor a file ever holds them. Review a file before you attach it to an
+issue.
 
 ## Test data in your bucket
 
