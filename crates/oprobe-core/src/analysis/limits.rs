@@ -439,10 +439,22 @@ fn served_service_s(obs: &[Obs]) -> f64 {
     }
 }
 
-/// Little's law under an in-flight cap: `rate × service` within ±35 % of `c`.
+/// Little's law under an in-flight cap: `rate × service` is at most `c` (with 35 % of slack
+/// for the estimates). The bound is one-sided. Only a client that keeps the cap full admits
+/// `c / S`; one that backs off after a 503 (OpenDAL's default retry sleeps a second) leaves it
+/// mostly empty and admits a fraction of that, so a rate under `c / S` says nothing against
+/// the cap. 9.3 asked for ±35 % and so never recognised a bucket that restated a cap met in
+/// bursts: on `lab://parquet` over its limit of 24 (≈ 10 ms of service, 2 350 requests/s at
+/// the cap) the buckets fitted 550 to 1 700 requests/s, and one with a change point
+/// out-fitted the clean step on a slow CI machine. A rate above `c / S` is still what tells a
+/// bucket from a cap, here and in [`peak_served_ratio`].
+///
+/// The fitted burst is no evidence either way and is not consulted: the grid ties it to the
+/// rate (2 to 30 % of it), so "a burst of at most twice the step" was a test of the rate under
+/// another name (the same lab on macOS CI: 54 against a step of 24, and the cap was refused).
 fn little_matches(rate: f64, service_s: f64, c: f64) -> bool {
     let l = rate * service_s;
-    c > 0.0 && l > 0.0 && (0.65..=1.35).contains(&(l / c))
+    c > 0.0 && l > 0.0 && l / c <= 1.35
 }
 
 /// Design v5 §4: in a saturated closed loop an in-flight cap `c` with service time `S` admits
@@ -454,8 +466,8 @@ fn little_matches(rate: f64, service_s: f64, c: f64) -> bool {
 /// `TimeVarying` whose every segment obeys Little's law with its own service time) is evidence
 /// for the in-flight limit: the in-flight hypothesis takes its likelihood and, with fewer
 /// parameters, is selected. Returns the best such fit's log-likelihood and recall. A genuine
-/// bucket keeps its lead: its burst is not the in-flight ceiling, throttling happens well
-/// below the step, or the service served bursts at a request rate no cap of `c` carries
+/// bucket keeps its lead: throttling happens well below the step, its rate is more than the
+/// cap carries, or the service served bursts at a request rate no cap of `c` carries
 /// ([`peak_served_ratio`]: with OpenDAL's default retry the workers sleep 1 s after a 503 and
 /// wake in step, so a bucket of rate `r` throttles only above ≈ r·S in flight and its fitted
 /// burst sits on the grid's floor — the request rate is what tells it from a cap).
@@ -470,29 +482,19 @@ fn rate_restatement(obs: &[Obs], fits: &mut [Fit], step: Step) -> Option<(f64, f
     let t0 = obs.first().map_or(0, |o| o.t);
     let mut best: Option<(f64, f64)> = None;
     for f in fits.iter_mut() {
-        // The burst of an in-flight cap is ≈ c; the burst grid starts at a share of the rate,
-        // so a bucket on that floor asked for a burst at most that small.
-        let burst_ok = match (f.params.burst_count, f.params.requests_per_s) {
-            (Some(b), Some(r)) => {
-                let b = b as f64;
-                b <= 2.0 * cf || b <= (r * MIN_BURST_FACTOR).max(1.0).round() + 1.0
-            }
-            _ => false,
-        };
         let equivalent = match f.kind {
             HypothesisKind::RateLimit => {
-                burst_ok
-                    && f.params
-                        .requests_per_s
-                        .is_some_and(|r| little_matches(r, s_all, cf))
+                true && f
+                    .params
+                    .requests_per_s
+                    .is_some_and(|r| little_matches(r, s_all, cf))
             }
             HypothesisKind::TimeVarying => {
                 let cp = f.params.change_points_s.first().copied().unwrap_or(0.0);
                 let cut = t0 + (cp * 1e6) as i64;
                 let (a, b): (Vec<Obs>, Vec<Obs>) = obs.iter().partition(|o| o.t < cut);
                 let segs = &f.params.segment_requests_per_s;
-                burst_ok
-                    && segs.len() == 2
+                true && segs.len() == 2
                     && little_matches(segs[0], served_service_s(&a), cf)
                     && little_matches(segs[1], served_service_s(&b), cf)
             }
@@ -503,7 +505,7 @@ fn rate_restatement(obs: &[Obs], fits: &mut [Fit], step: Step) -> Option<(f64, f
                 best = Some((f.ll, f.explains));
             }
             f.evidence.push(format!(
-                "indistinguishable from the in-flight limit of {c}: holding {c} requests in flight at ≈{:.1} ms of service admits ≈{:.0} requests/s in bursts of ≈{c}, which is this bucket",
+                "indistinguishable from the in-flight limit of {c}: holding {c} requests in flight at ≈{:.1} ms of service admits up to ≈{:.0} requests/s in bursts of ≈{c}, and this bucket asks for no more",
                 s_all * 1e3,
                 cf / s_all.max(1e-9)
             ));
@@ -1605,6 +1607,42 @@ pub(crate) mod tests {
                 "{rate:#?}"
             );
         }
+    }
+
+    /// The fits of a release-CI run of `lab://parquet` with 24 workers over the lab's limit of
+    /// 24 in flight: a clean step (nothing throttled at or below 24), and a bucket whose rate
+    /// "changed" from 1 131 to 595 requests/s that fitted the bursts better. Both rates are far
+    /// under the 2 400 requests/s the cap carries at 10 ms of service, because the workers
+    /// sleep a second after a 503: the bucket restates the cap.
+    #[test]
+    fn a_bucket_slower_than_an_unsaturated_cap_restates_it() {
+        let (reqs, ops) = closed_loop(48, 10.0, 1.0, 1000.0, 2300.0, |_, n| n < 24);
+        let (r, o): (Vec<&ReqRow>, Vec<&OpRow>) = (reqs.iter().collect(), ops.iter().collect());
+        let (obs, _, _) = observations(&r, &o);
+        let bucket = |segs: Vec<f64>, burst: u64| Fit {
+            kind: HypothesisKind::TimeVarying,
+            params: HypothesisParams {
+                requests_per_s: segs.iter().copied().reduce(f64::min),
+                burst_count: Some(burst),
+                change_points_s: vec![0.93],
+                segment_requests_per_s: segs,
+                ..Default::default()
+            },
+            ll: -53.7,
+            k: 8.0,
+            explains: 1.0,
+            evidence: Vec::new(),
+        };
+        let step: Step = (24, -83.3, 0.0, 0.777);
+        let mut fits = vec![bucket(vec![1131.0, 595.0], 48)];
+        assert_eq!(rate_restatement(&obs, &mut fits, step), Some((-53.7, 1.0)));
+        assert!(fits[0].evidence[0].contains("indistinguishable"));
+        // macOS CI, the same lab: a burst of 54, more than twice the step.
+        let mut fits = vec![bucket(vec![829.8, 1062.6], 54)];
+        assert!(rate_restatement(&obs, &mut fits, step).is_some());
+        // A rate no cap of 24 carries at this service time is a bucket's own.
+        let mut fits = vec![bucket(vec![4000.0, 3600.0], 48)];
+        assert_eq!(rate_restatement(&obs, &mut fits, step), None);
     }
 
     /// The same blurred client against a genuine bucket (300/s, burst 15): still a rate limit.
