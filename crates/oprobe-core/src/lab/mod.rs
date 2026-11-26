@@ -356,7 +356,7 @@ impl Scenario {
                  default workload: small-files, 64 × 64 KiB, 28 workers, 0.5 s warmup, 8 s"
             }
             Scenario::Throttle => {
-                "5 ms latency, 503 SlowDown above 8 concurrent requests; default workload: small-files, 32 workers"
+                "5 ms latency, 503 SlowDown above 8 concurrent requests; default workload: small-files, 48 workers"
             }
             Scenario::Stragglers => "5 ms latency, 3% of requests wait 400 ms",
             Scenario::Lossy => "20 ms latency, responses capped at 4 MiB/s per stream",
@@ -502,11 +502,19 @@ pub const DEMO_CONCURRENCY: usize = 28;
 pub const DEMO_STRAGGLER_EVERY: usize = 40;
 /// Extra delay of a `lab://demo` straggler.
 pub const DEMO_STRAGGLER_MS: u64 = 250;
-/// Workers of the `lab://throttle` default workload: four times its in-flight limit of 8. At
+/// Workers of the `lab://throttle` default workload: six times its in-flight limit of 8. At
 /// the profile default of 16, a few tenths of a percent of the operations met a 503 and its 1 s
 /// backoff, above the p99: the finding's remedy (a cap at the limit) then only queued the
 /// workers, and its prove on p99 could not decide (W8).
-pub const THROTTLE_CONCURRENCY: usize = 32;
+///
+/// 48, not 32: the workers start in step, so each burst rejects `workers − 8` of them, and
+/// those are the slow operations of a trial. The lab serves at most 8 requests per 5 ms
+/// (1 600/s), so a 2 s trial holds up to 3 200 operations and its p99 is the backoff only
+/// when more than 32 are slow. With 32 workers a burst rejects 24: about 1 % of a trial, on
+/// either side of the p99 depending on how fast the machine is (on a fast CI runner the
+/// baseline read 9 ms in some trials and 1 s in others, and the prove could not decide).
+/// With 48 a burst rejects 40.
+pub const THROTTLE_CONCURRENCY: usize = 48;
 /// Workers of the `lab://parquet` default workload (4 requests in flight per op: 6 fit, 8 throttle).
 pub const PARQUET_CONCURRENCY: usize = 8;
 

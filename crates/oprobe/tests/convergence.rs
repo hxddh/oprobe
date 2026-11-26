@@ -284,7 +284,7 @@ fn the_default_rate_limit_lab_is_a_rate_limit() {
     improved(&p);
 }
 
-/// The default `lab://throttle` (32 workers over an in-flight limit of 8): the finding's
+/// The default `lab://throttle` (48 workers over an in-flight limit of 8): the finding's
 /// `next`, run exactly as printed, proves the cap `improved` on p99 (W8: 9.0's `next` named no
 /// objective, and at 16 workers the throttled operations' backoffs sat above the p99).
 #[test]

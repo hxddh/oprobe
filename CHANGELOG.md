@@ -87,6 +87,10 @@ code is worth when pasted. It adds no command and no flag, and every v9 file of 
 - **A throttled trial no longer poisons the next.** After a trial that ended throttled, `prove`
   cools down (the longest `Retry-After` it saw, at least twice the trial warm-up, at most 5 s)
   before the next trial; the wait counts in `--max-duration` and is noted once.
+- **`lab://throttle` defaults to 48 workers** (was 32). A burst rejected 24 of 32 workers, about
+  1 % of a trial's operations: on a fast machine the baseline's p99 fell on either side of the
+  backoff from one trial to the next, and the default prove could not decide. A burst now
+  rejects 40, above 1 % at any speed the lab serves.
 - **A p99 limit cannot be passed by a stalled open loop.** Arrivals of a `--rate` run that never
   completed have no latency, only the time they had waited; the limit is now checked against the
   worst they allow: breached when more than 1 % of the scheduled arrivals never completed ("p99
