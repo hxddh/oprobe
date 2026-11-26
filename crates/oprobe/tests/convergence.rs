@@ -475,13 +475,9 @@ fn parquet_ranges_are_fetched_concurrently() {
 /// Scans with four ranges in flight each, from twice as many workers as the lab's limit of 24
 /// requests in flight lets through: the limit is found and the cap is sized at it.
 ///
-/// 24 workers, not 12. A worker that meets a 503 sleeps a second, so the requests in flight
-/// average under 10 whatever the worker count, and the limit shows only where workers overlap.
-/// With 12 workers that is little more than the start, when they scan in step: about 40
-/// throttled responses, all in one burst on a fast machine (Linux CI: 39 in 2 060 requests),
-/// which a token bucket of that burst explains as well as a limit of 24 does. The fit then
-/// called it a rate limit. With 24 workers the overlaps recur through the window (three to
-/// four times the throttled responses, at every speed), and only the in-flight step fits them.
+/// The workers sleep a second after a 503, so the limit is crossed in bursts and stays mostly
+/// empty: the buckets that fit those bursts ask for a fraction of what 24 in flight carry, and
+/// restate the limit (`limits::little_matches`).
 #[test]
 fn parquet_scans_over_the_inflight_limit_are_capped() {
     let env = Env::new();

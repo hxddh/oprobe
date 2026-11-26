@@ -14,12 +14,21 @@ All notable changes to this project are documented here. The format follows
   `cargo install --locked --git https://github.com/hxddh/oprobe --tag vX.Y.Z oprobe`.
   `oprobe-trace` remains the one crate published to crates.io, when the release has a token.
 
+### Fixed
+
+- **An in-flight limit met in bursts is no longer reported as a rate limit.** A token bucket
+  that fits the throttled responses of a clean in-flight step restates the step, and the step
+  is selected; 9.3 recognised that only when the bucket's rate matched what the limit carries
+  when it is full (limit ÷ service time, within 35 %). Workers that back off after a 503 (a
+  second, with OpenDAL's default retry) leave the limit mostly empty, so the bucket's rate was
+  a fraction of that and the finding could read `rate_limit`, or a limit that "changed" during
+  the run. A rate under what the limit carries no longer counts against it; a rate above it
+  still marks a bucket. The first build of this release failed its own tests on this.
+
 ### Known issues
 
-- A limit on requests in flight that a run crosses only in one burst (workers that start in
-  step and then back off) can be reported as a `rate_limit`: a token bucket of that burst fits
-  the same responses. The remedy path is the same (`layers.concurrent_limit.http`); the cap
-  `prove` sizes may differ. The test for it now crosses the limit throughout its window.
+- A bucket whose fitted burst is more than twice the in-flight step is still taken for a rate
+  limit, on any run. The remedy path is the same (`layers.concurrent_limit.http`).
 
 ## v9.3.0 — 2026-11-26
 
