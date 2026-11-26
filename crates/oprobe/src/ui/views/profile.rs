@@ -517,7 +517,12 @@ fn requests(m: &Rc<ProfileModel>, cx: Ctx) -> Option<View> {
                                     fmt::bytes(a.down_bytes),
                                     fmt::bytes(a.up_bytes)
                                 ),
-                                fmt::ratio(a.reused_ratio),
+                                // Unknown is not 0 %: the operator's own HTTP client.
+                                if m.conns.observed {
+                                    fmt::ratio(a.reused_ratio)
+                                } else {
+                                    "–".to_owned()
+                                },
                             ]
                         })
                         .collect();
@@ -2164,7 +2169,9 @@ fn conns(m: &ProfileModel, cx: Ctx) -> View {
         .child(
             prop(
                 tr("conn.dialed"),
-                if c.warmup_dialed_count > 0 {
+                if !c.observed {
+                    tr("conn.not_observed").to_owned()
+                } else if c.warmup_dialed_count > 0 {
                     fill(
                         "conn.dialed_of",
                         &[
@@ -2182,7 +2189,14 @@ fn conns(m: &ProfileModel, cx: Ctx) -> View {
             (c.dial_failures_count > 0)
                 .then(|| prop(tr("conn.dial_failures"), fmt::count(c.dial_failures_count))),
         )
-        .child(prop(tr("conn.reuse"), fmt::ratio(c.reuse_ratio)))
+        .child(prop(
+            tr("conn.reuse"),
+            if c.observed {
+                fmt::ratio(c.reuse_ratio)
+            } else {
+                tr("conn.not_observed").to_owned()
+            },
+        ))
         .child(prop(
             tr("conn.protocols"),
             [

@@ -17,8 +17,12 @@
 /// (permissions) and `sv`, `X-Amz-Date`, `X-Amz-Expires`, `X-Amz-SignedHeaders`, and the
 /// cursors and key ranges of a listing, which name a position and grant nothing
 /// (`continuation-token`, `pageToken`, `start_key`, `end_key`, `partition-key`, whatever their
-/// case and their `-` or `_`). Any other name that looks like a secret's is one.
+/// case and their `-` or `_`); and switches ([`is_switch_key`]: `skip_signature=true` turns
+/// signing off, it signs nothing). Any other name that looks like a secret's is one.
 pub fn is_secret_query_key(name: &str) -> bool {
+    if is_switch_key(name) {
+        return false;
+    }
     const CURSORS: [&str; 5] = [
         "continuationtoken",
         "pagetoken",
@@ -64,6 +68,22 @@ pub fn is_secret_query_key(name: &str) -> bool {
         || ["_key", "-key", "_sig", "-sig"].iter().any(|n| ends_with(n))
 }
 
+/// Whether the option or parameter `name` is a switch: `skip_…`, `disable_…`, `enable_…` or
+/// `allow_…` (OpenDAL's `skip_signature`, `disable_config_load`, `allow_anonymous`), also
+/// behind a path (`options.skip_signature`). A switch says whether something is used and is
+/// never a credential, whatever else its name holds. 9.2 took `skip_signature` for a
+/// signature: a run of a public bucket lost the option from its stored operator and its
+/// replay command, which then signed with whatever credentials were around.
+pub fn is_switch_key(name: &str) -> bool {
+    const SWITCHES: [&str; 4] = ["skip", "disable", "enable", "allow"];
+    let name = name.rsplit('.').next().unwrap_or(name).as_bytes();
+    SWITCHES.iter().any(|s| {
+        name.len() > s.len()
+            && name[..s.len()].eq_ignore_ascii_case(s.as_bytes())
+            && matches!(name[s.len()], b'_' | b'-')
+    })
+}
+
 /// What stands for a removed value where the name around it stays.
 const REDACTED: &str = "<redacted>";
 
@@ -88,11 +108,14 @@ fn ends_url(c: char) -> bool {
 ///   `https://h/k?partNumber=2`);
 /// - the same inside a percent-encoded value (`?next=https%3A%2F%2Fh%2Fk%3Fsig%3D…`);
 /// - the value of a lone `name=value` with such a name (the `Signature=…` and `Credential=…`
-///   of a quoted `Authorization` header, `password=…`), which becomes `name=<redacted>`;
+///   of a quoted `Authorization` header, `password=…`), which becomes `name=<redacted>`. A
+///   bare `key=…` outside a parameter list stays: there it names an object far more often
+///   than it carries an API key;
 /// - the value of an `Authorization` header (`Authorization: Bearer …`).
 ///
 /// Text without such credentials is returned unchanged, byte for byte. A value that is an
-/// environment reference (`${NAME}`) or already `<redacted>` stays.
+/// environment reference (`${NAME}`), a documentation ellipsis (`…`) or already `<redacted>`
+/// stays.
 ///
 /// What it cannot know: a credential in none of these forms (a bare token in a path or in
 /// prose, a JSON field), and a password before whose first `/` stands only a port number
@@ -216,10 +239,10 @@ fn name_start(s: &str, floor: usize, end: usize) -> usize {
         .map_or(floor, |(at, c)| floor + at + c.len_utf8())
 }
 
-/// A value that is no secret whatever its name: nothing, a reference to the environment, or
-/// what an earlier redaction left.
+/// A value that is no secret whatever its name: nothing, a reference to the environment, the
+/// ellipsis of a hint (`--set options.account_key=…`), or what an earlier redaction left.
 fn is_placeholder(value: &str) -> bool {
-    value.is_empty() || value.starts_with(REDACTED) || value.starts_with("${")
+    value.is_empty() || [REDACTED, "${", "…"].iter().any(|p| value.starts_with(p))
 }
 
 /// How many spaces `s` starts with.
@@ -368,7 +391,11 @@ fn strip_parameters(s: &str, depth: u8) -> Option<String> {
         let list_end = (list_start + list.len()).max(eq + 1);
         if lead.is_none() && !list.contains('&') {
             // A lone `name=value` in prose: the name stays and the value goes (up to its
-            // closing quote when it is quoted).
+            // closing quote when it is quoted). `key=…` there is the key of an object
+            // (`expected key=value`, `key=a/b.parquet not found`).
+            if s[start..eq].eq_ignore_ascii_case("key") {
+                continue;
+            }
             let (value_start, value_end) = match after.chars().next() {
                 Some(q @ ('"' | '\'')) => {
                     let inner = eq + 1 + q.len_utf8();
@@ -587,6 +614,8 @@ mod tests {
             "page_access_token",
             "start_key_secret",
             "row_key",
+            "skipped_signature",
+            "allowed-token",
         ] {
             assert!(is_secret_query_key(k), "{k} must be secret");
         }
@@ -627,6 +656,12 @@ mod tests {
             "upload-id-marker",
             "start-after",
             "max-keys",
+            // Switches: whether something is used.
+            "skip_signature",
+            "options.skip_signature",
+            "disable-token-refresh",
+            "enable_session_cache",
+            "Allow_Credentials",
         ] {
             assert!(!is_secret_query_key(k), "{k} is not secret");
         }
@@ -652,6 +687,12 @@ mod tests {
             "s3://b/p?uploadId=VXBsb2FkIElE&partNumber=3",
             "the authorization header is malformed; the region 'us-east-1' is wrong",
             "options.secret_access_key=<redacted> options.token=${TOKEN}",
+            // Hints and messages of oprobe itself.
+            "send unsigned requests to a public bucket with --set options.skip_signature=true",
+            "s3://bucket/p?skip_signature=true&region=us-east-1",
+            "set them in the operator's options (`--set options.access_key_id=…`, or `[options]`)",
+            "invalid condition `x` (expected key=value)",
+            "object key=a/b.parquet not found",
             "Authorization: <redacted>",
             "http://[::1]:9000/a@b",
             "x%3Dy=%41%42",

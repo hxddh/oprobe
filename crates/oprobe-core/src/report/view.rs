@@ -1091,8 +1091,10 @@ pub struct TcpView {
 }
 
 impl TcpView {
-    /// `rtt p50/p99 1.2ms/3.4ms · 2 of 16 connections retransmitted · rwnd-limited 3.0% ·
-    /// sndbuf-limited 0.0% · delivery p50 812 Mbit/s`.
+    /// `rtt p50/p99 1.2ms/3.4ms · 2 of 16 connections in use retransmitted · rwnd-limited
+    /// 3.0% · sndbuf-limited 0.0% · delivery p50 812 Mbit/s`. The connections are the ones
+    /// that carried the window's requests: a connection dialed and left idle (a pool keeps
+    /// one more than it uses at a time) is among the dialed, not among these.
     pub fn line(&self) -> String {
         use crate::util::fmt_ms;
         let min = self
@@ -1106,7 +1108,7 @@ impl TcpView {
             })
             .unwrap_or_default();
         let mut s = format!(
-            "{min}smoothed rtt p50/p99 {}/{} · {} of {} connections retransmitted · rwnd-limited {:.1}% · sndbuf-limited {:.1}%",
+            "{min}smoothed rtt p50/p99 {}/{} · {} of {} connections in use retransmitted · rwnd-limited {:.1}% · sndbuf-limited {:.1}%",
             fmt_ms(self.rtt_p50_us as f64 / 1000.0),
             fmt_ms(self.rtt_p99_us as f64 / 1000.0),
             self.retransmitting_connections_count,
@@ -1226,7 +1228,14 @@ impl ColdStartView {
 /// handshakes and the cold start. The one model of the Connections section of every front end.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ConnectionView {
-    /// `http/1.1 · plain`, `h2 · TLSv1.3 · …`.
+    /// Whether the connections were observed (`ConnStats::observed`). They were not when the
+    /// profiled operator kept its own HTTP client (oprobe-trace's
+    /// `Config::keep_http_transport`): the dials, the reuse and the dial phases are then
+    /// unknown, which every front end says instead of "0 dialed" and "0 % warm", and each
+    /// request's time to first byte includes connecting and sending its body.
+    pub observed: bool,
+    /// `http/1.1 · plain`, `h2 · TLSv1.3 · …`; the protocols of the responses alone when the
+    /// connections were not observed.
     pub protocol: String,
     /// `TLSv1.3 · h2` (empty for plain connections).
     pub tls: String,
@@ -1258,8 +1267,20 @@ impl ConnectionView {
     pub fn of(r: &Report, run: Option<&Run>) -> Self {
         let c = &r.connections;
         let n = &r.network;
+        let observed = c.observed();
         Self {
-            protocol: super::connection_protocol(c),
+            observed,
+            protocol: if observed {
+                super::connection_protocol(c)
+            } else {
+                // Whether they were encrypted is the client's to know.
+                [("http/1.1", c.http1_requests), ("h2", c.http2_requests)]
+                    .iter()
+                    .filter(|(_, requests)| *requests > 0)
+                    .map(|(protocol, _)| *protocol)
+                    .collect::<Vec<_>>()
+                    .join(" + ")
+            },
             tls: [c.tls_version.as_str(), c.alpn.as_str()]
                 .iter()
                 .filter(|s| !s.is_empty())
@@ -1345,9 +1366,34 @@ impl ConnectionView {
         }
     }
 
+    /// What every front end says where a count of connections would stand, when they were
+    /// not observed.
+    pub const NOT_OBSERVED: &'static str = "not observed";
+
+    /// `99.6% of requests warm`; `reuse not observed` when the connections were not.
+    pub fn reuse_line(&self) -> String {
+        if self.observed {
+            format!("{:.1}% of requests warm", self.reuse_ratio * 100.0)
+        } else {
+            format!("reuse {}", Self::NOT_OBSERVED)
+        }
+    }
+
+    /// Why the connections were not observed and what that does to the stages, for a
+    /// profile where they were not.
+    pub fn unobserved_note(&self) -> Option<&'static str> {
+        (!self.observed).then_some(
+            "the requests went through the operator's own HTTP client: connecting and sending are part of ttfb",
+        )
+    }
+
     /// The connections dialed, each count with its window: `28 dialed during warm-up · 1 in
-    /// the window` (the window alone when nothing was dialed during a warm-up).
+    /// the window` (the window alone when nothing was dialed during a warm-up); `dials not
+    /// observed` when the connections were not.
     pub fn dials_line(&self) -> String {
+        if !self.observed {
+            return format!("dials {}", Self::NOT_OBSERVED);
+        }
         if self.warmup_dialed_count > 0 {
             format!(
                 "{} dialed during warm-up · {} in the window",
@@ -3607,7 +3653,7 @@ mod tests {
         let tcp = v.tcp.as_ref().unwrap();
         assert_eq!(
             tcp.line(),
-            "smoothed rtt p50/p99 1.20ms/3.40ms · 2 of 16 connections retransmitted · rwnd-limited 3.0% · sndbuf-limited 0.0% · delivery p50 812 Mbit/s"
+            "smoothed rtt p50/p99 1.20ms/3.40ms · 2 of 16 connections in use retransmitted · rwnd-limited 3.0% · sndbuf-limited 0.0% · delivery p50 812 Mbit/s"
         );
         // One count of dials, each with its window (K18): 16 in the warm-up's cold start.
         assert_eq!(v.warmup_dialed_count, 16);
@@ -3642,6 +3688,35 @@ mod tests {
         );
         assert!(!quiet.networked());
         assert_eq!(quiet.dials_line(), "0 dialed in the window");
+    }
+
+    /// A profile whose operator kept its own HTTP client (oprobe-trace's
+    /// `keep_http_transport`): its connections were not observed, and the view says so
+    /// instead of counting (9.2: "0 dialed in the window · 100.0% of requests warm" on
+    /// "http/1.1 · plain", whatever the client did).
+    #[test]
+    fn unobserved_connections_are_not_reported_as_none_dialed_and_all_warm() {
+        let mut r = crate::report::fixture::report();
+        let c = &mut r.connections;
+        c.requests = 100;
+        c.http2_requests = 100;
+        c.peak_inflight_requests = 8;
+        let v = ConnectionView::of(&r, None);
+        assert!(v.networked() && !v.observed);
+        assert_eq!(v.dials_line(), "dials not observed");
+        assert_eq!(v.reuse_line(), "reuse not observed");
+        assert_eq!(v.protocol, "h2");
+        assert!(v.unobserved_note().is_some_and(|n| n.contains("ttfb")));
+
+        // The instrumented client's connections: numbers.
+        let c = &mut r.connections;
+        (c.reused_requests, c.reuse_pct, c.dialed) = (99, 99.0, 1);
+        let v = ConnectionView::of(&r, None);
+        assert!(v.observed);
+        assert_eq!(v.dials_line(), "1 dialed in the window");
+        assert_eq!(v.reuse_line(), "99.0% of requests warm");
+        assert_eq!(v.protocol, "http/1.1 · plain");
+        assert_eq!(v.unobserved_note(), None);
     }
 
     #[test]

@@ -470,6 +470,10 @@ static EN: &[(&str, &str)] = &[
     ("profile.warnings", "Warnings"),
     ("conn.dialed", "Connections dialed"),
     ("conn.reuse", "Reused connections"),
+    (
+        "conn.not_observed",
+        "not observed (the operator's own HTTP client)",
+    ),
     ("conn.protocols", "Protocols"),
     ("conn.peak", "Peak requests in flight"),
     ("conn.dial_failures", "Failed dials"),
@@ -1202,6 +1206,7 @@ static ZH: &[(&str, &str)] = &[
     ("profile.warnings", "警告"),
     ("conn.dialed", "新建连接数"),
     ("conn.reuse", "复用连接的请求"),
+    ("conn.not_observed", "未观测（Operator 自带的 HTTP 客户端）"),
     ("conn.protocols", "协议"),
     ("conn.peak", "在途请求峰值"),
     ("conn.dial_failures", "建连失败"),
