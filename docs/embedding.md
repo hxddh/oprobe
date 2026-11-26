@@ -1,12 +1,11 @@
 # Profiling production: `oprobe-trace`
 
-[`oprobe-trace`](https://crates.io/crates/oprobe-trace) is oprobe's instrumentation as one
+`oprobe-trace` is oprobe's instrumentation as one
 OpenDAL layer. Add it to the operator your service already uses, and every backend request is
 timed by stage and aggregated in bounded memory. Save a `.oprobe` file and open it with
 `oprobe show FILE` or in the app, like any run.
 
-It is the only crate oprobe publishes with a semver promise. (`oprobe-core` is on crates.io only
-so that `cargo install oprobe` works; it is internal.)
+It is the only crate oprobe publishes, and it has a semver promise.
 
 **Requirements.** OpenDAL 0.59 (`opendal` or `opendal-core`; another minor shows up as trait
 errors about `Layer` or `Servicer`), the Tokio runtime, Rust 1.91 or later (OpenDAL 0.59's own
@@ -18,7 +17,9 @@ meter).
 
 ```toml
 [dependencies]
-oprobe-trace = "9"
+oprobe-trace = "9"                      # once it is on crates.io
+# until then:
+# oprobe-trace = { git = "https://github.com/hxddh/oprobe", tag = "v9.3.0" }
 ```
 
 ```rust

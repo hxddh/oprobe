@@ -58,7 +58,8 @@ pub fn base_operator(target: &TargetSpec) -> Result<Operator> {
             ),
         )
         .with_hint(
-            "install a build with every service: `cargo install oprobe --features all-services`",
+            "install a build with every service: `cargo install --locked --git \
+             https://github.com/hxddh/oprobe oprobe --features all-services`",
         )
         .into());
     }

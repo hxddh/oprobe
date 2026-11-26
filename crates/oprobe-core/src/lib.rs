@@ -1,8 +1,7 @@
 //! **Internal: no semver promise.** oprobe-core is the engine of the `oprobe` binary (a
 //! profiler for OpenDAL operators): the operator spec, workloads, the profile and its findings,
-//! `prove`, the run store and the lab. It is published only so that `cargo install oprobe`
-//! works, and `oprobe` pins it with an exact version. To profile your own operator, use
-//! [`oprobe_trace`].
+//! `prove`, the run store and the lab. It is not published to crates.io. To profile your own
+//! operator, use [`oprobe_trace`].
 //!
 //! Front ends call the service layer, [`app::App`]; the other modules are its building blocks.
 

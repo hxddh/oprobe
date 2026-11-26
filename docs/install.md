@@ -6,19 +6,11 @@
 |---|---|
 | macOS, Linux | `curl -fsSL https://github.com/hxddh/oprobe/releases/latest/download/install.sh \| sh` |
 | macOS, Linux (CLI only) | `curl -fsSL https://github.com/hxddh/oprobe/releases/latest/download/install.sh \| sh -s -- --cli` |
-| Homebrew (when published) | `brew install hxddh/tap/oprobe` (the app bundle: `brew install --cask hxddh/tap/oprobe-app`) |
 | Windows | `irm https://github.com/hxddh/oprobe/releases/latest/download/install.ps1 \| iex`, or the `.msi` |
-| Windows, Scoop (when published) | `scoop bucket add hxddh https://github.com/hxddh/scoop-bucket` then `scoop install oprobe` |
-| Windows, winget | `winget install hxddh.oprobe`, once the package is accepted into winget-pkgs ([below](#windows)) |
 | Debian, Ubuntu, Fedora, RHEL | the `.deb` / `.rpm` from the release page |
-| Rust ≥ 1.97 (crates.io, when published) | `cargo install oprobe --locked`; until then `cargo install --locked --git https://github.com/hxddh/oprobe oprobe` |
+| Rust ≥ 1.97 (from source) | `cargo install --locked --git https://github.com/hxddh/oprobe --tag v9.3.0 oprobe` |
 
 Then try it with no account: `oprobe demo` ([getting started](getting-started.md)).
-
-Rows marked **when published** depend on the project's package channels (the Homebrew tap, the
-Scoop bucket, crates.io). A release publishes to a channel only when its publishing credentials
-are set, and its release notes list only the channels it published to; until then, use the
-install scripts, the release assets or `cargo install --git`.
 
 ## The app and the CLI-only build
 
@@ -27,7 +19,7 @@ Every platform has two builds of the same program:
 - **the app build** (the default everywhere): the four commands plus the app, in a native window
   on macOS and Windows and in the terminal everywhere ([app](app.md));
 - **the CLI-only build** (`oprobe-cli-<ver>-<target>` archives, `install.sh --cli`,
-  `install.ps1 -Cli`, `cargo install oprobe --no-default-features --features cli`): the four
+  `install.ps1 -Cli`, `cargo install … --no-default-features --features cli`): the four
   commands, text and JSON, no app. It is smaller and pulls in no UI toolkit, for servers, CI and
   containers.
 
@@ -61,8 +53,8 @@ there is one; without a terminal (CI, `docker build`) it changes nothing and pri
 add. `install.ps1` adds its directory to the user `PATH` and to the current session. It installs
 the native ARM64 build on ARM64 Windows.
 
-**Updating.** Run the install script again, or use your package manager (`brew upgrade oprobe`,
-`scoop update oprobe`, `winget upgrade hxddh.oprobe`, `cargo install oprobe --locked`).
+**Updating.** Run the install script again, install the newer package, or run `cargo install`
+with the newer tag.
 
 ## Release assets
 
@@ -80,39 +72,20 @@ the native ARM64 build on ARM64 Windows.
 | `oprobe-<ver>-x64.msi` / `-arm64.msi` | Windows installer: `PATH`, Start menu entry, removable in *Apps* |
 | `oprobe-<ver>-x86_64-pc-windows-msvc.zip` / `aarch64-…` | Windows portable |
 | `oprobe-cli-<ver>-<target>.tar.gz` / `.zip` | the CLI-only build for each target above (`universal-apple-darwin` on macOS) |
-| `oprobe.rb` / `oprobe-app.rb` | Homebrew formula `oprobe` and cask `oprobe-app` |
-| `oprobe.json` | Scoop manifest |
-| `winget-manifests.zip` | winget manifests for the `.msi` |
 | `latest.json` | machine-readable index: version, every asset's URL, size and SHA-256 |
 | `install.sh` / `install.ps1` | the install scripts |
 | `SHA256SUMS` | checksums of every asset |
 
 Archives contain `oprobe` (`oprobe.exe`), `README.md`, `LICENSE` and `CHANGELOG.md`.
 
-## Homebrew
-
-```bash
-brew install hxddh/tap/oprobe               # the command line with the app in the terminal
-brew install --cask hxddh/tap/oprobe-app    # oprobe.app, the native window (macOS)
-```
-
-The formula and the cask have different names, so both can be installed. Each release also
-attaches them (`oprobe.rb`, `oprobe-app.rb`) for a local tap.
-
 ## Windows
 
 ```powershell
 irm https://github.com/hxddh/oprobe/releases/latest/download/install.ps1 | iex   # no admin rights
 & ([scriptblock]::Create((irm https://github.com/hxddh/oprobe/releases/latest/download/install.ps1))) -Cli
-scoop bucket add hxddh https://github.com/hxddh/scoop-bucket; scoop install oprobe
 ```
 
 The `.msi` installs for all users (Start menu entry, `PATH`, removable in *Apps*).
-
-**winget:** each release opens a pull request to
-[winget-pkgs](https://github.com/microsoft/winget-pkgs); `winget install hxddh.oprobe` works
-only after Microsoft's review accepts the package. Until then (check with
-`winget search hxddh.oprobe`), use one of the commands above or the `.msi`.
 
 ## Debian, Ubuntu, Fedora
 
@@ -124,14 +97,12 @@ sudo dnf install ./oprobe-<ver>-1.x86_64.rpm
 ## From source
 
 ```bash
-cargo install oprobe --locked                                         # the app in the terminal
-cargo install oprobe --locked --features gui                          # plus native windows (Linux: libgtk-4-dev)
-cargo install oprobe --locked --no-default-features --features cli    # the CLI only
-cargo install --locked --git https://github.com/hxddh/oprobe --tag v7.1.0 oprobe
+cargo install --locked --git https://github.com/hxddh/oprobe --tag v9.3.0 oprobe                                         # the app in the terminal
+cargo install --locked --git https://github.com/hxddh/oprobe --tag v9.3.0 oprobe --features gui                          # plus native windows (Linux: libgtk-4-dev)
+cargo install --locked --git https://github.com/hxddh/oprobe --tag v9.3.0 oprobe --no-default-features --features cli    # the CLI only
 ```
 
-`cargo install oprobe` also downloads `oprobe-core`, oprobe's internal engine crate, at exactly
-the same version. To embed oprobe's instrumentation in your own program use
+oprobe is not on crates.io. To embed oprobe's instrumentation in your own program use
 [`oprobe-trace`](embedding.md).
 
 ## Verifying a download
@@ -178,9 +149,7 @@ are **not signed or notarized**. The operating system asks for one confirmation 
 - **Either, from a terminal**: `xattr -dr com.apple.quarantine /Applications/oprobe.app`.
 - **Windows**: SmartScreen says "Windows protected your PC": click **More info** → **Run anyway**.
 
-The Homebrew formula, Scoop, winget, the install scripts, `cargo install` and the plain archives
-used from a terminal are not affected. The Homebrew **cask** (`oprobe-app`) is: Homebrew keeps the
-quarantine attribute on the apps it installs, so the first open of `oprobe.app` asks as above.
+The install scripts, `cargo install` and the plain archives used from a terminal are not affected.
 The app is signed ad hoc, so macOS may refuse to verify its developer, but never reports it as
 damaged. Verify the download ([above](#verifying-a-download)) before you
 confirm.

@@ -173,10 +173,9 @@ oprobe prove last --with layers.retry.max_times=5 --max-duration 5m -o json > pr
 | Platform | |
 |---|---|
 | macOS / Linux | `curl -fsSL https://github.com/hxddh/oprobe/releases/latest/download/install.sh \| sh` (`-s -- --cli` for the CLI without the app) |
-| Homebrew (when published) | `brew install hxddh/tap/oprobe` (the app bundle: `brew install --cask hxddh/tap/oprobe-app`) |
-| Windows | `irm https://github.com/hxddh/oprobe/releases/latest/download/install.ps1 \| iex`, the `.msi`, Scoop when published (`scoop bucket add hxddh https://github.com/hxddh/scoop-bucket`, `scoop install oprobe`) or `winget install hxddh.oprobe` |
+| Windows | `irm https://github.com/hxddh/oprobe/releases/latest/download/install.ps1 \| iex` or the `.msi` |
 | Debian / Ubuntu, Fedora / RHEL | `.deb` / `.rpm` from the release page |
-| Rust (crates.io, when published) | `cargo install oprobe --locked` (`--no-default-features --features cli` for the CLI only, `--features gui` for native windows on Linux) |
+| Rust (from source) | `cargo install --locked --git https://github.com/hxddh/oprobe --tag v9.3.0 oprobe` (`--no-default-features --features cli` for the CLI only, `--features gui` for native windows on Linux) |
 
 The macOS and Windows packages are **not code-signed**: the first open needs one confirmation
 ([how](docs/install.md#first-open-of-unsigned-packages)). Every asset has a SHA-256 in `SHA256SUMS`

@@ -225,30 +225,30 @@ fn the_packages_register_run_files() {
     );
 }
 
-/// The release notes advertise a package channel only when the release publishes to it: its
-/// secret is set (P1).
+/// The GitHub release is the binary's one channel: the release notes advertise no package
+/// manager and no crates.io install, and the workflow publishes one crate, `oprobe-trace`.
 #[test]
-fn release_notes_name_only_published_channels() {
+fn release_notes_name_only_the_release_assets() {
     let yml = std::fs::read_to_string(root().join(".github/workflows/release.yml")).unwrap();
     let notes = yml
         .split("- name: Release notes from CHANGELOG")
         .nth(1)
         .and_then(|s| s.split("- uses:").next())
         .unwrap();
-    for (secret, flag, channel) in [
-        ("TAP_TOKEN", "HAS_TAP_TOKEN", "brew install"),
-        ("SCOOP_TOKEN", "HAS_SCOOP_TOKEN", "scoop install"),
-        ("CARGO_REGISTRY_TOKEN", "HAS_CARGO_TOKEN", "cargo install"),
-    ] {
+    assert!(notes.contains("install.sh") && notes.contains("install.ps1"));
+    for channel in ["brew ", "scoop ", "winget ", "cargo install"] {
         assert!(
-            notes.contains(&format!("{flag}: ${{{{ secrets.{secret} != '' }}}}")),
-            "{secret}"
-        );
-        let before = notes.split(channel).next().unwrap();
-        let guard = before.rsplit("if [").next().unwrap();
-        assert!(
-            guard.starts_with(&format!(" \"${flag}\" = true ]")),
-            "`{channel}` is printed without a check of {secret}: {guard}"
+            !notes.contains(channel),
+            "the release notes name `{channel}`"
         );
     }
+    let published: Vec<&str> = yml
+        .lines()
+        .filter(|l| l.contains("cargo publish "))
+        .collect();
+    assert_eq!(published.len(), 1, "{published:?}");
+    assert!(
+        published[0].trim().ends_with("-p oprobe-trace"),
+        "{published:?}"
+    );
 }

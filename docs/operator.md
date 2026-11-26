@@ -37,8 +37,9 @@ are `"50ms"`, `"10s"`, `"5m"`.
 The service: `s3://bucket/prefix`, `gcs://bucket/prefix`, `azblob://container/prefix`,
 `oss://…`, `cos://…`, `obs://…`, `b2://…`, `webdav://…`, `fs:///path`, `memory://`, or
 `lab://SCENARIO` for the built-in lab. Release builds include S3, GCS, Azure Blob, OSS, COS, OBS,
-B2 and WebDAV; `cargo install oprobe --features all-services` adds the rest OpenDAL offers to
-oprobe (Azure Data Lake, Azure Files, Swift, TOS, WebHDFS, UpYun, HTTP).
+B2 and WebDAV;
+`cargo install --locked --git https://github.com/hxddh/oprobe oprobe --features all-services`
+adds the rest OpenDAL offers to oprobe (Azure Data Lake, Azure Files, Swift, TOS, WebHDFS, UpYun, HTTP).
 
 ## `[options]`
 

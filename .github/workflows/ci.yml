@@ -176,13 +176,12 @@ jobs:
           $errors = $null
           [System.Management.Automation.Language.Parser]::ParseFile("$PWD\scripts\install.ps1", [ref]$null, [ref]$errors) | Out-Null
           if ($errors) { $errors; exit 1 }
-      # The package-manager manifests from a fake asset set: valid Ruby and JSON, distinct names.
-      - name: Release manifests
+      # The release index from a fake asset set.
+      - name: Release index (latest.json)
         if: runner.os == 'Linux'
         run: |
           d="$RUNNER_TEMP/dist"; mkdir -p "$d"; v=0.0.0-ci
-          for f in universal-apple-darwin.tar.gz x86_64-unknown-linux-musl.tar.gz aarch64-unknown-linux-musl.tar.gz \
-                   macos-universal.dmg x86_64-pc-windows-msvc.zip aarch64-pc-windows-msvc.zip x64.msi arm64.msi; do
+          for f in universal-apple-darwin.tar.gz x86_64-unknown-linux-musl.tar.gz x86_64-pc-windows-msvc.zip x64.msi; do
             echo "$f" > "$d/oprobe-$v-$f"
           done
           for f in universal-apple-darwin.tar.gz x86_64-unknown-linux-musl.tar.gz x86_64-pc-windows-msvc.zip; do
@@ -190,12 +189,7 @@ jobs:
           done
           (cd "$d" && sha256sum -- * > SHA256SUMS)
           scripts/release-manifests.sh "$v" "$d" hxddh/oprobe
-          ruby -c "$d/oprobe.rb" && ruby -c "$d/oprobe-app.rb"
-          grep -q '^class Oprobe < Formula' "$d/oprobe.rb"
-          grep -q '^cask "oprobe-app" do' "$d/oprobe-app.rb"
-          python3 -c "import json,sys; d=json.load(open(sys.argv[1])); assert d['autoupdate']['hash']['url'].endswith('/SHA256SUMS')" "$d/oprobe.json"
           python3 -c "import json,sys; d=json.load(open(sys.argv[1])); n=[a['name'] for a in d['assets']]; assert any(x.startswith('oprobe-cli-') for x in n), n" "$d/latest.json"
-          if grep -q 'completions\|profiles\|self-update' "$d/oprobe.rb"; then echo "::error::oprobe.rb names removed files"; exit 1; fi
 
   backends:
     name: real backends (MinIO, fake-gcs-server, Azurite)
@@ -286,7 +280,7 @@ jobs:
       - run: cargo check --workspace --locked --all-targets
 
   package:
-    name: cargo package (cargo install readiness)
+    name: cargo package (oprobe-trace) and install from source
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -294,9 +288,8 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
-      # All three crates are published (oprobe-core as an internal crate pinned with `=`), so
-      # `cargo install oprobe` works; `--workspace` packages them against each other.
-      - run: cargo package --workspace --locked
+      # Only the embeddable library is published; the binary installs from the repository.
+      - run: cargo package -p oprobe-trace --locked
       - name: cargo install (debug profile; release builds run on main and nightly)
         run: cargo install --locked --debug --path crates/oprobe --root "$RUNNER_TEMP/inst" && "$RUNNER_TEMP/inst/bin/oprobe" --version
 

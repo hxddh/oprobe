@@ -7,7 +7,7 @@ the fix, then do the same on your own storage. No account is needed until the la
 
 ```bash
 curl -fsSL https://github.com/hxddh/oprobe/releases/latest/download/install.sh | sh
-# or: brew install hxddh/tap/oprobe · cargo install oprobe --locked · Windows: docs/install.md
+# Windows, packages, from source: docs/install.md
 ```
 
 ## 2. Profile the lab
