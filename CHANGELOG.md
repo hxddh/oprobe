@@ -9,8 +9,8 @@ All notable changes to this project are documented here. The format follows
 9.3 is a truth-and-stop release. A deep review of 9.2 (`docs/design/v9.2-review.md`: a bug hunt on
 the binary and two code-review passes) found that the weakest part of the loop was Explain:
 several findings said the wrong thing on ordinary runs, a proof could be improved by failing, and
-a few stop paths still left data behind. 9.3 fixes those. It adds no command and no flag, and
-every v9 file of 9.1 and 9.2 still reads.
+a few stop paths still left data behind. 9.3 fixes those. It adds no command and no flag. It
+no longer promises to read what an older version wrote (see Removed); no format version changed.
 
 ### Fixed
 
@@ -57,7 +57,7 @@ every v9 file of 9.1 and 9.2 still reads.
   `credentials.json`, is no longer `auth.no_credentials`.
 - **A body that stalls is a hung request.** The stage was called `transfer` in one place and
   `body` in another, so body-stalled requests were never counted; it is `body` everywhere now
-  (`--by stage` says so, and `transfer` is still understood). A large download, downloads under a
+  (`--by stage` says so). A large download, downloads under a
   `bandwidth_cap`, and a slow upload through a kept HTTP client are not hung.
 - **An open loop that fell behind is judged on evidence.** It no longer says "raise `-c`" unless
   the service answered as fast with every worker in flight; a steady overload says that one run
@@ -99,8 +99,6 @@ every v9 file of 9.1 and 9.2 still reads.
 - **A rate limit is sized under the fitted rate:** a cap whose sizing trial sends more requests
   per second than the finding's fit is not chosen, even when its two seconds saw no throttle
   (9.2 chose it and then measured it `worse`).
-- **A prove stored by 9.1 draws the interval it decided on**, labelled, instead of today's wider
-  sequential interval beside a stored `improved`.
 - `--pairs` outside 3–12 is a usage error (9.2 clamped it silently) and, with `--trial`, is in
   `prove --help`. Notes are redacted where they enter the result. A prove with no pair offers no
   profile of the change; a prove of a run whose secrets were given by value says they were not
@@ -164,6 +162,15 @@ every v9 file of 9.1 and 9.2 still reads.
   `show --rm X X` removes X once; `show --list` cuts a long change; `show FILE` of an
   `oprobe run -o json` document says what it is; the `r2://` examples in the docs run as written.
 
+### Removed
+
+- **Compatibility with older versions and their data.** oprobe reads what its own version wrote:
+  a prove result without `pairs_max_count` (9.1) is refused as unreadable, and the fallbacks for
+  reports before 6.3 are gone. Also removed: the stage name `transfer` (it is `body`), the p99
+  limit remnants (`sla.p99_ms` in a config and in the report), the hidden `prove --budget`
+  spelling of `--max-duration`, and the 5.x preset names (`parquet`, `small`, `mixed`, …).
+  `oprobe-trace`'s API and the CLI and JSON output stay stable across 9.x.
+
 ### Known issues
 
 - A steady overloaded open loop cannot tell too few workers from a saturated service: only a run
@@ -172,8 +179,6 @@ every v9 file of 9.1 and 9.2 still reads.
   run interrupted.
 - A menu shortcut typed across a change that rebuilds the menu bar (a dialog, a run starting, a
   page switch) can still be lost: nsh 0.7 gives menu items new ids on each rebuild.
-- A run file with a segment above 64 MiB or 65 536 rows of one kind is refused; no file a 9.x
-  writer is known to produce has one.
 - The limits OpenDAL sets remain: an HTTP permit wait counts in `timeout.io`, and multipart
   uploads cannot be listed.
 
