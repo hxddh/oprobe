@@ -233,6 +233,46 @@ pub fn tail_cut(run: &Run, api: crate::trace::Api, setup: &TailCutSetup) -> Opti
     })
 }
 
+/// The cache `layers.cache` would need for the reads of `run`, or why a whole-object cache does
+/// not fit them ([`Cache::fit`], [`Cache::sized_for`]). The one rule the `repeated_reads`
+/// finding and `prove` share: a finding never offers a proof `prove` would refuse.
+pub fn sized_cache(run: &Run) -> Result<crate::operator::Cache, String> {
+    let r = &run.report;
+    let obj_bytes = r.workload.dataset.object_size_bytes;
+    let mut seen: std::collections::HashMap<&str, u64> = std::collections::HashMap::new();
+    // What the run read of those objects in all.
+    let mut read = 0u64;
+    for o in run
+        .ops
+        .iter()
+        .filter(|o| o.t_us >= 0 && (o.verb.starts_with("read") || o.verb.contains("parquet")))
+    {
+        let entry = seen.entry(o.key.as_str()).or_insert(0);
+        *entry = (*entry).max(o.bytes).max(obj_bytes);
+        read += o.bytes;
+    }
+    let mut set: u64 = seen.values().sum();
+    if r.run.sampled && r.sampling.kept_ratio > 0.0 && r.sampling.kept_ratio < 1.0 {
+        let kept = r.sampling.kept_ratio.max(0.05);
+        // The rows are a sample of the reads; every object may still be among them.
+        read = (read as f64 / kept).round() as u64;
+        let scaled = (set as f64 / kept).round() as u64;
+        let ds_cap = r
+            .workload
+            .dataset
+            .objects_count
+            .saturating_mul(obj_bytes.max(1));
+        set = if ds_cap > 0 {
+            scaled.min(ds_cap).max(set)
+        } else {
+            scaled
+        };
+    }
+    let largest = seen.values().copied().max().unwrap_or(obj_bytes);
+    crate::operator::Cache::fit(seen.values().sum(), read)
+        .and_then(|()| crate::operator::Cache::sized_for(set, largest))
+}
+
 /// Replay the read operations' keys through an LRU cache of `capacity_bytes` (object size =
 /// the bytes each read returned); a hit costs no backend request.
 pub fn cache(run: &Run, capacity_bytes: u64) -> Option<Prediction> {

@@ -1173,39 +1173,9 @@ fn remedy_change(run: &Run, f: &Finding) -> Result<Change> {
             });
         }
         "repeated_reads" => {
-            let obj_bytes = r.workload.dataset.object_size_bytes;
-            let mut seen: std::collections::HashMap<&str, u64> = std::collections::HashMap::new();
-            // What the run read of those objects in all.
-            let mut read = 0u64;
-            for o in run.ops.iter().filter(|o| {
-                o.t_us >= 0 && (o.verb.starts_with("read") || o.verb.contains("parquet"))
-            }) {
-                let entry = seen.entry(o.key.as_str()).or_insert(0);
-                *entry = (*entry).max(o.bytes).max(obj_bytes);
-                read += o.bytes;
-            }
-            let mut set: u64 = seen.values().sum();
-            if r.run.sampled && r.sampling.kept_ratio > 0.0 && r.sampling.kept_ratio < 1.0 {
-                let kept = r.sampling.kept_ratio.max(0.05);
-                // The rows are a sample of the reads; every object may still be among them.
-                read = (read as f64 / kept).round() as u64;
-                let scaled = (set as f64 / kept).round() as u64;
-                let ds_cap = r
-                    .workload
-                    .dataset
-                    .objects_count
-                    .saturating_mul(obj_bytes.max(1));
-                set = if ds_cap > 0 {
-                    scaled.min(ds_cap).max(set)
-                } else {
-                    scaled
-                };
-            }
-            let largest = seen.values().copied().max().unwrap_or(obj_bytes);
             // A whole-object cache that would fetch more than the run read, or hold an
             // object above the ceiling, is advice against itself (K3-7): nothing is sized.
-            let cache = crate::operator::Cache::fit(seen.values().sum(), read)
-                .and_then(|()| crate::operator::Cache::sized_for(set, largest))
+            let cache = crate::analysis::simulate::sized_cache(run)
                 .map_err(|why| {
                     OprobeError::new(
                         ErrorCode::UsageInvalidArgument,

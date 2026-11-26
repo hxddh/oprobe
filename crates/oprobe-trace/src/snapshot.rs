@@ -757,7 +757,7 @@ impl RequestStageMeans {
             ("connect", self.connect),
             ("send", self.send),
             ("ttfb", self.ttfb),
-            ("transfer", self.body),
+            ("body", self.body),
             ("consumer stall", self.stall),
         ]
     }

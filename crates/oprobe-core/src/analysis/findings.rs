@@ -155,6 +155,13 @@ pub fn remedy(code: &str, variant: Option<&str>) -> Remedy {
             true,
             "upload multipart parts concurrently",
         ),
+        ("repeated_reads", Some("no_cache")) => r(
+            None,
+            &[],
+            "",
+            false,
+            "cache the ranges you re-read in the application: OpenDAL's FoyerLayer caches whole objects, which does not fit these reads, so this is advice, not a layer to prove",
+        ),
         ("repeated_reads", _) => r(
             Some("layers.cache"),
             &[],
@@ -1205,7 +1212,10 @@ fn hung_requests(c: &Ctx, capped: Option<Direction>) -> Option<Finding> {
                 && match Stage::dominant(q) {
                     Stage::Send => capped != Some(Direction::Upload),
                     Stage::Body => capped != Some(Direction::Download) && stuck_body(q),
-                    Stage::Ttfb | Stage::Stall => true,
+                    // Through a transport the layer only wraps, connecting and sending the
+                    // body are part of the time to first byte: a slow upload is not a hang.
+                    Stage::Ttfb => !(q.connection_unobserved() && q.bytes_up > 0),
+                    Stage::Stall => true,
                     Stage::Queue | Stage::Connect => false,
                 }
         })
@@ -1486,24 +1496,32 @@ fn repeated_reads(c: &Ctx) -> Option<Finding> {
     if p.requests_per_1k_ops_delta > -300.0 {
         return None;
     }
+    // The same rule `prove` sizes the cache with: when no whole-object cache fits these reads,
+    // the remedy is advice and says why.
+    let fit = simulate::sized_cache(c.run);
+    let mut text = format!(
+        "replaying the reads through an in-memory cache would save {} requests per {} successful read operations",
+        crate::model::group_thousands(-p.requests_per_1k_ops_delta, 0),
+        crate::model::group_thousands(1000.0, 0)
+    );
+    if let Err(why) = &fit {
+        text.push_str("; ");
+        text.push_str(why);
+    }
     Some(Finding {
         code: "repeated_reads".into(),
         severity: Severity::Info,
         confidence: Confidence::Medium,
         cause: "The same bytes are read again and again.".into(),
         evidence: Evidence {
-            text: format!(
-                "replaying the reads through an in-memory cache would save {} requests per {} successful read operations",
-                crate::model::group_thousands(-p.requests_per_1k_ops_delta, 0),
-                crate::model::group_thousands(1000.0, 0)
-            ),
+            text,
             values: values(&[(
                 "saved_requests_per_1k_ops_mean",
                 -p.requests_per_1k_ops_delta,
             )]),
             ..Default::default()
         },
-        remedy: remedy("repeated_reads", None),
+        remedy: remedy("repeated_reads", fit.as_ref().err().map(|_| "no_cache")),
     })
 }
 
@@ -2117,6 +2135,23 @@ pub(crate) mod tests {
             l[0],
             ("Requests saved per 1\u{202f}000 reads".to_owned(), n)
         );
+        assert_eq!(rr.remedy.path.as_deref(), Some("layers.cache"));
+        // The same reads of 5 GiB objects: a whole-object cache does not fit, and the finding
+        // says so instead of offering a proof `prove` would refuse (9.2 pointed at `prove`).
+        run.report.workload.dataset.object_size_bytes = 5 << 30;
+        let f = derive(&run);
+        let rr = f
+            .iter()
+            .find(|x| x.code == "repeated_reads")
+            .unwrap_or_else(|| panic!("{f:#?}"));
+        assert_eq!(rr.remedy.path, None, "{:#?}", rr.remedy);
+        assert!(rr.remedy.text.contains("advice"), "{}", rr.remedy.text);
+        assert!(
+            rr.evidence.text.contains("FoyerLayer"),
+            "{}",
+            rr.evidence.text
+        );
+        assert!(crate::analysis::simulate::sized_cache(&run).is_err());
     }
 
     #[test]
@@ -2415,6 +2450,30 @@ pub(crate) mod tests {
         stall(&mut large, 1 << 30);
         let f = derive(&large);
         assert!(!f.iter().any(|x| x.code == "hung_requests"), "{f:#?}");
+    }
+
+    /// Through a transport the layer only wraps (`keep_http_transport`), connecting and
+    /// sending the body are inside the time to first byte: a slow upload there is not a hung
+    /// request, while a request without a body that waits as long still is.
+    #[test]
+    fn a_slow_upload_through_a_kept_transport_is_not_hung() {
+        let slow = |run: &mut Run, bytes_up: u64| {
+            for q in run.reqs.iter_mut().filter(|q| q.op_id % 300 == 1) {
+                (q.ttfb_us, q.total_us) = (6_000_000, 6_000_010);
+                (q.send_us, q.body_us, q.conn_id, q.status) = (0, 0, 0, 200);
+                q.bytes_up = bytes_up;
+            }
+        };
+        let mut upload = base();
+        slow(&mut upload, 8 << 20);
+        assert!(upload.reqs[0].connection_unobserved());
+        assert_eq!(Stage::dominant(&upload.reqs[0]), Stage::Ttfb);
+        let f = derive(&upload);
+        assert!(!f.iter().any(|x| x.code == "hung_requests"), "{f:#?}");
+        let mut waiting = base();
+        slow(&mut waiting, 0);
+        let f = derive(&waiting);
+        assert!(f.iter().any(|x| x.code == "hung_requests"), "{f:#?}");
     }
 
     /// The mirror of the capped uplink: under a bandwidth cap on the response bodies, a

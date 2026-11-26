@@ -119,8 +119,6 @@ pub struct SlaInput {
     /// Max share of throttled (429/503) operations, e.g. 0% (default: not checked by `run`;
     /// `tune` rejects any throttling)
     pub max_throttle_rate: Option<String>,
-    /// Max p99 latency per operation in ms (tune rejects trials above it)
-    pub p99_ms: Option<f64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, Default)]
