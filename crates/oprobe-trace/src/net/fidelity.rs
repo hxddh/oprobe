@@ -146,7 +146,13 @@ enum Sock {
     /// Not found or not supported: never looked up again.
     Missing,
     Found(Arc<TcpProbe>),
+    /// Dialed, its socket being looked up off the runtime's threads: the first request that
+    /// needs the probe shares that one lookup instead of starting its own.
+    Finding(Lookup),
 }
+
+/// One lookup of a connection's socket, run once by whoever asks first and shared by the rest.
+type Lookup = Arc<tokio::sync::OnceCell<Option<Arc<TcpProbe>>>>;
 
 struct ConnEntry {
     id: u64,
@@ -244,6 +250,31 @@ impl Shared {
             Some(id) => Sock::Found(Arc::new(TcpProbe::new_seeded(id, warm))),
             None => Sock::Missing,
         }
+    }
+
+    /// The probe of the freshly dialed connection `addr`, from its one shared `lookup`; the
+    /// connection table then holds the answer. The dial never waits for this: a connection is
+    /// handed to hyper as soon as its handshake ends, so the lookup costs its first request
+    /// nothing (9.2 development builds awaited it in the dial, after the dial's clock had
+    /// stopped: the wait read as time on the wire).
+    async fn resolve(&self, addr: ConnAddr, lookup: &Lookup) -> Sock {
+        let found = lookup
+            .get_or_init(|| async {
+                match self.probe(addr, false).await {
+                    Sock::Found(p) => Some(p),
+                    _ => None,
+                }
+            })
+            .await
+            .clone();
+        let sock = found.map_or(Sock::Missing, Sock::Found);
+        if let Ok(mut c) = self.conns.lock()
+            && let Some(e) = c.by_addr.get_mut(&addr)
+            && matches!(&e.sock, Sock::Finding(l) if Arc::ptr_eq(l, lookup))
+        {
+            e.sock = sock.clone();
+        }
+        sock
     }
 
     /// A dial started by the request behind `claim` made connection `addr`. The dial waits in
@@ -649,9 +680,19 @@ where
                 }
             };
             if let Some((addr, times)) = made {
-                // Find the socket right after the handshake, before hyper puts requests on
-                // the connection, so that all of them share one probe.
-                let sock = shared.probe(addr, false).await;
+                // The socket is looked up off the runtime's threads, starting now; the
+                // connection goes to hyper at once, and its requests share that one lookup.
+                let sock = match tokio::runtime::Handle::try_current() {
+                    Ok(runtime) if shared.tcp_info => {
+                        let lookup = Lookup::default();
+                        let (finding, shared) = (lookup.clone(), shared.clone());
+                        runtime.spawn(async move {
+                            shared.resolve(addr, &finding).await;
+                        });
+                        Sock::Finding(lookup)
+                    }
+                    _ => Sock::Missing,
+                };
                 shared.dialed(claim, addr, times, sock);
             }
             res
@@ -1415,6 +1456,10 @@ impl HttpTransport for FidelityTransport {
             open_streams = entry.active_streams.fetch_add(1, Ordering::AcqRel) + 1;
             stream_guard = StreamGuard(Some(entry.active_streams.clone()));
         }
+        if let (Some(addr), Sock::Finding(lookup)) = (addr, &sock) {
+            // Dialed a moment ago: its lookup is usually done by the time headers arrive.
+            sock = self.shared.resolve(addr, &lookup.clone()).await;
+        }
         if let (Some(addr), Sock::Unknown) = (addr, &sock) {
             // A connection the table did not see dialed (its entry was evicted): find its
             // socket now; requests racing here converge on the first probe installed.
@@ -1541,7 +1586,7 @@ impl HttpTransport for FidelityTransport {
                     let stream = probe.open_stream();
                     Some((probe, stream))
                 }
-                Sock::Unknown | Sock::Missing => None,
+                Sock::Unknown | Sock::Missing | Sock::Finding(_) => None,
             },
             _stream: stream_guard,
         });
@@ -1754,6 +1799,45 @@ mod tests {
             end: Instant::now(),
             tls: None,
         }
+    }
+
+    /// A new connection's socket is looked up once, whoever needs it: the lookup started at the
+    /// dial and the first request's share one probe, and the table keeps it. The dial itself
+    /// does not wait (awaiting the lookup there, after the dial's clock had stopped, read as
+    /// time on the wire for the request that dialed).
+    #[tokio::test]
+    async fn the_requests_of_a_new_connection_share_one_socket_lookup() {
+        if !tcpinfo::SUPPORTED {
+            return;
+        }
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (client, _server) = tokio::join!(
+            tokio::net::TcpStream::connect(l.local_addr().unwrap()),
+            l.accept()
+        );
+        let client = client.unwrap();
+        let addr = (client.local_addr().unwrap(), client.peer_addr().unwrap());
+        let shared = Arc::new(Shared {
+            recorder: None,
+            conns: Mutex::new(Conns::default()),
+            finder: Arc::default(),
+            proxy: None,
+            proxy_addrs: Vec::new(),
+            active_uploads: AtomicU32::new(0),
+            tcp_info: true,
+        });
+        let lookup = Lookup::default();
+        shared.dialed(None, addr, dial_times(), Sock::Finding(lookup.clone()));
+        let (a, b) = tokio::join!(shared.resolve(addr, &lookup), shared.resolve(addr, &lookup));
+        let (Sock::Found(a), Sock::Found(b)) = (a, b) else {
+            panic!("the socket of a live connection is found");
+        };
+        assert!(Arc::ptr_eq(&a, &b), "one probe for the connection");
+        let c = shared.conns.lock().unwrap();
+        let Sock::Found(kept) = &c.by_addr[&addr].sock else {
+            panic!("the table keeps the probe");
+        };
+        assert!(Arc::ptr_eq(kept, &a));
     }
 
     /// A dial belongs to the request that started it. When that request is answered on

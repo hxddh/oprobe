@@ -105,8 +105,9 @@ code is worth when pasted. It adds no command and no flag, and every v9 file of 
   read; `detail.retrans_count` adds up to the connection's count (9.1 charged them to whichever
   request ended next and could count some twice).
 - **No descriptor scans on runtime threads.** The socket of a new connection is found on the
-  blocking pool, one scan for every connection dialed meanwhile; 9.1 scanned `/proc/self/fd` on a
-  Tokio worker for every connection.
+  blocking pool, one scan for every connection dialed meanwhile, and the connection is handed
+  over without waiting for it; 9.1 scanned `/proc/self/fd` on a Tokio worker for every
+  connection, inside the dial.
 - **`http.client.request.duration` is one observation per HTTP request** with standard attributes
   only (`http.request.method`, `server.address`, `server.port`, `http.response.status_code`,
   `network.protocol.version`, `error.type`). The stages moved to
@@ -148,7 +149,10 @@ code is worth when pasted. It adds no command and no flag, and every v9 file of 
 - **Tests.** The app's tests run one at a time under nextest as they do under `cargo test`, wait
   for the opened run before pressing a menu shortcut (a shortcut pressed across the menu's
   rebuild was lost, and the test timed out on a loaded runner, macOS first), and the Ctrl-C test
-  waits for the run to measure instead of sleeping.
+  waits for the run to measure instead of sleeping. The parquet proof runs six workers, which
+  reach the lab's limit of 24 requests in flight without crossing it: with the default eight,
+  workers scanning in step crossed it on macOS CI and the proof was inconclusive over
+  `--max-throttle` (the test that failed on `main`).
 
 ### Known issues
 
