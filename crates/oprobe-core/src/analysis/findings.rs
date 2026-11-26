@@ -705,6 +705,11 @@ pub fn rank(findings: &mut [Finding]) {
     });
 }
 
+/// The shortest mean wait in a service's queue (per answered request) that is a finding: 1 ms.
+/// Below it the growth of the time to first byte with the requests in flight cannot be told
+/// from the client's own scheduling.
+const MIN_QUEUE_WAIT_US: f64 = 1000.0;
+
 /// `throttling` with no rejection: the selected limit model is queueing, asserted with medium
 /// confidence or more — the service serves a number of requests at once and the rest wait
 /// for their first byte. The limit is the same kind as a 429/503 in-flight limit, and so is
@@ -729,6 +734,13 @@ fn queueing(c: &Ctx) -> Option<Finding> {
     let waited = |q: &ReqRow| (q.ttfb_us as f64 - service_us).max(0.0);
     let wait: f64 = c.reqs().filter(|q| !q.is_error()).map(waited).sum();
     let total: f64 = c.reqs().map(|q| q.total_us as f64).sum::<f64>().max(1.0);
+    // A wait this short is not a service's queue: it is what the client's own scheduling and
+    // the loopback add when more requests are in flight (Windows CI: a time to first byte of
+    // 0.5 ms at 1 in flight and 1.1 ms at 15 on `lab://clean` fitted "7 served at once").
+    let answered = c.reqs().filter(|q| !q.is_error()).count().max(1) as f64;
+    if wait / answered < MIN_QUEUE_WAIT_US {
+        return None;
+    }
     let mut text = h.evidence.first().cloned().unwrap_or_default();
     text += "; no request was rejected (429/503)";
     Some(Finding {
@@ -2343,6 +2355,12 @@ pub(crate) mod tests {
         assert!(!q.cause.contains("concurrency") && !q.cause.contains("run at"));
         assert!(!q.evidence.op_ids.is_empty());
         assert_eq!(f.iter().filter(|x| x.code == "throttling").count(), 1);
+        // The same curve at a twentieth of the time (0.5 ms of service, waits of a fraction of
+        // a millisecond) is the client's own scheduling, not a service's queue: no finding.
+        let (reqs, ops) = crate::analysis::limits::tests::queueing_bursts_of(0.5, |b| 2 + b % 14);
+        let tiny = with_capacity(base(), reqs, ops);
+        let f = derive(&tiny);
+        assert!(!f.iter().any(|x| x.code == "throttling"), "{f:#?}");
         // The same service under a load that never varied asserts nothing: no finding.
         let (reqs, ops) = crate::analysis::limits::tests::queueing_closed_loops(&[12, 14, 16, 19]);
         let steady = with_capacity(base(), reqs, ops);

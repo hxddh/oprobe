@@ -125,8 +125,9 @@ code is worth when pasted. It adds no command and no flag, and every v9 file of 
   instead of reading as `hung_requests`.
 - **A service that queues instead of rejecting is found.** When the time to first byte grows
   with the requests in flight, in a run that varied them at least twofold, the run reports
-  `throttling` (a warning, `layers.concurrent_limit.http`) with no 429/503. 9.1 fitted the
-  model and no finding read it.
+  `throttling` (a warning, `layers.concurrent_limit.http`) with no 429/503, provided the
+  requests waited a millisecond or more on average (less is the client's own scheduling).
+  9.1 fitted the model and no finding read it.
 - **Run Again repeats the run.** The app rebuilt a run from New Run's five fields and lost its
   open-loop rate, dataset, seed, key popularity and operator options. It now replays the run's
   spec; for a real target New Run shows "Runs again as" with the command it keeps, and a field

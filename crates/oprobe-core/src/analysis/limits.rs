@@ -1695,6 +1695,14 @@ pub(crate) mod tests {
     /// Bursts of `widths(burst)` requests, each waiting ≈10 ms of service behind 4 servers:
     /// the time to first byte grows with the requests already in flight.
     pub(crate) fn queueing_bursts(widths: impl Fn(usize) -> usize) -> (Vec<ReqRow>, Vec<OpRow>) {
+        queueing_bursts_of(10.0, widths)
+    }
+
+    /// [`queueing_bursts`] with a service time of `service_ms`.
+    pub(crate) fn queueing_bursts_of(
+        service_ms: f64,
+        widths: impl Fn(usize) -> usize,
+    ) -> (Vec<ReqRow>, Vec<OpRow>) {
         let mut reqs = Vec::new();
         let mut ops = Vec::new();
         let mut id = 0;
@@ -1707,7 +1715,8 @@ pub(crate) mod tests {
                     .wrapping_mul(6364136223846793005)
                     .wrapping_add(1442695040888963407);
                 let noise = 1.0 + ((x >> 40) as f64 / (1u64 << 24) as f64 - 0.5) * 0.2;
-                let lat = 10.0 * (1.0 + ((j as u64 + 1).saturating_sub(4)) as f64 / 4.0) * noise;
+                let lat =
+                    service_ms * (1.0 + ((j as u64 + 1).saturating_sub(4)) as f64 / 4.0) * noise;
                 reqs.push(req(t0 + j as f64 * 0.01, lat, 200, id));
                 ops.push(op(id, "k", t0));
             }
