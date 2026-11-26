@@ -140,8 +140,11 @@ pub fn decode_run(r: impl Read) -> Result<Run> {
         } else if msg.contains("not an oprobe run file") {
             invalid("pass an `.oprobe` run file, a report `.json` or an `oprobe-trace` file")
         } else if msg.contains(super::runfile::TOO_LARGE) {
+            // No setting makes this file readable. A run of this oprobe never writes one
+            // (`RunFileStream` keeps to what a reader takes); one of 9.2 or earlier could,
+            // from a long run with many failed operations.
             invalid(
-                "re-run the workload with a lower `max_requests` (`[defaults]` in the config file)",
+                "run the workload again with this oprobe: it keeps a run file within what it reads",
             )
         } else {
             invalid("the run file is damaged or truncated: copy it again, or re-run the workload")
