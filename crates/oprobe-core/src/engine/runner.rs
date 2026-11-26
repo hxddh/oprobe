@@ -249,7 +249,9 @@ impl Session {
         let mut warnings = super::workloads::adapt_mix(&mut mix, &measured_cap, &target.scheme);
         if spec.existing_prefix.is_some() && mix.iter().any(|m| m.op.is_write()) {
             mix.retain(|m| !m.op.is_write());
-            warnings.push("existing_prefix datasets are read-only: write operations were removed from the mix".into());
+            warnings.push(
+                "`--existing` is read-only: write operations were removed from the mix".into(),
+            );
         }
         anyhow::ensure!(
             mix.iter().any(|m| m.weight > 0),

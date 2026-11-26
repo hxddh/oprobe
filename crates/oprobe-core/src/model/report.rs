@@ -234,6 +234,31 @@ impl Report {
                     run_file_hint(),
                 ));
             }
+            // The whole result of `oprobe run -o json`: its runs, each with its report.
+            None if v.get("runs").and_then(|r| r.as_array()).is_some() => {
+                let runs = v["runs"].as_array().map_or(&[][..], |r| r.as_slice());
+                let ids: Vec<&str> = runs
+                    .iter()
+                    .filter_map(|r| r.get("run_id").and_then(|i| i.as_str()))
+                    .collect();
+                let hint = match ids.as_slice() {
+                    [] => "pass one run's report: `.runs[0].report` of this document".to_owned(),
+                    [id] => format!(
+                        "pass the run it holds, `{id}`, or its report: `.runs[0].report` of this document"
+                    ),
+                    ids => format!(
+                        "pass one of the runs it holds ({}), or one's report: `.runs[N].report` of this document",
+                        ids.join(", ")
+                    ),
+                };
+                return Err(bad(
+                    format!(
+                        "it is the result of `oprobe run -o json` ({} runs), not one run's report",
+                        runs.len()
+                    ),
+                    hint,
+                ));
+            }
             None if str_of("workload_hash").is_some() && str_of("target_id").is_some() => {
                 let id = str_of("id").unwrap_or("RUN");
                 return Err(bad(
@@ -1000,6 +1025,23 @@ mod tests {
             assert_eq!(b.code, crate::errors::ErrorCode::UsageInvalidArgument);
             (b.message, b.hint.unwrap_or_default())
         };
+        // The result of `oprobe run -o json` holds the reports of its runs: it says where.
+        let (m, h) = err(serde_json::json!({
+            "runs": [
+                {"run_id": "20261120-140000-0001", "report": {"schema": REPORT_SCHEMA}},
+                {"run_id": "20261120-140100-0002", "report": {"schema": REPORT_SCHEMA}},
+            ]
+        }));
+        assert!(m.contains("`oprobe run -o json` (2 runs)"), "{m}");
+        assert!(
+            h.contains(".runs[N].report") && h.contains("20261120-140100-0002"),
+            "{h}"
+        );
+        let (_, h) = err(serde_json::json!({"runs": [{"run_id": "20261120-140000-0001"}]}));
+        assert!(
+            h.contains(".runs[0].report") && h.contains("`20261120-140000-0001`"),
+            "{h}"
+        );
         let (m, h) = err(serde_json::json!({
             "schema": "oprobe.prove/9", "prove_id": "20261120-143005-a1b2",
             "run_id": "20261120-140000-0001", "verdict": "improved"
