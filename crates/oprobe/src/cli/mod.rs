@@ -20,7 +20,8 @@ use crate::output::{Output, OutputFormat};
 use crate::report::style::{self, bold, red, yellow};
 use crate::store::{ConfigFile, Paths};
 
-/// Exit code of a command stopped by Ctrl-C (SIGINT), as shells report it.
+/// Exit code of a command stopped by Ctrl-C (SIGINT, or SIGTERM / SIGHUP), as shells report
+/// an interrupted command.
 pub const EXIT_INTERRUPTED: u8 = exit::INTERRUPTED;
 
 /// Run the parsed command line and return the process exit code.
@@ -235,17 +236,66 @@ async fn dispatch(cmd: Command, ctx: &Ctx) -> Result<u8> {
     }
 }
 
-/// Install a Ctrl-C handler: first press cancels gracefully (cleanup still runs), second exits.
+/// The signals that stop a command: Ctrl-C (SIGINT) everywhere, and on Unix also what a
+/// supervisor (SIGTERM: `kill`, a container runtime, CI) and a closing terminal or SSH session
+/// (SIGHUP) send. Their default action kills the process on the spot, with its test data and
+/// its multipart uploads left on the target.
+struct StopSignals {
+    #[cfg(unix)]
+    terminate: Option<tokio::signal::unix::Signal>,
+    #[cfg(unix)]
+    hangup: Option<tokio::signal::unix::Signal>,
+}
+
+impl StopSignals {
+    /// Handle the signals from now on (a signal that cannot be handled keeps its default).
+    fn install() -> Self {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            Self {
+                terminate: signal(SignalKind::terminate()).ok(),
+                hangup: signal(SignalKind::hangup()).ok(),
+            }
+        }
+        #[cfg(not(unix))]
+        Self {}
+    }
+
+    /// The next of them; `false` when none can be received any more.
+    async fn next(&mut self) -> bool {
+        #[cfg(unix)]
+        {
+            async fn recv(s: &mut Option<tokio::signal::unix::Signal>) -> Option<()> {
+                match s {
+                    Some(s) => s.recv().await,
+                    None => std::future::pending().await,
+                }
+            }
+            tokio::select! {
+                r = tokio::signal::ctrl_c() => r.is_ok(),
+                r = recv(&mut self.terminate) => r.is_some(),
+                r = recv(&mut self.hangup) => r.is_some(),
+            }
+        }
+        #[cfg(not(unix))]
+        tokio::signal::ctrl_c().await.is_ok()
+    }
+}
+
+/// Install the stop handler: the first Ctrl-C (or SIGTERM, SIGHUP) cancels gracefully — what is
+/// in flight is cut, multipart uploads are aborted and cleanup still runs — the second exits.
 fn install_ctrl_c(cancel: crate::engine::Cancel) {
+    let mut signals = StopSignals::install();
     tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
+        if signals.next().await {
             INTERRUPTED.store(true, std::sync::atomic::Ordering::SeqCst);
             cancel.cancel();
             eprintln!(
                 "\n{} stopping… cleaning up test data (press Ctrl-C again to abort immediately)",
                 yellow("■")
             );
-            if tokio::signal::ctrl_c().await.is_ok() {
+            if signals.next().await {
                 eprintln!(
                     "{} aborted; test data may be left under oprobe-run-*/",
                     red("■")

@@ -56,12 +56,14 @@ from the config file's `[operators.NAME]` also works.
 |---|---|
 | `--dry-run` | print the plan (requests, bytes, objects written and deleted, ETA, budgets; a warning when it would spend one) and exit (`-o json`: `schemas/plan.json`) |
 | `--read-only` | refuse every write and delete (exit 5) |
-| `--max-requests N` | stop after this many backend requests (exit 4) |
-| `--max-bytes SIZE` | stop after transferring this many bytes, e.g. `10GiB` (exit 4) |
+| `--max-requests N` | send at most this many HTTP requests to the target, retries and the dataset upload included; the next one is not sent (exit 4) |
+| `--max-bytes SIZE` | transfer at most this many body bytes, up and down, e.g. `10GiB`; a request body that does not fit is not sent, a download is cut where it crosses the budget (exit 4) |
 | `--max-duration DURATION` | stop after this much wall time, e.g. `5m` (exit 4) |
 
-A budget that stops a run saves the partial run and cleans up. Budgets cover the whole command:
-every operator of the run. `[defaults.budgets]` in the config file sets defaults.
+A budget that stops a run cuts what is in flight, aborts the multipart uploads it interrupted,
+saves the partial run and cleans up. Budgets cover the whole command: every operator of the
+run, and every phase but cleanup (see [concepts](concepts.md)). `[defaults.budgets]` in the
+config file sets defaults. Ctrl-C, SIGTERM and SIGHUP stop a run the same way (exit 130).
 
 ```bash
 oprobe run s3://bucket/oprobe
@@ -131,7 +133,7 @@ the service at its limit). The objective's change prints with its 95 % interval
 | `--save FILE\|OPERATOR` | when the verdict is `improved`, write the proven change to an `op.toml` file or to `[operators.OPERATOR]` in the config file. A new file gets the operator with its `${ENV}` references and without secret values; the run's own `op.toml` (or another of the same service) is patched in place; the config file's path saves to the run's `[operators.NAME]`. Any other existing file is refused before a trial runs. The proof is saved first: a save that fails is a note |
 | `--dry-run` | print the number of trials and the ETA of the whole proof, and exit (`-o json`: `schemas/prove-plan.json`) |
 | `--read-only` | refuse every write and delete (exit 5) |
-| `--max-requests N`, `--max-bytes SIZE` | stop after this many backend requests or bytes, over every trial (exit 4) |
+| `--max-requests N`, `--max-bytes SIZE` | send at most this many HTTP requests or body bytes, over every trial (exit 4) |
 
 Every trial is saved as a run, a child of the prove, and hidden from `show --list`. A prove
 stopped before its result is saved (Ctrl-C) deletes its trials.
@@ -213,7 +215,7 @@ unambiguous id prefix. `show` also takes a path to a file.
 | 3 | `prove`: the change is worse on the objective |
 | 4 | a budget stopped the command |
 | 5 | a safety rail refused the command |
-| 130 | interrupted (Ctrl-C) |
+| 130 | interrupted (Ctrl-C, SIGTERM, SIGHUP) |
 
 Errors carry a stable code (`-o json`: `{"type":"error","error":{"code":…}}`, schema
 `schemas/error.json`); [troubleshooting](troubleshooting.md#error-codes) lists them.

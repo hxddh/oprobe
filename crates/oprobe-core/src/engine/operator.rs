@@ -8,6 +8,7 @@ use anyhow::Result;
 use opendal::Operator;
 use opendal::layers::{RetryLayer, TimeoutLayer};
 
+use super::gate::Gate;
 use crate::config::TargetSpec;
 use crate::errors::{ErrorCode, OprobeError};
 use crate::net::{FidelityTransport, TlsClientOptions, TransportConfig};
@@ -329,18 +330,29 @@ pub fn transport_config(target: &TargetSpec, http: &HttpOptions) -> Result<Trans
     })
 }
 
-/// The tracing layer: OpenDAL's own HTTP client, instrumented (the fidelity transport).
+/// The tracing layer: OpenDAL's own HTTP client, instrumented (the fidelity transport), behind
+/// the run's `gate` (budgets and cancellation) when there is one.
 pub fn trace_layer(
     target: &TargetSpec,
     http: &HttpOptions,
     recorder: Option<Arc<Recorder>>,
+    gate: Option<&Gate>,
+) -> Result<TraceContextLayer> {
+    transport_layer(target, transport_config(target, http)?, recorder, gate)
+}
+
+fn transport_layer(
+    target: &TargetSpec,
+    cfg: TransportConfig,
+    recorder: Option<Arc<Recorder>>,
+    gate: Option<&Gate>,
 ) -> Result<TraceContextLayer> {
     let https = target.endpoint().is_none_or(|e| e.starts_with("https"));
-    Ok(TraceContextLayer::new(FidelityTransport::new(
-        transport_config(target, http)?,
-        https,
-        recorder,
-    )?))
+    let transport = FidelityTransport::new(cfg, https, recorder)?;
+    Ok(match gate {
+        Some(g) => TraceContextLayer::new(g.wrap(transport)),
+        None => TraceContextLayer::new(transport),
+    })
 }
 
 /// The measured operator: the service through the instrumented `HttpTransport` (every request is
@@ -352,10 +364,11 @@ pub async fn measured_operator(
     recorder: &Arc<Recorder>,
     tree_registry: Option<await_tree::Registry>,
 ) -> Result<Operator> {
-    measured_operator_with(base, target, spec, recorder, tree_registry, None).await
+    measured_operator_with(base, target, spec, recorder, tree_registry, None, None).await
 }
 
-/// [`measured_operator`], reusing an already-warmed [`opendal::layers::TailCutLayer`] when given.
+/// [`measured_operator`] behind the run's `gate`, reusing an already-warmed
+/// [`opendal::layers::TailCutLayer`] when given.
 pub async fn measured_operator_with(
     base: &Operator,
     target: &TargetSpec,
@@ -363,6 +376,7 @@ pub async fn measured_operator_with(
     recorder: &Arc<Recorder>,
     tree_registry: Option<await_tree::Registry>,
     shared_tail_cut: Option<opendal::layers::TailCutLayer>,
+    gate: Option<&Gate>,
 ) -> Result<Operator> {
     let mut op = base.clone();
     if !target.is_network() {
@@ -372,14 +386,9 @@ pub async fn measured_operator_with(
     // semantics of `ConcurrentLimitLayer::with_http_concurrent_limit` (a permit per request,
     // held until its body is consumed), so the wait is measured as the request's queue stage;
     // the layer would wait outside the transport, where it cannot be attributed.
-    let https = target.endpoint().is_none_or(|e| e.starts_with("https"));
     let mut cfg = transport_config(target, &spec.http)?;
     cfg.max_inflight = spec.http_limit();
-    op = op.layer(TraceContextLayer::new(FidelityTransport::new(
-        cfg,
-        https,
-        Some(recorder.clone()),
-    )?));
+    op = op.layer(transport_layer(target, cfg, Some(recorder.clone()), gate)?);
     // Async call stacks: operations are registered as await-tree roots by the runner, OpenDAL
     // sub-tasks by `ScopePropagatingExecutor`, and the transports add zero-allocation spans per
     // request. OpenDAL's `AwaitTreeLayer` is not used: it wraps every call and read chunk and
@@ -407,15 +416,16 @@ pub async fn measured_operator_with(
 /// the admin operator would otherwise retry every dataset upload for minutes. One `stat` on a
 /// key that does not exist, without retries; any HTTP answer (404, 403, ...) passes.
 pub async fn check_reachable(base: &Operator, target: &TargetSpec) -> Result<()> {
-    check_reachable_with(base, target, &HttpOptions::default()).await
+    check_reachable_with(base, target, &HttpOptions::default(), None).await
 }
 
 /// [`check_reachable`] with the run's transport and HTTP version (a server that only speaks
-/// HTTP/2 is reachable for an HTTP/2 client).
+/// HTTP/2 is reachable for an HTTP/2 client), behind the run's `gate`.
 pub async fn check_reachable_with(
     base: &Operator,
     target: &TargetSpec,
     http: &HttpOptions,
+    gate: Option<&Gate>,
 ) -> Result<()> {
     let h = HttpOptions {
         version: http.version,
@@ -423,7 +433,7 @@ pub async fn check_reachable_with(
     };
     let probe = base
         .clone()
-        .layer(trace_layer(target, &h, None)?)
+        .layer(trace_layer(target, &h, None, gate)?)
         .layer(TimeoutLayer::new().with_timeout(Duration::from_secs(20)));
     let Err(e) = probe.stat(".oprobe-reachability-check").await else {
         return Ok(());
@@ -684,13 +694,14 @@ pub async fn check_protocol(
     base: &Operator,
     target: &TargetSpec,
     http: &HttpOptions,
+    gate: Option<&Gate>,
 ) -> Result<()> {
     if http.version != crate::net::HttpVersion::H2 || !target.is_network() {
         return Ok(());
     }
     let probe = base
         .clone()
-        .layer(trace_layer(target, http, None)?)
+        .layer(trace_layer(target, http, None, gate)?)
         .layer(TimeoutLayer::new().with_timeout(Duration::from_secs(10)));
     let Err(e) = probe.stat(".oprobe-protocol-check").await else {
         return Ok(());
@@ -735,28 +746,16 @@ pub async fn check_protocol(
     .into())
 }
 
-/// Untraced operator for dataset seeding, verification and cleanup.
-/// Untraced operator that fails fast (few retries, short timeouts): the preflight check.
-pub fn preflight_operator(base: &Operator, target: &TargetSpec) -> Result<Operator> {
-    preflight_operator_with(base, target, None)
-}
-
-/// [`preflight_operator`] whose requests are recorded into `recorder` (budgets: a recorder
-/// with a guard accounts every request).
-pub fn preflight_operator_with(
+/// Untraced operator that fails fast (few retries, short timeouts): the preflight check,
+/// behind the run's `gate`.
+pub fn preflight_operator(
     base: &Operator,
     target: &TargetSpec,
-    recorder: Option<Arc<crate::trace::Recorder>>,
+    gate: Option<&Gate>,
 ) -> Result<Operator> {
-    let http = HttpOptions::default();
-    let mut op = base.clone();
-    if let Some(r) = &recorder
-        && !target.is_network()
-    {
-        op = op.layer(InProcessObserveLayer::new(r.clone()));
-    }
-    Ok(op
-        .layer(trace_layer(target, &http, recorder)?)
+    Ok(base
+        .clone()
+        .layer(trace_layer(target, &HttpOptions::default(), None, gate)?)
         .layer(
             TimeoutLayer::new()
                 .with_timeout(Duration::from_secs(30))
@@ -772,10 +771,22 @@ pub fn preflight_operator_with(
         ))
 }
 
+/// Untraced, patient operator outside any gate: cleanup (deleting test data), which no budget
+/// and no cancellation may stop.
 pub fn admin_operator(base: &Operator, target: &TargetSpec) -> Result<Operator> {
+    admin_operator_with(base, target, None)
+}
+
+/// [`admin_operator`] behind the run's `gate`: dataset preparation and verification, which
+/// count against the budgets and stop when the run is cancelled.
+pub fn admin_operator_with(
+    base: &Operator,
+    target: &TargetSpec,
+    gate: Option<&Gate>,
+) -> Result<Operator> {
     Ok(base
         .clone()
-        .layer(trace_layer(target, &HttpOptions::default(), None)?)
+        .layer(trace_layer(target, &HttpOptions::default(), None, gate)?)
         .layer(
             TimeoutLayer::new()
                 .with_timeout(Duration::from_secs(300))
