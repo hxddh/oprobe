@@ -217,7 +217,10 @@ pub fn hint_for(error_chain: &str, scheme: &str) -> Option<Hint> {
             ],
         ));
     }
-    if has("timed out") || has("timeout") {
+    // A timeout that happened, not the name of the setting: a refused value of
+    // `layers.timeout.io` is a usage error (9.2 answered `--set layers.timeout.io=0s` with
+    // "check reachability, firewalls and proxies").
+    if has("timed out") || e.replace("layers.timeout", "").contains("timeout") {
         return Some(h(
             "Network timeout",
             &[
@@ -245,6 +248,22 @@ mod tests {
         let msg = "cannot reach http://127.0.0.1:9 (s3://b): No connection could be made because \
                    the target machine actively refused it. (os error 10061)";
         assert!(hint_for(msg, "s3").unwrap().title.contains("refused"));
+    }
+
+    /// The network-timeout hint is for a timeout that happened, not for a refused value of
+    /// the timeout setting.
+    #[test]
+    fn a_refused_timeout_setting_gets_no_network_hint() {
+        let usage = "--set layers.timeout.io=0s: layers.timeout durations must be > 0";
+        assert_eq!(hint_for(usage, "s3"), None);
+        for failed in [
+            "read: Unexpected (temporary) at read => io operation timeout reached",
+            "connect to 10.0.0.1:443: operation timed out",
+            "layers.timeout.io cut the request: io timeout",
+        ] {
+            let h = hint_for(failed, "s3").unwrap_or_else(|| panic!("{failed}"));
+            assert_eq!(h.title, "Network timeout", "{failed}");
+        }
     }
 
     #[test]

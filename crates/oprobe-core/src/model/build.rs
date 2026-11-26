@@ -5,6 +5,7 @@ use std::time::SystemTime;
 
 use super::report::*;
 use super::{ReqRow, Run, RunId};
+use crate::analysis::censoring::StalledOpenLoop;
 use crate::analysis::diagnosis::{Severity, check_sla, diagnose};
 use crate::analysis::hypothesis::HypothesisKind;
 use crate::config::{Knobs, OpKind, Profile};
@@ -126,10 +127,23 @@ pub(super) fn finish(run: &mut Run, breached: bool) {
     };
 }
 
+/// How a run varies its own load: the flag a headline names. `prove` has nothing to prove on
+/// a run with no finding, so the headline never points at it.
+const VARY_THE_LOAD: &str = "`--set shape=ramp:FROM..TO/D` (arrivals per second, over D)";
+
 /// The verdict line (design v6 §3): the top finding's cause; with no finding, where the time
-/// went — and when nothing throttled and no load was varied, that a plateau is not a limit
-/// one run can size (N2: prove sizes it).
+/// went — and when nothing throttled, that a run at a steady load shows no limit, and how to
+/// vary the load (N2). An open loop that stalled says so first, with its arithmetic
+/// ([`StalledOpenLoop`]): its latencies are lower bounds, whatever the findings say.
 pub fn headline(r: &Report) -> String {
+    let what = what_happened(r);
+    match StalledOpenLoop::of(r.open_loop.as_ref(), r.summary.latency.p99) {
+        Some(stalled) if r.summary.ops > 0 => format!("{}. {what}", stalled.describe()),
+        _ => what,
+    }
+}
+
+fn what_happened(r: &Report) -> String {
     if let Some(f) = r.findings.first() {
         return f.cause.clone();
     }
@@ -137,30 +151,29 @@ pub fn headline(r: &Report) -> String {
         return "No operations completed in the measurement window.".into();
     }
     let kind = r.capacity.selected().map(|h| h.kind);
-    let stage = r.stages.bottleneck.label();
-    match kind {
-        Some(HypothesisKind::Queueing) => format!(
-            "Inconclusive: latency grows with the requests in flight ({stage}), but one run varies no load — prove sizes a change."
-        ),
-        _ if r.resilience.throttled_responses == 0
-            && matches!(
-                r.stages.bottleneck,
-                crate::analysis::diagnosis::Bottleneck::ServerLatency
-                    | crate::analysis::diagnosis::Bottleneck::Download
-                    | crate::analysis::diagnosis::Bottleneck::Upload
-            ) =>
-        {
-            format!(
-                "No limit reached: {stage} dominates (p50 {} · p99 {}); one run varies no load — prove sizes a change.",
-                crate::util::fmt_ms(r.summary.latency.p50),
-                crate::util::fmt_ms(r.summary.latency.p99)
-            )
-        }
-        _ => format!(
-            "No finding: {stage} dominates (p50 {} · p99 {}).",
-            crate::util::fmt_ms(r.summary.latency.p50),
-            crate::util::fmt_ms(r.summary.latency.p99)
-        ),
+    let found = format!(
+        "No finding: {} dominates (p50 {} · p99 {}).",
+        r.stages.bottleneck.label(),
+        crate::util::fmt_ms(r.summary.latency.p50),
+        crate::util::fmt_ms(r.summary.latency.p99)
+    );
+    // The time is the service's and nothing was rejected: a limit, if there is one, shows
+    // only when the load changes, and this run held it steady.
+    let service_bound = matches!(
+        r.stages.bottleneck,
+        crate::analysis::diagnosis::Bottleneck::ServerLatency
+            | crate::analysis::diagnosis::Bottleneck::Download
+            | crate::analysis::diagnosis::Bottleneck::Upload
+    );
+    if r.resilience.throttled_responses == 0
+        && !r.is_trace()
+        && (kind == Some(HypothesisKind::Queueing) || service_bound)
+    {
+        format!(
+            "{found} The load was not varied, so this run cannot show a limit: vary it with {VARY_THE_LOAD}."
+        )
+    } else {
+        found
     }
 }
 

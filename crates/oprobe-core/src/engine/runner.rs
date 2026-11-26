@@ -1162,28 +1162,29 @@ mod tests {
             "{:?}",
             v.breakdown
         );
-        // A p99 limit every completed operation is within is still not met: most arrivals
-        // never ran, and their latency is only known to be at least their wait (9.1 checked
-        // the completed operations alone and passed).
+        // Most arrivals never ran, and their latency is only known to be at least their wait:
+        // the run fails its checks with no limit set (9.1 looked at the completed operations
+        // alone and passed).
         let sla = crate::config::Sla {
-            p99_ms: Some(30_000.0),
             max_error_rate: 1.0,
             ..Default::default()
         };
-        assert!(snap.verbs.iter().all(|v| v.latency.max < 30_000.0));
         let verdict = crate::analysis::diagnosis::check_sla(&snap, &sla);
         assert_eq!(verdict.breaches.len(), 1, "{verdict:?}");
         assert!(
             verdict.breaches[0].contains("scheduled arrivals never completed"),
             "{verdict:?}"
         );
-        let (p99, censored, arrivals) =
-            crate::analysis::diagnosis::censored_p99(&snap).expect("censored arrivals");
-        assert_eq!((censored, arrivals), (ol.missed, ol.intended_count));
-        assert!(
-            matches!(p99, crate::analysis::censoring::CensoredQuantile::AtLeast(ms) if ms > 0.0),
-            "{p99:?}"
+        let stalled = crate::analysis::censoring::StalledOpenLoop::of(
+            snap.open_loop.as_ref(),
+            snap.summary.latency.p99,
+        )
+        .expect("a stalled open loop");
+        assert_eq!(
+            (stalled.censored_count, stalled.arrivals_count),
+            (ol.missed, ol.intended_count)
         );
+        assert_eq!(stalled.p99_at_least_ms, snap.summary.latency.p99);
     }
 
     /// W10: an open loop that falls behind stamps each operation when it actually starts, so
