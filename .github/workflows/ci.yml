@@ -259,6 +259,21 @@ jobs:
           echo "== minio"; tail -n 80 "$RUNNER_TEMP/minio.log" || true
           for c in gcs azurite; do echo "== $c"; docker logs --tail 80 $c || true; done
 
+  # oprobe-trace is the crate other programs embed: its floor is OpenDAL 0.59's (1.91), not the
+  # workbench's. Checked alone, as an embedder builds it (no `__internal`), with and without
+  # its features.
+  msrv-trace:
+    name: MSRV of oprobe-trace (1.91)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: "1.91"
+      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
+      - run: cargo check -p oprobe-trace --locked --all-targets --features otel,schemars
+      - run: cargo check -p oprobe-trace --locked
+
   msrv:
     name: MSRV (1.97)
     runs-on: ubuntu-latest
