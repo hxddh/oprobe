@@ -16,8 +16,9 @@
 //!   duration. Besides `oprobe.stage` it carries `oprobe.api` (`GetObject`, …),
 //!   `http.request.method`, `http.response.status_code` and OpenDAL's own metric labels
 //!   (`opendal-layer-otelmetrics`), so both layers' series join: `scheme`, `namespace` (the
-//!   bucket or container) and `root` of the service, and `operation` (`read`, `write`,
-//!   `stat`, …) when the service attached it.
+//!   bucket or container) and `root` of the service of the operator that issued the request
+//!   (a layer applied to several operators labels each one's requests with its own), and
+//!   `operation` (`read`, `write`, `stat`, …) when the service attached it.
 //!
 //! The backend calls of in-process services (`memory`, `fs`) are not HTTP requests and are in
 //! neither; operation durations are OpenDAL's own metrics (`opendal-layer-otelmetrics`).
@@ -28,7 +29,7 @@
 //! # let _ = (layer, handle);
 //! ```
 
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use opentelemetry::KeyValue;
 use opentelemetry::metrics::{Histogram, Meter};
@@ -59,8 +60,6 @@ const STAGE_BOUNDARIES_S: [f64; 19] = [
 pub struct OtelExporter {
     duration: Histogram<f64>,
     stage_duration: Histogram<f64>,
-    /// `scheme`, `namespace`, `root` of the service (once the layer is applied).
-    service: OnceLock<[KeyValue; 3]>,
 }
 
 impl std::fmt::Debug for OtelExporter {
@@ -84,7 +83,6 @@ impl OtelExporter {
                 .with_description("Duration of the stages of HTTP client requests.")
                 .with_boundaries(STAGE_BOUNDARIES_S.to_vec())
                 .build(),
-            service: OnceLock::new(),
         }
     }
 }
@@ -166,8 +164,14 @@ impl Exporter for OtelExporter {
             KeyValue::new("oprobe.api", r.service_op.unwrap_or_else(|| r.api.label())),
             KeyValue::new("http.request.method", method),
         ]);
-        if let Some(s) = self.service.get() {
-            attrs.extend(s.iter().cloned());
+        // The service of the operator that issued the request (9.2 labelled every request
+        // of a layer with the first operator it was applied to).
+        if let Some(s) = &r.service {
+            attrs.extend([
+                KeyValue::new("scheme", s.scheme.clone()),
+                KeyValue::new("namespace", s.namespace.clone()),
+                KeyValue::new("root", s.root.clone()),
+            ]);
         }
         if let Some(op) = r.operation {
             attrs.push(KeyValue::new("operation", op));
@@ -183,21 +187,13 @@ impl Exporter for OtelExporter {
             self.stage_duration.record(us as f64 / 1e6, &attrs);
         }
     }
-
-    fn on_service(&self, scheme: &str, name: &str, root: &str) {
-        let _ = self.service.set([
-            KeyValue::new("scheme", scheme.to_owned()),
-            KeyValue::new("namespace", name.to_owned()),
-            KeyValue::new("root", root.to_owned()),
-        ]);
-    }
 }
 
-/// A [`crate::Config`] that exports to `meter` (cloning it gives each traced operator its own
-/// `scheme`, `namespace` and `root` attributes).
+/// A [`crate::Config`] that exports to `meter`. Every operator its layers are applied to has
+/// its own `scheme`, `namespace` and `root` attributes, whether each has a layer of its own or
+/// they share a clone of one.
 pub fn config(meter: &Meter) -> crate::Config {
-    let meter = meter.clone();
-    crate::Config::default().exporter_factory(move || Arc::new(OtelExporter::new(&meter)))
+    crate::Config::default().exporter(Arc::new(OtelExporter::new(meter)))
 }
 
 #[cfg(test)]
@@ -215,6 +211,8 @@ mod tests {
     struct Collected {
         count: u64,
         attributes: BTreeMap<String, BTreeSet<String>>,
+        /// How many observations carry each attribute.
+        with: BTreeMap<String, u64>,
     }
 
     struct Meters {
@@ -236,6 +234,8 @@ mod tests {
         }
 
         fn histogram(&self, name: &str) -> Collected {
+            // The totals so far, once: not on top of what an earlier call collected.
+            self.exporter.reset();
             self.provider.force_flush().unwrap();
             let mut out = Collected::default();
             for rm in &self.exporter.get_finished_metrics().unwrap() {
@@ -254,6 +254,7 @@ mod tests {
                                 .entry(kv.key.to_string())
                                 .or_default()
                                 .insert(kv.value.to_string());
+                            *out.with.entry(kv.key.to_string()).or_default() += p.count();
                         }
                     }
                 }
@@ -370,5 +371,37 @@ mod tests {
         }
         let stages = meters.histogram(REQUEST_STAGE_DURATION);
         assert_eq!(values(&stages, "root"), ["/alpha/", "/beta/"]);
+    }
+
+    /// One layer, cloned onto two operators (a `TraceLayer` is `Clone`, and one profile of
+    /// several operators is what sharing it is for): each operator's requests carry its own
+    /// service labels (9.2 labelled all of them with the operator the layer met first).
+    #[tokio::test]
+    async fn a_layer_cloned_onto_two_operators_labels_each_ones_requests() {
+        let server = testserver::serve(|_| async { testserver::respond(200, "x") }).await;
+        let meters = Meters::new();
+        let cfg = config(&meters.meter()).https(false).proxy(None);
+        let (layer, handle) = crate::layer(cfg);
+        for root in ["/alpha", "/beta"] {
+            let endpoint = format!("http://{}", server.addr);
+            let http = opendal_service_http::Http::default()
+                .endpoint(&endpoint)
+                .root(root);
+            let op = opendal_core::Operator::new(http)
+                .unwrap()
+                .layer(layer.clone());
+            op.read("k").await.unwrap();
+            // A layer added afterwards replays the trace layer: the labels stay the operator's.
+            let op = op.layer(handle.queue_layer());
+            op.read("k").await.unwrap();
+        }
+        let stages = meters.histogram(REQUEST_STAGE_DURATION);
+        assert_eq!(values(&stages, "root"), ["/alpha/", "/beta/"]);
+        assert_eq!(values(&stages, "scheme"), ["http"]);
+        // Every observation has a root: none is left unlabelled.
+        let requests: u64 = handle.snapshot().apis.iter().map(|a| a.count).sum();
+        assert_eq!(requests, 4);
+        assert!(stages.count >= requests, "{stages:?}");
+        assert_eq!(stages.with["root"], stages.count, "{stages:?}");
     }
 }
