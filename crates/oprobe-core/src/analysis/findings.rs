@@ -925,6 +925,18 @@ fn bandwidth_cap(c: &Ctx) -> Option<(Finding, Direction)> {
         .map(|q| if upload { q.send_us } else { q.body_us } as f64)
         .sum();
     let total: f64 = c.reqs().map(|q| q.total_us as f64).sum::<f64>().max(1.0);
+    // What one transfer under the cap takes: the time a saturated client's scheduling lag
+    // would have to explain for the cap to be its own doing ([`excess_latency_ms`]).
+    let transfers: Vec<f64> = c
+        .reqs()
+        .map(|q| if upload { q.send_us } else { q.body_us } as f64)
+        .filter(|us| *us > 0.0)
+        .collect();
+    let typical_transfer_ms = if transfers.is_empty() {
+        0.0
+    } else {
+        super::stats::median(&transfers) / 1000.0
+    };
     let (cause, stage, key) = if upload {
         (
             "Every upload stream shares one bandwidth cap: more streams only split it.",
@@ -957,6 +969,7 @@ fn bandwidth_cap(c: &Ctx) -> Option<(Finding, Direction)> {
                 (key, moving / total),
                 ("fitted_bytes_per_s", bps),
                 ("explains_ratio", h.explains_ratio),
+                ("typical_transfer_ms", typical_transfer_ms),
             ]),
             op_ids: slowest_ops(c.run, c.reqs().map(|q| q.op_id)),
             windows: Vec::new(),
@@ -1721,13 +1734,17 @@ fn client_bound(c: &Ctx, growth: Option<&TtfbGrowth>) -> Option<Finding> {
 /// to survive a saturated client.
 const LAG_DWARF_FACTOR: f64 = 10.0;
 
-/// The delay a latency finding attributes to the server, over its typical request: what a
-/// saturated client's scheduling lag would have to explain. `None` for other findings.
+/// The delay a timing finding attributes to the service: what a saturated client's scheduling
+/// lag would have to explain. `None` for other findings.
 fn excess_latency_ms(f: &Finding) -> Option<f64> {
     let v = |k: &str| f.evidence.values.get(k).copied();
     match f.code.as_str() {
         "tail_stragglers" => Some(v("straggler_ttfb_ms")? - v("typical_ttfb_ms")?),
         "hung_requests" => Some(v("slowest_request_ms")? - v("median_request_ms")?),
+        // Streams that share a cap spend their time moving bytes: a scheduling lag far below
+        // one transfer's time cannot have made it (macOS CI: a lag of 5.06 ms, just over the
+        // saturation threshold, dropped the cap of transfers that take a quarter second).
+        "bandwidth_cap" => v("typical_transfer_ms"),
         _ => None,
     }
 }
@@ -2717,6 +2734,29 @@ pub(crate) mod tests {
         assert_eq!(f[0].code, "client_bound", "{f:#?}");
         assert!(f[0].remedy.path.is_none());
         assert!(!f.iter().any(|x| x.code == "tail_stragglers"));
+    }
+
+    /// Streams sharing a cap take a quarter second each: a scheduling lag just over the
+    /// saturation threshold (macOS CI: 5.06 ms at 7 % CPU) cannot have made the cap, so the
+    /// finding stays beside `client_bound`; a lag as long as the transfers drops it.
+    #[test]
+    fn a_bandwidth_cap_that_dwarfs_the_clients_lag_survives_a_saturated_client() {
+        let (reqs, ops) = crate::analysis::limits::tests::capped_link(false);
+        let mut run = with_capacity(base(), reqs, ops);
+        let cap = derive(&run)
+            .into_iter()
+            .find(|x| x.code == "bandwidth_cap")
+            .expect("the capped link is found");
+        let transfer_ms = cap.evidence.values["typical_transfer_ms"];
+        assert!(transfer_ms > LAG_DWARF_FACTOR * 5.06, "{transfer_ms}");
+        run.report.self_stats.client_saturated = true;
+        run.report.self_stats.sched_lag_p99_ms = Some(5.06);
+        let f = derive(&run);
+        assert_eq!(f[0].code, "client_bound", "{f:#?}");
+        assert!(f.iter().any(|x| x.code == "bandwidth_cap"), "{f:#?}");
+        run.report.self_stats.sched_lag_p99_ms = Some(transfer_ms);
+        let f = derive(&run);
+        assert!(!f.iter().any(|x| x.code == "bandwidth_cap"), "{f:#?}");
     }
 
     #[test]

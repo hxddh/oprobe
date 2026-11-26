@@ -792,7 +792,7 @@ async fn cancelled_prepare_leaves_no_test_data() {
 async fn connection_refused_fails_fast() {
     let lab = lab(LabConfig::default()).await;
     let mut p = lab.profile("bkt");
-    let (_bound, port) = refusing_port();
+    let port = REFUSING_PORT;
     p.operator
         .options
         .insert("endpoint".into(), format!("http://127.0.0.1:{port}"));
@@ -824,15 +824,11 @@ async fn connection_refused_fails_fast() {
     assert!(hint.title.contains("refused"), "{}", hint.title);
 }
 
-/// A port that refuses connections for as long as the returned socket lives: bound, never
-/// listening. (A port taken from a listener that was then dropped is free again: another
-/// process, or another test, can be listening on it by the time it is used.)
-fn refusing_port() -> (tokio::net::TcpSocket, u16) {
-    let socket = tokio::net::TcpSocket::new_v4().unwrap();
-    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
-    let port = socket.local_addr().unwrap().port();
-    (socket, port)
-}
+/// A local port that refuses connections on every platform: 1 (tcpmux), privileged and
+/// served by nothing on a test machine. A socket bound without `listen()` refuses on Linux
+/// but lets the connection time out on macOS, and a port taken from a dropped listener can
+/// be handed to another test.
+const REFUSING_PORT: u16 = 1;
 
 /// An `http.proxy` that cannot be reached is named: 9.2 said the endpoint had refused the
 /// connection, and hinted at `options.endpoint`.
@@ -840,7 +836,7 @@ fn refusing_port() -> (tokio::net::TcpSocket, u16) {
 async fn an_unreachable_proxy_is_reported_as_the_proxy() {
     let lab = lab(LabConfig::default()).await;
     let mut p = lab.profile("bkt");
-    let (_bound, port) = refusing_port();
+    let port = REFUSING_PORT;
     p.operator.http.proxy = Some(format!("http://127.0.0.1:{port}"));
     small(&mut p, Preset::SmallFiles);
     let opened = Session::open(p, Cancel::new(), quiet());

@@ -910,6 +910,7 @@ pub fn evidence_label(key: &str, v: f64) -> (String, String) {
         "explains_ratio" => Some("Share it explains"),
         "stream_bytes_per_s" => Some("Per-stream throughput"),
         "fitted_bytes_per_s" => Some("Fitted bandwidth"),
+        "typical_transfer_ms" => Some("Typical transfer time"),
         "fitted_requests_per_s" => Some("Fitted request rate"),
         "fitted_inflight_count" => Some("Fitted limit (in flight)"),
         "requests_per_op_mean" => Some("Requests per operation"),

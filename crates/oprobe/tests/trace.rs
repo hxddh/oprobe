@@ -221,10 +221,17 @@ async fn show_opens_a_production_trace_and_prove_refuses_it() {
         .unwrap();
     assert!(throttled >= requests / 6, "{throttled} of {requests}");
     let findings = r["findings"].as_array().unwrap();
+    // Which finding carries the 503s is not this test's subject: a 503 on every fifth request
+    // follows neither the load, the rate nor the keys, so on one machine the fit calls them a
+    // limit and on another transient `errors` (Windows CI). Either way a finding reports
+    // them, and its next step is the run below.
     let thr = findings
         .iter()
-        .find(|f| ["throttling", "rate_limit", "key_limit"].contains(&f["code"].as_str().unwrap()))
-        .unwrap_or_else(|| panic!("a throttling finding: {findings:#?}"));
+        .find(|f| {
+            ["throttling", "rate_limit", "key_limit", "errors"]
+                .contains(&f["code"].as_str().unwrap())
+        })
+        .unwrap_or_else(|| panic!("a finding for the 503s: {findings:#?}"));
     // The concrete run of the traced service, with the lab's endpoint (K8: 7.0 printed
     // `oprobe run OPERATOR` literally).
     let run_cmd = "oprobe run s3://app-bucket/prod --set options.endpoint=http://127.0.0.1:";
