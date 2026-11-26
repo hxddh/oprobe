@@ -968,6 +968,21 @@
       ],
       "type": "object"
     },
+    "Direction": {
+      "description": "The direction of the bodies a [`HypothesisKind::BandwidthCap`] was fitted on.",
+      "oneOf": [
+        {
+          "const": "download",
+          "description": "Response bodies (`bytes_down` over the body stage).",
+          "type": "string"
+        },
+        {
+          "const": "upload",
+          "description": "Request bodies (`bytes_up` over the send stage): an uplink at its capacity.",
+          "type": "string"
+        }
+      ]
+    },
     "EffectiveKnobs": {
       "description": "Knob values as OpenDAL applies them, which can differ from what was requested.",
       "properties": {
@@ -1463,6 +1478,17 @@
             "type": "number"
           },
           "type": "array"
+        },
+        "direction": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Direction"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Which bodies share `bytes_per_s` (a bandwidth cap; absent in reports of 9.2 and\nearlier, which told an upload cap by how its evidence opens)."
         },
         "key": {
           "description": "The key or prefix of a [`HypothesisKind::KeyLimit`] (the hottest one).",
@@ -3386,6 +3412,7 @@
           ]
         },
         "p99_ms": {
+          "description": "A p99 limit of a 9.2 report. Nothing sets or checks one since 9.3 (an open loop that\nstalled fails its checks without a limit); the field stays so that those reports read.",
           "format": "double",
           "type": [
             "number",
