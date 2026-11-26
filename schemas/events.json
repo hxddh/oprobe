@@ -4659,7 +4659,7 @@
           "type": "number"
         },
         "feasible": {
-          "description": "Within `--max-throttle` and the error ratio a run allows (1 %).",
+          "description": "Within `--max-throttle` and the error ratio a run allows (1 %), and, for the remedy of\na `rate_limit` finding, sending no more requests per second than the fitted limit.",
           "type": "boolean"
         },
         "goodput_ops_per_s": {
@@ -4675,6 +4675,11 @@
           "type": "integer"
         },
         "p99_ms": {
+          "format": "double",
+          "type": "number"
+        },
+        "p99_spread_ratio": {
+          "description": "How far off this trial's p99 can be, as a log ratio: a quarter of the log width of the\nlatencies at the ranks 0.99·n ± 2·√(0.0099·n) of its n operations (the p99's\norder-statistic interval). Above 0.17 those latencies differ by more than 2×: the p99\nsits on a cliff. Absent when 0, and in results of 9.2 and earlier.",
           "format": "double",
           "type": "number"
         },
