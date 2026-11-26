@@ -804,10 +804,11 @@ fn prove_needs_three_pairs_to_decide() {
     let o = env.run(&run_args(&["lab://clean"], &["-q", "-o", "json"]));
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     // Whatever one or two pairs measure, they cannot decide. A trial is 500 ms of window and
-    // 100 ms of warm-up: three pairs take at least 3.6 s and never fit in 3 s, and one pair
-    // fits while a trial takes up to 1.5 s (9.2's `--trial 300ms --max-duration 1s` left a
-    // slow machine 100 ms a trial; 9.3 no longer starts the second half of a pair past the
-    // budget, so that margin showed).
+    // 100 ms of warm-up: three pairs take at least 3.6 s and never fit in 3 s. One pair fits
+    // while a trial takes up to 1.5 s. A machine slower than that (a Linux CI runner was) ends
+    // the proof before its first pair, with the budget's exit code: that decides nothing
+    // either, and is accepted here, since 9.3 no longer starts the second half of a pair past
+    // the budget.
     let o = env.run(&[
         "prove",
         "last",
@@ -820,12 +821,13 @@ fn prove_needs_three_pairs_to_decide() {
         "-o",
         "json",
     ]);
-    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
     let v = json(&o);
     validate("prove", &v);
     let pairs = v["pairs_count"].as_u64().unwrap();
-    assert!((1..=2).contains(&pairs), "{v}");
+    assert!(pairs <= 2, "{v}");
     assert_eq!(v["verdict"], "inconclusive", "{v}");
+    let want = if pairs == 0 { 4 } else { 0 };
+    assert_eq!(code(&o), want, "{}\n{}", stdout(&o), stderr(&o));
     assert!(
         v["notes"].as_array().unwrap().iter().any(|n| n
             .as_str()
@@ -1292,8 +1294,12 @@ fn show_opens_a_prove_and_lists_proves_within_the_limit() {
             "read.gap=1MiB",
             "--trial",
             "300ms",
+            // Three pairs, and room for a machine that takes a second over each trial: under
+            // `--max-duration 2500ms` a slow first trial left no time for its pair (exit 4).
+            "--pairs",
+            "3",
             "--max-duration",
-            "2500ms",
+            "10s",
             "-o",
             "json",
         ]);
