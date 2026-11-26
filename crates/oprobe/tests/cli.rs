@@ -615,8 +615,8 @@ fn prove_balances_the_ab_order_and_cools_down_after_throttling() {
             first[p as usize].get_or_insert(t["kind"].as_str().unwrap());
         }
     }
-    for block in first.chunks_exact(2) {
-        assert_ne!(block[0], block[1], "one AB and one BA per block: {first:?}");
+    for [a, b] in first.as_chunks::<2>().0 {
+        assert_ne!(a, b, "one AB and one BA per block: {first:?}");
     }
     let notes: Vec<&str> = v["notes"]
         .as_array()
