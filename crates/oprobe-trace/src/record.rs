@@ -257,6 +257,10 @@ pub struct RequestRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "schemars", schemars(with = "Option<String>"))]
     pub remote: Option<std::net::SocketAddr>,
+    /// The host and port the request was addressed to (the URL's, whatever proxy carried it):
+    /// OpenTelemetry's `server.address` and `server.port`. Absent for in-process backends.
+    #[serde(skip)]
+    pub server: Option<(std::sync::Arc<str>, u16)>,
     /// The exact backend API (OpenDAL `ServiceOperation`) when the service attached one; the
     /// request row's `api`. `api` above is its class (aggregation).
     #[serde(skip)]
@@ -273,6 +277,16 @@ pub struct RequestRecord {
 }
 
 impl RequestRecord {
+    /// Remove URL credentials from the error text
+    /// ([`crate::util::strip_url_credentials`]). Every record passes here as it is captured
+    /// (`OpScope::push_request`, `Recorder::record_unscoped_request`), whatever transport or
+    /// backend wrote the text, so no exporter, snapshot or file sees a signature or token.
+    pub(crate) fn redact(&mut self) {
+        if let Some(error) = self.error.as_mut().filter(|e| e.contains("://")) {
+            *error = crate::util::strip_url_credentials(error);
+        }
+    }
+
     pub fn is_throttle(&self) -> bool {
         crate::rows::FailureCode::is_throttle_response(
             self.status,

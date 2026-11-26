@@ -1135,6 +1135,16 @@ impl Recorder {
     /// Request issued outside any operation scope (rare: background OpenDAL work).
     pub fn record_unscoped_request(&self, r: &RequestRecord) {
         crate::scope::note_backend_request();
+        // The capture boundary: an error text never keeps a URL's credentials.
+        let redacted;
+        let r = if r.error.as_deref().is_some_and(|e| e.contains("://")) {
+            let mut clean = r.clone();
+            clean.redact();
+            redacted = clean;
+            &redacted
+        } else {
+            r
+        };
         if let Some(g) = self.guard.get() {
             g.add(1, r.bytes_up + r.bytes_down);
         }
@@ -1262,7 +1272,11 @@ impl Recorder {
     }
 
     /// Record a completed logical operation (only if it started inside the window).
-    pub fn complete_op(&self, measured: bool, c: OpCompletion) {
+    pub fn complete_op(&self, measured: bool, mut c: OpCompletion) {
+        // The capture boundary, as for requests: no URL credentials in an error text.
+        if let Some(error) = c.error.as_mut().filter(|e| e.contains("://")) {
+            *error = crate::util::strip_url_credentials(error);
+        }
         let n = self.completions.fetch_add(1, Ordering::Relaxed);
         if n.is_multiple_of(OBSERVER_SAMPLE_EVERY) {
             let t = Instant::now();
@@ -2200,6 +2214,7 @@ mod tests {
             retry_after_ms: None,
             error: None,
             remote: None,
+            server: None,
             service_op: None,
             tls: None,
             tcp: None,
@@ -2449,6 +2464,20 @@ mod tests {
         assert_eq!(s.timeline.len(), 3);
         assert_eq!(s.timeline[2].errors, 1);
         assert_eq!(s.timeline[2].ops_count, 1);
+    }
+
+    /// An operation's error text is captured without the credentials of a URL in it.
+    #[test]
+    fn a_failed_operations_error_never_keeps_a_urls_credentials() {
+        let r = Recorder::always_on(16);
+        let error = "read https://b.example/k?sv=2024&sig=SASSECRET: connection reset";
+        completion(&r, 1, Instant::now(), 1000, Some(error), OpScopeData::default());
+        let rows = r.take_trace();
+        assert_eq!(
+            rows.ops[0].error.as_deref(),
+            Some("read https://b.example/k?sv=2024: connection reset")
+        );
+        assert!(!format!("{:?}{rows:?}", r.snapshot()).contains("SASSECRET"));
     }
 
     #[test]

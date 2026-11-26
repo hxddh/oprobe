@@ -490,3 +490,119 @@ async fn cache_layer_isolates_concurrent_hits_and_misses_and_counts_stat() {
         "{reqs:#?}"
     );
 }
+
+mod host_transport {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use opendal_core::raw::{Layer, Servicer};
+    use opendal_core::{
+        Buffer, HttpBody, HttpTransport, HttpTransporter, OperationContext, Operator, Result,
+    };
+
+    /// The application's own HTTP client: it answers itself (no network) and counts.
+    struct HostClient(Arc<AtomicUsize>);
+
+    impl HttpTransport for HostClient {
+        async fn fetch(&self, _: http::Request<Buffer>) -> Result<http::Response<HttpBody>> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            let body = futures::stream::iter([Ok(Buffer::from("hello"))]);
+            Ok(http::Response::builder()
+                .status(200)
+                .header("content-length", "5")
+                .body(HttpBody::new(body, Some(5)))
+                .unwrap())
+        }
+    }
+
+    /// What `ConcurrentLimitLayer::with_http_concurrent_limit` does to the context: it wraps
+    /// the transport the layers before it left (here it only counts).
+    #[derive(Debug)]
+    struct Gate(Arc<AtomicUsize>);
+
+    struct Gated {
+        inner: HttpTransporter,
+        passed: Arc<AtomicUsize>,
+    }
+
+    impl HttpTransport for Gated {
+        async fn fetch(&self, req: http::Request<Buffer>) -> Result<http::Response<HttpBody>> {
+            self.passed.fetch_add(1, Ordering::Relaxed);
+            self.inner.fetch(req).await
+        }
+    }
+
+    impl Layer for Gate {
+        fn apply_context(&self, _: Servicer, inner: OperationContext) -> OperationContext {
+            let gated = Gated {
+                inner: inner.http_transport().clone(),
+                passed: self.0.clone(),
+            };
+            inner.with_http_transport(HttpTransporter::new(gated))
+        }
+    }
+
+    /// An operator with its own client and an HTTP gate added *before* the trace layer.
+    fn operator(trace: oprobe_trace::TraceLayer) -> (Operator, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let (client, gate) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        // Port 1 on loopback: nothing listens, so a request that leaves the host's client
+        // fails at once instead of reaching anything.
+        let service = opendal_service_http::Http::default().endpoint("http://127.0.0.1:1");
+        let context = OperationContext::new()
+            .with_http_transport(HttpTransporter::new(HostClient(client.clone())));
+        let op = Operator::new(service)
+            .unwrap()
+            .with_context(context)
+            .layer(Gate(gate.clone()))
+            .layer(trace);
+        (op, client, gate)
+    }
+
+    /// `Config::keep_http_transport`: the application's client and the limiter beneath the
+    /// trace layer carry every request, and the layer still records them (9.1 had no way to
+    /// keep them: the layer always installed its own client in their place).
+    #[tokio::test]
+    async fn keep_http_transport_leaves_the_hosts_client_and_inner_limiters_in_charge() {
+        let cfg = oprobe_trace::Config::default().keep_http_transport(true);
+        let (trace, handle) = oprobe_trace::layer(cfg);
+        assert!(handle.transport_error().is_none());
+        assert_eq!(
+            format!("{trace:?}"),
+            r#"TraceLayer { http_transport: "the installed transport, observed", .. }"#
+        );
+        let (op, client, gate) = operator(trace);
+        for _ in 0..3 {
+            assert_eq!(op.read("k").await.unwrap().to_vec(), b"hello");
+        }
+        let snap = handle.snapshot();
+        let requests: u64 = snap.apis.iter().map(|a| a.count).sum();
+        assert!(requests >= 3, "{:?}", snap.apis);
+        // Every request went through the gate and the host's client, and was recorded.
+        assert_eq!(gate.load(Ordering::Relaxed) as u64, requests);
+        assert_eq!(client.load(Ordering::Relaxed) as u64, requests);
+        let down: u64 = snap.apis.iter().map(|a| a.bytes_down).sum();
+        assert_eq!(down, 5 * requests);
+        assert_eq!(snap.summary.ops, 3);
+        assert_eq!(snap.resilience.network_errors, 0, "{:?}", snap.resilience);
+        // The connections are the host client's own business: none is reported dialed.
+        assert_eq!(snap.connections.dialed, 0, "{:?}", snap.connections);
+    }
+
+    /// The default is the opposite, and says so: the layer's instrumented client replaces
+    /// whatever transport the operator had, so neither the host's client nor a limiter added
+    /// before the layer sees a request (docs/embedding.md: add the trace layer first).
+    #[tokio::test]
+    async fn by_default_the_instrumented_client_replaces_the_installed_transport() {
+        let cfg = oprobe_trace::Config::default().https(false).proxy(None);
+        let (trace, handle) = oprobe_trace::layer(cfg);
+        assert_eq!(
+            format!("{trace:?}"),
+            r#"TraceLayer { http_transport: "replaced by the instrumented client", .. }"#
+        );
+        let (op, client, gate) = operator(trace);
+        assert!(op.read("k").await.is_err());
+        assert_eq!(client.load(Ordering::Relaxed), 0);
+        assert_eq!(gate.load(Ordering::Relaxed), 0);
+        assert!(handle.snapshot().resilience.network_errors >= 1);
+    }
+}

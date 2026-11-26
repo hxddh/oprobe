@@ -2,7 +2,9 @@
 name = "oprobe-trace"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
+# OpenDAL 0.59's own floor (`opendal-core` declares 1.91), not the workspace's: the workbench needs a
+# newer compiler for its UI toolkit, an embedder of this crate does not.
+rust-version = "1.91"
 license.workspace = true
 repository.workspace = true
 documentation = "https://docs.rs/oprobe-trace"
@@ -17,7 +19,8 @@ features = ["otel", "schemars"]
 
 [features]
 default = []
-# OpenTelemetry metrics (`http.client.request.duration` with `oprobe.stage`/`oprobe.api`).
+# OpenTelemetry metrics: `http.client.request.duration` once per HTTP request (standard
+# attributes only) and `oprobe.http.client.request.stage.duration` per stage (`oprobe.stage`).
 otel = ["dep:opentelemetry"]
 # `schemars::JsonSchema` for the snapshot types.
 schemars = ["dep:schemars"]
@@ -66,6 +69,10 @@ tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "net", "io-
 opendal-service-http = "0.59"
 opendal-service-fs = "0.59"
 opendal-http-transport-reqwest = "0.59"
+# The in-process HTTP/1.1 and HTTP/2 server of the transport's tests.
+hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true
 
 [[bench]]
 name = "overhead"

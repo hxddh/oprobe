@@ -1,19 +1,23 @@
-//! Networking: TLS, proxy tunnelling, instrumented dialing, the fidelity HTTP transport and
-//! the stand-alone handshake probe.
+//! Networking: TLS, proxy tunnelling, instrumented dialing, the fidelity HTTP transport, the
+//! observer of a host's own transport and the stand-alone handshake probe.
 
 pub mod config;
 pub mod dial;
 pub mod fidelity;
 pub mod proxy;
 pub mod signals;
+#[cfg(test)]
+pub(crate) mod testserver;
 pub mod stats;
 pub mod tcpinfo;
 pub mod tls;
 pub mod tlsinfo;
+pub mod wrapped;
 
 pub use config::{HttpVersion, TransportConfig};
 pub use fidelity::FidelityTransport;
 pub use proxy::ProxyConfig;
+pub use wrapped::WrappedTransport;
 #[allow(unused_imports)]
 pub use tls::TlsClientOptions;
 
