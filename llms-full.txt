@@ -1129,9 +1129,10 @@ It is the only crate oprobe publishes with a semver promise. (`oprobe-core` is o
 so that `cargo install oprobe` works; it is internal.)
 
 **Requirements.** OpenDAL 0.59 (`opendal` or `opendal-core`; another minor shows up as trait
-errors about `Layer` or `Servicer`), the Tokio runtime, Rust 1.97 or later, and, for the `otel`
-feature, `opentelemetry` 0.32 (the version OpenDAL's `opendal-layer-otelmetrics` uses, so both
-layers share one global meter).
+errors about `Layer` or `Servicer`), the Tokio runtime, Rust 1.91 or later (OpenDAL 0.59's own
+minimum; the oprobe workbench itself needs 1.97), and, for the `otel` feature, `opentelemetry`
+0.32 (the version OpenDAL's `opendal-layer-otelmetrics` uses, so both layers share one global
+meter).
 
 ## Three lines
 
@@ -1148,8 +1149,9 @@ handle.save("prod.oprobe")?;          // then: oprobe show prod.oprobe
 
 Apply it first, before your other layers (`ConcurrentLimitLayer`, `TailCutLayer`, `RetryLayer`): it
 installs the instrumented `HttpTransport` on `OperationContext`, and the layers above it then wrap
-it, so HTTP concurrency caps stay in force and every retry is recorded as its own request. Give
-OpenDAL's retry layer the handle's notifier, so retries land in the profile's Retries section
+it, so HTTP concurrency caps stay in force and every retry is recorded as its own request. The
+order matters, and so does a client of your own: see [Where the layer goes](#where-the-layer-goes).
+Give OpenDAL's retry layer the handle's notifier, so retries land in the profile's Retries section
 (count, backoff, throttling) and the attempts of one call count as one operation:
 
 ```rust
@@ -1166,6 +1168,59 @@ so cache hits, hit bytes and lookup latency are recorded in `snapshot.cache` and
 ```rust
 let op = op.layer(foyer_layer).layer(handle.cache_layer());
 ```
+
+## Where the layer goes
+
+DNS, TCP, TLS and connection statistics can only be measured from inside the HTTP client. So by
+default the layer brings its own client (built like OpenDAL's default one) and **replaces the
+HTTP transport installed on the operator**. OpenDAL composes transports in the order of the
+`.layer(...)` calls: each layer receives the transport the layers before it left, and wraps or
+replaces it. Two things follow:
+
+- **Layers that wrap the transport go after the trace layer.**
+  `ConcurrentLimitLayer::with_http_concurrent_limit` added *after* the trace layer wraps the
+  instrumented client and limits it. Added *before*, it wraps a transport the trace layer then
+  replaces, and silently stops limiting. Add `handle.queue_layer()` last, and the time requests
+  wait for the limiter is their `queue` stage:
+
+  ```rust
+  let op = Operator::new(builder)?
+      .layer(trace)                                                   // first
+      .layer(ConcurrentLimitLayer::new(64).with_http_concurrent_limit(16))
+      .layer(RetryLayer::new().with_notify(handle.retry_notify()))
+      .layer(handle.queue_layer());                                   // last
+  ```
+
+- **A client of your own is not used.** A transport you installed with
+  `Operator::with_context(OperationContext::new().with_http_transport(..))`, or the process
+  default of `HttpTransporter::install_default`, is replaced too, with its proxy, TLS roots,
+  timeouts and pool settings. Either say the same on `Config` (`proxy`, `extra_ca_pem`,
+  `http_version`, `keep_alive`, `max_inflight`; see [Configuration](#configuration)), or keep your
+  client:
+
+```rust
+let cfg = oprobe_trace::Config::default().keep_http_transport(true);
+let (trace, handle) = oprobe_trace::layer(cfg);
+let op = Operator::new(builder)?
+    .with_context(OperationContext::new().with_http_transport(my_client))
+    .layer(ConcurrentLimitLayer::new(64).with_http_concurrent_limit(16)) // before or after: both work
+    .layer(trace);
+```
+
+With **`keep_http_transport(true)`** the layer wraps the installed transport instead of replacing
+it: your client, and every limiter beneath the trace layer, carries the requests unchanged,
+wherever the layer sits. The layer then sees each request from outside:
+
+| | the instrumented client (default) | `keep_http_transport(true)` |
+|---|---|---|
+| queue, time to first byte, body, consumer stall | yes | yes |
+| status, bytes, request IDs, provider error codes, retries, operations | yes | yes |
+| DNS, TCP, proxy and TLS time, upload send time | yes | no: part of the time to first byte |
+| connections: reuse, dials, TLS details, kernel TCP statistics | yes | no |
+| your proxy, TLS roots, timeouts, pool | no: set them on `Config` | yes |
+
+`format!("{trace:?}")` says which one a layer does (`http_transport: "replaced by the
+instrumented client"` or `"the installed transport, observed"`).
 
 ## What you get
 
@@ -1203,11 +1258,23 @@ let cfg = oprobe_trace::Config::default().exporter(std::sync::Arc::new(Slow));
 ```
 
 - **OpenTelemetry** (feature `otel`, `opentelemetry` 0.32): `oprobe_trace::otel::config(&meter)`
-  records `http.client.request.duration` (seconds) once per stage (with `oprobe.stage`,
-  `oprobe.api`, `http.request.method`, `http.response.status_code`), carrying OpenDAL's own
-  metric labels (`scheme`, `namespace`, `root`, `operation`) so its series join
-  `opendal-layer-otelmetrics`'. Operation durations and cache metrics are not repeated: use
-  OpenDAL's own metrics layers for them.
+  records two histograms, in seconds:
+  - `http.client.request.duration`, the standard metric of the HTTP semantic conventions:
+    **exactly once per HTTP request**, with standard attributes only (`http.request.method`,
+    `server.address`, `server.port`, and `http.response.status_code`,
+    `network.protocol.version`, `error.type` when they apply). Its count is the number of
+    requests, as any HTTP dashboard assumes.
+  - `oprobe.http.client.request.stage.duration`: where each request's time went, once per stage
+    that took time. `oprobe.stage` is `queue`, `connect`, `send`, `ttfb`, `body` or `stall`
+    (they add up to the request's duration); it also carries `oprobe.api`,
+    `http.request.method`, `http.response.status_code` and OpenDAL's own metric labels
+    (`scheme`, `namespace`, `root`, `operation`), so its series join
+    `opendal-layer-otelmetrics`'.
+
+  Backend calls of `memory` and `fs` are not HTTP requests and are in neither. Operation
+  durations and cache metrics are not repeated: use OpenDAL's own metrics layers for them.
+  (Until 9.1 the stages were recorded into `http.client.request.duration` itself, under
+  `oprobe.stage`, so every request counted up to seven times; query the new histogram for them.)
 
 ## Configuration
 
@@ -1224,6 +1291,7 @@ let cfg = oprobe_trace::Config::default().exporter(std::sync::Arc::new(Slow));
 | `proxy(Some(url) \| None)` | the environment | an explicit `http://` proxy, or none |
 | `https(on)` | true | selects `HTTPS_PROXY` over `HTTP_PROXY` |
 | `tcp_info(on)` | true | read kernel TCP statistics at the end of each request (Linux, macOS) |
+| `keep_http_transport(on)` | false | wrap the operator's own HTTP transport instead of replacing it ([Where the layer goes](#where-the-layer-goes)); the client settings above then do not apply, `max_inflight` does |
 | `exporter(e)` | none | your `Exporter` |
 
 `handle.transport_error()` says why HTTP requests are not instrumented, if the transport could not
@@ -1238,6 +1306,16 @@ host, 90 s idle timeout), observed through reqwest's public extension points: a 
 a connector layer that times each dial, a TLS session store that timestamps the ClientHello, and a
 body wrapper that times the transfer and your code's consumption. Nothing is decrypted or
 proxied. For `memory` and `fs` it records one request per backend call.
+
+A connection's dial belongs to the request that started it: that request is the connection's
+cold one, whichever request is answered first on a shared HTTP/2 connection; a request that
+waited for another's dial shows the wait as queue time (`detail.dial_wait_us`). A dial whose
+request went elsewhere is a connection nobody waited for: counted, charged to no request.
+Kernel TCP statistics are read at the end of each request; the retransmits of a connection
+shared by concurrent HTTP/2 streams are split among the requests in flight when they are read,
+so `detail.retrans_count` adds up to the connection's count and no retransmit is charged twice.
+The socket of a new connection is looked up on the runtime's blocking pool (one scan of the
+descriptor table answers every connection dialed meanwhile), never on a worker thread.
 
 Above the transport, the layer wraps the service: each call runs in an operation scope that the
 transport (and OpenDAL's background tasks, through a scope-propagating executor) reports its
@@ -1312,8 +1390,11 @@ byte range it asked for (`detail.range_bytes`) and, when it failed, its class
 **Keys are hashed.** An operation's `key` is its first path segment (at most 32 bytes) and a
 48-bit hash of the whole key: `logs/2026/11/a.parquet` is recorded as `logs/#3f2a…`. Prefixes and
 hot keys still slice the traffic, and repeated reads are still told apart, but the file never
-holds a key. Request IDs and remote addresses can be in it; credentials never are. Treat a
-profile like a log file before you paste it into an issue.
+holds a key. Request IDs and remote addresses can be in it; credentials never are: an error
+text loses the credentials of every URL in it (`user:password@`, the signature of a presigned
+URL, an SAS `sig`, STS and access tokens) when it is recorded, before any exporter, snapshot or
+file sees it, and the errors the instrumented client returns to your code quote URLs the same
+way. Treat a profile like a log file before you paste it into an issue.
 
 
 <!-- source: docs/app.md -->
@@ -1974,7 +2055,13 @@ you run them.
   the workload and one row per operation and request. Object keys, request IDs and remote IP
   addresses are part of a run. Secrets are not: credential options (`secret_access_key`,
   `account_key`, `sas_token`, `password`, `*_key`, …) are redacted before anything is printed or
-  saved, and URLs lose embedded credentials and query strings.
+  saved. URLs lose their credentials wherever they appear, in an operator, an option, a proxy
+  setting or the text of an error: `user:password@`, and the query parameters that carry a
+  signature or a token (`X-Amz-Signature`, `X-Amz-Credential`, `X-Amz-Security-Token`,
+  `Signature`, `AWSAccessKeyId`, an Azure SAS's `sig`, `X-Goog-Signature`, `x-oss-signature`,
+  `q-signature`, `access_token`, `token`, …, whatever their case). What only describes a
+  request stays readable (`X-Amz-Expires`, an SAS's `se` and `sp`). Errors, warnings and log
+  events are printed the same way.
 - **The host** is recorded as OS, architecture, CPU count and a hash of the host name, never the
   name itself.
 - **Pending-cleanup markers** in `<data dir>/oprobe/pending/`: while a run that writes is going,
@@ -1990,8 +2077,10 @@ Delete runs with `oprobe show --rm RUN…`, or remove the data directory.
 operations and their requests, with their API, method, status, timing, bytes, connection and
 request ID. Object keys are never stored: an operation's key is its first path segment (at most
 32 bytes) and a hash of the whole key (`logs/#3f2a…`), so a top-level directory name can be in
-the file, but not a key. Request IDs and remote addresses are. Credentials never are. Review a
-file before you attach it to an issue.
+the file, but not a key. Request IDs and remote addresses are. Credentials never are: the
+text of a failed request or operation loses the credentials of every URL in it (the signature
+and token of a presigned or SAS URL included) when it is recorded, so neither an `Exporter`,
+a `Snapshot` nor a file ever holds them. Review a file before you attach it to an issue.
 
 ## Test data in your bucket
 
