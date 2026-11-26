@@ -19,7 +19,8 @@
 //! No descriptor is ever duplicated, so no connection is kept open by oprobe.
 //!
 //! Cost: three syscalls per sample (≈1–3 µs), once per request (retransmits are attributed
-//! per request). The descriptor of a connection inside reqwest is found by scanning the
+//! per request), and once more at the response headers of an upload whose connection was
+//! known while it sent. The descriptor of a connection inside reqwest is found by scanning the
 //! process's descriptor table: [`SockFinder`] does that on the runtime's blocking pool, never
 //! on a worker thread, and one scan answers every connection dialed meanwhile.
 
@@ -320,20 +321,28 @@ impl SockFinder {
             return None;
         }
         let runtime = tokio::runtime::Handle::try_current().ok()?;
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let start = {
-            let mut q = self.queue();
-            q.pending.push((addr, tx));
-            !std::mem::replace(&mut q.scanning, true)
-        };
-        if start {
-            let mut scan = Scan {
-                finder: self.clone(),
-                done: false,
+        // A scan that its runtime dropped answers nobody. The lookup may have waited for the
+        // scan of another runtime (the finder is its operator's): it asks once more, and its
+        // own runtime scans.
+        for _ in 0..2 {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let start = {
+                let mut q = self.queue();
+                q.pending.push((addr, tx));
+                !std::mem::replace(&mut q.scanning, true)
             };
-            runtime.spawn_blocking(move || scan.drain());
+            if start {
+                let mut scan = Scan {
+                    finder: self.clone(),
+                    done: false,
+                };
+                runtime.spawn_blocking(move || scan.drain());
+            }
+            if let Ok(found) = rx.await {
+                return found;
+            }
         }
-        rx.await.ok().flatten()
+        None
     }
 
     fn queue(&self) -> std::sync::MutexGuard<'_, FinderQueue> {
@@ -344,7 +353,7 @@ impl SockFinder {
 /// The blocking task that answers a finder's queue. The runtime may drop it without running
 /// it (a runtime shut down while the task waits for a thread of its blocking pool), and the
 /// finder outlives the runtime when its operator does: dropped before it finished, it gives
-/// the queue back, so the lookups waiting for it are answered (nothing found) and the next
+/// the queue back, so the lookups waiting for it wake (and ask again, once) and the next
 /// lookup starts a scan on its own runtime. 9.2 left `scanning` set, and every later lookup
 /// waited for ever.
 struct Scan {
@@ -385,7 +394,7 @@ impl Drop for Scan {
             q.scanning = false;
             std::mem::take(&mut q.pending)
         };
-        // Dropping a sender answers its lookup: nothing found.
+        // Dropping a sender wakes its lookup.
         drop(waiting);
     }
 }
@@ -951,9 +960,10 @@ mod tests {
     }
 
     /// A runtime that is shutting down drops the scan without running it, and the finder
-    /// outlives the runtime with its operator: the lookup that waited for the scan is
-    /// answered (nothing found), and a lookup on another runtime starts a scan of its own
-    /// (9.2 left the finder scanning: that lookup, and every later one, never returned).
+    /// outlives the runtime with its operator: a lookup on the runtime that is gone is
+    /// answered (nothing found), one that waited for that scan from another runtime is
+    /// answered by a scan of its own, and so is every later one (9.2 left the finder
+    /// scanning: none of them ever returned).
     #[test]
     fn a_scan_dropped_by_its_runtime_gives_the_queue_back() {
         if !SUPPORTED {
@@ -980,17 +990,37 @@ mod tests {
         };
         assert_eq!(lost, Some(None), "answered when its scan was dropped");
 
-        let found = runtime().block_on(async {
+        let alive = runtime();
+        alive.block_on(async {
             let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let (client, _server) =
                 tokio::join!(tokio::net::TcpStream::connect(l.local_addr().unwrap()), l.accept());
             let client = client.unwrap();
             let id = sock_id_of(&client).unwrap();
-            let lookup = finder.find((id.local, id.remote));
-            let found = tokio::time::timeout(std::time::Duration::from_secs(120), lookup).await;
-            (found.expect("the finder is not stuck"), id)
+            let bound = std::time::Duration::from_secs(120);
+            let never_stuck = |lookup| tokio::time::timeout(bound, lookup);
+
+            // A lookup that waits for a scan queued on the runtime that is gone: when that
+            // scan is dropped, it asks again and this runtime scans.
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            {
+                let mut q = finder.queue();
+                q.pending.push((nowhere, tx));
+                q.scanning = true;
+            }
+            let mut waiting = Box::pin(finder.find((id.local, id.remote)));
+            assert!(futures::poll!(&mut waiting).is_pending());
+            drop(Scan {
+                finder: finder.clone(),
+                done: false,
+            });
+            assert!(rx.await.is_err(), "the lookup of the lost runtime wakes too");
+            let found = never_stuck(waiting).await.expect("the finder is not stuck");
+            assert_eq!(found, Some(id));
+            // And the finder is idle again: the next lookup starts its own scan.
+            let found = never_stuck(Box::pin(finder.find((id.local, id.remote)))).await;
+            assert_eq!(found.expect("the finder is not stuck"), Some(id));
         });
-        assert_eq!(found.0, Some(found.1));
     }
 
     /// Whatever the order in which the requests of a shared connection start, send and end,

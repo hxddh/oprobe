@@ -213,11 +213,12 @@ since the previous reading are charged to the requests in flight on it, so
 - else evenly to all of them (on HTTP/1.1 that is the one request).
 
 A request counts as sending from the moment the transport can tell which connection carries
-its body: with one upload in flight, the only connection alive, or the only one with unsent
-bytes in the kernel's send queue. With several uploads in flight it cannot, and an upload joins
-at its response headers; a request that ends on the same HTTP/2 connection before that is
-charged the upload's retransmits so far. An upload that fails or is cancelled before any
-response carries the retransmits of its connection when that connection was known.
+its body: with one upload in flight, the only connection alive, or, once the body is handed
+to the kernel, the only one with unsent bytes in its send queue. With several uploads in
+flight it cannot, and an upload joins at its response headers; a request that ends on the
+same HTTP/2 connection before that is charged the upload's retransmits so far. An upload that
+fails or is cancelled before any response carries the retransmits of its connection when that
+connection was known.
 
 The socket of a new connection is looked up on the runtime's blocking pool (one scan of the
 descriptor table answers every connection dialed meanwhile), never on a worker thread, and no

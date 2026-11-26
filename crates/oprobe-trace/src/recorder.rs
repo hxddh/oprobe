@@ -700,7 +700,9 @@ pub trait Exporter: Send + Sync {
         let _ = (lookups, hits);
     }
     /// The OpenDAL service the layer was applied to (once, before its first request): its
-    /// scheme, name (the bucket: OpenDAL's `namespace` label) and root.
+    /// scheme, name (the bucket: OpenDAL's `namespace` label) and root. A layer applied to
+    /// several operators reports the first one here; each HTTP request names its own
+    /// ([`RequestRecord::service`]).
     fn on_service(&self, scheme: &str, name: &str, root: &str) {
         let _ = (scheme, name, root);
     }

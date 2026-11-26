@@ -380,15 +380,16 @@ impl Shared {
     }
 
     /// The kernel probe of the connection the one upload in flight is being sent on, when
-    /// that is unambiguous: the only connection alive, or the only one with unsent bytes in
-    /// the kernel's send queue (`notsent_bytes > 0`) when idle connections exist beside it.
-    /// `None` with several uploads in flight. The guess can still be wrong (a connection
-    /// whose socket is not found yet is not among the candidates): the response headers say
-    /// which connection it was ([`SendingStream`]).
+    /// that is unambiguous: the only connection alive, or (`queued`: the body's last frame
+    /// was handed over, so what is left of it waits in the kernel) the only one with unsent
+    /// bytes in the kernel's send queue (`notsent_bytes > 0`) when idle connections exist
+    /// beside it. `None` with several uploads in flight. The guess can still be wrong (a
+    /// connection whose socket is not found yet is not among the candidates): the response
+    /// headers say which connection it was ([`SendingStream`]).
     ///
     /// The connection table is only locked to list the probes: each one is then read with
     /// three system calls, which 9.2 made under the lock that every request takes.
-    fn uploading_probe(&self) -> Option<Arc<TcpProbe>> {
+    fn uploading_probe(&self, queued: bool) -> Option<Arc<TcpProbe>> {
         if self.active_uploads.load(Ordering::Acquire) > 1 {
             return None;
         }
@@ -400,25 +401,22 @@ impl Shared {
             });
             found.collect()
         };
-        let mut alive = 0usize;
-        let mut last_alive = None;
-        let mut with_unsent = None;
-        for p in &probes {
-            let Some(row) = p.peek() else {
-                continue;
-            };
-            alive += 1;
-            last_alive = Some(p);
-            if row.notsent_bytes > 0 {
-                if with_unsent.is_some() {
-                    return None;
-                }
-                with_unsent = Some(p);
+        let alive: Vec<(&Arc<TcpProbe>, u64)> = probes
+            .iter()
+            .filter_map(|p| Some((p, p.peek()?.notsent_bytes)))
+            .collect();
+        if queued {
+            let mut unsent = alive.iter().filter(|(_, unsent)| *unsent > 0);
+            match (unsent.next(), unsent.next()) {
+                (Some((probe, _)), None) => return Some((*probe).clone()),
+                (Some(_), Some(_)) => return None,
+                (None, _) => {}
             }
         }
-        with_unsent
-            .or(last_alive.filter(|_| alive == 1))
-            .cloned()
+        match alive.as_slice() {
+            [(probe, _)] => Some((*probe).clone()),
+            _ => None,
+        }
     }
 }
 
@@ -1458,17 +1456,19 @@ impl HttpTransport for FidelityTransport {
                 // The first frame is handed over: hyper has chosen the connection. From now
                 // on the connection's retransmits are this upload's, if it can be told.
                 notify.notified().await;
-                let mut probe = shared.uploading_probe();
-                if end_ref.load(Ordering::Acquire) == 0 {
+                let handed_over = || end_ref.load(Ordering::Acquire) > 0;
+                let mut probe = shared.uploading_probe(handed_over());
+                if !handed_over() {
                     if let Some(probe) = &probe {
                         sending.open(probe);
                     }
                     // The last frame is handed over.
                     notify.notified().await;
                 }
-                // With bytes waiting in one send queue, the connection is told for certain.
+                // With the body's rest waiting in one send queue, the connection can be told
+                // among several.
                 if probe.is_none() {
-                    probe = shared.uploading_probe();
+                    probe = shared.uploading_probe(true);
                 }
                 let Some(probe) = probe else {
                     return;
@@ -2182,10 +2182,27 @@ mod tests {
         drop((closed, closed_server));
 
         shared.active_uploads.store(2, Ordering::Release);
-        assert!(shared.uploading_probe().is_none(), "two uploads: whose connection?");
+        assert!(
+            shared.uploading_probe(true).is_none(),
+            "two uploads: whose connection?"
+        );
         shared.active_uploads.store(1, Ordering::Release);
-        let probe = shared.uploading_probe().expect("the only connection alive");
-        assert!(probe.is_of(addr));
+        for queued in [false, true] {
+            let probe = shared
+                .uploading_probe(queued)
+                .expect("the only connection alive");
+            assert!(probe.is_of(addr));
+        }
+        let probe = shared.uploading_probe(false).unwrap();
+        // A second connection alive, both idle: no telling.
+        let (_other, _other_server, other_addr) = socket_pair().await;
+        let Sock::Finding(lookup) = shared.find_socket(other_addr, false) else {
+            panic!("the lookup starts");
+        };
+        shared.dialed(None, other_addr, dial_times(), Sock::Finding(lookup.clone()));
+        assert!(answered(&lookup).await.is_some());
+        assert!(shared.uploading_probe(false).is_none());
+        assert!(shared.uploading_probe(true).is_none());
 
         // Answered on that connection: the stream stays, past its send.
         let sending = SendingStream::default();
