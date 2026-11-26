@@ -4,6 +4,163 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## v9.2.0 — 2026-11-26
+
+9.2 is a hardening release on 9.1: what oprobe does to a target, what it reads from an untrusted
+file, what `prove` may claim, what the embedded layer does to its host, and what the generated
+code is worth when pasted. It adds no command and no flag, and every v9 file of 9.1 still reads
+(`oprobe.trace/9`, `oprobe.run/7`, `oprobe.report/7`, `oprobe.prove/9`, `oprobe.events/9`,
+`oprobe.operator/6`).
+
+### Fixed
+
+#### Target safety and untrusted input
+
+- **Budgets hold on the wire.** `--max-requests` and `--max-bytes` are enforced request by request
+  and chunk by chunk, not when an operation has finished: every HTTP request sent to the target
+  before cleanup counts as it is sent (retries, the preflight and the dataset upload included,
+  which 9.1 did not count), the request after the budget is never sent, a request body that does
+  not fit is not sent, and a download stops at the chunk that crosses the byte budget. A spent
+  budget cuts what is in flight instead of waiting for it. 9.1 let one large multipart write or a
+  retry storm run far past the budget. Cleanup is never counted and never refused; exit 4 and the
+  saved partial run are unchanged.
+- **A stopped run leaves no multipart upload.** A failed, timed-out, cancelled or budget-stopped
+  write or dataset upload aborts its multipart upload (9.1 dropped the writer, leaving billed
+  parts no object listing shows), also when the operation was dropped half-way. Ctrl-C now cuts
+  the requests in flight instead of draining them, and SIGTERM and SIGHUP stop a command the same
+  way (exit 130) instead of killing it with its test data in place. An upload that cannot be
+  aborted is named in the cleanup error.
+- **Presigned signatures and tokens never leave.** URLs lose `X-Amz-Signature`,
+  `X-Amz-Credential`, `X-Amz-Security-Token`, `Signature`, `AWSAccessKeyId`, an Azure SAS's `sig`,
+  `X-Goog-*`, `x-oss-*`, `q-signature`, `access_token`, … (any case) wherever they appear: in the
+  errors `oprobe-trace` records and the ones its client returns, in `.oprobe` files, reports,
+  error output, warnings and log events. 9.1 removed only `user:password@` from error text and
+  quoted the request URL whole in transport errors.
+- **A run file is read as untrusted input.** A block's declared length is no longer allocated
+  before its bytes arrive (9.1 took up to 1 GiB for a 60-byte file); a file may hold blocks of at
+  most 256 MiB, decompress to at most 4 GiB and its rows may take at most 4 GiB of memory, so a
+  zstd bomb or a segment that names one long string in every row is refused with
+  `usage.invalid_argument` and a hint instead of exhausting memory. Names found in a file are no
+  longer leaked for the life of the process (the app opens many files). Every 9.1 run file still
+  loads.
+- **Large conditional and metadata writes write their size.** The payload pool is sized from
+  every writing operation; 9.1 cut these two kinds to about 1 MiB without a word.
+
+#### The operator: generated code, layer order, cache
+
+- **Generated Rust compiles, and never overwrites your credentials.** The whole-operator Rust is
+  now a complete `build_operator()` (plus `reader()` / `writer()` for the `[read]` / `[write]`
+  options) instead of statements that used an unbound `path` and passed `&str` options to
+  `Operator::via_iter`. A secret option is left out with a comment instead of a `"<redacted>"`
+  literal that replaced the credential your program loads itself; a `${NAME}` reference is read
+  with `std::env::var`. `http.version = auto` with a custom client emits `.http1_only()`, as
+  measured. The output for 24 operators is checked in under `crates/oprobe-core/tests/codegen/`
+  and compiled against the workspace's OpenDAL, foyer and reqwest on every test build.
+- **A sound layer order.** The stack is now `cache → retry → throttle → concurrent_limit →
+  tail_cut → timeout → service` (was `cache → retry → tail_cut → timeout → concurrent_limit →
+  throttle`): a throttled write no longer waits with an operation permit held or runs into the io
+  timeout, and a call that queues for an operation permit is no longer timed out or tail-cut
+  while it queues. The measured operator and the generated Rust are built from the same list.
+  `layers.tail_cut.max_deadline` defaults to the shorter of `timeout.op` and `timeout.io` (was
+  `timeout.op`, a ceiling the 10 s io timeout made unreachable) and never below `min_deadline`
+  (OpenDAL panicked on it). The HTTP permit wait stays inside the timers by OpenDAL's design;
+  `docs/operator.md` says so.
+- **`layers.cache.memory` admits what it is sized for.** The cache was split in 8 shards and
+  admitted only objects up to an eighth of the budget, so a cache `prove` sized for large
+  objects could hold none of them, and OpenDAL fetched such an object whole on every read. The
+  cache now has one shard and admits any object no larger than `memory`; `FoyerLayer` gets the
+  same size limit, so larger objects are read through; `prove` sizes the budget with the same
+  rule and never below the largest object the run read. The generated Rust builds the same
+  cache.
+
+#### Prove and the service-level check
+
+- **A proof's verdict holds its 5 %.** The A/B pairs now run in a balanced order (blocks of one
+  `AB` and one `BA`, drawn from the run's seed), the estimate cancels an effect of the order
+  itself, and the verdict, the interval and the convergence chart share one sequential boundary
+  calibrated for the planned pairs: whenever a proof stops, it calls a change that is none in
+  fewer than 5 % of proofs. 9.1 drew each pair's order alone and let an unadjusted interval
+  decide: when the second trial of a pair ran better or worse by several times the noise, up
+  to one proof in four called that a change. Early looks now need clearer evidence, so a proof
+  may take one more pair. The result names its plan (`pairs_max_count`, optional;
+  `oprobe.prove/9` files of 9.1 still read).
+- **A throttled trial no longer poisons the next.** After a trial that ended throttled, `prove`
+  cools down (the longest `Retry-After` it saw, at least twice the trial warm-up, at most 5 s)
+  before the next trial; the wait counts in `--max-duration` and is noted once.
+- **A p99 limit cannot be passed by a stalled open loop.** Arrivals of a `--rate` run that never
+  completed have no latency, only the time they had waited; the limit is now checked against the
+  worst they allow: breached when more than 1 % of the scheduled arrivals never completed ("p99
+  is at least …"), and otherwise judged with each of them counted as slower than every completed
+  operation. 9.1 checked completed operations only.
+
+#### The trace layer
+
+- **`oprobe-trace` charges a connection to the request that dialed it.** On a shared HTTP/2
+  connection the DNS, TCP and TLS time went to whichever request was answered first; it now goes
+  to the request that started the dial, and a request that waited for another's dial shows the
+  wait as queue time. A dial its request did not use is a connection nobody waited for: counted
+  once, charged to no request.
+- **TCP retransmits are charged exactly once.** The retransmits of a connection shared by
+  concurrent HTTP/2 streams are split among the requests in flight when the kernel counter is
+  read; `detail.retrans_count` adds up to the connection's count (9.1 charged them to whichever
+  request ended next and could count some twice).
+- **No descriptor scans on runtime threads.** The socket of a new connection is found on the
+  blocking pool, one scan for every connection dialed meanwhile; 9.1 scanned `/proc/self/fd` on a
+  Tokio worker for every connection.
+- **`http.client.request.duration` is one observation per HTTP request** with standard attributes
+  only (`http.request.method`, `server.address`, `server.port`, `http.response.status_code`,
+  `network.protocol.version`, `error.type`). The stages moved to
+  `oprobe.http.client.request.stage.duration` (`oprobe.stage`); 9.1 recorded every request up to
+  seven times into the standard metric, and in-process `memory`/`fs` calls with it.
+
+#### Findings and the workbench
+
+- **A saturated uplink is a `bandwidth_cap`.** The shared-cap model is fitted on request bodies
+  as on response bodies; slow uploads over one capped link name `layers.throttle.bandwidth`
+  instead of reading as `hung_requests`.
+- **A service that queues instead of rejecting is found.** When the time to first byte grows
+  with the requests in flight, in a run that varied them at least twofold, the run reports
+  `throttling` (a warning, `layers.concurrent_limit.http`) with no 429/503. 9.1 fitted the
+  model and no finding read it.
+- **Run Again repeats the run.** The app rebuilt a run from New Run's five fields and lost its
+  open-loop rate, dataset, seed, key popularity and operator options. It now replays the run's
+  spec; for a real target New Run shows "Runs again as" with the command it keeps, and a field
+  changed there changes only that. The command a profile prints names an added layer's values
+  (`--set layers.concurrent_limit.http=12`) instead of `layers.NAME=on`, which could fail or mean
+  the layer's defaults.
+- **A time range sorts its rows once.** Every quantile, the distribution and the slowest
+  operations of a range, a verb or an API come from one order (9.1 sorted the rows for each); the
+  numbers are the same.
+
+### Changed
+
+- **`oprobe-trace` can keep your HTTP client.** `Config::keep_http_transport(true)` wraps the
+  transport installed on the operator (your client, and any HTTP concurrency limit beneath the
+  layer) instead of replacing it; requests are then observed from outside (no DNS/TCP/TLS split,
+  no connection statistics). The default still installs the instrumented client, and the docs now
+  say what that replaces and where the layer must go (`docs/embedding.md`, "Where the layer
+  goes"); `format!("{layer:?}")` names which one a layer does.
+- **`oprobe-trace` builds with Rust 1.91**, OpenDAL 0.59's own minimum (the workbench still needs
+  1.97 for nsh); CI checks it.
+- **A smaller terminal build.** The SVG renderer (resvg and its font stack, 30 crates) is built
+  for native windows only (`--features gui`); the terminal app draws glyphs. The binary crate
+  drops ten dependencies it did not use.
+- **Tests.** The app's tests run one at a time under nextest as they do under `cargo test`, wait
+  for the opened run before pressing a menu shortcut (a shortcut pressed across the menu's
+  rebuild was lost, and the test timed out on a loaded runner, macOS first), and the Ctrl-C test
+  waits for the run to measure instead of sleeping.
+
+### Known issues
+
+- An HTTP permit of `layers.concurrent_limit.http` is taken inside the transport, so its wait
+  counts in `timeout.io` and in the tail-cut deadline (OpenDAL's design).
+- OpenDAL cannot list multipart uploads: an upload whose `CreateMultipartUpload` answer was lost
+  to a timeout cannot be aborted, and cleanup cannot sweep for leftovers.
+- With `keep_http_transport`, records carry no connection identity (reuse reads as 100 %).
+- A run's default check (error rate, no p99 limit) still passes a stalled open loop; set a p99
+  limit to judge it.
+- A steady closed loop never yields the queueing finding: the model needs a run whose load varied.
+
 ## v9.1.0 — 2026-11-25
 
 9.1 fixes the bugs found in a deep review of 9.0 (several could lose data or report wrong numbers),
