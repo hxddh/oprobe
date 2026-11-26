@@ -217,19 +217,50 @@ impl Session {
 
     /// [`Session::open`] with safety rails: preflight before any write, budgets armed on
     /// `cancel`, a chosen run prefix.
+    ///
+    /// A run that is stopped while it opens (Ctrl-C, a signal, Stop) fails as
+    /// `run.interrupted`, whatever the request the gate cut made of it: 9.2 reported the cut
+    /// preflight probe, "cannot list the target", with a hint to check the credentials.
     pub async fn open_with(
         profile: Profile,
         cancel: Cancel,
         progress: ProgressFn,
         opts: SessionOptions,
     ) -> Result<Self> {
-        if cancel.is_cancelled() {
-            return Err(crate::errors::OprobeError::new(
+        let interrupted = |cause: Option<anyhow::Error>, unaborted: Option<String>| {
+            let mut e = crate::errors::OprobeError::new(
                 crate::errors::ErrorCode::RunInterrupted,
-                "run interrupted",
-            )
-            .into());
+                match unaborted {
+                    Some(u) => format!("run interrupted; {u}"),
+                    None => "run interrupted".to_owned(),
+                },
+            );
+            if let Some(cause) = cause {
+                e = e.with_detail(crate::util::strip_url_credentials(&format!("{cause:#}")));
+            }
+            anyhow::Error::new(e)
+        };
+        if cancel.is_cancelled() {
+            return Err(interrupted(None, None));
         }
+        let (aborts, guard) = (Aborts::new(), opts.guard.clone());
+        let opened = Self::open_gated(profile, cancel.clone(), progress, opts, aborts.clone());
+        match opened.await {
+            // A budget cancels too: its breach is the caller's error to report.
+            Err(e) if cancel.is_cancelled() && guard.is_none_or(|g| g.breach().is_none()) => {
+                Err(interrupted(Some(e), aborts.failure()))
+            }
+            opened => opened,
+        }
+    }
+
+    async fn open_gated(
+        profile: Profile,
+        cancel: Cancel,
+        progress: ProgressFn,
+        opts: SessionOptions,
+        aborts: Aborts,
+    ) -> Result<Self> {
         profile.validate()?;
         let mut target = profile.operator.target()?;
         super::operator::prepare_target(&mut target).await?;
@@ -238,10 +269,9 @@ impl Session {
         if let Some(g) = &opts.guard {
             g.arm(cancel.clone());
         }
-        let gate = Gate::new(opts.guard.clone(), cancel.clone());
+        let gate = Gate::new(opts.guard.clone(), cancel.clone(), aborts.clone());
         let admin = admin_operator_with(&base, &target, Some(&gate))?;
         let cleaner = admin_operator(&base, &target)?;
-        let aborts = Aborts::new();
         let spec = profile.workload.effective_dataset();
         let mut mix = profile.workload.effective_mix();
         // The mix runs on what the service can do.
@@ -262,7 +292,7 @@ impl Session {
         );
         if target.is_network() {
             let http = &profile.operator.http;
-            super::operator::check_reachable_with(&base, &target, http, Some(&gate)).await?;
+            super::operator::check_reachable(&base, &target, http, Some(&gate)).await?;
             super::operator::check_protocol(&base, &target, http, Some(&gate)).await?;
         }
         let needs_objects = mix.iter().any(|m| m.op.needs_dataset() && m.weight > 0);
@@ -270,8 +300,10 @@ impl Session {
             let writes = spec.existing_prefix.is_none()
                 && (needs_objects || mix.iter().any(|m| m.weight > 0 && m.op.is_write()));
             // Fail fast: few retries, short timeouts (the admin operator retries for minutes).
+            // The probe object is deleted outside the gate, as all test data is.
             let quick = super::operator::preflight_operator(&base, &target, Some(&gate))?;
-            crate::guard::preflight(&quick, &run_prefix, writes)
+            let quick_cleaner = super::operator::preflight_operator(&base, &target, None)?;
+            crate::guard::preflight(&quick, &quick_cleaner, &run_prefix, writes)
                 .await
                 .map_err(|e| super::operator::explain_preflight(e, &target))?;
         }
@@ -482,7 +514,7 @@ impl Session {
         let _ = sampler.await;
         // Operations that were dropped unfinished abort their uploads on their own tasks:
         // nothing of this window is in flight once they are done.
-        self.aborts.settle().await;
+        self.aborts.settle(&self.cancel).await;
         let obs = result?;
         let mut snap = recorder.snapshot();
         snap.self_obs = Some(obs);
@@ -671,6 +703,8 @@ impl Session {
                 let mut rng = SmallRng::seed_from_u64(seed);
                 let mut missed = 0u64;
                 let mut issued = 0u64;
+                // Issued operations the cancellation stopped: not operations of the window.
+                let stopped = Arc::new(AtomicU64::new(0));
                 let mut max_lag = Duration::ZERO;
                 let mut set = JoinSet::new();
                 let missed_arrival = |at: Instant, now: Instant| {
@@ -775,8 +809,9 @@ impl Session {
                     let intended = next;
                     // Decided at dispatch: the task may start after the window closed.
                     let in_window = measured && rec.window_open();
+                    let stopped = stopped.clone();
                     set.spawn(async move {
-                        run_one(
+                        let outcome = run_one(
                             &ctx,
                             &job,
                             &mut op_rng,
@@ -788,6 +823,9 @@ impl Session {
                             tree.as_ref(),
                         )
                         .await;
+                        if outcome == Outcome::Stopped {
+                            stopped.fetch_add(1, Ordering::Relaxed);
+                        }
                         drop(lease);
                         drop(permit);
                     });
@@ -809,6 +847,12 @@ impl Session {
                 }
                 join_workers(set).await?;
                 if measured {
+                    // What the cancellation stopped is in none of the window's numbers (it
+                    // neither completed nor failed, and it did not wait unserved either): the
+                    // arrivals of the window are its operations and its missed arrivals. 9.2
+                    // counted the stopped ones as issued, so an interrupted run reported more
+                    // arrivals, and a higher achieved rate, than its operations add up to.
+                    let issued = issued - stopped.load(Ordering::Relaxed);
                     recorder.set_open_loop(OpenLoopStats {
                         target_rate: src.mean_rate(horizon, issued + missed),
                         achieved_rate: issued as f64
@@ -852,9 +896,11 @@ impl Session {
 
     /// Delete everything this session wrote (unless disabled) and verify. Multipart uploads
     /// still being aborted are awaited first, whatever the cleanup setting: an upload in
-    /// progress is never test data to keep.
+    /// progress is never test data to keep. The wait is bounded once the run is cancelled
+    /// ([`super::upload::SETTLE_GRACE`]); the uploads that could not be aborted, or could not
+    /// be waited for, are named in the summary's error.
     pub async fn close(&self) -> CleanupSummary {
-        self.aborts.settle().await;
+        self.aborts.settle(&self.cancel).await;
         let mut s = self.delete_test_data().await;
         if let Some(e) = self.aborts.failure() {
             s.error = Some(match s.error.take() {
@@ -903,7 +949,7 @@ async fn run_one(
     measured: bool,
     rec: &Arc<Recorder>,
     tree: Option<&await_tree::Registry>,
-) {
+) -> Outcome {
     // The operation starts now: the timeline, the trace row and the request offsets count from
     // here (W10: 9.0 stamped an open-loop operation at its intended start, so a backlog piled
     // every operation into the first seconds). Its latency still counts from the intended
@@ -937,7 +983,12 @@ async fn run_one(
     // An operation that ended in an error after the run was cancelled was stopped (the gate
     // refused or cut its requests): it did not fail, and it did not complete. It is not an
     // operation of the window.
-    let measured = measured && !(res.is_err() && ctx.cancel.is_cancelled());
+    let outcome = if res.is_err() && ctx.cancel.is_cancelled() {
+        Outcome::Stopped
+    } else {
+        Outcome::Ended
+    };
+    let measured = measured && outcome == Outcome::Ended;
     let (lr, lw, error) = match res {
         Ok(o) => (o.logical_read, o.logical_write, None),
         Err(e) => {
@@ -974,6 +1025,16 @@ async fn run_one(
             schedule_us,
         },
     );
+    outcome
+}
+
+/// What became of an operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Outcome {
+    /// It ran to its end: it completed or it failed.
+    Ended,
+    /// The run's cancellation stopped it.
+    Stopped,
 }
 
 /// What one arrival runs: an operation of the mix.
@@ -1228,6 +1289,95 @@ mod tests {
             "{:?}",
             v.breakdown
         );
+    }
+
+    /// Wait until the lab has served `n` requests (a state the test then acts on).
+    async fn served(lab: &crate::lab::LabHandle, n: u64) {
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while lab.requests_served() < n {
+            assert!(Instant::now() < deadline, "the lab never saw {n} requests");
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
+    /// A lab that takes an hour to answer: a request sent to it is in flight until it is cut.
+    fn stalled() -> crate::lab::LabConfig {
+        crate::lab::LabConfig {
+            base_ttfb_delay: Duration::from_secs(3600),
+            throttle_status_code: 503,
+            ..Default::default()
+        }
+    }
+
+    /// A run stopped while it opens (here: its first probe is in flight) fails as
+    /// `run.interrupted`. 9.2 reported what the cut made of the preflight: "preflight: cannot
+    /// list the target: ... the run was cancelled", `internal`, with a hint to check the
+    /// credentials.
+    #[tokio::test]
+    async fn a_run_stopped_while_it_opens_is_interrupted() {
+        let lab = crate::lab::LabServer::spawn("127.0.0.1:0", stalled())
+            .await
+            .unwrap();
+        let mut p = lab.profile("b");
+        p.workload = profile("memory://").workload;
+        let cancel = Cancel::new();
+        let open = tokio::spawn(Session::open(p, cancel.clone(), quiet()));
+        served(&lab, 1).await;
+        cancel.cancel();
+        let e = open
+            .await
+            .unwrap()
+            .err()
+            .expect("the session does not open");
+        let b = crate::errors::classify(&e, "s3");
+        assert_eq!(b.code, crate::errors::ErrorCode::RunInterrupted, "{e:#}");
+        assert_eq!(b.message, "run interrupted");
+        assert_eq!(b.exit_code(), crate::errors::exit::INTERRUPTED);
+        assert!(
+            !b.hint.unwrap_or_default().contains("credentials"),
+            "not a credentials problem"
+        );
+        // What the stop cut is the detail.
+        assert!(b.detail.unwrap_or_default().contains("cancelled"));
+        assert_eq!(lab.stored_object_count(), 0);
+    }
+
+    /// The arrivals of an interrupted open-loop window are its operations and its missed
+    /// arrivals. 9.2 also counted the operations the stop cut (which are in no other number
+    /// of the window) as issued: more arrivals, and a higher achieved rate, than happened.
+    #[tokio::test]
+    async fn an_interrupted_open_loop_does_not_count_what_the_stop_cut() {
+        let lab = crate::lab::LabServer::spawn("127.0.0.1:0", Default::default())
+            .await
+            .unwrap();
+        let mut p = lab.profile("b");
+        p.workload = profile("memory://").workload;
+        p.workload.concurrency = 4;
+        let cancel = Cancel::new();
+        let s = Session::open(p, cancel.clone(), quiet()).await.unwrap();
+        // From here on nothing is answered: every operation issued is in flight when the run
+        // is stopped.
+        lab.update_faults(stalled());
+        let sent = lab.requests_served();
+        let run = tokio::spawn(async move {
+            let knobs = Knobs::of(&s.profile);
+            let snap = s.run(&knobs, &opts(600_000, Some(50.0)), None).await;
+            (snap.unwrap(), s)
+        });
+        served(&lab, sent + 4).await;
+        cancel.cancel();
+        let (snap, s) = run.await.unwrap();
+        // The cleanup is answered again.
+        lab.update_faults(crate::lab::LabConfig {
+            throttle_status_code: 503,
+            ..Default::default()
+        });
+        assert!(s.close().await.verified);
+        assert!(snap.interrupted);
+        assert_eq!(snap.summary.ops, 0, "nothing completed, nothing failed");
+        let ol = snap.open_loop.expect("open-loop stats");
+        assert_eq!(ol.intended_count, snap.summary.ops + ol.missed, "{ol:?}");
+        assert_eq!(ol.achieved_rate, 0.0, "{ol:?}");
     }
 
     #[tokio::test]

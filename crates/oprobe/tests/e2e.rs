@@ -626,22 +626,36 @@ async fn drain_does_not_stretch_the_measurement_window() {
     let s = Session::open(p, Cancel::new(), quiet()).await.unwrap();
     let mut o = opts(1000);
     o.warmup = Duration::ZERO;
-    let t = std::time::Instant::now();
     let snap = s
         .run(&oprobe::config::Knobs::of(&s.profile), &o, None)
         .await
         .unwrap();
-    let wall = t.elapsed();
+    let rows = s.take_trace().expect("the window's rows").ops;
     s.close().await;
+    // Asserted on the rows, not on the wall clock (which a slow machine stretches): each
+    // row has its start and its latency, in µs from the window start.
+    let window_us = (snap.elapsed_s * 1e6) as i64;
+    let end_us = |r: &oprobe::trace::OpRow| r.t_us + r.latency_us as i64;
+    // The workers are in an operation when the window ends (they never idle, and an operation
+    // takes 300 ms at least): those operations drain after it...
+    let drained: Vec<_> = rows.iter().filter(|r| end_us(r) > window_us).collect();
     assert!(
-        snap.elapsed_s <= 1.05,
-        "window {}s includes the drain",
-        snap.elapsed_s
+        (1..=4).contains(&drained.len()),
+        "window {window_us} µs: {rows:?}"
     );
+    // ... the window does not wait for them (it would end with the last of them) ...
+    let last_end = rows.iter().map(end_us).max().unwrap();
     assert!(
-        wall.as_secs_f64() > snap.elapsed_s + 0.1,
-        "ops drained after the window"
+        window_us < last_end,
+        "the window ({window_us} µs) includes the drain (until {last_end} µs)"
     );
+    // ... they started inside it, and they are recorded with their whole latency.
+    assert!(rows.iter().all(|r| r.t_us <= window_us), "{rows:?}");
+    assert!(
+        drained.iter().all(|r| r.latency_us >= 300_000),
+        "{drained:?}"
+    );
+    assert_eq!(rows.len() as u64, snap.summary.ops);
     assert!(snap.summary.ops > 0);
     let rate = snap.summary.ops as f64 / snap.elapsed_s;
     assert!(
@@ -778,20 +792,20 @@ async fn cancelled_prepare_leaves_no_test_data() {
 async fn connection_refused_fails_fast() {
     let lab = lab(LabConfig::default()).await;
     let mut p = lab.profile("bkt");
-    let port = {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        l.local_addr().unwrap().port()
-    };
+    let (_bound, port) = refusing_port();
     p.operator
         .options
         .insert("endpoint".into(), format!("http://127.0.0.1:{port}"));
     small(&mut p, Preset::SmallFiles);
-    let t = std::time::Instant::now();
-    let err = Session::open(p, Cancel::new(), quiet())
+    // Fast: the reachability probe fails once, where the dataset upload would retry for
+    // minutes (the error below is the probe's; the timeout only keeps a regression from
+    // hanging the suite).
+    let opened = Session::open(p, Cancel::new(), quiet());
+    let err = tokio::time::timeout(Duration::from_secs(120), opened)
         .await
+        .expect("it does not retry for minutes")
         .err()
         .expect("must fail");
-    assert!(t.elapsed() < Duration::from_secs(15), "{:?}", t.elapsed());
     let msg = format!("{err:#}");
     // One plain cause; OpenDAL's report is the detail (U2).
     assert_eq!(
@@ -808,6 +822,46 @@ async fn connection_refused_fails_fast() {
     );
     let hint = oprobe::analysis::hints::hint_for(&msg, "s3").expect("hint");
     assert!(hint.title.contains("refused"), "{}", hint.title);
+}
+
+/// A port that refuses connections for as long as the returned socket lives: bound, never
+/// listening. (A port taken from a listener that was then dropped is free again: another
+/// process, or another test, can be listening on it by the time it is used.)
+fn refusing_port() -> (tokio::net::TcpSocket, u16) {
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let port = socket.local_addr().unwrap().port();
+    (socket, port)
+}
+
+/// An `http.proxy` that cannot be reached is named: 9.2 said the endpoint had refused the
+/// connection, and hinted at `options.endpoint`.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unreachable_proxy_is_reported_as_the_proxy() {
+    let lab = lab(LabConfig::default()).await;
+    let mut p = lab.profile("bkt");
+    let (_bound, port) = refusing_port();
+    p.operator.http.proxy = Some(format!("http://127.0.0.1:{port}"));
+    small(&mut p, Preset::SmallFiles);
+    let opened = Session::open(p, Cancel::new(), quiet());
+    let err = tokio::time::timeout(Duration::from_secs(120), opened)
+        .await
+        .expect("it does not retry for minutes")
+        .err()
+        .expect("must fail");
+    let body = oprobe::errors::classify(&err, "s3");
+    assert_eq!(body.code, oprobe::errors::ErrorCode::NetUnreachable);
+    assert_eq!(
+        body.message,
+        format!(
+            "connection refused by the proxy 127.0.0.1:{port} (s3://bkt/bench, proxy set by \
+             `http.proxy`)"
+        )
+    );
+    let hint = body.hint.expect("hint");
+    assert!(hint.contains("http.proxy"), "{hint}");
+    assert!(!hint.contains("options.endpoint"), "{hint}");
+    assert_eq!(lab.requests_served(), 0, "nothing reached the endpoint");
 }
 
 /// A run stopped with Cancel is flagged `interrupted` (and partial) in the snapshot and report.

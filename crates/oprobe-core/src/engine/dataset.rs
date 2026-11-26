@@ -260,7 +260,7 @@ impl Dataset {
         let objects = match res {
             Ok(o) => o,
             Err(e) => {
-                aborts.settle().await;
+                aborts.settle(cancel).await;
                 let paths =
                     std::mem::take(&mut *uploaded.lock().unwrap_or_else(|e| e.into_inner()));
                 progress(format!(

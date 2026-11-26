@@ -16,12 +16,12 @@ use args::*;
 
 use crate::app::Ctx;
 use crate::errors::{ErrorCode, OprobeError, exit};
-use crate::output::{Output, OutputFormat};
+use crate::output::{Output, OutputFormat, stderr_line};
 use crate::report::style::{self, bold, red, yellow};
 use crate::store::{ConfigFile, Paths};
 
-/// Exit code of a command stopped by Ctrl-C (SIGINT, or SIGTERM / SIGHUP), as shells report
-/// an interrupted command.
+/// Exit code of a command stopped by Ctrl-C (SIGINT), SIGTERM, SIGHUP or a stderr whose
+/// reader went away, as shells report an interrupted command.
 pub const EXIT_INTERRUPTED: u8 = exit::INTERRUPTED;
 
 /// Run the parsed command line and return the process exit code.
@@ -76,7 +76,7 @@ pub async fn main(cli: Cli) -> ExitCode {
     ExitCode::from(code)
 }
 
-/// Set by the first Ctrl-C of a measuring command.
+/// Set when a measuring command is told to stop (the first signal, or stderr closing).
 static INTERRUPTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn scheme_of(cmd: &Command, ctx: &Ctx) -> String {
@@ -115,9 +115,9 @@ fn scheme_of(cmd: &Command, ctx: &Ctx) -> String {
 /// Print an error chain with a hint on stderr (before the CLI runtime exists).
 pub fn print_error(err: &anyhow::Error, scheme: &str) {
     let body = crate::errors::classify(err, scheme);
-    eprintln!("{} {}", red(&bold("error:")), body.message);
+    stderr_line(format_args!("{} {}", red(&bold("error:")), body.message));
     if let Some(h) = &body.hint {
-        eprintln!("{} {h}", yellow(&bold("hint:")));
+        stderr_line(format_args!("{} {h}", yellow(&bold("hint:"))));
     }
 }
 
@@ -285,21 +285,29 @@ impl StopSignals {
 
 /// Install the stop handler: the first Ctrl-C (or SIGTERM, SIGHUP) cancels gracefully — what is
 /// in flight is cut, multipart uploads are aborted and cleanup still runs — the second exits.
+///
+/// A stderr whose reader is gone stops the command the same way: the terminal or SSH session
+/// closed (with or without a SIGHUP reaching this process), or `2>&1 | head` read enough.
+/// Nobody is left to read the progress, and the run must still clean up and be saved.
 fn install_ctrl_c(cancel: crate::engine::Cancel) {
+    let stop = move || {
+        INTERRUPTED.store(true, std::sync::atomic::Ordering::SeqCst);
+        cancel.cancel();
+    };
+    crate::output::on_stderr_closed(stop.clone());
     let mut signals = StopSignals::install();
     tokio::spawn(async move {
         if signals.next().await {
-            INTERRUPTED.store(true, std::sync::atomic::Ordering::SeqCst);
-            cancel.cancel();
-            eprintln!(
+            stop();
+            stderr_line(format_args!(
                 "\n{} stopping… cleaning up test data (press Ctrl-C again to abort immediately)",
                 yellow("■")
-            );
+            ));
             if signals.next().await {
-                eprintln!(
+                stderr_line(format_args!(
                     "{} aborted; test data may be left under oprobe-run-*/",
                     red("■")
-                );
+                ));
                 std::process::exit(EXIT_INTERRUPTED.into());
             }
         }

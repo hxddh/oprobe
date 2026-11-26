@@ -42,8 +42,9 @@ runtime, `3` the proven change is worse, `4` budget, `5` safety refusal, `130` i
 ### `usage.invalid_argument` (exit 2)
 
 A flag or argument is malformed: an unknown flag, a value that does not parse
-(`--max-bytes lots`), an unknown `--set` path. With `-o json` argument errors are JSON too. Fix
-the argument; `--help` lists what the command accepts.
+(`--max-bytes lots`), an unknown `--set` path, or an address `oprobe lab --bind` cannot listen
+on (the port is taken: `--bind 127.0.0.1:0` takes a free one). With `-o json` argument errors
+are JSON too. Fix the argument; `--help` lists what the command accepts.
 
 <a id="usage-unknown_target"></a>
 ### `usage.unknown_target` (exit 2)
@@ -93,8 +94,10 @@ The service refused the credentials or the operation (`AccessDenied`, `Signature
 ### `net.unreachable` (exit 1, retryable)
 
 Nothing answered (`connection refused`, reset, no route). Check the endpoint and port; is MinIO or
-`oprobe lab` running? Behind an egress proxy check `HTTPS_PROXY` / `NO_PROXY`, or set
-`http.proxy = "none"`.
+`oprobe lab` running? When the requests go through a proxy (`http.proxy`, or `HTTPS_PROXY` /
+`HTTP_PROXY` / `ALL_PROXY` unless `NO_PROXY` exempts the endpoint), the proxy is what the client
+connects to, and the message names it ("connection refused by the proxy 127.0.0.1:3128"): check
+that it is running, or connect directly with `--set http.proxy=none`.
 
 <a id="net-dns"></a>
 ### `net.dns` (exit 1, retryable)
@@ -155,8 +158,11 @@ command. Budgets cover the whole command: every operator of `run`, every trial o
 every HTTP request sent to the target before cleanup (the preflight, the dataset upload and
 retries included). The request the budget had no room for was not sent, the operations in flight
 were cut, their multipart uploads aborted, the partial run saved and the test data cleaned up.
-When the budget runs out during the preflight or the dataset upload there is no run to save.
-Raise the budget or shorten the run; `--dry-run` shows the estimates.
+When the budget runs out during the preflight or the dataset upload there is no run to save (and
+nothing is left on the target: the preflight's probe object is deleted outside the budget).
+"the next request (8.0 MiB) does not fit the byte budget: 1 B of 4.0 MiB used" means
+`--max-bytes` is smaller than one request body (a multipart part, an object): raise it above
+that size. Raise the budget or shorten the run; `--dry-run` shows the estimates.
 
 <a id="safety-read_only"></a>
 ### `safety.read_only` (exit 5)
@@ -185,9 +191,17 @@ The change made things worse on the objective: `prove`'s verdict is `worse`. Rea
 <a id="run-interrupted"></a>
 ### `run.interrupted` (exit 130, retryable)
 
-Ctrl-C, SIGTERM, SIGHUP or Stop ended the command. The requests in flight were cut, the multipart
-uploads they belonged to aborted, and the test data cleaned up, unless a second signal ended the
-cleanup too. Run it again.
+Ctrl-C, SIGTERM, SIGHUP, a closed stderr (the terminal or SSH session went away, or
+`2>&1 | head` read enough) or Stop ended the command, at any point: while it opened the target,
+uploaded its dataset or measured. The requests in flight were cut, the multipart uploads they
+belonged to aborted, and the test data cleaned up, unless a second signal ended the cleanup too.
+A run that was measuring is saved as a partial run. Run it again.
+
+"N multipart uploads could not be aborted and may still hold parts (…)" in the message or in the
+cleanup error names uploads the stop could not remove: an abort the service refused or did not
+answer within 30 s, an upload whose creation did not answer within 10 s of the stop, or one
+still in flight 45 s after it. Their parts are billed until the upload is aborted: list and abort
+them with the service's tools (`aws s3api list-multipart-uploads` / `abort-multipart-upload`).
 
 <a id="internal"></a>
 ### `internal` (exit 1)

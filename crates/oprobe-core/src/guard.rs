@@ -58,16 +58,27 @@ pub struct BudgetBreach {
     pub budget: String,
     pub limit: f64,
     pub observed: f64,
+    /// The body of the request the byte budget refused because it did not fit in what was
+    /// left (the budget itself was not spent yet: `observed` is below `limit`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refused_request_bytes: Option<u64>,
 }
 
 impl BudgetBreach {
     pub fn message(&self) -> String {
-        match self.budget.as_str() {
-            "requests" => format!(
+        match (self.budget.as_str(), self.refused_request_bytes) {
+            ("requests", _) => format!(
                 "request budget spent: {} requests (limit {})",
                 self.observed, self.limit
             ),
-            "bytes" => format!(
+            // Not "spent": a 4 MiB budget with 1 B used refused an 8 MiB part.
+            ("bytes", Some(body)) => format!(
+                "the next request ({}) does not fit the byte budget: {} of {} used",
+                crate::util::fmt_bytes(body),
+                crate::util::fmt_bytes(self.observed as u64),
+                crate::util::fmt_bytes(self.limit as u64)
+            ),
+            ("bytes", None) => format!(
                 "byte budget spent: {} transferred (limit {})",
                 crate::util::fmt_bytes(self.observed as u64),
                 crate::util::fmt_bytes(self.limit as u64)
@@ -141,10 +152,6 @@ impl Guard {
         })
     }
 
-    pub fn budgets(&self) -> &Budgets {
-        &self.budgets
-    }
-
     /// Cancel `cancel` when a budget is exceeded. A guard shared by several measurements
     /// (one aggregate budget for `run --repeat`, `matrix`) is re-armed by each of them; a
     /// guard that has already tripped cancels at once.
@@ -166,12 +173,12 @@ impl Guard {
         if let Some(max) = self.budgets.max_requests_count
             && r >= max
         {
-            self.trip("requests", max as f64, r as f64, r > max, true);
+            self.trip(Self::spent("requests", max, r), r > max, true);
         }
         if let Some(max) = self.budgets.max_bytes
             && b >= max
         {
-            self.trip("bytes", max as f64, b as f64, b > max, true);
+            self.trip(Self::spent("bytes", max, b), b > max, true);
         }
         self.tick();
     }
@@ -181,16 +188,27 @@ impl Guard {
     /// (`Err`: it must not be sent), which is work the budget stopped: the run is cancelled
     /// and the budget breached. The request that spends a budget exactly is admitted and
     /// cancels nothing: what is in flight is within the budget and may finish.
+    ///
+    /// Once the byte budget is spent, every request is refused, one without a body too: its
+    /// response would be cut at its first chunk, after the target has done the work.
     pub fn admit(&self, body_bytes: u64) -> Result<(), BudgetBreach> {
         self.tick();
         let mut spent = None;
         match self.budgets.max_bytes {
             Some(max) => {
-                let room = |b: u64| b.checked_add(body_bytes).filter(|n| *n <= max);
+                let room = |b: u64| {
+                    let fits = b.checked_add(body_bytes).filter(|n| *n <= max);
+                    fits.filter(|_| b < max)
+                };
                 match take_room(&self.bytes, room) {
                     Ok(b) if b + body_bytes == max => spent = Some(("bytes", max)),
                     Ok(_) => {}
-                    Err(b) => return Err(self.refuse("bytes", max as f64, b as f64)),
+                    Err(b) => {
+                        let mut breach = Self::spent("bytes", max, b);
+                        // The budget has room, but not for this body.
+                        breach.refused_request_bytes = (b < max).then_some(body_bytes);
+                        return Err(self.refuse(breach));
+                    }
                 }
             }
             None => {
@@ -206,7 +224,7 @@ impl Guard {
                     Err(r) => {
                         // The request is not sent: its body is not transferred either.
                         self.bytes.fetch_sub(body_bytes, Ordering::AcqRel);
-                        return Err(self.refuse("requests", max as f64, r as f64));
+                        return Err(self.refuse(Self::spent("requests", max, r)));
                     }
                 }
             }
@@ -215,9 +233,19 @@ impl Guard {
             }
         }
         if let Some((budget, max)) = spent {
-            self.trip(budget, max as f64, max as f64, false, false);
+            self.trip(Self::spent(budget, max, max), false, false);
         }
         Ok(())
+    }
+
+    /// `budget` with `observed` of its `limit` used.
+    fn spent(budget: &str, limit: u64, observed: u64) -> BudgetBreach {
+        BudgetBreach {
+            budget: budget.to_owned(),
+            limit: limit as f64,
+            observed: observed as f64,
+            refused_request_bytes: None,
+        }
     }
 
     /// Count `bytes` of a response body as they arrive. Bytes past the budget were
@@ -228,32 +256,19 @@ impl Guard {
         if let Some(max) = self.budgets.max_bytes
             && b >= max
         {
-            self.trip("bytes", max as f64, b as f64, b > max, b > max);
+            let breach = Self::spent("bytes", max, b);
             if b > max {
-                return Err(self.spent_breach("bytes", max as f64, b as f64));
+                return Err(self.trip(breach, true, true));
             }
+            self.trip(breach, false, false);
         }
         Ok(())
     }
 
     /// A budget with no room left refused work: the run stops and the budget is breached.
-    fn refuse(&self, budget: &str, limit: f64, observed: f64) -> BudgetBreach {
+    fn refuse(&self, breach: BudgetBreach) -> BudgetBreach {
         self.note_cut_short();
-        self.trip(budget, limit, observed, false, true);
-        self.spent_breach(budget, limit, observed)
-    }
-
-    /// The breach on record (the first budget spent), else the one described.
-    fn spent_breach(&self, budget: &str, limit: f64, observed: f64) -> BudgetBreach {
-        self.breach
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
-            .unwrap_or_else(|| BudgetBreach {
-                budget: budget.to_owned(),
-                limit,
-                observed,
-            })
+        self.trip(breach, false, true)
     }
 
     /// Check the wall-clock budget.
@@ -262,24 +277,34 @@ impl Guard {
         if let Some(max) = self.budgets.max_duration_s {
             let s = self.started.elapsed().as_secs_f64();
             if s > max {
-                self.trip("duration", max, s, true, true);
+                self.trip(
+                    BudgetBreach {
+                        budget: "duration".to_owned(),
+                        limit: max,
+                        observed: s,
+                        refused_request_bytes: None,
+                    },
+                    true,
+                    true,
+                );
             }
         }
     }
 
-    /// A budget is spent (`exceeded`: more than its limit was used). `stop` cancels the armed
-    /// measurement: always, except for the HTTP request that spends a budget exactly.
-    fn trip(&self, budget: &str, limit: f64, observed: f64, exceeded: bool, stop: bool) {
+    /// A budget is spent as `breach` says (`exceeded`: more than its limit was used). `stop`
+    /// cancels the armed measurement: always, except for the HTTP request that spends a budget
+    /// exactly. Returns the breach on record: the first one, which `breach` is when no budget
+    /// was spent before.
+    fn trip(&self, breach: BudgetBreach, exceeded: bool, stop: bool) -> BudgetBreach {
         if exceeded {
             self.exceeded.store(true, Ordering::Release);
         }
-        if !self.tripped.swap(true, Ordering::AcqRel) {
-            *self.breach.lock().unwrap_or_else(|e| e.into_inner()) = Some(BudgetBreach {
-                budget: budget.to_owned(),
-                limit,
-                observed,
-            });
-        }
+        let on_record = {
+            let mut first = self.breach.lock().unwrap_or_else(|e| e.into_inner());
+            // Under the lock: whoever reads `tripped` as set finds the breach.
+            self.tripped.store(true, Ordering::Release);
+            first.get_or_insert(breach).clone()
+        };
         if stop
             && let Some(c) = self
                 .cancel
@@ -289,6 +314,7 @@ impl Guard {
         {
             c.cancel();
         }
+        on_record
     }
 
     /// A budget is spent: nothing more may start (work it stops cancels the measurement).
@@ -329,13 +355,6 @@ impl Guard {
             self.requests.load(Ordering::Relaxed),
             self.bytes.load(Ordering::Relaxed),
         )
-    }
-
-    /// Time until the duration budget runs out.
-    pub fn remaining_time(&self) -> Option<Duration> {
-        self.budgets
-            .max_duration_s
-            .map(|m| Duration::from_secs_f64(m).saturating_sub(self.started.elapsed()))
     }
 }
 
@@ -651,10 +670,21 @@ pub struct Preflight {
     pub write_delete: Option<bool>,
 }
 
+/// How long the probe object's delete may take once the preflight has failed or was stopped
+/// (the target may be unreachable, which is often why).
+const PROBE_DELETE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Credentials and permissions, before any write: list the root, then (when the run writes)
 /// write and delete a 1-byte object under the run prefix. Fails fast with a classified error.
+///
+/// `admin` is behind the run's gate (the probes count against the budgets and stop when the
+/// run is cancelled); `cleaner` is not: the probe object is deleted through it, whatever became
+/// of its write. A gate that closes between the write and the delete (the write spent the
+/// request budget, or Ctrl-C) would otherwise leave the object, and nothing cleans up after a
+/// run that never opened.
 pub async fn preflight(
     admin: &opendal::Operator,
+    cleaner: &opendal::Operator,
     run_prefix: &str,
     write_probe: bool,
 ) -> anyhow::Result<Preflight> {
@@ -686,11 +716,12 @@ pub async fn preflight(
     out.list = true;
     if write_probe {
         let key = format!("{run_prefix}.oprobe-preflight");
-        admin
-            .write(&key, vec![0u8])
-            .await
-            .map_err(|e| classify("write a test object", e))?;
-        admin
+        if let Err(e) = admin.write(&key, vec![0u8]).await {
+            // A write that failed may still have been stored (its answer was lost or cut).
+            let _ = tokio::time::timeout(PROBE_DELETE_TIMEOUT, cleaner.delete(&key)).await;
+            return Err(classify("write a test object", e));
+        }
+        cleaner
             .delete(&key)
             .await
             .map_err(|e| classify("delete a test object", e))?;
@@ -747,6 +778,61 @@ mod sec_tests {
             crate::errors::classify(&e, "s3").code,
             ErrorCode::SafetyBudgetExceeded
         );
+    }
+
+    /// A body that does not fit in what is left of the byte budget is refused with what
+    /// happened: 9.2 said "byte budget spent: 1 B transferred (limit 4.0 MiB)".
+    #[test]
+    fn a_request_that_does_not_fit_the_byte_budget_says_so() {
+        let g = Guard::new(Budgets {
+            max_bytes: Some(4 << 20),
+            ..Default::default()
+        });
+        g.admit(1).unwrap();
+        let b = g.admit(8 << 20).unwrap_err();
+        assert_eq!(
+            b.message(),
+            "the next request (8.0 MiB) does not fit the byte budget: 1 B of 4.0 MiB used"
+        );
+        assert_eq!(g.usage(), (1, 1), "the refused request is not counted");
+        assert_eq!(g.breach(), Some(b.clone()), "work the budget stopped");
+        // The breach reads back, and one written by 9.2 (without the field) still does.
+        let json = serde_json::to_value(&b).unwrap();
+        assert_eq!(json["refused_request_bytes"], 8 << 20);
+        assert_eq!(serde_json::from_value::<BudgetBreach>(json).unwrap(), b);
+        let old: BudgetBreach =
+            serde_json::from_str(r#"{"budget":"bytes","limit":10.0,"observed":10.0}"#).unwrap();
+        assert_eq!(old.refused_request_bytes, None);
+        assert_eq!(
+            old.message(),
+            "byte budget spent: 10 B transferred (limit 10 B)"
+        );
+        assert!(
+            serde_json::to_value(&old)
+                .unwrap()
+                .get("refused_request_bytes")
+                .is_none()
+        );
+
+        // Spent exactly: the request that spends it is admitted, and nothing after it is,
+        // a request without a body included (9.2 sent that one, and cut its response).
+        let g = Guard::new(Budgets {
+            max_bytes: Some(100),
+            ..Default::default()
+        });
+        let c = Cancel::new();
+        g.arm(c.clone());
+        g.admit(0).unwrap();
+        g.admit(100).unwrap();
+        assert!(g.tripped() && g.breach().is_none() && !c.is_cancelled());
+        let b = g.admit(0).unwrap_err();
+        assert_eq!(
+            b.message(),
+            "byte budget spent: 100 B transferred (limit 100 B)"
+        );
+        assert_eq!(g.usage(), (2, 100));
+        assert!(c.is_cancelled());
+        assert_eq!(g.breach(), Some(b));
     }
 
     #[test]

@@ -414,14 +414,10 @@ pub async fn measured_operator_with(
 
 /// Fail fast when the endpoint cannot be reached at all (connection refused, unknown host):
 /// the admin operator would otherwise retry every dataset upload for minutes. One `stat` on a
-/// key that does not exist, without retries; any HTTP answer (404, 403, ...) passes.
-pub async fn check_reachable(base: &Operator, target: &TargetSpec) -> Result<()> {
-    check_reachable_with(base, target, &HttpOptions::default(), None).await
-}
-
-/// [`check_reachable`] with the run's transport and HTTP version (a server that only speaks
-/// HTTP/2 is reachable for an HTTP/2 client), behind the run's `gate`.
-pub async fn check_reachable_with(
+/// key that does not exist, without retries; any HTTP answer (404, 403, ...) passes. The probe
+/// uses the run's transport and HTTP version (a server that only speaks HTTP/2 is reachable
+/// for an HTTP/2 client), behind the run's `gate`.
+pub async fn check_reachable(
     base: &Operator,
     target: &TargetSpec,
     http: &HttpOptions,
@@ -463,6 +459,30 @@ pub async fn check_reachable_with(
     Ok(())
 }
 
+/// The proxy the requests to `target` go through, without its credentials, and where it is
+/// set: `http.proxy`, or the environment (`HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`, unless
+/// `NO_PROXY` exempts the endpoint). `None`: they go to the endpoint directly.
+fn proxy_in_use(target: &TargetSpec) -> Option<(String, &'static str)> {
+    use crate::net::ProxyConfig;
+    match proxy_setting(target) {
+        Some(None) => None,
+        Some(Some(p)) => {
+            let p = ProxyConfig::parse(&p, "").ok()?;
+            Some((p.display(), "`http.proxy`"))
+        }
+        None => {
+            let endpoint = target.endpoint().and_then(|e| url::Url::parse(&e).ok());
+            let https = endpoint.as_ref().is_none_or(|u| u.scheme() == "https");
+            let p = ProxyConfig::from_env(https)?;
+            let direct = endpoint
+                .as_ref()
+                .and_then(|u| u.host_str())
+                .is_some_and(|h| p.bypass(h));
+            (!direct).then(|| (p.display(), "the environment"))
+        }
+    }
+}
+
 /// An OpenDAL error and its sources on one line, each text once (OpenDAL's own message already
 /// names its first source).
 fn error_chain(e: &opendal::Error) -> String {
@@ -491,26 +511,21 @@ fn host_port(endpoint: &str) -> Option<String> {
 
 /// The error of a target that cannot be reached: one plain cause (`connection refused by
 /// 127.0.0.1:9999`), the operator, and the storage library's report (`chain`) as the detail.
+///
+/// Behind a proxy the client only ever connects to the proxy, so the proxy is what refused,
+/// could not be resolved or could not be reached: it is named, not the endpoint (9.2 said the
+/// endpoint refused the connection, and hinted at `options.endpoint`).
 pub fn unreachable_error(target: &TargetSpec, chain: &str) -> OprobeError {
+    if let Some((proxy, set_by)) = proxy_in_use(target) {
+        return proxy_unreachable_error(target, &proxy, set_by, chain);
+    }
     let endpoint = target.endpoint();
     let at = endpoint
         .as_deref()
         .and_then(host_port)
         .or(endpoint)
         .unwrap_or_else(|| target.display());
-    let l = chain.to_ascii_lowercase();
-    let dns = [
-        "dns error",
-        "failed to lookup address",
-        "name or service not known",
-        "nodename nor servname",
-        "no such host",
-    ]
-    .iter()
-    .any(|n| l.contains(n));
-    let refused = ["connection refused", "actively refused", "os error 10061"]
-        .iter()
-        .any(|n| l.contains(n));
+    let (dns, refused) = connect_failure_kind(chain);
     let (code, cause, hint) = if dns {
         let host = at.rsplit_once(':').map_or(at.as_str(), |(h, _)| h);
         (
@@ -535,6 +550,62 @@ pub fn unreachable_error(target: &TargetSpec, chain: &str) -> OprobeError {
     OprobeError::new(code, format!("{cause} ({})", target.display()))
         .with_hint(hint)
         .with_detail(chain.trim())
+}
+
+/// What the storage library's report of a failed connection says: (the name could not be
+/// resolved, the connection was refused).
+fn connect_failure_kind(chain: &str) -> (bool, bool) {
+    let l = chain.to_ascii_lowercase();
+    let dns = [
+        "dns error",
+        "failed to lookup address",
+        "name or service not known",
+        "nodename nor servname",
+        "no such host",
+    ]
+    .iter()
+    .any(|n| l.contains(n));
+    let refused = ["connection refused", "actively refused", "os error 10061"]
+        .iter()
+        .any(|n| l.contains(n));
+    (dns, refused)
+}
+
+/// [`unreachable_error`] of a target whose requests go through `proxy` (set by `set_by`).
+fn proxy_unreachable_error(
+    target: &TargetSpec,
+    proxy: &str,
+    set_by: &str,
+    chain: &str,
+) -> OprobeError {
+    let at = host_port(proxy).unwrap_or_else(|| proxy.to_owned());
+    let (dns, refused) = connect_failure_kind(chain);
+    let (code, cause) = if dns {
+        let host = at.rsplit_once(':').map_or(at.as_str(), |(h, _)| h);
+        (
+            ErrorCode::NetDns,
+            format!("cannot resolve the proxy {host}"),
+        )
+    } else if refused {
+        (
+            ErrorCode::NetUnreachable,
+            format!("connection refused by the proxy {at}"),
+        )
+    } else {
+        (
+            ErrorCode::NetUnreachable,
+            format!("cannot connect through the proxy {at}"),
+        )
+    };
+    OprobeError::new(
+        code,
+        format!("{cause} ({}, proxy set by {set_by})", target.display()),
+    )
+    .with_hint(
+        "check that the proxy is running at that address, set another with \
+         `--set http.proxy=URL`, or connect directly with `--set http.proxy=none`",
+    )
+    .with_detail(chain.trim())
 }
 
 /// What [`credential_source`] says of a target that sends unsigned requests.
@@ -832,6 +903,8 @@ mod tests {
         let mut t = TargetSpec::from_url("s3://b/x").unwrap();
         t.options
             .insert("endpoint".into(), "http://127.0.0.1:9999".into());
+        // Directly, whatever proxy the environment of the test names.
+        t.proxy = Some("none".into());
         let dump = "Unexpected (temporary) at stat, context: { uri: http://127.0.0.1:9999/b/x, \
                     service: s3 } => send http request, source: error sending request: client \
                     error (Connect): tcp connect error: Connection refused (os error 111) ";
@@ -849,6 +922,49 @@ mod tests {
         );
         assert_eq!(b.code, ErrorCode::NetDns);
         assert_eq!(b.message, "cannot resolve 127.0.0.1 (s3://b/x)");
+    }
+
+    /// Behind a proxy, the proxy is what refused the connection: 9.2 named the endpoint
+    /// ("connection refused by 127.0.0.1:9999") and hinted at `options.endpoint`.
+    #[test]
+    fn an_unreachable_proxy_is_named_not_the_endpoint() {
+        let mut t = TargetSpec::from_url("s3://b/x").unwrap();
+        t.options
+            .insert("endpoint".into(), "http://127.0.0.1:9999".into());
+        t.proxy = Some("http://user:secret@127.0.0.1:3128".into());
+        let dump = "Unexpected (temporary) at stat => send http request, source: error sending \
+                    request: client error (Connect): tcp connect error: Connection refused (os \
+                    error 111)";
+        let b = crate::errors::classify(&unreachable_error(&t, dump).into(), "s3");
+        assert_eq!(b.code, ErrorCode::NetUnreachable);
+        assert_eq!(
+            b.message,
+            "connection refused by the proxy 127.0.0.1:3128 (s3://b/x, proxy set by `http.proxy`)"
+        );
+        let hint = b.hint.unwrap();
+        assert!(hint.contains("--set http.proxy=none"), "{hint}");
+        assert!(!hint.contains("options.endpoint"), "{hint}");
+        let b = crate::errors::classify(
+            &unreachable_error(&t, "dns error: failed to lookup address information").into(),
+            "s3",
+        );
+        assert_eq!(b.code, ErrorCode::NetDns);
+        assert!(
+            b.message.starts_with("cannot resolve the proxy 127.0.0.1 "),
+            "{}",
+            b.message
+        );
+        let b = crate::errors::classify(&unreachable_error(&t, "connect: timed out").into(), "s3");
+        assert!(
+            b.message
+                .starts_with("cannot connect through the proxy 127.0.0.1:3128 "),
+            "{}",
+            b.message
+        );
+        // `http.proxy=none` connects directly: the endpoint is named.
+        t.proxy = Some("none".into());
+        let b = crate::errors::classify(&unreachable_error(&t, dump).into(), "s3");
+        assert_eq!(b.message, "connection refused by 127.0.0.1:9999 (s3://b/x)");
     }
 
     /// A rejected key names the endpoint and where the key came from; the dump is the detail.

@@ -1,11 +1,13 @@
-//! Target safety (9.2): a run never leaves a multipart upload behind, and its budgets hold on
-//! the wire. Every count asserted here is the lab's own (server side), not the client's.
+//! Target safety (9.2, 9.3): a run never leaves a multipart upload or an object behind,
+//! however it is stopped, and its budgets hold on the wire. Every count asserted here is the
+//! lab's own (server side), not the client's.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use oprobe::config::{DatasetSpec, OpKind, OpSpec, Profile};
-use oprobe::engine::measure::{Measured, Rails, Request, guard_for, measure};
+use oprobe::engine::measure::{Measured, Rails, Request, Stage, guard_for, measure};
 use oprobe::engine::{Cancel, RunOptions, Session};
 use oprobe::errors::exit;
 use oprobe::guard::Budgets;
@@ -22,11 +24,18 @@ fn quiet() -> oprobe::engine::ProgressFn {
 }
 
 async fn lab(part_fault: Option<PartFaultKind>) -> LabHandle {
-    let faults = LabConfig {
-        throttle_status_code: 503,
+    lab_with(LabConfig {
         // The first part of every upload is stored; the second one breaks.
         part_fault: part_fault.map(|kind| PartFault { from_part: 2, kind }),
         ..Default::default()
+    })
+    .await
+}
+
+async fn lab_with(faults: LabConfig) -> LabHandle {
+    let faults = LabConfig {
+        throttle_status_code: 503,
+        ..faults
     };
     LabServer::spawn("127.0.0.1:0", faults)
         .await
@@ -54,8 +63,8 @@ fn multipart_writes(lab: &LabHandle, parts: u64) -> Profile {
 
 async fn measured(p: Profile, budgets: Budgets, cancel: Cancel) -> Measured {
     let rails = Rails::new(&p, false, None, budgets.clone()).unwrap();
-    let mut req = Request::new(p.clone(), rails, cancel, quiet());
-    req.guard = guard_for(&budgets, &p);
+    let mut req = Request::new(p, rails, cancel, quiet());
+    req.guard = guard_for(&budgets);
     // A fix that does not hold would hang here (9.1 drained stalled operations for ever).
     tokio::time::timeout(Duration::from_secs(120), measure(req))
         .await
@@ -111,9 +120,11 @@ async fn a_multipart_write_cut_by_a_timeout_aborts_its_upload() {
     let lab = lab(Some(PartFaultKind::Stall)).await;
     let mut p = multipart_writes(&lab, 4);
     p.workload.max_ops = Some(1);
+    // Seconds, not a fraction of one: the 5 MiB part before the stalled one must never time
+    // out, however slow the machine. The stall is for ever, so the timeout always fires.
     p.operator.layers.timeout = Some(Timeout {
-        op: HumanDuration::secs(30),
-        io: HumanDuration(Duration::from_millis(300)),
+        op: HumanDuration::secs(60),
+        io: HumanDuration::secs(3),
     });
     let m = measured(p, Budgets::default(), Cancel::new()).await;
     let s = &m.run.report.summary;
@@ -180,7 +191,15 @@ async fn a_cancelled_dataset_upload_aborts_its_uploads() {
         .unwrap()
         .err()
         .expect("the session does not open");
-    assert!(format!("{e:#}").contains("cancelled"), "{e:#}");
+    // Stopped, not failed: 9.2 said "cancelled while uploading the dataset", an `internal`
+    // error (exit 1) for the app's Stop.
+    let body = oprobe::errors::classify(&e, "s3");
+    assert_eq!(
+        body.code,
+        oprobe::errors::ErrorCode::RunInterrupted,
+        "{e:#}"
+    );
+    assert_eq!(body.message, "run interrupted");
     let c = lab.multipart_counts();
     assert_eq!((c.created, c.aborted), (3, 3), "{c:?}");
     assert_nothing_left(&lab);
@@ -192,13 +211,28 @@ async fn a_cancelled_dataset_upload_aborts_its_uploads() {
 /// aborted, the partial run is reported, and the exit code is 4.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_request_budget_holds_inside_a_multipart_operation() {
-    let lab = lab(None).await;
+    let lab = Arc::new(lab(None).await);
     let p = multipart_writes(&lab, 8);
     let budgets = Budgets {
         max_requests_count: Some(8),
         ..Default::default()
     };
-    let m = measured(p, budgets, Cancel::new()).await;
+    let rails = Rails::new(&p, false, None, budgets.clone()).unwrap();
+    let mut req = Request::new(p, rails, Cancel::new(), quiet());
+    req.guard = guard_for(&budgets);
+    // Every request the lab has served when the window has ended, before cleanup lists and
+    // deletes the run prefix.
+    let served = Arc::new(AtomicU64::new(0));
+    let (at_the_end, target) = (served.clone(), lab.clone());
+    req.on_stage = Some(Arc::new(move |stage| {
+        if stage == Stage::Measured {
+            at_the_end.store(target.requests_served(), Ordering::SeqCst);
+        }
+    }));
+    let m = tokio::time::timeout(Duration::from_secs(120), measure(req))
+        .await
+        .expect("the run ends")
+        .expect("the run is measured");
     let b = m.breach.as_ref().expect("the budget stopped the run");
     assert_eq!(
         (b.budget.as_str(), b.limit, b.observed),
@@ -207,11 +241,15 @@ async fn a_request_budget_holds_inside_a_multipart_operation() {
     assert_eq!(m.run.report.verdict.exit_code, exit::BUDGET);
     assert!(m.run.report.is_partial());
     let c = lab.multipart_counts();
-    // The reachability probe and the preflight count too: the first upload gets what they
-    // left of the 8 requests, and never completes.
-    assert!(c.parts >= 1, "the write started: {c:?}");
-    assert!(c.requests() <= 8, "{c:?}");
-    assert_eq!((c.completed, c.created, c.aborted), (0, 1, 1), "{c:?}");
+    // The reachability probe and the preflight count too (one request, then a list and a
+    // write): the first upload gets the other 5 of the 8 requests, and never completes.
+    assert_eq!((c.created, c.parts), (1, 4), "{c:?}");
+    assert_eq!((c.completed, c.aborted), (0, 1), "{c:?}");
+    // The lab's total, not only its multipart requests (9.2 asserted `c.requests() <= 8`,
+    // which a ninth request of any other kind would have passed): the 8 of the budget, and
+    // the two that are cleanup, which no budget counts: the preflight's probe object deleted,
+    // the upload aborted.
+    assert_eq!(served.load(Ordering::SeqCst), 8 + 2, "{c:?}");
     assert_nothing_left(&lab);
     assert!(m.run.report.cleanup.verified, "{:?}", m.run.report.cleanup);
 }
@@ -257,8 +295,8 @@ async fn a_budget_covers_the_dataset_upload() {
         ..Default::default()
     };
     let rails = Rails::new(&p, false, None, budgets.clone()).unwrap();
-    let mut req = Request::new(p.clone(), rails, Cancel::new(), quiet());
-    req.guard = guard_for(&budgets, &p);
+    let mut req = Request::new(p, rails, Cancel::new(), quiet());
+    req.guard = guard_for(&budgets);
     let guard = req.guard.clone().unwrap();
     let e = measure(req)
         .await
@@ -325,45 +363,237 @@ async fn large_conditional_and_metadata_writes_write_their_size() {
     assert!(s.close().await.verified);
 }
 
+/// K1-4: the preflight's probe object never stays. 9.2 deleted it through the run's gate: with
+/// `--max-requests 3` the write spent the budget, the delete was refused, and since a run
+/// that does not open has no cleanup, `oprobe-run-<id>/.oprobe-preflight` was left on the
+/// target. Whatever request the budget ends at, nothing is left.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_preflight_probe_object_is_deleted_whatever_the_budget_stops() {
+    for max in 1..=8 {
+        let lab = lab(None).await;
+        let mut p = lab.profile("bkt");
+        p.workload.mix = vec![OpSpec {
+            weight: 1,
+            op: OpKind::Read { size: None },
+        }];
+        p.workload.dataset = Some(DatasetSpec {
+            objects: 4,
+            object_size: ByteSize::kib(4),
+            ..Default::default()
+        });
+        let budgets = Budgets {
+            max_requests_count: Some(max),
+            ..Default::default()
+        };
+        let rails = Rails::new(&p, false, None, budgets.clone()).unwrap();
+        let mut req = Request::new(p, rails, Cancel::new(), quiet());
+        req.guard = guard_for(&budgets);
+        let stopped = tokio::time::timeout(Duration::from_secs(120), measure(req))
+            .await
+            .expect("the run ends");
+        // The budget stopped it: while it opened (an error), or in its window (a breach).
+        match stopped {
+            Ok(m) => assert!(m.breach.is_some(), "--max-requests {max}"),
+            Err(e) => assert_eq!(
+                oprobe::errors::classify(&e, "s3").code,
+                oprobe::errors::ErrorCode::SafetyBudgetExceeded,
+                "--max-requests {max}: {e:#}"
+            ),
+        }
+        assert_eq!(
+            lab.stored_keys(),
+            Vec::<String>::new(),
+            "--max-requests {max}"
+        );
+        assert_eq!(lab.open_uploads(), 0, "--max-requests {max}");
+    }
+}
+
+/// K1-5: a `CreateMultipartUpload` that never answers does not hang a cancelled run. 9.2
+/// never cut that request (its answer carries the id the upload is aborted with) and waited
+/// for it without a bound, so after Ctrl-C the run never reached its cleanup. It now has a
+/// grace period; then the run goes on, cleans up, and names the upload it could not abort.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_create_that_never_answers_does_not_hang_a_cancelled_run() {
+    let lab = lab_with(LabConfig {
+        create_never_answers: true,
+        ..Default::default()
+    })
+    .await;
+    let mut p = multipart_writes(&lab, 4);
+    // Nothing but the cancellation ends the stalled request.
+    p.operator.layers.timeout = None;
+    let cancel = Cancel::new();
+    let run = tokio::spawn(measured(p, Budgets::default(), cancel.clone()));
+    until(&lab, "the upload being created", |l| {
+        l.multipart_counts().created >= 1
+    })
+    .await;
+    cancel.cancel();
+    // `measured` gives the run two minutes; 9.2 never came back.
+    let m = run.await.unwrap();
+    assert!(m.cancelled);
+    assert!(m.run.report.is_partial());
+    let cleanup = &m.run.report.cleanup;
+    assert!(cleanup.verified, "the test data is deleted: {cleanup:?}");
+    let error = cleanup.error.as_deref().expect("the upload is reported");
+    assert!(
+        error.starts_with("1 multipart uploads could not be aborted"),
+        "{error}"
+    );
+    assert!(
+        error.contains("/writes/") && error.contains("no upload id to abort"),
+        "the upload is named: {error}"
+    );
+    // The report is true: the lab did create the upload, and nobody knows its id.
+    let c = lab.multipart_counts();
+    assert_eq!((c.created, c.aborted, c.parts), (1, 0, 0), "{c:?}");
+    assert_eq!(lab.open_uploads(), 1);
+    assert_eq!(lab.stored_object_count(), 0, "{:?}", lab.stored_keys());
+}
+
+/// The real binary against a lab of this process: what the stop tests below drive.
+#[cfg(unix)]
+mod binary {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::process::{Child, Command, ExitStatus, Stdio};
+
+    use super::*;
+
+    pub fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    /// `oprobe run` of `mix` against `lab`, with its data under `home`: a two-minute window,
+    /// no retries and no timeouts (only a stop ends a stalled request).
+    pub fn run(home: &std::path::Path, lab: &LabHandle, mix: &[OpSpec]) -> Command {
+        let mix = serde_json::to_string(mix).unwrap();
+        let mut c = Command::new(env!("CARGO_BIN_EXE_oprobe"));
+        c.env("OPROBE_DATA_DIR", home.join("data"))
+            .env("OPROBE_CONFIG", home.join("config.toml"))
+            .env_remove("OPROBE_OUTPUT")
+            .args(["run", "s3://bkt/x", "-d", "120s", "--warmup", "0s"])
+            .args(["--objects", "8", "--object-size", "64KiB"])
+            .args(["--set", &format!("options.endpoint={}", lab.endpoint_url)])
+            .args(["--set", "http.proxy=none"])
+            .args(["--set", "options.region=us-east-1"])
+            .args(["--set", "options.access_key_id=x"])
+            .args(["--set", "options.secret_access_key=x"])
+            .args(["--set", &format!("mix={mix}"), "--set", "write.chunk=5MiB"])
+            .args(["--set", "layers.retry=off", "--set", "layers.timeout=off"])
+            .stdin(Stdio::null());
+        c
+    }
+
+    pub fn multipart_write() -> OpSpec {
+        OpSpec {
+            weight: 1,
+            op: OpKind::MultipartWrite {
+                size: ByteSize(4 * PART),
+            },
+        }
+    }
+
+    /// Reads of an uploaded dataset next to the multipart writes: a run with objects on the
+    /// target while one of its uploads is stalled.
+    pub fn reads_and_multipart_writes() -> Vec<OpSpec> {
+        let read = OpSpec {
+            weight: 1,
+            op: OpKind::Read { size: None },
+        };
+        vec![read, multipart_write()]
+    }
+
+    /// The exit status of `child`; a child still running after two minutes is killed (a stop
+    /// that hangs fails its test, not the whole suite).
+    pub fn wait(child: &mut Child, what: &str) -> ExitStatus {
+        let deadline = std::time::Instant::now() + Duration::from_secs(120);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                return status;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("{what}: oprobe was still running two minutes after it was stopped");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    pub fn signal(child: &Child, signal: libc::c_int) {
+        // SAFETY: a plain signal to our own child process.
+        let sent = unsafe { libc::kill(child.id() as libc::pid_t, signal) };
+        assert_eq!(sent, 0, "kill: {}", std::io::Error::last_os_error());
+    }
+
+    /// The runs saved under `home`, and the run files still being written.
+    pub fn run_files(home: &std::path::Path) -> (usize, usize) {
+        let names: Vec<String> = std::fs::read_dir(home.join("data").join("runs"))
+            .map(|d| {
+                d.filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let count = |suffix: &str| names.iter().filter(|n| n.ends_with(suffix)).count();
+        (count(".oprobe"), count(".oprobe.tmp"))
+    }
+
+    /// The run is in the middle of its window: its dataset is on the target and one of its
+    /// multipart uploads has a part on the wire that never answers.
+    pub async fn mid_run(lab: &LabHandle) {
+        until(lab, "a dataset and a stalled part", |l| {
+            l.stored_object_count() >= 8 && l.multipart_counts().parts >= 2
+        })
+        .await;
+    }
+
+    /// A pseudo-terminal: the master side, and the slave side to give a child as its
+    /// terminal. Both are closed on exec: only what is passed as stdio reaches the child.
+    pub fn pty() -> (std::fs::File, std::fs::File) {
+        use std::os::fd::FromRawFd;
+        // SAFETY: plain libc calls on a descriptor this function has just opened and owns;
+        // `ptsname`'s static buffer is copied at once, and nothing else here calls it.
+        unsafe {
+            let master = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+            assert!(master >= 0, "{}", std::io::Error::last_os_error());
+            assert_eq!(libc::fcntl(master, libc::F_SETFD, libc::FD_CLOEXEC), 0);
+            assert_eq!(libc::grantpt(master), 0);
+            assert_eq!(libc::unlockpt(master), 0);
+            let name = libc::ptsname(master);
+            assert!(!name.is_null());
+            let path = std::ffi::CStr::from_ptr(name)
+                .to_string_lossy()
+                .into_owned();
+            let slave = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_NOCTTY)
+                .open(path)
+                .unwrap();
+            (std::fs::File::from_raw_fd(master), slave)
+        }
+    }
+}
+
 /// SIGTERM and SIGHUP stop `oprobe run` as Ctrl-C does: what is in flight is cut, the
 /// multipart upload is aborted, the test data is deleted, and the exit code is 130. In 9.1
 /// only SIGINT was handled: the others killed the process where it stood.
 #[cfg(unix)]
 #[test]
 fn sigterm_and_sighup_stop_a_run_cleanly() {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .unwrap();
+    let rt = binary::runtime();
     let home = tempfile::tempdir().unwrap();
-    let mix = serde_json::to_string(&vec![OpSpec {
-        weight: 1,
-        op: OpKind::MultipartWrite {
-            size: ByteSize(4 * PART),
-        },
-    }])
-    .unwrap();
-    for signal in ["TERM", "HUP"] {
+    for (name, signal) in [("TERM", libc::SIGTERM), ("HUP", libc::SIGHUP)] {
         let lab = rt.block_on(lab(Some(PartFaultKind::Stall)));
-        let child = std::process::Command::new(env!("CARGO_BIN_EXE_oprobe"))
-            .env("OPROBE_DATA_DIR", home.path().join("data"))
-            .env("OPROBE_CONFIG", home.path().join("config.toml"))
-            .env_remove("OPROBE_OUTPUT")
-            .args(["run", "s3://bkt/x", "-c", "1", "-d", "120s", "-q"])
-            .args(["--color", "never", "--warmup", "0s"])
-            .args(["--set", &format!("options.endpoint={}", lab.endpoint_url)])
-            .args([
-                "--set",
-                "http.proxy=none",
-                "--set",
-                "options.region=us-east-1",
-            ])
-            .args(["--set", "options.access_key_id=x"])
-            .args(["--set", "options.secret_access_key=x"])
-            .args(["--set", &format!("mix={mix}"), "--set", "write.chunk=5MiB"])
-            .args(["--set", "layers.retry=off", "--set", "layers.timeout=off"])
-            .stdout(std::process::Stdio::piped())
+        let mut child = binary::run(home.path(), &lab, &[binary::multipart_write()])
+            .args(["-c", "1", "-q", "--color", "never"])
+            .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
             .spawn()
             .unwrap();
@@ -371,16 +601,150 @@ fn sigterm_and_sighup_stop_a_run_cleanly() {
         rt.block_on(until(&lab, "the stalled part", |l| {
             l.multipart_counts().parts >= 2
         }));
-        let killed = std::process::Command::new("kill")
-            .args([&format!("-{signal}"), &child.id().to_string()])
-            .status()
-            .unwrap();
-        assert!(killed.success());
-        let out = child.wait_with_output().unwrap();
-        let err = String::from_utf8_lossy(&out.stderr);
-        assert_eq!(out.status.code(), Some(130), "SIG{signal}: {err}");
+        binary::signal(&child, signal);
+        let status = binary::wait(&mut child, name);
+        let err = std::io::read_to_string(child.stderr.take().unwrap()).unwrap();
+        assert_eq!(status.code(), Some(130), "SIG{name}: {err}");
+        // "Interrupted", whatever stopped it: 9.2 said "before Ctrl-C" of a SIGTERM.
+        assert!(err.contains("interrupted: partial results"), "{err}");
+        assert!(!err.contains("before Ctrl-C"), "SIG{name}: {err}");
         let c = lab.multipart_counts();
-        assert_eq!((c.created, c.aborted), (1, 1), "SIG{signal}: {c:?}");
+        assert_eq!((c.created, c.aborted), (1, 1), "SIG{name}: {c:?}");
         assert_nothing_left(&lab);
     }
+}
+
+/// K1-1, the terminal that closes: SIGHUP arrives and stderr is gone. 9.2 handled the signal,
+/// then panicked at its next line for stderr ("cleaning up…", through `eprintln!`): exit 101,
+/// no cleanup, no saved run, the dataset left on the target. No line for stderr can fail now:
+/// the run is cut, its upload aborted, its test data deleted, the partial run saved.
+#[cfg(unix)]
+#[test]
+fn a_closed_stderr_never_costs_the_cleanup() {
+    let rt = binary::runtime();
+    let home = tempfile::tempdir().unwrap();
+    let lab = rt.block_on(lab(Some(PartFaultKind::Stall)));
+    let mut child = binary::run(home.path(), &lab, &binary::reads_and_multipart_writes())
+        .args(["-c", "2", "--color", "never"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    rt.block_on(binary::mid_run(&lab));
+    assert_eq!(
+        binary::run_files(home.path()),
+        (0, 1),
+        "the run is measuring"
+    );
+    // The reader of stderr goes away (the SSH session, `2>&1 | head`), then the hangup.
+    drop(child.stderr.take());
+    binary::signal(&child, libc::SIGHUP);
+    let status = binary::wait(&mut child, "SIGHUP with stderr closed");
+    assert_eq!(status.code(), Some(130), "a panic exits 101");
+    let c = lab.multipart_counts();
+    assert_eq!(c.aborted, c.created, "{c:?}");
+    assert_nothing_left(&lab);
+    assert_eq!(
+        binary::run_files(home.path()),
+        (1, 0),
+        "the partial run is saved"
+    );
+}
+
+/// K1-1, without a signal: the terminal a run draws its live line on goes away and no SIGHUP
+/// reaches the process (it is not the session's controlling terminal, or the signal is
+/// blocked). The line that cannot be drawn stops the run as Ctrl-C would. 9.2 ignored the
+/// failed write and went on measuring for nobody, here for ever: its upload is stalled.
+#[cfg(unix)]
+#[test]
+fn a_terminal_that_goes_away_stops_the_run_like_a_signal() {
+    use std::io::Read;
+    let rt = binary::runtime();
+    let home = tempfile::tempdir().unwrap();
+    let lab = rt.block_on(lab(Some(PartFaultKind::Stall)));
+    let (mut master, slave) = binary::pty();
+    // stdin, stdout and stderr on the terminal: the run is interactive and draws its line.
+    let mut child = binary::run(home.path(), &lab, &binary::reads_and_multipart_writes())
+        .args(["-c", "2"])
+        .stdin(slave.try_clone().unwrap())
+        .stdout(slave.try_clone().unwrap())
+        .stderr(slave)
+        .spawn()
+        .unwrap();
+    // The terminal shows what the run draws until it is told to go away.
+    let gone = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let terminal = {
+        let gone = gone.clone();
+        std::thread::spawn(move || {
+            let mut drawn = Vec::new();
+            let mut buf = [0u8; 4096];
+            while !gone.load(Ordering::SeqCst) {
+                match master.read(&mut buf) {
+                    Ok(n) if n > 0 => drawn.extend_from_slice(&buf[..n]),
+                    _ => break,
+                }
+            }
+            // `master` is dropped here: the terminal is gone.
+            String::from_utf8_lossy(&drawn).into_owned()
+        })
+    };
+    rt.block_on(binary::mid_run(&lab));
+    gone.store(true, Ordering::SeqCst);
+    let drawn = terminal.join().unwrap();
+    assert!(
+        drawn.contains("ops/s"),
+        "the live line was drawn: {drawn:?}"
+    );
+    let status = binary::wait(&mut child, "the terminal went away");
+    assert_eq!(status.code(), Some(130));
+    let c = lab.multipart_counts();
+    assert_eq!(c.aborted, c.created, "{c:?}");
+    assert_nothing_left(&lab);
+    assert_eq!(
+        binary::run_files(home.path()),
+        (1, 0),
+        "the partial run is saved"
+    );
+}
+
+/// K1-1: no line for stderr is printed with a macro that panics when stderr is closed. The
+/// writers are `oprobe_core::output::{stderr_line, stderr_text}`.
+#[test]
+fn nothing_prints_to_stderr_with_a_macro_that_can_panic() {
+    fn sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                sources(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap();
+    let mut files = Vec::new();
+    for krate in ["oprobe", "oprobe-core", "oprobe-trace"] {
+        sources(&crates.join(krate).join("src"), &mut files);
+    }
+    assert!(files.len() > 50, "{} source files found", files.len());
+    let mut found = Vec::new();
+    for file in files {
+        // The app's own lines (`src/ui/`) are still to be moved: see the 9.3 notes.
+        if file.components().any(|c| c.as_os_str() == "ui") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&file).unwrap();
+        for (n, line) in text.lines().enumerate() {
+            let code = line.split("//").next().unwrap_or_default();
+            if ["eprintln!(", "eprint!(", "dbg!("]
+                .iter()
+                .any(|m| code.contains(m))
+            {
+                found.push(format!("{}:{}: {}", file.display(), n + 1, line.trim()));
+            }
+        }
+    }
+    assert!(found.is_empty(), "use `stderr_line`:\n{}", found.join("\n"));
 }

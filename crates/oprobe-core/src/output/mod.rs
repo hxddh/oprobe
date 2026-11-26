@@ -7,6 +7,13 @@
 //!
 //! stdout carries data only; logs and progress go to stderr. Errors are printed by
 //! [`Output::error`]: JSON on stdout in json mode, `error:` + `hint:` on stderr otherwise.
+//!
+//! Nothing here (or anywhere a run, a prove, cleanup or a signal handler can reach) prints
+//! with `eprintln!`: that macro panics when stderr is gone (the terminal or SSH session closed,
+//! `2>&1 | head`), and a panic skips cleanup. Every line for stderr goes through
+//! [`stderr_line`] / [`stderr_text`], which never fail; the first write a closed stderr
+//! refuses runs the hooks of [`on_stderr_closed`] (the CLI cancels its command there, as a
+//! signal would), and later lines are dropped.
 //! In-process consumers (the app) read the command's events from [`Output::bus`].
 //!
 //! Every JSON result is wrapped in the common envelope ([`Envelope`]): the result's own fields
@@ -192,7 +199,7 @@ impl Output {
     pub fn info(&self, msg: impl Into<String>) {
         let msg = crate::util::strip_url_credentials(&msg.into());
         if !self.quiet {
-            eprintln!("{msg}");
+            stderr_line(&msg);
         }
         self.bus.log(LogLevel::Info, msg);
     }
@@ -203,7 +210,7 @@ impl Output {
         if let Ok(mut w) = self.warned.lock() {
             w.push(crate::report::style::strip_ansi(&msg));
         }
-        eprintln!("{} {msg}", yellow("warning:"));
+        stderr_line(format_args!("{} {msg}", yellow("warning:")));
         self.bus.log(LogLevel::Warn, msg);
     }
 
@@ -251,15 +258,77 @@ impl Output {
                 let _ = out.flush();
             }
             OutputFormat::Text => {
-                eprintln!("{} {}", red(&bold("error:")), e.message);
+                stderr_line(format_args!("{} {}", red(&bold("error:")), e.message));
                 if let Some(h) = &e.hint {
-                    eprintln!("{} {h}", yellow(&bold("hint:")));
+                    stderr_line(format_args!("{} {h}", yellow(&bold("hint:"))));
                 }
-                eprintln!("{}", dim(&format!("({})", e.code)));
+                stderr_line(dim(&format!("({})", e.code)));
             }
         }
         e.exit_code()
     }
+}
+
+/// What became of the process's stderr: whether a write to it was refused, and who to tell.
+#[derive(Default)]
+struct ErrStream {
+    closed: std::sync::atomic::AtomicBool,
+    hooks: std::sync::Mutex<Vec<Box<dyn Fn() + Send + Sync>>>,
+}
+
+impl ErrStream {
+    /// Write `text` to `w` (stderr) and flush it. A refused write closes the stream: the
+    /// hooks run, once, and nothing is written from then on. A stream that is only full for
+    /// now (`WouldBlock`: a non-blocking pipe) loses the text and stays open.
+    fn write(&self, w: &mut dyn Write, text: &str) {
+        use std::sync::atomic::Ordering;
+        if self.closed.load(Ordering::Acquire) {
+            return;
+        }
+        let Err(e) = w.write_all(text.as_bytes()).and_then(|()| w.flush()) else {
+            return;
+        };
+        if e.kind() == std::io::ErrorKind::WouldBlock || self.closed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        // Taken out first: a hook runs without the lock.
+        let hooks = std::mem::take(&mut *self.hooks.lock().unwrap_or_else(|e| e.into_inner()));
+        for hook in hooks {
+            hook();
+        }
+    }
+
+    /// Run `hook` when the stream closes (at once when it already has).
+    fn on_closed(&self, hook: Box<dyn Fn() + Send + Sync>) {
+        let mut hooks = self.hooks.lock().unwrap_or_else(|e| e.into_inner());
+        // Read under the lock: a stream closing now either takes the hook or is seen here.
+        if self.closed.load(std::sync::atomic::Ordering::Acquire) {
+            drop(hooks);
+            hook();
+        } else {
+            hooks.push(hook);
+        }
+    }
+}
+
+static STDERR: std::sync::LazyLock<ErrStream> = std::sync::LazyLock::new(ErrStream::default);
+
+/// Write `text` to stderr as it is (no newline added: a live line redraws itself). Never
+/// panics and never fails: see the module documentation.
+pub fn stderr_text(text: &str) {
+    STDERR.write(&mut std::io::stderr().lock(), text);
+}
+
+/// Write one line to stderr. Never panics and never fails: see the module documentation.
+pub fn stderr_line(line: impl std::fmt::Display) {
+    stderr_text(&format!("{line}\n"));
+}
+
+/// Run `hook` once when a write to stderr is refused because its reader is gone (at once when
+/// that has already happened). A command that measures stops there as it does on a signal:
+/// nobody is left to read its progress, and it must still clean up.
+pub fn on_stderr_closed(hook: impl Fn() + Send + Sync + 'static) {
+    STDERR.on_closed(Box::new(hook));
 }
 
 /// Exit code of a command whose reader closed stdout (`oprobe runs list | head`): 128 + SIGPIPE,
@@ -319,6 +388,81 @@ mod tests {
         let logged = format!("{:?}", events.try_recv());
         assert!(logged.contains("X-Amz-Expires=60"), "{logged}");
         assert!(!logged.contains("SECRET"), "{logged}");
+    }
+
+    /// A stderr whose reader is gone (a closed terminal, `2>&1 | head`) refuses the write:
+    /// 9.2 printed with `eprintln!`, which panics there, and the panic skipped cleanup. The
+    /// refused write is no error to the caller; it runs the hooks once, and later lines are
+    /// dropped.
+    #[test]
+    fn a_closed_stderr_runs_its_hooks_once_and_never_fails() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// Accepts `open` writes, then fails every one as `kind`.
+        struct Pipe {
+            open: usize,
+            kind: std::io::ErrorKind,
+            written: String,
+            attempts: usize,
+        }
+        impl Write for Pipe {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.attempts += 1;
+                if self.open == 0 {
+                    return Err(self.kind.into());
+                }
+                self.open -= 1;
+                self.written.push_str(&String::from_utf8_lossy(buf));
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let pipe = |open, kind| Pipe {
+            open,
+            kind,
+            written: String::new(),
+            attempts: 0,
+        };
+        let counter = |stream: &ErrStream| {
+            let fired = Arc::new(AtomicUsize::new(0));
+            let f = fired.clone();
+            stream.on_closed(Box::new(move || {
+                f.fetch_add(1, Ordering::SeqCst);
+            }));
+            fired
+        };
+
+        let stream = ErrStream::default();
+        let fired = counter(&stream);
+        let mut w = pipe(1, std::io::ErrorKind::BrokenPipe);
+        stream.write(&mut w, "uploading\n");
+        assert_eq!(fired.load(Ordering::SeqCst), 0);
+        stream.write(&mut w, "cleaning up\n");
+        assert_eq!(fired.load(Ordering::SeqCst), 1, "the refused write");
+        stream.write(&mut w, "more\n");
+        stream.write(&mut w, "and more\n");
+        assert_eq!(fired.load(Ordering::SeqCst), 1, "once");
+        assert_eq!(w.written, "uploading\n");
+        assert_eq!(w.attempts, 2, "a closed stream is not written to again");
+        // A hook registered after the stream closed runs at once.
+        assert_eq!(counter(&stream).load(Ordering::SeqCst), 1);
+
+        // A terminal that hung up answers `EIO`, not `EPIPE`: closed all the same.
+        let stream = ErrStream::default();
+        let fired = counter(&stream);
+        stream.write(&mut pipe(0, std::io::ErrorKind::Other), "x\n");
+        assert_eq!(fired.load(Ordering::SeqCst), 1);
+        // A pipe that is only full loses the line and stays open.
+        let stream = ErrStream::default();
+        let fired = counter(&stream);
+        stream.write(&mut pipe(0, std::io::ErrorKind::WouldBlock), "x\n");
+        assert_eq!(fired.load(Ordering::SeqCst), 0);
+        let mut w = pipe(1, std::io::ErrorKind::BrokenPipe);
+        stream.write(&mut w, "y\n");
+        assert_eq!(w.written, "y\n");
     }
 
     #[test]
