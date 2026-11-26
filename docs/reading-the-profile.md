@@ -68,7 +68,10 @@ ranges; a column no row has, such as a hot key's errors, is left out). The timel
 the measured window: what draining operations did after it counts in its last interval.
 
 `--by stage` sums the requests' time per stage, `--by api` per storage API, `--by conn` per
-connection (cold and warm, per remote address). `--by stage` also gives each stage's p50/p99
+connection (cold and warm, per remote address). A request belongs to the stage it spent most of
+its time in, and the stages have one name everywhere (the groups of `--by stage`, the tail
+split, the waterfalls, the report's fields): `queue`, `connect`, `send`, `ttfb`, `body`,
+`stall`. Up to 9.2 `--by stage` and the waterfalls called the `body` stage `transfer`. `--by stage` also gives each stage's p50/p99
 per API and, when the requests recorded them, the request signals below.
 
 ### Request signals
@@ -104,8 +107,8 @@ Each operation's wall time is split exactly; an instant counts once even when re
 | queue | requests wait for a connection or an in-flight permit | a concurrency limit or a small pool; see `cold_connections` and `throttling` |
 | connect | DNS, TCP, proxy and TLS of a new connection | connections are not reused, or the proxy or TLS is slow (`http.keep_alive`, `http.version`) |
 | send | the request body goes out | upload bandwidth; `write.chunk`, `write.concurrent`. Uploads that share one saturated uplink are a `bandwidth_cap` (`layers.throttle.bandwidth`), not hung requests |
-| TTFB | waiting for the first byte (the server's work plus one round trip) | the store or the distance to it; stragglers show as a long tail (`layers.tail_cut`). A TTFB that grows with the requests in flight, in a run that varied them at least twofold, is the service's queue: `throttling` without a 429/503 (`layers.concurrent_limit.http`) |
-| body | the response body arrives | download bandwidth per stream × streams; `read.chunk`, `read.concurrent` |
+| TTFB | waiting for the first byte (the server's work plus one round trip) | the store or the distance to it; stragglers show as a long tail (`layers.tail_cut`). A TTFB that grows with the requests in flight, in a run that varied them at least twofold, is the service's queue: `throttling` without a 429/503 (below) |
+| body | the response body arrives | download bandwidth per stream × streams; `read.chunk`, `read.concurrent`. Downloads that share one capped link are a `bandwidth_cap`, not hung requests; a body that stalls (far slower than the other bodies) is a hung request |
 | stall | the body waits for your code to read it (client time: its own segment in a waterfall, never part of body) | the consumer, not storage |
 | retry | the retry layer sleeps before the next attempt | throttling or errors; see the findings (`errors` on retried 5xx or lost connections: `layers.retry.min_delay`) |
 | client | everything else: OpenDAL, signing, checksums | CPU (`client_bound`), tiny objects |
@@ -125,10 +128,31 @@ Each operation's wall time is split exactly; an instant counts once even when re
   started count in every percentile as censored values, so a slow server cannot hide behind fewer
   requests. A censored value is a lower bound (the arrival had waited that long when the window
   ended; nothing says how much longer it would have taken), so those percentiles are "at least"
-  values. A p99 limit (`p99_ms`) is therefore checked against the worst the censored arrivals
-  allow: it is breached when more than 1 % of the scheduled arrivals never completed (the p99
-  then has no upper bound), and otherwise when the p99 with each of them counted as slower than
-  every completed operation exceeds it.
+  values. When more than 1 % of the scheduled arrivals never completed, the p99 has no upper
+  bound at all (its rank falls among the censored arrivals): the open loop **stalled**. No limit
+  is needed to judge that. The headline leads with it ("1808 of 3000 scheduled arrivals never
+  completed (60.3%): the p99 is at least 1.80s and has no upper bound"), the profile's `checks`
+  line and `verdict.sla.breaches` carry the same sentence, and the verdict is Critical. The
+  bound is the run's own p99. The finding beside it says who fell behind: the service, when it
+  queues (`throttling`), or the client (`client_bound`).
+- **A service that queues** (`throttling` with no 429/503) is read from timing alone, so it is
+  held to more than a rejection is. The time to first byte is fitted against the requests in
+  flight with one service time per storage API (a HEAD is quicker than a ranged GET at any
+  load); the run must have varied its requests in flight at least twofold; the wait the model
+  puts at the busiest level must be more than twice the client's own scheduling lag (`self`),
+  which also grows with the requests in flight; and a run whose client was saturated has no
+  such finding. Its remedy is advice: a cap on the requests in flight
+  (`layers.concurrent_limit.http`) moves the wait from the service's queue to the client's. It
+  shortens no operation and adds no throughput, so there is nothing for `prove` to measure, and
+  `prove` refuses it. A run at a steady load shows no queue: its headline says the load was
+  not varied. Vary it with `--set shape=ramp:FROM..TO/D` (arrivals per second, over `D`).
+- **An open loop that fell behind** with CPU to spare kept every worker busy, so a steady one
+  shows a single level of requests in flight: nothing in it tells a service at its capacity
+  from too few workers, and `client_bound` says exactly that ("this run cannot tell") instead
+  of advising more workers. A run that varied its load can tell: when the time to first byte
+  grew with the requests in flight, the service queues (`throttling`, as above, and no
+  `client_bound`); when it stayed put from half the requests in flight to all of them, the
+  service had room and the workers are the bound (`client_bound`: raise `-c`).
 - **Percentiles** are exact when every operation was kept, otherwise from histograms with three
   significant digits. Counts always agree with the totals. The report keeps the run's whole
   latency distribution (`latency_histogram`, 20 bins per decade), and the latency distribution

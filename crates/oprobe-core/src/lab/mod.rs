@@ -286,9 +286,10 @@ pub enum Scenario {
     /// 4% `500 InternalError` and 2% connection resets.
     Flaky,
     /// The demo's limit without stragglers, for the parquet preset (HEAD, footer, then 4
-    /// parallel column reads): 503 above 24 in flight, so 6 parquet workers fit and 8 throttle.
+    /// parallel column reads): 503 above 24 in flight, so the default 6 parquet workers fit
+    /// (6 × 4 = 24) and 12 throttle.
     Parquet,
-    /// A token bucket: 300 requests/s (burst 20), whatever the concurrency.
+    /// A token bucket: 100 requests/s (burst 30), whatever the concurrency.
     RateLimit,
     /// One token bucket per key (40 requests/s): zipf reads make the hottest keys throttle.
     HotKey,
@@ -353,20 +354,20 @@ impl Scenario {
             Scenario::Clean => "no faults: S3 semantics only",
             Scenario::Demo => {
                 "8 ms latency, 2.5% stragglers (+250 ms), 503 SlowDown above 40 concurrent requests; \
-                 default workload: small-files, 64 × 64 KiB, 28 workers, 0.5 s warmup, 8 s"
+                 default workload: small-files, 64 × 64 KiB, 16 workers, 0.5 s warmup, 8 s"
             }
             Scenario::Throttle => {
-                "5 ms latency, 503 SlowDown above 8 concurrent requests; default workload: small-files, 48 workers"
+                "5 ms latency, 503 SlowDown above 8 concurrent requests; default workload: small-files, 64 workers"
             }
             Scenario::Stragglers => "5 ms latency, 3% of requests wait 400 ms",
             Scenario::Lossy => "20 ms latency, responses capped at 4 MiB/s per stream",
             Scenario::Flaky => "5 ms latency, 4% 500 InternalError, 2% connection resets",
             Scenario::Parquet => {
                 "8 ms latency, 503 SlowDown above 24 concurrent requests, no stragglers; \
-                 default workload: the parquet preset, 8 workers"
+                 default workload: the parquet preset, 6 workers"
             }
             Scenario::RateLimit => {
-                "5 ms latency, 503 SlowDown above 300 requests/s (token bucket, burst 20); \
+                "12 ms latency, 503 SlowDown above 100 requests/s (token bucket, burst 30); \
                  default workload: whole-object reads of 64 × 16 KiB, 16 workers"
             }
             Scenario::HotKey => {
@@ -443,10 +444,10 @@ impl Scenario {
                 ..base
             },
             Scenario::RateLimit => LabConfig {
-                base_ttfb_delay: ms(5),
+                base_ttfb_delay: ms(RATELIMIT_LATENCY_MS),
                 rate_limit: Some(RateLimitFault {
-                    requests_per_s: 300.0,
-                    burst: 20,
+                    requests_per_s: RATELIMIT_REQUESTS_PER_S,
+                    burst: RATELIMIT_BURST,
                     after: None,
                 }),
                 ..base
@@ -497,7 +498,17 @@ impl Scenario {
 pub const DEMO_THROTTLE_ABOVE: usize = 40;
 /// Workers of the `lab://demo` default workload: below the lab's in-flight limit, so the profile
 /// is about its stragglers, and the top finding proves on goodput.
-pub const DEMO_CONCURRENCY: usize = 28;
+///
+/// 16, well inside the limit on any machine. With the remedy (TailCutLayer) a cut straggler
+/// stays in flight at the lab until it answers, up to [`DEMO_STRAGGLER_MS`] later, while its
+/// worker sends the next request. `w` workers send at most `w / 8 ms` requests a second
+/// (the lab's latency is the floor, whatever the machine), one in
+/// [`DEMO_STRAGGLER_EVERY`] is a straggler, so at most `w / 0.008 / 40 × 0.25 = 0.78 w` cut
+/// requests linger: 16 + 12.5 = 28.5 in flight at the very most, against a limit of 40. 9.2
+/// ran 28 workers (28 + 21.9 = 49.9 at the bound): the proof stayed under the limit only
+/// while the machine was slow enough — it measured 37 in flight at 2 000 operations/s — and
+/// a faster one made the candidate throttle, which `--max-throttle` rightly refuses.
+pub const DEMO_CONCURRENCY: usize = 16;
 /// Every Nth request of `lab://demo` is a straggler.
 pub const DEMO_STRAGGLER_EVERY: usize = 40;
 /// Extra delay of a `lab://demo` straggler.
@@ -507,16 +518,46 @@ pub const DEMO_STRAGGLER_MS: u64 = 250;
 /// backoff, above the p99: the finding's remedy (a cap at the limit) then only queued the
 /// workers, and its prove on p99 could not decide (W8).
 ///
-/// 48, not 32: the workers start in step, so each burst rejects `workers − 8` of them, and
+/// More than 32: the workers start in step, so each burst rejects `workers − 8` of them, and
 /// those are the slow operations of a trial. The lab serves at most 8 requests per 5 ms
 /// (1 600/s), so a 2 s trial holds up to 3 200 operations and its p99 is the backoff only
 /// when more than 32 are slow. With 32 workers a burst rejects 24: about 1 % of a trial, on
 /// either side of the p99 depending on how fast the machine is (on a fast CI runner the
 /// baseline read 9 ms in some trials and 1 s in others, and the prove could not decide).
-/// With 48 a burst rejects 40.
-pub const THROTTLE_CONCURRENCY: usize = 48;
-/// Workers of the `lab://parquet` default workload (4 requests in flight per op: 6 fit, 8 throttle).
-pub const PARQUET_CONCURRENCY: usize = 8;
+/// With 48 a burst rejects 40: 1.25 % of the most a 2 s trial can hold, still near the p99.
+/// With 64 it rejects 56, 1.75 % of those 3 200 and more of any trial a real machine
+/// completes, so the baseline's p99 is the backoff whatever the machine's speed.
+pub const THROTTLE_CONCURRENCY: usize = 64;
+
+/// `lab://ratelimit`: latency, rate and burst of its token bucket.
+///
+/// The remedy of a rate limit is a cap on the requests in flight, and `k` in flight send
+/// `k / (latency + overhead)` requests a second, so the numbers decide which cap fits. They
+/// are chosen so that the answer is the same on every machine, for a client overhead per
+/// request anywhere from 0.15 ms to 3 ms:
+/// - a cap of 1 sends 67 to 82 requests/s, at most 82 % of the rate: never throttled;
+/// - a cap of 2 sends 133 to 164 requests/s, at least a third over the rate: it drains the
+///   burst within a second and is throttled in every sizing trial.
+///
+/// 9.2 had 5 ms and 300 requests/s (burst 20): a cap of 2 sent 250 to 390 requests/s, on
+/// either side of the rate with the machine. On a fast CI runner (310 requests/s) a short
+/// sizing trial stayed inside the burst, the cap was sized at 2, and the proof came out
+/// `worse`.
+///
+/// The burst is larger than what a small in-flight cap serves in eight service times
+/// (2 × 8 = 16): after each lull the bucket serves a burst no such cap carries, which is what
+/// tells this lab from an in-flight limit when the workers sleep a second and wake in step.
+pub const RATELIMIT_LATENCY_MS: u64 = 12;
+pub const RATELIMIT_REQUESTS_PER_S: f64 = 100.0;
+pub const RATELIMIT_BURST: u32 = 30;
+/// Workers of the `lab://parquet` default workload. A scan holds at most 4 requests in
+/// flight (its column ranges, with `read.concurrent = 4`; one at a time on OpenDAL's
+/// defaults), so 6 workers reach the lab's limit of 24 and never cross it: 6 × 4 = 24, and the
+/// lab rejects above 24. The profile is then about the ranges, whatever the machine. 9.2 ran
+/// 8 (8 × 4 = 32), which crossed the limit whenever the workers scanned in step: on some
+/// machines the same command threw 503s and on others none. The limit has its own test, at
+/// `-c 12` (48 in flight, twice the limit).
+pub const PARQUET_CONCURRENCY: usize = 6;
 
 /// The workload a `lab://NAME` target runs when no flag says otherwise (design v4 §10): what
 /// `oprobe demo` runs is exactly `oprobe run lab://demo`.

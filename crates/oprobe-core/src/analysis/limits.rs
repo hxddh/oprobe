@@ -980,9 +980,8 @@ pub fn queue_wait(reqs: &[ReqRow], window: (i64, i64), servers: u64) -> Option<Q
     })
 }
 
-/// How the time to first byte moved as the requests in flight rose, over every row given
-/// (the warm-up's included: a run's first requests are the only ones an overloaded open loop
-/// sends at less than all its workers in flight).
+/// How the time to first byte moved as the requests in flight rose, over the requests of a
+/// window.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TtfbGrowth {
     /// Slope of `ln ttfb` on `ln level`, within each API: 0 for a service that answers as
@@ -998,28 +997,29 @@ pub struct TtfbGrowth {
 }
 
 impl TtfbGrowth {
-    /// Slopes from this on, clear of their error, are a service at its capacity: at least a
-    /// quarter of every further request in flight is added wait.
-    const SATURATED: f64 = 0.25;
-
-    /// The time to first byte grew with the requests in flight, beyond doubt: more requests
-    /// in flight are not served sooner, they wait.
-    pub fn saturated(&self) -> bool {
-        self.elasticity - 2.0 * self.stderr >= Self::SATURATED
-    }
-
-    /// The time to first byte stayed put as the requests in flight rose, beyond doubt: the
-    /// service had room.
+    /// The time to first byte stayed put as the requests in flight at least doubled, beyond
+    /// doubt (less than a quarter of proportional growth, two standard errors included): the
+    /// service had room for all of them.
     pub fn flat(&self) -> bool {
-        self.elasticity + 2.0 * self.stderr < Self::SATURATED
+        self.elasticity + 2.0 * self.stderr < 0.25
     }
 }
 
-/// [`TtfbGrowth`] of `reqs`; `None` when fewer than 5 answered requests arrived at half the
-/// busiest level or less (nothing to compare the busy level with).
-pub fn ttfb_growth(reqs: &[ReqRow]) -> Option<TtfbGrowth> {
-    let rows: Vec<&ReqRow> = reqs.iter().collect();
+/// [`TtfbGrowth`] of the requests that started in `[from_us, to_us)`; `None` when the run
+/// did not send enough of them at half its busiest level or less.
+///
+/// "Enough" is twice the busiest level. The rows of a window do not show the requests still
+/// in flight from before it, so its first requests only seem to arrive at few in flight —
+/// at most one per level below the busiest. They carry the busy level's time to first byte
+/// and would make any service look as if it had room; among twice as many real ones they
+/// cannot.
+pub fn ttfb_growth(reqs: &[ReqRow], window: (i64, i64)) -> Option<TtfbGrowth> {
+    let rows: Vec<&ReqRow> = reqs
+        .iter()
+        .filter(|q| q.t_us >= window.0 && q.t_us < window.1)
+        .collect();
     let (obs, _, _) = observations(&rows, &[]);
+    // (API, level, ln level, ln ttfb ms)
     let pts: Vec<(u32, u32, f64, f64)> = obs
         .iter()
         .filter(|o| o.ok && !o.thr && o.ttfb_us > 0)
@@ -1041,12 +1041,12 @@ pub fn ttfb_growth(reqs: &[ReqRow]) -> Option<TtfbGrowth> {
         .filter(|(_, n)| **n >= POPULATED)
         .map(|(l, _)| *l)
         .max()?;
-    let geo_mean = |keep: &dyn Fn(u32) -> bool| {
+    let geo_mean = |keep: &dyn Fn(u32) -> bool, at_least: usize| {
         let v: Vec<f64> = pts.iter().filter(|p| keep(p.1)).map(|p| p.3).collect();
-        (v.len() >= 5).then(|| (v.iter().sum::<f64>() / v.len() as f64).exp())
+        (v.len() >= at_least).then(|| (v.iter().sum::<f64>() / v.len() as f64).exp())
     };
-    let quiet_ttfb_ms = geo_mean(&|l| l * 2 <= busy)?;
-    let busy_ttfb_ms = geo_mean(&|l| l == busy)?;
+    let quiet_ttfb_ms = geo_mean(&|l| l * 2 <= busy, 2 * busy as usize)?;
+    let busy_ttfb_ms = geo_mean(&|l| l == busy, 1)?;
     // Within-API least squares: both axes centred on their API's mean.
     let mut means: HashMap<u32, (f64, f64, f64)> = HashMap::new();
     for p in &pts {

@@ -71,8 +71,9 @@ async fn demo_lab_ceiling_brackets_its_limit_and_small_files_fit_twenty_workers(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn parquet_lab_ops_peak_at_four_requests_in_flight() {
-    // The shape of an operation, at a load the lab mostly accepts (8 × 4 around its 24).
-    let run = lab_run("parquet", Preset::RangeReads, 8).await;
+    // The shape of an operation, at a load the lab accepts whole: 6 × 4 reaches its limit of
+    // 24 and never crosses it, however the workers line up.
+    let run = lab_run("parquet", Preset::RangeReads, 6).await;
     let s = run.report.capacity.per_op;
     assert_eq!(s.peak_inflight_per_op, 4.0, "{s:?}");
     assert!(s.requests_per_op >= 6.0, "{s:?}");

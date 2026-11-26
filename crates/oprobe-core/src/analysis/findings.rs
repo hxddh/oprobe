@@ -5,7 +5,7 @@
 //!
 //! | code | remedy path |
 //! |---|---|
-//! | `throttling` | `layers.concurrent_limit.http` (sized) + `layers.retry.jitter`: the service rejects (429/503) above a number of requests in flight, or queues them without a rejection |
+//! | `throttling` | `layers.concurrent_limit.http` (sized) + `layers.retry.jitter`: the service rejects (429/503) above a number of requests in flight. When it queues them without a rejection, the cap is advice, not a layer to prove |
 //! | `rate_limit` | `layers.concurrent_limit.http` (sized from rate × latency) |
 //! | `key_limit` | the workload's key layout (advice, not a layer) |
 //! | `bandwidth_cap` | `layers.throttle.bandwidth` on writes (a capped uplink, or a capped link the workload also writes over); on reads not a layer |
@@ -18,8 +18,10 @@
 //! | `client_bound` | none (reported) |
 //!
 //! Plus `errors` (failures that are not throttling: `layers.retry.min_delay` (sized) +
-//! `layers.retry.jitter` when retries recovered every operation, else not a layer) and
-//! `invalid_run` (the run cannot be judged). One finding per code, most severe first.
+//! `layers.retry.jitter` when retries recovered the failures; `layers.throttle.burst`, named
+//! as a setting to correct, for writes the client's own ThrottleLayer refused; else not a
+//! layer) and `invalid_run` (the run cannot be judged). One finding per code, most severe
+//! first.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -893,47 +895,6 @@ fn queueing(c: &Ctx) -> Option<Finding> {
     })
 }
 
-/// The queueing form of `throttling` for an open loop that fell behind a service at its
-/// capacity (K2-2): every worker was busy for the whole window, so the window shows one level
-/// of requests in flight and fits no limit — but as the run filled its workers, the time to
-/// first byte grew with them. More workers would only wait: the service, not the client, is
-/// the bound.
-fn saturated_service(c: &Ctx, g: &TtfbGrowth) -> Option<Finding> {
-    let ol = c.r.open_loop.as_ref()?;
-    Some(Finding {
-        code: "throttling".into(),
-        severity: Severity::Warning,
-        confidence: Confidence::Medium,
-        cause: format!(
-            "The service is at its capacity and queues what it cannot serve: it carried {:.0} of the {:.0} operations/s scheduled, and more requests in flight only waited longer (no request was rejected).",
-            ol.achieved_rate, ol.target_rate
-        ),
-        evidence: Evidence {
-            text: format!(
-                "time to first byte grew from {} at half the requests in flight or fewer to {} at {} in flight ({:.2} of each further request in flight is added wait, ±{:.2}); {} of {} scheduled arrivals never started; client CPU {:.0}% of its cores; no request was rejected (429/503)",
-                fmt_ms(g.quiet_ttfb_ms),
-                fmt_ms(g.busy_ttfb_ms),
-                g.busy_inflight_count,
-                g.elasticity,
-                2.0 * g.stderr,
-                ol.missed,
-                ol.intended_count,
-                client_busy_ratio(c.r) * 100.0
-            ),
-            values: values(&[
-                ("busiest_inflight_count", f64::from(g.busy_inflight_count)),
-                ("typical_ttfb_ms", g.quiet_ttfb_ms),
-                ("busiest_ttfb_ms", g.busy_ttfb_ms),
-                ("ttfb_growth_ratio", g.elasticity),
-                ("missed_arrivals_count", ol.missed as f64),
-            ]),
-            op_ids: slowest_ops(c.run, c.reqs().map(|q| q.op_id)),
-            windows: Vec::new(),
-        },
-        remedy: remedy("throttling", Some("queueing")),
-    })
-}
-
 /// `bandwidth_cap`, and the direction of the bodies that share the cap.
 fn bandwidth_cap(c: &Ctx) -> Option<(Finding, Direction)> {
     let h = c.r.capacity.asserted()?;
@@ -1643,10 +1604,16 @@ fn client_busy(r: &Report) -> bool {
 }
 
 /// `client_bound`: the client's CPU or its scheduler set the pace (A9, T7), or an open-loop
-/// schedule fell behind its workers. `growth`: how the time to first byte moved as the
-/// requests in flight rose ([`super::limits::ttfb_growth`]), for the second case — the
-/// workers are blamed only when it stayed put (K2-2: 9.2 said "raise `-c`" of a service that
-/// carried the same 400 operations/s at 16 workers and at 64).
+/// schedule fell behind its workers.
+///
+/// In the second case the workers are blamed only with evidence (K2-2: 9.2 said "the workers
+/// set the pace, not the service: raise `-c`" of a lab that carried the same 400
+/// operations/s at 16 workers and at 64). An overloaded open loop keeps every worker busy,
+/// so a steady one shows a single level of requests in flight, and nothing in it tells too
+/// few workers from a service at its capacity: the finding then says so. Only a run that
+/// varied its load can tell — the service queues (the queueing form of `throttling`, and no
+/// `client_bound`: [`derive`]), or it answered as fast with every worker in flight as with
+/// half of them (`growth`, [`super::limits::ttfb_growth`]) and the workers are the bound.
 fn client_bound(c: &Ctx, growth: Option<&TtfbGrowth>) -> Option<Finding> {
     let r = c.r;
     let cpu = client_busy_ratio(r);
@@ -1678,12 +1645,11 @@ fn client_bound(c: &Ctx, growth: Option<&TtfbGrowth>) -> Option<Finding> {
         );
     }
     // The service answered as fast with every worker in flight as with half of them: it had
-    // room, and the workers are the bound. Without that evidence the run cannot tell too
-    // few workers from a service at its capacity, and says so.
+    // room, and the workers are the bound.
     let room = growth.filter(|g| queued.is_some() && g.flat());
     if let Some(g) = room {
         text += &format!(
-            "; time to first byte stayed at {} from half the requests in flight to {} ({} there)",
+            "; time to first byte stayed at {} from half the requests in flight or fewer to {} in flight ({} there)",
             fmt_ms(g.quiet_ttfb_ms),
             g.busy_inflight_count,
             fmt_ms(g.busy_ttfb_ms)
@@ -1762,27 +1728,17 @@ pub fn derive(run: &Run) -> Vec<Finding> {
     out.extend(thr);
     // The queueing form of `throttling` reads the requests' timing alone: only when nothing
     // was rejected (one finding per code), and never on a run whose timing is the client's.
-    let mut queue = None;
-    let mut growth = None;
-    if !client_busy(r) && !out.iter().any(|f| f.code == "throttling") {
-        queue = queueing(&c);
-        // An open loop that fell behind with CPU to spare and no queue fitted in its window
-        // (every worker was busy throughout): how the time to first byte moved while the
-        // run filled its workers tells a service at its capacity from too few workers. The
-        // rows must reach back before the window, or the first of them only seem to arrive
-        // at few requests in flight.
-        if queue.is_none() && backlog(r).is_some() && run.reqs.iter().any(|q| q.t_us < 0) {
-            growth = super::limits::ttfb_growth(&run.reqs);
-            queue = growth
-                .as_ref()
-                .filter(|g| g.saturated())
-                .and_then(|g| saturated_service(&c, g));
-        }
-    }
-    // A service that queues is the bound, not the workers behind it.
+    let queue = (!client_busy(r) && !out.iter().any(|f| f.code == "throttling"))
+        .then(|| queueing(&c))
+        .flatten();
+    // A service that queues is the bound, not the workers an open loop fell behind.
     let client = if queue.is_some() {
         None
     } else {
+        let window = (0, (r.run.window_s * 1e6).ceil() as i64);
+        let growth = (backlog(r).is_some() && !client_busy(r))
+            .then(|| super::limits::ttfb_growth(&run.reqs, window))
+            .flatten();
         client_bound(&c, growth.as_ref())
     };
     out.extend(queue);
@@ -2525,45 +2481,6 @@ pub(crate) mod tests {
         assert!((split.iter().map(|x| x.1).sum::<f64>() - 1.0).abs() < 1e-9);
     }
 
-    /// A closed loop of 16 workers that starts 1 ms apart at −300 ms (the warm-up) and runs
-    /// 3 s: `ttfb_ms(in flight at the arrival)` is each request's time to first byte.
-    fn filling_workers(ttfb_ms: impl Fn(usize) -> f64) -> (Vec<ReqRow>, Vec<crate::model::OpRow>) {
-        let (mut reqs, mut ops) = (Vec::new(), Vec::new());
-        let mut next: Vec<f64> = (0..16).map(|w| -300.0 + w as f64).collect();
-        let mut busy: Vec<f64> = Vec::new();
-        let (mut id, mut x) = (0u64, 11u64);
-        loop {
-            let (w, at) = next
-                .iter()
-                .copied()
-                .enumerate()
-                .min_by(|p, q| p.1.total_cmp(&q.1))
-                .unwrap();
-            if at >= 3000.0 {
-                break;
-            }
-            busy.retain(|e| *e > at);
-            x = x
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            let noise = 1.0 + ((x >> 40) as f64 / (1u64 << 24) as f64 - 0.5) * 0.2;
-            let ttfb = ttfb_ms(busy.len() + 1) * noise;
-            busy.push(at + ttfb);
-            id += 1;
-            let mut q =
-                crate::analysis::outliers::test_req((at * 1000.0) as i64, (ttfb * 1000.0) as u64);
-            q.op_id = id;
-            reqs.push(q);
-            ops.push(crate::analysis::simulate::tests::op(
-                id,
-                (at * 1000.0) as i64,
-                (ttfb * 1000.0) as u64,
-            ));
-            next[w] = at + ttfb + 0.05;
-        }
-        (reqs, ops)
-    }
-
     /// An open loop of 1 000 arrivals/s that carried 400/s with CPU to spare.
     fn fell_behind(reqs: Vec<ReqRow>, ops: Vec<crate::model::OpRow>) -> Run {
         let mut run = with_capacity(base(), reqs, ops);
@@ -2583,13 +2500,26 @@ pub(crate) mod tests {
 
     /// K2-2: `lab://queueing --rate 1000` carried the lab's 400 operations/s at 16 workers
     /// and at 64, and 9.2 said of both "the workers set the pace, not the service: raise
-    /// `-c`". Every worker is busy for the whole window, so the window shows one level of
-    /// requests in flight; what tells a service at its capacity from too few workers is how
-    /// the time to first byte moved while the run filled its workers.
+    /// `-c`". Every worker of an overloaded open loop is busy for the whole window: a steady
+    /// one cannot tell a service at its capacity from too few workers, and a run that varied
+    /// its load can.
     #[test]
-    fn an_open_loop_behind_a_saturated_service_is_not_blamed_on_the_workers() {
-        // Four served at once, 10 ms each: at 16 in flight a request waits for 40 ms.
-        let (reqs, ops) = filling_workers(|inflight| 10.0 * (inflight as f64 / 4.0).max(1.0));
+    fn an_open_loop_that_fell_behind_blames_the_workers_only_with_evidence() {
+        use crate::analysis::limits::tests::{queueing_bursts, queueing_closed_loops};
+        // Steady: 16 workers always in flight, 40 ms each behind four servers of 10 ms. The
+        // window's first rows only seem to arrive at 1 to 15 in flight, at the same 40 ms.
+        let (reqs, ops) = queueing_closed_loops(&[16]);
+        let run = fell_behind(reqs, ops);
+        let f = derive(&run);
+        assert!(!f.iter().any(|x| x.code == "throttling"), "{f:#?}");
+        let c = f.iter().find(|x| x.code == "client_bound").unwrap();
+        assert!(c.cause.contains("cannot tell"), "{}", c.cause);
+        assert!(c.cause.contains("16 workers"), "{}", c.cause);
+        assert!(!c.remedy.text.contains("`-c`"), "{}", c.remedy.text);
+        assert!(c.remedy.text.contains("shape=ramp"), "{}", c.remedy.text);
+        // The load varied, and the time to first byte grew with it: the service queues. It
+        // is the bound, not the workers.
+        let (reqs, ops) = queueing_bursts(|b| 2 + b % 14);
         let run = fell_behind(reqs, ops);
         let f = derive(&run);
         assert!(!f.iter().any(|x| x.code == "client_bound"), "{f:#?}");
@@ -2597,19 +2527,16 @@ pub(crate) mod tests {
             .iter()
             .find(|x| x.code == "throttling")
             .unwrap_or_else(|| panic!("{f:#?}"));
-        assert!(t.cause.contains("at its capacity"), "{}", t.cause);
-        assert!(
-            t.cause.contains("400 of the 1000 operations/s"),
-            "{}",
-            t.cause
-        );
-        assert!(t.evidence.values["ttfb_growth_ratio"] > 0.5, "{t:#?}");
-        assert_eq!(t.evidence.values["busiest_inflight_count"], 16.0);
+        assert!(t.cause.contains("queues the rest"), "{}", t.cause);
         assert!(t.remedy.path.is_none() && !t.remedy.text.contains("`-c`"));
         assert_eq!(t.remedy.next.as_deref(), Some("oprobe show r1 --detail"));
-        // A service that answers in 10 ms whatever is in flight had room: the workers are
-        // the bound, and the finding says what shows it.
-        let (reqs, ops) = filling_workers(|_| 10.0);
+        // The load varied, and the service answered in 10 ms whatever was in flight: it had
+        // room. The workers are the bound, and the finding says what shows it.
+        let (mut reqs, ops) = queueing_bursts(|b| 2 + b % 14);
+        for (i, q) in reqs.iter_mut().enumerate() {
+            q.ttfb_us = 9_500 + (i as u64 % 11) * 100;
+            q.total_us = q.ttfb_us + 10;
+        }
         let run = fell_behind(reqs, ops);
         let f = derive(&run);
         assert!(!f.iter().any(|x| x.code == "throttling"), "{f:#?}");
@@ -2621,30 +2548,8 @@ pub(crate) mod tests {
             "{}",
             c.evidence.text
         );
-        // Without the requests that filled the workers nothing tells the two apart, and
-        // the finding claims neither.
-        let (reqs, ops) = filling_workers(|inflight| 10.0 * (inflight as f64 / 4.0).max(1.0));
-        let keep: std::collections::HashSet<u64> = reqs
-            .iter()
-            .filter(|q| q.t_us >= 0)
-            .map(|q| q.op_id)
-            .collect();
-        let run = fell_behind(
-            reqs.into_iter()
-                .filter(|q| keep.contains(&q.op_id))
-                .collect(),
-            ops.into_iter()
-                .filter(|o| keep.contains(&o.op_id))
-                .collect(),
-        );
-        let f = derive(&run);
-        assert!(!f.iter().any(|x| x.code == "throttling"), "{f:#?}");
-        let c = f.iter().find(|x| x.code == "client_bound").unwrap();
-        assert!(c.cause.contains("cannot tell"), "{}", c.cause);
-        assert!(!c.remedy.text.contains("`-c`"), "{}", c.remedy.text);
-        assert!(c.remedy.text.contains("shape=ramp"), "{}", c.remedy.text);
         // A client that is itself saturated stays client-bound whatever its timing says.
-        let (reqs, ops) = filling_workers(|inflight| 10.0 * (inflight as f64 / 4.0).max(1.0));
+        let (reqs, ops) = queueing_bursts(|b| 2 + b % 14);
         let mut run = fell_behind(reqs, ops);
         run.report.self_stats.client_saturated = true;
         let f = derive(&run);
@@ -2822,7 +2727,7 @@ pub(crate) mod tests {
 
     /// An open-loop run whose arrivals queue behind the workers names the workers, not the
     /// CPU (K15). That more workers would help is said only with evidence
-    /// (`an_open_loop_behind_a_saturated_service_is_not_blamed_on_the_workers`).
+    /// (`an_open_loop_that_fell_behind_blames_the_workers_only_with_evidence`).
     #[test]
     fn a_rate_above_the_workers_names_the_workers() {
         let mut run = base();
@@ -2846,10 +2751,14 @@ pub(crate) mod tests {
             !c.cause.contains("CPU, not") && !c.remedy.text.contains("more cores"),
             "{c:#?}"
         );
-        // Nothing in these rows shows that the service had room (K2-2): the finding names the
-        // workers the arrivals queued behind, and does not claim that more would help.
-        assert!(c.cause.contains("cannot tell"), "{}", c.cause);
-        assert!(!c.remedy.text.contains("`-c`"), "{}", c.remedy.text);
+        // The rows show the service answering as fast at many requests in flight as at few
+        // (K2-2): that is what lets the finding say more workers would help.
+        assert!(c.remedy.text.contains("`-c`"), "{}", c.remedy.text);
+        assert!(
+            c.evidence.text.contains("time to first byte stayed at"),
+            "{}",
+            c.evidence.text
+        );
         assert!(
             c.evidence.text.contains("1000/s scheduled, 200/s carried"),
             "{}",

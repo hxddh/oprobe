@@ -39,7 +39,7 @@ const ENTRIES: &[Entry] = &[
         code: "throttling",
         title: "The service throttles above a number of requests in flight",
         severity: Severity::Critical,
-        meaning: "The service answered 429/503 and the rejections follow the requests in flight (the limit model is in the report's capacity section). OpenDAL's default retry then waits a full second per rejection. A service that rejects nothing but serves only so many requests at once and queues the rest is the same limit: the time to first byte grows with the requests in flight (a warning, and only when the run varied its load enough to show it).",
+        meaning: "The service answered 429/503 and the rejections follow the requests in flight (the limit model is in the report's capacity section). OpenDAL's default retry then waits a full second per rejection. A service that rejects nothing but serves only so many requests at once and queues the rest is the same limit: the time to first byte grows with the requests in flight (a warning, only when the run varied its load enough to show it, the wait stands clear of the client's own scheduling lag and the client was not saturated; or when an open loop fell behind it). For that form the cap is advice, not a change to prove: it moves the wait from the service's queue to the client's and shortens no operation.",
         causes: &[
             "more concurrent requests than a bucket, prefix or gateway accepts",
             "several operators or processes sharing one limit",
@@ -136,10 +136,10 @@ const ENTRIES: &[Entry] = &[
         code: "client_bound",
         title: "The client, not the service, sets the pace",
         severity: Severity::Warning,
-        meaning: "The load generator's CPU or its scheduler is saturated (scheduling lag), or an open-loop schedule fell behind: its latency and throughput understate the service, and latency findings are dropped. When the arrivals queue behind the workers while the CPU has room, the workers (`-c`) are the bound, not the CPU.",
+        meaning: "The load generator's CPU or its scheduler is saturated (scheduling lag), or an open-loop schedule fell behind: its latency and throughput understate the service, and latency findings are dropped. When the arrivals queue behind the workers while the CPU has room, the workers (`-c`) are the bound only if the service answered as fast with all of them in flight; a service whose time to first byte grew with them is at its capacity (`throttling`), and a run that cannot tell says so.",
         causes: &[
             "too few cores for the concurrency",
-            "an open-loop `--rate` above what the workers (`-c`) carry",
+            "an open-loop `--rate` above what the workers (`-c`) carry, on a service with room",
             "per-operation client work (checksums, decoding)",
         ],
     },
@@ -147,11 +147,12 @@ const ENTRIES: &[Entry] = &[
         code: "errors",
         title: "Requests or operations failed",
         severity: Severity::Warning,
-        meaning: "Operations failed for reasons other than throttling, or requests failed with a 5xx (including 503s that follow no load pattern) or a lost connection and retries absorbed them. When retries recovered every operation, the time goes to the retry backoff (OpenDAL waits a full second first): the remedy is a shorter first backoff with jitter, `layers.retry.min_delay` sized by prove. Failures that reach the application are not a layer: fix their cause.",
+        meaning: "Operations failed for reasons other than throttling, or requests failed with a 5xx (including 503s that follow no load pattern) or a lost connection and retries absorbed them. When retries recovered the failures (every operation, or all but a few that ran out of attempts on the same 5xx or lost connections), the time goes to the retry backoff (OpenDAL waits a full second first): the remedy is a shorter first backoff with jitter, `layers.retry.min_delay` sized by prove. Writes that OpenDAL's ThrottleLayer refuses because they are larger than `layers.throttle.burst` fail as rate-limited with no 429/503 from the service: raise the burst. Other failures that reach the application are not a layer: fix their cause.",
         causes: &[
             "missing permissions or wrong credentials",
             "objects or buckets that do not exist",
             "an unhealthy service or a noisy neighbour",
+            "`layers.throttle.burst` below the size of a write",
         ],
     },
     Entry {

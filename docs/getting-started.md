@@ -19,7 +19,7 @@ oprobe demo
 `demo` is `oprobe run lab://demo`. The lab is an S3-compatible server inside oprobe on 127.0.0.1:
 every 40th request is a straggler that waits 250 ms for its first byte, and it throttles
 (503 SlowDown) above 40 requests in flight. The default workload writes, reads and stats small objects
-with 28 workers for 8 seconds:
+with 16 workers for 8 seconds:
 
 ```text
 [Attention] 2.4% of HeadObject, 2.4% of PutObject and 2.6% of GetObject requests wait far longer for

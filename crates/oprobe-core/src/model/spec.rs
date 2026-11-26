@@ -555,7 +555,7 @@ pub const SET_KEYS: &[SetKey] = &[
         "p99_ms",
         Section::Sla,
         &[],
-        "SLA: max p99 per operation in ms (none: unchecked)",
+        "removed: a p99 limit (a stalled open loop is judged without one)",
     ),
     key("sla", Section::Sla, &[], "enforce or none"),
     key("label", Section::Run, &[], "label stored with the run"),
@@ -733,13 +733,9 @@ fn apply_one(
                 Some(input::share(&what, v)?)
             }
         }
-        "p99_ms" => {
-            p.sla.p99_ms = if none_word(v) {
-                None
-            } else {
-                Some(input::positive(&what, v)?)
-            }
-        }
+        // The p99 limit is gone (9.3): no run stores the key (`--set` refuses it), and a
+        // stalled open loop is judged without one.
+        "p99_ms" => {}
         "sla" => {
             p.sla.enforce = input::choice("SLA mode", v, &[("enforce", true), ("none", false)])?
         }

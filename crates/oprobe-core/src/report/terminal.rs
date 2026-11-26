@@ -104,7 +104,7 @@ pub fn request_line(i: usize, r: &ReqRow, op_t_us: i64, detail: bool) -> String 
     if r.protocol != WireProtocol::Inproc {
         parts.push(format!("send {}", ms(t.send_us)));
         parts.push(format!("ttfb {}", ms(t.ttfb_us)));
-        parts.push(format!("transfer {}", ms(t.body_us)));
+        parts.push(format!("body {}", ms(t.body_us)));
         if t.stall_us > 0 {
             parts.push(format!("stall {}", ms(t.stall_us)));
         }
@@ -362,8 +362,8 @@ pub fn apis_table(r: &Report, detail: bool) -> String {
             .collect();
         return table(
             &[
-                "request", "count", "warm", "queue", "connect", "send", "ttfb", "transfer",
-                "stall", "total", "down/up", "status",
+                "request", "count", "warm", "queue", "connect", "send", "ttfb", "body", "stall",
+                "total", "down/up", "status",
             ],
             &rows,
             2,
@@ -551,7 +551,7 @@ fn render_with(r: &Report, run: Option<&Run>, detail: bool) -> String {
         let line = view.retry.line();
         if view.retry.quiet() { dim(&line) } else { line }
     });
-    // A corrupted object or too many failed operations (the run's checks).
+    // A corrupted object, too many failed operations, a stalled open loop (the run's checks).
     if !r.verdict.sla.breaches.is_empty() {
         kv(
             &mut out,

@@ -606,3 +606,107 @@ pub fn build_run(i: ReportInput<'_>) -> Run {
 pub fn build_report(i: ReportInput<'_>) -> Report {
     build_run(i).report
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analysis::diagnosis::Bottleneck;
+    use crate::analysis::hypothesis::Hypothesis;
+
+    fn report() -> Report {
+        let mut r: Report =
+            serde_json::from_value(crate::analysis::findings::tests::empty_report_json()).unwrap();
+        r.run.id = "r1".into();
+        r.summary.ops = 1000;
+        r.summary.latency.p50 = 8.0;
+        r.summary.latency.p99 = 21.0;
+        r.stages.bottleneck = Bottleneck::ServerLatency;
+        r
+    }
+
+    /// K2-5: a healthy run read "Inconclusive: latency grows with the requests in flight … —
+    /// prove sizes a change", and `prove` refused it (there is no finding to prove). The
+    /// headline says the load was not varied and how to vary it, and names no command that
+    /// fails.
+    #[test]
+    fn a_healthy_run_says_how_to_vary_the_load_and_never_points_at_prove() {
+        let mut r = report();
+        let no_model = headline(&r);
+        r.capacity.hypotheses = vec![Hypothesis {
+            kind: HypothesisKind::Queueing,
+            selected: true,
+            ..Default::default()
+        }];
+        r.stages.bottleneck = Bottleneck::Client;
+        for h in [no_model, headline(&r)] {
+            assert!(h.starts_with("No finding: "), "{h}");
+            assert!(h.contains("(p50 8.00ms · p99 21.0ms)"), "{h}");
+            assert!(h.contains("The load was not varied"), "{h}");
+            assert!(h.contains("`--set shape=ramp:FROM..TO/D`"), "{h}");
+            assert!(!h.contains("prove") && !h.contains("Inconclusive"), "{h}");
+        }
+        // What the headline names exists: `--set` takes the key and the shape parses.
+        let mut o = crate::model::spec::Overrides::new();
+        o.set("shape", "ramp:50..350/3s").unwrap();
+        // The client's own time dominates and no model saw growth: nothing to vary.
+        r.capacity.hypotheses.clear();
+        let h = headline(&r);
+        assert_eq!(
+            h,
+            "No finding: client processing dominates (p50 8.00ms · p99 21.0ms)."
+        );
+    }
+
+    /// K4-1: a stalled open loop is judged with no limit. The headline leads with the
+    /// arrivals that never completed and what they leave known of the p99, and the verdict
+    /// follows the failed check.
+    #[test]
+    fn a_stalled_open_loop_leads_the_headline() {
+        let mut run = Run {
+            report: report(),
+            ops: vec![],
+            reqs: vec![],
+        };
+        let stalled = |missed: u64| crate::trace::OpenLoopStats {
+            target_rate: 1000.0,
+            achieved_rate: 400.0,
+            missed,
+            censored_count: missed,
+            intended_count: 3000,
+            ..Default::default()
+        };
+        run.report.summary.latency.p99 = 1805.0;
+        run.report.open_loop = Some(stalled(1808));
+        run.report.verdict.sla.enforced = true;
+        finish(&mut run, true);
+        let h = &run.report.verdict.headline;
+        assert!(
+            h.starts_with(
+                "1808 of 3000 scheduled arrivals never completed (60.3%): the p99 is at least 1.80s and has no upper bound. "
+            ),
+            "{h}"
+        );
+        assert_eq!(run.report.verdict.level, VerdictLevel::Critical);
+        // The finding's cause follows the stall.
+        run.report.findings = vec![Finding {
+            code: "client_bound".into(),
+            severity: Severity::Warning,
+            cause: "The client process set the pace.".into(),
+            ..Default::default()
+        }];
+        finish(&mut run, true);
+        let h = &run.report.verdict.headline;
+        assert!(
+            h.ends_with("has no upper bound. The client process set the pace."),
+            "{h}"
+        );
+        // Within 1 % of the arrivals the p99 is still bounded: the headline is the finding's.
+        run.report.open_loop = Some(stalled(30));
+        finish(&mut run, false);
+        assert_eq!(
+            run.report.verdict.headline,
+            "The client process set the pace."
+        );
+        assert_eq!(run.report.verdict.level, VerdictLevel::Attention);
+    }
+}
