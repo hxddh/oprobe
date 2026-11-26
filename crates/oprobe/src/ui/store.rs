@@ -1634,7 +1634,9 @@ impl Default for Store {
 pub fn finish_jobs(grace: Duration) {
     if jobs::busy() {
         if !grace.is_zero() {
-            eprintln!("oprobe: stopping the running job and cleaning up its test data…");
+            oprobe_core::output::stderr_line(
+                "oprobe: stopping the running job and cleaning up its test data…",
+            );
         }
         report_left(&jobs::shutdown(grace));
     }
@@ -1644,7 +1646,7 @@ pub fn finish_jobs(grace: Duration) {
 fn report_left(left: &[jobs::Left]) {
     for l in left {
         let line = jobs::left_line(l);
-        eprintln!("oprobe: {line}");
+        oprobe_core::output::stderr_line(format_args!("oprobe: {line}"));
         crate::ui::log_fatal(&line);
     }
 }

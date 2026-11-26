@@ -2548,7 +2548,7 @@ async fn prove_run(
     let mut safety = req.safety.clone();
     // The budget also bounds the trials themselves (with room for the last one's cleanup).
     safety.max_duration = budget.map(|b| format!("{}ms", (b.as_millis() as u64) * 2));
-    let guard = super::run::guard_for(ctx, &base, &super::run::budgets(ctx, &safety)?);
+    let guard = crate::engine::measure::guard_for(&super::run::budgets(ctx, &safety)?);
     let target_name =
         crate::operator::resolve::resolve(&run.report.spec.operator_ref, &*ctx.config()?)
             .ok()

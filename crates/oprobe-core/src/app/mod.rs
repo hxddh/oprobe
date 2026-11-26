@@ -499,11 +499,7 @@ impl App {
         }
         let resolved = self.resolve(&req)?;
         let ctx = self.ctx(&sink);
-        let guard = run::guard_for(
-            &ctx,
-            &resolved[0].profile,
-            &run::budgets(&ctx, &req.safety)?,
-        );
+        let guard = crate::engine::measure::guard_for(&run::budgets(&ctx, &req.safety)?);
         let mut runs = Vec::new();
         for r in resolved {
             if cancel.is_cancelled() {

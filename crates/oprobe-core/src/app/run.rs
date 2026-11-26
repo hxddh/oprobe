@@ -321,12 +321,6 @@ pub fn rails(ctx: &Ctx, profile: &Profile, s: &Safety) -> Result<Rails> {
     )
 }
 
-/// The command's live guard (one per command: every measurement of `run --repeat` or `matrix`
-/// shares it, so its budgets cover the whole command).
-pub fn guard_for(_ctx: &Ctx, _profile: &Profile, b: &Budgets) -> Option<Arc<Guard>> {
-    crate::engine::measure::guard_for(b)
-}
-
 /// Progress for this output mode: a live line on a terminal, messages on stderr otherwise.
 pub fn progress_for(ctx: &Ctx, total_s: f64) -> (ProgressFn, Option<Arc<live::LiveLine>>) {
     let quiet = ctx.out.quiet;
@@ -395,7 +389,7 @@ pub async fn measure(
     let guard = if safety.dry_run {
         None
     } else {
-        guard_for(ctx, &profile, &budgets(ctx, safety)?)
+        crate::engine::measure::guard_for(&budgets(ctx, safety)?)
     };
     measure_guarded(
         ctx,

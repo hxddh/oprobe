@@ -139,7 +139,7 @@ pub fn log_fatal(msg: &str) {
 pub fn App() -> impl IntoElement {
     match nsh_base::tokens_of(Some(include_str!("theme.json"))) {
         Ok(tokens) => set_tokens(tokens),
-        Err(e) => eprintln!("oprobe: theme.json: {e}"),
+        Err(e) => oprobe_core::output::stderr_line(format_args!("oprobe: theme.json: {e}")),
     }
     if !kit::in_terminal() {
         let mut look = nsh_base::ScrollbarLook::default();

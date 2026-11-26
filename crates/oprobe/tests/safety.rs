@@ -731,10 +731,6 @@ fn nothing_prints_to_stderr_with_a_macro_that_can_panic() {
     assert!(files.len() > 50, "{} source files found", files.len());
     let mut found = Vec::new();
     for file in files {
-        // The app's own lines (`src/ui/`) are still to be moved: see the 9.3 notes.
-        if file.components().any(|c| c.as_os_str() == "ui") {
-            continue;
-        }
         let text = std::fs::read_to_string(&file).unwrap();
         for (n, line) in text.lines().enumerate() {
             let code = line.split("//").next().unwrap_or_default();
